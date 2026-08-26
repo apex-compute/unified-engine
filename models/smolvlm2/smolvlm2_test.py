@@ -185,6 +185,35 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
     # generate_instruction_flag_check accepts engine indices 0-15
     # (user_dma_core.py:9351); 8 is what the DRAM budget above supports.
     MAX_ENGINES = 8
+    # Decode-side sharding is a SEPARATE knob (--decode-engines), default 1 = off.
+    # It is an experiment, not a default: decode is a weight-streaming GEMV, so an
+    # N-split halves the bytes EACH engine reads but leaves the TOTAL bytes moved
+    # unchanged. It only wins if the current limit is per-engine issue rate rather
+    # than the DRAM controller -- see compile_decoder_sharded.
+    DECODE_NUM_ENGINES = 1
+    # --- prefill sharding (follows --engines) ------------------------------------
+    # Row-block granularity. Nothing in the prefill body consumes a row count as
+    # anything but a runtime M -- rms_norm/matmul take gpr_M_reg, eltwise takes M/N,
+    # and attention is GROUP-sharded at full S with every strided DMA left intact --
+    # so this is a load-balance knob, not a correctness one. (pi05 uses 8 for its
+    # prefix for the same reason.) The word-address arithmetic is exact at ANY
+    # offset because every pitch is a multiple of 8.
+    # Per-stage override; None -> follow NUM_ENGINES (pi05's VIS_NUM_ENGINES
+    # convention). Prefill is M=PM with real weight reuse, so unlike decode it is
+    # compute-bound and shards well: ~1.79x on two engines.
+    PREFILL_NUM_ENGINES = None
+    PREFILL_ROW_ALIGN = 8
+    # Shard registers, primed per run by the preambles in run_prefill. 7..11 sit
+    # above the fixed regs (1..6); scratch allocation starts past them.
+    # NOTE gpr_M_reg must be 1..15 (user_dma_core eltwise/rms_norm validation), which
+    # PF_GPR_SHARD_ROWS=7 satisfies; the address GPRs may be 1..63 but must be
+    # distinct from it and from each other (_validate_addr_gprs).
+    PF_GPR_SHARD_ROWS   = 7    # this engine's row count  -> gpr_M_reg
+    PF_GPR_ROW_OFF      = 8    # this engine's first row  -> address arithmetic
+    PF_GPR_ADDR_A       = 9    # scratch: computed A base   (word address)
+    PF_GPR_ADDR_B       = 10   # scratch: computed B base   (eltwise only)
+    PF_GPR_ADDR_OUT     = 11   # scratch: computed OUT base
+    PF_ISA_SCRATCH_BASE = 12
     def __init__(self, script_dir: str = None):
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self._cfg = _SMOLVLM2_CFG
@@ -211,6 +240,12 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self._vis_sched = None
         self._vis_worker_prog_addrs = []
         self._vis_flags_precleared = False
+        self._lm_sched = None
+        self._pf_sched = None
+        self._vis_worker_arena = None
+        self._pf_worker_prog_addrs = []
+        self._pf_worker_preamble_addrs = []
+        self._lm_worker_prog_addrs = []
     # --- ISA register helpers (same as Gemma3) ---
     def _artifact_mode_suffix(self) -> str:
         # Only the decode linear kernel changes the compiled instruction stream (and, trivially, the
@@ -742,6 +777,43 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             "attn_scratch", self.VIS_ATTN_SCRATCH_DRAM, ((64 + _S) * _S + _S * 64) * _bpe)
         return self._vis_sched
 
+    def _is_sharded(self) -> bool:
+        """True if ANY stage is multi-engine. Gates every programs.bin read and
+        write: the manifest carries only the primary's segments, so a sharded build
+        must neither load a single-engine bin nor publish one."""
+        return (int(self.NUM_ENGINES) > 1 or int(self.DECODE_NUM_ENGINES) > 1
+                or self._prefill_engines() > 1)
+
+    def _lm_make_scheduler(self, num_engines: int):
+        """Scheduler for the decode stage, SHARING the encoder's worker engines.
+
+        The shared pool is a correctness requirement, not an optimization. Each
+        worker's DRAM allocators live in the UnifiedEngine object; a second
+        scheduler that CONSTRUCTS its own workers over the same arena restarts
+        those allocators at offset 0, so the decode worker programs would be
+        written on top of the encoder's, byte for byte, at the same addresses.
+        The encoder has already cached those addresses, so its next run would
+        launch decode code on the workers: different program, different barrier
+        count, instant desync, and both engines spin on a FLAG_CHECK that has no
+        timeout. Passing ``workers=`` keeps ONE allocator per engine, so decode's
+        programs land after the encoder's.
+        """
+        from multi_engine_shard import MultiEngineScheduler
+        if self._lm_sched is not None:
+            return self._lm_sched
+        # The encoder scheduler owns the pool and is always built first
+        # (compile_all compiles encoder -> decoder -> prefill).
+        enc = self._vis_make_scheduler(int(self.NUM_ENGINES))
+        assert num_engines <= int(self.NUM_ENGINES), (
+            f'--decode-engines {num_engines} exceeds --engines {self.NUM_ENGINES}: the\n'
+            f'worker engines are built by the encoder stage and shared.')
+        self._lm_sched = MultiEngineScheduler(
+            self, num_engines=num_engines,
+            workers=enc.workers,
+            allow_more_than_two_engines=True,
+        )
+        return self._lm_sched
+
     def compile_encoder_sharded(self) -> int:
         """compile_encoder with the ENTIRE per-layer body row-sharded over
         ``NUM_ENGINES`` engines. A SEPARATE forward pass: compile_encoder above is
@@ -982,6 +1054,80 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
               f"0x{program_addr:X}{extra} (num_engines={ne})")
         return program_addr
 
+    def _prefill_engines(self) -> int:
+        """Engine count for the prefill stage; None -> follow NUM_ENGINES."""
+        v = self.PREFILL_NUM_ENGINES
+        return int(self.NUM_ENGINES) if v is None else int(v)
+
+    def _pf_split_rows(self, S: int, ne: int):
+        """[(row_offset, rows)] per engine for a RUNTIME sequence length.
+
+        Called by run_prefill, not by the compiler: the split is primed into GPRs
+        each run, so one captured program serves any S. Whole ALIGN-row blocks
+        first, then the ragged tail onto the last engine -- the tail is at most
+        ALIGN-1 rows, so imbalance is bounded by that regardless of S.
+        """
+        A = self.PREFILL_ROW_ALIGN
+        blocks = S // A
+        base, rem = divmod(blocks, ne)
+        counts = [A * (base + (1 if i < rem else 0)) for i in range(ne)]
+        counts[-1] += S - sum(counts)          # ragged tail (S % ALIGN)
+        # NEVER hand an engine zero rows. gpr_M_reg drives a HARDWARE loop; a count of
+        # 0 is not a no-op, and the engine would still have to reach every rendezvous.
+        # Short prompts (S < ne*ALIGN) land here, so redistribute rather than assert.
+        for i in range(ne):
+            if counts[i] == 0:
+                j = counts.index(max(counts))
+                assert counts[j] > 1, (
+                    f'sequence length {S} cannot be split across {ne} engines')
+                counts[j] -= 1
+                counts[i] += 1
+        assert sum(counts) == S and all(c >= 1 for c in counts), (counts, S, ne)
+        offs = [sum(counts[:i]) for i in range(ne)]
+        return list(zip(offs, counts))
+
+    @staticmethod
+    def _pf_split_groups(n_groups: int, ne: int):
+        """[[kv_head, ...]] per engine. Attention is GROUP-sharded, not row-sharded."""
+        base, rem = divmod(n_groups, ne)
+        out, start = [], 0
+        for i in range(ne):
+            c = base + (1 if i < rem else 0)
+            out.append(list(range(start, start + c)))
+            start += c
+        return out
+
+    def _pf_make_scheduler(self, num_engines: int):
+        """Prefill scheduler, sharing the encoder's worker engines (see
+        _lm_make_scheduler for why the pool must be shared).
+
+        Registers the flash operand buffers PER_ENGINE: attention is group-sharded,
+        so two engines run DIFFERENT kv-groups at the same instant and would
+        otherwise marshal their Q/K/V into the same FLASH_* buffers.
+        """
+        from multi_engine_shard import MultiEngineScheduler
+        if self._pf_sched is not None:
+            return self._pf_sched
+        enc = self._vis_make_scheduler(int(self.NUM_ENGINES))
+        self._pf_sched = MultiEngineScheduler(
+            self, num_engines=num_engines,
+            workers=enc.workers,
+            allow_more_than_two_engines=True,
+        )
+        D, bpe = self.HEAD_DIM, 2
+        qmax = self.PREFILL_QMAX
+        for nm, addr in (("pf_flash_q", self.FLASH_Q_DRAM),
+                         ("pf_flash_k", self.FLASH_K_DRAM),
+                         ("pf_flash_v", self.FLASH_V_DRAM),
+                         ("pf_flash_out", self.FLASH_OUT_DRAM)):
+            self._pf_sched.register_per_engine(nm, addr, qmax * D * bpe)
+        self._pf_sched.register_per_engine(
+            "pf_flash_scratch", self.FLASH_SCRATCH_DRAM,
+            ((D + qmax) * qmax + qmax * D) * bpe)
+        # FLASH_BIAS stays SHARED: it is read-only and indexed by the FULL stacked
+        # batch, which group sharding does not change.
+        return self._pf_sched
+
     def compile_prefill(self) -> None:
         """Seq-len-agnostic gemma3-style prefill. Compiled ONCE for PREFILL_MAX; the runtime length
         is read by unified_attention_core via gpr_aligned_seq_len. Permutes/matmuls/norms run dynamic
@@ -995,6 +1141,68 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         runtime last-token offset and are emitted by run_prefill). Captured in place at a fixed
         program-DRAM address so the flash dispatcher's absolute jumps stay valid; run_prefill's
         preamble primes runtime sequence GPRs and jump_abs-es into this program.
+
+        MULTI-ENGINE (--engines N > 1)
+        ------------------------------
+        THE PROBLEM THIS SOLVES. The encoder shards on a COMPILE-TIME row count
+        (S=1024), so every engine's row offset folds into the addresses at capture
+        time. Prefill cannot do that: every projection takes gpr_M_reg=gpr_seq_len
+        and run_prefill primes that register to the ACTUAL prompt length, so the row
+        count is a RUNTIME value. A compile-time split would hand engine 1 a block of
+        pure epsilon padding on any prompt shorter than PREFILL_MAX.
+
+        THE MECHANISM. matmat_mul_core / rms_norm_core_dram / eltwise_core_dram all
+        accept gpr_a_addr / gpr_b_addr / gpr_out_addr on the dynamic path: the
+        pointer's DRAM base is sourced from a GPR at execute time (word address,
+        byte >> 3) via a one-shot PBI_MODE_REG override, while the in-loop row
+        strides stay compile-time immediates (user_dma_core.py:1988). So the
+        captured program refers to this engine's row block SYMBOLICALLY:
+
+            PF_GPR_ROW_OFF     this engine's first row      } primed per run by the
+            PF_GPR_SHARD_ROWS  this engine's row count      } preamble in run_prefill
+
+        and before each sharded op we emit, into a scratch GPR,
+        ``(base + ROW_OFF*pitch) >> 3`` with reg_mul_imm + add_imm -- the same idiom
+        compile_decoder already uses for KV-cache addressing. ONE program, ANY
+        sequence length. PREFILL_MAX and the seq-len-agnostic property are untouched.
+
+        Every pitch here (H*2=1920, KV*2=640, I*2=5120) is a multiple of 8, so the
+        word-address arithmetic is EXACT for any row offset -- PREFILL_ROW_ALIGN is
+        about kernel efficiency, not correctness.
+
+        THREE REGIONS PER LAYER:
+
+          A  row-sharded   residual eltwise, input RMSNorm, q/k/v projections
+          -- rendezvous --  region B reads ALL rows of Q/K/V
+          B  GROUP-sharded  the engine owning kv-head h does its K copy + RoPE-K, its
+                            V copy, then Q gather / RoPE-Q / duplicate / flash /
+                            un-stack. FULL S rows, so NO row offsets: every strided
+                            DMA and the static PM loop inside duplicate_gqa_rows keep
+                            their single-engine form. Row-splitting attention instead
+                            would need a per-engine slice of the block-diagonal
+                            causal bias and a row offset on each strided marshalling
+                            copy -- the failure class that yields finite, plausible,
+                            scrambled output. pi05 head-shards its prefix for the
+                            same reason.
+          -- rendezvous --  region C reads ALL rows of ATTN_RESULT
+          C  row-sharded   o projection, residual, post-attn RMSNorm, gate/up/mul/down
+          -- rendezvous --
+
+        The third rendezvous is CONSERVATIVE and could be dropped: C writes only this
+        engine's rows and the next layer's A reads exactly those rows, and the h_in
+        ping-pong alternates buffers between consecutive layers so a one-region
+        runahead cannot collide. Keeping it costs ~1% of a 2.7 s stage; removing it
+        should be a measured change, not an assumed one.
+
+        BALANCE. Projections + MLP are ~93% of prefill MACs and split evenly; the 5
+        kv-groups split 3/2 over two engines but are only ~7%, so the ceiling is
+        ~1.97x.
+
+        AT N == 1 THIS EMITS THE HISTORICAL STREAM BYTE FOR BYTE: `sharded` is False,
+        so no address GPR is computed, no barrier is emitted, gpr_M_reg stays
+        gpr_seq_len, every address is the literal, the flat eltwise helpers are used
+        as before, and the region split is a pure reordering of nothing (A, B, C
+        already ran in that order).
         """
         from user_dma_core import TYPE
         H, D, I = self.HIDDEN_SIZE, self.HEAD_DIM, self.INTERMEDIATE_SIZE
@@ -1004,130 +1212,252 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         PM = self.PREFILL_MAX_SEQ_LEN          # static row count for non-attention ops
         qmax = self.PREFILL_QMAX                # aligned(PM*G) — stacked flash rows
 
-        def lm_matmul(M, K, N, A, proj, la, OUT, **kw):
-            # PREFILL is M=PM (>1) → true GEMM via matmat_mul_core with gpr_M_reg (core_changes §3h):
-            # the M-tile loop becomes a runtime WHILE-loop (primed to PM via gpr_seq_len), so the body
-            # is emitted once instead of unrolled per output row. The M=1 GEMV quantized_matmat_core is
-            # decode-only (compile_decoder keeps it). NOTE gpr_M_reg dispatches to the PBI path.
-            self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
-                OUTPUT_DRAM_ADDR=OUT, is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=la[f'{proj}_scale'], gpr_M_reg=self.gpr_seq_len, **kw)
+        ne = self._prefill_engines()
+        sharded = ne > 1
+        sched = self._pf_make_scheduler(ne) if sharded else None
+        engines = sched.engines if sharded else [self]
+        groups = self._pf_split_groups(self.NUM_KV_HEADS, ne if sharded else 1)
+        # Row count register: this engine's share when sharded, the full runtime
+        # length otherwise. Region B always uses the FULL length (gpr_seq_len).
+        Mreg = self.PF_GPR_SHARD_ROWS if sharded else self.gpr_seq_len
 
-        def strided_copy(src, src_jump, dst, dst_jump, rows, width):
+        def pf_addr(ue, dst_reg, base, pitch):
+            """dst_reg <- (base + PF_GPR_ROW_OFF*pitch) >> 3, the PBI word-address format."""
+            assert pitch % 8 == 0, f"pitch {pitch} must be a multiple of 8 for word addressing"
+            ue.generate_instruction_reg_mul_imm(dst_reg, self.PF_GPR_ROW_OFF,
+                                                ue_35bit_addr_shifter(pitch))
+            ue.generate_instruction_add_imm(dst_reg, ue_35bit_addr_shifter(base), dst_reg)
+
+        def sh_mm(ue, K, N, A, proj, la, OUT, a_pitch, out_pitch, **kw):
+            ka = {}
+            if sharded:
+                pf_addr(ue, self.PF_GPR_ADDR_A, A, a_pitch)
+                pf_addr(ue, self.PF_GPR_ADDR_OUT, OUT, out_pitch)
+                ka = dict(gpr_a_addr=self.PF_GPR_ADDR_A, gpr_out_addr=self.PF_GPR_ADDR_OUT)
+            ue.matmat_mul_core(M=PM, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
+                OUTPUT_DRAM_ADDR=OUT, is_B_quantized=True, data_type=TYPE.IF4,
+                SCALE_DRAM_ADDR=la[f'{proj}_scale'], gpr_M_reg=Mreg, **ka, **kw)
+
+        def sh_rms(ue, A, OUT, gamma):
+            ka = {}
+            if sharded:
+                pf_addr(ue, self.PF_GPR_ADDR_A, A, H * bpe)
+                pf_addr(ue, self.PF_GPR_ADDR_OUT, OUT, H * bpe)
+                ka = dict(gpr_a_addr=self.PF_GPR_ADDR_A, gpr_out_addr=self.PF_GPR_ADDR_OUT)
+            ue.rms_norm_core_dram(M=PM, N=H, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=OUT,
+                GAMMA_DRAM_ADDR=gamma, gpr_M_reg=Mreg, **ka)
+
+        def sh_elt(ue, a, b, out, N, mode):
+            """Sharded eltwise. All THREE operands take the row offset: this is a flat
+            row-wise op, so element i of b pairs with element i of a."""
+            pitch = N * bpe
+            pf_addr(ue, self.PF_GPR_ADDR_A, a, pitch)
+            pf_addr(ue, self.PF_GPR_ADDR_B, b, pitch)
+            pf_addr(ue, self.PF_GPR_ADDR_OUT, out, pitch)
+            ue.eltwise_core_dram(M=PM, N=N, dram_a=a, dram_b=b, dram_out=out, mode=mode,
+                gpr_M_reg=Mreg, gpr_a_addr=self.PF_GPR_ADDR_A,
+                gpr_b_addr=self.PF_GPR_ADDR_B, gpr_out_addr=self.PF_GPR_ADDR_OUT)
+
+        def strided_copy(ue, src, src_jump, dst, dst_jump, rows, width):
             # static [rows, width] copy: strided gather -> contiguous SRAM -> strided scatter
-            self.accelerator_memory_to_sram(src, 0x00000, rows * width,
+            ue.accelerator_memory_to_sram(src, 0x00000, rows * width,
                 stride_bytes_per_chunk=width * bpe, stride_jump_bytes=src_jump)
-            self.sram_to_accelerator_memory(0x00000, dst, rows * width,
+            ue.sram_to_accelerator_memory(0x00000, dst, rows * width,
                 stride_bytes_per_chunk=width * bpe, stride_jump_bytes=dst_jump)
 
-        def duplicate_gqa_rows(src_sram_addr, dst_dram_addr):
+        def duplicate_gqa_rows(ue, src_sram_addr, dst_dram_addr):
             # token-major duplication: dst row t*G+g = src row t (kv head broadcast across the group)
             row_bytes = D * bpe
             row_uram_words = row_bytes // (UE_VECTOR_SIZE * bpe)
-            _, src_uram_addr = self.sram_address_to_uram_address(src_sram_addr)
-            ptr = self.alloc_inst_ptr()
-            self.generate_instruction_pbi_init(dram_shared_addr=dst_dram_addr, dma_length=row_bytes,
+            _, src_uram_addr = ue.sram_address_to_uram_address(src_sram_addr)
+            ptr = ue.alloc_inst_ptr()
+            ue.generate_instruction_pbi_init(dram_shared_addr=dst_dram_addr, dma_length=row_bytes,
                 output_size=0, uram_length=0, uram_a_start_addr=src_uram_addr,
                 uram_b_start_addr=src_uram_addr, uram_wb_addr=0, uram_dst_addr=0,
                 fmax_context_addr=0, inst_pointer_idx=ptr)
-            self.loop_start(loop_cnt=PM)
-            self.loop_start(G)
-            self.sram_to_accelerator_memory(sram_address=0, accelerator_dram_address=row_bytes,
+            ue.loop_start(loop_cnt=PM)
+            ue.loop_start(G)
+            ue.sram_to_accelerator_memory(sram_address=0, accelerator_dram_address=row_bytes,
                 element_size=D, inst_pointer_idx=ptr, memcpy_length_bytes=0)
-            self.loop_end()
-            self.generate_instruction_pbi_inc(dram_shared_addr=0, dma_length=0, output_size=0,
+            ue.loop_end()
+            ue.generate_instruction_pbi_inc(dram_shared_addr=0, dma_length=0, output_size=0,
                 uram_length=0, uram_a_start_addr=row_uram_words, uram_b_start_addr=row_uram_words,
                 uram_wb_addr=0, uram_dst_addr=0, fmax_context_addr=0, inst_pointer_idx=ptr)
-            self.loop_end()
-            self.release_inst_ptr(ptr)
+            ue.loop_end()
+            ue.release_inst_ptr(ptr)
 
-        # Scratch ISA regs start past the fixed gpr regs (1..6) so rope/flash scratch don't clobber them.
-        self._isa_reg_counter = max(self._cfg["fixed_isa_regs"].values()) + 1
+        def barrier():
+            if sharded:
+                sched.barrier()
+
+        # ---- region A: residual + input norm + q/k/v (ROW-sharded) ----
+        def emit_A(ue, layer_idx, la, h_in):
+            if layer_idx == 0:
+                sh_rms(ue, h_in, self.LAYER0_PRE_NORM_DRAM, la['ln1_gamma'])
+            else:
+                if sharded:
+                    sh_elt(ue, self.LAYER0_RESIDUAL_DRAM, self.LAYER0_MLP_DOWN_DRAM, h_in,
+                           H, UE_MODE.ELTWISE_ADD)
+                else:
+                    ue.eltwise_core_dram(M=PM, N=H, dram_a=self.LAYER0_RESIDUAL_DRAM,
+                        dram_b=self.LAYER0_MLP_DOWN_DRAM, dram_out=h_in, mode=UE_MODE.ELTWISE_ADD,
+                        gpr_M_reg=Mreg)
+                sh_rms(ue, h_in, self.LAYER0_PRE_NORM_DRAM, la['ln1_gamma'])
+            sh_mm(ue, H, H,  self.LAYER0_PRE_NORM_DRAM, 'q', la, self.LAYER0_Q_DRAM,
+                  H * bpe, H * bpe)
+            sh_mm(ue, H, KV, self.LAYER0_PRE_NORM_DRAM, 'k', la, self.LAYER0_K_PROJ_DRAM,
+                  H * bpe, KV * bpe)
+            sh_mm(ue, H, KV, self.LAYER0_PRE_NORM_DRAM, 'v', la, self.LAYER0_V_PROJ_DRAM,
+                  H * bpe, KV * bpe)
+
+        # ---- region B: KV cache staging + GQA attention (GROUP-sharded, FULL S) ----
+        def emit_B(ue, eidx, layer_idx):
+            my = groups[eidx]
+            FQ = sched.per_engine_addr("pf_flash_q", eidx) if sharded else self.FLASH_Q_DRAM
+            FK = sched.per_engine_addr("pf_flash_k", eidx) if sharded else self.FLASH_K_DRAM
+            FV = sched.per_engine_addr("pf_flash_v", eidx) if sharded else self.FLASH_V_DRAM
+            FO = sched.per_engine_addr("pf_flash_out", eidx) if sharded else self.FLASH_OUT_DRAM
+            FS = (sched.per_engine_addr("pf_flash_scratch", eidx) if sharded
+                  else self.FLASH_SCRATCH_DRAM)
+            # K per kv-head -> decoder KV cache (contiguous [PM,D]) + RoPE
+            for h in my:
+                k_cache = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
+                strided_copy(ue, self.LAYER0_K_PROJ_DRAM + h * D * bpe, KV * bpe, k_cache, D * bpe, PM, D)
+                ue.rope_hf_core_dram(M=PM, N=D, input_dram_addr=k_cache, output_dram_addr=k_cache,
+                    cos_dram_addr=self.ROPE_PACKED_DRAM, sin_dram_addr=self.ROPE_PACKED_DRAM + D * bpe,
+                    gpr_M_reg=self.gpr_seq_len)
+            # V per kv-head -> decoder KV cache (no RoPE)
+            for h in my:
+                v_cache = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
+                strided_copy(ue, self.LAYER0_V_PROJ_DRAM + h * D * bpe, KV * bpe, v_cache, D * bpe, PM, D)
+            # Per kv-group GQA: stack Q token-major, rope, duplicate K/V, one bucket flash, un-stack
+            for kv_b in my:
+                k_cache = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
+                v_cache = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
+                for g in range(G):
+                    strided_copy(ue, self.LAYER0_Q_DRAM + (kv_b * G + g) * D * bpe, H * bpe,
+                                 FQ + g * D * bpe, G * D * bpe, PM, D)
+                ue.rope_hf_core_dram(M=PM * G, N=D, input_dram_addr=FQ,
+                    output_dram_addr=FQ, cos_dram_addr=self.ROPE_PACKED_GQA_DRAM,
+                    sin_dram_addr=self.ROPE_PACKED_GQA_DRAM + D * bpe, gpr_M_reg=self.gpr_q_seq_len)
+                ue.accelerator_memory_to_sram(k_cache, 0x10000, PM * D)
+                duplicate_gqa_rows(ue, 0x10000, FK)
+                ue.accelerator_memory_to_sram(v_cache, 0x20000, PM * D)
+                duplicate_gqa_rows(ue, 0x20000, FV)
+                ue.unified_attention_core(batch=PM * G, aligned_seq_len=qmax, head_dim=D,
+                    Q_DRAM_ADDR=FQ, K_DRAM_ADDR=FK, V_DRAM_ADDR=FV,
+                    BIAS_DRAM_ADDR=self.FLASH_BIAS_DRAM,
+                    OUTPUT_DRAM_ADDR=FO, SCRATCH_DRAM_ADDR=FS,
+                    IDENTITY_DRAM_ADDR=self.identity_addr,
+                    gpr_batch_reg=self.gpr_q_seq_len,
+                    gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len)
+                for g in range(G):
+                    strided_copy(ue, FO + g * D * bpe, G * D * bpe,
+                                 self.LAYER0_ATTN_RESULT_DRAM + (kv_b * G + g) * D * bpe, H * bpe, PM, D)
+
+        # ---- region C: o proj + residual + post-norm + MLP (ROW-sharded) ----
+        def emit_C(ue, layer_idx, la, h_in, h_out):
+            sh_mm(ue, H, H, self.LAYER0_ATTN_RESULT_DRAM, 'o', la, self.LAYER0_O_PROJ_DRAM,
+                  H * bpe, H * bpe)
+            if sharded:
+                sh_elt(ue, h_in, self.LAYER0_O_PROJ_DRAM, self.LAYER0_RESIDUAL_DRAM,
+                       H, UE_MODE.ELTWISE_ADD)
+            else:
+                ue.eltwise_core_dram(M=PM, N=H, dram_a=h_in, dram_b=self.LAYER0_O_PROJ_DRAM,
+                    dram_out=self.LAYER0_RESIDUAL_DRAM, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=Mreg)
+            sh_rms(ue, self.LAYER0_RESIDUAL_DRAM, self.LAYER0_PRE_NORM_DRAM, la['ln2_gamma'])
+            sh_mm(ue, H, I, self.LAYER0_PRE_NORM_DRAM, 'gate', la, self.LAYER0_MLP_GATE_DRAM,
+                  H * bpe, I * bpe, silu_enable=True)
+            sh_mm(ue, H, I, self.LAYER0_PRE_NORM_DRAM, 'up', la, self.LAYER0_MLP_UP_DRAM,
+                  H * bpe, I * bpe)
+            if sharded:
+                sh_elt(ue, self.LAYER0_MLP_GATE_DRAM, self.LAYER0_MLP_UP_DRAM,
+                       self.LAYER0_MLP_MULT_DRAM, I, UE_MODE.ELTWISE_MUL)
+            else:
+                eltwise_mul_core_dram(ue, size=PM * I,
+                    A_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM)
+            sh_mm(ue, I, H, self.LAYER0_MLP_MULT_DRAM, 'down', la, self.LAYER0_MLP_DOWN_DRAM,
+                  I * bpe, H * bpe)
+            # MLP residual: materialize the last layer's output (the inner layers fuse it into the
+            # next layer's input norm; the last one is written out explicitly so the postamble can
+            # read it).
+            if layer_idx == self.NUM_LAYERS - 1:
+                if sharded:
+                    sh_elt(ue, self.LAYER0_RESIDUAL_DRAM, self.LAYER0_MLP_DOWN_DRAM, h_out,
+                           H, UE_MODE.ELTWISE_ADD)
+                else:
+                    eltwise_add_core_dram(ue, size=PM * H,
+                        A_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                        OUTPUT_DRAM_ADDR=h_out)
+
         self.start_capture()
+        if sharded:
+            sched.begin_program()
         prefill_addr = self.get_program_dram_addr()
+        # Scratch ISA regs start past the fixed gpr regs (1..6) so rope/flash scratch don't clobber
+        # them; when sharded they must also clear the five shard regs (7..11).
+        _scratch_base = (self.PF_ISA_SCRATCH_BASE if sharded
+                         else max(self._cfg["fixed_isa_regs"].values()) + 1)
+        for ue in engines:
+            ue._isa_reg_counter = _scratch_base
+        # ENTRY RENDEZVOUS -- NOT optional, and the reason prefill sharding first
+        # produced garbage. run_prefill launches the workers BEFORE the primary runs its
+        # preamble, and that preamble is what writes LAYER0_INPUT_DRAM (the on-device
+        # embed gather + vision merge). Without this barrier every worker charges into
+        # layer 0 region A and normalizes embeddings THAT HAVE NOT BEEN WRITTEN YET.
+        #
+        # It hid well: give engine 0 the full row range and the bug vanishes, because
+        # engine 0 -- delayed by running the preamble -- overwrites every row the worker
+        # got wrong. Only a real disjoint split leaves the worker's garbage in place.
+        # The encoder never needed this: its input arrives by host DMA before launch and
+        # its primary-only patch embed is followed by a rendezvous.
+        barrier()
         for layer_idx in range(self.NUM_LAYERS):
             la = self.lm_layer_addrs[layer_idx]
             h_in  = self.LAYER0_INPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_OUTPUT_DRAM
             h_out = self.LAYER0_OUTPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_INPUT_DRAM
-            # Input layernorm (fused with previous layer's MLP residual for layers 1+)
-            # PBI per-row norms (gpr_M_reg=gpr_seq_len) — hardware row loop, not a static-M unroll
-            # (that unrolled rms_norm_core_dram_post_add was 1.49 MiB of the prefill). The fused
-            # residual+norm is split into eltwise (residual sum) + rms_norm, both PBI, like qwen2.5.
-            if layer_idx == 0:
-                self.rms_norm_core_dram(M=PM, N=H, A_DRAM_ADDR=h_in,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'],
-                    gpr_M_reg=self.gpr_seq_len)
-            else:
-                self.eltwise_core_dram(M=PM, N=H, dram_a=self.LAYER0_RESIDUAL_DRAM,
-                    dram_b=self.LAYER0_MLP_DOWN_DRAM, dram_out=h_in, mode=UE_MODE.ELTWISE_ADD,
-                    gpr_M_reg=self.gpr_seq_len)
-                self.rms_norm_core_dram(M=PM, N=H, A_DRAM_ADDR=h_in,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'],
-                    gpr_M_reg=self.gpr_seq_len)
-            # Q/K/V projections
-            lm_matmul(PM, H, H,  self.LAYER0_PRE_NORM_DRAM, 'q', la, self.LAYER0_Q_DRAM)
-            lm_matmul(PM, H, KV, self.LAYER0_PRE_NORM_DRAM, 'k', la, self.LAYER0_K_PROJ_DRAM)
-            lm_matmul(PM, H, KV, self.LAYER0_PRE_NORM_DRAM, 'v', la, self.LAYER0_V_PROJ_DRAM)
-            # K per kv-head -> decoder KV cache (contiguous [PM,D]) + RoPE
-            for h in range(self.NUM_KV_HEADS):
-                k_cache = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
-                strided_copy(self.LAYER0_K_PROJ_DRAM + h * D * bpe, KV * bpe, k_cache, D * bpe, PM, D)
-                self.rope_hf_core_dram(M=PM, N=D, input_dram_addr=k_cache, output_dram_addr=k_cache,
-                    cos_dram_addr=self.ROPE_PACKED_DRAM, sin_dram_addr=self.ROPE_PACKED_DRAM + D * bpe,
-                    gpr_M_reg=self.gpr_seq_len)
-            # V per kv-head -> decoder KV cache (no RoPE)
-            for h in range(self.NUM_KV_HEADS):
-                v_cache = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
-                strided_copy(self.LAYER0_V_PROJ_DRAM + h * D * bpe, KV * bpe, v_cache, D * bpe, PM, D)
-            # Per kv-group GQA: stack Q token-major, rope, duplicate K/V, one bucket flash, un-stack
-            for kv_b in range(self.NUM_KV_HEADS):
-                k_cache = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
-                v_cache = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE + kv_b * self.KV_HEAD_STRIDE
-                # gather the group's 3 q-heads into token-major FLASH_Q (row t*G+g = q-head kv_b*G+g)
-                for g in range(G):
-                    strided_copy(self.LAYER0_Q_DRAM + (kv_b * G + g) * D * bpe, H * bpe,
-                                 self.FLASH_Q_DRAM + g * D * bpe, G * D * bpe, PM, D)
-                # rope stacked Q over M=PM*G using the token-major-duplicated table
-                self.rope_hf_core_dram(M=PM * G, N=D, input_dram_addr=self.FLASH_Q_DRAM,
-                    output_dram_addr=self.FLASH_Q_DRAM, cos_dram_addr=self.ROPE_PACKED_GQA_DRAM,
-                    sin_dram_addr=self.ROPE_PACKED_GQA_DRAM + D * bpe, gpr_M_reg=self.gpr_q_seq_len)
-                # duplicate K/V rows token-major into the flash buffers
-                self.accelerator_memory_to_sram(k_cache, 0x10000, PM * D)
-                duplicate_gqa_rows(0x10000, self.FLASH_K_DRAM)
-                self.accelerator_memory_to_sram(v_cache, 0x20000, PM * D)
-                duplicate_gqa_rows(0x20000, self.FLASH_V_DRAM)
-                self.unified_attention_core(batch=PM * G, aligned_seq_len=qmax, head_dim=D,
-                    Q_DRAM_ADDR=self.FLASH_Q_DRAM, K_DRAM_ADDR=self.FLASH_K_DRAM,
-                    V_DRAM_ADDR=self.FLASH_V_DRAM, BIAS_DRAM_ADDR=self.FLASH_BIAS_DRAM,
-                    OUTPUT_DRAM_ADDR=self.FLASH_OUT_DRAM, SCRATCH_DRAM_ADDR=self.FLASH_SCRATCH_DRAM,
-                    IDENTITY_DRAM_ADDR=self.identity_addr,
-                    gpr_batch_reg=self.gpr_q_seq_len,
-                    gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len)
-                # un-stack FLASH_OUT [PM,G,D] -> ATTN_RESULT [PM,H] at this group's head columns
-                for g in range(G):
-                    strided_copy(self.FLASH_OUT_DRAM + g * D * bpe, G * D * bpe,
-                                 self.LAYER0_ATTN_RESULT_DRAM + (kv_b * G + g) * D * bpe, H * bpe, PM, D)
-            # O projection + residual + RMS norm
-            lm_matmul(PM, H, H, self.LAYER0_ATTN_RESULT_DRAM, 'o', la, self.LAYER0_O_PROJ_DRAM)
-            self.eltwise_core_dram(M=PM, N=H, dram_a=h_in, dram_b=self.LAYER0_O_PROJ_DRAM,
-                dram_out=self.LAYER0_RESIDUAL_DRAM, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self.gpr_seq_len)
-            self.rms_norm_core_dram(M=PM, N=H, A_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM,
-                OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln2_gamma'],
-                gpr_M_reg=self.gpr_seq_len)
-            # MLP: gate+SiLU, up, gate*up, down
-            lm_matmul(PM, H, I, self.LAYER0_PRE_NORM_DRAM, 'gate', la, self.LAYER0_MLP_GATE_DRAM, silu_enable=True)
-            lm_matmul(PM, H, I, self.LAYER0_PRE_NORM_DRAM, 'up', la, self.LAYER0_MLP_UP_DRAM)
-            eltwise_mul_core_dram(self, size=PM * I,
-                A_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                OUTPUT_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM)
-            lm_matmul(PM, I, H, self.LAYER0_MLP_MULT_DRAM, 'down', la, self.LAYER0_MLP_DOWN_DRAM)
-            # MLP residual: materialize the last layer's output (the inner layers fuse it into the next
-            # layer's input norm; the last one is written out explicitly so the postamble can read it).
-            if layer_idx == self.NUM_LAYERS - 1:
-                eltwise_add_core_dram(self, size=PM * H,
-                    A_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM, B_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                    OUTPUT_DRAM_ADDR=h_out)
+            for ue in engines:
+                emit_A(ue, layer_idx, la, h_in)
+            barrier()
+            for eidx, ue in enumerate(engines):
+                emit_B(ue, eidx, layer_idx)
+            barrier()
+            for ue in engines:
+                emit_C(ue, layer_idx, la, h_in, h_out)
+            barrier()
+            # alloc_isa_reg/release_isa_reg are a bump allocator on a shared counter.
+            # If any core released more than it allocated, the counter would drift DOWN
+            # into 7..11 and a later scratch allocation would silently overwrite this
+            # engine's row offset -- finite, plausible, wrong output. Check per layer,
+            # where the message still names the layer.
+            if sharded:
+                for _e, _u in enumerate(engines):
+                    assert _u._isa_reg_counter >= self.PF_ISA_SCRATCH_BASE, (
+                        f'engine {_e} ISA counter drifted to {_u._isa_reg_counter} at layer '
+                        f'{layer_idx}, below the shard registers '
+                        f'({self.PF_ISA_SCRATCH_BASE}); scratch would clobber the row offset')
         self.generate_instruction_halt()
+        if sharded:
+            # Halts + flushes every WORKER program, then reserves each worker a preamble
+            # slot. run_prefill rewrites those preambles per run with this run's row split
+            # and jumps into the worker program -- that indirection is what lets ONE
+            # compiled program serve any sequence length.
+            self._pf_worker_prog_addrs = sched.finalize()
+            self._pf_worker_preamble_addrs = []
+            for _wi, w in enumerate(sched.workers):
+                _a = w.get_program_dram_addr()
+                w.allocate_program_dram(256)
+                self._pf_worker_preamble_addrs.append(_a)
+                # Worker programs ACCUMULATE across stages in one shared allocator
+                # (encoder, then prefill). Overflowing the arena slice would write this
+                # program over the NEXT worker's -- a desync, and a hang at the first
+                # rendezvous rather than an error.
+                _slice_end = (self._vis_worker_arena
+                              + (_wi + 1) * self.VIS_WORKER_ARENA_BYTES)
+                assert w.get_program_dram_addr() <= _slice_end, (
+                    f'worker {_wi} programs reach 0x{w.get_program_dram_addr():X}, past its '
+                    f'arena slice end 0x{_slice_end:X}; raise VIS_WORKER_ARENA_BYTES')
         self.stop_capture()
         self.write_captured_instructions_to_dram(prefill_addr)
         size_bytes = self.get_capture_instruction_size_bytes()
@@ -1149,8 +1479,13 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self.allocate_program_dram(4096)
         # Final hidden lands in the buffer matching the layer ping-pong parity.
         self._prefill_final_buf = self.LAYER0_INPUT_DRAM if self.NUM_LAYERS % 2 == 0 else self.LAYER0_OUTPUT_DRAM
+        _extra = ""
+        if sharded:
+            _wl = [w.get_capture_instruction_size_bytes() for w in sched.workers]
+            _extra = (f" + {len(_wl)} worker program(s) {_wl} bytes, engines={ne}, "
+                      f"kv-groups per engine {[len(g) for g in groups]}")
         print(f"    Prefill compiled @0x{prefill_addr:X}: {size_bytes} bytes, "
-              f"unified_attention_core, PM={PM}, qmax={qmax}")
+              f"unified_attention_core, PM={PM}, qmax={qmax}{_extra}")
 
     def _restore_unified_addrs(self, meta: dict) -> None:
         """Set the program/preamble addresses the run_* methods read, from the unified-bin meta."""
@@ -1208,7 +1543,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         # PRIMARY's allocator only, so a cached bin is by definition the
         # single-engine encoder and replaying it would run the unsharded program
         # with no worker programs behind it.
-        if int(self.NUM_ENGINES) == 1 and os.path.exists(uni_bin) and os.path.exists(uni_meta):
+        if not self._is_sharded() and os.path.exists(uni_bin) and os.path.exists(uni_meta):
             with open(uni_meta) as f:
                 meta = json.load(f)
             if all(meta.get(k) == v for k, v in sig.items()) and "segments" in meta:
@@ -1262,7 +1597,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         # primary's segments -- no worker programs -- so run_from_bin would replay the
         # primary half of a sharded encoder with the workers never launched: it would
         # read rows nobody wrote and silently encode part of the image.
-        if int(self.NUM_ENGINES) > 1:
+        if self._is_sharded():
             print(f'  NOT writing programs{artifact_suffix or ""}.bin: NUM_ENGINES='
                   f'{self.NUM_ENGINES} (worker programs are not representable in '
                   f'programs.json). Re-run with --engines 1 to produce a bin.')
@@ -1325,12 +1660,46 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self.generate_instruction_add_set(self.gpr_seq_len, seq_len)
         self.generate_instruction_add_set(self.gpr_q_seq_len, qS)
         self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_q)
+        # THE RUNTIME ROW SPLIT. gpr_seq_len above stays the FULL length (region B is
+        # group-sharded and runs every row); these two carry THIS engine's row block,
+        # which is why one captured program serves any sequence length.
+        _pf_sched = self._pf_sched
+        _pf_multi = _pf_sched is not None and _pf_sched.num_engines > 1
+        if _pf_multi:
+            _split = self._pf_split_rows(seq_len, _pf_sched.num_engines)
+            self.generate_instruction_add_set(self.PF_GPR_SHARD_ROWS, _split[0][1])
+            self.generate_instruction_add_set(self.PF_GPR_ROW_OFF, _split[0][0])
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(self._prefill_addr))
         self.stop_capture()
         self.write_captured_instructions_to_dram(self._prefill_preamble_addr)
         self.clear_capture_buffer()
+        if _pf_multi:
+            # One preamble per worker, rewritten every run: prime the full-length
+            # registers region B needs, this worker's row block, then jump into its
+            # compiled program.
+            for _wi, _w in enumerate(_pf_sched.workers):
+                _off, _rows = _split[_wi + 1]
+                _w.clear_inst_id()
+                _w.start_capture()
+                _w.generate_instruction_add_set(self.gpr_seq_len, seq_len)
+                _w.generate_instruction_add_set(self.gpr_q_seq_len, qS)
+                _w.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_q)
+                _w.generate_instruction_add_set(self.PF_GPR_SHARD_ROWS, _rows)
+                _w.generate_instruction_add_set(self.PF_GPR_ROW_OFF, _off)
+                _w.generate_instruction_jump_abs(
+                    ue_35bit_addr_shifter(self._pf_worker_prog_addrs[_wi]))
+                _w.stop_capture()
+                _w.write_captured_instructions_to_dram(self._pf_worker_preamble_addrs[_wi])
+                _w.clear_capture_buffer()
+            if not self._vis_flags_precleared:
+                _pf_sched.preclear_flags()
+                self._vis_flags_precleared = True
+            _pf_sched.start_workers(self._pf_worker_preamble_addrs)
         self.start_execute_from_dram(self._prefill_preamble_addr)
         self.wait_queue(180.0)
+        if _pf_multi:
+            for _w in _pf_sched.workers:
+                _w.wait_queue(180.0)
         # Static prefill writes epsilon-derived KV rows through PREFILL_MAX.
         # Retain real tokens and clear every remaining context row before decode.
         self._zero_runtime_attention_state(
@@ -1367,6 +1736,98 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             self._last_total_flops = None
         return self.get_arg_max_index()
 
+    def _emit_decode_gate_up(self, la, lm_matmul, H, I, bpe):
+        """gate + up + the silu*up multiply, optionally N-split over DECODE_NUM_ENGINES.
+
+        WHY THIS BLOCK AND NOTHING ELSE. Decode is M=1, so every linear is a GEMV
+        with no weight reuse: cost is bytes streamed from DRAM, and gate+up are
+        2.62 of the 5.24 MB a layer reads -- half the traffic. They are also the
+        only decode linears whose N divides cleanly: I=2560 is 40 blocks of 64, so
+        2/4/8 engines split exactly even. q (N=960) and k/v (N=320) are 15 and 5
+        blocks and split unevenly; o and down are K-fat and would need split_k plus
+        host-sliced weights.
+
+        AN N-SPLIT DOES NOT REDUCE TOTAL DRAM TRAFFIC. Each engine reads half of B,
+        so the bytes moved across the pair are identical to one engine reading all
+        of it. This is only a win if the current ceiling is per-engine issue rate
+        or AXI port, not the memory controller. Measured single-engine decode is
+        ~192 MB/token at ~12 tok/s = ~2.3 GB/s against a 256-bit/198 MHz AXI
+        (~6.35 GB/s), i.e. ~36% of peak -- suggestive but not proof. That is what
+        this exists to measure.
+
+        WHY NO PER-ENGINE OUTPUT BUFFERS. At M=1 a column block of a [1, N] buffer
+        IS a contiguous byte range, and matmat's writeback stride is the N it was
+        given, so each engine writes cols dense elements at OUT + col_offset*bpe --
+        directly into the shared buffer, no alloc_col_output, no gather. The silu*up
+        multiply is elementwise, so it stays in lane too: gate, up and the multiply
+        run with ZERO barriers between them. The region rejoins only for `down`,
+        which reads the full [1, I] intermediate.
+
+        Cost: 2 rendezvous per layer x 32 layers = 64 per TOKEN, against ~2.6 ms of
+        work per layer. That is a far higher barrier rate relative to work than the
+        encoder's 24 per image, and it is the main reason this may not pay off.
+        """
+        ne = int(self.DECODE_NUM_ENGINES)
+        if ne <= 1:
+            # Byte-identical to the historical stream.
+            lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'gate', la, self.LAYER0_MLP_GATE_DRAM, silu_enable=True)
+            lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'up',   la, self.LAYER0_MLP_UP_DRAM)
+            self.accelerator_memory_to_sram(self.LAYER0_MLP_GATE_DRAM, 0x10000, I)
+            self.accelerator_memory_to_sram(self.LAYER0_MLP_UP_DRAM,   0x90000, I)
+            self.eltwise_mul_core(0x10000, 0x90000, 0x10000, I)
+            self.sram_to_accelerator_memory(0x10000, self.LAYER0_MLP_MULT_DRAM, I)
+            return
+
+        from user_dma_core import TYPE
+        deterministic = bool(getattr(self, "decode_matmat_mul_core_enable", False))
+
+        # DIAGNOSTIC: SMOLVLM2_DECODE_BARRIER_ONLY=1 makes every engine emit the FULL
+        # gate/up/mul instead of its column slice -- same inputs, same weights, same
+        # addresses, so the concurrent writes are byte-identical and benign. The work is
+        # therefore redundant, not divided: the run pays every rendezvous and gains
+        # nothing. Timing it against --decode-engines 1 isolates pure barrier cost, which
+        # is what separates "the DRAM controller is the ceiling" from "the barriers ate
+        # the win" -- two conclusions with opposite implications for decode sharding.
+        barrier_only = os.environ.get("SMOLVLM2_DECODE_BARRIER_ONLY") == "1"
+
+        def _body(ctx):
+            # quantized_matmat_core and the SRAM ops are not on SHARDED_OP_ALLOWLIST
+            # (which names a 'quantized_matmat_mul_core' that does not exist in
+            # user_dma_core -- the real names are quantized_matmat_core{,_legacy,
+            # _dynamic}). Use the documented escape hatch rather than editing a
+            # library pi05 also depends on.
+            ue = ctx.unsafe_ue
+            nc = I if barrier_only else ctx.cols
+            off = 0 if barrier_only else ctx.col_offset * bpe
+            for proj, dst in (('gate', self.LAYER0_MLP_GATE_DRAM),
+                              ('up',   self.LAYER0_MLP_UP_DRAM)):
+                act = {'silu_enable': True} if proj == 'gate' else {}
+                # b_addr/scale_addr own the IF4 offsets: B is nibble-packed so the
+                # slice is (n0*K)//2 bytes in, while the scale blob is one bf16 per
+                # 64 elements of the flattened (N,K) weight -> ((n0*K)//64)*2. K=960
+                # is 15 whole 64-blocks, which is what makes the scale stride linear.
+                B = (la[f'{proj}_data'] if barrier_only
+                     else ctx.b_addr(la[f'{proj}_data'], H, data_type=TYPE.IF4))
+                SC = (la[f'{proj}_scale'] if barrier_only
+                      else ctx.scale_addr(la[f'{proj}_scale'], H))
+                if deterministic:
+                    ue.matmat_mul_core(M=1, K=H, N=nc, A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                        B_DRAM_ADDR=B, OUTPUT_DRAM_ADDR=dst + off, is_B_quantized=True,
+                        data_type=TYPE.IF4, SCALE_DRAM_ADDR=SC, **act)
+                else:
+                    ue.quantized_matmat_core(M=1, K=H, N=nc, A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                        B_DRAM_ADDR=B, OUTPUT_DRAM_ADDR=dst + off, SCALE_DRAM_ADDR=SC,
+                        data_type=TYPE.IF4, **act)
+            # Elementwise, so it stays in this engine's column lane. Each engine has
+            # its own SRAM, so the fixed 0x10000/0x90000 staging addresses do not
+            # collide across engines.
+            ue.accelerator_memory_to_sram(self.LAYER0_MLP_GATE_DRAM + off, 0x10000, nc)
+            ue.accelerator_memory_to_sram(self.LAYER0_MLP_UP_DRAM + off, 0x90000, nc)
+            ue.eltwise_mul_core(0x10000, 0x90000, 0x10000, nc)
+            ue.sram_to_accelerator_memory(0x10000, self.LAYER0_MLP_MULT_DRAM + off, nc)
+
+        self._lm_sched.col_sharded_region(I, _body, join=True)
+
     def compile_decoder(self) -> None:
         """Compile single decoder program with runtime KV length via unified_attention_core."""
         from user_dma_core import TYPE
@@ -1396,6 +1857,10 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         _SILENT_MODE = True
         self.clear_inst_id()
         self.start_capture()
+        ne_dec = int(self.DECODE_NUM_ENGINES)
+        lm_sched = self._lm_make_scheduler(ne_dec) if ne_dec > 1 else None
+        if lm_sched is not None:
+            lm_sched.begin_program()
         for layer_idx in range(self.NUM_LAYERS):
             la = self.lm_layer_addrs[layer_idx]
             h_in  = self.LAYER0_INPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_OUTPUT_DRAM
@@ -1482,12 +1947,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 NORMOUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                 GAMMA_DRAM_ADDR=la['ln2_gamma'])
             # MLP
-            lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'gate', la, self.LAYER0_MLP_GATE_DRAM, silu_enable=True)
-            lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'up',   la, self.LAYER0_MLP_UP_DRAM)
-            self.accelerator_memory_to_sram(self.LAYER0_MLP_GATE_DRAM, 0x10000, I)
-            self.accelerator_memory_to_sram(self.LAYER0_MLP_UP_DRAM,   0x90000, I)
-            self.eltwise_mul_core(0x10000, 0x90000, 0x10000, I)
-            self.sram_to_accelerator_memory(0x10000, self.LAYER0_MLP_MULT_DRAM, I)
+            self._emit_decode_gate_up(la, lm_matmul, H, I, bpe)
             lm_matmul(1, I, H, self.LAYER0_MLP_MULT_DRAM, 'down', la, self.LAYER0_MLP_DOWN_DRAM)
             # MLP residual
             self.accelerator_memory_to_sram(self.LAYER0_RESIDUAL_DRAM,  0x10000, H)
@@ -1518,6 +1978,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         # Advance token position on-device so next decode step writes to the right KV slot
         self.generate_instruction_add_inc(self.gpr_seq_len)
         self.generate_instruction_halt()
+        if lm_sched is not None:
+            self._lm_worker_prog_addrs = lm_sched.finalize()
         self.stop_capture()
         for _ in range(_NUM_FIXED_REGS):
             self.release_isa_reg()
@@ -1824,6 +2286,18 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         # Emit the prefill seed token now (after scroll-region setup, so it isn't clobbered).
         _original_print(self.tokenizer.decode([token_id]), end="", flush=True)
 
+        _lm_sched = self._lm_sched
+        _lm_multi = _lm_sched is not None and _lm_sched.num_engines > 1
+        if _lm_multi:
+            # Flags survive a killed run, and with --lm-enable the encoder never ran
+            # to clear them. Clear once before the first token's rendezvous.
+            # Under _SILENT_MODE: preclear_flags captures and runs a 2-instruction
+            # program per engine, and builtins.print is globally routed through
+            # _quiet_print -- so without this the core's capture/DMA chatter lands in
+            # the middle of the generated text.
+            _SILENT_MODE = True
+            _lm_sched.preclear_flags()
+            _SILENT_MODE = False
         while len(generated) < max_new_tokens and self.seq_len < self.max_seq_len:
             _SILENT_MODE = True
             self.seq_len += 1
@@ -1857,8 +2331,15 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             if _fpga_penalty and len(generated) >= _greedy_until:
                 self._write_penalty_bias(self._generated_tokens)
 
+            if _lm_multi:
+                # The worker program halts at the end of every token, so it has to be
+                # relaunched each step -- one register write per worker per token.
+                _lm_sched.start_workers(self._lm_worker_prog_addrs)
             self.start_execute_from_dram(preamble_addr)
             self.wait_queue(30.0)
+            if _lm_multi:
+                for _w in _lm_sched.workers:
+                    _w.wait_queue(30.0)
 
             # Greedy decode reads the HW argmax register, updated from the live LM-head output (no logit
             # readback).
@@ -1960,6 +2441,23 @@ def main():
                 f"--engines must be 1-{_MAX_ENGINES}, got {n}.")
         return n
     parser.add_argument(
+        "--prefill-engines", type=_engines_arg, default=None, metavar="N",
+        help="Row-shard the prefill LM across N engines. Defaults to --engines. Each "
+             "layer runs row-sharded residual/RMSNorm/q/k/v, then kv-GROUP-sharded "
+             "attention at full sequence length, then row-sharded o/MLP. The row split "
+             "is a RUNTIME value primed into GPRs, so one compiled program still serves "
+             "any sequence length. Must be <= --engines.",
+    )
+    parser.add_argument(
+        "--decode-engines", type=_engines_arg, default=1, metavar="N",
+        help="EXPERIMENT (default 1 = off). N-split the decode MLP's gate and up "
+             "projections across N engines -- half the per-layer weight bytes, and "
+             "the only decode linears whose N (2560) splits evenly. Decode is a "
+             "weight-streaming GEMV, so this reduces bytes read PER ENGINE but not "
+             "in TOTAL; it only wins if the ceiling is issue rate rather than the "
+             "DRAM controller. Must be <= --engines (workers are shared).",
+    )
+    parser.add_argument(
         "--engines", type=_engines_arg, default=2, metavar="N",
         help="Row-shard the vision encoder's whole layer body -- LayerNorms, q/k/v, "
              "attention, o, residuals, fc1, fc2 -- across N engines (1-8, default 2). "
@@ -1999,12 +2497,19 @@ def main():
     ue.zero_dram()
     ue.decode_matmat_mul_core_enable = bool(args.decode_matmat_mul_core_enable)
     ue.NUM_ENGINES = int(args.engines)
+    ue.DECODE_NUM_ENGINES = int(args.decode_engines)
+    ue.PREFILL_NUM_ENGINES = (None if args.prefill_engines is None
+                              else int(args.prefill_engines))
     ue.penalty_enable = not bool(args.greedy_enable)
     _original_print(f"decode_linear={ 'if4_matmat_mul_core' if ue.decode_matmat_mul_core_enable else 'quantized_matmat_core' }")
     _original_print(f"generation={ 'hardware_penalty' if ue.penalty_enable else 'greedy' }")
     _original_print(f"vision_encoder_engines={ue.NUM_ENGINES}"
                     + (" (full layer body row-sharded; compile-only, no bin)"
                        if ue.NUM_ENGINES > 1 else ""))
+    _original_print(f"decode_engines={ue.DECODE_NUM_ENGINES}"
+                    + (" (gate/up N-split)" if ue.DECODE_NUM_ENGINES > 1 else ""))
+    _original_print(f"prefill_engines={ue._prefill_engines()}"
+                    + (" (rows + kv-groups sharded)" if ue._prefill_engines() > 1 else ""))
     # Default is VLM (vision). The instruction bin is ALWAYS the full VLM bin (encoder+decoder+prefill) —
     # built once; this flag only decides whether the vision encoder actually RUNS this invocation.
     # --lm-enable (or --image none) selects pure LM-only text mode.
