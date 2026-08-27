@@ -877,10 +877,13 @@ class Gemma4VisionMixin:
                 worker_bytes = bytearray()
                 for inst in worker.capture_buffer:
                     worker_bytes.extend(inst.get_bytes())
-                # Uniform worker arena at every engine count: the slot is
-                # always one MULTICORE_WORKER_ISA_STRIDE, never the lower-2 GB
-                # LM_ISA_BASE the old 2-core special case ran up against.
-                worker_limit = worker_addr + self.MULTICORE_WORKER_ISA_STRIDE
+                # Uniform worker arena at every engine count. The bound is
+                # the END OF THIS WORKER'S SLOT, not worker_addr + stride: the
+                # shared worker pool makes each stage's program land AFTER the
+                # previous stage's inside the same slot, so a relative bound
+                # would silently license a spill into the next worker's slot.
+                worker_limit = (self.MULTICORE_WORKER_ISA_BASE
+                                + engine_idx * self.MULTICORE_WORKER_ISA_STRIDE)
                 if worker_addr + len(worker_bytes) > worker_limit:
                     raise RuntimeError(
                         f"vision core{engine_idx} ISA overflow: "

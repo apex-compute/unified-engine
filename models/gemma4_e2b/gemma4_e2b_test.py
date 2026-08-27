@@ -746,8 +746,20 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     bin, compiles prefill/decoder into one bin, runs prefill + decode. Numeric
     checks live in gemma4_e2b_numeric.py."""
 
-    def _ensure_stage_scheduler(self, stage: str, worker_dram_base: int):
-        """Return the shared two-engine scheduler configuration for one stage."""
+    def _ensure_stage_scheduler(self, stage: str, worker_dram_base: int = None):
+        """Return the multi-engine scheduler for one stage.
+
+        Every stage shares ONE worker-engine pool. That is a correctness
+        requirement, not an optimization (see MultiEngineScheduler.__init__):
+        each worker's DRAM allocators live in the UnifiedEngine object, so a
+        second scheduler built with FRESH worker objects restarts those
+        allocators at offset 0 and writes stage 2's worker programs on top of
+        stage 1's, at the same addresses. Stage 1 has already cached those
+        addresses, so its next launch runs stage 2's code: different barrier
+        count, instant desync, and the engines spin on a FLAG_CHECK that has no
+        timeout. Sharing the pool keeps one allocator per engine for the whole
+        run, so each stage's programs land AFTER the previous stage's.
+        """
         if self.multi_core == 1:
             return None
         scheduler = self._multi_core_schedulers.get(stage)
@@ -769,14 +781,20 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 worker_program_offset=0,
                 barrier_margin_nops=32,
                 allow_unaligned_rows=True,
-                allow_more_than_two_engines=self.multi_core > 2)
+                allow_more_than_two_engines=self.multi_core > 2,
+                workers=self._multi_core_worker_pool)
+            if self._multi_core_worker_pool is None:
+                # First stage built the engines; every later stage reuses them
+                # so the per-worker program allocator keeps advancing.
+                self._multi_core_worker_pool = scheduler.workers
             self._multi_core_schedulers[stage] = scheduler
         return scheduler
 
     def __init__(self, script_dir: str | None = None,
                  vision_kernel: str = "matmatmul", prefill_kernel: str = "streaming",
                  decode_kernel: str = "streaming", multi_core: int = 1,
-                 bin_reuse: bool = False):
+                 bin_reuse: bool = False, decode_shard_dummy: bool = False,
+                 decode_shard_oproj: bool = False):
         for stage, kernel in (("vision", vision_kernel), ("prefill", prefill_kernel),
                               ("decode", decode_kernel)):
             if kernel not in ("streaming", "matmatmul"):
@@ -805,7 +823,20 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # Program-image reuse: OFF by default (recompile programs.bin fresh every
         # run). --bin-reuse opts into reusing a matching cached section instead.
         self.bin_reuse = bin_reuse
+        # Decode-stage multi-engine SMOKE TEST: workers run a dummy memcpy inside
+        # a barrier-joined region at each layer's MLP phase while the master runs
+        # the real MLP unchanged. Proves the decode-stage fork/join plumbing
+        # (worker program compile + per-token launch + rendezvous) before any
+        # real decode work is sharded. Decode numerics MUST be bit-identical
+        # with it on and off.
+        self.decode_shard_dummy = decode_shard_dummy and multi_core > 1
+        # Decode-stage REAL sharding: the O projection (attention output,
+        # N=1536 on every layer) is split along N -- rows of the weight --
+        # across every engine, each reading its own private copy.
+        self.decode_shard_oproj = decode_shard_oproj and multi_core > 1
+        self._decode_shard_w = {}      # (layer_idx, engine) -> (data, scale)
         self._multi_core_schedulers = {}
+        self._multi_core_worker_pool = None
         self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
         # Gemma4 DRAM layout. ONE map, used at every engine count: the
@@ -834,7 +865,12 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         #   Worker ISA slots  : 0x80000000 – 0x8C000000  (16 MiB x 12 engines)
         #   Vision attn scr   : 0x90000000 – 0x9C000000  (16 MiB x 12; 13.12 used)
         #   Prefill attn scr  : 0x9C000000 – 0xA0000000  ( 4 MiB x 12;  1.50 used)
-        #   Reserved          : 0xA0000000 – 0x100000000 (1.5 GiB, future)
+        #   Decode dummy scr  : 0xA0000000 – 0xA0C00000  ( 1 MiB x 12; smoke
+        #                        test only, --decode-shard-dummy)
+        #   Decode shard wts  : 0xA1000000 – 0xB5000000  (320 MiB arena, split
+        #                        arena/N per core: private copy of the sharded
+        #                        MLP gate weight rows, all 35 layers)
+        #   Reserved          : 0xB5000000 – 0x100000000 (1.17 GiB, future)
         # Slot 0 of each scratch arena belongs to core 0, which keeps using its
         # own tensor-arena buffer; the slot is left reserved so engine index ==
         # slot index and the addressing needs no special case.
@@ -852,6 +888,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self.VISION_ATTN_SCRATCH_STRIDE  = 0
             self.PREFILL_ATTN_SCRATCH_BASE   = None          # unused (1-core)
             self.PREFILL_ATTN_SCRATCH_STRIDE = 0
+            self.DECODE_DUMMY_SCRATCH_BASE   = None          # unused (1-core)
+            self.DECODE_DUMMY_SCRATCH_STRIDE = 0
+            self.DECODE_SHARD_WEIGHT_BASE    = None          # unused (1-core)
+            self.DECODE_SHARD_WEIGHT_ARENA   = 0
+            self.DECODE_SHARD_WEIGHT_STRIDE  = 0
         else:
             _params_base  = 0x00000000                       # 0x80000000 - 2 GiB
             _tensor_base  = 0x61000000                       # 0xE1000000 - 2 GiB
@@ -870,6 +911,25 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self.VISION_ATTN_SCRATCH_STRIDE  = 0x01000000    # 16 MiB / engine
             self.PREFILL_ATTN_SCRATCH_BASE   = 0x9C000000
             self.PREFILL_ATTN_SCRATCH_STRIDE = 0x00400000    # 4 MiB / engine
+            # Decode worker DUMMY scratch (--decode-shard-dummy smoke test only;
+            # nothing the model reads ever lives here).
+            self.DECODE_DUMMY_SCRATCH_BASE   = 0xA0000000
+            self.DECODE_DUMMY_SCRATCH_STRIDE = 0x00100000    # 1 MiB / engine
+            # PRIVATE per-core decode weight copies. Decode N-shards the wide
+            # MLP gate: every engine owns its own row block of that weight, so
+            # the N engines never read the same DRAM segment concurrently.
+            # The arena is FIXED and the per-engine slot is arena/N, because the
+            # total staged is one redistributed copy of the weight no matter how
+            # many engines split it: ALL 35 layers = 263.0 MiB (15 narrow
+            # N=6144 -> 71.7 MiB, 20 wide N=12288 -> 191.2 MiB). A fixed
+            # per-engine slot would be wrong at both ends -- 64 MiB overflows at
+            # 2 cores and wastes most of itself at 8.
+            #   2 cores: 160 MiB/engine (131.5 used) | 4: 80 (65.7)
+            #   8 cores:  40 MiB/engine ( 32.9 used) | 12: 26.7 (21.9)
+            self.DECODE_SHARD_WEIGHT_BASE    = 0xA1000000
+            self.DECODE_SHARD_WEIGHT_ARENA   = 0x14000000    # 320 MiB total
+            self.DECODE_SHARD_WEIGHT_STRIDE  = (
+                self.DECODE_SHARD_WEIGHT_ARENA // self.multi_core) & ~0xFFF
         # Top of the vision tensor arena (vision weights are top-placed against
         # it; scratch stays below). In the multi-core layout every worker ISA
         # lives in the dedicated ISA region, so the tensor arena simply runs up
@@ -1216,6 +1276,18 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             prefill_size_bytes = (self.capture_count - prefill_count_at_start) * INSTRUCTION_SIZE_BYTES
             prefill_worker_addrs = (prefill_scheduler.finalize()
                                     if prefill_scheduler is not None else [])
+            # SNAPSHOT the worker programs NOW, not at store time below.
+            # Every stage shares ONE worker-engine pool, so decode's
+            # begin_program() clears these same capture buffers and refills them
+            # with the decode program. Reading worker.capture_buffer after that
+            # stores DECODE bytes under the prefill_worker sections: prefill
+            # then launches workers whose barrier count does not match the
+            # master's prefill program, and every engine spins on a FLAG_CHECK
+            # that has no timeout.
+            prefill_worker_images = (
+                [b"".join(inst.get_bytes() for inst in w.capture_buffer)
+                 for w in prefill_scheduler.workers]
+                if prefill_scheduler is not None else [])
             self._active_prefill_scheduler = None
             if prefill_scheduler is not None:
                 for worker in reversed(prefill_scheduler.workers):
@@ -1226,11 +1298,42 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             decoder_count_at_start = self.capture_count
             decoder_accounting_seq_len = (
                 (len(self.prefill_seq) + 63) // 64) * 64
+            # Decode-stage smoke test: its own scheduler stage, so its worker
+            # programs get their own addresses after prefill's in each worker
+            # slot (never on top of them).
+            decode_scheduler = self._ensure_decode_scheduler()
+            # Private per-engine weight copies must exist BEFORE the decoder is
+            # compiled: the sharded program bakes each engine's own addresses.
+            if getattr(self, "decode_shard_oproj", False):
+                self.stage_decode_shard_weights()
+            if decode_scheduler is not None:
+                decode_scheduler.begin_program()
+                # One M register per engine, holding M=1 -- the two-pass
+                # matmat_mul_core needs a dimension GPR. Mirrors prefill's
+                # _prefill_shard_m_regs.
+                self._decode_shard_m_regs = [self.alloc_isa_reg()]
+                self._decode_shard_m_regs.extend(
+                    w.alloc_isa_reg() for w in decode_scheduler.workers)
+                self._active_decode_scheduler = decode_scheduler
             _, decoder_program_sizes, decoder_total_flops = self.compile_decoder(
                 layer_size=layer_size, profile=profile,
                 accounting_seq_len=decoder_accounting_seq_len)
             decoder_program_addr = instruction_base_addr + decoder_count_at_start * INSTRUCTION_SIZE_BYTES
             decoder_size_bytes = decoder_program_sizes[0]
+            decode_worker_addrs = (decode_scheduler.finalize()
+                                   if decode_scheduler is not None else [])
+            # Snapshot for the same reason as prefill above: any stage compiled
+            # after this one would clear these shared capture buffers.
+            decode_worker_images = (
+                [b"".join(inst.get_bytes() for inst in w.capture_buffer)
+                 for w in decode_scheduler.workers]
+                if decode_scheduler is not None else [])
+            self._active_decode_scheduler = None
+            if decode_scheduler is not None:
+                for _w in reversed(decode_scheduler.workers):
+                    _w.release_isa_reg()
+                self.release_isa_reg()
+                self._decode_shard_m_regs = None
 
             self.stop_capture()
             image_bytes = bytearray()
@@ -1267,15 +1370,15 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # Merge the LM section into the combined programs bin (vision stays intact).
         self._store_program_section("lm", instruction_base_addr, image_bytes, lm_meta, profile=profile)
         if prefill_scheduler is not None:
-            for engine_idx, (worker, worker_addr) in enumerate(
-                    zip(prefill_scheduler.workers, prefill_worker_addrs), start=1):
-                worker_bytes = bytearray()
-                for inst in worker.capture_buffer:
-                    worker_bytes.extend(inst.get_bytes())
-                # Uniform worker arena at every engine count: the slot is
-                # always one MULTICORE_WORKER_ISA_STRIDE, never the lower-2 GB
-                # LM_ISA_BASE the old 2-core special case ran up against.
-                worker_limit = worker_addr + self.MULTICORE_WORKER_ISA_STRIDE
+            for engine_idx, (worker_bytes, worker_addr) in enumerate(
+                    zip(prefill_worker_images, prefill_worker_addrs), start=1):
+                # Uniform worker arena at every engine count. The bound is
+                # the END OF THIS WORKER'S SLOT, not worker_addr + stride: the
+                # shared worker pool makes each stage's program land AFTER the
+                # previous stage's inside the same slot, so a relative bound
+                # would silently license a spill into the next worker's slot.
+                worker_limit = (self.MULTICORE_WORKER_ISA_BASE
+                                + engine_idx * self.MULTICORE_WORKER_ISA_STRIDE)
                 if worker_addr + len(worker_bytes) > worker_limit:
                     raise RuntimeError(
                         f"prefill core{engine_idx} ISA overflow: "
@@ -1286,6 +1389,19 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                      "multi_core": self.multi_core,
                      "prefill_seq_len": prefill_flops_seq_len,
                      "prefill_kernel": self.prefill_kernel}, profile=profile)
+        if decode_scheduler is not None:
+            for engine_idx, (worker_bytes, worker_addr) in enumerate(
+                    zip(decode_worker_images, decode_worker_addrs), start=1):
+                worker_limit = (self.MULTICORE_WORKER_ISA_BASE
+                                + engine_idx * self.MULTICORE_WORKER_ISA_STRIDE)
+                if worker_addr + len(worker_bytes) > worker_limit:
+                    raise RuntimeError(
+                        f"decode core{engine_idx} ISA overflow: "
+                        f"0x{worker_addr + len(worker_bytes):X} > 0x{worker_limit:X}")
+                self._store_program_section(
+                    f"decode_worker{engine_idx}", worker_addr, worker_bytes,
+                    {"parent": "decode", "engine_idx": engine_idx,
+                     "multi_core": self.multi_core}, profile=profile)
 
         print(f"[compile] stored LM section ({len(image_bytes)/1024:.1f} KB @ 0x{instruction_base_addr:X}); "
               f"prefill @ 0x{prefill_program_addr:X} ({prefill_size_bytes/1024:.1f} KB), "
@@ -1694,10 +1810,18 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         """One decode step through the profile-bin's HALT checkpoints. Preamble
         primes gpr_seq_len (=decode_pos) / gpr_aligned_seq_len; the tail segment
         is the add_inc(gpr_seq_len) + terminal HALT."""
+        # Decode sharding: the slaves must be loaded and launched here too. The
+        # profile path bypasses run_decoder, so without this the master would
+        # enter a barrier-laden program with nothing on the other side and spin
+        # on a FLAG_CHECK that has no timeout. _profile_execute launches them;
+        # the master then HALTs at each checkpoint while the slaves park at the
+        # next region's entry flag (see its docstring).
+        _sched, _worker_addrs = self._load_decode_worker_programs(profile=True)
         results = self._profile_execute(
             [(self.gpr_seq_len, self.seq_len - 1),
              (self.gpr_aligned_seq_len, aligned_seq_len)],
-            decoder_addr, checkpoints, tail_name="tail_addinc", timeout=timeout)
+            decoder_addr, checkpoints, tail_name="tail_addinc", timeout=timeout,
+            worker_scheduler=_sched, worker_addrs=_worker_addrs)
         # The decoder program is captured with MAX_CONTEXT_SIZE as its template
         # aligned length, so compile-time attention FLOPs describe that maximum.
         # Replace only attention FLOPs with the exact live-length formula used by
@@ -1906,6 +2030,19 @@ def add_engine_args(parser) -> None:
                              "selects a different DMA device name); clock, AXI "
                              "width and engine count all come from HW_INFO, so "
                              "this flag no longer gates anything else.")
+    parser.add_argument("--decode-shard-dummy", action="store_true",
+                        help="Decode-stage multi-engine smoke test: slave cores run a "
+                             "dummy memcpy at each layer's MLP phase while the master "
+                             "runs the real MLP. Verifies decode fork/join plumbing; "
+                             "decoded text must be unchanged. Requires --multi-core.")
+    parser.add_argument("--decode-shard-oproj", action="store_true",
+                        help="Shard the O projection (attention output, N=1536) across "
+                             "every engine in decode, split along N (weight rows). It is "
+                             "the only matmul in its phase. Each core reads a private copy "
+                             "of its row block, so the engines never contend on one weight "
+                             "segment. Requires --multi-core with an engine count dividing "
+                             "N/64=24: 2, 3, 4, 6, 8 or 12. Defaults to layer 0 only; set "
+                             "GEMMA4_SHARD_LAYERS=all to widen.")
     parser.add_argument("--bin-reuse", action="store_true",
                         help="Reuse a matching cached program image (programs.bin) if it "
                              "exists instead of recompiling. Default: OFF (fresh compile "
@@ -1932,6 +2069,13 @@ def resolve_engine_config(parser, args) -> dict:
         args.prefill_kernel = "matmatmul"
     if args.multi_core > 1 and args.vision_kernel != "matmatmul":
         parser.error("--multi-core currently requires --vision-kernel matmatmul")
+    if args.decode_shard_dummy and args.multi_core < 2:
+        parser.error("--decode-shard-dummy requires --multi-core (it needs slave cores)")
+    if args.decode_shard_oproj and args.multi_core < 2:
+        parser.error("--decode-shard-oproj requires --multi-core (it needs slave cores)")
+    if args.decode_shard_oproj and args.decode_shard_dummy:
+        parser.error("--decode-shard-oproj and --decode-shard-dummy are mutually exclusive: "
+                     "the dummy memcpy occupies the same MLP-phase region")
 
     if os.environ.get("GEMMA4_PENALTY", "0") == "1":
         parser.error(
@@ -1993,6 +2137,8 @@ def resolve_engine_config(parser, args) -> dict:
         decode_kernel=args.decode_kernel,
         multi_core=args.multi_core,
         bin_reuse=args.bin_reuse,
+        decode_shard_dummy=args.decode_shard_dummy,
+        decode_shard_oproj=args.decode_shard_oproj,
     )
 
 
