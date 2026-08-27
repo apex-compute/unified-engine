@@ -1158,21 +1158,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 f"{self.multi_core}-engine fixed prefill requires at least "
                 f"{self.multi_core} prefill rows")
         prefill_scheduler = self._ensure_prefill_scheduler()
-        _lm_meta, _ = self._get_program_section("lm", profile)
-        _prefill_worker_metas = [
-            self._get_program_section(f"prefill_worker{i}", profile)[0]
-            for i in range(1, self.multi_core)
-        ]
-        if (self.bin_reuse
-                and _lm_meta is not None
-                and _lm_meta.get("prefill_flops_seq_len") == prefill_flops_seq_len
-                and _lm_meta.get("prefill_kernel") == self.prefill_kernel
-                and _lm_meta.get("decode_kernel") == self.decode_kernel
-                and _lm_meta.get("multi_core", 1) == self.multi_core
-                and all(meta is not None
-                        and meta.get("prefill_seq_len") == prefill_flops_seq_len
-                        and meta.get("prefill_kernel") == self.prefill_kernel
-                        for meta in _prefill_worker_metas)):
+        # Reuse is opt-in and unconditional: --bin-reuse reuses whatever is on
+        # disk, with no version matching and no presence check. Without the flag
+        # we recompile every run.
+        if self.bin_reuse:
             bin_path, _ = self._program_image_paths(profile)
             print(f"[compile] reusing existing instruction image at {bin_path}")
             print(f"  delete {bin_path} (or make clean) to force recompile.")

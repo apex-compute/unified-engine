@@ -536,16 +536,10 @@ class Gemma4VisionMixin:
         LM per-phase profile). The checkpoints go in the meta; a profile-compiled
         bin can only be run segment-by-segment."""
         L = self.VIS_LAYERS
-        _vmeta, _ = self._get_program_section("vision", profile)
-        _worker_metas = [
-            self._get_program_section(f"vision_worker{i}", profile)[0]
-            for i in range(1, self.multi_core)
-        ]
-        if (getattr(self, "bin_reuse", False)
-                and _vmeta is not None
-                and _vmeta.get("vision_kernel") == self.vision_kernel
-                and _vmeta.get("multi_core", 1) == self.multi_core
-                and all(meta is not None for meta in _worker_metas)):
+        # Reuse is opt-in and unconditional: --bin-reuse reuses whatever is on
+        # disk, with no version matching and no presence check. Without the flag
+        # we recompile every run.
+        if getattr(self, "bin_reuse", False):
             self._ensure_vision_gate_scheduler()
             bin_path, _ = self._program_image_paths(profile)
             print(f"  [Vision] reusing existing instruction image at {bin_path}", flush=True)
