@@ -921,14 +921,22 @@ class Gemma4VisionMixin:
         import threading
         # Runtime uploads: everything vision_tensor_init allocated + built on
         # host is DMA'd here, right before the encoder runs.
+        # Step markers for the pre-launch sequence too: every one of these
+        # touches the device (DMA or AXI-Lite), so any of them can be the step
+        # that does not return.
+        print(f"  [Vision][step] flushing {len(getattr(self, '_vis_pending_dmas', []))} "
+              f"pending input DMA(s)", flush=True)
         for _addr, _t in getattr(self, "_vis_pending_dmas", []):
             self.dma_to_accelerator_memory(_addr, _t)
         self._vis_pending_dmas = []
+        print("  [Vision][step] pending DMAs flushed", flush=True)
         meta, enc_bytes = self._get_program_section("vision", profile)
         if meta is None:
             raise FileNotFoundError("vision section not found in combined programs bin")
         program_addr = int(meta["dram_base"], 16)
         self._next_program_dram_addr = program_addr
+        print(f"  [Vision][step] DMA master program {len(enc_bytes)/1024/1024:.2f} MB "
+              f"-> 0x{program_addr:X}", flush=True)
         self.dma_write(DMA_DEVICE_H2C, program_addr, enc_bytes, len(enc_bytes))
         self.allocate_program_dram(len(enc_bytes))
         gate_scheduler = self._ensure_vision_gate_scheduler()
@@ -942,10 +950,14 @@ class Gemma4VisionMixin:
                         f"vision_worker{engine_idx} section not found in combined programs bin")
                 worker_addr = int(worker_meta["dram_base"], 16)
                 worker._next_program_dram_addr = worker_addr
+                print(f"  [Vision][step] DMA worker {engine_idx} program "
+                      f"{len(worker_bytes)/1024/1024:.2f} MB -> 0x{worker_addr:X}", flush=True)
                 worker.dma_write(DMA_DEVICE_H2C, worker_addr, worker_bytes, len(worker_bytes))
                 worker.allocate_program_dram(len(worker_bytes))
                 worker_addrs.append(worker_addr)
+            print("  [Vision][step] preclear_flags on all engines ...", flush=True)
             gate_scheduler.preclear_flags()
+            print("  [Vision][step] preclear_flags done", flush=True)
         print(f"  [Vision] launching patch+encoder ({len(enc_bytes)/1024/1024:.1f} MB) at 0x{program_addr:X}"
               f"{' [profiled]' if profile else ''} ...", flush=True)
         t0 = time.perf_counter()
@@ -980,13 +992,28 @@ class Gemma4VisionMixin:
             while not _stop.wait(10):
                 self._loud(f"  [Vision] ... running on FPGA ({time.perf_counter()-_anchor:.0f}s)", flush=True)
         _th = threading.Thread(target=_hb, daemon=True); _th.start()
+        # STEP MARKERS. Register polling is useless once the link drops (every
+        # read returns 0xffffffff), so instead mark each host-side step: the LAST
+        # line printed is the step that did not return.
+        def _step(msg):
+            print(f"  [Vision][step] {msg}", flush=True)
         try:
             if gate_scheduler is not None:
+                _step(f"start_workers: launching {len(worker_addrs)} worker(s) at "
+                      f"{[hex(a) for a in worker_addrs]}")
                 gate_scheduler.start_workers(worker_addrs)
+                _step("start_workers: returned")
+            _step(f"start_execute_from_dram(master @ 0x{program_addr:X})")
             self.start_execute_from_dram(program_addr)
+            _step("master launched; waiting on master queue (180s)")
             self.wait_queue(180.0)
-            for worker in gate_scheduler.workers if gate_scheduler is not None else []:
+            _step(f"master queue done ({time.perf_counter()-t0:.2f}s)")
+            for _wi, worker in enumerate(
+                    gate_scheduler.workers if gate_scheduler is not None else [], start=1):
+                _step(f"waiting on worker {_wi} queue (180s)")
                 worker.wait_queue(180.0)
+                _step(f"worker {_wi} queue done ({time.perf_counter()-t0:.2f}s)")
+            _step(f"all engines done ({time.perf_counter()-t0:.2f}s)")
         finally:
             _stop.set(); _th.join(timeout=1.0)
         elapsed = time.perf_counter() - t0

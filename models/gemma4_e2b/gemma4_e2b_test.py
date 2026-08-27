@@ -2057,6 +2057,13 @@ def main():
     _summary_name = run_summary_filename(args)
     engine_kwargs = resolve_engine_config(parser, args)
 
+    # Clear stale per-core state before anything else: a hung multi-core run
+    # leaves its workers spin-waiting on a FLAG_CHECK (no timeout), and that
+    # spin survives process exit -- later runs then inherit busy cores.
+    from user_hw_test import software_reset_test
+    print(f"\n--- Software-resetting {args.multi_core} core(s) ---")
+    software_reset_test(cores=args.multi_core)
+
     # Measure aggregate accelerator-side DRAM reads before model allocation.
     # The same flag-synchronized benchmark supports one engine and the exact
     # engine count selected by --multi-core. Keep private-region mode aligned
@@ -2066,6 +2073,15 @@ def main():
     print(f"\n--- Measuring {args.multi_core}-core aggregate DRAM read speed ---")
     dram_read_speed_mbps = matmat_mul_multi_engine_flag_check_test(
         M=4096, K=4096, N=4096, num_engines=args.multi_core)
+
+    # Poison the full 4 GB DRAM with zeros before any model allocation, so an
+    # uninitialised read downstream sees bf16 +0.0 rather than whatever the
+    # benchmark above left behind. '0' is the MOST FORGIVING pattern (a
+    # read-before-write on zeros usually looks benign) -- use it to confirm a
+    # suspected read-before-write disappears, not to validate correctness.
+    from randomize_dram import dram_random_fill
+    print("\n--- Poisoning DRAM with zeros (bf16 +0.0) ---")
+    dram_random_fill(UnifiedEngine(), pattern="0")
 
     ue = Gemma4_UnifiedEngine(**engine_kwargs)
     ue._dram_read_speed_mbps = dram_read_speed_mbps
