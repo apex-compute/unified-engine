@@ -752,14 +752,14 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             return None
         scheduler = self._multi_core_schedulers.get(stage)
         if scheduler is None:
-            # Two-core keeps its single worker at the supplied stage address
-            # (huge stride; only the base is used). >2-core packs the extra
-            # workers into the dedicated MULTICORE_WORKER_ISA arena. Vision and
-            # prefill are sequential, so both stages reuse this worker-ISA arena.
-            worker_stride = 0x10000000
-            if self.multi_core > 2:
-                worker_dram_base = self.MULTICORE_WORKER_ISA_BASE
-                worker_stride = self.MULTICORE_WORKER_ISA_STRIDE
+            # EVERY worker, at every engine count, executes from the dedicated
+            # MULTICORE_WORKER_ISA arena above 0x80000000 — the old 2-core
+            # special case (worker parked at the caller's stage address inside
+            # the lower-2 GB map) is gone. Vision and prefill are sequential, so
+            # both stages reuse the same slots. ``worker_dram_base`` from the
+            # caller is now advisory only and deliberately ignored.
+            worker_dram_base = self.MULTICORE_WORKER_ISA_BASE
+            worker_stride = self.MULTICORE_WORKER_ISA_STRIDE
             scheduler = MultiEngineScheduler(
                 self, num_engines=self.multi_core,
                 engine_base_stride=0x00010000,
@@ -808,28 +808,36 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._multi_core_schedulers = {}
         self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
-        # Gemma4 DRAM layout. SINGLE-CORE keeps the original upper-2 GB window
-        # (matching the Llama-3.2-1B path); its 16 MiB ISA region is tight but
-        # sufficient for one engine. MULTI-CORE re-bases to 0x0 with the full
-        # 4 GB budget so the per-engine worker programs (incl. sharded vision
-        # RoPE) and future parallelism add-ons have room, and so the vision
-        # tensor arena is large enough for N-engine scratch.
+        # Gemma4 DRAM layout. ONE map, used at every engine count: the
+        # single-core layout occupies the upper 2 GB, and MULTI-CORE is that
+        # SAME map shifted down by 0x80000000 into the lower 2 GB — identical
+        # region sizes, pure relocation, no arena grown or shrunk. Everything
+        # multi-core needs BEYOND the single-core map (per-engine worker ISA and
+        # per-engine attention scratch) is additive and lives above 0x80000000,
+        # so a worker can never land inside a region the single-core path owns.
         #
         # SINGLE-CORE (upper 2 GB):
         #   PARAMS  weights   : 0x80000000 – 0xE1000000  (1552 MiB)
         #   TENSOR  acts/scr  : 0xE1000000 – 0xFF000000  (480 MiB, LM<->vision)
         #   ISA vision core0  : 0xFF000000 – 0xFF400000  (4 MiB)
-        #   ISA vision core1  : 0xFF400000 – 0xFF620000  (2.125 MiB, unused 1-core)
+        #   ISA vision core1  : 0xFF400000 – 0xFF620000  (2.125 MiB, reserved)
         #   ISA LM            : 0xFF620000 – 0x100000000 (9.875 MiB)
         #
-        # MULTI-CORE (full 4 GB, base 0x0):
-        #   PARAMS  weights   : 0x00000000 – 0x80000000  (2 GiB;  LM ~1540 MB)
-        #   TENSOR  acts/scr  : 0x80000000 – 0xC0000000  (1 GiB;  LM + vision,
-        #                        incl. up-to-12-engine vision scratch + top wts)
-        #   ISA vision core0  : 0xC0000000 – 0xC8000000  (128 MiB, master)
-        #   ISA vision core1  : 0xC8000000 – 0xE0000000  (384 MiB, 2-core worker)
-        #   ISA LM            : 0xE0000000 – 0xF0000000  (256 MiB)
-        #   ISA >2-core workrs: 0xF0000000 – 0x100000000 (256 MiB, 16 MiB/worker)
+        # MULTI-CORE, lower 2 GB — the map above minus 0x80000000, same sizes:
+        #   PARAMS  weights   : 0x00000000 – 0x61000000  (1552 MiB)
+        #   TENSOR  acts/scr  : 0x61000000 – 0x7F000000  (480 MiB, LM<->vision)
+        #   ISA vision core0  : 0x7F000000 – 0x7F400000  (4 MiB)
+        #   ISA vision core1  : 0x7F400000 – 0x7F620000  (2.125 MiB, reserved)
+        #   ISA LM            : 0x7F620000 – 0x80000000  (9.875 MiB)
+        #
+        # MULTI-CORE EXTRAS, upper 2 GB — nothing here at 1 core:
+        #   Worker ISA slots  : 0x80000000 – 0x8C000000  (16 MiB x 12 engines)
+        #   Vision attn scr   : 0x90000000 – 0x9C000000  (16 MiB x 12; 13.12 used)
+        #   Prefill attn scr  : 0x9C000000 – 0xA0000000  ( 4 MiB x 12;  1.50 used)
+        #   Reserved          : 0xA0000000 – 0x100000000 (1.5 GiB, future)
+        # Slot 0 of each scratch arena belongs to core 0, which keeps using its
+        # own tensor-arena buffer; the slot is left reserved so engine index ==
+        # slot index and the addressing needs no special case.
         # Vision and LM programs remain resident at disjoint addresses.
         self.DRAM_END = 0x100000000
         if self.multi_core == 1:
@@ -840,17 +848,28 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self.LM_ISA_BASE                 = 0xFF620000
             self.MULTICORE_WORKER_ISA_BASE   = 0xFC000000    # unused (1-core)
             self.MULTICORE_WORKER_ISA_STRIDE = 0x00240000    # unused (1-core)
+            self.VISION_ATTN_SCRATCH_BASE    = None          # unused (1-core)
+            self.VISION_ATTN_SCRATCH_STRIDE  = 0
+            self.PREFILL_ATTN_SCRATCH_BASE   = None          # unused (1-core)
+            self.PREFILL_ATTN_SCRATCH_STRIDE = 0
         else:
-            _params_base  = 0x00000000
-            _tensor_base  = 0x80000000
-            self.VISION_ISA_BASE             = 0xC0000000
-            self.VISION_WORKER_ISA_BASE      = 0xC8000000
-            self.LM_ISA_BASE                 = 0xE0000000
-            self.MULTICORE_WORKER_ISA_BASE   = 0xF0000000    # >2-core worker arena
-            # Eleven 16-MiB slots support 12 engines and occupy 176 MiB of the
-            # 256-MiB worker arena. Current worker images are below 2 MiB; the
-            # per-section overflow checks below enforce the slot boundary.
+            _params_base  = 0x00000000                       # 0x80000000 - 2 GiB
+            _tensor_base  = 0x61000000                       # 0xE1000000 - 2 GiB
+            self.VISION_ISA_BASE             = 0x7F000000    # 0xFF000000 - 2 GiB
+            self.VISION_WORKER_ISA_BASE      = 0x7F400000    # 0xFF400000 - 2 GiB
+            self.LM_ISA_BASE                 = 0x7F620000    # 0xFF620000 - 2 GiB
+            # Extras, above 0x80000000. One uniform worker-ISA arena at EVERY
+            # engine count (2-core included) — vision and prefill are sequential
+            # and reuse it, so worker i always executes from the same slot.
+            self.MULTICORE_WORKER_ISA_BASE   = 0x80000000
             self.MULTICORE_WORKER_ISA_STRIDE = 0x01000000    # 16 MiB / worker
+            # Per-engine attention scratch, one slot per engine. Sized to the
+            # worst case (vision 13.12 MiB, prefill 1.50 MiB) and asserted at
+            # use; slot 0 is core 0's and stays reserved.
+            self.VISION_ATTN_SCRATCH_BASE    = 0x90000000
+            self.VISION_ATTN_SCRATCH_STRIDE  = 0x01000000    # 16 MiB / engine
+            self.PREFILL_ATTN_SCRATCH_BASE   = 0x9C000000
+            self.PREFILL_ATTN_SCRATCH_STRIDE = 0x00400000    # 4 MiB / engine
         # Top of the vision tensor arena (vision weights are top-placed against
         # it; scratch stays below). In the multi-core layout every worker ISA
         # lives in the dedicated ISA region, so the tensor arena simply runs up
@@ -1253,8 +1272,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 worker_bytes = bytearray()
                 for inst in worker.capture_buffer:
                     worker_bytes.extend(inst.get_bytes())
-                worker_limit = (worker_addr + self.MULTICORE_WORKER_ISA_STRIDE
-                                if self.multi_core > 2 else self.LM_ISA_BASE)
+                # Uniform worker arena at every engine count: the slot is
+                # always one MULTICORE_WORKER_ISA_STRIDE, never the lower-2 GB
+                # LM_ISA_BASE the old 2-core special case ran up against.
+                worker_limit = worker_addr + self.MULTICORE_WORKER_ISA_STRIDE
                 if worker_addr + len(worker_bytes) > worker_limit:
                     raise RuntimeError(
                         f"prefill core{engine_idx} ISA overflow: "
@@ -1875,14 +1896,16 @@ def add_engine_args(parser) -> None:
                              "(default: streaming).")
     parser.add_argument("--multi-core", nargs="?", const=2, default=1, type=int,
                         help="Enable multi-engine vision and LM prefill. Bare --multi-core "
-                             "selects 2 engines; up to 12 engines are supported on Alveo. "
-                             "Multicore prefill always uses matmatmul.")
+                             "selects 2 engines; the upper bound is whatever the board "
+                             "reports in HW_INFO (max 12). Multicore prefill always uses "
+                             "matmatmul.")
     parser.add_argument("--dev", type=str, default="xdma0",
                         help="DMA device name (e.g., xdma0, xdma1). Default: xdma0")
     parser.add_argument("--device", type=str, default="kintex7",
-                        help="FPGA board profile (kintex7, kintex7_systolic, rk, "
-                             "rk_256, puzhi, bittware, bittware_256, alveo, "
-                             "alveo_u55c, efinix).")
+                        help="FPGA board profile. Only needed for 'efinix' (it "
+                             "selects a different DMA device name); clock, AXI "
+                             "width and engine count all come from HW_INFO, so "
+                             "this flag no longer gates anything else.")
     parser.add_argument("--bin-reuse", action="store_true",
                         help="Reuse a matching cached program image (programs.bin) if it "
                              "exists instead of recompiling. Default: OFF (fresh compile "
@@ -1900,28 +1923,16 @@ def resolve_engine_config(parser, args) -> dict:
     """
     if args.multi_core not in range(1, 13):
         parser.error("--multi-core must be between 1 and 12")
-    if args.multi_core > 2 and args.device != "alveo" and args.device != "alveo_u55c":
-        parser.error("--multi-core values above 2 are currently supported only on Alveo and Alveo U55C")
+    # No board-name gate on the engine count: the number of engines the board
+    # actually has is read from HW_INFO (ANDROMEDA_CORE_COUNT) and checked below,
+    # after the hardware read. A --device allowlist could only ever be a stale
+    # proxy for it.
     if args.multi_core > 1:
         # Multicore prefill only has a matmatmul (two-pass) shard path.
         args.prefill_kernel = "matmatmul"
     if args.multi_core > 1 and args.vision_kernel != "matmatmul":
         parser.error("--multi-core currently requires --vision-kernel matmatmul")
 
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    # Gemma4 vision has K <= 3072, so its two-pass kernel remains valid on
-    # 512-bit AXI. LM prefill and decode include wide MLP-down K=12288 and
-    # therefore cannot select matmatmul on that hardware profile.
-    if axi_width_bits == 512 and (
-            args.prefill_kernel == "matmatmul" or args.decode_kernel == "matmatmul"):
-        requested = []
-        if args.prefill_kernel == "matmatmul":
-            requested.append("--prefill-kernel matmatmul")
-        if args.decode_kernel == "matmatmul":
-            requested.append("--decode-kernel matmatmul")
-        parser.error(
-            f"{' and '.join(requested)} unsupported: matmatmul is not supported "
-            "on the 512-bit AXI data path; use streaming.")
     if os.environ.get("GEMMA4_PENALTY", "0") == "1":
         parser.error(
             "GEMMA4_PENALTY=1 is temporarily unsupported; dynamic streaming "
@@ -1938,6 +1949,31 @@ def resolve_engine_config(parser, args) -> dict:
                     setattr(_mod, _attr, getattr(user_dma_core, _attr))
 
     user_dma_core.configure_clock_from_hardware()
+
+    # Everything board-dependent is now decided by HW_INFO, not by --device.
+    # Engine count: the board reports how many cores it has.
+    _cores = user_dma_core.ANDROMEDA_CORE_COUNT
+    if _cores and args.multi_core > _cores:
+        parser.error(
+            f"--multi-core {args.multi_core} exceeds the {_cores} engine(s) this "
+            f"board reports in HW_INFO")
+    # AXI width: read from HW_INFO (user_dma_core populates it there and states
+    # it has no board-name mapping by design). Gemma4 vision has K <= 3072, so
+    # its two-pass kernel stays valid on 512-bit AXI; LM prefill and decode
+    # include wide MLP-down K=12288 and cannot select matmatmul there.
+    _axi_width_bits = user_dma_core.UE_AXI_DATA_WIDTH_BITS
+    if _axi_width_bits == 512 and (
+            args.prefill_kernel == "matmatmul" or args.decode_kernel == "matmatmul"):
+        requested = []
+        if args.prefill_kernel == "matmatmul":
+            requested.append("--prefill-kernel matmatmul")
+        if args.decode_kernel == "matmatmul":
+            requested.append("--decode-kernel matmatmul")
+        parser.error(
+            f"{' and '.join(requested)} unsupported: matmatmul is not supported "
+            f"on the 512-bit AXI data path this board reports; use streaming."
+            + (" (multi-core forces prefill to matmatmul)"
+               if args.multi_core > 1 else ""))
 
     print(f"FPGA profile: device={args.device}")
     print(user_dma_core.hardware_info_summary())
@@ -2063,14 +2099,14 @@ def main():
     dram_read_speed_mbps = matmat_mul_multi_engine_flag_check_test(
         M=4096, K=4096, N=4096, num_engines=args.multi_core)
 
-    # Poison the full 4 GB DRAM with zeros before any model allocation, so an
-    # uninitialised read downstream sees bf16 +0.0 rather than whatever the
-    # benchmark above left behind. '0' is the MOST FORGIVING pattern (a
-    # read-before-write on zeros usually looks benign) -- use it to confirm a
-    # suspected read-before-write disappears, not to validate correctness.
+    # Poison the full 4 GB DRAM before any model allocation, so an uninitialised
+    # read downstream sees an obviously wrong value rather than whatever the
+    # benchmark above left behind. 'random' is the USEFUL poison: every
+    # read-before-write yields a wrong-but-finite bf16, and the fixed rng_seed
+    # keeps a failure reproducible and therefore bisectable.
     from randomize_dram import dram_random_fill
-    print("\n--- Poisoning DRAM with zeros (bf16 +0.0) ---")
-    dram_random_fill(UnifiedEngine(), pattern="0")
+    print("\n--- Poisoning DRAM with random bf16 (seed=0) ---")
+    dram_random_fill(UnifiedEngine(), pattern="random", rng_seed=0)
 
     ue = Gemma4_UnifiedEngine(**engine_kwargs)
     ue._dram_read_speed_mbps = dram_read_speed_mbps
