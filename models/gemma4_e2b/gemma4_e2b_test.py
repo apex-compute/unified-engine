@@ -2213,6 +2213,217 @@ def run_summary_filename(args) -> str:
     return "gemma4_e2b_test_" + "_".join(str(t) for t in tokens) + suffix + ".md"
 
 
+# Representative M=1 IF4 projection/MLP workload dimensions. This is an
+# individual kernel test: the labels only identify the source shape; no model
+# state or decoder program is involved.
+MULTI_CORE_QUANTIZED_MATMAT_SHAPES = [
+    # (name,                 K,      N)
+    # ("q_proj_sliding",     1536,   2048),
+    ("q_proj_full",        1536,   4096),
+    # ("kv_proj_sliding",    1536,    256),
+    # ("kv_proj_full",       1536,    512),
+    # ("o_proj_sliding",     2048,   1536),
+    # ("o_proj_full",        4096,   1536),
+    ("mlp_gate_up_narrow", 1536,   6144),
+    # ("mlp_gate_up_wide",   1536,  12288),
+    # ("mlp_down_narrow",    6144,   1536),
+    # ("mlp_down_wide",     12288,   1536),
+]
+
+
+def multi_core_quantized_matmat_mul_test(
+        num_engines: int, M: int = 1, int_variant: bool = True,
+        snr_threshold_db: float = 40.0, shapes=None) -> bool:
+    """Standalone manual N-sharded IF4 matmul test.
+
+    Core ``i`` owns the 256 MiB segment beginning at
+    ``i * 0x10000000``. Its quantized B row block and scales live in that
+    segment, so parallel weight reads do not contend on one segment. All cores
+    read the small A row from core0 and write their disjoint N slices directly
+    into one contiguous output row in core0's tensor arena. M is intentionally
+    fixed at 1: with M>1, direct N-shard writeback would need a strided output.
+
+    Execution uses the same manual master/worker flag pattern as
+    ``matmat_mul_multi_engine_flag_check_test``: core0 raises the start flag,
+    workers wait, every worker raises its completion flag, and core0 waits for
+    all workers before halting. No model is constructed or run.
+    """
+    from user_dma_core import calculate_snr
+
+    if M != 1:
+        raise ValueError(f"manual contiguous N-shard output requires M=1, got {M}")
+    if not 1 <= num_engines <= 12:
+        raise ValueError(f"num_engines must be between 1 and 12, got {num_engines}")
+    if shapes is None:
+        shapes = MULTI_CORE_QUANTIZED_MATMAT_SHAPES
+
+    engine_base_stride = 0x00010000
+    core_dram_stride = 0x10000000
+    tensor_offset = 0x08000000
+    program_offset = 0x0F000000
+    bpe = 2
+
+    def _split_cols(N: int, ne: int) -> list[tuple[int, int]]:
+        if N % UE_VECTOR_SIZE:
+            raise ValueError(
+                f"N={N} is not a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}")
+        blocks = N // UE_VECTOR_SIZE
+        if blocks < ne:
+            raise ValueError(
+                f"N={N} has only {blocks} x {UE_VECTOR_SIZE}-column blocks "
+                f"for {ne} engines")
+        base, rem = divmod(blocks, ne)
+        counts = [UE_VECTOR_SIZE * (base + (1 if i < rem else 0))
+                  for i in range(ne)]
+        offsets = [sum(counts[:i]) for i in range(ne)]
+        return list(zip(offsets, counts))
+
+    def _run(K: int, N: int, ne: int, a: torch.Tensor, b: torch.Tensor,
+             want_ref: bool = False):
+        splits = _split_cols(N, ne)
+        ues = []
+        for i in range(ne):
+            base = i * core_dram_stride
+            ues.append(UnifiedEngine(
+                BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride,
+                params_dram_base=base,
+                tensor_dram_base=base + tensor_offset,
+                program_dram_base=base + program_offset))
+
+        # Reset and verify every participating core before allocating test data.
+        # UnifiedEngine.software_reset() also reinitializes its host-side state.
+        for ue in ues:
+            ue.software_reset()
+
+        b_ref = (ues[0].quantize_weight_simulate(
+            b, data_type=TYPE.IF4, int_variant=int_variant)
+            if want_ref else None)
+
+        # Quantize each N row block through its owning engine. The resulting B
+        # and scale addresses therefore live in distinct 256 MiB segments.
+        b_addrs, scale_addrs = [], []
+        for ue, (col0, cols) in zip(ues, splits):
+            shard = b[col0:col0 + cols, :].contiguous()
+            b_addr, scale_addr = ue.quantize_weight(
+                weight=shard, N=cols, K=K, data_type=TYPE.IF4,
+                int_variant=int_variant)
+            if ue.get_params_dram_addr() > ue._params_dram_base + tensor_offset:
+                raise MemoryError(
+                    f"weight shard overruns core segment params region: "
+                    f"0x{ue.get_params_dram_addr():X}")
+            b_addrs.append(b_addr)
+            scale_addrs.append(scale_addr)
+
+        primary = ues[0]
+        a_addr = primary.allocate_tensor_dram(M * K * bpe)
+        out_addr = primary.allocate_tensor_dram(M * N * bpe)
+        primary.dma_to_accelerator_memory(a_addr, a)
+
+        prog_addrs = []
+        for i, (ue, (col0, cols)) in enumerate(zip(ues, splits)):
+            ue.clear_capture_buffer()
+            ue.reset_isa_reg_counter()
+            ue.reset_inst_ptr_counter()
+            ue.start_capture()
+            if ne > 1:
+                if i == 0:
+                    ue.generate_instruction_flag_set()
+                else:
+                    ue.generate_instruction_flag_clear()
+                    ue.generate_instruction_flag_check(target_engine_idx=0)
+
+            ue.quantized_matmat_core(
+                M=M, K=K, N=cols,
+                A_DRAM_ADDR=a_addr,
+                B_DRAM_ADDR=b_addrs[i],
+                OUTPUT_DRAM_ADDR=out_addr + col0 * bpe,
+                SCALE_DRAM_ADDR=scale_addrs[i],
+                data_type=TYPE.IF4)
+
+            if ne > 1:
+                if i == 0:
+                    for worker_idx in range(1, ne):
+                        ue.generate_instruction_flag_check(
+                            target_engine_idx=worker_idx)
+                    ue.generate_instruction_flag_clear()
+                else:
+                    ue.generate_instruction_flag_set()
+            ue.generate_instruction_halt()
+            ue.stop_capture()
+            prog_addr = ue.get_program_dram_addr()
+            ue.write_captured_instructions_to_dram(prog_addr)
+            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+            prog_addrs.append(prog_addr)
+
+        for i in range(1, ne):
+            ues[i].start_execute_from_dram(prog_addrs[i])
+        primary.start_execute_from_dram(prog_addrs[0])
+        primary.wait_queue(60.0)
+        if primary.is_queue_busy():
+            raise TimeoutError(
+                f"core0 still busy after 60 s for K={K}, N={N}, engines={ne}")
+        for i, worker in enumerate(ues[1:], start=1):
+            worker.wait_queue(1.0)
+            if worker.is_queue_busy():
+                raise TimeoutError(
+                    f"worker core{i} still busy after core0 completed")
+
+        out = primary.dma_from_accelerator_memory(out_addr, (M, N)).cpu()
+        latency_us = primary.report_latency_in_us()
+        return out, latency_us, b_ref, primary._clock_period_ns
+
+    print(f"\n=== multi_core_quantized_matmat_mul_test "
+          f"(M={M}, requested_engines={num_engines}, IF4) ===")
+    print("layout: core i base = i*0x10000000; private B/scales per core; "
+          "shared A + contiguous output in core0 tensor DRAM")
+
+    all_ok = True
+    results = []
+    for name, K, N in shapes:
+        # A kernel lane must own at least one 64-column block. Narrow N shapes
+        # therefore use fewer than args.multi_core engines when necessary.
+        effective_engines = min(num_engines, N // UE_VECTOR_SIZE)
+        torch.manual_seed(0xC0FFEE + K * 131 + N)
+        a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
+        b = torch.rand(N, K, dtype=torch.bfloat16) * 2 - 1
+
+        out_1c, latency_1c, b_ref, clock_ns = _run(
+            K, N, 1, a, b, want_ref=True)
+        out_mc, latency_mc, _, _ = _run(
+            K, N, effective_engines, a, b, want_ref=False)
+        ref = (a.float() @ b_ref.float().T).to(torch.bfloat16)
+        snr = calculate_snr(ref, out_mc)
+        exact = torch.equal(out_1c, out_mc)
+        speedup = latency_1c / latency_mc if latency_mc else float('nan')
+        work_flops = 2 * M * K * N
+        gflops = (work_flops / (latency_mc * 1e3)
+                  if latency_mc else float('nan'))
+        peak_gflops = ((128.0 / clock_ns) * effective_engines
+                       if clock_ns else 0.0)
+        peak_pct = (100.0 * gflops / peak_gflops
+                    if peak_gflops else float('nan'))
+        ok = (snr >= snr_threshold_db or snr == float('inf')) and exact
+        all_ok = all_ok and ok
+        results.append((name, K, N, effective_engines, snr, exact,
+                        latency_1c, latency_mc, speedup, gflops, peak_pct, ok))
+
+    print("\nMulti-core quantized matmat summary")
+    print(f"{'case':<20}{'K':>7}{'N':>7}{'eng':>5}{'SNR':>8}{'exact':>7}"
+          f"{'1c(us)':>10}{'mc(us)':>10}{'speedup':>9}"
+          f"{'GFLOPS':>10}{'%peak':>8}{'result':>9}")
+    for (name, K, N, effective_engines, snr, exact,
+         latency_1c, latency_mc, speedup, gflops, peak_pct, ok) in results:
+        print(f"{name:<20}{K:>7}{N:>7}{effective_engines:>5}"
+              f"{snr:>8.1f}{('yes' if exact else 'NO'):>7}"
+              f"{latency_1c:>10.1f}{latency_mc:>10.1f}{speedup:>8.2f}x"
+              f"{gflops:>10.1f}{peak_pct:>7.1f}%"
+              f"{('PASS' if ok else 'FAIL'):>9}")
+
+    print(f"=== multi_core_quantized_matmat_mul_test: "
+          f"{'PASS' if all_ok else 'FAIL'} ===\n")
+    return all_ok
+
+
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -2234,6 +2445,13 @@ def main():
     from user_hw_test import software_reset_test
     print(f"\n--- Software-resetting {args.multi_core} core(s) ---")
     software_reset_test(cores=args.multi_core)
+
+    # Validate representative M=1 IF4 N-shards before the benchmark/model run.
+    # The participating count comes only from --multi-core; there is no
+    # feature-specific command-line option.
+    if not multi_core_quantized_matmat_mul_test(num_engines=args.multi_core):
+        raise RuntimeError("multi-core quantized matmat workload test failed")
+    assert False, "multi-core quantized matmat workload test"
 
     # Measure aggregate accelerator-side DRAM reads before model allocation.
     # The same flag-synchronized benchmark supports one engine and the exact
