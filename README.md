@@ -163,6 +163,7 @@ engine today; each folder has its own README/config, and most LLMs ship a
 | Gemma 4 E4B | [`models/gemma4_e4b`](models/gemma4_e4b) | Multimodal LM (text, vision, audio) |
 | Llama 3.2 1B | [`models/llama3.2_1b`](models/llama3.2_1b) | Text LM |
 | Llama 3.2 3B | [`models/llama3.2_3b`](models/llama3.2_3b) | Text LM |
+| Qwen3 0.6B | [`models/qwen3_0.6b`](models/qwen3_0.6b) | Text LM |
 | Qwen3 1.7B | [`models/qwen3_1.7b`](models/qwen3_1.7b) | Text LM |
 | Qwen3 4B | [`models/qwen3_4b`](models/qwen3_4b) | Text LM |
 | Qwen3.5 2B | [`models/qwen3.5_2b`](models/qwen3.5_2b) | Text LM |
