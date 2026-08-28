@@ -691,6 +691,7 @@ class UnifiedEngine:
         # probe is the point (see software_reset_test).
         if init_unified_engine:
             self.init_unified_engine()
+<<<<<<< HEAD
         else:
             # init_unified_engine() used to run on EVERY construction, and its
             # DRAM self-test drew one torch.randint(8192, uint16) from the global
@@ -700,6 +701,8 @@ class UnifiedEngine:
             # byte unchanged. Must match init_unified_engine()'s draw exactly
             # (shape, dtype, device).
             torch.randint(0x0000, 0xFFFF, (8192,), dtype=torch.uint16, device=self.device)
+=======
+>>>>>>> 2e669ef0 (sync from pcie_only)
 
     @staticmethod
     def _align_up(value: int, align_bytes: int) -> int:

@@ -470,7 +470,30 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
     """
     import user_dma_core
 
+<<<<<<< HEAD
     ues, _dram_start_addr, _dram_base_stride = _make_multi_engine_ues(num_engines)
+=======
+    engine_base_stride = 0x00010000
+    # One 512 MB HBM pseudo-channel per engine, so no two engines share a
+    # memory controller. A 256 MB stride packs two engines into one channel.
+    dram_base_stride = 0x10000000
+
+    # HBM boards map DRAM from 0; the 2 GiB DDR4 boards start at 0x80000000.
+    if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
+        user_dma_core.configure_clock_from_hardware()
+    dram_start_addr = 0x0 if user_dma_core.AVAILABLE_DRAM_SIZE_GB >= 4 \
+        else user_dma_core.DRAM_START_ADDR
+
+    ues = []
+    for i in range(num_engines):
+        engine_dram_base = dram_start_addr + i * dram_base_stride
+        ue = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride,
+                            params_dram_base=engine_dram_base,
+                            tensor_dram_base=engine_dram_base + 0x08000000,
+                            program_dram_base=engine_dram_base + 0x0F000000,
+                            )
+        ues.append(ue)
+>>>>>>> 2e669ef0 (sync from pcie_only)
 
     a_addrs = []
     for i, ue in enumerate(ues):
@@ -544,6 +567,7 @@ def multi_core_dram_speed_test(data_size_kB: int = 512, num_engines: int = 4):
     """Concurrent DRAM read bandwidth across num_engines engines.
 
     Each engine DMA-reads its OWN private data_size_kB buffer from its OWN
+<<<<<<< HEAD
     DRAM window, so no two engines contend on one address range. The engines
     are barrier-synced so their reads overlap: engine 0 flag_sets, workers wait
     on it, then all read concurrently, workers flag_set, and engine 0 waits on
@@ -552,6 +576,17 @@ def multi_core_dram_speed_test(data_size_kB: int = 512, num_engines: int = 4):
 
     HBM hardware only: the layout is based at 0x0 and uses the shared
     _multi_engine_dram_layout() policy. Engines are NOT software-reset here.
+=======
+    512 MB DRAM window, so no two engines share an HBM pseudo-channel and no
+    two engines contend on one address range. The engines are barrier-synced
+    so their reads overlap: engine 0 flag_sets, workers wait on it, then all
+    read concurrently, workers flag_set, and engine 0 waits on every worker.
+    The measured latency therefore covers the whole concurrent read.
+
+    4 GB hardware only: the layout is based at 0x0 with a 512 MB stride, which
+    needs num_engines * 512 MB of HBM and assumes the HBM address space starts
+    at 0. Engines are NOT software-reset here.
+>>>>>>> 2e669ef0 (sync from pcie_only)
     """
     import user_dma_core
 
@@ -565,6 +600,15 @@ def multi_core_dram_speed_test(data_size_kB: int = 512, num_engines: int = 4):
     if num_engines < 1:
         raise ValueError(f"num_engines must be >= 1, got {num_engines}")
 
+<<<<<<< HEAD
+=======
+    engine_base_stride = 0x00010000
+    # 256 MB per core on the 8-core alveo, 512 MB per core on the 12-core
+    # alveo_u55c. HW_INFO has already been read above, so the count is set.
+    dram_base_stride = 0x10000000 if user_dma_core.ANDROMEDA_CORE_COUNT == 8 else 0x20000000
+    dram_start_addr = 0x0
+
+>>>>>>> 2e669ef0 (sync from pcie_only)
     transfer_bytes = data_size_kB * 1024
     element_size = transfer_bytes // 2          # bf16 elements
     if transfer_bytes % 2:
@@ -579,7 +623,27 @@ def multi_core_dram_speed_test(data_size_kB: int = 512, num_engines: int = 4):
             f"data_size_kB={data_size_kB} ({element_size} elements) exceeds the "
             f"{URAM_FULL_ELEMENTS}-element URAM ({URAM_FULL_ELEMENTS * 2 // 1024} kB)"
         )
+<<<<<<< HEAD
     ues, dram_start_addr, dram_base_stride = _make_multi_engine_ues(num_engines)
+=======
+    layout_end = dram_start_addr + (num_engines - 1) * dram_base_stride + 0x0F100000
+    dram_end = dram_start_addr + user_dma_core.AVAILABLE_DRAM_SIZE_GB * 1024 * 1024 * 1024
+    if layout_end > dram_end:
+        raise ValueError(
+            f"num_engines={num_engines} needs 0x{layout_end:x} of DRAM, "
+            f"but the 4 GB map ends at 0x{dram_end:x}"
+        )
+
+    ues = []
+    for i in range(num_engines):
+        engine_dram_base = dram_start_addr + i * dram_base_stride
+        ue = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride,
+                            params_dram_base=engine_dram_base,
+                            tensor_dram_base=engine_dram_base + 0x08000000,
+                            program_dram_base=engine_dram_base + 0x0F000000,
+                            )
+        ues.append(ue)
+>>>>>>> 2e669ef0 (sync from pcie_only)
 
     # Each engine reads from its own window: no shared source buffer.
     a_addrs = [ue.allocate_tensor_dram(transfer_bytes) for ue in ues]
@@ -849,12 +913,34 @@ def matmat_mul_multi_cores_unified_test(
     # Per-shape 1-engine dynamic latency (us), and the collected summary rows.
     baseline_us = {}
     summary_rows = []
+<<<<<<< HEAD
 
     def _run_case(M, K, N, dynamic, ne=None):
         if ne is None:
             ne = num_engines
         bytes_per_element = 2
         ues = _make_multi_engine_ues(ne)[0]
+=======
+
+    def _run_case(M, K, N, dynamic, ne=None):
+        if ne is None:
+            ne = num_engines
+        engine_base_stride = 0x00010000
+        program_region_stride = 0x01000000
+
+        ues = []
+        for i in range(ne):
+            ue = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride)
+            # This test shares one A/B/output tensor allocation across all engines.
+            # Each engine receives row-offset addresses inside matmat_mul_multi_cores().
+            ue._tensor_dram_addr = DRAM_ACTIVATION_ADDR
+            ue._next_program_dram_addr = DRAM_INSTRUCTION_ADDR + i * program_region_stride
+            ues.append(ue)
+
+        A_DRAM_ADDR = ues[0].allocate_tensor_dram(M * K * 2)
+        B_DRAM_ADDR = ues[0].allocate_tensor_dram(N * K * 2)
+        OUTPUT_DRAM_ADDR = ues[0].allocate_tensor_dram(M * N * 2)
+>>>>>>> 2e669ef0 (sync from pcie_only)
 
         a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
         if input_scale != 1.0:
@@ -954,6 +1040,11 @@ def matmat_mul_multi_cores_unified_test(
             f"{'silu_enabled' if silu_enable else 'silu_disabled'}_"
             f"{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}"
         )
+<<<<<<< HEAD
+=======
+        m_base, m_rem = divmod(M, ne)
+        m_shards = [m_base + (1 if i < m_rem else 0) for i in range(ne)]
+>>>>>>> 2e669ef0 (sync from pcie_only)
         # for i, ue in enumerate(ues):
         #     generate_trace(
         #         ue, f"matmat_mul_multi_cores_trace_engine{i}_{m_shards[i]}_{trace_suffix}.csv")
@@ -1105,9 +1196,16 @@ def quantized_matmat_mul_multi_cores_test(runtime_list=None, num_engines: int = 
       * The workload is sharded over N, not M. Each shard must be a multiple of
         UE_VECTOR_SIZE; if num_engines would leave a shard smaller than that,
         the extra cores are ignored (eff_ne = min(num_engines, N // 64)).
+<<<<<<< HEAD
       * Input A and output are also private per engine. Each engine receives
         its own copy of A, writes its local [M, cols] output shard, and the
         software test concatenates those shards along N for validation.
+=======
+      * Input A is SHARED (one allocation in core 0's tensor space, every engine
+        reads the same address) and the output is CONSECUTIVE in core 0's tensor
+        space, each engine writing its dense [M, cols] block. Only the weights
+        are separate.
+>>>>>>> 2e669ef0 (sync from pcie_only)
 
     The single-core reference runs first: it supplies both the bit-exactness
     reference and the FPGA latency baseline every speedup is computed against.
@@ -1126,6 +1224,17 @@ def quantized_matmat_mul_multi_cores_test(runtime_list=None, num_engines: int = 
             raise ValueError(
                 f"contiguous N-shard writeback requires M=1, got M={M}")
 
+<<<<<<< HEAD
+=======
+    engine_base_stride = 0x00010000
+    # Same layout as multi_core_dram_speed_test: base 0x0, 256 MB per core for
+    # alveo (8 cores) and 512 MB per core for alveo_u55c (12 cores). The core
+    # count comes from HW_INFO, which is None until it has actually been read.
+    if user_dma_core.ANDROMEDA_CORE_COUNT is None:
+        user_dma_core.configure_clock_from_hardware()
+    dram_base_stride = 0x10000000 if user_dma_core.ANDROMEDA_CORE_COUNT == 8 else 0x20000000
+    dram_start_addr = 0x0
+>>>>>>> 2e669ef0 (sync from pcie_only)
     bytes_per_element = 2
 
     summary_rows = []
@@ -1141,7 +1250,19 @@ def quantized_matmat_mul_multi_cores_test(runtime_list=None, num_engines: int = 
         return splits
 
     def _run(M, K, N, ne, a, b, want_ref=False, dynamic=False):
+<<<<<<< HEAD
         ues = _make_multi_engine_ues(ne)[0]
+=======
+        ues = []
+        for i in range(ne):
+            engine_dram_base = dram_start_addr + i * dram_base_stride
+            ues.append(UnifiedEngine(
+                BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride,
+                params_dram_base=engine_dram_base,
+                tensor_dram_base=engine_dram_base + 0x08000000,
+                program_dram_base=engine_dram_base + 0x0F000000,
+            ))
+>>>>>>> 2e669ef0 (sync from pcie_only)
 
         # Software model of the quantize+dequantize the hardware will apply, so
         # the CPU reference is a fair comparison (pure torch, no DRAM traffic).
@@ -1160,6 +1281,7 @@ def quantized_matmat_mul_multi_cores_test(runtime_list=None, num_engines: int = 
             b_addrs.append(b_addr)
             scale_addrs.append(scale_addr)
 
+<<<<<<< HEAD
         # PRIVATE input/output windows: every engine reads A and its B shard
         # from its own HBM window, then writes its N shard locally.
         a_addrs = []
@@ -1170,6 +1292,13 @@ def quantized_matmat_mul_multi_cores_test(runtime_list=None, num_engines: int = 
             ue.dma_to_accelerator_memory(a_addr, a)
             a_addrs.append(a_addr)
             out_addrs.append(out_addr)
+=======
+        # SHARED input and CONSECUTIVE output, both in core 0's tensor space.
+        a_addr = ues[0].allocate_tensor_dram(M * K * bytes_per_element)
+        ues[0].dma_to_accelerator_memory(a_addr, a)
+        out_addr = ues[0].allocate_tensor_dram(M * N * bytes_per_element)
+        out_offsets = [n_off * M * bytes_per_element for n_off, _ in splits]
+>>>>>>> 2e669ef0 (sync from pcie_only)
 
         program_addrs = []
         # Core 0 is the master. It raises the start flag, every worker waits on
@@ -1198,9 +1327,15 @@ def quantized_matmat_mul_multi_cores_test(runtime_list=None, num_engines: int = 
                 ue.generate_instruction_add_set(n_reg, splits[i][1])
             ue.quantized_matmat_core(
                 M=M, K=K, N=splits[i][1],
+<<<<<<< HEAD
                 A_DRAM_ADDR=a_addrs[i],
                 B_DRAM_ADDR=b_addrs[i],
                 OUTPUT_DRAM_ADDR=out_addrs[i],
+=======
+                A_DRAM_ADDR=a_addr,
+                B_DRAM_ADDR=b_addrs[i],
+                OUTPUT_DRAM_ADDR=out_addr + out_offsets[i],
+>>>>>>> 2e669ef0 (sync from pcie_only)
                 SCALE_DRAM_ADDR=scale_addrs[i],
                 data_type=data_type,
                 gpr_M_reg=m_reg, gpr_K_reg=k_reg, gpr_N_reg=n_reg)
@@ -1241,10 +1376,17 @@ def quantized_matmat_mul_multi_cores_test(runtime_list=None, num_engines: int = 
         # The master cannot retire before every worker has flag_set, so its own
         # latency already bounds the run and no worker poll is needed.
         latency_us = ues[0].report_latency_in_us()
+<<<<<<< HEAD
         output = torch.cat([
             ue.dma_from_accelerator_memory(out_addr, (M, cols))
             for ue, out_addr, (_n_off, cols) in zip(ues, out_addrs, splits)
         ], dim=1)
+=======
+        # One consecutive read by the master. Reading the whole [M, N] row in a
+        # single transfer is also what proves the shards landed contiguously;
+        # per-shard reads at the offsets we wrote could not catch a bad offset.
+        output = ues[0].dma_from_accelerator_memory(out_addr, (M, N))
+>>>>>>> 2e669ef0 (sync from pcie_only)
 
         for ue in ues:
             ue.reset_tensor_dram_addr()
