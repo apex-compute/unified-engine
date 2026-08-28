@@ -118,7 +118,10 @@ del models/pi05/pi05_bin/programs.json
 del models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.bin
 del models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.json
 
-# --- qwen3 1.7b / 4b: keep params.* ; drop programs/instruction -------------
+# --- qwen3 0.6b / 1.7b / 4b: keep params.* ; drop programs/instruction -------
+del models/qwen3_0.6b/qwen3_0.6b_bin/qwen3_0.6b_instruction*
+del models/qwen3_0.6b/qwen3_0.6b_bin/programs.bin
+del models/qwen3_0.6b/qwen3_0.6b_bin/programs.json
 del models/qwen3_1.7b/qwen3_1.7b_bin/qwen3_1.7b_instruction*
 del models/qwen3_1.7b/qwen3_1.7b_bin/programs.bin
 del models/qwen3_1.7b/qwen3_1.7b_bin/programs.json
