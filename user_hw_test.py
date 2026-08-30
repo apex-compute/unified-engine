@@ -26,7 +26,6 @@ from user_dma_core import (
     DMA_DEVICE_H2C,
     DMA_DEVICE_USER,
     DRAM_ACTIVATION_ADDR,
-    DRAM_INSTRUCTION_ADDR,
     INSTRUCTION_SIZE_BYTES,
     INT_CAUSE_HALT,
     INT_CAUSE_NONE,
@@ -80,6 +79,58 @@ _MAX_RNG_ALIGNED_AXI_DATA_WIDTH_BITS = 512
 # Allow a 0.5% decode-cost penalty for the dynamic Gemma3 hardware change.
 GEMMA3_HARDWARE_PENALTY_FACTOR = 1.005
 KINTEX7_SYSTOLIC_CSR_BASE_ADDR = 0x02020000
+
+
+def _multi_engine_dram_layout(num_engines: int):
+    """Return per-engine DRAM bases for multi-engine tests.
+
+    Alveo HBM designs expose at least 4 GB and map HBM from address 0. The
+    8-engine U50C build uses 256 MB windows; the 12-engine U55C build uses
+    512 MB windows. Smaller DDR designs keep the legacy DRAM_START_ADDR base,
+    but still use non-overlapping 256 MB windows for private multi-engine tests.
+    """
+    import user_dma_core
+
+    if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
+        user_dma_core.configure_clock_from_hardware()
+    if num_engines < 1:
+        raise ValueError(f"num_engines must be >= 1, got {num_engines}")
+
+    is_hbm = user_dma_core.AVAILABLE_DRAM_SIZE_GB >= 4
+    if is_hbm:
+        dram_start_addr = 0x0
+        dram_base_stride = (
+            0x10000000 if user_dma_core.ANDROMEDA_CORE_COUNT == 8 else 0x20000000
+        )
+        layout_end = dram_start_addr + (num_engines - 1) * dram_base_stride + 0x0F100000
+        dram_end = user_dma_core.AVAILABLE_DRAM_SIZE_GB * 1024 * 1024 * 1024
+        if layout_end > dram_end:
+            raise ValueError(
+                f"num_engines={num_engines} needs 0x{layout_end:x} of DRAM, "
+                f"but HW_INFO reports only 0x{dram_end:x} bytes"
+            )
+    else:
+        dram_start_addr = user_dma_core.DRAM_START_ADDR
+        dram_base_stride = 0x10000000
+
+    return dram_start_addr, dram_base_stride
+
+
+def _make_multi_engine_ues(num_engines: int):
+    import user_dma_core
+
+    engine_base_stride = 0x00010000
+    dram_start_addr, dram_base_stride = _multi_engine_dram_layout(num_engines)
+    ues = []
+    for i in range(num_engines):
+        engine_dram_base = dram_start_addr + i * dram_base_stride
+        ues.append(UnifiedEngine(
+            BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride,
+            params_dram_base=engine_dram_base,
+            tensor_dram_base=engine_dram_base + 0x08000000,
+            program_dram_base=engine_dram_base + 0x0F000000,
+        ))
+    return ues, dram_start_addr, dram_base_stride
 
 
 def _rng_state_fingerprint() -> str:
@@ -321,17 +372,8 @@ def matmat_mul_two_engine_flag_check_test(
     M_three_fourth = M * 3 // 4
     M_one_fourth = M // 4
 
-    engine0_base = user_dma_core.UE_0_BASE_ADDR
-    engine1_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000
-    tensor_region_stride = 0x04000000
-
-    ue0 = UnifiedEngine(BASE_ADDR=engine0_base)
-    ue1 = UnifiedEngine(BASE_ADDR=engine1_base)
-    ue0._tensor_dram_addr = DRAM_ACTIVATION_ADDR
-    ue1._tensor_dram_addr = DRAM_ACTIVATION_ADDR + tensor_region_stride
-    ue0._next_program_dram_addr = DRAM_INSTRUCTION_ADDR
-    ue1._next_program_dram_addr = DRAM_INSTRUCTION_ADDR + 0x01000000
-
+    ues, _dram_start_addr, _dram_base_stride = _make_multi_engine_ues(2)
+    ue0, ue1 = ues
 
     e0_a_addr = ue0.allocate_tensor_dram(M_three_fourth * K * 2)
     e0_b_addr = ue0.allocate_tensor_dram(N * K * 2)
@@ -428,21 +470,11 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
     """
     import user_dma_core
 
-    engine_base_stride = 0x00010000
-    dram_base_stride = 0x10000000
-
-    ues = []
-    for i in range(num_engines):
-        ue = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride,
-                            params_dram_base=user_dma_core.DRAM_START_ADDR + i * dram_base_stride,
-                            tensor_dram_base=user_dma_core.DRAM_START_ADDR + i * dram_base_stride + 0x08000000,
-                            program_dram_base=user_dma_core.DRAM_START_ADDR + i * dram_base_stride + 0x0F000000,
-                            )
-        ues.append(ue)
+    ues, _dram_start_addr, _dram_base_stride = _make_multi_engine_ues(num_engines)
 
     a_addrs = []
     for i, ue in enumerate(ues):
-        ue.software_reset()
+        # ue.software_reset()
         a_addrs.append(ue.allocate_tensor_dram(1 * 1024 * 1024))
     if shared_read:
         # All engines read the same DRAM buffer (engine 0's allocation).
@@ -507,6 +539,113 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
 
     return speed_mb_per_s
 
+
+def multi_core_dram_speed_test(data_size_kB: int = 512, num_engines: int = 4):
+    """Concurrent DRAM read bandwidth across num_engines engines.
+
+    Each engine DMA-reads its OWN private data_size_kB buffer from its OWN
+    DRAM window, so no two engines contend on one address range. The engines
+    are barrier-synced so their reads overlap: engine 0 flag_sets, workers wait
+    on it, then all read concurrently, workers flag_set, and engine 0 waits on
+    every worker. The measured latency therefore covers the whole concurrent
+    read.
+
+    HBM hardware only: the layout is based at 0x0 and uses the shared
+    _multi_engine_dram_layout() policy. Engines are NOT software-reset here.
+    """
+    import user_dma_core
+
+    if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
+        user_dma_core.configure_clock_from_hardware()
+    if user_dma_core.AVAILABLE_DRAM_SIZE_GB < 4:
+        raise RuntimeError(
+            f"multi_core_dram_speed_test targets 4 GB or larger hardware only; "
+            f"HW_INFO reports {user_dma_core.AVAILABLE_DRAM_SIZE_GB} GB"
+        )
+    if num_engines < 1:
+        raise ValueError(f"num_engines must be >= 1, got {num_engines}")
+
+    transfer_bytes = data_size_kB * 1024
+    element_size = transfer_bytes // 2          # bf16 elements
+    if transfer_bytes % 2:
+        raise ValueError(f"data_size_kB={data_size_kB} must be a whole number of bf16 elements")
+    if element_size % UE_VECTOR_SIZE:
+        raise ValueError(
+            f"data_size_kB={data_size_kB} gives {element_size} elements, "
+            f"not a multiple of UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
+        )
+    if element_size > URAM_FULL_ELEMENTS:
+        raise ValueError(
+            f"data_size_kB={data_size_kB} ({element_size} elements) exceeds the "
+            f"{URAM_FULL_ELEMENTS}-element URAM ({URAM_FULL_ELEMENTS * 2 // 1024} kB)"
+        )
+    ues, dram_start_addr, dram_base_stride = _make_multi_engine_ues(num_engines)
+
+    # Each engine reads from its own window: no shared source buffer.
+    a_addrs = [ue.allocate_tensor_dram(transfer_bytes) for ue in ues]
+
+    prog_addrs = []
+    ues[0].start_capture()
+    ues[0].generate_instruction_flag_set()
+    ues[0].accelerator_memory_to_sram(accelerator_dram_address=a_addrs[0],
+                                      sram_address=0x00000,
+                                      element_size=element_size)
+    for i in range(1, num_engines):
+        ues[0].generate_instruction_flag_check(target_engine_idx=i)
+    ues[0].generate_instruction_flag_clear()
+    ues[0].generate_instruction_halt()
+    ues[0].stop_capture()
+    prog_addrs.append(ues[0].get_program_dram_addr())
+    ues[0].write_captured_instructions_to_dram(prog_addrs[0])
+    ues[0].allocate_program_dram(ues[0].get_capture_instruction_size_bytes())
+
+    for i in range(1, num_engines):
+        ues[i].start_capture()
+        ues[i].generate_instruction_flag_clear()
+        ues[i].generate_instruction_flag_check(target_engine_idx=0)
+        ues[i].accelerator_memory_to_sram(accelerator_dram_address=a_addrs[i],
+                                          sram_address=0x00000,
+                                          element_size=element_size)
+        # if i == 2:
+        #     ues[i].accelerator_memory_to_sram(accelerator_dram_address=a_addrs[i],
+        #                                       sram_address=0x00000,
+        #                                       element_size=element_size)
+        ues[i].generate_instruction_flag_set()
+        ues[i].generate_instruction_halt()
+        ues[i].stop_capture()
+        prog_addrs.append(ues[i].get_program_dram_addr())
+        ues[i].write_captured_instructions_to_dram(prog_addrs[i])
+        ues[i].allocate_program_dram(ues[i].get_capture_instruction_size_bytes())
+
+    # Workers first so their flag_clear runs before engine 0 starts polling.
+    for i in range(1, num_engines):
+        ues[i].start_execute_from_dram(prog_addrs[i])
+    ues[0].start_execute_from_dram(prog_addrs[0])
+    ues[0].wait_queue(10.0)
+
+    latency_us = ues[0].report_latency_in_us()
+    total_bytes_transferred = num_engines * transfer_bytes
+    speed_mb_per_s = total_bytes_transferred / latency_us
+    print(f"multi_core_dram_speed_test: {num_engines} engines x {data_size_kB} kB "
+          f"({element_size} elements each), base=0x{dram_start_addr:x}, "
+          f"stride=0x{dram_base_stride:x}")
+    print(f"Total latency: {latency_us} us")
+    print(f"speed {speed_mb_per_s:.2f} MB/s")
+    # for i in range(num_engines):
+    #     generate_trace(ues[i],
+    #                    f"multi_core_dram_speed_test_{data_size_kB}kB_engine_{num_engines}_{i}.csv")
+
+    record_test("multi_core_dram_speed",
+                f"data_size_kB={data_size_kB}, num_engines={num_engines}",
+                mb_per_s=speed_mb_per_s)
+
+    for ue in ues:
+        ue.reset_tensor_dram_addr()
+        ue.clear_capture_buffer()
+
+    return speed_mb_per_s
+
+
 def matmat_mul_two_cores_unified_test(
     runtime_list=None,
     softmax_enable: bool = False,
@@ -526,46 +665,83 @@ def matmat_mul_two_cores_unified_test(
     assert runtime_list, "runtime_list must be non-empty"
 
     def _run_case(M, K, N, dynamic):
-        engine0_base = user_dma_core.UE_0_BASE_ADDR
-        engine1_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000
-        tensor_region_stride = 0x04000000
-
-        ue0 = UnifiedEngine(BASE_ADDR=engine0_base)
-        ue1 = UnifiedEngine(BASE_ADDR=engine1_base)
-        ue0._tensor_dram_addr = DRAM_ACTIVATION_ADDR
-        ue1._tensor_dram_addr = DRAM_ACTIVATION_ADDR + tensor_region_stride
-        ue0._next_program_dram_addr = DRAM_INSTRUCTION_ADDR
-        ue1._next_program_dram_addr = DRAM_INSTRUCTION_ADDR + 0x01000000
-
-        A_DRAM_ADDR = ue0.allocate_tensor_dram(M * K * 2)
-        B_DRAM_ADDR = ue0.allocate_tensor_dram(N * K * 2)
-        OUTPUT_DRAM_ADDR = ue0.allocate_tensor_dram(M * N * 2)
+        ues, _dram_start_addr, _dram_base_stride = _make_multi_engine_ues(2)
+        ue0, ue1 = ues
+        bytes_per_element = 2
+        m_engine0 = M // 2
+        m_engine1 = M - m_engine0
 
         a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
         if input_scale != 1.0:
             a = (a.to(torch.float32) * float(input_scale)).to(torch.bfloat16)
         b = torch.randn(N, K, dtype=torch.bfloat16)
 
-        ue0.dma_to_accelerator_memory(A_DRAM_ADDR, a)
-        ue0.dma_to_accelerator_memory(B_DRAM_ADDR, b)
+        e0_a_addr = ue0.allocate_tensor_dram(m_engine0 * K * bytes_per_element)
+        e0_b_addr = ue0.allocate_tensor_dram(N * K * bytes_per_element)
+        e0_out_addr = ue0.allocate_tensor_dram(m_engine0 * N * bytes_per_element)
+        e1_a_addr = ue1.allocate_tensor_dram(m_engine1 * K * bytes_per_element)
+        e1_b_addr = ue1.allocate_tensor_dram(N * K * bytes_per_element)
+        e1_out_addr = ue1.allocate_tensor_dram(m_engine1 * N * bytes_per_element)
 
-        total_flops = UnifiedEngine.matmat_mul_two_cores(
-            ue0=ue0,
-            ue1=ue1,
-            M=M,
-            K=K,
-            N=N,
-            A_DRAM_ADDR=A_DRAM_ADDR,
-            B_DRAM_ADDR=B_DRAM_ADDR,
-            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-            softmax_enable=softmax_enable,
-            gelu_enable=gelu_enable,
-            silu_enable=silu_enable,
-            sigmoid_enable=sigmoid_enable,
-            clamp_enable=clamp_enable,
-            log_enable=log_enable,
-            dynamic=dynamic,
-        )
+        ue0.dma_to_accelerator_memory(e0_a_addr, a[:m_engine0, :])
+        ue0.dma_to_accelerator_memory(e0_b_addr, b)
+        ue1.dma_to_accelerator_memory(e1_a_addr, a[m_engine0:, :])
+        ue1.dma_to_accelerator_memory(e1_b_addr, b)
+
+        def _program_engine(ue, is_master, m_engine, a_addr, b_addr, out_addr):
+            m_reg = k_reg = n_reg = None
+            if dynamic:
+                m_reg = ue.alloc_isa_reg()
+                k_reg = ue.alloc_isa_reg()
+                n_reg = ue.alloc_isa_reg()
+            ue.start_capture()
+            if is_master:
+                ue.generate_instruction_flag_clear()
+            if dynamic:
+                ue.generate_instruction_add_set(m_reg, m_engine)
+                ue.generate_instruction_add_set(k_reg, K)
+                ue.generate_instruction_add_set(n_reg, N)
+            flops = ue.matmat_mul_core(
+                M=m_engine,
+                K=K,
+                N=N,
+                A_DRAM_ADDR=a_addr,
+                B_DRAM_ADDR=b_addr,
+                OUTPUT_DRAM_ADDR=out_addr,
+                softmax_enable=softmax_enable,
+                gelu_enable=gelu_enable,
+                silu_enable=silu_enable,
+                sigmoid_enable=sigmoid_enable,
+                clamp_enable=clamp_enable,
+                log_enable=log_enable,
+                gpr_M_reg=m_reg,
+                gpr_K_reg=k_reg,
+                gpr_N_reg=n_reg,
+            )
+            if is_master:
+                ue.generate_instruction_flag_set()
+            else:
+                ue.generate_instruction_flag_check(target_engine_idx=0)
+            ue.generate_instruction_halt()
+            ue.stop_capture()
+            if dynamic:
+                ue.release_isa_reg()
+                ue.release_isa_reg()
+                ue.release_isa_reg()
+            program_addr = ue.get_program_dram_addr()
+            ue.write_captured_instructions_to_dram(program_addr)
+            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+            return program_addr, flops
+
+        e0_prog_addr, flops0 = _program_engine(
+            ue0, True, m_engine0, e0_a_addr, e0_b_addr, e0_out_addr)
+        e1_prog_addr, flops1 = _program_engine(
+            ue1, False, m_engine1, e1_a_addr, e1_b_addr, e1_out_addr)
+
+        ue0.start_execute_from_dram(e0_prog_addr)
+        ue1.start_execute_from_dram(e1_prog_addr)
+        ue1.wait_queue(10.0)
+        total_flops = flops0 + flops1
         ue0.report_timing_and_instruction_count()
         ue1.report_timing_and_instruction_count()
 
@@ -591,7 +767,9 @@ def matmat_mul_two_cores_unified_test(
         generate_trace(
             ue1, f"matmat_mul_two_cores_trace_engine1_{M - (M // 2)}_{trace_suffix}.csv")
 
-        output = ue0.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+        out0 = ue0.dma_from_accelerator_memory(e0_out_addr, (m_engine0, N))
+        out1 = ue1.dma_from_accelerator_memory(e1_out_addr, (m_engine1, N))
+        output = torch.cat([out0, out1], dim=0)
         ref = a @ b.T
         if gelu_enable:
             ref = ref * torch.sigmoid(1.702 * ref)
@@ -655,64 +833,117 @@ def matmat_mul_multi_cores_unified_test(
     input_scale: float = 1.0,
     snr_threshold_db: float = 40.0,
 ):
-    """Run RNG-matched legacy/dynamic multi-core matmuls (M sharded across num_engines)."""
+    """Run RNG-matched legacy/dynamic multi-core matmuls (M sharded across num_engines).
+
+    Each shape first runs the DYNAMIC path on ONE engine to get the FPGA-side
+    single-core execution time; that latency is the baseline every multi-core
+    leg's speedup is computed against. A summary table of all shapes, legs,
+    latencies, GFLOPS, SNR and speedups is printed at the end.
+    """
     import user_dma_core
 
     if runtime_list is None:
         runtime_list = [(4096, 4096, 4096)]
     assert runtime_list, "runtime_list must be non-empty"
 
-    def _run_case(M, K, N, dynamic):
-        engine_base_stride = 0x00010000
-        program_region_stride = 0x01000000
+    # Per-shape 1-engine dynamic latency (us), and the collected summary rows.
+    baseline_us = {}
+    summary_rows = []
 
-        ues = []
-        for i in range(num_engines):
-            ue = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride)
-            # This test shares one A/B/output tensor allocation across all engines.
-            # Each engine receives row-offset addresses inside matmat_mul_multi_cores().
-            ue._tensor_dram_addr = DRAM_ACTIVATION_ADDR
-            ue._next_program_dram_addr = DRAM_INSTRUCTION_ADDR + i * program_region_stride
-            ues.append(ue)
-
-        A_DRAM_ADDR = ues[0].allocate_tensor_dram(M * K * 2)
-        B_DRAM_ADDR = ues[0].allocate_tensor_dram(N * K * 2)
-        OUTPUT_DRAM_ADDR = ues[0].allocate_tensor_dram(M * N * 2)
+    def _run_case(M, K, N, dynamic, ne=None):
+        if ne is None:
+            ne = num_engines
+        bytes_per_element = 2
+        ues = _make_multi_engine_ues(ne)[0]
 
         a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
         if input_scale != 1.0:
             a = (a.to(torch.float32) * float(input_scale)).to(torch.bfloat16)
         b = torch.randn(N, K, dtype=torch.bfloat16)
 
-        ues[0].dma_to_accelerator_memory(A_DRAM_ADDR, a)
-        ues[0].dma_to_accelerator_memory(B_DRAM_ADDR, b)
+        m_base, m_rem = divmod(M, ne)
+        m_shards = [m_base + (1 if i < m_rem else 0) for i in range(ne)]
 
-        total_flops = UnifiedEngine.matmat_mul_multi_cores(
-            ues=ues,
-            M=M,
-            K=K,
-            N=N,
-            A_DRAM_ADDR=A_DRAM_ADDR,
-            B_DRAM_ADDR=B_DRAM_ADDR,
-            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
-            softmax_enable=softmax_enable,
-            gelu_enable=gelu_enable,
-            silu_enable=silu_enable,
-            sigmoid_enable=sigmoid_enable,
-            clamp_enable=clamp_enable,
-            log_enable=log_enable,
-            dynamic=dynamic,
-        )
+        a_addrs = []
+        b_addrs = []
+        out_addrs = []
+        row_base = 0
+        for ue, m_engine in zip(ues, m_shards):
+            row_end = row_base + m_engine
+            a_addr = ue.allocate_tensor_dram(m_engine * K * bytes_per_element)
+            b_addr = ue.allocate_tensor_dram(N * K * bytes_per_element)
+            out_addr = ue.allocate_tensor_dram(m_engine * N * bytes_per_element)
+            ue.dma_to_accelerator_memory(a_addr, a[row_base:row_end, :])
+            ue.dma_to_accelerator_memory(b_addr, b)
+            a_addrs.append(a_addr)
+            b_addrs.append(b_addr)
+            out_addrs.append(out_addr)
+            row_base = row_end
+
+        total_flops = 0
+        program_addrs = []
+        for i, (ue, m_engine) in enumerate(zip(ues, m_shards)):
+            is_last = (i == ne - 1)
+            m_reg = k_reg = n_reg = None
+            if dynamic:
+                m_reg = ue.alloc_isa_reg()
+                k_reg = ue.alloc_isa_reg()
+                n_reg = ue.alloc_isa_reg()
+            ue.start_capture()
+            if not is_last:
+                ue.generate_instruction_flag_clear()
+            if dynamic:
+                ue.generate_instruction_add_set(m_reg, m_engine)
+                ue.generate_instruction_add_set(k_reg, K)
+                ue.generate_instruction_add_set(n_reg, N)
+            total_flops += ue.matmat_mul_core(
+                M=m_engine,
+                K=K,
+                N=N,
+                A_DRAM_ADDR=a_addrs[i],
+                B_DRAM_ADDR=b_addrs[i],
+                OUTPUT_DRAM_ADDR=out_addrs[i],
+                softmax_enable=softmax_enable,
+                gelu_enable=gelu_enable,
+                silu_enable=silu_enable,
+                sigmoid_enable=sigmoid_enable,
+                clamp_enable=clamp_enable,
+                log_enable=log_enable,
+                gpr_M_reg=m_reg,
+                gpr_K_reg=k_reg,
+                gpr_N_reg=n_reg,
+            )
+            if not is_last:
+                ue.generate_instruction_flag_set()
+            else:
+                for j in range(ne - 1):
+                    ue.generate_instruction_flag_check(target_engine_idx=j)
+            ue.generate_instruction_halt()
+            ue.stop_capture()
+            if dynamic:
+                ue.release_isa_reg()
+                ue.release_isa_reg()
+                ue.release_isa_reg()
+            program_addr = ue.get_program_dram_addr()
+            ue.write_captured_instructions_to_dram(program_addr)
+            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+            program_addrs.append(program_addr)
+
+        for ue, program_addr in zip(ues, program_addrs):
+            ue.start_execute_from_dram(program_addr)
+        ues[-1].wait_queue(10.0)
         for ue in ues:
             ue.report_timing_and_instruction_count()
 
         # Parallel completion time is bounded by the slowest engine.
         latency_us = max(ue.report_latency_in_us() for ue in ues)
         flop_rate_gflops = total_flops / (latency_us * 1e3)
-        flops_ratio = flop_rate_gflops / user_dma_core.UE_PEAK_GFLOPS / (10 * num_engines)
+        # Peak is the peak of THIS leg's engine count: the 1-core baseline is
+        # measured against 1-core peak, the multi-core legs against ne-core peak.
+        flops_ratio = flop_rate_gflops / user_dma_core.UE_PEAK_GFLOPS / (10 * ne)
         print(
-            f"Report FLOPS for {num_engines}-cores MxKxN Matmul: {flop_rate_gflops:.2f} GFLOPS, "
-            f"{flops_ratio:.2f}% peak throughput for M={M}, K={K}, N={N}, "
+            f"Report FLOPS for {ne}-cores MxKxN Matmul: {flop_rate_gflops:.2f} GFLOPS, "
+            f"{flops_ratio:.2f}% of {ne}-core peak throughput for M={M}, K={K}, N={N}, "
             f"softmax_enable={softmax_enable}, gelu_enable={gelu_enable}, "
             f"silu_enable={silu_enable}, sigmoid_enable={sigmoid_enable}, dynamic={dynamic}"
         )
@@ -723,13 +954,14 @@ def matmat_mul_multi_cores_unified_test(
             f"{'silu_enabled' if silu_enable else 'silu_disabled'}_"
             f"{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}"
         )
-        m_base, m_rem = divmod(M, num_engines)
-        m_shards = [m_base + (1 if i < m_rem else 0) for i in range(num_engines)]
-        for i, ue in enumerate(ues):
-            generate_trace(
-                ue, f"matmat_mul_multi_cores_trace_engine{i}_{m_shards[i]}_{trace_suffix}.csv")
+        # for i, ue in enumerate(ues):
+        #     generate_trace(
+        #         ue, f"matmat_mul_multi_cores_trace_engine{i}_{m_shards[i]}_{trace_suffix}.csv")
 
-        output = ues[0].dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+        output = torch.cat([
+            ue.dma_from_accelerator_memory(out_addr, (m_engine, N))
+            for ue, out_addr, m_engine in zip(ues, out_addrs, m_shards)
+        ], dim=0)
         ref = a @ b.T
         if gelu_enable:
             ref = ref * torch.sigmoid(1.702 * ref)
@@ -751,7 +983,7 @@ def matmat_mul_multi_cores_unified_test(
         out_nonzero = (output != 0).sum().item()
         out_total = output.numel()
         print(
-            f"{num_engines}-cores matmul output stats: "
+            f"{ne}-cores matmul output stats: "
             f"ref_nan={ref_nan}, out_nan={out_nan}, ref_inf={ref_inf}, out_inf={out_inf}, "
             f"out_nonzero={out_nonzero}/{out_total}"
         )
@@ -766,14 +998,14 @@ def matmat_mul_multi_cores_unified_test(
             shard_total = out_shard.numel()
             shard_snr = calculate_snr(ref_shard, out_shard)
             print(
-                f"{num_engines}-cores shard engine{i}: rows={row_base}:{row_end}, "
+                f"{ne}-cores shard engine{i}: rows={row_base}:{row_end}, "
                 f"snr={shard_snr:.2f} dB, nan={shard_nan}, inf={shard_inf}, "
                 f"nonzero={shard_nonzero}/{shard_total}"
             )
             row_base = row_end
 
         snr_combined = calculate_snr(ref, output)
-        print(f"{num_engines}-cores matmul SNR combined: {snr_combined:.2f} dB")
+        print(f"{ne}-cores matmul SNR combined: {snr_combined:.2f} dB")
         assert snr_combined >= snr_threshold_db or snr_combined == float("inf"), \
             f"SNR {snr_combined:.2f} dB must be at least {snr_threshold_db:g} dB"
 
@@ -787,26 +1019,323 @@ def matmat_mul_multi_cores_unified_test(
         if dynamic:        flags.append("dynamic")
         if input_scale != 1.0: flags.append(f"scale={input_scale:g}")
         flag_str = ("+" + "+".join(flags)) if flags else ""
+        is_baseline = (ne == 1 and dynamic)
+        name = (f"matmat_mul_multi_cores_1core_baseline{flag_str}" if is_baseline
+                else f"matmat_mul_multi_cores{flag_str}")
         record_test(
-            f"matmat_mul_multi_cores{flag_str}",
-            f"M={M}, K={K}, N={N}, num_engines={num_engines}",
+            name,
+            f"M={M}, K={K}, N={N}, ne={ne}",
             snr_db=snr_combined,
             gflops=flop_rate_gflops,
         )
 
+        # Speedup is against the 1-engine dynamic FPGA execution time.
+        base_us = baseline_us.get((M, K, N))
+        speedup = (base_us / latency_us) if (base_us and latency_us) else None
+        summary_rows.append({
+            "shape": f"{M}x{K}x{N}",
+            "leg": "1-core baseline (dynamic)" if is_baseline
+                   else ("dynamic" if dynamic else "legacy"),
+            "engines": ne,
+            "latency_us": latency_us,
+            "gflops": flop_rate_gflops,
+            "peak_pct": flops_ratio,
+            "snr_db": snr_combined,
+            "speedup": speedup,
+        })
+
         for ue in ues:
             ue.reset_tensor_dram_addr()
             ue.clear_capture_buffer()
+
+        return latency_us, flop_rate_gflops, snr_combined
 
     for M, K, N in runtime_list:
         assert M >= num_engines, \
             f"M must be at least num_engines for multi-core execution, got M={M}, num_engines={num_engines}"
         assert K % UE_VECTOR_SIZE == 0 and N % UE_VECTOR_SIZE == 0, \
             "runtime K and N must be multiples of 64"
+        # Single-engine dynamic run FIRST: its FPGA execution time is the
+        # speedup baseline. Its shard is the whole M, so M must be 64-aligned.
+        assert M % UE_VECTOR_SIZE == 0, \
+            f"M={M} must be a multiple of {UE_VECTOR_SIZE} for the 1-engine baseline"
+        rng_state = _capture_rng_state()
+        base_latency_us, _, _ = _run_case(M, K, N, dynamic=True, ne=1)
+        baseline_us[(M, K, N)] = base_latency_us
+        print(f"1-core dynamic baseline for M={M}, K={K}, N={N}: "
+              f"{base_latency_us:.1f} us")
+        _restore_rng_state(rng_state)
         _run_rng_matched_pair(
             lambda M=M, K=K, N=N: _run_case(M, K, N, dynamic=False),
             lambda M=M, K=K, N=N: _run_case(M, K, N, dynamic=True),
         )
+
+    # ---- Summary -----------------------------------------------------------
+    print(f"\n=== matmat_mul_multi_cores_unified_test summary "
+          f"({num_engines} engines; speedup vs 1-core dynamic FPGA time; "
+          f"%peak vs each leg's own engine-count peak) ===")
+    header = (f"{'shape (MxKxN)':<20}{'leg':<28}{'eng':>5}"
+              f"{'latency(us)':>14}{'GFLOPS':>12}{'%peak':>9}"
+              f"{'SNR(dB)':>10}{'speedup':>10}")
+    print(header)
+    print("-" * len(header))
+    for row in summary_rows:
+        snr = row["snr_db"]
+        snr_str = "inf" if snr == float("inf") else f"{snr:.1f}"
+        spd = row["speedup"]
+        spd_str = "base" if spd is None else f"{spd:.2f}x"
+        print(f"{row['shape']:<20}{row['leg']:<28}{row['engines']:>5}"
+              f"{row['latency_us']:>14.1f}{row['gflops']:>12.2f}"
+              f"{row['peak_pct']:>8.2f}%{snr_str:>10}{spd_str:>10}")
+    print("-" * len(header))
+    print()
+    return summary_rows
+
+
+def quantized_matmat_mul_multi_cores_test(runtime_list=None, num_engines: int = 8,
+                                          data_type=TYPE.IF4, int_variant: bool = True,
+                                          snr_threshold_db: float = 40.0):
+    """Quantized multi-core matmul, N-sharded, with PRIVATE per-core weights.
+
+    Differs from matmat_mul_multi_cores_unified_test in three ways:
+
+      * Weights are quantized THROUGH each engine, so every core's B row block
+        (+ its scale blob) lands in that core's OWN private DRAM window. Weight
+        reads never contend on one address range.
+      * The workload is sharded over N, not M. Each shard must be a multiple of
+        UE_VECTOR_SIZE; if num_engines would leave a shard smaller than that,
+        the extra cores are ignored (eff_ne = min(num_engines, N // 64)).
+      * Input A and output are also private per engine. Each engine receives
+        its own copy of A, writes its local [M, cols] output shard, and the
+        software test concatenates those shards along N for validation.
+
+    The single-core reference runs first: it supplies both the bit-exactness
+    reference and the FPGA latency baseline every speedup is computed against.
+    """
+    import user_dma_core
+    global _PAIR_ID_COUNTER, _CURRENT_PAIR_ID
+
+    if runtime_list is None:
+        runtime_list = [(1, 1536, 4096)]
+    assert runtime_list, "runtime_list must be non-empty"
+    for M, _K, _N in runtime_list:
+        # Each core writes its N slice straight into one contiguous output row.
+        # With M>1 a column shard is strided in a row-major [M, N] buffer, so
+        # direct writeback would need a stride the kernel does not emit here.
+        if M != 1:
+            raise ValueError(
+                f"contiguous N-shard writeback requires M=1, got M={M}")
+
+    bytes_per_element = 2
+
+    summary_rows = []
+
+    def _split_n(N, ne):
+        """Even N split; every shard a whole multiple of UE_VECTOR_SIZE."""
+        blocks, rem = divmod(N // UE_VECTOR_SIZE, ne)
+        splits, off = [], 0
+        for i in range(ne):
+            cols = (blocks + (1 if i < rem else 0)) * UE_VECTOR_SIZE
+            splits.append((off, cols))
+            off += cols
+        return splits
+
+    def _run(M, K, N, ne, a, b, want_ref=False, dynamic=False):
+        ues = _make_multi_engine_ues(ne)[0]
+
+        # Software model of the quantize+dequantize the hardware will apply, so
+        # the CPU reference is a fair comparison (pure torch, no DRAM traffic).
+        b_ref = (ues[0].quantize_weight_simulate(
+            b, data_type=data_type, int_variant=int_variant) if want_ref else None)
+
+        splits = _split_n(N, ne)
+
+        # PRIVATE weights: engine i quantizes its own B rows through itself, so
+        # the blob + scales land in engine i's params region.
+        b_addrs, scale_addrs = [], []
+        for i, (n_off, cols) in enumerate(splits):
+            b_addr, scale_addr = ues[i].quantize_weight(
+                weight=b[n_off:n_off + cols, :].contiguous(), N=cols, K=K,
+                data_type=data_type, int_variant=int_variant)
+            b_addrs.append(b_addr)
+            scale_addrs.append(scale_addr)
+
+        # PRIVATE input/output windows: every engine reads A and its B shard
+        # from its own HBM window, then writes its N shard locally.
+        a_addrs = []
+        out_addrs = []
+        for i, ue in enumerate(ues):
+            a_addr = ue.allocate_tensor_dram(M * K * bytes_per_element)
+            out_addr = ue.allocate_tensor_dram(M * splits[i][1] * bytes_per_element)
+            ue.dma_to_accelerator_memory(a_addr, a)
+            a_addrs.append(a_addr)
+            out_addrs.append(out_addr)
+
+        program_addrs = []
+        # Core 0 is the master. It raises the start flag, every worker waits on
+        # it before touching DRAM, so all cores begin together and host launch
+        # skew stays OUT of the measured window. At the end the master waits on
+        # every worker, so core 0's latency bounds the whole run.
+        for i, ue in enumerate(ues):
+            is_master = (i == 0)
+            # Dynamic path primes M/K/N GPRs on each engine before capture, so
+            # quantized_matmat_core dispatches to its runtime-dimension variant.
+            m_reg = k_reg = n_reg = None
+            if dynamic:
+                m_reg = ue.alloc_isa_reg()
+                k_reg = ue.alloc_isa_reg()
+                n_reg = ue.alloc_isa_reg()
+            ue.start_capture()
+            if ne > 1:
+                if is_master:
+                    ue.generate_instruction_flag_set()      # start barrier
+                else:
+                    ue.generate_instruction_flag_clear()
+                    ue.generate_instruction_flag_check(target_engine_idx=0)
+            if dynamic:
+                ue.generate_instruction_add_set(m_reg, M)
+                ue.generate_instruction_add_set(k_reg, K)
+                ue.generate_instruction_add_set(n_reg, splits[i][1])
+            ue.quantized_matmat_core(
+                M=M, K=K, N=splits[i][1],
+                A_DRAM_ADDR=a_addrs[i],
+                B_DRAM_ADDR=b_addrs[i],
+                OUTPUT_DRAM_ADDR=out_addrs[i],
+                SCALE_DRAM_ADDR=scale_addrs[i],
+                data_type=data_type,
+                gpr_M_reg=m_reg, gpr_K_reg=k_reg, gpr_N_reg=n_reg)
+            # #uncomment below to verifiy the effectiveness of the semaphore synchronization
+            # if i == 2:
+            #      ue.quantized_matmat_core(
+            #                     M=M, K=K, N=splits[i][1],
+            #                     A_DRAM_ADDR=a_addr,
+            #                     B_DRAM_ADDR=b_addrs[i],
+            #                     OUTPUT_DRAM_ADDR=out_addr + out_offsets[i],
+            #                     SCALE_DRAM_ADDR=scale_addrs[i],
+            #                     data_type=data_type)
+            if ne > 1:
+                if is_master:
+                    for j in range(1, ne):                  # completion barrier
+                        ue.generate_instruction_flag_check(target_engine_idx=j)
+                    ue.generate_instruction_flag_clear()
+                else:
+                    ue.generate_instruction_flag_set()
+            ue.generate_instruction_halt()
+            ue.stop_capture()
+            if dynamic:
+                ue.release_isa_reg()
+                ue.release_isa_reg()
+                ue.release_isa_reg()
+            program_dram_addr = ue.get_program_dram_addr()
+            ue.write_captured_instructions_to_dram(program_dram_addr)
+            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+            program_addrs.append(program_dram_addr)
+
+        # Workers first: each must be parked on flag_check(0) before the master
+        # raises the start flag, otherwise the barrier does not hold them.
+        for i in range(1, ne):
+            ues[i].start_execute_from_dram(program_addrs[i])
+        ues[0].start_execute_from_dram(program_addrs[0])
+        ues[0].wait_queue(60.0)
+
+        # The master cannot retire before every worker has flag_set, so its own
+        # latency already bounds the run and no worker poll is needed.
+        latency_us = ues[0].report_latency_in_us()
+        output = torch.cat([
+            ue.dma_from_accelerator_memory(out_addr, (M, cols))
+            for ue, out_addr, (_n_off, cols) in zip(ues, out_addrs, splits)
+        ], dim=1)
+
+        for ue in ues:
+            ue.reset_tensor_dram_addr()
+            ue.reset_params_dram_addr()
+            ue.clear_capture_buffer()
+        return output, latency_us, b_ref
+
+    for M, K, N in runtime_list:
+        assert K % UE_VECTOR_SIZE == 0 and N % UE_VECTOR_SIZE == 0, \
+            "runtime K and N must be multiples of 64"
+        # A shard below UE_VECTOR_SIZE is not representable: drop the extra cores.
+        eff_ne = min(num_engines, N // UE_VECTOR_SIZE)
+        assert eff_ne >= 1, f"N={N} is smaller than UE_VECTOR_SIZE={UE_VECTOR_SIZE}"
+        if eff_ne < num_engines:
+            print(f"N={N} only supports {eff_ne} cores at {UE_VECTOR_SIZE}-column "
+                  f"granularity; ignoring the other {num_engines - eff_ne}")
+
+        torch.manual_seed(0xC0FFEE + K * 131 + N)
+        a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
+        b = (torch.rand(N, K, dtype=torch.bfloat16) * 2 - 1)
+        total_flops = 2 * M * K * N
+
+        # Single-core dynamic reference FIRST: latency baseline + CPU reference.
+        out_ref, base_us, b_ref = _run(M, K, N, 1, a, b,
+                                       want_ref=True, dynamic=True)
+        print(f"1-core dynamic reference for M={M}, K={K}, N={N}: {base_us:.1f} us")
+        out_leg, leg_us, _ = _run(M, K, N, eff_ne, a, b, dynamic=False)
+        out_dyn, dyn_us, _ = _run(M, K, N, eff_ne, a, b, dynamic=True)
+
+        # Reference uses the same effective BF16 weights as the accelerator
+        # (quantize + dequant), not the raw pre-quantization b — otherwise SNR
+        # is dominated by quantization error rather than compute error.
+        ref = a @ b_ref.T
+        legs = [
+            ("1-core baseline (dynamic)", 1, base_us, out_ref,
+             "quantized_matmat_mul_multi_cores_1core_baseline+dynamic"),
+            (f"{eff_ne}-core legacy", eff_ne, leg_us, out_leg,
+             "quantized_matmat_mul_multi_cores"),
+            (f"{eff_ne}-core dynamic", eff_ne, dyn_us, out_dyn,
+             "quantized_matmat_mul_multi_cores+dynamic"),
+        ]
+        # Pair the two multi-core rows so write_test_summary emits the SNR /
+        # GFLOPS diff columns. A pair_id must group EXACTLY two rows, one of
+        # them "+dynamic", so the 1-core baseline stays unpaired.
+        _PAIR_ID_COUNTER += 1
+        pair_id = _PAIR_ID_COUNTER
+
+        for leg, ne, lat, out, record_name in legs:
+            snr = calculate_snr(ref, out)
+            gflops = total_flops / (lat * 1e3)
+            peak_pct = gflops / user_dma_core.UE_PEAK_GFLOPS / (10 * ne)
+            summary_rows.append({
+                "shape": f"{M}x{K}x{N}", "leg": leg, "engines": ne,
+                "latency_us": lat, "gflops": gflops, "peak_pct": peak_pct,
+                "snr_db": snr, "speedup": None if ne == 1 else base_us / lat,
+            })
+            # Sharding must not change the result at all, on either path.
+            exact = torch.equal(out_ref, out)
+            print(f"{leg}: bit-exact vs 1-core={'yes' if exact else 'NO'}, "
+                  f"SNR vs CPU={snr:.2f} dB, {lat:.1f} us"
+                  + ("" if ne == 1 else f", speedup={base_us / lat:.2f}x"))
+            assert exact, f"{leg} result is not bit-identical to the 1-core result"
+            assert snr >= snr_threshold_db or snr == float("inf"), \
+                f"{leg} SNR vs CPU reference {snr:.2f} dB is below {snr_threshold_db:g} dB"
+            _CURRENT_PAIR_ID = None if ne == 1 else pair_id
+            record_test(record_name,
+                        f"M={M}, K={K}, N={N}, num_engines={ne}, "
+                        f"{data_type.name}, private weights",
+                        snr_db=snr,
+                        gflops=gflops)
+            _CURRENT_PAIR_ID = None
+
+    print(f"\n=== quantized_matmat_mul_multi_cores_test summary "
+          f"(private per-core weights, N-sharded; speedup vs 1-core FPGA time; "
+          f"%peak vs each leg's own engine-count peak) ===")
+    header = (f"{'shape (MxKxN)':<20}{'leg':<24}{'eng':>5}"
+              f"{'latency(us)':>14}{'GFLOPS':>12}{'%peak':>9}"
+              f"{'SNR(dB)':>10}{'speedup':>10}")
+    print(header)
+    print("-" * len(header))
+    for row in summary_rows:
+        snr = row["snr_db"]
+        snr_str = "n/a" if snr is None else ("inf" if snr == float("inf") else f"{snr:.1f}")
+        spd = row["speedup"]
+        spd_str = "base" if spd is None else f"{spd:.2f}x"
+        print(f"{row['shape']:<20}{row['leg']:<24}{row['engines']:>5}"
+              f"{row['latency_us']:>14.1f}{row['gflops']:>12.2f}"
+              f"{row['peak_pct']:>8.2f}%{snr_str:>10}{spd_str:>10}")
+    print("-" * len(header))
+    print()
+    return summary_rows
 
 
 def unified_attention_test(batch: int = 256, aligned_seq_len: int = 256, head_dim: int = 128):
@@ -6169,7 +6698,7 @@ def software_reset_test(cores: int = 1):
     for core in range(cores):
         base = user_dma_core.UE_0_BASE_ADDR + core * ENGINE_BASE_STRIDE
         print(f"--- software_reset: core {core} (base 0x{base:08x}) ---")
-        ue = UnifiedEngine(BASE_ADDR=base)
+        ue = UnifiedEngine(BASE_ADDR=base, init_unified_engine=True)
 
         # Break any stale FLAG_CHECK spin-wait and drain this core's queue.
         ue.software_reset()
@@ -6414,7 +6943,7 @@ def gemma3_inference_test() -> None:
     # (300 MHz, 3.3333 ns/cycle): streaming/legacy = 16.23 tok/s (>16 tok/s
     # required -> <18,750,000 cycles/tok), matmatmul = 8.43 tok/s (>8 tok/s
     # required -> <37,500,000 cycles/tok). Cycles/tok is clock-independent,
-    # so the same thresholds below apply uniformly to every --device; convert
+    # so the same thresholds below apply uniformly to every hardware profile; convert
     # each run's measured peak tok/s to cycles/tok using its own clock period
     # before comparing. streaming/legacy bumped to 20,000,000 after a device
     # measured 19,831,745 cycles/tok (16.81 tok/s @ 3.0000 ns/cycle), which
@@ -6782,8 +7311,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='User DMA Operations for Unified Engine')
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument('--device', type=str, default='kintex7',
-                        help='Board profile used only for Efinix device-node selection and optional systolic tests; hardware properties come from HW_INFO.')
     parser.add_argument('--base-addr', type=lambda x: int(x, 0), default=None,
                         help='AXI-Lite register base address (default: device-specific).')
     parser.add_argument(
@@ -6814,7 +7341,7 @@ if __name__ == "__main__":
     _TEST_NAME_SUFFIX = args.test_name_suffix
 
     import user_dma_core
-    set_dma_device("efinix" if args.device == "efinix" else args.dev, base_addr=args.base_addr)
+    set_dma_device(args.dev, base_addr=args.base_addr)
     print(f"DMA dev={args.dev}"
           f" (H2C={user_dma_core.DMA_DEVICE_H2C},"
           f" C2H={user_dma_core.DMA_DEVICE_C2H},"
@@ -7130,10 +7657,10 @@ if __name__ == "__main__":
 
     _RNG_STATE_END = _rng_state_fingerprint()
 
-    # --- Multi-core / multi-engine tests (kintex7, kintex7_systolic, and alveo) ---
+    # --- Multi-core / multi-engine tests, enabled by HW_INFO core count ---
     # Keep device-specific optional coverage last so it cannot advance RNG
     # before common tests. That makes SNR results comparable across devices.
-    if not args.single_core_only and args.device in ('kintex7', 'kintex7_systolic', 'alveo', 'alveo_u55c'):
+    if not args.single_core_only and engine_count >= 2:
         two_core_shapes = [(1920, 768, 2048)]
         matmat_mul_two_engine_flag_check_test(M=256, K=2048, N=1024)
         matmat_mul_two_cores_unified_test(runtime_list=two_core_shapes)
@@ -7160,24 +7687,16 @@ if __name__ == "__main__":
                 input_scale=scale,
                 snr_threshold_db=snr_floor,
             )
-    if args.device == 'alveo':
-        # Each engine reads its own DRAM buffer, then all engines hammer the
-        # same DRAM buffer (concurrent reads to a single memory location).
-        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=engine_count)
-        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=engine_count,
-                                                shared_read=True)
-        matmat_mul_multi_cores_unified_test(num_engines=8)
-    elif args.device == 'alveo_u55c':
-        # U55C hardware instantiates 12 Andromeda engines.
-        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=12)
-        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=12,
-                                                shared_read=True)
-        matmat_mul_multi_cores_unified_test(runtime_list=[(4608, 4096, 4096)], num_engines=12)
+    if engine_count >= 8: # alveo and alveo_u55c only
+        multi_core_dram_speed_test(data_size_kB=512, num_engines=engine_count)
+        matmat_mul_multi_cores_unified_test(runtime_list=[(6144, 1024, 1024)], num_engines=engine_count)
+        quantized_matmat_mul_multi_cores_test(runtime_list=[(1, 1536, 6144)], num_engines=engine_count)
 
-    # --- Systolic core tests (kintex7_systolic only) ---
+    # --- Systolic core tests are disabled until HW_INFO exposes systolic presence ---
     # Run last, after all andromeda-core coverage, so a systolic-specific
     # failure never masks whether the andromeda core itself passed.
-    if args.device == 'kintex7_systolic':
+    systolic_core_present = False
+    if systolic_core_present:
         from systolic_engine import SystolicEngine
         SystolicEngine(csr_base=KINTEX7_SYSTOLIC_CSR_BASE_ADDR).dump_csrs()
 
@@ -7216,7 +7735,7 @@ if __name__ == "__main__":
     dram_to_scales_bram_test()
     dram_to_bias_bram_test()
     # 8 GB dual-half DRAM test only applies to the U55C (8 GB HBM, 33-bit space).
-    if args.device == "alveo_u55c":
+    if user_dma_core.AVAILABLE_DRAM_SIZE_GB == 8:
         dram_read_write_speed_test_8GB()
 
     #Adding new tests here
