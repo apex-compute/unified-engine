@@ -18,13 +18,11 @@ Weights:
 Usage:
   python gemma3_test.py
   python gemma3_test.py --prompt "your prompt"
-  python gemma3_test.py --dev xdma0 [--device kintex7]
-  python gemma3_test.py --dev xdma0 --device bittware
+  python gemma3_test.py --dev xdma0
   python gemma3_test.py --local-weights
   python gemma3_test.py --dual-engine
 
-``--device`` matches the FPGA/DMA profile; AXI width and clock come from HW_INFO.
-``--dev`` is the XDMA device name (e.g. ``xdma0``).
+``--dev`` is the DMA device name (e.g. ``xdma0``); AXI width, clock, DRAM size, and core count come from HW_INFO.
 
 Fixed layout: gemma3_test.py, gemma3_numeric.py, *.json, and gemma3_bin/ live in the same folder.
   user_dma_core.py is two folders up (models/../..); that grandparent is added to sys.path.
@@ -2944,7 +2942,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         L.append(f"- **HW version:** {hw_version_str}")
         L.append(f"- **Hardware info register:** {user_dma_core.hardware_info_summary()}")
         L.append(f"- **--dev:** {args.dev}")
-        L.append(f"- **--device:** {args.device}")
         L.append(f"- **Clock / frequency:** {clock_ns:.4f} ns ({freq_mhz:.1f} MHz)")
         L.append(f"- **Cores:** {cores}")
         L.append(f"- **Peak throughput:** {peak_gflops:.2f} GFLOPS "
@@ -3011,8 +3008,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 def gemma3_run_summary_filename(args, prefix: str = "gemma3_test") -> str:
     """Per-run summary .md filename encoding the CLI config, e.g.
     ``gemma3_test_xdma1_kintex7.md`` or ``gemma3_test_xdma0_alveo_legacy.md``.
-    dev/device are always present; other knobs are appended only when non-default."""
-    tokens = [args.dev, args.device]
+    dev and HW_INFO are present when available; other knobs are appended only when non-default."""
+    tokens = [args.dev]
+    if user_dma_core.HW_INFO_RAW is not None:
+        tokens.append(f"hw{user_dma_core.HW_INFO_RAW:08x}")
     if getattr(args, "dual_engine", False):
         tokens.append("dual-engine")
     if getattr(args, "legacy", False):
@@ -3038,12 +3037,6 @@ def main():
     )
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
-    parser.add_argument(
-        '--device',
-        type=str,
-        default='kintex7',
-        help='FPGA board / DMA profile; AXI width and clock are read from HW_INFO.',
-    )
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and run one decode step to measure per-step latency breakdown.')
     parser.add_argument('--legacy', action='store_true',
@@ -3064,14 +3057,13 @@ def main():
                              'Default: always recompile the program image from scratch.')
     args = parser.parse_args()
 
-    set_dma_device("efinix" if args.device == "efinix" else args.dev)
+    set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
 
     user_dma_core.configure_clock_from_hardware()
-    print(f"FPGA profile: device={args.device}")
     print(user_dma_core.hardware_info_summary())
 
     _boot = user_dma_core.UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR)

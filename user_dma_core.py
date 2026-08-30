@@ -631,7 +631,8 @@ class UnifiedEngine:
                  program_dram_base: int = DRAM_INSTRUCTION_ADDR,
                  tensor_dram_base: int = DRAM_ACTIVATION_ADDR,
                  clock_period_ns: float = None,
-                 device_name: Optional[str] = None):
+                 device_name: Optional[str] = None,
+                 init_unified_engine: bool = False):
         self.device = device
         if device_name is not None:
             set_dma_device(device_name)
@@ -683,8 +684,22 @@ class UnifiedEngine:
 
         self._base_addr = BASE_ADDR
 
-        # Initialize
-        self.init_unified_engine()
+        # Initialize. OFF by default: init_unified_engine() dumps every register
+        # and runs a DRAM read/write self-test at the HARDCODED DRAM_START_ADDR,
+        # which ignores params_dram_base and so stomps 16 KB there for EVERY
+        # engine ever constructed. Pass init_unified_engine=True only where that
+        # probe is the point (see software_reset_test).
+        if init_unified_engine:
+            self.init_unified_engine()
+        else:
+            # init_unified_engine() used to run on EVERY construction, and its
+            # DRAM self-test drew one torch.randint(8192, uint16) from the global
+            # torch RNG. Now that the self-test is gated off, consume an identical
+            # throwaway draw so the global RNG stream advances exactly as before.
+            # This keeps every downstream test case's random test data byte-for-
+            # byte unchanged. Must match init_unified_engine()'s draw exactly
+            # (shape, dtype, device).
+            torch.randint(0x0000, 0xFFFF, (8192,), dtype=torch.uint16, device=self.device)
 
     @staticmethod
     def _align_up(value: int, align_bytes: int) -> int:
@@ -908,7 +923,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xe7ac2caf, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xe7ac2caf. Please update FPGA with commit update_e7ac2caf.bin using update_flash.py (public release v1.4)"
+        assert hw_version == 0x19788da0, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x19788da0. Please update FPGA with commit update_19788da0.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
