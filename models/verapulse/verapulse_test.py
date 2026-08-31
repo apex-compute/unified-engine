@@ -62,9 +62,17 @@ Hardware rules that shape this file -- see verapulse_config.json["hw_notes"]:
     append_row(). This is the bug that gave 94% relative error on Q while K stayed golden.
   * never skip compute for masked/zero slots; mask via the attention bias instead.
 
-Usage (once implemented):
+Usage:
     python verapulse_test.py --stage vision --snr
-    python verapulse_test.py --stage all --dump-bins
+    python verapulse_test.py --engines 8          # compiles, then dumps its bin set
+    python verapulse_test.py --engines 8          # ... and this one loads it
+
+Bins are automatic. A full run (--stage all, no --stop-after/--bisect-*) loads the set
+matching its engine configuration if one exists and dumps one if it does not. params.bin
+is shared by every configuration -- sharding never writes the params region -- while the
+programs are keyed by the (vision, prefix, denoise) engine triple, because a sharded
+program bakes one rendezvous per engine and cannot be replayed at a different count.
+Use --dump-bins to force a re-dump after a compile-affecting edit.
 """
 
 import argparse
@@ -350,6 +358,90 @@ HF_CODE_GLOBS = _CFG["paths"].get("hf_code_globs", [])
 # The smolvla variant is a LOCAL export, not an HF repo: hf_model_repo is null and
 # local_ckpt_dir points at the finetune package. There is nothing to download.
 LOCAL_CKPT_DIR = _CFG["paths"].get("local_ckpt_dir")
+
+# ======================================================================================
+# Bin layout
+# ======================================================================================
+# ONE params.bin, MANY programs_e*.bin. That asymmetry is the whole design and it is not
+# a shortcut: sharding never writes the params region. Workers get their own
+# params_dram_base purely so their allocators cannot collide with the primary's
+# (multi_engine_shard.py asserts exactly that at construction), and every per-engine
+# buffer is allocated out of the TENSOR arena via w.allocate_tensor_dram. So the params
+# snapshot a 1-engine run produces is byte-identical to an 8-engine one, and re-dumping
+# it per engine count would burn ~2.2 GB of disk per variant to store the same bytes.
+#
+# Programs are the opposite: they bake ABSOLUTE jump targets, absolute tensor addresses
+# and a rendezvous structure whose barrier count IS the engine count. A program compiled
+# for 8 engines cannot be executed by 4 -- the missing workers never answer the first
+# FLAG_CHECK, which has no timeout, so the primary hangs forever rather than failing.
+# Hence one programs file per engine configuration, keyed by the (vision, prefix,
+# denoise) triple because this model shards the three stages independently
+# (--vis_8/--pref_8/--dns_8 set them separately).
+_BIN_SUBDIR = "verapulse_bin"
+BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), _BIN_SUBDIR)
+
+# Load order is load-bearing: program DRAM is a bump allocator, so replaying
+# vision -> prefix -> denoise is what reproduces the absolute addresses each program was
+# compiled against. MUST match dump_programs_to_file's write order.
+_PROGRAM_ORDER = ("vision", "prefix", "denoise")
+
+# stage -> (_num_engines key, primary program addr attr, saved worker addr list attr,
+#           worker program size list attr)
+_STAGE_ATTRS = {
+    "vision":  ("VIS",     "_vis_program_addr",     "_vis_worker_prog_addrs",
+                "_vis_worker_prog_sizes"),
+    "prefix":  ("PREFIX",  "_prefix_program_addr",  "_prefix_worker_progs",
+                "_prefix_worker_prog_sizes"),
+    "denoise": ("DENOISE", "_denoise_program_addr", "_denoise_worker_prog_addrs",
+                "_denoise_worker_prog_sizes"),
+}
+
+# Compile-time state that EXECUTION reads and a bin run therefore has to restore. Kept
+# as an explicit list rather than pickling __dict__: these are the only four non-address
+# values the execute paths touch (run_vision reads _vis_batched; run_prefix reads
+# PREFIX_HIDDEN_DRAM), and an explicit list fails loudly when a new one appears instead
+# of silently restoring a stale value.
+_BIN_DERIVED_ATTRS = ("_vis_batched", "PREFIX_HIDDEN_DRAM")
+
+
+def _programs_stem(engines):
+    """(vision, prefix, denoise) engine counts -> programs file stem."""
+    v, p, d = (int(engines[s]) for s in _PROGRAM_ORDER)
+    return f"programs_e{v}_{p}_{d}"
+
+
+def clean_bins(bin_dir=None, verbose=True):
+    """Delete every bin artifact in `bin_dir`, for ALL engine configurations.
+
+    NAMES THE FILES; never rm -rf the directory. The downloaded checkpoint lives INSIDE
+    the bin dir (verapulse__<repo>/, ~2.2 GB), so removing the directory would throw away
+    the weights and force a re-download -- and on the smolvla variant, which is a LOCAL
+    export with nothing to download, it would be unrecoverable. Only params.* and
+    programs_e*.* are touched; anything else in the directory is left alone.
+    """
+    import glob
+    if bin_dir is None:
+        bin_dir = BIN_DIR
+    victims = sorted(
+        glob.glob(os.path.join(bin_dir, "params.bin"))
+        + glob.glob(os.path.join(bin_dir, "params.json"))
+        + glob.glob(os.path.join(bin_dir, "weight_tensors.pt"))
+        + glob.glob(os.path.join(bin_dir, "programs_e*.bin"))
+        + glob.glob(os.path.join(bin_dir, "programs_e*_tensors.pt"))
+        + glob.glob(os.path.join(bin_dir, "programs_e*.json")))
+    freed = 0
+    for p in victims:
+        freed += os.path.getsize(p)
+        os.remove(p)
+    if verbose:
+        if victims:
+            print(f"[clean] removed {len(victims)} bin file(s), "
+                  f"{freed / 1024**3:.2f} GB from {bin_dir}")
+            for p in victims:
+                print(f"    {os.path.basename(p)}")
+        else:
+            print(f"[clean] no bin files in {bin_dir} (nothing to remove)")
+    return victims
 
 CKPT_DIR_NAME = HF_REPO.replace("/", "__") if HF_REPO else None
 # Exact count; a mismatch means the mapping silently dropped or aliased a weight.
@@ -1569,6 +1661,9 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
     #                 still the only strictly increasing term.
     STAGE_MAX_ENGINES = {"VIS": 12, "PREFIX": 12, "DENOISE": 10}
 
+    # Where bins are read from / written to. An instance attribute overrides it.
+    bin_dir = BIN_DIR
+
     # 12, not 16, even though the FLAG index the fabric decodes is 4 bits wide (see
     # generate_instruction_flag_check). 12 is what this board HAS -- HW_INFO reports
     # cores=12 -- and engines 12-15 would be barriers against silicon that does not
@@ -1824,6 +1919,11 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         dma_read only round-trips bits losslessly for bf16/int32, so any other dtype
         corrupts more than it repairs."""
         assert_bf16_only(self._cfg)     # 16-bit multipliers: no quantized path exists
+        # Snapshot the instance BEFORE any weight lands, so the tail of this method can
+        # tell exactly which attributes the weight phase published (see _capture_weight
+        # _attrs). A bin run skips this whole method, and those attributes -- weight DRAM
+        # addresses, above all -- are what the host-side readback paths index.
+        _bin_attrs_before = set(self.__dict__)
         # EVERY worker engine is constructed HERE, before the first store_weight, for
         # the reason the docstring's ORDERING HAZARD paragraph gives. This is the actual
         # fix; _vp_dram_selftest_guard is only belt and braces. It is a no-op at
@@ -1851,6 +1951,13 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         self._weight_init_expert(sd)
         self._weight_init_head(sd)
         self._assert_params_fit()
+        # Where the params allocator stood when the weight phase finished. params.bin is
+        # dumped at the END of a full run, so it also contains what the compile phase
+        # allocated afterwards (the AE time table). load_params rewinds to THIS, not to
+        # params.json's total, so anything allocating params after a bin load lands back
+        # on the addresses the programs bake rather than past every weight.
+        self._params_ofs_after_weight_init = self.get_params_dram_usage()
+        self._capture_phase_attrs(_bin_attrs_before, "weight")
 
     def _weight_init_vision(self, sd):
         """Store the SigLIP tower in bf16. sd holds fp32 tensors under the canonical
@@ -2804,6 +2911,75 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         sched.preclear_flags()
         self.__dict__["_vp_flags_precleared"] = True
 
+    def _record_worker_prog_sizes(self, stage, sched):
+        """Snapshot each worker program's byte size, immediately after finalize().
+
+        MUST be called here and not later: finalize() flushes the capture but leaves the
+        buffer in place, and the NEXT stage's begin_program() calls clear_capture_buffer()
+        on the same shared workers -- after which the size is unrecoverable. Sizes cannot
+        be re-derived by differencing worker program addresses either, because
+        allocate_program_dram rounds every allocation up to 64 B.
+        """
+        _, _, _addr_attr, size_attr = _STAGE_ATTRS[stage]
+        setattr(self, size_attr,
+                [w.get_capture_instruction_size_bytes() for w in sched.workers])
+
+    # ---------------------------------------------------------------- bin DMA I/O --
+
+    def _bin_read(self, addr, size, label="", ue=None):
+        """Chunked + retried + CHECKED readback -> bytes. Same discipline as _read_bf16:
+        raw dma_read() returns -1 after only PRINTING the errno and leaves the caller's
+        buffer zero-filled, so an unchecked read writes a plausible all-zero bin."""
+        ue = ue or self
+        buf = bytearray(size)
+        mv = memoryview(buf)
+        chunk, offset = 256 * 1024, 0
+        tag = f" {label}" if label else ""
+        while offset < size:
+            n = min(chunk, size - offset)
+            piece = bytearray(n)
+            for _ in range(5):
+                if ue.dma_read(DMA_DEVICE_C2H, addr + offset, piece, n) == n:
+                    break
+            else:
+                if chunk > 4096:
+                    chunk //= 2
+                    continue
+                raise RuntimeError(
+                    f"dma_read{tag} FAILED at 0x{addr + offset:X} (+{offset}/{size} B) "
+                    f"even at the 4KB floor -- refusing to write a zero-filled bin that "
+                    f"would masquerade as a real program")
+            mv[offset:offset + n] = piece
+            offset += n
+        return bytes(buf)
+
+    def _bin_write(self, addr, data, label="", ue=None):
+        """Chunked + retried write of `data` to DRAM. `ue` selects which engine's DMA
+        channel to use -- worker programs must be written through their OWN engine."""
+        ue = ue or self
+        size = len(data)
+        mv = memoryview(data)
+        chunk, offset = 256 * 1024, 0
+        tag = f" {label}" if label else ""
+        while offset < size:
+            n = min(chunk, size - offset)
+            piece = bytes(mv[offset:offset + n])
+            for _ in range(5):
+                if ue.dma_write(DMA_DEVICE_H2C, addr + offset, piece, n) == n:
+                    break
+            else:
+                if chunk > 4096:
+                    chunk //= 2
+                    continue
+                raise RuntimeError(
+                    f"dma_write{tag} FAILED at 0x{addr + offset:X} "
+                    f"(+{offset}/{size} B) even at the 4KB floor")
+            offset += n
+
+    def _bin_engines(self):
+        """The (vision, prefix, denoise) engine triple this run is configured for."""
+        return {s: int(self._num_engines(_STAGE_ATTRS[s][0])) for s in _PROGRAM_ORDER}
+
     def _assert_worker_programs_fit(self, sched=None, label=""):
         """Every sharded stage's worker programs share ONE allocator per worker engine.
         Overflowing an arena marches that allocator into the NEXT worker's arena --
@@ -2989,6 +3165,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # the same worker pool overwrites that scheduler's _worker_prog_addrs, so a bare
         # start_workers() in run_vision could relaunch the wrong program.
         self._vis_worker_prog_addrs = sched.finalize()   # halts + flushes every worker
+        self._record_worker_prog_sizes("vision", sched)
         self._assert_worker_programs_fit()
         self.stop_capture()
 
@@ -4450,6 +4627,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             eng.release_isa_reg()                  # qb_reg
             eng.release_isa_reg()                  # m_reg
         self._prefix_worker_progs = sched.finalize()
+        self._record_worker_prog_sizes("prefix", sched)
         self._prefix_sched = sched
         # The prefix's per-engine footprint GREW when attention moved onto the workers
         # (flash staging + scratch, 1.06 MB/worker) and its worker programs grew with it
@@ -6941,6 +7119,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # bare start_workers() after a later stage would relaunch the wrong program.
         if sched is not None:
             self._denoise_worker_prog_addrs = sched.finalize()
+            self._record_worker_prog_sizes("denoise", sched)
             wbytes = self._assert_worker_programs_fit(sched, label="denoise: ")
             print(f"    [denoise] {len(sched.workers)} worker program(s), "
                   f"{wbytes / 1e6:.2f} MB total "
@@ -8506,6 +8685,17 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
     COMPILE_STAGES = ("vision", "prefix", "denoise")
 
     def precompile_all(self, stages=COMPILE_STAGES, freeze=True):
+        _bin_attrs_before = set(self.__dict__)
+        try:
+            return self._precompile_all_inner(stages=stages, freeze=freeze)
+        finally:
+            # Compile publishes state that EXECUTION reads -- the action expert's rope
+            # and bias DRAM addresses, its head/stride constants, the time table. A bin
+            # run never compiles, so without this it silently runs the expert against
+            # whatever the class defaults are: no crash, just different numbers.
+            self._capture_phase_attrs(_bin_attrs_before, "compile")
+
+    def _precompile_all_inner(self, stages=COMPILE_STAGES, freeze=True):
         """COMPILE EVERYTHING UP FRONT, then execute stage by stage.
 
         The engine already had compile-once/execute-many per stage (_compile_once), but
@@ -8569,11 +8759,583 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             self._compile_frozen = (len(want) == len(self.COMPILE_STAGES))
         return out
 
+    def dump_params_to_file(self, bin_dir):
+        """Dump the whole params DRAM region to bin_dir/params.bin + params.json.
+
+        ONE file for every engine count -- see the bin-layout note at module scope.
+        Follows pi05/mobilesam's dump-DRAM approach rather than writing a per-tensor map:
+        the bytes read back are exactly the bytes the run just used, and a bin run
+        re-derives every address by re-running the real weight_init/tensor_init
+        allocators instead of consulting a map that could drift from them.
+        """
+        os.makedirs(bin_dir, exist_ok=True)
+        total = self.get_params_dram_usage()
+        assert total > 0, "params DRAM is empty -- dump only after weight_init()"
+        assert hasattr(self, "_params_ofs_after_weight_init"), (
+            "dump_params_to_file: _params_ofs_after_weight_init missing -- dump only "
+            "after a real weight_init() (a bin-backed run must not re-dump).")
+        data = self._bin_read(self._params_dram_base, total, label="params")
+        with open(os.path.join(bin_dir, "params.bin"), "wb") as f:
+            f.write(data)
+        tensors = getattr(self, "_weight_tensor_attrs", None) or {}
+        if tensors:
+            torch.save(tensors, os.path.join(bin_dir, "weight_tensors.pt"))
+            _original_print(f"  Host tensors: {', '.join(sorted(tensors))} -> "
+                            f"weight_tensors.pt")
+        _skipped = [x for x in getattr(self, "_weight_attrs_skipped", [])
+                    if not x.startswith("_worker_pool:")]
+        if _skipped:
+            # LOUD, because a dropped attribute does not crash a bin run -- the stages
+            # that index it fall back and the only symptom is different numbers. Three
+            # per-layer address maps were dropped exactly this way.
+            _original_print(f"  WARNING: {len(_skipped)} weight attribute(s) could not "
+                            f"be persisted and will be MISSING in a bin run: "
+                            f"{', '.join(_skipped)}")
+        attrs = getattr(self, "_weight_attrs", None)
+        assert attrs, (
+            "dump_params_to_file: no captured weight attributes -- dump only after a "
+            "real weight_init(). Without them a bin run has no weight DRAM addresses "
+            "and dies in the first host-side readback.")
+        with open(os.path.join(bin_dir, "params.json"), "w") as f:
+            json.dump({"size": total,
+                       "ofs_after_weight_init": int(self._params_ofs_after_weight_init),
+                       "dummy_weights": bool(getattr(self, "_dummy_weights", False)),
+                       # Weight-phase state. Lives with params.bin, not with the programs:
+                       # the weight phase does not depend on the engine count, so every
+                       # programs_e*.bin shares exactly these values.
+                       "weight_attrs": attrs,
+                       "weight_tensor_attrs": sorted(tensors),
+                       "weight_attrs_skipped": getattr(self, "_weight_attrs_skipped", [])},
+                      f, indent=2)
+        _original_print(f"  Params: {total / 1024**2:.1f} MB ({total} bytes) -> "
+                        f"{os.path.join(bin_dir, 'params.bin')}")
+
+    def dump_programs_to_file(self, bin_dir):
+        """Dump this run's programs to bin_dir/programs_e<v>_<p>_<d>.bin + .json.
+
+        The file is keyed by the engine triple, so an 8-engine dump and a 1-engine dump
+        coexist in one bin dir and neither can be loaded as the other. Within the file
+        each stage carries the PRIMARY program plus one section per worker, because a
+        sharded stage is not one program: every extra engine runs its own instruction
+        stream out of its own arena, and replaying only the primary's would leave the
+        worker rows as stale garbage while the primary waits at a rendezvous nobody
+        answers.
+
+        Worker programs record an explicit dram_base; the primary's does not. That
+        asymmetry is real: primary programs are bump-allocated, so replaying them in
+        order reproduces their addresses, whereas worker arenas are scheduler-owned at
+        VIS_WORKER_ARENA_BASE + i*stride + program_offset and must be stated.
+        """
+        engines = self._bin_engines()
+        meta = self.__dict__.get("_prog_meta", {})
+        for s in _PROGRAM_ORDER:
+            assert s in meta, (
+                f"dump_programs_to_file: program {s!r} was never compiled this run "
+                f"(have {sorted(meta)}). Dump only after a full non-debug inference.")
+        for a in _BIN_DERIVED_ATTRS:
+            assert hasattr(self, a), (
+                f"dump_programs_to_file: {a} missing -- dump only after a full "
+                f"vision -> prefix -> denoise inference on this engine instance.")
+
+        os.makedirs(bin_dir, exist_ok=True)
+        stem = _programs_stem(engines)
+        bin_path = os.path.join(bin_dir, stem + ".bin")
+        meta_path = os.path.join(bin_dir, stem + ".json")
+
+        manifest = {"programs": {}, "engines": engines, "sig": {},
+                    "derived": {a: getattr(self, a) for a in _BIN_DERIVED_ATTRS}}
+        blob = bytearray()
+        for stage in _PROGRAM_ORDER:
+            ne_key, _addr_attr, waddr_attr, wsize_attr = _STAGE_ATTRS[stage]
+            addr, size = meta[stage]
+            offset = len(blob)
+            blob.extend(self._bin_read(addr, size, label=f"{stage} program"))
+            sections = [{"offset": offset, "size": size, "engine": 0}]
+
+            waddrs = list(getattr(self, waddr_attr, None) or [])
+            wsizes = list(getattr(self, wsize_attr, None) or [])
+            assert len(waddrs) == engines[stage] - 1, (
+                f"dump_programs_to_file: stage {stage!r} runs on {engines[stage]} "
+                f"engine(s) but {waddr_attr} holds {len(waddrs)} worker address(es). "
+                f"The stage was compiled at a different engine count than it is "
+                f"configured for -- regenerate from a single clean run.")
+            assert len(wsizes) == len(waddrs), (
+                f"dump_programs_to_file: stage {stage!r} has {len(waddrs)} worker "
+                f"address(es) but {len(wsizes)} recorded size(s). "
+                f"_record_worker_prog_sizes did not run for this stage.")
+            for wi, (waddr, wsize) in enumerate(zip(waddrs, wsizes)):
+                w_off = len(blob)
+                # Read through the WORKER's own engine: the arenas are outside the
+                # primary's allocator regions and each engine has its own DMA channel.
+                worker = self._worker_engine_pool()[wi]
+                blob.extend(self._bin_read(waddr, wsize, ue=worker,
+                                           label=f"{stage} worker {wi + 1}"))
+                sections.append({"offset": w_off, "size": wsize, "engine": wi + 1,
+                                 "dram_base": hex(waddr)})
+            manifest["programs"][stage] = sections
+
+        # SCHEDULER REGISTRIES. register_per_engine()/alloc_col_output() run at COMPILE
+        # time and hand back worker-arena addresses that the emitted programs bake. A bin
+        # run never compiles, so a freshly built scheduler has EMPTY registries -- and
+        # run_vision calls sched.refresh_per_engine("vis_zeros") on every inference to
+        # re-zero scratch the kernel dirties. Without this the first bin-backed inference
+        # dies with KeyError: 'vis_zeros'; worse, col_output_addr would silently hand a
+        # later caller the wrong lane. Persist the addresses and re-register them on load.
+        sched_state = {}
+        # _make_stage_scheduler caches under the TUPLE (stage_key, num_engines), not the
+        # bare stage name -- look up by the first element or every stage silently misses
+        # and the block is written empty.
+        _by_stage = self.__dict__.get("_sched_by_stage", {})
+        for stage in _PROGRAM_ORDER:
+            want = _STAGE_ATTRS[stage][0]
+            sc = next((v for k, v in _by_stage.items()
+                       if (k[0] if isinstance(k, tuple) else k) == want), None)
+            if sc is None:
+                continue
+            sched_state[stage] = {
+                "per_engine": {k: list(v) for k, v in sc._per_engine.items()},
+                "col_outputs": {k: list(v) for k, v in sc._col_outputs.items()},
+            }
+        _cattrs = getattr(self, "_compile_attrs", None)
+        assert _cattrs is not None, (
+            "dump_programs_to_file: no captured compile attributes -- dump only after "
+            "precompile_all() ran on this engine.")
+        _cskipped = getattr(self, "_compile_attrs_skipped", [])
+        if _cskipped:
+            _original_print(f"  WARNING: {len(_cskipped)} compile attribute(s) could not "
+                            f"be persisted and will be MISSING in a bin run: "
+                            f"{', '.join(_cskipped)}")
+        manifest["compile_attrs"] = _cattrs
+        _ctensors = getattr(self, "_compile_tensor_attrs", None) or {}
+        manifest["compile_tensor_attrs"] = sorted(_ctensors)
+        if _ctensors:
+            torch.save(_ctensors, os.path.join(bin_dir, stem + "_tensors.pt"))
+
+        assert sched_state, (
+            "dump_programs_to_file: no stage schedulers found in _sched_by_stage -- the "
+            "per-engine registries would be lost and every bin run would die in "
+            "refresh_per_engine. Dump only after a full inference.")
+        manifest["scheduler"] = sched_state
+        # Where each worker's TENSOR allocator finished. The per-engine buffers above came
+        # out of it, so a bin run that re-registers the addresses without advancing the
+        # allocator would hand the next allocation an address already in use.
+        manifest["worker_tensor_addr"] = [w.get_tensor_dram_addr()
+                                          for w in self._worker_engine_pool()]
+
+        HEAD, V, L = self._cfg["action_head"], self._cfg["vision"], self._cfg["lm"]
+        manifest["sig"] = {
+            "num_image_slots": int(V["num_image_slots"]),
+            "chunk_size": int(HEAD["chunk_size"]),
+            "denoise_steps": int(HEAD["num_denoise_steps"]),
+            "rope_theta": float(L["rope_theta"]),
+            "quant": "bf16",
+            "vis_layers": self.VIS_LAYERS,
+            "vis_no_batch": bool(getattr(self, "VIS_NO_BATCH", False)),
+            "prefix_fused_silu": bool(getattr(self, "PREFIX_FUSED_SILU", False)),
+            "params_dram_base": hex(self._params_dram_base),
+            "tensor_dram_base": hex(self._tensor_dram_base),
+            "program_dram_base": hex(self._program_dram_base),
+            "worker_arena_base": hex(self.VIS_WORKER_ARENA_BASE),
+            "worker_arena_bytes": int(self.VIS_WORKER_ARENA_BYTES),
+        }
+        with open(bin_path, "wb") as f:
+            f.write(blob)
+        with open(meta_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        _original_print(f"  Programs: {len(blob) / 1024**2:.1f} MB ({len(blob)} bytes) "
+                        f"-> {bin_path}")
+        for stage, secs in manifest["programs"].items():
+            for s in secs:
+                _original_print(f"    {stage:<8} engine{s['engine']:<2} "
+                                f"offset={s['offset']:>10}  size={s['size']:>10}")
+
     def dump_bins(self, bin_dir):
-        """params.bin + programs.bin + programs.json. Carry a signature (num image slots,
-        prefix_len, chunk, quant mode, rope theta) and refuse to load on mismatch.
-        rm the bin dir after any compile-affecting edit -- stale bins reload silently."""
-        raise NotImplementedError
+        """params.bin + programs_e<v>_<p>_<d>.bin/.json. The programs carry a signature
+        (image slots, chunk, denoise steps, rope theta, quant, dram bases) and the loader
+        refuses on mismatch. rm the bin dir after any compile-affecting edit -- stale bins
+        reload silently."""
+        self.dump_params_to_file(bin_dir)
+        self.dump_programs_to_file(bin_dir)
+
+    # ---------------------------------------------------------------- bin loading --
+    # These live on the BASE class, not on VeraPulse_Run, because the decision to use a
+    # bin set can only be made AFTER the engine exists: which programs_e*.json applies
+    # depends on _num_engines, which consults the board's core limit and the prefix's
+    # column-block count. main() therefore builds the normal engine, configures the
+    # engine counts, and only then asks bins_available().
+
+    # Values a weight attribute may hold and still survive the JSON round trip. Weight
+    # DRAM addresses -- the ones that actually matter -- are plain ints.
+    _BIN_ATTR_SCALARS = (int, float, bool, str, type(None))
+
+    # Attributes load_programs() sets ITSELF from the manifest. Restoring these from a
+    # captured snapshot would overwrite the addresses just DMA'd, so they are never
+    # captured: the loader is the authority for them.
+    _BIN_ATTR_LOADER_OWNED = frozenset((
+        "_prog_cache", "_prog_meta", "_compile_frozen", "_sched_by_stage",
+        "_vis_sched", "_prefix_sched", "_denoise_sched",
+        "_vis_program_addr", "_prefix_program_addr", "_denoise_program_addr",
+        "_vis_worker_prog_addrs", "_prefix_worker_progs", "_denoise_worker_prog_addrs",
+        "_vis_worker_prog_sizes", "_prefix_worker_prog_sizes",
+        "_denoise_worker_prog_sizes",
+    ))
+
+    def _capture_weight_attrs(self, before):
+        """Record every JSON-safe attribute the weight phase published.
+
+        Captured by DIFFING __dict__ rather than from a hand-written list, because the
+        list is what drifts: _weight_init_lm alone publishes dozens of *_addr attributes,
+        and one added later without touching this file would surface as an AttributeError
+        deep inside a bin run's first inference (state_proj_weight did exactly that).
+        Anything unserializable is recorded by NAME in _weight_attrs_skipped so a later
+        failure names the attribute instead of leaving it a mystery.
+        """
+        def ok(v, depth=0):
+            """JSON-safety, RECURSIVELY. The per-layer weight address maps
+            (lm_layer_addrs / vis_layer_addrs / ae_layer_addrs) are lists of dicts, and
+            a flat scalars-only check silently dropped all three -- which is not a
+            missing attribute you find at once but a WRONG ANSWER: the stages fall back
+            rather than raise, and only the numbers differ."""
+            if depth > 6:
+                return False
+            if isinstance(v, self._BIN_ATTR_SCALARS):
+                return True
+            if isinstance(v, (list, tuple)):
+                return all(ok(x, depth + 1) for x in v)
+            if isinstance(v, dict):
+                return all(isinstance(k, str) and ok(x, depth + 1)
+                           for k, x in v.items())
+            return False
+
+        def norm(v):
+            """tuples -> lists, so the JSON round trip is identity."""
+            if isinstance(v, (list, tuple)):
+                return [norm(x) for x in v]
+            if isinstance(v, dict):
+                return {k: norm(x) for k, x in v.items()}
+            return v
+
+        attrs, tensors, skipped = {}, {}, []
+        for k in sorted(set(self.__dict__) - set(before)):
+            if k.startswith("_bin_attrs") or k in self._BIN_ATTR_LOADER_OWNED:
+                continue
+            v = self.__dict__[k]
+            if ok(v):
+                attrs[k] = norm(v)
+            elif isinstance(v, torch.Tensor):
+                # HOST-side tables (the token embedding gather table, above all) are
+                # indexed per observation on the CPU and never reach params DRAM, so
+                # params.bin cannot contain them. They travel in their own file.
+                tensors[k] = v
+            else:
+                skipped.append(f"{k}:{type(v).__name__}")
+        return attrs, tensors, skipped
+
+    def _capture_phase_attrs(self, before, phase):
+        """Store the diff under _<phase>_attrs / _<phase>_tensor_attrs / _..._skipped."""
+        attrs, tensors, skipped = self._capture_weight_attrs(before)
+        setattr(self, f"_{phase}_attrs", attrs)
+        setattr(self, f"_{phase}_tensor_attrs", tensors)
+        setattr(self, f"_{phase}_attrs_skipped", skipped)
+        return attrs, tensors, skipped
+
+    def _restore_weight_attrs(self, attrs):
+        for k, v in attrs.items():
+            setattr(self, k, v)
+
+    def bins_available(self, bin_dir=None):
+        """True if a complete bin set exists for THIS run's engine configuration."""
+        bin_dir = bin_dir or getattr(self, "bin_dir", None) or BIN_DIR
+        if not os.path.isdir(bin_dir):
+            return False
+        stem = _programs_stem(self._bin_engines())
+        if not all(os.path.exists(os.path.join(bin_dir, f))
+                   for f in ("params.bin", "params.json",
+                             stem + ".bin", stem + ".json")):
+            return False
+        try:
+            with open(os.path.join(bin_dir, "params.json")) as f:
+                _pm = json.load(f)
+        except (OSError, ValueError):
+            return False
+        if _pm.get("weight_tensor_attrs") and not os.path.exists(
+                os.path.join(bin_dir, "weight_tensors.pt")):
+            return False
+        # Weight provenance is part of "matching". A dummy-weight dump is plumbing only
+        # and says nothing about fidelity, so silently loading it into a real-weight run
+        # (or the reverse) would score a model nobody asked for. Report NOT available so
+        # the caller falls back to compiling, rather than refusing the whole run.
+        try:
+            with open(os.path.join(bin_dir, "params.json")) as f:
+                dumped = bool(json.load(f).get("dummy_weights", False))
+        except (OSError, ValueError):
+            return False
+        return dumped == bool(getattr(self, "_dummy_weights_wanted", False))
+
+    def weight_init_from_bin(self, dummy=False):
+        """Bin-mode stand-in for weight_init: build the worker pool, restore params.
+
+        Keeps weight_init's FIRST act -- building the worker pool -- because the ordering
+        hazard is identical and just as fatal here: every UnifiedEngine ctor DMA-writes
+        16 KB of noise to a hardcoded 0x80000000, which is this model's first stored
+        weight. A worker built after the params restore silently shreds the head of
+        params, and the result is finite, plausible and wrong.
+        """
+        self._worker_engine_pool()
+        self._dummy_weights = bool(dummy)
+        self.load_params()
+
+    def _sig_check(self, name, live, want, hint=""):
+        if live != want:
+            raise RuntimeError(
+                f"\n*** REFUSING TO RUN: pre-compiled bins do not match this run ***\n"
+                f"  {name}: bins were compiled for {want!r}, this run wants {live!r}\n"
+                f"  bins: {self.bin_dir}\n"
+                f"  The compiled programs bake absolute jump targets and absolute tensor\n"
+                f"  DRAM addresses; they CANNOT be adapted to a different {name}.\n"
+                + (f"  Fix: {hint}.\n" if hint else "")
+                + f"  Regenerate with:  python {os.path.abspath(__file__)} "
+                  f"--stage all --dump-bins\n")
+
+    # ------------------------------------------------------------- weights/params --
+
+    def load_params(self):
+        """Restore the params DRAM snapshot, then rewind the params allocator to the
+        post-weight_init boundary."""
+        bin_path = os.path.join(self.bin_dir, "params.bin")
+        meta_path = os.path.join(self.bin_dir, "params.json")
+        for p in (bin_path, meta_path):
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"missing {p} -- regenerate the bins")
+        with open(meta_path) as f:
+            pmeta = json.load(f)
+        total = int(pmeta["size"])
+        actual = os.path.getsize(bin_path)
+        assert actual == total, (
+            f"params.bin is {actual}B but params.json declares {total}B -- truncated or "
+            f"stale bin set; regenerate.")
+        # A dummy-weight dump is plumbing-only and says nothing about fidelity; loading
+        # it while the caller believes it asked for real weights would silently score a
+        # random model. Refuse in BOTH directions.
+        self._sig_check("dummy_weights", bool(getattr(self, "_dummy_weights", False)),
+                        bool(pmeta.get("dummy_weights", False)),
+                        "pass --weights dummy to match, or regenerate the bins")
+        with open(bin_path, "rb") as f:
+            data = f.read()
+        self._bin_write(self._params_dram_base, data, label="params")
+        # Rewind to the post-weight_init boundary, NOT to `total`: params.bin is dumped
+        # at the END of a full run, so it also holds what the compile phase allocated
+        # afterwards (the AE time table). The bytes are correct on-device either way --
+        # this only puts the allocator back where the programs expect it.
+        attrs = pmeta.get("weight_attrs")
+        if not attrs:
+            raise RuntimeError(
+                f"params.bin at {self.bin_dir} predates the `weight_attrs` block, so this "
+                f"run has no weight DRAM addresses -- regenerate with --clean.")
+        self._restore_weight_attrs(attrs)
+        want_tensors = pmeta.get("weight_tensor_attrs") or []
+        if want_tensors:
+            tpath = os.path.join(self.bin_dir, "weight_tensors.pt")
+            if not os.path.exists(tpath):
+                raise FileNotFoundError(
+                    f"missing {tpath}: params.json lists host tensors {want_tensors} "
+                    f"that live outside params.bin -- regenerate with --clean")
+            loaded = torch.load(tpath, map_location="cpu", weights_only=True)
+            missing = [k for k in want_tensors if k not in loaded]
+            if missing:
+                raise RuntimeError(
+                    f"weight_tensors.pt is missing {missing} -- stale set; --clean")
+            for k, v in loaded.items():
+                setattr(self, k, v)
+        ofs = int(pmeta["ofs_after_weight_init"])
+        self._next_params_dram_addr = self._params_dram_base + ofs
+        self._params_ofs_after_weight_init = ofs
+        _original_print(f"  Params: {total / 1024**2:.1f} MB from bin "
+                        f"(allocator rewound to +{ofs}B)")
+        return True
+
+    # ------------------------------------------------------------------- programs --
+
+    def load_programs(self):
+        """DMA every compiled program back to DRAM -- the primary's and each worker's --
+        and pre-seed the caches the stock run_vision()/run_inference() consult, so no
+        stage ever compiles."""
+        engines = self._bin_engines()
+        stem = _programs_stem(engines)
+        bin_path = os.path.join(self.bin_dir, stem + ".bin")
+        meta_path = os.path.join(self.bin_dir, stem + ".json")
+        if not os.path.exists(meta_path):
+            have = sorted(f[:-5] for f in os.listdir(self.bin_dir)
+                          if f.startswith("programs_e") and f.endswith(".json"))
+            raise FileNotFoundError(
+                f"\n*** No bins for this engine configuration ***\n"
+                f"  wanted: {stem} (vision={engines['vision']}, "
+                f"prefix={engines['prefix']}, denoise={engines['denoise']})\n"
+                f"  bin dir {self.bin_dir} has: {have or 'nothing'}\n"
+                f"  A sharded program bakes one rendezvous per engine, so a set compiled\n"
+                f"  for a different engine count cannot be replayed -- the missing workers\n"
+                f"  never answer the first FLAG_CHECK (which has no timeout) and the run\n"
+                f"  hangs. Dump this configuration with:\n"
+                f"    python {os.path.abspath(__file__)} --stage all --dump-bins "
+                f"--engines <N>\n")
+        with open(meta_path) as f:
+            self._manifest = json.load(f)
+        sig = self._manifest["sig"]
+
+        HEAD, V, L = self._cfg["action_head"], self._cfg["vision"], self._cfg["lm"]
+        for name, live, want, hint in (
+                ("num_image_slots", int(V["num_image_slots"]),
+                 int(sig["num_image_slots"]), "camera count changed in the config"),
+                ("chunk_size", int(HEAD["chunk_size"]), int(sig["chunk_size"]),
+                 "action chunk length changed in the config"),
+                ("denoise_steps", int(HEAD["num_denoise_steps"]),
+                 int(sig["denoise_steps"]), "denoise step count changed in the config"),
+                ("rope_theta", float(L["rope_theta"]), float(sig["rope_theta"]),
+                 "rope theta changed in the config"),
+                ("vis_layers", self.VIS_LAYERS, sig["vis_layers"],
+                 "pass --vis-layers to match, or regenerate the bins"),
+                ("vis_no_batch", bool(getattr(self, "VIS_NO_BATCH", False)),
+                 bool(sig["vis_no_batch"]),
+                 "toggle --no-vis-batch to match, or regenerate the bins"),
+                ("prefix_fused_silu", bool(getattr(self, "PREFIX_FUSED_SILU", False)),
+                 bool(sig["prefix_fused_silu"]),
+                 "toggle --fused-silu to match, or regenerate the bins"),
+                ("params_dram_base", hex(self._params_dram_base),
+                 sig["params_dram_base"], "verapulse_config.json dram_layout changed"),
+                ("tensor_dram_base", hex(self._tensor_dram_base),
+                 sig["tensor_dram_base"], "verapulse_config.json dram_layout changed"),
+                ("program_dram_base", hex(self._program_dram_base),
+                 sig["program_dram_base"], "verapulse_config.json dram_layout changed"),
+        ):
+            self._sig_check(name, live, want, hint)
+
+        # Worker arena geometry must be resolved BEFORE the bases are compared: the
+        # stride is what every worker program address was derived from, and a worker
+        # whose arena moved would have its program written into its neighbour's.
+        # ONLY checked when this configuration actually has workers. At 1 engine
+        # everywhere, _worker_engine_pool returns early without resolving the profile,
+        # so both sides would be comparing whatever the class defaults happen to be --
+        # a check that can only produce false refusals, never catch a real mismatch.
+        if max(engines.values()) > 1:
+            self._resolve_worker_arena_profile()
+            self._sig_check("worker_arena_base", hex(self.VIS_WORKER_ARENA_BASE),
+                            sig["worker_arena_base"], "worker arena layout changed")
+            self._sig_check("worker_arena_bytes", int(self.VIS_WORKER_ARENA_BYTES),
+                            int(sig["worker_arena_bytes"]), "worker arena layout changed")
+
+        with open(bin_path, "rb") as f:
+            blob = f.read()
+
+        cache = self.__dict__.setdefault("_prog_cache", {})
+        meta = self.__dict__.setdefault("_prog_meta", {})
+        pool = self._worker_engine_pool()
+        for stage in _PROGRAM_ORDER:
+            ne_key, addr_attr, waddr_attr, wsize_attr = _STAGE_ATTRS[stage]
+            secs = self._manifest["programs"][stage]
+            primary = next(s for s in secs if s["engine"] == 0)
+            data = blob[primary["offset"]:primary["offset"] + primary["size"]]
+            assert len(data) == primary["size"], (
+                f"{stem}.bin truncated: {stage} wants {primary['size']}B, "
+                f"got {len(data)}B")
+            addr = self.get_program_dram_addr()
+            self._bin_write(addr, data, label=f"{stage} program")
+            self.allocate_program_dram(len(data))
+            cache[stage] = addr
+            meta[stage] = (addr, len(data))
+            setattr(self, addr_attr, addr)
+
+            waddrs, wsizes = [], []
+            for s in sorted((s for s in secs if s["engine"] != 0),
+                            key=lambda s: s["engine"]):
+                w = pool[s["engine"] - 1]
+                want_addr = int(s["dram_base"], 16)
+                # The worker allocator must stand exactly where it stood when this stage
+                # was compiled. If it does not, an earlier stage loaded a different size
+                # and every baked jump target in this program is off.
+                assert w.get_program_dram_addr() == want_addr, (
+                    f"worker {s['engine']} program allocator is at "
+                    f"0x{w.get_program_dram_addr():X} but {stage} was compiled at "
+                    f"0x{want_addr:X} -- stale or partial bin set; regenerate.")
+                wdata = blob[s["offset"]:s["offset"] + s["size"]]
+                self._bin_write(want_addr, wdata, ue=w,
+                                label=f"{stage} worker {s['engine']}")
+                w.allocate_program_dram(s["size"])
+                waddrs.append(want_addr)
+                wsizes.append(s["size"])
+            setattr(self, waddr_attr, waddrs)
+            setattr(self, wsize_attr, wsizes)
+
+            # Rebuild the scheduler this stage's execute path reaches for. It is the
+            # object that owns start_workers/rendezvous; _make_stage_scheduler is cached
+            # and builds over the SAME shared worker pool, so this reproduces exactly
+            # what the compile path would have installed. Only vision builds one
+            # unconditionally (compile_encoder calls split_rows even at ne == 1); prefix
+            # and denoise install one only when they actually shard, matching their
+            # compile-time `if sched is not None` guard.
+            if stage == "vision" or engines[stage] > 1:
+                sc = self._make_stage_scheduler(ne_key)
+                setattr(self, {"vision": "_vis_sched", "prefix": "_prefix_sched",
+                               "denoise": "_denoise_sched"}[stage], sc)
+                # Re-register what compile time allocated (see dump_programs_to_file).
+                st = (self._manifest.get("scheduler") or {}).get(stage)
+                if st is None:
+                    raise RuntimeError(
+                        f"bin set {stem} predates the `scheduler` block (stage "
+                        f"{stage!r} has no per-engine registry) -- regenerate with "
+                        f"--dump-bins.")
+                for nm, addrs in st["per_engine"].items():
+                    sc.register_per_engine_addrs(nm, [int(a) for a in addrs])
+                for nm, addrs in st["col_outputs"].items():
+                    # No public re-register hook for column outputs (alloc_col_output
+                    # both allocates AND records); the registry is a plain
+                    # {name: [addr per engine]} map, so restoring it directly is exact.
+                    sc._col_outputs[nm] = [int(a) for a in addrs]
+
+        wt = self._manifest.get("worker_tensor_addr")
+        if wt is not None:
+            for w, addr in zip(self._worker_engine_pool(), wt):
+                w._tensor_dram_addr = int(addr)
+
+        assert cache[_PROGRAM_ORDER[0]] == self._program_dram_base, (
+            f"program allocator was not at its base when load_programs ran "
+            f"(0x{cache[_PROGRAM_ORDER[0]]:X} != 0x{self._program_dram_base:X}) -- "
+            f"every baked absolute jump target would be wrong.")
+
+        cattrs = self._manifest.get("compile_attrs")
+        if cattrs is None:
+            raise RuntimeError(
+                f"bin set {stem} predates the `compile_attrs` block -- regenerate "
+                f"with --clean.")
+        self._restore_weight_attrs(cattrs)
+        _cnames = self._manifest.get("compile_tensor_attrs") or []
+        if _cnames:
+            _ctpath = os.path.join(self.bin_dir, stem + "_tensors.pt")
+            if not os.path.exists(_ctpath):
+                raise FileNotFoundError(
+                    f"missing {_ctpath}: {stem}.json lists compile tensors {_cnames} "
+                    f"-- regenerate with --clean")
+            for k, v in torch.load(_ctpath, map_location="cpu",
+                                   weights_only=True).items():
+                setattr(self, k, v)
+
+        derived = self._manifest.get("derived") or {}
+        missing = [a for a in _BIN_DERIVED_ATTRS if a not in derived]
+        if missing:
+            raise RuntimeError(
+                f"bin set {stem} is missing derived attrs {missing} (stale set -- "
+                f"regenerate)")
+        for a, v in derived.items():
+            setattr(self, a, v)
+
+        # Freeze exactly as precompile_all does on the compile path, so a stray lazy
+        # compile inside the execution flow raises instead of allocating program DRAM
+        # per inference.
+        self._compile_frozen = True
+        _original_print(f"  Programs: {len(blob) / 1024**2:.1f} MB from {stem}.bin "
+                        f"(vision={engines['vision']}, prefix={engines['prefix']}, "
+                        f"denoise={engines['denoise']})")
+        return dict(cache)
+
 
 
 # ======================================================================================
@@ -8581,7 +9343,11 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
 # ======================================================================================
 
 class VeraPulse_Run(VeraPulse_UnifiedEngine):
-    """Load params/programs from bins instead of compiling.
+    """Engine pinned to bin-backed execution: REQUIRES a matching bin set and never
+    compiles. main() does not use this -- it builds the normal engine and switches on
+    bins_available(), so a missing set falls back to compiling instead of failing. This
+    exists for callers that want the guarantee (libero_eval, CI) that no compile can
+    happen mid-episode, and for a clear error when the set they expect is absent.
 
     __init__ MUST mirror the full 5-surface clear that survives software_reset():
       1. clear_on_chip_sram()            URAM A/B lower halves + scale/bias BRAM
@@ -8592,21 +9358,30 @@ class VeraPulse_Run(VeraPulse_UnifiedEngine):
     Skipping any of these lets a previously-run model contaminate results."""
 
     def __init__(self, bin_dir=None, **kw):
-        raise NotImplementedError
+        self.bin_dir = bin_dir or BIN_DIR
+        if not os.path.isdir(self.bin_dir):
+            raise FileNotFoundError(
+                f"No bin dir at {self.bin_dir}.\n"
+                f"Generate one first with a full compile run:\n"
+                f"    python {os.path.abspath(__file__)} --stage all --engines <N>")
+        self._manifest = None
+        super().__init__(**kw)
 
     def weight_init(self, dummy=False, seed=0):
-        """No-op: params come from params.bin. Signature mirrors the base class so the
-        same caller (main) drives either engine without knowing which it holds."""
-        raise NotImplementedError
+        """No-op on the checkpoint: params come from params.bin. Signature mirrors the
+        base class so the same caller drives either engine without knowing which."""
+        self.weight_init_from_bin(dummy=dummy)
 
-    def load_params(self):
-        raise NotImplementedError
+    def precompile_all(self, stages=None, freeze=True):
+        """A bin run's stand-in for the compile phase. Always loads the FULL program
+        set -- a bin file is dumped whole or not at all."""
+        return self.load_programs()
 
-    def load_programs(self):
-        raise NotImplementedError
-
-    def _sig_check(self, name, live, want):
-        raise NotImplementedError
+    def dump_bins(self, bin_dir):
+        raise RuntimeError(
+            "refusing to re-dump bins from a bin-backed run: this engine never compiled "
+            "anything, so it would only write back what it just loaded. Dump from a "
+            "fresh compile run.")
 
 
 # ======================================================================================
@@ -9453,8 +10228,7 @@ def configure_engines(ue, spec=1, *, vis=None, prefix=None, denoise=None, tag="m
         capped = {k: min(n, v) for k, v in caps.items() if min(n, v) < n}
         note = ("" if not capped else "; clamped by stage ceiling to "
                 + ", ".join(f"{k.lower()}={v}" for k, v in sorted(capped.items())))
-        print(f"[{tag}] NUM_ENGINES={n}: sharded regions run across {n} engines{note} "
-              f"(bins cannot be dumped in this mode)")
+        print(f"[{tag}] NUM_ENGINES={n}: sharded regions run across {n} engines{note}")
 
     for stage, want in (("VIS", vis), ("PREFIX", prefix), ("DENOISE", denoise)):
         if want is None:
@@ -9468,11 +10242,15 @@ def configure_engines(ue, spec=1, *, vis=None, prefix=None, denoise=None, tag="m
     multi = max([n] + [int(getattr(ue, f"{st}_NUM_ENGINES", None) or n)
                        for st in caps]) > 1
     if multi:
-        # Multi-engine programs live in N separate capture buffers; a bin holds only
-        # engine 0's, so loading it back would run a primary that barriers against
-        # workers that were never launched -- a deadlock with no timeout, not a wrong
-        # answer. Refused at the source rather than warned about.
-        print(f"[{tag}] multi-engine: bins cannot be dumped in this mode")
+        # Multi-engine programs live in N separate capture buffers -- one per engine.
+        # The bin set carries ALL of them: each stage stores the primary's program plus
+        # one section per worker, and the whole set is keyed by the (vision, prefix,
+        # denoise) engine triple, so a set can only ever be replayed at the engine count
+        # it was compiled for. Loading an 8-engine set on 4 engines would leave the
+        # primary barriering against workers that were never launched -- a deadlock with
+        # no timeout, not a wrong answer -- so load_programs refuses on the triple.
+        print(f"[{tag}] multi-engine: bins are keyed per engine configuration "
+              f"(dump/load with the same --engines)")
     return multi
 
 
@@ -9652,8 +10430,20 @@ def main():
                     help="restore the full gate commentary: per-comparison RMS, the "
                          "known-fault notes, per-layer KV cos, oracle-load lines. Off "
                          "by default -- a green run needs one line per check.")
-    ap.add_argument("--dump-bins", action="store_true")
-    ap.add_argument("--from-bin", action="store_true")
+    # Bins are automatic (see the _bin_eligible block in main): a full run loads the set
+    # matching its --engines configuration if one exists, and dumps one if it does not.
+    # These two flags only override that choice.
+    ap.add_argument("--dump-bins", action="store_true",
+                    help="force a re-compile and re-dump even when a matching bin set "
+                         "already exists (use after any compile-affecting edit)")
+    ap.add_argument("--from-bin", action="store_true",
+                    help="require bins: fail if no set matches this --engines "
+                         "configuration, instead of falling back to compiling")
+    ap.add_argument("--clean", action="store_true",
+                    help="delete every bin set (all engine configurations) before "
+                         "running, so this run recompiles and dumps fresh ones. Removes "
+                         "params.* and programs_e*.* only -- the downloaded checkpoint "
+                         "lives in the same directory and is left alone")
     ap.add_argument("--download-only", action="store_true",
                     help="fetch the checkpoint and exit")
     ap.add_argument("--tiny", action="store_true",
@@ -10052,8 +10842,29 @@ def main():
             f"--stage {args.stage}: HW path is a skeleton -- only vision/connector and "
             f"the end-to-end 'all' path are implemented. Bring a stage up and gate it "
             f"before wiring it here.")
-    if args.from_bin or args.dump_bins:
-        raise NotImplementedError("bins are not implemented yet for the vision stage")
+    if args.clean:
+        clean_bins(BIN_DIR)
+
+    # Bins are AUTOMATIC: a run that could produce a valid set loads one if it exists
+    # and dumps one if it does not. No flag selects the path -- --engines does, because
+    # the set is keyed by the engine configuration. The two flags below only override
+    # the automatic choice: --from-bin makes a missing set an error instead of a compile,
+    # --dump-bins forces a re-dump over an existing set.
+    #
+    # Only a full, non-probing run qualifies. The debug/bisect paths compile extra probe
+    # programs or skip stages entirely, which desyncs the program allocator from the
+    # dumped layout; --no-precompile skips the phase that does the loading.
+    _bin_eligible = (args.stage == "all" and args.precompile
+                     and not args.stop_after
+                     and not args.bisect_vision
+                     and args.bisect_expert is None
+                     and args.bisect_prefix is None)
+    if args.from_bin and not _bin_eligible:
+        raise SystemExit(
+            "--from-bin needs a full non-probing run: --stage all, the precompile phase "
+            "on, and no --stop-after/--bisect-*. Those paths compile extra probe "
+            "programs or skip stages, which desyncs the program allocator from the "
+            "dumped layout.")
     if args.quant != "bf16":
         raise NotImplementedError("the vision tower is stored bf16 only")
 
@@ -10098,14 +10909,6 @@ def main():
     ue.DENOISE_DIGEST = args.denoise_digest
     if args.exec_timeout:
         ue.EXEC_TIMEOUT = float(args.exec_timeout)
-    if args.dump_bins and max(ue._num_engines(s_)
-                              for s_ in ("VIS", "PREFIX", "DENOISE")) > 1:
-        # A bin carries ONE program stream and one params blob. A sharded run also has
-        # per-worker programs in per-worker arenas and per-engine scratch, none of which
-        # the bin schema describes -- loading it back would launch the primary alone
-        # against a rendezvous no worker ever answers, and hang on a FLAG_CHECK that has
-        # no timeout. Refuse rather than emit a bin that cannot be replayed.
-        raise SystemExit("--dump-bins is single-engine only; re-run with --engines 1")
     # weight_init LAST among engine constructions: every UnifiedEngine ctor DMA-writes
     # 16KB of noise to a hardcoded 0x80000000, which is this model's first stored weight.
     # SiLU variant must be set BEFORE compile_prefix runs (it is read at emit time).
@@ -10135,7 +10938,26 @@ def main():
     ue.VIS_LAYERS = args.vis_layers
     ue.VIS_NO_BATCH = args.no_vis_batch
     ue.PREFIX_FUSED_SILU = args.fused_silu
-    ue.weight_init(dummy=(args.weights == "dummy"), seed=args.seed)
+
+    # --- bins: use them if this run's engine configuration already has a set ---------
+    # Asked HERE and not earlier: the set is keyed by the (vision, prefix, denoise)
+    # engine triple, and _num_engines cannot resolve that until the engine exists and
+    # configure_engines has run -- it clamps against the board's core count and the
+    # prefix's column-block count.
+    ue._dummy_weights_wanted = (args.weights == "dummy")
+    _have_bins = _bin_eligible and ue.bins_available(BIN_DIR)
+    if args.from_bin and not _have_bins:
+        raise SystemExit(
+            f"--from-bin: no bin set for this engine configuration "
+            f"({_programs_stem(ue._bin_engines())}) in {BIN_DIR}. "
+            f"Run once without --from-bin to compile and dump it.")
+    _use_bins = _have_bins and not args.dump_bins
+    if _use_bins:
+        print(f"[main] bins: loading {_programs_stem(ue._bin_engines())} from {BIN_DIR} "
+              f"(no weight unpack, no compile)")
+        ue.weight_init_from_bin(dummy=(args.weights == "dummy"))
+    else:
+        ue.weight_init(dummy=(args.weights == "dummy"), seed=args.seed)
     ue.tensor_init()
 
     # --- compile phase: every program built BEFORE anything executes ---------------
@@ -10151,7 +10973,10 @@ def main():
             _stages = ("vision", "prefix")
         else:
             _stages = ue.COMPILE_STAGES
-        ue.precompile_all(stages=_stages)
+        if _use_bins:
+            ue.load_programs()
+        else:
+            ue.precompile_all(stages=_stages)
 
     # ================= END-TO-END: vision -> prefix -> denoise ======================
     if args.stage == "all":
@@ -10279,6 +11104,16 @@ def main():
         drop = HEADC["chunk_size"] - n_exec
         print(f"  ({drop} predicted actions discarded before re-plan; "
               f"{HEADC['max_action_dim'] - adim} padding columns dropped)")
+
+        # Dump AFTER a successful full inference: _prog_meta, the per-stage worker
+        # address/size lists and the derived vision geometry only exist once every
+        # stage has actually compiled and run. The file is keyed by this run's engine
+        # triple, so dumping at --engines 8 adds a set rather than replacing the 1-engine
+        # one, and params.bin is shared by both.
+        if _bin_eligible and not _use_bins:
+            print(f"\n[main] dumping bins for this engine configuration "
+                  f"({_programs_stem(ue._bin_engines())}) to {BIN_DIR} ...")
+            ue.dump_bins(BIN_DIR)
 
         PHASES.summary("hardware timing (compile is paid once, exec every inference)")
         return
