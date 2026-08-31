@@ -437,6 +437,49 @@ def reset_device(dev: str = "xdma0") -> None:
 # Runner
 # ---------------------------------------------------------------------------
 
+_CI_MAX_ENGINES = "unset"          # sentinel: not probed yet (None means "unknown")
+
+
+def _device_max_engines():
+    """How many engines THIS board has, from the HW_INFO register. None if unknown.
+
+    CI should exercise the configuration the accelerator actually ships in, not the
+    single-engine fallback: every multi-engine model clamps its own per-stage ceiling
+    against this number anyway (a barrier addressed at an engine the fabric does not have
+    spins forever -- FLAG_CHECK has no timeout), so handing it the board's core count is
+    the same as asking each model for "as many as this device supports".
+
+    UE_CI_ENGINES overrides it, for a runner that wants to pin a count (or set 1 to get
+    the old single-engine behaviour back without editing the registry).
+    """
+    global _CI_MAX_ENGINES
+    if _CI_MAX_ENGINES != "unset":
+        return _CI_MAX_ENGINES
+    override = os.environ.get("UE_CI_ENGINES")
+    if override:
+        try:
+            _CI_MAX_ENGINES = max(1, int(override))
+            print(f"[ci] UE_CI_ENGINES={_CI_MAX_ENGINES} (env override)")
+            return _CI_MAX_ENGINES
+        except ValueError:
+            print(f"[ci] ignoring non-integer UE_CI_ENGINES={override!r}")
+    try:
+        import user_dma_core
+        if getattr(user_dma_core, "ANDROMEDA_CORE_COUNT", None) is None:
+            user_dma_core.configure_clock_from_hardware()
+        _CI_MAX_ENGINES = user_dma_core.ANDROMEDA_CORE_COUNT
+    except Exception as exc:
+        # No device, no driver, or a bitstream without HW_INFO: fall back to each
+        # model's own default rather than failing the run for a reporting detail.
+        print(f"[ci] could not read the board core count ({exc!r}); "
+              f"models keep their default engine count")
+        _CI_MAX_ENGINES = None
+    if _CI_MAX_ENGINES:
+        print(f"[ci] board reports {_CI_MAX_ENGINES} core(s); "
+              f"multi-engine models will run with --engines {_CI_MAX_ENGINES}")
+    return _CI_MAX_ENGINES
+
+
 def _script_supports_flag(script_path: str, flag: str) -> bool:
     """True when the model script declares `flag` in its own argparse.
 
@@ -472,6 +515,13 @@ def run_test(test: dict, verbose: bool = False,
     if test.get("prompt"):
         cmd += ["--prompt", test["prompt"]]
     cmd += test.get("extra_args", [])
+    # Max engines, for every script that takes --engines. Generic rather than a
+    # per-entry opt-in so a model added later is covered the day its entry lands; an
+    # explicit --engines in extra_args still wins, for a case that must pin its own count.
+    if "--engines" not in cmd and _script_supports_flag(script, "--engines"):
+        _ne = _device_max_engines()
+        if _ne and _ne > 1:
+            cmd += ["--engines", str(_ne)]
     unsupported = []
     for flag, value in (("--dev", dev), ("--device", device)):
         if value is None:
