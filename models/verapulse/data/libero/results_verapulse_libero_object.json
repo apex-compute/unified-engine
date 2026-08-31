@@ -1,0 +1,121 @@
+{
+  "model": "verapulse/pulsevla-libero-0.5b",
+  "policy_validated": false,
+  "warning": "action expert ~17 dB below its bf16 floor, executed actions at cos 0.97 vs the CPU oracle -- this success rate does NOT characterize the model or the accelerator",
+  "backend": "fpga",
+  "weights": "real",
+  "task_suite": "libero_object",
+  "seed": 7,
+  "task_start": 0,
+  "tasks": 10,
+  "trials": 1,
+  "max_steps": 280,
+  "replan_steps": 10,
+  "image_norm": "pm1",
+  "entry": "vision+prefix+denoise",
+  "successes": 7,
+  "episodes_total": 10,
+  "success_rate": 0.7,
+  "episodes": [
+    {
+      "task_id": 0,
+      "trial": 0,
+      "language": "pick up the alphabet soup and place it in the basket",
+      "steps": 136,
+      "inferences": 13,
+      "seconds": 12.0,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 1,
+      "trial": 0,
+      "language": "pick up the cream cheese and place it in the basket",
+      "steps": 255,
+      "inferences": 25,
+      "seconds": 115.3,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 2,
+      "trial": 0,
+      "language": "pick up the salad dressing and place it in the basket",
+      "steps": 137,
+      "inferences": 13,
+      "seconds": 60.0,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 3,
+      "trial": 0,
+      "language": "pick up the bbq sauce and place it in the basket",
+      "steps": 290,
+      "inferences": 28,
+      "seconds": 128.4,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 4,
+      "trial": 0,
+      "language": "pick up the ketchup and place it in the basket",
+      "steps": 163,
+      "inferences": 16,
+      "seconds": 73.6,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 5,
+      "trial": 0,
+      "language": "pick up the tomato sauce and place it in the basket",
+      "steps": 290,
+      "inferences": 28,
+      "seconds": 129.7,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 6,
+      "trial": 0,
+      "language": "pick up the butter and place it in the basket",
+      "steps": 290,
+      "inferences": 28,
+      "seconds": 129.8,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 7,
+      "trial": 0,
+      "language": "pick up the milk and place it in the basket",
+      "steps": 139,
+      "inferences": 13,
+      "seconds": 60.6,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 8,
+      "trial": 0,
+      "language": "pick up the chocolate pudding and place it in the basket",
+      "steps": 160,
+      "inferences": 16,
+      "seconds": 74.3,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 9,
+      "trial": 0,
+      "language": "pick up the orange juice and place it in the basket",
+      "steps": 126,
+      "inferences": 12,
+      "seconds": 55.9,
+      "success": true,
+      "errored": false
+    }
+  ]
+}
