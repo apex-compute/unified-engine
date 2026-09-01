@@ -2480,8 +2480,8 @@ class UnifiedEngine:
         _BROADCAST_MODES = (UE_MODE.MUL_BROADCAST, UE_MODE.ADD_BROADCAST)
         if mode not in _VECTOR_MODES + _BROADCAST_MODES:
             raise ValueError(f"{fn}: mode must be ELTWISE_ADD/MUL/SUB or MUL_BROADCAST/ADD_BROADCAST, got {mode!r}")
-        is_broadcast = mode in _BROADCAST_MODES
-        if is_broadcast:
+        is_broadcast_mode = mode in _BROADCAST_MODES
+        if is_broadcast_mode:
             if scalar is None:
                 raise ValueError(f"{fn}: scalar required for {mode!r}")
             if dram_b is not None:
@@ -2533,9 +2533,16 @@ class UnifiedEngine:
         tail_rows_reg  = _alloc()  # (total mod CHUNK)/64 (tail compute URAM_ROW_SIZE; 0 iff no tail)
         tail_bytes_reg = _alloc()  # (total mod CHUNK)*2 (tail DMA length)
         chunk_rows_reg = _alloc()  # constant CHUNK_ROWS (populates the compute pointer's row size)
-        zb_reg         = _alloc() if not is_broadcast else None  # constant b-operand URAM row
+        # Benchmark-only Gemma shortcut: treat vector elementwise staging like a broadcast so
+        # the B-side DRAM->URAM DMA is omitted.  Keep the real mode separately so the emitted
+        # compute descriptor is still ELTWISE_ADD/MUL/SUB and measures the same arithmetic path;
+        # URAM_B intentionally contains stale data, so this knob is for latency measurement only.
+        is_broadcast = is_broadcast_mode or bool(
+            getattr(self, "_benchmark_single_dma_eltwise", False)
+        )
+        zb_reg         = _alloc() if not is_broadcast_mode else None  # constant b-operand URAM row
         # UE_PBI broadcasts source their Y-row stride from pointer field 10.
-        one_reg        = _alloc() if is_broadcast else None
+        one_reg        = _alloc() if is_broadcast_mode else None
 
         self.generate_instruction_mul32_reg(total_reg, gpr_M_reg, gpr_N_reg)
         self.generate_instruction_shr(n_chunks_reg, total_reg, CHUNK_LOG2)
@@ -2579,7 +2586,7 @@ class UnifiedEngine:
         # tail compute (runtime row size) and by vector full chunks; broadcast full chunks avoid it.
         self.generate_instruction_pbi_init(
             inst_pointer_idx=ptr_comp,
-            lalu_scalar=(self.float_to_bf16(scalar) if is_broadcast else 0),
+            lalu_scalar=(self.float_to_bf16(scalar) if is_broadcast_mode else 0),
         )
         _set(ptr_comp, PBI_FIELD.URAM_START_ADDR_Y, 0)   # reg 0 = hardwired zero (A row 0)
         if zb_reg is not None:
@@ -2596,7 +2603,7 @@ class UnifiedEngine:
         def _emit_compute(rows: int, elems: int, pbi_tail: bool) -> None:
             """One chunk/tail compute. Full chunks are plain baked ops (fast path); the vector-mode
             and all broadcast operations that need runtime pointer state use UE_PBI via ptr_comp."""
-            if not is_broadcast:
+            if not is_broadcast_mode:
                 if pbi_tail:
                     self.start_queue_eltwise(mode, a_uram_row, b_uram_row, a_uram_row,
                                              URAM_SECTION.URAM_A.value, rows, inst_pointer_idx=ptr_comp)

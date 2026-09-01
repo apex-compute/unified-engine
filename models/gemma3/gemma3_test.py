@@ -267,6 +267,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         program_dram_base = DRAM_INSTRUCTION_ADDR + 0x10000000 if engine_slave else DRAM_INSTRUCTION_ADDR
         engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
         super().__init__(BASE_ADDR=engine_base, program_dram_base=program_dram_base)
+        # Performance experiment: omit the second input DMA in dynamic vector elementwise ops.
+        # This intentionally sacrifices numerical correctness and must not be used as a model
+        # correctness configuration; it isolates the latency benefit of single-DMA eltwise.
+        self._benchmark_single_dma_eltwise = True
         self.dual_engine = dual_engine
         self.legacy = legacy
         self.two_pass_prefill = two_pass_prefill
@@ -1861,6 +1865,12 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         global _SILENT_MODE
         _SILENT_MODE = True
 
+        # Benchmark-only decoder shortcut.  Mirroring the dynamic DRAM eltwise experiment,
+        # is_broadcast=True suppresses each vector op's second DRAM->SRAM input transfer while
+        # leaving its ADD/MUL compute and writeback instructions in place.  URAM_B is therefore
+        # stale and numerical output is intentionally invalid; this isolates DMA latency only.
+        is_broadcast = bool(getattr(self, "_benchmark_single_dma_eltwise", False))
+
         # ---- persistent registers (seeded once, before the loop) ----
         # PBI row-loop trip-count registers (matmul/rms gpr_M_reg) must be low GPRs (1..15) because
         # the hardware loop-counter field is narrow — allocate the two decode row-counts (M=1 and
@@ -2091,7 +2101,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         # --- post-attention residual (SRAM-staged; layer-invariant buffers, literal addrs) ---
         self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
+        if not is_broadcast:
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
         self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
         self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
         if profile:
@@ -2121,7 +2132,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         # --- gate * up (SRAM-staged) ---
         self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
+        if not is_broadcast:
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
         self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
         self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
         if profile:
@@ -2143,7 +2155,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         # --- post-MLP residual (SRAM-staged) -> LAYER0_OUTPUT_DRAM ---
         self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_MLP_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
+        if not is_broadcast:
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_MLP_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
         self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
         self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
         if profile:
