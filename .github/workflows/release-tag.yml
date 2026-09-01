@@ -1,0 +1,206 @@
+name: Create Release Tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name (example: v1.2.3)"
+        required: true
+        type: string
+      message:
+        description: "Annotated tag message (optional)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  create-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate and create tag
+        id: create_tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          INPUT_MESSAGE: ${{ github.event.inputs.message }}
+        run: |
+          set -euo pipefail
+
+          tag="$(echo "$INPUT_TAG" | xargs)"
+          msg="$INPUT_MESSAGE"
+
+          if [ -z "$tag" ]; then
+            echo "::error::tag input cannot be empty."
+            exit 1
+          fi
+
+          # Conservative validation: allow common release-tag characters.
+          if ! [[ "$tag" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Invalid tag '$tag'. Allowed: letters, numbers, dot, underscore, dash, slash."
+            exit 1
+          fi
+
+          git fetch --tags origin main
+
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::Tag '$tag' already exists locally."
+            exit 1
+          fi
+
+          if git ls-remote --tags origin "refs/tags/$tag" | grep -q .; then
+            echo "::error::Tag '$tag' already exists on origin."
+            exit 1
+          fi
+
+          target_sha="$(git rev-parse "origin/main^{commit}")"
+          echo "Resolved fixed ref 'main' to commit $target_sha"
+
+          if [ -n "$(echo "$msg" | xargs)" ]; then
+            git tag -a "$tag" "$target_sha" -m "$msg"
+          else
+            git tag -a "$tag" "$target_sha" -m "Release $tag"
+          fi
+
+          git push origin "refs/tags/$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$target_sha" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Release tag created"
+            echo "- Tag: \`$tag\`"
+            echo "- Ref: \`main\`"
+            echo "- Commit: \`$target_sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download latest existing PCIe build artifact
+        id: latest_artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          branch="main"
+
+          mkdir -p release_artifacts
+          runs_json="$(gh run list -R "$SOURCE_REPO" --workflow pcie-build.yml --branch "$branch" --status success --limit 30 --json databaseId,headSha,url)"
+
+          run_id=""
+          artifact_name=""
+          run_url=""
+          artifact_sha=""
+          while IFS='|' read -r rid rsha rurl; do
+            [ -z "$rid" ] && continue
+            candidate_name="$(gh api "repos/${SOURCE_REPO}/actions/runs/${rid}/artifacts" --jq '[.artifacts[] | select((.expired | not) and (.name | startswith("andromeda_pcie_bit-")))][0].name // empty')"
+            if [ -z "$candidate_name" ]; then
+              continue
+            fi
+            echo "Trying artifact '$candidate_name' from run $rid..."
+            if gh run download "$rid" -R "$SOURCE_REPO" -n "$candidate_name" -D release_artifacts; then
+              if rg --files release_artifacts -g "*.bin" >/dev/null; then
+                run_id="$rid"
+                artifact_name="$candidate_name"
+                run_url="$rurl"
+                artifact_sha="$rsha"
+                break
+              fi
+            fi
+            rm -rf release_artifacts/*
+          done < <(echo "$runs_json" | jq -r '.[] | "\(.databaseId)|\(.headSha)|\(.url)"')
+
+          if [ -z "$run_id" ]; then
+            echo "::error::Could not find a usable andromeda_pcie_bit-* artifact with .bin on branch '$branch'."
+            exit 1
+          fi
+
+          echo "Using artifact '$artifact_name' from run $run_id ($run_url)"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "run_url=$run_url" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "artifact_sha=$artifact_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Verify release .bin files exist
+        id: download_artifact
+        run: |
+          set -euo pipefail
+          if ! rg --files release_artifacts -g "*.bin" >/dev/null; then
+            echo "::error::No .bin files found in downloaded artifact."
+            exit 1
+          fi
+          bin_count="$(rg --files release_artifacts -g "*.bin" | wc -l)"
+          if [ "$bin_count" -ne 1 ]; then
+            echo "::error::Expected exactly 1 .bin file, found ${bin_count}."
+            rg --files release_artifacts -g "*.bin" || true
+            exit 1
+          fi
+          echo "Found exactly 1 .bin file."
+          echo "bin_count=$bin_count" >> "$GITHUB_OUTPUT"
+
+      - name: Upload .bin to destination release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
+          DEST_REPO: ${{ secrets.RELEASE_REPO }}
+          TAG_NAME: ${{ steps.create_tag.outputs.tag }}
+          TAG_SHA: ${{ steps.create_tag.outputs.sha }}
+          INPUT_MESSAGE: ${{ github.event.inputs.message }}
+          RUN_ID: ${{ steps.latest_artifact.outputs.run_id }}
+          RUN_URL: ${{ steps.latest_artifact.outputs.run_url }}
+          ARTIFACT_NAME: ${{ steps.latest_artifact.outputs.artifact_name }}
+          ARTIFACT_BRANCH: ${{ steps.latest_artifact.outputs.branch }}
+          ARTIFACT_SHA: ${{ steps.latest_artifact.outputs.artifact_sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::Missing required release token secret."
+            exit 1
+          fi
+          if [ -z "${DEST_REPO:-}" ]; then
+            echo "::error::Missing required destination repo secret (format: owner/repo)."
+            exit 1
+          fi
+
+          if gh release view "$TAG_NAME" -R "$DEST_REPO" >/dev/null 2>&1; then
+            echo "Release for $TAG_NAME already exists in destination repo; reusing."
+          else
+            notes="Release $TAG_NAME"
+            if [ -n "$(echo "$INPUT_MESSAGE" | xargs)" ]; then
+              notes="$INPUT_MESSAGE"
+            fi
+            gh release create "$TAG_NAME" -R "$DEST_REPO" --title "$TAG_NAME" --notes "$notes"
+          fi
+
+          mapfile -t bins < <(rg --files release_artifacts -g "*.bin")
+          if [ "${#bins[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly 1 .bin file, found ${#bins[@]}."
+            exit 1
+          fi
+
+          fpga_hash="${ARTIFACT_SHA:0:8}"
+          if [ -z "$fpga_hash" ]; then
+            echo "::error::Could not derive FPGA hash from artifact source run."
+            exit 1
+          fi
+
+          renamed_bin="release_artifacts/update_${fpga_hash}.bin"
+          cp "${bins[0]}" "$renamed_bin"
+          gh release upload "$TAG_NAME" "$renamed_bin" -R "$DEST_REPO" --clobber
+
+          {
+            echo ""
+            echo "### Release assets uploaded"
+            echo "- Release tag: \`$TAG_NAME\`"
+            echo "- Commit: \`$TAG_SHA\`"
+            echo "- Source branch for artifact lookup: \`$ARTIFACT_BRANCH\`"
+            echo "- Reused artifact: \`$ARTIFACT_NAME\`"
+            echo "- Source PCIe build run: [${RUN_ID}](${RUN_URL})"
+            echo "- FPGA hash for asset naming: \`$fpga_hash\`"
+            echo "- Uploaded renamed .bin file: \`$(basename "$renamed_bin")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
