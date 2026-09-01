@@ -138,10 +138,8 @@ def quantize_q4_64(tensor):
 def clean_bins(bin_dir: str, verbose: bool = True) -> list:
     """Delete every cached artifact in `bin_dir`, for ALL engine configurations.
 
-    NAMES THE FILES; never rm -rf the directory. The downloaded HF checkpoint lives
-    INSIDE the bin dir (smolvlm2_bin/SmolVLM2-500M-Video-Instruct/, see weight_init), so
-    removing the directory would throw the weights away and force a re-download. Only
-    params*.bin/.json and programs*.bin/.json are touched.
+    NAMES THE FILES; never rm -rf the dir -- the HF checkpoint lives inside it
+    (smolvlm2_bin/SmolVLM2-500M-Video-Instruct/, see weight_init).
     """
     import glob
     victims = sorted(
@@ -288,12 +286,10 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
     def _artifact_engine_suffix(self) -> str:
         """Engine configuration, as a programs-file suffix.
 
-        SEPARATE from _artifact_mode_suffix because params{suffix}.bin uses that one and
-        the params snapshot is engine-count INVARIANT: sharding never writes the params
-        region (every per-engine buffer is registered out of the worker TENSOR arena), so
-        one params.bin serves every configuration. The programs are the opposite -- a
-        sharded program bakes one rendezvous per engine and cannot be replayed at a
-        different count -- so they get one file per (encoder, prefill, decode) triple.
+        SEPARATE from _artifact_mode_suffix, which params{suffix}.bin also uses: the
+        params snapshot is engine-count invariant (per-engine buffers come out of the
+        worker TENSOR arena), while a sharded program bakes one rendezvous per engine
+        and needs a file per (encoder, prefill, decode) triple.
         """
         return (f"_e{int(self.NUM_ENGINES)}_{self._prefill_engines()}"
                 f"_{int(self.DECODE_NUM_ENGINES)}")
@@ -304,12 +300,11 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 os.path.join(bin_dir, f"programs{suffix}.json"), suffix)
 
     def _record_worker_prog_sizes(self, attr: str, sched) -> None:
-        """Snapshot each worker program's size right after finalize().
+        """Worker program sizes, snapshotted right after finalize().
 
-        Must happen HERE: finalize() flushes the capture but leaves the buffer in place,
-        and the next stage's begin_program() clears it on the same shared workers. The
-        size cannot be recovered by differencing worker program addresses either --
-        allocate_program_dram rounds every allocation up to 64 B.
+        Here and nowhere later: the next stage's begin_program() clears the capture on
+        these SHARED workers. Differencing addresses does not work either --
+        allocate_program_dram rounds up to 64 B and over-reports.
         """
         setattr(self, attr + "_sizes",
                 [w.get_capture_instruction_size_bytes() for w in sched.workers])
@@ -326,9 +321,9 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
     def _collect_worker_segments(self, raw: bytearray) -> tuple[list, dict]:
         """Read every worker program back and append it to `raw`.
 
-        A sharded stage is not one program: each extra engine executes its own stream out
-        of its own arena slice. Replaying only the primary's would leave the worker rows
-        unwritten while the primary waits at a rendezvous nobody answers.
+        A sharded stage is not one program: each extra engine runs its own stream out of
+        its own arena slice, and replaying only the primary leaves those rows unwritten
+        while it waits at a rendezvous nobody answers.
         """
         segs, addrs = [], {}
         pool = self._worker_pool()
@@ -356,10 +351,9 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
     def _restore_worker_programs(self, meta: dict, raw: bytes) -> None:
         """Rebuild the schedulers, DMA every worker program back, restore the addresses.
 
-        The scheduler builders are replayed rather than persisted: every per-engine
-        registration lives INSIDE them (_vis_make_scheduler / _pf_make_scheduler), and
-        they allocate from the worker tensor arenas in a fixed order, so calling them in
-        the compile order reproduces byte-identical addresses.
+        The builders are replayed rather than persisted: every per-engine registration
+        lives inside them and allocates in a fixed order, so calling them in compile
+        order reproduces byte-identical addresses.
         """
         if not self._is_sharded():
             return
@@ -382,8 +376,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self._vis_worker_prog_addrs = list(wa.get("encoder") or [])
         self._pf_worker_prog_addrs = list(wa.get("prefill") or [])
         self._lm_worker_prog_addrs = list(wa.get("decode") or [])
-        # Prefill preambles are RESERVED slots, not compiled code: run_prefill rewrites
-        # them every run with that run's row split. Only the addresses need restoring.
+        # Prefill preambles are reserved slots, not compiled code -- run_prefill rewrites
+        # them per run with that run's row split, so only the addresses matter.
         self._pf_worker_preamble_addrs = list(meta.get("pf_worker_preambles") or [])
         for w, end in zip(pool, meta.get("worker_prog_end") or []):
             w._next_program_dram_addr = int(end)
@@ -541,14 +535,11 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
     _SNAP_SCALARS = (int, float, bool, str, type(None))
 
     def _capture_tensor_attrs(self, before) -> dict:
-        """Every JSON-safe attribute tensor_init published.
+        """Every JSON-safe attribute tensor_init published, by DIFFING __dict__.
 
-        Captured by DIFFING __dict__ rather than from the hand-written addr_attrs list.
-        That list is what drifts: VIS_FLASH_Q/K/V/OUT_DRAM were added to tensor_init for
-        the sharded encoder but never added to the list, so a snapshot-backed multi-engine
-        run had no attribute for _vis_make_scheduler to register. It was invisible before
-        only because 1-engine runs never build a scheduler and multi-engine runs never
-        loaded a bin.
+        The hand-written addr_attrs list drifts: VIS_FLASH_Q/K/V/OUT_DRAM were added to
+        tensor_init for the sharded encoder but never to the list, leaving a
+        snapshot-backed multi-engine run nothing for _vis_make_scheduler to register.
         """
         def ok(v, d=0):
             if d > 6:
@@ -1709,19 +1700,15 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                "decoder_attention_use_pbi": False,
                "decoder_attention_impl": "unified_attention_core",
                "decoder_attention_shared_subroutine": False,
-               # A sharded program bakes one rendezvous per engine, so a set built for a
-               # different count cannot be replayed: the missing workers never answer the
-               # first FLAG_CHECK, which has no timeout, and the run hangs instead of
-               # failing. The filename separates configurations; this makes a stale file
-               # under the right name refuse too.
+               # The filename separates configurations; this makes a stale file under
+               # the right name refuse too, rather than hang at a missing rendezvous.
                "engines": [int(self.NUM_ENGINES), self._prefill_engines(),
                            int(self.DECODE_NUM_ENGINES)],
                **self._artifact_mode_meta()}
 
         # ---- cache hit: replay the encoder LN params, DMA each program to its stored abs addr ----
-        # Sharded builds load too: the bin carries one segment per WORKER program
-        # alongside the primary's, and the file is keyed by the engine triple, so what is
-        # replayed always matches the configuration that produced it.
+        # Sharded builds load too: the bin carries one segment per worker program and is
+        # keyed by the engine triple, so a replay always matches its own configuration.
         if os.path.exists(uni_bin) and os.path.exists(uni_meta):
             with open(uni_meta) as f:
                 meta = json.load(f)
@@ -2261,7 +2248,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         }
         meta["lm_head_data"] = self.lm_head_data
         meta["lm_head_scale"] = self.lm_head_scale
-        # Superset of addr_attrs, captured automatically (see _capture_tensor_attrs).
+        # Superset of addr_attrs (see _capture_tensor_attrs).
         meta["tensor_attrs"] = getattr(self, "_tensor_attrs", None) or {}
         for attr in addr_attrs:
             meta[attr] = getattr(self, attr)
@@ -2300,8 +2287,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 offset += len(data)
         self.allocate_params_dram(total)
         self.allocate_tensor_dram(meta["tensor_size"])
-        # tensor_init's full published state first; the explicit meta keys below carry
-        # the same values and simply win on any overlap.
+        # tensor_init's full state first; the explicit meta keys below win on overlap.
         for key, val in (meta.get("tensor_attrs") or {}).items():
             setattr(self, key, val)
         for key, val in meta.items():
@@ -2719,8 +2705,7 @@ def main():
     init_hang_prevention(ue)
     _artifact_suffix = ue._artifact_mode_suffix()
     # Load the snapshot (params.bin) only when the program bin for THIS engine
-    # configuration also exists. NUM_ENGINES no longer gates it: the bin carries one
-    # segment per worker program and is keyed by the (encoder, prefill, decode) triple.
+    # configuration also exists. NUM_ENGINES no longer gates it.
     _bin_dir = os.path.join(script_dir, "smolvlm2_bin")
     _pbin, _pmeta, _ = ue._programs_paths(_bin_dir)
     _have_instr_bin = os.path.exists(_pbin) and os.path.exists(_pmeta)
