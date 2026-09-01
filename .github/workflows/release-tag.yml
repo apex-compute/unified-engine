@@ -33,6 +33,9 @@ jobs:
         run: |
           set -euo pipefail
 
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           tag="$(echo "$INPUT_TAG" | xargs)"
           msg="$INPUT_MESSAGE"
 
@@ -79,93 +82,39 @@ jobs:
             echo "- Commit: \`$target_sha\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Download latest existing PCIe build artifact
-        id: latest_artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_REPO: ${{ github.repository }}
+      - name: Collect local .bin file
+        id: collect_bin
         run: |
           set -euo pipefail
-          branch="main"
-
           mkdir -p release_artifacts
-          runs_json="$(gh run list -R "$SOURCE_REPO" --workflow pcie-build.yml --branch "$branch" --status success --limit 30 --json databaseId,headSha,url)"
 
-          run_id=""
-          artifact_name=""
-          run_url=""
-          artifact_sha=""
-          while IFS='|' read -r rid rsha rurl; do
-            [ -z "$rid" ] && continue
-            candidate_name="$(gh api "repos/${SOURCE_REPO}/actions/runs/${rid}/artifacts" --jq '[.artifacts[] | select((.expired | not) and (.name | startswith("andromeda_pcie_bit-")))][0].name // empty')"
-            if [ -z "$candidate_name" ]; then
-              continue
-            fi
-            echo "Trying artifact '$candidate_name' from run $rid..."
-            if gh run download "$rid" -R "$SOURCE_REPO" -n "$candidate_name" -D release_artifacts; then
-              if rg --files release_artifacts -g "*.bin" >/dev/null; then
-                run_id="$rid"
-                artifact_name="$candidate_name"
-                run_url="$rurl"
-                artifact_sha="$rsha"
-                break
-              fi
-            fi
-            rm -rf release_artifacts/*
-          done < <(echo "$runs_json" | jq -r '.[] | "\(.databaseId)|\(.headSha)|\(.url)"')
-
-          if [ -z "$run_id" ]; then
-            echo "::error::Could not find a usable andromeda_pcie_bit-* artifact with .bin on branch '$branch'."
+          git fetch --no-tags origin main
+          mapfile -t bins < <(git ls-tree -r --name-only origin/main | grep -E '\.bin$' || true)
+          if [ "${#bins[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly 1 tracked .bin file on origin/main, found ${#bins[@]}."
+            echo "Tracked .bin files on origin/main:"
+            git ls-tree -r --name-only origin/main | grep -E '\.bin$' || true
             exit 1
           fi
 
-          echo "Using artifact '$artifact_name' from run $run_id ($run_url)"
-          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-          echo "run_url=$run_url" >> "$GITHUB_OUTPUT"
-          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-          echo "artifact_sha=$artifact_sha" >> "$GITHUB_OUTPUT"
-
-      - name: Verify release .bin files exist
-        id: download_artifact
-        run: |
-          set -euo pipefail
-          if ! rg --files release_artifacts -g "*.bin" >/dev/null; then
-            echo "::error::No .bin files found in downloaded artifact."
-            exit 1
-          fi
-          bin_count="$(rg --files release_artifacts -g "*.bin" | wc -l)"
-          if [ "$bin_count" -ne 1 ]; then
-            echo "::error::Expected exactly 1 .bin file, found ${bin_count}."
-            rg --files release_artifacts -g "*.bin" || true
-            exit 1
-          fi
-          echo "Found exactly 1 .bin file."
-          echo "bin_count=$bin_count" >> "$GITHUB_OUTPUT"
+          source_bin="${bins[0]}"
+          out_bin="release_artifacts/$(basename "$source_bin")"
+          git show "origin/main:${source_bin}" > "$out_bin"
+          echo "source_bin=$source_bin" >> "$GITHUB_OUTPUT"
+          echo "source_ref=origin/main" >> "$GITHUB_OUTPUT"
 
       - name: Upload .bin to destination release
+        id: upload_release
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_REPO_TOKEN }}
-          DEST_REPO: ${{ secrets.RELEASE_REPO }}
+          GH_TOKEN: ${{ github.token }}
+          DEST_REPO: ${{ github.repository }}
           TAG_NAME: ${{ steps.create_tag.outputs.tag }}
           TAG_SHA: ${{ steps.create_tag.outputs.sha }}
           INPUT_MESSAGE: ${{ github.event.inputs.message }}
-          RUN_ID: ${{ steps.latest_artifact.outputs.run_id }}
-          RUN_URL: ${{ steps.latest_artifact.outputs.run_url }}
-          ARTIFACT_NAME: ${{ steps.latest_artifact.outputs.artifact_name }}
-          ARTIFACT_BRANCH: ${{ steps.latest_artifact.outputs.branch }}
-          ARTIFACT_SHA: ${{ steps.latest_artifact.outputs.artifact_sha }}
+          SOURCE_BIN: ${{ steps.collect_bin.outputs.source_bin }}
+          SOURCE_REF: ${{ steps.collect_bin.outputs.source_ref }}
         run: |
           set -euo pipefail
-
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::Missing required release token secret."
-            exit 1
-          fi
-          if [ -z "${DEST_REPO:-}" ]; then
-            echo "::error::Missing required destination repo secret (format: owner/repo)."
-            exit 1
-          fi
 
           if gh release view "$TAG_NAME" -R "$DEST_REPO" >/dev/null 2>&1; then
             echo "Release for $TAG_NAME already exists in destination repo; reusing."
@@ -177,30 +126,42 @@ jobs:
             gh release create "$TAG_NAME" -R "$DEST_REPO" --title "$TAG_NAME" --notes "$notes"
           fi
 
-          mapfile -t bins < <(rg --files release_artifacts -g "*.bin")
+          mapfile -t bins < <(find release_artifacts -type f -name '*.bin' | sort)
           if [ "${#bins[@]}" -ne 1 ]; then
             echo "::error::Expected exactly 1 .bin file, found ${#bins[@]}."
             exit 1
           fi
 
-          fpga_hash="${ARTIFACT_SHA:0:8}"
-          if [ -z "$fpga_hash" ]; then
-            echo "::error::Could not derive FPGA hash from artifact source run."
-            exit 1
-          fi
-
-          renamed_bin="release_artifacts/update_${fpga_hash}.bin"
-          cp "${bins[0]}" "$renamed_bin"
-          gh release upload "$TAG_NAME" "$renamed_bin" -R "$DEST_REPO" --clobber
+          original_bin="${bins[0]}"
+          gh release upload "$TAG_NAME" "$original_bin" -R "$DEST_REPO" --clobber
 
           {
             echo ""
             echo "### Release assets uploaded"
             echo "- Release tag: \`$TAG_NAME\`"
             echo "- Commit: \`$TAG_SHA\`"
-            echo "- Source branch for artifact lookup: \`$ARTIFACT_BRANCH\`"
-            echo "- Reused artifact: \`$ARTIFACT_NAME\`"
-            echo "- Source PCIe build run: [${RUN_ID}](${RUN_URL})"
-            echo "- FPGA hash for asset naming: \`$fpga_hash\`"
-            echo "- Uploaded renamed .bin file: \`$(basename "$renamed_bin")\`"
+            echo "- Source ref for .bin: \`$SOURCE_REF\`"
+            echo "- Source local .bin: \`$SOURCE_BIN\`"
+            echo "- Uploaded .bin file: \`$(basename "$original_bin")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Roll back tag when upload fails
+        if: ${{ failure() && steps.create_tag.outcome == 'success' && steps.upload_release.outcome != 'success' }}
+        env:
+          TAG_NAME: ${{ steps.create_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAG_NAME:-}" ]; then
+            echo "No tag name available for rollback."
+            exit 0
+          fi
+
+          git push origin ":refs/tags/$TAG_NAME" || true
+          git tag -d "$TAG_NAME" || true
+
+          {
+            echo ""
+            echo "### Rollback"
+            echo "- Upload failed before completion."
+            echo "- Deleted tag: \`$TAG_NAME\`"
           } >> "$GITHUB_STEP_SUMMARY"
