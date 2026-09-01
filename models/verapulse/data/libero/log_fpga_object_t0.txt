@@ -1,0 +1,1133 @@
+==========================================================================
+  VeraPulse PulseVLA-LIBERO-0.5B  |  LIBERO closed-loop eval
+  !! FPGA BACKEND ONLY: the action expert on the DEVICE is missing three known
+     model faults (prefix-K/V concat on even layers, (320,320) cross reprojection,
+     causal suffix mask). They are fixed in VeraPulseRef and NOT in the emitter, so
+     the device reads cos 0.64 vs upstream. --backend cpu and --backend oracle both
+     reproduce upstream exactly (114.9 dB / 1/1 on libero_object) and are sound.
+==========================================================================
+[robosuite WARNING] No private macro file found! (macros.py:53)
+[robosuite WARNING] It is recommended to use a private macro file (macros.py:54)
+[robosuite WARNING] To setup, run: python /home/rohit/miniconda3/envs/pi05_libero/lib/python3.11/site-packages/robosuite/scripts/setup_macros.py (macros.py:55)
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+[info] using task orders [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+[eval] building FPGA engine (ctor + weight_init + tensor_init)...
+/dev/xdma0_user register access...
+HW version via user device: 0x5affec20
+address 0x00000000 = 0x5affec20
+address 0x00000030 = 0x0705a8ad
+address 0x00000054 = 0x000000c8
+address 0x00000070 = 0x01ab8948
+address 0x00000078 = 0x0acaddf0
+address 0x00000084 = 0x00000948
+address 0x00000088 = 0x0704dfa6
+address 0x0000008c = 0x00000a06
+address 0x00000090 = 0x00000506
+address 0x00000094 = 0x00000302
+address 0x00000098 = 0x00000b86
+address 0x0000009c = 0x00000002
+FPGA DRAM read/write test
+Dram read/write test passed
+init_unified_engine()
+Unified Engine initialization completed successfully!
+    rope tables [192,128] theta=10000 (+ x3 gqa)
+  params DRAM region map (absolute addresses):
+    params  0x080000000 .. 0x0C340A600     1076.0 MB used /   1152.0 MB available
+    tensor  0x0C8000000 .. 0x0D6000000      224.0 MB region
+    program 0x0D6000000 .. 0x100000000      672.0 MB region
+  tensor DRAM starts at 0x48000000
+  tensor DRAM: vision 39.4 MB + kv cache 7.5 MB = 46.9 MB / 224 MB region
+[eval] engine ready in 0.6s
+[eval] backend ready.
+[Warning]: datasets path /home/rohit/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/third_party/libero/libero/libero/../datasets does not exist!
+[Warning]: datasets path /home/rohit/apex-compute-ML/simple-llm/src/models/pi0_5/openpi_src/third_party/libero/libero/libero/../datasets does not exist!
+[eval] task 0 'pick up the alphabet soup and place it in the basket' trial 0
+[eval] first inference: the encoder/prefix/denoise programs compile here (once). Later inferences are execute-only.
+Capture started. Buffer initialized, count=0
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.847567 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.832625 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.847567 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.832625 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.847567 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.832625 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.847567 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.832625 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.847567 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.832625 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.847567 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.832625 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.847567 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.832625 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.847567 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.832625 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.847567 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.832625 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.847567 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.832625 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56/home/rohit/unified-engine/models/verapulse/verapulse_test.py:3622: UserWarning: The given buffer is not writable, and PyTorch does not support non-writable tensors. This means you can write to the underlying (supposedly non-writable) buffer using the tensor. You may want to copy the buffer to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_new.cpp:1577.)
+  return torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(*shape).float()
+
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.847567 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.832625 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 99
+Total Theoretical FLOPS: 0.140509 G
+matmat_mul_core_dynamic while-loop body size: 56
+Total Theoretical FLOPS: 0.134218 G
+unified_attention_core_dynamic: batch=1024, aligned_seq_len=1024, head_dim=64, FLOPS=0.274792 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 1.208746 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.847567 G
+matmat_mul_core_dynamic while-loop body size: 63
+Total Theoretical FLOPS: 4.832625 G
+Layer norm dynamic (chunk-tiled) outer loop body size: 121 (U=16 rows/chunk × ceil(M/U) chunks, M=GPR[1], N=768 compile-time addr, sqrt(N)=GPR[3] runtime, 3 PBI pointers)
+M_chunk: 21, N_chunk: 16 N_chunk_aligned: 64
+URAM_A usage: 98.95% of URAM_FULL_ELEMENTS
+URAM_B usage: 75.00% of URAM_FULL_ELEMENTS
+Total Theoretical FLOPS: 1.509949 G
+Capture stopped. Total instructions captured: 71412, size: 2285184 bytes
+    vision encoder + connector: 2285184 bytes @0x56000000
+Execute program start at 0x56000000
+    Total program execution latency = 5815220.928 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815211.952 us
+  vision: 2 slots -> tokens (128, 960) absmax=101.5000
+  [prefix] compiling ONCE...  [prefix] compiled in 0.34s  3.41 MB @0x5622DE80                
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=18.3750 (KV cache written)
+  expert constants re-staged for valid_prefix_len=141 (rope base 141..204, bias cutoff col 141)
+  [denoise] compiling ONCE...  [denoise] compiled in 3.14s  32.40 MB @0x5656EF80                
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=2.5156
+Execute program start at 0x56000000
+    Total program execution latency = 5815226.928 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815212.144 us
+  vision: 2 slots -> tokens (128, 960) absmax=101.5000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=18.8750 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=2.5312
+Execute program start at 0x56000000
+    Total program execution latency = 5815223.712 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815232.928 us
+  vision: 2 slots -> tokens (128, 960) absmax=101.0000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=19.7500 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=2.3125
+Execute program start at 0x56000000
+    Total program execution latency = 5815205.088 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815208.448 us
+  vision: 2 slots -> tokens (128, 960) absmax=101.5000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=19.6250 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=2.2344
+Execute program start at 0x56000000
+    Total program execution latency = 5815232.016 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815219.968 us
+  vision: 2 slots -> tokens (128, 960) absmax=103.5000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=21.0000 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=2.2812
+Execute program start at 0x56000000
+    Total program execution latency = 5815207.248 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815203.024 us
+  vision: 2 slots -> tokens (128, 960) absmax=101.0000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=21.8750 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=2.2812
+Execute program start at 0x56000000
+    Total program execution latency = 5815223.04 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815227.216 us
+  vision: 2 slots -> tokens (128, 960) absmax=92.0000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=19.0000 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=2.2344
+Execute program start at 0x56000000
+    Total program execution latency = 5815234.56 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815226.4 us
+  vision: 2 slots -> tokens (128, 960) absmax=89.5000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=18.6250 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=1.9609
+Execute program start at 0x56000000
+    Total program execution latency = 5815207.104 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815214.064 us
+  vision: 2 slots -> tokens (128, 960) absmax=90.5000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=16.6250 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=1.9141
+Execute program start at 0x56000000
+    Total program execution latency = 5815233.792 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815221.792 us
+  vision: 2 slots -> tokens (128, 960) absmax=91.5000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=17.7500 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=1.9453
+Execute program start at 0x56000000
+    Total program execution latency = 5815217.424 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815210.56 us
+  vision: 2 slots -> tokens (128, 960) absmax=92.0000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=18.7500 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=1.9141
+Execute program start at 0x56000000
+    Total program execution latency = 5815212.48 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815202.88 us
+  vision: 2 slots -> tokens (128, 960) absmax=113.5000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=22.3750 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=1.5938
+Execute program start at 0x56000000
+    Total program execution latency = 5815200.576 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815227.936 us
+  vision: 2 slots -> tokens (128, 960) absmax=102.0000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=22.5000 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=1.8125
+Execute program start at 0x56000000
+    Total program execution latency = 5815227.264 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815219.44 us
+  vision: 2 slots -> tokens (128, 960) absmax=94.0000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=18.6250 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=1.1094
+Execute program start at 0x56000000
+    Total program execution latency = 5815231.968 us
+Execute program start at 0x56000000
+    Total program execution latency = 5815201.104 us
+  vision: 2 slots -> tokens (128, 960) absmax=97.5000
+  [prefix] running... 1s  [prefix] running... 2s  [prefix] running... 3s  [prefix] done in 3.5s                    
+  [prefix] executed in 3.51s
+  prefix: 32 layers, valid 141/192 rows -> hidden (192, 960) absmax=19.6250 (KV cache written)
+  [denoise] running... 1s  [denoise] running... 2s  [denoise] running... 3s  [denoise] running... 4s  [denoise] running... 5s  [denoise] done in 5.1s                    
+  [denoise] executed in 5.14s
+  denoise: 10 steps x 32 layers -> actions (50, 7) absmax=1.4531
+[eval]   -> SUCCESS  15 inferences  (running 1/1 = 100.0%)
+[eval]   checkpointed -> models/verapulse/data/libero/results_fpga_object_t0.json
+[eval]   if the box reboots, resume with:  MUJOCO_GL=egl python /home/rohit/unified-engine/models/verapulse/libero_eval.py --task-suite libero_object --trials 1 --results-out models/verapulse/data/libero/results_fpga_object_t0.json --resume
+[eval] task 0 success rate: 1/1
+
+==========================================================================
+  LIBERO libero_object  |  backend=fpga  tasks=1  trials/task=1
+    task  0: 1/1 = 100.0%
+  OVERALL: 1/1 = 100.0%   (296s)
+  per-episode results -> models/verapulse/data/libero/results_fpga_object_t0.json
+  !! FPGA BACKEND ONLY: the action expert on the DEVICE is missing three known
+     model faults (prefix-K/V concat on even layers, (320,320) cross reprojection,
+     causal suffix mask). They are fixed in VeraPulseRef and NOT in the emitter, so
+     the device reads cos 0.64 vs upstream. --backend cpu and --backend oracle both
+     reproduce upstream exactly (114.9 dB / 1/1 on libero_object) and are sound.
+  inference trace (15 inferences) -> models/verapulse/data/libero/trace_fpga_object_t0.npz
+  replay on CPU:  python libero_eval.py --compare-trace models/verapulse/data/libero/trace_fpga_object_t0.npz
+==========================================================================

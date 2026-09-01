@@ -1,0 +1,141 @@
+{
+  "model": "verapulse/pulsevla-libero-0.5b",
+  "policy_validated": false,
+  "warning": "action expert ~17 dB below its bf16 floor, executed actions at cos 0.97 vs the CPU oracle -- this success rate does NOT characterize the model or the accelerator",
+  "backend": "fpga",
+  "weights": "real",
+  "task_suite": "libero_spatial",
+  "seed": 7,
+  "task_start": 0,
+  "tasks": 10,
+  "trials": 1,
+  "max_steps": 220,
+  "replan_steps": 10,
+  "image_norm": "pm1",
+  "entry": "vision+prefix+denoise",
+  "successes": 8,
+  "episodes_total": 12,
+  "success_rate": 0.6666666666666666,
+  "episodes": [
+    {
+      "task_id": 0,
+      "trial": 0,
+      "language": "fake task 0: pick up the black bowl and place it on the plate",
+      "steps": 30,
+      "inferences": 2,
+      "seconds": 0.1,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 0,
+      "trial": 1,
+      "language": "fake task 0: pick up the black bowl and place it on the plate",
+      "steps": 30,
+      "inferences": 2,
+      "seconds": 0.1,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 1,
+      "trial": 0,
+      "language": "fake task 1: pick up the black bowl and place it on the plate",
+      "steps": 30,
+      "inferences": 2,
+      "seconds": 0.1,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 1,
+      "trial": 1,
+      "language": "fake task 1: pick up the black bowl and place it on the plate",
+      "steps": 30,
+      "inferences": 2,
+      "seconds": 0.1,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 2,
+      "trial": 0,
+      "language": "pick up the black bowl from table center and place it on the plate",
+      "steps": 102,
+      "inferences": 10,
+      "seconds": 47.2,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 3,
+      "trial": 0,
+      "language": "pick up the black bowl on the cookie box and place it on the plate",
+      "steps": 97,
+      "inferences": 9,
+      "seconds": 42.0,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 4,
+      "trial": 0,
+      "language": "pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate",
+      "steps": 156,
+      "inferences": 15,
+      "seconds": 69.7,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 5,
+      "trial": 0,
+      "language": "pick up the black bowl on the ramekin and place it on the plate",
+      "steps": 107,
+      "inferences": 10,
+      "seconds": 46.6,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 6,
+      "trial": 0,
+      "language": "pick up the black bowl next to the cookie box and place it on the plate",
+      "steps": 115,
+      "inferences": 11,
+      "seconds": 51.2,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 7,
+      "trial": 0,
+      "language": "pick up the black bowl on the stove and place it on the plate",
+      "steps": 131,
+      "inferences": 13,
+      "seconds": 60.5,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 8,
+      "trial": 0,
+      "language": "pick up the black bowl next to the plate and place it on the plate",
+      "steps": 111,
+      "inferences": 11,
+      "seconds": 51.1,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 9,
+      "trial": 0,
+      "language": "pick up the black bowl on the wooden cabinet and place it on the plate",
+      "steps": 134,
+      "inferences": 13,
+      "seconds": 60.4,
+      "success": true,
+      "errored": false
+    }
+  ]
+}

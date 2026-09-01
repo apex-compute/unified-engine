@@ -1,0 +1,121 @@
+{
+  "model": "verapulse/pulsevla-libero-0.5b",
+  "policy_validated": false,
+  "warning": "action expert ~17 dB below its bf16 floor, executed actions at cos 0.97 vs the CPU oracle -- this success rate does NOT characterize the model or the accelerator",
+  "backend": "fpga",
+  "weights": "real",
+  "task_suite": "libero_goal",
+  "seed": 7,
+  "task_start": 0,
+  "tasks": 10,
+  "trials": 1,
+  "max_steps": 300,
+  "replan_steps": 10,
+  "image_norm": "pm1",
+  "entry": "vision+prefix+denoise",
+  "successes": 9,
+  "episodes_total": 10,
+  "success_rate": 0.9,
+  "episodes": [
+    {
+      "task_id": 0,
+      "trial": 0,
+      "language": "open the middle drawer of the cabinet",
+      "steps": 141,
+      "inferences": 14,
+      "seconds": 65.7,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 1,
+      "trial": 0,
+      "language": "put the bowl on the stove",
+      "steps": 99,
+      "inferences": 9,
+      "seconds": 42.2,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 2,
+      "trial": 0,
+      "language": "put the wine bottle on top of the cabinet",
+      "steps": 106,
+      "inferences": 10,
+      "seconds": 46.8,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 3,
+      "trial": 0,
+      "language": "open the top drawer and put the bowl inside",
+      "steps": 177,
+      "inferences": 17,
+      "seconds": 79.1,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 4,
+      "trial": 0,
+      "language": "put the bowl on top of the cabinet",
+      "steps": 310,
+      "inferences": 30,
+      "seconds": 139.1,
+      "success": false,
+      "errored": false
+    },
+    {
+      "task_id": 5,
+      "trial": 0,
+      "language": "push the plate to the front of the stove",
+      "steps": 125,
+      "inferences": 12,
+      "seconds": 56.0,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 6,
+      "trial": 0,
+      "language": "put the cream cheese in the bowl",
+      "steps": 100,
+      "inferences": 10,
+      "seconds": 46.7,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 7,
+      "trial": 0,
+      "language": "turn on the stove",
+      "steps": 93,
+      "inferences": 9,
+      "seconds": 42.1,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 8,
+      "trial": 0,
+      "language": "put the bowl on the plate",
+      "steps": 94,
+      "inferences": 9,
+      "seconds": 42.1,
+      "success": true,
+      "errored": false
+    },
+    {
+      "task_id": 9,
+      "trial": 0,
+      "language": "put the wine bottle on the rack",
+      "steps": 146,
+      "inferences": 14,
+      "seconds": 65.2,
+      "success": true,
+      "errored": false
+    }
+  ]
+}
