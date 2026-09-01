@@ -375,7 +375,11 @@ LOCAL_CKPT_DIR = _CFG["paths"].get("local_ckpt_dir")
 # one. One programs file per (vision, prefix, denoise) engine triple: programs bake
 # absolute jump targets and one rendezvous per engine, so a set built for 8 cannot run
 # on 4 -- the missing workers never answer a FLAG_CHECK that has no timeout.
-_BIN_SUBDIR = "verapulse_bin"
+# PER VARIANT, from the config -- NOT hardcoded. Each variant declares its own
+# (verapulse_bin / verapulse_smolvla_bin / verapulse_smolvla_qg_bin), and sharing one
+# directory would let bins_available() hand a qg run the pulsevla set. smolvla and
+# smolvla_qg are byte-identical in shape, so `sig` alone cannot tell those two apart.
+_BIN_SUBDIR = _CFG["paths"].get("bin_dir", "verapulse_bin")
 BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), _BIN_SUBDIR)
 
 # Load order is load-bearing: program DRAM is a bump allocator, so vision -> prefix ->
@@ -8910,6 +8914,9 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
 
         HEAD, V, L = self._cfg["action_head"], self._cfg["vision"], self._cfg["lm"]
         manifest["sig"] = {
+            # smolvla and smolvla_qg share every shape field, so the variant name is the
+            # only thing separating their bin sets if they ever meet in one directory.
+            "variant": VARIANT,
             "num_image_slots": int(V["num_image_slots"]),
             "chunk_size": int(HEAD["chunk_size"]),
             "denoise_steps": int(HEAD["num_denoise_steps"]),
@@ -9157,6 +9164,8 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
 
         HEAD, V, L = self._cfg["action_head"], self._cfg["vision"], self._cfg["lm"]
         for name, live, want, hint in (
+                ("variant", VARIANT, sig.get("variant", VARIANT),
+                 "these bins were built for a different --variant"),
                 ("num_image_slots", int(V["num_image_slots"]),
                  int(sig["num_image_slots"]), "camera count changed in the config"),
                 ("chunk_size", int(HEAD["chunk_size"]), int(sig["chunk_size"]),
