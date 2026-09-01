@@ -115,6 +115,9 @@ def ensure_tokenizer(script_dir=None):
     construction. Same cache root as everything else, so it lands in <model>_bin/.
     Idempotent and network-free once present (4 MB).
     """
+    packaged = _bin_asset(TOKENIZER_ASSET)
+    if packaged:
+        return packaged          # bin set carries its own; no GCS, no openpi import
     path = os.path.join(_ckpt_cache_root(script_dir),
                         *_CFG["paths"]["paligemma_tokenizer"].split("//")[1].split("/"))
     if os.path.exists(path):
@@ -344,6 +347,19 @@ def ensure_weights_export(script_dir=None):
 # Pre-compiled bin location (paths.* are script-dir-relative, qwen3 convention).
 BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), _BIN_SUBDIR)
 
+# The three RUNTIME assets a bin-only run still needs, packaged INTO the bin dir by
+# dump_bins so a copied set is self-contained. Without them a bin run drags in the 13 GB
+# weights_export/ tree (for ONE host-side table), a GCS download, and the openpi package.
+HOST_TENSORS_ASSET = "weight_tensors.pt"
+TOKENIZER_ASSET = "paligemma_tokenizer.model"
+NORM_STATS_ASSET = "norm_stats.json"
+
+
+def _bin_asset(name, bin_dir=None):
+    """Path to a packaged asset if the bin dir carries one, else None."""
+    p = os.path.join(bin_dir or BIN_DIR, name)
+    return p if os.path.exists(p) else None
+
 # Vision-geometry scalars that _weight_init_vision DERIVES and publishes on the instance
 # (see its `V = self._cfg["vision"]` block and VIS_HEAD_OUT = hk.shape[1]). They are NOT
 # DRAM addresses and NOT class attributes, so a run_from_bin engine -- which replaces the
@@ -360,7 +376,12 @@ BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), _BIN_SUBDIR)
 # Derived by an AST sweep of the weight_init call graph vs everything reachable in bin
 # mode; dump_programs_to_file asserts this list still covers every such attr.
 _BIN_DERIVED_ATTRS = ("VIS_H", "VIS_NH", "VIS_D", "VIS_DP", "VIS_I", "VIS_I_PAD",
-                      "VIS_S", "VIS_PATCH_K", "VIS_HEAD_OUT")
+                      "VIS_S", "VIS_PATCH_K", "VIS_HEAD_OUT",
+                      # Worker-arena geometry, sized at runtime by
+                      # _resolve_worker_arena_profile. RESTORED, not recomputed: every
+                      # worker program address in the manifest was derived from these
+                      # two. Absent at 1 engine, where the profile never resolves.
+                      "VIS_WORKER_ARENA_BYTES", "VIS_WORKER_PROGRAM_OFFSET")
 
 
 class _DebugStop(Exception):
@@ -1511,6 +1532,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # KEEP the addresses: sched is shared with the encoder and finalize()
             # overwrites sched._worker_prog_addrs.
             self._prefix_worker_prog_addrs = sched.finalize()
+            self._record_worker_prog_sizes("prefix", sched)
             print(f"    [prefix] worker program(s): "
                   f"{[w.get_capture_instruction_size_bytes() for w in sched.workers]} bytes")
             self._assert_worker_programs_fit(sched)
@@ -2370,6 +2392,22 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             f"{workers} * {per >> 20} MB = {(workers * per) >> 20} MB of tensor DRAM, "
             f"{self.VIS_WORKER_AE_TENSOR_RESERVE >> 20} MB reserved for the action expert")
 
+    def _record_worker_prog_sizes(self, stage, sched):
+        """Worker program sizes, snapshotted right after finalize().
+
+        Here and nowhere later: the next stage's begin_program() clears the capture on
+        these SHARED workers. Differencing addresses over-reports (64 B rounding).
+        """
+        setattr(self, _STAGE_ATTRS[stage][2],
+                [w.get_capture_instruction_size_bytes() for w in sched.workers])
+
+    def _bin_engines(self):
+        """The engine triple this run is CONFIGURED for (see _configured_engines)."""
+        return _configured_engines(self)
+
+    def _bin_worker_pool(self, n):
+        return self._worker_engine_pool(n)
+
     def _assert_worker_programs_fit(self, sched):
         """Both stages' worker programs share ONE arena; overflowing it would march
         the worker program allocator straight into the model's tensor DRAM (silent
@@ -2834,6 +2872,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # finalize() overwrites sched._worker_prog_addrs, so a bare start_workers()
         # in run_vision would relaunch the PREFIX worker program on the next slot.
         self._vis_worker_prog_addrs = sched.finalize()   # halts + writes every WORKER program
+        self._record_worker_prog_sizes("encoder", sched)
         self._assert_worker_programs_fit(sched)
         self.stop_capture()
 
@@ -4817,6 +4856,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # prefix, and finalize() overwrites sched._worker_prog_addrs -- a bare
             # start_workers() later would relaunch the wrong stage's worker program.
             self._denoise_worker_prog_addrs = sched.finalize()
+            self._record_worker_prog_sizes("denoise", sched)
             print(f"    [denoise] worker program(s): "
                   f"{[w.get_capture_instruction_size_bytes() for w in sched.workers]} bytes")
             self._assert_worker_programs_fit(sched)
@@ -6309,15 +6349,18 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     DMA_READ_CHUNK_BYTES = 256 * 1024        # 256 KB per chunk (reads -- see _dma_read_checked)
     DMA_READ_MIN_CHUNK_BYTES = 4 * 1024      # floor for the bisect-on-EIO fallback
 
-    def _dma_write_retry(self, device, address, buffer, size, attempts=5):
+    def _dma_write_retry(self, device, address, buffer, size, attempts=5, ue=None):
         """Chunked + retried DMA write. A failed/incomplete program-blob write
         here means start_execute_from_dram runs stale/garbage DRAM content --
         this bit us for real (denoise-loop program silently didn't get written,
         producing garbage action output) so this is NOT optional."""
+        # `ue` selects the engine whose DMA channel is used: worker programs live in
+        # scheduler-owned arenas and must be written through their OWN engine.
+        _dev = ue or self
         data = bytes(buffer[:size]) if isinstance(buffer, (bytes, bytearray)) else buffer
         if size <= self.DMA_CHUNK_BYTES:
             for i in range(attempts):
-                n = self.dma_write(device, address, data, size)
+                n = _dev.dma_write(device, address, data, size)
                 if n == size:
                     return n
                 print(f"  [dma_write_retry] attempt {i+1}/{attempts} failed (wrote {n}, wanted {size}), retrying...")
@@ -6336,7 +6379,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         while offset < size:
             chunk_size = min(self.DMA_CHUNK_BYTES, size - offset)
             self._dma_write_retry(device, address + offset, data[offset:offset + chunk_size],
-                                  chunk_size, attempts=attempts)
+                                  chunk_size, attempts=attempts, ue=ue)
             offset += chunk_size
         return size
 
@@ -6519,29 +6562,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         statically unrolled: 10 steps x 18 layers = 180 bodies, 1440 flash-attn jump
         sites), so a bin set is only valid for the exact config it was compiled under.
         """
-        # programs.json describes the PRIMARY's program allocator only. A multi-engine
-        # encoder also compiles one worker program per extra engine, into a separate
-        # scheduler-owned allocator arena that the bin format has no slot for -- a bin
-        # set dumped from such a run would execute engine0's half of the image and
-        # leave rows 128..255 as stale garbage. Refuse rather than dump it.
-        assert self._num_engines("VIS") == 1, (
-            f"dump_programs_to_file: vision engines={self._num_engines('VIS')} -- the bin "
-            f"format only carries the primary engine's programs, so a multi-engine "
-            f"encoder cannot be dumped. Re-run with --engines 1 to produce bins.")
+        # Multi-engine dumps ARE supported: each stage stores the primary's program plus
+        # one section per WORKER program, and the whole set is keyed by the engine triple
+        # so it can only ever be replayed at the count it was built for.
         _pre_sched = getattr(self, "_prefix_sched", None)
         _dn_sched = getattr(self, "_denoise_sched", None)
-        assert _dn_sched is None or _dn_sched.num_engines == 1, (
-            f"dump_programs_to_file: denoise engines={_dn_sched.num_engines} -- the bin "
-            "format carries ONE program stream per stage and cannot express the worker "
-            "programs. Re-run with --engines 1 to produce a bin.")
-        assert _pre_sched is None or _pre_sched.num_engines == 1, (
-            f"dump_programs_to_file: prefix engines={_pre_sched.num_engines} -- same"
-            f"reason as the encoder above: the worker programs live in a scheduler-owned "
-            f"arena the bin format has no slot for, and a bin set dumped from a sharded "
-            f"prefix would run only the primary's row block. Re-run with --engines 1.")
         os.makedirs(bin_dir, exist_ok=True)
-        bin_path = os.path.join(bin_dir, "programs.bin")
-        meta_path = os.path.join(bin_dir, "programs.json")
+        _engines = self._bin_engines()
+        _stem = _programs_stem(_engines)
+        bin_path = os.path.join(bin_dir, _stem + ".bin")
+        meta_path = os.path.join(bin_dir, _stem + ".json")
         meta = getattr(self, "_prog_meta", {})
         for _k in ("encoder", "prefix", "denoise"):
             assert _k in meta, (
@@ -6557,7 +6587,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # this list, the dump fails HERE (loud, on the compile run) instead of the bin run
         # dying with an AttributeError deep inside tensor_init -- or worse, silently
         # reading a stale value.
+        _arena_attrs = ("VIS_WORKER_ARENA_BYTES", "VIS_WORKER_PROGRAM_OFFSET")
         for _a in _BIN_DERIVED_ATTRS:
+            if _a in _arena_attrs and max(_engines.values()) <= 1:
+                continue          # single-engine run: the arena profile never resolves
             assert hasattr(self, _a), (
                 f"dump_programs_to_file: {_a} missing -- dump only after weight_init has run.")
         _uncovered = sorted(
@@ -6569,9 +6602,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             f"dump_programs_to_file: new weight-init-derived vision scalar(s) {_uncovered} "
             f"are not in _BIN_DERIVED_ATTRS. Add them there (and they will be restored by "
             f"Pi05Libero_Run) or run_from_bin will not see them.")
-        derived = {a: getattr(self, a) for a in _BIN_DERIVED_ATTRS}
+        derived = {a: getattr(self, a) for a in _BIN_DERIVED_ATTRS if hasattr(self, a)}
 
-        manifest = {"programs": {}, "sig": {}, "derived": derived}
+        manifest = {"programs": {}, "workers": {}, "engines": _engines,
+                    "sig": {}, "derived": derived}
         all_bytes = bytearray()
         CHUNK = self.DMA_READ_CHUNK_BYTES
         # Order matters and MUST match run_from_bin's load order: program DRAM is a bump
@@ -6587,7 +6621,51 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 all_bytes.extend(buf)
                 read += sz
             manifest["programs"][name] = {"offset": offset_in_file, "size": size}
+            # WORKER programs. A sharded stage is not one program: replaying only the
+            # primary leaves those rows unwritten while it waits at a rendezvous nobody
+            # answers. Worker sections state an explicit dram_base -- the primary's comes
+            # from replaying the bump allocator, but worker arenas are scheduler-owned.
+            _waddrs = list(getattr(self, _STAGE_ATTRS[name][1], None) or [])
+            _wsizes = list(getattr(self, _STAGE_ATTRS[name][2], None) or [])
+            assert len(_wsizes) == len(_waddrs), (
+                f"dump_programs_to_file: stage {name!r} has {len(_waddrs)} worker "
+                f"address(es) but {len(_wsizes)} recorded size(s) -- "
+                f"_record_worker_prog_sizes did not run for it.")
+            _wsecs = []
+            _pool = self._bin_worker_pool(_engines[name]) if _waddrs else []
+            for _wi, (_wa, _ws) in enumerate(zip(_waddrs, _wsizes)):
+                _buf = bytearray(_ws)
+                _w = _pool[_wi]
+                _got = _w.dma_read(DMA_DEVICE_C2H, _wa, _buf, _ws)
+                if _got != _ws:
+                    raise RuntimeError(
+                        f"dma_read of {name} worker {_wi + 1} at 0x{_wa:X} returned "
+                        f"{_got}/{_ws} B -- refusing to write a bin holding a "
+                        f"zero-filled program that would masquerade as real code")
+                _wsecs.append({"offset": len(all_bytes), "size": _ws,
+                               "engine": _wi + 1, "dram_base": hex(_wa)})
+                all_bytes.extend(_buf)
+            manifest["workers"][name] = _wsecs
+        # SCHEDULER REGISTRIES. _vis_make_scheduler registers internally and replays on
+        # load, but denoise registers inside compile_denoise_loop, which a bin run never
+        # executes. A missing one is a WRONG ANSWER, not a crash: the addresses are
+        # already baked into the programs.
+        _sched_state = {}
+        for _ne, _sc in self.__dict__.get("_sched_by_ne", {}).items():
+            _sched_state[str(_ne)] = {
+                "per_engine": {k: list(v) for k, v in _sc._per_engine.items()},
+                "col_outputs": {k: list(v) for k, v in _sc._col_outputs.items()},
+                "worker_tensor_addr": [w.get_tensor_dram_addr() for w in _sc.workers],
+                "worker_program_addr": [w.get_program_dram_addr() for w in _sc.workers],
+            }
+        manifest["schedulers"] = _sched_state
         manifest["sig"] = {
+            "engines": _engines,
+            # What each stage ACTUALLY ran at, after the board/column clamps. The
+            # filename carries the configured triple; this catches a set whose stages
+            # resolved differently (another board, another observation).
+            "engines_resolved": {s_: int(self._num_engines(_STAGE_ATTRS[s_][0]))
+                                 for s_ in _PROGRAM_ORDER},
             "prefix_seq_len": int(self.PREFIX_SEQ_LEN),
             "denoise_steps": int(self.AE_NUM_DENOISE_STEPS),
             "keep_masked_slots": bool(self.KEEP_MASKED_SLOTS),
@@ -6620,13 +6698,53 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         _sz = len(all_bytes)
         print(f"  Programs: {_sz / 1024**2:.1f} MB ({_sz} bytes) -> {bin_path}")
         for name, m in manifest["programs"].items():
-            print(f"    {name:<8} offset={m['offset']:>10}  size={m['size']:>10}")
+            print(f"    {name:<8} engine0  offset={m['offset']:>10}  size={m['size']:>10}")
+            for w in manifest["workers"].get(name, []):
+                print(f"    {name:<8} engine{w['engine']:<2} "
+                      f"offset={w['offset']:>10}  size={w['size']:>10}")
         print(f"  Derived vision geometry persisted: {derived}")
 
     def dump_bins(self, bin_dir):
-        """Dump params + programs. Safe to call after any full non-debug inference."""
+        """Dump params + programs + the runtime assets. Safe to call after any full
+        non-debug inference."""
         self.dump_params_to_file(bin_dir)
         self.dump_programs_to_file(bin_dir)
+        self._package_runtime_assets(bin_dir)
+
+    def _package_runtime_assets(self, bin_dir):
+        """Copy the host-side embedding table, tokenizer and norm stats INTO the bin dir.
+
+        These are the only three things a bin run still reads from outside it, and each
+        otherwise reaches back into this machine: the embedder is a HOST-side gather
+        table (indexed per observation on the CPU, so it cannot live in params.bin) and
+        comes from the 13 GB weights_export/ tree that CANNOT be re-fetched from
+        HuggingFace; the tokenizer is a GCS download that needs the openpi package; the
+        norm stats live in the checkpoint tree. Stored bf16 -- the .npy on disk is fp32,
+        but weight_init casts it, so the packaged copy is half the size and identical to
+        what the run actually uses.
+        """
+        import shutil
+        tpath = os.path.join(bin_dir, HOST_TENSORS_ASSET)
+        if not os.path.exists(tpath):
+            assert hasattr(self, "embedding_table"), (
+                "_package_runtime_assets: no embedding_table -- package only after a "
+                "real weight_init()")
+            torch.save({"embedding_table": self.embedding_table.to(torch.bfloat16)},
+                       tpath)
+            _original_print(f"  Packaged embedding table -> {HOST_TENSORS_ASSET} "
+                            f"({os.path.getsize(tpath) / 1024**2:.1f} MB)")
+        tok_dst = os.path.join(bin_dir, TOKENIZER_ASSET)
+        if not os.path.exists(tok_dst):
+            shutil.copyfile(ensure_tokenizer(self.script_dir), tok_dst)
+            _original_print(f"  Packaged tokenizer -> {TOKENIZER_ASSET}")
+        ns_dst = os.path.join(bin_dir, NORM_STATS_ASSET)
+        if not os.path.exists(ns_dst):
+            rel = (Path("assets") / "physical-intelligence" / "libero"
+                   / "norm_stats.json")
+            src = Path(_ckpt_local_dir()) / rel
+            if src.exists():
+                shutil.copyfile(src, ns_dst)
+                _original_print(f"  Packaged norm stats -> {NORM_STATS_ASSET}")
 
     def _compile_once(self, key, compile_fn, label="compile_once"):
         """COMPILE-ONCE half of compile-once/execute-many. Captures + serializes +
@@ -6730,6 +6848,73 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 # were compiled against. MUST match dump_programs_to_file's write order.
 _PROGRAM_ORDER = ("encoder", "prefix", "denoise")
 
+# stage -> (_num_engines key, saved worker-address attr, saved worker-size attr)
+_STAGE_ATTRS = {
+    "encoder": ("VIS",     "_vis_worker_prog_addrs",     "_vis_worker_prog_sizes"),
+    "prefix":  ("PREFIX",  "_prefix_worker_prog_addrs",  "_prefix_worker_prog_sizes"),
+    "denoise": ("DENOISE", "_denoise_worker_prog_addrs", "_denoise_worker_prog_sizes"),
+}
+
+
+def clean_bins(bin_dir=None, verbose=True):
+    """Delete every bin artifact in `bin_dir`, for ALL engine configurations.
+
+    NAMES THE FILES; never rm -rf the dir -- the 13 GB weights_export/ tree lives inside
+    it and comes from an offline export, so removing it would be unrecoverable.
+    """
+    import glob
+    if bin_dir is None:
+        bin_dir = BIN_DIR
+    victims = sorted(
+        glob.glob(os.path.join(bin_dir, "params.bin"))
+        + glob.glob(os.path.join(bin_dir, "params.json"))
+        + glob.glob(os.path.join(bin_dir, "programs_e*.bin"))
+        + glob.glob(os.path.join(bin_dir, "programs_e*.json"))
+        + glob.glob(os.path.join(bin_dir, HOST_TENSORS_ASSET))
+        + glob.glob(os.path.join(bin_dir, TOKENIZER_ASSET))
+        + glob.glob(os.path.join(bin_dir, NORM_STATS_ASSET)))
+    freed = 0
+    for p in victims:
+        freed += os.path.getsize(p)
+        os.remove(p)
+    if verbose:
+        if victims:
+            print(f"[clean] removed {len(victims)} bin file(s), "
+                  f"{freed / 1024**3:.2f} GB from {bin_dir}")
+            for p in victims:
+                print(f"    {os.path.basename(p)}")
+        else:
+            print(f"[clean] no bin files in {bin_dir} (nothing to remove)")
+    return victims
+
+
+def _configured_engines(obj):
+    """(encoder, prefix, denoise) engine counts from the CONFIGURED knobs.
+
+    Class OR instance: main names the bin file before it knows which engine to build, and
+    both sides must derive the same name or a dumped set is never found again. Skips
+    _num_engines' runtime clamps (board cores, prefix column blocks) -- those depend on
+    the board and the observation; the resolved counts go in `sig` instead.
+    """
+    out = {}
+    for stage, (key, *_rest) in _STAGE_ATTRS.items():
+        ov = getattr(obj, f"{key}_NUM_ENGINES", None)
+        n = int(ov if ov is not None else getattr(obj, "NUM_ENGINES", 1))
+        cap = getattr(obj, "STAGE_MAX_ENGINES", {}).get(key, n)
+        out[stage] = min(n, int(cap))
+    return out
+
+
+def _programs_stem(engines):
+    """(encoder, prefix, denoise) engine counts -> programs file stem.
+
+    ONE params.bin serves every configuration (sharding never writes params), but one
+    programs file per triple: a sharded program bakes one rendezvous per engine, so an
+    8-engine set replayed on 4 hangs waiting on workers that were never launched.
+    """
+    e, p, d = (int(engines[s]) for s in _PROGRAM_ORDER)
+    return f"programs_e{e}_{p}_{d}"
+
 
 class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
     """Bin-backed pi05_libero engine. Inherits the entire validated inference path;
@@ -6737,12 +6922,21 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
 
     def __init__(self, bin_dir=None, **kw):
         self.bin_dir = bin_dir or BIN_DIR
-        meta_path = os.path.join(self.bin_dir, "programs.json")
+        # The engine counts are class attributes by the time this runs (configure_engines
+        # sets them before construction), so the right file is known here.
+        self._bin_stem = _programs_stem(self._bin_engines())
+        meta_path = os.path.join(self.bin_dir, self._bin_stem + ".json")
         if not os.path.exists(meta_path):
+            _have = sorted(f[:-5] for f in os.listdir(self.bin_dir)
+                           if f.startswith("programs_e") and f.endswith(".json")) \
+                if os.path.isdir(self.bin_dir) else []
             raise FileNotFoundError(
-                f"No compiled bins at {self.bin_dir} (missing programs.json).\n"
-                f"Generate them first with a full run of the golden path:\n"
-                f"    python {os.path.abspath(__file__)}")
+                f"No compiled bins for this engine configuration at {self.bin_dir}.\n"
+                f"  wanted: {self._bin_stem}\n"
+                f"  have:   {_have or 'nothing'}\n"
+                f"A sharded program bakes one rendezvous per engine, so a set built for a\n"
+                f"different count cannot be replayed. Generate this one with:\n"
+                f"    python {os.path.abspath(__file__)} --engines <N>")
         with open(meta_path) as f:
             self._manifest = json.load(f)
         self.sig = self._manifest["sig"]
@@ -6787,7 +6981,12 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
                 f"{os.path.join(self.bin_dir, '*.json')} && "
                 f"python {os.path.abspath(__file__)}\n"
                 f"  (Do NOT rm -rf the bin dir: weights_export/ lives inside it.)\n")
-        missing = [a for a in _BIN_DERIVED_ATTRS if a not in derived]
+        # The worker-arena pair is only produced by a multi-engine run (the profile
+        # resolver never runs at 1 engine), so it is required only when this set is one.
+        _sharded = max(_configured_engines(self).values()) > 1
+        missing = [a for a in _BIN_DERIVED_ATTRS if a not in derived
+                   and (_sharded or a not in ("VIS_WORKER_ARENA_BYTES",
+                                              "VIS_WORKER_PROGRAM_OFFSET"))]
         if missing:
             raise RuntimeError(
                 f"bin set at {self.bin_dir} is missing derived attrs {missing} "
@@ -6824,6 +7023,12 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
         a HOST-side gather table (embed_and_concat_prefix indexes it per obs), never a
         params-DRAM resident, so it is not in params.bin and cannot be. Read-only.
         """
+        packaged = _bin_asset(HOST_TENSORS_ASSET, getattr(self, "bin_dir", None))
+        if packaged:
+            # Self-contained bin set: no weights_export/ needed on this machine.
+            self.embedding_table = torch.load(
+                packaged, map_location="cpu", weights_only=True)["embedding_table"]
+            return self.load_params()
         self.embedding_table = self._npy(
             "PaliGemma.llm.embedder.input_embedding").to(torch.bfloat16)
         self.load_params()
@@ -6870,17 +7075,88 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
     # Programs
     # ------------------------------------------------------------------
 
+    def _restore_schedulers(self):
+        """Rebuild every scheduler the dump recorded and re-register its buffers.
+
+        Both mechanisms, because pi05 needs both: _vis_make_scheduler registers inside
+        the builder (replaying it suffices), while denoise registers inside
+        compile_denoise_loop, which a bin run never executes. Re-registering an address
+        the builder already installed is a no-op.
+        """
+        state = self._manifest.get("schedulers")
+        if state is None:
+            raise RuntimeError(
+                f"bin set {self._bin_stem} predates the `schedulers` block -- the "
+                f"per-engine buffer addresses would be missing and the run would produce "
+                f"wrong numbers rather than fail. Regenerate the bins.")
+        eng = self._bin_engines()
+        # Vision first: it owns the shared worker pool, exactly as compile order does.
+        # Built at 1 engine too -- _make_stage_scheduler is written so a 1-engine split
+        # is the historical single-engine stream, and run_vision reads _vis_sched.
+        self._vis_sched = self._vis_make_scheduler(eng["encoder"])
+        for stage, mk in (("prefix", self._prefix_make_scheduler),
+                          ("denoise", self._denoise_make_scheduler)):
+            sc = mk(eng[stage])
+            if sc is not None:
+                setattr(self, f"_{'prefix' if stage == 'prefix' else 'denoise'}_sched", sc)
+
+        for ne_s, st in state.items():
+            sc = self.__dict__.get("_sched_by_ne", {}).get(int(ne_s))
+            if sc is None:
+                continue
+            for nm, addrs in st["per_engine"].items():
+                sc.register_per_engine_addrs(nm, [int(a) for a in addrs])
+            for nm, addrs in st["col_outputs"].items():
+                # alloc_col_output both allocates and records; there is no public
+                # re-register hook, and the registry is a plain {name: [addr]} map.
+                sc._col_outputs[nm] = [int(a) for a in addrs]
+            for w, ta in zip(sc.workers, st.get("worker_tensor_addr") or []):
+                w._tensor_dram_addr = int(ta)
+
+    def _load_stage_workers(self, stage, blob):
+        """DMA one stage's worker programs back to their recorded arena addresses."""
+        secs = (self._manifest.get("workers") or {}).get(stage) or []
+        if not secs:
+            setattr(self, _STAGE_ATTRS[stage][1], [])
+            return
+        pool = self._bin_worker_pool(self._bin_engines()[stage])
+        addrs = []
+        for sec in sorted(secs, key=lambda x: x["engine"]):
+            w = pool[sec["engine"] - 1]
+            want = int(sec["dram_base"], 16)
+            assert w.get_program_dram_addr() == want, (
+                f"worker {sec['engine']} program allocator is at "
+                f"0x{w.get_program_dram_addr():X} but {stage} was compiled at "
+                f"0x{want:X} -- stale or partial bin set; regenerate.")
+            data = blob[sec["offset"]:sec["offset"] + sec["size"]]
+            self._dma_write_retry(DMA_DEVICE_H2C, want, data, len(data), ue=w)
+            w.allocate_program_dram(sec["size"])
+            addrs.append(want)
+        setattr(self, _STAGE_ATTRS[stage][1], addrs)
+
     def load_programs(self):
         """DMA the three compiled programs back to DRAM and pre-seed the caches the
         stock run_vision()/run_inference() consult, so neither ever compiles."""
-        bin_path = os.path.join(self.bin_dir, "programs.bin")
+        bin_path = os.path.join(self.bin_dir, self._bin_stem + ".bin")
         if not os.path.exists(bin_path):
             raise FileNotFoundError(f"missing {bin_path} -- regenerate the bins")
         with open(bin_path, "rb") as f:
             blob = f.read()
 
+        _want = self.sig.get("engines_resolved")
+        if _want is not None:
+            _live = {s_: int(self._num_engines(_STAGE_ATTRS[s_][0]))
+                     for s_ in _PROGRAM_ORDER}
+            if {k: int(v) for k, v in _want.items()} != _live:
+                self._sig_check("engines_resolved", _live,
+                                {k: int(v) for k, v in _want.items()},
+                                "a stage resolved to a different engine count than the "
+                                "bins were built at (board core count or prefix column "
+                                "blocks differ) -- regenerate with --clean")
+
         cache = self.__dict__.setdefault("_prog_cache", {})
         meta = self.__dict__.setdefault("_prog_meta", {})
+        self._restore_schedulers()
         for name in _PROGRAM_ORDER:
             m = self._manifest["programs"][name]
             data = blob[m["offset"]:m["offset"] + m["size"]]
@@ -6892,6 +7168,7 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
             cache[name] = addr
             meta[name] = (addr, len(data))
             _original_print(f"    {name:<8} {len(data):>10}B -> 0x{addr:X}")
+            self._load_stage_workers(name, blob)
 
         # The first program must land exactly on the program base; if it does not, the
         # allocator was already advanced and every baked jump target is off.
@@ -7023,7 +7300,9 @@ def _load_norm_stats():
     ~/.cache/openpi location is still accepted so an existing machine keeps working
     if only assets/ was left behind there."""
     rel = Path("assets") / "physical-intelligence" / "libero" / "norm_stats.json"
-    candidates = [Path(_ckpt_local_dir()) / rel,
+    packaged = _bin_asset(NORM_STATS_ASSET)
+    candidates = [Path(packaged)] if packaged else []
+    candidates += [Path(_ckpt_local_dir()) / rel,
                   Path.home() / ".cache" / "openpi" / "openpi-assets" / "checkpoints"
                   / "pi05_libero" / rel]
     for path in candidates:
@@ -7110,7 +7389,7 @@ def configure_engines(engines=1, vis_4=False, pref_8=False, dns_8=False, vis_m_s
         if eng_n > 1:
             print(f"[{tag}] NUM_ENGINES={eng_n} -- vision encoder AND prefix LM "
                   f"row-sharded (M) and the denoise gated MLP column-sharded (N) across "
-                  f"{eng_n} engines (bins cannot be dumped in this mode)")
+                  f"{eng_n} engines")
 
     # Per-stage engine overrides. These set <STAGE>_NUM_ENGINES, which
     # _num_engines() prefers over NUM_ENGINES, so they compose with --engines and
@@ -7142,7 +7421,11 @@ def configure_engines(engines=1, vis_4=False, pref_8=False, dns_8=False, vis_m_s
               "(M=64 is one row block -> row-sharding impossible; mlp down uses "
               "split_k + reduce_add)")
     if multi or vis_4 or pref_8 or dns_8:
-        print(f"[{tag}] multi-engine: bins cannot be dumped in this mode")
+        # The bin set carries every WORKER program alongside the primary's and is keyed
+        # by the (encoder, prefix, denoise) engine triple, so each configuration gets its
+        # own set and can only be replayed at the count it was built for.
+        print(f"[{tag}] multi-engine: bins are keyed per engine configuration "
+              f"(dump/load with the same --engines)")
     return multi or vis_4 or pref_8 or dns_8
 
 
@@ -7225,6 +7508,11 @@ def main():
                 f"got {n}")
         return n
 
+    ap.add_argument("--clean", action="store_true",
+                    help="delete every bin set (all engine configurations) before "
+                         "running, so this run recompiles and dumps fresh ones. Removes "
+                         "params.* and programs_e*.* only -- weights_export/ lives in "
+                         "the same directory and is left alone.")
     ap.add_argument("--engines", type=_engines_arg, default=1, metavar="N|max",
                      help="Number of accelerator engines to row-shard across. DEFAULT 1 = "
                           "the single-engine path, byte-identical to before; only an "
@@ -7391,13 +7679,19 @@ def main():
     # run the unsharded model while printing that sharding is on -- the flags would
     # silently do nothing. Any knob that changes the compiled program must be listed
     # here, or it is quietly ignored whenever a bin set happens to be present.
+    # Sharding flags no longer invalidate a bin set -- the programs file is keyed by the
+    # engine triple, so each configuration has its own. Only the debug/probe paths still
+    # disqualify a run: they compile extra programs or skip stages, desyncing the
+    # allocator from the dumped layout.
+    if args.clean:
+        clean_bins(BIN_DIR)
     _bin_ok = not (args.debug or args.sanity_check or args.probe_step0
-                   or _multi or args.vis_4 or args.pref_8 or args.dns_8
                    or args.vis_m_shard is not None
                    or args.encoderend or args.prefixend)
+    _stem = _programs_stem(_configured_engines(Pi05Libero_UnifiedEngine))
     bins_exist = _bin_ok and os.path.exists(os.path.join(BIN_DIR, "params.bin")) \
-                          and os.path.exists(os.path.join(BIN_DIR, "programs.bin")) \
-                          and os.path.exists(os.path.join(BIN_DIR, "programs.json"))
+                          and os.path.exists(os.path.join(BIN_DIR, _stem + ".bin")) \
+                          and os.path.exists(os.path.join(BIN_DIR, _stem + ".json"))
 
     if bins_exist:
         print(f"[main] loading pre-compiled bins from {BIN_DIR} (no weight unpack, no compile)")
@@ -7476,12 +7770,10 @@ def main():
         # Multi-engine runs cannot be dumped (the bin format carries only the primary's
         # programs -- dump_programs_to_file refuses). Skip rather than assert, so a
         # successful --engines N inference does not exit non-zero after the fact.
-        if not bins_exist and ue._num_engines("VIS") == 1:
-            print(f"\n[main] dumping pre-compiled bins to {BIN_DIR} ...")
+        if not bins_exist and _bin_ok:
+            print(f"\n[main] dumping bins for this engine configuration "
+                  f"({_stem}) to {BIN_DIR} ...")
             ue.dump_bins(BIN_DIR)
-        elif not bins_exist:
-            print("\n[main] skipping bin dump: multi-engine run "
-                  "(bins carry only the primary engine's programs). Use --engines 1.")
 
     if args.probe_step0:
         ue.verify_denoise_step0(PREFIX_KV_DUMP_PATH)
