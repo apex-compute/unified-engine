@@ -381,6 +381,33 @@ LOCAL_CKPT_DIR = _CFG["paths"].get("local_ckpt_dir")
 # smolvla_qg are byte-identical in shape, so `sig` alone cannot tell those two apart.
 _BIN_SUBDIR = _CFG["paths"].get("bin_dir", "verapulse_bin")
 BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), _BIN_SUBDIR)
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# The two RUNTIME assets a bin-only run still needs, packaged INTO the bin dir by
+# dump_bins so a copied set is self-contained: no checkpoint, no HF download, no
+# absolute path back to the machine that compiled it.
+TOKENIZER_ASSET = "tokenizer.json"
+NORM_STATS_ASSET = "norm_stats.json"
+
+
+def _resolve_path(p):
+    """Config path -> absolute. Absolute wins; otherwise try the repo root (the
+    directory these scripts are run from) and then this model's own directory."""
+    if not p:
+        return None
+    if os.path.isabs(p):
+        return p
+    for base in (_REPO_ROOT, os.path.dirname(os.path.abspath(__file__))):
+        cand = os.path.join(base, p)
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(_REPO_ROOT, p)
+
+
+def _bin_asset(name, bin_dir=None):
+    """Path to a packaged asset if the bin dir carries one, else None."""
+    p = os.path.join(bin_dir or BIN_DIR, name)
+    return p if os.path.exists(p) else None
 
 # Load order is load-bearing: program DRAM is a bump allocator, so vision -> prefix ->
 # denoise reproduces the baked addresses. MUST match dump_programs_to_file's order.
@@ -423,7 +450,9 @@ def clean_bins(bin_dir=None, verbose=True):
         + glob.glob(os.path.join(bin_dir, "weight_tensors.pt"))
         + glob.glob(os.path.join(bin_dir, "programs_e*.bin"))
         + glob.glob(os.path.join(bin_dir, "programs_e*_tensors.pt"))
-        + glob.glob(os.path.join(bin_dir, "programs_e*.json")))
+        + glob.glob(os.path.join(bin_dir, "programs_e*.json"))
+        + glob.glob(os.path.join(bin_dir, TOKENIZER_ASSET))
+        + glob.glob(os.path.join(bin_dir, "norm_stats.*")))
     freed = 0
     for p in victims:
         freed += os.path.getsize(p)
@@ -8943,12 +8972,45 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                                 f"offset={s['offset']:>10}  size={s['size']:>10}")
 
     def dump_bins(self, bin_dir):
-        """params.bin + programs_e<v>_<p>_<d>.bin/.json. The programs carry a signature
-        (image slots, chunk, denoise steps, rope theta, quant, dram bases) and the loader
-        refuses on mismatch. rm the bin dir after any compile-affecting edit -- stale bins
-        reload silently."""
+        """params.bin + programs_e<v>_<p>_<d>.bin/.json + the runtime assets. The programs
+        carry a signature (variant, image slots, chunk, denoise steps, rope theta, quant,
+        dram bases) and the loader refuses on mismatch. rm the bin dir after any
+        compile-affecting edit -- stale bins reload silently."""
         self.dump_params_to_file(bin_dir)
         self.dump_programs_to_file(bin_dir)
+        self._package_runtime_assets(bin_dir)
+
+    def _package_runtime_assets(self, bin_dir):
+        """Copy the tokenizer and norm stats INTO the bin dir.
+
+        These are the only two files a bin-only run still reads from outside it, and both
+        are otherwise reached by a path that does not exist on another machine (this
+        variant's norm_stats is an absolute local_ckpt_dir path, and its tokenizer is an
+        HF download). Packaging them is what makes a copied bin set runnable as-is.
+        """
+        import shutil
+        # Tokenizer: whatever tokenize() would have resolved, materialised as a file.
+        dst = os.path.join(bin_dir, TOKENIZER_ASSET)
+        if not os.path.exists(dst):
+            rel = _CFG["paths"].get("tokenizer_file")
+            if rel:
+                src = _resolve_path(rel)
+            else:
+                from huggingface_hub import hf_hub_download
+                src = hf_hub_download(repo_id=_CFG["paths"]["tokenizer_hf_repo"],
+                                      filename="tokenizer.json")
+            shutil.copyfile(src, dst)
+            _original_print(f"  Packaged tokenizer -> {TOKENIZER_ASSET}")
+        # Norm stats: keep the ORIGINAL extension's format, but under a fixed name --
+        # load_norm_stats branches on the suffix, so a .json source must stay .json.
+        ns_src = _resolve_path(_CFG["paths"]["norm_stats"])
+        if ns_src and os.path.exists(ns_src):
+            ns_dst = os.path.join(bin_dir, NORM_STATS_ASSET)
+            if not ns_src.endswith(".json"):
+                ns_dst = os.path.join(bin_dir, "norm_stats" + os.path.splitext(ns_src)[1])
+            if not os.path.exists(ns_dst):
+                shutil.copyfile(ns_src, ns_dst)
+                _original_print(f"  Packaged norm stats -> {os.path.basename(ns_dst)}")
 
     # ---------------------------------------------------------------- bin loading --
     # These live on the BASE class, not on VeraPulse_Run, because the decision to use a
@@ -9405,9 +9467,14 @@ def tokenize(prompt, max_len=None, return_mask=False):
     from tokenizers import Tokenizer
     max_len = max_len or _CFG["lm"]["tokenizer_max_length"]
     if _TOKENIZER is None:
+        packaged = _bin_asset(TOKENIZER_ASSET)
         rel = _CFG["paths"].get("tokenizer_file")
-        if rel:
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
+        if packaged:
+            # A bin set copied to another machine carries its own tokenizer, so no
+            # checkpoint and no network are needed to run it.
+            _TOKENIZER = Tokenizer.from_file(packaged)
+        elif rel:
+            path = _resolve_path(rel)
             if not os.path.exists(path):
                 ensure_checkpoint()      # tokenizer.json ships with the checkpoint
             _TOKENIZER = Tokenizer.from_file(path)
@@ -9471,9 +9538,9 @@ def load_norm_stats():
     global _NORM_STATS
     if _NORM_STATS is not None:
         return _NORM_STATS
-    path = _CFG["paths"]["norm_stats"]
-    if not os.path.isabs(path):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+    path = (_bin_asset(NORM_STATS_ASSET)
+            or _bin_asset("norm_stats.safetensors")
+            or _resolve_path(_CFG["paths"]["norm_stats"]))
 
     # TWO FILE FORMATS, ONE CONTRACT. pulsevla ships norm_stats.safetensors with FLAT
     # keys ('observation.state.mean'); the smolvla finetune ships normalization_stats.json
