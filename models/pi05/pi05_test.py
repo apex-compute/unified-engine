@@ -115,6 +115,9 @@ def ensure_tokenizer(script_dir=None):
     construction. Same cache root as everything else, so it lands in <model>_bin/.
     Idempotent and network-free once present (4 MB).
     """
+    packaged = _bin_asset(TOKENIZER_ASSET)
+    if packaged:
+        return packaged          # bin set carries its own; no GCS, no openpi import
     path = os.path.join(_ckpt_cache_root(script_dir),
                         *_CFG["paths"]["paligemma_tokenizer"].split("//")[1].split("/"))
     if os.path.exists(path):
@@ -343,6 +346,19 @@ def ensure_weights_export(script_dir=None):
 
 # Pre-compiled bin location (paths.* are script-dir-relative, qwen3 convention).
 BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), _BIN_SUBDIR)
+
+# The three RUNTIME assets a bin-only run still needs, packaged INTO the bin dir by
+# dump_bins so a copied set is self-contained. Without them a bin run drags in the 13 GB
+# weights_export/ tree (for ONE host-side table), a GCS download, and the openpi package.
+HOST_TENSORS_ASSET = "weight_tensors.pt"
+TOKENIZER_ASSET = "paligemma_tokenizer.model"
+NORM_STATS_ASSET = "norm_stats.json"
+
+
+def _bin_asset(name, bin_dir=None):
+    """Path to a packaged asset if the bin dir carries one, else None."""
+    p = os.path.join(bin_dir or BIN_DIR, name)
+    return p if os.path.exists(p) else None
 
 # Vision-geometry scalars that _weight_init_vision DERIVES and publishes on the instance
 # (see its `V = self._cfg["vision"]` block and VIS_HEAD_OUT = hk.shape[1]). They are NOT
@@ -6689,9 +6705,46 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         print(f"  Derived vision geometry persisted: {derived}")
 
     def dump_bins(self, bin_dir):
-        """Dump params + programs. Safe to call after any full non-debug inference."""
+        """Dump params + programs + the runtime assets. Safe to call after any full
+        non-debug inference."""
         self.dump_params_to_file(bin_dir)
         self.dump_programs_to_file(bin_dir)
+        self._package_runtime_assets(bin_dir)
+
+    def _package_runtime_assets(self, bin_dir):
+        """Copy the host-side embedding table, tokenizer and norm stats INTO the bin dir.
+
+        These are the only three things a bin run still reads from outside it, and each
+        otherwise reaches back into this machine: the embedder is a HOST-side gather
+        table (indexed per observation on the CPU, so it cannot live in params.bin) and
+        comes from the 13 GB weights_export/ tree that CANNOT be re-fetched from
+        HuggingFace; the tokenizer is a GCS download that needs the openpi package; the
+        norm stats live in the checkpoint tree. Stored bf16 -- the .npy on disk is fp32,
+        but weight_init casts it, so the packaged copy is half the size and identical to
+        what the run actually uses.
+        """
+        import shutil
+        tpath = os.path.join(bin_dir, HOST_TENSORS_ASSET)
+        if not os.path.exists(tpath):
+            assert hasattr(self, "embedding_table"), (
+                "_package_runtime_assets: no embedding_table -- package only after a "
+                "real weight_init()")
+            torch.save({"embedding_table": self.embedding_table.to(torch.bfloat16)},
+                       tpath)
+            _original_print(f"  Packaged embedding table -> {HOST_TENSORS_ASSET} "
+                            f"({os.path.getsize(tpath) / 1024**2:.1f} MB)")
+        tok_dst = os.path.join(bin_dir, TOKENIZER_ASSET)
+        if not os.path.exists(tok_dst):
+            shutil.copyfile(ensure_tokenizer(self.script_dir), tok_dst)
+            _original_print(f"  Packaged tokenizer -> {TOKENIZER_ASSET}")
+        ns_dst = os.path.join(bin_dir, NORM_STATS_ASSET)
+        if not os.path.exists(ns_dst):
+            rel = (Path("assets") / "physical-intelligence" / "libero"
+                   / "norm_stats.json")
+            src = Path(_ckpt_local_dir()) / rel
+            if src.exists():
+                shutil.copyfile(src, ns_dst)
+                _original_print(f"  Packaged norm stats -> {NORM_STATS_ASSET}")
 
     def _compile_once(self, key, compile_fn, label="compile_once"):
         """COMPILE-ONCE half of compile-once/execute-many. Captures + serializes +
@@ -6816,7 +6869,10 @@ def clean_bins(bin_dir=None, verbose=True):
         glob.glob(os.path.join(bin_dir, "params.bin"))
         + glob.glob(os.path.join(bin_dir, "params.json"))
         + glob.glob(os.path.join(bin_dir, "programs_e*.bin"))
-        + glob.glob(os.path.join(bin_dir, "programs_e*.json")))
+        + glob.glob(os.path.join(bin_dir, "programs_e*.json"))
+        + glob.glob(os.path.join(bin_dir, HOST_TENSORS_ASSET))
+        + glob.glob(os.path.join(bin_dir, TOKENIZER_ASSET))
+        + glob.glob(os.path.join(bin_dir, NORM_STATS_ASSET)))
     freed = 0
     for p in victims:
         freed += os.path.getsize(p)
@@ -6967,6 +7023,12 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
         a HOST-side gather table (embed_and_concat_prefix indexes it per obs), never a
         params-DRAM resident, so it is not in params.bin and cannot be. Read-only.
         """
+        packaged = _bin_asset(HOST_TENSORS_ASSET, getattr(self, "bin_dir", None))
+        if packaged:
+            # Self-contained bin set: no weights_export/ needed on this machine.
+            self.embedding_table = torch.load(
+                packaged, map_location="cpu", weights_only=True)["embedding_table"]
+            return self.load_params()
         self.embedding_table = self._npy(
             "PaliGemma.llm.embedder.input_embedding").to(torch.bfloat16)
         self.load_params()
@@ -7238,7 +7300,9 @@ def _load_norm_stats():
     ~/.cache/openpi location is still accepted so an existing machine keeps working
     if only assets/ was left behind there."""
     rel = Path("assets") / "physical-intelligence" / "libero" / "norm_stats.json"
-    candidates = [Path(_ckpt_local_dir()) / rel,
+    packaged = _bin_asset(NORM_STATS_ASSET)
+    candidates = [Path(packaged)] if packaged else []
+    candidates += [Path(_ckpt_local_dir()) / rel,
                   Path.home() / ".cache" / "openpi" / "openpi-assets" / "checkpoints"
                   / "pi05_libero" / rel]
     for path in candidates:
