@@ -79,69 +79,26 @@ jobs:
             echo "- Commit: \`$target_sha\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Download latest existing PCIe build artifact
-        id: latest_artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_REPO: ${{ github.repository }}
+      - name: Collect local .bin file
+        id: collect_bin
         run: |
           set -euo pipefail
-          branch="main"
-
           mkdir -p release_artifacts
-          runs_json="$(gh run list -R "$SOURCE_REPO" --workflow pcie-build.yml --branch "$branch" --status success --limit 30 --json databaseId,headSha,url)"
 
-          run_id=""
-          artifact_name=""
-          run_url=""
-          artifact_sha=""
-          while IFS='|' read -r rid rsha rurl; do
-            [ -z "$rid" ] && continue
-            candidate_name="$(gh api "repos/${SOURCE_REPO}/actions/runs/${rid}/artifacts" --jq '[.artifacts[] | select((.expired | not) and (.name | startswith("andromeda_pcie_bit-")))][0].name // empty')"
-            if [ -z "$candidate_name" ]; then
-              continue
-            fi
-            echo "Trying artifact '$candidate_name' from run $rid..."
-            if gh run download "$rid" -R "$SOURCE_REPO" -n "$candidate_name" -D release_artifacts; then
-              if rg --files release_artifacts -g "*.bin" >/dev/null; then
-                run_id="$rid"
-                artifact_name="$candidate_name"
-                run_url="$rurl"
-                artifact_sha="$rsha"
-                break
-              fi
-            fi
-            rm -rf release_artifacts/*
-          done < <(echo "$runs_json" | jq -r '.[] | "\(.databaseId)|\(.headSha)|\(.url)"')
-
-          if [ -z "$run_id" ]; then
-            echo "::error::Could not find a usable andromeda_pcie_bit-* artifact with .bin on branch '$branch'."
+          git fetch --no-tags origin main
+          mapfile -t bins < <(git ls-tree -r --name-only origin/main -- '*.bin')
+          if [ "${#bins[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly 1 tracked .bin file on origin/main, found ${#bins[@]}."
+            echo "Tracked .bin files on origin/main:"
+            git ls-tree -r --name-only origin/main -- '*.bin' || true
             exit 1
           fi
 
-          echo "Using artifact '$artifact_name' from run $run_id ($run_url)"
-          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-          echo "run_url=$run_url" >> "$GITHUB_OUTPUT"
-          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-          echo "artifact_sha=$artifact_sha" >> "$GITHUB_OUTPUT"
-
-      - name: Verify release .bin files exist
-        id: download_artifact
-        run: |
-          set -euo pipefail
-          if ! rg --files release_artifacts -g "*.bin" >/dev/null; then
-            echo "::error::No .bin files found in downloaded artifact."
-            exit 1
-          fi
-          bin_count="$(rg --files release_artifacts -g "*.bin" | wc -l)"
-          if [ "$bin_count" -ne 1 ]; then
-            echo "::error::Expected exactly 1 .bin file, found ${bin_count}."
-            rg --files release_artifacts -g "*.bin" || true
-            exit 1
-          fi
-          echo "Found exactly 1 .bin file."
-          echo "bin_count=$bin_count" >> "$GITHUB_OUTPUT"
+          source_bin="${bins[0]}"
+          out_bin="release_artifacts/$(basename "$source_bin")"
+          git show "origin/main:${source_bin}" > "$out_bin"
+          echo "source_bin=$source_bin" >> "$GITHUB_OUTPUT"
+          echo "source_ref=origin/main" >> "$GITHUB_OUTPUT"
 
       - name: Upload .bin to destination release
         env:
@@ -150,11 +107,8 @@ jobs:
           TAG_NAME: ${{ steps.create_tag.outputs.tag }}
           TAG_SHA: ${{ steps.create_tag.outputs.sha }}
           INPUT_MESSAGE: ${{ github.event.inputs.message }}
-          RUN_ID: ${{ steps.latest_artifact.outputs.run_id }}
-          RUN_URL: ${{ steps.latest_artifact.outputs.run_url }}
-          ARTIFACT_NAME: ${{ steps.latest_artifact.outputs.artifact_name }}
-          ARTIFACT_BRANCH: ${{ steps.latest_artifact.outputs.branch }}
-          ARTIFACT_SHA: ${{ steps.latest_artifact.outputs.artifact_sha }}
+          SOURCE_BIN: ${{ steps.collect_bin.outputs.source_bin }}
+          SOURCE_REF: ${{ steps.collect_bin.outputs.source_ref }}
         run: |
           set -euo pipefail
 
@@ -183,9 +137,9 @@ jobs:
             exit 1
           fi
 
-          fpga_hash="${ARTIFACT_SHA:0:8}"
+          fpga_hash="${TAG_SHA:0:8}"
           if [ -z "$fpga_hash" ]; then
-            echo "::error::Could not derive FPGA hash from artifact source run."
+            echo "::error::Could not derive hash from tag commit."
             exit 1
           fi
 
@@ -198,9 +152,8 @@ jobs:
             echo "### Release assets uploaded"
             echo "- Release tag: \`$TAG_NAME\`"
             echo "- Commit: \`$TAG_SHA\`"
-            echo "- Source branch for artifact lookup: \`$ARTIFACT_BRANCH\`"
-            echo "- Reused artifact: \`$ARTIFACT_NAME\`"
-            echo "- Source PCIe build run: [${RUN_ID}](${RUN_URL})"
+            echo "- Source ref for .bin: \`$SOURCE_REF\`"
+            echo "- Source local .bin: \`$SOURCE_BIN\`"
             echo "- FPGA hash for asset naming: \`$fpga_hash\`"
             echo "- Uploaded renamed .bin file: \`$(basename "$renamed_bin")\`"
           } >> "$GITHUB_STEP_SUMMARY"
