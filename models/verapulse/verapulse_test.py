@@ -3606,9 +3606,9 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             B_DRAM_ADDR=self.conn_weight_addr + off * K * 2,
             OUTPUT_DRAM_ADDR=lane)
         # SCATTERED ONE SLOT AT A TIME. _ae_scatter_lane stages [rows, cols] through
-        # SRAM 0x00000, and at M=128 x 128 columns that is exactly the 0x10000 window
-        # below the flash region -- zero margin. Two 64-row copies halve it. The matmul
-        # above is still ONE op; only the write-back is chunked.
+        # SRAM 0x00000, against the 0x10000 window below the flash region; per-slot rows
+        # halve it, and _ae_scatter_lane splits the columns too if the lane is still too
+        # wide (which it is at low engine counts). The matmul above stays ONE op.
         for sl in range(nslots):
             self._ae_scatter_lane(
                 ue, lane + sl * TOUT * cols * bpe,
@@ -5239,19 +5239,27 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # (Measured context: denoise's unaccounted 658 ms tracks strided row-DMA
         # transactions, not op count -- see the --expert-layers layer sweep.)
         #
-        # SRAM: staging is rows*cols*bpe = 64*128*2 = 16 KB, doubled for the
-        # gather/scatter pair = 32 KB, against the 64 KB below the flash window at
-        # 0x10000. Asserted on the ACTUAL width now rather than on UE_VECTOR_SIZE, so a
-        # wider lane fails here instead of silently overrunning into flash scratch.
-        assert rows * cols * bpe * 2 <= 0x10000, (
-            f"scatter staging {rows}x{cols} needs {rows * cols * bpe * 2} B, over the "
-            f"{0x10000} B SRAM window below the flash region")
-        dst_a = dst_base + col_offset * bpe
-        assert src % mes.AXI_BEAT_BYTES == 0, \
-            f"scatter src 0x{src:X} is not {mes.AXI_BEAT_BYTES} B beat aligned"
-        assert dst_a % mes.AXI_BEAT_BYTES == 0, \
-            f"scatter dst 0x{dst_a:X} is not {mes.AXI_BEAT_BYTES} B beat aligned"
-        self._ae_strided_copy(ue, src, cols * bpe, dst_a, full_n * bpe, rows, cols)
+        # SRAM: staging is rows*cols*bpe, doubled for the gather/scatter pair, against
+        # the 64 KB below the flash window at 0x10000. One full-width copy whenever it
+        # fits; a lane too wide for the window is split into the widest chunks that do.
+        # LOW ENGINE COUNTS NEED THIS: cols is N/ne, so N=1024 fits at ne>=4 (256 cols =
+        # exactly 64 KB) and needs two chunks at ne=2. Chunking doubles the transactions
+        # and halves the burst, so it is a fallback, never the default.
+        max_cols = (0x10000 // (rows * bpe * 2)) // UE_VECTOR_SIZE * UE_VECTOR_SIZE
+        assert max_cols >= UE_VECTOR_SIZE, (
+            f"scatter staging {rows} rows leaves no room for even one "
+            f"{UE_VECTOR_SIZE}-column chunk in the {0x10000} B SRAM window")
+        for c0 in range(0, cols, max_cols):
+            c = min(max_cols, cols - c0)
+            dst_a = dst_base + (col_offset + c0) * bpe
+            src_a = src + c0 * bpe
+            assert src_a % mes.AXI_BEAT_BYTES == 0, \
+                f"scatter src 0x{src_a:X} is not {mes.AXI_BEAT_BYTES} B beat aligned"
+            assert dst_a % mes.AXI_BEAT_BYTES == 0, \
+                f"scatter dst 0x{dst_a:X} is not {mes.AXI_BEAT_BYTES} B beat aligned"
+            # src_jump stays the FULL lane row stride: the lane is a dense [rows, cols]
+            # and a chunk reads c of its cols, so the source is strided when chunked.
+            self._ae_strided_copy(ue, src_a, cols * bpe, dst_a, full_n * bpe, rows, c)
 
     def _assert_flag_check_reaches(self, ne):
         """Refuse to compile a rendezvous the ISA emitter would silently DROP.
