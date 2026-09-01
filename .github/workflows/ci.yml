@@ -34,9 +34,10 @@ on:
         type: boolean
         default: false
   push:
-    # model/pi05_libero is here so the pi05 bring-up branch gets HW CI on every
-    # push; the model subset it runs is branch-dependent (see "Run CI suite").
-    branches: [main, model/pi05_libero]
+    # model/pi05_libero and model/verapulse are here so the two VLA bring-up
+    # branches get HW CI on every push; the model subset each runs is
+    # branch-dependent (see "Run CI suite").
+    branches: [main, model/pi05_libero, model/verapulse]
   pull_request:
     branches: [main]
 
@@ -97,6 +98,12 @@ jobs:
 
           if [[ "${{ inputs.full_run }}" == "true" ]]; then
             : # no --only: the whole model_auto_test.py registry, pi05 first
+          elif [[ "$BRANCH" == "model/verapulse" ]]; then
+            # verapulse bring-up branch: run ONLY verapulse. Same reasoning as pi05
+            # below -- the Gemma4 cases add ~15 min of shared-board time and cannot
+            # regress from changes confined to models/verapulse.
+            echo "[ci] branch $BRANCH -> verapulse only"
+            ARGS+=(--only verapulse)
           elif [[ "$BRANCH" == "model/pi05_libero" ]]; then
             # pi05 bring-up branch: run ONLY pi05. The Gemma4 cases add ~15 min of
             # shared-board time and cannot regress from pi05-only changes.

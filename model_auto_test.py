@@ -354,6 +354,28 @@ def _check_pi05(text):
         return False, f"action chunk has nan={nan} inf={inf}"
     return True, f"finite action chunk (min={lo}, max={hi})"
 
+def _check_verapulse(text):
+    # verapulse (pulsevla) is a robot policy (VLA) like pi05: no text output, no labels.
+    # It prints a denoise summary "denoise: N steps x L layers -> actions (50, 7)
+    # absmax=2.7188" followed by a "=== MODEL OUTPUT [n, dof]" table. Different shape
+    # from pi05's summary line, hence a separate check rather than reusing _check_pi05.
+    m = re.search(r"denoise:.*actions \((\d+), (\d+)\) absmax=(nan|inf|-?[\d.]+)", text)
+    if not m:
+        return False, "no denoise action summary (run did not reach the action head)"
+    chunk, dof, absmax = m.group(1), m.group(2), m.group(3)
+    if absmax in ("nan", "inf"):
+        return False, f"action chunk absmax={absmax}"
+    if "=== MODEL OUTPUT" not in text:
+        return False, "denoise finished but no MODEL OUTPUT table was printed"
+    hi = float(absmax)
+    # An all-zero chunk is finite and would pass a naive nan/inf check. It is a REAL
+    # failure mode here: a stage whose output buffer was never written reads back as
+    # zeros, which is what a mis-addressed shard or an unlaunched worker produces.
+    if hi == 0.0:
+        return False, "action chunk is all zeros (absmax=0) -- a stage wrote nothing"
+    return True, f"finite action chunk ({chunk}x{dof}, absmax={hi})"
+
+
 # Shared algebra prompt: a single-answer math question whose correct result is
 # "x = 2" (checked by _check_x_equals_2). Used for all LM/decoder models below.
 MATH_PROMPT = "If x + 3 = 5, what is x?"
@@ -409,6 +431,13 @@ TESTS = [
     {"name": "parakeet",  "script": "models/parakeet/parakeet_test.py",        "pass_check": _check_parakeet},
     {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",      "pass_check": _check_nonempty},
     {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_swin},
+
+    # verapulse (pulsevla): SmolVLA-derived robot policy. No --prompt and no text output
+    # -- vision -> prefix -> denoise, emitting a [50, 32] action chunk of which the first
+    # 10x7 is executed. Runs at the board's core count (see _device_max_engines), and the
+    # bins are keyed per engine configuration, so pass 1 compiles + dumps and a later pass
+    # on the same runner loads them.
+    {"name": "verapulse", "script": "models/verapulse/verapulse_test.py",                "pass_check": _check_verapulse},
 
 ]
 
