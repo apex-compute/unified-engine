@@ -298,9 +298,17 @@ from multi_engine_shard import (  # noqa: E402
 # VERAPULSE_VARIANT=smolvla is the programmatic door in.
 
 _VARIANTS = {
-    "pulsevla": "verapulse_config.json",
-    "smolvla":  "verapulse_smolvla_config.json",
+    "pulsevla":   "verapulse_config.json",
+    "smolvla":    "verapulse_smolvla_config.json",
+    # smolvla's shape config EXACTLY -- vision/text/connector tensors are byte-identical
+    # -- with only the action expert retrained, against a quick_gelu backbone so the
+    # expert consumes the features this silicon actually produces.
+    "smolvla_qg": "verapulse_smolvla_qg_config.json",
 }
+
+# Variants whose weights were TRAINED in the accelerator's activation, so quick_gelu is
+# the published model rather than a substitution to cancel out.
+NATIVE_QUICK_GELU = {"smolvla_qg"}
 
 
 def _select_variant():
@@ -9584,34 +9592,149 @@ def _patch_upstream_quick_gelu(up):
     def fwd(self, x):
         return self.fc2(qg(self.fc1(x)))
 
-    for layer in up.model.vlm_with_expert.vision.encoder.layers:
-        layer.mlp.forward = types.MethodType(fwd, layer.mlp)
+    # Structural: the bundle nests the tower as vlm_with_expert.vision.encoder.layers,
+    # lerobot as vlm.model.vision_model. Match on the fc1/fc2 pair under a 'vision' name.
+    n = 0
+    for name, mod in up.model.vlm_with_expert.named_modules():
+        if "vision" in name and hasattr(mod, "fc1") and hasattr(mod, "fc2"):
+            mod.forward = types.MethodType(fwd, mod)
+            n += 1
+    if n == 0:
+        raise RuntimeError("quick_gelu patch found no vision MLP -- refusing to return "
+                           "an unpatched oracle scored as if it were patched")
     return up
 
 
-def _upstream_load(quiet=False, hw_gelu=False):
+# Oracle numeric format. False = fp32 (the model as mathematically specified); True =
+# cast the whole oracle to bf16 so it carries the SAME storage precision as the device.
+#
+# WHY THIS MATTERS. Every SNR in this file scores a bf16 device against an fp32 oracle,
+# so it conflates two unrelated things: the FORMAT gap, which is a property of the
+# datapath and not a defect, and genuine implementation error, which is. bf16 has an
+# 8-bit mantissa (~0.4% per rounding, ~48 dB from a single op), so a deep stack cannot
+# hold 40 dB no matter how perfect the emitter is -- see the measured ceilings above.
+# Running the oracle in bf16 puts the format on BOTH sides, and what is left is the
+# emitter's own error.
+#
+# NOT a perfect null: torch accumulates bf16 matmuls in fp32 internally, and so does the
+# hardware (wider than bf16), so this is bf16-storage / wide-accumulate on both sides
+# rather than a strict 16-bit simulation. It is the closest apples-to-apples available
+# without _STRICT16, which is pessimistic in the other direction.
+_ORACLE_BF16 = False
+
+
+def _bf16ify(up):
+    """Give the oracle the device's STORAGE precision without changing its dtype.
+
+    A blanket up.to(torch.bfloat16) does not work: lerobot builds several tensors in
+    fp32 unconditionally (the timestep embedding among them), so they meet bf16 weights
+    mid-graph and F.linear raises `mat1 and mat2 must have the same dtype`. Chasing every
+    such site would mean patching upstream's forward pass, which is the one thing this
+    oracle exists to avoid.
+
+    So round-trip through bf16 instead and stay in fp32:
+      - every parameter is quantized to bf16 and back  -> bf16 WEIGHT precision
+      - every Linear output is rounded to bf16 and back -> bf16 ACTIVATION precision
+        between ops, which is what the device stores between kernels
+
+    Accumulation stays wide, which is correct: the hardware also accumulates wider than
+    bf16 (see the ceiling notes above -- a pure-bf16 sim is pessimistic). What this does
+    NOT model is rounding inside a reduction; for that there is _STRICT16, which errs the
+    other way. This sits between the two and needs no upstream edits.
+    """
+    for prm in up.parameters():
+        prm.data = prm.data.bfloat16().float()
+    for mod in up.modules():
+        if isinstance(mod, torch.nn.Linear):
+            mod.register_forward_hook(
+                lambda _m, _i, out: out.bfloat16().float()
+                if isinstance(out, torch.Tensor) else out)
+    return up
+
+
+def _up_cast(t, up):
+    """Cast a tensor to the oracle's parameter dtype, so a bf16 oracle is not silently
+    upcast back to fp32 by its inputs -- which would make the bf16 measurement a lie."""
+    return t.to(next(up.parameters()).dtype)
+
+
+def _upstream_load(quiet=False, hw_gelu=None, bf16=None):
     """The checkpoint's OWN shipped forward pass, as the gate oracle.
 
     hw_gelu=True patches the vision activation to the accelerator's quick_gelu, giving
     a SHARP gate (GELU cancels). hw_gelu=False is the honest fidelity number: distance
     from the model as published. Report both -- they answer different questions."""
+    if hw_gelu is None:
+        hw_gelu = VARIANT in NATIVE_QUICK_GELU
+    if bf16 is None:
+        bf16 = _ORACLE_BF16
     import os as _os
+    # The bundle is the only copy of the upstream `smolvla` package, so it stays the
+    # source of CODE. Its config.json/model.safetensors are PULSEVLA's, though, so
+    # weights come from ensure_checkpoint() -- the same variant-aware resolver the device
+    # path uses -- or the oracle grades one model against another model's answer key.
     bundle = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
                            "verapulse_bin", "verapulse__pulsevla-libero-0.5b")
     if not _os.path.isdir(bundle):
         raise FileNotFoundError(
             f"upstream bundle not found at {bundle} -- it ships alongside the weights; "
             f"the downloader must not filter the .py files out")
+    ckpt = ensure_checkpoint()
+    _BACKBONE = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+
+    # TWO SCHEMAS. The bundle's SmolVLA wants nested "text"/"vision" blocks (pulsevla).
+    # The finetunes ship LEROBOT's flat SmolVLAConfig -- no "text" key -- and are not
+    # convertible by renaming. For those the checkpoint's real forward pass is lerobot's
+    # own VLAFlowMatching, which is the oracle bench_vs_upstream.py has always used.
+    with open(_os.path.join(ckpt, "config.json")) as _f:
+        _raw = json.load(_f)
+    if "text" not in _raw:
+        from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+        from lerobot.configs.policies import PreTrainedConfig
+        cfg_l = PreTrainedConfig.from_pretrained(ckpt)
+        _vm = getattr(cfg_l, "vlm_model_name", None)
+        if isinstance(_vm, str) and _os.path.isabs(_vm) and not _os.path.exists(_vm):
+            # Training-machine path. Only the ARCHITECTURE comes from here; every weight
+            # is overwritten from the checkpoint below, and the activation is set
+            # explicitly by _patch_upstream_quick_gelu.
+            vnote(f"cfg.vlm_model_name absent here ({_vm}); building from {_BACKBONE}")
+            cfg_l.vlm_model_name = _BACKBONE
+        cfg_l.device = "cpu"
+        up = SmolVLAPolicy.from_pretrained(ckpt, config=cfg_l, strict=True)
+        up = up.to("cpu").eval().float()
+        # strict=True can be honoured loosely by some versions; prove coverage instead of
+        # trusting it. An unsupplied parameter still holds a PUBLIC value, which would
+        # make this a silent blend of two models that still produces plausible numbers.
+        from safetensors.torch import load_file as _lf
+        _have = set(_lf(_os.path.join(ckpt, "model.safetensors")))
+        _missing = [nm for nm, _ in up.named_parameters() if nm not in _have]
+        if _missing:
+            raise RuntimeError(
+                f"{len(_missing)} parameter(s) not supplied by {ckpt}/model.safetensors "
+                f"(e.g. {_missing[:5]}) -- refusing to score against a blended oracle.")
+        if hw_gelu:
+            _patch_upstream_quick_gelu(up)
+        if bf16:
+            _bf16ify(up)
+        if not quiet:
+            vnote(f"upstream oracle: lerobot SmolVLAPolicy from {ckpt} "
+                  f"[{'bf16' if bf16 else 'fp32'}] "
+                  f"({sum(p.numel() for p in up.parameters())/1e6:.1f}M"
+                  f"{', vision GELU -> quick_gelu' if hw_gelu else ''})")
+        return up
+
     sys.path.insert(0, bundle)
     from safetensors.torch import load_file
     from smolvla import SmolVLA, load_smolvla_config
-    cfg_u = load_smolvla_config(_os.path.join(bundle, "config.json"))
+    cfg_u = load_smolvla_config(_os.path.join(ckpt, "config.json"))
     up = SmolVLA(cfg_u).float().eval()
-    up.load_state_dict(load_file(_os.path.join(bundle, "model.safetensors")))
+    up.load_state_dict(load_file(_os.path.join(ckpt, "model.safetensors")))
     if hw_gelu:
         _patch_upstream_quick_gelu(up)
+    if bf16:
+        _bf16ify(up)
     if not quiet:
-        vnote(f"upstream oracle loaded "
+        vnote(f"upstream oracle loaded [{'bf16' if bf16 else 'fp32'}] "
               f"({sum(p.numel() for p in up.parameters())/1e6:.1f}M"
               f"{', vision GELU -> quick_gelu' if hw_gelu else ''})")
     return up
@@ -9620,11 +9743,48 @@ def _upstream_load(quiet=False, hw_gelu=False):
 _UP_CACHE = {}
 
 
-def _upstream_cached(hw_gelu):
+def _upstream_cached(hw_gelu=None):
     """Loading 2.23 GB twice per gate is pure latency; the gates want both variants."""
-    if hw_gelu not in _UP_CACHE:
-        _UP_CACHE[hw_gelu] = _upstream_load(hw_gelu=hw_gelu)
-    return _UP_CACHE[hw_gelu]
+    if hw_gelu is None:
+        hw_gelu = VARIANT in NATIVE_QUICK_GELU
+    # Keyed on the DTYPE too: an fp32 and a bf16 oracle are different models for scoring
+    # purposes, and sharing one cache slot would hand back whichever was built first.
+    key = (hw_gelu, _ORACLE_BF16)
+    if key not in _UP_CACHE:
+        _UP_CACHE[key] = _upstream_load(hw_gelu=hw_gelu, bf16=_ORACLE_BF16)
+    return _UP_CACHE[key]
+
+
+def _up_embed_image(vwe, px):
+    """Vision tower + connector for one image -> [tokens, dim]. Same tap on both
+    backends: the bundle exposes connector(vision(px)), lerobot exposes embed_image."""
+    if hasattr(vwe, "embed_image"):
+        return vwe.embed_image(px)[0]
+    return vwe.connector(vwe.vision(px))[0]
+
+
+def _up_prefix_forward(vwe, att2d, pos, embs):
+    """Prefix forward + KV fill -> (hidden [S,D], [(K,V)] with K,V as [n_kv, S, head_dim],
+    the device's layout, so the gates never branch on backend."""
+    if hasattr(vwe, "embed_image"):          # lerobot
+        # past_key_values=None, NOT an empty DynamicCache: forward_cross_attn_layer
+        # branches on `is not None`, so an empty-but-present cache makes cross-attn
+        # layers read a prefix the self-attn layers have not written yet. This mirrors
+        # modeling_smolvla.sample_actions' own prefill exactly.
+        outs, cache = vwe.forward(
+            attention_mask=att2d, position_ids=pos, past_key_values=None,
+            inputs_embeds=[embs, None], use_cache=True)
+        # DynamicCache holds [B, n_kv, S, D]; drop batch -> device layout.
+        kv = [(l.keys[0], l.values[0]) for l in cache.layers if l.is_initialized]
+    else:                                    # bundle
+        outs, kvu = vwe.forward(
+            attention_mask=att2d, position_ids=pos, past_key_values=None,
+            inputs_embeds=[embs, None], use_cache=True, fill_kv_cache=True)
+        # Bundle holds [B, S, n_kv, D]; permute to match. Getting this transpose wrong
+        # loads cleanly and scores as pure garbage.
+        kv = [(d["key_states"][0].permute(1, 0, 2),
+               d["value_states"][0].permute(1, 0, 2)) for d in kvu]
+    return outs[0][0], kv
 
 
 def _upstream_prefix_gate(ue, images, token_ids, text_mask, hidden, kv):
@@ -9638,24 +9798,26 @@ def _upstream_prefix_gate(ue, images, token_ids, text_mask, hidden, kv):
     while the cache is the action expert's ONLY view of the observation.
     """
     import math as _m
-    up = _upstream_load()
+    up = _upstream_cached()
     vwe = up.model.vlm_with_expert
     m = torch.as_tensor(text_mask).reshape(-1).bool()
     ids = torch.as_tensor(token_ids, dtype=torch.long).reshape(-1)
     with torch.no_grad():
-        imgs = [images[s].permute(2, 0, 1).unsqueeze(0).contiguous().float()
+        imgs = [_up_cast(images[s].permute(2, 0, 1).unsqueeze(0).contiguous().float(), up)
                 for s in range(images.shape[0])]
         # state: the device already has it K-padded; rebuild the same vector here
-        st = torch.as_tensor(ue._prefix_state_used, dtype=torch.float32).reshape(1, -1)
+        st = _up_cast(
+            torch.as_tensor(ue._prefix_state_used, dtype=torch.float32).reshape(1, -1), up)
         embs, pad, att = up.model.embed_prefix(
             imgs, [torch.ones(1, dtype=torch.bool)] * len(imgs),
             ids[None, :], m[None, :], st)
         att2d = make_att_2d_masks_local(pad, att)
         pos = torch.cumsum(pad, dim=1) - 1
-        outs, kvu = vwe.forward(attention_mask=att2d, position_ids=pos,
-                                past_key_values=None, inputs_embeds=[embs, None],
-                                use_cache=True, fill_kv_cache=True)
-    up_hidden = outs[0][0]                      # [S, 960]
+        up_hidden, kvu = _up_prefix_forward(vwe, att2d, pos, embs)
+    # Back to fp32 for SCORING only: the oracle already computed in its own dtype, and
+    # snr/cos must not be taken in bf16 or the metric quantizes the metric.
+    up_hidden = up_hidden.float()
+    kvu = [(k.float(), v.float()) for k, v in kvu]
     valid = int(pad[0].sum())
     section("prefix")
     vnote(f"upstream rows={up_hidden.shape[0]} valid={valid}; "
@@ -9668,9 +9830,11 @@ def _upstream_prefix_gate(ue, images, token_ids, text_mask, hidden, kv):
     report("prefix hidden", hw, up_hidden[:n], threshold=20.0)
     # KV: upstream stores [B, S, n_kv, D]; device gives [n_kv, S, D] per layer
     worst = 1.0
-    for li in (0, 1, 15, 31):
-        ku = kvu[li]["key_states"][0][:n].permute(1, 0, 2)     # [5, n, 64]
-        vu = kvu[li]["value_states"][0][:n].permute(1, 0, 2)
+    # Derived from actual depth: the literal (0, 1, 15, 31) was pulsevla's 32 layers and
+    # raised IndexError on any 16-layer checkpoint.
+    _nl = min(len(kv), len(kvu))
+    for li in sorted({0, min(1, _nl - 1), _nl // 2, _nl - 1}):
+        ku, vu = kvu[li][0][:, :n], kvu[li][1][:, :n]          # [n_kv, n, 64]
         kh, vh = torch.as_tensor(kv[li][0])[:, :n], torch.as_tensor(kv[li][1])[:, :n]
         ck, cv = cos_sim(kh, ku), cos_sim(vh, vu)
         worst = min(worst, ck, cv)
@@ -9699,14 +9863,15 @@ def _upstream_denoise_gate(ue, images, token_ids, text_mask, state, noise, hw_ac
     up = _upstream_cached(True)          # sharp variant: GELU cancels
     m = torch.as_tensor(text_mask).reshape(-1).bool()
     ids = torch.as_tensor(token_ids, dtype=torch.long).reshape(-1)
-    st = torch.as_tensor(state, dtype=torch.float32).reshape(1, -1)
+    st = _up_cast(torch.as_tensor(state, dtype=torch.float32).reshape(1, -1), up)
     with torch.no_grad():
-        imgs = [images[s].permute(2, 0, 1).unsqueeze(0).contiguous().float()
+        imgs = [_up_cast(images[s].permute(2, 0, 1).unsqueeze(0).contiguous().float(), up)
                 for s in range(images.shape[0])]
         up_act = up.model.sample_actions(
             imgs, [torch.ones(1, dtype=torch.bool)] * len(imgs),
             ids[None, :], m[None, :], st,
-            torch.as_tensor(noise, dtype=torch.float32)[None])[0]
+            _up_cast(torch.as_tensor(noise, dtype=torch.float32), up)[None])[0]
+    up_act = up_act.float()
     hw = torch.as_tensor(hw_actions).float()
     n = min(hw.shape[0], up_act.shape[0])
     d = min(hw.shape[1], up_act.shape[1])
@@ -9792,7 +9957,7 @@ def _upstream_vision_gate(ue, images, tokens):
             con = []
             for s in range(images.shape[0]):
                 px = images[s].permute(2, 0, 1).unsqueeze(0).contiguous().float()
-                con.append(vwe.connector(vwe.vision(px))[0])
+                con.append(_up_embed_image(vwe, _up_cast(px, up)).float())
             up_con = torch.cat(con, 0)
         assert hw.shape == up_con.shape, (
             f"device produced {tuple(hw.shape)}, upstream {tuple(up_con.shape)} -- a "
@@ -10454,6 +10619,12 @@ def main():
                          "weights are worse-conditioned than trained ones.")
     ap.add_argument("--hw-gelu", action="store_true",
                     help="model the FPGA's x*sigmoid(1.702x) instead of gelu_tanh")
+    ap.add_argument("--oracle-bf16", action=argparse.BooleanOptionalAction, default=False,
+                    help="run the upstream oracle in bf16 so it carries the SAME storage "
+                         "precision as the device. Default off = fp32 oracle, which "
+                         "measures fidelity to the model as specified but charges the "
+                         "accelerator for the format gap; on = apples-to-apples, "
+                         "isolating emitter error from bf16 itself")
     ap.add_argument("--prefix-order", default=None,
                     choices=["state_images_text", "images_text_state", "scatter_into_text"])
     ap.add_argument("--images", default=None,
@@ -10475,6 +10646,12 @@ def main():
             f"variant mismatch: argparse says {_want!r} but the module was imported as "
             f"{VARIANT!r}. _select_variant() and the CLI have drifted apart.")
     print(f"  [variant] {VARIANT}  ({_VARIANTS[VARIANT]})")
+    global _ORACLE_BF16
+    _ORACLE_BF16 = args.oracle_bf16
+    print("  [oracle] " + (
+        "bf16 -- same storage precision as the device; the residual is emitter error, "
+        "not format" if _ORACLE_BF16 else
+        "fp32 -- fidelity to the model as specified; includes the bf16 format gap"))
 
     # Resolve the sentinel. Default = "all" (the full FPGA path). The one exception is
     # --tiny with no explicit --stage: --tiny means "2 layers per stack, 64 patches",
