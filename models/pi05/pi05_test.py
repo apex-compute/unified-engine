@@ -362,13 +362,9 @@ BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), _BIN_SUBDIR)
 _BIN_DERIVED_ATTRS = ("VIS_H", "VIS_NH", "VIS_D", "VIS_DP", "VIS_I", "VIS_I_PAD",
                       "VIS_S", "VIS_PATCH_K", "VIS_HEAD_OUT",
                       # Worker-arena geometry, sized at runtime by
-                      # _resolve_worker_arena_profile from the worker count and the tensor
-                      # DRAM left after the action-expert reserve. RESTORED, not
-                      # recomputed: every worker program address recorded in the manifest
-                      # was derived from these two, so a bin run that re-derived a
-                      # different arena size would place its workers somewhere the
-                      # programs were never compiled for. Only present on a multi-engine
-                      # run; absent at 1 engine, which the dump tolerates.
+                      # _resolve_worker_arena_profile. RESTORED, not recomputed: every
+                      # worker program address in the manifest was derived from these
+                      # two. Absent at 1 engine, where the profile never resolves.
                       "VIS_WORKER_ARENA_BYTES", "VIS_WORKER_PROGRAM_OFFSET")
 
 
@@ -2381,24 +2377,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             f"{self.VIS_WORKER_AE_TENSOR_RESERVE >> 20} MB reserved for the action expert")
 
     def _record_worker_prog_sizes(self, stage, sched):
-        """Snapshot each worker program's size immediately after finalize().
+        """Worker program sizes, snapshotted right after finalize().
 
-        Must happen HERE: finalize() flushes the capture but leaves the buffer, and the
-        next stage's begin_program() clears it on the same SHARED workers. Sizes also
-        cannot be recovered by differencing worker addresses -- allocate_program_dram
-        rounds every allocation up to 64 B, which over-reports each one.
+        Here and nowhere later: the next stage's begin_program() clears the capture on
+        these SHARED workers. Differencing addresses over-reports (64 B rounding).
         """
         setattr(self, _STAGE_ATTRS[stage][2],
                 [w.get_capture_instruction_size_bytes() for w in sched.workers])
 
     def _bin_engines(self):
-        """The (encoder, prefix, denoise) engine triple this run is CONFIGURED for.
-
-        Configured, not resolved: _prefix_num_engines can fall back to 1 for a short
-        sequence, but that depends on the observation and is not knowable before the bin
-        file has to be chosen. The resolved count is pinned by prefix_seq_len in `sig`,
-        which is checked once vision has told us how many rows this obs produced.
-        """
+        """The engine triple this run is CONFIGURED for (see _configured_engines)."""
         return _configured_engines(self)
 
     def _bin_worker_pool(self, n):
@@ -6617,12 +6605,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 all_bytes.extend(buf)
                 read += sz
             manifest["programs"][name] = {"offset": offset_in_file, "size": size}
-            # WORKER programs for this stage. A sharded stage is not one program: every
-            # extra engine runs its own stream out of its own arena slice, and replaying
-            # only the primary's leaves those rows unwritten while the primary waits at a
-            # rendezvous nobody answers. Worker sections carry an explicit dram_base --
-            # the primary's is reproduced by replaying the bump allocator, but worker
-            # arenas are scheduler-owned and must be stated.
+            # WORKER programs. A sharded stage is not one program: replaying only the
+            # primary leaves those rows unwritten while it waits at a rendezvous nobody
+            # answers. Worker sections state an explicit dram_base -- the primary's comes
+            # from replaying the bump allocator, but worker arenas are scheduler-owned.
             _waddrs = list(getattr(self, _STAGE_ATTRS[name][1], None) or [])
             _wsizes = list(getattr(self, _STAGE_ATTRS[name][2], None) or [])
             assert len(_wsizes) == len(_waddrs), (
@@ -6644,12 +6630,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                                "engine": _wi + 1, "dram_base": hex(_wa)})
                 all_bytes.extend(_buf)
             manifest["workers"][name] = _wsecs
-        # SCHEDULER REGISTRIES. _vis_make_scheduler registers its per-engine scratch
-        # internally and so replays on load, but the denoise stage registers inside
-        # compile_denoise_loop (ae_mlp_down_partial / ae_o_proj_partial / the col
-        # outputs), which a bin run never executes. Persist every scheduler's registries
-        # and re-register them; a missing one is not a crash but a WRONG ANSWER, since
-        # the addresses are already baked into the programs.
+        # SCHEDULER REGISTRIES. _vis_make_scheduler registers internally and replays on
+        # load, but denoise registers inside compile_denoise_loop, which a bin run never
+        # executes. A missing one is a WRONG ANSWER, not a crash: the addresses are
+        # already baked into the programs.
         _sched_state = {}
         for _ne, _sc in self.__dict__.get("_sched_by_ne", {}).items():
             _sched_state[str(_ne)] = {
@@ -6661,9 +6645,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         manifest["schedulers"] = _sched_state
         manifest["sig"] = {
             "engines": _engines,
-            # What each stage ACTUALLY ran at, after _num_engines' board/column clamps.
-            # The filename carries the configured triple; this catches a set built on a
-            # board (or an observation) where a stage resolved to a different count.
+            # What each stage ACTUALLY ran at, after the board/column clamps. The
+            # filename carries the configured triple; this catches a set whose stages
+            # resolved differently (another board, another observation).
             "engines_resolved": {s_: int(self._num_engines(_STAGE_ATTRS[s_][0]))
                                  for s_ in _PROGRAM_ORDER},
             "prefix_seq_len": int(self.PREFIX_SEQ_LEN),
@@ -6822,10 +6806,8 @@ _STAGE_ATTRS = {
 def clean_bins(bin_dir=None, verbose=True):
     """Delete every bin artifact in `bin_dir`, for ALL engine configurations.
 
-    NAMES THE FILES; never rm -rf the directory. pi05's 13 GB weights_export/ tree lives
-    INSIDE the bin dir and CANNOT be regenerated from HuggingFace -- the weights come
-    from an offline export, so removing the directory would be unrecoverable. Only
-    params.* and programs_e*.* are touched.
+    NAMES THE FILES; never rm -rf the dir -- the 13 GB weights_export/ tree lives inside
+    it and comes from an offline export, so removing it would be unrecoverable.
     """
     import glob
     if bin_dir is None:
@@ -6853,14 +6835,10 @@ def clean_bins(bin_dir=None, verbose=True):
 def _configured_engines(obj):
     """(encoder, prefix, denoise) engine counts from the CONFIGURED knobs.
 
-    Takes a class or an instance, because main must name the bin file BEFORE it knows
-    whether to construct Pi05Libero_Run or the compiling engine -- and both sides have to
-    derive the same name or a dumped set is never found again.
-
-    Deliberately does NOT apply _num_engines' runtime clamps (board core count, the
-    prefix's column-block count). Those depend on the board and on the observation, so
-    they cannot be resolved at naming time; the RESOLVED counts are recorded in `sig` and
-    checked on load instead.
+    Class OR instance: main names the bin file before it knows which engine to build, and
+    both sides must derive the same name or a dumped set is never found again. Skips
+    _num_engines' runtime clamps (board cores, prefix column blocks) -- those depend on
+    the board and the observation; the resolved counts go in `sig` instead.
     """
     out = {}
     for stage, (key, *_rest) in _STAGE_ATTRS.items():
@@ -6874,11 +6852,9 @@ def _configured_engines(obj):
 def _programs_stem(engines):
     """(encoder, prefix, denoise) engine counts -> programs file stem.
 
-    ONE params.bin serves every configuration -- sharding never writes the params region
-    (every per-engine buffer is allocated out of the worker TENSOR arena) -- but the
-    programs get one file per engine triple: a sharded program bakes one rendezvous per
-    engine, so replaying an 8-engine set on 4 leaves the primary waiting on workers that
-    were never launched, at a FLAG_CHECK with no timeout.
+    ONE params.bin serves every configuration (sharding never writes params), but one
+    programs file per triple: a sharded program bakes one rendezvous per engine, so an
+    8-engine set replayed on 4 hangs waiting on workers that were never launched.
     """
     e, p, d = (int(engines[s]) for s in _PROGRAM_ORDER)
     return f"programs_e{e}_{p}_{d}"
@@ -7040,12 +7016,10 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
     def _restore_schedulers(self):
         """Rebuild every scheduler the dump recorded and re-register its buffers.
 
-        Two mechanisms, because pi05 uses both: _vis_make_scheduler registers its
-        per-engine scratch INSIDE the builder (so replaying it is enough), while the
-        denoise stage registers inside compile_denoise_loop, which a bin run never
-        executes. The persisted registries cover the second case; re-registering an
-        address the builder already installed is a no-op (register_per_engine_addrs
-        asserts equality and returns).
+        Both mechanisms, because pi05 needs both: _vis_make_scheduler registers inside
+        the builder (replaying it suffices), while denoise registers inside
+        compile_denoise_loop, which a bin run never executes. Re-registering an address
+        the builder already installed is a no-op.
         """
         state = self._manifest.get("schedulers")
         if state is None:
@@ -7641,11 +7615,10 @@ def main():
     # run the unsharded model while printing that sharding is on -- the flags would
     # silently do nothing. Any knob that changes the compiled program must be listed
     # here, or it is quietly ignored whenever a bin set happens to be present.
-    # --engines/--vis_4/--pref_8/--dns_8 no longer invalidate a bin set: the programs
-    # file is KEYED by the (encoder, prefix, denoise) engine triple, so each sharding
-    # configuration gets its own set and can never load another's. Only the debug/probe
-    # paths still disqualify a run -- they compile extra programs or skip stages, which
-    # desyncs the program allocator from the dumped layout.
+    # Sharding flags no longer invalidate a bin set -- the programs file is keyed by the
+    # engine triple, so each configuration has its own. Only the debug/probe paths still
+    # disqualify a run: they compile extra programs or skip stages, desyncing the
+    # allocator from the dumped layout.
     if args.clean:
         clean_bins(BIN_DIR)
     _bin_ok = not (args.debug or args.sanity_check or args.probe_step0
