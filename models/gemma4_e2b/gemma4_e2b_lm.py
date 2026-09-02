@@ -38,26 +38,16 @@ class Gemma4LMMixin:
         """Return the shared multicore configuration for the prefill stage."""
         return self._ensure_stage_scheduler("prefill", self.VISION_ISA_BASE)
 
-    def _ensure_decode_scheduler(self):
-        """Scheduler for the decode SMOKE TEST only (--decode-shard-dummy).
-
-        The real O-projection shard does NOT go through MultiEngineScheduler any
-        more: it is emitted inline, one independent program per core, following
-        ``quantized_matmat_mul_multi_cores_test`` in user_hw_test.py (see
-        :meth:`_decode_shard_engines` and :meth:`_decode_shard_region`). The two
-        flags are mutually exclusive at the CLI, so only one mechanism is ever
-        live in a run.
-        """
-        if not getattr(self, "decode_shard_dummy", False):
-            return None
-        return self._ensure_stage_scheduler("decode")
-
     def _decode_shard_engines(self) -> list:
-        """The slave engines the decode O-proj shard runs on ([] when off).
+        """The slave engines the decode shards run on ([] when off).
 
-        Engine OBJECTS still come from the run-wide pool: their program
-        allocators must keep advancing across stages, or the decode worker
-        programs land on top of prefill's (see _ensure_worker_pool).
+        Decode does not go through MultiEngineScheduler at all: its shards are
+        emitted inline, one independent program per core, following
+        ``quantized_matmat_mul_multi_cores_test`` in user_hw_test.py (see
+        :meth:`_decode_shard_region`). Engine OBJECTS still come from the
+        run-wide pool: their program allocators must keep advancing across
+        stages, or the decode worker programs land on top of prefill's
+        (see _ensure_worker_pool).
         """
         if not getattr(self, "decode_shard_oproj", False):
             return []
@@ -189,8 +179,7 @@ class Gemma4LMMixin:
         launch the master into a program full of barriers with nothing on the
         other side and spin on a FLAG_CHECK that has no timeout.
         """
-        sched = self._ensure_decode_scheduler()          # dummy smoke test only
-        workers = sched.workers if sched is not None else self._decode_shard_engines()
+        workers = self._decode_shard_engines()
         if not workers:
             return [], []
         addrs = []
@@ -206,28 +195,19 @@ class Gemma4LMMixin:
             worker.dma_write(DMA_DEVICE_H2C, w_addr, w_bytes, len(w_bytes))
             worker.allocate_program_dram(len(w_bytes))
             addrs.append(w_addr)
-            if getattr(self, "decode_shard_dummy", False):
-                self.dma_to_accelerator_memory(
-                    self.DECODE_DUMMY_SCRATCH_BASE
-                    + (engine_idx - 1) * self.DECODE_DUMMY_SCRATCH_STRIDE,
-                    torch.zeros(2 * 4096, dtype=torch.bfloat16))
-        if sched is not None:
-            sched.preclear_flags()
-        else:
-            self._decode_preclear_flags([self] + list(workers))
-        _what = ("dummy memcpy" if getattr(self, "decode_shard_dummy", False)
-                 else "O-proj N-shard")
+        self._decode_preclear_flags([self] + list(workers))
         print(f"[decode shard] {len(addrs)} slave core(s) armed "
-              f"@ {[hex(a) for a in addrs]} ({_what})", flush=True)
+              f"@ {[hex(a) for a in addrs]} (O-proj + MLP-gate N-shard)", flush=True)
         return list(workers), addrs
 
     def _decode_shard_layers(self) -> list[int]:
-        """Layer indices whose O projection is N-sharded in decode.
+        """Layer indices whose O projection and MLP gate are N-sharded in decode.
 
         Defaults to LAYER 0 ONLY while decode sharding is being brought up; set
         GEMMA4_SHARD_LAYERS=all to shard every layer. O-proj N is 1536 on every
-        layer, so the split is the same everywhere (192 cols/engine at 8 cores)
-        and widening is an env var, not a code change.
+        layer (192 cols/engine at 8 cores); the gate is 6144 on the narrow
+        layers and 12288 on the wide ones (768 / 1536 cols/engine). Widening is
+        an env var, not a code change.
         """
         if not getattr(self, "decode_shard_oproj", False):
             return []
@@ -261,7 +241,7 @@ class Gemma4LMMixin:
         return layers
 
     def stage_decode_shard_weights(self) -> None:
-        """Copy each engine's ROW BLOCK of the O-projection weight into that
+        """Copy each engine's ROW BLOCK of every sharded weight into that
         engine's own private DRAM region, ahead of any decode.
 
         This is the difference from vision/prefill sharding. There every engine
@@ -272,59 +252,91 @@ class Gemma4LMMixin:
         ``DECODE_SHARD_WEIGHT_BASE + e*DECODE_SHARD_WEIGHT_STRIDE``, and the
         compiled program points that engine at its own copy.
 
-        O-proj is [N, K] with N = hidden = 1536 for EVERY layer, and K per layer
-        = cur_q_size (4096 on full-attention layers, 2048 on sliding). The bin
-        packs each layer's rows at that layer's ACTUAL K -- the region is sized
-        for the 4096 maximum and zero-padded -- so the row stride is K/2 bytes
-        for data and K/64*2 for the block scales, both per layer.
+        Both sharded ops store B as [N, K] row-major, so a column shard of the
+        OUTPUT is a contiguous ROW BLOCK of B -- no strided gather, and the block
+        scales (one bf16 per 64-element K block, i.e. an [N, K/64] blob) slice
+        the same way:
+
+          O-proj    N = hidden = 1536 on every layer; K = cur_q_size (4096 on
+                    full-attention layers, 2048 on sliding). Row stride K/2 bytes
+                    of data, K/64*2 of scale -- per layer, since K varies.
+          MLP gate  N = cur_mlp (6144 narrow / 12288 wide); K = hidden = 1536 on
+                    every layer, so the row strides are constant at 768 and 48
+                    bytes. The bin sizes each layer's block for the WIDE maximum
+                    and zero-pads, and we only ever touch the first N rows.
         """
         layers = self._decode_shard_layers()
         if not layers:
             return
         n_eng = self.multi_core
         LWS = self.weight_defs["LAYER_WEIGHT_SIZE"]
-        data_off0 = self.weight_defs["BLK0_ATTN_OUTPUT_WEIGHT_DATA"]
-        scale_off0 = self.weight_defs["BLK0_ATTN_OUTPUT_WEIGHT_SCALE"]
-        N = self.vector_length                       # 1536, all layers
-        if N % n_eng or (N // n_eng) % UE_VECTOR_SIZE:
-            raise ValueError(
-                f"--decode-shard-oproj: o_proj N={N} does not split into "
-                f"{n_eng} {UE_VECTOR_SIZE}-aligned column blocks "
-                f"(N/{n_eng} = {N / n_eng:g}). Use an engine count that divides "
-                f"N/{UE_VECTOR_SIZE} = {N // UE_VECTOR_SIZE}: 2, 3, 4, 6, 8 or 12.")
-        cols = N // n_eng
+        K_gate = self.vector_length                  # 1536, all layers
+        o_data_off0 = self.weight_defs["BLK0_ATTN_OUTPUT_WEIGHT_DATA"]
+        o_scale_off0 = self.weight_defs["BLK0_ATTN_OUTPUT_WEIGHT_SCALE"]
+        g_data_off0 = self.weight_defs["BLK0_FFN_GATE_WEIGHT_DATA"]
+        g_scale_off0 = self.weight_defs["BLK0_FFN_GATE_WEIGHT_SCALE"]
 
-        def _rows(L):
+        def _check_split(N: int, what: str) -> int:
+            if N % n_eng or (N // n_eng) % UE_VECTOR_SIZE:
+                raise ValueError(
+                    f"--decode-shard-oproj: {what} N={N} does not split into "
+                    f"{n_eng} {UE_VECTOR_SIZE}-aligned column blocks "
+                    f"(N/{n_eng} = {N / n_eng:g}). Use an engine count that "
+                    f"divides N/{UE_VECTOR_SIZE} = {N // UE_VECTOR_SIZE}.")
+            return N // n_eng
+
+        o_cols = _check_split(self.vector_length, "o_proj")
+        for L in layers:
+            _check_split(self._get_mlp_elements(L), f"mlp_gate (layer {L})")
+
+        # (rows-of-B to copy, data row stride, scale row stride) per op per layer.
+        def _o_plan(L):
             _, cur_q_size, _ = self._get_layer_attention_dims(L)
-            return cur_q_size // 2, (cur_q_size // UE_VECTOR_SIZE) * 2
+            return o_cols, cur_q_size // 2, (cur_q_size // UE_VECTOR_SIZE) * 2
+
+        def _g_plan(L):
+            return (self._get_mlp_elements(L) // n_eng,
+                    K_gate // 2, (K_gate // UE_VECTOR_SIZE) * 2)
 
         self._decode_shard_w = {}
-        per_engine_bytes = sum(cols * (d + s) for d, s in (_rows(L) for L in layers))
+        self._decode_shard_gate_w = {}
+        per_engine_bytes = sum(
+            rows * (d + s)
+            for L in layers
+            for rows, d, s in (_o_plan(L), _g_plan(L)))
         if per_engine_bytes > self.DECODE_SHARD_WEIGHT_STRIDE:
             raise MemoryError(
                 f"decode shard weights need {per_engine_bytes/(1024*1024):.1f} MiB "
                 f"per engine but the private slot is "
-                f"{self.DECODE_SHARD_WEIGHT_STRIDE/(1024*1024):.0f} MiB")
+                f"{self.DECODE_SHARD_WEIGHT_STRIDE/(1024*1024):.0f} MiB "
+                f"(arena {self.DECODE_SHARD_WEIGHT_ARENA/(1024*1024):.0f} MiB / "
+                f"{n_eng} engines)")
         t0 = time.perf_counter()
         for e in range(n_eng):
             cursor = self.DECODE_SHARD_WEIGHT_BASE + e * self.DECODE_SHARD_WEIGHT_STRIDE
-            row0 = e * cols
             for L in layers:
-                data_row, scale_row = _rows(L)
-                d_src = data_off0 + L * LWS + row0 * data_row
-                s_src = scale_off0 + L * LWS + row0 * scale_row
-                d_len, s_len = cols * data_row, cols * scale_row
-                d_addr = cursor
-                self.dma_write(DMA_DEVICE_H2C, d_addr,
-                               self.weight_bin[d_src: d_src + d_len], d_len)
-                cursor += d_len
-                s_addr = cursor
-                self.dma_write(DMA_DEVICE_H2C, s_addr,
-                               self.weight_bin[s_src: s_src + s_len], s_len)
-                cursor += s_len
-                self._decode_shard_w[(L, e)] = (d_addr, s_addr)
-        print(f"[decode shard] staged O-proj rows for {n_eng} engine(s) x "
-              f"{len(layers)} layer(s): N={N} -> {cols} rows/engine, "
+                for store, plan, data_off0, scale_off0 in (
+                        (self._decode_shard_w, _o_plan, o_data_off0, o_scale_off0),
+                        (self._decode_shard_gate_w, _g_plan, g_data_off0, g_scale_off0)):
+                    rows, data_row, scale_row = plan(L)
+                    row0 = e * rows
+                    d_src = data_off0 + L * LWS + row0 * data_row
+                    s_src = scale_off0 + L * LWS + row0 * scale_row
+                    d_len, s_len = rows * data_row, rows * scale_row
+                    d_addr = cursor
+                    self.dma_write(DMA_DEVICE_H2C, d_addr,
+                                   self.weight_bin[d_src: d_src + d_len], d_len)
+                    cursor += d_len
+                    s_addr = cursor
+                    self.dma_write(DMA_DEVICE_H2C, s_addr,
+                                   self.weight_bin[s_src: s_src + s_len], s_len)
+                    cursor += s_len
+                    store[(L, e)] = (d_addr, s_addr)
+        print(f"[decode shard] staged O-proj + MLP-gate rows for {n_eng} engine(s) "
+              f"x {len(layers)} layer(s): o_proj N={self.vector_length} -> "
+              f"{o_cols} rows/engine, gate N={self.mlp_elements}/"
+              f"{self.mlp_elements_wide} -> {self.mlp_elements // n_eng}/"
+              f"{self.mlp_elements_wide // n_eng} rows/engine, "
               f"{per_engine_bytes/(1024*1024):.2f} MiB private per engine "
               f"@0x{self.DECODE_SHARD_WEIGHT_BASE:X} stride "
               f"{self.DECODE_SHARD_WEIGHT_STRIDE/(1024*1024):.0f} MiB "
@@ -1720,26 +1732,17 @@ class Gemma4LMMixin:
                 f"[{self.group_size}, {self.MAX_CONTEXT_SIZE}], got "
                 f"{accounting_seq_len}")
 
-        # Decode-stage smoke-test scheduler (None unless --decode-shard-dummy).
-        # Bound once here so the per-layer emission below is a cheap None check.
-        _decode_sched = getattr(self, "_active_decode_scheduler", None)
-        # 8 KiB copied per engine per layer: big enough to be a real DMA, small
-        # enough to stay far inside the 1 MiB private slot (src and dst halves).
-        _DUMMY_ELEMS = 4096
-        _DUMMY_HALF = 0x80000
-        # Real decode sharding (--decode-shard-oproj): the slave engines whose
-        # capture buffers compile_gemma4 opened for us. Scheduler-free -- each
-        # one is an independent program, exactly like the reference test.
+        # Decode sharding (--decode-shard-oproj): the slave engines whose capture
+        # buffers compile_gemma4 opened for us. Scheduler-free -- each one is an
+        # independent program, exactly like the reference test.
         _decode_workers = list(getattr(self, "_active_decode_workers", []) or [])
         _shard_gate_layers = set(self._decode_shard_layers())
         _shard_gate = bool(_shard_gate_layers) and bool(_decode_workers)
-        _decode_dummy = (getattr(self, "decode_shard_dummy", False)
-                         and _decode_sched is not None)
-        if _shard_gate and not self._decode_shard_w:
+        if _shard_gate and not (self._decode_shard_w and self._decode_shard_gate_w):
             raise RuntimeError(
                 "--decode-shard-oproj: call stage_decode_shard_weights() before "
                 "compile_decoder() -- the sharded program bakes each engine's "
-                "private weight addresses")
+                "private weight addresses for BOTH the o_proj and the mlp gate")
 
         self._set_silent(True)
         self._loud(f"  Emitting dynamic-PBI decoder: 1 segment x {layer_size} layers, attention=unified-inline")
@@ -2082,48 +2085,60 @@ class Gemma4LMMixin:
 
                 _checkpoint(f"L{layer_idx}_o_proj")
 
-                # ---- decode-stage multi-engine SMOKE TEST (--decode-shard-dummy)
-                # Open a barrier-joined region across every engine for the MLP
-                # phase. The MASTER's MLP emission below is untouched (it is
-                # engine 0 == self), so decode numerics are bit-identical; the
-                # SLAVES run a dummy DRAM->SRAM->DRAM memcpy in their own private
-                # 1 MiB scratch, which nothing else reads. This exercises exactly
-                # the plumbing real decode sharding needs -- worker program
-                # compiled in the same capture session, per-token launch, and the
-                # entry/exit rendezvous -- without changing any result.
-                if _decode_dummy:
-                    _dummy_ctxs = _decode_sched.begin_sharded(self.multi_core)
-                    for _ctx in _dummy_ctxs[1:]:
-                        # unsafe_ue: SRAM<->DRAM marshalling is deliberately NOT
-                        # in SHARDED_OP_ALLOWLIST. Here it is safe only because
-                        # the copy is confined to this engine's own private
-                        # dummy scratch and nothing reads the result.
-                        _w = _ctx.unsafe_ue
-                        _src = (self.DECODE_DUMMY_SCRATCH_BASE
-                                + (_ctx.engine_idx - 1) * self.DECODE_DUMMY_SCRATCH_STRIDE)
-                        _w.accelerator_memory_to_sram(
-                            accelerator_dram_address=_src, sram_address=0x10000,
-                            element_size=_DUMMY_ELEMS)
-                        _w.sram_to_accelerator_memory(
-                            sram_address=0x10000,
-                            accelerator_dram_address=_src + _DUMMY_HALF,
-                            element_size=_DUMMY_ELEMS)
+                # MLP GATE projection, N-sharded exactly like the O projection
+                # above: same _decode_shard_region, same private-weight rule.
+                # N here is cur_mlp -- 6144 on the narrow layers, 12288 on the
+                # wide ones -- so this is 4x/8x the weight traffic of the O-proj
+                # and the bigger prize. At M=1 the output row is contiguous, so
+                # engine e writes columns [e*cols, (e+1)*cols) of
+                # LAYER0_MLP_GATE_DRAM directly and the eltwise-mul against
+                # MLP_UP downstream reads the reassembled row. GELU is applied
+                # inside the kernel, per element, so it shards with the columns.
+                if _shard_gate and layer_idx in _shard_gate_layers:
+                    _g_cols = cur_mlp // self.multi_core
 
-                total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
-                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
-                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                    data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
-                    gelu_enable=True,
-                    )
+                    def _emit_gate_shard(_ue, _e, _N=cur_mlp, _L=layer_idx):
+                        """Engine _e's gate column block, into ITS OWN program."""
+                        _d_addr, _s_addr = self._decode_shard_gate_w[(_L, _e)]
+                        _out = (self.LAYER0_MLP_GATE_DRAM
+                                + _e * _g_cols * self.bytes_per_element)
+                        if self.decode_kernel == "matmatmul":
+                            _m_reg = self._decode_shard_m_regs[_e]
+                            _ue.generate_instruction_add_set(_m_reg, 1)
+                            _ue.matmat_mul_core(
+                                M=1, K=self.vector_length, N=_g_cols,
+                                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                                B_DRAM_ADDR=_d_addr, OUTPUT_DRAM_ADDR=_out,
+                                SCALE_DRAM_ADDR=_s_addr, is_B_quantized=True,
+                                data_type=TYPE.IF4, gelu_enable=True,
+                                gpr_M_reg=_m_reg)
+                        else:
+                            _ue.quantized_matmat_core(
+                                M=1, K=self.vector_length, N=_g_cols,
+                                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                                B_DRAM_ADDR=_d_addr, OUTPUT_DRAM_ADDR=_out,
+                                SCALE_DRAM_ADDR=_s_addr, data_type=TYPE.IF4,
+                                gelu_enable=True)
+
+                    self._decode_shard_region(_decode_workers, _emit_gate_shard)
+                    total_flops += 2 * self.vector_length * cur_mlp
+                else:
+                    total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
+                        A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
+                        data_type=TYPE.IF4,
+                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
+                        gelu_enable=True,
+                        )
 
                 # Phase boundary so --profile times the gate projection ON ITS
-                # OWN (L*_mlp then covers up + eltwise-mul + down). This is the
-                # op --decode-shard-oproj shards, so this checkpoint is what shows
-                # its speedup. Emitted on BOTH branches, and placed at the
-                # sharded-region boundary (never inside one), which is what
-                # _profile_execute requires of a multi-engine checkpoint.
+                # OWN (L*_mlp then covers up + eltwise-mul + down). The gate is
+                # sharded above, so this phase is where its speedup shows --
+                # and unlike o_proj the span holds nothing but the projection.
+                # Placed at the sharded-region boundary (never inside one),
+                # which is what _profile_execute requires of a multi-engine
+                # checkpoint.
                 _checkpoint(f"L{layer_idx}_mlp_gate")
                 total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
@@ -2163,14 +2178,6 @@ class Gemma4LMMixin:
                 self.eltwise_add_core(_vec_a, _vec_b, _vec_a, self.vector_length)
                 self.sram_to_accelerator_memory(
                     _vec_a, self.LAYER0_OUTPUT_DRAM, self.vector_length)
-
-                # Close the smoke-test region: the exit rendezvous makes the
-                # master wait for every slave's dummy copy, so a desynced or
-                # never-launched worker shows up as a hang here rather than as
-                # silently wrong numerics later. Must use the SAME condition as
-                # the open above, or the region is left unbalanced.
-                if _decode_dummy:
-                    _decode_sched.end_sharded(join=True)
 
                 _checkpoint(f"L{layer_idx}_mlp")
 

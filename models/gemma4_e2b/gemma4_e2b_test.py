@@ -823,8 +823,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     def __init__(self, script_dir: str | None = None,
                  vision_kernel: str = "matmatmul", prefill_kernel: str = "streaming",
                  decode_kernel: str = "streaming", multi_core: int = 1,
-                 bin_reuse: bool = False, decode_shard_dummy: bool = False,
-                 decode_shard_oproj: bool = False):
+                 bin_reuse: bool = False, decode_shard_oproj: bool = False):
         for stage, kernel in (("vision", vision_kernel), ("prefill", prefill_kernel),
                               ("decode", decode_kernel)):
             if kernel not in ("streaming", "matmatmul"):
@@ -853,23 +852,17 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # Program-image reuse: OFF by default (recompile programs.bin fresh every
         # run). --bin-reuse opts into reusing a matching cached section instead.
         self.bin_reuse = bin_reuse
-        # Decode-stage multi-engine SMOKE TEST: workers run a dummy memcpy inside
-        # a barrier-joined region at each layer's MLP phase while the master runs
-        # the real MLP unchanged. Proves the decode-stage fork/join plumbing
-        # (worker program compile + per-token launch + rendezvous) before any
-        # real decode work is sharded. Decode numerics MUST be bit-identical
-        # with it on and off.
-        self.decode_shard_dummy = decode_shard_dummy and multi_core > 1
-        # Decode-stage REAL sharding: the O projection (attention output,
-        # N=1536 on every layer) is split along N -- rows of the weight --
-        # across every engine, each reading its own private copy.
+        # Decode-stage sharding: the O projection (attention output, N=1536 on
+        # every layer) and the MLP gate (N=cur_mlp) are each split along N --
+        # rows of the weight -- across every engine, each reading its own
+        # private copy.
         self.decode_shard_oproj = decode_shard_oproj and multi_core > 1
-        self._decode_shard_w = {}      # (layer_idx, engine) -> (data, scale)
+        self._decode_shard_w = {}        # o_proj: (layer_idx, engine) -> (data, scale)
+        self._decode_shard_gate_w = {}   # mlp gate: same keying
         self._multi_core_schedulers = {}
         self._multi_core_worker_pool = None
         self._prefill_shard_m_regs = None
         self._decode_shard_m_regs = None
-        self._active_decode_scheduler = None   # --decode-shard-dummy only
         self._active_decode_workers = []       # --decode-shard-oproj slave engines
         engine_base = user_dma_core.UE_0_BASE_ADDR
         # Gemma4 DRAM layout. ONE map, used at every engine count: the
@@ -898,12 +891,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         #   Worker ISA slots  : 0x80000000 – 0x8C000000  (16 MiB x 12 engines)
         #   Vision attn scr   : 0x90000000 – 0x9C000000  (16 MiB x 12; 13.12 used)
         #   Prefill attn scr  : 0x9C000000 – 0xA0000000  ( 4 MiB x 12;  1.50 used)
-        #   Decode dummy scr  : 0xA0000000 – 0xA0C00000  ( 1 MiB x 12; smoke
-        #                        test only, --decode-shard-dummy)
-        #   Decode shard wts  : 0xA1000000 – 0xB5000000  (320 MiB arena, split
+        #   Decode shard wts  : 0xA0000000 – 0xB8000000  (384 MiB arena, split
         #                        arena/N per core: private copy of the sharded
-        #                        MLP gate weight rows, all 35 layers)
-        #   Reserved          : 0xB5000000 – 0x100000000 (1.17 GiB, future)
+        #                        O-proj + MLP-gate weight rows, all 35 layers)
+        #   Reserved          : 0xB8000000 – 0x100000000 (1.13 GiB, future)
         # Slot 0 of each scratch arena belongs to core 0, which keeps using its
         # own tensor-arena buffer; the slot is left reserved so engine index ==
         # slot index and the addressing needs no special case.
@@ -921,8 +912,6 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self.VISION_ATTN_SCRATCH_STRIDE  = 0
             self.PREFILL_ATTN_SCRATCH_BASE   = None          # unused (1-core)
             self.PREFILL_ATTN_SCRATCH_STRIDE = 0
-            self.DECODE_DUMMY_SCRATCH_BASE   = None          # unused (1-core)
-            self.DECODE_DUMMY_SCRATCH_STRIDE = 0
             self.DECODE_SHARD_WEIGHT_BASE    = None          # unused (1-core)
             self.DECODE_SHARD_WEIGHT_ARENA   = 0
             self.DECODE_SHARD_WEIGHT_STRIDE  = 0
@@ -944,23 +933,20 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self.VISION_ATTN_SCRATCH_STRIDE  = 0x01000000    # 16 MiB / engine
             self.PREFILL_ATTN_SCRATCH_BASE   = 0x9C000000
             self.PREFILL_ATTN_SCRATCH_STRIDE = 0x00400000    # 4 MiB / engine
-            # Decode worker DUMMY scratch (--decode-shard-dummy smoke test only;
-            # nothing the model reads ever lives here).
-            self.DECODE_DUMMY_SCRATCH_BASE   = 0xA0000000
-            self.DECODE_DUMMY_SCRATCH_STRIDE = 0x00100000    # 1 MiB / engine
-            # PRIVATE per-core decode weight copies. Decode N-shards the wide
-            # MLP gate: every engine owns its own row block of that weight, so
-            # the N engines never read the same DRAM segment concurrently.
-            # The arena is FIXED and the per-engine slot is arena/N, because the
-            # total staged is one redistributed copy of the weight no matter how
-            # many engines split it: ALL 35 layers = 263.0 MiB (15 narrow
-            # N=6144 -> 71.7 MiB, 20 wide N=12288 -> 191.2 MiB). A fixed
-            # per-engine slot would be wrong at both ends -- 64 MiB overflows at
-            # 2 cores and wastes most of itself at 8.
-            #   2 cores: 160 MiB/engine (131.5 used) | 4: 80 (65.7)
-            #   8 cores:  40 MiB/engine ( 32.9 used) | 12: 26.7 (21.9)
-            self.DECODE_SHARD_WEIGHT_BASE    = 0xA1000000
-            self.DECODE_SHARD_WEIGHT_ARENA   = 0x14000000    # 320 MiB total
+            # PRIVATE per-core decode weight copies. Decode N-shards the O
+            # projection and the MLP gate: every engine owns its own row block of
+            # each weight, so the N engines never read the same DRAM segment
+            # concurrently. The arena is FIXED and the per-engine slot is
+            # arena/N, because the total staged is one redistributed copy of
+            # those weights no matter how many engines split it. ALL 35 layers:
+            #   mlp gate 263.0 MiB (15 narrow N=6144 -> 71.7, 20 wide
+            #     N=12288 -> 191.2)  +  o_proj 66.9 MiB  =  329.9 MiB total.
+            # A fixed per-engine slot would be wrong at both ends -- it overflows
+            # at 2 cores and wastes most of itself at 8.
+            #   2 cores: 192 MiB/engine (165.0 used) | 4: 96 (82.5)
+            #   8 cores:  48 MiB/engine ( 41.2 used) | 12: 32 (27.5)
+            self.DECODE_SHARD_WEIGHT_BASE    = 0xA0000000
+            self.DECODE_SHARD_WEIGHT_ARENA   = 0x18000000    # 384 MiB total
             self.DECODE_SHARD_WEIGHT_STRIDE  = (
                 self.DECODE_SHARD_WEIGHT_ARENA // self.multi_core) & ~0xFFF
         # Top of the vision tensor arena (vision weights are top-placed against
@@ -1331,12 +1317,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             decoder_count_at_start = self.capture_count
             decoder_accounting_seq_len = (
                 (len(self.prefill_seq) + 63) // 64) * 64
-            # Decode-stage SMOKE TEST (--decode-shard-dummy) only: its own
-            # scheduler stage, so its worker programs get their own addresses
-            # after prefill's in each worker slot (never on top of them). The
-            # real O-proj shard below does NOT use the scheduler.
-            decode_scheduler = self._ensure_decode_scheduler()
-            # Real decode sharding (--decode-shard-oproj): one INDEPENDENT
+            # Decode sharding (--decode-shard-oproj): one INDEPENDENT
             # program per core, emitted inline, following
             # quantized_matmat_mul_multi_cores_test in user_hw_test.py. The
             # engine objects come from the run-wide pool so their program
@@ -1346,20 +1327,13 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             # compiled: the sharded program bakes each engine's own addresses.
             if getattr(self, "decode_shard_oproj", False):
                 self.stage_decode_shard_weights()
-            if decode_scheduler is not None:
-                decode_scheduler.begin_program()
-                # One M register per engine, holding M=1 -- the two-pass
-                # matmat_mul_core needs a dimension GPR. Mirrors prefill's
-                # _prefill_shard_m_regs.
-                self._decode_shard_m_regs = [self.alloc_isa_reg()]
-                self._decode_shard_m_regs.extend(
-                    w.alloc_isa_reg() for w in decode_scheduler.workers)
-                self._active_decode_scheduler = decode_scheduler
             if decode_workers:
                 # Open one capture per slave HERE and close it below: the shard
                 # bodies in compile_decoder emit straight into these buffers,
                 # the way the reference test captures each engine's program in
-                # its own start_capture()/stop_capture() pair.
+                # its own start_capture()/stop_capture() pair. One M register per
+                # engine, holding M=1 -- the two-pass matmat_mul_core needs a
+                # dimension GPR. Mirrors prefill's _prefill_shard_m_regs.
                 for _w in decode_workers:
                     _w.clear_capture_buffer()
                     _w.reset_isa_reg_counter()
@@ -1374,20 +1348,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 accounting_seq_len=decoder_accounting_seq_len)
             decoder_program_addr = instruction_base_addr + decoder_count_at_start * INSTRUCTION_SIZE_BYTES
             decoder_size_bytes = decoder_program_sizes[0]
-            decode_worker_addrs = (decode_scheduler.finalize()
-                                   if decode_scheduler is not None else [])
             # Snapshot for the same reason as prefill above: any stage compiled
             # after this one would clear these shared capture buffers.
-            decode_worker_images = (
-                [b"".join(inst.get_bytes() for inst in w.capture_buffer)
-                 for w in decode_scheduler.workers]
-                if decode_scheduler is not None else [])
-            self._active_decode_scheduler = None
-            if decode_scheduler is not None:
-                for _w in reversed(decode_scheduler.workers):
-                    _w.release_isa_reg()
-                self.release_isa_reg()
-                self._decode_shard_m_regs = None
+            decode_worker_addrs = []
+            decode_worker_images = []
             if decode_workers:
                 # Close each slave program the way the reference does: terminal
                 # HALT, stop_capture, flush to that engine's OWN program DRAM
@@ -2092,18 +2056,13 @@ def add_engine_args(parser) -> None:
                              "matmatmul.")
     parser.add_argument("--dev", type=str, default="xdma0",
                         help="DMA device name (e.g., xdma0, xdma1, efinix). Default: xdma0")
-    parser.add_argument("--decode-shard-dummy", action="store_true",
-                        help="Decode-stage multi-engine smoke test: slave cores run a "
-                             "dummy memcpy at each layer's MLP phase while the master "
-                             "runs the real MLP. Verifies decode fork/join plumbing; "
-                             "decoded text must be unchanged. Requires --multi-core.")
     parser.add_argument("--decode-shard-oproj", action="store_true",
-                        help="Shard the O projection (attention output, N=1536) across "
-                             "every engine in decode, split along N (weight rows). It is "
-                             "the only matmul in its phase. Each core reads a private copy "
-                             "of its row block, so the engines never contend on one weight "
-                             "segment. Requires --multi-core with an engine count dividing "
-                             "N/64=24: 2, 3, 4, 6, 8 or 12. Defaults to layer 0 only; set "
+                        help="Shard the decode O projection (N=1536) and MLP gate "
+                             "(N=6144/12288) across every engine, split along N (weight "
+                             "rows). Each core reads a private copy of its row block, so "
+                             "the engines never contend on one weight segment. Requires "
+                             "--multi-core with an engine count dividing N/64 for both: "
+                             "2, 3, 4, 6, 8 or 12. Defaults to layer 0 only; set "
                              "GEMMA4_SHARD_LAYERS=all to widen.")
     parser.add_argument("--bin-reuse", action="store_true",
                         help="Reuse a matching cached program image (programs.bin) if it "
@@ -2130,13 +2089,8 @@ def resolve_engine_config(parser, args) -> dict:
         args.prefill_kernel = "matmatmul"
     if args.multi_core > 1 and args.vision_kernel != "matmatmul":
         parser.error("--multi-core currently requires --vision-kernel matmatmul")
-    if args.decode_shard_dummy and args.multi_core < 2:
-        parser.error("--decode-shard-dummy requires --multi-core (it needs slave cores)")
     if args.decode_shard_oproj and args.multi_core < 2:
         parser.error("--decode-shard-oproj requires --multi-core (it needs slave cores)")
-    if args.decode_shard_oproj and args.decode_shard_dummy:
-        parser.error("--decode-shard-oproj and --decode-shard-dummy are mutually exclusive: "
-                     "the dummy memcpy occupies the same MLP-phase region")
 
     if os.environ.get("GEMMA4_PENALTY", "0") == "1":
         parser.error(
@@ -2196,7 +2150,6 @@ def resolve_engine_config(parser, args) -> dict:
         decode_kernel=args.decode_kernel,
         multi_core=args.multi_core,
         bin_reuse=args.bin_reuse,
-        decode_shard_dummy=args.decode_shard_dummy,
         decode_shard_oproj=args.decode_shard_oproj,
     )
 
