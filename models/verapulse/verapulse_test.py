@@ -304,6 +304,10 @@ _VARIANTS = {
     # -- with only the action expert retrained, against a quick_gelu backbone so the
     # expert consumes the features this silicon actually produces.
     "smolvla_qg": "verapulse_smolvla_qg_config.json",
+    # Stock-gelu backbone (smolvla_base + HF SmolVLM2), so it is NOT in
+    # NATIVE_QUICK_GELU -- the FPGA's quick_gelu substitutes for the trained
+    # gelu_pytorch_tanh here rather than matching it.
+    "smolvla_lid": "verapulse_smolvla_lid_config.json",
 }
 
 # Variants whose weights were TRAINED in the accelerator's activation, so quick_gelu is
