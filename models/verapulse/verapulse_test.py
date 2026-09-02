@@ -9862,16 +9862,25 @@ def _upstream_prefix_gate(ue, images, token_ids, text_mask, hidden, kv):
     if up_hidden.shape[0] != ue._prefix_valid_len:
         vnote(f"row count differs: upstream keeps {ids.numel()-int(m.sum())} padded text "
               f"slots as real rows, the device packs them out -- valid rows only.")
-    n = min(valid, int(ue._prefix_valid_len))
+    # SELECT UPSTREAM'S VALID ROWS BY THE MASK, not its first n rows. Upstream keeps the
+    # padded text slots as real rows and positions around them (pos = cumsum(pad) - 1);
+    # the device PACKS them out. prefix_order is images_text_state, so the pads are
+    # INTERIOR -- the state row sits after them. Slicing [:n] therefore lines the
+    # device's state row up against an upstream PAD row and drops upstream's state row
+    # entirely, scoring different tokens against each other. That is a metric bug, not a
+    # model error, and it reads as a broken prefix.
+    sel = pad[0].bool()
+    up_valid = up_hidden[sel]
+    n = min(valid, int(ue._prefix_valid_len), up_valid.shape[0])
     hw = torch.as_tensor(hidden).float()[:n]
-    report("prefix hidden", hw, up_hidden[:n], threshold=20.0)
+    report("prefix hidden", hw, up_valid[:n], threshold=20.0)
     # KV: upstream stores [B, S, n_kv, D]; device gives [n_kv, S, D] per layer
     worst = 1.0
     # Derived from actual depth: the literal (0, 1, 15, 31) was pulsevla's 32 layers and
     # raised IndexError on any 16-layer checkpoint.
     _nl = min(len(kv), len(kvu))
     for li in sorted({0, min(1, _nl - 1), _nl // 2, _nl - 1}):
-        ku, vu = kvu[li][0][:, :n], kvu[li][1][:, :n]          # [n_kv, n, 64]
+        ku, vu = kvu[li][0][:, sel][:, :n], kvu[li][1][:, sel][:, :n]   # [n_kv, n, 64]
         kh, vh = torch.as_tensor(kv[li][0])[:, :n], torch.as_tensor(kv[li][1])[:, :n]
         ck, cv = cos_sim(kh, ku), cos_sim(vh, vu)
         worst = min(worst, ck, cv)
