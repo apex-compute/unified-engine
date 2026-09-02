@@ -1512,7 +1512,6 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         lines.append("")
         lines.append(f"- **HW version:** {hw_version_str}")
         lines.append(f"- **--dev:** {args.dev}")
-        lines.append(f"- **--device:** {args.device}")
         lines.append(f"- **Clock / frequency:** {clock_ns:.1f} ns ({freq_mhz:.1f} MHz)")
         lines.append(f"- **Cores (--multi-core):** {cores}")
         lines.append(f"- **Peak throughput:** {peak_gflops:.1f} GFLOPS "
@@ -1668,7 +1667,6 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "",
             f"- **HW version:** {hw_version_str}",
             f"- **--dev:** {args.dev}",
-            f"- **--device:** {args.device}",
             f"- **Clock / frequency:** {clock_ns:.1f} ns ({freq_mhz:.1f} MHz)",
             f"- **Cores (--multi-core):** {cores}",
             f"- **Peak throughput:** {peak_gflops:.1f} GFLOPS "
@@ -1994,11 +1992,12 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
 
 # --- Shared engine CLI/config -------------------------------------------------
 # add_engine_args + resolve_engine_config are the SINGLE source of truth for the
-# kernel/device knobs, their validation, and the device->AXI->clock wiring.
+# kernel + DMA knobs and their validation. There is no board-profile flag: clock,
+# AXI width, DRAM size and engine count all come from HW_INFO.
 # gemma4_e2b_numeric.py imports this module and calls both, so anything changed
 # here is reflected there automatically (no second arg-parser to keep in sync).
 def add_engine_args(parser) -> None:
-    """Register the kernel + device knobs shared by every gemma4_e2b entrypoint."""
+    """Register the kernel + DMA knobs shared by every gemma4_e2b entrypoint."""
     parser.add_argument("--vision-kernel", choices=("streaming", "matmatmul"),
                         default="matmatmul",
                         help="Quantized projection kernel for FPGA vision (default: matmatmul).")
@@ -2015,12 +2014,7 @@ def add_engine_args(parser) -> None:
                              "reports in HW_INFO (max 12). Multicore prefill always uses "
                              "matmatmul.")
     parser.add_argument("--dev", type=str, default="xdma0",
-                        help="DMA device name (e.g., xdma0, xdma1). Default: xdma0")
-    parser.add_argument("--device", type=str, default="kintex7",
-                        help="FPGA board profile. Only needed for 'efinix' (it "
-                             "selects a different DMA device name); clock, AXI "
-                             "width and engine count all come from HW_INFO, so "
-                             "this flag no longer gates anything else.")
+                        help="DMA device name (e.g., xdma0, xdma1, efinix). Default: xdma0")
     parser.add_argument("--decode-shard-dummy", action="store_true",
                         help="Decode-stage multi-engine smoke test: slave cores run a "
                              "dummy memcpy at each layer's MLP phase while the master "
@@ -2041,8 +2035,8 @@ def add_engine_args(parser) -> None:
 
 
 def resolve_engine_config(parser, args) -> dict:
-    """Validate the shared knobs, wire device->AXI->clock, sync DMA globals, and
-    return the kwargs dict for ``Gemma4_UnifiedEngine(...)``.
+    """Validate the shared knobs against HW_INFO, sync DMA globals, and return
+    the kwargs dict for ``Gemma4_UnifiedEngine(...)``.
 
     Entrypoint-only cross-checks (``--profile`` vs ``--multi-core``,
     ``--vision-host`` requires ``--image``, etc.) stay in each ``main()``, before
@@ -2053,8 +2047,7 @@ def resolve_engine_config(parser, args) -> dict:
         parser.error("--multi-core must be between 1 and 12")
     # No board-name gate on the engine count: the number of engines the board
     # actually has is read from HW_INFO (ANDROMEDA_CORE_COUNT) and checked below,
-    # after the hardware read. A --device allowlist could only ever be a stale
-    # proxy for it.
+    # after the hardware read.
     if args.multi_core > 1:
         # Multicore prefill only has a matmatmul (two-pass) shard path.
         args.prefill_kernel = "matmatmul"
@@ -2073,8 +2066,7 @@ def resolve_engine_config(parser, args) -> dict:
             "GEMMA4_PENALTY=1 is temporarily unsupported; dynamic streaming "
             "quantized_matmat_core needs broadcast-bias support first")
 
-    dma_name = "efinix" if args.device == "efinix" else args.dev
-    set_dma_device(dma_name)
+    set_dma_device(args.dev)
     # Refresh DMA_DEVICE_* on every loaded gemma4_e2b_* module (they import the
     # names by value). Covers test/lm/vision/audio without a hand-kept list.
     for _name, _mod in list(sys.modules.items()):
@@ -2085,15 +2077,15 @@ def resolve_engine_config(parser, args) -> dict:
 
     user_dma_core.configure_clock_from_hardware()
 
-    # Everything board-dependent is now decided by HW_INFO, not by --device.
+    # Everything board-dependent is decided by HW_INFO.
     # Engine count: the board reports how many cores it has.
     _cores = user_dma_core.ANDROMEDA_CORE_COUNT
     if _cores and args.multi_core > _cores:
         parser.error(
             f"--multi-core {args.multi_core} exceeds the {_cores} engine(s) this "
             f"board reports in HW_INFO")
-    # AXI width: read from HW_INFO (user_dma_core populates it there and states
-    # it has no board-name mapping by design). Gemma4 vision has K <= 3072, so
+    # AXI width: read from HW_INFO (user_dma_core populates it there and has no
+    # board-name mapping by design). Gemma4 vision has K <= 3072, so
     # its two-pass kernel stays valid on 512-bit AXI; LM prefill and decode
     # include wide MLP-down K=12288 and cannot select matmatmul there.
     _axi_width_bits = user_dma_core.UE_AXI_DATA_WIDTH_BITS
@@ -2110,9 +2102,8 @@ def resolve_engine_config(parser, args) -> dict:
             + (" (multi-core forces prefill to matmatmul)"
                if args.multi_core > 1 else ""))
 
-    print(f"FPGA profile: device={args.device}")
     print(user_dma_core.hardware_info_summary())
-    print(f"Using DMA device: {dma_name}")
+    print(f"Using DMA device: {args.dev}")
     print(f"  H2C: {user_dma_core.DMA_DEVICE_H2C}")
     print(f"  C2H: {user_dma_core.DMA_DEVICE_C2H}")
     print(f"  USER: {user_dma_core.DMA_DEVICE_USER}")
@@ -2172,10 +2163,10 @@ default prompt: "x+3=5, what is x?"
 
 def run_summary_filename(args) -> str:
     """Build the per-run summary .md filename encoding the full CLI config, e.g.
-    ``--dev xdma0 --device alveo --image --multi-core 2`` ->
-    ``gemma4_e2b_test_xdma0_alveo_image_multi-core_2.md``.
+    ``--dev xdma0 --image --multi-core 2`` ->
+    ``gemma4_e2b_test_xdma0_image_multi-core_2.md``.
 
-    dev / device / mode are always present (in that order); every other engine
+    dev / mode are always present (in that order); every other engine
     knob is appended only when it differs from its default, so a plain LM run
     stays short. Call this BEFORE resolve_engine_config(), which mutates
     args.prefill_kernel for multi-core — otherwise an auto-forced kernel would
@@ -2187,7 +2178,7 @@ def run_summary_filename(args) -> str:
         mode = "image"
     else:
         mode = "lm"
-    tokens = [args.dev, args.device, mode]
+    tokens = [args.dev, mode]
     if args.image and args.vision_host:
         tokens.append("vision-host")
     if args.multi_core != 1:

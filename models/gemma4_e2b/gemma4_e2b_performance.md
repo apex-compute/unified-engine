@@ -27,17 +27,17 @@ weights, 35 LM layers, 16 vision layers, and 256 image soft tokens.
 Commands:
 
 ```bash
-python models/gemma4_e2b/gemma4_e2b_test.py --device rk_256 --dev xdma0 --image
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 --image
 
-python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image
-python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --multi-core 2
-python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image
-python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core 2
-python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core 4
-python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core 8
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma1 --image
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma1 --image --multi-core 2
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 --image
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 --image --multi-core 2
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 --image --multi-core 4
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 --image --multi-core 8
 
-python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --profile
-python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --multi-core --profile
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma1 --image --profile
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma1 --image --multi-core --profile
 ```
 
 ## Performance comparison
