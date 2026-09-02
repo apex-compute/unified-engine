@@ -1387,7 +1387,6 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         lines.append("")
         lines.append(f"- **HW version:** {hw_version_str}")
         lines.append(f"- **--dev:** {args.dev}")
-        lines.append(f"- **--device:** {args.device}")
         lines.append(f"- **Clock / frequency:** {clock_ns:.1f} ns ({freq_mhz:.1f} MHz)")
         lines.append(f"- **Cores (--multi-core):** {cores}")
         lines.append(f"- **Peak throughput:** {peak_gflops:.1f} GFLOPS "
@@ -1547,7 +1546,6 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "",
             f"- **HW version:** {hw_version_str}",
             f"- **--dev:** {args.dev}",
-            f"- **--device:** {args.device}",
             f"- **Clock / frequency:** {clock_ns:.1f} ns ({freq_mhz:.1f} MHz)",
             f"- **Cores (--multi-core):** {cores}",
             f"- **Peak throughput:** {peak_gflops:.1f} GFLOPS "
@@ -1869,11 +1867,13 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
 
 # --- Shared engine CLI/config -------------------------------------------------
 # add_engine_args + resolve_engine_config are the SINGLE source of truth for the
-# kernel/device knobs, their validation, and the device->AXI->clock wiring.
+# kernel knobs and their validation. There is no board profile: AXI width, clock,
+# DRAM size and engine count all come from HW_INFO, exactly as user_hw_test.py
+# reads them.
 # gemma4_e2b_numeric.py imports this module and calls both, so anything changed
 # here is reflected there automatically (no second arg-parser to keep in sync).
 def add_engine_args(parser) -> None:
-    """Register the kernel + device knobs shared by every gemma4_e2b entrypoint."""
+    """Register the kernel + DMA knobs shared by every gemma4_e2b entrypoint."""
     parser.add_argument("--vision-kernel", choices=("streaming", "matmatmul"),
                         default="matmatmul",
                         help="Quantized projection kernel for FPGA vision (default: matmatmul).")
@@ -1886,14 +1886,11 @@ def add_engine_args(parser) -> None:
                              "(default: streaming).")
     parser.add_argument("--multi-core", nargs="?", const=2, default=1, type=int,
                         help="Enable multi-engine vision and LM prefill. Bare --multi-core "
-                             "selects 2 engines; up to 12 engines are supported on Alveo. "
+                             "selects 2 engines; the ceiling is the engine count HW_INFO "
+                             "reports for the loaded bitstream (max 12). "
                              "Multicore prefill always uses matmatmul.")
     parser.add_argument("--dev", type=str, default="xdma0",
-                        help="DMA device name (e.g., xdma0, xdma1). Default: xdma0")
-    parser.add_argument("--device", type=str, default="kintex7",
-                        help="FPGA board profile (kintex7, kintex7_systolic, rk, "
-                             "rk_256, puzhi, bittware, bittware_256, alveo, "
-                             "alveo_u55c, efinix).")
+                        help="DMA device name (e.g., xdma0, xdma1, efinix). Default: xdma0")
     parser.add_argument("--bin-reuse", action="store_true",
                         help="Reuse a matching cached program image (programs.bin) if it "
                              "exists instead of recompiling. Default: OFF (fresh compile "
@@ -1901,8 +1898,8 @@ def add_engine_args(parser) -> None:
 
 
 def resolve_engine_config(parser, args) -> dict:
-    """Validate the shared knobs, wire device->AXI->clock, sync DMA globals, and
-    return the kwargs dict for ``Gemma4_UnifiedEngine(...)``.
+    """Validate the shared knobs against HW_INFO, sync DMA globals, and return
+    the kwargs dict for ``Gemma4_UnifiedEngine(...)``.
 
     Entrypoint-only cross-checks (``--profile`` vs ``--multi-core``,
     ``--vision-host`` requires ``--image``, etc.) stay in each ``main()``, before
@@ -1911,34 +1908,20 @@ def resolve_engine_config(parser, args) -> dict:
     """
     if args.multi_core not in range(1, 13):
         parser.error("--multi-core must be between 1 and 12")
-    if args.multi_core > 2 and args.device != "alveo" and args.device != "alveo_u55c":
-        parser.error("--multi-core values above 2 are currently supported only on Alveo and Alveo U55C")
+    # The real ceiling is per-bitstream and comes from HW_INFO below, once the
+    # DMA device is selected and the registers are readable.
     if args.multi_core > 1:
         # Multicore prefill only has a matmatmul (two-pass) shard path.
         args.prefill_kernel = "matmatmul"
     if args.multi_core > 1 and args.vision_kernel != "matmatmul":
         parser.error("--multi-core currently requires --vision-kernel matmatmul")
 
-    axi_width_bits = 512 if args.device in ("bittware", "rk") else 256
-    # Gemma4 vision has K <= 3072, so its two-pass kernel remains valid on
-    # 512-bit AXI. LM prefill and decode include wide MLP-down K=12288 and
-    # therefore cannot select matmatmul on that hardware profile.
-    if axi_width_bits == 512 and (
-            args.prefill_kernel == "matmatmul" or args.decode_kernel == "matmatmul"):
-        requested = []
-        if args.prefill_kernel == "matmatmul":
-            requested.append("--prefill-kernel matmatmul")
-        if args.decode_kernel == "matmatmul":
-            requested.append("--decode-kernel matmatmul")
-        parser.error(
-            f"{' and '.join(requested)} unsupported: matmatmul is not supported "
-            "on the 512-bit AXI data path; use streaming.")
     if os.environ.get("GEMMA4_PENALTY", "0") == "1":
         parser.error(
             "GEMMA4_PENALTY=1 is temporarily unsupported; dynamic streaming "
             "quantized_matmat_core needs broadcast-bias support first")
 
-    dma_name = "efinix" if args.device == "efinix" else args.dev
+    dma_name = args.dev
     set_dma_device(dma_name)
     # Refresh DMA_DEVICE_* on every loaded gemma4_e2b_* module (they import the
     # names by value). Covers test/lm/vision/audio without a hand-kept list.
@@ -1948,9 +1931,34 @@ def resolve_engine_config(parser, args) -> dict:
                 if hasattr(_mod, _attr):
                     setattr(_mod, _attr, getattr(user_dma_core, _attr))
 
+    # HW_INFO is the sole source for clock, queue mode, AXI width, DRAM size and
+    # engine count (user_hw_test.py reads it the same way). Must run before any
+    # UnifiedEngine is constructed.
     user_dma_core.configure_clock_from_hardware()
 
-    print(f"FPGA profile: device={args.device}")
+    # Engine count: the board reports how many cores its bitstream has.
+    _cores = user_dma_core.ANDROMEDA_CORE_COUNT
+    if _cores and args.multi_core > _cores:
+        parser.error(
+            f"--multi-core {args.multi_core} exceeds the {_cores} engine(s) this "
+            f"board reports in HW_INFO")
+    # AXI width: also from HW_INFO (user_dma_core has no board-name mapping, by
+    # design). Gemma4 vision has K <= 3072, so its two-pass kernel stays valid on
+    # 512-bit AXI; LM prefill and decode include wide MLP-down K=12288 and cannot
+    # select matmatmul there.
+    _axi_width_bits = user_dma_core.UE_AXI_DATA_WIDTH_BITS
+    if _axi_width_bits == 512 and (
+            args.prefill_kernel == "matmatmul" or args.decode_kernel == "matmatmul"):
+        requested = []
+        if args.prefill_kernel == "matmatmul":
+            requested.append("--prefill-kernel matmatmul")
+        if args.decode_kernel == "matmatmul":
+            requested.append("--decode-kernel matmatmul")
+        parser.error(
+            f"{' and '.join(requested)} unsupported: matmatmul is not supported "
+            f"on the {_axi_width_bits}-bit AXI data path; use streaming.")
+
+
     print(user_dma_core.hardware_info_summary())
     print(f"Using DMA device: {dma_name}")
     print(f"  H2C: {user_dma_core.DMA_DEVICE_H2C}")
@@ -2001,7 +2009,7 @@ default prompt: "x+3=5, what is x?"
     parser.add_argument("--vision-host", action="store_true",
                         help="With --image, generate image soft-token embeddings on the host "
                              "with the HF vision tower; FPGA prefill/decode are unchanged.")
-    add_engine_args(parser)   # --vision-kernel/--prefill-kernel/--decode-kernel/--multi-core/--dev/--device/--cycle
+    add_engine_args(parser)   # --vision-kernel/--prefill-kernel/--decode-kernel/--multi-core/--dev
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile bin with per-phase HALT checkpoints and run one '
                              'profiled decode step; print a per-phase HW-latency breakdown.')
@@ -2010,10 +2018,10 @@ default prompt: "x+3=5, what is x?"
 
 def run_summary_filename(args) -> str:
     """Build the per-run summary .md filename encoding the full CLI config, e.g.
-    ``--dev xdma0 --device alveo --image --multi-core 2`` ->
+    ``--dev xdma0 --image --multi-core 2`` ->
     ``gemma4_e2b_test_xdma0_alveo_image_multi-core_2.md``.
 
-    dev / device / mode are always present (in that order); every other engine
+    dev / mode are always present (in that order); every other engine
     knob is appended only when it differs from its default, so a plain LM run
     stays short. Call this BEFORE resolve_engine_config(), which mutates
     args.prefill_kernel for multi-core — otherwise an auto-forced kernel would
@@ -2025,7 +2033,7 @@ def run_summary_filename(args) -> str:
         mode = "image"
     else:
         mode = "lm"
-    tokens = [args.dev, args.device, mode]
+    tokens = [args.dev, mode]
     if args.image and args.vision_host:
         tokens.append("vision-host")
     if args.multi_core != 1:
@@ -2046,7 +2054,7 @@ def main():
     parser = build_arg_parser()
     args = parser.parse_args()
     # Entrypoint-only cross-checks (reference test.py-specific flags); the shared
-    # kernel/device validation + wiring lives in resolve_engine_config().
+    # shared kernel validation + HW_INFO wiring lives in resolve_engine_config().
     if args.vision_host and not args.image:
         parser.error("--vision-host requires --image")
     if args.image and args.audio:
