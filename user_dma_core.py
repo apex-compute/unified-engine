@@ -74,9 +74,17 @@ UE_ARGMAX3_INDEX = 0x00000094
 UE_ARGMAX4_INDEX = 0x00000098
 UE_INT_REG = 0x0000009C  # bits [1:0] interrupt cause; write clears latch (axi_lite_*_module.sv)
 # UE_HW_INFO_ADDR is imported from andromeda_hw_info.py.
+# CONV2D / MAXPOOL geometry side registers (axi_reg_map_pkg.sv, matches andromeda.c).
+# Write-only legacy staging registers.  Newer queue-CONFIG RTL can shadow all
+# four values in instruction order; programs without CONFIG retain this CSR
+# fallback.
+UE_CONV_GEOM_ADDR = 0x0000006C     # [11:0] out_w, [23:12] out_h, [30:24] CT
+UE_CONV_CTRL_ADDR = 0x000000A4     # [3:0] kernel_w, [7:4] kernel_h, [23:8] oc_count
+UE_CONV_STRIDE_ADDR = 0x000000A8   # [11:0] row_stride, [23:12] col_stride
+UE_CONV_PIXSTEP_ADDR = 0x000000AC  # [11:0] pix_col_step, [23:12] pix_row_step
 # Backward compatibility: primary argmax readout (same as andromeda.c UE_ARGMAX1_INDEX)
 UE_ARGMAX_INDEX = UE_ARGMAX1_INDEX
-UE_LAST_REG_ADDR = UE_HW_INFO_ADDR  # last AXI-Lite offset for init scan
+UE_LAST_REG_ADDR = UE_HW_INFO_ADDR  # last readable init-scan register (UE_CONV_* are write-only)
 
 # queue_state_module.sv int_cause / andromeda.c INT_CAUSE_*
 INT_CAUSE_NONE = 0
@@ -194,6 +202,44 @@ def ue_assert_axi_beat_aligned_bytes(nbytes: int, what: str, hint: str = "") -> 
     )
 
 
+# Strided-DMA descriptor field widths (see :meth:`UnifiedEngine.ue_op_descriptor`):
+# stride_bytes_per_chunk rides ``output_size`` — w[4][31:28] (low 4 bits),
+# w[5][11:0], and the extension at descriptor bit 247 (w[7][23]) — 17 bits
+# total. stride_jump_bytes rides ``scalar`` — w[5][31:26] (low 6) plus
+# w[6][14:0] — 21 bits total. Both are range-checked before packing.
+UE_STRIDE_CHUNK_MAX_BYTES = (1 << 17) - 1
+UE_STRIDE_JUMP_MAX_BYTES = (1 << 21) - 1
+
+#: Bias+scratch ceiling for the dense VAE attention path
+#: (:meth:`UnifiedEngine.run_vae_attention_block`). The score matrix is
+#: O(seq^2), so the footprint grows quadratically in the pixel count: ~75 MB at
+#: the SD 512x512 mid-block (seq=4096) but ~1.1 GB at SDXL 1024x1024
+#: (seq=16384), over half the board's 2 GB. Past this the answer is a tiled /
+#: streaming-softmax attention, not a bigger allocation.
+VAE_ATTENTION_MAX_FOOTPRINT_MB = 256
+
+
+def ue_assert_stride_fields_fit(stride_bytes_per_chunk: int, stride_jump_bytes: int,
+                                what: str, hint: str = "") -> None:
+    """Assert the strided-DMA parameters fit their descriptor fields.
+
+    These fields are masked when packed, so reject oversized values before
+    descriptor construction rather than silently scattering to wrong addresses.
+    """
+    assert 0 <= stride_bytes_per_chunk <= UE_STRIDE_CHUNK_MAX_BYTES, (
+        f"{what}: stride_bytes_per_chunk={stride_bytes_per_chunk} does not fit the "
+        f"17-bit descriptor field (max {UE_STRIDE_CHUNK_MAX_BYTES}); it would be masked to "
+        f"{stride_bytes_per_chunk & UE_STRIDE_CHUNK_MAX_BYTES} and silently corrupt the transfer"
+        + (f"; {hint}" if hint else "")
+    )
+    assert 0 <= stride_jump_bytes <= UE_STRIDE_JUMP_MAX_BYTES, (
+        f"{what}: stride_jump_bytes={stride_jump_bytes} does not fit the 21-bit descriptor "
+        f"field (max {UE_STRIDE_JUMP_MAX_BYTES}); it would be masked to "
+        f"{stride_jump_bytes & UE_STRIDE_JUMP_MAX_BYTES} and silently corrupt the transfer"
+        + (f"; {hint}" if hint else "")
+    )
+
+
 # DMA device paths (can be overridden by command-line argument)
 DMA_DEVICE_H2C = "/dev/xdma0_h2c_0"
 DMA_DEVICE_C2H = "/dev/xdma0_c2h_0"
@@ -281,6 +327,14 @@ UE_VECTOR_SIZE = 64
 INSTRUCTION_SIZE_BYTES = 32
 UE_FMAX_CONTEXT_SIZE = 64
 SCALE_BRAM_ELEMENTS = 8192
+# GroupNorm live-accumulator budget in URAM lines (see plan_group_norm): the
+# stats pass keeps 2 slot-blocks in URAM_A and 3 in URAM_B, so 1024 lines per
+# block clears both 4096-line banks with room to spare.
+GROUP_NORM_SLOT_LINES = 1024
+# Max bf16 additions any GroupNorm accumulator absorbs before being flushed to
+# DRAM and re-zeroed; the host finishes the sum in float64. Accumulation error
+# grows like sqrt(depth), so this caps it regardless of tensor size.
+GROUP_NORM_MAX_ACC_DEPTH = 32
 SCALE_BRAM_SIZE_BYTES = SCALE_BRAM_ELEMENTS * 2
 BIAS_BRAM_ELEMENTS = 8192
 BIAS_BRAM_SIZE_BYTES = BIAS_BRAM_ELEMENTS * 2
@@ -314,7 +368,8 @@ class UE_MODE(IntEnum):
     DOT_PRODUCT = 0
     EXP = 1
     ELTWISE_MUL = 2
-    ROPE = 3
+    MAXPOOL = 3   # HW opcode 3 (was ROPE, a SW-only constant that never reached HDL)
+    ROPE = 3      # legacy alias — RoPE is SW-composed from ELTWISE_MUL/ADD, not a HW mode
     ELTWISE_ADD = 4
     RMS = 5
     MUL_BROADCAST = 6
@@ -325,6 +380,7 @@ class UE_MODE(IntEnum):
     ADD_REDUCE = 11
     DEQUANTIZE = 12
     ELTWISE_SUB = 13
+    CONV2D = 14   # 4'hE — streams IF4/IF8/TQ4 weights DOT-style, walker replays window per oc
     MEMCPY_FROM_DRAM = 15
 
 class TYPE(IntEnum):
@@ -416,6 +472,11 @@ INSTRUCTION_SWI = 0x8
 INSTRUCTION_HALT = 0x9
 INSTRUCTION_NOP = 0xA
 INSTRUCTION_PBI_SET_NONPREFETCH = 0xB
+INSTRUCTION_CONFIG = 0xC
+
+CONFIG_SUBTYPE_CONV = 0x0
+CONV_GEOMETRY_LIVE_CSR = "live-csr-v1"
+CONV_GEOMETRY_QUEUE_CONFIG = "queue-config-v1"
 
 # Compatibility aliases for existing compiler call sites.
 INSTRUCTION_REG_ALU = INSTRUCTION_REG_ALU_PREFETCH
@@ -431,15 +492,15 @@ class PBI_FIELD(IntEnum):
     Matches the next_* assigns in queue_state_module.sv."""
     DRAM_ADDR            = 0  # next_dram_addr              [31:0]  — bits [31:0]   of pointer row
     DMA_LENGTH           = 1  # next_dma_length             [31:0]  — bits [63:32]
-    OUTPUT_SIZE          = 2  # next_output_size            [15:0]  — bits [79:64]
-    URAM_ROW_SIZE        = 3  # next_uram_row_size          [11:0]  — bits [91:80]
-    URAM_START_ADDR_Y    = 4  # next_uram_start_addr_y      [11:0]  — bits [103:92]
-    URAM_START_ADDR_Z    = 5  # next_uram_start_addr_z      [11:0]  — bits [115:104]
-    URAM_WRITEB_ADDR     = 6  # next_uram_writeb_addr       [11:0]  — bits [127:116]
-    URAM_ROW_SIZE_Z      = 7  # next_uram_row_size_z        [11:0]  — bits [139:128]
-    URAM_MEMCPY_DST_ADDR = 8  # next_uram_memcpy_dst_addr   [11:0]  — bits [151:140]
-    FMX_CONTEXT          = 9  # next_fmx_context            [5:0]   — bits [157:152]
-    URAM_ROW_STRIDE_Z    = 10 # next_uram_row_stride_z_pbi  [11:0]  — bits [169:158]; delta=inst_uram_row_stride_z
+    OUTPUT_SIZE          = 2  # next_output_size            [16:0]  — bits [80:64]
+    URAM_ROW_SIZE        = 3  # next_uram_row_size          [11:0]  — bits [92:81]
+    URAM_START_ADDR_Y    = 4  # next_uram_start_addr_y      [11:0]  — bits [104:93]
+    URAM_START_ADDR_Z    = 5  # next_uram_start_addr_z      [11:0]  — bits [116:105]
+    URAM_WRITEB_ADDR     = 6  # next_uram_writeb_addr       [11:0]  — bits [128:117]
+    URAM_ROW_SIZE_Z      = 7  # next_uram_row_size_z        [11:0]  — bits [140:129]
+    URAM_MEMCPY_DST_ADDR = 8  # next_uram_memcpy_dst_addr   [11:0]  — bits [152:141]
+    FMX_CONTEXT          = 9  # next_fmx_context            [5:0]   — bits [158:153]
+    URAM_ROW_STRIDE_Z    = 10 # next_uram_row_stride_z_pbi  [11:0]  — bits [170:159]; delta=inst_uram_row_stride_z
     LALU_SCALAR_OR_STRIDE_JUMP = 11 # shared descriptor/PBI field; interpretation follows UE mode
     LALU_SCALAR          = 11 # arithmetic interpretation; delta=inst_lalu_scalar
     STRIDE_JUMP          = 11 # memcpy/writeback interpretation
@@ -514,6 +575,104 @@ class Instructions:
 
     def __repr__(self):
         return f"Instructions(words=[{', '.join(f'0x{w:08X}' for w in self.words)}])"
+
+
+def validate_conv2d_geometry_words(
+        words: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Validate raw ``UE_CONV_*`` words in GEOM/CTRL/STRIDE/PIXSTEP order."""
+    if len(words) != 4:
+        raise ValueError(f"expected four CONV geometry words, got {len(words)}")
+    geom, ctrl, stride, pixstep = (int(value) for value in words)
+    if any(value < 0 or value > 0xFFFFFFFF
+           for value in (geom, ctrl, stride, pixstep)):
+        raise ValueError("CONV geometry words must be unsigned 32-bit values")
+    out_w = geom & 0xFFF
+    out_h = (geom >> 12) & 0xFFF
+    geom_hi = (geom >> 24) & 0xFF
+    kernel_w = ctrl & 0xF
+    kernel_h = (ctrl >> 4) & 0xF
+    count = (ctrl >> 8) & 0xFFFF
+    gather = bool(ctrl & (1 << 31))
+    row_stride = stride & 0xFFF
+    col_stride = (stride >> 12) & 0xFFF
+    pix_col_step = pixstep & 0xFFF
+    pix_row_step = (pixstep >> 12) & 0xFFF
+    chunks = (pixstep >> 24) & 0x7
+    if not all((out_w, out_h, geom_hi, kernel_w, kernel_h, count,
+                row_stride, col_stride, pix_col_step, pix_row_step)):
+        raise ValueError("CONV geometry dimensions, counts, and steps must be non-zero")
+    if ctrl & 0x7F000000:
+        raise ValueError(f"CONV CTRL reserved bits are non-zero: {ctrl:#010x}")
+    if stride & 0xFF000000:
+        raise ValueError(f"CONV STRIDE reserved bits are non-zero: {stride:#010x}")
+    if pixstep & 0xF8000000:
+        raise ValueError(f"CONV PIXSTEP reserved bits are non-zero: {pixstep:#010x}")
+    if gather:
+        if not 1 <= chunks <= 4:
+            raise ValueError(f"gather chunks={chunks} exceeds the four RTL patch buffers")
+        expected_chunks = (
+            kernel_h * kernel_w * geom_hi + UE_VECTOR_SIZE - 1
+        ) // UE_VECTOR_SIZE
+        if chunks != expected_chunks:
+            raise ValueError(
+                f"gather chunks={chunks} != ceil(Kh*Kw*C/64)={expected_chunks}")
+        if count % chunks:
+            raise ValueError(
+                f"gather blocks_per_pixel={count} is not divisible by chunks={chunks}")
+    elif geom & (1 << 31) or chunks:
+        raise ValueError("channels mode requires CT<=127 and a zero chunks field")
+    return geom, ctrl, stride, pixstep
+
+
+def pack_conv2d_geometry_words(*, out_w: int, out_h: int, ct: int,
+                               kernel_w: int, kernel_h: int, oc_count: int,
+                               row_stride: int, col_stride: int,
+                               pix_col_step: int, pix_row_step: int,
+                               gather: bool = False, c_in: Optional[int] = None,
+                               blocks_per_pixel: Optional[int] = None,
+                               chunks: Optional[int] = None) -> tuple[int, int, int, int]:
+    """Pack logical CONV/MAXPOOL geometry into the four hardware words."""
+    if not 1 <= kernel_w <= 15 or not 1 <= kernel_h <= 15:
+        raise ValueError(f"kernel {kernel_h}x{kernel_w} exceeds the 4-bit fields")
+    if not 0 < out_w <= 0xFFF or not 0 < out_h <= 0xFFF:
+        raise ValueError(f"output {out_h}x{out_w} exceeds the 12-bit fields")
+    for name, value in (("row_stride", row_stride), ("col_stride", col_stride),
+                        ("pix_col_step", pix_col_step), ("pix_row_step", pix_row_step)):
+        if not 0 < value <= 0xFFF:
+            raise ValueError(f"{name}={value} exceeds the 12-bit field")
+    if gather:
+        if c_in is None or not 0 < c_in <= 0xFF:
+            raise ValueError(f"gather c_in={c_in} exceeds the 8-bit field")
+        if chunks is None or not 1 <= chunks <= 4:
+            raise ValueError(f"gather chunks={chunks} exceeds the four RTL patch buffers")
+        expected_chunks = (
+            kernel_h * kernel_w * c_in + UE_VECTOR_SIZE - 1
+        ) // UE_VECTOR_SIZE
+        if chunks != expected_chunks:
+            raise ValueError(
+                f"gather chunks={chunks} != ceil(Kh*Kw*C/64)={expected_chunks}")
+        if blocks_per_pixel is None or not 0 < blocks_per_pixel <= 0xFFFF:
+            raise ValueError(f"blocks_per_pixel={blocks_per_pixel} exceeds the 16-bit field")
+        expected_ct = (c_in + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        if ct != expected_ct:
+            raise ValueError(f"gather ct={ct} is inconsistent with c_in={c_in}")
+        if blocks_per_pixel != oc_count * chunks:
+            raise ValueError(
+                f"blocks_per_pixel={blocks_per_pixel} != oc_count*chunks={oc_count * chunks}")
+        geom_hi, count = c_in, blocks_per_pixel
+        ctrl31, chunks_field = 1 << 31, chunks << 24
+    else:
+        if not 0 < ct <= 0x7F:
+            raise ValueError(f"ct={ct} exceeds the 7-bit field")
+        if not 0 < oc_count <= 0xFFFF:
+            raise ValueError(f"oc_count={oc_count} exceeds the 16-bit field")
+        geom_hi, count, ctrl31, chunks_field = ct, oc_count, 0, 0
+    return validate_conv2d_geometry_words((
+        (geom_hi << 24) | (out_h << 12) | out_w,
+        ctrl31 | (count << 8) | (kernel_h << 4) | kernel_w,
+        (col_stride << 12) | row_stride,
+        chunks_field | (pix_row_step << 12) | pix_col_step,
+    ))
 
 class DeviceTensor:
     """
@@ -632,7 +791,8 @@ class UnifiedEngine:
                  tensor_dram_base: int = DRAM_ACTIVATION_ADDR,
                  clock_period_ns: float = None,
                  device_name: Optional[str] = None,
-                 init_unified_engine: bool = False):
+                 init_unified_engine: bool = False,
+                 conv_geometry_mode: str = CONV_GEOMETRY_LIVE_CSR):
         self.device = device
         if device_name is not None:
             set_dma_device(device_name)
@@ -676,6 +836,14 @@ class UnifiedEngine:
         # (counter_reg, body_start_inst_id, relative, program_dram_addr)
         # per nested loop_start/loop_end.
         self._capture_loop_stack: list[tuple[int, int, bool, int]] = []
+        # Most recently handled capture-time CONV/MAXPOOL geometry. Legacy mode
+        # uses it to enforce one live-CSR value; queued mode records it only for
+        # diagnostics and emits CONFIG at every operation site.
+        self._capture_conv_geometry: Optional[tuple] = None
+        if conv_geometry_mode not in (
+                CONV_GEOMETRY_LIVE_CSR, CONV_GEOMETRY_QUEUE_CONFIG):
+            raise ValueError(f"unsupported conv_geometry_mode={conv_geometry_mode!r}")
+        self.conv_geometry_mode = conv_geometry_mode
         # Preserve the existing API override while using HW_INFO as the default
         # source when the caller does not provide a period explicitly.
         if clock_period_ns is None and CLOCK_CYCLE_TIME_NS is None:
@@ -683,6 +851,9 @@ class UnifiedEngine:
         self._clock_period_ns = clock_period_ns if clock_period_ns is not None else CLOCK_CYCLE_TIME_NS
 
         self._base_addr = BASE_ADDR
+        # Cache the stamped FPGA version lazily so ordinary engine construction
+        # retains main's non-destructive default.
+        self.hw_version: Optional[int] = None
 
         # Initialize. OFF by default: init_unified_engine() dumps every register
         # and runs a DRAM read/write self-test at the HARDCODED DRAM_START_ADDR,
@@ -918,12 +1089,28 @@ class UnifiedEngine:
             f.write(all_instructions_bytes)
         print(f"Successfully wrote {len(self.capture_buffer)} captured instructions ({len(all_instructions_bytes)} bytes) to {filename}")
 
-    def init_unified_engine(self):
+    def get_hardware_version(self) -> int:
+        """Return the cached FPGA build stamp, reading only its BAR register."""
+        hw_version = getattr(self, "hw_version", None)
+        if hw_version is None:
+            hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
+        hw_version = int(hw_version) & 0xFFFFFFFF
+        self.hw_version = hw_version
+        return hw_version
+
+    def init_unified_engine(self, *, run_dram_self_test: bool = True):
+        """Initialize register-visible engine state.
+
+        ``run_dram_self_test=False`` skips the destructive 16 KiB H2C/C2H
+        probe at :data:`DRAM_START_ADDR`.  Register discovery and hardware
+        initialization still run.  The default preserves the historical
+        initialization behavior for existing callers.
+        """
         # Test user device register access first
         print(f"{DMA_DEVICE_USER} register access...")
-        hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
-        print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x19788da0, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x19788da0. Please update FPGA with commit update_19788da0.bin using update_flash.py (public release v1.4)"
+        self.hw_version = None
+        self.hw_version = self.get_hardware_version()
+        print(f"HW version via user device: 0x{self.hw_version:08x}")
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -932,17 +1119,29 @@ class UnifiedEngine:
                 print(f"address 0x{addr:08x} = 0x{value & 0xFFFFFFFF:08x}")
             addr += 4
 
-        # Dram read/write test
-        print("FPGA DRAM read/write test")
-        number_of_elements = 8192
-        test_data = torch.randint(0x0000, 0xFFFF, (number_of_elements,), dtype=torch.uint16, device=self.device)
-        self.dma_write(DMA_DEVICE_H2C, DRAM_START_ADDR, test_data, number_of_elements * 2)
-        test_read_data = torch.zeros((number_of_elements,), dtype=torch.uint16, device=self.device)
-        self.dma_read(DMA_DEVICE_C2H, DRAM_START_ADDR, test_read_data, number_of_elements * 2)
-        if torch.allclose(test_read_data, test_data, atol=0):
-            print("Dram read/write test passed")
+        # DRAM read/write test. Some direct-bin runtimes need reset and HW_INFO
+        # initialization without any unaccounted model-arena DMA, so keep the
+        # historical probe as the default but make it explicitly skippable.
+        if run_dram_self_test:
+            print("FPGA DRAM read/write test")
+            number_of_elements = 8192
+            test_data = torch.randint(
+                0x0000, 0xFFFF, (number_of_elements,),
+                dtype=torch.uint16, device=self.device)
+            self.dma_write(
+                DMA_DEVICE_H2C, DRAM_START_ADDR,
+                test_data, number_of_elements * 2)
+            test_read_data = torch.zeros(
+                (number_of_elements,), dtype=torch.uint16, device=self.device)
+            self.dma_read(
+                DMA_DEVICE_C2H, DRAM_START_ADDR,
+                test_read_data, number_of_elements * 2)
+            if torch.allclose(test_read_data, test_data, atol=0):
+                print("Dram read/write test passed")
+            else:
+                print("Dram read/write test failed")
         else:
-            print("Dram read/write test failed")
+            print("FPGA DRAM read/write test skipped")
 
         # Initialize Unified Engine hardware
         # Pipeline latency delays are now derived internally by the hardware
@@ -1077,16 +1276,12 @@ class UnifiedEngine:
         try:
             # Convert buffer to bytes
             if isinstance(buffer, torch.Tensor):
-                # Convert tensor to bytes
-                # Handle bfloat16 specially by reinterpreting as uint16 and serializing
-                if buffer.dtype == torch.bfloat16:
-                    buffer_uint16 = buffer.view(torch.uint16).cpu().contiguous()
-                    # Use PyTorch's numpy bridge (no direct numpy dependency/import)
-                    data_bytes = buffer_uint16.numpy().tobytes()[:size]
-                else:
-                    # For other dtypes, serialize contiguous CPU tensor via numpy bridge
-                    tensor_cpu = buffer.cpu().contiguous()
-                    data_bytes = tensor_cpu.numpy().tobytes()[:size]
+                # Present contiguous tensor storage directly to write(2). This
+                # avoids materialising a second, potentially hundreds-of-MiB
+                # Python ``bytes`` object for every activation upload.
+                tensor_bytes = buffer.detach().cpu().contiguous().reshape(-1) \
+                    .view(torch.uint8)
+                data_bytes = memoryview(tensor_bytes.numpy()).cast('B')[:size]
             elif isinstance(buffer, int):
                 # Convert integer to bytes (for register writes)
                 if size == 4:
@@ -1096,7 +1291,7 @@ class UnifiedEngine:
                 else:
                     data_bytes = buffer.to_bytes(size, byteorder='little', signed=False)
             elif isinstance(buffer, (bytes, bytearray)):
-                data_bytes = bytes(buffer[:size])
+                data_bytes = memoryview(buffer)[:size]
             else:
                 # Try to convert to bytes
                 data_bytes = bytes(buffer)[:size]
@@ -1183,36 +1378,31 @@ class UnifiedEngine:
 
                 # Copy data into buffer
                 if isinstance(buffer, torch.Tensor):
-                    # Convert bytes to tensor using struct unpack and view
-                    if buffer.dtype == torch.int32 and size == 4:
-                        # 32-bit register read
-                        # Unpack as signed int32
-                        value = struct.unpack('i', data_bytes[:4])[0]
-                        buffer[0] = value
+                    # DMA is a byte-exact transfer. Copy directly into writable
+                    # contiguous CPU tensor storage rather than expanding every
+                    # uint16 into a Python tuple and constructing another tensor.
+                    # Large YOLO readbacks spend hundreds of milliseconds in
+                    # that tuple conversion despite no numerical conversion
+                    # being required.
+                    if buffer.device.type == 'cpu' and buffer.is_contiguous():
+                        target = memoryview(
+                            buffer.detach().view(torch.uint8).numpy()).cast('B')
+                        take = min(len(data_bytes), len(target), size)
+                        target[:take] = data_bytes[:take]
                     else:
-                        # Regular data read (bf16/uint16)
-                        # Unpack as uint16 (generic type)
-                        num_elements = size // 2
-                        # Use struct.unpack to convert bytes to uint16 values
-                        format_str = f'{num_elements}H'  # 'H' = unsigned short (uint16)
-                        uint16_values = struct.unpack(format_str, data_bytes[:size])
-
-                        # Create tensor from uint16 values
-                        tensor_uint16 = torch.tensor(uint16_values, dtype=torch.uint16, device=buffer.device)
-
-                        # Convert to target dtype using view
-                        if buffer.dtype == torch.bfloat16:
-                            # View uint16 as bfloat16
-                            tensor_data = tensor_uint16.view(torch.bfloat16)
-                        else:
-                            # Use as-is or convert to target dtype
-                            tensor_data = tensor_uint16.to(buffer.dtype)
-
-                        # Copy to buffer
-                        if buffer.numel() >= num_elements:
-                            buffer[:num_elements].copy_(tensor_data[:num_elements])
-                        else:
-                            buffer.copy_(tensor_data[:buffer.numel()])
+                        # ``reshape(-1)`` may allocate for a non-contiguous
+                        # destination, in which case copying into that reshape
+                        # would silently leave ``buffer`` unchanged. Stage the
+                        # raw bytes in a contiguous CPU tensor and copy the
+                        # logical tensor back instead. Initialising from the
+                        # destination also preserves bytes beyond a short read.
+                        staged = buffer.detach().cpu().contiguous()
+                        target = memoryview(
+                            staged.view(torch.uint8).numpy()).cast('B')
+                        take = min(len(data_bytes), len(target), size)
+                        target[:take] = data_bytes[:take]
+                        with torch.no_grad():
+                            buffer.copy_(staged.to(buffer.device))
                 else:
                     # For other buffer types, copy bytes directly
                     if hasattr(buffer, '__setitem__'):
@@ -1289,9 +1479,14 @@ class UnifiedEngine:
         uram_start = int((mode != UE_MODE.DOT_PRODUCT) and
                         (mode != UE_MODE.URAM_DRAM_WRITEBACK) and
                         (mode != UE_MODE.DEQUANTIZE) and
-                        (mode != UE_MODE.MEMCPY_FROM_DRAM))
+                        (mode != UE_MODE.MEMCPY_FROM_DRAM) and
+                        (mode != UE_MODE.CONV2D))
         uram_bram_wb_start = int(mode == UE_MODE.URAM_DRAM_WRITEBACK)
-        dma_start = int((mode == UE_MODE.DOT_PRODUCT) or (mode == UE_MODE.DEQUANTIZE))
+        # CONV2D streams weights on the X-stream exactly like DOT_PRODUCT, so it
+        # asserts dma_start (not uram_start); MAXPOOL is URAM-only and rides the
+        # eltwise uram_start default above (mirrors start_queue in andromeda.c).
+        dma_start = int((mode == UE_MODE.DOT_PRODUCT) or (mode == UE_MODE.DEQUANTIZE) or
+                        (mode == UE_MODE.CONV2D))
         uram_length_z = dma_length >> 6  # in 64 element units
 
         wb_padding_control = 0
@@ -1324,6 +1519,11 @@ class UnifiedEngine:
                 assert int(inst_type) == int(INSTRUCTION_UE_PBI), \
                     "pbi_stride_en is only valid for UE_PBI instructions"
             stride_en = 1 if (stride_jump_bytes > 0 or pbi_stride_en) else 0
+            if stride_en:
+                # Both fields are masked below; without this the overflow is
+                # silent and shows up as scrambled data, not as an error.
+                ue_assert_stride_fields_fit(
+                    stride_bytes_per_chunk, stride_jump_bytes, "ue_op_descriptor")
             output_size = stride_bytes_per_chunk if (stride_en and stride_bytes_per_chunk > 0) else output_size
             scalar = stride_jump_bytes if stride_en else scalar
 
@@ -1377,6 +1577,10 @@ class UnifiedEngine:
                 w[7] = ((((fmx >> 1) & 0x1F)) |
                             (((broadcast_mode & 3) << 5)) |
                             (((lalu_b & 0xFFFF) << 7)))
+            # Descriptor bit 247 extends output_size without shifting the
+            # legacy [246:0] layout. It is consumed as a stride chunk MSB;
+            # compute operations continue to use output_size[15:0].
+            w[7] |= ((output_size >> 16) & 0x1) << 23
 
             self.capture_buffer.append(inst)
             self.capture_count += 1
@@ -1388,6 +1592,7 @@ class UnifiedEngine:
                             stride_bytes_per_chunk: int = 0,
                             stride_jump_bytes: int = 0,
                             inst_pointer_idx: Optional[int] = None,
+                            pbi_stride_en: bool = False,
                             ):
         """
         Memory copy from DRAM to URAM/BRAM. Emits the UE descriptor via :meth:`ue_op_descriptor` only.
@@ -1404,6 +1609,8 @@ class UnifiedEngine:
             stride_bytes_per_chunk: Bytes to copy per stride (0 = no stride mode)
             stride_jump_bytes: Distance in bytes between start of consecutive copies in DRAM
             inst_pointer_idx: when nonzero, emit PBI-style memcpy (pointer-backed registers are incremented by the immediate value specified in the instruction).
+            pbi_stride_en: Enable stride for a PBI memcpy whose chunk and jump
+                values are already stored in the pointer row.
         """
         if inst_pointer_idx is not None:
             inst_type = INSTRUCTION_UE_PBI
@@ -1439,6 +1646,7 @@ class UnifiedEngine:
             stride_bytes_per_chunk=stride_bytes_per_chunk,
             stride_jump_bytes=stride_jump_bytes,
             fmax_context_addr=0,
+            pbi_stride_en=pbi_stride_en,
         )
 
     def ue_memcpy_to_dram(self, memcpy_type: int, uram_type: int,
@@ -1741,23 +1949,37 @@ class UnifiedEngine:
         ``element_size * 2``. **You must issue** :meth:`generate_instruction_pbi_init` first for
         the same pointer index so base address and length live in the pointer row.
 
+        ``general_reg_src`` builds that PBI sequence internally and sources the
+        DRAM base from the named GPR. For a strided register-based read, the
+        chunk and jump values are stored in that same pointer row because
+        UE_PBI execution sources both fields from the row, not from descriptor
+        immediates.
+
         """
         uram_type, uram_start_addr = self.sram_address_to_uram_address(sram_address)
         nbytes = element_size * 2 if memcpy_length_bytes is None else memcpy_length_bytes
         if general_reg_src is not None:
             if inst_pointer_idx is not None:
                 raise ValueError("general_reg_src and inst_pointer_idx are mutually exclusive")
+            pbi_stride_en = stride_jump_bytes > 0
+            if pbi_stride_en:
+                ue_assert_stride_fields_fit(
+                    stride_bytes_per_chunk, stride_jump_bytes,
+                    "accelerator_memory_to_sram")
             ptr = self.alloc_inst_ptr()
             try:
                 self.generate_instruction_pbi_init(
-                    dma_length=nbytes, uram_dst_addr=uram_start_addr,
+                    dma_length=nbytes,
+                    output_size=stride_bytes_per_chunk if pbi_stride_en else 0,
+                    uram_dst_addr=uram_start_addr,
+                    stride_jump=stride_jump_bytes if pbi_stride_en else 0,
                     inst_pointer_idx=ptr)
                 self.generate_instruction_pbi_inc(
                     inst_pointer_idx=ptr, pbi_field_select=PBI_FIELD.DRAM_ADDR,
                     general_reg_src=general_reg_src)
                 self.ue_memcpy_from_dram(
                     0, 0, MEMCPY_TYPE.URAM.value, 0, uram_type.value,
-                    inst_pointer_idx=ptr)
+                    inst_pointer_idx=ptr, pbi_stride_en=pbi_stride_en)
             finally:
                 self.release_inst_ptr(ptr)
             return
@@ -2736,6 +2958,45 @@ class UnifiedEngine:
         self.start_queue_broadcast(
             UE_MODE.ADD_BROADCAST, BROADCAST_MODE.SCALAR_IN_REG,
             sram_start_addr, sram_wb_addr, element_size, scalar, inst_pointer_idx=inst_pointer_idx
+        )
+
+    def exp_core(self, vector_sram_start_addr: int, output_sram_wb_addr: int,
+                 element_size: int) -> None:
+        """Apply ``exp`` independently to every BF16 lane in an URAM_A tensor.
+
+        ``EXP`` is often driven through :meth:`start_queue_for_bf16_softmax_operation`,
+        where its scalar leg also reduces the row and feeds reciprocal into the
+        following broadcast.  The wide result itself is already a normal
+        64-lane ``alu_out`` value, though, so element-wise users only need EXP
+        with a zero addend and LALU bypass.
+        """
+        vector_uram_type, vector_uram_start_addr = \
+            self.sram_address_to_uram_address(vector_sram_start_addr)
+        assert vector_uram_type == URAM_SECTION.URAM_A, \
+            "exp_core: input must live in URAM_A"
+        output_uram_type, output_uram_start_addr = \
+            self.sram_address_to_uram_address(output_sram_wb_addr)
+        row_size = (element_size + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        self.ue_arithmetic_op(
+            BROADCAST_MODE.SCALAR_IN_REG.value,
+            0,  # max_clear_en
+            1,  # stride_z
+            0,  # lalu_a
+            0,  # lalu_b
+            LALU_MODE.BYPASS.value,
+            self.float_to_bf16(0.0),  # exp(x + 0)
+            output_uram_type.value,
+            0,  # uram_dst_addr
+            output_uram_start_addr,
+            URAM_WRITE_SRC.URAM_WRITE_BACK.value,
+            UE_MODE.EXP,
+            0,  # data_type
+            vector_uram_start_addr,
+            0,  # uram_b_start_addr (EXP's second operand is broadcast)
+            row_size,
+            0,  # dma_start_addr
+            0,  # dma_length
+            0,  # output_size
         )
 
     def start_queue_for_dot_product_operation(self, max_clear_en: int, fmax_context_addr: int, vector_sram_start_addr: int, output_sram_wb_addr: int,
@@ -8418,6 +8679,1960 @@ class UnifiedEngine:
             total_flops += 2 * M * N
         return total_flops
 
+    # -------------------------------------------------------------------------
+    # CONV2D / MAXPOOL instruction drivers.
+    #
+    # Mirror ue_conv2d() / ue_maxpool2d() in Vitis/common/src/andromeda.c and the
+    # geometry contract in Vivado/doc/convolution_architecture.md: the feature
+    # map lives PRE-PADDED in URAM bank Y (bank A), channels-in-lanes (one
+    # 1024-bit line = 64 channels of one pixel, CT = ceil(C_in/64) lines per
+    # pixel, ct inner). All strides are host-computed products; the walker never
+    # multiplies:
+    #   row_stride = W_pad*CT, col_stride = CT,
+    #   pix_col_step = S*CT,   pix_row_step = S*W_pad*CT.
+    # CONV streams IF4/IF8/TQ4 weights on the X-stream as [pixel][oc][tap]
+    # blocks of 64 lanes each (one bf16 scale per block, in stream order, in the
+    # scale BRAM) and emits one BF16 scalar per (pixel, oc), packed 64/line by
+    # the dot-style writeback. MAXPOOL is URAM-only (uram_start paced) and emits
+    # one full 64-lane line per pooled pixel; uram_row_size must be the TOTAL
+    # tap count of the launch.
+    # -------------------------------------------------------------------------
+
+    def write_conv2d_geometry_registers(self, *, out_w: int, out_h: int, ct: int,
+                                        kernel_w: int, kernel_h: int, oc_count: int,
+                                        row_stride: int, col_stride: int,
+                                        pix_col_step: int, pix_row_step: int,
+                                        gather: bool = False, c_in: Optional[int] = None,
+                                        blocks_per_pixel: Optional[int] = None,
+                                        chunks: Optional[int] = None) -> None:
+        """Program or queue the four UE_CONV_* geometry words.
+
+        Immediate operations and ``live-csr-v1`` captures retain the legacy
+        AXI-Lite path. ``queue-config-v1`` captures append an ordered CONFIG
+        instruction instead, allowing more than one geometry in a DRAM program.
+
+        ``gather=True`` selects the small-C GATHER path (UE_CONV_CTRL[31], doc
+        §9.4): GEOM[31:24] carries ``c_in`` in CHANNELS (not ct), CTRL[23:8]
+        carries ``blocks_per_pixel = OC*chunks`` (walker oc replay forced to 1),
+        and PIXSTEP[26:24] carries ``chunks``. Strides/pixsteps stay in URAM
+        line units exactly as channels mode.
+        """
+        words = pack_conv2d_geometry_words(
+            out_w=out_w, out_h=out_h, ct=ct,
+            kernel_w=kernel_w, kernel_h=kernel_h, oc_count=oc_count,
+            row_stride=row_stride, col_stride=col_stride,
+            pix_col_step=pix_col_step, pix_row_step=pix_row_step,
+            gather=gather, c_in=c_in,
+            blocks_per_pixel=blocks_per_pixel, chunks=chunks)
+        if self.is_capture_on:
+            if self.conv_geometry_mode == CONV_GEOMETRY_QUEUE_CONFIG:
+                # Always emit at the operation site. Linear capture-time
+                # deduplication is unsafe across loop backedges and conditional
+                # joins, where runtime shadow state can differ.
+                self.generate_instruction_conv_config(words)
+                self._capture_conv_geometry = words
+                return
+            if self._capture_conv_geometry == words:
+                return
+            if self._capture_conv_geometry is not None:
+                raise AssertionError(
+                    "conv/maxpool geometry registers are per-launch, not per-descriptor: "
+                    f"this capture session already programmed {self._capture_conv_geometry} "
+                    f"and cannot also use {words}. Use queue-config-v1 or capture "
+                    "one program per geometry."
+                )
+            self._capture_conv_geometry = words
+        for address, value in zip(
+                (UE_CONV_GEOM_ADDR, UE_CONV_CTRL_ADDR,
+                 UE_CONV_STRIDE_ADDR, UE_CONV_PIXSTEP_ADDR), words):
+            self.write_reg32(address, value)
+
+    def start_queue_for_conv2d_operation(self, act_sram_start_addr: int, output_sram_wb_addr: int,
+                                         weights_dram_addr: int,
+                                         kernel_w: int, kernel_h: int, ct: int, oc_count: int,
+                                         out_w: int, out_h: int, w_pad: int, stride_s: int,
+                                         data_type: TYPE,
+                                         bias_enable: bool = False,
+                                         lalu_mode: LALU_MODE = LALU_MODE.BYPASS,
+                                         lalu_a: int = 0, lalu_b: int = 0,
+                                         dilation: int = 1,
+                                         gather: bool = False, c_in: Optional[int] = None) -> None:
+        """Emit one CONV2D (mode 0xE) descriptor + program its geometry registers.
+
+        Python twin of ``ue_conv2d()`` in andromeda.c. The pre-padded activation
+        map must already be in URAM_A at ``act_sram_start_addr`` and the packed
+        weight stream (:func:`conv2d_pack_weight_stream`) at
+        ``weights_dram_addr``; per-block scales (:func:`conv2d_pack_scale_stream`)
+        must be loaded into the scale BRAM before this op runs.
+
+        ``gather=True`` selects the small-C GATHER path (UE_CONV_CTRL[31], doc
+        §9.4): the whole Kh*Kw*C im2col patch computes as a plain dot summed over
+        ``chunks = ceil(Kh*Kw*C/64)`` by the bf20 ladder. Pass ``c_in`` (channels,
+        <= 255); weights use :func:`conv2d_pack_weight_stream_gather` ([pixel]
+        [oc][chunk]) and scales :func:`conv2d_pack_scale_stream_gather` (ONE
+        pixel's oc*chunks blocks — hardware rewinds per pixel). The scalar
+        result then follows the normal bias-adder/LALU epilogue. Requires
+        Kh*Kw*C <= 256 (MAX_CHUNKS=4).
+
+        Args:
+            act_sram_start_addr: SRAM byte address of the padded map (URAM_A only)
+            output_sram_wb_addr: SRAM byte address for the dot-style writeback
+            weights_dram_addr: DRAM byte address of the [pixel][oc][tap] weight stream
+            kernel_w, kernel_h: kernel extent (<= 15 each)
+            ct: channel tiles = ceil(C_in/64)
+            oc_count: output channels (window is replayed once per oc)
+            out_w, out_h: output tile extent
+            w_pad: padded map width W_in + 2*pad (host pre-fills the halo)
+            stride_s: convolution stride (dilation folds into the stride regs)
+            data_type: TYPE.IF4 / TYPE.IF8 / TYPE.TQ4 (X-stream weight format)
+            bias_enable: per-(pixel,oc) bias from bias BRAM (see conv2d_pack_bias_stream)
+            lalu_mode/lalu_a/lalu_b: fused activation (e.g. CLAMP-as-ReLU)
+            dilation: kernel-tap dilation. Rides the kernel-step registers for
+                free (col_stride = dil*CT, row_stride = dil*W_pad*CT); the
+                pixel-step registers keep the plain stride.
+        """
+        act_uram_type, act_uram_start_addr = self.sram_address_to_uram_address(act_sram_start_addr)
+        assert act_uram_type == URAM_SECTION.URAM_A, \
+            "conv activations must live in URAM_A (bank Y); bank Z is reserved for the TQ4 codebook"
+        output_uram_type, output_uram_start_addr = self.sram_address_to_uram_address(output_sram_wb_addr)
+
+        row_stride = dilation * w_pad * ct
+        col_stride = dilation * ct
+        pix_col_step = stride_s * ct
+        pix_row_step = stride_s * w_pad * ct
+        results = out_h * out_w * oc_count
+        bytes_per_blk = 64 if data_type == TYPE.IF8 else 32
+        assert results <= 0xFFFF, f"output_size={results} exceeds the 16-bit descriptor field"
+        if bias_enable:
+            assert results <= BIAS_BRAM_ELEMENTS, (
+                f"bias stream has {results} results > bias BRAM {BIAS_BRAM_ELEMENTS}")
+
+        if gather:
+            assert c_in is not None and 0 < c_in <= 0xFF, f"gather requires 0 < c_in <= 255, got {c_in}"
+            patch_taps = kernel_h * kernel_w * c_in
+            assert patch_taps <= 256, \
+                f"gather Kh*Kw*C={patch_taps} exceeds 256 (MAX_CHUNKS=4)"
+            chunks = (patch_taps + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+            bpp = oc_count * chunks                       # blocks_per_pixel
+            blocks = out_h * out_w * bpp                  # whole weight stream
+            assert bpp <= SCALE_BRAM_ELEMENTS, (
+                f"gather scale needs {bpp} blocks (one pixel) > scale BRAM {SCALE_BRAM_ELEMENTS}"
+            )
+            self.write_conv2d_geometry_registers(
+                out_w=out_w, out_h=out_h, ct=ct,
+                kernel_w=kernel_w, kernel_h=kernel_h, oc_count=oc_count,
+                row_stride=row_stride, col_stride=col_stride,
+                pix_col_step=pix_col_step, pix_row_step=pix_row_step,
+                gather=True, c_in=c_in, blocks_per_pixel=bpp, chunks=chunks)
+            uram_length = chunks                          # itr_add = chunks
+        else:
+            taps = kernel_h * kernel_w * ct
+            blocks = results * taps
+            assert taps <= 0xFFF, f"taps={taps} exceeds the 12-bit uram_row_size field"
+            assert blocks <= SCALE_BRAM_ELEMENTS, (
+                f"launch has {blocks} X blocks > scale BRAM capacity {SCALE_BRAM_ELEMENTS}; "
+                f"chunk the launch (oc or output rows) as matmul does"
+            )
+            self.write_conv2d_geometry_registers(
+                out_w=out_w, out_h=out_h, ct=ct,
+                kernel_w=kernel_w, kernel_h=kernel_h, oc_count=oc_count,
+                row_stride=row_stride, col_stride=col_stride,
+                pix_col_step=pix_col_step, pix_row_step=pix_row_step)
+            uram_length = taps                            # itr_add = Kh*Kw*CT
+
+        self.ue_arithmetic_op(
+            0,  # broadcast_mode
+            0,  # max_clear_en
+            1,  # stride_z (uram_row_stride_z)
+            lalu_a,
+            lalu_b,
+            lalu_mode.value,
+            0,  # scalar
+            output_uram_type.value,  # uram_section (writeback bank)
+            0,  # uram_dst_addr
+            output_uram_start_addr,  # uram_wb_addr
+            URAM_WRITE_SRC.URAM_WRITE_BACK.value,
+            UE_MODE.CONV2D,
+            data_type,
+            act_uram_start_addr,  # uram_a_start_addr = pix_base0
+            0,  # uram_b_start_addr (bank Z reserved for TQ4 codebook)
+            uram_length,  # uram_length -> URAM_ROW_SIZE -> add_itr
+            weights_dram_addr,
+            blocks * bytes_per_blk,  # dma_length
+            results,  # output_size
+            bias_adder_en=int(bias_enable),
+        )
+
+    def start_queue_for_maxpool2d_operation(self, act_sram_start_addr: int, output_sram_wb_addr: int,
+                                            kernel_w: int, kernel_h: int,
+                                            out_w: int, out_h: int, w_pad: int,
+                                            stride_s: int) -> None:
+        """Emit one MAXPOOL (mode 0x3) descriptor + program its geometry registers.
+
+        Python twin of ``ue_maxpool2d()`` in andromeda.c. Per-channel running max
+        over the window: one full 64-lane line out per pooled pixel, bit-exact
+        BF16 (compare-select only, no arithmetic). Pooling never folds across
+        channel tiles — for C_in > 64 issue one op per 64-channel tile.
+
+        The padded map (halo pre-filled with -inf = 0xFF80 when pad > 0) must be
+        in URAM_A at ``act_sram_start_addr``.
+        """
+        act_uram_type, act_uram_start_addr = self.sram_address_to_uram_address(act_sram_start_addr)
+        assert act_uram_type == URAM_SECTION.URAM_A, "maxpool activations must live in URAM_A (bank Y)"
+        output_uram_type, output_uram_start_addr = self.sram_address_to_uram_address(output_sram_wb_addr)
+
+        taps_total = kernel_h * kernel_w * out_w * out_h
+        assert taps_total <= 0xFFF, (
+            f"total taps {taps_total} exceeds the 12-bit uram_row_size field; tile the output"
+        )
+
+        # MAXPOOL reuses the conv walker with oc_count = 1 and ct = 1.
+        self.write_conv2d_geometry_registers(
+            out_w=out_w, out_h=out_h, ct=1,
+            kernel_w=kernel_w, kernel_h=kernel_h, oc_count=1,
+            row_stride=w_pad, col_stride=1,
+            pix_col_step=stride_s, pix_row_step=stride_s * w_pad)
+
+        self.ue_arithmetic_op(
+            0,  # broadcast_mode
+            0,  # max_clear_en
+            1,  # stride_z
+            0,  # lalu_a
+            0,  # lalu_b
+            LALU_MODE.BYPASS.value,
+            0,  # scalar
+            output_uram_type.value,
+            0,  # uram_dst_addr
+            output_uram_start_addr,
+            URAM_WRITE_SRC.URAM_WRITE_BACK.value,
+            UE_MODE.MAXPOOL,
+            TYPE.IF4.value,  # data_type (unused: no X-stream in pooling)
+            act_uram_start_addr,
+            0,  # uram_b_start_addr
+            taps_total,  # uram_length: TOTAL taps (paces the eltwise walk + walker)
+            0,  # dma_start_addr (URAM-only op)
+            0,  # dma_length
+            out_h * out_w,  # output_size: pooled lines
+        )
+
+    def conv2d_core(self, ACT_DRAM_ADDR: int, WEIGHTS_DRAM_ADDR: int, SCALE_DRAM_ADDR: int,
+                    OUTPUT_DRAM_ADDR: int, *,
+                    c_in: int, in_h: int, in_w: int,
+                    kernel_h: int, kernel_w: int, stride_s: int, pad: int,
+                    oc_count: int, data_type: TYPE,
+                    BIAS_DRAM_ADDR: Optional[int] = None,
+                    relu_enable: bool = False,
+                    silu_enable: bool = False,
+                    gelu_enable: bool = False,
+                    dilation: int = 1,
+                    pad_h: Optional[int] = None,
+                    act_uram_addr: int = 0x000, wb_uram_addr: int = 0x300) -> int:
+        """DRAM-to-DRAM 2D convolution (single launch, one geometry).
+
+        Emits: padded map -> URAM_A, scales -> scale BRAM, optional bias ->
+        bias BRAM, the CONV2D op, and the result writeback to DRAM. Inputs must
+        be pre-packed on the host:
+          - ACT_DRAM_ADDR:     :func:`conv2d_pack_activation_map` bytes
+          - WEIGHTS_DRAM_ADDR: :func:`conv2d_pack_weight_stream` bytes
+          - SCALE_DRAM_ADDR:   :func:`conv2d_pack_scale_stream` bytes
+          - BIAS_DRAM_ADDR:    :func:`conv2d_pack_bias_stream` bytes (optional)
+        Output: out_h*out_w*oc_count bf16 scalars, pixel-major with oc
+        innermost, padded to a whole 128-byte line
+        (:func:`conv2d_unpack_result` reorders to (OC, out_h, out_w)).
+
+        Geometry registers are per-launch (see
+        :meth:`write_conv2d_geometry_registers`) — capture one program per
+        conv geometry. ``pad_h`` overrides the H-axis padding (defaults to
+        ``pad``; Conv1d uses pad_h=0). Returns the FLOP count of the launch.
+        """
+        ct = (c_in + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        if pad_h is None:
+            pad_h = pad
+        h_pad = in_h + 2 * pad_h
+        w_pad = in_w + 2 * pad
+        eff_kh = dilation * (kernel_h - 1) + 1
+        eff_kw = dilation * (kernel_w - 1) + 1
+        assert h_pad >= eff_kh and w_pad >= eff_kw, "dilated kernel larger than padded map"
+        out_h = (h_pad - eff_kh) // stride_s + 1
+        out_w = (w_pad - eff_kw) // stride_s + 1
+        taps = kernel_h * kernel_w * ct
+        results = out_h * out_w * oc_count
+        result_lines = (results + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        map_lines = h_pad * w_pad * ct
+
+        assert act_uram_addr + map_lines <= wb_uram_addr, (
+            f"padded map ({map_lines} lines @ {act_uram_addr:#x}) overlaps writeback base {wb_uram_addr:#x}"
+        )
+        assert wb_uram_addr + result_lines <= 4096, "writeback runs past the 4096-line URAM bank"
+
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=ACT_DRAM_ADDR,
+            sram_address=act_uram_addr << 7,
+            element_size=map_lines * UE_VECTOR_SIZE)
+        self.accelerator_memory_to_scale_sram(
+            accelerator_dram_address=SCALE_DRAM_ADDR,
+            element_size=results * taps)
+        bias_enable = BIAS_DRAM_ADDR is not None
+        if bias_enable:
+            self.accelerator_memory_to_bias_sram(
+                accelerator_dram_address=BIAS_DRAM_ADDR,
+                element_size=results)
+
+        lalu_mode, lalu_a, lalu_b = _conv_fused_lalu(relu_enable, silu_enable, gelu_enable)
+
+        self.start_queue_for_conv2d_operation(
+            act_sram_start_addr=act_uram_addr << 7,
+            output_sram_wb_addr=wb_uram_addr << 7,
+            weights_dram_addr=WEIGHTS_DRAM_ADDR,
+            kernel_w=kernel_w, kernel_h=kernel_h, ct=ct, oc_count=oc_count,
+            out_w=out_w, out_h=out_h, w_pad=w_pad, stride_s=stride_s,
+            data_type=data_type, bias_enable=bias_enable,
+            lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b,
+            dilation=dilation)
+
+        self.sram_to_accelerator_memory(
+            sram_address=wb_uram_addr << 7,
+            accelerator_dram_address=OUTPUT_DRAM_ADDR,
+            element_size=result_lines * UE_VECTOR_SIZE)
+
+        total_flops = 2 * results * taps * UE_VECTOR_SIZE
+        if bias_enable:
+            total_flops += results
+        if relu_enable:
+            total_flops += results
+        if silu_enable or gelu_enable:
+            total_flops += 4 * results
+        return total_flops
+
+    def conv1d_core(self, ACT_DRAM_ADDR: int, WEIGHTS_DRAM_ADDR: int, SCALE_DRAM_ADDR: int,
+                    OUTPUT_DRAM_ADDR: int, *,
+                    c_in: int, length: int, kernel_size: int, stride_s: int, pad: int,
+                    oc_count: int, data_type: TYPE,
+                    BIAS_DRAM_ADDR: Optional[int] = None,
+                    relu_enable: bool = False,
+                    silu_enable: bool = False,
+                    gelu_enable: bool = False,
+                    dilation: int = 1,
+                    act_uram_addr: int = 0x000, wb_uram_addr: int = 0x300) -> int:
+        """DRAM-to-DRAM 1D convolution (Whisper-style audio conv stem).
+
+        A Conv1d over (C, T) is CONV2D with H = 1 / Kh = 1: channels in the
+        URAM lanes, time on the W axis, padding on the time axis only. The
+        activation map is packed by :func:`conv2d_pack_activation_map` from a
+        (C, 1, T) tensor with ``pad_h=0``; weights/scales/bias use the same
+        packers with kernel shape (OC, C, 1, K). Covers e.g.
+        Conv1d(n_mels->d, 3, stride=1, padding=1) and
+        Conv1d(d->d, 3, stride=2, padding=1) + GELU.
+        """
+        return self.conv2d_core(
+            ACT_DRAM_ADDR, WEIGHTS_DRAM_ADDR, SCALE_DRAM_ADDR, OUTPUT_DRAM_ADDR,
+            c_in=c_in, in_h=1, in_w=length,
+            kernel_h=1, kernel_w=kernel_size, stride_s=stride_s,
+            pad=pad, pad_h=0,
+            oc_count=oc_count, data_type=data_type,
+            BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
+            relu_enable=relu_enable, silu_enable=silu_enable, gelu_enable=gelu_enable,
+            dilation=dilation,
+            act_uram_addr=act_uram_addr, wb_uram_addr=wb_uram_addr)
+
+    # -------------------------------------------------------------------------
+    # Layer-level drivers: full-tensor conv / pool via multiple launches.
+    #
+    # A single launch is capped by the 8192-entry scale BRAM (X blocks), the
+    # URAM bank (padded map below the writeback base), the 16-bit output_size
+    # and the 12-bit uram_row_size. Real model layers (224x224 stems, 64x64
+    # latents, T=3000 audio) exceed those, so these host-orchestrated drivers
+    # tile the output (and oc), run one resident program whose ordered CONFIG
+    # blocks select each exact tile geometry, and assemble the result after one
+    # bulk readback.  This remains bit-exact and shape-complete without a PCIe
+    # roundtrip per tile.
+    # -------------------------------------------------------------------------
+
+    def _capture_conv2d_tile_loop(self, *, n_tiles: int,
+                                  act_base: int, act_bytes: int,
+                                  weights_dram_addr: int,
+                                  out_base: int, out_bytes: int,
+                                  kernel_w: int, kernel_h: int, ct: int,
+                                  oc_count: int, out_w: int, out_h: int,
+                                  w_pad: int, stride_s: int, dilation: int,
+                                  data_type: TYPE,
+                                  scale_dram_addr: int, scale_count: int,
+                                  bias_dram_addr: Optional[int], results: int,
+                                  lalu_mode: LALU_MODE, lalu_a: int, lalu_b: int,
+                                  gather: bool = False, c_in: Optional[int] = None,
+                                  act_uram_addr: int = 0x000,
+                                  wb_uram_addr: int = 0x300) -> None:
+        """Capture ONE resident PBI tile loop covering ``n_tiles`` same-shape
+        conv tiles — the single code piece the engine executes end-to-end
+        with no host involvement.
+
+        Emitted stream (the proven eltwise_core_dram_pbi shape):
+          scale BRAM load (once — contents persist; the per-op read address
+          restarts at op start), optional bias BRAM load (once per oc chunk),
+          pbi_init(act ptr: base=act_base, len=act_bytes),
+          pbi_init(out ptr: base=out_base, len=out_bytes),
+          abs-jump i-cache anchor,
+          loop_start(n_tiles):
+            PBI memcpy DRAM->URAM_A   (pointer advances act_bytes/iteration)
+            CONFIG + CONV2D           (constant descriptor for this group;
+                                       ordered queued geometry precedes it)
+            PBI writeback URAM->DRAM  (pointer advances out_bytes/iteration)
+          loop_end.
+
+        Activation windows must be pre-staged contiguously at ``act_base``
+        (slot i at ``act_base + i*act_bytes``); results land contiguously at
+        ``out_base``. PBI pointers post-increment: iteration 0 uses the base.
+        """
+        self.accelerator_memory_to_scale_sram(scale_dram_addr, scale_count)
+        if bias_dram_addr is not None:
+            self.accelerator_memory_to_bias_sram(bias_dram_addr, results)
+
+        # The running act-read / result-write DRAM addresses live in ISA GP
+        # registers (word address = byte >> 3, the REG_REWRITE convention).
+        # PBI pointer post-increment does NOT survive here: the CONV op streams
+        # weights through the shared DMA address register, corrupting a pointer
+        # accumulator that spans it (tile 0 was exact, tiles 1+ misaligned). So
+        # each memcpy RE-SOURCES its DRAM address from a GP register via
+        # REG_REWRITE (reloaded immediately before the transfer, overriding
+        # whatever CONV left) with the length re-asserted in the descriptor,
+        # and the registers are advanced explicitly once per iteration.
+        act_reg = self.alloc_isa_reg()
+        out_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(act_reg, act_base >> 3)
+        self.generate_instruction_add_set(out_reg, out_base >> 3)
+
+        # Abs-jump anchor: reloads the i-cache so loop_end's RELA_JNZ lands
+        # inside the cache window (eltwise_core_dram_pbi pattern).
+        program_dram_start_addr = self.get_program_dram_addr()
+        self.generate_instruction_jump_abs(
+            ue_35bit_addr_shifter(
+                program_dram_start_addr
+                + (self.capture_count + 1) * INSTRUCTION_SIZE_BYTES))
+        self.loop_start(loop_cnt=n_tiles)
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=0,
+            sram_address=act_uram_addr << 7,
+            element_size=0,
+            memcpy_length_bytes=act_bytes,
+            general_reg_src=act_reg,
+        )
+        self.start_queue_for_conv2d_operation(
+            act_sram_start_addr=act_uram_addr << 7,
+            output_sram_wb_addr=wb_uram_addr << 7,
+            weights_dram_addr=weights_dram_addr,
+            kernel_w=kernel_w, kernel_h=kernel_h, ct=ct, oc_count=oc_count,
+            out_w=out_w, out_h=out_h, w_pad=w_pad, stride_s=stride_s,
+            data_type=data_type, bias_enable=bias_dram_addr is not None,
+            lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b,
+            dilation=dilation, gather=gather, c_in=c_in)
+        self.sram_to_accelerator_memory(
+            sram_address=wb_uram_addr << 7,
+            accelerator_dram_address=0,
+            element_size=0,
+            memcpy_length_bytes=out_bytes,
+            general_reg_src=out_reg,
+        )
+        # Advance the running addresses (word units) for the next tile.
+        self.generate_instruction_add_imm(src_reg_idx=act_reg, immediate_value=act_bytes >> 3)
+        self.generate_instruction_add_imm(src_reg_idx=out_reg, immediate_value=out_bytes >> 3)
+        loop_body_size = self.loop_end()
+        assert loop_body_size <= 256, (
+            f"conv tile loop body {loop_body_size} instructions exceeds i-cache budget")
+        self.release_isa_reg()  # out_reg
+        self.release_isa_reg()  # act_reg
+
+    def run_conv2d_layer(self, x: torch.Tensor, w_codes: torch.Tensor, *,
+                         stride_s: int, pad: int, pad_h: Optional[int] = None,
+                         dilation: int = 1, scale_mag: float = 1.0,
+                         block_scales: Optional[torch.Tensor] = None,
+                         bias: Optional[torch.Tensor] = None,
+                         relu_enable: bool = False, silu_enable: bool = False,
+                         gelu_enable: bool = False,
+                         data_type: TYPE = TYPE.IF4,
+                         wb_uram_addr: int = 0x300,
+                         gather: Optional[bool] = None,
+                         timeout_s: float = 300.0) -> torch.Tensor:
+        """Full-tensor Conv2d layer as one resident multi-geometry program.
+
+        x: (C, H, W) tensor (cast to bf16); w_codes: (OC, C, kh, kw) integer
+        hardware codes. ``scale_mag`` is the positive, uniform IF4-INT scale.
+        For block-quantized weights, ``block_scales`` carries the signed BF16
+        hardware scales instead: negative selects INT4 and positive selects
+        FP4. In channels mode its shape is
+        ``(OC, kh*kw*ceil(C/64))`` in ``[oc, ky, kx, ct]`` order; in gather
+        mode it is ``(OC, ceil(kh*kw*C/64))``. Symmetric padding via pad/pad_h;
+        for asymmetric padding pre-pad x and pass pad=0.
+        Conv1d layers: x = (C, 1, T), kernel (OC, C, 1, k), pad_h=0.
+
+        Execution model (single big stream): every exact tile window is staged
+        contiguously in DRAM with ONE bulk DMA, then one captured program runs
+        one :meth:`_capture_conv2d_tile_loop` per ordered
+        interior/right/bottom/corner geometry group and OC chunk.  CONFIG
+        instructions switch geometry inside that SAME resident program.  The
+        whole result region is read back with one bulk DMA, so a layer remains
+        exactly one capture + one program + one execute without recomputing
+        overlap-clamped edge pixels.
+        """
+        assert data_type in (TYPE.IF4, TYPE.IF8), \
+            f"layer driver supports IF4/IF8 weights, got {data_type}"
+        C, H, W = x.shape
+        OC, wc_c, kernel_h, kernel_w = w_codes.shape
+        assert wc_c == C, f"weight C_in {wc_c} != activation C {C}"
+        if pad_h is None:
+            pad_h = pad
+        ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        taps = kernel_h * kernel_w * ct
+        lalu_mode, lalu_a, lalu_b = _conv_fused_lalu(relu_enable, silu_enable, gelu_enable)
+
+        # Gather mode (small-C, UE_CONV_CTRL[31]): computes the whole im2col
+        # patch as a plain dot -> ~9x utilization on C_in=3/4 stems. The gather
+        # result rejoins the standard dot epilogue, so per-result bias and the
+        # fused LALU remain available. The four-channel walker supports up to
+        # four 64-tap chunks. Auto-engage only when the slower of patch
+        # production and dot consumption beats channels mode;
+        # ``gather=True/False`` forces it.
+        patch_taps = kernel_h * kernel_w * C
+        chunks = (patch_taps + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        can_gather = C <= 255 and patch_taps <= 256
+        gather_producer_cycles = kernel_h * kernel_w * ((C + 3) // 4)
+        gather_cycles_per_pixel = max(gather_producer_cycles, OC * chunks)
+        channel_cycles_per_pixel = OC * taps
+        beneficial = gather_cycles_per_pixel < channel_cycles_per_pixel
+        use_gather = (can_gather and beneficial) if gather is None else bool(gather)
+        if use_gather and not can_gather:
+            raise ValueError(
+                f"gather=True unsupported here: need C<=255 (got {C}) and "
+                f"Kh*Kw*C<=256 (got {patch_taps})")
+        scales_per_oc = chunks if use_gather else taps
+        if block_scales is not None:
+            block_scales = block_scales.detach().to(device="cpu", dtype=torch.bfloat16)
+            expected = (OC, scales_per_oc)
+            if tuple(block_scales.shape) != expected:
+                raise ValueError(
+                    f"block_scales has shape {tuple(block_scales.shape)}, "
+                    f"expected {expected} for {'gather' if use_gather else 'channels'} mode")
+            if not torch.isfinite(block_scales.float()).all() or (block_scales == 0).any():
+                raise ValueError("block_scales entries must be finite and non-zero")
+        else:
+            if isinstance(scale_mag, torch.Tensor):
+                raise TypeError(
+                    "scale_mag is a scalar magnitude; pass signed per-block values "
+                    "with block_scales=")
+            if not math.isfinite(float(scale_mag)) or float(scale_mag) <= 0:
+                raise ValueError(f"scale_mag must be finite and > 0, got {scale_mag!r}")
+        if bias is not None and tuple(bias.shape) != (OC,):
+            raise ValueError(f"bias has shape {tuple(bias.shape)}, expected ({OC},)")
+
+        out_h, out_w, oc_chunk, tiles = plan_conv2d_layer_tiles(
+            c_in=C, oc_count=OC, in_h=H, in_w=W,
+            kernel_h=kernel_h, kernel_w=kernel_w, stride_s=stride_s,
+            pad=pad, pad_h=pad_h, dilation=dilation,
+            gather=use_gather, bias_enabled=bias is not None,
+            wb_uram_addr=wb_uram_addr)
+        n_chunks = -(-OC // oc_chunk)
+        assert OC % oc_chunk == 0, (
+            "planner must choose a divisor of OC so every descriptor and "
+            "result chunk uses the same oc_count")
+
+        groups, activation_bytes, chunk_output_bytes = \
+            conv2d_tiled_dram_layout(tiles, ct, oc_chunk)
+        if (len(groups) > 1
+                and self.conv_geometry_mode != CONV_GEOMETRY_QUEUE_CONFIG):
+            raise RuntimeError(
+                "exact convolution edge tiles require queue-config-v1 geometry")
+
+        # Stage every exact tile window in geometry-group order; ONE bulk DMA.
+        staged = conv2d_pack_activation_tiles(
+            x, tiles, pad=pad, pad_h=pad_h)
+        assert staged.numel() * staged.element_size() == activation_bytes
+        ACT_BASE = self.allocate_params_dram(activation_bytes)
+        self.dma_write(DMA_DEVICE_H2C, ACT_BASE, staged, staged.numel() * 2)
+        OUT_BASE = self.allocate_tensor_dram(n_chunks * chunk_output_bytes)
+
+        # ONE capture wrapping the whole layer: each OC chunk contains ordered
+        # interior/right/bottom/corner CONFIG + PBI loop blocks.
+        self.start_capture()
+        for ci, oc0 in enumerate(range(0, OC, oc_chunk)):
+            n_oc = oc_chunk
+            wc = w_codes[oc0:oc0 + n_oc]
+            # A scalar is the backwards-compatible forced-INT path. Signed
+            # block scales pass through unchanged so IF4 MixMSE can select
+            # INT4/FP4 independently for every 64-value block.
+            chunk_scale = _conv2d_chunk_scale(
+                block_scales, scale_mag, oc0=oc0, n_oc=n_oc)
+            # Weight, channel-scale, and bias streams repeat the same
+            # per-output-pixel pattern.  Pack the largest geometry once: every
+            # tail geometry consumes an exact prefix from the same address.
+            # Gather scales are already one geometry-independent pixel pattern.
+            stream_group = max(groups, key=lambda group: group[2] * group[3])
+            stream_th, stream_tw = stream_group[2], stream_group[3]
+            if use_gather:
+                w_stream = conv2d_pack_weight_stream_gather(
+                    wc, stream_th, stream_tw, data_type)
+                scale_stream = conv2d_pack_scale_stream_gather(
+                    chunk_scale, n_oc, chunks)
+            else:
+                w_stream = conv2d_pack_weight_stream(
+                    wc, stream_th, stream_tw, data_type)
+                scale_stream = conv2d_pack_scale_stream(
+                    chunk_scale, n_oc, taps, stream_th, stream_tw)
+            WEIGHTS_DRAM_ADDR = self.allocate_params_dram(w_stream.numel())
+            self.dma_write(
+                DMA_DEVICE_H2C, WEIGHTS_DRAM_ADDR,
+                w_stream, w_stream.numel())
+            SCALE_DRAM_ADDR = self.allocate_params_dram(
+                scale_stream.numel() * 2)
+            self.dma_write(
+                DMA_DEVICE_H2C, SCALE_DRAM_ADDR,
+                scale_stream, scale_stream.numel() * 2)
+            BIAS_DRAM_ADDR = None
+            if bias is not None:
+                bias_stream = conv2d_pack_bias_stream(
+                    bias[oc0:oc0 + n_oc], stream_th, stream_tw)
+                BIAS_DRAM_ADDR = self.allocate_params_dram(
+                    bias_stream.numel() * 2)
+                self.dma_write(
+                    DMA_DEVICE_H2C, BIAS_DRAM_ADDR,
+                    bias_stream, bias_stream.numel() * 2)
+            for (start, stop, th, tw, _win_h, win_w,
+                 act_offset, act_bytes, out_offset, out_bytes,
+                 _result_lines) in groups:
+                if use_gather:
+                    scale_count = n_oc * chunks
+                else:
+                    scale_count = th * tw * n_oc * taps
+                self._capture_conv2d_tile_loop(
+                    n_tiles=stop - start,
+                    act_base=ACT_BASE + act_offset, act_bytes=act_bytes,
+                    weights_dram_addr=WEIGHTS_DRAM_ADDR,
+                    out_base=(OUT_BASE + ci * chunk_output_bytes + out_offset),
+                    out_bytes=out_bytes,
+                    kernel_w=kernel_w, kernel_h=kernel_h, ct=ct,
+                    oc_count=n_oc, out_w=tw, out_h=th,
+                    w_pad=win_w, stride_s=stride_s, dilation=dilation,
+                    data_type=data_type,
+                    scale_dram_addr=SCALE_DRAM_ADDR,
+                    scale_count=scale_count,
+                    bias_dram_addr=BIAS_DRAM_ADDR, results=th * tw * n_oc,
+                    lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b,
+                    gather=use_gather, c_in=C,
+                    wb_uram_addr=wb_uram_addr)
+        self.stop_capture()
+        self.generate_instruction_halt()
+        program_dram_addr = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(program_dram_addr)
+        inst_bytes = self.get_capture_instruction_size_bytes()
+        self.allocate_program_dram(inst_bytes)
+        self.start_execute_from_dram(program_dram_addr)
+        self.wait_queue(timeout_s)
+        # Stash the whole-layer program size and HW execute latency so callers
+        # / tests can report them (the capture buffer is cleared just below).
+        self.last_conv_inst_bytes = inst_bytes
+        self.last_conv_cycles = self.read_latency_cycles()
+        self.clear_capture_buffer()
+
+        # ONE bulk readback for the whole layer; scatter exact grouped tiles.
+        big = self.dma_from_accelerator_memory(
+            OUT_BASE, (n_chunks * chunk_output_bytes // 2,))
+        return conv2d_unpack_tiled_result(
+            big, tiles, out_h, out_w, OC, oc_chunk)
+
+    def run_maxpool2d_layer(self, x: torch.Tensor, *, kernel: int, stride_s: int,
+                            pad: int, wb_uram_addr: int = 0x300,
+                            timeout_s: float = 300.0) -> torch.Tensor:
+        """Full-tensor MaxPool2d layer for any channel count.
+
+        Tiles over 64-channel groups (pooling never folds across lanes) and
+        over output rows so the launch's total tap count fits the 12-bit
+        uram_row_size field (k*k*tile_pixels <= 4095 — e.g. k=5 caps at 163
+        output pixels per launch) and the padded window fits the URAM tile.
+        The -inf halo is host-materialised once. Returns (C, out_h, out_w).
+        """
+        import torch.nn.functional as F
+        C, H, W = x.shape
+        h_pad, w_pad = H + 2 * pad, W + 2 * pad
+        out_h = (h_pad - kernel) // stride_s + 1
+        out_w = (w_pad - kernel) // stride_s + 1
+
+        def fits(rows: int) -> bool:
+            win_h = (rows - 1) * stride_s + kernel
+            return (kernel * kernel * rows * out_w <= 0xFFF
+                    and win_h * w_pad <= wb_uram_addr
+                    and wb_uram_addr + rows * out_w <= 4096
+                    and rows * out_w <= 0xFFFF)
+
+        rows_per = 1
+        while rows_per < out_h and fits(rows_per + 1):
+            rows_per += 1
+        assert fits(rows_per), (
+            f"one output row does not fit a launch (out_w={out_w}, k={kernel})")
+
+        x_padded = F.pad(x.to(torch.bfloat16), (pad, pad, pad, pad),
+                         value=float('-inf'))
+        out = torch.zeros(C, out_h, out_w, dtype=torch.bfloat16)
+
+        # Overlap-clamped row chunks: every chunk is exactly rows_per rows
+        # (the last one shifted up to overlap), so all (channel tile, row
+        # chunk) slots share ONE geometry and the layer is ONE program.
+        rh = rows_per
+        oy0s = list(range(0, max(out_h - rh, 0) + 1, rh))
+        if oy0s[-1] != out_h - rh:
+            oy0s.append(out_h - rh)
+
+        win_h = (rh - 1) * stride_s + kernel
+        win_lines = win_h * w_pad
+        act_bytes = win_lines * 128
+        out_bytes = rh * out_w * 128
+        # Stage all (channel tile, row chunk) maps contiguously; ONE bulk DMA.
+        slots = []
+        for c0 in range(0, C, UE_VECTOR_SIZE):
+            n_ch = min(UE_VECTOR_SIZE, C - c0)
+            for oy0 in oy0s:
+                slots.append((c0, n_ch, oy0))
+        staged = torch.empty(len(slots) * win_lines, UE_VECTOR_SIZE,
+                             dtype=torch.bfloat16)
+        for i, (c0, n_ch, oy0) in enumerate(slots):
+            y0 = oy0 * stride_s
+            staged[i * win_lines:(i + 1) * win_lines] = conv2d_pack_activation_map(
+                x_padded[c0:c0 + n_ch, y0:y0 + win_h, :], 0,
+                pad_value=float('-inf'))
+        ACT_BASE = self.allocate_params_dram(len(slots) * act_bytes)
+        self.dma_write(DMA_DEVICE_H2C, ACT_BASE, staged, staged.numel() * 2)
+        OUT_BASE = self.allocate_tensor_dram(len(slots) * out_bytes)
+
+        # ONE capture for the whole layer: PBI pointers + loop over every
+        # slot (geometry is channel-tile independent).
+        # Running act-read / result-write DRAM addresses in ISA GP registers
+        # (word address = byte >> 3), re-sourced per iteration via REG_REWRITE
+        # and advanced explicitly — same robust pattern as the conv tile loop
+        # (PBI pointer post-increment is unreliable across the pool op).
+        self.start_capture()
+        act_reg = self.alloc_isa_reg()
+        out_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(act_reg, ACT_BASE >> 3)
+        self.generate_instruction_add_set(out_reg, OUT_BASE >> 3)
+        program_dram_start_addr = self.get_program_dram_addr()
+        self.generate_instruction_jump_abs(
+            ue_35bit_addr_shifter(
+                program_dram_start_addr
+                + (self.capture_count + 1) * INSTRUCTION_SIZE_BYTES))
+        self.loop_start(loop_cnt=len(slots))
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=0, sram_address=0x00000,
+            element_size=0, memcpy_length_bytes=act_bytes, general_reg_src=act_reg)
+        self.start_queue_for_maxpool2d_operation(
+            act_sram_start_addr=0x00000,
+            output_sram_wb_addr=wb_uram_addr << 7,
+            kernel_w=kernel, kernel_h=kernel,
+            out_w=out_w, out_h=rh, w_pad=w_pad, stride_s=stride_s)
+        self.sram_to_accelerator_memory(
+            sram_address=wb_uram_addr << 7,
+            accelerator_dram_address=0,
+            element_size=0, memcpy_length_bytes=out_bytes, general_reg_src=out_reg)
+        self.generate_instruction_add_imm(src_reg_idx=act_reg, immediate_value=act_bytes >> 3)
+        self.generate_instruction_add_imm(src_reg_idx=out_reg, immediate_value=out_bytes >> 3)
+        loop_body_size = self.loop_end()
+        assert loop_body_size <= 256
+        self.release_isa_reg()  # out_reg
+        self.release_isa_reg()  # act_reg
+        self.stop_capture()
+        self.generate_instruction_halt()
+        program_dram_addr = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(program_dram_addr)
+        inst_bytes = self.get_capture_instruction_size_bytes()
+        self.allocate_program_dram(inst_bytes)
+        self.start_execute_from_dram(program_dram_addr)
+        self.wait_queue(timeout_s)
+        # Stash whole-layer program size + HW execute latency for tests/callers.
+        self.last_maxpool_inst_bytes = inst_bytes
+        self.last_maxpool_cycles = self.read_latency_cycles()
+        self.clear_capture_buffer()
+
+        big = self.dma_from_accelerator_memory(
+            OUT_BASE, (len(slots) * rh * out_w * UE_VECTOR_SIZE,))
+        big = big.view(len(slots), rh * out_w * UE_VECTOR_SIZE)
+        for i, (c0, n_ch, oy0) in enumerate(slots):
+            out[c0:c0 + n_ch, oy0:oy0 + rh, :] = \
+                maxpool2d_unpack_result(big[i], rh, out_w)[:n_ch]
+        return out
+
+    def run_maxpool2d_chain(self, x: torch.Tensor, *, kernel: int, stride_s: int,
+                            pad: int, chain: int, wb_uram_addr: int = 0x300,
+                            timeout_s: float = 10.0) -> torch.Tensor:
+        """N chained MaxPool2d stages as ONE captured program (single execute).
+
+        YOLO SPPF is MaxPool2d(5, s=1, p=2) applied 3x. Naively each stage is a
+        host round-trip: read the pooled map back, re-materialise the -inf halo,
+        re-upload. Instead every stage's destination map is pre-filled with -inf
+        ONCE on the host, and each stage's writeback lands STRIDED into that
+        map's interior (one output row per chunk, jumping a padded row between
+        chunks) so the halo ring survives untouched and the next stage reads the
+        buffer in place. All stages share one geometry, so the whole chain is a
+        single capture + single execute with no host in the loop.
+
+        Requires ``stride_s == 1`` and ``pad == (kernel-1)//2`` (out == in, so a
+        stage's output exactly fills the next stage's interior) and ``C <= 64``
+        (one URAM line per pixel). Returns (C, H, W).
+        """
+        C, H, W = x.shape
+        assert C <= UE_VECTOR_SIZE, "chain path packs one URAM line per pixel (C <= 64)"
+        assert stride_s == 1 and 2 * pad == kernel - 1, \
+            "chained pooling needs out == in (stride 1, pad = (kernel-1)//2)"
+        assert chain >= 1
+        h_pad, w_pad = H + 2 * pad, W + 2 * pad
+        out_h, out_w = H, W
+        lines = h_pad * w_pad                     # ct = 1 (C <= 64)
+        neg_inf = float('-inf')
+
+        # buf[0] = host-packed padded input; buf[1..chain-1] = fully -inf, each
+        # receives the previous stage's interior writeback.
+        bufs = []
+        act0 = conv2d_pack_activation_map(x.to(torch.bfloat16), pad, pad_value=neg_inf)
+        b0 = self.allocate_params_dram(lines * 128)
+        self.dma_write(DMA_DEVICE_H2C, b0, act0, act0.numel() * 2)
+        bufs.append(b0)
+        halo = torch.full((lines, UE_VECTOR_SIZE), neg_inf, dtype=torch.bfloat16)
+        for _ in range(1, chain):
+            b = self.allocate_params_dram(lines * 128)
+            self.dma_write(DMA_DEVICE_H2C, b, halo, halo.numel() * 2)
+            bufs.append(b)
+        OUT = self.allocate_tensor_dram(out_h * out_w * 128)
+
+        row_bytes = out_w * 128                   # one output row of URAM lines
+        pad_row_bytes = w_pad * 128               # one padded-map row
+        interior = (pad * w_pad + pad) * 128      # byte offset of pixel (pad, pad)
+
+        self.start_capture()
+        for i in range(chain):
+            self.accelerator_memory_to_sram(
+                accelerator_dram_address=bufs[i], sram_address=0x00000,
+                element_size=lines * UE_VECTOR_SIZE)
+            self.start_queue_for_maxpool2d_operation(
+                act_sram_start_addr=0x00000, output_sram_wb_addr=wb_uram_addr << 7,
+                kernel_w=kernel, kernel_h=kernel,
+                out_w=out_w, out_h=out_h, w_pad=w_pad, stride_s=stride_s)
+            if i + 1 < chain:
+                # Strided: drop each output row into the next map's interior,
+                # leaving its pre-filled -inf halo ring untouched. An output row
+                # of out_w*128 B overflows the 17-bit stride chunk field once
+                # out_w >= 1024 (and the field is masked, not checked), so fall
+                # back to one contiguous write per row there — same fix as
+                # run_nn_upsample_2x.
+                if (row_bytes <= UE_STRIDE_CHUNK_MAX_BYTES
+                        and pad_row_bytes <= UE_STRIDE_JUMP_MAX_BYTES):
+                    self.sram_to_accelerator_memory(
+                        sram_address=wb_uram_addr << 7,
+                        accelerator_dram_address=bufs[i + 1] + interior,
+                        element_size=out_h * out_w * UE_VECTOR_SIZE,
+                        stride_bytes_per_chunk=row_bytes,
+                        stride_jump_bytes=pad_row_bytes)
+                else:
+                    for r in range(out_h):
+                        self.sram_to_accelerator_memory(
+                            sram_address=(wb_uram_addr << 7) + r * row_bytes,
+                            accelerator_dram_address=bufs[i + 1] + interior + r * pad_row_bytes,
+                            element_size=0,
+                            memcpy_length_bytes=row_bytes)
+            else:
+                self.sram_to_accelerator_memory(
+                    sram_address=wb_uram_addr << 7,
+                    accelerator_dram_address=OUT,
+                    element_size=out_h * out_w * UE_VECTOR_SIZE)
+        self.stop_capture()
+        self.generate_instruction_halt()
+        program_dram_addr = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(program_dram_addr)
+        inst_bytes = self.get_capture_instruction_size_bytes()
+        self.allocate_program_dram(inst_bytes)
+        self.start_execute_from_dram(program_dram_addr)
+        self.wait_queue(timeout_s)
+        self.last_maxpool_inst_bytes = inst_bytes
+        self.last_maxpool_cycles = self.read_latency_cycles()
+        self.clear_capture_buffer()
+
+        flat = self.dma_from_accelerator_memory(OUT, (out_h * out_w * UE_VECTOR_SIZE,))
+        return maxpool2d_unpack_result(flat, out_h, out_w)[:C]
+
+    def run_conv_transpose2d_k4s2p1(self, x: torch.Tensor, w_codes: torch.Tensor, *,
+                                    scale_mag: float = 1.0,
+                                    data_type: TYPE = TYPE.IF4,
+                                    wb_uram_addr: int = 0x300,
+                                    timeout_s: float = 10.0) -> torch.Tensor:
+        """ConvTranspose2d(C, OC, kernel_size=4, stride=2, padding=1) — the
+        standard UNet/GAN/SAM 2x upsampler — with no new hardware.
+
+        Sub-pixel decomposition (see conv_transpose2d_k4s2p1_decompose): each
+        output parity class (oy%2, ox%2) is an ordinary k=2 s=1 conv of the
+        input padded by one row/column on one side, using a 2x2 sub-grid of
+        the 4x4 kernel; the four (OC, H, W) results interleave into
+        (OC, 2H, 2W). All four sub-convs share one geometry, so they run as
+        ONE captured program. w_codes: (C_in, C_out, 4, 4) integer hardware
+        codes in ConvTranspose weight layout, IF4-INT with |scale| =
+        ``scale_mag``. Returns (OC, 2H, 2W) bf16.
+        """
+        assert data_type == TYPE.IF4
+        import torch.nn.functional as F
+        C, H, W = x.shape
+        assert w_codes.shape[0] == C and w_codes.shape[2:] == (4, 4)
+        OC = w_codes.shape[1]
+        ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        taps = 4 * ct  # 2x2 sub-kernel per parity class
+        results = H * W * OC
+        result_lines = (results + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        subs = conv_transpose2d_k4s2p1_decompose(w_codes)
+        x_bf16 = x.to(torch.bfloat16)
+
+        sub_bufs = []
+        for (a, b, side_pad, w_sub) in subs:
+            xs = F.pad(x_bf16, side_pad)  # (C, H+1, W+1)
+            act_map = conv2d_pack_activation_map(xs, 0)
+            w_stream = conv2d_pack_weight_stream(w_sub, H, W, data_type)
+            scale_stream = conv2d_pack_scale_stream(-abs(scale_mag), OC, taps, H, W)
+            ACT = self.allocate_params_dram(act_map.numel() * 2)
+            self.dma_write(DMA_DEVICE_H2C, ACT, act_map, act_map.numel() * 2)
+            WTS = self.allocate_params_dram(w_stream.numel())
+            self.dma_write(DMA_DEVICE_H2C, WTS, w_stream, w_stream.numel())
+            SCL = self.allocate_params_dram(scale_stream.numel() * 2)
+            self.dma_write(DMA_DEVICE_H2C, SCL, scale_stream, scale_stream.numel() * 2)
+            OUT = self.allocate_tensor_dram(result_lines * 128)
+            sub_bufs.append((a, b, ACT, WTS, SCL, OUT))
+
+        self.start_capture()
+        for (a, b, ACT, WTS, SCL, OUT) in sub_bufs:
+            self.conv2d_core(
+                ACT, WTS, SCL, OUT,
+                c_in=C, in_h=H + 1, in_w=W + 1,
+                kernel_h=2, kernel_w=2, stride_s=1, pad=0,
+                oc_count=OC, data_type=data_type, wb_uram_addr=wb_uram_addr)
+        self.stop_capture()
+        self.generate_instruction_halt()
+        program_dram_addr = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(program_dram_addr)
+        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
+        self.start_execute_from_dram(program_dram_addr)
+        self.wait_queue(timeout_s)
+
+        out = torch.empty(OC, 2 * H, 2 * W, dtype=torch.bfloat16)
+        for (a, b, _, _, _, OUT) in sub_bufs:
+            flat = self.dma_from_accelerator_memory(OUT, (result_lines * UE_VECTOR_SIZE,))
+            out[:, a::2, b::2] = conv2d_unpack_result(flat, H, W, OC)
+        self.clear_capture_buffer()
+        return out
+
+    def run_group_norm(self, x: torch.Tensor, *, num_groups: int = 32,
+                       gamma: Optional[torch.Tensor] = None,
+                       beta: Optional[torch.Tensor] = None,
+                       eps: float = 1e-5,
+                       timeout_s: float = 60.0) -> torch.Tensor:
+        """GroupNorm over (C, H, W) — every VAE decoder ResNetBlock and the
+        final norm_out. Matches ``F.group_norm`` to within bf16 accumulation
+        error (this is an SNR-gated op, not a bit-exact one).
+
+        Three stages (see :func:`plan_group_norm` for why this shape):
+
+        1. DEVICE, O(C*H*W): lane-wise accumulation of per-channel ``sum(x)``
+           and ``sum(x^2)`` into ``slots`` live pixel accumulators, using only
+           ELTWISE_ADD / ELTWISE_MUL. Because a URAM line already holds 64
+           channels of one pixel, adding lines lane-wise yields per-channel
+           sums directly — no repack, and no reduction row spanning a whole
+           group.
+        2. HOST, O(C): finish the slot sums in float64, reduce channels into
+           ``num_groups`` group statistics, and fold mean/inv_std/gamma/beta
+           into one per-channel ``(A, B)`` via :func:`group_norm_fold_affine`.
+        3. DEVICE, O(C*H*W): apply ``y = x * A_c + B_c``, which in this layout
+           is two eltwise ops against a repeated 64-lane vector.
+
+        The stage-2 host round trip moves only ``2*C`` scalars, but it IS a
+        host round trip per GroupNorm layer. Folding it on-device needs the
+        LALU RSQRT leg and is the natural follow-on once layer chaining
+        (avoiding per-layer host round-trips) is built.
+
+        Squaring loads each chunk into BOTH URAM banks, since ELTWISE_MUL
+        requires its operands in different banks — that costs a second DMA
+        read of the activation, not extra compute.
+        """
+        assert x.dim() == 3, f"expected (C, H, W), got shape {tuple(x.shape)}"
+        C, H, W = x.shape
+        assert C % num_groups == 0, f"C={C} not divisible by num_groups={num_groups}"
+        for nm, t in (("gamma", gamma), ("beta", beta)):
+            if t is not None:
+                assert t.numel() == C, f"{nm} must have C={C} entries, got {t.numel()}"
+        (ct, slots, slot_lines, n_full, tail,
+         flush_every, n_flushes) = plan_group_norm(C, H, W, num_groups)
+        pixels = H * W
+        line_bytes = UE_VECTOR_SIZE * 2
+        chunk_bytes = slot_lines * line_bytes
+
+        act_map = conv2d_pack_activation_map(x.to(torch.bfloat16), 0)
+        ACT = self.allocate_params_dram(act_map.numel() * 2)
+        self.dma_write(DMA_DEVICE_H2C, ACT, act_map, act_map.numel() * 2)
+        # One partial block per flush, for each statistic. ZERO is the source
+        # the accumulators are re-primed from after every flush.
+        zeros = torch.zeros(slot_lines, UE_VECTOR_SIZE, dtype=torch.bfloat16)
+        ZERO = self.allocate_params_dram(chunk_bytes)
+        self.dma_write(DMA_DEVICE_H2C, ZERO, zeros, zeros.numel() * 2)
+        SUM = self.allocate_params_dram(chunk_bytes * n_flushes)
+        SQ = self.allocate_params_dram(chunk_bytes * n_flushes)
+
+        # URAM map (lines). A: chunk | square scratch.  B: chunk copy | sum | sumsq.
+        # sram_address_to_uram_address masks the line index with 0xFFF, so an
+        # over-budget block would silently WRAP onto live data instead of
+        # faulting — assert the budget explicitly.
+        A_CHUNK, A_SQUARE = 0, slot_lines
+        B_COPY, B_SUM, B_SQ = 0, slot_lines, 2 * slot_lines
+        assert 2 * slot_lines <= 4096 and 3 * slot_lines <= 4096, (
+            f"run_group_norm: slot_lines={slot_lines} overruns a 4096-line URAM bank "
+            f"(URAM_A needs 2x, URAM_B needs 3x); lower GROUP_NORM_SLOT_LINES")
+        a_sram = lambda ln: ln * line_bytes
+        b_sram = lambda ln: 0x80000 + ln * line_bytes
+
+        # ---- pass 1: per-channel sum / sumsq ----
+        n_chunks = n_full + (1 if tail else 0)
+        self.start_capture()
+
+        def _prime():
+            """(Re-)zero both accumulators from the shared ZERO block."""
+            self.accelerator_memory_to_sram(accelerator_dram_address=ZERO,
+                                            sram_address=b_sram(B_SUM), element_size=0,
+                                            memcpy_length_bytes=chunk_bytes)
+            self.accelerator_memory_to_sram(accelerator_dram_address=ZERO,
+                                            sram_address=b_sram(B_SQ), element_size=0,
+                                            memcpy_length_bytes=chunk_bytes)
+
+        def _flush(f):
+            """Write both accumulators out as partial block f."""
+            self.sram_to_accelerator_memory(sram_address=b_sram(B_SUM),
+                                            accelerator_dram_address=SUM + f * chunk_bytes,
+                                            element_size=0, memcpy_length_bytes=chunk_bytes)
+            self.sram_to_accelerator_memory(sram_address=b_sram(B_SQ),
+                                            accelerator_dram_address=SQ + f * chunk_bytes,
+                                            element_size=0, memcpy_length_bytes=chunk_bytes)
+
+        _prime()
+        for i in range(n_chunks):
+            take_px = slots if i < n_full else tail
+            take_lines = take_px * ct
+            take_bytes = take_lines * line_bytes
+            src = ACT + i * chunk_bytes
+            # Same data into both banks: URAM_A for the sum leg, URAM_B so the
+            # square has a legal second operand.
+            self.accelerator_memory_to_sram(accelerator_dram_address=src,
+                                            sram_address=a_sram(A_CHUNK), element_size=0,
+                                            memcpy_length_bytes=take_bytes)
+            self.accelerator_memory_to_sram(accelerator_dram_address=src,
+                                            sram_address=b_sram(B_COPY), element_size=0,
+                                            memcpy_length_bytes=take_bytes)
+            # sum += x
+            self.eltwise_add_core(a_sram(A_CHUNK), b_sram(B_SUM), b_sram(B_SUM),
+                                  take_lines * UE_VECTOR_SIZE)
+            # sq += x*x
+            self.eltwise_mul_core(a_sram(A_CHUNK), b_sram(B_COPY), a_sram(A_SQUARE),
+                                  take_lines * UE_VECTOR_SIZE)
+            self.eltwise_add_core(a_sram(A_SQUARE), b_sram(B_SQ), b_sram(B_SQ),
+                                  take_lines * UE_VECTOR_SIZE)
+            # Flush at the depth cap (and after the final chunk) so no bf16
+            # accumulator absorbs more than flush_every additions.
+            if (i + 1) % flush_every == 0 or i == n_chunks - 1:
+                f = i // flush_every
+                _flush(f)
+                if i != n_chunks - 1:
+                    _prime()
+        self.stop_capture()
+        self.generate_instruction_halt()
+        prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog)
+        stats_inst_bytes = self.get_capture_instruction_size_bytes()
+        self.allocate_program_dram(stats_inst_bytes)
+        self.start_execute_from_dram(prog)
+        self.wait_queue(timeout_s)
+        stats_cycles = self.read_latency_cycles()
+        self.clear_capture_buffer()
+
+        # ---- host: finish the slot sums, fold group stats into per-channel (A, B) ----
+        sum_blocks = self.dma_from_accelerator_memory(
+            SUM, (n_flushes * slot_lines * UE_VECTOR_SIZE,)).reshape(-1, ct * UE_VECTOR_SIZE)
+        sq_blocks = self.dma_from_accelerator_memory(
+            SQ, (n_flushes * slot_lines * UE_VECTOR_SIZE,)).reshape(-1, ct * UE_VECTOR_SIZE)
+        sum_c = sum_blocks.to(torch.float64).sum(dim=0)[:C]
+        sumsq_c = sq_blocks.to(torch.float64).sum(dim=0)[:C]
+        A_vec, B_vec = group_norm_fold_affine(
+            sum_c, sumsq_c, (C // num_groups) * H * W, num_groups, gamma, beta, eps)
+
+        # ---- pass 2: y = x*A + B, per-channel vectors repeated per pixel slot ----
+        def _repeat(vec):
+            line = torch.zeros(ct * UE_VECTOR_SIZE, dtype=torch.bfloat16)
+            line[:C] = vec
+            return line.reshape(ct, UE_VECTOR_SIZE).repeat(slots, 1).contiguous()
+
+        a_rep, b_rep = _repeat(A_vec), _repeat(B_vec)
+        AREP = self.allocate_params_dram(chunk_bytes)
+        self.dma_write(DMA_DEVICE_H2C, AREP, a_rep, a_rep.numel() * 2)
+        BREP = self.allocate_params_dram(chunk_bytes)
+        self.dma_write(DMA_DEVICE_H2C, BREP, b_rep, b_rep.numel() * 2)
+        OUT = self.allocate_tensor_dram(pixels * ct * line_bytes)
+
+        B_A, B_B = 0, slot_lines
+        self.start_capture()
+        self.accelerator_memory_to_sram(accelerator_dram_address=AREP,
+                                        sram_address=b_sram(B_A), element_size=0,
+                                        memcpy_length_bytes=chunk_bytes)
+        self.accelerator_memory_to_sram(accelerator_dram_address=BREP,
+                                        sram_address=b_sram(B_B), element_size=0,
+                                        memcpy_length_bytes=chunk_bytes)
+        for i in range(n_full + (1 if tail else 0)):
+            take_px = slots if i < n_full else tail
+            take_lines = take_px * ct
+            take_bytes = take_lines * line_bytes
+            off = i * chunk_bytes
+            self.accelerator_memory_to_sram(accelerator_dram_address=ACT + off,
+                                            sram_address=a_sram(A_CHUNK), element_size=0,
+                                            memcpy_length_bytes=take_bytes)
+            self.eltwise_mul_core(a_sram(A_CHUNK), b_sram(B_A), a_sram(A_CHUNK),
+                                  take_lines * UE_VECTOR_SIZE)
+            self.eltwise_add_core(a_sram(A_CHUNK), b_sram(B_B), a_sram(A_CHUNK),
+                                  take_lines * UE_VECTOR_SIZE)
+            self.sram_to_accelerator_memory(sram_address=a_sram(A_CHUNK),
+                                            accelerator_dram_address=OUT + off,
+                                            element_size=0, memcpy_length_bytes=take_bytes)
+        self.stop_capture()
+        self.generate_instruction_halt()
+        prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog)
+        apply_inst_bytes = self.get_capture_instruction_size_bytes()
+        self.allocate_program_dram(apply_inst_bytes)
+        self.start_execute_from_dram(prog)
+        self.wait_queue(timeout_s)
+        self.last_groupnorm_cycles = stats_cycles + self.read_latency_cycles()
+        self.last_groupnorm_inst_bytes = stats_inst_bytes + apply_inst_bytes
+        self.clear_capture_buffer()
+
+        flat = self.dma_from_accelerator_memory(OUT, (pixels * ct * UE_VECTOR_SIZE,))
+        return packed_map_to_chw(flat, H, W, C)
+
+    def run_nn_upsample_2x(self, x: torch.Tensor, *,
+                           timeout_s: float = 30.0) -> torch.Tensor:
+        """Nearest-neighbour 2x spatial upsample, (C, H, W) -> (C, 2H, 2W).
+
+        Matches ``F.interpolate(x, scale_factor=2, mode='nearest')`` — the
+        SD/SDXL VAE decoder and UNet upsample op. Pure data movement: no
+        compute unit is involved, no arithmetic touches the payload, so any
+        bf16 input (including inf/NaN) is reproduced bit-exactly.
+
+        STRIDE FIELD LIMIT: a vertical chunk is one input row
+        (``in_w * ct * 128`` bytes). The descriptor now carries 17 bits, so the
+        VAE's 65536-byte 512-channel 64x64 chunk remains on the strided path.
+        Larger chunks or 21-bit jump overflows unroll into one contiguous write
+        per chunk; only the instruction count grows.
+
+        Runs as four uniform strided DMA passes over the packed
+        channels-in-lanes map (see :func:`plan_nn_upsample_2x`): two vertical
+        row-doubling passes into a scratch buffer, then two horizontal
+        pixel-doubling passes into the output. Each pass is a sequence of
+        [contiguous read -> URAM staging -> strided writeback] rounds sized to
+        the URAM budget; all rounds are captured into ONE program and executed
+        without host involvement.
+
+        DEPLOYMENT NOTE: for the VAE decoder's ``[upsample -> 3x3 conv]``
+        stages, prefer :meth:`run_nn_upsample_conv3x3`, which folds the
+        upsample into the conv as four parity k=2 sub-convs. That skips
+        materialising the 2x map entirely — at the 256x256x256 stage this op
+        writes 201 MB the fused form never touches — and cuts the conv's MACs
+        to 4/9. This standalone primitive is the correctness reference and the
+        fallback for upsamples that are not immediately followed by a conv
+        (and for weights whose folded codes overflow the type — see
+        :func:`nn_upsample_conv3x3_fold`).
+        """
+        assert x.dim() == 3, f"expected (C, H, W), got shape {tuple(x.shape)}"
+        C, H, W = x.shape
+        out_h, out_w, ct, passes = plan_nn_upsample_2x(H, W, C)
+
+        # Every pass stages one round in URAM_A, so a single chunk (one input
+        # row for the vertical passes) must fit the bank.
+        max_chunk = max(p['chunk_bytes'] for p in passes)
+        if max_chunk > URAM_NEAR_FULL_SIZE:
+            raise ValueError(
+                f"run_nn_upsample_2x: one input row is {max_chunk} bytes "
+                f"(in_w={W}, ct={ct}), over the {URAM_NEAR_FULL_SIZE}-byte URAM "
+                f"staging budget. Split the tensor into column strips, or fuse "
+                f"the upsample into the following conv."
+            )
+
+        act_map = conv2d_pack_activation_map(x.to(torch.bfloat16), 0)
+        IN = self.allocate_params_dram(act_map.numel() * 2)
+        self.dma_write(DMA_DEVICE_H2C, IN, act_map, act_map.numel() * 2)
+        TMP = self.allocate_tensor_dram(2 * H * W * ct * 128)
+        OUT = self.allocate_tensor_dram(out_h * out_w * ct * 128)
+        src_of = {'in': IN, 'tmp': TMP}
+
+        self.start_capture()
+        for p in passes:
+            src = src_of[p['src']]
+            dst = TMP if p['kind'] == 'v' else OUT
+            chunk, jump = p['chunk_bytes'], p['jump_bytes']
+            # The descriptor's stride fields are only 16/21 bits wide and are
+            # MASKED, not checked, so an oversized chunk silently scatters to
+            # the wrong addresses. A vertical chunk is one input row
+            # (in_w*ct*128), which reaches 65536 B at the VAE's 512-ch 64x64
+            # up-stage — exactly one over the 16-bit limit. When it does not
+            # fit, unroll the stride into one contiguous write per chunk; the
+            # batched read is unaffected, so only the write instruction count
+            # grows (one per chunk instead of one per round).
+            strided = (chunk <= UE_STRIDE_CHUNK_MAX_BYTES
+                       and jump <= UE_STRIDE_JUMP_MAX_BYTES)
+            # Round = as many whole chunks as the staging bank holds.
+            round_bytes = (URAM_NEAR_FULL_SIZE // chunk) * chunk
+            done_bytes = 0
+            chunks_done = 0
+            while done_bytes < p['total_bytes']:
+                take = min(round_bytes, p['total_bytes'] - done_bytes)
+                self.accelerator_memory_to_sram(
+                    accelerator_dram_address=src + done_bytes,
+                    sram_address=0x00000,
+                    element_size=0,
+                    memcpy_length_bytes=take)
+                base = dst + p['dst_off'] + chunks_done * jump
+                if strided:
+                    self.sram_to_accelerator_memory(
+                        sram_address=0x00000,
+                        accelerator_dram_address=base,
+                        element_size=0,
+                        memcpy_length_bytes=take,
+                        stride_bytes_per_chunk=chunk,
+                        stride_jump_bytes=jump)
+                else:
+                    for i in range(take // chunk):
+                        self.sram_to_accelerator_memory(
+                            sram_address=i * chunk,
+                            accelerator_dram_address=base + i * jump,
+                            element_size=0,
+                            memcpy_length_bytes=chunk)
+                done_bytes += take
+                chunks_done += take // chunk
+        self.stop_capture()
+        self.generate_instruction_halt()
+        program_dram_addr = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(program_dram_addr)
+        inst_bytes = self.get_capture_instruction_size_bytes()
+        self.allocate_program_dram(inst_bytes)
+        self.start_execute_from_dram(program_dram_addr)
+        self.wait_queue(timeout_s)
+        self.last_upsample_inst_bytes = inst_bytes
+        self.last_upsample_cycles = self.read_latency_cycles()
+        self.clear_capture_buffer()
+
+        flat = self.dma_from_accelerator_memory(
+            OUT, (out_h * out_w * ct * UE_VECTOR_SIZE,))
+        return nn_upsample_2x_unpack_result(flat, out_h, out_w, C)
+
+    def run_nn_upsample_conv3x3(self, x: torch.Tensor, w_codes: torch.Tensor, *,
+                                scale_mag: float = 1.0,
+                                bias: Optional[torch.Tensor] = None,
+                                relu_enable: bool = False,
+                                silu_enable: bool = False,
+                                gelu_enable: bool = False,
+                                data_type: TYPE = TYPE.IF4,
+                                wb_uram_addr: int = 0x300,
+                                timeout_s: float = 300.0) -> torch.Tensor:
+        """Fused ``[nearest 2x upsample -> Conv2d(k=3, s=1, p=1)]``, the VAE
+        decoder / UNet resize-conv block, as four k=2 convs on the ORIGINAL map.
+
+        Matches ``F.conv2d(F.interpolate(x, scale_factor=2, mode='nearest'),
+        w, k=3, s=1, p=1)`` for (C, H, W) -> (OC, 2H, 2W). See
+        :func:`nn_upsample_conv3x3_fold` for the derivation: each output parity
+        class (oy%2, ox%2) reads only two distinct source pixels per axis, so
+        the k=3 taps fold pairwise into a k=2 conv on a one-side-padded input.
+
+        Why this and not [run_nn_upsample_2x -> run_conv2d_layer]: the 2x map is
+        never materialised (saving its whole DMA round trip — 201 MB at the
+        256x256x256 stage) and the conv runs 4/9 the MACs (2.25x), because
+        convolving the upsampled map recomputes taps that read the same source
+        pixel.
+
+        Each parity runs as its own full tiled layer via
+        :meth:`run_conv2d_layer`, so the tiling planner, PBI tile loop and
+        single-launch caps all apply unchanged and real VAE shapes work.
+        Bias/fused-activation are per output pixel and every output pixel
+        belongs to exactly ONE parity class, so they pass through to all four
+        sub-convs untouched.
+
+        ``w_codes``: (OC, C, 3, 3) integer codes, IF4-INT with uniform
+        effective |scale| = ``scale_mag``. Raises if the folded codes overflow
+        the type — the fold sums up to four codes, so INT4 needs unfolded codes
+        in [-2, 1] worst case (:func:`nn_upsample_conv3x3_fold_fits`).
+        """
+        import torch.nn.functional as F
+        assert x.dim() == 3, f"expected (C, H, W), got shape {tuple(x.shape)}"
+        assert w_codes.dim() == 4 and w_codes.shape[2:] == (3, 3), \
+            f"expected (OC, C, 3, 3) weights, got {tuple(w_codes.shape)}"
+        C, H, W = x.shape
+        OC = w_codes.shape[0]
+        assert w_codes.shape[1] == C, f"weight C_in {w_codes.shape[1]} != activation C {C}"
+
+        subs = nn_upsample_conv3x3_fold(w_codes)
+        lo, hi = (-128, 127) if data_type == TYPE.IF8 else (-8, 7)
+        worst = max(max(abs(int(ws.min())), abs(int(ws.max()))) for _, _, _, ws in subs)
+        if not nn_upsample_conv3x3_fold_fits(w_codes, data_type):
+            raise ValueError(
+                f"fused upsample+conv3x3: folded weight codes reach magnitude {worst}, "
+                f"outside the {data_type.name} code range [{lo}, {hi}]. The fold sums up "
+                f"to 4 taps, so unfolded codes must stay within a quarter of the range. "
+                f"Fall back to run_nn_upsample_2x + run_conv2d_layer for these weights.")
+
+        x_bf16 = x.to(torch.bfloat16)
+        out = torch.empty(OC, 2 * H, 2 * W, dtype=torch.bfloat16)
+        inst_bytes = cycles = 0
+        for (a, b, side_pad, w_sub) in subs:
+            sub = self.run_conv2d_layer(
+                F.pad(x_bf16, side_pad), w_sub,
+                stride_s=1, pad=0, scale_mag=scale_mag, bias=bias,
+                relu_enable=relu_enable, silu_enable=silu_enable,
+                gelu_enable=gelu_enable, data_type=data_type,
+                wb_uram_addr=wb_uram_addr, timeout_s=timeout_s)
+            out[:, a::2, b::2] = sub
+            inst_bytes += self.last_conv_inst_bytes
+            cycles += self.last_conv_cycles
+        # Aggregate across the four parity launches so callers report the whole
+        # fused op, matching the single-launch last_conv_* contract.
+        self.last_conv_inst_bytes = inst_bytes
+        self.last_conv_cycles = cycles
+        return out
+
+    def run_eltwise_add_layer(self, x: torch.Tensor, y: torch.Tensor, *,
+                              timeout_s: float = 120.0) -> torch.Tensor:
+        """Full-tensor element-wise add, ``(C, H, W) + (C, H, W)`` on device.
+
+        The ResNetBlock residual (and any whole-tensor bf16 add). ELTWISE_ADD is
+        already a 64-lane hardware mode; what was missing was a DRAM-to-DRAM
+        layer driver over it — :meth:`eltwise_add_core` is SRAM-level and only
+        covers one URAM-resident chunk.
+
+        Runs as [read X into URAM_A -> read Y into URAM_B -> ELTWISE_ADD ->
+        writeback] rounds sized to the staging budget, all captured into ONE
+        program. ``eltwise_add_core`` requires its two operands in DIFFERENT
+        banks, which is why Y is staged into URAM_B rather than reusing A.
+
+        Layout-agnostic: the add is per-element over the packed
+        channels-in-lanes map, so it neither knows nor cares about the pixel /
+        channel-tile split, and any bf16 payload is added exactly as the
+        hardware adder does (this is an SNR-gated op only insofar as bf16
+        rounding is).
+        """
+        assert x.shape == y.shape, f"shape mismatch: {tuple(x.shape)} vs {tuple(y.shape)}"
+        assert x.dim() == 3, f"expected (C, H, W), got {tuple(x.shape)}"
+        C, H, W = x.shape
+        line_bytes = UE_VECTOR_SIZE * 2
+        ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        total_lines = H * W * ct
+
+        # Both operands must be resident simultaneously in opposite banks, so a
+        # round is capped by the SMALLER of the two banks' budgets.
+        max_lines = min(URAM_NEAR_FULL_SIZE // line_bytes, 4096)
+        round_lines = max_lines
+
+        xs = conv2d_pack_activation_map(x.to(torch.bfloat16), 0)
+        ys = conv2d_pack_activation_map(y.to(torch.bfloat16), 0)
+        XB = self.allocate_params_dram(xs.numel() * 2)
+        self.dma_write(DMA_DEVICE_H2C, XB, xs, xs.numel() * 2)
+        YB = self.allocate_params_dram(ys.numel() * 2)
+        self.dma_write(DMA_DEVICE_H2C, YB, ys, ys.numel() * 2)
+        OUT = self.allocate_tensor_dram(total_lines * line_bytes)
+
+        self.start_capture()
+        done = 0
+        while done < total_lines:
+            take = min(round_lines, total_lines - done)
+            off = done * line_bytes
+            nbytes = take * line_bytes
+            self.accelerator_memory_to_sram(
+                accelerator_dram_address=XB + off, sram_address=0x00000,
+                element_size=0, memcpy_length_bytes=nbytes)
+            self.accelerator_memory_to_sram(
+                accelerator_dram_address=YB + off, sram_address=0x80000,
+                element_size=0, memcpy_length_bytes=nbytes)
+            self.eltwise_add_core(0x00000, 0x80000, 0x00000, take * UE_VECTOR_SIZE)
+            self.sram_to_accelerator_memory(
+                sram_address=0x00000, accelerator_dram_address=OUT + off,
+                element_size=0, memcpy_length_bytes=nbytes)
+            done += take
+        self.stop_capture()
+        self.generate_instruction_halt()
+        prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog)
+        inst_bytes = self.get_capture_instruction_size_bytes()
+        self.allocate_program_dram(inst_bytes)
+        self.start_execute_from_dram(prog)
+        self.wait_queue(timeout_s)
+        self.last_eltwise_inst_bytes = inst_bytes
+        self.last_eltwise_cycles = self.read_latency_cycles()
+        self.clear_capture_buffer()
+
+        flat = self.dma_from_accelerator_memory(OUT, (total_lines * UE_VECTOR_SIZE,))
+        return packed_map_to_chw(flat, H, W, C)
+
+    @staticmethod
+    def _pack_relu_pairs(x: torch.Tensor):
+        """Pack ``x`` and an interleaved zero line for 1x2 per-lane pooling."""
+        assert x.dim() == 3, f"expected (C, H, W), got {tuple(x.shape)}"
+        C, H, W = x.shape
+        assert C > 0 and H > 0 and W > 0, f"empty activation shape {tuple(x.shape)}"
+        line_bytes = UE_VECTOR_SIZE * 2
+        ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        total_lines = H * W * ct
+
+        # Every output consumes the pair [x_line, zero_line]. The geometry's
+        # pix_row_step is stride(2) * padded_width(2*round_lines), so that
+        # otherwise-unused (out_h=1) 12-bit field is the tightest limit.
+        round_lines = min(total_lines, 0xFFF // 4,
+                          (URAM_NEAR_FULL_SIZE // line_bytes) // 2)
+        n_rounds = (total_lines + round_lines - 1) // round_lines
+        padded_lines = n_rounds * round_lines
+
+        packed = conv2d_pack_activation_map(x.to(torch.bfloat16), 0)
+        paired = torch.zeros(padded_lines, 2, UE_VECTOR_SIZE, dtype=torch.bfloat16)
+        paired[:total_lines, 0, :] = packed
+        return paired.reshape(-1, UE_VECTOR_SIZE), (
+            C, H, W, total_lines, round_lines, n_rounds)
+
+    def run_relu_layer(self, x: torch.Tensor, *,
+                       timeout_s: float = 120.0) -> torch.Tensor:
+        """Full-tensor per-lane ``max(x, 0)`` using the MAXPOOL compare tree.
+
+        MAXPOOL is already a 64-lane BF16 compare-select unit.  Presenting the
+        packed map as adjacent ``[x_line, zero_line]`` pairs and selecting a
+        1x2, stride-2 window exposes that unit as the missing wide ReLU
+        primitive.  Fixed-size padded rounds keep one geometry for the whole
+        captured loop; padding is discarded on readback.
+
+        The pooling unit intentionally filters NaNs, so this primitive has the
+        same finite-input contract as the VAE GroupNorm output it serves.
+        """
+        paired, shape = self._pack_relu_pairs(x)
+        C, H, W, total_lines, round_lines, n_rounds = shape
+        line_bytes = UE_VECTOR_SIZE * 2
+        pair_bytes = 2 * round_lines * line_bytes
+        out_bytes = round_lines * line_bytes
+
+        params_mark = self._next_params_dram_addr
+        tensor_mark = self._tensor_dram_addr
+        PAIRS = self.allocate_params_dram(paired.numel() * 2)
+        self.dma_write(DMA_DEVICE_H2C, PAIRS, paired, paired.numel() * 2)
+        OUT = self.allocate_tensor_dram(n_rounds * out_bytes)
+
+        self.start_capture()
+        pair_reg = self.alloc_isa_reg()
+        out_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(pair_reg, PAIRS >> 3)
+        self.generate_instruction_add_set(out_reg, OUT >> 3)
+        program_dram_start_addr = self.get_program_dram_addr()
+        self.generate_instruction_jump_abs(
+            ue_35bit_addr_shifter(
+                program_dram_start_addr
+                + (self.capture_count + 1) * INSTRUCTION_SIZE_BYTES))
+        self.loop_start(loop_cnt=n_rounds)
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=0, sram_address=0x00000,
+            element_size=0, memcpy_length_bytes=pair_bytes,
+            general_reg_src=pair_reg)
+        self.start_queue_for_maxpool2d_operation(
+            act_sram_start_addr=0x00000,
+            output_sram_wb_addr=0x80000,
+            kernel_w=2, kernel_h=1,
+            out_w=round_lines, out_h=1,
+            w_pad=2 * round_lines, stride_s=2)
+        self.sram_to_accelerator_memory(
+            sram_address=0x80000, accelerator_dram_address=0,
+            element_size=0, memcpy_length_bytes=out_bytes,
+            general_reg_src=out_reg)
+        self.generate_instruction_add_imm(
+            src_reg_idx=pair_reg, immediate_value=pair_bytes >> 3)
+        self.generate_instruction_add_imm(
+            src_reg_idx=out_reg, immediate_value=out_bytes >> 3)
+        loop_body_size = self.loop_end()
+        assert loop_body_size <= 256
+        self.release_isa_reg()  # out_reg
+        self.release_isa_reg()  # pair_reg
+        self.stop_capture()
+        self.generate_instruction_halt()
+        prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog)
+        inst_bytes = self.get_capture_instruction_size_bytes()
+        self.allocate_program_dram(inst_bytes)
+        self.start_execute_from_dram(prog)
+        self.wait_queue(timeout_s)
+        self.last_relu_inst_bytes = inst_bytes
+        self.last_relu_cycles = self.read_latency_cycles()
+        self.clear_capture_buffer()
+
+        flat = self.dma_from_accelerator_memory(
+            OUT, (n_rounds * round_lines * UE_VECTOR_SIZE,))
+        result = packed_map_to_chw(
+            flat[:total_lines * UE_VECTOR_SIZE], H, W, C)
+        # All device buffers are staging for a host-returning layer; make the
+        # arena reusable by the next decoder node.
+        self._next_params_dram_addr = params_mark
+        self._tensor_dram_addr = tensor_mark
+        return result
+
+    def run_silu_layer(self, x: torch.Tensor, *,
+                       coeffs=None,
+                       timeout_s: float = 300.0) -> torch.Tensor:
+        """Full-tensor SiLU composed from existing 64-lane device operations.
+
+        For finite ``x``::
+
+            xp = max(x, 0);  xn = x - xp
+            w = exp(xn - xp) = exp(-abs(x))
+            p = P(w) ~= 1/(1+w);  q = w*p
+            silu(x) = xp*p + xn*q
+
+        ``P`` is the degree-4 polynomial in :data:`SILU_RECIP_POLY`.  The
+        sign split keeps EXP's input non-positive and makes both tails stable.
+        Every intermediate is rounded through BF16, matching
+        :func:`silu_mul_add_ref`.
+
+        The entire layer is one captured hardware loop.  Only input/output are
+        full-tensor allocations; ``xp``, ``xn``, and ``w/q`` reuse three
+        fixed one-round DRAM buffers.
+        """
+        if coeffs is None:
+            coeffs = SILU_RECIP_POLY
+        if len(coeffs) < 2:
+            raise ValueError("run_silu_layer: coeffs must contain at least c0 and c1")
+        paired, shape = self._pack_relu_pairs(x)
+        C, H, W, total_lines, round_lines, n_rounds = shape
+        line_bytes = UE_VECTOR_SIZE * 2
+        chunk_bytes = round_lines * line_bytes
+        pair_bytes = 2 * chunk_bytes
+        elements = round_lines * UE_VECTOR_SIZE
+
+        params_mark = self._next_params_dram_addr
+        tensor_mark = self._tensor_dram_addr
+        PAIRS = self.allocate_params_dram(paired.numel() * 2)
+        self.dma_write(DMA_DEVICE_H2C, PAIRS, paired, paired.numel() * 2)
+
+        # Round-local scratch: XP is later reused for the positive term.
+        XP = self.allocate_tensor_dram(chunk_bytes)
+        XN = self.allocate_tensor_dram(chunk_bytes)
+        WQ = self.allocate_tensor_dram(chunk_bytes)
+        OUT = self.allocate_tensor_dram(n_rounds * chunk_bytes)
+
+        self.start_capture()
+        pair_reg = self.alloc_isa_reg()
+        out_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(pair_reg, PAIRS >> 3)
+        self.generate_instruction_add_set(out_reg, OUT >> 3)
+        program_dram_start_addr = self.get_program_dram_addr()
+        self.generate_instruction_jump_abs(
+            ue_35bit_addr_shifter(
+                program_dram_start_addr
+                + (self.capture_count + 1) * INSTRUCTION_SIZE_BYTES))
+        self.loop_start(loop_cnt=n_rounds)
+
+        # xp = max(x, 0), with [x, 0] pairs staged in URAM_A.
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=0, sram_address=0x00000,
+            element_size=0, memcpy_length_bytes=pair_bytes,
+            general_reg_src=pair_reg)
+        self.start_queue_for_maxpool2d_operation(
+            act_sram_start_addr=0x00000,
+            output_sram_wb_addr=0x80000,
+            kernel_w=2, kernel_h=1,
+            out_w=round_lines, out_h=1,
+            w_pad=2 * round_lines, stride_s=2)
+        self.sram_to_accelerator_memory(
+            sram_address=0x80000, accelerator_dram_address=XP,
+            element_size=0, memcpy_length_bytes=chunk_bytes)
+
+        # Read only the x lines back out of the same [x,0] map, then
+        # xn = x - xp. The stride fields are tiny (128/256 bytes), avoiding
+        # the 16-bit large-row limit that affected vertical upsampling.
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=0, sram_address=0x00000,
+            element_size=0, memcpy_length_bytes=chunk_bytes,
+            stride_bytes_per_chunk=line_bytes,
+            stride_jump_bytes=2 * line_bytes,
+            general_reg_src=pair_reg)
+        self.eltwise_sub_core(0x00000, 0x80000, 0x00000, elements)
+        self.sram_to_accelerator_memory(
+            sram_address=0x00000, accelerator_dram_address=XN,
+            element_size=0, memcpy_length_bytes=chunk_bytes)
+
+        # w = exp(xn - xp), always in (0, 1] for finite inputs.
+        self.eltwise_sub_core(0x00000, 0x80000, 0x00000, elements)
+        self.exp_core(0x00000, 0x00000, elements)
+        self.sram_to_accelerator_memory(
+            sram_address=0x00000, accelerator_dram_address=WQ,
+            element_size=0, memcpy_length_bytes=chunk_bytes)
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=WQ, sram_address=0x80000,
+            element_size=0, memcpy_length_bytes=chunk_bytes)
+
+        # Horner without a constant-fill pass:
+        # p = (((c4*w + c3)*w + c2)*w + c1)*w + c0.
+        self.broadcast_mul(float(coeffs[-1]), 0x00000, 0x00000, elements)
+        self.broadcast_add(float(coeffs[-2]), 0x00000, 0x00000, elements)
+        for coeff in reversed(coeffs[:-2]):
+            self.eltwise_mul_core(0x00000, 0x80000, 0x00000, elements)
+            self.broadcast_add(float(coeff), 0x00000, 0x00000, elements)
+
+        # q = w*p. Keep p in A, write q to B, then preserve q over the
+        # positive-branch multiply.
+        self.eltwise_mul_core(0x00000, 0x80000, 0x80000, elements)
+        self.sram_to_accelerator_memory(
+            sram_address=0x80000, accelerator_dram_address=WQ,
+            element_size=0, memcpy_length_bytes=chunk_bytes)
+
+        # pos = xp*p; XP is dead after this load, so reuse its scratch buffer.
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=XP, sram_address=0x80000,
+            element_size=0, memcpy_length_bytes=chunk_bytes)
+        self.eltwise_mul_core(0x00000, 0x80000, 0x00000, elements)
+        self.sram_to_accelerator_memory(
+            sram_address=0x00000, accelerator_dram_address=XP,
+            element_size=0, memcpy_length_bytes=chunk_bytes)
+
+        # y = xn*q + pos.
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=XN, sram_address=0x00000,
+            element_size=0, memcpy_length_bytes=chunk_bytes)
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=WQ, sram_address=0x80000,
+            element_size=0, memcpy_length_bytes=chunk_bytes)
+        self.eltwise_mul_core(0x00000, 0x80000, 0x00000, elements)
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=XP, sram_address=0x80000,
+            element_size=0, memcpy_length_bytes=chunk_bytes)
+        self.eltwise_add_core(0x00000, 0x80000, 0x00000, elements)
+        self.sram_to_accelerator_memory(
+            sram_address=0x00000, accelerator_dram_address=0,
+            element_size=0, memcpy_length_bytes=chunk_bytes,
+            general_reg_src=out_reg)
+
+        self.generate_instruction_add_imm(
+            src_reg_idx=pair_reg, immediate_value=pair_bytes >> 3)
+        self.generate_instruction_add_imm(
+            src_reg_idx=out_reg, immediate_value=chunk_bytes >> 3)
+        loop_body_size = self.loop_end()
+        assert loop_body_size <= 256
+        self.release_isa_reg()  # out_reg
+        self.release_isa_reg()  # pair_reg
+        self.stop_capture()
+        self.generate_instruction_halt()
+        prog = self.get_program_dram_addr()
+        self.write_captured_instructions_to_dram(prog)
+        inst_bytes = self.get_capture_instruction_size_bytes()
+        self.allocate_program_dram(inst_bytes)
+        self.start_execute_from_dram(prog)
+        self.wait_queue(timeout_s)
+        self.last_silu_inst_bytes = inst_bytes
+        self.last_silu_cycles = self.read_latency_cycles()
+        self.last_silu_passes = 2 * (len(coeffs) - 1) + 9
+        self.clear_capture_buffer()
+
+        flat = self.dma_from_accelerator_memory(
+            OUT, (n_rounds * round_lines * UE_VECTOR_SIZE,))
+        result = packed_map_to_chw(
+            flat[:total_lines * UE_VECTOR_SIZE], H, W, C)
+        self._next_params_dram_addr = params_mark
+        self._tensor_dram_addr = tensor_mark
+        return result
+
+    def run_vae_attention_block(self, x: torch.Tensor, *,
+                                w_q: torch.Tensor, w_k: torch.Tensor,
+                                w_v: torch.Tensor, w_proj: torch.Tensor,
+                                gamma: Optional[torch.Tensor] = None,
+                                beta: Optional[torch.Tensor] = None,
+                                num_groups: int = 32,
+                                scale_mag: float = 1.0,
+                                eps: float = 1e-6,
+                                timeout_s: float = 300.0) -> torch.Tensor:
+        """SD/SDXL VAE mid-block spatial self-attention (``AttnBlock``):
+
+            h = GroupNorm(x); q,k,v = 1x1 convs of h
+            h = softmax(q @ k.T / sqrt(C)) @ v      (single head, head_dim = C)
+            out = x + proj_1x1(h)
+
+        The pixels are the sequence: a (C, H, W) map becomes ``H*W`` tokens of
+        ``C`` features, so ``seq_len = H*W`` and ``head_dim = C``.
+
+        LAYOUT — why no repack is needed. The conv writeback is pixel-major
+        with channels in lanes, so for ``C % 64 == 0`` a packed (C, H, W) map
+        is byte-identical to a row-major ``(H*W, C)`` matrix — exactly the
+        ``[batch, head_dim]`` layout :meth:`unified_attention_core` wants. The
+        1x1 conv outputs are therefore attention-ready in place, and the
+        attention output is conv-ready in place. The host reshapes below are an
+        artifact of the per-stage readback in the layer drivers, NOT of the
+        data layout; a device-resident chain would pass the DRAM buffers
+        straight through. This is the whole reason the VAE attention block
+        needs no transpose kernel.
+
+        Weights are (OC, C, 1, 1) integer codes (IF4-INT, uniform |scale| =
+        ``scale_mag``); ``gamma``/``beta`` are the GroupNorm affine. Requires
+        ``C % 64 == 0`` and ``H*W % 64 == 0`` (the attention core's
+        ``aligned_seq_len`` granularity).
+        """
+        assert x.dim() == 3, f"expected (C, H, W), got shape {tuple(x.shape)}"
+        C, H, W = x.shape
+        seq = H * W
+        assert C % UE_VECTOR_SIZE == 0, (
+            f"VAE attention needs C % {UE_VECTOR_SIZE} == 0 (got C={C}) so the packed map "
+            f"is byte-identical to a (H*W, C) matrix")
+        assert seq % UE_VECTOR_SIZE == 0, (
+            f"VAE attention needs H*W % {UE_VECTOR_SIZE} == 0 (got H*W={seq}); the attention "
+            f"core requires aligned_seq_len on a {UE_VECTOR_SIZE} boundary")
+        # Every projection is C -> C: q/k must share head_dim, and proj's output
+        # is added to the residual. Checking OC here turns what would otherwise
+        # surface as an opaque reshape error into a named precondition.
+        for nm, wt in (("w_q", w_q), ("w_k", w_k), ("w_v", w_v), ("w_proj", w_proj)):
+            assert tuple(wt.shape) == (C, C, 1, 1), \
+                f"{nm}: expected ({C}, {C}, 1, 1) 1x1 conv codes — the AttnBlock's " \
+                f"projections are all C->C — got {tuple(wt.shape)}"
+
+        # The score matrix is O(seq^2) and the core wants a materialised
+        # [batch, aligned_seq_len] bias alongside it, so the footprint grows
+        # quadratically in the PIXEL COUNT. At the SD 512x512 mid-block
+        # (seq=4096) that is ~75 MB; at SDXL 1024x1024 (seq=16384) it is
+        # ~1.1 GB, over half the board's DRAM. Fail with the number rather than
+        # attempting the allocation — the fix is a tiled/streaming-softmax
+        # attention, not a bigger buffer.
+        bias_bytes = seq * seq * 2
+        scratch_bytes = (C * seq + seq * seq + seq * C) * 2
+        total_mb = (bias_bytes + scratch_bytes) / 1e6
+        if total_mb > VAE_ATTENTION_MAX_FOOTPRINT_MB:
+            raise ValueError(
+                f"run_vae_attention_block: seq={seq} (H*W) needs {total_mb:.0f} MB of "
+                f"bias+scratch (score matrix is O(seq^2)), over the "
+                f"{VAE_ATTENTION_MAX_FOOTPRINT_MB} MB budget. This shape needs a tiled / "
+                f"streaming-softmax attention; the dense path here does not scale past "
+                f"roughly seq=4096.")
+
+        # 1) GroupNorm, then the three 1x1 projections.
+        h = self.run_group_norm(x, num_groups=num_groups, gamma=gamma, beta=beta,
+                                eps=eps, timeout_s=timeout_s)
+        qkv = [self.run_conv2d_layer(h, wt, stride_s=1, pad=0, scale_mag=scale_mag,
+                                     timeout_s=timeout_s)
+               for wt in (w_q, w_k, w_v)]
+        # (C, H, W) -> (H*W, C): the device buffer is already in this order (see
+        # the layout note); this only undoes conv2d_unpack_result's test permute.
+        q, k, v = [t.reshape(C, seq).t().contiguous() for t in qkv]
+
+        # 2) Attention over the pixel sequence. batch == aligned_seq_len == H*W.
+        bpe = 2
+        Q = self.allocate_tensor_dram(seq * C * bpe)
+        K = self.allocate_tensor_dram(seq * C * bpe)
+        V = self.allocate_tensor_dram(seq * C * bpe)
+        BIAS = self.allocate_tensor_dram(seq * seq * bpe)
+        OUT = self.allocate_tensor_dram(seq * C * bpe)
+        SCRATCH = self.allocate_tensor_dram((C * seq + seq * seq + seq * C) * bpe)
+        IDENT = self.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bpe)
+
+        self.start_capture()
+        self.unified_attention_core(
+            batch=seq, aligned_seq_len=seq, head_dim=C,
+            Q_DRAM_ADDR=Q, K_DRAM_ADDR=K, V_DRAM_ADDR=V,
+            BIAS_DRAM_ADDR=BIAS, OUTPUT_DRAM_ADDR=OUT,
+            SCRATCH_DRAM_ADDR=SCRATCH, IDENTITY_DRAM_ADDR=IDENT)
+        self.stop_capture()
+        self.generate_instruction_halt()
+        program_dram_addr = self.get_program_dram_addr()
+        inst_bytes = self.get_capture_instruction_size_bytes()
+        self.write_captured_instructions_to_dram(program_dram_addr)
+        self.allocate_program_dram(inst_bytes)
+
+        self.dma_to_accelerator_memory(Q, q)
+        self.dma_to_accelerator_memory(K, k)
+        self.dma_to_accelerator_memory(V, v)
+        # AttnBlock has no mask or positional bias — every pixel attends to
+        # every pixel — so the core's additive bias term is zeroed.
+        self.dma_to_accelerator_memory(BIAS, torch.zeros(seq, seq, dtype=torch.bfloat16))
+        self.dma_to_accelerator_memory(IDENT, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
+
+        self.start_execute_from_dram(program_dram_addr)
+        self.wait_queue(timeout_s)
+        self.last_attention_inst_bytes = inst_bytes
+        self.last_attention_cycles = self.read_latency_cycles()
+        self.clear_capture_buffer()
+
+        attn = self.dma_from_accelerator_memory(OUT, (seq, C))
+
+        # 3) Output projection + residual. The residual is the block INPUT, not
+        # the normalised h — GroupNorm is inside the branch.
+        h2 = self.run_conv2d_layer(attn.t().reshape(C, H, W).contiguous(), w_proj,
+                                   stride_s=1, pad=0, scale_mag=scale_mag,
+                                   timeout_s=timeout_s)
+        return (x.to(torch.float32) + h2.to(torch.float32)).to(torch.bfloat16)
+
+    def run_vae_decoder(self, z: torch.Tensor, weights: dict, *,
+                        num_groups: int = 32, scale_mag: float = 1.0,
+                        eps: float = 1e-6, fuse_upsample: bool = True,
+                        progress: bool = False,
+                        timeout_s: float = 600.0,
+                        **plan_kwargs) -> torch.Tensor:
+        """Run the whole SD/SDXL VAE decoder, latent (4, H, W) -> image (3, 8H, 8W).
+
+        Executes the op list from :func:`vae_decoder_plan` — the SAME plan the
+        structural test checks — so the executor cannot drift from the graph
+        that was validated. Each op dispatches to its mapped primitive.
+
+        ``weights`` maps op name -> parameters:
+          ``run_conv2d_layer`` / ``run_nn_upsample_conv3x3`` ops -> ``codes``
+          tensor, or ``(codes, bias)``; ``run_group_norm`` ops ->
+          ``(gamma, beta)``; the attention op -> a dict with exactly
+          ``w_q``, ``w_k``, ``w_v``, ``w_proj`` AND ``gamma``/``beta`` (the
+          AttnBlock has its own GroupNorm — these are required rather than
+          defaulted, because a dropped affine yields a plausible but wrong
+          image that no shape check would catch; pass None to disable it).
+          A missing entry raises, so a partial weight dump fails loudly at the
+          op that needs it rather than producing an image.
+
+        SiLU after every GroupNorm runs through :meth:`run_silu_layer`: the
+        MAXPOOL compare tree supplies per-lane ``max(x, 0)``, and EXP plus the
+        existing wide mul/add/sub modes evaluate a stable degree-4
+        construction. No decoder activation is evaluated on the host.
+        """
+        assert z.dim() == 3, f"expected (C, H, W) latent, got {tuple(z.shape)}"
+        clash = {'latent_h', 'latent_w', 'latent_ch'} & set(plan_kwargs)
+        if clash:
+            raise TypeError(
+                f"run_vae_decoder: {sorted(clash)} come from the latent's own shape "
+                f"{tuple(z.shape)}; pass them by shaping z, not as keywords.")
+        ops, summary = vae_decoder_plan(
+            latent_h=z.shape[1], latent_w=z.shape[2], latent_ch=z.shape[0],
+            num_groups=num_groups, fuse_upsample=fuse_upsample, **plan_kwargs)
+
+        def need(op_name):
+            if op_name not in weights:
+                raise KeyError(
+                    f"run_vae_decoder: no weights for op '{op_name}' "
+                    f"(needs the '{[o for o in ops if o['op'] == op_name][0]['primitive']}' "
+                    f"parameters)")
+            return weights[op_name]
+
+        def conv_args(op_name):
+            e = need(op_name)
+            return (e, None) if isinstance(e, torch.Tensor) else (e[0], e[1])
+
+        cur = z.to(torch.bfloat16)
+        # Residual sources, pushed at each ResnetBlock's first op and popped at
+        # its residual add. The shortcut conv (when channels change) consumes
+        # the same saved input, so it is read, not popped.
+        residual = {}
+        for idx, o in enumerate(ops):
+            name, prim = o['op'], o['primitive']
+            if progress:
+                print(f"  [{idx+1}/{len(ops)}] {name:<36} {prim or '(host)'} "
+                      f"{o['in_shape']} -> {o['out_shape']}")
+            block = name.rsplit('.', 1)[0]
+            if name.endswith('.norm1'):
+                residual[block] = cur
+
+            if prim == 'run_group_norm':
+                g, b = need(name)
+                cur = self.run_group_norm(cur, num_groups=num_groups, gamma=g,
+                                          beta=b, eps=eps, timeout_s=timeout_s)
+            elif prim == 'run_conv2d_layer':
+                if name.endswith('.conv_shortcut'):
+                    src = residual[block]
+                else:
+                    src = cur
+                codes, bias = conv_args(name)
+                k = codes.shape[-1]
+                out = self.run_conv2d_layer(src, codes, stride_s=1,
+                                            pad=1 if k == 3 else 0,
+                                            scale_mag=scale_mag, bias=bias,
+                                            timeout_s=timeout_s)
+                # The shortcut replaces the saved residual; it does not advance
+                # the main branch (which already holds conv2's output).
+                if name.endswith('.conv_shortcut'):
+                    residual[block] = out
+                else:
+                    cur = out
+            elif prim == 'run_nn_upsample_conv3x3':
+                codes, bias = conv_args(name)
+                cur = self.run_nn_upsample_conv3x3(cur, codes, scale_mag=scale_mag,
+                                                   bias=bias, timeout_s=timeout_s)
+            elif prim == 'run_nn_upsample_2x':
+                cur = self.run_nn_upsample_2x(cur, timeout_s=timeout_s)
+            elif prim == 'run_vae_attention_block':
+                w = need(name)
+                # The AttnBlock carries its OWN GroupNorm, so gamma/beta must be
+                # supplied explicitly (None to disable). Defaulting them would
+                # drop the affine silently and produce a plausible-looking but
+                # wrong image, which no shape or dtype check would catch.
+                required = {'w_q', 'w_k', 'w_v', 'w_proj', 'gamma', 'beta'}
+                missing = required - set(w)
+                if missing:
+                    raise KeyError(
+                        f"run_vae_decoder: attention op '{name}' is missing {sorted(missing)}. "
+                        f"The AttnBlock has its own GroupNorm; pass 'gamma'/'beta' explicitly "
+                        f"(None to run it without an affine) so the affine is never dropped "
+                        f"silently.")
+                unexpected = set(w) - required
+                if unexpected:
+                    raise KeyError(
+                        f"run_vae_decoder: attention op '{name}' has unexpected keys "
+                        f"{sorted(unexpected)}; expected exactly {sorted(required)}")
+                cur = self.run_vae_attention_block(
+                    cur, num_groups=num_groups, scale_mag=scale_mag, eps=eps,
+                    timeout_s=timeout_s, **w)
+            elif prim == 'run_eltwise_add_layer':
+                cur = self.run_eltwise_add_layer(cur, residual.pop(block),
+                                                 timeout_s=timeout_s)
+            elif prim == 'run_silu_layer':
+                cur = self.run_silu_layer(cur, timeout_s=timeout_s)
+            else:
+                raise AssertionError(f"run_vae_decoder: unhandled primitive {prim!r} for {name}")
+
+            assert tuple(cur.shape) == tuple(o['out_shape']) or name.endswith('.conv_shortcut'), \
+                f"run_vae_decoder: {name} produced {tuple(cur.shape)}, plan says {o['out_shape']}"
+
+        assert tuple(cur.shape) == tuple(summary['out_shape']), \
+            f"decoder produced {tuple(cur.shape)}, plan says {summary['out_shape']}"
+        return cur
+
+    def maxpool2d_core(self, ACT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, *,
+                       in_h: int, in_w: int,
+                       kernel_h: int, kernel_w: int, stride_s: int, pad: int,
+                       act_uram_addr: int = 0x000, wb_uram_addr: int = 0x300) -> int:
+        """DRAM-to-DRAM 2D max-pool over one 64-channel tile (single launch).
+
+        ACT_DRAM_ADDR holds the padded channels-in-lanes map packed by
+        :func:`conv2d_pack_activation_map` with ``pad_value=-inf`` (halo =
+        0xFF80, so padding never wins the max — same contract as
+        torch.nn.functional.max_pool2d). Output: one 64-lane bf16 line per
+        pooled pixel, pixel-major (:func:`maxpool2d_unpack_result`).
+        Returns the compare-op count of the launch.
+        """
+        h_pad = in_h + 2 * pad
+        w_pad = in_w + 2 * pad
+        assert h_pad >= kernel_h and w_pad >= kernel_w, "window larger than padded map"
+        out_h = (h_pad - kernel_h) // stride_s + 1
+        out_w = (w_pad - kernel_w) // stride_s + 1
+        map_lines = h_pad * w_pad
+
+        assert act_uram_addr + map_lines <= wb_uram_addr, (
+            f"padded map ({map_lines} lines @ {act_uram_addr:#x}) overlaps writeback base {wb_uram_addr:#x}"
+        )
+        assert wb_uram_addr + out_h * out_w <= 4096, "writeback runs past the 4096-line URAM bank"
+
+        self.accelerator_memory_to_sram(
+            accelerator_dram_address=ACT_DRAM_ADDR,
+            sram_address=act_uram_addr << 7,
+            element_size=map_lines * UE_VECTOR_SIZE)
+
+        self.start_queue_for_maxpool2d_operation(
+            act_sram_start_addr=act_uram_addr << 7,
+            output_sram_wb_addr=wb_uram_addr << 7,
+            kernel_w=kernel_w, kernel_h=kernel_h,
+            out_w=out_w, out_h=out_h, w_pad=w_pad, stride_s=stride_s)
+
+        self.sram_to_accelerator_memory(
+            sram_address=wb_uram_addr << 7,
+            accelerator_dram_address=OUTPUT_DRAM_ADDR,
+            element_size=out_h * out_w * UE_VECTOR_SIZE)
+
+        return out_h * out_w * kernel_h * kernel_w * UE_VECTOR_SIZE
+
     def _emit_pbi_scatter_per_token(self, *, read_base, read_stride_bytes,
                                     write_specs, sram_byte_addr, element_count,
                                     gpr_seq_len, template_seq_len: int = 0):
@@ -8499,6 +10714,7 @@ class UnifiedEngine:
         self.capture_count = 0
         self.capture_buffer = []
         self._capture_loop_stack = []
+        self._capture_conv_geometry = None
         self.is_capture_on = True
         print(f"Capture started. Buffer initialized, count={self.capture_count}")
 
@@ -8536,6 +10752,7 @@ class UnifiedEngine:
         self.capture_buffer = []
         self.capture_count = 0
         self._capture_loop_stack = []
+        self._capture_conv_geometry = None
 
     def get_captured_instructions(self) -> list[Instructions]:
         """Get list of captured instructions"""
@@ -8571,6 +10788,17 @@ class UnifiedEngine:
         inst_type = _inst_desc_bits(w, 8, 11)
         transaction_id = _inst_desc_bits(w, 0, 7)
 
+        if inst_type == INSTRUCTION_CONFIG:
+            subtype = _inst_desc_bits(w, 12, 15)
+            result = (
+                f"ISA_CONFIG subtype={subtype}\n"
+                f"    geom={_u32(w[1]):#010X} ctrl={_u32(w[2]):#010X}\n"
+                f"    stride={_u32(w[3]):#010X} pixstep={_u32(w[4]):#010X}\n"
+                f"    transaction_id: {transaction_id}")
+            for line in result.split("\n"):
+                print(f"        {line}")
+            return
+
         # PBI pointer-row load / bump-only (inst_type 6/C). Same 256b payload layout as UE ops; do not decode as ISA.
         if inst_type == INSTRUCTION_PBI_SET:
             ptr_i = _inst_desc_bits(w, 12, 15)
@@ -8587,7 +10815,7 @@ class UnifiedEngine:
             dram_w = _inst_desc_bits(w, 32, 63)
             src_reg = _inst_desc_bits(w, 24, 29)  # pbi_general_reg_idx = descriptor[29:24]
             dma_len = _inst_desc_bits(w, 64, 95)
-            out_sz = _inst_desc_bits(w, 156, 171)
+            out_sz = _inst_desc_bits(w, 156, 171) | (_inst_desc_bits(w, 247, 247) << 16)
             ur_rs = _inst_desc_bits(w, 96, 107)
             ur_rsz = _inst_desc_bits(w, 108, 119)
             ur_ay = _inst_desc_bits(w, 120, 131)
@@ -8625,7 +10853,8 @@ class UnifiedEngine:
                 uram_memcpy_dst_addr = _inst_desc_bits(w, 234, 245)
                 stride_en = _inst_desc_bits(w, 222, 222)
                 lalu_scalar = _inst_desc_bits(w, 186, 206)
-                output_size = _inst_desc_bits(w, 156, 171)
+                output_size = (_inst_desc_bits(w, 156, 171)
+                               | (_inst_desc_bits(w, 247, 247) << 16))
 
                 memcpy_type_name = MEMCPY_TYPE(bram_uram_select).name if bram_uram_select in [e.value for e in MEMCPY_TYPE] else f"UNKNOWN({bram_uram_select})"
                 memcpy_type_str = f"{memcpy_type_name}"
@@ -8651,7 +10880,8 @@ class UnifiedEngine:
             dma_start = _inst_desc_bits(w, 179, 179)
             uram_start = _inst_desc_bits(w, 180, 180)
             data_type = _inst_desc_bits(w, 181, 182)
-            output_size = _inst_desc_bits(w, 156, 171)
+            output_size = (_inst_desc_bits(w, 156, 171)
+                           | (_inst_desc_bits(w, 247, 247) << 16))
             uram_length = _inst_desc_bits(w, 96, 107)
             uram_length_z = _inst_desc_bits(w, 108, 119)
             uram_a_start_addr = _inst_desc_bits(w, 120, 131)
@@ -8880,6 +11110,23 @@ class UnifiedEngine:
         self.capture_buffer.append(inst)
         self.capture_count += 1
         self._inst_id = tid + 1
+
+    def generate_instruction_conv_config(
+            self, words: tuple[int, int, int, int]) -> None:
+        """Append one ordered queued CONV/MAXPOOL geometry CONFIG instruction."""
+        if not self.is_capture_on:
+            raise RuntimeError("CONV CONFIG can only be emitted inside an active capture")
+        geom, ctrl, stride, pixstep = validate_conv2d_geometry_words(words)
+        if self.capture_count >= MAX_DECODER_INSTRUCTIONS:
+            raise RuntimeError("decoder instruction capture buffer is full")
+        inst = Instructions()
+        inst.words[0] = ((self._inst_id & 0xFF)
+                         | (INSTRUCTION_CONFIG << 8)
+                         | (CONFIG_SUBTYPE_CONV << 12))
+        inst.words[1:5] = [geom, ctrl, stride, pixstep]
+        self.capture_buffer.append(inst)
+        self.capture_count += 1
+        self._inst_id += 1
 
     def generate_instruction_halt(self):
         """Generate a HALT instruction. Instruction index comes from :attr:`_inst_id` (then incremented).
@@ -9639,10 +11886,14 @@ class UnifiedEngine:
                 print(f"Report FLOPS for program execution: {flop_rate_program:.2f} GFLOPS")
         return latency, flop_rate_program
 
-    def software_reset(self):
+    def software_reset(self, *, run_dram_self_test: bool = True):
         """
         Trigger a software reset of the engine via the UE_QUEUE_CTRL register
         and reinitialize all hardware and software state.
+
+        Set ``run_dram_self_test=False`` to retain reset and register
+        initialization while skipping the 16 KiB DRAM DMA probe.  The default
+        preserves the historical reset behavior.
 
         Writes bit[31]=1 (reset command flag) and bit[15]=1 (sw_reset_pending)
         to UE_QUEUE_CTRL_ADDR. The hardware defers the actual reset pulse until
@@ -9652,15 +11903,28 @@ class UnifiedEngine:
         SW_RESET_CMD = 0x80008000
         self.write_reg32(UE_QUEUE_CTRL_ADDR, SW_RESET_CMD)
         self.wait_queue(1.0) # 1 seconds timeout
-        self.init_unified_engine()
+        # Keep the historical no-argument call on the default path so existing
+        # subclasses that override init_unified_engine(self) remain compatible.
+        if run_dram_self_test:
+            self.init_unified_engine()
+        else:
+            self.init_unified_engine(run_dram_self_test=False)
         self._inst_id = 0
         print("Software reset complete.")
+
+    def read_latency_counter_ticks(self) -> int:
+        """Read the raw, prescaled hardware latency-counter value."""
+        return int(self.read_reg32(UE_LATENCY_COUNT_ADDR))
+
+    def read_latency_cycles(self) -> int:
+        """Read the last program latency in FPGA ``aclk`` cycles."""
+        return self.read_latency_counter_ticks() * UE_PIPELINE_COUNTER_CLK_DIV
 
     def report_timing_and_instruction_count(self):
         """
         Report timing and instruction count
         """
-        latency = self.read_reg32(UE_LATENCY_COUNT_ADDR) * UE_PIPELINE_COUNTER_CLK_DIV
+        latency = self.read_latency_cycles()
         instruction_count = self.read_reg32(UE_INSTRUCTION_CTL_ADDR)
         print(f"Latency: {latency * self._clock_period_ns / 1e3:.3f} us, Instruction count: {instruction_count}")
         print(f"Latency in cycles: {latency}")
@@ -9670,13 +11934,13 @@ class UnifiedEngine:
         """
         Report latency
         """
-        return self.read_reg32(UE_LATENCY_COUNT_ADDR) * UE_PIPELINE_COUNTER_CLK_DIV * self._clock_period_ns / 1e3
+        return self.read_latency_cycles() * self._clock_period_ns / 1e3
 
     def report_flop_rate_gflops(self, num_flops: int):
         """
         Report flop rate and gflops ratio of peak throughput
         """
-        cycles = self.read_reg32(UE_LATENCY_COUNT_ADDR) * UE_PIPELINE_COUNTER_CLK_DIV
+        cycles = self.read_latency_cycles()
         gflops_ratio = num_flops / 1.28 / cycles
         return num_flops / (cycles * self._clock_period_ns), gflops_ratio
 
@@ -10155,6 +12419,1092 @@ def check_isa_jumps(
                     )
 
     return issues
+
+
+# ---------------------------------------------------------------------------
+# CONV2D / MAXPOOL host-side packing helpers.
+#
+# Data-layout twins of the geometry contract used by UnifiedEngine.conv2d_core /
+# maxpool2d_core (Vivado/doc/convolution_architecture.md): channels-in-lanes
+# activation map with a host-materialised halo, [pixel][oc][tap] weight
+# stream, per-block scale stream, per-(pixel,oc) bias stream, and the
+# pixel-major/oc-innermost result order of the dot-style writeback.
+# ---------------------------------------------------------------------------
+
+def conv2d_pack_activation_map(x: torch.Tensor, pad: int, pad_value: float = 0.0,
+                               pad_h: Optional[int] = None) -> torch.Tensor:
+    """Pack a (C, H, W) tensor into the padded channels-in-lanes URAM map.
+
+    Returns a ((H+2p_h)*(W+2p)*CT, 64) bf16 tensor, one row per URAM line:
+    line((r, c), ct) holds channels [ct*64, ct*64+64) of pixel (r, c), ct
+    inner. The halo ring (and any unused lanes past C) is filled with
+    ``pad_value``: 0.0 for conv (matches torch's zero padding), -inf for
+    max-pool (0xFF80 never wins the compare). ``pad_h`` overrides the H-axis
+    padding (defaults to ``pad``; Conv1d maps pack a (C, 1, T) tensor with
+    ``pad_h=0``).
+    """
+    assert x.dim() == 3, f"expected (C, H, W), got shape {tuple(x.shape)}"
+    C, H, W = x.shape
+    if pad_h is None:
+        pad_h = pad
+    ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    h_pad, w_pad = H + 2 * pad_h, W + 2 * pad
+    m = torch.full((h_pad, w_pad, ct * UE_VECTOR_SIZE), pad_value, dtype=torch.bfloat16)
+    m[pad_h:pad_h + H, pad:pad + W, :C] = x.permute(1, 2, 0).to(torch.bfloat16)
+    return m.reshape(h_pad * w_pad * ct, UE_VECTOR_SIZE).contiguous()
+
+
+def conv2d_tile_geometry_groups(tiles):
+    """Return contiguous exact-tile geometry groups.
+
+    Each result tuple is ``(start, stop, th, tw, win_h, win_w)`` and indexes
+    the original ``tiles`` sequence.  The planner deliberately orders its
+    interior, right, bottom, and corner partitions this way so activation and
+    result buffers can stay single contiguous DMA regions while a resident
+    program switches geometry with ordered CONFIG instructions.  Rejecting a
+    geometry that reappears later prevents the compiler and direct-bin runtime
+    from silently disagreeing about offsets.
+    """
+    assert tiles, "at least one convolution tile is required"
+    groups = []
+    seen = set()
+    start = 0
+    first = tiles[0]
+    assert len(first) >= 8, f"invalid convolution tile {first!r}"
+    key = tuple(int(first[index]) for index in (2, 3, 6, 7))
+    assert all(value > 0 for value in key), f"invalid tile geometry {key!r}"
+    seen.add(key)
+    for index, tile in enumerate(tiles[1:], 1):
+        assert len(tile) >= 8, f"invalid convolution tile {tile!r}"
+        next_key = tuple(int(tile[field]) for field in (2, 3, 6, 7))
+        assert all(value > 0 for value in next_key), \
+            f"invalid tile geometry {next_key!r}"
+        if next_key == key:
+            continue
+        assert next_key not in seen, \
+            f"tile geometry {next_key!r} is not one contiguous group"
+        groups.append((start, index, *key))
+        start, key = index, next_key
+        seen.add(key)
+    groups.append((start, len(tiles), *key))
+    assert len(groups) <= 4, \
+        f"exact convolution tiling needs at most four geometries, got {len(groups)}"
+    return groups
+
+
+def conv2d_tiled_dram_layout(tiles, ct: int, oc_chunk: int):
+    """Describe the shared compiler/runtime staging layout for exact tiles.
+
+    Returns ``(groups, activation_bytes, output_bytes_per_oc_chunk)``.  Each
+    group extends :func:`conv2d_tile_geometry_groups` with
+    ``(act_offset, act_bytes_per_tile, out_offset, out_bytes_per_tile,
+    result_lines_per_tile)``.  All sizes and offsets are whole 1024-bit lines,
+    hence also satisfy the allocator's 64-byte address alignment.
+    """
+    assert ct > 0 and oc_chunk > 0
+    layout = []
+    act_offset = 0
+    out_offset = 0
+    for start, stop, th, tw, win_h, win_w in \
+            conv2d_tile_geometry_groups(tiles):
+        count = stop - start
+        act_bytes = win_h * win_w * ct * 128
+        result_lines = \
+            (th * tw * oc_chunk + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        out_bytes = result_lines * 128
+        layout.append((
+            start, stop, th, tw, win_h, win_w,
+            act_offset, act_bytes, out_offset, out_bytes, result_lines))
+        act_offset += count * act_bytes
+        out_offset += count * out_bytes
+    assert act_offset > 0 and out_offset > 0
+    assert act_offset % 128 == 0 and out_offset % 128 == 0
+    return layout, act_offset, out_offset
+
+
+def conv2d_pack_activation_tiles(x: torch.Tensor, tiles, pad: int,
+                                 pad_h: Optional[int] = None,
+                                 pad_value: float = 0.0) -> torch.Tensor:
+    """Pack exact planner tiles with at most one gather per geometry group.
+
+    ``tiles`` uses :func:`plan_conv2d_layer_tiles` tuples, ordered in contiguous
+    interior/right/bottom/corner geometry groups.  Advanced indexing gathers
+    all windows in one group at once and the groups are concatenated as
+    ``[group][tile][pixel][ct][lane]``.  This is byte-identical to calling
+    :func:`conv2d_pack_activation_map` once per exact tile, including channel
+    tail padding, while avoiding a Python loop over the (potentially thousands
+    of) tiles.
+    """
+    assert x.dim() == 3, f"expected (C, H, W), got shape {tuple(x.shape)}"
+    assert tiles, "at least one activation tile is required"
+    C, _, _ = x.shape
+    if pad_h is None:
+        pad_h = pad
+    assert pad >= 0 and pad_h >= 0, "padding must be non-negative"
+    x_padded = torch.nn.functional.pad(
+        x.to(torch.bfloat16), (pad, pad, pad_h, pad_h), value=float(pad_value))
+    device = x_padded.device
+    ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    packed_groups = []
+    for start, stop, _th, _tw, win_h, win_w in \
+            conv2d_tile_geometry_groups(tiles):
+        group = tiles[start:stop]
+        y0 = torch.tensor([int(tile[4]) for tile in group],
+                          dtype=torch.long, device=device)
+        x0 = torch.tensor([int(tile[5]) for tile in group],
+                          dtype=torch.long, device=device)
+        yi = y0[:, None, None] + \
+            torch.arange(win_h, device=device)[None, :, None]
+        xi = x0[:, None, None] + \
+            torch.arange(win_w, device=device)[None, None, :]
+        windows = x_padded[:, yi, xi].permute(1, 2, 3, 0)
+        if C == ct * UE_VECTOR_SIZE:
+            packed = windows.reshape(-1, UE_VECTOR_SIZE).contiguous()
+        else:
+            staged = torch.full(
+                (stop - start, win_h, win_w, ct * UE_VECTOR_SIZE),
+                float(pad_value), dtype=torch.bfloat16, device=device)
+            staged[..., :C] = windows
+            packed = staged.reshape(-1, UE_VECTOR_SIZE)
+        packed_groups.append(packed)
+    return torch.cat(packed_groups, dim=0).contiguous()
+
+
+def conv2d_pack_weight_stream(w_codes: torch.Tensor, out_h: int, out_w: int,
+                              data_type: TYPE) -> torch.Tensor:
+    """Pack (OC, C, KH, KW) integer weight codes into the conv X-stream bytes.
+
+    Block order matches the walker (ct inner -> kx -> ky -> oc, replayed once
+    per output pixel): for every pixel, for every oc, taps in (ky, kx, ct)
+    order, each block = 64 lanes (channels ct*64..ct*64+63; lanes past C are
+    zero codes). IF4/TQ4: 32 bytes/block, lane 2j in the LOW nibble of byte j;
+    IF8: 64 bytes/block. Codes are raw hardware codes (e.g. two's-complement
+    INT4/INT8 when the block scale is negative, FP4/FP8/TQ4 indices otherwise).
+
+    Returns a flat uint8 tensor of out_h*out_w * OC * taps * bytes_per_block.
+    Note the footprint: weights live only in the X-stream, so the walker
+    re-fetches the window per output pixel and this buffer scales with
+    out_h*out_w (doc §5.4 risk R6) — pack per-tile, not per-layer.
+    """
+    assert w_codes.dim() == 4, f"expected (OC, C, KH, KW), got shape {tuple(w_codes.shape)}"
+    OC, C, KH, KW = w_codes.shape
+    ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    mask = 0xFF if data_type == TYPE.IF8 else 0xF
+    codes = w_codes.to(torch.int16) & mask
+    padded = torch.zeros(OC, ct * UE_VECTOR_SIZE, KH, KW, dtype=torch.int16)
+    padded[:, :C] = codes
+    # (OC, ct, 64, KH, KW) -> (OC, KH, KW, ct, 64): blocks in [oc][ky][kx][ct] order
+    blocks = padded.view(OC, ct, UE_VECTOR_SIZE, KH, KW).permute(0, 3, 4, 1, 2) \
+                   .reshape(-1, UE_VECTOR_SIZE)
+    if data_type == TYPE.IF8:
+        per_pixel = blocks.to(torch.uint8).reshape(-1)
+    else:  # IF4 / TQ4: two 4-bit codes per byte, even lane in the low nibble
+        per_pixel = (blocks[:, 0::2] | (blocks[:, 1::2] << 4)).to(torch.uint8).reshape(-1)
+    return per_pixel.repeat(out_h * out_w).contiguous()
+
+
+def conv2d_pack_scale_stream(scale, oc_count: int, taps: int, out_h: int, out_w: int) -> torch.Tensor:
+    """Per-block bf16 scale stream, one entry per X block in stream order.
+
+    ``scale`` is a float (uniform) or an (OC, taps)-shaped tensor; either way
+    the per-pixel [oc][tap] pattern is replicated out_h*out_w times because
+    the walker re-streams the same weight blocks for every output pixel. The
+    scale's SIGN selects the IF4/IF8 variant (negative -> INT path); hardware
+    multiplies by |scale|. TQ4 scales must stay positive.
+    """
+    if isinstance(scale, torch.Tensor):
+        per_pixel = scale.to(torch.bfloat16).reshape(-1)
+        assert per_pixel.numel() == oc_count * taps, (
+            f"scale tensor has {per_pixel.numel()} entries, expected oc_count*taps = {oc_count * taps}"
+        )
+    else:
+        per_pixel = torch.full((oc_count * taps,), float(scale), dtype=torch.bfloat16)
+    return per_pixel.repeat(out_h * out_w).contiguous()
+
+
+def _conv2d_chunk_scale(block_scales: Optional[torch.Tensor], scale_mag: float,
+                        *, oc0: int, n_oc: int):
+    """Select one planner OC chunk without changing signed IF4 scale values."""
+    if block_scales is None:
+        return -abs(float(scale_mag))
+    return block_scales[oc0:oc0 + n_oc]
+
+
+def conv2d_pack_weight_stream_gather(w_codes: torch.Tensor, out_h: int, out_w: int,
+                                     data_type: TYPE) -> torch.Tensor:
+    """Pack (OC, C, KH, KW) codes into the GATHER-mode X-stream (UE_CONV_CTRL[31]).
+
+    Gather mode computes conv as a plain dot: each output pixel's whole im2col
+    patch (Kh*Kw*C taps) is chunked into ``chunks = ceil(Kh*Kw*C/64)`` blocks of
+    64 taps, and the bf20 ladder sums the per-chunk dots. Block layout is
+    ``[pixel][oc][chunk]`` (repeated per output pixel, tail-zero-padded); within
+    a chunk the 64 taps run in walker order ``[ky][kx][ch]`` (ch innermost),
+    tap t = ky*(KW*C)+kx*C+ch. IF4/TQ4: 32 bytes/block (tap 2j low nibble of
+    byte j); IF8: 64 bytes/block. Contrast :func:`conv2d_pack_weight_stream`
+    (channels mode: block = 64 channels of one (ky,kx), Kh*Kw*CT blocks/oc).
+    """
+    assert w_codes.dim() == 4, f"expected (OC, C, KH, KW), got shape {tuple(w_codes.shape)}"
+    OC, C, KH, KW = w_codes.shape
+    taps = KH * KW * C
+    chunks = (taps + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    mask = 0xFF if data_type == TYPE.IF8 else 0xF
+    codes = w_codes.to(torch.int16) & mask
+    # (OC, C, KH, KW) -> (OC, KH, KW, C) -> (OC, taps) in [ky][kx][ch] order.
+    taps_arr = codes.permute(0, 2, 3, 1).reshape(OC, taps)
+    padded = torch.zeros(OC, chunks * UE_VECTOR_SIZE, dtype=torch.int16)
+    padded[:, :taps] = taps_arr
+    blocks = padded.reshape(OC * chunks, UE_VECTOR_SIZE)  # [oc][chunk], 64 codes each
+    if data_type == TYPE.IF8:
+        per_pixel = blocks.to(torch.uint8).reshape(-1)
+    else:
+        per_pixel = (blocks[:, 0::2] | (blocks[:, 1::2] << 4)).to(torch.uint8).reshape(-1)
+    return per_pixel.repeat(out_h * out_w).contiguous()
+
+
+def conv2d_pack_scale_stream_gather(scale, oc_count: int, chunks: int) -> torch.Tensor:
+    """Gather-mode per-block bf16 scale: ONE pixel's ``oc_count*chunks`` blocks.
+
+    Unlike channels mode, the gather scale is NOT replicated per output pixel —
+    the hardware rewinds the scale-BRAM read address at every pixel boundary
+    (``bram_raddr`` raddr_rewind). Block index = oc*chunks + chunk. ``scale`` is
+    a float (uniform) or an (oc_count, chunks) tensor. Sign selects INT4/FP4;
+    hardware multiplies by |scale| at the lmult stage before the ladder.
+    """
+    bpp = oc_count * chunks
+    if isinstance(scale, torch.Tensor):
+        blocks = scale.to(torch.bfloat16).reshape(-1)
+        assert blocks.numel() == bpp, f"scale has {blocks.numel()} entries, expected {bpp}"
+    else:
+        blocks = torch.full((bpp,), float(scale), dtype=torch.bfloat16)
+    return blocks.contiguous()
+
+
+def conv2d_pack_bias_stream(bias: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
+    """Per-(pixel, oc) bf16 bias stream for the bias BRAM.
+
+    The bias address increments once per scalar result (pixel-major, oc
+    innermost) and wraps at output_size, so a per-oc bias must be replicated
+    once per output pixel: entry(pixel, oc) = bias[oc].
+    """
+    assert bias.dim() == 1, f"expected (OC,), got shape {tuple(bias.shape)}"
+    return bias.to(torch.bfloat16).repeat(out_h * out_w).contiguous()
+
+
+def conv2d_unpack_result(flat: torch.Tensor, out_h: int, out_w: int, oc_count: int) -> torch.Tensor:
+    """Reorder the conv writeback (pixel-major, oc innermost, 64 scalars/line)
+    into a (OC, out_h, out_w) tensor matching torch.nn.functional.conv2d[0].
+
+    The trailing permute is a TEST-ONLY convenience: the hardware writeback is
+    already channels-in-lanes (``addr(oy,ox,oc) = ((oy*out_w+ox)*OC+oc)*2``),
+    i.e. exactly what :func:`conv2d_pack_activation_map` emits. When
+    ``OC % 64 == 0`` the raw output buffer is BYTE-IDENTICAL to the next conv's
+    activation map, so a chained layer reads it in place — no repack, no host
+    reorder. When ``OC % 64 != 0`` the conv packs scalars densely (no per-pixel
+    lane padding), so a pixel's channels straddle 64-lane lines and the buffer
+    must be repacked (or OC padded to a multiple of 64). See
+    ``Vivado/doc/convolution_architecture.md`` §10.
+    """
+    n = out_h * out_w * oc_count
+    return flat.reshape(-1)[:n].view(out_h, out_w, oc_count).permute(2, 0, 1).contiguous()
+
+
+def conv2d_unpack_tiled_result(flat: torch.Tensor, tiles, out_h: int,
+                               out_w: int, oc_count: int,
+                               oc_chunk: int) -> torch.Tensor:
+    """Scatter exact grouped conv tile/chunk results without per-tile copies.
+
+    ``flat`` is the bulk readback for
+    ``[oc_chunk][geometry_group][tile][result_line][lane]``.  Each geometry
+    group has its own padded result-line stride.  There are at most four such
+    groups, so parsing each group still avoids a Python loop over tiles while
+    preserving the exact, non-overlapping output partition.
+    """
+    assert tiles, "at least one result tile is required"
+    assert oc_count > 0 and oc_chunk > 0 and oc_count % oc_chunk == 0
+    n_chunks = oc_count // oc_chunk
+    groups = conv2d_tile_geometry_groups(tiles)
+    chunk_values = sum(
+        (stop - start)
+        * ((th * tw * oc_chunk + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE)
+        * UE_VECTOR_SIZE
+        for start, stop, th, tw, _win_h, _win_w in groups)
+    expected = n_chunks * chunk_values
+    assert flat.numel() == expected, \
+        f"tiled result has {flat.numel()} values, expected {expected}"
+
+    big = flat.reshape(n_chunks, chunk_values)
+    out = torch.empty(
+        n_chunks, oc_chunk, out_h, out_w,
+        dtype=flat.dtype, device=flat.device)
+    offset = 0
+    for start, stop, th, tw, _win_h, _win_w in groups:
+        count = stop - start
+        result_lines = \
+            (th * tw * oc_chunk + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        group_values = count * result_lines * UE_VECTOR_SIZE
+        values = big[:, offset:offset + group_values] \
+            .view(n_chunks, count, result_lines * UE_VECTOR_SIZE) \
+            [..., :th * tw * oc_chunk] \
+            .view(n_chunks, count, th, tw, oc_chunk)
+        group = tiles[start:stop]
+        # Exact planner groups are Cartesian row-major grids. Reassemble each
+        # one with a bulk reshape/permute/copy instead of an advanced indexed
+        # scatter. The latter launches a large PyTorch parallel-index kernel
+        # for every group and can dominate direct-bin wall time even though the
+        # FPGA work is unchanged.
+        ys = list(dict.fromkeys(int(tile[0]) for tile in group))
+        xs = list(dict.fromkeys(int(tile[1]) for tile in group))
+        expected_positions = [(y, x) for y in ys for x in xs]
+        actual_positions = [(int(tile[0]), int(tile[1])) for tile in group]
+        assert actual_positions == expected_positions, \
+            "convolution tile group must be a row-major Cartesian grid"
+        assert all(ys[index] == ys[0] + index * th
+                   for index in range(len(ys))), \
+            "convolution tile rows must be adjacent"
+        assert all(xs[index] == xs[0] + index * tw
+                   for index in range(len(xs))), \
+            "convolution tile columns must be adjacent"
+        dense = values \
+            .view(n_chunks, len(ys), len(xs), th, tw, oc_chunk) \
+            .permute(0, 5, 1, 3, 2, 4) \
+            .reshape(n_chunks, oc_chunk, len(ys) * th, len(xs) * tw)
+        out[:, :, ys[0]:ys[0] + len(ys) * th,
+            xs[0]:xs[0] + len(xs) * tw] = dense
+        offset += group_values
+    assert offset == chunk_values
+    return out.reshape(oc_count, out_h, out_w)
+
+
+def maxpool2d_unpack_result(flat: torch.Tensor, out_h: int, out_w: int,
+                            c: int = UE_VECTOR_SIZE) -> torch.Tensor:
+    """Reorder the max-pool writeback (one 64-lane line per pooled pixel,
+    pixel-major) into a (C, out_h, out_w) tensor matching
+    torch.nn.functional.max_pool2d[0] (first ``c`` lanes)."""
+    lines = flat.reshape(-1, UE_VECTOR_SIZE)[:out_h * out_w, :c]
+    return lines.view(out_h, out_w, c).permute(2, 0, 1).contiguous()
+
+
+def _conv_fused_lalu(relu_enable: bool, silu_enable: bool, gelu_enable: bool):
+    """(lalu_mode, lalu_a, lalu_b) for the conv fused-activation epilogue."""
+    assert sum([relu_enable, silu_enable, gelu_enable]) <= 1, "pick one fused activation"
+    if relu_enable:
+        return LALU_MODE.CLAMP, LALU_CLAMP_RELU_A, LALU_CLAMP_RELU_B
+    if silu_enable:  # YOLO Conv: x * sigmoid(x) (BN folded into scales/bias)
+        return LALU_MODE.ACT, LALU_ACT_SILU_A, LALU_ACT_SILU_B
+    if gelu_enable:  # Whisper conv stem: x * sigmoid(1.702x)
+        return LALU_MODE.ACT, LALU_ACT_GELU_A, LALU_ACT_GELU_B
+    return LALU_MODE.BYPASS, 0, 0
+
+
+def plan_conv2d_layer_tiles(*, c_in: int, oc_count: int, in_h: int, in_w: int,
+                            kernel_h: int, kernel_w: int, stride_s: int,
+                            pad: int, pad_h: Optional[int] = None,
+                            dilation: int = 1,
+                            gather: bool = False,
+                            bias_enabled: bool = False,
+                            act_uram_addr: int = 0x000,
+                            wb_uram_addr: int = 0x300):
+    """Tile a full conv layer into single-launch chunks.
+
+    Returns ``(out_h, out_w, oc_chunk, tiles)``; each tile is
+    ``(oy0, ox0, th, tw, y0, x0, win_h, win_w)`` — the launch computes output
+    block [oy0:oy0+th, ox0:ox0+tw] for one oc chunk from the PADDED-input
+    window [y0:y0+win_h, x0:x0+win_w]. Per-launch constraints honoured:
+    In channels mode, X blocks per launch must fit SCALE_BRAM_ELEMENTS. In
+    gather mode the hardware rewinds its scale address at each pixel, so only
+    ``oc_chunk*ceil(Kh*Kw*C/64)`` scales must fit; tile pixels do not multiply
+    that requirement. Both modes also keep the padded window below the
+    writeback base, writeback inside the 4096-line bank, output_size within 16
+    bits, and taps/stride products within their geometry fields. oc is chunked
+    first, then the output tile grows greedily toward a square (a full-width
+    strip when out_h == 1, i.e. Conv1d).  The grid is an exact, non-overlapping
+    partition ordered as contiguous interior/right/bottom/corner geometry
+    groups.  A queue-config resident program can therefore switch geometry at
+    most four times without recomputing overlap-clamped edge pixels.  Every OC
+    block still uses one ``oc_chunk`` value, so it is a divisor of
+    ``oc_count``; a prime OC above the per-launch cap can therefore fall back
+    to chunk 1.  Callers with such shapes may pad OC when throughput matters.
+    """
+    assert c_in > 0 and oc_count > 0, "channel counts must be positive"
+    assert in_h > 0 and in_w > 0, "input dimensions must be positive"
+    assert 1 <= kernel_h <= 15 and 1 <= kernel_w <= 15, \
+        f"kernel {kernel_h}x{kernel_w} exceeds the 4-bit geometry fields"
+    assert stride_s > 0 and dilation > 0, "stride and dilation must be positive"
+    assert pad >= 0 and (pad_h is None or pad_h >= 0), "padding must be non-negative"
+    assert 0 <= act_uram_addr < wb_uram_addr < 4096, \
+        f"invalid URAM split act={act_uram_addr:#x}, wb={wb_uram_addr:#x}"
+    if pad_h is None:
+        pad_h = pad
+    ct = (c_in + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    assert ct <= 0x7F, f"ct={ct} exceeds the 7-bit convolution geometry field"
+    taps = kernel_h * kernel_w * ct
+    assert taps <= 0xFFF, f"taps={taps} exceeds the 12-bit uram_row_size field"
+    gather_chunks = (kernel_h * kernel_w * c_in + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    if gather:
+        assert c_in <= 0xFF, f"gather c_in={c_in} exceeds the 8-bit geometry field"
+        assert gather_chunks <= 4, \
+            f"gather needs {gather_chunks} chunks, over the RTL limit of four"
+    eff_kh = dilation * (kernel_h - 1) + 1
+    eff_kw = dilation * (kernel_w - 1) + 1
+    h_pad, w_pad = in_h + 2 * pad_h, in_w + 2 * pad
+    assert h_pad >= eff_kh and w_pad >= eff_kw
+    out_h = (h_pad - eff_kh) // stride_s + 1
+    out_w = (w_pad - eff_kw) // stride_s + 1
+
+    def fits(th: int, tw: int, n_oc: int) -> bool:
+        win_h = (th - 1) * stride_s + eff_kh
+        win_w = (tw - 1) * stride_s + eff_kw
+        results = th * tw * n_oc
+        result_lines = (results + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+        row_stride = dilation * win_w * ct
+        col_stride = dilation * ct
+        pix_col_step = stride_s * ct
+        pix_row_step = stride_s * win_w * ct
+        return (th <= 0xFFF and tw <= 0xFFF
+                and max(row_stride, col_stride,
+                        pix_col_step, pix_row_step) <= 0xFFF
+                and ((n_oc * gather_chunks <= SCALE_BRAM_ELEMENTS)
+                     if gather else (results * taps <= SCALE_BRAM_ELEMENTS))
+                and (not bias_enabled or results <= BIAS_BRAM_ELEMENTS)
+                and win_h * win_w * ct <= wb_uram_addr - act_uram_addr
+                and wb_uram_addr + result_lines <= 4096
+                and results <= 0xFFFF)
+
+    # Keep one ``oc_count`` and result-slot layout across every OC block in the
+    # resident program. Pick the largest fitting divisor instead of leaving a
+    # short tail block (e.g. 512 -> 113+...+60).
+    scale_blocks_per_oc = gather_chunks if gather else taps
+    oc_cap = min(
+        oc_count, max(1, SCALE_BRAM_ELEMENTS // scale_blocks_per_oc))
+    oc_chunk = next(
+        (n for n in range(oc_cap, 0, -1)
+         if oc_count % n == 0 and fits(1, 1, n)),
+        None,
+    )
+    assert oc_chunk is not None, "a single output pixel does not fit one launch"
+    assert oc_count % oc_chunk == 0
+
+    tile_h = tile_w = 1
+    grew = True
+    while grew:
+        grew = False
+        if tile_h < out_h and fits(tile_h + 1, tile_w, oc_chunk):
+            tile_h += 1
+            grew = True
+        if tile_w < out_w and fits(tile_h, tile_w + 1, oc_chunk):
+            tile_w += 1
+            grew = True
+
+    # Exact grid, grouped rather than row-major so each shape is one contiguous
+    # DRAM segment and one CONFIG + PBI loop in the resident program.  There is
+    # always at least one full-size tile on each axis because tile_h/out_h and
+    # tile_w/out_w start at one and never grow past the output dimensions.
+    full_h, rem_h = divmod(out_h, tile_h)
+    full_w, rem_w = divmod(out_w, tile_w)
+    full_ys = [index * tile_h for index in range(full_h)]
+    full_xs = [index * tile_w for index in range(full_w)]
+    tiles = []
+    def _append_group(ys, xs, th: int, tw: int) -> None:
+        win_h = (th - 1) * stride_s + eff_kh
+        win_w = (tw - 1) * stride_s + eff_kw
+        for oy0 in ys:
+            for ox0 in xs:
+                tiles.append((oy0, ox0, th, tw,
+                              oy0 * stride_s, ox0 * stride_s,
+                              win_h, win_w))
+
+    _append_group(full_ys, full_xs, tile_h, tile_w)       # interior
+    if rem_w:
+        _append_group(full_ys, [full_w * tile_w], tile_h, rem_w)  # right
+    if rem_h:
+        _append_group([full_h * tile_h], full_xs, rem_h, tile_w)  # bottom
+    if rem_h and rem_w:
+        _append_group(
+            [full_h * tile_h], [full_w * tile_w], rem_h, rem_w)   # corner
+    assert sum(int(tile[2]) * int(tile[3]) for tile in tiles) == out_h * out_w
+    conv2d_tile_geometry_groups(tiles)  # Validate contiguous grouping now.
+    return out_h, out_w, oc_chunk, tiles
+
+
+def group_norm_ref(x: torch.Tensor, num_groups: int,
+                   gamma: Optional[torch.Tensor] = None,
+                   beta: Optional[torch.Tensor] = None,
+                   eps: float = 1e-5) -> torch.Tensor:
+    """Host reference GroupNorm over (C, H, W), matching F.group_norm.
+
+    Normalises over (channels-per-group x H x W) and applies a PER-CHANNEL
+    affine — unlike LayerNorm, whose affine is per-element of the normalised
+    axis. Computed in float32 and returned as bf16.
+    """
+    assert x.dim() == 3, f"expected (C, H, W), got shape {tuple(x.shape)}"
+    C = x.shape[0]
+    assert C % num_groups == 0, f"C={C} not divisible by num_groups={num_groups}"
+    xf = x.to(torch.float32)
+    g = xf.reshape(num_groups, -1)
+    mean = g.mean(dim=1, keepdim=True)
+    var = g.var(dim=1, unbiased=False, keepdim=True)
+    y = ((g - mean) / torch.sqrt(var + eps)).reshape(xf.shape)
+    if gamma is not None:
+        y = y * gamma.to(torch.float32).reshape(C, 1, 1)
+    if beta is not None:
+        y = y + beta.to(torch.float32).reshape(C, 1, 1)
+    return y.to(torch.bfloat16).contiguous()
+
+
+def group_norm_fold_affine(sum_c: torch.Tensor, sumsq_c: torch.Tensor,
+                           count: int, num_groups: int,
+                           gamma: Optional[torch.Tensor] = None,
+                           beta: Optional[torch.Tensor] = None,
+                           eps: float = 1e-5):
+    """Fold group statistics + per-channel affine into a single per-channel
+    ``(A, B)`` so the apply pass is ``y = x * A_c + B_c``.
+
+    ``sum_c`` / ``sumsq_c`` are per-channel sums of x and x^2 over the spatial
+    plane (shape ``(C,)``); ``count`` is the group population
+    ``channels_per_group * H * W``. Returns ``(A, B)`` as bf16 ``(C,)``
+    tensors.
+
+    NUMERICS: variance comes from ``E[x^2] - E[x]^2``, which cancels
+    catastrophically when ``|mean| >> std``. That is the price of a
+    single-pass reduction — the stable alternative (subtract the mean, then
+    re-reduce the centered data) doubles the traffic over the full tensor.
+    The combine itself runs in float64 so only the device-side bf16 sums limit
+    accuracy; :func:`group_norm_cancellation_ratio` quantifies the headroom
+    for a given tensor.
+    """
+    C = sum_c.numel()
+    assert sumsq_c.numel() == C
+    assert C % num_groups == 0, f"C={C} not divisible by num_groups={num_groups}"
+    cg = C // num_groups
+    s = sum_c.to(torch.float64).reshape(num_groups, cg).sum(dim=1)
+    q = sumsq_c.to(torch.float64).reshape(num_groups, cg).sum(dim=1)
+    mean = s / count
+    var = torch.clamp(q / count - mean * mean, min=0.0)
+    inv_std = 1.0 / torch.sqrt(var + eps)
+
+    mean_c = mean.repeat_interleave(cg)
+    inv_c = inv_std.repeat_interleave(cg)
+    g = torch.ones(C, dtype=torch.float64) if gamma is None else gamma.to(torch.float64)
+    b = torch.zeros(C, dtype=torch.float64) if beta is None else beta.to(torch.float64)
+    A = inv_c * g
+    B = b - mean_c * inv_c * g
+    return A.to(torch.bfloat16), B.to(torch.bfloat16)
+
+
+def group_norm_cancellation_ratio(x: torch.Tensor, num_groups: int) -> float:
+    """Worst-group ``|mean| / std`` for a tensor — how much precision the
+    ``E[x^2] - E[x]^2`` variance in :func:`group_norm_fold_affine` gives up.
+
+    bf16 carries ~8 mantissa bits, so a ratio approaching ~16 leaves almost no
+    significant bits in the difference. Use this to decide whether a given
+    layer needs the stable two-pass variance instead.
+    """
+    g = x.to(torch.float64).reshape(num_groups, -1)
+    mean = g.mean(dim=1)
+    std = g.std(dim=1, unbiased=False)
+    return float((mean.abs() / torch.clamp(std, min=1e-30)).max())
+
+
+def plan_group_norm(c: int, h: int, w: int, num_groups: int = 32):
+    """Plan GroupNorm as lane-wise accumulation over the packed conv map.
+
+    KEY IDEA: in the channels-in-lanes layout, a URAM line already holds 64
+    channels of one pixel. Accumulating lines *lane-wise* therefore produces
+    PER-CHANNEL spatial sums directly — no group-planar repack, and no
+    reduction row that has to span a whole group. The group reduction is then
+    just summing ``channels_per_group`` scalars, and the final scale/shift is
+    a per-channel affine, which in this layout is an ordinary eltwise against
+    a repeated 64-lane vector.
+
+    That sidesteps both limits a LayerNorm-shaped GroupNorm would hit: the
+    262,080-element single-row reduction cap (largest VAE group is 1M
+    elements) and the sub-64-lane group width (groups of 4-16 channels would
+    under-fill a 64-lane line).
+
+    Accumulation is SLOTTED and FLUSHED. ``slots`` pixel accumulators are kept
+    live, slot j accumulating pixels j, j+slots, j+2*slots, ...; every
+    ``flush_every`` chunks the accumulators are written to DRAM and re-zeroed.
+    So no bf16 accumulator ever absorbs more than ``flush_every`` additions,
+    and the host finishes the remaining sum in float64.
+
+    That bound is what makes the op usable at VAE scale. bf16 carries ~8
+    mantissa bits, and serial accumulation error grows like sqrt(depth): the
+    deepest VAE GroupNorm (128ch @ 512x512) reduces 262,144 pixels, which
+    unflushed lands around 24 dB SNR — roughly 4 bits. Capping the depth at
+    ``GROUP_NORM_MAX_ACC_DEPTH`` costs a few MB of extra partial writes
+    against a 64 MB activation and buys back most of those bits.
+
+    Budgets per pass (URAM_A and URAM_B are 4096 lines each):
+      stats: URAM_A = chunk + square scratch (2 * slot_lines)
+             URAM_B = chunk copy + sum acc + sumsq acc (3 * slot_lines)
+      apply: URAM_A = chunk (slot_lines)
+             URAM_B = A-repeat + B-repeat (2 * slot_lines)
+    so ``slot_lines = slots * ct <= 1024`` satisfies every one.
+
+    Returns ``(ct, slots, slot_lines, n_full_chunks, tail_pixels, flush_every,
+    n_flushes)``.
+    """
+    assert c >= 1 and h >= 1 and w >= 1
+    assert c % num_groups == 0, f"C={c} not divisible by num_groups={num_groups}"
+    ct = (c + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    slots = max(1, GROUP_NORM_SLOT_LINES // ct)
+    pixels = h * w
+    slots = min(slots, pixels)
+    slot_lines = slots * ct
+    n_full_chunks = pixels // slots
+    tail_pixels = pixels - n_full_chunks * slots
+    n_chunks = n_full_chunks + (1 if tail_pixels else 0)
+    flush_every = min(max(1, GROUP_NORM_MAX_ACC_DEPTH), max(1, n_chunks))
+    n_flushes = -(-n_chunks // flush_every)
+    return (ct, slots, slot_lines, n_full_chunks, tail_pixels,
+            flush_every, n_flushes)
+
+
+def packed_map_to_chw(flat: torch.Tensor, h: int, w: int, c: int) -> torch.Tensor:
+    """Inverse of :func:`conv2d_pack_activation_map` (``pad=0``): unpack a
+    channels-in-lanes map back into a (C, H, W) tensor.
+
+    TEST-ONLY convenience. Ops that move or scale whole ``ct``-line pixel
+    groups (upsample, GroupNorm) leave their output in the packed layout, so
+    the next conv reads the buffer in place — this permute exists only to
+    compare against a torch reference.
+    """
+    ct = (c + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    lines = flat.reshape(-1, UE_VECTOR_SIZE)[:h * w * ct]
+    return lines.reshape(h, w, ct * UE_VECTOR_SIZE)[:, :, :c] \
+                .permute(2, 0, 1).contiguous()
+
+
+def nn_upsample_2x_unpack_result(flat: torch.Tensor, out_h: int, out_w: int,
+                                 c: int) -> torch.Tensor:
+    """Unpack the upsample writeback into a (C, out_h, out_w) tensor.
+
+    The upsample moves whole ``ct``-line pixel groups, so its output is in the
+    SAME channels-in-lanes layout :func:`conv2d_pack_activation_map` emits —
+    the buffer is directly readable as the next conv's activation map (with
+    ``pad=0``), no repack.
+    """
+    return packed_map_to_chw(flat, out_h, out_w, c)
+
+
+def nn_upsample_2x_ref(x: torch.Tensor) -> torch.Tensor:
+    """Host reference for nearest-neighbour 2x upsample, (C, H, W) -> (C, 2H, 2W).
+
+    Equals ``F.interpolate(x, scale_factor=2, mode='nearest')`` — a pure data
+    movement, so bf16 payloads are reproduced bit-exactly.
+    """
+    assert x.dim() == 3, f"expected (C, H, W), got shape {tuple(x.shape)}"
+    return x.repeat_interleave(2, dim=1).repeat_interleave(2, dim=2).contiguous()
+
+
+def plan_nn_upsample_2x(in_h: int, in_w: int, c: int):
+    """Plan nearest-neighbour 2x upsample as uniform strided DMA passes.
+
+    Operates directly on the packed channels-in-lanes map that
+    :func:`conv2d_pack_activation_map` emits (``pad=0``): one 128-byte URAM
+    line per (pixel, channel-tile), pixel-major with ``ct`` inner. Upsampling
+    never touches lanes, so a pixel's whole ``ct``-line group moves as one
+    unit and the plan is independent of ``C`` beyond that group size.
+
+    Decomposition (two axes, two output parities each):
+
+    * **Vertical** (pass ``a`` in {0, 1}): input row ``y`` -> intermediate row
+      ``2y + a``. Rows are contiguous ``in_w * ct`` line runs, so this is a
+      contiguous read and a uniform strided write with chunk = one row and
+      jump = two rows.
+    * **Horizontal** (pass ``b`` in {0, 1}): intermediate pixel index ``i`` ->
+      output index ``2i + b``. Because ``2*(W*y + x) == 2W*y + 2x``, the
+      doubling is uniform across row boundaries too — one stride pair covers
+      the whole tensor, no per-row loop.
+
+    Vertical runs first so the staged unit stays one *input*-width row
+    (``in_w * ct`` lines); doing it the other way would stage ``2 * in_w``.
+
+    Returns ``(out_h, out_w, lines_per_pixel, passes)`` where each pass is a
+    dict with the byte-level DMA parameters:
+    ``{'kind', 'parity', 'src', 'dst_off', 'chunk_bytes', 'jump_bytes',
+       'total_bytes', 'rows'}``. ``src`` names the buffer ('in' or 'tmp'),
+    ``dst_off`` is the byte offset of the first written chunk in the
+    destination buffer, and ``rows`` is the number of chunks the pass moves.
+    """
+    assert in_h >= 1 and in_w >= 1, "input must be non-empty"
+    assert c >= 1, "need at least one channel"
+    ct = (c + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    line_bytes = UE_VECTOR_SIZE * 2          # one 64-lane bf16 URAM line
+    pixel_bytes = ct * line_bytes            # all channel tiles of one pixel
+    row_bytes = in_w * pixel_bytes           # one input row, contiguous
+
+    passes = []
+    # Vertical: in (in_h, in_w) -> tmp (2*in_h, in_w), one row per chunk.
+    for a in (0, 1):
+        passes.append({
+            'kind': 'v', 'parity': a, 'src': 'in',
+            'dst_off': a * row_bytes,
+            'chunk_bytes': row_bytes,
+            'jump_bytes': 2 * row_bytes,
+            'total_bytes': in_h * row_bytes,
+            'rows': in_h,
+        })
+    # Horizontal: tmp (2*in_h, in_w) -> out (2*in_h, 2*in_w), one pixel per
+    # chunk; uniform across rows because 2*(W*y + x) == 2W*y + 2x.
+    tmp_pixels = 2 * in_h * in_w
+    for b in (0, 1):
+        passes.append({
+            'kind': 'h', 'parity': b, 'src': 'tmp',
+            'dst_off': b * pixel_bytes,
+            'chunk_bytes': pixel_bytes,
+            'jump_bytes': 2 * pixel_bytes,
+            'total_bytes': tmp_pixels * pixel_bytes,
+            'rows': tmp_pixels,
+        })
+    return 2 * in_h, 2 * in_w, ct, passes
+
+
+def nn_upsample_2x_simulate(act_map: torch.Tensor, in_h: int, in_w: int, c: int) -> torch.Tensor:
+    """Execute :func:`plan_nn_upsample_2x` in host memory on a packed map.
+
+    Applies each pass exactly as the DMA does — contiguous read, uniform
+    strided write — so a mismatch against :func:`nn_upsample_2x_ref` is a bug
+    in the plan's address arithmetic, not in the hardware. Returns the packed
+    output map ((2H*2W*ct), 64).
+    """
+    out_h, out_w, ct, passes = plan_nn_upsample_2x(in_h, in_w, c)
+    lines = act_map.reshape(-1, UE_VECTOR_SIZE)
+    line_bytes = UE_VECTOR_SIZE * 2
+    bufs = {
+        'in': lines,
+        'tmp': torch.zeros(2 * in_h * in_w * ct, UE_VECTOR_SIZE, dtype=act_map.dtype),
+        'out': torch.zeros(out_h * out_w * ct, UE_VECTOR_SIZE, dtype=act_map.dtype),
+    }
+    for p in passes:
+        dst = 'tmp' if p['kind'] == 'v' else 'out'
+        src_lines = bufs[p['src']]
+        chunk_lines = p['chunk_bytes'] // line_bytes
+        jump_lines = p['jump_bytes'] // line_bytes
+        base_line = p['dst_off'] // line_bytes
+        for i in range(p['rows']):
+            s = i * chunk_lines
+            d = base_line + i * jump_lines
+            bufs[dst][d:d + chunk_lines] = src_lines[s:s + chunk_lines]
+    return bufs['out']
+
+
+#: Per-parity 2x3 tap-fold matrices for :func:`nn_upsample_conv3x3_fold`.
+#: Row r of ``F_a`` lists which of the three k=3 taps land on the r-th of the
+#: two distinct source pixels for output parity ``a``.
+_NN_FOLD = {0: ((1, 0, 0), (0, 1, 1)),
+            1: ((1, 1, 0), (0, 0, 1))}
+#: Per-parity one-sided pad (before, after) on the folded axis.
+_NN_FOLD_PAD = {0: (1, 0), 1: (0, 1)}
+
+
+def nn_upsample_conv3x3_fold(w: torch.Tensor):
+    """Fold ``[nearest-2x-upsample -> Conv2d(k=3, s=1, p=1)]`` into four k=2
+    convs on the ORIGINAL (un-upsampled) map — the VAE decoder / UNet
+    resize-conv fusion.
+
+    Derivation (rows; columns are identical and independent). With
+    ``y[i] = x[i//2]`` and a p=1 conv, output row ``oy`` reads ``y`` rows
+    ``oy + ky - 1`` for ``ky in {0,1,2}``. Writing ``oy = 2m + a``, the source
+    x row is ``m + floor((a + ky - 1)/2)``:
+
+    * ``a=0`` -> x rows ``(m-1, m, m)``: taps ky=1 and ky=2 hit the SAME source
+      pixel, so they sum. Two distinct rows ``(m-1, m)`` with folded weights
+      ``(w0, w1+w2)``; row ``m-1`` at ``m=0`` is the conv's own top halo, so the
+      sub-conv needs one TOP pad row.
+    * ``a=1`` -> x rows ``(m, m, m+1)``: taps ky=0,1 sum. Rows ``(m, m+1)`` with
+      ``(w0+w1, w2)``, one BOTTOM pad row.
+
+    So ``out[:, a::2, b::2] = conv2d(pad(x, side), w_sub[a][b], k=2, s=1, p=0)``
+    — the same parity-class shape as :func:`conv_transpose2d_k4s2p1_decompose`,
+    with a different weight fold. The 2x map is never materialised.
+
+    Cost: 4 parities x (H*W*OC*4*ct) MACs vs 4*H*W*OC*9*ct for the unfused
+    pair, i.e. **4/9 the MACs** (2.25x), and it drops the upsample's entire
+    DMA round trip (201 MB at the 512x512x256 decoder stage).
+
+    ``w``: (OC, C, 3, 3) integer hardware codes. Returns four
+    ``(a, b, (left, right, top, bottom) pad, w_sub)`` with w_sub (OC, C, 2, 2).
+
+    NOTE — code growth. The fold is an exact integer sum of up to 2x2 = 4
+    original codes, so folded codes span 4x the input range. Callers must keep
+    the result representable in the target data type (INT4 is [-8, 7], so
+    unfolded codes must sit in [-2, 1] for the worst case);
+    :func:`nn_upsample_conv3x3_fold_fits` checks it. This is a real deployment
+    constraint, not a test artifact: it is why the fused path wants a wider
+    weight type, and IF8 conv is currently blocked on the multi-block X-stream
+    HW issue (see if4_if8_dot_product_test).
+    """
+    assert w.dim() == 4 and w.shape[2] == 3 and w.shape[3] == 3, \
+        f"expected (OC, C, 3, 3), got shape {tuple(w.shape)}"
+    wl = w.to(torch.int64)
+    out = []
+    for a in (0, 1):
+        fa = torch.tensor(_NN_FOLD[a], dtype=torch.int64)   # (2, 3)
+        for b in (0, 1):
+            fb = torch.tensor(_NN_FOLD[b], dtype=torch.int64)  # (2, 3)
+            # w_sub[oc, c, r, s] = sum_{ky,kx} F_a[r,ky] * F_b[s,kx] * w[oc,c,ky,kx]
+            w_sub = torch.einsum('rk,sl,ockl->ocrs', fa, fb, wl).contiguous()
+            pt, pb = _NN_FOLD_PAD[a]
+            pl, pr = _NN_FOLD_PAD[b]
+            out.append((a, b, (pl, pr, pt, pb), w_sub))
+    return out
+
+
+def nn_upsample_conv3x3_fold_fits(w: torch.Tensor, data_type: "TYPE") -> bool:
+    """True when every folded code from :func:`nn_upsample_conv3x3_fold` is
+    representable as a two's-complement code of ``data_type`` (INT4 [-8, 7],
+    INT8 [-128, 127]). See that function's code-growth note."""
+    lo, hi = (-128, 127) if data_type == TYPE.IF8 else (-8, 7)
+    return all(int(w_sub.min()) >= lo and int(w_sub.max()) <= hi
+               for (_, _, _, w_sub) in nn_upsample_conv3x3_fold(w))
+
+
+def nn_upsample_conv3x3_ref(x: torch.Tensor, w: torch.Tensor,
+                            scale_mag: float = 1.0,
+                            bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Host reference for the fused op: ``F.interpolate(nearest, 2x)`` then
+    ``F.conv2d(k=3, s=1, p=1)`` with |scale| dequant — the unfused pair the
+    fold must reproduce exactly."""
+    import torch.nn.functional as F
+    y = F.interpolate(x.to(torch.float32).unsqueeze(0), scale_factor=2, mode='nearest')
+    wf = w.to(torch.float32) * abs(scale_mag)
+    bf = None if bias is None else bias.to(torch.float32)
+    return F.conv2d(y, wf, bias=bf, stride=1, padding=1)[0]
+
+
+#: Degree-4 Chebyshev fit of 1/(1+w) on w in [0, 1], ascending (c0..c4). Used by
+#: :func:`silu_mul_add_ref`. Degree 4 already puts the polynomial error
+#: (2.5e-4) an order of magnitude below bf16's 3.9e-3 resolution, so the
+#: construction is bf16-rounding-limited and a higher degree buys nothing:
+#: measured 54.89 dB vs a 55.14 dB floor (exact SiLU rounded to bf16).
+SILU_RECIP_POLY = (0.9997467059, -0.9861153368, 0.8719873901,
+                   -0.5423068868, 0.1568672644)
+
+
+def silu_mul_add_ref(x: torch.Tensor, coeffs=SILU_RECIP_POLY,
+                     dtype=torch.bfloat16) -> torch.Tensor:
+    """SiLU built ONLY from ops the 64-lane datapath already has.
+
+    There is no per-lane activation unit — the single ``lalu`` sits on the
+    scalar ``S_out`` leg while eltwise results leave on the 1024-bit
+    ``alu_out`` — so ``x*sigmoid(x)`` has to be constructed from
+    ELTWISE_MUL/ADD/SUB, MUL_/ADD_BROADCAST, per-lane max, and EXP. EXP is
+    genuinely per-lane: ``compute_unit`` instantiates ``MAX_N`` (64)
+    ``custom_exp`` units and EXP_MODE routes them to ``alu_out``.
+
+    Construction::
+
+        xp = max(x, 0) >= 0            xn = x - xp <= 0     (one is always 0)
+        w  = exp(xn - xp) = exp(-|x|)  in (0, 1]
+        p  = P(w) ~ 1/(1+w)            (Horner, scalar coeffs)
+        q  = w * p  = w/(1+w) = 1 - p
+        y  = xp*p + xn*q
+
+    ``x>=0`` gives ``x/(1+e^-x)``; ``x<0`` gives ``x*e^x/(1+e^x)``, the same
+    thing. Two properties make it work where a plain polynomial in ``x``
+    cannot:
+
+    * The sign split forces EXP's argument to be **non-positive**, so ``w``
+      lands in (0, 1] and can never overflow. SiLU saturates, so any polynomial
+      in ``x`` diverges on the tails; this construction instead tends to zero
+      on the negative tail and to ``x`` on the positive tail.
+    * ``1/(1+w)`` on [0,1] has its nearest pole at w=-1, so Chebyshev error
+      falls like (3+sqrt(8))^-n ~ 5.83^-n. Degree 4 is already below bf16.
+
+    ``q`` is computed as ``w*p``, NOT as ``1-p``: when ``|x|`` is large ``w`` is
+    tiny, ``p`` rounds to exactly 1.0 in bf16, and ``1-p`` cancels to 0 —
+    which cost ~3 decimal digits at x=-8 (error 2.7e-3 vs 2.7e-6). ``w*p`` is
+    algebraically identical, one op cheaper, and has no cancellation.
+
+    :meth:`UnifiedEngine.run_silu_layer` evaluates this in ``2*deg + 9`` wide
+    passes (17 at degree 4). The first pass exposes the existing MAXPOOL
+    compare tree as ``max(x, 0)`` by feeding interleaved ``[x, 0]`` lines.
+    """
+    def r(t):
+        return t.to(dtype).to(torch.float32)
+    x = r(x)
+    xp = r(torch.clamp(x, min=0))
+    xn = r(x - xp)
+    w = r(torch.exp(r(xn - xp)))
+    p = r(torch.full_like(w, float(coeffs[-1])))
+    for j in range(len(coeffs) - 2, -1, -1):
+        # Driver broadcast scalars are encoded as BF16 in the descriptor, so
+        # round each coefficient before the add as hardware does.
+        cj = r(torch.full_like(w, float(coeffs[j])))
+        p = r(r(p * w) + cj)
+    q = r(w * p)
+    return r(r(xp * p) + r(xn * q)).to(dtype)
+
+
+def vae_decoder_plan(*, latent_h: int = 64, latent_w: int = 64,
+                     latent_ch: int = 4, out_ch: int = 3,
+                     block_out_channels=(128, 256, 512, 512),
+                     layers_per_block: int = 3,
+                     num_groups: int = 32,
+                     fuse_upsample: bool = True):
+    """Enumerate the SD/SDXL VAE decoder as a flat list of primitive calls.
+
+    Bring-up glue: walks the diffusers ``Decoder`` graph (conv_in -> mid block
+    -> up blocks -> norm_out/SiLU/conv_out) and maps EVERY op to the driver
+    entry point that runs it, with its shape and MAC count. It is a pure
+    function — no device — so it answers "is the decoder covered, and what
+    does it cost" without a board.
+
+    Structure follows diffusers ``AutoencoderKL``: the decoder walks
+    ``block_out_channels`` reversed, each up block is ``layers_per_block``
+    ResnetBlock2Ds followed by an ``Upsample2D`` (except the last block), and
+    each ResnetBlock2D is ``[GroupNorm, SiLU, conv3x3] x2`` plus a 1x1
+    shortcut when the channel count changes.
+
+    ``fuse_upsample`` maps each ``[Upsample2D(interpolate) -> conv3x3]`` onto
+    :meth:`UnifiedEngine.run_nn_upsample_conv3x3` (four parity k=2 sub-convs)
+    instead of the unfused ``run_nn_upsample_2x`` + ``run_conv2d_layer`` pair.
+
+    Returns ``(ops, summary)``. Each op is a dict with ``op`` (graph node),
+    ``primitive`` (driver method), ``in_shape``/``out_shape`` (C, H, W),
+    ``macs``, and ``note``. ``summary`` totals MACs and counts ops by
+    primitive. SiLU maps to :meth:`UnifiedEngine.run_silu_layer`, which exposes
+    the existing pooling compare tree as per-lane ``max(x, 0)`` and composes
+    the rest from wide EXP/mul/add/sub operations.
+    """
+    assert layers_per_block >= 1 and len(block_out_channels) >= 1
+    # Every GroupNorm in the graph normalises one of these channel counts, so
+    # catch an indivisible schedule here rather than at the run that hits it.
+    bad_groups = [c for c in block_out_channels if c % num_groups != 0]
+    assert not bad_groups, (
+        f"vae_decoder_plan: num_groups={num_groups} does not divide {bad_groups}; "
+        f"every GroupNorm in the decoder normalises one of block_out_channels")
+    ops = []
+
+    def emit(op, primitive, in_shape, out_shape, macs=0, note=""):
+        ops.append({'op': op, 'primitive': primitive, 'in_shape': in_shape,
+                    'out_shape': out_shape, 'macs': int(macs), 'note': note})
+
+    def ct_of(c):
+        return -(-c // UE_VECTOR_SIZE)
+
+    def conv_macs(c_in, c_out, h, w, k):
+        # Device cost tracks 64-lane channel tiles, not raw channels.
+        return h * w * c_out * k * k * ct_of(c_in) * UE_VECTOR_SIZE
+
+    def resnet(prefix, c_in, c_out, h, w):
+        for j, c in ((1, c_in), (2, c_out)):
+            emit(f"{prefix}.norm{j}", "run_group_norm", (c, h, w), (c, h, w),
+                 note=f"GroupNorm({num_groups}, {c})")
+            emit(f"{prefix}.nonlinearity{j}", "run_silu_layer",
+                 (c, h, w), (c, h, w),
+                 note="SiLU: MAXPOOL sign split + wide EXP/mul/add/sub")
+            cs = c_in if j == 1 else c_out
+            emit(f"{prefix}.conv{j}", "run_conv2d_layer", (cs, h, w), (c_out, h, w),
+                 conv_macs(cs, c_out, h, w, 3), note="k3 s1 p1")
+        if c_in != c_out:
+            emit(f"{prefix}.conv_shortcut", "run_conv2d_layer", (c_in, h, w),
+                 (c_out, h, w), conv_macs(c_in, c_out, h, w, 1), note="k1 s1 p0")
+        emit(f"{prefix}.residual", "run_eltwise_add_layer", (c_out, h, w), (c_out, h, w),
+             note="ELTWISE_ADD, 64-lane hardware mode")
+
+    rev = list(reversed(block_out_channels))
+    c, h, w = rev[0], latent_h, latent_w
+
+    emit("post_quant_conv", "run_conv2d_layer", (latent_ch, h, w), (latent_ch, h, w),
+         conv_macs(latent_ch, latent_ch, h, w, 1), note="k1 s1 p0")
+    emit("conv_in", "run_conv2d_layer", (latent_ch, h, w), (c, h, w),
+         conv_macs(latent_ch, c, h, w, 3), note="k3 s1 p1")
+
+    resnet("mid.resnets.0", c, c, h, w)
+    emit("mid.attentions.0", "run_vae_attention_block", (c, h, w), (c, h, w),
+         2 * (h * w) * (h * w) * c + 4 * conv_macs(c, c, h, w, 1),
+         note=f"single head, seq={h*w}, head_dim={c}; incl. 4 1x1 convs")
+    resnet("mid.resnets.1", c, c, h, w)
+
+    for i, c_out in enumerate(rev):
+        for j in range(layers_per_block):
+            resnet(f"up_blocks.{i}.resnets.{j}", c if j == 0 else c_out, c_out, h, w)
+        c = c_out
+        if i < len(rev) - 1:
+            if fuse_upsample:
+                emit(f"up_blocks.{i}.upsamplers.0", "run_nn_upsample_conv3x3",
+                     (c, h, w), (c, 2 * h, 2 * w), conv_macs(c, c, h, w, 2) * 4,
+                     note="fused: 4 parity k2 sub-convs, 4/9 the MACs, 2x map never built")
+            else:
+                emit(f"up_blocks.{i}.upsamplers.0.interpolate", "run_nn_upsample_2x",
+                     (c, h, w), (c, 2 * h, 2 * w), 0, note="pure DMA, no compute")
+                emit(f"up_blocks.{i}.upsamplers.0.conv", "run_conv2d_layer",
+                     (c, 2 * h, 2 * w), (c, 2 * h, 2 * w),
+                     conv_macs(c, c, 2 * h, 2 * w, 3), note="k3 s1 p1")
+            h, w = 2 * h, 2 * w
+
+    emit("conv_norm_out", "run_group_norm", (c, h, w), (c, h, w),
+         note=f"GroupNorm({num_groups}, {c})")
+    emit("conv_act", "run_silu_layer", (c, h, w), (c, h, w),
+         note="SiLU: MAXPOOL sign split + wide EXP/mul/add/sub")
+    emit("conv_out", "run_conv2d_layer", (c, h, w), (out_ch, h, w),
+         conv_macs(c, out_ch, h, w, 3), note="k3 s1 p1")
+
+    by_primitive = {}
+    for o in ops:
+        by_primitive[o['primitive']] = by_primitive.get(o['primitive'], 0) + 1
+    summary = {
+        'total_macs': sum(o['macs'] for o in ops),
+        'n_ops': len(ops),
+        'by_primitive': by_primitive,
+        'gaps': sorted({o['note'] for o in ops if o['primitive'] is None}),
+        'n_unmapped': sum(1 for o in ops if o['primitive'] is None),
+        'out_shape': (out_ch, h, w),
+    }
+    return ops, summary
+
+
+def vae_attention_block_ref(x: torch.Tensor, *, w_q, w_k, w_v, w_proj,
+                            gamma=None, beta=None, num_groups: int = 32,
+                            scale_mag: float = 1.0,
+                            eps: float = 1e-6) -> torch.Tensor:
+    """Host reference for :meth:`UnifiedEngine.run_vae_attention_block` — the
+    SD/SDXL VAE ``AttnBlock``, in float32.
+
+    Mirrors diffusers' ``Attention`` with ``residual_connection=True`` and
+    ``group_norm`` inside the branch: the residual adds the block INPUT, not
+    the normalised tensor.
+    """
+    import torch.nn.functional as F
+    C, H, W = x.shape
+    xf = x.to(torch.float32)
+    h = F.group_norm(xf.unsqueeze(0), num_groups,
+                     weight=None if gamma is None else gamma.to(torch.float32),
+                     bias=None if beta is None else beta.to(torch.float32), eps=eps)
+    q, k, v = [F.conv2d(h, wt.to(torch.float32) * abs(scale_mag))[0].reshape(-1, H * W).t()
+               for wt in (w_q, w_k, w_v)]
+    probs = torch.softmax(q @ k.t() / math.sqrt(C), dim=-1)
+    a = (probs @ v).t().reshape(C, H, W)
+    h2 = F.conv2d(a.unsqueeze(0), w_proj.to(torch.float32) * abs(scale_mag))[0]
+    return xf + h2
+
+
+def conv_transpose2d_k4s2p1_decompose(w: torch.Tensor):
+    """Sub-pixel decomposition of ConvTranspose2d(k=4, stride=2, padding=1).
+
+    With ``oy = 2m + a``: valid taps satisfy ``iy = (oy + 1 - ky)/2``
+    integer, so even output rows (a=0) read taps ky in {3, 1} at input rows
+    (m-1, m) — a k=2 conv needing one TOP pad row — and odd rows (a=1) read
+    ky in {2, 0} at rows (m, m+1) — one BOTTOM pad row. Same per column.
+    So: ``y[:, a::2, b::2] = conv2d(pad(x, side), w_sub[a][b], k=2, s=1)``.
+
+    ``w``: (C_in, C_out, 4, 4) in ConvTranspose weight layout. Returns four
+    ``(a, b, (left, right, top, bottom) pad, w_sub)`` with w_sub already in
+    conv2d layout (C_out, C_in, 2, 2), tap order matching the input walk.
+    """
+    assert w.dim() == 4 and w.shape[2] == 4 and w.shape[3] == 4
+    ky_sets = {0: [3, 1], 1: [2, 0]}
+    side = {0: (1, 0), 1: (0, 1)}  # (before, after) pad on that axis
+    out = []
+    for a in (0, 1):
+        for b in (0, 1):
+            w_sub = w[:, :, ky_sets[a], :][:, :, :, ky_sets[b]].permute(1, 0, 2, 3).contiguous()
+            pt, pb = side[a]
+            pl, pr = side[b]
+            out.append((a, b, (pl, pr, pt, pb), w_sub))
+    return out
 
 
 def calculate_snr(reference, result) -> float:

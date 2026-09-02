@@ -142,4 +142,24 @@ del models/smolvlm2/smolvlm2_bin/decoder_program.json
 # --- swin: full bin dir wipe ------------------------------------------------
 del models/swin/swin_bin/
 
+# --- yolov5s: drop generated artifacts; keep official v7.0 checkpoint -------
+del models/yolov5s/yolov5s_bin/yolov5s-andromeda.bin
+del models/yolov5s/yolov5s_bin/.yolov5s-andromeda.bin.tmp
+del models/yolov5s/yolov5s_bin/programs*.bin
+del models/yolov5s/yolov5s_bin/programs*.json
+del models/yolov5s/yolov5s_bin/params*.bin
+del models/yolov5s/yolov5s_bin/params*.json
+del models/yolov5s/yolov5s_bin/*_detections_*.jpg
+del models/yolov5s/*_detections_*.jpg
+
+# --- yolov5n: drop generated artifacts; keep official v7.0 checkpoint -------
+del models/yolov5n/yolov5n_bin/yolov5n-andromeda.bin
+del models/yolov5n/yolov5n_bin/.yolov5n-andromeda.bin.tmp
+del models/yolov5n/yolov5n_bin/programs*.bin
+del models/yolov5n/yolov5n_bin/programs*.json
+del models/yolov5n/yolov5n_bin/params*.bin
+del models/yolov5n/yolov5n_bin/params*.json
+del models/yolov5n/yolov5n_bin/*_detections_*.jpg
+del models/yolov5n/*_detections_*.jpg
+
 echo "clean done."
