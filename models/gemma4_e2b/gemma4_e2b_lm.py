@@ -39,40 +39,162 @@ class Gemma4LMMixin:
         return self._ensure_stage_scheduler("prefill", self.VISION_ISA_BASE)
 
     def _ensure_decode_scheduler(self):
-        """Return the multicore scheduler for the DECODE stage, or None.
+        """Scheduler for the decode SMOKE TEST only (--decode-shard-dummy).
 
-        A separate stage from prefill on purpose: its worker programs are a
-        different length (different barrier count), so they must not share
-        prefill's cached worker addresses. The shared worker pool in
-        _ensure_stage_scheduler makes decode's programs land AFTER prefill's in
-        each worker's slot rather than on top of them.
+        The real O-projection shard does NOT go through MultiEngineScheduler any
+        more: it is emitted inline, one independent program per core, following
+        ``quantized_matmat_mul_multi_cores_test`` in user_hw_test.py (see
+        :meth:`_decode_shard_engines` and :meth:`_decode_shard_region`). The two
+        flags are mutually exclusive at the CLI, so only one mechanism is ever
+        live in a run.
         """
-        if not (getattr(self, "decode_shard_dummy", False)
-                or getattr(self, "decode_shard_oproj", False)):
+        if not getattr(self, "decode_shard_dummy", False):
             return None
         return self._ensure_stage_scheduler("decode")
 
+    def _decode_shard_engines(self) -> list:
+        """The slave engines the decode O-proj shard runs on ([] when off).
+
+        Engine OBJECTS still come from the run-wide pool: their program
+        allocators must keep advancing across stages, or the decode worker
+        programs land on top of prefill's (see _ensure_worker_pool).
+        """
+        if not getattr(self, "decode_shard_oproj", False):
+            return []
+        return self._ensure_worker_pool()
+
+    # Instructions the slave spins through after raising its completion flag,
+    # before waiting on the master's next start flag. The flag ISA has SET /
+    # CLEAR / CHECK-for-one, and CHECK only spin-waits for ==1 -- there is no
+    # wait-for-zero -- so a multi-region program cannot be made stale-flag-proof
+    # by construction, only by margin. See _decode_shard_region for the exact
+    # window this covers. 32 is the margin proven by flag_rendezvous_repeat_test.
+    DECODE_SHARD_MARGIN_NOPS = 32
+
+    def _decode_shard_rendezvous(self, engines: list) -> None:
+        """Symmetric all-engine rendezvous, emitted into EVERY engine's program.
+
+            per engine i:  SET(i) ; CHECK(every j != i) ; margin NOPs ; CLEAR(i)
+
+        Every engine both signals and waits, so the gate re-arms: an engine
+        cannot leave until it has OBSERVED every other engine's flag, and it
+        lowers its own only afterwards. The margin NOPs cover the only remaining
+        window -- engine A reaching the NEXT rendezvous's CHECK(B) while B, which
+        A has already observed, has not executed its CLEAR yet. That window is a
+        handful of instructions wide, versus a whole region body on the other
+        side. This is the shape flag_rendezvous_repeat_test validates over 27
+        rounds, and the one the 8-core prefill path already runs 3x per layer.
+        """
+        for i, ue in enumerate(engines):
+            ue.generate_instruction_flag_set()
+            for j in range(len(engines)):
+                if j != i:
+                    ue.generate_instruction_flag_check(target_engine_idx=j)
+            for _ in range(self.DECODE_SHARD_MARGIN_NOPS):
+                ue.generate_instruction_nop()
+            ue.generate_instruction_flag_clear()
+
+    def _decode_shard_region(self, workers: list, emit_body) -> None:
+        """Emit ONE fork/join region across the master and every slave.
+
+        Same execution model as ``quantized_matmat_mul_multi_cores_test``: no
+        core touches DRAM until every core has arrived, each core then runs ITS
+        OWN shard out of ITS OWN program against its OWN private weights, and
+        nothing downstream reads the output row until every column block is
+        written. ``emit_body(engine, engine_idx)`` emits that core's shard into
+        that core's capture buffer; engine 0 is the master (``self``).
+
+        THE BARRIER IS *NOT* THE REFERENCE TEST'S, AND CANNOT BE. That test runs
+        exactly ONE region per program and every slave halts straight after it,
+        so its asymmetric start/completion pair (master SET -> slaves go; slaves
+        SET -> master waits) never has to re-arm. Here there is one region per
+        sharded layer, and that pair deadlocks or races the moment it repeats:
+        the master's start flag necessarily stays HIGH for the whole region --
+        it cannot clear until the slowest slave has acked -- so the first slave
+        to finish its shard loops round and passes the NEXT region's CHECK on
+        the flag still standing from the region it just left. It then clears its
+        own ack (which the master may not have consumed) and computes layer r+1's
+        columns from the layer-r attention output the master has not yet
+        overwritten. Finite garbage, no hang, and with N equal-sized shards some
+        engine wins that race essentially every time.
+
+        VERIFIED: GEMMA4_SHARD_LAYERS unset (layer 0 only, one region) decodes
+        correctly with the asymmetric pair; =all (35 regions) decodes garbage.
+        No margin can fix it -- the window is a whole matmul wide, not skew --
+        so the region boundaries use the symmetric rendezvous above instead.
+        """
+        engines = [self] + list(workers)
+        self._decode_shard_rendezvous(engines)      # entry: A is written, all in
+        for engine_idx, ue in enumerate(engines):
+            emit_body(ue, engine_idx)
+        self._decode_shard_rendezvous(engines)      # exit: every column written
+
+    def _decode_preclear_flags(self, engines: list, timeout_seconds: float = 5.0) -> None:
+        """Run a tiny flag-clear program on the master and every slave.
+
+        Once, before the first decode step: a flag left set by an earlier
+        program (or an earlier PROCESS -- the FPGA is not reset between runs)
+        would make the first CHECK pass spuriously, and the master would race
+        ahead of a slave that has not written its columns yet.
+
+        STALE-BUSY RECOVERY first: a run that died mid-execution leaves its
+        slaves spin-waiting at a FLAG_CHECK (which has no timeout) with
+        queue_busy asserted, and they never accept this program. A bare SW_RESET
+        register write clears that. Deliberately not UnifiedEngine.software_reset(),
+        whose init_unified_engine() would re-run the 16 KB DRAM self-test on top
+        of live model memory.
+        """
+        SW_RESET_CMD = 0x80008000
+        for i, ue in enumerate(engines):
+            if not ue.is_queue_busy():
+                continue
+            print(f"    [decode shard] engine {i} is stuck busy from a previous "
+                  f"run; issuing SW_RESET")
+            ue.write_reg32(user_dma_core.UE_QUEUE_CTRL_ADDR, SW_RESET_CMD)
+            for _ in range(50):                      # ~0.5 s, 10 ms granularity
+                if not ue.is_queue_busy():
+                    break
+                time.sleep(0.01)
+            assert not ue.is_queue_busy(), (
+                f"engine {i} still reports queue_busy after SW_RESET. Continuing "
+                f"would let the master pass every rendezvous on stale flags -- "
+                f"fast, WRONG results rather than a hang. Power-cycle or reload "
+                f"the bitstream.")
+        for ue in engines:
+            assert not ue.is_capture_on, "_decode_preclear_flags() must run outside capture"
+            ue.start_capture()
+            ue.generate_instruction_flag_clear()
+            ue.generate_instruction_halt()
+            ue.stop_capture()
+            addr = ue.get_program_dram_addr()
+            ue.write_captured_instructions_to_dram(addr)
+            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+            ue.clear_capture_buffer()
+            ue.start_execute_from_dram(addr)
+            ue.wait_queue(timeout_seconds)
+
     def _load_decode_worker_programs(self, profile: bool = False):
-        """Load each decode slave's worker program into DRAM and clear flags.
+        """Load each decode slave's program into DRAM and clear every flag.
 
         ``profile`` selects which combined bin to read: the profile build stores
         its own sections, so a profiled run must not look in the normal one.
 
-        Returns ``(scheduler, worker_addrs)``, or ``(None, [])`` when decode
+        Returns ``(worker_engines, worker_addrs)``, or ``([], [])`` when decode
         sharding is off. The addresses are fixed for the whole run, so this is
-        done ONCE; the workers are (re)launched per decode step by the caller,
-        because a worker program runs once and halts.
+        done ONCE; the slaves are (re)launched per decode step by the caller,
+        because a slave program runs once and halts.
 
         Shared by the normal decode loop and the profiled decode step -- the
         profile path bypasses run_decoder entirely, so without this it would
         launch the master into a program full of barriers with nothing on the
         other side and spin on a FLAG_CHECK that has no timeout.
         """
-        sched = self._ensure_decode_scheduler()
-        if sched is None:
-            return None, []
+        sched = self._ensure_decode_scheduler()          # dummy smoke test only
+        workers = sched.workers if sched is not None else self._decode_shard_engines()
+        if not workers:
+            return [], []
         addrs = []
-        for engine_idx, worker in enumerate(sched.workers, start=1):
+        for engine_idx, worker in enumerate(workers, start=1):
             w_meta, w_bytes = self._get_program_section(
                 f"decode_worker{engine_idx}", profile)
             if w_meta is None:
@@ -89,12 +211,15 @@ class Gemma4LMMixin:
                     self.DECODE_DUMMY_SCRATCH_BASE
                     + (engine_idx - 1) * self.DECODE_DUMMY_SCRATCH_STRIDE,
                     torch.zeros(2 * 4096, dtype=torch.bfloat16))
-        sched.preclear_flags()
+        if sched is not None:
+            sched.preclear_flags()
+        else:
+            self._decode_preclear_flags([self] + list(workers))
         _what = ("dummy memcpy" if getattr(self, "decode_shard_dummy", False)
-                 else "wide-MLP gate N-shard")
+                 else "O-proj N-shard")
         print(f"[decode shard] {len(addrs)} slave core(s) armed "
               f"@ {[hex(a) for a in addrs]} ({_what})", flush=True)
-        return sched, addrs
+        return list(workers), addrs
 
     def _decode_shard_layers(self) -> list[int]:
         """Layer indices whose O projection is N-sharded in decode.
@@ -1513,7 +1638,8 @@ class Gemma4LMMixin:
                  (self.gpr_q_seq_len,       q_seq_len),
                  (self.gpr_aligned_seq_len, attn_aligned)],
                 prefill_program_addr, profile_checkpoints, tail_name="tail_halt",
-                worker_scheduler=prefill_scheduler,
+                worker_engines=(prefill_scheduler.workers
+                                if prefill_scheduler is not None else None),
                 worker_addrs=worker_program_addrs)
 
         print(f"[Prefill] [exec] launching prefill program on FPGA ({seq_len} tokens, {self.LAYER_SIZE} layers)...", flush=True)
@@ -1601,12 +1727,12 @@ class Gemma4LMMixin:
         # enough to stay far inside the 1 MiB private slot (src and dst halves).
         _DUMMY_ELEMS = 4096
         _DUMMY_HALF = 0x80000
-        # Real decode sharding: which layers, and is it on at all.
+        # Real decode sharding (--decode-shard-oproj): the slave engines whose
+        # capture buffers compile_gemma4 opened for us. Scheduler-free -- each
+        # one is an independent program, exactly like the reference test.
+        _decode_workers = list(getattr(self, "_active_decode_workers", []) or [])
         _shard_gate_layers = set(self._decode_shard_layers())
-        _shard_gate = bool(_shard_gate_layers) and _decode_sched is not None
-        # The dummy region and the real shard both need a decode scheduler, so
-        # "_decode_sched is not None" does NOT distinguish them -- gate the dummy
-        # on its own flag or it emits in --decode-shard-oproj runs too.
+        _shard_gate = bool(_shard_gate_layers) and bool(_decode_workers)
         _decode_dummy = (getattr(self, "decode_shard_dummy", False)
                          and _decode_sched is not None)
         if _shard_gate and not self._decode_shard_w:
@@ -1873,7 +1999,11 @@ class Gemma4LMMixin:
 
                 # O projection: INT4, K=cur_q_size (actual per-layer attention output dim)
                 if _shard_gate and layer_idx in _shard_gate_layers:
-                    # N-SHARDED O projection -- the ONLY matmul in this phase
+                    # N-SHARDED O projection, emitted the way
+                    # quantized_matmat_mul_multi_cores_test does it: every core
+                    # runs its own program, private weights, one flag rendezvous
+                    # around the op (see _decode_shard_region).
+                    # It is the ONLY matmul in this phase
                     # (everything after it is SRAM-resident norm/residual work
                     # that stays on the master). Split along N (weight rows):
                     # engine e computes output columns [e*cols, (e+1)*cols) from
@@ -1883,10 +2013,10 @@ class Gemma4LMMixin:
                     # engine writes its own slice and no gather is needed. Only
                     # A (the attention output) is shared.
                     _cols = self.vector_length // self.multi_core
-                    _ctxs = _decode_sched.begin_sharded(self.multi_core)
-                    for _ctx in _ctxs:
-                        _e = _ctx.engine_idx
-                        _d_addr, _s_addr = self._decode_shard_w[(layer_idx, _e)]
+
+                    def _emit_oproj_shard(_ue, _e, _K=cur_q_size, _L=layer_idx):
+                        """Engine _e's column block, emitted into ITS OWN program."""
+                        _d_addr, _s_addr = self._decode_shard_w[(_L, _e)]
                         _out = (self.LAYER0_ATTN_PROJ_OUTPUT_DRAM
                                 + _e * _cols * self.bytes_per_element)
                         # SAME kernel selection as the unsharded _projection_core
@@ -1894,26 +2024,23 @@ class Gemma4LMMixin:
                         # only in which columns they compute -- not in how.
                         if self.decode_kernel == "matmatmul":
                             _m_reg = self._decode_shard_m_regs[_e]
-                            _ctx.ue.generate_instruction_add_set(_m_reg, 1)
-                            _ctx.ue.matmat_mul_core(
-                                M=1, K=cur_q_size, N=_cols,
+                            _ue.generate_instruction_add_set(_m_reg, 1)
+                            _ue.matmat_mul_core(
+                                M=1, K=_K, N=_cols,
                                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                                 B_DRAM_ADDR=_d_addr, OUTPUT_DRAM_ADDR=_out,
                                 SCALE_DRAM_ADDR=_s_addr, is_B_quantized=True,
                                 data_type=TYPE.IF4, gpr_M_reg=_m_reg)
                         else:
-                            # unsafe_ue: SHARDED_OP_ALLOWLIST names
-                            # "quantized_matmat_mul_core", a method that does
-                            # not exist, so the guard proxy rejects the real
-                            # quantized_matmat_core. Passing no dimension GPRs
-                            # takes the legacy path -- exactly what
+                            # No dimension GPRs -> the legacy path, exactly what
                             # _projection_core does for the unsharded call.
-                            _ctx.unsafe_ue.quantized_matmat_core(
-                                M=1, K=cur_q_size, N=_cols,
+                            _ue.quantized_matmat_core(
+                                M=1, K=_K, N=_cols,
                                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                                 B_DRAM_ADDR=_d_addr, OUTPUT_DRAM_ADDR=_out,
                                 SCALE_DRAM_ADDR=_s_addr, data_type=TYPE.IF4)
-                    _decode_sched.end_sharded(join=True)
+
+                    self._decode_shard_region(_decode_workers, _emit_oproj_shard)
                     total_flops += 2 * cur_q_size * self.vector_length
                 else:
                     total_flops += _projection_core(M=1, K=cur_q_size, N=self.vector_length,
@@ -2183,8 +2310,8 @@ class Gemma4LMMixin:
         # preamble (no program to run) just latches the register on the HW.
         self._dispatch_program([(self.gpr_seq_len, self.seq_len)], None, timeout=10.0)
 
-        # Arm the decode slave cores (dummy smoke test or real MLP sharding).
-        _decode_sched, _decode_worker_addrs = self._load_decode_worker_programs()
+        # Arm the decode slave cores (dummy smoke test or real O-proj sharding).
+        _decode_workers, _decode_worker_addrs = self._load_decode_worker_programs()
 
         print("\n------------------------------ DECODE START ------------------------------\n", flush=True)
 
@@ -2262,22 +2389,23 @@ class Gemma4LMMixin:
             # each step, may cross a 64-align boundary), then jump into the
             # cached decoder program. gpr_seq_len was primed once above and is
             # advanced by the decoder's trailing add_inc.
-            # Workers halt at the end of their program, so relaunch every token.
-            # They must be spinning at the first barrier before the master
-            # reaches it, hence immediately before the master's dispatch.
-            if _decode_sched is not None:
-                _decode_sched.start_workers(_decode_worker_addrs)
+            # Slaves halt at the end of their program, so relaunch every token.
+            # Workers FIRST, master second (the reference's launch order): each
+            # slave must be parked on its entry FLAG_CHECK before the master
+            # raises the start flag, or the barrier does not hold it and host
+            # launch skew lands inside the measured window.
+            for _w, _w_addr in zip(_decode_workers, _decode_worker_addrs):
+                _w.start_execute_from_dram(_w_addr)
             latency, flop_rate_program = self._dispatch_program(
                 [(self.gpr_aligned_seq_len, aligned_seq_len)],
                 prog_addr, timeout=300.0, flops=live_flops_per_token)
-            if _decode_sched is not None:
-                # Drain the slaves before the next token relaunches them. The
-                # exit barrier means they are only a HALT behind the master, so
-                # this costs nothing on a healthy run -- but it turns a desync
-                # into a visible timeout here instead of a start_execute on a
-                # still-busy engine next token.
-                for _w in _decode_sched.workers:
-                    _w.wait_queue(60.0)
+            # Drain the slaves before the next token relaunches them. The exit
+            # rendezvous means they are only a HALT behind the master, so this
+            # costs nothing on a healthy run -- but it turns a desync into a
+            # visible timeout here instead of a start_execute on a still-busy
+            # engine next token.
+            for _w in _decode_workers:
+                _w.wait_queue(60.0)
             total_latency += latency
             total_flop_rate += flop_rate_program
             # HW argmax of the streaming LM-head logits.

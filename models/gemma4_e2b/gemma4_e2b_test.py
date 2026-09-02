@@ -49,7 +49,7 @@ from user_dma_core import UnifiedEngine
 from user_dma_core import ue_35bit_addr_shifter
 from user_dma_core import INSTRUCTION_SIZE_BYTES
 from user_dma_core import UE_MODE
-from multi_engine_shard import MultiEngineScheduler
+from multi_engine_shard import MultiEngineScheduler, DRAM_SELFTEST_GUARD_BYTES
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -745,19 +745,54 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     bin, compiles prefill/decoder into one bin, runs prefill + decode. Numeric
     checks live in gemma4_e2b_numeric.py."""
 
-    def _ensure_stage_scheduler(self, stage: str, worker_dram_base: int = None):
-        """Return the multi-engine scheduler for one stage.
+    def _ensure_worker_pool(self) -> list:
+        """The run-wide pool of slave engines (engine 1 .. multi_core-1).
 
-        Every stage shares ONE worker-engine pool. That is a correctness
-        requirement, not an optimization (see MultiEngineScheduler.__init__):
-        each worker's DRAM allocators live in the UnifiedEngine object, so a
-        second scheduler built with FRESH worker objects restarts those
-        allocators at offset 0 and writes stage 2's worker programs on top of
-        stage 1's, at the same addresses. Stage 1 has already cached those
-        addresses, so its next launch runs stage 2's code: different barrier
-        count, instant desync, and the engines spin on a FLAG_CHECK that has no
-        timeout. Sharing the pool keeps one allocator per engine for the whole
-        run, so each stage's programs land AFTER the previous stage's.
+        ONE pool per run, whoever asks for it -- the scheduler stages (vision,
+        prefill) and the scheduler-free decode O-proj shard alike. That is a
+        correctness requirement, not an optimization: each engine's DRAM
+        allocators live in the UnifiedEngine object, so a second set of FRESH
+        objects restarts the program allocator at offset 0 and writes one
+        stage's worker programs on top of another's, at the same addresses. The
+        earlier stage has already cached those addresses, so its next launch
+        runs the other stage's code: different barrier count, instant desync,
+        and the engines spin on a FLAG_CHECK that has no timeout.
+
+        BUILDING AN ENGINE DESTROYS THE FIRST 16 KB OF DRAM: init_unified_engine()
+        runs a self-test at the HARDCODED DRAM_START_ADDR, which in the
+        multi-core map is inside the weights. Snapshot and restore it around
+        construction, exactly as MultiEngineScheduler does when it builds the
+        pool itself (bf16 buffer -- dma_read only round-trips those losslessly).
+        """
+        if self.multi_core == 1:
+            return []
+        if self._multi_core_worker_pool is None:
+            guard = torch.zeros(DRAM_SELFTEST_GUARD_BYTES // 2, dtype=torch.bfloat16)
+            self.dma_read(self.c2h_device, user_dma_core.DRAM_START_ADDR,
+                          guard, DRAM_SELFTEST_GUARD_BYTES)
+            pool = []
+            for i in range(1, self.multi_core):
+                # Same bases the scheduler used (worker_tensor_offset=0,
+                # worker_program_offset=0): one 16 MiB slot per worker.
+                base = (self.MULTICORE_WORKER_ISA_BASE
+                        + (i - 1) * self.MULTICORE_WORKER_ISA_STRIDE)
+                pool.append(UnifiedEngine(
+                    BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * 0x00010000,
+                    params_dram_base=base,
+                    tensor_dram_base=base,
+                    program_dram_base=base))
+            self.dma_write(self.h2c_device, user_dma_core.DRAM_START_ADDR,
+                           guard, DRAM_SELFTEST_GUARD_BYTES)
+            self._multi_core_worker_pool = pool
+        return self._multi_core_worker_pool
+
+    def _ensure_stage_scheduler(self, stage: str, worker_dram_base: int = None):
+        """Return the multi-engine scheduler for one stage (vision, prefill, and
+        the decode SMOKE TEST only -- the real decode O-proj shard is emitted
+        inline against _ensure_worker_pool(), with no scheduler).
+
+        Every stage shares the one worker-engine pool; see _ensure_worker_pool
+        for why that is a correctness requirement.
         """
         if self.multi_core == 1:
             return None
@@ -781,11 +816,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 barrier_margin_nops=32,
                 allow_unaligned_rows=True,
                 allow_more_than_two_engines=self.multi_core > 2,
-                workers=self._multi_core_worker_pool)
-            if self._multi_core_worker_pool is None:
-                # First stage built the engines; every later stage reuses them
-                # so the per-worker program allocator keeps advancing.
-                self._multi_core_worker_pool = scheduler.workers
+                workers=self._ensure_worker_pool())
             self._multi_core_schedulers[stage] = scheduler
         return scheduler
 
@@ -837,6 +868,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._multi_core_schedulers = {}
         self._multi_core_worker_pool = None
         self._prefill_shard_m_regs = None
+        self._decode_shard_m_regs = None
+        self._active_decode_scheduler = None   # --decode-shard-dummy only
+        self._active_decode_workers = []       # --decode-shard-oproj slave engines
         engine_base = user_dma_core.UE_0_BASE_ADDR
         # Gemma4 DRAM layout. ONE map, used at every engine count: the
         # single-core layout occupies the upper 2 GB, and MULTI-CORE is that
@@ -1297,10 +1331,17 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             decoder_count_at_start = self.capture_count
             decoder_accounting_seq_len = (
                 (len(self.prefill_seq) + 63) // 64) * 64
-            # Decode-stage smoke test: its own scheduler stage, so its worker
-            # programs get their own addresses after prefill's in each worker
-            # slot (never on top of them).
+            # Decode-stage SMOKE TEST (--decode-shard-dummy) only: its own
+            # scheduler stage, so its worker programs get their own addresses
+            # after prefill's in each worker slot (never on top of them). The
+            # real O-proj shard below does NOT use the scheduler.
             decode_scheduler = self._ensure_decode_scheduler()
+            # Real decode sharding (--decode-shard-oproj): one INDEPENDENT
+            # program per core, emitted inline, following
+            # quantized_matmat_mul_multi_cores_test in user_hw_test.py. The
+            # engine objects come from the run-wide pool so their program
+            # allocators keep advancing past prefill's worker programs.
+            decode_workers = self._decode_shard_engines()
             # Private per-engine weight copies must exist BEFORE the decoder is
             # compiled: the sharded program bakes each engine's own addresses.
             if getattr(self, "decode_shard_oproj", False):
@@ -1314,6 +1355,20 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 self._decode_shard_m_regs.extend(
                     w.alloc_isa_reg() for w in decode_scheduler.workers)
                 self._active_decode_scheduler = decode_scheduler
+            if decode_workers:
+                # Open one capture per slave HERE and close it below: the shard
+                # bodies in compile_decoder emit straight into these buffers,
+                # the way the reference test captures each engine's program in
+                # its own start_capture()/stop_capture() pair.
+                for _w in decode_workers:
+                    _w.clear_capture_buffer()
+                    _w.reset_isa_reg_counter()
+                    _w.reset_inst_ptr_counter()
+                    _w.start_capture()
+                self._decode_shard_m_regs = [self.alloc_isa_reg()]
+                self._decode_shard_m_regs.extend(
+                    _w.alloc_isa_reg() for _w in decode_workers)
+                self._active_decode_workers = decode_workers
             _, decoder_program_sizes, decoder_total_flops = self.compile_decoder(
                 layer_size=layer_size, profile=profile,
                 accounting_seq_len=decoder_accounting_seq_len)
@@ -1330,6 +1385,25 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self._active_decode_scheduler = None
             if decode_scheduler is not None:
                 for _w in reversed(decode_scheduler.workers):
+                    _w.release_isa_reg()
+                self.release_isa_reg()
+                self._decode_shard_m_regs = None
+            if decode_workers:
+                # Close each slave program the way the reference does: terminal
+                # HALT, stop_capture, flush to that engine's OWN program DRAM
+                # cursor, advance it. A worker program runs once and halts, so
+                # run_decoder relaunches it every token.
+                for _w in decode_workers:
+                    _w.generate_instruction_halt()
+                    _w.stop_capture()
+                    _w_addr = _w.get_program_dram_addr()
+                    _w.write_captured_instructions_to_dram(_w_addr)
+                    _w.allocate_program_dram(_w.get_capture_instruction_size_bytes())
+                    decode_worker_addrs.append(_w_addr)
+                    decode_worker_images.append(
+                        b"".join(inst.get_bytes() for inst in _w.capture_buffer))
+                self._active_decode_workers = []
+                for _w in reversed(decode_workers):
                     _w.release_isa_reg()
                 self.release_isa_reg()
                 self._decode_shard_m_regs = None
@@ -1388,7 +1462,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                      "multi_core": self.multi_core,
                      "prefill_seq_len": prefill_flops_seq_len,
                      "prefill_kernel": self.prefill_kernel}, profile=profile)
-        if decode_scheduler is not None:
+        if decode_worker_addrs:
             for engine_idx, (worker_bytes, worker_addr) in enumerate(
                     zip(decode_worker_images, decode_worker_addrs), start=1):
                 worker_limit = (self.MULTICORE_WORKER_ISA_BASE
@@ -1740,7 +1814,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
 
     def _profile_execute(self, gpr_sets: list[tuple[int, int]], target_addr: int,
                          checkpoints: list, tail_name: str, timeout: float = 120.0,
-                         worker_scheduler=None, worker_addrs=None) -> list:
+                         worker_engines=None, worker_addrs=None) -> list:
         """Run checkpointed segments, returning ``(name, ms, FLOPs)`` samples.
         A preamble at self._preamble_addr primes each
         (reg, value) in ``gpr_sets`` then jumps into ``target_addr``; each
@@ -1751,7 +1825,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         after each HALT, the segments tile the whole program with no gaps, so the
         summed latencies cover all FPGA execution (see run_gemma4_profile).
 
-        Two-engine (``worker_scheduler``/``worker_addrs``): the worker runs its
+        Two-engine (``worker_engines``/``worker_addrs``): the worker runs its
         own continuous shard stream once. Master checkpoints sit at the sharded-
         region boundaries, so a master HALT lands while the worker is parked at the
         next region's entry flag — the master's per-segment counter then measures
@@ -1766,11 +1840,14 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self.clear_capture_buffer()
 
         results = []
-        if worker_scheduler is not None:
-            # run_prefill() already preclears every engine after loading the
-            # worker programs.  Do not preclear again here: that redundant
-            # core-0 program corrupts the first segmented latency sample.
-            worker_scheduler.start_workers(worker_addrs or [])
+        worker_engines = list(worker_engines or [])
+        # run_prefill() / _load_decode_worker_programs() already preclear every
+        # engine after loading the worker programs.  Do not preclear again here:
+        # that redundant core-0 program corrupts the first segmented latency
+        # sample. Workers first, so each is parked on its entry FLAG_CHECK
+        # before the master raises the start flag.
+        for _w, _a in zip(worker_engines, worker_addrs or []):
+            _w.start_execute_from_dram(_a)
         self.start_execute_from_dram(self._preamble_addr)
         for checkpoint in checkpoints:
             name, resume_hex, *extra = checkpoint
@@ -1790,7 +1867,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             results[-1] = (prev_name, prev_ms + tail_ms, prev_flops)
         else:
             results.append((tail_name, tail_ms, 0))
-        for worker in (worker_scheduler.workers if worker_scheduler is not None else []):
+        for worker in worker_engines:
             worker.wait_queue(timeout)
         return results
 
@@ -1805,12 +1882,12 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # on a FLAG_CHECK that has no timeout. _profile_execute launches them;
         # the master then HALTs at each checkpoint while the slaves park at the
         # next region's entry flag (see its docstring).
-        _sched, _worker_addrs = self._load_decode_worker_programs(profile=True)
+        _workers, _worker_addrs = self._load_decode_worker_programs(profile=True)
         results = self._profile_execute(
             [(self.gpr_seq_len, self.seq_len - 1),
              (self.gpr_aligned_seq_len, aligned_seq_len)],
             decoder_addr, checkpoints, tail_name="tail_addinc", timeout=timeout,
-            worker_scheduler=_sched, worker_addrs=_worker_addrs)
+            worker_engines=_workers, worker_addrs=_worker_addrs)
         # The decoder program is captured with MAX_CONTEXT_SIZE as its template
         # aligned length, so compile-time attention FLOPs describe that maximum.
         # Replace only attention FLOPs with the exact live-length formula used by
