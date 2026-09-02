@@ -7329,6 +7329,11 @@ if __name__ == "__main__":
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        '--reset-only', action='store_true',
+        help='Run ONLY software_reset_test and exit 0. A smoke test that the board '
+             'answers and every core can be reset, without the ~15 min op suite.',
+    )
+    parser.add_argument(
         '--summary-path', default='user_hw_test_summary.md',
         help=argparse.SUPPRESS,
     )
@@ -7376,6 +7381,11 @@ if __name__ == "__main__":
     atexit.register(_atexit_write_test_summary)
 
     software_reset_test(cores=args.multi_core)
+    if args.reset_only:
+        # sys.exit (not return): this is module level under __main__. The atexit hook
+        # still runs, so the summary is written and CI's artifact upload is unchanged.
+        print("[user_hw_test] --reset-only: software_reset passed; skipping the op suite")
+        sys.exit(0)
     dram_read_write_speed_test()
     isa_rela_loop_test()
     isa_abs_loop_test()

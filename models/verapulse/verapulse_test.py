@@ -304,6 +304,10 @@ _VARIANTS = {
     # -- with only the action expert retrained, against a quick_gelu backbone so the
     # expert consumes the features this silicon actually produces.
     "smolvla_qg": "verapulse_smolvla_qg_config.json",
+    # Stock-gelu backbone (smolvla_base + HF SmolVLM2), so it is NOT in
+    # NATIVE_QUICK_GELU -- the FPGA's quick_gelu substitutes for the trained
+    # gelu_pytorch_tanh here rather than matching it.
+    "smolvla_lid": "verapulse_smolvla_lid_config.json",
 }
 
 # Variants whose weights were TRAINED in the accelerator's activation, so quick_gelu is
@@ -375,8 +379,39 @@ LOCAL_CKPT_DIR = _CFG["paths"].get("local_ckpt_dir")
 # one. One programs file per (vision, prefix, denoise) engine triple: programs bake
 # absolute jump targets and one rendezvous per engine, so a set built for 8 cannot run
 # on 4 -- the missing workers never answer a FLAG_CHECK that has no timeout.
-_BIN_SUBDIR = "verapulse_bin"
+# PER VARIANT, from the config -- NOT hardcoded. Each variant declares its own
+# (verapulse_bin / verapulse_smolvla_bin / verapulse_smolvla_qg_bin), and sharing one
+# directory would let bins_available() hand a qg run the pulsevla set. smolvla and
+# smolvla_qg are byte-identical in shape, so `sig` alone cannot tell those two apart.
+_BIN_SUBDIR = _CFG["paths"].get("bin_dir", "verapulse_bin")
 BIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), _BIN_SUBDIR)
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# The two RUNTIME assets a bin-only run still needs, packaged INTO the bin dir by
+# dump_bins so a copied set is self-contained: no checkpoint, no HF download, no
+# absolute path back to the machine that compiled it.
+TOKENIZER_ASSET = "tokenizer.json"
+NORM_STATS_ASSET = "norm_stats.json"
+
+
+def _resolve_path(p):
+    """Config path -> absolute. Absolute wins; otherwise try the repo root (the
+    directory these scripts are run from) and then this model's own directory."""
+    if not p:
+        return None
+    if os.path.isabs(p):
+        return p
+    for base in (_REPO_ROOT, os.path.dirname(os.path.abspath(__file__))):
+        cand = os.path.join(base, p)
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(_REPO_ROOT, p)
+
+
+def _bin_asset(name, bin_dir=None):
+    """Path to a packaged asset if the bin dir carries one, else None."""
+    p = os.path.join(bin_dir or BIN_DIR, name)
+    return p if os.path.exists(p) else None
 
 # Load order is load-bearing: program DRAM is a bump allocator, so vision -> prefix ->
 # denoise reproduces the baked addresses. MUST match dump_programs_to_file's order.
@@ -419,7 +454,9 @@ def clean_bins(bin_dir=None, verbose=True):
         + glob.glob(os.path.join(bin_dir, "weight_tensors.pt"))
         + glob.glob(os.path.join(bin_dir, "programs_e*.bin"))
         + glob.glob(os.path.join(bin_dir, "programs_e*_tensors.pt"))
-        + glob.glob(os.path.join(bin_dir, "programs_e*.json")))
+        + glob.glob(os.path.join(bin_dir, "programs_e*.json"))
+        + glob.glob(os.path.join(bin_dir, TOKENIZER_ASSET))
+        + glob.glob(os.path.join(bin_dir, "norm_stats.*")))
     freed = 0
     for p in victims:
         freed += os.path.getsize(p)
@@ -3606,9 +3643,9 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             B_DRAM_ADDR=self.conn_weight_addr + off * K * 2,
             OUTPUT_DRAM_ADDR=lane)
         # SCATTERED ONE SLOT AT A TIME. _ae_scatter_lane stages [rows, cols] through
-        # SRAM 0x00000, and at M=128 x 128 columns that is exactly the 0x10000 window
-        # below the flash region -- zero margin. Two 64-row copies halve it. The matmul
-        # above is still ONE op; only the write-back is chunked.
+        # SRAM 0x00000, against the 0x10000 window below the flash region; per-slot rows
+        # halve it, and _ae_scatter_lane splits the columns too if the lane is still too
+        # wide (which it is at low engine counts). The matmul above stays ONE op.
         for sl in range(nslots):
             self._ae_scatter_lane(
                 ue, lane + sl * TOUT * cols * bpe,
@@ -5239,19 +5276,27 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # (Measured context: denoise's unaccounted 658 ms tracks strided row-DMA
         # transactions, not op count -- see the --expert-layers layer sweep.)
         #
-        # SRAM: staging is rows*cols*bpe = 64*128*2 = 16 KB, doubled for the
-        # gather/scatter pair = 32 KB, against the 64 KB below the flash window at
-        # 0x10000. Asserted on the ACTUAL width now rather than on UE_VECTOR_SIZE, so a
-        # wider lane fails here instead of silently overrunning into flash scratch.
-        assert rows * cols * bpe * 2 <= 0x10000, (
-            f"scatter staging {rows}x{cols} needs {rows * cols * bpe * 2} B, over the "
-            f"{0x10000} B SRAM window below the flash region")
-        dst_a = dst_base + col_offset * bpe
-        assert src % mes.AXI_BEAT_BYTES == 0, \
-            f"scatter src 0x{src:X} is not {mes.AXI_BEAT_BYTES} B beat aligned"
-        assert dst_a % mes.AXI_BEAT_BYTES == 0, \
-            f"scatter dst 0x{dst_a:X} is not {mes.AXI_BEAT_BYTES} B beat aligned"
-        self._ae_strided_copy(ue, src, cols * bpe, dst_a, full_n * bpe, rows, cols)
+        # SRAM: staging is rows*cols*bpe, doubled for the gather/scatter pair, against
+        # the 64 KB below the flash window at 0x10000. One full-width copy whenever it
+        # fits; a lane too wide for the window is split into the widest chunks that do.
+        # LOW ENGINE COUNTS NEED THIS: cols is N/ne, so N=1024 fits at ne>=4 (256 cols =
+        # exactly 64 KB) and needs two chunks at ne=2. Chunking doubles the transactions
+        # and halves the burst, so it is a fallback, never the default.
+        max_cols = (0x10000 // (rows * bpe * 2)) // UE_VECTOR_SIZE * UE_VECTOR_SIZE
+        assert max_cols >= UE_VECTOR_SIZE, (
+            f"scatter staging {rows} rows leaves no room for even one "
+            f"{UE_VECTOR_SIZE}-column chunk in the {0x10000} B SRAM window")
+        for c0 in range(0, cols, max_cols):
+            c = min(max_cols, cols - c0)
+            dst_a = dst_base + (col_offset + c0) * bpe
+            src_a = src + c0 * bpe
+            assert src_a % mes.AXI_BEAT_BYTES == 0, \
+                f"scatter src 0x{src_a:X} is not {mes.AXI_BEAT_BYTES} B beat aligned"
+            assert dst_a % mes.AXI_BEAT_BYTES == 0, \
+                f"scatter dst 0x{dst_a:X} is not {mes.AXI_BEAT_BYTES} B beat aligned"
+            # src_jump stays the FULL lane row stride: the lane is a dense [rows, cols]
+            # and a chunk reads c of its cols, so the source is strided when chunked.
+            self._ae_strided_copy(ue, src_a, cols * bpe, dst_a, full_n * bpe, rows, c)
 
     def _assert_flag_check_reaches(self, ne):
         """Refuse to compile a rendezvous the ISA emitter would silently DROP.
@@ -8902,6 +8947,9 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
 
         HEAD, V, L = self._cfg["action_head"], self._cfg["vision"], self._cfg["lm"]
         manifest["sig"] = {
+            # smolvla and smolvla_qg share every shape field, so the variant name is the
+            # only thing separating their bin sets if they ever meet in one directory.
+            "variant": VARIANT,
             "num_image_slots": int(V["num_image_slots"]),
             "chunk_size": int(HEAD["chunk_size"]),
             "denoise_steps": int(HEAD["num_denoise_steps"]),
@@ -8928,12 +8976,45 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                                 f"offset={s['offset']:>10}  size={s['size']:>10}")
 
     def dump_bins(self, bin_dir):
-        """params.bin + programs_e<v>_<p>_<d>.bin/.json. The programs carry a signature
-        (image slots, chunk, denoise steps, rope theta, quant, dram bases) and the loader
-        refuses on mismatch. rm the bin dir after any compile-affecting edit -- stale bins
-        reload silently."""
+        """params.bin + programs_e<v>_<p>_<d>.bin/.json + the runtime assets. The programs
+        carry a signature (variant, image slots, chunk, denoise steps, rope theta, quant,
+        dram bases) and the loader refuses on mismatch. rm the bin dir after any
+        compile-affecting edit -- stale bins reload silently."""
         self.dump_params_to_file(bin_dir)
         self.dump_programs_to_file(bin_dir)
+        self._package_runtime_assets(bin_dir)
+
+    def _package_runtime_assets(self, bin_dir):
+        """Copy the tokenizer and norm stats INTO the bin dir.
+
+        These are the only two files a bin-only run still reads from outside it, and both
+        are otherwise reached by a path that does not exist on another machine (this
+        variant's norm_stats is an absolute local_ckpt_dir path, and its tokenizer is an
+        HF download). Packaging them is what makes a copied bin set runnable as-is.
+        """
+        import shutil
+        # Tokenizer: whatever tokenize() would have resolved, materialised as a file.
+        dst = os.path.join(bin_dir, TOKENIZER_ASSET)
+        if not os.path.exists(dst):
+            rel = _CFG["paths"].get("tokenizer_file")
+            if rel:
+                src = _resolve_path(rel)
+            else:
+                from huggingface_hub import hf_hub_download
+                src = hf_hub_download(repo_id=_CFG["paths"]["tokenizer_hf_repo"],
+                                      filename="tokenizer.json")
+            shutil.copyfile(src, dst)
+            _original_print(f"  Packaged tokenizer -> {TOKENIZER_ASSET}")
+        # Norm stats: keep the ORIGINAL extension's format, but under a fixed name --
+        # load_norm_stats branches on the suffix, so a .json source must stay .json.
+        ns_src = _resolve_path(_CFG["paths"]["norm_stats"])
+        if ns_src and os.path.exists(ns_src):
+            ns_dst = os.path.join(bin_dir, NORM_STATS_ASSET)
+            if not ns_src.endswith(".json"):
+                ns_dst = os.path.join(bin_dir, "norm_stats" + os.path.splitext(ns_src)[1])
+            if not os.path.exists(ns_dst):
+                shutil.copyfile(ns_src, ns_dst)
+                _original_print(f"  Packaged norm stats -> {os.path.basename(ns_dst)}")
 
     # ---------------------------------------------------------------- bin loading --
     # These live on the BASE class, not on VeraPulse_Run, because the decision to use a
@@ -9149,6 +9230,8 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
 
         HEAD, V, L = self._cfg["action_head"], self._cfg["vision"], self._cfg["lm"]
         for name, live, want, hint in (
+                ("variant", VARIANT, sig.get("variant", VARIANT),
+                 "these bins were built for a different --variant"),
                 ("num_image_slots", int(V["num_image_slots"]),
                  int(sig["num_image_slots"]), "camera count changed in the config"),
                 ("chunk_size", int(HEAD["chunk_size"]), int(sig["chunk_size"]),
@@ -9388,9 +9471,14 @@ def tokenize(prompt, max_len=None, return_mask=False):
     from tokenizers import Tokenizer
     max_len = max_len or _CFG["lm"]["tokenizer_max_length"]
     if _TOKENIZER is None:
+        packaged = _bin_asset(TOKENIZER_ASSET)
         rel = _CFG["paths"].get("tokenizer_file")
-        if rel:
-            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
+        if packaged:
+            # A bin set copied to another machine carries its own tokenizer, so no
+            # checkpoint and no network are needed to run it.
+            _TOKENIZER = Tokenizer.from_file(packaged)
+        elif rel:
+            path = _resolve_path(rel)
             if not os.path.exists(path):
                 ensure_checkpoint()      # tokenizer.json ships with the checkpoint
             _TOKENIZER = Tokenizer.from_file(path)
@@ -9454,9 +9542,9 @@ def load_norm_stats():
     global _NORM_STATS
     if _NORM_STATS is not None:
         return _NORM_STATS
-    path = _CFG["paths"]["norm_stats"]
-    if not os.path.isabs(path):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+    path = (_bin_asset(NORM_STATS_ASSET)
+            or _bin_asset("norm_stats.safetensors")
+            or _resolve_path(_CFG["paths"]["norm_stats"]))
 
     # TWO FILE FORMATS, ONE CONTRACT. pulsevla ships norm_stats.safetensors with FLAT
     # keys ('observation.state.mean'); the smolvla finetune ships normalization_stats.json
@@ -9774,16 +9862,25 @@ def _upstream_prefix_gate(ue, images, token_ids, text_mask, hidden, kv):
     if up_hidden.shape[0] != ue._prefix_valid_len:
         vnote(f"row count differs: upstream keeps {ids.numel()-int(m.sum())} padded text "
               f"slots as real rows, the device packs them out -- valid rows only.")
-    n = min(valid, int(ue._prefix_valid_len))
+    # SELECT UPSTREAM'S VALID ROWS BY THE MASK, not its first n rows. Upstream keeps the
+    # padded text slots as real rows and positions around them (pos = cumsum(pad) - 1);
+    # the device PACKS them out. prefix_order is images_text_state, so the pads are
+    # INTERIOR -- the state row sits after them. Slicing [:n] therefore lines the
+    # device's state row up against an upstream PAD row and drops upstream's state row
+    # entirely, scoring different tokens against each other. That is a metric bug, not a
+    # model error, and it reads as a broken prefix.
+    sel = pad[0].bool()
+    up_valid = up_hidden[sel]
+    n = min(valid, int(ue._prefix_valid_len), up_valid.shape[0])
     hw = torch.as_tensor(hidden).float()[:n]
-    report("prefix hidden", hw, up_hidden[:n], threshold=20.0)
+    report("prefix hidden", hw, up_valid[:n], threshold=20.0)
     # KV: upstream stores [B, S, n_kv, D]; device gives [n_kv, S, D] per layer
     worst = 1.0
     # Derived from actual depth: the literal (0, 1, 15, 31) was pulsevla's 32 layers and
     # raised IndexError on any 16-layer checkpoint.
     _nl = min(len(kv), len(kvu))
     for li in sorted({0, min(1, _nl - 1), _nl // 2, _nl - 1}):
-        ku, vu = kvu[li][0][:, :n], kvu[li][1][:, :n]          # [n_kv, n, 64]
+        ku, vu = kvu[li][0][:, sel][:, :n], kvu[li][1][:, sel][:, :n]   # [n_kv, n, 64]
         kh, vh = torch.as_tensor(kv[li][0])[:, :n], torch.as_tensor(kv[li][1])[:, :n]
         ck, cv = cos_sim(kh, ku), cos_sim(vh, vu)
         worst = min(worst, ck, cv)

@@ -110,14 +110,33 @@ class FPGABackend:
         # may be constructed afterwards (see the class docstring).
         vp.configure_engines(self.ue, engines, vis=vis, prefix=prefix, denoise=denoise,
                              tag="fpga")
-        self.ue.weight_init()
+        # BINS IF THIS ENGINE CONFIGURATION HAS A SET, else compile. Same switch main()
+        # uses: the set is keyed by the (vision, prefix, denoise) engine triple, so it is
+        # only asked AFTER configure_engines. A bin start skips the weight unpack and the
+        # compile entirely -- it is a params DMA restore plus a program DMA.
+        #
+        # This does NOT remove lerobot's own from_pretrained: the checkpoint is still
+        # loaded for the pre/post pipeline (units, tokenizer, unnormalization). Only the
+        # FPGA-side weight+program build is served from bins.
+        self.ue.bin_dir = vp.BIN_DIR
+        self.ue._dummy_weights_wanted = False
+        use_bins = self.ue.bins_available(vp.BIN_DIR)
+        if use_bins:
+            print(f"[fpga] bins: loading {vp._programs_stem(self.ue._bin_engines())} "
+                  f"from {vp.BIN_DIR} (no weight unpack, no compile)")
+            self.ue.weight_init_from_bin()
+        else:
+            self.ue.weight_init()
         self.ue.tensor_init()
 
-        # COMPILE EVERYTHING NOW. freeze=True makes a later lazy compile raise instead of
-        # silently allocating program DRAM mid-rollout: compilation is ~7 s, which at
-        # 13 Hz is ~90 dropped control ticks, and it would land on the first GetActions
-        # rather than at startup where it is free.
-        self.ue.precompile_all(stages=("vision", "prefix", "denoise"))
+        # COMPILE EVERYTHING NOW (or load it). freeze=True makes a later lazy compile
+        # raise instead of silently allocating program DRAM mid-rollout: compilation is
+        # ~7 s, which at 13 Hz is ~90 dropped control ticks, and it would land on the
+        # first GetActions rather than at startup where it is free.
+        if use_bins:
+            self.ue.load_programs()
+        else:
+            self.ue.precompile_all(stages=("vision", "prefix", "denoise"))
 
         self.slots = self.ue.V_SLOTS
         self.img = self.ue._cfg["vision"]["image_size"]
