@@ -1228,6 +1228,15 @@ class Gemma4LMMixin:
         # bias-masked reads past seq_len see clean zeros, zero the attention
         # Q/K/V gather buffers, and re-upload the IDENTITY matrix (read by the
         # attention I @ V^T step). Idempotent for LM-only runs.
+        # EVERY buffer unified_attention_core reads is initialised here, over its
+        # WHOLE allocation, not just the part this prefill fills. The kernel
+        # always runs the 64-aligned length, so the rows/columns past the live
+        # sequence are multiplied on every call and only discarded afterwards by
+        # the -inf bias -- which needs them FINITE. Uninitialised padding is
+        # whatever the last run left (NaN under an 0xFF DRAM poison), and
+        # -inf + NaN is NaN, so one stale pad element takes out a whole softmax
+        # row. Each size below mirrors its allocate_tensor_dram() in tensor_init,
+        # in ELEMENTS (dma_to_accelerator_memory writes numel()*2 bytes).
         from user_dma_core import UE_VECTOR_SIZE as _UE_VS
         num_slots = getattr(self, "_num_kv_slots", self.LAYER_SIZE)
         kv_cache_bytes = getattr(
@@ -1237,18 +1246,47 @@ class Gemma4LMMixin:
             kv_cache_bytes // self.bytes_per_element, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, kv_zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, kv_zero_pad)
-        _pre_align = ((self.max_prefill_seq_len * self.group_size + 63) // 64) * 64
-        flash_qkv_elems = _pre_align * self.head_dim
-        _flash_zero = torch.zeros(flash_qkv_elems, dtype=torch.bfloat16)
+        # Same expression tensor_init sized the attention buffers with: prefill
+        # rows are seq*group_size, decode needs MAX_CONTEXT_SIZE KV rows, and
+        # the buffers take the larger. Deriving a prefill-only alignment here
+        # (the old _pre_align) matches only while max_prefill_seq_len*group_size
+        # >= MAX_CONTEXT_SIZE -- true today at 512*8 == 4096, and silently short
+        # the moment either constant moves.
+        _prefill_aligned = ((min(self.max_prefill_seq_len, self.MAX_CONTEXT_SIZE)
+                             * self.group_size + 63) // 64) * 64
+        _decode_aligned = ((self.MAX_CONTEXT_SIZE + 63) // 64) * 64
+        _attn_aligned = max(_prefill_aligned, _decode_aligned)
+        # Q / K / OUTPUT: [aligned, head_dim].  V: [activation_seq_len, head_dim].
+        _flash_zero = torch.zeros(_attn_aligned * self.head_dim, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, _flash_zero)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, _flash_zero)
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_OUTPUT_DRAM, _flash_zero)
         self.dma_to_accelerator_memory(
             self.LAYER0_FLASH_V_DRAM,
-            torch.zeros(self.max_prefill_seq_len * self.head_dim,
+            torch.zeros(max(self.max_prefill_seq_len, 1) * self.head_dim,
                         dtype=torch.bfloat16))
+        # Attention scratch: V.T [head_dim, aligned] + scores [aligned, aligned]
+        # + scaled_q [batch, head_dim]. The scores plane is the one that must be
+        # finite everywhere -- softmax reads the full aligned row.
+        self.dma_to_accelerator_memory(
+            self.LAYER0_FLASH_SCRATCH_DRAM,
+            torch.zeros(_attn_aligned * _attn_aligned
+                        + 2 * self.head_dim * _attn_aligned,
+                        dtype=torch.bfloat16))
+        # Both bias planes, full [aligned, aligned]. run_prefill overwrites the
+        # live square below and run_decoder rewrites its rows per token, but the
+        # region past the live length is only ever written here -- and it is
+        # exactly the region the kernel reads as padding.
+        _bias_zero = torch.full((_attn_aligned * _attn_aligned,), float("-inf"),
+                                dtype=torch.bfloat16)
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_FULL_DRAM, _bias_zero)
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, _bias_zero)
         self.dma_to_accelerator_memory(self.IDENTITY_DRAM_ADDR,
                                        torch.eye(_UE_VS, dtype=torch.bfloat16))
-        print(f"[Prefill] LM-state restored ({num_slots} KV slots zeroed, IDENTITY re-uploaded)")
+        print(f"[Prefill] flash-attention state initialised "
+              f"({num_slots} KV slots, Q/K/V/OUTPUT + scratch + both bias planes "
+              f"zeroed over the full {_attn_aligned}-row alignment, "
+              f"IDENTITY re-uploaded)")
 
         # Time host-side prep (embedding lookup, per-layer inputs, bias build,
         # DMAs) — reported only in the segmented-profile path's status line.

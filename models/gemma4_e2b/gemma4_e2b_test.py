@@ -1891,6 +1891,32 @@ def add_engine_args(parser) -> None:
                              "Multicore prefill always uses matmatmul.")
     parser.add_argument("--dev", type=str, default="xdma0",
                         help="DMA device name (e.g., xdma0, xdma1, efinix). Default: xdma0")
+    parser.add_argument("--dram-poison", type=str, default=None, metavar="SPEC[,SPEC...]",
+                        help="Pre-run DRAM fill (default: zero -- the whole device is "
+                             "zeroed before the model is built, silently). WORKAROUND, not "
+                             "a fix: "
+                             "the LM path reads something in the params region that it "
+                             "never initialises, and a zero fill makes that read 0.0 "
+                             "instead of whatever the last run left. Each SPEC is 'ff' or "
+                             "'zero', optionally limited to a hex byte range as "
+                             "'ff:START:END'; passes apply in order. Override for debug: "
+                             "'ff' makes an uninitialised read NaN, 'off' skips the write "
+                             "entirely, and a comma-separated list isolates one region -- "
+                             "e.g. --dram-poison zero,ff:0x0:0x80000000 reproduces the "
+                             "failure by poisoning params alone.")
+    parser.add_argument("--dram-poison-isa", choices=("ff", "zero"), default=None,
+                        help="Second pass over the program/ISA region only "
+                             "[VISION_ISA_BASE..end of DRAM), applied AFTER the model is "
+                             "constructed. Combine with --dram-poison to give ISA a "
+                             "different fill from the rest: '--dram-poison ff "
+                             "--dram-poison-isa zero' leaves NaN everywhere except ISA, "
+                             "so a run that then decodes correctly proves the residual "
+                             "being consumed lives in ISA space.")
+    parser.add_argument("--dram-poison-range", type=str, default=None, metavar="START:END",
+                        help="Restrict --dram-poison to one hex byte range, e.g. "
+                             "0xC0000000:0x100000000. Use it to find which region a run "
+                             "reads without initialising: poison one arena at a time, then "
+                             "halve whichever range reproduces the failure.")
     parser.add_argument("--bin-reuse", action="store_true",
                         help="Reuse a matching cached program image (programs.bin) if it "
                              "exists instead of recompiling. Default: OFF (fresh compile "
@@ -2050,6 +2076,87 @@ def run_summary_filename(args) -> str:
     return "gemma4_e2b_test_" + "_".join(str(t) for t in tokens) + suffix + ".md"
 
 
+def poison_dram(pattern: str = "ff", dram_range: str | None = None,
+                ue=None, quiet: bool = False,
+                chunk_bytes: int = 64 * 1024 * 1024) -> None:
+    """Fill the board's whole DRAM before the model allocates anything. DEBUG AID.
+
+    ``pattern``:
+      ``ff``   every byte 0xFF, i.e. every bf16 element NaN. A region this run
+               fails to initialise turns whatever consumes it into NaN, which
+               propagates -- loud, and impossible to mistake for a real result.
+      ``zero`` every byte 0x00. Same coverage test, benign values: a region the
+               run fails to initialise reads as 0.0 instead of NaN. Run both and
+               compare -- a model that decodes under ``zero`` but not under
+               ``ff`` is reading something it never wrote, and the difference
+               between the two runs is what localises it.
+
+    ``dram_range`` ("START:END", hex) restricts the fill to one region instead
+    of the whole device -- the tool for finding WHICH region a run reads without
+    initialising. Poison one arena at a time and see which one reproduces the
+    failure; then halve that range and repeat. The map at multi-core is
+    params [0, 0x80000000), tensor [0x80000000, 0xC0000000), program/ISA
+    [0xC0000000, 0x100000000); single-core is params [0x80000000, 0xE1000000),
+    tensor [0xE1000000, 0xFF000000), ISA [0xFF000000, 0x100000000).
+
+    Size comes from HW_INFO (AVAILABLE_DRAM_SIZE_GB), so this is board-agnostic
+    like the rest of resolve_engine_config; it must run AFTER that call and
+    BEFORE Gemma4_UnifiedEngine() allocates or uploads anything.
+    """
+    gb = user_dma_core.AVAILABLE_DRAM_SIZE_GB
+    if not gb:
+        # Always reported: this one is a real failure to establish known state,
+        # not routine progress.
+        print("[poison] HW_INFO reports no DRAM size; skipping DRAM poison")
+        return
+    dram_end = gb * 1024 ** 3
+    start, end = 0, dram_end
+    if dram_range:
+        try:
+            _s, _e = dram_range.split(":")
+            start, end = int(_s, 0), int(_e, 0)
+        except ValueError:
+            raise SystemExit(f"--dram-poison-range: expected START:END, got {dram_range!r}")
+        if not (0 <= start < end <= dram_end):
+            raise SystemExit(
+                f"--dram-poison-range 0x{start:X}:0x{end:X} is outside "
+                f"[0x0..0x{dram_end:X}]")
+    total_bytes = end - start
+    # ``ue``: reuse the caller's engine when the model is already loaded. A bare
+    # UnifiedEngine() runs init_unified_engine()'s 16 KB DRAM self-test at the
+    # HARDCODED DRAM_START_ADDR, which in the single-core map is the params base
+    # -- i.e. it would shred the first 16 KB of layer-0 weights on a second pass.
+    if ue is None:
+        ue = UnifiedEngine()      # bare engine: opens the device, self-tests
+    bpe = 2
+    # 0xFF: int16 -1 viewed as bf16 gives the 0xFFFF bit pattern. bf16 has no
+    # value spelling for it (a literal NaN packs as 0x7FC0) and dma_write ships
+    # bf16 bits verbatim.
+    fill_word = -1 if pattern == "ff" else 0
+    t0 = time.perf_counter()
+    offset = 0
+    while offset < total_bytes:
+        take = min(chunk_bytes, total_bytes - offset) // bpe
+        data = torch.full((take,), fill_word, dtype=torch.int16).view(torch.bfloat16)
+        # user_dma_core.DMA_DEVICE_H2C, not the name imported at module scope:
+        # resolve_engine_config refreshes that name only on modules called
+        # gemma4_e2b_*, and this file is __main__ when run directly, so its own
+        # copy still points at the default device after --dev selects another.
+        wrote = ue.dma_write(user_dma_core.DMA_DEVICE_H2C, start + offset,
+                             data, take * bpe)
+        if wrote != take * bpe:
+            raise RuntimeError(
+                f"DRAM poison: dma_write wrote {wrote} of {take * bpe} bytes "
+                f"at 0x{start + offset:X}")
+        offset += take * bpe
+    if not quiet:
+        print(f"[poison] wrote 0x{'FF' if pattern == 'ff' else '00'} over "
+              f"{total_bytes / 1024**2:.0f} MiB of DRAM "
+              f"[0x{start:08X}..0x{end - 1:08X}] in {time.perf_counter()-t0:.1f}s",
+              flush=True)
+    del ue
+
+
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -2065,6 +2172,29 @@ def main():
     _summary_name = run_summary_filename(args)
     engine_kwargs = resolve_engine_config(parser, args)
 
+    # Poison DRAM before the model (or the DRAM benchmark) writes anything, so
+    # an uninitialised read downstream is NaN rather than an earlier run's data.
+    # No --dram-poison given: zero the device silently. It is a workaround for a
+    # read of un-established params state, not something the user asked for, so
+    # it does not narrate itself. An EXPLICIT --dram-poison is a debug request
+    # and does report, including "--dram-poison zero".
+    _poison = args.dram_poison if args.dram_poison is not None else "zero"
+    _poison_quiet = args.dram_poison is None
+    if _poison != "off":
+        for _spec in _poison.split(","):
+            _spec = _spec.strip()
+            if not _spec:
+                continue
+            _pat, _, _rng = _spec.partition(":")
+            if _pat not in ("ff", "zero"):
+                parser.error(f"--dram-poison: bad pattern {_pat!r} in {_spec!r} "
+                             f"(expected ff or zero)")
+            if not _poison_quiet:
+                print(f"\n--- Poisoning DRAM with 0x{'FF' if _pat == 'ff' else '00'}"
+                      f"{' over ' + _rng if _rng else ''} ---")
+            poison_dram(_pat, _rng or args.dram_poison_range,
+                        quiet=_poison_quiet)
+
     # Measure aggregate accelerator-side DRAM reads before model allocation.
     # The same flag-synchronized benchmark supports one engine and the exact
     # engine count selected by --multi-core. Keep private-region mode aligned
@@ -2076,6 +2206,16 @@ def main():
         M=4096, K=4096, N=4096, num_engines=args.multi_core)
 
     ue = Gemma4_UnifiedEngine(**engine_kwargs)
+
+    # ISA-only second pass. After construction so ue.VISION_ISA_BASE is known
+    # (it depends on the engine count), and before compile/program load, which
+    # are the only things that write this region.
+    if args.dram_poison_isa:
+        _isa_top = (user_dma_core.AVAILABLE_DRAM_SIZE_GB or 4) * 1024 ** 3
+        print(f"\n--- Re-poisoning ISA region with "
+              f"0x{'FF' if args.dram_poison_isa == 'ff' else '00'} ---")
+        poison_dram(args.dram_poison_isa,
+                    f"0x{ue.VISION_ISA_BASE:X}:0x{_isa_top:X}", ue=ue)
     ue._dram_read_speed_mbps = dram_read_speed_mbps
 
     # Prompt first — the prefill program is compiled for its exact length.
