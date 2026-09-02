@@ -96,20 +96,6 @@ jobs:
           # and workflow_dispatch.
           BRANCH="${{ github.head_ref || github.ref_name }}"
 
-          # ---- TEMPORARY: minimal bring-up path for model/verapulse ----------------
-          # Software-reset smoke test, then verapulse, then stop. Deliberately skips
-          # the ~15 min user_hw_test.py op suite and every other model while the
-          # verapulse HW path is being brought up on this runner.
-          # REVERT: delete this block to fall back to the branch dispatch below,
-          # which already routes model/verapulse to `--only verapulse` via run_ci.sh.
-          if [[ "$BRANCH" == "model/verapulse" && "${{ inputs.full_run }}" != "true" ]]; then
-            echo "[ci] branch $BRANCH -> MINIMAL: software_reset + verapulse only"
-            python user_hw_test.py --reset-only || exit 1
-            python model_auto_test.py --only verapulse
-            exit $?
-          fi
-          # ---- end TEMPORARY -------------------------------------------------------
-
           if [[ "${{ inputs.full_run }}" == "true" ]]; then
             : # no --only: the whole model_auto_test.py registry, pi05 first
           elif [[ "$BRANCH" == "model/verapulse" ]]; then
