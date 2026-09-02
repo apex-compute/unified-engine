@@ -59,6 +59,52 @@ python models/qwen2.5_vl_3b/qwen2.5_vl_3b_run_from_bin.py --image /path/to/photo
 VLM mode runs when you pass `--image <path>` or `--vision-enable` (which uses the
 default sample image); otherwise it runs LM / text-only.
 
+### Multi-engine sharding (`--engines N`)
+
+```bash
+# 8-engine vision encoder + prefill (decode stays single-engine)
+python models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py --vision-enable --engines 8
+```
+
+`--engines N` (1/2/4/8, default 1) shards the two prefix-heavy stages across
+engines via `multi_engine_shard.MultiEngineScheduler` (same worker-pool /
+rendezvous machinery as pi05):
+
+- **Vision encoder** — ROW (token) shard of every norm/matmul/eltwise/extract
+  (576 patches → e.g. 8×72 rows, offsets folded at compile time) + **HEAD**
+  shard of the transposes, RoPE, per-(head,window) attention and the 128→80
+  trim (16 heads → e.g. 8×2). Two rendezvous per layer; the 2×2 merger stays
+  row-local.
+- **LM prefill** — ROW (token) shard of the whole layer through **runtime
+  address GPRs** (the program stays one seq-len-agnostic bin; each engine's
+  preamble primes its row count and byte offsets per prompt). Attention shards
+  along the packed-Q batch (= token axis × 8 group heads); the duplicated
+  FLASH_K/V sets are built cooperatively and the KV cache is written
+  row-disjoint. Two rendezvous per layer. No weights are sliced or duplicated
+  and the arithmetic is unchanged (`--engines 1` is byte-identical to the
+  historical stream).
+
+The `programs.bin` cache is keyed by the engine counts (splits, barrier
+fan-out and worker addresses are baked into every stream): a bin serves only
+the exact `--engines` it was built with, and a mismatch triggers a clean
+rebuild. Multi-engine bins carry every worker program as an ordinary segment
+plus a `multi` state block (worker arenas, program/preamble addresses, shard
+GPR map, scratch-registry end cursors) that the loader replays and
+address-asserts — so a cached multi-engine run does **zero compilation**:
+load segments, reconstruct the worker pool, rewrite the tiny per-prompt
+preambles, execute. `qwen2.5_vl_3b_run_from_bin.py` consumes the same block
+and follows whatever engine count the bin was built with (it has no
+`--engines` flag of its own).
+
+Measured on the 8-core board (2026-09-02, yosemite.jpg VLM prompt, 172-token
+prefill):
+
+| Stage | `--engines 1` | `--engines 8` | speedup |
+| :--- | :--- | :--- | :--- |
+| Vision encoder run | 25.03 s (35.0 GFLOPS) | 3.97 s (262.2 GFLOPS) | **6.3×** |
+| Prefill run | 28.99 s (85.7 GFLOPS) | 4.10 s (607.6 GFLOPS) | **7.1×** |
+| Decode (single-engine) | 0.31 s/tok | 0.31 s/tok | — |
+
 ### Decode options (on-FPGA repetition penalty)
 
 The repetition penalty is folded into the LM-head matmul bias, so the hardware
