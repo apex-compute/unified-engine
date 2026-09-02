@@ -3116,11 +3116,12 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
     def _restore_multi_engine_runtime(self, meta: dict) -> None:
         """Build the run-only multi-engine state from the bin's meta block."""
         eng = {k: int(v) for k, v in
-               meta.get("engines", {"VIS": 1, "PREFILL": 1}).items()}
-        ne_v, ne_p = eng["VIS"], eng["PREFILL"]
-        peak = max(ne_v, ne_p)
+               meta.get("engines", {"VIS": 1, "PREFILL": 1, "DECODE": 1}).items()}
+        eng.setdefault("DECODE", 1)
+        ne_v, ne_p, ne_d = eng["VIS"], eng["PREFILL"], eng["DECODE"]
+        peak = max(ne_v, ne_p, ne_d)
         if peak <= 1:
-            self._vis_sched = self._prefill_sched = None
+            self._vis_sched = self._prefill_sched = self._decode_sched = None
             return
         from multi_engine_shard import MultiEngineScheduler
         mm = meta["multi"]
@@ -3153,7 +3154,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self._worker_pool = pool
 
         scheds = {}
-        for ne in {ne_v, ne_p}:
+        for ne in {ne_v, ne_p, ne_d}:
             if ne > 1:
                 scheds[ne] = MultiEngineScheduler(
                     self, num_engines=ne,
@@ -3163,8 +3164,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     workers=pool)
         self._vis_sched = scheds.get(ne_v)
         self._prefill_sched = scheds.get(ne_p)
+        self._decode_sched = scheds.get(ne_d)
         self._prefill_worker_prog_addrs = [int(a) for a in mm["prefill_worker_progs"]]
         self._prefill_worker_preamble_addrs = [int(a) for a in mm["prefill_worker_preambles"]]
+        self._decode_worker_prog_addrs = [int(a) for a in mm.get("decoder_worker_progs", [])]
+        self._decode_worker_preamble_addrs = [int(a) for a in mm.get("decoder_worker_preambles", [])]
         self._vis_worker_prog_addrs = [int(a) for a in mm["encoder_worker_progs"]]
         # The second KV head's shared FLASH_K/V pair (allocated past this
         # runtime's own tensors at build time). One-time zero fill, mirroring
@@ -3177,8 +3181,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             zero_pad = torch.zeros(n, dtype=torch.bfloat16)
             self.dma_to_accelerator_memory(self._FLASH_K2, zero_pad)
             self.dma_to_accelerator_memory(self._FLASH_V2, zero_pad)
-        _original_print(f"  Multi-engine bin: vision x{ne_v}, prefill x{ne_p} "
-                        f"({peak - 1} worker engine(s) reconstructed)")
+        _original_print(f"  Multi-engine bin: vision x{ne_v}, prefill x{ne_p}, "
+                        f"decode x{ne_d} ({peak - 1} worker engine(s) reconstructed)")
 
     def load_all_from_bin(self) -> dict:
         """Load the complete pre-generated prefill+decoder+encoder instruction bin."""
@@ -3341,6 +3345,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         if _use_status:
             _status_setup()
 
+        # Sharded decode (multi-engine bin): workers HALT after every step and
+        # are relaunched via per-step preambles priming the same gf_* values.
+        dec_sched = getattr(self, "_decode_sched", None)
+        dec_multi = dec_sched is not None and dec_sched.num_engines > 1
+        if dec_multi:
+            self._preclear_shard_flags(dec_sched)
+
         global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
         while self.seq_len < max_seq_len:
@@ -3365,20 +3376,37 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             if fpga_penalty and (self.seq_len - prefill_seq_start) > greedy_until:
                 self._write_penalty_bias(self._generated_tokens)
 
-            # Per-step preamble: prime dynamic GPRs + JUMP_ABS into cached decoder program.
+            # Per-step preamble(s): prime dynamic GPRs + JUMP_ABS into the
+            # engine's cached decoder program (identical values on all engines).
+            def _emit_step_preamble(eng, jump_target):
+                eng.generate_instruction_add_set(self.gf_seq_len,         step_pos)
+                eng.generate_instruction_add_set(self.gf_q_seq_len,       self.seq_len)
+                eng.generate_instruction_add_set(self.gf_aligned_seq_len, aligned_seq_len)
+                eng.generate_instruction_add_set(self._gf_rope_cos_abs,   ue_35bit_addr_shifter(cos_abs_addr))
+                eng.generate_instruction_jump_abs(ue_35bit_addr_shifter(jump_target))
+
             self.clear_inst_id()
             self.start_capture()
-            self.generate_instruction_add_set(self.gf_seq_len,         step_pos)
-            self.generate_instruction_add_set(self.gf_q_seq_len,       self.seq_len)
-            self.generate_instruction_add_set(self.gf_aligned_seq_len, aligned_seq_len)
-            self.generate_instruction_add_set(self._gf_rope_cos_abs,   ue_35bit_addr_shifter(cos_abs_addr))
-            self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
+            _emit_step_preamble(self, decoder_program_addr)
             self.stop_capture()
             self.write_captured_instructions_to_dram(preamble_addr)
             self.clear_capture_buffer()
 
+            if dec_multi:
+                for wi, w in enumerate(dec_sched.workers):
+                    w.clear_inst_id()
+                    w.start_capture()
+                    _emit_step_preamble(w, self._decode_worker_prog_addrs[wi])
+                    w.stop_capture()
+                    w.write_captured_instructions_to_dram(
+                        self._decode_worker_preamble_addrs[wi])
+                    w.clear_capture_buffer()
+                dec_sched.start_workers(self._decode_worker_preamble_addrs)
+
             step_latency_us, step_flop_rate = self.program_execute(
                 preamble_addr, timeout=10.0, flops=per_token_flops, verbose=False)
+            if dec_multi:
+                self._join_workers(dec_sched, timeout_s=10.0)
             total_latency_us += step_latency_us
             total_flop_rate += step_flop_rate
 
