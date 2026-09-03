@@ -21,6 +21,7 @@ Usage:
   python gemma3_test.py --dev xdma0
   python gemma3_test.py --local-weights
   python gemma3_test.py --dual-engine
+  python gemma3_test.py --engines 8      # multi-engine DECODE (prefill stays single-engine)
 
 ``--dev`` is the DMA device name (e.g. ``xdma0``); AXI width, clock, DRAM size, and core count come from HW_INFO.
 
@@ -263,7 +264,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     can build on the same structure; runtime enablement remains gated until validated.
     """
 
-    def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False, legacy: bool = False, matmatmul: bool = False, two_pass_prefill: bool = False):
+    def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False, legacy: bool = False, matmatmul: bool = False, two_pass_prefill: bool = False,
+                 decode_engines: int = 1):
         program_dram_base = DRAM_INSTRUCTION_ADDR + 0x10000000 if engine_slave else DRAM_INSTRUCTION_ADDR
         engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
         super().__init__(BASE_ADDR=engine_base, program_dram_base=program_dram_base)
@@ -271,6 +273,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.legacy = legacy
         self.two_pass_prefill = two_pass_prefill
         self.matmatmul = matmatmul
+        self.DECODE_NUM_ENGINES = max(1, int(decode_engines))
+        self._decode_sched = None
         self.local_weights = local_weights
         self.script_dir = script_dir or SCRIPT_DIR
         self._cfg = self.load_config(script_dir=self.script_dir)
@@ -504,7 +508,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             + aligned_seq_len_q * aligned_seq_len_q
             + aligned_seq_len_q * self.head_dim
         )
-        self.LAYER0_FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(unified_attention_scratch_elements * self.bytes_per_element)
+        self.LAYER0_FLASH_SCRATCH_BYTES = unified_attention_scratch_elements * self.bytes_per_element
+        self.LAYER0_FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(self.LAYER0_FLASH_SCRATCH_BYTES)
         self.LAYER0_FLASH_ATTN_P_DRAM = self.allocate_tensor_dram(aligned_seq_len_q * aligned_seq_len_q * self.bytes_per_element)
         self.LAYER0_FLASH_BIAS_DRAM = self.allocate_tensor_dram(aligned_seq_len_q * aligned_seq_len_q * self.bytes_per_element)
         self.LAYER0_ATTN_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.vector_length * 2)
@@ -1818,6 +1823,180 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "checkpoints": checkpoints,
         }
 
+    # ------------------------------------------------------------------
+    # Multi-engine DECODE sharding (ported from qwen2.5_vl_3b, commit 6409e00).
+    # Prefill stays single-engine. The folded decoder body is emitted once
+    # PER ENGINE; every intermediate is a single row in shared DRAM, so an
+    # N-split's [1, Nc] output lands IN PLACE at OUT + n0*bpe (no per-engine
+    # buffers, no reductions, no weight slicing: B/scale column offsets are
+    # compile-time constants added to the same per-layer GPR base).
+    # ------------------------------------------------------------------
+    DECODE_NUM_ENGINES = 1           # set from --engines in __init__
+    DECODE_MAX_ENGINES = 8
+    SHARD_BARRIER_MARGIN_NOPS = 32   # CHECK->CLEAR margin, see pi05 writeup
+    # Worker DRAM arenas. Gemma3 layout: params 0x80000000+ (~525 MB), tensors
+    # 0xB0000000+ (~40 MB), primary program 0xD0000000+ (a few hundred KB).
+    # Arenas sit at the top of the 4 GB space; the stride is derived from the
+    # worker count (512 MB region split evenly, 16 MB-floored).
+    WORKER_ARENA_BASE    = 0xE0000000
+    WORKER_ARENA_TOP     = 0x100000000   # 4 GB DRAM top
+    WORKER_TENSOR_OFFSET = 0x00100000    # 1 MB guard
+    WORKER_TENSOR_WINDOW = 0x02000000    # 32 MB (per-engine attention scratch ~10.5 MB)
+
+    def _engine_tag(self) -> str:
+        """Bin/meta filename suffix: the primary's decoder stream bakes the lane
+        geometry, so a sharded image must never be picked up by --bin-reuse at
+        a different engine count."""
+        ne = int(self.DECODE_NUM_ENGINES)
+        return "" if ne <= 1 else f"_e{ne}"
+
+    @staticmethod
+    def _col_split(N: int, num_engines: int, align: int = 64):
+        """[(offset, count)] whole-``align``-block split -- the same rule as
+        multi_engine_shard.MultiEngineScheduler.split_cols (duplicated so the
+        host-side LM-head merge and the emission agree without a scheduler)."""
+        if num_engines == 1:
+            return [(0, N)]
+        assert N % align == 0, f"_col_split: N={N} not a multiple of {align}"
+        blocks = N // align
+        assert blocks >= num_engines, f"_col_split: N={N} too few {align}-blocks"
+        base, rem = divmod(blocks, num_engines)
+        counts = [align * (base + (1 if i < rem else 0)) for i in range(num_engines)]
+        offsets = [sum(counts[:i]) for i in range(num_engines)]
+        return list(zip(offsets, counts))
+
+    @staticmethod
+    def _shard_barrier(ue, engine_idx: int, num_engines: int,
+                       margin_nops: int = SHARD_BARRIER_MARGIN_NOPS):
+        """Emit ONE engine's slice of the symmetric all-engine rendezvous
+        (SET; CHECK all peers; <margin NOPs>; CLEAR -- flag_rendezvous_repeat_test
+        shape). Bodies are emitted one complete engine stream at a time, so
+        MultiEngineScheduler.barrier() (which emits into every engine at once)
+        is the wrong tool here."""
+        if num_engines <= 1:
+            return
+        ue.generate_instruction_flag_set()
+        for j in range(num_engines):
+            if j != engine_idx:
+                ue.generate_instruction_flag_check(target_engine_idx=j)
+        for _ in range(margin_nops):
+            ue.generate_instruction_nop()
+        ue.generate_instruction_flag_clear()
+
+    def _prepare_decode_sharding(self) -> None:
+        """Worker engines + scheduler + per-engine attention scratch + the
+        LM-head candidate slots for the sharded decoder. Must run BEFORE
+        compile_gemma3's capture opens (allocates tensor DRAM). Idempotent."""
+        ne = int(self.DECODE_NUM_ENGINES)
+        if ne <= 1:
+            self._decode_sched = None
+            return
+        if getattr(self, "_decode_sched", None) is not None:
+            return
+        assert 2 <= ne <= self.DECODE_MAX_ENGINES, f"--engines {ne}: use 1..{self.DECODE_MAX_ENGINES}"
+        nh = self.group_size
+        na = min(ne, nh)
+        assert nh % na == 0, (
+            f"--engines {ne}: the {nh} Q heads must split evenly over "
+            f"min(engines, heads)={na} attention engines (use 1, 2, 4 or 8)")
+        assert not self.legacy and not self.matmatmul, (
+            "sharded decode supports only the default folded streaming decoder "
+            "(no --legacy / --two-pass-decoder)")
+        # Fail FAST on a board with fewer cores than requested: a FLAG_CHECK
+        # against a nonexistent engine spin-waits forever.
+        hw_cores = getattr(user_dma_core, "ANDROMEDA_CORE_COUNT", None)
+        if hw_cores is not None:
+            assert ne <= int(hw_cores), (
+                f"--engines {ne} but the bitstream reports only {hw_cores} "
+                f"core(s) (HW_INFO); use --engines {hw_cores} or lower")
+        assert self.get_program_dram_addr() < self.WORKER_ARENA_BASE, (
+            f"primary program allocator 0x{self.get_program_dram_addr():X} has "
+            f"grown into the worker arena base 0x{self.WORKER_ARENA_BASE:X}")
+        n_workers = ne - 1
+        stride = (self.WORKER_ARENA_TOP - self.WORKER_ARENA_BASE) // n_workers
+        stride &= ~0x00FFFFFF                      # floor to 16 MB
+        program_offset = self.WORKER_TENSOR_OFFSET + self.WORKER_TENSOR_WINDOW
+        assert stride >= program_offset + 0x01000000, (
+            f"{n_workers} workers leave only 0x{stride:X} B/arena -- no room for "
+            f"a program window past the 0x{program_offset:X} B tensor region")
+        self._worker_arena_stride = stride
+        self._worker_program_offset = program_offset
+        from multi_engine_shard import MultiEngineScheduler
+        sched = MultiEngineScheduler(
+            self, num_engines=ne,
+            worker_dram_base=self.WORKER_ARENA_BASE,
+            worker_dram_stride=stride,
+            worker_tensor_offset=self.WORKER_TENSOR_OFFSET,
+            worker_program_offset=program_offset,
+            barrier_margin_nops=self.SHARD_BARRIER_MARGIN_NOPS,
+            allow_more_than_two_engines=True)
+        # Attention scratch is WRITTEN by every attention engine -> private copies.
+        sched.register_per_engine("attn_scratch", self.LAYER0_FLASH_SCRATCH_DRAM,
+                                  self.LAYER0_FLASH_SCRATCH_BYTES)
+        # LM-head merge slots: engine e exports -(max logit of its lane) as a
+        # 64-element row at CAND + e*128 B (fmax_core over a zero vector); the
+        # host pairs it with the engine's argmax register (lane-local index).
+        # APPENDED to the tensor region so the --engines 1 layout is untouched.
+        self.LMHEAD_CAND_DRAM = self.allocate_tensor_dram(ne * UE_VECTOR_SIZE * self.bytes_per_element)
+        self._decode_sched = sched
+        _original_print(f"    [engines] decode sharded over {ne} engine(s): "
+                        f"{len(sched.workers)} worker(s), {stride >> 20} MB arena(s) "
+                        f"({(stride - program_offset) >> 20} MB program window each)")
+
+    def _assert_worker_arenas_fit(self, sched) -> None:
+        """Every worker's tensor and program allocators must stay inside its
+        arena windows -- an overflow silently lands in the NEXT worker's arena
+        and shows up as scrambled data, not an error."""
+        stride = self._worker_arena_stride
+        program_offset = self._worker_program_offset
+        for i, w in enumerate(sched.workers):
+            base = self.WORKER_ARENA_BASE + i * stride
+            t_end = w.get_tensor_dram_addr()
+            p_end = w.get_program_dram_addr()
+            assert t_end <= base + program_offset, (
+                f"[decode] worker {i + 1} tensor allocator 0x{t_end:X} overflows "
+                f"its window (base 0x{base:X} + tensor "
+                f"0x{self.WORKER_TENSOR_OFFSET:X}..0x{program_offset:X})")
+            assert p_end <= base + stride, (
+                f"[decode] worker {i + 1} program allocator 0x{p_end:X} overflows "
+                f"its 0x{stride:X}-byte arena at 0x{base:X}")
+
+    def _preclear_shard_flags(self, sched) -> None:
+        """One-time flag preclear + stale-busy recovery before the first
+        sharded execution of the process (multi_engine_shard.preclear_flags)."""
+        if getattr(self, "_shard_flags_precleared", False):
+            return
+        sched.preclear_flags()
+        self._shard_flags_precleared = True
+
+    @staticmethod
+    def _join_workers(sched, timeout_s: float = 60.0) -> None:
+        """The primary retires its halt as soon as the last rendezvous clears;
+        a worker may still be draining its margin NOPs / LM-head tail. Wait
+        rather than assert-not-busy."""
+        for w in sched.workers:
+            w.wait_queue(timeout_s)
+
+    def _select_token_sharded(self, sched, lm_lanes) -> int:
+        """Merge the per-engine LM-head candidates: each engine's argmax
+        register holds the index of its lane's max (lane-local, the tracker
+        is cleared at the lane GEMV's first chunk) and LMHEAD_CAND_DRAM holds
+        -(that max) per engine. Pick the largest value; ties -> lowest index."""
+        ne = sched.num_engines
+        cand = self.dma_from_accelerator_memory(self.LMHEAD_CAND_DRAM, (ne * UE_VECTOR_SIZE,))
+        best_val, best_idx = None, None
+        for e, eng in enumerate(sched.engines):
+            local = int(eng.get_arg_max_index())
+            l0, lc = lm_lanes[e]
+            assert 0 <= local < lc, (
+                f"engine {e} argmax {local} outside its LM-head lane of {lc} columns "
+                f"-- the argmax index is not lane-local as assumed")
+            val = -float(cand[e * UE_VECTOR_SIZE])
+            gidx = l0 + local
+            if best_val is None or val > best_val or (val == best_val and gidx < best_idx):
+                best_val, best_idx = val, gidx
+        return best_idx
+
     def _compile_decoder_programs_folded(self, layer_size: int = 26, profile: bool = False) -> dict:
         """Dynamic decoder: compile ONE decoder layer body and hardware-loop it ``layer_size``
         times, the decode-side mirror of the folded prefill in :meth:`_compile_prefill_program`.
@@ -1841,64 +2020,201 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         layer-independent). The outer
         loop-back is an absolute conditional jump (JNZ) — a full decoder layer body is far larger
         than the 512-instruction relative i-cache window, exactly as in the prefill.
+
+        **Multi-engine (--engines N > 1):** the body is emitted once PER ENGINE (the primary's into
+        the model's capture, each worker's into its own arena via MultiEngineScheduler); see
+        :meth:`_emit_folded_decoder_body` for the shard assignment. With ``--engines 1`` this is
+        the historical single-engine stream byte-for-byte.
+        """
+        ne = int(self.DECODE_NUM_ENGINES)
+        sched = getattr(self, "_decode_sched", None)
+        assert (sched is not None) == (ne > 1), (
+            "compile_gemma3 must call _prepare_decode_sharding() before start_capture()")
+        if sched is not None:
+            assert not profile, "sharded decode has no per-step HALT checkpoints (--profile needs --engines 1)"
+            assert layer_size == self.LAYER_SIZE, "sharded decode needs the full model (LM-head merge)"
+            sched.begin_program()
+            for w in sched.workers:
+                # regs 1-4 are the fixed TMP/SEQ_LEN/Q_SEQ_LEN/ALIGNED set on every
+                # engine (the per-step preamble primes 2 and 4 by fixed index).
+                w._isa_reg_counter = 5
+            engines = sched.engines
+            na = min(ne, self.group_size)
+            _original_print(f"    [decode] sharded over {ne} engine(s): N-lanes of "
+                            f"{self.vector_length}/{self.mlp_elements}/{self.EMBEDDING_ELEMENTS}, "
+                            f"{self.group_size // na} Q head(s) on each of {na} attention engine(s), "
+                            f"K on engine {max(ne - 2, 0)}, V on engine {ne - 1}; "
+                            f"5 rendezvous/layer; LM head lane-split + host merge")
+        else:
+            engines = [self]
+
+        decoder_count_at_start = self.capture_count
+        count_at_start = self.capture_count
+        checkpoints: list[list] = []
+
+        global _SILENT_MODE
+        _SILENT_MODE = True
+        total_flops = 0
+        worker_sizes: list[int] = []
+        for e, ue in enumerate(engines):
+            # Engines partition the work; the sum is the whole model's FLOPs per
+            # token (replicated 1152-element norms/residuals are noise).
+            total_flops += self._emit_folded_decoder_body(ue, e, ne, layer_size, profile, checkpoints)
+        _SILENT_MODE = False
+
+        if sched is not None:
+            self._decode_worker_prog_addrs = sched.finalize()
+            self._decode_worker_preamble_addrs = [w.allocate_program_dram(256) for w in sched.workers]
+            self._assert_worker_arenas_fit(sched)
+            for wi, (w, addr) in enumerate(zip(sched.workers, self._decode_worker_prog_addrs)):
+                issues = user_dma_core.check_isa_jumps(w.capture_buffer, addr, name=f"decoder_worker{wi + 1}")
+                if issues:
+                    for issue in issues:
+                        print(f"  {issue}")
+                    raise RuntimeError(f"decoder worker {wi + 1}: {len(issues)} ISA jump safety violation(s)")
+                worker_sizes.append(w.get_capture_instruction_size_bytes())
+                w.clear_capture_buffer()
+
+        inst_count = self.capture_count - count_at_start
+        decoder_program_addr = self.get_program_dram_addr() + decoder_count_at_start * INSTRUCTION_SIZE_BYTES
+        program_size_bytes = inst_count * INSTRUCTION_SIZE_BYTES
+        print(
+            f"Decoder program compiled (FOLDED single-layer body, HW-looped {layer_size}x) at "
+            f"0x{decoder_program_addr:X}, size {program_size_bytes} bytes"
+            + (f"; {len(worker_sizes)} worker program(s) of {worker_sizes} bytes in their arenas"
+               if worker_sizes else "")
+        )
+        return {
+            "program_size_bytes": program_size_bytes,
+            "total_flops": total_flops,
+            "checkpoints": checkpoints,
+            "worker_program_sizes": worker_sizes,
+        }
+
+    def _emit_folded_decoder_body(self, ue, engine_idx: int, ne: int, layer_size: int,
+                                  profile: bool, checkpoints: list) -> int:
+        """Emit ONE engine's folded decoder stream (``ue`` is the primary or a worker).
+
+        Shard assignment per layer (ne = 2/4/8; ne == 1 collapses to the full problem):
+          norms + residuals   REPLICATED (identical concurrent writes -- the pi05
+                              redundant-K-lane precedent; 1152-element ops)
+          q proj              N-split by whole Q heads over min(ne, 4) engines
+          q norm + Q RoPE     per engine over its own heads (in place)
+          k proj/norm/RoPE +  engine ne-2 (N=256, small)
+            K cache append
+          v proj + V append   engine ne-1
+          attention           HEAD-split: 4/min(ne,4) heads per attention engine
+                              over the single KV head, cache read in place
+          o proj              N-split of 1152 (reads ALL heads' output)
+          gate/up/mult        N-split lanes of 6912 (gelu + mult stay in lane)
+          down proj           N-split of 1152 reading the FULL mult row
+          final norm          REPLICATED
+          LM head             N-split of 262144, write_back_disable; each engine
+                              exports -(lane max) for the host-side merge
+                              (:meth:`_select_token_sharded`)
+
+        Five rendezvous per layer: after {proj+norm+RoPE+append}, after attention,
+        after o-proj lanes, after mult lanes, after down lanes.
         """
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         KV_CACHE_LAYER_STRIDE = self.MAX_CONTEXT_SIZE * self.k_size
         decoder_aligned_seq_len = ((self.MAX_CONTEXT_SIZE + 63) // 64) * 64
         bpe = self.bytes_per_element
+        hd = self.head_dim
+        nh = self.group_size
+        sharded = ne > 1
 
-        decoder_count_at_start = self.capture_count
-        count_at_start = self.capture_count
-        total_flops = 0
-        checkpoints: list[list] = []
+        # ---- shard geometry (all compile-time) ----
+        na = min(ne, nh)                      # engines that own Q heads
+        hp = nh // na                         # Q heads per attention engine
+        owns_heads = engine_idx < na
+        h0 = engine_idx * hp if owns_heads else 0
+        owns_k = engine_idx == max(ne - 2, 0)
+        owns_v = engine_idx == ne - 1
+        n0, nc = self._col_split(self.vector_length, ne)[engine_idx]
+        m0, mc = self._col_split(self.mlp_elements, ne)[engine_idx]
+        l0, lc = self._col_split(self.EMBEDDING_ELEMENTS, ne)[engine_idx]
+        if sharded:
+            attn_scratch = self._decode_sched.per_engine_addr("attn_scratch", engine_idx)
+        else:
+            attn_scratch = self.LAYER0_FLASH_SCRATCH_DRAM
+
+        def _if4_lane(base_data, base_scale, K, col0):
+            # THE PER-COLUMN OFFSETS for an N-lane of an IF4 (N x K) weight:
+            # B + (n0*K)//2, scale + ((n0*K)//64)*bpe (multi_engine_shard's rule).
+            return base_data + (col0 * K) // 2, base_scale + ((col0 * K) // UE_VECTOR_SIZE) * bpe
+
+        def _barrier():
+            self._shard_barrier(ue, engine_idx, ne)
 
         def _checkpoint(name: str) -> None:
-            self.generate_instruction_halt()
-            self.pad_capture_to_64b_boundary()
-            resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
+            if not profile:
+                return
+            ue.generate_instruction_halt()
+            ue.pad_capture_to_64b_boundary()
+            resume = ue.get_program_dram_addr() + ue.capture_count * INSTRUCTION_SIZE_BYTES
             checkpoints.append([name, f"0x{resume:X}"])
 
-        global _SILENT_MODE
-        _SILENT_MODE = True
+        total_flops = 0
 
         # ---- persistent registers (seeded once, before the loop) ----
         # PBI row-loop trip-count registers (matmul/rms gpr_M_reg) must be low GPRs (1..15) because
         # the hardware loop-counter field is narrow — allocate the two decode row-counts (M=1 and
         # M=group_size) FIRST so they land in that window. Address/dimension registers may be high.
-        gpr_one = self.alloc_isa_reg()  # holds M=1 for the single-token matmuls / rms
-        gpr_dim_group = self.alloc_isa_reg()  # holds group_size (Q-norm row count)
-        gpr_layer_off = self.alloc_isa_reg()
-        gpr_kv_off = self.alloc_isa_reg()
-        gpr_rope_cycle = self.alloc_isa_reg()
-        gpr_rope_saved = self.alloc_isa_reg()
-        gpr_rope_base = self.alloc_isa_reg()
-        gpr_scratch_a = self.alloc_isa_reg()
-        gpr_scratch_b = self.alloc_isa_reg()
-        gpr_scratch_c = self.alloc_isa_reg()
-        gpr_scratch_d = self.alloc_isa_reg()
-        gpr_scratch_e = self.alloc_isa_reg()
-        gpr_dim_vector_length = self.alloc_isa_reg()
-        gpr_dim_head_dim = self.alloc_isa_reg()
-        gpr_dim_head_dim_group = self.alloc_isa_reg()
-        gpr_dim_mlp_elements = self.alloc_isa_reg()
+        gpr_one = ue.alloc_isa_reg()  # holds M=1 for the single-token matmuls / rms
+        gpr_dim_group = ue.alloc_isa_reg()  # holds group_size (Q-norm row count)
+        if sharded:
+            # This engine's Q-head count: Q-norm row count + attention batch, so it
+            # must also sit in the low (1..15) loop-counter window. Only allocated
+            # when sharded so the --engines 1 stream stays byte-identical.
+            gpr_dim_heads_lane = ue.alloc_isa_reg()
+        gpr_layer_off = ue.alloc_isa_reg()
+        gpr_kv_off = ue.alloc_isa_reg()
+        gpr_rope_cycle = ue.alloc_isa_reg()
+        gpr_rope_saved = ue.alloc_isa_reg()
+        gpr_rope_base = ue.alloc_isa_reg()
+        gpr_scratch_a = ue.alloc_isa_reg()
+        gpr_scratch_b = ue.alloc_isa_reg()
+        gpr_scratch_c = ue.alloc_isa_reg()
+        gpr_scratch_d = ue.alloc_isa_reg()
+        gpr_scratch_e = ue.alloc_isa_reg()
+        gpr_dim_vector_length = ue.alloc_isa_reg()
+        gpr_dim_head_dim = ue.alloc_isa_reg()
+        gpr_dim_head_dim_group = ue.alloc_isa_reg()
+        gpr_dim_mlp_elements = ue.alloc_isa_reg()
         # RMS RSQRT scalar registers: bf19 of sqrt(N) for each N an RMS-norm runs over (head_dim and
         # vector_length in the decode body). The ISA has no on-device sqrt, so the host bakes them.
-        gpr_sqrt_vector_length = self.alloc_isa_reg()
-        gpr_sqrt_head_dim = self.alloc_isa_reg()
-        gpr_attn_scale = self.alloc_isa_reg()  # bf16 of 1/sqrt(head_dim) for the runtime attention scale
-        self.generate_instruction_add_set(gpr_one, 1)
-        self.generate_instruction_add_set(gpr_dim_group, self.group_size)
-        self.generate_instruction_add_set(gpr_layer_off, 0)
-        self.generate_instruction_add_set(gpr_kv_off, 0)
-        self.generate_instruction_add_set(gpr_rope_cycle, 6)
-        self.generate_instruction_add_set(gpr_dim_vector_length, self.vector_length)
-        self.generate_instruction_add_set(gpr_dim_head_dim, self.head_dim)
-        self.generate_instruction_add_set(gpr_dim_head_dim_group, self.head_dim * self.group_size)
-        self.generate_instruction_add_set(gpr_dim_mlp_elements, self.mlp_elements)
-        self.generate_instruction_add_set(gpr_sqrt_vector_length, self.float_to_bf19(self.vector_length ** 0.5))
-        self.generate_instruction_add_set(gpr_sqrt_head_dim, self.float_to_bf19(self.head_dim ** 0.5))
-        self.generate_instruction_add_set(gpr_attn_scale, self.float_to_bf16(1.0 / (self.head_dim ** 0.5)))
-        program_start = self.get_program_dram_addr()
+        gpr_sqrt_vector_length = ue.alloc_isa_reg()
+        gpr_sqrt_head_dim = ue.alloc_isa_reg()
+        gpr_attn_scale = ue.alloc_isa_reg()  # bf16 of 1/sqrt(head_dim) for the runtime attention scale
+        if sharded:
+            # Lane dimensions (this engine's share; N registers may be high).
+            gpr_dim_q_lane = ue.alloc_isa_reg()       # hp*hd (q proj N)
+            gpr_dim_hid_lane = ue.alloc_isa_reg()     # nc   (o proj / down N)
+            gpr_dim_mlp_lane = ue.alloc_isa_reg()     # mc   (gate / up N)
+        else:
+            gpr_dim_heads_lane = gpr_dim_group
+            gpr_dim_q_lane = gpr_dim_head_dim_group
+            gpr_dim_hid_lane = gpr_dim_vector_length
+            gpr_dim_mlp_lane = gpr_dim_mlp_elements
+        ue.generate_instruction_add_set(gpr_one, 1)
+        ue.generate_instruction_add_set(gpr_dim_group, self.group_size)
+        ue.generate_instruction_add_set(gpr_layer_off, 0)
+        ue.generate_instruction_add_set(gpr_kv_off, 0)
+        ue.generate_instruction_add_set(gpr_rope_cycle, 6)
+        ue.generate_instruction_add_set(gpr_dim_vector_length, self.vector_length)
+        ue.generate_instruction_add_set(gpr_dim_head_dim, self.head_dim)
+        ue.generate_instruction_add_set(gpr_dim_head_dim_group, self.head_dim * self.group_size)
+        ue.generate_instruction_add_set(gpr_dim_mlp_elements, self.mlp_elements)
+        ue.generate_instruction_add_set(gpr_sqrt_vector_length, ue.float_to_bf19(self.vector_length ** 0.5))
+        ue.generate_instruction_add_set(gpr_sqrt_head_dim, ue.float_to_bf19(self.head_dim ** 0.5))
+        ue.generate_instruction_add_set(gpr_attn_scale, ue.float_to_bf16(1.0 / (self.head_dim ** 0.5)))
+        if sharded:
+            ue.generate_instruction_add_set(gpr_dim_heads_lane, hp)
+            ue.generate_instruction_add_set(gpr_dim_q_lane, hp * hd)
+            ue.generate_instruction_add_set(gpr_dim_hid_lane, nc)
+            ue.generate_instruction_add_set(gpr_dim_mlp_lane, mc)
+        program_start = ue.get_program_dram_addr()
 
         # RMS N -> (dimension register, sqrt(N) RSQRT-scalar register).
         _rms_dim_reg = {self.vector_length: gpr_dim_vector_length, self.head_dim: gpr_dim_head_dim}
@@ -1908,43 +2224,43 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             """One decoder-fold RMS-norm through the fully-dynamic RMS core: runtime row count
             (``gpr_M``), runtime N (``gpr_N_reg``) and runtime sqrt(N) RSQRT scalar
             (``gpr_sqrt_n_reg``), with gpr-sourced addresses. ``M`` is FLOPs/template only."""
-            return self.rms_norm_core_dram(
+            return ue.rms_norm_core_dram(
                 M=M, N=N, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=O, GAMMA_DRAM_ADDR=GAMMA,
                 gpr_M_reg=gpr_M, gpr_N_reg=_rms_dim_reg[N], gpr_sqrt_n_reg=_rms_sqrt_reg[N],
                 gpr_a_addr=ga, gpr_out_addr=go, gpr_gamma_addr=gg)
 
         def layer_addr(base_literal: int, scratch_reg: int) -> int:
             # per-layer weight/scale/gamma base = gpr_layer_off + base_literal
-            self.generate_instruction_add_imm(src_reg_idx=gpr_layer_off,
-                                              immediate_value=ue_35bit_addr_shifter(base_literal),
-                                              dst_reg_idx=scratch_reg)
+            ue.generate_instruction_add_imm(src_reg_idx=gpr_layer_off,
+                                            immediate_value=ue_35bit_addr_shifter(base_literal),
+                                            dst_reg_idx=scratch_reg)
             return scratch_reg
 
         def kv_addr(base_literal: int, scratch_reg: int) -> int:
             # per-layer KV-cache base = gpr_kv_off + base_literal (row 0 of this layer's cache)
-            self.generate_instruction_add_imm(src_reg_idx=gpr_kv_off,
-                                              immediate_value=ue_35bit_addr_shifter(base_literal),
-                                              dst_reg_idx=scratch_reg)
+            ue.generate_instruction_add_imm(src_reg_idx=gpr_kv_off,
+                                            immediate_value=ue_35bit_addr_shifter(base_literal),
+                                            dst_reg_idx=scratch_reg)
             return scratch_reg
 
         def const_addr(base_literal: int, scratch_reg: int) -> int:
             # layer-invariant scratch buffer base, loaded from a plain ADD_SET
-            self.generate_instruction_add_set(scratch_reg, ue_35bit_addr_shifter(base_literal))
+            ue.generate_instruction_add_set(scratch_reg, ue_35bit_addr_shifter(base_literal))
             return scratch_reg
 
         def cache_pos_ptr(base_literal: int) -> int:
             # TMP = gpr_seq_len*k_size + base_literal + gpr_kv_off  (append slot at token position)
-            self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len,
-                                                  ue_35bit_addr_shifter(self.k_size))
-            self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(base_literal), self.TMP_REG)
-            self.generate_instruction_add_reg(self.TMP_REG, self.TMP_REG, gpr_kv_off)
+            ue.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len,
+                                                ue_35bit_addr_shifter(self.k_size))
+            ue.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(base_literal), self.TMP_REG)
+            ue.generate_instruction_add_reg(self.TMP_REG, self.TMP_REG, gpr_kv_off)
             return self.TMP_REG
 
         def rope_weight_ptr() -> int:
             # TMP = gpr_seq_len*(k_size*2) + gpr_rope_base  (runtime global/local table + position)
-            self.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len,
-                                                  ue_35bit_addr_shifter(self.k_size * 2))
-            self.generate_instruction_add_reg(self.TMP_REG, self.TMP_REG, gpr_rope_base)
+            ue.generate_instruction_reg_mul_imm(self.TMP_REG, self.gpr_seq_len,
+                                                ue_35bit_addr_shifter(self.k_size * 2))
+            ue.generate_instruction_add_reg(self.TMP_REG, self.TMP_REG, gpr_rope_base)
             return self.TMP_REG
 
         def fold_matmul(K, N, a_lit, b_lit, out_lit, scale_lit, gpr_K, gpr_N, gelu=False):
@@ -1952,7 +2268,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             # weights straight through DOT_PRODUCT (no dequantize pass), fully dynamic in K/N and every
             # DRAM base. matmat_mul_core's dynamic path DEQUANTIZES B first (2 passes) — that 2x weight
             # traffic was the streaming decode regression, so the folded decoder must use this core.
-            return self.quantized_matmat_core(
+            return ue.quantized_matmat_core(
                 M=1, K=K, N=N,
                 A_DRAM_ADDR=a_lit, B_DRAM_ADDR=b_lit, OUTPUT_DRAM_ADDR=out_lit, SCALE_DRAM_ADDR=scale_lit,
                 data_type=TYPE.IF4, gelu_enable=gelu,
@@ -1964,24 +2280,24 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             )
 
         # ---- outer per-layer loop: absolute-JNZ hardware loop over one body ----
-        gpr_layer_cnt = self.alloc_isa_reg()
-        self.generate_instruction_add_set(gpr_layer_cnt, layer_size)
-        self.pad_capture_to_64b_boundary()
-        layer_body_start_word_addr = ue_35bit_addr_shifter(program_start + self.capture_count * INSTRUCTION_SIZE_BYTES)
+        gpr_layer_cnt = ue.alloc_isa_reg()
+        ue.generate_instruction_add_set(gpr_layer_cnt, layer_size)
+        ue.pad_capture_to_64b_boundary()
+        layer_body_start_word_addr = ue_35bit_addr_shifter(program_start + ue.capture_count * INSTRUCTION_SIZE_BYTES)
 
         # --- per-iteration RoPE global/local selection (runtime mod-6), identical to prefill ---
-        self.generate_instruction_add_dec(reg_idx=gpr_rope_cycle)
-        self.generate_instruction_add_imm(src_reg_idx=gpr_rope_cycle, immediate_value=0, dst_reg_idx=gpr_rope_saved)
-        self.generate_instruction_add_set(gpr_rope_base, ue_35bit_addr_shifter(self.DRAM_ADDR_ROPE_GLOBAL))
-        _rope_patch = self._emit_forward_skip_jz(gpr_rope_saved, program_start)
-        self.generate_instruction_add_set(gpr_rope_base, ue_35bit_addr_shifter(self.DRAM_ADDR_ROPE_LOCAL))
+        ue.generate_instruction_add_dec(reg_idx=gpr_rope_cycle)
+        ue.generate_instruction_add_imm(src_reg_idx=gpr_rope_cycle, immediate_value=0, dst_reg_idx=gpr_rope_saved)
+        ue.generate_instruction_add_set(gpr_rope_base, ue_35bit_addr_shifter(self.DRAM_ADDR_ROPE_GLOBAL))
+        _rope_patch = ue._emit_forward_skip_jz(gpr_rope_saved, program_start)
+        ue.generate_instruction_add_set(gpr_rope_base, ue_35bit_addr_shifter(self.DRAM_ADDR_ROPE_LOCAL))
         _rope_patch()
-        self.generate_instruction_add_set(gpr_rope_cycle, 6)
-        _cycle_patch = self._emit_forward_skip_jz(gpr_rope_saved, program_start)
-        self.generate_instruction_add_imm(src_reg_idx=gpr_rope_saved, immediate_value=0, dst_reg_idx=gpr_rope_cycle)
+        ue.generate_instruction_add_set(gpr_rope_cycle, 6)
+        _cycle_patch = ue._emit_forward_skip_jz(gpr_rope_saved, program_start)
+        ue.generate_instruction_add_imm(src_reg_idx=gpr_rope_saved, immediate_value=0, dst_reg_idx=gpr_rope_cycle)
         _cycle_patch()
 
-        # --- pre-attention RMS norm ---
+        # --- pre-attention RMS norm (REPLICATED when sharded: every engine needs the normed row) ---
         total_flops += dec_rms(
             1, self.vector_length,
             self.LAYER0_INPUT_DRAM, self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA,
@@ -1990,96 +2306,119 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             const_addr(self.LAYER0_PRE_NORM_DRAM, gpr_scratch_b),
             layer_addr(self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA, gpr_scratch_c),
         )
-        if profile:
-            _checkpoint("pre_norm")
+        _checkpoint("pre_norm")
 
         # --- Q / K / V projections (single token) ---
-        total_flops += fold_matmul(self.vector_length, self.head_dim * self.group_size,
-                                   self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
-                                   self.LAYER0_Q_DRAM, self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE,
-                                   gpr_dim_vector_length, gpr_dim_head_dim_group)
-        total_flops += fold_matmul(self.vector_length, self.head_dim,
-                                   self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_K_PROJ_QUANT,
-                                   self.LAYER0_K_DRAM, self.DRAM_ADDR_LAYER0_K_PROJ_SCALE,
-                                   gpr_dim_vector_length, gpr_dim_head_dim)
-        total_flops += fold_matmul(self.vector_length, self.head_dim,
-                                   self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_V_PROJ_QUANT,
-                                   self.LAYER0_FLASH_V_DRAM, self.DRAM_ADDR_LAYER0_V_PROJ_SCALE,
-                                   gpr_dim_vector_length, gpr_dim_head_dim)
+        if owns_heads:
+            # q lane = this engine's whole heads [h0, h0+hp): columns h0*hd .. (h0+hp)*hd
+            _qb, _qs = _if4_lane(self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT, self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE,
+                                 self.vector_length, h0 * hd)
+            total_flops += fold_matmul(self.vector_length, hp * hd,
+                                       self.LAYER0_PRE_NORM_DRAM, _qb,
+                                       self.LAYER0_Q_DRAM + h0 * hd * bpe, _qs,
+                                       gpr_dim_vector_length, gpr_dim_q_lane)
+        if owns_k:
+            total_flops += fold_matmul(self.vector_length, self.head_dim,
+                                       self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_K_PROJ_QUANT,
+                                       self.LAYER0_K_DRAM, self.DRAM_ADDR_LAYER0_K_PROJ_SCALE,
+                                       gpr_dim_vector_length, gpr_dim_head_dim)
+        if owns_v:
+            total_flops += fold_matmul(self.vector_length, self.head_dim,
+                                       self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_V_PROJ_QUANT,
+                                       self.LAYER0_FLASH_V_DRAM, self.DRAM_ADDR_LAYER0_V_PROJ_SCALE,
+                                       gpr_dim_vector_length, gpr_dim_head_dim)
 
-        # --- append V row into this layer's V cache at the current token position ---
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_FLASH_V_DRAM,
-                                        sram_address=0x10000, element_size=self.head_dim)
-        cache_pos_ptr(self.LAYER0_V_DRAM)
-        self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=0,
-                                        element_size=self.head_dim, general_reg_src=self.TMP_REG)
-        if profile:
-            _checkpoint("qkv_proj_vcache")
+            # --- append V row into this layer's V cache at the current token position ---
+            ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_FLASH_V_DRAM,
+                                          sram_address=0x10000, element_size=self.head_dim)
+            cache_pos_ptr(self.LAYER0_V_DRAM)
+            ue.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=0,
+                                          element_size=self.head_dim, general_reg_src=self.TMP_REG)
+        _checkpoint("qkv_proj_vcache")
 
-        # --- Q/K RMS norms ---
-        total_flops += dec_rms(
-            1, self.head_dim,
-            self.LAYER0_K_DRAM, self.LAYER0_K_NORM_DRAM, self.DRAM_ADDR_LAYER0_K_NORM_GAMMA,
-            gpr_one,
-            const_addr(self.LAYER0_K_DRAM, gpr_scratch_a),
-            const_addr(self.LAYER0_K_NORM_DRAM, gpr_scratch_b),
-            layer_addr(self.DRAM_ADDR_LAYER0_K_NORM_GAMMA, gpr_scratch_c),
-        )
-        total_flops += dec_rms(
-            self.group_size, self.head_dim,  # loops group_size rows at runtime (gpr_dim_group)
-            self.LAYER0_Q_DRAM, self.LAYER0_Q_NORM_DRAM, self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA,
-            gpr_dim_group,
-            const_addr(self.LAYER0_Q_DRAM, gpr_scratch_a),
-            const_addr(self.LAYER0_Q_NORM_DRAM, gpr_scratch_b),
-            layer_addr(self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA, gpr_scratch_c),
-        )
+        # --- Q/K RMS norms (each engine over what it just projected) ---
+        if owns_k:
+            total_flops += dec_rms(
+                1, self.head_dim,
+                self.LAYER0_K_DRAM, self.LAYER0_K_NORM_DRAM, self.DRAM_ADDR_LAYER0_K_NORM_GAMMA,
+                gpr_one,
+                const_addr(self.LAYER0_K_DRAM, gpr_scratch_a),
+                const_addr(self.LAYER0_K_NORM_DRAM, gpr_scratch_b),
+                layer_addr(self.DRAM_ADDR_LAYER0_K_NORM_GAMMA, gpr_scratch_c),
+            )
+        if owns_heads:
+            total_flops += dec_rms(
+                hp, self.head_dim,  # loops hp rows at runtime (gpr_dim_heads_lane)
+                self.LAYER0_Q_DRAM + h0 * hd * bpe, self.LAYER0_Q_NORM_DRAM + h0 * hd * bpe,
+                self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA,
+                gpr_dim_heads_lane,
+                const_addr(self.LAYER0_Q_DRAM + h0 * hd * bpe, gpr_scratch_a),
+                const_addr(self.LAYER0_Q_NORM_DRAM + h0 * hd * bpe, gpr_scratch_b),
+                layer_addr(self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA, gpr_scratch_c),
+            )
 
-        # --- RoPE (decode, single token): K then Q(group_size) ---
-        rope_weight_ptr()  # TMP -> K rope table base at this position
-        total_flops += self.rope_hf_core_decode(
-            N=self.head_dim, input_dram_addr=self.LAYER0_K_NORM_DRAM,
-            output_dram_addr=self.LAYER0_K_ROPE_DECODE_DRAM, gr_weight_dram=self.TMP_REG)
-        cache_pos_ptr(self.LAYER0_K_ROPE_DRAM)  # TMP -> K-rope cache append slot
-        self.accelerator_memcpy(self.LAYER0_K_ROPE_DECODE_DRAM, 0, self.k_size, gr_dst_addr=self.TMP_REG)
-        rope_weight_ptr()  # TMP -> Q rope table base (recomputed; TMP was clobbered above)
-        for g in range(self.group_size):
-            total_flops += self.rope_hf_core_decode(
-                N=self.head_dim,
-                input_dram_addr=self.LAYER0_Q_NORM_DRAM + g * self.head_dim * bpe,
-                output_dram_addr=self.LAYER0_FLASH_Q_DRAM + g * self.head_dim * bpe,
-                gr_weight_dram=self.TMP_REG)
-        if profile:
-            _checkpoint("qk_norm_rope")
+        # --- RoPE (decode, single token): K then Q (own heads) ---
+        if owns_k:
+            rope_weight_ptr()  # TMP -> K rope table base at this position
+            total_flops += ue.rope_hf_core_decode(
+                N=self.head_dim, input_dram_addr=self.LAYER0_K_NORM_DRAM,
+                output_dram_addr=self.LAYER0_K_ROPE_DECODE_DRAM, gr_weight_dram=self.TMP_REG)
+            cache_pos_ptr(self.LAYER0_K_ROPE_DRAM)  # TMP -> K-rope cache append slot
+            ue.accelerator_memcpy(self.LAYER0_K_ROPE_DECODE_DRAM, 0, self.k_size, gr_dst_addr=self.TMP_REG)
+        if owns_heads:
+            rope_weight_ptr()  # TMP -> Q rope table base (recomputed; TMP was clobbered above)
+            for g in range(h0, h0 + hp):
+                total_flops += ue.rope_hf_core_decode(
+                    N=self.head_dim,
+                    input_dram_addr=self.LAYER0_Q_NORM_DRAM + g * self.head_dim * bpe,
+                    output_dram_addr=self.LAYER0_FLASH_Q_DRAM + g * self.head_dim * bpe,
+                    gr_weight_dram=self.TMP_REG)
+        _checkpoint("qk_norm_rope")
+
+        # ---- RENDEZVOUS A: attention reads every engine's Q heads + the appended K/V rows
+        _barrier()
 
         # --- grouped flash attention over the full accumulated cache for this layer ---
-        total_flops += self.unified_attention_core(
-            batch=self.group_size,
-            aligned_seq_len=decoder_aligned_seq_len,
-            head_dim=self.head_dim,
-            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-            K_DRAM_ADDR=self.LAYER0_K_ROPE_DRAM,
-            V_DRAM_ADDR=self.LAYER0_V_DRAM,
-            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-            gpr_batch_reg=gpr_dim_group,  # batch = group_size
-            gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
-            gpr_q_addr=const_addr(self.LAYER0_FLASH_Q_DRAM, gpr_scratch_a),
-            gpr_k_addr=kv_addr(self.LAYER0_K_ROPE_DRAM, gpr_scratch_b),
-            gpr_v_addr=kv_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
-            gpr_bias_addr=const_addr(self.LAYER0_FLASH_BIAS_DRAM, gpr_scratch_d),
-            gpr_out_addr=const_addr(self.LAYER0_FLASH_OUTPUT_DRAM, gpr_scratch_e),
-            gpr_scale_reg=gpr_attn_scale,
-        ) or 0
-        if profile:
-            _checkpoint("attention")
+        if owns_heads:
+            total_flops += ue.unified_attention_core(
+                batch=hp,
+                aligned_seq_len=decoder_aligned_seq_len,
+                head_dim=self.head_dim,
+                Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM + h0 * hd * bpe,
+                K_DRAM_ADDR=self.LAYER0_K_ROPE_DRAM,
+                V_DRAM_ADDR=self.LAYER0_V_DRAM,
+                BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM + h0 * hd * bpe,
+                SCRATCH_DRAM_ADDR=attn_scratch,
+                IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                gpr_batch_reg=gpr_dim_heads_lane,  # batch = heads on this engine
+                gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                gpr_q_addr=const_addr(self.LAYER0_FLASH_Q_DRAM + h0 * hd * bpe, gpr_scratch_a),
+                gpr_k_addr=kv_addr(self.LAYER0_K_ROPE_DRAM, gpr_scratch_b),
+                gpr_v_addr=kv_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
+                # BIAS: run_gemma3_decode writes ONE mask row repeated group_size
+                # times, so rows 0..hp-1 equal rows h0..h0+hp-1 -> shared base.
+                gpr_bias_addr=const_addr(self.LAYER0_FLASH_BIAS_DRAM, gpr_scratch_d),
+                gpr_out_addr=const_addr(self.LAYER0_FLASH_OUTPUT_DRAM + h0 * hd * bpe, gpr_scratch_e),
+                gpr_scale_reg=gpr_attn_scale,
+            ) or 0
+        _checkpoint("attention")
 
-        # --- attention output projection ---
-        total_flops += fold_matmul(self.head_dim * self.group_size, self.vector_length,
-                                   self.LAYER0_FLASH_OUTPUT_DRAM, self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT,
-                                   self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE,
-                                   gpr_dim_head_dim_group, gpr_dim_vector_length)
+        # ---- RENDEZVOUS B: the o-proj lanes read ALL heads' attention output
+        _barrier()
+
+        # --- attention output projection (N-lane of 1152) ---
+        _ob, _os = _if4_lane(self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT, self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE,
+                             self.head_dim * self.group_size, n0)
+        total_flops += fold_matmul(self.head_dim * self.group_size, nc,
+                                   self.LAYER0_FLASH_OUTPUT_DRAM, _ob,
+                                   self.LAYER0_ATTN_PROJ_OUTPUT_DRAM + n0 * bpe, _os,
+                                   gpr_dim_head_dim_group, gpr_dim_hid_lane)
+
+        # ---- RENDEZVOUS C: the post-attention norm reads the FULL o-proj row
+        _barrier()
+
+        # (REPLICATED when sharded, identical writes)
         total_flops += dec_rms(
             1, self.vector_length,
             self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, self.LAYER0_POST_ATTN_NORM_DRAM, self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA,
@@ -2090,14 +2429,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         )
 
         # --- post-attention residual (SRAM-staged; layer-invariant buffers, literal addrs) ---
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
-        self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
-        self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
-        if profile:
-            _checkpoint("o_proj_post_attn_norm_residual")
+        ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
+        ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
+        ue.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+        ue.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
+        _checkpoint("o_proj_post_attn_norm_residual")
 
-        # --- pre-FFN RMS norm ---
+        # --- pre-FFN RMS norm (REPLICATED) ---
         total_flops += dec_rms(
             1, self.vector_length,
             self.LAYER0_POST_ATTN_RESIDUAL_DRAM, self.LAYER0_PRE_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA,
@@ -2106,32 +2444,44 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             const_addr(self.LAYER0_PRE_MLP_NORM_DRAM, gpr_scratch_b),
             layer_addr(self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA, gpr_scratch_c),
         )
-        if profile:
-            _checkpoint("pre_ffn_norm")
+        _checkpoint("pre_ffn_norm")
 
-        # --- MLP gate (gelu) + up ---
-        total_flops += fold_matmul(self.vector_length, self.mlp_elements,
-                                   self.LAYER0_PRE_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT,
-                                   self.LAYER0_MLP_GATE_DRAM, self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE,
-                                   gpr_dim_vector_length, gpr_dim_mlp_elements, gelu=True)
-        total_flops += fold_matmul(self.vector_length, self.mlp_elements,
-                                   self.LAYER0_PRE_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_MLP_UP_QUANT,
-                                   self.LAYER0_MLP_UP_DRAM, self.DRAM_ADDR_LAYER0_MLP_UP_SCALE,
-                                   gpr_dim_vector_length, gpr_dim_mlp_elements)
+        # --- MLP gate (gelu) + up (N-lanes of 6912) ---
+        _gb, _gs = _if4_lane(self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT, self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE,
+                             self.vector_length, m0)
+        total_flops += fold_matmul(self.vector_length, mc,
+                                   self.LAYER0_PRE_MLP_NORM_DRAM, _gb,
+                                   self.LAYER0_MLP_GATE_DRAM + m0 * bpe, _gs,
+                                   gpr_dim_vector_length, gpr_dim_mlp_lane, gelu=True)
+        _ub, _us = _if4_lane(self.DRAM_ADDR_LAYER0_MLP_UP_QUANT, self.DRAM_ADDR_LAYER0_MLP_UP_SCALE,
+                             self.vector_length, m0)
+        total_flops += fold_matmul(self.vector_length, mc,
+                                   self.LAYER0_PRE_MLP_NORM_DRAM, _ub,
+                                   self.LAYER0_MLP_UP_DRAM + m0 * bpe, _us,
+                                   gpr_dim_vector_length, gpr_dim_mlp_lane)
 
-        # --- gate * up (SRAM-staged) ---
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
-        self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
-        self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
-        if profile:
-            _checkpoint("mlp_gateup_gelu_mul")
+        # --- gate * up (SRAM-staged; stays in this engine's lane) ---
+        ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM + m0 * bpe, sram_address=0x10000, element_size=mc)
+        ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM + m0 * bpe, sram_address=0x90000, element_size=mc)
+        ue.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=mc)
+        ue.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM + m0 * bpe, element_size=mc)
+        _checkpoint("mlp_gateup_gelu_mul")
 
-        # --- MLP down ---
-        total_flops += fold_matmul(self.mlp_elements, self.vector_length,
-                                   self.LAYER0_MLP_MULT_DRAM, self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT,
-                                   self.LAYER0_MLP_DOWN_DRAM, self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE,
-                                   gpr_dim_mlp_elements, gpr_dim_vector_length)
+        # ---- RENDEZVOUS D: the down lanes read the FULL mult row the lanes assembled in place
+        _barrier()
+
+        # --- MLP down (N-lane of 1152 over the full K=6912 mult row) ---
+        _db, _ds = _if4_lane(self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT, self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE,
+                             self.mlp_elements, n0)
+        total_flops += fold_matmul(self.mlp_elements, nc,
+                                   self.LAYER0_MLP_MULT_DRAM, _db,
+                                   self.LAYER0_MLP_DOWN_DRAM + n0 * bpe, _ds,
+                                   gpr_dim_mlp_elements, gpr_dim_hid_lane)
+
+        # ---- RENDEZVOUS E: the post-MLP norm reads the FULL down row
+        _barrier()
+
+        # (REPLICATED)
         total_flops += dec_rms(
             1, self.vector_length,
             self.LAYER0_MLP_DOWN_DRAM, self.LAYER0_POST_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA,
@@ -2141,87 +2491,97 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             layer_addr(self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA, gpr_scratch_c),
         )
 
-        # --- post-MLP residual (SRAM-staged) -> LAYER0_OUTPUT_DRAM ---
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_MLP_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
-        self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
-        self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
-        if profile:
-            _checkpoint("mlp_down_post_ffn_norm_residual")
+        # --- post-MLP residual (SRAM-staged) -> LAYER0_OUTPUT_DRAM (REPLICATED) ---
+        ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
+        ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_MLP_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
+        ue.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+        ue.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
+        _checkpoint("mlp_down_post_ffn_norm_residual")
 
         # --- end of body: copy OUTPUT -> INPUT for the next layer, advance running offsets ---
         # The unrolled decoder copies OUTPUT->INPUT at the *top* of every layer except layer 0;
         # doing it at the *bottom* here is equivalent (layer 0 reads the primed INPUT embedding,
         # every later layer reads the previous layer's OUTPUT) and needs no per-iteration special
         # case. OUTPUT still holds the final layer's result after the last iteration for the LM head.
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
-        self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=self.vector_length)
-        self.generate_instruction_add_imm(src_reg_idx=gpr_layer_off, immediate_value=ue_35bit_addr_shifter(LAYER_WEIGHT_SIZE), dst_reg_idx=gpr_layer_off)
-        self.generate_instruction_add_imm(src_reg_idx=gpr_kv_off, immediate_value=ue_35bit_addr_shifter(KV_CACHE_LAYER_STRIDE), dst_reg_idx=gpr_kv_off)
-        self.generate_instruction_add_dec(reg_idx=gpr_layer_cnt)
-        self.generate_instruction_jump_abs_jnz(layer_body_start_word_addr, gpr_layer_cnt)
+        # Sharded: replicated identical write; every reader of INPUT in this layer is behind
+        # rendezvous E, and the next layer's readers wrote it themselves first.
+        ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
+        ue.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=self.vector_length)
+        ue.generate_instruction_add_imm(src_reg_idx=gpr_layer_off, immediate_value=ue_35bit_addr_shifter(LAYER_WEIGHT_SIZE), dst_reg_idx=gpr_layer_off)
+        ue.generate_instruction_add_imm(src_reg_idx=gpr_kv_off, immediate_value=ue_35bit_addr_shifter(KV_CACHE_LAYER_STRIDE), dst_reg_idx=gpr_kv_off)
+        ue.generate_instruction_add_dec(reg_idx=gpr_layer_cnt)
+        ue.generate_instruction_jump_abs_jnz(layer_body_start_word_addr, gpr_layer_cnt)
 
         total_flops *= layer_size
 
-        self.release_isa_reg()  # gpr_layer_cnt
-        self.release_isa_reg()  # gpr_attn_scale
-        self.release_isa_reg()  # gpr_sqrt_head_dim
-        self.release_isa_reg()  # gpr_sqrt_vector_length
-        self.release_isa_reg()  # gpr_dim_mlp_elements
-        self.release_isa_reg()  # gpr_dim_head_dim_group
-        self.release_isa_reg()  # gpr_dim_head_dim
-        self.release_isa_reg()  # gpr_dim_vector_length
-        self.release_isa_reg()  # gpr_scratch_e
-        self.release_isa_reg()  # gpr_scratch_d
-        self.release_isa_reg()  # gpr_scratch_c
-        self.release_isa_reg()  # gpr_scratch_b
-        self.release_isa_reg()  # gpr_scratch_a
-        self.release_isa_reg()  # gpr_rope_base
-        self.release_isa_reg()  # gpr_rope_saved
-        self.release_isa_reg()  # gpr_rope_cycle
-        self.release_isa_reg()  # gpr_kv_off
-        self.release_isa_reg()  # gpr_layer_off
-        self.release_isa_reg()  # gpr_dim_group
-        self.release_isa_reg()  # gpr_one
+        ue.release_isa_reg()  # gpr_layer_cnt
+        if sharded:
+            ue.release_isa_reg()  # gpr_dim_mlp_lane
+            ue.release_isa_reg()  # gpr_dim_hid_lane
+            ue.release_isa_reg()  # gpr_dim_q_lane
+        ue.release_isa_reg()  # gpr_attn_scale
+        ue.release_isa_reg()  # gpr_sqrt_head_dim
+        ue.release_isa_reg()  # gpr_sqrt_vector_length
+        ue.release_isa_reg()  # gpr_dim_mlp_elements
+        ue.release_isa_reg()  # gpr_dim_head_dim_group
+        ue.release_isa_reg()  # gpr_dim_head_dim
+        ue.release_isa_reg()  # gpr_dim_vector_length
+        ue.release_isa_reg()  # gpr_scratch_e
+        ue.release_isa_reg()  # gpr_scratch_d
+        ue.release_isa_reg()  # gpr_scratch_c
+        ue.release_isa_reg()  # gpr_scratch_b
+        ue.release_isa_reg()  # gpr_scratch_a
+        ue.release_isa_reg()  # gpr_rope_base
+        ue.release_isa_reg()  # gpr_rope_saved
+        ue.release_isa_reg()  # gpr_rope_cycle
+        ue.release_isa_reg()  # gpr_kv_off
+        ue.release_isa_reg()  # gpr_layer_off
+        if sharded:
+            ue.release_isa_reg()  # gpr_dim_heads_lane
+        ue.release_isa_reg()  # gpr_dim_group
+        ue.release_isa_reg()  # gpr_one
 
         # --- once-per-token tail: final norm + LM head (layer-independent, literal addresses) ---
         if layer_size == self.LAYER_SIZE:
-            total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
+            # Final norm REPLICATED (every engine holds the full OUTPUT row).
+            total_flops += ue.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
             # LM head is a single large matmul with fixed addresses; keep it on the streaming/matmatmul
             # dispatch (quantized_matmat_core for the streaming variant) — no per-layer addressing needed.
             if self.matmatmul:
-                lm_one = self.alloc_isa_reg()
-                self.generate_instruction_add_set(lm_one, 1)
-                total_flops += self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+                assert not sharded
+                lm_one = ue.alloc_isa_reg()
+                ue.generate_instruction_add_set(lm_one, 1)
+                total_flops += ue.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                     gpr_M_reg=lm_one,
                     A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT,
                     OUTPUT_DRAM_ADDR=self.LOGITS_DRAM, is_B_quantized=True, data_type=TYPE.IF4,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, write_back_disable=True)
-                self.release_isa_reg()
+                ue.release_isa_reg()
             else:
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
-                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT,
-                    OUTPUT_DRAM_ADDR=self.LOGITS_DRAM, data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, write_back_disable=True)
+                # N-lane of the vocab (whole problem at ne == 1). The streaming GEMV clears the
+                # fmax/argmax tracker on its first chunk, so after it the engine's argmax
+                # register is this lane's local winner and fmax context 0 its max logit.
+                _lb, _ls = _if4_lane(self.DRAM_ADDR_LM_HEAD_QUANT, self.DRAM_ADDR_LM_HEAD_SCALE,
+                                     self.vector_length, l0)
+                total_flops += ue.quantized_matmat_core(M=1, K=self.vector_length, N=lc,
+                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=_lb,
+                    OUTPUT_DRAM_ADDR=self.LOGITS_DRAM + l0 * bpe, data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=_ls, write_back_disable=True)
+            if sharded:
+                # Export -(lane max): fmax_core = x - fmax over a zero vector (argmax_test shape).
+                cand_addr = self.LMHEAD_CAND_DRAM + engine_idx * UE_VECTOR_SIZE * bpe
+                ue.accelerator_memory_to_sram(accelerator_dram_address=self.ZERO_DRAM_ADDR,
+                                              sram_address=0x10000, element_size=UE_VECTOR_SIZE)
+                ue.fmax_core(vector_sram_start_addr=0x10000, output_sram_wb_addr=0x20000,
+                             N=UE_VECTOR_SIZE, fmax_context_addr=0)
+                ue.sram_to_accelerator_memory(sram_address=0x20000, accelerator_dram_address=cand_addr,
+                                              element_size=UE_VECTOR_SIZE)
 
         # Advance token position once per decode step (shared with the unrolled path's semantics).
-        self.generate_instruction_add_inc(self.gpr_seq_len)
-        self.generate_instruction_halt()
-
-        inst_count = self.capture_count - count_at_start
-        _SILENT_MODE = False
-        decoder_program_addr = self.get_program_dram_addr() + decoder_count_at_start * INSTRUCTION_SIZE_BYTES
-        program_size_bytes = inst_count * INSTRUCTION_SIZE_BYTES
-        print(
-            f"Decoder program compiled (FOLDED single-layer body, HW-looped {layer_size}x) at "
-            f"0x{decoder_program_addr:X}, size {program_size_bytes} bytes"
-        )
-        return {
-            "program_size_bytes": program_size_bytes,
-            "total_flops": total_flops,
-            "checkpoints": checkpoints,
-        }
+        ue.generate_instruction_add_inc(self.gpr_seq_len)
+        ue.generate_instruction_halt()
+        return total_flops
 
     def compile_gemma3(self, layer_size: int = 26, use_pbi: bool = False, slave_engine = None, profile: bool = False, bin_reuse: bool = False) -> None:
         """Compile a single prefill program (seq_len-agnostic) and one decoder program into a
@@ -2250,6 +2610,16 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
           - paths.instruction_meta : per-stage start addresses, sizes, FLOPs.
         """
         use_pbi = not self.legacy
+        ne = int(self.DECODE_NUM_ENGINES)
+        if ne > 1:
+            assert not self.legacy and not profile, (
+                "sharded decode (--engines > 1) supports only the default folded decoder, no --legacy / --profile")
+            self._prepare_decode_sharding()   # workers + scratch + LM-head slots, before capture opens
+            if bin_reuse:
+                print("--bin-reuse ignored: sharded decode writes the worker programs at compile time")
+                bin_reuse = False
+        else:
+            self._decode_sched = None
         if self.legacy:
             # Static: prefill seq_len is baked in at compile time, so the binary is prompt-specific.
             assert self.prefill_seq is not None, "--legacy requires set_prefill_seq() before compile_gemma3()"
@@ -2267,12 +2637,12 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         elif self.matmatmul or self.two_pass_prefill:
             prefill_seq_len = UE_VECTOR_SIZE
             mode_tag = ("_matmatmul" if self.matmatmul else "") + ("_prefill_twopass" if self.two_pass_prefill else "")
-            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mode_tag}_program.bin")
-            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mode_tag}_program.json")
+            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mode_tag}{self._engine_tag()}_program.bin")
+            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mode_tag}{self._engine_tag()}_program.json")
         else:
             prefill_seq_len = UE_VECTOR_SIZE
-            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_bin/gemma3_program.bin")
-            instruction_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_program.json")
+            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3{self._engine_tag()}_program.bin")
+            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{self._engine_tag()}_program.json")
         print(f"Decode kernel: {'matmat_mul_core (two-pass)' if self.matmatmul else 'quantized_matmat_core (streaming)'}")
         print(f"Prefill kernel: {'two-pass (matmat_mul_core)' if self.two_pass_prefill else 'streaming (quantized_matmat_core)'}")
         if bin_reuse and os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
@@ -2342,6 +2712,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "decoder_program_start_addr": f"0x{decoder_program_addr:X}",
             "decoder_program_size": decoder_program["program_size_bytes"],
             "decoder_total_flops": decoder_program["total_flops"],
+            "decode_engines": ne,
+            "decoder_worker_program_addrs": [f"0x{a:X}" for a in getattr(self, "_decode_worker_prog_addrs", [])] if ne > 1 else [],
+            "decoder_worker_preamble_addrs": [f"0x{a:X}" for a in getattr(self, "_decode_worker_preamble_addrs", [])] if ne > 1 else [],
+            "decoder_worker_program_sizes": decoder_program.get("worker_program_sizes", []),
         }
         if profile:
             # Both prefill and decoder are FOLDED (one body hardware-looped `layer_size`×), so each
@@ -2546,9 +2920,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.json")
         elif self.matmatmul or self.two_pass_prefill:
             mode_tag = ("_matmatmul" if self.matmatmul else "") + ("_prefill_twopass" if self.two_pass_prefill else "")
-            meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mode_tag}_program.json")
+            meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mode_tag}{self._engine_tag()}_program.json")
         else:
-            meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_program.json")
+            meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{self._engine_tag()}_program.json")
         with open(meta_path, "r") as f:
             meta = json.load(f)
         self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
@@ -2740,6 +3114,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             sys.stdout.write("\033[r")                # reset scroll region
             sys.stdout.write(f"\033[{rows};1H\033[2K") # clear the status row
             sys.stdout.flush()
+        # Sharded decode: workers HALT after every step and are relaunched via
+        # per-step preambles priming the SAME fixed GPRs as the primary's stub.
+        dec_sched = getattr(self, "_decode_sched", None)
+        dec_multi = dec_sched is not None and dec_sched.num_engines > 1
+        lm_lanes = None
+        if dec_multi:
+            self._preclear_shard_flags(dec_sched)
+            lm_lanes = self._col_split(self.EMBEDDING_ELEMENTS, dec_sched.num_engines)
         if _use_status:
             _status_setup()
 
@@ -2765,6 +3147,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
             self.clear_inst_id()
             self.start_capture()
+            if dec_multi:
+                # Workers never ran the prefill preamble: prime the token position on
+                # EVERY engine (equals what the primary's own add_inc produced).
+                self.generate_instruction_add_set(self.gpr_seq_len, self.seq_len - 1)
             self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len_q)
             self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
             self.stop_capture()
@@ -2780,7 +3166,23 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.write_captured_instructions_to_dram(preamble_addr)
             self.clear_capture_buffer()
 
+            if dec_multi:
+                for wi, w in enumerate(dec_sched.workers):
+                    w.clear_inst_id()
+                    w.start_capture()
+                    w.generate_instruction_add_set(self.gpr_seq_len, self.seq_len - 1)
+                    w.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len_q)
+                    w.generate_instruction_jump_abs(ue_35bit_addr_shifter(self._decode_worker_prog_addrs[wi]))
+                    w.stop_capture()
+                    w.write_captured_instructions_to_dram(self._decode_worker_preamble_addrs[wi])
+                    w.clear_capture_buffer()
+                dec_sched.start_workers(self._decode_worker_preamble_addrs)
+
             latency, flop_rate_program = self.program_execute(preamble_addr, flops=flops_hw)
+            if dec_multi:
+                # Workers only drain their halt after the LM-head tail; the relaunch
+                # above would race a still-busy queue without this.
+                self._join_workers(dec_sched, timeout_s=10.0)
             hw_decode_lats_us.append(latency)
             total_latency += latency
             total_flop_rate += flop_rate_program
@@ -2804,7 +3206,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 snr_v_new = calculate_snr(ref_v_new, hw_v_new)
                 _original_print(f"[Numeric/Decoder step 1 KV]  K SNR={snr_k_new:.2f} dB  V SNR={snr_v_new:.2f} dB")
 
-            token_id = self.get_arg_max_index()
+            token_id = (self._select_token_sharded(dec_sched, lm_lanes) if dec_multi
+                        else self.get_arg_max_index())
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
             if token_id in [1, self._end_of_turn_token_id]:
@@ -2851,6 +3254,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         avg_tokens_per_s = tokens_decoded / latency_decoder if latency_decoder > 0 else 0.0
         return {
             "prefill_tokens": prefill_seq_len,
+            "decode_engines": dec_sched.num_engines if dec_multi else 1,
             "total_tokens": self.seq_len,
             "decoded_text": decoded_text,
             "decoded_tokens": tokens_decoded,
@@ -3035,6 +3439,10 @@ def main():
         action="store_true",
         help="Dual-engine path (compile-time sharding hooks exist; PBI + dual not verified end-to-end—CLI still rejects).",
     )
+    parser.add_argument('--engines', type=int, default=1,
+                        help='Decode engines (1..8). >1 shards the folded decoder over N cores: N-lane '
+                             'projections/MLP/LM head, head-split attention, 5 rendezvous per layer. '
+                             'Prefill stays on engine 0. Use 1, 2, 4 or 8.')
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--profile', action='store_true',
@@ -3080,8 +3488,12 @@ def main():
         "Dual-engine Gemma3 PBI is not verified end-to-end yet; compile preserves sharding hooks for "
         "future work. Re-run without --dual-engine until validation lands."
     )
+    if args.engines > 1:
+        assert not args.profile and not args.legacy and not args.matmatmul, (
+            "--engines > 1 needs the default folded streaming decoder (no --profile/--legacy/--two-pass-decoder)")
     ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=dual_engine, legacy=args.legacy,
-                              matmatmul=args.matmatmul, two_pass_prefill=args.two_pass_prefill)
+                              matmatmul=args.matmatmul, two_pass_prefill=args.two_pass_prefill,
+                              decode_engines=args.engines)
     ue.set_prefill_seq(args.prompt)
 
     if dual_engine:
@@ -3113,7 +3525,7 @@ def main():
     _summary_path = os.path.join(SCRIPT_DIR, gemma3_run_summary_filename(args))
     try:
         ue.write_run_summary(_summary_path, args, run_result,
-                             cores=2 if dual_engine else 1)
+                             cores=max(args.engines, 2 if dual_engine else 1))
         print(f"Wrote run summary: {_summary_path}")
     except Exception as _e:
         print(f"[warn] failed to write run summary: {_e}")

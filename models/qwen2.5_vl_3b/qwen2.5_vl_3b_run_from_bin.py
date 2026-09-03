@@ -347,9 +347,11 @@ _TOP_MAP = {
         'merger.mlp.2.bias': 'v.merger_mlp2.bias',
     },
 }
-# LM-side quant scope: q/k/gate/up/down (v_proj and o_proj stay BF16 for
-# attention accuracy). Same set for every supported precision.
-_LM_QUANT_LAYERS = {'q_proj.weight', 'k_proj.weight',
+# LM-side quant scope: q/k/o/gate/up/down. v_proj stays BF16 (it feeds the
+# attention matmul directly). o_proj was BF16 until 2026-09-03: decode on this
+# board is DRAM-bandwidth bound and the BF16 o_proj was ~16% of the bytes
+# streamed per token (8 MB/layer vs 2 MB in IF4). Same set for every precision.
+_LM_QUANT_LAYERS = {'q_proj.weight', 'k_proj.weight', 'o_proj.weight',
                     'gate_proj.weight', 'up_proj.weight', 'down_proj.weight'}
 
 _VALID_PRECISIONS = ('int4', 'fp4', 'if4')
@@ -1302,11 +1304,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             model_dir, trust_remote_code=True, local_files_only=True)
 
         # Per-layer weights — config-driven precision (precision.lm) for
-        # Q/K/gate/up/down, BF16 for V/O (all from binary). Default 'if4'
+        # Q/K/O/gate/up/down, BF16 for V (all from binary). Default 'if4'
         # picks INT4 vs FP4 per 64-block by min weight-MSE; near-lossless
         # vs BF16 on this LM (PPL +0.9% on WikiText-2 vs +7.9% for pure FP4
         # and +17% for pure INT4 — see src/models/qwen2.5_VL_3b/compare/summary.md).
-        # V/O stored as BF16 in binary for better attention accuracy.
+        # V stored as BF16 in binary (attention-side matmul operand).
         lm_prec = _lm_precision(self._cfg)
         print(f"  Loading {self.LAYER_SIZE} LM layers to FPGA DRAM ({lm_prec})...", flush=True)
         self.lm_layer_addrs = []
@@ -1320,9 +1322,24 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                                   ('gate', 'mlp.gate_proj'), ('up', 'mlp.up_proj'),
                                   ('down', 'mlp.down_proj')]:
                 la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.{hf_sub}.weight.{lm_prec}'])
-            # V and O as BF16 from binary
+            # V as BF16 from binary (feeds the attention matmul directly)
             la['v_weight'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.self_attn.v_proj.weight'].copy()).view(torch.bfloat16))
-            la['o_weight'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.self_attn.o_proj.weight'].copy()).view(torch.bfloat16))
+            # O: precision.lm-quantized. Newer bins carry it pre-quantized; a bin
+            # generated before o_proj joined _LM_QUANT_LAYERS only has the BF16
+            # tensor, so quantize it on the host at load (~2 s for all layers,
+            # byte-identical to what the generator writes). Same DRAM footprint
+            # either way, so programs.bin addresses do not depend on the path.
+            o_key = f'{prefix}.self_attn.o_proj.weight.{lm_prec}'
+            if o_key in lm_cache:
+                o_raw = lm_cache[o_key]
+            else:
+                if i == 0:
+                    print(f"    [o_proj] params.bin predates IF4 o_proj -- quantizing on the host "
+                          f"({lm_prec}); delete params.bin to regenerate with it pre-quantized")
+                o_bf16 = (torch.from_numpy(lm_cache[f'{prefix}.self_attn.o_proj.weight'].copy())
+                          .view(torch.bfloat16).view(self.vector_length, self.head_dim * self.group_size))
+                o_raw, _ = _qs_pack(lm_prec, o_bf16)
+            la['o_scale'], la['o_data'] = store_quantized_weight(self, o_raw)
             # Biases from binary
             for proj, hf_sub in [('q', 'self_attn.q_proj'), ('k', 'self_attn.k_proj'),
                                   ('v', 'self_attn.v_proj')]:
@@ -2313,7 +2330,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         Qwen2.5-VL specifics vs Dave's qwen3:
           - Q/K/V have biases (C_DRAM_ADDR=la['*_bias']).
           - NO QK RMSNorm — rope reads from K_DRAM/Q_DRAM directly.
-          - o_proj has no quantization.
+          - o_proj is IF4 (no bias); v_proj stays BF16.
           - mRoPE table is pre-baked at DRAM_ADDR_ROPE in per-token rows
             (cos[ahd] || sin[ahd]) so sequential reads work.
         """
@@ -2455,9 +2472,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     template_seq_len=seq_len,
                 )
 
-            # o_proj (no quantization params for qwen2.5_vl)
-            total_flops += (self.matmat_mul_core(M=seq_len, K=hd * qpkv, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+            # o_proj (IF4, no bias)
+            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=hd * qpkv, N=self.vector_length,
+                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_data'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                SCALE_DRAM_ADDR=la['o_scale'], data_type=TYPE.IF4,
                 gpr_M_reg=self.gf_seq_len) or 0)
 
             # Post-attn residual: layer_input + o_proj. PBI runtime loop.
@@ -2836,10 +2854,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe,
                     qpkv * ahd)
 
-            # o_proj (BF16)
-            total_flops += (self.matmat_mul_core(M=1, K=hd * qpkv, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                gpr_M_reg=gf_one) or 0)
+            # o_proj (IF4, no bias; 1-pass streaming GEMV as q_proj)
+            total_flops += (self.quantized_matmat_core(M=1, K=hd * qpkv, N=self.vector_length,
+                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_data'],
+                OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                SCALE_DRAM_ADDR=la['o_scale'], data_type=TYPE.IF4) or 0)
 
             # Qwen2.5-VL: no post-attention norm; residual direct on o_proj output
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)

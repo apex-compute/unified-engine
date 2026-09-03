@@ -348,9 +348,11 @@ _TOP_MAP = {
         'merger.mlp.2.bias': 'v.merger_mlp2.bias',
     },
 }
-# LM-side quant scope: q/k/gate/up/down (v_proj and o_proj stay BF16 for
-# attention accuracy). Same set for every supported precision.
-_LM_QUANT_LAYERS = {'q_proj.weight', 'k_proj.weight',
+# LM-side quant scope: q/k/o/gate/up/down. v_proj stays BF16 (it feeds the
+# attention matmul directly). o_proj was BF16 until 2026-09-03: decode on this
+# board is DRAM-bandwidth bound and the BF16 o_proj was ~16% of the bytes
+# streamed per token (8 MB/layer vs 2 MB in IF4). Same set for every precision.
+_LM_QUANT_LAYERS = {'q_proj.weight', 'k_proj.weight', 'o_proj.weight',
                     'gate_proj.weight', 'up_proj.weight', 'down_proj.weight'}
 
 _VALID_PRECISIONS = ('int4', 'fp4', 'if4')
@@ -1396,11 +1398,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
 
         # Per-layer weights — config-driven precision (precision.lm) for
-        # Q/K/gate/up/down, BF16 for V/O (all from binary). Default 'if4'
+        # Q/K/O/gate/up/down, BF16 for V (all from binary). Default 'if4'
         # picks INT4 vs FP4 per 64-block by min weight-MSE; near-lossless
         # vs BF16 on this LM (PPL +0.9% on WikiText-2 vs +7.9% for pure FP4
         # and +17% for pure INT4 — see src/models/qwen2.5_VL_3b/compare/summary.md).
-        # V/O stored as BF16 in binary for better attention accuracy.
+        # V stored as BF16 in binary (attention-side matmul operand).
         lm_prec = _lm_precision(self._cfg)
         print(f"  Loading {self.LAYER_SIZE} LM layers to FPGA DRAM ({lm_prec})...", flush=True)
         self.lm_layer_addrs = []
@@ -1414,9 +1416,24 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                                   ('gate', 'mlp.gate_proj'), ('up', 'mlp.up_proj'),
                                   ('down', 'mlp.down_proj')]:
                 la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.{hf_sub}.weight.{lm_prec}'])
-            # V and O as BF16 from binary
+            # V as BF16 from binary (feeds the attention matmul directly)
             la['v_weight'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.self_attn.v_proj.weight'].copy()).view(torch.bfloat16))
-            la['o_weight'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.self_attn.o_proj.weight'].copy()).view(torch.bfloat16))
+            # O: precision.lm-quantized. Newer bins carry it pre-quantized; a bin
+            # generated before o_proj joined _LM_QUANT_LAYERS only has the BF16
+            # tensor, so quantize it on the host at load (~2 s for all layers,
+            # byte-identical to what the generator writes). Same DRAM footprint
+            # either way, so programs.bin addresses do not depend on the path.
+            o_key = f'{prefix}.self_attn.o_proj.weight.{lm_prec}'
+            if o_key in lm_cache:
+                o_raw = lm_cache[o_key]
+            else:
+                if i == 0:
+                    print(f"    [o_proj] params.bin predates IF4 o_proj -- quantizing on the host "
+                          f"({lm_prec}); delete params.bin to regenerate with it pre-quantized")
+                o_bf16 = (torch.from_numpy(lm_cache[f'{prefix}.self_attn.o_proj.weight'].copy())
+                          .view(torch.bfloat16).view(self.vector_length, self.head_dim * self.group_size))
+                o_raw, _ = _qs_pack(lm_prec, o_bf16)
+            la['o_scale'], la['o_data'] = store_quantized_weight(self, o_raw)
             # Biases from binary
             for proj, hf_sub in [('q', 'self_attn.q_proj'), ('k', 'self_attn.k_proj'),
                                   ('v', 'self_attn.v_proj')]:
@@ -1841,7 +1858,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                        "SH_ADDR_A", "SH_ADDR_B", "SH_ADDR_C")
     # Bump when EMISSION changes so stale programs.bin caches rebuild instead
     # of silently running old streams (rev 2: zero-copy decode attention).
-    PROGRAMS_BIN_REV = 3
+    PROGRAMS_BIN_REV = 4   # 4: o_proj IF4 (was BF16)
 
     @staticmethod
     def _capture_bytes(ue) -> bytes:
@@ -3169,9 +3186,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     total_flops += _emit_attn_stage(kv_h)
                 self._shard_barrier(ue, engine_idx, ne)
 
-            # o_proj (no quantization params for qwen2.5_vl)
-            total_flops += (ue.matmat_mul_core(M=seq_len, K=hd * qpkv, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+            # o_proj (IF4, no bias)
+            total_flops += (ue.matmat_mul_core(is_B_quantized=True, M=seq_len, K=hd * qpkv, N=self.vector_length,
+                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_data'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                SCALE_DRAM_ADDR=la['o_scale'], data_type=TYPE.IF4,
                 gpr_M_reg=self.gf_seq_len,
                 gpr_a_addr=sh.addr(0, self.LAYER0_FLASH_OUTPUT_DRAM, sh.OFF_HID),
                 gpr_out_addr=sh.addr(1, self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sh.OFF_HID)) or 0)
@@ -3442,7 +3460,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
           Q RoPE              per-engine over its own q heads (in place)
           attention           HEAD-split: 16/ne q heads over ONE KV group per
                               engine, K/V read from the cache in place
-          o proj              N-split (bf16 row-block slices)
+          o proj              N-split (IF4 lanes, as q proj)
           gate/up/mult        N-split lanes of 11008, mult stays in lane
           down proj           N-split of 2048 reading the FULL mult row (the
                               lanes assembled it in place -- no K-split needed)
@@ -3679,12 +3697,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                 # ---- RENDEZVOUS B: the o-proj lanes read ALL heads' output
                 self._shard_barrier(ue, engine_idx, ne)
 
-            # o_proj (BF16, N-lane: row block of the N x K weight at n0*K)
-            total_flops += (ue.matmat_mul_core(M=1, K=hd * qpkv, N=nc,
-                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-                B_DRAM_ADDR=la['o_weight'] + n0 * (hd * qpkv) * bpe,
+            # o_proj (IF4, no bias; N-lane via the four per-column offsets). K=2048
+            # < SCALE_BRAM_ELEMENTS, so the 1-pass streaming GEMV applies (as q_proj).
+            _ob, _os = _if4_lane(la['o_data'], la['o_scale'], hd * qpkv, n0)
+            total_flops += (ue.quantized_matmat_core(M=1, K=hd * qpkv, N=nc,
+                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=_ob,
                 OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM + n0 * bpe,
-                gpr_M_reg=gf_one) or 0)
+                SCALE_DRAM_ADDR=_os, data_type=TYPE.IF4) or 0)
             # ---- RENDEZVOUS C: the residual reads the FULL o-proj row
             self._shard_barrier(ue, engine_idx, ne)
 

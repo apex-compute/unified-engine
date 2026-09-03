@@ -16,7 +16,7 @@ and text-only prompts.
 
 - **LM:** 36 layers, hidden 2048, GQA 16 Q / 2 KV heads (group 8), head_dim 128,
   SwiGLU (intermediate 11008), Q/K/V bias, no QK-norm, mRoPE `[16,24,24]`,
-  tied LM head, vocab 151936. IF4 weights (V/O kept BF16).
+  tied LM head, vocab 151936. IF4 weights (V kept BF16; o_proj IF4 since 2026-09-03).
 - **Vision encoder:** 32 layers, hidden 1280, 16 heads, head_dim 80 (padded to
   128 on-chip), SwiGLU (intermediate 3420), RMSNorm, window attention
   (112-px windows) with full attention at layers 7/15/23/31; 2×2 patch merger
