@@ -308,11 +308,24 @@ _VARIANTS = {
     # NATIVE_QUICK_GELU -- the FPGA's quick_gelu substitutes for the trained
     # gelu_pytorch_tanh here rather than matching it.
     "smolvla_lid": "verapulse_smolvla_lid_config.json",
+    # smolvla_lid_pickup_all ckpt 004000, copied 2026-09-03: the same stock-gelu lane
+    # as smolvla_lid, on a later/larger run -- the name says tanh so the lane is
+    # legible at the call site. Its train_config.json is the evidence: output_dir is
+    # outputs/smolvla_lid_pickup_all, NOT the ..._quickgelu sibling Omer also shipped.
+    # Deliberately NOT in NATIVE_QUICK_GELU. The quickgelu run of the SAME dataset is a
+    # separate checkpoint and wants its own variant.
+    "smolvla_sept3_tanh": "verapulse_smolvla_sept3_tanh_config.json",
+    # The quickgelu sibling of the run above -- same dataset and ckpt index, expert
+    # trained against a quick_gelu backbone, so the silicon is EXACT on the vision
+    # activation and --hw-gelu is the honest oracle. IN NATIVE_QUICK_GELU. The two are
+    # distinguishable ONLY by train_config.json's output_dir/job_name; every tensor
+    # shape and vlm_model_name match.
+    "smolvla_sept3_qg": "verapulse_smolvla_sept3_qg_config.json",
 }
 
 # Variants whose weights were TRAINED in the accelerator's activation, so quick_gelu is
 # the published model rather than a substitution to cancel out.
-NATIVE_QUICK_GELU = {"smolvla_qg"}
+NATIVE_QUICK_GELU = {"smolvla_qg", "smolvla_sept3_qg"}
 
 
 def _select_variant():
@@ -5547,11 +5560,31 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                             la["down_weight_k"][i],
                             sched.per_engine_addr("ae_mlp_down_partial", i), m_reg=mreg)
 
-        # join=False TWICE. col_sharded_region's exit barrier is redundant because
-        # reduce_add opens with its own rendezvous and the partials are meaningless until
-        # it runs; reduce_add's exit barrier is redundant because the only thing a worker
-        # can do afterwards is block on the NEXT region's opening rendezvous. Over 32
-        # layers x 10 Euler steps that is 320 barriers saved instead of 960.
+        # join=False ONCE, NOT TWICE. col_sharded_region's exit barrier is genuinely
+        # redundant: reduce_add opens with its own rendezvous and the partials are
+        # meaningless until it runs, so that one stays elided.
+        #
+        # reduce_add's EXIT barrier is NOT redundant, and eliding it was a real race.
+        # The old reasoning here was "the only thing a worker can do afterwards is block
+        # on the NEXT region's opening rendezvous" -- but the next thing is _ae_row_add,
+        # which deliberately opens with NO rendezvous (see its "ROW-SPLIT. NO NEW
+        # BARRIER" note, which in turn justifies itself by assuming the reduction
+        # "FORCES its join barrier"). Each comment assumed the other provided the fence
+        # and neither did.
+        #
+        # reduce_add runs its (ne-1) adds ON THE PRIMARY with the workers IDLE. Without
+        # the exit barrier the workers fall straight into _ae_row_add and read
+        # AE_MLP_DOWN_DRAM[S_e] WHILE the primary is still writing it. Measured on the
+        # smolvla_sept3_qg checkpoint at ne=8: engine 0's rows (0-7 of 64) matched the
+        # oracle exactly while every worker's block was wrong, with the error growing
+        # toward the high rows -- i.e. toward the part of the [64, HP] block the primary
+        # writes last. Integrated over 10 Euler steps that became actions ~4x too large
+        # (cos 0.652 vs oracle, absmax 5.75 where the model wants 1.01). ne=1 has no
+        # reduction at all, which is why it gated clean at 46.1 dB.
+        #
+        # Cost: one rendezvous per expert layer per Euler step. Do not re-elide this to
+        # buy it back -- if the barrier count matters, give _ae_row_add its own opening
+        # rendezvous instead, but exactly one of the two must exist.
         sched.col_sharded_region(I, _body, join=False)
         # partial[0] IS AE_MLP_DOWN_DRAM (register_per_engine keeps the primary on its
         # existing model address), so the add chain accumulates IN PLACE: dram_a ==
@@ -5568,7 +5601,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # op counts.
         sched.reduce_add([sched.per_engine_addr("ae_mlp_down_partial", i)
                           for i in range(ne)],
-                         self.AE_MLP_DOWN_DRAM, M, HP, join=False)
+                         self.AE_MLP_DOWN_DRAM, M, HP, join=True)
 
     def _ae_group_map(self, ne):
         """kv_b -> engine index. THE ONE SOURCE for every per-kv-head split in a self

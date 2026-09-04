@@ -71,7 +71,15 @@ import threading
 # Every dim on VeraPulse_UnifiedEngine (V_SLOTS, E_HIDDEN, NUM_LAYERS, ...) is a CLASS
 # attribute read from the config when the class STATEMENT executes, so setting this after
 # the import would change nothing while appearing to work.
-os.environ.setdefault("VERAPULSE_VARIANT", "smolvla")
+#
+# setdefault, not assignment: VERAPULSE_VARIANT in the environment still wins, so the
+# other lanes stay one env var away. The default is smolvla_sept3_tanh
+# (smolvla_lid_pickup_all ckpt 004000) -- the checkpoint actually present on this
+# machine. It is NOT in NATIVE_QUICK_GELU, so its oracle defaults to the honest
+# gelu_pytorch_tanh the weights were trained under. Omer also shipped a
+# ..._quickgelu sibling of the same run; that is a DIFFERENT checkpoint and gets its
+# own variant when copied -- do not point this one at it.
+os.environ.setdefault("VERAPULSE_VARIANT", "smolvla_sept3_tanh")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(os.path.dirname(_HERE))
@@ -316,6 +324,13 @@ def main():
     ap.add_argument("--engines", default="8", metavar="N|max")
     ap.add_argument("--vis-engines", type=int, default=None)
     ap.add_argument("--prefix-engines", type=int, default=None)
+    # Back to None (follow --engines) now that the reduce_add exit barrier is restored
+    # in _compile_denoise_sharded. That race made every WORKER engine's row block wrong
+    # while the primary's rows 0-7 stayed correct, integrating over the 10 Euler steps
+    # into actions ~4x too large; the pin to 1 engine here was the workaround. Measured
+    # after the fix at ne=8: actions 46.17 dB / cos 0.999988, absmax 1.0078 vs the
+    # oracle's 1.0073, and the barrier cost ~10 ms of a 2.86 s forward pass. ne=1 is
+    # still a valid reference but is ~2x slower end to end (5.93 s).
     ap.add_argument("--denoise-engines", type=int, default=None)
     args = ap.parse_args()
 
