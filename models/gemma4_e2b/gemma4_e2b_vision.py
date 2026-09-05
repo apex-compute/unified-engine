@@ -55,8 +55,7 @@ class Gemma4VisionMixin:
 
     def _ensure_vision_gate_scheduler(self):
         """Return the shared multicore configuration for the vision stage."""
-        return self._ensure_stage_scheduler(
-            "vision", self.VISION_WORKER_ISA_BASE)
+        return self._ensure_stage_scheduler("vision")
 
 
     # ------------------------------------------------------------------
@@ -283,16 +282,18 @@ class Gemma4VisionMixin:
         attn_scratch_bytes = (aligned_S * aligned_S + 2 * HD * aligned_S) * 2
         self.VIS_FLASH_SCRATCH = self.allocate_tensor_dram(attn_scratch_bytes)
         # Head-sharded attention needs one private scratch region per engine.
-        # Keep the primary copy dedicated. Worker copies are assigned after all
-        # tensor allocations, by aliasing output-only regions that are dead
-        # during attention and fully overwritten before their later reads.
+        # Core 0 keeps this dedicated tensor-arena copy. Worker copies are
+        # assigned below from each engine's private window in the low 2 GB (they
+        # are no longer aliased onto tensor regions that are "dead" during
+        # attention).
         self.VIS_FLASH_SCRATCH_PER_ENGINE = [self.VIS_FLASH_SCRATCH]
         # Unused by unified_attention_core but kept to keep the allocation order
         # (and every baked address after it) stable.
         attn_p_bytes = aligned_S * aligned_S * bpe
         self.VIS_ATTN_P = self.allocate_tensor_dram(attn_p_bytes)
-        # Make VIS_ATTN_P itself a full-size alias candidate without spilling
-        # into the identity matrix that follows it.
+        # Vestigial: this padding existed only to make VIS_ATTN_P a full-size
+        # alias candidate. The aliasing is gone, but the allocation stays so the
+        # arena layout (and every address after it) is unchanged.
         self._vis_attn_p_alias_pad = self.allocate_tensor_dram(
             attn_scratch_bytes - attn_p_bytes)
 
@@ -437,44 +438,24 @@ class Gemma4VisionMixin:
                         Pm[cell, base + ky * Wg + kx] = 1.0
         self._vis_pending_dmas.append((self.VIS_POOL_P, Pm))
 
-        # Worker attention scratch aliases. Every region below is dead while
-        # attention runs and is completely produced again before consumption:
-        # post-attention/MLP intermediates, the QKV/MLP clip workspaces, the
-        # unused VIS_ATTN_P buffer plus explicit pad, and embed-pool outputs.
-        # Carve fixed-size, non-overlapping blocks and use only as many as the
-        # selected engine count needs. If the dead-region aliases do not cover
-        # every worker, use the remaining space in the 1-GiB tensor arena for
-        # dedicated scratch; the tensor-vs-weight guard below remains final.
-        alias_regions = [
-            (self.VIS_POST_ATTN_NORM,
-             self.VIS_POST_FFN_NORM + S * H * bpe,
-             "post_attn_mlp"),
-            (self.VIS_INPUT_CLIP_H_SCRATCH,
-             self.VIS_INPUT_CLIP_MLP_SCRATCH + S * MLP * bpe,
-             "clip_workspaces"),
-            (self.VIS_ATTN_P,
-             self._vis_attn_p_alias_pad + (attn_scratch_bytes - attn_p_bytes),
-             "unused_attn_p"),
-            (self.VIS_EMBED_POOL,
-             self.VIS_EMBED_OUT + S * text_h * bpe,
-             "embed_outputs"),
-        ]
-        alias_candidates = []
-        for region_start, region_end, region_name in alias_regions:
-            addr = self._align_up(region_start, 64)
-            while addr + attn_scratch_bytes <= region_end:
-                alias_candidates.append((addr, region_name))
-                addr = self._align_up(addr + attn_scratch_bytes, 64)
-        workers_needed = self.multi_core - 1
-        dedicated_needed = max(0, workers_needed - len(alias_candidates))
-        for _ in range(dedicated_needed):
-            alias_candidates.append((
-                self.allocate_tensor_dram(attn_scratch_bytes),
-                "dedicated_tensor_arena",
-            ))
-        chosen_aliases = alias_candidates[:workers_needed]
-        self.VIS_FLASH_SCRATCH_PER_ENGINE.extend(
-            addr for addr, _ in chosen_aliases)
+        # Worker attention scratch: allocated from each engine's PRIVATE TENSOR
+        # window in self.mc_arena (low 2 GB). This replaces the old scheme,
+        # which aliased worker scratch onto tensor regions judged "dead during
+        # attention" (post-attn/MLP intermediates, clip workspaces, the unused
+        # VIS_ATTN_P, embed-pool outputs) and fell back to carving the tensor
+        # arena when the aliases ran out. Those aliases put per-engine scratch
+        # inside regions the model also owns, which is how vision scratch once
+        # reached the vision weights. A private window cannot alias the model
+        # map at all, and the arena's own bump cursor -- shared with prefill's
+        # scratch and with every stage's worker ISA -- is what keeps the two
+        # stages from handing out the same address twice.
+        # Window 0 belongs to core 0, which keeps its dedicated tensor-arena
+        # buffer above, so its window allocation is skipped and engine index
+        # still maps straight to window index.
+        if self.multi_core > 1:
+            self.VIS_FLASH_SCRATCH_PER_ENGINE.extend(
+                self.mc_arena.alloc_tensor(e, attn_scratch_bytes, "vision attn scratch")
+                for e in range(1, self.multi_core))
         self.VIS_FLASH_SCRATCH_WORKER = (
             self.VIS_FLASH_SCRATCH_PER_ENGINE[1]
             if self.multi_core > 1 else None)
@@ -482,10 +463,17 @@ class Gemma4VisionMixin:
             (addr, addr + attn_scratch_bytes)
             for addr in self.VIS_FLASH_SCRATCH_PER_ENGINE)
         for (_, prev_end), (next_start, _) in zip(scratch_ranges, scratch_ranges[1:]):
-            assert prev_end <= next_start, "per-engine attention scratch aliases overlap"
-        print(f"  Vision attention scratch: {self.multi_core} private buffer(s); "
-              f"{workers_needed} worker alias(es): "
-              f"{[name for _, name in chosen_aliases]}")
+            assert prev_end <= next_start, "per-engine attention scratch slots overlap"
+        if self.multi_core > 1:
+            print(f"  Vision attention scratch: {self.multi_core} private buffer(s), "
+                  f"{attn_scratch_bytes / (1024*1024):.2f} MiB each; core0 "
+                  f"@0x{self.VIS_FLASH_SCRATCH:X} (tensor arena), workers in "
+                  f"private windows "
+                  f"{', '.join(f'0x{a:X}' for a in self.VIS_FLASH_SCRATCH_PER_ENGINE[1:])}")
+        else:
+            print(f"  Vision attention scratch: single buffer "
+                  f"@0x{self.VIS_FLASH_SCRATCH:X} "
+                  f"({attn_scratch_bytes / (1024*1024):.2f} MiB)")
 
         # Scratch must stay below the vision WEIGHTS (placed at the top of the
         # tensor arena by vision_weight_init). The old guard used the ISA base and
@@ -894,12 +882,11 @@ class Gemma4VisionMixin:
                 worker_bytes = bytearray()
                 for inst in worker.capture_buffer:
                     worker_bytes.extend(inst.get_bytes())
-                worker_limit = (worker_addr + self.MULTICORE_WORKER_ISA_STRIDE
-                                if self.multi_core > 2 else self.LM_ISA_BASE)
-                if worker_addr + len(worker_bytes) > worker_limit:
-                    raise RuntimeError(
-                        f"vision core{engine_idx} ISA overflow: "
-                        f"0x{worker_addr + len(worker_bytes):X} > 0x{worker_limit:X}")
+                # The arena owns the bound: this engine's ISA slice, whose
+                # neighbour above is its own tensor scratch and then the next
+                # engine's window. An overrun would not fault, so it is checked
+                # where the image is written.
+                self.mc_arena.check_isa_fits(engine_idx, worker_addr, len(worker_bytes))
                 self._store_program_section(
                     f"vision_worker{engine_idx}", worker_addr, worker_bytes,
                     {"parent": "vision", "engine_idx": engine_idx,
