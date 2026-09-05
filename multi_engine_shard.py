@@ -1891,6 +1891,13 @@ class MultiEngineScheduler:
             w.reset_isa_reg_counter()
             w.reset_inst_ptr_counter()
             w.start_capture()
+        # THE RENDEZVOUS LATCH IS PER PROGRAM. What must agree on a topology is
+        # the pair of streams that RUN TOGETHER; two programs compiled on one
+        # scheduler and launched separately never rendezvous with each other. A
+        # model that row-shards its prefill through sharded_region (symmetric) and
+        # then master/worker-shards its decode on the same engines is doing
+        # nothing wrong, so each begin_program() starts the choice afresh.
+        self._rendezvous_mode = None
         self._program_open = True
 
     def finalize(self) -> list[int]:
@@ -2020,6 +2027,8 @@ class MultiEngineScheduler:
         a symmetric ``barrier()`` waits forever, and FLAG_CHECK has NO TIMEOUT, so the
         failure is an unkillable hang rather than an error. Catching it at emit time is
         the only place it can be caught cheaply.
+
+        Scope: ONE PROGRAM. :meth:`begin_program` clears the latch -- see there.
         """
         if self._rendezvous_mode is None:
             self._rendezvous_mode = kind
@@ -2120,6 +2129,33 @@ class MultiEngineScheduler:
     def worker_indices(self) -> list[int]:
         """Engine indices 1..N-1. Engine 0 is the primary and never a worker."""
         return list(range(1, self.num_engines))
+
+    def begin_worker_round(self, engine_idx: int) -> None:
+        """WORKER, phase 1: wait for the master's release.
+
+        The worker side of :meth:`release` / :meth:`join`, for a model that emits
+        its workers' streams itself (an unrolled decoder, say) rather than through
+        :meth:`emit_worker_program`. Emit this, then this engine's share of the
+        round, then :meth:`end_worker_round`.
+
+        Every worker must run EVERY round the master emits, even one where it has
+        no work: a skipped rendezvous desynchronises the group permanently and the
+        master then waits forever on a flag that never rises.
+        """
+        if self.num_engines == 1:
+            return
+        self._latch_rendezvous("master_worker")
+        self.engines[engine_idx].generate_instruction_flag_check_set(target_engine_idx=0)
+
+    def end_worker_round(self, engine_idx: int) -> None:
+        """WORKER, phases 2-4: signal done, wait for the round to close, re-arm."""
+        if self.num_engines == 1:
+            return
+        self._latch_rendezvous("master_worker")
+        ue = self.engines[engine_idx]
+        ue.generate_instruction_flag_set()                             # 2: done
+        ue.generate_instruction_flag_check_clear(target_engine_idx=0)  # 3: closed
+        ue.generate_instruction_flag_clear()                           # 4: re-armed
 
     def preclear_flags(self, timeout_seconds: float = 5.0) -> None:
         """Run a tiny program on every engine that just clears its flag.

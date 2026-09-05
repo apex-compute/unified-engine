@@ -1215,6 +1215,13 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             prefill_size_bytes = (self.capture_count - prefill_count_at_start) * INSTRUCTION_SIZE_BYTES
             prefill_worker_addrs = (prefill_scheduler.finalize()
                                     if prefill_scheduler is not None else [])
+            # SNAPSHOT NOW, not at store time. The same worker engines are
+            # re-captured for decode below, and begin_program() clears their
+            # capture buffers -- reading worker.capture_buffer after that point
+            # would store the DECODE image under the prefill section's name.
+            self._prefill_worker_images = [
+                b"".join(inst.get_bytes() for inst in w.capture_buffer)
+                for w in prefill_scheduler.workers] if prefill_scheduler is not None else []
             self._active_prefill_scheduler = None
             if prefill_scheduler is not None:
                 for worker in reversed(prefill_scheduler.workers):
@@ -1225,9 +1232,21 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             decoder_count_at_start = self.capture_count
             decoder_accounting_seq_len = (
                 (len(self.prefill_seq) + 63) // 64) * 64
+            # Decode reuses the SAME scheduler as prefill (see
+            # _ensure_lm_scheduler); reopening the capture appends decode's worker
+            # programs after prefill's, so both stay resident.
+            if prefill_scheduler is not None:
+                prefill_scheduler.begin_program()
+                self._active_decode_scheduler = prefill_scheduler
             _, decoder_program_sizes, decoder_total_flops = self.compile_decoder(
                 layer_size=layer_size, profile=profile,
                 accounting_seq_len=decoder_accounting_seq_len)
+            decoder_worker_addrs = (prefill_scheduler.finalize()
+                                    if prefill_scheduler is not None else [])
+            self._decode_worker_images = [
+                b"".join(inst.get_bytes() for inst in w.capture_buffer)
+                for w in prefill_scheduler.workers] if prefill_scheduler is not None else []
+            self._active_decode_scheduler = None
             decoder_program_addr = instruction_base_addr + decoder_count_at_start * INSTRUCTION_SIZE_BYTES
             decoder_size_bytes = decoder_program_sizes[0]
 
@@ -1266,11 +1285,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # Merge the LM section into the combined programs bin (vision stays intact).
         self._store_program_section("lm", instruction_base_addr, image_bytes, lm_meta, profile=profile)
         if prefill_scheduler is not None:
-            for engine_idx, (worker, worker_addr) in enumerate(
-                    zip(prefill_scheduler.workers, prefill_worker_addrs), start=1):
-                worker_bytes = bytearray()
-                for inst in worker.capture_buffer:
-                    worker_bytes.extend(inst.get_bytes())
+            for engine_idx, worker_addr in enumerate(prefill_worker_addrs, start=1):
+                worker_bytes = self._prefill_worker_images[engine_idx - 1]
                 # The arena owns the bound: this engine's ISA slice, whose
                 # neighbour above is its own tensor scratch and then the next
                 # engine's window. An overrun would not fault, so it is checked
@@ -1282,6 +1298,16 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                      "multi_core": self.multi_core,
                      "prefill_seq_len": prefill_flops_seq_len,
                      "prefill_kernel": self.prefill_kernel}, profile=profile)
+            # Decode workers: their own image per engine, at addresses following
+            # the prefill ones in the same ISA slice.
+            for engine_idx, worker_addr in enumerate(decoder_worker_addrs, start=1):
+                worker_bytes = self._decode_worker_images[engine_idx - 1]
+                self.mc_arena.check_isa_fits(engine_idx, worker_addr, len(worker_bytes))
+                self._store_program_section(
+                    f"decode_worker{engine_idx}", worker_addr, worker_bytes,
+                    {"parent": "lm", "engine_idx": engine_idx,
+                     "multi_core": self.multi_core,
+                     "decode_kernel": self.decode_kernel}, profile=profile)
 
         print(f"[compile] stored LM section ({len(image_bytes)/1024:.1f} KB @ 0x{instruction_base_addr:X}); "
               f"prefill @ 0x{prefill_program_addr:X} ({prefill_size_bytes/1024:.1f} KB), "
@@ -1671,6 +1697,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self.start_execute_from_dram(int(resume_hex, 16))
         self.wait_queue(timeout)   # tail segment: everything up to the terminal HALT
         tail_ms = self.report_latency_in_us() / 1e3
+        if worker_scheduler is not None:
+            # The master halting does not mean a worker has retired its own HALT;
+            # relaunching a still-busy engine desyncs the group (see run_decoder).
+            for _w in worker_scheduler.workers:
+                _w.wait_queue(timeout)
         if results:
             # The terminal segment is a coverage boundary, not a useful report
             # row. Fold prefill's HALT into inject and decode's position
@@ -1684,14 +1715,16 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         return results
 
     def _decode_profile_execute(self, decoder_addr: int, aligned_seq_len: int,
-                                checkpoints: list, timeout: float = 120.0) -> list:
+                                checkpoints: list, timeout: float = 120.0,
+                                worker_scheduler=None, worker_addrs=None) -> list:
         """One decode step through the profile-bin's HALT checkpoints. Preamble
         primes gpr_seq_len (=decode_pos) / gpr_aligned_seq_len; the tail segment
         is the add_inc(gpr_seq_len) + terminal HALT."""
         results = self._profile_execute(
             [(self.gpr_seq_len, self.seq_len - 1),
              (self.gpr_aligned_seq_len, aligned_seq_len)],
-            decoder_addr, checkpoints, tail_name="tail_addinc", timeout=timeout)
+            decoder_addr, checkpoints, tail_name="tail_addinc", timeout=timeout,
+            worker_scheduler=worker_scheduler, worker_addrs=worker_addrs)
         # The decoder program is captured with MAX_CONTEXT_SIZE as its template
         # aligned length, so compile-time attention FLOPs describe that maximum.
         # Replace only attention FLOPs with the exact live-length formula used by
@@ -1807,6 +1840,29 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._prefill_profile_results = prefill_results
         self._print_phase_breakdown("PREFILL", prefill_results, per_token=False)
 
+        # Multi-core decode: upload the workers' decode images from the PROFILE
+        # bin. A master checkpoint HALT lands while the workers sit in the next
+        # round's entry FLAG_CHECK -- the ordinary steady state whenever the
+        # master is slow -- so segmenting the master does not disturb the
+        # rendezvous, and each segment measures its round's fork-to-join time.
+        _dec_sched = self._ensure_lm_scheduler()
+        _dec_worker_addrs = []
+        if _dec_sched is not None:
+            for engine_idx, worker in enumerate(_dec_sched.workers, start=1):
+                w_meta, w_bytes = self._get_program_section(
+                    f"decode_worker{engine_idx}", True)
+                if w_meta is None:
+                    raise FileNotFoundError(
+                        f"decode_worker{engine_idx} section not found in the profile "
+                        f"programs bin; recompile with --profile")
+                w_addr = int(w_meta["dram_base"], 16)
+                worker._next_program_dram_addr = w_addr
+                worker.dma_write(DMA_DEVICE_H2C, w_addr, w_bytes, len(w_bytes))
+                worker.allocate_program_dram(len(w_bytes))   # see run_decoder
+                _dec_worker_addrs.append(w_addr)
+            print(f"[profile] decode workers loaded at "
+                  f"{', '.join(f'0x{a:X}' for a in _dec_worker_addrs)}")
+
         # Host prep for a decode position (mirrors run_decoder's per-step work).
         token_id = self.prefill_seq[-1]
         self.dma_to_accelerator_memory(
@@ -1842,7 +1898,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         print(f"\n--- Profiling first decode step (pos {first_context_len - 1}) ---",
               flush=True)
         decode_results = self._decode_profile_execute(
-            decoder_program_addr, aligned_seq_len, decoder_checkpoints)
+            decoder_program_addr, aligned_seq_len, decoder_checkpoints,
+            worker_scheduler=_dec_sched, worker_addrs=_dec_worker_addrs)
         self._decode_profile_results = decode_results
         self._print_phase_breakdown("DECODE (first step)", decode_results, per_token=True)
 
@@ -1854,7 +1911,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         print(f"\n--- Profiling 1024th token (pos {target_context_len - 1}) ---",
               flush=True)
         decode_1024_results = self._decode_profile_execute(
-            decoder_program_addr, aligned_seq_len, decoder_checkpoints)
+            decoder_program_addr, aligned_seq_len, decoder_checkpoints,
+            worker_scheduler=_dec_sched, worker_addrs=_dec_worker_addrs)
         self._decode_1024_profile_results = decode_1024_results
         self._print_phase_breakdown(
             "DECODE (1024th token)", decode_1024_results, per_token=True)
@@ -2177,6 +2235,18 @@ def main():
     # kernels out of the name.
     _summary_name = run_summary_filename(args)
     engine_kwargs = resolve_engine_config(parser, args)
+
+    # Reset every engine this run will use, BEFORE anything else touches the
+    # hardware -- this is the first point at which a reset can issue, since
+    # resolve_engine_config() is what selects the DMA device and reads HW_INFO.
+    # software_reset() is PER-CORE, so a run that died mid-rendezvous leaves
+    # cores 1..N-1 spin-waiting on a FLAG_CHECK (which has no timeout) and the
+    # next process inherits engines that never accept a program. Clearing them
+    # here means the DRAM poison pass, the bandwidth benchmark and the model
+    # itself all start from idle cores.
+    from user_hw_test import software_reset_test
+    print(f"\n--- Software-resetting {args.multi_core} core(s) ---")
+    software_reset_test(cores=args.multi_core)
 
     # Poison DRAM before the model (or the DRAM benchmark) writes anything, so
     # an uninitialised read downstream is NaN rather than an earlier run's data.

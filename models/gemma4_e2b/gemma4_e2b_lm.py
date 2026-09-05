@@ -22,6 +22,7 @@ if os.path.dirname(os.path.dirname(_SD)) not in sys.path:
 
 import torch
 import torch.nn.functional as F
+import multi_engine_shard as mes
 import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE,
@@ -34,9 +35,70 @@ from transformers import AutoTokenizer
 class Gemma4LMMixin:
     """LM prefill/decode methods for Gemma4_UnifiedEngine (see module docstring)."""
 
-    def _ensure_prefill_scheduler(self):
-        """Return the shared multicore configuration for the prefill stage."""
-        return self._ensure_stage_scheduler("prefill")
+    def _ensure_lm_scheduler(self):
+        """The ONE scheduler shared by LM prefill and LM decode.
+
+        Deliberately not one per stage: a second scheduler builds fresh worker
+        ``UnifiedEngine`` objects whose program allocators restart at the engine's
+        ISA base, so decode's worker images would be written on top of prefill's,
+        byte for byte. Sharing the object keeps a single program cursor per
+        engine, so decode's images land AFTER prefill's and both stay resident --
+        prefill runs once, decode then runs per token, with no reload between.
+        """
+        return self._ensure_stage_scheduler("lm")
+
+    # Back-compat alias: prefill used to own the scheduler outright.
+    _ensure_prefill_scheduler = _ensure_lm_scheduler
+
+    def _ensure_decode_q_shards(self, sched, layer_size: int) -> dict:
+        """Copy each engine's column block of the FULL layers' Q weight into that
+        engine's private arena. Returns ``{layer_idx: ShardedWeight}``.
+
+        SCOPE: Q only, full-attention layers only. Those are the widest N in the
+        decoder (4096 = 8 x 512 at 8 engines, a perfectly even split) and Q writes
+        a buffer nothing else in the round touches, so it is the smallest change
+        that is still worth making. The other projections stay on the master.
+
+        THE COPY IS THE POINT. Engine i reads its block out of ITS OWN private
+        window rather than out of the one shared weight image, so the engines'
+        weight streams do not contend for the same memory. Decode is
+        bandwidth-bound -- a whole weight block streamed per token -- so sharing
+        one image would cap the speedup however evenly the columns divide. Cost is
+        one copy of the sharded weights spread over the engines: 22.3 MB total,
+        2.8 MB per core at 8, against a 224 MB private weight arena each.
+
+        ONE SHARD PER LAYER (``layers=1``), not one spanning all 35: gemma4
+        alternates two attention shapes, so there is no single N. That suits an
+        unrolled decoder anyway -- every address is a compile-time literal.
+
+        Cached: an image may be compiled more than once per process, and
+        shard_quantized_weight refuses to allocate the same name twice.
+        """
+        cached = getattr(self, "_decode_q_shards", None)
+        if cached is not None:
+            return cached
+        t0 = time.perf_counter()
+        stride = self.weight_defs["LAYER_WEIGHT_SIZE"]
+        shards = {}
+        for layer_idx in sorted(self._full_attention_layers):
+            if layer_idx >= layer_size:
+                continue
+            _, cur_q_size, _ = self._get_layer_attention_dims(layer_idx)
+            if not mes.can_split(cur_q_size, sched.num_engines):
+                continue
+            shards[layer_idx] = sched.shard_quantized_weight(
+                name=f"q_proj_L{layer_idx}",
+                main_weight_addr=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_idx * stride,
+                main_scale_addr=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_idx * stride,
+                K=self.vector_length, N=cur_q_size, layers=1, main_layer_stride=0,
+                data_type=TYPE.IF4, verbose=False)
+        self._decode_q_shards = shards
+        used = sched.private_usage()
+        print(f"[Decode] Q sharded on {len(shards)} full-attention layer(s) over "
+              f"{sched.num_engines} engines in {time.perf_counter() - t0:.1f}s; "
+              f"private weight arenas: "
+              f"{', '.join(f'{u / 2**20:.1f}MB' for u in used)}", flush=True)
+        return shards
 
 
     def set_prefill_seq(self, prompt: str | None = None) -> None:
@@ -1510,6 +1572,45 @@ class Gemma4LMMixin:
             kwargs.pop("gpr_N_reg", None)
             kwargs.pop("is_B_quantized", None)
             return self.quantized_matmat_core(**kwargs)
+
+        # ---------------- decode multi-core: N-sharded Q projection ----------
+        # Decode is M=1, so there is no row axis to split; N (the output columns)
+        # is the only dimension with width. A column shard of an (N x K) row-major
+        # weight is a contiguous ROW BLOCK of it, and at M=1 the matching slice of
+        # the output is contiguous too, so each engine writes a disjoint piece of
+        # the same Q vector with no gather.
+        _dec_sched = getattr(self, "_active_decode_scheduler", None)
+        if _dec_sched is not None and self.decode_kernel != "streaming":
+            raise NotImplementedError(
+                f"multi-core decode sharding requires --decode-kernel streaming, "
+                f"got {self.decode_kernel!r}: the shard emits quantized_matmat_core "
+                f"directly on each engine")
+        _q_shards = (self._ensure_decode_q_shards(_dec_sched, layer_size)
+                     if _dec_sched is not None else {})
+
+        def _emit_q_shard(ue, sw, e: int) -> int:
+            """Emit engine ``e``'s column block of one layer's Q projection.
+
+            B and the scales come from THIS engine's private arena; only the
+            output slice is an offset into the shared Q buffer, which is what the
+            engines are cooperating to produce.
+            """
+            sh = sw.shard(e)
+            out_off = sh.col_offset * self.bytes_per_element
+            # A shard is a whole multiple of UE_VECTOR_SIZE (64), so at bf16 the
+            # output offset is a whole 128-byte SRAM row. Asserted rather than
+            # assumed: a misaligned writeback base is finite-but-wrong data, not
+            # a fault.
+            assert out_off % 128 == 0, (
+                f"Q shard output offset {out_off} is not a whole 128 B SRAM row")
+            return ue.quantized_matmat_core(
+                M=1, K=sw.K, N=sh.cols,
+                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                B_DRAM_ADDR=sh.weight_addr,
+                OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM + out_off,
+                SCALE_DRAM_ADDR=sh.scale_addr,
+                data_type=TYPE.IF4) or 0
+
         # gpr_one holds the constant 1 — used as gpr_M_reg for all M=1 ops.
         gpr_one = self.alloc_isa_reg()
         self.generate_instruction_add_set(gpr_one, 1)
@@ -1577,13 +1678,28 @@ class Gemma4LMMixin:
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
                               gpr_M_reg=gpr_one)
                 # Q/K/V projections: use per-layer dims
-                total_flops += _projection_core(M=1, K=self.vector_length, N=cur_q_size,
-                                                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
-                                                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
-                                                    OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                                                    data_type=TYPE.IF4,
-                                                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
-                                                    )
+                _q_sw = _q_shards.get(layer_idx)
+                if _q_sw is None:
+                    total_flops += _projection_core(M=1, K=self.vector_length, N=cur_q_size,
+                                                        A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                                                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
+                                                        OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                                                        data_type=TYPE.IF4,
+                                                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
+                                                        )
+                else:
+                    # ONE ROUND, THIS LAYER ONLY. The rendezvous is emitted only
+                    # where there is sharded work; master and workers walk the same
+                    # layer set in this one loop, so their round counts cannot
+                    # disagree. Everything after join() reads a complete Q vector.
+                    _dec_sched.release()
+                    total_flops += _emit_q_shard(self, _q_sw, 0)
+                    total_flops += _dec_sched.worker_flops(_q_sw)
+                    for _e in _dec_sched.worker_indices():
+                        _dec_sched.begin_worker_round(_e)
+                        _emit_q_shard(_dec_sched.engines[_e], _q_sw, _e)
+                        _dec_sched.end_worker_round(_e)
+                    _dec_sched.join()
                 if layer_idx in self._kv_shared_map:
                     ref_layer = self._kv_shared_map[layer_idx]
                     kv_layer_for_attn = ref_layer  # read from reference layer's KV cache
@@ -1951,6 +2067,35 @@ class Gemma4LMMixin:
         # rely on the program's add_inc to advance it. A HALT-terminated
         # preamble (no program to run) just latches the register on the HW.
         self._dispatch_program([(self.gpr_seq_len, self.seq_len)], None, timeout=10.0)
+
+        # Multi-core decode: upload each worker's decode image and clear stale
+        # flags once. A worker's program covers one whole decode step and ends in
+        # HALT, so it is relaunched every step below, like the master's.
+        _dec_sched = self._ensure_lm_scheduler()
+        _dec_worker_addrs = []
+        if _dec_sched is not None:
+            for engine_idx, worker in enumerate(_dec_sched.workers, start=1):
+                w_meta, w_bytes = self._get_program_section(
+                    f"decode_worker{engine_idx}", False)
+                if w_meta is None:
+                    raise FileNotFoundError(
+                        f"decode_worker{engine_idx} section not found in the combined "
+                        f"programs bin; recompile the program image")
+                w_addr = int(w_meta["dram_base"], 16)
+                worker._next_program_dram_addr = w_addr
+                worker.dma_write(DMA_DEVICE_H2C, w_addr, w_bytes, len(w_bytes))
+                # ADVANCE PAST THE IMAGE. preclear_flags() below writes its tiny
+                # clear+halt program at each engine's CURRENT program cursor; left
+                # pointing at this image, the preclear lands on top of it. The
+                # worker would then run flag_clear+halt, exit immediately, and the
+                # master would wait forever at its first CHECK_SET.
+                worker.allocate_program_dram(len(w_bytes))
+                _dec_worker_addrs.append(w_addr)
+            # A run killed mid-rendezvous leaves flags raised; the first release
+            # would then sail through and read a half-written Q vector.
+            _dec_sched.preclear_flags()
+            print(f"[Decode] {_dec_sched.num_engines} engines, worker images at "
+                  f"{', '.join(f'0x{a:X}' for a in _dec_worker_addrs)}", flush=True)
         print("\n------------------------------ DECODE START ------------------------------\n", flush=True)
 
         # Live decode status bar (mirrors llama3.2_1b / gemma4_e4b): pin the bottom
@@ -2023,6 +2168,10 @@ class Gemma4LMMixin:
                 sliding_bias_row[:, window_start:self.seq_len] = 0.0
             self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias_row)
 
+            if _dec_sched is not None:
+                # Workers first: each parks on the master's first release, so they
+                # must already be running before the master reaches it.
+                _dec_sched.start_workers(_dec_worker_addrs)
             # Dynamic-PBI dispatch: re-set the attention length (K context grows
             # each step, may cross a 64-align boundary), then jump into the
             # cached decoder program. gpr_seq_len was primed once above and is
@@ -2030,6 +2179,14 @@ class Gemma4LMMixin:
             latency, flop_rate_program = self._dispatch_program(
                 [(self.gpr_aligned_seq_len, aligned_seq_len)],
                 prog_addr, timeout=300.0, flops=live_flops_per_token)
+            if _dec_sched is not None:
+                # DRAIN BEFORE THE NEXT TOKEN. _dispatch_program waits only for the
+                # MASTER to halt; a worker is at most a HALT behind, but nothing has
+                # waited for that HALT to retire. start_workers() on the next token
+                # would then be issued to a still-busy engine, which does not raise
+                # -- it desyncs the group. Prefill drains its workers the same way.
+                for _w in _dec_sched.workers:
+                    _w.wait_queue(300.0)
             total_latency += latency
             total_flop_rate += flop_rate_program
             # HW argmax of the streaming LM-head logits.
