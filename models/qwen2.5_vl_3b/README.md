@@ -6,9 +6,6 @@ and text-only prompts.
 ## Layout
 
 - **qwen2.5_vl_3b_test.py** – Full VLM pipeline: vision encoder + prefill + decode
-- **qwen2.5_vl_3b_run_from_bin.py** – Offline runtime-only entry point for
-  pre-generated weight and instruction bins. It uses only local
-  tokenizer/processor metadata and does not require the HF model safetensor shards.
 - **qwen2.5_vl_3b_config.json** – Model dimensions, precision, and paths
 - **qwen2.5_vl_3b_bin/** – Weights, HF model, and the compiled instruction bin (generated at runtime)
 
