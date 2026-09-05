@@ -86,16 +86,26 @@ class Gemma4LMMixin:
             off = layer_idx * stride
             _, cur_q_size, cur_k_size = self._get_layer_attention_dims(layer_idx)
             kv_own = layer_idx not in self._kv_shared_map
-            plan = [("q", cur_q_size, self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
-                     self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE)]
+            # (op, K, N, weight base, scale base). Q/K/V share K=vector_length
+            # and differ in N; the O projection is the transpose of that shape --
+            # it consumes the attention output, so its K is cur_q_size and its N
+            # is vector_length.
+            plan = [("q", self.vector_length, cur_q_size,
+                     self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
+                     self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE),
+                    ("o", cur_q_size, self.vector_length,
+                     self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT,
+                     self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE)]
             if kv_own:
                 # A layer that borrows another layer's KV cache projects no K/V
                 # of its own, so there is nothing to shard for it.
-                plan += [("k", cur_k_size, self.DRAM_ADDR_LAYER0_K_PROJ_QUANT,
+                plan += [("k", self.vector_length, cur_k_size,
+                          self.DRAM_ADDR_LAYER0_K_PROJ_QUANT,
                           self.DRAM_ADDR_LAYER0_K_PROJ_SCALE),
-                         ("v", cur_k_size, self.DRAM_ADDR_LAYER0_V_PROJ_QUANT,
+                         ("v", self.vector_length, cur_k_size,
+                          self.DRAM_ADDR_LAYER0_V_PROJ_QUANT,
                           self.DRAM_ADDR_LAYER0_V_PROJ_SCALE)]
-            for op, N, w_base, s_base in plan:
+            for op, K, N, w_base, s_base in plan:
                 if not mes.can_split(N, sched.num_engines):
                     # Fewer than one 64-column block per engine (the sliding
                     # layers' K/V past 4 engines). Left full-width on the master
@@ -105,11 +115,11 @@ class Gemma4LMMixin:
                 shards[(op, layer_idx)] = sched.shard_quantized_weight(
                     name=f"{op}_proj_L{layer_idx}",
                     main_weight_addr=w_base + off, main_scale_addr=s_base + off,
-                    K=self.vector_length, N=N, layers=1, main_layer_stride=0,
+                    K=K, N=N, layers=1, main_layer_stride=0,
                     data_type=TYPE.IF4, verbose=False)
         self._decode_qkv_shards = shards
         used = sched.private_usage()
-        print(f"[Decode] Q/K/V sharded: {len(shards)} projection(s) over "
+        print(f"[Decode] Q/K/V/O sharded: {len(shards)} projection(s) over "
               f"{sched.num_engines} engines in {time.perf_counter() - t0:.1f}s"
               f"{f'; {len(skipped)} left on the master' if skipped else ''}; "
               f"private weight arenas: "
@@ -1604,12 +1614,12 @@ class Gemma4LMMixin:
         _shards = (self._ensure_decode_qkv_shards(_dec_sched, layer_size)
                    if _dec_sched is not None else {})
 
-        def _emit_shard(ue, sw, e: int, out_base: int) -> int:
+        def _emit_shard(ue, sw, e: int, out_base: int, a_addr: int) -> int:
             """Emit engine ``e``'s column block of one projection.
 
-            B and the scales come from THIS engine's private arena; only the
-            output slice is an offset into the shared Q/K/V buffer, which is what
-            the engines are cooperating to produce.
+            B and the scales come from THIS engine's private arena; ``a_addr`` is
+            the shared input every engine reads in full (PRE_NORM for Q/K/V,
+            FLASH_OUTPUT for O), and only the output slice is per-engine.
             """
             sh = sw.shard(e)
             out_off = sh.col_offset * self.bytes_per_element
@@ -1621,7 +1631,7 @@ class Gemma4LMMixin:
                 f"shard output offset {out_off} is not a whole 128 B SRAM row")
             return ue.quantized_matmat_core(
                 M=1, K=sw.K, N=sh.cols,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                A_DRAM_ADDR=a_addr,
                 B_DRAM_ADDR=sh.weight_addr,
                 OUTPUT_DRAM_ADDR=out_base + out_off,
                 SCALE_DRAM_ADDR=sh.scale_addr,
@@ -1630,15 +1640,15 @@ class Gemma4LMMixin:
         def _emit_worker_round(ops) -> None:
             """Workers' side of one layer's round, then close it.
 
-            ``ops`` is [(ShardedWeight, out_base)] for whatever sharded in this
-            layer. Called exactly once per layer that opened a round, and only
+            ``ops`` is [(ShardedWeight, out_base, a_addr)] for whatever shards in
+            this round. Called exactly once per round the master opened, and only
             after the master has emitted its own blocks, so each engine's stream
             reads: wait, work, signal, wait-for-close, re-arm.
             """
             for e in _dec_sched.worker_indices():
                 _dec_sched.begin_worker_round(e)
-                for sw, out_base in ops:
-                    _emit_shard(_dec_sched.engines[e], sw, e, out_base)
+                for sw, out_base, a_addr in ops:
+                    _emit_shard(_dec_sched.engines[e], sw, e, out_base, a_addr)
                 _dec_sched.end_worker_round(e)
             _dec_sched.join()
 
@@ -1717,7 +1727,7 @@ class Gemma4LMMixin:
                 _q_sw = _shards.get(("q", layer_idx))
                 _k_sw = _shards.get(("k", layer_idx)) if _kv_own else None
                 _v_sw = _shards.get(("v", layer_idx)) if _kv_own else None
-                _round_ops = [(sw, out) for sw, out in
+                _round_ops = [(sw, out, self.LAYER0_PRE_NORM_DRAM) for sw, out in
                               ((_q_sw, self.LAYER0_Q_DRAM),
                                (_k_sw, self.LAYER0_K_DRAM),
                                (_v_sw, self.LAYER0_FLASH_V_DRAM)) if sw is not None]
@@ -1732,7 +1742,8 @@ class Gemma4LMMixin:
                                                         SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
                                                         )
                 else:
-                    total_flops += _emit_shard(self, _q_sw, 0, self.LAYER0_Q_DRAM)
+                    total_flops += _emit_shard(self, _q_sw, 0, self.LAYER0_Q_DRAM,
+                                               self.LAYER0_PRE_NORM_DRAM)
                     total_flops += _dec_sched.worker_flops(_q_sw)
                 if layer_idx in self._kv_shared_map:
                     ref_layer = self._kv_shared_map[layer_idx]
@@ -1751,7 +1762,8 @@ class Gemma4LMMixin:
                             SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
                             )
                     else:
-                        total_flops += _emit_shard(self, _k_sw, 0, self.LAYER0_K_DRAM)
+                        total_flops += _emit_shard(self, _k_sw, 0, self.LAYER0_K_DRAM,
+                                               self.LAYER0_PRE_NORM_DRAM)
                         total_flops += _dec_sched.worker_flops(_k_sw)
                     # V projection
                     if _v_sw is None:
@@ -1763,7 +1775,8 @@ class Gemma4LMMixin:
                             SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
                             )
                     else:
-                        total_flops += _emit_shard(self, _v_sw, 0, self.LAYER0_FLASH_V_DRAM)
+                        total_flops += _emit_shard(self, _v_sw, 0, self.LAYER0_FLASH_V_DRAM,
+                                               self.LAYER0_PRE_NORM_DRAM)
                         total_flops += _dec_sched.worker_flops(_v_sw)
                     # Close the round BEFORE the V staging below: that reads the
                     # whole V vector, including the columns the workers wrote.
@@ -1891,14 +1904,28 @@ class Gemma4LMMixin:
                 decoder_attention_flops += live_attention_flops
                 _checkpoint(f"L{layer_idx}_attention")
 
-                # O projection: INT4, K=cur_q_size (actual per-layer attention output dim)
-                total_flops += _projection_core(M=1, K=cur_q_size, N=self.vector_length,
-                    A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                    data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
-                    )
+                # O projection: INT4, K=cur_q_size (actual per-layer attention output dim).
+                # ITS OWN ROUND, not the Q/K/V one: it reads FLASH_OUTPUT, which
+                # attention produces on the master alone, so the whole input only
+                # exists after that. N=1536 is 24 blocks of 64 -- 192 columns per
+                # engine at 8, an even split.
+                _o_sw = _shards.get(("o", layer_idx))
+                if _o_sw is None:
+                    total_flops += _projection_core(M=1, K=cur_q_size, N=self.vector_length,
+                        A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                        data_type=TYPE.IF4,
+                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
+                        )
+                else:
+                    _dec_sched.release()
+                    total_flops += _emit_shard(self, _o_sw, 0,
+                                               self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                                               self.LAYER0_FLASH_OUTPUT_DRAM)
+                    total_flops += _dec_sched.worker_flops(_o_sw)
+                    _emit_worker_round([(_o_sw, self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                                         self.LAYER0_FLASH_OUTPUT_DRAM)])
                 # Decode-only fused attention residual and FFN pre-normalization.
                 _vec_a = 0x10000
                 _vec_b = 0x90000
