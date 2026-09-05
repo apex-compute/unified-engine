@@ -360,37 +360,59 @@ def capture_digest(ue) -> str:
 # default stays ``"legacy"`` so existing callers keep the exact map they are
 # validated against.
 PRIVATE_ALIGN = 0x0100_0000           # 16 MB window granularity
-PRIVATE_TENSOR_BYTES = 0x0100_0000    # 16 MB, the ending slice of each window
-PRIVATE_ISA_BYTES = 0x0100_0000       # 16 MB, immediately before the tensor slice
-MAX_PRIVATE_ENGINES = 8
-"""Ceiling for the private map: 8 windows is the smallest useful stride."""
+PRIVATE_TENSOR_BYTES = 0x0100_0000    # 16 MB default, the ending slice of each window
+PRIVATE_ISA_BYTES = 0x0100_0000       # 16 MB default, immediately before the tensor slice
+MAX_PRIVATE_ENGINES = 16
+"""Ceiling for the private map -- the per-engine FLAG index is 4 bits, so 16 is
+the hard architectural limit; the practical one is whatever stride the arena
+leaves per engine."""
+
+# WHERE THE ARENA LIVES IS A PARAMETER, NOT A CONSTANT. The low 2 GB is only the
+# DEFAULT, and it is the right default for a model whose own map starts at
+# DRAM_START_ADDR (gemma3). A model that has re-based ITS OWN map into the low
+# 2 GB (gemma4-e2b multi-core does exactly this) must carve its per-engine
+# windows somewhere else, or the windows land on its weights -- which is the
+# very failure this map exists to prevent, merely inverted. Pass an explicit
+# ``(base, size)`` in that case; :class:`PrivateArena` owns the arithmetic
+# either way.
 
 
 def private_total() -> int:
-    """Size of the low arena: everything below the main map at DRAM_START_ADDR."""
+    """Default arena size: everything below the main map at DRAM_START_ADDR."""
     return user_dma_core.DRAM_START_ADDR
 
 
-def private_stride(num_engines: int) -> int:
-    """Bytes per engine in the private low map (see the block comment above)."""
+def private_stride(num_engines: int, arena_bytes: Optional[int] = None,
+                   isa_bytes: int = PRIVATE_ISA_BYTES,
+                   tensor_bytes: int = PRIVATE_TENSOR_BYTES) -> int:
+    """Bytes per engine when ``arena_bytes`` is split ``num_engines`` ways.
+
+    Rounded DOWN to :data:`PRIVATE_ALIGN`, so an engine count that does not
+    divide the arena evenly leaves slack at the TOP rather than overrunning it.
+    """
+    if arena_bytes is None:
+        arena_bytes = private_total()
     if not 1 <= num_engines <= MAX_PRIVATE_ENGINES:
         raise ValueError(
             f"num_engines must be in [1, {MAX_PRIVATE_ENGINES}] for the private map, "
             f"got {num_engines}")
-    stride = (private_total() // num_engines) & ~(PRIVATE_ALIGN - 1)
-    floor = PRIVATE_TENSOR_BYTES + PRIVATE_ISA_BYTES + PRIVATE_ALIGN
+    stride = (arena_bytes // num_engines) & ~(PRIVATE_ALIGN - 1)
+    floor = tensor_bytes + isa_bytes + PRIVATE_ALIGN
     if stride < floor:
         raise ValueError(
-            f"num_engines={num_engines} leaves only 0x{stride:X} per window, below the "
-            f"0x{floor:X} needed for ISA + tensor + at least one weight block")
-    assert num_engines * stride <= private_total(), \
-        "private windows must not reach DRAM_START_ADDR"
+            f"num_engines={num_engines} over a 0x{arena_bytes:X} arena leaves only "
+            f"0x{stride:X} per window, below the 0x{floor:X} needed for ISA + tensor "
+            f"+ at least one weight block")
+    assert num_engines * stride <= arena_bytes, "private windows must not leave the arena"
     return stride
 
 
-def private_weight_bytes(num_engines: int) -> int:
+def private_weight_bytes(num_engines: int, arena_bytes: Optional[int] = None,
+                         isa_bytes: int = PRIVATE_ISA_BYTES,
+                         tensor_bytes: int = PRIVATE_TENSOR_BYTES) -> int:
     """Weight arena inside one private window (the window minus its ISA + tensor tail)."""
-    return private_stride(num_engines) - PRIVATE_TENSOR_BYTES - PRIVATE_ISA_BYTES
+    return (private_stride(num_engines, arena_bytes, isa_bytes, tensor_bytes)
+            - tensor_bytes - isa_bytes)
 
 
 @dataclass(frozen=True)
@@ -414,23 +436,196 @@ class PrivateRegion:
                 f"tensor 0x{self.tensor_base:08X}")
 
 
-def private_region(engine_idx: int, num_engines: int) -> PrivateRegion:
-    """The private window belonging to ``engine_idx`` when ``num_engines`` are in play."""
+def private_region(engine_idx: int, num_engines: int, arena_base: int = 0,
+                   arena_bytes: Optional[int] = None,
+                   isa_bytes: int = PRIVATE_ISA_BYTES,
+                   tensor_bytes: int = PRIVATE_TENSOR_BYTES) -> PrivateRegion:
+    """The private window belonging to ``engine_idx`` when ``num_engines`` are in play.
+
+    Layout inside a window, low to high: WEIGHTS, then the ISA slice, then the
+    TENSOR slice at the very top. The two fixed-size slices sit at the END so
+    the weight arena -- the only part whose size varies with the engine count --
+    grows and shrinks against the window base, leaving the ISA and scratch
+    addresses at a constant offset from the window top.
+    """
     if not 0 <= engine_idx < num_engines:
         raise ValueError(f"engine_idx {engine_idx} outside [0, {num_engines})")
-    stride = private_stride(num_engines)
-    base = engine_idx * stride
-    tensor_base = base + stride - PRIVATE_TENSOR_BYTES
-    isa_base = tensor_base - PRIVATE_ISA_BYTES
+    stride = private_stride(num_engines, arena_bytes, isa_bytes, tensor_bytes)
+    base = arena_base + engine_idx * stride
+    tensor_base = base + stride - tensor_bytes
+    isa_base = tensor_base - isa_bytes
     return PrivateRegion(engine_idx=engine_idx, base=base, weight_base=base,
                          weight_limit=isa_base, isa_base=isa_base, tensor_base=tensor_base)
 
 
-def describe_private_map(num_engines: int) -> str:
-    lines = [f"  private low-DRAM map, {num_engines} core(s), "
-             f"{private_stride(num_engines) / 2**20:.0f} MB/core:"]
-    lines += ["    " + private_region(i, num_engines).describe() for i in range(num_engines)]
+def describe_private_map(num_engines: int, arena_base: int = 0,
+                         arena_bytes: Optional[int] = None,
+                         isa_bytes: int = PRIVATE_ISA_BYTES,
+                         tensor_bytes: int = PRIVATE_TENSOR_BYTES) -> str:
+    if arena_bytes is None:
+        arena_bytes = private_total()
+    stride = private_stride(num_engines, arena_bytes, isa_bytes, tensor_bytes)
+    lines = [f"  private DRAM map over "
+             f"[0x{arena_base:08X}..0x{arena_base + arena_bytes:08X}), "
+             f"{num_engines} core(s), {stride / 2**20:.0f} MB/core:"]
+    lines += ["    " + private_region(i, num_engines, arena_base, arena_bytes,
+                                      isa_bytes, tensor_bytes).describe()
+              for i in range(num_engines)]
     return "\n".join(lines)
+
+
+class PrivateArena:
+    """Per-engine private DRAM windows, and the bump allocators inside them.
+
+    THE ALLOCATOR IS SHARED, DELIBERATELY. A model needs these addresses in
+    places that have no scheduler in hand -- laying out per-engine attention
+    scratch during tensor init, bounds-checking a worker's ISA image at program
+    write time -- while the scheduler needs the same windows to place worker
+    engines and weight shards. Two independent allocators over one address range
+    is precisely how a worker's program ends up on top of another engine's
+    scratch, so there is ONE arena object and everything asks it.
+
+    Build it once on the model, hand it to every
+    :class:`MultiEngineScheduler` for the run (``arena=``), and the schedulers
+    stop owning any DRAM arithmetic of their own.
+    """
+
+    def __init__(self, num_engines: int, arena_base: int = 0,
+                 arena_bytes: Optional[int] = None,
+                 isa_bytes: int = PRIVATE_ISA_BYTES,
+                 tensor_bytes: int = PRIVATE_TENSOR_BYTES,
+                 verbose: bool = False):
+        if arena_bytes is None:
+            arena_bytes = private_total()
+        assert arena_base % PRIVATE_ALIGN == 0, (
+            f"arena_base 0x{arena_base:X} must be {PRIVATE_ALIGN // 2**20} MB aligned")
+        self.num_engines = num_engines
+        self.arena_base = arena_base
+        self.arena_bytes = arena_bytes
+        self.isa_bytes = isa_bytes
+        self.tensor_bytes = tensor_bytes
+        self.stride = private_stride(num_engines, arena_bytes, isa_bytes, tensor_bytes)
+        self.regions = [private_region(i, num_engines, arena_base, arena_bytes,
+                                       isa_bytes, tensor_bytes)
+                        for i in range(num_engines)]
+        self._weight_cursor = [r.weight_base for r in self.regions]
+        self._tensor_cursor = [r.tensor_base for r in self.regions]
+        if verbose:
+            print(self.describe())
+
+    # -- introspection ------------------------------------------------------
+    def region(self, engine_idx: int) -> PrivateRegion:
+        return self.regions[engine_idx]
+
+    def isa_base(self, engine_idx: int) -> int:
+        return self.regions[engine_idx].isa_base
+
+    def isa_limit(self, engine_idx: int) -> int:
+        return self.regions[engine_idx].isa_base + self.isa_bytes
+
+    def weight_bytes(self) -> int:
+        return self.stride - self.isa_bytes - self.tensor_bytes
+
+    def usage(self) -> list[int]:
+        """Bytes of weight arena used per engine."""
+        return [self._weight_cursor[i] - self.regions[i].weight_base
+                for i in range(self.num_engines)]
+
+    def describe(self) -> str:
+        return describe_private_map(self.num_engines, self.arena_base, self.arena_bytes,
+                                    self.isa_bytes, self.tensor_bytes)
+
+    # -- allocation ---------------------------------------------------------
+    def alloc_weights(self, engine_idx: int, size_bytes: int, what: str) -> int:
+        """Bump-allocate in an engine's WEIGHT arena, 64 B aligned."""
+        addr = (self._weight_cursor[engine_idx] + 63) & ~63
+        end = addr + size_bytes
+        limit = self.regions[engine_idx].weight_limit
+        if end > limit:
+            raise MemoryError(
+                f"{what}: engine {engine_idx} private weight arena overflow -- needs "
+                f"0x{end:X}, window ends at 0x{limit:X} "
+                f"({self.weight_bytes() // 2**20} MB per core at "
+                f"num_engines={self.num_engines})")
+        self._weight_cursor[engine_idx] = end
+        return addr
+
+    def alloc_tensor(self, engine_idx: int, size_bytes: int, what: str) -> int:
+        """Bump-allocate in an engine's TENSOR window, 64 B aligned.
+
+        This is where anything an engine must not share goes: attention scratch,
+        per-engine staging buffers -- the things that are WRITTEN, as opposed to
+        the read-only inputs every engine can address in the primary's map.
+        """
+        addr = (self._tensor_cursor[engine_idx] + 63) & ~63
+        limit = self.regions[engine_idx].tensor_base + self.tensor_bytes
+        if addr + size_bytes > limit:
+            raise MemoryError(
+                f"{what}: engine {engine_idx} private tensor window overflow -- needs "
+                f"0x{addr + size_bytes:X}, window ends at 0x{limit:X} "
+                f"({self.tensor_bytes // 2**20} MB per core)")
+        self._tensor_cursor[engine_idx] = addr + size_bytes
+        return addr
+
+    def alloc_tensor_all(self, size_bytes: int, what: str) -> list[int]:
+        """One same-sized private buffer per engine; returns them indexed by engine.
+
+        The common shape for per-engine scratch: every engine needs its own copy
+        of the same thing, and the caller wants a list it can index by engine.
+        """
+        return [self.alloc_tensor(i, size_bytes, what) for i in range(self.num_engines)]
+
+    # -- protection ---------------------------------------------------------
+    def check_isa_fits(self, engine_idx: int, addr: int, size_bytes: int) -> None:
+        """Refuse a program image that would leave its engine's ISA slice.
+
+        The ISA slice sits directly below the tensor slice, which sits directly
+        below the NEXT engine's window. An overrun would not fault -- it would
+        silently scribble instructions over a neighbour's scratch or weights, so
+        it has to be caught where the image is written.
+        """
+        region = self.regions[engine_idx]
+        limit = self.isa_limit(engine_idx)
+        if addr < region.isa_base or addr + size_bytes > limit:
+            spill = ("tensor slice"
+                     if addr + size_bytes <= region.tensor_base + self.tensor_bytes
+                     else "next engine window")
+            raise MemoryError(
+                f"engine {engine_idx} ISA overflow: program "
+                f"[0x{addr:X}..0x{addr + size_bytes:X}) is outside its slice "
+                f"[0x{region.isa_base:X}..0x{limit:X}) "
+                f"({self.isa_bytes // 2**20} MB). Writing it would corrupt the {spill}.")
+
+    def verify(self, engines: Optional[list] = None, verbose: bool = True) -> None:
+        """Check every engine's weight arena (and, if given, ISA cursor) is in bounds.
+
+        Cheap, host-side, and worth calling after setup: an overflow here is
+        silent corruption of a neighbouring engine's memory, not a fault.
+        """
+        for i, region in enumerate(self.regions):
+            used = self._weight_cursor[i] - region.weight_base
+            cap = region.weight_capacity
+            if self._weight_cursor[i] > region.weight_limit:
+                raise MemoryError(
+                    f"engine {i} weight arena overflow: {used / 2**20:.1f} MB used of "
+                    f"{cap / 2**20:.1f} MB, spilling into its ISA slice at "
+                    f"0x{region.isa_base:X}")
+            isa_used = None
+            if engines is not None and i < len(engines) and engines[i] is not None:
+                isa_used = engines[i].get_program_dram_addr() - region.isa_base
+                if i > 0 and not 0 <= isa_used <= self.isa_bytes:
+                    raise MemoryError(
+                        f"engine {i} ISA cursor "
+                        f"0x{engines[i].get_program_dram_addr():X} is outside its "
+                        f"{self.isa_bytes // 2**20} MB slice at 0x{region.isa_base:X}")
+            if verbose:
+                tensor_used = self._tensor_cursor[i] - region.tensor_base
+                isa_txt = (f"{isa_used / 1024:7.1f} KB" if isa_used is not None and i > 0
+                           else "     (main map)")
+                print(f"    core {i}: weights {used / 2**20:6.1f} / {cap / 2**20:.0f} MB"
+                      f"   isa {isa_txt} / {self.isa_bytes // 2**20} MB"
+                      f"   tensor {tensor_used / 2**20:5.2f} / "
+                      f"{self.tensor_bytes // 2**20} MB")
 
 
 def can_split(N: int, num_engines: int) -> bool:
@@ -1010,6 +1205,8 @@ class MultiEngineScheduler:
                  allow_more_than_two_engines: bool = False,
                  workers: Optional[list] = None,
                  worker_map: str = "legacy",
+                 worker_arena: Optional[tuple] = None,
+                 arena: Optional[PrivateArena] = None,
                  handshake: str = "nops",
                  verbose: bool = False):
         assert num_engines >= 1, f"num_engines must be >= 1, got {num_engines}"
@@ -1059,18 +1256,35 @@ class MultiEngineScheduler:
         self._rendezvous_mode: Optional[str] = None
         self.verbose = verbose
 
-        # PRIVATE LOW-DRAM MAP (opt-in). See the module-level block comment.
+        # PRIVATE PER-ENGINE MAP (opt-in). Three ways in:
+        #   worker_map="legacy"       -- no private map; the original worker bases.
+        #   worker_map="private_low"  -- the default low-2 GB arena, below the model
+        #                                map at DRAM_START_ADDR.
+        #   worker_map="private" + worker_arena=(base, size), or arena=<PrivateArena>
+        #                             -- an explicit arena, for a model that has put
+        #                                its OWN map in the low 2 GB.
         # Regions cover EVERY engine including the primary: engine 0 keeps its own
         # model map for activations, but its WEIGHT SHARD lives in region 0 like
         # everybody else's, so all N shards are laid out by one rule.
-        assert worker_map in ("legacy", "private_low"), \
-            f"worker_map must be 'legacy' or 'private_low', got {worker_map!r}"
+        #
+        # PASS ``arena`` WHEN THE MODEL ALREADY OWNS ONE. Several schedulers over one
+        # address range with one allocator each is how a worker program ends up on
+        # another engine's scratch; sharing the arena object keeps a single cursor per
+        # engine for the whole run.
+        assert worker_map in ("legacy", "private_low", "private"), \
+            f"worker_map must be 'legacy', 'private_low' or 'private', got {worker_map!r}"
+        if arena is not None:
+            assert arena.num_engines >= num_engines, (
+                f"shared arena covers {arena.num_engines} engine(s), need {num_engines}")
+            worker_map = "private"
+        elif worker_map != "legacy":
+            a_base, a_bytes = worker_arena if worker_arena is not None else (0, None)
+            arena = PrivateArena(num_engines, arena_base=a_base, arena_bytes=a_bytes)
         self.worker_map = worker_map
-        self.regions: Optional[list] = (
-            [private_region(i, num_engines) for i in range(num_engines)]
-            if worker_map == "private_low" else None)
-        if self.regions is not None and verbose:
-            print(describe_private_map(num_engines))
+        self.arena: Optional[PrivateArena] = arena
+        self.regions: Optional[list] = arena.regions if arena is not None else None
+        if arena is not None and verbose:
+            print(arena.describe())
 
         # Worker engines. Their allocator bases are OWNED HERE: DRAM is one flat
         # space, so independent Python allocators would silently collide with
@@ -1151,11 +1365,8 @@ class MultiEngineScheduler:
         self._worker_prog_addrs: list[int] = []
 
         # --- master/worker sharding state (all unused by the region API) ---
-        # Bump cursors into each engine's private arena; None under the legacy map.
-        self._weight_cursor = ([r.weight_base for r in self.regions]
-                               if self.regions is not None else None)
-        self._tensor_cursor = ([r.tensor_base for r in self.regions]
-                               if self.regions is not None else None)
+        # Allocation lives in self.arena (a PrivateArena), never in the scheduler:
+        # see the note above about one cursor per engine per run.
         self._weights: dict[str, ShardedWeight] = {}
         self._persistent_prog: dict[int, int] = {}        # engine -> body address
         self._persistent_preamble: dict[int, int] = {}    # engine -> preamble address
@@ -1979,44 +2190,25 @@ class MultiEngineScheduler:
     # k_sharded_region / head_sharded_region), which is unchanged.
     # ======================================================================
     def _require_private_map(self, what: str) -> None:
-        assert self.regions is not None, (
+        assert self.arena is not None, (
             f"{what} needs the private low-DRAM map: construct the scheduler with "
             f"worker_map='private_low'. Under the legacy map there is no per-engine "
             f"arena to place shards in that is guaranteed not to alias the model.")
 
     def _alloc_private(self, engine_idx: int, size_bytes: int, what: str) -> int:
-        """Bump-allocate in an engine's private WEIGHT arena, 64 B aligned."""
+        """Bump-allocate in an engine's private WEIGHT arena (delegates to the arena)."""
         self._require_private_map(what)
-        addr = (self._weight_cursor[engine_idx] + 63) & ~63
-        end = addr + size_bytes
-        limit = self.regions[engine_idx].weight_limit
-        if end > limit:
-            raise MemoryError(
-                f"{what}: engine {engine_idx} private weight arena overflow -- needs "
-                f"0x{end:X}, window ends at 0x{limit:X} "
-                f"({private_weight_bytes(self.num_engines) // 2**20} MB per core at "
-                f"num_engines={self.num_engines})")
-        self._weight_cursor[engine_idx] = end
-        return addr
+        return self.arena.alloc_weights(engine_idx, size_bytes, what)
 
     def _alloc_private_tensor(self, engine_idx: int, size_bytes: int, what: str) -> int:
-        """Bump-allocate in an engine's private TENSOR window, 64 B aligned."""
+        """Bump-allocate in an engine's private TENSOR window (delegates to the arena)."""
         self._require_private_map(what)
-        addr = (self._tensor_cursor[engine_idx] + 63) & ~63
-        limit = self.regions[engine_idx].tensor_base + PRIVATE_TENSOR_BYTES
-        if addr + size_bytes > limit:
-            raise MemoryError(
-                f"{what}: engine {engine_idx} private tensor window overflow -- needs "
-                f"0x{addr + size_bytes:X}, window ends at 0x{limit:X} "
-                f"({PRIVATE_TENSOR_BYTES // 2**20} MB per core)")
-        self._tensor_cursor[engine_idx] = addr + size_bytes
-        return addr
+        return self.arena.alloc_tensor(engine_idx, size_bytes, what)
 
     def private_usage(self) -> list[int]:
         """Bytes of private weight arena used per engine."""
         self._require_private_map("private_usage")
-        return [self._weight_cursor[i] - self.regions[i].weight_base
-                for i in range(self.num_engines)]
+        return self.arena.usage()
 
     def shard_quantized_weight(self, name: str, main_weight_addr: int, main_scale_addr: int,
                                K: int, N: int, layers: int, main_layer_stride: int,
@@ -2060,12 +2252,13 @@ class MultiEngineScheduler:
         # garbage rather than as an error.
         for engine_idx, (col_offset, cols) in enumerate(splits):
             need = int(cols * K * eb) * layers + (cols * K // COL_ALIGN) * 2 * layers
-            free = self.regions[engine_idx].weight_limit - self._weight_cursor[engine_idx]
+            free = (self.regions[engine_idx].weight_limit
+                    - self.arena._weight_cursor[engine_idx])
             if need > free:
                 raise MemoryError(
                     f"{name}: engine {engine_idx} needs {need / 2**20:.1f} MB for its "
                     f"{cols}-column shard but only {free / 2**20:.1f} MB is left in its "
-                    f"{private_weight_bytes(self.num_engines) / 2**20:.0f} MB weight "
+                    f"{self.arena.weight_bytes() / 2**20:.0f} MB weight "
                     f"arena (num_engines={self.num_engines}). Already allocated: "
                     f"{', '.join(sorted(self._weights)) or 'nothing'}. Either shard "
                     f"fewer ops or use fewer cores (bigger window each).")
@@ -2530,51 +2723,13 @@ class MultiEngineScheduler:
 
     # -- private-space protection ------------------------------------------
     def _check_isa_fits(self, engine_idx: int, addr: int, size_bytes: int) -> None:
-        """Refuse to write a worker program that would leave its private ISA slice.
-
-        The ISA slice sits directly below the tensor slice, which sits directly below
-        the NEXT engine's window. An overrun would not fault -- it would silently
-        scribble instructions over a neighbour's weights, so it has to be caught at emit
-        time. The program cursor also accumulates across compiles, which is the
-        realistic way to run out.
-        """
-        region = self.regions[engine_idx]
-        limit = region.isa_base + PRIVATE_ISA_BYTES
-        if addr < region.isa_base or addr + size_bytes > limit:
-            spill = ("tensor slice"
-                     if addr + size_bytes <= region.tensor_base + PRIVATE_TENSOR_BYTES
-                     else "next engine window")
-            raise MemoryError(
-                f"engine {engine_idx} ISA overflow: program "
-                f"[0x{addr:X}..0x{addr + size_bytes:X}) is outside its slice "
-                f"[0x{region.isa_base:X}..0x{limit:X}) "
-                f"({PRIVATE_ISA_BYTES // 2**20} MB). Writing it would corrupt the {spill}.")
+        """Refuse a worker program that would leave its private ISA slice."""
+        self.arena.check_isa_fits(engine_idx, addr, size_bytes)
 
     def verify_private_space(self, verbose: bool = True) -> None:
-        """Check every engine's weight arena and ISA slice are inside their window.
-
-        Cheap, host-side, and worth calling after setup: an overflow here is silent
-        corruption of a neighbouring engine's memory, not a fault.
-        """
+        """Check every engine's weight arena and ISA slice are inside their window."""
         self._require_private_map("verify_private_space")
-        for i, region in enumerate(self.regions):
-            used = self._weight_cursor[i] - region.weight_base
-            cap = region.weight_capacity
-            if self._weight_cursor[i] > region.weight_limit:
-                raise MemoryError(
-                    f"engine {i} weight arena overflow: {used / 2**20:.1f} MB used of "
-                    f"{cap / 2**20:.1f} MB, spilling into its ISA slice at "
-                    f"0x{region.isa_base:X}")
-            isa_used = self.engines[i].get_program_dram_addr() - region.isa_base
-            if i > 0 and not 0 <= isa_used <= PRIVATE_ISA_BYTES:
-                raise MemoryError(
-                    f"engine {i} ISA cursor 0x{self.engines[i].get_program_dram_addr():X} "
-                    f"is outside its {PRIVATE_ISA_BYTES // 2**20} MB slice at "
-                    f"0x{region.isa_base:X}")
-            if verbose:
-                isa_txt = f"{isa_used / 1024:7.1f} KB" if i > 0 else "     (main map)"
-                print(f"    core {i}: weights {used / 2**20:6.1f} / {cap / 2**20:.0f} MB"
-                      f"   isa {isa_txt} / {PRIVATE_ISA_BYTES // 2**20} MB")
+        self.arena.verify(self.engines, verbose=verbose)
 
     # ------------------------------------------------------------ internal --
     def _acquire_m_reg(self, engine_idx: int, rows: int) -> int:

@@ -36,7 +36,7 @@ class Gemma4LMMixin:
 
     def _ensure_prefill_scheduler(self):
         """Return the shared multicore configuration for the prefill stage."""
-        return self._ensure_stage_scheduler("prefill", self.VISION_ISA_BASE)
+        return self._ensure_stage_scheduler("prefill")
 
 
     def set_prefill_seq(self, prompt: str | None = None) -> None:
@@ -236,15 +236,17 @@ class Gemma4LMMixin:
          0x100000000 └───────────────────────────────────────────────────┘
 
         MULTI-CORE PROGRAM DRAM (MultiEngineScheduler via _ensure_stage_scheduler):
-          * 2-core (kintex7, --multi-core): worker base = VISION_WORKER_ISA_BASE.
-              vision:  core0 @0xFF000000 (4 MiB) | core1 @0xFF400000 (2.125 MiB).
-              LM prefill: master @LM_ISA_BASE | worker @VISION_ISA_BASE
-                          (reuses the vision core0 region — vision has finished).
-          * 8-core (Alveo, --multi-core 8): worker base = 0xFC000000,
-              stride 0x00240000 (2.25 MiB/worker) -> 7 slots 0xFC000000,
-              0xFC240000, ...  The vision weight/scratch arena top then drops
-              to 0xFC000000 (see tensor_init() / vision_weight_init()).
-        Single-core (--multi-core 1) uses only core0/master; no worker ISA.
+          Uniform at EVERY engine count (the old 2-core / >2-core split is gone).
+          The map above does not move: masters stay at VISION_ISA_BASE
+          0xFF000000 (vision) and LM_ISA_BASE 0xFF620000 (LM). EVERY worker
+          executes from the ISA slice of its own window in the LOW 2 GB,
+          allocated by multi_engine_shard.PrivateArena:
+              8 engines -> window i @ i*256 MiB, ISA slice at
+              window_top - 32 MiB, 16 MiB (images ~1.7 MB).
+          Vision and prefill are sequential and share ONE arena object, so
+          worker i always executes from the same slice in both stages.
+        Single-core (--multi-core 1) uses only core0/master; no worker ISA, and
+        keeps the original upper-2 GB addresses unchanged.
         ==================================================================
         """
         import mmap as _mmap
@@ -399,14 +401,14 @@ class Gemma4LMMixin:
                      │    against the arena top so scratch can't reach it. │
           0xFF000000 └ VISION_ISA_BASE (program region begins) ───────────┘
 
-        MULTI-CORE: each engine gets its OWN private attention scratch
-        VIS_FLASH_SCRATCH_PER_ENGINE[i] (~13.4 MiB each), so 2-core adds
-        ~13 MiB of scratch vs single-core and pushes the vision scratch
-        high-water up (single ~0xF54CE000 -> 2-core ~0xF61EE000). Vision
-        weights are top-placed to stay clear of it; the arena TOP is
-        VISION_ISA_BASE for <=2-core, or 0xFC000000 for >2-core (Alveo),
-        because the 8-core worker ISA arena starts at 0xFC000000 (the LM
-        persistent region below _scratch_dram_base is untouched either way).
+        MULTI-CORE: the map above does not move -- not one model address changes
+        with the engine count.
+        Core 0's tensor-arena usage is IDENTICAL to single-core, because
+        every per-engine buffer moved out: workers' attention scratch now comes
+        from each engine's private tensor window in the low 2 GB (see
+        self.mc_arena), not aliased onto "dead" tensor regions. So the scratch high-water
+        no longer grows with engine count, and the arena TOP is VISION_ISA_BASE
+        at every engine count. Vision weights stay top-placed against it.
         ==================================================================
         """
         # KV state follows the full decode context. Token-major workspaces only
@@ -730,19 +732,28 @@ class Gemma4LMMixin:
             _attn_scr_stride = (self.head_dim * _ph_rows + _ph_rows * _ph_rows
                                 + _ph_rows * self.head_dim) * self.bytes_per_element
             _n_eng = prefill_scheduler.num_engines
-            _scr_end = self.LAYER0_FLASH_SCRATCH_DRAM + _n_eng * _attn_scr_stride
-            print(f"[prefill attn scratch] base=0x{self.LAYER0_FLASH_SCRATCH_DRAM:X} "
-                  f"stride=0x{_attn_scr_stride:X} engines={_n_eng} "
-                  f"end=0x{_scr_end:X} next_tensor=0x{self.LAYER0_ATTN_PROJ_OUTPUT_DRAM:X} "
-                  f"slack={ (self.LAYER0_ATTN_PROJ_OUTPUT_DRAM - _scr_end)/(1024*1024):.2f} MiB")
-            assert _scr_end <= self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, (
-                f"prefill per-engine attn scratch overruns FLASH_SCRATCH: "
-                f"{_n_eng} engines × 0x{_attn_scr_stride:X} ends at 0x{_scr_end:X} > "
+            # Workers take their scratch from their PRIVATE TENSOR window in
+            # self.mc_arena (low 2 GB); core 0 keeps its LAYER0_FLASH_SCRATCH_DRAM
+            # buffer in the tensor arena. Previously every engine strided into
+            # that one buffer, so N engines walked straight through the tensors
+            # that follow it -- guarded only by an assert. The arena's cursor is
+            # shared with the vision scratch allocated earlier in the run, so
+            # the two stages cannot be handed the same address.
+            _scr_addrs = [self.LAYER0_FLASH_SCRATCH_DRAM] + [
+                self.mc_arena.alloc_tensor(e, _attn_scr_stride, "prefill attn scratch")
+                for e in range(1, _n_eng)]
+            print(f"[prefill attn scratch] core0=0x{self.LAYER0_FLASH_SCRATCH_DRAM:X} "
+                  f"(tensor arena) workers="
+                  f"{', '.join(f'0x{a:X}' for a in _scr_addrs[1:])} "
+                  f"used=0x{_attn_scr_stride:X} engines={_n_eng}")
+            # Core 0's own buffer must still hold one engine's worth.
+            assert (self.LAYER0_FLASH_SCRATCH_DRAM + _attn_scr_stride
+                    <= self.LAYER0_ATTN_PROJ_OUTPUT_DRAM), (
+                f"prefill core0 attn scratch overruns FLASH_SCRATCH: "
+                f"0x{_attn_scr_stride:X} from 0x{self.LAYER0_FLASH_SCRATCH_DRAM:X} > "
                 f"next tensor 0x{self.LAYER0_ATTN_PROJ_OUTPUT_DRAM:X}")
             prefill_scheduler.register_per_engine_addrs(
-                "prefill_attn_scratch",
-                [self.LAYER0_FLASH_SCRATCH_DRAM + e * _attn_scr_stride
-                 for e in range(_n_eng)])
+                "prefill_attn_scratch", _scr_addrs)
 
         def _shard_projection_core(ctx, **kwargs) -> int:
             """Emit one fixed row shard through the two-pass matmatmul core."""

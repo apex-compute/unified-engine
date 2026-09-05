@@ -50,7 +50,7 @@ from user_dma_core import UnifiedEngine
 from user_dma_core import ue_35bit_addr_shifter
 from user_dma_core import INSTRUCTION_SIZE_BYTES
 from user_dma_core import UE_MODE
-from multi_engine_shard import MultiEngineScheduler
+from multi_engine_shard import MultiEngineScheduler, PrivateArena
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -746,27 +746,28 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     bin, compiles prefill/decoder into one bin, runs prefill + decode. Numeric
     checks live in gemma4_e2b_numeric.py."""
 
-    def _ensure_stage_scheduler(self, stage: str, worker_dram_base: int):
-        """Return the shared two-engine scheduler configuration for one stage."""
+    def _ensure_stage_scheduler(self, stage: str):
+        """Return the shared scheduler for one stage, over the model-wide arena.
+
+        Every worker, at every engine count, executes from its own window in
+        ``self.mc_arena`` (upper 2 GB) — the old hand-rolled worker-ISA base and
+        stride are gone, and so is the 2-core special case that parked a worker
+        inside the lower-2 GB model map.
+
+        THE ARENA IS PASSED IN, NOT BUILT PER STAGE. Vision and prefill get
+        separate schedulers but must not get separate allocators: two allocators
+        over one address range hand out the same addresses twice, and stage 2's
+        worker programs land on stage 1's. Sharing the object keeps one cursor
+        per engine for the whole run.
+        """
         if self.multi_core == 1:
             return None
         scheduler = self._multi_core_schedulers.get(stage)
         if scheduler is None:
-            # Two-core keeps its single worker at the supplied stage address
-            # (huge stride; only the base is used). >2-core packs the extra
-            # workers into the dedicated MULTICORE_WORKER_ISA arena. Vision and
-            # prefill are sequential, so both stages reuse this worker-ISA arena.
-            worker_stride = 0x10000000
-            if self.multi_core > 2:
-                worker_dram_base = self.MULTICORE_WORKER_ISA_BASE
-                worker_stride = self.MULTICORE_WORKER_ISA_STRIDE
             scheduler = MultiEngineScheduler(
                 self, num_engines=self.multi_core,
                 engine_base_stride=0x00010000,
-                worker_dram_base=worker_dram_base,
-                worker_dram_stride=worker_stride,
-                worker_tensor_offset=0,
-                worker_program_offset=0,
+                arena=self.mc_arena,
                 barrier_margin_nops=32,
                 allow_unaligned_rows=True,
                 allow_more_than_two_engines=self.multi_core > 2)
@@ -808,49 +809,55 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._multi_core_schedulers = {}
         self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
-        # Gemma4 DRAM layout. SINGLE-CORE keeps the original upper-2 GB window
-        # (matching the Llama-3.2-1B path); its 16 MiB ISA region is tight but
-        # sufficient for one engine. MULTI-CORE re-bases to 0x0 with the full
-        # 4 GB budget so the per-engine worker programs (incl. sharded vision
-        # RoPE) and future parallelism add-ons have room, and so the vision
-        # tensor arena is large enough for N-engine scratch.
+        # Gemma4 DRAM layout. ONE model map, used at EVERY engine count: the
+        # original upper-2 GB window, unchanged from the single-core path. Adding
+        # engines does not move a single model address.
         #
-        # SINGLE-CORE (upper 2 GB):
+        # MODEL MAP, upper 2 GB (all engine counts):
         #   PARAMS  weights   : 0x80000000 – 0xE1000000  (1552 MiB)
         #   TENSOR  acts/scr  : 0xE1000000 – 0xFF000000  (480 MiB, LM<->vision)
-        #   ISA vision core0  : 0xFF000000 – 0xFF400000  (4 MiB)
-        #   ISA vision core1  : 0xFF400000 – 0xFF620000  (2.125 MiB, unused 1-core)
-        #   ISA LM            : 0xFF620000 – 0x100000000 (9.875 MiB)
+        #   ISA vision core0  : 0xFF000000 – 0xFF400000  (4 MiB, master)
+        #   ISA reserved      : 0xFF400000 – 0xFF620000  (2.125 MiB)
+        #   ISA LM            : 0xFF620000 – 0x100000000 (9.875 MiB, master)
+        # Vision and LM programs remain resident at disjoint addresses. Only
+        # MASTER programs live here now -- workers moved out (below).
         #
-        # MULTI-CORE (full 4 GB, base 0x0):
-        #   PARAMS  weights   : 0x00000000 – 0x80000000  (2 GiB;  LM ~1540 MB)
-        #   TENSOR  acts/scr  : 0x80000000 – 0xC0000000  (1 GiB;  LM + vision,
-        #                        incl. up-to-12-engine vision scratch + top wts)
-        #   ISA vision core0  : 0xC0000000 – 0xC8000000  (128 MiB, master)
-        #   ISA vision core1  : 0xC8000000 – 0xE0000000  (384 MiB, 2-core worker)
-        #   ISA LM            : 0xE0000000 – 0xF0000000  (256 MiB)
-        #   ISA >2-core workrs: 0xF0000000 – 0x100000000 (256 MiB, 16 MiB/worker)
-        # Vision and LM programs remain resident at disjoint addresses.
+        # MULTI-CORE PRIVATE SPACE, the whole lower 2 GB — empty at 1 core. It is
+        # NOT hand-partitioned: it goes to multi_engine_shard.PrivateArena, which
+        # splits it into one window per engine, each laid out
+        # [ weights | ISA | tensor ] with the two fixed slices at the TOP:
+        #   8 engines  -> 256 MiB/window: 224 MiB weights + 16 MiB ISA + 16 MiB tensor
+        #   12 engines -> 160 MiB/window: 128 MiB weights + 16 MiB ISA + 16 MiB tensor
+        # The ISA slice holds that engine's worker program (~1.7 MB today); the
+        # tensor slice holds everything an engine must not share -- vision attn
+        # scratch (13.12 MiB) and prefill attn scratch (1.50 MiB) both come out
+        # of it. The weight arena is unused so far and is what decoder weight
+        # sharding will draw on.
+        #
+        # WHY BELOW THE MODEL MAP AND NOT ABOVE IT. The model map begins at
+        # DRAM_START_ADDR (0x80000000) and every model address is allocated
+        # upwards from there, so nothing the model owns can ever reach below it.
+        # A private window carved from the low 2 GB therefore cannot alias model
+        # memory however the model's cursors move -- which is the whole point,
+        # and is the same arrangement gemma3 uses.
+        #
+        # ONE arena object serves the whole run (self.mc_arena): the model
+        # allocates scratch from it during tensor init, and every stage's
+        # MultiEngineScheduler is handed the SAME object, so there is exactly one
+        # cursor per engine rather than one per scheduler.
+        # Window 0 belongs to core 0, which keeps its own tensor-arena buffers;
+        # its window stays reserved so engine index == window index everywhere.
         self.DRAM_END = 0x100000000
-        if self.multi_core == 1:
-            _params_base  = 0x80000000
-            _tensor_base  = 0xE1000000
-            self.VISION_ISA_BASE             = 0xFF000000
-            self.VISION_WORKER_ISA_BASE      = 0xFF400000
-            self.LM_ISA_BASE                 = 0xFF620000
-            self.MULTICORE_WORKER_ISA_BASE   = 0xFC000000    # unused (1-core)
-            self.MULTICORE_WORKER_ISA_STRIDE = 0x00240000    # unused (1-core)
-        else:
-            _params_base  = 0x00000000
-            _tensor_base  = 0x80000000
-            self.VISION_ISA_BASE             = 0xC0000000
-            self.VISION_WORKER_ISA_BASE      = 0xC8000000
-            self.LM_ISA_BASE                 = 0xE0000000
-            self.MULTICORE_WORKER_ISA_BASE   = 0xF0000000    # >2-core worker arena
-            # Eleven 16-MiB slots support 12 engines and occupy 176 MiB of the
-            # 256-MiB worker arena. Current worker images are below 2 MiB; the
-            # per-section overflow checks below enforce the slot boundary.
-            self.MULTICORE_WORKER_ISA_STRIDE = 0x01000000    # 16 MiB / worker
+        _params_base  = 0x80000000
+        _tensor_base  = 0xE1000000
+        self.VISION_ISA_BASE             = 0xFF000000
+        self.VISION_WORKER_ISA_BASE      = 0xFF400000
+        self.LM_ISA_BASE                 = 0xFF620000
+        # Per-engine private windows: the whole low 2 GB, split by the library.
+        # Uniform at EVERY engine count -- vision and prefill are sequential and
+        # share one arena, so engine i always owns the same window in both.
+        self.mc_arena = (PrivateArena(multi_core, verbose=True)
+                         if multi_core > 1 else None)
         # Top of the vision tensor arena (vision weights are top-placed against
         # it; scratch stays below). In the multi-core layout every worker ISA
         # lives in the dedicated ISA region, so the tensor arena simply runs up
@@ -1264,12 +1271,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 worker_bytes = bytearray()
                 for inst in worker.capture_buffer:
                     worker_bytes.extend(inst.get_bytes())
-                worker_limit = (worker_addr + self.MULTICORE_WORKER_ISA_STRIDE
-                                if self.multi_core > 2 else self.LM_ISA_BASE)
-                if worker_addr + len(worker_bytes) > worker_limit:
-                    raise RuntimeError(
-                        f"prefill core{engine_idx} ISA overflow: "
-                        f"0x{worker_addr + len(worker_bytes):X} > 0x{worker_limit:X}")
+                # The arena owns the bound: this engine's ISA slice, whose
+                # neighbour above is its own tensor scratch and then the next
+                # engine's window. An overrun would not fault, so it is checked
+                # where the image is written.
+                self.mc_arena.check_isa_fits(engine_idx, worker_addr, len(worker_bytes))
                 self._store_program_section(
                     f"prefill_worker{engine_idx}", worker_addr, worker_bytes,
                     {"parent": "lm", "engine_idx": engine_idx,
