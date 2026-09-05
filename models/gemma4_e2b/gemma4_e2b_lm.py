@@ -2261,7 +2261,7 @@ class Gemma4LMMixin:
         import shutil
         _dec_start_seq = self.seq_len
         _dec_timer = time.perf_counter()
-        _first_tok_dt = None   # wall-clock of the 1st decoded token → peak tok/s
+        _first_tok_hw_us = None  # FPGA latency of the 1st decoded token → peak tok/s
         _decoded_n = 0         # number of decode steps (for average tok/s)
         _decoded_ids = []      # generated token ids (for the run-summary decoded text)
         _use_status = sys.stdout.isatty()
@@ -2356,8 +2356,17 @@ class Gemma4LMMixin:
             self._set_silent(False)
 
             _tok_dt = time.perf_counter() - _tok_t0
-            if _first_tok_dt is None:
-                _first_tok_dt = _tok_dt                  # 1st token (shortest context) → peak
+            if _first_tok_hw_us is None:
+                # PEAK IS AN FPGA NUMBER. `latency` is this token's hardware
+                # execution counter in microseconds (report_latency_in_us via
+                # program_execute), so it excludes every host-side cost in this
+                # loop -- the embedding lookups, the two bias uploads, the worker
+                # preambles and drains, the argmax readback and the tokenizer.
+                # Those belong in the AVERAGE, which is wall-clock by design;
+                # putting them in the peak would report host overhead as though
+                # it were accelerator speed, and would make the number move with
+                # unrelated host work.
+                _first_tok_hw_us = latency
             _decoded_n += 1
 
             if token_id in [1, self._end_of_turn_token_id]:
@@ -2374,10 +2383,14 @@ class Gemma4LMMixin:
                 _status_teardown()
         # Decode-speed report (matches the Qwen comparison table format).
         _elapsed = time.perf_counter() - _dec_timer
-        _peak = (1.0 / _first_tok_dt) if _first_tok_dt else 0.0
+        # peak  = 1st token, FPGA hardware counter  (comparable with --profile's
+        #         "Decode HW throughput", which sums the same counter per segment)
+        # average = every token, host wall clock    (what a user actually waits)
+        _peak = (1e6 / _first_tok_hw_us) if _first_tok_hw_us else 0.0
         _avg = (_decoded_n / _elapsed) if _elapsed > 0 else 0.0
-        print(f"\nDecode speed: peak (1st token) {_peak:.2f} tok/s, "
-              f"average {_avg:.2f} tok/s  ({_decoded_n} tokens in {_elapsed:.2f}s)")
+        print(f"\nDecode speed: peak (1st token, HW) {_peak:.2f} tok/s, "
+              f"average (wall clock) {_avg:.2f} tok/s  "
+              f"({_decoded_n} tokens in {_elapsed:.2f}s)")
         # Stash decode metrics for the run-summary writer (write_run_summary).
         self._decode_peak_toks = _peak
         self._decode_avg_toks = _avg

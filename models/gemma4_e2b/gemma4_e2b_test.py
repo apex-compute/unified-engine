@@ -1516,7 +1516,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         lines.append(f"- **Decoded tokens:** {gen_n if gen_n is not None else 'n/a'} generated "
                      f"(sequence total {total_tok})")
         if peak_toks is not None:
-            lines.append(f"- **First-token speed (peak):** {peak_toks:.1f} tok/s")
+            lines.append(f"- **First-token speed (peak, HW counter):** {peak_toks:.1f} tok/s")
         if avg_gflops is not None:
             lines.append(f"- **Average FLOPS:** {avg_gflops:.1f} GFLOPS")
             lines.append(f"- **Decode utilization (% peak):** {_util(avg_gflops)}")
