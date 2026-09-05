@@ -85,6 +85,7 @@ class Gemma4LMMixin:
         for layer_idx in range(layer_size):
             off = layer_idx * stride
             _, cur_q_size, cur_k_size = self._get_layer_attention_dims(layer_idx)
+            cur_mlp = self._get_mlp_elements(layer_idx)
             kv_own = layer_idx not in self._kv_shared_map
             # (op, K, N, weight base, scale base). Q/K/V share K=vector_length
             # and differ in N; the O projection is the transpose of that shape --
@@ -95,7 +96,19 @@ class Gemma4LMMixin:
                      self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE),
                     ("o", cur_q_size, self.vector_length,
                      self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT,
-                     self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE)]
+                     self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE),
+                    # MLP. gate and up are the same shape and read the same
+                    # input; down is their transpose -- it consumes the whole
+                    # gate*up product, so its K is the MLP width.
+                    ("gate", self.vector_length, cur_mlp,
+                     self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT,
+                     self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE),
+                    ("up", self.vector_length, cur_mlp,
+                     self.DRAM_ADDR_LAYER0_MLP_UP_QUANT,
+                     self.DRAM_ADDR_LAYER0_MLP_UP_SCALE),
+                    ("down", cur_mlp, self.vector_length,
+                     self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT,
+                     self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE)]
             if kv_own:
                 # A layer that borrows another layer's KV cache projects no K/V
                 # of its own, so there is nothing to shard for it.
@@ -119,7 +132,7 @@ class Gemma4LMMixin:
                     data_type=TYPE.IF4, verbose=False)
         self._decode_qkv_shards = shards
         used = sched.private_usage()
-        print(f"[Decode] Q/K/V/O sharded: {len(shards)} projection(s) over "
+        print(f"[Decode] sharded: {len(shards)} projection(s) over "
               f"{sched.num_engines} engines in {time.perf_counter() - t0:.1f}s"
               f"{f'; {len(skipped)} left on the master' if skipped else ''}; "
               f"private weight arenas: "
@@ -1614,7 +1627,8 @@ class Gemma4LMMixin:
         _shards = (self._ensure_decode_qkv_shards(_dec_sched, layer_size)
                    if _dec_sched is not None else {})
 
-        def _emit_shard(ue, sw, e: int, out_base: int, a_addr: int) -> int:
+        def _emit_shard(ue, sw, e: int, out_base: int, a_addr: int,
+                        gelu: bool = False) -> int:
             """Emit engine ``e``'s column block of one projection.
 
             B and the scales come from THIS engine's private arena; ``a_addr`` is
@@ -1635,20 +1649,23 @@ class Gemma4LMMixin:
                 B_DRAM_ADDR=sh.weight_addr,
                 OUTPUT_DRAM_ADDR=out_base + out_off,
                 SCALE_DRAM_ADDR=sh.scale_addr,
+                # gelu is elementwise on the output columns, so a column shard
+                # applies it to exactly its own block -- no cross-engine term.
+                gelu_enable=gelu,
                 data_type=TYPE.IF4) or 0
 
         def _emit_worker_round(ops) -> None:
             """Workers' side of one layer's round, then close it.
 
-            ``ops`` is [(ShardedWeight, out_base, a_addr)] for whatever shards in
-            this round. Called exactly once per round the master opened, and only
+            ``ops`` is [(ShardedWeight, out_base, a_addr, gelu)] for whatever
+            shards in this round. Called exactly once per round the master opened, and only
             after the master has emitted its own blocks, so each engine's stream
             reads: wait, work, signal, wait-for-close, re-arm.
             """
             for e in _dec_sched.worker_indices():
                 _dec_sched.begin_worker_round(e)
-                for sw, out_base, a_addr in ops:
-                    _emit_shard(_dec_sched.engines[e], sw, e, out_base, a_addr)
+                for sw, out_base, a_addr, gelu in ops:
+                    _emit_shard(_dec_sched.engines[e], sw, e, out_base, a_addr, gelu)
                 _dec_sched.end_worker_round(e)
             _dec_sched.join()
 
@@ -1727,7 +1744,7 @@ class Gemma4LMMixin:
                 _q_sw = _shards.get(("q", layer_idx))
                 _k_sw = _shards.get(("k", layer_idx)) if _kv_own else None
                 _v_sw = _shards.get(("v", layer_idx)) if _kv_own else None
-                _round_ops = [(sw, out, self.LAYER0_PRE_NORM_DRAM) for sw, out in
+                _round_ops = [(sw, out, self.LAYER0_PRE_NORM_DRAM, False) for sw, out in
                               ((_q_sw, self.LAYER0_Q_DRAM),
                                (_k_sw, self.LAYER0_K_DRAM),
                                (_v_sw, self.LAYER0_FLASH_V_DRAM)) if sw is not None]
@@ -1925,7 +1942,7 @@ class Gemma4LMMixin:
                                                self.LAYER0_FLASH_OUTPUT_DRAM)
                     total_flops += _dec_sched.worker_flops(_o_sw)
                     _emit_worker_round([(_o_sw, self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                                         self.LAYER0_FLASH_OUTPUT_DRAM)])
+                                         self.LAYER0_FLASH_OUTPUT_DRAM, False)])
                 # Decode-only fused attention residual and FFN pre-normalization.
                 _vec_a = 0x10000
                 _vec_b = 0x90000
@@ -1958,36 +1975,73 @@ class Gemma4LMMixin:
 
                 _checkpoint(f"L{layer_idx}_o_proj")
 
-                total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
-                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
-                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                    data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
-                    gelu_enable=True,
-                    )
-                total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
-                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
-                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                    data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
-                    )
+                # MLP gate + up: ONE round. Both read PRE_MLP_NORM and write
+                # their own output, so an engine stays in its own lane across the
+                # pair and no barrier is needed between them.
+                _gate_sw = _shards.get(("gate", layer_idx))
+                _up_sw = _shards.get(("up", layer_idx))
+                _mlp_ops = [(sw, out, self.LAYER0_PRE_MLP_NORM_DRAM, gelu)
+                            for sw, out, gelu in
+                            ((_gate_sw, self.LAYER0_MLP_GATE_DRAM, True),
+                             (_up_sw, self.LAYER0_MLP_UP_DRAM, False))
+                            if sw is not None]
+                if _mlp_ops:
+                    _dec_sched.release()
+                if _gate_sw is None:
+                    total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
+                        A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
+                        data_type=TYPE.IF4,
+                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
+                        gelu_enable=True,
+                        )
+                else:
+                    total_flops += _emit_shard(self, _gate_sw, 0, self.LAYER0_MLP_GATE_DRAM,
+                                               self.LAYER0_PRE_MLP_NORM_DRAM, gelu=True)
+                    total_flops += _dec_sched.worker_flops(_gate_sw)
+                if _up_sw is None:
+                    total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
+                        A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                        data_type=TYPE.IF4,
+                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
+                        )
+                else:
+                    total_flops += _emit_shard(self, _up_sw, 0, self.LAYER0_MLP_UP_DRAM,
+                                               self.LAYER0_PRE_MLP_NORM_DRAM)
+                    total_flops += _dec_sched.worker_flops(_up_sw)
+                # Close BEFORE the multiply: it reads both vectors whole.
+                if _mlp_ops:
+                    _emit_worker_round(_mlp_ops)
 
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=cur_mlp)
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=cur_mlp)
                 self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=cur_mlp)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=cur_mlp)
 
-                total_flops += _projection_core(M=1, K=cur_mlp, N=self.vector_length,
-                    A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
-                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                    is_B_quantized=True,
-                    data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
-                    gpr_M_reg=gpr_one,
-                    )
+                # MLP down: ITS OWN round. Its K spans the whole gate*up product,
+                # which only exists after the master's multiply above, so it cannot
+                # ride in the gate/up round.
+                _down_sw = _shards.get(("down", layer_idx))
+                if _down_sw is None:
+                    total_flops += _projection_core(M=1, K=cur_mlp, N=self.vector_length,
+                        A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
+                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                        is_B_quantized=True,
+                        data_type=TYPE.IF4,
+                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
+                        gpr_M_reg=gpr_one,
+                        )
+                else:
+                    _dec_sched.release()
+                    total_flops += _emit_shard(self, _down_sw, 0, self.LAYER0_MLP_DOWN_DRAM,
+                                               self.LAYER0_MLP_MULT_DRAM)
+                    total_flops += _dec_sched.worker_flops(_down_sw)
+                    _emit_worker_round([(_down_sw, self.LAYER0_MLP_DOWN_DRAM,
+                                         self.LAYER0_MLP_MULT_DRAM, False)])
                 # Decode-only fused MLP post-normalization + residual. Keep the
                 # normalized MLP-down vector in SRAM through the residual add,
                 # removing the post-MLP-norm DRAM write/read pair.
