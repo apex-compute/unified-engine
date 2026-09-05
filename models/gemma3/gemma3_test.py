@@ -265,8 +265,27 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     run_prefill/run_decoder (numeric checks in gemma3_numeric.py).
     """
 
-    def __init__(self, script_dir: str | None = None, local_weights: bool = False, legacy: bool = False, matmatmul: bool = False, two_pass_prefill: bool = False):
+    def __init__(self, script_dir: str | None = None, local_weights: bool = False, legacy: bool = False, matmatmul: bool = False, two_pass_prefill: bool = False, multi_core: int = 1):
         super().__init__(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR, program_dram_base=DRAM_INSTRUCTION_ADDR)
+        # Decode sharding N-splits ONE quantized_matmat_core across engines. --legacy
+        # (no PBI) and --two-pass-decoder (matmat_mul_core) are different decode kernels
+        # with no sharded form, so multi-core forces the quantized/PBI path.
+        self.multi_core = int(multi_core)
+        if self.multi_core > 1:
+            if legacy:
+                raise ValueError("--multi-core requires the PBI decoder; drop --legacy")
+            if matmatmul:
+                raise ValueError("--multi-core shards quantized_matmat_core only; drop --two-pass-decoder")
+        self.shard_group = None          # set by setup_multi_core() once HW_INFO is known
+        self.sharded_mlp_gate = None
+        self.sharded_mlp_up = None
+        self.sharded_lm_head = None
+        self.sharded_mlp_down = None
+        self.sharded_attn_oproj = None
+        self.sharded_q_proj = None
+        self.sharded_k_proj = None
+        self.sharded_v_proj = None
+        self.sharded_attention = None
         self.legacy = legacy
         self.two_pass_prefill = two_pass_prefill
         self.matmatmul = matmatmul
@@ -1555,6 +1574,124 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "checkpoints": checkpoints,
         }
         
+    def _mc_tag(self) -> str:
+        """Cache-name suffix for the engine count.
+
+        The sharded decoder body bakes in each engine's own N and its private weight
+        bases, so a compiled image is valid ONLY for the core count that built it. Every
+        bin/meta path -- run and profile, compiler and loader -- must agree on this tag,
+        or a --multi-core run replays a body built for a different split.
+        """
+        return f"_mc{self.multi_core}" if self.multi_core > 1 else ""
+
+    def setup_multi_core(self) -> None:
+        """Bring up the worker engines and copy each one's column block of the MLP gate.
+
+        Called after the weights are in DRAM (the shard copy reads them back out of the
+        main params image) and before compile. A no-op at --multi-core 1.
+        """
+        if self.multi_core <= 1:
+            return
+        from multi_engine_shard_gemma3 import Gemma3ShardGroup
+
+        print(f"\n--- Multi-core setup ({self.multi_core} engines) ---")
+        self.shard_group = Gemma3ShardGroup(self, self.multi_core)
+        self.shard_group.reset_workers()
+        self.sharded_mlp_gate = self.shard_group.shard_quantized_weight(
+            name="mlp_gate",
+            main_weight_addr=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT,
+            main_scale_addr=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE,
+            K=self.vector_length, N=self.mlp_elements, layers=self.LAYER_SIZE,
+            main_layer_stride=self.weight_defs["LAYER_WEIGHT_SIZE"],
+            data_type=TYPE.IF4,
+        )
+        # gate and up read the SAME pre-MLP-norm input and write disjoint column slices of
+        # their own outputs, so an engine's lane covers both. They ride in one round.
+        self.sharded_mlp_up = self.shard_group.shard_quantized_weight(
+            name="mlp_up",
+            main_weight_addr=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT,
+            main_scale_addr=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE,
+            K=self.vector_length, N=self.mlp_elements, layers=self.LAYER_SIZE,
+            main_layer_stride=self.weight_defs["LAYER_WEIGHT_SIZE"],
+            data_type=TYPE.IF4,
+        )
+        # Q / K / V projections: all three read PRE_NORM and write disjoint LITERAL staging
+        # buffers (the KV-cache append happens separately, after), so they share one round.
+        # K and V are N=256 -- only 4 blocks of 64 -- so they cannot be split beyond 4
+        # engines and are left full-width above that; Q (N=1024) splits evenly to 8.
+        if SHARD_QKV:
+            from multi_engine_shard_gemma3 import can_split
+            _qkv = [("q_proj", self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
+                     self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE, self.head_dim * self.group_size),
+                    ("k_proj", self.DRAM_ADDR_LAYER0_K_PROJ_QUANT,
+                     self.DRAM_ADDR_LAYER0_K_PROJ_SCALE, self.head_dim),
+                    ("v_proj", self.DRAM_ADDR_LAYER0_V_PROJ_QUANT,
+                     self.DRAM_ADDR_LAYER0_V_PROJ_SCALE, self.head_dim)]
+            for _name, _w, _s, _n in _qkv:
+                if not can_split(_n, self.multi_core):
+                    print(f"  {_name}: N={_n} is only {_n // 64} block(s) of 64, too few for "
+                          f"{self.multi_core} engines -- left full-width on engine 0")
+                    continue
+                setattr(self, f"sharded_{_name}", self.shard_group.shard_quantized_weight(
+                    name=_name, main_weight_addr=_w, main_scale_addr=_s,
+                    K=self.vector_length, N=_n, layers=self.LAYER_SIZE,
+                    main_layer_stride=self.weight_defs["LAYER_WEIGHT_SIZE"],
+                    data_type=TYPE.IF4))
+
+        # Attention itself, split over its BATCH (the GQA query group). Unlike every other
+        # shard this one needs private SCRATCH -- the core stages V-transpose / scores /
+        # scaled-Q through it, so two engines sharing one would corrupt each other. It comes
+        # out of the private TENSOR window, reserved and unused until now.
+        # batch = group_size = 4, so above 4 engines the leading ones get zero rows; they
+        # still run the round's handshake.
+        if SHARD_ATTENTION:
+            _aq = ((self.MAX_CONTEXT_SIZE + 63) // 64) * 64
+            _scratch = (self.head_dim * _aq + _aq * _aq + _aq * self.head_dim) * self.bytes_per_element
+            self.sharded_attention = self.shard_group.shard_attention(
+                name="attention", batch=self.group_size, head_dim=self.head_dim,
+                aligned_seq_len=_aq, scratch_bytes=_scratch)
+
+        # Attention output projection. Reads FLASH_OUTPUT, which only the master produces
+        # (attention itself is not sharded), so it needs its own round before the post-attn
+        # norm. K=1024, N=1152 -- the same N split as mlp down.
+        if SHARD_ATTN_OPROJ:
+            self.sharded_attn_oproj = self.shard_group.shard_quantized_weight(
+                name="attn_oproj",
+                main_weight_addr=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT,
+                main_scale_addr=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE,
+                K=self.head_dim * self.group_size, N=self.vector_length,
+                layers=self.LAYER_SIZE,
+                main_layer_stride=self.weight_defs["LAYER_WEIGHT_SIZE"],
+                data_type=TYPE.IF4,
+            )
+
+        # MLP down: MASKED OFF for now -- runs full-width on engine 0.
+        # It consumes the FULL gate*up product, so its K spans every engine's columns: it
+        # cannot ride in the gate/up round and needs a SECOND rendezvous per layer, and its
+        # N=1152 splits 192x2 + 128x6, a 33% imbalance against gate's 7%. Both of those
+        # lean hard on the dummy-delay stand-in for the missing CHECK_ZERO. Set
+        # SHARD_MLP_DOWN = True to re-enable; the emit path below is still in place.
+        if SHARD_MLP_DOWN:
+            self.sharded_mlp_down = self.shard_group.shard_quantized_weight(
+                name="mlp_down",
+                main_weight_addr=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT,
+                main_scale_addr=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE,
+                K=self.mlp_elements, N=self.vector_length, layers=self.LAYER_SIZE,
+                main_layer_stride=self.weight_defs["LAYER_WEIGHT_SIZE"],
+                data_type=TYPE.IF4,
+            )
+        # LM head: once per token, layer-independent, and N=262144 splits into 4096 blocks
+        # of 64 -- exactly 512 per engine at 8 cores, the only perfectly even shard here.
+        self.sharded_lm_head = self.shard_group.shard_quantized_weight(
+            name="lm_head",
+            main_weight_addr=self.DRAM_ADDR_LM_HEAD_QUANT,
+            main_scale_addr=self.DRAM_ADDR_LM_HEAD_SCALE,
+            K=self.vector_length, N=self.EMBEDDING_ELEMENTS, layers=1,
+            main_layer_stride=0,
+            data_type=TYPE.IF4,
+        )
+        self.shard_group.verify_private_space()
+
     def _compile_decoder_programs(self, layer_size: int = 26, use_pbi: bool = False, profile: bool = False) -> dict:
         """Compile a single decoder program; KV length is selected at runtime via ``gpr_aligned_seq_len``.
 
@@ -1877,9 +2014,64 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         gpr_sqrt_vector_length = self.alloc_isa_reg()
         gpr_sqrt_head_dim = self.alloc_isa_reg()
         gpr_attn_scale = self.alloc_isa_reg()  # bf16 of 1/sqrt(head_dim) for the runtime attention scale
+        # Decode sharding: engine 0's own private weight/scale cursors. They cannot ride on
+        # gpr_layer_off -- that steps by the main image's LAYER_WEIGHT_SIZE, while the private
+        # arena holds only this engine's columns, packed layer after layer.
+        _shard = self.shard_group if (self.shard_group is not None
+                                      and self.sharded_mlp_gate is not None
+                                      and self.sharded_mlp_up is not None
+                                      and self.sharded_lm_head is not None) else None
+        _shard_down = _shard if (_shard is not None
+                                 and self.sharded_mlp_down is not None) else None
+        _shard_op = _shard if (_shard is not None
+                               and self.sharded_attn_oproj is not None) else None
+        _shard_at = _shard if (_shard is not None
+                               and self.sharded_attention is not None) else None
+        _attn_op = None
+        if _shard_at is not None:
+            from multi_engine_shard_gemma3 import AttentionOp
+            _attn_op = AttentionOp(
+                sa=self.sharded_attention,
+                q_addr=self.LAYER0_FLASH_Q_DRAM,
+                k_addr=self.LAYER0_K_ROPE_DRAM, v_addr=self.LAYER0_V_DRAM,
+                bias_addr=self.LAYER0_FLASH_BIAS_DRAM,
+                out_addr=self.LAYER0_FLASH_OUTPUT_DRAM,
+                identity_addr=self.IDENTITY_DRAM_ADDR,
+                kv_layer_stride=self.MAX_CONTEXT_SIZE * self.k_size,
+                scale_bf16=self.float_to_bf16(1.0 / (self.head_dim ** 0.5)))
+        # Q/K/V: whichever of the three actually got sharded (K/V drop out above 4 engines).
+        _qkv_ops = [] if _shard is None else [
+            (sw, self.LAYER0_PRE_NORM_DRAM, out, kdim)
+            for sw, out, kdim in ((self.sharded_q_proj, self.LAYER0_Q_DRAM,
+                                   self.head_dim * self.group_size),
+                                  (self.sharded_k_proj, self.LAYER0_K_DRAM, self.head_dim),
+                                  (self.sharded_v_proj, self.LAYER0_FLASH_V_DRAM, self.head_dim))
+            if sw is not None]
+        _shard_qkv = _shard if _qkv_ops else None
+        gpr_shard_w = self.alloc_isa_reg() if _shard is not None else None
+        gpr_shard_s = self.alloc_isa_reg() if _shard is not None else None
+        gpr_shard_w_up = self.alloc_isa_reg() if _shard is not None else None
+        gpr_shard_s_up = self.alloc_isa_reg() if _shard is not None else None
+        gpr_shard_w_dn = self.alloc_isa_reg() if _shard_down is not None else None
+        gpr_shard_s_dn = self.alloc_isa_reg() if _shard_down is not None else None
+        gpr_shard_w_op = self.alloc_isa_reg() if _shard_op is not None else None
+        gpr_shard_s_op = self.alloc_isa_reg() if _shard_op is not None else None
+        # gpr_dim_group holds group_size for the Q-norm row count, so the master's OWN
+        # attention batch (its slice of the group) needs a register of its own.
+        gpr_attn_batch = self.alloc_isa_reg() if _shard_at is not None else None
+        gpr_qkv = [(self.alloc_isa_reg(), self.alloc_isa_reg()) for _ in _qkv_ops]
         self.generate_instruction_add_set(gpr_one, 1)
         self.generate_instruction_add_set(gpr_dim_group, self.group_size)
         self.generate_instruction_add_set(gpr_layer_off, 0)
+        if _shard is not None:
+            _shard.emit_primary_prologue(self.sharded_mlp_gate, gpr_shard_w, gpr_shard_s)
+            _shard.emit_primary_prologue(self.sharded_mlp_up, gpr_shard_w_up, gpr_shard_s_up)
+        if _shard_down is not None:
+            _shard_down.emit_primary_prologue(self.sharded_mlp_down, gpr_shard_w_dn, gpr_shard_s_dn)
+        if _shard_op is not None:
+            _shard_op.emit_primary_prologue(self.sharded_attn_oproj, gpr_shard_w_op, gpr_shard_s_op)
+        for (sw, _a, _o, _k), (gw, gs) in zip(_qkv_ops, gpr_qkv):
+            _shard.emit_primary_prologue(sw, gw, gs)
         self.generate_instruction_add_set(gpr_kv_off, 0)
         self.generate_instruction_add_set(gpr_rope_cycle, 6)
         self.generate_instruction_add_set(gpr_dim_vector_length, self.vector_length)
@@ -1889,6 +2081,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_add_set(gpr_sqrt_vector_length, self.float_to_bf19(self.vector_length ** 0.5))
         self.generate_instruction_add_set(gpr_sqrt_head_dim, self.float_to_bf19(self.head_dim ** 0.5))
         self.generate_instruction_add_set(gpr_attn_scale, self.float_to_bf16(1.0 / (self.head_dim ** 0.5)))
+        if _shard_at is not None:
+            self.generate_instruction_add_set(
+                gpr_attn_batch, self.sharded_attention.shard(0).batch_rows)
         program_start = self.get_program_dram_addr()
 
         # RMS N -> (dimension register, sqrt(N) RSQRT-scalar register).
@@ -1985,18 +2180,32 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             _checkpoint("pre_norm")
 
         # --- Q / K / V projections (single token) ---
-        total_flops += fold_matmul(self.vector_length, self.head_dim * self.group_size,
-                                   self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
-                                   self.LAYER0_Q_DRAM, self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE,
-                                   gpr_dim_vector_length, gpr_dim_head_dim_group)
-        total_flops += fold_matmul(self.vector_length, self.head_dim,
-                                   self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_K_PROJ_QUANT,
-                                   self.LAYER0_K_DRAM, self.DRAM_ADDR_LAYER0_K_PROJ_SCALE,
-                                   gpr_dim_vector_length, gpr_dim_head_dim)
-        total_flops += fold_matmul(self.vector_length, self.head_dim,
-                                   self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_V_PROJ_QUANT,
-                                   self.LAYER0_FLASH_V_DRAM, self.DRAM_ADDR_LAYER0_V_PROJ_SCALE,
-                                   gpr_dim_vector_length, gpr_dim_head_dim)
+        if _shard_qkv is not None:
+            # All three read PRE_NORM and write disjoint literal buffers, so every sharded
+            # one rides in a SINGLE round -- no barrier between them.
+            _shard_qkv.emit_release_workers()
+            for (sw, a_addr, out_addr, _k), (gw, gs) in zip(_qkv_ops, gpr_qkv):
+                total_flops += _shard_qkv.emit_primary_matmat(
+                    sw, a_addr=a_addr, out_addr=out_addr, gpr_w=gw, gpr_s=gs,
+                    gpr_a=gpr_scratch_a, gpr_out=gpr_scratch_c,
+                    gpr_M_reg=gpr_one, gelu=False)
+                total_flops += _shard_qkv.worker_flops(sw)
+            _shard_qkv.emit_join_workers()
+        if self.sharded_q_proj is None:
+            total_flops += fold_matmul(self.vector_length, self.head_dim * self.group_size,
+                                       self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
+                                       self.LAYER0_Q_DRAM, self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE,
+                                       gpr_dim_vector_length, gpr_dim_head_dim_group)
+        if self.sharded_k_proj is None:
+            total_flops += fold_matmul(self.vector_length, self.head_dim,
+                                       self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_K_PROJ_QUANT,
+                                       self.LAYER0_K_DRAM, self.DRAM_ADDR_LAYER0_K_PROJ_SCALE,
+                                       gpr_dim_vector_length, gpr_dim_head_dim)
+        if self.sharded_v_proj is None:
+            total_flops += fold_matmul(self.vector_length, self.head_dim,
+                                       self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_V_PROJ_QUANT,
+                                       self.LAYER0_FLASH_V_DRAM, self.DRAM_ADDR_LAYER0_V_PROJ_SCALE,
+                                       gpr_dim_vector_length, gpr_dim_head_dim)
 
         # --- append V row into this layer's V cache at the current token position ---
         self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_FLASH_V_DRAM,
@@ -2043,8 +2252,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             _checkpoint("qk_norm_rope")
 
         # --- grouped flash attention over the full accumulated cache for this layer ---
+        if _shard_at is not None:
+            _shard_at.emit_release_workers()
         _attn_flops = self.unified_attention_core(
-            batch=self.group_size,
+            batch=(self.sharded_attention.shard(0).batch_rows
+                   if _shard_at is not None else self.group_size),
             aligned_seq_len=decoder_aligned_seq_len,
             head_dim=self.head_dim,
             Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
@@ -2065,14 +2277,32 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         ) or 0
         total_flops += _attn_flops
         attn_flops += _attn_flops
+        if _shard_at is not None:
+            total_flops += _shard_at.attention_worker_flops(self.sharded_attention)
+            attn_flops += _shard_at.attention_worker_flops(self.sharded_attention)
+            _shard_at.emit_join_workers()
         if profile:
             _checkpoint("attention")
 
         # --- attention output projection ---
-        total_flops += fold_matmul(self.head_dim * self.group_size, self.vector_length,
-                                   self.LAYER0_FLASH_OUTPUT_DRAM, self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT,
-                                   self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE,
-                                   gpr_dim_head_dim_group, gpr_dim_vector_length)
+        if _shard_op is not None:
+            # FIRST round of the layer: attention above is master-only, so the workers sit
+            # parked here until its result exists for them to project.
+            _shard_op.emit_release_workers()
+            total_flops += _shard_op.emit_primary_matmat(
+                self.sharded_attn_oproj,
+                a_addr=self.LAYER0_FLASH_OUTPUT_DRAM,
+                out_addr=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                gpr_w=gpr_shard_w_op, gpr_s=gpr_shard_s_op,
+                gpr_a=gpr_scratch_a, gpr_out=gpr_scratch_c,
+                gpr_M_reg=gpr_one, gelu=False)
+            total_flops += _shard_op.worker_flops(self.sharded_attn_oproj)
+            _shard_op.emit_join_workers()
+        else:
+            total_flops += fold_matmul(self.head_dim * self.group_size, self.vector_length,
+                                       self.LAYER0_FLASH_OUTPUT_DRAM, self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT,
+                                       self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE,
+                                       gpr_dim_head_dim_group, gpr_dim_vector_length)
         total_flops += dec_rms(
             1, self.vector_length,
             self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, self.LAYER0_POST_ATTN_NORM_DRAM, self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA,
@@ -2103,14 +2333,37 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             _checkpoint("pre_ffn_norm")
 
         # --- MLP gate (gelu) + up ---
-        total_flops += fold_matmul(self.vector_length, self.mlp_elements,
-                                   self.LAYER0_PRE_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT,
-                                   self.LAYER0_MLP_GATE_DRAM, self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE,
-                                   gpr_dim_vector_length, gpr_dim_mlp_elements, gelu=True)
-        total_flops += fold_matmul(self.vector_length, self.mlp_elements,
-                                   self.LAYER0_PRE_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_MLP_UP_QUANT,
-                                   self.LAYER0_MLP_UP_DRAM, self.DRAM_ADDR_LAYER0_MLP_UP_SCALE,
-                                   gpr_dim_vector_length, gpr_dim_mlp_elements)
+        if _shard is not None:
+            # ONE sharded region covering gate AND up: both read PRE_MLP_NORM and write
+            # disjoint column slices of their own outputs, so each engine stays in its own
+            # lane and no barrier is needed BETWEEN them -- one release, one join per layer.
+            _shard.emit_release_workers()
+            total_flops += _shard.emit_primary_matmat(
+                self.sharded_mlp_gate,
+                a_addr=self.LAYER0_PRE_MLP_NORM_DRAM,
+                out_addr=self.LAYER0_MLP_GATE_DRAM,
+                gpr_w=gpr_shard_w, gpr_s=gpr_shard_s,
+                gpr_a=gpr_scratch_a, gpr_out=gpr_scratch_c,
+                gpr_M_reg=gpr_one, gelu=True)
+            total_flops += _shard.worker_flops(self.sharded_mlp_gate)
+            total_flops += _shard.emit_primary_matmat(
+                self.sharded_mlp_up,
+                a_addr=self.LAYER0_PRE_MLP_NORM_DRAM,
+                out_addr=self.LAYER0_MLP_UP_DRAM,
+                gpr_w=gpr_shard_w_up, gpr_s=gpr_shard_s_up,
+                gpr_a=gpr_scratch_a, gpr_out=gpr_scratch_c,
+                gpr_M_reg=gpr_one, gelu=False)
+            total_flops += _shard.worker_flops(self.sharded_mlp_up)
+            _shard.emit_join_workers()
+        else:
+            total_flops += fold_matmul(self.vector_length, self.mlp_elements,
+                                       self.LAYER0_PRE_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT,
+                                       self.LAYER0_MLP_GATE_DRAM, self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE,
+                                       gpr_dim_vector_length, gpr_dim_mlp_elements, gelu=True)
+            total_flops += fold_matmul(self.vector_length, self.mlp_elements,
+                                       self.LAYER0_PRE_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_MLP_UP_QUANT,
+                                       self.LAYER0_MLP_UP_DRAM, self.DRAM_ADDR_LAYER0_MLP_UP_SCALE,
+                                       gpr_dim_vector_length, gpr_dim_mlp_elements)
 
         # --- gate * up (SRAM-staged) ---
         self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
@@ -2121,10 +2374,25 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             _checkpoint("mlp_gateup_gelu_mul")
 
         # --- MLP down ---
-        total_flops += fold_matmul(self.mlp_elements, self.vector_length,
-                                   self.LAYER0_MLP_MULT_DRAM, self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT,
-                                   self.LAYER0_MLP_DOWN_DRAM, self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE,
-                                   gpr_dim_mlp_elements, gpr_dim_vector_length)
+        if _shard_down is not None:
+            # SECOND round of the layer. down reads the whole gate*up product, which only
+            # exists after the master's multiply above, so it cannot share the gate/up
+            # rendezvous -- it needs its own release/join.
+            _shard_down.emit_release_workers()
+            total_flops += _shard_down.emit_primary_matmat(
+                self.sharded_mlp_down,
+                a_addr=self.LAYER0_MLP_MULT_DRAM,
+                out_addr=self.LAYER0_MLP_DOWN_DRAM,
+                gpr_w=gpr_shard_w_dn, gpr_s=gpr_shard_s_dn,
+                gpr_a=gpr_scratch_a, gpr_out=gpr_scratch_c,
+                gpr_M_reg=gpr_one, gelu=False)
+            total_flops += _shard_down.worker_flops(self.sharded_mlp_down)
+            _shard_down.emit_join_workers()
+        else:
+            total_flops += fold_matmul(self.mlp_elements, self.vector_length,
+                                       self.LAYER0_MLP_MULT_DRAM, self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT,
+                                       self.LAYER0_MLP_DOWN_DRAM, self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE,
+                                       gpr_dim_mlp_elements, gpr_dim_vector_length)
         total_flops += dec_rms(
             1, self.vector_length,
             self.LAYER0_MLP_DOWN_DRAM, self.LAYER0_POST_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA,
@@ -2151,12 +2419,41 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=self.vector_length)
         self.generate_instruction_add_imm(src_reg_idx=gpr_layer_off, immediate_value=ue_35bit_addr_shifter(LAYER_WEIGHT_SIZE), dst_reg_idx=gpr_layer_off)
         self.generate_instruction_add_imm(src_reg_idx=gpr_kv_off, immediate_value=ue_35bit_addr_shifter(KV_CACHE_LAYER_STRIDE), dst_reg_idx=gpr_kv_off)
+        if _shard is not None:
+            _shard.emit_primary_layer_advance(self.sharded_mlp_gate, gpr_shard_w, gpr_shard_s)
+            _shard.emit_primary_layer_advance(self.sharded_mlp_up, gpr_shard_w_up, gpr_shard_s_up)
+        if _shard_down is not None:
+            _shard_down.emit_primary_layer_advance(self.sharded_mlp_down, gpr_shard_w_dn, gpr_shard_s_dn)
+        if _shard_op is not None:
+            _shard_op.emit_primary_layer_advance(self.sharded_attn_oproj, gpr_shard_w_op, gpr_shard_s_op)
+        for (sw, _a, _o, _k), (gw, gs) in zip(_qkv_ops, gpr_qkv):
+            _shard.emit_primary_layer_advance(sw, gw, gs)
         self.generate_instruction_add_dec(reg_idx=gpr_layer_cnt)
         self.generate_instruction_jump_abs_jnz(layer_body_start_word_addr, gpr_layer_cnt)
 
         total_flops *= layer_size
         attn_flops *= layer_size
 
+        # Shard cursors, released in reverse allocation order. These MUST be released:
+        # alloc_isa_reg()'s counter is per-engine and cumulative, and compile_gemma3 runs
+        # TWICE under --profile. Leaking them pushes the next compile's gpr_one out of the
+        # low 1..15 window that PBI row-loop trip counts require.
+        for _ in gpr_qkv:
+            self.release_isa_reg()   # qkv scale cursor
+            self.release_isa_reg()   # qkv weight cursor
+        if _shard_at is not None:
+            self.release_isa_reg()   # gpr_attn_batch
+        if _shard_op is not None:
+            self.release_isa_reg()   # gpr_shard_s_op
+            self.release_isa_reg()   # gpr_shard_w_op
+        if _shard_down is not None:
+            self.release_isa_reg()   # gpr_shard_s_dn
+            self.release_isa_reg()   # gpr_shard_w_dn
+        if _shard is not None:
+            self.release_isa_reg()   # gpr_shard_s_up
+            self.release_isa_reg()   # gpr_shard_w_up
+            self.release_isa_reg()   # gpr_shard_s
+            self.release_isa_reg()   # gpr_shard_w
         self.release_isa_reg()  # gpr_layer_cnt
         self.release_isa_reg()  # gpr_attn_scale
         self.release_isa_reg()  # gpr_sqrt_head_dim
@@ -2193,6 +2490,18 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     OUTPUT_DRAM_ADDR=self.LOGITS_DRAM, is_B_quantized=True, data_type=TYPE.IF4,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, write_back_disable=True)
                 self.release_isa_reg()
+            elif _shard is not None:
+                # Sharded: one more rendezvous, after the final norm has produced the input.
+                # Writeback is ENABLED here (unlike the single-engine path, which keeps the
+                # logits on-chip): the per-engine argmax registers report indices only, so
+                # the host has to read the 8 candidate logits back to compare them.
+                _shard.emit_release_workers()
+                total_flops += _shard.emit_static_matmat(
+                    self, 0, self.sharded_lm_head,
+                    a_addr=self.OUTPUT_NORM_DRAM, out_addr=self.LOGITS_DRAM,
+                    write_back_disable=False)
+                total_flops += _shard.worker_flops(self.sharded_lm_head)
+                _shard.emit_join_workers()
             else:
                 total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                     A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT,
@@ -2211,6 +2520,31 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             f"Decoder program compiled (FOLDED single-layer body, HW-looped {layer_size}x) at "
             f"0x{decoder_program_addr:X}, size {program_size_bytes} bytes"
         )
+        if _shard is not None:
+            # Workers mirror the folded structure: one body, hardware-looped layer_size x,
+            # each iteration gated on the primary's release flag.
+            _shard.emit_worker_program(
+                rounds=(([[(sw, a, o, False) for sw, a, o, _k in _qkv_ops]]
+                         if _shard_qkv is not None else [])
+                        + ([[_attn_op]] if _shard_at is not None else []) + ([
+                    # attention output projection, straight after attention
+                    [(self.sharded_attn_oproj, self.LAYER0_FLASH_OUTPUT_DRAM,
+                      self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, False)],
+                ] if _shard_op is not None else []) + [
+                    # round 1: gate + up share a lane (same input, disjoint outputs)
+                    [(self.sharded_mlp_gate, self.LAYER0_PRE_MLP_NORM_DRAM,
+                      self.LAYER0_MLP_GATE_DRAM, True),
+                     (self.sharded_mlp_up, self.LAYER0_PRE_MLP_NORM_DRAM,
+                      self.LAYER0_MLP_UP_DRAM, False)],
+                ] + ([
+                    # round 2: down, after the master has multiplied gate*up
+                    [(self.sharded_mlp_down, self.LAYER0_MLP_MULT_DRAM,
+                      self.LAYER0_MLP_DOWN_DRAM, False)],
+                ] if _shard_down is not None else [])),
+                layers=layer_size,
+                tail_rounds=[[(self.sharded_lm_head, self.OUTPUT_NORM_DRAM,
+                               self.LOGITS_DRAM, False)]])
+
         return {
             "program_size_bytes": program_size_bytes,
             "total_flops": total_flops,
@@ -2258,17 +2592,20 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             prefill_seq_len = UE_VECTOR_SIZE
             matmatmul_tag = "_matmatmul" if self.matmatmul else ""
             matmatmul_tag += "_prefill_twopass" if self.two_pass_prefill else ""
+            matmatmul_tag += self._mc_tag()
             instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_program.bin")
             instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_program.json")
         elif self.matmatmul or self.two_pass_prefill:
             prefill_seq_len = UE_VECTOR_SIZE
             mode_tag = ("_matmatmul" if self.matmatmul else "") + ("_prefill_twopass" if self.two_pass_prefill else "")
+            mode_tag += self._mc_tag()
             instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mode_tag}_program.bin")
             instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mode_tag}_program.json")
         else:
             prefill_seq_len = UE_VECTOR_SIZE
-            instruction_bin_path  = os.path.join(self.script_dir, "gemma3_bin/gemma3_program.bin")
-            instruction_meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_program.json")
+            mc_tag = self._mc_tag()
+            instruction_bin_path  = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mc_tag}_program.bin")
+            instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mc_tag}_program.json")
         print(f"Decode kernel: {'matmat_mul_core (two-pass)' if self.matmatmul else 'quantized_matmat_core (streaming)'}")
         print(f"Prefill kernel: {'two-pass (matmat_mul_core)' if self.two_pass_prefill else 'streaming (quantized_matmat_core)'}")
         if bin_reuse and os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
@@ -2349,6 +2686,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             # checkpoint fires once per layer at runtime. run_gemma3_profile walks all iterations and
             # sums per step. Store the fold count so the profiler knows how many times to loop.
             metadata["profile_folded_layers"] = layer_size
+            metadata["multi_core"] = self.multi_core
             metadata["prefill_profile_checkpoints"] = prefill_prog["checkpoints"]
             metadata["decoder_profile_checkpoints"] = decoder_program["checkpoints"]
 
@@ -2394,30 +2732,45 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
     @staticmethod
     def _print_profile_table(title: str, order: list, step_ms: dict,
-                             step_flops: dict = None, peak_gflops: float = 0.0) -> float:
+                             step_flops: dict = None, peak_gflops: float = 0.0,
+                             sharded_steps=(), peak_1core: float = 0.0) -> float:
         """Print one per-step HW-latency table (summed over all layers) and return the total ms.
 
         With ``step_flops`` (per-step FLOPs, scaled the same way the latencies are summed) the
-        table also carries each step's achieved GFLOPS and its share of ``peak_gflops`` — which
-        is what identifies a step as compute-bound or memory/latency-bound."""
+        table also carries each step's achieved GFLOPS and its share of peak -- which is what
+        identifies a step as compute-bound or memory/latency-bound.
+
+        ``peak_gflops`` is one engine's peak and scores every step by default; a step named in
+        ``sharded_steps`` runs on all ``cores`` engines at once and is scored against
+        ``peak_all`` instead."""
         total_ms = sum(step_ms.values())
         total_flops = sum(step_flops.values()) if step_flops else 0.0
         print(f"\n=== {title} (HW latency, summed over all layers) ===")
-        print(f"{'Step':<38} {'ms':>9}  {'%':>6}  {'GFLOPS':>9}  {'%peak':>6}")
-        print("-" * 76)
+        print(f"{'Step':<38} {'ms':>9}  {'%':>6}  {'GFLOPS':>9}  {'%peak':>6}  {'vs':>3}")
+        print("-" * 82)
 
-        def _row(name, ms, flops):
+        def _engines(name):
+            n = sharded_steps.get(name, 1) if isinstance(sharded_steps, dict) else (
+                1 if name not in sharded_steps else 0)
+            return max(int(n), 1)
+
+        def _row(name, ms, flops, engines=1):
             pct = ms / total_ms * 100 if total_ms > 0 else 0.0
             gf = flops / (ms * 1e6) if (flops and ms > 0) else 0.0
-            util = gf / peak_gflops * 100 if peak_gflops else 0.0
+            peak = (peak_1core or peak_gflops) * engines
+            util = gf / peak * 100 if peak else 0.0
             gf_s = f"{gf:9.2f}" if gf else f"{'n/a':>9}"
-            ut_s = f"{util:5.1f}%" if gf and peak_gflops else f"{'n/a':>6}"
-            print(f"{name:<38} {ms:>9.3f}  {pct:>5.1f}%  {gf_s}  {ut_s}")
+            ut_s = f"{util:5.1f}%" if gf and peak else f"{'n/a':>6}"
+            print(f"{name:<38} {ms:>9.3f}  {pct:>5.1f}%  {gf_s}  {ut_s}  {engines:>2}c")
 
         for name in order:
-            _row(name, step_ms[name], (step_flops or {}).get(name, 0.0))
-        print("-" * 76)
-        _row("Total", total_ms, total_flops)
+            _row(name, step_ms[name], (step_flops or {}).get(name, 0.0),
+                 engines=_engines(name))
+        print("-" * 82)
+        _den = sum((step_flops or {}).get(n, 0.0) / ((peak_1core or peak_gflops) * _engines(n))
+                   for n in order) or 1.0
+        _row("Total", total_ms, total_flops,
+             engines=max((total_flops / _den) / (peak_1core or peak_gflops), 1.0))
         return total_ms
 
     def run_gemma3_profile(self) -> dict:
@@ -2431,6 +2784,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         """
         matmatmul_tag = "_matmatmul" if self.matmatmul else ""
         matmatmul_tag += "_prefill_twopass" if self.two_pass_prefill else ""
+        matmatmul_tag += self._mc_tag()   # must match what compile_gemma3(profile=True) wrote
         profile_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{matmatmul_tag}_profile_program.json")
         with open(profile_meta_path, "r") as f:
             meta = json.load(f)
@@ -2445,7 +2799,35 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         decoder_checkpoints  = meta["decoder_profile_checkpoints"]
 
         hw_info = user_dma_core.configured_hardware_info()
-        peak_gflops = hw_info.frequency_mhz * 0.128   # single engine; matches write_run_summary
+        # Two ceilings: every step is single-engine EXCEPT the sharded one, which runs on all
+        # engines at once. Scoring an unsharded step against the aggregate would understate it
+        # by exactly 1/cores, so each step is measured against the peak it could actually hit.
+        peak_gflops = hw_info.frequency_mhz * 0.128            # one engine
+        peak_all = peak_gflops * self.multi_core               # all engines, sharded step only
+        # Which profile steps contain a SHARDED matmul, derived from what setup_multi_core
+        # actually sharded rather than hardcoded -- each op is behind its own flag, and K/V
+        # silently drop out above 4 engines. A step is listed if ANY matmul inside it is
+        # sharded; the norms, residuals and the gate*up multiply folded into these steps
+        # still run on engine 0 alone, so the aggregate peak flatters them slightly.
+        # step -> how many engines ACTUALLY work on it. Not a blanket ``cores``: attention
+        # splits over batch = group_size = 4, so above 4 engines the extras sit idle and
+        # scoring it against the 8-core peak would understate it by 2x.
+        _step_of = [
+            ("qkv_proj_vcache", (self.sharded_q_proj, self.sharded_k_proj, self.sharded_v_proj)),
+            ("o_proj_post_attn_norm_residual", (self.sharded_attn_oproj,)),
+            ("mlp_gateup_gelu_mul", (self.sharded_mlp_gate, self.sharded_mlp_up)),
+            ("mlp_down_post_ffn_norm_residual", (self.sharded_mlp_down,)),
+            ("output_norm_lm_head", (self.sharded_lm_head,)),
+        ]
+        sharded_steps = {}
+        if self.shard_group is not None:
+            for step, sws in _step_of:
+                if any(sw is not None for sw in sws):
+                    sharded_steps[step] = self.multi_core
+            if self.sharded_attention is not None:
+                # only the engines holding at least one query row
+                sharded_steps["attention"] = sum(
+                    1 for s in self.sharded_attention.shards if s.batch_rows)
 
         def _step_flops(cps, layers: int, aligned_kv: int = 0, attn_aligned: int = 0,
                         seq_scale: float = 1.0, attn_scale: float = 1.0) -> dict:
@@ -2528,6 +2910,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                            if _pf_attn_aligned else _seq_scale)
             pf_step_flops = _step_flops(prefill_checkpoints, folded_layers,
                                         seq_scale=_seq_scale, attn_scale=_attn_scale)
+            # Prefill is not sharded -- only the decoder is -- so every prefill step is 1-core.
             prefill_total_ms = self._print_profile_table(f"Prefill  (seq_len={prefill_seq_len})",
                                                          pf_order, pf_step_ms, pf_step_flops, peak_gflops)
         else:
@@ -2571,6 +2954,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.clear_capture_buffer()
 
             print(f"\n--- Profiling: decoder ({label}) ---")
+            if self.shard_group is not None:
+                # Workers run ONE folded pass then HALT, so they are relaunched for every
+                # profiled decode pass and must already be executing when the primary starts:
+                # the primary's flag_check has no timeout and would hang forever against
+                # unlaunched workers. Single-stepping the primary through its HALT checkpoints
+                # is safe -- no checkpoint falls between a flag_set and its matching
+                # flag_check, so the per-layer rendezvous stays intact.
+                self.shard_group.start_workers(aligned_seq_len=aligned)
             order, step_ms = self._profile_execute_folded(
                 preamble_addr, decoder_checkpoints, folded_layers, tail_label="output_norm_lm_head")
 
@@ -2585,7 +2976,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             # per-token total has left over after the in-loop steps.
             step_flops["output_norm_lm_head"] = max(total_flops - sum(step_flops.values()), 0.0)
             total_ms = self._print_profile_table(f"Decoder  ({label})", order, step_ms,
-                                                 step_flops, peak_gflops)
+                                                 step_flops, peak_gflops,
+                                                 sharded_steps=sharded_steps,
+                                                 peak_1core=peak_gflops)
             return order, step_ms, step_flops, aligned, total_ms
 
         self._zero_kv_cache(start_token=prefill_seq_len)
@@ -2624,6 +3017,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "decoder_total_ms": decoder_total_ms,
             "decoder_steps": [[n, step_ms[n], dec_step_flops.get(n, 0.0)] for n in order],
             "decoder_aligned_kv": aligned_dec,
+            # Steps that ran on every engine at once; the summary scores only these against
+            # the aggregate peak. Prefill is never sharded.
+            # {step: engines} -- how many engines each step really ran on.
+            "sharded_steps": dict(sharded_steps),
         }
         if long_result:
             result.update(long_result)
@@ -2649,9 +3046,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3_legacy{matmatmul_tag}_{prefill_seq_len}_program.json")
         elif self.matmatmul or self.two_pass_prefill:
             mode_tag = ("_matmatmul" if self.matmatmul else "") + ("_prefill_twopass" if self.two_pass_prefill else "")
+            mode_tag += self._mc_tag()
             meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mode_tag}_program.json")
         else:
-            meta_path = os.path.join(self.script_dir, "gemma3_bin/gemma3_program.json")
+            meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{self._mc_tag()}_program.json")
         with open(meta_path, "r") as f:
             meta = json.load(f)
         self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
@@ -2859,6 +3257,12 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             _SILENT_MODE = True
             self.seq_len += 1
             aligned_seq_len_q = ((self.seq_len + 63) // 64) * 64
+            # Workers run one folded pass per token and HALT, so they are relaunched each
+            # token; they immediately block on the primary's first release flag.
+            if self.shard_group is not None:
+                # Sharded attention needs this token's KV length; the workers' bodies are
+                # compiled once, so it arrives through their per-token preamble.
+                self.shard_group.start_workers(aligned_seq_len=aligned_seq_len_q)
             flops_hw = _token_flops(aligned_seq_len_q)
             if decoder_token_cnt == 1:
                 first_token_flops = flops_hw
@@ -2914,7 +3318,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 snr_v_new = calculate_snr(ref_v_new, hw_v_new)
                 _original_print(f"[Numeric/Decoder step 1 KV]  K SNR={snr_k_new:.2f} dB  V SNR={snr_v_new:.2f} dB")
 
-            token_id = self.get_arg_max_index()
+            token_id = (self.shard_group.global_argmax(self.sharded_lm_head, self.LOGITS_DRAM)
+                        if self.shard_group is not None
+                        else self.get_arg_max_index())
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
             if token_id in [1, self._end_of_turn_token_id]:
@@ -3004,11 +3410,16 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     def _summary_head_lines(self, args, cores: int, prefill_kb, decoder_kb, title: str):
         """Common head of both Markdown summaries -- device/clock/cores, weight sizes and
         program-image sizes. Reads no FPGA state beyond the version register, so it is cheap
-        to call after a run. Returns ``(lines, peak_gflops)``."""
+        to call after a run.
+
+        Returns ``(lines, peak_1core, peak_all)``. Both peaks are reported because only the
+        SHARDED step runs on every engine: scoring an unsharded, single-engine step against
+        the aggregate would make it look 1/cores as efficient as it really is."""
         hw_info = user_dma_core.configured_hardware_info()
         clock_ns = 1000.0 / hw_info.frequency_mhz
         freq_mhz = hw_info.frequency_mhz
-        peak_gflops = freq_mhz * 0.128 * cores   # freq(MHz) * 128 MAC/cyc/1000 * cores
+        peak_1core = freq_mhz * 0.128            # freq(MHz) * 128 MAC/cyc / 1000
+        peak_gflops = peak_1core * cores         # aggregate, all engines busy
         try:
             hw_version = self.user_read_reg32(user_dma_core.UE_FPGA_VERSION_ADDR) & 0xFFFFFFFF
             hw_version_str = f"0x{hw_version:08x}"
@@ -3034,8 +3445,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         L.append(f"- **--dev:** {args.dev}")
         L.append(f"- **Clock / frequency:** {clock_ns:.4f} ns ({freq_mhz:.1f} MHz)")
         L.append(f"- **Cores:** {cores}")
-        L.append(f"- **Peak throughput:** {peak_gflops:.2f} GFLOPS "
-                 f"({freq_mhz:.1f} MHz × 128 × {cores} core(s))")
+        L.append(f"- **Peak throughput (1 core):** {peak_1core:.2f} GFLOPS "
+                 f"({freq_mhz:.1f} MHz × 128)")
+        if cores > 1:
+            L.append(f"- **Peak throughput ({cores} cores):** {peak_gflops:.2f} GFLOPS "
+                     f"({freq_mhz:.1f} MHz × 128 × {cores})")
         L.append("")
         L.append(f"## Weights")
         L.append("")
@@ -3048,7 +3462,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         L.append(f"- **Decoder program:** {_kb(decoder_kb)}")
         L.append(f"- **Combined program image:** {_kb(combined_kb)}")
         L.append("")
-        return L, peak_gflops
+        return L, peak_1core, peak_gflops
 
     def write_profile_summary(self, out_path: str, args, profile_result: dict, cores: int = 1,
                               title: str = "gemma3_test") -> str:
@@ -3056,11 +3470,21 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         as :meth:`write_run_summary`, with the throughput and prompt/output sections replaced by
         the two per-step HW-latency tables (prefill, and the first decoded token) that
         run_gemma3_profile prints. Returns the written path."""
-        L, peak_gflops = self._summary_head_lines(args, cores,
-                                                  profile_result.get("prefill_size_kb"),
-                                                  profile_result.get("decoder_size_kb"), title)
+        L, peak_1core, peak_all = self._summary_head_lines(
+            args, cores, profile_result.get("prefill_size_kb"),
+            profile_result.get("decoder_size_kb"), title)
+        # Only the sharded step spreads across engines; everything else is single-engine, so
+        # each row is scored against the peak that its own step could actually reach.
+        # DECODE-only: prefill is never sharded, and its checkpoints happen to carry the
+        # same names (qkv_proj_vcache, mlp_gateup_gelu_mul, ...), so this set must be
+        # applied per table rather than globally or the prefill rows claim shards that the
+        # prefill program does not have.
+        _ds = profile_result.get("sharded_steps") or {}
+        # {step: engines}. Older metadata stored a plain list of names; fall back to
+        # "all cores" for those so an old profile still renders.
+        decode_sharded = _ds if isinstance(_ds, dict) else {n: cores for n in _ds}
 
-        def _table(heading: str, steps, total_ms: float) -> None:
+        def _table(heading: str, steps, total_ms: float, sharded=frozenset()) -> None:
             L.append(f"## {heading}")
             L.append("")
             if not steps:
@@ -3068,23 +3492,43 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 L.append("")
                 return
             total_flops = sum((s[2] if len(s) > 2 else 0.0) for s in steps)
-            L.append("| Step | ms | % | GFLOP | GFLOPS | % peak |")
-            L.append("|---|---:|---:|---:|---:|---:|")
+            L.append("| Step | ms | % | GFLOP | GFLOPS | % peak | vs |")
+            L.append("|---|---:|---:|---:|---:|---:|---|")
 
-            def _row(name, ms, flops, bold=False):
+            def _engines(name):
+                """How many engines actually ran this step (1 when it is not sharded)."""
+                n = sharded.get(name, 1) if isinstance(sharded, dict) else (
+                    cores if name in sharded else 1)
+                return max(int(n), 1)
+
+            def _row(name, ms, flops, bold=False, engines=1, peak=None, label=None):
                 pct = ms / total_ms * 100 if total_ms > 0 else 0.0
                 gf = flops / (ms * 1e6) if (flops and ms > 0) else 0.0
-                util = gf / peak_gflops * 100 if (gf and peak_gflops) else 0.0
+                if peak is None:
+                    peak = peak_1core * engines
+                    label = f"{engines} core" + ("s" if engines > 1 else "")
+                util = gf / peak * 100 if (gf and peak) else 0.0
                 b = "**" if bold else ""
                 cells = [f"{b}{name}{b}", f"{b}{ms:.3f}{b}", f"{b}{pct:.1f}%{b}",
                          f"{b}{flops / 1e9:.3f}{b}" if flops else "n/a",
                          f"{b}{gf:.2f}{b}" if gf else "n/a",
-                         f"{b}{util:.1f}%{b}" if util else "n/a"]
+                         f"{b}{util:.1f}%{b}" if util else "n/a",
+                         label if gf else "n/a"]
                 L.append("| " + " | ".join(cells) + " |")
 
             for step in steps:
-                _row(step[0], step[1], step[2] if len(step) > 2 else 0.0)
-            _row("Total", total_ms, total_flops, bold=True)
+                _row(step[0], step[1], step[2] if len(step) > 2 else 0.0,
+                     engines=_engines(step[0]))
+            # The total mixes sharded and unsharded work, so neither peak alone is honest.
+            # Score it against the FLOP-WEIGHTED peak -- the throughput this step mix could
+            # reach if every step hit its own ceiling. Formally sum(F) / sum(F_i / peak_i),
+            # which collapses to peak_1core when nothing is sharded and to peak_all when
+            # everything is. Without it, adding shards makes the Total row look worse.
+            _den = sum((s[2] if len(s) > 2 else 0.0) / (peak_1core * _engines(s[0]))
+                       for s in steps)
+            _blend = (total_flops / _den) if _den else peak_1core
+            _row("Total", total_ms, total_flops, bold=True, peak=_blend,
+                 label=f"blend ({_blend / peak_1core:.1f} cores eff.)")
             L.append("")
 
         pf_tokens = profile_result.get("prefill_tokens")
@@ -3093,6 +3537,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         # Both programs are folded (one body hardware-looped layer_size×), so each table is a
         # per-step total across ALL layers, not a per-layer breakdown.
+        # Prefill runs entirely on engine 0 -> every row is scored against one core.
         _table(f"Prefill profile (seq_len={pf_tokens if pf_tokens is not None else 'n/a'}, "
                f"HW latency summed over all layers)",
                profile_result.get("prefill_steps", []), pf_ms)
@@ -3100,7 +3545,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         _table("Decode profile (first token"
                + (f", aligned KV={_kv}" if _kv else "")
                + ", HW latency summed over all layers)",
-               profile_result.get("decoder_steps", []), dec_ms)
+               profile_result.get("decoder_steps", []), dec_ms, sharded=decode_sharded)
         # Optional second decode table: the same decoder body entered at a long token position,
         # so its attention step runs against a full-length KV cache.
         long_pos = profile_result.get("decoder_long_pos")
@@ -3110,7 +3555,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             _table(f"Decode profile (token {long_pos}"
                    + (f", aligned KV={_lkv}" if _lkv else "")
                    + ", HW latency summed over all layers)",
-                   profile_result.get("decoder_long_steps", []), long_ms)
+                   profile_result.get("decoder_long_steps", []), long_ms, sharded=decode_sharded)
 
         L.append(f"## Totals")
         L.append("")
@@ -3135,9 +3580,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         built from ``run_result`` (the run_gemma3_decode dict) plus cheap host-side
         bookkeeping. No FPGA program is launched here, so calling it after a run is
         free. Mirrors gemma4_e2b_test.write_run_summary. Returns the written path."""
-        L, peak_gflops = self._summary_head_lines(args, cores,
-                                                  run_result.get("prefill_size_kb"),
-                                                  run_result.get("decoder_size_kb"), title)
+        L, _peak_1core, peak_gflops = self._summary_head_lines(
+            args, cores, run_result.get("prefill_size_kb"),
+            run_result.get("decoder_size_kb"), title)
 
         def _util(gflops):
             """Reported throughput as a percent of this run's peak GFLOPS."""
@@ -3205,9 +3650,15 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 def gemma3_run_summary_filename(args, parser, prefix: str = "gemma3_test") -> str:
     """Per-run summary .md filename: ``gemma3_test.md`` when the script is run with no
     arguments, plus one token per argument that was actually given (i.e. differs from
-    its default), e.g. ``gemma3_test_xdma1_legacy.md``. A store_true flag contributes its
-    flag name; a value argument contributes its value. ``--prompt`` is skipped -- its
-    value is freeform prose, not a run configuration."""
+    its default), e.g. ``gemma3_test_xdma1_multi-core-8_profile.md``.
+
+    Token per argument kind:
+      * store_true flag  -> its flag name (``profile``, ``legacy``)
+      * text value       -> the value alone, which already names itself (``xdma1``)
+      * numeric value    -> ``flag-value``, because a bare number in a filename says
+                            nothing about which knob it set (``multi-core-8``, not ``8``)
+      * ``--prompt``     -> skipped; its value is freeform prose, not a configuration
+    """
     flag_names = {
         a.dest: a.option_strings[0].lstrip("-")
         for a in parser._actions if a.option_strings
@@ -3220,9 +3671,41 @@ def gemma3_run_summary_filename(args, parser, prefix: str = "gemma3_test") -> st
     for dest, value in vars(args).items():
         if dest == "prompt" or value == parser.get_default(dest):
             continue
-        tokens.append(flag_names.get(dest, dest.replace("_", "-"))
-                      if isinstance(value, bool) else _sanitize(value))
+        flag = flag_names.get(dest, dest.replace("_", "-"))
+        if isinstance(value, bool):
+            tokens.append(flag)
+        elif isinstance(value, (int, float)):
+            tokens.append(f"{flag}-{_sanitize(value)}")
+        else:
+            tokens.append(_sanitize(value))
     return prefix + ("_" + "_".join(tokens) if tokens else "") + ".md"
+
+SHARD_ATTENTION = True
+"""Shard unified_attention_core over its batch (GQA query-group) dimension.
+
+batch = group_size = 4, so at most 4 engines get rows; the rest take part in the round's
+handshake with no work. Each engine needs its OWN scratch buffer (1 MB, from the private
+tensor window) because the core stages V-transpose / scores / scaled-Q through it."""
+
+SHARD_QKV = True
+"""Shard the Q / K / V projections. All three share ONE round (same input, disjoint
+literal outputs). K and V are N=256 = 4 blocks of 64, so they are skipped above 4
+engines and run full-width there; Q is N=1024 and splits evenly to 8."""
+
+SHARD_ATTN_OPROJ = True
+"""Shard the attention output projection (K=1024, N=1152).
+
+Adds a round per layer BEFORE the MLP: attention itself is master-only, so the workers
+wait on FLASH_OUTPUT before they can project it. N=1152 splits like mlp down does --
+192x2 + 128x6 at 8 cores."""
+
+SHARD_MLP_DOWN = True
+"""Shard the MLP down projection too (adds a 2nd rendezvous per layer).
+
+Off by default: down needs its own round because its K spans the whole gate*up
+product, and its N=1152 splits 192x2 + 128x6 -- a 33% imbalance against gate's 7%.
+Both stress the dummy-delay stand-in for the missing CHECK_ZERO handshake. Turning
+it on takes sharded decode traffic from 72% to 92%."""
 
 # -----------------------------------------------------------------------------
 # Main
@@ -3234,6 +3717,11 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use gemma3_bin/full_model_weights.bin instead of generated weights_gemma3_hf.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
+    parser.add_argument('--multi-core', dest='multi_core', type=int, default=1, metavar='N',
+                        help='N-shard the decoder MLP gate across N engines (1..8, default 1). '
+                             'Forces the quantized_matmat_core decode path: incompatible with '
+                             '--legacy and --two-pass-decoder. The ceiling is the engine count '
+                             'HW_INFO reports for the loaded bitstream.')
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and run one decode step to measure per-step latency breakdown.')
     parser.add_argument('--legacy', action='store_true',
@@ -3263,8 +3751,10 @@ def main():
     user_dma_core.configure_clock_from_hardware()
     print(user_dma_core.hardware_info_summary())
 
+    from user_hw_test import software_reset_test
+    software_reset_test(cores=args.multi_core)
+
     _boot = user_dma_core.UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR)
-    _boot.software_reset()
     _boot.clear_dram()
 
     print(f"Using DMA device: {args.dev}")
@@ -3272,9 +3762,13 @@ def main():
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
 
+    if not 1 <= args.multi_core <= 8:
+        parser.error(f"--multi-core must be in [1, 8], got {args.multi_core}")
     ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, legacy=args.legacy,
-                              matmatmul=args.matmatmul, two_pass_prefill=args.two_pass_prefill)
+                              matmatmul=args.matmatmul, two_pass_prefill=args.two_pass_prefill,
+                              multi_core=args.multi_core)
     ue.set_prefill_seq(args.prompt)
+    ue.setup_multi_core()
 
     print(f"\n--- Compiling ---")
     timer = time.perf_counter()
@@ -3289,7 +3783,7 @@ def main():
         profile_result = ue.run_gemma3_profile()
         _summary_path = os.path.join(SCRIPT_DIR, gemma3_run_summary_filename(args, parser))
         try:
-            ue.write_profile_summary(_summary_path, args, profile_result, cores=1)
+            ue.write_profile_summary(_summary_path, args, profile_result, cores=args.multi_core)
             print(f"Wrote profile summary: {_summary_path}")
         except Exception as _e:
             print(f"[warn] failed to write profile summary: {_e}")
@@ -3304,7 +3798,7 @@ def main():
     # next to this script (see gemma3_run_summary_filename / write_run_summary).
     _summary_path = os.path.join(SCRIPT_DIR, gemma3_run_summary_filename(args, parser))
     try:
-        ue.write_run_summary(_summary_path, args, run_result, cores=1)
+        ue.write_run_summary(_summary_path, args, run_result, cores=args.multi_core)
         print(f"Wrote run summary: {_summary_path}")
     except Exception as _e:
         print(f"[warn] failed to write run summary: {_e}")
