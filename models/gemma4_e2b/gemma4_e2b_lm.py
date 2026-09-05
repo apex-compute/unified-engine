@@ -50,14 +50,16 @@ class Gemma4LMMixin:
     # Back-compat alias: prefill used to own the scheduler outright.
     _ensure_prefill_scheduler = _ensure_lm_scheduler
 
-    def _ensure_decode_q_shards(self, sched, layer_size: int) -> dict:
-        """Copy each engine's column block of the FULL layers' Q weight into that
-        engine's private arena. Returns ``{layer_idx: ShardedWeight}``.
+    def _ensure_decode_qkv_shards(self, sched, layer_size: int) -> dict:
+        """Copy each engine's column block of the Q/K/V weights into that engine's
+        private arena. Returns ``{(op, layer_idx): ShardedWeight}``.
 
-        SCOPE: Q only, full-attention layers only. Those are the widest N in the
-        decoder (4096 = 8 x 512 at 8 engines, a perfectly even split) and Q writes
-        a buffer nothing else in the round touches, so it is the smallest change
-        that is still worth making. The other projections stay on the master.
+        SCOPE: Q, K and V, every layer -- minus whatever cannot be split at this
+        engine count. Q is the widest N and divides evenly either way (full
+        4096 = 8 x 512, sliding 2048 = 8 x 256). K/V are N=head_dim: 512 on the
+        full layers, which is exactly 8 blocks of 64, but only 256 on the sliding
+        ones, i.e. 4 blocks -- so beyond 4 engines the sliding K/V stay full-width
+        on the master. The MLP is not sharded here.
 
         THE COPY IS THE POINT. Engine i reads its block out of ITS OWN private
         window rather than out of the one shared weight image, so the engines'
@@ -74,28 +76,42 @@ class Gemma4LMMixin:
         Cached: an image may be compiled more than once per process, and
         shard_quantized_weight refuses to allocate the same name twice.
         """
-        cached = getattr(self, "_decode_q_shards", None)
+        cached = getattr(self, "_decode_qkv_shards", None)
         if cached is not None:
             return cached
         t0 = time.perf_counter()
         stride = self.weight_defs["LAYER_WEIGHT_SIZE"]
-        shards = {}
-        for layer_idx in sorted(self._full_attention_layers):
-            if layer_idx >= layer_size:
-                continue
-            _, cur_q_size, _ = self._get_layer_attention_dims(layer_idx)
-            if not mes.can_split(cur_q_size, sched.num_engines):
-                continue
-            shards[layer_idx] = sched.shard_quantized_weight(
-                name=f"q_proj_L{layer_idx}",
-                main_weight_addr=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_idx * stride,
-                main_scale_addr=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_idx * stride,
-                K=self.vector_length, N=cur_q_size, layers=1, main_layer_stride=0,
-                data_type=TYPE.IF4, verbose=False)
-        self._decode_q_shards = shards
+        shards, skipped = {}, []
+        for layer_idx in range(layer_size):
+            off = layer_idx * stride
+            _, cur_q_size, cur_k_size = self._get_layer_attention_dims(layer_idx)
+            kv_own = layer_idx not in self._kv_shared_map
+            plan = [("q", cur_q_size, self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
+                     self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE)]
+            if kv_own:
+                # A layer that borrows another layer's KV cache projects no K/V
+                # of its own, so there is nothing to shard for it.
+                plan += [("k", cur_k_size, self.DRAM_ADDR_LAYER0_K_PROJ_QUANT,
+                          self.DRAM_ADDR_LAYER0_K_PROJ_SCALE),
+                         ("v", cur_k_size, self.DRAM_ADDR_LAYER0_V_PROJ_QUANT,
+                          self.DRAM_ADDR_LAYER0_V_PROJ_SCALE)]
+            for op, N, w_base, s_base in plan:
+                if not mes.can_split(N, sched.num_engines):
+                    # Fewer than one 64-column block per engine (the sliding
+                    # layers' K/V past 4 engines). Left full-width on the master
+                    # rather than asserting inside split_cols.
+                    skipped.append((op, layer_idx))
+                    continue
+                shards[(op, layer_idx)] = sched.shard_quantized_weight(
+                    name=f"{op}_proj_L{layer_idx}",
+                    main_weight_addr=w_base + off, main_scale_addr=s_base + off,
+                    K=self.vector_length, N=N, layers=1, main_layer_stride=0,
+                    data_type=TYPE.IF4, verbose=False)
+        self._decode_qkv_shards = shards
         used = sched.private_usage()
-        print(f"[Decode] Q sharded on {len(shards)} full-attention layer(s) over "
-              f"{sched.num_engines} engines in {time.perf_counter() - t0:.1f}s; "
+        print(f"[Decode] Q/K/V sharded: {len(shards)} projection(s) over "
+              f"{sched.num_engines} engines in {time.perf_counter() - t0:.1f}s"
+              f"{f'; {len(skipped)} left on the master' if skipped else ''}; "
               f"private weight arenas: "
               f"{', '.join(f'{u / 2**20:.1f}MB' for u in used)}", flush=True)
         return shards
@@ -1585,15 +1601,15 @@ class Gemma4LMMixin:
                 f"multi-core decode sharding requires --decode-kernel streaming, "
                 f"got {self.decode_kernel!r}: the shard emits quantized_matmat_core "
                 f"directly on each engine")
-        _q_shards = (self._ensure_decode_q_shards(_dec_sched, layer_size)
-                     if _dec_sched is not None else {})
+        _shards = (self._ensure_decode_qkv_shards(_dec_sched, layer_size)
+                   if _dec_sched is not None else {})
 
-        def _emit_q_shard(ue, sw, e: int) -> int:
-            """Emit engine ``e``'s column block of one layer's Q projection.
+        def _emit_shard(ue, sw, e: int, out_base: int) -> int:
+            """Emit engine ``e``'s column block of one projection.
 
             B and the scales come from THIS engine's private arena; only the
-            output slice is an offset into the shared Q buffer, which is what the
-            engines are cooperating to produce.
+            output slice is an offset into the shared Q/K/V buffer, which is what
+            the engines are cooperating to produce.
             """
             sh = sw.shard(e)
             out_off = sh.col_offset * self.bytes_per_element
@@ -1602,14 +1618,29 @@ class Gemma4LMMixin:
             # assumed: a misaligned writeback base is finite-but-wrong data, not
             # a fault.
             assert out_off % 128 == 0, (
-                f"Q shard output offset {out_off} is not a whole 128 B SRAM row")
+                f"shard output offset {out_off} is not a whole 128 B SRAM row")
             return ue.quantized_matmat_core(
                 M=1, K=sw.K, N=sh.cols,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                 B_DRAM_ADDR=sh.weight_addr,
-                OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM + out_off,
+                OUTPUT_DRAM_ADDR=out_base + out_off,
                 SCALE_DRAM_ADDR=sh.scale_addr,
                 data_type=TYPE.IF4) or 0
+
+        def _emit_worker_round(ops) -> None:
+            """Workers' side of one layer's round, then close it.
+
+            ``ops`` is [(ShardedWeight, out_base)] for whatever sharded in this
+            layer. Called exactly once per layer that opened a round, and only
+            after the master has emitted its own blocks, so each engine's stream
+            reads: wait, work, signal, wait-for-close, re-arm.
+            """
+            for e in _dec_sched.worker_indices():
+                _dec_sched.begin_worker_round(e)
+                for sw, out_base in ops:
+                    _emit_shard(_dec_sched.engines[e], sw, e, out_base)
+                _dec_sched.end_worker_round(e)
+            _dec_sched.join()
 
         # gpr_one holds the constant 1 — used as gpr_M_reg for all M=1 ops.
         gpr_one = self.alloc_isa_reg()
@@ -1677,8 +1708,21 @@ class Gemma4LMMixin:
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=layer_input_addr,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
                               gpr_M_reg=gpr_one)
-                # Q/K/V projections: use per-layer dims
-                _q_sw = _q_shards.get(layer_idx)
+                # Q/K/V projections: use per-layer dims.
+                # All three read PRE_NORM and write disjoint buffers, so whichever
+                # of them shard ride in ONE rendezvous for the layer -- no engine
+                # reads a column another engine is producing. An op that cannot
+                # split runs full-width on the master inside that same round.
+                _kv_own = layer_idx not in self._kv_shared_map
+                _q_sw = _shards.get(("q", layer_idx))
+                _k_sw = _shards.get(("k", layer_idx)) if _kv_own else None
+                _v_sw = _shards.get(("v", layer_idx)) if _kv_own else None
+                _round_ops = [(sw, out) for sw, out in
+                              ((_q_sw, self.LAYER0_Q_DRAM),
+                               (_k_sw, self.LAYER0_K_DRAM),
+                               (_v_sw, self.LAYER0_FLASH_V_DRAM)) if sw is not None]
+                if _round_ops:
+                    _dec_sched.release()
                 if _q_sw is None:
                     total_flops += _projection_core(M=1, K=self.vector_length, N=cur_q_size,
                                                         A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
@@ -1688,39 +1732,43 @@ class Gemma4LMMixin:
                                                         SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
                                                         )
                 else:
-                    # ONE ROUND, THIS LAYER ONLY. The rendezvous is emitted only
-                    # where there is sharded work; master and workers walk the same
-                    # layer set in this one loop, so their round counts cannot
-                    # disagree. Everything after join() reads a complete Q vector.
-                    _dec_sched.release()
-                    total_flops += _emit_q_shard(self, _q_sw, 0)
+                    total_flops += _emit_shard(self, _q_sw, 0, self.LAYER0_Q_DRAM)
                     total_flops += _dec_sched.worker_flops(_q_sw)
-                    for _e in _dec_sched.worker_indices():
-                        _dec_sched.begin_worker_round(_e)
-                        _emit_q_shard(_dec_sched.engines[_e], _q_sw, _e)
-                        _dec_sched.end_worker_round(_e)
-                    _dec_sched.join()
                 if layer_idx in self._kv_shared_map:
                     ref_layer = self._kv_shared_map[layer_idx]
                     kv_layer_for_attn = ref_layer  # read from reference layer's KV cache
+                    if _round_ops:            # Q-only round: close it here
+                        _emit_worker_round(_round_ops)
                 else:
                     kv_layer_for_attn = layer_idx  # read from own KV cache
                     # K projection
-                    total_flops += _projection_core(M=1, K=self.vector_length, N=cur_k_size,
-                        A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
-                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                        data_type=TYPE.IF4,
-                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
-                        )
+                    if _k_sw is None:
+                        total_flops += _projection_core(M=1, K=self.vector_length, N=cur_k_size,
+                            A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                            B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
+                            OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
+                            data_type=TYPE.IF4,
+                            SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
+                            )
+                    else:
+                        total_flops += _emit_shard(self, _k_sw, 0, self.LAYER0_K_DRAM)
+                        total_flops += _dec_sched.worker_flops(_k_sw)
                     # V projection
-                    total_flops += _projection_core(M=1, K=self.vector_length, N=cur_k_size,
-                        A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
-                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                        data_type=TYPE.IF4,
-                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
-                        )
+                    if _v_sw is None:
+                        total_flops += _projection_core(M=1, K=self.vector_length, N=cur_k_size,
+                            A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                            B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
+                            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                            data_type=TYPE.IF4,
+                            SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
+                            )
+                    else:
+                        total_flops += _emit_shard(self, _v_sw, 0, self.LAYER0_FLASH_V_DRAM)
+                        total_flops += _dec_sched.worker_flops(_v_sw)
+                    # Close the round BEFORE the V staging below: that reads the
+                    # whole V vector, including the columns the workers wrote.
+                    if _round_ops:
+                        _emit_worker_round(_round_ops)
                     self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_FLASH_V_DRAM, sram_address=0x10000, element_size=cur_k_size)
                     # V norm (Gemma4: normalize V without learnable scale)
                     self.rms_norm_core(0x10000, 0x10000, cur_k_size)  # no gamma

@@ -2280,14 +2280,16 @@ def main():
                         quiet=_poison_quiet)
 
     # Measure aggregate accelerator-side DRAM reads before model allocation.
-    # The same flag-synchronized benchmark supports one engine and the exact
-    # engine count selected by --multi-core. Keep private-region mode aligned
-    # with the benchmark's default; user_hw_test.py separately exercises its
-    # shared-address stress variant.
-    from user_hw_test import matmat_mul_multi_engine_flag_check_test
+    # Each engine reads its OWN private buffer, barrier-synced so the reads
+    # overlap. That is the number that matters for this model: the sharded
+    # decoder gives every engine a private copy of its Q weight block precisely
+    # so the weight streams do not contend, and this benchmark measures the same
+    # access pattern. Runs before the model is built, so the low-DRAM buffers it
+    # allocates are long gone by the time the private arena is used.
+    from user_hw_test import multi_core_dram_speed_test
     print(f"\n--- Measuring {args.multi_core}-core aggregate DRAM read speed ---")
-    dram_read_speed_mbps = matmat_mul_multi_engine_flag_check_test(
-        M=4096, K=4096, N=4096, num_engines=args.multi_core)
+    dram_read_speed_mbps = multi_core_dram_speed_test(
+        num_engines=args.multi_core)
 
     ue = Gemma4_UnifiedEngine(**engine_kwargs)
 
