@@ -445,9 +445,11 @@ class PBI_FIELD(IntEnum):
     STRIDE_JUMP          = 11 # memcpy/writeback interpretation
 
 # FLAG instruction mode constants
-FLAG_MODE_SET   = 0  # Assert this engine's flag (signal busy)
-FLAG_MODE_CLEAR = 1  # De-assert this engine's flag (signal done)
-FLAG_MODE_CHECK = 2  # Spin-wait until target engine's flag is 1
+FLAG_MODE_SET         = 0  # Assert this engine's flag (signal busy)
+FLAG_MODE_CLEAR       = 1  # De-assert this engine's flag (signal done)
+FLAG_MODE_CHECK_SET   = 2  # Spin-wait until target engine's flag is 1
+FLAG_MODE_CHECK_CLEAR = 3  # Spin-wait until target engine's flag is 0
+FLAG_MODE_CHECK       = FLAG_MODE_CHECK_SET  # legacy alias
 
 # JUMP mode constants (match queue_state_module.sv / andromeda.c)
 JUMP_MODE_ABSOLUTE = 0
@@ -923,7 +925,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xaea79c09, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xaea79c09. Please update FPGA with commit update_aea79c09.bin using update_flash.py (public release v1.4)"
+        assert hw_version == 0x87a48e85, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x87a48e85. Please update FPGA with commit update_87a48e85.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -8820,12 +8822,13 @@ class UnifiedEngine:
             flag_mode_names = {
                 FLAG_MODE_SET: "SET",
                 FLAG_MODE_CLEAR: "CLEAR",
-                FLAG_MODE_CHECK: "CHECK",
+                FLAG_MODE_CHECK_SET: "CHECK_SET",
+                FLAG_MODE_CHECK_CLEAR: "CHECK_CLEAR",
             }
             mode_name = flag_mode_names.get(flag_mode, f"UNKNOWN({flag_mode})")
             result = f"ISA_FLAG ({mode_name})"
             result += f"\n    transaction_id: {transaction_id}"
-            if flag_mode == FLAG_MODE_CHECK:
+            if flag_mode in (FLAG_MODE_CHECK_SET, FLAG_MODE_CHECK_CLEAR):
                 result += f"\n    target_engine: {target_engine}"
             for line in result.split('\n'):
                 print(f"        {line}")
@@ -9356,7 +9359,7 @@ class UnifiedEngine:
         """Clear this engine's flag to 0, signaling done to other engines."""
         self.ue_isa_descriptor(INSTRUCTION_FLAG, isa_mode=FLAG_MODE_CLEAR)
 
-    def generate_instruction_flag_check(self, target_engine_idx: int):
+    def generate_instruction_flag_check_set(self, target_engine_idx: int):
         """
         Spin-wait until target engine's flag is 1 before proceeding.
 
@@ -9366,7 +9369,23 @@ class UnifiedEngine:
         if target_engine_idx < 0 or target_engine_idx > 15:
             print(f"ERROR: target_engine_idx must be 0-15, got {target_engine_idx}")
             return
-        self.ue_isa_descriptor(INSTRUCTION_FLAG, isa_mode=FLAG_MODE_CHECK,
+        self.ue_isa_descriptor(INSTRUCTION_FLAG, isa_mode=FLAG_MODE_CHECK_SET,
+                               src_reg_idx=target_engine_idx)
+
+    # Legacy name: flag_check == flag_check_set.
+    generate_instruction_flag_check = generate_instruction_flag_check_set
+
+    def generate_instruction_flag_check_clear(self, target_engine_idx: int):
+        """
+        Spin-wait until target engine's flag is 0 before proceeding.
+
+        Args:
+            target_engine_idx: Engine index (0-15) whose flag to wait on
+        """
+        if target_engine_idx < 0 or target_engine_idx > 15:
+            print(f"ERROR: target_engine_idx must be 0-15, got {target_engine_idx}")
+            return
+        self.ue_isa_descriptor(INSTRUCTION_FLAG, isa_mode=FLAG_MODE_CHECK_CLEAR,
                                src_reg_idx=target_engine_idx)
 
     def _patch_jump_immediate(self, capture_idx: int, target_word_addr: int) -> None:
