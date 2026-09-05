@@ -768,6 +768,14 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 self, num_engines=self.multi_core,
                 engine_base_stride=0x00010000,
                 arena=self.mc_arena,
+                # ASYMMETRIC RENDEZVOUS for the sharded regions (vision encoder
+                # and LM prefill). One four-phase round wraps each region instead
+                # of an all-to-all barrier at entry and again at exit: O(N) checks
+                # on the master and one per worker rather than O(N^2), half the
+                # rendezvous, and no NOP timing margin -- every flag edge is
+                # acknowledged, so it does not degrade as engines are added. Same
+                # region API, same bodies; only the synchronisation changes.
+                region_rendezvous="master_worker",
                 barrier_margin_nops=32,
                 allow_unaligned_rows=True,
                 allow_more_than_two_engines=self.multi_core > 2)

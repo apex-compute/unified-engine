@@ -1208,6 +1208,7 @@ class MultiEngineScheduler:
                  worker_arena: Optional[tuple] = None,
                  arena: Optional[PrivateArena] = None,
                  handshake: str = "nops",
+                 region_rendezvous: str = "symmetric",
                  verbose: bool = False):
         assert num_engines >= 1, f"num_engines must be >= 1, got {num_engines}"
         # ENGINE-COUNT GATE. This used to be an unconditional opt-in ("the device
@@ -1252,6 +1253,31 @@ class MultiEngineScheduler:
         assert handshake in ("nops", "four_phase"), \
             f"handshake must be 'nops' or 'four_phase', got {handshake!r}"
         self.handshake = handshake
+
+        # HOW A REGION SYNCHRONISES. The region API (sharded_region,
+        # col_sharded_region, k_sharded_region, head_sharded_region) is unchanged
+        # in shape either way -- one body replayed per engine -- but the
+        # rendezvous around it has two implementations:
+        #
+        #   "symmetric"    (default, and what every existing caller gets): an
+        #       all-to-all barrier at region entry and again at exit. Each engine
+        #       waits on all N-1 others, twice per region: O(N^2) checks, and the
+        #       re-arm rests on a NOP margin unless handshake="four_phase".
+        #
+        #   "master_worker": ONE four-phase round WRAPPED AROUND the body --
+        #       master SET at entry, join at exit; workers wait at entry, signal at
+        #       exit. O(N) checks on the master and exactly one on each worker,
+        #       half as many rendezvous, and every flag edge is acknowledged, so it
+        #       needs no timing margin at any engine count.
+        #
+        # The default is "symmetric" ON PURPOSE: it emits the identical
+        # instruction stream those models are validated against, so opting in is
+        # a per-model decision, not a library-wide change.
+        assert region_rendezvous in ("symmetric", "master_worker"), (
+            f"region_rendezvous must be 'symmetric' or 'master_worker', "
+            f"got {region_rendezvous!r}")
+        self.region_rendezvous = region_rendezvous
+        self._mw_round_open = False
         # Latched by the first rendezvous emitted; see _latch_rendezvous().
         self._rendezvous_mode: Optional[str] = None
         self.verbose = verbose
@@ -1599,7 +1625,7 @@ class MultiEngineScheduler:
         assert self._program_open, "begin_head_sharded() without begin_program()"
         assert not self._in_region, "nested sharded regions are not supported"
         split = self.split_heads(H, gqa_ratio, mode=mode)
-        self.barrier()
+        self._region_enter()
         self._in_region = True
         self._region_count += 1
         return [HeadShardContext(self, i, ue, H, split[i][0], split[i][1],
@@ -1735,7 +1761,7 @@ class MultiEngineScheduler:
         assert self._program_open, "begin_col_sharded() without begin_program()"
         assert not self._in_region, "nested sharded regions are not supported"
         split = self.split_cols(N)
-        self.barrier()
+        self._region_enter()
         self._in_region = True
         self._region_count += 1
         self._n_regs.clear()   # column counts are per-region
@@ -1768,7 +1794,7 @@ class MultiEngineScheduler:
         assert self._program_open, "k_sharded_region() without begin_program()"
         assert not self._in_region, "nested sharded regions are not supported"
         split = self.split_k(K)
-        self.barrier()
+        self._region_enter()
         self._in_region = True
         self._region_count += 1
         self._n_regs.clear()
@@ -1914,6 +1940,12 @@ class MultiEngineScheduler:
         """
         assert self._program_open, "finalize() without begin_program()"
         assert not self._in_region, "finalize() inside an open sharded region"
+        if self._mw_round_open:
+            # The last region closed with join=False. In the symmetric shape that
+            # is harmless (no trailing barrier); here it would leave the master's
+            # release standing with no join, and every worker waiting on a close
+            # that never comes. Shut the round before the HALT.
+            self._region_exit(join=True)
         self._worker_prog_addrs = []
         for wi, w in enumerate(self.workers):
             w.generate_instruction_halt()
@@ -2001,7 +2033,7 @@ class MultiEngineScheduler:
         assert self._program_open, "begin_sharded() without begin_program()"
         assert not self._in_region, "nested sharded regions are not supported"
         split = self.split_rows(M)
-        self.barrier()
+        self._region_enter()
         self._in_region = True
         self._region_count += 1
         self._m_regs.clear()   # row counts are per-region
@@ -2014,8 +2046,37 @@ class MultiEngineScheduler:
         Pass ``join=False`` only if you emit :meth:`barrier` yourself later."""
         assert self._in_region, "end_sharded() without begin_sharded()"
         self._in_region = False
-        if join:
+        self._region_exit(join)
+
+    def _region_enter(self) -> None:
+        """Rendezvous at region ENTRY, in whichever shape this scheduler uses."""
+        if self.region_rendezvous == "symmetric":
             self.barrier()
+            return
+        if self.num_engines == 1:
+            return
+        if self._mw_round_open:
+            # A previous region closed with join=False, meaning "stay in this
+            # lane": the round it opened is still the current one, and opening a
+            # second SET inside it would be a protocol error, not a barrier.
+            return
+        self.release()
+        for idx in self.worker_indices():
+            self.begin_worker_round(idx)
+        self._mw_round_open = True
+
+    def _region_exit(self, join: bool) -> None:
+        """Rendezvous at region EXIT, or defer it when the caller passed join=False."""
+        if self.region_rendezvous == "symmetric":
+            if join:
+                self.barrier()
+            return
+        if self.num_engines == 1 or not join:
+            return
+        for idx in self.worker_indices():
+            self.end_worker_round(idx)
+        self.join()
+        self._mw_round_open = False
 
     def _latch_rendezvous(self, kind: str) -> None:
         """Pin this scheduler to ONE rendezvous topology and refuse a mix.
@@ -2063,6 +2124,20 @@ class MultiEngineScheduler:
         assert not self._in_region, "barrier() inside an open sharded region"
         if self.num_engines == 1:
             return   # exact passthrough: not one extra instruction
+        if self.region_rendezvous == "master_worker":
+            # A standalone barrier is one complete round with no work inside it:
+            # the master opens and closes, every worker waits and acknowledges.
+            # Same meeting point, asymmetric implementation -- so a model can opt
+            # in without touching its explicit barrier() call sites.
+            assert not self._mw_round_open, (
+                "barrier() inside an open master/worker round: the region before "
+                "it closed with join=False, so the round is still current")
+            self.release()
+            for idx in self.worker_indices():
+                self.begin_worker_round(idx)
+                self.end_worker_round(idx)
+            self.join()
+            return
         self._latch_rendezvous("symmetric")
         for i, ue in enumerate(self.engines):
             ue.generate_instruction_flag_set()
