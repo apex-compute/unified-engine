@@ -11,7 +11,9 @@ This folder contains the Gemma3 accelerator inference example and numeric verifi
 ## Layout
 
 - **gemma3_test.py** – Prefill + decode loop on accelerator (single or multi engine, `--multi-core N`).
-- **multi_engine_shard_gemma3.py** – N-sharded quantized matmul for the decoder, up to 8 engines.
+- **../../multi_engine_shard.py** – the shared multi-engine library. The decoder's
+  N-sharded matmuls, batch-split attention and master/worker rendezvous all come
+  from here (`MultiEngineScheduler`, `worker_map="private_low"`).
 - **gemma3_test_IF8.py** – **Deprecated and currently non-working** IF8 experiment.
 - **gemma3_numeric.py** – Numeric verification with torch reference (prefill + decoder).
 - **gemma3_config.json** – Model and layout config.

@@ -1592,10 +1592,17 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         """
         if self.multi_core <= 1:
             return
-        from multi_engine_shard_gemma3 import Gemma3ShardGroup
+        from multi_engine_shard import MultiEngineScheduler
 
         print(f"\n--- Multi-core setup ({self.multi_core} engines) ---")
-        self.shard_group = Gemma3ShardGroup(self, self.multi_core)
+        # worker_map="private_low": every engine's weight shard, ISA and scratch live
+        # in the low 2 GB, BELOW the model's own 0x8000_0000 map, so a worker arena can
+        # never alias the weights however the model moves its cursors.
+        # handshake="four_phase": see release()/join() -- the master/worker rendezvous is
+        # always four-phase; this also makes any symmetric barrier() margin-free.
+        self.shard_group = MultiEngineScheduler(
+            self, num_engines=self.multi_core,
+            worker_map="private_low", handshake="four_phase", verbose=True)
         self.shard_group.reset_workers()
         self.sharded_mlp_gate = self.shard_group.shard_quantized_weight(
             name="mlp_gate",
@@ -1620,7 +1627,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # K and V are N=256 -- only 4 blocks of 64 -- so they cannot be split beyond 4
         # engines and are left full-width above that; Q (N=1024) splits evenly to 8.
         if SHARD_QKV:
-            from multi_engine_shard_gemma3 import can_split
+            from multi_engine_shard import can_split
             _qkv = [("q_proj", self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
                      self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE, self.head_dim * self.group_size),
                     ("k_proj", self.DRAM_ADDR_LAYER0_K_PROJ_QUANT,
@@ -2029,7 +2036,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                                and self.sharded_attention is not None) else None
         _attn_op = None
         if _shard_at is not None:
-            from multi_engine_shard_gemma3 import AttentionOp
+            from multi_engine_shard import AttentionOp
             _attn_op = AttentionOp(
                 sa=self.sharded_attention,
                 q_addr=self.LAYER0_FLASH_Q_DRAM,
@@ -2183,14 +2190,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         if _shard_qkv is not None:
             # All three read PRE_NORM and write disjoint literal buffers, so every sharded
             # one rides in a SINGLE round -- no barrier between them.
-            _shard_qkv.emit_release_workers()
+            _shard_qkv.release()
             for (sw, a_addr, out_addr, _k), (gw, gs) in zip(_qkv_ops, gpr_qkv):
                 total_flops += _shard_qkv.emit_primary_matmat(
                     sw, a_addr=a_addr, out_addr=out_addr, gpr_w=gw, gpr_s=gs,
                     gpr_a=gpr_scratch_a, gpr_out=gpr_scratch_c,
                     gpr_M_reg=gpr_one, gelu=False)
                 total_flops += _shard_qkv.worker_flops(sw)
-            _shard_qkv.emit_join_workers()
+            _shard_qkv.join()
         if self.sharded_q_proj is None:
             total_flops += fold_matmul(self.vector_length, self.head_dim * self.group_size,
                                        self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
@@ -2253,7 +2260,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         # --- grouped flash attention over the full accumulated cache for this layer ---
         if _shard_at is not None:
-            _shard_at.emit_release_workers()
+            _shard_at.release()
         _attn_flops = self.unified_attention_core(
             batch=(self.sharded_attention.shard(0).batch_rows
                    if _shard_at is not None else self.group_size),
@@ -2280,7 +2287,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         if _shard_at is not None:
             total_flops += _shard_at.attention_worker_flops(self.sharded_attention)
             attn_flops += _shard_at.attention_worker_flops(self.sharded_attention)
-            _shard_at.emit_join_workers()
+            _shard_at.join()
         if profile:
             _checkpoint("attention")
 
@@ -2288,7 +2295,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         if _shard_op is not None:
             # FIRST round of the layer: attention above is master-only, so the workers sit
             # parked here until its result exists for them to project.
-            _shard_op.emit_release_workers()
+            _shard_op.release()
             total_flops += _shard_op.emit_primary_matmat(
                 self.sharded_attn_oproj,
                 a_addr=self.LAYER0_FLASH_OUTPUT_DRAM,
@@ -2297,7 +2304,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 gpr_a=gpr_scratch_a, gpr_out=gpr_scratch_c,
                 gpr_M_reg=gpr_one, gelu=False)
             total_flops += _shard_op.worker_flops(self.sharded_attn_oproj)
-            _shard_op.emit_join_workers()
+            _shard_op.join()
         else:
             total_flops += fold_matmul(self.head_dim * self.group_size, self.vector_length,
                                        self.LAYER0_FLASH_OUTPUT_DRAM, self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT,
@@ -2337,7 +2344,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             # ONE sharded region covering gate AND up: both read PRE_MLP_NORM and write
             # disjoint column slices of their own outputs, so each engine stays in its own
             # lane and no barrier is needed BETWEEN them -- one release, one join per layer.
-            _shard.emit_release_workers()
+            _shard.release()
             total_flops += _shard.emit_primary_matmat(
                 self.sharded_mlp_gate,
                 a_addr=self.LAYER0_PRE_MLP_NORM_DRAM,
@@ -2354,7 +2361,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 gpr_a=gpr_scratch_a, gpr_out=gpr_scratch_c,
                 gpr_M_reg=gpr_one, gelu=False)
             total_flops += _shard.worker_flops(self.sharded_mlp_up)
-            _shard.emit_join_workers()
+            _shard.join()
         else:
             total_flops += fold_matmul(self.vector_length, self.mlp_elements,
                                        self.LAYER0_PRE_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT,
@@ -2378,7 +2385,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             # SECOND round of the layer. down reads the whole gate*up product, which only
             # exists after the master's multiply above, so it cannot share the gate/up
             # rendezvous -- it needs its own release/join.
-            _shard_down.emit_release_workers()
+            _shard_down.release()
             total_flops += _shard_down.emit_primary_matmat(
                 self.sharded_mlp_down,
                 a_addr=self.LAYER0_MLP_MULT_DRAM,
@@ -2387,7 +2394,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 gpr_a=gpr_scratch_a, gpr_out=gpr_scratch_c,
                 gpr_M_reg=gpr_one, gelu=False)
             total_flops += _shard_down.worker_flops(self.sharded_mlp_down)
-            _shard_down.emit_join_workers()
+            _shard_down.join()
         else:
             total_flops += fold_matmul(self.mlp_elements, self.vector_length,
                                        self.LAYER0_MLP_MULT_DRAM, self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT,
@@ -2495,13 +2502,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 # Writeback is ENABLED here (unlike the single-engine path, which keeps the
                 # logits on-chip): the per-engine argmax registers report indices only, so
                 # the host has to read the 8 candidate logits back to compare them.
-                _shard.emit_release_workers()
+                _shard.release()
                 total_flops += _shard.emit_static_matmat(
                     self, 0, self.sharded_lm_head,
                     a_addr=self.OUTPUT_NORM_DRAM, out_addr=self.LOGITS_DRAM,
                     write_back_disable=False)
                 total_flops += _shard.worker_flops(self.sharded_lm_head)
-                _shard.emit_join_workers()
+                _shard.join()
             else:
                 total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                     A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT,
