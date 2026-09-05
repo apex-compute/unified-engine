@@ -6,6 +6,7 @@ per src/models/qwen2.5_VL_3b/compare/summary.md), vision=int4 (legacy
 released codec, byte-identical to the prior Q4_64 path). All
 quantization goes through src/template/quant_lib.py."""
 
+import contextlib
 import json
 import math
 import os
@@ -347,9 +348,11 @@ _TOP_MAP = {
         'merger.mlp.2.bias': 'v.merger_mlp2.bias',
     },
 }
-# LM-side quant scope: q/k/gate/up/down (v_proj and o_proj stay BF16 for
-# attention accuracy). Same set for every supported precision.
-_LM_QUANT_LAYERS = {'q_proj.weight', 'k_proj.weight',
+# LM-side quant scope: q/k/o/gate/up/down. v_proj stays BF16 (it feeds the
+# attention matmul directly). o_proj was BF16 until 2026-09-03: decode on this
+# board is DRAM-bandwidth bound and the BF16 o_proj was ~16% of the bytes
+# streamed per token (8 MB/layer vs 2 MB in IF4). Same set for every precision.
+_LM_QUANT_LAYERS = {'q_proj.weight', 'k_proj.weight', 'o_proj.weight',
                     'gate_proj.weight', 'up_proj.weight', 'down_proj.weight'}
 
 _VALID_PRECISIONS = ('int4', 'fp4', 'if4')
@@ -657,10 +660,65 @@ def weight_bin_generate(script_dir: str | None = None, output_params: str | None
     print(f"Unified params.bin: lm={lm_size/1048576:.1f} MB + vision={vis_size/1048576:.1f} MB -> {params_path}")
     return params_path
 
+class _PrefillShard:
+    """Per-engine view of the ROW(token)-sharded, seq-len-agnostic prefill.
+
+    The prefill program is ONE bin primed at run time (gf_seq_len etc.), so an
+    engine's row offset CANNOT be folded into addresses at capture time the way
+    the vision encoder folds its. Instead each engine's runtime preamble
+    ADD_SETs shifter(row0 * pitch) word offsets into the fixed SH_OFF_* GPRs,
+    and every sharded op sources its DRAM base from a scratch GPR computed with
+    one add_imm: scratch = SH_OFF_<pitch> + shifter(literal_base). This is the
+    gemma3-proven runtime-address mechanism (gpr_*_addr /
+    _pbi_override_dram_base_from_gpr, word addr = byte >> 3).
+
+    With num_engines == 1 every accessor is None and addr() emits NOTHING, so
+    call sites collapse to today's literal-address path -- byte-identical.
+    """
+
+    def __init__(self, model, ue, engine_idx: int, num_engines: int):
+        self.ue = ue
+        self.engine_idx = engine_idx
+        self.num_engines = num_engines
+        self.active = num_engines > 1
+        if self.active:
+            self.OFF_HID   = model.SH_OFF_HID
+            self.OFF_KV    = model.SH_OFF_KV
+            self.OFF_MLP   = model.SH_OFF_MLP
+            self.OFF_FQ    = model.SH_OFF_FQ
+            self.OFF_BIAS  = model.SH_OFF_BIAS
+            self.OFF_CACHE = model.SH_OFF_CACHE
+            self.row0_reg  = model.SH_ROW0
+            self.scratch0  = model.SH_ADDR_A
+            self._scratch  = (model.SH_ADDR_A, model.SH_ADDR_B, model.SH_ADDR_C)
+        else:
+            self.OFF_HID = self.OFF_KV = self.OFF_MLP = self.OFF_FQ = None
+            self.OFF_BIAS = self.OFF_CACHE = None
+            self.row0_reg = self.scratch0 = None
+            self._scratch = (None, None, None)
+
+    def addr(self, slot: int, base: int, off_reg):
+        """Emit ``scratch[slot] = off_reg + shifter(base)`` and return the
+        scratch GPR index, or None (emit nothing) when unsharded. Scratch regs
+        are reused SEQUENTIALLY across ops (each consumer instruction reads its
+        GPR when it executes), but slots within ONE op must be distinct --
+        which the cores' _validate_addr_gprs asserts."""
+        if not self.active:
+            return None
+        assert off_reg is not None
+        reg = self._scratch[slot]
+        self.ue.generate_instruction_add_imm(
+            src_reg_idx=off_reg,
+            immediate_value=ue_35bit_addr_shifter(base),
+            dst_reg_idx=reg)
+        return reg
+
+
 class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
     """UnifiedEngine for Qwen2.5-VL-3B-Instruct: config + weight bins, compile, run."""
 
-    def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None):
+    def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None,
+                 engines: int = 1):
         # Initialize identity-DMA dedup state before super().__init__() which calls dma_write.
         self._identity_dram_written = False
         self._identity_dram_addr = None
@@ -723,6 +781,12 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # Vision config
         self._vis_cfg = self._cfg.get("vision", {})
 
+        # Multi-engine sharding (--engines N). 1 = the exact historical
+        # single-engine behaviour: no workers, no barriers, byte-identical
+        # streams. Resolved per stage via _num_engines(). Set BEFORE
+        # weight/tensor init so compile paths can allocate shard scratch.
+        self.NUM_ENGINES = max(1, int(engines))
+
         # Weight loading
         self.weight_init()
         self.tensor_init()
@@ -741,54 +805,87 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
     def _emit_pbi_scatter_per_token(self, *, read_base, read_stride_bytes,
                                     write_specs, sram_byte_addr, element_count,
-                                    gf_seq_len, template_seq_len):
+                                    gf_seq_len, template_seq_len,
+                                    ue=None, row0_reg=None, write_off_regs=None,
+                                    addr_scratch_reg=None):
         """PBI runtime-loop scatter: gf_seq_len iterations, each iter copies
         element_count rows from read_base + t*read_stride_bytes to each
         (dst_base, dst_stride) in write_specs. SRAM→DRAM scatters use pbi_init
         pointers that auto-advance by their stride per iteration. The captured
-        bin is seq_len-agnostic up to MAX_CONTEXT_SIZE."""
+        bin is seq_len-agnostic up to MAX_CONTEXT_SIZE.
+
+        Multi-engine row sharding (all optional, defaults = historical stream):
+          ue              engine to emit into (worker or primary)
+          row0_reg        GPR holding THIS ENGINE's first token index; the loop
+                          counter t starts there instead of 0 (the read side is
+                          computed per-iteration from t, so it row-shards free)
+          write_off_regs  one GPR (or None) per write spec holding
+                          shifter(row0 * dst_stride); the PBI pointer's DRAM
+                          base is overridden to base + that offset via
+                          _pbi_override_dram_base_from_gpr, emitted after
+                          pbi_init and before the loop as its contract requires
+          addr_scratch_reg scratch GPR for the base+offset add_imm results
+                          (reused sequentially across pointers -- each override
+                          reads it when IT executes)
+        """
+        ue = ue if ue is not None else self
         bpe = self.bytes_per_element
         bytes_per_call = element_count * bpe
-        _, sram_words = self.sram_address_to_uram_address(sram_byte_addr)
+        _, sram_words = ue.sram_address_to_uram_address(sram_byte_addr)
+        if write_off_regs is None:
+            write_off_regs = [None] * len(write_specs)
+        assert len(write_off_regs) == len(write_specs)
 
-        ptr_ws = [self.alloc_inst_ptr() for _ in write_specs]
-        for ptr_w, (dst_base, _stride) in zip(ptr_ws, write_specs):
-            self.generate_instruction_pbi_init(
+        ptr_ws = [ue.alloc_inst_ptr() for _ in write_specs]
+        for ptr_w, (dst_base, _stride), off_reg in zip(ptr_ws, write_specs, write_off_regs):
+            ue.generate_instruction_pbi_init(
                 dram_shared_addr=dst_base,
                 dma_length=bytes_per_call,
                 uram_a_start_addr=sram_words,
                 uram_b_start_addr=sram_words,
                 inst_pointer_idx=ptr_w,
             )
+            if off_reg is not None:
+                assert addr_scratch_reg is not None
+                ue.generate_instruction_add_imm(
+                    src_reg_idx=off_reg,
+                    immediate_value=ue_35bit_addr_shifter(dst_base),
+                    dst_reg_idx=addr_scratch_reg)
+                ue._pbi_override_dram_base_from_gpr(
+                    inst_pointer_idx=ptr_w, gpr_addr_reg=addr_scratch_reg)
 
-        t_reg = self.alloc_isa_reg()
-        self.generate_instruction_add_set(t_reg, 0)
+        t_reg = ue.alloc_isa_reg()
+        if row0_reg is None:
+            ue.generate_instruction_add_set(t_reg, 0)
+        else:
+            ue.generate_instruction_add_imm(
+                src_reg_idx=row0_reg, immediate_value=0, dst_reg_idx=t_reg)
 
-        self.loop_start(loop_cnt=template_seq_len, gpr_loop_cnt=gf_seq_len)
-        self.generate_instruction_reg_mul_imm(
+        ue.loop_start(loop_cnt=template_seq_len, gpr_loop_cnt=gf_seq_len)
+        ue.generate_instruction_reg_mul_imm(
             self.TMP_REG, t_reg, ue_35bit_addr_shifter(read_stride_bytes))
-        self.generate_instruction_add_imm(
+        ue.generate_instruction_add_imm(
             self.TMP_REG, ue_35bit_addr_shifter(read_base), self.TMP_REG)
-        self.accelerator_memory_to_sram(
+        ue.accelerator_memory_to_sram(
             accelerator_dram_address=0,
             sram_address=sram_byte_addr,
             element_size=element_count,
             general_reg_src=self.TMP_REG,
         )
         for ptr_w, (_base, dst_stride) in zip(ptr_ws, write_specs):
-            self.sram_to_accelerator_memory(
+            ue.sram_to_accelerator_memory(
                 sram_address=0,
                 accelerator_dram_address=dst_stride,
                 element_size=element_count,
                 inst_pointer_idx=ptr_w,
                 memcpy_length_bytes=0,
             )
-        self.generate_instruction_add_inc(t_reg)
-        self.loop_end()
+        ue.generate_instruction_add_inc(t_reg)
+        ue.loop_end()
 
-        self.release_isa_reg()
+        ue.release_isa_reg()
         for ptr in reversed(ptr_ws):
-            self.release_inst_ptr(ptr)
+            ue.release_inst_ptr(ptr)
 
     def _flash_attention_core_cached(self, **kwargs) -> int:
         """Compatibility wrapper: translate legacy flash args to unified attention."""
@@ -1301,11 +1398,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
 
         # Per-layer weights — config-driven precision (precision.lm) for
-        # Q/K/gate/up/down, BF16 for V/O (all from binary). Default 'if4'
+        # Q/K/O/gate/up/down, BF16 for V (all from binary). Default 'if4'
         # picks INT4 vs FP4 per 64-block by min weight-MSE; near-lossless
         # vs BF16 on this LM (PPL +0.9% on WikiText-2 vs +7.9% for pure FP4
         # and +17% for pure INT4 — see src/models/qwen2.5_VL_3b/compare/summary.md).
-        # V/O stored as BF16 in binary for better attention accuracy.
+        # V stored as BF16 in binary (attention-side matmul operand).
         lm_prec = _lm_precision(self._cfg)
         print(f"  Loading {self.LAYER_SIZE} LM layers to FPGA DRAM ({lm_prec})...", flush=True)
         self.lm_layer_addrs = []
@@ -1319,9 +1416,24 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                                   ('gate', 'mlp.gate_proj'), ('up', 'mlp.up_proj'),
                                   ('down', 'mlp.down_proj')]:
                 la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.{hf_sub}.weight.{lm_prec}'])
-            # V and O as BF16 from binary
+            # V as BF16 from binary (feeds the attention matmul directly)
             la['v_weight'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.self_attn.v_proj.weight'].copy()).view(torch.bfloat16))
-            la['o_weight'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.self_attn.o_proj.weight'].copy()).view(torch.bfloat16))
+            # O: precision.lm-quantized. Newer bins carry it pre-quantized; a bin
+            # generated before o_proj joined _LM_QUANT_LAYERS only has the BF16
+            # tensor, so quantize it on the host at load (~2 s for all layers,
+            # byte-identical to what the generator writes). Same DRAM footprint
+            # either way, so programs.bin addresses do not depend on the path.
+            o_key = f'{prefix}.self_attn.o_proj.weight.{lm_prec}'
+            if o_key in lm_cache:
+                o_raw = lm_cache[o_key]
+            else:
+                if i == 0:
+                    print(f"    [o_proj] params.bin predates IF4 o_proj -- quantizing on the host "
+                          f"({lm_prec}); delete params.bin to regenerate with it pre-quantized")
+                o_bf16 = (torch.from_numpy(lm_cache[f'{prefix}.self_attn.o_proj.weight'].copy())
+                          .view(torch.bfloat16).view(self.vector_length, self.head_dim * self.group_size))
+                o_raw, _ = _qs_pack(lm_prec, o_bf16)
+            la['o_scale'], la['o_data'] = store_quantized_weight(self, o_raw)
             # Biases from binary
             for proj, hf_sub in [('q', 'self_attn.q_proj'), ('k', 'self_attn.k_proj'),
                                   ('v', 'self_attn.v_proj')]:
@@ -1459,6 +1571,11 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         lm_scratch_elems = ((ahd + lm_attn_aligned) * lm_attn_aligned
                             + lm_attn_batch * ahd)
         self.LAYER0_FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(lm_scratch_elems * bpe)
+        # Sizes stashed for multi-engine PER_ENGINE duplication (the attention
+        # core WRITES its scratch, so a shared copy would interleave score
+        # planes) and for the second KV head's shared FLASH_K/V pair.
+        self._lm_scratch_bytes = lm_scratch_elems * bpe
+        self._lm_flash_kv_bytes = aligned_seq_len * ahd * bpe
         # PBI prefill packs FLASH_Q with qpkv rows per token (q_seq_len = PREFILL_MAX_SEQ_LEN * qpkv),
         # so BIAS and ATTN_P are sized to (prefill_aligned)^2 where prefill_aligned = PREFILL_MAX_SEQ_LEN*qpkv aligned to UE_VECTOR_SIZE.
         self.LAYER0_FLASH_BIAS_DRAM = self.allocate_tensor_dram(prefill_aligned * prefill_aligned * bpe)
@@ -1658,8 +1775,305 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             print(f"    Total program execution latency = {latency_us:.0f} us")
         return latency_us, flop_rate
 
-    def _vis_transpose_10(self, input_addr: int, output_addr: int, d0: int, d1: int, last: int) -> None:
+    # =====================================================================
+    # MULTI-ENGINE SHARDING (--engines N) -- structure ported from
+    # models/pi05/pi05_test.py (worker pool / stage scheduler / self-test
+    # guard / symmetric rendezvous). multi_engine_shard.MultiEngineScheduler
+    # is used for worker construction + capture + PER_ENGINE scratch; the
+    # bodies below emit one COMPLETE engine stream at a time and therefore
+    # use the per-engine _shard_barrier, not scheduler.barrier().
+    #
+    # Two stages shard, on different axes:
+    #   VIS      rows (tokens) for norms/matmuls/eltwise/extracts, HEADS for
+    #            the transposes/RoPE/attention/trim. S=576 is compile-time,
+    #            so every row offset is a folded constant.
+    #   PREFILL  rows (tokens) via RUNTIME ADDRESS GPRs: the prefill program
+    #            is seq-len-agnostic (one bin, gf_seq_len primed at run time),
+    #            so an engine's row offset cannot be folded at capture time.
+    #            Each engine's preamble ADD_SETs its row count into regs 2/3
+    #            and its byte offsets (>>3, word addrs) into regs 5..11; ops
+    #            take gpr_a_addr/gpr_out_addr scratch regs computed with one
+    #            add_imm per operand (the gemma3-proven mechanism:
+    #            user_dma_core._pbi_override_dram_base_from_gpr).
+    # DECODE stays single-engine.
+    # =====================================================================
+    NUM_ENGINES = 1              # set from --engines in __init__
+    VIS_NUM_ENGINES = None       # per-stage override; None -> NUM_ENGINES
+    PREFILL_NUM_ENGINES = None
+    DECODE_NUM_ENGINES = None
+    STAGE_MAX_ENGINES = {"VIS": 8, "PREFILL": 8, "DECODE": 8}
+    # Vision row-split granularity. 8, not 64: VS=576 is 72 blocks of 8 and
+    # divides 8 ways EXACTLY (72 rows each); at 64 it is 9 blocks and an
+    # 8-engine split is 2/1/1/1/1/1/1/1 (56% efficient). Legal because every
+    # vision op consumes the row count as a runtime M (matmul tiles M per
+    # row; only N/K carry the 64-element rule) and every per-engine byte
+    # offset here is row_offset * pitch with pitch % 128 == 0, so DRAM bases
+    # stay SRAM-row (128 B) aligned for ANY row offset.
+    VIS_ROW_ALIGN = 8
+    SHARD_BARRIER_MARGIN_NOPS = 32   # CHECK->CLEAR margin, see pi05 writeup
+
+    # Worker DRAM arenas. Qwen layout: params 0x0-0x90000000, tensors
+    # 0x90000000-0xA0000000, primary program 0xA0000000+ (a few MB used).
+    # Arenas sit at the top of the 4 GB space, far above the program
+    # allocator (asserted at pool construction): 7 workers x 64 MB =
+    # 0xE0000000..0xFC000000.
+    WORKER_ARENA_BASE    = 0xE0000000
+    WORKER_ARENA_TOP     = 0x100000000   # 4 GB DRAM top
+    WORKER_TENSOR_OFFSET = 0x00100000    # 1 MB params/guard headroom
+    WORKER_TENSOR_WINDOW = 0x02000000    # 32 MB (LM attn scratch ~20.5 MB +
+                                         # vision flash/scratch ~1.7 MB)
+    # The arena STRIDE and the program window are DERIVED per run from the
+    # worker count in _worker_engine_pool: the 512 MB region above 0xE0000000
+    # is split evenly (16 MB-floored) across the peak worker count. This is a
+    # hardware-measured requirement, not tidiness: the vision encoder inlines
+    # unified_attention_core per (head, window), so a worker's program share
+    # SHRINKS with the engine count -- measured ~36 MB at --engines 2 (half
+    # the 16 heads) vs ~13 MB at 8 (two heads). A fixed 64 MB/24 MB split
+    # overflowed at ne=2 (the exact assert this replaces fired on hardware);
+    # 1 worker now gets the whole region, 7 workers get 64 MB each.
+
+    # ---- PREFILL fixed shard GPRs (engine-local values, primed by each
+    # engine's runtime preamble in run_prefill; regs 1-4 keep their existing
+    # meaning, with 2/3 now holding THIS ENGINE's row counts).
+    #   5  SH_OFF_HID    shifter(row0 * 4096)   hidden-pitch rows (input/norm/
+    #                    q/attn-out/residual/mlp_down/output/flash_output)
+    #   6  SH_OFF_KV     shifter(row0 * 512)    k/v projection + RoPE-table rows
+    #   7  SH_OFF_MLP    shifter(row0 * 22016)  gate/up/mult rows
+    #   8  SH_OFF_FQ     shifter(row0 * 2048)   packed FLASH_Q / FLASH_OUT rows
+    #   9  SH_OFF_BIAS   shifter(row0 * qpkv * aligned_seq_len * 2)
+    #   10 SH_ROW0       row0 itself (PBI scatter loop-counter start)
+    #   11 SH_OFF_CACHE  shifter(row0 * 256)    KV-cache rows
+    #   12-14 scratch regs for per-call add_imm(base + offset) results
+    # Dynamic allocation starts at 15 when sharded (5 when not).
+    SH_OFF_HID, SH_OFF_KV, SH_OFF_MLP, SH_OFF_FQ = 5, 6, 7, 8
+    SH_OFF_BIAS, SH_ROW0, SH_OFF_CACHE = 9, 10, 11
+    SH_ADDR_A, SH_ADDR_B, SH_ADDR_C = 12, 13, 14
+    SH_DYN_REG_BASE = 15
+    # Every register the compiled prefill streams consume from the runtime
+    # preambles. Serialized into programs.json so a runtime (run_from_bin, or a
+    # future build of this script) can PROVE its preamble register map matches
+    # the bin's instead of silently priming the wrong GPRs.
+    SHARD_REG_NAMES = ("SH_OFF_HID", "SH_OFF_KV", "SH_OFF_MLP", "SH_OFF_FQ",
+                       "SH_OFF_BIAS", "SH_ROW0", "SH_OFF_CACHE",
+                       "SH_ADDR_A", "SH_ADDR_B", "SH_ADDR_C")
+    # Bump when EMISSION changes so stale programs.bin caches rebuild instead
+    # of silently running old streams (rev 2: zero-copy decode attention).
+    PROGRAMS_BIN_REV = 4   # 4: o_proj IF4 (was BF16)
+
+    @staticmethod
+    def _capture_bytes(ue) -> bytes:
+        """Serialize an engine's current capture buffer (used to harvest
+        worker program bytes right after finalize(), before the next stage's
+        begin_program() clears them)."""
+        out = bytearray()
+        for inst in ue.capture_buffer:
+            out.extend(inst.get_bytes())
+        return bytes(out)
+
+    def _num_engines(self, stage: str) -> int:
+        override = getattr(self, f"{stage}_NUM_ENGINES", None)
+        ne = int(override if override is not None else self.NUM_ENGINES)
+        cap = self.STAGE_MAX_ENGINES.get(stage, 8)
+        assert 1 <= ne <= cap, f"{stage}: engines={ne} outside 1..{cap}"
+        return ne
+
+    @staticmethod
+    def _col_split(N: int, num_engines: int, align: int = 64):
+        """[(offset, count)] whole-``align``-block split -- the same rule as
+        multi_engine_shard.MultiEngineScheduler.split_cols, duplicated here so
+        host-side splits (run_prefill row math) and emission agree without a
+        scheduler existing yet (the pi05 lesson: a silent disagreement is
+        finite-but-wrong output, not a crash)."""
+        if num_engines == 1:
+            return [(0, N)]
+        assert N % align == 0, f"_col_split: N={N} not a multiple of {align}"
+        blocks = N // align
+        assert blocks >= num_engines, f"_col_split: N={N} too few {align}-blocks"
+        base, rem = divmod(blocks, num_engines)
+        counts = [align * (base + (1 if i < rem else 0)) for i in range(num_engines)]
+        offsets = [sum(counts[:i]) for i in range(num_engines)]
+        return list(zip(offsets, counts))
+
+    @staticmethod
+    def _head_split(H: int, num_engines: int):
+        """[(head_offset, head_count)] over H attention heads. Requires an even
+        division: heads are whole units and the vision RoPE/attention emission
+        assumes one contiguous head range per engine."""
+        assert H % num_engines == 0, (
+            f"_head_split: {num_engines} engines must divide {H} heads "
+            f"(use 1, 2, 4 or 8)")
+        per = H // num_engines
+        return [(e * per, per) for e in range(num_engines)]
+
+    @contextlib.contextmanager
+    def _dram_selftest_guard(self, num_engines: int):
+        """Protect params DRAM from UnifiedEngine.__init__ (pi05's guard).
+
+        Constructing ANY UnifiedEngine runs init_unified_engine(), whose DRAM
+        read/write self-test writes 8192 random uint16 (16 KB) at the HARDCODED
+        user_dma_core.DRAM_START_ADDR (0x80000000) -- which for this model is
+        INSIDE the params region (0x0..0x90000000, vision weights live up
+        there). Snapshot the window, build the workers, put it back. The
+        snapshot round-trips through a real torch tensor (dma_from returns an
+        owning copy) -- NOT torch.frombuffer over bytes, which aliased a
+        temporary and corrupted the CPython heap in pi05.
+        """
+        if num_engines <= 1:
+            yield
+            return
+        n_elems = 8192            # must match init_unified_engine's self-test
+        base = user_dma_core.DRAM_START_ADDR
+        snap = self.dma_from_accelerator_memory(base, (n_elems,)).clone()
+        try:
+            yield
+        finally:
+            self.dma_to_accelerator_memory(base, snap)
+
+    def _worker_engine_pool(self, num_engines: int):
+        """The run's ONE set of worker UnifiedEngines, indices 1..peak-1.
+
+        Built once at the PEAK stage engine count and handed to every
+        scheduler: the DRAM allocators live inside these objects, and sharing
+        them is what keeps each stage's worker programs landing AFTER the
+        previous stage's instead of on top of it (see the ``workers`` note in
+        multi_engine_shard.MultiEngineScheduler.__init__ for the desync
+        failure mode)."""
+        pool = getattr(self, "_worker_pool", None)
+        peak = max(int(num_engines), self._num_engines("VIS"),
+                   self._num_engines("PREFILL"), self._num_engines("DECODE"))
+        if pool is not None:
+            assert len(pool) >= num_engines - 1, (
+                f"worker pool holds {len(pool)} engine(s) but {num_engines - 1} "
+                f"are needed; the pool is sized from the peak stage count at "
+                f"first use")
+            return pool
+        if peak <= 1:
+            return []
+        # Fail FAST on a board with fewer cores than requested: a FLAG_CHECK
+        # against a nonexistent engine spin-waits forever (no timeout), so an
+        # oversubscribed --engines would present as a hang, not an error. The
+        # core count comes from the HW_INFO register (populated by
+        # configure_clock_from_hardware in main), not from a board-name guess.
+        hw_cores = getattr(user_dma_core, "ANDROMEDA_CORE_COUNT", None)
+        if hw_cores is not None:
+            assert peak <= int(hw_cores), (
+                f"--engines {peak} but the bitstream reports only {hw_cores} "
+                f"core(s) (HW_INFO); use --engines {hw_cores} or lower")
+        assert self.get_program_dram_addr() < self.WORKER_ARENA_BASE, (
+            f"primary program allocator 0x{self.get_program_dram_addr():X} has "
+            f"grown into the worker arena base 0x{self.WORKER_ARENA_BASE:X}")
+        n_workers = peak - 1
+        stride = (self.WORKER_ARENA_TOP - self.WORKER_ARENA_BASE) // n_workers
+        stride &= ~0x00FFFFFF                      # floor to 16 MB
+        program_offset = self.WORKER_TENSOR_OFFSET + self.WORKER_TENSOR_WINDOW
+        assert stride >= program_offset + 0x01000000, (
+            f"{n_workers} workers leave only 0x{stride:X} B/arena -- no room for "
+            f"a program window past the 0x{program_offset:X} B tensor region")
+        self._worker_arena_stride = stride
+        self._worker_program_offset = program_offset
+        pool = []
+        with self._dram_selftest_guard(peak):
+            for i in range(1, peak):
+                base = self.WORKER_ARENA_BASE + (i - 1) * stride
+                pool.append(UnifiedEngine(
+                    BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * 0x00010000,
+                    params_dram_base=base,
+                    tensor_dram_base=base + self.WORKER_TENSOR_OFFSET,
+                    program_dram_base=base + program_offset,
+                ))
+        self._worker_pool = pool
+        _original_print(f"    [engines] worker pool: {len(pool)} shared engine(s), "
+                        f"{stride >> 20} MB arena(s) "
+                        f"({(stride - program_offset) >> 20} MB program window each)")
+        return pool
+
+    def _make_stage_scheduler(self, num_engines: int):
+        """Scheduler for ANY stage over the shared worker pool, cached by
+        engine count (pi05's fix: per-stage schedulers over fresh allocators
+        silently overwrite each other's worker programs)."""
+        from multi_engine_shard import MultiEngineScheduler
+        cache = self.__dict__.setdefault("_sched_by_ne", {})
+        if num_engines in cache:
+            return cache[num_engines]
+        # Build the pool FIRST: it derives _worker_arena_stride/_program_offset
+        # from the peak worker count, which the ctor args below read.
+        pool = self._worker_engine_pool(num_engines)
+        sched = MultiEngineScheduler(
+            self, num_engines=num_engines,
+            worker_dram_base=self.WORKER_ARENA_BASE,
+            worker_dram_stride=self._worker_arena_stride,
+            worker_tensor_offset=self.WORKER_TENSOR_OFFSET,
+            worker_program_offset=self._worker_program_offset,
+            allow_more_than_two_engines=True,
+            workers=pool)
+        cache[num_engines] = sched
+        return sched
+
+    @staticmethod
+    def _shard_barrier(ue, engine_idx: int, num_engines: int,
+                       margin_nops: int = SHARD_BARRIER_MARGIN_NOPS):
+        """Emit ONE engine's slice of the symmetric all-engine rendezvous.
+
+        MultiEngineScheduler.barrier() emits into every engine at once, which
+        is wrong here: bodies are emitted one COMPLETE engine stream at a
+        time. Same proven shape (flag_rendezvous_repeat_test): SET; CHECK all
+        peers; <margin NOPs>; CLEAR. CLEAR too early -> the partner misses our
+        SET (hang); too late -> its NEXT rendezvous sees a stale 1 (races
+        ahead)."""
+        if num_engines <= 1:
+            return
+        ue.generate_instruction_flag_set()
+        for j in range(num_engines):
+            if j != engine_idx:
+                ue.generate_instruction_flag_check(target_engine_idx=j)
+        for _ in range(margin_nops):
+            ue.generate_instruction_nop()
+        ue.generate_instruction_flag_clear()
+
+    def _assert_worker_arenas_fit(self, sched, stage: str) -> None:
+        """Every worker's tensor and program allocators must stay inside its
+        64 MB arena windows -- an overflow silently lands in the NEXT worker's
+        arena (or past the DRAM top) and shows up as scrambled data, not an
+        error. Checked after every finalize()."""
+        stride = self._worker_arena_stride
+        program_offset = self._worker_program_offset
+        for i, w in enumerate(sched.workers):
+            base = self.WORKER_ARENA_BASE + i * stride
+            t_end = w.get_tensor_dram_addr()
+            p_end = w.get_program_dram_addr()
+            assert t_end <= base + program_offset, (
+                f"[{stage}] worker {i + 1} tensor allocator 0x{t_end:X} overflows "
+                f"its window (base 0x{base:X} + tensor "
+                f"0x{self.WORKER_TENSOR_OFFSET:X}..0x{program_offset:X})")
+            assert p_end <= base + stride, (
+                f"[{stage}] worker {i + 1} program allocator 0x{p_end:X} overflows "
+                f"its 0x{stride:X}-byte arena at 0x{base:X}")
+
+    def _preclear_shard_flags(self, sched) -> None:
+        """One-time flag preclear + stale-busy recovery before the first
+        sharded execution of the process (multi_engine_shard.preclear_flags)."""
+        if getattr(self, "_shard_flags_precleared", False):
+            return
+        sched.preclear_flags()
+        self._shard_flags_precleared = True
+
+    @staticmethod
+    def _join_workers(sched, timeout_s: float = 60.0) -> None:
+        """The primary retires its halt as soon as the exit rendezvous clears;
+        a worker may still be draining its (write-free) margin NOPs. Wait
+        rather than assert-not-busy, which would be flaky."""
+        for w in sched.workers:
+            w.wait_queue(timeout_s)
+
+    def _vis_transpose_10(self, input_addr: int, output_addr: int, d0: int, d1: int, last: int,
+                          ue=None, i1_lo: int = 0, i1_hi: int = None) -> None:
         """Transpose [d0, d1, last] -> [d1, d0, last] (permute [1,0,2]) via strided DMA.
+
+        ``ue`` / ``i1_lo`` / ``i1_hi`` shard the OUTPUT-block loop for multi-engine
+        emission: each output block i1 is one independent gather+store, so an
+        engine owning blocks [i1_lo, i1_hi) covers exactly its heads (head->token
+        merge, d1=VN) or its tokens (token->head merge, d1=VS) with zero overlap.
+        Defaults reproduce the historical full-range single-engine emission.
 
         One gather DMA pair per OUTPUT block (d1 iterations) instead of
         bf16_permute_core_v2's per-row unroll (d0*d1 rows): for output block i1,
@@ -1672,363 +2086,121 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # output on device (verified 2026-06-10: ATTN_RESULT cos=0.06) even though the
         # symmetric strided READ is correct. Stay on the gather (strided read) path.
         bpe = self.bytes_per_element
-        for i1 in range(d1):
-            self.accelerator_memory_to_sram(
+        ue = ue if ue is not None else self
+        for i1 in range(i1_lo, d1 if i1_hi is None else i1_hi):
+            ue.accelerator_memory_to_sram(
                 accelerator_dram_address=input_addr + i1 * last * bpe,
                 sram_address=0x00000, element_size=d0 * last,
                 stride_bytes_per_chunk=last * bpe, stride_jump_bytes=d1 * last * bpe)
-            self.sram_to_accelerator_memory(
+            ue.sram_to_accelerator_memory(
                 sram_address=0x00000,
                 accelerator_dram_address=output_addr + i1 * d0 * last * bpe,
                 element_size=d0 * last)
 
-    def compile_encoder(self, num_layers: int = None) -> int:
-        """Compile vision encoder FPGA program. Returns program DRAM address."""
-        from user_dma_core import TYPE
-
+    def _vis_register_shard_scratch(self, sched) -> None:
+        """PER_ENGINE duplication of every vision buffer a kernel WRITES as
+        scratch. One shared copy would have engines interleaving writes into
+        the same flash staging / score plane -- the finite-but-scrambled
+        failure, not a hang (pi05's _vis_make_scheduler lesson). Idempotent
+        per scheduler; the primary keeps its existing model addresses."""
+        if getattr(sched, "_qwen_vis_registered", False):
+            return
+        sched._qwen_vis_registered = True
         vis_cfg = self._vis_cfg
         VS = vis_cfg["num_patches"]
-        VH = vis_cfg["hidden_size"]
-        VN = vis_cfg["num_heads"]
-        VD = vis_cfg["head_dim"]
-        VI = vis_cfg["intermediate_size"]
-        VIS_MLP_PAD = ((VI + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
-        total_layers = num_layers if num_layers is not None else vis_cfg["depth"]
         VD_PAD = 128
-        VH_OUT = vis_cfg["out_hidden_size"]
-        VMERGE = vis_cfg["spatial_merge_size"]
         bpe = 2
+        for name, addr in (("vis_flash_q", self.VIS_FLASH_Q_DRAM),
+                           ("vis_flash_k", self.VIS_FLASH_K_DRAM),
+                           ("vis_flash_v", self.VIS_FLASH_V_DRAM),
+                           ("vis_flash_out", self.VIS_FLASH_OUT_DRAM)):
+            sched.register_per_engine(name, addr, VS * VD_PAD * bpe)
+        vis_scratch_elems = (VD_PAD + VS) * VS + VS * VD_PAD
+        sched.register_per_engine("vis_attn_scratch", self.VIS_ATTN_SCRATCH_DRAM,
+                                  vis_scratch_elems * bpe)
 
-        head_stride_pad = VS * VD_PAD * bpe
-        head_stride_raw = VS * VD * bpe
+    def compile_encoder(self, num_layers: int = None) -> int:
+        """Compile vision encoder FPGA program. Returns program DRAM address.
 
-        permute_dims_merge = [VN, VS, VD]        # [16, 576, 80] for head merge
-        permute_idx = [1, 0, 2]                  # swap dim 0 and dim 1
+        With --engines N (N > 1) the same body is emitted once per engine over
+        (a) a contiguous ROW block of the VS=576 patch tokens for every
+        row-independent op (norms, all matmuls, eltwise, the QK column
+        extracts, the merger) and (b) a contiguous HEAD range for the
+        head-major stretch (the three token->head transposes, RoPE, the
+        per-(head,window) attention calls, the 128->80 trim). Two rendezvous
+        per layer:
 
-        _bf16_mode = getattr(self, '_vision_bf16_mode', False)
+          #1 after {norm1, qk, v, Q/K extracts} -- the head-major transposes
+             gather ALL token rows of buffers written row-sharded (RAW).
+          #2 after the trim -- the token-major merge transpose reads ALL heads
+             of ATTN_TRIM, written head-sharded (RAW). #2 is also the WAR
+             fence: every cross-engine read in the head stretch (qbuf/kbuf/
+             VIS_V/ATTN_TRIM) completes before it, and every later write up to
+             the next #1 stays inside the writer's own rows.
+
+        num_engines == 1 emits (0, VS) rows x (0, VN) heads: the historical
+        single-engine stream (the one deliberate delta: the K extract lands in
+        its own half of VIS_PERMUTE_TEMP instead of reusing the Q half, so
+        both extracts can precede rendezvous #1; at 1 engine that is only a
+        different scratch address, same ops).
+        """
+        vis_cfg = self._vis_cfg
+        VS = vis_cfg["num_patches"]
+        VN = vis_cfg["num_heads"]
+        total_layers = num_layers if num_layers is not None else vis_cfg["depth"]
+
         bin_dir = os.path.join(self.script_dir, "qwen2.5_vl_3b_bin")
         os.makedirs(bin_dir, exist_ok=True)
-        # NOTE: no standalone encoder_program.bin — the ONLY instruction bin is
-        # the unified programs.bin written by compile_all. Direct callers
-        # (e.g. the compare script's per-layer vision checks) just compile fresh
-        # into program DRAM; nothing is cached to disk here.
+        # NOTE: no standalone encoder_program.bin -- the ONLY instruction bin is
+        # the unified programs.bin written by compile_all (single-engine only;
+        # worker programs live in worker DRAM and are not part of it).
 
         global _SILENT_MODE
         _SILENT_MODE = True
 
-        _bf16_mode = getattr(self, '_vision_bf16_mode', False)
-        def vis_matmul(M, K, N, A, la_key_prefix, la, OUT, bias=None, silu_en=False, gelu_en=False, gpr_M_reg=None):
-            if _bf16_mode and f'{la_key_prefix}_weight_bf16' in la:
-                self.matmat_mul_core(
-                    M=M, K=K, N=N, A_DRAM_ADDR=A,
-                    B_DRAM_ADDR=la[f'{la_key_prefix}_weight_bf16'],
-                    OUTPUT_DRAM_ADDR=OUT,
-                    C_DRAM_ADDR=la.get(f'{la_key_prefix}_bias_bf16', bias), bias_mode="broadcast_N",
-                    silu_enable=silu_en, gelu_enable=gelu_en, gpr_M_reg=gpr_M_reg)
-            else:
-                self.matmat_mul_core(
-                    M=M, K=K, N=N, A_DRAM_ADDR=A,
-                    B_DRAM_ADDR=la[f'{la_key_prefix}_data'],
-                    OUTPUT_DRAM_ADDR=OUT,
-                    C_DRAM_ADDR=bias, bias_mode="broadcast_N",
-                    is_B_quantized=True, data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=la[f'{la_key_prefix}_scale'],
-                    silu_enable=silu_en, gelu_enable=gelu_en, gpr_M_reg=gpr_M_reg)
-
-        total_bytes = 0
+        ne = self._num_engines("VIS")
+        row_splits = self._col_split(VS, ne, align=self.VIS_ROW_ALIGN)
+        head_splits = self._head_split(VN, ne)
+        sched = self._make_stage_scheduler(ne) if ne > 1 else None
+        self._vis_sched = sched
+        if sched is not None:
+            self._vis_register_shard_scratch(sched)
+            _original_print(f"    [vis] {ne} engine(s): rows "
+                            f"{[c for _, c in row_splits]} of {VS}, heads "
+                            f"{[c for _, c in head_splits]} of {VN}, "
+                            f"2 rendezvous/layer")
 
         _original_print(f"  Compiling vision encoder: {total_layers} layers (single program)...")
         self.start_capture()
-
-        # Runtime row-count register (M=VS) shared by all M-agnostic PBI ops in the
-        # encoder — matmuls, norm1, and the rope core. Constant across heads/layers;
-        # primed once, not consumed by the hardware loop. Drives the per-layer ISA to
-        # be M-agnostic (single hardware loop instead of VS-row unrolling).
         self.reset_isa_reg_counter()
-        vis_M_reg = self.alloc_isa_reg()
-        self.generate_instruction_add_set(vis_M_reg, VS)
+        if sched is not None:
+            sched.begin_program()
+            engines = sched.engines
+        else:
+            engines = [self]
 
-        def _vis_flash_call(q_src, k_src, v_src, out_dst, seg_len):
-            """Marshal one segment's Q/K/V into fixed buffers and run unified attention."""
-            elems = seg_len * VD_PAD
-            for src, dst in ((q_src, self.VIS_FLASH_Q_DRAM),
-                             (k_src, self.VIS_FLASH_K_DRAM),
-                             (v_src, self.VIS_FLASH_V_DRAM)):
-                self.accelerator_memory_to_sram(src, 0x00000, elems)
-                self.sram_to_accelerator_memory(0x00000, dst, elems)
-            self.unified_attention_core(
-                batch=seg_len,
-                aligned_seq_len=seg_len,
-                head_dim=VD_PAD,
-                Q_DRAM_ADDR=self.VIS_FLASH_Q_DRAM,
-                K_DRAM_ADDR=self.VIS_FLASH_K_DRAM,
-                V_DRAM_ADDR=self.VIS_FLASH_V_DRAM,
-                BIAS_DRAM_ADDR=self.VIS_ATTN_BIAS_DRAM,
-                OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_DRAM,
-                SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH_DRAM,
-                IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR)
-            self.accelerator_memory_to_sram(self.VIS_FLASH_OUT_DRAM, 0x00000, elems)
-            self.sram_to_accelerator_memory(0x00000, out_dst, elems)
+        for e, ue in enumerate(engines):
+            row_offset, rows = row_splits[e]
+            head_off, heads = head_splits[e]
+            self._emit_encoder_body(ue, e, sched, row_offset, rows,
+                                    head_off, heads, total_layers)
 
-        for layer_idx in range(total_layers):
-            _original_print(f"    vision layer {layer_idx + 1}/{total_layers}", end="\r", flush=True)
-            la = self.vis_layer_addrs[layer_idx]
-            h_in  = self.VIS_IO_A_DRAM if layer_idx % 2 == 0 else self.VIS_IO_B_DRAM
-            h_out = self.VIS_IO_B_DRAM if layer_idx % 2 == 0 else self.VIS_IO_A_DRAM
-
-
-            # Layer 0 copies patch input to IO_A
-            if layer_idx == 0:
-                for chunk_start in range(0, VS * VH, URAM_NEAR_FULL_ELEMENTS):
-                    chunk_take = min(URAM_NEAR_FULL_ELEMENTS, VS * VH - chunk_start)
-                    self.accelerator_memory_to_sram(
-                        accelerator_dram_address=self.VIS_PATCH_INPUT_DRAM + chunk_start * bpe,
-                        sram_address=0x00000, element_size=chunk_take)
-                    self.sram_to_accelerator_memory(
-                        sram_address=0x00000,
-                        accelerator_dram_address=self.VIS_IO_A_DRAM + chunk_start * bpe,
-                        element_size=chunk_take)
-
-            self.rms_norm_core_dram(M=VS, N=VH,
-                A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la['norm1_weight'], gpr_M_reg=vis_M_reg)
-
-            VN_VD_PAD = VN * VD_PAD
-            if _bf16_mode and 'qk_weight_bf16' in la:
-                self.matmat_mul_core(
-                    M=VS, K=VH, N=VN_VD_PAD * 2,
-                    A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
-                    B_DRAM_ADDR=la['qk_weight_bf16'],
-                    OUTPUT_DRAM_ADDR=self.VIS_QK_DRAM,
-                    C_DRAM_ADDR=la['qk_bias_bf16'], bias_mode="broadcast_N",
-                    gpr_M_reg=vis_M_reg)
-            else:
-                self.matmat_mul_core(
-                    M=VS, K=VH, N=VN_VD_PAD * 2,
-                    A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
-                    B_DRAM_ADDR=la['qk_data'],
-                    OUTPUT_DRAM_ADDR=self.VIS_QK_DRAM,
-                    C_DRAM_ADDR=la['qk_bias'], bias_mode="broadcast_N",
-                    is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=la['qk_scale'], gpr_M_reg=vis_M_reg)
-
-            if _bf16_mode and 'v_weight_bf16' in la:
-                self.matmat_mul_core(
-                    M=VS, K=VH, N=VN_VD_PAD,
-                    A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
-                    B_DRAM_ADDR=la['v_weight_bf16'],
-                    OUTPUT_DRAM_ADDR=self.VIS_V_DRAM,
-                    C_DRAM_ADDR=la['v_bias_bf16'], bias_mode="broadcast_N",
-                    gpr_M_reg=vis_M_reg)
-            else:
-                self.matmat_mul_core(
-                    M=VS, K=VH, N=VN_VD_PAD,
-                    A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
-                    B_DRAM_ADDR=la['v_data'],
-                    OUTPUT_DRAM_ADDR=self.VIS_V_DRAM,
-                    C_DRAM_ADDR=la['v_bias'], bias_mode="broadcast_N",
-                    is_B_quantized=True, data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=la['v_scale'], gpr_M_reg=vis_M_reg)
-
-            qk_row_pad = VN_VD_PAD * 2
-            extract_buf = self.VIS_PERMUTE_TEMP_DRAM
-            perm_temp = self.VIS_PERMUTE_TEMP_DRAM + VS * VN_VD_PAD * bpe
-
-            # Extract Q/K from interleaved QK output using strided DMA
-            ext_chunk = URAM_NEAR_FULL_ELEMENTS // VN_VD_PAD
-            for proj_idx, (proj_col_off, pad_dst) in enumerate([
-                (0,              self.VIS_Q_PAD_DRAM),
-                (VN_VD_PAD,      self.VIS_K_PAD_DRAM),
-            ]):
-                for t_start in range(0, VS, ext_chunk):
-                    t_take = min(ext_chunk, VS - t_start)
-                    src = self.VIS_QK_DRAM + t_start * qk_row_pad * bpe + proj_col_off * bpe
-                    dst = extract_buf + t_start * VN_VD_PAD * bpe
-                    self.accelerator_memory_to_sram(
-                        src, 0x00000, t_take * VN_VD_PAD,
-                        stride_bytes_per_chunk=VN_VD_PAD * bpe,
-                        stride_jump_bytes=qk_row_pad * bpe)
-                    self.sram_to_accelerator_memory(0x00000, dst, t_take * VN_VD_PAD)
-
-                # Token-major [VS, VN, VD_PAD] -> head-major [VN, VS, VD_PAD] via
-                # strided DMA (16 iters), replacing the per-row-unrolled permute.
-                self._vis_transpose_10(extract_buf, pad_dst, d0=VS, d1=VN, last=VD_PAD)
-
-            self._vis_transpose_10(self.VIS_V_DRAM, self.VIS_V_PAD_DRAM,
-                                   d0=VS, d1=VN, last=VD_PAD)
-
-            # RoPE via the shared PBI core (rope_hf_core_dram). Per token it loads x plus
-            # the interleaved [cos||sin] row through 2 auto-advancing load pointers (+1
-            # store) — the proven-good pointer count, unlike the old 3-separate-load path
-            # whose 3rd pointer didn't reliably advance and corrupted vision output.
-            # cos/sin are position-only, so the same table is reused for every head.
-            # One rope call per buffer over ALL heads (M=VN*VS, head-major Q/K_PAD).
-            # The VN-tiled cos/sin table makes row h*VS+t use cos/sin[t]. Replaces the
-            # old 16-heads x (Q,K) = 32 per-head calls with 2 PBI-looped calls.
-            # Re-prime the shared M register to VN*VS for the rope, then back to VS
-            # (no extra ISA register — the encoder is at the reg budget).
-            self.generate_instruction_add_set(vis_M_reg, VN * VS)
-            for buf_dram in (self.VIS_Q_PAD_DRAM, self.VIS_K_PAD_DRAM):
-                self.rope_hf_core_dram(
-                    M=VN * VS, N=VD_PAD,
-                    input_dram_addr=buf_dram, output_dram_addr=buf_dram,
-                    cos_dram_addr=self.VIS_ROPE_COS_DRAM,
-                    sin_dram_addr=self.VIS_ROPE_SIN_DRAM,
-                    gpr_M_reg=vis_M_reg)
-            self.generate_instruction_add_set(vis_M_reg, VS)
-
-            # flash_attention_core scales by 1/sqrt(128) instead of 1/sqrt(80).
-            # The softer attention (sqrt(128)) is more robust to INT4 quantization noise
-            # and empirically gives better end-to-end results than correcting to sqrt(80).
-            fullatt_indexes = set(vis_cfg.get("fullatt_block_indexes", [7, 15, 23, 31]))
-            cu_win = getattr(self, '_cu_window_seqlens', [0, VS])
-            is_full_attn = (layer_idx in fullatt_indexes)
-
-            if is_full_attn:
-                for h in range(VN):
-                    base = h * head_stride_pad
-                    _vis_flash_call(self.VIS_Q_PAD_DRAM + base, self.VIS_K_PAD_DRAM + base,
-                                    self.VIS_V_PAD_DRAM + base, self.VIS_ATTN_OUT_DRAM + base, VS)
-            else:
-                for h in range(VN):
-                    for w_idx in range(len(cu_win) - 1):
-                        w_start = cu_win[w_idx]
-                        w_len = cu_win[w_idx + 1] - w_start
-                        if w_len <= 0:
-                            continue
-                        off = h * head_stride_pad + w_start * VD_PAD * bpe
-                        _vis_flash_call(self.VIS_Q_PAD_DRAM + off, self.VIS_K_PAD_DRAM + off,
-                                        self.VIS_V_PAD_DRAM + off, self.VIS_ATTN_OUT_DRAM + off, w_len)
-
-            # Trim: extract first 80 from each 128-element row. Batch per head using strided DMA.
-            trim_chunk = URAM_NEAR_FULL_ELEMENTS // VD  # rows per SRAM batch
-            for h in range(VN):
-                src_head = self.VIS_ATTN_OUT_DRAM + h * head_stride_pad
-                dst_head = self.VIS_ATTN_TRIM_DRAM + h * head_stride_raw
-                for t_start in range(0, VS, trim_chunk):
-                    t_take = min(trim_chunk, VS - t_start)
-                    self.accelerator_memory_to_sram(
-                        src_head + t_start * VD_PAD * bpe, 0x00000, t_take * VD,
-                        stride_bytes_per_chunk=VD * bpe,
-                        stride_jump_bytes=VD_PAD * bpe)
-                    self.sram_to_accelerator_memory(
-                        0x00000, dst_head + t_start * VD * bpe, t_take * VD)
-
-            # Head-major [VN, VS, VD] -> token-major [VS, VN, VD] via strided DMA.
-            self._vis_transpose_10(self.VIS_ATTN_TRIM_DRAM, self.VIS_ATTN_RESULT_DRAM,
-                                   d0=VN, d1=VS, last=VD)
-
-            vis_matmul(VS, VH, VH, self.VIS_ATTN_RESULT_DRAM, 'o', la,
-                       self.VIS_O_PROJ_DRAM, bias=la['o_bias'], gpr_M_reg=vis_M_reg)
-
-            # norm2 kept LEGACY (static): its PBI variant uses a 2-load+2-store pointer
-            # pattern that corrupts output on device (verified 2026-05-29) AND saved only
-            # ~2MB — net loss. See [[project_qwenvl_rope_pbi_bug]].
-            # post-attn residual + norm2, split into an efficient chunked eltwise-add
-            # and an M-looped rms_norm instead of the fused post_add (whose legacy form
-            # is M-unrolled over VS rows ≈ 2400 instr/layer, and whose PBI form corrupts
-            # on device). Same result: residual = h_in + o_proj; norm = rms_norm(residual).
-            eltwise_add_core_dram(self, size=VS * VH,
-                A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM,
-                OUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM)
-            self.rms_norm_core_dram(M=VS, N=VH,
-                A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM, OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
-                GAMMA_DRAM_ADDR=la['norm2_weight'], gpr_M_reg=vis_M_reg)
-
-            self.matmat_mul_core(is_B_quantized=True,
-                M=VS, K=VH, N=VIS_MLP_PAD,
-                A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
-                B_DRAM_ADDR=la['gate_data'],
-                OUTPUT_DRAM_ADDR=self.VIS_MLP_GATE_DRAM,
-                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4,
-                C_DRAM_ADDR=la['gate_bias'], bias_mode="broadcast_N",
-                silu_enable=True, gpr_M_reg=vis_M_reg)
-            self.matmat_mul_core(is_B_quantized=True,
-                M=VS, K=VH, N=VIS_MLP_PAD,
-                A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM,
-                B_DRAM_ADDR=la['up_data'],
-                OUTPUT_DRAM_ADDR=self.VIS_MLP_UP_DRAM,
-                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4,
-                C_DRAM_ADDR=la['up_bias'], bias_mode="broadcast_N", gpr_M_reg=vis_M_reg)
-
-            # gate * up chunked
-            _M_CHUNK = min((0x80000 - 0x10000) // 2 // VIS_MLP_PAD, VS)
-            for _t in range(0, VS, _M_CHUNK):
-                _m_take = min(_M_CHUNK, VS - _t)
-                _g_row = self.VIS_MLP_GATE_DRAM + _t * VIS_MLP_PAD * bpe
-                _u_row = self.VIS_MLP_UP_DRAM   + _t * VIS_MLP_PAD * bpe
-                _m_row = self.VIS_MLP_MULT_DRAM  + _t * VIS_MLP_PAD * bpe
-                self.accelerator_memory_to_sram(_g_row, 0x10000, _m_take * VIS_MLP_PAD)
-                self.accelerator_memory_to_sram(_u_row, 0x90000, _m_take * VIS_MLP_PAD)
-                self.eltwise_mul_core(0x10000, 0x90000, 0x10000, _m_take * VIS_MLP_PAD)
-                self.sram_to_accelerator_memory(0x10000, _m_row, _m_take * VIS_MLP_PAD)
-
-            # down_proj
-            self.matmat_mul_core(is_B_quantized=True,
-                M=VS, K=VIS_MLP_PAD, N=VH,
-                A_DRAM_ADDR=self.VIS_MLP_MULT_DRAM,
-                B_DRAM_ADDR=la['down_data'],
-                OUTPUT_DRAM_ADDR=self.VIS_MLP_DOWN_DRAM,
-                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4,
-                C_DRAM_ADDR=la['down_bias'], bias_mode="broadcast_N", gpr_M_reg=vis_M_reg)
-
-            eltwise_add_core_dram(self, size=VS * VH,
-                A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM,
-                B_DRAM_ADDR=self.VIS_MLP_DOWN_DRAM,
-                OUTPUT_DRAM_ADDR=h_out)
+        if sched is not None:
+            # KEEP the returned addresses: the scheduler is shared with the
+            # prefill stage and finalize() overwrites sched._worker_prog_addrs.
+            self._vis_worker_prog_addrs = sched.finalize()
+            self._assert_worker_arenas_fit(sched, "vis")
+            self._seg_encoder_workers = [
+                (addr, self._capture_bytes(w))
+                for addr, w in zip(self._vis_worker_prog_addrs, sched.workers)]
+            for (_a, _b), w in zip(self._seg_encoder_workers, sched.workers):
+                assert len(_b) == w.get_capture_instruction_size_bytes()
+            _original_print(f"    [vis] worker program(s): "
+                            f"{[w.get_capture_instruction_size_bytes() for w in sched.workers]} bytes")
 
         _original_print()  # newline after \r progress
 
-        final_vis = self.VIS_IO_A_DRAM if total_layers % 2 == 0 else self.VIS_IO_B_DRAM
-
-        self.rms_norm_core_dram(M=VS, N=VH,
-            A_DRAM_ADDR=final_vis, OUTPUT_DRAM_ADDR=self.VIS_POST_NORM_DRAM,
-            GAMMA_DRAM_ADDR=self.merger_ln_q_weight, gpr_M_reg=vis_M_reg)
-
-        merge_dim = VMERGE * VMERGE * VH
-        for chunk_start in range(0, VS * VH, URAM_NEAR_FULL_ELEMENTS):
-            chunk_take = min(URAM_NEAR_FULL_ELEMENTS, VS * VH - chunk_start)
-            self.accelerator_memory_to_sram(
-                self.VIS_POST_NORM_DRAM + chunk_start * bpe, 0x00000, chunk_take)
-            self.sram_to_accelerator_memory(
-                0x00000, self.VIS_MERGED_DRAM + chunk_start * bpe, chunk_take)
-
-        if _bf16_mode and hasattr(self, 'merger_mlp0_weight_bf16'):
-            self.matmat_mul_core(
-                M=self.NUM_MERGED_TOKENS, K=merge_dim, N=merge_dim,
-                A_DRAM_ADDR=self.VIS_MERGED_DRAM,
-                B_DRAM_ADDR=self.merger_mlp0_weight_bf16,
-                OUTPUT_DRAM_ADDR=self.VIS_MERGER_INTER_DRAM,
-                C_DRAM_ADDR=self.merger_mlp0_bias_bf16, bias_mode="broadcast_N",
-                gelu_enable=True)
-            self.matmat_mul_core(
-                M=self.NUM_MERGED_TOKENS, K=merge_dim, N=VH_OUT,
-                A_DRAM_ADDR=self.VIS_MERGER_INTER_DRAM,
-                B_DRAM_ADDR=self.merger_mlp2_weight_bf16,
-                OUTPUT_DRAM_ADDR=self.VIS_ENCODER_OUT_DRAM,
-                C_DRAM_ADDR=self.merger_mlp2_bias_bf16, bias_mode="broadcast_N")
-        else:
-            self.matmat_mul_core(
-                M=self.NUM_MERGED_TOKENS, K=merge_dim, N=merge_dim,
-                A_DRAM_ADDR=self.VIS_MERGED_DRAM,
-                B_DRAM_ADDR=self.merger_mlp0_data,
-                OUTPUT_DRAM_ADDR=self.VIS_MERGER_INTER_DRAM,
-                C_DRAM_ADDR=self.merger_mlp0_bias, bias_mode="broadcast_N",
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.merger_mlp0_scale,
-                gelu_enable=True)
-            self.matmat_mul_core(
-                M=self.NUM_MERGED_TOKENS, K=merge_dim, N=VH_OUT,
-                A_DRAM_ADDR=self.VIS_MERGER_INTER_DRAM,
-                B_DRAM_ADDR=self.merger_mlp2_data,
-                OUTPUT_DRAM_ADDR=self.VIS_ENCODER_OUT_DRAM,
-                C_DRAM_ADDR=self.merger_mlp2_bias, bias_mode="broadcast_N",
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.merger_mlp2_scale)
-
-        self.generate_instruction_halt()
-
-        # Finalize single program
+        # Finalize single program (primary engine)
         self.stop_capture()
         prog_bytes = bytearray()
         for inst in self.capture_buffer:
@@ -2046,8 +2218,403 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # Unified single-bin mode: hand bytes to compile_all for programs.bin.
             self._seg_encoder = (program_addr, bytes(prog_bytes))
         _original_print(f"    Vision encoder compiled: {total_bytes} bytes at 0x{program_addr:X}, "
-                        f"{total_layers} layers + merger")
+                        f"{total_layers} layers + merger"
+                        + (f" (+{len(sched.workers)} worker program(s))" if sched else ""))
         return program_addr
+
+    def _emit_encoder_body(self, ue, engine_idx: int, sched, row_offset: int,
+                           rows: int, head_off: int, heads: int,
+                           total_layers: int) -> None:
+        """Emit ONE engine's complete encoder program over token rows
+        [row_offset, row_offset+rows) and heads [head_off, head_off+heads).
+
+        ADDRESSING CONTRACT (pi05 audit style):
+          SHARED_FULL  weights / scales / biases / identity / rope table
+                       -> address passed through unchanged
+          SHARED_ROWS  every [VS, *] activation buffer -> + row_offset * pitch
+                       (every pitch here is a multiple of 128 B, so ANY row
+                       offset keeps strided-DMA bases SRAM-row aligned)
+          SHARED_HEADS the head-major [VN, VS, *] buffers -> + head * stride
+                       (engines write disjoint whole-head slices in place)
+          PER_ENGINE   VIS_FLASH_{Q,K,V,OUT} + attention scratch -> the
+                       attention core WRITES these (V^T / score plane /
+                       scaled Q), so they are duplicated per engine
+        """
+        from user_dma_core import TYPE
+
+        vis_cfg = self._vis_cfg
+        VS = vis_cfg["num_patches"]
+        VH = vis_cfg["hidden_size"]
+        VN = vis_cfg["num_heads"]
+        VD = vis_cfg["head_dim"]
+        VI = vis_cfg["intermediate_size"]
+        VIS_MLP_PAD = ((VI + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+        VD_PAD = 128
+        VH_OUT = vis_cfg["out_hidden_size"]
+        VMERGE = vis_cfg["spatial_merge_size"]
+        bpe = 2
+
+        head_stride_pad = VS * VD_PAD * bpe
+        head_stride_raw = VS * VD * bpe
+        VN_VD_PAD = VN * VD_PAD
+        qk_row_pad = VN_VD_PAD * 2
+        ne = sched.num_engines if sched is not None else 1
+        is_primary = engine_idx == 0
+        h_lo, h_hi = head_off, head_off + heads
+
+        # Per-engine byte offsets into the SHARED_ROWS buffers -- COMPILE-TIME
+        # CONSTANTS folded here at capture time (VS is fixed; unlike the
+        # prefill, no runtime address GPRs are needed).
+        RH   = row_offset * VH * bpe          # [VS, 1280] buffers
+        RQK  = row_offset * qk_row_pad * bpe  # [VS, 4096] fused QK output
+        RV   = row_offset * VN_VD_PAD * bpe   # [VS, 2048] V output
+        RMLP = row_offset * VIS_MLP_PAD * bpe # [VS, 3456] MLP buffers
+
+        # PER_ENGINE flash staging + attention scratch.
+        if sched is not None:
+            FQ = sched.per_engine_addr("vis_flash_q", engine_idx)
+            FK = sched.per_engine_addr("vis_flash_k", engine_idx)
+            FV = sched.per_engine_addr("vis_flash_v", engine_idx)
+            FO = sched.per_engine_addr("vis_flash_out", engine_idx)
+            ATTN_SCRATCH = sched.per_engine_addr("vis_attn_scratch", engine_idx)
+        else:
+            FQ, FK, FV, FO = (self.VIS_FLASH_Q_DRAM, self.VIS_FLASH_K_DRAM,
+                              self.VIS_FLASH_V_DRAM, self.VIS_FLASH_OUT_DRAM)
+            ATTN_SCRATCH = self.VIS_ATTN_SCRATCH_DRAM
+
+        # Q/K column-extract destinations. Q keeps the historical first half of
+        # VIS_PERMUTE_TEMP; K gets the (previously dead) second half so both
+        # extracts are emitted BEFORE rendezvous #1 with no WAR on one buffer.
+        qbuf = self.VIS_PERMUTE_TEMP_DRAM
+        kbuf = self.VIS_PERMUTE_TEMP_DRAM + VN * VS * VD_PAD * bpe
+
+        _bf16_mode = getattr(self, '_vision_bf16_mode', False)
+
+        # Runtime row-count register (M=this engine's rows) shared by all
+        # M-agnostic PBI ops. Re-primed to heads*VS around the RoPE calls.
+        vis_M_reg = ue.alloc_isa_reg()
+        ue.generate_instruction_add_set(vis_M_reg, rows)
+
+        def vis_matmul(M, K, N, A, la_key_prefix, la, OUT, bias=None, silu_en=False, gelu_en=False, gpr_M_reg=None):
+            if _bf16_mode and f'{la_key_prefix}_weight_bf16' in la:
+                ue.matmat_mul_core(
+                    M=M, K=K, N=N, A_DRAM_ADDR=A,
+                    B_DRAM_ADDR=la[f'{la_key_prefix}_weight_bf16'],
+                    OUTPUT_DRAM_ADDR=OUT,
+                    C_DRAM_ADDR=la.get(f'{la_key_prefix}_bias_bf16', bias), bias_mode="broadcast_N",
+                    silu_enable=silu_en, gelu_enable=gelu_en, gpr_M_reg=gpr_M_reg)
+            else:
+                ue.matmat_mul_core(
+                    M=M, K=K, N=N, A_DRAM_ADDR=A,
+                    B_DRAM_ADDR=la[f'{la_key_prefix}_data'],
+                    OUTPUT_DRAM_ADDR=OUT,
+                    C_DRAM_ADDR=bias, bias_mode="broadcast_N",
+                    is_B_quantized=True, data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=la[f'{la_key_prefix}_scale'],
+                    silu_enable=silu_en, gelu_enable=gelu_en, gpr_M_reg=gpr_M_reg)
+
+        def _vis_flash_call(q_src, k_src, v_src, out_dst, seg_len):
+            """Marshal one segment's Q/K/V into THIS ENGINE's flash buffers and
+            run unified attention with THIS ENGINE's scratch."""
+            elems = seg_len * VD_PAD
+            for src_a, dst in ((q_src, FQ), (k_src, FK), (v_src, FV)):
+                ue.accelerator_memory_to_sram(src_a, 0x00000, elems)
+                ue.sram_to_accelerator_memory(0x00000, dst, elems)
+            ue.unified_attention_core(
+                batch=seg_len,
+                aligned_seq_len=seg_len,
+                head_dim=VD_PAD,
+                Q_DRAM_ADDR=FQ,
+                K_DRAM_ADDR=FK,
+                V_DRAM_ADDR=FV,
+                BIAS_DRAM_ADDR=self.VIS_ATTN_BIAS_DRAM,
+                OUTPUT_DRAM_ADDR=FO,
+                SCRATCH_DRAM_ADDR=ATTN_SCRATCH,
+                IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR)
+            ue.accelerator_memory_to_sram(FO, 0x00000, elems)
+            ue.sram_to_accelerator_memory(0x00000, out_dst, elems)
+
+        for layer_idx in range(total_layers):
+            if is_primary:
+                _original_print(f"    vision layer {layer_idx + 1}/{total_layers}"
+                                + (f" (engine 0/{ne})" if ne > 1 else ""),
+                                end="\r", flush=True)
+            la = self.vis_layer_addrs[layer_idx]
+            h_in  = self.VIS_IO_A_DRAM if layer_idx % 2 == 0 else self.VIS_IO_B_DRAM
+            h_out = self.VIS_IO_B_DRAM if layer_idx % 2 == 0 else self.VIS_IO_A_DRAM
+
+            # Layer 0 copies patch input to IO_A (this engine's rows only)
+            if layer_idx == 0:
+                base_elem = row_offset * VH
+                for chunk_start in range(base_elem, base_elem + rows * VH, URAM_NEAR_FULL_ELEMENTS):
+                    chunk_take = min(URAM_NEAR_FULL_ELEMENTS, base_elem + rows * VH - chunk_start)
+                    ue.accelerator_memory_to_sram(
+                        accelerator_dram_address=self.VIS_PATCH_INPUT_DRAM + chunk_start * bpe,
+                        sram_address=0x00000, element_size=chunk_take)
+                    ue.sram_to_accelerator_memory(
+                        sram_address=0x00000,
+                        accelerator_dram_address=self.VIS_IO_A_DRAM + chunk_start * bpe,
+                        element_size=chunk_take)
+
+            ue.rms_norm_core_dram(M=rows, N=VH,
+                A_DRAM_ADDR=h_in + RH, OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT_DRAM + RH,
+                GAMMA_DRAM_ADDR=la['norm1_weight'], gpr_M_reg=vis_M_reg)
+
+            if _bf16_mode and 'qk_weight_bf16' in la:
+                ue.matmat_mul_core(
+                    M=rows, K=VH, N=VN_VD_PAD * 2,
+                    A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM + RH,
+                    B_DRAM_ADDR=la['qk_weight_bf16'],
+                    OUTPUT_DRAM_ADDR=self.VIS_QK_DRAM + RQK,
+                    C_DRAM_ADDR=la['qk_bias_bf16'], bias_mode="broadcast_N",
+                    gpr_M_reg=vis_M_reg)
+            else:
+                ue.matmat_mul_core(
+                    M=rows, K=VH, N=VN_VD_PAD * 2,
+                    A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM + RH,
+                    B_DRAM_ADDR=la['qk_data'],
+                    OUTPUT_DRAM_ADDR=self.VIS_QK_DRAM + RQK,
+                    C_DRAM_ADDR=la['qk_bias'], bias_mode="broadcast_N",
+                    is_B_quantized=True, data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=la['qk_scale'], gpr_M_reg=vis_M_reg)
+
+            if _bf16_mode and 'v_weight_bf16' in la:
+                ue.matmat_mul_core(
+                    M=rows, K=VH, N=VN_VD_PAD,
+                    A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM + RH,
+                    B_DRAM_ADDR=la['v_weight_bf16'],
+                    OUTPUT_DRAM_ADDR=self.VIS_V_DRAM + RV,
+                    C_DRAM_ADDR=la['v_bias_bf16'], bias_mode="broadcast_N",
+                    gpr_M_reg=vis_M_reg)
+            else:
+                ue.matmat_mul_core(
+                    M=rows, K=VH, N=VN_VD_PAD,
+                    A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM + RH,
+                    B_DRAM_ADDR=la['v_data'],
+                    OUTPUT_DRAM_ADDR=self.VIS_V_DRAM + RV,
+                    C_DRAM_ADDR=la['v_bias'], bias_mode="broadcast_N",
+                    is_B_quantized=True, data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=la['v_scale'], gpr_M_reg=vis_M_reg)
+
+            # Extract Q/K from the interleaved QK output using strided DMA --
+            # per-token, so ROW-sharded: this engine gathers its own token
+            # range into token-major qbuf/kbuf (shared buffers, disjoint rows).
+            ext_chunk = URAM_NEAR_FULL_ELEMENTS // VN_VD_PAD
+            for proj_col_off, ext_dst in ((0, qbuf), (VN_VD_PAD, kbuf)):
+                for t_start in range(row_offset, row_offset + rows, ext_chunk):
+                    t_take = min(ext_chunk, row_offset + rows - t_start)
+                    src_a = self.VIS_QK_DRAM + t_start * qk_row_pad * bpe + proj_col_off * bpe
+                    dst = ext_dst + t_start * VN_VD_PAD * bpe
+                    ue.accelerator_memory_to_sram(
+                        src_a, 0x00000, t_take * VN_VD_PAD,
+                        stride_bytes_per_chunk=VN_VD_PAD * bpe,
+                        stride_jump_bytes=qk_row_pad * bpe)
+                    ue.sram_to_accelerator_memory(0x00000, dst, t_take * VN_VD_PAD)
+
+            # ---- RENDEZVOUS #1: the head-major transposes below gather ALL
+            # token rows of qbuf/kbuf/VIS_V, which were written row-sharded.
+            self._shard_barrier(ue, engine_idx, ne)
+
+            # Token-major [VS, VN, VD_PAD] -> head-major [VN, VS, VD_PAD]:
+            # HEAD-sharded (one gather+store per output head block).
+            self._vis_transpose_10(qbuf, self.VIS_Q_PAD_DRAM, d0=VS, d1=VN,
+                                   last=VD_PAD, ue=ue, i1_lo=h_lo, i1_hi=h_hi)
+            self._vis_transpose_10(kbuf, self.VIS_K_PAD_DRAM, d0=VS, d1=VN,
+                                   last=VD_PAD, ue=ue, i1_lo=h_lo, i1_hi=h_hi)
+            self._vis_transpose_10(self.VIS_V_DRAM, self.VIS_V_PAD_DRAM,
+                                   d0=VS, d1=VN, last=VD_PAD, ue=ue,
+                                   i1_lo=h_lo, i1_hi=h_hi)
+
+            # RoPE via the shared PBI core over THIS ENGINE's contiguous head
+            # range: head-major rows [h_lo*VS, h_hi*VS) of Q_PAD/K_PAD, with
+            # the VN-tiled [cos||sin] table offset by the same head rows
+            # (table row pitch = 2*VD_PAD*bpe = 512 B, so the base stays
+            # 128 B-aligned and sin remains cos + VD_PAD*bpe).
+            rope_row_off = h_lo * VS * (2 * VD_PAD) * bpe
+            ue.generate_instruction_add_set(vis_M_reg, heads * VS)
+            for buf_dram in (self.VIS_Q_PAD_DRAM, self.VIS_K_PAD_DRAM):
+                ue.rope_hf_core_dram(
+                    M=heads * VS, N=VD_PAD,
+                    input_dram_addr=buf_dram + h_lo * head_stride_pad,
+                    output_dram_addr=buf_dram + h_lo * head_stride_pad,
+                    cos_dram_addr=self.VIS_ROPE_COS_DRAM + rope_row_off,
+                    sin_dram_addr=self.VIS_ROPE_SIN_DRAM + rope_row_off,
+                    gpr_M_reg=vis_M_reg)
+            ue.generate_instruction_add_set(vis_M_reg, rows)
+
+            # flash_attention scales by 1/sqrt(128) instead of 1/sqrt(80) (kept:
+            # softer attention is empirically more robust to INT4 noise).
+            # HEAD-sharded: every (head, window) call is independent -- windows
+            # never cross heads, and MQA does not apply here (per-head K/V).
+            fullatt_indexes = set(vis_cfg.get("fullatt_block_indexes", [7, 15, 23, 31]))
+            cu_win = getattr(self, '_cu_window_seqlens', [0, VS])
+            is_full_attn = (layer_idx in fullatt_indexes)
+
+            if is_full_attn:
+                for h in range(h_lo, h_hi):
+                    base = h * head_stride_pad
+                    _vis_flash_call(self.VIS_Q_PAD_DRAM + base, self.VIS_K_PAD_DRAM + base,
+                                    self.VIS_V_PAD_DRAM + base, self.VIS_ATTN_OUT_DRAM + base, VS)
+            else:
+                for h in range(h_lo, h_hi):
+                    for w_idx in range(len(cu_win) - 1):
+                        w_start = cu_win[w_idx]
+                        w_len = cu_win[w_idx + 1] - w_start
+                        if w_len <= 0:
+                            continue
+                        off = h * head_stride_pad + w_start * VD_PAD * bpe
+                        _vis_flash_call(self.VIS_Q_PAD_DRAM + off, self.VIS_K_PAD_DRAM + off,
+                                        self.VIS_V_PAD_DRAM + off, self.VIS_ATTN_OUT_DRAM + off, w_len)
+
+            # Trim: extract first 80 of each 128-element row -- HEAD-sharded.
+            trim_chunk = URAM_NEAR_FULL_ELEMENTS // VD
+            for h in range(h_lo, h_hi):
+                src_head = self.VIS_ATTN_OUT_DRAM + h * head_stride_pad
+                dst_head = self.VIS_ATTN_TRIM_DRAM + h * head_stride_raw
+                for t_start in range(0, VS, trim_chunk):
+                    t_take = min(trim_chunk, VS - t_start)
+                    ue.accelerator_memory_to_sram(
+                        src_head + t_start * VD_PAD * bpe, 0x00000, t_take * VD,
+                        stride_bytes_per_chunk=VD * bpe,
+                        stride_jump_bytes=VD_PAD * bpe)
+                    ue.sram_to_accelerator_memory(
+                        0x00000, dst_head + t_start * VD * bpe, t_take * VD)
+
+            # ---- RENDEZVOUS #2: the token-major merge below reads ALL heads
+            # of ATTN_TRIM (written head-sharded), and it doubles as the WAR
+            # fence for the head stretch (see compile_encoder docstring).
+            self._shard_barrier(ue, engine_idx, ne)
+
+            # Head-major [VN, VS, VD] -> token-major [VS, VN, VD]: d1 is the
+            # TOKEN axis here, so this transpose is ROW-sharded.
+            self._vis_transpose_10(self.VIS_ATTN_TRIM_DRAM, self.VIS_ATTN_RESULT_DRAM,
+                                   d0=VN, d1=VS, last=VD, ue=ue,
+                                   i1_lo=row_offset, i1_hi=row_offset + rows)
+
+            vis_matmul(rows, VH, VH, self.VIS_ATTN_RESULT_DRAM + RH, 'o', la,
+                       self.VIS_O_PROJ_DRAM + RH, bias=la['o_bias'], gpr_M_reg=vis_M_reg)
+
+            # post-attn residual + norm2 (row-independent, own rows).
+            eltwise_add_core_dram(ue, size=rows * VH,
+                A_DRAM_ADDR=h_in + RH, B_DRAM_ADDR=self.VIS_O_PROJ_DRAM + RH,
+                OUTPUT_DRAM_ADDR=self.VIS_RESIDUAL_DRAM + RH)
+            ue.rms_norm_core_dram(M=rows, N=VH,
+                A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM + RH,
+                OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT_DRAM + RH,
+                GAMMA_DRAM_ADDR=la['norm2_weight'], gpr_M_reg=vis_M_reg)
+
+            ue.matmat_mul_core(is_B_quantized=True,
+                M=rows, K=VH, N=VIS_MLP_PAD,
+                A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM + RH,
+                B_DRAM_ADDR=la['gate_data'],
+                OUTPUT_DRAM_ADDR=self.VIS_MLP_GATE_DRAM + RMLP,
+                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4,
+                C_DRAM_ADDR=la['gate_bias'], bias_mode="broadcast_N",
+                silu_enable=True, gpr_M_reg=vis_M_reg)
+            ue.matmat_mul_core(is_B_quantized=True,
+                M=rows, K=VH, N=VIS_MLP_PAD,
+                A_DRAM_ADDR=self.VIS_NORM_OUT_DRAM + RH,
+                B_DRAM_ADDR=la['up_data'],
+                OUTPUT_DRAM_ADDR=self.VIS_MLP_UP_DRAM + RMLP,
+                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4,
+                C_DRAM_ADDR=la['up_bias'], bias_mode="broadcast_N", gpr_M_reg=vis_M_reg)
+
+            # gate * up chunked over this engine's rows
+            _M_CHUNK = min((0x80000 - 0x10000) // 2 // VIS_MLP_PAD, VS)
+            for _t in range(row_offset, row_offset + rows, _M_CHUNK):
+                _m_take = min(_M_CHUNK, row_offset + rows - _t)
+                _g_row = self.VIS_MLP_GATE_DRAM + _t * VIS_MLP_PAD * bpe
+                _u_row = self.VIS_MLP_UP_DRAM   + _t * VIS_MLP_PAD * bpe
+                _m_row = self.VIS_MLP_MULT_DRAM  + _t * VIS_MLP_PAD * bpe
+                ue.accelerator_memory_to_sram(_g_row, 0x10000, _m_take * VIS_MLP_PAD)
+                ue.accelerator_memory_to_sram(_u_row, 0x90000, _m_take * VIS_MLP_PAD)
+                ue.eltwise_mul_core(0x10000, 0x90000, 0x10000, _m_take * VIS_MLP_PAD)
+                ue.sram_to_accelerator_memory(0x10000, _m_row, _m_take * VIS_MLP_PAD)
+
+            # down_proj
+            ue.matmat_mul_core(is_B_quantized=True,
+                M=rows, K=VIS_MLP_PAD, N=VH,
+                A_DRAM_ADDR=self.VIS_MLP_MULT_DRAM + RMLP,
+                B_DRAM_ADDR=la['down_data'],
+                OUTPUT_DRAM_ADDR=self.VIS_MLP_DOWN_DRAM + RH,
+                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4,
+                C_DRAM_ADDR=la['down_bias'], bias_mode="broadcast_N", gpr_M_reg=vis_M_reg)
+
+            eltwise_add_core_dram(ue, size=rows * VH,
+                A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM + RH,
+                B_DRAM_ADDR=self.VIS_MLP_DOWN_DRAM + RH,
+                OUTPUT_DRAM_ADDR=h_out + RH)
+            # NOTE: no rendezvous at the layer boundary. Layer i writes
+            # h_out + RH for its OWN rows and layer i+1 reads the same rows;
+            # the only cross-shard reads are fenced by #1/#2 above.
+
+        final_vis = self.VIS_IO_A_DRAM if total_layers % 2 == 0 else self.VIS_IO_B_DRAM
+
+        ue.rms_norm_core_dram(M=rows, N=VH,
+            A_DRAM_ADDR=final_vis + RH, OUTPUT_DRAM_ADDR=self.VIS_POST_NORM_DRAM + RH,
+            GAMMA_DRAM_ADDR=self.merger_ln_q_weight, gpr_M_reg=vis_M_reg)
+
+        # 2x2 spatial merge = a flat reinterpret: merged row r (5120 wide) IS
+        # tokens [4r, 4r+4) of POST_NORM, so the row shard carries through
+        # EXACTLY (rows % 4 == 0 asserted) and the whole merger tail stays
+        # row-local -- no rendezvous until the final one before the halt.
+        merge_dim = VMERGE * VMERGE * VH
+        assert rows % (VMERGE * VMERGE) == 0, (
+            f"merger row shard: {rows} rows not a multiple of {VMERGE * VMERGE}")
+        m_row0 = row_offset // (VMERGE * VMERGE)
+        m_rows = rows // (VMERGE * VMERGE)
+        base_elem = row_offset * VH
+        for chunk_start in range(base_elem, base_elem + rows * VH, URAM_NEAR_FULL_ELEMENTS):
+            chunk_take = min(URAM_NEAR_FULL_ELEMENTS, base_elem + rows * VH - chunk_start)
+            ue.accelerator_memory_to_sram(
+                self.VIS_POST_NORM_DRAM + chunk_start * bpe, 0x00000, chunk_take)
+            ue.sram_to_accelerator_memory(
+                0x00000, self.VIS_MERGED_DRAM + chunk_start * bpe, chunk_take)
+
+        RM  = m_row0 * merge_dim * bpe
+        RMO = m_row0 * VH_OUT * bpe
+        if _bf16_mode and hasattr(self, 'merger_mlp0_weight_bf16'):
+            ue.matmat_mul_core(
+                M=m_rows, K=merge_dim, N=merge_dim,
+                A_DRAM_ADDR=self.VIS_MERGED_DRAM + RM,
+                B_DRAM_ADDR=self.merger_mlp0_weight_bf16,
+                OUTPUT_DRAM_ADDR=self.VIS_MERGER_INTER_DRAM + RM,
+                C_DRAM_ADDR=self.merger_mlp0_bias_bf16, bias_mode="broadcast_N",
+                gelu_enable=True)
+            ue.matmat_mul_core(
+                M=m_rows, K=merge_dim, N=VH_OUT,
+                A_DRAM_ADDR=self.VIS_MERGER_INTER_DRAM + RM,
+                B_DRAM_ADDR=self.merger_mlp2_weight_bf16,
+                OUTPUT_DRAM_ADDR=self.VIS_ENCODER_OUT_DRAM + RMO,
+                C_DRAM_ADDR=self.merger_mlp2_bias_bf16, bias_mode="broadcast_N")
+        else:
+            ue.matmat_mul_core(
+                M=m_rows, K=merge_dim, N=merge_dim,
+                A_DRAM_ADDR=self.VIS_MERGED_DRAM + RM,
+                B_DRAM_ADDR=self.merger_mlp0_data,
+                OUTPUT_DRAM_ADDR=self.VIS_MERGER_INTER_DRAM + RM,
+                C_DRAM_ADDR=self.merger_mlp0_bias, bias_mode="broadcast_N",
+                is_B_quantized=True, data_type=TYPE.IF4,
+                SCALE_DRAM_ADDR=self.merger_mlp0_scale,
+                gelu_enable=True)
+            ue.matmat_mul_core(
+                M=m_rows, K=merge_dim, N=VH_OUT,
+                A_DRAM_ADDR=self.VIS_MERGER_INTER_DRAM + RM,
+                B_DRAM_ADDR=self.merger_mlp2_data,
+                OUTPUT_DRAM_ADDR=self.VIS_ENCODER_OUT_DRAM + RMO,
+                C_DRAM_ADDR=self.merger_mlp2_bias, bias_mode="broadcast_N",
+                is_B_quantized=True, data_type=TYPE.IF4,
+                SCALE_DRAM_ADDR=self.merger_mlp2_scale)
+
+        # Final rendezvous, then halt. Workers' halts are emitted by
+        # sched.finalize(); only the primary halts here, so the HOST still
+        # waits on engine 0 alone -- and engine 0 cannot report done until
+        # every worker has written its rows of VIS_ENCODER_OUT.
+        self._shard_barrier(ue, engine_idx, ne)
+        if is_primary:
+            ue.generate_instruction_halt()
+
+        ue.release_isa_reg()   # vis_M_reg
 
     def prepare_encoder_input(self, pixel_values: torch.Tensor,
                               image_grid_thw: torch.Tensor = None) -> dict:
@@ -2216,8 +2783,17 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         vis_flops += 2 * self.NUM_MERGED_TOKENS * merge_dim * VH_OUT     # merger MLP2
 
         print(f"    Running vision encoder on FPGA (longest single step, ~40-60s)...", flush=True)
+        sched = getattr(self, "_vis_sched", None)
+        multi = sched is not None and sched.num_engines > 1
+        if multi:
+            # Workers HALT at the end of every run, so they are relaunched on
+            # EVERY execution (compile-once/execute-many), BEFORE the primary.
+            self._preclear_shard_flags(sched)
+            sched.start_workers(self._vis_worker_prog_addrs)
         self.start_execute_from_dram(program_addr)
         wall_s = self._wait_with_heartbeat(lambda: self.wait_queue(600.0), label="vision")
+        if multi:
+            self._join_workers(sched)
         latency_us = self._corrected_hw_latency_us(wall_s)
         vis_gflops = vis_flops / (latency_us * 1e-6) / 1e9
         self._vis_total_flops = vis_flops
@@ -2235,18 +2811,147 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self._image_grid_thw = image_grid_thw  # store for mRoPE computation
         print(f"    Vision encoder output: {self._vis_num_tokens} tokens at 0x{self.VIS_ENCODER_OUT_DRAM:X}")
 
+    def _prepare_prefill_sharding(self) -> None:
+        """Build the prefill stage scheduler + shard DRAM BEFORE the capture
+        opens (worker construction runs the DRAM self-test guard and buffer
+        registration DMA-writes zero fills -- host-side work, not emission)."""
+        ne = self._num_engines("PREFILL")
+        if ne <= 1:
+            self._prefill_sched = None
+            return
+        sched = self._make_stage_scheduler(ne)
+        self._prefill_sched = sched
+        self._ensure_prefill_shard_buffers(sched)
+
+    def _prepare_decode_sharding(self) -> None:
+        """Scheduler + per-engine attention scratch for the sharded decoder,
+        built BEFORE compile_decoder's capture opens (same discipline as
+        _prepare_prefill_sharding). Decode requires an engine count that
+        divides the 16 Q heads with whole KV groups per engine (1/2/4/8)."""
+        ne = self._num_engines("DECODE")
+        if ne <= 1:
+            self._decode_sched = None
+            return
+        assert ne in (2, 4, 8), (
+            f"DECODE engines={ne}: each engine must own whole Q heads of ONE "
+            f"KV head (16 heads, 2 KV groups) -- use 1, 2, 4 or 8")
+        sched = self._make_stage_scheduler(ne)
+        self._decode_sched = sched
+        # Registers the per-engine "lm_attn_scratch" copies (idempotent per
+        # scheduler; shared with the prefill when the counts match).
+        self._ensure_prefill_shard_buffers(sched)
+
+    def _ensure_prefill_shard_buffers(self, sched) -> None:
+        """Multi-engine prefill DRAM: PER_ENGINE attention scratch + the second
+        KV head's SHARED duplicated FLASH_K/V pair.
+
+        The single-engine stream reuses ONE FLASH_K/V across the two KV heads
+        sequentially. Sharded, the duplicated K/V set is built COOPERATIVELY
+        (each engine scatters its own token rows) and read by every engine, so
+        both heads' sets must coexist across one rendezvous -- hence a second
+        pair for kv_h=1. Allocated lazily and APPENDED to the tensor region so
+        the --engines 1 layout stays byte-identical. Idempotent per scheduler.
+        """
+        if getattr(sched, "_qwen_prefill_registered", False):
+            return
+        sched._qwen_prefill_registered = True
+        sched.register_per_engine("lm_attn_scratch", self.LAYER0_FLASH_SCRATCH_DRAM,
+                                  self._lm_scratch_bytes)
+        if self.num_kv_heads > 1 and not hasattr(self, "_FLASH_K2"):
+            assert self.num_kv_heads == 2, "prefill shard: extend FLASH_K/V pairs for nkvh > 2"
+            n = self._lm_flash_kv_bytes
+            zero_pad = torch.zeros(n // 2, dtype=torch.bfloat16)
+            self._FLASH_K2 = self.allocate_tensor_dram(n)
+            self._FLASH_V2 = self.allocate_tensor_dram(n)
+            self.dma_to_accelerator_memory(self._FLASH_K2, zero_pad)
+            self.dma_to_accelerator_memory(self._FLASH_V2, zero_pad)
+
     def _emit_prefill_program(self, seq_len: int, layer_size: int) -> int:
-        """Emit ONE seq_len-agnostic prefill program (PBI single-bin pattern).
+        """Emit the seq_len-agnostic prefill program(s) -- one per engine.
 
-        Caller wraps in start_capture()/stop_capture(). Program ends with a halt
-        so it can be jumped to via a runtime preamble that primes
-        gf_seq_len / gf_q_seq_len / gf_aligned_seq_len.
+        With --engines 1 this is exactly the historical single-engine PBI
+        stream (see _emit_prefill_body). With N > 1 the S prompt tokens are
+        ROW-sharded: every op in the layer is row-independent over tokens
+        (norms/matmuls/eltwise take gpr_M_reg; the PBI scatters loop per
+        token; attention's packed-Q batch axis IS the token axis x qpkv), so
+        each engine runs the whole layer over its own token range, with the
+        row offsets primed at RUN time through the SH_* GPRs (the program
+        stays one seq-len-agnostic bin per engine). Two rendezvous per layer:
 
-        ``seq_len`` is a compile-time template for FLOPS bookkeeping and
-        static ``M=`` args. K/V/Q scatters and FLASH_OUTPUT assembly use PBI
-        runtime loops keyed off gf_seq_len. rms_norm/matmat/rope use
-        ``gpr_M_reg=gf_seq_len`` (or TMP_REG holding gf_seq_len*mult for QK
-        heads). Unified attention is bounded by gf_aligned_seq_len.
+          #1 after the K/V cache + duplicated FLASH_K/V scatters -- attention
+             reads the FULL duplicated K/V set, built cooperatively (RAW).
+          #2 after attention + output assembly -- the WAR fence that stops an
+             engine from overwriting FLASH_K/V rows for layer i+1 while a
+             peer still attends over layer i's set. Everything between #2 and
+             the next #1 (o proj, residuals, norms, the whole MLP, the
+             inter-layer copy, q/k/v + RoPE) stays inside the writer's own
+             token rows.
+
+        Returns the single-engine-equivalent FLOP count (engine 0's template
+        accounting -- the row split partitions, not duplicates, the work).
+        """
+        # Scheduler + shard buffers were built by compile_prefill BEFORE the
+        # capture opened: worker construction DMAs the self-test guard and the
+        # buffer registration DMAs zero-fills, none of which belongs inside an
+        # instruction capture.
+        ne = self._num_engines("PREFILL")
+        sched = self._prefill_sched if ne > 1 else None
+        assert (sched is not None) == (ne > 1), (
+            "compile_prefill must call _prepare_prefill_sharding() before "
+            "start_capture()")
+        if sched is not None:
+            sched.begin_program()
+            for w in sched.workers:
+                # begin_program reset the worker allocator to 1; the prefill
+                # body treats regs 1..SH_DYN_REG_BASE-1 as fixed (TMP/gf/SH_*).
+                w._isa_reg_counter = self.SH_DYN_REG_BASE
+            engines = sched.engines
+            _original_print(f"    [prefill] row-sharded over {ne} engine(s) via runtime "
+                            f"address GPRs (splits computed per prompt in run_prefill); "
+                            f"2 rendezvous/layer")
+        else:
+            engines = [self]
+
+        total_flops = 0
+        for e, ue in enumerate(engines):
+            sh = _PrefillShard(self, ue, e, ne)
+            flops = self._emit_prefill_body(ue, e, ne, sh, seq_len, layer_size)
+            if e == 0:
+                total_flops = flops   # engines partition the work; report once
+
+        if sched is not None:
+            # KEEP the returned addresses: the scheduler is shared with the
+            # vision stage and finalize() overwrites sched._worker_prog_addrs.
+            self._prefill_worker_prog_addrs = sched.finalize()
+            # Per-worker runtime-preamble slots (rewritten on EVERY run_prefill
+            # with that prompt's row split, mirroring the primary's preamble).
+            self._prefill_worker_preamble_addrs = [
+                w.allocate_program_dram(512) for w in sched.workers]
+            self._assert_worker_arenas_fit(sched, "prefill")
+            # Harvest the worker program bytes NOW for programs.bin: the next
+            # stage's begin_program() clears the worker capture buffers.
+            self._seg_prefill_workers = [
+                (addr, self._capture_bytes(w))
+                for addr, w in zip(self._prefill_worker_prog_addrs, sched.workers)]
+            for (_a, _b), w in zip(self._seg_prefill_workers, sched.workers):
+                assert len(_b) == w.get_capture_instruction_size_bytes()
+            _original_print(f"    [prefill] worker program(s): "
+                            f"{[w.get_capture_instruction_size_bytes() for w in sched.workers]} bytes")
+        return total_flops
+
+    def _emit_prefill_body(self, ue, engine_idx: int, ne: int, sh, seq_len: int,
+                           layer_size: int) -> int:
+        """Emit ONE engine's complete prefill stream (PBI single-bin pattern).
+
+        Caller wraps in start_capture()/stop_capture() (workers: the stage
+        scheduler's begin_program/finalize). Ends with a halt on the PRIMARY
+        only; worker halts come from sched.finalize().
+
+        ``seq_len`` is a compile-time template for FLOPs bookkeeping and
+        static ``M=`` args. At run time gf_seq_len/gf_q_seq_len hold THIS
+        ENGINE's token/query-row counts and the SH_* GPRs its row offsets
+        (see _PrefillShard); with ne == 1 the sh helpers are inert and this is
+        the historical stream.
 
         Qwen2.5-VL specifics vs Dave's qwen3:
           - Q/K/V have biases (C_DRAM_ADDR=la['*_bias']).
@@ -2263,12 +2968,42 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         bpe  = self.bytes_per_element
         hd   = self.head_dim
         ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE
+        is_primary = engine_idx == 0
+        if ne > 1:
+            # The SH_OFF_* register plan folds several buffers onto one pitch
+            # register; these are the identities it depends on. Both hold for
+            # Qwen2.5-VL-3B (2048 = 256*8, nkvh = 2); a different geometry
+            # needs its own offset registers, not a silent reuse.
+            assert hd * qpkv == self.vector_length, (
+                "OFF_HID reuse for Q_DRAM/FLASH_OUTPUT requires head_dim*group "
+                "== hidden")
+            assert nkvh == 2, (
+                "OFF_KV doubles as the RoPE-table row offset (2*ahd*bpe per "
+                "position), which equals the K/V row pitch only at nkvh == 2")
 
-        self._isa_reg_counter = 5
+        # Dynamic GPR allocation floor: 5 unsharded (regs 1-4 fixed), or past
+        # the SH_* block when sharded. Same attribute on workers (set by the
+        # orchestrator after begin_program's reset).
+        ue._isa_reg_counter = self.SH_DYN_REG_BASE if ne > 1 else 5
         total_flops = 0
 
+        # The duplicated FLASH_K/V sets. Single-engine: ONE pair reused across
+        # KV heads sequentially (historical). Sharded: one SHARED pair per KV
+        # head, built cooperatively before rendezvous #1.
+        if ne == 1:
+            flash_k = {h: self.LAYER0_FLASH_K_DRAM for h in range(nkvh)}
+            flash_v = {h: self.LAYER0_FLASH_V_DRAM for h in range(nkvh)}
+            attn_scratch = self.LAYER0_FLASH_SCRATCH_DRAM
+        else:
+            flash_k = {0: self.LAYER0_FLASH_K_DRAM, 1: self._FLASH_K2}
+            flash_v = {0: self.LAYER0_FLASH_V_DRAM, 1: self._FLASH_V2}
+            attn_scratch = self._prefill_sched.per_engine_addr("lm_attn_scratch", engine_idx)
+
         for layer_idx in range(layer_size):
-            _original_print(f"    prefill layer {layer_idx + 1}/{layer_size}", end="\r", flush=True)
+            if is_primary:
+                _original_print(f"    prefill layer {layer_idx + 1}/{layer_size}"
+                                + (f" (x{ne} engines)" if ne > 1 else ""),
+                                end="\r", flush=True)
             la = self.lm_layer_addrs[layer_idx]
             if layer_idx != 0:
                 # Inter-layer copy via PBI per-token scatter to stay under URAM_A.
@@ -2280,46 +3015,66 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     element_count=self.vector_length,
                     gf_seq_len=self.gf_seq_len,
                     template_seq_len=seq_len,
+                    ue=ue, row0_reg=sh.row0_reg,
+                    write_off_regs=[sh.OFF_HID], addr_scratch_reg=sh.scratch0,
                 )
 
             # Pre-norm (input_layernorm)
-            total_flops += (self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
+            total_flops += (ue.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'],
-                              gpr_M_reg=self.gf_seq_len) or 0)
+                              gpr_M_reg=self.gf_seq_len,
+                              gpr_a_addr=sh.addr(0, self.LAYER0_INPUT_DRAM, sh.OFF_HID),
+                              gpr_out_addr=sh.addr(1, self.LAYER0_PRE_NORM_DRAM, sh.OFF_HID)) or 0)
 
-            # Q, K, V projections with bias
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=hd * qpkv,
+            # Q, K, V projections with bias (row-sharded: A and OUT move by the
+            # engine's token offset; B/scale/bias are SHARED_FULL weights)
+            total_flops += (ue.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=hd * qpkv,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['q_data'], OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
                 SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.IF4,
-                C_DRAM_ADDR=la['q_bias'], gpr_M_reg=self.gf_seq_len) or 0)
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=hd,
+                C_DRAM_ADDR=la['q_bias'], gpr_M_reg=self.gf_seq_len,
+                gpr_a_addr=sh.addr(0, self.LAYER0_PRE_NORM_DRAM, sh.OFF_HID),
+                gpr_out_addr=sh.addr(1, self.LAYER0_Q_DRAM, sh.OFF_HID)) or 0)
+            total_flops += (ue.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['k_data'], OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
                 SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.IF4,
-                C_DRAM_ADDR=la['k_bias'], gpr_M_reg=self.gf_seq_len) or 0)
-            total_flops += (self.matmat_mul_core(M=seq_len, K=self.vector_length, N=hd,
+                C_DRAM_ADDR=la['k_bias'], gpr_M_reg=self.gf_seq_len,
+                gpr_a_addr=sh.addr(0, self.LAYER0_PRE_NORM_DRAM, sh.OFF_HID),
+                gpr_out_addr=sh.addr(1, self.LAYER0_K_DRAM, sh.OFF_KV)) or 0)
+            total_flops += (ue.matmat_mul_core(M=seq_len, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['v_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
-                C_DRAM_ADDR=la['v_bias'], gpr_M_reg=self.gf_seq_len) or 0)
+                C_DRAM_ADDR=la['v_bias'], gpr_M_reg=self.gf_seq_len,
+                gpr_a_addr=sh.addr(0, self.LAYER0_PRE_NORM_DRAM, sh.OFF_HID),
+                gpr_out_addr=sh.addr(1, self.LAYER0_V_PROJ_TEMP, sh.OFF_KV)) or 0)
 
             # RoPE in place on K_DRAM (nkvh groups per token) and Q_DRAM (nkvh*qpkv groups per token).
-            # mRoPE table layout is per-token contiguous rows [cos(ahd) || sin(ahd)].
-            total_flops += self.rope_hf_core_dram_gqa(
+            # mRoPE table layout is per-token contiguous rows [cos(ahd) || sin(ahd)] -- the
+            # 64-bf16-element halves are exactly one 128 B SRAM row each, which is what
+            # keeps the shared rope core row-aligned. The table is position-indexed, so
+            # the engine's cos base moves by row0 * 2*ahd*bpe = row0 * 512 B = OFF_KV.
+            total_flops += ue.rope_hf_core_dram_gqa(
                 M=seq_len, group_size=nkvh, N=ahd,
                 input_dram_addr=self.LAYER0_K_DRAM,
                 output_dram_addr=self.LAYER0_K_DRAM,
                 cos_dram_addr=ROPE_WEIGHT_ADDR,
                 sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
-                gpr_M_reg=self.gf_seq_len)
-            total_flops += self.rope_hf_core_dram_gqa(
+                gpr_M_reg=self.gf_seq_len,
+                gpr_input_addr=sh.addr(0, self.LAYER0_K_DRAM, sh.OFF_KV),
+                gpr_out_addr=sh.addr(1, self.LAYER0_K_DRAM, sh.OFF_KV),
+                gpr_cos_addr=sh.addr(2, ROPE_WEIGHT_ADDR, sh.OFF_KV))
+            total_flops += ue.rope_hf_core_dram_gqa(
                 M=seq_len, group_size=nkvh * qpkv, N=ahd,
                 input_dram_addr=self.LAYER0_Q_DRAM,
                 output_dram_addr=self.LAYER0_Q_DRAM,
                 cos_dram_addr=ROPE_WEIGHT_ADDR,
                 sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
-                gpr_M_reg=self.gf_seq_len)
+                gpr_M_reg=self.gf_seq_len,
+                gpr_input_addr=sh.addr(0, self.LAYER0_Q_DRAM, sh.OFF_HID),
+                gpr_out_addr=sh.addr(1, self.LAYER0_Q_DRAM, sh.OFF_HID),
+                gpr_cos_addr=sh.addr(2, ROPE_WEIGHT_ADDR, sh.OFF_KV))
 
-            # Per-KV-head: PBI scatter K/V to cache + FLASH_K/V (duplicated qpkv times per token),
-            # PBI scatter packed FLASH_Q (qpkv rows per token), bucketed flash, PBI assemble output.
-            for kv_h in range(nkvh):
+            def _emit_kv_scatters(kv_h):
+                """K/V -> KV cache + the duplicated FLASH_K/V set, THIS ENGINE's
+                token rows only (write bases shifted by the runtime row offset)."""
                 k_cache_base = (self.LAYER0_K_ROPE_DRAM
                                 + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
                                 + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
@@ -2329,8 +3084,10 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
                 # K scatter: K_DRAM[t][kv_h] → K cache[kv_h][t] + qpkv copies into FLASH_K
                 k_write_specs = [(k_cache_base, ahd * bpe)]
+                k_off_regs = [sh.OFF_CACHE]
                 for g in range(qpkv):
-                    k_write_specs.append((self.LAYER0_FLASH_K_DRAM + g * ahd * bpe, qpkv * ahd * bpe))
+                    k_write_specs.append((flash_k[kv_h] + g * ahd * bpe, qpkv * ahd * bpe))
+                    k_off_regs.append(sh.OFF_FQ)
                 self._emit_pbi_scatter_per_token(
                     read_base=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
                     read_stride_bytes=nkvh * ahd * bpe,
@@ -2339,12 +3096,16 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     element_count=ahd,
                     gf_seq_len=self.gf_seq_len,
                     template_seq_len=seq_len,
+                    ue=ue, row0_reg=sh.row0_reg,
+                    write_off_regs=k_off_regs, addr_scratch_reg=sh.scratch0,
                 )
 
                 # V scatter: V_PROJ_TEMP[t][kv_h] → V cache[kv_h][t] + qpkv copies into FLASH_V
                 v_write_specs = [(v_cache_base, ahd * bpe)]
+                v_off_regs = [sh.OFF_CACHE]
                 for g in range(qpkv):
-                    v_write_specs.append((self.LAYER0_FLASH_V_DRAM + g * ahd * bpe, qpkv * ahd * bpe))
+                    v_write_specs.append((flash_v[kv_h] + g * ahd * bpe, qpkv * ahd * bpe))
+                    v_off_regs.append(sh.OFF_FQ)
                 self._emit_pbi_scatter_per_token(
                     read_base=self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe,
                     read_stride_bytes=nkvh * ahd * bpe,
@@ -2353,8 +3114,15 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     element_count=ahd,
                     gf_seq_len=self.gf_seq_len,
                     template_seq_len=seq_len,
+                    ue=ue, row0_reg=sh.row0_reg,
+                    write_off_regs=v_off_regs, addr_scratch_reg=sh.scratch0,
                 )
 
+            def _emit_attn_stage(kv_h):
+                """Packed-Q build + attention + output assembly, all inside THIS
+                ENGINE's token rows: batch is gf_q_seq_len (= rows*qpkv), Q/bias/
+                out bases are shifted by the runtime row offset, and K/V is the
+                FULL duplicated set (shared, read-only after rendezvous #1)."""
                 # Q scatter: Q_DRAM[t][kv_h*qpkv:kv_h*qpkv+qpkv] → FLASH_Q[t*qpkv:(t+1)*qpkv]
                 self._emit_pbi_scatter_per_token(
                     read_base=self.LAYER0_Q_DRAM + kv_h * qpkv * ahd * bpe,
@@ -2364,21 +3132,26 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     element_count=qpkv * ahd,
                     gf_seq_len=self.gf_seq_len,
                     template_seq_len=seq_len,
+                    ue=ue, row0_reg=sh.row0_reg,
+                    write_off_regs=[sh.OFF_FQ], addr_scratch_reg=sh.scratch0,
                 )
 
-                total_flops += (self.unified_attention_core(
+                flops = (ue.unified_attention_core(
                     batch=q_seq_len,
                     aligned_seq_len=aligned_seq_len,
                     head_dim=ahd,
                     Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                    K_DRAM_ADDR=flash_k[kv_h],
+                    V_DRAM_ADDR=flash_v[kv_h],
                     BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
                     OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                    SCRATCH_DRAM_ADDR=attn_scratch,
                     IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                     gpr_batch_reg=self.gf_q_seq_len,
-                    gpr_aligned_seq_len_reg=self.gf_aligned_seq_len) or 0)
+                    gpr_aligned_seq_len_reg=self.gf_aligned_seq_len,
+                    gpr_q_addr=sh.addr(0, self.LAYER0_FLASH_Q_DRAM, sh.OFF_FQ),
+                    gpr_bias_addr=sh.addr(1, self.LAYER0_FLASH_BIAS_DRAM, sh.OFF_BIAS),
+                    gpr_out_addr=sh.addr(2, self.LAYER0_FLASH_OUT_HEAD_DRAM, sh.OFF_FQ)) or 0)
 
                 # Assemble: per token, copy qpkv rows from FLASH_OUT_HEAD[t*qpkv:(t+1)*qpkv]
                 # to FLASH_OUTPUT[t][kv_h*qpkv:(kv_h+1)*qpkv].
@@ -2391,63 +3164,108 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     element_count=qpkv * ahd,
                     gf_seq_len=self.gf_seq_len,
                     template_seq_len=seq_len,
+                    ue=ue, row0_reg=sh.row0_reg,
+                    write_off_regs=[sh.OFF_HID], addr_scratch_reg=sh.scratch0,
                 )
+                return flops
 
-            # o_proj (no quantization params for qwen2.5_vl)
-            total_flops += (self.matmat_mul_core(M=seq_len, K=hd * qpkv, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                gpr_M_reg=self.gf_seq_len) or 0)
+            if ne == 1:
+                # Historical interleaved order: one FLASH_K/V pair reused per KV
+                # head (scatter → attend → overwrite for the next head).
+                for kv_h in range(nkvh):
+                    _emit_kv_scatters(kv_h)
+                    total_flops += _emit_attn_stage(kv_h)
+            else:
+                # Two-phase: build BOTH heads' duplicated K/V sets cooperatively,
+                # rendezvous (#1), then attend both heads over this engine's own
+                # query rows, rendezvous (#2, the WAR fence for the K/V sets).
+                for kv_h in range(nkvh):
+                    _emit_kv_scatters(kv_h)
+                self._shard_barrier(ue, engine_idx, ne)
+                for kv_h in range(nkvh):
+                    total_flops += _emit_attn_stage(kv_h)
+                self._shard_barrier(ue, engine_idx, ne)
+
+            # o_proj (IF4, no bias)
+            total_flops += (ue.matmat_mul_core(is_B_quantized=True, M=seq_len, K=hd * qpkv, N=self.vector_length,
+                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_data'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                SCALE_DRAM_ADDR=la['o_scale'], data_type=TYPE.IF4,
+                gpr_M_reg=self.gf_seq_len,
+                gpr_a_addr=sh.addr(0, self.LAYER0_FLASH_OUTPUT_DRAM, sh.OFF_HID),
+                gpr_out_addr=sh.addr(1, self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sh.OFF_HID)) or 0)
 
             # Post-attn residual: layer_input + o_proj. PBI runtime loop.
-            self.eltwise_core_dram(
+            ue.eltwise_core_dram(
                 M=seq_len, N=self.vector_length,
                 dram_a=self.LAYER0_INPUT_DRAM,
                 dram_b=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                 dram_out=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                 mode=UE_MODE.ELTWISE_ADD,
                 gpr_M_reg=self.gf_seq_len,
+                gpr_a_addr=sh.addr(0, self.LAYER0_INPUT_DRAM, sh.OFF_HID),
+                gpr_b_addr=sh.addr(1, self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sh.OFF_HID),
+                gpr_out_addr=sh.addr(2, self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sh.OFF_HID),
             )
 
             # post_attention_layernorm = pre-FFN norm
-            total_flops += (self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+            total_flops += (ue.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln2_gamma'],
-                              gpr_M_reg=self.gf_seq_len) or 0)
+                              gpr_M_reg=self.gf_seq_len,
+                              gpr_a_addr=sh.addr(0, self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sh.OFF_HID),
+                              gpr_out_addr=sh.addr(1, self.LAYER0_PRE_MLP_NORM_DRAM, sh.OFF_HID)) or 0)
 
             # MLP gate (with SiLU), up, gate × up, down.
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=self.mlp_elements,
+            total_flops += (ue.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['gate_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
                 SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True,
-                gpr_M_reg=self.gf_seq_len) or 0)
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=self.mlp_elements,
+                gpr_M_reg=self.gf_seq_len,
+                gpr_a_addr=sh.addr(0, self.LAYER0_PRE_MLP_NORM_DRAM, sh.OFF_HID),
+                gpr_out_addr=sh.addr(1, self.LAYER0_MLP_GATE_DRAM, sh.OFF_MLP)) or 0)
+            total_flops += (ue.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.vector_length, N=self.mlp_elements,
                 A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['up_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
                 SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4,
-                gpr_M_reg=self.gf_seq_len) or 0)
+                gpr_M_reg=self.gf_seq_len,
+                gpr_a_addr=sh.addr(0, self.LAYER0_PRE_MLP_NORM_DRAM, sh.OFF_HID),
+                gpr_out_addr=sh.addr(1, self.LAYER0_MLP_UP_DRAM, sh.OFF_MLP)) or 0)
 
-            self.eltwise_core_dram(
+            ue.eltwise_core_dram(
                 M=seq_len, N=self.mlp_elements,
                 dram_a=self.LAYER0_MLP_GATE_DRAM,
                 dram_b=self.LAYER0_MLP_UP_DRAM,
                 dram_out=self.LAYER0_MLP_MULT_DRAM,
                 mode=UE_MODE.ELTWISE_MUL,
                 gpr_M_reg=self.gf_seq_len,
+                gpr_a_addr=sh.addr(0, self.LAYER0_MLP_GATE_DRAM, sh.OFF_MLP),
+                gpr_b_addr=sh.addr(1, self.LAYER0_MLP_UP_DRAM, sh.OFF_MLP),
+                gpr_out_addr=sh.addr(2, self.LAYER0_MLP_MULT_DRAM, sh.OFF_MLP),
             )
 
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.mlp_elements, N=self.vector_length,
+            total_flops += (ue.matmat_mul_core(is_B_quantized=True, M=seq_len, K=self.mlp_elements, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                 SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4,
-                gpr_M_reg=self.gf_seq_len) or 0)
+                gpr_M_reg=self.gf_seq_len,
+                gpr_a_addr=sh.addr(0, self.LAYER0_MLP_MULT_DRAM, sh.OFF_MLP),
+                gpr_out_addr=sh.addr(1, self.LAYER0_MLP_DOWN_DRAM, sh.OFF_HID)) or 0)
 
             # Post-MLP residual: layer_output = POST_ATTN_RESIDUAL + MLP_DOWN.
-            self.eltwise_core_dram(
+            ue.eltwise_core_dram(
                 M=seq_len, N=self.vector_length,
                 dram_a=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                 dram_b=self.LAYER0_MLP_DOWN_DRAM,
                 dram_out=self.LAYER0_OUTPUT_DRAM,
                 mode=UE_MODE.ELTWISE_ADD,
                 gpr_M_reg=self.gf_seq_len,
+                gpr_a_addr=sh.addr(0, self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sh.OFF_HID),
+                gpr_b_addr=sh.addr(1, self.LAYER0_MLP_DOWN_DRAM, sh.OFF_HID),
+                gpr_out_addr=sh.addr(2, self.LAYER0_OUTPUT_DRAM, sh.OFF_HID),
             )
 
-        self.generate_instruction_halt()
+        # Final rendezvous: the KV cache is written row-sharded across all 36
+        # layers, and the host (and later the decoder) reads it in full -- the
+        # primary may not report done until every engine's rows have landed.
+        self._shard_barrier(ue, engine_idx, ne)
+        if is_primary:
+            ue.generate_instruction_halt()
 
         return total_flops
 
@@ -2457,10 +3275,16 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         bytes are handed to compile_all (via self._seg_prefill) for the unified
         programs.bin. The program is seq_len-agnostic for actual_seq_len ≤
         PREFILL_MAX_SEQ_LEN, primed at runtime by the preamble in run_prefill.
+
+        With --engines N > 1 the emission is repeated per engine over a
+        runtime ROW (token) shard -- see _emit_prefill_program; worker
+        programs are finalized to worker DRAM here and their runtime
+        preambles are rewritten per prompt by run_prefill.
         """
         if layer_size is None:
             layer_size = self.LAYER_SIZE
         template_seq_len = self.PREFILL_MAX_SEQ_LEN
+        self._prepare_prefill_sharding()
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -2477,7 +3301,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self.dma_write(DMA_DEVICE_H2C, program_addr, prog_bytes, len(prog_bytes))
         self.allocate_program_dram(len(prog_bytes))
         self.clear_capture_buffer()
-        preamble_addr = self.allocate_program_dram(256)
+        # Sharded preambles carry 7 extra ADD_SETs (the SH_* offsets).
+        preamble_addr = self.allocate_program_dram(
+            512 if self._num_engines("PREFILL") > 1 else 256)
         _SILENT_MODE = False
         _original_print()
 
@@ -2534,20 +3360,77 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         bias_one_group[:, q_seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
 
-        # Emit runtime preamble: ADD_SETs for the 3 GPRs + JUMP_ABS into prefill.
+        # Emit runtime preamble(s): ADD_SETs for the GPRs + JUMP_ABS into the
+        # engine's prefill program. Sharded, each engine additionally gets its
+        # row split's SH_* offsets (all host-computed -- zero on-device address
+        # math); the compiled programs are untouched, only these preambles are
+        # rewritten per prompt.
+        sched = getattr(self, "_prefill_sched", None)
+        multi = sched is not None and sched.num_engines > 1
+        if multi:
+            ne = sched.num_engines
+            if actual_seq_len < ne:
+                raise ValueError(
+                    f"Prompt too short for the sharded prefill: {actual_seq_len} "
+                    f"token(s) < {ne} engines (the compiled program's rendezvous "
+                    f"require every engine to own >= 1 row). Rebuild with "
+                    f"--engines 1 or a longer prompt.")
+            splits = self._col_split(actual_seq_len, ne, align=1)
+            print(f"    Prefill row split over {ne} engine(s): "
+                  f"{[c for _, c in splits]} of {actual_seq_len} tokens")
+        else:
+            splits = [(0, actual_seq_len)]
+
+        def _emit_shard_preamble(eng, r0, rows, jump_target):
+            bpe = self.bytes_per_element
+            eng.generate_instruction_add_set(self.gf_seq_len,         rows)
+            eng.generate_instruction_add_set(self.gf_q_seq_len,       rows * self.group_size)
+            eng.generate_instruction_add_set(self.gf_aligned_seq_len, aligned_seq_len)
+            if multi:
+                sh8 = ue_35bit_addr_shifter
+                eng.generate_instruction_add_set(self.SH_OFF_HID,
+                    sh8(r0 * self.vector_length * bpe))
+                eng.generate_instruction_add_set(self.SH_OFF_KV,
+                    sh8(r0 * self.num_kv_heads * self.actual_head_dim * bpe))
+                eng.generate_instruction_add_set(self.SH_OFF_MLP,
+                    sh8(r0 * self.mlp_elements * bpe))
+                eng.generate_instruction_add_set(self.SH_OFF_FQ,
+                    sh8(r0 * self.group_size * self.actual_head_dim * bpe))
+                eng.generate_instruction_add_set(self.SH_OFF_BIAS,
+                    sh8(r0 * self.group_size * aligned_seq_len * bpe))
+                eng.generate_instruction_add_set(self.SH_ROW0, r0)
+                eng.generate_instruction_add_set(self.SH_OFF_CACHE,
+                    sh8(r0 * self.actual_head_dim * bpe))
+            eng.generate_instruction_jump_abs(ue_35bit_addr_shifter(jump_target))
+
         self.clear_inst_id()
         self.start_capture()
-        self.generate_instruction_add_set(self.gf_seq_len,         actual_seq_len)
-        self.generate_instruction_add_set(self.gf_q_seq_len,       q_seq_len)
-        self.generate_instruction_add_set(self.gf_aligned_seq_len, aligned_seq_len)
-        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
+        _emit_shard_preamble(self, splits[0][0], splits[0][1], prefill_program_addr)
         self.stop_capture()
         self.write_captured_instructions_to_dram(preamble_addr)
         self.clear_capture_buffer()
 
+        if multi:
+            for wi, w in enumerate(sched.workers):
+                r0, rows = splits[wi + 1]
+                w.clear_inst_id()
+                w.start_capture()
+                _emit_shard_preamble(w, r0, rows,
+                                     self._prefill_worker_prog_addrs[wi])
+                w.stop_capture()
+                w.write_captured_instructions_to_dram(
+                    self._prefill_worker_preamble_addrs[wi])
+                w.clear_capture_buffer()
+            # Workers HALT at the end of every run; relaunch them (via their
+            # fresh preambles) BEFORE the primary on EVERY execution.
+            self._preclear_shard_flags(sched)
+            sched.start_workers(self._prefill_worker_preamble_addrs)
+
         prefill_flops = gflops if isinstance(gflops, (int, float)) else 0
         latency_us, flop_rate = self.program_execute(preamble_addr, timeout=180.0,
                                                      flops=prefill_flops, verbose=False)
+        if multi:
+            self._join_workers(sched)
         self._latency_hw_prefill = latency_us
         self._flop_rate_hw_prefill = flop_rate
         self._last_hw_gflops = flop_rate
@@ -2555,19 +3438,86 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         print(f"    HW latency: {latency_us/1e6:.2f}s, {flop_rate:.2f} GFLOPS")
 
     def _emit_decoder_program(self, layer_size: int) -> int:
-        """Emit ONE decode-position-agnostic decoder program (PBI single-bin pattern).
+        """Emit the decode-position-agnostic decoder program(s) -- one per engine.
 
-        Caller wraps this in start_capture()/stop_capture(). The emitted program
-        ends with ADD_INC gf_seq_len + halt so it can be jumped to via a runtime
-        preamble that primes gf_q_seq_len, gf_aligned_seq_len, and gf_rope_cos_abs
-        each step (and gf_seq_len as the cache write position).
+        With --engines 1 this is the historical single-engine stream (see
+        _emit_decoder_body). With N > 1 every intermediate is a single row
+        vector in shared DRAM, which makes decode the CLEANEST shard in the
+        model: an N-split's [1, Nc] output is CONTIGUOUS at OUT + n0*bpe, so
+        every lane lands IN PLACE -- no per-engine buffers, no reductions, no
+        weight slicing (B/scale/bias column offsets are the compile-time
+        "four per-column offsets"), and no runtime address GPRs (the gf_*
+        step registers hold the SAME values on every engine).
+
+        Assignment per layer (ne = 2/4/8):
+          norms + residuals   REPLICATED (identical concurrent writes -- the
+                              pi05 redundant-K-lane precedent; 2048-elt ops,
+                              ~0.01%% of the layer)
+          q proj              N-split (head-aligned lanes of 2048)
+          k proj + K RoPE +   engine 0 (small: N=256)
+            K cache append
+          v proj + V append   engine 1
+          Q RoPE              per-engine over its own q heads (in place)
+          attention           HEAD-split: 16/ne q heads over ONE KV group per
+                              engine, K/V read from the cache in place
+          o proj              N-split (IF4 lanes, as q proj)
+          gate/up/mult        N-split lanes of 11008, mult stays in lane
+          down proj           N-split of 2048 reading the FULL mult row (the
+                              lanes assembled it in place -- no K-split needed)
+          final norm+LM head  PRIMARY only (argmax exposes indices, not
+                              values, so a lane-split head cannot be merged
+                              on-device -- ~9%% serial tail; see the register
+                              note at get_arg_max_index)
+
+        Five rendezvous per layer: after {proj+RoPE+append}, after attention,
+        after o-proj lanes, after mult lanes, after down lanes.
+        """
+        ne = self._num_engines("DECODE")
+        sched = self._decode_sched if ne > 1 else None
+        assert (sched is not None) == (ne > 1), (
+            "compile_decoder must call _prepare_decode_sharding() before "
+            "start_capture()")
+        if sched is not None:
+            sched.begin_program()
+            for w in sched.workers:
+                # regs 1-4 are the fixed gf_* set on every engine; dynamic
+                # allocation (gf_one / gf_rope_cos_abs) starts at 5 so the
+                # per-step preamble primes the SAME indices on all engines.
+                w._isa_reg_counter = 5
+            engines = sched.engines
+            _original_print(f"    [decode] sharded over {ne} engine(s): "
+                            f"N-lanes of {self.vector_length}/{self.mlp_elements}, "
+                            f"{(self.num_kv_heads * self.group_size) // ne} Q head(s)/engine, "
+                            f"5 rendezvous/layer; final norm + LM head on the primary")
+        else:
+            engines = [self]
+
+        total_flops = 0
+        for e, ue in enumerate(engines):
+            flops = self._emit_decoder_body(ue, e, ne, layer_size)
+            if e == 0:
+                total_flops = flops   # engines partition the work; report once
+
+        if sched is not None:
+            self._decode_worker_prog_addrs = sched.finalize()
+            self._decode_worker_preamble_addrs = [
+                w.allocate_program_dram(256) for w in sched.workers]
+            self._assert_worker_arenas_fit(sched, "decode")
+            self._seg_decoder_workers = [
+                (addr, self._capture_bytes(w))
+                for addr, w in zip(self._decode_worker_prog_addrs, sched.workers)]
+            for (_a, _b), w in zip(self._seg_decoder_workers, sched.workers):
+                assert len(_b) == w.get_capture_instruction_size_bytes()
+        return total_flops
+
+    def _emit_decoder_body(self, ue, engine_idx: int, ne: int, layer_size: int) -> int:
+        """Emit ONE engine's decode stream (PBI single-bin pattern; see
+        _emit_decoder_program for the shard assignment). ne == 1 emits the
+        historical single-engine stream byte-for-byte.
 
         Address math: K/V cache write addresses are computed at runtime as
         ``base + gf_seq_len * (ahd*bpe)`` via reg_mul_imm + add_imm into TMP_REG,
         then passed as ``general_reg_src=TMP_REG`` to the scatter store.
-
-        Decoder attention uses inline ``unified_attention_core``; one call per KV
-        head processes all qpkv Q heads and is bounded by gf_aligned_seq_len.
 
         All bulk ops use ``gpr_M_reg=gf_one`` (M=1) for consistency.
         """
@@ -2579,30 +3529,54 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         rope_row_bytes = ahd * 2 * bpe   # 512 B per token
 
         ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE
+        is_primary = engine_idx == 0
 
-        # Reset dynamic GPR allocator.
-        self._isa_reg_counter = 5
-        gf_one             = self.alloc_isa_reg()
-        gf_rope_cos_abs    = self.alloc_isa_reg()
-        # Stash for run_decoder preamble to use the same indices.
-        self._gf_one          = gf_one
-        self._gf_rope_cos_abs = gf_rope_cos_abs
+        # Reset dynamic GPR allocator (identical on every engine: 5 = gf_one,
+        # 6 = gf_rope_cos_abs).
+        ue._isa_reg_counter = 5
+        gf_one             = ue.alloc_isa_reg()
+        gf_rope_cos_abs    = ue.alloc_isa_reg()
+        if is_primary:
+            # Stash for run_decoder's preambles (same indices on all engines).
+            self._gf_one          = gf_one
+            self._gf_rope_cos_abs = gf_rope_cos_abs
 
         # gf_one is primed once inside the program (always = 1).
-        self.generate_instruction_add_set(gf_one, 1)
+        ue.generate_instruction_add_set(gf_one, 1)
         # gf_rope_cos_abs is primed per-step by run_decoder's preamble (depends on _rope_offset).
+
+        # ---- shard geometry (all compile-time; ne == 1 collapses to full) ----
+        n0, nc = self._col_split(self.vector_length, ne)[engine_idx]
+        m0, mc = self._col_split(self.mlp_elements, ne)[engine_idx]
+        hp = (nkvh * qpkv) // ne          # q heads per engine
+        h0 = engine_idx * hp
+        owns_k = engine_idx == 0
+        owns_v = engine_idx == (1 if ne > 1 else 0)
+        if ne > 1:
+            assert nc % ahd == 0, f"decode q lane {nc} not head-aligned"
+            assert (h0 // qpkv) == ((h0 + hp - 1) // qpkv), (
+                f"decode heads [{h0},{h0 + hp}) straddle a KV group")
+            attn_scratch = self._decode_sched.per_engine_addr("lm_attn_scratch", engine_idx)
+        else:
+            attn_scratch = self.LAYER0_FLASH_SCRATCH_DRAM
+
+        # THE FOUR PER-COLUMN OFFSETS for an N-lane (multi_engine_shard's rule,
+        # all compile-time constants here): B(IF4) + (n0*K)//2, scale +
+        # ((n0*K)//64)*bpe, bias + n0*bpe, OUT + n0*bpe (M=1: dense in place).
+        def _if4_lane(base_data, base_scale, K, col0):
+            return base_data + (col0 * K) // 2, base_scale + ((col0 * K) // UE_VECTOR_SIZE) * bpe
 
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
             la = self.lm_layer_addrs[layer_idx]
-            if layer_idx != 0:
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
-                self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=self.vector_length)
+            # (No OUTPUT->INPUT bounce: the previous layer's final residual
+            # wrote LAYER0_INPUT_DRAM directly -- see the layer tail below.)
 
-            # Pre-norm — M=1 via gf_one
-            total_flops += (self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
+            # Pre-norm — M=1 via gf_one. REPLICATED when sharded: every engine
+            # needs the normed row and writes identical bytes (benign race).
+            total_flops += (ue.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'],
                           gpr_M_reg=gf_one) or 0)
 
@@ -2610,32 +3584,37 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # §3h: q_proj, k_proj (IF4, K=2048<8192) use the M=1 GEMV kernel.
             # v_proj is BF16 — quantized_matmat_core asserts IF4/IF8/TQ4 only
             # (see [[bf16_models_no_quantized_gemv]]), so it stays on matmat_mul_core.
-            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=hd * qpkv,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['q_data'], OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                SCALE_DRAM_ADDR=la['q_scale'], data_type=TYPE.IF4,
-                C_DRAM_ADDR=la['q_bias']) or 0)
-            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=hd,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['k_data'], OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.IF4,
-                C_DRAM_ADDR=la['k_bias']) or 0)
-            total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=hd,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['v_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
-                C_DRAM_ADDR=la['v_bias'], gpr_M_reg=gf_one) or 0)
+            _qb, _qs = _if4_lane(la['q_data'], la['q_scale'], self.vector_length, n0)
+            total_flops += (ue.quantized_matmat_core(M=1, K=self.vector_length, N=nc,
+                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=_qb,
+                OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM + n0 * bpe,
+                SCALE_DRAM_ADDR=_qs, data_type=TYPE.IF4,
+                C_DRAM_ADDR=la['q_bias'] + n0 * bpe) or 0)
+            if owns_k:
+                total_flops += (ue.quantized_matmat_core(M=1, K=self.vector_length, N=hd,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['k_data'], OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
+                    SCALE_DRAM_ADDR=la['k_scale'], data_type=TYPE.IF4,
+                    C_DRAM_ADDR=la['k_bias']) or 0)
+            if owns_v:
+                total_flops += (ue.matmat_mul_core(M=1, K=self.vector_length, N=hd,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=la['v_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
+                    C_DRAM_ADDR=la['v_bias'], gpr_M_reg=gf_one) or 0)
 
             # Qwen2.5-VL: NO QK norm — Q/K used directly
 
             # RoPE per head — use gr_weight_dram=gf_rope_cos_abs (absolute cos base addr
             # primed by per-step preamble = ROPE_LOCAL + (seq_len-1 + _rope_offset) * rope_row_bytes).
-            for kv_h in range(nkvh):
-                total_flops += (self.rope_hf_core_decode(
-                    N=ahd,
-                    input_dram_addr=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
-                    output_dram_addr=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
-                    cos_dram_addr=ROPE_WEIGHT_ADDR,
-                    sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
-                    gr_weight_dram=gf_rope_cos_abs) or 0)
-            for q_h in range(nkvh * qpkv):
-                total_flops += (self.rope_hf_core_decode(
+            if owns_k:
+                for kv_h in range(nkvh):
+                    total_flops += (ue.rope_hf_core_decode(
+                        N=ahd,
+                        input_dram_addr=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
+                        output_dram_addr=self.LAYER0_K_DRAM + kv_h * ahd * bpe,
+                        cos_dram_addr=ROPE_WEIGHT_ADDR,
+                        sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
+                        gr_weight_dram=gf_rope_cos_abs) or 0)
+            for q_h in range(h0, h0 + hp):
+                total_flops += (ue.rope_hf_core_decode(
                     N=ahd,
                     input_dram_addr=self.LAYER0_Q_DRAM + q_h * ahd * bpe,
                     output_dram_addr=self.LAYER0_Q_DRAM + q_h * ahd * bpe,
@@ -2643,131 +3622,156 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                     sin_dram_addr=ROPE_WEIGHT_ADDR + ahd * bpe,
                     gr_weight_dram=gf_rope_cos_abs) or 0)
 
-            # Per-KV-head: store new K/V to cache at gf_seq_len position, then unified attention.
-            for kv_h in range(nkvh):
+            def _cache_bases(kv_h):
                 k_cache_base = (self.LAYER0_K_ROPE_DRAM
                                 + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
                                 + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
                 v_cache_base = (self.LAYER0_V_DRAM
                                 + layer_idx * nkvh * self.MAX_CONTEXT_SIZE * ahd * bpe
                                 + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
+                return k_cache_base, v_cache_base
 
+            def _emit_k_append(kv_h):
+                k_cache_base, _ = _cache_bases(kv_h)
                 # K cache write: TMP_REG = k_cache_base + gf_seq_len * (ahd*bpe)
-                self.accelerator_memory_to_sram(self.LAYER0_K_DRAM + kv_h * ahd * bpe, 0x10000, ahd)
-                self.generate_instruction_reg_mul_imm(
+                ue.accelerator_memory_to_sram(self.LAYER0_K_DRAM + kv_h * ahd * bpe, 0x10000, ahd)
+                ue.generate_instruction_reg_mul_imm(
                     self.TMP_REG, self.gf_seq_len, ue_35bit_addr_shifter(ahd * bpe))
-                self.generate_instruction_add_imm(
+                ue.generate_instruction_add_imm(
                     self.TMP_REG, ue_35bit_addr_shifter(k_cache_base), self.TMP_REG)
-                self.sram_to_accelerator_memory(
+                ue.sram_to_accelerator_memory(
                     sram_address=0x10000, accelerator_dram_address=0,
                     element_size=ahd, general_reg_src=self.TMP_REG)
 
-                # V cache write
-                self.accelerator_memory_to_sram(self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe, 0x20000, ahd)
-                self.generate_instruction_reg_mul_imm(
+            def _emit_v_append(kv_h):
+                _, v_cache_base = _cache_bases(kv_h)
+                ue.accelerator_memory_to_sram(self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe, 0x20000, ahd)
+                ue.generate_instruction_reg_mul_imm(
                     self.TMP_REG, self.gf_seq_len, ue_35bit_addr_shifter(ahd * bpe))
-                self.generate_instruction_add_imm(
+                ue.generate_instruction_add_imm(
                     self.TMP_REG, ue_35bit_addr_shifter(v_cache_base), self.TMP_REG)
-                self.sram_to_accelerator_memory(
+                ue.sram_to_accelerator_memory(
                     sram_address=0x20000, accelerator_dram_address=0,
                     element_size=ahd, general_reg_src=self.TMP_REG)
 
-                # Gather qpkv Q heads for this KV head into FLASH_Q (contiguous: 0, ahd*bpe, ...)
-                for q in range(qpkv):
-                    q_src = self.LAYER0_Q_DRAM + (kv_h * qpkv + q) * ahd * bpe
-                    flash_q_addr = self.LAYER0_FLASH_Q_DRAM + q * ahd * bpe
-                    self.accelerator_memory_to_sram(q_src, 0x30000, ahd)
-                    self.sram_to_accelerator_memory(0x30000, flash_q_addr, ahd)
-
-                # Marshal active K/V history into FLASH_K / FLASH_V. gf_q_seq_len is
-                # the active KV token count; gf_aligned_seq_len bounds attention.
-                self._emit_pbi_scatter_per_token(
-                    read_base=k_cache_base,
-                    read_stride_bytes=ahd * bpe,
-                    write_specs=[(self.LAYER0_FLASH_K_DRAM, ahd * bpe)],
-                    sram_byte_addr=0x50000,
-                    element_count=ahd,
-                    gf_seq_len=self.gf_q_seq_len,
-                    template_seq_len=self.MAX_CONTEXT_SIZE,
-                )
-                self._emit_pbi_scatter_per_token(
-                    read_base=v_cache_base,
-                    read_stride_bytes=ahd * bpe,
-                    write_specs=[(self.LAYER0_FLASH_V_DRAM, ahd * bpe)],
-                    sram_byte_addr=0x60000,
-                    element_count=ahd,
-                    gf_seq_len=self.gf_q_seq_len,
-                    template_seq_len=self.MAX_CONTEXT_SIZE,
-                )
-
-                total_flops += (self.unified_attention_core(
-                    batch=qpkv,
+            def _emit_attention(head0, nheads):
+                """ZERO-COPY attention (gemma3 decode parity): Q read in place
+                (the nheads Q heads are contiguous in Q_DRAM), K/V read from
+                the cache slice in place (rows past the active length are
+                masked by the per-step bias, exactly as before), OUT written
+                straight into the assembled FLASH_OUTPUT slot. BIAS uses the
+                buffer base for every engine: run_decoder builds the decode
+                bias as ONE row repeated group_size times, so rows 0..nheads-1
+                equal rows head0..head0+nheads-1 by construction."""
+                kv_h = head0 // qpkv
+                k_cache_base, v_cache_base = _cache_bases(kv_h)
+                return (ue.unified_attention_core(
+                    batch=nheads,
                     aligned_seq_len=self.MAX_CONTEXT_SIZE,
                     head_dim=ahd,
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=self.LAYER0_FLASH_K_DRAM,
-                    V_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                    Q_DRAM_ADDR=self.LAYER0_Q_DRAM + head0 * ahd * bpe,
+                    K_DRAM_ADDR=k_cache_base,
+                    V_DRAM_ADDR=v_cache_base,
                     BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM + head0 * ahd * bpe,
+                    SCRATCH_DRAM_ADDR=attn_scratch,
                     IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                     gpr_aligned_seq_len_reg=self.gf_aligned_seq_len) or 0)
 
-                # Post-return: copy FLASH_OUT_HEAD (qpkv × ahd) → assembled FLASH_OUTPUT
-                # at this KV head's offset. Decode M=1 → 2 KB per copy.
-                self.accelerator_memory_to_sram(
-                    self.LAYER0_FLASH_OUT_HEAD_DRAM, 0x40000, qpkv * ahd)
-                self.sram_to_accelerator_memory(
-                    0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe,
-                    qpkv * ahd)
+            if ne == 1:
+                # Historical order: append + attend per KV head.
+                for kv_h in range(nkvh):
+                    _emit_k_append(kv_h)
+                    _emit_v_append(kv_h)
+                    total_flops += _emit_attention(kv_h * qpkv, qpkv)
+            else:
+                if owns_k:
+                    for kv_h in range(nkvh):
+                        _emit_k_append(kv_h)
+                if owns_v:
+                    for kv_h in range(nkvh):
+                        _emit_v_append(kv_h)
+                # ---- RENDEZVOUS A: attention reads q lanes + the appended K/V
+                self._shard_barrier(ue, engine_idx, ne)
+                total_flops += _emit_attention(h0, hp)
+                # ---- RENDEZVOUS B: the o-proj lanes read ALL heads' output
+                self._shard_barrier(ue, engine_idx, ne)
 
-            # o_proj (BF16)
-            total_flops += (self.matmat_mul_core(M=1, K=hd * qpkv, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=la['o_weight'], OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                gpr_M_reg=gf_one) or 0)
+            # o_proj (IF4, no bias; N-lane via the four per-column offsets). K=2048
+            # < SCALE_BRAM_ELEMENTS, so the 1-pass streaming GEMV applies (as q_proj).
+            _ob, _os = _if4_lane(la['o_data'], la['o_scale'], hd * qpkv, n0)
+            total_flops += (ue.quantized_matmat_core(M=1, K=hd * qpkv, N=nc,
+                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=_ob,
+                OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM + n0 * bpe,
+                SCALE_DRAM_ADDR=_os, data_type=TYPE.IF4) or 0)
+            # ---- RENDEZVOUS C: the residual reads the FULL o-proj row
+            self._shard_barrier(ue, engine_idx, ne)
 
             # Qwen2.5-VL: no post-attention norm; residual direct on o_proj output
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=0x90000, element_size=self.vector_length)
-            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
-            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
+            # (REPLICATED when sharded, identical writes)
+            ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
+            ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=0x90000, element_size=self.vector_length)
+            ue.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+            ue.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
 
-            # Qwen2.5-VL: post_attention_layernorm IS the pre-FFN norm
-            total_flops += (self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+            # Qwen2.5-VL: post_attention_layernorm IS the pre-FFN norm (REPLICATED)
+            total_flops += (ue.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln2_gamma'],
                           gpr_M_reg=gf_one) or 0)
 
             # MLP: SwiGLU
             # §3h: gate_proj, up_proj (IF4, K=2048<8192) use the M=1 GEMV kernel.
-            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['gate_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                SCALE_DRAM_ADDR=la['gate_scale'], data_type=TYPE.IF4, silu_enable=True) or 0)
-            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=la['up_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                SCALE_DRAM_ADDR=la['up_scale'], data_type=TYPE.IF4) or 0)
+            _gb, _gs = _if4_lane(la['gate_data'], la['gate_scale'], self.vector_length, m0)
+            total_flops += (ue.quantized_matmat_core(M=1, K=self.vector_length, N=mc,
+                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=_gb,
+                OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM + m0 * bpe,
+                SCALE_DRAM_ADDR=_gs, data_type=TYPE.IF4, silu_enable=True) or 0)
+            _ub, _us = _if4_lane(la['up_data'], la['up_scale'], self.vector_length, m0)
+            total_flops += (ue.quantized_matmat_core(M=1, K=self.vector_length, N=mc,
+                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=_ub,
+                OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM + m0 * bpe,
+                SCALE_DRAM_ADDR=_us, data_type=TYPE.IF4) or 0)
 
-            # gate x up (M=1: mlp_elements fits in SRAM in one shot)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
-            self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
-            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
+            # gate x up — stays in this engine's lane (M=1: the lane fits SRAM)
+            ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM + m0 * bpe, sram_address=0x10000, element_size=mc)
+            ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM + m0 * bpe, sram_address=0x90000, element_size=mc)
+            ue.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=mc)
+            ue.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM + m0 * bpe, element_size=mc)
+            # ---- RENDEZVOUS D: the down lanes read the FULL mult row, which
+            # the lanes just assembled IN PLACE (no K-split/reduce needed)
+            self._shard_barrier(ue, engine_idx, ne)
 
             # down_proj — K=mlp_elements=11008 > SCALE_BRAM_ELEMENTS=8192 triggers
             # quantized_matmat_core N_chunk=0 compile-hang (§3h), so stay on matmat_mul_core.
-            total_flops += (self.matmat_mul_core(is_B_quantized=True, M=1, K=self.mlp_elements, N=self.vector_length,
-                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=la['down_data'], OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                SCALE_DRAM_ADDR=la['down_scale'], data_type=TYPE.IF4,
+            _db, _ds = _if4_lane(la['down_data'], la['down_scale'], self.mlp_elements, n0)
+            total_flops += (ue.matmat_mul_core(is_B_quantized=True, M=1, K=self.mlp_elements, N=nc,
+                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=_db,
+                OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM + n0 * bpe,
+                SCALE_DRAM_ADDR=_ds, data_type=TYPE.IF4,
                 gpr_M_reg=gf_one) or 0)
+            # ---- RENDEZVOUS E: the final residual reads the FULL down row
+            self._shard_barrier(ue, engine_idx, ne)
 
             # Qwen2.5-VL: no post-FFN norm; residual direct on down_proj output
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_DOWN_DRAM, sram_address=0x90000, element_size=self.vector_length)
-            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
-            self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
+            # (REPLICATED when sharded)
+            ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
+            ue.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_DOWN_DRAM, sram_address=0x90000, element_size=self.vector_length)
+            ue.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+            # Layer output: straight into the NEXT layer's input (this layer's
+            # INPUT was last read by the post-attn residual above, so the
+            # in-place hand-off is safe); the final layer keeps OUTPUT for the
+            # final norm. Replaces the per-layer OUTPUT->INPUT SRAM bounce.
+            _layer_out = (self.LAYER0_OUTPUT_DRAM if layer_idx == layer_size - 1
+                          else self.LAYER0_INPUT_DRAM)
+            ue.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=_layer_out, element_size=self.vector_length)
 
-        # Final norm + LM head (only when running full model)
-        if layer_size == self.LAYER_SIZE:
-            total_flops += (self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
+        # Final norm + LM head (only when running full model). PRIMARY ONLY when
+        # sharded: the HW argmax exposes indices, not values, so per-lane local
+        # argmaxes cannot be merged without a logit readback (v2 candidate).
+        # Every engine holds the full OUTPUT row (replicated residual), so no
+        # rendezvous is needed -- the workers simply fall through to their halt.
+        if layer_size == self.LAYER_SIZE and is_primary:
+            total_flops += (ue.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.final_norm_addr,
                 gpr_M_reg=gf_one) or 0)
             # §3h LM head (M=1 GEMV). On-FPGA repetition penalty (llama3.2_1b style):
@@ -2775,15 +3779,17 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             # the HW argmax of (logits + bias) returns the penalized token directly —
             # write_back_disable=True means LOGITS_DRAM is never written and there is
             # NO host logit readback. All-zero bias buffer = pure greedy.
-            total_flops += (self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+            total_flops += (ue.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4,
                 C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
                 write_back_disable=True) or 0)
 
-        # End-of-body: bump gf_seq_len for next decode step, then halt.
-        self.generate_instruction_add_inc(self.gf_seq_len)
-        self.generate_instruction_halt()
+        # End-of-body: bump gf_seq_len for next decode step, then halt (the
+        # per-step preamble re-primes it anyway; kept for stream consistency).
+        ue.generate_instruction_add_inc(self.gf_seq_len)
+        if is_primary:
+            ue.generate_instruction_halt()
 
         return total_flops
 
@@ -2796,6 +3802,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         """
         if layer_size is None:
             layer_size = self.LAYER_SIZE
+        self._prepare_decode_sharding()
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -2838,6 +3845,61 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                         f"({img_size}×{img_size}) for the encoder section...")
         self.prepare_encoder_input(synthetic)
 
+    def _restore_multi_engine_state(self, meta: dict) -> None:
+        """Reconstruct the multi-engine runtime from a cached programs.json.
+
+        The bin holds every engine's PROGRAM bytes; what it cannot hold is the
+        Python-side state -- worker engines, schedulers, the per-engine scratch
+        registry and the K2/V2 shard buffers. Those are rebuilt by REPLAYING the
+        exact allocation sequence compile_all used (deterministic allocators),
+        then ASSERTING the replay landed where the bin's instructions expect it
+        (the pi05 sig-guard discipline: a drifted address is finite-but-wrong
+        output, never an error).
+        """
+        mm = meta["multi"]
+        eng = meta["engines"]
+        ne_p, ne_v = int(eng["PREFILL"]), int(eng["VIS"])
+        for name, idx in mm["shard_regs"].items():
+            assert getattr(self, name) == int(idx), (
+                f"programs.bin was compiled with {name}={idx} but this build "
+                f"uses {getattr(self, name)}; rebuild the bin")
+
+        # Replay compile_all's allocation order exactly: prefill sharding
+        # (pool + scheduler + lm scratch + K2/V2), then the vision scratch.
+        self._prepare_prefill_sharding()
+        if ne_p > 1:
+            assert (self._FLASH_K2, self._FLASH_V2) == (int(mm["flash_k2"]), int(mm["flash_v2"])), (
+                "K2/V2 shard buffers landed at different addresses than the bin "
+                "was compiled for -- tensor layout drifted; rebuild the bin")
+        self._prepare_decode_sharding()   # same order as compile_all
+        sched_v = self._make_stage_scheduler(ne_v) if ne_v > 1 else None
+        if sched_v is not None:
+            self._vis_register_shard_scratch(sched_v)
+        self._vis_sched = sched_v
+
+        ar = mm["worker_arena"]
+        assert (int(ar["base"]), int(ar["stride"]),
+                int(ar["tensor_offset"]), int(ar["program_offset"])) == (
+                self.WORKER_ARENA_BASE, self._worker_arena_stride,
+                self.WORKER_TENSOR_OFFSET, self._worker_program_offset), (
+            "worker arena layout differs from the bin's; rebuild the bin")
+        # The scratch registrations above must land exactly where compile did;
+        # then jump each worker's PROGRAM cursor past its loaded programs so a
+        # later tiny allocation (the flag-preclear program) cannot clobber them.
+        for w, t_end, p_end in zip(self._worker_pool,
+                                   mm["worker_tensor_ends"],
+                                   mm["worker_program_ends"]):
+            assert w.get_tensor_dram_addr() == int(t_end), (
+                f"worker scratch registry replay ended at "
+                f"0x{w.get_tensor_dram_addr():X}, bin expects 0x{int(t_end):X}")
+            w._next_program_dram_addr = int(p_end)
+
+        self._prefill_worker_prog_addrs = [int(a) for a in mm["prefill_worker_progs"]]
+        self._prefill_worker_preamble_addrs = [int(a) for a in mm["prefill_worker_preambles"]]
+        self._decode_worker_prog_addrs = [int(a) for a in mm.get("decoder_worker_progs", [])]
+        self._decode_worker_preamble_addrs = [int(a) for a in mm.get("decoder_worker_preambles", [])]
+        self._vis_worker_prog_addrs = [int(a) for a in mm["encoder_worker_progs"]]
+
     def compile_all(self, layer_size: int | None = None) -> dict:
         """Build the COMPLETE single instruction bin (prefill + decoder + encoder),
         once, serving BOTH LM-only and VLM requests.
@@ -2852,7 +3914,12 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
         The encoder section is always compiled (canonical 336×336 window layout),
         so the first run builds the complete bin regardless of LM/VLM. Subsequent
-        runs load it. Cache key: PREFILL_MAX_SEQ_LEN + layer_size.
+        runs load it. Cache key: PREFILL_MAX_SEQ_LEN + layer_size + the per-stage
+        ENGINE COUNTS (splits/barriers/worker addresses are baked into the
+        streams). Multi-engine bins additionally carry every worker program as a
+        segment plus the "multi" state block that _restore_multi_engine_state
+        replays, so a cached multi-engine run needs zero compilation: load,
+        rebuild pool/scratch, rewrite the per-prompt preambles, execute.
 
         Returns dict: encoder_addr, prefill_addr, prefill_preamble, decoder_addr,
         decoder_preamble, prefill_flops, decoder_flops.
@@ -2864,23 +3931,43 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         tmpl = self.PREFILL_MAX_SEQ_LEN
         uni_bin  = os.path.join(bin_dir, "programs.bin")
         uni_meta = os.path.join(bin_dir, "programs.json")
-
         # ---- cache hit: load the one bin, DMA each segment at its stored addr ----
         # Filename is fixed (programs.bin), so validate the baked layout
         # signature — a bin built for a different prefill_max_seq_len / layer_size
         # has different bucket bodies and addresses (core_changes §6) and must be
-        # rebuilt, not silently reused.
+        # rebuilt, not silently reused. THE ENGINE COUNTS ARE PART OF THE
+        # SIGNATURE: barrier fan-out, row/head splits and worker addresses are
+        # baked into every stream, so a bin only serves the exact --engines it
+        # was built with. Multi-engine bins carry the worker program segments +
+        # a "multi" state block (see _restore_multi_engine_state).
+        _cur_engines = {"VIS": self._num_engines("VIS"),
+                        "PREFILL": self._num_engines("PREFILL"),
+                        "DECODE": self._num_engines("DECODE")}
+        _multi = max(_cur_engines.values()) > 1
         _meta_ok = False
         if os.path.exists(uni_bin) and os.path.exists(uni_meta):
             with open(uni_meta) as f:
                 meta = json.load(f)
+            _bin_engines = {k: int(v) for k, v in
+                            meta.get("engines",
+                                     {"VIS": 1, "PREFILL": 1, "DECODE": 1}).items()}
+            _bin_engines.setdefault("DECODE", 1)
             _meta_ok = (meta.get("template_seq_len") == tmpl
-                        and meta.get("layer_size") == layer_size)
+                        and meta.get("layer_size") == layer_size
+                        and meta.get("emit_rev") == self.PROGRAMS_BIN_REV
+                        and _bin_engines == _cur_engines)
             if not _meta_ok:
-                _original_print(f"  programs.bin was built for template_seq_len="
-                                f"{meta.get('template_seq_len')}/layer_size={meta.get('layer_size')} "
-                                f"≠ current {tmpl}/{layer_size} — rebuilding.")
+                _original_print(
+                    f"  programs.bin was built for template_seq_len="
+                    f"{meta.get('template_seq_len')}/layer_size={meta.get('layer_size')}/"
+                    f"engines={_bin_engines} ≠ current {tmpl}/{layer_size}/"
+                    f"{_cur_engines} — rebuilding.")
+        self._compile_all_cached = _meta_ok
         if _meta_ok:
+            if _multi:
+                # Rebuild pool/schedulers/scratch and validate every replayed
+                # address BEFORE any DMA, so a mismatch aborts cleanly.
+                self._restore_multi_engine_state(meta)
             with open(uni_bin, "rb") as f:
                 raw = f.read()
             for seg in meta["segments"]:
@@ -2902,6 +3989,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         self._ensure_canonical_vision_layout()
         self._unified_active = True
         self._seg_encoder = self._seg_prefill = self._seg_decoder = None
+        self._seg_prefill_workers = []
+        self._seg_encoder_workers = []
+        self._seg_decoder_workers = []
         try:
             # LM FIRST → prefill/decoder land at the fixed base; their §7 jumps
             # bake here and stay valid whether or not the encoder runs.
@@ -2914,11 +4004,35 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             self._unified_active = False
         end_addr = self.get_program_dram_addr()
 
-        # Assemble one bin: concat segment bytes; meta records each at its abs addr.
+        # Assemble one bin: concat segment bytes; meta records each at its abs
+        # addr. Worker programs are ordinary segments -- DRAM is one flat space,
+        # so the loader's single dma_write loop replays them exactly like the
+        # primary's. "Correctly compiling everything first" is enforced here:
+        # a multi build must have harvested ne-1 worker programs per sharded
+        # stage or the dump refuses.
         segments, raw = [], bytearray()
-        for name, seg in (("prefill", self._seg_prefill),
-                          ("decoder", self._seg_decoder),
-                          ("encoder", self._seg_encoder)):
+        named = [("prefill", self._seg_prefill),
+                 ("decoder", self._seg_decoder),
+                 ("encoder", self._seg_encoder)]
+        if _multi:
+            ne_p, ne_v = _cur_engines["PREFILL"], _cur_engines["VIS"]
+            assert len(self._seg_prefill_workers) == max(ne_p - 1, 0), (
+                f"prefill compiled {len(self._seg_prefill_workers)} worker "
+                f"program(s), engines={ne_p} needs {ne_p - 1}")
+            assert len(self._seg_encoder_workers) == max(ne_v - 1, 0), (
+                f"encoder compiled {len(self._seg_encoder_workers)} worker "
+                f"program(s), engines={ne_v} needs {ne_v - 1}")
+            ne_d = _cur_engines["DECODE"]
+            assert len(self._seg_decoder_workers) == max(ne_d - 1, 0), (
+                f"decoder compiled {len(self._seg_decoder_workers)} worker "
+                f"program(s), engines={ne_d} needs {ne_d - 1}")
+            named += [(f"prefill_w{i + 1}", seg)
+                      for i, seg in enumerate(self._seg_prefill_workers)]
+            named += [(f"decoder_w{i + 1}", seg)
+                      for i, seg in enumerate(self._seg_decoder_workers)]
+            named += [(f"encoder_w{i + 1}", seg)
+                      for i, seg in enumerate(self._seg_encoder_workers)]
+        for name, seg in named:
             if seg is None:
                 continue
             addr, b = seg
@@ -2926,6 +4040,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             raw.extend(b)
         meta = {
             "template_seq_len": tmpl, "layer_size": layer_size,
+            "emit_rev": self.PROGRAMS_BIN_REV,
+            "engines": _cur_engines,
             "segments": segments, "end_addr": end_addr,
             "encoder_addr": enc_addr,
             "prefill_addr": prefill_addr, "prefill_preamble": prefill_preamble,
@@ -2934,12 +4050,32 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             "decoder_flops": decoder_flops,
             "gf_one": self._gf_one, "gf_rope_cos_abs": self._gf_rope_cos_abs,
         }
+        if _multi:
+            pool = self._worker_pool
+            meta["multi"] = {
+                "worker_arena": {"base": self.WORKER_ARENA_BASE,
+                                 "stride": self._worker_arena_stride,
+                                 "tensor_offset": self.WORKER_TENSOR_OFFSET,
+                                 "program_offset": self._worker_program_offset},
+                "worker_tensor_ends": [w.get_tensor_dram_addr() for w in pool],
+                "worker_program_ends": [w.get_program_dram_addr() for w in pool],
+                "prefill_worker_progs": list(getattr(self, "_prefill_worker_prog_addrs", [])),
+                "prefill_worker_preambles": list(getattr(self, "_prefill_worker_preamble_addrs", [])),
+                "decoder_worker_progs": list(getattr(self, "_decode_worker_prog_addrs", [])),
+                "decoder_worker_preambles": list(getattr(self, "_decode_worker_preamble_addrs", [])),
+                "encoder_worker_progs": list(getattr(self, "_vis_worker_prog_addrs", [])),
+                "flash_k2": getattr(self, "_FLASH_K2", 0),
+                "flash_v2": getattr(self, "_FLASH_V2", 0),
+                "shard_regs": {k: getattr(self, k) for k in self.SHARD_REG_NAMES},
+            }
         with open(uni_bin, "wb") as f:
             f.write(raw)
         with open(uni_meta, "w") as f:
             json.dump(meta, f)
         print(f"  Complete instruction bin: {len(raw)/1024/1024:.1f} MB, "
-              f"{len(segments)} segments (prefill+decoder+encoder) → {uni_bin}")
+              f"{len(segments)} segments "
+              f"({'multi-engine ' + str(_cur_engines) + ', ' if _multi else ''}"
+              f"prefill+decoder+encoder) → {uni_bin}")
         return {k: meta[k] for k in ("encoder_addr", "prefill_addr", "prefill_preamble",
                                       "decoder_addr", "decoder_preamble",
                                       "prefill_flops", "decoder_flops")}
@@ -3055,6 +4191,13 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         if _use_status:
             _status_setup()
 
+        # Sharded decode: workers HALT after every step and are relaunched via
+        # per-step preambles priming the SAME gf_* values as the primary's.
+        dec_sched = getattr(self, "_decode_sched", None)
+        dec_multi = dec_sched is not None and dec_sched.num_engines > 1
+        if dec_multi:
+            self._preclear_shard_flags(dec_sched)
+
         global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
         while self.seq_len < max_seq_len:
@@ -3079,20 +4222,40 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             if fpga_penalty and (self.seq_len - prefill_seq_start) > greedy_until:
                 self._write_penalty_bias(self._generated_tokens)
 
-            # Per-step preamble: prime dynamic GPRs + JUMP_ABS into cached decoder program.
+            # Per-step preamble(s): prime dynamic GPRs + JUMP_ABS into the
+            # engine's cached decoder program (all engines get identical values;
+            # the shard geometry is compile-time).
+            def _emit_step_preamble(eng, jump_target):
+                eng.generate_instruction_add_set(self.gf_seq_len,         step_pos)
+                eng.generate_instruction_add_set(self.gf_q_seq_len,       self.seq_len)
+                eng.generate_instruction_add_set(self.gf_aligned_seq_len, aligned_seq_len)
+                eng.generate_instruction_add_set(self._gf_rope_cos_abs,   ue_35bit_addr_shifter(cos_abs_addr))
+                eng.generate_instruction_jump_abs(ue_35bit_addr_shifter(jump_target))
+
             self.clear_inst_id()
             self.start_capture()
-            self.generate_instruction_add_set(self.gf_seq_len,         step_pos)
-            self.generate_instruction_add_set(self.gf_q_seq_len,       self.seq_len)
-            self.generate_instruction_add_set(self.gf_aligned_seq_len, aligned_seq_len)
-            self.generate_instruction_add_set(self._gf_rope_cos_abs,   ue_35bit_addr_shifter(cos_abs_addr))
-            self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
+            _emit_step_preamble(self, decoder_program_addr)
             self.stop_capture()
             self.write_captured_instructions_to_dram(preamble_addr)
             self.clear_capture_buffer()
 
+            if dec_multi:
+                for wi, w in enumerate(dec_sched.workers):
+                    w.clear_inst_id()
+                    w.start_capture()
+                    _emit_step_preamble(w, self._decode_worker_prog_addrs[wi])
+                    w.stop_capture()
+                    w.write_captured_instructions_to_dram(
+                        self._decode_worker_preamble_addrs[wi])
+                    w.clear_capture_buffer()
+                dec_sched.start_workers(self._decode_worker_preamble_addrs)
+
             step_latency_us, step_flop_rate = self.program_execute(
                 preamble_addr, timeout=10.0, flops=per_token_flops, verbose=False)
+            if dec_multi:
+                # Workers only drain their halt after the last rendezvous; the
+                # relaunch above would race a still-busy queue without this.
+                self._join_workers(dec_sched, timeout_s=10.0)
             total_latency_us += step_latency_us
             total_flop_rate += step_flop_rate
 
@@ -3125,6 +4288,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
               f"total {self.seq_len} tokens.")
         print(f"HW counter: Latency: {hw_total_s:.2f} seconds, "
               f"decoder average Gflops: {avg_hw_gflops:.2f} Gflops")
+        self._decode_avg_gflops = avg_hw_gflops   # for main()'s summary table
         return self.seq_len, "".join(decoded_chars)
 
 def process_image(image_path: str, size: int = 448) -> torch.Tensor:
@@ -3172,6 +4336,19 @@ def main():
                              'special tokens). Default 256.')
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
+    parser.add_argument("--clean", action="store_true",
+                        help="delete the cached artifacts (params.bin/json and programs.bin/json) "
+                             "before running, so this run regenerates the weight bin and "
+                             "recompiles the instruction bin. The downloaded HF checkpoint in "
+                             "the same directory is left alone. Same convention as "
+                             "pi05/smolvlm2. Normally unnecessary for engine-count changes -- "
+                             "the programs.bin signature (template/layers/engines/emit_rev) "
+                             "already triggers a rebuild on any mismatch.")
+    parser.add_argument('--engines', type=int, default=1,
+                        help='Engine count for the multi-engine vision encoder + prefill '
+                             '(1/2/4/8). 1 (default) is the exact historical single-engine '
+                             'path. Decode stays single-engine. Multi-engine runs bypass the '
+                             'programs.bin cache (worker programs are not part of it).')
     parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     args = parser.parse_args()
 
@@ -3186,7 +4363,18 @@ def main():
     print(f"FPGA profile: device={args.device}")
     print(user_dma_core.hardware_info_summary())
 
-    ue = Qwen25VL3B_UnifiedEngine(script_dir=script_dir)
+    if args.clean:
+        _bin_dir = os.path.join(script_dir, "qwen2.5_vl_3b_bin")
+        for _f in ("programs.bin", "programs.json", "params.bin", "params.json"):
+            _p = os.path.join(_bin_dir, _f)
+            if os.path.exists(_p):
+                os.remove(_p)
+                print(f"  --clean: removed {_p}")
+
+    ue = Qwen25VL3B_UnifiedEngine(script_dir=script_dir, engines=args.engines)
+    if ue.NUM_ENGINES > 1:
+        print(f"Multi-engine: vision={ue._num_engines('VIS')} "
+              f"prefill={ue._num_engines('PREFILL')} engine(s), decode=1")
 
     ue.start_capture()
     ue.generate_instruction_halt()
@@ -3216,7 +4404,7 @@ def main():
     print(f"  Image : {args.image if has_image else '(none)'}")
     print(f"  Prompt: {args.prompt!r}")
 
-    t_compile = t_total = 0.0  # vision compile/total wall (set by the FPGA vision branch)
+    t_img_prep = t_vis_run = 0.0  # vision preprocess / encoder-run wall (set by the FPGA vision branch)
 
     if fpga_vision:
         # FPGA vision encoder — preprocess only; the encoder PROGRAM is compiled
@@ -3226,6 +4414,7 @@ def main():
         _pixel_values = process_image(args.image)
         print(f"Image loaded: {args.image} -> {_pixel_values.shape}")
         ue.prepare_encoder_input(_pixel_values)  # sets _cu_window_seqlens before compile
+        t_img_prep = time.perf_counter() - timer_vis
 
     # ---- Single complete instruction bin: prefill + decoder + encoder ----
     # Built once (first run), serves BOTH LM-only and VLM. LM section is captured
@@ -3238,10 +4427,11 @@ def main():
     print(f"  {t_uni_compile:.2f}s")
 
     if fpga_vision:
-        t_compile = time.perf_counter() - timer_vis
+        _t_vis0 = time.perf_counter()
         ue.run_encoder(progs["encoder_addr"], _pixel_values)
-        t_total = time.perf_counter() - timer_vis
-        print(f"Vision encoder: compile {t_compile:.2f}s + run {t_total - t_compile:.2f}s = {t_total:.2f}s total")
+        t_vis_run = time.perf_counter() - _t_vis0
+        print(f"Vision encoder: preprocess {t_img_prep:.2f}s + run {t_vis_run:.2f}s "
+              f"(program is part of the unified bin)")
 
     if args.prompt is not None or has_image:
         tok_path = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
@@ -3346,24 +4536,42 @@ def main():
         gflops=gflops_per_token, latency_prefill_wall=latency_prefill)
     latency_decoder = time.perf_counter() - timer
     n_new = token_cnt_decoded - len(prefill_seq)
-    print(f"\n  {latency_decoder:.2f}s ({n_new} tokens, {latency_decoder/max(n_new,1):.2f}s/tok)")
+    print(f"\n  {latency_decoder:.2f}s ({n_new} tokens, {n_new / max(latency_decoder, 1e-9):.2f} tok/s)")
 
     print(f"\n{'='*60}")
-    print(f"  Summary")
+    _ne_v = getattr(getattr(ue, "_vis_sched", None), "num_engines", 1)
+    _ne_p = getattr(getattr(ue, "_prefill_sched", None), "num_engines", 1)
+    _mode = "VLM" if has_image else "LM"
+    _ne_d = getattr(getattr(ue, "_decode_sched", None), "num_engines", 1)
+    print(f"  Summary  —  {_mode}  ·  engines: vision {_ne_v} / prefill {_ne_p} / decode {_ne_d}")
     print(f"{'='*60}")
+    print(f"  Setup")
     if has_image:
-        vis_flops = getattr(ue, '_vis_total_flops', 0)
-        vis_gflops = getattr(ue, '_vis_gflops', 0)
-        vis_run = t_total - t_compile
-        print(f"  Vision compile:   {t_compile:.2f}s")
-        print(f"  Vision run:       {vis_run:.2f}s  ({vis_gflops:.2f} GFLOPS)")
-    print(f"  Unified compile:  {t_uni_compile:.2f}s  (encoder+prefill+decoder, one bin)")
-    prefill_flops = gflops_prefill if isinstance(gflops_prefill, (int, float)) else 0
-    print(f"  Prefill run:      {latency_prefill:.2f}s  ({prefill_hw_gflops:.2f} GFLOPS)  ({len(prefill_seq)} tokens)")
-    print(f"  Decode run:       {latency_decoder:.2f}s  ({n_new} tokens, {latency_decoder/max(n_new,1):.2f}s/tok)")
-    total = (t_total if fpga_vision else 0) + t_uni_compile + latency_prefill + latency_decoder
-    print(f"  ──────────────────────────")
-    print(f"  Total:            {total:.2f}s")
+        print(f"    {'Image preprocess':<17}{t_img_prep:>9.2f} s")
+    _bin_note = ("loaded from programs.bin" if getattr(ue, "_compile_all_cached", False)
+                 else "compiled fresh (prefill+decoder+encoder)")
+    print(f"    {'Instruction bin':<17}{t_uni_compile:>9.2f} s   {_bin_note}")
+    print(f"  Execution")
+    if has_image:
+        _vis_gflops = getattr(ue, '_vis_gflops', 0)
+        _vis_tok = getattr(ue, '_vis_num_tokens', 0)
+        _mid = f"{ue._vis_cfg['num_patches']} patches \u2192 {_vis_tok} tokens"
+        print(f"    {'Vision encoder':<17}{t_vis_run:>9.2f} s   "
+              f"{_mid:<26}{_vis_gflops:>7.1f} GFLOPS")
+    _pref_tps = len(prefill_seq) / max(latency_prefill, 1e-9)
+    _mid = f"{len(prefill_seq):>4} tok  {_pref_tps:>7.2f} tok/s"
+    print(f"    {'Prefill':<17}{latency_prefill:>9.2f} s   "
+          f"{_mid:<26}{prefill_hw_gflops:>7.1f} GFLOPS")
+    _dec_tps = n_new / max(latency_decoder, 1e-9)
+    _dec_gflops = getattr(ue, '_decode_avg_gflops', 0.0)
+    _mid = f"{n_new:>4} tok  {_dec_tps:>7.2f} tok/s"
+    print(f"    {'Decode':<17}{latency_decoder:>9.2f} s   "
+          f"{_mid:<26}{_dec_gflops:>7.1f} GFLOPS   ({latency_decoder / max(n_new, 1):.3f} s/tok)")
+    _t_exec = (t_vis_run if fpga_vision else 0.0) + latency_prefill + latency_decoder
+    _t_e2e = _t_exec + t_uni_compile + (t_img_prep if fpga_vision else 0.0)
+    print(f"  {'\u2500' * 58}")
+    print(f"    {'Execution total':<17}{_t_exec:>9.2f} s")
+    print(f"    {'End-to-end':<17}{_t_e2e:>9.2f} s   (setup + execution)")
 
     print("Qwen2.5-VL-3B test ends.")
 
