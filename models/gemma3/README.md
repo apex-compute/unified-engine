@@ -10,15 +10,15 @@ This folder contains the Gemma3 accelerator inference example and numeric verifi
 
 ## Layout
 
-- **gemma3_test.py** – Prefill + decode loop on accelerator (single or dual engine).
+- **gemma3_test.py** – Prefill + decode loop on accelerator (single engine).
 - **gemma3_test_IF8.py** – **Deprecated and currently non-working** IF8 experiment.
 - **gemma3_numeric.py** – Numeric verification with torch reference (prefill + decoder).
 - **gemma3_config.json** – Model and layout config.
-- **decoder_program.json** / **decoder_program_slave.json** – Decoder program metadata (written on first decoder compile).
+- **decoder_program.json** – Decoder program metadata (written on first decoder compile).
 - **gemma3_bin/** – Weights, HF model, and decoder binaries. Contains:
   - `weights_gemma3_hf.bin` or `full_model_weights.bin`
   - `gemma-3-1b-it/` (Hugging Face model, or set via config)
-  - `decoder_program.bin` (and `decoder_program_slave.bin` when using dual engine)
+  - `decoder_program.bin`
 
 ## Prerequisites
 
@@ -45,6 +45,4 @@ python models/gemma3/gemma3_test.py --dev xdma0 --cycle 5.0422
 # Use local full-model weights bin
 python models/gemma3/gemma3_test.py --local-weights
 
-# Dual engine (master + slave)
-python models/gemma3/gemma3_test.py --dual-engine
 ```
