@@ -683,7 +683,6 @@ def main():
     parser.add_argument("--layer-size",type=int,default=26,help="Number of layers to compile and verify (default: 1)")
     parser.add_argument("--prompt", type=str, default=None, help="User prompt for prefill; if not set, use config default_prefill_tokens")
     parser.add_argument("--local-weights", action="store_true", help="Require existing gemma3_bin/params.bin (skip HF regeneration)")
-    parser.add_argument("--dual-engine", action="store_true", help="Use dual engine")
     parser.add_argument('--dev', type=str, default='xdma0',help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--cycle', type=float, default=None, help='Clock cycle time in ns. Overrides --device default.')
     parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo).')
@@ -705,28 +704,16 @@ def main():
     print(f"  C2H: {gemma3_test.DMA_DEVICE_C2H}")
     print(f"  USER: {gemma3_test.DMA_DEVICE_USER}")
 
-    dual_engine = args.dual_engine
-    ue = Gemma3_NumericEngine(local_weights=args.local_weights, dual_engine=dual_engine)
+    ue = Gemma3_NumericEngine(local_weights=args.local_weights)
     ue.set_prefill_seq(args.prompt)
-
-    if dual_engine:
-        ue2 = Gemma3_NumericEngine(local_weights=args.local_weights, dual_engine=True, engine_slave=True)
-        ue2.set_prefill_seq(args.prompt)
 
     print(f"\n--- Compiling prefill (layer_size={args.layer_size}) ---")
     prefill_program_addr, flops_prefill = ue.compile_prefill(seq_len=len(ue.prefill_seq), layer_size=args.layer_size)
-    
-    if dual_engine:
-        print(f"\n--- Compiling prefill for dual engine (layer_size={args.layer_size}) ---")
-        prefill_program_addr2, flops_prefill2 = ue2.compile_prefill(seq_len=len(ue2.prefill_seq), layer_size=args.layer_size)
-        ue2.program_execute(prefill_program_addr2, timeout=0, flops=flops_prefill2)
 
     print(f"\n--- Running prefill ---")
     timer=time.perf_counter()
     latency_prefill, _ = ue.run_prefill(prefill_program_addr, flops=flops_prefill)
     print(f"Prefill done in {(time.perf_counter() - timer):.2f} seconds.")
-    if dual_engine:
-        print(f"Dual engine prefill gflops: {((flops_prefill + flops_prefill2) / (latency_prefill * 1e3)):.2f} GFLOPS")
 
     print(f"\n--- Torch ref check ---")
     kv_cache = ue.torch_ref_check_prefill(layer_size=args.layer_size)

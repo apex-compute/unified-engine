@@ -37,7 +37,6 @@ Usage:
   python gemma3_test_IF8.py --prompt "your prompt"
   python gemma3_test_IF8.py --dev xdma0
   python gemma3_test_IF8.py --local-weights
-  python gemma3_test_IF8.py --dual-engine
 
 ``--dev`` is the DMA device name (e.g. ``xdma0``); AXI width, clock, DRAM size, and core count come from HW_INFO.
 
@@ -49,6 +48,7 @@ import gc
 import json
 import math
 import os
+import re
 import sys
 
 # This file's folder: model scripts, *.json, and cache dirs live here. user_dma_core is two folders up (models/../..).
@@ -309,14 +309,9 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
 class Gemma3_UnifiedEngine(UnifiedEngine):
     """UnifiedEngine with Gemma3 dims: loads config + weight bin; compile_prefill/compile_decoder;
     run_prefill/run_decoder (numeric checks in gemma3_numeric.py).
-
-    Dual-engine: not verified end-to-end after the PBI migration. The compile path still carries
-    sharding hooks (row split, flags, ``shard_dram_addr``) where practical so future dual-PBI work
-    can build on the same structure; runtime enablement remains gated until validated.
     """
 
-    def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False, legacy: bool = False, matmatmul: bool = False, two_pass_prefill: bool = False):
-        engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
+    def __init__(self, script_dir: str | None = None, local_weights: bool = False, legacy: bool = False, matmatmul: bool = False, two_pass_prefill: bool = False):
         # Compute Params/Tensor/Program DRAM bases dynamically so the IF8 weight set
         # (~990 MB: 26 layers ~687 MB + LM_HEAD ~297 MB + ROPE + OUTPUT_NORM) fits in a
         # single contiguous Params region. The 768 MB Params default in user_dma_core.py
@@ -332,10 +327,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         _tensor_base = ((0x80000000 + _params_estimate + 0xFFFFF) // 0x100000) * 0x100000  # 1 MB aligned
         _tensor_estimate = 0x12000000  # 288 MB; KV cache + activations + flash scratch fit in ~80 MB on Gemma3-1B with margin
         _program_base = ((_tensor_base + _tensor_estimate + 0xFFFFF) // 0x100000) * 0x100000  # 1 MB aligned
-        if engine_slave:
-            _program_base += 0x10000000
-        super().__init__(BASE_ADDR=engine_base, program_dram_base=_program_base, tensor_dram_base=_tensor_base)
-        self.dual_engine = dual_engine
+        super().__init__(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR, program_dram_base=_program_base, tensor_dram_base=_tensor_base)
         self.legacy = legacy
         self.two_pass_prefill = two_pass_prefill
         self.matmatmul = matmatmul
@@ -376,7 +368,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._end_of_turn_token_id = model["end_of_turn_token_id"]
         self._gamma_bin_offset = self._cfg["special"]["rms_norm"]["gamma_offset"]
         self.prefill_seq = None 
-        self.engine_slave = engine_slave
 
         self._weights_bin_rel = "gemma3_if8_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
         self.weight_init()
@@ -733,34 +724,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # its static batch/aligned are seq_len / align64(seq_len), not the q_seq_len
         # values (which only size the token-major Q/OUTPUT scratch buffers).
         aligned_seq_len = ((seq_len + 63) // 64) * 64
-        engine_master = not self.engine_slave
-        row_offset = 0 if engine_master else seq_len // 2
-        # Dual-engine: halve per-engine ``seq_len`` and offset DRAM views. Not validated with PBI
-        # on hardware yet; kept at compile time for forward compatibility.
-        if self.dual_engine:
-            seq_len = (seq_len - row_offset if self.engine_slave else row_offset) 
-
-        def shard_dram_addr(base_addr: int, row_offset: int, row_width: int) -> int:
-            return base_addr + row_offset * row_width * self.bytes_per_element
-
-        def begin_parallel_stage() -> None:
-            if not self.dual_engine:
-                return
-            if self.engine_slave:
-                self.generate_instruction_flag_check(target_engine_idx=0)
-                self.generate_instruction_flag_clear()
-            else:
-                self.generate_instruction_flag_set()
-                self.generate_instruction_flag_clear()
-
-        def end_parallel_stage() -> None:
-            if not self.dual_engine:
-                return
-            if self.engine_slave:
-                self.generate_instruction_flag_set()
-            else:
-                self.generate_instruction_flag_check(target_engine_idx=1)
-
         def prefill_projection_core(**kwargs) -> int:
             """Select the default one-pass streaming kernel or two-pass compatibility path."""
             if self.two_pass_prefill:
@@ -777,23 +740,20 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             scale_dram_addr: int,
             **kwargs,
         ) -> int:
-            begin_parallel_stage()
             projection_kwargs = dict(
                 M=seq_len,
                 K=k_dim,
                 N=n_dim,
                 gpr_M_reg=None,
-                A_DRAM_ADDR=shard_dram_addr(input_dram_addr, row_offset, k_dim),
+                A_DRAM_ADDR=input_dram_addr,
                 B_DRAM_ADDR=weight_dram_addr,
-                OUTPUT_DRAM_ADDR=shard_dram_addr(output_dram_addr, row_offset, n_dim),
+                OUTPUT_DRAM_ADDR=output_dram_addr,
                 is_B_quantized=True,
                 data_type=TYPE.IF8,
                 SCALE_DRAM_ADDR=scale_dram_addr,
                 **kwargs,
             )
-            flops = prefill_projection_core(**projection_kwargs)
-            end_parallel_stage()
-            return flops
+            return prefill_projection_core(**projection_kwargs)
 
         def duplicate_gqa_rows_pbi(src_dram_addr: int, dst_dram_addr: int, staging_sram_addr: int, gpr_seq_len: int = None,
                                    gpr_src_addr: int = None, gpr_dst_addr: int = None) -> None:
@@ -875,8 +835,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # --- Gemma3 26 layers: compile---
         global _SILENT_MODE
         _SILENT_MODE = True
-        if self.dual_engine:
-            self.generate_instruction_flag_clear()
         total_flops = 0
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         KV_CACHE_LAYER_STRIDE = self.MAX_CONTEXT_SIZE * self.k_size
@@ -1017,15 +975,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.generate_instruction_add_imm(src_reg_idx=gpr_rope_saved, immediate_value=0, dst_reg_idx=gpr_rope_cycle)
             _cycle_patch()
 
-            if engine_master:
-                total_flops += fold_rms(
-                    seq_len, self.vector_length,
-                    self.LAYER0_INPUT_DRAM, self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA,
-                    self.gpr_seq_len,
-                    const_addr(self.LAYER0_INPUT_DRAM, gpr_scratch_a),
-                    const_addr(self.LAYER0_PRE_NORM_DRAM, gpr_scratch_b),
-                    layer_addr(self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA, gpr_scratch_c),
-                )
+            total_flops += fold_rms(
+                seq_len, self.vector_length,
+                self.LAYER0_INPUT_DRAM, self.LAYER0_PRE_NORM_DRAM, self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA,
+                self.gpr_seq_len,
+                const_addr(self.LAYER0_INPUT_DRAM, gpr_scratch_a),
+                const_addr(self.LAYER0_PRE_NORM_DRAM, gpr_scratch_b),
+                layer_addr(self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA, gpr_scratch_c),
+            )
             total_flops += prefill_projection_core(
                 M=seq_len,
                 K=self.vector_length,
@@ -1080,143 +1037,142 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_V_PROJ_SCALE, gpr_scratch_d),
                 gpr_out_addr=kv_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
             )
-            if engine_master:
-                total_flops += fold_rms(
-                    seq_len, self.head_dim,
-                    self.LAYER0_K_DRAM, self.LAYER0_K_NORM_DRAM, self.DRAM_ADDR_LAYER0_K_NORM_GAMMA,
-                    self.gpr_seq_len,
-                    const_addr(self.LAYER0_K_DRAM, gpr_scratch_a),
-                    const_addr(self.LAYER0_K_NORM_DRAM, gpr_scratch_b),
-                    layer_addr(self.DRAM_ADDR_LAYER0_K_NORM_GAMMA, gpr_scratch_c),
-                )
-                total_flops += fold_rms(
-                    seq_len * self.group_size, self.head_dim,
-                    self.LAYER0_Q_DRAM, self.LAYER0_Q_NORM_DRAM, self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA,
-                    self.gpr_q_seq_len,
-                    const_addr(self.LAYER0_Q_DRAM, gpr_scratch_a),
-                    const_addr(self.LAYER0_Q_NORM_DRAM, gpr_scratch_b),
-                    layer_addr(self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA, gpr_scratch_c),
-                )
+            total_flops += fold_rms(
+                seq_len, self.head_dim,
+                self.LAYER0_K_DRAM, self.LAYER0_K_NORM_DRAM, self.DRAM_ADDR_LAYER0_K_NORM_GAMMA,
+                self.gpr_seq_len,
+                const_addr(self.LAYER0_K_DRAM, gpr_scratch_a),
+                const_addr(self.LAYER0_K_NORM_DRAM, gpr_scratch_b),
+                layer_addr(self.DRAM_ADDR_LAYER0_K_NORM_GAMMA, gpr_scratch_c),
+            )
+            total_flops += fold_rms(
+                seq_len * self.group_size, self.head_dim,
+                self.LAYER0_Q_DRAM, self.LAYER0_Q_NORM_DRAM, self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA,
+                self.gpr_q_seq_len,
+                const_addr(self.LAYER0_Q_DRAM, gpr_scratch_a),
+                const_addr(self.LAYER0_Q_NORM_DRAM, gpr_scratch_b),
+                layer_addr(self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA, gpr_scratch_c),
+            )
 
-                # ROPE weights are shared between layers; global/local table selection is the
-                # runtime mod-6 branch above (gpr_rope_base), not a compile-time layer_idx check.
-                total_flops += self.rope_hf_core_dram(
-                    M=seq_len,
-                    N=self.head_dim,
-                    input_dram_addr=self.LAYER0_K_NORM_DRAM,
-                    output_dram_addr=self.LAYER0_K_ROPE_DRAM,
-                    cos_dram_addr=self.DRAM_ADDR_ROPE_GLOBAL,
-                    sin_dram_addr=self.DRAM_ADDR_ROPE_GLOBAL + self.head_dim * self.bytes_per_element,
-                    gpr_M_reg=self.gpr_seq_len,
-                    gpr_N_reg=gpr_dim_head_dim,
-                    gpr_input_addr=const_addr(self.LAYER0_K_NORM_DRAM, gpr_scratch_b),
-                    gpr_out_addr=kv_addr(self.LAYER0_K_ROPE_DRAM, gpr_scratch_a),
-                    gpr_cos_addr=gpr_rope_base,
-                )
-                total_flops += self.rope_hf_core_dram_gqa(
-                    M=seq_len,
-                    group_size=self.group_size,
-                    N=self.head_dim,
-                    input_dram_addr=self.LAYER0_Q_NORM_DRAM,
-                    output_dram_addr=self.LAYER0_FLASH_Q_DRAM,
-                    cos_dram_addr=self.DRAM_ADDR_ROPE_GLOBAL,
-                    sin_dram_addr=self.DRAM_ADDR_ROPE_GLOBAL + self.head_dim * self.bytes_per_element,
-                    gpr_M_reg=self.gpr_seq_len,
-                    gpr_N_reg=gpr_dim_head_dim,
-                    gpr_input_addr=const_addr(self.LAYER0_Q_NORM_DRAM, gpr_scratch_a),
-                    gpr_out_addr=const_addr(self.LAYER0_FLASH_Q_DRAM, gpr_scratch_b),
-                    gpr_cos_addr=gpr_rope_base,
-                )
+            # ROPE weights are shared between layers; global/local table selection is the
+            # runtime mod-6 branch above (gpr_rope_base), not a compile-time layer_idx check.
+            total_flops += self.rope_hf_core_dram(
+                M=seq_len,
+                N=self.head_dim,
+                input_dram_addr=self.LAYER0_K_NORM_DRAM,
+                output_dram_addr=self.LAYER0_K_ROPE_DRAM,
+                cos_dram_addr=self.DRAM_ADDR_ROPE_GLOBAL,
+                sin_dram_addr=self.DRAM_ADDR_ROPE_GLOBAL + self.head_dim * self.bytes_per_element,
+                gpr_M_reg=self.gpr_seq_len,
+                gpr_N_reg=gpr_dim_head_dim,
+                gpr_input_addr=const_addr(self.LAYER0_K_NORM_DRAM, gpr_scratch_b),
+                gpr_out_addr=kv_addr(self.LAYER0_K_ROPE_DRAM, gpr_scratch_a),
+                gpr_cos_addr=gpr_rope_base,
+            )
+            total_flops += self.rope_hf_core_dram_gqa(
+                M=seq_len,
+                group_size=self.group_size,
+                N=self.head_dim,
+                input_dram_addr=self.LAYER0_Q_NORM_DRAM,
+                output_dram_addr=self.LAYER0_FLASH_Q_DRAM,
+                cos_dram_addr=self.DRAM_ADDR_ROPE_GLOBAL,
+                sin_dram_addr=self.DRAM_ADDR_ROPE_GLOBAL + self.head_dim * self.bytes_per_element,
+                gpr_M_reg=self.gpr_seq_len,
+                gpr_N_reg=gpr_dim_head_dim,
+                gpr_input_addr=const_addr(self.LAYER0_Q_NORM_DRAM, gpr_scratch_a),
+                gpr_out_addr=const_addr(self.LAYER0_FLASH_Q_DRAM, gpr_scratch_b),
+                gpr_cos_addr=gpr_rope_base,
+            )
 
-                # ---- Proper GQA: an outer loop over the group's query heads ----
-                # Standard GQA: the group_size query heads all attend the SAME K/V
-                # head (num_kv=1). Instead of replicating the compact per-layer K/V
-                # cache group_size times and running ONE attention over a
-                # q_seq_len=(seq_len*group_size)-long KV dimension — which spends
-                # group_size x the score-matrix FLOPs and DMA — the K/V are read
-                # straight from the compact per-layer cache (seq_len rows) and one
-                # SDPA is run per query head, reusing that shared K/V. This turns the
-                # attention cost from O((seq_len*group_size)^2) into
-                # group_size * O(seq_len^2) — a group_size-fold reduction.
-                #
-                # Layout bridge: the projection + RoPE produce Q token-major
-                # (row = token*group_size + head) in FLASH_Q, but the core reads Q /
-                # writes OUT as contiguous [batch, head_dim]. So permute Q to
-                # head-major [group, per_head_rows, head_dim] (each head's seq_len
-                # rows contiguous) into the FLASH_K scratch (freed by dropping the
-                # GQA duplication), run one core per head reusing the compact K/V,
-                # write each head's OUT back into the SAME head slot (safe — the core
-                # copies Q into its scaled-Q scratch before writing OUT), then permute
-                # the head-major output back to token-major [seq, group*head_dim] in
-                # FLASH_OUTPUT for the O projection. Both permutes are runtime-length
-                # (gpr_seq_len) strided copies.
-                #
-                # per_head_rows is the compile-time MAX aligned KV length; it sizes
-                # the head-major per-head slot stride. The live length comes from
-                # gpr_aligned_seq_len = align64(seq_len) at run time. batch/aligned
-                # for the core are seq_len / align64(seq_len) (NOT q_seq_len), primed
-                # into the runtime GPRs by the preamble.
-                head_bytes = self.head_dim * self.bytes_per_element
-                per_head_rows = ((self.PREFILL_MAX_SEQ_LEN + 63) // 64) * 64
-                qhm_head_bytes = per_head_rows * head_bytes
-                # Q token-major -> head-major (into freed FLASH_K per-head slots).
-                for g in range(self.group_size):
-                    self._emit_strided_copy_pbi(
-                        self.LAYER0_FLASH_Q_DRAM + g * head_bytes,        # token-major head g
-                        self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes,    # head-major head g
-                        self.head_dim,
-                        self.group_size * head_bytes,                     # token-major row stride
-                        head_bytes,                                       # head-major contiguous
-                        seq_len, self.gpr_seq_len)
+            # ---- Proper GQA: an outer loop over the group's query heads ----
+            # Standard GQA: the group_size query heads all attend the SAME K/V
+            # head (num_kv=1). Instead of replicating the compact per-layer K/V
+            # cache group_size times and running ONE attention over a
+            # q_seq_len=(seq_len*group_size)-long KV dimension — which spends
+            # group_size x the score-matrix FLOPs and DMA — the K/V are read
+            # straight from the compact per-layer cache (seq_len rows) and one
+            # SDPA is run per query head, reusing that shared K/V. This turns the
+            # attention cost from O((seq_len*group_size)^2) into
+            # group_size * O(seq_len^2) — a group_size-fold reduction.
+            #
+            # Layout bridge: the projection + RoPE produce Q token-major
+            # (row = token*group_size + head) in FLASH_Q, but the core reads Q /
+            # writes OUT as contiguous [batch, head_dim]. So permute Q to
+            # head-major [group, per_head_rows, head_dim] (each head's seq_len
+            # rows contiguous) into the FLASH_K scratch (freed by dropping the
+            # GQA duplication), run one core per head reusing the compact K/V,
+            # write each head's OUT back into the SAME head slot (safe — the core
+            # copies Q into its scaled-Q scratch before writing OUT), then permute
+            # the head-major output back to token-major [seq, group*head_dim] in
+            # FLASH_OUTPUT for the O projection. Both permutes are runtime-length
+            # (gpr_seq_len) strided copies.
+            #
+            # per_head_rows is the compile-time MAX aligned KV length; it sizes
+            # the head-major per-head slot stride. The live length comes from
+            # gpr_aligned_seq_len = align64(seq_len) at run time. batch/aligned
+            # for the core are seq_len / align64(seq_len) (NOT q_seq_len), primed
+            # into the runtime GPRs by the preamble.
+            head_bytes = self.head_dim * self.bytes_per_element
+            per_head_rows = ((self.PREFILL_MAX_SEQ_LEN + 63) // 64) * 64
+            qhm_head_bytes = per_head_rows * head_bytes
+            # Q token-major -> head-major (into freed FLASH_K per-head slots).
+            for g in range(self.group_size):
+                self._emit_strided_copy_pbi(
+                    self.LAYER0_FLASH_Q_DRAM + g * head_bytes,        # token-major head g
+                    self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes,    # head-major head g
+                    self.head_dim,
+                    self.group_size * head_bytes,                     # token-major row stride
+                    head_bytes,                                       # head-major contiguous
+                    seq_len, self.gpr_seq_len)
 
-                # head_dim is a model constant, so it is kept BAKED (no gpr_head_dim_reg)
-                # — the V transpose and Q pre-scale then take their validated
-                # dynamic-M / N-baked paths. Only batch (seq_len) and aligned_seq_len
-                # (align64(seq_len)) are runtime. K/V bases are sourced from the
-                # per-layer KV GPR (kv_addr — the identical gpr-address path the
-                # decoder fold uses); Q/OUT/bias bases are layer-invariant scratch
-                # (const_addr); the 1/sqrt(head_dim) scale from gpr_attn_scale.
-                for g in range(self.group_size):
-                    head_slot = self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes
-                    flash_attention_result = self.unified_attention_core(
-                        batch=seq_len,
-                        # aligned_seq_len is the compile-time MAX per-head aligned KV
-                        # length (per_head_rows = align64(PREFILL_MAX_SEQ_LEN)); it sizes
-                        # the core's scratch sub-buffers (Vᵀ / score / scaled_q) so they
-                        # never overlap at any runtime length. The real KV length is
-                        # primed into gpr_aligned_seq_len at run time (dynamic path), and
-                        # the caller owns the SCRATCH buffer (LAYER0_FLASH_SCRATCH_DRAM,
-                        # sized for the max). Keeping this at the per-head max (not the
-                        # duplicated q_seq_len) is what makes the reserved scratch and the
-                        # reported attention FLOPs match the compact per-head shapes.
-                        aligned_seq_len=per_head_rows,
-                        head_dim=self.head_dim,
-                        Q_DRAM_ADDR=head_slot,
-                        K_DRAM_ADDR=self.LAYER0_K_ROPE_DRAM,
-                        V_DRAM_ADDR=self.LAYER0_V_DRAM,
-                        BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                        OUTPUT_DRAM_ADDR=head_slot,
-                        SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                        IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                        gpr_batch_reg=self.gpr_seq_len,
-                        gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
-                        gpr_q_addr=const_addr(head_slot, gpr_scratch_a),
-                        gpr_k_addr=kv_addr(self.LAYER0_K_ROPE_DRAM, gpr_scratch_b),
-                        gpr_v_addr=kv_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
-                        gpr_bias_addr=const_addr(self.LAYER0_FLASH_BIAS_DRAM, gpr_scratch_d),
-                        gpr_out_addr=const_addr(head_slot, gpr_scratch_e),
-                        gpr_scale_reg=gpr_attn_scale,
-                    )
-                    total_flops += flash_attention_result or 0
-                # head-major OUT -> token-major FLASH_OUTPUT for the O projection.
-                for g in range(self.group_size):
-                    self._emit_strided_copy_pbi(
-                        self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes,    # head-major head g
-                        self.LAYER0_FLASH_OUTPUT_DRAM + g * head_bytes,   # token-major head g
-                        self.head_dim,
-                        head_bytes,                                       # head-major contiguous
-                        self.group_size * head_bytes,                     # token-major row stride
-                        seq_len, self.gpr_seq_len)
+            # head_dim is a model constant, so it is kept BAKED (no gpr_head_dim_reg)
+            # — the V transpose and Q pre-scale then take their validated
+            # dynamic-M / N-baked paths. Only batch (seq_len) and aligned_seq_len
+            # (align64(seq_len)) are runtime. K/V bases are sourced from the
+            # per-layer KV GPR (kv_addr — the identical gpr-address path the
+            # decoder fold uses); Q/OUT/bias bases are layer-invariant scratch
+            # (const_addr); the 1/sqrt(head_dim) scale from gpr_attn_scale.
+            for g in range(self.group_size):
+                head_slot = self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes
+                flash_attention_result = self.unified_attention_core(
+                    batch=seq_len,
+                    # aligned_seq_len is the compile-time MAX per-head aligned KV
+                    # length (per_head_rows = align64(PREFILL_MAX_SEQ_LEN)); it sizes
+                    # the core's scratch sub-buffers (Vᵀ / score / scaled_q) so they
+                    # never overlap at any runtime length. The real KV length is
+                    # primed into gpr_aligned_seq_len at run time (dynamic path), and
+                    # the caller owns the SCRATCH buffer (LAYER0_FLASH_SCRATCH_DRAM,
+                    # sized for the max). Keeping this at the per-head max (not the
+                    # duplicated q_seq_len) is what makes the reserved scratch and the
+                    # reported attention FLOPs match the compact per-head shapes.
+                    aligned_seq_len=per_head_rows,
+                    head_dim=self.head_dim,
+                    Q_DRAM_ADDR=head_slot,
+                    K_DRAM_ADDR=self.LAYER0_K_ROPE_DRAM,
+                    V_DRAM_ADDR=self.LAYER0_V_DRAM,
+                    BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                    OUTPUT_DRAM_ADDR=head_slot,
+                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                    gpr_batch_reg=self.gpr_seq_len,
+                    gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                    gpr_q_addr=const_addr(head_slot, gpr_scratch_a),
+                    gpr_k_addr=kv_addr(self.LAYER0_K_ROPE_DRAM, gpr_scratch_b),
+                    gpr_v_addr=kv_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
+                    gpr_bias_addr=const_addr(self.LAYER0_FLASH_BIAS_DRAM, gpr_scratch_d),
+                    gpr_out_addr=const_addr(head_slot, gpr_scratch_e),
+                    gpr_scale_reg=gpr_attn_scale,
+                )
+                total_flops += flash_attention_result or 0
+            # head-major OUT -> token-major FLASH_OUTPUT for the O projection.
+            for g in range(self.group_size):
+                self._emit_strided_copy_pbi(
+                    self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes,    # head-major head g
+                    self.LAYER0_FLASH_OUTPUT_DRAM + g * head_bytes,   # token-major head g
+                    self.head_dim,
+                    head_bytes,                                       # head-major contiguous
+                    self.group_size * head_bytes,                     # token-major row stride
+                    seq_len, self.gpr_seq_len)
             total_flops += prefill_projection_core(
                 M=seq_len,
                 K=self.head_dim * self.group_size,
@@ -1235,36 +1191,35 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 gpr_out_addr=const_addr(self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, gpr_scratch_c),
                 gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE, gpr_scratch_d),
             )
-            if engine_master:
-                total_flops += fold_rms(
-                    seq_len, self.vector_length,
-                    self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, self.LAYER0_POST_ATTN_NORM_DRAM, self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA,
-                    self.gpr_seq_len,
-                    const_addr(self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, gpr_scratch_a),
-                    const_addr(self.LAYER0_POST_ATTN_NORM_DRAM, gpr_scratch_b),
-                    layer_addr(self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA, gpr_scratch_c),
-                )
-                total_flops += self.eltwise_core_dram(
-                    seq_len,
-                    self.vector_length,
-                    self.LAYER0_INPUT_DRAM,
-                    self.LAYER0_POST_ATTN_NORM_DRAM,
-                    self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                    UE_MODE.ELTWISE_ADD,
-                    gpr_M_reg=self.gpr_seq_len,
-                    gpr_N_reg=gpr_dim_vector_length,
-                    gpr_a_addr=const_addr(self.LAYER0_INPUT_DRAM, gpr_scratch_a),
-                    gpr_b_addr=const_addr(self.LAYER0_POST_ATTN_NORM_DRAM, gpr_scratch_b),
-                    gpr_out_addr=const_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, gpr_scratch_c),
-                )
-                total_flops += fold_rms(
-                    seq_len, self.vector_length,
-                    self.LAYER0_POST_ATTN_RESIDUAL_DRAM, self.LAYER0_PRE_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA,
-                    self.gpr_seq_len,
-                    const_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, gpr_scratch_a),
-                    const_addr(self.LAYER0_PRE_MLP_NORM_DRAM, gpr_scratch_b),
-                    layer_addr(self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA, gpr_scratch_c),
-                )
+            total_flops += fold_rms(
+                seq_len, self.vector_length,
+                self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, self.LAYER0_POST_ATTN_NORM_DRAM, self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA,
+                self.gpr_seq_len,
+                const_addr(self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, gpr_scratch_a),
+                const_addr(self.LAYER0_POST_ATTN_NORM_DRAM, gpr_scratch_b),
+                layer_addr(self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA, gpr_scratch_c),
+            )
+            total_flops += self.eltwise_core_dram(
+                seq_len,
+                self.vector_length,
+                self.LAYER0_INPUT_DRAM,
+                self.LAYER0_POST_ATTN_NORM_DRAM,
+                self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                UE_MODE.ELTWISE_ADD,
+                gpr_M_reg=self.gpr_seq_len,
+                gpr_N_reg=gpr_dim_vector_length,
+                gpr_a_addr=const_addr(self.LAYER0_INPUT_DRAM, gpr_scratch_a),
+                gpr_b_addr=const_addr(self.LAYER0_POST_ATTN_NORM_DRAM, gpr_scratch_b),
+                gpr_out_addr=const_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, gpr_scratch_c),
+            )
+            total_flops += fold_rms(
+                seq_len, self.vector_length,
+                self.LAYER0_POST_ATTN_RESIDUAL_DRAM, self.LAYER0_PRE_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA,
+                self.gpr_seq_len,
+                const_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, gpr_scratch_a),
+                const_addr(self.LAYER0_PRE_MLP_NORM_DRAM, gpr_scratch_b),
+                layer_addr(self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA, gpr_scratch_c),
+            )
             total_flops += prefill_projection_core(
                 M=seq_len,
                 K=self.vector_length,
@@ -1302,23 +1257,22 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 gpr_out_addr=const_addr(self.LAYER0_MLP_UP_DRAM, gpr_scratch_c),
                 gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_UP_SCALE, gpr_scratch_d),
             )
-            if engine_master:
-                # BF16 multiply of [seq_len, mlp_elements] tensors in DRAM; tiles inside
-                # eltwise_core_dram so large prefill (up through model.prefill_max_seq_len, 64-aligned
-                # with flash attn) is not limited by staging full tensors in flat URAM.
-                total_flops += self.eltwise_core_dram(
-                    seq_len,
-                    self.mlp_elements,
-                    self.LAYER0_MLP_GATE_DRAM,
-                    self.LAYER0_MLP_UP_DRAM,
-                    self.LAYER0_MLP_MULT_DRAM,
-                    UE_MODE.ELTWISE_MUL,
-                    gpr_M_reg=self.gpr_seq_len,
-                    gpr_N_reg=gpr_dim_mlp_elements,
-                    gpr_a_addr=const_addr(self.LAYER0_MLP_GATE_DRAM, gpr_scratch_a),
-                    gpr_b_addr=const_addr(self.LAYER0_MLP_UP_DRAM, gpr_scratch_b),
-                    gpr_out_addr=const_addr(self.LAYER0_MLP_MULT_DRAM, gpr_scratch_c),
-                )
+            # BF16 multiply of [seq_len, mlp_elements] tensors in DRAM; tiles inside
+            # eltwise_core_dram so large prefill (up through model.prefill_max_seq_len, 64-aligned
+            # with flash attn) is not limited by staging full tensors in flat URAM.
+            total_flops += self.eltwise_core_dram(
+                seq_len,
+                self.mlp_elements,
+                self.LAYER0_MLP_GATE_DRAM,
+                self.LAYER0_MLP_UP_DRAM,
+                self.LAYER0_MLP_MULT_DRAM,
+                UE_MODE.ELTWISE_MUL,
+                gpr_M_reg=self.gpr_seq_len,
+                gpr_N_reg=gpr_dim_mlp_elements,
+                gpr_a_addr=const_addr(self.LAYER0_MLP_GATE_DRAM, gpr_scratch_a),
+                gpr_b_addr=const_addr(self.LAYER0_MLP_UP_DRAM, gpr_scratch_b),
+                gpr_out_addr=const_addr(self.LAYER0_MLP_MULT_DRAM, gpr_scratch_c),
+            )
             total_flops += prefill_projection_core(
                 M=seq_len,
                 K=self.mlp_elements,
@@ -1337,28 +1291,27 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 gpr_out_addr=const_addr(self.LAYER0_MLP_DOWN_DRAM, gpr_scratch_c),
                 gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE, gpr_scratch_d),
             )
-            if engine_master:
-                total_flops += fold_rms(
-                    seq_len, self.vector_length,
-                    self.LAYER0_MLP_DOWN_DRAM, self.LAYER0_POST_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA,
-                    self.gpr_seq_len,
-                    const_addr(self.LAYER0_MLP_DOWN_DRAM, gpr_scratch_a),
-                    const_addr(self.LAYER0_POST_MLP_NORM_DRAM, gpr_scratch_b),
-                    layer_addr(self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA, gpr_scratch_c),
-                )
-                total_flops += self.eltwise_core_dram(
-                    seq_len,
-                    self.vector_length,
-                    self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                    self.LAYER0_POST_MLP_NORM_DRAM,
-                    self.LAYER0_INPUT_DRAM,
-                    UE_MODE.ELTWISE_ADD,
-                    gpr_M_reg=self.gpr_seq_len,
-                    gpr_N_reg=gpr_dim_vector_length,
-                    gpr_a_addr=const_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, gpr_scratch_a),
-                    gpr_b_addr=const_addr(self.LAYER0_POST_MLP_NORM_DRAM, gpr_scratch_b),
-                    gpr_out_addr=const_addr(self.LAYER0_INPUT_DRAM, gpr_scratch_c),
-                )
+            total_flops += fold_rms(
+                seq_len, self.vector_length,
+                self.LAYER0_MLP_DOWN_DRAM, self.LAYER0_POST_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA,
+                self.gpr_seq_len,
+                const_addr(self.LAYER0_MLP_DOWN_DRAM, gpr_scratch_a),
+                const_addr(self.LAYER0_POST_MLP_NORM_DRAM, gpr_scratch_b),
+                layer_addr(self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA, gpr_scratch_c),
+            )
+            total_flops += self.eltwise_core_dram(
+                seq_len,
+                self.vector_length,
+                self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                self.LAYER0_POST_MLP_NORM_DRAM,
+                self.LAYER0_INPUT_DRAM,
+                UE_MODE.ELTWISE_ADD,
+                gpr_M_reg=self.gpr_seq_len,
+                gpr_N_reg=gpr_dim_vector_length,
+                gpr_a_addr=const_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, gpr_scratch_a),
+                gpr_b_addr=const_addr(self.LAYER0_POST_MLP_NORM_DRAM, gpr_scratch_b),
+                gpr_out_addr=const_addr(self.LAYER0_INPUT_DRAM, gpr_scratch_c),
+            )
 
             # Advance the running per-layer offsets by one layer stride for the NEXT iteration.
             # Done here at the end (not the top) so iteration i reads layer i: the offsets hold
@@ -1395,15 +1348,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         else:
             for layer_idx in range(layer_size):
                 layer_off = layer_idx * LAYER_WEIGHT_SIZE
-                if engine_master:
-                    total_flops += self.rms_norm_core_dram(
-                        M=seq_len,
-                        N=self.vector_length,
-                        A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
-                        GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
-                        gpr_M_reg=None,
-                    )
+                total_flops += self.rms_norm_core_dram(
+                    M=seq_len,
+                    N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                    GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
+                    gpr_M_reg=None,
+                )
                 # Dual-engine PBI matmul sharding is only partially wired; full validation is TBD.
                 total_flops += prefill_projection_core(
                     M=seq_len,
@@ -1442,95 +1394,94 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
                 )
                 # TODO: OUTPUT_DRAM_ADDR=temp addr. Then memcpy from temp addr to self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
-                if engine_master:
-                    total_flops += self.rms_norm_core_dram(
-                        M=seq_len,
-                        N=self.head_dim,
-                        A_DRAM_ADDR=self.LAYER0_K_DRAM,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_K_NORM_DRAM,
-                        GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_NORM_GAMMA + layer_off,
-                        gpr_M_reg=None,
-                    )
-                    total_flops += self.rms_norm_core_dram(
-                        M=seq_len * self.group_size,
-                        N=self.head_dim,
-                        A_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_Q_NORM_DRAM,
-                        GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA + layer_off,
-                        gpr_M_reg=None,
-                    )
+                total_flops += self.rms_norm_core_dram(
+                    M=seq_len,
+                    N=self.head_dim,
+                    A_DRAM_ADDR=self.LAYER0_K_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_K_NORM_DRAM,
+                    GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_NORM_GAMMA + layer_off,
+                    gpr_M_reg=None,
+                )
+                total_flops += self.rms_norm_core_dram(
+                    M=seq_len * self.group_size,
+                    N=self.head_dim,
+                    A_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_Q_NORM_DRAM,
+                    GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA + layer_off,
+                    gpr_M_reg=None,
+                )
 
-                    # ROPE weights are shared between layers
-                    # TODO: need to enumerate the two cases (global and local) and use jump_abs to switch between them
-                    ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers else self.DRAM_ADDR_ROPE_LOCAL
-                    total_flops += self.rope_hf_core_dram(
-                        M=seq_len,
-                        N=self.head_dim,
-                        input_dram_addr=self.LAYER0_K_NORM_DRAM,
-                        output_dram_addr=self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
-                        cos_dram_addr=ROPE_WEIGHT_ADDR,
-                        sin_dram_addr=ROPE_WEIGHT_ADDR + self.head_dim * self.bytes_per_element,
-                        gpr_M_reg=None,
-                    )
-                    # TODO: output_dram_addr= fixed dram addr, then memcpy from temp addr to self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
-                    total_flops += self.rope_hf_core_dram_gqa(
-                        M=seq_len,
-                        group_size=self.group_size,
-                        N=self.head_dim,
-                        input_dram_addr=self.LAYER0_Q_NORM_DRAM,
-                        output_dram_addr=self.LAYER0_FLASH_Q_DRAM,
-                        cos_dram_addr=ROPE_WEIGHT_ADDR,
-                        sin_dram_addr=ROPE_WEIGHT_ADDR + self.head_dim * self.bytes_per_element,
-                        gpr_M_reg=None,
-                    )
+                # ROPE weights are shared between layers
+                # TODO: need to enumerate the two cases (global and local) and use jump_abs to switch between them
+                ROPE_WEIGHT_ADDR = self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers else self.DRAM_ADDR_ROPE_LOCAL
+                total_flops += self.rope_hf_core_dram(
+                    M=seq_len,
+                    N=self.head_dim,
+                    input_dram_addr=self.LAYER0_K_NORM_DRAM,
+                    output_dram_addr=self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
+                    cos_dram_addr=ROPE_WEIGHT_ADDR,
+                    sin_dram_addr=ROPE_WEIGHT_ADDR + self.head_dim * self.bytes_per_element,
+                    gpr_M_reg=None,
+                )
+                # TODO: output_dram_addr= fixed dram addr, then memcpy from temp addr to self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size,
+                total_flops += self.rope_hf_core_dram_gqa(
+                    M=seq_len,
+                    group_size=self.group_size,
+                    N=self.head_dim,
+                    input_dram_addr=self.LAYER0_Q_NORM_DRAM,
+                    output_dram_addr=self.LAYER0_FLASH_Q_DRAM,
+                    cos_dram_addr=ROPE_WEIGHT_ADDR,
+                    sin_dram_addr=ROPE_WEIGHT_ADDR + self.head_dim * self.bytes_per_element,
+                    gpr_M_reg=None,
+                )
 
-                    # ---- Proper GQA (legacy static-unrolled path) ----
-                    # Same correctness fix as the folded path: no K/V duplication.
-                    # seq_len is a compile-time constant here (legacy bakes it), so
-                    # the per-head permutes + attention use static addresses and the
-                    # static (Python-unrolled) copy helper — no ISA loops, matching
-                    # the legacy path's loop-free style. Q token-major -> head-major
-                    # into freed FLASH_K per-head slots; one attention per head over
-                    # the compact per-layer K/V; head-major OUT permuted back to
-                    # token-major FLASH_OUTPUT for the O projection.
-                    head_bytes = self.head_dim * self.bytes_per_element
-                    per_head_rows = ((self.PREFILL_MAX_SEQ_LEN + 63) // 64) * 64
-                    qhm_head_bytes = per_head_rows * head_bytes
-                    k_cache_base = self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
-                    v_cache_base = self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
-                    for g in range(self.group_size):
-                        self._emit_strided_copy_static(
-                            self.LAYER0_FLASH_Q_DRAM + g * head_bytes,
-                            self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes,
-                            self.head_dim,
-                            self.group_size * head_bytes,
-                            head_bytes,
-                            seq_len)
-                    for g in range(self.group_size):
-                        head_slot = self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes
-                        flash_attention_result = self.unified_attention_core(
-                            batch=seq_len,
-                            aligned_seq_len=aligned_seq_len,
-                            head_dim=self.head_dim,
-                            Q_DRAM_ADDR=head_slot,
-                            K_DRAM_ADDR=k_cache_base,
-                            V_DRAM_ADDR=v_cache_base,
-                            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                            OUTPUT_DRAM_ADDR=head_slot,
-                            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                            gpr_batch_reg=None,
-                            gpr_aligned_seq_len_reg=None,
-                        )
-                        total_flops += flash_attention_result or 0
-                    for g in range(self.group_size):
-                        self._emit_strided_copy_static(
-                            self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes,
-                            self.LAYER0_FLASH_OUTPUT_DRAM + g * head_bytes,
-                            self.head_dim,
-                            head_bytes,
-                            self.group_size * head_bytes,
-                            seq_len)
+                # ---- Proper GQA (legacy static-unrolled path) ----
+                # Same correctness fix as the folded path: no K/V duplication.
+                # seq_len is a compile-time constant here (legacy bakes it), so
+                # the per-head permutes + attention use static addresses and the
+                # static (Python-unrolled) copy helper — no ISA loops, matching
+                # the legacy path's loop-free style. Q token-major -> head-major
+                # into freed FLASH_K per-head slots; one attention per head over
+                # the compact per-layer K/V; head-major OUT permuted back to
+                # token-major FLASH_OUTPUT for the O projection.
+                head_bytes = self.head_dim * self.bytes_per_element
+                per_head_rows = ((self.PREFILL_MAX_SEQ_LEN + 63) // 64) * 64
+                qhm_head_bytes = per_head_rows * head_bytes
+                k_cache_base = self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
+                v_cache_base = self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
+                for g in range(self.group_size):
+                    self._emit_strided_copy_static(
+                        self.LAYER0_FLASH_Q_DRAM + g * head_bytes,
+                        self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes,
+                        self.head_dim,
+                        self.group_size * head_bytes,
+                        head_bytes,
+                        seq_len)
+                for g in range(self.group_size):
+                    head_slot = self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes
+                    flash_attention_result = self.unified_attention_core(
+                        batch=seq_len,
+                        aligned_seq_len=aligned_seq_len,
+                        head_dim=self.head_dim,
+                        Q_DRAM_ADDR=head_slot,
+                        K_DRAM_ADDR=k_cache_base,
+                        V_DRAM_ADDR=v_cache_base,
+                        BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                        OUTPUT_DRAM_ADDR=head_slot,
+                        SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                        IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                        gpr_batch_reg=None,
+                        gpr_aligned_seq_len_reg=None,
+                    )
+                    total_flops += flash_attention_result or 0
+                for g in range(self.group_size):
+                    self._emit_strided_copy_static(
+                        self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes,
+                        self.LAYER0_FLASH_OUTPUT_DRAM + g * head_bytes,
+                        self.head_dim,
+                        head_bytes,
+                        self.group_size * head_bytes,
+                        seq_len)
                 total_flops += prefill_projection_core(
                     M=seq_len,
                     K=self.head_dim * self.group_size,
@@ -1543,32 +1494,31 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     data_type=TYPE.IF8,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
                 )
-                if engine_master:
-                    total_flops += self.rms_norm_core_dram(
-                        M=seq_len,
-                        N=self.vector_length,
-                        A_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_POST_ATTN_NORM_DRAM,
-                        GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA + layer_off,
-                        gpr_M_reg=None,
-                    )
-                    total_flops += self.eltwise_core_dram(
-                        seq_len,
-                        self.vector_length,
-                        self.LAYER0_INPUT_DRAM,
-                        self.LAYER0_POST_ATTN_NORM_DRAM,
-                        self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                        UE_MODE.ELTWISE_ADD,
-                        gpr_M_reg=None,
-                    )
-                    total_flops += self.rms_norm_core_dram(
-                        M=seq_len,
-                        N=self.vector_length,
-                        A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
-                        GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
-                        gpr_M_reg=None,
-                    )
+                total_flops += self.rms_norm_core_dram(
+                    M=seq_len,
+                    N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_POST_ATTN_NORM_DRAM,
+                    GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA + layer_off,
+                    gpr_M_reg=None,
+                )
+                total_flops += self.eltwise_core_dram(
+                    seq_len,
+                    self.vector_length,
+                    self.LAYER0_INPUT_DRAM,
+                    self.LAYER0_POST_ATTN_NORM_DRAM,
+                    self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                    UE_MODE.ELTWISE_ADD,
+                    gpr_M_reg=None,
+                )
+                total_flops += self.rms_norm_core_dram(
+                    M=seq_len,
+                    N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                    GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
+                    gpr_M_reg=None,
+                )
                 total_flops += prefill_projection_core(
                     M=seq_len,
                     K=self.vector_length,
@@ -1594,19 +1544,18 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     data_type=TYPE.IF8,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
                 )
-                if engine_master:
-                    # BF16 multiply of [seq_len, mlp_elements] tensors in DRAM; tiles inside
-                    # eltwise_core_dram so large prefill (up through model.prefill_max_seq_len, 64-aligned
-                    # with flash attn) is not limited by staging full tensors in flat URAM.
-                    total_flops += self.eltwise_core_dram(
-                        seq_len,
-                        self.mlp_elements,
-                        self.LAYER0_MLP_GATE_DRAM,
-                        self.LAYER0_MLP_UP_DRAM,
-                        self.LAYER0_MLP_MULT_DRAM,
-                        UE_MODE.ELTWISE_MUL,
-                        gpr_M_reg=None,
-                    )
+                # BF16 multiply of [seq_len, mlp_elements] tensors in DRAM; tiles inside
+                # eltwise_core_dram so large prefill (up through model.prefill_max_seq_len, 64-aligned
+                # with flash attn) is not limited by staging full tensors in flat URAM.
+                total_flops += self.eltwise_core_dram(
+                    seq_len,
+                    self.mlp_elements,
+                    self.LAYER0_MLP_GATE_DRAM,
+                    self.LAYER0_MLP_UP_DRAM,
+                    self.LAYER0_MLP_MULT_DRAM,
+                    UE_MODE.ELTWISE_MUL,
+                    gpr_M_reg=None,
+                )
                 total_flops += prefill_projection_core(
                     M=seq_len,
                     K=self.mlp_elements,
@@ -1619,24 +1568,23 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     data_type=TYPE.IF8,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
                 )
-                if engine_master:
-                    total_flops += self.rms_norm_core_dram(
-                        M=seq_len,
-                        N=self.vector_length,
-                        A_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_POST_MLP_NORM_DRAM,
-                        GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off,
-                        gpr_M_reg=None,
-                    )
-                    total_flops += self.eltwise_core_dram(
-                        seq_len,
-                        self.vector_length,
-                        self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
-                        self.LAYER0_POST_MLP_NORM_DRAM,
-                        self.LAYER0_INPUT_DRAM,
-                        UE_MODE.ELTWISE_ADD,
-                        gpr_M_reg=None,
-                    )
+                total_flops += self.rms_norm_core_dram(
+                    M=seq_len,
+                    N=self.vector_length,
+                    A_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_POST_MLP_NORM_DRAM,
+                    GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off,
+                    gpr_M_reg=None,
+                )
+                total_flops += self.eltwise_core_dram(
+                    seq_len,
+                    self.vector_length,
+                    self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
+                    self.LAYER0_POST_MLP_NORM_DRAM,
+                    self.LAYER0_INPUT_DRAM,
+                    UE_MODE.ELTWISE_ADD,
+                    gpr_M_reg=None,
+                )
         # NOTE: gpr_seq_len holds the current token position and is primed by the runtime preamble.
         # K/V and RoPE DRAM offsets are derived at runtime via MUL_IMM(gpr_seq_len, stride) + ADD_IMM(base).
         self.generate_instruction_halt()
@@ -2272,7 +2220,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "checkpoints": checkpoints,
         }
 
-    def compile_gemma3(self, layer_size: int = 26, use_pbi: bool = False, slave_engine = None, profile: bool = False, bin_reuse: bool = False) -> None:
+    def compile_gemma3(self, layer_size: int = 26, use_pbi: bool = False, profile: bool = False, bin_reuse: bool = False) -> None:
         """Compile a single prefill program (seq_len-agnostic) and one decoder program into a
         combined instruction image.
 
@@ -2394,31 +2342,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         }
         if profile:
             metadata["decoder_profile_checkpoints"] = decoder_program["checkpoints"]
-
-        if slave_engine is not None:
-            # Dual-engine slave compiles the same single prefill program.
-            slave_engine.clear_inst_id()
-            slave_engine.start_capture()
-            slave_prefill_prog = slave_engine._compile_prefill_program(
-                prefill_seq_len=prefill_seq_len, layer_size=layer_size, use_pbi=use_pbi
-            )
-            slave_engine.stop_capture()
-            slave_bin_path = os.path.join(self.script_dir, "gemma3_if8_bin", "prefill_program_slave.bin")
-            slave_program_bytes = bytearray()
-            for inst in slave_engine.capture_buffer:
-                slave_program_bytes.extend(inst.get_bytes())
-            assert len(slave_program_bytes) % 64 == 0, (
-                "slave prefill instruction image must be 64-byte aligned"
-            )
-            with open(slave_bin_path, "wb") as f:
-                f.write(slave_program_bytes)
-            slave_engine.clear_capture_buffer()
-            slave_prefill_addr = slave_engine.get_program_dram_addr()
-            metadata["dual_engine_slave_prefill"] = {
-                "bin_path": os.path.relpath(slave_bin_path, self.script_dir),
-                "start_addr": f"0x{slave_prefill_addr:X}",
-                "flops": slave_prefill_prog["flops"],
-            }
 
         with open(instruction_meta_path, "w") as f:
             json.dump(metadata, f, indent=2)
@@ -2546,7 +2469,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         for name, ms in results:
             print(f"{name:<40} {ms:>8.2f}")
 
-    def run_gemma3_prefill(self, slave_engine = None, numeric: bool = False) -> dict:
+    def run_gemma3_prefill(self, numeric: bool = False) -> dict:
         """Load the unified instruction image once and run prefill only.
 
         The cached gemma3_program.bin is seq_len-agnostic; the runtime prefill_seq_len is
@@ -2597,21 +2520,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # back-of-envelope GFLOPS reporting).
         flops_prefill = flops_prefill_template * prefill_seq_len // max(template_prefill_seq_len, 1)
 
-        slave_prefill_flops = None
-        slave_prefill_addr = None
-        slave_prefill = meta.get("dual_engine_slave_prefill")
-        if slave_engine is not None and slave_prefill is not None:
-            slave_bin_path = os.path.join(self.script_dir, slave_prefill["bin_path"])
-            slave_engine.reset_program_dram_addr()
-            slave_engine.load_program_instructions_from_file(slave_bin_path)
-            slave_prefill_addr = _parse_offset(slave_prefill["start_addr"])
-            slave_prefill_flops = slave_prefill["flops"]
-
         print(f"\n--- Starting prefill (seq_len={prefill_seq_len}) ---")
         print(f"Prompt ({len(self.prefill_seq)}) tokens: {self.prefill_seq}")
         timer = time.perf_counter()
-        if slave_prefill_addr is not None:
-            slave_engine.program_execute(slave_prefill_addr, timeout=0)
 
         seq_len = prefill_seq_len
         q_seq_len = seq_len * self.group_size
@@ -2652,8 +2563,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # Execute from the preamble; preamble jumps into cached prefill, which HALTs on completion.
         latency_hw_prefill, flop_rate_hw_prefill = self.program_execute(preamble_addr, flops=flops_prefill)
         latency_prefill = time.perf_counter() - timer
-        if slave_prefill_flops is not None:
-            print(f"Dual engine prefill gflops: {((flops_prefill + slave_prefill_flops) / (latency_hw_prefill * 1e3)):.2f} GFLOPS")
         print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n")
 
         _ref_kv = None
@@ -2884,13 +2793,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "snr_v_new": snr_v_new,
         }
 
-    def run_gemma3(self, slave_engine = None, numeric: bool = False) -> dict:
+    def run_gemma3(self, numeric: bool = False) -> dict:
         """Convenience wrapper: run one prefill pass, then one decode pass against it.
 
         For repeated decode passes against the same prefill (e.g. a stability/regression loop),
         call :meth:`run_gemma3_prefill` once and :meth:`run_gemma3_decode` per iteration instead.
         """
-        ctx = self.run_gemma3_prefill(slave_engine=slave_engine, numeric=numeric)
+        ctx = self.run_gemma3_prefill(numeric=numeric)
         return self.run_gemma3_decode(ctx)
 
     def write_run_summary(self, out_path: str, args, run_result: dict, cores: int = 1,
@@ -2935,8 +2844,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         peak_toks = run_result.get("peak_tokens_per_s")
         avg_toks = run_result.get("avg_tokens_per_s")
         dec_gflops = run_result.get("decoder_gflops")
-        dec_first_ms = run_result.get("decode_first_hw_ms")
-        dec_avg_ms = run_result.get("decode_avg_hw_ms")
 
         try:
             prompt_text = self.tokenizer.decode(list(self.prefill_seq), skip_special_tokens=False)
@@ -2988,10 +2895,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         if dec_gflops is not None:
             L.append(f"- **Average FLOPS:** {dec_gflops:.2f} GFLOPS")
             L.append(f"- **Decode utilization (% peak):** {_util(dec_gflops)}")
-        if dec_first_ms is not None:
-            L.append(f"- **Decode 1st-token HW latency:** {dec_first_ms:.1f} ms/tok")
-        if dec_avg_ms is not None:
-            L.append(f"- **Decode average HW latency:** {dec_avg_ms:.1f} ms/tok")
         L.append("")
         L.append(f"## Prompt & output")
         L.append("")
@@ -3013,22 +2916,27 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         return out_path
 
 
-def gemma3_run_summary_filename(args, prefix: str = "gemma3_test_IF8") -> str:
-    """Per-run summary .md filename encoding the CLI config, e.g.
-    ``gemma3_test_IF8_xdma1_kintex7.md``. dev/device always present; other knobs
-    appended only when non-default."""
-    tokens = [args.dev]
-    if user_dma_core.HW_INFO_RAW is not None:
-        tokens.append(f"hw{user_dma_core.HW_INFO_RAW:08x}")
-    if getattr(args, "dual_engine", False):
-        tokens.append("dual-engine")
-    if getattr(args, "legacy", False):
-        tokens.append("legacy")
-    if getattr(args, "two_pass_prefill", False):
-        tokens.append("two-pass-prefill")
-    if getattr(args, "matmatmul", False):
-        tokens.append("two-pass-decoder")
-    return prefix + "_" + "_".join(str(t) for t in tokens) + ".md"
+def gemma3_run_summary_filename(args, parser, prefix: str = "gemma3_test_IF8") -> str:
+    """Per-run summary .md filename: ``gemma3_test_IF8.md`` when the script is run with no
+    arguments, plus one token per argument that was actually given (i.e. differs from
+    its default), e.g. ``gemma3_test_IF8_xdma1_legacy.md``. A store_true flag contributes its
+    flag name; a value argument contributes its value. ``--prompt`` is skipped -- its
+    value is freeform prose, not a run configuration."""
+    flag_names = {
+        a.dest: a.option_strings[0].lstrip("-")
+        for a in parser._actions if a.option_strings
+    }
+
+    def _sanitize(v):
+        return re.sub(r"[^A-Za-z0-9.-]+", "-", str(v)).strip("-")
+
+    tokens = []
+    for dest, value in vars(args).items():
+        if dest == "prompt" or value == parser.get_default(dest):
+            continue
+        tokens.append(flag_names.get(dest, dest.replace("_", "-"))
+                      if isinstance(value, bool) else _sanitize(value))
+    return prefix + ("_" + "_".join(tokens) if tokens else "") + ".md"
 
 # -----------------------------------------------------------------------------
 # Main
@@ -3246,11 +3154,6 @@ def main():
     )
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt: tokenizer encodes this to prefill_seq (overrides default)")
     parser.add_argument("--local-weights", action="store_true", help="Use gemma3_if8_bin/full_model_weights.bin instead of generated weights_gemma3_hf.bin")
-    parser.add_argument(
-        "--dual-engine",
-        action="store_true",
-        help="Dual-engine path (compile-time sharding hooks exist; PBI + dual not verified end-to-end—CLI still rejects).",
-    )
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--profile', action='store_true',
@@ -3288,23 +3191,13 @@ def main():
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
 
-    dual_engine = args.dual_engine
-    assert dual_engine == False, (
-        "Dual-engine Gemma3 PBI is not verified end-to-end yet; compile preserves sharding hooks for "
-        "future work. Re-run without --dual-engine until validation lands."
-    )
-    ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=dual_engine, legacy=args.legacy,
+    ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, legacy=args.legacy,
                               matmatmul=args.matmatmul, two_pass_prefill=args.two_pass_prefill)
     ue.set_prefill_seq(args.prompt)
 
-    if dual_engine:
-        ue2 = Gemma3_UnifiedEngine(local_weights=args.local_weights, dual_engine=True, engine_slave=True, legacy=args.legacy,
-                                   matmatmul=args.matmatmul, two_pass_prefill=args.two_pass_prefill)
-        ue2.set_prefill_seq(args.prompt)
-
     print(f"\n--- Compiling ---")
     timer = time.perf_counter()
-    ue.compile_gemma3(slave_engine=ue2 if dual_engine else None, bin_reuse=args.bin_reuse)
+    ue.compile_gemma3(bin_reuse=args.bin_reuse)
     print(f"Compile done in {time.perf_counter() - timer:.2f} seconds")
 
     if args.profile:
@@ -3316,15 +3209,14 @@ def main():
         print("Decoder profile done.")
         return
 
-    run_result = ue.run_gemma3(slave_engine=ue2 if dual_engine else None, numeric=args.numeric)
+    run_result = ue.run_gemma3(numeric=args.numeric)
     print("Gemma3 test ends.")
 
     # Per-run Markdown performance summary, named for the CLI config, written
     # next to this script (see gemma3_run_summary_filename / write_run_summary).
-    _summary_path = os.path.join(SCRIPT_DIR, gemma3_run_summary_filename(args))
+    _summary_path = os.path.join(SCRIPT_DIR, gemma3_run_summary_filename(args, parser))
     try:
-        ue.write_run_summary(_summary_path, args, run_result,
-                             cores=2 if dual_engine else 1)
+        ue.write_run_summary(_summary_path, args, run_result, cores=1)
         print(f"Wrote run summary: {_summary_path}")
     except Exception as _e:
         print(f"[warn] failed to write run summary: {_e}")
