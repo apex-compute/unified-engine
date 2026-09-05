@@ -130,6 +130,17 @@ class Gemma4LMMixin:
                     main_weight_addr=w_base + off, main_scale_addr=s_base + off,
                     K=K, N=N, layers=1, main_layer_stride=0,
                     data_type=TYPE.IF4, verbose=False)
+        # LM head: ONE op, outside the layer loop -- it runs once per token and is
+        # layer-independent. N=262144 is 4096 blocks of 64, so it splits perfectly
+        # at any engine count (32768 columns each at 8).
+        self._decode_lm_shard = None
+        if mes.can_split(self.EMBEDDING_ELEMENTS, sched.num_engines):
+            self._decode_lm_shard = sched.shard_quantized_weight(
+                name="lm_head",
+                main_weight_addr=self.DRAM_ADDR_LM_HEAD_QUANT,
+                main_scale_addr=self.DRAM_ADDR_LM_HEAD_SCALE,
+                K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+                layers=1, main_layer_stride=0, data_type=TYPE.IF4, verbose=False)
         self._decode_qkv_shards = shards
         used = sched.private_usage()
         print(f"[Decode] sharded: {len(shards)} projection(s) over "
@@ -2110,14 +2121,28 @@ class Gemma4LMMixin:
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                     OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA,
                     gpr_M_reg=gpr_one)
-                total_flops += _projection_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
-                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM,
-                    B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT,
-                    OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    is_B_quantized=True,
-                    data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE,
-                    )
+                # LM head: its own round, after the final norm has produced the
+                # input. Writeback stays ENABLED -- global_argmax() reads the
+                # candidate logits back, because each engine's argmax register
+                # reports an index into its OWN column block with no value to
+                # compare across engines.
+                _lm_sw = getattr(self, "_decode_lm_shard", None) if _dec_sched else None
+                if _lm_sw is None:
+                    total_flops += _projection_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+                        A_DRAM_ADDR=self.OUTPUT_NORM_DRAM,
+                        B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT,
+                        OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
+                        is_B_quantized=True,
+                        data_type=TYPE.IF4,
+                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE,
+                        )
+                else:
+                    _dec_sched.release()
+                    total_flops += _emit_shard(self, _lm_sw, 0, self.LOGITS_DRAM,
+                                               self.OUTPUT_NORM_DRAM)
+                    total_flops += _dec_sched.worker_flops(_lm_sw)
+                    _emit_worker_round([(_lm_sw, self.LOGITS_DRAM,
+                                         self.OUTPUT_NORM_DRAM, False)])
                 _checkpoint("lm_head")
 
             # Advance decode_pos for next token. The host's preamble only
@@ -2318,8 +2343,15 @@ class Gemma4LMMixin:
                     _w.wait_queue(300.0)
             total_latency += latency
             total_flop_rate += flop_rate_program
-            # HW argmax of the streaming LM-head logits.
-            token_id = self.get_arg_max_index()
+            # HW argmax of the streaming LM-head logits. When the head is
+            # sharded, each engine's register holds an index into ITS OWN column
+            # block and the hardware exposes no max VALUE, so the global winner is
+            # found by reading back the N candidate logits and comparing them --
+            # N tiny reads per token, not the 512 KB a full-logits readback costs.
+            _lm_sw = getattr(self, "_decode_lm_shard", None)
+            token_id = (_dec_sched.global_argmax(_lm_sw, self.LOGITS_DRAM)
+                        if _dec_sched is not None and _lm_sw is not None
+                        else self.get_arg_max_index())
             token_char = self.tokenizer.decode([token_id])
             self._set_silent(False)
 
