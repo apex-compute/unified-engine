@@ -722,6 +722,12 @@ def main():
     profiles = []          # (title, note, samples) collected across stages
 
     def _write_summary():
+        # Same tables the .md gets, echoed to the log: a profile run is usually
+        # read once, at the terminal, and having to open a file to see the
+        # result of the run you just watched is friction for no reason.
+        for title, note, results in profiles:
+            if results:
+                ue.print_profile_table(title, results, note)
         out = os.path.join(SCRIPT_DIR, summary_filename(args, cores))
         try:
             ue.write_run_summary(out, args, profiles=profiles or None)

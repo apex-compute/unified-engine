@@ -1014,8 +1014,8 @@ class Qwen25VLVisionMixin:
                         r["flops"] / 1e9, r["gflops"], r["util_pct"]))
         return out
 
-    def _print_vis_profile(self, results) -> None:
-        """Per-phase breakdown.
+    def print_profile_table(self, title, results, note=None) -> None:
+        """Per-phase breakdown, printed for any stage.
 
         Absolute times include one HALT + restart round trip per phase, so the
         SHARE column is the number to act on -- it says which phase to shard
@@ -1024,7 +1024,8 @@ class Qwen25VLVisionMixin:
         rows = self._aggregate_vis_profile(results)
         total_ms = sum(r["ms"] for r in rows) or 1.0
         peak = self.vis_peak_gflops()
-        print(f"\n  peak {peak:.1f} GFLOPS ({getattr(self, 'multi_core', 1)} core(s))")
+        self._loud(f"\n  === {title} ===" + (f"  {note}" if note else ""))
+        print(f"  peak {peak:.1f} GFLOPS ({getattr(self, 'multi_core', 1)} core(s))")
         print(f"\n  {'phase':<18}{'calls':>6}{'total ms':>10}{'share':>8}"
               f"{'GFLOP':>9}{'GFLOPS':>9}{'% peak':>9}")
         print(f"  {'-' * 69}")
@@ -1037,6 +1038,8 @@ class Qwen25VLVisionMixin:
         print(f"  {'TOTAL':<18}{len(results):>6}{total_ms:>10.1f}{100.0:>7.1f}%"
               f"{tot_gf:>9.1f}{tot_gfs:>9.1f}{(100 * tot_gfs / peak if peak else 0):>8.1f}%")
         blocked = sum(r["ms"] for r in rows if r["serial"])
+        if not blocked:
+            return
         frac = blocked / total_ms if total_ms else 0.0
         cores = getattr(self, "multi_core", 1)
         print(f"\n  * runs on core 0 only (strided-DMA permutes, pad-lane trim, "
@@ -1139,6 +1142,4 @@ class Qwen25VLVisionMixin:
         self._vis_embeddings = out
         self._vis_num_tokens = T
         self._loud(f"  [Vision] {T} image embeddings ready")
-        if profile:
-            self._print_vis_profile(self._vis_profile)
         return out

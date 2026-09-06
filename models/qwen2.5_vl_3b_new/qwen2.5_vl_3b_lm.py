@@ -349,7 +349,7 @@ class Qwen25VLLMMixin:
     def _emit_layer(self, li: int, M: int, *, decode: bool, m_reg: int,
                     aligned_kv: int, in_addr: int, out_addr: int,
                     rope_base: int, aligned_kv_reg: int = None,
-                    ckpt=None) -> int:
+                    ckpt=None, sched=None, gate_m_regs=None) -> int:
         """One decoder layer. Shared by prefill (M=seq) and decode (M=1)."""
         d = self._lm_dims()
         H, AHD, KVH, QH, G, MLP = (d["H"], d["AHD"], d["KVH"], d["QH"],
@@ -393,10 +393,46 @@ class Qwen25VLLMMixin:
             M=M, N=H, A_DRAM_ADDR=in_addr, OUTPUT_DRAM_ADDR=self.LM_PRE_NORM,
             GAMMA_DRAM_ADDR=la["ln1"], gpr_M_reg=m_reg) or 0
         ckpt(f"L{li}:norm1", flops)
-        flops += mm(H, QH * AHD, self.LM_PRE_NORM, "q", self.LM_Q, bias=la["q_bias"])
-        flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "k", self.LM_K, bias=la["k_bias"])
-        flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "v", self.LM_V,
-                    quant=False, bias=la["v_bias"])
+        if sched is None:
+            flops += mm(H, QH * AHD, self.LM_PRE_NORM, "q", self.LM_Q, bias=la["q_bias"])
+            flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "k", self.LM_K, bias=la["k_bias"])
+            flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "v", self.LM_V,
+                        quant=False, bias=la["v_bias"])
+        else:
+            # Row-shard the three projections over tokens: each engine reads its
+            # own rows of LM_PRE_NORM and writes the matching rows of Q/K/V.
+            # Weights and biases are shared read-only -- the bias is per-COLUMN
+            # (broadcast_N), so it is not sliced.
+            acc = [0]
+
+            def _qkv(ctx, la=la, acc=acc):
+                m = gate_m_regs[ctx.engine_idx]
+                for tag, n_out, out, row, quant in (
+                        ("q", QH * AHD, self.LM_Q, QH * AHD * bpe, True),
+                        ("k", KVH * AHD, self.LM_K, KVH * AHD * bpe, True),
+                        ("v", KVH * AHD, self.LM_V, KVH * AHD * bpe, False)):
+                    ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                    kw = dict(M=ctx.rows, K=H, N=n_out,
+                              A_DRAM_ADDR=ctx.rows_addr(self.LM_PRE_NORM, H * bpe),
+                              OUTPUT_DRAM_ADDR=ctx.rows_addr(out, row),
+                              C_DRAM_ADDR=la[f"{tag}_bias"],
+                              bias_mode="broadcast_N", gpr_M_reg=m)
+                    if quant:
+                        kw.update(B_DRAM_ADDR=la[f"{tag}_data"], is_B_quantized=True,
+                                  data_type=TYPE.IF4,
+                                  SCALE_DRAM_ADDR=la[f"{tag}_scale"])
+                    else:
+                        kw.update(B_DRAM_ADDR=la[f"{tag}_weight"])
+                    acc[0] += ctx.ue.matmat_mul_core(**kw) or 0
+
+            sched.sharded_region(M, _qkv)
+            flops += acc[0]
+            # ENGINE 0's row register IS gf_seq_len, and the region left it
+            # holding that engine's shard row count. Everything after here --
+            # rope, o_proj, the eltwise ops -- reads it expecting the full
+            # seq_len, so it has to be restored. (Vision never hits this because
+            # its serial ops re-prime through _prime_M on every call.)
+            self.generate_instruction_add_set(m_reg, M)
 
         ckpt = ckpt or (lambda name, f: None)
         rope_cos, rope_sin = rope_base, rope_base + AHD * bpe
@@ -546,8 +582,29 @@ class Qwen25VLLMMixin:
                                     self.LM_ATTN_RESULT, write_grouped=False,
                                     group_stride_rows=head_rows)
         ckpt(f"L{li}:attn_permute", flops)
-        flops += mm(QH * AHD, H, self.LM_ATTN_RESULT, "o", self.LM_ATTN_PROJ,
-                    quant=False)
+        if sched is None:
+            flops += mm(QH * AHD, H, self.LM_ATTN_RESULT, "o", self.LM_ATTN_PROJ,
+                        quant=False)
+        else:
+            # Same row shard as qkv: each engine takes its own tokens of the
+            # attention result and writes the matching rows of the projection.
+            # o_proj is BF16 (no .if4 bytes exist for it), so it takes the
+            # unquantized branch -- and it has no bias.
+            o_acc = [0]
+
+            def _o(ctx, la=la, o_acc=o_acc):
+                m = gate_m_regs[ctx.engine_idx]
+                ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                o_acc[0] += ctx.ue.matmat_mul_core(
+                    M=ctx.rows, K=QH * AHD, N=H,
+                    A_DRAM_ADDR=ctx.rows_addr(self.LM_ATTN_RESULT, QH * AHD * bpe),
+                    B_DRAM_ADDR=la["o_weight"],
+                    OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_ATTN_PROJ, H * bpe),
+                    gpr_M_reg=m) or 0
+
+            sched.sharded_region(M, _o)
+            flops += o_acc[0]
+            self.generate_instruction_add_set(m_reg, M)   # restore gf_seq_len
         ckpt(f"L{li}:o_proj", flops)
         flops += self.eltwise_core_dram(
             M=M, N=H, dram_a=in_addr, dram_b=self.LM_ATTN_PROJ,
@@ -558,13 +615,53 @@ class Qwen25VLLMMixin:
             OUTPUT_DRAM_ADDR=self.LM_MLP_NORM, GAMMA_DRAM_ADDR=la["ln2"],
             gpr_M_reg=m_reg) or 0
         ckpt(f"L{li}:resid+norm2", flops)
-        flops += mm(H, MLP, self.LM_MLP_NORM, "gate", self.LM_MLP_GATE, silu=True)
-        flops += mm(H, MLP, self.LM_MLP_NORM, "up", self.LM_MLP_UP)
-        flops += self.eltwise_core_dram(
-            M=M, N=MLP, dram_a=self.LM_MLP_GATE, dram_b=self.LM_MLP_UP,
-            dram_out=self.LM_MLP_MULT, mode=UE_MODE.ELTWISE_MUL,
-            gpr_M_reg=m_reg) or 0
-        flops += mm(MLP, H, self.LM_MLP_MULT, "down", self.LM_MLP_DOWN)
+        if sched is None:
+            flops += mm(H, MLP, self.LM_MLP_NORM, "gate", self.LM_MLP_GATE, silu=True)
+            flops += mm(H, MLP, self.LM_MLP_NORM, "up", self.LM_MLP_UP)
+            flops += self.eltwise_core_dram(
+                M=M, N=MLP, dram_a=self.LM_MLP_GATE, dram_b=self.LM_MLP_UP,
+                dram_out=self.LM_MLP_MULT, mode=UE_MODE.ELTWISE_MUL,
+                gpr_M_reg=m_reg) or 0
+            flops += mm(MLP, H, self.LM_MLP_MULT, "down", self.LM_MLP_DOWN)
+        else:
+            # gate -> up -> (gate*up) -> down as ONE region. Within an engine's
+            # rows the chain is strictly sequential, so only region entry and
+            # exit need a rendezvous; splitting it into four would pay three
+            # extra barriers per layer for nothing. The SwiGLU MLP has no
+            # biases, so only the activations are sliced.
+            mlp_acc = [0]
+
+            def _mlp(ctx, la=la, mlp_acc=mlp_acc):
+                m = gate_m_regs[ctx.engine_idx]
+                h_row, mlp_row = H * bpe, MLP * bpe
+                a = ctx.rows_addr(self.LM_MLP_NORM, h_row)
+                for tag, out in (("gate", self.LM_MLP_GATE), ("up", self.LM_MLP_UP)):
+                    ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                    mlp_acc[0] += ctx.ue.matmat_mul_core(
+                        M=ctx.rows, K=H, N=MLP, A_DRAM_ADDR=a,
+                        B_DRAM_ADDR=la[f"{tag}_data"], is_B_quantized=True,
+                        data_type=TYPE.IF4, SCALE_DRAM_ADDR=la[f"{tag}_scale"],
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(out, mlp_row),
+                        silu_enable=(tag == "gate"), gpr_M_reg=m) or 0
+                ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                mlp_acc[0] += ctx.ue.eltwise_core_dram(
+                    M=ctx.rows, N=MLP,
+                    dram_a=ctx.rows_addr(self.LM_MLP_GATE, mlp_row),
+                    dram_b=ctx.rows_addr(self.LM_MLP_UP, mlp_row),
+                    dram_out=ctx.rows_addr(self.LM_MLP_MULT, mlp_row),
+                    mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=m) or 0
+                ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                mlp_acc[0] += ctx.ue.matmat_mul_core(
+                    M=ctx.rows, K=MLP, N=H,
+                    A_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_MULT, mlp_row),
+                    B_DRAM_ADDR=la["down_data"], is_B_quantized=True,
+                    data_type=TYPE.IF4, SCALE_DRAM_ADDR=la["down_scale"],
+                    OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_DOWN, h_row),
+                    gpr_M_reg=m) or 0
+
+            sched.sharded_region(M, _mlp)
+            flops += mlp_acc[0]
+            self.generate_instruction_add_set(m_reg, M)   # restore gf_seq_len
         ckpt(f"L{li}:mlp_proj", flops)
         flops += self.eltwise_core_dram(
             M=M, N=H, dram_a=self.LM_RESIDUAL, dram_b=self.LM_MLP_DOWN,
@@ -643,6 +740,18 @@ class Qwen25VLLMMixin:
         flops_ref = [0]
         self._prefill_checkpoints = []
         ckpt = self._make_ckpt(profile, flops_ref, self._prefill_checkpoints)
+
+        # Prefill gets its OWN scheduler but the SAME arena as vision, so the
+        # two stages' worker programs never land on one another.
+        sched = self._ensure_stage_scheduler("prefill")
+        gate_m_regs = None
+        if sched is not None:
+            sched.begin_program()
+            # Engine 0 reuses the model's row-count register; workers are plain
+            # UnifiedEngines and allocate their own after begin_program() resets
+            # their allocator.
+            gate_m_regs = [self.gf_seq_len]
+            gate_m_regs.extend(w.alloc_isa_reg() for w in sched.workers)
         nl = d["NL"] if layer_size is None else layer_size
         for li in range(nl):
             in_addr = self.LM_IO_A if li % 2 == 0 else self.LM_IO_B
@@ -650,9 +759,14 @@ class Qwen25VLLMMixin:
             flops += self._emit_layer(
                 li, seq_len, decode=False, m_reg=m_reg, aligned_kv=aligned,
                 in_addr=in_addr, out_addr=out_addr,
-                rope_base=self.LM_ROPE_PRE, ckpt=ckpt)
+                rope_base=self.LM_ROPE_PRE, ckpt=ckpt,
+                sched=sched, gate_m_regs=gate_m_regs)
             flops_ref[0] = flops
         self.generate_instruction_halt()
+        worker_addrs = sched.finalize() if sched is not None else []
+        if sched is not None:
+            for w in reversed(sched.workers):
+                w.release_isa_reg()
         self._set_silent(prev)
         self.stop_capture()
 
@@ -660,6 +774,15 @@ class Qwen25VLLMMixin:
         for inst in self.capture_buffer:
             blob.extend(inst.get_bytes())
         self.clear_capture_buffer()
+
+        self._prefill_workers = []
+        if sched is not None:
+            for idx, (w, addr) in enumerate(zip(sched.workers, worker_addrs), start=1):
+                wb = bytearray()
+                for inst in w.capture_buffer:
+                    wb.extend(inst.get_bytes())
+                self.mc_arena.check_isa_fits(idx, addr, len(wb))
+                self._prefill_workers.append((idx, w, addr, bytes(wb)))
         self._prefill_program = (base, bytes(blob))
         self._prefill_flops = int(flops)
         self._prefill_seq_len = seq_len
@@ -767,9 +890,19 @@ class Qwen25VLLMMixin:
     # ---- execution ---------------------------------------------------------
 
     def _upload(self, program) -> int:
+        """Write a compiled program to its baked address and ADVANCE the cursor.
+
+        The advance is not bookkeeping. Leaving the cursor on the program's own
+        base means the next thing that emits a program there overwrites it --
+        and at multi-core that is preclear_flags(), which drops a small
+        flag-clearing program on every engine right before launch. The master
+        then executes whatever is left and never halts, which is exactly how
+        multi-core prefill hung while single-core was fine.
+        """
         addr, blob = program
         self._next_program_dram_addr = addr
         self.dma_write(DMA_DEVICE_H2C, addr, blob, len(blob))
+        self.allocate_program_dram(len(blob))
         return addr
 
     def run_prefill(self, tokens, image_embeddings=None, positions=None,
@@ -800,16 +933,35 @@ class Qwen25VLLMMixin:
         self.dma_to_accelerator_memory(self.LM_BIAS, bias)
 
         addr = self._upload(self._prefill_program)
+        sched = self._ensure_stage_scheduler("prefill")
+        worker_addrs = []
+        for idx, w, waddr, blob in getattr(self, "_prefill_workers", []):
+            w._next_program_dram_addr = waddr
+            w.dma_write(DMA_DEVICE_H2C, waddr, blob, len(blob))
+            w.allocate_program_dram(len(blob))
+            worker_addrs.append(waddr)
+        if sched is not None:
+            sched.preclear_flags()
         t0 = time.perf_counter()
         if profile:
             cps = getattr(self, "_prefill_checkpoints", [])
             if not cps:
                 raise RuntimeError("profiled prefill needs compile_prefill(profile=True)")
+            if sched is not None:
+                sched.start_workers(worker_addrs)
             self._prefill_profile = self._run_checkpointed(addr, cps, 180.0)
+            for w in (sched.workers if sched is not None else []):
+                w.wait_queue(180.0)
             us = sum(r[1] for r in self._prefill_profile) * 1e3
         else:
+            # Workers first: each parks on its first rendezvous until the master
+            # enters the region.
+            if sched is not None:
+                sched.start_workers(worker_addrs)
             self.start_execute_from_dram(addr)
             self.wait_queue(180.0)
+            for w in (sched.workers if sched is not None else []):
+                w.wait_queue(180.0)
             us = self.report_latency_in_us()
         # Prefill's compile-time shapes ARE what runs -- it is compiled for this
         # exact seq_len -- so the cores' FLOP sum needs no rescaling, unlike
