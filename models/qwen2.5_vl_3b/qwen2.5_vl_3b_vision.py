@@ -2,7 +2,7 @@
 """Qwen2.5-VL-3B vision-encoder method group (ViT tower with window attention).
 
 ``Qwen25VLVisionMixin`` carries the vision methods and is mixed into
-``Qwen25VL_UnifiedEngine`` in qwen2.5_vl_3b_test_new.py; it is never
+``Qwen25VL_UnifiedEngine`` in qwen2.5_vl_3b_test.py; it is never
 instantiated on its own. Everything shared -- the config on ``self._cfg``, the
 DRAM allocators, ``self._loud`` -- resolves through the concrete class, so this
 module imports nothing from the test module (keeps the split cycle-free).
@@ -12,7 +12,7 @@ WEIGHTS ARE TRANSIENT. The encoder runs exactly once, before LM prefill, so its
 weights and the LM's occupy the SAME params window at 0x8000_0000: vision loads
 first, the encoder runs, its 144 output embeddings are copied out, and the LM
 weights are then loaded over the top. Only the encoder output survives the
-handover -- see the DRAM map in qwen2.5_vl_3b_test_new.py.
+handover -- see the DRAM map in qwen2.5_vl_3b_test.py.
 """
 import json
 import math

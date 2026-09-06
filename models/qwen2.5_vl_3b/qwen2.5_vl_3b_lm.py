@@ -2,7 +2,7 @@
 """Qwen2.5-VL-3B language-model method group (36-layer GQA decoder).
 
 ``Qwen25VLLMMixin`` carries the LM methods and is mixed into
-``Qwen25VL_UnifiedEngine`` in qwen2.5_vl_3b_test_new.py; it is never
+``Qwen25VL_UnifiedEngine`` in qwen2.5_vl_3b_test.py; it is never
 instantiated on its own. Like the vision mixin it imports nothing from the
 test module, so the split stays cycle-free.
 

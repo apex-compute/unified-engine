@@ -47,9 +47,9 @@ few channels every token shares, so any two tokens point nearly the same way
 and only SNR notices the mispairing.
 
 Usage:
-  python models/qwen2.5_vl_3b_new/qwen2.5_vl_3b_numeric.py --image
-  python models/qwen2.5_vl_3b_new/qwen2.5_vl_3b_numeric.py --image people.jpg
-  python models/qwen2.5_vl_3b_new/qwen2.5_vl_3b_numeric.py --image --layers 4
+  python models/qwen2.5_vl_3b/qwen2.5_vl_3b_numeric.py --image
+  python models/qwen2.5_vl_3b/qwen2.5_vl_3b_numeric.py --image people.jpg
+  python models/qwen2.5_vl_3b/qwen2.5_vl_3b_numeric.py --image --layers 4
 """
 import argparse
 import math
@@ -68,7 +68,7 @@ import user_dma_core
 from user_dma_core import calculate_snr
 import quant_lib
 
-_qt = None          # qwen2.5_vl_3b_test_new, loaded by path (see _load)
+_qt = None          # qwen2.5_vl_3b_test, loaded by path (see _load)
 _qv = None          # qwen2.5_vl_3b_vision
 
 
@@ -76,14 +76,14 @@ def _load():
     """Import the dotted-name sibling modules by path ("2.5" is not an identifier)."""
     global _qt, _qv
     import importlib.util
-    for name, filename in (("qwen2_5_vl_3b_test_new", "qwen2.5_vl_3b_test_new.py"),):
+    for name, filename in (("qwen2_5_vl_3b_test", "qwen2.5_vl_3b_test.py"),):
         spec = importlib.util.spec_from_file_location(
             name, os.path.join(SCRIPT_DIR, filename))
         mod = importlib.util.module_from_spec(spec)
         sys.modules[name] = mod
         spec.loader.exec_module(mod)
         _qt = mod
-    _qv = sys.modules["qwen2_5_vl_3b_vision"]     # test_new loads it on import
+    _qv = sys.modules["qwen2_5_vl_3b_vision"]     # qwen2.5_vl_3b_test.py loads it on import
 
 
 # ---------------------------------------------------------------------------
