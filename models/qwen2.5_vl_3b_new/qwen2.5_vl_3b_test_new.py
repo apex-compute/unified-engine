@@ -287,6 +287,10 @@ qwen2.5_vl_3b_numeric.py.""")
     parser.add_argument("--image", type=str, nargs="?", const=DEFAULT_IMAGE, default=None,
                         help=f"VLM mode: run the vision encoder and merge image tokens into "
                              f"the prompt. Bare --image uses {os.path.basename(DEFAULT_IMAGE)}.")
+    parser.add_argument("--profile", action="store_true",
+                        help="Compile the encoder with per-phase HALT checkpoints and "
+                             "print a HW-latency breakdown by phase. Read the share "
+                             "column: it says which phase is worth sharding.")
     add_engine_args(parser)
     return parser
 
@@ -416,10 +420,20 @@ def main():
     ue.vision_tensor_init()
 
     print(f"\n--- Vision encoder compile ---")
-    ue.compile_vision_encoder()
+    ue.compile_vision_encoder(profile=args.profile)
 
     print(f"\n--- Vision encoder run ---")
-    embeddings = ue.run_vision_encoder()
+    embeddings = ue.run_vision_encoder(profile=args.profile)
+
+    if args.profile:
+        name = (f"qwen2.5_vl_3b_vision_profile_{args.dev}"
+                f"{'_multi-core_%d' % cores if cores > 1 else ''}.md")
+        out = os.path.join(SCRIPT_DIR, name)
+        try:
+            ue.write_vision_profile_summary(out, args)
+            print(f"\nWrote profile summary: {out}")
+        except Exception as exc:
+            print(f"[warn] failed to write profile summary: {exc}")
     print(f"\nEncoder output {tuple(embeddings.shape)}: "
           f"mean {embeddings.float().mean():+.4f}, std {embeddings.float().std():.4f}, "
           f"absmax {embeddings.float().abs().max():.4f}")

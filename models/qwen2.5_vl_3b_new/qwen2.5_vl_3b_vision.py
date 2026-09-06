@@ -29,7 +29,8 @@ import torch
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, TYPE, UE_MODE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS)
+    DMA_DEVICE_H2C, INSTRUCTION_SIZE_BYTES, TYPE, UE_MODE, UE_VECTOR_SIZE,
+    URAM_NEAR_FULL_ELEMENTS)
 
 # Vision matmuls are IF4-quantized; norms and biases stay BF16. Module-level so
 # a numeric harness can import it without constructing an engine.
@@ -532,9 +533,15 @@ class Qwen25VLVisionMixin:
             self.sram_to_accelerator_memory(
                 0x00000, dst_tokens + t0 * out_row * bpe, take * out_row)
 
-    def compile_vision_encoder(self) -> int:
+    def compile_vision_encoder(self, profile: bool = False) -> int:
         """Capture the whole encoder -- 32 layers + merger -- as one program at
         the ISA base. Host emission only; nothing touches the device.
+
+        ``profile``: emit a HALT at every phase boundary and record the resume
+        address, so run_vision_encoder can time each phase's HW latency
+        separately. A profile-compiled bin can ONLY be run segment-by-segment
+        (each phase ends in a HALT), and the extra stop/restart round trips
+        inflate the wall total -- read the SHARE column, not the absolute times.
 
         Returns the program's DRAM base address.
         """
@@ -569,6 +576,19 @@ class Qwen25VLVisionMixin:
         self.start_capture()
         prev_silent = self._set_silent(True)
         flops = 0
+        self._vis_checkpoints = []
+        _ckpt_flops = [0]
+
+        def _ckpt(name: str) -> None:
+            """End a profile phase: HALT, then record where to resume."""
+            if not profile:
+                return
+            self.generate_instruction_halt()
+            resume = (self.get_program_dram_addr()
+                      + self.capture_count * INSTRUCTION_SIZE_BYTES)
+            self._vis_checkpoints.append(
+                [name, resume, int(flops - _ckpt_flops[0])])
+            _ckpt_flops[0] = int(flops)
 
         def matmul(M, K, N, A, w, tag, OUT, *, silu=False, gelu=False, bias=True):
             return self.matmat_mul_core(
@@ -592,6 +612,7 @@ class Qwen25VLVisionMixin:
                 GAMMA_DRAM_ADDR=w["norm1_weight"], gpr_M_reg=self._prime_M(VS)) or 0
             flops += matmul(VS, VH, 2 * VN * VD_PAD, self.VIS_NORM_OUT, w, "qk", self.VIS_QK)
             flops += matmul(VS, VH, VN * VD_PAD, self.VIS_NORM_OUT, w, "v", self.VIS_V)
+            _ckpt(f"L{li}:norm+proj")
 
             # Token-major -> head-major. Viewing the fused QK output as
             # [VS, 2*VN, VD_PAD] makes Q's heads groups 0..VN-1 and K's heads
@@ -600,6 +621,7 @@ class Qwen25VLVisionMixin:
                                         write_grouped=True, group_stride_rows=aligned_S)
             self.bf16_permute_dram_core(VN, VS, VD_PAD, self.VIS_V, self.VIS_V_HM,
                                         write_grouped=True, group_stride_rows=aligned_S)
+            _ckpt(f"L{li}:permute_qkv")
 
             # RoPE over all heads at once; the table is tiled VN times so row
             # h*VS+t reads position t's cos/sin.
@@ -608,6 +630,7 @@ class Qwen25VLVisionMixin:
                     M=VN * VS, N=VD_PAD, input_dram_addr=buf, output_dram_addr=buf,
                     cos_dram_addr=self.VIS_ROPE_COS, sin_dram_addr=self.VIS_ROPE_SIN,
                     gpr_M_reg=self._prime_M(VN * VS)) or 0
+            _ckpt(f"L{li}:rope")
 
             bias = self.VIS_BIAS_FULL if li in FULL else self.VIS_BIAS_WINDOW
             for h in range(VN):
@@ -628,6 +651,7 @@ class Qwen25VLVisionMixin:
                 self.release_isa_reg()
                 self.release_isa_reg()
                 flops += f if isinstance(f, (int, float)) else 0
+            _ckpt(f"L{li}:attention")
 
             # Head-major -> token-major at the PADDED width (the permute core
             # requires a 64-multiple row_width, and VD=80 is not one), then drop
@@ -636,12 +660,14 @@ class Qwen25VLVisionMixin:
                                         self.VIS_ATTN_PAD, write_grouped=False,
                                         group_stride_rows=aligned_S)
             self._vis_trim_pad_lanes(self.VIS_ATTN_PAD, self.VIS_ATTN_RESULT)
+            _ckpt(f"L{li}:unpermute+trim")
             flops += matmul(VS, VH, VH, self.VIS_ATTN_RESULT, w, "o", self.VIS_O_PROJ)
 
             flops += self.eltwise_core_dram(
                 M=VS, N=VH, dram_a=IN, dram_b=self.VIS_O_PROJ,
                 dram_out=self.VIS_RESIDUAL, mode=UE_MODE.ELTWISE_ADD,
                 gpr_M_reg=self._prime_M(VS)) or 0
+            _ckpt(f"L{li}:o_proj+resid")
 
             # --- SwiGLU MLP ---
             flops += self.rms_norm_core_dram(
@@ -661,6 +687,7 @@ class Qwen25VLVisionMixin:
                 M=VS, N=VH, dram_a=self.VIS_RESIDUAL, dram_b=self.VIS_MLP_DOWN,
                 dram_out=OUT, mode=UE_MODE.ELTWISE_ADD,
                 gpr_M_reg=self._prime_M(VS)) or 0
+            _ckpt(f"L{li}:mlp")
 
         # --- merger ---
         final = self.VIS_IO_A if VL % 2 == 0 else self.VIS_IO_B
@@ -683,6 +710,7 @@ class Qwen25VLVisionMixin:
             SCALE_DRAM_ADDR=self.merger_mlp2_scale,
             C_DRAM_ADDR=self.merger_mlp2_bias, bias_mode="broadcast_N",
             gpr_M_reg=self._prime_M(T)) or 0
+        _ckpt("merger")
 
         self.generate_instruction_halt()
         self._set_silent(prev_silent)
@@ -707,7 +735,172 @@ class Qwen25VLVisionMixin:
 
     # ---- run ---------------------------------------------------------------
 
-    def run_vision_encoder(self, timeout_s: float = 600.0) -> torch.Tensor:
+    def vis_peak_gflops(self) -> float:
+        """Engine peak throughput, straight from HW_INFO.
+
+        128 flops per cycle per core: freq_MHz x 0.128 GFLOPS, times the engine
+        count in play. Same expression gemma4_e2b uses.
+
+        NOT user_dma_core.UE_PEAK_GFLOPS -- despite the name that global is
+        ``0.128 / clock_ns``, which is TFLOPS (0.047 on this board, not 46.9).
+        Using it directly reports % of peak 1000x too high.
+        """
+        clock_ns = (getattr(self, "_clock_period_ns", None)
+                    or user_dma_core.CLOCK_CYCLE_TIME_NS)
+        if not clock_ns:
+            return 0.0
+        return (1000.0 / clock_ns) * 0.128 * getattr(self, "multi_core", 1)
+
+    # Phases the multi-engine scheduler cannot row-shard: they are strided-DMA
+    # permutes, the pad-lane trim and the RoPE core, none of which are in
+    # multi_engine_shard.SHARDED_OP_ALLOWLIST. Their combined share bounds what
+    # sharding can win, so the table marks them.
+    _VIS_UNSHARDABLE = ("permute_qkv", "rope", "unpermute+trim")
+
+    def _aggregate_vis_profile(self, results):
+        """Fold per-layer samples into one row per phase, preserving order."""
+        peak = self.vis_peak_gflops()
+        agg, order = {}, []
+        for name, ms, ph_flops in results:
+            phase = name.split(":", 1)[1] if ":" in name else name
+            if phase not in agg:
+                agg[phase] = dict(phase=phase, ms=0.0, flops=0, n=0)
+                order.append(phase)
+            row = agg[phase]
+            row["ms"] += float(ms)
+            row["n"] += 1
+            row["flops"] += int(ph_flops)
+        rows = []
+        for phase in order:
+            row = agg[phase]
+            row["gflops"] = (row["flops"] / (row["ms"] * 1e6)) if row["ms"] else 0.0
+            row["util_pct"] = (100.0 * row["gflops"] / peak) if peak else 0.0
+            rows.append(row)
+        return rows
+
+    def _vis_profile_table(self, rows, total_ms):
+        """The profile table as markdown rows, shared by the terminal and the .md."""
+        out = []
+        for r in rows:
+            mark = " *" if r["phase"] in self._VIS_UNSHARDABLE else ""
+            share = 100.0 * r["ms"] / total_ms if total_ms else 0.0
+            out.append((r["phase"] + mark, r["n"], r["ms"], share,
+                        r["flops"] / 1e9, r["gflops"], r["util_pct"]))
+        return out
+
+    def _print_vis_profile(self, results) -> None:
+        """Per-phase breakdown.
+
+        Absolute times include one HALT + restart round trip per phase, so the
+        SHARE column is the number to act on -- it says which phase to shard
+        first, which is the whole reason to run this.
+        """
+        rows = self._aggregate_vis_profile(results)
+        total_ms = sum(r["ms"] for r in rows) or 1.0
+        peak = self.vis_peak_gflops()
+        print(f"\n  peak {peak:.1f} GFLOPS ({getattr(self, 'multi_core', 1)} core(s))")
+        print(f"\n  {'phase':<18}{'calls':>6}{'total ms':>10}{'share':>8}"
+              f"{'GFLOP':>9}{'GFLOPS':>9}{'% peak':>9}")
+        print(f"  {'-' * 69}")
+        for name, n, ms, share, gf, gfs, util in self._vis_profile_table(rows, total_ms):
+            print(f"  {name:<18}{n:>6}{ms:>10.1f}{share:>7.1f}%"
+                  f"{gf:>9.1f}{gfs:>9.1f}{util:>8.1f}%")
+        print(f"  {'-' * 69}")
+        tot_gf = sum(r["flops"] for r in rows) / 1e9
+        tot_gfs = tot_gf / (total_ms / 1e3) if total_ms else 0.0
+        print(f"  {'TOTAL':<18}{len(results):>6}{total_ms:>10.1f}{100.0:>7.1f}%"
+              f"{tot_gf:>9.1f}{tot_gfs:>9.1f}{(100 * tot_gfs / peak if peak else 0):>8.1f}%")
+        blocked = sum(r["ms"] for r in rows if r["phase"] in self._VIS_UNSHARDABLE)
+        frac = blocked / total_ms if total_ms else 0.0
+        print(f"\n  * not in the scheduler's shard allowlist "
+              f"(strided-DMA permutes / trim / RoPE): {100 * frac:.1f}% of HW time.")
+        print(f"    Amdahl ceiling if only the rest is sharded: "
+              f"{1.0 / (frac + (1 - frac) / 8):.2f}x at 8 cores.")
+
+    def write_vision_profile_summary(self, out_path: str, args=None) -> str:
+        """Write the profile run as markdown: HW info, then the phase table.
+
+        The table carries measured GFLOPS and % of peak per phase on top of the
+        latency split -- utilisation is what says whether a phase is worth
+        sharding (near peak: more engines help) or stalled on something else
+        (far from peak: find the stall first).
+        """
+        rows = self._aggregate_vis_profile(self._vis_profile)
+        total_ms = sum(r["ms"] for r in rows) or 1.0
+        peak = self.vis_peak_gflops()
+        cores = getattr(self, "multi_core", 1)
+        clock_ns = getattr(self, "_clock_period_ns", None) or user_dma_core.CLOCK_CYCLE_TIME_NS
+        freq_mhz = 1000.0 / clock_ns if clock_ns else 0.0
+        try:
+            hw_version = f"0x{self.user_read_reg32(user_dma_core.UE_FPGA_VERSION_ADDR) & 0xFFFFFFFF:08x}"
+        except Exception as exc:
+            hw_version = f"(read failed: {exc})"
+        d = self._vision_dims()
+        prog_bytes = len(getattr(self, "_vis_program_bytes", b""))
+        weight_mib = (getattr(self, "_vis_weight_end", 0)
+                      - getattr(self, "_vis_weight_start", 0)) / 2**20
+
+        L = [
+            "# qwen2.5_vl_3b vision encoder — profile summary",
+            "",
+            "## Hardware",
+            "",
+            f"- **HW version:** {hw_version}",
+            f"- **Device:** {getattr(args, 'dev', 'xdma0')}",
+            f"- **Clock:** {clock_ns:.4f} ns ({freq_mhz:.1f} MHz)",
+            f"- **AXI data width:** {user_dma_core.UE_AXI_DATA_WIDTH_BITS} bits",
+            f"- **DRAM:** {user_dma_core.AVAILABLE_DRAM_SIZE_GB} GiB",
+            f"- **Cores in use (--multi-core):** {cores}"
+            f" of {user_dma_core.ANDROMEDA_CORE_COUNT} reported",
+            f"- **Peak throughput:** {peak:.1f} GFLOPS "
+            f"({freq_mhz:.1f} MHz x 128 x {cores} core(s))",
+            "",
+            "## Encoder",
+            "",
+            f"- **Image:** `{os.path.basename(getattr(args, 'image', '') or '')}` "
+            f"-> {d['VS']} patches -> {d['NUM_MERGED_TOKENS']} tokens",
+            f"- **Layers:** {d['VL']} (full attention at "
+            f"{sorted(d['FULL_ATTN_LAYERS'])}, block-diagonal window mask elsewhere)",
+            f"- **Weights:** {weight_mib:.1f} MiB IF4 at "
+            f"0x{getattr(self, '_vis_weight_start', 0):X}",
+            f"- **Program image:** {prog_bytes / 2**20:.2f} MiB "
+            f"({prog_bytes // INSTRUCTION_SIZE_BYTES:,} instructions)",
+            f"- **Tensor DRAM:** {self.get_tensor_dram_usage() / 2**20:.1f} MiB",
+            "",
+            "## Per-phase profile",
+            "",
+            "Phase latencies come from the HW counter between per-phase HALTs, so "
+            "they exclude host time but include one stop/restart per phase "
+            "(~0.1 s over the whole run).",
+            "",
+            "| phase | calls | total ms | share | GFLOP | GFLOPS | % of peak |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for name, n, ms, share, gf, gfs, util in self._vis_profile_table(rows, total_ms):
+            L.append(f"| {name} | {n} | {ms:.1f} | {share:.1f}% | "
+                     f"{gf:.1f} | {gfs:.1f} | {util:.1f}% |")
+        tot_gf = sum(r["flops"] for r in rows) / 1e9
+        tot_gfs = tot_gf / (total_ms / 1e3) if total_ms else 0.0
+        L.append(f"| **TOTAL** | {len(self._vis_profile)} | {total_ms:.1f} | 100.0% | "
+                 f"{tot_gf:.1f} | {tot_gfs:.1f} | "
+                 f"{(100 * tot_gfs / peak if peak else 0):.1f}% |")
+
+        blocked = sum(r["ms"] for r in rows if r["phase"] in self._VIS_UNSHARDABLE)
+        frac = blocked / total_ms if total_ms else 0.0
+        L += [
+            "",
+            f"`*` marks phases outside `multi_engine_shard.SHARDED_OP_ALLOWLIST` "
+            f"(strided-DMA permutes, the pad-lane trim, the RoPE core). They are "
+            f"**{100 * frac:.1f}%** of HW time, so sharding everything else gives an "
+            f"Amdahl ceiling of **{1.0 / (frac + (1 - frac) / 8):.2f}x** at 8 cores.",
+            "",
+        ]
+        with open(out_path, "w") as f:
+            f.write("\n".join(L))
+        return out_path
+
+    def run_vision_encoder(self, timeout_s: float = 600.0,
+                           profile: bool = False) -> torch.Tensor:
         """Upload the queued inputs and the program, execute, and return the
         [NUM_MERGED_TOKENS, out_hidden_size] embeddings in raster order."""
         if not hasattr(self, "_vis_program_bytes"):
@@ -726,12 +919,32 @@ class Qwen25VLVisionMixin:
         self.allocate_program_dram(len(self._vis_program_bytes))
 
         self._loud(f"  [Vision] launching encoder "
-                   f"({len(self._vis_program_bytes) / 2**20:.2f} MiB) at 0x{addr:X} ...")
+                   f"({len(self._vis_program_bytes) / 2**20:.2f} MiB) at 0x{addr:X}"
+                   f"{' [profiled]' if profile else ''} ...")
         t0 = time.perf_counter()
-        self.start_execute_from_dram(addr)
-        self.wait_queue(timeout_s)
+        if profile:
+            checkpoints = getattr(self, "_vis_checkpoints", [])
+            if not checkpoints:
+                raise RuntimeError(
+                    "profile run needs a profile-compiled bin; call "
+                    "compile_vision_encoder(profile=True) first")
+            # Each phase ends in a HALT, so the encoder is driven forward one
+            # segment at a time. It still computes the full output -- the
+            # segments tile the whole program.
+            results = []
+            self.start_execute_from_dram(addr)
+            for name, resume, ph_flops in checkpoints:
+                self.wait_queue(timeout_s)
+                results.append((name, self.report_latency_in_us() / 1e3, ph_flops))
+                self.start_execute_from_dram(resume)
+            self.wait_queue(timeout_s)
+            latency_us = sum(r[1] for r in results) * 1e3
+            self._vis_profile = results
+        else:
+            self.start_execute_from_dram(addr)
+            self.wait_queue(timeout_s)
+            latency_us = self.report_latency_in_us()
         wall = time.perf_counter() - t0
-        latency_us = self.report_latency_in_us()
         gflops = (self._vis_total_flops / (latency_us * 1e-6) / 1e9
                   if latency_us > 0 else 0.0)
         self._loud(f"  [Vision] done: {wall:.2f}s wall, {latency_us / 1e6:.2f}s HW, "
@@ -745,4 +958,6 @@ class Qwen25VLVisionMixin:
         self._vis_embeddings = out
         self._vis_num_tokens = T
         self._loud(f"  [Vision] {T} image embeddings ready")
+        if profile:
+            self._print_vis_profile(self._vis_profile)
         return out
