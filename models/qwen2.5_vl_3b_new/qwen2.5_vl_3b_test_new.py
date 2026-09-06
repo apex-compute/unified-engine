@@ -662,7 +662,8 @@ def main():
             # trips per token.
             ue.compile_prefill(len(context), profile=True)
             ue.compile_decoder(profile=True)
-            prof_dec = (ue._decoder_program, list(ue._decoder_checkpoints))
+            prof_dec = (ue._decoder_program, list(ue._decoder_checkpoints),
+                        list(getattr(ue, "_decoder_workers", [])))
             ue.compile_decoder(profile=False)
         else:
             ue.compile_prefill(len(context))

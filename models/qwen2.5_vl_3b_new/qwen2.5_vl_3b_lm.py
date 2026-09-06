@@ -354,13 +354,103 @@ class Qwen25VLLMMixin:
 
     # ---- program emission --------------------------------------------------
 
+    def _ensure_decode_shards(self, sched, layer_size: int) -> dict:
+        """Copy each engine's COLUMN block of the decode weights into its own
+        private arena. Returns ``{(op, layer): ShardedWeight}``.
+
+        WHY COLUMNS, AND WHY A COPY. Decode is M=1, so there are no rows to
+        split -- the only parallel axis is the output width N. And decode is
+        bandwidth-bound: a whole weight block is streamed per token, so if every
+        engine read its block out of the ONE shared weight image their streams
+        would contend and the speedup would cap however evenly N divides.
+        Engine i therefore reads from ITS OWN window.
+
+        SCOPE AT 8 ENGINES: q over all 8, k over 4. q is N=2048 -- 32 blocks of
+        64, i.e. 4 blocks per engine. k is N=256, only 4 blocks, so it CANNOT
+        reach 8 engines; rather than leave it full-width on the master it goes
+        one block to each of engines 0-3 and engines 4-7 emit nothing for it.
+        That is still the right trade: they are already stopped at this layer's
+        rendezvous waiting for q, so k costs them nothing, and the master sheds
+        three quarters of a projection. v shards the same 4 ways: it is BF16, so
+        it carries no scale blob and lands on matmat_mul_core rather than the
+        GEMV kernel, but a column block of a bf16 [N, K] blob is the same
+        contiguous row block, so it materializes into the private arenas too.
+        """
+        cached = getattr(self, "_decode_shards", None)
+        if cached is not None:
+            return cached
+        import multi_engine_shard as mes
+        d = self._lm_dims()
+        t0 = time.perf_counter()
+        shards, skipped = {}, []
+        for li in range(layer_size):
+            la = self.lm_layer_addrs[li]
+            for op, K, N, quant in (("q", d["H"], d["QH"] * d["AHD"], True),
+                                    ("k", d["H"], d["KVH"] * d["AHD"], True),
+                                    ("v", d["H"], d["KVH"] * d["AHD"], False)):
+                # An op narrower than one 64-column block per engine still
+                # shards -- over as many engines as it fills.
+                n_sh = min(sched.num_engines, mes.max_shards(N))
+                if n_sh < 2:
+                    skipped.append((op, li))
+                    continue
+                if quant:
+                    sw = sched.shard_quantized_weight(
+                        name=f"{op}_proj_L{li}",
+                        main_weight_addr=la[f"{op}_data"],
+                        main_scale_addr=la[f"{op}_scale"],
+                        K=K, N=N, layers=1, main_layer_stride=0,
+                        data_type=TYPE.IF4, max_engines=n_sh, verbose=False)
+                else:
+                    sw = sched.shard_bf16_weight(
+                        name=f"{op}_proj_L{li}",
+                        main_weight_addr=la[f"{op}_weight"],
+                        K=K, N=N, layers=1, main_layer_stride=0,
+                        max_engines=n_sh, verbose=False)
+                shards[(op, li)] = sw
+        self._decode_shards = shards
+        used = sched.private_usage()
+        self._loud(f"  [Decode] sharded {len(shards)} projection(s) over "
+                   f"{sched.num_engines} engines in {time.perf_counter() - t0:.1f}s"
+                   f"{f'; {len(skipped)} left on the master' if skipped else ''}; "
+                   f"private weight arenas: "
+                   f"{', '.join(f'{u / 2**20:.1f} MiB' for u in used)}")
+        return shards
+
+    def _emit_dec_shard(self, ue, sw, e: int, out_base: int, a_addr: int,
+                        bias_base: int = None) -> int:
+        """Emit engine ``e``'s column block of one decode projection.
+
+        B and the scales come from THIS engine's private arena; ``a_addr`` is the
+        shared input every engine reads in full, and only the output slice --
+        and the bias, which is per-column -- are per-engine.
+        """
+        import multi_engine_shard as mes
+        sh = sw.shard(e)
+        off = sh.col_offset * self.bytes_per_element
+        # A shard is a whole multiple of 64 columns, so at bf16 the output
+        # offset is a whole 128-byte SRAM row. Asserted, not assumed: a
+        # misaligned writeback is finite-but-wrong data, not a fault.
+        assert off % 128 == 0, f"shard output offset {off} is not a whole SRAM row"
+        kw = dict(M=1, K=sw.K, N=sh.cols, A_DRAM_ADDR=a_addr,
+                  B_DRAM_ADDR=sh.weight_addr, OUTPUT_DRAM_ADDR=out_base + off)
+        if bias_base is not None:
+            kw.update(C_DRAM_ADDR=bias_base + off, bias_mode="broadcast_N")
+        if sw.data_type is mes.DENSE_BF16:
+            # bf16 weights have no scale blob and no GEMV kernel of their own;
+            # the general matmat is what the unsharded path uses for them too.
+            return ue.matmat_mul_core(**kw) or 0
+        kw.update(SCALE_DRAM_ADDR=sh.scale_addr, data_type=TYPE.IF4)
+        return ue.quantized_matmat_core(**kw) or 0
+
     def _kv_addr(self, cache_base: int, layer: int, kv_head: int) -> int:
         return cache_base + layer * self.KV_STRIDE_LAYER + kv_head * self.KV_STRIDE_HEAD
 
     def _emit_layer(self, li: int, M: int, *, decode: bool, m_reg: int,
                     aligned_kv: int, in_addr: int, out_addr: int,
                     rope_base: int, aligned_kv_reg: int = None,
-                    ckpt=None, sched=None, gate_m_regs=None) -> int:
+                    ckpt=None, sched=None, gate_m_regs=None,
+                    dec_sched=None, dec_shards=None) -> int:
         """One decoder layer. Shared by prefill (M=seq) and decode (M=1)."""
         d = self._lm_dims()
         H, AHD, KVH, QH, G, MLP = (d["H"], d["AHD"], d["KVH"], d["QH"],
@@ -404,6 +494,48 @@ class Qwen25VLLMMixin:
             flops += self.rms_norm_core_dram(
                 M=M, N=H, A_DRAM_ADDR=in_addr, OUTPUT_DRAM_ADDR=self.LM_PRE_NORM,
                 GAMMA_DRAM_ADDR=la["ln1"], gpr_M_reg=m_reg) or 0
+
+        if decode and dec_sched is not None:
+            # DECODE: column shard, master/worker round. q, k and v all read
+            # PRE_NORM and write disjoint buffers, so everything that shards
+            # rides ONE rendezvous for the layer; an op that cannot split runs
+            # full-width on the master inside that same round, overlapping the
+            # workers rather than serialising after them.
+            projs = (("q", self.LM_Q, QH * AHD, la["q_bias"], True),
+                     ("k", self.LM_K, KVH * AHD, la["k_bias"], True),
+                     ("v", self.LM_V, KVH * AHD, la["v_bias"], False))
+            round_ops = [(dec_shards[(tag, li)], out, self.LM_PRE_NORM, bias)
+                         for tag, out, _, bias, _ in projs
+                         if (tag, li) in dec_shards]
+            if round_ops:
+                dec_sched.release()
+            for tag, out, N_op, bias, quant in projs:
+                sw = dec_shards.get((tag, li))
+                if sw is None:
+                    flops += mm(H, N_op, self.LM_PRE_NORM, tag, out,
+                                quant=quant, bias=bias)
+                else:
+                    # The master owns shard 0 and emits it inline; the rest of
+                    # the shards are the workers' and their FLOPs come from
+                    # worker_flops, which counts shards[1:] however many exist.
+                    flops += self._emit_dec_shard(self, sw, 0, out,
+                                                  self.LM_PRE_NORM, bias)
+                    flops += dec_sched.worker_flops(sw)
+            if round_ops:
+                # Every worker must run EVERY round the master opens, even one
+                # where it has no work -- a skipped rendezvous desynchronises
+                # the group permanently and the master waits forever.
+                for e in dec_sched.worker_indices():
+                    dec_sched.begin_worker_round(e)
+                    for sw, out_base, a_addr, bias in round_ops:
+                        # An engine past a narrow weight's last shard emits
+                        # nothing for it -- but still runs the round.
+                        if sw.shard_or_none(e) is not None:
+                            self._emit_dec_shard(dec_sched.engines[e], sw, e,
+                                                 out_base, a_addr, bias)
+                    dec_sched.end_worker_round(e)
+                dec_sched.join()
+        elif sched is None:
             flops += mm(H, QH * AHD, self.LM_PRE_NORM, "q", self.LM_Q, bias=la["q_bias"])
             flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "k", self.LM_K, bias=la["k_bias"])
             flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "v", self.LM_V,
@@ -904,7 +1036,18 @@ class Qwen25VLLMMixin:
         flops_ref = [0]
         self._decoder_checkpoints = []
         ckpt = self._make_ckpt(profile, flops_ref, self._decoder_checkpoints)
+
+        # Decode gets its own scheduler (its own worker stream) but the SAME
+        # arena, so its weight blocks and worker ISA cannot land on vision's or
+        # prefill's.
+        # Layer count first: the shard setup below allocates one weight block
+        # per layer, so it needs nl.
         nl = d["NL"] if layer_size is None else layer_size
+        dec_sched = self._ensure_stage_scheduler("decode")
+        dec_shards = {}
+        if dec_sched is not None:
+            dec_sched.begin_program()
+            dec_shards = self._ensure_decode_shards(dec_sched, nl)
         for li in range(nl):
             in_addr = self.LM_IO_A if li % 2 == 0 else self.LM_IO_B
             out_addr = self.LM_IO_B if li % 2 == 0 else self.LM_IO_A
@@ -916,7 +1059,8 @@ class Qwen25VLLMMixin:
                 # short context does not pay for a full one.
                 aligned_kv=self.MAX_CONTEXT_SIZE,
                 aligned_kv_reg=self.gf_aligned_seq_len, in_addr=in_addr,
-                out_addr=out_addr, rope_base=self.LM_ROPE_DEC, ckpt=ckpt)
+                out_addr=out_addr, rope_base=self.LM_ROPE_DEC, ckpt=ckpt,
+                dec_sched=dec_sched, dec_shards=dec_shards)
             flops_ref[0] = flops
 
         final_buf = self.LM_IO_A if nl % 2 == 0 else self.LM_IO_B
@@ -939,6 +1083,7 @@ class Qwen25VLLMMixin:
         ckpt("lm_head", flops - flops_ref[0])
         self.generate_instruction_add_inc(self.gf_seq_len)
         self.generate_instruction_halt()
+        dec_worker_addrs = dec_sched.finalize() if dec_sched is not None else []
         self._set_silent(prev)
         self.stop_capture()
 
@@ -946,6 +1091,15 @@ class Qwen25VLLMMixin:
         for inst in self.capture_buffer:
             blob.extend(inst.get_bytes())
         self.clear_capture_buffer()
+        self._decoder_workers = []
+        if dec_sched is not None:
+            for idx, (w, addr) in enumerate(zip(dec_sched.workers, dec_worker_addrs),
+                                            start=1):
+                wb = bytearray()
+                for inst in w.capture_buffer:
+                    wb.extend(inst.get_bytes())
+                self.mc_arena.check_isa_fits(idx, addr, len(wb))
+                self._decoder_workers.append((idx, w, addr, bytes(wb)))
         self._decoder_program = (base, bytes(blob))
         self._decoder_flops = int(flops)
         # Split so a step can be priced at its real KV length: everything except
@@ -1062,7 +1216,7 @@ class Qwen25VLLMMixin:
         self._prefill_seq_len_run = seq_len
 
     def run_decode_step_profiled(self, token: int, program, checkpoints,
-                                 timeout_s: float = 60.0):
+                                 workers=None, timeout_s: float = 60.0):
         """One profiled decode step at the CURRENT context length.
 
         Runs a real step -- it writes K/V at gf_seq_len and advances the
@@ -1073,6 +1227,18 @@ class Qwen25VLLMMixin:
         d = self._lm_dims()
         addr, _ = program
         self._upload(program)
+        # The profiled decoder has its OWN worker images -- compile_decoder runs
+        # twice under --profile and the second (plain) call overwrites
+        # self._decoder_workers -- so they are passed in alongside the program.
+        dec_sched = self._ensure_stage_scheduler("decode")
+        worker_addrs = []
+        for idx, w, waddr, wblob in (workers or []):
+            w._next_program_dram_addr = waddr
+            w.dma_write(DMA_DEVICE_H2C, waddr, wblob, len(wblob))
+            w.allocate_program_dram(len(wblob))
+            worker_addrs.append(waddr)
+        if dec_sched is not None:
+            dec_sched.preclear_flags()
         step_pos = self.seq_len
         self.seq_len += 1
         aligned = ((self.seq_len + 63) // 64) * 64
@@ -1096,7 +1262,14 @@ class Qwen25VLLMMixin:
         self.clear_capture_buffer()
 
         prev = self._set_silent(True)
+        # Workers run their whole stream and block at each rendezvous; the
+        # master's HALTs sit at phase boundaries OUTSIDE any round, so stopping
+        # it between segments does not strand them.
+        if dec_sched is not None:
+            dec_sched.start_workers(worker_addrs)
         results = self._run_checkpointed(self._decoder_preamble, checkpoints, timeout_s)
+        for w in (dec_sched.workers if dec_sched is not None else []):
+            w.wait_queue(timeout_s)
         self._set_silent(prev)
         return results, self.get_arg_max_index(), aligned
 
@@ -1113,6 +1286,15 @@ class Qwen25VLLMMixin:
         stop = {151643, 151645, self._end_of_turn_token_id}
         addr, _ = self._decoder_program
         self._upload(self._decoder_program)
+        dec_sched = self._ensure_stage_scheduler("decode")
+        dec_worker_addrs = []
+        for idx, w, waddr, wblob in getattr(self, "_decoder_workers", []):
+            w._next_program_dram_addr = waddr
+            w.dma_write(DMA_DEVICE_H2C, waddr, wblob, len(wblob))
+            w.allocate_program_dram(len(wblob))
+            dec_worker_addrs.append(waddr)
+        if dec_sched is not None:
+            dec_sched.preclear_flags()
 
         token, out = first_token, []
         total_us = 0.0
@@ -1200,8 +1382,15 @@ class Qwen25VLLMMixin:
             self.write_captured_instructions_to_dram(self._decoder_preamble)
             self.clear_capture_buffer()
 
+            # Workers are relaunched EVERY step: each decoder program ends with
+            # its workers halted, so a step that did not start them would leave
+            # the master waiting on a rendezvous that never arrives.
+            if dec_sched is not None:
+                dec_sched.start_workers(dec_worker_addrs)
             self.start_execute_from_dram(self._decoder_preamble)
             self.wait_queue(30.0)
+            for w in (dec_sched.workers if dec_sched is not None else []):
+                w.wait_queue(30.0)
             step_us = self.report_latency_in_us()
             total_us += step_us
             # Per-step latencies: the FIRST is the peak-speed datapoint (shortest

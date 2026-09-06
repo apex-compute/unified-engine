@@ -639,15 +639,43 @@ def can_split(N: int, num_engines: int) -> bool:
     return num_engines == 1 or (N % COL_ALIGN == 0 and N // COL_ALIGN >= num_engines)
 
 
+def max_shards(N: int) -> int:
+    """How many engines ``N`` columns can actually feed at 64-column granularity.
+
+    The companion to :func:`can_split` for callers that would rather shard over a
+    subset than not shard at all: pass this as ``max_engines``.
+    """
+    return N // COL_ALIGN if N % COL_ALIGN == 0 else 0
+
+
+class _DenseBF16:
+    """Sentinel ``data_type`` for an UNQUANTIZED bf16 weight blob.
+
+    Not a member of ``TYPE``: that enum is the hardware's quantization-format
+    field, and bf16 weights are the absence of one -- they carry no scale blob
+    and go to ``matmat_mul_core`` rather than ``quantized_matmat_core``. It
+    exists so the column materializer can size and slice a dense blob with the
+    same code path as a quantized one.
+    """
+
+    def __repr__(self) -> str:
+        return "DENSE_BF16"
+
+
+DENSE_BF16 = _DenseBF16()
+
+
 def _weight_elem_bytes(data_type) -> float:
-    """Bytes per weight element for a quantized blob (IF4 packs two per byte)."""
+    """Bytes per weight element for a weight blob (IF4 packs two per byte)."""
     if data_type == user_dma_core.TYPE.IF4:
         return 0.5
     if data_type == user_dma_core.TYPE.IF8:
         return 1.0
+    if data_type is DENSE_BF16:
+        return 2.0
     raise AssertionError(
-        f"materialized weight shards support IF4/IF8 only, got {data_type!r}. "
-        f"For bf16 weights use the zero-copy ColumnShardContext.b_addr() path instead.")
+        f"materialized weight shards support IF4/IF8/DENSE_BF16 only, got "
+        f"{data_type!r}.")
 
 
 # ==========================================================================
@@ -699,6 +727,14 @@ class ShardedWeight:
 
     def shard(self, engine_idx: int) -> WeightShard:
         return self.shards[engine_idx]
+
+    def shard_or_none(self, engine_idx: int) -> Optional[WeightShard]:
+        """This engine's block, or None when the weight was too narrow to reach it.
+
+        A weight sharded with ``max_engines`` covers only engines 0..max-1; the
+        engines past the end still run the round, they just emit nothing for it.
+        """
+        return self.shards[engine_idx] if engine_idx < len(self.shards) else None
 
     def summary(self) -> str:
         parts = ", ".join(f"e{s.engine_idx}:{s.cols}" for s in self.shards)
@@ -1474,8 +1510,15 @@ class MultiEngineScheduler:
         return list(zip(offsets, counts))
 
     # ------------------------------------------------------------- columns --
-    def split_cols(self, N: int, remainder: str = "leading") -> list[tuple[int, int]]:
+    def split_cols(self, N: int, remainder: str = "leading",
+                   max_engines: Optional[int] = None) -> list[tuple[int, int]]:
         """Return [(col_offset, col_count)] per engine for a full column count N.
+
+        ``max_engines`` caps how many engines take part, so a weight too narrow
+        to give every engine a 64-column block can still be shared by the few it
+        does fill (gemma3's N=256 K projection: 4 blocks, 4 engines, the rest
+        idle for that op). The returned list is then SHORTER than num_engines --
+        engine i owns entry i, and engines past the end own nothing.
 
         ``remainder`` decides WHICH engines carry the extra 64-column blocks when N
         does not divide evenly:
@@ -1501,7 +1544,8 @@ class MultiEngineScheduler:
         At bpe=2 a ``col_align``-element block is exactly 128 bytes, so every
         offset this produces is a whole SRAM row (asserted in :func:`_shifted`).
         """
-        n = self.num_engines
+        n = self.num_engines if max_engines is None else min(self.num_engines,
+                                                             max(1, max_engines))
         a = self.col_align
         if n == 1:
             return [(0, N)]
@@ -1511,7 +1555,8 @@ class MultiEngineScheduler:
         blocks = N // a
         assert blocks >= n, (
             f"split_cols: N={N} is only {blocks} block(s) of {a} columns, too few "
-            f"for num_engines={n}")
+            f"for {n} engine(s); pass max_engines<={blocks} to shard it over "
+            f"a subset and leave the rest idle for this op")
         assert remainder in ("leading", "trailing"), \
             f"remainder must be 'leading' or 'trailing', got {remainder!r}"
         base, rem = divmod(blocks, n)
@@ -2324,6 +2369,7 @@ class MultiEngineScheduler:
     def shard_quantized_weight(self, name: str, main_weight_addr: int, main_scale_addr: int,
                                K: int, N: int, layers: int, main_layer_stride: int,
                                data_type=None, remainder: str = "trailing",
+                               max_engines: Optional[int] = None,
                                verbose: bool = True) -> ShardedWeight:
         """MATERIALIZE each engine's column block of a weight into its private arena.
 
@@ -2340,6 +2386,10 @@ class MultiEngineScheduler:
 
         The copy goes card -> host -> card: the source is the image the model loader
         already wrote to DRAM, and there is no device-to-device DMA path.
+
+        Pass ``data_type=DENSE_BF16`` (and ``main_scale_addr=None``) for an
+        unquantized bf16 weight: the row-block slicing is identical, there is
+        simply no scale blob to carry -- see :meth:`shard_bf16_weight`.
         """
         self._require_private_map("shard_quantized_weight")
         if data_type is None:
@@ -2347,14 +2397,17 @@ class MultiEngineScheduler:
         if name in self._weights:
             raise ValueError(f"weight {name!r} already sharded")
         eb = _weight_elem_bytes(data_type)
+        has_scale = data_type is not DENSE_BF16
+        if has_scale and main_scale_addr is None:
+            raise ValueError(f"{name}: {data_type!r} needs main_scale_addr")
         if (K * eb) % 1:
             raise ValueError(f"{name}: K={K} x {eb} B/elem is not a whole number of bytes")
-        assert K % COL_ALIGN == 0, (
+        assert not has_scale or K % COL_ALIGN == 0, (
             f"{name}: K={K} must be a multiple of {COL_ALIGN} -- the scale blob is "
             f"blocked at whole K-vectors, so a column shard's scale stride is only "
             f"linear when K is too")
 
-        splits = self.split_cols(N, remainder=remainder)
+        splits = self.split_cols(N, remainder=remainder, max_engines=max_engines)
         sw = ShardedWeight(name=name, K=K, N=N, layers=layers, data_type=data_type)
 
         # PRE-FLIGHT: check every engine has room BEFORE copying a single byte. Without
@@ -2362,7 +2415,9 @@ class MultiEngineScheduler:
         # some arenas holding this weight and others not -- a state that reads as
         # garbage rather than as an error.
         for engine_idx, (col_offset, cols) in enumerate(splits):
-            need = int(cols * K * eb) * layers + (cols * K // COL_ALIGN) * 2 * layers
+            need = int(cols * K * eb) * layers
+            if has_scale:
+                need += (cols * K // COL_ALIGN) * 2 * layers
             free = (self.regions[engine_idx].weight_limit
                     - self.arena._weight_cursor[engine_idx])
             if need > free:
@@ -2376,9 +2431,10 @@ class MultiEngineScheduler:
 
         for engine_idx, (col_offset, cols) in enumerate(splits):
             w_stride = int(cols * K * eb)                      # this shard, one layer
-            s_stride = (cols * K // COL_ALIGN) * 2
+            s_stride = (cols * K // COL_ALIGN) * 2 if has_scale else 0
             w_addr = self._alloc_private(engine_idx, w_stride * layers, f"{name} weights")
-            s_addr = self._alloc_private(engine_idx, s_stride * layers, f"{name} scales")
+            s_addr = (self._alloc_private(engine_idx, s_stride * layers, f"{name} scales")
+                      if has_scale else 0)
             sw.shards.append(WeightShard(
                 engine_idx=engine_idx, col_offset=col_offset, cols=cols,
                 weight_addr=w_addr, scale_addr=s_addr,
@@ -2387,13 +2443,15 @@ class MultiEngineScheduler:
         # One layer at a time: read the full row block for this layer, scatter the slices.
         for layer in range(layers):
             src_w = main_weight_addr + layer * main_layer_stride
-            src_s = main_scale_addr + layer * main_layer_stride
+            src_s = (main_scale_addr + layer * main_layer_stride) if has_scale else 0
             for shard in sw.shards:
                 w_off = int(shard.col_offset * K * eb)
-                s_off = (shard.col_offset * K // COL_ALIGN) * 2
                 self._copy_dram_bytes(src_w + w_off,
                                       shard.weight_addr + layer * shard.layer_stride,
                                       shard.layer_stride)
+                if not has_scale:
+                    continue
+                s_off = (shard.col_offset * K // COL_ALIGN) * 2
                 self._copy_dram_bytes(src_s + s_off,
                                       shard.scale_addr + layer * shard.scale_layer_stride,
                                       shard.scale_layer_stride)
@@ -2403,6 +2461,25 @@ class MultiEngineScheduler:
             used = [f"{u / 2**20:.1f}MB" for u in self.private_usage()]
             print(f"  sharded {sw.summary()}; private arenas used: {', '.join(used)}")
         return sw
+
+    def shard_bf16_weight(self, name: str, main_weight_addr: int,
+                          K: int, N: int, layers: int, main_layer_stride: int,
+                          remainder: str = "trailing",
+                          max_engines: Optional[int] = None,
+                          verbose: bool = True) -> ShardedWeight:
+        """MATERIALIZE column blocks of an UNQUANTIZED bf16 ``[N, K]`` weight.
+
+        For the weights a model deliberately keeps in bf16 (Qwen2.5-VL's v_proj
+        and o_proj, where attention accuracy pays for the width). Column shards
+        do not care about the element format: the blob is row-major in N, so a
+        column block is a contiguous row block either way. The result feeds
+        ``matmat_mul_core`` -- ``scale_addr`` is 0 and there is no scale blob.
+        """
+        return self.shard_quantized_weight(
+            name=name, main_weight_addr=main_weight_addr, main_scale_addr=None,
+            K=K, N=N, layers=layers, main_layer_stride=main_layer_stride,
+            data_type=DENSE_BF16, remainder=remainder, max_engines=max_engines,
+            verbose=verbose)
 
     def _copy_dram_bytes(self, src_addr: int, dst_addr: int, size_bytes: int) -> None:
         """Move a raw byte range within device DRAM, staging through the host.
@@ -2680,6 +2757,14 @@ class MultiEngineScheduler:
                     if isinstance(op, AttentionOp):
                         continue
                     sw = op[0]
+                    if idx >= len(sw.shards):
+                        raise NotImplementedError(
+                            f"{sw.name} was sharded over {len(sw.shards)} of "
+                            f"{self.num_engines} engine(s) (max_engines), and the "
+                            f"folded worker-program emitter has no way to skip an "
+                            f"op for one engine inside a shared round body. Emit "
+                            f"the worker streams directly (begin_worker_round / "
+                            f"end_worker_round) for partially-sharded weights.")
                     shard = sw.shard(idx)
                     gpr_w = ue.alloc_isa_reg()
                     gpr_s = ue.alloc_isa_reg()
@@ -2806,6 +2891,11 @@ class MultiEngineScheduler:
         unlike a single-engine path that can keep the vector on-chip and read the
         register directly.
         """
+        if len(sw.shards) != self.num_engines:
+            raise NotImplementedError(
+                f"sharded_argmax needs every engine to hold a slice, but {sw.name} "
+                f"covers {len(sw.shards)} of {self.num_engines} engine(s); the "
+                f"engines without one never produced a candidate")
         best_idx, best_val = None, None
         for i in range(self.num_engines):
             shard = sw.shard(i)
