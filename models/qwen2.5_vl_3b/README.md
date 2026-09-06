@@ -18,9 +18,8 @@ and text-only prompts.
   128 on-chip), SwiGLU (intermediate 3420), RMSNorm, window attention
   (112-px windows) with full attention at layers 7/15/23/31; 2×2 patch merger
   → 144 tokens × 2048. IF4 weights.
-- **Compute graphs (mermaid):** see
-  `output/compute_graphs/qwen2.5_vl_3b/` —
-  `..._vision_encoder_semantic.md` and `..._lm_semantic.md`.
+- **Compute graph (mermaid):** see `qwen2.5_vl_3b_model_graph.md` — the hardware-agnostic model
+  graph (vision encoder, prefill, decode) with shapes, params and FLOP costs.
 
 ## Performance
 
