@@ -8827,8 +8827,7 @@ class UnifiedEngine:
             w_pad: padded map width W_in + 2*pad (host pre-fills the halo)
             stride_s: convolution stride (dilation folds into the stride regs)
             data_type: TYPE.IF4 / TYPE.IF8 / TYPE.TQ4 (X-stream weight format)
-            bias_enable: per-output-channel bias from bias BRAM; CONV RTL
-                rewinds the bias address after ``oc_count`` results
+            bias_enable: per-(pixel,oc) bias from bias BRAM (see conv2d_pack_bias_stream)
             lalu_mode/lalu_a/lalu_b: fused activation (e.g. CLAMP-as-ReLU)
             dilation: kernel-tap dilation. Rides the kernel-step registers for
                 free (col_stride = dil*CT, row_stride = dil*W_pad*CT); the
@@ -8847,8 +8846,8 @@ class UnifiedEngine:
         bytes_per_blk = 64 if data_type == TYPE.IF8 else 32
         assert results <= 0xFFFF, f"output_size={results} exceeds the 16-bit descriptor field"
         if bias_enable:
-            assert oc_count <= BIAS_BRAM_ELEMENTS, (
-                f"bias vector has {oc_count} channels > bias BRAM {BIAS_BRAM_ELEMENTS}")
+            assert results <= BIAS_BRAM_ELEMENTS, (
+                f"bias stream has {results} results > bias BRAM {BIAS_BRAM_ELEMENTS}")
 
         if gather:
             assert c_in is not None and 0 < c_in <= 0xFF, f"gather requires 0 < c_in <= 255, got {c_in}"
@@ -9019,7 +9018,7 @@ class UnifiedEngine:
         if bias_enable:
             self.accelerator_memory_to_bias_sram(
                 accelerator_dram_address=BIAS_DRAM_ADDR,
-                element_size=oc_count)
+                element_size=results)
 
         lalu_mode, lalu_a, lalu_b = _conv_fused_lalu(relu_enable, silu_enable, gelu_enable)
 
@@ -9100,7 +9099,7 @@ class UnifiedEngine:
                                   w_pad: int, stride_s: int, dilation: int,
                                   data_type: TYPE,
                                   scale_dram_addr: int, scale_count: int,
-                                  bias_dram_addr: Optional[int], bias_count: int,
+                                  bias_dram_addr: Optional[int], results: int,
                                   lalu_mode: LALU_MODE, lalu_a: int, lalu_b: int,
                                   gather: bool = False, c_in: Optional[int] = None,
                                   act_uram_addr: int = 0x000,
@@ -9128,7 +9127,7 @@ class UnifiedEngine:
         """
         self.accelerator_memory_to_scale_sram(scale_dram_addr, scale_count)
         if bias_dram_addr is not None:
-            self.accelerator_memory_to_bias_sram(bias_dram_addr, bias_count)
+            self.accelerator_memory_to_bias_sram(bias_dram_addr, results)
 
         # The running act-read / result-write DRAM addresses live in ISA GP
         # registers (word address = byte >> 3, the REG_REWRITE convention).
@@ -9303,11 +9302,10 @@ class UnifiedEngine:
             # INT4/FP4 independently for every 64-value block.
             chunk_scale = _conv2d_chunk_scale(
                 block_scales, scale_mag, oc0=oc0, n_oc=n_oc)
-            # Weight and channels-mode scale streams repeat the same
-            # per-output-pixel pattern. Pack the largest geometry once: every
+            # Weight, channel-scale, and bias streams repeat the same
+            # per-output-pixel pattern.  Pack the largest geometry once: every
             # tail geometry consumes an exact prefix from the same address.
-            # Gather scales and the per-channel bias vector are
-            # geometry-independent.
+            # Gather scales are already one geometry-independent pixel pattern.
             stream_group = max(groups, key=lambda group: group[2] * group[3])
             stream_th, stream_tw = stream_group[2], stream_group[3]
             if use_gather:
@@ -9357,7 +9355,7 @@ class UnifiedEngine:
                     data_type=data_type,
                     scale_dram_addr=SCALE_DRAM_ADDR,
                     scale_count=scale_count,
-                    bias_dram_addr=BIAS_DRAM_ADDR, bias_count=n_oc,
+                    bias_dram_addr=BIAS_DRAM_ADDR, results=th * tw * n_oc,
                     lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b,
                     gather=use_gather, c_in=C,
                     wb_uram_addr=wb_uram_addr)
@@ -12488,7 +12486,7 @@ def check_isa_jumps(
 # Data-layout twins of the geometry contract used by UnifiedEngine.conv2d_core /
 # maxpool2d_core (Vivado/doc/convolution_architecture.md): channels-in-lanes
 # activation map with a host-materialised halo, [pixel][oc][tap] weight
-# stream, per-block scale stream, one per-output-channel bias vector, and the
+# stream, per-block scale stream, per-(pixel,oc) bias stream, and the
 # pixel-major/oc-innermost result order of the dot-style writeback.
 # ---------------------------------------------------------------------------
 
@@ -12741,15 +12739,14 @@ def conv2d_pack_scale_stream_gather(scale, oc_count: int, chunks: int) -> torch.
 
 
 def conv2d_pack_bias_stream(bias: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
-    """Pack one per-output-channel bf16 bias vector for CONV.
+    """Per-(pixel, oc) bf16 bias stream for the bias BRAM.
 
-    CONV RTL wraps the bias-BRAM read address after ``oc_count`` scalar
-    results, so every spatial position reuses this one vector. ``out_h`` and
-    ``out_w`` remain in the API for source compatibility and shape checks.
+    The bias address increments once per scalar result (pixel-major, oc
+    innermost) and wraps at output_size, so a per-oc bias must be replicated
+    once per output pixel: entry(pixel, oc) = bias[oc].
     """
     assert bias.dim() == 1, f"expected (OC,), got shape {tuple(bias.shape)}"
-    assert out_h > 0 and out_w > 0, f"invalid output shape {out_h}x{out_w}"
-    return bias.to(torch.bfloat16).contiguous()
+    return bias.to(torch.bfloat16).repeat(out_h * out_w).contiguous()
 
 
 def conv2d_unpack_result(flat: torch.Tensor, out_h: int, out_w: int, oc_count: int) -> torch.Tensor:
@@ -12927,7 +12924,7 @@ def plan_conv2d_layer_tiles(*, c_in: int, oc_count: int, in_h: int, in_w: int,
                         pix_col_step, pix_row_step) <= 0xFFF
                 and ((n_oc * gather_chunks <= SCALE_BRAM_ELEMENTS)
                      if gather else (results * taps <= SCALE_BRAM_ELEMENTS))
-                and (not bias_enabled or n_oc <= BIAS_BRAM_ELEMENTS)
+                and (not bias_enabled or results <= BIAS_BRAM_ELEMENTS)
                 and win_h * win_w * ct <= wb_uram_addr - act_uram_addr
                 and wb_uram_addr + result_lines <= 4096
                 and results <= 0xFFFF)

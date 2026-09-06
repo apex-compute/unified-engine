@@ -26,8 +26,6 @@ import user_dma_core
 PRECOMPILED_ABI = "andromeda-yolov5-whole-graph-v1"
 GEOMETRY_ABI = "conv-config-inst-v1"
 PRECOMPILED_AXI_DATA_WIDTH_BITS = 256
-SUPPORTED_RUNTIME_AXI_DATA_WIDTH_BITS = (256, 512)
-REQUIRED_ANDROMEDA_HW_VERSION = 0xB34D1AC8
 
 # In strided-write mode the checked-in RTL stores the per-stride AXI beat
 # count in eight bits.  A zero value represents the legal 256-beat maximum;
@@ -55,14 +53,9 @@ PROGRAM_BASE = MODEL_BASE
 PROGRAM_LIMIT = MODEL_LIMIT
 
 _LINE_BYTES = user_dma_core.UE_VECTOR_SIZE * 2
-# MAXPOOL keeps the original fixed split. CONV chooses a split per layer so a
-# large spatial window is not artificially limited to these 768 lines.
 _ACT_URAM_LINES = 0x300
+_ACT_TEMPLATE_BYTES = _ACT_URAM_LINES * _LINE_BYTES
 _WB_SRAM_ADDRESS = _ACT_URAM_LINES << 7
-_URAM_LINES = 4096
-_CONV_SPLIT_ALIGNMENT_LINES = 64
-_ZERO_TEMPLATE_BYTES = _URAM_LINES * _LINE_BYTES
-_POOL_TEMPLATE_BYTES = _ACT_URAM_LINES * _LINE_BYTES
 
 
 def _align_up(value: int, alignment: int) -> int:
@@ -449,46 +442,21 @@ def _prepare_conv_plan(operation: dict, weight: dict, source: _PackedMap,
         padded_bias = torch.zeros(physical_oc, dtype=torch.bfloat16)
         padded_bias[:logical_oc] = bias
 
-    planner_args = dict(
+    out_h, out_w, oc_chunk, tiles = user_dma_core.plan_conv2d_layer_tiles(
         c_in=convolution_c, oc_count=physical_oc,
         in_h=source.height, in_w=source.width,
         kernel_h=kh, kernel_w=kw,
         stride_s=int(operation["stride"]), pad=int(operation["pad"]),
         dilation=int(operation["dilation"]), gather=use_gather,
-        bias_enabled=padded_bias is not None)
-    candidates = []
-    for wb_uram_addr in range(
-            _CONV_SPLIT_ALIGNMENT_LINES,
-            _URAM_LINES,
-            _CONV_SPLIT_ALIGNMENT_LINES):
-        try:
-            candidate = user_dma_core.plan_conv2d_layer_tiles(
-                **planner_args, wb_uram_addr=wb_uram_addr)
-        except AssertionError:
-            continue
-        candidate_out_h, candidate_out_w, candidate_oc, candidate_tiles = \
-            candidate
-        if candidate_oc % user_dma_core.UE_VECTOR_SIZE:
-            continue
-        groups = user_dma_core.conv2d_tile_geometry_groups(candidate_tiles)
-        stream_pixels = max(group[2] * group[3] for group in groups)
-        launches = len(candidate_tiles) * (physical_oc // candidate_oc)
-        # First minimize hardware launches. For equal launch counts prefer the
-        # smaller resident weight stream, then the smaller activation region.
-        score = (launches, stream_pixels * physical_oc, wb_uram_addr)
-        candidates.append((score, wb_uram_addr, candidate, groups))
-    if not candidates:
-        raise RuntimeError(
-            f"{operation['name']}: no aligned CONV URAM split is feasible")
-    _score, wb_uram_addr, selected, groups = min(
-        candidates, key=lambda item: item[0])
-    out_h, out_w, oc_chunk, tiles = selected
+        bias_enabled=padded_bias is not None,
+        wb_uram_addr=_ACT_URAM_LINES)
     if (out_h, out_w) != destination.logical_shape[1:]:
         raise RuntimeError(f"{operation['name']}: convolution planner shape differs")
     if oc_chunk % user_dma_core.UE_VECTOR_SIZE:
         raise RuntimeError(
             f"{operation['name']}: OC chunk {oc_chunk} cannot be scattered "
             "into the persistent packed map without host repacking")
+    groups = user_dma_core.conv2d_tile_geometry_groups(tiles)
     stream_group = max(groups, key=lambda group: group[2] * group[3])
     stream_h, stream_w = stream_group[2], stream_group[3]
 
@@ -529,7 +497,6 @@ def _prepare_conv_plan(operation: dict, weight: dict, source: _PackedMap,
         "convolution_c": convolution_c,
         "kernel_h": kh,
         "kernel_w": kw,
-        "wb_uram_addr": wb_uram_addr,
         "oc_chunk": oc_chunk,
         "tiles": tiles,
         "groups": groups,
@@ -618,8 +585,7 @@ def _stage_conv_window(engine: _WholeGraphEngine, source: _PackedMap,
 
 
 def _scatter_conv_tile(engine: _WholeGraphEngine, destination: _PackedMap,
-                       tile, oc0: int, oc_chunk: int,
-                       wb_sram_address: int) -> None:
+                       tile, oc0: int, oc_chunk: int) -> None:
     oy, ox, th, tw = (int(value) for value in tile[:4])
     source_row_bytes = tw * oc_chunk * 2
     destination_pixel_bytes = destination.physical_channels * 2
@@ -627,13 +593,13 @@ def _scatter_conv_tile(engine: _WholeGraphEngine, destination: _PackedMap,
         destination_address = destination.address + (
             (oy * destination.width + ox) * destination_pixel_bytes)
         _copy_contiguous_or_strided_write(
-            engine, sram=wb_sram_address,
+            engine, sram=_WB_SRAM_ADDRESS,
             destination=destination_address,
             total=th * source_row_bytes, chunk=source_row_bytes,
             jump=destination.width * destination_pixel_bytes)
         return
     for row in range(th):
-        source_sram = wb_sram_address + row * source_row_bytes
+        source_sram = _WB_SRAM_ADDRESS + row * source_row_bytes
         destination_address = destination.address + (
             ((oy + row) * destination.width + ox)
             * destination_pixel_bytes + oc0 * 2)
@@ -654,7 +620,6 @@ def _emit_conv(engine: _WholeGraphEngine, plan: dict,
     ct = (plan["convolution_c"] + user_dma_core.UE_VECTOR_SIZE - 1) \
         // user_dma_core.UE_VECTOR_SIZE
     taps = plan["kernel_h"] * plan["kernel_w"] * ct
-    wb_sram_address = int(plan["wb_uram_addr"]) << 7
     for chunk in plan["chunks"]:
         oc0 = chunk["oc0"]
         for start, stop, th, tw, _win_h, win_w in plan["groups"]:
@@ -666,12 +631,12 @@ def _emit_conv(engine: _WholeGraphEngine, plan: dict,
                 chunk["scale_address"], scale_count)
             if chunk["bias_address"] is not None:
                 engine.accelerator_memory_to_bias_sram(
-                    chunk["bias_address"], plan["oc_chunk"])
+                    chunk["bias_address"], th * tw * plan["oc_chunk"])
             for tile in plan["tiles"][start:stop]:
                 _stage_conv_window(engine, source, tile, pad, zero_address)
                 engine.start_queue_for_conv2d_operation(
                     act_sram_start_addr=0,
-                    output_sram_wb_addr=wb_sram_address,
+                    output_sram_wb_addr=_WB_SRAM_ADDRESS,
                     weights_dram_addr=chunk["weight_address"],
                     kernel_w=plan["kernel_w"], kernel_h=plan["kernel_h"],
                     ct=ct, oc_count=plan["oc_chunk"],
@@ -682,8 +647,7 @@ def _emit_conv(engine: _WholeGraphEngine, plan: dict,
                     dilation=dilation, gather=plan["use_gather"],
                     c_in=plan["convolution_c"])
                 _scatter_conv_tile(
-                    engine, destination, tile, oc0, plan["oc_chunk"],
-                    wb_sram_address)
+                    engine, destination, tile, oc0, plan["oc_chunk"])
 
 
 def _maxpool_rows(operation: dict, source: _PackedMap):
@@ -848,10 +812,10 @@ def _compile_precompiled_hardware(payload: dict) -> dict:
      scratch_address, scratch_bytes) = _build_memory_plan(payload)
     image = _ImageBuilder(MODEL_BASE, MODEL_LIMIT)
     zero_address = image.allocate(
-        torch.zeros(_ZERO_TEMPLATE_BYTES // 2, dtype=torch.bfloat16),
+        torch.zeros(_ACT_TEMPLATE_BYTES // 2, dtype=torch.bfloat16),
         alignment=64)
     neg_inf_address = image.allocate(
-        torch.full((_POOL_TEMPLATE_BYTES // 2,), float("-inf"),
+        torch.full((_ACT_TEMPLATE_BYTES // 2,), float("-inf"),
                    dtype=torch.bfloat16), alignment=64)
 
     conv_plans = {}
@@ -951,20 +915,6 @@ def _instruction_types(program: bytes) -> list[int]:
     ]
 
 
-def decode_precompiled_program(hardware: dict) -> list[user_dma_core.Instructions]:
-    """Recover the resident instruction stream from a validated model image."""
-    image = hardware["model_image"]
-    start = int(hardware["program_offset"])
-    stop = start + int(hardware["program_size"])
-    program = _tensor_bytes(image)[start:stop]
-    decoded = []
-    for offset in range(0, len(program), user_dma_core.INSTRUCTION_SIZE_BYTES):
-        instruction = user_dma_core.Instructions()
-        instruction.words = list(struct.unpack_from("<8I", program, offset))
-        decoded.append(instruction)
-    return decoded
-
-
 def validate_precompiled_hardware(payload: dict,
                                   hardware: dict | None = None) -> None:
     """Validate the closed, non-relocatable whole-graph hardware section."""
@@ -1022,7 +972,11 @@ def validate_precompiled_hardware(payload: dict,
            for value in instruction_types[halt + 1:]):
         raise RuntimeError("YOLO whole-graph HALT is not terminal")
     _scan_queue_configs(program, 0, len(program))
-    decoded = decode_precompiled_program(hardware)
+    decoded = []
+    for offset in range(0, len(program), 32):
+        instruction = user_dma_core.Instructions()
+        instruction.words = list(struct.unpack_from("<8I", program, offset))
+        decoded.append(instruction)
     jump_issues = user_dma_core.check_isa_jumps(
         decoded, program_address, name="YOLOv5 whole graph")
     if jump_issues:
@@ -1075,14 +1029,13 @@ class WholeGraphAndromedaBackend:
 
     def __init__(self, ue: user_dma_core.UnifiedEngine, payload: dict, *,
                  axi_data_width_bits: int,
-                 timeout_s: float = 300.0,
-                 trace_tail_path: str | None = None):
+                 timeout_s: float = 300.0):
         validate_precompiled_hardware(payload)
-        if int(axi_data_width_bits) not in \
-                SUPPORTED_RUNTIME_AXI_DATA_WIDTH_BITS:
+        if int(axi_data_width_bits) != PRECOMPILED_AXI_DATA_WIDTH_BITS:
             raise RuntimeError(
-                "whole-graph YOLO runtime supports AXI-256 or AXI-512, "
-                f"live hardware reports AXI-{axi_data_width_bits}")
+                f"whole-graph YOLO was compiled for AXI-"
+                f"{PRECOMPILED_AXI_DATA_WIDTH_BITS}, live hardware reports "
+                f"AXI-{axi_data_width_bits}")
         if getattr(ue, "conv_geometry_mode", None) != \
                 user_dma_core.CONV_GEOMETRY_QUEUE_CONFIG:
             raise RuntimeError(
@@ -1095,13 +1048,7 @@ class WholeGraphAndromedaBackend:
             raise ValueError(f"timeout_s must be finite and > 0, got {timeout_s!r}")
         cached_version = getattr(ue, "hw_version", None)
         self.hw_version = (int(cached_version) if cached_version is not None
-                           else user_dma_core.UnifiedEngine.get_hardware_version(ue)) \
-            & 0xFFFFFFFF
-        if self.hw_version != REQUIRED_ANDROMEDA_HW_VERSION:
-            raise RuntimeError(
-                "whole-graph YOLO requires Andromeda commit b34d1ac8 "
-                f"(HW version 0x{REQUIRED_ANDROMEDA_HW_VERSION:08x}), "
-                f"live hardware reports 0x{self.hw_version:08x}")
+                           else user_dma_core.UnifiedEngine.get_hardware_version(ue))
         self.cycles: dict[str, int] = collections.defaultdict(int)
         self.instruction_bytes: dict[str, int] = collections.defaultdict(int)
         self.model_upload_bytes = 0
@@ -1112,12 +1059,6 @@ class WholeGraphAndromedaBackend:
         self.output_reads = 0
         self.intermediate_upload_writes = 0
         self.intermediate_output_reads = 0
-        self.trace_tail_path = trace_tail_path
-        self.trace_tail_result = None
-        self.trace_export_seconds = 0.0
-        self._trace_instructions = (
-            decode_precompiled_program(self.hardware)
-            if trace_tail_path is not None else None)
         self._load_model_image()
 
     @property
@@ -1204,14 +1145,6 @@ class WholeGraphAndromedaBackend:
         self._wait_strict()
         self.cycles["whole_graph"] += self.ue.read_latency_cycles()
         self.instruction_bytes["whole_graph"] += self.hardware["program_size"]
-        if self.trace_tail_path is not None:
-            from read_trace import generate_circular_tail_trace
-            trace_started = time.perf_counter()
-            self.trace_tail_result = generate_circular_tail_trace(
-                self.ue, self.trace_tail_path,
-                instructions=self._trace_instructions,
-                program_dram_addr=self.hardware["program_address"])
-            self.trace_export_seconds = time.perf_counter() - trace_started
 
         bundle = torch.empty(
             self.hardware["head_bundle_bytes"] // 2, dtype=torch.bfloat16)

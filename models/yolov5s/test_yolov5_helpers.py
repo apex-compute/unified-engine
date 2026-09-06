@@ -40,7 +40,6 @@ from yolov5_precompiled import (
     _scan_queue_configs,
     compile_precompiled_hardware,
     PRECOMPILED_AXI_DATA_WIDTH_BITS,
-    REQUIRED_ANDROMEDA_HW_VERSION,
     validate_precompiled_hardware,
 )
 from yolov5_common import (
@@ -105,14 +104,14 @@ class VariantTests(unittest.TestCase):
         self.assertEqual(
             artifact.weights_sha256,
             "b8ca688e49a44c87b657de6b5c4c9d7b0193718c40ccc8f860733cd89865f666")
-        self.assertEqual(artifact.model_bytes, 38_365_440)
-        self.assertEqual(artifact.program_bytes, 260_352)
+        self.assertEqual(artifact.model_bytes, 19_718_784)
+        self.assertEqual(artifact.program_bytes, 290_560)
         self.assertEqual(
             artifact.model_sha256,
-            "1092939f7b1d39a8972dd458d3ac7671853fefcfbce5c2259c3ba72133afac65")
+            "fe1674e69a2645d2b62937184f5cffdef89f663437615d318a6e58269fbc7cce")
         self.assertEqual(
             artifact.program_sha256,
-            "516535c30572df4b82953476789e90299607858319d849b49c7be457ee18bcd2")
+            "e1a8cf92d99aaa1516c9c39122a660c65f04f8ab2baaf8af1662ce52419aa924")
         self.assertEqual(artifact_variant({"format": artifact.format}), "n")
 
     def test_variant_configs_match_pinned_profiles(self):
@@ -755,28 +754,15 @@ class PlannerTests(unittest.TestCase):
         self.assertLess(len(gather_plan[3]), len(channel_plan[3]))
         self.assertGreater(gather_plan[3][0][2] * gather_plan[3][0][3], 6)
 
-    def test_gather_bias_reuse_does_not_limit_spatial_tile(self):
-        kwargs = dict(
-            c_in=3, oc_count=64, in_h=256, in_w=256,
+    def test_gather_planner_respects_bias_bram_capacity(self):
+        _, _, oc_chunk, tiles = user_dma_core.plan_conv2d_layer_tiles(
+            c_in=3, oc_count=32, in_h=256, in_w=256,
             kernel_h=6, kernel_w=6, stride_s=2, pad=2,
-            gather=True, wb_uram_addr=2032)
-        no_bias = user_dma_core.plan_conv2d_layer_tiles(
-            **kwargs, bias_enabled=False)
-        with_bias = user_dma_core.plan_conv2d_layer_tiles(
-            **kwargs, bias_enabled=True)
-
-        self.assertEqual(with_bias, no_bias)
-        tile_h, tile_w = with_bias[3][0][2:4]
-        self.assertGreater(
-            tile_h * tile_w * with_bias[2],
+            gather=True, bias_enabled=True)
+        tile_h, tile_w = tiles[0][2:4]
+        self.assertLessEqual(
+            tile_h * tile_w * oc_chunk,
             user_dma_core.BIAS_BRAM_ELEMENTS)
-
-    def test_conv_bias_stream_stores_one_channel_vector(self):
-        bias = torch.arange(64, dtype=torch.float32)
-        packed = user_dma_core.conv2d_pack_bias_stream(bias, 11, 11)
-        self.assertEqual(packed.dtype, torch.bfloat16)
-        self.assertEqual(packed.numel(), 64)
-        self.assertTrue(torch.equal(packed.float(), bias))
 
     def test_hardware_version_is_masked_and_cached(self):
         engine = user_dma_core.UnifiedEngine.__new__(user_dma_core.UnifiedEngine)
@@ -964,7 +950,7 @@ class PrecompiledBinTests(unittest.TestCase):
                      never_halt=False):
             self.h2c_device = "fake-h2c"
             self.c2h_device = "fake-c2h"
-            self.hw_version = REQUIRED_ANDROMEDA_HW_VERSION
+            self.hw_version = 0x1234ABCD
             self.conv_geometry_mode = user_dma_core.CONV_GEOMETRY_QUEUE_CONFIG
             self.write_shortfall = int(write_shortfall)
             self.read_shortfall = int(read_shortfall)
@@ -1152,21 +1138,6 @@ class PrecompiledBinTests(unittest.TestCase):
         self.assertEqual(rebuilt["program_offset"], hardware["program_offset"])
         self.assertEqual(rebuilt["program_size"], hardware["program_size"])
 
-    def test_offline_conv_chooses_a_layer_specific_uram_split(self):
-        hardware = compile_precompiled_hardware(self._one_conv_payload())
-        conv = next(
-            instruction for instruction in
-            yolov5_precompiled.decode_precompiled_program(hardware)
-            if ((instruction.words[0] >> 8) & 0xF)
-            == user_dma_core.INSTRUCTION_UE_OP
-            and ((instruction.words[5] >> 12) & 0xF)
-            == user_dma_core.UE_MODE.CONV2D.value)
-        wb_uram_addr = (instruction_word := conv.words[4]) >> 16 & 0xFFF
-        output_size = ((instruction_word >> 28) & 0xF) \
-            | ((conv.words[5] & 0xFFF) << 4)
-        self.assertEqual(wb_uram_addr, 1600)
-        self.assertGreater(output_size, user_dma_core.BIAS_BRAM_ELEMENTS)
-
     def test_runtime_has_one_model_upload_and_one_io_transaction_per_image(self):
         self.assertIsNotNone(
             WholeGraphAndromedaBackend,
@@ -1257,25 +1228,11 @@ class PrecompiledBinTests(unittest.TestCase):
                 axi_data_width_bits=PRECOMPILED_AXI_DATA_WIDTH_BITS)
         self.assertEqual(stale_engine.writes, [])
 
-        wrong_version_engine = self.FakeRuntimeEngine()
-        wrong_version_engine.hw_version = 0x12345678
-        with self.assertRaisesRegex(
-                RuntimeError, "requires Andromeda commit b34d1ac8"):
-            WholeGraphAndromedaBackend(
-                wrong_version_engine, payload,
-                axi_data_width_bits=PRECOMPILED_AXI_DATA_WIDTH_BITS)
-        self.assertEqual(wrong_version_engine.writes, [])
-
         wide_engine = self.FakeRuntimeEngine()
-        WholeGraphAndromedaBackend(
-            wide_engine, payload, axi_data_width_bits=512)
-        self.assertEqual(len(wide_engine.writes), 1)
-
-        unsupported_engine = self.FakeRuntimeEngine()
-        with self.assertRaisesRegex(RuntimeError, "AXI-256 or AXI-512"):
+        with self.assertRaisesRegex(RuntimeError, "AXI-256"):
             WholeGraphAndromedaBackend(
-                unsupported_engine, payload, axi_data_width_bits=1024)
-        self.assertEqual(unsupported_engine.writes, [])
+                wide_engine, payload, axi_data_width_bits=512)
+        self.assertEqual(wide_engine.writes, [])
 
         short_write = self.FakeRuntimeEngine(write_shortfall=1)
         with self.assertRaisesRegex(RuntimeError, "wrote .* of"):
