@@ -223,7 +223,7 @@ from __future__ import annotations
 import hashlib
 import struct
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Callable, Optional
 
@@ -494,7 +494,17 @@ class PrivateArena:
                  arena_bytes: Optional[int] = None,
                  isa_bytes: int = PRIVATE_ISA_BYTES,
                  tensor_bytes: int = PRIVATE_TENSOR_BYTES,
+                 external_isa: Optional[tuple] = None,
                  verbose: bool = False):
+        """``external_isa=(base, stride)`` moves the per-engine ISA slices OUT of
+        the private windows and into a region the model owns elsewhere.
+
+        Worth doing when private space is the scarce resource and the model map
+        is not: worker programs are a few MB, so a 16 MB slice per window buys
+        little and costs the weight arena the same 16 MB on every core. With it
+        set, a window is just [ weights | tensor ] and the whole reclaimed slice
+        goes to weights.
+        """
         if arena_bytes is None:
             arena_bytes = private_total()
         assert arena_base % PRIVATE_ALIGN == 0, (
@@ -502,12 +512,23 @@ class PrivateArena:
         self.num_engines = num_engines
         self.arena_base = arena_base
         self.arena_bytes = arena_bytes
-        self.isa_bytes = isa_bytes
+        self.external_isa = external_isa
+        # What the WINDOW reserves for ISA (0 when the slices live elsewhere)
+        # versus how big one engine's ISA slice IS -- the same number only when
+        # the slices are carved from the windows.
+        self._carve_isa_bytes = 0 if external_isa is not None else isa_bytes
+        self.isa_bytes = external_isa[1] if external_isa is not None else isa_bytes
         self.tensor_bytes = tensor_bytes
-        self.stride = private_stride(num_engines, arena_bytes, isa_bytes, tensor_bytes)
+        self.stride = private_stride(num_engines, arena_bytes,
+                                     self._carve_isa_bytes, tensor_bytes)
         self.regions = [private_region(i, num_engines, arena_base, arena_bytes,
-                                       isa_bytes, tensor_bytes)
+                                       self._carve_isa_bytes, tensor_bytes)
                         for i in range(num_engines)]
+        if external_isa is not None:
+            ext_base, ext_stride = external_isa
+            assert ext_base % 64 == 0, "external ISA base must be 64 B aligned"
+            self.regions = [replace(r, isa_base=ext_base + i * ext_stride)
+                            for i, r in enumerate(self.regions)]
         self._weight_cursor = [r.weight_base for r in self.regions]
         self._tensor_cursor = [r.tensor_base for r in self.regions]
         if verbose:
@@ -524,7 +545,7 @@ class PrivateArena:
         return self.regions[engine_idx].isa_base + self.isa_bytes
 
     def weight_bytes(self) -> int:
-        return self.stride - self.isa_bytes - self.tensor_bytes
+        return self.stride - self._carve_isa_bytes - self.tensor_bytes
 
     def usage(self) -> list[int]:
         """Bytes of weight arena used per engine."""
@@ -532,8 +553,21 @@ class PrivateArena:
                 for i in range(self.num_engines)]
 
     def describe(self) -> str:
-        return describe_private_map(self.num_engines, self.arena_base, self.arena_bytes,
-                                    self.isa_bytes, self.tensor_bytes)
+        if self.external_isa is None:
+            return describe_private_map(self.num_engines, self.arena_base,
+                                        self.arena_bytes, self.isa_bytes,
+                                        self.tensor_bytes)
+        # Built from self.regions, not recomputed: the ISA bases were relocated
+        # after the carve and describe_private_map would recompute the old ones.
+        b, st = self.external_isa
+        lines = [f"  Private map: 0x{self.arena_base:08X} .. "
+                 f"+{self.arena_bytes / 2**20:.0f} MB, "
+                 f"{self.num_engines} core(s), {self.stride / 2**20:.0f} MB/core:"]
+        lines += ["    " + r.describe() for r in self.regions]
+        lines.append(f"    ISA slices are OUTSIDE the private map: "
+                     f"0x{b:08X} + {st / 2**20:.0f} MB/core "
+                     f"({st * self.num_engines / 2**20:.0f} MB total)")
+        return "\n".join(lines)
 
     # -- allocation ---------------------------------------------------------
     def alloc_weights(self, engine_idx: int, size_bytes: int, what: str) -> int:
@@ -587,9 +621,12 @@ class PrivateArena:
         region = self.regions[engine_idx]
         limit = self.isa_limit(engine_idx)
         if addr < region.isa_base or addr + size_bytes > limit:
-            spill = ("tensor slice"
-                     if addr + size_bytes <= region.tensor_base + self.tensor_bytes
-                     else "next engine window")
+            if self.external_isa is not None:
+                spill = "next engine's ISA slice or the model map"
+            else:
+                spill = ("tensor slice"
+                         if addr + size_bytes <= region.tensor_base + self.tensor_bytes
+                         else "next engine window")
             raise MemoryError(
                 f"engine {engine_idx} ISA overflow: program "
                 f"[0x{addr:X}..0x{addr + size_bytes:X}) is outside its slice "
@@ -639,15 +676,43 @@ def can_split(N: int, num_engines: int) -> bool:
     return num_engines == 1 or (N % COL_ALIGN == 0 and N // COL_ALIGN >= num_engines)
 
 
+def max_shards(N: int) -> int:
+    """How many engines ``N`` columns can actually feed at 64-column granularity.
+
+    The companion to :func:`can_split` for callers that would rather shard over a
+    subset than not shard at all: pass this as ``max_engines``.
+    """
+    return N // COL_ALIGN if N % COL_ALIGN == 0 else 0
+
+
+class _DenseBF16:
+    """Sentinel ``data_type`` for an UNQUANTIZED bf16 weight blob.
+
+    Not a member of ``TYPE``: that enum is the hardware's quantization-format
+    field, and bf16 weights are the absence of one -- they carry no scale blob
+    and go to ``matmat_mul_core`` rather than ``quantized_matmat_core``. It
+    exists so the column materializer can size and slice a dense blob with the
+    same code path as a quantized one.
+    """
+
+    def __repr__(self) -> str:
+        return "DENSE_BF16"
+
+
+DENSE_BF16 = _DenseBF16()
+
+
 def _weight_elem_bytes(data_type) -> float:
-    """Bytes per weight element for a quantized blob (IF4 packs two per byte)."""
+    """Bytes per weight element for a weight blob (IF4 packs two per byte)."""
     if data_type == user_dma_core.TYPE.IF4:
         return 0.5
     if data_type == user_dma_core.TYPE.IF8:
         return 1.0
+    if data_type is DENSE_BF16:
+        return 2.0
     raise AssertionError(
-        f"materialized weight shards support IF4/IF8 only, got {data_type!r}. "
-        f"For bf16 weights use the zero-copy ColumnShardContext.b_addr() path instead.")
+        f"materialized weight shards support IF4/IF8/DENSE_BF16 only, got "
+        f"{data_type!r}.")
 
 
 # ==========================================================================
@@ -699,6 +764,14 @@ class ShardedWeight:
 
     def shard(self, engine_idx: int) -> WeightShard:
         return self.shards[engine_idx]
+
+    def shard_or_none(self, engine_idx: int) -> Optional[WeightShard]:
+        """This engine's block, or None when the weight was too narrow to reach it.
+
+        A weight sharded with ``max_engines`` covers only engines 0..max-1; the
+        engines past the end still run the round, they just emit nothing for it.
+        """
+        return self.shards[engine_idx] if engine_idx < len(self.shards) else None
 
     def summary(self) -> str:
         parts = ", ".join(f"e{s.engine_idx}:{s.cols}" for s in self.shards)
@@ -1474,8 +1547,15 @@ class MultiEngineScheduler:
         return list(zip(offsets, counts))
 
     # ------------------------------------------------------------- columns --
-    def split_cols(self, N: int, remainder: str = "leading") -> list[tuple[int, int]]:
+    def split_cols(self, N: int, remainder: str = "leading",
+                   max_engines: Optional[int] = None) -> list[tuple[int, int]]:
         """Return [(col_offset, col_count)] per engine for a full column count N.
+
+        ``max_engines`` caps how many engines take part, so a weight too narrow
+        to give every engine a 64-column block can still be shared by the few it
+        does fill (gemma3's N=256 K projection: 4 blocks, 4 engines, the rest
+        idle for that op). The returned list is then SHORTER than num_engines --
+        engine i owns entry i, and engines past the end own nothing.
 
         ``remainder`` decides WHICH engines carry the extra 64-column blocks when N
         does not divide evenly:
@@ -1501,7 +1581,8 @@ class MultiEngineScheduler:
         At bpe=2 a ``col_align``-element block is exactly 128 bytes, so every
         offset this produces is a whole SRAM row (asserted in :func:`_shifted`).
         """
-        n = self.num_engines
+        n = self.num_engines if max_engines is None else min(self.num_engines,
+                                                             max(1, max_engines))
         a = self.col_align
         if n == 1:
             return [(0, N)]
@@ -1511,7 +1592,8 @@ class MultiEngineScheduler:
         blocks = N // a
         assert blocks >= n, (
             f"split_cols: N={N} is only {blocks} block(s) of {a} columns, too few "
-            f"for num_engines={n}")
+            f"for {n} engine(s); pass max_engines<={blocks} to shard it over "
+            f"a subset and leave the rest idle for this op")
         assert remainder in ("leading", "trailing"), \
             f"remainder must be 'leading' or 'trailing', got {remainder!r}"
         base, rem = divmod(blocks, n)
@@ -2324,6 +2406,7 @@ class MultiEngineScheduler:
     def shard_quantized_weight(self, name: str, main_weight_addr: int, main_scale_addr: int,
                                K: int, N: int, layers: int, main_layer_stride: int,
                                data_type=None, remainder: str = "trailing",
+                               max_engines: Optional[int] = None,
                                verbose: bool = True) -> ShardedWeight:
         """MATERIALIZE each engine's column block of a weight into its private arena.
 
@@ -2340,6 +2423,10 @@ class MultiEngineScheduler:
 
         The copy goes card -> host -> card: the source is the image the model loader
         already wrote to DRAM, and there is no device-to-device DMA path.
+
+        Pass ``data_type=DENSE_BF16`` (and ``main_scale_addr=None``) for an
+        unquantized bf16 weight: the row-block slicing is identical, there is
+        simply no scale blob to carry -- see :meth:`shard_bf16_weight`.
         """
         self._require_private_map("shard_quantized_weight")
         if data_type is None:
@@ -2347,14 +2434,17 @@ class MultiEngineScheduler:
         if name in self._weights:
             raise ValueError(f"weight {name!r} already sharded")
         eb = _weight_elem_bytes(data_type)
+        has_scale = data_type is not DENSE_BF16
+        if has_scale and main_scale_addr is None:
+            raise ValueError(f"{name}: {data_type!r} needs main_scale_addr")
         if (K * eb) % 1:
             raise ValueError(f"{name}: K={K} x {eb} B/elem is not a whole number of bytes")
-        assert K % COL_ALIGN == 0, (
+        assert not has_scale or K % COL_ALIGN == 0, (
             f"{name}: K={K} must be a multiple of {COL_ALIGN} -- the scale blob is "
             f"blocked at whole K-vectors, so a column shard's scale stride is only "
             f"linear when K is too")
 
-        splits = self.split_cols(N, remainder=remainder)
+        splits = self.split_cols(N, remainder=remainder, max_engines=max_engines)
         sw = ShardedWeight(name=name, K=K, N=N, layers=layers, data_type=data_type)
 
         # PRE-FLIGHT: check every engine has room BEFORE copying a single byte. Without
@@ -2362,7 +2452,9 @@ class MultiEngineScheduler:
         # some arenas holding this weight and others not -- a state that reads as
         # garbage rather than as an error.
         for engine_idx, (col_offset, cols) in enumerate(splits):
-            need = int(cols * K * eb) * layers + (cols * K // COL_ALIGN) * 2 * layers
+            need = int(cols * K * eb) * layers
+            if has_scale:
+                need += (cols * K // COL_ALIGN) * 2 * layers
             free = (self.regions[engine_idx].weight_limit
                     - self.arena._weight_cursor[engine_idx])
             if need > free:
@@ -2376,9 +2468,10 @@ class MultiEngineScheduler:
 
         for engine_idx, (col_offset, cols) in enumerate(splits):
             w_stride = int(cols * K * eb)                      # this shard, one layer
-            s_stride = (cols * K // COL_ALIGN) * 2
+            s_stride = (cols * K // COL_ALIGN) * 2 if has_scale else 0
             w_addr = self._alloc_private(engine_idx, w_stride * layers, f"{name} weights")
-            s_addr = self._alloc_private(engine_idx, s_stride * layers, f"{name} scales")
+            s_addr = (self._alloc_private(engine_idx, s_stride * layers, f"{name} scales")
+                      if has_scale else 0)
             sw.shards.append(WeightShard(
                 engine_idx=engine_idx, col_offset=col_offset, cols=cols,
                 weight_addr=w_addr, scale_addr=s_addr,
@@ -2387,13 +2480,15 @@ class MultiEngineScheduler:
         # One layer at a time: read the full row block for this layer, scatter the slices.
         for layer in range(layers):
             src_w = main_weight_addr + layer * main_layer_stride
-            src_s = main_scale_addr + layer * main_layer_stride
+            src_s = (main_scale_addr + layer * main_layer_stride) if has_scale else 0
             for shard in sw.shards:
                 w_off = int(shard.col_offset * K * eb)
-                s_off = (shard.col_offset * K // COL_ALIGN) * 2
                 self._copy_dram_bytes(src_w + w_off,
                                       shard.weight_addr + layer * shard.layer_stride,
                                       shard.layer_stride)
+                if not has_scale:
+                    continue
+                s_off = (shard.col_offset * K // COL_ALIGN) * 2
                 self._copy_dram_bytes(src_s + s_off,
                                       shard.scale_addr + layer * shard.scale_layer_stride,
                                       shard.scale_layer_stride)
@@ -2403,6 +2498,25 @@ class MultiEngineScheduler:
             used = [f"{u / 2**20:.1f}MB" for u in self.private_usage()]
             print(f"  sharded {sw.summary()}; private arenas used: {', '.join(used)}")
         return sw
+
+    def shard_bf16_weight(self, name: str, main_weight_addr: int,
+                          K: int, N: int, layers: int, main_layer_stride: int,
+                          remainder: str = "trailing",
+                          max_engines: Optional[int] = None,
+                          verbose: bool = True) -> ShardedWeight:
+        """MATERIALIZE column blocks of an UNQUANTIZED bf16 ``[N, K]`` weight.
+
+        For the weights a model deliberately keeps in bf16 (Qwen2.5-VL's v_proj
+        and o_proj, where attention accuracy pays for the width). Column shards
+        do not care about the element format: the blob is row-major in N, so a
+        column block is a contiguous row block either way. The result feeds
+        ``matmat_mul_core`` -- ``scale_addr`` is 0 and there is no scale blob.
+        """
+        return self.shard_quantized_weight(
+            name=name, main_weight_addr=main_weight_addr, main_scale_addr=None,
+            K=K, N=N, layers=layers, main_layer_stride=main_layer_stride,
+            data_type=DENSE_BF16, remainder=remainder, max_engines=max_engines,
+            verbose=verbose)
 
     def _copy_dram_bytes(self, src_addr: int, dst_addr: int, size_bytes: int) -> None:
         """Move a raw byte range within device DRAM, staging through the host.
@@ -2680,6 +2794,14 @@ class MultiEngineScheduler:
                     if isinstance(op, AttentionOp):
                         continue
                     sw = op[0]
+                    if idx >= len(sw.shards):
+                        raise NotImplementedError(
+                            f"{sw.name} was sharded over {len(sw.shards)} of "
+                            f"{self.num_engines} engine(s) (max_engines), and the "
+                            f"folded worker-program emitter has no way to skip an "
+                            f"op for one engine inside a shared round body. Emit "
+                            f"the worker streams directly (begin_worker_round / "
+                            f"end_worker_round) for partially-sharded weights.")
                     shard = sw.shard(idx)
                     gpr_w = ue.alloc_isa_reg()
                     gpr_s = ue.alloc_isa_reg()
@@ -2806,6 +2928,11 @@ class MultiEngineScheduler:
         unlike a single-engine path that can keep the vector on-chip and read the
         register directly.
         """
+        if len(sw.shards) != self.num_engines:
+            raise NotImplementedError(
+                f"sharded_argmax needs every engine to hold a slice, but {sw.name} "
+                f"covers {len(sw.shards)} of {self.num_engines} engine(s); the "
+                f"engines without one never produced a candidate")
         best_idx, best_val = None, None
         for i in range(self.num_engines):
             shard = sw.shard(i)
