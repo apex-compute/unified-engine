@@ -249,7 +249,37 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
         _SILENT_MODE = on
         return prev
 
-    def write_run_summary(self, out_path: str, args) -> str:
+    def _profile_tables(self, stages) -> list:
+        """Per-phase markdown tables for one or more stages.
+
+        Shared by every stage: the aggregation, the peak-utilisation guard and
+        the column set are identical whether the samples came from the vision
+        encoder, prefill, or a decode step.
+        """
+        peak = self.vis_peak_gflops()
+        out = []
+        for title, note, results in stages:
+            if not results:
+                continue
+            rows = self._aggregate_vis_profile(results)
+            total = sum(r["ms"] for r in rows) or 1.0
+            out += [f"### {title}", ""]
+            if note:
+                out += [note, ""]
+            out += ["| phase | calls | total ms | share | GFLOP | GFLOPS | % of peak |",
+                    "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |"]
+            for name, n, ms, share, gf, gfs, util in self._vis_profile_table(rows, total):
+                out.append(f"| {name} | {n} | {ms:.2f} | {share:.1f}% | "
+                           f"{gf:.2f} | {gfs:.1f} | {util:.1f}% |")
+            tot_gf = sum(r["flops"] for r in rows) / 1e9
+            tot_gfs = tot_gf / (total / 1e3) if total else 0.0
+            out.append(f"| **TOTAL** | {len(results)} | {total:.2f} | 100.0% | "
+                       f"{tot_gf:.2f} | {tot_gfs:.1f} | "
+                       f"{(100 * tot_gfs / peak if peak else 0):.1f}% |")
+            out.append("")
+        return out
+
+    def write_run_summary(self, out_path: str, args, profiles=None) -> str:
         """Per-run Markdown summary: hardware, sizes, and per-stage metrics.
 
         Reads only attributes the stages already stashed plus cheap host-side
@@ -365,6 +395,14 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
                 "",
             ]
 
+        if profiles:
+            L += ["## Per-phase profile", "",
+                  "Phase latencies come from the HW counter between per-phase HALTs: "
+                  "they exclude host time but include one stop/restart per phase. "
+                  "`*` marks phases that run on core 0 only, whose % of peak is "
+                  "measured against ONE core.", ""]
+            L += self._profile_tables(profiles)
+
         prompt = getattr(self, "_prompt_text", None)
         if prompt is not None:
             L += ["## Prompt & output", "", "### Prompt", "", "```", prompt, "```", ""]
@@ -465,11 +503,17 @@ qwen2.5_vl_3b_numeric.py.""")
                         help="Cap on generated tokens (default 256). A low cap is the "
                              "guard against a bad argmax decoding until the context "
                              "fills, which is indistinguishable from a hung board.")
+    parser.add_argument("--profile-ctx", type=int, default=MAX_CONTEXT_SIZE,
+                        help=f"Context length for the SECOND profiled decode step "
+                             f"(default {MAX_CONTEXT_SIZE}, the full context). The first "
+                             f"is taken right after prefill, so the pair brackets decode "
+                             f"cost from the shortest to the longest KV history.")
     parser.add_argument("--profile", action="store_true",
                         help="Compile the encoder with per-phase HALT checkpoints and "
                              "print a HW-latency breakdown by phase. Read the share "
-                             "column: it says which phase is worth sharding. Works with "
-                             "--multi-core (checkpoints sit outside sharded regions).")
+                             "column: it says which phase is worth sharding. Covers the "
+                             "vision encoder, LM prefill, and two decode steps. Works "
+                             "with --multi-core.")
     add_engine_args(parser)
     return parser
 
@@ -514,6 +558,23 @@ def clean_dram_4gb(ue=None, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
     ue.clear_dram(chunk_size_bytes=chunk_size_bytes)
     if owned:
         del ue
+
+
+def summary_filename(args, cores: int) -> str:
+    """One .md per run, named for the CLI config that produced it.
+
+    Script stem plus arg tags only -- `_<dev>`, `_image`, `_multi-core_N`,
+    `_profile` -- so two runs collide only when they were genuinely the same
+    configuration, and the filename says which one it was.
+    """
+    tags = [args.dev]
+    if args.image:
+        tags.append("image")
+    if cores > 1:
+        tags.append(f"multi-core_{cores}")
+    if args.profile:
+        tags.append("profile")
+    return "qwen2.5_vl_3b_test_" + "_".join(tags) + ".md"
 
 
 def process_image(image_path: str, size: int = 336) -> torch.Tensor:
@@ -593,13 +654,50 @@ def main():
         context, seed = prefill_tokens[:-1], prefill_tokens[-1]
 
         print(f"\n--- LM compile ---")
-        ue.compile_prefill(len(context))
-        ue.compile_decoder()
+        if args.profile:
+            # Three programs: a checkpointed prefill, a checkpointed decoder for
+            # the two profiled steps, and a PLAIN decoder to advance the context
+            # between them -- a checkpointed program only runs segment by
+            # segment, so building context with it would cost ~180 host round
+            # trips per token.
+            ue.compile_prefill(len(context), profile=True)
+            ue.compile_decoder(profile=True)
+            prof_dec = (ue._decoder_program, list(ue._decoder_checkpoints))
+            ue.compile_decoder(profile=False)
+        else:
+            ue.compile_prefill(len(context))
+            ue.compile_decoder()
 
         print(f"\n--- Prefill ({len(context)} tokens) ---")
         ue.run_prefill(context, image_embeddings=image_embeddings,
                        positions=None if positions is None
-                       else positions[:len(context)])
+                       else positions[:len(context)],
+                       profile=args.profile)
+
+        if args.profile:
+            print(f"\n--- Profiled decode: 1st token (ctx {ue.seq_len}) ---")
+            first_res, tok, aligned_1 = ue.run_decode_step_profiled(seed, *prof_dec)
+            ctx_1 = ue.seq_len
+            # Jump straight to the target context. --profile measures TIME, not
+            # numerics, and a step's cost is set by the KV *length* -- gf_seq_len,
+            # gf_aligned_seq_len, the bias width -- not by what the cache holds.
+            # Generating there would never arrive anyway: the model hits EOS long
+            # before the context fills, and a checkpointed program costs ~180
+            # round trips per token. So the position is simply forced.
+            ue.seq_len = max(ue.seq_len, args.profile_ctx - 1)
+            print(f"  forcing ctx {args.profile_ctx} (timing only; KV rows past "
+                  f"the prompt are zeros, which does not change latency)")
+            print(f"\n--- Profiled decode: at context (ctx {ue.seq_len}) ---")
+            ctx_res, _, aligned_2 = ue.run_decode_step_profiled(tok, *prof_dec)
+            profiles.extend([
+                ("LM prefill", f"{len(context)} tokens.",
+                 getattr(ue, "_prefill_profile", None)),
+                ("LM decode — 1st token",
+                 f"Context {ctx_1} tokens (aligned {aligned_1}).", first_res),
+                ("LM decode — full context",
+                 f"Context {ue.seq_len} tokens (aligned {aligned_2}).", ctx_res),
+            ])
+            return ""
 
         # "--- Decode run ---" ... "Decoder done in" is one of the stdout formats
         # model_auto_test._extract_decode_text knows how to slice; without a
@@ -621,16 +719,15 @@ def main():
         }))
         return text
 
+    profiles = []          # (title, note, samples) collected across stages
+
     def _write_summary():
-        name = (f"qwen2.5_vl_3b_run_{args.dev}"
-                f"{'_image' if args.image else ''}"
-                f"{'_multi-core_%d' % cores if cores > 1 else ''}.md")
-        out = os.path.join(SCRIPT_DIR, name)
+        out = os.path.join(SCRIPT_DIR, summary_filename(args, cores))
         try:
-            ue.write_run_summary(out, args)
-            print(f"\nWrote run summary: {out}")
+            ue.write_run_summary(out, args, profiles=profiles or None)
+            print(f"\nWrote summary: {out}")
         except Exception as exc:
-            print(f"[warn] failed to write run summary: {exc}")
+            print(f"[warn] failed to write summary: {exc}")
 
     if not args.image:
         _run_lm()
@@ -673,14 +770,11 @@ def main():
     embeddings = ue.run_vision_encoder(profile=args.profile)
 
     if args.profile:
-        name = (f"qwen2.5_vl_3b_vision_profile_{args.dev}"
-                f"{'_multi-core_%d' % cores if cores > 1 else ''}.md")
-        out = os.path.join(SCRIPT_DIR, name)
-        try:
-            ue.write_vision_profile_summary(out, args)
-            print(f"\nWrote profile summary: {out}")
-        except Exception as exc:
-            print(f"[warn] failed to write profile summary: {exc}")
+        d = ue._vision_dims()
+        profiles.append(("Vision encoder",
+                         f"{d['VL']} layers, {d['VS']} patches -> "
+                         f"{d['NUM_MERGED_TOKENS']} tokens.",
+                         getattr(ue, "_vis_profile", None)))
     print(f"\nEncoder output {tuple(embeddings.shape)}: "
           f"mean {embeddings.float().mean():+.4f}, std {embeddings.float().std():.4f}, "
           f"absmax {embeddings.float().abs().max():.4f}")

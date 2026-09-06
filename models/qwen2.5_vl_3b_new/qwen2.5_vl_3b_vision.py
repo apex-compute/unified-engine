@@ -680,7 +680,7 @@ class Qwen25VLVisionMixin:
 
                 sched.sharded_region(VS, _proj)
                 flops += acc[0]
-            _ckpt(f"L{li}:norm+proj")
+            _ckpt(f"L{li}:qkv_proj")
 
             # Token-major -> head-major. Viewing the fused QK output as
             # [VS, 2*VN, VD_PAD] makes Q's heads groups 0..VN-1 and K's heads
@@ -793,7 +793,7 @@ class Qwen25VLVisionMixin:
                     M=VS, N=VH, dram_a=IN, dram_b=self.VIS_O_PROJ,
                     dram_out=self.VIS_RESIDUAL, mode=UE_MODE.ELTWISE_ADD,
                     gpr_M_reg=self._prime_M(VS)) or 0
-                _ckpt(f"L{li}:o_proj+resid")
+
 
                 # --- SwiGLU MLP ---
                 flops += self.rms_norm_core_dram(
@@ -813,7 +813,12 @@ class Qwen25VLVisionMixin:
                     M=VS, N=VH, dram_a=self.VIS_RESIDUAL, dram_b=self.VIS_MLP_DOWN,
                     dram_out=OUT, mode=UE_MODE.ELTWISE_ADD,
                     gpr_M_reg=self._prime_M(VS)) or 0
-                _ckpt(f"L{li}:mlp")
+                # ONE phase, matching the sharded path's single region: the
+                # multi-core body fuses o_proj through the MLP so only its entry
+                # and exit need a rendezvous, and a checkpoint inside a region
+                # would strand the workers. Naming the serial path the same way
+                # is what makes the 1-core and N-core tables comparable.
+                _ckpt(f"L{li}:o_proj+mlp")
             else:
                 # o_proj through the second residual is one region: within an
                 # engine's rows the chain is sequential, so only region entry
@@ -990,9 +995,10 @@ class Qwen25VLVisionMixin:
                 row["suspect"] = True
                 self._loud(
                     f"  [warn] {phase}: {row['util_pct']:.1f}% of peak is "
-                    f"impossible. Check _VIS_SERIAL_PHASES against what "
-                    f"compile_vision_encoder actually shards"
-                    f"{' (marked serial, but is it?)' if row['serial'] else ''}.")
+                    f"impossible -- the FLOP count is billed at shapes the "
+                    f"hardware did not run, or the phase's share of the total "
+                    f"is misattributed"
+                    f"{' (also check _VIS_SERIAL_PHASES)' if row['serial'] else ''}.")
             else:
                 row["suspect"] = False
             rows.append(row)
@@ -1044,94 +1050,6 @@ class Qwen25VLVisionMixin:
         else:
             print(f"    These do not shrink with more cores; at {cores} cores they "
                   f"are already {100 * frac:.1f}% of the total.")
-
-    def write_vision_profile_summary(self, out_path: str, args=None) -> str:
-        """Write the profile run as markdown: HW info, then the phase table.
-
-        The table carries measured GFLOPS and % of peak per phase on top of the
-        latency split -- utilisation is what says whether a phase is worth
-        sharding (near peak: more engines help) or stalled on something else
-        (far from peak: find the stall first).
-        """
-        rows = self._aggregate_vis_profile(self._vis_profile)
-        total_ms = sum(r["ms"] for r in rows) or 1.0
-        peak = self.vis_peak_gflops()
-        cores = getattr(self, "multi_core", 1)
-        clock_ns = getattr(self, "_clock_period_ns", None) or user_dma_core.CLOCK_CYCLE_TIME_NS
-        freq_mhz = 1000.0 / clock_ns if clock_ns else 0.0
-        try:
-            hw_version = f"0x{self.user_read_reg32(user_dma_core.UE_FPGA_VERSION_ADDR) & 0xFFFFFFFF:08x}"
-        except Exception as exc:
-            hw_version = f"(read failed: {exc})"
-        d = self._vision_dims()
-        prog_bytes = len(getattr(self, "_vis_program_bytes", b""))
-        weight_mib = (getattr(self, "_vis_weight_end", 0)
-                      - getattr(self, "_vis_weight_start", 0)) / 2**20
-
-        L = [
-            "# qwen2.5_vl_3b vision encoder — profile summary",
-            "",
-            "## Hardware",
-            "",
-            f"- **HW version:** {hw_version}",
-            f"- **Device:** {getattr(args, 'dev', 'xdma0')}",
-            f"- **Clock:** {clock_ns:.4f} ns ({freq_mhz:.1f} MHz)",
-            f"- **AXI data width:** {user_dma_core.UE_AXI_DATA_WIDTH_BITS} bits",
-            f"- **DRAM:** {user_dma_core.AVAILABLE_DRAM_SIZE_GB} GiB",
-            f"- **Cores in use (--multi-core):** {cores}"
-            f" of {user_dma_core.ANDROMEDA_CORE_COUNT} reported",
-            f"- **Peak throughput:** {peak:.1f} GFLOPS "
-            f"({freq_mhz:.1f} MHz x 128 x {cores} core(s))",
-            "",
-            "## Encoder",
-            "",
-            f"- **Image:** `{os.path.basename(getattr(args, 'image', '') or '')}` "
-            f"-> {d['VS']} patches -> {d['NUM_MERGED_TOKENS']} tokens",
-            f"- **Layers:** {d['VL']} (full attention at "
-            f"{sorted(d['FULL_ATTN_LAYERS'])}, block-diagonal window mask elsewhere)",
-            f"- **Weights:** {weight_mib:.1f} MiB IF4 at "
-            f"0x{getattr(self, '_vis_weight_start', 0):X}",
-            f"- **Program image:** {prog_bytes / 2**20:.2f} MiB "
-            f"({prog_bytes // INSTRUCTION_SIZE_BYTES:,} instructions)",
-            f"- **Tensor DRAM:** {self.get_tensor_dram_usage() / 2**20:.1f} MiB",
-            "",
-            "## Per-phase profile",
-            "",
-            "Phase latencies come from the HW counter between per-phase HALTs, so "
-            "they exclude host time but include one stop/restart per phase "
-            "(~0.1 s over the whole run).",
-            "",
-            "| phase | calls | total ms | share | GFLOP | GFLOPS | % of peak |",
-            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
-        ]
-        for name, n, ms, share, gf, gfs, util in self._vis_profile_table(rows, total_ms):
-            L.append(f"| {name} | {n} | {ms:.1f} | {share:.1f}% | "
-                     f"{gf:.1f} | {gfs:.1f} | {util:.1f}% |")
-        tot_gf = sum(r["flops"] for r in rows) / 1e9
-        tot_gfs = tot_gf / (total_ms / 1e3) if total_ms else 0.0
-        L.append(f"| **TOTAL** | {len(self._vis_profile)} | {total_ms:.1f} | 100.0% | "
-                 f"{tot_gf:.1f} | {tot_gfs:.1f} | "
-                 f"{(100 * tot_gfs / peak if peak else 0):.1f}% |")
-
-        blocked = sum(r["ms"] for r in rows if r["serial"])
-        frac = blocked / total_ms if total_ms else 0.0
-        L += [
-            "",
-            f"`*` marks phases that run on core 0 only (strided-DMA permutes, the "
-            f"pad-lane trim, the merger tail); their % of peak is measured against "
-            f"ONE core. RoPE is sharded despite being outside "
-            f"`multi_engine_shard.SHARDED_OP_ALLOWLIST` -- it is row-independent, so "
-            f"it goes through `ctx.unsafe_ue`. The serial phases are "
-            f"**{100 * frac:.1f}%** of this run's HW time"
-            + (f", an Amdahl ceiling of "
-               f"**{1.0 / (frac + (1 - frac) / 8):.2f}x** at 8 cores."
-               if cores == 1 else
-               f"; they do not shrink as cores are added."),
-            "",
-        ]
-        with open(out_path, "w") as f:
-            f.write("\n".join(L))
-        return out_path
 
     def run_vision_encoder(self, timeout_s: float = 600.0,
                            profile: bool = False) -> torch.Tensor:

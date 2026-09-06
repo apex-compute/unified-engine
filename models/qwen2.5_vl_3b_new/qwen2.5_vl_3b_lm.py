@@ -32,7 +32,8 @@ import torch
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, TYPE, UE_MODE, UE_VECTOR_SIZE, ue_35bit_addr_shifter)
+    DMA_DEVICE_H2C, INSTRUCTION_SIZE_BYTES, TYPE, UE_MODE, UE_VECTOR_SIZE,
+    ue_35bit_addr_shifter)
 
 LM_QUANT_PRECISION = "if4"
 
@@ -347,7 +348,8 @@ class Qwen25VLLMMixin:
 
     def _emit_layer(self, li: int, M: int, *, decode: bool, m_reg: int,
                     aligned_kv: int, in_addr: int, out_addr: int,
-                    rope_base: int, aligned_kv_reg: int = None) -> int:
+                    rope_base: int, aligned_kv_reg: int = None,
+                    ckpt=None) -> int:
         """One decoder layer. Shared by prefill (M=seq) and decode (M=1)."""
         d = self._lm_dims()
         H, AHD, KVH, QH, G, MLP = (d["H"], d["AHD"], d["KVH"], d["QH"],
@@ -390,11 +392,13 @@ class Qwen25VLLMMixin:
         flops += self.rms_norm_core_dram(
             M=M, N=H, A_DRAM_ADDR=in_addr, OUTPUT_DRAM_ADDR=self.LM_PRE_NORM,
             GAMMA_DRAM_ADDR=la["ln1"], gpr_M_reg=m_reg) or 0
+        ckpt(f"L{li}:norm1", flops)
         flops += mm(H, QH * AHD, self.LM_PRE_NORM, "q", self.LM_Q, bias=la["q_bias"])
         flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "k", self.LM_K, bias=la["k_bias"])
         flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "v", self.LM_V,
                     quant=False, bias=la["v_bias"])
 
+        ckpt = ckpt or (lambda name, f: None)
         rope_cos, rope_sin = rope_base, rope_base + AHD * bpe
         # ATTENTION BATCH MUST BE 64-ALIGNED. unified_attention_core consumes Q
         # in 64-row tiles, so a batch of 37 rounds DOWN to zero tiles and the
@@ -409,6 +413,8 @@ class Qwen25VLLMMixin:
         # zero output and I read that as an alignment rule; the real cause was
         # the under-sized scratch fixed above.)
         head_rows = M
+
+        ckpt(f"L{li}:qkv_proj", flops)
 
         # Q token-major [M, QH, AHD] -> head-major [QH, M, AHD].
         self.bf16_permute_dram_core(QH, M, AHD, self.LM_Q, self.LM_Q_HM,
@@ -481,6 +487,8 @@ class Qwen25VLLMMixin:
                     cos_dram_addr=rope_cos, sin_dram_addr=rope_sin,
                     gpr_M_reg=m_reg) or 0
 
+        ckpt(f"L{li}:rope+cache", flops)
+
         # GQA attention.
         #
         # DECODE GROUPS THE 8 Q HEADS THAT SHARE A KV HEAD INTO ONE CALL. At
@@ -532,11 +540,15 @@ class Qwen25VLLMMixin:
             # throughput. run_decoder rescales it by the actual length.
             self._emit_attn_flops += f
 
+        ckpt(f"L{li}:attention", flops)
+
         self.bf16_permute_dram_core(QH, M, AHD, self.LM_ATTN_HM,
                                     self.LM_ATTN_RESULT, write_grouped=False,
                                     group_stride_rows=head_rows)
+        ckpt(f"L{li}:attn_permute", flops)
         flops += mm(QH * AHD, H, self.LM_ATTN_RESULT, "o", self.LM_ATTN_PROJ,
                     quant=False)
+        ckpt(f"L{li}:o_proj", flops)
         flops += self.eltwise_core_dram(
             M=M, N=H, dram_a=in_addr, dram_b=self.LM_ATTN_PROJ,
             dram_out=self.LM_RESIDUAL, mode=UE_MODE.ELTWISE_ADD,
@@ -545,6 +557,7 @@ class Qwen25VLLMMixin:
             M=M, N=H, A_DRAM_ADDR=self.LM_RESIDUAL,
             OUTPUT_DRAM_ADDR=self.LM_MLP_NORM, GAMMA_DRAM_ADDR=la["ln2"],
             gpr_M_reg=m_reg) or 0
+        ckpt(f"L{li}:resid+norm2", flops)
         flops += mm(H, MLP, self.LM_MLP_NORM, "gate", self.LM_MLP_GATE, silu=True)
         flops += mm(H, MLP, self.LM_MLP_NORM, "up", self.LM_MLP_UP)
         flops += self.eltwise_core_dram(
@@ -552,12 +565,57 @@ class Qwen25VLLMMixin:
             dram_out=self.LM_MLP_MULT, mode=UE_MODE.ELTWISE_MUL,
             gpr_M_reg=m_reg) or 0
         flops += mm(MLP, H, self.LM_MLP_MULT, "down", self.LM_MLP_DOWN)
+        ckpt(f"L{li}:mlp_proj", flops)
         flops += self.eltwise_core_dram(
             M=M, N=H, dram_a=self.LM_RESIDUAL, dram_b=self.LM_MLP_DOWN,
             dram_out=out_addr, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m_reg) or 0
+        ckpt(f"L{li}:resid2", flops)
         return flops
 
-    def compile_prefill(self, seq_len: int, layer_size: int = None) -> int:
+    def _make_ckpt(self, profile: bool, base_ref, store):
+        """Phase-boundary checkpoint emitter shared by prefill and decode.
+
+        Each call ends the current phase with a HALT and records where to
+        resume, so the run driver can time phases separately.
+
+        THE RUNNING FLOP TOTAL IS PASSED IN, not read from an outer variable.
+        _emit_layer accumulates into a local and only publishes it on return, so
+        a checkpoint firing mid-layer would otherwise be billed the PREVIOUS
+        layer's total -- which reported norm+qkv at 1348% of peak.
+        ``base_ref[0]`` carries the total from layers already emitted.
+        """
+        last = [0]
+
+        def ckpt(name: str, flops_in_layer: float = 0.0) -> None:
+            if not profile:
+                return
+            self.generate_instruction_halt()
+            resume = (self.get_program_dram_addr()
+                      + self.capture_count * INSTRUCTION_SIZE_BYTES)
+            total = base_ref[0] + flops_in_layer
+            store.append([name, resume, int(total - last[0])])
+            last[0] = int(total)
+
+        return ckpt
+
+    def _run_checkpointed(self, start_addr: int, checkpoints, timeout_s: float):
+        """Drive a profile-compiled program segment by segment.
+
+        Every phase ends in a HALT, so the program only advances when restarted
+        at the recorded resume address. It still computes the full result --
+        the segments tile the whole program.
+        """
+        results = []
+        self.start_execute_from_dram(start_addr)
+        for name, resume, ph_flops in checkpoints:
+            self.wait_queue(timeout_s)
+            results.append((name, self.report_latency_in_us() / 1e3, ph_flops))
+            self.start_execute_from_dram(resume)
+        self.wait_queue(timeout_s)
+        return results
+
+    def compile_prefill(self, seq_len: int, layer_size: int = None,
+                        profile: bool = False) -> int:
         """Emit a prefill program for exactly ``seq_len`` tokens.
 
         Compiled per prompt rather than made length-agnostic: the head-major
@@ -582,6 +640,9 @@ class Qwen25VLLMMixin:
         m_reg = self.gf_seq_len
         self.generate_instruction_add_set(m_reg, seq_len)
         flops = 0
+        flops_ref = [0]
+        self._prefill_checkpoints = []
+        ckpt = self._make_ckpt(profile, flops_ref, self._prefill_checkpoints)
         nl = d["NL"] if layer_size is None else layer_size
         for li in range(nl):
             in_addr = self.LM_IO_A if li % 2 == 0 else self.LM_IO_B
@@ -589,7 +650,8 @@ class Qwen25VLLMMixin:
             flops += self._emit_layer(
                 li, seq_len, decode=False, m_reg=m_reg, aligned_kv=aligned,
                 in_addr=in_addr, out_addr=out_addr,
-                rope_base=self.LM_ROPE_PRE)
+                rope_base=self.LM_ROPE_PRE, ckpt=ckpt)
+            flops_ref[0] = flops
         self.generate_instruction_halt()
         self._set_silent(prev)
         self.stop_capture()
@@ -615,7 +677,8 @@ class Qwen25VLLMMixin:
                    f"{flops / 1e9:.1f} GFLOP, {time.perf_counter() - t0:.1f}s")
         return base
 
-    def compile_decoder(self, layer_size: int = None) -> int:
+    def compile_decoder(self, layer_size: int = None,
+                        profile: bool = False) -> int:
         """Emit ONE position-agnostic decode program.
 
         Everything that depends on the step is a register: gf_seq_len is the KV
@@ -634,6 +697,9 @@ class Qwen25VLLMMixin:
         m_reg = self.gf_one
         self.generate_instruction_add_set(m_reg, 1)
         flops = 0
+        flops_ref = [0]
+        self._decoder_checkpoints = []
+        ckpt = self._make_ckpt(profile, flops_ref, self._decoder_checkpoints)
         nl = d["NL"] if layer_size is None else layer_size
         for li in range(nl):
             in_addr = self.LM_IO_A if li % 2 == 0 else self.LM_IO_B
@@ -646,7 +712,8 @@ class Qwen25VLLMMixin:
                 # short context does not pay for a full one.
                 aligned_kv=self.MAX_CONTEXT_SIZE,
                 aligned_kv_reg=self.gf_aligned_seq_len, in_addr=in_addr,
-                out_addr=out_addr, rope_base=self.LM_ROPE_DEC)
+                out_addr=out_addr, rope_base=self.LM_ROPE_DEC, ckpt=ckpt)
+            flops_ref[0] = flops
 
         final_buf = self.LM_IO_A if nl % 2 == 0 else self.LM_IO_B
         self.LM_DECODE_OUT = final_buf
@@ -654,6 +721,8 @@ class Qwen25VLLMMixin:
             M=1, N=d["H"], A_DRAM_ADDR=final_buf,
             OUTPUT_DRAM_ADDR=self.LM_OUT_NORM,
             GAMMA_DRAM_ADDR=self.final_norm_addr, gpr_M_reg=m_reg) or 0
+        ckpt("final_norm", flops - flops_ref[0])
+
         # LM head with the penalty vector as its bias term: the HW argmax of
         # (logits + bias) is the answer, so write_back_disable keeps the 151936
         # logits off the bus entirely. An all-zero bias is plain greedy.
@@ -663,6 +732,7 @@ class Qwen25VLLMMixin:
             SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4,
             C_DRAM_ADDR=self.PENALTY_BIAS, bias_mode="broadcast_N",
             write_back_disable=True) or 0
+        ckpt("lm_head", flops - flops_ref[0])
         self.generate_instruction_add_inc(self.gf_seq_len)
         self.generate_instruction_halt()
         self._set_silent(prev)
@@ -702,7 +772,8 @@ class Qwen25VLLMMixin:
         self.dma_write(DMA_DEVICE_H2C, addr, blob, len(blob))
         return addr
 
-    def run_prefill(self, tokens, image_embeddings=None, positions=None) -> None:
+    def run_prefill(self, tokens, image_embeddings=None, positions=None,
+                    profile: bool = False) -> None:
         """Embed the prompt (splicing image tokens if given), then run prefill."""
         d = self._lm_dims()
         seq_len = len(tokens)
@@ -730,9 +801,16 @@ class Qwen25VLLMMixin:
 
         addr = self._upload(self._prefill_program)
         t0 = time.perf_counter()
-        self.start_execute_from_dram(addr)
-        self.wait_queue(180.0)
-        us = self.report_latency_in_us()
+        if profile:
+            cps = getattr(self, "_prefill_checkpoints", [])
+            if not cps:
+                raise RuntimeError("profiled prefill needs compile_prefill(profile=True)")
+            self._prefill_profile = self._run_checkpointed(addr, cps, 180.0)
+            us = sum(r[1] for r in self._prefill_profile) * 1e3
+        else:
+            self.start_execute_from_dram(addr)
+            self.wait_queue(180.0)
+            us = self.report_latency_in_us()
         # Prefill's compile-time shapes ARE what runs -- it is compiled for this
         # exact seq_len -- so the cores' FLOP sum needs no rescaling, unlike
         # decode's. The guard is here anyway: >100% of peak is impossible and
@@ -749,6 +827,45 @@ class Qwen25VLLMMixin:
         self._prefill_gflops = gflops
         self._prefill_wall_s = time.perf_counter() - t0
         self._prefill_seq_len_run = seq_len
+
+    def run_decode_step_profiled(self, token: int, program, checkpoints,
+                                 timeout_s: float = 60.0):
+        """One profiled decode step at the CURRENT context length.
+
+        Runs a real step -- it writes K/V at gf_seq_len and advances the
+        position -- so calling it twice, once right after prefill and once after
+        some tokens, gives the 1st-token and at-context breakdowns that bracket
+        how attention grows while the projections stay fixed.
+        """
+        d = self._lm_dims()
+        addr, _ = program
+        self._upload(program)
+        step_pos = self.seq_len
+        self.seq_len += 1
+        aligned = ((self.seq_len + 63) // 64) * 64
+
+        self.dma_to_accelerator_memory(
+            self.LM_IO_A, self.get_embedding_for_tokens([token]).flatten())
+        pos = step_pos + getattr(self, "_rope_offset", 0)
+        self.load_rope_for_positions(torch.tensor([[pos, pos, pos]]), decode=True)
+        bias = torch.full((self.LM_BATCH_ROWS, aligned), float("-inf"),
+                          dtype=torch.bfloat16)
+        bias[:, :self.seq_len] = 0.0
+        self.dma_to_accelerator_memory(self.LM_BIAS, bias)
+
+        self.clear_inst_id()
+        self.start_capture()
+        self.generate_instruction_add_set(self.gf_seq_len, step_pos)
+        self.generate_instruction_add_set(self.gf_aligned_seq_len, aligned)
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(addr))
+        self.stop_capture()
+        self.write_captured_instructions_to_dram(self._decoder_preamble)
+        self.clear_capture_buffer()
+
+        prev = self._set_silent(True)
+        results = self._run_checkpointed(self._decoder_preamble, checkpoints, timeout_s)
+        self._set_silent(prev)
+        return results, self.get_arg_max_index(), aligned
 
     def run_decoder(self, first_token: int, max_new_tokens: int = 256) -> tuple[int, str]:
         """Greedy decode until EOS, ``max_new_tokens``, or the context fills.
