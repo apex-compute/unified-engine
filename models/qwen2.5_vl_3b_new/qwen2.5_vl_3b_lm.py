@@ -377,7 +377,12 @@ class Qwen25VLLMMixin:
         contiguous row block, so it materializes into the private arenas too.
         o is bf16 as well and N=H=2048, so it splits 8 ways like q -- but it
         consumes the ATTENTION output, so it cannot ride the qkv rendezvous and
-        opens a second one after the permute.
+        opens a second one after the permute. gate and up (N=11008, 172 blocks:
+        21 per engine with the last four taking 22) read the same post-norm
+        input and write disjoint buffers, so they share a third; down
+        (N=H=2048) consumes their product and takes a fourth. Four rendezvous
+        per layer is the minimum the dataflow allows -- each one separates a
+        producer from its consumer.
         """
         cached = getattr(self, "_decode_shards", None)
         if cached is not None:
@@ -391,7 +396,10 @@ class Qwen25VLLMMixin:
             for op, K, N, quant in (("q", d["H"], d["QH"] * d["AHD"], True),
                                     ("k", d["H"], d["KVH"] * d["AHD"], True),
                                     ("v", d["H"], d["KVH"] * d["AHD"], False),
-                             ("o", d["QH"] * d["AHD"], d["H"], False)):
+                             ("o", d["QH"] * d["AHD"], d["H"], False),
+                             ("gate", d["H"], d["MLP"], True),
+                             ("up", d["H"], d["MLP"], True),
+                             ("down", d["MLP"], d["H"], True)):
                 # An op narrower than one 64-column block per engine still
                 # shards -- over as many engines as it fills.
                 n_sh = min(sched.num_engines, mes.max_shards(N))
@@ -422,7 +430,7 @@ class Qwen25VLLMMixin:
         return shards
 
     def _emit_dec_shard(self, ue, sw, e: int, out_base: int, a_addr: int,
-                        bias_base: int = None) -> int:
+                        bias_base: int = None, silu: bool = False) -> int:
         """Emit engine ``e``'s column block of one decode projection.
 
         B and the scales come from THIS engine's private arena; ``a_addr`` is the
@@ -440,6 +448,10 @@ class Qwen25VLLMMixin:
                   B_DRAM_ADDR=sh.weight_addr, OUTPUT_DRAM_ADDR=out_base + off)
         if bias_base is not None:
             kw.update(C_DRAM_ADDR=bias_base + off, bias_mode="broadcast_N")
+        if silu:
+            # SwiGLU's gate half. The activation is elementwise, so it applies
+            # to a column shard exactly as it does to the full width.
+            kw.update(silu_enable=True)
         if sw.data_type is mes.DENSE_BF16:
             # bf16 weights have no scale blob and no GEMV kernel of their own;
             # the general matmat is what the unsharded path uses for them too.
@@ -447,14 +459,17 @@ class Qwen25VLLMMixin:
         kw.update(SCALE_DRAM_ADDR=sh.scale_addr, data_type=TYPE.IF4)
         return ue.quantized_matmat_core(**kw) or 0
 
-    def _dec_round(self, dec_sched, ops, master_emit) -> int:
+    def _dec_round(self, dec_sched, ops, master_emit, worker_extra=None) -> int:
         """One decode rendezvous: release, master's work, workers' rounds, join.
 
-        ``ops`` is [(ShardedWeight, out_base, a_addr, bias)] -- the ops every
-        engine holding a shard re-emits against its own private block.
+        ``ops`` is [(ShardedWeight, out_base, a_addr, bias, silu)] -- the ops
+        every engine holding a shard re-emits against its own private block.
         ``master_emit`` emits engine 0's side: its own shard-0 blocks plus
         anything left unsharded, which then OVERLAPS the workers instead of
-        serialising after them.
+        serialising after them. ``worker_extra(ue, e)`` appends non-matmul work
+        to each worker's round -- for an op that consumes only THIS engine's
+        outputs of the ops above it, and so needs no barrier of its own (the
+        master emits its own copy inside ``master_emit``).
 
         Every worker runs every round the master opens, even one where its
         engine holds no shard of a narrow weight -- a skipped rendezvous
@@ -466,10 +481,12 @@ class Qwen25VLLMMixin:
         if ops:
             for e in dec_sched.worker_indices():
                 dec_sched.begin_worker_round(e)
-                for sw, out_base, a_addr, bias in ops:
+                for sw, out_base, a_addr, bias, silu in ops:
                     if sw.shard_or_none(e) is not None:
                         self._emit_dec_shard(dec_sched.engines[e], sw, e,
-                                             out_base, a_addr, bias)
+                                             out_base, a_addr, bias, silu)
+                if worker_extra is not None:
+                    worker_extra(dec_sched.engines[e], e)
                 dec_sched.end_worker_round(e)
             dec_sched.join()
         return flops
@@ -535,7 +552,7 @@ class Qwen25VLLMMixin:
             projs = (("q", self.LM_Q, QH * AHD, la["q_bias"], True),
                      ("k", self.LM_K, KVH * AHD, la["k_bias"], True),
                      ("v", self.LM_V, KVH * AHD, la["v_bias"], False))
-            round_ops = [(dec_shards[(tag, li)], out, self.LM_PRE_NORM, bias)
+            round_ops = [(dec_shards[(tag, li)], out, self.LM_PRE_NORM, bias, False)
                          for tag, out, _, bias, _ in projs
                          if (tag, li) in dec_shards]
 
@@ -808,7 +825,7 @@ class Qwen25VLLMMixin:
 
             flops += self._dec_round(
                 dec_sched,
-                [(o_sw, self.LM_ATTN_PROJ, self.LM_ATTN_RESULT, None)],
+                [(o_sw, self.LM_ATTN_PROJ, self.LM_ATTN_RESULT, None, False)],
                 _master_o)
         elif sched is None:
             flops += mm(QH * AHD, H, self.LM_ATTN_RESULT, "o", self.LM_ATTN_PROJ,
@@ -834,7 +851,102 @@ class Qwen25VLLMMixin:
             flops += o_acc[0]
             self.generate_instruction_add_set(m_reg, M)   # restore gf_seq_len
         ckpt(f"L{li}:o_proj", flops)
-        if sched is None:
+        mlp_sw = ({t: dec_shards.get((t, li)) for t in ("gate", "up", "down")}
+                  if (decode and dec_shards) else {})
+        folded_resid2 = False
+        if any(mlp_sw.values()):
+            # The residual add, norm2 and the gate*up product stay on the
+            # master: they are elementwise over a single row at decode, cheap
+            # next to the projections, and each sits BETWEEN two rounds where
+            # the workers are parked anyway.
+            flops += self.eltwise_core_dram(
+                M=M, N=H, dram_a=in_addr, dram_b=self.LM_ATTN_PROJ,
+                dram_out=self.LM_RESIDUAL, mode=UE_MODE.ELTWISE_ADD,
+                gpr_M_reg=m_reg) or 0
+            flops += self.rms_norm_core_dram(
+                M=M, N=H, A_DRAM_ADDR=self.LM_RESIDUAL,
+                OUTPUT_DRAM_ADDR=self.LM_MLP_NORM, GAMMA_DRAM_ADDR=la["ln2"],
+                gpr_M_reg=m_reg) or 0
+            # Its own phase: resid+norm2 are master-serial, so folding them in
+            # with the projections would report a diluted MLP speedup.
+            ckpt(f"L{li}:mlp_norm", flops)
+
+            # gate and up read the SAME post-norm row and write disjoint
+            # buffers, so one rendezvous covers both.
+            gu = (("gate", self.LM_MLP_GATE, True), ("up", self.LM_MLP_UP, False))
+            gu_ops = [(mlp_sw[t], out, self.LM_MLP_NORM, None, silu)
+                      for t, out, silu in gu if mlp_sw[t] is not None]
+
+            # The SwiGLU product folds INTO that round rather than following
+            # it: engine e produced gate[e] and up[e] over the SAME columns, so
+            # multiplying them over those columns reads nothing another engine
+            # wrote. It needs no barrier -- and it is the widest of the layer's
+            # elementwise ops (N=11008), so leaving it on the master was
+            # capping the MLP speedup.
+            fold_mul = (mlp_sw["gate"] is not None and mlp_sw["up"] is not None
+                        and len(mlp_sw["gate"].shards) == len(mlp_sw["up"].shards))
+
+            def _mul_slice(ue, e):
+                sh = mlp_sw["gate"].shard(e)
+                off = sh.col_offset * bpe
+                return ue.eltwise_core_dram(
+                    M=1, N=sh.cols,
+                    dram_a=self.LM_MLP_GATE + off, dram_b=self.LM_MLP_UP + off,
+                    dram_out=self.LM_MLP_MULT + off,
+                    mode=UE_MODE.ELTWISE_MUL) or 0
+
+            def _master_gu():
+                f = 0
+                for t, out, silu in gu:
+                    sw = mlp_sw[t]
+                    if sw is None:
+                        f += mm(H, MLP, self.LM_MLP_NORM, t, out, silu=silu)
+                    else:
+                        f += self._emit_dec_shard(self, sw, 0, out,
+                                                  self.LM_MLP_NORM, None, silu)
+                        f += dec_sched.worker_flops(sw)
+                if fold_mul:
+                    f += _mul_slice(self, 0)
+                return f
+
+            flops += self._dec_round(dec_sched, gu_ops, _master_gu,
+                                     worker_extra=_mul_slice if fold_mul else None)
+            if not fold_mul:
+                flops += self.eltwise_core_dram(
+                    M=M, N=MLP, dram_a=self.LM_MLP_GATE, dram_b=self.LM_MLP_UP,
+                    dram_out=self.LM_MLP_MULT, mode=UE_MODE.ELTWISE_MUL,
+                    gpr_M_reg=m_reg) or 0
+
+            dn = mlp_sw["down"]
+            # The layer-output residual folds into the down round for the same
+            # reason the SwiGLU product folded into the gate/up one: down is
+            # column-sharded over N=H, so engine e adds into exactly the slice
+            # it just wrote.
+            folded_resid2 = dn is not None
+
+            def _resid2_slice(ue, e, dn=dn, out_addr=out_addr):
+                sh = dn.shard(e)
+                off = sh.col_offset * bpe
+                return ue.eltwise_core_dram(
+                    M=1, N=sh.cols,
+                    dram_a=self.LM_RESIDUAL + off, dram_b=self.LM_MLP_DOWN + off,
+                    dram_out=out_addr + off, mode=UE_MODE.ELTWISE_ADD) or 0
+
+            def _master_down(dn=dn):
+                if dn is None:
+                    return mm(MLP, H, self.LM_MLP_MULT, "down", self.LM_MLP_DOWN)
+                return (self._emit_dec_shard(self, dn, 0, self.LM_MLP_DOWN,
+                                             self.LM_MLP_MULT)
+                        + dec_sched.worker_flops(dn)
+                        + _resid2_slice(self, 0))
+
+            ckpt(f"L{li}:mlp_gate_up", flops)
+            flops += self._dec_round(
+                dec_sched,
+                [(dn, self.LM_MLP_DOWN, self.LM_MLP_MULT, None, False)] if dn else [],
+                _master_down,
+                worker_extra=_resid2_slice if folded_resid2 else None)
+        elif sched is None:
             flops += self.eltwise_core_dram(
                 M=M, N=H, dram_a=in_addr, dram_b=self.LM_ATTN_PROJ,
                 dram_out=self.LM_RESIDUAL, mode=UE_MODE.ELTWISE_ADD,
@@ -911,7 +1023,7 @@ class Qwen25VLLMMixin:
             sched.sharded_region(M, _mlp)
             flops += mlp_acc[0]
             self.generate_instruction_add_set(m_reg, M)   # restore gf_seq_len
-        if sched is None:
+        if sched is None and not folded_resid2:
             flops += self.eltwise_core_dram(
                 M=M, N=H, dram_a=self.LM_RESIDUAL, dram_b=self.LM_MLP_DOWN,
                 dram_out=out_addr, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m_reg) or 0
