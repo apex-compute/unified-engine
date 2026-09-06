@@ -346,6 +346,38 @@ def build_hf_reference(ue):
     return None, out.float()
 
 
+def _run_lm_check(ue, args):
+    """Bisect the LM prefill: FPGA vs IF4 hostsim, layer by layer.
+
+    Compares the hidden state after N layers, read straight out of the
+    ping-pong buffer the last layer wrote. FPGA-vs-HOSTSIM is the diagnostic --
+    both sides use identical quantized weights, so a low SNR there is emission,
+    not quantization.
+    """
+    ue.lm_weight_init()
+    ue.lm_tensor_init()
+    tokens = list(ue._cfg["default_prefill_tokens"])[:-1]
+    layers = args.layers or ue._lm_dims()["NL"]
+    print(f"\n--- LM prefill check: {len(tokens)} tokens, {layers} layer(s) ---")
+
+    ue.compile_prefill(len(tokens), layer_size=layers)
+    ue.run_prefill(tokens)
+    got = ue.dma_from_accelerator_memory(
+        ue.LM_PREFILL_OUT, (len(tokens), ue._lm_dims()["H"])).cpu()
+
+    print("  building IF4 hostsim ...")
+    sim = build_lm_hostsim(ue, tokens, num_layers=layers)
+    print(f"\n=== FPGA vs HOSTSIM (both IF4 -- low SNR here is emission, not quant) ===")
+    report(f"hidden after {layers} layer(s)", sim, got)
+    if not args.skip_hf:
+        ref = build_lm_hf_reference(ue, tokens, num_layers=layers)
+        print(f"\n=== vs HF (adds IF4 loss) ===")
+        report("HOSTSIM vs HF", ref, sim)
+        report("FPGA vs HF", ref, got)
+    print(f"\n--- Cleaning DRAM (4 GiB) ---")
+    _qt.clean_dram_4gb(ue)
+
+
 class _HostOnlyEngine:
     """Factory for an engine whose DMAs are no-ops, so the host references can
     be built without a board. Allocation and program emission still run for
@@ -384,6 +416,9 @@ def main():
                              "runs today. 'bf16' answers what an unquantized vision bin "
                              "would score WITHOUT generating one or touching the board. "
                              "'both' runs the pair and prints the quantization delta.")
+    parser.add_argument("--lm", action="store_true",
+                        help="Check the LM prefill path instead of the vision encoder: "
+                             "FPGA vs an IF4 host simulation, and both vs HuggingFace.")
     parser.add_argument("--no-fpga", action="store_true",
                         help="Host only: skip the device entirely (no reset, no run, no "
                              "DRAM clean). Use with --weights both to price BF16 vision.")
@@ -417,6 +452,10 @@ def main():
         ue = _HostOnlyEngine.make(_qt.Qwen25VL_UnifiedEngine, multi_core=cores)
     else:
         ue = _qt.Qwen25VL_UnifiedEngine(multi_core=cores)
+
+    if args.lm:
+        return _run_lm_check(ue, args)
+
     ue.vision_weight_init()
     print(f"\n--- Host preprocessing ({os.path.basename(args.image)}) ---")
     ue.prepare_encoder_input(_qt.process_image(args.image))
@@ -480,6 +519,121 @@ def main():
     if args.no_fpga:
         return
 
+
+
+
+
+# ---------------------------------------------------------------------------
+# LM references
+# ---------------------------------------------------------------------------
+
+class LMWeights:
+    """The exact LM bytes the FPGA reads, dequantized on the host."""
+
+    def __init__(self, ue):
+        region = ue._read_lm_region()
+        self.sections = region["sections"]
+        with open(region["bin_path"], "rb") as f:
+            f.seek(region["base_offset"])
+            self.blob = f.read(region["size"])
+
+    def _raw(self, key):
+        s = self.sections[key]
+        return self.blob[s["offset"]:s["offset"] + s["size"]]
+
+    def bf16(self, key, shape=None):
+        t = torch.frombuffer(bytearray(self._raw(key)), dtype=torch.bfloat16)
+        return t.reshape(shape) if shape else t
+
+    def if4(self, key, n, k):
+        raw = self._raw(key)
+        nb = len(raw) // 34
+        if nb * 64 != n * k:
+            raise ValueError(f"{key}: {nb} blocks != {n}x{k}/64")
+        return quant_lib.dequant("if4", raw[nb * 2:], raw[:nb * 2], n, k, block_size=64)
+
+
+def build_lm_hostsim(ue, tokens, num_layers=None, weights=None):
+    """Recompute LM prefill on the host exactly as the FPGA program does.
+
+    Returns the hidden state after ``num_layers`` layers, so a mismatch can be
+    bisected to a layer instead of only observed at the logits.
+    """
+    d = ue._lm_dims()
+    H, AHD, KVH, QH, G, MLP = d["H"], d["AHD"], d["KVH"], d["QH"], d["G"], d["MLP"]
+    NL = d["NL"] if num_layers is None else num_layers
+    W = LMWeights(ue) if weights is None else weights
+    M = len(tokens)
+
+    x = ue.get_embedding_for_tokens(tokens).to(torch.bfloat16)
+    pos = torch.arange(M)
+    half = AHD // 2
+    theta = ue._cfg["special"]["rope"]["theta"]
+    inv = 1.0 / (theta ** (torch.arange(half, dtype=torch.float32) / half))
+    fr = torch.outer(pos.float(), inv)
+    cos = torch.cat([fr.cos(), fr.cos()], -1).to(torch.bfloat16)
+    sin = torch.cat([fr.sin(), fr.sin()], -1).to(torch.bfloat16)
+
+    def rope(t):                      # t: [M, heads, AHD]
+        c = cos[:, None, :].float()
+        s = sin[:, None, :].float()
+        rot = torch.cat((-t[..., half:].float(), t[..., :half].float()), -1)
+        return (t.float() * c + rot * s).to(torch.bfloat16)
+
+    causal = torch.full((M, M), float("-inf"))
+    causal.masked_fill_(torch.tril(torch.ones(M, M, dtype=torch.bool)), 0.0)
+    scale = 1.0 / math.sqrt(AHD)
+
+    for li in range(NL):
+        pre = f"language_model.layers.{li}"
+        h = _hw_rms(x, W.bf16(f"{pre}.input_layernorm.weight"))
+        q = _hw_linear(h, W.if4(f"{pre}.self_attn.q_proj.weight.if4", QH * AHD, H),
+                       W.bf16(f"{pre}.self_attn.q_proj.bias"))
+        k = _hw_linear(h, W.if4(f"{pre}.self_attn.k_proj.weight.if4", KVH * AHD, H),
+                       W.bf16(f"{pre}.self_attn.k_proj.bias"))
+        v = _hw_linear(h, W.bf16(f"{pre}.self_attn.v_proj.weight", (KVH * AHD, H)),
+                       W.bf16(f"{pre}.self_attn.v_proj.bias"))
+        q = rope(q.reshape(M, QH, AHD))
+        k = rope(k.reshape(M, KVH, AHD))
+        v = v.reshape(M, KVH, AHD)
+
+        heads = []
+        for qh in range(QH):
+            kv = qh // G
+            sc = (q[:, qh].float() * scale) @ k[:, kv].float().T
+            sc = sc.to(torch.bfloat16).float() + causal
+            heads.append((torch.softmax(sc, -1).to(torch.bfloat16).float()
+                          @ v[:, kv].float()).to(torch.bfloat16))
+        attn = torch.stack(heads, 1).reshape(M, QH * AHD)
+
+        o = _hw_linear(attn, W.bf16(f"{pre}.self_attn.o_proj.weight", (H, QH * AHD)))
+        x = (x.to(torch.bfloat16) + o).to(torch.bfloat16)
+        h2 = _hw_rms(x, W.bf16(f"{pre}.post_attention_layernorm.weight"))
+        gate = _hw_linear(h2, W.if4(f"{pre}.mlp.gate_proj.weight.if4", MLP, H), silu=True)
+        up = _hw_linear(h2, W.if4(f"{pre}.mlp.up_proj.weight.if4", MLP, H))
+        down = _hw_linear((gate * up).to(torch.bfloat16),
+                          W.if4(f"{pre}.mlp.down_proj.weight.if4", H, MLP))
+        x = (x + down).to(torch.bfloat16)
+        print(f"\r    lm hostsim layer {li + 1}/{NL}", end="", flush=True)
+    print()
+    return x
+
+
+def build_lm_hf_reference(ue, tokens, num_layers=None):
+    """HF hidden states for the same tokens, layer by layer (unquantized bf16)."""
+    from transformers import Qwen2_5_VLForConditionalGeneration
+    if not hasattr(ue, "_hf_model"):
+        ue._hf_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            os.path.join(ue.script_dir, ue._cfg["paths"]["hf_model_dir"]),
+            torch_dtype=torch.bfloat16)
+        ue._hf_model.eval()
+    lm = getattr(ue._hf_model, "model", ue._hf_model)
+    lm = getattr(lm, "language_model", lm)
+    with torch.no_grad():
+        out = lm(input_ids=torch.tensor([list(tokens)]), output_hidden_states=True)
+    hs = out.hidden_states                      # tuple: embeddings, then each layer
+    NL = ue._lm_dims()["NL"] if num_layers is None else num_layers
+    return hs[NL].squeeze(0).float()
 
 
 if __name__ == "__main__":

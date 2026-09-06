@@ -1207,6 +1207,9 @@ class Qwen25VLVisionMixin:
         wall = time.perf_counter() - t0
         gflops = (self._vis_total_flops / (latency_us * 1e-6) / 1e9
                   if latency_us > 0 else 0.0)
+        self._vis_latency_us = latency_us
+        self._vis_gflops = gflops
+        self._vis_wall_s = wall
         self._loud(f"  [Vision] done: {wall:.2f}s wall, {latency_us / 1e6:.2f}s HW, "
                    f"{gflops:.1f} GFLOPS")
 

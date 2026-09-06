@@ -62,13 +62,24 @@ def _load_sibling(module_name: str, filename: str):
 
 _vision_mod = _load_sibling("qwen2_5_vl_3b_vision", "qwen2.5_vl_3b_vision.py")
 Qwen25VLVisionMixin = _vision_mod.Qwen25VLVisionMixin
+_lm_mod = _load_sibling("qwen2_5_vl_3b_lm", "qwen2.5_vl_3b_lm.py")
+Qwen25VLLMMixin = _lm_mod.Qwen25VLLMMixin
 
 DEFAULT_IMAGE = os.path.normpath(
     os.path.join(SCRIPT_DIR, "..", "..", "test_samples", "yosemite.jpg"))
 
 # Static context capacity. Tensor sizing and decoder bounds follow this one
 # constant; it must stay 64-aligned.
-MAX_CONTEXT_SIZE = 4096
+#
+# WHY 2048 AND NOT 4096. Two terms scale with it and together overrun the
+# 224 MiB tensor region: the KV cache (36 KiB/token -> 144 MiB at 4096) and
+# unified_attention_core's scratch, whose score buffer is
+# [aligned_seq, aligned_seq] -- 33 MiB at 4096 against 8.5 at 2048. The total
+# is ~239 MiB at ctx 4096 / prefill 512 versus ~142 MiB at ctx 2048.
+# Raising it to 4096 needs the map re-carved (params 1808 -> ~1804 MiB and ISA
+# 16 -> 8 MiB buys ~12 MiB, still short), so it is a deliberate decision, not a
+# constant to flip blind.
+MAX_CONTEXT_SIZE = 2048
 MIN_CONTEXT_SIZE = 512
 
 # Engine ceiling for this model's private map: 8 cores x 256 MiB fills the low
@@ -76,7 +87,7 @@ MIN_CONTEXT_SIZE = 512
 MAX_ENGINES = 8
 
 
-class Qwen25VL_UnifiedEngine(Qwen25VLVisionMixin, UnifiedEngine):
+class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine):
     """Qwen2.5-VL-3B engine: DRAM map, weight loading, stage mixins."""
 
     def __init__(self, script_dir: str | None = None, multi_core: int = 1):
@@ -91,8 +102,13 @@ class Qwen25VL_UnifiedEngine(Qwen25VLVisionMixin, UnifiedEngine):
         #
         # MODEL MAP, upper 2 GB (identical at every engine count):
         #   PARAMS  weights  : 0x8000_0000 - 0xF100_0000  (1808 MiB)
-        #   TENSOR  acts/KV  : 0xF100_0000 - 0xFF00_0000  ( 224 MiB)
-        #   ISA     programs : 0xFF00_0000 - 0x1_0000_0000 (  16 MiB)
+        #   TENSOR  acts/KV  : 0xF100_0000 - 0xFB00_0000  ( 160 MiB)
+        #   ISA     programs : 0xFB00_0000 - 0x1_0000_0000 (  80 MiB)
+        #
+        # ISA IS 80 MiB, NOT 16. The LM keeps a per-prompt prefill program AND
+        # the decoder resident at once -- 8.7 + 7.5 MiB at a 37-token prompt,
+        # and prefill grows with the prompt -- which overran a 16 MiB region.
+        # The tensor side had the slack: it uses 125 MiB of its 224 at ctx 2048.
         #
         # THE PARAMS WINDOW IS TIME-SHARED, NOT SPLIT. Vision and LM weights do
         # not fit side by side -- LM is 1801.7 MiB and vision another 389.7 MiB,
@@ -121,7 +137,7 @@ class Qwen25VL_UnifiedEngine(Qwen25VLVisionMixin, UnifiedEngine):
         self.PARAMS_BASE = 0x80000000
         self.PARAMS_LIMIT = 0xF1000000        # 1808 MiB, > the 1801.7 MiB LM needs
         self.TENSOR_BASE = self.PARAMS_LIMIT
-        self.ISA_BASE = 0xFF000000
+        self.ISA_BASE = 0xFB000000
         self.TENSOR_LIMIT = self.ISA_BASE
         # Vision loads at the base of the same window (see the note above).
         self.VISION_WEIGHT_BASE = self.PARAMS_BASE
@@ -173,6 +189,10 @@ class Qwen25VL_UnifiedEngine(Qwen25VLVisionMixin, UnifiedEngine):
         self.gf_aligned_seq_len = fixed["GF_ALIGNED_SEQ_LEN_REG"]
         self._isa_reg_base = max(fixed.values()) + 1
         self._isa_reg_counter = self._isa_reg_base
+        # Decode runs every bulk op at M=1; a dedicated register holding 1 keeps
+        # the emitters uniform with prefill's runtime row count.
+        self.gf_one = self.alloc_isa_reg()
+        self._isa_reg_base = self._isa_reg_counter
 
         self._end_of_turn_token_id = model["end_of_turn_token_id"]
         self.causal_mask_upper = False
@@ -228,6 +248,131 @@ class Qwen25VL_UnifiedEngine(Qwen25VLVisionMixin, UnifiedEngine):
         prev = _SILENT_MODE
         _SILENT_MODE = on
         return prev
+
+    def write_run_summary(self, out_path: str, args) -> str:
+        """Per-run Markdown summary: hardware, sizes, and per-stage metrics.
+
+        Reads only attributes the stages already stashed plus cheap host-side
+        bookkeeping, so calling it after a run launches no FPGA program.
+
+        Two clocks are reported deliberately and they answer different
+        questions. The HW counter times the program on the engine; the CPU timer
+        wraps the whole step including the per-token host work (embedding
+        gather, RoPE and bias DMA, preamble write, argmax readback, detokenize).
+        Their ratio is the host overhead, which is what to attack if HW
+        utilisation already looks good.
+        """
+        clock_ns = (getattr(self, "_clock_period_ns", None)
+                    or user_dma_core.CLOCK_CYCLE_TIME_NS)
+        freq_mhz = 1000.0 / clock_ns if clock_ns else 0.0
+        peak = self.vis_peak_gflops()
+        try:
+            hw = f"0x{self.user_read_reg32(user_dma_core.UE_FPGA_VERSION_ADDR) & 0xFFFFFFFF:08x}"
+        except Exception as exc:
+            hw = f"(read failed: {exc})"
+
+        def util(g):
+            return f"{100.0 * g / peak:.1f}% of peak" if peak and g else "n/a"
+
+        params_bin = os.path.join(self.script_dir, self._cfg["paths"]["params"])
+        L = [
+            "# qwen2.5_vl_3b run summary",
+            "",
+            "## Hardware",
+            "",
+            f"- **HW version:** {hw}",
+            f"- **Device:** {args.dev}",
+            f"- **Clock:** {clock_ns:.4f} ns ({freq_mhz:.1f} MHz)",
+            f"- **AXI data width:** {user_dma_core.UE_AXI_DATA_WIDTH_BITS} bits",
+            f"- **DRAM:** {user_dma_core.AVAILABLE_DRAM_SIZE_GB} GiB",
+            f"- **Cores in use:** {self.multi_core} of "
+            f"{user_dma_core.ANDROMEDA_CORE_COUNT} reported",
+            f"- **Peak throughput:** {peak:.1f} GFLOPS "
+            f"({freq_mhz:.1f} MHz x 128 x {self.multi_core} core(s))",
+            "",
+            "## Weights and programs",
+            "",
+            f"- **Weight bin:** `{os.path.basename(params_bin)}` — "
+            f"{os.path.getsize(params_bin) / 2**20:.1f} MiB"
+            if os.path.exists(params_bin) else "- **Weight bin:** n/a",
+        ]
+        vis_w = (getattr(self, "_vis_weight_end", 0)
+                 - getattr(self, "_vis_weight_start", 0))
+        if vis_w:
+            L.append(f"- **Vision weight DRAM:** {vis_w / 2**20:.1f} MiB (IF4)")
+        if getattr(self, "_lm_weight_init_done", False):
+            L.append(f"- **LM weight DRAM:** "
+                     f"{(self._lm_weight_end - self.PARAMS_BASE) / 2**20:.1f} MiB "
+                     f"(IF4 + BF16 V/O; embedding host-side)")
+        for name, prog in (("Vision encoder", getattr(self, "_vis_program_bytes", None)),
+                           ("Prefill program", getattr(self, "_prefill_program", None)),
+                           ("Decoder program", getattr(self, "_decoder_program", None))):
+            blob = prog[1] if isinstance(prog, tuple) else prog
+            if blob:
+                L.append(f"- **{name}:** {len(blob) / 2**20:.2f} MiB")
+        L.append("")
+
+        if getattr(self, "_vis_latency_us", None):
+            d = self._vision_dims()
+            L += [
+                "## Vision",
+                "",
+                f"- **Image:** `{os.path.basename(getattr(args, 'image', '') or '')}` "
+                f"-> {d['VS']} patches -> {d['NUM_MERGED_TOKENS']} tokens",
+                f"- **HW latency:** {self._vis_latency_us / 1e3:.1f} ms",
+                f"- **Reported FLOPs:** {self._vis_total_flops / 1e9:.1f} GFLOP",
+                f"- **Throughput:** {self._vis_gflops:.1f} GFLOPS "
+                f"({util(self._vis_gflops)})",
+                f"- **End-to-end (CPU timer):** {self._vis_wall_s:.2f} s",
+                "",
+            ]
+
+        if getattr(self, "_latency_prefill_us", None):
+            L += [
+                "## Prefill",
+                "",
+                f"- **Sequence length:** {self._prefill_seq_len_run} tokens",
+                f"- **HW latency:** {self._latency_prefill_us / 1e3:.1f} ms",
+                f"- **Reported FLOPs:** {self._prefill_flops / 1e9:.1f} GFLOP",
+                f"- **Throughput:** {self._prefill_gflops:.1f} GFLOPS "
+                f"({util(self._prefill_gflops)})",
+                f"- **End-to-end (CPU timer):** {self._prefill_wall_s:.2f} s",
+                "",
+            ]
+
+        steps = getattr(self, "_decode_step_us", None)
+        if steps:
+            n = self._decode_n
+            first_us = steps[0]
+            hw_avg_us = self._decode_total_us / n
+            L += [
+                "## Decode",
+                "",
+                f"- **Tokens generated:** {n} (sequence total {self.seq_len})",
+                f"- **First-token speed (peak, HW counter):** "
+                f"{1e6 / first_us:.2f} tok/s ({first_us / 1e3:.1f} ms)",
+                f"- **Average speed (HW counter):** {1e6 / hw_avg_us:.2f} tok/s "
+                f"({hw_avg_us / 1e3:.1f} ms/token)",
+                f"- **Average speed (CPU timer):** {n / self._decode_wall_s:.2f} tok/s "
+                f"({1e3 * self._decode_wall_s / n:.1f} ms/token)",
+                f"- **Host overhead:** "
+                f"{100 * (1 - self._decode_total_us / 1e6 / self._decode_wall_s):.1f}% "
+                f"of wall time outside the engine",
+                f"- **FLOPs per token:** {self._decode_step_flops / n / 1e9:.2f} GFLOP",
+                f"- **Average throughput:** {self._decode_gflops:.1f} GFLOPS "
+                f"({util(self._decode_gflops)})",
+                f"- **End-to-end (CPU timer):** {self._decode_wall_s:.2f} s",
+                "",
+            ]
+
+        prompt = getattr(self, "_prompt_text", None)
+        if prompt is not None:
+            L += ["## Prompt & output", "", "### Prompt", "", "```", prompt, "```", ""]
+            L += ["### Decoded text", "", "```",
+                  getattr(self, "_decoded_text", "") or "(none)", "```", ""]
+        with open(out_path, "w") as f:
+            f.write("\n".join(L))
+        return out_path
 
     def describe_dram_map(self) -> str:
         lines = [
@@ -315,6 +460,10 @@ qwen2.5_vl_3b_numeric.py.""")
     parser.add_argument("--image", type=str, nargs="?", const=DEFAULT_IMAGE, default=None,
                         help=f"VLM mode: run the vision encoder and merge image tokens into "
                              f"the prompt. Bare --image uses {os.path.basename(DEFAULT_IMAGE)}.")
+    parser.add_argument("--max-new-tokens", type=int, default=256,
+                        help="Cap on generated tokens (default 256). A low cap is the "
+                             "guard against a bad argmax decoding until the context "
+                             "fills, which is indistinguishable from a hung board.")
     parser.add_argument("--profile", action="store_true",
                         help="Compile the encoder with per-phase HALT checkpoints and "
                              "print a HW-latency breakdown by phase. Read the share "
@@ -410,15 +559,65 @@ def main():
     ue = Qwen25VL_UnifiedEngine(**engine_kwargs)
     print(ue.describe_dram_map())
 
-    if not args.image:
-        # Weight phase only -- there is nothing for the encoder to run on.
-        print(f"\n--- Vision weight init ---")
+    def _run_lm(image_embeddings=None, prefill_tokens=None):
+        """Phase B: LM weights over the params window, then prefill + decode."""
+        print(f"\n--- LM weight init ---")
         timer = time.perf_counter()
-        ue.vision_weight_init()
+        ue.lm_weight_init()
         print(f"  loaded in {time.perf_counter() - timer:.2f}s")
-        print(ue.vision_weight_summary())
-        print("\nNo --image given, so the encoder was not run. The LM path is "
-              "not wired up yet.")
+        ue.lm_tensor_init()
+
+        if prefill_tokens is None:
+            if args.prompt:
+                # tokenize=False then encode: apply_chat_template(tokenize=True)
+                # returns a BatchEncoding on this transformers version, not a
+                # list of ids, and everything downstream wants plain ints.
+                text = ue.tokenizer.apply_chat_template(
+                    [{"role": "user", "content": args.prompt}],
+                    tokenize=False, add_generation_prompt=True)
+                prefill_tokens = ue.tokenizer(text)["input_ids"]
+            else:
+                prefill_tokens = list(ue._cfg["default_prefill_tokens"])
+                print(f"  using the built-in default prompt "
+                      f"({len(prefill_tokens)} tokens)")
+        ue._prompt_text = ue.tokenizer.decode(prefill_tokens)
+        print(f"  prompt: {ue._prompt_text!r}")
+
+        # PREFILL HAS NO LM HEAD. It fills the KV cache and stops; the logits
+        # only exist in the decoder. So prefill consumes all but the LAST prompt
+        # token, and the decode loop is seeded with that last token -- its step
+        # produces the first generated token. Calling get_arg_max_index() after
+        # prefill reads a stale register, which is what made the first run
+        # decode garbage.
+        context, seed = prefill_tokens[:-1], prefill_tokens[-1]
+
+        print(f"\n--- LM compile ---")
+        ue.compile_prefill(len(context))
+        ue.compile_decoder()
+
+        print(f"\n--- Prefill ({len(context)} tokens) ---")
+        ue.run_prefill(context, image_embeddings=image_embeddings)
+
+        print(f"\n--- Decode ---")
+        _, text = ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)
+        return text
+
+    def _write_summary():
+        name = (f"qwen2.5_vl_3b_run_{args.dev}"
+                f"{'_image' if args.image else ''}"
+                f"{'_multi-core_%d' % cores if cores > 1 else ''}.md")
+        out = os.path.join(SCRIPT_DIR, name)
+        try:
+            ue.write_run_summary(out, args)
+            print(f"\nWrote run summary: {out}")
+        except Exception as exc:
+            print(f"[warn] failed to write run summary: {exc}")
+
+    if not args.image:
+        _run_lm()
+        _write_summary()
+        print(f"\n--- Cleaning DRAM (4 GiB) ---")
+        clean_dram_4gb(ue)
         return
 
     # Resolve a bare filename against the shipped test_samples directory.

@@ -19,7 +19,7 @@
     "bytes_per_element": 2
   },
   "model": {
-    "max_context_size": 4096,
+    "max_context_size": 2048,
     "prefill_max_seq_len": 384,
     "end_of_turn_token_id": 151645,
     "rope_global_layers": []
@@ -60,20 +60,9 @@
     198,
     2610,
     525,
-    1195,
-    58,
-    16,
-    13,
-    358,
-    1079,
-    498,
-    279,
-    4226,
-    311,
-    856,
-    3405,
-    1191,
-    20173,
+    264,
+    10950,
+    17847,
     13,
     151645,
     198,
@@ -128,5 +117,6 @@
       0.26130258,
       0.27577711
     ]
-  }
+  },
+  "_default_prompt_note": "Proper chat template. The tokens inherited from models/qwen2.5_vl_3b decoded to a corrupted system message: 'You areey[1. I am you the answer to x question start Students.'"
 }
