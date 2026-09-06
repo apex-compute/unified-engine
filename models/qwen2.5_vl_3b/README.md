@@ -42,7 +42,7 @@ python models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py --image --multi-core 8 --profi
 ```
 
 Args follow gemma4: `--prompt --image [PATH] --max-new-tokens --profile --profile-ctx
---multi-core [N] --dev --dev-list`. Vision runs when `--image` is given; otherwise
+--multi-core [N] --dev`. Vision runs when `--image` is given; otherwise
 text-only. `--profile` additionally writes a markdown run report next to the script,
 named for the args used (e.g. `qwen2.5_vl_3b_test_xdma0_image_multi-core_8_profile.md`).
 
