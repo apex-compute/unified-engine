@@ -365,7 +365,7 @@ class Qwen25VLLMMixin:
         would contend and the speedup would cap however evenly N divides.
         Engine i therefore reads from ITS OWN window.
 
-        SCOPE AT 8 ENGINES: q over all 8, k over 4. q is N=2048 -- 32 blocks of
+        SCOPE AT 8 ENGINES: q and o over all 8, k and v over 4. q is N=2048 -- 32 blocks of
         64, i.e. 4 blocks per engine. k is N=256, only 4 blocks, so it CANNOT
         reach 8 engines; rather than leave it full-width on the master it goes
         one block to each of engines 0-3 and engines 4-7 emit nothing for it.
@@ -375,6 +375,9 @@ class Qwen25VLLMMixin:
         it carries no scale blob and lands on matmat_mul_core rather than the
         GEMV kernel, but a column block of a bf16 [N, K] blob is the same
         contiguous row block, so it materializes into the private arenas too.
+        o is bf16 as well and N=H=2048, so it splits 8 ways like q -- but it
+        consumes the ATTENTION output, so it cannot ride the qkv rendezvous and
+        opens a second one after the permute.
         """
         cached = getattr(self, "_decode_shards", None)
         if cached is not None:
@@ -387,7 +390,8 @@ class Qwen25VLLMMixin:
             la = self.lm_layer_addrs[li]
             for op, K, N, quant in (("q", d["H"], d["QH"] * d["AHD"], True),
                                     ("k", d["H"], d["KVH"] * d["AHD"], True),
-                                    ("v", d["H"], d["KVH"] * d["AHD"], False)):
+                                    ("v", d["H"], d["KVH"] * d["AHD"], False),
+                             ("o", d["QH"] * d["AHD"], d["H"], False)):
                 # An op narrower than one 64-column block per engine still
                 # shards -- over as many engines as it fills.
                 n_sh = min(sched.num_engines, mes.max_shards(N))
@@ -442,6 +446,33 @@ class Qwen25VLLMMixin:
             return ue.matmat_mul_core(**kw) or 0
         kw.update(SCALE_DRAM_ADDR=sh.scale_addr, data_type=TYPE.IF4)
         return ue.quantized_matmat_core(**kw) or 0
+
+    def _dec_round(self, dec_sched, ops, master_emit) -> int:
+        """One decode rendezvous: release, master's work, workers' rounds, join.
+
+        ``ops`` is [(ShardedWeight, out_base, a_addr, bias)] -- the ops every
+        engine holding a shard re-emits against its own private block.
+        ``master_emit`` emits engine 0's side: its own shard-0 blocks plus
+        anything left unsharded, which then OVERLAPS the workers instead of
+        serialising after them.
+
+        Every worker runs every round the master opens, even one where its
+        engine holds no shard of a narrow weight -- a skipped rendezvous
+        desynchronises the group permanently and the master waits forever.
+        """
+        if ops:
+            dec_sched.release()
+        flops = master_emit()
+        if ops:
+            for e in dec_sched.worker_indices():
+                dec_sched.begin_worker_round(e)
+                for sw, out_base, a_addr, bias in ops:
+                    if sw.shard_or_none(e) is not None:
+                        self._emit_dec_shard(dec_sched.engines[e], sw, e,
+                                             out_base, a_addr, bias)
+                dec_sched.end_worker_round(e)
+            dec_sched.join()
+        return flops
 
     def _kv_addr(self, cache_base: int, layer: int, kv_head: int) -> int:
         return cache_base + layer * self.KV_STRIDE_LAYER + kv_head * self.KV_STRIDE_HEAD
@@ -507,34 +538,25 @@ class Qwen25VLLMMixin:
             round_ops = [(dec_shards[(tag, li)], out, self.LM_PRE_NORM, bias)
                          for tag, out, _, bias, _ in projs
                          if (tag, li) in dec_shards]
-            if round_ops:
-                dec_sched.release()
-            for tag, out, N_op, bias, quant in projs:
-                sw = dec_shards.get((tag, li))
-                if sw is None:
-                    flops += mm(H, N_op, self.LM_PRE_NORM, tag, out,
+
+            def _master_qkv():
+                f = 0
+                for tag, out, N_op, bias, quant in projs:
+                    sw = dec_shards.get((tag, li))
+                    if sw is None:
+                        f += mm(H, N_op, self.LM_PRE_NORM, tag, out,
                                 quant=quant, bias=bias)
-                else:
-                    # The master owns shard 0 and emits it inline; the rest of
-                    # the shards are the workers' and their FLOPs come from
-                    # worker_flops, which counts shards[1:] however many exist.
-                    flops += self._emit_dec_shard(self, sw, 0, out,
+                    else:
+                        # The master owns shard 0 and emits it inline; the rest
+                        # are the workers' and their FLOPs come from
+                        # worker_flops, which counts shards[1:] however many
+                        # exist.
+                        f += self._emit_dec_shard(self, sw, 0, out,
                                                   self.LM_PRE_NORM, bias)
-                    flops += dec_sched.worker_flops(sw)
-            if round_ops:
-                # Every worker must run EVERY round the master opens, even one
-                # where it has no work -- a skipped rendezvous desynchronises
-                # the group permanently and the master waits forever.
-                for e in dec_sched.worker_indices():
-                    dec_sched.begin_worker_round(e)
-                    for sw, out_base, a_addr, bias in round_ops:
-                        # An engine past a narrow weight's last shard emits
-                        # nothing for it -- but still runs the round.
-                        if sw.shard_or_none(e) is not None:
-                            self._emit_dec_shard(dec_sched.engines[e], sw, e,
-                                                 out_base, a_addr, bias)
-                    dec_sched.end_worker_round(e)
-                dec_sched.join()
+                        f += dec_sched.worker_flops(sw)
+                return f
+
+            flops += self._dec_round(dec_sched, round_ops, _master_qkv)
         elif sched is None:
             flops += mm(H, QH * AHD, self.LM_PRE_NORM, "q", self.LM_Q, bias=la["q_bias"])
             flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "k", self.LM_K, bias=la["k_bias"])
@@ -774,7 +796,21 @@ class Qwen25VLLMMixin:
                                     self.LM_ATTN_RESULT, write_grouped=False,
                                     group_stride_rows=head_rows)
         ckpt(f"L{li}:attn_permute", flops)
-        if sched is None:
+        o_sw = dec_shards.get(("o", li)) if (decode and dec_shards) else None
+        if o_sw is not None:
+            # SECOND rendezvous of the layer: o_proj reads the attention result,
+            # so it cannot ride the qkv round. bf16 and N=H=2048, i.e. 32 blocks
+            # of 64 -- an even 4 blocks per engine at 8 cores. No bias.
+            def _master_o(o_sw=o_sw):
+                return (self._emit_dec_shard(self, o_sw, 0, self.LM_ATTN_PROJ,
+                                             self.LM_ATTN_RESULT)
+                        + dec_sched.worker_flops(o_sw, M=1))
+
+            flops += self._dec_round(
+                dec_sched,
+                [(o_sw, self.LM_ATTN_PROJ, self.LM_ATTN_RESULT, None)],
+                _master_o)
+        elif sched is None:
             flops += mm(QH * AHD, H, self.LM_ATTN_RESULT, "o", self.LM_ATTN_PROJ,
                         quant=False)
         else:
