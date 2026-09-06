@@ -456,7 +456,8 @@ def build_arg_parser():
 numeric checks (FPGA vs host-simulate and HuggingFace) live in
 qwen2.5_vl_3b_numeric.py.""")
     parser.add_argument("--prompt", type=str, default=None,
-                        help="Text prompt. Default is the built-in test question.")
+                        help="Text prompt. Defaults to the built-in question in LM mode, "
+                             "or 'Describe the picture in details.' with --image.")
     parser.add_argument("--image", type=str, nargs="?", const=DEFAULT_IMAGE, default=None,
                         help=f"VLM mode: run the vision encoder and merge image tokens into "
                              f"the prompt. Bare --image uses {os.path.basename(DEFAULT_IMAGE)}.")
@@ -559,7 +560,7 @@ def main():
     ue = Qwen25VL_UnifiedEngine(**engine_kwargs)
     print(ue.describe_dram_map())
 
-    def _run_lm(image_embeddings=None, prefill_tokens=None):
+    def _run_lm(image_embeddings=None, prefill_tokens=None, positions=None):
         """Phase B: LM weights over the params window, then prefill + decode."""
         print(f"\n--- LM weight init ---")
         timer = time.perf_counter()
@@ -596,10 +597,28 @@ def main():
         ue.compile_decoder()
 
         print(f"\n--- Prefill ({len(context)} tokens) ---")
-        ue.run_prefill(context, image_embeddings=image_embeddings)
+        ue.run_prefill(context, image_embeddings=image_embeddings,
+                       positions=None if positions is None
+                       else positions[:len(context)])
 
-        print(f"\n--- Decode ---")
+        # "--- Decode run ---" ... "Decoder done in" is one of the stdout formats
+        # model_auto_test._extract_decode_text knows how to slice; without a
+        # recognised pair it sees no generated text and the check fails even on a
+        # perfect run.
+        print(f"\n--- Decode run ---")
         _, text = ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)
+        # Structured result for harness checks that prefer it to scraping stdout.
+        print("TEST_RESULT: " + json.dumps({
+            "model": "qwen2.5_vl_3b",
+            "decoded_text": text,
+            "tokens_generated": ue._decode_n,
+            "decode_tok_s": ue._decode_n / ue._decode_wall_s,
+            "first_token_tok_s": (1e6 / ue._decode_step_us[0]
+                                  if ue._decode_step_us else None),
+            "decode_gflops": ue._decode_gflops,
+            "prefill_gflops": getattr(ue, "_prefill_gflops", None),
+            "vision_gflops": getattr(ue, "_vis_gflops", None),
+        }))
         return text
 
     def _write_summary():
@@ -665,7 +684,43 @@ def main():
     print(f"\nEncoder output {tuple(embeddings.shape)}: "
           f"mean {embeddings.float().mean():+.4f}, std {embeddings.float().std():.4f}, "
           f"absmax {embeddings.float().abs().max():.4f}")
-    print("\nVision path complete. The LM path is not wired up yet.")
+
+    # ---- hand off to the LM -------------------------------------------------
+    # The encoder's output is already on the host, which is exactly what lets
+    # the LM reclaim the params window those weights were computed in.
+    ue._ensure_tokenizer()
+    prompt = args.prompt or "Describe the picture in details."
+    grid = ue._image_grid_thw
+    n_img = int(grid.prod()) // (ue._vision_dims()["VMERGE"] ** 2)
+    text = ue.tokenizer.apply_chat_template(
+        [{"role": "user",
+          "content": [{"type": "image"}, {"type": "text", "text": prompt}]}],
+        tokenize=False, add_generation_prompt=True)
+    # The template emits ONE <|image_pad|>; expand it to one per merged token so
+    # each gets its own embedding row spliced in by run_prefill.
+    text = text.replace("<|image_pad|>", "<|image_pad|>" * n_img)
+    tokens = ue.tokenizer(text)["input_ids"]
+    print(f"\n[Mode] VLM -- {n_img} image tokens, prompt: {prompt!r}")
+
+    # mRoPE: image tokens carry (t, h, w) from the patch grid, so their position
+    # is not their sequence index, and the text after them resumes past the
+    # grid's extent rather than at seq_len. HF owns that arithmetic; the delta
+    # it returns is what decode must add to every subsequent position.
+    ids = torch.tensor([tokens])
+    mm_type = torch.zeros_like(ids)
+    mm_type[ids == 151655] = 1
+    hf = ue._hf_model.model if hasattr(ue._hf_model, "model") else ue._hf_model
+    pos, delta = hf.get_rope_index(ids, mm_type, image_grid_thw=grid)
+    positions = pos[:, 0, :].transpose(0, 1).contiguous()          # [seq, 3]
+    ue._rope_offset = int(delta.flatten()[0])
+    print(f"  mRoPE: positions {tuple(positions.shape)}, decode offset {ue._rope_offset}")
+
+    _run_lm(image_embeddings=embeddings, prefill_tokens=tokens, positions=positions)
+    _write_summary()
+
+    print(f"\n--- Cleaning DRAM (4 GiB) ---")
+    clean_dram_4gb(ue)
+    print("\nVLM run complete.")
 
 
 if __name__ == "__main__":

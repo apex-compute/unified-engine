@@ -137,11 +137,21 @@ class Qwen25VLLMMixin:
         self._loud(f"  [LM] weights loaded: {used / 2**20:.1f} MiB "
                    f"(embedding {len(raw) / 2**20:.1f} MiB kept on host)")
 
+        self._ensure_tokenizer()
+
+    def _ensure_tokenizer(self):
+        """Load the tokenizer on demand.
+
+        The VLM path needs it BEFORE lm_weight_init -- it builds the prompt (and
+        from it the mRoPE positions) while the vision weights are still resident
+        in the params window.
+        """
         if not hasattr(self, "tokenizer"):
             from transformers import AutoTokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(
                 os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"]),
                 trust_remote_code=True)
+        return self.tokenizer
 
     def get_embedding_for_tokens(self, token_ids) -> torch.Tensor:
         return self.embedding_weight[torch.as_tensor(list(token_ids),
@@ -149,8 +159,23 @@ class Qwen25VLLMMixin:
 
     # ---- RoPE --------------------------------------------------------------
 
+    def _mrope_dim_source(self) -> torch.Tensor:
+        """Which of (t, h, w) each of the AHD/2 half-dims takes its position from.
+
+        mrope_section [16, 24, 24] splits the 64 half-dims: the first 16 rotate
+        by the temporal index, the next 24 by height, the last 24 by width. Text
+        tokens set t = h = w, so the same table construction covers both cases.
+        """
+        sec = self._cfg["special"]["rope"]["mrope_section"]
+        return torch.cat([torch.full((n,), i, dtype=torch.long)
+                          for i, n in enumerate(sec)])
+
     def _build_rope_table(self, positions: torch.Tensor) -> torch.Tensor:
         """[n, 4*AHD/2] rows of [cos | cos | -sin | sin] for rope_hf_core.
+
+        ``positions`` is either [n] (1-D, text-only) or [n, 3] carrying the
+        mRoPE (t, h, w) triple per token -- image tokens occupy a 2-D grid, so
+        their height and width indices differ from their sequence order.
 
         Half-width AHD/2 duplicated because rotate-half at width AHD pairs lane
         i with i+AHD/2; sin's lower half is pre-negated so the core's two
@@ -160,7 +185,11 @@ class Qwen25VLLMMixin:
         half = d["AHD"] // 2
         theta = self._cfg["special"]["rope"]["theta"]
         inv = 1.0 / (theta ** (torch.arange(half, dtype=torch.float32) / half))
-        f = torch.outer(positions.float(), inv)
+        if positions.dim() == 1:
+            f = torch.outer(positions.float(), inv)
+        else:
+            # Per half-dim, take the position component that dim rotates by.
+            f = positions.float()[:, self._mrope_dim_source()] * inv
         c, s = f.cos().to(torch.bfloat16), f.sin().to(torch.bfloat16)
         return torch.cat([c, c, -s, s], dim=1).contiguous()
 
@@ -673,7 +702,7 @@ class Qwen25VLLMMixin:
         self.dma_write(DMA_DEVICE_H2C, addr, blob, len(blob))
         return addr
 
-    def run_prefill(self, tokens, image_embeddings=None) -> None:
+    def run_prefill(self, tokens, image_embeddings=None, positions=None) -> None:
         """Embed the prompt (splicing image tokens if given), then run prefill."""
         d = self._lm_dims()
         seq_len = len(tokens)
@@ -690,7 +719,8 @@ class Qwen25VLLMMixin:
                        f"{'...' if len(slots) > 4 else ''}")
         self.dma_to_accelerator_memory(self.LM_IO_A, emb.flatten())
 
-        self.load_rope_for_positions(torch.arange(seq_len))
+        self.load_rope_for_positions(
+            positions if positions is not None else torch.arange(seq_len))
         # Causal mask over the aligned square; columns past the real prompt are
         # masked too, so the alignment padding cannot be attended to.
         bias = torch.full((aligned, aligned), float("-inf"), dtype=torch.bfloat16)
@@ -739,6 +769,45 @@ class Qwen25VLLMMixin:
         step_flops = 0.0
         self._decode_step_us = []
         t0 = time.perf_counter()
+
+        # Live status bar: pin the bottom terminal row via an ANSI scroll region
+        # so generated tokens stream above it while the counter refreshes in
+        # place. Everything is on stdout -- tokens scroll inside rows 1..rows-1,
+        # the status writes row `rows` with cursor save/restore -- so it never
+        # clobbers the streamed text. TTY only; skipped when piped or redirected,
+        # which is why the escape codes never reach a log file.
+        import shutil
+        start_seq = self.seq_len
+        use_status = sys.stdout.isatty()
+
+        def _status_setup():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write(f"\033[1;{rows - 1}r")    # scroll region = rows 1..rows-1
+            sys.stdout.write(f"\033[{rows - 1};1H")    # park cursor at its bottom
+            sys.stdout.flush()
+
+        def _status_update():
+            rows = shutil.get_terminal_size().lines
+            n_done = self.seq_len - start_seq
+            elapsed = time.perf_counter() - t0
+            rate = n_done / elapsed if elapsed > 0 else 0.0
+            hw = (1e6 / (total_us / n_done)) if n_done and total_us else 0.0
+            sys.stdout.write("\0337")                  # save cursor
+            sys.stdout.write(f"\033[{rows};1H\033[2K")  # bottom row, clear it
+            sys.stdout.write(
+                f" decoding… {n_done} tokens  (pos {self.seq_len}/{self.MAX_CONTEXT_SIZE})"
+                f"  {elapsed:.1f}s  {rate:.2f} tok/s  (HW {hw:.2f} tok/s)")
+            sys.stdout.write("\0338")                  # restore cursor
+            sys.stdout.flush()
+
+        def _status_teardown():
+            rows = shutil.get_terminal_size().lines
+            sys.stdout.write("\033[r")                 # reset scroll region
+            sys.stdout.write(f"\033[{rows};1H\033[2K")  # clear the status row
+            sys.stdout.flush()
+
+        if use_status:
+            _status_setup()
         limit = self.MAX_CONTEXT_SIZE
         if max_new_tokens is not None:
             limit = min(limit, self.seq_len + max_new_tokens)
@@ -750,9 +819,12 @@ class Qwen25VLLMMixin:
 
             self.dma_to_accelerator_memory(
                 self.LM_IO_A, self.get_embedding_for_tokens([token]).flatten())
+            # After an image the next text position is NOT step_pos: the image
+            # occupied max(h, w) positions, not one per token, so mrope_delta
+            # carries the gap. All three components advance together for text.
+            pos = step_pos + getattr(self, "_rope_offset", 0)
             self.load_rope_for_positions(
-                torch.tensor([step_pos + getattr(self, "_rope_offset", 0)]),
-                decode=True)
+                torch.tensor([[pos, pos, pos]]), decode=True)
             # Mask everything past the tokens actually written to the cache.
             # Cover EVERY row the kernel reads: batch is the 64-aligned tile,
             # not QH. Rows past the live query are unread, but an all -inf row
@@ -790,12 +862,20 @@ class Qwen25VLLMMixin:
 
             token = self.get_arg_max_index()
             if token in stop:
+                if use_status:
+                    _status_teardown()
                 break
             piece = self.tokenizer.decode([token])
             out.append(piece)
             self._set_silent(False)
             print(piece, end="", flush=True)
             self._set_silent(True)
+            if use_status:
+                _status_update()
+        else:
+            # Loop ran to the token cap or the context end rather than breaking.
+            if use_status:
+                _status_teardown()
         self._set_silent(prev_silent)
 
         wall = time.perf_counter() - t0
@@ -807,8 +887,18 @@ class Qwen25VLLMMixin:
             # Cannot happen physically; means the FLOP count is billed at
             # shapes the hardware did not run.
             note = f"  [warn] {100 * gflops / peak:.0f}% of peak is impossible"
+        # Emitted BEFORE the [LM] line on purpose: model_auto_test slices the
+        # generated text from "--- Decode run ---" up to "\nDecoder done in",
+        # so anything printed in between lands inside what it scores as model
+        # output. Keeping the marker here leaves that region pure token stream.
+        self._loud(f"\nDecoder done in {wall:.2f} seconds, "
+                   f"speed: {n / wall:.2f} tokens/s, total {self.seq_len} tokens.")
+
+        # First-token speed from the HW counter is the PEAK: the KV history is
+        # shortest on step 1, so every later step attends further and is slower.
+        first_toks = (1e6 / self._decode_step_us[0]) if self._decode_step_us else 0.0
         self._loud(f"\n  [LM] {n} tokens in {wall:.2f}s = {n / wall:.2f} tok/s "
-                   f"({total_us / 1e3 / n:.1f} ms/token HW, "
+                   f"(1st decode token: {first_toks:.2f} tok/s, "
                    f"{step_flops / n / 1e9:.2f} GFLOP/token, {gflops:.1f} GFLOPS"
                    f"{f' = {100 * gflops / peak:.0f}% of peak' if peak else ''})"
                    f"{note}")
