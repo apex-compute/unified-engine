@@ -18,16 +18,12 @@ interpret the embedded graph operation by operation.
 ## Hardware compatibility
 
 Hardware inference requires native CONV2D/MAXPOOL, ordered queue-CONFIG
-geometry, and the corrected gather-IF8 scale rewind introduced by Andromeda
-commit `77e8adf3`. Older queue-CONFIG builds `d93eea82`, `9ef15fc1`, and
-`663de8d5`, as well as the bundled `update_19788da0.bin`, do not satisfy those
-requirements. The four-channel banked gather, direct-bin
-inference, and complete Andromeda hardware suite are strictly validated on
-timing-clean RK-256 build `eed3a5d9` (WNS `+0.002 ns`, TNS `0`). The runtime
-does not enforce an FPGA build-hash allow-list, so callers must select an image
-with the required features. The validated build includes the read-only
-`HW_INFO` register and remaps the live geometry CSRs. Queue-CONFIG direct
-inference does not write those live CSRs.
+geometry, and the FPGA build stamped from Andromeda commit `b34d1ac8`, reported
+by the hardware-version register as `0xb34d1ac8`. The runner checks this value
+before uploading the deployment image. This build includes per-output-channel
+CONV bias reuse, the corrected gather-IF8 scale rewind, the read-only `HW_INFO`
+register, and the live geometry CSR remap. Queue-CONFIG direct inference does
+not write those live CSRs. The bundled `update_19788da0.bin` is not compatible.
 
 ## Checkpoint and quantization
 
@@ -69,7 +65,16 @@ python3 models/yolov5n/yolov5n_run_from_bin.py --list-resolutions
 
 # Validate the same artifact without an FPGA.
 python3 models/yolov5n/yolov5n_run_from_bin.py --cpu
+
+# Export the final 8192 decoded events from the circular trace BRAM.
+python3 models/yolov5n/yolov5n_run_from_bin.py \
+  --trace-tail perf_logs/yolov5n
 ```
+
+The trace command writes a CSV and a native Perfetto `.pftrace` file below the
+requested directory. Trace-register reads happen after the single terminal
+HALT and add host-side debug overhead; `FPGA execution time` remains based on
+the hardware latency counter.
 
 The dedicated commands are pinned to YOLOv5n and intentionally do not expose a
 `--variant` option. Use the sibling `models/yolov5s` commands for YOLOv5s.

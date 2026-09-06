@@ -83,15 +83,15 @@ CANONICAL_ARTIFACTS = {
         weights_sha256=(
             "273634fad085fa82ed76b5c5f03d80abebf3c8edcf4c8dbda95697c8c8b7d4d3"),
         model_sha256=(
-            "dd744ebd010b11e06bc527836da2d3e457ca8bf3be1454545b537df752acdfe3"),
+            "4343c3f74143db8869844cb823461f7c111685158de3a9156c72650991e8a0b1"),
         program_sha256=(
-            "a96d21abbdf647374a23e4d76b3f39527d3b03f90ae5b4ebb6bb4e7cb02c7498"),
+            "5dab415227f78baf805c2a06639015417591d2797920c314b11379b7254736a5"),
         manifest_sha256=(
-            "6c83bf28f149462a19d790f195391bf9ee575953c95bcbe11a2127854d7511e2"),
+            "aaf8475902ed53a3ce747d453f2631614010ce152596fb47810fd24e16fb514e"),
         bundle_sha256=(
-            "a94de56d9cb84f66e8e3b3ba4fd10a3f82b62a2d34512d9cb9435fdd268836e4"),
-        model_bytes=18_094_976,
-        program_bytes=625_152,
+            "ee6f80475b040bd2808aa7b253c863cbe531febee9aac488b97dc91988c7f70d"),
+        model_bytes=22_780_416,
+        program_bytes=605_312,
     ),
     "n": CanonicalArtifact(
         variant="n",
@@ -101,15 +101,15 @@ CANONICAL_ARTIFACTS = {
         weights_sha256=(
             "b8ca688e49a44c87b657de6b5c4c9d7b0193718c40ccc8f860733cd89865f666"),
         model_sha256=(
-            "fe1674e69a2645d2b62937184f5cffdef89f663437615d318a6e58269fbc7cce"),
+            "1092939f7b1d39a8972dd458d3ac7671853fefcfbce5c2259c3ba72133afac65"),
         program_sha256=(
-            "e1a8cf92d99aaa1516c9c39122a660c65f04f8ab2baaf8af1662ce52419aa924"),
+            "516535c30572df4b82953476789e90299607858319d849b49c7be457ee18bcd2"),
         manifest_sha256=(
-            "41c57c40ded178332abc96c3a262ab270ab5b2afec2deff617aa3719b3b8b489"),
+            "24d0be53eb28184f853a145c6ffca8c04959e2064a2fbff084456241046612f6"),
         bundle_sha256=(
-            "75a0fcea766b5dc64bb1b18b1b42c21b368c82198f297efcc65ed3354b04c6d6"),
-        model_bytes=19_718_784,
-        program_bytes=290_560,
+            "e78adcca219924cb2c97393e0c5cddfe4735374ddcb1c6030d18c9355b8ad0ca"),
+        model_bytes=38_365_440,
+        program_bytes=260_352,
     ),
 }
 

@@ -19,17 +19,13 @@ YOLOv5 requires a convolution-enabled FPGA image. The repository-shipped
 `update_19788da0.bin` image is **not compatible** because it does not implement
 the required convolution/max-pool modes and registers.
 
-The hardware runtime uses ordered queue-CONFIG geometry. The optimized
-mixed-precision path additionally requires the corrected gather-IF8 scale
-rewind introduced by Andromeda commit `77e8adf3`; older queue-CONFIG builds
-`d93eea82`, `9ef15fc1`, and `663de8d5` do not provide that correction. The
-four-channel banked gather and direct-bin path are strictly validated on
-timing-clean RK-256 build `eed3a5d9` (WNS `+0.002 ns`, TNS `0`). The runtime
-does not enforce an FPGA build-hash allow-list, so callers must select an image
-with the required features. The validated build includes the read-only
-`HW_INFO` register and remaps the live geometry CSRs. Queue-CONFIG direct
-inference does not write those live CSRs. No compatible update image is shipped
-in this repository.
+The hardware runtime uses ordered queue-CONFIG geometry and requires the FPGA
+build stamped from Andromeda commit `b34d1ac8`, reported by the hardware-version
+register as `0xb34d1ac8`. The runner checks this value before uploading the
+deployment image. This build includes per-output-channel CONV bias reuse, the
+corrected gather-IF8 scale rewind, the read-only `HW_INFO` register, and the live
+geometry CSR remap. Queue-CONFIG direct inference does not write those live
+CSRs. No compatible update image is shipped in this repository.
 
 Artifact-v6 schema/profile/digest checks, no-capture replay guards, offline
 queue-CONFIG compilation, and quantized CPU direct execution are host-validated.
@@ -95,7 +91,14 @@ python3 models/yolov5s/yolov5s_run_from_bin.py --list-resolutions
 
 # Check the same artifact and graph on the quantized CPU backend, without FPGA.
 python3 models/yolov5s/yolov5s_run_from_bin.py --cpu
+
+# Export the chronological tail retained by the 8192-entry trace BRAM.
+python3 models/yolov5s/yolov5s_run_from_bin.py --trace-tail perf_logs/yolov5s
 ```
+
+Trace export produces CSV and native Perfetto `.pftrace` files after the one
+terminal HALT. The register reads increase host wall time but do not change the
+reported FPGA latency-counter time.
 
 `yolov5s-andromeda.bin` is the only model data file required by the direct
 runner. Artifact format version 6 contains six validated fixed-shape graphs,
