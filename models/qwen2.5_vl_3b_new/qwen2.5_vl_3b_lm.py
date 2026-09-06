@@ -400,11 +400,10 @@ class Qwen25VLLMMixin:
                 kw.update(B_DRAM_ADDR=la[f"{tag}_weight"])
             return self.matmat_mul_core(**kw) or 0
 
-        flops += self.rms_norm_core_dram(
-            M=M, N=H, A_DRAM_ADDR=in_addr, OUTPUT_DRAM_ADDR=self.LM_PRE_NORM,
-            GAMMA_DRAM_ADDR=la["ln1"], gpr_M_reg=m_reg) or 0
-        ckpt(f"L{li}:norm1", flops)
         if sched is None:
+            flops += self.rms_norm_core_dram(
+                M=M, N=H, A_DRAM_ADDR=in_addr, OUTPUT_DRAM_ADDR=self.LM_PRE_NORM,
+                GAMMA_DRAM_ADDR=la["ln1"], gpr_M_reg=m_reg) or 0
             flops += mm(H, QH * AHD, self.LM_PRE_NORM, "q", self.LM_Q, bias=la["q_bias"])
             flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "k", self.LM_K, bias=la["k_bias"])
             flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "v", self.LM_V,
@@ -416,8 +415,17 @@ class Qwen25VLLMMixin:
             # (broadcast_N), so it is not sliced.
             acc = [0]
 
-            def _qkv(ctx, la=la, acc=acc):
+            def _qkv(ctx, la=la, acc=acc, in_addr=in_addr):
                 m = gate_m_regs[ctx.engine_idx]
+                # norm1 folded in: it is row-independent and feeds the three
+                # projections directly, so it rides the region already here
+                # rather than paying its own entry/exit rendezvous.
+                ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                acc[0] += ctx.ue.rms_norm_core_dram(
+                    M=ctx.rows, N=H,
+                    A_DRAM_ADDR=ctx.rows_addr(in_addr, H * bpe),
+                    OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_PRE_NORM, H * bpe),
+                    GAMMA_DRAM_ADDR=la["ln1"], gpr_M_reg=m) or 0
                 for tag, n_out, out, row, quant in (
                         ("q", QH * AHD, self.LM_Q, QH * AHD * bpe, True),
                         ("k", KVH * AHD, self.LM_K, KVH * AHD * bpe, True),
@@ -658,16 +666,15 @@ class Qwen25VLLMMixin:
             flops += o_acc[0]
             self.generate_instruction_add_set(m_reg, M)   # restore gf_seq_len
         ckpt(f"L{li}:o_proj", flops)
-        flops += self.eltwise_core_dram(
-            M=M, N=H, dram_a=in_addr, dram_b=self.LM_ATTN_PROJ,
-            dram_out=self.LM_RESIDUAL, mode=UE_MODE.ELTWISE_ADD,
-            gpr_M_reg=m_reg) or 0
-        flops += self.rms_norm_core_dram(
-            M=M, N=H, A_DRAM_ADDR=self.LM_RESIDUAL,
-            OUTPUT_DRAM_ADDR=self.LM_MLP_NORM, GAMMA_DRAM_ADDR=la["ln2"],
-            gpr_M_reg=m_reg) or 0
-        ckpt(f"L{li}:resid+norm2", flops)
         if sched is None:
+            flops += self.eltwise_core_dram(
+                M=M, N=H, dram_a=in_addr, dram_b=self.LM_ATTN_PROJ,
+                dram_out=self.LM_RESIDUAL, mode=UE_MODE.ELTWISE_ADD,
+                gpr_M_reg=m_reg) or 0
+            flops += self.rms_norm_core_dram(
+                M=M, N=H, A_DRAM_ADDR=self.LM_RESIDUAL,
+                OUTPUT_DRAM_ADDR=self.LM_MLP_NORM, GAMMA_DRAM_ADDR=la["ln2"],
+                gpr_M_reg=m_reg) or 0
             flops += mm(H, MLP, self.LM_MLP_NORM, "gate", self.LM_MLP_GATE, silu=True)
             flops += mm(H, MLP, self.LM_MLP_NORM, "up", self.LM_MLP_UP)
             flops += self.eltwise_core_dram(
@@ -683,9 +690,24 @@ class Qwen25VLLMMixin:
             # biases, so only the activations are sliced.
             mlp_acc = [0]
 
-            def _mlp(ctx, la=la, mlp_acc=mlp_acc):
+            def _mlp(ctx, la=la, mlp_acc=mlp_acc, in_addr=in_addr, out_addr=out_addr):
                 m = gate_m_regs[ctx.engine_idx]
                 h_row, mlp_row = H * bpe, MLP * bpe
+                # Both residuals and norm2 fold in: the whole chain from the
+                # attention residual to the layer output is row-independent, so
+                # it is one region rather than four with barriers between.
+                ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                mlp_acc[0] += ctx.ue.eltwise_core_dram(
+                    M=ctx.rows, N=H, dram_a=ctx.rows_addr(in_addr, h_row),
+                    dram_b=ctx.rows_addr(self.LM_ATTN_PROJ, h_row),
+                    dram_out=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                    mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
+                ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                mlp_acc[0] += ctx.ue.rms_norm_core_dram(
+                    M=ctx.rows, N=H,
+                    A_DRAM_ADDR=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                    OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_NORM, h_row),
+                    GAMMA_DRAM_ADDR=la["ln2"], gpr_M_reg=m) or 0
                 a = ctx.rows_addr(self.LM_MLP_NORM, h_row)
                 for tag, out in (("gate", self.LM_MLP_GATE), ("up", self.LM_MLP_UP)):
                     ctx.ue.generate_instruction_add_set(m, ctx.rows)
@@ -710,15 +732,22 @@ class Qwen25VLLMMixin:
                     data_type=TYPE.IF4, SCALE_DRAM_ADDR=la["down_scale"],
                     OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_DOWN, h_row),
                     gpr_M_reg=m) or 0
+                ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                mlp_acc[0] += ctx.ue.eltwise_core_dram(
+                    M=ctx.rows, N=H,
+                    dram_a=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                    dram_b=ctx.rows_addr(self.LM_MLP_DOWN, h_row),
+                    dram_out=ctx.rows_addr(out_addr, h_row),
+                    mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
 
             sched.sharded_region(M, _mlp)
             flops += mlp_acc[0]
             self.generate_instruction_add_set(m_reg, M)   # restore gf_seq_len
+        if sched is None:
+            flops += self.eltwise_core_dram(
+                M=M, N=H, dram_a=self.LM_RESIDUAL, dram_b=self.LM_MLP_DOWN,
+                dram_out=out_addr, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m_reg) or 0
         ckpt(f"L{li}:mlp_proj", flops)
-        flops += self.eltwise_core_dram(
-            M=M, N=H, dram_a=self.LM_RESIDUAL, dram_b=self.LM_MLP_DOWN,
-            dram_out=out_addr, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m_reg) or 0
-        ckpt(f"L{li}:resid2", flops)
         return flops
 
     def _make_ckpt(self, profile: bool, base_ref, store):
