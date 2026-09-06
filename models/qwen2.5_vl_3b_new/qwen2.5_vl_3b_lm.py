@@ -420,6 +420,16 @@ class Qwen25VLLMMixin:
                         K=K, N=N, layers=1, main_layer_stride=0,
                         max_engines=n_sh, verbose=False)
                 shards[(op, li)] = sw
+        # The head is not per-layer: one [151936, 2048] IF4 block, 2374 col
+        # blocks, an even 296-297 per engine. It is ~8.7% of the bytes decode
+        # streams per token, so it is worth a round of its own.
+        self._decode_lm_shard = None
+        if mes.max_shards(d["VOCAB"]) >= sched.num_engines:
+            self._decode_lm_shard = sched.shard_quantized_weight(
+                name="lm_head", main_weight_addr=self.lm_head_data,
+                main_scale_addr=self.lm_head_scale,
+                K=d["H"], N=d["VOCAB"], layers=1, main_layer_stride=0,
+                data_type=TYPE.IF4, verbose=False)
         self._decode_shards = shards
         used = sched.private_usage()
         self._loud(f"  [Decode] sharded {len(shards)} projection(s) over "
@@ -490,6 +500,20 @@ class Qwen25VLLMMixin:
                 dec_sched.end_worker_round(e)
             dec_sched.join()
         return flops
+
+    def _decode_token(self) -> int:
+        """The sampled token after one decode step.
+
+        With a sharded head each engine argmaxes only its own column block, so
+        the winner is whichever engine's candidate has the largest value --
+        global_argmax reads those back and compares. Unsharded, the master's
+        argmax register already holds the answer.
+        """
+        sw = getattr(self, "_decode_lm_shard", None)
+        sched = self._multi_core_schedulers.get("decode") if sw is not None else None
+        if sw is None or sched is None:
+            return self.get_arg_max_index()
+        return sched.global_argmax(sw, self.LOGITS)
 
     def _kv_addr(self, cache_base: int, layer: int, kv_head: int) -> int:
         return cache_base + layer * self.KV_STRIDE_LAYER + kv_head * self.KV_STRIDE_HEAD
@@ -1143,6 +1167,7 @@ class Qwen25VLLMMixin:
                 for inst in w.capture_buffer:
                     wb.extend(inst.get_bytes())
                 self.mc_arena.check_isa_fits(idx, addr, len(wb))
+                self._note_worker_isa(idx, "prefill", len(wb))
                 self._prefill_workers.append((idx, w, addr, bytes(wb)))
         self._prefill_program = (base, bytes(blob))
         self._prefill_flops = int(flops)
@@ -1219,15 +1244,34 @@ class Qwen25VLLMMixin:
             GAMMA_DRAM_ADDR=self.final_norm_addr, gpr_M_reg=m_reg) or 0
         ckpt("final_norm", flops - flops_ref[0])
 
-        # LM head with the penalty vector as its bias term: the HW argmax of
-        # (logits + bias) is the answer, so write_back_disable keeps the 151936
-        # logits off the bus entirely. An all-zero bias is plain greedy.
-        flops += self.quantized_matmat_core(
-            M=1, K=d["H"], N=d["VOCAB"], A_DRAM_ADDR=self.LM_OUT_NORM,
-            B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS,
-            SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4,
-            C_DRAM_ADDR=self.PENALTY_BIAS, bias_mode="broadcast_N",
-            write_back_disable=True) or 0
+        head_sw = getattr(self, "_decode_lm_shard", None) if dec_sched else None
+        if head_sw is not None:
+            # SHARDED HEAD: writeback must be ENABLED, unlike the single-engine
+            # path below. Each engine's argmax register holds a LOCAL index into
+            # its own column block and the hardware exposes no max-VALUE
+            # register, so the global winner is found by reading back the eight
+            # candidates' values -- which requires them to be in DRAM.
+            # That is 8 two-byte reads, not a 297 KiB readback.
+            def _master_head():
+                return (self._emit_dec_shard(self, head_sw, 0, self.LOGITS,
+                                             self.LM_OUT_NORM, self.PENALTY_BIAS)
+                        + dec_sched.worker_flops(head_sw))
+
+            flops += self._dec_round(
+                dec_sched,
+                [(head_sw, self.LOGITS, self.LM_OUT_NORM, self.PENALTY_BIAS, False)],
+                _master_head)
+        else:
+            # LM head with the penalty vector as its bias term: the HW argmax of
+            # (logits + bias) is the answer, so write_back_disable keeps the
+            # 151936 logits off the bus entirely. An all-zero bias is plain
+            # greedy.
+            flops += self.quantized_matmat_core(
+                M=1, K=d["H"], N=d["VOCAB"], A_DRAM_ADDR=self.LM_OUT_NORM,
+                B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS,
+                SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4,
+                C_DRAM_ADDR=self.PENALTY_BIAS, bias_mode="broadcast_N",
+                write_back_disable=True) or 0
         ckpt("lm_head", flops - flops_ref[0])
         self.generate_instruction_add_inc(self.gf_seq_len)
         self.generate_instruction_halt()
@@ -1247,6 +1291,7 @@ class Qwen25VLLMMixin:
                 for inst in w.capture_buffer:
                     wb.extend(inst.get_bytes())
                 self.mc_arena.check_isa_fits(idx, addr, len(wb))
+                self._note_worker_isa(idx, "decode", len(wb))
                 self._decoder_workers.append((idx, w, addr, bytes(wb)))
         self._decoder_program = (base, bytes(blob))
         self._decoder_flops = int(flops)
@@ -1419,7 +1464,7 @@ class Qwen25VLLMMixin:
         for w in (dec_sched.workers if dec_sched is not None else []):
             w.wait_queue(timeout_s)
         self._set_silent(prev)
-        return results, self.get_arg_max_index(), aligned
+        return results, self._decode_token(), aligned
 
     def run_decoder(self, first_token: int, max_new_tokens: int = 256) -> tuple[int, str]:
         """Greedy decode until EOS, ``max_new_tokens``, or the context fills.
@@ -1547,7 +1592,7 @@ class Qwen25VLLMMixin:
             step_flops += (self._decoder_flops_fixed
                            + self._decoder_attn_per_aligned * aligned)
 
-            token = self.get_arg_max_index()
+            token = self._decode_token()
             if token in stop:
                 if use_status:
                     _status_teardown()

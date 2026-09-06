@@ -223,7 +223,7 @@ from __future__ import annotations
 import hashlib
 import struct
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Callable, Optional
 
@@ -494,7 +494,17 @@ class PrivateArena:
                  arena_bytes: Optional[int] = None,
                  isa_bytes: int = PRIVATE_ISA_BYTES,
                  tensor_bytes: int = PRIVATE_TENSOR_BYTES,
+                 external_isa: Optional[tuple] = None,
                  verbose: bool = False):
+        """``external_isa=(base, stride)`` moves the per-engine ISA slices OUT of
+        the private windows and into a region the model owns elsewhere.
+
+        Worth doing when private space is the scarce resource and the model map
+        is not: worker programs are a few MB, so a 16 MB slice per window buys
+        little and costs the weight arena the same 16 MB on every core. With it
+        set, a window is just [ weights | tensor ] and the whole reclaimed slice
+        goes to weights.
+        """
         if arena_bytes is None:
             arena_bytes = private_total()
         assert arena_base % PRIVATE_ALIGN == 0, (
@@ -502,12 +512,23 @@ class PrivateArena:
         self.num_engines = num_engines
         self.arena_base = arena_base
         self.arena_bytes = arena_bytes
-        self.isa_bytes = isa_bytes
+        self.external_isa = external_isa
+        # What the WINDOW reserves for ISA (0 when the slices live elsewhere)
+        # versus how big one engine's ISA slice IS -- the same number only when
+        # the slices are carved from the windows.
+        self._carve_isa_bytes = 0 if external_isa is not None else isa_bytes
+        self.isa_bytes = external_isa[1] if external_isa is not None else isa_bytes
         self.tensor_bytes = tensor_bytes
-        self.stride = private_stride(num_engines, arena_bytes, isa_bytes, tensor_bytes)
+        self.stride = private_stride(num_engines, arena_bytes,
+                                     self._carve_isa_bytes, tensor_bytes)
         self.regions = [private_region(i, num_engines, arena_base, arena_bytes,
-                                       isa_bytes, tensor_bytes)
+                                       self._carve_isa_bytes, tensor_bytes)
                         for i in range(num_engines)]
+        if external_isa is not None:
+            ext_base, ext_stride = external_isa
+            assert ext_base % 64 == 0, "external ISA base must be 64 B aligned"
+            self.regions = [replace(r, isa_base=ext_base + i * ext_stride)
+                            for i, r in enumerate(self.regions)]
         self._weight_cursor = [r.weight_base for r in self.regions]
         self._tensor_cursor = [r.tensor_base for r in self.regions]
         if verbose:
@@ -524,7 +545,7 @@ class PrivateArena:
         return self.regions[engine_idx].isa_base + self.isa_bytes
 
     def weight_bytes(self) -> int:
-        return self.stride - self.isa_bytes - self.tensor_bytes
+        return self.stride - self._carve_isa_bytes - self.tensor_bytes
 
     def usage(self) -> list[int]:
         """Bytes of weight arena used per engine."""
@@ -532,8 +553,21 @@ class PrivateArena:
                 for i in range(self.num_engines)]
 
     def describe(self) -> str:
-        return describe_private_map(self.num_engines, self.arena_base, self.arena_bytes,
-                                    self.isa_bytes, self.tensor_bytes)
+        if self.external_isa is None:
+            return describe_private_map(self.num_engines, self.arena_base,
+                                        self.arena_bytes, self.isa_bytes,
+                                        self.tensor_bytes)
+        # Built from self.regions, not recomputed: the ISA bases were relocated
+        # after the carve and describe_private_map would recompute the old ones.
+        b, st = self.external_isa
+        lines = [f"  Private map: 0x{self.arena_base:08X} .. "
+                 f"+{self.arena_bytes / 2**20:.0f} MB, "
+                 f"{self.num_engines} core(s), {self.stride / 2**20:.0f} MB/core:"]
+        lines += ["    " + r.describe() for r in self.regions]
+        lines.append(f"    ISA slices are OUTSIDE the private map: "
+                     f"0x{b:08X} + {st / 2**20:.0f} MB/core "
+                     f"({st * self.num_engines / 2**20:.0f} MB total)")
+        return "\n".join(lines)
 
     # -- allocation ---------------------------------------------------------
     def alloc_weights(self, engine_idx: int, size_bytes: int, what: str) -> int:
@@ -587,9 +621,12 @@ class PrivateArena:
         region = self.regions[engine_idx]
         limit = self.isa_limit(engine_idx)
         if addr < region.isa_base or addr + size_bytes > limit:
-            spill = ("tensor slice"
-                     if addr + size_bytes <= region.tensor_base + self.tensor_bytes
-                     else "next engine window")
+            if self.external_isa is not None:
+                spill = "next engine's ISA slice or the model map"
+            else:
+                spill = ("tensor slice"
+                         if addr + size_bytes <= region.tensor_base + self.tensor_bytes
+                         else "next engine window")
             raise MemoryError(
                 f"engine {engine_idx} ISA overflow: program "
                 f"[0x{addr:X}..0x{addr + size_bytes:X}) is outside its slice "

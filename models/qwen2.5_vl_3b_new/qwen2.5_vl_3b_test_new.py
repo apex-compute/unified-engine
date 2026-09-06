@@ -127,8 +127,16 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
         #
         # MULTI-CORE PRIVATE SPACE, the whole lower 2 GB -- empty at 1 core, and
         # handed to PrivateArena, which splits it into one window per engine laid
-        # out [ weights | ISA | tensor ] with the two fixed slices at the top:
-        #   8 engines -> 256 MiB/window: 224 MiB weights + 16 MiB ISA + 16 MiB tensor
+        # out [ weights | tensor ]:
+        #   8 engines -> 256 MiB/window: 240 MiB weights + 16 MiB tensor
+        #
+        # WORKER ISA LIVES IN THE MODEL MAP, NOT THE PRIVATE WINDOWS. A worker
+        # program is a few MB, so a 16 MiB private slice per core bought little
+        # and cost the weight arena 16 MiB on EVERY core -- the arena being the
+        # binding constraint on how much of decode can be sharded. The upper 2 GB
+        # has the room instead: the 80 MiB ISA window holds only the master's
+        # vision/prefill/decoder images (~9 MiB together at 8 cores). So the
+        # workers take the TOP of that window and the master keeps the bottom.
         # The model map begins at 0x8000_0000 and allocates upward, so a window
         # carved from the low 2 GB cannot alias model memory however the model's
         # cursors move. Same arrangement as gemma4_e2b and gemma3.
@@ -142,9 +150,27 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
         # Vision loads at the base of the same window (see the note above).
         self.VISION_WEIGHT_BASE = self.PARAMS_BASE
 
-        self.mc_arena = (PrivateArena(multi_core, arena_base=0x00000000,
-                                      arena_bytes=self.PARAMS_BASE, verbose=True)
-                         if multi_core > 1 else None)
+        # Master keeps the bottom of the ISA window; workers slice the top.
+        # MASTER_ISA_RESERVE is what the master may grow into -- prefill is
+        # compiled per prompt and grows with it, so it is deliberately much
+        # larger than the ~9 MiB three resident images take today.
+        self.MASTER_ISA_RESERVE = 24 * 2**20
+        self.WORKER_ISA_BASE = self.ISA_BASE + self.MASTER_ISA_RESERVE
+        n_workers = max(multi_core - 1, 1)
+        # 1 MiB granularity, and every worker gets the same stride so an image
+        # can be checked against a single size.
+        self.WORKER_ISA_STRIDE = (
+            ((self.DRAM_END - self.WORKER_ISA_BASE) // n_workers) & ~(2**20 - 1))
+        # Engine 0's slice is never used (the master allocates from ISA_BASE
+        # through the normal program cursor), so index the stride from engine 1.
+        self.mc_arena = (PrivateArena(
+            multi_core, arena_base=0x00000000, arena_bytes=self.PARAMS_BASE,
+            external_isa=(self.WORKER_ISA_BASE - self.WORKER_ISA_STRIDE,
+                          self.WORKER_ISA_STRIDE),
+            verbose=True)
+            if multi_core > 1 else None)
+        # Exact per-core worker image sizes, filled in as each stage compiles.
+        self._worker_isa_used = {}
 
         super().__init__(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
                          params_dram_base=self.PARAMS_BASE,
@@ -196,6 +222,46 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
 
         self._end_of_turn_token_id = model["end_of_turn_token_id"]
         self.causal_mask_upper = False
+
+    def _note_worker_isa(self, idx: int, stage: str, nbytes: int) -> None:
+        """Record one worker's compiled image size, per stage.
+
+        Stages do NOT share an image: each engine's program cursor advances, so
+        a core's ISA slice must hold vision + prefill + decode together. The sum
+        is what has to fit, not the largest one.
+        """
+        self._worker_isa_used.setdefault(idx, {})[stage] = nbytes
+
+    def isa_usage_lines(self) -> list:
+        """Per-core ISA usage, master and workers, as report lines."""
+        if self.multi_core < 2 or not self._worker_isa_used:
+            return []
+        st = self.WORKER_ISA_STRIDE
+        master_end = self.get_program_dram_addr()
+        out = [f"  ISA window 0x{self.ISA_BASE:08X}-0x{self.DRAM_END:09X} "
+               f"({(self.DRAM_END - self.ISA_BASE) / 2**20:.0f} MiB): "
+               f"master reserve {self.MASTER_ISA_RESERVE / 2**20:.0f} MiB, "
+               f"then {self.multi_core - 1} worker slice(s) of {st / 2**20:.0f} MiB",
+               f"    core 0 (master): {(master_end - self.ISA_BASE) / 2**20:6.2f} "
+               f"/ {self.MASTER_ISA_RESERVE / 2**20:.0f} MiB"]
+        for idx in sorted(self._worker_isa_used):
+            per = self._worker_isa_used[idx]
+            tot = sum(per.values())
+            parts = ", ".join(f"{k} {v / 2**20:.2f}" for k, v in sorted(per.items()))
+            out.append(f"    core {idx}:          {tot / 2**20:6.2f} / "
+                       f"{st / 2**20:.0f} MiB   ({parts} MiB)")
+        return out
+
+    def check_master_isa(self) -> None:
+        """The master's images must stay below the first worker slice."""
+        if self.multi_core < 2:
+            return
+        end = self.get_program_dram_addr()
+        if end > self.WORKER_ISA_BASE:
+            raise MemoryError(
+                f"master ISA overflow: programs reach 0x{end:X}, past the worker "
+                f"ISA region at 0x{self.WORKER_ISA_BASE:X}. Raise "
+                f"MASTER_ISA_RESERVE (and shrink WORKER_ISA_STRIDE to match).")
 
     def _ensure_stage_scheduler(self, stage: str):
         """The shared MultiEngineScheduler for one stage, over the model arena.
@@ -340,6 +406,14 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
             blob = prog[1] if isinstance(prog, tuple) else prog
             if blob:
                 L.append(f"- **{name}:** {len(blob) / 2**20:.2f} MiB")
+        isa = self.isa_usage_lines()
+        if isa:
+            L.append("")
+            L.append("### ISA usage")
+            L.append("")
+            L.append("```")
+            L += [ln.rstrip() for ln in isa]
+            L.append("```")
         L.append("")
 
         if getattr(self, "_vis_latency_us", None):
@@ -668,6 +742,12 @@ def main():
         else:
             ue.compile_prefill(len(context))
             ue.compile_decoder()
+
+        # Programs are all compiled: check the master's images stayed below the
+        # worker slices, and report what every core's ISA actually costs.
+        ue.check_master_isa()
+        for _ln in ue.isa_usage_lines():
+            print(_ln)
 
         print(f"\n--- Prefill ({len(context)} tokens) ---")
         ue.run_prefill(context, image_embeddings=image_embeddings,

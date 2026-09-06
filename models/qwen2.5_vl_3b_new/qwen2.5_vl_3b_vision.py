@@ -918,6 +918,7 @@ class Qwen25VLVisionMixin:
                 for inst in wk.capture_buffer:
                     blob.extend(inst.get_bytes())
                 self.mc_arena.check_isa_fits(idx, addr, len(blob))
+                self._note_worker_isa(idx, "vision", len(blob))
                 self._vis_worker_programs.append((idx, wk, addr, bytes(blob)))
         if base_addr + len(enc) > self.DRAM_END:
             raise MemoryError(
