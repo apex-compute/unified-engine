@@ -281,6 +281,17 @@ class Qwen25VLLMMixin:
         # silent -- it lands on whatever is allocated next. IDENTITY was that
         # neighbour twice.
         self._lm_scratch_guard = alloc(64 * 1024, "lm.scratch_guard")
+        # Head-sharded prefill attention needs ONE PRIVATE scratch per engine:
+        # heads run concurrently and each builds its own V.T / scores / scaled_q.
+        # Sized for the PREFILL shape, not the decode-worst-case LM_SCRATCH --
+        # 480 KiB against 8.6 MiB, and 8 copies of the latter would be 69 MiB
+        # for buffers prefill never fills.
+        self.LM_ATTN_SCRATCH_PER_ENGINE = [self.LM_SCRATCH]
+        if getattr(self, "multi_core", 1) > 1:
+            n_pref = (AHD + aligned_P) * aligned_P + aligned_P * AHD
+            self.LM_ATTN_SCRATCH_PER_ENGINE.extend(
+                self.mc_arena.alloc_tensor(e, n_pref * bpe, "lm prefill attn scratch")
+                for e in range(1, self.multi_core))
         self.LM_IDENTITY = alloc(UE_VECTOR_SIZE * UE_VECTOR_SIZE, "lm.identity")
         # One row per position; every head reads the same rows.
         self.LM_ROPE_PRE = alloc(P * 2 * AHD, "lm.rope_prefill")
@@ -448,7 +459,12 @@ class Qwen25VLLMMixin:
         # M query rows -- no padding tile. (An earlier batch=37 run produced
         # zero output and I read that as an alignment rule; the real cause was
         # the under-sized scratch fixed above.)
-        head_rows = M
+        # Head-plane stride. Prefill uses the 64-ALIGNED length because
+        # HeadShardContext.q_addr/out_addr index planes as head*seq_len*head_dim
+        # -- a plane strided by M would put every head past 0 in the wrong
+        # place. Decode keeps M=1 so its 16 planes stay contiguous, which is
+        # what makes the grouped decode call free.
+        head_rows = M if decode else ((M + 63) // 64) * 64
 
         ckpt(f"L{li}:qkv_proj", flops)
 
@@ -542,6 +558,42 @@ class Qwen25VLLMMixin:
         else:
             groups = [(qh // G, qh * head_rows * AHD * bpe, M) for qh in range(QH)]
         self.LM_BATCH_ROWS = G if decode else M
+        if sched is not None and not decode:
+            attn_acc = [0]
+
+            def _attn(ctx, k_base=k_base, v_base=v_base, attn_acc=attn_acc):
+                # Q/out come from the context accessors (address discipline);
+                # K/V are computed here because the KV cache planes stride by
+                # MAX_CONTEXT_SIZE, not by seq_len as ctx.kv_addr assumes.
+                scratch = self.LM_ATTN_SCRATCH_PER_ENGINE[ctx.engine_idx]
+                for qh in range(ctx.head_off, ctx.head_off + ctx.heads):
+                    kv_h = qh // G
+                    b_reg = ctx.ue.alloc_isa_reg()
+                    ctx.ue.generate_instruction_add_set(b_reg, M)
+                    a_reg = ctx.ue.alloc_isa_reg()
+                    ctx.ue.generate_instruction_add_set(a_reg, aligned_kv)
+                    f = ctx.ue.unified_attention_core(
+                        batch=M, aligned_seq_len=aligned_kv, head_dim=AHD,
+                        Q_DRAM_ADDR=ctx.q_addr(self.LM_Q_HM, qh),
+                        K_DRAM_ADDR=k_base + kv_h * self.KV_STRIDE_HEAD,
+                        V_DRAM_ADDR=v_base + kv_h * self.KV_STRIDE_HEAD,
+                        BIAS_DRAM_ADDR=self.LM_BIAS,
+                        OUTPUT_DRAM_ADDR=ctx.out_addr(self.LM_ATTN_HM, qh),
+                        SCRATCH_DRAM_ADDR=scratch,
+                        IDENTITY_DRAM_ADDR=self.LM_IDENTITY,
+                        gpr_batch_reg=b_reg, gpr_aligned_seq_len_reg=a_reg)
+                    ctx.ue.release_isa_reg()
+                    ctx.ue.release_isa_reg()
+                    attn_acc[0] += f if isinstance(f, (int, float)) else 0
+
+            # mode="qheads": split all QH Q heads, not the KV groups -- there are
+            # only KVH=2 groups, so mode="groups" would cap parallelism at 2.
+            sched.head_sharded_region(QH, aligned_kv, AHD, _attn,
+                                      gqa_ratio=G, mode="qheads")
+            flops += attn_acc[0]
+            self.generate_instruction_add_set(m_reg, M)   # restore gf_seq_len
+            groups = []
+
         for kv_h, plane_off, batch in groups:
             batch_reg = self.alloc_isa_reg()
             self.generate_instruction_add_set(batch_reg, batch)
