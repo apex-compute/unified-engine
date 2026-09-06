@@ -9,7 +9,7 @@ STATUS: engine construction, the DRAM map and vision weight loading. Program
 compilation and execution are not wired up yet.
 
     python qwen2.5_vl_3b_test_new.py --dev xdma0 --image
-    python qwen2.5_vl_3b_test_new.py --dev xdma0 --multi-core 8 --map-only
+    python qwen2.5_vl_3b_test_new.py --dev xdma0 --multi-core 8
 """
 import argparse
 import json
@@ -279,17 +279,58 @@ def build_arg_parser():
         epilog="""examples:
   python qwen2.5_vl_3b_test_new.py --dev xdma0 --image
   python qwen2.5_vl_3b_test_new.py --dev xdma0 --multi-core 8
-  python qwen2.5_vl_3b_test_new.py --map-only     # print the DRAM map, no hardware""")
+
+numeric checks (FPGA vs host-simulate and HuggingFace) live in
+qwen2.5_vl_3b_numeric.py.""")
     parser.add_argument("--prompt", type=str, default=None,
                         help="Text prompt. Default is the built-in test question.")
     parser.add_argument("--image", type=str, nargs="?", const=DEFAULT_IMAGE, default=None,
                         help=f"VLM mode: run the vision encoder and merge image tokens into "
                              f"the prompt. Bare --image uses {os.path.basename(DEFAULT_IMAGE)}.")
     add_engine_args(parser)
-    parser.add_argument("--map-only", action="store_true",
-                        help="Print the DRAM map for the requested engine count and exit. "
-                             "Host-only: no device is opened and no weights are loaded.")
     return parser
+
+
+def clean_dram_4gb(ue=None, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
+    """Fill the whole 32-bit DRAM space with 0xFF, both halves.
+
+    Runs AFTER the software reset and BEFORE the model allocates or uploads
+    anything, so every region this run then reads is either something it wrote
+    itself or a loud NaN. Cleaning afterwards instead would only tidy up for the
+    next process and would leave this run inheriting the last one's memory --
+    which is the failure mode worth preventing.
+
+    UnifiedEngine.clear_dram() only walks from DRAM_START_ADDR (0x8000_0000)
+    upward, i.e. the 2 GB model map. This model also uses the low 2 GB for the
+    per-engine private arena, so the low half is cleared here as well.
+
+    0xFF (not zero) is deliberate, matching clear_dram: it decodes to NaN in
+    bf16, so an uninitialised read shows up as NaN and propagates, instead of
+    silently reading as a plausible 0.0.
+
+    ``ue`` is optional -- pass the model's engine once it exists, or leave it
+    None to open a bare one just for this (as gemma4_e2b's poison_dram does).
+    """
+    owned = ue is None
+    if owned:
+        ue = UnifiedEngine()          # bare engine: opens the device, self-tests
+    fill = b"\xff" * chunk_size_bytes
+    low_bytes = user_dma_core.DRAM_START_ADDR
+    print(f"Clearing low DRAM [0x0..0x{low_bytes - 1:X}] "
+          f"({low_bytes / 1024**3:.2f} GiB)")
+    offset = 0
+    while offset < low_bytes:
+        n = min(chunk_size_bytes, low_bytes - offset)
+        ue.dma_write(user_dma_core.DMA_DEVICE_H2C, offset, fill[:n], n)
+        offset += n
+        pct = offset / low_bytes
+        bar = "\u2588" * int(40 * pct) + "\u2591" * (40 - int(40 * pct))
+        print(f"\r  [{bar}] {pct * 100:5.1f}%  "
+              f"{offset / 1024**2:.0f}/{low_bytes / 1024**2:.0f} MB", end="", flush=True)
+    print()
+    ue.clear_dram(chunk_size_bytes=chunk_size_bytes)
+    if owned:
+        del ue
 
 
 def process_image(image_path: str, size: int = 336) -> torch.Tensor:
@@ -317,26 +358,20 @@ def main():
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    # --map-only is a host-side layout check: PrivateArena does the same
-    # arithmetic the engine would, without touching the board.
-    if args.map_only:
-        print(f"\n--- DRAM map, {args.multi_core} core(s) ---")
-        print(f"  PARAMS  0x80000000 - 0xF1000000    1808 MiB "
-              f"(time-shared: vision 389.7 MiB, then LM 1801.7 MiB)")
-        print(f"  TENSOR  0xF1000000 - 0xFF000000     224 MiB")
-        print(f"  ISA     0xFF000000 - 0x100000000     16 MiB")
-        if args.multi_core > 1:
-            PrivateArena(args.multi_core, arena_base=0x00000000,
-                         arena_bytes=0x80000000, verbose=True)
-        else:
-            print("  private map: single core, low 2 GB unused")
-        return
-
     engine_kwargs = resolve_engine_config(parser, args)
 
+    # Reset every engine this run will touch BEFORE anything else reaches the
+    # hardware. software_reset_test is per-core: a run that died mid-rendezvous
+    # leaves cores spin-waiting on a FLAG_CHECK with no timeout, and the next
+    # process inherits engines that never accept a program.
     from user_hw_test import software_reset_test
-    print(f"\n--- Software-resetting {args.multi_core} core(s) ---")
-    software_reset_test(cores=args.multi_core)
+    cores = args.multi_core or 1
+    print(f"\n--- Software-resetting {cores} core(s) ---")
+    software_reset_test(cores=cores)
+
+    # Establish known DRAM state before the model allocates or uploads anything.
+    print(f"\n--- Cleaning DRAM (4 GiB) ---")
+    clean_dram_4gb()
 
     print(f"\n--- Building engine ---")
     ue = Qwen25VL_UnifiedEngine(**engine_kwargs)

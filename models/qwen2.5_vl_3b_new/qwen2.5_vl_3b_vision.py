@@ -301,6 +301,7 @@ class Qwen25VLVisionMixin:
         with torch.no_grad():
             if image_grid_thw is None:
                 pixel_values, image_grid_thw = self._hf_preprocess_image(pixel_values)
+            self._vis_hf_pixels = pixel_values
             patch_embeds = visual.patch_embed(pixel_values.to(torch.bfloat16))
             if patch_embeds.shape != (VS, VH):
                 raise ValueError(
