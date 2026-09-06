@@ -44,7 +44,7 @@ builtins.print = quiet_print
 
 import user_dma_core
 from user_dma_core import UnifiedEngine, UE_VECTOR_SIZE, set_dma_device
-from multi_engine_shard import PrivateArena
+from multi_engine_shard import MultiEngineScheduler, PrivateArena
 
 # The sibling mixin file is named for the model (qwen2.5_vl_3b_vision.py), and
 # "2.5" makes that an invalid module name, so it is loaded by path rather than
@@ -177,6 +177,34 @@ class Qwen25VL_UnifiedEngine(Qwen25VLVisionMixin, UnifiedEngine):
         self._end_of_turn_token_id = model["end_of_turn_token_id"]
         self.causal_mask_upper = False
 
+    def _ensure_stage_scheduler(self, stage: str):
+        """The shared MultiEngineScheduler for one stage, over the model arena.
+
+        THE ARENA IS PASSED IN, NOT BUILT PER STAGE. Every stage's workers
+        execute from their own window in ``self.mc_arena``; two allocators over
+        one address range would hand out the same address twice and stage 2's
+        worker programs would land on stage 1's. One object, one cursor per
+        engine, for the whole run.
+        """
+        if self.multi_core == 1:
+            return None
+        sched = self._multi_core_schedulers.get(stage)
+        if sched is None:
+            sched = MultiEngineScheduler(
+                self, num_engines=self.multi_core,
+                engine_base_stride=0x00010000,
+                arena=self.mc_arena,
+                # One four-phase master/worker round per region instead of an
+                # all-to-all barrier at entry and exit: O(N) checks rather than
+                # O(N^2), and every flag edge is acknowledged so it does not
+                # need NOP timing margin.
+                region_rendezvous="master_worker",
+                barrier_margin_nops=32,
+                allow_unaligned_rows=True,
+                allow_more_than_two_engines=self.multi_core > 2)
+            self._multi_core_schedulers[stage] = sched
+        return sched
+
     # ---- plumbing shared with the mixins ----------------------------------
 
     @staticmethod
@@ -290,7 +318,8 @@ qwen2.5_vl_3b_numeric.py.""")
     parser.add_argument("--profile", action="store_true",
                         help="Compile the encoder with per-phase HALT checkpoints and "
                              "print a HW-latency breakdown by phase. Read the share "
-                             "column: it says which phase is worth sharding.")
+                             "column: it says which phase is worth sharding. Works with "
+                             "--multi-core (checkpoints sit outside sharded regions).")
     add_engine_args(parser)
     return parser
 

@@ -453,6 +453,23 @@ class Qwen25VLVisionMixin:
         self.VIS_BIAS_WINDOW = alloc(aligned_S * aligned_S, "vis.bias_window")
         scratch_elems = (VD_PAD + aligned_S) * aligned_S + aligned_S * VD_PAD
         self.VIS_ATTN_SCRATCH = alloc(scratch_elems, "vis.attn_scratch")
+        # Head-sharded attention needs ONE PRIVATE scratch per engine -- the
+        # heads run concurrently and each writes its own V.T / scores / scaled-Q.
+        # Core 0 keeps the tensor-arena buffer above; workers get theirs from
+        # their private low-DRAM window, which cannot alias the model map
+        # however the model's cursors move.
+        self.VIS_ATTN_SCRATCH_PER_ENGINE = [self.VIS_ATTN_SCRATCH]
+        if getattr(self, "multi_core", 1) > 1:
+            scratch_bytes = scratch_elems * bpe
+            self.VIS_ATTN_SCRATCH_PER_ENGINE.extend(
+                self.mc_arena.alloc_tensor(e, scratch_bytes, "vision attn scratch")
+                for e in range(1, self.multi_core))
+            spans = sorted((a, a + scratch_bytes)
+                           for a in self.VIS_ATTN_SCRATCH_PER_ENGINE)
+            for (_, prev_end), (next_start, _) in zip(spans, spans[1:]):
+                assert prev_end <= next_start, "per-engine attention scratch overlaps"
+            self._loud(f"  Vision attention scratch: {self.multi_core} private "
+                       f"buffer(s), {scratch_bytes / 2**20:.2f} MiB each")
 
         # Attention output: token-major at the padded width, then trimmed.
         self.VIS_ATTN_PAD = alloc(VS * VN * VD_PAD, "vis.attn_pad")
@@ -566,14 +583,26 @@ class Qwen25VLVisionMixin:
         # q_scale = 1.0 / math.sqrt(VD_PAD) before hunting elsewhere.
         q_scale = 1.0 / math.sqrt(VD)
 
+        sched = self._ensure_stage_scheduler("vision")
         self._loud(f"  [Vision] compiling {VL} layers + merger "
-                   f"(block-diagonal window mask, q_scale=1/sqrt({VD})) ...")
+                   f"(block-diagonal window mask, q_scale=1/sqrt({VD}), "
+                   f"{getattr(self, 'multi_core', 1)} engine(s)) ...")
         t0 = time.perf_counter()
         self.reset_program_dram_addr()
         base_addr = self.get_program_dram_addr()
         self.clear_inst_id()
         self.clear_capture_buffer()
         self.start_capture()
+        gate_m_regs = None
+        if sched is not None:
+            sched.register_per_engine_addrs("vision_attn_scratch",
+                                            self.VIS_ATTN_SCRATCH_PER_ENGINE)
+            sched.begin_program()
+            # Engine 0 reuses the model's row-count GPR; plain UnifiedEngine
+            # workers have no such model attribute, so each allocates its own
+            # after begin_program() resets its allocator.
+            gate_m_regs = [self.gf_seq_len]
+            gate_m_regs.extend(wk.alloc_isa_reg() for wk in sched.workers)
         prev_silent = self._set_silent(True)
         flops = 0
         self._vis_checkpoints = []
@@ -601,17 +630,56 @@ class Qwen25VLVisionMixin:
                 silu_enable=silu, gelu_enable=gelu,
                 gpr_M_reg=self._prime_M(M)) or 0
 
+        def sh_matmul(ctx, m_reg, K, N, A, A_row, w, tag, OUT, OUT_row,
+                      *, silu=False, gelu=False):
+            """One engine's row-block of a projection. Bias is per-COLUMN
+            (broadcast_N), so it is shared, not sliced."""
+            ctx.ue.generate_instruction_add_set(m_reg, ctx.rows)
+            return ctx.ue.matmat_mul_core(
+                M=ctx.rows, K=K, N=N,
+                A_DRAM_ADDR=ctx.rows_addr(A, A_row),
+                B_DRAM_ADDR=w[f"{tag}_data"],
+                OUTPUT_DRAM_ADDR=ctx.rows_addr(OUT, OUT_row),
+                is_B_quantized=True, data_type=TYPE.IF4,
+                SCALE_DRAM_ADDR=w[f"{tag}_scale"],
+                C_DRAM_ADDR=w[f"{tag}_bias"], bias_mode="broadcast_N",
+                silu_enable=silu, gelu_enable=gelu, gpr_M_reg=m_reg) or 0
+
+        h_row = VH * bpe
         for li in range(VL):
             w = self.vis_layer_addrs[li]
             IN = self.VIS_IO_A if li % 2 == 0 else self.VIS_IO_B
             OUT = self.VIS_IO_B if li % 2 == 0 else self.VIS_IO_A
 
             # --- attention ---
-            flops += self.rms_norm_core_dram(
-                M=VS, N=VH, A_DRAM_ADDR=IN, OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT,
-                GAMMA_DRAM_ADDR=w["norm1_weight"], gpr_M_reg=self._prime_M(VS)) or 0
-            flops += matmul(VS, VH, 2 * VN * VD_PAD, self.VIS_NORM_OUT, w, "qk", self.VIS_QK)
-            flops += matmul(VS, VH, VN * VD_PAD, self.VIS_NORM_OUT, w, "v", self.VIS_V)
+            if sched is None:
+                flops += self.rms_norm_core_dram(
+                    M=VS, N=VH, A_DRAM_ADDR=IN, OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT,
+                    GAMMA_DRAM_ADDR=w["norm1_weight"], gpr_M_reg=self._prime_M(VS)) or 0
+                flops += matmul(VS, VH, 2 * VN * VD_PAD, self.VIS_NORM_OUT, w, "qk", self.VIS_QK)
+                flops += matmul(VS, VH, VN * VD_PAD, self.VIS_NORM_OUT, w, "v", self.VIS_V)
+            else:
+                # Row-shard over tokens: norm1 and both projections are
+                # independent per token row.
+                acc = [0]
+
+                def _proj(ctx, w=w, IN=IN, acc=acc):
+                    m = gate_m_regs[ctx.engine_idx]
+                    ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                    acc[0] += ctx.ue.rms_norm_core_dram(
+                        M=ctx.rows, N=VH,
+                        A_DRAM_ADDR=ctx.rows_addr(IN, h_row),
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(self.VIS_NORM_OUT, h_row),
+                        GAMMA_DRAM_ADDR=w["norm1_weight"], gpr_M_reg=m) or 0
+                    acc[0] += sh_matmul(ctx, m, VH, 2 * VN * VD_PAD,
+                                        self.VIS_NORM_OUT, h_row, w, "qk",
+                                        self.VIS_QK, 2 * VN * VD_PAD * bpe)
+                    acc[0] += sh_matmul(ctx, m, VH, VN * VD_PAD,
+                                        self.VIS_NORM_OUT, h_row, w, "v",
+                                        self.VIS_V, VN * VD_PAD * bpe)
+
+                sched.sharded_region(VS, _proj)
+                flops += acc[0]
             _ckpt(f"L{li}:norm+proj")
 
             # Token-major -> head-major. Viewing the fused QK output as
@@ -625,32 +693,90 @@ class Qwen25VLVisionMixin:
 
             # RoPE over all heads at once; the table is tiled VN times so row
             # h*VS+t reads position t's cos/sin.
-            for buf in (self.VIS_Q_HM, self.VIS_K_HM):
-                flops += self.rope_hf_core_dram(
-                    M=VN * VS, N=VD_PAD, input_dram_addr=buf, output_dram_addr=buf,
-                    cos_dram_addr=self.VIS_ROPE_COS, sin_dram_addr=self.VIS_ROPE_SIN,
-                    gpr_M_reg=self._prime_M(VN * VS)) or 0
+            if sched is None:
+                for buf in (self.VIS_Q_HM, self.VIS_K_HM):
+                    flops += self.rope_hf_core_dram(
+                        M=VN * VS, N=VD_PAD, input_dram_addr=buf, output_dram_addr=buf,
+                        cos_dram_addr=self.VIS_ROPE_COS, sin_dram_addr=self.VIS_ROPE_SIN,
+                        gpr_M_reg=self._prime_M(VN * VS)) or 0
+            else:
+                # RoPE is row-independent over its flattened M = VN*VS, but
+                # rope_hf_core_dram is NOT in the shard proxy's allowlist, so it
+                # goes through ctx.unsafe_ue with explicitly sliced addresses --
+                # the same escape hatch gemma4_e2b uses for its RoPE.
+                # TWO STRIDES: the Q/K rows are VD_PAD wide, while the cos/sin
+                # table is interleaved [cos||sin] and so strides 2*VD_PAD per row.
+                rope_acc = [0]
+                rope_row = VD_PAD * bpe
+                table_row = 2 * VD_PAD * bpe
+
+                def _rope(ctx, buf, acc=rope_acc):
+                    m = gate_m_regs[ctx.engine_idx]
+                    ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                    src = ctx.rows_addr(buf, rope_row)
+                    acc[0] += ctx.unsafe_ue.rope_hf_core_dram(
+                        M=ctx.rows, N=VD_PAD,
+                        input_dram_addr=src, output_dram_addr=src,
+                        cos_dram_addr=ctx.rows_addr(self.VIS_ROPE_COS, table_row),
+                        sin_dram_addr=ctx.rows_addr(self.VIS_ROPE_SIN, table_row),
+                        gpr_M_reg=m) or 0
+
+                for buf in (self.VIS_Q_HM, self.VIS_K_HM):
+                    sched.sharded_region(VN * VS,
+                                         lambda ctx, b=buf: _rope(ctx, b))
+                flops += rope_acc[0]
             _ckpt(f"L{li}:rope")
 
             bias = self.VIS_BIAS_FULL if li in FULL else self.VIS_BIAS_WINDOW
-            for h in range(VN):
-                off = h * head_stride
-                batch_reg = self.alloc_isa_reg()
-                self.generate_instruction_add_set(batch_reg, aligned_S)
-                aligned_reg = self.alloc_isa_reg()
-                self.generate_instruction_add_set(aligned_reg, aligned_S)
-                f = self.unified_attention_core(
-                    batch=aligned_S, aligned_seq_len=aligned_S, head_dim=VD_PAD,
-                    Q_DRAM_ADDR=self.VIS_Q_HM + off, K_DRAM_ADDR=self.VIS_K_HM + off,
-                    V_DRAM_ADDR=self.VIS_V_HM + off, BIAS_DRAM_ADDR=bias,
-                    OUTPUT_DRAM_ADDR=self.VIS_OUT_HM + off,
-                    SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH,
-                    IDENTITY_DRAM_ADDR=self._vis_identity_dram,
+
+            def _attn_kernel(ue, head_dim, seq_len, _acc=None, **kwargs):
+                """One head through unified_attention_core.
+
+                Vision is MHA -- one call per head -- so the GQA fan-out
+                argument the scheduler passes for the LM is dropped.
+                """
+                kwargs.pop("num_q_heads", None)
+                batch_reg = ue.alloc_isa_reg()
+                ue.generate_instruction_add_set(batch_reg, seq_len)
+                aligned_reg = ue.alloc_isa_reg()
+                ue.generate_instruction_add_set(aligned_reg, seq_len)
+                f = ue.unified_attention_core(
+                    batch=seq_len, aligned_seq_len=seq_len, head_dim=head_dim,
                     gpr_batch_reg=batch_reg, gpr_aligned_seq_len_reg=aligned_reg,
-                    q_scale=q_scale)
-                self.release_isa_reg()
-                self.release_isa_reg()
-                flops += f if isinstance(f, (int, float)) else 0
+                    q_scale=q_scale, **kwargs)
+                ue.release_isa_reg()
+                ue.release_isa_reg()
+                if _acc is not None and isinstance(f, (int, float)):
+                    _acc[0] += f
+
+            if sched is None:
+                for h in range(VN):
+                    off = h * head_stride
+                    _acc = [0]
+                    _attn_kernel(
+                        self, VD_PAD, aligned_S, _acc=_acc,
+                        Q_DRAM_ADDR=self.VIS_Q_HM + off,
+                        K_DRAM_ADDR=self.VIS_K_HM + off,
+                        V_DRAM_ADDR=self.VIS_V_HM + off,
+                        BIAS_DRAM_ADDR=bias,
+                        OUTPUT_DRAM_ADDR=self.VIS_OUT_HM + off,
+                        SCRATCH_DRAM_ADDR=self.VIS_ATTN_SCRATCH,
+                        IDENTITY_DRAM_ADDR=self._vis_identity_dram)
+                    flops += _acc[0]
+            else:
+                # 16 heads over N engines; each engine writes only its own
+                # heads' planes of OUT_HM and uses its own private scratch.
+                attn_acc = [0]
+                sched.head_sharded_attention(
+                    VN, aligned_S, VD_PAD,
+                    Q_addr=self.VIS_Q_HM, K_addr=self.VIS_K_HM,
+                    V_addr=self.VIS_V_HM, OUT_addr=self.VIS_OUT_HM,
+                    IDENTITY_addr=self._vis_identity_dram,
+                    bias_addr=bias, bias_per_head=False,
+                    scratch_name="vision_attn_scratch",
+                    kernel=lambda ue, head_dim, seq_len, **kw: _attn_kernel(
+                        ue, head_dim, seq_len, _acc=attn_acc, **kw))
+                flops += attn_acc[0]
             _ckpt(f"L{li}:attention")
 
             # Head-major -> token-major at the PADDED width (the permute core
@@ -661,33 +787,85 @@ class Qwen25VLVisionMixin:
                                         group_stride_rows=aligned_S)
             self._vis_trim_pad_lanes(self.VIS_ATTN_PAD, self.VIS_ATTN_RESULT)
             _ckpt(f"L{li}:unpermute+trim")
-            flops += matmul(VS, VH, VH, self.VIS_ATTN_RESULT, w, "o", self.VIS_O_PROJ)
+            if sched is None:
+                flops += matmul(VS, VH, VH, self.VIS_ATTN_RESULT, w, "o", self.VIS_O_PROJ)
+                flops += self.eltwise_core_dram(
+                    M=VS, N=VH, dram_a=IN, dram_b=self.VIS_O_PROJ,
+                    dram_out=self.VIS_RESIDUAL, mode=UE_MODE.ELTWISE_ADD,
+                    gpr_M_reg=self._prime_M(VS)) or 0
+                _ckpt(f"L{li}:o_proj+resid")
 
-            flops += self.eltwise_core_dram(
-                M=VS, N=VH, dram_a=IN, dram_b=self.VIS_O_PROJ,
-                dram_out=self.VIS_RESIDUAL, mode=UE_MODE.ELTWISE_ADD,
-                gpr_M_reg=self._prime_M(VS)) or 0
-            _ckpt(f"L{li}:o_proj+resid")
+                # --- SwiGLU MLP ---
+                flops += self.rms_norm_core_dram(
+                    M=VS, N=VH, A_DRAM_ADDR=self.VIS_RESIDUAL,
+                    OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT,
+                    GAMMA_DRAM_ADDR=w["norm2_weight"], gpr_M_reg=self._prime_M(VS)) or 0
+                flops += matmul(VS, VH, VI_PAD, self.VIS_NORM_OUT, w, "gate",
+                                self.VIS_MLP_GATE, silu=True)
+                flops += matmul(VS, VH, VI_PAD, self.VIS_NORM_OUT, w, "up", self.VIS_MLP_UP)
+                flops += self.eltwise_core_dram(
+                    M=VS, N=VI_PAD, dram_a=self.VIS_MLP_GATE, dram_b=self.VIS_MLP_UP,
+                    dram_out=self.VIS_MLP_MULT, mode=UE_MODE.ELTWISE_MUL,
+                    gpr_M_reg=self._prime_M(VS)) or 0
+                flops += matmul(VS, VI_PAD, VH, self.VIS_MLP_MULT, w, "down",
+                                self.VIS_MLP_DOWN)
+                flops += self.eltwise_core_dram(
+                    M=VS, N=VH, dram_a=self.VIS_RESIDUAL, dram_b=self.VIS_MLP_DOWN,
+                    dram_out=OUT, mode=UE_MODE.ELTWISE_ADD,
+                    gpr_M_reg=self._prime_M(VS)) or 0
+                _ckpt(f"L{li}:mlp")
+            else:
+                # o_proj through the second residual is one region: within an
+                # engine's rows the chain is sequential, so only region entry
+                # and exit need a rendezvous.
+                post_acc = [0]
+                mlp_row = VI_PAD * bpe
 
-            # --- SwiGLU MLP ---
-            flops += self.rms_norm_core_dram(
-                M=VS, N=VH, A_DRAM_ADDR=self.VIS_RESIDUAL,
-                OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT,
-                GAMMA_DRAM_ADDR=w["norm2_weight"], gpr_M_reg=self._prime_M(VS)) or 0
-            flops += matmul(VS, VH, VI_PAD, self.VIS_NORM_OUT, w, "gate",
-                            self.VIS_MLP_GATE, silu=True)
-            flops += matmul(VS, VH, VI_PAD, self.VIS_NORM_OUT, w, "up", self.VIS_MLP_UP)
-            flops += self.eltwise_core_dram(
-                M=VS, N=VI_PAD, dram_a=self.VIS_MLP_GATE, dram_b=self.VIS_MLP_UP,
-                dram_out=self.VIS_MLP_MULT, mode=UE_MODE.ELTWISE_MUL,
-                gpr_M_reg=self._prime_M(VS)) or 0
-            flops += matmul(VS, VI_PAD, VH, self.VIS_MLP_MULT, w, "down",
-                            self.VIS_MLP_DOWN)
-            flops += self.eltwise_core_dram(
-                M=VS, N=VH, dram_a=self.VIS_RESIDUAL, dram_b=self.VIS_MLP_DOWN,
-                dram_out=OUT, mode=UE_MODE.ELTWISE_ADD,
-                gpr_M_reg=self._prime_M(VS)) or 0
-            _ckpt(f"L{li}:mlp")
+                def _post(ctx, w=w, IN=IN, OUT=OUT, acc=post_acc):
+                    m = gate_m_regs[ctx.engine_idx]
+                    acc[0] += sh_matmul(ctx, m, VH, VH, self.VIS_ATTN_RESULT,
+                                        h_row, w, "o", self.VIS_O_PROJ, h_row)
+                    ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                    acc[0] += ctx.ue.eltwise_core_dram(
+                        M=ctx.rows, N=VH,
+                        dram_a=ctx.rows_addr(IN, h_row),
+                        dram_b=ctx.rows_addr(self.VIS_O_PROJ, h_row),
+                        dram_out=ctx.rows_addr(self.VIS_RESIDUAL, h_row),
+                        mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
+                    ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                    acc[0] += ctx.ue.rms_norm_core_dram(
+                        M=ctx.rows, N=VH,
+                        A_DRAM_ADDR=ctx.rows_addr(self.VIS_RESIDUAL, h_row),
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(self.VIS_NORM_OUT, h_row),
+                        GAMMA_DRAM_ADDR=w["norm2_weight"], gpr_M_reg=m) or 0
+                    acc[0] += sh_matmul(ctx, m, VH, VI_PAD, self.VIS_NORM_OUT,
+                                        h_row, w, "gate", self.VIS_MLP_GATE,
+                                        mlp_row, silu=True)
+                    acc[0] += sh_matmul(ctx, m, VH, VI_PAD, self.VIS_NORM_OUT,
+                                        h_row, w, "up", self.VIS_MLP_UP, mlp_row)
+                    ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                    acc[0] += ctx.ue.eltwise_core_dram(
+                        M=ctx.rows, N=VI_PAD,
+                        dram_a=ctx.rows_addr(self.VIS_MLP_GATE, mlp_row),
+                        dram_b=ctx.rows_addr(self.VIS_MLP_UP, mlp_row),
+                        dram_out=ctx.rows_addr(self.VIS_MLP_MULT, mlp_row),
+                        mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=m) or 0
+                    acc[0] += sh_matmul(ctx, m, VI_PAD, VH, self.VIS_MLP_MULT,
+                                        mlp_row, w, "down", self.VIS_MLP_DOWN, h_row)
+                    ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                    acc[0] += ctx.ue.eltwise_core_dram(
+                        M=ctx.rows, N=VH,
+                        dram_a=ctx.rows_addr(self.VIS_RESIDUAL, h_row),
+                        dram_b=ctx.rows_addr(self.VIS_MLP_DOWN, h_row),
+                        dram_out=ctx.rows_addr(OUT, h_row),
+                        mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
+
+                sched.sharded_region(VS, _post)
+                flops += post_acc[0]
+                # o_proj through the MLP is ONE region here, so it is one phase.
+                # Without this the sharded path emits no checkpoint at all and
+                # the work silently folds into the next phase's sample.
+                _ckpt(f"L{li}:o_proj+mlp")
 
         # --- merger ---
         final = self.VIS_IO_A if VL % 2 == 0 else self.VIS_IO_B
@@ -713,6 +891,10 @@ class Qwen25VLVisionMixin:
         _ckpt("merger")
 
         self.generate_instruction_halt()
+        worker_addrs = sched.finalize() if sched is not None else []
+        if sched is not None:
+            for wk in reversed(sched.workers):
+                wk.release_isa_reg()
         self._set_silent(prev_silent)
         self.stop_capture()
 
@@ -720,6 +902,18 @@ class Qwen25VLVisionMixin:
         for inst in self.capture_buffer:
             enc.extend(inst.get_bytes())
         self.clear_capture_buffer()
+
+        # Worker images live in each engine's private ISA slice. An overrun
+        # would not fault -- it would scribble over that engine's own scratch or
+        # the next engine's window -- so the arena checks it where it is written.
+        self._vis_worker_programs = []
+        if sched is not None:
+            for idx, (wk, addr) in enumerate(zip(sched.workers, worker_addrs), start=1):
+                blob = bytearray()
+                for inst in wk.capture_buffer:
+                    blob.extend(inst.get_bytes())
+                self.mc_arena.check_isa_fits(idx, addr, len(blob))
+                self._vis_worker_programs.append((idx, wk, addr, bytes(blob)))
         if base_addr + len(enc) > self.DRAM_END:
             raise MemoryError(
                 f"vision ISA overflow: 0x{base_addr + len(enc):X} > "
@@ -728,8 +922,13 @@ class Qwen25VLVisionMixin:
         self._vis_program_bytes = bytes(enc)
         self._vis_program_addr = base_addr
         self._vis_total_flops = int(flops)
+        wk_note = ""
+        if self._vis_worker_programs:
+            wk_mib = sum(len(b) for *_, b in self._vis_worker_programs) / 2**20
+            wk_note = (f", {len(self._vis_worker_programs)} worker image(s) "
+                       f"{wk_mib:.2f} MiB")
         self._loud(f"  [Vision] encoder compiled: {len(enc) / 2**20:.2f} MiB at "
-                   f"0x{base_addr:X}, {flops / 1e9:.1f} GFLOP, "
+                   f"0x{base_addr:X}{wk_note}, {flops / 1e9:.1f} GFLOP, "
                    f"{time.perf_counter() - t0:.1f}s")
         return base_addr
 
@@ -751,11 +950,13 @@ class Qwen25VLVisionMixin:
             return 0.0
         return (1000.0 / clock_ns) * 0.128 * getattr(self, "multi_core", 1)
 
-    # Phases the multi-engine scheduler cannot row-shard: they are strided-DMA
-    # permutes, the pad-lane trim and the RoPE core, none of which are in
-    # multi_engine_shard.SHARDED_OP_ALLOWLIST. Their combined share bounds what
-    # sharding can win, so the table marks them.
-    _VIS_UNSHARDABLE = ("permute_qkv", "rope", "unpermute+trim")
+    # Phases that stay on core 0 whatever --multi-core says: the strided-DMA
+    # permutes, the pad-lane trim, and the merger tail. RoPE is NOT here -- it is
+    # outside multi_engine_shard.SHARDED_OP_ALLOWLIST but still row-independent,
+    # so it is sharded through ctx.unsafe_ue like gemma4_e2b does.
+    # These bound what sharding can win, and their utilisation must be measured
+    # against ONE core's peak, not the aggregate.
+    _VIS_SERIAL_PHASES = ("permute_qkv", "unpermute+trim", "merger")
 
     def _aggregate_vis_profile(self, results):
         """Fold per-layer samples into one row per phase, preserving order."""
@@ -770,11 +971,30 @@ class Qwen25VLVisionMixin:
             row["ms"] += float(ms)
             row["n"] += 1
             row["flops"] += int(ph_flops)
+        cores = getattr(self, "multi_core", 1)
         rows = []
         for phase in order:
             row = agg[phase]
             row["gflops"] = (row["flops"] / (row["ms"] * 1e6)) if row["ms"] else 0.0
-            row["util_pct"] = (100.0 * row["gflops"] / peak) if peak else 0.0
+            # A phase that runs on core 0 alone can only ever reach one core's
+            # peak; charging it the aggregate would understate it N-fold.
+            row["serial"] = phase in self._VIS_SERIAL_PHASES
+            phase_peak = peak / cores if row["serial"] else peak
+            row["util_pct"] = (100.0 * row["gflops"] / phase_peak) if phase_peak else 0.0
+            # A phase cannot exceed the peak of the engines actually running it,
+            # so >100% means the DENOMINATOR is wrong, not that the hardware
+            # overachieved -- almost always _VIS_SERIAL_PHASES disagreeing with
+            # what compile_vision_encoder really shards (charging a sharded
+            # phase one core's peak inflates it by up to the core count).
+            if row["util_pct"] > 100.5:
+                row["suspect"] = True
+                self._loud(
+                    f"  [warn] {phase}: {row['util_pct']:.1f}% of peak is "
+                    f"impossible. Check _VIS_SERIAL_PHASES against what "
+                    f"compile_vision_encoder actually shards"
+                    f"{' (marked serial, but is it?)' if row['serial'] else ''}.")
+            else:
+                row["suspect"] = False
             rows.append(row)
         return rows
 
@@ -782,7 +1002,7 @@ class Qwen25VLVisionMixin:
         """The profile table as markdown rows, shared by the terminal and the .md."""
         out = []
         for r in rows:
-            mark = " *" if r["phase"] in self._VIS_UNSHARDABLE else ""
+            mark = " *" if r["serial"] else ""
             share = 100.0 * r["ms"] / total_ms if total_ms else 0.0
             out.append((r["phase"] + mark, r["n"], r["ms"], share,
                         r["flops"] / 1e9, r["gflops"], r["util_pct"]))
@@ -810,12 +1030,20 @@ class Qwen25VLVisionMixin:
         tot_gfs = tot_gf / (total_ms / 1e3) if total_ms else 0.0
         print(f"  {'TOTAL':<18}{len(results):>6}{total_ms:>10.1f}{100.0:>7.1f}%"
               f"{tot_gf:>9.1f}{tot_gfs:>9.1f}{(100 * tot_gfs / peak if peak else 0):>8.1f}%")
-        blocked = sum(r["ms"] for r in rows if r["phase"] in self._VIS_UNSHARDABLE)
+        blocked = sum(r["ms"] for r in rows if r["serial"])
         frac = blocked / total_ms if total_ms else 0.0
-        print(f"\n  * not in the scheduler's shard allowlist "
-              f"(strided-DMA permutes / trim / RoPE): {100 * frac:.1f}% of HW time.")
-        print(f"    Amdahl ceiling if only the rest is sharded: "
-              f"{1.0 / (frac + (1 - frac) / 8):.2f}x at 8 cores.")
+        cores = getattr(self, "multi_core", 1)
+        print(f"\n  * runs on core 0 only (strided-DMA permutes, pad-lane trim, "
+              f"merger): {100 * frac:.1f}% of HW time; % peak is vs ONE core.")
+        if cores == 1:
+            # The Amdahl form takes SINGLE-core phase times. Applying it to an
+            # already-sharded run would treat times that never shrink as though
+            # they still could, and understate the ceiling.
+            print(f"    Amdahl ceiling with the rest sharded: "
+                  f"{1.0 / (frac + (1 - frac) / 8):.2f}x at 8 cores.")
+        else:
+            print(f"    These do not shrink with more cores; at {cores} cores they "
+                  f"are already {100 * frac:.1f}% of the total.")
 
     def write_vision_profile_summary(self, out_path: str, args=None) -> str:
         """Write the profile run as markdown: HW info, then the phase table.
@@ -885,14 +1113,20 @@ class Qwen25VLVisionMixin:
                  f"{tot_gf:.1f} | {tot_gfs:.1f} | "
                  f"{(100 * tot_gfs / peak if peak else 0):.1f}% |")
 
-        blocked = sum(r["ms"] for r in rows if r["phase"] in self._VIS_UNSHARDABLE)
+        blocked = sum(r["ms"] for r in rows if r["serial"])
         frac = blocked / total_ms if total_ms else 0.0
         L += [
             "",
-            f"`*` marks phases outside `multi_engine_shard.SHARDED_OP_ALLOWLIST` "
-            f"(strided-DMA permutes, the pad-lane trim, the RoPE core). They are "
-            f"**{100 * frac:.1f}%** of HW time, so sharding everything else gives an "
-            f"Amdahl ceiling of **{1.0 / (frac + (1 - frac) / 8):.2f}x** at 8 cores.",
+            f"`*` marks phases that run on core 0 only (strided-DMA permutes, the "
+            f"pad-lane trim, the merger tail); their % of peak is measured against "
+            f"ONE core. RoPE is sharded despite being outside "
+            f"`multi_engine_shard.SHARDED_OP_ALLOWLIST` -- it is row-independent, so "
+            f"it goes through `ctx.unsafe_ue`. The serial phases are "
+            f"**{100 * frac:.1f}%** of this run's HW time"
+            + (f", an Amdahl ceiling of "
+               f"**{1.0 / (frac + (1 - frac) / 8):.2f}x** at 8 cores."
+               if cores == 1 else
+               f"; they do not shrink as cores are added."),
             "",
         ]
         with open(out_path, "w") as f:
@@ -918,6 +1152,18 @@ class Qwen25VLVisionMixin:
                        len(self._vis_program_bytes))
         self.allocate_program_dram(len(self._vis_program_bytes))
 
+        sched = self._ensure_stage_scheduler("vision")
+        worker_addrs = []
+        for idx, wk, wk_addr, blob in getattr(self, "_vis_worker_programs", []):
+            wk._next_program_dram_addr = wk_addr
+            wk.dma_write(DMA_DEVICE_H2C, wk_addr, blob, len(blob))
+            wk.allocate_program_dram(len(blob))
+            worker_addrs.append(wk_addr)
+        if sched is not None:
+            # A flag left set by an earlier program would make the first CHECK
+            # pass spuriously, so clear every engine's flag before the run.
+            sched.preclear_flags()
+
         self._loud(f"  [Vision] launching encoder "
                    f"({len(self._vis_program_bytes) / 2**20:.2f} MiB) at 0x{addr:X}"
                    f"{' [profiled]' if profile else ''} ...")
@@ -932,17 +1178,31 @@ class Qwen25VLVisionMixin:
             # segment at a time. It still computes the full output -- the
             # segments tile the whole program.
             results = []
+            # Workers are launched ONCE and run their whole program; they simply
+            # block longer at each rendezvous while the master is stopped at a
+            # checkpoint. This works only because every checkpoint sits OUTSIDE
+            # a sharded region -- a HALT inside one would strand the workers.
+            if sched is not None:
+                sched.start_workers(worker_addrs)
             self.start_execute_from_dram(addr)
             for name, resume, ph_flops in checkpoints:
                 self.wait_queue(timeout_s)
                 results.append((name, self.report_latency_in_us() / 1e3, ph_flops))
                 self.start_execute_from_dram(resume)
             self.wait_queue(timeout_s)
+            for wk in (sched.workers if sched is not None else []):
+                wk.wait_queue(timeout_s)
             latency_us = sum(r[1] for r in results) * 1e3
             self._vis_profile = results
         else:
+            # Workers first: they park on their first rendezvous and wait for
+            # the master to enter the region.
+            if sched is not None:
+                sched.start_workers(worker_addrs)
             self.start_execute_from_dram(addr)
             self.wait_queue(timeout_s)
+            for wk in (sched.workers if sched is not None else []):
+                wk.wait_queue(timeout_s)
             latency_us = self.report_latency_in_us()
         wall = time.perf_counter() - t0
         gflops = (self._vis_total_flops / (latency_us * 1e-6) / 1e9
