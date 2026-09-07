@@ -36,6 +36,21 @@ from user_dma_core import (
     ue_35bit_addr_shifter)
 
 LM_QUANT_PRECISION = "if4"
+def _weight_gen():
+    """The sibling weight-bin generator, loaded by path ("2.5" is not an
+    identifier). Imported lazily: it pulls in transformers and huggingface_hub,
+    which a run with the bin already present has no reason to load."""
+    name = "qwen2_5_vl_3b_weights"
+    if name in sys.modules:
+        return sys.modules[name]
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qwen2.5_vl_3b_weights.py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 class Qwen25VLLMMixin:
@@ -52,7 +67,9 @@ class Qwen25VLLMMixin:
                     VOCAB=fi["embedding_vocab"])
 
     def _read_lm_region(self) -> dict:
-        bin_path = os.path.join(self.script_dir, self._cfg["paths"]["params"])
+        # Generates params.bin + params.json from the HF checkpoint on a machine
+        # that has neither. A no-op once they exist.
+        bin_path = _weight_gen().ensure_params_bin(self.script_dir)
         json_path = bin_path.rsplit(".", 1)[0] + ".json"
         with open(json_path) as f:
             manifest = json.load(f)
