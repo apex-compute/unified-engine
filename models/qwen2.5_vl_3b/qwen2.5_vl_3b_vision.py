@@ -35,6 +35,21 @@ from user_dma_core import (
 # Vision matmuls are IF4-quantized; norms and biases stay BF16. Module-level so
 # a numeric harness can import it without constructing an engine.
 VISION_QUANT_PRECISION = "if4"
+def _weight_gen():
+    """The sibling weight-bin generator, loaded by path ("2.5" is not an
+    identifier). Imported lazily: it pulls in transformers and huggingface_hub,
+    which a run with the bin already present has no reason to load."""
+    name = "qwen2_5_vl_3b_weights"
+    if name in sys.modules:
+        return sys.modules[name]
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qwen2.5_vl_3b_weights.py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 # IF4 on-disk block layout: 64 elements per block, stored as a 2-byte BF16 scale
 # followed by 32 bytes of packed nibbles. The two halves are split into separate
@@ -83,12 +98,10 @@ class Qwen25VLVisionMixin:
         tensor offsets. Only the vision region is read here -- the LM region is
         2.4 GB and this phase never touches it.
         """
-        bin_path = os.path.join(self.script_dir, self._cfg["paths"]["params"])
+        # Generates params.bin + params.json from the HF checkpoint on a machine
+        # that has neither. A no-op once they exist.
+        bin_path = _weight_gen().ensure_params_bin(self.script_dir)
         json_path = bin_path.rsplit(".", 1)[0] + ".json"
-        if not (os.path.exists(bin_path) and os.path.exists(json_path)):
-            raise FileNotFoundError(
-                f"weight bin not found: {bin_path}. Generate it with the sibling "
-                f"models/qwen2.5_vl_3b build, or point paths.params elsewhere.")
         with open(json_path) as f:
             manifest = json.load(f)
         regions = manifest.get("regions") or {}
