@@ -853,6 +853,36 @@ class TransposeOp:
 
 
 @dataclass
+class ColumnMatmatOp:
+    """An N-SHARDED plain (non-quantized) ``matmat_mul_core`` inside a worker round.
+
+    B is stored ``[N, K]``, so output columns ``[n0, n0+Nc)`` are a CONTIGUOUS ROW BLOCK
+    of B -- the same layout fact the quantized column shards rely on. What is different
+    here is the OUTPUT: with ``M > 1`` a column block of ``[M, N]`` is STRIDED (Nc every
+    N), so each engine writes in place through ``gpr_out_row_stride_reg`` rather than into
+    a private dense buffer. That keeps the result correctly interleaved with no gather.
+
+    ``max_engines`` caps participation. ``N`` splits in whole 64-column blocks, so an N of
+    256 is four blocks and never more than four engines; the rest emit nothing for this op
+    and still run the round's handshake.
+
+    ``K`` is RUNTIME (it is the KV length), which is why B's per-engine offset -- ``n0 * K
+    * bpe`` -- cannot be baked and is primed per token by :meth:`start_workers`. The
+    output offset ``n0 * bpe`` does not depend on K and is a literal.
+    """
+
+    a_addr: int
+    b_addr: int
+    out_addr: int
+    M: int
+    N: int                 # the FULL N; this is also the output row stride
+    K_max: int             # compile-time template K (the largest runtime K)
+    max_engines: int
+    col_block: int = 64
+    bytes_per_element: int = 2
+
+
+@dataclass
 class ShardedAttention:
     """A unified_attention_core distributed over its batch (query-row) dimension."""
 
@@ -1504,6 +1534,8 @@ class MultiEngineScheduler:
         self._persistent_body_word: dict[int, int] = {}   # engine -> body word address
         self._persistent_aligned_reg: dict[int, Optional[int]] = {}
         self._persistent_transpose_regs: dict[int, Optional[dict]] = {}
+        self._persistent_colmatmat_regs: dict[int, dict] = {}
+        self._colmatmat_ops: dict[int, "ColumnMatmatOp"] = {}
 
     # ------------------------------------------------- engine-construction --
     def _save_dram_selftest_region(self):
@@ -2128,10 +2160,12 @@ class MultiEngineScheduler:
             # the entry point may be a per-token preamble rather than the body itself.
             tr_sets = (self.transpose_worker_gpr_sets(aligned_seq_len)
                        if aligned_seq_len is not None else {})
+            cm_sets = (self.column_matmat_worker_gpr_sets(aligned_seq_len)
+                       if aligned_seq_len is not None else {})
             for idx in self.worker_indices():
                 ue = self.engines[idx]
                 reg = self._persistent_aligned_reg.get(idx)
-                sets = list(tr_sets.get(idx, []))
+                sets = list(tr_sets.get(idx, [])) + list(cm_sets.get(idx, []))
                 if aligned_seq_len is not None and reg is not None:
                     sets.append((reg, aligned_seq_len))
                 if not sets:
@@ -2835,6 +2869,56 @@ class MultiEngineScheduler:
             ue.get_program_dram_addr()
             + ue.capture_count * user_dma_core.INSTRUCTION_SIZE_BYTES))
 
+    def column_matmat_shard(self, op: ColumnMatmatOp, engine_idx: int) -> tuple[int, int]:
+        """``(n_offset, columns)`` for one engine's slice of a ColumnMatmatOp.
+
+        Splits N in whole ``col_block`` columns across the first ``max_engines`` engines,
+        remainder to the leading ones. An engine past that -- or past the block count --
+        gets ``(0, 0)`` and emits nothing.
+        """
+        blocks, rem_cols = divmod(op.N, op.col_block)
+        if rem_cols:
+            raise ValueError(f"ColumnMatmatOp: N={op.N} is not a multiple of "
+                             f"col_block={op.col_block}")
+        n = min(self.num_engines, op.max_engines, blocks)
+        if engine_idx >= n:
+            return 0, 0
+        base, rem = divmod(blocks, n)
+        counts = [op.col_block * (base + (1 if i < rem else 0)) for i in range(n)]
+        return sum(counts[:engine_idx]), counts[engine_idx]
+
+    def emit_column_matmat(self, ue, op: ColumnMatmatOp, entry, gpr_K: int) -> int:
+        """Emit ONE engine's column slice of a ColumnMatmatOp."""
+        n_off, cols, r = entry
+        bpe = op.bytes_per_element
+        return ue.matmat_mul_core(
+            M=op.M, K=op.K_max, N=cols,
+            A_DRAM_ADDR=op.a_addr, B_DRAM_ADDR=op.b_addr,
+            OUTPUT_DRAM_ADDR=op.out_addr + n_off * bpe,
+            gpr_M_reg=r["M"], gpr_K_reg=gpr_K, gpr_N_reg=r["N"],
+            gpr_b_addr=r["b"],
+            gpr_out_row_stride_reg=r["stride"]) or 0
+
+    def column_matmat_worker_gpr_sets(self, K: int) -> dict:
+        """Per-token ``{engine: [(reg, value), ...]}``: each worker's B row block.
+
+        B is ``[N, K]``, so this engine's columns start at ``b_addr + n0*K*bpe`` -- linear
+        in the RUNTIME K, hence primed here rather than baked.
+        """
+        out = {}
+        for idx, ops in self._persistent_colmatmat_regs.items():
+            for op_id, (n_off, cols, r) in ops.items():
+                op = self._colmatmat_ops[op_id]
+                out.setdefault(idx, []).append(
+                    (r["b"], user_dma_core.ue_35bit_addr_shifter(
+                        op.b_addr + n_off * K * op.bytes_per_element)))
+        return out
+
+    def column_matmat_worker_flops(self, op: ColumnMatmatOp, K: int) -> int:
+        """FLOPs the WORKERS contribute to one ColumnMatmatOp at runtime K."""
+        return sum(2 * op.M * K * self.column_matmat_shard(op, i)[1]
+                   for i in self.worker_indices())
+
     def transpose_worker_gpr_sets(self, rows: int) -> dict:
         """Per-token ``{engine: [(reg, value), ...]}`` for the M-sharded transpose.
 
@@ -2907,6 +2991,8 @@ class MultiEngineScheduler:
         """
         self._require_private_map("emit_worker_program")
         self._latch_rendezvous("master_worker")
+        self._colmatmat_ops = {id(op): op for rnd in list(rounds) + list(tail_rounds)
+                               for op in rnd if isinstance(op, ColumnMatmatOp)}
         for idx in self.worker_indices():
             ue = self.engines[idx]
             ue.clear_inst_id()
@@ -2939,10 +3025,15 @@ class MultiEngineScheduler:
                      if isinstance(op, AttentionOp)]
             _tr = [op for rnd in list(rounds) + list(tail_rounds) for op in rnd
                    if isinstance(op, TransposeOp)]
+            _cm = [op for rnd in list(rounds) + list(tail_rounds) for op in rnd
+                   if isinstance(op, ColumnMatmatOp)]
             gpr_aligned = gpr_batch = gpr_scale = None
             gpr_k = gpr_v = gpr_q = gpr_bias = gpr_out = gpr_tmp = gpr_kv = None
-            if _attn:
+            if _attn or _cm:
+                # The runtime KV length: attention's aligned_seq_len and a column-sharded
+                # matmat's K are the same value, primed the same way.
                 gpr_aligned = ue.alloc_isa_reg()
+            if _attn:
                 gpr_batch = ue.alloc_isa_reg()
                 gpr_scale = ue.alloc_isa_reg()
                 gpr_kv = ue.alloc_isa_reg()
@@ -2967,6 +3058,19 @@ class MultiEngineScheduler:
                     "stride": ue.alloc_isa_reg(),    # full row count * bpe, in BYTES
                 }
             self._persistent_transpose_regs[idx] = gpr_tr
+            # Column-sharded matmats: constants baked here, B's base primed per token.
+            gpr_cm = {}
+            for op in _cm:
+                n_off, cols = self.column_matmat_shard(op, idx)
+                if not cols:
+                    continue
+                r = {"M": ue.alloc_isa_reg(), "N": ue.alloc_isa_reg(),
+                     "stride": ue.alloc_isa_reg(), "b": ue.alloc_isa_reg()}
+                ue.generate_instruction_add_set(r["M"], op.M)
+                ue.generate_instruction_add_set(r["N"], cols)
+                ue.generate_instruction_add_set(r["stride"], op.N)   # ELEMENTS, the full N
+                gpr_cm[id(op)] = (n_off, cols, r)
+            self._persistent_colmatmat_regs[idx] = gpr_cm
             self._persistent_aligned_reg[idx] = gpr_aligned
 
             # One private weight/scale cursor pair per op, across every round: each arena
@@ -2974,7 +3078,7 @@ class MultiEngineScheduler:
             cursors = {}
             for rnd in rounds:
                 for op in rnd:
-                    if isinstance(op, (AttentionOp, TransposeOp)):
+                    if isinstance(op, (AttentionOp, TransposeOp, ColumnMatmatOp)):
                         continue
                     sw = op[0]
                     if idx >= len(sw.shards):
@@ -3013,6 +3117,11 @@ class MultiEngineScheduler:
                         continue
                     if isinstance(op, TransposeOp):
                         self.emit_transpose(ue, op, gpr_tr, gpr_kv)
+                        continue
+                    if isinstance(op, ColumnMatmatOp):
+                        ent = gpr_cm.get(id(op))
+                        if ent is not None:      # None: this engine is past max_engines
+                            self.emit_column_matmat(ue, op, ent, gpr_aligned)
                         continue
                     sw, a_addr, out_addr, gelu = op
                     shard, gpr_w, gpr_s = cursors[id(sw)]
@@ -3076,7 +3185,7 @@ class MultiEngineScheduler:
             # value is passed. Reserved even when it is not, so ISA accounting is uniform.
             self._persistent_preamble[idx] = ue.get_program_dram_addr()
             # One add_set per runtime register plus the jump into the body.
-            _pre = 2 + (4 if gpr_tr else 0)
+            _pre = 2 + (4 if gpr_tr else 0) + len(gpr_cm)
             ue.allocate_program_dram(max(4, _pre) * user_dma_core.INSTRUCTION_SIZE_BYTES)
 
     def reset_workers(self) -> None:
