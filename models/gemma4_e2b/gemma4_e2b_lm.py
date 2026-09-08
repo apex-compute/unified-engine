@@ -1596,6 +1596,7 @@ class Gemma4LMMixin:
                 (reg["out_off"], ue_35bit_addr_shifter(m_off * bpe)),
                 (reg["rows"], m_cnt),
                 (reg["stride"], aligned_seq_len * bpe),
+                (reg["aligned"], aligned_seq_len),
             ])
         return sets
 
@@ -1723,6 +1724,12 @@ class Gemma4LMMixin:
                     "out_off": _w.alloc_isa_reg(),   # m_off * 2 bytes, in words
                     "rows": _w.alloc_isa_reg(),      # m_cnt (this worker's slice)
                     "stride": _w.alloc_isa_reg(),    # aligned_seq_len * 2 BYTES
+                    # P@V^T's runtime K, and the multiplier for its B row-block offset:
+                    # V^T rows are aligned_seq_len apart, NOT MAX_CONTEXT_SIZE apart, so a
+                    # column shard's B base must be derived from the LIVE length. Baking it
+                    # off the compile-time context size is what makes engines 1..N-1 read
+                    # uninitialised scratch.
+                    "aligned": _w.alloc_isa_reg(),   # aligned_seq_len, in ELEMENTS
                 })
         self._decode_attn_worker_regs = _attn_regs
 
@@ -2089,18 +2096,77 @@ class Gemma4LMMixin:
                         _dec_sched.end_worker_round(_wi)
                     _dec_sched.join()
 
-                    # Scores and V^T are both complete; engine 0 finishes the chain.
-                    # NOT sharded: an M-shard divides the MACs but every engine still
-                    # streams all of V^T, and a column shard (which would divide the
-                    # traffic too) did not hold up in the model. Both measured worse
-                    # end-to-end than leaving this whole. The transpose above is the
-                    # shard that pays.
+                    # Scores and V^T are both complete; P@V^T closes the chain, split
+                    # over its N (= cur_head_dim). B is V^T stored [cur_head_dim, aligned],
+                    # so an output column block is a contiguous ROW BLOCK of it. The OUTPUT
+                    # block is strided though -- M = group_size > 1 -- so each engine writes
+                    # IN PLACE at row stride cur_head_dim rather than into a private dense
+                    # buffer, which keeps the result interleaved with no gather.
+                    #
+                    # ITS OWN ROUND: it reads both the scores and the FINISHED V^T, so it
+                    # cannot ride in the transpose's round.
+                    #
+                    # cur_head_dim is 512 on full-attention layers and 256 on sliding ones,
+                    # so the block count -- and with it how many engines take part -- is
+                    # PER LAYER: 8 and 4 at multi_core=8. Engines past that emit nothing and
+                    # just run the handshake.
+                    _pv_op = mes.ColumnMatmatOp(
+                        a_addr=_score_addr, b_addr=_v_t_addr,
+                        out_addr=self.LAYER0_FLASH_OUTPUT_DRAM,
+                        M=self.group_size, N=cur_head_dim,
+                        K_max=self.MAX_CONTEXT_SIZE,
+                        max_engines=_dec_sched.num_engines,
+                        bytes_per_element=self.bytes_per_element)
+                    _pv_off0, _pv_cols0 = _dec_sched.column_matmat_shard(_pv_op, 0)
+                    assert _pv_off0 == 0, "engine 0 must own the first P@V^T column block"
+                    _dec_sched.release()
+                    _pv_n_reg = self.alloc_isa_reg()
+                    self.generate_instruction_add_set(_pv_n_reg, _pv_cols0)
                     self.matmat_mul_core(
-                        M=self.group_size, K=self.MAX_CONTEXT_SIZE, N=cur_head_dim,
+                        M=self.group_size, K=self.MAX_CONTEXT_SIZE, N=_pv_cols0,
                         A_DRAM_ADDR=_score_addr, B_DRAM_ADDR=_v_t_addr,
                         OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                         gpr_M_reg=gpr_group_size,
-                        gpr_K_reg=self.gpr_aligned_seq_len, gpr_N_reg=_hd_reg)
+                        gpr_K_reg=self.gpr_aligned_seq_len, gpr_N_reg=_pv_n_reg,
+                        gpr_out_row_stride_reg=_hd_reg)
+                    self.release_isa_reg()   # _pv_n_reg
+                    for _wi in _dec_sched.worker_indices():
+                        _dec_sched.begin_worker_round(_wi)
+                        _n_off, _cols = _dec_sched.column_matmat_shard(_pv_op, _wi)
+                        if _cols:
+                            _w = _dec_sched.engines[_wi]
+                            _rg = _attn_regs[_wi - 1]
+                            _pm = _w.alloc_isa_reg()
+                            _pn = _w.alloc_isa_reg()
+                            _ps = _w.alloc_isa_reg()
+                            _pb = _w.alloc_isa_reg()
+                            _w.generate_instruction_add_set(_pm, self.group_size)
+                            _w.generate_instruction_add_set(_pn, _cols)
+                            _w.generate_instruction_add_set(_ps, cur_head_dim)
+                            # B row block = v_t + n_off * aligned * bpe. The multiply is
+                            # folded into the immediate as a WORD count, the same trick the
+                            # batch-split bias offset uses: n_off*bpe is a multiple of 8
+                            # because n_off is a multiple of 64.
+                            _w.generate_instruction_reg_mul_imm(
+                                _pb, _rg["aligned"],
+                                ue_35bit_addr_shifter(_n_off * self.bytes_per_element))
+                            _w.generate_instruction_add_imm(
+                                src_reg_idx=_pb,
+                                immediate_value=ue_35bit_addr_shifter(_v_t_addr),
+                                dst_reg_idx=_pb)
+                            _w.matmat_mul_core(
+                                M=self.group_size, K=self.MAX_CONTEXT_SIZE, N=_cols,
+                                A_DRAM_ADDR=_score_addr, B_DRAM_ADDR=_v_t_addr,
+                                OUTPUT_DRAM_ADDR=(self.LAYER0_FLASH_OUTPUT_DRAM
+                                                  + _n_off * self.bytes_per_element),
+                                gpr_M_reg=_pm, gpr_K_reg=_rg["aligned"], gpr_N_reg=_pn,
+                                gpr_b_addr=_pb, gpr_out_row_stride_reg=_ps)
+                            _w.release_isa_reg()   # _pb
+                            _w.release_isa_reg()   # _ps
+                            _w.release_isa_reg()   # _pn
+                            _w.release_isa_reg()   # _pm
+                        _dec_sched.end_worker_round(_wi)
+                    _dec_sched.join()
                     self.release_isa_reg()   # _hd_reg
                 live_attention_flops = self._dynamic_attention_flops(
                     self.group_size, seq_len, cur_head_dim,
@@ -2110,10 +2176,10 @@ class Gemma4LMMixin:
                 _checkpoint(f"L{layer_idx}_attention")
 
                 # O projection: INT4, K=cur_q_size (actual per-layer attention output dim).
-                # ITS OWN ROUND, not the Q/K/V one: it reads FLASH_OUTPUT, which
-                # attention produces on the master alone, so the whole input only
-                # exists after that. N=1536 is 24 blocks of 64 -- 192 columns per
-                # engine at 8, an even split.
+                # ITS OWN ROUND, not the Q/K/V one: its K spans the whole of
+                # FLASH_OUTPUT, whose column blocks P@V^T spread across the engines, so
+                # the input only exists once that round has joined. N=1536 is 24 blocks
+                # of 64 -- 192 columns per engine at 8, an even split.
                 _o_sw = _shards.get(("o", layer_idx))
                 if _o_sw is None:
                     total_flops += _projection_core(M=1, K=cur_q_size, N=self.vector_length,
