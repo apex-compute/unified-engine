@@ -22,6 +22,7 @@ implementations disagree completely, which reads as a hardware fault.
 """
 
 import argparse
+import inspect
 import os
 import sys
 
@@ -144,7 +145,15 @@ def main():
     # ---- 2b. upstream intermediates, for the stage ladder ----------------------------
     # Re-run the prefix half explicitly. sample_actions does exactly this internally; we
     # repeat it so the intermediates are in hand rather than hooking into it.
-    from lerobot.policies.common.vla_utils import make_att_2d_masks
+    # Import site moved between lerobot versions: 0.5+/0.6.x expose it from
+    # policies.common.vla_utils, 0.4.x defines it in the smolvla model module itself.
+    # Same function, same (pad_masks, att_masks) signature -- verified identical body.
+    # This file's header targets 0.6.1; 0.4.4 is what installs on Python 3.11, since
+    # every release from 0.5.0 on requires >=3.12.
+    try:
+        from lerobot.policies.common.vla_utils import make_att_2d_masks   # >= 0.5
+    except ModuleNotFoundError:
+        from lerobot.policies.smolvla.modeling_smolvla import make_att_2d_masks  # 0.4.x
     with torch.no_grad():
         up_img_emb = torch.cat([m.vlm_with_expert.embed_image(im) for im in up_images],
                                dim=1)[0].float()                    # [128, 960] UNSCALED
@@ -152,9 +161,17 @@ def main():
                                               state=state.unsqueeze(0))
         p_att2d = make_att_2d_masks(p_pad, p_att)
         p_pos = torch.cumsum(p_pad, dim=1) - 1
+        # PREFILL, NOT DECODE. lerobot 0.4.x keeps a DICT cache and branches on
+        # fill_kv_cache, whose default is None -- falsy -- so layer 0 takes the READ
+        # path and KeyErrors on the empty dict forward() just created one line earlier.
+        # >= 0.5 dropped the argument in favour of a DynamicCache, so gate on the
+        # signature rather than pinning a version.
+        _fwd_kw = {}
+        if "fill_kv_cache" in inspect.signature(m.vlm_with_expert.forward).parameters:
+            _fwd_kw["fill_kv_cache"] = True
         _, up_pkv = m.vlm_with_expert.forward(
             attention_mask=p_att2d, position_ids=p_pos, past_key_values=None,
-            inputs_embeds=[p_embs, None], use_cache=True)
+            inputs_embeds=[p_embs, None], use_cache=True, **_fwd_kw)
 
     # THE TWO PREFIXES ARE LAID OUT DIFFERENTLY AND MUST BE ALIGNED BY MASK, NOT INDEX.
     # Upstream keeps all 48 language slots (6 real + 42 pad) and puts state at row 176;
@@ -211,7 +228,13 @@ def main():
             up_k = up_pkv.key_cache[li]
         else:
             e = up_pkv[li]
-            up_k = e["key_states"] if isinstance(e, dict) else e[0]
+            if isinstance(e, dict):
+                # lerobot 0.4.x concatenates on dim 1, so its cache is [B, seq, nkv, D]
+                # while every other path here is [B, nkv, seq, D]. Permute, or `keep`
+                # below indexes the HEAD axis with a sequence mask.
+                up_k = e["key_states"].permute(0, 2, 1, 3)
+            else:
+                up_k = e[0]
         up_k = up_k[0].float()[:, keep].reshape(-1, D)   # [nkv, seq, D] -> [nkv*valid, D]
         if li in (0, ue.NUM_LAYERS // 2, ue.NUM_LAYERS - 1):
             row(f"KV L{li} k", hw_k, up_k)
