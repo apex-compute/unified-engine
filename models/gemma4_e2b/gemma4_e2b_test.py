@@ -2309,10 +2309,17 @@ def main():
     # so the weight streams do not contend, and this benchmark measures the same
     # access pattern. Runs before the model is built, so the low-DRAM buffers it
     # allocates are long gone by the time the private arena is used.
-    from user_hw_test import multi_core_dram_speed_test
-    print(f"\n--- Measuring {args.multi_core}-core aggregate DRAM read speed ---")
-    dram_read_speed_mbps = multi_core_dram_speed_test(
-        num_engines=args.multi_core)
+    # Skipped on a single engine: the benchmark is a barrier-synced overlap of
+    # per-engine reads, so with nobody to overlap with the whole program is four
+    # instructions and engine 0's latency counter reads back 0 -- which is a
+    # divide-by-zero in multi_core_dram_speed_test, not a measurement. The .md
+    # writers already treat a missing speed as "omit the line".
+    dram_read_speed_mbps = None
+    if args.multi_core > 1:
+        from user_hw_test import multi_core_dram_speed_test
+        print(f"\n--- Measuring {args.multi_core}-core aggregate DRAM read speed ---")
+        dram_read_speed_mbps = multi_core_dram_speed_test(
+            num_engines=args.multi_core)
 
     ue = Gemma4_UnifiedEngine(**engine_kwargs)
 
