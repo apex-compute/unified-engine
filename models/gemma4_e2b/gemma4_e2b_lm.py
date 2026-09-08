@@ -1539,9 +1539,9 @@ class Gemma4LMMixin:
 
     @staticmethod
     def _dynamic_attention_flops(batch: int, aligned_seq_len: int,
-                                 head_dim: int) -> int:
+                                 head_dim: int, *, q_pre_scaled: bool = False) -> int:
         """Q scale + QK (bias + softmax) + PV at the live runtime shape."""
-        return (batch * head_dim
+        return ((0 if q_pre_scaled else batch * head_dim)
                 + batch * aligned_seq_len * (4 * head_dim + 6))
 
     def _decoder_flops_for_aligned_seq_len(self, aligned_seq_len: int) -> int:
@@ -1552,7 +1552,8 @@ class Gemma4LMMixin:
         attention = sum(
             self._dynamic_attention_flops(
                 self.group_size, aligned_seq_len,
-                self._get_layer_attention_dims(layer_idx)[0])
+                self._get_layer_attention_dims(layer_idx)[0],
+                q_pre_scaled=self.multi_core > 1)
             for layer_idx in range(self.LAYER_SIZE))
         return int(base + attention)
 
@@ -1637,6 +1638,15 @@ class Gemma4LMMixin:
                 f"directly on each engine")
         _shards = (self._ensure_decode_qkv_shards(_dec_sched, layer_size)
                    if _dec_sched is not None else {})
+        # The ordinary (unrolled) worker programs need the live aligned context
+        # length for engine 1's V transpose.  Reserve the same low GPR on every
+        # worker so the host can prime it through start_workers' transient
+        # preamble.  Engines 2..N still rendezvous in the attention round but do
+        # no attention work; they remain available for all projection shards.
+        _worker_attn_len_regs = ([worker.alloc_isa_reg()
+                                  for worker in _dec_sched.workers]
+                                 if _dec_sched is not None else [])
+        self._decode_worker_attn_len_regs = list(_worker_attn_len_regs)
 
         def _emit_shard(ue, sw, e: int, out_base: int, a_addr: int,
                         gelu: bool = False) -> int:
@@ -1908,26 +1918,82 @@ class Gemma4LMMixin:
                 # exactly the row the O projection consumes. batch=group_size
                 # shares one Vᵀ transpose across all heads (a per-head batch=1
                 # loop would recompute that identical transpose group_size times).
-                # Multi-core will shard these group rows across engines
-                # (batch=shard_size per engine); this is the single-core (shard=
-                # group_size) case.
-                self.unified_attention_core(
-                    batch=self.group_size,
-                    aligned_seq_len=self.MAX_CONTEXT_SIZE,
-                    head_dim=cur_head_dim,
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=kv_k_base,
-                    V_DRAM_ADDR=kv_v_base,
-                    BIAS_DRAM_ADDR=bias_addr_layer,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                    gpr_batch_reg=gpr_group_size,
-                    gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
-                    q_scale=1.0,
-                )
+                # With >=2 engines, overlap the two independent first-stage
+                # operations: engine 0 computes Q@K^T + bias + softmax while
+                # engine 1 transposes V.  The join is the exact dependency edge
+                # before P@V^T. Gemma's attention scale is exactly 1.0, so Q is
+                # already score-ready and the old multiply-by-one can be skipped.
+                if _dec_sched is None:
+                    self.unified_attention_core(
+                        batch=self.group_size,
+                        aligned_seq_len=self.MAX_CONTEXT_SIZE,
+                        head_dim=cur_head_dim,
+                        Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                        K_DRAM_ADDR=kv_k_base,
+                        V_DRAM_ADDR=kv_v_base,
+                        BIAS_DRAM_ADDR=bias_addr_layer,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                        SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                        IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                        gpr_batch_reg=gpr_group_size,
+                        gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                        q_scale=1.0,
+                    )
+                else:
+                    _v_t_addr = self.LAYER0_FLASH_SCRATCH_DRAM
+                    _score_addr = (_v_t_addr + cur_head_dim
+                                   * self.MAX_CONTEXT_SIZE
+                                   * self.bytes_per_element)
+                    _head_dim_reg = self.alloc_isa_reg()
+                    self.generate_instruction_add_set(_head_dim_reg, cur_head_dim)
+
+                    _dec_sched.release()
+                    # Engine 0: score path. matmat B is [N,K], so this is
+                    # Q @ K^T despite the historical "KQ^T" shorthand.
+                    self.matmat_mul_core(
+                        M=self.group_size, K=cur_head_dim,
+                        N=self.MAX_CONTEXT_SIZE,
+                        A_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                        B_DRAM_ADDR=kv_k_base,
+                        OUTPUT_DRAM_ADDR=_score_addr,
+                        softmax_enable=True,
+                        C_DRAM_ADDR=bias_addr_layer,
+                        bias_mode="full_matrix",
+                        gpr_M_reg=gpr_group_size,
+                        gpr_K_reg=_head_dim_reg,
+                        gpr_N_reg=self.gpr_aligned_seq_len)
+
+                    # Worker streams: only engine 1 performs V^T; every other
+                    # worker executes the handshake so the 8-engine round stays
+                    # synchronized with the surrounding projection rounds.
+                    for _worker_idx in _dec_sched.worker_indices():
+                        _dec_sched.begin_worker_round(_worker_idx)
+                        if _worker_idx == 1:
+                            _worker = _dec_sched.engines[_worker_idx]
+                            _worker.bf16_transpose_core(
+                                M=self.MAX_CONTEXT_SIZE,
+                                N=cur_head_dim,
+                                INPUT_DRAM_ADDR=kv_v_base,
+                                OUTPUT_DRAM_ADDR=_v_t_addr,
+                                IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                                gpr_M_reg=_worker_attn_len_regs[_worker_idx - 1])
+                        _dec_sched.end_worker_round(_worker_idx)
+                    _dec_sched.join()
+
+                    # Both score probabilities and V^T are now complete.
+                    self.matmat_mul_core(
+                        M=self.group_size, K=self.MAX_CONTEXT_SIZE,
+                        N=cur_head_dim,
+                        A_DRAM_ADDR=_score_addr,
+                        B_DRAM_ADDR=_v_t_addr,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                        gpr_M_reg=gpr_group_size,
+                        gpr_K_reg=self.gpr_aligned_seq_len,
+                        gpr_N_reg=_head_dim_reg)
+                    self.release_isa_reg()  # _head_dim_reg
                 live_attention_flops = self._dynamic_attention_flops(
-                    self.group_size, seq_len, cur_head_dim)
+                    self.group_size, seq_len, cur_head_dim,
+                    q_pre_scaled=_dec_sched is not None)
                 total_flops += live_attention_flops
                 decoder_attention_flops += live_attention_flops
                 _checkpoint(f"L{layer_idx}_attention")
@@ -2192,6 +2258,16 @@ class Gemma4LMMixin:
         self.clear_capture_buffer()
         return self.program_execute(self._preamble_addr, timeout=timeout, flops=flops)
 
+    def _decode_worker_gpr_sets(self, scheduler, aligned_seq_len: int):
+        """Runtime register preamble for the decoder attention workers."""
+        regs = list(getattr(self, "_decode_worker_attn_len_regs", []))
+        if len(regs) != len(scheduler.workers):
+            raise RuntimeError(
+                "decode worker attention-register metadata does not match the "
+                f"engine setup ({len(regs)} registers for "
+                f"{len(scheduler.workers)} workers); recompile the program image")
+        return [[(reg, aligned_seq_len)] for reg in regs]
+
     def run_decoder(self, decoder_program_sizes: list[int], decoder_base_addr: int, token_id: int, flops_per_token: list[int] | None = None) -> dict:
         """Run decode loop with dynamic PBI.
 
@@ -2325,7 +2401,10 @@ class Gemma4LMMixin:
             if _dec_sched is not None:
                 # Workers first: each parks on the master's first release, so they
                 # must already be running before the master reaches it.
-                _dec_sched.start_workers(_dec_worker_addrs)
+                _dec_sched.start_workers(
+                    _dec_worker_addrs,
+                    gpr_sets_by_worker=self._decode_worker_gpr_sets(
+                        _dec_sched, aligned_seq_len))
             # Dynamic-PBI dispatch: re-set the attention length (K context grows
             # each step, may cross a 64-align boundary), then jump into the
             # cached decoder program. gpr_seq_len was primed once above and is

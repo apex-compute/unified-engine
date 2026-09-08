@@ -1286,6 +1286,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "prefill_kernel": self.prefill_kernel,
             "multi_core": self.multi_core,
             "decode_kernel": self.decode_kernel,
+            "decoder_worker_attention_aligned_regs": getattr(
+                self, "_decode_worker_attn_len_regs", []),
         }
         if profile:
             lm_meta["prefill_profile_checkpoints"] = self._prefill_checkpoints
@@ -1315,7 +1317,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                     f"decode_worker{engine_idx}", worker_addr, worker_bytes,
                     {"parent": "lm", "engine_idx": engine_idx,
                      "multi_core": self.multi_core,
-                     "decode_kernel": self.decode_kernel}, profile=profile)
+                     "decode_kernel": self.decode_kernel,
+                     "attention_aligned_reg": (
+                         self._decode_worker_attn_len_regs[engine_idx - 1]
+                         if self._decode_worker_attn_len_regs else None)},
+                    profile=profile)
 
         print(f"[compile] stored LM section ({len(image_bytes)/1024:.1f} KB @ 0x{instruction_base_addr:X}); "
               f"prefill @ 0x{prefill_program_addr:X} ({prefill_size_bytes/1024:.1f} KB), "
@@ -1340,6 +1346,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         if "decoder_non_attention_flops" in meta:
             self._decoder_non_attention_flops = int(
                 meta["decoder_non_attention_flops"])
+        self._decode_worker_attn_len_regs = list(
+            meta.get("decoder_worker_attention_aligned_regs", []))
         self._preamble_addr = self.get_program_dram_addr()
         print(f"[run] loaded LM section at 0x{base_addr:X} ({meta['prefill_program_size']/1024:.1f} + "
               f"{meta['decoder_program_size']/1024:.1f} KB); dispatch preamble @ 0x{self._preamble_addr:X}")
@@ -1663,7 +1671,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
 
     def _profile_execute(self, gpr_sets: list[tuple[int, int]], target_addr: int,
                          checkpoints: list, tail_name: str, timeout: float = 120.0,
-                         worker_scheduler=None, worker_addrs=None) -> list:
+                         worker_scheduler=None, worker_addrs=None,
+                         worker_gpr_sets=None) -> list:
         """Run checkpointed segments, returning ``(name, ms, FLOPs)`` samples.
         A preamble at self._preamble_addr primes each
         (reg, value) in ``gpr_sets`` then jumps into ``target_addr``; each
@@ -1693,7 +1702,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             # run_prefill() already preclears every engine after loading the
             # worker programs.  Do not preclear again here: that redundant
             # core-0 program corrupts the first segmented latency sample.
-            worker_scheduler.start_workers(worker_addrs or [])
+            worker_scheduler.start_workers(
+                worker_addrs or [], gpr_sets_by_worker=worker_gpr_sets)
         self.start_execute_from_dram(self._preamble_addr)
         for checkpoint in checkpoints:
             name, resume_hex, *extra = checkpoint
@@ -1732,7 +1742,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             [(self.gpr_seq_len, self.seq_len - 1),
              (self.gpr_aligned_seq_len, aligned_seq_len)],
             decoder_addr, checkpoints, tail_name="tail_addinc", timeout=timeout,
-            worker_scheduler=worker_scheduler, worker_addrs=worker_addrs)
+            worker_scheduler=worker_scheduler, worker_addrs=worker_addrs,
+            worker_gpr_sets=(self._decode_worker_gpr_sets(
+                worker_scheduler, aligned_seq_len)
+                if worker_scheduler is not None else None))
         # The decoder program is captured with MAX_CONTEXT_SIZE as its template
         # aligned length, so compile-time attention FLOPs describe that maximum.
         # Replace only attention FLOPs with the exact live-length formula used by
@@ -1745,7 +1758,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 layer_idx = int(match.group(1))
                 head_dim, _, _ = self._get_layer_attention_dims(layer_idx)
                 batch = self.group_size
-                flops = (batch * head_dim
+                flops = ((0 if self.multi_core > 1 else batch * head_dim)
                          + batch * aligned_seq_len * (4 * head_dim + 6))
             adjusted.append((name, ms, flops))
         return adjusted
@@ -1828,6 +1841,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         Use to find where prefill / decode time goes. Requires
         compile_gemma4(profile=True)."""
         meta = self._load_program_section("lm", profile=True)
+        self._decode_worker_attn_len_regs = list(
+            meta.get("decoder_worker_attention_aligned_regs", []))
         base_addr = meta["_dram_base_int"]
         prefill_program_addr = int(meta["prefill_program_start_addr"], 16)
         decoder_program_addr = int(meta["decoder_program_start_addr"], 16)

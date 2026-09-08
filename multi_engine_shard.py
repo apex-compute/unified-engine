@@ -2066,12 +2066,21 @@ class MultiEngineScheduler:
         return list(self._worker_prog_addrs)
 
     def start_workers(self, prog_addrs: Optional[list[int]] = None,
-                      aligned_seq_len: Optional[int] = None) -> None:
+                      aligned_seq_len: Optional[int] = None,
+                      gpr_sets_by_worker: Optional[list[list[tuple[int, int]]]] = None) -> None:
         """Launch every worker program. Call BEFORE launching the primary's
         program, on EVERY execution (each run ends with the workers halted).
 
         ``prog_addrs`` overrides the most recent finalize()'s addresses -- pass
         the stage's saved list when one scheduler carries several stages.
+
+        ``gpr_sets_by_worker`` primes runtime registers in ordinary worker
+        programs (those emitted between :meth:`begin_program` and
+        :meth:`finalize`).  It is indexed by worker, not engine, and each entry
+        is a list of ``(register, value)`` pairs.  A tiny preamble is rewritten
+        immediately after that worker's loaded program and jumps to its normal
+        entry point.  This is useful when a worker participates in an otherwise
+        unrolled program but one kernel needs a live runtime dimension.
 
         NEW -- ``aligned_seq_len`` is for workers built by
         :meth:`emit_worker_program` whose rounds contain attention. Their body is
@@ -2102,8 +2111,43 @@ class MultiEngineScheduler:
         addrs = self._worker_prog_addrs if prog_addrs is None else prog_addrs
         assert len(addrs) == len(self.workers), \
             f"start_workers: {len(addrs)} program address(es) for {len(self.workers)} worker(s)"
-        for w, addr in zip(self.workers, addrs):
-            w.start_execute_from_dram(addr)
+        if gpr_sets_by_worker is not None and len(gpr_sets_by_worker) != len(self.workers):
+            raise ValueError(
+                "gpr_sets_by_worker must contain one register list per worker: "
+                f"got {len(gpr_sets_by_worker)} for {len(self.workers)} workers")
+        preambles = getattr(self, "_runtime_worker_preambles", None)
+        if preambles is None:
+            preambles = self._runtime_worker_preambles = {}
+        for wi, (w, addr) in enumerate(zip(self.workers, addrs)):
+            reg_sets = (gpr_sets_by_worker[wi]
+                        if gpr_sets_by_worker is not None else [])
+            if not reg_sets:
+                w.start_execute_from_dram(addr)
+                continue
+            # Reserve one aligned slot after the loaded image on first use, then
+            # rewrite that same slot every launch. This keeps the preamble from
+            # consuming ISA space once per decode token and gives the arena its
+            # normal hard bounds check.
+            preamble_key = (wi, int(addr), tuple(reg for reg, _ in reg_sets))
+            preamble_addr = preambles.get(preamble_key)
+            if preamble_addr is None:
+                preamble_bytes = ((len(reg_sets) + 1)
+                                  * user_dma_core.INSTRUCTION_SIZE_BYTES)
+                preamble_addr = w.allocate_program_dram(
+                    preamble_bytes,
+                    label=f"worker{wi + 1}_runtime_preamble")
+                self._check_isa_fits(wi + 1, preamble_addr, preamble_bytes)
+                preambles[preamble_key] = preamble_addr
+            w.clear_inst_id()
+            w.start_capture()
+            for reg, value in reg_sets:
+                w.generate_instruction_add_set(reg, value)
+            w.generate_instruction_jump_abs(
+                user_dma_core.ue_35bit_addr_shifter(addr))
+            w.stop_capture()
+            w.write_captured_instructions_to_dram(preamble_addr)
+            w.clear_capture_buffer()
+            w.start_execute_from_dram(preamble_addr)
 
     def worker_program_bytes(self) -> int:
         return sum(w.get_capture_instruction_size_bytes() for w in self.workers)
