@@ -16,7 +16,7 @@ class UnifiedEngineResetTests(unittest.TestCase):
         engine = object.__new__(user_dma_core.UnifiedEngine)
         engine.device = "cpu"
         engine.hw_version = None
-        engine.get_hardware_version = mock.Mock(return_value=0x12345678)
+        engine.get_hardware_version = mock.Mock(return_value=0x7FA22ACF)
         engine.user_read_reg32 = mock.Mock(return_value=0xDEADBEEF)
         return engine
 
