@@ -1,6 +1,6 @@
 # YOLOv5n
 
-This directory owns the YOLOv5n v7.0 public entrypoints, configuration, model
+This directory owns the YOLOv5n master-compatible public entrypoints, configuration, model
 cache, and generated artifacts. The graph interpreter, artifact schema, mixed
 channel-IF4/gather-IF8 quantization, and Andromeda primitive implementations are
 shared with
@@ -31,9 +31,9 @@ inference does not write those live CSRs.
 
 ## Checkpoint and quantization
 
-The integration pins the official Ultralytics YOLOv5
-[`v7.0` release](https://github.com/ultralytics/yolov5/releases/tag/v7.0),
-source commit `915bbf294bb74c859f0b41f1c23bc395014ea679`, and
+The integration pins official Ultralytics YOLOv5 master source commit
+`35b48237aef6d71ca9de2c5dea345d7536eb7fa7` (checked 2026-09-09), and
+retains the verified v7.0 checkpoint
 [`yolov5n.pt`](https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n.pt)
 with SHA-256
 `4f180cf23ba0717ada0badd6c685026d73d48f184d00fc159c2641284b2ac0a3`.

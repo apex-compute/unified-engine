@@ -1,7 +1,7 @@
 {
   "model": {
     "name": "YOLOv5s",
-    "upstream_version": "v7.0",
+    "upstream_version": "master@35b48237aef6",
     "input_size": 256,
     "input_resolutions": [
       "256x256", "320x320", "416x416", "512x512",
@@ -20,8 +20,9 @@
   "source": {
     "release_url": "https://github.com/ultralytics/yolov5/releases/tag/v7.0",
     "repository_url": "https://github.com/ultralytics/yolov5.git",
-    "tag": "v7.0",
-    "commit_sha": "915bbf294bb74c859f0b41f1c23bc395014ea679",
+    "branch": "master",
+    "weights_tag": "v7.0",
+    "commit_sha": "35b48237aef6d71ca9de2c5dea345d7536eb7fa7",
     "weights_url": "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.pt",
     "weights_sha256": "8b3b748c1e592ddd8868022e8732fde20025197328490623cc16c6f24d0782ee"
   },

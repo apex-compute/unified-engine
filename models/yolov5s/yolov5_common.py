@@ -34,6 +34,10 @@ if str(REPO_ROOT) not in sys.path:
 import quant_lib
 import user_dma_core
 
+# Audited upstream master snapshot. Official n/s checkpoint assets remain v7.0;
+# the supported inference operators and YAML graphs are unchanged at this pin.
+YOLOV5_SOURCE_COMMIT = "35b48237aef6d71ca9de2c5dea345d7536eb7fa7"
+
 
 @dataclass(frozen=True)
 class YOLOv5Variant:
@@ -127,6 +131,9 @@ def load_yolov5_config(
         raise RuntimeError(
             f"{config_path} does not describe {profile.model_name}")
     source = config.get("source", {})
+    if (source.get("branch") != "master"
+            or source.get("commit_sha") != YOLOV5_SOURCE_COMMIT):
+        raise RuntimeError(f"{config_path} does not pin the audited YOLOv5 master snapshot")
     if (source.get("weights_url") != profile.checkpoint_url
             or source.get("weights_sha256") != profile.checkpoint_sha256):
         raise RuntimeError(

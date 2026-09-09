@@ -403,7 +403,9 @@ def _expanded_channel_weights(
 
 
 def _prepare_conv_plan(operation: dict, weight: dict, source: _PackedMap,
-                       destination: _PackedMap, image: _ImageBuilder) -> dict:
+                       destination: _PackedMap, image: _ImageBuilder, *,
+                       allow_half_vector_output: bool = False,
+                       weight_stream_budget_bytes: int = _CONV_WEIGHT_STREAM_BUDGET_BYTES) -> dict:
     precision = weight["precision"]
     data_type = user_dma_core.TYPE[precision.upper()]
     codes = _unpack_codes(
@@ -457,11 +459,12 @@ def _prepare_conv_plan(operation: dict, weight: dict, source: _PackedMap,
         bias_enabled=padded_bias is not None,
         weight_bytes_per_block=(
             64 if data_type == user_dma_core.TYPE.IF8 else 32),
-        weight_stream_budget_bytes=_CONV_WEIGHT_STREAM_BUDGET_BYTES,
+        weight_stream_budget_bytes=weight_stream_budget_bytes,
         wb_uram_addr=_ACT_URAM_LINES)
     if (out_h, out_w) != destination.logical_shape[1:]:
         raise RuntimeError(f"{operation['name']}: convolution planner shape differs")
-    if oc_chunk % user_dma_core.UE_VECTOR_SIZE:
+    if oc_chunk % user_dma_core.UE_VECTOR_SIZE and not (
+            allow_half_vector_output and oc_chunk == 32):
         raise RuntimeError(
             f"{operation['name']}: OC chunk {oc_chunk} cannot be scattered "
             "into the persistent packed map without host repacking")

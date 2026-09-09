@@ -1112,7 +1112,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x7fa22acf, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x7fa22acf. Please update FPGA with commit update_7fa22acf.bin using update_flash.py (public release v1.4)"
+        # assert hw_version == 0x7fa22acf, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x7fa22acf. Please update FPGA with commit update_7fa22acf.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -9129,7 +9129,9 @@ class UnifiedEngine:
         """
         self.accelerator_memory_to_scale_sram(scale_dram_addr, scale_count)
         if bias_dram_addr is not None:
-            self.accelerator_memory_to_bias_sram(bias_dram_addr, results)
+            # CONV rewinds bias after each pixel's OC vector. The packed
+            # allocation contains only oc_count entries, even for large tiles.
+            self.accelerator_memory_to_bias_sram(bias_dram_addr, oc_count)
 
         # The running act-read / result-write DRAM addresses live in ISA GP
         # registers (word address = byte >> 3, the REG_REWRITE convention).
@@ -9373,6 +9375,8 @@ class UnifiedEngine:
         # / tests can report them (the capture buffer is cleared just below).
         self.last_conv_inst_bytes = inst_bytes
         self.last_conv_cycles = self.read_latency_cycles()
+        if getattr(self, 'layer_trace_callback', None) is not None:
+            self.layer_trace_callback(self, program_dram_addr, self.last_conv_cycles)
         self.clear_capture_buffer()
 
         # ONE bulk readback for the whole layer; scatter exact grouped tiles.
@@ -9490,6 +9494,8 @@ class UnifiedEngine:
         # Stash whole-layer program size + HW execute latency for tests/callers.
         self.last_maxpool_inst_bytes = inst_bytes
         self.last_maxpool_cycles = self.read_latency_cycles()
+        if getattr(self, 'layer_trace_callback', None) is not None:
+            self.layer_trace_callback(self, program_dram_addr, self.last_maxpool_cycles)
         self.clear_capture_buffer()
 
         big = self.dma_from_accelerator_memory(

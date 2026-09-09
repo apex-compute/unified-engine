@@ -1,6 +1,6 @@
 # YOLOv5s
 
-This directory contains YOLOv5s v7.0 object detection with precompiled
+This directory contains YOLOv5s master-compatible object detection with precompiled
 256x256, 320x320, 416x416, 512x512, 640x480, and 640x640 input profiles.
 Convolution, SiLU, SPPF max-pooling, nearest-neighbor upsampling,
 bottleneck residual additions, concatenation, and tensor handoff execute inside
@@ -38,15 +38,29 @@ about `0.51` confidence (the final low bits can vary with the host BF16 kernel).
 
 ## Model and weights
 
-The integration is pinned to the official Ultralytics YOLOv5
-[`v7.0` release](https://github.com/ultralytics/yolov5/releases/tag/v7.0),
-source commit `915bbf294bb74c859f0b41f1c23bc395014ea679`. On first use it downloads
-the official
+The supported inference subset is pinned to official YOLOv5 master commit
+`35b48237aef6d71ca9de2c5dea345d7536eb7fa7` (checked 2026-09-09).
+The n/s YAML graphs and Conv/Bottleneck/C3/SPPF/Concat/Detect implementations
+are unchanged from v7.0 after excluding documentation. Consequently the native
+compiler, quantization, and artifact ABI remain unchanged. This is a native
+Andromeda adapter, not an installation of upstream training/export/AutoShape.
+The source pin and checkpoint release are tracked separately. On first use it
+downloads the verified official v7.0
 [`yolov5s.pt`](https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5s.pt)
 checkpoint and verifies SHA-256
 `8b3b748c1e592ddd8868022e8732fde20025197328490623cc16c6f24d0782ee`.
 The cached checkpoint is stored as `yolov5s_bin/yolov5s-v7.0.pt` and is kept by
 `make clean`.
+
+To repeat the source compatibility audit with a local official Git clone:
+
+```bash
+python models/yolov5s/verify_upstream.py --upstream /path/to/yolov5
+```
+
+The clone must contain both the v7.0 and pinned master commits. The audit reads
+Git objects, compares parsed YAML and Python ASTs, and never imports upstream
+Python. Existing compiled bins need no rebuild solely for this source-pin update.
 
 The artifact compiler uses PyTorch's restricted `weights_only=True` path with a
 minimal class allow-list, so it does not need an Ultralytics checkout, OpenCV,
