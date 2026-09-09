@@ -1509,6 +1509,23 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             lines.append(f"- **Prefill utilization (% peak):** {_util(pf_gflops)}")
         if pf_e2e is not None:
             lines.append(f"- **Prefill end-to-end (CPU timer):** {pf_e2e:.1f} s")
+        # TTFT ends when prefill has produced the first decode-ready state.  In
+        # VLM mode it includes the preceding CPU-timed vision pass; otherwise
+        # it is the prefill CPU timer alone.
+        ttft_s = pf_e2e
+        if is_image:
+            vis_e2e = getattr(self, "_vis_e2e_s", None)
+            ttft_s = (vis_e2e + pf_e2e
+                      if vis_e2e is not None and pf_e2e is not None else None)
+        if ttft_s is not None:
+            lines.append(f"- **Time to first token (TTFT, CPU timer):** {ttft_s:.1f} s")
+        ttft_hw_us = pf_lat_us
+        if is_image:
+            vis_lat_us = getattr(self, "_vis_last_latency_us", None)
+            ttft_hw_us = (vis_lat_us + pf_lat_us
+                          if vis_lat_us is not None and pf_lat_us is not None else None)
+        if ttft_hw_us is not None:
+            lines.append(f"- **Time to first token (TTFT, HW counter):** {ttft_hw_us / 1e3:.1f} ms")
         lines.append("")
 
         # --- Decode ----------------------------------------------------------

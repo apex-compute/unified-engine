@@ -444,6 +444,25 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
                 "",
             ]
 
+        # TTFT ends at the decode-ready prefill state. Both the accelerator
+        # counter and CPU wall-clock views include vision for VLM requests;
+        # text-only is prefill-only.
+        prefill_wall_s = getattr(self, "_prefill_wall_s", None)
+        vision_wall_s = getattr(self, "_vis_wall_s", None)
+        prefill_hw_us = getattr(self, "_latency_prefill_us", None)
+        vision_hw_us = getattr(self, "_vis_latency_us", None)
+        if prefill_wall_s is not None or prefill_hw_us is not None:
+            ttft_stages = ("vision + prefill" if vision_wall_s is not None
+                           or vision_hw_us is not None else "prefill")
+            L += ["## Time to first token", ""]
+            if prefill_hw_us is not None:
+                ttft_hw_us = prefill_hw_us + (vision_hw_us or 0.0)
+                L.append(f"- **TTFT (HW counter; {ttft_stages}):** {ttft_hw_us / 1e3:.1f} ms")
+            if prefill_wall_s is not None:
+                ttft_s = prefill_wall_s + (vision_wall_s or 0.0)
+                L.append(f"- **TTFT (CPU timer; {ttft_stages}):** {ttft_s:.2f} s")
+            L.append("")
+
         steps = getattr(self, "_decode_step_us", None)
         if steps:
             n = self._decode_n
