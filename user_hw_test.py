@@ -824,6 +824,8 @@ def matmat_mul_two_cores_unified_test(
 def matmat_mul_multi_cores_unified_test(
     runtime_list=None,
     num_engines: int = 8,
+    weight_mode: str = "private",
+    also_run_shared_dynamic: bool = True,
     softmax_enable: bool = False,
     gelu_enable: bool = False,
     silu_enable: bool = False,
@@ -835,6 +837,14 @@ def matmat_mul_multi_cores_unified_test(
 ):
     """Run RNG-matched legacy/dynamic multi-core matmuls (M sharded across num_engines).
 
+    ``weight_mode="private"`` gives every engine a full private copy of B in
+    its tensor window (the historical layout). ``weight_mode="shared"`` puts
+    one full B in engine 0's tensor window and every engine reads that same
+    flat DRAM address; A and output remain M-sharded/private in both modes.
+    With the default private mode, a fourth leg also runs the dynamic multicore
+    workload with shared B, so private-vs-shared bandwidth is directly visible
+    without duplicating the one-core baseline or legacy leg.
+
     Each shape first runs the DYNAMIC path on ONE engine to get the FPGA-side
     single-core execution time; that latency is the baseline every multi-core
     leg's speedup is computed against. A summary table of all shapes, legs,
@@ -845,14 +855,19 @@ def matmat_mul_multi_cores_unified_test(
     if runtime_list is None:
         runtime_list = [(4096, 4096, 4096)]
     assert runtime_list, "runtime_list must be non-empty"
+    if weight_mode not in ("private", "shared"):
+        raise ValueError(
+            f"weight_mode must be 'private' or 'shared', got {weight_mode!r}")
 
     # Per-shape 1-engine dynamic latency (us), and the collected summary rows.
     baseline_us = {}
     summary_rows = []
 
-    def _run_case(M, K, N, dynamic, ne=None):
+    def _run_case(M, K, N, dynamic, ne=None, run_weight_mode=None):
         if ne is None:
             ne = num_engines
+        if run_weight_mode is None:
+            run_weight_mode = weight_mode
         bytes_per_element = 2
         ues = _make_multi_engine_ues(ne)[0]
 
@@ -867,14 +882,24 @@ def matmat_mul_multi_cores_unified_test(
         a_addrs = []
         b_addrs = []
         out_addrs = []
+        shared_b_addr = None
+        if run_weight_mode == "shared":
+            # DRAM is flat across engines: one B allocation in engine 0's
+            # window is a legal read address for every worker. Do not allocate
+            # any worker B buffers or duplicate the DMA write in this mode.
+            shared_b_addr = ues[0].allocate_tensor_dram(N * K * bytes_per_element)
+            ues[0].dma_to_accelerator_memory(shared_b_addr, b)
         row_base = 0
         for ue, m_engine in zip(ues, m_shards):
             row_end = row_base + m_engine
             a_addr = ue.allocate_tensor_dram(m_engine * K * bytes_per_element)
-            b_addr = ue.allocate_tensor_dram(N * K * bytes_per_element)
+            if run_weight_mode == "private":
+                b_addr = ue.allocate_tensor_dram(N * K * bytes_per_element)
+                ue.dma_to_accelerator_memory(b_addr, b)
+            else:
+                b_addr = shared_b_addr
             out_addr = ue.allocate_tensor_dram(m_engine * N * bytes_per_element)
             ue.dma_to_accelerator_memory(a_addr, a[row_base:row_end, :])
-            ue.dma_to_accelerator_memory(b_addr, b)
             a_addrs.append(a_addr)
             b_addrs.append(b_addr)
             out_addrs.append(out_addr)
@@ -1017,6 +1042,8 @@ def matmat_mul_multi_cores_unified_test(
         if clamp_enable:   flags.append("clamp")
         if log_enable:     flags.append("log")
         if dynamic:        flags.append("dynamic")
+        if run_weight_mode == "shared":
+            flags.append("shared")
         if input_scale != 1.0: flags.append(f"scale={input_scale:g}")
         flag_str = ("+" + "+".join(flags)) if flags else ""
         is_baseline = (ne == 1 and dynamic)
@@ -1036,6 +1063,7 @@ def matmat_mul_multi_cores_unified_test(
             "shape": f"{M}x{K}x{N}",
             "leg": "1-core baseline (dynamic)" if is_baseline
                    else ("dynamic" if dynamic else "legacy"),
+            "weight_mode": run_weight_mode,
             "engines": ne,
             "latency_us": latency_us,
             "gflops": flop_rate_gflops,
@@ -1069,12 +1097,21 @@ def matmat_mul_multi_cores_unified_test(
             lambda M=M, K=K, N=N: _run_case(M, K, N, dynamic=False),
             lambda M=M, K=K, N=N: _run_case(M, K, N, dynamic=True),
         )
+        if also_run_shared_dynamic and weight_mode == "private":
+            # Reuse the exact same random A/B as the private legacy/dynamic
+            # pair. This is intentionally only one extra leg: the 1-core
+            # baseline has no inter-engine weight-layout distinction, and the
+            # requested comparison is dynamic private versus dynamic shared.
+            _restore_rng_state(rng_state)
+            _run_case(M, K, N, dynamic=True, run_weight_mode="shared")
 
     # ---- Summary -----------------------------------------------------------
+    mode_summary = ("private + shared-dynamic" if also_run_shared_dynamic
+                    and weight_mode == "private" else weight_mode)
     print(f"\n=== matmat_mul_multi_cores_unified_test summary "
           f"({num_engines} engines; speedup vs 1-core dynamic FPGA time; "
-          f"%peak vs each leg's own engine-count peak) ===")
-    header = (f"{'shape (MxKxN)':<20}{'leg':<28}{'eng':>5}"
+          f"%peak vs each leg's own engine-count peak; weights={mode_summary}) ===")
+    header = (f"{'shape (MxKxN)':<20}{'leg':<28}{'weights':<10}{'eng':>5}"
               f"{'latency(us)':>14}{'GFLOPS':>12}{'%peak':>9}"
               f"{'SNR(dB)':>10}{'speedup':>10}")
     print(header)
@@ -1084,7 +1121,7 @@ def matmat_mul_multi_cores_unified_test(
         snr_str = "inf" if snr == float("inf") else f"{snr:.1f}"
         spd = row["speedup"]
         spd_str = "base" if spd is None else f"{spd:.2f}x"
-        print(f"{row['shape']:<20}{row['leg']:<28}{row['engines']:>5}"
+        print(f"{row['shape']:<20}{row['leg']:<28}{row['weight_mode']:<10}{row['engines']:>5}"
               f"{row['latency_us']:>14.1f}{row['gflops']:>12.2f}"
               f"{row['peak_pct']:>8.2f}%{snr_str:>10}{spd_str:>10}")
     print("-" * len(header))
