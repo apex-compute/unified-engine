@@ -104,14 +104,14 @@ class VariantTests(unittest.TestCase):
         self.assertEqual(
             artifact.weights_sha256,
             "b8ca688e49a44c87b657de6b5c4c9d7b0193718c40ccc8f860733cd89865f666")
-        self.assertEqual(artifact.model_bytes, 19_718_784)
-        self.assertEqual(artifact.program_bytes, 290_560)
+        self.assertEqual(artifact.model_bytes, 128_758_464)
+        self.assertEqual(artifact.program_bytes, 109_120)
         self.assertEqual(
             artifact.model_sha256,
-            "fe1674e69a2645d2b62937184f5cffdef89f663437615d318a6e58269fbc7cce")
+            "d13b4daaf3998b8da7d682137729d1f65a3b4526b24aa86f7e9bdbd6da908e0b")
         self.assertEqual(
             artifact.program_sha256,
-            "e1a8cf92d99aaa1516c9c39122a660c65f04f8ab2baaf8af1662ce52419aa924")
+            "fa0e228a4f43038d0260c86702602d162d9cf8c6308853fa82c51fc514835004")
         self.assertEqual(artifact_variant({"format": artifact.format}), "n")
 
     def test_variant_configs_match_pinned_profiles(self):
@@ -494,7 +494,7 @@ class QuantizationTests(unittest.TestCase):
         self.assertEqual(
             [(group[2], group[3]) for group in
              user_dma_core.conv2d_tile_geometry_groups(tiles)],
-            [(6, 5), (6, 1), (1, 5), (1, 1)])
+            [(7, 6)])
         canonical = torch.arange(
             510 * out_h * out_w, dtype=torch.int64).remainder(2048) \
             .to(torch.bfloat16).view(510, out_h, out_w)
@@ -509,7 +509,7 @@ class QuantizationTests(unittest.TestCase):
                 c_in=64, oc_count=255, in_h=10, in_w=10,
                 kernel_h=1, kernel_w=1, stride_s=1, pad=0)
         self.assertEqual(oc_chunk, 255)
-        self.assertGreater(len(tiles), 1)
+        self.assertEqual(len(tiles), 1)
         self.assertTrue(any(
             tile[2] * tile[3] * oc_chunk % 64 for tile in tiles))
         canonical = torch.arange(
@@ -552,8 +552,8 @@ class QuantizationTests(unittest.TestCase):
         ), dtype=torch.bfloat16)
         packed = user_dma_core.conv2d_pack_scale_stream(
             signed, oc_count=3, taps=2, out_h=2, out_w=1)
-        self.assertTrue(torch.equal(packed[:6], signed.flatten()))
-        self.assertTrue(torch.equal(packed[6:], signed.flatten()))
+        self.assertEqual(packed.numel(), 6)
+        self.assertTrue(torch.equal(packed, signed.flatten()))
 
     def test_layer_scale_chunks_preserve_all_oc_rows(self):
         _, _, chunk, _ = user_dma_core.plan_conv2d_layer_tiles(
@@ -697,10 +697,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual((out_h, out_w, oc_chunk), (4, 5, 64))
         groups = user_dma_core.conv2d_tile_geometry_groups(tiles)
         self.assertEqual(groups, [
-            (0, 2, 3, 2, 7, 5),
-            (2, 3, 3, 1, 7, 3),
-            (3, 5, 1, 2, 3, 5),
-            (5, 6, 1, 1, 3, 3),
+            (0, 1, 4, 5, 9, 11),
         ])
         occupancy = torch.zeros(out_h, out_w, dtype=torch.int32)
         for oy0, ox0, th, tw, y0, x0, win_h, win_w in tiles:
@@ -714,12 +711,11 @@ class PlannerTests(unittest.TestCase):
         layout, activation_bytes, chunk_output_bytes = \
             user_dma_core.conv2d_tiled_dram_layout(
                 tiles, ct=2, oc_chunk=oc_chunk)
-        self.assertEqual(activation_bytes, 33_280)
+        self.assertEqual(activation_bytes, 25_344)
         self.assertEqual(chunk_output_bytes, 2_560)
         self.assertEqual(
             [(item[6], item[8]) for item in layout],
-            [(0, 0), (17_920, 1_536),
-             (23_296, 1_920), (30_976, 2_432)])
+            [(0, 0)])
         self.assertTrue(all(
             value % 128 == 0
             for item in layout for value in (item[6], item[7], item[8], item[9])))
@@ -741,7 +737,7 @@ class PlannerTests(unittest.TestCase):
                     kernel_h=1, kernel_w=1, stride_s=1, pad=0)
                 self.assertEqual(chunk, 255)
 
-    def test_gather_planner_uses_rewound_scale_bram(self):
+    def test_both_conv_modes_use_rewound_scale_bram(self):
         channel_plan = user_dma_core.plan_conv2d_layer_tiles(
             c_in=3, oc_count=32, in_h=256, in_w=256,
             kernel_h=6, kernel_w=6, stride_s=2, pad=2,
@@ -751,18 +747,56 @@ class PlannerTests(unittest.TestCase):
             kernel_h=6, kernel_w=6, stride_s=2, pad=2,
             gather=True)
         self.assertEqual(gather_plan[2], 32)
-        self.assertLess(len(gather_plan[3]), len(channel_plan[3]))
+        self.assertEqual(gather_plan, channel_plan)
+        self.assertGreater(
+            channel_plan[3][0][2] * channel_plan[3][0][3] * 32 * 36,
+            user_dma_core.SCALE_BRAM_ELEMENTS)
         self.assertGreater(gather_plan[3][0][2] * gather_plan[3][0][3], 6)
 
-    def test_gather_planner_respects_bias_bram_capacity(self):
-        _, _, oc_chunk, tiles = user_dma_core.plan_conv2d_layer_tiles(
-            c_in=3, oc_count=32, in_h=256, in_w=256,
+    def test_gather_bias_reuse_does_not_limit_spatial_tile(self):
+        kwargs = dict(
+            c_in=3, oc_count=64, in_h=256, in_w=256,
             kernel_h=6, kernel_w=6, stride_s=2, pad=2,
-            gather=True, bias_enabled=True)
-        tile_h, tile_w = tiles[0][2:4]
-        self.assertLessEqual(
-            tile_h * tile_w * oc_chunk,
+            gather=True, wb_uram_addr=2032)
+        no_bias = user_dma_core.plan_conv2d_layer_tiles(
+            **kwargs, bias_enabled=False)
+        with_bias = user_dma_core.plan_conv2d_layer_tiles(
+            **kwargs, bias_enabled=True)
+        self.assertEqual(with_bias, no_bias)
+        tile_h, tile_w = with_bias[3][0][2:4]
+        self.assertGreater(
+            tile_h * tile_w * with_bias[2],
             user_dma_core.BIAS_BRAM_ELEMENTS)
+
+    def test_spatial_search_reduces_yolo_stem_launches(self):
+        out_h, out_w, oc_chunk, tiles = \
+            user_dma_core.plan_conv2d_layer_tiles(
+                c_in=3, oc_count=64, in_h=640, in_w=640,
+                kernel_h=3, kernel_w=3, stride_s=2, pad=1,
+                gather=True)
+        self.assertEqual((out_h, out_w, oc_chunk), (320, 320, 64))
+        self.assertEqual(len(tiles), 600)
+        self.assertEqual(tiles[0][2:4], (11, 16))
+        self.assertEqual(
+            sum(tile[2] * tile[3] for tile in tiles), out_h * out_w)
+
+    def test_resident_weight_budget_bounds_precompiled_tile(self):
+        _, _, oc_chunk, tiles = user_dma_core.plan_conv2d_layer_tiles(
+            c_in=256, oc_count=256, in_h=32, in_w=32,
+            kernel_h=3, kernel_w=3, stride_s=1, pad=1,
+            weight_bytes_per_block=32,
+            weight_stream_budget_bytes=4 << 20)
+        tile_h, tile_w = tiles[0][2:4]
+        blocks_per_oc = 3 * 3 * (256 // user_dma_core.UE_VECTOR_SIZE)
+        self.assertLessEqual(
+            tile_h * tile_w * 256 * blocks_per_oc * 32, 4 << 20)
+
+    def test_conv_bias_stream_stores_one_channel_vector(self):
+        bias = torch.arange(64, dtype=torch.float32)
+        packed = user_dma_core.conv2d_pack_bias_stream(bias, 11, 11)
+        self.assertEqual(packed.dtype, torch.bfloat16)
+        self.assertEqual(packed.numel(), 64)
+        self.assertTrue(torch.equal(packed.float(), bias))
 
     def test_hardware_version_is_masked_and_cached(self):
         engine = user_dma_core.UnifiedEngine.__new__(user_dma_core.UnifiedEngine)
@@ -845,6 +879,9 @@ class PlannerTests(unittest.TestCase):
             pix_col_step=1, pix_row_step=1, gather=True)
         engine.write_conv2d_geometry_registers(
             **common, c_in=8, blocks_per_pixel=4, chunks=2)
+        words = user_dma_core.pack_conv2d_geometry_words(
+            **common, c_in=8, blocks_per_pixel=4, chunks=2)
+        self.assertEqual((words[1] >> 8) & 0xFFFF, common["oc_count"])
         with self.assertRaisesRegex(ValueError, "four RTL"):
             engine.write_conv2d_geometry_registers(
                 **common, c_in=33, blocks_per_pixel=10, chunks=5)
@@ -1229,10 +1266,15 @@ class PrecompiledBinTests(unittest.TestCase):
         self.assertEqual(stale_engine.writes, [])
 
         wide_engine = self.FakeRuntimeEngine()
-        with self.assertRaisesRegex(RuntimeError, "AXI-256"):
+        WholeGraphAndromedaBackend(
+            wide_engine, payload, axi_data_width_bits=512)
+        self.assertEqual(len(wide_engine.writes), 1)
+
+        unsupported_engine = self.FakeRuntimeEngine()
+        with self.assertRaisesRegex(RuntimeError, "AXI-256 or AXI-512"):
             WholeGraphAndromedaBackend(
-                wide_engine, payload, axi_data_width_bits=512)
-        self.assertEqual(wide_engine.writes, [])
+                unsupported_engine, payload, axi_data_width_bits=1024)
+        self.assertEqual(unsupported_engine.writes, [])
 
         short_write = self.FakeRuntimeEngine(write_shortfall=1)
         with self.assertRaisesRegex(RuntimeError, "wrote .* of"):

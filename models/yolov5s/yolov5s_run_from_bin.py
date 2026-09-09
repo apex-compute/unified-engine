@@ -83,9 +83,14 @@ def main(argv=None, *, pinned_variant: str = "s",
     parser.add_argument("--cycle", type=float, default=None)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--progress", action="store_true")
+    parser.add_argument(
+        "--trace-tail", type=Path, default=None, metavar="DIR",
+        help="Export the final 8192 hardware trace events as CSV and Perfetto")
     args = parser.parse_args(argv)
     if args.cpu:
         args.backend = "cpu-quantized"
+    if args.trace_tail is not None and args.backend != "hardware":
+        parser.error("--trace-tail requires --backend hardware")
     if args.backend == "hardware":
         # Bound the host work used to pack the single input and unpack the
         # bundled final output. Preserve smaller user settings.
@@ -144,10 +149,19 @@ def main(argv=None, *, pinned_variant: str = "s",
         # Backend initialization uploads the immutable model/program image
         # once. Each execute() call then performs one packed-input upload, one
         # whole-program kick, and one bundled final-output read.
+        trace_tail_path = None
+        if args.trace_tail is not None:
+            trace_tail_path = str(
+                args.trace_tail.expanduser()
+                / f"{profile.model_name.lower()}_{resolution}_tail.csv")
+            print(
+                "Trace capture: exporting the chronological BRAM tail after "
+                "HALT; host execution time will include trace-register reads")
         backend = WholeGraphAndromedaBackend(
             ue, selected_payload,
             axi_data_width_bits=hw_info.axi_data_width_bits,
-            timeout_s=args.timeout)
+            timeout_s=args.timeout,
+            trace_tail_path=trace_tail_path)
     else:
         backend = TorchBackend(quantized=True)
 
@@ -239,6 +253,18 @@ def main(argv=None, *, pinned_variant: str = "s",
             + ", ".join(
                 f"{key}={value}" for key, value
                 in hardware_accounting.items()))
+        if args.trace_tail is not None:
+            trace_result = backend.trace_tail_result
+            print(
+                f"Trace tail: {trace_result['retained_events']} of "
+                f"{trace_result['executed_events']} events, instructions "
+                f"{trace_result['first_instruction_index']}.."
+                f"{trace_result['last_instruction_index']}")
+            print(f"Trace CSV: {trace_result['csv']}")
+            print(f"Perfetto trace: {trace_result['perfetto']}")
+            print(
+                f"Trace export time: {backend.trace_export_seconds:.6f}s "
+                "(host-side debug overhead)")
 
     result = {
         "model": profile.model_name.lower(),
@@ -276,6 +302,10 @@ def main(argv=None, *, pinned_variant: str = "s",
             "model_upload_writes"]
         result["fpga_cycles"] = total_cycles
         result["fpga_execution_s"] = round(fpga_execution_s, 6)
+        if args.trace_tail is not None:
+            result["trace_tail"] = backend.trace_tail_result
+            result["trace_export_s"] = round(
+                backend.trace_export_seconds, 6)
     print("TEST_RESULT:" + json.dumps(result, separators=(",", ":")))
 
 

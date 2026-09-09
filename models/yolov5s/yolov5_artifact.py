@@ -83,15 +83,15 @@ CANONICAL_ARTIFACTS = {
         weights_sha256=(
             "273634fad085fa82ed76b5c5f03d80abebf3c8edcf4c8dbda95697c8c8b7d4d3"),
         model_sha256=(
-            "dd744ebd010b11e06bc527836da2d3e457ca8bf3be1454545b537df752acdfe3"),
+            "169dec4503e9e04f6f968f47d539d5a1b42338a547b5d6d312fd25317dc8a277"),
         program_sha256=(
-            "a96d21abbdf647374a23e4d76b3f39527d3b03f90ae5b4ebb6bb4e7cb02c7498"),
+            "dfb22c24ee749c66a3e8448d94bf4b0e05a2918012af0bf43b6c5dd82dc2a027"),
         manifest_sha256=(
-            "6c83bf28f149462a19d790f195391bf9ee575953c95bcbe11a2127854d7511e2"),
+            "c66c0d3ece1d36fcb7290aef58f3c1d5538d201cb8859311e4f35ff2d6671abe"),
         bundle_sha256=(
-            "a94de56d9cb84f66e8e3b3ba4fd10a3f82b62a2d34512d9cb9435fdd268836e4"),
-        model_bytes=18_094_976,
-        program_bytes=625_152,
+            "2ec6e653082fae35f12067513b1d3bd516986d87534d8960fa238c2c331814f6"),
+        model_bytes=191_365_248,
+        program_bytes=145_024,
     ),
     "n": CanonicalArtifact(
         variant="n",
@@ -101,15 +101,15 @@ CANONICAL_ARTIFACTS = {
         weights_sha256=(
             "b8ca688e49a44c87b657de6b5c4c9d7b0193718c40ccc8f860733cd89865f666"),
         model_sha256=(
-            "fe1674e69a2645d2b62937184f5cffdef89f663437615d318a6e58269fbc7cce"),
+            "d13b4daaf3998b8da7d682137729d1f65a3b4526b24aa86f7e9bdbd6da908e0b"),
         program_sha256=(
-            "e1a8cf92d99aaa1516c9c39122a660c65f04f8ab2baaf8af1662ce52419aa924"),
+            "fa0e228a4f43038d0260c86702602d162d9cf8c6308853fa82c51fc514835004"),
         manifest_sha256=(
-            "41c57c40ded178332abc96c3a262ab270ab5b2afec2deff617aa3719b3b8b489"),
+            "a496a6081257aa25f595f120741b7a405ad46e5dd98d1a50f9f00eaf9ea86f16"),
         bundle_sha256=(
-            "75a0fcea766b5dc64bb1b18b1b42c21b368c82198f297efcc65ed3354b04c6d6"),
-        model_bytes=19_718_784,
-        program_bytes=290_560,
+            "91e214d9e1babd3f8d432c43dfa9c6220fabf6977b6856b0bdc1884b04313ea2"),
+        model_bytes=128_758_464,
+        program_bytes=109_120,
     ),
 }
 

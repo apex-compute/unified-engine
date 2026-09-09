@@ -26,6 +26,12 @@ import user_dma_core
 PRECOMPILED_ABI = "andromeda-yolov5-whole-graph-v1"
 GEOMETRY_ABI = "conv-config-inst-v1"
 PRECOMPILED_AXI_DATA_WIDTH_BITS = 256
+SUPPORTED_RUNTIME_AXI_DATA_WIDTH_BITS = (256, 512)
+
+# The CONV X stream repeats a layer's weights for every pixel of its largest
+# tile.  Keep that resident-data trade-off bounded while still allowing much
+# larger launches than the former spatial scale/bias-BRAM limits.
+_CONV_WEIGHT_STREAM_BUDGET_BYTES = 4 << 20
 
 # In strided-write mode the checked-in RTL stores the per-stride AXI beat
 # count in eight bits.  A zero value represents the legal 256-beat maximum;
@@ -449,6 +455,9 @@ def _prepare_conv_plan(operation: dict, weight: dict, source: _PackedMap,
         stride_s=int(operation["stride"]), pad=int(operation["pad"]),
         dilation=int(operation["dilation"]), gather=use_gather,
         bias_enabled=padded_bias is not None,
+        weight_bytes_per_block=(
+            64 if data_type == user_dma_core.TYPE.IF8 else 32),
+        weight_stream_budget_bytes=_CONV_WEIGHT_STREAM_BUDGET_BYTES,
         wb_uram_addr=_ACT_URAM_LINES)
     if (out_h, out_w) != destination.logical_shape[1:]:
         raise RuntimeError(f"{operation['name']}: convolution planner shape differs")
@@ -626,12 +635,12 @@ def _emit_conv(engine: _WholeGraphEngine, plan: dict,
             if plan["use_gather"]:
                 scale_count = plan["oc_chunk"] * plan["gather_chunks"]
             else:
-                scale_count = th * tw * plan["oc_chunk"] * taps
+                scale_count = plan["oc_chunk"] * taps
             engine.accelerator_memory_to_scale_sram(
                 chunk["scale_address"], scale_count)
             if chunk["bias_address"] is not None:
                 engine.accelerator_memory_to_bias_sram(
-                    chunk["bias_address"], th * tw * plan["oc_chunk"])
+                    chunk["bias_address"], plan["oc_chunk"])
             for tile in plan["tiles"][start:stop]:
                 _stage_conv_window(engine, source, tile, pad, zero_address)
                 engine.start_queue_for_conv2d_operation(
@@ -915,6 +924,20 @@ def _instruction_types(program: bytes) -> list[int]:
     ]
 
 
+def decode_precompiled_program(hardware: dict) -> list[user_dma_core.Instructions]:
+    """Recover the resident instruction stream from a validated model image."""
+    image = hardware["model_image"]
+    start = int(hardware["program_offset"])
+    stop = start + int(hardware["program_size"])
+    program = _tensor_bytes(image)[start:stop]
+    decoded = []
+    for offset in range(0, len(program), user_dma_core.INSTRUCTION_SIZE_BYTES):
+        instruction = user_dma_core.Instructions()
+        instruction.words = list(struct.unpack_from("<8I", program, offset))
+        decoded.append(instruction)
+    return decoded
+
+
 def validate_precompiled_hardware(payload: dict,
                                   hardware: dict | None = None) -> None:
     """Validate the closed, non-relocatable whole-graph hardware section."""
@@ -972,11 +995,7 @@ def validate_precompiled_hardware(payload: dict,
            for value in instruction_types[halt + 1:]):
         raise RuntimeError("YOLO whole-graph HALT is not terminal")
     _scan_queue_configs(program, 0, len(program))
-    decoded = []
-    for offset in range(0, len(program), 32):
-        instruction = user_dma_core.Instructions()
-        instruction.words = list(struct.unpack_from("<8I", program, offset))
-        decoded.append(instruction)
+    decoded = decode_precompiled_program(hardware)
     jump_issues = user_dma_core.check_isa_jumps(
         decoded, program_address, name="YOLOv5 whole graph")
     if jump_issues:
@@ -1029,13 +1048,14 @@ class WholeGraphAndromedaBackend:
 
     def __init__(self, ue: user_dma_core.UnifiedEngine, payload: dict, *,
                  axi_data_width_bits: int,
-                 timeout_s: float = 300.0):
+                 timeout_s: float = 300.0,
+                 trace_tail_path: str | None = None):
         validate_precompiled_hardware(payload)
-        if int(axi_data_width_bits) != PRECOMPILED_AXI_DATA_WIDTH_BITS:
+        if int(axi_data_width_bits) not in \
+                SUPPORTED_RUNTIME_AXI_DATA_WIDTH_BITS:
             raise RuntimeError(
-                f"whole-graph YOLO was compiled for AXI-"
-                f"{PRECOMPILED_AXI_DATA_WIDTH_BITS}, live hardware reports "
-                f"AXI-{axi_data_width_bits}")
+                "whole-graph YOLO runtime supports AXI-256 or AXI-512, "
+                f"live hardware reports AXI-{axi_data_width_bits}")
         if getattr(ue, "conv_geometry_mode", None) != \
                 user_dma_core.CONV_GEOMETRY_QUEUE_CONFIG:
             raise RuntimeError(
@@ -1059,6 +1079,12 @@ class WholeGraphAndromedaBackend:
         self.output_reads = 0
         self.intermediate_upload_writes = 0
         self.intermediate_output_reads = 0
+        self.trace_tail_path = trace_tail_path
+        self.trace_tail_result = None
+        self.trace_export_seconds = 0.0
+        self._trace_instructions = (
+            decode_precompiled_program(self.hardware)
+            if trace_tail_path is not None else None)
         self._load_model_image()
 
     @property
@@ -1145,6 +1171,14 @@ class WholeGraphAndromedaBackend:
         self._wait_strict()
         self.cycles["whole_graph"] += self.ue.read_latency_cycles()
         self.instruction_bytes["whole_graph"] += self.hardware["program_size"]
+        if self.trace_tail_path is not None:
+            from read_trace import generate_circular_tail_trace
+            trace_started = time.perf_counter()
+            self.trace_tail_result = generate_circular_tail_trace(
+                self.ue, self.trace_tail_path,
+                instructions=self._trace_instructions,
+                program_dram_addr=self.hardware["program_address"])
+            self.trace_export_seconds = time.perf_counter() - trace_started
 
         bundle = torch.empty(
             self.hardware["head_bundle_bytes"] // 2, dtype=torch.bfloat16)
