@@ -22,6 +22,7 @@ if os.path.dirname(os.path.dirname(_SD)) not in sys.path:
 
 import torch
 import torch.nn.functional as F
+import multi_engine_shard as mes
 import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE,
@@ -34,9 +35,120 @@ from transformers import AutoTokenizer
 class Gemma4LMMixin:
     """LM prefill/decode methods for Gemma4_UnifiedEngine (see module docstring)."""
 
-    def _ensure_prefill_scheduler(self):
-        """Return the shared multicore configuration for the prefill stage."""
-        return self._ensure_stage_scheduler("prefill", self.VISION_ISA_BASE)
+    def _ensure_lm_scheduler(self):
+        """The ONE scheduler shared by LM prefill and LM decode.
+
+        Deliberately not one per stage: a second scheduler builds fresh worker
+        ``UnifiedEngine`` objects whose program allocators restart at the engine's
+        ISA base, so decode's worker images would be written on top of prefill's,
+        byte for byte. Sharing the object keeps a single program cursor per
+        engine, so decode's images land AFTER prefill's and both stay resident --
+        prefill runs once, decode then runs per token, with no reload between.
+        """
+        return self._ensure_stage_scheduler("lm")
+
+    # Back-compat alias: prefill used to own the scheduler outright.
+    _ensure_prefill_scheduler = _ensure_lm_scheduler
+
+    def _ensure_decode_qkv_shards(self, sched, layer_size: int) -> dict:
+        """Copy each engine's column block of the Q/K/V weights into that engine's
+        private arena. Returns ``{(op, layer_idx): ShardedWeight}``.
+
+        SCOPE: Q, K and V, every layer -- minus whatever cannot be split at this
+        engine count. Q is the widest N and divides evenly either way (full
+        4096 = 8 x 512, sliding 2048 = 8 x 256). K/V are N=head_dim: 512 on the
+        full layers, which is exactly 8 blocks of 64, but only 256 on the sliding
+        ones, i.e. 4 blocks -- so beyond 4 engines the sliding K/V stay full-width
+        on the master. The MLP is not sharded here.
+
+        THE COPY IS THE POINT. Engine i reads its block out of ITS OWN private
+        window rather than out of the one shared weight image, so the engines'
+        weight streams do not contend for the same memory. Decode is
+        bandwidth-bound -- a whole weight block streamed per token -- so sharing
+        one image would cap the speedup however evenly the columns divide. Cost is
+        one copy of the sharded weights spread over the engines: 22.3 MB total,
+        2.8 MB per core at 8, against a 224 MB private weight arena each.
+
+        ONE SHARD PER LAYER (``layers=1``), not one spanning all 35: gemma4
+        alternates two attention shapes, so there is no single N. That suits an
+        unrolled decoder anyway -- every address is a compile-time literal.
+
+        Cached: an image may be compiled more than once per process, and
+        shard_quantized_weight refuses to allocate the same name twice.
+        """
+        cached = getattr(self, "_decode_qkv_shards", None)
+        if cached is not None:
+            return cached
+        t0 = time.perf_counter()
+        stride = self.weight_defs["LAYER_WEIGHT_SIZE"]
+        shards, skipped = {}, []
+        for layer_idx in range(layer_size):
+            off = layer_idx * stride
+            _, cur_q_size, cur_k_size = self._get_layer_attention_dims(layer_idx)
+            cur_mlp = self._get_mlp_elements(layer_idx)
+            kv_own = layer_idx not in self._kv_shared_map
+            # (op, K, N, weight base, scale base). Q/K/V share K=vector_length
+            # and differ in N; the O projection is the transpose of that shape --
+            # it consumes the attention output, so its K is cur_q_size and its N
+            # is vector_length.
+            plan = [("q", self.vector_length, cur_q_size,
+                     self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
+                     self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE),
+                    ("o", cur_q_size, self.vector_length,
+                     self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT,
+                     self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE),
+                    # MLP. gate and up are the same shape and read the same
+                    # input; down is their transpose -- it consumes the whole
+                    # gate*up product, so its K is the MLP width.
+                    ("gate", self.vector_length, cur_mlp,
+                     self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT,
+                     self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE),
+                    ("up", self.vector_length, cur_mlp,
+                     self.DRAM_ADDR_LAYER0_MLP_UP_QUANT,
+                     self.DRAM_ADDR_LAYER0_MLP_UP_SCALE),
+                    ("down", cur_mlp, self.vector_length,
+                     self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT,
+                     self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE)]
+            if kv_own:
+                # A layer that borrows another layer's KV cache projects no K/V
+                # of its own, so there is nothing to shard for it.
+                plan += [("k", self.vector_length, cur_k_size,
+                          self.DRAM_ADDR_LAYER0_K_PROJ_QUANT,
+                          self.DRAM_ADDR_LAYER0_K_PROJ_SCALE),
+                         ("v", self.vector_length, cur_k_size,
+                          self.DRAM_ADDR_LAYER0_V_PROJ_QUANT,
+                          self.DRAM_ADDR_LAYER0_V_PROJ_SCALE)]
+            for op, K, N, w_base, s_base in plan:
+                if not mes.can_split(N, sched.num_engines):
+                    # Fewer than one 64-column block per engine (the sliding
+                    # layers' K/V past 4 engines). Left full-width on the master
+                    # rather than asserting inside split_cols.
+                    skipped.append((op, layer_idx))
+                    continue
+                shards[(op, layer_idx)] = sched.shard_quantized_weight(
+                    name=f"{op}_proj_L{layer_idx}",
+                    main_weight_addr=w_base + off, main_scale_addr=s_base + off,
+                    K=K, N=N, layers=1, main_layer_stride=0,
+                    data_type=TYPE.IF4, verbose=False)
+        # LM head: ONE op, outside the layer loop -- it runs once per token and is
+        # layer-independent. N=262144 is 4096 blocks of 64, so it splits perfectly
+        # at any engine count (32768 columns each at 8).
+        self._decode_lm_shard = None
+        if mes.can_split(self.EMBEDDING_ELEMENTS, sched.num_engines):
+            self._decode_lm_shard = sched.shard_quantized_weight(
+                name="lm_head",
+                main_weight_addr=self.DRAM_ADDR_LM_HEAD_QUANT,
+                main_scale_addr=self.DRAM_ADDR_LM_HEAD_SCALE,
+                K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+                layers=1, main_layer_stride=0, data_type=TYPE.IF4, verbose=False)
+        self._decode_qkv_shards = shards
+        used = sched.private_usage()
+        print(f"[Decode] sharded: {len(shards)} projection(s) over "
+              f"{sched.num_engines} engines in {time.perf_counter() - t0:.1f}s"
+              f"{f'; {len(skipped)} left on the master' if skipped else ''}; "
+              f"private weight arenas: "
+              f"{', '.join(f'{u / 2**20:.1f}MB' for u in used)}", flush=True)
+        return shards
 
 
     def set_prefill_seq(self, prompt: str | None = None) -> None:
@@ -236,15 +348,17 @@ class Gemma4LMMixin:
          0x100000000 └───────────────────────────────────────────────────┘
 
         MULTI-CORE PROGRAM DRAM (MultiEngineScheduler via _ensure_stage_scheduler):
-          * 2-core (kintex7, --multi-core): worker base = VISION_WORKER_ISA_BASE.
-              vision:  core0 @0xFF000000 (4 MiB) | core1 @0xFF400000 (2.125 MiB).
-              LM prefill: master @LM_ISA_BASE | worker @VISION_ISA_BASE
-                          (reuses the vision core0 region — vision has finished).
-          * 8-core (Alveo, --multi-core 8): worker base = 0xFC000000,
-              stride 0x00240000 (2.25 MiB/worker) -> 7 slots 0xFC000000,
-              0xFC240000, ...  The vision weight/scratch arena top then drops
-              to 0xFC000000 (see tensor_init() / vision_weight_init()).
-        Single-core (--multi-core 1) uses only core0/master; no worker ISA.
+          Uniform at EVERY engine count (the old 2-core / >2-core split is gone).
+          The map above does not move: masters stay at VISION_ISA_BASE
+          0xFF000000 (vision) and LM_ISA_BASE 0xFF620000 (LM). EVERY worker
+          executes from the ISA slice of its own window in the LOW 2 GB,
+          allocated by multi_engine_shard.PrivateArena:
+              8 engines -> window i @ i*256 MiB, ISA slice at
+              window_top - 32 MiB, 16 MiB (images ~1.7 MB).
+          Vision and prefill are sequential and share ONE arena object, so
+          worker i always executes from the same slice in both stages.
+        Single-core (--multi-core 1) uses only core0/master; no worker ISA, and
+        keeps the original upper-2 GB addresses unchanged.
         ==================================================================
         """
         import mmap as _mmap
@@ -399,14 +513,14 @@ class Gemma4LMMixin:
                      │    against the arena top so scratch can't reach it. │
           0xFF000000 └ VISION_ISA_BASE (program region begins) ───────────┘
 
-        MULTI-CORE: each engine gets its OWN private attention scratch
-        VIS_FLASH_SCRATCH_PER_ENGINE[i] (~13.4 MiB each), so 2-core adds
-        ~13 MiB of scratch vs single-core and pushes the vision scratch
-        high-water up (single ~0xF54CE000 -> 2-core ~0xF61EE000). Vision
-        weights are top-placed to stay clear of it; the arena TOP is
-        VISION_ISA_BASE for <=2-core, or 0xFC000000 for >2-core (Alveo),
-        because the 8-core worker ISA arena starts at 0xFC000000 (the LM
-        persistent region below _scratch_dram_base is untouched either way).
+        MULTI-CORE: the map above does not move -- not one model address changes
+        with the engine count.
+        Core 0's tensor-arena usage is IDENTICAL to single-core, because
+        every per-engine buffer moved out: workers' attention scratch now comes
+        from each engine's private tensor window in the low 2 GB (see
+        self.mc_arena), not aliased onto "dead" tensor regions. So the scratch high-water
+        no longer grows with engine count, and the arena TOP is VISION_ISA_BASE
+        at every engine count. Vision weights stay top-placed against it.
         ==================================================================
         """
         # KV state follows the full decode context. Token-major workspaces only
@@ -730,19 +844,28 @@ class Gemma4LMMixin:
             _attn_scr_stride = (self.head_dim * _ph_rows + _ph_rows * _ph_rows
                                 + _ph_rows * self.head_dim) * self.bytes_per_element
             _n_eng = prefill_scheduler.num_engines
-            _scr_end = self.LAYER0_FLASH_SCRATCH_DRAM + _n_eng * _attn_scr_stride
-            print(f"[prefill attn scratch] base=0x{self.LAYER0_FLASH_SCRATCH_DRAM:X} "
-                  f"stride=0x{_attn_scr_stride:X} engines={_n_eng} "
-                  f"end=0x{_scr_end:X} next_tensor=0x{self.LAYER0_ATTN_PROJ_OUTPUT_DRAM:X} "
-                  f"slack={ (self.LAYER0_ATTN_PROJ_OUTPUT_DRAM - _scr_end)/(1024*1024):.2f} MiB")
-            assert _scr_end <= self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, (
-                f"prefill per-engine attn scratch overruns FLASH_SCRATCH: "
-                f"{_n_eng} engines × 0x{_attn_scr_stride:X} ends at 0x{_scr_end:X} > "
+            # Workers take their scratch from their PRIVATE TENSOR window in
+            # self.mc_arena (low 2 GB); core 0 keeps its LAYER0_FLASH_SCRATCH_DRAM
+            # buffer in the tensor arena. Previously every engine strided into
+            # that one buffer, so N engines walked straight through the tensors
+            # that follow it -- guarded only by an assert. The arena's cursor is
+            # shared with the vision scratch allocated earlier in the run, so
+            # the two stages cannot be handed the same address.
+            _scr_addrs = [self.LAYER0_FLASH_SCRATCH_DRAM] + [
+                self.mc_arena.alloc_tensor(e, _attn_scr_stride, "prefill attn scratch")
+                for e in range(1, _n_eng)]
+            print(f"[prefill attn scratch] core0=0x{self.LAYER0_FLASH_SCRATCH_DRAM:X} "
+                  f"(tensor arena) workers="
+                  f"{', '.join(f'0x{a:X}' for a in _scr_addrs[1:])} "
+                  f"used=0x{_attn_scr_stride:X} engines={_n_eng}")
+            # Core 0's own buffer must still hold one engine's worth.
+            assert (self.LAYER0_FLASH_SCRATCH_DRAM + _attn_scr_stride
+                    <= self.LAYER0_ATTN_PROJ_OUTPUT_DRAM), (
+                f"prefill core0 attn scratch overruns FLASH_SCRATCH: "
+                f"0x{_attn_scr_stride:X} from 0x{self.LAYER0_FLASH_SCRATCH_DRAM:X} > "
                 f"next tensor 0x{self.LAYER0_ATTN_PROJ_OUTPUT_DRAM:X}")
             prefill_scheduler.register_per_engine_addrs(
-                "prefill_attn_scratch",
-                [self.LAYER0_FLASH_SCRATCH_DRAM + e * _attn_scr_stride
-                 for e in range(_n_eng)])
+                "prefill_attn_scratch", _scr_addrs)
 
         def _shard_projection_core(ctx, **kwargs) -> int:
             """Emit one fixed row shard through the two-pass matmatmul core."""
@@ -1228,6 +1351,15 @@ class Gemma4LMMixin:
         # bias-masked reads past seq_len see clean zeros, zero the attention
         # Q/K/V gather buffers, and re-upload the IDENTITY matrix (read by the
         # attention I @ V^T step). Idempotent for LM-only runs.
+        # EVERY buffer unified_attention_core reads is initialised here, over its
+        # WHOLE allocation, not just the part this prefill fills. The kernel
+        # always runs the 64-aligned length, so the rows/columns past the live
+        # sequence are multiplied on every call and only discarded afterwards by
+        # the -inf bias -- which needs them FINITE. Uninitialised padding is
+        # whatever the last run left (NaN under an 0xFF DRAM poison), and
+        # -inf + NaN is NaN, so one stale pad element takes out a whole softmax
+        # row. Each size below mirrors its allocate_tensor_dram() in tensor_init,
+        # in ELEMENTS (dma_to_accelerator_memory writes numel()*2 bytes).
         from user_dma_core import UE_VECTOR_SIZE as _UE_VS
         num_slots = getattr(self, "_num_kv_slots", self.LAYER_SIZE)
         kv_cache_bytes = getattr(
@@ -1237,18 +1369,47 @@ class Gemma4LMMixin:
             kv_cache_bytes // self.bytes_per_element, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, kv_zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, kv_zero_pad)
-        _pre_align = ((self.max_prefill_seq_len * self.group_size + 63) // 64) * 64
-        flash_qkv_elems = _pre_align * self.head_dim
-        _flash_zero = torch.zeros(flash_qkv_elems, dtype=torch.bfloat16)
+        # Same expression tensor_init sized the attention buffers with: prefill
+        # rows are seq*group_size, decode needs MAX_CONTEXT_SIZE KV rows, and
+        # the buffers take the larger. Deriving a prefill-only alignment here
+        # (the old _pre_align) matches only while max_prefill_seq_len*group_size
+        # >= MAX_CONTEXT_SIZE -- true today at 512*8 == 4096, and silently short
+        # the moment either constant moves.
+        _prefill_aligned = ((min(self.max_prefill_seq_len, self.MAX_CONTEXT_SIZE)
+                             * self.group_size + 63) // 64) * 64
+        _decode_aligned = ((self.MAX_CONTEXT_SIZE + 63) // 64) * 64
+        _attn_aligned = max(_prefill_aligned, _decode_aligned)
+        # Q / K / OUTPUT: [aligned, head_dim].  V: [activation_seq_len, head_dim].
+        _flash_zero = torch.zeros(_attn_aligned * self.head_dim, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, _flash_zero)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, _flash_zero)
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_OUTPUT_DRAM, _flash_zero)
         self.dma_to_accelerator_memory(
             self.LAYER0_FLASH_V_DRAM,
-            torch.zeros(self.max_prefill_seq_len * self.head_dim,
+            torch.zeros(max(self.max_prefill_seq_len, 1) * self.head_dim,
                         dtype=torch.bfloat16))
+        # Attention scratch: V.T [head_dim, aligned] + scores [aligned, aligned]
+        # + scaled_q [batch, head_dim]. The scores plane is the one that must be
+        # finite everywhere -- softmax reads the full aligned row.
+        self.dma_to_accelerator_memory(
+            self.LAYER0_FLASH_SCRATCH_DRAM,
+            torch.zeros(_attn_aligned * _attn_aligned
+                        + 2 * self.head_dim * _attn_aligned,
+                        dtype=torch.bfloat16))
+        # Both bias planes, full [aligned, aligned]. run_prefill overwrites the
+        # live square below and run_decoder rewrites its rows per token, but the
+        # region past the live length is only ever written here -- and it is
+        # exactly the region the kernel reads as padding.
+        _bias_zero = torch.full((_attn_aligned * _attn_aligned,), float("-inf"),
+                                dtype=torch.bfloat16)
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_FULL_DRAM, _bias_zero)
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, _bias_zero)
         self.dma_to_accelerator_memory(self.IDENTITY_DRAM_ADDR,
                                        torch.eye(_UE_VS, dtype=torch.bfloat16))
-        print(f"[Prefill] LM-state restored ({num_slots} KV slots zeroed, IDENTITY re-uploaded)")
+        print(f"[Prefill] flash-attention state initialised "
+              f"({num_slots} KV slots, Q/K/V/OUTPUT + scratch + both bias planes "
+              f"zeroed over the full {_attn_aligned}-row alignment, "
+              f"IDENTITY re-uploaded)")
 
         # Time host-side prep (embedding lookup, per-layer inputs, bias build,
         # DMAs) — reported only in the segmented-profile path's status line.
@@ -1376,11 +1537,78 @@ class Gemma4LMMixin:
             _pf_th.join(timeout=1.0)
         return latency, flop_rate_program
 
+    def start_decode_workers(self, scheduler, prog_addrs, aligned_seq_len: int) -> None:
+        """Launch the decode workers for one token. THE only way to start them.
+
+        Workers park on the master's first release, so they must already be running
+        before it gets there. They also need this token's V^T slice primed into their
+        runtime registers -- a worker entering with a stale row count transposes the
+        wrong rows, or hangs on a garbage one.
+
+        Run and profile both go through here so they cannot drift: the profile is then
+        simply core 0's HW counter over a program identical to the run's, and core 0
+        already absorbs the workers' time because it blocks at the join.
+        """
+        scheduler.start_workers(
+            prog_addrs,
+            gpr_sets_by_worker=self._decode_attn_worker_gpr_sets(
+                scheduler, aligned_seq_len))
+
+    def _decode_attn_worker_gpr_sets(self, scheduler, aligned_seq_len: int):
+        """Per-token (register, value) pairs for the M-sharded V transpose.
+
+        Splits the LIVE aligned KV length across the workers by input rows. The remainder
+        goes to the leading workers, so slices stay contiguous and together cover exactly
+        [0, aligned_seq_len) -- every V row is transposed exactly once, and no worker
+        writes a column another worker owns.
+
+        The row stride handed to every worker is the FULL aligned length, because each is
+        writing a column slice of one shared [head_dim, aligned_seq_len] V^T. Without that
+        each slice would compact at its own width and land in the wrong columns.
+        """
+        regs = getattr(self, "_decode_attn_worker_regs", [])
+        if len(regs) != len(scheduler.workers):
+            raise RuntimeError(
+                f"decode attention worker registers ({len(regs)}) do not match the "
+                f"{len(scheduler.workers)} worker engine(s); recompile the program image")
+        n = len(regs)
+        bpe = self.bytes_per_element
+        # Split in whole 64-ROW blocks. A V^T column offset is m_off*2 bytes and DRAM
+        # addresses are 8-byte words, so m_off must be a multiple of 4; 64 also keeps each
+        # slice on the transpose's own 64-column block boundary. aligned_seq_len is always
+        # a multiple of 64, so the blocks divide exactly.
+        blocks = aligned_seq_len // 64
+        if blocks >= n:
+            base, rem = divmod(blocks, n)
+            counts = [64 * (base + (1 if i < rem else 0)) for i in range(n)]
+        else:
+            # Fewer blocks than workers: give the first `blocks` one each and leave the
+            # rest EMPTY. They branch over the transpose (see the jz above) rather than
+            # being handed 0 rows, which hangs the core.
+            counts = [64 if i < blocks else 0 for i in range(n)]
+        offsets = [sum(counts[:i]) for i in range(n)]
+        assert sum(counts) == aligned_seq_len, (
+            f"V^T shards {counts} do not cover aligned_seq_len={aligned_seq_len}")
+        sets = []
+        for reg, m_off, m_cnt in zip(regs, offsets, counts):
+            sets.append([
+                (reg["row_off"], m_off),
+                (reg["out_off"], ue_35bit_addr_shifter(m_off * bpe)),
+                (reg["rows"], m_cnt),
+                (reg["stride"], aligned_seq_len * bpe),
+                (reg["aligned"], aligned_seq_len),
+            ])
+        return sets
+
     @staticmethod
     def _dynamic_attention_flops(batch: int, aligned_seq_len: int,
-                                 head_dim: int) -> int:
-        """Q scale + QK (bias + softmax) + PV at the live runtime shape."""
-        return (batch * head_dim
+                                 head_dim: int, *, q_pre_scaled: bool = False) -> int:
+        """Q scale + QK (bias + softmax) + PV at the live runtime shape.
+
+        ``q_pre_scaled`` drops the Q-scale term: the inlined multi-core chain does not
+        emit it, because gemma's attention scale is exactly 1.0 and the multiply is a
+        no-op."""
+        return ((0 if q_pre_scaled else batch * head_dim)
                 + batch * aligned_seq_len * (4 * head_dim + 6))
 
     def _decoder_flops_for_aligned_seq_len(self, aligned_seq_len: int) -> int:
@@ -1391,7 +1619,8 @@ class Gemma4LMMixin:
         attention = sum(
             self._dynamic_attention_flops(
                 self.group_size, aligned_seq_len,
-                self._get_layer_attention_dims(layer_idx)[0])
+                self._get_layer_attention_dims(layer_idx)[0],
+                q_pre_scaled=self.multi_core > 1)
             for layer_idx in range(self.LAYER_SIZE))
         return int(base + attention)
 
@@ -1461,6 +1690,91 @@ class Gemma4LMMixin:
             kwargs.pop("gpr_N_reg", None)
             kwargs.pop("is_B_quantized", None)
             return self.quantized_matmat_core(**kwargs)
+
+        # ---------------- decode multi-core: N-sharded Q projection ----------
+        # Decode is M=1, so there is no row axis to split; N (the output columns)
+        # is the only dimension with width. A column shard of an (N x K) row-major
+        # weight is a contiguous ROW BLOCK of it, and at M=1 the matching slice of
+        # the output is contiguous too, so each engine writes a disjoint piece of
+        # the same Q vector with no gather.
+        _dec_sched = getattr(self, "_active_decode_scheduler", None)
+        if _dec_sched is not None and self.decode_kernel != "streaming":
+            raise NotImplementedError(
+                f"multi-core decode sharding requires --decode-kernel streaming, "
+                f"got {self.decode_kernel!r}: the shard emits quantized_matmat_core "
+                f"directly on each engine")
+        _shards = (self._ensure_decode_qkv_shards(_dec_sched, layer_size)
+                   if _dec_sched is not None else {})
+        # M-SHARDED V TRANSPOSE. V^T is 75% of decode attention and scales linearly in the
+        # KV length, so it is split by INPUT ROWS across the workers while engine 0 runs
+        # Q@K^T concurrently (the two are independent; they meet only at P@V^T).
+        #
+        # Each worker transposes V[m_off : m_off+m_cnt, :] and writes the matching COLUMN
+        # slice of the shared V^T, so it needs four values that only exist at run time
+        # (the KV length grows every token): its input word address, its output word
+        # address, its row count, and the V^T row stride -- which is the FULL aligned
+        # length, not this worker's slice, or the slices would each compact into the wrong
+        # columns. They are primed once per token through start_workers' preamble and
+        # reused across all layers; the per-layer K/V base is added on top as a literal.
+        _attn_regs = []
+        if _dec_sched is not None:
+            for _w in _dec_sched.workers:
+                _attn_regs.append({
+                    "row_off": _w.alloc_isa_reg(),   # m_off, in ROWS
+                    "out_off": _w.alloc_isa_reg(),   # m_off * 2 bytes, in words
+                    "rows": _w.alloc_isa_reg(),      # m_cnt (this worker's slice)
+                    "stride": _w.alloc_isa_reg(),    # aligned_seq_len * 2 BYTES
+                    # P@V^T's runtime K, and the multiplier for its B row-block offset:
+                    # V^T rows are aligned_seq_len apart, NOT MAX_CONTEXT_SIZE apart, so a
+                    # column shard's B base must be derived from the LIVE length. Baking it
+                    # off the compile-time context size is what makes engines 1..N-1 read
+                    # uninitialised scratch.
+                    "aligned": _w.alloc_isa_reg(),   # aligned_seq_len, in ELEMENTS
+                })
+        self._decode_attn_worker_regs = _attn_regs
+
+        def _emit_shard(ue, sw, e: int, out_base: int, a_addr: int,
+                        gelu: bool = False) -> int:
+            """Emit engine ``e``'s column block of one projection.
+
+            B and the scales come from THIS engine's private arena; ``a_addr`` is
+            the shared input every engine reads in full (PRE_NORM for Q/K/V,
+            FLASH_OUTPUT for O), and only the output slice is per-engine.
+            """
+            sh = sw.shard(e)
+            out_off = sh.col_offset * self.bytes_per_element
+            # A shard is a whole multiple of UE_VECTOR_SIZE (64), so at bf16 the
+            # output offset is a whole 128-byte SRAM row. Asserted rather than
+            # assumed: a misaligned writeback base is finite-but-wrong data, not
+            # a fault.
+            assert out_off % 128 == 0, (
+                f"shard output offset {out_off} is not a whole 128 B SRAM row")
+            return ue.quantized_matmat_core(
+                M=1, K=sw.K, N=sh.cols,
+                A_DRAM_ADDR=a_addr,
+                B_DRAM_ADDR=sh.weight_addr,
+                OUTPUT_DRAM_ADDR=out_base + out_off,
+                SCALE_DRAM_ADDR=sh.scale_addr,
+                # gelu is elementwise on the output columns, so a column shard
+                # applies it to exactly its own block -- no cross-engine term.
+                gelu_enable=gelu,
+                data_type=TYPE.IF4) or 0
+
+        def _emit_worker_round(ops) -> None:
+            """Workers' side of one layer's round, then close it.
+
+            ``ops`` is [(ShardedWeight, out_base, a_addr, gelu)] for whatever
+            shards in this round. Called exactly once per round the master opened, and only
+            after the master has emitted its own blocks, so each engine's stream
+            reads: wait, work, signal, wait-for-close, re-arm.
+            """
+            for e in _dec_sched.worker_indices():
+                _dec_sched.begin_worker_round(e)
+                for sw, out_base, a_addr, gelu in ops:
+                    _emit_shard(_dec_sched.engines[e], sw, e, out_base, a_addr, gelu)
+                _dec_sched.end_worker_round(e)
+            _dec_sched.join()
+
         # gpr_one holds the constant 1 — used as gpr_M_reg for all M=1 ops.
         gpr_one = self.alloc_isa_reg()
         self.generate_instruction_add_set(gpr_one, 1)
@@ -1527,35 +1841,70 @@ class Gemma4LMMixin:
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=layer_input_addr,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
                               gpr_M_reg=gpr_one)
-                # Q/K/V projections: use per-layer dims
-                total_flops += _projection_core(M=1, K=self.vector_length, N=cur_q_size,
-                                                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
-                                                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
-                                                    OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                                                    data_type=TYPE.IF4,
-                                                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
-                                                    )
+                # Q/K/V projections: use per-layer dims.
+                # All three read PRE_NORM and write disjoint buffers, so whichever
+                # of them shard ride in ONE rendezvous for the layer -- no engine
+                # reads a column another engine is producing. An op that cannot
+                # split runs full-width on the master inside that same round.
+                _kv_own = layer_idx not in self._kv_shared_map
+                _q_sw = _shards.get(("q", layer_idx))
+                _k_sw = _shards.get(("k", layer_idx)) if _kv_own else None
+                _v_sw = _shards.get(("v", layer_idx)) if _kv_own else None
+                _round_ops = [(sw, out, self.LAYER0_PRE_NORM_DRAM, False) for sw, out in
+                              ((_q_sw, self.LAYER0_Q_DRAM),
+                               (_k_sw, self.LAYER0_K_DRAM),
+                               (_v_sw, self.LAYER0_FLASH_V_DRAM)) if sw is not None]
+                if _round_ops:
+                    _dec_sched.release()
+                if _q_sw is None:
+                    total_flops += _projection_core(M=1, K=self.vector_length, N=cur_q_size,
+                                                        A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                                                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
+                                                        OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                                                        data_type=TYPE.IF4,
+                                                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off,
+                                                        )
+                else:
+                    total_flops += _emit_shard(self, _q_sw, 0, self.LAYER0_Q_DRAM,
+                                               self.LAYER0_PRE_NORM_DRAM)
+                    total_flops += _dec_sched.worker_flops(_q_sw)
                 if layer_idx in self._kv_shared_map:
                     ref_layer = self._kv_shared_map[layer_idx]
                     kv_layer_for_attn = ref_layer  # read from reference layer's KV cache
+                    if _round_ops:            # Q-only round: close it here
+                        _emit_worker_round(_round_ops)
                 else:
                     kv_layer_for_attn = layer_idx  # read from own KV cache
                     # K projection
-                    total_flops += _projection_core(M=1, K=self.vector_length, N=cur_k_size,
-                        A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
-                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                        data_type=TYPE.IF4,
-                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
-                        )
+                    if _k_sw is None:
+                        total_flops += _projection_core(M=1, K=self.vector_length, N=cur_k_size,
+                            A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                            B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
+                            OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
+                            data_type=TYPE.IF4,
+                            SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
+                            )
+                    else:
+                        total_flops += _emit_shard(self, _k_sw, 0, self.LAYER0_K_DRAM,
+                                               self.LAYER0_PRE_NORM_DRAM)
+                        total_flops += _dec_sched.worker_flops(_k_sw)
                     # V projection
-                    total_flops += _projection_core(M=1, K=self.vector_length, N=cur_k_size,
-                        A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
-                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
-                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
-                        data_type=TYPE.IF4,
-                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
-                        )
+                    if _v_sw is None:
+                        total_flops += _projection_core(M=1, K=self.vector_length, N=cur_k_size,
+                            A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                            B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
+                            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
+                            data_type=TYPE.IF4,
+                            SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
+                            )
+                    else:
+                        total_flops += _emit_shard(self, _v_sw, 0, self.LAYER0_FLASH_V_DRAM,
+                                               self.LAYER0_PRE_NORM_DRAM)
+                        total_flops += _dec_sched.worker_flops(_v_sw)
+                    # Close the round BEFORE the V staging below: that reads the
+                    # whole V vector, including the columns the workers wrote.
+                    if _round_ops:
+                        _emit_worker_round(_round_ops)
                     self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_FLASH_V_DRAM, sram_address=0x10000, element_size=cur_k_size)
                     # V norm (Gemma4: normalize V without learnable scale)
                     self.rms_norm_core(0x10000, 0x10000, cur_k_size)  # no gamma
@@ -1657,35 +2006,197 @@ class Gemma4LMMixin:
                 # Multi-core will shard these group rows across engines
                 # (batch=shard_size per engine); this is the single-core (shard=
                 # group_size) case.
-                self.unified_attention_core(
-                    batch=self.group_size,
-                    aligned_seq_len=self.MAX_CONTEXT_SIZE,
-                    head_dim=cur_head_dim,
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=kv_k_base,
-                    V_DRAM_ADDR=kv_v_base,
-                    BIAS_DRAM_ADDR=bias_addr_layer,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                    gpr_batch_reg=gpr_group_size,
-                    gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
-                    q_scale=1.0,
-                )
+                if _dec_sched is None:
+                    self.unified_attention_core(
+                        batch=self.group_size,
+                        aligned_seq_len=self.MAX_CONTEXT_SIZE,
+                        head_dim=cur_head_dim,
+                        Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                        K_DRAM_ADDR=kv_k_base,
+                        V_DRAM_ADDR=kv_v_base,
+                        BIAS_DRAM_ADDR=bias_addr_layer,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                        SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                        IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                        gpr_batch_reg=gpr_group_size,
+                        gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                        q_scale=1.0,
+                    )
+                else:
+                    # Inlined unified_attention_core, same scratch carve it uses
+                    # internally: V^T first, then the score/probability matrix.
+                    _v_t_addr = self.LAYER0_FLASH_SCRATCH_DRAM
+                    _score_addr = (_v_t_addr + cur_head_dim * self.MAX_CONTEXT_SIZE
+                                   * self.bytes_per_element)
+                    _hd_reg = self.alloc_isa_reg()
+                    self.generate_instruction_add_set(_hd_reg, cur_head_dim)
+
+                    _dec_sched.release()
+                    # Engine 0: Q@K^T + bias + softmax. matmat B is [N,K], so B=K gives
+                    # Q@K^T. The BIAS is NOT sharded -- only engine 0 touches it.
+                    # Gemma's attention scale is exactly 1.0, so the Q pre-scale that
+                    # unified_attention_core would emit is a multiply by one; dropped.
+                    self.matmat_mul_core(
+                        M=self.group_size, K=cur_head_dim, N=self.MAX_CONTEXT_SIZE,
+                        A_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                        B_DRAM_ADDR=kv_k_base,
+                        OUTPUT_DRAM_ADDR=_score_addr,
+                        softmax_enable=True,
+                        C_DRAM_ADDR=bias_addr_layer, bias_mode="full_matrix",
+                        gpr_M_reg=gpr_group_size, gpr_K_reg=_hd_reg,
+                        gpr_N_reg=self.gpr_aligned_seq_len)
+
+                    # Workers: each transposes its row slice of V into the matching
+                    # column slice of the shared V^T. The IDENTITY matrix is read-only
+                    # and shared -- DRAM is flat, the per-engine BASE_ADDR only selects
+                    # control registers, so every engine reads the one copy.
+                    for _wi in _dec_sched.worker_indices():
+                        _dec_sched.begin_worker_round(_wi)
+                        _w = _dec_sched.engines[_wi]
+                        _rg = _attn_regs[_wi - 1]
+                        # SKIP when this worker has no rows this token. A short KV has
+                        # fewer 64-row blocks than there are workers, and the trailing
+                        # ones then get nothing -- but M=0 HANGS the transpose (its row
+                        # loop never terminates), so they must branch over it rather than
+                        # run it empty. They still execute the round's handshake, which is
+                        # what keeps the group in step.
+                        _jz_at = _w.capture_count
+                        _w.generate_instruction_jump_abs_jz(0, _rg["rows"])  # patched below
+                        _in = _w.alloc_isa_reg()
+                        _out = _w.alloc_isa_reg()
+                        # Input offset is m_off ROWS in, and a V row is cur_head_dim wide
+                        # -- 512 on full-attention layers, 256 on sliding ones -- so it
+                        # cannot be a per-token constant and is scaled here, per layer.
+                        _w.generate_instruction_reg_mul_imm(
+                            _in, _rg["row_off"],
+                            ue_35bit_addr_shifter(cur_head_dim * self.bytes_per_element))
+                        _w.generate_instruction_add_imm(
+                            src_reg_idx=_in,
+                            immediate_value=ue_35bit_addr_shifter(kv_v_base),
+                            dst_reg_idx=_in)
+                        _w.generate_instruction_add_imm(
+                            src_reg_idx=_rg["out_off"],
+                            immediate_value=ue_35bit_addr_shifter(_v_t_addr),
+                            dst_reg_idx=_out)
+                        _w.bf16_transpose_core(
+                            M=self.MAX_CONTEXT_SIZE, N=cur_head_dim,
+                            INPUT_DRAM_ADDR=kv_v_base, OUTPUT_DRAM_ADDR=_v_t_addr,
+                            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                            gpr_M_reg=_rg["rows"],
+                            gpr_input_addr=_in, gpr_out_addr=_out,
+                            gpr_out_row_stride_reg=_rg["stride"])
+                        _w.release_isa_reg()   # _out
+                        _w.release_isa_reg()   # _in
+                        # Land the skip on the instruction after the transpose. The
+                        # program base is already final here -- finalize() writes the
+                        # capture at exactly this get_program_dram_addr().
+                        _w._patch_jump_immediate(_jz_at, ue_35bit_addr_shifter(
+                            _w.get_program_dram_addr()
+                            + _w.capture_count * INSTRUCTION_SIZE_BYTES))
+                        _dec_sched.end_worker_round(_wi)
+                    _dec_sched.join()
+
+                    # Scores and V^T are both complete; P@V^T closes the chain, split
+                    # over its N (= cur_head_dim). B is V^T stored [cur_head_dim, aligned],
+                    # so an output column block is a contiguous ROW BLOCK of it. The OUTPUT
+                    # block is strided though -- M = group_size > 1 -- so each engine writes
+                    # IN PLACE at row stride cur_head_dim rather than into a private dense
+                    # buffer, which keeps the result interleaved with no gather.
+                    #
+                    # ITS OWN ROUND: it reads both the scores and the FINISHED V^T, so it
+                    # cannot ride in the transpose's round.
+                    #
+                    # cur_head_dim is 512 on full-attention layers and 256 on sliding ones,
+                    # so the block count -- and with it how many engines take part -- is
+                    # PER LAYER: 8 and 4 at multi_core=8. Engines past that emit nothing and
+                    # just run the handshake.
+                    _pv_op = mes.ColumnMatmatOp(
+                        a_addr=_score_addr, b_addr=_v_t_addr,
+                        out_addr=self.LAYER0_FLASH_OUTPUT_DRAM,
+                        M=self.group_size, N=cur_head_dim,
+                        K_max=self.MAX_CONTEXT_SIZE,
+                        max_engines=_dec_sched.num_engines,
+                        bytes_per_element=self.bytes_per_element)
+                    _pv_off0, _pv_cols0 = _dec_sched.column_matmat_shard(_pv_op, 0)
+                    assert _pv_off0 == 0, "engine 0 must own the first P@V^T column block"
+                    _dec_sched.release()
+                    _pv_n_reg = self.alloc_isa_reg()
+                    self.generate_instruction_add_set(_pv_n_reg, _pv_cols0)
+                    self.matmat_mul_core(
+                        M=self.group_size, K=self.MAX_CONTEXT_SIZE, N=_pv_cols0,
+                        A_DRAM_ADDR=_score_addr, B_DRAM_ADDR=_v_t_addr,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                        gpr_M_reg=gpr_group_size,
+                        gpr_K_reg=self.gpr_aligned_seq_len, gpr_N_reg=_pv_n_reg,
+                        gpr_out_row_stride_reg=_hd_reg)
+                    self.release_isa_reg()   # _pv_n_reg
+                    for _wi in _dec_sched.worker_indices():
+                        _dec_sched.begin_worker_round(_wi)
+                        _n_off, _cols = _dec_sched.column_matmat_shard(_pv_op, _wi)
+                        if _cols:
+                            _w = _dec_sched.engines[_wi]
+                            _rg = _attn_regs[_wi - 1]
+                            _pm = _w.alloc_isa_reg()
+                            _pn = _w.alloc_isa_reg()
+                            _ps = _w.alloc_isa_reg()
+                            _pb = _w.alloc_isa_reg()
+                            _w.generate_instruction_add_set(_pm, self.group_size)
+                            _w.generate_instruction_add_set(_pn, _cols)
+                            _w.generate_instruction_add_set(_ps, cur_head_dim)
+                            # B row block = v_t + n_off * aligned * bpe. The multiply is
+                            # folded into the immediate as a WORD count, the same trick the
+                            # batch-split bias offset uses: n_off*bpe is a multiple of 8
+                            # because n_off is a multiple of 64.
+                            _w.generate_instruction_reg_mul_imm(
+                                _pb, _rg["aligned"],
+                                ue_35bit_addr_shifter(_n_off * self.bytes_per_element))
+                            _w.generate_instruction_add_imm(
+                                src_reg_idx=_pb,
+                                immediate_value=ue_35bit_addr_shifter(_v_t_addr),
+                                dst_reg_idx=_pb)
+                            _w.matmat_mul_core(
+                                M=self.group_size, K=self.MAX_CONTEXT_SIZE, N=_cols,
+                                A_DRAM_ADDR=_score_addr, B_DRAM_ADDR=_v_t_addr,
+                                OUTPUT_DRAM_ADDR=(self.LAYER0_FLASH_OUTPUT_DRAM
+                                                  + _n_off * self.bytes_per_element),
+                                gpr_M_reg=_pm, gpr_K_reg=_rg["aligned"], gpr_N_reg=_pn,
+                                gpr_b_addr=_pb, gpr_out_row_stride_reg=_ps)
+                            _w.release_isa_reg()   # _pb
+                            _w.release_isa_reg()   # _ps
+                            _w.release_isa_reg()   # _pn
+                            _w.release_isa_reg()   # _pm
+                        _dec_sched.end_worker_round(_wi)
+                    _dec_sched.join()
+                    self.release_isa_reg()   # _hd_reg
                 live_attention_flops = self._dynamic_attention_flops(
-                    self.group_size, seq_len, cur_head_dim)
+                    self.group_size, seq_len, cur_head_dim,
+                    q_pre_scaled=_dec_sched is not None)
                 total_flops += live_attention_flops
                 decoder_attention_flops += live_attention_flops
                 _checkpoint(f"L{layer_idx}_attention")
 
-                # O projection: INT4, K=cur_q_size (actual per-layer attention output dim)
-                total_flops += _projection_core(M=1, K=cur_q_size, N=self.vector_length,
-                    A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                    data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
-                    )
+                # O projection: INT4, K=cur_q_size (actual per-layer attention output dim).
+                # ITS OWN ROUND, not the Q/K/V one: its K spans the whole of
+                # FLASH_OUTPUT, whose column blocks P@V^T spread across the engines, so
+                # the input only exists once that round has joined. N=1536 is 24 blocks
+                # of 64 -- 192 columns per engine at 8, an even split.
+                _o_sw = _shards.get(("o", layer_idx))
+                if _o_sw is None:
+                    total_flops += _projection_core(M=1, K=cur_q_size, N=self.vector_length,
+                        A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                        data_type=TYPE.IF4,
+                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
+                        )
+                else:
+                    _dec_sched.release()
+                    total_flops += _emit_shard(self, _o_sw, 0,
+                                               self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                                               self.LAYER0_FLASH_OUTPUT_DRAM)
+                    total_flops += _dec_sched.worker_flops(_o_sw)
+                    _emit_worker_round([(_o_sw, self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                                         self.LAYER0_FLASH_OUTPUT_DRAM, False)])
                 # Decode-only fused attention residual and FFN pre-normalization.
                 _vec_a = 0x10000
                 _vec_b = 0x90000
@@ -1718,36 +2229,73 @@ class Gemma4LMMixin:
 
                 _checkpoint(f"L{layer_idx}_o_proj")
 
-                total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
-                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
-                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                    data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
-                    gelu_enable=True,
-                    )
-                total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
-                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
-                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                    data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
-                    )
+                # MLP gate + up: ONE round. Both read PRE_MLP_NORM and write
+                # their own output, so an engine stays in its own lane across the
+                # pair and no barrier is needed between them.
+                _gate_sw = _shards.get(("gate", layer_idx))
+                _up_sw = _shards.get(("up", layer_idx))
+                _mlp_ops = [(sw, out, self.LAYER0_PRE_MLP_NORM_DRAM, gelu)
+                            for sw, out, gelu in
+                            ((_gate_sw, self.LAYER0_MLP_GATE_DRAM, True),
+                             (_up_sw, self.LAYER0_MLP_UP_DRAM, False))
+                            if sw is not None]
+                if _mlp_ops:
+                    _dec_sched.release()
+                if _gate_sw is None:
+                    total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
+                        A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
+                        data_type=TYPE.IF4,
+                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
+                        gelu_enable=True,
+                        )
+                else:
+                    total_flops += _emit_shard(self, _gate_sw, 0, self.LAYER0_MLP_GATE_DRAM,
+                                               self.LAYER0_PRE_MLP_NORM_DRAM, gelu=True)
+                    total_flops += _dec_sched.worker_flops(_gate_sw)
+                if _up_sw is None:
+                    total_flops += _projection_core(M=1, K=self.vector_length, N=cur_mlp,
+                        A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                        data_type=TYPE.IF4,
+                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
+                        )
+                else:
+                    total_flops += _emit_shard(self, _up_sw, 0, self.LAYER0_MLP_UP_DRAM,
+                                               self.LAYER0_PRE_MLP_NORM_DRAM)
+                    total_flops += _dec_sched.worker_flops(_up_sw)
+                # Close BEFORE the multiply: it reads both vectors whole.
+                if _mlp_ops:
+                    _emit_worker_round(_mlp_ops)
 
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=cur_mlp)
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=cur_mlp)
                 self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=cur_mlp)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=cur_mlp)
 
-                total_flops += _projection_core(M=1, K=cur_mlp, N=self.vector_length,
-                    A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
-                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                    is_B_quantized=True,
-                    data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
-                    gpr_M_reg=gpr_one,
-                    )
+                # MLP down: ITS OWN round. Its K spans the whole gate*up product,
+                # which only exists after the master's multiply above, so it cannot
+                # ride in the gate/up round.
+                _down_sw = _shards.get(("down", layer_idx))
+                if _down_sw is None:
+                    total_flops += _projection_core(M=1, K=cur_mlp, N=self.vector_length,
+                        A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
+                        B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                        is_B_quantized=True,
+                        data_type=TYPE.IF4,
+                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
+                        gpr_M_reg=gpr_one,
+                        )
+                else:
+                    _dec_sched.release()
+                    total_flops += _emit_shard(self, _down_sw, 0, self.LAYER0_MLP_DOWN_DRAM,
+                                               self.LAYER0_MLP_MULT_DRAM)
+                    total_flops += _dec_sched.worker_flops(_down_sw)
+                    _emit_worker_round([(_down_sw, self.LAYER0_MLP_DOWN_DRAM,
+                                         self.LAYER0_MLP_MULT_DRAM, False)])
                 # Decode-only fused MLP post-normalization + residual. Keep the
                 # normalized MLP-down vector in SRAM through the residual add,
                 # removing the post-MLP-norm DRAM write/read pair.
@@ -1816,14 +2364,28 @@ class Gemma4LMMixin:
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
                     OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA,
                     gpr_M_reg=gpr_one)
-                total_flops += _projection_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
-                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM,
-                    B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT,
-                    OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                    is_B_quantized=True,
-                    data_type=TYPE.IF4,
-                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE,
-                    )
+                # LM head: its own round, after the final norm has produced the
+                # input. Writeback stays ENABLED -- global_argmax() reads the
+                # candidate logits back, because each engine's argmax register
+                # reports an index into its OWN column block with no value to
+                # compare across engines.
+                _lm_sw = getattr(self, "_decode_lm_shard", None) if _dec_sched else None
+                if _lm_sw is None:
+                    total_flops += _projection_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+                        A_DRAM_ADDR=self.OUTPUT_NORM_DRAM,
+                        B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT,
+                        OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
+                        is_B_quantized=True,
+                        data_type=TYPE.IF4,
+                        SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE,
+                        )
+                else:
+                    _dec_sched.release()
+                    total_flops += _emit_shard(self, _lm_sw, 0, self.LOGITS_DRAM,
+                                               self.OUTPUT_NORM_DRAM)
+                    total_flops += _dec_sched.worker_flops(_lm_sw)
+                    _emit_worker_round([(_lm_sw, self.LOGITS_DRAM,
+                                         self.OUTPUT_NORM_DRAM, False)])
                 _checkpoint("lm_head")
 
             # Advance decode_pos for next token. The host's preamble only
@@ -1902,6 +2464,35 @@ class Gemma4LMMixin:
         # rely on the program's add_inc to advance it. A HALT-terminated
         # preamble (no program to run) just latches the register on the HW.
         self._dispatch_program([(self.gpr_seq_len, self.seq_len)], None, timeout=10.0)
+
+        # Multi-core decode: upload each worker's decode image and clear stale
+        # flags once. A worker's program covers one whole decode step and ends in
+        # HALT, so it is relaunched every step below, like the master's.
+        _dec_sched = self._ensure_lm_scheduler()
+        _dec_worker_addrs = []
+        if _dec_sched is not None:
+            for engine_idx, worker in enumerate(_dec_sched.workers, start=1):
+                w_meta, w_bytes = self._get_program_section(
+                    f"decode_worker{engine_idx}", False)
+                if w_meta is None:
+                    raise FileNotFoundError(
+                        f"decode_worker{engine_idx} section not found in the combined "
+                        f"programs bin; recompile the program image")
+                w_addr = int(w_meta["dram_base"], 16)
+                worker._next_program_dram_addr = w_addr
+                worker.dma_write(DMA_DEVICE_H2C, w_addr, w_bytes, len(w_bytes))
+                # ADVANCE PAST THE IMAGE. preclear_flags() below writes its tiny
+                # clear+halt program at each engine's CURRENT program cursor; left
+                # pointing at this image, the preclear lands on top of it. The
+                # worker would then run flag_clear+halt, exit immediately, and the
+                # master would wait forever at its first CHECK_SET.
+                worker.allocate_program_dram(len(w_bytes))
+                _dec_worker_addrs.append(w_addr)
+            # A run killed mid-rendezvous leaves flags raised; the first release
+            # would then sail through and read a half-written Q vector.
+            _dec_sched.preclear_flags()
+            print(f"[Decode] {_dec_sched.num_engines} engines, worker images at "
+                  f"{', '.join(f'0x{a:X}' for a in _dec_worker_addrs)}", flush=True)
         print("\n------------------------------ DECODE START ------------------------------\n", flush=True)
 
         # Live decode status bar (mirrors llama3.2_1b / gemma4_e4b): pin the bottom
@@ -1913,7 +2504,7 @@ class Gemma4LMMixin:
         import shutil
         _dec_start_seq = self.seq_len
         _dec_timer = time.perf_counter()
-        _first_tok_dt = None   # wall-clock of the 1st decoded token → peak tok/s
+        _first_tok_hw_us = None  # FPGA latency of the 1st decoded token → peak tok/s
         _decoded_n = 0         # number of decode steps (for average tok/s)
         _decoded_ids = []      # generated token ids (for the run-summary decoded text)
         _use_status = sys.stdout.isatty()
@@ -1974,6 +2565,11 @@ class Gemma4LMMixin:
                 sliding_bias_row[:, window_start:self.seq_len] = 0.0
             self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias_row)
 
+            if _dec_sched is not None:
+                # Workers first: each parks on the master's first release, so they
+                # must already be running before the master reaches it.
+                self.start_decode_workers(_dec_sched, _dec_worker_addrs,
+                                          aligned_seq_len)
             # Dynamic-PBI dispatch: re-set the attention length (K context grows
             # each step, may cross a 64-align boundary), then jump into the
             # cached decoder program. gpr_seq_len was primed once above and is
@@ -1981,16 +2577,40 @@ class Gemma4LMMixin:
             latency, flop_rate_program = self._dispatch_program(
                 [(self.gpr_aligned_seq_len, aligned_seq_len)],
                 prog_addr, timeout=300.0, flops=live_flops_per_token)
+            if _dec_sched is not None:
+                # DRAIN BEFORE THE NEXT TOKEN. _dispatch_program waits only for the
+                # MASTER to halt; a worker is at most a HALT behind, but nothing has
+                # waited for that HALT to retire. start_workers() on the next token
+                # would then be issued to a still-busy engine, which does not raise
+                # -- it desyncs the group. Prefill drains its workers the same way.
+                for _w in _dec_sched.workers:
+                    _w.wait_queue(300.0)
             total_latency += latency
             total_flop_rate += flop_rate_program
-            # HW argmax of the streaming LM-head logits.
-            token_id = self.get_arg_max_index()
+            # HW argmax of the streaming LM-head logits. When the head is
+            # sharded, each engine's register holds an index into ITS OWN column
+            # block and the hardware exposes no max VALUE, so the global winner is
+            # found by reading back the N candidate logits and comparing them --
+            # N tiny reads per token, not the 512 KB a full-logits readback costs.
+            _lm_sw = getattr(self, "_decode_lm_shard", None)
+            token_id = (_dec_sched.global_argmax(_lm_sw, self.LOGITS_DRAM)
+                        if _dec_sched is not None and _lm_sw is not None
+                        else self.get_arg_max_index())
             token_char = self.tokenizer.decode([token_id])
             self._set_silent(False)
 
             _tok_dt = time.perf_counter() - _tok_t0
-            if _first_tok_dt is None:
-                _first_tok_dt = _tok_dt                  # 1st token (shortest context) → peak
+            if _first_tok_hw_us is None:
+                # PEAK IS AN FPGA NUMBER. `latency` is this token's hardware
+                # execution counter in microseconds (report_latency_in_us via
+                # program_execute), so it excludes every host-side cost in this
+                # loop -- the embedding lookups, the two bias uploads, the worker
+                # preambles and drains, the argmax readback and the tokenizer.
+                # Those belong in the AVERAGE, which is wall-clock by design;
+                # putting them in the peak would report host overhead as though
+                # it were accelerator speed, and would make the number move with
+                # unrelated host work.
+                _first_tok_hw_us = latency
             _decoded_n += 1
 
             if token_id in [1, self._end_of_turn_token_id]:
@@ -2007,10 +2627,14 @@ class Gemma4LMMixin:
                 _status_teardown()
         # Decode-speed report (matches the Qwen comparison table format).
         _elapsed = time.perf_counter() - _dec_timer
-        _peak = (1.0 / _first_tok_dt) if _first_tok_dt else 0.0
+        # peak  = 1st token, FPGA hardware counter  (comparable with --profile's
+        #         "Decode HW throughput", which sums the same counter per segment)
+        # average = every token, host wall clock    (what a user actually waits)
+        _peak = (1e6 / _first_tok_hw_us) if _first_tok_hw_us else 0.0
         _avg = (_decoded_n / _elapsed) if _elapsed > 0 else 0.0
-        print(f"\nDecode speed: peak (1st token) {_peak:.2f} tok/s, "
-              f"average {_avg:.2f} tok/s  ({_decoded_n} tokens in {_elapsed:.2f}s)")
+        print(f"\nDecode speed: peak (1st token, HW) {_peak:.2f} tok/s, "
+              f"average (wall clock) {_avg:.2f} tok/s  "
+              f"({_decoded_n} tokens in {_elapsed:.2f}s)")
         # Stash decode metrics for the run-summary writer (write_run_summary).
         self._decode_peak_toks = _peak
         self._decode_avg_toks = _avg

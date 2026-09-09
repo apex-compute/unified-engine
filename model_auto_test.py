@@ -532,7 +532,7 @@ TESTS = [
     # qwen3.5_2b VLM: FPGA vision encoder (--vision-enable defaults to on-FPGA vision)
     # on yosemite.jpg; gemma4-style criteria (coherent decode + scene keywords).
     {"name": "qwen3.5_2b_vlm", "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",        "pass_check": _check_qwen_vlm, "extra_args": ["--vision-enable", "--vision-on-hardware"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe what you see in this image. (default)"},
-    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py", "pass_check": _check_qwen_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the image in detail. (default)"},
+    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py", "pass_check": _check_qwen_vlm, "extra_args": ["--image"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the picture in details. (default)", "no_device": True},
     # SmolVLM2 has a read-before-write defect and depends on clean, zero-filled
     # DRAM. Rather than special-casing it in the harness, SmolVLM2 is poisoned
     # before its run like every other model; smolvlm2_test.py zeroes DRAM itself

@@ -42,9 +42,43 @@ del() {
     done
 }
 
+# Git-tracked files are source, never build output: recursive deletion must
+# never touch them (models/*/*_config.json, models/verapulse/data/libero/
+# results_*.json, models/pi05/pi05_sample_meta.json ... are all committed).
+TRACKED="$(git ls-files 2>/dev/null)"
+
+# del_find <name-globs...> — recursive counterpart of del(): delete matching
+# files anywhere under the repo, not just at the root. Guarded, because a blind
+# recursive `*.json` would eat files that must survive a clean:
+#   * .git/, myvenv/ + venv/ + .venv/, .claude/, .vscode/, node_modules/ pruned;
+#   * every *_bin/ dir pruned — those per-model caches are handled by the
+#     explicit per-model rules below, which deliberately KEEP params.json and
+#     the downloaded HF snapshots (config.json / tokenizer.json / ...);
+#   * git-tracked files skipped (see $TRACKED above).
+del_find() {
+    if [[ -z "$TRACKED" ]]; then
+        echo "del_find: 'git ls-files' returned nothing (not a git checkout?) --" \
+             "skipping recursive delete of: $*" >&2
+        return 0
+    fi
+    local pat f rel
+    for pat in "$@"; do
+        while IFS= read -r -d '' f; do
+            rel="${f#./}"
+            grep -qxF -- "$rel" <<<"$TRACKED" && continue
+            del "$rel"
+        done < <(find . \
+                     \( -name .git -o -name myvenv -o -name venv -o -name .venv \
+                        -o -name .claude -o -name .vscode -o -name node_modules \
+                        -o -name '*_bin' \) -prune -o \
+                     -type f -name "$pat" -print0)
+    done
+}
+
 # # --- repo-root build artifacts ---------------------------------------------
 del user_dma_core                       # compiled C binary from `make all` (NOT user_dma_core.py)
-del *.mcs *.prm *.jou *.log *.json *.csv
+del *.mcs *.prm *.jou
+del_find '*.log' '*.json' '*.csv'   # repo-wide, see del_find guards above
 del mask_point.png
 del model_auto_test_results.txt
 del andromeda_IP-* andromeda_wrapper-*

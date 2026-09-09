@@ -50,7 +50,7 @@ from user_dma_core import UnifiedEngine
 from user_dma_core import ue_35bit_addr_shifter
 from user_dma_core import INSTRUCTION_SIZE_BYTES
 from user_dma_core import UE_MODE
-from multi_engine_shard import MultiEngineScheduler
+from multi_engine_shard import MultiEngineScheduler, PrivateArena
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -746,27 +746,36 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     bin, compiles prefill/decoder into one bin, runs prefill + decode. Numeric
     checks live in gemma4_e2b_numeric.py."""
 
-    def _ensure_stage_scheduler(self, stage: str, worker_dram_base: int):
-        """Return the shared two-engine scheduler configuration for one stage."""
+    def _ensure_stage_scheduler(self, stage: str):
+        """Return the shared scheduler for one stage, over the model-wide arena.
+
+        Every worker, at every engine count, executes from its own window in
+        ``self.mc_arena`` (upper 2 GB) — the old hand-rolled worker-ISA base and
+        stride are gone, and so is the 2-core special case that parked a worker
+        inside the lower-2 GB model map.
+
+        THE ARENA IS PASSED IN, NOT BUILT PER STAGE. Vision and prefill get
+        separate schedulers but must not get separate allocators: two allocators
+        over one address range hand out the same addresses twice, and stage 2's
+        worker programs land on stage 1's. Sharing the object keeps one cursor
+        per engine for the whole run.
+        """
         if self.multi_core == 1:
             return None
         scheduler = self._multi_core_schedulers.get(stage)
         if scheduler is None:
-            # Two-core keeps its single worker at the supplied stage address
-            # (huge stride; only the base is used). >2-core packs the extra
-            # workers into the dedicated MULTICORE_WORKER_ISA arena. Vision and
-            # prefill are sequential, so both stages reuse this worker-ISA arena.
-            worker_stride = 0x10000000
-            if self.multi_core > 2:
-                worker_dram_base = self.MULTICORE_WORKER_ISA_BASE
-                worker_stride = self.MULTICORE_WORKER_ISA_STRIDE
             scheduler = MultiEngineScheduler(
                 self, num_engines=self.multi_core,
                 engine_base_stride=0x00010000,
-                worker_dram_base=worker_dram_base,
-                worker_dram_stride=worker_stride,
-                worker_tensor_offset=0,
-                worker_program_offset=0,
+                arena=self.mc_arena,
+                # ASYMMETRIC RENDEZVOUS for the sharded regions (vision encoder
+                # and LM prefill). One four-phase round wraps each region instead
+                # of an all-to-all barrier at entry and again at exit: O(N) checks
+                # on the master and one per worker rather than O(N^2), half the
+                # rendezvous, and no NOP timing margin -- every flag edge is
+                # acknowledged, so it does not degrade as engines are added. Same
+                # region API, same bodies; only the synchronisation changes.
+                region_rendezvous="master_worker",
                 barrier_margin_nops=32,
                 allow_unaligned_rows=True,
                 allow_more_than_two_engines=self.multi_core > 2)
@@ -808,49 +817,55 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._multi_core_schedulers = {}
         self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
-        # Gemma4 DRAM layout. SINGLE-CORE keeps the original upper-2 GB window
-        # (matching the Llama-3.2-1B path); its 16 MiB ISA region is tight but
-        # sufficient for one engine. MULTI-CORE re-bases to 0x0 with the full
-        # 4 GB budget so the per-engine worker programs (incl. sharded vision
-        # RoPE) and future parallelism add-ons have room, and so the vision
-        # tensor arena is large enough for N-engine scratch.
+        # Gemma4 DRAM layout. ONE model map, used at EVERY engine count: the
+        # original upper-2 GB window, unchanged from the single-core path. Adding
+        # engines does not move a single model address.
         #
-        # SINGLE-CORE (upper 2 GB):
+        # MODEL MAP, upper 2 GB (all engine counts):
         #   PARAMS  weights   : 0x80000000 – 0xE1000000  (1552 MiB)
         #   TENSOR  acts/scr  : 0xE1000000 – 0xFF000000  (480 MiB, LM<->vision)
-        #   ISA vision core0  : 0xFF000000 – 0xFF400000  (4 MiB)
-        #   ISA vision core1  : 0xFF400000 – 0xFF620000  (2.125 MiB, unused 1-core)
-        #   ISA LM            : 0xFF620000 – 0x100000000 (9.875 MiB)
+        #   ISA vision core0  : 0xFF000000 – 0xFF400000  (4 MiB, master)
+        #   ISA reserved      : 0xFF400000 – 0xFF620000  (2.125 MiB)
+        #   ISA LM            : 0xFF620000 – 0x100000000 (9.875 MiB, master)
+        # Vision and LM programs remain resident at disjoint addresses. Only
+        # MASTER programs live here now -- workers moved out (below).
         #
-        # MULTI-CORE (full 4 GB, base 0x0):
-        #   PARAMS  weights   : 0x00000000 – 0x80000000  (2 GiB;  LM ~1540 MB)
-        #   TENSOR  acts/scr  : 0x80000000 – 0xC0000000  (1 GiB;  LM + vision,
-        #                        incl. up-to-12-engine vision scratch + top wts)
-        #   ISA vision core0  : 0xC0000000 – 0xC8000000  (128 MiB, master)
-        #   ISA vision core1  : 0xC8000000 – 0xE0000000  (384 MiB, 2-core worker)
-        #   ISA LM            : 0xE0000000 – 0xF0000000  (256 MiB)
-        #   ISA >2-core workrs: 0xF0000000 – 0x100000000 (256 MiB, 16 MiB/worker)
-        # Vision and LM programs remain resident at disjoint addresses.
+        # MULTI-CORE PRIVATE SPACE, the whole lower 2 GB — empty at 1 core. It is
+        # NOT hand-partitioned: it goes to multi_engine_shard.PrivateArena, which
+        # splits it into one window per engine, each laid out
+        # [ weights | ISA | tensor ] with the two fixed slices at the TOP:
+        #   8 engines  -> 256 MiB/window: 224 MiB weights + 16 MiB ISA + 16 MiB tensor
+        #   12 engines -> 160 MiB/window: 128 MiB weights + 16 MiB ISA + 16 MiB tensor
+        # The ISA slice holds that engine's worker program (~1.7 MB today); the
+        # tensor slice holds everything an engine must not share -- vision attn
+        # scratch (13.12 MiB) and prefill attn scratch (1.50 MiB) both come out
+        # of it. The weight arena is unused so far and is what decoder weight
+        # sharding will draw on.
+        #
+        # WHY BELOW THE MODEL MAP AND NOT ABOVE IT. The model map begins at
+        # DRAM_START_ADDR (0x80000000) and every model address is allocated
+        # upwards from there, so nothing the model owns can ever reach below it.
+        # A private window carved from the low 2 GB therefore cannot alias model
+        # memory however the model's cursors move -- which is the whole point,
+        # and is the same arrangement gemma3 uses.
+        #
+        # ONE arena object serves the whole run (self.mc_arena): the model
+        # allocates scratch from it during tensor init, and every stage's
+        # MultiEngineScheduler is handed the SAME object, so there is exactly one
+        # cursor per engine rather than one per scheduler.
+        # Window 0 belongs to core 0, which keeps its own tensor-arena buffers;
+        # its window stays reserved so engine index == window index everywhere.
         self.DRAM_END = 0x100000000
-        if self.multi_core == 1:
-            _params_base  = 0x80000000
-            _tensor_base  = 0xE1000000
-            self.VISION_ISA_BASE             = 0xFF000000
-            self.VISION_WORKER_ISA_BASE      = 0xFF400000
-            self.LM_ISA_BASE                 = 0xFF620000
-            self.MULTICORE_WORKER_ISA_BASE   = 0xFC000000    # unused (1-core)
-            self.MULTICORE_WORKER_ISA_STRIDE = 0x00240000    # unused (1-core)
-        else:
-            _params_base  = 0x00000000
-            _tensor_base  = 0x80000000
-            self.VISION_ISA_BASE             = 0xC0000000
-            self.VISION_WORKER_ISA_BASE      = 0xC8000000
-            self.LM_ISA_BASE                 = 0xE0000000
-            self.MULTICORE_WORKER_ISA_BASE   = 0xF0000000    # >2-core worker arena
-            # Eleven 16-MiB slots support 12 engines and occupy 176 MiB of the
-            # 256-MiB worker arena. Current worker images are below 2 MiB; the
-            # per-section overflow checks below enforce the slot boundary.
-            self.MULTICORE_WORKER_ISA_STRIDE = 0x01000000    # 16 MiB / worker
+        _params_base  = 0x80000000
+        _tensor_base  = 0xE1000000
+        self.VISION_ISA_BASE             = 0xFF000000
+        self.VISION_WORKER_ISA_BASE      = 0xFF400000
+        self.LM_ISA_BASE                 = 0xFF620000
+        # Per-engine private windows: the whole low 2 GB, split by the library.
+        # Uniform at EVERY engine count -- vision and prefill are sequential and
+        # share one arena, so engine i always owns the same window in both.
+        self.mc_arena = (PrivateArena(multi_core, verbose=True)
+                         if multi_core > 1 else None)
         # Top of the vision tensor arena (vision weights are top-placed against
         # it; scratch stays below). In the multi-core layout every worker ISA
         # lives in the dedicated ISA region, so the tensor arena simply runs up
@@ -1208,6 +1223,13 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             prefill_size_bytes = (self.capture_count - prefill_count_at_start) * INSTRUCTION_SIZE_BYTES
             prefill_worker_addrs = (prefill_scheduler.finalize()
                                     if prefill_scheduler is not None else [])
+            # SNAPSHOT NOW, not at store time. The same worker engines are
+            # re-captured for decode below, and begin_program() clears their
+            # capture buffers -- reading worker.capture_buffer after that point
+            # would store the DECODE image under the prefill section's name.
+            self._prefill_worker_images = [
+                b"".join(inst.get_bytes() for inst in w.capture_buffer)
+                for w in prefill_scheduler.workers] if prefill_scheduler is not None else []
             self._active_prefill_scheduler = None
             if prefill_scheduler is not None:
                 for worker in reversed(prefill_scheduler.workers):
@@ -1218,9 +1240,21 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             decoder_count_at_start = self.capture_count
             decoder_accounting_seq_len = (
                 (len(self.prefill_seq) + 63) // 64) * 64
+            # Decode reuses the SAME scheduler as prefill (see
+            # _ensure_lm_scheduler); reopening the capture appends decode's worker
+            # programs after prefill's, so both stay resident.
+            if prefill_scheduler is not None:
+                prefill_scheduler.begin_program()
+                self._active_decode_scheduler = prefill_scheduler
             _, decoder_program_sizes, decoder_total_flops = self.compile_decoder(
                 layer_size=layer_size, profile=profile,
                 accounting_seq_len=decoder_accounting_seq_len)
+            decoder_worker_addrs = (prefill_scheduler.finalize()
+                                    if prefill_scheduler is not None else [])
+            self._decode_worker_images = [
+                b"".join(inst.get_bytes() for inst in w.capture_buffer)
+                for w in prefill_scheduler.workers] if prefill_scheduler is not None else []
+            self._active_decode_scheduler = None
             decoder_program_addr = instruction_base_addr + decoder_count_at_start * INSTRUCTION_SIZE_BYTES
             decoder_size_bytes = decoder_program_sizes[0]
 
@@ -1252,6 +1286,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "prefill_kernel": self.prefill_kernel,
             "multi_core": self.multi_core,
             "decode_kernel": self.decode_kernel,
+            # Register indices the M-sharded V^T workers read their per-token slice from.
+            # Allocated during compile; a run that only LOADS the image would otherwise
+            # have no idea which registers its preamble must prime.
+            "decoder_attn_worker_regs": getattr(
+                self, "_decode_attn_worker_regs", []),
         }
         if profile:
             lm_meta["prefill_profile_checkpoints"] = self._prefill_checkpoints
@@ -1259,23 +1298,29 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # Merge the LM section into the combined programs bin (vision stays intact).
         self._store_program_section("lm", instruction_base_addr, image_bytes, lm_meta, profile=profile)
         if prefill_scheduler is not None:
-            for engine_idx, (worker, worker_addr) in enumerate(
-                    zip(prefill_scheduler.workers, prefill_worker_addrs), start=1):
-                worker_bytes = bytearray()
-                for inst in worker.capture_buffer:
-                    worker_bytes.extend(inst.get_bytes())
-                worker_limit = (worker_addr + self.MULTICORE_WORKER_ISA_STRIDE
-                                if self.multi_core > 2 else self.LM_ISA_BASE)
-                if worker_addr + len(worker_bytes) > worker_limit:
-                    raise RuntimeError(
-                        f"prefill core{engine_idx} ISA overflow: "
-                        f"0x{worker_addr + len(worker_bytes):X} > 0x{worker_limit:X}")
+            for engine_idx, worker_addr in enumerate(prefill_worker_addrs, start=1):
+                worker_bytes = self._prefill_worker_images[engine_idx - 1]
+                # The arena owns the bound: this engine's ISA slice, whose
+                # neighbour above is its own tensor scratch and then the next
+                # engine's window. An overrun would not fault, so it is checked
+                # where the image is written.
+                self.mc_arena.check_isa_fits(engine_idx, worker_addr, len(worker_bytes))
                 self._store_program_section(
                     f"prefill_worker{engine_idx}", worker_addr, worker_bytes,
                     {"parent": "lm", "engine_idx": engine_idx,
                      "multi_core": self.multi_core,
                      "prefill_seq_len": prefill_flops_seq_len,
                      "prefill_kernel": self.prefill_kernel}, profile=profile)
+            # Decode workers: their own image per engine, at addresses following
+            # the prefill ones in the same ISA slice.
+            for engine_idx, worker_addr in enumerate(decoder_worker_addrs, start=1):
+                worker_bytes = self._decode_worker_images[engine_idx - 1]
+                self.mc_arena.check_isa_fits(engine_idx, worker_addr, len(worker_bytes))
+                self._store_program_section(
+                    f"decode_worker{engine_idx}", worker_addr, worker_bytes,
+                    {"parent": "lm", "engine_idx": engine_idx,
+                     "multi_core": self.multi_core,
+                     "decode_kernel": self.decode_kernel}, profile=profile)
 
         print(f"[compile] stored LM section ({len(image_bytes)/1024:.1f} KB @ 0x{instruction_base_addr:X}); "
               f"prefill @ 0x{prefill_program_addr:X} ({prefill_size_bytes/1024:.1f} KB), "
@@ -1300,6 +1345,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         if "decoder_non_attention_flops" in meta:
             self._decoder_non_attention_flops = int(
                 meta["decoder_non_attention_flops"])
+        self._decode_attn_worker_regs = [
+            {k: int(vv) for k, vv in r.items()}
+            for r in meta.get("decoder_attn_worker_regs", [])]
         self._preamble_addr = self.get_program_dram_addr()
         print(f"[run] loaded LM section at 0x{base_addr:X} ({meta['prefill_program_size']/1024:.1f} + "
               f"{meta['decoder_program_size']/1024:.1f} KB); dispatch preamble @ 0x{self._preamble_addr:X}")
@@ -1476,7 +1524,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         lines.append(f"- **Decoded tokens:** {gen_n if gen_n is not None else 'n/a'} generated "
                      f"(sequence total {total_tok})")
         if peak_toks is not None:
-            lines.append(f"- **First-token speed (peak):** {peak_toks:.1f} tok/s")
+            lines.append(f"- **First-token speed (peak, HW counter):** {peak_toks:.1f} tok/s")
         if avg_gflops is not None:
             lines.append(f"- **Average FLOPS:** {avg_gflops:.1f} GFLOPS")
             lines.append(f"- **Decode utilization (% peak):** {_util(avg_gflops)}")
@@ -1623,7 +1671,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
 
     def _profile_execute(self, gpr_sets: list[tuple[int, int]], target_addr: int,
                          checkpoints: list, tail_name: str, timeout: float = 120.0,
-                         worker_scheduler=None, worker_addrs=None) -> list:
+                         worker_scheduler=None, worker_addrs=None,
+                         worker_launch=None) -> list:
         """Run checkpointed segments, returning ``(name, ms, FLOPs)`` samples.
         A preamble at self._preamble_addr primes each
         (reg, value) in ``gpr_sets`` then jumps into ``target_addr``; each
@@ -1653,7 +1702,14 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             # run_prefill() already preclears every engine after loading the
             # worker programs.  Do not preclear again here: that redundant
             # core-0 program corrupts the first segmented latency sample.
-            worker_scheduler.start_workers(worker_addrs or [])
+            # ``worker_launch`` lets the caller start the workers exactly as its run
+            # path does (decode needs this token's V^T slice primed). Everything after
+            # is unchanged: the sample is core 0's HW counter, which already contains
+            # the wait for the workers because core 0 blocks at the join.
+            if worker_launch is not None:
+                worker_launch()
+            else:
+                worker_scheduler.start_workers(worker_addrs or [])
         self.start_execute_from_dram(self._preamble_addr)
         for checkpoint in checkpoints:
             name, resume_hex, *extra = checkpoint
@@ -1665,6 +1721,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self.start_execute_from_dram(int(resume_hex, 16))
         self.wait_queue(timeout)   # tail segment: everything up to the terminal HALT
         tail_ms = self.report_latency_in_us() / 1e3
+        if worker_scheduler is not None:
+            # The master halting does not mean a worker has retired its own HALT;
+            # relaunching a still-busy engine desyncs the group (see run_decoder).
+            for _w in worker_scheduler.workers:
+                _w.wait_queue(timeout)
         if results:
             # The terminal segment is a coverage boundary, not a useful report
             # row. Fold prefill's HALT into inject and decode's position
@@ -1678,14 +1739,20 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         return results
 
     def _decode_profile_execute(self, decoder_addr: int, aligned_seq_len: int,
-                                checkpoints: list, timeout: float = 120.0) -> list:
+                                checkpoints: list, timeout: float = 120.0,
+                                worker_scheduler=None, worker_addrs=None) -> list:
         """One decode step through the profile-bin's HALT checkpoints. Preamble
         primes gpr_seq_len (=decode_pos) / gpr_aligned_seq_len; the tail segment
         is the add_inc(gpr_seq_len) + terminal HALT."""
         results = self._profile_execute(
             [(self.gpr_seq_len, self.seq_len - 1),
              (self.gpr_aligned_seq_len, aligned_seq_len)],
-            decoder_addr, checkpoints, tail_name="tail_addinc", timeout=timeout)
+            decoder_addr, checkpoints, tail_name="tail_addinc", timeout=timeout,
+            worker_scheduler=worker_scheduler, worker_addrs=worker_addrs,
+            worker_launch=(
+                (lambda: self.start_decode_workers(
+                    worker_scheduler, worker_addrs or [], aligned_seq_len))
+                if worker_scheduler is not None else None))
         # The decoder program is captured with MAX_CONTEXT_SIZE as its template
         # aligned length, so compile-time attention FLOPs describe that maximum.
         # Replace only attention FLOPs with the exact live-length formula used by
@@ -1698,7 +1765,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 layer_idx = int(match.group(1))
                 head_dim, _, _ = self._get_layer_attention_dims(layer_idx)
                 batch = self.group_size
-                flops = (batch * head_dim
+                # The inlined multi-core chain drops the Q pre-scale (gemma's attention
+                # scale is exactly 1.0, so it was a multiply by one); single-core still
+                # emits it via unified_attention_core.
+                flops = ((0 if self.multi_core > 1 else batch * head_dim)
                          + batch * aligned_seq_len * (4 * head_dim + 6))
             adjusted.append((name, ms, flops))
         return adjusted
@@ -1801,6 +1871,29 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._prefill_profile_results = prefill_results
         self._print_phase_breakdown("PREFILL", prefill_results, per_token=False)
 
+        # Multi-core decode: upload the workers' decode images from the PROFILE
+        # bin. A master checkpoint HALT lands while the workers sit in the next
+        # round's entry FLAG_CHECK -- the ordinary steady state whenever the
+        # master is slow -- so segmenting the master does not disturb the
+        # rendezvous, and each segment measures its round's fork-to-join time.
+        _dec_sched = self._ensure_lm_scheduler()
+        _dec_worker_addrs = []
+        if _dec_sched is not None:
+            for engine_idx, worker in enumerate(_dec_sched.workers, start=1):
+                w_meta, w_bytes = self._get_program_section(
+                    f"decode_worker{engine_idx}", True)
+                if w_meta is None:
+                    raise FileNotFoundError(
+                        f"decode_worker{engine_idx} section not found in the profile "
+                        f"programs bin; recompile with --profile")
+                w_addr = int(w_meta["dram_base"], 16)
+                worker._next_program_dram_addr = w_addr
+                worker.dma_write(DMA_DEVICE_H2C, w_addr, w_bytes, len(w_bytes))
+                worker.allocate_program_dram(len(w_bytes))   # see run_decoder
+                _dec_worker_addrs.append(w_addr)
+            print(f"[profile] decode workers loaded at "
+                  f"{', '.join(f'0x{a:X}' for a in _dec_worker_addrs)}")
+
         # Host prep for a decode position (mirrors run_decoder's per-step work).
         token_id = self.prefill_seq[-1]
         self.dma_to_accelerator_memory(
@@ -1836,7 +1929,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         print(f"\n--- Profiling first decode step (pos {first_context_len - 1}) ---",
               flush=True)
         decode_results = self._decode_profile_execute(
-            decoder_program_addr, aligned_seq_len, decoder_checkpoints)
+            decoder_program_addr, aligned_seq_len, decoder_checkpoints,
+            worker_scheduler=_dec_sched, worker_addrs=_dec_worker_addrs)
         self._decode_profile_results = decode_results
         self._print_phase_breakdown("DECODE (first step)", decode_results, per_token=True)
 
@@ -1848,7 +1942,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         print(f"\n--- Profiling 1024th token (pos {target_context_len - 1}) ---",
               flush=True)
         decode_1024_results = self._decode_profile_execute(
-            decoder_program_addr, aligned_seq_len, decoder_checkpoints)
+            decoder_program_addr, aligned_seq_len, decoder_checkpoints,
+            worker_scheduler=_dec_sched, worker_addrs=_dec_worker_addrs)
         self._decode_1024_profile_results = decode_1024_results
         self._print_phase_breakdown(
             "DECODE (1024th token)", decode_1024_results, per_token=True)
@@ -1891,6 +1986,32 @@ def add_engine_args(parser) -> None:
                              "Multicore prefill always uses matmatmul.")
     parser.add_argument("--dev", type=str, default="xdma0",
                         help="DMA device name (e.g., xdma0, xdma1, efinix). Default: xdma0")
+    parser.add_argument("--dram-poison", type=str, default=None, metavar="SPEC[,SPEC...]",
+                        help="Pre-run DRAM fill (default: zero -- the whole device is "
+                             "zeroed before the model is built, silently). WORKAROUND, not "
+                             "a fix: "
+                             "the LM path reads something in the params region that it "
+                             "never initialises, and a zero fill makes that read 0.0 "
+                             "instead of whatever the last run left. Each SPEC is 'ff' or "
+                             "'zero', optionally limited to a hex byte range as "
+                             "'ff:START:END'; passes apply in order. Override for debug: "
+                             "'ff' makes an uninitialised read NaN, 'off' skips the write "
+                             "entirely, and a comma-separated list isolates one region -- "
+                             "e.g. --dram-poison zero,ff:0x0:0x80000000 reproduces the "
+                             "failure by poisoning params alone.")
+    parser.add_argument("--dram-poison-isa", choices=("ff", "zero"), default=None,
+                        help="Second pass over the program/ISA region only "
+                             "[VISION_ISA_BASE..end of DRAM), applied AFTER the model is "
+                             "constructed. Combine with --dram-poison to give ISA a "
+                             "different fill from the rest: '--dram-poison ff "
+                             "--dram-poison-isa zero' leaves NaN everywhere except ISA, "
+                             "so a run that then decodes correctly proves the residual "
+                             "being consumed lives in ISA space.")
+    parser.add_argument("--dram-poison-range", type=str, default=None, metavar="START:END",
+                        help="Restrict --dram-poison to one hex byte range, e.g. "
+                             "0xC0000000:0x100000000. Use it to find which region a run "
+                             "reads without initialising: poison one arena at a time, then "
+                             "halve whichever range reproduces the failure.")
     parser.add_argument("--bin-reuse", action="store_true",
                         help="Reuse a matching cached program image (programs.bin) if it "
                              "exists instead of recompiling. Default: OFF (fresh compile "
@@ -2050,6 +2171,87 @@ def run_summary_filename(args) -> str:
     return "gemma4_e2b_test_" + "_".join(str(t) for t in tokens) + suffix + ".md"
 
 
+def poison_dram(pattern: str = "ff", dram_range: str | None = None,
+                ue=None, quiet: bool = False,
+                chunk_bytes: int = 64 * 1024 * 1024) -> None:
+    """Fill the board's whole DRAM before the model allocates anything. DEBUG AID.
+
+    ``pattern``:
+      ``ff``   every byte 0xFF, i.e. every bf16 element NaN. A region this run
+               fails to initialise turns whatever consumes it into NaN, which
+               propagates -- loud, and impossible to mistake for a real result.
+      ``zero`` every byte 0x00. Same coverage test, benign values: a region the
+               run fails to initialise reads as 0.0 instead of NaN. Run both and
+               compare -- a model that decodes under ``zero`` but not under
+               ``ff`` is reading something it never wrote, and the difference
+               between the two runs is what localises it.
+
+    ``dram_range`` ("START:END", hex) restricts the fill to one region instead
+    of the whole device -- the tool for finding WHICH region a run reads without
+    initialising. Poison one arena at a time and see which one reproduces the
+    failure; then halve that range and repeat. The map at multi-core is
+    params [0, 0x80000000), tensor [0x80000000, 0xC0000000), program/ISA
+    [0xC0000000, 0x100000000); single-core is params [0x80000000, 0xE1000000),
+    tensor [0xE1000000, 0xFF000000), ISA [0xFF000000, 0x100000000).
+
+    Size comes from HW_INFO (AVAILABLE_DRAM_SIZE_GB), so this is board-agnostic
+    like the rest of resolve_engine_config; it must run AFTER that call and
+    BEFORE Gemma4_UnifiedEngine() allocates or uploads anything.
+    """
+    gb = user_dma_core.AVAILABLE_DRAM_SIZE_GB
+    if not gb:
+        # Always reported: this one is a real failure to establish known state,
+        # not routine progress.
+        print("[poison] HW_INFO reports no DRAM size; skipping DRAM poison")
+        return
+    dram_end = gb * 1024 ** 3
+    start, end = 0, dram_end
+    if dram_range:
+        try:
+            _s, _e = dram_range.split(":")
+            start, end = int(_s, 0), int(_e, 0)
+        except ValueError:
+            raise SystemExit(f"--dram-poison-range: expected START:END, got {dram_range!r}")
+        if not (0 <= start < end <= dram_end):
+            raise SystemExit(
+                f"--dram-poison-range 0x{start:X}:0x{end:X} is outside "
+                f"[0x0..0x{dram_end:X}]")
+    total_bytes = end - start
+    # ``ue``: reuse the caller's engine when the model is already loaded. A bare
+    # UnifiedEngine() runs init_unified_engine()'s 16 KB DRAM self-test at the
+    # HARDCODED DRAM_START_ADDR, which in the single-core map is the params base
+    # -- i.e. it would shred the first 16 KB of layer-0 weights on a second pass.
+    if ue is None:
+        ue = UnifiedEngine()      # bare engine: opens the device, self-tests
+    bpe = 2
+    # 0xFF: int16 -1 viewed as bf16 gives the 0xFFFF bit pattern. bf16 has no
+    # value spelling for it (a literal NaN packs as 0x7FC0) and dma_write ships
+    # bf16 bits verbatim.
+    fill_word = -1 if pattern == "ff" else 0
+    t0 = time.perf_counter()
+    offset = 0
+    while offset < total_bytes:
+        take = min(chunk_bytes, total_bytes - offset) // bpe
+        data = torch.full((take,), fill_word, dtype=torch.int16).view(torch.bfloat16)
+        # user_dma_core.DMA_DEVICE_H2C, not the name imported at module scope:
+        # resolve_engine_config refreshes that name only on modules called
+        # gemma4_e2b_*, and this file is __main__ when run directly, so its own
+        # copy still points at the default device after --dev selects another.
+        wrote = ue.dma_write(user_dma_core.DMA_DEVICE_H2C, start + offset,
+                             data, take * bpe)
+        if wrote != take * bpe:
+            raise RuntimeError(
+                f"DRAM poison: dma_write wrote {wrote} of {take * bpe} bytes "
+                f"at 0x{start + offset:X}")
+        offset += take * bpe
+    if not quiet:
+        print(f"[poison] wrote 0x{'FF' if pattern == 'ff' else '00'} over "
+              f"{total_bytes / 1024**2:.0f} MiB of DRAM "
+              f"[0x{start:08X}..0x{end - 1:08X}] in {time.perf_counter()-t0:.1f}s",
+              flush=True)
+    del ue
+
+
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -2065,17 +2267,71 @@ def main():
     _summary_name = run_summary_filename(args)
     engine_kwargs = resolve_engine_config(parser, args)
 
+    # Reset every engine this run will use, BEFORE anything else touches the
+    # hardware -- this is the first point at which a reset can issue, since
+    # resolve_engine_config() is what selects the DMA device and reads HW_INFO.
+    # software_reset() is PER-CORE, so a run that died mid-rendezvous leaves
+    # cores 1..N-1 spin-waiting on a FLAG_CHECK (which has no timeout) and the
+    # next process inherits engines that never accept a program. Clearing them
+    # here means the DRAM poison pass, the bandwidth benchmark and the model
+    # itself all start from idle cores.
+    from user_hw_test import software_reset_test
+    print(f"\n--- Software-resetting {args.multi_core} core(s) ---")
+    software_reset_test(cores=args.multi_core)
+
+    # Poison DRAM before the model (or the DRAM benchmark) writes anything, so
+    # an uninitialised read downstream is NaN rather than an earlier run's data.
+    # No --dram-poison given: zero the device silently. It is a workaround for a
+    # read of un-established params state, not something the user asked for, so
+    # it does not narrate itself. An EXPLICIT --dram-poison is a debug request
+    # and does report, including "--dram-poison zero".
+    _poison = args.dram_poison if args.dram_poison is not None else "zero"
+    _poison_quiet = args.dram_poison is None
+    if _poison != "off":
+        for _spec in _poison.split(","):
+            _spec = _spec.strip()
+            if not _spec:
+                continue
+            _pat, _, _rng = _spec.partition(":")
+            if _pat not in ("ff", "zero"):
+                parser.error(f"--dram-poison: bad pattern {_pat!r} in {_spec!r} "
+                             f"(expected ff or zero)")
+            if not _poison_quiet:
+                print(f"\n--- Poisoning DRAM with 0x{'FF' if _pat == 'ff' else '00'}"
+                      f"{' over ' + _rng if _rng else ''} ---")
+            poison_dram(_pat, _rng or args.dram_poison_range,
+                        quiet=_poison_quiet)
+
     # Measure aggregate accelerator-side DRAM reads before model allocation.
-    # The same flag-synchronized benchmark supports one engine and the exact
-    # engine count selected by --multi-core. Keep private-region mode aligned
-    # with the benchmark's default; user_hw_test.py separately exercises its
-    # shared-address stress variant.
-    from user_hw_test import matmat_mul_multi_engine_flag_check_test
-    print(f"\n--- Measuring {args.multi_core}-core aggregate DRAM read speed ---")
-    dram_read_speed_mbps = matmat_mul_multi_engine_flag_check_test(
-        M=4096, K=4096, N=4096, num_engines=args.multi_core)
+    # Each engine reads its OWN private buffer, barrier-synced so the reads
+    # overlap. That is the number that matters for this model: the sharded
+    # decoder gives every engine a private copy of its Q weight block precisely
+    # so the weight streams do not contend, and this benchmark measures the same
+    # access pattern. Runs before the model is built, so the low-DRAM buffers it
+    # allocates are long gone by the time the private arena is used.
+    # Skipped on a single engine: the benchmark is a barrier-synced overlap of
+    # per-engine reads, so with nobody to overlap with the whole program is four
+    # instructions and engine 0's latency counter reads back 0 -- which is a
+    # divide-by-zero in multi_core_dram_speed_test, not a measurement. The .md
+    # writers already treat a missing speed as "omit the line".
+    dram_read_speed_mbps = None
+    if args.multi_core > 1:
+        from user_hw_test import multi_core_dram_speed_test
+        print(f"\n--- Measuring {args.multi_core}-core aggregate DRAM read speed ---")
+        dram_read_speed_mbps = multi_core_dram_speed_test(
+            num_engines=args.multi_core)
 
     ue = Gemma4_UnifiedEngine(**engine_kwargs)
+
+    # ISA-only second pass. After construction so ue.VISION_ISA_BASE is known
+    # (it depends on the engine count), and before compile/program load, which
+    # are the only things that write this region.
+    if args.dram_poison_isa:
+        _isa_top = (user_dma_core.AVAILABLE_DRAM_SIZE_GB or 4) * 1024 ** 3
+        print(f"\n--- Re-poisoning ISA region with "
+              f"0x{'FF' if args.dram_poison_isa == 'ff' else '00'} ---")
+        poison_dram(args.dram_poison_isa,
+                    f"0x{ue.VISION_ISA_BASE:X}:0x{_isa_top:X}", ue=ue)
     ue._dram_read_speed_mbps = dram_read_speed_mbps
 
     # Prompt first — the prefill program is compiled for its exact length.

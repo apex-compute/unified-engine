@@ -1,135 +1,133 @@
 # Gemma4 E2B performance
 
-## Alveo U55C scaling
-
-Measured on Alveo U55C (`xdma0`, HW version `0x68f0c76c`) at 300 MHz using
-the current single-core and 2/4/8/10/12-core image-run summaries.
-
-| Metric | 1 core | 2 cores | 4 cores | 8 cores | 10 cores | 12 cores |
-|---|---:|---:|---:|---:|---:|---:|
-| Peak throughput (GFLOPS) | 38.4 | 76.8 | 153.6 | 307.2 | 384.0 | 460.8 |
-| DRAM read speed (MB/s) | 8,288.7 | 8,953.0 | 14,414.1 | 25,483.9 | 31,793.0 | 38,250.6 |
-| Vision throughput (GFLOPS) | 32.3 | 60.8 | 115.0 | 187.6 | 199.2 | 248.7 |
-| Vision utilization (% peak) | 84.0% | 79.2% | 74.9% | 61.1% | 51.9% | 54.0% |
-| Vision FPGA execution (s) | 35.6 | 18.9 | 10.0 | 6.1 | 5.8 | 4.6 |
-| Prefill throughput (GFLOPS) | 33.6 | 67.8 | 125.1 | 217.7 | 203.7 | 218.8 |
-| Prefill utilization (% peak) | 87.6% | 88.3% | 81.5% | 70.9% | 53.1% | 47.5% |
-| Prefill FPGA execution (s) | 31.5 | 15.6 | 8.5 | 4.9 | 5.2 | 4.8 |
-| Decode first-token speed (tok/s) | 5.6 | 5.8 | 5.8 | 5.8 | 5.5 | 5.5 |
-| Decode average speed (tok/s, CPU timer) | 5.3 | 5.5 | 5.5 | 5.4 | 5.2 | 5.2 |
+All numbers below are Alveo, `--dev xdma0`, HW version `0x6e7aca2e`, 2.7 ns
+(366.7 MHz). Peak throughput is `366.7 MHz × 128 × cores`: **46.9 GFLOPS** at one
+core, **375.5 GFLOPS** at eight.
 
 ## Test setup
 
-All implementations used `test_samples/yosemite.jpg`, the prompt
-`Describe this image in detail.`, the same `params.bin`, IF4 projection
-weights, 35 LM layers, 16 vision layers, and 256 image soft tokens.
-
-Commands:
+`test_samples/yosemite.jpg`, the prompt `Describe this image in detail.`, the same
+`params.bin` (7078.6 MB on disk, 1544.4 MB of quantized weights on the FPGA), IF4
+projection weights, 35 LM layers, 16 vision layers, 256 image soft tokens.
 
 ```bash
-python models/gemma4_e2b/gemma4_e2b_test.py --device rk_256 --dev xdma0 --image
-
-python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image
-python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --multi-core 2
 python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image
-python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core 2
-python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core 4
 python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core 8
 
-python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --profile
-python models/gemma4_e2b/gemma4_e2b_test.py --device kintex7 --dev xdma1 --image --multi-core --profile
+python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --profile
+python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image --multi-core 8 --profile
 ```
 
 ## Performance comparison
-> `--device alveo` with HW version `0x68f0c76c`
-> `--dev xdma1` (kintex7) with HW version `0x6ee171b8`
-> `--device rk_256` with HW version `0x3d04c689`
 
-| Metric | Kintex | Kintex 2-core | rk_256 | Alveo | Alveo 2-core | Alveo 4-core | Alveo 8-core |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Peak throughput (GFLOPS) | 25.4 | 50.8 | 42.7 | 46.9 | 93.9 | 187.7 | 375.5 |
-| DRAM read speed (MB/s) | 5875.9 | 6980.4 | 9272.2 | **10484.2** | **11176.7** | **15094.1** | **22918.3** |
+| Metric | 1 core | 8 cores | Speedup |
+|---|---:|---:|---:|
+| Peak throughput (GFLOPS) | 46.9 | 375.5 | 8.00× |
+| DRAM read speed (MB/s) | 10,802.2 | **86,128.9** | 7.97× |
 | **Vision** |
-| Vision soft tokens | 256 | 256 | 256 | 256 | 256 | 256 | 256 |
-| Vision throughput (GFLOPS) | 21.4 | 41.4 | 35.9 | **39.5** | **74.9** | **142.2** | **232.2** |
-| — utilization (% peak) | 84.2% | 81.6% | 84.0% | **84.1%** | **79.8%** | **75.7%** | **61.9%** |
-| Vision FPGA execution (s)| 53.8 | 27.7 | 32.1 | **29.1** | **15.3** | **8.1** | **4.9** |
-| Vision end-to-end (CPU)(s) | 53.8 | 27.8 | 32.1 | **29.2** | **15.4** | **8.2** | **5.1** |
+| Vision soft tokens | 256 | 256 | |
+| Vision throughput (GFLOPS) | 39.5 | **242.8** | 6.15× |
+| — utilization (% peak) | 84.1% | 64.7% | |
+| Vision FPGA execution (s) | 29.1 | **4.7** | 6.15× |
+| Vision end-to-end (CPU) (s) | 29.2 | **4.8** | 6.08× |
 | **LM PREFILL** |
-| LM prefill seq length | 272 | 272 | 272 | 272 | 272 | 272 | 272 |
-| LM prefill throughput (GFLOPS) | 24.1 | 45.1 | 37.8 | **42.5** | **82.3** | **152.7** | **263.4** |
-| — utilization (% peak) | 94.9% | 88.9% | 88.5% | **90.5%** | **87.7%** | **81.3%** | **70.2%** |
-| Prefill FPGA execution (s)| 44.0 | 23.5 | 28.0 | **24.9** | **12.9** | **6.9** | **4.0** |
-| Prefill end-to-end (CPU)(s) | 44.1 | 23.6 | 28.1 | **25.0** | **13.0** | **7.1** | **4.3** |
+| LM prefill seq length | 272 | 272 | |
+| LM prefill throughput (GFLOPS) | 42.5 | **265.2** | 6.24× |
+| — utilization (% peak) | 90.5% | 70.6% | |
+| Prefill FPGA execution (s) | 24.9 | **4.0** | 6.24× |
+| Prefill end-to-end (CPU) (s) | 25.0 | **4.2** | 5.95× |
 | **LM DECODE** |
-| Decode 1-st tok throughput (tok/s)| 4.0 | 3.9 | 6.2 | **6.8** | **6.7** | **6.6** | **6.8** |
-| Decode average throughput (GFLOPS) | 18.3 | 18.2 | 28.9 | **32.3** | **32.2** | **32.2** | **32.2** |
-| — utilization (% peak) | 71.9% | 35.8% | 67.7% | **68.8%** | **34.3%** | **17.1%** | **8.6%** |
-| Decode end-to-end (CPU)(s) | 104.0 | 115.9 | 66.3 | **60.3** | **67.3** | **67.1** | **67.5** |
-| Decode average throughput (CPU)(tok/s)| 3.7 | 3.7 | 5.8 | **6.4** | **6.3** | **6.4** | **6.3** |
+| Decode 1st-token speed (tok/s, HW counter) | 7.2 | **31.1** | 4.32× |
+| Decode average throughput (GFLOPS) | 32.3 | **138.1** | 4.28× |
+| — utilization (% peak) | 68.8% | 36.8% | |
+| Decode average speed (CPU timer) (tok/s) | 6.5 | **24.2** | 3.72× |
+| Decode end-to-end (CPU) (s) † | 58.8 | 18.4 | |
 | **ARTIFACT** |
-| Vision program section (MiB) | 3.2 | 2.4 | 3.2 | 3.2 | 2.4 | 1.9 | 1.8 |
-| Prefill program section (MiB)| 5.8 | 4.8 | 5.8 | 5.8 | 4.8 | 4.1 | 3.7 |
-| Decode program section (MiB)| 1.4 | 1.4 | 1.4 | 1.4 | 1.4 | 1.4 | 1.4 |
-| Combined program image (MiB)| 10.5 | 13.7 | 10.5 | 10.5 | 13.7 | 19.2 | 30.4 |
-| Weight image (`params.bin`) (GiB) | 6.9 | same | same | same | same | same | same |
-| Correctness | coherent, total 656 | coherent, total 699 | coherent, total 656 | coherent, total 656 | coherent, total 699 | coherent, total 699 | coherent, total 699 |
+| Vision program section (MB) | 3.2 | 1.6 | |
+| Prefill program (KB) | 5989.2 | 3593.9 | |
+| Decoder program (KB) | 1456.5 | 1076.7 | |
+| Combined program image (MB) | 10.5 | 28.1 | |
+| Weight image (`params.bin`) (MB) | 7078.6 | same | |
+| Correctness | coherent, total 656 | coherent, total 716 | |
 
-## Profile backup: vision encoder (kintex7)
+† Not a like-for-like ratio: the two runs generated different token counts (384 vs
+444), so compare the tok/s rows instead.
 
-Vision multi-core segments tile cleanly (they sum to the single-shot master total).
+## Profile: vision encoder
 
-| Phase | Work (GFLOPs) | Samples | Single-core | | | `--multi-core 2` | | |
+| Phase | Work (GFLOPs) | Samples | 1 core | | | 8 cores | | |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| | | | FPGA execution time (ms) | Throughput (GFLOPS) | Utilization (% peak) | FPGA execution time (ms) | Throughput (GFLOPS) | Utilization (% peak) |
-| patch_embed | 2.97 | 1 | 123.6 | 24.1 | 94.8% | 123.6 | 24.1 | 47.4% |
-| proj † | 147.15 | 16 | 6,682.5 | 22.0 | 86.7% | 3,361.0 | 43.8 | 86.2% |
-| rope † | 8.24 | 16 | 1,072.9 | 7.7 | 30.2% | 738.2 | 11.2 | 22.0% |
-| permute | 0.00 | 16 | 269.6 | 0.0 | 0.0% | 269.6 | 0.0 | 0.0% |
-| attention † | 329.70 | 16 | 16,642.3 | 19.8 | 78.0% | 8,636.4 | 38.2 | 75.2% |
-| post_attn † | 659.51 | 16 | 28,912.0 | 22.8 | 89.9% | 14,539.7 | 45.4 | 89.3% |
-| pooler_tail | 1.51 | 1 | 75.3 | 20.1 | 79.0% | 75.3 | 20.1 | 39.5% |
-| **TOTAL** | **1149.1** | | **53,778.1** | **21.4** | **84.2%** | **27,743.7** | **41.4** | **81.6%** |
+| | | | FPGA (ms) | GFLOPS | % peak | FPGA (ms) | GFLOPS | % peak |
+| patch_embed | 2.97 | 1 | 66.8 | 44.5 | 94.8% | 66.8 | 44.5 | 11.9% |
+| proj † | 147.15 | 16 | 3,610.0 | 40.8 | 86.9% | 473.7 | 310.6 | 82.7% |
+| rope † | 8.24 | 16 | 575.1 | 14.3 | 30.5% | 249.8 | 33.0 | 8.8% |
+| permute | 0.00 | 16 | 183.1 | 0.0 | 0.0% | 183.1 | 0.0 | 0.0% |
+| attention † | 329.70 | 16 | 9,052.0 | 36.4 | 77.6% | 1,664.4 | 198.1 | 52.8% |
+| post_attn † | 659.51 | 16 | 15,591.2 | 42.3 | 90.1% | 2,057.6 | 320.5 | 85.4% |
+| pooler_tail | 1.51 | 1 | 40.7 | 37.1 | 79.1% | 40.7 | 37.1 | 9.9% |
+| **TOTAL** | **1149.1** | | **29,119.0** | **39.5** | **84.1%** | **4,736.2** | **242.6** | **64.6%** |
 
-† Multicore implemented: `proj` and `post_attn` are row-sharded, `rope` is row-sharded, and `attention` is head-sharded across the two engines. `patch_embed`, `permute`, and `pooler_tail` run on core 0 only.
+† Sharded: `proj`, `post_attn` and `rope` are row-sharded, `attention` is
+head-sharded. `patch_embed`, `permute` and `pooler_tail` run on core 0 only — their
+times are identical in both columns, and their 8-core `% peak` is scored against the
+full 375.5 GFLOPS, which is why it collapses.
 
-## Profile backup: LM prefill (kintex7)
+## Profile: LM prefill
 
-| Phase | Work (GFLOPs) | Samples | Single-core | | | `--multi-core 2` | | |
+| Phase | Work (GFLOPs) | Samples | 1 core | | | 8 cores | | |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| | | | FPGA execution time (ms) | Throughput (GFLOPS) | Utilization (% peak) | FPGA execution time (ms) | Throughput (GFLOPS) | Utilization (% peak) |
-| per_layer_prepare | 14.11 | 1 | 595.9 | 23.7 | 93.3% | 595.9 | 23.7 | 93.3% |
-| qkv_vproj † | 79.73 | 35 | 3,302.6 | 24.1 | 95.1% | 1,693.6 | 47.1 | 92.7% |
-| rope | 0.08 | 35 | 162.6 | 0.5 | 1.9% | 162.4 | 0.5 | 1.0% |
-| q_permute | 0.00 | 35 | 75.2 | 0.0 | 0.0% | 75.2 | 0.0 | 0.0% |
-| attention † | 30.12 | 35 | 1,697.2 | 17.7 | 69.9% | 906.5 | 33.2 | 65.4% |
-| mlp † | 919.50 | 35 | 37,426.7 | 24.6 | 96.8% | 19,333.1 | 47.6 | 93.7% |
-| inject | 15.07 | 35 | 694.2 | 21.7 | 85.5% | 694.2 | 21.7 | 42.8% |
-| **TOTAL** | **1058.6** | | **43,954.4** | **24.1** | **94.9%** | **23,460.9** | **45.1** | **88.9%** |
+| | | | FPGA (ms) | GFLOPS | % peak | FPGA (ms) | GFLOPS | % peak |
+| per_layer_prepare | 14.11 | 1 | 322.6 | 43.7 | 93.2% | 322.6 | 43.7 | 93.2% |
+| qkv_vproj † | 79.73 | 35 | 1,876.8 | 42.5 | 90.5% | 247.9 | 321.6 | 85.7% |
+| rope | 0.08 | 35 | 91.8 | 0.9 | 1.8% | 91.8 | 0.9 | 0.2% |
+| q_permute | 0.00 | 35 | 43.9 | 0.0 | 0.0% | 43.9 | 0.0 | 0.0% |
+| attention † | 30.12 | 35 | 920.8 | 32.7 | 69.7% | 171.7 | 175.4 | 46.7% |
+| mlp † | 919.50 | 35 | 21,280.6 | 43.2 | 92.1% | 2,739.4 | 335.7 | 89.4% |
+| inject | 15.07 | 35 | 376.8 | 40.0 | 85.2% | 376.8 | 40.0 | 10.7% |
+| **TOTAL** | **1058.6** | | **24,913.3** | **42.5** | **90.5%** | **3,994.2** | **265.0** | **70.6%** |
 
-† Multicore implemented: `qkv_vproj`, `attention`, and `mlp` are sharded across the two engines. `per_layer_prepare`, `rope`, `q_permute`, and `inject` run on core 0 only.
+† Sharded: `qkv_vproj`, `attention` and `mlp`. `per_layer_prepare`, `rope`,
+`q_permute` and `inject` run on core 0 only.
 
-## Profile backup: decode tokens (kintex7; no multicore use case)
+## Profile: LM decode
 
-| Phase | Samples | First decode step (position 272) | | | | 1024th token (position 1023) | | | |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| | | Work (GFLOPs) | FPGA execution time (ms) | Throughput (GFLOPS) | Utilization (% peak) | Work (GFLOPs) | FPGA execution time (ms) | Throughput (GFLOPS) | Utilization (% peak) |
-| per_layer_prepare | 1 | 0.03 | 5.6 | 5.0 | 19.6% | 0.03 | 5.6 | 5.0 | 19.6% |
-| qkv_vproj | 35 | 0.29 | 13.2 | 22.3 | 87.7% | 0.29 | 13.2 | 22.3 | 87.7% |
-| rope | 35 | 0.00 | 1.0 | 0.6 | 2.4% | 0.00 | 1.0 | 0.6 | 2.4% |
-| attention | 35 | 0.11 | 30.6 | 3.6 | 14.3% | 0.35 | 92.5 | 3.8 | 15.1% |
-| o_proj | 35 | 0.26 | 11.8 | 22.5 | 88.6% | 0.26 | 11.8 | 22.5 | 88.5% |
-| mlp | 35 | 3.12 | 135.8 | 22.9 | 90.4% | 3.12 | 135.8 | 22.9 | 90.4% |
-| inject | 35 | 0.06 | 12.6 | 4.4 | 17.3% | 0.06 | 12.6 | 4.4 | 17.3% |
-| lm_head | 1 | 0.81 | 34.8 | 23.1 | 91.1% | 0.81 | 34.8 | 23.1 | 91.1% |
-| **TOTAL** | | **4.7** | **245.3** | **19.1** | **75.0%** | **4.9** | **307.2** | **16.0** | **63.0%** |
+### First decode step (position 272)
 
-### Ideal attention prediction (100% peak throughput)
-
-All non-attention phase latencies remain measured values. Predicted attention latency is `attention work / 25.4 GFLOPS`.
-
-| Phase | First decode step (position 272) | | | | 1024th token (position 1023) | | | |
+| Phase | Work (GFLOPs) | Samples | 1 core | | | 8 cores | | |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| | Work (GFLOPs) | FPGA execution time (ms) | Throughput (GFLOPS) | Utilization (% peak) | Work (GFLOPs) | FPGA execution time (ms) | Throughput (GFLOPS) | Utilization (% peak) |
-| attention | 0.11 | 4.4 | 25.4 | 100.0% | 0.35 | 13.9 | 25.4 | 100.0% |
-| **TOTAL** | **4.7** | **219.1** | **21.3** | **84.0%** | **4.9** | **228.6** | **21.5** | **84.7%** |
+| | | | FPGA (ms) | GFLOPS | % peak | FPGA (ms) | GFLOPS | % peak |
+| per_layer_prepare | 0.03 | 1 | 3.1 | 8.8 | 18.8% | 3.1 | 8.8 | 18.8% |
+| qkv_vproj † | 0.29 | 35 | 7.5 | 38.9 | 82.9% | 1.7 | 175.0 | 46.6% |
+| rope | 0.00 | 35 | 0.6 | 1.1 | 2.2% | 0.6 | 1.1 | 0.3% |
+| attention † | 0.11 | 35 | 16.6 | 6.7 | 14.2% | 5.7 | 19.4 | 5.2% |
+| o_proj † | 0.26 | 35 | 6.7 | 39.5 | 84.1% | 1.2 | 229.4 | 61.1% |
+| mlp † | 3.12 | 35 | 77.6 | 40.2 | 85.6% | 10.7 | 292.1 | 77.8% |
+| inject | 0.06 | 35 | 7.1 | 7.8 | 16.6% | 7.1 | 7.8 | 2.1% |
+| lm_head † | 0.81 | 1 | 19.9 | 40.5 | 86.4% | 2.5 | 322.6 | 85.9% |
+| **TOTAL** | **4.7** | | **139.0** | **33.6** | **71.6%** | **32.5** | **143.7** | **38.3%** |
+
+### 1024th token (position 1023)
+
+| Phase | Work (GFLOPs) | Samples | 1 core | | | 8 cores | | |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| | | | FPGA (ms) | GFLOPS | % peak | FPGA (ms) | GFLOPS | % peak |
+| per_layer_prepare | 0.03 | 1 | 3.1 | 8.8 | 18.8% | 3.1 | 8.8 | 18.8% |
+| qkv_vproj † | 0.29 | 35 | 7.5 | 38.9 | 83.0% | 1.7 | 174.6 | 46.5% |
+| rope | 0.00 | 35 | 0.6 | 1.1 | 2.3% | 0.6 | 1.1 | 0.3% |
+| attention † | 0.35 | 35 | 50.2 | 7.1 | 15.0% | 13.3 | 26.6 | 7.1% |
+| o_proj † | 0.26 | 35 | 6.7 | 39.5 | 84.2% | 1.2 | 229.7 | 61.2% |
+| mlp † | 3.12 | 35 | 77.6 | 40.2 | 85.6% | 10.7 | 292.0 | 77.8% |
+| inject | 0.06 | 35 | 7.1 | 7.8 | 16.6% | 7.1 | 7.8 | 2.1% |
+| lm_head † | 0.81 | 1 | 19.9 | 40.5 | 86.4% | 2.5 | 322.7 | 85.9% |
+| **TOTAL** | **4.9** | | **172.6** | **28.5** | **60.7%** | **40.1** | **122.4** | **32.6%** |
+
+† Sharded: `qkv_vproj`, `o_proj`, `mlp` and `lm_head` are column-sharded weights.
+`attention` is partly sharded — its V transpose is split over the workers by input
+rows and P@V^T over its output columns, but Q@K^T stays whole on core 0 (softmax is
+a row reduction over exactly the axis an N-shard would split). `per_layer_prepare`,
+`rope` and `inject` run on core 0 only.
+
+Amdahl, at the 1024th token: the three unsharded phases total 10.8 ms either way,
+which is 6% of the 1-core step (172.6 ms) but 27% of the 8-core one (40.1 ms) --
+`inject` alone is 7.1 ms of it. The largest single phase in the 8-core run is
+`attention` at 13.3 ms, ahead of `mlp` at 10.7, because only part of it is split.
