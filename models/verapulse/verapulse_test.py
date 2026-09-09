@@ -3075,22 +3075,46 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         """
         if getattr(self, "_vis_per_engine_done", None) is sched:
             return sched
-        V = self._cfg["vision"]
-        S, H, D, bpe = V["num_patches"], V["hidden_size"], V["head_dim"], 2
-        sched.register_per_engine("vis_zeros", self.vis_zeros_addr, H * bpe,
-                                  init_tensor=torch.zeros(H, dtype=torch.bfloat16))
-        zeros_d = torch.zeros(S * D, dtype=torch.bfloat16)
-        for name, addr in (("flash_q", self.VIS_FLASH_Q_DRAM),
-                           ("flash_k", self.VIS_FLASH_K_DRAM),
-                           ("flash_v", self.VIS_FLASH_V_DRAM),
-                           ("flash_out", self.VIS_FLASH_OUT_DRAM)):
-            sched.register_per_engine(name, addr, S * D * bpe, init_tensor=zeros_d)
-        scratch_n = (D + S) * S + S * D
-        sched.register_per_engine(
-            "attn_scratch", self.VIS_ATTN_SCRATCH_DRAM, scratch_n * bpe,
-            init_tensor=torch.zeros(scratch_n, dtype=torch.bfloat16))
+        for name, addr, init in self._vis_per_engine_specs():
+            sched.register_per_engine(name, addr, init.numel() * 2, init_tensor=init)
         self._vis_per_engine_done = sched
         return sched
+
+    def _vis_per_engine_specs(self):
+        """(name, primary_addr, init_tensor) for every vision per-engine buffer.
+
+        ONE table, TWO consumers, and that is the point. The compile path feeds it to
+        register_per_engine, which allocates each worker's copy AND uploads the zeros.
+        The bin path cannot: load_programs replays compile-time addresses through
+        register_per_engine_addrs, which only RECORDS them (multi_engine_shard.py:1238)
+        -- it has no init_tensor argument and uploads nothing. vis_zeros is READ as a
+        zeros OPERAND at ne>1 (see the per_engine_addr pick in _emit_encoder_body), so
+        without a re-upload every worker reads whatever DRAM residue sits at its arena
+        address. That is invisible in a compiling run and intermittent in a bin-backed
+        one, which is exactly the ne=8 policy-server behaviour this table exists to
+        stop. Keep the two paths reading the same source or they WILL drift again."""
+        V = self._cfg["vision"]
+        S, H, D = V["num_patches"], V["hidden_size"], V["head_dim"]
+        zeros_d = torch.zeros(S * D, dtype=torch.bfloat16)
+        scratch_n = (D + S) * S + S * D
+        return [("vis_zeros", self.vis_zeros_addr,
+                 torch.zeros(H, dtype=torch.bfloat16)),
+                ("flash_q", self.VIS_FLASH_Q_DRAM, zeros_d),
+                ("flash_k", self.VIS_FLASH_K_DRAM, zeros_d),
+                ("flash_v", self.VIS_FLASH_V_DRAM, zeros_d),
+                ("flash_out", self.VIS_FLASH_OUT_DRAM, zeros_d),
+                ("attn_scratch", self.VIS_ATTN_SCRATCH_DRAM,
+                 torch.zeros(scratch_n, dtype=torch.bfloat16))]
+
+    def _vis_stage_per_engine_init(self, sched):
+        """Upload the zeros register_per_engine would have uploaded, to the WORKER
+        copies only (the primary's live at model addresses the checkpoint staging
+        already covers). Bin path only -- see _vis_per_engine_specs."""
+        if sched is None or sched.num_engines <= 1:
+            return
+        for name, _addr, init in self._vis_per_engine_specs():
+            for e, w in enumerate(sched.workers, start=1):
+                w.dma_to_accelerator_memory(sched.per_engine_addr(name, e), init)
 
     def compile_encoder(self):
         """One SigLIP pass over [1024,768] + the connector, compiled ONCE and executed
@@ -9363,6 +9387,12 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                     # alloc_col_output both allocates and records, so there is no public
                     # re-register hook; the registry is a plain {name: [addr]} map.
                     sc._col_outputs[nm] = [int(a) for a in addrs]
+                # register_per_engine_addrs RECORDS addresses and uploads nothing, so
+                # the zeros compile time DMA'd into every worker copy are missing here.
+                # vis_zeros is read as a zeros OPERAND at ne>1: without this the workers
+                # read DRAM residue and the run is intermittently wrong.
+                if stage == "vision":
+                    self._vis_stage_per_engine_init(sc)
 
         wt = self._manifest.get("worker_tensor_addr")
         if wt is not None:

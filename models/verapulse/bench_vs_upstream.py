@@ -61,6 +61,14 @@ def main():
                          "common-mode and this measures arithmetic, not the known "
                          "approximation")
     ap.add_argument("--prompt", default="Pick up the tape.")
+    ap.add_argument("--pixel-range", default="0-1", choices=["0-1", "-1-1"],
+                    help="pixel range fed to BOTH the device and the oracle. 0-1 is what "
+                         "this bench has always used; -1-1 is what modeling_smolvla's "
+                         "prepare_images actually produces (img * 2 - 1) and therefore "
+                         "what the policy server feeds the tower in deployment. The SNR "
+                         "gate cannot see this difference on its own -- it hands the same "
+                         "tensor to both sides -- so a score that holds at 0-1 says "
+                         "nothing about the range the robot actually runs.")
     ap.add_argument("--ckpt",
                     default="/home/rohit/vera_pulse_finetune_v0/checkpoints/run01_020000")
     args = ap.parse_args()
@@ -74,6 +82,8 @@ def main():
     g = torch.Generator().manual_seed(args.seed)
     images = torch.randint(0, 256, (slots, IMG, IMG, 3), generator=g,
                            dtype=torch.uint8).float() / 255.0
+    if args.pixel_range == "-1-1":
+        images = images * 2.0 - 1.0
     state = torch.randn(HEAD["state_dim"], generator=g)
     token_ids, text_mask = vp.tokenize(args.prompt, cfg["lm"]["tokenizer_max_length"],
                                        return_mask=True)
