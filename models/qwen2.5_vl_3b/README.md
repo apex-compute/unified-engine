@@ -53,10 +53,15 @@ identical at 1 and 8 cores.
 
 | phase | 1 core | 8 cores | speedup |
 | :--- | ---: | ---: | ---: |
-| Vision (576 patches → 144 tokens) | 22038.7 ms | 3306.9 ms | 6.66× |
-| Prefill (170 tokens) | 22169.3 ms | 3186.8 ms | 6.96× |
-| Decode, 1st token | 207.9 ms (4.81 tok/s) | 38.9 ms (25.70 tok/s) | 5.34× |
-| Decode, average | 214.0 ms (4.67 tok/s) | 45.8 ms (21.83 tok/s) | 4.67× |
+| Vision (576 patches → 144 tokens) | 21990.2 ms | 3306.2 ms | 6.65× |
+| Prefill (170 tokens) | 22135.0 ms | 3185.5 ms | 6.95× |
+| Decode, 1st token | 207.9 ms (4.81 tok/s) | 33.3 ms (30.02 tok/s) | 6.24× |
+| Decode, average | 214.0 ms (4.67 tok/s) | 34.3 ms (29.13 tok/s) | 6.24× |
+| Decode, long ctx (2048 tokens) † | 282.2 ms | 51.0 ms | 5.54× |
+
+† From `--profile`, which times one decode step at a full 2048-token context in
+addition to the live one. It is where attention dominates: 84.5 ms of the 1-core
+step, and the phase that the decode attention shard targets.
 
 See `pr_summary.md` for the per-phase breakdown.
 
@@ -82,7 +87,7 @@ tensor). Worker ISA lives in the model map above, not in the windows.
 | :--- | :--- | :--- |
 | Vision | qkv_proj, attention (per head), o_proj+mlp, rope | permutes, merger |
 | Prefill | qkv, o_proj, mlp, attention (per head), norms/eltwise | rope |
-| Decode | q/k/v, o_proj, gate/up + SwiGLU product, down + residual, lm_head | rope, attention, permute |
+| Decode | q/k/v, o_proj, gate/up + SwiGLU product, down + residual, lm_head, attention (V transpose + P@V^T) | rope, Q@K^T, permute |
 
 Decode weights are duplicated into each engine's private arena (column shards) so
 engines do not contend on one shared weight image; 228.4 MiB of the 240 MiB window
