@@ -486,6 +486,80 @@ class Qwen25VLLMMixin:
         kw.update(SCALE_DRAM_ADDR=sh.scale_addr, data_type=TYPE.IF4)
         return ue.quantized_matmat_core(**kw) or 0
 
+    # Decode attention is sharded two ways, both of which need values that only
+    # exist at run time (the KV length grows every step). See _emit_layer.
+    DEC_ATTN_REGS = ("row_off", "out_off", "rows", "stride", "aligned")
+
+    def _ensure_decode_attn_regs(self, dec_sched) -> list:
+        """One runtime register set per worker for the sharded decode attention.
+
+        Allocated ONCE, before any layer is emitted, and reused by all 36 -- the
+        split is the same in every layer, only the per-layer K/V and scratch
+        bases differ, and those are literals.
+        """
+        regs = getattr(self, "_decode_attn_worker_regs", None)
+        if regs is None:
+            regs = [{n: w.alloc_isa_reg() for n in self.DEC_ATTN_REGS}
+                    for w in dec_sched.workers]
+            self._decode_attn_worker_regs = regs
+        return regs
+
+    def _decode_attn_worker_gpr_sets(self, dec_sched, aligned: int):
+        """Per-step ``(register, value)`` pairs for the M-sharded V transpose.
+
+        Splits the LIVE aligned KV length across the workers in whole 64-row
+        blocks; the remainder goes to the leading workers so the slices stay
+        contiguous and together cover exactly [0, aligned). 64 is not a choice:
+        bf16_transpose_core writes each block as one strided DMA of 64 Y-rows
+        whose URAM cursor steps by ceil(m_take/64) rows, so a non-multiple-of-64
+        row count reads the DMA chunks at the wrong offsets.
+
+        Fewer blocks than workers: the leading ones get a block each and the rest
+        get ZERO, which they branch over. Never a 0-row transpose -- its row loop
+        never terminates and the core hangs.
+
+        The SAME split serves both KV groups; only the base addresses differ, and
+        those are per-layer literals.
+        """
+        regs = getattr(self, "_decode_attn_worker_regs", [])
+        if len(regs) != len(dec_sched.workers):
+            raise RuntimeError(
+                f"decode attention worker registers ({len(regs)}) do not match "
+                f"the {len(dec_sched.workers)} worker engine(s); recompile")
+        n = len(regs)
+        bpe = self.bytes_per_element
+        blocks = aligned // 64
+        if blocks >= n:
+            base, rem = divmod(blocks, n)
+            counts = [64 * (base + (1 if i < rem else 0)) for i in range(n)]
+        else:
+            counts = [64 if i < blocks else 0 for i in range(n)]
+        assert sum(counts) == aligned, (
+            f"V^T shards {counts} do not cover aligned={aligned}")
+        offsets = [sum(counts[:i]) for i in range(n)]
+        return [[(r["row_off"], off), (r["out_off"], ue_35bit_addr_shifter(off * bpe)),
+                 (r["rows"], cnt), (r["stride"], aligned * bpe),
+                 (r["aligned"], aligned)]
+                for r, off, cnt in zip(regs, offsets, counts)]
+
+    def _start_decode_workers(self, dec_sched, worker_addrs, aligned: int) -> None:
+        """THE only way to start the decode workers. Both the run loop and the
+        profile path go through here so they cannot drift: a worker entering with
+        a stale row count transposes the wrong rows."""
+        dec_sched.start_workers(
+            worker_addrs,
+            gpr_sets_by_worker=self._decode_attn_worker_gpr_sets(dec_sched, aligned))
+
+    def _decode_pv_shards(self, KVH: int, AHD: int, num_engines: int) -> list:
+        """``[[(group, n_offset, columns), ...]]`` indexed by engine.
+
+        P@V^T's N is AHD, so it splits into AHD/64 column blocks per KV group --
+        2 x 2 = 4 blocks here, dealt round-robin. At 8 engines that leaves 4..7
+        with nothing for this round; they still run its handshake.
+        """
+        blocks = [(g, n, 64) for g in range(KVH) for n in range(0, AHD, 64)]
+        return [blocks[e::num_engines] for e in range(num_engines)]
+
     def _dec_round(self, dec_sched, ops, master_emit, worker_extra=None) -> int:
         """One decode rendezvous: release, master's work, workers' rounds, join.
 
@@ -812,6 +886,149 @@ class Qwen25VLLMMixin:
                                       gqa_ratio=G, mode="qheads")
             flops += attn_acc[0]
             self.generate_instruction_add_set(m_reg, M)   # restore gf_seq_len
+            groups = []
+
+        if decode and dec_sched is not None and groups:
+            # SHARDED DECODE ATTENTION. unified_attention_core is inlined so its
+            # V transpose -- which is most of the step at a long context, and the
+            # only part that grows with the KV length -- can be split across the
+            # workers while engine 0 runs the parts that do not depend on it.
+            #
+            #   round 1   workers: V^T row slices, BOTH groups
+            #             engine 0: Q scale + Q@K^T + bias + softmax, both groups
+            #   round 2   all engines: P@V^T, column-sharded
+            #
+            # Q@K^T is NOT sharded: softmax is a row reduction over N, which is
+            # exactly the axis an N-shard would split, and the hardware's fmax
+            # context is per engine.
+            #
+            # Own scratch carve, not the core's: the core reserves score as
+            # [aligned, aligned] because batch can reach aligned, but decode's
+            # batch is G=8, so [batch, aligned] is 256x smaller and both groups
+            # fit side by side inside LM_SCRATCH with room to spare.
+            A = aligned_kv
+            g_elems = AHD * A + G * A + G * AHD
+            def _vt(g):  return self.LM_SCRATCH + g * g_elems * bpe
+            def _sc(g):  return _vt(g) + AHD * A * bpe
+            def _sq(g):  return _sc(g) + G * A * bpe
+            attn_regs = self._decode_attn_worker_regs
+            pv_by_engine = self._decode_pv_shards(KVH, AHD, dec_sched.num_engines)
+            b_reg = self.alloc_isa_reg()
+            hd_reg = self.alloc_isa_reg()
+            self.generate_instruction_add_set(b_reg, G)
+            self.generate_instruction_add_set(hd_reg, AHD)
+
+            # ---- round 1: transpose (workers) || scale + scores (engine 0) ----
+            dec_sched.release()
+            for kv_h, plane_off, batch in groups:
+                flops += self.eltwise_core_dram(
+                    M=batch, N=AHD, dram_a=self.LM_Q_HM + plane_off, dram_b=None,
+                    dram_out=_sq(kv_h), mode=UE_MODE.MUL_BROADCAST,
+                    scalar=1.0 / math.sqrt(AHD), gpr_M_reg=b_reg) or 0
+                f = self.matmat_mul_core(
+                    M=batch, K=AHD, N=A,
+                    A_DRAM_ADDR=_sq(kv_h),
+                    B_DRAM_ADDR=k_base + kv_h * self.KV_STRIDE_HEAD,
+                    OUTPUT_DRAM_ADDR=_sc(kv_h),
+                    softmax_enable=True,
+                    C_DRAM_ADDR=self.LM_BIAS, bias_mode="full_matrix",
+                    gpr_M_reg=b_reg, gpr_K_reg=hd_reg,
+                    gpr_N_reg=aligned_kv_reg) or 0
+                flops += f
+                self._emit_attn_flops += f
+            for e in dec_sched.worker_indices():
+                dec_sched.begin_worker_round(e)
+                ue = dec_sched.engines[e]
+                rg = attn_regs[e - 1]
+                # Branch over the transpose when this worker drew no rows this
+                # step -- M=0 hangs the core's row loop. The handshake still runs.
+                jz_at = ue.capture_count
+                ue.generate_instruction_jump_abs_jz(0, rg["rows"])   # patched below
+                for kv_h, _plane_off, _batch in groups:
+                    src = ue.alloc_isa_reg()
+                    dst = ue.alloc_isa_reg()
+                    ue.generate_instruction_reg_mul_imm(
+                        src, rg["row_off"], ue_35bit_addr_shifter(AHD * bpe))
+                    ue.generate_instruction_add_imm(
+                        src_reg_idx=src,
+                        immediate_value=ue_35bit_addr_shifter(
+                            v_base + kv_h * self.KV_STRIDE_HEAD),
+                        dst_reg_idx=src)
+                    ue.generate_instruction_add_imm(
+                        src_reg_idx=rg["out_off"],
+                        immediate_value=ue_35bit_addr_shifter(_vt(kv_h)),
+                        dst_reg_idx=dst)
+                    ue.bf16_transpose_core(
+                        M=A, N=AHD,
+                        INPUT_DRAM_ADDR=v_base + kv_h * self.KV_STRIDE_HEAD,
+                        OUTPUT_DRAM_ADDR=_vt(kv_h),
+                        IDENTITY_DRAM_ADDR=self.LM_IDENTITY,
+                        gpr_M_reg=rg["rows"], gpr_input_addr=src,
+                        gpr_out_addr=dst,
+                        gpr_out_row_stride_reg=rg["stride"])
+                    ue.release_isa_reg()   # dst
+                    ue.release_isa_reg()   # src
+                ue._patch_jump_immediate(jz_at, ue_35bit_addr_shifter(
+                    ue.get_program_dram_addr()
+                    + ue.capture_count * INSTRUCTION_SIZE_BYTES))
+                dec_sched.end_worker_round(e)
+            dec_sched.join()
+
+            # ---- round 2: P@V^T, column-sharded --------------------------
+            # B is V^T, [AHD, aligned], so an output column block is a contiguous
+            # ROW BLOCK of it. The OUTPUT block is strided though (batch > 1), so
+            # each engine writes IN PLACE at row stride AHD instead of into a
+            # private dense buffer -- no gather, and o_proj still reads one
+            # [batch, AHD] plane per group.
+            dec_sched.release()
+            n_reg = self.alloc_isa_reg()
+            self.generate_instruction_add_set(n_reg, 64)
+            for g, n_off, cols in pv_by_engine[0]:
+                f = self.matmat_mul_core(
+                    M=G, K=A, N=cols,
+                    A_DRAM_ADDR=_sc(g), B_DRAM_ADDR=_vt(g) + n_off * A * bpe,
+                    OUTPUT_DRAM_ADDR=self.LM_ATTN_HM + g * G * AHD * bpe + n_off * bpe,
+                    gpr_M_reg=b_reg, gpr_K_reg=aligned_kv_reg, gpr_N_reg=n_reg,
+                    gpr_out_row_stride_reg=hd_reg) or 0
+                flops += f
+                self._emit_attn_flops += f
+            self.release_isa_reg()   # n_reg
+            for e in dec_sched.worker_indices():
+                dec_sched.begin_worker_round(e)
+                ue = dec_sched.engines[e]
+                rg = attn_regs[e - 1]
+                for g, n_off, cols in pv_by_engine[e]:
+                    wb = ue.alloc_isa_reg()
+                    wn = ue.alloc_isa_reg()
+                    wm = ue.alloc_isa_reg()
+                    ws = ue.alloc_isa_reg()
+                    ue.generate_instruction_add_set(wn, cols)
+                    ue.generate_instruction_add_set(wm, G)
+                    ue.generate_instruction_add_set(ws, AHD)
+                    # V^T row block = _vt(g) + n_off * aligned * bpe. Linear in
+                    # the RUNTIME KV length, so it is derived from the primed
+                    # register, never baked off the MAX_CONTEXT_SIZE bound.
+                    ue.generate_instruction_reg_mul_imm(
+                        wb, rg["aligned"], ue_35bit_addr_shifter(n_off * bpe))
+                    ue.generate_instruction_add_imm(
+                        src_reg_idx=wb,
+                        immediate_value=ue_35bit_addr_shifter(_vt(g)),
+                        dst_reg_idx=wb)
+                    f = ue.matmat_mul_core(
+                        M=G, K=A, N=cols,
+                        A_DRAM_ADDR=_sc(g), B_DRAM_ADDR=_vt(g),
+                        OUTPUT_DRAM_ADDR=(self.LM_ATTN_HM + g * G * AHD * bpe
+                                          + n_off * bpe),
+                        gpr_M_reg=wm, gpr_K_reg=rg["aligned"], gpr_N_reg=wn,
+                        gpr_b_addr=wb, gpr_out_row_stride_reg=ws) or 0
+                    for _ in range(4):
+                        ue.release_isa_reg()
+                    flops += f
+                    self._emit_attn_flops += f
+                dec_sched.end_worker_round(e)
+            dec_sched.join()
+            self.release_isa_reg()   # hd_reg
+            self.release_isa_reg()   # b_reg
             groups = []
 
         for kv_h, plane_off, batch in groups:
@@ -1238,6 +1455,7 @@ class Qwen25VLLMMixin:
         if dec_sched is not None:
             dec_sched.begin_program()
             dec_shards = self._ensure_decode_shards(dec_sched, nl)
+            self._ensure_decode_attn_regs(dec_sched)
         for li in range(nl):
             in_addr = self.LM_IO_A if li % 2 == 0 else self.LM_IO_B
             out_addr = self.LM_IO_B if li % 2 == 0 else self.LM_IO_A
@@ -1476,7 +1694,7 @@ class Qwen25VLLMMixin:
         # master's HALTs sit at phase boundaries OUTSIDE any round, so stopping
         # it between segments does not strand them.
         if dec_sched is not None:
-            dec_sched.start_workers(worker_addrs)
+            self._start_decode_workers(dec_sched, worker_addrs, aligned)
         results = self._run_checkpointed(self._decoder_preamble, checkpoints, timeout_s)
         for w in (dec_sched.workers if dec_sched is not None else []):
             w.wait_queue(timeout_s)
@@ -1596,7 +1814,7 @@ class Qwen25VLLMMixin:
             # its workers halted, so a step that did not start them would leave
             # the master waiting on a rendezvous that never arrives.
             if dec_sched is not None:
-                dec_sched.start_workers(dec_worker_addrs)
+                self._start_decode_workers(dec_sched, dec_worker_addrs, aligned)
             self.start_execute_from_dram(self._decoder_preamble)
             self.wait_queue(30.0)
             for w in (dec_sched.workers if dec_sched is not None else []):

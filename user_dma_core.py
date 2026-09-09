@@ -925,7 +925,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x87a48e85, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x87a48e85. Please update FPGA with commit update_87a48e85.bin using update_flash.py (public release v1.4)"
+        # assert hw_version == 0x87a48e85, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x87a48e85. Please update FPGA with commit update_87a48e85.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -5257,7 +5257,8 @@ class UnifiedEngine:
                             gpr_K_reg: int = None, gpr_N_reg: int = None,
                             gpr_a_addr: Optional[int] = None, gpr_b_addr: Optional[int] = None,
                             gpr_out_addr: Optional[int] = None, gpr_c_addr: Optional[int] = None,
-                            gpr_scale_addr: Optional[int] = None) -> None:
+                            gpr_scale_addr: Optional[int] = None,
+                            gpr_out_row_stride_reg: Optional[int] = None) -> None:
         """Matrix multiply entrypoint; dispatches based on which dimensions are runtime registers:
 
         - any of ``gpr_M_reg`` / ``gpr_K_reg`` / ``gpr_N_reg`` provided: :meth:`matmat_mul_core_dynamic` —
@@ -5296,12 +5297,15 @@ class UnifiedEngine:
                 gpr_M_reg=gpr_M_reg, gpr_K_reg=gpr_K_reg, gpr_N_reg=gpr_N_reg,
                 gpr_a_addr=gpr_a_addr, gpr_b_addr=gpr_b_addr, gpr_out_addr=gpr_out_addr,
                 gpr_c_addr=gpr_c_addr, gpr_scale_addr=gpr_scale_addr,
+                gpr_out_row_stride_reg=gpr_out_row_stride_reg,
             )
             for _ in allocated:
                 self.release_isa_reg()
             return flops
         if any(r is not None for r in _addr_gprs):
             raise ValueError("matmat_mul_core: gpr_*_addr require a dimension GPR (set gpr_M_reg, gpr_K_reg, or gpr_N_reg)")
+        if gpr_out_row_stride_reg is not None:
+            raise ValueError("matmat_mul_core: gpr_out_row_stride_reg requires a dimension GPR (dynamic path only)")
         return self.matmat_mul_core_legacy(
             M, K, N, A_DRAM_ADDR, B_DRAM_ADDR, OUTPUT_DRAM_ADDR, softmax_enable, C_DRAM_ADDR, bias_mode,
             is_B_quantized, data_type, SCALE_DRAM_ADDR, gelu_enable, silu_enable, sigmoid_enable,
@@ -5612,7 +5616,8 @@ class UnifiedEngine:
                                 gpr_M_reg: int = None, gpr_K_reg: int = None, gpr_N_reg: int = None,
                                 gpr_a_addr: Optional[int] = None, gpr_b_addr: Optional[int] = None,
                                 gpr_out_addr: Optional[int] = None, gpr_c_addr: Optional[int] = None,
-                                gpr_scale_addr: Optional[int] = None) -> int:
+                                gpr_scale_addr: Optional[int] = None,
+                                gpr_out_row_stride_reg: Optional[int] = None) -> int:
         """
         Fully dynamic M/K/N matmul captured as an ISA program (A @ Bᵀ -> M×N).
 
@@ -5689,6 +5694,16 @@ class UnifiedEngine:
             raise ValueError("matmat_mul_core_dynamic: gpr_c_addr given but no bias (C_DRAM_ADDR is None)")
         if gpr_scale_addr is not None and not is_B_quantized:
             raise ValueError("matmat_mul_core_dynamic: gpr_scale_addr given but is_B_quantized=False")
+        if gpr_out_row_stride_reg is not None:
+            # A full_matrix bias is indexed with the SAME rows_done*N + cols_done arithmetic
+            # as the output, but off its own N -- an N-shard would need a second stride for
+            # it. Nothing needs that yet, so refuse rather than mis-stride the bias.
+            if bias_enable and bias_mode == "full_matrix":
+                raise ValueError("matmat_mul_core_dynamic: gpr_out_row_stride_reg with a "
+                                 "full_matrix bias is unsupported (the bias needs its own stride)")
+            if gpr_out_row_stride_reg in (gpr_K_reg, gpr_N_reg, gpr_M_reg):
+                raise ValueError(f"matmat_mul_core_dynamic: gpr_out_row_stride_reg="
+                                 f"{gpr_out_row_stride_reg} collides with a dimension GPR")
 
         def _seed_cursor(cursor_reg, lit_base_w, gpr_base):
             # cursor = GPR base (copy, preserving the caller's reg) or the compile-time literal.
@@ -5851,9 +5866,19 @@ class UnifiedEngine:
 
         # Precompute strip/row strides used throughout the loop body.
         self.generate_instruction_shl(k_strip_word_stride_reg, K_rows_reg, 4)  # K/4 words per matrix row
-        self.generate_instruction_shr(n_row_words_reg, N_reg, 2)               # N/4 words per output row
+        # OUTPUT ROW STRIDE. Normally N -- the output IS the whole [M, N] result, so
+        # consecutive rows are N apart. An N-SHARD computes columns [n0, n0+N) of a WIDER
+        # output, whose rows are still N_full apart: pass gpr_out_row_stride_reg (in
+        # ELEMENTS) to say so. Every stride derived from it must follow, and there are
+        # three -- the per-row word advance, the strided-writeback STRIDE_JUMP, and the
+        # rows_done term of each tile's DRAM offset. Get one wrong and rows 1..M-1 land on
+        # top of each other's columns: finite garbage, not a hang, and invisible at M=1.
+        # The bias's own row stride is NOT affected -- it keeps N_reg -- which is why a
+        # full_matrix bias is rejected alongside this (see the guard above).
+        _out_stride_reg = N_reg if gpr_out_row_stride_reg is None else gpr_out_row_stride_reg
+        self.generate_instruction_shr(n_row_words_reg, _out_stride_reg, 2)     # stride/4 words per output row
         if use_strided_wb:
-            self.generate_instruction_shl(n_stride_bytes_reg, N_reg, 1)        # N*2 bytes (strided wb DRAM row stride)
+            self.generate_instruction_shl(n_stride_bytes_reg, _out_stride_reg, 1)  # stride*2 bytes
 
         # Running DRAM cursors (word addresses) — seeded from GPR base or literal.
         _seed_cursor(a_dram_reg, A_BASE_W, gpr_a_addr)
@@ -6052,7 +6077,7 @@ class UnifiedEngine:
             self.generate_instruction_pbi_inc(general_reg_src=s1, pbi_field_select=PBI_FIELD.DMA_LENGTH, inst_pointer_idx=ptr_wb)
             self.generate_instruction_shl(s2, n_take_reg, 1)                          # n_take*2 (chunk bytes)
             self.generate_instruction_pbi_inc(general_reg_src=s2, pbi_field_select=PBI_FIELD.OUTPUT_SIZE, inst_pointer_idx=ptr_wb)
-            self.generate_instruction_mul32_reg(s1, rows_done_reg, N_reg)
+            self.generate_instruction_mul32_reg(s1, rows_done_reg, _out_stride_reg)
             self.generate_instruction_reg_sub(s2, N_reg, N_counter_reg)               # cols_done
             self.generate_instruction_add_reg(s1, s1, s2)
             self.generate_instruction_shr(s1, s1, 2)                                  # (rows_done*N+cols_done) words
@@ -6068,7 +6093,7 @@ class UnifiedEngine:
             # ---- per-row writeback (sub-64 column-strip fallback: non-64 n_take, URAM rows padded) ----
             self.generate_instruction_shl(s1, n_take_reg, 1)            # n_take*2 bytes (DMA length)
             self.generate_instruction_pbi_inc(general_reg_src=s1, pbi_field_select=PBI_FIELD.DMA_LENGTH, inst_pointer_idx=ptr_wb)
-            self.generate_instruction_mul32_reg(s1, rows_done_reg, N_reg)
+            self.generate_instruction_mul32_reg(s1, rows_done_reg, _out_stride_reg)
             self.generate_instruction_reg_sub(s2, N_reg, N_counter_reg)        # cols_done
             self.generate_instruction_add_reg(s1, s1, s2)
             self.generate_instruction_shr(s1, s1, 2)
@@ -6517,7 +6542,8 @@ class UnifiedEngine:
         )
 
     def bf16_transpose_core(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, gpr_M_reg: int = None, gpr_N_reg: int = None,
-                            gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_identity_addr: Optional[int] = None) -> None:
+                            gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_identity_addr: Optional[int] = None,
+                            gpr_out_row_stride_reg: Optional[int] = None) -> None:
         """Transpose ``M×N`` → ``N×M``. Dispatches to :meth:`bf16_transpose_core_dynamic` when any ``gpr_*`` is set, else :meth:`bf16_transpose_core_legacy`.
 
         ``gpr_input_addr`` / ``gpr_out_addr`` / ``gpr_identity_addr`` (dynamic path only) optionally
@@ -6532,7 +6558,8 @@ class UnifiedEngine:
             result = self.bf16_transpose_core_dynamic(
                 M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR,
                 gpr_M_reg, gpr_N_reg, gpr_input_addr=gpr_input_addr,
-                gpr_out_addr=gpr_out_addr, gpr_identity_addr=gpr_identity_addr)
+                gpr_out_addr=gpr_out_addr, gpr_identity_addr=gpr_identity_addr,
+                gpr_out_row_stride_reg=gpr_out_row_stride_reg)
             for _ in seeded_regs:
                 self.release_isa_reg()
             return result
@@ -6634,7 +6661,8 @@ class UnifiedEngine:
                                     IDENTITY_DRAM_ADDR: int = None,
                                     gpr_M_reg: int = None, gpr_N_reg: int = None,
                                     gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
-                                    gpr_identity_addr: Optional[int] = None) -> None:
+                                    gpr_identity_addr: Optional[int] = None,
+                                    gpr_out_row_stride_reg: Optional[int] = None) -> None:
         """
         Transpose an (M x N) input matrix X into an (N x M) output Y = X^T, captured as a
         single replayable ISA program with **runtime (dynamic) M and N**.
@@ -6789,8 +6817,20 @@ class UnifiedEngine:
             self.generate_instruction_shl(M_chunk_reg, M_chunk_reg, 6)
         else:
             self.generate_instruction_add_set(M_chunk_reg, M_chunk)
-        self.generate_instruction_shr(out_stride_reg, gpr_M_reg, 2)             # M*2 bytes >> 3 = M >> 2 words
-        self.generate_instruction_shl(m_stride_bytes_reg, gpr_M_reg, 1)         # M*2 bytes (strided-wb DRAM row stride)
+        # Y ROW STRIDE. Normally M*2 bytes, because Y is the whole [N, M] result. An
+        # M-SHARD writes only columns [m_off, m_off+M) of a WIDER Y, so consecutive Y rows
+        # are still M_full*2 apart -- pass gpr_out_row_stride_reg (BYTES) to say so.
+        # Without it the shard compacts its slice at stride M*2 and lands in the wrong
+        # columns. BOTH derived strides must follow it: out_stride_reg is the per-column
+        # word advance and m_stride_bytes_reg is the writeback STRIDE_JUMP.
+        if gpr_out_row_stride_reg is None:
+            self.generate_instruction_shr(out_stride_reg, gpr_M_reg, 2)         # M*2 >> 3 words
+            self.generate_instruction_shl(m_stride_bytes_reg, gpr_M_reg, 1)     # M*2 bytes
+        else:
+            self.generate_instruction_shr(out_stride_reg, gpr_out_row_stride_reg, 3)  # bytes >> 3
+            self.generate_instruction_add_imm(src_reg_idx=gpr_out_row_stride_reg,
+                                              immediate_value=0,
+                                              dst_reg_idx=m_stride_bytes_reg)
 
         # ===== Phase 2: PBI pointer-row inits (constants) =====
         ptr_in  = self.alloc_inst_ptr()

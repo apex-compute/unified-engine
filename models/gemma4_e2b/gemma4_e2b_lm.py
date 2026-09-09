@@ -1537,11 +1537,78 @@ class Gemma4LMMixin:
             _pf_th.join(timeout=1.0)
         return latency, flop_rate_program
 
+    def start_decode_workers(self, scheduler, prog_addrs, aligned_seq_len: int) -> None:
+        """Launch the decode workers for one token. THE only way to start them.
+
+        Workers park on the master's first release, so they must already be running
+        before it gets there. They also need this token's V^T slice primed into their
+        runtime registers -- a worker entering with a stale row count transposes the
+        wrong rows, or hangs on a garbage one.
+
+        Run and profile both go through here so they cannot drift: the profile is then
+        simply core 0's HW counter over a program identical to the run's, and core 0
+        already absorbs the workers' time because it blocks at the join.
+        """
+        scheduler.start_workers(
+            prog_addrs,
+            gpr_sets_by_worker=self._decode_attn_worker_gpr_sets(
+                scheduler, aligned_seq_len))
+
+    def _decode_attn_worker_gpr_sets(self, scheduler, aligned_seq_len: int):
+        """Per-token (register, value) pairs for the M-sharded V transpose.
+
+        Splits the LIVE aligned KV length across the workers by input rows. The remainder
+        goes to the leading workers, so slices stay contiguous and together cover exactly
+        [0, aligned_seq_len) -- every V row is transposed exactly once, and no worker
+        writes a column another worker owns.
+
+        The row stride handed to every worker is the FULL aligned length, because each is
+        writing a column slice of one shared [head_dim, aligned_seq_len] V^T. Without that
+        each slice would compact at its own width and land in the wrong columns.
+        """
+        regs = getattr(self, "_decode_attn_worker_regs", [])
+        if len(regs) != len(scheduler.workers):
+            raise RuntimeError(
+                f"decode attention worker registers ({len(regs)}) do not match the "
+                f"{len(scheduler.workers)} worker engine(s); recompile the program image")
+        n = len(regs)
+        bpe = self.bytes_per_element
+        # Split in whole 64-ROW blocks. A V^T column offset is m_off*2 bytes and DRAM
+        # addresses are 8-byte words, so m_off must be a multiple of 4; 64 also keeps each
+        # slice on the transpose's own 64-column block boundary. aligned_seq_len is always
+        # a multiple of 64, so the blocks divide exactly.
+        blocks = aligned_seq_len // 64
+        if blocks >= n:
+            base, rem = divmod(blocks, n)
+            counts = [64 * (base + (1 if i < rem else 0)) for i in range(n)]
+        else:
+            # Fewer blocks than workers: give the first `blocks` one each and leave the
+            # rest EMPTY. They branch over the transpose (see the jz above) rather than
+            # being handed 0 rows, which hangs the core.
+            counts = [64 if i < blocks else 0 for i in range(n)]
+        offsets = [sum(counts[:i]) for i in range(n)]
+        assert sum(counts) == aligned_seq_len, (
+            f"V^T shards {counts} do not cover aligned_seq_len={aligned_seq_len}")
+        sets = []
+        for reg, m_off, m_cnt in zip(regs, offsets, counts):
+            sets.append([
+                (reg["row_off"], m_off),
+                (reg["out_off"], ue_35bit_addr_shifter(m_off * bpe)),
+                (reg["rows"], m_cnt),
+                (reg["stride"], aligned_seq_len * bpe),
+                (reg["aligned"], aligned_seq_len),
+            ])
+        return sets
+
     @staticmethod
     def _dynamic_attention_flops(batch: int, aligned_seq_len: int,
-                                 head_dim: int) -> int:
-        """Q scale + QK (bias + softmax) + PV at the live runtime shape."""
-        return (batch * head_dim
+                                 head_dim: int, *, q_pre_scaled: bool = False) -> int:
+        """Q scale + QK (bias + softmax) + PV at the live runtime shape.
+
+        ``q_pre_scaled`` drops the Q-scale term: the inlined multi-core chain does not
+        emit it, because gemma's attention scale is exactly 1.0 and the multiply is a
+        no-op."""
+        return ((0 if q_pre_scaled else batch * head_dim)
                 + batch * aligned_seq_len * (4 * head_dim + 6))
 
     def _decoder_flops_for_aligned_seq_len(self, aligned_seq_len: int) -> int:
@@ -1552,7 +1619,8 @@ class Gemma4LMMixin:
         attention = sum(
             self._dynamic_attention_flops(
                 self.group_size, aligned_seq_len,
-                self._get_layer_attention_dims(layer_idx)[0])
+                self._get_layer_attention_dims(layer_idx)[0],
+                q_pre_scaled=self.multi_core > 1)
             for layer_idx in range(self.LAYER_SIZE))
         return int(base + attention)
 
@@ -1637,6 +1705,33 @@ class Gemma4LMMixin:
                 f"directly on each engine")
         _shards = (self._ensure_decode_qkv_shards(_dec_sched, layer_size)
                    if _dec_sched is not None else {})
+        # M-SHARDED V TRANSPOSE. V^T is 75% of decode attention and scales linearly in the
+        # KV length, so it is split by INPUT ROWS across the workers while engine 0 runs
+        # Q@K^T concurrently (the two are independent; they meet only at P@V^T).
+        #
+        # Each worker transposes V[m_off : m_off+m_cnt, :] and writes the matching COLUMN
+        # slice of the shared V^T, so it needs four values that only exist at run time
+        # (the KV length grows every token): its input word address, its output word
+        # address, its row count, and the V^T row stride -- which is the FULL aligned
+        # length, not this worker's slice, or the slices would each compact into the wrong
+        # columns. They are primed once per token through start_workers' preamble and
+        # reused across all layers; the per-layer K/V base is added on top as a literal.
+        _attn_regs = []
+        if _dec_sched is not None:
+            for _w in _dec_sched.workers:
+                _attn_regs.append({
+                    "row_off": _w.alloc_isa_reg(),   # m_off, in ROWS
+                    "out_off": _w.alloc_isa_reg(),   # m_off * 2 bytes, in words
+                    "rows": _w.alloc_isa_reg(),      # m_cnt (this worker's slice)
+                    "stride": _w.alloc_isa_reg(),    # aligned_seq_len * 2 BYTES
+                    # P@V^T's runtime K, and the multiplier for its B row-block offset:
+                    # V^T rows are aligned_seq_len apart, NOT MAX_CONTEXT_SIZE apart, so a
+                    # column shard's B base must be derived from the LIVE length. Baking it
+                    # off the compile-time context size is what makes engines 1..N-1 read
+                    # uninitialised scratch.
+                    "aligned": _w.alloc_isa_reg(),   # aligned_seq_len, in ELEMENTS
+                })
+        self._decode_attn_worker_regs = _attn_regs
 
         def _emit_shard(ue, sw, e: int, out_base: int, a_addr: int,
                         gelu: bool = False) -> int:
@@ -1911,32 +2006,180 @@ class Gemma4LMMixin:
                 # Multi-core will shard these group rows across engines
                 # (batch=shard_size per engine); this is the single-core (shard=
                 # group_size) case.
-                self.unified_attention_core(
-                    batch=self.group_size,
-                    aligned_seq_len=self.MAX_CONTEXT_SIZE,
-                    head_dim=cur_head_dim,
-                    Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-                    K_DRAM_ADDR=kv_k_base,
-                    V_DRAM_ADDR=kv_v_base,
-                    BIAS_DRAM_ADDR=bias_addr_layer,
-                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-                    SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-                    IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-                    gpr_batch_reg=gpr_group_size,
-                    gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
-                    q_scale=1.0,
-                )
+                if _dec_sched is None:
+                    self.unified_attention_core(
+                        batch=self.group_size,
+                        aligned_seq_len=self.MAX_CONTEXT_SIZE,
+                        head_dim=cur_head_dim,
+                        Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                        K_DRAM_ADDR=kv_k_base,
+                        V_DRAM_ADDR=kv_v_base,
+                        BIAS_DRAM_ADDR=bias_addr_layer,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                        SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                        IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                        gpr_batch_reg=gpr_group_size,
+                        gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                        q_scale=1.0,
+                    )
+                else:
+                    # Inlined unified_attention_core, same scratch carve it uses
+                    # internally: V^T first, then the score/probability matrix.
+                    _v_t_addr = self.LAYER0_FLASH_SCRATCH_DRAM
+                    _score_addr = (_v_t_addr + cur_head_dim * self.MAX_CONTEXT_SIZE
+                                   * self.bytes_per_element)
+                    _hd_reg = self.alloc_isa_reg()
+                    self.generate_instruction_add_set(_hd_reg, cur_head_dim)
+
+                    _dec_sched.release()
+                    # Engine 0: Q@K^T + bias + softmax. matmat B is [N,K], so B=K gives
+                    # Q@K^T. The BIAS is NOT sharded -- only engine 0 touches it.
+                    # Gemma's attention scale is exactly 1.0, so the Q pre-scale that
+                    # unified_attention_core would emit is a multiply by one; dropped.
+                    self.matmat_mul_core(
+                        M=self.group_size, K=cur_head_dim, N=self.MAX_CONTEXT_SIZE,
+                        A_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                        B_DRAM_ADDR=kv_k_base,
+                        OUTPUT_DRAM_ADDR=_score_addr,
+                        softmax_enable=True,
+                        C_DRAM_ADDR=bias_addr_layer, bias_mode="full_matrix",
+                        gpr_M_reg=gpr_group_size, gpr_K_reg=_hd_reg,
+                        gpr_N_reg=self.gpr_aligned_seq_len)
+
+                    # Workers: each transposes its row slice of V into the matching
+                    # column slice of the shared V^T. The IDENTITY matrix is read-only
+                    # and shared -- DRAM is flat, the per-engine BASE_ADDR only selects
+                    # control registers, so every engine reads the one copy.
+                    for _wi in _dec_sched.worker_indices():
+                        _dec_sched.begin_worker_round(_wi)
+                        _w = _dec_sched.engines[_wi]
+                        _rg = _attn_regs[_wi - 1]
+                        # SKIP when this worker has no rows this token. A short KV has
+                        # fewer 64-row blocks than there are workers, and the trailing
+                        # ones then get nothing -- but M=0 HANGS the transpose (its row
+                        # loop never terminates), so they must branch over it rather than
+                        # run it empty. They still execute the round's handshake, which is
+                        # what keeps the group in step.
+                        _jz_at = _w.capture_count
+                        _w.generate_instruction_jump_abs_jz(0, _rg["rows"])  # patched below
+                        _in = _w.alloc_isa_reg()
+                        _out = _w.alloc_isa_reg()
+                        # Input offset is m_off ROWS in, and a V row is cur_head_dim wide
+                        # -- 512 on full-attention layers, 256 on sliding ones -- so it
+                        # cannot be a per-token constant and is scaled here, per layer.
+                        _w.generate_instruction_reg_mul_imm(
+                            _in, _rg["row_off"],
+                            ue_35bit_addr_shifter(cur_head_dim * self.bytes_per_element))
+                        _w.generate_instruction_add_imm(
+                            src_reg_idx=_in,
+                            immediate_value=ue_35bit_addr_shifter(kv_v_base),
+                            dst_reg_idx=_in)
+                        _w.generate_instruction_add_imm(
+                            src_reg_idx=_rg["out_off"],
+                            immediate_value=ue_35bit_addr_shifter(_v_t_addr),
+                            dst_reg_idx=_out)
+                        _w.bf16_transpose_core(
+                            M=self.MAX_CONTEXT_SIZE, N=cur_head_dim,
+                            INPUT_DRAM_ADDR=kv_v_base, OUTPUT_DRAM_ADDR=_v_t_addr,
+                            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                            gpr_M_reg=_rg["rows"],
+                            gpr_input_addr=_in, gpr_out_addr=_out,
+                            gpr_out_row_stride_reg=_rg["stride"])
+                        _w.release_isa_reg()   # _out
+                        _w.release_isa_reg()   # _in
+                        # Land the skip on the instruction after the transpose. The
+                        # program base is already final here -- finalize() writes the
+                        # capture at exactly this get_program_dram_addr().
+                        _w._patch_jump_immediate(_jz_at, ue_35bit_addr_shifter(
+                            _w.get_program_dram_addr()
+                            + _w.capture_count * INSTRUCTION_SIZE_BYTES))
+                        _dec_sched.end_worker_round(_wi)
+                    _dec_sched.join()
+
+                    # Scores and V^T are both complete; P@V^T closes the chain, split
+                    # over its N (= cur_head_dim). B is V^T stored [cur_head_dim, aligned],
+                    # so an output column block is a contiguous ROW BLOCK of it. The OUTPUT
+                    # block is strided though -- M = group_size > 1 -- so each engine writes
+                    # IN PLACE at row stride cur_head_dim rather than into a private dense
+                    # buffer, which keeps the result interleaved with no gather.
+                    #
+                    # ITS OWN ROUND: it reads both the scores and the FINISHED V^T, so it
+                    # cannot ride in the transpose's round.
+                    #
+                    # cur_head_dim is 512 on full-attention layers and 256 on sliding ones,
+                    # so the block count -- and with it how many engines take part -- is
+                    # PER LAYER: 8 and 4 at multi_core=8. Engines past that emit nothing and
+                    # just run the handshake.
+                    _pv_op = mes.ColumnMatmatOp(
+                        a_addr=_score_addr, b_addr=_v_t_addr,
+                        out_addr=self.LAYER0_FLASH_OUTPUT_DRAM,
+                        M=self.group_size, N=cur_head_dim,
+                        K_max=self.MAX_CONTEXT_SIZE,
+                        max_engines=_dec_sched.num_engines,
+                        bytes_per_element=self.bytes_per_element)
+                    _pv_off0, _pv_cols0 = _dec_sched.column_matmat_shard(_pv_op, 0)
+                    assert _pv_off0 == 0, "engine 0 must own the first P@V^T column block"
+                    _dec_sched.release()
+                    _pv_n_reg = self.alloc_isa_reg()
+                    self.generate_instruction_add_set(_pv_n_reg, _pv_cols0)
+                    self.matmat_mul_core(
+                        M=self.group_size, K=self.MAX_CONTEXT_SIZE, N=_pv_cols0,
+                        A_DRAM_ADDR=_score_addr, B_DRAM_ADDR=_v_t_addr,
+                        OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                        gpr_M_reg=gpr_group_size,
+                        gpr_K_reg=self.gpr_aligned_seq_len, gpr_N_reg=_pv_n_reg,
+                        gpr_out_row_stride_reg=_hd_reg)
+                    self.release_isa_reg()   # _pv_n_reg
+                    for _wi in _dec_sched.worker_indices():
+                        _dec_sched.begin_worker_round(_wi)
+                        _n_off, _cols = _dec_sched.column_matmat_shard(_pv_op, _wi)
+                        if _cols:
+                            _w = _dec_sched.engines[_wi]
+                            _rg = _attn_regs[_wi - 1]
+                            _pm = _w.alloc_isa_reg()
+                            _pn = _w.alloc_isa_reg()
+                            _ps = _w.alloc_isa_reg()
+                            _pb = _w.alloc_isa_reg()
+                            _w.generate_instruction_add_set(_pm, self.group_size)
+                            _w.generate_instruction_add_set(_pn, _cols)
+                            _w.generate_instruction_add_set(_ps, cur_head_dim)
+                            # B row block = v_t + n_off * aligned * bpe. The multiply is
+                            # folded into the immediate as a WORD count, the same trick the
+                            # batch-split bias offset uses: n_off*bpe is a multiple of 8
+                            # because n_off is a multiple of 64.
+                            _w.generate_instruction_reg_mul_imm(
+                                _pb, _rg["aligned"],
+                                ue_35bit_addr_shifter(_n_off * self.bytes_per_element))
+                            _w.generate_instruction_add_imm(
+                                src_reg_idx=_pb,
+                                immediate_value=ue_35bit_addr_shifter(_v_t_addr),
+                                dst_reg_idx=_pb)
+                            _w.matmat_mul_core(
+                                M=self.group_size, K=self.MAX_CONTEXT_SIZE, N=_cols,
+                                A_DRAM_ADDR=_score_addr, B_DRAM_ADDR=_v_t_addr,
+                                OUTPUT_DRAM_ADDR=(self.LAYER0_FLASH_OUTPUT_DRAM
+                                                  + _n_off * self.bytes_per_element),
+                                gpr_M_reg=_pm, gpr_K_reg=_rg["aligned"], gpr_N_reg=_pn,
+                                gpr_b_addr=_pb, gpr_out_row_stride_reg=_ps)
+                            _w.release_isa_reg()   # _pb
+                            _w.release_isa_reg()   # _ps
+                            _w.release_isa_reg()   # _pn
+                            _w.release_isa_reg()   # _pm
+                        _dec_sched.end_worker_round(_wi)
+                    _dec_sched.join()
+                    self.release_isa_reg()   # _hd_reg
                 live_attention_flops = self._dynamic_attention_flops(
-                    self.group_size, seq_len, cur_head_dim)
+                    self.group_size, seq_len, cur_head_dim,
+                    q_pre_scaled=_dec_sched is not None)
                 total_flops += live_attention_flops
                 decoder_attention_flops += live_attention_flops
                 _checkpoint(f"L{layer_idx}_attention")
 
                 # O projection: INT4, K=cur_q_size (actual per-layer attention output dim).
-                # ITS OWN ROUND, not the Q/K/V one: it reads FLASH_OUTPUT, which
-                # attention produces on the master alone, so the whole input only
-                # exists after that. N=1536 is 24 blocks of 64 -- 192 columns per
-                # engine at 8, an even split.
+                # ITS OWN ROUND, not the Q/K/V one: its K spans the whole of
+                # FLASH_OUTPUT, whose column blocks P@V^T spread across the engines, so
+                # the input only exists once that round has joined. N=1536 is 24 blocks
+                # of 64 -- 192 columns per engine at 8, an even split.
                 _o_sw = _shards.get(("o", layer_idx))
                 if _o_sw is None:
                     total_flops += _projection_core(M=1, K=cur_q_size, N=self.vector_length,
@@ -2325,7 +2568,8 @@ class Gemma4LMMixin:
             if _dec_sched is not None:
                 # Workers first: each parks on the master's first release, so they
                 # must already be running before the master reaches it.
-                _dec_sched.start_workers(_dec_worker_addrs)
+                self.start_decode_workers(_dec_sched, _dec_worker_addrs,
+                                          aligned_seq_len)
             # Dynamic-PBI dispatch: re-set the attention length (K context grows
             # each step, may cross a 64-align boundary), then jump into the
             # cached decoder program. gpr_seq_len was primed once above and is

@@ -1286,6 +1286,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "prefill_kernel": self.prefill_kernel,
             "multi_core": self.multi_core,
             "decode_kernel": self.decode_kernel,
+            # Register indices the M-sharded V^T workers read their per-token slice from.
+            # Allocated during compile; a run that only LOADS the image would otherwise
+            # have no idea which registers its preamble must prime.
+            "decoder_attn_worker_regs": getattr(
+                self, "_decode_attn_worker_regs", []),
         }
         if profile:
             lm_meta["prefill_profile_checkpoints"] = self._prefill_checkpoints
@@ -1340,6 +1345,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         if "decoder_non_attention_flops" in meta:
             self._decoder_non_attention_flops = int(
                 meta["decoder_non_attention_flops"])
+        self._decode_attn_worker_regs = [
+            {k: int(vv) for k, vv in r.items()}
+            for r in meta.get("decoder_attn_worker_regs", [])]
         self._preamble_addr = self.get_program_dram_addr()
         print(f"[run] loaded LM section at 0x{base_addr:X} ({meta['prefill_program_size']/1024:.1f} + "
               f"{meta['decoder_program_size']/1024:.1f} KB); dispatch preamble @ 0x{self._preamble_addr:X}")
@@ -1663,7 +1671,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
 
     def _profile_execute(self, gpr_sets: list[tuple[int, int]], target_addr: int,
                          checkpoints: list, tail_name: str, timeout: float = 120.0,
-                         worker_scheduler=None, worker_addrs=None) -> list:
+                         worker_scheduler=None, worker_addrs=None,
+                         worker_launch=None) -> list:
         """Run checkpointed segments, returning ``(name, ms, FLOPs)`` samples.
         A preamble at self._preamble_addr primes each
         (reg, value) in ``gpr_sets`` then jumps into ``target_addr``; each
@@ -1693,7 +1702,14 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             # run_prefill() already preclears every engine after loading the
             # worker programs.  Do not preclear again here: that redundant
             # core-0 program corrupts the first segmented latency sample.
-            worker_scheduler.start_workers(worker_addrs or [])
+            # ``worker_launch`` lets the caller start the workers exactly as its run
+            # path does (decode needs this token's V^T slice primed). Everything after
+            # is unchanged: the sample is core 0's HW counter, which already contains
+            # the wait for the workers because core 0 blocks at the join.
+            if worker_launch is not None:
+                worker_launch()
+            else:
+                worker_scheduler.start_workers(worker_addrs or [])
         self.start_execute_from_dram(self._preamble_addr)
         for checkpoint in checkpoints:
             name, resume_hex, *extra = checkpoint
@@ -1732,7 +1748,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             [(self.gpr_seq_len, self.seq_len - 1),
              (self.gpr_aligned_seq_len, aligned_seq_len)],
             decoder_addr, checkpoints, tail_name="tail_addinc", timeout=timeout,
-            worker_scheduler=worker_scheduler, worker_addrs=worker_addrs)
+            worker_scheduler=worker_scheduler, worker_addrs=worker_addrs,
+            worker_launch=(
+                (lambda: self.start_decode_workers(
+                    worker_scheduler, worker_addrs or [], aligned_seq_len))
+                if worker_scheduler is not None else None))
         # The decoder program is captured with MAX_CONTEXT_SIZE as its template
         # aligned length, so compile-time attention FLOPs describe that maximum.
         # Replace only attention FLOPs with the exact live-length formula used by
@@ -1745,7 +1765,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 layer_idx = int(match.group(1))
                 head_dim, _, _ = self._get_layer_attention_dims(layer_idx)
                 batch = self.group_size
-                flops = (batch * head_dim
+                # The inlined multi-core chain drops the Q pre-scale (gemma's attention
+                # scale is exactly 1.0, so it was a multiply by one); single-core still
+                # emits it via unified_attention_core.
+                flops = ((0 if self.multi_core > 1 else batch * head_dim)
                          + batch * aligned_seq_len * (4 * head_dim + 6))
             adjusted.append((name, ms, flops))
         return adjusted
@@ -2286,10 +2309,17 @@ def main():
     # so the weight streams do not contend, and this benchmark measures the same
     # access pattern. Runs before the model is built, so the low-DRAM buffers it
     # allocates are long gone by the time the private arena is used.
-    from user_hw_test import multi_core_dram_speed_test
-    print(f"\n--- Measuring {args.multi_core}-core aggregate DRAM read speed ---")
-    dram_read_speed_mbps = multi_core_dram_speed_test(
-        num_engines=args.multi_core)
+    # Skipped on a single engine: the benchmark is a barrier-synced overlap of
+    # per-engine reads, so with nobody to overlap with the whole program is four
+    # instructions and engine 0's latency counter reads back 0 -- which is a
+    # divide-by-zero in multi_core_dram_speed_test, not a measurement. The .md
+    # writers already treat a missing speed as "omit the line".
+    dram_read_speed_mbps = None
+    if args.multi_core > 1:
+        from user_hw_test import multi_core_dram_speed_test
+        print(f"\n--- Measuring {args.multi_core}-core aggregate DRAM read speed ---")
+        dram_read_speed_mbps = multi_core_dram_speed_test(
+            num_engines=args.multi_core)
 
     ue = Gemma4_UnifiedEngine(**engine_kwargs)
 

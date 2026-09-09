@@ -821,6 +821,68 @@ class AttentionOp:
 
 
 @dataclass
+class TransposeOp:
+    """An M-SHARDED bf16 transpose inside a worker round.
+
+    ``bf16_transpose_core`` turns ``[rows, N]`` into ``[N, rows]``. Splitting it by
+    INPUT ROWS gives each worker a contiguous row slice of the source and the matching
+    COLUMN slice of one shared result -- so the workers together write a single
+    ``[N, rows_full]`` buffer that the primary then reads whole.
+
+    This is what decode attention wants: V^T dominates the step and grows linearly with
+    the KV length, while the primary's Q@K^T is independent of it, so the two overlap
+    inside one release/join.
+
+    Four values only exist at RUN time (the KV length grows every token) and are primed
+    per token by :meth:`start_workers`: the row offset, the output column offset, the row
+    count, and the result's ROW STRIDE -- which is the FULL row count, not this worker's
+    slice, or each slice would compact at its own width and land in the wrong columns.
+
+    ``in_addr`` is row 0 of the source for LAYER 0; the worker's own KV layer cursor
+    (the same one attention rounds use) is added on top, so one folded body serves every
+    layer. ``out_addr`` is layer-invariant scratch.
+    """
+
+    in_addr: int
+    out_addr: int
+    identity_addr: int
+    N: int                 # source columns = result rows (head_dim)
+    max_rows: int          # compile-time template M (the largest runtime row count)
+    kv_layer_stride: int
+    bytes_per_element: int = 2
+
+
+@dataclass
+class ColumnMatmatOp:
+    """An N-SHARDED plain (non-quantized) ``matmat_mul_core`` inside a worker round.
+
+    B is stored ``[N, K]``, so output columns ``[n0, n0+Nc)`` are a CONTIGUOUS ROW BLOCK
+    of B -- the same layout fact the quantized column shards rely on. What is different
+    here is the OUTPUT: with ``M > 1`` a column block of ``[M, N]`` is STRIDED (Nc every
+    N), so each engine writes in place through ``gpr_out_row_stride_reg`` rather than into
+    a private dense buffer. That keeps the result correctly interleaved with no gather.
+
+    ``max_engines`` caps participation. ``N`` splits in whole 64-column blocks, so an N of
+    256 is four blocks and never more than four engines; the rest emit nothing for this op
+    and still run the round's handshake.
+
+    ``K`` is RUNTIME (it is the KV length), which is why B's per-engine offset -- ``n0 * K
+    * bpe`` -- cannot be baked and is primed per token by :meth:`start_workers`. The
+    output offset ``n0 * bpe`` does not depend on K and is a literal.
+    """
+
+    a_addr: int
+    b_addr: int
+    out_addr: int
+    M: int
+    N: int                 # the FULL N; this is also the output row stride
+    K_max: int             # compile-time template K (the largest runtime K)
+    max_engines: int
+    col_block: int = 64
+    bytes_per_element: int = 2
+
+
+@dataclass
 class ShardedAttention:
     """A unified_attention_core distributed over its batch (query-row) dimension."""
 
@@ -1471,6 +1533,9 @@ class MultiEngineScheduler:
         self._persistent_preamble: dict[int, int] = {}    # engine -> preamble address
         self._persistent_body_word: dict[int, int] = {}   # engine -> body word address
         self._persistent_aligned_reg: dict[int, Optional[int]] = {}
+        self._persistent_transpose_regs: dict[int, Optional[dict]] = {}
+        self._persistent_colmatmat_regs: dict[int, dict] = {}
+        self._colmatmat_ops: dict[int, "ColumnMatmatOp"] = {}
 
     # ------------------------------------------------- engine-construction --
     def _save_dram_selftest_region(self):
@@ -2066,12 +2131,21 @@ class MultiEngineScheduler:
         return list(self._worker_prog_addrs)
 
     def start_workers(self, prog_addrs: Optional[list[int]] = None,
-                      aligned_seq_len: Optional[int] = None) -> None:
+                      aligned_seq_len: Optional[int] = None,
+                      gpr_sets_by_worker: Optional[list[list[tuple[int, int]]]] = None) -> None:
         """Launch every worker program. Call BEFORE launching the primary's
         program, on EVERY execution (each run ends with the workers halted).
 
         ``prog_addrs`` overrides the most recent finalize()'s addresses -- pass
         the stage's saved list when one scheduler carries several stages.
+
+        ``gpr_sets_by_worker`` primes runtime registers in ordinary worker
+        programs (those emitted between :meth:`begin_program` and
+        :meth:`finalize`).  It is indexed by worker, not engine, and each entry
+        is a list of ``(register, value)`` pairs.  A tiny preamble is rewritten
+        immediately after that worker's loaded program and jumps to its normal
+        entry point.  This is useful when a worker participates in an otherwise
+        unrolled program but one kernel needs a live runtime dimension.
 
         NEW -- ``aligned_seq_len`` is for workers built by
         :meth:`emit_worker_program` whose rounds contain attention. Their body is
@@ -2084,15 +2158,23 @@ class MultiEngineScheduler:
         if self._persistent_prog and prog_addrs is None:
             # Persistent (master/worker) workers: addresses are per engine index and
             # the entry point may be a per-token preamble rather than the body itself.
+            tr_sets = (self.transpose_worker_gpr_sets(aligned_seq_len)
+                       if aligned_seq_len is not None else {})
+            cm_sets = (self.column_matmat_worker_gpr_sets(aligned_seq_len)
+                       if aligned_seq_len is not None else {})
             for idx in self.worker_indices():
                 ue = self.engines[idx]
                 reg = self._persistent_aligned_reg.get(idx)
-                if aligned_seq_len is None or reg is None:
+                sets = list(tr_sets.get(idx, [])) + list(cm_sets.get(idx, []))
+                if aligned_seq_len is not None and reg is not None:
+                    sets.append((reg, aligned_seq_len))
+                if not sets:
                     ue.start_execute_from_dram(self._persistent_prog[idx])
                     continue
                 ue.clear_inst_id()
                 ue.start_capture()
-                ue.generate_instruction_add_set(reg, aligned_seq_len)
+                for _reg, _val in sets:
+                    ue.generate_instruction_add_set(_reg, _val)
                 ue.generate_instruction_jump_abs(self._persistent_body_word[idx])
                 ue.stop_capture()
                 ue.write_captured_instructions_to_dram(self._persistent_preamble[idx])
@@ -2102,8 +2184,43 @@ class MultiEngineScheduler:
         addrs = self._worker_prog_addrs if prog_addrs is None else prog_addrs
         assert len(addrs) == len(self.workers), \
             f"start_workers: {len(addrs)} program address(es) for {len(self.workers)} worker(s)"
-        for w, addr in zip(self.workers, addrs):
-            w.start_execute_from_dram(addr)
+        if gpr_sets_by_worker is not None and len(gpr_sets_by_worker) != len(self.workers):
+            raise ValueError(
+                "gpr_sets_by_worker must contain one register list per worker: "
+                f"got {len(gpr_sets_by_worker)} for {len(self.workers)} workers")
+        preambles = getattr(self, "_runtime_worker_preambles", None)
+        if preambles is None:
+            preambles = self._runtime_worker_preambles = {}
+        for wi, (w, addr) in enumerate(zip(self.workers, addrs)):
+            reg_sets = (gpr_sets_by_worker[wi]
+                        if gpr_sets_by_worker is not None else [])
+            if not reg_sets:
+                w.start_execute_from_dram(addr)
+                continue
+            # Reserve one aligned slot after the loaded image on first use, then
+            # rewrite that same slot every launch. This keeps the preamble from
+            # consuming ISA space once per decode token and gives the arena its
+            # normal hard bounds check.
+            preamble_key = (wi, int(addr), tuple(reg for reg, _ in reg_sets))
+            preamble_addr = preambles.get(preamble_key)
+            if preamble_addr is None:
+                preamble_bytes = ((len(reg_sets) + 1)
+                                  * user_dma_core.INSTRUCTION_SIZE_BYTES)
+                preamble_addr = w.allocate_program_dram(
+                    preamble_bytes,
+                    label=f"worker{wi + 1}_runtime_preamble")
+                self._check_isa_fits(wi + 1, preamble_addr, preamble_bytes)
+                preambles[preamble_key] = preamble_addr
+            w.clear_inst_id()
+            w.start_capture()
+            for reg, value in reg_sets:
+                w.generate_instruction_add_set(reg, value)
+            w.generate_instruction_jump_abs(
+                user_dma_core.ue_35bit_addr_shifter(addr))
+            w.stop_capture()
+            w.write_captured_instructions_to_dram(preamble_addr)
+            w.clear_capture_buffer()
+            w.start_execute_from_dram(preamble_addr)
 
     def worker_program_bytes(self) -> int:
         return sum(w.get_capture_instruction_size_bytes() for w in self.workers)
@@ -2710,6 +2827,138 @@ class MultiEngineScheduler:
             gpr_scale_reg=gpr_scale,
         ) or 0
 
+    def emit_transpose(self, ue, op: TransposeOp, regs: dict, gpr_kv: int) -> None:
+        """Emit ONE worker's row slice of an M-sharded bf16 transpose.
+
+        SKIP when this worker has no rows this token. A short KV has fewer whole row
+        blocks than there are workers, and the trailing ones then get nothing -- but M=0
+        HANGS the transpose (its row loop never terminates), so they branch over it
+        rather than run it empty. They still execute the round's handshake, which is what
+        keeps the group in step.
+        """
+        jz_at = ue.capture_count
+        ue.generate_instruction_jump_abs_jz(0, regs["rows"])      # patched below
+        gpr_in = ue.alloc_isa_reg()
+        gpr_out = ue.alloc_isa_reg()
+        # Input offset is row_off ROWS in, and one source row is N wide, so the byte
+        # offset depends on the op -- scaled here rather than primed per token.
+        ue.generate_instruction_reg_mul_imm(
+            gpr_in, regs["row_off"],
+            user_dma_core.ue_35bit_addr_shifter(op.N * op.bytes_per_element))
+        ue.generate_instruction_add_reg(gpr_in, gpr_kv, gpr_in)   # + this layer's KV base
+        ue.generate_instruction_add_imm(
+            src_reg_idx=gpr_in,
+            immediate_value=user_dma_core.ue_35bit_addr_shifter(op.in_addr),
+            dst_reg_idx=gpr_in)
+        ue.generate_instruction_add_imm(
+            src_reg_idx=regs["out_off"],
+            immediate_value=user_dma_core.ue_35bit_addr_shifter(op.out_addr),
+            dst_reg_idx=gpr_out)
+        ue.bf16_transpose_core(
+            M=op.max_rows, N=op.N,
+            INPUT_DRAM_ADDR=op.in_addr, OUTPUT_DRAM_ADDR=op.out_addr,
+            IDENTITY_DRAM_ADDR=op.identity_addr,
+            gpr_M_reg=regs["rows"],
+            gpr_input_addr=gpr_in, gpr_out_addr=gpr_out,
+            gpr_out_row_stride_reg=regs["stride"])
+        ue.release_isa_reg()   # gpr_out
+        ue.release_isa_reg()   # gpr_in
+        # Land the skip on the instruction after the transpose. The program base is
+        # already final here -- finalize writes the capture at this address.
+        ue._patch_jump_immediate(jz_at, user_dma_core.ue_35bit_addr_shifter(
+            ue.get_program_dram_addr()
+            + ue.capture_count * user_dma_core.INSTRUCTION_SIZE_BYTES))
+
+    def column_matmat_shard(self, op: ColumnMatmatOp, engine_idx: int) -> tuple[int, int]:
+        """``(n_offset, columns)`` for one engine's slice of a ColumnMatmatOp.
+
+        Splits N in whole ``col_block`` columns across the first ``max_engines`` engines,
+        remainder to the leading ones. An engine past that -- or past the block count --
+        gets ``(0, 0)`` and emits nothing.
+        """
+        blocks, rem_cols = divmod(op.N, op.col_block)
+        if rem_cols:
+            raise ValueError(f"ColumnMatmatOp: N={op.N} is not a multiple of "
+                             f"col_block={op.col_block}")
+        n = min(self.num_engines, op.max_engines, blocks)
+        if engine_idx >= n:
+            return 0, 0
+        base, rem = divmod(blocks, n)
+        counts = [op.col_block * (base + (1 if i < rem else 0)) for i in range(n)]
+        return sum(counts[:engine_idx]), counts[engine_idx]
+
+    def emit_column_matmat(self, ue, op: ColumnMatmatOp, entry, gpr_K: int) -> int:
+        """Emit ONE engine's column slice of a ColumnMatmatOp."""
+        n_off, cols, r = entry
+        bpe = op.bytes_per_element
+        return ue.matmat_mul_core(
+            M=op.M, K=op.K_max, N=cols,
+            A_DRAM_ADDR=op.a_addr, B_DRAM_ADDR=op.b_addr,
+            OUTPUT_DRAM_ADDR=op.out_addr + n_off * bpe,
+            gpr_M_reg=r["M"], gpr_K_reg=gpr_K, gpr_N_reg=r["N"],
+            gpr_b_addr=r["b"],
+            gpr_out_row_stride_reg=r["stride"]) or 0
+
+    def column_matmat_worker_gpr_sets(self, K: int) -> dict:
+        """Per-token ``{engine: [(reg, value), ...]}``: each worker's B row block.
+
+        B is ``[N, K]``, so this engine's columns start at ``b_addr + n0*K*bpe`` -- linear
+        in the RUNTIME K, hence primed here rather than baked.
+        """
+        out = {}
+        for idx, ops in self._persistent_colmatmat_regs.items():
+            for op_id, (n_off, cols, r) in ops.items():
+                op = self._colmatmat_ops[op_id]
+                out.setdefault(idx, []).append(
+                    (r["b"], user_dma_core.ue_35bit_addr_shifter(
+                        op.b_addr + n_off * K * op.bytes_per_element)))
+        return out
+
+    def column_matmat_worker_flops(self, op: ColumnMatmatOp, K: int) -> int:
+        """FLOPs the WORKERS contribute to one ColumnMatmatOp at runtime K."""
+        return sum(2 * op.M * K * self.column_matmat_shard(op, i)[1]
+                   for i in self.worker_indices())
+
+    def transpose_worker_gpr_sets(self, rows: int) -> dict:
+        """Per-token ``{engine: [(reg, value), ...]}`` for the M-sharded transpose.
+
+        Splits ``rows`` across the workers in whole 64-row blocks. The remainder goes to
+        the leading workers, so slices stay contiguous and together cover exactly
+        ``[0, rows)`` -- every source row is transposed once, and no worker writes a
+        column another worker owns. 64 keeps each output offset word-aligned (an offset
+        is ``m_off * 2`` bytes against 8-byte words) and each slice on the transpose's own
+        64-column block boundary.
+
+        Fewer blocks than workers: the leading ones get a block each and the rest get
+        ZERO, which they branch over -- never a 0-row transpose, which hangs.
+        """
+        idxs = [i for i in self.worker_indices()
+                if self._persistent_transpose_regs.get(i)]
+        n = len(idxs)
+        if not n:
+            return {}
+        if rows % 64:
+            raise ValueError(f"transpose_worker_gpr_sets: rows={rows} is not a multiple of 64")
+        blocks = rows // 64
+        if blocks >= n:
+            base, rem = divmod(blocks, n)
+            counts = [64 * (base + (1 if i < rem else 0)) for i in range(n)]
+        else:
+            counts = [64 if i < blocks else 0 for i in range(n)]
+        assert sum(counts) == rows, f"transpose shards {counts} do not cover rows={rows}"
+        offsets = [sum(counts[:i]) for i in range(n)]
+        out = {}
+        for i, engine_idx in enumerate(idxs):
+            rg = self._persistent_transpose_regs[engine_idx]
+            bpe = 2
+            out[engine_idx] = [
+                (rg["row_off"], offsets[i]),
+                (rg["out_off"], user_dma_core.ue_35bit_addr_shifter(offsets[i] * bpe)),
+                (rg["rows"], counts[i]),
+                (rg["stride"], rows * bpe),
+            ]
+        return out
+
     def attention_worker_flops(self, sa: ShardedAttention) -> int:
         """FLOPs the WORKERS contribute to one attention invocation (engines 1..N-1)."""
         per_row = 2 * 2 * sa.aligned_seq_len * sa.head_dim   # Q@K^T + P@V
@@ -2742,6 +2991,8 @@ class MultiEngineScheduler:
         """
         self._require_private_map("emit_worker_program")
         self._latch_rendezvous("master_worker")
+        self._colmatmat_ops = {id(op): op for rnd in list(rounds) + list(tail_rounds)
+                               for op in rnd if isinstance(op, ColumnMatmatOp)}
         for idx in self.worker_indices():
             ue = self.engines[idx]
             ue.clear_inst_id()
@@ -2772,10 +3023,17 @@ class MultiEngineScheduler:
             # and jumps into the body (see start_workers).
             _attn = [op for rnd in list(rounds) + list(tail_rounds) for op in rnd
                      if isinstance(op, AttentionOp)]
+            _tr = [op for rnd in list(rounds) + list(tail_rounds) for op in rnd
+                   if isinstance(op, TransposeOp)]
+            _cm = [op for rnd in list(rounds) + list(tail_rounds) for op in rnd
+                   if isinstance(op, ColumnMatmatOp)]
             gpr_aligned = gpr_batch = gpr_scale = None
             gpr_k = gpr_v = gpr_q = gpr_bias = gpr_out = gpr_tmp = gpr_kv = None
-            if _attn:
+            if _attn or _cm:
+                # The runtime KV length: attention's aligned_seq_len and a column-sharded
+                # matmat's K are the same value, primed the same way.
                 gpr_aligned = ue.alloc_isa_reg()
+            if _attn:
                 gpr_batch = ue.alloc_isa_reg()
                 gpr_scale = ue.alloc_isa_reg()
                 gpr_kv = ue.alloc_isa_reg()
@@ -2784,6 +3042,35 @@ class MultiEngineScheduler:
                 gpr_out, gpr_tmp = ue.alloc_isa_reg(), ue.alloc_isa_reg()
                 ue.generate_instruction_add_set(gpr_scale, _attn[0].scale_bf16)
                 ue.generate_instruction_add_set(gpr_kv, 0)   # per-layer KV cache offset
+            # M-sharded transpose: this worker's slice of the shared result. All four
+            # are written per token by start_workers. ``rows`` is the transpose's row-loop
+            # trip count, so it is allocated here, early, while the register window is
+            # still low.
+            gpr_tr = None
+            if _tr:
+                if gpr_kv is None:
+                    gpr_kv = ue.alloc_isa_reg()
+                    ue.generate_instruction_add_set(gpr_kv, 0)
+                gpr_tr = {
+                    "row_off": ue.alloc_isa_reg(),   # m_off, in ROWS
+                    "out_off": ue.alloc_isa_reg(),   # m_off * bpe, in WORDS
+                    "rows": ue.alloc_isa_reg(),      # this worker's row count
+                    "stride": ue.alloc_isa_reg(),    # full row count * bpe, in BYTES
+                }
+            self._persistent_transpose_regs[idx] = gpr_tr
+            # Column-sharded matmats: constants baked here, B's base primed per token.
+            gpr_cm = {}
+            for op in _cm:
+                n_off, cols = self.column_matmat_shard(op, idx)
+                if not cols:
+                    continue
+                r = {"M": ue.alloc_isa_reg(), "N": ue.alloc_isa_reg(),
+                     "stride": ue.alloc_isa_reg(), "b": ue.alloc_isa_reg()}
+                ue.generate_instruction_add_set(r["M"], op.M)
+                ue.generate_instruction_add_set(r["N"], cols)
+                ue.generate_instruction_add_set(r["stride"], op.N)   # ELEMENTS, the full N
+                gpr_cm[id(op)] = (n_off, cols, r)
+            self._persistent_colmatmat_regs[idx] = gpr_cm
             self._persistent_aligned_reg[idx] = gpr_aligned
 
             # One private weight/scale cursor pair per op, across every round: each arena
@@ -2791,7 +3078,7 @@ class MultiEngineScheduler:
             cursors = {}
             for rnd in rounds:
                 for op in rnd:
-                    if isinstance(op, AttentionOp):
+                    if isinstance(op, (AttentionOp, TransposeOp, ColumnMatmatOp)):
                         continue
                     sw = op[0]
                     if idx >= len(sw.shards):
@@ -2828,6 +3115,14 @@ class MultiEngineScheduler:
                         self.emit_attention(ue, idx, op, gpr_batch, gpr_aligned, gpr_scale,
                                             gpr_k, gpr_v, gpr_q, gpr_bias, gpr_out, gpr_tmp)
                         continue
+                    if isinstance(op, TransposeOp):
+                        self.emit_transpose(ue, op, gpr_tr, gpr_kv)
+                        continue
+                    if isinstance(op, ColumnMatmatOp):
+                        ent = gpr_cm.get(id(op))
+                        if ent is not None:      # None: this engine is past max_engines
+                            self.emit_column_matmat(ue, op, ent, gpr_aligned)
+                        continue
                     sw, a_addr, out_addr, gelu = op
                     shard, gpr_w, gpr_s = cursors[id(sw)]
                     ue.quantized_matmat_core(
@@ -2844,11 +3139,11 @@ class MultiEngineScheduler:
                 ue.generate_instruction_flag_check_clear(target_engine_idx=0)  # 3: closed
                 ue.generate_instruction_flag_clear()                           # 4: re-armed
 
-            if _attn:
+            if _attn or _tr:
                 ue.generate_instruction_add_imm(
                     src_reg_idx=gpr_kv,
                     immediate_value=user_dma_core.ue_35bit_addr_shifter(
-                        _attn[0].kv_layer_stride),
+                        (_attn or _tr)[0].kv_layer_stride),
                     dst_reg_idx=gpr_kv)
             for shard, gpr_w, gpr_s in cursors.values():
                 ue.generate_instruction_add_imm(
@@ -2889,7 +3184,9 @@ class MultiEngineScheduler:
             # Slot for the per-token preamble, rewritten by start_workers when a runtime
             # value is passed. Reserved even when it is not, so ISA accounting is uniform.
             self._persistent_preamble[idx] = ue.get_program_dram_addr()
-            ue.allocate_program_dram(4 * user_dma_core.INSTRUCTION_SIZE_BYTES)
+            # One add_set per runtime register plus the jump into the body.
+            _pre = 2 + (4 if gpr_tr else 0) + len(gpr_cm)
+            ue.allocate_program_dram(max(4, _pre) * user_dma_core.INSTRUCTION_SIZE_BYTES)
 
     def reset_workers(self) -> None:
         """Clear stale flags left set by an aborted run, so the next rendezvous is clean.

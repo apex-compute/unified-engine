@@ -285,7 +285,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.sharded_q_proj = None
         self.sharded_k_proj = None
         self.sharded_v_proj = None
-        self.sharded_attention = None
         self.legacy = legacy
         self.two_pass_prefill = two_pass_prefill
         self.matmatmul = matmatmul
@@ -1645,19 +1644,6 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     main_layer_stride=self.weight_defs["LAYER_WEIGHT_SIZE"],
                     data_type=TYPE.IF4))
 
-        # Attention itself, split over its BATCH (the GQA query group). Unlike every other
-        # shard this one needs private SCRATCH -- the core stages V-transpose / scores /
-        # scaled-Q through it, so two engines sharing one would corrupt each other. It comes
-        # out of the private TENSOR window, reserved and unused until now.
-        # batch = group_size = 4, so above 4 engines the leading ones get zero rows; they
-        # still run the round's handshake.
-        if SHARD_ATTENTION:
-            _aq = ((self.MAX_CONTEXT_SIZE + 63) // 64) * 64
-            _scratch = (self.head_dim * _aq + _aq * _aq + _aq * self.head_dim) * self.bytes_per_element
-            self.sharded_attention = self.shard_group.shard_attention(
-                name="attention", batch=self.group_size, head_dim=self.head_dim,
-                aligned_seq_len=_aq, scratch_bytes=_scratch)
-
         # Attention output projection. Reads FLASH_OUTPUT, which only the master produces
         # (attention itself is not sharded), so it needs its own round before the post-attn
         # norm. K=1024, N=1152 -- the same N split as mlp down.
@@ -2032,20 +2018,39 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                                  and self.sharded_mlp_down is not None) else None
         _shard_op = _shard if (_shard is not None
                                and self.sharded_attn_oproj is not None) else None
-        _shard_at = _shard if (_shard is not None
-                               and self.sharded_attention is not None) else None
-        _attn_op = None
-        if _shard_at is not None:
-            from multi_engine_shard import AttentionOp
-            _attn_op = AttentionOp(
-                sa=self.sharded_attention,
-                q_addr=self.LAYER0_FLASH_Q_DRAM,
-                k_addr=self.LAYER0_K_ROPE_DRAM, v_addr=self.LAYER0_V_DRAM,
-                bias_addr=self.LAYER0_FLASH_BIAS_DRAM,
-                out_addr=self.LAYER0_FLASH_OUTPUT_DRAM,
+        # V-transpose shard. Nothing to pre-carve: V is a plain bf16 tensor, the workers
+        # write disjoint COLUMN slices of the one shared V^T in engine 0's scratch, and
+        # the identity matrix is read-only, so all three live in the main image and every
+        # engine addresses them directly (DRAM is flat; the per-engine base only selects
+        # control registers).
+        _shard_tr = _shard if (_shard is not None and SHARD_ATTN_TRANSPOSE) else None
+        # P@V^T column shard. Same shape of round as the transpose but a SEPARATE one: it
+        # consumes both the scores and the FINISHED V^T, so it cannot ride in the
+        # transpose's round.
+        _shard_pv = _shard if (_shard is not None and SHARD_PV_MAX_ENGINES > 1
+                               and _shard_tr is not None) else None
+        _pv_op = _pv_cols = None
+        _tr_op = None
+        if _shard_tr is not None:
+            from multi_engine_shard import TransposeOp
+            _tr_op = TransposeOp(
+                in_addr=self.LAYER0_V_DRAM,
+                out_addr=self.LAYER0_FLASH_SCRATCH_DRAM,   # V^T is the scratch's first buffer
                 identity_addr=self.IDENTITY_DRAM_ADDR,
-                kv_layer_stride=self.MAX_CONTEXT_SIZE * self.k_size,
-                scale_bf16=self.float_to_bf16(1.0 / (self.head_dim ** 0.5)))
+                N=self.head_dim, max_rows=decoder_aligned_seq_len,
+                kv_layer_stride=KV_CACHE_LAYER_STRIDE,
+                bytes_per_element=self.bytes_per_element)
+        if _shard_pv is not None:
+            from multi_engine_shard import ColumnMatmatOp
+            _pv_op = ColumnMatmatOp(
+                a_addr=(self.LAYER0_FLASH_SCRATCH_DRAM
+                        + self.head_dim * decoder_aligned_seq_len * self.bytes_per_element),
+                b_addr=self.LAYER0_FLASH_SCRATCH_DRAM,       # V^T
+                out_addr=self.LAYER0_FLASH_OUTPUT_DRAM,
+                M=self.group_size, N=self.head_dim,
+                K_max=decoder_aligned_seq_len,
+                max_engines=SHARD_PV_MAX_ENGINES,
+                bytes_per_element=self.bytes_per_element)
         # Q/K/V: whichever of the three actually got sharded (K/V drop out above 4 engines).
         _qkv_ops = [] if _shard is None else [
             (sw, self.LAYER0_PRE_NORM_DRAM, out, kdim)
@@ -2063,9 +2068,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         gpr_shard_s_dn = self.alloc_isa_reg() if _shard_down is not None else None
         gpr_shard_w_op = self.alloc_isa_reg() if _shard_op is not None else None
         gpr_shard_s_op = self.alloc_isa_reg() if _shard_op is not None else None
-        # gpr_dim_group holds group_size for the Q-norm row count, so the master's OWN
-        # attention batch (its slice of the group) needs a register of its own.
-        gpr_attn_batch = self.alloc_isa_reg() if _shard_at is not None else None
+        # Engine 0's own P@V^T column count. The row stride it writes at is the FULL
+        # head_dim, which gpr_dim_head_dim already holds.
+        gpr_pv_cols = self.alloc_isa_reg() if _shard_pv is not None else None
         gpr_qkv = [(self.alloc_isa_reg(), self.alloc_isa_reg()) for _ in _qkv_ops]
         self.generate_instruction_add_set(gpr_one, 1)
         self.generate_instruction_add_set(gpr_dim_group, self.group_size)
@@ -2088,9 +2093,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_add_set(gpr_sqrt_vector_length, self.float_to_bf19(self.vector_length ** 0.5))
         self.generate_instruction_add_set(gpr_sqrt_head_dim, self.float_to_bf19(self.head_dim ** 0.5))
         self.generate_instruction_add_set(gpr_attn_scale, self.float_to_bf16(1.0 / (self.head_dim ** 0.5)))
-        if _shard_at is not None:
-            self.generate_instruction_add_set(
-                gpr_attn_batch, self.sharded_attention.shard(0).batch_rows)
+        if _shard_pv is not None:
+            _pv_off, _pv_cols = _shard_pv.column_matmat_shard(_pv_op, 0)
+            assert _pv_off == 0, "engine 0 must own the first P@V^T column block"
+            self.generate_instruction_add_set(gpr_pv_cols, _pv_cols)
         program_start = self.get_program_dram_addr()
 
         # RMS N -> (dimension register, sqrt(N) RSQRT-scalar register).
@@ -2259,35 +2265,85 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             _checkpoint("qk_norm_rope")
 
         # --- grouped flash attention over the full accumulated cache for this layer ---
-        if _shard_at is not None:
-            _shard_at.release()
-        _attn_flops = self.unified_attention_core(
-            batch=(self.sharded_attention.shard(0).batch_rows
-                   if _shard_at is not None else self.group_size),
-            aligned_seq_len=decoder_aligned_seq_len,
-            head_dim=self.head_dim,
-            Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
-            K_DRAM_ADDR=self.LAYER0_K_ROPE_DRAM,
-            V_DRAM_ADDR=self.LAYER0_V_DRAM,
-            BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-            OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-            SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
-            IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
-            gpr_batch_reg=gpr_dim_group,  # batch = group_size
-            gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
-            gpr_q_addr=const_addr(self.LAYER0_FLASH_Q_DRAM, gpr_scratch_a),
-            gpr_k_addr=kv_addr(self.LAYER0_K_ROPE_DRAM, gpr_scratch_b),
-            gpr_v_addr=kv_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
-            gpr_bias_addr=const_addr(self.LAYER0_FLASH_BIAS_DRAM, gpr_scratch_d),
-            gpr_out_addr=const_addr(self.LAYER0_FLASH_OUTPUT_DRAM, gpr_scratch_e),
-            gpr_scale_reg=gpr_attn_scale,
-        ) or 0
+        if _shard_tr is not None:
+            # Inlined unified_attention_core, so the V transpose can run on the workers
+            # while engine 0 does the parts that do not depend on it. Same scratch carve
+            # the core uses internally, so the buffer allocated for it still fits:
+            #   V^T [head_dim, aligned] | scores [aligned, aligned] | scaled Q [batch, head_dim]
+            _v_t_addr = self.LAYER0_FLASH_SCRATCH_DRAM
+            _score_addr = _v_t_addr + self.head_dim * decoder_aligned_seq_len * bpe
+            _scaled_q_addr = _score_addr + decoder_aligned_seq_len * decoder_aligned_seq_len * bpe
+            _shard_tr.release()
+            # Engine 0, concurrent with the workers' transpose: Q * (1/sqrt(head_dim)),
+            # then Q@K^T + bias + softmax. matmat B is [N, K], so B = K gives Q@K^T. The
+            # bias is NOT sharded -- only engine 0 reads it.
+            _attn_flops = self.eltwise_core_dram(
+                M=self.group_size, N=self.head_dim,
+                dram_a=self.LAYER0_FLASH_Q_DRAM, dram_b=None, dram_out=_scaled_q_addr,
+                mode=UE_MODE.MUL_BROADCAST, scalar=1.0 / (self.head_dim ** 0.5),
+                gpr_M_reg=gpr_dim_group,
+                gpr_a_addr=const_addr(self.LAYER0_FLASH_Q_DRAM, gpr_scratch_a),
+                gpr_scalar_reg=gpr_attn_scale) or 0
+            _attn_flops += self.matmat_mul_core(
+                M=self.group_size, K=self.head_dim, N=decoder_aligned_seq_len,
+                A_DRAM_ADDR=_scaled_q_addr, B_DRAM_ADDR=self.LAYER0_K_ROPE_DRAM,
+                OUTPUT_DRAM_ADDR=_score_addr,
+                softmax_enable=True,
+                C_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM, bias_mode="full_matrix",
+                gpr_M_reg=gpr_dim_group, gpr_K_reg=gpr_dim_head_dim,
+                gpr_N_reg=self.gpr_aligned_seq_len,
+                gpr_b_addr=kv_addr(self.LAYER0_K_ROPE_DRAM, gpr_scratch_b),
+                gpr_c_addr=const_addr(self.LAYER0_FLASH_BIAS_DRAM, gpr_scratch_d)) or 0
+            _shard_tr.join()
+            # Scores and V^T are both complete; P@V^T closes the chain. B is V^T, stored
+            # [head_dim, aligned], so an output column block is a contiguous ROW BLOCK of
+            # it -- but the OUTPUT block is strided (M = group_size > 1), so each engine
+            # writes IN PLACE at row stride head_dim instead of into a private buffer.
+            # An M-shard would divide the MACs and not the traffic -- every engine would
+            # still stream the whole V^T -- which is why this is split on N.
+            if _shard_pv is not None:
+                _shard_pv.release()
+                _attn_flops += self.matmat_mul_core(
+                    M=self.group_size, K=decoder_aligned_seq_len, N=_pv_cols,
+                    A_DRAM_ADDR=_score_addr, B_DRAM_ADDR=_v_t_addr,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                    gpr_M_reg=gpr_dim_group, gpr_K_reg=self.gpr_aligned_seq_len,
+                    gpr_N_reg=gpr_pv_cols,
+                    gpr_out_row_stride_reg=gpr_dim_head_dim) or 0
+                _attn_flops += _shard_pv.column_matmat_worker_flops(
+                    _pv_op, decoder_aligned_seq_len)
+                _shard_pv.join()
+            else:
+                _attn_flops += self.matmat_mul_core(
+                    M=self.group_size, K=decoder_aligned_seq_len, N=self.head_dim,
+                    A_DRAM_ADDR=_score_addr, B_DRAM_ADDR=_v_t_addr,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                    gpr_M_reg=gpr_dim_group, gpr_K_reg=self.gpr_aligned_seq_len,
+                    gpr_N_reg=gpr_dim_head_dim,
+                    gpr_out_addr=const_addr(self.LAYER0_FLASH_OUTPUT_DRAM, gpr_scratch_e)) or 0
+        else:
+            _attn_flops = self.unified_attention_core(
+                batch=self.group_size,
+                aligned_seq_len=decoder_aligned_seq_len,
+                head_dim=self.head_dim,
+                Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
+                K_DRAM_ADDR=self.LAYER0_K_ROPE_DRAM,
+                V_DRAM_ADDR=self.LAYER0_V_DRAM,
+                BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
+                OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
+                IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
+                gpr_batch_reg=gpr_dim_group,  # batch = group_size
+                gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
+                gpr_q_addr=const_addr(self.LAYER0_FLASH_Q_DRAM, gpr_scratch_a),
+                gpr_k_addr=kv_addr(self.LAYER0_K_ROPE_DRAM, gpr_scratch_b),
+                gpr_v_addr=kv_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
+                gpr_bias_addr=const_addr(self.LAYER0_FLASH_BIAS_DRAM, gpr_scratch_d),
+                gpr_out_addr=const_addr(self.LAYER0_FLASH_OUTPUT_DRAM, gpr_scratch_e),
+                gpr_scale_reg=gpr_attn_scale,
+            ) or 0
         total_flops += _attn_flops
         attn_flops += _attn_flops
-        if _shard_at is not None:
-            total_flops += _shard_at.attention_worker_flops(self.sharded_attention)
-            attn_flops += _shard_at.attention_worker_flops(self.sharded_attention)
-            _shard_at.join()
         if profile:
             _checkpoint("attention")
 
@@ -2448,8 +2504,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         for _ in gpr_qkv:
             self.release_isa_reg()   # qkv scale cursor
             self.release_isa_reg()   # qkv weight cursor
-        if _shard_at is not None:
-            self.release_isa_reg()   # gpr_attn_batch
+        if _shard_pv is not None:
+            self.release_isa_reg()   # gpr_pv_cols
         if _shard_op is not None:
             self.release_isa_reg()   # gpr_shard_s_op
             self.release_isa_reg()   # gpr_shard_w_op
@@ -2533,7 +2589,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             _shard.emit_worker_program(
                 rounds=(([[(sw, a, o, False) for sw, a, o, _k in _qkv_ops]]
                          if _shard_qkv is not None else [])
-                        + ([[_attn_op]] if _shard_at is not None else []) + ([
+                        + ([[_tr_op]] if _shard_tr is not None else [])
+                        + ([[_pv_op]] if _shard_pv is not None else []) + ([
                     # attention output projection, straight after attention
                     [(self.sharded_attn_oproj, self.LAYER0_FLASH_OUTPUT_DRAM,
                       self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, False)],
@@ -2816,9 +2873,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # silently drop out above 4 engines. A step is listed if ANY matmul inside it is
         # sharded; the norms, residuals and the gate*up multiply folded into these steps
         # still run on engine 0 alone, so the aggregate peak flatters them slightly.
-        # step -> how many engines ACTUALLY work on it. Not a blanket ``cores``: attention
-        # splits over batch = group_size = 4, so above 4 engines the extras sit idle and
-        # scoring it against the 8-core peak would understate it by 2x.
+        # step -> how many engines ACTUALLY work on it.
         _step_of = [
             ("qkv_proj_vcache", (self.sharded_q_proj, self.sharded_k_proj, self.sharded_v_proj)),
             ("o_proj_post_attn_norm_residual", (self.sharded_attn_oproj,)),
@@ -2827,14 +2882,21 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             ("output_norm_lm_head", (self.sharded_lm_head,)),
         ]
         sharded_steps = {}
+        _pv_engines = (min(self.multi_core, SHARD_PV_MAX_ENGINES,
+                           self.head_dim // UE_VECTOR_SIZE)
+                       if (SHARD_ATTN_TRANSPOSE and SHARD_PV_MAX_ENGINES > 1) else 1)
         if self.shard_group is not None:
             for step, sws in _step_of:
                 if any(sw is not None for sw in sws):
                     sharded_steps[step] = self.multi_core
-            if self.sharded_attention is not None:
-                # only the engines holding at least one query row
-                sharded_steps["attention"] = sum(
-                    1 for s in self.sharded_attention.shards if s.batch_rows)
+            # "attention" is scored against however many engines P@V^T actually uses.
+            # The step is a mix: the V transpose is spread over every worker but is pure
+            # data movement and contributes NO FLOPs; Q scale and Q@K^T run on engine 0
+            # alone; only P@V^T -- half the step's arithmetic -- is genuinely spread, and
+            # only over SHARD_PV_MAX_ENGINES. So this denominator is generous by roughly
+            # 2x and the reported %-of-peak for this step is a lower bound.
+            if _pv_engines > 1:
+                sharded_steps["attention"] = _pv_engines
 
         def _step_flops(cps, layers: int, aligned_kv: int = 0, attn_aligned: int = 0,
                         seq_scale: float = 1.0, attn_scale: float = 1.0) -> dict:
@@ -3687,12 +3749,23 @@ def gemma3_run_summary_filename(args, parser, prefix: str = "gemma3_test") -> st
             tokens.append(_sanitize(value))
     return prefix + ("_" + "_".join(tokens) if tokens else "") + ".md"
 
-SHARD_ATTENTION = True
-"""Shard unified_attention_core over its batch (GQA query-group) dimension.
+SHARD_ATTN_TRANSPOSE = True
+"""M-shard decode attention's V transpose across the worker engines.
 
-batch = group_size = 4, so at most 4 engines get rows; the rest take part in the round's
-handshake with no work. Each engine needs its OWN scratch buffer (1 MB, from the private
-tensor window) because the core stages V-transpose / scores / scaled-Q through it."""
+V^T dominates decode attention and grows linearly with the KV length, while engine 0's
+Q@K^T does not depend on it -- so the workers transpose row slices of V while engine 0
+scales Q and computes the scores, and the two meet at P@V^T. This replaces the batch
+split of the whole attention core: batch = group_size = 4 capped that at 4 engines and
+left the transpose serial inside each."""
+
+SHARD_PV_MAX_ENGINES = 4
+"""N-shard decode attention's P@V^T across at most this many engines; 0 or 1 disables it.
+
+The output is [group_size, head_dim] = [4, 256], so N splits into four 64-column blocks
+and four engines is the ceiling -- engines past that emit nothing for this round and just
+run its handshake. Unlike every other column shard here M > 1, so a column block of the
+output is STRIDED; each engine writes in place at the full row stride rather than into a
+private dense buffer, which is what keeps the result interleaved with no gather step."""
 
 SHARD_QKV = True
 """Shard the Q / K / V projections. All three share ONE round (same input, disjoint
