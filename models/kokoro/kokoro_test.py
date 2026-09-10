@@ -629,23 +629,43 @@ def text_to_phonemes(text: str, british: bool = False) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Kokoro-82M standalone CUDA reference inference")
-    parser.add_argument("--text", type=str, default=DEFAULT_TEXT)
+    parser = argparse.ArgumentParser(
+        description="Kokoro-82M on the UnifiedEngine FPGA accelerator (default); "
+                    "--cuda runs the stock CUDA/CPU reference instead.")
+    parser.add_argument("--prompt", "--text", dest="prompt", type=str, default=DEFAULT_TEXT,
+                         help="Text to speak. (--text is kept as an alias.)")
     parser.add_argument("--voice", type=str, default="af_heart")
     parser.add_argument("--speed", type=float, default=1.0)
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default=None,
+                         help="Torch device for the reference path (default: cuda if available, "
+                              "else cpu). Ignored on the FPGA path, which always builds its "
+                              "reference/comparison tensors on the host.")
     parser.add_argument("--out", type=str, default=os.path.join(SCRIPT_DIR, "kokoro_out.wav"))
+    parser.add_argument("--cuda", action="store_true",
+                         help="Run the stock CUDA/CPU KokoroModel reference path instead of the "
+                              "FPGA accelerator. Use --device to pick cuda vs cpu.")
     parser.add_argument("--fpga", action="store_true",
-                         help="Run on the UnifiedEngine FPGA accelerator instead of CUDA/CPU. "
-                              "Being built section-by-section (see fpga_forward.py); sections not "
-                              "yet ported fall back to the CUDA/CPU KokoroModel path for now, "
-                              "compared via SNR against the FPGA section's own output.")
+                         help="Run on the UnifiedEngine FPGA accelerator. This is now the DEFAULT, "
+                              "so the flag is only needed to be explicit (or to override nothing). "
+                              "Built section-by-section (see fpga_forward.py); sections not yet "
+                              "ported fall back to the CUDA/CPU path, compared via SNR against the "
+                              "FPGA section's own output.")
     parser.add_argument("--dev", type=str, default="xdma0",
-                         help="XDMA device name for --fpga (e.g. xdma0).")
+                         help="XDMA device name for the FPGA path (e.g. xdma0).")
+    parser.add_argument("--debug-snr", action="store_true", dest="debug_snr",
+                         help="Print the per-section SNR bisects against the CPU reference. "
+                              "Bring-up instrumentation; off by default.")
     args = parser.parse_args()
 
-    if args.fpga:
+    # FPGA is the default; --cuda opts out to the stock reference path.
+    use_fpga = not args.cuda
+    if args.cuda and args.fpga:
+        parser.error("--cuda and --fpga are mutually exclusive")
+
+    if use_fpga:
         args.device = "cpu"  # reference/comparison tensors still computed on host
+    elif args.device is None:
+        args.device = "cuda"
 
     if args.device == "cuda" and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU")
@@ -660,22 +680,28 @@ def main():
 
     ref_s = ensure_voice(args.voice, args.device)
 
-    print(f"Phonemizing text: {args.text!r}")
-    phonemes = text_to_phonemes(args.text, british=args.voice.startswith("b"))
+    print(f"Phonemizing text: {args.prompt!r}")
+    phonemes = text_to_phonemes(args.prompt, british=args.voice.startswith("b"))
     print(f"Phonemes: {phonemes}")
 
-    if args.fpga:
+    if use_fpga:
         from fpga_forward import run_fpga_forward
         print("Running FPGA inference (only sections currently ported to hardware) ...")
-        run_fpga_forward(model, phonemes, ref_s[len(phonemes) - 1], speed=args.speed, dev=args.dev)
-        return  # no audio yet -- see fpga_forward.py's section checklist
+        audio = run_fpga_forward(model, phonemes, ref_s[len(phonemes) - 1], speed=args.speed,
+                                 dev=args.dev, debug=args.debug_snr)
+        if audio is None:
+            return  # see fpga_forward.py's section checklist
+        import soundfile as sf
+        sf.write(args.out, audio.cpu().numpy(), 24000, subtype='PCM_16')
+        print(f"\nWrote {len(audio) / 24000:.2f}s of audio to {os.path.abspath(args.out)}")
+        return
 
-    print("Running inference ...")
+    print(f"Running {args.device.upper()} reference inference ...")
     output = model(phonemes, ref_s[len(phonemes) - 1], speed=args.speed)
 
     import soundfile as sf
-    sf.write(args.out, output.audio.numpy(), 24000)
-    print(f"Wrote {len(output.audio) / 24000:.2f}s of audio to {args.out}")
+    sf.write(args.out, output.audio.numpy(), 24000, subtype='PCM_16')
+    print(f"\nWrote {len(output.audio) / 24000:.2f}s of audio to {os.path.abspath(args.out)}")
 
 
 if __name__ == "__main__":
