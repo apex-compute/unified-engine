@@ -50,13 +50,16 @@ user_dma_core.py:5234-5254 -- "A @ B^T"), so every Linear weight below is
 uploaded as-is, no transpose needed.
 """
 import builtins
+import hashlib
+import json
 import time
 from contextlib import contextmanager
 
 import torch
 
 from user_dma_core import (UnifiedEngine, UE_MODE, UE_VECTOR_SIZE, set_dma_device,
-                           ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES)
+                           ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES,
+                           DRAM_ACTIVATION_ADDR, DRAM_INSTRUCTION_ADDR)
 
 # ---------------------------------------------------------------------------
 # Compile-print suppression + per-section timing
@@ -90,6 +93,11 @@ def report_snr(*args, **kwargs):
         _original_print(*args, **kwargs)
 
 _STATS: "dict[str, list]" = {}    # name -> [compile_s, exec_s, runs, instructions]
+# Per-program fingerprints. Stage 1 of the single-bin work is making every captured program
+# byte-identical regardless of prompt length; this is how we know which ones already are.
+_PROGRAMS: "list[dict]" = []
+_DUMP_PROGRAMS = [None]
+_DRAM_HIGH = [0]          # peak activation bytes in use, for the budget report
 _CUR = [None]
 _T_CAPTURE = [None]
 
@@ -125,6 +133,26 @@ def _instrument(ue):
 
     ue.start_capture = wrapped
 
+    # Capacity sizing trades DRAM for a fixed address map, so guard the activation region.
+    # Overrunning it would silently walk into the instruction region at 0xD0000000 and corrupt
+    # the program being executed -- a failure that would look like garbage output, not an error.
+    orig_alloc = ue.allocate_tensor_dram
+
+    def guarded_alloc(size_bytes, *a, **k):
+        addr = orig_alloc(size_bytes, *a, **k)
+        end = ue._tensor_dram_addr
+        if end > KOKORO_TENSOR_END:
+            raise MemoryError(
+                f"activation DRAM exhausted: high-water 0x{end:X} passed the program region "
+                f"at 0x{KOKORO_TENSOR_END:X} "
+                f"({(end - KOKORO_TENSOR_BASE) / 2**20:.0f} MB used of "
+                f"{(KOKORO_TENSOR_END - KOKORO_TENSOR_BASE) / 2**20:.0f} MB). Lower "
+                f"MAX_FRAMES/MAX_T, or reuse buffers instead of allocating fresh ones per call.")
+        _DRAM_HIGH[0] = max(_DRAM_HIGH[0], end - KOKORO_TENSOR_BASE)
+        return addr
+
+    ue.allocate_tensor_dram = guarded_alloc
+
     # Permanently reserve GPR_M/GPR_K/GPR_N (see their definition). Never released.
     reserved = [ue.alloc_isa_reg() for _ in range(3)]
     assert reserved == [GPR_M, GPR_K, GPR_N], (
@@ -144,6 +172,17 @@ def _timed_run(ue):
     ue.write_captured_instructions_to_dram(prog)
     ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
     n_inst = ue.get_capture_instruction_size_bytes() // INSTRUCTION_SIZE_BYTES
+    if _DUMP_PROGRAMS[0] is not None:
+        # Hash the exact instruction stream that was just written to DRAM. Any prompt-dependent
+        # value baked into an operand -- a loop trip count, an ADD_SET immediate, a shifted DRAM
+        # base -- changes this digest even when the instruction COUNT is unchanged.
+        blob = bytearray()
+        for inst in ue.capture_buffer:
+            blob.extend(inst.get_bytes())
+        _PROGRAMS.append({
+            "section": _CUR[0], "idx": len(_PROGRAMS), "n_inst": n_inst,
+            "sha1": hashlib.sha1(bytes(blob)).hexdigest(),
+        })
     t1 = time.perf_counter()
     ue.start_execute_from_dram(prog)
     ue.wait_queue(30.0)
@@ -159,6 +198,17 @@ def _timed_run(ue):
     _T_CAPTURE[0] = None
 
 
+def _dump_program_fingerprints():
+    """Write per-program (section, index, instruction count, sha1) so two prompt lengths can be
+    diffed. A program whose digest matches across lengths is already cacheable as a bin."""
+    path = _DUMP_PROGRAMS[0]
+    if path is None:
+        return
+    with open(path, "w") as f:
+        json.dump(_PROGRAMS, f, indent=1)
+    report(f"[fpga] wrote {len(_PROGRAMS)} program fingerprints to {path}")
+
+
 def _report_timings():
     if not _STATS:
         return
@@ -171,11 +221,85 @@ def _report_timings():
         tc += c; te += e; ti += ni
     report("-" * 70)
     report(f"{'TOTAL':<30}{tc:>9.3f}s{te:>9.3f}s{'':>6}{ti:>14,d}")
+    budget = (KOKORO_TENSOR_END - KOKORO_TENSOR_BASE) / 2**20
+    report(f"activation DRAM peak: {_DRAM_HIGH[0] / 2**20:.0f} MB of {budget:.0f} MB "
+           f"({100 * _DRAM_HIGH[0] / (budget * 2**20):.0f}%)")
 
 
 
 def _round_up(n: int, mult: int) -> int:
     return ((n + mult - 1) // mult) * mult
+
+
+# Capacity sizing, so DRAM addresses stop moving with the prompt.
+#
+# allocate_tensor_dram is a bump pointer, so a buffer sized by T_pad shifts EVERY address after it
+# -- which is why all 107 captured programs differed between two prompts even where the instruction
+# counts were already identical. Sizing at a fixed capacity instead makes the address map constant,
+# exactly what llama does with MAX_CONTEXT_SIZE (llama3.2_1b_test.py:459) while carrying the real
+# length in GPRs. 64-byte alignment does NOT solve this: it rounds each allocation up, it does not
+# make different sizes land on the same addresses.
+MAX_T = 512          # phoneme context; PL-BERT's max_position_embeddings
+MAX_FRAMES = 2048    # duration-expanded frames (n_frames = pred_dur.sum()); ~51 s of audio
+T_CAP = _round_up(MAX_T, UE_VECTOR_SIZE)
+F_CAP = _round_up(MAX_FRAMES, UE_VECTOR_SIZE)
+
+# MAX_FRAMES is bounded by the activation region. The default map only gives activations 512 MB
+# (0xB0000000..0xD0000000), which caps frames near 512. The board has 4 GiB but the default map
+# only ever uses the bottom 2 GiB, so kokoro moves its ACTIVATION region into the untouched upper
+# half and leaves the params/program regions exactly where every other model expects them.
+#
+# This is reachable: the instruction address field is a 35-bit WORD address = 38-bit byte address
+# (user_dma_core.py:292), and the host path seeks with os.lseek, whose off_t is 64-bit. The
+# "32-bit address" note at user_dma_core.py:8498 constrains only that DRAM-clear helper.
+#
+# Section 5a is the consumer: ~100 live [rows, 1152] buffers plus the conv weights _conv1d
+# re-uploads per call. At the 4096-row cap below that is roughly 1 GiB, inside the 2 GiB region.
+# Kokoro FIXED DRAM layout. DRAM is the full 4 GiB at 0x00000000..0x100000000 -- the module-level
+# DRAM_START_ADDR (0xB0000000-based) default map only uses the TOP HALF and leaves the bottom 2 GiB
+# untouched. Big models already take the whole space this way; see gemma4_e4b_test.py:1015-1026,
+# whose weight region starts at 0x00000000.
+#
+#   params  (weights)     : 0x00000000 - 0x10000000   (256 MB; kokoro is 82M params bf16 ~164 MB)
+#   tensor  (activations) : 0x10000000 - 0xF0000000   (3.5 GB)
+#   program (instructions): 0xF0000000 - 0x100000000  (256 MB; the image is ~107k x 32 B ~ 3.4 MB)
+#
+# Do NOT address past 0x100000000: that is the end of physical DRAM, and the XDMA character
+# device BLOCKS inside os.write() rather than returning an error, so the process wedges on the
+# first upload with the accelerator completely idle.
+#
+# allocate_tensor_dram has no overflow guard of its own -- gemma4 documents the same hazard at
+# gemma4_e4b_test.py:1035-1038 ("silently scribbles into the audio ISA -> corruption / board
+# hang"), which is why _instrument() wraps it below.
+KOKORO_PARAMS_BASE = 0x00000000
+KOKORO_TENSOR_BASE = 0x10000000
+KOKORO_PROGRAM_BASE = 0xF0000000
+KOKORO_TENSOR_END = KOKORO_PROGRAM_BASE
+
+# The row capacity currently in force. Set per section, because the shared helpers (_conv1d,
+# _adain1d, _adain_res_blk) are called with PHONEME counts from Sections 2/4 and with FRAME counts
+# from Sections 3/5a, and every allocation inside them must be sized for whichever is larger in
+# that section. It already includes the x2 from the upsample block, so every buffer in a section
+# -- pre- or post-upsample -- fits within one number.
+_ROW_CAP = [None]
+
+
+def _cap() -> int:
+    """Row capacity for allocations in the section currently executing."""
+    assert _ROW_CAP[0] is not None, "_ROW_CAP not set -- section forgot to declare its row capacity"
+    return _ROW_CAP[0]
+
+
+def _set_row_cap(actual_rows: int, cap_rows: int, what: str):
+    """Declare the row capacity for the section about to run, and fail loudly rather than
+    silently corrupting: an over-long input would under-size every buffer and write past it."""
+    if actual_rows > cap_rows:
+        raise ValueError(
+            f"{what}={actual_rows} exceeds the compiled capacity of {cap_rows} rows. The "
+            f"instruction image is frozen against a fixed DRAM map, so a longer input cannot "
+            f"reuse it -- shorten or chunk the input, or raise MAX_T / MAX_FRAMES, which needs "
+            f"the 512 MB activation budget re-checked (see the note above).")
+    _ROW_CAP[0] = cap_rows
 
 
 def _bf16(t: torch.Tensor) -> torch.Tensor:
@@ -227,6 +351,14 @@ class PLBertFPGA:
 
     def _up(self, tensor: torch.Tensor) -> int:
         a = self.ue.allocate_tensor_dram(tensor.numel() * 2)
+        self.ue.dma_to_accelerator_memory(a, tensor.reshape(-1))
+        return a
+
+    def _up_cap(self, tensor: torch.Tensor, cap_elems: int) -> int:
+        """Upload `tensor` but RESERVE cap_elems, so the allocator advances by a constant amount.
+        The tensor's own layout is untouched -- only the address becomes prompt-independent."""
+        assert tensor.numel() <= cap_elems, (tensor.numel(), cap_elems)
+        a = self.ue.allocate_tensor_dram(cap_elems * 2)
         self.ue.dma_to_accelerator_memory(a, tensor.reshape(-1))
         return a
 
@@ -285,10 +417,13 @@ class PLBertFPGA:
         ue = self.ue
         T = input_ids.shape[0]
         T_pad = _round_up(T, UE_VECTOR_SIZE)
+        _set_row_cap(T_pad, T_CAP, "T_pad")
         E, H, NH, HD, FFN = self.E, self.H, self.NH, self.HD, self.FFN
+        # Allocate at capacity, not at T_pad, so the DRAM address map is identical for every
+        # prompt. T_pad still drives the op DIMENSIONS; only the sizes change here.
+        TC = T_CAP
 
         # ---- upload weights (once per call; bin-dump caching is a later optimization) ----
-        w_word = self._up(self.word_emb)
         w_map_in, b_map_in = self._up(self.map_in_w), self._up(self.map_in_b)
         w_emb_ln, b_emb_ln = self._up(self.emb_ln_w), self._up(self.emb_ln_b)
         w_q, b_q = self._up(self.q_w), self._up(self.q_b)
@@ -302,69 +437,51 @@ class PLBertFPGA:
         w_bert_enc, b_bert_enc = self._up(self.bert_encoder_w), self._up(self.bert_encoder_b)
         identity_dram = self._up(torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
 
-        # Attention padding mask: same [T_pad] key-mask row broadcast across all T_pad query rows
-        # (host-precomputed constant, not a runtime hardware op) -- 0 for real keys (j<T), -inf for
-        # padded keys (j>=T), so padded positions contribute nothing to the softmax.
         key_mask_row = torch.zeros(T_pad, dtype=torch.float32)
         key_mask_row[T:] = self.NEG_INF
         attn_bias = key_mask_row.unsqueeze(0).expand(T_pad, T_pad).contiguous().to(torch.bfloat16)
-        bias_dram = self._up(attn_bias)
+        bias_dram = self._up_cap(attn_bias, TC * TC)
 
-        # ---- embeddings: word (indexed gather, ids known at capture time), position (contiguous
-        #      rows 0..T_pad-1 of the table), token_type (row 0 broadcast to every position) ----
-        word_dram = ue.allocate_tensor_dram(T_pad * E * 2)
-        row_bytes_e = E * 2
-        ue.start_capture()
-        for i in range(T):
-            tok_id = int(input_ids[i].item())
-            ue.accelerator_memory_to_sram(accelerator_dram_address=w_word + tok_id * row_bytes_e,
-                                           sram_address=0x00000, element_size=E)
-            ue.sram_to_accelerator_memory(sram_address=0x00000,
-                                           accelerator_dram_address=word_dram + i * row_bytes_e,
-                                           element_size=E)
-        for i in range(T, T_pad):
-            # Padding rows: content doesn't matter (attention bias masks these positions out, and
-            # only the first T output rows are ever read back), reuse row 0 for a cheap fill.
-            ue.accelerator_memory_to_sram(accelerator_dram_address=w_word,
-                                           sram_address=0x00000, element_size=E)
-            ue.sram_to_accelerator_memory(sram_address=0x00000,
-                                           accelerator_dram_address=word_dram + i * row_bytes_e,
-                                           element_size=E)
-        ue.stop_capture()
-        ue.generate_instruction_halt()
-        prog = ue.get_program_dram_addr()
-        ue.write_captured_instructions_to_dram(prog)
-        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-        ue.start_execute_from_dram(prog)
-        ue.wait_queue(10.0)
-        ue.clear_capture_buffer(); ue.reset_program_dram_addr()
+        # ---- embeddings: word (gathered HOST-side), position (contiguous rows 0..T_pad-1 of the
+        #      table), token_type (row 0 broadcast to every position) ----
+        #
+        # The word gather used to be a captured row-copy per token, which was the last emission in
+        # this section that scaled with T (2 instructions x T). The token ids are known at capture
+        # time, so the identical result comes from indexing the table on the host and uploading the
+        # [T_pad, E] slice directly: ZERO instructions, and the full [n_token, E] table no longer
+        # has to be uploaded or occupy DRAM at all. Padding rows reuse row 0 exactly as before --
+        # their content is irrelevant, the attention bias masks those positions out and only the
+        # first T output rows are ever read back.
+        ids_padded = torch.zeros(T_pad, dtype=torch.long)
+        ids_padded[:T] = input_ids[:T].reshape(-1).long()
+        word_dram = self._up_cap(self.word_emb[ids_padded].contiguous(), TC * E)
 
-        pos_dram = self._up(self.pos_emb[:T_pad])
-        type_dram = self._up(self.type_emb0.unsqueeze(0).expand(T_pad, E).contiguous())
+        pos_dram = self._up_cap(self.pos_emb[:T_pad], TC * E)
+        type_dram = self._up_cap(self.type_emb0.unsqueeze(0).expand(T_pad, E).contiguous(), TC * E)
 
-        emb_sum_dram = ue.allocate_tensor_dram(T_pad * E * 2)
-        emb_ln_dram = ue.allocate_tensor_dram(T_pad * E * 2)
-        hidden_dram = ue.allocate_tensor_dram(T_pad * H * 2)
+        emb_sum_dram = ue.allocate_tensor_dram(TC * E * 2)
+        emb_ln_dram = ue.allocate_tensor_dram(TC * E * 2)
+        hidden_dram = ue.allocate_tensor_dram(TC * H * 2)
 
-        q_dram = ue.allocate_tensor_dram(T_pad * H * 2)
-        k_dram = ue.allocate_tensor_dram(T_pad * H * 2)
-        v_dram = ue.allocate_tensor_dram(T_pad * H * 2)
-        q_heads_dram = ue.allocate_tensor_dram(T_pad * H * 2)
-        k_heads_dram = ue.allocate_tensor_dram(T_pad * H * 2)
-        v_heads_dram = ue.allocate_tensor_dram(T_pad * H * 2)
-        attn_heads_out_dram = ue.allocate_tensor_dram(T_pad * H * 2)
-        attn_merged_dram = ue.allocate_tensor_dram(T_pad * H * 2)
-        attn_proj_dram = ue.allocate_tensor_dram(T_pad * H * 2)
-        resid1_dram = ue.allocate_tensor_dram(T_pad * H * 2)
-        attn_ln_dram = ue.allocate_tensor_dram(T_pad * H * 2)
-        ffn_mid_dram = ue.allocate_tensor_dram(T_pad * FFN * 2)
-        gelu_tmp1_dram = ue.allocate_tensor_dram(T_pad * FFN * 2)
-        gelu_tmp2_dram = ue.allocate_tensor_dram(T_pad * FFN * 2)
-        gelu_tmp3_dram = ue.allocate_tensor_dram(T_pad * FFN * 2)
-        ffn_out_dram = ue.allocate_tensor_dram(T_pad * H * 2)
-        resid2_dram = ue.allocate_tensor_dram(T_pad * H * 2)
-        scratch_dram = ue.allocate_tensor_dram((HD + T_pad) * T_pad * 2 + T_pad * HD * 2)
-        d_en_dram = ue.allocate_tensor_dram(T_pad * 512 * 2)
+        q_dram = ue.allocate_tensor_dram(TC * H * 2)
+        k_dram = ue.allocate_tensor_dram(TC * H * 2)
+        v_dram = ue.allocate_tensor_dram(TC * H * 2)
+        q_heads_dram = ue.allocate_tensor_dram(TC * H * 2)
+        k_heads_dram = ue.allocate_tensor_dram(TC * H * 2)
+        v_heads_dram = ue.allocate_tensor_dram(TC * H * 2)
+        attn_heads_out_dram = ue.allocate_tensor_dram(TC * H * 2)
+        attn_merged_dram = ue.allocate_tensor_dram(TC * H * 2)
+        attn_proj_dram = ue.allocate_tensor_dram(TC * H * 2)
+        resid1_dram = ue.allocate_tensor_dram(TC * H * 2)
+        attn_ln_dram = ue.allocate_tensor_dram(TC * H * 2)
+        ffn_mid_dram = ue.allocate_tensor_dram(TC * FFN * 2)
+        gelu_tmp1_dram = ue.allocate_tensor_dram(TC * FFN * 2)
+        gelu_tmp2_dram = ue.allocate_tensor_dram(TC * FFN * 2)
+        gelu_tmp3_dram = ue.allocate_tensor_dram(TC * FFN * 2)
+        ffn_out_dram = ue.allocate_tensor_dram(TC * H * 2)
+        resid2_dram = ue.allocate_tensor_dram(TC * H * 2)
+        scratch_dram = ue.allocate_tensor_dram((HD + TC) * TC * 2 + TC * HD * 2)
+        d_en_dram = ue.allocate_tensor_dram(TC * 512 * 2)
 
         from user_dma_core import calculate_snr
 
@@ -412,7 +529,7 @@ class PLBertFPGA:
             head_stride = T_pad * HD * 2
             for h in range(NH):
                 off = h * head_stride
-                ue.unified_attention_core(
+                _dyn_attention(ue, 
                     batch=T_pad, aligned_seq_len=T_pad, head_dim=HD,
                     Q_DRAM_ADDR=q_heads_dram + off, K_DRAM_ADDR=k_heads_dram + off, V_DRAM_ADDR=v_heads_dram + off,
                     BIAS_DRAM_ADDR=bias_dram, OUTPUT_DRAM_ADDR=attn_heads_out_dram + off,
@@ -545,6 +662,14 @@ class ProsodyDurationFPGA:
         self.ue.dma_to_accelerator_memory(a, tensor.reshape(-1))
         return a
 
+    def _up_cap(self, tensor: torch.Tensor, cap_elems: int) -> int:
+        """Upload `tensor` but RESERVE cap_elems, so the allocator advances by a constant amount.
+        The tensor's own layout is untouched -- only the address becomes prompt-independent."""
+        assert tensor.numel() <= cap_elems, (tensor.numel(), cap_elems)
+        a = self.ue.allocate_tensor_dram(cap_elems * 2)
+        self.ue.dma_to_accelerator_memory(a, tensor.reshape(-1))
+        return a
+
     def _run(self, ue):
         """Flush the current captured instruction stream to the device and execute it. dma_to/from_
         accelerator_memory are direct host<->device PCIe DMA calls (confirmed via user_dma_core.py:
@@ -589,31 +714,65 @@ class ProsodyDurationFPGA:
                 _dyn_eltwise(ue, 1, H, tmp, None, tmp, mode=UE_MODE.MUL_BROADCAST, scalar=2.0)
                 _dyn_eltwise(ue, 1, H, tmp, None, dst, mode=UE_MODE.ADD_BROADCAST, scalar=-1.0)
 
-            time_range = range(T - 1, -1, -1) if reverse else range(T)
-            h_prev, c_prev = h_bufs[0], c_bufs[0]
-            for step, t in enumerate(time_range):
-                x_t = x_dram + t * Cin * 2
-                h_cur, c_cur = h_bufs[(step + 1) % 2], c_bufs[(step + 1) % 2]
+            # ONE hardware loop instead of T Python-unrolled bodies. The recurrence is still
+            # strictly sequential -- this changes only how the instruction stream is EMITTED, not
+            # the order the accelerator executes in.
+            #
+            # Two things varied per timestep and both are now register-computed:
+            #   * the input row x[t], gathered into a fixed scratch buffer;
+            #   * the output row out[t], scattered from a fixed buffer.
+            # Everything between keeps literal addresses, so the body is the same op sequence as
+            # before; only the gather/scatter use general_reg_src. That avoids forcing every M=1
+            # matmul onto the dynamic path just to source an address.
+            #
+            # h/c became SINGLE in-place buffers (they used to ping-pong per timestep, which a loop
+            # body cannot express). Safe: gates_h reads h before h is rewritten at the end of the
+            # body, and fc_ consumes c before c is rewritten -- every read precedes its write.
+            x_scratch = ue.allocate_tensor_dram(Cin * 2)
+            h_buf, c_buf = h_bufs[0], c_bufs[0]
+            i_reg = ue.alloc_isa_reg()
+            a_reg = ue.alloc_isa_reg()
+            ue.generate_instruction_add_set(i_reg, (T - 1) if reverse else 0)
+            ue.loop_start(loop_cnt=T)
 
-                _dyn_matmul(ue, M=1, K=Cin, N=G, A_DRAM_ADDR=x_t, B_DRAM_ADDR=wx_dram,
-                                    OUTPUT_DRAM_ADDR=gates_x, C_DRAM_ADDR=b_dram, bias_mode="broadcast_N")
-                _dyn_matmul(ue, M=1, K=H, N=G, A_DRAM_ADDR=h_prev, B_DRAM_ADDR=wh_dram, OUTPUT_DRAM_ADDR=gates_h)
-                _dyn_eltwise(ue, 1, G, gates_x, gates_h, gates, mode=UE_MODE.ELTWISE_ADD)
+            ue.generate_instruction_reg_mul_imm(a_reg, i_reg, ue_35bit_addr_shifter(Cin * 2))
+            ue.generate_instruction_add_imm(a_reg, ue_35bit_addr_shifter(x_dram), a_reg)
+            ue.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=0x00000,
+                                          element_size=Cin, general_reg_src=a_reg)
+            ue.sram_to_accelerator_memory(sram_address=0x00000,
+                                          accelerator_dram_address=x_scratch, element_size=Cin)
 
-                i_raw, f_raw, g_raw, o_raw = (gates + k * H * 2 for k in range(4))
-                sigmoid_ip(i_raw, i_d); sigmoid_ip(f_raw, f_d); sigmoid_ip(o_raw, o_d)
-                tanh_via_sigmoid(g_raw, g_tmp, g_d)
+            _dyn_matmul(ue, M=1, K=Cin, N=G, A_DRAM_ADDR=x_scratch, B_DRAM_ADDR=wx_dram,
+                        OUTPUT_DRAM_ADDR=gates_x, C_DRAM_ADDR=b_dram, bias_mode="broadcast_N")
+            _dyn_matmul(ue, M=1, K=H, N=G, A_DRAM_ADDR=h_buf, B_DRAM_ADDR=wh_dram,
+                        OUTPUT_DRAM_ADDR=gates_h)
+            _dyn_eltwise(ue, 1, G, gates_x, gates_h, gates, mode=UE_MODE.ELTWISE_ADD)
 
-                _dyn_eltwise(ue, 1, H, f_d, c_prev, fc_, mode=UE_MODE.ELTWISE_MUL)
-                _dyn_eltwise(ue, 1, H, i_d, g_d, ig_, mode=UE_MODE.ELTWISE_MUL)
-                _dyn_eltwise(ue, 1, H, fc_, ig_, c_cur, mode=UE_MODE.ELTWISE_ADD)
+            i_raw, f_raw, g_raw, o_raw = (gates + k * H * 2 for k in range(4))
+            sigmoid_ip(i_raw, i_d); sigmoid_ip(f_raw, f_d); sigmoid_ip(o_raw, o_d)
+            tanh_via_sigmoid(g_raw, g_tmp, g_d)
 
-                tanh_via_sigmoid(c_cur, c_tmp, tanh_c)
-                _dyn_eltwise(ue, 1, H, o_d, tanh_c, h_cur, mode=UE_MODE.ELTWISE_MUL)
-                out_addr = out_dram + t * (2 * H) * 2 + col_off_bytes
-                _dyn_eltwise(ue, 1, H, o_d, tanh_c, out_addr, mode=UE_MODE.ELTWISE_MUL)
+            _dyn_eltwise(ue, 1, H, f_d, c_buf, fc_, mode=UE_MODE.ELTWISE_MUL)
+            _dyn_eltwise(ue, 1, H, i_d, g_d, ig_, mode=UE_MODE.ELTWISE_MUL)
+            _dyn_eltwise(ue, 1, H, fc_, ig_, c_buf, mode=UE_MODE.ELTWISE_ADD)
 
-                h_prev, c_prev = h_cur, c_cur
+            tanh_via_sigmoid(c_buf, c_tmp, tanh_c)
+            _dyn_eltwise(ue, 1, H, o_d, tanh_c, h_buf, mode=UE_MODE.ELTWISE_MUL)
+
+            ue.accelerator_memory_to_sram(accelerator_dram_address=h_buf, sram_address=0x00000,
+                                          element_size=H)
+            ue.generate_instruction_reg_mul_imm(a_reg, i_reg, ue_35bit_addr_shifter((2 * H) * 2))
+            ue.generate_instruction_add_imm(a_reg, ue_35bit_addr_shifter(out_dram + col_off_bytes), a_reg)
+            ue.sram_to_accelerator_memory(sram_address=0x00000, accelerator_dram_address=0,
+                                          element_size=H, general_reg_src=a_reg)
+
+            if reverse:
+                ue.generate_instruction_add_dec(i_reg)
+            else:
+                ue.generate_instruction_add_inc(i_reg)
+            ue.loop_end()
+            ue.release_isa_reg()   # a_reg
+            ue.release_isa_reg()   # i_reg
 
         run_direction(False, w["Wx_f"], w["Wh_f"], w["b_f"], 0)
         run_direction(True, w["Wx_b"], w["Wh_b"], w["b_b"], H * 2)
@@ -657,12 +816,12 @@ class ProsodyDurationFPGA:
 
         gb = ue.dma_from_accelerator_memory(gb_dram, (2 * C,))
         gamma, beta = gb[:C], gb[C:]
-        gamma_tiled = self._up(gamma.unsqueeze(0).expand(T, C).contiguous())
-        beta_tiled = self._up(beta.unsqueeze(0).expand(T, C).contiguous())
+        gamma_tiled = self._up_cap(gamma.unsqueeze(0).expand(T, C).contiguous(), _cap() * C)
+        beta_tiled = self._up_cap(beta.unsqueeze(0).expand(T, C).contiguous(), _cap() * C)
 
-        normed_dram = ue.allocate_tensor_dram(T * C * 2)
-        ng_dram = ue.allocate_tensor_dram(T * C * 2)
-        tmp_dram = ue.allocate_tensor_dram(T * C * 2)
+        normed_dram = ue.allocate_tensor_dram(_cap() * C * 2)
+        ng_dram = ue.allocate_tensor_dram(_cap() * C * 2)
+        tmp_dram = ue.allocate_tensor_dram(_cap() * C * 2)
         ue.start_capture()
         _dyn_layernorm(ue, M=T, N=C, A_DRAM_ADDR=x_dram, OUTPUT_DRAM_ADDR=normed_dram)
         _dyn_eltwise(ue, T, C, normed_dram, gamma_tiled, ng_dram, mode=UE_MODE.ELTWISE_MUL)   # normed*gamma
@@ -677,6 +836,7 @@ class ProsodyDurationFPGA:
         """
         ue = self.ue
         C, style_dim = self.C, self.style_dim
+        _set_row_cap(T, T_CAP, "T")
         debug_log = []
 
         def _check(name, dram_addr, shape, cpu_ref, cols=None):
@@ -697,9 +857,10 @@ class ProsodyDurationFPGA:
         self.identity_dram = self._up(torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
 
         style_dram = self._up(_bf16(style_vec))
-        style_tiled_dram = self._up(_bf16(style_vec).unsqueeze(0).expand(T, style_dim).contiguous())
+        style_tiled_dram = self._up_cap(_bf16(style_vec).unsqueeze(0).expand(T, style_dim).contiguous(),
+                                        _cap() * style_dim)
 
-        x_dram = ue.allocate_tensor_dram(T * C * 2)
+        x_dram = ue.allocate_tensor_dram(_cap() * C * 2)
         ue.dma_to_accelerator_memory(x_dram, _bf16(d_en.T))  # [T, 512]
 
         # --- Stage A: 3x (BiLSTM + AdaLayerNorm + style-concat) -> d ---
@@ -707,21 +868,21 @@ class ProsodyDurationFPGA:
         # docstring), so it CANNOT be called from inside another active capture -- LSTM and concat
         # each get their own bracket instead of one big Stage-A capture.
         ue.start_capture()
-        cur_dram = ue.allocate_tensor_dram(T * (C + style_dim) * 2)
+        cur_dram = ue.allocate_tensor_dram(_cap() * (C + style_dim) * 2)
         self._concat_columns(x_dram, C, style_tiled_dram, style_dim, T, cur_dram)  # [T, 640]
         self._run(ue)
 
         for lw, aw in zip(self.lstm_blocks, self.adaln_blocks):
             ue.start_capture()
-            lstm_out_dram = ue.allocate_tensor_dram(T * C * 2)
+            lstm_out_dram = ue.allocate_tensor_dram(_cap() * C * 2)
             self._lstm_bidir(cur_dram, T, C + style_dim, lw, lstm_out_dram)  # [T, 512]
             self._run(ue)
 
-            adaln_out_dram = ue.allocate_tensor_dram(T * C * 2)
+            adaln_out_dram = ue.allocate_tensor_dram(_cap() * C * 2)
             self._adaln(lstm_out_dram, T, C, style_dram, aw, adaln_out_dram)  # [T, 512]
 
             ue.start_capture()
-            cur_dram = ue.allocate_tensor_dram(T * (C + style_dim) * 2)
+            cur_dram = ue.allocate_tensor_dram(_cap() * (C + style_dim) * 2)
             self._concat_columns(adaln_out_dram, C, style_tiled_dram, style_dim, T, cur_dram)  # [T, 640]
             self._run(ue)
         d_dram = cur_dram  # [T, 640] -- matches KokoroModel.forward_with_tokens's `d`
@@ -729,14 +890,14 @@ class ProsodyDurationFPGA:
 
         # --- Stage B: predictor.lstm ---
         ue.start_capture()
-        pred_lstm_out_dram = ue.allocate_tensor_dram(T * C * 2)
+        pred_lstm_out_dram = ue.allocate_tensor_dram(_cap() * C * 2)
         self._lstm_bidir(d_dram, T, C + style_dim, self.pred_lstm_w, pred_lstm_out_dram)  # [T, 512]
         self._run(ue)
         _check("predictor.lstm output", pred_lstm_out_dram, (T, C), debug_cpu_ref["lstm_out"] if debug_cpu_ref else None)
 
         # --- Stage C: duration_proj (N padded to 64, see __init__'s dur_w/dur_b comment) ---
         ue.start_capture()
-        dur_dram = ue.allocate_tensor_dram(T * self.dur_n_pad * 2)
+        dur_dram = ue.allocate_tensor_dram(_cap() * self.dur_n_pad * 2)
         _dyn_matmul(ue, M=T, K=C, N=self.dur_n_pad, A_DRAM_ADDR=pred_lstm_out_dram, B_DRAM_ADDR=self._up(self.dur_w),
                             OUTPUT_DRAM_ADDR=dur_dram, C_DRAM_ADDR=self._up(self.dur_b), bias_mode="broadcast_N")
         self._run(ue)
@@ -850,6 +1011,14 @@ class F0NPredictionFPGA:
         self.ue.dma_to_accelerator_memory(a, tensor.reshape(-1))
         return a
 
+    def _up_cap(self, tensor: torch.Tensor, cap_elems: int) -> int:
+        """Upload `tensor` but RESERVE cap_elems, so the allocator advances by a constant amount.
+        The tensor's own layout is untouched -- only the address becomes prompt-independent."""
+        assert tensor.numel() <= cap_elems, (tensor.numel(), cap_elems)
+        a = self.ue.allocate_tensor_dram(cap_elems * 2)
+        self.ue.dma_to_accelerator_memory(a, tensor.reshape(-1))
+        return a
+
     def _run(self, ue):
         _timed_run(ue)
 
@@ -882,26 +1051,65 @@ class F0NPredictionFPGA:
                 _dyn_eltwise(ue, 1, H, tmp, None, tmp, mode=UE_MODE.MUL_BROADCAST, scalar=2.0)
                 _dyn_eltwise(ue, 1, H, tmp, None, dst, mode=UE_MODE.ADD_BROADCAST, scalar=-1.0)
 
-            time_range = range(T - 1, -1, -1) if reverse else range(T)
-            h_prev, c_prev = h_bufs[0], c_bufs[0]
-            for step, t in enumerate(time_range):
-                x_t = x_dram + t * Cin * 2
-                h_cur, c_cur = h_bufs[(step + 1) % 2], c_bufs[(step + 1) % 2]
-                _dyn_matmul(ue, M=1, K=Cin, N=G, A_DRAM_ADDR=x_t, B_DRAM_ADDR=wx_dram,
-                                    OUTPUT_DRAM_ADDR=gates_x, C_DRAM_ADDR=b_dram, bias_mode="broadcast_N")
-                _dyn_matmul(ue, M=1, K=H, N=G, A_DRAM_ADDR=h_prev, B_DRAM_ADDR=wh_dram, OUTPUT_DRAM_ADDR=gates_h)
-                _dyn_eltwise(ue, 1, G, gates_x, gates_h, gates, mode=UE_MODE.ELTWISE_ADD)
-                i_raw, f_raw, g_raw, o_raw = (gates + k * H * 2 for k in range(4))
-                sigmoid_ip(i_raw, i_d); sigmoid_ip(f_raw, f_d); sigmoid_ip(o_raw, o_d)
-                tanh_via_sigmoid(g_raw, g_tmp, g_d)
-                _dyn_eltwise(ue, 1, H, f_d, c_prev, fc_, mode=UE_MODE.ELTWISE_MUL)
-                _dyn_eltwise(ue, 1, H, i_d, g_d, ig_, mode=UE_MODE.ELTWISE_MUL)
-                _dyn_eltwise(ue, 1, H, fc_, ig_, c_cur, mode=UE_MODE.ELTWISE_ADD)
-                tanh_via_sigmoid(c_cur, c_tmp, tanh_c)
-                _dyn_eltwise(ue, 1, H, o_d, tanh_c, h_cur, mode=UE_MODE.ELTWISE_MUL)
-                out_addr = out_dram + t * (2 * H) * 2 + col_off_bytes
-                _dyn_eltwise(ue, 1, H, o_d, tanh_c, out_addr, mode=UE_MODE.ELTWISE_MUL)
-                h_prev, c_prev = h_cur, c_cur
+            # ONE hardware loop instead of T Python-unrolled bodies. The recurrence is still
+            # strictly sequential -- this changes only how the instruction stream is EMITTED, not
+            # the order the accelerator executes in.
+            #
+            # Two things varied per timestep and both are now register-computed:
+            #   * the input row x[t], gathered into a fixed scratch buffer;
+            #   * the output row out[t], scattered from a fixed buffer.
+            # Everything between keeps literal addresses, so the body is the same op sequence as
+            # before; only the gather/scatter use general_reg_src. That avoids forcing every M=1
+            # matmul onto the dynamic path just to source an address.
+            #
+            # h/c became SINGLE in-place buffers (they used to ping-pong per timestep, which a loop
+            # body cannot express). Safe: gates_h reads h before h is rewritten at the end of the
+            # body, and fc_ consumes c before c is rewritten -- every read precedes its write.
+            x_scratch = ue.allocate_tensor_dram(Cin * 2)
+            h_buf, c_buf = h_bufs[0], c_bufs[0]
+            i_reg = ue.alloc_isa_reg()
+            a_reg = ue.alloc_isa_reg()
+            ue.generate_instruction_add_set(i_reg, (T - 1) if reverse else 0)
+            ue.loop_start(loop_cnt=T)
+
+            ue.generate_instruction_reg_mul_imm(a_reg, i_reg, ue_35bit_addr_shifter(Cin * 2))
+            ue.generate_instruction_add_imm(a_reg, ue_35bit_addr_shifter(x_dram), a_reg)
+            ue.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=0x00000,
+                                          element_size=Cin, general_reg_src=a_reg)
+            ue.sram_to_accelerator_memory(sram_address=0x00000,
+                                          accelerator_dram_address=x_scratch, element_size=Cin)
+
+            _dyn_matmul(ue, M=1, K=Cin, N=G, A_DRAM_ADDR=x_scratch, B_DRAM_ADDR=wx_dram,
+                        OUTPUT_DRAM_ADDR=gates_x, C_DRAM_ADDR=b_dram, bias_mode="broadcast_N")
+            _dyn_matmul(ue, M=1, K=H, N=G, A_DRAM_ADDR=h_buf, B_DRAM_ADDR=wh_dram,
+                        OUTPUT_DRAM_ADDR=gates_h)
+            _dyn_eltwise(ue, 1, G, gates_x, gates_h, gates, mode=UE_MODE.ELTWISE_ADD)
+
+            i_raw, f_raw, g_raw, o_raw = (gates + k * H * 2 for k in range(4))
+            sigmoid_ip(i_raw, i_d); sigmoid_ip(f_raw, f_d); sigmoid_ip(o_raw, o_d)
+            tanh_via_sigmoid(g_raw, g_tmp, g_d)
+
+            _dyn_eltwise(ue, 1, H, f_d, c_buf, fc_, mode=UE_MODE.ELTWISE_MUL)
+            _dyn_eltwise(ue, 1, H, i_d, g_d, ig_, mode=UE_MODE.ELTWISE_MUL)
+            _dyn_eltwise(ue, 1, H, fc_, ig_, c_buf, mode=UE_MODE.ELTWISE_ADD)
+
+            tanh_via_sigmoid(c_buf, c_tmp, tanh_c)
+            _dyn_eltwise(ue, 1, H, o_d, tanh_c, h_buf, mode=UE_MODE.ELTWISE_MUL)
+
+            ue.accelerator_memory_to_sram(accelerator_dram_address=h_buf, sram_address=0x00000,
+                                          element_size=H)
+            ue.generate_instruction_reg_mul_imm(a_reg, i_reg, ue_35bit_addr_shifter((2 * H) * 2))
+            ue.generate_instruction_add_imm(a_reg, ue_35bit_addr_shifter(out_dram + col_off_bytes), a_reg)
+            ue.sram_to_accelerator_memory(sram_address=0x00000, accelerator_dram_address=0,
+                                          element_size=H, general_reg_src=a_reg)
+
+            if reverse:
+                ue.generate_instruction_add_dec(i_reg)
+            else:
+                ue.generate_instruction_add_inc(i_reg)
+            ue.loop_end()
+            ue.release_isa_reg()   # a_reg
+            ue.release_isa_reg()   # i_reg
 
         run_direction(False, w["Wx_f"], w["Wh_f"], w["b_f"], 0)
         run_direction(True, w["Wx_b"], w["Wh_b"], w["b_b"], H * 2)
@@ -943,7 +1151,7 @@ class F0NPredictionFPGA:
                                 C_DRAM_ADDR=(self._up(b) if b is not None else None),
                                 bias_mode="broadcast_N")
             return
-        x_pad_dram = ue.allocate_tensor_dram((T + 2 * pad) * Cin * 2)
+        x_pad_dram = ue.allocate_tensor_dram((_cap() + 2 * pad) * Cin * 2)
         ue.dma_to_accelerator_memory(
             x_pad_dram, torch.zeros((T + 2 * pad) * Cin, dtype=torch.bfloat16))  # constant zero-fill, safe direct DMA
         self._device_row_copy(x_dram, x_pad_dram + pad * Cin * 2, T, Cin)  # on-device, NOT a host round-trip
@@ -961,8 +1169,8 @@ class F0NPredictionFPGA:
             ue.dma_to_accelerator_memory(zeros_dram, torch.zeros(n_pad_rows * Cin, dtype=torch.bfloat16))
             self._device_row_copy(zeros_dram, x_pad_dram + (pad + real_T) * Cin * 2, n_pad_rows, Cin)
         w_tap_dram = [self._up(W[:, :, k].contiguous()) for k in range(kernel_size)]
-        acc_a = ue.allocate_tensor_dram(T * Cout * 2)
-        acc_b = ue.allocate_tensor_dram(T * Cout * 2)
+        acc_a = ue.allocate_tensor_dram(_cap() * Cout * 2)
+        acc_b = ue.allocate_tensor_dram(_cap() * Cout * 2)
         for k in range(kernel_size):
             A_DRAM_ADDR = x_pad_dram + k * Cin * 2
             prev_acc = acc_a if k % 2 == 0 else acc_b
@@ -1020,26 +1228,26 @@ class F0NPredictionFPGA:
         # copy (x_dram -> group0; group1 is a constant zero-fill, a safe direct DMA since it doesn't
         # depend on any same-capture-block predecessor) -- then scattered into the interleaved
         # [T,2,C] == dilated [2T-1,C] layout via bf16_permute_dram_core's native strided write.
-        grouped_dram = ue.allocate_tensor_dram(2 * T * C * 2)
+        grouped_dram = ue.allocate_tensor_dram(2 * _cap() * C * 2)
         ue.dma_to_accelerator_memory(grouped_dram + T * C * 2, torch.zeros(T * C, dtype=torch.bfloat16))
         self._device_row_copy(x_dram, grouped_dram, T, C)  # on-device, NOT a host round-trip
-        dilated_dram = ue.allocate_tensor_dram((dilated_len + 1) * C * 2)
+        dilated_dram = ue.allocate_tensor_dram(((2 * _cap()) + 1) * C * 2)
         ue.bf16_permute_dram_core(num_groups=2, group_rows=T, row_width=C,
                                    in_dram=grouped_dram, out_dram=dilated_dram, write_grouped=False)
 
         pad_l, pad_r = 1, 2
         L_pad = pad_l + dilated_len + pad_r
-        x_dilated_pad = ue.allocate_tensor_dram(L_pad * C * 2)
+        x_dilated_pad = ue.allocate_tensor_dram((2 * _cap() + 4) * C * 2)
         ue.dma_to_accelerator_memory(x_dilated_pad, torch.zeros(L_pad * C, dtype=torch.bfloat16))  # constant, safe
         self._device_row_copy(dilated_dram, x_dilated_pad + pad_l * C * 2, dilated_len, C)  # on-device
 
         T_out = 2 * T
         assert L_pad - 3 + 1 == T_out, (L_pad, T_out)
         w_tap_tiled = [W[:, 0, 2 - k].unsqueeze(0).expand(T_out, C).contiguous() for k in range(3)]  # flipped taps
-        w_tap_dram = [self._up(w_tap_tiled[k]) for k in range(3)]
-        tmp = [ue.allocate_tensor_dram(T_out * C * 2) for _ in range(3)]
-        acc_a = ue.allocate_tensor_dram(T_out * C * 2)
-        acc_b = ue.allocate_tensor_dram(T_out * C * 2)
+        w_tap_dram = [self._up_cap(w_tap_tiled[k], _cap() * C) for k in range(3)]
+        tmp = [ue.allocate_tensor_dram(_cap() * C * 2) for _ in range(3)]
+        acc_a = ue.allocate_tensor_dram(_cap() * C * 2)
+        acc_b = ue.allocate_tensor_dram(_cap() * C * 2)
         running = None
         for k in range(3):
             shifted_x = x_dilated_pad + k * C * 2
@@ -1050,7 +1258,7 @@ class F0NPredictionFPGA:
             cur = acc_a if k % 2 == 1 else acc_b
             _dyn_eltwise(ue, T_out, C, tmp[k], running, cur, mode=UE_MODE.ELTWISE_ADD)
             running = cur
-        b_tiled_dram = self._up(b.unsqueeze(0).expand(T_out, C).contiguous())
+        b_tiled_dram = self._up_cap(b.unsqueeze(0).expand(T_out, C).contiguous(), _cap() * C)
         _dyn_eltwise(ue, T_out, C, running, b_tiled_dram, out_dram, mode=UE_MODE.ELTWISE_ADD)
 
     def _adain1d(self, x_dram, T, C, style_dram, fc_w, fc_b, out_dram, real_T=None):
@@ -1082,8 +1290,8 @@ class F0NPredictionFPGA:
             # broadcast (src stride 0 re-reads the same row every iteration), not the strided
             # per-channel scatter it would be in the [C, T] view.
             row_b = C * 2
-            half_a = ue.allocate_tensor_dram(((T + 1) // 2) * row_b)
-            half_b = ue.allocate_tensor_dram(((T + 1) // 2) * row_b)
+            half_a = ue.allocate_tensor_dram(((_cap() + 1) // 2) * row_b)
+            half_b = ue.allocate_tensor_dram(((_cap() + 1) // 2) * row_b)
             sum_dram = _col_sum_rows(ue, x_dram, real_T, C, half_a, half_b)
             mean_dram = ue.allocate_tensor_dram(row_b)
             _dyn_eltwise(ue, 1, C, sum_dram, None, mean_dram,
@@ -1094,7 +1302,7 @@ class F0NPredictionFPGA:
             pad_k = (real_T / T) ** 0.5
         _dyn_matmul(ue, M=1, K=self.style_dim, N=2 * C, A_DRAM_ADDR=style_dram, B_DRAM_ADDR=self._up(fc_w),
                             OUTPUT_DRAM_ADDR=gb_dram, C_DRAM_ADDR=self._up(fc_b), bias_mode="broadcast_N")
-        x_ct_dram = ue.allocate_tensor_dram(T * C * 2)
+        x_ct_dram = ue.allocate_tensor_dram(_cap() * C * 2)
         _dyn_transpose(ue, M=T, N=C, INPUT_DRAM_ADDR=x_dram, OUTPUT_DRAM_ADDR=x_ct_dram,
                                 IDENTITY_DRAM_ADDR=self.identity_dram)
         self._run(ue)
@@ -1106,13 +1314,13 @@ class F0NPredictionFPGA:
             # is normed_real * sqrt(T/real_T). AdaIN computes normed*(1+gamma)+beta, so the
             # correction folds in as gamma' = pad_k*(1+gamma) - 1. Free: gb is already host-side.
             gamma = ((1.0 + gamma.float()) * pad_k - 1.0).to(gamma.dtype)
-        gamma_tiled = self._up(gamma.unsqueeze(1).expand(C, T).contiguous())
-        beta_tiled = self._up(beta.unsqueeze(1).expand(C, T).contiguous())
+        gamma_tiled = self._up_cap(gamma.unsqueeze(1).expand(C, T).contiguous(), C * _cap())
+        beta_tiled = self._up_cap(beta.unsqueeze(1).expand(C, T).contiguous(), C * _cap())
 
-        normed_ct = ue.allocate_tensor_dram(C * T * 2)
-        ng_ct = ue.allocate_tensor_dram(C * T * 2)
-        tmp_ct = ue.allocate_tensor_dram(C * T * 2)
-        out_ct = ue.allocate_tensor_dram(C * T * 2)
+        normed_ct = ue.allocate_tensor_dram(C * _cap() * 2)
+        ng_ct = ue.allocate_tensor_dram(C * _cap() * 2)
+        tmp_ct = ue.allocate_tensor_dram(C * _cap() * 2)
+        out_ct = ue.allocate_tensor_dram(C * _cap() * 2)
         ue.start_capture()
         _dyn_layernorm(ue, M=C, N=T, A_DRAM_ADDR=x_ct_dram, OUTPUT_DRAM_ADDR=normed_ct)
         _dyn_eltwise(ue, C, T, normed_ct, gamma_tiled, ng_ct, mode=UE_MODE.ELTWISE_MUL)
@@ -1131,46 +1339,46 @@ class F0NPredictionFPGA:
         real_T_out = None if real_T is None else (2 * real_T if upsample else real_T)
         learned_sc = Cin != Cout
 
-        h1_dram = ue.allocate_tensor_dram(T * Cin * 2)
+        h1_dram = ue.allocate_tensor_dram(_cap() * Cin * 2)
         self._adain1d(x_dram, T, Cin, style_dram, w["norm1_fc_w"], w["norm1_fc_b"], h1_dram,
                       real_T=real_T)
 
         ue.start_capture()
-        act1_dram = ue.allocate_tensor_dram(T * Cin * 2)
+        act1_dram = ue.allocate_tensor_dram(_cap() * Cin * 2)
         self._leaky_relu(h1_dram, T, Cin, act1_dram)
         if upsample:
-            pooled_dram = ue.allocate_tensor_dram(T_out * Cin * 2)
+            pooled_dram = ue.allocate_tensor_dram(_cap() * Cin * 2)
             self._depthwise_convtranspose_upsample2x(act1_dram, T, Cin, w["pool_w"], w["pool_b"], pooled_dram)
         else:
             pooled_dram = act1_dram
-        conv1_out_dram = ue.allocate_tensor_dram(T_out * Cout * 2)
+        conv1_out_dram = ue.allocate_tensor_dram(_cap() * Cout * 2)
         self._conv1d(pooled_dram, T_out, Cin, Cout, w["conv1_w"], w["conv1_b"], conv1_out_dram, kernel_size=3, pad=1,
                      real_T=real_T_out)
         self._run(ue)
 
-        h2_dram = ue.allocate_tensor_dram(T_out * Cout * 2)
+        h2_dram = ue.allocate_tensor_dram(_cap() * Cout * 2)
         self._adain1d(conv1_out_dram, T_out, Cout, style_dram, w["norm2_fc_w"], w["norm2_fc_b"], h2_dram,
                       real_T=real_T_out)
 
         ue.start_capture()
-        act2_dram = ue.allocate_tensor_dram(T_out * Cout * 2)
+        act2_dram = ue.allocate_tensor_dram(_cap() * Cout * 2)
         self._leaky_relu(h2_dram, T_out, Cout, act2_dram)
-        residual_dram = ue.allocate_tensor_dram(T_out * Cout * 2)
+        residual_dram = ue.allocate_tensor_dram(_cap() * Cout * 2)
         self._conv1d(act2_dram, T_out, Cout, Cout, w["conv2_w"], w["conv2_b"], residual_dram, kernel_size=3, pad=1,
                      real_T=real_T_out)
 
         if upsample:
-            sc_dram = ue.allocate_tensor_dram(T_out * Cin * 2)
+            sc_dram = ue.allocate_tensor_dram(_cap() * Cin * 2)
             self._nearest_upsample2x(x_dram, T, Cin, sc_dram)
         else:
             sc_dram = x_dram
         if learned_sc:
-            sc_proj_dram = ue.allocate_tensor_dram(T_out * Cout * 2)
+            sc_proj_dram = ue.allocate_tensor_dram(_cap() * Cout * 2)
             self._conv1d(sc_dram, T_out, Cin, Cout, w["conv1x1_w"], None, sc_proj_dram, kernel_size=1, pad=0)
             sc_dram = sc_proj_dram
 
-        out_dram = ue.allocate_tensor_dram(T_out * Cout * 2)
-        sum_dram = ue.allocate_tensor_dram(T_out * Cout * 2)
+        out_dram = ue.allocate_tensor_dram(_cap() * Cout * 2)
+        sum_dram = ue.allocate_tensor_dram(_cap() * Cout * 2)
         _dyn_eltwise(ue, T_out, Cout, residual_dram, sc_dram, sum_dram, mode=UE_MODE.ELTWISE_ADD)
         _dyn_eltwise(ue, T_out, Cout, sum_dram, None, out_dram, mode=UE_MODE.MUL_BROADCAST, scalar=0.7071067811865476)
         self._run(ue)
@@ -1182,6 +1390,8 @@ class F0NPredictionFPGA:
         style_vec: [128]. Returns (F0_pred [n_frames], N_pred [n_frames]) FloatTensors.
         """
         ue = self.ue
+        _set_row_cap(2 * _round_up(int(pred_dur.sum().item()), UE_VECTOR_SIZE),
+                     2 * F_CAP, "2 x padded n_frames")
         debug_log = []
 
         def _check(name, dram_addr, shape, cpu_ref, cols=None, rows=None):
@@ -1229,13 +1439,13 @@ class F0NPredictionFPGA:
         d_T[:, :T] = _bf16(d).T
 
         ue.start_capture()
-        en_dram = ue.allocate_tensor_dram(nf_pad * 640 * 2)
-        _dyn_matmul(ue, M=nf_pad, K=T_pad, N=640, A_DRAM_ADDR=self._up(pred_aln_trg_T),
-                            B_DRAM_ADDR=self._up(d_T.contiguous()), OUTPUT_DRAM_ADDR=en_dram)
+        en_dram = ue.allocate_tensor_dram(_cap() * 640 * 2)
+        _dyn_matmul(ue, M=nf_pad, K=T_pad, N=640, A_DRAM_ADDR=self._up_cap(pred_aln_trg_T, _cap() * T_CAP),
+                            B_DRAM_ADDR=self._up_cap(d_T.contiguous(), 640 * T_CAP), OUTPUT_DRAM_ADDR=en_dram)
         self._run(ue)
 
         # --- predictor.shared LSTM ---
-        shared_out_dram = ue.allocate_tensor_dram(nf_pad * 512 * 2)
+        shared_out_dram = ue.allocate_tensor_dram(_cap() * 512 * 2)
         # Zero the whole buffer up front: the LSTM below writes only the first n_frames rows (it is
         # a SEQUENTIAL bidirectional pass -- running it over the padding would have the backward
         # direction start inside the pad and corrupt every real timestep), so rows n_frames..nf_pad
@@ -1263,7 +1473,7 @@ class F0NPredictionFPGA:
                     _check(f"{branch_name} block {i}", cur_dram, (cur_T, cur_C), cpu_refs[i], rows=real_T)
 
             ue.start_capture()
-            proj_dram = ue.allocate_tensor_dram(cur_T * proj_n_pad * 2)
+            proj_dram = ue.allocate_tensor_dram(_cap() * proj_n_pad * 2)
             _dyn_matmul(ue, M=cur_T, K=cur_C, N=proj_n_pad, A_DRAM_ADDR=cur_dram, B_DRAM_ADDR=self._up(proj_w),
                                 OUTPUT_DRAM_ADDR=proj_dram, C_DRAM_ADDR=self._up(proj_b), bias_mode="broadcast_N")
             self._run(ue)
@@ -1321,6 +1531,7 @@ class TextEncoderFPGA:
     _leaky_relu = F0NPredictionFPGA._leaky_relu
     _device_row_copy = F0NPredictionFPGA._device_row_copy
     _up = F0NPredictionFPGA._up
+    _up_cap = F0NPredictionFPGA._up_cap
     _run = F0NPredictionFPGA._run
 
     def __init__(self, model, ue: UnifiedEngine):
@@ -1356,6 +1567,7 @@ class TextEncoderFPGA:
         """
         ue = self.ue
         C, T_pad = self.C, _round_up(T, UE_VECTOR_SIZE)
+        _set_row_cap(T_pad, T_CAP, "T_pad")
         row_bytes = C * 2
         debug_log = []
 
@@ -1369,37 +1581,32 @@ class TextEncoderFPGA:
             debug_log.append((name, calculate_snr(cpu_ref.detach().float().reshape(-1), got.reshape(-1))))
 
         self.identity_dram = self._up(torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
-        emb_dram = self._up(self.emb_w)
 
         # ---- phoneme embedding gather (same row-copy technique as Section 1's) ----
         # Zero-fill first, at emit time: the captured gather below writes ONLY rows 0..T-1, and no
         # other captured op touches rows T..T_pad, so the host zeros survive to execution. (Where a
         # captured op DOES rewrite the region, a host DMA would be silently clobbered -- see
         # _conv1d's real_T handling.) Zero is also what the CPU mask puts in padded positions.
-        x_dram = ue.allocate_tensor_dram(T_pad * C * 2)
-        ue.dma_to_accelerator_memory(x_dram, torch.zeros(T_pad * C, dtype=torch.bfloat16))
-        ue.start_capture()
-        for i in range(T):
-            tok_id = int(input_ids[i].item())
-            ue.accelerator_memory_to_sram(accelerator_dram_address=emb_dram + tok_id * row_bytes,
-                                          sram_address=0x00000, element_size=C)
-            ue.sram_to_accelerator_memory(sram_address=0x00000,
-                                          accelerator_dram_address=x_dram + i * row_bytes,
-                                          element_size=C)
-        self._run(ue)
+        # Gathered HOST-side: the ids are known at capture time, so indexing the table here gives
+        # the identical result with ZERO instructions -- this was the last emission in this section
+        # that scaled with T. Rows T..T_pad stay zero, which is what the CPU mask puts in padded
+        # positions. The [n_token, C] table no longer needs uploading at all.
+        emb_padded = torch.zeros(T_pad, C, dtype=torch.bfloat16)
+        emb_padded[:T] = self.emb_w[input_ids[:T].reshape(-1).long()]
+        x_dram = self._up_cap(emb_padded, _cap() * C)
         _check("embedding", x_dram, (T_pad, C),
                debug_cpu_ref["embedding"] if debug_cpu_ref else None, rows=T)
 
         # ---- 3 x (Conv1d k=5 -> LayerNorm -> LeakyReLU(0.2)) ----
         for i, w in enumerate(self.cnn_blocks):
             ue.start_capture()
-            conv_dram = ue.allocate_tensor_dram(T_pad * C * 2)
+            conv_dram = ue.allocate_tensor_dram(_cap() * C * 2)
             self._conv1d(x_dram, T_pad, C, C, w["conv_w"], w["conv_b"], conv_dram,
                          kernel_size=self.kernel_size, pad=self.pad, real_T=T)
-            ln_dram = ue.allocate_tensor_dram(T_pad * C * 2)
+            ln_dram = ue.allocate_tensor_dram(_cap() * C * 2)
             _dyn_layernorm(ue, M=T_pad, N=C, A_DRAM_ADDR=conv_dram, OUTPUT_DRAM_ADDR=ln_dram,
                                     GAMMA_DRAM_ADDR=self._up(w["ln_g"]), BETA_DRAM_ADDR=self._up(w["ln_b"]))
-            act_dram = ue.allocate_tensor_dram(T_pad * C * 2)
+            act_dram = ue.allocate_tensor_dram(_cap() * C * 2)
             self._leaky_relu(ln_dram, T_pad, C, act_dram)
             self._run(ue)
             x_dram = act_dram
@@ -1409,7 +1616,7 @@ class TextEncoderFPGA:
         # ---- BiLSTM (C -> 2 * C/2 = C) ----
         # Run over the REAL T only: this is a sequential bidirectional pass, so starting the
         # backward direction inside the alignment padding would corrupt every real timestep.
-        out_dram = ue.allocate_tensor_dram(T_pad * C * 2)
+        out_dram = ue.allocate_tensor_dram(_cap() * C * 2)
         ue.dma_to_accelerator_memory(out_dram, torch.zeros(T_pad * C, dtype=torch.bfloat16))
         ue.start_capture()
         self._lstm_bidir(x_dram, T, C, self.lstm_w, out_dram)
@@ -1441,6 +1648,8 @@ class TextEncoderFPGA:
 # Safe because nothing in the repo calls reset_isa_reg_counter() and start_capture() leaves the
 # counter alone, so the reservation survives every capture in the run.
 GPR_M, GPR_K, GPR_N = 1, 2, 3
+
+
 
 # Below this many output rows the dynamic path is a net loss: it costs 3 ADD_SETs to prime the
 # dimension registers, while the legacy path emits one matvec per row. The LSTM's per-timestep
@@ -1514,6 +1723,25 @@ def _dyn_activation(ue, *args, **kw):
         ue.generate_instruction_add_set(GPR_M, M)
         kw["gpr_M_reg"] = GPR_M
     return ue.activation_core(*args, **kw)
+
+
+
+def _dyn_attention(ue, **kw):
+    """unified_attention_core with its dimensions in registers.
+
+    Section 1 calls this 144 times (12 heads x 12 layers) at batch = aligned_seq_len = T_pad, and
+    the legacy path emits per-row work each time -- which is why Section 1 was the largest section
+    (171k instructions at T=138) despite having no per-timestep loop of its own. The GPR parameters
+    already existed (user_dma_core.py:7164); nothing was passing them.
+    """
+    batch = kw.get("batch")
+    aligned = kw.get("aligned_seq_len")
+    if batch is not None and batch >= _DYN_M_MIN and kw.get("gpr_batch_reg") is None:
+        ue.generate_instruction_add_set(GPR_M, batch)
+        ue.generate_instruction_add_set(GPR_K, aligned)
+        kw["gpr_batch_reg"] = GPR_M
+        kw["gpr_aligned_seq_len_reg"] = GPR_K
+    return ue.unified_attention_core(**kw)
 
 
 def _pbi_row_loop(ue, n_rows, reads, writes, gpr_rows=None, sram_addr=0x00000):
@@ -1662,6 +1890,7 @@ class DecoderFPGA:
     _concat_columns = ProsodyDurationFPGA._concat_columns   # lives on Section 2, not Section 3
     _device_row_copy = F0NPredictionFPGA._device_row_copy
     _up = F0NPredictionFPGA._up
+    _up_cap = F0NPredictionFPGA._up_cap
     _run = F0NPredictionFPGA._run
 
     def __init__(self, model, ue: UnifiedEngine):
@@ -1737,6 +1966,7 @@ class DecoderFPGA:
 
         T = asr.shape[-1]
         T_pad = _round_up(T, UE_VECTOR_SIZE)
+        _set_row_cap(2 * T_pad, 2 * F_CAP, "2 x padded asr frames")
         self.identity_dram = self._up(torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
         style_dram = self._up(_bf16(s))
 
@@ -1746,7 +1976,7 @@ class DecoderFPGA:
         x0[:T, self.C_asr] = _bf16(F0[0])
         x0[:T, self.C_asr + 1] = _bf16(Nc[0])
         _tile_pad_channels(x0, self.C_enc_in)
-        x_dram = self._up(x0)
+        x_dram = self._up_cap(x0, _cap() * self.C_enc_in_pad)
 
         cur_dram, cur_C = self._adain_res_blk(
             x_dram, T_pad, self.C_enc_in_pad, self.C_enc_out, False, self.encode_w,
@@ -1763,14 +1993,14 @@ class DecoderFPGA:
         side[:T, self.C_res] = _bf16(F0[0])
         side[:T, self.C_res + 1] = _bf16(Nc[0])
         _tile_pad_channels(side, self.C_res + 2)
-        side_dram = self._up(side)
+        side_dram = self._up_cap(side, _cap() * side_w)
 
         cur_T, real_T = T_pad, T
         res = True
         for i, (blk, w) in enumerate(zip(dec.decode, self.decode_w)):
             if res:
                 ue.start_capture()
-                cat_dram = ue.allocate_tensor_dram(cur_T * self.C_dec_in_pad * 2)
+                cat_dram = ue.allocate_tensor_dram(_cap() * self.C_dec_in_pad * 2)
                 self._concat_columns(cur_dram, self.C_enc_out, side_dram, side_w, cur_T, cat_dram)
                 self._run(ue)
                 cur_dram, cur_C = cat_dram, self.C_dec_in_pad
@@ -1797,7 +2027,7 @@ class DecoderFPGA:
 
 
 def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: float = 1.0,
-                     dev: str = "xdma0", debug: bool = False):
+                     dev: str = "xdma0", debug: bool = False, dump_programs: str = None):
     """Entry point called from kokoro_test.py --fpga. Only runs the section(s) currently ported to
     hardware (Section 1: PL-BERT) and reports their SNR against the CPU reference, with a bisect
     down to sub-stage granularity within each layer. Deliberately does NOT fall back to running the
@@ -1807,7 +2037,10 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
     """
     set_dma_device(dev)
     _DEBUG_SNR[0] = debug
-    ue = UnifiedEngine()
+    _DUMP_PROGRAMS[0] = dump_programs
+    ue = UnifiedEngine(params_dram_base=KOKORO_PARAMS_BASE,
+                       program_dram_base=KOKORO_PROGRAM_BASE,
+                       tensor_dram_base=KOKORO_TENSOR_BASE)
     _instrument(ue)
     global _SILENT_MODE
     _SILENT_MODE = True   # hide the cores' per-call tiling/FLOP prints
@@ -1995,6 +2228,7 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
         _CUR[0] = None
         report(f"[fpga] Pipeline complete: sections 1-5a on hardware, generator on CPU.")
         _report_timings()
+        _dump_program_fingerprints()
         _SILENT_MODE = False     # hand normal printing back to the caller
         return audio
 

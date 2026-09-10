@@ -652,6 +652,10 @@ def main():
                               "FPGA section's own output.")
     parser.add_argument("--dev", type=str, default="xdma0",
                          help="XDMA device name for the FPGA path (e.g. xdma0).")
+    parser.add_argument("--dump-programs", type=str, default=None, dest="dump_programs",
+                         help="Write per-program instruction fingerprints (section, count, sha1) "
+                              "to this JSON path. Diff two prompt lengths to see which captured "
+                              "programs are already prompt-independent.")
     parser.add_argument("--debug-snr", action="store_true", dest="debug_snr",
                          help="Print the per-section SNR bisects against the CPU reference. "
                               "Bring-up instrumentation; off by default.")
@@ -688,7 +692,8 @@ def main():
         from fpga_forward import run_fpga_forward
         print("Running FPGA inference (only sections currently ported to hardware) ...")
         audio = run_fpga_forward(model, phonemes, ref_s[len(phonemes) - 1], speed=args.speed,
-                                 dev=args.dev, debug=args.debug_snr)
+                                 dev=args.dev, debug=args.debug_snr,
+                                 dump_programs=args.dump_programs)
         if audio is None:
             return  # see fpga_forward.py's section checklist
         import soundfile as sf
