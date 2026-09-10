@@ -1687,8 +1687,23 @@ class MultiEngineScheduler:
 
     # --------------------------------------------------------------- heads --
     def split_heads(self, H: int, gqa_ratio: int = 1,
-                    mode: str = "groups") -> list[tuple[int, int]]:
+                    mode: str = "groups",
+                    max_engines: Optional[int] = None) -> list[tuple[int, int]]:
         """Return [(head_offset, head_count)] per engine for H attention heads.
+
+        ``max_engines`` caps how many engines take part, the head-axis twin of
+        :meth:`split_cols`'s parameter. The list is always ``num_engines`` long;
+        engines past the cap get ``(H, 0)`` -- no heads, no emission, and they
+        still pass through the region's entry and exit rendezvous, so the
+        program's barrier sequence is identical whatever the cap.
+
+        USE IT WHEN H IS THE CEILING, NOT THE ENGINE COUNT. A model with 8 Q
+        heads on a 12-engine board cannot give all twelve a head however the
+        split is written; without a cap the caller's only options are an
+        assertion or a fallback to the primary alone, and the fallback is the
+        worse of the two by a factor of H -- one engine doing work that eight
+        could share. Pass ``max_engines=H // gqa_ratio`` (or ``H`` under
+        ``"qheads"``) and the region runs on as many engines as there are heads.
 
         ``mode="groups"`` (default) splits on KV-GROUP boundaries, so every
         engine owns whole groups and each KV plane is transposed to ``V^T``
@@ -1710,33 +1725,38 @@ class MultiEngineScheduler:
         gives only 2 groups), and ``"groups"`` -- the tidier default -- when
         there are enough groups to go around.
         """
-        n = self.num_engines
+        n_all = self.num_engines
+        n = n_all if max_engines is None else min(n_all, max(1, max_engines))
         assert gqa_ratio >= 1, f"gqa_ratio must be >= 1, got {gqa_ratio}"
         assert H % gqa_ratio == 0, (
             f"split_heads: H={H} is not a multiple of gqa_ratio={gqa_ratio}")
         assert mode in ("groups", "qheads"), f"unknown head split mode {mode!r}"
-        if n == 1:
+        if n_all == 1:
             return [(0, H)]
+
+        def _pad(counts):
+            """Offsets for the participating engines, then idle tails at (H, 0)."""
+            offsets = [sum(counts[:i]) for i in range(len(counts))]
+            split = list(zip(offsets, counts))
+            return split + [(H, 0)] * (n_all - len(split))
 
         if mode == "qheads":
             assert H >= n, (
                 f"split_heads(mode='qheads'): H={H} head(s) is fewer than "
-                f"num_engines={n}; there is nothing left to split.")
+                f"{n} engine(s); pass max_engines<={H} to run the region on a "
+                f"subset and leave the rest idle at the barrier.")
             base, rem = divmod(H, n)
-            counts = [base + (1 if i < rem else 0) for i in range(n)]
-            offsets = [sum(counts[:i]) for i in range(n)]
-            return list(zip(offsets, counts))
+            return _pad([base + (1 if i < rem else 0) for i in range(n)])
 
         groups = H // gqa_ratio
         assert groups >= n, (
             f"split_heads: H={H} is only {groups} KV group(s) of {gqa_ratio} "
-            f"head(s), too few for num_engines={n}. Pass mode='qheads' to split "
-            f"within groups (costs a duplicated V^T per straddled group), shard "
-            f"a different axis, or run attention on the primary alone.")
+            f"head(s), too few for {n} engine(s). Pass max_engines<={groups} to "
+            f"run the region on a subset (the rest idle at the barrier), "
+            f"mode='qheads' to split within groups (costs a duplicated V^T per "
+            f"straddled group), or shard a different axis.")
         base, rem = divmod(groups, n)
-        counts = [gqa_ratio * (base + (1 if i < rem else 0)) for i in range(n)]
-        offsets = [sum(counts[:i]) for i in range(n)]
-        return list(zip(offsets, counts))
+        return _pad([gqa_ratio * (base + (1 if i < rem else 0)) for i in range(n)])
 
     @staticmethod
     def attn_scratch_bytes(seq_len: int, head_dim: int, elem_bytes: int = 2) -> int:
@@ -1767,11 +1787,18 @@ class MultiEngineScheduler:
     def begin_head_sharded(self, H: int, seq_len: int, head_dim: int,
                            gqa_ratio: int = 1,
                            elem_bytes: int = 2,
-                           mode: str = "groups") -> list[HeadShardContext]:
-        """Rendezvous, then open a head-sharded region, one context per engine."""
+                           mode: str = "groups",
+                           max_engines: Optional[int] = None) -> list[HeadShardContext]:
+        """Rendezvous, then open a head-sharded region, one context per engine.
+
+        A context is returned for EVERY engine even when ``max_engines`` caps the
+        split: the capped ones carry ``heads == 0``, so ``call_runs()`` is empty
+        and the body emits nothing for them, while the rendezvous -- which does
+        not consult the split -- keeps them in the round.
+        """
         assert self._program_open, "begin_head_sharded() without begin_program()"
         assert not self._in_region, "nested sharded regions are not supported"
-        split = self.split_heads(H, gqa_ratio, mode=mode)
+        split = self.split_heads(H, gqa_ratio, mode=mode, max_engines=max_engines)
         self._region_enter()
         self._in_region = True
         self._region_count += 1
@@ -1782,7 +1809,8 @@ class MultiEngineScheduler:
     def head_sharded_region(self, H: int, seq_len: int, head_dim: int,
                             body: Callable[[HeadShardContext], None],
                             gqa_ratio: int = 1, elem_bytes: int = 2,
-                            mode: str = "groups", join: bool = True) -> None:
+                            mode: str = "groups", join: bool = True,
+                            max_engines: Optional[int] = None) -> None:
         """Replay ``body(ctx)`` once per engine over a head split.
 
         ``join`` defaults to True and should almost always stay there: the next
@@ -1791,7 +1819,8 @@ class MultiEngineScheduler:
         cross-shard read the exit barrier exists for.
         """
         contexts = self.begin_head_sharded(H, seq_len, head_dim, gqa_ratio,
-                                           elem_bytes, mode=mode)
+                                           elem_bytes, mode=mode,
+                                           max_engines=max_engines)
         for ctx in contexts:
             body(ctx)
         self.end_sharded(join=join)
@@ -1807,7 +1836,8 @@ class MultiEngineScheduler:
                                mode: str = "groups",
                                kernel: Optional[Callable] = None,
                                elem_bytes: int = 2,
-                               join: bool = True) -> None:
+                               join: bool = True,
+                               max_engines: Optional[int] = None) -> None:
         """Head-sharded prefill attention -- the whole stage in one call.
 
         ``kernel`` defaults to ``nn_lib.prefill_flash_attention_core``; pass a
@@ -1865,7 +1895,7 @@ class MultiEngineScheduler:
 
         self.head_sharded_region(H, seq_len, head_dim, body,
                                  gqa_ratio=gqa_ratio, elem_bytes=elem_bytes,
-                                 mode=mode, join=join)
+                                 mode=mode, join=join, max_engines=max_engines)
 
     def alloc_col_output(self, name: str, M: int, N: int, elem_bytes: int = 2) -> list[int]:
         """Allocate one contiguous ``[M, cols]`` output buffer PER ENGINE.

@@ -533,6 +533,7 @@ class Gemma4VisionMixin:
                 and _vmeta is not None
                 and _vmeta.get("vision_kernel") == self.vision_kernel
                 and _vmeta.get("multi_core", 1) == self.multi_core
+                and _vmeta.get("dram_layout", "legacy") == self.dram_layout
                 and all(meta is not None for meta in _worker_metas)):
             self._ensure_vision_gate_scheduler()
             bin_path, _ = self._program_image_paths(profile)
@@ -750,7 +751,11 @@ class Gemma4VisionMixin:
                     IDENTITY_addr=self._vis_identity_dram,
                     bias_addr=self.VIS_FLASH_BIAS,
                     scratch_name="vision_attn_scratch",
-                    kernel=_vision_attention_kernel)
+                    kernel=_vision_attention_kernel,
+                    # No-op at <= 12 engines (NH == 12), but it keeps the
+                    # region from collapsing onto the primary should a wider
+                    # bitstream ever run more engines than the tower has heads.
+                    max_engines=NH)
                 self._vis_flops += attn_flops[0]
             # head-major attn output [NH, aligned_S, HD] -> interleaved VIS_Q_DRAM [S, NH, HD]
             self.bf16_permute_dram_core(NH, S, HD, self.VIS_FLASH_OUT_HM, self.VIS_Q_DRAM,
@@ -865,6 +870,7 @@ class Gemma4VisionMixin:
                      "includes_patch_embed": True,
                      "vision_kernel": self.vision_kernel,
                      "multi_core": self.multi_core,
+                     "dram_layout": self.dram_layout,
                      "total_flops": total_flops}
         if profile:
             _vis_meta["profile_checkpoints"] = enc_checkpoints
@@ -890,7 +896,8 @@ class Gemma4VisionMixin:
                 self._store_program_section(
                     f"vision_worker{engine_idx}", worker_addr, worker_bytes,
                     {"parent": "vision", "engine_idx": engine_idx,
-                     "multi_core": self.multi_core}, profile=profile)
+                     "multi_core": self.multi_core,
+                     "dram_layout": self.dram_layout}, profile=profile)
         print(f"  [Vision] encoder section stored ({len(enc_bytes)/1024/1024:.1f} MB @ 0x{base_addr:X}, "
               f"{time.perf_counter()-t0:.1f}s)", flush=True)
 
