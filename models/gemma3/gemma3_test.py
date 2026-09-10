@@ -3683,6 +3683,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             L.append(f"- **Prefill utilization (% peak):** {_util(pf_gflops)}")
         if pf_cpu_ms is not None:
             L.append(f"- **Prefill end-to-end (CPU timer):** {pf_cpu_ms / 1e3:.2f} s")
+            L.append(f"- **Time to first token (TTFT, CPU timer):** {pf_cpu_ms / 1e3:.2f} s")
+        if pf_hw_ms is not None:
+            L.append(f"- **Time to first token (TTFT, HW counter):** {pf_hw_ms:.2f} ms")
         L.append("")
         L.append(f"## Decode")
         L.append("")

@@ -55,6 +55,8 @@ identical at 1 and 8 cores.
 | :--- | ---: | ---: | ---: |
 | Vision (576 patches → 144 tokens) | 21990.2 ms | 3306.2 ms | 6.65× |
 | Prefill (170 tokens) | 22135.0 ms | 3185.5 ms | 6.95× |
+| Time to first token (TTFT, CPU; vision + prefill) | 44.13 s | 6.50 s | 6.79× |
+| Time to first token (TTFT, HW counter; vision + prefill) | 44.13 s | 6.49 s | 6.80× |
 | Decode, 1st token | 207.9 ms (4.81 tok/s) | 33.3 ms (30.02 tok/s) | 6.24× |
 | Decode, average | 214.0 ms (4.67 tok/s) | 34.3 ms (29.13 tok/s) | 6.24× |
 | Decode, long ctx (2048 tokens) † | 282.2 ms | 51.0 ms | 5.54× |

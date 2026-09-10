@@ -36,6 +36,8 @@ python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image -
 | — utilization (% peak) | 90.5% | 70.6% | |
 | Prefill FPGA execution (s) | 24.9 | **4.0** | 6.24× |
 | Prefill end-to-end (CPU) (s) | 25.0 | **4.2** | 5.95× |
+| Time to first token (TTFT, CPU; vision + prefill) (s) | 54.2 | **9.0** | 6.02× |
+| Time to first token (TTFT, HW counter; vision + prefill) (s) | 54.0 | **8.7** | 6.19× |
 | **LM DECODE** |
 | Decode 1st-token speed (tok/s, HW counter) | 7.2 | **31.1** | 4.32× |
 | Decode average throughput (GFLOPS) | 32.3 | **138.1** | 4.28× |
