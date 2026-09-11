@@ -30,10 +30,15 @@ Section status:
       AdainResBlk1d) -> the Generator's input. First section where the CHANNEL
       axis needs 64-alignment (514 -> 576, 1090 -> 1152); padding is applied to
       the conv weights' input-channel axis, not by scrubbing activations.
-  [ ] Section 5b-5d: ISTFTNet Generator (SourceModule/SineGen + STFT, the
-      ConvTranspose1d ups, dilated AdaINResBlock1 stacks with Snake1D,
-      conv_post + iSTFT). Op gaps already proven in user_hw_test.py; the open
-      question is SineGen's unbounded phase vs the [-1,1] Taylor fit.
+  [x] Section 5b: ISTFTNet Generator body (ConvTranspose1d ups, noise_convs,
+      dilated AdaINResBlock1 stacks with Snake1D, conv_post) -> GeneratorFPGA.
+      InstanceNorm at T=30601 uses a chunked-reduction path (no large-N
+      transpose); every op is one program with scratch released afterwards.
+  [x] Section 5c: SineGen + tanh(l_linear) + STFT + CORDIC mag/phase -> `har`
+      (GeneratorFPGA._source_har). Host keeps only the f0-derived increment
+      tables (double-bf16 splits need fp32) and the model's random noise draw.
+  [x] Section 5d: exp (softmax epilogue) / sin-cos (magic mod) + block-Toeplitz
+      iSTFT -> audio (GeneratorFPGA._istft).
 
 Weights are pulled directly from the loaded CPU `model`'s state dict at call
 time (no bin-dump step yet -- that's a later optimization once the full
@@ -52,6 +57,7 @@ uploaded as-is, no transpose needed.
 import builtins
 import hashlib
 import json
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -909,6 +915,8 @@ class PLBertFPGA:
                 return
             _debug_flush(ue, self._run)
             got = ue.dma_from_accelerator_memory(dram_addr, shape)[:T].float()
+            if isinstance(cpu_ref, (tuple, list)):
+                cpu_ref = cpu_ref[0]          # HF AlbertLayer returns (hidden_states, ...)
             snr_db = calculate_snr(cpu_ref.detach().float().reshape(-1), got.reshape(-1))
             debug_log.append((stage_name, snr_db))
 
@@ -996,6 +1004,8 @@ class PLBertFPGA:
                 # tuple[...] type hint) in this transformers version -- confirmed via direct
                 # inspection, so no [0]/tuple-unpack here.
                 hidden_cpu = debug_cpu_ref["layer"](hidden_cpu, attention_mask=debug_cpu_ref["ext_mask"])
+                if isinstance(hidden_cpu, (tuple, list)):
+                    hidden_cpu = hidden_cpu[0]      # newer transformers return (hidden_states, ...)
                 _check(f"layer {layer_idx} full (post-FFN)", hidden_dram, (T_pad, H), hidden_cpu)
 
         ue.start_capture()
@@ -2217,10 +2227,13 @@ class Dim(int):
     back to plain int, which is what a non-affine derivative should be.
     """
 
-    def __new__(cls, value, base=None, mul=1, cap=None):
+    def __new__(cls, value, base=None, mul=1, cap=None, off=0):
         self = super().__new__(cls, int(value))
         self.base = base
         self.mul = int(mul)
+        # Affine offset: runtime value = reg[base] * mul + off. The generator's reflection pad
+        # makes its row count 120*n_frames + 1, which no (base, mul) pair can express.
+        self.off = int(off)
         # The value a kernel is TEMPLATED at. Cores shape their body from the compile-time M --
         # layer_norm_core_dram_dynamic picks its chunk height as min(M, 16), so M=7 emits a
         # 51-instruction body and M=66 a 105-instruction one even though both drive the trip
@@ -2231,21 +2244,30 @@ class Dim(int):
 
     def __mul__(self, k):
         if isinstance(k, int) and not isinstance(k, Dim) and self.base is not None:
-            return Dim(int(self) * k, self.base, self.mul * k, self.cap * k)
+            return Dim(int(self) * k, self.base, self.mul * k, self.cap * k, self.off * k)
         return int(self) * int(k)
 
     __rmul__ = __mul__
+
+    def __add__(self, k):
+        """Adding a constant keeps provenance (it lands in ``off``); Dim + Dim degrades to int."""
+        if isinstance(k, int) and not isinstance(k, Dim) and self.base is not None:
+            return Dim(int(self) + k, self.base, self.mul, self.cap + k, self.off + k)
+        return int(self) + int(k)
+
+    __radd__ = __add__
 
     def __floordiv__(self, k):
         """Exact division keeps provenance (rows = T*C // 64 with C a multiple of 64); anything
         else degrades to a plain int, which then bakes -- the fingerprint diff will show it."""
         if (isinstance(k, int) and not isinstance(k, Dim) and self.base is not None
-                and self.mul % k == 0 and int(self) % k == 0 and self.cap % k == 0):
-            return Dim(int(self) // k, self.base, self.mul // k, self.cap // k)
+                and self.mul % k == 0 and self.off % k == 0 and int(self) % k == 0
+                and self.cap % k == 0):
+            return Dim(int(self) // k, self.base, self.mul // k, self.cap // k, self.off // k)
         return int(self) // int(k)
 
     def __repr__(self):
-        return f"Dim({int(self)}, base={self.base}, mul={self.mul})"
+        return f"Dim({int(self)}, base={self.base}, mul={self.mul}, off={self.off})"
 
 
 def _as_dim(m):
@@ -2265,13 +2287,19 @@ def _emit_M(ue, dim):
     if dim.base is None:
         ue.generate_instruction_add_set(GPR_M, int(dim))
         return GPR_M
-    if dim.mul == 1:
+    if dim.mul == 1 and dim.off == 0:
         return dim.base
-    # reg_mul_imm zero-extends a 16-bit immediate (user_dma_core.py:9241).
-    assert 0 < dim.mul <= 0xFFFF, f"affine coefficient {dim.mul} exceeds the 16-bit immediate field"
     reg = GPR_MSCRATCH[_MSCRATCH_RR[0] % len(GPR_MSCRATCH)]
     _MSCRATCH_RR[0] += 1
+    if dim.mul == 1:
+        ue.generate_instruction_add_imm(dim.base, dim.off, reg)
+        return reg
+    # reg_mul_imm zero-extends a 16-bit immediate (user_dma_core.py:9241).
+    assert 0 < dim.mul <= 0xFFFF, f"affine coefficient {dim.mul} exceeds the 16-bit immediate field"
     ue.generate_instruction_reg_mul_imm(reg, dim.base, dim.mul)
+    if dim.off:
+        assert dim.off > 0, "negative affine offsets are not supported (immediate is unsigned)"
+        ue.generate_instruction_add_imm(reg, dim.off, reg)
     return reg
 
 
@@ -2348,10 +2376,12 @@ def _emit_into(ue, dim, dst):
     if dim.base is None:
         ue.generate_instruction_add_set(dst, int(dim))
     elif dim.mul == 1:
-        ue.generate_instruction_add_imm(dim.base, 0, dst)
+        ue.generate_instruction_add_imm(dim.base, dim.off, dst)
     else:
         assert 0 < dim.mul <= 0xFFFF, dim.mul
         ue.generate_instruction_reg_mul_imm(dst, dim.base, dim.mul)
+        if dim.off:
+            ue.generate_instruction_add_imm(dst, dim.off, dst)
 
 
 
@@ -2778,6 +2808,1168 @@ class DecoderFPGA:
         return x_out
 
 
+# ---------------------------------------------------------------------------
+# Section 5b: ISTFTNet Generator body
+# ---------------------------------------------------------------------------
+# The generator's own capacity. It runs at 20x and 120x the frame count, so a buffer at the
+# model-wide MAX_FRAMES would be 61 MB and the section would need ~3 GB even with scratch reuse.
+# 512 frames is ~12.8 s of audio.
+MAX_GEN_FRAMES = 512
+GEN_T0_CAP = 2 * MAX_GEN_FRAMES                                  # decoder-front output rows
+GEN_T1_CAP = 20 * MAX_GEN_FRAMES                                 # after ups[0] (x10)
+GEN_IN_CHUNK = 4096                                              # InstanceNorm reduction chunk
+GEN_T2_CAP = _round_up(120 * MAX_GEN_FRAMES + 64, GEN_IN_CHUNK)  # after ups[1] (x6) + reflection pad
+GEN_STEP_RAMP = 4096.0
+# Snake range reduction: cos(2*a*x) = sin(2*pi*(a*x/pi + 0.25 mod 1)). The operand reaches ~15
+# turns (measured on the CPU oracle), so the integer part is split off by MAGIC ROUNDING instead of
+# a clamp staircase: n = (p + GEN_MAGIC) - GEN_MAGIC. With magic 192 and |p| < 64, p + magic lies in
+# [128, 256) where the bf16 grid (8-bit significand) is exactly 1.0, so n is an integer and
+# |p - n| <= 1 whether the unit rounds or truncates. HW-MEASURED (magic_round_test): the eltwise
+# unit TRUNCATES -- with 256 the positive half sat on the grid-2 region and |p - n| reached 2.
+# The residual is then shifted by +1 and wrapped once at 1.
+GEN_MAGIC = 192.0
+
+
+class GeneratorFPGA:
+    """Section 5b: everything in ISTFTNet Generator.forward between `har` and `conv_post`, on
+    hardware. `har` (SineGen source + STFT, Section 5c) and exp/sin + iSTFT (Section 5d) stay on
+    the host for now; both are proven compositions in user_hw_test.py, not yet wired.
+
+    Layout is [T, C] rows=time throughout, like Sections 3-5a. Every op is one captured program
+    whose SCRATCH is released afterwards (``_block``): the tensor allocator is rewound to the mark
+    taken after the op's output was allocated. Programs execute synchronously, so nothing still
+    needs the scratch when it is reclaimed, and the rewind is deterministic, so the address map
+    (and the frozen bin) is unchanged by it.
+
+    Per-op mechanics, each HW-proven in user_hw_test.py before this was written:
+      * ConvTranspose1d ups           zero-insert row loop + stride-1 conv with the flipped kernel
+                                      (conv_transpose1d_zero_insert_test)
+      * dilated Conv1d                shifted-matmul taps at offset k*dilation (conv1d_shifted_matmul_test)
+      * AdaIN InstanceNorm at T=30601 chunked transpose + masked-ones matmul stats, Newton rsqrt,
+                                      apply in [T, C] -- no large-N transpose (instance_norm_large_T_test)
+      * Snake1D                       x + (1 - cos(2ax))/(2a), cos via staircase mod + quarter-wave
+                                      fold + degree-9 Taylor (snake_vs_gelu_timing_test, sinegen test)
+      * noise_convs                   im2col built on the host from `har` (already host data), one matmul
+    """
+
+    _up = F0NPredictionFPGA._up
+    _up_cap = F0NPredictionFPGA._up_cap
+    _run = F0NPredictionFPGA._run
+
+    def __init__(self, model, ue: UnifiedEngine):
+        self.model = model
+        self.ue = ue
+        gen = model.decoder.generator
+        self.gen = gen
+        self.style_dim = gen.resblocks[0].adain1[0].fc.in_features       # 128
+        self.n_kernels = gen.num_kernels
+        self.n_fft = gen.post_n_fft                                        # 20
+        self.C_har = self.n_fft + 2                                        # 22
+        self.ups = []
+        for m in gen.ups:
+            w, b = _wn_conv(m)                                             # [Cin, Cout, k]
+            self.ups.append(dict(Cin=w.shape[0], Cout=w.shape[1], k=w.shape[2], stride=m.stride[0],
+                                 pad=m.padding[0], w=w, b=b))
+        self.noise_convs = []
+        for m in gen.noise_convs:
+            self.noise_convs.append(dict(Cout=m.out_channels, k=m.kernel_size[0], stride=m.stride[0],
+                                         pad=m.padding[0], w=_bf16(m.weight), b=_bf16(m.bias)))
+        self._const = {}
+        self.resblocks = [self._resblk_w(m) for m in gen.resblocks]
+        self.noise_res = [self._resblk_w(m) for m in gen.noise_res]
+        cp_w, cp_b = _wn_conv(gen.conv_post)                              # [22, C, 7]
+        self.conv_post = dict(Cout=UE_VECTOR_SIZE, k=cp_w.shape[2],
+                              w=_bf16(_pad_dim(cp_w, 0, UE_VECTOR_SIZE)),
+                              b=_bf16(_pad_dim(cp_b, 0, UE_VECTOR_SIZE)))
+
+    @staticmethod
+    def _resblk_w(m):
+        w = dict(C=m.convs1[0].in_channels, k=m.convs1[0].kernel_size[0],
+                 dil=[c.dilation[0] for c in m.convs1], taps=[])
+        for c1, c2, n1, n2, a1, a2 in zip(m.convs1, m.convs2, m.adain1, m.adain2, m.alpha1, m.alpha2):
+            c1w, c1b = _wn_conv(c1)
+            c2w, c2b = _wn_conv(c2)
+            w["taps"].append(dict(
+                c1w=c1w, c1b=c1b, c2w=c2w, c2b=c2b,
+                n1w=_bf16(n1.fc.weight), n1b=_bf16(n1.fc.bias),
+                n2w=_bf16(n2.fc.weight), n2b=_bf16(n2.fc.bias),
+                a1=_bf16(a1.reshape(-1)), a2=_bf16(a2.reshape(-1))))
+        return w
+
+    # ---- program / scratch plumbing -------------------------------------------------------------
+    def _acquire(self, rows_cap, C):
+        """A cap-sized activation buffer from the free list (or a fresh one at the live top).
+        Call _release when its last reader has run. Deterministic, so the address map is fixed."""
+        free = self._pool.setdefault((rows_cap, C), [])
+        if free:
+            return free.pop()
+        return self.ue.allocate_tensor_dram(rows_cap * C * 2)
+
+    def _release(self, addr):
+        key = self._owner.pop(addr)
+        self._pool[key].append(addr)
+
+    def _program(self, emit):
+        """Capture/run one program whose outputs the caller allocated already; scratch rewound."""
+        ue = self.ue
+        ue.start_capture()
+        mark = ue._tensor_dram_addr
+        emit()
+        self._run(ue)
+        ue._tensor_dram_addr = mark
+
+    def _block(self, emit, out_rows_cap, C):
+        """Capture one program: take its output buffer, mark, emit (scratch allocated inside),
+        run, rewind the allocator to the mark. Returns the output address."""
+        ue = self.ue
+        ue.start_capture()
+        out = self._acquire(out_rows_cap, C)
+        self._owner[out] = (out_rows_cap, C)
+        mark = ue._tensor_dram_addr
+        emit(out)
+        self._run(ue)
+        ue._tensor_dram_addr = mark
+        return out
+
+    def _zeros_row(self, C):
+        """A constant all-zero row of C elements (params region, memoised)."""
+        return self._up(torch.zeros(C, dtype=torch.bfloat16))
+
+    def _zero_rows(self, dst, C, n_rows, row_start=None, row_start_off=0):
+        """Zero ``n_rows`` (int or Dim) rows of dst starting at row_start (+off): ONE HW loop."""
+        _pbi_row_loop(self.ue, n_rows, reads=[(self._zeros_row(C), 0, C, 0)],
+                      writes=[(dst, C * 2, C, 0)], row_start=row_start, row_start_off=row_start_off)
+
+    def _copy_rows(self, src, dst, C, n_rows, dst_row_stride=1):
+        _pbi_row_loop(self.ue, n_rows, reads=[(src, C * 2, C, 0)],
+                      writes=[(dst, dst_row_stride * C * 2, C, 0)])
+
+    def _tile_row(self, row_dram, dst, C, n_rows):
+        """Broadcast one row down n_rows rows (zero source stride)."""
+        _pbi_row_loop(self.ue, n_rows, reads=[(row_dram, 0, C, 0)], writes=[(dst, C * 2, C, 0)])
+
+    def _step(self, M, N, src, dst):
+        """dst = clamp(RAMP*src, 0, 1) -- the soft unit step, on a flat 64-wide view."""
+        ue = self.ue
+        rows = (M * N) // UE_VECTOR_SIZE
+        _dyn_eltwise(ue, M, N, src, None, dst, mode=UE_MODE.MUL_BROADCAST, scalar=GEN_STEP_RAMP)
+        _dyn_activation(ue, M=rows, N=UE_VECTOR_SIZE, A_DRAM_ADDR=dst, OUTPUT_DRAM_ADDR=dst,
+                        IDENTITY_DRAM_ADDR=self.identity_dram, activation="clamp",
+                        clamp_min=0.0, clamp_max=1.0)
+
+    # ---- ops ----------------------------------------------------------------------------------
+    def _conv1d(self, x, T, real_T, Cin, Cout, W, b, out, k, dilation=1):
+        """Conv1d 'same' with dilation: y[t] = sum_k xpad[t + k*d] @ W[:, :, k]^T.
+
+        ``T`` is the 64-aligned row count (Dim), ``real_T`` the real one (Dim); zero padding is
+        placed at the REAL sequence end (rows [real_T, T) are re-zeroed, see Section 3's _conv1d
+        for why that matters). W: [Cout, Cin, k] host bf16 (PyTorch layout; each tap is already
+        the [N, K] operand matmat_mul_core wants).
+        """
+        ue = self.ue
+        pad = dilation * (k - 1) // 2
+        if k == 1:
+            _dyn_matmul(ue, M=T, K=Cin, N=Cout, A_DRAM_ADDR=x, B_DRAM_ADDR=self._up(W[:, :, 0].contiguous()),
+                        OUTPUT_DRAM_ADDR=out, C_DRAM_ADDR=self._up(b), bias_mode="broadcast_N")
+            return
+        xpad = ue.allocate_tensor_dram((_template(T) + 2 * pad + UE_VECTOR_SIZE) * Cin * 2)
+        self._zero_rows(xpad, Cin, pad)                                   # top pad
+        self._copy_rows(x, xpad + pad * Cin * 2, Cin, T)                  # real + alignment rows
+        # rows [pad + real_T, pad + T + pad]: alignment padding (stale) + bottom pad. Count is
+        # (T - real_T) + pad + 1 >= 1 always (a zero trip count wraps the loop counter).
+        if _is_dyn(T) and _is_dyn(real_T):
+            # (T - real_T) = mul*(nf_pad - nf) + (T.off - real_T.off): affine in GPR_PADROWS.
+            assert T.mul == real_T.mul and T.off >= real_T.off, (T, real_T)
+            n_tail = Dim(int(T) - int(real_T), GPR_PADROWS, mul=T.mul,
+                         cap=T.mul * (UE_VECTOR_SIZE - 1) + T.off - real_T.off, off=T.off - real_T.off)
+        else:
+            n_tail = int(T) - int(real_T)
+        self._zero_rows(xpad, Cin, n_tail + pad + 1, row_start=real_T, row_start_off=pad)
+        acc = [ue.allocate_tensor_dram(_template(T) * Cout * 2) for _ in range(2)]
+        for kk in range(k):
+            last = kk == k - 1
+            dst = out if last else acc[kk % 2]
+            prev = None if kk == 0 else acc[(kk - 1) % 2]
+            _dyn_matmul(ue, M=T, K=Cin, N=Cout, A_DRAM_ADDR=xpad + (kk * dilation) * Cin * 2,
+                        B_DRAM_ADDR=self._up(W[:, :, kk].contiguous()), OUTPUT_DRAM_ADDR=dst,
+                        C_DRAM_ADDR=(self._up(b) if kk == 0 else prev),
+                        bias_mode=("broadcast_N" if kk == 0 else "full_matrix"))
+
+    def _conv_transpose(self, x, T, Cin, Cout, W, b, out, k, stride, pad, T_out):
+        """ConvTranspose1d(Cin, Cout, k, stride, padding=pad) with output length stride*T:
+        zero-insert x (row t -> row (k-1) + stride*t of a zeroed buffer), then a stride-1 conv with
+        the FLIPPED kernel read at offset (pad + k'):  out[t] = sum_k' xz[t + pad + k'] @ Wf[k']^T,
+        Wf[k'] = W[:, :, k-1-k'].  W: [Cin, Cout, k] (PyTorch ConvTranspose layout).
+        """
+        ue = self.ue
+        rows = _template(T_out) + 2 * k + UE_VECTOR_SIZE
+        xz = ue.allocate_tensor_dram(rows * Cin * 2)
+        self._zero_rows(xz, Cin, rows)
+        self._copy_rows(x, xz + (k - 1) * Cin * 2, Cin, T, dst_row_stride=stride)
+        acc = [ue.allocate_tensor_dram(_template(T_out) * Cout * 2) for _ in range(2)]
+        for kk in range(k):
+            wf = W[:, :, k - 1 - kk].T.contiguous()                        # [Cout, Cin] = [N, K]
+            last = kk == k - 1
+            dst = out if last else acc[kk % 2]
+            prev = None if kk == 0 else acc[(kk - 1) % 2]
+            _dyn_matmul(ue, M=T_out, K=Cin, N=Cout, A_DRAM_ADDR=xz + (pad + kk) * Cin * 2,
+                        B_DRAM_ADDR=self._up(wf), OUTPUT_DRAM_ADDR=dst,
+                        C_DRAM_ADDR=(self._up(b) if kk == 0 else prev),
+                        bias_mode=("broadcast_N" if kk == 0 else "full_matrix"))
+
+    def _leaky(self, x, T, C, out, slope):
+        """leaky_relu = relu(x) - slope*relu(-x), both via clamp on a flat 64-wide view."""
+        ue = self.ue
+        rows = (T * C) // UE_VECTOR_SIZE
+        pos = ue.allocate_tensor_dram(_template(T) * C * 2)
+        neg = ue.allocate_tensor_dram(_template(T) * C * 2)
+        _dyn_activation(ue, M=rows, N=UE_VECTOR_SIZE, A_DRAM_ADDR=x, OUTPUT_DRAM_ADDR=pos,
+                        IDENTITY_DRAM_ADDR=self.identity_dram, activation="clamp")
+        _dyn_eltwise(ue, rows, UE_VECTOR_SIZE, x, None, neg, mode=UE_MODE.MUL_BROADCAST, scalar=-1.0)
+        _dyn_activation(ue, M=rows, N=UE_VECTOR_SIZE, A_DRAM_ADDR=neg, OUTPUT_DRAM_ADDR=neg,
+                        IDENTITY_DRAM_ADDR=self.identity_dram, activation="clamp")
+        _dyn_eltwise(ue, rows, UE_VECTOR_SIZE, neg, None, neg, mode=UE_MODE.MUL_BROADCAST, scalar=slope)
+        _dyn_eltwise(ue, rows, UE_VECTOR_SIZE, pos, neg, out, mode=UE_MODE.ELTWISE_SUB)
+
+    def _mask_vec(self, level, real_T):
+        """Per-run reduction mask for one time level: 1/real_T on [0, real_T), 0 after, with a
+        64*chunk zero tail so the [64, chunk] A-operand view at the last chunk stays in bounds
+        (rows 1..63 of that view read the tail; only row 0 is used)."""
+        key = ("mask", level)
+        if key in self._live:
+            return self._live[key]
+        cap = self._caps[level]
+        n = cap + 64 * GEN_IN_CHUNK
+        m = torch.zeros(n, dtype=torch.bfloat16)
+        m[:int(real_T)] = 1.0 / int(real_T)
+        self._live[key] = self._up_cap(m, n)
+        return self._live[key]
+
+    def _reduce_T(self, src, level, C, xt, acc, dst_row):
+        """dst_row [1, C] = sum_t mask[t] * src[t, :]  over ALL cap chunks (masked)."""
+        ue = self.ue
+        cap = self._caps[level]
+        mask = self._live[("mask", level)]
+        n_chunks = cap // GEN_IN_CHUNK
+        for j in range(n_chunks):
+            _dyn_transpose(ue, M=GEN_IN_CHUNK, N=C, INPUT_DRAM_ADDR=src + j * GEN_IN_CHUNK * C * 2,
+                           OUTPUT_DRAM_ADDR=xt, IDENTITY_DRAM_ADDR=self.identity_dram)
+            last = j == n_chunks - 1
+            _dyn_matmul(ue, M=64, K=GEN_IN_CHUNK, N=C, A_DRAM_ADDR=mask + j * GEN_IN_CHUNK * 2,
+                        B_DRAM_ADDR=xt, OUTPUT_DRAM_ADDR=(dst_row if last else acc[j % 2]),
+                        C_DRAM_ADDR=(None if j == 0 else acc[(j - 1) % 2]),
+                        bias_mode="full_matrix")
+
+    def _adain(self, x, T, real_T, level, C, fc_w, fc_b, out, newton_iters=40, eps=1e-6, y0=1e-2):
+        """AdaIN1d at generator scale: (x - mean) * (1 + gamma) * rstd + beta, per channel over
+        time, entirely in [T, C]. Stats via _reduce_T; rstd by Newton from a constant seed (no
+        rsqrt core; converges for var < 3/y0^2 = 3e4)."""
+        ue = self.ue
+        cap = self._caps[level]
+        self._mask_vec(level, real_T)
+        xt = ue.allocate_tensor_dram(C * GEN_IN_CHUNK * 2)
+        acc = [ue.allocate_tensor_dram(64 * C * 2) for _ in range(2)]
+        stat = ue.allocate_tensor_dram(64 * C * 2)        # row 0 = mean, later var
+        meant = ue.allocate_tensor_dram(cap * C * 2)
+        xc = ue.allocate_tensor_dram(cap * C * 2)
+        sq = ue.allocate_tensor_dram(cap * C * 2)
+        y = ue.allocate_tensor_dram(C * 2)
+        tmp = ue.allocate_tensor_dram(C * 2)
+        gb = ue.allocate_tensor_dram(2 * C * 2)
+        scale = ue.allocate_tensor_dram(C * 2)
+        scalet = ue.allocate_tensor_dram(cap * C * 2)
+        betat = ue.allocate_tensor_dram(cap * C * 2)
+        # style affine: gb = [gamma | beta]
+        _dyn_matmul(ue, M=1, K=self.style_dim, N=2 * C, A_DRAM_ADDR=self.style_dram,
+                    B_DRAM_ADDR=self._up(fc_w), OUTPUT_DRAM_ADDR=gb, C_DRAM_ADDR=self._up(fc_b),
+                    bias_mode="broadcast_N")
+        # Pad rows [real_T, cap) must be FINITE (they are multiplied by a zero mask, and 0*NaN=NaN).
+        # cap - real_T is not affine in a primed register, so the count is derived on device.
+        zrow = self._zeros_row(C)
+        _zero_rows_from(ue, x, C * 2, C, start=real_T, count_cap=cap, zeros_src=zrow)
+        self._reduce_T(x, level, C, xt, acc, stat)                        # row 0 = mean
+        self._tile_row(stat, meant, C, T)
+        _dyn_eltwise(ue, T, C, x, meant, xc, mode=UE_MODE.ELTWISE_SUB)
+        _dyn_eltwise(ue, T, C, xc, xc, sq, mode=UE_MODE.ELTWISE_MUL)
+        _zero_rows_from(ue, sq, C * 2, C, start=real_T, count_cap=cap, zeros_src=zrow)
+        self._reduce_T(sq, level, C, xt, acc, stat)                       # row 0 = var
+        ue.eltwise_core_dram(1, C, stat, None, stat, UE_MODE.ADD_BROADCAST, scalar=eps)
+        ue.eltwise_core_dram(1, C, stat, None, y, UE_MODE.MUL_BROADCAST, scalar=0.0)
+        ue.eltwise_core_dram(1, C, y, None, y, UE_MODE.ADD_BROADCAST, scalar=y0)
+        for _ in range(newton_iters):
+            ue.eltwise_core_dram(1, C, y, y, tmp, UE_MODE.ELTWISE_MUL)
+            ue.eltwise_core_dram(1, C, tmp, stat, tmp, UE_MODE.ELTWISE_MUL)
+            ue.eltwise_core_dram(1, C, tmp, None, tmp, UE_MODE.MUL_BROADCAST, scalar=-0.5)
+            ue.eltwise_core_dram(1, C, tmp, None, tmp, UE_MODE.ADD_BROADCAST, scalar=1.5)
+            ue.eltwise_core_dram(1, C, y, tmp, y, UE_MODE.ELTWISE_MUL)
+        ue.eltwise_core_dram(1, C, gb, None, scale, UE_MODE.ADD_BROADCAST, scalar=1.0)   # 1 + gamma
+        ue.eltwise_core_dram(1, C, scale, y, scale, UE_MODE.ELTWISE_MUL)                 # * rstd
+        self._tile_row(scale, scalet, C, T)
+        self._tile_row(gb + C * 2, betat, C, T)
+        _dyn_eltwise(ue, T, C, xc, scalet, out, mode=UE_MODE.ELTWISE_MUL)
+        _dyn_eltwise(ue, T, C, out, betat, out, mode=UE_MODE.ELTWISE_ADD)
+
+    def _snake(self, x, T, C, alpha, out):
+        """Snake1D: x + sin^2(a x)/a = x + (1 - cos(2 a x)) / (2 a), per-channel alpha.
+        cos(2ax) = sin(2*pi*p), p = (a x / pi + 0.25) mod 1: staircase mod over
+        [-GEN_SNAKE_TURNS, GEN_SNAKE_TURNS], quarter-wave fold, degree-9 Taylor."""
+        ue = self.ue
+        cap = _template(T)
+        a_over_pi = ue.allocate_tensor_dram(cap * C * 2)
+        inv2a = ue.allocate_tensor_dram(cap * C * 2)
+        p = ue.allocate_tensor_dram(cap * C * 2)
+        v = ue.allocate_tensor_dram(cap * C * 2)
+        n = ue.allocate_tensor_dram(cap * C * 2)
+        s = ue.allocate_tensor_dram(cap * C * 2)
+        q = ue.allocate_tensor_dram(cap * C * 2)
+        x2 = ue.allocate_tensor_dram(cap * C * 2)
+        tm = ue.allocate_tensor_dram(cap * C * 2)
+        self._tile_row(self._up((alpha.float() / math.pi).to(torch.bfloat16)), a_over_pi, C, T)
+        self._tile_row(self._up((1.0 / (2.0 * alpha.float())).to(torch.bfloat16)), inv2a, C, T)
+        # p = a x / pi + 0.25;  n = (p + MAGIC) - MAGIC  (integer part, see GEN_MAGIC);
+        # r = p - n + 1 in (0, 2);  r -= step(r - 1)  -> [0, 1).  (The wrap band sits at 1, where the
+        # bf16 grid is coarse enough that the soft step never lands inside it.)
+        _dyn_eltwise(ue, T, C, x, a_over_pi, p, mode=UE_MODE.ELTWISE_MUL)
+        _dyn_eltwise(ue, T, C, p, None, p, mode=UE_MODE.ADD_BROADCAST, scalar=0.25)
+        _dyn_eltwise(ue, T, C, p, None, n, mode=UE_MODE.ADD_BROADCAST, scalar=GEN_MAGIC)
+        _dyn_eltwise(ue, T, C, n, None, n, mode=UE_MODE.ADD_BROADCAST, scalar=-GEN_MAGIC)
+        _dyn_eltwise(ue, T, C, p, n, p, mode=UE_MODE.ELTWISE_SUB)
+        _dyn_eltwise(ue, T, C, p, None, p, mode=UE_MODE.ADD_BROADCAST, scalar=1.0)
+        _dyn_eltwise(ue, T, C, p, None, s, mode=UE_MODE.ADD_BROADCAST, scalar=-1.0)
+        self._step(T, C, s, s)
+        _dyn_eltwise(ue, T, C, p, s, p, mode=UE_MODE.ELTWISE_SUB)                 # p in [0, 1)
+        # quarter-wave fold: q = p + s1 (0.5 - 2p) + s2 (2p - 1.5),  s1 = step(p-.25), s2 = step(p-.75)
+        _dyn_eltwise(ue, T, C, p, None, s, mode=UE_MODE.ADD_BROADCAST, scalar=-0.25)
+        self._step(T, C, s, s)
+        _dyn_eltwise(ue, T, C, p, None, v, mode=UE_MODE.MUL_BROADCAST, scalar=-2.0)
+        _dyn_eltwise(ue, T, C, v, None, v, mode=UE_MODE.ADD_BROADCAST, scalar=0.5)     # 0.5 - 2p
+        _dyn_eltwise(ue, T, C, v, s, v, mode=UE_MODE.ELTWISE_MUL)
+        _dyn_eltwise(ue, T, C, p, v, q, mode=UE_MODE.ELTWISE_ADD)
+        _dyn_eltwise(ue, T, C, p, None, s, mode=UE_MODE.ADD_BROADCAST, scalar=-0.75)
+        self._step(T, C, s, s)
+        _dyn_eltwise(ue, T, C, p, None, v, mode=UE_MODE.MUL_BROADCAST, scalar=2.0)
+        _dyn_eltwise(ue, T, C, v, None, v, mode=UE_MODE.ADD_BROADCAST, scalar=-1.5)    # 2p - 1.5
+        _dyn_eltwise(ue, T, C, v, s, v, mode=UE_MODE.ELTWISE_MUL)
+        _dyn_eltwise(ue, T, C, q, v, q, mode=UE_MODE.ELTWISE_ADD)
+        _dyn_eltwise(ue, T, C, q, None, q, mode=UE_MODE.MUL_BROADCAST, scalar=2.0 * math.pi)   # r
+        # sin(r), degree 9, Horner in r^2
+        _dyn_eltwise(ue, T, C, q, q, x2, mode=UE_MODE.ELTWISE_MUL)
+        coef = [((-1) ** ((k - 1) // 2)) / math.factorial(k) for k in (9, 7, 5, 3, 1)]
+        _dyn_eltwise(ue, T, C, x2, None, tm, mode=UE_MODE.MUL_BROADCAST, scalar=coef[0])
+        for c in coef[1:]:
+            _dyn_eltwise(ue, T, C, tm, None, tm, mode=UE_MODE.ADD_BROADCAST, scalar=c)
+            if c != coef[-1]:
+                _dyn_eltwise(ue, T, C, tm, x2, tm, mode=UE_MODE.ELTWISE_MUL)
+        _dyn_eltwise(ue, T, C, tm, q, tm, mode=UE_MODE.ELTWISE_MUL)                     # cos(2ax)
+        # out = x + (1 - cos) * inv2a
+        _dyn_eltwise(ue, T, C, tm, None, tm, mode=UE_MODE.MUL_BROADCAST, scalar=-1.0)
+        _dyn_eltwise(ue, T, C, tm, None, tm, mode=UE_MODE.ADD_BROADCAST, scalar=1.0)
+        _dyn_eltwise(ue, T, C, tm, inv2a, tm, mode=UE_MODE.ELTWISE_MUL)
+        _dyn_eltwise(ue, T, C, x, tm, out, mode=UE_MODE.ELTWISE_ADD)
+
+    def _resblock(self, x, T, real_T, level, w):
+        """AdaINResBlock1: for each dilation, x += conv2(snake(adain2(conv1(snake(adain1(x)))))).
+        Returns the address of the block output (a fresh buffer; x is not modified)."""
+        C, k, cap = w["C"], w["k"], self._caps[level]
+        cur = x
+        for i, (d, t) in enumerate(zip(w["dil"], w["taps"])):
+            def chain(prev, emit):
+                """next = emit(prev); the previous intermediate is dead once its program ran."""
+                nxt = self._block(emit, cap, C)
+                if prev is not None:
+                    self._release(prev)
+                return nxt
+            h = chain(None, lambda o: self._adain(cur, T, real_T, level, C, t["n1w"], t["n1b"], o))
+            h = chain(h, lambda o: self._snake(h, T, C, t["a1"], o))
+            h = chain(h, lambda o: self._conv1d(h, T, real_T, C, C, t["c1w"], t["c1b"], o, k, d))
+            h = chain(h, lambda o: self._adain(h, T, real_T, level, C, t["n2w"], t["n2b"], o))
+            h = chain(h, lambda o: self._snake(h, T, C, t["a2"], o))
+            h = chain(h, lambda o: self._conv1d(h, T, real_T, C, C, t["c2w"], t["c2b"], o, k, 1))
+            nxt = chain(h, lambda o: _dyn_eltwise(self.ue, T, C, h, cur, o, mode=UE_MODE.ELTWISE_ADD))
+            if cur is not x:
+                self._release(cur)          # the caller still owns x
+            cur = nxt
+        return cur
+
+    # ---- Section 5c: SineGen source + STFT -> har ----------------------------------------------
+    GEN_UP = 300                       # prod(upsample_rates) * hop: fine samples per frame
+    GEN_HARM = 9                       # harmonic_num + 1 lanes
+    GEN_STFT_K = 384                   # samples one 64-frame STFT block reads (320 + window slack)
+    GEN_HEAD_ROWS = 64                 # zero/reflect prefix rows before sample 0 in the time-major buffer
+
+    def _source_prep(self, F0_curve: torch.Tensor, noise: torch.Tensor, T_f: int):
+        """Host side of SineGen: the per-frame increment tables (double-bf16) and the per-run
+        noise. F0_curve: [2*nf] (Section 3's output, the SineGen frame rate). noise: [S, 9] fp32
+        already scaled by noise_amp (host randn -- it is model randomness, not model compute).
+        Returns dict of [GEN_T0_CAP, 64] bf16 tables + the noise in j-major slabs."""
+        gen = self.gen
+        sg = gen.m_source.l_sin_gen
+        V, H, UP = UE_VECTOR_SIZE, self.GEN_HARM, self.GEN_UP
+        cap = GEN_T0_CAP
+        f0 = F0_curve.detach().double().reshape(-1)[:T_f]
+        harm = torch.arange(1, H + 1, dtype=torch.float64)
+        rad = (f0[:, None] * harm[None, :] / sg.sampling_rate) % 1.0                # [T_f, H]
+        rad_up = torch.cat([rad[1:], torch.zeros(1, H, dtype=torch.float64)], 0)     # slope, j >= 150
+        rad_dn = rad.clone(); rad_dn[0] = 0                                           # slope, j < 150
+        uv = (f0 > sg.voiced_threshold).double()
+
+        def split(v):
+            hi = v.to(torch.bfloat16); lo = (v - hi.double()).to(torch.bfloat16)
+            Hh = torch.zeros(cap, V, dtype=torch.bfloat16); Hh[:T_f, :H] = hi
+            Ll = torch.zeros(cap, V, dtype=torch.bfloat16); Ll[:T_f, :H] = lo
+            return Hh, Ll
+        t = {}
+        t["D_h"], t["D_l"] = split((UP * rad) % 1.0)
+        t["U_h"], t["U_l"] = split(rad_up)
+        t["N_h"], t["N_l"] = split(-rad_dn)
+        amp = torch.zeros(cap, V, dtype=torch.bfloat16)
+        amp[:T_f, :H] = (sg.sine_amp * uv)[:, None].to(torch.bfloat16)               # sine_amp * uv
+        t["AMP"] = amp
+        nz = torch.zeros(UP, cap, V, dtype=torch.bfloat16)
+        nz[:, :T_f, :H] = noise.reshape(T_f, UP, H).permute(1, 0, 2).to(torch.bfloat16)   # j-major
+        t["NOISE"] = nz
+        return t
+
+    def _source_har(self, tables, T_f, S, F_rows, HAR):
+        """Section 5c on device. T_f: frames (Dim, 2*nf). S: samples (Dim, 300*T_f). F_rows: STFT
+        frames (Dim, S/5 + 1). Writes har [F_cap, 64] (mag in cols 0..10, phase 11..21, 0 after)
+        into HAR (live, cap-sized). Everything is unrolled at the caps; the runtime lengths only
+        steer the masked/strided copies, so the program is prompt-invariant.
+
+        SineGen recipe = sinegen_wrapped_phase_test (49 dB on HW): two-sum accumulators with
+        double-bf16 increments, wrapped phase, quarter-wave fold + degree-9 Taylor + lo correction.
+        Sine lanes are written TIME-MAJOR (row = 300 r + j, plus reflect pads) by a strided row
+        copy per fine step, so tanh(l_linear) and the STFT see a plain [samples, 64] buffer.
+        STFT = one M=1 matmul per 64-frame block against a block-Toeplitz hann*DFT basis
+        (stft_istft_matmul_test); magnitude/phase by CORDIC (cordic_atan2_magnitude_test).
+        """
+        ue = self.ue
+        gen = self.gen
+        V, H, UP = UE_VECTOR_SIZE, self.GEN_HARM, self.GEN_UP
+        half = UP // 2
+        cap_f = GEN_T0_CAP                       # frame cap
+        row = V * 2
+        blk = cap_f * row
+        S_cap = UP * cap_f
+        R = self.GEN_HEAD_ROWS + S_cap + V       # time-major rows incl. head/tail slack
+        n_blocks = -(-GEN_T2_CAP // 64)          # STFT blocks at the cap
+        up = lambda t: self._up_cap(t, t.numel())
+        DH, DL, UH, UL, NH, NL, AMP = [up(tables[k]) for k in ("D_h", "D_l", "U_h", "U_l", "N_h", "N_l", "AMP")]
+        NOISE = up(tables["NOISE"])
+        ONES = self._up(torch.ones(cap_f, V, dtype=torch.bfloat16))
+        ident = self.identity_dram
+        OUTB = ue.allocate_tensor_dram(R * row)                      # time-major sine lanes
+        PF, PFL = ue.allocate_tensor_dram(blk), ue.allocate_tensor_dram(blk)
+        fr = {k: ue.allocate_tensor_dram(row) for k in ("p", "lo", "s", "bv", "t1", "t2")}
+        fn = {k: ue.allocate_tensor_dram(blk) for k in
+              ("p", "lo", "s", "bv", "t1", "t2", "q", "x2", "tm", "sn", "cs", "u", "w", "pc", "pm", "o")}
+        LAST = ue.allocate_tensor_dram(row)
+
+        def E(M, a, b, o, mode, sc=None):
+            ue.eltwise_core_dram(M, V, a, b, o, mode, scalar=sc)
+
+        def twosum(M, b, d):
+            E(M, b["p"], d, b["s"], UE_MODE.ELTWISE_ADD); E(M, b["s"], b["p"], b["bv"], UE_MODE.ELTWISE_SUB)
+            E(M, b["s"], b["bv"], b["t1"], UE_MODE.ELTWISE_SUB); E(M, b["p"], b["t1"], b["t1"], UE_MODE.ELTWISE_SUB)
+            E(M, d, b["bv"], b["t2"], UE_MODE.ELTWISE_SUB); E(M, b["t1"], b["t2"], b["t1"], UE_MODE.ELTWISE_ADD)
+            E(M, b["lo"], b["t1"], b["lo"], UE_MODE.ELTWISE_ADD); E(M, b["s"], b["lo"], b["p"], UE_MODE.ELTWISE_ADD)
+            E(M, b["p"], b["s"], b["t1"], UE_MODE.ELTWISE_SUB); E(M, b["lo"], b["t1"], b["lo"], UE_MODE.ELTWISE_SUB)
+
+        def step(M, src, dst):
+            E(M, src, None, dst, UE_MODE.MUL_BROADCAST, GEN_STEP_RAMP)
+            ue.activation_core(M=M, N=V, A_DRAM_ADDR=dst, OUTPUT_DRAM_ADDR=dst, IDENTITY_DRAM_ADDR=ident,
+                               activation="clamp", clamp_min=0.0, clamp_max=1.0)
+
+        def wrap_up(M, b):
+            E(M, b["p"], None, b["t1"], UE_MODE.ADD_BROADCAST, -1.0); step(M, b["t1"], b["t2"])
+            E(M, b["p"], b["t2"], b["p"], UE_MODE.ELTWISE_SUB)
+
+        def wrap_dn(M, b):
+            E(M, b["p"], None, b["t1"], UE_MODE.MUL_BROADCAST, -1.0); E(M, b["t1"], None, b["t1"], UE_MODE.ADD_BROADCAST, 1.0)
+            step(M, b["t1"], b["q"]); twosum(M, b, b["q"])
+
+        def sin2pi_fold(M, b, src, dst):
+            E(M, src, None, b["t1"], UE_MODE.ADD_BROADCAST, -0.25); step(M, b["t1"], b["u"])
+            E(M, src, None, b["t1"], UE_MODE.ADD_BROADCAST, -0.75); step(M, b["t1"], b["w"])
+            E(M, src, None, b["t2"], UE_MODE.MUL_BROADCAST, 2.0)
+            E(M, b["t2"], None, b["t1"], UE_MODE.MUL_BROADCAST, -1.0); E(M, b["t1"], None, b["t1"], UE_MODE.ADD_BROADCAST, 0.5)
+            E(M, b["t1"], b["u"], b["t1"], UE_MODE.ELTWISE_MUL); E(M, src, b["t1"], b["q"], UE_MODE.ELTWISE_ADD)
+            E(M, b["t2"], None, b["t2"], UE_MODE.ADD_BROADCAST, -1.5); E(M, b["t2"], b["w"], b["t2"], UE_MODE.ELTWISE_MUL)
+            E(M, b["q"], b["t2"], b["q"], UE_MODE.ELTWISE_ADD); E(M, b["q"], None, b["q"], UE_MODE.MUL_BROADCAST, 2.0 * math.pi)
+            E(M, b["q"], b["q"], b["x2"], UE_MODE.ELTWISE_MUL)
+            coef = [((-1) ** ((k - 1) // 2)) / math.factorial(k) for k in (9, 7, 5, 3, 1)]
+            E(M, b["x2"], None, b["tm"], UE_MODE.MUL_BROADCAST, coef[0])
+            for c in coef[1:]:
+                E(M, b["tm"], None, b["tm"], UE_MODE.ADD_BROADCAST, c)
+                if c != coef[-1]:
+                    E(M, b["tm"], b["x2"], b["tm"], UE_MODE.ELTWISE_MUL)
+            E(M, b["tm"], b["q"], dst, UE_MODE.ELTWISE_MUL)
+
+        def emit_sine(M, b, src, out):
+            sin2pi_fold(M, b, src, b["sn"])
+            E(M, src, None, b["pc"], UE_MODE.ADD_BROADCAST, 0.25)
+            wrap_up(M, {"p": b["pc"], "t1": b["t1"], "t2": b["t2"]})
+            sin2pi_fold(M, b, b["pc"], b["cs"])
+            E(M, b["lo"], None, b["t1"], UE_MODE.MUL_BROADCAST, 2.0 * math.pi)
+            E(M, b["t1"], b["cs"], b["t1"], UE_MODE.ELTWISE_MUL)
+            E(M, b["sn"], b["t1"], out, UE_MODE.ELTWISE_ADD)
+
+        def emit_step(j, src):
+            """sine lanes for fine step j (all frames): amplitude*uv + noise_j, then scatter to
+            time-major row 300 r + j (+ head rows), plus the reflect pads torch.stft(center=True)
+            would add: head row 64-m <- sample m (m = j, r = 0), tail row S+k <- sample S-2-k."""
+            o = fn["o"]
+            emit_sine(cap_f, fn, src, o)
+            E(cap_f, o, AMP, o, UE_MODE.ELTWISE_MUL)
+            E(cap_f, o, NOISE + j * blk, o, UE_MODE.ELTWISE_ADD)
+            base = OUTB + (self.GEN_HEAD_ROWS + j) * row
+            _pbi_row_loop(ue, T_f, reads=[(o, row, V, 0)], writes=[(base, UP * row, V, 0)])
+            if 1 <= j <= gen.stft.filter_length // 2:                       # head: x[-m] = x[m]
+                _pbi_row_loop(ue, 1, reads=[(o, 0, V, 0)],
+                              writes=[(OUTB + (self.GEN_HEAD_ROWS - j) * row, 0, V, 0)])
+            k = UP - 2 - j
+            if 0 <= k < gen.stft.filter_length // 2:                        # tail: x[S+k] = x[S-2-k]
+                # LAST <- o[T_f - 1] (row index T_f - 1 = row_start T_f on a base one row back)
+                _pbi_row_loop(ue, 1, reads=[(o - row, row, V, 0)], writes=[(LAST, 0, V, 0)], row_start=T_f)
+                _pbi_row_loop(ue, 1, reads=[(LAST, 0, V, 0)], writes=[(OUTB + self.GEN_HEAD_ROWS * row, row, V, 0)],
+                              row_start=S, row_start_off=k)
+
+        # ---- 0. the time-major buffer must be finite everywhere the STFT blocks can read ----
+        self._zero_rows(OUTB, V, R)
+        # ---- 1. frame accumulator ----
+        E(1, DH, None, fr["p"], UE_MODE.MUL_BROADCAST, 0.0); E(1, DH, None, fr["lo"], UE_MODE.MUL_BROADCAST, 0.0)
+        for r in range(cap_f):
+            twosum(1, fr, DH + r * row); E(1, fr["lo"], DL + r * row, fr["lo"], UE_MODE.ELTWISE_ADD); wrap_up(1, fr)
+            E(1, fr["p"], None, PF + r * row, UE_MODE.MUL_BROADCAST, 1.0)
+            E(1, fr["lo"], None, PFL + r * row, UE_MODE.MUL_BROADCAST, 1.0)
+        # ---- 2a. fine steps counting up: j = 150 .. 299 ----
+        E(cap_f, PF, None, fn["p"], UE_MODE.MUL_BROADCAST, 1.0); E(cap_f, PFL, None, fn["lo"], UE_MODE.MUL_BROADCAST, 1.0)
+        E(cap_f, UH, None, fn["x2"], UE_MODE.MUL_BROADCAST, 0.5); E(cap_f, UL, None, fn["tm"], UE_MODE.MUL_BROADCAST, 0.5)
+        twosum(cap_f, fn, fn["x2"]); E(cap_f, fn["lo"], fn["tm"], fn["lo"], UE_MODE.ELTWISE_ADD); wrap_up(cap_f, fn)
+        emit_step(half, fn["p"])
+        for jj in range(half + 1, UP):
+            twosum(cap_f, fn, UH); E(cap_f, fn["lo"], UL, fn["lo"], UE_MODE.ELTWISE_ADD); wrap_up(cap_f, fn)
+            emit_step(jj, fn["p"])
+        # ---- 2b. counting down: j = 149 .. 0, phase held as q = p + 1 ----
+        E(cap_f, PF, None, fn["p"], UE_MODE.MUL_BROADCAST, 1.0); E(cap_f, PFL, None, fn["lo"], UE_MODE.MUL_BROADCAST, 1.0)
+        twosum(cap_f, fn, ONES)
+        E(cap_f, NH, None, fn["x2"], UE_MODE.MUL_BROADCAST, 0.5); E(cap_f, NL, None, fn["tm"], UE_MODE.MUL_BROADCAST, 0.5)
+        twosum(cap_f, fn, fn["x2"]); E(cap_f, fn["lo"], fn["tm"], fn["lo"], UE_MODE.ELTWISE_ADD); wrap_dn(cap_f, fn)
+        E(cap_f, fn["p"], None, fn["pm"], UE_MODE.ADD_BROADCAST, -1.0)
+        emit_step(half - 1, fn["pm"])
+        for jj in range(half - 2, -1, -1):
+            twosum(cap_f, fn, NH); E(cap_f, fn["lo"], NL, fn["lo"], UE_MODE.ELTWISE_ADD); wrap_dn(cap_f, fn)
+            E(cap_f, fn["p"], None, fn["pm"], UE_MODE.ADD_BROADCAST, -1.0)
+            emit_step(jj, fn["pm"])
+        # ---- 3. sine_merge = tanh(l_linear(sines)) over the whole time-major buffer ----
+        lin = gen.m_source.l_linear
+        Wl = torch.zeros(V, V, dtype=torch.bfloat16); Wl[0, :H] = _bf16(lin.weight.reshape(-1))
+        bl = torch.zeros(V, dtype=torch.bfloat16); bl[0] = _bf16(lin.bias.reshape(-1))
+        MERGE = ue.allocate_tensor_dram(R * row)
+        _dyn_matmul(ue, M=R, K=V, N=V, A_DRAM_ADDR=OUTB, B_DRAM_ADDR=self._up(Wl), OUTPUT_DRAM_ADDR=MERGE,
+                    C_DRAM_ADDR=self._up(bl), bias_mode="broadcast_N")
+        self._tanh(R, V, MERGE, MERGE)
+        # ---- 4. column 0 -> contiguous signal: transpose [R, 64] -> [64, R]; row 0 is x_pad ----
+        XP = ue.allocate_tensor_dram(V * R * 2)
+        _dyn_transpose(ue, M=R, N=V, INPUT_DRAM_ADDR=MERGE, OUTPUT_DRAM_ADDR=XP, IDENTITY_DRAM_ADDR=ident)
+        # ---- 5. STFT: spec block b = x_pad[48 + 320 b : +384] @ B^T, frames 64b..64b+63 ----
+        n_fft, hop = gen.stft.filter_length, gen.stft.hop_length
+        n_bins = n_fft // 2 + 1
+        Bre, Bim = self._stft_basis(n_fft, hop)
+        RE = ue.allocate_tensor_dram(n_blocks * 64 * row)
+        IM = ue.allocate_tensor_dram(n_blocks * 64 * row)
+        REraw = ue.allocate_tensor_dram(n_blocks * 64 * row)
+        IMraw = ue.allocate_tensor_dram(n_blocks * 64 * row)
+        self._dbg = dict(OUTB=OUTB, XP=XP, RE=REraw, IM=IMraw, R=R)
+        off0 = self.GEN_HEAD_ROWS - n_fft // 2 - 6          # 48: first block's read start (8 B aligned)
+        for b in range(n_blocks):
+            a = XP + (off0 + 64 * hop * b) * 2
+            ue.matmat_mul_core(M=1, K=self.GEN_STFT_K, N=64 * V, A_DRAM_ADDR=a, B_DRAM_ADDR=self._up(Bre),
+                               OUTPUT_DRAM_ADDR=RE + b * 64 * row)
+            ue.matmat_mul_core(M=1, K=self.GEN_STFT_K, N=64 * V, A_DRAM_ADDR=a, B_DRAM_ADDR=self._up(Bim),
+                               OUTPUT_DRAM_ADDR=IM + b * 64 * row)
+        # ---- 6. CORDIC vectoring: |z| and atan2(im, re), rows = all cap frames ----
+        Mf = n_blocks * 64
+        SX, SY, T1, T2, Z = [ue.allocate_tensor_dram(Mf * row) for _ in range(5)]
+        E(Mf, RE, None, REraw, UE_MODE.MUL_BROADCAST, 1.0)                   # debug copies (pre-CORDIC)
+        E(Mf, IM, None, IMraw, UE_MODE.MUL_BROADCAST, 1.0)
+        # The spectrum bins are ~1e-2 and the clamp step's soft band is 1/GEN_STEP_RAMP = 2.4e-4:
+        # unscaled, a few percent of the (near-empty) bins got a FRACTIONAL quadrant sign, i.e. a
+        # garbage angle -- 10 dB off the model's own noise floor at conv_post. The angle is
+        # scale-invariant, so scale up first (exact in bf16) and fold 1/scale into the gain.
+        PRE = 1024.0
+        E(Mf, RE, None, RE, UE_MODE.MUL_BROADCAST, PRE)
+        E(Mf, IM, None, IM, UE_MODE.MUL_BROADCAST, PRE)
+        iters = 8
+        Kg = 1.0
+        for k in range(iters):
+            Kg *= math.sqrt(1.0 + 2.0 ** (-2 * k))
+
+        def sign(src, dst):
+            step(Mf, src, dst); E(Mf, dst, None, dst, UE_MODE.MUL_BROADCAST, 2.0); E(Mf, dst, None, dst, UE_MODE.ADD_BROADCAST, -1.0)
+        step(Mf, RE, T1); E(Mf, T1, None, T1, UE_MODE.MUL_BROADCAST, -1.0); E(Mf, T1, None, T1, UE_MODE.ADD_BROADCAST, 1.0)
+        # Quadrant sign with sign(0) = +1: the DC and Nyquist bins are purely real (im == 0 exactly),
+        # where torch.angle gives atan2(0, x<0) = +pi. A plain clamp step gives sign(0) = -1, i.e.
+        # -pi: a systematic 2*pi error on the STRONGEST channel (82% of DC frames in simulation).
+        E(Mf, IM, None, T2, UE_MODE.ADD_BROADCAST, 4.0 / GEN_STEP_RAMP)   # > the step band, << PRE-scaled bins
+        sign(T2, SY); E(Mf, T1, SY, Z, UE_MODE.ELTWISE_MUL); E(Mf, Z, None, Z, UE_MODE.MUL_BROADCAST, math.pi)
+        sign(RE, SX); E(Mf, RE, SX, RE, UE_MODE.ELTWISE_MUL); E(Mf, IM, SX, IM, UE_MODE.ELTWISE_MUL)
+        for k in range(iters):
+            sign(IM, SY)
+            E(Mf, IM, SY, T1, UE_MODE.ELTWISE_MUL); E(Mf, T1, None, T1, UE_MODE.MUL_BROADCAST, 2.0 ** (-k))
+            E(Mf, RE, SY, T2, UE_MODE.ELTWISE_MUL); E(Mf, T2, None, T2, UE_MODE.MUL_BROADCAST, 2.0 ** (-k))
+            E(Mf, RE, T1, RE, UE_MODE.ELTWISE_ADD); E(Mf, IM, T2, IM, UE_MODE.ELTWISE_SUB)
+            E(Mf, SY, None, T1, UE_MODE.MUL_BROADCAST, math.atan(2.0 ** (-k))); E(Mf, Z, T1, Z, UE_MODE.ELTWISE_ADD)
+        E(Mf, RE, None, RE, UE_MODE.MUL_BROADCAST, 1.0 / (Kg * PRE))         # magnitude
+        # ---- 7. har = [mag(0..10) | phase(11..21) | 0]: two selection matmuls ----
+        S1 = torch.zeros(V, V, dtype=torch.bfloat16); S2 = torch.zeros(V, V, dtype=torch.bfloat16)
+        for k in range(n_bins):
+            S1[k, k] = 1.0; S2[n_bins + k, k] = 1.0
+        _dyn_matmul(ue, M=Mf, K=V, N=V, A_DRAM_ADDR=RE, B_DRAM_ADDR=self._up(S1), OUTPUT_DRAM_ADDR=T1)
+        _dyn_matmul(ue, M=Mf, K=V, N=V, A_DRAM_ADDR=Z, B_DRAM_ADDR=self._up(S2), OUTPUT_DRAM_ADDR=HAR,
+                    C_DRAM_ADDR=T1, bias_mode="full_matrix")
+        # rows [F, F+64): the convs' right zero-padding (frame F would otherwise carry the tail)
+        self._zero_rows(HAR, V, V, row_start=F_rows)
+
+    def _tanh(self, M, N, x, out, x_split=0.6):
+        """tanh without the 2*sigmoid(2x)-1 cancellation: sigmoid lands near 0.5 for small x, where
+        bf16 has 2^-9 resolution, so that form caps the SOURCE signal at ~32 dB (measured in the
+        5c bisect). Here |x| < x_split uses the odd Taylor series x - x^3/3 + 2x^5/15 - 17x^7/315
+        (relative precision), and |x| >= x_split the sigmoid form (|tanh| >= 0.54 there, so the
+        absolute 2^-9 error is < 1%). Blend weight s = step(|x| - x_split) from the clamp step."""
+        ue = self.ue
+        ident = self.identity_dram
+        n = M * N
+        xc, x2, poly, sig, sgn, w = [ue.allocate_tensor_dram(n * 2) for _ in range(6)]
+        E = lambda a, b, o, mode, sc=None: ue.eltwise_core_dram(M, N, a, b, o, mode, scalar=sc)
+        # xc = clamp(x, -split, split); poly(xc) by Horner in xc^2
+        _dyn_activation(ue, M=M, N=N, A_DRAM_ADDR=x, OUTPUT_DRAM_ADDR=xc, IDENTITY_DRAM_ADDR=ident,
+                        activation="clamp", clamp_min=-x_split, clamp_max=x_split)
+        E(xc, xc, x2, UE_MODE.ELTWISE_MUL)
+        coef = (-17.0 / 315.0, 2.0 / 15.0, -1.0 / 3.0, 1.0)
+        E(x2, None, poly, UE_MODE.MUL_BROADCAST, coef[0])
+        for c in coef[1:]:
+            E(poly, None, poly, UE_MODE.ADD_BROADCAST, c)
+            if c != coef[-1]:
+                E(poly, x2, poly, UE_MODE.ELTWISE_MUL)
+        E(poly, xc, poly, UE_MODE.ELTWISE_MUL)
+        # sig = 2 sigmoid(2x) - 1
+        E(x, None, sig, UE_MODE.MUL_BROADCAST, 2.0)
+        _dyn_activation(ue, M=M, N=N, A_DRAM_ADDR=sig, OUTPUT_DRAM_ADDR=sig, IDENTITY_DRAM_ADDR=ident,
+                        activation="sigmoid")
+        E(sig, None, sig, UE_MODE.MUL_BROADCAST, 2.0); E(sig, None, sig, UE_MODE.ADD_BROADCAST, -1.0)
+        # s = step(|x| - split), |x| = x * sign(x), sign = 2 step(x) - 1
+        self._step(M, N, x, sgn)
+        E(sgn, None, sgn, UE_MODE.MUL_BROADCAST, 2.0); E(sgn, None, sgn, UE_MODE.ADD_BROADCAST, -1.0)
+        E(x, sgn, w, UE_MODE.ELTWISE_MUL); E(w, None, w, UE_MODE.ADD_BROADCAST, -x_split)
+        self._step(M, N, w, w)
+        # out = poly + s * (sig - poly)
+        E(sig, poly, sig, UE_MODE.ELTWISE_SUB); E(sig, w, sig, UE_MODE.ELTWISE_MUL)
+        E(poly, sig, out, UE_MODE.ELTWISE_ADD)
+
+    def _stft_basis(self, n_fft, hop):
+        """Block-Toeplitz hann*DFT bases for 64 frames per block: rows i*64 + k (frame i, bin k),
+        columns = sample offset 6 + hop*i + n within the block's 384-sample read (which starts 16
+        samples before the block's first frame's centre - n_fft/2, i.e. 6 before its first sample)."""
+        V = UE_VECTOR_SIZE
+        key = ("stft_basis", n_fft, hop)
+        if key in self._const:
+            return self._const[key]
+        win = torch.hann_window(n_fft, periodic=True, dtype=torch.float64)
+        n = torch.arange(n_fft, dtype=torch.float64)
+        n_bins = n_fft // 2 + 1
+        Bre = torch.zeros(64 * V, self.GEN_STFT_K, dtype=torch.float64)
+        Bim = torch.zeros(64 * V, self.GEN_STFT_K, dtype=torch.float64)
+        for i in range(64):
+            c0 = 6 + hop * i
+            for k in range(n_bins):
+                Bre[i * V + k, c0:c0 + n_fft] = win * torch.cos(2 * math.pi * k * n / n_fft)
+                Bim[i * V + k, c0:c0 + n_fft] = -win * torch.sin(2 * math.pi * k * n / n_fft)
+        self._const[key] = (Bre.to(torch.bfloat16).contiguous(), Bim.to(torch.bfloat16).contiguous())
+        return self._const[key]
+
+    def _noise_conv_strided(self, HAR, T_out, Cout, W, b, k, stride, pad, out):
+        """noise_convs[0]: Conv1d(22 -> Cout, k, stride, pad) over har rows: gather rows
+        stride*t + kk - pad for each tap into a contiguous [T_out, 64] view (one HW loop per tap),
+        then k shifted matmuls accumulate. W: [Cout, 22, k]."""
+        ue = self.ue
+        V = UE_VECTOR_SIZE
+        cap = _template(T_out)
+        g = ue.allocate_tensor_dram(cap * V * 2)
+        acc = [ue.allocate_tensor_dram(cap * Cout * 2) for _ in range(2)]
+        for kk in range(k):
+            # source row = stride*t + (kk - pad): a negative start for kk < pad reads the zero rows
+            # that precede HAR (HAR is allocated with a 64-row zero prefix).
+            src = HAR + (kk - pad) * V * 2
+            _pbi_row_loop(ue, T_out, reads=[(src, stride * V * 2, V, 0)], writes=[(g, V * 2, V, 0)])
+            wk = _bf16(_pad_dim(W[:, :, kk].contiguous(), 1, V))            # [Cout, 64]
+            last = kk == k - 1
+            _dyn_matmul(ue, M=T_out, K=V, N=Cout, A_DRAM_ADDR=g, B_DRAM_ADDR=self._up(wk),
+                        OUTPUT_DRAM_ADDR=(out if last else acc[kk % 2]),
+                        C_DRAM_ADDR=(self._up(b) if kk == 0 else acc[(kk - 1) % 2]),
+                        bias_mode=("broadcast_N" if kk == 0 else "full_matrix"))
+
+    # ---- Section 5d: exp / sin -> complex spectrum -> iSTFT --------------------------------------
+    GEN_EXP_C = 14.0            # softmax anchor: exp(x) = softmax([x.., C, -inf..]) * e^C, x <= ~4
+    GEN_ISTFT_FRAMES = 68       # frames one 320-sample block depends on (64b-2 .. 64b+65)
+
+    def _sincos_2pi_frac(self, T, C, p, sn, cs):
+        """sn = sin(2*pi*p), cs = cos(2*pi*p) for any |p| < 64: magic-round mod 1 (see GEN_MAGIC),
+        quarter-wave fold, degree-9 Taylor -- the Snake path, run twice (cos = sin at p + 0.25)."""
+        ue = self.ue
+        cap = _template(T)
+        n, s, v, q, x2, tm, pf = [ue.allocate_tensor_dram(cap * C * 2) for _ in range(7)]
+        E = lambda a, b, o, mode, sc=None: _dyn_eltwise(ue, T, C, a, b, o, mode=mode, scalar=sc)
+        for shift, dst in ((0.0, sn), (0.25, cs)):
+            E(p, None, pf, UE_MODE.ADD_BROADCAST, shift)
+            E(pf, None, n, UE_MODE.ADD_BROADCAST, GEN_MAGIC); E(n, None, n, UE_MODE.ADD_BROADCAST, -GEN_MAGIC)
+            E(pf, n, pf, UE_MODE.ELTWISE_SUB); E(pf, None, pf, UE_MODE.ADD_BROADCAST, 1.0)
+            E(pf, None, s, UE_MODE.ADD_BROADCAST, -1.0); self._step(T, C, s, s); E(pf, s, pf, UE_MODE.ELTWISE_SUB)
+            # fold
+            E(pf, None, s, UE_MODE.ADD_BROADCAST, -0.25); self._step(T, C, s, s)
+            E(pf, None, v, UE_MODE.MUL_BROADCAST, -2.0); E(v, None, v, UE_MODE.ADD_BROADCAST, 0.5)
+            E(v, s, v, UE_MODE.ELTWISE_MUL); E(pf, v, q, UE_MODE.ELTWISE_ADD)
+            E(pf, None, s, UE_MODE.ADD_BROADCAST, -0.75); self._step(T, C, s, s)
+            E(pf, None, v, UE_MODE.MUL_BROADCAST, 2.0); E(v, None, v, UE_MODE.ADD_BROADCAST, -1.5)
+            E(v, s, v, UE_MODE.ELTWISE_MUL); E(q, v, q, UE_MODE.ELTWISE_ADD)
+            E(q, None, q, UE_MODE.MUL_BROADCAST, 2.0 * math.pi)
+            E(q, q, x2, UE_MODE.ELTWISE_MUL)
+            coef = [((-1) ** ((k - 1) // 2)) / math.factorial(k) for k in (9, 7, 5, 3, 1)]
+            E(x2, None, tm, UE_MODE.MUL_BROADCAST, coef[0])
+            for c in coef[1:]:
+                E(tm, None, tm, UE_MODE.ADD_BROADCAST, c)
+                if c != coef[-1]:
+                    E(tm, x2, tm, UE_MODE.ELTWISE_MUL)
+            E(tm, q, dst, UE_MODE.ELTWISE_MUL)
+
+    def _istft_basis(self, n_fft, hop):
+        """Bi [320, 68*64]: y[m] (block-relative) = sum over frames f_rel (0..67, frame 64b-2+f_rel)
+        and bins of  w[n]/n_fft/1.5 * c_k * (re_k cos - im_k sin), n = m - (hop*(f_rel-2) - n_fft/2).
+        Row layout per frame: re_k at col k, im_k at col 11+k. sum(w^2) over the 4 overlapping hann
+        frames is exactly 1.5 everywhere torch.istft(center=True) keeps, so no edge correction."""
+        key = ("istft_basis", n_fft, hop)
+        if key in self._const:
+            return self._const[key]
+        V = UE_VECTOR_SIZE
+        NF = self.GEN_ISTFT_FRAMES
+        win = torch.hann_window(n_fft, periodic=True, dtype=torch.float64)
+        n_bins = n_fft // 2 + 1
+        ck = torch.full((n_bins,), 2.0, dtype=torch.float64); ck[0] = 1.0; ck[-1] = 1.0
+        Bi = torch.zeros(64 * hop, NF * V, dtype=torch.float64)
+        for f_rel in range(NF):
+            for nn_ in range(n_fft):
+                m = hop * (f_rel - 2) - n_fft // 2 + nn_
+                if 0 <= m < 64 * hop:
+                    for k in range(n_bins):
+                        g = win[nn_] * ck[k] / n_fft / 1.5
+                        Bi[m, f_rel * V + k] = g * math.cos(2 * math.pi * k * nn_ / n_fft)
+                        Bi[m, f_rel * V + n_bins + k] = -g * math.sin(2 * math.pi * k * nn_ / n_fft)
+        self._const[key] = Bi.to(torch.bfloat16).contiguous()
+        return self._const[key]
+
+    def _istft(self, y, T, real_T, S, OUT):
+        """y [T, 64] = conv_post output (log-mag 0..10 | phase 11..21). OUT [S_cap] = audio samples.
+        exp via the softmax epilogue (native LALU exp): row' = [x_0..x_10 | C | -100...], spec =
+        softmax(row') * e^C  (the -100 lanes and the 1 + sum e^{x-C} < 1.0003 correction vanish).
+        sin/cos via _sincos_2pi_frac; complex rows [re | im | 0]; iSTFT = one M=1 matmul per
+        320-sample block over 68 frame rows (2 zero frames precede frame 0; frames >= F zeroed)."""
+        ue = self.ue
+        gen = self.gen
+        V = UE_VECTOR_SIZE
+        n_fft, hop = gen.stft.filter_length, gen.stft.hop_length
+        nb = n_fft // 2 + 1
+        cap = _template(T)
+        row = V * 2
+        C_ = self.GEN_EXP_C
+        # --- exp ---
+        Ssel = torch.zeros(V, V, dtype=torch.bfloat16)                 # keep cols 0..10, drop the rest
+        for k in range(nb):
+            Ssel[k, k] = 1.0
+        bsel = torch.full((V,), -100.0, dtype=torch.bfloat16); bsel[:nb] = 0.0; bsel[nb] = C_
+        rowp = ue.allocate_tensor_dram(cap * row)
+        spec = ue.allocate_tensor_dram(cap * row)
+        _dyn_matmul(ue, M=T, K=V, N=V, A_DRAM_ADDR=y, B_DRAM_ADDR=self._up(Ssel), OUTPUT_DRAM_ADDR=rowp,
+                    C_DRAM_ADDR=self._up(bsel), bias_mode="broadcast_N")
+        _dyn_activation(ue, M=T, N=V, A_DRAM_ADDR=rowp, OUTPUT_DRAM_ADDR=spec, IDENTITY_DRAM_ADDR=self.identity_dram,
+                        activation="softmax")
+        _dyn_eltwise(ue, T, V, spec, None, spec, mode=UE_MODE.MUL_BROADCAST, scalar=math.exp(C_))
+        # --- sin / cos of the phase lanes (cols 11..21 of y), moved to cols 0..10 ---
+        Sph = torch.zeros(V, V, dtype=torch.bfloat16)
+        for k in range(nb):
+            Sph[k, nb + k] = 1.0
+        ph = ue.allocate_tensor_dram(cap * row)
+        _dyn_matmul(ue, M=T, K=V, N=V, A_DRAM_ADDR=y, B_DRAM_ADDR=self._up(Sph), OUTPUT_DRAM_ADDR=ph)
+        _dyn_eltwise(ue, T, V, ph, None, ph, mode=UE_MODE.MUL_BROADCAST, scalar=1.0 / (2.0 * math.pi))
+        # The model's angle is phi = sin(x) (TorchSTFT.inverse gets `phase = torch.sin(x)` and
+        # forms spec * exp(1j * phase)), so the complex parts are cos(phi), sin(phi) with |phi| <= 1:
+        # inner sin by the wrapped path, outer pair by the bounded degree-7/6 Taylor series.
+        phi = ue.allocate_tensor_dram(cap * row)
+        cs0 = ue.allocate_tensor_dram(cap * row)
+        self._sincos_2pi_frac(T, V, ph, phi, cs0)                          # phi = sin(x)
+        sn = ue.allocate_tensor_dram(cap * row)
+        cs = ue.allocate_tensor_dram(cap * row)
+        x2 = ue.allocate_tensor_dram(cap * row)
+        E = lambda a, b, o, mode, sc=None: _dyn_eltwise(ue, T, V, a, b, o, mode=mode, scalar=sc)
+        E(phi, phi, x2, UE_MODE.ELTWISE_MUL)
+        E(x2, None, cs, UE_MODE.MUL_BROADCAST, -1.0 / 720.0); E(cs, None, cs, UE_MODE.ADD_BROADCAST, 1.0 / 24.0)
+        E(cs, x2, cs, UE_MODE.ELTWISE_MUL); E(cs, None, cs, UE_MODE.ADD_BROADCAST, -0.5)
+        E(cs, x2, cs, UE_MODE.ELTWISE_MUL); E(cs, None, cs, UE_MODE.ADD_BROADCAST, 1.0)          # cos(phi)
+        E(x2, None, sn, UE_MODE.MUL_BROADCAST, -1.0 / 5040.0); E(sn, None, sn, UE_MODE.ADD_BROADCAST, 1.0 / 120.0)
+        E(sn, x2, sn, UE_MODE.ELTWISE_MUL); E(sn, None, sn, UE_MODE.ADD_BROADCAST, -1.0 / 6.0)
+        E(sn, x2, sn, UE_MODE.ELTWISE_MUL); E(sn, None, sn, UE_MODE.ADD_BROADCAST, 1.0)
+        E(sn, phi, sn, UE_MODE.ELTWISE_MUL)                                                     # sin(phi)
+        # --- complex rows: [spec*cos (0..10) | spec*sin (11..21) | 0], with 64 zero rows in front ---
+        n_blocks = _template(S) // (64 * hop)
+        SPECB = ue.allocate_tensor_dram((V + cap + 2 * V) * row)
+        SPEC = SPECB + V * row
+        re = ue.allocate_tensor_dram(cap * row)
+        im = ue.allocate_tensor_dram(cap * row)
+        _dyn_eltwise(ue, T, V, spec, cs, re, mode=UE_MODE.ELTWISE_MUL)
+        _dyn_eltwise(ue, T, V, spec, sn, im, mode=UE_MODE.ELTWISE_MUL)
+        S1 = torch.zeros(V, V, dtype=torch.bfloat16); S2 = torch.zeros(V, V, dtype=torch.bfloat16)
+        for k in range(nb):
+            S1[k, k] = 1.0; S2[nb + k, k] = 1.0
+        tmp = ue.allocate_tensor_dram(cap * row)
+        _dyn_matmul(ue, M=T, K=V, N=V, A_DRAM_ADDR=re, B_DRAM_ADDR=self._up(S1), OUTPUT_DRAM_ADDR=tmp)
+        _dyn_matmul(ue, M=T, K=V, N=V, A_DRAM_ADDR=im, B_DRAM_ADDR=self._up(S2), OUTPUT_DRAM_ADDR=SPEC,
+                    C_DRAM_ADDR=tmp, bias_mode="full_matrix")
+        self._dbg5d = dict(spec=spec, phi=phi, sn=sn, cs=cs, SPEC=SPEC)
+        self._zero_rows(SPECB, V, V)                                       # the 2 (and more) frames before 0
+        self._zero_rows(SPEC, V, 2 * V, row_start=real_T)                  # frames >= F contribute nothing
+        # --- iSTFT ---
+        Bi = self._istft_basis(n_fft, hop)
+        K_i = self.GEN_ISTFT_FRAMES * V
+        for b in range(n_blocks):
+            ue.matmat_mul_core(M=1, K=K_i, N=64 * hop, A_DRAM_ADDR=SPEC + (64 * b - 2) * row,
+                               B_DRAM_ADDR=self._up(Bi), OUTPUT_DRAM_ADDR=OUT + 64 * hop * b * 2)
+
+    # ---- forward ------------------------------------------------------------------------------
+    def forward(self, x_gen: torch.Tensor, s: torch.Tensor, F0_curve: torch.Tensor, noise: torch.Tensor,
+                n_frames: int, debug_cpu_ref=None):
+        """x_gen: [C0, 2*n_frames] host (Section 5a's output). s: [style_dim]. F0_curve: [2*n_frames]
+        host (Section 3's output; SineGen's frame rate). noise: [S, 9] host, SineGen's additive
+        noise already scaled by noise_amp (the model's randomness -- generate_source_noise()).
+        Returns (audio [600*n_frames] host, conv_post output [22, F] host, F = 120*n_frames + 1).
+        debug_cpu_ref["har"] (if given) is compared right after Section 5c.
+        """
+        ue = self.ue
+        gen = self.gen
+        V = UE_VECTOR_SIZE
+        nf = n_frames
+        assert nf <= MAX_GEN_FRAMES, (
+            f"n_frames={nf} exceeds the generator capacity MAX_GEN_FRAMES={MAX_GEN_FRAMES}; the "
+            f"program image is frozen against that cap (see GEN_T2_CAP).")
+        nf_pad = _round_up(nf, V)
+        set_runtime_dims(n_frames=nf, nf_pad=nf_pad, pad_rows=nf_pad - nf)
+        _set_row_cap(GEN_T2_CAP, GEN_T2_CAP, "generator rows")
+        # Time levels: 0 = decoder-front output (2 nf), 1 = after ups[0] (20 nf),
+        # 2 = after ups[1] + reflection pad (120 nf + 1). Each (real, 64-aligned) pair is affine
+        # in the two preamble-primed frame registers.
+        T0, T0p = Dim(2 * nf, GPR_F, mul=2, cap=GEN_T0_CAP), Dim(2 * nf_pad, GPR_NFPAD, mul=2, cap=GEN_T0_CAP)
+        T1, T1p = Dim(20 * nf, GPR_F, mul=20, cap=GEN_T1_CAP), Dim(20 * nf_pad, GPR_NFPAD, mul=20, cap=GEN_T1_CAP)
+        T2r = Dim(120 * nf, GPR_F, mul=120, cap=GEN_T2_CAP - 64)              # before the pad
+        T2, T2p = (Dim(120 * nf + 1, GPR_F, mul=120, cap=GEN_T2_CAP - 63, off=1),
+                   Dim(120 * nf_pad + 64, GPR_NFPAD, mul=120, cap=GEN_T2_CAP, off=64))
+        self._caps = {0: GEN_T0_CAP, 1: GEN_T1_CAP, 2: GEN_T2_CAP}
+        self._live = {}
+        self._pool, self._owner = {}, {}
+        F_ = int(T2)
+        S = Dim(self.GEN_UP * 2 * nf, GPR_F, mul=self.GEN_UP * 2, cap=self.GEN_UP * GEN_T0_CAP)   # samples
+        assert noise.shape == (int(S), self.GEN_HARM), (noise.shape, int(S))
+        self.identity_dram = self._up(torch.eye(V, dtype=torch.bfloat16))
+        self.style_dram = self._up_cap(_bf16(s.reshape(-1)), self.style_dim)
+        debug_log = []
+
+        def _check(name, addr, rows, C, cpu_ref):
+            if debug_cpu_ref is None or cpu_ref is None:
+                return
+            got = ue.dma_from_accelerator_memory(addr, (int(rows), C)).float()
+            ref = cpu_ref.detach().float()
+            if ref.shape[0] != got.shape[0]:
+                ref = ref.T                                         # [C, T] -> [T, C]
+            got = got[:ref.shape[0], :ref.shape[1]]
+            from user_dma_core import calculate_snr
+            debug_log.append((name, calculate_snr(ref.reshape(-1), got.reshape(-1))))
+
+        # ---- inputs ----
+        C0 = x_gen.shape[0]
+        x0 = torch.zeros(GEN_T0_CAP, C0, dtype=torch.bfloat16)
+        x0[:int(T0)] = _bf16(x_gen.T)
+        x = self._up_cap(x0, GEN_T0_CAP * C0)
+        # ---- Section 5c: har [F, 64] on device (mag 0..10 | phase 11..21 | 0). Allocated with a
+        # 64-row zero prefix so noise_convs[0]'s strided gather can read its left zero-padding.
+        n_blocks = -(-GEN_T2_CAP // 64)
+        HARB = ue.allocate_tensor_dram((64 + n_blocks * 64) * V * 2)
+        HAR = HARB + 64 * V * 2
+        tables = self._source_prep(F0_curve, noise, int(T0))
+        self._program(lambda: (self._zero_rows(HARB, V, 64),
+                               self._source_har(tables, T0, S, T2, HAR)))
+        if debug_cpu_ref is not None and debug_cpu_ref.get("har") is not None:
+            from user_dma_core import calculate_snr
+            # Intermediate probes (scratch is rewound but untouched until the next program runs).
+            sg = self.gen.m_source.l_sin_gen
+            with torch.no_grad():
+                f0u = self.gen.f0_upsamp(F0_curve.reshape(1, 1, -1)).transpose(1, 2)
+                fn_ = f0u * torch.arange(1, sg.harmonic_num + 2, dtype=f0u.dtype)[None, None, :]
+                sine_ref = (sg._f02sine(fn_) * sg.sine_amp * sg._f02uv(f0u) + noise.unsqueeze(0)).squeeze(0)
+                merge_ref = self.gen.m_source.l_tanh(self.gen.m_source.l_linear(sine_ref.unsqueeze(0))).reshape(-1)
+                spec_ref = torch.stft(merge_ref, self.n_fft, self.gen.stft.hop_length, self.n_fft,
+                                      window=torch.hann_window(self.n_fft, periodic=True), center=True,
+                                      return_complex=True)                       # [11, F]
+            d = self._dbg
+            S_ = int(S)
+            outb = ue.dma_from_accelerator_memory(d["OUTB"] + self.GEN_HEAD_ROWS * V * 2, (S_, V)).float()
+            debug_log.append(("5c sine lanes (time-major)", calculate_snr(sine_ref.reshape(-1), outb[:, :self.GEN_HARM].reshape(-1))))
+            xp = ue.dma_from_accelerator_memory(d["XP"], (d["R"],)).float()
+            debug_log.append(("5c tanh(l_linear) signal", calculate_snr(merge_ref, xp[self.GEN_HEAD_ROWS:self.GEN_HEAD_ROWS + S_])))
+            head_ref = merge_ref[1:self.n_fft // 2 + 1].flip(0); tail_ref = merge_ref[-self.n_fft // 2 - 1:-1].flip(0)
+            debug_log.append(("5c reflect head", calculate_snr(head_ref, xp[self.GEN_HEAD_ROWS - 10:self.GEN_HEAD_ROWS])))
+            debug_log.append(("5c reflect tail", calculate_snr(tail_ref, xp[self.GEN_HEAD_ROWS + S_:self.GEN_HEAD_ROWS + S_ + 10])))
+            nb_ = self.n_fft // 2 + 1
+            re_hw = ue.dma_from_accelerator_memory(d["RE"], (F_, V)).float()[:, :nb_]
+            im_hw = ue.dma_from_accelerator_memory(d["IM"], (F_, V)).float()[:, :nb_]
+            debug_log.append(("5c STFT re", calculate_snr(spec_ref.real.T.reshape(-1), re_hw.reshape(-1))))
+            debug_log.append(("5c STFT im", calculate_snr(spec_ref.imag.T.reshape(-1), im_hw.reshape(-1))))
+            got = ue.dma_from_accelerator_memory(HAR, (F_, V)).float()
+            ref_h = debug_cpu_ref["har"].detach().float().T                   # [F, 22]
+            nb = self.n_fft // 2 + 1
+            mag_snr = calculate_snr(ref_h[:, :nb].reshape(-1), got[:, :nb].reshape(-1))
+            ang_r, ang_g = ref_h[:, nb:2 * nb], got[:, nb:2 * nb]
+            unit_snr = calculate_snr(torch.cat([torch.cos(ang_r), torch.sin(ang_r)]).reshape(-1),
+                                     torch.cat([torch.cos(ang_g), torch.sin(ang_g)]).reshape(-1))
+            debug_log.append(("har |X| (5c)", mag_snr))
+            debug_log.append(("har phase as (cos,sin) (5c)", unit_snr))
+            # per-bin breakdown: is the phase error in the strong bins, the empty bins, or branch-cut flips?
+            d = (ang_g - ang_r)
+            lines = []
+            for k in range(nb):
+                u = calculate_snr(torch.cat([torch.cos(ang_r[:, k]), torch.sin(ang_r[:, k])]),
+                                  torch.cat([torch.cos(ang_g[:, k]), torch.sin(ang_g[:, k])]))
+                raw = calculate_snr(ang_r[:, k], ang_g[:, k])
+                flips = (d[:, k].abs() > 3.0).float().mean().item() * 100
+                m = calculate_snr(ref_h[:, k], got[:, k])
+                lines.append(f"bin{k}: |X| {ref_h[:, k].abs().mean().item():.4f} mag {m:5.1f} dB, "
+                             f"phase unit {u:5.1f} dB raw {raw:5.1f} dB, |dphi|>3: {flips:4.1f}%")
+            report_snr("[fpga][debug] har per-bin:\n  " + "\n  ".join(lines))
+            har2 = debug_cpu_ref.get("har2")                                   # second noise seed
+            if har2 is not None:
+                a2 = har2.detach().float().T[:, nb:2 * nb]
+                debug_log.append(("  floor: har phase seed-vs-seed",
+                                  calculate_snr(torch.cat([torch.cos(ang_r), torch.sin(ang_r)]).reshape(-1),
+                                                torch.cat([torch.cos(a2), torch.sin(a2)]).reshape(-1))))
+                with torch.no_grad():
+                    nc_a = self.gen.noise_convs[0](debug_cpu_ref["har"].unsqueeze(0))
+                    nc_b = self.gen.noise_convs[0](har2.unsqueeze(0))
+                debug_log.append(("  floor: noise_conv0 seed-vs-seed", calculate_snr(nc_a.reshape(-1), nc_b.reshape(-1))))
+            # the strided conv alone, driven by the CPU's har: isolates _noise_conv_strided from 5c
+            HARB2 = ue.allocate_tensor_dram((64 + n_blocks * 64) * V * 2)
+            h2 = torch.zeros(64 + n_blocks * 64, V, dtype=torch.bfloat16)
+            h2[64:64 + F_, :self.C_har] = _bf16(debug_cpu_ref["har"].T)
+            ue.dma_to_accelerator_memory(HARB2, h2.reshape(-1))
+            nc0_ = self.noise_convs[0]
+            probe = self._block(lambda o: self._noise_conv_strided(HARB2 + 64 * V * 2, T1p, nc0_["Cout"], nc0_["w"],
+                                                                   nc0_["b"], nc0_["k"], nc0_["stride"], nc0_["pad"], o),
+                                GEN_T1_CAP, nc0_["Cout"])
+            got_nc = ue.dma_from_accelerator_memory(probe, (int(T1p), nc0_["Cout"])).float()[:int(T1)]
+            debug_log.append(("noise_conv0 on device from CPU har", calculate_snr(
+                debug_cpu_ref["noise_conv"][0].detach().float().T.reshape(-1), got_nc.reshape(-1))))
+            self._release(probe)
+        nc0, nc1 = self.noise_convs[0], self.noise_convs[1]
+        W1 = _bf16(_pad_dim(nc1["w"].reshape(nc1["Cout"], -1), 1, V))
+        noise_conv = {
+            0: lambda o: self._noise_conv_strided(HAR, T1p, nc0["Cout"], nc0["w"], nc0["b"], nc0["k"],
+                                                  nc0["stride"], nc0["pad"], o),
+            1: lambda o: _dyn_matmul(ue, M=T2p, K=V, N=nc1["Cout"], A_DRAM_ADDR=HAR, B_DRAM_ADDR=self._up(W1),
+                                     OUTPUT_DRAM_ADDR=o, C_DRAM_ADDR=self._up(nc1["b"]), bias_mode="broadcast_N"),
+        }
+        # Reduction masks are LIVE for the whole section: allocate them before the first block,
+        # since a block rewinds the allocator to its own mark when it finishes.
+        self._mask_vec(1, T1)
+        self._mask_vec(2, T2)
+
+        self._owner[x] = (GEN_T0_CAP, C0)          # let the pool recycle the input buffer too
+        E = lambda T_, C_, a, b, o, **kw: _dyn_eltwise(ue, T_, C_, a, b, o, **kw)
+        ref = lambda *keys: (debug_cpu_ref and _dig(debug_cpu_ref, keys))
+
+        def stage(i, x, T_in, T_in_p, Cin, Cout, T_out, T_out_p, cap_in, cap_out, level, refl=None):
+            u = self.ups[i]
+            h = self._block(lambda o: self._leaky(x, T_in_p, Cin, o, 0.1), cap_in, Cin)
+            self._release(x)
+            xu = self._block(lambda o: self._conv_transpose(h, T_in, Cin, Cout, u["w"], u["b"], o, u["k"],
+                                                            u["stride"], u["pad"], T_out_p), cap_out, Cout)
+            self._release(h)
+            if refl is not None:
+                # ReflectionPad1d((1, 0)): out[0] = in[1], out[1 + t] = in[t]
+                def _refl(o):
+                    self._copy_rows(xu, o + Cout * 2, Cout, refl)
+                    self._copy_rows(xu + Cout * 2, o, Cout, 1)
+                x = self._block(_refl, cap_out, Cout)
+                self._release(xu)
+            else:
+                x = xu
+            _check(f"ups{i}", x, T_out, Cout, ref("ups", i))
+            xs = self._block(noise_conv[i], cap_out, Cout)
+            _check(f"noise_conv{i}", xs, T_out, Cout, ref("noise_conv", i))
+            xr = self._resblock(xs, T_out_p, T_out, level, self.noise_res[i])
+            self._release(xs)
+            _check(f"noise_res{i}", xr, T_out, Cout, ref("noise_res", i))
+            xsum = self._block(lambda o: E(T_out_p, Cout, x, xr, o, mode=UE_MODE.ELTWISE_ADD), cap_out, Cout)
+            self._release(x); self._release(xr)
+            acc = None
+            for j_ in range(self.n_kernels):
+                r = self._resblock(xsum, T_out_p, T_out, level, self.resblocks[i * self.n_kernels + j_])
+                _check(f"resblock{i}.{j_}", r, T_out, Cout, ref("resblocks", i, j_))
+                if acc is None:
+                    acc = r
+                else:
+                    nacc = self._block(lambda o, a=acc, r=r: E(T_out_p, Cout, a, r, o, mode=UE_MODE.ELTWISE_ADD),
+                                       cap_out, Cout)
+                    self._release(acc); self._release(r)
+                    acc = nacc
+            self._release(xsum)
+            out = self._block(lambda o: E(T_out_p, Cout, acc, None, o, mode=UE_MODE.MUL_BROADCAST,
+                                          scalar=1.0 / self.n_kernels), cap_out, Cout)
+            self._release(acc)
+            _check(f"stage{i}", out, T_out, Cout, ref("stage", i))
+            return out
+
+        C1, C2 = self.ups[0]["Cout"], self.ups[1]["Cout"]
+        x = stage(0, x, T0, T0p, C0, C1, T1, T1p, GEN_T0_CAP, GEN_T1_CAP, 1)
+        x = stage(1, x, T1, T1p, C1, C2, T2, T2p, GEN_T1_CAP, GEN_T2_CAP, 2, refl=T2r)
+
+        # ================= conv_post =================
+        h = self._block(lambda o: self._leaky(x, T2p, C2, o, 0.01), GEN_T2_CAP, C2)
+        self._release(x)
+        cp = self.conv_post
+        y = self._block(lambda o: self._conv1d(h, T2p, T2, C2, cp["Cout"], cp["w"], cp["b"], o, cp["k"], 1),
+                        GEN_T2_CAP, cp["Cout"])
+        self._release(h)
+        _check("conv_post", y, T2, cp["Cout"], ref("conv_post"))
+        # ================= Section 5d: exp/sin + iSTFT -> audio =================
+        AUDIO = ue.allocate_tensor_dram(_template(S) * 2)
+        self._program(lambda: self._istft(y, T2p, T2, S, AUDIO))
+        n_bufs = sum(len(v) for v in self._pool.values()) + len(self._owner)
+        report(f"[fpga] Section 5b: {n_bufs} pooled activation buffers, tensor high-water "
+               f"{_DRAM_HIGH[0] / 2**20:.0f} MB")
+
+        if debug_cpu_ref is not None:
+            report_snr("\n[fpga][debug] --- Section 5b bisect (SNR vs CPU, same har) ---")
+            for name, snr_db in debug_log:
+                flag = "  <-- LOW" if snr_db < 30.0 else ""
+                report_snr(f"[fpga][debug] {name:38s} {snr_db:8.2f} dB{flag}")
+            report_snr("[fpga][debug] --- end bisect ---\n")
+
+        out = ue.dma_from_accelerator_memory(y, (int(T2p), cp["Cout"])).float()[:F_, :self.C_har].T.contiguous()
+        audio = ue.dma_from_accelerator_memory(AUDIO, (int(S),)).float()
+        if debug_cpu_ref is not None:
+            from user_dma_core import calculate_snr
+            # 5d in isolation: the device iSTFT of the device's OWN conv_post output vs torch's
+            d5 = self._dbg5d
+            nb = self.n_fft // 2 + 1
+            yr = out.T                                                          # [F, 22]
+            sp = ue.dma_from_accelerator_memory(d5["spec"], (int(T2p), V)).float()[:F_, :nb]
+            report_snr(f"[fpga][debug] 5d exp(logmag) via softmax:        {calculate_snr(torch.exp(yr[:, :nb]).reshape(-1), sp.reshape(-1)):.2f} dB")
+            phi = ue.dma_from_accelerator_memory(d5["phi"], (int(T2p), V)).float()[:F_, :nb]
+            report_snr(f"[fpga][debug] 5d phi = sin(x):                    {calculate_snr(torch.sin(yr[:, nb:]).reshape(-1), phi.reshape(-1)):.2f} dB")
+            sn_ = ue.dma_from_accelerator_memory(d5["sn"], (int(T2p), V)).float()[:F_, :nb]
+            cs_ = ue.dma_from_accelerator_memory(d5["cs"], (int(T2p), V)).float()[:F_, :nb]
+            pr = torch.sin(yr[:, nb:])
+            report_snr(f"[fpga][debug] 5d sin(phi), cos(phi):              {calculate_snr(torch.sin(pr).reshape(-1), sn_.reshape(-1)):.2f} / {calculate_snr(torch.cos(pr).reshape(-1), cs_.reshape(-1)):.2f} dB")
+            spr = ue.dma_from_accelerator_memory(d5["SPEC"], (int(T2p), V)).float()[:F_]
+            zr = torch.exp(yr[:, :nb]) * torch.exp(1j * pr)
+            report_snr(f"[fpga][debug] 5d complex rows re / im:            {calculate_snr(zr.real.reshape(-1), spr[:, :nb].reshape(-1)):.2f} / {calculate_snr(zr.imag.reshape(-1), spr[:, nb:2 * nb].reshape(-1)):.2f} dB")
+            zdev = torch.complex(spr[:, :nb], spr[:, nb:2 * nb]).T                # the device's own rows
+            report_snr(f"[fpga][debug] 5d complex rows (power-weighted): "
+                       f"{calculate_snr(torch.view_as_real(zr.T).reshape(-1), torch.view_as_real(zdev).reshape(-1)):.2f} dB; "
+                       f"per-bin re/im dB: " + " ".join(f"{calculate_snr(torch.view_as_real(zr.T[k]).reshape(-1), torch.view_as_real(zdev[k]).reshape(-1)):.0f}" for k in range(nb)))
+            a_ref_rows = torch.istft(zr.T, self.n_fft, self.gen.stft.hop_length, self.n_fft,
+                                     window=torch.hann_window(self.n_fft, periodic=True), center=True)
+            a_from_dev_rows = torch.istft(zdev, self.n_fft, self.gen.stft.hop_length, self.n_fft,
+                                          window=torch.hann_window(self.n_fft, periodic=True), center=True)
+            report_snr(f"[fpga][debug] 5d iSTFT alone (torch istft of the device rows vs device audio): "
+                       f"{calculate_snr(a_from_dev_rows, audio[:a_from_dev_rows.numel()]):.2f} dB; "
+                       f"torch istft(ref rows) vs torch istft(device rows): {calculate_snr(a_ref_rows, a_from_dev_rows):.2f} dB")
+            report_snr(f"[fpga][debug] 5d exp/sin+iSTFT vs host istft of the same conv_post: "
+                       f"{calculate_snr(generator_host_istft(self.gen, out).reshape(-1), audio):.2f} dB")
+        ue.reset_tensor_dram_addr()
+        return audio, out
+
+
+def _dig(d, keys):
+    for k in keys:
+        d = d[k]
+    return d
+
+
+def generator_cpu_reference(gen, x, s, har):
+    """Generator.forward from `har` onward on the CPU, given the SAME har the FPGA path used,
+    recording every stage so the device bisect has a like-for-like reference. x: [1, C, T],
+    s: [1, style_dim], har: [1, 22, F]. Returns (conv_post output [1, 22, F], refs dict)."""
+    import torch.nn.functional as F
+    refs = {"ups": [], "noise_conv": [], "noise_res": [], "resblocks": [], "stage": []}
+    with torch.no_grad():
+        for i in range(gen.num_upsamples):
+            x = F.leaky_relu(x, negative_slope=0.1)
+            x_source = gen.noise_convs[i](har)
+            refs["noise_conv"].append(x_source.squeeze(0))
+            x_source = gen.noise_res[i](x_source, s)
+            refs["noise_res"].append(x_source.squeeze(0))
+            x = gen.ups[i](x)
+            if i == gen.num_upsamples - 1:
+                x = gen.reflection_pad(x)
+            refs["ups"].append(x.squeeze(0))
+            x = x + x_source
+            xs, blk = None, []
+            for j in range(gen.num_kernels):
+                r = gen.resblocks[i * gen.num_kernels + j](x, s)
+                blk.append(r.squeeze(0))
+                xs = r if xs is None else xs + r
+            refs["resblocks"].append(blk)
+            x = xs / gen.num_kernels
+            refs["stage"].append(x.squeeze(0))
+        x = F.leaky_relu(x)
+        x = gen.conv_post(x)
+        refs["conv_post"] = x.squeeze(0)
+    return x, refs
+
+
+def generate_source_noise(gen, F0_curve):
+    """SineGen's additive noise for this utterance: randn scaled by noise_amp (per frame: noise_std
+    where voiced, sine_amp/3 where not), time-major [S, 9]. The model's own randomness, drawn on
+    the host and fed to BOTH the device path and the CPU reference so they are comparable."""
+    sg = gen.m_source.l_sin_gen
+    with torch.no_grad():
+        f0 = gen.f0_upsamp(F0_curve.reshape(1, 1, -1)).transpose(1, 2)          # [1, S, 1]
+        uv = sg._f02uv(f0)
+        noise_amp = uv * sg.noise_std + (1 - uv) * sg.sine_amp / 3
+        return (noise_amp * torch.randn(1, f0.shape[1], sg.dim)).squeeze(0)     # [S, 9]
+
+
+def generator_host_har(gen, F0_curve, noise):
+    """Section 5c on the host, deterministic given `noise`: f0 upsample -> SineGen -> l_linear/tanh
+    -> STFT -> har [1, 22, F]. Mirrors SourceModuleHnNSF.forward with the noise injected."""
+    sg = gen.m_source.l_sin_gen
+    with torch.no_grad():
+        f0 = gen.f0_upsamp(F0_curve.reshape(1, 1, -1)).transpose(1, 2)
+        fn = f0 * torch.arange(1, sg.harmonic_num + 2, dtype=f0.dtype)[None, None, :]
+        sine = sg._f02sine(fn) * sg.sine_amp
+        uv = sg._f02uv(f0)
+        sine = sine * uv + noise.unsqueeze(0)
+        merge = gen.m_source.l_tanh(gen.m_source.l_linear(sine))                # [1, S, 1]
+        har_spec, har_phase = gen.stft.transform(merge.transpose(1, 2).squeeze(1))
+        return torch.cat([har_spec, har_phase], dim=1)
+
+
+def generator_host_istft(gen, y):
+    """Section 5d on the host: y [22, F] (conv_post output) -> audio [samples]."""
+    with torch.no_grad():
+        y = y.reshape(1, *y.shape).float()
+        n = gen.post_n_fft // 2 + 1
+        spec = torch.exp(y[:, :n, :])
+        phase = torch.sin(y[:, n:, :])
+        return gen.stft.inverse(spec, phase).squeeze()
+
+
 def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: float = 1.0,
                      dev: str = "xdma0", debug: bool = False, dump_programs: str = None,
                      bin_cache: str = None):
@@ -2983,17 +4175,39 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
         report_snr(f"[fpga] Section 5a decoder-front SNR vs CPU: "
               f"{calculate_snr(dec_cpu[-1].reshape(-1), x_gen.T.reshape(-1)):.2f} dB")
 
-        # ---- Section 5b-5d: ISTFTNet Generator -- STILL ON CPU ----
-        # Not blocked, just not written: the op gaps are already proven in user_hw_test.py
-        # (sincos_bounded_poly_test for Snake1D/phase, exp_via_sigmoid_test for `spec`,
-        # conv_transpose1d_zero_insert_test for `ups`). SineGen's unbounded accumulating phase is
-        # the one genuinely open question -- the Taylor fit is proven on [-1,1] only.
-        report("[fpga] Section 5b-5d (ISTFTNet generator): CPU fallback -- not ported yet.")
-        with torch.no_grad():
-            audio = dec.generator(x_gen.unsqueeze(0), s_dec, F0_pred_fpga.unsqueeze(0)).squeeze()
+        # ---- Section 5b: ISTFTNet Generator body ----
+        # `har` (Section 5c: SineGen + STFT) and exp/sin + iSTFT (Section 5d) are host-side for
+        # now; both are HW-proven compositions in user_hw_test.py (sinegen_wrapped_phase_test,
+        # cordic_atan2_magnitude_test, stft_istft_matmul_test) awaiting wiring. har's noise terms
+        # are random, so it is computed ONCE and fed to both the FPGA path and the CPU reference.
+        gen = dec.generator
+        n_frames_dec = x_gen.shape[-1] // 2
+        noise = generate_source_noise(gen, F0_pred_fpga)                        # [S, 9]
+        har = generator_host_har(gen, F0_pred_fpga, noise)                     # [1, 22, F] reference
+        y_cpu, gen_refs = generator_cpu_reference(gen, x_gen.unsqueeze(0), s_dec, har)
+        gen_refs["har"] = har.squeeze(0)
+        _begin("5b-5d: Generator")
+        report(f"\n[fpga] Section 5b-5d (SineGen/STFT + Generator body + iSTFT): n_frames={n_frames_dec}, "
+               f"F={har.shape[-1]} STFT frames, {har.shape[-1] * gen.stft.hop_length} samples ...")
+        generator = GeneratorFPGA(model, ue)
+        audio, y_fpga = generator.forward(x_gen, s_dec.reshape(-1), F0_pred_fpga, noise, n_frames_dec,
+                                          debug_cpu_ref=(gen_refs if debug else None))     # [S], [22, F]
+        report_snr(f"[fpga] Section 5b conv_post output SNR vs CPU (same noise): "
+                   f"{calculate_snr(y_cpu.squeeze(0).reshape(-1), y_fpga.reshape(-1)):.2f} dB")
+        # The model's OWN noise floor: the same CPU generator with a second noise draw. The FPGA
+        # cannot be expected to track the CPU closer than the CPU tracks itself across seeds.
+        y_cpu2, _ = generator_cpu_reference(
+            gen, x_gen.unsqueeze(0), s_dec, generator_host_har(gen, F0_pred_fpga, generate_source_noise(gen, F0_pred_fpga)))
+        report_snr(f"[fpga] Section 5b conv_post CPU-vs-CPU across noise seeds (floor): "
+                   f"{calculate_snr(y_cpu.squeeze(0).reshape(-1), y_cpu2.squeeze(0).reshape(-1)):.2f} dB")
+        audio_cpu = generator_host_istft(gen, y_cpu.squeeze(0))
+        report_snr(f"[fpga] Section 5d audio CPU-vs-CPU across noise seeds (floor): "
+                   f"{calculate_snr(audio_cpu.reshape(-1), generator_host_istft(gen, y_cpu2.squeeze(0)).reshape(-1)):.2f} dB")
+        report_snr(f"[fpga] Section 5d audio SNR vs CPU (same noise; waveform SNR, see METRIC note): "
+                   f"{calculate_snr(audio_cpu.reshape(-1), audio.reshape(-1)):.2f} dB")
 
         _CUR[0] = None
-        report(f"[fpga] Pipeline complete: sections 1-5a on hardware, generator on CPU.")
+        report(f"[fpga] Pipeline complete: sections 1-5d on hardware -- phonemes in, samples out.")
         _report_timings()
         _dump_program_fingerprints()
         # Freeze the image on the first successful run so later runs skip emission entirely.
