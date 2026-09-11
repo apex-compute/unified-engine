@@ -52,6 +52,20 @@ from user_dma_core import INSTRUCTION_SIZE_BYTES
 from user_dma_core import UE_MODE
 from multi_engine_shard import MultiEngineScheduler, PrivateArena
 
+# On hardware whose HW_INFO reports 12 cores, multi-core Gemma4 E2B owns the
+# full 8 GB map as two non-overlapping arenas, regardless of how many cores the
+# run activates:
+#   [0, 6 GB) -- twelve fixed 512 MB private engine windows
+#   [6, 8 GB) -- the primary's original 2 GB params/tensor/ISA layout, rebased
+#                upward without changing a single internal offset.
+# Other hardware keeps the historical Gemma4 layout (model in the upper 2 GB,
+# private windows carved out of the low 2 GB).
+MULTI_CORE_MAX_ENGINES = 12
+MULTI_CORE_ENGINE_WINDOW_BYTES = 0x20000000
+MULTI_CORE_MODEL_BASE = 0x180000000
+MULTI_CORE_DRAM_LIMIT = 0x200000000
+MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
+
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
 
@@ -801,8 +815,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 "GEMMA4_PENALTY=1 is temporarily unsupported: the dynamic streaming "
                 "quantized_matmat_core must gain broadcast-bias support before the "
                 "on-FPGA penalty can be re-enabled.")
-        if not 1 <= multi_core <= 12:
-            raise ValueError(f"multi_core must be between 1 and 12, got {multi_core}")
+        if not 1 <= multi_core <= MULTI_CORE_MAX_ENGINES:
+            raise ValueError(
+                f"multi_core must be between 1 and {MULTI_CORE_MAX_ENGINES}, "
+                f"got {multi_core}")
         if multi_core > 1 and vision_kernel != "matmatmul":
             raise ValueError("multi-engine vision projection sharding requires --vision-kernel matmatmul")
         if multi_core > 1:
@@ -817,9 +833,30 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._multi_core_schedulers = {}
         self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
+        # A multicore run on a 12-core bitstream uses twelve fixed 512 MB slots
+        # below 6 GB and moves the primary's unchanged 2 GB model map to
+        # [6, 8 GB). Other hardware, and single-core runs, retain the historical
+        # addresses.
+        self._use_hw12_dram_layout = (
+            multi_core > 1
+            and user_dma_core.ANDROMEDA_CORE_COUNT == MULTI_CORE_MAX_ENGINES
+        )
+        if (self._use_hw12_dram_layout
+                and user_dma_core.AVAILABLE_DRAM_SIZE_GB is not None
+                and user_dma_core.AVAILABLE_DRAM_SIZE_GB < 8):
+            raise ValueError(
+                "12-core Gemma4 multicore layout requires the 8 GB DRAM map; "
+                f"HW_INFO reports {user_dma_core.AVAILABLE_DRAM_SIZE_GB} GB")
+        _rebase = MULTI_CORE_MODEL_REBASE if self._use_hw12_dram_layout else 0
+        # Every DRAM address in a compiled program image is a literal baked
+        # against the map below, so a cached section is only reusable by a run
+        # with the SAME layout. The program bin/meta path -- run and profile,
+        # compiler and loader -- must agree on this tag.
+        self.dram_layout = "hw12" if self._use_hw12_dram_layout else "legacy"
         # Gemma4 DRAM layout. ONE model map, used at EVERY engine count: the
-        # original upper-2 GB window, unchanged from the single-core path. Adding
-        # engines does not move a single model address.
+        # original 2 GB window, unchanged from the single-core path apart from
+        # the whole-map rebase above. Adding engines does not move a single
+        # model address RELATIVE to the map base.
         #
         # MODEL MAP, upper 2 GB (all engine counts):
         #   PARAMS  weights   : 0x80000000 – 0xE1000000  (1552 MiB)
@@ -827,27 +864,35 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         #   ISA vision core0  : 0xFF000000 – 0xFF400000  (4 MiB, master)
         #   ISA reserved      : 0xFF400000 – 0xFF620000  (2.125 MiB)
         #   ISA LM            : 0xFF620000 – 0x100000000 (9.875 MiB, master)
-        # Vision and LM programs remain resident at disjoint addresses. Only
-        # MASTER programs live here now -- workers moved out (below).
+        # On a 12-core bitstream every address above is + 4 GB, i.e. the same map
+        # at 0x180000000 – 0x200000000. Vision and LM programs remain resident at
+        # disjoint addresses. Only MASTER programs live here -- workers moved out
+        # (below).
         #
-        # MULTI-CORE PRIVATE SPACE, the whole lower 2 GB — empty at 1 core. It is
-        # NOT hand-partitioned: it goes to multi_engine_shard.PrivateArena, which
-        # splits it into one window per engine, each laid out
-        # [ weights | ISA | tensor ] with the two fixed slices at the TOP:
-        #   8 engines  -> 256 MiB/window: 224 MiB weights + 16 MiB ISA + 16 MiB tensor
-        #   12 engines -> 160 MiB/window: 128 MiB weights + 16 MiB ISA + 16 MiB tensor
+        # MULTI-CORE PRIVATE SPACE — empty at 1 core. It is NOT hand-partitioned:
+        # it goes to multi_engine_shard.PrivateArena, which splits it into one
+        # window per engine, each laid out [ weights | ISA | tensor ] with the two
+        # fixed slices at the TOP:
+        #   Legacy map (< 12-core HW), the whole lower 2 GB:
+        #     8 engines  -> 256 MiB/window: 224 MiB weights + 16 ISA + 16 tensor
+        #   12-core HW map, a fixed [0, 6 GB) arena of TWELVE 512 MiB windows,
+        #   allocated whatever the run's engine count is (a --multi-core 6 run
+        #   uses regions 0..5 and leaves 6..11 unused; it does not resize the six
+        #   active windows to 1 GB or move the primary model map):
+        #     any count -> 512 MiB/window: 480 MiB weights + 16 ISA + 16 tensor
         # The ISA slice holds that engine's worker program (~1.7 MB today); the
         # tensor slice holds everything an engine must not share -- vision attn
         # scratch (13.12 MiB) and prefill attn scratch (1.50 MiB) both come out
         # of it. The weight arena is unused so far and is what decoder weight
         # sharding will draw on.
         #
-        # WHY BELOW THE MODEL MAP AND NOT ABOVE IT. The model map begins at
-        # DRAM_START_ADDR (0x80000000) and every model address is allocated
-        # upwards from there, so nothing the model owns can ever reach below it.
-        # A private window carved from the low 2 GB therefore cannot alias model
-        # memory however the model's cursors move -- which is the whole point,
-        # and is the same arrangement gemma3 uses.
+        # WHY BELOW THE MODEL MAP AND NOT ABOVE IT. The model map begins at its
+        # params base and every model address is allocated upwards from there,
+        # so nothing the model owns can ever reach below it. A private window
+        # carved from the space underneath therefore cannot alias model memory
+        # however the model's cursors move -- which is the whole point, and is
+        # the same arrangement gemma3 uses. The 12-core map keeps that invariant
+        # with more room on both sides: 6 GB of arena, 2 GB of model.
         #
         # ONE arena object serves the whole run (self.mc_arena): the model
         # allocates scratch from it during tensor init, and every stage's
@@ -855,17 +900,30 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # cursor per engine rather than one per scheduler.
         # Window 0 belongs to core 0, which keeps its own tensor-arena buffers;
         # its window stays reserved so engine index == window index everywhere.
-        self.DRAM_END = 0x100000000
-        _params_base  = 0x80000000
-        _tensor_base  = 0xE1000000
-        self.VISION_ISA_BASE             = 0xFF000000
-        self.VISION_WORKER_ISA_BASE      = 0xFF400000
-        self.LM_ISA_BASE                 = 0xFF620000
-        # Per-engine private windows: the whole low 2 GB, split by the library.
-        # Uniform at EVERY engine count -- vision and prefill are sequential and
-        # share one arena, so engine i always owns the same window in both.
-        self.mc_arena = (PrivateArena(multi_core, verbose=True)
-                         if multi_core > 1 else None)
+        self.DRAM_END = 0x100000000 + _rebase
+        _params_base  = 0x80000000 + _rebase
+        _tensor_base  = 0xE1000000 + _rebase
+        self.VISION_ISA_BASE             = 0xFF000000 + _rebase
+        self.VISION_WORKER_ISA_BASE      = 0xFF400000 + _rebase
+        self.LM_ISA_BASE                 = 0xFF620000 + _rebase
+        assert not self._use_hw12_dram_layout or self.DRAM_END == MULTI_CORE_DRAM_LIMIT, (
+            f"12-core model map ends at 0x{self.DRAM_END:X}, not at the 8 GB "
+            f"device limit 0x{MULTI_CORE_DRAM_LIMIT:X}")
+        # Per-engine private windows, split by the library. Uniform at EVERY
+        # engine count -- vision and prefill are sequential and share one arena,
+        # so engine i always owns the same window in both. On 12-core HW the
+        # arena is the FIXED [0, 6 GB) twelve-slot map (see above); elsewhere it
+        # is the low 2 GB divided by the run's engine count.
+        if self._use_hw12_dram_layout:
+            self.mc_arena = PrivateArena(
+                MULTI_CORE_MAX_ENGINES,
+                arena_base=0,
+                arena_bytes=(MULTI_CORE_MAX_ENGINES
+                             * MULTI_CORE_ENGINE_WINDOW_BYTES),
+                verbose=True)
+        else:
+            self.mc_arena = (PrivateArena(multi_core, verbose=True)
+                             if multi_core > 1 else None)
         # Top of the vision tensor arena (vision weights are top-placed against
         # it; scratch stays below). In the multi-core layout every worker ISA
         # lives in the dedicated ISA region, so the tensor arena simply runs up
@@ -1184,6 +1242,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 and _lm_meta.get("prefill_kernel") == self.prefill_kernel
                 and _lm_meta.get("decode_kernel") == self.decode_kernel
                 and _lm_meta.get("multi_core", 1) == self.multi_core
+                and _lm_meta.get("dram_layout", "legacy") == self.dram_layout
                 and all(meta is not None
                         and meta.get("prefill_seq_len") == prefill_flops_seq_len
                         and meta.get("prefill_kernel") == self.prefill_kernel
@@ -1285,6 +1344,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "layer_size": layer_size,
             "prefill_kernel": self.prefill_kernel,
             "multi_core": self.multi_core,
+            "dram_layout": self.dram_layout,
             "decode_kernel": self.decode_kernel,
             # Register indices the M-sharded V^T workers read their per-token slice from.
             # Allocated during compile; a run that only LOADS the image would otherwise
@@ -1296,6 +1356,14 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             lm_meta["prefill_profile_checkpoints"] = self._prefill_checkpoints
             lm_meta["decoder_profile_checkpoints"] = self._decoder_checkpoints
         # Merge the LM section into the combined programs bin (vision stays intact).
+        # The LM ISA slice runs to the top of the model map, which on the 12-core
+        # layout is also the top of the 8 GB device: overrunning it would not
+        # fault, so it is checked where the image is written.
+        if instruction_base_addr + len(image_bytes) > self.DRAM_END:
+            raise MemoryError(
+                f"Gemma4 LM program ends at "
+                f"0x{instruction_base_addr + len(image_bytes):X}, beyond the model "
+                f"map limit 0x{self.DRAM_END:X}")
         self._store_program_section("lm", instruction_base_addr, image_bytes, lm_meta, profile=profile)
         if prefill_scheduler is not None:
             for engine_idx, worker_addr in enumerate(prefill_worker_addrs, start=1):
@@ -1309,6 +1377,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                     f"prefill_worker{engine_idx}", worker_addr, worker_bytes,
                     {"parent": "lm", "engine_idx": engine_idx,
                      "multi_core": self.multi_core,
+                     "dram_layout": self.dram_layout,
                      "prefill_seq_len": prefill_flops_seq_len,
                      "prefill_kernel": self.prefill_kernel}, profile=profile)
             # Decode workers: their own image per engine, at addresses following
@@ -1320,6 +1389,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                     f"decode_worker{engine_idx}", worker_addr, worker_bytes,
                     {"parent": "lm", "engine_idx": engine_idx,
                      "multi_core": self.multi_core,
+                     "dram_layout": self.dram_layout,
                      "decode_kernel": self.decode_kernel}, profile=profile)
 
         print(f"[compile] stored LM section ({len(image_bytes)/1024:.1f} KB @ 0x{instruction_base_addr:X}); "
@@ -1437,6 +1507,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         lines.append(f"- **--dev:** {args.dev}")
         lines.append(f"- **Clock / frequency:** {clock_ns:.1f} ns ({freq_mhz:.1f} MHz)")
         lines.append(f"- **Cores (--multi-core):** {cores}")
+        lines.append(f"- **DRAM layout:** {self.dram_layout} "
+                     f"(model map 0x{self._params_dram_base:X}..0x{self.DRAM_END:X}"
+                     + (f", {MULTI_CORE_MAX_ENGINES} x 512 MB private windows "
+                        f"from 0x0" if self._use_hw12_dram_layout else "") + ")")
         lines.append(f"- **Peak throughput:** {peak_gflops:.1f} GFLOPS "
                      f"({freq_mhz:.1f} MHz × 128 × {cores} core(s))")
         dram_read_speed = getattr(self, "_dram_read_speed_mbps", None)
@@ -1613,6 +1687,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             f"- **--dev:** {args.dev}",
             f"- **Clock / frequency:** {clock_ns:.1f} ns ({freq_mhz:.1f} MHz)",
             f"- **Cores (--multi-core):** {cores}",
+            f"- **DRAM layout:** {self.dram_layout} "
+            f"(model map 0x{self._params_dram_base:X}..0x{self.DRAM_END:X})",
             f"- **Peak throughput:** {peak_gflops:.1f} GFLOPS "
             f"({freq_mhz:.1f} MHz × 128 × {cores} core(s))",
         ]
@@ -1997,10 +2073,13 @@ def add_engine_args(parser) -> None:
                         help="Quantized projection kernel for LM decode, including LM head "
                              "(default: streaming).")
     parser.add_argument("--multi-core", nargs="?", const=2, default=1, type=int,
-                        help="Enable multi-engine vision and LM prefill. Bare --multi-core "
-                             "selects 2 engines; the ceiling is the engine count HW_INFO "
-                             "reports for the loaded bitstream (max 12). "
-                             "Multicore prefill always uses matmatmul.")
+                        help="Enable multi-engine vision, LM prefill and decode. Bare "
+                             "--multi-core selects 2 engines; the ceiling is the engine "
+                             "count HW_INFO reports for the loaded bitstream (max 12). "
+                             "On a 12-core bitstream the run uses the 8 GB map: twelve "
+                             "fixed 512 MB private windows below 6 GB and the model map "
+                             "rebased to [6, 8 GB). Multicore prefill always uses "
+                             "matmatmul.")
     parser.add_argument("--dev", type=str, default="xdma0",
                         help="DMA device name (e.g., xdma0, xdma1, efinix). Default: xdma0")
     parser.add_argument("--dram-poison", type=str, default=None, metavar="SPEC[,SPEC...]",
@@ -2206,10 +2285,10 @@ def poison_dram(pattern: str = "ff", dram_range: str | None = None,
     ``dram_range`` ("START:END", hex) restricts the fill to one region instead
     of the whole device -- the tool for finding WHICH region a run reads without
     initialising. Poison one arena at a time and see which one reproduces the
-    failure; then halve that range and repeat. The map at multi-core is
-    params [0, 0x80000000), tensor [0x80000000, 0xC0000000), program/ISA
-    [0xC0000000, 0x100000000); single-core is params [0x80000000, 0xE1000000),
-    tensor [0xE1000000, 0xFF000000), ISA [0xFF000000, 0x100000000).
+    failure; then halve that range and repeat. The model map is params
+    [0x80000000, 0xE1000000), tensor [0xE1000000, 0xFF000000), ISA
+    [0xFF000000, 0x100000000) -- each + 4 GB on the 12-core layout, where the
+    per-engine private windows occupy [0, 0x180000000) instead.
 
     Size comes from HW_INFO (AVAILABLE_DRAM_SIZE_GB), so this is board-agnostic
     like the rest of resolve_engine_config; it must run AFTER that call and

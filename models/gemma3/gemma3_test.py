@@ -46,6 +46,19 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, calculate_snr
 from user_dma_core import UnifiedEngine
 
+# On hardware whose HW_INFO reports 12 cores, multi-core Gemma3 owns the full
+# 8 GB map as two non-overlapping arenas, regardless of how many cores the run
+# activates:
+#   [0, 6 GB) -- twelve fixed 512 MB private engine windows
+#   [6, 8 GB) -- the primary's original 2 GB params/tensor/program layout,
+#                rebased upward without changing its internal offsets.
+# Other hardware keeps the historical Gemma3 DRAM layout.
+MULTI_CORE_MAX_ENGINES = 12
+MULTI_CORE_ENGINE_WINDOW_BYTES = 0x20000000
+MULTI_CORE_MODEL_BASE = 0x180000000
+MULTI_CORE_DRAM_LIMIT = 0x200000000
+MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
+
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
 
@@ -266,11 +279,34 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, local_weights: bool = False, legacy: bool = False, matmatmul: bool = False, two_pass_prefill: bool = False, multi_core: int = 1):
-        super().__init__(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR, program_dram_base=DRAM_INSTRUCTION_ADDR)
+        # A multicore run on a 12-core bitstream uses twelve fixed 512 MB slots
+        # below 6 GB and moves the primary's unchanged 2 GB layout to [6, 8 GB).
+        # Other hardware, and single-core runs, retain the historical addresses.
+        self.multi_core = int(multi_core)
+        if not 1 <= self.multi_core <= MULTI_CORE_MAX_ENGINES:
+            raise ValueError(
+                f"multi_core must be in [1, {MULTI_CORE_MAX_ENGINES}], "
+                f"got {self.multi_core}")
+        self._use_hw12_dram_layout = (
+            self.multi_core > 1
+            and user_dma_core.ANDROMEDA_CORE_COUNT == MULTI_CORE_MAX_ENGINES
+        )
+        if (self._use_hw12_dram_layout
+                and user_dma_core.AVAILABLE_DRAM_SIZE_GB is not None
+                and user_dma_core.AVAILABLE_DRAM_SIZE_GB < 8):
+            raise ValueError(
+                "12-core Gemma3 multicore layout requires the 8 GB DRAM map; "
+                f"HW_INFO reports {user_dma_core.AVAILABLE_DRAM_SIZE_GB} GB")
+        _rebase = MULTI_CORE_MODEL_REBASE if self._use_hw12_dram_layout else 0
+        super().__init__(
+            BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
+            params_dram_base=user_dma_core.DRAM_START_ADDR + _rebase,
+            tensor_dram_base=user_dma_core.DRAM_ACTIVATION_ADDR + _rebase,
+            program_dram_base=DRAM_INSTRUCTION_ADDR + _rebase,
+        )
         # Decode sharding N-splits ONE quantized_matmat_core across engines. --legacy
         # (no PBI) and --two-pass-decoder (matmat_mul_core) are different decode kernels
         # with no sharded form, so multi-core forces the quantized/PBI path.
-        self.multi_core = int(multi_core)
         if self.multi_core > 1:
             if legacy:
                 raise ValueError("--multi-core requires the PBI decoder; drop --legacy")
@@ -329,6 +365,15 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._weights_bin_rel = "gemma3_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
         self.weight_init()
         self.tensor_init()
+        if self._use_hw12_dram_layout:
+            if self.get_params_dram_addr() > self._tensor_dram_base:
+                raise MemoryError(
+                    f"Gemma3 params end at 0x{self.get_params_dram_addr():X}, "
+                    f"crossing tensor base 0x{self._tensor_dram_base:X}")
+            if self.get_tensor_dram_addr() > self._program_dram_base:
+                raise MemoryError(
+                    f"Gemma3 tensors end at 0x{self.get_tensor_dram_addr():X}, "
+                    f"crossing program base 0x{self._program_dram_base:X}")
 
     @staticmethod
     def load_config(config_path: str | None = None, script_dir: str | None = None) -> dict:
@@ -1581,7 +1626,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         bin/meta path -- run and profile, compiler and loader -- must agree on this tag,
         or a --multi-core run replays a body built for a different split.
         """
-        return f"_mc{self.multi_core}" if self.multi_core > 1 else ""
+        if self.multi_core <= 1:
+            return ""
+        layout_tag = "_hw12" if self._use_hw12_dram_layout else ""
+        return f"_mc{self.multi_core}{layout_tag}"
 
     def setup_multi_core(self) -> None:
         """Bring up the worker engines and copy each one's column block of the MLP gate.
@@ -1591,17 +1639,29 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         """
         if self.multi_core <= 1:
             return
-        from multi_engine_shard import MultiEngineScheduler
+        from multi_engine_shard import MultiEngineScheduler, PrivateArena
 
         print(f"\n--- Multi-core setup ({self.multi_core} engines) ---")
-        # worker_map="private_low": every engine's weight shard, ISA and scratch live
-        # in the low 2 GB, BELOW the model's own 0x8000_0000 map, so a worker arena can
-        # never alias the weights however the model moves its cursors.
+        # The 12-core HW layout always reserves all twelve physical 512 MB slots.
+        # A --multi-core 6 run uses regions 0..5 and leaves 6..11 unused; it does
+        # not resize the six active regions to 1 GB or move the primary model map.
+        if self._use_hw12_dram_layout:
+            _arena = PrivateArena(
+                MULTI_CORE_MAX_ENGINES,
+                arena_base=0,
+                arena_bytes=(MULTI_CORE_MAX_ENGINES
+                             * MULTI_CORE_ENGINE_WINDOW_BYTES),
+            )
+            _scheduler_map = {"arena": _arena}
+        else:
+            # Preserve the pre-existing low-2-GB dynamically divided map on
+            # hardware that does not report twelve cores.
+            _scheduler_map = {"worker_map": "private_low"}
         # handshake="four_phase": see release()/join() -- the master/worker rendezvous is
         # always four-phase; this also makes any symmetric barrier() margin-free.
         self.shard_group = MultiEngineScheduler(
             self, num_engines=self.multi_core,
-            worker_map="private_low", handshake="four_phase", verbose=True)
+            handshake="four_phase", verbose=True, **_scheduler_map)
         self.shard_group.reset_workers()
         self.sharded_mlp_gate = self.shard_group.shard_quantized_weight(
             name="mlp_gate",
@@ -1624,7 +1684,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # Q / K / V projections: all three read PRE_NORM and write disjoint LITERAL staging
         # buffers (the KV-cache append happens separately, after), so they share one round.
         # K and V are N=256 -- only 4 blocks of 64 -- so they cannot be split beyond 4
-        # engines and are left full-width above that; Q (N=1024) splits evenly to 8.
+        # engines and are left full-width above that; Q (N=1024) uses all 12, unevenly.
         if SHARD_QKV:
             from multi_engine_shard import can_split
             _qkv = [("q_proj", self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
@@ -1658,12 +1718,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 data_type=TYPE.IF4,
             )
 
-        # MLP down: MASKED OFF for now -- runs full-width on engine 0.
-        # It consumes the FULL gate*up product, so its K spans every engine's columns: it
-        # cannot ride in the gate/up round and needs a SECOND rendezvous per layer, and its
-        # N=1152 splits 192x2 + 128x6, a 33% imbalance against gate's 7%. Both of those
-        # lean hard on the dummy-delay stand-in for the missing CHECK_ZERO. Set
-        # SHARD_MLP_DOWN = True to re-enable; the emit path below is still in place.
+        # MLP down consumes the FULL gate*up product, so its K spans every engine's
+        # columns. It cannot ride in the gate/up round and needs a second four-phase
+        # rendezvous per layer.
         if SHARD_MLP_DOWN:
             self.sharded_mlp_down = self.shard_group.shard_quantized_weight(
                 name="mlp_down",
@@ -1674,7 +1731,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 data_type=TYPE.IF4,
             )
         # LM head: once per token, layer-independent, and N=262144 splits into 4096 blocks
-        # of 64 -- exactly 512 per engine at 8 cores, the only perfectly even shard here.
+        # of 64. At 12 cores the trailing four engines receive one extra block.
         self.sharded_lm_head = self.shard_group.shard_quantized_weight(
             name="lm_head",
             main_weight_addr=self.DRAM_ADDR_LM_HEAD_QUANT,
@@ -2714,6 +2771,12 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         assert len(instruction_bytes) % 64 == 0, (
             "combined instruction image must be 64-byte aligned (HALT emits trailing NOP via generate_instruction_halt)"
         )
+        if (self._use_hw12_dram_layout
+                and instruction_base_addr + len(instruction_bytes) > MULTI_CORE_DRAM_LIMIT):
+            raise MemoryError(
+                f"Gemma3 program ends at "
+                f"0x{instruction_base_addr + len(instruction_bytes):X}, beyond the "
+                f"8 GB DRAM limit 0x{MULTI_CORE_DRAM_LIMIT:X}")
         with open(instruction_bin_path, "wb") as f:
             f.write(instruction_bytes)
         self.clear_capture_buffer()
@@ -3773,22 +3836,21 @@ private dense buffer, which is what keeps the result interleaved with no gather 
 SHARD_QKV = True
 """Shard the Q / K / V projections. All three share ONE round (same input, disjoint
 literal outputs). K and V are N=256 = 4 blocks of 64, so they are skipped above 4
-engines and run full-width there; Q is N=1024 and splits evenly to 8."""
+engines and run full-width there; Q is N=1024: 128 columns/core at 8, and 64/128 columns at 12."""
 
 SHARD_ATTN_OPROJ = True
 """Shard the attention output projection (K=1024, N=1152).
 
 Adds a round per layer BEFORE the MLP: attention itself is master-only, so the workers
-wait on FLASH_OUTPUT before they can project it. N=1152 splits like mlp down does --
-192x2 + 128x6 at 8 cores."""
+wait on FLASH_OUTPUT before they can project it. N=1152 splits like mlp down does: 128x6 + 192x2 at 8 cores, and
+64x6 + 128x6 at 12 cores."""
 
 SHARD_MLP_DOWN = True
 """Shard the MLP down projection too (adds a 2nd rendezvous per layer).
 
-Off by default: down needs its own round because its K spans the whole gate*up
-product, and its N=1152 splits 192x2 + 128x6 -- a 33% imbalance against gate's 7%.
-Both stress the dummy-delay stand-in for the missing CHECK_ZERO handshake. Turning
-it on takes sharded decode traffic from 72% to 92%."""
+Down needs its own round because its K spans the whole gate*up product. Its N=1152
+splits 128x6 + 192x2 at 8 cores and 64x6 + 128x6 at 12 cores. The four-phase
+handshake keeps the extra round re-armed safely at either engine count."""
 
 # -----------------------------------------------------------------------------
 # Main
@@ -3801,7 +3863,7 @@ def main():
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
     parser.add_argument('--multi-core', dest='multi_core', type=int, default=1, metavar='N',
-                        help='N-shard the decoder MLP gate across N engines (1..8, default 1). '
+                        help='N-shard the decoder across N engines (1..12, default 1). '
                              'Forces the quantized_matmat_core decode path: incompatible with '
                              '--legacy and --two-pass-decoder. The ceiling is the engine count '
                              'HW_INFO reports for the loaded bitstream.')
@@ -3824,6 +3886,10 @@ def main():
                         help='Reuse a cached program image (gemma3_bin/*_program.bin + .json) if it exists. '
                              'Default: always recompile the program image from scratch.')
     args = parser.parse_args()
+    if not 1 <= args.multi_core <= MULTI_CORE_MAX_ENGINES:
+        parser.error(
+            f"--multi-core must be in [1, {MULTI_CORE_MAX_ENGINES}], "
+            f"got {args.multi_core}")
 
     set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
@@ -3833,6 +3899,11 @@ def main():
 
     user_dma_core.configure_clock_from_hardware()
     print(user_dma_core.hardware_info_summary())
+    _hw_cores = user_dma_core.ANDROMEDA_CORE_COUNT
+    if _hw_cores is not None and args.multi_core > _hw_cores:
+        parser.error(
+            f"--multi-core {args.multi_core} exceeds the {_hw_cores} cores "
+            "reported by HW_INFO")
 
     from user_hw_test import software_reset_test
     software_reset_test(cores=args.multi_core)
@@ -3845,8 +3916,6 @@ def main():
     print(f"  C2H: {DMA_DEVICE_C2H}")
     print(f"  USER: {DMA_DEVICE_USER}")
 
-    if not 1 <= args.multi_core <= 8:
-        parser.error(f"--multi-core must be in [1, 8], got {args.multi_core}")
     ue = Gemma3_UnifiedEngine(local_weights=args.local_weights, legacy=args.legacy,
                               matmatmul=args.matmatmul, two_pass_prefill=args.two_pass_prefill,
                               multi_core=args.multi_core)
