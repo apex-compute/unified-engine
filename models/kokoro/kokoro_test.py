@@ -656,6 +656,15 @@ def main():
                          help="Write per-program instruction fingerprints (section, count, sha1) "
                               "to this JSON path. Diff two prompt lengths to see which captured "
                               "programs are already prompt-independent.")
+    parser.add_argument("--clean", action="store_true",
+                         help="Delete the frozen instruction image (kokoro_bin/params.bin, "
+                              "programs.bin, programs.json) before running, so this run "
+                              "recompiles and saves a fresh one. Model weights and voices are kept.")
+    parser.add_argument("--no-bin-cache", action="store_true", dest="no_bin_cache",
+                         help="Ignore kokoro_bin/programs.bin and recompile the instruction "
+                              "streams from scratch. The cache is keyed on the compiler "
+                              "fingerprint and the capacity caps -- deliberately NOT on the "
+                              "sequence length, since one image is meant to serve every prompt.")
     parser.add_argument("--debug-snr", action="store_true", dest="debug_snr",
                          help="Print the per-section SNR bisects against the CPU reference. "
                               "Bring-up instrumentation; off by default.")
@@ -689,11 +698,19 @@ def main():
     print(f"Phonemes: {phonemes}")
 
     if use_fpga:
-        from fpga_forward import run_fpga_forward
+        from fpga_forward import run_fpga_forward, FROZEN_IMAGE_FILES
+        if args.clean:
+            for name in FROZEN_IMAGE_FILES:
+                path = os.path.join(BIN_DIR, name)
+                if os.path.exists(path):
+                    os.remove(path)
+            print(f"--clean: removed the frozen instruction image from {BIN_DIR}; "
+                  f"this run recompiles and saves a new one")
         print("Running FPGA inference (only sections currently ported to hardware) ...")
         audio = run_fpga_forward(model, phonemes, ref_s[len(phonemes) - 1], speed=args.speed,
                                  dev=args.dev, debug=args.debug_snr,
-                                 dump_programs=args.dump_programs)
+                                 dump_programs=args.dump_programs,
+                                 bin_cache=(None if args.no_bin_cache else BIN_DIR))
         if audio is None:
             return  # see fpga_forward.py's section checklist
         import soundfile as sf

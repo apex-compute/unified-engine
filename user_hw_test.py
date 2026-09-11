@@ -7491,6 +7491,494 @@ def instance_norm1d_via_layernorm_test(C: int = 64, T: int = 128):
     ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
 
 
+# ---------------------------------------------------------------------------
+# Kokoro AdaIN1d normalization: which padding formula is correct?
+# ---------------------------------------------------------------------------
+# Sentinel prefilled into every output buffer before a device run. -12288.0 =
+# -1.5 * 2^13 is exactly representable in bf16, so the read-back comparison is
+# exact and a trailing run of sentinels means "the core never wrote here".
+_ADAIN_SENTINEL = -12288.0
+
+
+def _adain_elems_written(out: torch.Tensor) -> int:
+    """Number of leading elements the core actually wrote (sentinel-tail detector).
+
+    Returns ``last_non_sentinel_index + 1`` over the flattened buffer, so a full write
+    returns ``out.numel()`` and a short write returns the truncated element count.
+    """
+    flat = out.reshape(-1).float()
+    non_sent = (flat != _ADAIN_SENTINEL).nonzero()
+    return 0 if non_sent.numel() == 0 else int(non_sent[-1].item()) + 1
+
+
+def adain1d_norm_formula_test(shapes=None, snr_threshold_db: float = 40.0,
+                              assert_on_fail: bool = False):
+    """Pin down the exact InstanceNorm formula Kokoro's ``_adain1d`` must use when the
+    TIME axis is padded to a multiple of 64.
+
+    ``_adain1d`` (models/kokoro/fpga_forward.py:1680) does InstanceNorm1d over TIME: it
+    transposes ``[T, C] -> [C, T]`` and layer-norms with ``M=C`` rows and ``N=T`` columns.
+    ``T`` is padded up to a multiple of 64 but only ``real_T`` frames carry signal, so the
+    pad columns are *samples* in the per-channel mean/variance and their value matters.
+
+    For each ``(C, real_T)`` this runs the same reference against three formulations and
+    reports SNR plus a short-write diagnostic for each:
+
+      * ``mean_pad``  -- (A), the CURRENT/WORKING path: fill the pad columns with the
+        per-channel MEAN of the real columns, normalize over all ``T``, then rescale by
+        ``pad_k = sqrt(real_T / T)``. Padding at the mean shifts the mean not at all and
+        adds nothing to the sum of squares, so the variance is scaled by exactly
+        ``real_T/T`` and ``pad_k`` undoes it. In the model ``pad_k`` is folded into the
+        AdaIN affine as ``gamma' = pad_k*(1 + gamma) - 1``; here gamma=0, so folding it in
+        is the same host-side scalar multiply, and the device math under test is identical.
+      * ``short_n``   -- (B), the ATTEMPTED/BROKEN path: ``layer_norm_core_dram_dynamic``'s
+        short-N mode. N is baked at the padded cap, ``INV_N_DRAM_ADDR`` carries ``1/real_T``
+        in the first ``real_T`` lanes and 0 after, ``MASK_DRAM_ADDR`` carries 1/0 over the
+        same split, and ``gpr_N_reg`` / ``gpr_sqrt_n_reg`` are primed with ``real_T`` and
+        ``float_to_bf19(sqrt(real_T))``.
+      * ``short_n_padN`` -- (B'), the same masked inv_n/mask, but ``gpr_N_reg`` primed with
+        the PADDED N (so the DMA/store length still spans the whole row) while the RSQRT
+        scalar keeps ``sqrt(real_T)``. This separates "the masking math is wrong" from
+        "``gpr_N_reg`` < baked N truncates the writes".
+      * ``plain``     -- (C), the baseline: conventional call, zero-padded input, uniform
+        ``1/N`` over the padded ``T``, no mask, no correction. Its SNR shows how badly the
+        padding biases an uncorrected InstanceNorm (the thing (A) and (B) both exist to fix).
+
+    Short-write diagnostic: every output buffer is prefilled with ``_ADAIN_SENTINEL`` before
+    the run, and the read-back is scanned for a contiguous unwritten tail. ``rows_written``
+    (= elements written / N) vs ``rows_expected`` (= C) makes it obvious which ``(M, N)``
+    combinations short-write -- the observed failure was M=512, N=1984 writing only 34 rows.
+
+    ``shapes`` entries are ``(C, real_T)`` -- baked ``N = round_up(real_T, 64)``, i.e. tight
+    padding -- or ``(C, real_T, baked_N)``, which decouples the two. The decoupled form is the
+    one that matters: kokoro cap-templates the frame axis at ``F_CAP = 1984`` while a short
+    prompt carries as few as 78 real frames, so the reduction runs over ~4% signal and ~96% pad.
+    The default grid sweeps ``real_T/N`` from 4% to 100% with ``N`` pinned at 1984, and the
+    summary prints the highest ratio at which each method still fails -- that threshold is what
+    decides whether kokoro can bake N at the cap.
+
+    Runs only on hardware. ``assert_on_fail=False`` by default so the whole grid is swept and
+    reported even when a formulation is badly wrong -- that comparison is the point of the test.
+    """
+    if shapes is None:
+        # Kokoro-typical (C, real_T): decoder channel counts x frame counts, then the
+        # large-N cases that reproduce the short write (padded_T up to F_CAP = 1984).
+        shapes = [(C, rt) for C in (512, 256, 128) for rt in (78, 128, 173, 348)]
+        shapes += [(512, 1024), (256, 1984), (512, 1950), (512, 1984)]
+        # Low real_T/N ratio at a LARGE baked N -- the regime kokoro actually runs in and the
+        # one the tight-padding grid above never reaches (its worst ratio is 61%). Kokoro caps
+        # the frame axis at F_CAP=1984 while a short prompt carries as few as 78 real frames
+        # (4%), so the reduction is almost entirely pad lanes. The M=512, N=1984 short write
+        # (34 rows) was observed in exactly this regime. Baked N is pinned at 1984 and real_T
+        # swept, so the ratio is the only variable.
+        shapes += [(512, rt, 1984) for rt in (78, 128, 173, 348, 992)]
+        shapes += [(256, 78, 1984), (128, 78, 1984)]
+
+    eps = 1e-5
+    rows = []
+
+    def _reference(x_real: torch.Tensor):
+        """Exact float64 InstanceNorm over the real columns only (biased variance, as
+        torch.nn.functional.instance_norm / nn.InstanceNorm1d use)."""
+        xd = x_real.double()
+        mean = xd.mean(dim=1, keepdim=True)
+        var = xd.var(dim=1, unbiased=False, keepdim=True)
+        return (xd - mean) / torch.sqrt(var + eps)
+
+    def _run_legacy(x_pad, C, N):
+        """Conventional baked-dims layer_norm_core_dram over [C, N]; no gamma/beta."""
+        ue = UnifiedEngine()
+        A = ue.allocate_tensor_dram(C * N * 2)
+        O = ue.allocate_tensor_dram(C * N * 2)
+
+        ue.start_capture()
+        ue.layer_norm_core_dram(M=C, N=N, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=O)
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        prog = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(prog)
+        inst_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(inst_bytes)
+        ue.clear_capture_buffer()
+
+        ue.dma_to_accelerator_memory(A, x_pad.reshape(-1).contiguous())
+        ue.dma_to_accelerator_memory(O, torch.full((C * N,), _ADAIN_SENTINEL, dtype=torch.bfloat16))
+
+        ue.start_execute_from_dram(prog)
+        ue.wait_queue(30.0)
+        out = ue.dma_from_accelerator_memory(O, (C, N))
+        ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
+        return out, _adain_elems_written(out), inst_bytes
+
+    def _run_short_n(x_pad, C, N, real_T, n_reg_value):
+        """Dynamic core in short-N mode: baked N = padded N, masked inv_n + mask band,
+        runtime sqrt(real_T). ``n_reg_value`` is what gpr_N_reg gets primed with."""
+        ue = UnifiedEngine()
+        A = ue.allocate_tensor_dram(C * N * 2)
+        O = ue.allocate_tensor_dram(C * N * 2)
+        G = ue.allocate_tensor_dram(N * 2)      # plain gamma (ones): the core wants it present
+        INV = ue.allocate_tensor_dram(N * 2)    # 1/real_T in real lanes, 0 in pad lanes
+        MASK = ue.allocate_tensor_dram(N * 2)   # 1 in real lanes, 0 in pad lanes
+
+        regs = []
+        def areg():
+            r = ue.alloc_isa_reg(); regs.append(r); return r
+        m_reg = areg(); n_reg = areg(); sqrt_reg = areg()
+        a_reg = areg(); out_reg = areg(); g_reg = areg()
+        invn_reg = areg(); mask_reg = areg()
+
+        # 1. Compile once at template M=64, N=padded N; runtime M / N / sqrt(N) via GPRs.
+        ue.start_capture()
+        ue.layer_norm_core_dram_dynamic(
+            M=64, N=N, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=O,
+            GAMMA_DRAM_ADDR=G, BETA_DRAM_ADDR=None, INV_N_DRAM_ADDR=INV, MASK_DRAM_ADDR=MASK,
+            gpr_M_reg=m_reg, gpr_N_reg=n_reg, gpr_sqrt_n_reg=sqrt_reg,
+            gpr_a_addr=a_reg, gpr_out_addr=out_reg, gpr_gamma_addr=g_reg, gpr_beta_addr=None,
+            gpr_invn_addr=invn_reg, gpr_mask_addr=mask_reg,
+        )
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        main_prog = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(main_prog)
+        main_inst_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(main_inst_bytes)
+
+        # 2. Preamble: prime real M, the N register under test, sqrt(real_T) + DRAM bases, then jump.
+        preamble = ue.get_program_dram_addr()
+        ue.allocate_program_dram((len(regs) + 2) * INSTRUCTION_SIZE_BYTES)
+        main_word_addr = ue_35bit_addr_shifter(main_prog)
+        ue.clear_capture_buffer()
+        ue.start_capture()
+        ue.generate_instruction_add_set(m_reg, C)
+        ue.generate_instruction_add_set(n_reg, n_reg_value)
+        ue.generate_instruction_add_set(sqrt_reg, ue.float_to_bf19(float(real_T ** 0.5)))
+        ue.generate_instruction_add_set(a_reg, A >> 3)
+        ue.generate_instruction_add_set(out_reg, O >> 3)
+        ue.generate_instruction_add_set(g_reg, G >> 3)
+        ue.generate_instruction_add_set(invn_reg, INV >> 3)
+        ue.generate_instruction_add_set(mask_reg, MASK >> 3)
+        ue.generate_instruction_jump_abs(main_word_addr)
+        ue.stop_capture()
+        ue.write_captured_instructions_to_dram(preamble)
+
+        inv_n = torch.zeros(N, dtype=torch.bfloat16)
+        inv_n[:real_T] = 1.0 / real_T
+        mask = torch.zeros(N, dtype=torch.bfloat16)
+        mask[:real_T] = 1.0
+        ue.dma_to_accelerator_memory(A, x_pad.reshape(-1).contiguous())
+        ue.dma_to_accelerator_memory(G, torch.ones(N, dtype=torch.bfloat16))
+        ue.dma_to_accelerator_memory(INV, inv_n)
+        ue.dma_to_accelerator_memory(MASK, mask)
+        ue.dma_to_accelerator_memory(O, torch.full((C * N,), _ADAIN_SENTINEL, dtype=torch.bfloat16))
+
+        ue.start_execute_from_dram(preamble)
+        ue.wait_queue(30.0)
+        out = ue.dma_from_accelerator_memory(O, (C, N))
+        for _ in regs:
+            ue.release_isa_reg()
+        ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
+        return out, _adain_elems_written(out), main_inst_bytes
+
+    def _report(method, C, real_T, N, ref, got, elems, inst_bytes):
+        snr_db = calculate_snr(ref.to(torch.bfloat16), got)
+        rows_written = elems / N
+        dims = f"C={C},realT={real_T},padT={N}"
+        ratio = real_T / N
+        rows.append((dims, method, snr_db, rows_written, C, elems, C * N, ratio))
+        short = "SHORT-WRITE" if elems < C * N else "full"
+        print(f"[adain1d_norm+{method}] {dims} SNR={snr_db:.2f} dB "
+              f"rows_written={rows_written:.2f}/{C} ({short}, {elems}/{C * N} elems)")
+        record_test(f"adain1d_norm+{method}", f"{dims},rows={rows_written:.2f}/{C}",
+                    snr_db=snr_db, inst_bytes=inst_bytes)
+        if assert_on_fail:
+            assert snr_db >= snr_threshold_db or snr_db == float("inf"), \
+                f"adain1d_norm+{method} {dims} SNR {snr_db:.2f} dB < {snr_threshold_db:g} dB"
+            assert elems == C * N, \
+                f"adain1d_norm+{method} {dims} short write: {elems}/{C * N} elements"
+        return snr_db
+
+    for shape in shapes:
+        # A shape is (C, real_T) -- baked N = round_up(real_T, 64), tight padding -- or
+        # (C, real_T, baked_N), which DECOUPLES the two so N can be a fixed cap far above the
+        # real frame count. Kokoro cap-templates the frame axis, so baked_N is F_CAP while
+        # real_T follows the prompt; the ratio real_T/N is the thing under test.
+        if len(shape) == 3:
+            C, real_T, N = shape
+        else:
+            C, real_T = shape
+            N = _round_up_vec(real_T)
+        assert N % UE_VECTOR_SIZE == 0, f"baked N={N} must be a multiple of {UE_VECTOR_SIZE}"
+        assert N >= real_T, f"baked N={N} is smaller than real_T={real_T}"
+        pad_k = (real_T / N) ** 0.5
+        x_real = torch.randn(C, real_T, dtype=torch.bfloat16)
+        ref = _reference(x_real)                       # float64, [C, real_T]
+
+        # (A) pad the time columns at the per-channel mean, then undo the variance scaling.
+        x_meanpad = torch.zeros(C, N, dtype=torch.bfloat16)
+        x_meanpad[:, :real_T] = x_real
+        chan_mean = x_real.float().mean(dim=1, keepdim=True).to(torch.bfloat16)
+        x_meanpad[:, real_T:] = chan_mean.expand(C, N - real_T)
+
+        # (B)/(C) zero-padded input.
+        x_zeropad = torch.zeros(C, N, dtype=torch.bfloat16)
+        x_zeropad[:, :real_T] = x_real
+
+        out, elems, ib = _run_legacy(x_meanpad, C, N)
+        got = (out[:, :real_T].float() * pad_k).to(torch.bfloat16)
+        _report("mean_pad", C, real_T, N, ref, got, elems, ib)
+
+        out, elems, ib = _run_short_n(x_zeropad, C, N, real_T, n_reg_value=real_T)
+        _report("short_n", C, real_T, N, ref, out[:, :real_T], elems, ib)
+
+        out, elems, ib = _run_short_n(x_zeropad, C, N, real_T, n_reg_value=N)
+        _report("short_n_padN", C, real_T, N, ref, out[:, :real_T], elems, ib)
+
+        out, elems, ib = _run_legacy(x_zeropad, C, N)
+        _report("plain", C, real_T, N, ref, out[:, :real_T], elems, ib)
+
+    # Per-shape summary table: the whole point is the side-by-side comparison.
+    print("\n=== adain1d_norm_formula_test summary ===")
+    print(f"{'shape':<28} {'realT/N':>8} {'method':<14} {'SNR dB':>9} {'rows_written':>13} "
+          f"{'rows_exp':>9} {'write':>12}")
+    for dims, method, snr_db, rows_written, rows_exp, elems, elems_exp, ratio in rows:
+        write = "full" if elems == elems_exp else f"SHORT {elems}/{elems_exp}"
+        print(f"{dims:<28} {ratio:>7.1%} {method:<14} {snr_db:>9.2f} {rows_written:>13.2f} "
+              f"{rows_exp:>9d} {write:>12}")
+    # The headline number: the highest real_T/N ratio at which each method still misbehaves.
+    # If short_n is clean above some ratio and broken below it, that threshold decides whether
+    # kokoro can bake N at F_CAP or must keep sizing N to the prompt.
+    print("\n--- worst (highest) real_T/N ratio at which each method fails ---")
+    for method in ("mean_pad", "short_n", "short_n_padN", "plain"):
+        bad = [(ratio, dims, snr_db, elems, elems_exp)
+               for dims, m, snr_db, _rw, _re, elems, elems_exp, ratio in rows
+               if m == method and (elems != elems_exp or not (snr_db >= snr_threshold_db)
+                                   or snr_db != snr_db)]
+        if not bad:
+            print(f"  {method:<14} clean at every ratio tested")
+            continue
+        ratio, dims, snr_db, elems, elems_exp = max(bad)
+        why = f"SHORT {elems}/{elems_exp}" if elems != elems_exp else f"SNR {snr_db:.2f} dB"
+        print(f"  {method:<14} fails up to ratio {ratio:.1%} ({dims}, {why}); "
+              f"{sum(1 for b in bad)} of "
+              f"{sum(1 for r in rows if r[1] == method)} shapes bad")
+    print("=========================================\n")
+
+
+def adain1d_frozen_device_test(C_list=(512, 256), real_T_list=(348, 78, 992, 173, 1920),
+                               N_cap: int = 1984, style_dim: int = 128,
+                               snr_threshold_db: float = 35.0, assert_on_fail: bool = False):
+    """The WHOLE kokoro AdaIN1d op -- style affine, InstanceNorm over time, per-channel
+    (1+gamma)*x_hat + beta -- compiled ONCE per channel count and replayed for several prompt
+    lengths with NOTHING but the register preamble and the per-run data tables changing. No host
+    readback, no host tiling, no capture split anywhere inside the op.
+
+    Why this exists: ``_adain1d`` is the one kokoro op whose sequence length lands on the
+    layer-norm N axis (it normalizes each channel across TIME), and the layer-norm core bakes N.
+    Every other section is already byte-identical across prompts. This test is the proof that
+    the op can be made sequence-length invariant with the cores as they are.
+
+    Layout under test (x is [T, C], kokoro's convention; T_cap = N_cap frames):
+      1. gb = style @ fc_w^T + fc_b                 -> [1, 2C]   (matmul, fixed dims)
+      2. g1 = gb[:C] + 1                            -> [1, C]    (eltwise ADD_BROADCAST)
+      3. zero x's pad rows [T64, N_cap)             (HW loop, trip count = pad-rows GPR)
+      4. x_ct = transpose(x)  at M = N_cap          -> [C, N_cap] (row stride == baked LN N)
+      5. InstanceNorm: layer_norm short-N mode, N baked at N_cap, gpr_N_reg = real_T,
+         gpr_sqrt_n_reg = sqrt(real_T), inv_n/mask tables = 1/real_T,1 in real lanes, 0 after
+      6. normed = transpose(normed_ct) at M = C     -> [N_cap, C]
+      7. g1 / beta tiled down T64 rows              (HW zero-source-stride loops, trip = T64 GPR)
+      8. out = normed * g1_tiled + beta_tiled       (eltwise, gpr_M_reg = T64)
+
+    Steps 4 and 6 execute at the cap: a [C, N_cap] view with row stride N_cap can only be built by
+    a transpose whose M IS N_cap, and the same holds going back. Everything else runs at the real
+    length. The two transposes are 2*C*N_cap elements -- noise next to the section's matmuls.
+
+    Per-run host inputs (the same class of thing as the GPR preamble and the LLMs' attention
+    masks): x, style, inv_n, mask, the three GPRs. Per-run instruction changes: the preamble only.
+
+    Checks per (C, real_T): SNR of out[:real_T] against a float64 AdaIN reference, and the
+    sentinel-tail short-write detector on the [N_cap, C] output. Program bytes are read back from
+    DRAM after every run and compared to the bytes written at compile time.
+    """
+    torch.manual_seed(0)
+    eps = 1e-5
+    T64 = lambda t: ((t + 63) // 64) * 64
+    for rt in real_T_list:
+        assert T64(rt) < N_cap, f"real_T={rt}: the pad-row loop needs >= 1 pad row below N_cap={N_cap}"
+    results = []
+
+    for C in C_list:
+        ue = UnifiedEngine()
+        # ---- DRAM plan (fixed for the life of the program) ----
+        X = ue.allocate_tensor_dram(N_cap * C * 2)
+        STYLE = ue.allocate_tensor_dram(64 * style_dim * 2)
+        FCW = ue.allocate_tensor_dram(2 * C * style_dim * 2)
+        FCB = ue.allocate_tensor_dram(2 * C * 2)
+        GB = ue.allocate_tensor_dram(64 * 2 * C * 2)
+        G1 = ue.allocate_tensor_dram(64 * C * 2)
+        ZROW = ue.allocate_tensor_dram(N_cap * 2)          # zeros, >= max(C, N_cap) elements
+        IDENT = ue.allocate_tensor_dram(64 * 64 * 2)
+        XCT = ue.allocate_tensor_dram(C * N_cap * 2)
+        NCT = ue.allocate_tensor_dram(C * N_cap * 2)
+        NORMED = ue.allocate_tensor_dram(N_cap * C * 2)
+        GT = ue.allocate_tensor_dram(N_cap * C * 2)
+        BT = ue.allocate_tensor_dram(N_cap * C * 2)
+        NG = ue.allocate_tensor_dram(N_cap * C * 2)
+        OUT = ue.allocate_tensor_dram(N_cap * C * 2)
+        ONES = ue.allocate_tensor_dram(N_cap * 2)
+        INV = ue.allocate_tensor_dram(N_cap * 2)
+        MASK = ue.allocate_tensor_dram(N_cap * 2)
+        assert ZROW % 8 == 0 and X % 8 == 0 and GT % 8 == 0 and BT % 8 == 0
+
+        # ---- registers: runtime ones (preamble-primed) first so they stay in the 1..15 M range ----
+        t64_reg = ue.alloc_isa_reg()     # T rounded up to 64 (row count for the [T,C] ops)
+        pad_reg = ue.alloc_isa_reg()     # N_cap - T64 (pad rows to zero)
+        n_reg = ue.alloc_isa_reg()       # real_T (LN reduction length)
+        sqrt_reg = ue.alloc_isa_reg()    # bf19 sqrt(real_T)
+        m_cap_reg = ue.alloc_isa_reg()   # constant N_cap, seeded IN the body
+        m_c_reg = ue.alloc_isa_reg()     # constant C, seeded IN the body
+        i_reg = ue.alloc_isa_reg()
+        t_reg = ue.alloc_isa_reg()
+
+        def _zero_stride_tile(src_row, dst, row_bytes, elems, sram_off):
+            """dst[i, :] = src_row for i in [0, T64): one HW loop, zero source stride."""
+            ue.accelerator_memory_to_sram(accelerator_dram_address=src_row, sram_address=sram_off,
+                                          element_size=elems)
+            ue.generate_instruction_add_set(i_reg, 0)
+            ue.loop_start(loop_cnt=N_cap, gpr_loop_cnt=t64_reg)
+            ue.generate_instruction_reg_mul_imm(t_reg, i_reg, ue_35bit_addr_shifter(row_bytes))
+            ue.generate_instruction_add_imm(t_reg, ue_35bit_addr_shifter(dst), t_reg)
+            ue.sram_to_accelerator_memory(sram_address=sram_off, accelerator_dram_address=0,
+                                          element_size=elems, general_reg_src=t_reg)
+            ue.generate_instruction_add_inc(i_reg)
+            ue.loop_end()
+
+        # ---- compile the body ONCE ----
+        ue.start_capture()
+        ue.generate_instruction_add_set(m_cap_reg, N_cap)
+        ue.generate_instruction_add_set(m_c_reg, C)
+        # 1. style affine  gb = style @ fc_w^T + fc_b  (M=1: legacy tiling, fixed dims)
+        ue.matmat_mul_core(M=1, K=style_dim, N=2 * C, A_DRAM_ADDR=STYLE, B_DRAM_ADDR=FCW,
+                           OUTPUT_DRAM_ADDR=GB, C_DRAM_ADDR=FCB, bias_mode="broadcast_N")
+        # 2. g1 = gamma + 1
+        ue.eltwise_core_dram(1, C, GB, None, G1, UE_MODE.ADD_BROADCAST, scalar=1.0)
+        # 3. zero x's pad rows: rows [T64, N_cap)
+        ue.accelerator_memory_to_sram(accelerator_dram_address=ZROW, sram_address=0, element_size=C)
+        ue.generate_instruction_add_imm(t64_reg, 0, i_reg)
+        ue.loop_start(loop_cnt=N_cap, gpr_loop_cnt=pad_reg)
+        ue.generate_instruction_reg_mul_imm(t_reg, i_reg, ue_35bit_addr_shifter(C * 2))
+        ue.generate_instruction_add_imm(t_reg, ue_35bit_addr_shifter(X), t_reg)
+        ue.sram_to_accelerator_memory(sram_address=0, accelerator_dram_address=0, element_size=C,
+                                      general_reg_src=t_reg)
+        ue.generate_instruction_add_inc(i_reg)
+        ue.loop_end()
+        # 4. x_ct [C, N_cap] = transpose(x [N_cap, C])  -- M = N_cap so the row stride is N_cap
+        ue.bf16_transpose_core(M=N_cap, N=C, INPUT_DRAM_ADDR=X, OUTPUT_DRAM_ADDR=XCT,
+                               IDENTITY_DRAM_ADDR=IDENT, gpr_M_reg=m_cap_reg)
+        # 5. InstanceNorm over time, short-N mode
+        ue.layer_norm_core_dram_dynamic(
+            M=C, N=N_cap, A_DRAM_ADDR=XCT, OUTPUT_DRAM_ADDR=NCT,
+            gpr_M_reg=m_c_reg, gpr_N_reg=n_reg, gpr_sqrt_n_reg=sqrt_reg,
+            GAMMA_DRAM_ADDR=ONES, BETA_DRAM_ADDR=None, ZEROS_DRAM_ADDR=ZROW,
+            INV_N_DRAM_ADDR=INV, MASK_DRAM_ADDR=MASK)
+        # 6. normed [N_cap, C] = transpose(normed_ct [C, N_cap])
+        ue.bf16_transpose_core(M=C, N=N_cap, INPUT_DRAM_ADDR=NCT, OUTPUT_DRAM_ADDR=NORMED,
+                               IDENTITY_DRAM_ADDR=IDENT, gpr_M_reg=m_c_reg)
+        # 7. tile g1 / beta down T64 rows
+        _zero_stride_tile(G1, GT, C * 2, C, 0)
+        _zero_stride_tile(GB + C * 2, BT, C * 2, C, 0)
+        # 8. out = normed * g1 + beta   (row count from t64_reg)
+        ue.eltwise_core_dram(N_cap, C, NORMED, GT, NG, UE_MODE.ELTWISE_MUL, gpr_M_reg=t64_reg)
+        ue.eltwise_core_dram(N_cap, C, NG, BT, OUT, UE_MODE.ELTWISE_ADD, gpr_M_reg=t64_reg)
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        body = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(body)
+        body_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(body_bytes)
+        n_inst = body_bytes // INSTRUCTION_SIZE_BYTES
+        preamble = ue.get_program_dram_addr()
+        ue.allocate_program_dram(8 * INSTRUCTION_SIZE_BYTES)
+        body_word_addr = ue_35bit_addr_shifter(body)
+        print(f"[adain1d_frozen] C={C}: body compiled once, {n_inst} instructions ({body_bytes} B)")
+
+        # ---- constants (once) ----
+        fc_w = (torch.randn(2 * C, style_dim) * 0.05).to(torch.bfloat16)
+        fc_b = (torch.randn(2 * C) * 0.1).to(torch.bfloat16)
+        style = torch.randn(style_dim).to(torch.bfloat16)
+        style_pad = torch.zeros(64, style_dim, dtype=torch.bfloat16); style_pad[0] = style
+        ue.dma_to_accelerator_memory(FCW, fc_w.reshape(-1).contiguous())
+        ue.dma_to_accelerator_memory(FCB, fc_b.contiguous())
+        ue.dma_to_accelerator_memory(STYLE, style_pad.reshape(-1).contiguous())
+        ue.dma_to_accelerator_memory(ZROW, torch.zeros(N_cap, dtype=torch.bfloat16))
+        ue.dma_to_accelerator_memory(IDENT, torch.eye(64, dtype=torch.bfloat16).reshape(-1).contiguous())
+        ue.dma_to_accelerator_memory(ONES, torch.ones(N_cap, dtype=torch.bfloat16))
+        gb_ref = (style.float() @ fc_w.float().T + fc_b.float())
+        gamma_ref, beta_ref = gb_ref[:C].double(), gb_ref[C:].double()
+
+        for real_T in real_T_list:
+            t64 = T64(real_T)
+            x_real = torch.randn(real_T, C, dtype=torch.bfloat16)
+            xd = x_real.double()
+            mean = xd.mean(dim=0, keepdim=True)
+            var = xd.var(dim=0, unbiased=False, keepdim=True)
+            ref = ((xd - mean) / torch.sqrt(var + eps)) * (1.0 + gamma_ref) + beta_ref   # [real_T, C]
+
+            # per-run data: x (real rows; rows [real_T, t64) zero, rows >= t64 GARBAGE on purpose so
+            # the device zero-fill is what makes them safe), inv_n / mask tables.
+            x_dev = torch.full((N_cap, C), float("nan"), dtype=torch.bfloat16)
+            x_dev[:real_T] = x_real
+            x_dev[real_T:t64] = 0.0
+            inv_n = torch.zeros(N_cap, dtype=torch.bfloat16); inv_n[:real_T] = 1.0 / real_T
+            mask = torch.zeros(N_cap, dtype=torch.bfloat16); mask[:real_T] = 1.0
+            ue.dma_to_accelerator_memory(X, x_dev.reshape(-1).contiguous())
+            ue.dma_to_accelerator_memory(INV, inv_n)
+            ue.dma_to_accelerator_memory(MASK, mask)
+            for buf, n in ((OUT, N_cap * C), (NCT, C * N_cap), (NORMED, N_cap * C)):
+                ue.dma_to_accelerator_memory(buf, torch.full((n,), _ADAIN_SENTINEL, dtype=torch.bfloat16))
+
+            # the ONLY per-run instructions: prime 4 GPRs and jump into the frozen body
+            ue.clear_capture_buffer()
+            ue.start_capture()
+            ue.generate_instruction_add_set(t64_reg, t64)
+            ue.generate_instruction_add_set(pad_reg, N_cap - t64)
+            ue.generate_instruction_add_set(n_reg, real_T)
+            ue.generate_instruction_add_set(sqrt_reg, ue.float_to_bf19(float(real_T ** 0.5)))
+            ue.generate_instruction_jump_abs(body_word_addr)
+            ue.stop_capture()
+            ue.write_captured_instructions_to_dram(preamble)
+
+            ue.start_execute_from_dram(preamble)
+            ue.wait_queue(60.0)
+            out = ue.dma_from_accelerator_memory(OUT, (N_cap, C))
+            nct = ue.dma_from_accelerator_memory(NCT, (C, N_cap))
+
+            got = out[:real_T]
+            snr_db = calculate_snr(ref.to(torch.bfloat16), got)
+            elems_out = _adain_elems_written(out)
+            elems_nct = _adain_elems_written(nct)
+            rows_out = elems_out / C
+            nan_out = int(torch.isnan(out[:t64].float()).sum().item())
+            dims = f"C={C},realT={real_T},T64={t64},Ncap={N_cap}"
+            print(f"[adain1d_frozen] {dims} SNR={snr_db:.2f} dB rows_written={rows_out:.1f}/{t64} "
+                  f"nct_elems={elems_nct}/{C * N_cap} nan_in_out[:T64]={nan_out}")
+            record_test("adain1d_frozen", dims, snr_db=snr_db, inst_bytes=body_bytes)
+            results.append((dims, snr_db, rows_out, t64, elems_nct, C * N_cap, nan_out))
+            if assert_on_fail:
+                assert snr_db >= snr_threshold_db, f"{dims} SNR {snr_db:.2f} < {snr_threshold_db}"
+                assert elems_out >= t64 * C, f"{dims} short write {elems_out}/{t64 * C}"
+
+        for _ in range(8):
+            ue.release_isa_reg()
+        ue.clear_capture_buffer(); ue.reset_tensor_dram_addr(); ue.reset_program_dram_addr()
+
+    print("\n=== adain1d_frozen_device_test summary (one body per C, replayed per real_T) ===")
+    print(f"{'shape':<40} {'SNR dB':>8} {'rows_out':>12} {'nct_write':>16} {'nan':>5}")
+    for dims, snr_db, rows_out, t64, en, en_exp, nan_out in results:
+        w = "full" if en == en_exp else f"SHORT {en}/{en_exp}"
+        print(f"{dims:<40} {snr_db:>8.2f} {rows_out:>7.1f}/{t64:<4d} {w:>16} {nan_out:>5d}")
+    print("==============================================================================\n")
+
+
 def exp_via_sigmoid_test(N: int = 64, x_min: float = -3.0, x_max: float = 3.0):
     """Proves exp(x) (needed for Kokoro ISTFTNet's ``spec = exp(raw)``) is exactly derivable from
     the native ``sigmoid`` activation plus elementwise ops:
@@ -8105,6 +8593,11 @@ if __name__ == "__main__":
         # dram_read_write_speed_test_8GB()
 # 
     # #Adding new tests here
+# 
+    # # Kokoro AdaIN1d padding-formula bake-off: mean-pad+pad_k (A) vs short-N masked
+    # # inv_n (B) vs uncorrected baseline (C), with a sentinel-based short-write detector.
+    # adain1d_norm_formula_test()
+    # adain1d_frozen_device_test()
 # 
     # gemma3_inference_test()
     # gemma3_if8_inference_test()
