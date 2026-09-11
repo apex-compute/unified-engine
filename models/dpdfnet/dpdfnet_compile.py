@@ -29,14 +29,15 @@ import user_dma_core as udc
 import yolov5_precompiled as shared
 from yolov5_common import quantize_conv_for_andromeda
 from nn_lib import tanh_core_dram
-from dpdfnet_common import DEFAULT_MODEL_PATH, download_model, validate_digest
+from dpdfnet_common import (
+    DEFAULT_MODEL_PATH, download_model, initial_state, validate_digest,
+)
 from dpdfnet_precompiled import (
     DeviceEmitter, FORMAT, MODEL_BASE, MODEL_LIMIT, TENSOR_ALIGNMENT,
     TENSOR_LIMIT, TensorLayout, align_up, build_layout_plan, make_layout,
     manifest_sha256, physical_indices, tensor_manifest,
     transform_source_indices,
 )
-from dpdfnet_run_cpu import initial_state
 
 
 class GraphCompiler:

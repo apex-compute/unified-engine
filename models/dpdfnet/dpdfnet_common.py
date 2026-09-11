@@ -9,10 +9,33 @@ import os
 from pathlib import Path
 import urllib.request
 
+import numpy as np
+
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "dpdfnet_config.json"
 DEFAULT_MODEL_PATH = HERE / "dpdfnet_bin" / "dpdfnet2.onnx"
+
+
+def initial_state(metadata: dict[str, str]) -> np.ndarray:
+    """Build the recurrent state from the pinned ONNX metadata."""
+    required = (
+        "state_size", "erb_norm_state_size", "spec_norm_state_size",
+        "erb_norm_init", "spec_norm_init",
+    )
+    missing = [key for key in required if key not in metadata]
+    if missing:
+        raise RuntimeError(f"ONNX metadata is missing {missing}")
+    state = np.zeros(int(metadata["state_size"]), dtype=np.float32)
+    erb = np.fromstring(metadata["erb_norm_init"], sep=",", dtype=np.float32)
+    spec = np.fromstring(metadata["spec_norm_init"], sep=",", dtype=np.float32)
+    ne = int(metadata["erb_norm_state_size"])
+    ns = int(metadata["spec_norm_state_size"])
+    if erb.size != ne or spec.size != ns:
+        raise RuntimeError("ONNX normalization metadata has inconsistent lengths")
+    state[:ne] = erb
+    state[ne:ne + ns] = spec
+    return state
 
 
 def load_config() -> dict:
@@ -183,4 +206,3 @@ def inspect_model(path: Path = DEFAULT_MODEL_PATH) -> dict:
             ],
         },
     }
-

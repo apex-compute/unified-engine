@@ -22,7 +22,7 @@ import user_dma_core as udc
 from nn_lib import tanh_core_dram
 from dpdfnet_common import DEFAULT_MODEL_PATH, download_model, validate_digest
 from dpdfnet_conv_smoke import _metric, _shape, _value_info, expose_intermediates
-from dpdfnet_run_cpu import initial_state
+from dpdfnet_common import initial_state
 
 
 SUPPORTED = ("Relu", "Sigmoid", "Tanh")

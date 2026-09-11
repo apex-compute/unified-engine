@@ -13,30 +13,15 @@ import soundfile as sf
 import torch
 import torchaudio.functional as AF
 
-from dpdfnet_common import DEFAULT_MODEL_PATH, download_model, validate_digest
+from dpdfnet_common import (
+    DEFAULT_MODEL_PATH, download_model, initial_state, validate_digest,
+)
 
 
 def vorbis_window(length: int) -> torch.Tensor:
     index = torch.arange(length, dtype=torch.float32)
     inner = torch.sin(torch.pi * (index + 0.5) / length)
     return torch.sin(0.5 * torch.pi * inner.square())
-
-
-def initial_state(metadata: dict[str, str]) -> np.ndarray:
-    required = ("state_size", "erb_norm_state_size", "spec_norm_state_size",
-                "erb_norm_init", "spec_norm_init")
-    missing = [key for key in required if key not in metadata]
-    if missing:
-        raise RuntimeError(f"ONNX metadata is missing {missing}")
-    state = np.zeros(int(metadata["state_size"]), dtype=np.float32)
-    erb = np.fromstring(metadata["erb_norm_init"], sep=",", dtype=np.float32)
-    spec = np.fromstring(metadata["spec_norm_init"], sep=",", dtype=np.float32)
-    ne, ns = int(metadata["erb_norm_state_size"]), int(metadata["spec_norm_state_size"])
-    if erb.size != ne or spec.size != ns:
-        raise RuntimeError("ONNX normalization metadata has inconsistent lengths")
-    state[:ne] = erb
-    state[ne:ne + ns] = spec
-    return state
 
 
 def fit_length(value: np.ndarray, length: int) -> np.ndarray:

@@ -3,14 +3,12 @@ import unittest
 import numpy as np
 import torch
 
-from dpdfnet_common import load_config
+from dpdfnet_common import initial_state, load_config
 from dpdfnet_precompiled import (
     copy_patterns, copy_runs, make_layout, pack_tensor, physical_indices,
     transform_source_indices, unpack_tensor,
 )
-from dpdfnet_run_cpu import (
-    attenuation_limit, fit_length, initial_state, resample, vorbis_window,
-)
+from dpdfnet_run_cpu import attenuation_limit, fit_length, resample, vorbis_window
 
 
 class DPDFNetHelpersTest(unittest.TestCase):

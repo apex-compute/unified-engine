@@ -10,7 +10,7 @@ import time
 
 import numpy as np
 
-from dpdfnet_common import DEFAULT_MODEL_PATH, validate_digest
+from dpdfnet_common import DEFAULT_MODEL_PATH, initial_state, validate_digest
 
 
 def _load_frames(path: Path) -> np.ndarray:
@@ -24,26 +24,6 @@ def _load_frames(path: Path) -> np.ndarray:
     if not np.issubdtype(value.dtype, np.number) or not np.isfinite(value).all():
         raise ValueError("spectrum input must contain finite numeric values")
     return np.ascontiguousarray(value, dtype=np.float32)
-
-
-def _initial_state(metadata: dict[str, str]) -> np.ndarray:
-    required = (
-        "state_size", "erb_norm_state_size", "spec_norm_state_size",
-        "erb_norm_init", "spec_norm_init",
-    )
-    missing = [key for key in required if key not in metadata]
-    if missing:
-        raise RuntimeError(f"ONNX metadata is missing {missing}")
-    state = np.zeros(int(metadata["state_size"]), dtype=np.float32)
-    erb = np.fromstring(metadata["erb_norm_init"], sep=",", dtype=np.float32)
-    spec = np.fromstring(metadata["spec_norm_init"], sep=",", dtype=np.float32)
-    ne = int(metadata["erb_norm_state_size"])
-    ns = int(metadata["spec_norm_state_size"])
-    if erb.size != ne or spec.size != ns:
-        raise RuntimeError("ONNX normalization metadata has inconsistent lengths")
-    state[:ne] = erb
-    state[ne:ne + ns] = spec
-    return state
 
 
 def main() -> None:
@@ -78,7 +58,7 @@ def main() -> None:
     session = ort.InferenceSession(
         str(model), sess_options=options, providers=["CPUExecutionProvider"])
     session_load_s = time.perf_counter() - load_started
-    state = _initial_state(session.get_modelmeta().custom_metadata_map)
+    state = initial_state(session.get_modelmeta().custom_metadata_map)
     input_spec, input_state = (item.name for item in session.get_inputs())
     output_spec, output_state = (item.name for item in session.get_outputs())
 

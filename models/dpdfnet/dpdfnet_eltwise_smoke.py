@@ -21,7 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 import user_dma_core as udc
 from dpdfnet_common import DEFAULT_MODEL_PATH, download_model, validate_digest
 from dpdfnet_conv_smoke import _metric, _shape, _value_info, expose_intermediates
-from dpdfnet_run_cpu import initial_state
+from dpdfnet_common import initial_state
 
 
 MODE = {

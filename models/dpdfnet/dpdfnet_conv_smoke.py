@@ -24,7 +24,7 @@ for search_path in (REPO_ROOT, YOLO_HELPERS):
 
 import user_dma_core as udc
 from dpdfnet_common import DEFAULT_MODEL_PATH, download_model, validate_digest
-from dpdfnet_run_cpu import initial_state
+from dpdfnet_common import initial_state
 from yolov5_common import quantize_conv_for_andromeda
 
 
