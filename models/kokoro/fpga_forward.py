@@ -158,7 +158,7 @@ def _instrument(ue):
     def guarded_alloc(size_bytes, *a, **k):
         addr = orig_alloc(size_bytes, *a, **k)
         end = ue._tensor_dram_addr
-        if end > KOKORO_TENSOR_END:
+        if end > _TENSOR_END[0]:
             raise MemoryError(
                 f"activation DRAM exhausted: high-water 0x{end:X} passed the program region "
                 f"at 0x{KOKORO_TENSOR_END:X} "
@@ -184,6 +184,8 @@ def _instrument(ue):
     assert reserved == want, (
         f"ISA register reservation got {reserved}, expected {want} -- something "
         f"allocated a register before _instrument() ran")
+    shard = [ue.alloc_isa_reg() for _ in range(len(GPR_SHARD_OFF) + len(GPR_SHARD_TMP))]
+    assert shard == list(GPR_SHARD_OFF + GPR_SHARD_TMP), shard
     # Reserve the preamble slot before any body is placed, so jump_abs targets never collide
     # with it and the very first program lands above it.
     _reset_programs(ue)
@@ -216,6 +218,37 @@ def _raw_start_capture(ue):
 # Runtime values for the preamble-primed registers, set by run_fpga_forward once the real phoneme
 # and frame counts are known. Body emission never reads these -- only the preamble does.
 _RT = {}
+
+# --- multi-engine state (see GPR_SHARD_* and GeneratorFPGA._tap_matmuls) ---
+_ENGINES = [1]                 # engine count for this run (kokoro_test --engines)
+_SCHED = [None]                # MultiEngineScheduler when _ENGINES > 1
+_SHARD_WORKER_SETS = [None]    # per-worker [(reg, value)] register sets for the current run
+_TENSOR_END = [None]           # activation-region ceiling for the allocator guard (set below)
+KOKORO_WORKER_BASE = 0x90000000    # worker arenas: above the activation high-water, below programs
+KOKORO_WORKER_STRIDE = 0x03000000  # 48 MB per engine window: weights | 16 MB ISA | 16 MB tensor
+
+
+def set_shard_dims(level_rows):
+    """Compute every engine's (offset, count) row shard for each generator time level and prime
+    the primary's preamble (_RT) with engine 0's; the workers' sets go to start_workers().
+    ``level_rows``: {level: padded row count}. Balanced split, any row granularity (K/N are the
+    64-aligned dims, rows are not); an engine past the real rows still gets one in-range row so
+    no kernel sees a zero trip count."""
+    ne = _ENGINES[0]
+    sets = [[] for _ in range(ne)]
+    for L, rows in level_rows.items():
+        rows = int(rows)
+        # Boundaries on SHARD_ALIGN rows: SramChain tiles are <= 128 rows and an engine's last
+        # tile may run past its count, so counts must be tile multiples for every engine but
+        # the last (whose overrun lands in pad rows of a cap-sized buffer).
+        r = -(-(-(-rows // ne)) // SHARD_ALIGN) * SHARD_ALIGN
+        for e in range(ne):
+            off = min(e * r, max(rows - 1, 0))
+            cnt = max(1, min(r, rows - off))
+            sets[e] += [(GPR_SHARD_CNT[L], cnt), (GPR_SHARD_OFF[L], off)]
+    for reg, val in sets[0]:
+        _RT[reg] = val
+    _SHARD_WORKER_SETS[0] = sets[1:]
 
 
 def set_runtime_dims(T=None, n_frames=None, T_pad=None, nf_pad=None, pad_rows=None):
@@ -693,6 +726,7 @@ KOKORO_TENSOR_BASE = 0x10000000
 KOKORO_PROGRAM_BASE = 0xF0000000
 KOKORO_PROGRAM_END = 0x100000000   # end of physical DRAM; see the warning above
 KOKORO_TENSOR_END = KOKORO_PROGRAM_BASE
+_TENSOR_END[0] = KOKORO_TENSOR_END
 
 # The row capacity currently in force. Set per section, because the shared helpers (_conv1d,
 # _adain1d, _adain_res_blk) are called with PHONEME counts from Sections 2/4 and with FRAME counts
@@ -2178,8 +2212,20 @@ GPR_NFPAD = 11
 # scaled by that level's upsample factor, so one primed register covers all of them.
 GPR_PADROWS = 12
 
+# --- Multi-engine row shards (generator only) -------------------------------------------------
+# Engine e owns rows [off_e, off_e + cnt_e) of each generator time level (0: 2*nf rows, 1: 20*nf,
+# 2: 120*nf). Both are per-run, per-engine values primed by that engine's preamble (the primary's
+# via _RT, the workers' via start_workers(gpr_sets_by_worker)). The COUNT registers double as the
+# dynamic kernels' gpr_M_reg, which must be a 1..15 index, so they sit inside the low block; the
+# offsets and the address scratch live past the normalisation pool. Every engine runs the SAME
+# body with these registers as the only difference.
+GPR_SHARD_CNT = (13, 14, 15)      # rows in this engine's shard, per level (gpr_M_reg-legal)
+GPR_SHARD_OFF = (28, 29, 30)      # first row of this engine's shard, per level
+GPR_SHARD_TMP = (31, 32, 33)      # A / OUT / C word-address scratch for the sharded bodies
+SHARD_ALIGN = 128                 # shard boundary granularity in rows (see set_shard_dims)
+_SHARD_STAT_CHUNKS = 2            # per-engine AdaIN staging: up to 2 x GEN_IN_CHUNK rows (cap/12 + align)
 _RESERVED_GPRS = (GPR_M, GPR_K, GPR_N, GPR_T, GPR_F, GPR_TMP, GPR_TPAD, GPR_NFPAD,
-                  GPR_PADROWS) + GPR_MSCRATCH
+                  GPR_PADROWS) + GPR_MSCRATCH + GPR_SHARD_CNT
 _NREG_POOL_SIZE = 12   # 6 distinct normalisation axes (N reg + sqrt(N) reg each)
 
 # Registers carrying a runtime NORMALISATION length. InstanceNorm reduces over the TIME axis, so
@@ -2492,6 +2538,301 @@ def _dyn_attention(ue, **kw):
             ue.generate_instruction_shl(GPR_K, GPR_K, 6)
             kw["gpr_aligned_seq_len_reg"] = GPR_K
     return ue.unified_attention_core(**kw)
+
+
+
+# ---------------------------------------------------------------------------------------------
+# SRAM-resident eltwise chains
+#
+# Every eltwise_core_dram call is a DRAM round trip: load a tile, one op, store it. Measured on the
+# board for the generator's level-2 tensor ([30784, 128], 7.5 MB): 2.9 ms per vector op, 2.0 ms per
+# broadcast, and 27 ms for a clamp (activation_core is one matvec instruction per 64-element row,
+# wherever the data lives). A 40-op Snake therefore moved ~1 GB through DRAM and spent half its
+# time in three clamps.
+#
+# _sram_chain runs a whole op list on one tile while it sits in URAM: load once, N ops at the
+# eltwise unit's own rate (0.29 ms per op on the same tensor, ~10x), store once. Steps/clamps on
+# range-reduced inputs are expressed as exact floors via the magic-192 truncation this file
+# already relies on (GEN_MAGIC): three broadcast ops instead of a matvec pass.
+#
+# Bank contract (user_dma_core): ELTWISE_ADD/MUL need their two operands in different URAMs,
+# ELTWISE_SUB needs A in URAM_A and B in URAM_B, broadcasts need their source in URAM_A; the
+# write-back may go to either bank. The executor places results by looking at their next consumer
+# and inserts a one-op copy only when an operand is in the wrong bank.
+#
+# Tile loop: one hardware loop with PBI pointers striding through the [T, N] inputs/outputs, trip
+# count = ceil(T / tile_rows) derived from T's register, so the body is prompt-invariant. The last
+# tile may run past T; every buffer this is used on is cap-sized and those rows are pad rows that
+# downstream ops re-zero, exactly as with the 64-row padding elsewhere in this file.
+# ---------------------------------------------------------------------------------------------
+_SRAM_A, _SRAM_B = 0x00000, 0x80000
+_SRAM_BANK_ROWS = 4096          # URAM rows per bank (128 B each)
+
+
+class _ChainOp:
+    __slots__ = ("kind", "dst", "a", "b", "scalar")
+
+    def __init__(self, kind, dst, a, b=None, scalar=None):
+        self.kind, self.dst, self.a, self.b, self.scalar = kind, dst, a, b, scalar
+
+
+class SramChain:
+    """Build an eltwise op list over named tiles, then emit it as one SRAM-resident tile loop.
+
+    inputs:  name -> DRAM base of a [T, N] bf16 buffer, loaded per tile.
+    consts:  name -> DRAM base of a [tile_rows, N] bf16 tile, loaded ONCE before the loop (use it
+             for per-channel vectors tiled down tile_rows rows).
+    outputs: name -> DRAM base of a [T, N] bf16 buffer, stored per tile. An output name may also
+             be an input name (in-place).
+    Ops are recorded through mul/add/sub/muls/adds/step; names are free-form.
+    """
+
+    def __init__(self, ue, T, N, tile_rows=128):
+        assert N % UE_VECTOR_SIZE == 0, N
+        self.ue, self.T, self.N, self.tile_rows = ue, T, N, tile_rows
+        self.TE = tile_rows * N                              # elements per tile
+        self.slot_rows = self.TE // UE_VECTOR_SIZE           # URAM rows per tile slot
+        self.inputs, self.consts, self.outputs = {}, {}, {}
+        self.ops: "list[_ChainOp]" = []
+
+    # ---- op recording ----
+    def mul(self, dst, a, b):   self.ops.append(_ChainOp("mul", dst, a, b))
+    def add(self, dst, a, b):   self.ops.append(_ChainOp("add", dst, a, b))
+    def sub(self, dst, a, b):   self.ops.append(_ChainOp("sub", dst, a, b))
+    def muls(self, dst, a, s):  self.ops.append(_ChainOp("muls", dst, a, scalar=float(s)))
+    def adds(self, dst, a, s):  self.ops.append(_ChainOp("adds", dst, a, scalar=float(s)))
+
+    def exp(self, dst, a):      self.ops.append(_ChainOp("exp", dst, a))
+
+    def round(self, dst, a):
+        """dst = nearest integer to a, for |a| < 64: the magic-192 trick (GEN_MAGIC). Board-
+        measured: the adder ROUNDS to nearest (ties to even, with a fuzzy band of ~0.01 around
+        the tie), it does not truncate -- so this is round(), never floor()."""
+        self.adds(dst, a, GEN_MAGIC)
+        self.adds(dst, dst, -GEN_MAGIC)
+
+    STEP_K = 16384.0
+
+    def step(self, dst, a, boundary=0.0, k=STEP_K, eps=2.0 ** -11):
+        """Soft unit step dst ~= 1[a >= boundary] as exp(-exp(-k (a - boundary + eps))): 0 below
+        the boundary by more than ~3/k, 1 above, no matvec. Board-verified for k=16384 including
+        the overflow ends (exp -> inf -> exp(-inf) = 0). Same role as the clamp(RAMP x, 0, 1) step
+        of the DRAM path (band 1/4096); this band is +-2.5e-4.
+
+        ``boundary`` must be exactly representable in bf16 (0, 0.25, 0.75, 1.0 ...): the exact
+        difference is formed FIRST, then ``eps`` (also representable) nudges a value sitting
+        exactly on the boundary to the "above" side. Folding eps into the boundary does not work:
+        1 - 1e-3 rounds to the bf16 grid point 0.99609375, so a phase there would land on the
+        step's midpoint (e^-1) and the fold would not cancel it."""
+        if boundary:
+            self.adds(dst, a, -boundary)
+            self.adds(dst, dst, eps)
+        else:
+            self.adds(dst, a, eps)
+        self.muls(dst, dst, -k)
+        self.exp(dst, dst)
+        self.muls(dst, dst, -1.0)
+        self.exp(dst, dst)
+
+    # ---- placement + emission ----
+    def _plan(self):
+        """Assign every named tile a (bank, slot) with liveness-based reuse, inserting copies
+        where the bank contract needs them. Returns the concrete op list."""
+        names = list(self.inputs) + list(self.consts)
+        last_use = {}
+        for i, op in enumerate(self.ops):
+            for n in (op.a, op.b):
+                if n is not None:
+                    last_use[n] = i
+        for n in self.outputs:
+            last_use[n] = len(self.ops)          # live until the store
+        n_slots = _SRAM_BANK_ROWS // self.slot_rows
+        free = {0: list(range(n_slots)), 1: list(range(n_slots))}
+        where = {}                                          # name -> (bank, slot)
+
+        def take(bank):
+            assert free[bank], f"SramChain: out of URAM slots in bank {bank} (tile {self.TE} elems)"
+            return (bank, free[bank].pop(0))
+
+        def release(name, at):
+            # consts keep their slot for the whole loop (loaded once); outputs until the store.
+            if name in where and last_use.get(name, -1) <= at and name not in self.outputs \
+                    and name not in self.consts:
+                b, sidx = where.pop(name)
+                free[b].append(sidx)
+
+        def wanted_bank(name, at):
+            """Bank the NEXT consumer of `name` after op index `at` would like it in."""
+            for op in self.ops[at + 1:]:
+                if name in (op.a, op.b):
+                    if op.kind == "sub":
+                        return 0 if op.a == name else 1
+                    if op.kind in ("muls", "adds", "exp"):
+                        return 0
+                    other = op.b if op.a == name else op.a
+                    if other in where:
+                        return 1 - where[other][0]
+                    return 0
+            return 0
+
+        plan = []                                           # (kind, dst_loc, a_loc, b_loc, scalar)
+        # consts + inputs: place by first consumer's preference
+        for n in self.consts:
+            where[n] = take(0 if n == "__zero__" else wanted_bank(n, -1))
+        for n in self.inputs:
+            where[n] = take(wanted_bank(n, -1))
+        home = dict(where)                                  # load slots for inputs/consts
+        zero = where.get("__zero__")                        # const zero tile (bank A), if registered
+
+        def copy_to(name, bank, at):
+            src = where[name]
+            dst = take(bank)
+            if bank == 1:                                   # A -> B: broadcast add 0
+                plan.append(("adds", dst, src, None, 0.0))
+            else:                                           # B -> A: add the zero tile
+                assert zero is not None, "SramChain: B->A copy needs the __zero__ const"
+                plan.append(("add", dst, zero, src, None))
+            return dst
+
+        for i, op in enumerate(self.ops):
+            a_loc = where[op.a]
+            b_loc = where[op.b] if op.b is not None else None
+            tmp = []
+            if op.kind == "sub":
+                if a_loc[0] != 0:
+                    a_loc = copy_to(op.a, 0, i); tmp.append(a_loc)
+                if b_loc[0] != 1:
+                    b_loc = copy_to(op.b, 1, i); tmp.append(b_loc)
+            elif op.kind in ("mul", "add"):
+                if a_loc[0] == b_loc[0]:
+                    b_loc = copy_to(op.b, 1 - a_loc[0], i); tmp.append(b_loc)
+            else:                                           # broadcast / exp: source in A
+                if a_loc[0] != 0:
+                    a_loc = copy_to(op.a, 0, i); tmp.append(a_loc)
+            # destination: reuse dst's own slot if it already exists, else allocate by lookahead
+            if op.dst in where:
+                d_loc = where[op.dst]
+            else:
+                d_loc = take(wanted_bank(op.dst, i))
+                where[op.dst] = d_loc
+            plan.append((op.kind, d_loc, a_loc, b_loc, op.scalar))
+            for t in tmp:
+                free[t[0]].append(t[1])
+            for n in (op.a, op.b):
+                if n is not None and n != op.dst:
+                    release(n, i)
+        home.update({n: where[n] for n in self.outputs})
+        return plan, home
+
+    def emit(self, shard=None):
+        """Emit the chain. ``shard=(off_reg, cnt_reg)`` restricts it to THIS engine's rows
+        [off, off + cnt) of every input/output: each PBI pointer's DRAM base becomes
+        literal + off * row_pitch (computed into a scratch GPR and written into the pointer
+        row), and the tile trip count is ceil(cnt / tile_rows) instead of ceil(T / tile_rows).
+        Consts are shared and unchanged. Shard boundaries are SHARD_ALIGN-row multiples, so an
+        engine's tiles never spill into its neighbour's rows."""
+        ue, TE = self.ue, self.TE
+        # A real zero tile from DRAM for bank-B -> bank-A copies. (Multiplying an uninitialised
+        # slot by 0 is not a zero: stale inf/NaN survive, and it made a Snake chain's output
+        # depend on whatever the previous program left in URAM.)
+        if "__zero__" not in self.consts:
+            self.consts["__zero__"] = _upload_const(ue, torch.zeros(TE, dtype=torch.bfloat16))
+        plan, where = self._plan()
+        slot_bytes = self.slot_rows * 128
+
+        def sram(loc):
+            return (_SRAM_A if loc[0] == 0 else _SRAM_B) + loc[1] * slot_bytes
+
+        # consts: once, before the loop
+        for n, dram in self.consts.items():
+            ue.accelerator_memory_to_sram(accelerator_dram_address=dram, sram_address=sram(where[n]),
+                                          element_size=TE)
+        # tile loop trip count
+        T = self.T
+        shift = self.tile_rows.bit_length() - 1
+        assert (1 << shift) == self.tile_rows, "tile_rows must be a power of two"
+        assert SHARD_ALIGN % self.tile_rows == 0, (SHARD_ALIGN, self.tile_rows)
+        if shard is not None:
+            off_reg, cnt_reg = shard
+            ue.generate_instruction_add_imm(cnt_reg, self.tile_rows - 1, GPR_TMP)
+            ue.generate_instruction_shr(GPR_TMP, GPR_TMP, shift)
+            n_tiles_cap = -(-_template(T) // self.tile_rows)
+            gpr_cnt = GPR_TMP
+        elif _is_dyn(T):
+            base = _emit_M(ue, T)
+            ue.generate_instruction_add_imm(base, self.tile_rows - 1, GPR_TMP)
+            ue.generate_instruction_shr(GPR_TMP, GPR_TMP, shift)
+            n_tiles_cap = -(-_template(T) // self.tile_rows)
+            gpr_cnt = GPR_TMP
+        else:
+            n_tiles_cap = -(-int(T) // self.tile_rows)
+            gpr_cnt = None
+        # PBI pointers: one per input and per output
+        ptrs = {}
+        for n, dram in list(self.inputs.items()) + [("out:" + k, v) for k, v in self.outputs.items()]:
+            ptr = ue.alloc_inst_ptr()
+            loc = where[n] if not n.startswith("out:") else where[n[4:]]
+            _, row = ue.sram_address_to_uram_address(sram(loc))
+            if n.startswith("out:"):
+                ue.generate_instruction_pbi_init(dram_shared_addr=dram, dma_length=TE * 2,
+                                                 uram_a_start_addr=row, uram_b_start_addr=row,
+                                                 inst_pointer_idx=ptr)
+            else:
+                ue.generate_instruction_pbi_init(dram_shared_addr=dram, dma_length=TE * 2,
+                                                 uram_dst_addr=row, inst_pointer_idx=ptr)
+            if shard is not None:
+                # base := literal + off * row pitch (words), written into the pointer row
+                treg = GPR_SHARD_TMP[0]
+                ue.generate_instruction_reg_mul_imm(treg, shard[0], ue_35bit_addr_shifter(self.N * 2))
+                ue.generate_instruction_add_imm(treg, ue_35bit_addr_shifter(dram), treg)
+                ue._pbi_override_dram_base_from_gpr(ptr, treg)
+            ptrs[n] = ptr
+        body_est = len(plan) + len(ptrs) + 4
+        relative = body_est <= 200
+        if relative:
+            prog = ue.get_program_dram_addr()
+            ue.generate_instruction_jump_abs(ue_35bit_addr_shifter(
+                prog + (ue.capture_count + 1) * INSTRUCTION_SIZE_BYTES))
+        ue.loop_start(loop_cnt=n_tiles_cap, gpr_loop_cnt=gpr_cnt, relative=relative)
+        # In pointer mode the in-loop DMA's sram_address field is a per-iteration URAM INCREMENT
+        # (board-verified: a slot row here walked the destination every tile); only its bank bit
+        # is an address. The slot row was set once in the pointer init above.
+        bank_base = lambda loc: _SRAM_A if loc[0] == 0 else _SRAM_B
+        for n in self.inputs:
+            ue.accelerator_memory_to_sram(accelerator_dram_address=TE * 2, sram_address=bank_base(where[n]),
+                                          element_size=0, inst_pointer_idx=ptrs[n])
+        for kind, d, a, b, sc in plan:
+            if kind == "mul":
+                ue.eltwise_mul_core(sram(a), sram(b), sram(d), TE)
+            elif kind == "add":
+                ue.eltwise_add_core(sram(a), sram(b), sram(d), TE)
+            elif kind == "sub":
+                ue.eltwise_sub_core(sram(a), sram(b), sram(d), TE)
+            elif kind == "muls":
+                ue.broadcast_mul(scalar=sc, sram_start_addr=sram(a), sram_wb_addr=sram(d), element_size=TE)
+            elif kind == "adds":
+                ue.broadcast_add(scalar=sc, sram_start_addr=sram(a), sram_wb_addr=sram(d), element_size=TE)
+            elif kind == "exp":
+                # eltwise-unit EXP (UE_MODE.EXP), same descriptor shape as a broadcast: source row
+                # in URAM_A, write-back to either bank. Board-verified against torch.exp.
+                # broadcast_mode MUST be SCALAR_IN_REG with a zero scalar: mode 0 is LALU_RESULT,
+                # i.e. exp(x + <stale LALU register>), which drifts with every activation/softmax
+                # program that ran before (measured x1.16 .. x1.9 on the output).
+                _, srow = ue.sram_address_to_uram_address(sram(a))
+                dbank, drow = ue.sram_address_to_uram_address(sram(d))
+                ue.ue_arithmetic_op(_udc.BROADCAST_MODE.SCALAR_IN_REG.value, 0, 1, 0, 0,
+                                    _udc.LALU_MODE.BYPASS.value, 0, dbank.value, 0, drow,
+                                    _udc.URAM_WRITE_SRC.URAM_WRITE_BACK.value, UE_MODE.EXP, 0, srow, 0,
+                                    self.slot_rows, 0, 0, 0)
+            else:
+                raise AssertionError(kind)
+        for n in self.outputs:
+            ue.sram_to_accelerator_memory(sram_address=bank_base(where[n]), accelerator_dram_address=TE * 2,
+                                          element_size=0, inst_pointer_idx=ptrs["out:" + n])
+        ue.loop_end()
+        for _ in ptrs:                      # release_inst_ptr is a plain counter decrement
+            ue.release_inst_ptr(0)
+        return len(plan)
 
 
 def _pbi_row_loop(ue, n_rows, reads, writes, gpr_rows=None, sram_addr=0x00000,
@@ -2909,25 +3250,43 @@ class GeneratorFPGA:
         key = self._owner.pop(addr)
         self._pool[key].append(addr)
 
+    # FUSED MODE (the normal, non-debug run): the whole generator -- SineGen/STFT, both upsample
+    # stages, every resblock op, conv_post, exp/sin + iSTFT -- is ONE captured program, launched
+    # once. Nothing between the former 187 programs ever needed the host: every input is uploaded
+    # before the first instruction and every intermediate stays in DRAM. Splitting only existed
+    # so the --debug-snr probes could read intermediates back, and it cost a host launch + poll
+    # per op with Python emission of the next op serialised against the device (a short prompt
+    # spent ~6 s emitting while the accelerator idled).
+    #
+    # The scratch rewind and the output-buffer pool stay exactly as they were. Both rely on
+    # "the previous op has finished with this memory before the next op reuses it", which held
+    # because programs ran synchronously and holds just the same because a program executes its
+    # instructions in order -- the resblock chains already depend on that within one program.
+    # Only the --debug-snr path keeps one program per op, since its probes read DRAM mid-way.
     def _program(self, emit):
-        """Capture/run one program whose outputs the caller allocated already; scratch rewound."""
+        """One program (or, fused, one more op in the open capture) whose outputs the caller
+        allocated already; scratch rewound."""
         ue = self.ue
-        ue.start_capture()
+        if not self._fused:
+            ue.start_capture()
         mark = ue._tensor_dram_addr
         emit()
-        self._run(ue)
+        if not self._fused:
+            self._run(ue)
         ue._tensor_dram_addr = mark
 
     def _block(self, emit, out_rows_cap, C):
-        """Capture one program: take its output buffer, mark, emit (scratch allocated inside),
-        run, rewind the allocator to the mark. Returns the output address."""
+        """Take an output buffer, mark, emit (scratch allocated inside), rewind the allocator to
+        the mark. Runs immediately unless fused. Returns the output address."""
         ue = self.ue
-        ue.start_capture()
+        if not self._fused:
+            ue.start_capture()
         out = self._acquire(out_rows_cap, C)
         self._owner[out] = (out_rows_cap, C)
         mark = ue._tensor_dram_addr
         emit(out)
-        self._run(ue)
+        if not self._fused:
+            self._run(ue)
         ue._tensor_dram_addr = mark
         return out
 
@@ -2958,6 +3317,110 @@ class GeneratorFPGA:
                         clamp_min=0.0, clamp_max=1.0)
 
     # ---- ops ----------------------------------------------------------------------------------
+    @staticmethod
+    def _level_of(T):
+        """Generator time level of a row Dim: 0 (2*nf), 1 (20*nf), 2 (120*nf)."""
+        return {2: 0, 20: 1, 120: 2}[_as_dim(T).mul]
+
+    def _chain_region(self, T, C, build, kind="chain"):
+        """Run an SRAM chain over [T, C] rows: ``build(ch)`` registers inputs/consts/outputs and
+        records the ops on a fresh SramChain. Single engine: emitted inline. Sharded: one
+        master/worker round in which every engine runs the same chain over its own rows
+        (SramChain.emit(shard=...) with T's level registers)."""
+        sched = self.sched
+        _kinds = os.environ.get("KOKORO_SHARD_KINDS")
+        if sched is None or (_kinds is not None and kind not in _kinds.split(",")):
+            ch = SramChain(self.ue, T, C, tile_rows=self._chain_tile_rows(C))
+            build(ch)
+            ch.emit()
+            return
+        L = self._level_of(T)
+        shard = (GPR_SHARD_OFF[L], GPR_SHARD_CNT[L])
+
+        def body(ctx):
+            ch = SramChain(ctx.unsafe_ue, T, C, tile_rows=self._chain_tile_rows(C))
+            build(ch)
+            ch.emit(shard=shard)
+        sched.sharded_region(int(T), body)
+
+    def _row_loop_region(self, T, reads, writes, kind="rows"):
+        """_pbi_row_loop over T rows (a level Dim), row-sharded: every engine walks rows
+        [off, off + cnt) of T's level with the row index itself offset (row_start = the shard
+        offset register, trip count = the shard count register), so reads/writes keep their
+        literal bases and per-row pitches exactly as for _pbi_row_loop. Single engine: plain."""
+        sched = self.sched
+        _kinds = os.environ.get("KOKORO_SHARD_KINDS")
+        if sched is None or (_kinds is not None and kind not in _kinds.split(",")):
+            _pbi_row_loop(self.ue, T, reads=reads, writes=writes)
+            return
+        L = self._level_of(T)
+        off_reg, cnt_reg = GPR_SHARD_OFF[L], GPR_SHARD_CNT[L]
+        ne = sched.num_engines
+        cap = -(-_template(T) // ne) + SHARD_ALIGN
+
+        def body(ctx):
+            _pbi_row_loop(ctx.unsafe_ue, cap, reads=reads, writes=writes, gpr_rows=cnt_reg,
+                          row_start=Dim(0, off_reg, cap=_template(T)))
+        sched.sharded_region(int(T), body)
+
+    def _static_matmul(self, M, K, N, A, B, OUT, kind="static"):
+        """matmat_mul_core with a compile-time M (the STFT/iSTFT block counts), row-sharded with
+        the scheduler's compile-time split when active: engine e runs rows [off_e, off_e+rows_e)
+        with literal addresses (A + off*K*2, OUT + off*N*2), B shared."""
+        sched = self.sched
+        _kinds = os.environ.get("KOKORO_SHARD_KINDS")
+        if sched is None or (_kinds is not None and kind not in _kinds.split(",")):
+            self.ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=B, OUTPUT_DRAM_ADDR=OUT)
+            return
+
+        def body(ctx):
+            ctx.unsafe_ue.matmat_mul_core(M=ctx.rows, K=K, N=N, A_DRAM_ADDR=A + ctx.row_offset * K * 2,
+                                          B_DRAM_ADDR=B, OUTPUT_DRAM_ADDR=OUT + ctx.row_offset * N * 2)
+        sched.sharded_region(int(M), body)
+
+    def _tap_matmuls(self, T, K, N, taps, kind="conv"):
+        """Run the matmuls of one conv (``taps``: [(A, B, OUT, C, bias_mode)], all over the same
+        ``T`` rows) -- row-sharded across the engines when a scheduler is active.
+
+        Sharded form: one barrier-delimited region; engine e runs every tap on its rows
+        [off_e, off_e + cnt_e) (GPR_SHARD_OFF/CNT for T's level, primed per engine), sourcing
+        the A / OUT / C bases from registers = literal base + off_e * row pitch. B (the weights)
+        and any broadcast_N bias are shared and stay literal. The taps of one conv chain through
+        the accumulator on the SAME rows, so no engine depends on another inside the region; the
+        halo rows the shifted A reads need were written by the primary before the region (the
+        entry barrier orders that) and the outputs are complete after the exit barrier.
+        """
+        ue, sched = self.ue, self.sched
+        _kinds = os.environ.get("KOKORO_SHARD_KINDS")          # bring-up bisect: shard only these kinds
+        if sched is None or (_kinds is not None and kind not in _kinds.split(",")):
+            for A, B, O, Cc, mode in taps:
+                _dyn_matmul(ue, M=T, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=B, OUTPUT_DRAM_ADDR=O,
+                            C_DRAM_ADDR=Cc, bias_mode=mode)
+            return
+        L = self._level_of(T)
+        cnt_reg, off_reg = GPR_SHARD_CNT[L], GPR_SHARD_OFF[L]
+        ne = sched.num_engines
+        M_local = Dim(-(-int(T) // ne), cnt_reg, cap=-(-_template(T) // ne) + UE_VECTOR_SIZE)
+        ta, to, tc = GPR_SHARD_TMP
+        k_words, n_words = ue_35bit_addr_shifter(K * 2), ue_35bit_addr_shifter(N * 2)
+
+        def body(ctx):
+            raw = ctx.unsafe_ue
+            for A, B, O, Cc, mode in taps:
+                raw.generate_instruction_reg_mul_imm(ta, off_reg, k_words)
+                raw.generate_instruction_add_imm(ta, ue_35bit_addr_shifter(A), ta)
+                raw.generate_instruction_reg_mul_imm(to, off_reg, n_words)
+                raw.generate_instruction_add_imm(to, ue_35bit_addr_shifter(O), to)
+                gpr_c = None
+                if Cc is not None and mode == "full_matrix":
+                    raw.generate_instruction_reg_mul_imm(tc, off_reg, n_words)
+                    raw.generate_instruction_add_imm(tc, ue_35bit_addr_shifter(Cc), tc)
+                    gpr_c = tc
+                _dyn_matmul(raw, M=M_local, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=B, OUTPUT_DRAM_ADDR=O,
+                            C_DRAM_ADDR=Cc, bias_mode=mode,
+                            gpr_a_addr=ta, gpr_out_addr=to, gpr_c_addr=gpr_c)
+        sched.sharded_region(int(T), body)
+
     def _conv1d(self, x, T, real_T, Cin, Cout, W, b, out, k, dilation=1):
         """Conv1d 'same' with dilation: y[t] = sum_k xpad[t + k*d] @ W[:, :, k]^T.
 
@@ -2969,12 +3432,13 @@ class GeneratorFPGA:
         ue = self.ue
         pad = dilation * (k - 1) // 2
         if k == 1:
-            _dyn_matmul(ue, M=T, K=Cin, N=Cout, A_DRAM_ADDR=x, B_DRAM_ADDR=self._up(W[:, :, 0].contiguous()),
-                        OUTPUT_DRAM_ADDR=out, C_DRAM_ADDR=self._up(b), bias_mode="broadcast_N")
+            self._tap_matmuls(T, Cin, Cout, [(x, self._up(W[:, :, 0].contiguous()), out, self._up(b), "broadcast_N")], kind="conv1x1")
             return
         xpad = ue.allocate_tensor_dram((_template(T) + 2 * pad + UE_VECTOR_SIZE) * Cin * 2)
         self._zero_rows(xpad, Cin, pad)                                   # top pad
-        self._copy_rows(x, xpad + pad * Cin * 2, Cin, T)                  # real + alignment rows
+        # real + alignment rows: a T-row copy, sharded (it was ~50 ms per conv at level 2)
+        self._row_loop_region(T, reads=[(x, Cin * 2, Cin, 0)],
+                              writes=[(xpad + pad * Cin * 2, Cin * 2, Cin, 0)], kind="convcopy")
         # rows [pad + real_T, pad + T + pad]: alignment padding (stale) + bottom pad. Count is
         # (T - real_T) + pad + 1 >= 1 always (a zero trip count wraps the loop counter).
         if _is_dyn(T) and _is_dyn(real_T):
@@ -2986,14 +3450,14 @@ class GeneratorFPGA:
             n_tail = int(T) - int(real_T)
         self._zero_rows(xpad, Cin, n_tail + pad + 1, row_start=real_T, row_start_off=pad)
         acc = [ue.allocate_tensor_dram(_template(T) * Cout * 2) for _ in range(2)]
+        taps = []
         for kk in range(k):
             last = kk == k - 1
             dst = out if last else acc[kk % 2]
             prev = None if kk == 0 else acc[(kk - 1) % 2]
-            _dyn_matmul(ue, M=T, K=Cin, N=Cout, A_DRAM_ADDR=xpad + (kk * dilation) * Cin * 2,
-                        B_DRAM_ADDR=self._up(W[:, :, kk].contiguous()), OUTPUT_DRAM_ADDR=dst,
-                        C_DRAM_ADDR=(self._up(b) if kk == 0 else prev),
-                        bias_mode=("broadcast_N" if kk == 0 else "full_matrix"))
+            taps.append((xpad + (kk * dilation) * Cin * 2, self._up(W[:, :, kk].contiguous()), dst,
+                         (self._up(b) if kk == 0 else prev), ("broadcast_N" if kk == 0 else "full_matrix")))
+        self._tap_matmuls(T, Cin, Cout, taps, kind="conv1d")
 
     def _conv_transpose(self, x, T, Cin, Cout, W, b, out, k, stride, pad, T_out):
         """ConvTranspose1d(Cin, Cout, k, stride, padding=pad) with output length stride*T:
@@ -3004,20 +3468,47 @@ class GeneratorFPGA:
         ue = self.ue
         rows = _template(T_out) + 2 * k + UE_VECTOR_SIZE
         xz = ue.allocate_tensor_dram(rows * Cin * 2)
-        self._zero_rows(xz, Cin, rows)
-        self._copy_rows(x, xz + (k - 1) * Cin * 2, Cin, T, dst_row_stride=stride)
+        zrow = self._zeros_row(Cin)
+        self._row_loop_region(T_out, reads=[(zrow, 0, Cin, 0)], writes=[(xz, Cin * 2, Cin, 0)],
+                              kind="convcopy")                                   # rows [0, T_out)
+        _zero_rows_from(ue, xz, Cin * 2, Cin, start=T_out, count_cap=rows, zeros_src=zrow)  # tail
+        self._row_loop_region(T, reads=[(x, Cin * 2, Cin, 0)],
+                              writes=[(xz + (k - 1) * Cin * 2, stride * Cin * 2, Cin, 0)], kind="convcopy")
         acc = [ue.allocate_tensor_dram(_template(T_out) * Cout * 2) for _ in range(2)]
+        taps = []
         for kk in range(k):
             wf = W[:, :, k - 1 - kk].T.contiguous()                        # [Cout, Cin] = [N, K]
             last = kk == k - 1
             dst = out if last else acc[kk % 2]
             prev = None if kk == 0 else acc[(kk - 1) % 2]
-            _dyn_matmul(ue, M=T_out, K=Cin, N=Cout, A_DRAM_ADDR=xz + (pad + kk) * Cin * 2,
-                        B_DRAM_ADDR=self._up(wf), OUTPUT_DRAM_ADDR=dst,
-                        C_DRAM_ADDR=(self._up(b) if kk == 0 else prev),
-                        bias_mode=("broadcast_N" if kk == 0 else "full_matrix"))
+            taps.append((xz + (pad + kk) * Cin * 2, self._up(wf), dst,
+                         (self._up(b) if kk == 0 else prev), ("broadcast_N" if kk == 0 else "full_matrix")))
+        self._tap_matmuls(T_out, Cin, Cout, taps, kind="convT")
+
+    @staticmethod
+    def _chain_tile_rows(C):
+        """Largest power-of-two tile height whose [rows, C] tile is <= 16k elements (16 slots per
+        bank at C=128; wider channel counts get shorter tiles so the planner keeps enough slots)."""
+        tr = 128
+        while tr * C > 16384 and tr > 8:
+            tr //= 2
+        return tr
 
     def _leaky(self, x, T, C, out, slope):
+        """leaky_relu as one SRAM chain: t = x * step(x) (= relu), r = x - t (= min(x, 0)),
+        out = t + slope * r. Exact on both branches; the exp step's +-2.5e-4 band replaces the
+        two clamp passes of _leaky_dram (each a matvec per 64-element row)."""
+        def build(ch):
+            ch.inputs["x"] = x
+            ch.outputs["out"] = out
+            ch.step("s", "x", 0.0)
+            ch.mul("t", "x", "s")
+            ch.sub("r", "x", "t")
+            ch.muls("r", "r", slope)
+            ch.add("out", "t", "r")
+        self._chain_region(T, C, build, kind="leaky")       # row-sharded when engines > 1
+
+    def _leaky_dram(self, x, T, C, out, slope):
         """leaky_relu = relu(x) - slope*relu(-x), both via clamp on a flat 64-wide view."""
         ue = self.ue
         rows = (T * C) // UE_VECTOR_SIZE
@@ -3045,22 +3536,202 @@ class GeneratorFPGA:
         self._live[key] = self._up_cap(m, n)
         return self._live[key]
 
-    def _reduce_T(self, src, level, C, xt, acc, dst_row):
-        """dst_row [1, C] = sum_t mask[t] * src[t, :]  over ALL cap chunks (masked)."""
+    def _reduce_T(self, src, level, C, xt, acc, dst_row, T=None):
+        """dst_row [1, C] = sum_t mask[t] * src[t, :] over the cap chunks (masked).
+
+        With ``T`` (the 64-aligned runtime row count, a Dim) only the chunks that hold real rows
+        run: chunk j is guarded by a forward JZ on ``(n_real_chunks - 1 - j) >> 31 == 1`` (i.e.
+        j >= n_real_chunks), so at 254 frames level 2 walks 8 of its 16 cap chunks and a 62-frame
+        prompt walks 2. The sum accumulates IN PLACE into dst_row (zeroed first), so no chunk has
+        to know whether it is the last one. Rows past T are zero in every caller (pad rows are
+        re-zeroed before the reduce), so skipping them changes nothing numerically.
+        """
         ue = self.ue
         cap = self._caps[level]
         mask = self._live[("mask", level)]
         n_chunks = cap // GEN_IN_CHUNK
+        # dst_row := 0 (a row copy from the constant zero row; a 0*stale multiply is not a zero)
+        _pbi_row_loop(ue, 1, reads=[(self._zeros_row(C), 0, C, 0)], writes=[(dst_row, 0, C, 0)])
+        n_real = None
+        if T is not None and _is_dyn(T):
+            base = _emit_M(ue, T)                       # a MSCRATCH register, stable across the loop
+            ue.generate_instruction_add_imm(base, GEN_IN_CHUNK - 1, base)
+            ue.generate_instruction_shr(base, base, GEN_IN_CHUNK.bit_length() - 1)   # ceil(T / chunk)
+            n_real = base
+        prog = ue.get_program_dram_addr()
         for j in range(n_chunks):
+            patch = None
+            if n_real is not None:
+                # GPR_TMP = ((n_real - 1 - j) >> 31) + 1: the register ALU's SHR is ARITHMETIC
+                # (board-measured: a negative value stays -1 after any shift, so a logical
+                # sign-bit extract never works), hence -1 + 1 == 0 exactly when j >= n_real, and
+                # 0 + 1 == 1 otherwise -> JZ skips exactly the chunks past the real rows.
+                ue.generate_instruction_add_imm(n_real, -(j + 1), GPR_TMP)
+                ue.generate_instruction_shr(GPR_TMP, GPR_TMP, 31)
+                ue.generate_instruction_add_imm(GPR_TMP, 1, GPR_TMP)
+                patch = ue._emit_forward_skip_jz(GPR_TMP, prog)
             _dyn_transpose(ue, M=GEN_IN_CHUNK, N=C, INPUT_DRAM_ADDR=src + j * GEN_IN_CHUNK * C * 2,
                            OUTPUT_DRAM_ADDR=xt, IDENTITY_DRAM_ADDR=self.identity_dram)
-            last = j == n_chunks - 1
-            _dyn_matmul(ue, M=64, K=GEN_IN_CHUNK, N=C, A_DRAM_ADDR=mask + j * GEN_IN_CHUNK * 2,
-                        B_DRAM_ADDR=xt, OUTPUT_DRAM_ADDR=(dst_row if last else acc[j % 2]),
-                        C_DRAM_ADDR=(None if j == 0 else acc[(j - 1) % 2]),
+            # M=1: only row 0 of the result was ever consumed, so the former M=64 view did 64x the
+            # MACs (64 GFLOP of throwaway work per run, ~2.4 s measured). The M=1 path is the
+            # same legacy matvec the LSTM steps run on; the mask's 64*chunk zero tail is now slack.
+            _dyn_matmul(ue, M=1, K=GEN_IN_CHUNK, N=C, A_DRAM_ADDR=mask + j * GEN_IN_CHUNK * 2,
+                        B_DRAM_ADDR=xt, OUTPUT_DRAM_ADDR=dst_row, C_DRAM_ADDR=dst_row,
                         bias_mode="full_matrix")
+            if patch is not None:
+                patch()
+
+    def _stats_sharded(self, src, T, level, C, dst_row):
+        """dst_row [1, C] = (1/real_T) * sum_{t < T} src[t, :], row-sharded. Rows [real_T, T) of
+        src must already be zero (the caller zeroes them), so a UNIFORM 1/real_T weight is exact.
+        Each engine: copy its rows [off, off+cnt) into its private [GEN_IN_CHUNK, C] scratch
+        (row 0 onwards), zero the rest, transpose, one M=1 matvec against the uniform row into
+        its partial; then a reduce_add sums the partials into dst_row on the primary. Two
+        rendezvous. Replaces the primary's 8-chunk transpose+matvec walk (the 2.9 s AdaIN)."""
+        sched = self.sched
+        L = self._level_of(T)
+        off_reg, cnt_reg = GPR_SHARD_OFF[L], GPR_SHARD_CNT[L]
+        ne = sched.num_engines
+        cap_rows = -(-_template(T) // ne) + SHARD_ALIGN
+        stage_rows = _SHARD_STAT_CHUNKS * GEN_IN_CHUNK
+        assert cap_rows <= stage_rows, (cap_rows, stage_rows)
+        umask = self._live[("umask", level)]
+        names = self._shard_names[C]
+        zrow = self._zeros_row(C)
+        rb = C * 2
+        shift = GEN_IN_CHUNK.bit_length() - 1
+
+        def body(ctx):
+            raw, e = ctx.unsafe_ue, ctx.engine_idx
+            P, XT, PART = (sched.per_engine_addr(names[k], e) for k in ("P", "XT", "PART"))
+            i_reg, j_reg, t_reg = raw.alloc_isa_reg(), raw.alloc_isa_reg(), raw.alloc_isa_reg()
+            raw.generate_instruction_add_set(i_reg, 0)
+            raw.generate_instruction_add_imm(off_reg, 0, j_reg)             # j = off
+            raw.loop_start(loop_cnt=cap_rows, gpr_loop_cnt=cnt_reg)
+            raw.generate_instruction_reg_mul_imm(t_reg, j_reg, ue_35bit_addr_shifter(rb))
+            raw.generate_instruction_add_imm(t_reg, ue_35bit_addr_shifter(src), t_reg)
+            raw.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=0x00000,
+                                           element_size=C, general_reg_src=t_reg)
+            raw.generate_instruction_reg_mul_imm(t_reg, i_reg, ue_35bit_addr_shifter(rb))
+            raw.generate_instruction_add_imm(t_reg, ue_35bit_addr_shifter(P), t_reg)
+            raw.sram_to_accelerator_memory(sram_address=0x00000, accelerator_dram_address=0,
+                                           element_size=C, general_reg_src=t_reg)
+            raw.generate_instruction_add_inc(i_reg)
+            raw.generate_instruction_add_inc(j_reg)
+            raw.loop_end()
+            for _ in range(3):
+                raw.release_isa_reg()
+            # n_real = ceil(cnt / chunk) staged chunks hold rows; zero only [cnt, n_real*chunk]
+            # (one row past the boundary so the trip count is never 0), not the whole scratch.
+            n_real = raw.alloc_isa_reg()
+            raw.generate_instruction_add_imm(cnt_reg, GEN_IN_CHUNK - 1, n_real)
+            raw.generate_instruction_shr(n_real, n_real, shift)
+            raw.generate_instruction_shl(GPR_TMP, n_real, shift)               # n_real * chunk
+            raw.generate_instruction_reg_sub(GPR_TMP, GPR_TMP, cnt_reg)        # - cnt
+            raw.generate_instruction_add_imm(GPR_TMP, 1, GPR_TMP)
+            _pbi_row_loop(raw, stage_rows, reads=[(zrow, 0, C, 0)], writes=[(P, rb, C, 0)],
+                          gpr_rows=GPR_TMP, row_start=Dim(0, cnt_reg, cap=stage_rows))
+            # PART := 0, then one transpose + matvec per staged chunk that holds rows, accumulating
+            # in place (same runtime chunk skip as _reduce_T).
+            _pbi_row_loop(raw, 1, reads=[(zrow, 0, C, 0)], writes=[(PART, 0, C, 0)])
+            prog = raw.get_program_dram_addr()
+            for j in range(_SHARD_STAT_CHUNKS):
+                raw.generate_instruction_add_imm(n_real, -(j + 1), GPR_TMP)
+                raw.generate_instruction_shr(GPR_TMP, GPR_TMP, 31)
+                raw.generate_instruction_add_imm(GPR_TMP, 1, GPR_TMP)
+                patch = raw._emit_forward_skip_jz(GPR_TMP, prog)
+                _dyn_transpose(raw, M=GEN_IN_CHUNK, N=C, INPUT_DRAM_ADDR=P + j * GEN_IN_CHUNK * rb,
+                               OUTPUT_DRAM_ADDR=XT, IDENTITY_DRAM_ADDR=self.identity_dram)
+                _dyn_matmul(raw, M=1, K=GEN_IN_CHUNK, N=C, A_DRAM_ADDR=umask, B_DRAM_ADDR=XT,
+                            OUTPUT_DRAM_ADDR=PART, C_DRAM_ADDR=PART, bias_mode="full_matrix")
+                patch()
+            raw.release_isa_reg()
+        sched.sharded_region(int(T), body)
+        sched.reduce_add([sched.per_engine_addr(names["PART"], e) for e in range(ne)], dst_row, 1, C)
 
     def _adain(self, x, T, real_T, level, C, fc_w, fc_b, out, newton_iters=40, eps=1e-6, y0=1e-2):
+        """AdaIN1d at generator scale with the per-element work on SRAM chains (see SramChain).
+
+        Same math as _adain_dram: stats via _reduce_T, rstd by Newton. What changed: the three
+        [T, C] row-tilings of mean / scale / beta (one hardware row loop of T iterations each,
+        ~30k iterations at level 2) and the four full-tensor eltwise passes become two chains
+        whose per-channel rows are tiled to ONE tile (128 rows) on device and loaded once as chain
+        consts. Chain 1: xc = x - mean, sq = xc^2. Chain 2: out = xc * scale + beta.
+        """
+        ue = self.ue
+        cap = self._caps[level]
+        self._mask_vec(level, real_T)
+        R = 128                                             # SramChain tile rows
+        xt = ue.allocate_tensor_dram(C * GEN_IN_CHUNK * 2)
+        acc = [ue.allocate_tensor_dram(64 * C * 2) for _ in range(2)]
+        stat = ue.allocate_tensor_dram(64 * C * 2)        # row 0 = mean, later var
+        xc = ue.allocate_tensor_dram(cap * C * 2)
+        sq = ue.allocate_tensor_dram(cap * C * 2)
+        y = ue.allocate_tensor_dram(C * 2)
+        tmp = ue.allocate_tensor_dram(C * 2)
+        gb = ue.allocate_tensor_dram(2 * C * 2)
+        scale = ue.allocate_tensor_dram(C * 2)
+        mean_r = ue.allocate_tensor_dram(R * C * 2)       # [R, C] tiles of the per-channel rows
+        scale_r = ue.allocate_tensor_dram(R * C * 2)
+        beta_r = ue.allocate_tensor_dram(R * C * 2)
+        _dyn_matmul(ue, M=1, K=self.style_dim, N=2 * C, A_DRAM_ADDR=self.style_dram,
+                    B_DRAM_ADDR=self._up(fc_w), OUTPUT_DRAM_ADDR=gb, C_DRAM_ADDR=self._up(fc_b),
+                    bias_mode="broadcast_N")
+        zrow = self._zeros_row(C)
+        _kinds = os.environ.get("KOKORO_SHARD_KINDS")
+        sharded = self.sched is not None and (_kinds is None or "adain" in _kinds.split(","))
+
+        def chain1(ch):
+            ch.inputs["x"] = x; ch.consts["mean"] = mean_r
+            ch.outputs["xc"] = xc; ch.outputs["sq"] = sq
+            ch.sub("xc", "x", "mean"); ch.mul("sq", "xc", "xc")
+        if sharded:
+            # Sharded stats read only rows < T, so only [real_T, T) needs zeroing (not up to cap).
+            n_pad = Dim(int(T) - int(real_T), GPR_PADROWS, mul=T.mul,
+                        cap=T.mul * (UE_VECTOR_SIZE - 1) + T.off - real_T.off, off=T.off - real_T.off)
+            self._zero_rows(x, C, n_pad + 1, row_start=real_T)
+            self._stats_sharded(x, T, level, C, stat)                     # row 0 = mean
+            self._tile_row(stat, mean_r, C, R)
+            self._chain_region(T, C, chain1, kind="adain")
+            self._zero_rows(sq, C, n_pad + 1, row_start=real_T)
+            self._stats_sharded(sq, T, level, C, stat)                    # row 0 = var
+        else:
+            _zero_rows_from(ue, x, C * 2, C, start=real_T, count_cap=cap, zeros_src=zrow)
+            self._reduce_T(x, level, C, xt, acc, stat, T=T)               # row 0 = mean
+            self._tile_row(stat, mean_r, C, R)
+            ch = SramChain(ue, T, C, tile_rows=self._chain_tile_rows(C))
+            chain1(ch)
+            ch.emit()
+            # The chain's last tile runs to the next tile boundary, so sq's pad rows hold mean^2:
+            # re-zero [real_T, cap) before the masked reduce, exactly as the DRAM version did.
+            _zero_rows_from(ue, sq, C * 2, C, start=real_T, count_cap=cap, zeros_src=zrow)
+            self._reduce_T(sq, level, C, xt, acc, stat, T=T)              # row 0 = var
+        ue.eltwise_core_dram(1, C, stat, None, stat, UE_MODE.ADD_BROADCAST, scalar=eps)
+        ue.eltwise_core_dram(1, C, stat, None, y, UE_MODE.MUL_BROADCAST, scalar=0.0)
+        ue.eltwise_core_dram(1, C, y, None, y, UE_MODE.ADD_BROADCAST, scalar=y0)
+        for _ in range(newton_iters):
+            ue.eltwise_core_dram(1, C, y, y, tmp, UE_MODE.ELTWISE_MUL)
+            ue.eltwise_core_dram(1, C, tmp, stat, tmp, UE_MODE.ELTWISE_MUL)
+            ue.eltwise_core_dram(1, C, tmp, None, tmp, UE_MODE.MUL_BROADCAST, scalar=-0.5)
+            ue.eltwise_core_dram(1, C, tmp, None, tmp, UE_MODE.ADD_BROADCAST, scalar=1.5)
+            ue.eltwise_core_dram(1, C, y, tmp, y, UE_MODE.ELTWISE_MUL)
+        ue.eltwise_core_dram(1, C, gb, None, scale, UE_MODE.ADD_BROADCAST, scalar=1.0)   # 1 + gamma
+        ue.eltwise_core_dram(1, C, scale, y, scale, UE_MODE.ELTWISE_MUL)                 # * rstd
+        self._tile_row(scale, scale_r, C, R)
+        self._tile_row(gb + C * 2, beta_r, C, R)
+
+        def chain2(ch):
+            ch.inputs["xc"] = xc; ch.consts["scale"] = scale_r; ch.consts["beta"] = beta_r
+            ch.outputs["out"] = out
+            ch.mul("out", "xc", "scale"); ch.add("out", "out", "beta")
+        if sharded:
+            self._chain_region(T, C, chain2, kind="adain")
+        else:
+            ch = SramChain(ue, T, C, tile_rows=self._chain_tile_rows(C))
+            chain2(ch)
+            ch.emit()
+
+    def _adain_dram(self, x, T, real_T, level, C, fc_w, fc_b, out, newton_iters=40, eps=1e-6, y0=1e-2):
         """AdaIN1d at generator scale: (x - mean) * (1 + gamma) * rstd + beta, per channel over
         time, entirely in [T, C]. Stats via _reduce_T; rstd by Newton from a constant seed (no
         rsqrt core; converges for var < 3/y0^2 = 3e4)."""
@@ -3087,12 +3758,12 @@ class GeneratorFPGA:
         # cap - real_T is not affine in a primed register, so the count is derived on device.
         zrow = self._zeros_row(C)
         _zero_rows_from(ue, x, C * 2, C, start=real_T, count_cap=cap, zeros_src=zrow)
-        self._reduce_T(x, level, C, xt, acc, stat)                        # row 0 = mean
+        self._reduce_T(x, level, C, xt, acc, stat, T=T)                   # row 0 = mean
         self._tile_row(stat, meant, C, T)
         _dyn_eltwise(ue, T, C, x, meant, xc, mode=UE_MODE.ELTWISE_SUB)
         _dyn_eltwise(ue, T, C, xc, xc, sq, mode=UE_MODE.ELTWISE_MUL)
         _zero_rows_from(ue, sq, C * 2, C, start=real_T, count_cap=cap, zeros_src=zrow)
-        self._reduce_T(sq, level, C, xt, acc, stat)                       # row 0 = var
+        self._reduce_T(sq, level, C, xt, acc, stat, T=T)                  # row 0 = var
         ue.eltwise_core_dram(1, C, stat, None, stat, UE_MODE.ADD_BROADCAST, scalar=eps)
         ue.eltwise_core_dram(1, C, stat, None, y, UE_MODE.MUL_BROADCAST, scalar=0.0)
         ue.eltwise_core_dram(1, C, y, None, y, UE_MODE.ADD_BROADCAST, scalar=y0)
@@ -3110,6 +3781,40 @@ class GeneratorFPGA:
         _dyn_eltwise(ue, T, C, out, betat, out, mode=UE_MODE.ELTWISE_ADD)
 
     def _snake(self, x, T, C, alpha, out):
+        """Snake1D as one SRAM-resident chain (see SramChain): the same recipe as _snake_dram --
+        p = a x / pi + 0.25 reduced mod 1, quarter-wave fold, degree-9 Taylor -- but the tile is
+        loaded once and every intermediate stays in URAM, and the wrap/fold steps are exp-based
+        soft steps instead of clamp passes (each of those was a 27 ms matvec pass)."""
+        R = self._chain_tile_rows(C)
+        api = self._up((alpha.float() / math.pi).to(torch.bfloat16).reshape(1, C).expand(R, C).contiguous())
+        inv2a = self._up((1.0 / (2.0 * alpha.float())).to(torch.bfloat16).reshape(1, C).expand(R, C).contiguous())
+        self._chain_region(T, C, lambda ch: self._snake_ops(ch, x, api, inv2a, out), kind="snake")
+
+    @staticmethod
+    def _snake_ops(ch, x, api, inv2a, out):
+        ch.inputs["x"] = x
+        ch.consts["api"] = api
+        ch.consts["inv2a"] = inv2a
+        ch.outputs["out"] = out
+        ch.mul("p", "x", "api"); ch.adds("p", "p", 0.25)
+        ch.round("n", "p"); ch.sub("p", "p", "n"); ch.adds("p", "p", 1.0)   # r in (0, 2)
+        ch.step("s", "p", 1.0); ch.sub("p", "p", "s")                          # [0, 1)
+        ch.step("s1", "p", 0.25); ch.step("s2", "p", 0.75)
+        ch.muls("v", "p", -2.0); ch.adds("v", "v", 0.5); ch.mul("v", "v", "s1"); ch.add("q", "p", "v")
+        ch.muls("v", "p", 2.0); ch.adds("v", "v", -1.5); ch.mul("v", "v", "s2"); ch.add("q", "q", "v")
+        ch.muls("q", "q", 2.0 * math.pi)
+        ch.mul("x2", "q", "q")
+        coef = [((-1) ** ((k - 1) // 2)) / math.factorial(k) for k in (9, 7, 5, 3, 1)]
+        ch.muls("tm", "x2", coef[0])
+        for c in coef[1:]:
+            ch.adds("tm", "tm", c)
+            if c != coef[-1]:
+                ch.mul("tm", "tm", "x2")
+        ch.mul("tm", "tm", "q")                                          # cos(2ax)
+        ch.muls("tm", "tm", -1.0); ch.adds("tm", "tm", 1.0); ch.mul("tm", "tm", "inv2a")
+        ch.add("out", "x", "tm")
+
+    def _snake_dram(self, x, T, C, alpha, out):
         """Snake1D: x + sin^2(a x)/a = x + (1 - cos(2 a x)) / (2 a), per-channel alpha.
         cos(2ax) = sin(2*pi*p), p = (a x / pi + 0.25) mod 1: staircase mod over
         [-GEN_SNAKE_TURNS, GEN_SNAKE_TURNS], quarter-wave fold, degree-9 Taylor."""
@@ -3230,7 +3935,301 @@ class GeneratorFPGA:
         t["NOISE"] = nz
         return t
 
-    def _source_har(self, tables, T_f, S, F_rows, HAR):
+    CORDIC_PRE = 1024.0          # angle is scale-invariant: scale bins (~1e-2) up, fold 1/PRE into the gain
+    CORDIC_ITERS = 8
+
+    def _cordic(self, Mf, RE, IM, Z, REraw=None, IMraw=None):
+        """CORDIC vectoring as one SRAM chain over [Mf, 64] rows: RE <- |z| (gain-corrected),
+        Z <- atan2(im, re). Same recipe as _cordic_dram (PRE scale, quadrant flag with sign(0)=+1,
+        8 rotations); every sign() is 2*step - 1 on the exp step instead of a clamp pass, so the
+        ~60 matvec passes of the DRAM version become ~150 SRAM ops. REraw/IMraw: optional debug
+        copies of the pre-CORDIC spectrum."""
+        V = UE_VECTOR_SIZE
+        PRE, iters = self.CORDIC_PRE, self.CORDIC_ITERS
+        Kg = 1.0
+        for k in range(iters):
+            Kg *= math.sqrt(1.0 + 2.0 ** (-2 * k))
+        def build(ch):
+            ch.inputs["re"] = RE; ch.inputs["im"] = IM
+            ch.outputs["re"] = RE; ch.outputs["z"] = Z
+            if REraw is not None:
+                ch.outputs["rer"] = REraw; ch.outputs["imr"] = IMraw
+                ch.muls("rer", "re", 1.0); ch.muls("imr", "im", 1.0)
+
+            def sign(dst, src):
+                ch.step(dst, src, 0.0); ch.muls(dst, dst, 2.0); ch.adds(dst, dst, -1.0)
+            ch.muls("re", "re", PRE); ch.muls("im", "im", PRE)
+            ch.step("t1", "re", 0.0); ch.muls("t1", "t1", -1.0); ch.adds("t1", "t1", 1.0)     # 1 where re < 0
+            # sign(0) = +1 for the purely-real DC/Nyquist bins (atan2(0, x<0) = +pi): the step's eps
+            # already gives that; the +4/RAMP offset of the DRAM version is kept for identical numerics.
+            ch.adds("t2", "im", 4.0 / GEN_STEP_RAMP)
+            sign("sy", "t2"); ch.mul("z", "t1", "sy"); ch.muls("z", "z", math.pi)
+            sign("sx", "re"); ch.mul("re", "re", "sx"); ch.mul("im", "im", "sx")
+            for k in range(iters):
+                sign("sy", "im")
+                ch.mul("t1", "im", "sy"); ch.muls("t1", "t1", 2.0 ** (-k))
+                ch.mul("t2", "re", "sy"); ch.muls("t2", "t2", 2.0 ** (-k))
+                ch.add("re", "re", "t1"); ch.sub("im", "im", "t2")
+                ch.muls("t1", "sy", math.atan(2.0 ** (-k))); ch.add("z", "z", "t1")
+            ch.muls("re", "re", 1.0 / (Kg * PRE))                                          # magnitude
+        # Mf is the STFT-frame row Dim (F_rows_p == T2p): row-sharded when engines > 1.
+        self._chain_region(Mf, V, build, kind="cordic")
+
+    def _cordic_dram(self, Mf, RE, IM, Z, SX, SY, T1, T2, REraw, IMraw):
+        """DRAM-op CORDIC vectoring (the original Section 5c step 6): RE <- |z|, Z <- atan2."""
+        ue = self.ue
+        V = UE_VECTOR_SIZE
+        ident = self.identity_dram
+        E = lambda M, a, b, o, mode, sc=None: _dyn_eltwise(ue, M, V, a, b, o, mode=mode, scalar=sc)
+
+        def step(M, src, dst):
+            E(M, src, None, dst, UE_MODE.MUL_BROADCAST, GEN_STEP_RAMP)
+            _dyn_activation(ue, M=M, N=V, A_DRAM_ADDR=dst, OUTPUT_DRAM_ADDR=dst, IDENTITY_DRAM_ADDR=ident,
+                            activation="clamp", clamp_min=0.0, clamp_max=1.0)
+        E(Mf, RE, None, REraw, UE_MODE.MUL_BROADCAST, 1.0)                   # debug copies (pre-CORDIC)
+        E(Mf, IM, None, IMraw, UE_MODE.MUL_BROADCAST, 1.0)
+        # The spectrum bins are ~1e-2 and the clamp step's soft band is 1/GEN_STEP_RAMP = 2.4e-4:
+        # unscaled, a few percent of the (near-empty) bins got a FRACTIONAL quadrant sign, i.e. a
+        # garbage angle -- 10 dB off the model's own noise floor at conv_post. The angle is
+        # scale-invariant, so scale up first (exact in bf16) and fold 1/scale into the gain.
+        PRE = self.CORDIC_PRE
+        E(Mf, RE, None, RE, UE_MODE.MUL_BROADCAST, PRE)
+        E(Mf, IM, None, IM, UE_MODE.MUL_BROADCAST, PRE)
+        iters = self.CORDIC_ITERS
+        Kg = 1.0
+        for k in range(iters):
+            Kg *= math.sqrt(1.0 + 2.0 ** (-2 * k))
+
+        def sign(src, dst):
+            step(Mf, src, dst); E(Mf, dst, None, dst, UE_MODE.MUL_BROADCAST, 2.0); E(Mf, dst, None, dst, UE_MODE.ADD_BROADCAST, -1.0)
+        step(Mf, RE, T1); E(Mf, T1, None, T1, UE_MODE.MUL_BROADCAST, -1.0); E(Mf, T1, None, T1, UE_MODE.ADD_BROADCAST, 1.0)
+        # Quadrant sign with sign(0) = +1: the DC and Nyquist bins are purely real (im == 0 exactly),
+        # where torch.angle gives atan2(0, x<0) = +pi. A plain clamp step gives sign(0) = -1, i.e.
+        # -pi: a systematic 2*pi error on the STRONGEST channel (82% of DC frames in simulation).
+        E(Mf, IM, None, T2, UE_MODE.ADD_BROADCAST, 4.0 / GEN_STEP_RAMP)   # > the step band, << PRE-scaled bins
+        sign(T2, SY); E(Mf, T1, SY, Z, UE_MODE.ELTWISE_MUL); E(Mf, Z, None, Z, UE_MODE.MUL_BROADCAST, math.pi)
+        sign(RE, SX); E(Mf, RE, SX, RE, UE_MODE.ELTWISE_MUL); E(Mf, IM, SX, IM, UE_MODE.ELTWISE_MUL)
+        for k in range(iters):
+            sign(IM, SY)
+            E(Mf, IM, SY, T1, UE_MODE.ELTWISE_MUL); E(Mf, T1, None, T1, UE_MODE.MUL_BROADCAST, 2.0 ** (-k))
+            E(Mf, RE, SY, T2, UE_MODE.ELTWISE_MUL); E(Mf, T2, None, T2, UE_MODE.MUL_BROADCAST, 2.0 ** (-k))
+            E(Mf, RE, T1, RE, UE_MODE.ELTWISE_ADD); E(Mf, IM, T2, IM, UE_MODE.ELTWISE_SUB)
+            E(Mf, SY, None, T1, UE_MODE.MUL_BROADCAST, math.atan(2.0 ** (-k))); E(Mf, Z, T1, Z, UE_MODE.ELTWISE_ADD)
+        E(Mf, RE, None, RE, UE_MODE.MUL_BROADCAST, 1.0 / (Kg * PRE))         # magnitude
+
+    def _source_har(self, tables, T_f, T_fp, S, F_rows, F_rows_p, HAR):
+        """Section 5c on device, SRAM-chain version of _source_har_dram (same buffers, same scatter,
+        same numerics up to the exp-step vs clamp-step band): the frame accumulator stays on DRAM
+        ops (M=1, unrolled at the cap), but every fine step's two-sum/wrap/sine recipe is ONE
+        SramChain over the [T_fp, 64] frame rows (state p/lo in, state + sine tile out), the
+        tanh(l_linear) merge is _tanh's chain and the CORDIC is _cordic's chain. That removes the
+        ~100 DRAM round trips and 6 clamp passes per fine step x 300 steps.
+        """
+        ue = self.ue
+        gen = self.gen
+        V, H, UP = UE_VECTOR_SIZE, self.GEN_HARM, self.GEN_UP
+        half = UP // 2
+        cap_f = GEN_T0_CAP                       # frame cap
+        row = V * 2
+        blk = cap_f * row
+        S_cap = UP * cap_f
+        R = self.GEN_HEAD_ROWS + S_cap + V       # time-major rows incl. head/tail slack
+        n_blocks = -(-GEN_T2_CAP // 64)          # STFT blocks at the cap
+        up = lambda t: self._up_cap(t, t.numel())
+        DH, DL, UH, UL, NH, NL, AMP = [up(tables[k]) for k in ("D_h", "D_l", "U_h", "U_l", "N_h", "N_l", "AMP")]
+        NOISE = up(tables["NOISE"])
+        ONES = self._up(torch.ones(cap_f, V, dtype=torch.bfloat16))
+        ident = self.identity_dram
+        OUTB = ue.allocate_tensor_dram(R * row)                      # time-major sine lanes
+        PF, PFL = ue.allocate_tensor_dram(blk), ue.allocate_tensor_dram(blk)
+        fr = {k: ue.allocate_tensor_dram(row) for k in ("p", "lo", "s", "bv", "t1", "t2")}
+        fn = {k: ue.allocate_tensor_dram(blk) for k in
+              ("p", "lo", "s", "bv", "t1", "t2", "q", "x2", "tm", "o")}
+        LAST = ue.allocate_tensor_dram((gen.stft.filter_length // 2) * row)   # one tail-pad row per k
+
+        def E(M, a, b, o, mode, sc=None):
+            _dyn_eltwise(ue, M, V, a, b, o, mode=mode, scalar=sc)
+
+        # DRAM helpers: the M=1 frame accumulator and the per-direction initialisation only.
+        def twosum(M, b, d):
+            E(M, b["p"], d, b["s"], UE_MODE.ELTWISE_ADD); E(M, b["s"], b["p"], b["bv"], UE_MODE.ELTWISE_SUB)
+            E(M, b["s"], b["bv"], b["t1"], UE_MODE.ELTWISE_SUB); E(M, b["p"], b["t1"], b["t1"], UE_MODE.ELTWISE_SUB)
+            E(M, d, b["bv"], b["t2"], UE_MODE.ELTWISE_SUB); E(M, b["t1"], b["t2"], b["t1"], UE_MODE.ELTWISE_ADD)
+            E(M, b["lo"], b["t1"], b["lo"], UE_MODE.ELTWISE_ADD); E(M, b["s"], b["lo"], b["p"], UE_MODE.ELTWISE_ADD)
+            E(M, b["p"], b["s"], b["t1"], UE_MODE.ELTWISE_SUB); E(M, b["lo"], b["t1"], b["lo"], UE_MODE.ELTWISE_SUB)
+
+        def step(M, src, dst):
+            E(M, src, None, dst, UE_MODE.MUL_BROADCAST, GEN_STEP_RAMP)
+            _dyn_activation(ue, M=M, N=V, A_DRAM_ADDR=dst, OUTPUT_DRAM_ADDR=dst, IDENTITY_DRAM_ADDR=ident,
+                            activation="clamp", clamp_min=0.0, clamp_max=1.0)
+
+        def wrap_up(M, b):
+            E(M, b["p"], None, b["t1"], UE_MODE.ADD_BROADCAST, -1.0); step(M, b["t1"], b["t2"])
+            E(M, b["p"], b["t2"], b["p"], UE_MODE.ELTWISE_SUB)
+
+        def wrap_dn(M, b):
+            E(M, b["p"], None, b["t1"], UE_MODE.MUL_BROADCAST, -1.0); E(M, b["t1"], None, b["t1"], UE_MODE.ADD_BROADCAST, 1.0)
+            step(M, b["t1"], b["q"]); twosum(M, b, b["q"])
+
+        # Chain builders: the same recipe on SramChain names (p, lo = state; s, bv, t1, t2, q, u, w,
+        # x2, tm, sn, cs, pc, pm = temps; D, DL = per-frame increment tables; amp, nz = tables).
+        coef = [((-1) ** ((k - 1) // 2)) / math.factorial(k) for k in (9, 7, 5, 3, 1)]
+
+        def ch_twosum(ch, d):
+            ch.add("s", "p", d); ch.sub("bv", "s", "p")
+            ch.sub("t1", "s", "bv"); ch.sub("t1", "p", "t1")
+            ch.sub("t2", d, "bv"); ch.add("t1", "t1", "t2")
+            ch.add("lo", "lo", "t1"); ch.add("p", "s", "lo")
+            ch.sub("t1", "p", "s"); ch.sub("lo", "lo", "t1")
+
+        def ch_wrap_up(ch, p="p"):
+            ch.step("t2", p, 1.0); ch.sub(p, p, "t2")
+
+        def ch_wrap_dn(ch):
+            ch.muls("t1", "p", -1.0); ch.adds("t1", "t1", 1.0); ch.step("q", "t1", 0.0); ch_twosum(ch, "q")
+
+        def ch_sin2pi_fold(ch, src, dst):
+            ch.step("u", src, 0.25); ch.step("w", src, 0.75)
+            ch.muls("t2", src, 2.0)
+            ch.muls("t1", "t2", -1.0); ch.adds("t1", "t1", 0.5)
+            ch.mul("t1", "t1", "u"); ch.add("q", src, "t1")
+            ch.adds("t2", "t2", -1.5); ch.mul("t2", "t2", "w")
+            ch.add("q", "q", "t2"); ch.muls("q", "q", 2.0 * math.pi)
+            ch.mul("x2", "q", "q")
+            ch.muls("tm", "x2", coef[0])
+            for c in coef[1:]:
+                ch.adds("tm", "tm", c)
+                if c != coef[-1]:
+                    ch.mul("tm", "tm", "x2")
+            ch.mul(dst, "tm", "q")
+
+        def ch_emit_sine(ch, src, out):
+            ch_sin2pi_fold(ch, src, "sn")
+            ch.adds("pc", src, 0.25); ch_wrap_up(ch, "pc")
+            ch_sin2pi_fold(ch, "pc", "cs")
+            ch.muls("t1", "lo", 2.0 * math.pi); ch.mul("t1", "t1", "cs"); ch.add(out, "sn", "t1")
+
+        def emit_step(j, update):
+            """One fine step j for all frames as ONE chain: optional state update (`update` is
+            None for the first step of a direction, "up" = two-sum with U + wrap-up, "dn" =
+            two-sum with N + wrap-down and the phase is read as p - 1), then the sine lanes
+            amplitude*uv + noise_j into fn["o"]; then the unchanged time-major scatter (row
+            300 r + j, + head rows), plus the reflect pads torch.stft(center=True) would add:
+            head row 64-m <- sample m (m = j, r = 0), tail row S+k <- sample S-2-k."""
+            def build(ch):
+                ch.inputs["p"] = fn["p"]; ch.inputs["lo"] = fn["lo"]
+                ch.inputs["amp"] = AMP; ch.inputs["nz"] = NOISE + j * blk
+                if update == "up":
+                    ch.inputs["D"] = UH; ch.inputs["DL"] = UL
+                    ch_twosum(ch, "D"); ch.add("lo", "lo", "DL"); ch_wrap_up(ch)
+                elif update == "dn":
+                    ch.inputs["D"] = NH; ch.inputs["DL"] = NL
+                    ch_twosum(ch, "D"); ch.add("lo", "lo", "DL"); ch_wrap_dn(ch)
+                if j < half:                         # counting down: phase held as q = p + 1
+                    ch.adds("pm", "p", -1.0); src = "pm"
+                else:
+                    src = "p"
+                ch_emit_sine(ch, src, "o"); ch.mul("o", "o", "amp"); ch.add("o", "o", "nz")
+                ch.outputs["o"] = fn["o"]
+                if update is not None:
+                    ch.outputs["p"] = fn["p"]; ch.outputs["lo"] = fn["lo"]
+            # T_fp is the level-0 frame Dim: row-sharded when engines > 1 (row-local: frame r's
+            # state and sine lane come from frame r only).
+            self._chain_region(T_fp, V, build, kind="sinegen")
+            o = fn["o"]
+            base = OUTB + (self.GEN_HEAD_ROWS + j) * row
+            # Scatter over ALL T_fp frame rows (sharded), not just the T_f real ones: rows
+            # [T_f, T_fp) of `o` are exact zeros (AMP and NOISE are zero past T_f), so they land as
+            # zeros in OUTB rows >= S -- the same value the initial zero-fill left there. The one
+            # thing they would clobber is the tail reflect pad (rows S+0..S+9, written by the
+            # up-counting steps j >= 289 and then overwritten by the down-counting steps j <= 9),
+            # so the tail pads are captured per step into LAST[k] and written AFTER every step.
+            self._row_loop_region(T_fp, reads=[(o, row, V, 0)], writes=[(base, UP * row, V, 0)],
+                                  kind="sinescatter")
+            if 1 <= j <= gen.stft.filter_length // 2:                       # head: x[-m] = x[m]
+                _pbi_row_loop(ue, 1, reads=[(o, 0, V, 0)],
+                              writes=[(OUTB + (self.GEN_HEAD_ROWS - j) * row, 0, V, 0)])
+            k = UP - 2 - j
+            if 0 <= k < gen.stft.filter_length // 2:                        # tail: x[S+k] = x[S-2-k]
+                # LAST[k] <- o[T_f - 1] (row index T_f - 1 = row_start T_f on a base one row back);
+                # the write to OUTB row S+k is deferred to tail_pads() below.
+                _pbi_row_loop(ue, 1, reads=[(o - row, row, V, 0)], writes=[(LAST + k * row, 0, V, 0)], row_start=T_f)
+
+        def tail_pads():
+            """x[S+k] = x[S-2-k] for k < n_fft/2, from the per-step LAST[k] captures. Emitted once,
+            after the last fine step, so the sharded pad-frame scatters cannot overwrite them."""
+            for k in range(gen.stft.filter_length // 2):
+                _pbi_row_loop(ue, 1, reads=[(LAST + k * row, 0, V, 0)],
+                              writes=[(OUTB + self.GEN_HEAD_ROWS * row, row, V, 0)],
+                              row_start=S, row_start_off=k)
+
+        # ---- 0. the time-major buffer must be finite everywhere the STFT blocks can read ----
+        self._zero_rows(OUTB, V, R)
+        # ---- 1. frame accumulator ----
+        E(1, DH, None, fr["p"], UE_MODE.MUL_BROADCAST, 0.0); E(1, DH, None, fr["lo"], UE_MODE.MUL_BROADCAST, 0.0)
+        for r in range(cap_f):
+            twosum(1, fr, DH + r * row); E(1, fr["lo"], DL + r * row, fr["lo"], UE_MODE.ELTWISE_ADD); wrap_up(1, fr)
+            E(1, fr["p"], None, PF + r * row, UE_MODE.MUL_BROADCAST, 1.0)
+            E(1, fr["lo"], None, PFL + r * row, UE_MODE.MUL_BROADCAST, 1.0)
+        # ---- 2a. fine steps counting up: j = 150 .. 299 ----
+        E(T_fp, PF, None, fn["p"], UE_MODE.MUL_BROADCAST, 1.0); E(T_fp, PFL, None, fn["lo"], UE_MODE.MUL_BROADCAST, 1.0)
+        E(T_fp, UH, None, fn["x2"], UE_MODE.MUL_BROADCAST, 0.5); E(T_fp, UL, None, fn["tm"], UE_MODE.MUL_BROADCAST, 0.5)
+        twosum(T_fp, fn, fn["x2"]); E(T_fp, fn["lo"], fn["tm"], fn["lo"], UE_MODE.ELTWISE_ADD); wrap_up(T_fp, fn)
+        emit_step(half, None)
+        for jj in range(half + 1, UP):
+            emit_step(jj, "up")
+        # ---- 2b. counting down: j = 149 .. 0, phase held as q = p + 1 ----
+        E(T_fp, PF, None, fn["p"], UE_MODE.MUL_BROADCAST, 1.0); E(T_fp, PFL, None, fn["lo"], UE_MODE.MUL_BROADCAST, 1.0)
+        twosum(T_fp, fn, ONES)
+        E(T_fp, NH, None, fn["x2"], UE_MODE.MUL_BROADCAST, 0.5); E(T_fp, NL, None, fn["tm"], UE_MODE.MUL_BROADCAST, 0.5)
+        twosum(T_fp, fn, fn["x2"]); E(T_fp, fn["lo"], fn["tm"], fn["lo"], UE_MODE.ELTWISE_ADD); wrap_dn(T_fp, fn)
+        emit_step(half - 1, None)
+        for jj in range(half - 2, -1, -1):
+            emit_step(jj, "dn")
+        tail_pads()
+        # ---- 3. sine_merge = tanh(l_linear(sines)) over the whole time-major buffer ----
+        # R is a cap-sized int, not a level Dim: the merge matmul and the tanh chain stay on the primary.
+        lin = gen.m_source.l_linear
+        Wl = torch.zeros(V, V, dtype=torch.bfloat16); Wl[0, :H] = _bf16(lin.weight.reshape(-1))
+        bl = torch.zeros(V, dtype=torch.bfloat16); bl[0] = _bf16(lin.bias.reshape(-1))
+        MERGE = ue.allocate_tensor_dram(R * row)
+        _dyn_matmul(ue, M=R, K=V, N=V, A_DRAM_ADDR=OUTB, B_DRAM_ADDR=self._up(Wl), OUTPUT_DRAM_ADDR=MERGE,
+                    C_DRAM_ADDR=self._up(bl), bias_mode="broadcast_N")
+        self._tanh(R, V, MERGE, MERGE)                                       # SRAM chain (primary)
+        # ---- 4. column 0 -> contiguous signal: transpose [R, 64] -> [64, R]; row 0 is x_pad ----
+        XP = ue.allocate_tensor_dram(V * R * 2)
+        _dyn_transpose(ue, M=R, N=V, INPUT_DRAM_ADDR=MERGE, OUTPUT_DRAM_ADDR=XP, IDENTITY_DRAM_ADDR=ident)
+        # ---- 5. STFT: spec block b = x_pad[48 + 320 b : +384] @ B^T, frames 64b..64b+63 ----
+        n_fft, hop = gen.stft.filter_length, gen.stft.hop_length
+        n_bins = n_fft // 2 + 1
+        Bre, Bim = self._stft_basis(n_fft, hop)
+        RE = ue.allocate_tensor_dram(n_blocks * 64 * row)
+        IM = ue.allocate_tensor_dram(n_blocks * 64 * row)
+        REraw = ue.allocate_tensor_dram(n_blocks * 64 * row)
+        IMraw = ue.allocate_tensor_dram(n_blocks * 64 * row)
+        self._dbg = dict(OUTB=OUTB, XP=XP, RE=REraw, IM=IMraw, R=R)
+        off0 = self.GEN_HEAD_ROWS - n_fft // 2 - 6          # 48: first block's read start (8 B aligned)
+        GW = ue.allocate_tensor_dram(n_blocks * self.GEN_STFT_K * 2)
+        _pbi_row_loop(ue, n_blocks, reads=[(XP + off0 * 2, 64 * hop * 2, self.GEN_STFT_K, 0)],
+                      writes=[(GW, self.GEN_STFT_K * 2, self.GEN_STFT_K, 0)])
+        self._static_matmul(n_blocks, self.GEN_STFT_K, 64 * V, GW, self._up(Bre), RE, kind="stft")
+        self._static_matmul(n_blocks, self.GEN_STFT_K, 64 * V, GW, self._up(Bim), IM, kind="stft")
+        # ---- 6. CORDIC vectoring (SRAM chain): |z| into RE, atan2(im, re) into Z ----
+        Mf_cap = n_blocks * 64
+        Mf = F_rows_p                              # runtime rows (== T2p); buffers stay cap-sized
+        T1, Z = [ue.allocate_tensor_dram(Mf_cap * row) for _ in range(2)]
+        self._cordic(Mf, RE, IM, Z, REraw, IMraw)
+        # ---- 7. har = [mag(0..10) | phase(11..21) | 0]: two selection matmuls ----
+        S1 = torch.zeros(V, V, dtype=torch.bfloat16); S2 = torch.zeros(V, V, dtype=torch.bfloat16)
+        for k in range(n_bins):
+            S1[k, k] = 1.0; S2[n_bins + k, k] = 1.0
+        _dyn_matmul(ue, M=Mf, K=V, N=V, A_DRAM_ADDR=RE, B_DRAM_ADDR=self._up(S1), OUTPUT_DRAM_ADDR=T1)
+        _dyn_matmul(ue, M=Mf, K=V, N=V, A_DRAM_ADDR=Z, B_DRAM_ADDR=self._up(S2), OUTPUT_DRAM_ADDR=HAR,
+                    C_DRAM_ADDR=T1, bias_mode="full_matrix")
+        # rows [F, F+64): the convs' right zero-padding (frame F would otherwise carry the tail)
+        self._zero_rows(HAR, V, V, row_start=F_rows)
+
+    def _source_har_dram(self, tables, T_f, T_fp, S, F_rows, F_rows_p, HAR):
         """Section 5c on device. T_f: frames (Dim, 2*nf). S: samples (Dim, 300*T_f). F_rows: STFT
         frames (Dim, S/5 + 1). Writes har [F_cap, 64] (mag in cols 0..10, phase 11..21, 0 after)
         into HAR (live, cap-sized). Everything is unrolled at the caps; the runtime lengths only
@@ -3266,7 +4265,10 @@ class GeneratorFPGA:
         LAST = ue.allocate_tensor_dram(row)
 
         def E(M, a, b, o, mode, sc=None):
-            ue.eltwise_core_dram(M, V, a, b, o, mode, scalar=sc)
+            # Runtime row count (a Dim) where the caller passes one: the per-step sine ops used to
+            # run at cap_f (1024 frames) and the CORDIC at the 65536-frame cap regardless of the
+            # prompt, which was ~half the 4.4 s this program took at 254 frames.
+            _dyn_eltwise(ue, M, V, a, b, o, mode=mode, scalar=sc)
 
         def twosum(M, b, d):
             E(M, b["p"], d, b["s"], UE_MODE.ELTWISE_ADD); E(M, b["s"], b["p"], b["bv"], UE_MODE.ELTWISE_SUB)
@@ -3277,8 +4279,8 @@ class GeneratorFPGA:
 
         def step(M, src, dst):
             E(M, src, None, dst, UE_MODE.MUL_BROADCAST, GEN_STEP_RAMP)
-            ue.activation_core(M=M, N=V, A_DRAM_ADDR=dst, OUTPUT_DRAM_ADDR=dst, IDENTITY_DRAM_ADDR=ident,
-                               activation="clamp", clamp_min=0.0, clamp_max=1.0)
+            _dyn_activation(ue, M=M, N=V, A_DRAM_ADDR=dst, OUTPUT_DRAM_ADDR=dst, IDENTITY_DRAM_ADDR=ident,
+                            activation="clamp", clamp_min=0.0, clamp_max=1.0)
 
         def wrap_up(M, b):
             E(M, b["p"], None, b["t1"], UE_MODE.ADD_BROADCAST, -1.0); step(M, b["t1"], b["t2"])
@@ -3319,9 +4321,9 @@ class GeneratorFPGA:
             time-major row 300 r + j (+ head rows), plus the reflect pads torch.stft(center=True)
             would add: head row 64-m <- sample m (m = j, r = 0), tail row S+k <- sample S-2-k."""
             o = fn["o"]
-            emit_sine(cap_f, fn, src, o)
-            E(cap_f, o, AMP, o, UE_MODE.ELTWISE_MUL)
-            E(cap_f, o, NOISE + j * blk, o, UE_MODE.ELTWISE_ADD)
+            emit_sine(T_fp, fn, src, o)
+            E(T_fp, o, AMP, o, UE_MODE.ELTWISE_MUL)
+            E(T_fp, o, NOISE + j * blk, o, UE_MODE.ELTWISE_ADD)
             base = OUTB + (self.GEN_HEAD_ROWS + j) * row
             _pbi_row_loop(ue, T_f, reads=[(o, row, V, 0)], writes=[(base, UP * row, V, 0)])
             if 1 <= j <= gen.stft.filter_length // 2:                       # head: x[-m] = x[m]
@@ -3343,23 +4345,23 @@ class GeneratorFPGA:
             E(1, fr["p"], None, PF + r * row, UE_MODE.MUL_BROADCAST, 1.0)
             E(1, fr["lo"], None, PFL + r * row, UE_MODE.MUL_BROADCAST, 1.0)
         # ---- 2a. fine steps counting up: j = 150 .. 299 ----
-        E(cap_f, PF, None, fn["p"], UE_MODE.MUL_BROADCAST, 1.0); E(cap_f, PFL, None, fn["lo"], UE_MODE.MUL_BROADCAST, 1.0)
-        E(cap_f, UH, None, fn["x2"], UE_MODE.MUL_BROADCAST, 0.5); E(cap_f, UL, None, fn["tm"], UE_MODE.MUL_BROADCAST, 0.5)
-        twosum(cap_f, fn, fn["x2"]); E(cap_f, fn["lo"], fn["tm"], fn["lo"], UE_MODE.ELTWISE_ADD); wrap_up(cap_f, fn)
+        E(T_fp, PF, None, fn["p"], UE_MODE.MUL_BROADCAST, 1.0); E(T_fp, PFL, None, fn["lo"], UE_MODE.MUL_BROADCAST, 1.0)
+        E(T_fp, UH, None, fn["x2"], UE_MODE.MUL_BROADCAST, 0.5); E(T_fp, UL, None, fn["tm"], UE_MODE.MUL_BROADCAST, 0.5)
+        twosum(T_fp, fn, fn["x2"]); E(T_fp, fn["lo"], fn["tm"], fn["lo"], UE_MODE.ELTWISE_ADD); wrap_up(T_fp, fn)
         emit_step(half, fn["p"])
         for jj in range(half + 1, UP):
-            twosum(cap_f, fn, UH); E(cap_f, fn["lo"], UL, fn["lo"], UE_MODE.ELTWISE_ADD); wrap_up(cap_f, fn)
+            twosum(T_fp, fn, UH); E(T_fp, fn["lo"], UL, fn["lo"], UE_MODE.ELTWISE_ADD); wrap_up(T_fp, fn)
             emit_step(jj, fn["p"])
         # ---- 2b. counting down: j = 149 .. 0, phase held as q = p + 1 ----
-        E(cap_f, PF, None, fn["p"], UE_MODE.MUL_BROADCAST, 1.0); E(cap_f, PFL, None, fn["lo"], UE_MODE.MUL_BROADCAST, 1.0)
-        twosum(cap_f, fn, ONES)
-        E(cap_f, NH, None, fn["x2"], UE_MODE.MUL_BROADCAST, 0.5); E(cap_f, NL, None, fn["tm"], UE_MODE.MUL_BROADCAST, 0.5)
-        twosum(cap_f, fn, fn["x2"]); E(cap_f, fn["lo"], fn["tm"], fn["lo"], UE_MODE.ELTWISE_ADD); wrap_dn(cap_f, fn)
-        E(cap_f, fn["p"], None, fn["pm"], UE_MODE.ADD_BROADCAST, -1.0)
+        E(T_fp, PF, None, fn["p"], UE_MODE.MUL_BROADCAST, 1.0); E(T_fp, PFL, None, fn["lo"], UE_MODE.MUL_BROADCAST, 1.0)
+        twosum(T_fp, fn, ONES)
+        E(T_fp, NH, None, fn["x2"], UE_MODE.MUL_BROADCAST, 0.5); E(T_fp, NL, None, fn["tm"], UE_MODE.MUL_BROADCAST, 0.5)
+        twosum(T_fp, fn, fn["x2"]); E(T_fp, fn["lo"], fn["tm"], fn["lo"], UE_MODE.ELTWISE_ADD); wrap_dn(T_fp, fn)
+        E(T_fp, fn["p"], None, fn["pm"], UE_MODE.ADD_BROADCAST, -1.0)
         emit_step(half - 1, fn["pm"])
         for jj in range(half - 2, -1, -1):
-            twosum(cap_f, fn, NH); E(cap_f, fn["lo"], NL, fn["lo"], UE_MODE.ELTWISE_ADD); wrap_dn(cap_f, fn)
-            E(cap_f, fn["p"], None, fn["pm"], UE_MODE.ADD_BROADCAST, -1.0)
+            twosum(T_fp, fn, NH); E(T_fp, fn["lo"], NL, fn["lo"], UE_MODE.ELTWISE_ADD); wrap_dn(T_fp, fn)
+            E(T_fp, fn["p"], None, fn["pm"], UE_MODE.ADD_BROADCAST, -1.0)
             emit_step(jj, fn["pm"])
         # ---- 3. sine_merge = tanh(l_linear(sines)) over the whole time-major buffer ----
         lin = gen.m_source.l_linear
@@ -3368,7 +4370,7 @@ class GeneratorFPGA:
         MERGE = ue.allocate_tensor_dram(R * row)
         _dyn_matmul(ue, M=R, K=V, N=V, A_DRAM_ADDR=OUTB, B_DRAM_ADDR=self._up(Wl), OUTPUT_DRAM_ADDR=MERGE,
                     C_DRAM_ADDR=self._up(bl), bias_mode="broadcast_N")
-        self._tanh(R, V, MERGE, MERGE)
+        self._tanh_dram(R, V, MERGE, MERGE)
         # ---- 4. column 0 -> contiguous signal: transpose [R, 64] -> [64, R]; row 0 is x_pad ----
         XP = ue.allocate_tensor_dram(V * R * 2)
         _dyn_transpose(ue, M=R, N=V, INPUT_DRAM_ADDR=MERGE, OUTPUT_DRAM_ADDR=XP, IDENTITY_DRAM_ADDR=ident)
@@ -3382,45 +4384,20 @@ class GeneratorFPGA:
         IMraw = ue.allocate_tensor_dram(n_blocks * 64 * row)
         self._dbg = dict(OUTB=OUTB, XP=XP, RE=REraw, IM=IMraw, R=R)
         off0 = self.GEN_HEAD_ROWS - n_fft // 2 - 6          # 48: first block's read start (8 B aligned)
-        for b in range(n_blocks):
-            a = XP + (off0 + 64 * hop * b) * 2
-            ue.matmat_mul_core(M=1, K=self.GEN_STFT_K, N=64 * V, A_DRAM_ADDR=a, B_DRAM_ADDR=self._up(Bre),
-                               OUTPUT_DRAM_ADDR=RE + b * 64 * row)
-            ue.matmat_mul_core(M=1, K=self.GEN_STFT_K, N=64 * V, A_DRAM_ADDR=a, B_DRAM_ADDR=self._up(Bim),
-                               OUTPUT_DRAM_ADDR=IM + b * 64 * row)
+        # Gather every block's 384-sample window into one [n_blocks, 384] operand and run TWO
+        # matmuls (re, im) instead of 2*n_blocks M=1 matmuls. Each M=1 call re-streamed the 3 MB
+        # basis, 6.3 GB per run; the gathered form streams it a handful of times. Output row b is
+        # the block's 64 frame rows, exactly the RE + b*64*row layout the M=1 loop produced.
+        GW = ue.allocate_tensor_dram(n_blocks * self.GEN_STFT_K * 2)
+        _pbi_row_loop(ue, n_blocks, reads=[(XP + off0 * 2, 64 * hop * 2, self.GEN_STFT_K, 0)],
+                      writes=[(GW, self.GEN_STFT_K * 2, self.GEN_STFT_K, 0)])
+        self._static_matmul(n_blocks, self.GEN_STFT_K, 64 * V, GW, self._up(Bre), RE, kind="stft")
+        self._static_matmul(n_blocks, self.GEN_STFT_K, 64 * V, GW, self._up(Bim), IM, kind="stft")
         # ---- 6. CORDIC vectoring: |z| and atan2(im, re), rows = all cap frames ----
-        Mf = n_blocks * 64
-        SX, SY, T1, T2, Z = [ue.allocate_tensor_dram(Mf * row) for _ in range(5)]
-        E(Mf, RE, None, REraw, UE_MODE.MUL_BROADCAST, 1.0)                   # debug copies (pre-CORDIC)
-        E(Mf, IM, None, IMraw, UE_MODE.MUL_BROADCAST, 1.0)
-        # The spectrum bins are ~1e-2 and the clamp step's soft band is 1/GEN_STEP_RAMP = 2.4e-4:
-        # unscaled, a few percent of the (near-empty) bins got a FRACTIONAL quadrant sign, i.e. a
-        # garbage angle -- 10 dB off the model's own noise floor at conv_post. The angle is
-        # scale-invariant, so scale up first (exact in bf16) and fold 1/scale into the gain.
-        PRE = 1024.0
-        E(Mf, RE, None, RE, UE_MODE.MUL_BROADCAST, PRE)
-        E(Mf, IM, None, IM, UE_MODE.MUL_BROADCAST, PRE)
-        iters = 8
-        Kg = 1.0
-        for k in range(iters):
-            Kg *= math.sqrt(1.0 + 2.0 ** (-2 * k))
-
-        def sign(src, dst):
-            step(Mf, src, dst); E(Mf, dst, None, dst, UE_MODE.MUL_BROADCAST, 2.0); E(Mf, dst, None, dst, UE_MODE.ADD_BROADCAST, -1.0)
-        step(Mf, RE, T1); E(Mf, T1, None, T1, UE_MODE.MUL_BROADCAST, -1.0); E(Mf, T1, None, T1, UE_MODE.ADD_BROADCAST, 1.0)
-        # Quadrant sign with sign(0) = +1: the DC and Nyquist bins are purely real (im == 0 exactly),
-        # where torch.angle gives atan2(0, x<0) = +pi. A plain clamp step gives sign(0) = -1, i.e.
-        # -pi: a systematic 2*pi error on the STRONGEST channel (82% of DC frames in simulation).
-        E(Mf, IM, None, T2, UE_MODE.ADD_BROADCAST, 4.0 / GEN_STEP_RAMP)   # > the step band, << PRE-scaled bins
-        sign(T2, SY); E(Mf, T1, SY, Z, UE_MODE.ELTWISE_MUL); E(Mf, Z, None, Z, UE_MODE.MUL_BROADCAST, math.pi)
-        sign(RE, SX); E(Mf, RE, SX, RE, UE_MODE.ELTWISE_MUL); E(Mf, IM, SX, IM, UE_MODE.ELTWISE_MUL)
-        for k in range(iters):
-            sign(IM, SY)
-            E(Mf, IM, SY, T1, UE_MODE.ELTWISE_MUL); E(Mf, T1, None, T1, UE_MODE.MUL_BROADCAST, 2.0 ** (-k))
-            E(Mf, RE, SY, T2, UE_MODE.ELTWISE_MUL); E(Mf, T2, None, T2, UE_MODE.MUL_BROADCAST, 2.0 ** (-k))
-            E(Mf, RE, T1, RE, UE_MODE.ELTWISE_ADD); E(Mf, IM, T2, IM, UE_MODE.ELTWISE_SUB)
-            E(Mf, SY, None, T1, UE_MODE.MUL_BROADCAST, math.atan(2.0 ** (-k))); E(Mf, Z, T1, Z, UE_MODE.ELTWISE_ADD)
-        E(Mf, RE, None, RE, UE_MODE.MUL_BROADCAST, 1.0 / (Kg * PRE))         # magnitude
+        Mf_cap = n_blocks * 64
+        Mf = F_rows_p                              # runtime rows (== T2p); buffers stay cap-sized
+        SX, SY, T1, T2, Z = [ue.allocate_tensor_dram(Mf_cap * row) for _ in range(5)]
+        self._cordic_dram(Mf, RE, IM, Z, SX, SY, T1, T2, REraw, IMraw)
         # ---- 7. har = [mag(0..10) | phase(11..21) | 0]: two selection matmuls ----
         S1 = torch.zeros(V, V, dtype=torch.bfloat16); S2 = torch.zeros(V, V, dtype=torch.bfloat16)
         for k in range(n_bins):
@@ -3431,7 +4408,42 @@ class GeneratorFPGA:
         # rows [F, F+64): the convs' right zero-padding (frame F would otherwise carry the tail)
         self._zero_rows(HAR, V, V, row_start=F_rows)
 
-    def _tanh(self, M, N, x, out, x_split=0.6):
+    def _tanh(self, M, N, x, out, x_split=0.625):
+        """tanh as one SRAM chain, same split as _tanh_dram: |x| < x_split uses the odd Taylor
+        series (relative precision where tanh ~ x), |x| >= x_split uses the closed form
+        tanh(|x|) = (1 - u) / (1 + u), u = exp(-2|x|), with 1/(1+u) by two Newton steps from
+        v0 = 1 - u + u^2 (u <= 0.29 there, so v0 is within 3% and two steps reach bf16
+        precision) -- no sigmoid matvec pass and no division. The Taylor branch is left
+        unclamped: it is finite for any bf16 x and multiplied by exactly (1 - s) = 0 where the
+        closed form takes over. x_split must be bf16-representable (0.625 is; 0.6 is not)."""
+        assert float(torch.tensor(x_split).bfloat16()) == x_split, x_split
+        ch = SramChain(self.ue, M, N, tile_rows=self._chain_tile_rows(N))
+        ch.inputs["x"] = x
+        ch.outputs["out"] = out
+        ch.step("sg", "x", 0.0); ch.muls("sg", "sg", 2.0); ch.adds("sg", "sg", -1.0)   # sign(x), sign(0)=+1
+        ch.mul("ax", "x", "sg")                                                            # |x|
+        ch.step("s", "ax", x_split)                                                        # blend weight
+        ch.muls("u", "ax", -2.0); ch.exp("u", "u")                                         # u = e^(-2|x|)
+        ch.adds("w", "u", 1.0)
+        ch.mul("v", "u", "u"); ch.sub("v", "v", "u"); ch.adds("v", "v", 1.0)               # v0 ~ 1/(1+u)
+        for _ in range(2):
+            ch.mul("t", "w", "v"); ch.muls("t", "t", -1.0); ch.adds("t", "t", 2.0); ch.mul("v", "v", "t")
+        ch.muls("b", "u", -1.0); ch.adds("b", "b", 1.0); ch.mul("b", "b", "v"); ch.mul("b", "b", "sg")
+        ch.mul("x2", "x", "x")
+        coef = (-17.0 / 315.0, 2.0 / 15.0, -1.0 / 3.0, 1.0)
+        ch.muls("poly", "x2", coef[0])
+        for c in coef[1:]:
+            ch.adds("poly", "poly", c)
+            if c != coef[-1]:
+                ch.mul("poly", "poly", "x2")
+        ch.mul("poly", "poly", "x")
+        # Blend as poly*(1-s) + b*s, NOT poly + s*(b - poly): the unclamped poly reaches ~1e4 at
+        # |x| = 6 and the second form cancels two bf16 numbers of that size (128 left over).
+        ch.muls("d", "s", -1.0); ch.adds("d", "d", 1.0)
+        ch.mul("poly", "poly", "d"); ch.mul("b", "b", "s"); ch.add("out", "poly", "b")
+        ch.emit()
+
+    def _tanh_dram(self, M, N, x, out, x_split=0.6):
         """tanh without the 2*sigmoid(2x)-1 cancellation: sigmoid lands near 0.5 for small x, where
         bf16 has 2^-9 resolution, so that form caps the SOURCE signal at ~32 dB (measured in the
         5c bisect). Here |x| < x_split uses the odd Taylor series x - x^3/3 + 2x^5/15 - 17x^7/315
@@ -3495,19 +4507,24 @@ class GeneratorFPGA:
         ue = self.ue
         V = UE_VECTOR_SIZE
         cap = _template(T_out)
-        g = ue.allocate_tensor_dram(cap * V * 2)
         acc = [ue.allocate_tensor_dram(cap * Cout * 2) for _ in range(2)]
+        # Gather every tap's rows first (primary), then all k matmuls as one sharded region: the
+        # gathers only depend on HAR, so they need no barrier between them, and the taps chain on
+        # their own rows. k gather buffers instead of one reused one.
+        gs = [ue.allocate_tensor_dram(cap * V * 2) for _ in range(k)]
+        taps = []
         for kk in range(k):
             # source row = stride*t + (kk - pad): a negative start for kk < pad reads the zero rows
             # that precede HAR (HAR is allocated with a 64-row zero prefix).
             src = HAR + (kk - pad) * V * 2
-            _pbi_row_loop(ue, T_out, reads=[(src, stride * V * 2, V, 0)], writes=[(g, V * 2, V, 0)])
+            self._row_loop_region(T_out, reads=[(src, stride * V * 2, V, 0)], writes=[(gs[kk], V * 2, V, 0)],
+                                  kind="noisegather")
             wk = _bf16(_pad_dim(W[:, :, kk].contiguous(), 1, V))            # [Cout, 64]
             last = kk == k - 1
-            _dyn_matmul(ue, M=T_out, K=V, N=Cout, A_DRAM_ADDR=g, B_DRAM_ADDR=self._up(wk),
-                        OUTPUT_DRAM_ADDR=(out if last else acc[kk % 2]),
-                        C_DRAM_ADDR=(self._up(b) if kk == 0 else acc[(kk - 1) % 2]),
-                        bias_mode=("broadcast_N" if kk == 0 else "full_matrix"))
+            taps.append((gs[kk], self._up(wk), (out if last else acc[kk % 2]),
+                         (self._up(b) if kk == 0 else acc[(kk - 1) % 2]),
+                         ("broadcast_N" if kk == 0 else "full_matrix")))
+        self._tap_matmuls(T_out, V, Cout, taps, kind="noise0")
 
     # ---- Section 5d: exp / sin -> complex spectrum -> iSTFT --------------------------------------
     GEN_EXP_C = 14.0            # softmax anchor: exp(x) = softmax([x.., C, -inf..]) * e^C, x <= ~4
@@ -3568,6 +4585,89 @@ class GeneratorFPGA:
         return self._const[key]
 
     def _istft(self, y, T, real_T, S, OUT):
+        """y [T, 64] = conv_post output (log-mag 0..10 | phase 11..21). OUT [S_cap] = audio samples.
+        SRAM-chain version of _istft_dram: exp of the log-magnitude lanes is the chain's exact
+        eltwise EXP (no softmax anchoring; the lanes are <= ~4 so it is bounded), phi = sin(x) by
+        the wrapped-phase path and cos(phi)/sin(phi) by the bounded Taylor pairs, all in ONE
+        chain over [T, 64] with re/im out. The dead lanes (cols >= 11) hold exp(0) = 1 and are
+        dropped by the S1/S2 selection matmuls exactly as before. iSTFT = one gathered matmul."""
+        ue = self.ue
+        gen = self.gen
+        V = UE_VECTOR_SIZE
+        n_fft, hop = gen.stft.filter_length, gen.stft.hop_length
+        nb = n_fft // 2 + 1
+        cap = _template(T)
+        row = V * 2
+        # --- lane selection: log-mag lanes -> rowp (cols 0..10), phase lanes -> ph (cols 0..10) ---
+        Ssel = torch.zeros(V, V, dtype=torch.bfloat16)
+        Sph = torch.zeros(V, V, dtype=torch.bfloat16)
+        for k in range(nb):
+            Ssel[k, k] = 1.0
+            Sph[k, nb + k] = 1.0
+        rowp = ue.allocate_tensor_dram(cap * row)
+        ph = ue.allocate_tensor_dram(cap * row)
+        _dyn_matmul(ue, M=T, K=V, N=V, A_DRAM_ADDR=y, B_DRAM_ADDR=self._up(Ssel), OUTPUT_DRAM_ADDR=rowp)
+        _dyn_matmul(ue, M=T, K=V, N=V, A_DRAM_ADDR=y, B_DRAM_ADDR=self._up(Sph), OUTPUT_DRAM_ADDR=ph)
+        # --- one chain: spec = exp(logmag); phi = sin(x); re = spec cos(phi), im = spec sin(phi) ---
+        spec, phi, sn, cs, re, im = [ue.allocate_tensor_dram(cap * row) for _ in range(6)]
+        coef = [((-1) ** ((k - 1) // 2)) / math.factorial(k) for k in (9, 7, 5, 3, 1)]
+
+        def build(ch):
+            ch.inputs["lm"] = rowp; ch.inputs["ph"] = ph
+            for name, buf in (("spec", spec), ("phi", phi), ("sn", sn), ("cs", cs), ("re", re), ("im", im)):
+                ch.outputs[name] = buf
+            ch.exp("spec", "lm")
+            # The model's angle is phi = sin(x) (TorchSTFT.inverse gets `phase = torch.sin(x)` and
+            # forms spec * exp(1j * phase)): sin(x) = sin(2 pi p), p = x / 2pi, by magic-round mod 1,
+            # wrap, quarter-wave fold and the degree-9 Taylor (the Snake path).
+            ch.muls("p", "ph", 1.0 / (2.0 * math.pi))
+            ch.round("n", "p"); ch.sub("pf", "p", "n"); ch.adds("pf", "pf", 1.0)
+            ch.step("s", "pf", 1.0); ch.sub("pf", "pf", "s")
+            ch.step("u", "pf", 0.25); ch.step("w", "pf", 0.75)
+            ch.muls("v", "pf", -2.0); ch.adds("v", "v", 0.5); ch.mul("v", "v", "u"); ch.add("q", "pf", "v")
+            ch.muls("v", "pf", 2.0); ch.adds("v", "v", -1.5); ch.mul("v", "v", "w"); ch.add("q", "q", "v")
+            ch.muls("q", "q", 2.0 * math.pi)
+            ch.mul("x2", "q", "q")
+            ch.muls("tm", "x2", coef[0])
+            for c in coef[1:]:
+                ch.adds("tm", "tm", c)
+                if c != coef[-1]:
+                    ch.mul("tm", "tm", "x2")
+            ch.mul("phi", "tm", "q")                                              # phi = sin(x), |phi| <= 1
+            # cos(phi), sin(phi): bounded degree-6/7 Taylor
+            ch.mul("x2", "phi", "phi")
+            ch.muls("cs", "x2", -1.0 / 720.0); ch.adds("cs", "cs", 1.0 / 24.0)
+            ch.mul("cs", "cs", "x2"); ch.adds("cs", "cs", -0.5)
+            ch.mul("cs", "cs", "x2"); ch.adds("cs", "cs", 1.0)
+            ch.muls("sn", "x2", -1.0 / 5040.0); ch.adds("sn", "sn", 1.0 / 120.0)
+            ch.mul("sn", "sn", "x2"); ch.adds("sn", "sn", -1.0 / 6.0)
+            ch.mul("sn", "sn", "x2"); ch.adds("sn", "sn", 1.0)
+            ch.mul("sn", "sn", "phi")
+            ch.mul("re", "spec", "cs"); ch.mul("im", "spec", "sn")
+        self._chain_region(T, V, build, kind="istft")       # T is T2p: row-sharded when engines > 1
+        # --- complex rows: [spec*cos (0..10) | spec*sin (11..21) | 0], with 64 zero rows in front ---
+        n_blocks = _template(S) // (64 * hop)
+        SPECB = ue.allocate_tensor_dram((V + cap + 2 * V) * row)
+        SPEC = SPECB + V * row
+        S1 = torch.zeros(V, V, dtype=torch.bfloat16); S2 = torch.zeros(V, V, dtype=torch.bfloat16)
+        for k in range(nb):
+            S1[k, k] = 1.0; S2[nb + k, k] = 1.0
+        tmp = ue.allocate_tensor_dram(cap * row)
+        _dyn_matmul(ue, M=T, K=V, N=V, A_DRAM_ADDR=re, B_DRAM_ADDR=self._up(S1), OUTPUT_DRAM_ADDR=tmp)
+        _dyn_matmul(ue, M=T, K=V, N=V, A_DRAM_ADDR=im, B_DRAM_ADDR=self._up(S2), OUTPUT_DRAM_ADDR=SPEC,
+                    C_DRAM_ADDR=tmp, bias_mode="full_matrix")
+        self._dbg5d = dict(spec=spec, phi=phi, sn=sn, cs=cs, SPEC=SPEC)
+        self._zero_rows(SPECB, V, V)                                       # the 2 (and more) frames before 0
+        self._zero_rows(SPEC, V, 2 * V, row_start=real_T)                  # frames >= F contribute nothing
+        # --- iSTFT: one gathered matmul (see _istft_dram for the layout argument) ---
+        Bi = self._istft_basis(n_fft, hop)
+        K_i = self.GEN_ISTFT_FRAMES * V
+        GW = ue.allocate_tensor_dram(n_blocks * K_i * 2)
+        _pbi_row_loop(ue, n_blocks, reads=[(SPEC - 2 * row, 64 * row, K_i, 0)],
+                      writes=[(GW, K_i * 2, K_i, 0)])
+        self._static_matmul(n_blocks, K_i, 64 * hop, GW, self._up(Bi), OUT, kind="istftmm")
+
+    def _istft_dram(self, y, T, real_T, S, OUT):
         """y [T, 64] = conv_post output (log-mag 0..10 | phase 11..21). OUT [S_cap] = audio samples.
         exp via the softmax epilogue (native LALU exp): row' = [x_0..x_10 | C | -100...], spec =
         softmax(row') * e^C  (the -100 lanes and the 1 + sum e^{x-C} < 1.0003 correction vanish).
@@ -3639,9 +4739,13 @@ class GeneratorFPGA:
         # --- iSTFT ---
         Bi = self._istft_basis(n_fft, hop)
         K_i = self.GEN_ISTFT_FRAMES * V
-        for b in range(n_blocks):
-            ue.matmat_mul_core(M=1, K=K_i, N=64 * hop, A_DRAM_ADDR=SPEC + (64 * b - 2) * row,
-                               B_DRAM_ADDR=self._up(Bi), OUTPUT_DRAM_ADDR=OUT + 64 * hop * b * 2)
+        # Same gather trick as the STFT: block b's 68 frame rows (64b-2 .. 64b+65) become row b of
+        # a [n_blocks, 68*64] operand, one matmul writes 320 contiguous samples per row -- the
+        # audio layout -- instead of n_blocks M=1 calls each re-streaming the 2.8 MB basis.
+        GW = ue.allocate_tensor_dram(n_blocks * K_i * 2)
+        _pbi_row_loop(ue, n_blocks, reads=[(SPEC - 2 * row, 64 * row, K_i, 0)],
+                      writes=[(GW, K_i * 2, K_i, 0)])
+        self._static_matmul(n_blocks, K_i, 64 * hop, GW, self._up(Bi), OUT, kind="istftmm")
 
     # ---- forward ------------------------------------------------------------------------------
     def forward(self, x_gen: torch.Tensor, s: torch.Tensor, F0_curve: torch.Tensor, noise: torch.Tensor,
@@ -3673,6 +4777,10 @@ class GeneratorFPGA:
         self._caps = {0: GEN_T0_CAP, 1: GEN_T1_CAP, 2: GEN_T2_CAP}
         self._live = {}
         self._pool, self._owner = {}, {}
+        self._fused = debug_cpu_ref is None      # see _program/_block
+        self.sched = _SCHED[0] if self._fused else None   # multi-engine only on the fused path
+        if self.sched is not None:
+            set_shard_dims({0: T0p, 1: T1p, 2: T2p})
         F_ = int(T2)
         S = Dim(self.GEN_UP * 2 * nf, GPR_F, mul=self.GEN_UP * 2, cap=self.GEN_UP * GEN_T0_CAP)   # samples
         assert noise.shape == (int(S), self.GEN_HARM), (noise.shape, int(S))
@@ -3702,8 +4810,45 @@ class GeneratorFPGA:
         HARB = ue.allocate_tensor_dram((64 + n_blocks * 64) * V * 2)
         HAR = HARB + 64 * V * 2
         tables = self._source_prep(F0_curve, noise, int(T0))
+        # Reduction masks are LIVE for the whole section and are HOST-uploaded at emit time, so
+        # they must be allocated before any program whose scratch gets rewound. Fused, that is
+        # not optional: a host DMA into reclaimed scratch would overwrite data (SineGen's
+        # tables) that the not-yet-launched program still has to read. Unfused, the earlier
+        # program had already run, which is why this used to sit after it and get away with it.
+        self._mask_vec(1, T1)
+        self._mask_vec(2, T2)
+        if self.sched is not None:
+            # Sharded AdaIN statistics (_stats_sharded): every engine stages its rows into a
+            # private [GEN_IN_CHUNK, C] scratch, transposes it and reduces against a UNIFORM
+            # 1/real_T row (pad rows are zero, so no per-row mask is needed). Live for the
+            # section; the workers' copies come from their own arenas.
+            self._shard_names = {}
+            for Cx in (self.ups[0]["Cout"], self.ups[1]["Cout"]):
+                names = {}
+                for nm, size in (("P", (_SHARD_STAT_CHUNKS * GEN_IN_CHUNK + 1) * Cx * 2),
+                                 ("XT", Cx * GEN_IN_CHUNK * 2), ("PART", 64 * Cx * 2)):
+                    key = f"adain_{nm}{Cx}"
+                    if key not in self.sched._per_engine:
+                        self.sched.register_per_engine(key, ue.allocate_tensor_dram(size), size)
+                    names[nm] = key
+                self._shard_names[Cx] = names
+            for level, real in ((1, T1), (2, T2)):
+                self._live[("umask", level)] = self._up_cap(
+                    torch.full((GEN_IN_CHUNK,), 1.0 / int(real)).to(torch.bfloat16), GEN_IN_CHUNK)
+        if self._fused:
+            ue.start_capture()          # the one capture for the whole generator
+            if self.sched is not None:
+                self.sched.begin_program()   # open the worker captures alongside it
+                # begin_program resets every worker's ISA register allocator to 1. The sharded
+                # bodies address the shard registers (GPR_SHARD_CNT/OFF/TMP) by fixed index on
+                # every engine, so burn the same low block on each worker that _instrument burns
+                # on the primary; the cores' private scratch then starts past it there too.
+                top = max(GPR_SHARD_OFF + GPR_SHARD_TMP)
+                for w in self.sched.workers:
+                    for _ in range(top):
+                        w.alloc_isa_reg()
         self._program(lambda: (self._zero_rows(HARB, V, 64),
-                               self._source_har(tables, T0, S, T2, HAR)))
+                               self._source_har(tables, T0, T0p, S, T2, T2p, HAR)))
         if debug_cpu_ref is not None and debug_cpu_ref.get("har") is not None:
             from user_dma_core import calculate_snr
             # Intermediate probes (scratch is rewound but untouched until the next program runs).
@@ -3779,13 +4924,9 @@ class GeneratorFPGA:
         noise_conv = {
             0: lambda o: self._noise_conv_strided(HAR, T1p, nc0["Cout"], nc0["w"], nc0["b"], nc0["k"],
                                                   nc0["stride"], nc0["pad"], o),
-            1: lambda o: _dyn_matmul(ue, M=T2p, K=V, N=nc1["Cout"], A_DRAM_ADDR=HAR, B_DRAM_ADDR=self._up(W1),
-                                     OUTPUT_DRAM_ADDR=o, C_DRAM_ADDR=self._up(nc1["b"]), bias_mode="broadcast_N"),
+            1: lambda o: self._tap_matmuls(T2p, V, nc1["Cout"],
+                                           [(HAR, self._up(W1), o, self._up(nc1["b"]), "broadcast_N")], kind="noise1"),
         }
-        # Reduction masks are LIVE for the whole section: allocate them before the first block,
-        # since a block rewinds the allocator to its own mark when it finishes.
-        self._mask_vec(1, T1)
-        self._mask_vec(2, T2)
 
         self._owner[x] = (GEN_T0_CAP, C0)          # let the pool recycle the input buffer too
         E = lambda T_, C_, a, b, o, **kw: _dyn_eltwise(ue, T_, C_, a, b, o, **kw)
@@ -3848,6 +4989,18 @@ class GeneratorFPGA:
         # ================= Section 5d: exp/sin + iSTFT -> audio =================
         AUDIO = ue.allocate_tensor_dram(_template(S) * 2)
         self._program(lambda: self._istft(y, T2p, T2, S, AUDIO))
+        if self._fused:
+            if self.sched is not None:
+                # Close/flush the worker programs and launch them first: they park at their
+                # first barrier until the primary (launched by _run below) reaches it.
+                self.sched.finalize()
+                self.sched.start_workers(gpr_sets_by_worker=_SHARD_WORKER_SETS[0])
+            self._run(ue)               # phonemes-to-samples for the generator: one launch
+            if self.sched is not None:
+                # The primary retires its halt as soon as the last rendezvous clears; a worker
+                # may still be draining (pi05 convention). Join them before any readback.
+                for w in self.sched.workers:
+                    w.wait_queue(60.0)
         n_bufs = sum(len(v) for v in self._pool.values()) + len(self._owner)
         report(f"[fpga] Section 5b: {n_bufs} pooled activation buffers, tensor high-water "
                f"{_DRAM_HIGH[0] / 2**20:.0f} MB")
@@ -3972,7 +5125,7 @@ def generator_host_istft(gen, y):
 
 def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: float = 1.0,
                      dev: str = "xdma0", debug: bool = False, dump_programs: str = None,
-                     bin_cache: str = None):
+                     bin_cache: str = None, engines: int = 1):
     """Entry point called from kokoro_test.py --fpga. Only runs the section(s) currently ported to
     hardware (Section 1: PL-BERT) and reports their SNR against the CPU reference, with a bisect
     down to sub-stage granularity within each layer. Deliberately does NOT fall back to running the
@@ -3991,6 +5144,35 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
     _instrument(ue)
     global _SILENT_MODE
     _SILENT_MODE = True   # hide the cores' per-call tiling/FLOP prints
+
+    _ENGINES[0] = int(engines)
+    _SCHED[0] = None
+    _TENSOR_END[0] = KOKORO_TENSOR_END
+    if engines > 1:
+        from multi_engine_shard import MultiEngineScheduler, PrivateArena
+        if bin_cache:
+            report("[fpga] --engines > 1: the frozen image does not carry worker programs yet; "
+                   "compiling this run (no bin cache)")
+            bin_cache = None
+            _BIN_CACHE[0] = None
+        # Private per-engine windows (the runtime-preamble path of start_workers bounds-checks
+        # worker ISA against them), carved above the activation high-water mark.
+        arena = PrivateArena(engines, arena_base=KOKORO_WORKER_BASE,
+                             arena_bytes=engines * KOKORO_WORKER_STRIDE)
+        assert KOKORO_WORKER_BASE + engines * KOKORO_WORKER_STRIDE <= KOKORO_PROGRAM_BASE
+        # master/worker rounds, not the symmetric barrier: the symmetric four-phase handshake
+        # deadlocked at 12 engines (an early finisher clears its flag before a slow engine has
+        # checked it; the race window grows with the engine count -- 2 engines passed, 12 hung
+        # with the work already complete). In a round the master clears only after every worker
+        # acknowledged, so it is edge-safe at any count; gemma3/4 and Qwen use the same mode.
+        sched = MultiEngineScheduler(
+            ue, num_engines=engines, arena=arena,
+            allow_more_than_two_engines=True, allow_unaligned_rows=True,
+            handshake="four_phase", region_rendezvous="master_worker")
+        sched.preclear_flags()
+        _SCHED[0] = sched
+        _TENSOR_END[0] = KOKORO_WORKER_BASE     # activations must stay below the worker arenas
+        report(f"[fpga] multi-engine: {engines} engines, generator conv taps row-sharded")
 
     if bin_cache:
         _manifest = load_bin_cache(ue, bin_cache)
@@ -4032,11 +5214,16 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
 
         input_ids_b = input_ids.unsqueeze(0)
         text_mask = torch.zeros(1, T, dtype=torch.bool)
-        bert_dur_cpu = model.bert(input_ids_b, attention_mask=(~text_mask).int())
-        d_en_cpu = model.bert_encoder(bert_dur_cpu).transpose(-1, -2).squeeze(0)  # [512, T]
         from user_dma_core import calculate_snr
-        snr_db = calculate_snr(d_en_cpu.reshape(-1), d_en.reshape(-1))
-        report_snr(f"[fpga] Section 1 (PL-BERT) end-to-end SNR vs CPU: {snr_db:.2f} dB")
+        # Every *_cpu value below is a CPU reference that feeds only report_snr / _check probes
+        # (silent unless --debug-snr), so it is computed only under `debug`; the pipeline's real
+        # host-side inputs (input_ids, style_vec, pred_aln_trg_cpu, s_dec, asr_fpga, noise) stay
+        # unconditional.
+        if debug:
+            bert_dur_cpu = model.bert(input_ids_b, attention_mask=(~text_mask).int())
+            d_en_cpu = model.bert_encoder(bert_dur_cpu).transpose(-1, -2).squeeze(0)  # [512, T]
+            snr_db = calculate_snr(d_en_cpu.reshape(-1), d_en.reshape(-1))
+            report_snr(f"[fpga] Section 1 (PL-BERT) end-to-end SNR vs CPU: {snr_db:.2f} dB")
 
         # ---- Section 2: prosody/duration path ----
         # WIRED: fed from Section 1's own FPGA output (`d_en`), not the clean CPU value. The
@@ -4047,28 +5234,30 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
         input_lengths = torch.full((1,), T, dtype=torch.long)
         ref_s_b = ref_s.reshape(1, -1)
         s_cpu = ref_s_b[:, 128:]
-        d_cpu = model.predictor.text_encoder(d_en_cpu.unsqueeze(0), s_cpu, input_lengths, text_mask)  # [1,T,640]
-        lstm_out_cpu, _ = model.predictor.lstm(d_cpu)  # [1,T,512]
-        duration_raw_cpu = model.predictor.duration_proj(lstm_out_cpu)  # [1,T,50]
+        debug_cpu_ref2 = None
+        if debug:
+            d_cpu = model.predictor.text_encoder(d_en_cpu.unsqueeze(0), s_cpu, input_lengths, text_mask)  # [1,T,640]
+            lstm_out_cpu, _ = model.predictor.lstm(d_cpu)  # [1,T,512]
+            duration_raw_cpu = model.predictor.duration_proj(lstm_out_cpu)  # [1,T,50]
+            debug_cpu_ref2 = {
+                "d": d_cpu.squeeze(0), "lstm_out": lstm_out_cpu.squeeze(0), "duration_raw": duration_raw_cpu.squeeze(0),
+            }
 
         _begin("2: Prosody / duration")
         report(f"\n[fpga] Section 2 (prosody/duration): T={T} ...")
         prosody = ProsodyDurationFPGA(model, ue)
-        debug_cpu_ref2 = {
-            "d": d_cpu.squeeze(0), "lstm_out": lstm_out_cpu.squeeze(0), "duration_raw": duration_raw_cpu.squeeze(0),
-        }
-        d_fpga, pred_dur_fpga = prosody.forward(d_en, style_vec, T,
-                                                debug_cpu_ref=(debug_cpu_ref2 if debug else None))
+        d_fpga, pred_dur_fpga = prosody.forward(d_en, style_vec, T, debug_cpu_ref=debug_cpu_ref2)
 
-        duration_cpu = torch.sigmoid(duration_raw_cpu.squeeze(0)).sum(axis=-1)
-        pred_dur_cpu = torch.round(duration_cpu).clamp(min=1).long()
-        pred_dur_snr = calculate_snr(pred_dur_cpu.float(), pred_dur_fpga.float())
-        report_snr(f"[fpga] Section 2 (prosody/duration) end-to-end SNR (d) vs CPU: "
-              f"{calculate_snr(d_cpu.squeeze(0).reshape(-1), d_fpga.reshape(-1)):.2f} dB")
-        report_snr(f"[fpga] Section 2 pred_dur SNR vs CPU (post-round, should be near-exact): {pred_dur_snr:.2f} dB")
-        n_mismatch = (pred_dur_cpu != pred_dur_fpga).sum().item()
-        report_snr(f"[fpga] Section 2 pred_dur exact-match: {T - n_mismatch}/{T} positions "
-              f"(mismatches usually a rounding tie at a .5 boundary, not a correctness bug)")
+        if debug:
+            duration_cpu = torch.sigmoid(duration_raw_cpu.squeeze(0)).sum(axis=-1)
+            pred_dur_cpu = torch.round(duration_cpu).clamp(min=1).long()
+            pred_dur_snr = calculate_snr(pred_dur_cpu.float(), pred_dur_fpga.float())
+            report_snr(f"[fpga] Section 2 (prosody/duration) end-to-end SNR (d) vs CPU: "
+                  f"{calculate_snr(d_cpu.squeeze(0).reshape(-1), d_fpga.reshape(-1)):.2f} dB")
+            report_snr(f"[fpga] Section 2 pred_dur SNR vs CPU (post-round, should be near-exact): {pred_dur_snr:.2f} dB")
+            n_mismatch = (pred_dur_cpu != pred_dur_fpga).sum().item()
+            report_snr(f"[fpga] Section 2 pred_dur exact-match: {T - n_mismatch}/{T} positions "
+                  f"(mismatches usually a rounding tie at a .5 boundary, not a correctness bug)")
 
         # ---- Section 3: F0/N prediction ----
         # WIRED: fed from Section 2's own FPGA outputs (d_fpga / pred_dur_fpga).
@@ -4086,43 +5275,46 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
         pred_aln_trg_cpu = torch.zeros((T, indices_cpu.shape[0]))
         pred_aln_trg_cpu[indices_cpu, torch.arange(indices_cpu.shape[0])] = 1
         pred_aln_trg_cpu = pred_aln_trg_cpu.unsqueeze(0)
-        en_cpu = d_fpga.unsqueeze(0).float().transpose(-1, -2) @ pred_aln_trg_cpu  # [1,640,n_frames]
-        shared_lstm_out_cpu, _ = model.predictor.shared(en_cpu.transpose(-1, -2))  # [1,n_frames,512]
-
-        def run_branch_cpu(blocks, proj):
-            x = shared_lstm_out_cpu.transpose(-1, -2)  # [1,512,n_frames], channels-first (CPU conv layout)
-            block_outs = []
-            for blk in blocks:
-                x = blk(x, s_cpu)
-                block_outs.append(x.squeeze(0).transpose(-1, -2))  # store as [T,C] to match our device layout
-            proj_out = proj(x)  # [1,1,n_frames_final]
-            return block_outs, proj_out.squeeze(1).squeeze(0)  # [n_frames_final]
-
-        F0_block_outs_cpu, F0_pred_cpu = run_branch_cpu(model.predictor.F0, model.predictor.F0_proj)
-        N_block_outs_cpu, N_pred_cpu = run_branch_cpu(model.predictor.N, model.predictor.N_proj)
-
         n_frames = int(pred_dur_fpga.sum().item())
-        n_frames_cpu = int(pred_dur_cpu.sum().item())
-        if n_frames != n_frames_cpu:
-            report_snr(f"[fpga][note] n_frames: fpga={n_frames} vs pure-CPU={n_frames_cpu} "
-                  f"({n_frames - n_frames_cpu:+d} frames from pred_dur rounding ties upstream). "
-                  f"Section 3's reference is built from the FPGA alignment, so the SNRs below "
-                  f"remain valid measures of Section 3 itself.")
+        debug_cpu_ref3 = None
+        if debug:
+            en_cpu = d_fpga.unsqueeze(0).float().transpose(-1, -2) @ pred_aln_trg_cpu  # [1,640,n_frames]
+            shared_lstm_out_cpu, _ = model.predictor.shared(en_cpu.transpose(-1, -2))  # [1,n_frames,512]
+
+            def run_branch_cpu(blocks, proj):
+                x = shared_lstm_out_cpu.transpose(-1, -2)  # [1,512,n_frames], channels-first (CPU conv layout)
+                block_outs = []
+                for blk in blocks:
+                    x = blk(x, s_cpu)
+                    block_outs.append(x.squeeze(0).transpose(-1, -2))  # store as [T,C] to match our device layout
+                proj_out = proj(x)  # [1,1,n_frames_final]
+                return block_outs, proj_out.squeeze(1).squeeze(0)  # [n_frames_final]
+
+            F0_block_outs_cpu, F0_pred_cpu = run_branch_cpu(model.predictor.F0, model.predictor.F0_proj)
+            N_block_outs_cpu, N_pred_cpu = run_branch_cpu(model.predictor.N, model.predictor.N_proj)
+
+            n_frames_cpu = int(pred_dur_cpu.sum().item())
+            if n_frames != n_frames_cpu:
+                report_snr(f"[fpga][note] n_frames: fpga={n_frames} vs pure-CPU={n_frames_cpu} "
+                      f"({n_frames - n_frames_cpu:+d} frames from pred_dur rounding ties upstream). "
+                      f"Section 3's reference is built from the FPGA alignment, so the SNRs below "
+                      f"remain valid measures of Section 3 itself.")
+            debug_cpu_ref3 = {
+                "shared_out": shared_lstm_out_cpu.squeeze(0),
+                "F0_blocks": F0_block_outs_cpu, "F0_pred_pre_squeeze": F0_pred_cpu,
+                "N_blocks": N_block_outs_cpu, "N_pred_pre_squeeze": N_pred_cpu,
+            }
         _begin("3: F0 / N prediction")
         report(f"\n[fpga] Section 3 (F0/N prediction): n_frames={n_frames} ...")
         f0n = F0NPredictionFPGA(model, ue)
-        debug_cpu_ref3 = {
-            "shared_out": shared_lstm_out_cpu.squeeze(0),
-            "F0_blocks": F0_block_outs_cpu, "F0_pred_pre_squeeze": F0_pred_cpu,
-            "N_blocks": N_block_outs_cpu, "N_pred_pre_squeeze": N_pred_cpu,
-        }
         F0_pred_fpga, N_pred_fpga = f0n.forward(d_fpga, pred_dur_fpga, style_vec, T,
-                                                 debug_cpu_ref=(debug_cpu_ref3 if debug else None))
+                                                 debug_cpu_ref=debug_cpu_ref3)
 
-        f0_snr = calculate_snr(F0_pred_cpu.reshape(-1), F0_pred_fpga.reshape(-1))
-        n_snr = calculate_snr(N_pred_cpu.reshape(-1), N_pred_fpga.reshape(-1))
-        report_snr(f"[fpga] Section 3 F0_pred end-to-end SNR vs CPU: {f0_snr:.2f} dB")
-        report_snr(f"[fpga] Section 3 N_pred end-to-end SNR vs CPU: {n_snr:.2f} dB")
+        if debug:
+            f0_snr = calculate_snr(F0_pred_cpu.reshape(-1), F0_pred_fpga.reshape(-1))
+            n_snr = calculate_snr(N_pred_cpu.reshape(-1), N_pred_fpga.reshape(-1))
+            report_snr(f"[fpga] Section 3 F0_pred end-to-end SNR vs CPU: {f0_snr:.2f} dB")
+            report_snr(f"[fpga] Section 3 N_pred end-to-end SNR vs CPU: {n_snr:.2f} dB")
 
         # ---- Section 4: TextEncoder (phoneme embed + Conv1d k=5 stack + BiLSTM) ----
         # Independent of Sections 2/3: it consumes the raw phoneme ids, not the prosody path, so
@@ -4131,28 +5323,31 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
         _begin("4: TextEncoder")
         report(f"\n[fpga] Section 4 (TextEncoder): T={T} phoneme tokens ...")
         te = model.text_encoder
-        emb_cpu = te.embedding(input_ids_b).squeeze(0)                 # [T, C]
-        xc = emb_cpu.transpose(0, 1).unsqueeze(0)                      # [1, C, T] channels-first
-        cnn_cpu = []
-        for blk in te.cnn:
-            xc = blk(xc)
-            cnn_cpu.append(xc.squeeze(0).transpose(0, 1))              # store [T, C] to match device
-        lstm_cpu, _ = te.lstm(xc.transpose(-1, -2))                    # [1, T, C]
-        t_en_cpu = te(input_ids_b, input_lengths, text_mask).squeeze(0)  # [C, T]
+        debug_cpu_ref4 = None
+        if debug:
+            emb_cpu = te.embedding(input_ids_b).squeeze(0)                 # [T, C]
+            xc = emb_cpu.transpose(0, 1).unsqueeze(0)                      # [1, C, T] channels-first
+            cnn_cpu = []
+            for blk in te.cnn:
+                xc = blk(xc)
+                cnn_cpu.append(xc.squeeze(0).transpose(0, 1))              # store [T, C] to match device
+            lstm_cpu, _ = te.lstm(xc.transpose(-1, -2))                    # [1, T, C]
+            t_en_cpu = te(input_ids_b, input_lengths, text_mask).squeeze(0)  # [C, T]
+            debug_cpu_ref4 = {"embedding": emb_cpu, "cnn": cnn_cpu, "lstm": lstm_cpu.squeeze(0)}
 
         textenc = TextEncoderFPGA(model, ue)
-        t_en_fpga = textenc.forward(input_ids, T, debug_cpu_ref=({
-            "embedding": emb_cpu, "cnn": cnn_cpu, "lstm": lstm_cpu.squeeze(0),
-        } if debug else None))
-        report_snr(f"[fpga] Section 4 t_en end-to-end SNR vs CPU: "
-              f"{calculate_snr(t_en_cpu.reshape(-1), t_en_fpga.reshape(-1)):.2f} dB")
+        t_en_fpga = textenc.forward(input_ids, T, debug_cpu_ref=debug_cpu_ref4)
+        if debug:
+            report_snr(f"[fpga] Section 4 t_en end-to-end SNR vs CPU: "
+                  f"{calculate_snr(t_en_cpu.reshape(-1), t_en_fpga.reshape(-1)):.2f} dB")
 
         # ---- Section 5a: Decoder front (encode + 4 decode AdainResBlk1d) ----
         # Wired from Sections 3 and 4's own FPGA outputs: asr from t_en_fpga, F0/N from Section 3.
         s_dec = ref_s.reshape(1, -1)[:, :128]                      # decoder style (predictor uses [128:])
         asr_fpga = t_en_fpga @ pred_aln_trg_cpu.squeeze(0)          # [C, n_frames]
         dec = model.decoder
-        with torch.no_grad():
+        debug_cpu_ref5 = None
+        if debug:
             F0c = dec.F0_conv(F0_pred_fpga.unsqueeze(0).unsqueeze(1)).squeeze(0)
             Nc_ = dec.N_conv(N_pred_fpga.unsqueeze(0).unsqueeze(1)).squeeze(0)
             asr_res_cpu = dec.asr_res(asr_fpga.unsqueeze(0))
@@ -4165,15 +5360,16 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
                 if blk.upsample_type != "none":
                     res_ = False
                 dec_cpu.append(xc.squeeze(0).transpose(0, 1))       # [T, C] to match device layout
+            debug_cpu_ref5 = {"encode": enc_cpu.squeeze(0).transpose(0, 1), "decode": dec_cpu}
 
         _begin("5a: Decoder front")
         report(f"\n[fpga] Section 5a (Decoder front): asr={tuple(asr_fpga.shape)} ...")
         decoder = DecoderFPGA(model, ue)
         x_gen = decoder.forward(asr_fpga, F0_pred_fpga, N_pred_fpga, s_dec.reshape(-1),
-                                debug_cpu_ref=({"encode": enc_cpu.squeeze(0).transpose(0, 1),
-                                                "decode": dec_cpu} if debug else None))
-        report_snr(f"[fpga] Section 5a decoder-front SNR vs CPU: "
-              f"{calculate_snr(dec_cpu[-1].reshape(-1), x_gen.T.reshape(-1)):.2f} dB")
+                                debug_cpu_ref=debug_cpu_ref5)
+        if debug:
+            report_snr(f"[fpga] Section 5a decoder-front SNR vs CPU: "
+                  f"{calculate_snr(dec_cpu[-1].reshape(-1), x_gen.T.reshape(-1)):.2f} dB")
 
         # ---- Section 5b: ISTFTNet Generator body ----
         # `har` (Section 5c: SineGen + STFT) and exp/sin + iSTFT (Section 5d) are host-side for
@@ -4183,28 +5379,32 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
         gen = dec.generator
         n_frames_dec = x_gen.shape[-1] // 2
         noise = generate_source_noise(gen, F0_pred_fpga)                        # [S, 9]
-        har = generator_host_har(gen, F0_pred_fpga, noise)                     # [1, 22, F] reference
-        y_cpu, gen_refs = generator_cpu_reference(gen, x_gen.unsqueeze(0), s_dec, har)
-        gen_refs["har"] = har.squeeze(0)
+        n_stft = noise.shape[0] // gen.stft.hop_length + 1                      # F (center=True STFT)
+        gen_refs = None
+        if debug:
+            har = generator_host_har(gen, F0_pred_fpga, noise)                 # [1, 22, F] reference
+            y_cpu, gen_refs = generator_cpu_reference(gen, x_gen.unsqueeze(0), s_dec, har)
+            gen_refs["har"] = har.squeeze(0)
         _begin("5b-5d: Generator")
         report(f"\n[fpga] Section 5b-5d (SineGen/STFT + Generator body + iSTFT): n_frames={n_frames_dec}, "
-               f"F={har.shape[-1]} STFT frames, {har.shape[-1] * gen.stft.hop_length} samples ...")
+               f"F={n_stft} STFT frames, {n_stft * gen.stft.hop_length} samples ...")
         generator = GeneratorFPGA(model, ue)
         audio, y_fpga = generator.forward(x_gen, s_dec.reshape(-1), F0_pred_fpga, noise, n_frames_dec,
-                                          debug_cpu_ref=(gen_refs if debug else None))     # [S], [22, F]
-        report_snr(f"[fpga] Section 5b conv_post output SNR vs CPU (same noise): "
-                   f"{calculate_snr(y_cpu.squeeze(0).reshape(-1), y_fpga.reshape(-1)):.2f} dB")
-        # The model's OWN noise floor: the same CPU generator with a second noise draw. The FPGA
-        # cannot be expected to track the CPU closer than the CPU tracks itself across seeds.
-        y_cpu2, _ = generator_cpu_reference(
-            gen, x_gen.unsqueeze(0), s_dec, generator_host_har(gen, F0_pred_fpga, generate_source_noise(gen, F0_pred_fpga)))
-        report_snr(f"[fpga] Section 5b conv_post CPU-vs-CPU across noise seeds (floor): "
-                   f"{calculate_snr(y_cpu.squeeze(0).reshape(-1), y_cpu2.squeeze(0).reshape(-1)):.2f} dB")
-        audio_cpu = generator_host_istft(gen, y_cpu.squeeze(0))
-        report_snr(f"[fpga] Section 5d audio CPU-vs-CPU across noise seeds (floor): "
-                   f"{calculate_snr(audio_cpu.reshape(-1), generator_host_istft(gen, y_cpu2.squeeze(0)).reshape(-1)):.2f} dB")
-        report_snr(f"[fpga] Section 5d audio SNR vs CPU (same noise; waveform SNR, see METRIC note): "
-                   f"{calculate_snr(audio_cpu.reshape(-1), audio.reshape(-1)):.2f} dB")
+                                          debug_cpu_ref=gen_refs)                          # [S], [22, F]
+        if debug:
+            report_snr(f"[fpga] Section 5b conv_post output SNR vs CPU (same noise): "
+                       f"{calculate_snr(y_cpu.squeeze(0).reshape(-1), y_fpga.reshape(-1)):.2f} dB")
+            # The model's OWN noise floor: the same CPU generator with a second noise draw. The FPGA
+            # cannot be expected to track the CPU closer than the CPU tracks itself across seeds.
+            y_cpu2, _ = generator_cpu_reference(
+                gen, x_gen.unsqueeze(0), s_dec, generator_host_har(gen, F0_pred_fpga, generate_source_noise(gen, F0_pred_fpga)))
+            report_snr(f"[fpga] Section 5b conv_post CPU-vs-CPU across noise seeds (floor): "
+                       f"{calculate_snr(y_cpu.squeeze(0).reshape(-1), y_cpu2.squeeze(0).reshape(-1)):.2f} dB")
+            audio_cpu = generator_host_istft(gen, y_cpu.squeeze(0))
+            report_snr(f"[fpga] Section 5d audio CPU-vs-CPU across noise seeds (floor): "
+                       f"{calculate_snr(audio_cpu.reshape(-1), generator_host_istft(gen, y_cpu2.squeeze(0)).reshape(-1)):.2f} dB")
+            report_snr(f"[fpga] Section 5d audio SNR vs CPU (same noise; waveform SNR, see METRIC note): "
+                       f"{calculate_snr(audio_cpu.reshape(-1), audio.reshape(-1)):.2f} dB")
 
         _CUR[0] = None
         report(f"[fpga] Pipeline complete: sections 1-5d on hardware -- phonemes in, samples out.")

@@ -665,6 +665,9 @@ def main():
                               "streams from scratch. The cache is keyed on the compiler "
                               "fingerprint and the capacity caps -- deliberately NOT on the "
                               "sequence length, since one image is meant to serve every prompt.")
+    parser.add_argument("--engines", type=int, default=1,
+                         help="Accelerator engines to row-shard the generator's conv taps across "
+                              "(1 = single engine). >1 compiles every run for now (no bin cache).")
     parser.add_argument("--debug-snr", action="store_true", dest="debug_snr",
                          help="Print the per-section SNR bisects against the CPU reference. "
                               "Bring-up instrumentation; off by default.")
@@ -710,7 +713,8 @@ def main():
         audio = run_fpga_forward(model, phonemes, ref_s[len(phonemes) - 1], speed=args.speed,
                                  dev=args.dev, debug=args.debug_snr,
                                  dump_programs=args.dump_programs,
-                                 bin_cache=(None if args.no_bin_cache else BIN_DIR))
+                                 bin_cache=(None if args.no_bin_cache else BIN_DIR),
+                                 engines=args.engines)
         if audio is None:
             return  # see fpga_forward.py's section checklist
         import soundfile as sf
