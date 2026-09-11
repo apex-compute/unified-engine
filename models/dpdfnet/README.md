@@ -27,6 +27,9 @@ The checked-in source supports AXI-256 and AXI-512 devices. The generated ONNX
 and `dpdfnet2-andromeda.bin` files remain local build products under the ignored
 `dpdfnet_bin/` directory.
 
+See [BENCHMARK.md](BENCHMARK.md) for portable Bittware/RK AXI-256 and CPU
+benchmark procedures and the shared result template.
+
 Install only the model-specific inspection/reference dependencies:
 
 ```bash
