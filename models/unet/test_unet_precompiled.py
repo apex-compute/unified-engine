@@ -28,7 +28,7 @@ class MemoryEngine:
 
 
 class WholeGraphTests(unittest.TestCase):
-    def test_phase_merge_matches_host(self):
+    def test_merge_only_copies_skip_half(self):
         engine = MemoryEngine()
         shapes = [(64,4,6)]+[(64,2,3)]*4
         sources = []
@@ -50,14 +50,47 @@ class WholeGraphTests(unittest.TestCase):
                                   offset=dst.address).reshape(4,6,128)
         expected = torch.empty(4,6,128,dtype=torch.int16)
         expected[...,:64] = tensors[0]
-        for i,value in enumerate(tensors[1:]):
-            expected[i//2::2,i%2::2,64:] = value
+        expected[...,64:] = 0
+        torch.testing.assert_close(output,expected)
+
+    def test_phase_conv_results_scatter_directly_into_merge(self):
+        engine = MemoryEngine()
+        dst = up.shared._layout_for_conv((128,4,6))
+        dst.address = 0x80000
+        expected = torch.zeros(4,6,128,dtype=torch.int16)
+        for phase in range(4):
+            values = (torch.arange(2*3*64,dtype=torch.int32)+phase*1000).to(torch.int16)
+            raw = values.numpy().tobytes()
+            start = up.shared._WB_SRAM_ADDRESS
+            engine.sram[start:start+len(raw)] = raw
+            up._scatter_phase_tile(engine,dst,(0,0,2,3),0,64,
+                                   phase,64*2,0x60000)
+            expected[phase//2::2,phase%2::2,64:] = values.reshape(2,3,64)
+        output = torch.frombuffer(engine.dram,dtype=torch.int16,
+            count=dst.size_bytes//2,offset=dst.address).reshape(4,6,128)
+        torch.testing.assert_close(output,expected)
+
+    def test_phase_oc32_uses_safe_contiguous_pixel_writes(self):
+        engine = MemoryEngine()
+        dst = up.shared._layout_for_conv((128,2,4))
+        dst.address = 0x80000
+        values = torch.arange(2*32,dtype=torch.int16)
+        raw = values.numpy().tobytes()
+        start = up.shared._WB_SRAM_ADDRESS
+        engine.sram[start:start+len(raw)] = raw
+        up._scatter_phase_tile(engine,dst,(0,0,1,2),32,32,1,128,0x60000)
+        output = torch.frombuffer(engine.dram,dtype=torch.int16,
+            count=dst.size_bytes//2,offset=dst.address).reshape(2,4,128)
+        expected = torch.zeros_like(output)
+        expected[0,1::2,96:128] = values.reshape(1,2,32)
         torch.testing.assert_close(output,expected)
 
     def test_memory_reuse_does_not_overwrite_live_skips(self):
         shapes = {name:(64,4,4) for name in ('input','a','b','c','d')}
-        ops = [dict(output='a',inputs=['input']),dict(output='b',inputs=['a']),
-               dict(output='c',inputs=['b']),dict(output='d',inputs=['a','c'])]
+        ops = [dict(op='conv',output='a',inputs=['input']),
+               dict(op='conv',output='b',inputs=['a']),
+               dict(op='conv',output='c',inputs=['b']),
+               dict(op='conv',output='d',inputs=['a','c'])]
         layouts,_ = up.memory_plan(shapes,ops)
         self.assertEqual(layouts['d'].address,layouts['b'].address)
         self.assertNotEqual(layouts['a'].address,layouts['d'].address)
@@ -66,6 +99,8 @@ class WholeGraphTests(unittest.TestCase):
     def test_resolution_rejected_before_compilation(self):
         with self.assertRaises(ValueError):
             up.graph({},33,32)
+        with self.assertRaises(ValueError):
+            up.compile_hardware({},16,16,weight_reuse_pixels=0)
 
     def test_runtime_one_upload_kick_read(self):
         engine = mock.Mock()

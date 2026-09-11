@@ -1112,7 +1112,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        # assert hw_version == 0x7fa22acf, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x7fa22acf. Please update FPGA with commit update_7fa22acf.bin using update_flash.py (public release v1.4)"
+        assert hw_version == 0x011093e5, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x011093e5. Please update FPGA with commit update_11093e5.bin using update_flash.py"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -3070,6 +3070,7 @@ class UnifiedEngine:
         stride_z: int = UE_VECTOR_SIZE,
         lalu_a: int = 0,
         lalu_b: int = 0,
+        lalu_scalar: int = 0,
         inst_pointer_idx: Optional[int] = None,
     ) -> None:
         """Start queue for bf16 matvec operation. Wraps ue_arithmetic_op with UE_MODE.BF16_DOT_PRODUCT.
@@ -3102,7 +3103,7 @@ class UnifiedEngine:
             lalu_a,  # lalu_a
             lalu_b,  # lalu_b
             lalu_mode.value,  # lalu_mode
-            0,  # scalar
+            lalu_scalar,
             output_uram_type.value,
             0,  # uram_dst_addr
             output_uram_start_addr,
@@ -5682,7 +5683,8 @@ class UnifiedEngine:
             lalu_b = self.float_to_bf16(clamp_max)
         elif log_enable:
             lalu_mode = LALU_MODE.LOG
-            lalu_a = LALU_LOG_A
+            lalu_a = (self.float_to_bf16(clamp_min)
+                      if clamp_min > 0 else LALU_LOG_A)
             lalu_b = LALU_LOG_B
 
         # Calculate N_chunk
@@ -5935,7 +5937,10 @@ class UnifiedEngine:
         elif clamp_enable:
             lalu_mode, lalu_a, lalu_b = LALU_MODE.CLAMP, self.float_to_bf16(clamp_min), self.float_to_bf16(clamp_max)
         elif log_enable:
-            lalu_mode, lalu_a, lalu_b = LALU_MODE.LOG, LALU_LOG_A, LALU_LOG_B
+            lalu_mode, lalu_a, lalu_b = (
+                LALU_MODE.LOG,
+                self.float_to_bf16(clamp_min) if clamp_min > 0 else LALU_LOG_A,
+                LALU_LOG_B)
 
         assert (gpr_M_reg is not None and gpr_K_reg is not None and gpr_N_reg is not None), "Dynamic requires gpr inputs of m n k dims!"
 
@@ -7910,7 +7915,8 @@ class UnifiedEngine:
             lalu_b = LALU_CLAMP_RELU_B
         elif log_enable:
             lalu_mode = LALU_MODE.LOG
-            lalu_a = LALU_LOG_A
+            lalu_a = (self.float_to_bf16(clamp_min)
+                      if clamp_min > 0 else LALU_LOG_A)
             lalu_b = LALU_LOG_B
 
         # We put entire input matrix into URAM_A, and entire output matrix into URAM_B
@@ -8128,7 +8134,10 @@ class UnifiedEngine:
         elif clamp_enable:
             lalu_mode, lalu_a, lalu_b = LALU_MODE.CLAMP, self.float_to_bf16(clamp_min), self.float_to_bf16(clamp_max)
         elif log_enable:
-            lalu_mode, lalu_a, lalu_b = LALU_MODE.LOG, LALU_LOG_A, LALU_LOG_B
+            lalu_mode, lalu_a, lalu_b = (
+                LALU_MODE.LOG,
+                self.float_to_bf16(clamp_min) if clamp_min > 0 else LALU_LOG_A,
+                LALU_LOG_B)
 
         SRAM_A = 0x00000
         SRAM_B = 0x80000

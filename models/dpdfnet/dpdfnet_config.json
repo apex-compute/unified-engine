@@ -1,0 +1,20 @@
+{
+  "model": "dpdfnet2",
+  "source_repository": "https://github.com/ceva-ip/DPDFNet",
+  "onnx_url": "https://huggingface.co/Ceva-IP/DPDFNet/resolve/main/onnx/dpdfnet2.onnx",
+  "onnx_sha256": "4f0ee28935b4a32abecc717d745416976565834d839601acf43031094b4dc94c",
+  "sample_rate": 16000,
+  "window_length": 320,
+  "hop_length": 160,
+  "frequency_bins": 161,
+  "state_size": 45424,
+  "onnx_inputs": {
+    "spec": [1, 1, 161, 2],
+    "state_in": [45424]
+  },
+  "onnx_outputs": {
+    "spec_e": [1, 1, 161, 2],
+    "state_out": [45424]
+  }
+}
+

@@ -61,23 +61,45 @@ def memory_plan(shapes, ops):
     last = {name: i for i,op in enumerate(ops) for name in op['inputs']}
     free = []
     cursor = shared.TENSOR_BASE
+    # Phase tensors are virtual: their CONV writeback lands directly in the
+    # corresponding merge tensor. Reserve that persistent destination before
+    # phase0, and never allocate/free four redundant phase buffers.
+    phase_merge = {
+        source: op['output']
+        for op in ops if op['op'] == 'merge' for source in op['inputs'][1:]
+    }
+    virtual = set(phase_merge)
     for i,op in enumerate(ops):
         name = op['output']
         layout = shared._layout_for_conv(shapes[name])
-        size = shared._align_up(layout.size_bytes, 128)
-        candidates = [(span[1],j) for j,span in enumerate(free) if span[1] >= size]
-        if candidates:
-            _,j = min(candidates)
-            address, available = free.pop(j)
-            if available > size:
-                free.append((address+size, available-size))
+        if name in virtual:
+            merge_name = phase_merge[name]
+            if merge_name not in layouts:
+                merge = shared._layout_for_conv(shapes[merge_name])
+                merge.address = cursor
+                cursor += shared._align_up(merge.size_bytes, 128)
+                layouts[merge_name] = merge
+            # Address is documentary only: this map is non-contiguous and is
+            # never read. The emitter uses merge address + phase coordinates.
+            layout.address = layouts[merge_name].address
+        elif name in layouts:
+            # Merge storage was reserved when its first phase was planned.
+            layout = layouts[name]
         else:
-            address = cursor
-            cursor += size
-        layout.address = address
+            size = shared._align_up(layout.size_bytes, 128)
+            candidates = [(span[1],j) for j,span in enumerate(free) if span[1] >= size]
+            if candidates:
+                _,j = min(candidates)
+                address, available = free.pop(j)
+                if available > size:
+                    free.append((address+size, available-size))
+            else:
+                address = cursor
+                cursor += size
+            layout.address = address
         layouts[name] = layout
         for source in op['inputs']:
-            if source != 'input' and last[source] == i:
+            if source != 'input' and source not in virtual and last[source] == i:
                 old = layouts[source]
                 free.append((old.address, shared._align_up(old.size_bytes,128)))
         free.sort()
@@ -96,7 +118,48 @@ def memory_plan(shapes, ops):
     return layouts, scratch
 
 
-def emit_conv(engine, plan, zero, scratch, relu):
+def _write_oc32_pixels(engine, *, scratch, source_sram, th, tw,
+                       destination, destination_pixel_bytes,
+                       destination_row_pixels, row_step=1, col_step=1,
+                       channel_offset=0):
+    """AXI512-safe dense OC32 scatter using only contiguous 64-byte writes."""
+    row_bytes = tw * 64
+    engine.sram_to_accelerator_memory(source_sram,scratch,0,
+                                      memcpy_length_bytes=th*row_bytes)
+    for row in range(th):
+        for col in range(tw):
+            engine.accelerator_memory_to_sram(
+                scratch+row*row_bytes+col*64,0,0,memcpy_length_bytes=64)
+            address = destination + (
+                row*row_step*destination_row_pixels
+                + col*col_step) * destination_pixel_bytes + channel_offset
+            engine.sram_to_accelerator_memory(
+                0,address,0,memcpy_length_bytes=64)
+
+
+def _scatter_phase_tile(engine, destination, tile, oc0, oc_chunk,
+                        phase, channel_offset, scratch):
+    oy,ox,th,tw = (int(value) for value in tile[:4])
+    pixel_bytes = destination.physical_channels*2
+    source_row_bytes = tw*oc_chunk*2
+    base = destination.address + (
+        ((2*oy+phase//2)*destination.width+2*ox+phase%2)*pixel_bytes)
+    if oc_chunk == 32:
+        _write_oc32_pixels(engine,scratch=scratch,
+            source_sram=shared._WB_SRAM_ADDRESS,th=th,tw=tw,
+            destination=base,destination_pixel_bytes=pixel_bytes,
+            destination_row_pixels=destination.width,row_step=2,col_step=2,
+            channel_offset=channel_offset+oc0*2)
+        return
+    for row in range(th):
+        shared._copy_contiguous_or_strided_write(
+            engine,sram=shared._WB_SRAM_ADDRESS+row*source_row_bytes,
+            destination=base+row*2*destination.width*pixel_bytes
+                        +channel_offset+oc0*2,
+            total=source_row_bytes,chunk=oc_chunk*2,jump=2*pixel_bytes)
+
+
+def emit_conv(engine, plan, zero, scratch, relu, phase_target=None):
     mode,a,b = udc._conv_fused_lalu(relu,False,False)
     src,dst = plan['source'],plan['destination']
     ct = (plan['convolution_c']+63)//64
@@ -114,29 +177,28 @@ def emit_conv(engine, plan, zero, scratch, relu):
                     out_w=tw,out_h=th,w_pad=win_w,stride_s=1,data_type=udc.TYPE.IF8,
                     bias_enable=True,lalu_mode=mode,lalu_a=a,lalu_b=b,
                     dilation=1,gather=plan['use_gather'],c_in=plan['convolution_c'])
-                if plan['oc_chunk'] != 32:
+                if phase_target is not None:
+                    destination,phase,channel_offset = phase_target
+                    _scatter_phase_tile(engine,destination,tile,chunk['oc0'],
+                                        plan['oc_chunk'],phase,channel_offset,scratch)
+                elif plan['oc_chunk'] != 32:
                     shared._scatter_conv_tile(engine,dst,tile,chunk['oc0'],plan['oc_chunk'])
                 else:
                     # Dense OC32 pixels occupy half a 128-byte SRAM line.
                     # A multi-chunk 64-byte strided write was incorrect on
                     # AXI512 hardware. Spill once, then stage each 64-byte
                     # pixel at SRAM line 0 and use a contiguous write instead.
-                    row_bytes = tw*64
-                    engine.sram_to_accelerator_memory(shared._WB_SRAM_ADDRESS,scratch,0,
-                                                      memcpy_length_bytes=th*row_bytes)
                     oy,ox = tile[:2]
-                    pixel_bytes = dst.physical_channels*2
-                    for row in range(th):
-                        for col in range(tw):
-                            engine.accelerator_memory_to_sram(scratch+row*row_bytes+col*64,0,0,
-                                                             memcpy_length_bytes=64)
-                            engine.sram_to_accelerator_memory(0,
-                                dst.address+((oy+row)*dst.width+ox+col)*pixel_bytes+chunk['oc0']*2,
-                                0,memcpy_length_bytes=64)
+                    _write_oc32_pixels(engine,scratch=scratch,
+                        source_sram=shared._WB_SRAM_ADDRESS,th=th,tw=tw,
+                        destination=dst.address+(oy*dst.width+ox)*dst.physical_channels*2,
+                        destination_pixel_bytes=dst.physical_channels*2,
+                        destination_row_pixels=dst.width,
+                        channel_offset=chunk['oc0']*2)
 
 
 def emit_merge(engine, sources, dst):
-    skip,*phases = sources
+    skip,*_phases = sources
     pixel = skip.physical_channels*2
     out_pixel = dst.physical_channels*2
     # Skip channels occupy the first half; transpose phases the second half.
@@ -146,33 +208,33 @@ def emit_merge(engine, sources, dst):
         engine.accelerator_memory_to_sram(skip.address+start*pixel,0,0,memcpy_length_bytes=n*pixel)
         shared._copy_contiguous_or_strided_write(engine,sram=0,
             destination=dst.address+start*out_pixel,total=n*pixel,chunk=pixel,jump=out_pixel)
-    for phase,source in enumerate(phases):
-        for y in range(source.height):
-            for x in range(0,source.width,take_pixels):
-                n = min(take_pixels,source.width-x)
-                engine.accelerator_memory_to_sram(source.address+(y*source.width+x)*pixel,
-                                                 0,0,memcpy_length_bytes=n*pixel)
-                address = dst.address+((2*y+phase//2)*dst.width+2*x+phase%2)*out_pixel+pixel
-                shared._copy_contiguous_or_strided_write(engine,sram=0,destination=address,
-                    total=n*pixel,chunk=pixel,jump=2*out_pixel)
 
 
-def compile_hardware(layers, height, width):
+def compile_hardware(layers, height, width, *, weight_reuse_pixels=12):
+    if not 1 <= int(weight_reuse_pixels) <= 16:
+        raise ValueError('weight_reuse_pixels must be in [1,16]')
     previous = udc.UE_AXI_DATA_WIDTH_BITS
     udc.UE_AXI_DATA_WIDTH_BITS = 256
     try:
-        return _compile(layers,height,width)
+        return _compile(layers,height,width,int(weight_reuse_pixels))
     finally:
         udc.UE_AXI_DATA_WIDTH_BITS = previous
 
 
-def _compile(layers,height,width):
+def _compile(layers,height,width,weight_reuse_pixels=12):
     shapes,ops = graph(layers,height,width)
     layouts,scratch = memory_plan(shapes,ops)
     image = shared._ImageBuilder(shared.MODEL_BASE,shared.MODEL_LIMIT)
     zero = image.allocate(torch.zeros(shared._ACT_TEMPLATE_BYTES//2,dtype=torch.bfloat16))
     neg = image.allocate(torch.full((shared._ACT_TEMPLATE_BYTES//2,),float('-inf'),dtype=torch.bfloat16))
     plans = {}
+    phase_targets = {}
+    for op in ops:
+        if op['op'] == 'merge':
+            skip = layouts[op['inputs'][0]]
+            for phase,source in enumerate(op['inputs'][1:]):
+                phase_targets[source] = (layouts[op['output']],phase,
+                                         skip.physical_channels*2)
     for op in ops:
         if op['op'] != 'conv':
             continue
@@ -185,10 +247,10 @@ def _compile(layers,height,width):
         weight = dict(precision='if8',codes_packed=codes.contiguous().view(torch.uint8).flatten(),
                       codes_shape=list(codes.shape),layout='gather' if gather else 'channel',
                       block_scales=-layer['scales'][:,None].expand(oc,blocks).contiguous(),bias=layer['bias'])
-        # A deep 1024-channel kernel alone exceeds YOLO's 4 MiB per-layer
-        # stream budget. Permit four spatial copies there so the planner is
-        # not forced into single-pixel launches; retain the 4 MiB floor.
-        budget = max(4 << 20, oc*blocks*64*4)
+        # A deep kernel alone can exceed YOLO's 4 MiB floor. Permit a bounded
+        # number of spatial weight copies so the planner can amortize tile
+        # setup/halo DMA; the compiler exposes this memory/latency tradeoff.
+        budget = max(4 << 20, oc*blocks*64*weight_reuse_pixels)
         plans[op['name']] = shared._prepare_conv_plan(op,weight,layouts[op['inputs'][0]],
             layouts[op['output']],image,allow_half_vector_output=True,
             weight_stream_budget_bytes=budget)
@@ -201,7 +263,8 @@ def _compile(layers,height,width):
         sources = [layouts[name] for name in op['inputs']]
         dst = layouts[op['output']]
         if op['op'] == 'conv':
-            emit_conv(engine,plans[op['name']],zero,scratch,layers[op['name']]['relu'])
+            emit_conv(engine,plans[op['name']],zero,scratch,
+                      layers[op['name']]['relu'],phase_targets.get(op['name']))
         elif op['op'] == 'maxpool':
             shared._emit_maxpool(engine,op,sources[0],dst,neg)
         else:
@@ -216,6 +279,7 @@ def _compile(layers,height,width):
         program_offset=base-shared.MODEL_BASE,program_size=len(program),
         model_sha256=hashlib.sha256(image.data).hexdigest(),
         program_sha256=hashlib.sha256(program).hexdigest(),
+        weight_reuse_pixels=weight_reuse_pixels,
         tensors={name:layout.manifest() for name,layout in layouts.items()},
         scratch=scratch,operations=entries)
     validate(layers,hardware)
@@ -223,6 +287,8 @@ def _compile(layers,height,width):
 
 
 def validate(layers, hardware):
+    if not 1 <= int(hardware.get('weight_reuse_pixels',4)) <= 16:
+        raise RuntimeError('invalid U-Net weight reuse setting')
     width,height = hardware['resolution']
     shapes,ops = graph(layers,height,width)
     layouts,scratch = memory_plan(shapes,ops)

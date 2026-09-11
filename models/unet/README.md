@@ -42,8 +42,11 @@ AXI512 at 256x256; AXI256-compatible alignment is used but not yet tested on
 an AXI256 board for this model.
 
 The allocator reuses tensor storage only after its final consumer, including
-skips. Repeated weight streams have a 4 MiB per-layer budget, raised to four
-spatial copies for kernels exceeding that budget. OC32 output is staged in
+skips. Transpose phases write directly into the final skip-concat map, avoiding
+four temporary phase tensors and their copy pass. Repeated weight streams have
+a 4 MiB floor and default to a twelve-spatial-copy budget for deep kernels;
+`--weight-reuse-pixels 1..16` exposes the deployment-size/latency tradeoff.
+The 256x256 default uses about 420 MiB of the 512 MiB model arena. OC32 output is staged in
 device scratch and written with individual contiguous 64-byte transfers;
 multi-pixel 64-byte strided writes were incorrect on the local AXI512 build.
 Instruction layout follows the existing YOLO static tile emitter; hardware
