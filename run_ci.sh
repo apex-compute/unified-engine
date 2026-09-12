@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Local CI runner — mirrors what CI runs: generic HW op tests, then every
-# model compiled from scratch + run from its cached bin, with DRAM randomized
-# (poisoned) before every single pass. Stops immediately on the first failure
+# Local CI runner — mirrors what CI runs: host-only model/driver regressions,
+# generic HW op tests, then every model compiled from scratch + run from its
+# cached bin, with DRAM randomized (poisoned) before every single pass. Stops
+# immediately on the first failure
 # — a bad run must not be allowed to keep going and corrupt/mask later results.
 #
 # Usage:
@@ -46,8 +47,8 @@ fi
 FIRST_ARGS=()
 [[ $PI05_FIRST -eq 1 ]] && FIRST_ARGS=(--first pi05)
 
-STEP_TOTAL=2
-[[ $CLEAN_BINS -eq 1 ]] && STEP_TOTAL=3
+STEP_TOTAL=3
+[[ $CLEAN_BINS -eq 1 ]] && STEP_TOTAL=4
 STEP=1
 
 if [[ $CLEAN_BINS -eq 1 ]]; then
@@ -62,6 +63,19 @@ if [[ $CLEAN_BINS -eq 1 ]]; then
     STEP=$((STEP + 1))
     echo
 fi
+
+run_yolov5_host_tests() {
+    echo "############################################################"
+    echo "# $STEP/$STEP_TOTAL  YOLOv5 host regressions — offline compiler + no-capture replay"
+    echo "############################################################"
+    python models/yolov5s/test_yolov5_helpers.py && \
+    python models/yolov5n/test_yolov5n.py
+    if [[ $? -ne 0 ]]; then
+        echo "!!! YOLOv5 host regressions failed — stopping before hardware tests."
+        exit 1
+    fi
+    STEP=$((STEP + 1))
+}
 
 run_hw_tests() {
     echo
@@ -86,6 +100,8 @@ run_model_tests() {
     MODEL_STATUS=$?
     STEP=$((STEP + 1))
 }
+
+run_yolov5_host_tests
 
 if [[ $PI05_FIRST -eq 1 ]]; then
     # Models FIRST (pi05 hoisted to the head of the round), HW ops after. The

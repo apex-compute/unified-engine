@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="update_87eabea5.bin">&#9881;&#65039; Hardware Architecture Update v1.41(update_87eabea5.bin)</a>
+  <a href="update_19788da0.bin">&#9881;&#65039; Hardware Architecture Update v1.4 (update_19788da0.bin)</a>
 </p>
 
 <p align="center">
@@ -129,7 +129,10 @@ python3 models/gemma3/gemma3_test.py --prompt "your prompt"
 
 ### 7. Updating HW bin file
 
-The current hardware release is **v1.4** (`update_006e0d2f.bin`). At startup the software reads the FPGA version register and checks it against the expected release hash (`0x006e0d2f`); on a mismatch it stops and tells you which bin to flash.
+The current bundled hardware release is **v1.4** (`update_19788da0.bin`).
+`update_fpga.sh` reads the running FPGA version and compares it with the bundled
+image before programming. Models that need newer accelerator operations apply
+their own fail-closed compatibility checks.
 
 ```
 ./update_fpga.sh
@@ -142,7 +145,7 @@ If the image currently running predates the warm-boot block, the flash is still 
 Options:
 
 ```
-./update_fpga.sh --bin update_006e0d2f.bin   # explicit image (or pass it positionally)
+./update_fpga.sh --bin update_19788da0.bin   # explicit image (or pass it positionally)
 ./update_fpga.sh --check                     # device ID + running FPGA hash vs the repo bin
 ./update_fpga.sh --boot                      # no reflash: warm boot from flash, rescan
 ./update_fpga.sh --force                     # reflash even if already up to date
@@ -152,9 +155,10 @@ Options:
 
 ## Supported Models
 
-Gemma3 above is just the quick-start example. Every model below runs on the
-engine today; each folder has its own README/config, and most LLMs ship a
-`*_run_from_bin.py` for execute-only deploys from precompiled bins.
+Gemma3 above is just the quick-start example. Each model below has an engine
+integration and its own README/config; required FPGA images are called out
+where they differ from the bundled build. Most LLMs ship a `*_run_from_bin.py`
+for execute-only deploys from precompiled bins.
 
 | Model | Folder | Type |
 |---|---|---|
@@ -172,9 +176,61 @@ engine today; each folder has its own README/config, and most LLMs ship a
 | GPT-2 | [`models/gpt2`](models/gpt2) | Text LM |
 | LocateAnything 3B | [`models/locateanything_3b`](models/locateanything_3b) | Open-vocabulary localization |
 | MobileNetV2 (224 + SSD-FPNLite 640) | [`models/mobilenetv2`](models/mobilenetv2) | Classification / detection |
+| YOLOv5n | [`models/yolov5n`](models/yolov5n) | Object detection (conv-enabled FPGA image required) |
+| YOLOv5s | [`models/yolov5s`](models/yolov5s) | Object detection (conv-enabled FPGA image required) |
 | Parakeet | [`models/parakeet`](models/parakeet) | Speech recognition (incl. streaming) |
 | MobileSAM | [`models/mobilesam`](models/mobilesam) | Segmentation |
 | Swin | [`models/swin`](models/swin) | Image classification |
+
+YOLOv5n has dedicated commands, configuration, cache, and documentation under
+`models/yolov5n`; YOLOv5s is under `models/yolov5s`. The variants share the
+low-level YOLOv5 primitive implementation. Both use native CONV2D/MAXPOOL modes
+and ordered queue-CONFIG geometry from Andromeda's `pcie_conv_maxpool` line.
+The bundled `update_19788da0.bin` predates those modes; see the model READMEs
+for the required corrected gather-IF8 commit before running either model. No
+compatible update image is shipped in this repository. YOLOv5 is therefore
+opt-in rather than part of the default suite. Both optimized artifacts are
+strictly validated on timing-clean RK-256 build `eed3a5d9` (WNS `+0.002 ns`,
+TNS `0`). That build includes the read-only `HW_INFO` register and remapped live
+geometry CSRs. The runtime does not enforce an FPGA build-hash allow-list; the
+selected image must provide native CONV, ordered queue-CONFIG, and corrected
+gather-IF8 behavior. The direct-bin queue-CONFIG path does not write those live
+CSRs.
+
+Both variants use a single checkpoint-free model artifact. The canonical model
+test compiles or validates that artifact first, then invokes only the direct-bin
+runtime:
+
+```bash
+make model_test yolov5n
+make model_test yolov5s
+
+# Explicit compile-only targets remain available for deployment preparation.
+make yolov5n_bin
+make yolov5s_bin
+
+# Select any exact profile embedded in the same bin (WIDTHxHEIGHT).
+python3 models/yolov5s/yolov5s_run_from_bin.py --resolution 640x480
+python3 models/yolov5n/yolov5n_run_from_bin.py --list-resolutions
+```
+
+Artifact version 6 is loaded and validated once. One bin embeds precompiled
+profiles for `256x256`, `320x320`, `416x416`, `512x512`, `640x480`, and
+`640x640` inputs. It stores mixed channel-IF4/gather-IF8 tensors and, for each
+profile, one fixed-address deployment image containing both packed parameters
+and one complete graph program. Backend initialization uploads the selected
+deployment image with one bulk H2C write. Each inference then performs exactly
+one packed-image H2C write, one program kick, uninterrupted FPGA execution to
+one terminal HALT, and one bundled result C2H read. There is no host graph
+walk, layer dispatch, concatenation, intermediate transfer, program capture,
+instruction-by-instruction upload, or live geometry-CSR write on the hardware
+path. Decode, NMS, and drawing remain host-side after the final read.
+
+The mixed-precision artifacts require ordered queue-CONFIG geometry and the
+corrected gather-IF8 datapath. The reset used by these runners skips the legacy
+16 KiB DRAM probe so it cannot add hidden H2C/C2H traffic to the model contract.
+Prior per-layer-dispatch performance numbers are not comparable with this
+whole-graph path and are intentionally not reused.
 
 Run the whole suite (or a subset) with the automated tester:
 
@@ -189,12 +245,13 @@ Notes on the two modes:
 - Without the `run_from_bin` word, `model_test` runs `make clean` first,
   which deletes cached model bins and rebuilds everything from the HF
   models (slow; needs the HF models available).
-- `run_from_bin` skips the pre-clean so models with a
-  `*_run_from_bin.py` runtime (the LLM/VLM rows above) reuse their bins.
-  gemma3, gpt2 and the vision/speech models have no runtime-only entry
-  yet and still run through their `*_test.py` scripts, which need their
-  model assets on disk. On a deploy host that only has pregenerated
-  bins, run the runtime-only subset by name, e.g.
+- `run_from_bin` skips the pre-clean. The canonical `yolov5n` and `yolov5s`
+  entries always validate or compile their artifact and then execute the
+  direct-bin runner; when cleaning is skipped, a valid existing artifact is
+  reused. Other models retain their own runtime selection behavior. Models
+  without a runtime-only entry still run through their `*_test.py` scripts and
+  need their model assets on disk. On a deploy host, run the desired models,
+  for example
   `make model_test gemma4_e2b llama3.2_1b qwen3_4b run_from_bin`.
 
 ---
