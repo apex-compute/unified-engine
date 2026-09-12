@@ -54,7 +54,7 @@
 #define UE_BIAS_ADDER_EN_ADDR        0x00000060
 #define UE_URAM_WB_PADDING_ADDR      0x00000064
 #define UE_BROADCAST_MODE_ADDR       0x00000068
-#define UE_ARGMAX_INDEX              0x0000006C
+#define UE_CONV_GEOM_ADDR            0x0000006C
 #define UE_INSTRUCTION_CTL_ADDR      0x00000070
 #define UE_TOTAL_BYTES_PER_STRIDE    0x00000074
 #define UE_INSTRUCTION_ADDR          0x00000078
@@ -62,7 +62,13 @@
 #define UE_FMAX_CONTEXT_ADDR         0x00000080
 #define UE_TRACE_BRAM_ADDR           0x00000084
 #define UE_TRACE_BRAM_DATA           0x00000088
-#define UE_LAST_REG_ADDR             0x00000088
+#define UE_ARGMAX_INDEX              0x0000008C
+#define UE_HW_INFO_ADDR              0x000000A0
+#define UE_CONV_CTRL_ADDR            0x000000A4
+#define UE_CONV_STRIDE_ADDR          0x000000A8
+#define UE_CONV_PIXSTEP_ADDR         0x000000AC
+/* UE_CONV_* are write-only; stop the diagnostic read scan at HW_INFO. */
+#define UE_LAST_REG_ADDR             UE_HW_INFO_ADDR
 
 /* ── Latency constants (from user_dma_core.py pipeline calculations) ── */
 #define UE_PIPELINE_BF19_MULT       2

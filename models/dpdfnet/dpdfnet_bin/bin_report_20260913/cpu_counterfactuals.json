@@ -1,0 +1,158 @@
+{
+  "case": "p257_018",
+  "date_utc": "2026-09-13",
+  "diagnostic_only": true,
+  "source_files_modified": false,
+  "hardware_accessed": false,
+  "method": {
+    "input": "Existing saved16k noisy FLOAT WAV; shared read_audio/synthesize_audio framing and fixed4-hop delay compensation",
+    "inference": "ONNX Runtime CPUExecutionProvider; intra_op_num_threads=inter_op_num_threads=1; fresh recurrentstate per variant; all model edits in memory",
+    "reference": "Existing saved CPU FLOAT WAV; original CPU rerun matched every float32 sample exactly",
+    "comparison": "No extra delay, trimming, gain normalization or fitting before L2 comparison",
+    "onset_interval_seconds": [
+      0.593,
+      0.793
+    ],
+    "onset_slice_samples_half_open": [
+      9488,
+      12688
+    ],
+    "relative_l2_units": "fractions, not percentages",
+    "precision": "Full-clip L2 vs CPU and errorenergy calculations use float64 differences; relativeL2 vsFPGA and onsetgain retain original float32 diagnostic operations",
+    "onset_relative_l2": "Derived from sqrt(variant onset errorenergy / FPGA onset errorenergy) * independently measured FPGA onset relativeL2",
+    "reproduction_script_guards": "Before inference, verify recorded model/input/reference/audio-wrapper hashes; abort if the original CPU rerun does not match reference sample bits. Guards added after the recorded experiment; inference and metric calculations unchanged."
+  },
+  "configurations": {
+    "original": "Pinned ONNX unchanged",
+    "epsilon_zero": "Only epsilon attributes of all8 LayerNormalization nodes set to0",
+    "state_bf16": "All45424 recurrentstate elements rounded BF16 then converted back FP32 before every frame includingfirst",
+    "frontend_state_bf16": "Only state[:128] (32 ERBnorm +96 spectrum norm elements) rounded BF16 before every frame",
+    "constants_bf16_state_bf16": "All float32 ONNX initializers (including learnedweights and scalarconstants) rounded BF16 and stored FP32; all recurrentstate rounded BF16 before every frame"
+  },
+  "confirmed_semantic_mismatch": {
+    "onnx_node_indices": [
+      65,
+      89,
+      102,
+      126,
+      157,
+      181,
+      194,
+      218
+    ],
+    "onnx_epsilon": 9.999999747378752e-06,
+    "compiler_location": "models/dpdfnet/dpdfnet_compile.py:946",
+    "core_locations": [
+      "user_dma_core.py:3687",
+      "user_dma_core.py:3169"
+    ],
+    "description": "Compiler ignores ONNX epsilon. Shared LayerNorm subtracts mean then computes reciprocal RMS without addingepsilon."
+  },
+  "actual_fpga": {
+    "relative_l2_vs_cpu": 0.24774248112402483,
+    "onset_relative_l2_vs_cpu": 0.42877301850574406,
+    "baseline_repeat_optimized_waveform_sample_bits_identical": true,
+    "wav_container_hashes_identical": false
+  },
+  "results": [
+    {
+      "mode": "original",
+      "bit_equal_cpu": true,
+      "relative_l2_vs_cpu": 0.0,
+      "relative_l2_vs_fpga": 0.27380096912384033,
+      "onset_error_energy_vs_fpga_error_energy": 0.0,
+      "error_alignment_with_fpga": null,
+      "onset_gain_vs_cpu": 1.0,
+      "onset_relative_l2_vs_cpu": 0.0
+    },
+    {
+      "mode": "epsilon_zero",
+      "bit_equal_cpu": false,
+      "relative_l2_vs_cpu": 3.7238490032777456e-05,
+      "relative_l2_vs_fpga": 0.2738147974014282,
+      "onset_error_energy_vs_fpga_error_energy": 2.1547683691200303e-08,
+      "error_alignment_with_fpga": -0.335773119073731,
+      "onset_gain_vs_cpu": 1.0000147819519043,
+      "onset_relative_l2_vs_cpu": 6.294014577622568e-05
+    },
+    {
+      "mode": "state_bf16",
+      "bit_equal_cpu": false,
+      "relative_l2_vs_cpu": 0.02239938655249183,
+      "relative_l2_vs_fpga": 0.26514241099357605,
+      "onset_error_energy_vs_fpga_error_energy": 0.008047866020711787,
+      "error_alignment_with_fpga": 0.38944228841493805,
+      "onset_gain_vs_cpu": 0.9888935089111328,
+      "onset_relative_l2_vs_cpu": 0.03846518428473656
+    },
+    {
+      "mode": "frontend_state_bf16",
+      "bit_equal_cpu": false,
+      "relative_l2_vs_cpu": 0.022101379592970805,
+      "relative_l2_vs_fpga": 0.2649801969528198,
+      "onset_error_energy_vs_fpga_error_energy": 0.007862787135231678,
+      "error_alignment_with_fpga": 0.39991098523023744,
+      "onset_gain_vs_cpu": 0.9886585474014282,
+      "onset_relative_l2_vs_cpu": 0.03802031474746447
+    },
+    {
+      "mode": "constants_bf16_state_bf16",
+      "bit_equal_cpu": false,
+      "relative_l2_vs_cpu": 0.023514879156111,
+      "relative_l2_vs_fpga": 0.26339098811149597,
+      "onset_error_energy_vs_fpga_error_energy": 0.008912482510421831,
+      "error_alignment_with_fpga": 0.44040894315197154,
+      "onset_gain_vs_cpu": 0.987295389175415,
+      "onset_relative_l2_vs_cpu": 0.04047872213669935
+    }
+  ],
+  "limitations": [
+    "Not a complete FPGA emulator: no IF8 convolutionweight conversion, hardware accumulatorprecision, LALU approximation, or per-operator intermediateBF16 rounding.",
+    "Counterfactuals do not prove structuralbug or exclude interaction of epsilon omission with other arithmeticdifferences.",
+    "Results apply to this single outlier and do not establish corpuswide sensitivity.",
+    "The epsilon omission barely changes this CPU output and does not independently explain the large FPGA onset error.",
+    "Simplified BF16state/constants counterfactuals reproduce less than0.9% of observed FPGA onset errorenergy."
+  ],
+  "sources": {
+    "noisy_wav": {
+      "path": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/results/p257_018/noisy.wav",
+      "sha256": "7a13108a8a40a94cdf0aa112b04bd2bc9e9bc3c1e2fa5d48abe1a22047db1d04"
+    },
+    "cpu_reference_wav": {
+      "path": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/results/p257_018/cpu.wav",
+      "sha256": "86933ba1fe055fb5a360b687a01f94b015731392302aa6743990dada66f77280"
+    },
+    "fpga_wav": {
+      "path": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/results/p257_018/fpga.wav",
+      "sha256": "862a5a5c5359d5a49ec6b924485d5220ca6caa7af9e20c4eb1de7deaa7fbdc00"
+    },
+    "fpga_repeat_wav": {
+      "path": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/results/p257_018/fpga_repeat.wav",
+      "sha256": "dbcec26423b467a12d8b01696e423b8a51ba045cb1efb6f9e2d86f3f92dce25c"
+    },
+    "fpga_baseline_wav": {
+      "path": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/results/p257_018/fpga_baseline.wav",
+      "sha256": "344722296634ea09a57a8fc5ee6a2b7b8aaccc4de34b775af4ca90040ea615ac"
+    },
+    "onnx_model": {
+      "path": "models/dpdfnet/dpdfnet_bin/dpdfnet2.onnx",
+      "sha256": "4f0ee28935b4a32abecc717d745416976565834d839601acf43031094b4dc94c"
+    },
+    "audio_wrapper": {
+      "path": "models/dpdfnet/dpdfnet_audio.py",
+      "sha256": "35fe44d370109f391a56955769153df72d8029e7058d353bfe1ec58503cacb45"
+    },
+    "compiler": {
+      "path": "models/dpdfnet/dpdfnet_compile.py",
+      "sha256": "d1b7895fe5eb70d2599ee570c17e701e55d932ad0933a5fe171e777d49365c2b"
+    },
+    "shared_core": {
+      "path": "user_dma_core.py",
+      "sha256": "b0c134bc2c5c1c37932cca0f1fea3d17586dc11e64aaa6f3901f2fb1e1059acd"
+    },
+    "reproduction_script": {
+      "path": "models/dpdfnet/dpdfnet_bin/bin_report_20260913/cpu_counterfactuals.py",
+      "sha256": "8630e0134545725cdba948413bfad12b7ef382c8f96ba7f6942e61b74bb1cd3a"
+    }
+  }
+}

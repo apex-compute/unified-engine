@@ -1,0 +1,35 @@
+{
+  "model": "dpdfnet2_8khz",
+  "dpdfnet_package": "0.6.0",
+  "backend": "onnxruntime-cpu",
+  "model_sample_rate": 8000,
+  "n_fft": 160,
+  "hop_length": 80,
+  "freq_bins": 81,
+  "state_size": 37860,
+  "graph_nodes": 492,
+  "onnx_sha256": "6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d",
+  "onnx_path": "/home/hunlu/.cache/dpdfnet/models/dpdfnet2_8khz.onnx",
+  "audio": {
+    "p232_007_noisy_8khz.wav": {
+      "sample_rate": 8000,
+      "samples": 31648,
+      "duration_s": 3.956,
+      "finite": true,
+      "peak": 0.506539523601532,
+      "subtype": "FLOAT",
+      "sha256": "eceada88351289a0f80829a84066a63301f041afecd830ba0300237c558e823c"
+    },
+    "p232_007_enhanced_cpu_8khz.wav": {
+      "sample_rate": 8000,
+      "samples": 31648,
+      "duration_s": 3.956,
+      "finite": true,
+      "peak": 0.4951171875,
+      "subtype": "PCM_16",
+      "sha256": "6114a8451c4c6bcb71e8ce6a64a590b1296004b01b428614e37176c7cae8a2e7"
+    }
+  },
+  "quality_metrics_evaluated": false,
+  "fpga_run": false
+}

@@ -172,9 +172,62 @@ engine today; each folder has its own README/config, and most LLMs ship a
 | GPT-2 | [`models/gpt2`](models/gpt2) | Text LM |
 | LocateAnything 3B | [`models/locateanything_3b`](models/locateanything_3b) | Open-vocabulary localization |
 | MobileNetV2 (224 + SSD-FPNLite 640) | [`models/mobilenetv2`](models/mobilenetv2) | Classification / detection |
+| YOLOv5n | [`models/yolov5n`](models/yolov5n) | Object detection (conv-enabled FPGA image required) |
+| YOLOv5s | [`models/yolov5s`](models/yolov5s) | Object detection (conv-enabled FPGA image required) |
 | Parakeet | [`models/parakeet`](models/parakeet) | Speech recognition (incl. streaming) |
+| UNET | [`models/unet`](models/unet) | Segmentation (conv-enabled FPGA image required) |
+| DPDFnet | [`models/dpdfnet`](models/dpdfnet) | Streaming speech enhancement (conv-enabled FPGA image required) |
 | MobileSAM | [`models/mobilesam`](models/mobilesam) | Segmentation |
 | Swin | [`models/swin`](models/swin) | Image classification |
+
+YOLOv5n has dedicated commands, configuration, cache, and documentation under
+`models/yolov5n`; YOLOv5s is under `models/yolov5s`. The variants share the
+low-level YOLOv5 primitive implementation. Both use native CONV2D/MAXPOOL modes
+and ordered queue-CONFIG geometry from Andromeda's `pcie_conv_maxpool` line.
+See the model READMEs for the required corrected gather-IF8 commit before
+running either model. Select and program a compatible FPGA image separately
+from the model artifact. YOLOv5 is opt-in rather than part of the default suite.
+Both optimized artifacts are strictly validated on timing-clean RK-256 build `eed3a5d9` (WNS `+0.002 ns`,
+TNS `0`). That build includes the read-only `HW_INFO` register and remapped live
+geometry CSRs. The runtime does not enforce an FPGA build-hash allow-list; the
+selected image must provide native CONV, ordered queue-CONFIG, and corrected
+gather-IF8 behavior. The direct-bin queue-CONFIG path does not write those live
+CSRs.
+
+Both variants use a single checkpoint-free model artifact. The canonical model
+test compiles or validates that artifact first, then invokes only the direct-bin
+runtime:
+
+```bash
+make model_test yolov5n
+make model_test yolov5s
+
+# Explicit compile-only targets remain available for deployment preparation.
+make yolov5n_bin
+make yolov5s_bin
+
+# Select any exact profile embedded in the same bin (WIDTHxHEIGHT).
+python3 models/yolov5s/yolov5s_run_from_bin.py --resolution 640x480
+python3 models/yolov5n/yolov5n_run_from_bin.py --list-resolutions
+```
+
+Artifact version 6 is loaded and validated once. One bin embeds precompiled
+profiles for `256x256`, `320x320`, `416x416`, `512x512`, `640x480`, and
+`640x640` inputs. It stores mixed channel-IF4/gather-IF8 tensors and, for each
+profile, one fixed-address deployment image containing both packed parameters
+and one complete graph program. Backend initialization uploads the selected
+deployment image with one bulk H2C write. Each inference then performs exactly
+one packed-image H2C write, one program kick, uninterrupted FPGA execution to
+one terminal HALT, and one bundled result C2H read. There is no host graph
+walk, layer dispatch, concatenation, intermediate transfer, program capture,
+instruction-by-instruction upload, or live geometry-CSR write on the hardware
+path. Decode, NMS, and drawing remain host-side after the final read.
+
+The mixed-precision artifacts require ordered queue-CONFIG geometry and the
+corrected gather-IF8 datapath. The reset used by these runners skips the legacy
+16 KiB DRAM probe so it cannot add hidden H2C/C2H traffic to the model contract.
+Prior per-layer-dispatch performance numbers are not comparable with this
+whole-graph path and are intentionally not reused.
 
 Run the whole suite (or a subset) with the automated tester:
 
@@ -196,6 +249,9 @@ Notes on the two modes:
   model assets on disk. On a deploy host that only has pregenerated
   bins, run the runtime-only subset by name, e.g.
   `make model_test gemma4_e2b llama3.2_1b qwen3_4b run_from_bin`.
+- The `yolov5n` and `yolov5s` entries always validate or compile their artifact
+  before executing the direct-bin runner. With `run_from_bin`, a valid existing
+  artifact is reused.
 
 ---
 

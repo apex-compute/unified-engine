@@ -1,0 +1,4 @@
+# Optional objective speech-quality evaluation dependencies.
+-r requirements.txt
+pystoi==0.4.1
+pesq==0.0.4
