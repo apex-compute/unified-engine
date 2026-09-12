@@ -109,8 +109,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--download", action="store_true")
-    parser.add_argument("--device", choices=("bittware", "bittware_512", "efinix"),
-                        default="bittware_512")
+    parser.add_argument(
+        "--device", choices=("bittware", "bittware_512", "rk", "efinix"),
+        default="bittware_512")
     parser.add_argument("--dev", default="xdma0")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--timeout", type=float, default=300.0)
