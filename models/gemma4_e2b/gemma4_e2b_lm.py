@@ -54,20 +54,23 @@ class Gemma4LMMixin:
         """Copy each engine's column block of the Q/K/V weights into that engine's
         private arena. Returns ``{(op, layer_idx): ShardedWeight}``.
 
-        SCOPE: Q, K and V, every layer -- minus whatever cannot be split at this
-        engine count. Q is the widest N and divides evenly either way (full
-        4096 = 8 x 512, sliding 2048 = 8 x 256). K/V are N=head_dim: 512 on the
-        full layers, which is exactly 8 blocks of 64, but only 256 on the sliding
-        ones, i.e. 4 blocks -- so beyond 4 engines the sliding K/V stay full-width
-        on the master. The MLP is not sharded here.
+        SCOPE: Q, K, V, O and the MLP, every layer. EACH OP IS SHARDED OVER AS
+        MANY ENGINES AS ITS WIDTH CAN FEED (``max_engines=max_shards(N)``), not
+        over all of them or none. Q is wide and divides at any engine count
+        (full 4096 = 64 blocks of 64, sliding 2048 = 32). K/V are N=head_dim:
+        512 on the full layers is 8 blocks, 256 on the sliding ones is 4, so
+        they cap at 8 and 4 engines respectively and the rest emit nothing for
+        that op. Only a weight under two blocks is left full-width on the
+        master -- there is nothing to split there at any engine count.
 
         THE COPY IS THE POINT. Engine i reads its block out of ITS OWN private
         window rather than out of the one shared weight image, so the engines'
         weight streams do not contend for the same memory. Decode is
         bandwidth-bound -- a whole weight block streamed per token -- so sharing
         one image would cap the speedup however evenly the columns divide. Cost is
-        one copy of the sharded weights spread over the engines: 22.3 MB total,
-        2.8 MB per core at 8, against a 224 MB private weight arena each.
+        one copy of the sharded weights spread over the engines: tens of MB
+        total, against a 224 MB (8-core legacy map) or 480 MB (12-core map)
+        private weight arena each.
 
         ONE SHARD PER LAYER (``layers=1``), not one spanning all 35: gemma4
         alternates two attention shapes, so there is no single N. That suits an
@@ -119,33 +122,46 @@ class Gemma4LMMixin:
                           self.DRAM_ADDR_LAYER0_V_PROJ_QUANT,
                           self.DRAM_ADDR_LAYER0_V_PROJ_SCALE)]
             for op, K, N, w_base, s_base in plan:
-                if not mes.can_split(N, sched.num_engines):
-                    # Fewer than one 64-column block per engine (the sliding
-                    # layers' K/V past 4 engines). Left full-width on the master
-                    # rather than asserting inside split_cols.
+                # SHARD OVER AS MANY ENGINES AS THE WIDTH CAN FEED, not all or
+                # nothing. The narrow projections are K/V: N=512 on the full
+                # layers is 8 blocks of 64 and N=256 on the sliding ones is 4,
+                # so past 8 (resp. 4) engines can_split() is false. Dropping
+                # those to full width on the master costs the whole op --
+                # an 8x or 4x regression on that projection -- where capping at
+                # max_shards(N) keeps the engines the width DOES fill busy and
+                # parks only the rest. The engines past the cap still run the
+                # round and emit nothing for this op (ShardedWeight.shard_or_none).
+                _cap = mes.max_shards(N)
+                if _cap < 2:
+                    # Under two 64-column blocks there is nothing to split at
+                    # any engine count; leave it full-width on the master.
                     skipped.append((op, layer_idx))
                     continue
                 shards[(op, layer_idx)] = sched.shard_quantized_weight(
                     name=f"{op}_proj_L{layer_idx}",
                     main_weight_addr=w_base + off, main_scale_addr=s_base + off,
                     K=K, N=N, layers=1, main_layer_stride=0,
-                    data_type=TYPE.IF4, verbose=False)
+                    data_type=TYPE.IF4, max_engines=_cap, verbose=False)
         # LM head: ONE op, outside the layer loop -- it runs once per token and is
         # layer-independent. N=262144 is 4096 blocks of 64, so it splits perfectly
         # at any engine count (32768 columns each at 8).
         self._decode_lm_shard = None
-        if mes.can_split(self.EMBEDDING_ELEMENTS, sched.num_engines):
+        _lm_cap = mes.max_shards(self.EMBEDDING_ELEMENTS)
+        if _lm_cap >= 2:
             self._decode_lm_shard = sched.shard_quantized_weight(
                 name="lm_head",
                 main_weight_addr=self.DRAM_ADDR_LM_HEAD_QUANT,
                 main_scale_addr=self.DRAM_ADDR_LM_HEAD_SCALE,
                 K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
-                layers=1, main_layer_stride=0, data_type=TYPE.IF4, verbose=False)
+                layers=1, main_layer_stride=0, data_type=TYPE.IF4,
+                max_engines=_lm_cap, verbose=False)
         self._decode_qkv_shards = shards
-        used = sched.private_usage()
+        # The 12-core arena always has twelve regions; report only the ones
+        # this run actually activated.
+        used = sched.private_usage()[:sched.num_engines]
         print(f"[Decode] sharded: {len(shards)} projection(s) over "
               f"{sched.num_engines} engines in {time.perf_counter() - t0:.1f}s"
-              f"{f'; {len(skipped)} left on the master' if skipped else ''}; "
+              f"{f'; {len(skipped)} too narrow to split, left on the master' if skipped else ''}; "
               f"private weight arenas: "
               f"{', '.join(f'{u / 2**20:.1f}MB' for u in used)}", flush=True)
         return shards
@@ -317,10 +333,14 @@ class Gemma4LMMixin:
         HF model entirely.
 
         ==================================================================
-        FULL DRAM ADDRESS MAP (upper 2 GB window; 3 arenas, each its own bump
+        FULL DRAM ADDRESS MAP (2 GB model window; 3 arenas, each its own bump
         allocator: allocate_params_dram / allocate_tensor_dram / program DRAM).
         Fixed bases are set in Gemma4_UnifiedEngine.__init__; `~` marks a
         run-time high-water (values shown are the 2-core VLM example).
+
+        ADD 4 GB TO EVERY ADDRESS BELOW ON A 12-CORE BITSTREAM. There the same
+        map is rebased to 0x180000000 .. 0x200000000 so the private windows can
+        own a flat [0, 6 GB); nothing inside the map moves relative to its base.
 
           0x80000000 ┌ PARAMS  (weights, allocate_params_dram) ~1552 MiB ┐
                      │  LM weights ...................... ~1540.4 MB      │
@@ -355,10 +375,16 @@ class Gemma4LMMixin:
           allocated by multi_engine_shard.PrivateArena:
               8 engines -> window i @ i*256 MiB, ISA slice at
               window_top - 32 MiB, 16 MiB (images ~1.7 MB).
+          On a 12-core bitstream the arena is instead the FIXED [0, 6 GB) map of
+          twelve 512 MiB windows, allocated at every engine count: window i @
+          i*512 MiB, same 16 MiB ISA + 16 MiB tensor slices at the top, 480 MiB
+          of private weight arena below them. A run with fewer engines uses the
+          leading windows and leaves the rest untouched.
           Vision and prefill are sequential and share ONE arena object, so
           worker i always executes from the same slice in both stages.
-        Single-core (--multi-core 1) uses only core0/master; no worker ISA, and
-        keeps the original upper-2 GB addresses unchanged.
+        Single-core (--multi-core 1) uses only core0/master; no worker ISA, no
+        private arena, and keeps the original upper-2 GB addresses unchanged on
+        every bitstream.
         ==================================================================
         """
         import mmap as _mmap
@@ -1110,7 +1136,7 @@ class Gemma4LMMixin:
                     total_flops += _emit_prefill_head(
                         self, g, self.LAYER0_FLASH_SCRATCH_DRAM,
                         self.gpr_seq_len, self.gpr_aligned_seq_len)
-            elif prefill_scheduler.num_engines <= self.group_size:
+            else:
                 # Multi core: shard the group heads across engines; each engine
                 # LOOPS its own heads (batch=seq per head — prefill can't stack
                 # heads into one batch, that would break batch<=aligned and the
@@ -1122,6 +1148,8 @@ class Gemma4LMMixin:
                 # the region (workers park at the entry/exit barriers).
                 _attn_flops = [0]
                 def _emit_prefill_attn_shard(ctx):
+                    if not ctx.heads:
+                        return            # capped out by max_engines; barrier only
                     b_reg = ctx.ue.alloc_isa_reg()
                     ctx.ue.generate_instruction_add_set(b_reg, seq_len)
                     a_reg = ctx.ue.alloc_isa_reg()
@@ -1131,23 +1159,19 @@ class Gemma4LMMixin:
                         _attn_flops[0] += _emit_prefill_head(ctx.ue, h, scr, b_reg, a_reg)
                     ctx.ue.release_isa_reg()
                     ctx.ue.release_isa_reg()
+                # max_engines: Gemma4 E2B has eight LM query/KV groups, so on a
+                # 9-12 engine board there are fewer heads than engines. The cap
+                # runs attention on the first group_size engines and parks the
+                # rest at the region's rendezvous -- which is what the barrier
+                # sequence does anyway, so the program shape is unchanged. The
+                # alternative, falling back to attention on the primary alone,
+                # costs 8x on this phase and more than eats the gain the
+                # projection and MLP regions get from the extra engines.
                 prefill_scheduler.head_sharded_region(
                     self.group_size, per_head_rows, cur_head_dim,
-                    _emit_prefill_attn_shard, gqa_ratio=1)
+                    _emit_prefill_attn_shard, gqa_ratio=1,
+                    max_engines=self.group_size)
                 total_flops += _attn_flops[0]
-            else:
-                # Gemma4 E2B has eight LM query/KV groups. With 9-12 engines
-                # there are fewer heads than engines, so head sharding cannot
-                # give every engine non-empty work. Keep all workers in the
-                # program's barrier sequence and execute attention on the
-                # primary; projection and post-attention regions still use all
-                # selected engines.
-                prefill_scheduler.barrier()
-                for g in range(self.group_size):
-                    total_flops += _emit_prefill_head(
-                        self, g, self.LAYER0_FLASH_SCRATCH_DRAM,
-                        self.gpr_seq_len, self.gpr_aligned_seq_len)
-                prefill_scheduler.barrier()
             # Permute the head-major attention output back to token-major for O-proj.
             for g in range(self.group_size):
                 self._emit_strided_copy_pbi(
@@ -1741,7 +1765,9 @@ class Gemma4LMMixin:
             the shared input every engine reads in full (PRE_NORM for Q/K/V,
             FLASH_OUTPUT for O), and only the output slice is per-engine.
             """
-            sh = sw.shard(e)
+            sh = sw.shard_or_none(e)
+            if sh is None:
+                return 0          # past this weight's max_engines cap: round only
             out_off = sh.col_offset * self.bytes_per_element
             # A shard is a whole multiple of UE_VECTOR_SIZE (64), so at bf16 the
             # output offset is a whole 128-byte SRAM row. Asserted rather than

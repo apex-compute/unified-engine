@@ -30,6 +30,8 @@ python models/gemma3/gemma3_test.py --dev xdma0 --multi-core 8 --profile
 | Prefill throughput (GFLOPS) | 42.18 | 42.17 | 1.00× |
 | — utilization (% peak) | 89.9% | 11.2% † | |
 | Prefill end-to-end (CPU) (s) | 0.64 | 0.64 | |
+| Time to first token (TTFT, CPU) (s) | 0.64 | 0.64 | 1.00× |
+| Time to first token (TTFT, HW counter) (ms) | 638.73 | 638.87 | 1.00× |
 | **DECODE** |
 | Decoded tokens | 76 (total 95) | 76 (total 95) | |
 | Decode 1st-token speed (tok/s, HW counter) | 18.64 | **85.91** | 4.61× |

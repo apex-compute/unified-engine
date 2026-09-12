@@ -1112,7 +1112,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x0b63cb60, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x0b63cb60. Please update FPGA with commit update_b63cb60.bin using update_flash.py"
+        assert hw_version == 0xfe984d16, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xfe984d16. Please update FPGA with commit update_fe984d16.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
