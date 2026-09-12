@@ -1,0 +1,4 @@
+onnx>=1.17,<2
+onnxruntime>=1.20,<2
+soundfile>=0.12,<1
+# torch and torchaudio are already repository-wide runtime dependencies.
