@@ -1,0 +1,66 @@
+{
+  "artifact": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/dpdfnet2-andromeda.bin",
+  "artifact_bytes": 17984019,
+  "artifact_sha256": "4f540ae650c27d822f4da24cfb0a0ac7f9cf33e53e84cbd9ce2fc7f1cdd5fc77",
+  "format": "andromeda.dpdfnet2.streaming-v2",
+  "precision": "BF16/IF8-INT",
+  "onnx_sha256": "4f0ee28935b4a32abecc717d745416976565834d839601acf43031094b4dc94c",
+  "uploaded_image_bytes": 17863808,
+  "uploaded_image_sha256": "c997284c3c8ef0a4a82078b3abaf2fa6d33754640b18c061845bf68ee958b59d",
+  "program_offset": 16575360,
+  "instruction_bytes": 32,
+  "instructions": 40264,
+  "graph_operations": 472,
+  "operations_with_state_commit": 473,
+  "instruction_counts": {
+    "0": {
+      "names": [
+        "INSTRUCTION_UE_OP"
+      ],
+      "count": 40246
+    },
+    "9": {
+      "names": [
+        "INSTRUCTION_HALT"
+      ],
+      "count": 1
+    },
+    "10": {
+      "names": [
+        "INSTRUCTION_NOP"
+      ],
+      "count": 2
+    },
+    "12": {
+      "names": [
+        "INSTRUCTION_CONFIG"
+      ],
+      "count": 15
+    }
+  },
+  "files": {
+    "dpdfnet2.instructions.bin": {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/bin_report_20260913/dpdfnet2.instructions.bin",
+      "bytes": 1288448,
+      "mib": 1.228759765625,
+      "load_address": "0x90fceb80",
+      "sha256": "899b85840eacc47bb0c8206dc908dbb7e10de35e54de500e5b06c757a79ae897",
+      "description": "Raw 32-byte Andromeda instructions, including the terminal HALT."
+    },
+    "dpdfnet2.params-data.bin": {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/bin_report_20260913/dpdfnet2.params-data.bin",
+      "bytes": 16575360,
+      "mib": 15.8074951171875,
+      "load_address": "0x90000000",
+      "sha256": "487efdca08cc3d60638a4309604743a685f55077414e4a99857af221f9b73948",
+      "description": "Complete pre-program deployment data: packed weights/scales/biases, constants/selectors, zero data, initial recurrent state and alignment padding; not a pure learned-weights file."
+    }
+  },
+  "validation": {
+    "deployment_manifest_and_checksums_valid": true,
+    "split_recombines_exactly": true,
+    "terminal_halts": 1,
+    "halt_index": 40263
+  },
+  "usage": "These raw files were extracted for inspection. The production runner continues to load the original combined dpdfnet2-andromeda.bin. Addresses are model accelerator-memory addresses, not MMIO register bases."
+}
