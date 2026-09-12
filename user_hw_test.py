@@ -78,6 +78,64 @@ _RNG_SEED = None
 _MAX_RNG_ALIGNED_AXI_DATA_WIDTH_BITS = 512
 # Allow a 0.5% decode-cost penalty for the dynamic Gemma3 hardware change.
 GEMMA3_HARDWARE_PENALTY_FACTOR = 1.005
+
+# Gemma3 IF4 greedy-decode golden, shared by the single-core and multi-core
+# inference tests. ONE copy on purpose: sharding is a performance change, so the
+# multi-core run must reproduce this byte for byte -- a separate copy would let
+# the two drift and hide exactly the bug the multi-core test exists to catch.
+# Refreshed 2026-08-19 for the proper-GQA prefill (per-head loop over the compact
+# K/V; the old duplicate-KV + plain-tril path under-weighted the diagonal token
+# for non-last query heads). The legacy/streaming/matmatmul labels all share it.
+GEMMA3_EXPECTED_TEXT = (
+    "If you add 3 to both sides of the equation, you get:\n\n"
+    "x + 3 + 3 = 5 + 3\n\n"
+    "This simplifies to:\n\n"
+    "x + 6 = 8\n\n"
+    "Now, subtract 6 from both sides:\n\n"
+    "x = 8 - 6\n\n"
+    "Therefore, x = 2\n\n"
+    "So the answer is **2**"
+)
+GEMMA3_EXPECTED_TOKENS = 76
+
+# Peak (1st-token) decode floor for the default kernel config, in cycles/token so
+# it is clock-independent. The multi-core test derives its own floor from this
+# one -- floor / cores * coefficient -- so a change here propagates to both.
+_GEMMA3_SINGLE_CORE_MAX_CYCLES_PER_TOKEN = 20_000_000
+# Multi-core decode floors, MEASURED per core count rather than derived from the
+# single-core floor. Scaling is set by DRAM bandwidth, not by core count, and the
+# two boards differ in kind:
+#
+#   2 cores (kintex7, DDR3)  measured 6,108 MB/s with one engine reading and only
+#       7,149 MB/s with two -- 1.17x aggregate for 2x the readers, i.e. the
+#       controller is already saturated by a single engine. Decode streams ~500 MB
+#       of IF4 weights per token and runs at 81-87% of that ceiling, so 1.09x is
+#       very nearly all the hardware can give. A derived floor (floor/cores, or
+#       even floor/sqrt(cores) = 14.2M) is unreachable here however correct the
+#       sharding is.
+#   8 cores (alveo, HBM)     bandwidth scales with the engines, so decode reaches
+#       4.31x and the floor can be tight enough to catch a real regression.
+#
+# Values carry deliberate slack over the measurements below, because DRAM speed is
+# the least stable thing being measured here -- it moves with refresh, temperature
+# and whatever else is touching memory:
+#   2 cores: 17,111,832 measured (11.59 tok/s, twice)      -> floor 19,500,000
+#   8 cores: 4,561,728 / 4,566,164 / 4,774,495 measured    -> floor  6,500,000
+#
+# NOTE the 2-core floor is a sanity check, not a sharding check: unsharded decode
+# on that board is ~18.7M cycles/tok, only 9% away from the 17.1M a correct run
+# achieves, so no threshold can separate them with slack left over. On DDR3 the
+# exact-text and token-count assertions are what actually guard sharding; here the
+# speed floor only catches gross breakage.
+#
+# Core counts with no entry do not run the test at all -- a floor guessed for
+# hardware nobody has measured is worse than no floor.
+_GEMMA3_MULTI_CORE_MAX_CYCLES_PER_TOKEN = {
+    2: 19_500_000,
+    8: 6_500_000,
+}
+
+
 KINTEX7_SYSTOLIC_CSR_BASE_ADDR = 0x02020000
 
 
@@ -824,8 +882,6 @@ def matmat_mul_two_cores_unified_test(
 def matmat_mul_multi_cores_unified_test(
     runtime_list=None,
     num_engines: int = 8,
-    weight_mode: str = "private",
-    also_run_shared_dynamic: bool = True,
     softmax_enable: bool = False,
     gelu_enable: bool = False,
     silu_enable: bool = False,
@@ -837,14 +893,6 @@ def matmat_mul_multi_cores_unified_test(
 ):
     """Run RNG-matched legacy/dynamic multi-core matmuls (M sharded across num_engines).
 
-    ``weight_mode="private"`` gives every engine a full private copy of B in
-    its tensor window (the historical layout). ``weight_mode="shared"`` puts
-    one full B in engine 0's tensor window and every engine reads that same
-    flat DRAM address; A and output remain M-sharded/private in both modes.
-    With the default private mode, a fourth leg also runs the dynamic multicore
-    workload with shared B, so private-vs-shared bandwidth is directly visible
-    without duplicating the one-core baseline or legacy leg.
-
     Each shape first runs the DYNAMIC path on ONE engine to get the FPGA-side
     single-core execution time; that latency is the baseline every multi-core
     leg's speedup is computed against. A summary table of all shapes, legs,
@@ -855,19 +903,14 @@ def matmat_mul_multi_cores_unified_test(
     if runtime_list is None:
         runtime_list = [(4096, 4096, 4096)]
     assert runtime_list, "runtime_list must be non-empty"
-    if weight_mode not in ("private", "shared"):
-        raise ValueError(
-            f"weight_mode must be 'private' or 'shared', got {weight_mode!r}")
 
     # Per-shape 1-engine dynamic latency (us), and the collected summary rows.
     baseline_us = {}
     summary_rows = []
 
-    def _run_case(M, K, N, dynamic, ne=None, run_weight_mode=None):
+    def _run_case(M, K, N, dynamic, ne=None):
         if ne is None:
             ne = num_engines
-        if run_weight_mode is None:
-            run_weight_mode = weight_mode
         bytes_per_element = 2
         ues = _make_multi_engine_ues(ne)[0]
 
@@ -882,24 +925,14 @@ def matmat_mul_multi_cores_unified_test(
         a_addrs = []
         b_addrs = []
         out_addrs = []
-        shared_b_addr = None
-        if run_weight_mode == "shared":
-            # DRAM is flat across engines: one B allocation in engine 0's
-            # window is a legal read address for every worker. Do not allocate
-            # any worker B buffers or duplicate the DMA write in this mode.
-            shared_b_addr = ues[0].allocate_tensor_dram(N * K * bytes_per_element)
-            ues[0].dma_to_accelerator_memory(shared_b_addr, b)
         row_base = 0
         for ue, m_engine in zip(ues, m_shards):
             row_end = row_base + m_engine
             a_addr = ue.allocate_tensor_dram(m_engine * K * bytes_per_element)
-            if run_weight_mode == "private":
-                b_addr = ue.allocate_tensor_dram(N * K * bytes_per_element)
-                ue.dma_to_accelerator_memory(b_addr, b)
-            else:
-                b_addr = shared_b_addr
+            b_addr = ue.allocate_tensor_dram(N * K * bytes_per_element)
             out_addr = ue.allocate_tensor_dram(m_engine * N * bytes_per_element)
             ue.dma_to_accelerator_memory(a_addr, a[row_base:row_end, :])
+            ue.dma_to_accelerator_memory(b_addr, b)
             a_addrs.append(a_addr)
             b_addrs.append(b_addr)
             out_addrs.append(out_addr)
@@ -1042,8 +1075,6 @@ def matmat_mul_multi_cores_unified_test(
         if clamp_enable:   flags.append("clamp")
         if log_enable:     flags.append("log")
         if dynamic:        flags.append("dynamic")
-        if run_weight_mode == "shared":
-            flags.append("shared")
         if input_scale != 1.0: flags.append(f"scale={input_scale:g}")
         flag_str = ("+" + "+".join(flags)) if flags else ""
         is_baseline = (ne == 1 and dynamic)
@@ -1063,7 +1094,6 @@ def matmat_mul_multi_cores_unified_test(
             "shape": f"{M}x{K}x{N}",
             "leg": "1-core baseline (dynamic)" if is_baseline
                    else ("dynamic" if dynamic else "legacy"),
-            "weight_mode": run_weight_mode,
             "engines": ne,
             "latency_us": latency_us,
             "gflops": flop_rate_gflops,
@@ -1097,21 +1127,12 @@ def matmat_mul_multi_cores_unified_test(
             lambda M=M, K=K, N=N: _run_case(M, K, N, dynamic=False),
             lambda M=M, K=K, N=N: _run_case(M, K, N, dynamic=True),
         )
-        if also_run_shared_dynamic and weight_mode == "private":
-            # Reuse the exact same random A/B as the private legacy/dynamic
-            # pair. This is intentionally only one extra leg: the 1-core
-            # baseline has no inter-engine weight-layout distinction, and the
-            # requested comparison is dynamic private versus dynamic shared.
-            _restore_rng_state(rng_state)
-            _run_case(M, K, N, dynamic=True, run_weight_mode="shared")
 
     # ---- Summary -----------------------------------------------------------
-    mode_summary = ("private + shared-dynamic" if also_run_shared_dynamic
-                    and weight_mode == "private" else weight_mode)
     print(f"\n=== matmat_mul_multi_cores_unified_test summary "
           f"({num_engines} engines; speedup vs 1-core dynamic FPGA time; "
-          f"%peak vs each leg's own engine-count peak; weights={mode_summary}) ===")
-    header = (f"{'shape (MxKxN)':<20}{'leg':<28}{'weights':<10}{'eng':>5}"
+          f"%peak vs each leg's own engine-count peak) ===")
+    header = (f"{'shape (MxKxN)':<20}{'leg':<28}{'eng':>5}"
               f"{'latency(us)':>14}{'GFLOPS':>12}{'%peak':>9}"
               f"{'SNR(dB)':>10}{'speedup':>10}")
     print(header)
@@ -1121,7 +1142,7 @@ def matmat_mul_multi_cores_unified_test(
         snr_str = "inf" if snr == float("inf") else f"{snr:.1f}"
         spd = row["speedup"]
         spd_str = "base" if spd is None else f"{spd:.2f}x"
-        print(f"{row['shape']:<20}{row['leg']:<28}{row['weight_mode']:<10}{row['engines']:>5}"
+        print(f"{row['shape']:<20}{row['leg']:<28}{row['engines']:>5}"
               f"{row['latency_us']:>14.1f}{row['gflops']:>12.2f}"
               f"{row['peak_pct']:>8.2f}%{snr_str:>10}{spd_str:>10}")
     print("-" * len(header))
@@ -6963,17 +6984,8 @@ def gemma3_inference_test() -> None:
     # reference). IF4's greedy decode shifted to this coherent completion; the
     # legacy/streaming/matmatmul labels all share this golden (all use the same
     # corrected prefill attention).
-    expected_text = (
-        "If you add 3 to both sides of the equation, you get:\n\n"
-        "x + 3 + 3 = 5 + 3\n\n"
-        "This simplifies to:\n\n"
-        "x + 6 = 8\n\n"
-        "Now, subtract 6 from both sides:\n\n"
-        "x = 8 - 6\n\n"
-        "Therefore, x = 2\n\n"
-        "So the answer is **2**"
-    )
-    expected_tokens = 76
+    expected_text = GEMMA3_EXPECTED_TEXT
+    expected_tokens = GEMMA3_EXPECTED_TOKENS
     token_tol = 0
 
     # Peak (1st-token) decode throughput floors were measured on bittware
@@ -7159,6 +7171,92 @@ def gemma3_if8_inference_test() -> None:
         )
         record_test(f"gemma3_if8_inference_{label}", dims=dims, inst_bytes=inst_bytes,
                     merge_metric_cols=True)
+
+
+def gemma3_multi_core_inference_test(num_engines: int) -> None:
+    """Run Gemma3 IF4 streaming inference across ``num_engines`` cores.
+
+    Sharding is a PERFORMANCE change, not a numerical one: the decoded text and
+    token count must match the single-core golden byte for byte. They share one
+    module-level golden precisely so this cannot be "fixed" by widening a
+    tolerance -- a difference here means a shard boundary, a rendezvous or a
+    private-arena address is wrong, and the coherent-looking text a bad shard
+    produces is exactly what an exact-match check catches and an eyeball does not.
+
+    Speed is asserted in cycles/token, like the single-core test, so the floor is
+    clock-independent. The threshold is deliberately loose: its job is to catch
+    sharding silently degenerating to single-core work (~20M cycles/tok), not to
+    police the last few percent of a speedup.
+    """
+    gemma3_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "gemma3")
+    if gemma3_dir not in sys.path:
+        sys.path.insert(0, gemma3_dir)
+    from gemma3_test import Gemma3_UnifiedEngine
+    import user_dma_core
+
+    # Derived from the single-core floor rather than measured independently, so
+    # the two stay tied: perfect scaling would be floor/cores, and the
+    # coefficient is the slack for the part of a decode step that does not shard
+    # (rope, attention, the norms) plus per-round rendezvous cost.
+    # Measured per core count; see the table for why this is not derived.
+    max_cycles_per_token = int(_GEMMA3_MULTI_CORE_MAX_CYCLES_PER_TOKEN[num_engines]
+                               * GEMMA3_HARDWARE_PENALTY_FACTOR)
+
+    # Workers have to be reset for the core count they will run at, and
+    # setup_multi_core() is what brings up the scheduler and copies each
+    # engine's weight shard -- main() does both, and without them the engine
+    # constructs with multi_core=N but decodes at single-core speed.
+    software_reset_test(cores=num_engines)
+    ue = Gemma3_UnifiedEngine(multi_core=num_engines)
+    ue.set_prefill_seq()
+    ue.setup_multi_core()
+    ue.compile_gemma3()
+    result = ue.run_gemma3()
+    # After construction: HW_INFO is the source for the clock.
+    _clock_ns = user_dma_core.CLOCK_CYCLE_TIME_NS
+
+    label = f"multi_core_{num_engines}"
+    decoded_text = result["decoded_text"].strip()
+    tokens_decoded = result["tokens_decoded"]
+    assert decoded_text == GEMMA3_EXPECTED_TEXT, (
+        f"Gemma3 {label}: decoded text does not exactly match the single-core golden.\n"
+        f"  expected reference: {GEMMA3_EXPECTED_TEXT!r}\n"
+        f"  got:                {decoded_text!r}"
+    )
+    assert tokens_decoded == GEMMA3_EXPECTED_TOKENS, (
+        f"Gemma3 {label}: token count mismatch "
+        f"(expected {GEMMA3_EXPECTED_TOKENS}, got {tokens_decoded}).\n"
+        f"  got text: {decoded_text!r}"
+    )
+
+    peak_tokens_per_s = result["peak_tokens_per_s"]
+    cycles_per_token = (
+        (1e9 / peak_tokens_per_s) / _clock_ns if peak_tokens_per_s > 0 else math.inf
+    )
+    assert cycles_per_token < max_cycles_per_token, (
+        f"Gemma3 {label}: peak decode cost {cycles_per_token:,.0f} cycles/tok "
+        f"({peak_tokens_per_s:.2f} tok/s @ {_clock_ns:.4f} ns/cycle) "
+        f"exceeds required {max_cycles_per_token:,} cycles/tok."
+    )
+
+    inst_bin = os.path.join(ue.script_dir, "gemma3_bin/gemma3_program.bin")
+    inst_bytes = os.path.getsize(inst_bin) if os.path.exists(inst_bin) else None
+    prefill_toks = result["prefill_tokens"]
+    ttft_s = result["prefill_hw_ms"] / 1000.0
+    print(
+        f"Gemma3 {label} inference OK: 'x = 2' found, "
+        f"prefill_toks={prefill_toks}, decoded_toks={tokens_decoded}, "
+        f"TTFT={ttft_s:.2f} s, decode_peak={peak_tokens_per_s:.2f} tok/s "
+        f"({cycles_per_token:,.0f} cycles/tok), "
+        f"bin {inst_bytes if inst_bytes is not None else 'n/a'} bytes."
+    )
+    dims = (
+        f"engines={num_engines}, prefill_toks={prefill_toks}, "
+        f"decoded_toks={tokens_decoded}, TTFT={ttft_s:.2f} s, "
+        f"decode_peak={peak_tokens_per_s:.2f} tok/s"
+    )
+    record_test(f"gemma3_inference_{label}", dims=dims, inst_bytes=inst_bytes,
+                merge_metric_cols=True)
 
 
 def _llama32_1b_inference_test(module_filename: str, class_name: str, label_prefix: str,
@@ -7779,6 +7877,17 @@ if __name__ == "__main__":
 
     gemma3_inference_test()
     gemma3_if8_inference_test()
+    # One multi-core case, default kernel config, only on core counts with a
+    # measured floor (see _GEMMA3_MULTI_CORE_MAX_CYCLES_PER_TOKEN). No IF8
+    # counterpart: gemma3_test_IF8.py has no multi-core path (no multi_core
+    # argument, no scheduler) -- add one there first and this gains a
+    # gemma3_if8_multi_core case.
+    if engine_count in _GEMMA3_MULTI_CORE_MAX_CYCLES_PER_TOKEN:
+        gemma3_multi_core_inference_test(num_engines=engine_count)
+    elif engine_count > 1:
+        print(f"Gemma3 multi-core inference: skipped, no measured decode floor "
+              f"for {engine_count} core(s) "
+              f"(have {sorted(_GEMMA3_MULTI_CORE_MAX_CYCLES_PER_TOKEN)})")
 
     llama32_1b_inference_test()
     llama32_1b_if8_inference_test()
