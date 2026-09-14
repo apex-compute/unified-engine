@@ -143,6 +143,8 @@ The checked-in [listening samples](validation/20260914_dual_rate/samples/README.
 include noisy, CPU and FPGA audio for both recordings at each model's native
 rate. Their hashes and sample counts are in
 [listening_samples.json](validation/20260914_dual_rate/listening_samples.json).
+Five [longer noisy test sequences](validation/20260914_noisy20s/README.md),
+each over 20 seconds, also provide committed inputs and both FPGA outputs.
 
 A limited clean-reference check on `p257_018`, evaluating all outputs in the
 common 8-kHz band, gives PESQ-NB 3.670 noisy, 4.127 FPGA-8k and 3.638 FPGA-16k;

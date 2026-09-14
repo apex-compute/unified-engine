@@ -16,6 +16,8 @@ baseline on 1,362 frames, including exact-zero silence. See
 The [matched 8-kHz/16-kHz benchmark](../dpdfnet/DUAL_RATE_BENCHMARK.md) compares
 both deployed bins on the same source recordings and verifies their per-hop
 DRAM transfer and execution sequence.
+For longer listening examples, the [20-second noisy test collection](../dpdfnet/validation/20260914_noisy20s/README.md)
+contains five environments, their noisy inputs and both models' FPGA outputs.
 
 Install the model-specific dependencies from the repository root, using an
 environment with the repository's matching `torch` and `torchaudio` packages:
