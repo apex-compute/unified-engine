@@ -1,0 +1,5 @@
+numpy>=1.26,<3
+torch>=2.1
+einops>=0.8,<1
+soundfile>=0.12,<1
+librosa>=0.10,<2
