@@ -1,5 +1,11 @@
 # DPDFNet2 tests with recorded environmental noise
 
+The [20-second noisy test collection](validation/20260914_noisy20s/README.md)
+adds five 20.5–23.7-second sequences and FPGA output WAVs from both native
+8-kHz and existing 16-kHz models on build `df0749de`. These join complete
+utterances from the pinned source mixtures; their timings and comparisons
+are separate from the historical 20-clip quality evaluation below.
+
 On 2026-09-13, Italy RK-256 processed 20 paired noisy-speech test clips and
 two clean-speech controls through the production WAV-to-WAV bin runner.
 All 9,890 frames completed with finite output. Average quality improved,
