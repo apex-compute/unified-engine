@@ -1,0 +1,124 @@
+{
+  "format": "bigcodec-optimization-candidate-manifest-v1",
+  "scope": "Software-validated candidates; FPGA timing and accuracy pending hardware readiness",
+  "files": {
+    "README.md": {
+      "bytes": 5238,
+      "sha256": "e59c8a25b222ad953e3ee9db9eabe54e4e7ff8db7e5d30e988fb38157f930b74"
+    },
+    "candidate_artifacts.json": {
+      "bytes": 3485,
+      "sha256": "302757f784bf1c09f24700210eb09cb2a4007013087feda87ecddfda05e38b9a"
+    },
+    "convolution_traffic_estimate.json": {
+      "bytes": 3631,
+      "sha256": "10395290cfc507ee35c80ff0a72fc3b6d35f8616c44d7edb7eed664f9f4a7daa"
+    },
+    "hardware_readiness.json": {
+      "bytes": 735,
+      "sha256": "1a89287177138738b7a687e51a30a6ee4fd18a47fa8c9d8a96cd040707ebdf14"
+    },
+    "if8_lstm_cpu_probe.json": {
+      "bytes": 9760,
+      "sha256": "79a4fe4f3d75af2f57d311833d00d359d02e8a1fc576b4048116bda5c329141b"
+    },
+    "software_tests.txt": {
+      "bytes": 436,
+      "sha256": "7baba47cd744bd1854914c0bebb24113f470b78dbce6d36621375963fd88fd5b"
+    }
+  },
+  "source_files": {
+    "models/bigcodec/bigcodec_activation.py": {
+      "bytes": 12201,
+      "sha256": "614fc7eef0a0dc77ed69500ef58d3797f4299a5b6986811a79d470bcd4678794"
+    },
+    "models/bigcodec/bigcodec_common.py": {
+      "bytes": 7451,
+      "sha256": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6"
+    },
+    "models/bigcodec/bigcodec_compare.py": {
+      "bytes": 6108,
+      "sha256": "42219382a6031722f89f4530ac2f1b4e028be391e5f1da5ab62ffcf6fed6c9e2"
+    },
+    "models/bigcodec/bigcodec_compile.py": {
+      "bytes": 31116,
+      "sha256": "ee481d5c61b9543fde67e583df12a88b8322e99a4dbae6824de7729feda7ce4e"
+    },
+    "models/bigcodec/bigcodec_conv.py": {
+      "bytes": 24176,
+      "sha256": "8718ec8441ad9195ebcdf232ffe21ccfb3bc55d836cef1c25098f98b9e632b53"
+    },
+    "models/bigcodec/bigcodec_conv_bf16.py": {
+      "bytes": 18212,
+      "sha256": "e60caa1cc611160db23de9e8590c18111c2cf283f414b34651e8ddd1943d87a7"
+    },
+    "models/bigcodec/bigcodec_device.py": {
+      "bytes": 12281,
+      "sha256": "f177f696fec467d607fe34631ea61780139e89ba3ca3f58d727de6c54c8ed36c"
+    },
+    "models/bigcodec/bigcodec_fetch.py": {
+      "bytes": 1757,
+      "sha256": "d8c2404b53ed5dda2866e7883042af7f37ed0067f84d4393f28222beb9cd7a0e"
+    },
+    "models/bigcodec/bigcodec_lstm.py": {
+      "bytes": 21012,
+      "sha256": "7b2ae83dbe918816fda8cc2ce80781c79712e7427fff33a8afd49b3ef29efbb2"
+    },
+    "models/bigcodec/bigcodec_precompiled.py": {
+      "bytes": 16788,
+      "sha256": "10dfa6a07320d746e5f8b3bbb7f63463cb55faa1770244ddf635c4736ff9ee23"
+    },
+    "models/bigcodec/bigcodec_quantizer.py": {
+      "bytes": 17568,
+      "sha256": "b2bd4350bd1b581f41dc1d73e6e70901f6c8d614a22e262412d1e1089c8772e7"
+    },
+    "models/bigcodec/bigcodec_run_cpu.py": {
+      "bytes": 6293,
+      "sha256": "d6b5abd1fe8beb3bdb11f90f6b7e7004469fac0baa35206007274093687dd37f"
+    },
+    "models/bigcodec/bigcodec_run_from_bin.py": {
+      "bytes": 7691,
+      "sha256": "9c4421116b1d022070feeefbbaf2be4409fcb017afd97c272f1c3d8793a07e53"
+    },
+    "models/bigcodec/test_bigcodec_activation.py": {
+      "bytes": 21027,
+      "sha256": "00f44584798161b3e094b127f33584507bab4c78e0d47dbca03ab09c45aef9c9"
+    },
+    "models/bigcodec/test_bigcodec_common.py": {
+      "bytes": 3812,
+      "sha256": "1a96d2eef10afec5ab1f4c9b04ab39ae8f3f629788944b0958b557951c2bea9a"
+    },
+    "models/bigcodec/test_bigcodec_compare.py": {
+      "bytes": 11470,
+      "sha256": "d27bb6f18fd8bf53748820feb29e2ddaa3e51a1e4708fdbd79872e828ac72903"
+    },
+    "models/bigcodec/test_bigcodec_compile.py": {
+      "bytes": 7021,
+      "sha256": "e9944219d2043ff518598feb756380e6ef5216a864cc4a57661dbc0e02349fa2"
+    },
+    "models/bigcodec/test_bigcodec_conv.py": {
+      "bytes": 17024,
+      "sha256": "d1dcedb22dca7fe59df3c3dd9e93ea11d13ffc5ee56198eb7f95ab1c9a39b65b"
+    },
+    "models/bigcodec/test_bigcodec_conv_bf16.py": {
+      "bytes": 23754,
+      "sha256": "a5ef4fdab941aa396b3dc96a277fdb04a3d484769756e909e0def44e54433132"
+    },
+    "models/bigcodec/test_bigcodec_lstm.py": {
+      "bytes": 23388,
+      "sha256": "252e9c1d9aedcd7cbb07aea0c928c96cd619e6ed5ba29fc8891d316ff6f5d1d8"
+    },
+    "models/bigcodec/test_bigcodec_quantizer.py": {
+      "bytes": 16361,
+      "sha256": "ae8e0027635fb13b2916bf97601a2b836d5d6586fda4abf9aa25b94dc2439c0e"
+    },
+    "models/bigcodec/test_bigcodec_runtime.py": {
+      "bytes": 21364,
+      "sha256": "e25dcd1b8fca7c55ed1230e06b5fc3b4a9b48c5215592e90953e05bbe885867e"
+    },
+    "models/bigcodec/test_bigcodec_waveform_tanh.py": {
+      "bytes": 8284,
+      "sha256": "7044e612148bcf8451211d291f98bb6b2037a4502996cfbbc04d3d78acee4ce0"
+    }
+  }
+}

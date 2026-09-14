@@ -1,13 +1,18 @@
-"""BF16 BigCodec convolutions using bounded device im2col and matrix multiply.
+"""BF16 BigCodec convolutions using overlapping SRAM windows and matrix dots.
 
 All neural arithmetic stays in the resident instruction stream. Weights have
 one BF16 copy in the image, independent of audio length. Tensors retain the
 shared ``[time, pad64(channels)]`` ABI. Learned transpose convolutions use
 exact polyphase kernels, including their output-padding samples.
+
+The default emitter gathers a source window once and reuses it for many
+dots, including decimated windows for dilation. ``plan['use_sram'] = False``
+retains the original device-im2col path for diagnostic comparisons.
 """
 
 from __future__ import annotations
 
+import math
 import torch
 
 from bigcodec_conv import (
@@ -204,6 +209,113 @@ def _stage_patches(engine, plan, phase, *, first, take, row_bytes):
                 0, memcpy_length_bytes=patch_row_bytes)
 
 
+def _anchor(engine):
+    engine.generate_instruction_jump_abs(udc.ue_35bit_addr_shifter(
+        engine.get_program_dram_addr() + (engine.capture_count + 1) * udc.INSTRUCTION_SIZE_BYTES))
+
+
+def _dot_rows(engine, *, rows, K, N, input_step_bytes, output_sram, bias_enable):
+    """Reuse one resident weight strip, advancing overlapping SRAM windows."""
+    output_row_bytes = shared._align_up(N, 64) * 2
+    if rows <= 4:
+        for row in range(rows):
+            engine.start_queue_for_bf16_matvec_operation(
+                max_clear_en=0, fmax_context_addr=0,
+                vector_sram_start_addr=row * input_step_bytes,
+                matrix_sram_start_addr=0x80000,
+                output_sram_wb_addr=output_sram + row * output_row_bytes,
+                K=K, N=N, bias_enable=bias_enable)
+        return
+    pointer = engine.alloc_inst_ptr()
+    try:
+        engine.generate_instruction_pbi_init(
+            dma_length=K * N, output_size=N, uram_length=K // 64,
+            uram_wb_addr=output_sram // 128, inst_pointer_idx=pointer)
+        _anchor(engine)
+        engine.loop_start(loop_cnt=rows)
+        # Pointer fields are used before their literal post-increments. K/N
+        # stay resident; only input and output row cursors advance per dot.
+        engine.start_queue_for_bf16_matvec_operation(
+            max_clear_en=0, fmax_context_addr=0,
+            vector_sram_start_addr=input_step_bytes,
+            matrix_sram_start_addr=0x80000,
+            output_sram_wb_addr=output_row_bytes,
+            K=0, N=0, bias_enable=bias_enable,
+            inst_pointer_idx=pointer)
+        engine.loop_end()
+    finally:
+        engine.release_inst_ptr(pointer)
+
+
+def _write_sram_rows(engine, *, source, destination, rows, outputs, destination_stride):
+    if outputs % 64 == 0:
+        shared._copy_contiguous_or_strided_write(
+            engine, sram=source, destination=destination,
+            total=rows * outputs * 2, chunk=outputs * 2, jump=destination_stride)
+        return
+    # N32/N16 dot outputs occupy complete SRAM rows. A pointer loop skips
+    # their unused lanes while writing only the valid output strip to DRAM.
+    pointer = engine.alloc_inst_ptr()
+    try:
+        engine.generate_instruction_pbi_init(
+            dram_shared_addr=destination, dma_length=outputs * 2,
+            uram_a_start_addr=source // 128, uram_b_start_addr=source // 128,
+            inst_pointer_idx=pointer)
+        _anchor(engine)
+        engine.loop_start(loop_cnt=rows)
+        engine.sram_to_accelerator_memory(
+            128, destination_stride, 0, inst_pointer_idx=pointer)
+        engine.loop_end()
+    finally:
+        engine.release_inst_ptr(pointer)
+
+
+def _emit_sram_phase(engine, plan, phase, row_bytes):
+    K, outputs = phase["K"], phase["N"]
+    strip = min(outputs, (udc.URAM_NEAR_FULL_ELEMENTS // K) // 64 * 64,
+                (4095 // (K // 64)) // 64 * 64)
+    if strip < 64:
+        strip = min(32, 4095 // (K // 64)) // 16 * 16
+    if strip < 16:
+        raise ValueError("BF16 convolution weight strip exceeds SRAM")
+    divisor = math.gcd(phase["stride"], phase["dilation"])
+    period = phase["dilation"] // divisor
+    inner_stride = phase["stride"] // divisor
+    # The source window is shared by overlapping dots, rather than expanded
+    # into M separate patches. Leave room after it for a padded output strip.
+    max_rows = min(1024, (udc.URAM_NEAR_FULL_SIZE - (phase["kernel"] - inner_stride) * row_bytes)
+                   // (inner_stride * row_bytes + shared._align_up(strip, 64) * 2))
+    if max_rows < 1:
+        raise ValueError("BF16 convolution input/output tile exceeds SRAM")
+    output_row_bytes = outputs * 2
+    for residue in range(min(period, phase["output_length"])):
+        length = (phase["output_length"] - residue + period - 1) // period
+        for first in range(0, length, max_rows):
+            take = min(max_rows, length - first)
+            input_rows = (take - 1) * inner_stride + phase["kernel"]
+            input_bytes = input_rows * row_bytes
+            output_index = residue + first * period
+            shared._copy_contiguous_or_strided_read(
+                engine, source=plan["padded_input_address"] + output_index * phase["stride"] * row_bytes,
+                sram=0, total=input_bytes, chunk=row_bytes,
+                jump=phase["dilation"] * row_bytes)
+            for column in range(0, outputs, strip):
+                count = min(strip, outputs - column)
+                engine.accelerator_memory_to_sram(
+                    phase["weight_address"] + column * K * 2, 0x80000, count * K)
+                bias = phase["bias_address"]
+                if bias is not None:
+                    engine.accelerator_memory_to_bias_sram(bias + column * 2, count)
+                _dot_rows(engine, rows=take, K=K, N=count,
+                          input_step_bytes=inner_stride * row_bytes,
+                          output_sram=input_bytes, bias_enable=bias is not None)
+                destination = plan["output_address"] + (
+                    (output_index * plan["output_step"] + phase["phase"]) * output_row_bytes + column * 2)
+                _write_sram_rows(engine, source=input_bytes, destination=destination,
+                                 rows=take, outputs=count,
+                                 destination_stride=period * plan["output_step"] * output_row_bytes)
+
+
 def emit_conv(engine, plan, *, zero_address):
     """Append all input staging, BF16 arithmetic and output copies to capture."""
     _address(zero_address, "zero_address")
@@ -215,6 +327,9 @@ def emit_conv(engine, plan, *, zero_address):
     output_row_bytes = packed_bytes((1, plan["output_shape"][1]))
     for phase in plan["phases"]:
         _stage_window(engine, plan, phase, zero_address)
+        if plan.get("use_sram", True):
+            _emit_sram_phase(engine, plan, phase, row_bytes)
+            continue
         for first in range(0, phase["output_length"], plan["chunk_rows"]):
             take = min(plan["chunk_rows"], phase["output_length"] - first)
             _stage_patches(engine, plan, phase, first=first, take=take, row_bytes=row_bytes)

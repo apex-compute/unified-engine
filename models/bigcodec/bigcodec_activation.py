@@ -12,9 +12,12 @@ import math
 import torch
 
 from bigcodec_device import (channels, channel_mul, clamp, copy, elementwise,
-                             gather_rows, scale, scatter_rows, shift, udc)
+                             gather_rows, gather_rows_to_sram, scale, scatter_rows,
+                             shift, sram_copy, sram_maximum, sram_scale, sram_shift,
+                             shared, udc)
 
 SNAKE_ARGUMENT_LIMIT = 32 * math.pi
+ACTIVATION_TILE_ELEMENTS = 32768
 
 
 def sine_squared(value, *, bf16=False):
@@ -105,7 +108,7 @@ def prepare_activation(module, image, *, input_shape, input_address,
         raise ValueError('Only official factor-two alias-free activation is supported')
     if not module.act.alpha_logscale or module.act.alpha.numel() != logical_channels:
         raise ValueError('Expected the official log-scale SnakeBeta activation')
-    count = max(1, min(2 * rows, 8192 // width))
+    count = max(1, min(2 * rows, ACTIVATION_TILE_ELEMENTS // width))
     alpha = torch.zeros(count, width, dtype=torch.bfloat16)
     beta = torch.zeros_like(alpha)
     alpha[:, :logical_channels] = module.act.alpha.detach().exp()
@@ -117,7 +120,8 @@ def prepare_activation(module, image, *, input_shape, input_address,
                           count, up, down)
 
 
-def emit_activation(engine, plan):
+def emit_activation_dram(engine, plan):
+    """Original DRAM lowering, retained for numerical and performance A/B checks."""
     t, c = plan.rows, plan.width
     row_tensor_bytes = t * c * 2
     y = plan.scratch
@@ -170,3 +174,86 @@ def emit_activation(engine, plan):
         else:
             elementwise(engine, udc.UE_MODE.ELTWISE_ADD,
                         plan.destination, b, plan.destination, t * c)
+
+
+def emit_activation(engine, plan):
+    """Keep FIR accumulators and the complete folded Snake polynomial in SRAM.
+
+    Every multiplication/addition still writes BF16 before the next operation.
+    Wide MAXPOOL compare/select implements finite-value clamps, avoiding the
+    scalar identity-dot path. Full tensors cross DRAM only between upsample,
+    Snake and downsample stages; FIR taps load directly into the tile buffer.
+    """
+    t, c = plan.rows, plan.width
+    tile_rows = min(plan.constant_rows, ACTIVATION_TILE_ELEMENTS // c)
+    if tile_rows <= 0:
+        raise ValueError('Activation channel width exceeds the SRAM tile budget')
+    # Fixed disjoint vector slots permit up to32768 BF16 elements each.
+    a, p, temporary, zeros, limit = 0, 0x10000, 0x20000, 0x30000, 0x40000
+    original, square, constant = 0x80000, 0x90000, 0xA0000
+
+    def filter_phase(source, destination, *, source_rows, start, stride,
+                     taps, output_start=0, output_stride=1):
+        for first in range(0, t, tile_rows):
+            count = min(tile_rows, t - first)
+            elements = count * c
+            for index, (tap_offset, coefficient) in enumerate(taps):
+                gather_rows_to_sram(engine, source, a, source_rows=source_rows,
+                    rows=count, width=c, start=start + first * stride + tap_offset,
+                    stride=stride)
+                sram_scale(engine, a, a, elements, coefficient)
+                if index == 0:
+                    sram_copy(engine, a, original, elements)
+                else:
+                    engine.eltwise_add_core(a, original, original, elements)
+            shared._copy_contiguous_or_strided_write(engine, sram=original,
+                destination=destination + (output_start + first * output_stride) * c * 2,
+                total=elements * 2, chunk=c * 2, jump=output_stride * c * 2)
+
+    for phase in range(2):
+        taps = [((phase + 5 - tap) // 2, 2 * plan.up_filter[tap])
+                for tap in range(12) if (phase + 15 - tap) % 2 == 0]
+        filter_phase(plan.source, plan.scratch, source_rows=t, start=0,
+                     stride=1, taps=taps, output_start=phase, output_stride=2)
+
+    for first in range(0, 2 * t, tile_rows):
+        count = min(tile_rows, 2 * t - first)
+        elements = count * c
+        address = plan.scratch + first * c * 2
+        engine.accelerator_memory_to_sram(address, a, elements)
+        sram_copy(engine, a, original, elements)
+        engine.accelerator_memory_to_sram(plan.alpha, constant, elements)
+        engine.eltwise_mul_core(a, constant, a, elements)
+        sram_scale(engine, a, zeros, elements, 0)
+        # abs(x) is exact for finite BF16; max selects without a dot reduction.
+        sram_scale(engine, a, temporary, elements, -1)
+        sram_maximum(engine, a, temporary, a, elements)
+        # min(abs(x), argument_limit) via -max(-abs(x), -argument_limit).
+        sram_scale(engine, a, temporary, elements, -1)
+        sram_shift(engine, zeros, limit, elements, -SNAKE_ARGUMENT_LIMIT)
+        sram_maximum(engine, temporary, limit, temporary, elements)
+        sram_scale(engine, temporary, a, elements, -1)
+        for exponent in range(5, -1, -1):
+            sram_shift(engine, a, temporary, elements, -(math.pi / 2) * 2 ** exponent)
+            sram_maximum(engine, temporary, zeros, temporary, elements)
+            sram_scale(engine, temporary, square, elements, 2)
+            engine.eltwise_sub_core(a, square, a, elements)
+        sram_copy(engine, a, square, elements)
+        engine.eltwise_mul_core(a, square, a, elements)
+        sram_copy(engine, a, square, elements)
+        sram_scale(engine, a, p, elements, 2 / 14175)
+        for coefficient in (-1 / 315, 2 / 45, -1 / 3, 1):
+            sram_shift(engine, p, p, elements, coefficient)
+            engine.eltwise_mul_core(p, square, p, elements)
+        sram_maximum(engine, p, zeros, p, elements)
+        sram_scale(engine, p, temporary, elements, -1)
+        sram_shift(engine, zeros, limit, elements, -1)
+        sram_maximum(engine, temporary, limit, temporary, elements)
+        sram_scale(engine, temporary, p, elements, -1)
+        engine.accelerator_memory_to_sram(plan.inverse_beta, constant, elements)
+        engine.eltwise_mul_core(p, constant, p, elements)
+        engine.eltwise_add_core(p, original, a, elements)
+        engine.sram_to_accelerator_memory(a, address, elements)
+
+    filter_phase(plan.scratch, plan.destination, source_rows=2 * t, start=-5,
+                 stride=2, taps=list(enumerate(plan.down_filter)))
