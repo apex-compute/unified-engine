@@ -96,6 +96,47 @@ step. A 115-step arithmetic response measures 9.85 tokens/s as the KV history
 grows. These rates include host control, DMA, FPGA argmax readback, and
 detokenization; learned inference arithmetic remains on the FPGA.
 
+## Performance reporting
+
+Every run writes a Markdown summary next to this script, named for the CLI
+config (`qwen2.5_omni_7b_test_xdma0_image_multi-core_8.md`). It is built only
+from metrics the stages already recorded plus host bookkeeping, so writing it
+launches no FPGA program and cannot perturb what it measures. Pass
+`--summary PATH` to redirect it or `--no-summary` to skip it.
+
+The summary reports, per stage (vision, audio, prefill, decode): work in
+GFLOP, HW-counter latency, achieved GFLOPS, percent of the run's peak
+(`freq_MHz x 128 FLOP/cycle x engines`), effective speedup against one
+engine's peak, and the CPU wall time around the same stage. The gap between
+the two clocks is host overhead. TTFT covers whichever encoders the request
+ran plus prefill.
+
+A multi-core scaling section converts each stage's speedup into an implied
+serial fraction by solving Amdahl's law for `s`. Because this model requires
+exactly eight engines, no single-engine baseline can be measured; the speedup
+is taken against one engine's *peak*, which makes it a lower bound and folds
+every other inefficiency into the serial estimate. `--profile` is what
+separates those.
+
+`--profile` compiles the vision encoder, prefill, and decoder with per-phase
+HALT checkpoints, then runs a profiled prefill and two profiled decode steps --
+one at the prompt's own context and one at `--profile-ctx` (default 2048) --
+and reports a per-phase table for each: calls, total ms, share of stage, GFLOP,
+GFLOPS, and percent of peak. Phases marked `*` run on engine 0 alone and are
+scored against one engine's peak. The share column is the one to act on: it
+says which phase is worth sharding next. A profile run replaces generation, and
+its summary is written to a separate `..._profile_...md` so it never overwrites
+a generation run's report. The audio encoder has no checkpoints, so it appears
+at stage level only.
+
+```bash
+# Generation run + summary
+python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --image
+
+# Per-phase breakdown instead of generation
+python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --image --profile
+```
+
 ## Build and run
 
 Run commands from the repository root after activating the PyTorch environment
