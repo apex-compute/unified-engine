@@ -1,0 +1,186 @@
+{
+  "created_utc": "2026-09-14T04:01:06.053946+00:00",
+  "model": "dpdfnet2_8khz",
+  "onnx_sha256": "6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d",
+  "reference_manifest": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/cpu_reference_manifest.json",
+  "reference_manifest_sha256": "b76f71c5c9d145b3c5ae0ece4c50516f685ea9bdb770fb6c0c2d12d59690e17a",
+  "comparison": "Same native 8 kHz spectrum inputs with independent fresh resident state per case; current output compared bitwise to corrected optimized IF8 baseline",
+  "cases": [
+    {
+      "id": "p232_007",
+      "frames": 402,
+      "shape": [
+        402,
+        1,
+        1,
+        81,
+        2
+      ],
+      "input_sha256": "1efe2b515779e5e962276e7f609c031912ad30a714c2052ade87c8de71355f3f",
+      "cpu_sha256": "25d49ccf65c80a06377ec92d10c8debed98d35141ed4e427a9c96aa750ae56e3",
+      "input_and_cpu_reference_hashes_verified": true,
+      "baseline": {
+        "output": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_rk256/optimized_if8/p232_007_fpga.npy",
+        "output_sha256": "0caf8c5b3aa6e648f0d0d1ca2c409aa222e2ed6397786063c126a33e0fe7f5bd",
+        "dtype": "float32",
+        "finite": true,
+        "test_result_log_sha256": "087fc807a3cf601d55db22d10df9decef290c7b432351df104b43e8c816fafb7",
+        "metrics_sha256": "ce0aaf92f838e321d10fc373cdc2de029ff22d8c8d12ba62bff094976dc65e8e",
+        "test_result_and_metrics_hash_bindings_verified": true,
+        "bin_sha256": "2abf08cffeb1f39f6283ac7e1c74906d13ec99c41a369b459fb3e24bfc43f5b9",
+        "hardware_version": "0x5fbbfbf0",
+        "axi_data_width_bits": 256
+      },
+      "current": {
+        "output": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_df0749de/shared_full/p232_007_fpga.npy",
+        "output_sha256": "0caf8c5b3aa6e648f0d0d1ca2c409aa222e2ed6397786063c126a33e0fe7f5bd",
+        "dtype": "float32",
+        "finite": true,
+        "test_result_log_sha256": "b3297444a0aa436d79f6886491b53896883ee69bbb339437d289004c78363019",
+        "metrics_sha256": "85e7fbccfb4c314eb335f36378fa2f6196294d21d5cdf0e9346d09b0d50e5d0c",
+        "test_result_and_metrics_hash_bindings_verified": true,
+        "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+        "hardware_version": "0xdf0749de",
+        "axi_data_width_bits": 256
+      },
+      "bitwise_equal_uint32": true,
+      "differing_float32_bit_patterns": 0,
+      "max_abs_difference": 0.0,
+      "same_npy_file_sha256": true
+    },
+    {
+      "id": "p257_018",
+      "frames": 448,
+      "shape": [
+        448,
+        1,
+        1,
+        81,
+        2
+      ],
+      "input_sha256": "d4693976976548903cb39715ac9f89ca3eafbedcf95df9ea669fdfdcd243478d",
+      "cpu_sha256": "2cc480b9e5816a82399d80687098af5531a68ec95c65b3f9f48fc75dafeb4c07",
+      "input_and_cpu_reference_hashes_verified": true,
+      "baseline": {
+        "output": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_rk256/optimized_if8/p257_018_fpga.npy",
+        "output_sha256": "c1b3ff6d227a213e553971705f9dbb88d338148c94cd0ce13053e01328c91a0a",
+        "dtype": "float32",
+        "finite": true,
+        "test_result_log_sha256": "fc5561ddafd6e5337b3e37ca7031416d720e9655234e35c60058e0b397687df0",
+        "metrics_sha256": "1b6e53993ffaf2d2fae8e110e12321772daccd3474d10ae3eb227d902d8c53ec",
+        "test_result_and_metrics_hash_bindings_verified": true,
+        "bin_sha256": "2abf08cffeb1f39f6283ac7e1c74906d13ec99c41a369b459fb3e24bfc43f5b9",
+        "hardware_version": "0x5fbbfbf0",
+        "axi_data_width_bits": 256
+      },
+      "current": {
+        "output": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_df0749de/shared_full/p257_018_fpga.npy",
+        "output_sha256": "c1b3ff6d227a213e553971705f9dbb88d338148c94cd0ce13053e01328c91a0a",
+        "dtype": "float32",
+        "finite": true,
+        "test_result_log_sha256": "94aa8d627ee081eab32d428a43b090a4be4b261f49d527c2f12db72e3b0918d4",
+        "metrics_sha256": "32d32087498e56a039f14808cab019cc5fad632ee0c71141a4d9144a0c63a449",
+        "test_result_and_metrics_hash_bindings_verified": true,
+        "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+        "hardware_version": "0xdf0749de",
+        "axi_data_width_bits": 256
+      },
+      "bitwise_equal_uint32": true,
+      "differing_float32_bit_patterns": 0,
+      "max_abs_difference": 0.0,
+      "same_npy_file_sha256": true
+    },
+    {
+      "id": "silence_128",
+      "frames": 128,
+      "shape": [
+        128,
+        1,
+        1,
+        81,
+        2
+      ],
+      "input_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee",
+      "cpu_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee",
+      "input_and_cpu_reference_hashes_verified": true,
+      "baseline": {
+        "output": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_rk256/optimized_if8/silence_128_fpga.npy",
+        "output_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee",
+        "dtype": "float32",
+        "finite": true,
+        "test_result_log_sha256": "66f0b240762e0165cd5dfd346b62bc1d8f9bee1a6548aca9d31eedeedbe25f84",
+        "metrics_sha256": "76c858aa1f27e9697768fef857162abebbc297b1bc3d5fc22e754376c15657e3",
+        "test_result_and_metrics_hash_bindings_verified": true,
+        "bin_sha256": "2abf08cffeb1f39f6283ac7e1c74906d13ec99c41a369b459fb3e24bfc43f5b9",
+        "hardware_version": "0x5fbbfbf0",
+        "axi_data_width_bits": 256
+      },
+      "current": {
+        "output": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_df0749de/shared_full/silence_128_fpga.npy",
+        "output_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee",
+        "dtype": "float32",
+        "finite": true,
+        "test_result_log_sha256": "50ea141fed671dbbd870a28a0294eb2d5ebf2fb8210d9e2c96c1f6f100fda1dd",
+        "metrics_sha256": "06191c17123f801e9bd9f0bd25944ff6ebadd12d912cb382feee521d3d8d2cc8",
+        "test_result_and_metrics_hash_bindings_verified": true,
+        "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+        "hardware_version": "0xdf0749de",
+        "axi_data_width_bits": 256
+      },
+      "bitwise_equal_uint32": true,
+      "differing_float32_bit_patterns": 0,
+      "max_abs_difference": 0.0,
+      "same_npy_file_sha256": true
+    },
+    {
+      "id": "audio_silence_audio_384",
+      "frames": 384,
+      "shape": [
+        384,
+        1,
+        1,
+        81,
+        2
+      ],
+      "input_sha256": "aebb45383d60063fd696c7c7747ef120c8215fa1ca702faeea1e825d8aaf51ff",
+      "cpu_sha256": "56348582c9f4b5ea535edf4d3a6afa1fd459c7908accb36802a0137d61c58dd5",
+      "input_and_cpu_reference_hashes_verified": true,
+      "baseline": {
+        "output": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_rk256/optimized_if8/audio_silence_audio_384_fpga.npy",
+        "output_sha256": "a9fcdff49b33d04b5dcd3a514370affab1440d66d44737c2b49a3b5b72869466",
+        "dtype": "float32",
+        "finite": true,
+        "test_result_log_sha256": "88ebd750480071126057489ebefe795f10e9e334b0ab612c7b3ff593940e3eca",
+        "metrics_sha256": "4c385e4df4465f2ae853aa3027b755410a05766887b5ebdd259ddef0067a31cf",
+        "test_result_and_metrics_hash_bindings_verified": true,
+        "bin_sha256": "2abf08cffeb1f39f6283ac7e1c74906d13ec99c41a369b459fb3e24bfc43f5b9",
+        "hardware_version": "0x5fbbfbf0",
+        "axi_data_width_bits": 256
+      },
+      "current": {
+        "output": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_df0749de/shared_full/audio_silence_audio_384_fpga.npy",
+        "output_sha256": "a9fcdff49b33d04b5dcd3a514370affab1440d66d44737c2b49a3b5b72869466",
+        "dtype": "float32",
+        "finite": true,
+        "test_result_log_sha256": "4b41b71455ed3088326bc623d7207585f4cde23c71f370bcd089dd56ac4b49f6",
+        "metrics_sha256": "a429ced70d6112ec61564572db177b84dfd7ec4d2cffaa580802c0c0260596f3",
+        "test_result_and_metrics_hash_bindings_verified": true,
+        "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+        "hardware_version": "0xdf0749de",
+        "axi_data_width_bits": 256
+      },
+      "bitwise_equal_uint32": true,
+      "differing_float32_bit_patterns": 0,
+      "max_abs_difference": 0.0,
+      "same_npy_file_sha256": true
+    }
+  ],
+  "case_count": 4,
+  "frame_count": 1362,
+  "logical_float32_count": 220644,
+  "all_finite": true,
+  "all_input_output_metrics_hash_bindings_verified": true,
+  "all_shapes_verified": true,
+  "all_bitwise_equal_uint32": true,
+  "all_same_npy_file_sha256": true
+}

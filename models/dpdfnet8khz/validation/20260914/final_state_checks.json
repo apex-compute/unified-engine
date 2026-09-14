@@ -1,0 +1,68 @@
+{
+  "scope": "Final logical state only after each sustained spectrum run, outside timed frame loop",
+  "cases": [
+    {
+      "record": {
+        "case": "audio_silence_audio_384",
+        "scope": "final state only, read after benchmark without reset",
+        "axi_data_width_bits": 256,
+        "hardware_version": "0xdf0749de",
+        "state_in": {
+          "address": "0x90000000",
+          "logical_elements": 37860,
+          "finite": true,
+          "nonfinite_count": 0
+        },
+        "state_out": {
+          "address": "0xb03c7100",
+          "logical_elements": 37860,
+          "finite": true,
+          "nonfinite_count": 0
+        }
+      },
+      "file_sha256": "18502e4509c77e3bec6560658d74788702d1b69510779bca15187f406f866a12"
+    },
+    {
+      "record": {
+        "case": "silence_128",
+        "scope": "final state only, read after benchmark without reset",
+        "axi_data_width_bits": 256,
+        "hardware_version": "0xdf0749de",
+        "state_in": {
+          "address": "0x90000000",
+          "logical_elements": 37860,
+          "finite": true,
+          "nonfinite_count": 0
+        },
+        "state_out": {
+          "address": "0xb03c7100",
+          "logical_elements": 37860,
+          "finite": true,
+          "nonfinite_count": 0
+        }
+      },
+      "file_sha256": "5f9b3cefe78fb0eab12838dcc0b73dc8e9e8ce443bb93ae8b344b92061a20779"
+    },
+    {
+      "record": {
+        "case": "sustained60",
+        "scope": "final state only, read after benchmark without reset",
+        "axi_data_width_bits": 256,
+        "hardware_version": "0xdf0749de",
+        "state_in": {
+          "address": "0x90000000",
+          "logical_elements": 37860,
+          "finite": true,
+          "nonfinite_count": 0
+        },
+        "state_out": {
+          "address": "0xb03c7100",
+          "logical_elements": 37860,
+          "finite": true,
+          "nonfinite_count": 0
+        }
+      },
+      "file_sha256": "9801845b61fe935cffae08bc7efea092b64f4568ddae580e2830e700b2ca226b"
+    }
+  ]
+}
