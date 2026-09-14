@@ -5,6 +5,8 @@ inputs and actual FPGA outputs from the 8-kHz and 16-kHz models.
 
 ## Test WAVs
 
+[Download all 24 WAV files (ZIP, 30.0 MB)](dpdfnet_noisy_audio_wavs.zip)
+
 | Test | SNR | Duration | Noisy input | FPGA 8 kHz | FPGA 16 kHz |
 | --- | ---: | ---: | --- | --- | --- |
 | Bus | 2.5–17.5 dB | 23.682 s | [bus_noisy.wav](noisy/bus_noisy.wav) | [bus_fpga_8khz.wav](fpga8k/bus_fpga_8khz.wav) | [bus_fpga_16khz.wav](fpga16k/bus_fpga_16khz.wav) |
