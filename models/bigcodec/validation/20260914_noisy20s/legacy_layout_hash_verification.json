@@ -1,0 +1,16 @@
+{
+  "legacy_preserved": true,
+  "all_metadata_equal": true,
+  "resident_image_bytes_equal": true,
+  "resident_image_bytes": 415250560,
+  "model_sha256": "ef6a388680c55708bb263d53eb02f3ac9f03f1b70e764a40232e00044315100a",
+  "program_sha256": "60e216e28899e19e062a41635f3746c82136dafd10385e4299ab48ba9e4c9645",
+  "instructions": 2624968,
+  "model_base": 2415919104,
+  "model_limit": 2952790016,
+  "output_address": 2952790016,
+  "tensor_limit": 3489660928,
+  "old_bin": "bigcodec-p232_007-sram-v4-bf16.bin",
+  "recompiled_bin": "noisy20s/legacy_bf16_recompile.bin",
+  "note": "torch.save archive filenames differ; deployed image and all payload metadata are identical."
+}

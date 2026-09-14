@@ -11,9 +11,11 @@
 | Parameters | 159,436,290, counting upstream weight normalization parameters |
 | Execution | Complete utterance; centered convolutions and two residual LSTM stacks |
 
-The CPU reference uses the pinned official FP32 checkpoint. The FPGA implementation runs the complete encoder, quantizer and decoder. On Italy, optimized BF16 reaches **RTF 4.84**, down from **15.32**, with waveform samples and tokens bit-identical to the previous FPGA implementation. IF8 recurrent weights reach **RTF 4.40** with different reconstruction errors. These measurements use the 3.956-second noisy speech sample; see the [current benchmarks and audio](validation/20260914_optimized_italy/README.md).
+The CPU reference uses the pinned official FP32 checkpoint. The FPGA implementation runs the complete encoder, quantizer and decoder. On the [eight 20–24-second noisy files previously tested with DPDFNet](validation/20260914_noisy20s/README.md), pooled processing RTF is **4.80 for BF16**, **4.36 for IF8 recurrence** and **2.32 for one-thread CPU FP32**. All 16 FPGA runs use one bin and one START/HALT per complete file. The report includes all inputs, CPU reconstructions and FPGA reconstructions.
 
-The port remains experimental: optimized BF16 differs from the official FP32 waveform by 19.29% relative L2, and real time requires RTF ≤ 1. The [earlier benchmarks](validation/20260914_italy/README.md) and [initial optimization estimates](validation/20260914_optimization/README.md) retain their original measurements.
+The port remains experimental: pooled waveform error against CPU is **28.06% for BF16** and **27.04% for IF8 recurrence**. Processing RTF excludes initial loading and upload; including measured runner startup gives **6.57** and **6.04**, respectively. Real time requires RTF ≤ 1.
+
+The [previous 3.956-second benchmark](validation/20260914_optimized_italy/README.md) measured the optimization from RTF 15.32 to 4.84 with BF16 waveform samples and tokens bit-identical to the earlier FPGA implementation; IF8 recurrence reached 4.40. The [earlier benchmarks](validation/20260914_italy/README.md) and [initial optimization estimates](validation/20260914_optimization/README.md) retain their original measurements.
 
 ## Setup
 
@@ -41,11 +43,13 @@ python models/bigcodec/bigcodec_run_from_bin.py \
 
 Use `--force` to replace an existing compiled bin. `--conv-precision bf16` reuses overlapping input windows in SRAM for BF16 matrix multiplication; `--conv-precision if8` uses native IF8 convolutions and is the CLI default. BF16 was faster and had lower end-to-end waveform error in the baseline measurements. Compilation is offline and requires the checkpoint. Execution needs only the deployment bin and input audio. The bin contains both packed parameters and the captured instruction program.
 
-Recurrent weights default to BF16. Add `--lstm-precision encoder-if8` to stream IF8 recurrent weights in the encoder, or `--lstm-precision if8` for both encoder and decoder. Input projections and gate/state arithmetic remain BF16. Measured RTF is 4.62 for encoder-only IF8 and 4.40 for both stacks; the benchmark report records their waveform and same-token decoder errors separately. BF16 preserves the previous FPGA output and is the prepared default bin on Italy.
+Recurrent weights default to BF16. Add `--lstm-precision encoder-if8` to stream IF8 recurrent weights in the encoder, or `--lstm-precision if8` for both encoder and decoder. Input projections and gate/state arithmetic remain BF16. On the previous short sample, RTF was 4.62 for encoder-only IF8 and 4.40 for both stacks; that benchmark report records their waveform and same-token decoder errors separately. BF16 preserves the previous FPGA output and is the prepared default bin on Italy.
 
 The runner uploads the model image once, writes the padded input to DRAM, issues one START, waits for the terminal HALT, then reads one output bundle containing the waveform and tokens. All neural operations, including recurrent state updates and codebook selection, execute on the FPGA. Host processing reads/resamples the input and writes the output WAV and token NPZ.
 
 The mono output preserves the source duration and sample rate; multichannel inputs are averaged before encoding. Each bin accepts a fixed padded native length and can be reused for inputs with that length. Matching upstream, padding always adds `200 - (samples % 200)` zeros, including a full extra hop for aligned inputs. The complete utterance resets recurrent state. Independent 10 ms calls are not equivalent to this model's inference.
+
+For longer utterances, the compiler automatically expands the model/program arena to 1 GiB and the tensor arena to 768 MiB within the RK-256 board's 2 GiB DRAM. This allows the full 20–24-second noisy test files to run in one execution. The runner checks the board's reported capacity before uploading; shorter files retain the original memory layout.
 
 The command also writes `reconstructed_fpga.tokens.npz` and `reconstructed_fpga.metrics.json`. NPZ stores uint16 token IDs with audio metadata; it is not a packed 13-bit transport stream.
 

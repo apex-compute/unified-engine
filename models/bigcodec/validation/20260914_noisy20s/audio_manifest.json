@@ -1,0 +1,327 @@
+{
+  "format": "bigcodec-noisy20s-audio-v1",
+  "wav_files": 32,
+  "source_files_unchanged": true,
+  "files": [
+    {
+      "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus_noisy.wav",
+      "sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+      "bytes": 1515744,
+      "case": "bus",
+      "role": "input",
+      "zip_member": "noisy/bus_noisy.wav",
+      "samples": 378916,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+      "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+      "bytes": 1515744,
+      "case": "bus",
+      "role": "cpu",
+      "zip_member": "cpu/bus.wav",
+      "samples": 378916,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus.wav",
+      "sha256": "bff0a4e91d8d1f7520a4d2dec2821ac3dd52d76d9c2ddd9fc472f129ad16e21f",
+      "bytes": 1515744,
+      "case": "bus",
+      "role": "fpga_bf16",
+      "zip_member": "fpga_bf16/bus.wav",
+      "samples": 378916,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus.wav",
+      "sha256": "8e9c024f4f2c1e5b9226904ffbb2dedb1d79a3f74e024a9d61ed96372cc71e8c",
+      "bytes": 1515744,
+      "case": "bus",
+      "role": "fpga_if8",
+      "zip_member": "fpga_if8/bus.wav",
+      "samples": 378916,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_noisy.wav",
+      "sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868",
+      "bytes": 1312664,
+      "case": "cafe",
+      "role": "input",
+      "zip_member": "noisy/cafe_noisy.wav",
+      "samples": 328146,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav",
+      "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e",
+      "bytes": 1312664,
+      "case": "cafe",
+      "role": "cpu",
+      "zip_member": "cpu/cafe.wav",
+      "samples": 328146,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe.wav",
+      "sha256": "ab0f591a0461f2f9e1e1e0322763bc64b4144662ab24f6ec78abad96d81158f1",
+      "bytes": 1312664,
+      "case": "cafe",
+      "role": "fpga_bf16",
+      "zip_member": "fpga_bf16/cafe.wav",
+      "samples": 328146,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe.wav",
+      "sha256": "5ae9693a871e825ab466853904901f12e5e95bf12a68ab42942a473058206867",
+      "bytes": 1312664,
+      "case": "cafe",
+      "role": "fpga_if8",
+      "zip_member": "fpga_if8/cafe.wav",
+      "samples": 328146,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/office_noisy.wav",
+      "sha256": "b5dc82530929875863ebb564cc892c64c4e1cf5c5cead6b17a34c368593d6f73",
+      "bytes": 1406832,
+      "case": "office",
+      "role": "input",
+      "zip_member": "noisy/office_noisy.wav",
+      "samples": 351688,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.wav",
+      "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad",
+      "bytes": 1406832,
+      "case": "office",
+      "role": "cpu",
+      "zip_member": "cpu/office.wav",
+      "samples": 351688,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office.wav",
+      "sha256": "2617b86e92957d95459e045baed28f28d44474d53f4b43f3c2fae4d882cebf5b",
+      "bytes": 1406832,
+      "case": "office",
+      "role": "fpga_bf16",
+      "zip_member": "fpga_bf16/office.wav",
+      "samples": 351688,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office.wav",
+      "sha256": "efe25788a9fd67a6af579a99c571bb005c5f49ce3cc4aca8ba7f5adfc81346e5",
+      "bytes": 1406832,
+      "case": "office",
+      "role": "fpga_if8",
+      "zip_member": "fpga_if8/office.wav",
+      "samples": 351688,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_noisy.wav",
+      "sha256": "a20d68e238fb9acae1044ced9e05581535764ef2942d2efad5d3a7c1bf1cb26e",
+      "bytes": 1374376,
+      "case": "psquare",
+      "role": "input",
+      "zip_member": "noisy/psquare_noisy.wav",
+      "samples": 343574,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.wav",
+      "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059",
+      "bytes": 1374376,
+      "case": "psquare",
+      "role": "cpu",
+      "zip_member": "cpu/psquare.wav",
+      "samples": 343574,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare.wav",
+      "sha256": "418f2664b6b4b94ae783821730e9b3309dc13985b2a048b9550a2aa9ca968f9f",
+      "bytes": 1374376,
+      "case": "psquare",
+      "role": "fpga_bf16",
+      "zip_member": "fpga_bf16/psquare.wav",
+      "samples": 343574,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare.wav",
+      "sha256": "5e40326bd2d884e7a505c3626ba3344e828b18cbb21ead00e2f9f2bfa0ec5879",
+      "bytes": 1374376,
+      "case": "psquare",
+      "role": "fpga_if8",
+      "zip_member": "fpga_if8/psquare.wav",
+      "samples": 343574,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus_low_snr_noisy.wav",
+      "sha256": "6ffae073e5549f58e19127bfcc701616baca9bc68d299103c01aeec7a8e0d288",
+      "bytes": 1336348,
+      "case": "bus_low_snr",
+      "role": "input",
+      "zip_member": "noisy/bus_low_snr_noisy.wav",
+      "samples": 334067,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.wav",
+      "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6",
+      "bytes": 1336348,
+      "case": "bus_low_snr",
+      "role": "cpu",
+      "zip_member": "cpu/bus_low_snr.wav",
+      "samples": 334067,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus_low_snr.wav",
+      "sha256": "2b9fcbedb52f30103b210670fe09a385ed54e65e0c84247d8c5df6f72b18cd79",
+      "bytes": 1336348,
+      "case": "bus_low_snr",
+      "role": "fpga_bf16",
+      "zip_member": "fpga_bf16/bus_low_snr.wav",
+      "samples": 334067,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus_low_snr.wav",
+      "sha256": "caebe81d6dc682df234ec6c5f69afd8bdd6d501d457c86defe1997e711e46869",
+      "bytes": 1336348,
+      "case": "bus_low_snr",
+      "role": "fpga_if8",
+      "zip_member": "fpga_if8/bus_low_snr.wav",
+      "samples": 334067,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_low_snr_noisy.wav",
+      "sha256": "e61711a17c0ee70e99377efde0f7ff1010cbc4673d76b4914e468529cc8ba915",
+      "bytes": 1373880,
+      "case": "cafe_low_snr",
+      "role": "input",
+      "zip_member": "noisy/cafe_low_snr_noisy.wav",
+      "samples": 343450,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.wav",
+      "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c",
+      "bytes": 1373880,
+      "case": "cafe_low_snr",
+      "role": "cpu",
+      "zip_member": "cpu/cafe_low_snr.wav",
+      "samples": 343450,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe_low_snr.wav",
+      "sha256": "0fa21cd5e7d54901f9c2552487deb113466966bb886a1ae3baba02cfa8009503",
+      "bytes": 1373880,
+      "case": "cafe_low_snr",
+      "role": "fpga_bf16",
+      "zip_member": "fpga_bf16/cafe_low_snr.wav",
+      "samples": 343450,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe_low_snr.wav",
+      "sha256": "bb6e39ddf13aaecc715dc82cad8cdaeca5e8e8e6bfeac435620b520d767e1dae",
+      "bytes": 1373880,
+      "case": "cafe_low_snr",
+      "role": "fpga_if8",
+      "zip_member": "fpga_if8/cafe_low_snr.wav",
+      "samples": 343450,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/office_low_snr_noisy.wav",
+      "sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620",
+      "bytes": 1375720,
+      "case": "office_low_snr",
+      "role": "input",
+      "zip_member": "noisy/office_low_snr_noisy.wav",
+      "samples": 343910,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.wav",
+      "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708",
+      "bytes": 1375720,
+      "case": "office_low_snr",
+      "role": "cpu",
+      "zip_member": "cpu/office_low_snr.wav",
+      "samples": 343910,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office_low_snr.wav",
+      "sha256": "5bec2f29e29a90fc25da07749f210198a4566908f040559eca016d39b840bc83",
+      "bytes": 1375720,
+      "case": "office_low_snr",
+      "role": "fpga_bf16",
+      "zip_member": "fpga_bf16/office_low_snr.wav",
+      "samples": 343910,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office_low_snr.wav",
+      "sha256": "bc886065e084a91de896936088455261cc559d4332aff5f217d90c28e096692f",
+      "bytes": 1375720,
+      "case": "office_low_snr",
+      "role": "fpga_if8",
+      "zip_member": "fpga_if8/office_low_snr.wav",
+      "samples": 343910,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_low_snr_noisy.wav",
+      "sha256": "e44f139883a4570596b455d50eba708ab5e013b86eb6979880da3c6f769f78a8",
+      "bytes": 1377704,
+      "case": "psquare_low_snr",
+      "role": "input",
+      "zip_member": "noisy/psquare_low_snr_noisy.wav",
+      "samples": 344406,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.wav",
+      "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b",
+      "bytes": 1377704,
+      "case": "psquare_low_snr",
+      "role": "cpu",
+      "zip_member": "cpu/psquare_low_snr.wav",
+      "samples": 344406,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare_low_snr.wav",
+      "sha256": "2168a78f5f4280ef38650ad2f424f6c3d6c4dfe5cf3273c53900c77e395987af",
+      "bytes": 1377704,
+      "case": "psquare_low_snr",
+      "role": "fpga_bf16",
+      "zip_member": "fpga_bf16/psquare_low_snr.wav",
+      "samples": 344406,
+      "sample_rate": 16000
+    },
+    {
+      "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare_low_snr.wav",
+      "sha256": "f1219516b0d8cf1ebdad77a772d62b2e95cd17f3207986293fa1b235d531273f",
+      "bytes": 1377704,
+      "case": "psquare_low_snr",
+      "role": "fpga_if8",
+      "zip_member": "fpga_if8/psquare_low_snr.wav",
+      "samples": 344406,
+      "sample_rate": 16000
+    }
+  ]
+}
