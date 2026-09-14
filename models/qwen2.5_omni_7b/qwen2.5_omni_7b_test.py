@@ -109,6 +109,9 @@ _vision_mod = _load_sibling(
     "qwen2_5_omni_7b_vision", "qwen2.5_omni_7b_vision.py"
 )
 _audio_mod = _load_sibling("qwen2_5_omni_7b_audio", "qwen2.5_omni_7b_audio.py")
+_model_flops = _load_sibling(
+    "qwen2_5_omni_7b_model_flops", "qwen2.5_omni_7b_model_flops.py"
+)
 _position_mod = _load_sibling(
     "qwen2_5_omni_7b_positions", "qwen2.5_omni_7b_positions.py"
 )
@@ -256,6 +259,11 @@ class Qwen25OmniUnifiedEngine(
         self._executed_program_stages: set[str] = set()
         self._program_stage_profiles: dict[str, bool] = {}
         self._runtime_processor_dir: str | None = None
+        # Audit trail of FPGA-selected token IDs.  run_decoder resets it per
+        # request, but _decode_token also runs from the profiled single-step
+        # API, which --profile drives WITHOUT ever entering run_decoder -- so
+        # the list has to exist from construction.
+        self._fpga_decode_token_ids: list[int] = []
 
         # U55 8-GiB DRAM map
         #
@@ -1081,6 +1089,7 @@ class Qwen25OmniUnifiedEngine(
                 "detail": f"{dims['VS']} patches -> "
                           f"{dims['NUM_MERGED_TOKENS']} soft tokens",
                 "flops": float(self._vis_total_flops),
+                "model_flops": self._model_flops_vision(dims),
                 "us": float(self._vis_latency_us),
                 "wall": float(getattr(self, "_vis_wall_s", 0.0)),
             })
@@ -1089,6 +1098,7 @@ class Qwen25OmniUnifiedEngine(
                 "stage": "Audio encoder",
                 "detail": f"{getattr(self, '_audio_num_tokens', 0)} soft tokens",
                 "flops": float(getattr(self, "_audio_total_flops", 0.0)),
+                "model_flops": self._model_flops_audio(),
                 "us": float(self._audio_latency_us),
                 "wall": float(getattr(self, "_audio_wall_s", 0.0)),
             })
@@ -1097,6 +1107,7 @@ class Qwen25OmniUnifiedEngine(
                 "stage": "Prefill",
                 "detail": f"{getattr(self, '_prefill_seq_len_run', 0)} tokens",
                 "flops": float(getattr(self, "_prefill_flops", 0.0)),
+                "model_flops": self._model_flops_prefill(),
                 "us": float(self._latency_prefill_us),
                 "wall": float(getattr(self, "_prefill_wall_s", 0.0)),
             })
@@ -1107,6 +1118,7 @@ class Qwen25OmniUnifiedEngine(
                 "detail": f"{len(steps)} steps, "
                           f"{getattr(self, '_decode_n', len(steps))} tokens kept",
                 "flops": float(getattr(self, "_decode_step_flops", 0.0)),
+                "model_flops": self._model_flops_decode(len(steps)),
                 "us": float(getattr(self, "_decode_total_us", 0.0)),
                 "wall": float(getattr(self, "_decode_wall_s", 0.0)),
             })
@@ -1116,7 +1128,63 @@ class Qwen25OmniUnifiedEngine(
             row["gflops"] = row["flops"] / (row["us"] * 1e3) if row["us"] else 0.0
             row["util_pct"] = 100.0 * row["gflops"] / peak if peak else 0.0
             row["speedup"] = row["gflops"] / core_peak if core_peak else 0.0
+            model = row.get("model_flops")
+            row["model_gflops"] = (
+                model / (row["us"] * 1e3) if model and row["us"] else None
+            )
+            row["model_util_pct"] = (
+                100.0 * row["model_gflops"] / peak
+                if row["model_gflops"] and peak else None
+            )
+            row["useful_pct"] = (
+                100.0 * model / row["flops"] if model and row["flops"] else None
+            )
         return rows
+
+    # Model-FLOP counters.  Each one converts what the stage actually ran into
+    # the logical shapes qwen2.5_omni_7b_model_flops prices, and returns None
+    # rather than raising if a stage did not record what it needs -- a report
+    # must never be the reason a completed run fails.
+
+    def _model_flops_vision(self, dims: dict) -> float | None:
+        try:
+            return float(_model_flops.vision_flops(
+                self._cfg,
+                patches=int(dims["VS"]),
+                merged_tokens=int(dims["NUM_MERGED_TOKENS"]),
+            ))
+        except Exception:
+            return None
+
+    def _model_flops_audio(self) -> float | None:
+        try:
+            chunks = [int(n) for n in self._audio_chunk_aftercnn_lens]
+            return float(_model_flops.audio_flops(
+                self._cfg,
+                conv1_rows=sum(int(n) for n in self._audio_chunk_feature_lens),
+                encoder_states=int(self._audio_seq_len),
+                chunk_states=chunks,
+                pooled_tokens=int(self._audio_num_tokens),
+            ))
+        except Exception:
+            return None
+
+    def _model_flops_prefill(self) -> float | None:
+        try:
+            return float(_model_flops.prefill_flops(
+                self._cfg, int(self._prefill_seq_len_run)))
+        except Exception:
+            return None
+
+    def _model_flops_decode(self, steps: int) -> float | None:
+        # Step i attended the KV history it actually had: the run ends at
+        # self.seq_len and every step advanced it by one.
+        try:
+            end = int(self.seq_len)
+            contexts = range(end - int(steps) + 1, end + 1)
+            return float(_model_flops.decode_flops(self._cfg, contexts))
+        except Exception:
+            return None
 
     def _stage_table(self, rows: list[dict]) -> list[str]:
         """Headline table: work, time, throughput, % of peak, core scaling."""
@@ -1146,6 +1214,75 @@ class Qwen25OmniUnifiedEngine(
             f"**{(total_gflops / core_peak if core_peak else 0.0):.2f}x** | "
             f"**{total_wall:.2f}** |"
         )
+        return out
+
+    def _effective_table(self, rows: list[dict]) -> list[str]:
+        """Throughput measured against the MODEL's work, not the engine's.
+
+        Every stage bills the FLOPs it issued, at the padded and tile-aligned
+        shapes the hardware ran: a 64-row execution multiple for a 31-token
+        prompt, windowed attention widened to a full mask, an aligned head.
+        Dividing the architecture's own FLOP count by the same measured time
+        gives the effective rate -- useful work per second -- which is what
+        compares across implementations and accelerators.  ``Useful`` is the
+        ratio: how much of what the engine issued the model actually needed.
+        """
+        priced = [row for row in rows if row.get("model_flops")]
+        if not priced:
+            return []
+        peak = self.vis_peak_gflops()
+        out = [
+            "## Effective throughput (model FLOPs)",
+            "",
+            "`Model GFLOP` is what the architecture owes at its own "
+            "dimensions -- true prompt length, true attention windows, matrix "
+            "products only. `Issued GFLOP` is what this engine billed at the "
+            "shapes it actually ran. `Effective GFLOPS` divides the first by "
+            "the measured FPGA time, so it is comparable to any other "
+            "implementation of this model on any hardware; `Useful` is how "
+            "much of the issued work the model needed.",
+            "",
+            "| Stage | Model GFLOP | Issued GFLOP | Useful | FPGA time (ms) | "
+            "Effective GFLOPS | % of peak |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        suspect = False
+        for row in priced:
+            # Above 100% the engine billed FEWER FLOPs than the architecture
+            # requires, which cannot happen: padding and alignment only ever
+            # ADD work.  It means that stage's own accounting is undercounting
+            # what it issued, so flag it rather than printing it deadpan.
+            mark = ""
+            if row["useful_pct"] > 100.5:
+                mark = " !"
+                suspect = True
+            out.append(
+                f"| {row['stage']}{mark} | {row['model_flops'] / 1e9:.2f} | "
+                f"{row['flops'] / 1e9:.2f} | {row['useful_pct']:.1f}% | "
+                f"{row['us'] / 1e3:.1f} | {row['model_gflops']:.1f} | "
+                f"{row['model_util_pct']:.1f}% |"
+            )
+        model_total = sum(row["model_flops"] for row in priced)
+        issued_total = sum(row["flops"] for row in priced)
+        us_total = sum(row["us"] for row in priced)
+        rate = model_total / (us_total * 1e3) if us_total else 0.0
+        out.append(
+            f"| **TOTAL** | **{model_total / 1e9:.2f}** | "
+            f"**{issued_total / 1e9:.2f}** | "
+            f"**{(100.0 * model_total / issued_total if issued_total else 0.0):.1f}%** | "
+            f"**{us_total / 1e3:.1f}** | **{rate:.1f}** | "
+            f"**{(100.0 * rate / peak if peak else 0.0):.1f}%** |"
+        )
+        out.append("")
+        if suspect:
+            out += [
+                "`!` marks a stage whose issued FLOPs came out BELOW the "
+                "model's requirement. Padding and alignment can only add work, "
+                "so that stage's own FLOP accounting is undercounting what it "
+                "issued -- treat its `% of peak` in the stage summary above as "
+                "understated, and the effective rate here as the reliable one.",
+                "",
+            ]
         return out
 
     def _profile_tables(self, stages) -> list[str]:
@@ -1363,6 +1500,7 @@ class Qwen25OmniUnifiedEngine(
             ]
             lines += self._stage_table(rows)
             lines.append("")
+            lines += self._effective_table(rows)
 
         if getattr(self, "_vis_latency_us", None):
             dims = self._vision_dims()
@@ -2182,6 +2320,10 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
             "combined programs.bin does not contain one master + seven worker "
             "sections for every executed stage"
         )
+    try:
+        _summary_rows = ue.stage_metrics(args)
+    except Exception:  # noqa: BLE001 - reporting must not fail a good run
+        _summary_rows = []
     result = {
         "model": "qwen2.5_omni_7b",
         "mode": _result_mode(args),
@@ -2220,6 +2362,16 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
             if getattr(ue, "_decode_step_us", None)
             else None
         ),
+        "model_gflops_effective": {
+            row["stage"]: round(row["model_gflops"], 3)
+            for row in _summary_rows
+            if row.get("model_gflops")
+        },
+        "model_gflop_work": {
+            row["stage"]: round(row["model_flops"] / 1e9, 3)
+            for row in _summary_rows
+            if row.get("model_flops")
+        },
         "prefill_gflops": getattr(ue, "_prefill_gflops", None),
         "decode_gflops": getattr(ue, "_decode_gflops", None),
         "vision_gflops": getattr(ue, "_vis_gflops", None),
