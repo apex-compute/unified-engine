@@ -58,6 +58,62 @@ class Qwen25VLLMMixin:
 
     # ---- weights -----------------------------------------------------------
 
+    def _lm_quantized_projections(self) -> set[str]:
+        """Projection tags stored with the configured block-quantized codec.
+
+        Qwen2.5-VL-3B keeps V/O in BF16 for accuracy. Larger compatible
+        decoders can opt either projection into IF4 independently; notably,
+        Qwen2.5-Omni-7B uses IF4 O during prefill, then switches to a shared
+        BF16 O overlay for decode while retaining BF16 V in both phases.
+        Keeping the choices phase-aware here makes the emitter reusable without
+        changing the released 3B bin format.
+        """
+        default = ("q", "k", "gate", "up", "down")
+        values = self._cfg.get("precision", {}).get(
+            "lm_quantized_projections", default)
+        valid = {"q", "k", "v", "o", "gate", "up", "down"}
+        result = set(values)
+        unknown = result - valid
+        if unknown:
+            raise ValueError(
+                f"unknown LM quantized projection tag(s): {sorted(unknown)}")
+        return result
+
+    def _lm_projection_is_quantized(self, tag: str) -> bool:
+        return tag in self._lm_quantized_projections()
+
+    def _decode_projection_is_quantized(self, tag: str) -> bool:
+        """Decode storage policy, overridable independently from prefill."""
+        return self._lm_projection_is_quantized(tag)
+
+    def _decode_projection_should_shard(self, tag: str, layer: int) -> bool:
+        """Whether decode materializes this projection in private DRAM."""
+        return True
+
+    def _decode_projection_uses_static_bf16(self, tag: str) -> bool:
+        """Whether an unsharded BF16 decode projection uses legacy tiling.
+
+        The dynamic dense-BF16 matmul path is not yet a proven replacement for
+        the compile-time tiler.  Models that phase-share an unsharded M=1
+        matrix can opt into the same static path used by Gemma4 E2B.
+        """
+        return False
+
+    def _prepare_decode_shared_weights(self, layer_size: int) -> None:
+        """Optional post-sharding hook for phase-shared decoder weights."""
+        return None
+
+    def _prefill_use_streaming_quantized_projection(self, tag: str) -> bool:
+        """Whether a row-sharded prefill projection uses the streaming core.
+
+        The released Qwen2.5-VL dimensions fit the general dynamic matmat
+        tiler, so its established path remains the default.  Compatible models
+        with a larger inner dimension can opt individual projections into the
+        runtime-row, one-pass quantized core used by Gemma4 E2B's configurable
+        prefill implementation.
+        """
+        return False
+
     def _lm_dims(self) -> dict:
         fi = self._cfg["file_info"]
         qh = fi["num_kv_heads"] * fi["group_size"]
@@ -82,10 +138,11 @@ class Qwen25VLLMMixin:
     def lm_weight_init(self) -> None:
         """Load LM weights over the params window. Idempotent.
 
-        Q/K/gate/up/down and the LM head are IF4; V and O stay BF16 (the
-        previous build kept them full-precision for attention accuracy, and the
-        bin is written that way). The embedding is NOT uploaded -- lookup is a
-        host-side gather and only the selected rows are ever DMA'd.
+        Projection storage follows ``precision.lm_quantized_projections`` and
+        the LM head is IF4. Embeddings default to the original host-side BF16
+        gather. Models that set ``precision.embedding`` to ``if4`` or ``if8``
+        retain only the artifact descriptor here and provide an accelerator
+        lookup hook.
         """
         if getattr(self, "_lm_weight_init_done", False):
             return
@@ -96,9 +153,26 @@ class Qwen25VLLMMixin:
         if getattr(self, "_vision_weight_init_done", False):
             self._loud("  [LM] reclaiming the params window from vision weights")
         self.reset_params_dram_addr()
+        # The first successful DMA below starts destroying every previous
+        # occupant of this phase-shared window. Invalidate optimistic cache
+        # flags before that can happen so a short write remains safely retryable.
+        self._lm_weight_init_done = False
+        self._vision_weight_init_done = False
+        if hasattr(self, "_audio_weight_init_done"):
+            self._audio_weight_init_done = False
         start = self.get_params_dram_addr()
-        self._loud(f"  [LM] loading {d['NL']} layers ({sfx.upper()} Q/K/MLP, "
-                   f"BF16 V/O) at 0x{start:X} ...")
+        quantized = self._lm_quantized_projections()
+        q_desc = "/".join(t.upper() for t in
+                          ("q", "k", "v", "o", "gate", "up", "down")
+                          if t in quantized)
+        dense_desc = "/".join(t.upper() for t in
+                              ("q", "k", "v", "o", "gate", "up", "down")
+                              if t not in quantized)
+        storage = f"{sfx.upper()} {q_desc}"
+        if dense_desc:
+            storage += f", BF16 {dense_desc}"
+        self._loud(f"  [LM] loading {d['NL']} layers ({storage}) at "
+                   f"0x{start:X} ...")
 
         def need(k):
             if k not in sec:
@@ -111,14 +185,21 @@ class Qwen25VLLMMixin:
             for i in range(d["NL"]):
                 pre = f"language_model.layers.{i}"
                 la = {}
-                for tag, key in (("q", "self_attn.q_proj"), ("k", "self_attn.k_proj"),
-                                 ("gate", "mlp.gate_proj"), ("up", "mlp.up_proj"),
-                                 ("down", "mlp.down_proj")):
-                    la[f"{tag}_scale"], la[f"{tag}_data"] = self._dma_if4(
-                        f, need(f"{pre}.{key}.weight.{sfx}"), base, f"{pre}.{key}")
-                for tag, key in (("v", "self_attn.v_proj"), ("o", "self_attn.o_proj")):
-                    la[f"{tag}_weight"] = self._dma_bf16(
-                        f, need(f"{pre}.{key}.weight"), base, f"{pre}.{key}")
+                projections = (
+                    ("q", "self_attn.q_proj"), ("k", "self_attn.k_proj"),
+                    ("v", "self_attn.v_proj"), ("o", "self_attn.o_proj"),
+                    ("gate", "mlp.gate_proj"), ("up", "mlp.up_proj"),
+                    ("down", "mlp.down_proj"),
+                )
+                for tag, key in projections:
+                    if tag in quantized:
+                        la[f"{tag}_scale"], la[f"{tag}_data"] = self._dma_if4(
+                            f, need(f"{pre}.{key}.weight.{sfx}"), base,
+                            f"{pre}.{key}")
+                    else:
+                        la[f"{tag}_weight"] = self._dma_bf16(
+                            f, need(f"{pre}.{key}.weight"), base,
+                            f"{pre}.{key}")
                 for tag, key in (("q", "self_attn.q_proj"), ("k", "self_attn.k_proj"),
                                  ("v", "self_attn.v_proj")):
                     la[f"{tag}_bias"] = self._dma_bf16(
@@ -136,13 +217,43 @@ class Qwen25VLLMMixin:
             self.lm_head_scale, self.lm_head_data = self._dma_if4(
                 f, need(f"lm_head.weight.{sfx}"), base, "lm_head")
 
-            # Embedding: host-side gather. Read once into host RAM; the device
-            # never sees it, which is what keeps the LM inside 1808 MiB.
-            s = need("language_model.embed_tokens.weight")
-            f.seek(base + s["offset"])
-            raw = f.read(s["size"])
-        self.embedding_weight = torch.frombuffer(
-            bytearray(raw), dtype=torch.bfloat16).reshape(d["VOCAB"], d["H"])
+            embedding_precision = self._cfg.get("precision", {}).get(
+                "embedding", "bf16"
+            )
+            if embedding_precision == "bf16":
+                # Original Qwen2.5-VL path: retain the table in host RAM and
+                # DMA only rows selected by token IDs.
+                s = need("language_model.embed_tokens.weight")
+                f.seek(base + s["offset"])
+                raw = f.read(s["size"])
+                if len(raw) != s["size"]:
+                    raise RuntimeError("truncated host embedding table")
+                self.embedding_weight = torch.frombuffer(
+                    bytearray(raw), dtype=torch.bfloat16
+                ).reshape(d["VOCAB"], d["H"])
+                self._embedding_artifact = None
+                embedding_desc = f"{len(raw) / 2**20:.1f} MiB kept on host"
+            elif embedding_precision in ("if4", "if8"):
+                s = need(
+                    f"language_model.embed_tokens.weight.{embedding_precision}"
+                )
+                self._embedding_artifact = {
+                    "bin_path": region["bin_path"],
+                    "file_offset": base + int(s["offset"]),
+                    "section": dict(s),
+                    "precision": embedding_precision,
+                }
+                if hasattr(self, "embedding_weight"):
+                    del self.embedding_weight
+                embedding_desc = (
+                    f"{int(s['size']) / 2**20:.1f} MiB {embedding_precision.upper()} "
+                    "reserved for device lookup"
+                )
+            else:
+                raise ValueError(
+                    "precision.embedding must be 'bf16', 'if4', or 'if8', "
+                    f"got {embedding_precision!r}"
+                )
 
         self._lm_weight_end = self.get_params_dram_addr()
         used = self._lm_weight_end - start
@@ -151,9 +262,8 @@ class Qwen25VLLMMixin:
                 f"LM weights overflow the params window: end "
                 f"0x{self._lm_weight_end:X} > 0x{self.PARAMS_LIMIT:X}")
         self._lm_weight_init_done = True
-        self._vision_weight_init_done = False   # vision weights are gone now
         self._loud(f"  [LM] weights loaded: {used / 2**20:.1f} MiB "
-                   f"(embedding {len(raw) / 2**20:.1f} MiB kept on host)")
+                   f"(embedding {embedding_desc})")
 
         self._ensure_tokenizer()
 
@@ -172,8 +282,33 @@ class Qwen25VLLMMixin:
         return self.tokenizer
 
     def get_embedding_for_tokens(self, token_ids) -> torch.Tensor:
+        if not hasattr(self, "embedding_weight"):
+            raise RuntimeError(
+                "this model keeps embeddings on the accelerator; use its "
+                "device embedding loader"
+            )
         return self.embedding_weight[torch.as_tensor(list(token_ids),
                                                      dtype=torch.long)].contiguous()
+
+    def _device_embedding_enabled(self) -> bool:
+        """Whether token rows are produced by an accelerator-specific hook."""
+        return False
+
+    def _prefill_execution_rows(self, seq_len: int) -> int:
+        """Rows the FPGA executes for ``seq_len`` live prompt tokens.
+
+        Most models execute the live row count directly.  A concrete model may
+        round this up when its multi-engine kernels require a non-ragged shape;
+        :meth:`run_prefill` keeps every extra row finite and masks its key
+        column, so padded rows cannot affect live-token results.
+        """
+        return seq_len
+
+    def _load_device_embeddings(self, token_ids, output_dram_addr: int) -> None:
+        raise NotImplementedError("device embedding lookup is not implemented")
+
+    def _emit_device_decode_embedding(self, token: int, output_dram_addr: int) -> None:
+        raise NotImplementedError("device decode embedding lookup is not implemented")
 
     # ---- RoPE --------------------------------------------------------------
 
@@ -372,6 +507,33 @@ class Qwen25VLLMMixin:
     # ---- program emission --------------------------------------------------
 
     def _ensure_decode_shards(self, sched, layer_size: int) -> dict:
+        """Build the complete decode shard set atomically."""
+        missing = object()
+        arena_cursors_before = list(sched.arena._weight_cursor)
+        scheduler_weights_before = dict(sched._weights)
+        decode_shards_before = getattr(self, "_decode_shards", missing)
+        lm_shard_before = getattr(self, "_decode_lm_shard", missing)
+        try:
+            return self._ensure_decode_shards_impl(sched, layer_size)
+        except Exception:
+            # A shard copy is card -> host -> card and may fail after earlier
+            # projections were fully cached. Roll back the whole set so retry
+            # neither collides with those names nor leaks private-arena space.
+            sched.arena._weight_cursor[:] = arena_cursors_before
+            sched._weights.clear()
+            sched._weights.update(scheduler_weights_before)
+            for attr, value in (
+                ("_decode_shards", decode_shards_before),
+                ("_decode_lm_shard", lm_shard_before),
+            ):
+                if value is missing:
+                    if hasattr(self, attr):
+                        delattr(self, attr)
+                else:
+                    setattr(self, attr, value)
+            raise
+
+    def _ensure_decode_shards_impl(self, sched, layer_size: int) -> dict:
         """Copy each engine's COLUMN block of the decode weights into its own
         private arena. Returns ``{(op, layer): ShardedWeight}``.
 
@@ -410,13 +572,17 @@ class Qwen25VLLMMixin:
         shards, skipped = {}, []
         for li in range(layer_size):
             la = self.lm_layer_addrs[li]
-            for op, K, N, quant in (("q", d["H"], d["QH"] * d["AHD"], True),
-                                    ("k", d["H"], d["KVH"] * d["AHD"], True),
-                                    ("v", d["H"], d["KVH"] * d["AHD"], False),
-                             ("o", d["QH"] * d["AHD"], d["H"], False),
-                             ("gate", d["H"], d["MLP"], True),
-                             ("up", d["H"], d["MLP"], True),
-                             ("down", d["MLP"], d["H"], True)):
+            for op, K, N in (("q", d["H"], d["QH"] * d["AHD"]),
+                             ("k", d["H"], d["KVH"] * d["AHD"]),
+                             ("v", d["H"], d["KVH"] * d["AHD"]),
+                             ("o", d["QH"] * d["AHD"], d["H"]),
+                             ("gate", d["H"], d["MLP"]),
+                             ("up", d["H"], d["MLP"]),
+                             ("down", d["MLP"], d["H"])):
+                if not self._decode_projection_should_shard(op, li):
+                    skipped.append((op, li))
+                    continue
+                quant = self._decode_projection_is_quantized(op)
                 # An op narrower than one 64-column block per engine still
                 # shards -- over as many engines as it fills.
                 n_sh = min(sched.num_engines, mes.max_shards(N))
@@ -498,10 +664,19 @@ class Qwen25VLLMMixin:
         bases differ, and those are literals.
         """
         regs = getattr(self, "_decode_attn_worker_regs", None)
-        if regs is None:
+        if regs is None or len(regs) != len(dec_sched.workers):
             regs = [{n: w.alloc_isa_reg() for n in self.DEC_ATTN_REGS}
                     for w in dec_sched.workers]
             self._decode_attn_worker_regs = regs
+        else:
+            # begin_program() deliberately resets worker allocators. A second
+            # decoder compile (profiling or retry) reuses these stable runtime
+            # IDs, so reserve them again before any temporary register is
+            # allocated or it will alias row_off/out_off/... in the program.
+            for worker, worker_regs in zip(dec_sched.workers, regs):
+                next_free = max(worker_regs.values(), default=0) + 1
+                if worker._isa_reg_counter < next_free:
+                    worker._isa_reg_counter = next_free
         return regs
 
     def _decode_attn_worker_gpr_sets(self, dec_sched, aligned: int):
@@ -606,6 +781,10 @@ class Qwen25VLLMMixin:
             return self.get_arg_max_index()
         return sched.global_argmax(sw, self.LOGITS)
 
+    def _decode_stop_token_ids(self) -> set[int]:
+        """Token IDs that terminate greedy generation for this model family."""
+        return {151643, 151645, self._end_of_turn_token_id}
+
     def _kv_addr(self, cache_base: int, layer: int, kv_head: int) -> int:
         return cache_base + layer * self.KV_STRIDE_LAYER + kv_head * self.KV_STRIDE_HEAD
 
@@ -628,11 +807,10 @@ class Qwen25VLLMMixin:
             DECODE USES THE M=1 GEMV KERNEL for every IF4 weight. At M=1 the
             general matmat kernel pays for a row tile it does not fill;
             quantized_matmat_core streams the packed weights straight through
-            DOT_PRODUCT instead. It accepts IF4/IF8/TQ4 only, so v_proj and
-            o_proj -- the two the weight bin deliberately keeps BF16 for
-            attention accuracy, with no .if4 bytes to give it -- stay on
-            matmat_mul_core. Prefill has real rows to fill and stays on the
-            general kernel throughout.
+            DOT_PRODUCT instead. It accepts IF4/IF8/TQ4 only, so projections
+            configured as BF16 stay on matmat_mul_core. Prefill has real rows
+            to fill and normally stays on the general kernel; compatible
+            large-K models may opt a projection into the streaming path.
             """
             if decode and quant:
                 return self.quantized_matmat_core(
@@ -642,6 +820,23 @@ class Qwen25VLLMMixin:
                     C_DRAM_ADDR=bias,
                     bias_mode="broadcast_N" if bias is not None else "broadcast_N",
                     silu_enable=silu) or 0
+            if (
+                decode
+                and not quant
+                and self._decode_projection_uses_static_bf16(tag)
+            ):
+                # Gemma4 E2B deliberately uses the legacy/static kernel for
+                # dense BF16 M=1 projections.  Do not pass gpr_M_reg here: that
+                # would dispatch to the unresolved dynamic dense-BF16 path.
+                return self.matmat_mul_core_legacy(
+                    M=M, K=K, N=N,
+                    A_DRAM_ADDR=A,
+                    B_DRAM_ADDR=la[f"{tag}_weight"],
+                    OUTPUT_DRAM_ADDR=OUT,
+                    C_DRAM_ADDR=bias,
+                    bias_mode="broadcast_N",
+                    silu_enable=silu,
+                ) or 0
             kw = dict(M=M, K=K, N=N, A_DRAM_ADDR=A, OUTPUT_DRAM_ADDR=OUT,
                       silu_enable=silu, gpr_M_reg=m_reg)
             if bias is not None:
@@ -664,9 +859,14 @@ class Qwen25VLLMMixin:
             # rides ONE rendezvous for the layer; an op that cannot split runs
             # full-width on the master inside that same round, overlapping the
             # workers rather than serialising after them.
-            projs = (("q", self.LM_Q, QH * AHD, la["q_bias"], True),
-                     ("k", self.LM_K, KVH * AHD, la["k_bias"], True),
-                     ("v", self.LM_V, KVH * AHD, la["v_bias"], False))
+            projs = tuple(
+                (tag, out, width, bias,
+                 self._decode_projection_is_quantized(tag))
+                for tag, out, width, bias in (
+                    ("q", self.LM_Q, QH * AHD, la["q_bias"]),
+                    ("k", self.LM_K, KVH * AHD, la["k_bias"]),
+                    ("v", self.LM_V, KVH * AHD, la["v_bias"]),
+                ))
             round_ops = [(dec_shards[(tag, li)], out, self.LM_PRE_NORM, bias, False)
                          for tag, out, _, bias, _ in projs
                          if (tag, li) in dec_shards]
@@ -692,8 +892,11 @@ class Qwen25VLLMMixin:
         elif sched is None:
             flops += mm(H, QH * AHD, self.LM_PRE_NORM, "q", self.LM_Q, bias=la["q_bias"])
             flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "k", self.LM_K, bias=la["k_bias"])
-            flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "v", self.LM_V,
-                        quant=False, bias=la["v_bias"])
+            flops += mm(
+                H, KVH * AHD, self.LM_PRE_NORM, "v", self.LM_V,
+                quant=(self._decode_projection_is_quantized("v") if decode
+                       else self._lm_projection_is_quantized("v")),
+                bias=la["v_bias"])
         else:
             # Row-shard the three projections over tokens: each engine reads its
             # own rows of LM_PRE_NORM and writes the matching rows of Q/K/V.
@@ -712,10 +915,11 @@ class Qwen25VLLMMixin:
                     A_DRAM_ADDR=ctx.rows_addr(in_addr, H * bpe),
                     OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_PRE_NORM, H * bpe),
                     GAMMA_DRAM_ADDR=la["ln1"], gpr_M_reg=m) or 0
-                for tag, n_out, out, row, quant in (
-                        ("q", QH * AHD, self.LM_Q, QH * AHD * bpe, True),
-                        ("k", KVH * AHD, self.LM_K, KVH * AHD * bpe, True),
-                        ("v", KVH * AHD, self.LM_V, KVH * AHD * bpe, False)):
+                for tag, n_out, out, row in (
+                        ("q", QH * AHD, self.LM_Q, QH * AHD * bpe),
+                        ("k", KVH * AHD, self.LM_K, KVH * AHD * bpe),
+                        ("v", KVH * AHD, self.LM_V, KVH * AHD * bpe)):
+                    quant = self._lm_projection_is_quantized(tag)
                     ctx.ue.generate_instruction_add_set(m, ctx.rows)
                     kw = dict(M=ctx.rows, K=H, N=n_out,
                               A_DRAM_ADDR=ctx.rows_addr(self.LM_PRE_NORM, H * bpe),
@@ -1086,24 +1290,32 @@ class Qwen25VLLMMixin:
                 [(o_sw, self.LM_ATTN_PROJ, self.LM_ATTN_RESULT, None, False)],
                 _master_o)
         elif sched is None:
-            flops += mm(QH * AHD, H, self.LM_ATTN_RESULT, "o", self.LM_ATTN_PROJ,
-                        quant=False)
+            flops += mm(
+                QH * AHD, H, self.LM_ATTN_RESULT, "o", self.LM_ATTN_PROJ,
+                quant=(self._decode_projection_is_quantized("o") if decode
+                       else self._lm_projection_is_quantized("o")))
         else:
             # Same row shard as qkv: each engine takes its own tokens of the
             # attention result and writes the matching rows of the projection.
-            # o_proj is BF16 (no .if4 bytes exist for it), so it takes the
-            # unquantized branch -- and it has no bias.
+            # The storage policy is per-model; the 3B build keeps o_proj BF16,
+            # while memory-constrained larger decoders opt it into IF4.
             o_acc = [0]
 
             def _o(ctx, la=la, o_acc=o_acc):
                 m = gate_m_regs[ctx.engine_idx]
                 ctx.ue.generate_instruction_add_set(m, ctx.rows)
-                o_acc[0] += ctx.ue.matmat_mul_core(
+                kw = dict(
                     M=ctx.rows, K=QH * AHD, N=H,
                     A_DRAM_ADDR=ctx.rows_addr(self.LM_ATTN_RESULT, QH * AHD * bpe),
-                    B_DRAM_ADDR=la["o_weight"],
                     OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_ATTN_PROJ, H * bpe),
-                    gpr_M_reg=m) or 0
+                    gpr_M_reg=m)
+                if self._lm_projection_is_quantized("o"):
+                    kw.update(B_DRAM_ADDR=la["o_data"], is_B_quantized=True,
+                              data_type=TYPE.IF4,
+                              SCALE_DRAM_ADDR=la["o_scale"])
+                else:
+                    kw.update(B_DRAM_ADDR=la["o_weight"])
+                o_acc[0] += ctx.ue.matmat_mul_core(**kw) or 0
 
             sched.sharded_region(M, _o)
             flops += o_acc[0]
@@ -1221,64 +1433,92 @@ class Qwen25VLLMMixin:
                 gpr_M_reg=m_reg) or 0
             flops += mm(MLP, H, self.LM_MLP_MULT, "down", self.LM_MLP_DOWN)
         else:
-            # gate -> up -> (gate*up) -> down as ONE region. Within an engine's
-            # rows the chain is strictly sequential, so only region entry and
-            # exit need a rendezvous; splitting it into four would pay three
-            # extra barriers per layer for nothing. The SwiGLU MLP has no
-            # biases, so only the activations are sliced.
+            # The SwiGLU MLP has no biases, so only the activations are sliced.
+            # Four-phase images keep the whole row-independent chain in one
+            # region. A host-segmented legacy image places a HALT between its
+            # kernels: besides matching that image's one-rendezvous-per-launch
+            # contract, it prevents a very long resumed queue from spanning
+            # several independent PBI loop nests.
             mlp_acc = [0]
 
-            def _mlp(ctx, la=la, mlp_acc=mlp_acc, in_addr=in_addr, out_addr=out_addr):
+            def _mlp_step(ctx, step, la=la, mlp_acc=mlp_acc,
+                          in_addr=in_addr, out_addr=out_addr):
                 m = gate_m_regs[ctx.engine_idx]
                 h_row, mlp_row = H * bpe, MLP * bpe
-                # Both residuals and norm2 fold in: the whole chain from the
-                # attention residual to the layer output is row-independent, so
-                # it is one region rather than four with barriers between.
                 ctx.ue.generate_instruction_add_set(m, ctx.rows)
-                mlp_acc[0] += ctx.ue.eltwise_core_dram(
-                    M=ctx.rows, N=H, dram_a=ctx.rows_addr(in_addr, h_row),
-                    dram_b=ctx.rows_addr(self.LM_ATTN_PROJ, h_row),
-                    dram_out=ctx.rows_addr(self.LM_RESIDUAL, h_row),
-                    mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
-                ctx.ue.generate_instruction_add_set(m, ctx.rows)
-                mlp_acc[0] += ctx.ue.rms_norm_core_dram(
-                    M=ctx.rows, N=H,
-                    A_DRAM_ADDR=ctx.rows_addr(self.LM_RESIDUAL, h_row),
-                    OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_NORM, h_row),
-                    GAMMA_DRAM_ADDR=la["ln2"], gpr_M_reg=m) or 0
-                a = ctx.rows_addr(self.LM_MLP_NORM, h_row)
-                for tag, out in (("gate", self.LM_MLP_GATE), ("up", self.LM_MLP_UP)):
-                    ctx.ue.generate_instruction_add_set(m, ctx.rows)
+                if step == "residual1":
+                    mlp_acc[0] += ctx.ue.eltwise_core_dram(
+                        M=ctx.rows, N=H,
+                        dram_a=ctx.rows_addr(in_addr, h_row),
+                        dram_b=ctx.rows_addr(self.LM_ATTN_PROJ, h_row),
+                        dram_out=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                        mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
+                elif step == "norm":
+                    mlp_acc[0] += ctx.ue.rms_norm_core_dram(
+                        M=ctx.rows, N=H,
+                        A_DRAM_ADDR=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_NORM, h_row),
+                        GAMMA_DRAM_ADDR=la["ln2"], gpr_M_reg=m) or 0
+                elif step in ("gate", "up"):
+                    out = (self.LM_MLP_GATE if step == "gate"
+                           else self.LM_MLP_UP)
+                    a = ctx.rows_addr(self.LM_MLP_NORM, h_row)
                     mlp_acc[0] += ctx.ue.matmat_mul_core(
                         M=ctx.rows, K=H, N=MLP, A_DRAM_ADDR=a,
-                        B_DRAM_ADDR=la[f"{tag}_data"], is_B_quantized=True,
-                        data_type=TYPE.IF4, SCALE_DRAM_ADDR=la[f"{tag}_scale"],
+                        B_DRAM_ADDR=la[f"{step}_data"], is_B_quantized=True,
+                        data_type=TYPE.IF4,
+                        SCALE_DRAM_ADDR=la[f"{step}_scale"],
                         OUTPUT_DRAM_ADDR=ctx.rows_addr(out, mlp_row),
-                        silu_enable=(tag == "gate"), gpr_M_reg=m) or 0
-                ctx.ue.generate_instruction_add_set(m, ctx.rows)
-                mlp_acc[0] += ctx.ue.eltwise_core_dram(
-                    M=ctx.rows, N=MLP,
-                    dram_a=ctx.rows_addr(self.LM_MLP_GATE, mlp_row),
-                    dram_b=ctx.rows_addr(self.LM_MLP_UP, mlp_row),
-                    dram_out=ctx.rows_addr(self.LM_MLP_MULT, mlp_row),
-                    mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=m) or 0
-                ctx.ue.generate_instruction_add_set(m, ctx.rows)
-                mlp_acc[0] += ctx.ue.matmat_mul_core(
-                    M=ctx.rows, K=MLP, N=H,
-                    A_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_MULT, mlp_row),
-                    B_DRAM_ADDR=la["down_data"], is_B_quantized=True,
-                    data_type=TYPE.IF4, SCALE_DRAM_ADDR=la["down_scale"],
-                    OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_DOWN, h_row),
-                    gpr_M_reg=m) or 0
-                ctx.ue.generate_instruction_add_set(m, ctx.rows)
-                mlp_acc[0] += ctx.ue.eltwise_core_dram(
-                    M=ctx.rows, N=H,
-                    dram_a=ctx.rows_addr(self.LM_RESIDUAL, h_row),
-                    dram_b=ctx.rows_addr(self.LM_MLP_DOWN, h_row),
-                    dram_out=ctx.rows_addr(out_addr, h_row),
-                    mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
+                        silu_enable=(step == "gate"), gpr_M_reg=m) or 0
+                elif step == "multiply":
+                    mlp_acc[0] += ctx.ue.eltwise_core_dram(
+                        M=ctx.rows, N=MLP,
+                        dram_a=ctx.rows_addr(self.LM_MLP_GATE, mlp_row),
+                        dram_b=ctx.rows_addr(self.LM_MLP_UP, mlp_row),
+                        dram_out=ctx.rows_addr(self.LM_MLP_MULT, mlp_row),
+                        mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=m) or 0
+                elif step == "down":
+                    down_kw = dict(
+                        M=ctx.rows, K=MLP, N=H,
+                        A_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_MULT, mlp_row),
+                        B_DRAM_ADDR=la["down_data"],
+                        data_type=TYPE.IF4, SCALE_DRAM_ADDR=la["down_scale"],
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_DOWN, h_row),
+                    )
+                    if self._prefill_use_streaming_quantized_projection("down"):
+                        # Keep M in the engine-local row-count register. This
+                        # is Gemma4 E2B's compact streaming-prefill form: one
+                        # captured loop serves text and multimodal row counts.
+                        down_kw["gpr_M_reg"] = m
+                        mlp_acc[0] += (
+                            ctx.ue.quantized_matmat_core(**down_kw) or 0)
+                    else:
+                        down_kw.update(is_B_quantized=True, gpr_M_reg=m)
+                        mlp_acc[0] += ctx.ue.matmat_mul_core(**down_kw) or 0
+                elif step == "residual2":
+                    mlp_acc[0] += ctx.ue.eltwise_core_dram(
+                        M=ctx.rows, N=H,
+                        dram_a=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                        dram_b=ctx.rows_addr(self.LM_MLP_DOWN, h_row),
+                        dram_out=ctx.rows_addr(out_addr, h_row),
+                        mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
+                else:
+                    raise AssertionError(f"unknown prefill MLP step {step!r}")
 
-            sched.sharded_region(M, _mlp)
+            mlp_steps = (
+                "residual1", "norm", "gate", "up", "multiply", "down",
+                "residual2",
+            )
+            if sched.host_segmented:
+                for step in mlp_steps:
+                    sched.sharded_region(
+                        M, lambda ctx, step=step: _mlp_step(ctx, step))
+            else:
+                def _mlp(ctx):
+                    for step in mlp_steps:
+                        _mlp_step(ctx, step)
+
+                sched.sharded_region(M, _mlp)
             flops += mlp_acc[0]
             self.generate_instruction_add_set(m_reg, M)   # restore gf_seq_len
         if sched is None and not folded_resid2:
@@ -1324,14 +1564,65 @@ class Qwen25VLLMMixin:
         results = []
         self.start_execute_from_dram(start_addr)
         for name, resume, ph_flops in checkpoints:
-            self.wait_queue(timeout_s)
+            self._wait_lm_queue(self, timeout_s, f"profile phase {name}")
             results.append((name, self.report_latency_in_us() / 1e3, ph_flops))
             self.start_execute_from_dram(resume)
-        self.wait_queue(timeout_s)
+        self._wait_lm_queue(self, timeout_s, "profile tail")
         return results
+
+    @staticmethod
+    def _wait_lm_queue(engine, timeout_s: float, what: str) -> None:
+        if not math.isfinite(float(timeout_s)) or timeout_s <= 0:
+            raise ValueError(f"timeout_s must be finite and positive, got {timeout_s!r}")
+        engine.wait_queue(float(timeout_s))
+        if engine.is_queue_busy():
+            raise TimeoutError(f"{what} is still busy after {timeout_s:.1f}s")
+
+    def _run_lm_compile_transaction(self, stage: str, compiler):
+        """Run a capture compiler without leaking partial state on failure."""
+        previous_silent = self._set_silent(False)
+        self._set_silent(previous_silent)
+        reg_counter_before = self._isa_reg_counter
+        inst_ptr_counter_before = self._inst_ptr_counter
+        program_cursor_before = self.get_program_dram_addr()
+        scheduler_before = getattr(self, "_multi_core_schedulers", {}).get(stage)
+        worker_cursors_before = (
+            [worker.get_program_dram_addr() for worker in scheduler_before.workers]
+            if scheduler_before is not None else None
+        )
+        try:
+            return compiler()
+        except Exception:
+            scheduler = getattr(self, "_multi_core_schedulers", {}).get(stage)
+            if scheduler is not None:
+                scheduler.abort_program()
+                if worker_cursors_before is None:
+                    for worker in scheduler.workers:
+                        worker.reset_program_dram_addr()
+                else:
+                    for worker, cursor in zip(
+                        scheduler.workers, worker_cursors_before
+                    ):
+                        worker._next_program_dram_addr = cursor
+            if getattr(self, "is_capture_on", False):
+                self.stop_capture()
+            self.clear_capture_buffer()
+            self._isa_reg_counter = reg_counter_before
+            self._inst_ptr_counter = inst_ptr_counter_before
+            self._next_program_dram_addr = program_cursor_before
+            raise
+        finally:
+            self._set_silent(previous_silent)
 
     def compile_prefill(self, seq_len: int, layer_size: int = None,
                         profile: bool = False) -> int:
+        return self._run_lm_compile_transaction(
+            "prefill",
+            lambda: self._compile_prefill_impl(seq_len, layer_size, profile),
+        )
+
+    def _compile_prefill_impl(self, seq_len: int, layer_size: int = None,
+                              profile: bool = False) -> int:
         """Emit a prefill program for exactly ``seq_len`` tokens.
 
         Compiled per prompt rather than made length-agnostic: the head-major
@@ -1343,7 +1634,12 @@ class Qwen25VLLMMixin:
             raise ValueError(
                 f"prompt is {seq_len} tokens, PREFILL_MAX_SEQ_LEN is "
                 f"{self.PREFILL_MAX_SEQ_LEN}; tensors are sized for the latter")
-        aligned = ((seq_len + 63) // 64) * 64
+        execution_rows = int(self._prefill_execution_rows(seq_len))
+        if not seq_len <= execution_rows <= self.PREFILL_MAX_SEQ_LEN:
+            raise ValueError(
+                f"prefill execution rows must satisfy {seq_len} <= rows <= "
+                f"{self.PREFILL_MAX_SEQ_LEN}, got {execution_rows}")
+        aligned = ((execution_rows + 63) // 64) * 64
         t0 = time.perf_counter()
         self.reset_program_dram_addr()
         base = self.get_program_dram_addr()
@@ -1354,7 +1650,7 @@ class Qwen25VLLMMixin:
         self._emit_attn_flops = 0
 
         m_reg = self.gf_seq_len
-        self.generate_instruction_add_set(m_reg, seq_len)
+        self.generate_instruction_add_set(m_reg, execution_rows)
         flops = 0
         flops_ref = [0]
         self._prefill_checkpoints = []
@@ -1376,7 +1672,7 @@ class Qwen25VLLMMixin:
             in_addr = self.LM_IO_A if li % 2 == 0 else self.LM_IO_B
             out_addr = self.LM_IO_B if li % 2 == 0 else self.LM_IO_A
             flops += self._emit_layer(
-                li, seq_len, decode=False, m_reg=m_reg, aligned_kv=aligned,
+                li, execution_rows, decode=False, m_reg=m_reg, aligned_kv=aligned,
                 in_addr=in_addr, out_addr=out_addr,
                 rope_base=self.LM_ROPE_PRE, ckpt=ckpt,
                 sched=sched, gate_m_regs=gate_m_regs)
@@ -1406,6 +1702,7 @@ class Qwen25VLLMMixin:
         self._prefill_program = (base, bytes(blob))
         self._prefill_flops = int(flops)
         self._prefill_seq_len = seq_len
+        self._prefill_execution_rows_compiled = execution_rows
         self._prefill_layers = nl
         # Buffer the last emitted layer wrote (ping-pong: even count -> IO_A).
         self.LM_PREFILL_OUT = self.LM_IO_A if nl % 2 == 0 else self.LM_IO_B
@@ -1415,13 +1712,24 @@ class Qwen25VLLMMixin:
                 f"LM prefill program overruns the ISA region: "
                 f"0x{base + len(blob):X} > 0x{self.DRAM_END:X}. Prefill and "
                 f"decoder share it; shorten the prompt or enlarge the region.")
-        self._loud(f"  [LM] prefill compiled for {seq_len} tokens: "
+        row_note = (
+            f" ({execution_rows} FPGA execution rows)"
+            if execution_rows != seq_len else ""
+        )
+        self._loud(f"  [LM] prefill compiled for {seq_len} tokens{row_note}: "
                    f"{len(blob) / 2**20:.2f} MiB at 0x{base:X}, "
                    f"{flops / 1e9:.1f} GFLOP, {time.perf_counter() - t0:.1f}s")
         return base
 
     def compile_decoder(self, layer_size: int = None,
                         profile: bool = False) -> int:
+        return self._run_lm_compile_transaction(
+            "decode",
+            lambda: self._compile_decoder_impl(layer_size, profile),
+        )
+
+    def _compile_decoder_impl(self, layer_size: int = None,
+                              profile: bool = False) -> int:
         """Emit ONE position-agnostic decode program.
 
         Everything that depends on the step is a register: gf_seq_len is the KV
@@ -1456,6 +1764,11 @@ class Qwen25VLLMMixin:
             dec_sched.begin_program()
             dec_shards = self._ensure_decode_shards(dec_sched, nl)
             self._ensure_decode_attn_regs(dec_sched)
+            # This runs only after every private shard has been copied out of
+            # the shared params window. Larger models may now repurpose that
+            # window for decode-only weights, following the same phase-sharing
+            # discipline used by the media towers.
+            self._prepare_decode_shared_weights(nl)
         for li in range(nl):
             in_addr = self.LM_IO_A if li % 2 == 0 else self.LM_IO_B
             out_addr = self.LM_IO_B if li % 2 == 0 else self.LM_IO_A
@@ -1564,30 +1877,147 @@ class Qwen25VLLMMixin:
         """
         addr, blob = program
         self._next_program_dram_addr = addr
-        self.dma_write(DMA_DEVICE_H2C, addr, blob, len(blob))
+        written = self.dma_write(DMA_DEVICE_H2C, addr, blob, len(blob))
+        if written != len(blob):
+            raise IOError(
+                f"LM master ISA DMA wrote {written} of {len(blob)} bytes")
         self.allocate_program_dram(len(blob))
         return addr
 
     def run_prefill(self, tokens, image_embeddings=None, positions=None,
-                    profile: bool = False) -> None:
-        """Embed the prompt (splicing image tokens if given), then run prefill."""
+                    profile: bool = False, audio_embeddings=None,
+                    video_embeddings=None, modality_embeddings=None) -> None:
+        """Embed a prompt, splice supplied modality rows, then run prefill.
+
+        ``modality_embeddings`` may map ``image``/``audio``/``video`` to
+        tensors and is merged with the explicit backwards-compatible keyword
+        arguments.  Placeholder IDs come from the model config when present,
+        so compatible Qwen multimodal decoders do not inherit this model's
+        image-only assumptions.
+        """
         d = self._lm_dims()
         seq_len = len(tokens)
-        aligned = ((seq_len + 63) // 64) * 64
-        self.seq_len = seq_len
+        compiled_seq_len = getattr(self, "_prefill_seq_len", None)
+        if compiled_seq_len != seq_len:
+            raise ValueError(
+                f"prefill program was compiled for {compiled_seq_len} live "
+                f"token(s), but run received {seq_len}")
+        execution_rows = int(getattr(
+            self, "_prefill_execution_rows_compiled", seq_len
+        ))
+        if not seq_len <= execution_rows <= self.PREFILL_MAX_SEQ_LEN:
+            raise RuntimeError(
+                f"invalid compiled prefill execution row count {execution_rows} "
+                f"for {seq_len} live token(s)")
+        aligned = ((execution_rows + 63) // 64) * 64
 
-        emb = self.get_embedding_for_tokens(tokens)
-        if image_embeddings is not None:
-            slots = [i for i, t in enumerate(tokens) if t == 151655]
-            n = min(len(slots), image_embeddings.shape[0])
-            for i in range(n):
-                emb[slots[i]] = image_embeddings[i]
-            self._loud(f"  [LM] spliced {n} image embeddings at {slots[:4]}"
-                       f"{'...' if len(slots) > 4 else ''}")
-        self.dma_to_accelerator_memory(self.LM_IO_A, emb.flatten())
+        device_embedding = self._device_embedding_enabled()
+        emb = None if device_embedding else self.get_embedding_for_tokens(tokens)
+        if device_embedding:
+            # The model-specific hook emits IF4 row lookup + dequantization on
+            # the accelerator and writes the resulting BF16 rows straight into
+            # LM_IO_A.  The host handles token IDs and addresses only.
+            self._load_device_embeddings(tokens, self.LM_IO_A)
+            if execution_rows > seq_len:
+                # Padding is data preparation, not learned inference. It must be
+                # finite AND nonzero: this FPGA RMS reciprocal path cannot
+                # normalize an all-zero row. Padding keys are masked from every
+                # live query below, so the sentinel cannot affect live tokens.
+                self.dma_to_accelerator_memory(
+                    self.LM_IO_A + seq_len * d["H"] * self.bytes_per_element,
+                    torch.ones(
+                        (execution_rows - seq_len) * d["H"],
+                        dtype=torch.bfloat16,
+                    ),
+                )
+        elif execution_rows > seq_len:
+            padded = torch.ones((execution_rows, d["H"]), dtype=emb.dtype)
+            padded[:seq_len] = emb
+            emb = padded
+        supplied = dict(modality_embeddings or {})
+        for name, value in (("image", image_embeddings),
+                            ("audio", audio_embeddings),
+                            ("video", video_embeddings)):
+            if value is not None:
+                if name in supplied:
+                    raise ValueError(
+                        f"{name} embeddings supplied both explicitly and in "
+                        f"modality_embeddings")
+                supplied[name] = value
 
-        self.load_rope_for_positions(
-            positions if positions is not None else torch.arange(seq_len))
+        token_cfg = self._cfg.get("tokens", {})
+        token_ids = {
+            "image": int(token_cfg.get("image_token_id", 151655)),
+            "audio": int(token_cfg.get("audio_token_id", 151646)),
+            "video": int(token_cfg.get("video_token_id", 151656)),
+        }
+        for name, values in supplied.items():
+            if name not in token_ids:
+                raise ValueError(
+                    f"unsupported modality {name!r}; expected one of "
+                    f"{sorted(token_ids)}")
+            if device_embedding:
+                values = torch.as_tensor(values)
+                if values.dtype != torch.bfloat16:
+                    raise TypeError(
+                        f"{name} device embeddings must already be BF16; got "
+                        f"{values.dtype}. Host-side learned-data conversion is disabled."
+                    )
+            else:
+                values = torch.as_tensor(values, dtype=emb.dtype)
+            if values.ndim != 2 or values.shape[1] != d["H"]:
+                raise ValueError(
+                    f"{name} embeddings must have shape [tokens, {d['H']}], "
+                    f"got {tuple(values.shape)}")
+            slots = [i for i, token in enumerate(tokens)
+                     if token == token_ids[name]]
+            if len(slots) != values.shape[0]:
+                raise ValueError(
+                    f"{name} placeholder/embedding mismatch: prompt has "
+                    f"{len(slots)} token(s) {token_ids[name]}, encoder returned "
+                    f"{values.shape[0]} row(s)")
+            if slots:
+                if device_embedding:
+                    # Encoder rows already came from accelerator execution.
+                    # Copy contiguous placeholder runs back to their final LM
+                    # addresses without evaluating learned arithmetic on host.
+                    first = 0
+                    while first < len(slots):
+                        last = first + 1
+                        while (
+                            last < len(slots)
+                            and slots[last] == slots[last - 1] + 1
+                        ):
+                            last += 1
+                        rows = values[first:last].contiguous()
+                        self.dma_to_accelerator_memory(
+                            self.LM_IO_A + slots[first] * d["H"] * 2,
+                            rows.flatten(),
+                        )
+                        first = last
+                else:
+                    emb[torch.tensor(slots, dtype=torch.long)] = values
+            self._loud(
+                f"  [LM] spliced {len(slots)} {name} embeddings at {slots[:4]}"
+                f"{'...' if len(slots) > 4 else ''}")
+        if not device_embedding:
+            self.dma_to_accelerator_memory(self.LM_IO_A, emb.flatten())
+
+        live_positions = torch.as_tensor(
+            positions if positions is not None else torch.arange(seq_len)
+        )
+        if live_positions.ndim not in (1, 2) or live_positions.shape[0] != seq_len:
+            raise ValueError(
+                f"positions must have leading shape [{seq_len}], got "
+                f"{tuple(live_positions.shape)}")
+        if execution_rows > seq_len:
+            pad_shape = (execution_rows - seq_len, *live_positions.shape[1:])
+            live_positions = torch.cat(
+                (live_positions,
+                 torch.zeros(pad_shape, dtype=live_positions.dtype)),
+                dim=0,
+            )
+        self.load_rope_for_positions(live_positions)
         # Causal mask over the aligned square; columns past the real prompt are
         # masked too, so the alignment padding cannot be attended to.
         bias = torch.full((aligned, aligned), float("-inf"), dtype=torch.bfloat16)
@@ -1600,32 +2030,52 @@ class Qwen25VLLMMixin:
         worker_addrs = []
         for idx, w, waddr, blob in getattr(self, "_prefill_workers", []):
             w._next_program_dram_addr = waddr
-            w.dma_write(DMA_DEVICE_H2C, waddr, blob, len(blob))
+            written = w.dma_write(DMA_DEVICE_H2C, waddr, blob, len(blob))
+            if written != len(blob):
+                raise IOError(
+                    f"prefill worker {idx} ISA DMA wrote {written} of "
+                    f"{len(blob)} bytes")
             w.allocate_program_dram(len(blob))
             worker_addrs.append(waddr)
-        if sched is not None:
+        if sched is not None and not sched.host_segmented:
             sched.preclear_flags()
         t0 = time.perf_counter()
         if profile:
+            if sched is not None and sched.host_segmented:
+                raise RuntimeError(
+                    "profile checkpoints cannot be combined with the installed "
+                    "FPGA build's host-segmented rendezvous")
             cps = getattr(self, "_prefill_checkpoints", [])
             if not cps:
                 raise RuntimeError("profiled prefill needs compile_prefill(profile=True)")
             if sched is not None:
                 sched.start_workers(worker_addrs)
             self._prefill_profile = self._run_checkpointed(addr, cps, 180.0)
-            for w in (sched.workers if sched is not None else []):
-                w.wait_queue(180.0)
+            for idx, w in enumerate(
+                sched.workers if sched is not None else [], start=1
+            ):
+                self._wait_lm_queue(w, 180.0, f"prefill worker {idx}")
             us = sum(r[1] for r in self._prefill_profile) * 1e3
         else:
             # Workers first: each parks on its first rendezvous until the master
             # enters the region.
-            if sched is not None:
+            if sched is not None and sched.host_segmented:
+                us = sched.run_host_segmented(
+                    addr, worker_addrs, timeout_seconds=30.0)
+            elif sched is not None:
                 sched.start_workers(worker_addrs)
-            self.start_execute_from_dram(addr)
-            self.wait_queue(180.0)
-            for w in (sched.workers if sched is not None else []):
-                w.wait_queue(180.0)
-            us = self.report_latency_in_us()
+            if sched is None or not sched.host_segmented:
+                self.start_execute_from_dram(addr)
+                self._wait_lm_queue(self, 180.0, "prefill master")
+                for idx, w in enumerate(
+                    sched.workers if sched is not None else [], start=1
+                ):
+                    self._wait_lm_queue(w, 180.0, f"prefill worker {idx}")
+                us = self.report_latency_in_us()
+        # Expose the prompt length only after every engine has completed the
+        # cache population. Failed uploads or launches leave host state at the
+        # last known-complete sequence.
+        self.seq_len = seq_len
         # Prefill's compile-time shapes ARE what runs -- it is compiled for this
         # exact seq_len -- so the cores' FLOP sum needs no rescaling, unlike
         # decode's. The guard is here anyway: >100% of peak is impossible and
@@ -1662,46 +2112,96 @@ class Qwen25VLLMMixin:
         worker_addrs = []
         for idx, w, waddr, wblob in (workers or []):
             w._next_program_dram_addr = waddr
-            w.dma_write(DMA_DEVICE_H2C, waddr, wblob, len(wblob))
+            written = w.dma_write(DMA_DEVICE_H2C, waddr, wblob, len(wblob))
+            if written != len(wblob):
+                raise IOError(
+                    f"profiled decode worker {idx} ISA DMA wrote {written} of "
+                    f"{len(wblob)} bytes")
             w.allocate_program_dram(len(wblob))
             worker_addrs.append(waddr)
-        if dec_sched is not None:
+        if dec_sched is not None and not dec_sched.host_segmented:
             dec_sched.preclear_flags()
         step_pos = self.seq_len
-        self.seq_len += 1
-        aligned = ((self.seq_len + 63) // 64) * 64
+        next_seq_len = step_pos + 1
+        aligned = ((next_seq_len + 63) // 64) * 64
 
-        self.dma_to_accelerator_memory(
-            self.LM_IO_A, self.get_embedding_for_tokens([token]).flatten())
+        if not self._device_embedding_enabled():
+            self.dma_to_accelerator_memory(
+                self.LM_IO_A, self.get_embedding_for_tokens([token]).flatten())
         pos = step_pos + getattr(self, "_rope_offset", 0)
         self.load_rope_for_positions(torch.tensor([[pos, pos, pos]]), decode=True)
         bias = torch.full((self.LM_BATCH_ROWS, aligned), float("-inf"),
                           dtype=torch.bfloat16)
-        bias[:, :self.seq_len] = 0.0
+        bias[:, :next_seq_len] = 0.0
         self.dma_to_accelerator_memory(self.LM_BIAS, bias)
 
         self.clear_inst_id()
         self.start_capture()
+        if self._device_embedding_enabled():
+            self._emit_device_decode_embedding(token, self.LM_IO_A)
         self.generate_instruction_add_set(self.gf_seq_len, step_pos)
         self.generate_instruction_add_set(self.gf_aligned_seq_len, aligned)
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(addr))
         self.stop_capture()
-        self.write_captured_instructions_to_dram(self._decoder_preamble)
-        self.clear_capture_buffer()
+        try:
+            written = self.write_captured_instructions_to_dram(
+                self._decoder_preamble)
+            expected = self.get_capture_instruction_size_bytes()
+            if written != expected:
+                raise IOError(
+                    f"profiled decoder preamble DMA wrote {written} of "
+                    f"{expected} bytes")
+        finally:
+            self.clear_capture_buffer()
 
         prev = self._set_silent(True)
-        # Workers run their whole stream and block at each rendezvous; the
-        # master's HALTs sit at phase boundaries OUTSIDE any round, so stopping
-        # it between segments does not strand them.
-        if dec_sched is not None:
-            self._start_decode_workers(dec_sched, worker_addrs, aligned)
-        results = self._run_checkpointed(self._decoder_preamble, checkpoints, timeout_s)
-        for w in (dec_sched.workers if dec_sched is not None else []):
-            w.wait_queue(timeout_s)
-        self._set_silent(prev)
-        return results, self._decode_token(), aligned
+        try:
+            if dec_sched is not None and dec_sched.host_segmented:
+                raise RuntimeError(
+                    "profile checkpoints cannot be combined with the installed "
+                    "FPGA build's host-segmented rendezvous")
+            # Workers run their whole stream and block at each rendezvous; the
+            # master's HALTs sit at phase boundaries OUTSIDE any round, so stopping
+            # it between segments does not strand them.
+            if dec_sched is not None:
+                self._start_decode_workers(dec_sched, worker_addrs, aligned)
+            results = self._run_checkpointed(
+                self._decoder_preamble, checkpoints, timeout_s)
+            for idx, w in enumerate(
+                dec_sched.workers if dec_sched is not None else [], start=1
+            ):
+                self._wait_lm_queue(
+                    w, timeout_s, f"profiled decode worker {idx}")
+            # Commit the host position only after every participating engine
+            # completed the step. Upload or launch failures leave it unchanged.
+            self.seq_len = next_seq_len
+            return results, self._decode_token(), aligned
+        finally:
+            self._set_silent(prev)
 
-    def run_decoder(self, first_token: int, max_new_tokens: int = 256) -> tuple[int, str]:
+    def run_decoder(self, first_token: int,
+                    max_new_tokens: int = 256) -> tuple[int, str]:
+        """Run greedy decode and always restore process-wide output state."""
+        previous_silent = self._set_silent(False)
+        self._set_silent(previous_silent)
+        try:
+            return self._run_decoder_impl(first_token, max_new_tokens)
+        except Exception:
+            # The implementation installs a terminal scroll region only while
+            # decoding. A DMA failure or queue timeout must not leave the
+            # caller's terminal pinned after the exception propagates.
+            if sys.stdout.isatty():
+                import shutil
+                rows = shutil.get_terminal_size().lines
+                sys.stdout.write("\033[r")
+                sys.stdout.write(f"\033[{rows};1H\033[2K")
+                sys.stdout.flush()
+            raise
+        finally:
+            self._set_silent(previous_silent)
+
+    def _run_decoder_impl(self, first_token: int,
+                          max_new_tokens: int = 256) -> tuple[int, str]:
         """Greedy decode until EOS, ``max_new_tokens``, or the context fills.
 
         The cap is NOT cosmetic. If anything upstream makes the argmax garbage
@@ -1711,17 +2211,21 @@ class Qwen25VLLMMixin:
         so the NEXT run looks hung too.
         """
         d = self._lm_dims()
-        stop = {151643, 151645, self._end_of_turn_token_id}
+        stop = self._decode_stop_token_ids()
         addr, _ = self._decoder_program
         self._upload(self._decoder_program)
         dec_sched = self._ensure_stage_scheduler("decode")
         dec_worker_addrs = []
         for idx, w, waddr, wblob in getattr(self, "_decoder_workers", []):
             w._next_program_dram_addr = waddr
-            w.dma_write(DMA_DEVICE_H2C, waddr, wblob, len(wblob))
+            written = w.dma_write(DMA_DEVICE_H2C, waddr, wblob, len(wblob))
+            if written != len(wblob):
+                raise IOError(
+                    f"decode worker {idx} ISA DMA wrote {written} of "
+                    f"{len(wblob)} bytes")
             w.allocate_program_dram(len(wblob))
             dec_worker_addrs.append(waddr)
-        if dec_sched is not None:
+        if dec_sched is not None and not dec_sched.host_segmented:
             dec_sched.preclear_flags()
 
         token, out = first_token, []
@@ -1774,11 +2278,12 @@ class Qwen25VLLMMixin:
         prev_silent = self._set_silent(True)
         while self.seq_len < limit:
             step_pos = self.seq_len            # KV row this step writes
-            self.seq_len += 1
-            aligned = ((self.seq_len + 63) // 64) * 64
+            next_seq_len = step_pos + 1
+            aligned = ((next_seq_len + 63) // 64) * 64
 
-            self.dma_to_accelerator_memory(
-                self.LM_IO_A, self.get_embedding_for_tokens([token]).flatten())
+            if not self._device_embedding_enabled():
+                self.dma_to_accelerator_memory(
+                    self.LM_IO_A, self.get_embedding_for_tokens([token]).flatten())
             # After an image the next text position is NOT step_pos: the image
             # occupied max(h, w) positions, not one per token, so mrope_delta
             # carries the gap. All three components advance together for text.
@@ -1797,29 +2302,56 @@ class Qwen25VLLMMixin:
             # being right and the other seven wrong.
             bias = torch.full((self.LM_BATCH_ROWS, aligned), float("-inf"),
                               dtype=torch.bfloat16)
-            bias[:, :self.seq_len] = 0.0
+            bias[:, :next_seq_len] = 0.0
             self.dma_to_accelerator_memory(self.LM_BIAS, bias)
 
             # Per-step preamble: prime the position registers, jump to the body.
             self.clear_inst_id()
             self.start_capture()
+            if self._device_embedding_enabled():
+                self._emit_device_decode_embedding(token, self.LM_IO_A)
             self.generate_instruction_add_set(self.gf_seq_len, step_pos)
             self.generate_instruction_add_set(self.gf_aligned_seq_len, aligned)
             self.generate_instruction_jump_abs(ue_35bit_addr_shifter(addr))
             self.stop_capture()
-            self.write_captured_instructions_to_dram(self._decoder_preamble)
-            self.clear_capture_buffer()
+            try:
+                written = self.write_captured_instructions_to_dram(
+                    self._decoder_preamble)
+                expected = self.get_capture_instruction_size_bytes()
+                if written != expected:
+                    raise IOError(
+                        f"decoder preamble DMA wrote {written} of "
+                        f"{expected} bytes")
+            finally:
+                self.clear_capture_buffer()
 
             # Workers are relaunched EVERY step: each decoder program ends with
             # its workers halted, so a step that did not start them would leave
             # the master waiting on a rendezvous that never arrives.
-            if dec_sched is not None:
-                self._start_decode_workers(dec_sched, dec_worker_addrs, aligned)
-            self.start_execute_from_dram(self._decoder_preamble)
-            self.wait_queue(30.0)
-            for w in (dec_sched.workers if dec_sched is not None else []):
-                w.wait_queue(30.0)
-            step_us = self.report_latency_in_us()
+            if dec_sched is not None and dec_sched.host_segmented:
+                step_us = dec_sched.run_host_segmented(
+                    self._decoder_preamble,
+                    dec_worker_addrs,
+                    gpr_sets_by_worker=self._decode_attn_worker_gpr_sets(
+                        dec_sched, aligned),
+                    master_reserved_end=self._decoder_preamble + 64 * 8,
+                    timeout_seconds=30.0,
+                )
+            else:
+                if dec_sched is not None:
+                    self._start_decode_workers(
+                        dec_sched, dec_worker_addrs, aligned)
+                self.start_execute_from_dram(self._decoder_preamble)
+                self._wait_lm_queue(self, 30.0, "decode master")
+                for idx, w in enumerate(
+                    dec_sched.workers if dec_sched is not None else [], start=1
+                ):
+                    self._wait_lm_queue(w, 30.0, f"decode worker {idx}")
+                step_us = self.report_latency_in_us()
+            # The FPGA step is now complete on every engine. Only now expose
+            # its KV row as committed host state; failed uploads/launches leave
+            # seq_len at the last known-complete token.
+            self.seq_len = next_seq_len
             total_us += step_us
             # Per-step latencies: the FIRST is the peak-speed datapoint (shortest
             # KV history), and the spread across steps shows the context growth.

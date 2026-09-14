@@ -129,6 +129,10 @@ python3 models/gemma3/gemma3_test.py --prompt "your prompt"
 
 ### 7. Updating HW bin file
 
+> **Qwen2.5-Omni U55C:** do not run this generic update procedure for the
+> Omni runner. It validates the already-installed supported image and never
+> reprograms the FPGA; see [`models/qwen2.5_omni_7b/README.md`](models/qwen2.5_omni_7b/README.md).
+
 The current hardware release is **v1.4** (`update_006e0d2f.bin`). At startup the software reads the FPGA version register and checks it against the expected release hash (`0x006e0d2f`); on a mismatch it stops and tells you which bin to flash.
 
 ```
@@ -168,6 +172,7 @@ engine today; each folder has its own README/config, and most LLMs ship a
 | Qwen3 4B | [`models/qwen3_4b`](models/qwen3_4b) | Text LM |
 | Qwen3.5 2B | [`models/qwen3.5_2b`](models/qwen3.5_2b) | Text LM |
 | Qwen2.5-VL 3B | [`models/qwen2.5_vl_3b`](models/qwen2.5_vl_3b) | Vision-language |
+| Qwen2.5-Omni 7B | [`models/qwen2.5_omni_7b`](models/qwen2.5_omni_7b) | Multimodal Thinker (text, image, audio -> text) |
 | SmolVLM2 | [`models/smolvlm2`](models/smolvlm2) | Vision-language |
 | GPT-2 | [`models/gpt2`](models/gpt2) | Text LM |
 | LocateAnything 3B | [`models/locateanything_3b`](models/locateanything_3b) | Open-vocabulary localization |
@@ -175,6 +180,23 @@ engine today; each folder has its own README/config, and most LLMs ship a
 | Parakeet | [`models/parakeet`](models/parakeet) | Speech recognition (incl. streaming) |
 | MobileSAM | [`models/mobilesam`](models/mobilesam) | Segmentation |
 | Swin | [`models/swin`](models/swin) | Image classification |
+
+Qwen2.5-Omni-7B currently accelerates the Thinker path: text, image, and audio
+inputs produce text. It targets the 8 GiB Alveo U55 configuration and runs on
+engines 0-7; HW_INFO must report 8 GiB and at least eight available engines.
+
+```bash
+# Text
+python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 \
+  --prompt "If x + 3 = 5, what is x?"
+
+# Image (bare --image uses test_samples/yosemite.jpg)
+python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --image
+
+# Audio
+python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 \
+  --audio test_samples/apex.wav --prompt "Transcribe the speech exactly."
+```
 
 Run the whole suite (or a subset) with the automated tester:
 

@@ -29,7 +29,7 @@ import torch
 
 import user_dma_core
 from user_dma_core import (
-    DMA_DEVICE_H2C, INSTRUCTION_SIZE_BYTES, TYPE, UE_MODE, UE_VECTOR_SIZE,
+    DMA_DEVICE_C2H, DMA_DEVICE_H2C, INSTRUCTION_SIZE_BYTES, TYPE, UE_MODE, UE_VECTOR_SIZE,
     URAM_NEAR_FULL_ELEMENTS)
 
 # Vision matmuls are IF4-quantized; norms and biases stay BF16. Module-level so
@@ -120,7 +120,10 @@ class Qwen25VLVisionMixin:
         if len(blob) != section["size"]:
             raise RuntimeError(f"truncated read for {what}")
         addr = self.allocate_params_dram(section["size"], label=what)
-        self.dma_write(DMA_DEVICE_H2C, addr, blob, section["size"])
+        written = self.dma_write(DMA_DEVICE_H2C, addr, blob, section["size"])
+        if written != section["size"]:
+            raise IOError(
+                f"{what}: params DMA wrote {written} of {section['size']} bytes")
         return addr
 
     def _dma_if4(self, f, section: dict, base_offset: int, what: str) -> tuple[int, int]:
@@ -143,10 +146,21 @@ class Qwen25VLVisionMixin:
         data_bytes = n_blocks * IF4_DATA_BYTES
 
         scale_addr = self.allocate_params_dram(scale_bytes, label=f"{what}.scale")
-        self.dma_write(DMA_DEVICE_H2C, scale_addr, blob[:scale_bytes], scale_bytes)
+        written = self.dma_write(
+            DMA_DEVICE_H2C, scale_addr, blob[:scale_bytes], scale_bytes)
+        if written != scale_bytes:
+            raise IOError(
+                f"{what}.scale: params DMA wrote {written} of {scale_bytes} bytes")
         data_addr = self.allocate_params_dram(data_bytes, label=f"{what}.data")
-        self.dma_write(DMA_DEVICE_H2C, data_addr,
-                       blob[scale_bytes:scale_bytes + data_bytes], data_bytes)
+        written = self.dma_write(
+            DMA_DEVICE_H2C,
+            data_addr,
+            blob[scale_bytes:scale_bytes + data_bytes],
+            data_bytes,
+        )
+        if written != data_bytes:
+            raise IOError(
+                f"{what}.data: params DMA wrote {written} of {data_bytes} bytes")
         return scale_addr, data_addr
 
     def vision_weight_init(self) -> None:
@@ -170,6 +184,13 @@ class Qwen25VLVisionMixin:
         # addresses (see the module docstring); nothing else may allocate params
         # DRAM between here and the encoder run.
         self.reset_params_dram_addr()
+        # Loading from this point overwrites any previous LM image. Clear both
+        # phase-cache flags before the first DMA so a partial transfer cannot
+        # make a retry trust corrupt shared-window contents.
+        self._vision_weight_init_done = False
+        self._lm_weight_init_done = False
+        if hasattr(self, "_audio_weight_init_done"):
+            self._audio_weight_init_done = False
         start_addr = self.get_params_dram_addr()
         if start_addr != self.VISION_WEIGHT_BASE:
             raise AssertionError(
@@ -564,6 +585,42 @@ class Qwen25VLVisionMixin:
                 0x00000, dst_tokens + t0 * out_row * bpe, take * out_row)
 
     def compile_vision_encoder(self, profile: bool = False) -> int:
+        """Capture the encoder and restore primary/worker state on failure."""
+        previous_silent = self._set_silent(False)
+        self._set_silent(previous_silent)
+        reg_counter_before = self._isa_reg_counter
+        inst_ptr_counter_before = self._inst_ptr_counter
+        program_cursor_before = self.get_program_dram_addr()
+        scheduler_before = getattr(self, "_multi_core_schedulers", {}).get("vision")
+        worker_cursors_before = (
+            [worker.get_program_dram_addr() for worker in scheduler_before.workers]
+            if scheduler_before is not None else None
+        )
+        try:
+            return self._compile_vision_encoder_impl(profile)
+        except Exception:
+            scheduler = getattr(self, "_multi_core_schedulers", {}).get("vision")
+            if scheduler is not None:
+                scheduler.abort_program()
+                if worker_cursors_before is None:
+                    for worker in scheduler.workers:
+                        worker.reset_program_dram_addr()
+                else:
+                    for worker, cursor in zip(
+                        scheduler.workers, worker_cursors_before
+                    ):
+                        worker._next_program_dram_addr = cursor
+            if getattr(self, "is_capture_on", False):
+                self.stop_capture()
+            self.clear_capture_buffer()
+            self._isa_reg_counter = reg_counter_before
+            self._inst_ptr_counter = inst_ptr_counter_before
+            self._next_program_dram_addr = program_cursor_before
+            raise
+        finally:
+            self._set_silent(previous_silent)
+
+    def _compile_vision_encoder_impl(self, profile: bool = False) -> int:
         """Capture the whole encoder -- 32 layers + merger -- as one program at
         the ISA base. Host emission only; nothing touches the device.
 
@@ -1074,27 +1131,37 @@ class Qwen25VLVisionMixin:
         [NUM_MERGED_TOKENS, out_hidden_size] embeddings in raster order."""
         if not hasattr(self, "_vis_program_bytes"):
             raise RuntimeError("compile_vision_encoder() must run first")
+        if not math.isfinite(float(timeout_s)) or timeout_s <= 0:
+            raise ValueError(f"timeout_s must be finite and positive, got {timeout_s!r}")
         vis = self._vision_dims()
         T, VH_OUT = vis["NUM_MERGED_TOKENS"], vis["VH_OUT"]
 
         for addr, tensor in self._vis_pending_dmas:
             self.dma_to_accelerator_memory(addr, tensor)
-        self._vis_pending_dmas = []
 
         addr = self._vis_program_addr
         self._next_program_dram_addr = addr
-        self.dma_write(DMA_DEVICE_H2C, addr, self._vis_program_bytes,
-                       len(self._vis_program_bytes))
+        written = self.dma_write(
+            DMA_DEVICE_H2C, addr, self._vis_program_bytes,
+            len(self._vis_program_bytes))
+        if written != len(self._vis_program_bytes):
+            raise IOError(
+                f"vision master ISA DMA wrote {written} of "
+                f"{len(self._vis_program_bytes)} bytes")
         self.allocate_program_dram(len(self._vis_program_bytes))
 
         sched = self._ensure_stage_scheduler("vision")
         worker_addrs = []
         for idx, wk, wk_addr, blob in getattr(self, "_vis_worker_programs", []):
             wk._next_program_dram_addr = wk_addr
-            wk.dma_write(DMA_DEVICE_H2C, wk_addr, blob, len(blob))
+            written = wk.dma_write(DMA_DEVICE_H2C, wk_addr, blob, len(blob))
+            if written != len(blob):
+                raise IOError(
+                    f"vision worker {idx} ISA DMA wrote {written} of "
+                    f"{len(blob)} bytes")
             wk.allocate_program_dram(len(blob))
             worker_addrs.append(wk_addr)
-        if sched is not None:
+        if sched is not None and not sched.host_segmented:
             # A flag left set by an earlier program would make the first CHECK
             # pass spuriously, so clear every engine's flag before the run.
             sched.preclear_flags()
@@ -1104,6 +1171,10 @@ class Qwen25VLVisionMixin:
                    f"{' [profiled]' if profile else ''} ...")
         t0 = time.perf_counter()
         if profile:
+            if sched is not None and sched.host_segmented:
+                raise RuntimeError(
+                    "profile checkpoints cannot be combined with the installed "
+                    "FPGA build's host-segmented rendezvous")
             checkpoints = getattr(self, "_vis_checkpoints", [])
             if not checkpoints:
                 raise RuntimeError(
@@ -1122,23 +1193,48 @@ class Qwen25VLVisionMixin:
             self.start_execute_from_dram(addr)
             for name, resume, ph_flops in checkpoints:
                 self.wait_queue(timeout_s)
+                if self.is_queue_busy():
+                    raise TimeoutError(
+                        f"vision profile phase {name} is still busy after "
+                        f"{timeout_s:.1f}s")
                 results.append((name, self.report_latency_in_us() / 1e3, ph_flops))
                 self.start_execute_from_dram(resume)
             self.wait_queue(timeout_s)
-            for wk in (sched.workers if sched is not None else []):
+            if self.is_queue_busy():
+                raise TimeoutError(
+                    f"vision profile tail is still busy after {timeout_s:.1f}s")
+            for idx, wk in enumerate(
+                sched.workers if sched is not None else [], start=1
+            ):
                 wk.wait_queue(timeout_s)
+                if wk.is_queue_busy():
+                    raise TimeoutError(
+                        f"vision worker {idx} is still busy after {timeout_s:.1f}s")
             latency_us = sum(r[1] for r in results) * 1e3
             self._vis_profile = results
         else:
             # Workers first: they park on their first rendezvous and wait for
             # the master to enter the region.
-            if sched is not None:
+            if sched is not None and sched.host_segmented:
+                latency_us = sched.run_host_segmented(
+                    addr, worker_addrs, timeout_seconds=timeout_s)
+            elif sched is not None:
                 sched.start_workers(worker_addrs)
-            self.start_execute_from_dram(addr)
-            self.wait_queue(timeout_s)
-            for wk in (sched.workers if sched is not None else []):
-                wk.wait_queue(timeout_s)
-            latency_us = self.report_latency_in_us()
+            if sched is None or not sched.host_segmented:
+                self.start_execute_from_dram(addr)
+                self.wait_queue(timeout_s)
+                if self.is_queue_busy():
+                    raise TimeoutError(
+                        f"vision master is still busy after {timeout_s:.1f}s")
+                for idx, wk in enumerate(
+                    sched.workers if sched is not None else [], start=1
+                ):
+                    wk.wait_queue(timeout_s)
+                    if wk.is_queue_busy():
+                        raise TimeoutError(
+                            f"vision worker {idx} is still busy after "
+                            f"{timeout_s:.1f}s")
+                latency_us = self.report_latency_in_us()
         wall = time.perf_counter() - t0
         gflops = (self._vis_total_flops / (latency_us * 1e-6) / 1e9
                   if latency_us > 0 else 0.0)
@@ -1148,12 +1244,22 @@ class Qwen25VLVisionMixin:
         self._loud(f"  [Vision] done: {wall:.2f}s wall, {latency_us / 1e6:.2f}s HW, "
                    f"{gflops:.1f} GFLOPS")
 
-        out = self.dma_from_accelerator_memory(self.VIS_ENCODER_OUT, (T, VH_OUT)).cpu()
+        out = torch.zeros(T * VH_OUT, dtype=torch.bfloat16)
+        read = self.dma_read(
+            DMA_DEVICE_C2H, self.VIS_ENCODER_OUT, out, out.numel() * 2)
+        if read != out.numel() * 2:
+            raise IOError(
+                f"vision output DMA read {read} of {out.numel() * 2} bytes")
+        out = out.reshape(T, VH_OUT).cpu()
         # Undo the window reordering so the tokens are back in raster order,
         # which is what the LM prompt expects at the <|image_pad|> positions.
         if hasattr(self, "_vis_reverse_index"):
             out = out[self._vis_reverse_index].contiguous()
         self._vis_embeddings = out
         self._vis_num_tokens = T
+        # The encoder ping-pongs through its original input buffers. Retain the
+        # pristine host copies until output validation succeeds so a failed run
+        # can re-upload them before retrying on this same engine instance.
+        self._vis_pending_dmas = []
         self._loud(f"  [Vision] {T} image embeddings ready")
         return out

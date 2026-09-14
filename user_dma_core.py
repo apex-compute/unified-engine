@@ -5749,6 +5749,19 @@ class UnifiedEngine:
         # get dedicated registers so both bias modes work with softmax.
         # N and M totals are aliased onto the caller's gpr regs when provided (read-only).
         # ----------------------------------------------------------------------
+        # A strip narrower than 16 columns cannot satisfy both the 12-bit Z-row
+        # field and the 32-byte DMA alignment used by this two-pass kernel.  The
+        # old fallback aligned such a width down to zero and emitted a runtime
+        # N loop that could never make progress.  Reject that geometry while it
+        # is still a compile-time model error; large quantized projections must
+        # use quantized_matmat_core's one-pass 16-column streaming path.
+        if K // UE_VECTOR_SIZE > 4095 // 16:
+            raise ValueError(
+                "matmat_mul_core_dynamic: K is too large for a nonzero "
+                f"16-column strip (K={K}); use quantized_matmat_core for "
+                "quantized weights"
+            )
+
         _alloc_list = []
         def _alloc():
             r = self.alloc_isa_reg()
