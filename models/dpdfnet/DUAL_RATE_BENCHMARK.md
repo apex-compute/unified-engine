@@ -10,8 +10,9 @@ disagreement with its CPU reference on some samples.
 The board reports `0xdf0749de`, RK AXI-256, 333.25 MHz. Both models were tested
 sequentially on the same programmed board, with scalar DMA handle reuse and the host runner
 pinned to CPU core 6. CPU references use ONNX Runtime FP32 with one thread on
-core 7 of Italy's Intel Core Ultra 9 285K. `OMP_NUM_THREADS=1` and
-`MKL_NUM_THREADS=1` are set. No trace capture or clock override is enabled.
+core 7 of Italy's **Intel Core Ultra 9 285K**, rated for
+[up to **5.7 GHz** maximum turbo](https://www.intel.com/content/www/us/en/support/articles/000099656/processors.html).
+`OMP_NUM_THREADS=1` and `MKL_NUM_THREADS=1` are set. No trace capture or clock override is enabled.
 
 ## Real-time ratio
 
