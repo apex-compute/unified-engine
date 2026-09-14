@@ -111,6 +111,19 @@ engine's peak, and the CPU wall time around the same stage. The gap between
 the two clocks is host overhead. TTFT covers whichever encoders the request
 ran plus prefill.
 
+A second table reports **effective throughput against model FLOPs**: the work
+the architecture owes at its own dimensions -- true prompt length, true
+attention windows, matrix products only -- rather than the padded,
+tile-aligned, mask-widened shapes the engine actually issues and bills. Those
+counts come from `qwen2.5_omni_7b_model_flops.py`, derived entirely from the
+model config so they follow it rather than drifting from it. Dividing model
+FLOPs by the same measured FPGA time gives a rate comparable across
+implementations and accelerators, and the `Useful` column is the ratio of the
+two: how much of what the engine issued the model actually needed. A stage
+marked `!` billed fewer FLOPs than the architecture requires, which is
+impossible -- padding only adds work -- and means that stage's own accounting
+is undercounting.
+
 A multi-core scaling section converts each stage's speedup into an implied
 serial fraction by solving Amdahl's law for `s`. Because this model requires
 exactly eight engines, no single-engine baseline can be measured; the speedup
