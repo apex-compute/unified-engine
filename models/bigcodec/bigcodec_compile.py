@@ -25,7 +25,7 @@ from bigcodec_conv import (
     conv_transpose1d_padding_bytes, packed_bytes, prepare_conv1d,
     prepare_conv_transpose1d, emit_conv1d, emit_conv_transpose1d,
 )
-from bigcodec_lstm import scratch_bytes as lstm_scratch_bytes, prepare_lstm, emit_lstm, tanh_identity, tanh_scratch_bytes, TANH_ARGUMENT_LIMIT
+from bigcodec_lstm import scratch_bytes as lstm_scratch_bytes, prepare_lstm, emit_lstm, tanh_identity, tanh_scratch_bytes, TANH_ARGUMENT_LIMIT, TANH_CHUNK_ELEMENTS, _tanh_sram
 from bigcodec_quantizer import quantizer_scratch_bytes, prepare_quantizer, emit_quantizer
 
 FORMAT = "andromeda.bigcodec.whole-utterance-v1"
@@ -33,6 +33,8 @@ DEFAULT_OUTPUT = Path(__file__).resolve().parent / "bigcodec_bin" / "bigcodec-an
 CONV_SCATTER_BYTES = 512 * 1024
 CONV_STREAM_BUDGET_PER_64_OUTPUTS = 256 * 1024
 CONV_MAX_REUSE_PIXELS = 32
+WAVEFORM_BEAT_LANES = 16  # One32-byte AXI256 beat carries16 BF16 values.
+WAVEFORM_TILE_ROWS = TANH_CHUNK_ELEMENTS // WAVEFORM_BEAT_LANES
 
 
 @dataclass
@@ -69,6 +71,7 @@ class Graph:
     operations: list[Operation]
     output: str
     conv_precision: str = "if8"
+    lstm_precision: str = "bf16"
     output_address: int = shared.TENSOR_BASE
     output_bytes: int = 0
     tokens_address: int = 0
@@ -99,12 +102,14 @@ def convolution_reuse_pixels(module) -> int:
     return max(1, min(CONV_MAX_REUSE_PIXELS, CONV_STREAM_BUDGET_PER_64_OUTPUTS // bytes_per_pixel))
 
 
-def build_graph(encoder, decoder, compiled_samples: int, *, conv_precision="if8") -> Graph:
+def build_graph(encoder, decoder, compiled_samples: int, *, conv_precision="if8", lstm_precision="bf16") -> Graph:
     """Trace module structure and exact lengths without executing neural layers."""
     if compiled_samples < HOP_LENGTH or compiled_samples % HOP_LENGTH:
         raise ValueError("compiled_samples must be a positive multiple of 200")
     if conv_precision not in ("if8", "bf16"):
         raise ValueError("convolution precision must be if8 or bf16")
+    if lstm_precision not in ("bf16", "encoder-if8", "if8"):
+        raise ValueError("LSTM precision must be bf16, encoder-if8 or if8")
     tensors = {"input": Tensor("input", (compiled_samples, 1), shared.INPUT_BASE)}
     operations = []
 
@@ -160,12 +165,52 @@ def build_graph(encoder, decoder, compiled_samples: int, *, conv_precision="if8"
     output = walk(decoder.model, quantized, "decoder.model")
     if tensors[output].shape != (compiled_samples, 1):
         raise ValueError(f"Decoder output is {tensors[output].shape}, expected {(compiled_samples, 1)}")
-    return Graph(compiled_samples, expected_codes[0], tensors, operations, output, conv_precision)
+    return Graph(compiled_samples, expected_codes[0], tensors, operations, output,
+                 conv_precision, lstm_precision)
 
 
 def _bf16_convolutions():
     import bigcodec_conv_bf16
     return bigcodec_conv_bf16
+
+
+def _compact_waveform_tanh(graph, operation):
+    return (operation.op == 'tanh' and operation.output == graph.output
+            and graph.tensors[operation.output].shape[1] == 1)
+
+
+def emit_waveform_tanh(engine, source, destination, rows, identity_address,
+                       zero_address, mask_address):
+    """Evaluate the mono waveform on one AXI beat per pad64 source row.
+
+    Strided32-byte DMA compacts16 lanes per time sample into SRAM, reducing
+    Padé/reciprocal work fourfold. The mask keeps the first lane of each beat;
+    prezeroing the destination and scattering those beats restores pad64 rows.
+    Both source and workspace stay off the host; no DRAM scratch is needed.
+    """
+    if not isinstance(rows, int) or isinstance(rows, bool) or rows <= 0 or rows % 4:
+        raise ValueError('Waveform tanh needs a positive multiple of four rows')
+    size = rows * 128
+    if (any(address < 0 or address % 128 for address in
+                   (source, destination, identity_address, zero_address, mask_address))
+            or source < destination + size and destination < source + size):
+        raise ValueError('Waveform tanh needs aligned, disjoint pad64 tensors and rows divisible by four')
+    zero(engine, destination, size, zero_address)
+    engine.accelerator_memory_to_sram(identity_address, 0x80000, 64 * 64)
+    # _tanh_sram uses B[0x80000:0x82000] and B[0x90000:0x96000].
+    mask_sram = 0xB0000
+    engine.accelerator_memory_to_sram(mask_address, mask_sram, TANH_CHUNK_ELEMENTS)
+    for first in range(0, rows, WAVEFORM_TILE_ROWS):
+        take = min(WAVEFORM_TILE_ROWS, rows - first)
+        elements = take * WAVEFORM_BEAT_LANES
+        shared._copy_contiguous_or_strided_read(engine,
+            source=source + first * 128, sram=0, total=elements * 2,
+            chunk=32, jump=128)
+        _tanh_sram(engine, 0, 0, elements)
+        engine.eltwise_mul_core(0, mask_sram, 0, elements)
+        shared._copy_contiguous_or_strided_write(engine, sram=0,
+            destination=destination + first * 128, total=elements * 2,
+            chunk=32, jump=128)
 
 
 class Arena:
@@ -233,7 +278,8 @@ def plan_memory(graph: Graph) -> Graph:
         elif operation.op == "quantizer":
             operation.scratch_bytes = quantizer_scratch_bytes(shape[0])
         elif operation.op == "tanh":
-            operation.scratch_bytes = tanh_scratch_bytes(output.size_bytes // 2)
+            operation.scratch_bytes = (0 if _compact_waveform_tanh(graph, operation)
+                else tanh_scratch_bytes(output.size_bytes // 2))
         elif operation.op == "conv1d":
             if graph.conv_precision == "bf16":
                 operation.scratch_bytes = _bf16_convolutions().conv_scratch_bytes(shape, module.weight.shape,
@@ -289,14 +335,22 @@ def _prepare_operation(graph, image, identity_address, zero_address, operation):
             input_address=source.address, output_address=output.address,
             scratch_address=graph.scratch_address, identity_address=identity_address)
     elif operation.op == "lstm":
+        recurrent_precision = ('if8' if graph.lstm_precision == 'if8'
+            or (graph.lstm_precision == 'encoder-if8' and operation.name.startswith('encoder.'))
+            else 'bf16')
         operation.plan = prepare_lstm(module.lstm, image, input_shape=source.shape,
             input_address=source.address, output_address=output.address,
             scratch_address=graph.scratch_address, identity_address=identity_address,
-            zero_address=zero_address, skip=module.skip)
+            zero_address=zero_address, skip=module.skip,
+            recurrent_precision=recurrent_precision)
     elif operation.op == "quantizer":
         operation.plan = prepare_quantizer(module, image, frames=source.shape[0],
             source_address=source.address, destination_address=output.address,
             scratch_address=graph.scratch_address, token_address=graph.tokens_address)
+    elif _compact_waveform_tanh(graph, operation):
+        mask = torch.zeros(TANH_CHUNK_ELEMENTS, dtype=torch.bfloat16)
+        mask[::WAVEFORM_BEAT_LANES] = 1
+        operation.plan = {'mask_address': image.allocate(mask, alignment=128)}
     elif operation.op not in ("add", "tanh"):
         raise AssertionError(operation.op)
     if operation.op in ("conv1d", "conv_transpose1d") and graph.conv_precision == "if8":
@@ -336,20 +390,25 @@ def emit_operation(engine, graph, operation, identity_address, zero_address):
         elementwise(engine, udc.UE_MODE.ELTWISE_ADD, source.address,
                     other.address, output.address, output.size_bytes // 2)
     elif operation.op == "tanh":
-        tanh_identity(engine, source.address, output.address, output.size_bytes // 2, identity_address,
-                       scratch_address=graph.scratch_address)
+        if _compact_waveform_tanh(graph, operation):
+            emit_waveform_tanh(engine, source.address, output.address, source.shape[0],
+                identity_address, zero_address, operation.plan['mask_address'])
+        else:
+            tanh_identity(engine, source.address, output.address, output.size_bytes // 2, identity_address,
+                           scratch_address=graph.scratch_address)
     else:
         raise AssertionError(operation.op)
 
 
-def compile_models(encoder, decoder, *, samples: int, conv_precision="if8") -> dict:
+def compile_models(encoder, decoder, *, samples: int, conv_precision="if8", lstm_precision="bf16") -> dict:
     if encoder.training or decoder.training:
         raise ValueError("Compile eval models loaded with remove_weight_norm=True")
     if any(name.endswith(("weight_g", "weight_v"))
            for model in (encoder, decoder) for name, _ in model.named_parameters()):
         raise ValueError("Remove all weight normalization before reading compile-time weights")
     compiled_samples = compiled_sample_count(samples)
-    graph = plan_memory(build_graph(encoder, decoder, compiled_samples, conv_precision=conv_precision))
+    graph = plan_memory(build_graph(encoder, decoder, compiled_samples,
+                                   conv_precision=conv_precision, lstm_precision=lstm_precision))
     image = shared._ImageBuilder(shared.MODEL_BASE, shared.MODEL_LIMIT)
     zero_address = image.allocate(torch.zeros(udc.URAM_NEAR_FULL_SIZE // 2, dtype=torch.bfloat16), alignment=128)
     identity_address = image.allocate(torch.eye(64, dtype=torch.bfloat16), alignment=128)
@@ -418,11 +477,22 @@ def compile_models(encoder, decoder, *, samples: int, conv_precision="if8") -> d
     return {"format": FORMAT, "model": "bigcodec", "checkpoint_sha256": CHECKPOINT_SHA256,
         "sample_rate": SAMPLE_RATE, "hop_length": HOP_LENGTH, "native_samples": samples,
         "full_utterance": True, "all_neural_operations_on_device": True,
-        "precision": {"convolutions": "IF8-INT" if conv_precision == "if8" else "BF16", "lstm_and_activations": "BF16"},
+        "precision": {"convolutions": "IF8-INT" if conv_precision == "if8" else "BF16",
+            "activations": "BF16", "lstm_input_weights": "BF16",
+            "lstm_recurrent_weights": {
+                "encoder": "BF16" if lstm_precision == "bf16" else "IF8-INT",
+                "decoder": "IF8-INT" if lstm_precision == "if8" else "BF16"}},
         "convolution_tiling": ({"target_weight_stream_bytes_per_64_outputs": CONV_STREAM_BUDGET_PER_64_OUTPUTS,
             "maximum_reuse_pixels": CONV_MAX_REUSE_PIXELS,
             "minimum_one_pixel_even_when_weights_exceed_target": True} if conv_precision == "if8"
-            else {"method": "bounded im2col with BF16 matrix multiplication", "chunk_rows": 64}),
+            else {"method": "SRAM overlapping windows with dilation residue tiling and BF16 matrix multiplication",
+                  "maximum_output_rows_per_tile": 1024}),
+        "execution_optimizations": {
+            "activation": "SRAM FIR and Snake tiles; native wide MAXPOOL clamp",
+            "lstm": "SRAM recurrent gates and state updates with BF16 Pade tanh",
+            "quantizer": "SRAM comparison masks and first seven tournament rounds",
+            "waveform_tanh": "compact AXI beats; evaluate 16 lanes instead of 64 per sample",
+        },
         "approximation": {"snake_argument_clamp": SNAKE_ARGUMENT_LIMIT,
             "snake_sine_squared_polynomial_degree": 10, "snake_storage": "BF16",
             "alias_free_filters": "symmetric BF16, exact unit DC, nearest L2 within +/-2 ULP",
@@ -441,6 +511,8 @@ def main():
     length.add_argument("--input", type=Path, help="Infer native sample count from a WAV")
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--conv-precision", choices=("if8", "bf16"), default="if8")
+    parser.add_argument("--lstm-precision", choices=("bf16", "encoder-if8", "if8"), default="bf16",
+                        help="Recurrent weight precision; input projections and gate/state math stay BF16")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--cpu-core", type=int)
@@ -466,7 +538,8 @@ def main():
     encoder, decoder = load_models(args.checkpoint, remove_weight_norm=True)
     # Shared planners print per-tile diagnostics; retain a quiet compile command.
     with contextlib.redirect_stdout(io.StringIO()):
-        payload = compile_models(encoder, decoder, samples=samples, conv_precision=args.conv_precision)
+        payload = compile_models(encoder, decoder, samples=samples,
+                                 conv_precision=args.conv_precision, lstm_precision=args.lstm_precision)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(prefix="bigcodec-", suffix=".tmp", dir=args.output.parent)
     os.close(fd)
@@ -479,6 +552,7 @@ def main():
     hardware = payload["hardware"]
     report = {"bin": str(args.output), "bin_sha256": sha256_file(args.output),
         "convolution_precision": args.conv_precision,
+        "lstm_recurrent_precision": args.lstm_precision,
         "bin_bytes": args.output.stat().st_size, "native_samples": samples,
         "compiled_samples": hardware["compiled_samples"], "code_frames": hardware["code_frames"],
         "operations": len(hardware["operations"]), "instructions": hardware["instructions"],

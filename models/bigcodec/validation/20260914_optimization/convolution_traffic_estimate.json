@@ -1,0 +1,69 @@
+{
+  "status": "offline modeled DMA payload bytes; not measured hardware traffic or execution time",
+  "scope": "74 learned Conv1d/ConvTranspose1d operators only, including their explicit input staging, bias loads and transpose scatter; excludes compiler prezero of operator output, instruction fetch, host upload/download, activation, LSTM, VQ and final tanh",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "native_input_samples": 63295,
+  "compiled_input_samples": 63400,
+  "sample_rate_hz": 16000,
+  "operation_count": 74,
+  "method": "Sum exact requested BF16 DMA payload lengths over geometric tiles. The im2col baseline models use_sram=False and the selected static/dynamic matmat tiling; the SRAM candidate models use_sram=True. Repeated transfers count every time; strided gaps do not count as payload.",
+  "assumptions": {
+    "bf16_bytes_per_element": 2,
+    "physical_channel_alignment": 64,
+    "axi_data_width_bits": 256,
+    "sram_bank_bytes": 524288,
+    "usable_sram_bank_bytes": 524160,
+    "old_im2col_max_batch_rows": 64,
+    "new_window_max_batch_rows": 1024,
+    "weight_strip": "BF16 N strip bounded by SRAM-B and N*(K/64)<=4095; 64-aligned, with 32/16 fallback",
+    "new_batch": "Input decimated window and one padded output strip must jointly fit 524160-byte SRAM-A; each weight strip reused for every output row in the batch.",
+    "dilation": "Separate dilation/gcd(stride,dilation) time residues, with input step stride/gcd; window reads include repeated halos at tile boundaries.",
+    "transpose": "Exact polyphases are separate regular convolutions; baseline writes/reads temporary result then scatters, candidate directly scatters SRAM.",
+    "bus_overhead": "Does not model burst scheduling/command overhead, memory-controller efficiency, arithmetic latency, pipeline overlap or cache behavior; cannot infer speedup from bytes alone."
+  },
+  "old_im2col": {
+    "dma_bytes": 15595292160,
+    "dma_read_bytes": 12390546176,
+    "dma_write_bytes": 3204745984,
+    "weight_read_bytes": 7842840576,
+    "components": {
+      "stage_zero_read": 476902656,
+      "stage_zero_write": 476902656,
+      "stage_input_read": 476362240,
+      "stage_input_write": 476362240,
+      "patch_input_read": 1778202624,
+      "patch_write": 1778202624,
+      "matmul_input_read": 1778202624,
+      "output_write": 442440704,
+      "weight_read": 7842840576,
+      "bias_read": 7197696,
+      "transpose_result_read": 30837760,
+      "transpose_result_scatter_write": 30837760
+    }
+  },
+  "new_sram": {
+    "dma_bytes": 4010565888,
+    "dma_read_bytes": 2614860288,
+    "dma_write_bytes": 1395705600,
+    "weight_read_bytes": 1182285824,
+    "components": {
+      "stage_zero_read": 476902656,
+      "stage_zero_write": 476902656,
+      "stage_input_read": 476362240,
+      "stage_input_write": 476362240,
+      "output_write": 442440704,
+      "sram_window_read": 478522368,
+      "weight_read": 1182285824,
+      "bias_read": 787200
+    }
+  },
+  "dma_payload_reduction_factor": 3.8885515399865684,
+  "weight_read_reduction_factor": 6.633624811186098,
+  "source_sha256": {
+    "models/bigcodec/bigcodec_conv_bf16.py": "e60caa1cc611160db23de9e8590c18111c2cf283f414b34651e8ddd1943d87a7",
+    "models/bigcodec/bigcodec_conv.py": "8718ec8441ad9195ebcdf232ffe21ccfb3bc55d836cef1c25098f98b9e632b53",
+    "models/bigcodec/bigcodec_compile.py": "ee481d5c61b9543fde67e583df12a88b8322e99a4dbae6824de7729feda7ce4e",
+    "user_dma_core.py": "b0c134bc2c5c1c37932cca0f1fea3d17586dc11e64aaa6f3901f2fb1e1059acd"
+  },
+  "per_operation_details": "convolution_traffic_estimate_ops.json"
+}

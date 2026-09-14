@@ -98,6 +98,49 @@ class MemoryEngine:
         assert address % 128 == sram % 128 == 0
         self.view(address, elements).copy_(self.sram[sram // 2:][:elements])
 
+    def sram_view(self, address, count):
+        assert address >= 0 and address % 128 == 0 and count % 64 == 0
+        assert address // 0x80000 == (address + count * 2 - 1) // 0x80000
+        assert address + count * 2 <= 0x100000
+        return self.sram[address // 2:][:count]
+
+    def broadcast_mul(self, scalar, sram_start_addr, sram_wb_addr, element_size):
+        assert sram_start_addr < 0x80000
+        self.sram_view(sram_wb_addr, element_size).copy_(
+            self.sram_view(sram_start_addr, element_size).float() * scalar)
+
+    def broadcast_add(self, scalar, sram_start_addr, sram_wb_addr, element_size):
+        assert sram_start_addr < 0x80000
+        self.sram_view(sram_wb_addr, element_size).copy_(
+            self.sram_view(sram_start_addr, element_size).float() + scalar)
+
+    def eltwise_add_core(self, a, b, output, count):
+        assert a // 0x80000 != b // 0x80000
+        self.sram_view(output, count).copy_(
+            self.sram_view(a, count).float() + self.sram_view(b, count).float())
+
+    def eltwise_mul_core(self, a, b, output, count):
+        assert a // 0x80000 != b // 0x80000
+        self.sram_view(output, count).copy_(
+            self.sram_view(a, count).float() * self.sram_view(b, count).float())
+
+    def eltwise_sub_core(self, a, b, output, count):
+        assert a < 0x80000 <= b
+        self.sram_view(output, count).copy_(
+            self.sram_view(a, count).float() - self.sram_view(b, count).float())
+
+    def start_queue_for_maxpool2d_operation(self, *, act_sram_start_addr,
+            output_sram_wb_addr, kernel_w, kernel_h, out_w, out_h, w_pad, stride_s):
+        assert act_sram_start_addr < 0x80000 and kernel_w > 0 and kernel_h > 0
+        windows = []
+        for y in range(out_h):
+            for x in range(out_w):
+                samples = [self.sram_view(act_sram_start_addr +
+                    ((y * stride_s + ky) * w_pad + x * stride_s + kx) * 128, 64).float()
+                    for ky in range(kernel_h) for kx in range(kernel_w)]
+                windows.append(torch.stack(samples).amax(0))
+        self.sram_view(output_sram_wb_addr, out_h * out_w * 64).copy_(torch.cat(windows))
+
     float_to_bf19 = staticmethod(udc.UnifiedEngine.float_to_bf19)
 
     def start_queue_for_bf16_matvec_operation(self, *, max_clear_en, fmax_context_addr,
@@ -172,13 +215,10 @@ class QuantizerTests(unittest.TestCase):
     def test_rk_mask_flushes_only_positive_subnormal_gaps(self):
         class FlushMaskEngine(MemoryEngine):
             """Model the measured mask contract, not cycle-accurate hardware."""
-            def activation_core(self, *, M, N, A_DRAM_ADDR, OUTPUT_DRAM_ADDR,
-                                IDENTITY_DRAM_ADDR, activation, clamp_min=0.0,
-                                clamp_max=float("inf")):
-                assert activation == "clamp"
-                value = self.view(A_DRAM_ADDR, M * N).float()
+            def broadcast_mul(self, scalar, sram_start_addr, sram_wb_addr, element_size):
+                value = self.sram_view(sram_start_addr, element_size).float()
                 value = value.masked_fill(value.abs() < torch.finfo(torch.bfloat16).tiny, 0)
-                self.view(OUTPUT_DRAM_ADDR, M * N).copy_(value.clamp(clamp_min, clamp_max))
+                self.sram_view(sram_wb_addr, element_size).copy_(value * scalar)
 
         # RK 0xdf0749de measured 127 mismatches over all 65536 patterns, all
         # positive subnormals. Those score gaps therefore retain the left entry.

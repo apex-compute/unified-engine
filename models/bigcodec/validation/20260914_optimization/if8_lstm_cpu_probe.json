@@ -1,0 +1,289 @@
+{
+  "description": "CPU sensitivity estimate only: recurrent matrices are dequantized to BF16, then official remaining math executes in FP32. Native IF8 streaming may have different accumulation/scale rounding and requires hardware comparison.",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "only_changed_parameters": "weight_hh_l0 and weight_hh_l1 in both encoder and decoder LSTM",
+  "block_size": 64,
+  "quantizer": "IF8 INT8 absmax /127 BF16 scales; negative stored scale marks INT; BF16 division then nearest-even integer round/clamp; dequantized products rounded BF16",
+  "vectorized_quantizer_matches_driver_probe": true,
+  "weights": {
+    "encoder.0": {
+      "shape": [
+        6144,
+        1536
+      ],
+      "if8_vs_original_fp32": {
+        "relative_l2": 0.007673974148929119,
+        "max_abs": 0.004634231328964233,
+        "rms": 0.000348322035279125,
+        "finite": true
+      },
+      "if8_vs_bf16": {
+        "relative_l2": 0.007489695679396391,
+        "max_abs": 0.00439453125,
+        "rms": 0.000340096972649917,
+        "finite": true
+      },
+      "codes_bytes": 9437184,
+      "scales_bytes": 294912,
+      "bf16_bytes": 18874368,
+      "codes_sha256": "531d539538fe2f68d563de6be88ab6a4c666f418100830c3ac66cbe945ff77bc",
+      "scales_sha256": "8538c89b608a8dbd840f14dc6cf3d2911be63176ce29bc4e473ccf0b3573f452"
+    },
+    "encoder.1": {
+      "shape": [
+        6144,
+        1536
+      ],
+      "if8_vs_original_fp32": {
+        "relative_l2": 0.007677137851715088,
+        "max_abs": 0.00295044481754303,
+        "rms": 0.0003448294010013342,
+        "finite": true
+      },
+      "if8_vs_bf16": {
+        "relative_l2": 0.007492227479815483,
+        "max_abs": 0.0029296875,
+        "rms": 0.0003366765158716589,
+        "finite": true
+      },
+      "codes_bytes": 9437184,
+      "scales_bytes": 294912,
+      "bf16_bytes": 18874368,
+      "codes_sha256": "5a8db5e54b88dbe58983925363230defcf1b6112e4e8329dd16fe136e6ab914a",
+      "scales_sha256": "7fbcc58d346f699bb6a534f9083eca60c91239d18b121a7f8ea028a295c7f882"
+    },
+    "decoder.0": {
+      "shape": [
+        6144,
+        1536
+      ],
+      "if8_vs_original_fp32": {
+        "relative_l2": 0.007713154423981905,
+        "max_abs": 0.004522830247879028,
+        "rms": 0.0004179240495432168,
+        "finite": true
+      },
+      "if8_vs_bf16": {
+        "relative_l2": 0.007529367692768574,
+        "max_abs": 0.00390625,
+        "rms": 0.0004080773505847901,
+        "finite": true
+      },
+      "codes_bytes": 9437184,
+      "scales_bytes": 294912,
+      "bf16_bytes": 18874368,
+      "codes_sha256": "d56d5a8bb3fdb012732aea3719f5aa2cfade97d860d4c2f32bc3bd82507f3156",
+      "scales_sha256": "189aaec5037d921810aede127532ad76b1873eb97a4bf148f896b77acd55c15b"
+    },
+    "decoder.1": {
+      "shape": [
+        6144,
+        1536
+      ],
+      "if8_vs_original_fp32": {
+        "relative_l2": 0.008427347987890244,
+        "max_abs": 0.010887622833251953,
+        "rms": 0.0004930900176987052,
+        "finite": true
+      },
+      "if8_vs_bf16": {
+        "relative_l2": 0.008260482922196388,
+        "max_abs": 0.00830078125,
+        "rms": 0.00048348348354920745,
+        "finite": true
+      },
+      "codes_bytes": 9437184,
+      "scales_bytes": 294912,
+      "bf16_bytes": 18874368,
+      "codes_sha256": "771823c2075942e99cede9bf17cf0c9938decf2376e03a345e476960b274f74a",
+      "scales_sha256": "a28ae8918645ca3c5f6360c12aa8703817c1543b4c6ad88c3ec6a74c43308218"
+    }
+  },
+  "results": {
+    "original_fp32": {
+      "quiet400ms": {
+        "input": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/validation/speech_6400.wav",
+        "input_sha256": "66ada5357392310b69bbf6a01868b172d581dda9f4a4d9ffa0f5425d7d53fb10",
+        "samples": 6400,
+        "tokens": 33,
+        "matching_tokens": 33,
+        "waveform_vs_original": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "finite": true
+        },
+        "encoder_features_vs_original": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "finite": true
+        },
+        "cpu_forward_s": 0.6292346020004516,
+        "same_reference_lstm_input": {}
+      },
+      "speech3956ms": {
+        "input": "test_samples/p232_007.wav",
+        "input_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+        "samples": 63295,
+        "tokens": 317,
+        "matching_tokens": 317,
+        "waveform_vs_original": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "finite": true
+        },
+        "encoder_features_vs_original": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "finite": true
+        },
+        "cpu_forward_s": 6.2206647379998685,
+        "same_reference_lstm_input": {}
+      }
+    },
+    "recurrent_bf16": {
+      "quiet400ms": {
+        "input": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/validation/speech_6400.wav",
+        "input_sha256": "66ada5357392310b69bbf6a01868b172d581dda9f4a4d9ffa0f5425d7d53fb10",
+        "samples": 6400,
+        "tokens": 33,
+        "matching_tokens": 33,
+        "waveform_vs_original": {
+          "relative_l2": 0.0006509387167170644,
+          "max_abs": 1.9737286493182182e-05,
+          "rms": 2.784209755191114e-06,
+          "finite": true
+        },
+        "encoder_features_vs_original": {
+          "relative_l2": 0.00017765839584171772,
+          "max_abs": 0.0007056295871734619,
+          "rms": 0.0001751154923113063,
+          "finite": true
+        },
+        "cpu_forward_s": 0.6067398850000245,
+        "same_reference_lstm_input": {
+          "encoder": {
+            "relative_l2": 0.0006434067618101835,
+            "max_abs": 0.0019956007599830627,
+            "rms": 0.00016446091467514634,
+            "finite": true
+          },
+          "decoder": {
+            "relative_l2": 0.0009289925801567733,
+            "max_abs": 0.003564000129699707,
+            "rms": 0.00020830512221436948,
+            "finite": true
+          }
+        }
+      },
+      "speech3956ms": {
+        "input": "test_samples/p232_007.wav",
+        "input_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+        "samples": 63295,
+        "tokens": 317,
+        "matching_tokens": 317,
+        "waveform_vs_original": {
+          "relative_l2": 0.02276715077459812,
+          "max_abs": 0.014243513345718384,
+          "rms": 0.0016669252654537559,
+          "finite": true
+        },
+        "encoder_features_vs_original": {
+          "relative_l2": 0.0002185389312217012,
+          "max_abs": 0.0011138916015625,
+          "rms": 0.00021745388221461326,
+          "finite": true
+        },
+        "cpu_forward_s": 6.362085500000376,
+        "same_reference_lstm_input": {
+          "encoder": {
+            "relative_l2": 0.00069862772943452,
+            "max_abs": 0.00467856228351593,
+            "rms": 0.00018382177222520113,
+            "finite": true
+          },
+          "decoder": {
+            "relative_l2": 0.0024584231432527304,
+            "max_abs": 0.027548477053642273,
+            "rms": 0.0005281747435219586,
+            "finite": true
+          }
+        }
+      }
+    },
+    "recurrent_if8_int": {
+      "quiet400ms": {
+        "input": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/validation/speech_6400.wav",
+        "input_sha256": "66ada5357392310b69bbf6a01868b172d581dda9f4a4d9ffa0f5425d7d53fb10",
+        "samples": 6400,
+        "tokens": 33,
+        "matching_tokens": 33,
+        "waveform_vs_original": {
+          "relative_l2": 0.005251995287835598,
+          "max_abs": 0.00017871346790343523,
+          "rms": 2.2463953428086825e-05,
+          "finite": true
+        },
+        "encoder_features_vs_original": {
+          "relative_l2": 0.0007799167069606483,
+          "max_abs": 0.003797619603574276,
+          "rms": 0.0007687536417506635,
+          "finite": true
+        },
+        "cpu_forward_s": 0.6051562020002166,
+        "same_reference_lstm_input": {
+          "encoder": {
+            "relative_l2": 0.003220000071451068,
+            "max_abs": 0.007223889231681824,
+            "rms": 0.0008230623207055032,
+            "finite": true
+          },
+          "decoder": {
+            "relative_l2": 0.004994520451873541,
+            "max_abs": 0.0232803076505661,
+            "rms": 0.0011199063155800104,
+            "finite": true
+          }
+        }
+      },
+      "speech3956ms": {
+        "input": "test_samples/p232_007.wav",
+        "input_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+        "samples": 63295,
+        "tokens": 317,
+        "matching_tokens": 317,
+        "waveform_vs_original": {
+          "relative_l2": 0.09206301718950272,
+          "max_abs": 0.059704333543777466,
+          "rms": 0.006740509532392025,
+          "finite": true
+        },
+        "encoder_features_vs_original": {
+          "relative_l2": 0.0011597194243222475,
+          "max_abs": 0.006331965327262878,
+          "rms": 0.0011539661791175604,
+          "finite": true
+        },
+        "cpu_forward_s": 6.429728620999867,
+        "same_reference_lstm_input": {
+          "encoder": {
+            "relative_l2": 0.0036052807699888945,
+            "max_abs": 0.012473851442337036,
+            "rms": 0.0009486154303885996,
+            "finite": true
+          },
+          "decoder": {
+            "relative_l2": 0.011177563108503819,
+            "max_abs": 0.11214660108089447,
+            "rms": 0.0024014210794121027,
+            "finite": true
+          }
+        }
+      }
+    }
+  },
+  "elapsed_s": 26.270233786000063
+}

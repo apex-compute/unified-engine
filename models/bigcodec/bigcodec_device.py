@@ -53,6 +53,139 @@ def shift(engine, source, destination, elements, value):
     elementwise(engine, udc.UE_MODE.ADD_BROADCAST, source, None, destination, elements, value)
 
 
+def sram_scale(engine, source, destination, elements, value):
+    """Wide SRAM broadcast with the same BF16 immediate rounding as DRAM ops."""
+    engine.broadcast_mul(float(torch.tensor(value, dtype=torch.float32).bfloat16()),
+                         source, destination, elements)
+
+
+def sram_shift(engine, source, destination, elements, value):
+    engine.broadcast_add(float(torch.tensor(value, dtype=torch.float32).bfloat16()),
+                         source, destination, elements)
+
+
+def sram_copy(engine, source, destination, elements):
+    """Copy finite BF16 lanes from URAM_A using a 1x1 native MAXPOOL walk."""
+    size = elements * 2
+    if (elements <= 0 or elements % 64 or elements // 64 > 0xFFF
+            or any(address % 128 for address in (source, destination))
+            or not 0 <= source < 0x80000
+            or source + size > udc.URAM_NEAR_FULL_SIZE
+            or not 0 <= destination < 0x100000
+            or destination % 0x80000 + size > udc.URAM_NEAR_FULL_SIZE):
+        raise ValueError('Invalid SRAM copy geometry')
+    if source == destination:
+        return
+    if destination < source + size and source < destination + size:
+        raise ValueError('SRAM copy ranges partially overlap')
+    engine.start_queue_for_maxpool2d_operation(
+        act_sram_start_addr=source, output_sram_wb_addr=destination,
+        kernel_w=1, kernel_h=1, out_w=elements // 64, out_h=1,
+        w_pad=1, stride_s=1)
+
+
+def sram_maximum(engine, left, right, destination, elements):
+    """Compare two finite BF16 vectors using the native 64-lane MAXPOOL unit.
+
+    Both inputs occupy disjoint, contiguous URAM_A ranges. Treat them as two
+    image rows: a vertical 2x1 window compares corresponding lanes without
+    interleaving or an identity matmul. Output may alias either input. NaNs
+    follow MAXPOOL's filtering policy; callers must supply finite activations.
+    """
+    if left > right:
+        left, right = right, left
+    size = elements * 2
+    if (elements <= 0 or elements % 64 or 2 * (elements // 64) > 0xFFF
+            or any(address % 128 for address in (left, right, destination))
+            or not 0 <= left < right < 0x80000
+            or left + size > right or right + size > udc.URAM_NEAR_FULL_SIZE
+            or not 0 <= destination < 0x100000
+            or destination % 0x80000 + size > udc.URAM_NEAR_FULL_SIZE):
+        raise ValueError('Invalid SRAM maximum geometry or overlapping inputs')
+    for source in (left, right):
+        if destination != source and destination < source + size and source < destination + size:
+            raise ValueError('SRAM maximum output partially overlaps an input')
+    engine.start_queue_for_maxpool2d_operation(
+        act_sram_start_addr=left, output_sram_wb_addr=destination,
+        kernel_w=1, kernel_h=2, out_w=elements // 64, out_h=1,
+        w_pad=(right - left) // 128, stride_s=1)
+
+
+def sram_clamp(engine, source, destination, elements, *, scratch_address,
+               lo=-float('inf'), hi=float('inf')):
+    """Finite-input clamp, preserving other SRAM and every BF16 value boundary.
+
+    Source must be in URAM_A; destination can be in either bank or equal source.
+    Workspace is two contiguous vectors in URAM_A, disjoint from input/output.
+    MAXPOOL selects BF16 values directly. Upper bounds also use arithmetic
+    negation; subnormal flushing therefore depends on the active datapath and
+    needs hardware verification. No polynomial approximation is introduced.
+    """
+    size = elements * 2
+    temporary, constant = scratch_address, scratch_address + size
+    if (lo != lo or hi != hi or lo > hi or elements <= 0 or elements % 64
+            or any(address % 128 for address in (source, destination, scratch_address))
+            or not 0 <= source < 0x80000
+            or source + size > udc.URAM_NEAR_FULL_SIZE
+            or not 0 <= scratch_address < 0x80000
+            or scratch_address + 2 * size > udc.URAM_NEAR_FULL_SIZE):
+        raise ValueError('Invalid SRAM clamp geometry or bounds')
+    for address in (source, destination):
+        if scratch_address < address + size and address < scratch_address + 2 * size:
+            raise ValueError('SRAM clamp workspace overlaps input/output')
+    sram_scale(engine, source, constant, elements, 0)
+    current = source
+    if lo != -float('inf'):
+        if lo != 0:
+            sram_shift(engine, constant, constant, elements, lo)
+        sram_maximum(engine, source, constant,
+                     destination if hi == float('inf') else temporary, elements)
+        current = destination if hi == float('inf') else temporary
+    if hi != float('inf'):
+        sram_scale(engine, current, temporary, elements, -1)
+        sram_scale(engine, source, constant, elements, 0)
+        if hi != 0:
+            sram_shift(engine, constant, constant, elements, -hi)
+        sram_maximum(engine, temporary, constant, temporary, elements)
+        sram_scale(engine, temporary, destination, elements, -1)
+    elif current == source and source != destination:
+        sram_copy(engine, source, destination, elements)
+
+
+def gather_rows_to_sram(engine, source, destination, *, source_rows, rows,
+                        width, start=0, stride=1):
+    """Gather an endpoint-padded time tile directly into a bounded SRAM span."""
+    row_bytes = width * 2
+    if (source_rows <= 0 or rows <= 0 or width <= 0 or width % 64 or stride <= 0
+            or destination % 128 or destination % 0x80000 + rows * row_bytes > udc.URAM_NEAR_FULL_SIZE):
+        raise ValueError('Invalid SRAM row gather geometry')
+    first = min(rows, max(0, (-start + stride - 1) // stride))
+    stop = max(first, min(rows, (source_rows - 1 - start) // stride + 1))
+    for index in range(first):
+        engine.accelerator_memory_to_sram(source, destination + index * row_bytes,
+                                          0, memcpy_length_bytes=row_bytes)
+    if stop > first:
+        shared._copy_contiguous_or_strided_read(
+            engine, source=source + (start + first * stride) * row_bytes,
+            sram=destination + first * row_bytes, total=(stop - first) * row_bytes,
+            chunk=row_bytes, jump=stride * row_bytes)
+    for index in range(stop, rows):
+        engine.accelerator_memory_to_sram(source + (source_rows - 1) * row_bytes,
+                                          destination + index * row_bytes, 0,
+                                          memcpy_length_bytes=row_bytes)
+
+
+def clamp_wide(engine, source, destination, elements, lo=0.0, hi=float('inf')):
+    """DRAM wrapper for the finite-input, native wide SRAM clamp."""
+    if elements <= 0 or elements % 64:
+        raise ValueError('Wide clamp requires a positive multiple of 64 elements')
+    for first in range(0, elements, 32768):
+        count = min(32768, elements - first)
+        engine.accelerator_memory_to_sram(source + first * 2, 0, count)
+        sram_clamp(engine, 0, 0, count, scratch_address=0x20000, lo=lo, hi=hi)
+        engine.sram_to_accelerator_memory(0, destination + first * 2, count)
+
+
 def clamp(engine, source, destination, elements, identity_address, lo=0.0, hi=float('inf')):
     assert elements > 0 and elements % 64 == 0
     rows = elements // 64
