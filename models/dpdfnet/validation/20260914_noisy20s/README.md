@@ -26,6 +26,7 @@ for playback. Sources and transformations: [attribution](ATTRIBUTION.md),
 
 **173.010 seconds; 17,353 frames per model.**
 Italy RK-256, build `0xdf0749de`, measured clock 333.25 MHz.
+Host CPU: **Intel Core Ultra 9 285K**, [up to **5.7 GHz** maximum turbo](https://www.intel.com/content/www/us/en/support/articles/000099656/processors.html).
 FPGA host: core 6; FP32 CPU reference: one thread on core 7.
 
 | Measurement | Native 8 kHz | Existing 16 kHz |
