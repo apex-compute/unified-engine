@@ -24,8 +24,9 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ---------------------------------------------------------------------------
 # DRAM Prewriting Tests
 # ---------------------------------------------------------------------------
-# When enabled, the harness DMA-writes test data across the FULL 4 GiB
-# DRAM right before launching each model, so the model (loaded from its bin) starts
+# When enabled, the harness DMA-writes test data across the FULL DRAM capacity
+# reported by HW_INFO (4 GiB on the U50 build, 8 GiB on the U55 build, etc.)
+# right before launching each model, so the model (loaded from its bin) starts
 # on poisoned DRAM. A PASS then proves model setup writes every byte it reads.
 # Toggle off with RANDOMIZE_DRAM=0 in the env to run on clean DRAM.
 RANDOMIZE_DRAM   = os.environ.get("RANDOMIZE_DRAM", "1") != "0"
@@ -35,13 +36,14 @@ DMA_DEV          = os.environ.get("DMA_DEV", "xdma0")
 
 def randomize_dram(seed: int = 0, dev: str = "xdma0",
                    chunk_bytes: int = 64 * 1024 * 1024,
-                   total_bytes: int = 0x100000000) -> bool:
-    """DMA-write random bf16 values across the full 4 GiB DRAM, then release the
+                   total_bytes: int | None = None) -> bool:
+    """DMA-write random bf16 values across all HW-reported DRAM, then release the
     device, so the model launched next starts on poisoned DRAM.
 
-    Covers the ENTIRE 4 GB DMA-mapped DRAM (0x00000000..0xFFFFFFFF): weight / ISA /
-    scratch regions all start as garbage, so a model that still decodes correctly
-    proves its run-from-bin path (re)writes every byte it reads.
+    By default the byte count comes from HW_INFO. This matters on the 8 GiB U55
+    layout: limiting poison to the historical low 4 GiB leaves the model map in
+    the upper half carrying stale state. ``total_bytes`` remains injectable for
+    focused tests.
 
     Uses random bf16 values in [-8, 8] (same method as randomize_dram.py), NOT an
     all-0xFF fill — 0xFF bytes decode to bf16 NaN, which corrupts any DRAM region
@@ -52,11 +54,22 @@ def randomize_dram(seed: int = 0, dev: str = "xdma0",
     run the model because that would not exercise the required poisoned-DRAM state.
     """
     try:
-        if chunk_bytes <= 0 or total_bytes <= 0:
-            raise ValueError("chunk_bytes and total_bytes must be positive")
+        if chunk_bytes <= 0:
+            raise ValueError("chunk_bytes must be positive")
         import torch
         import user_dma_core
         user_dma_core.set_dma_device(dev)
+        if total_bytes is None:
+            # UnifiedEngine only reads HW_INFO automatically when the process has
+            # not configured a clock yet. Read it explicitly here so a long-lived
+            # harness and a freshly selected --dev always agree on DRAM capacity.
+            user_dma_core.configure_clock_from_hardware()
+            dram_gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
+            if not dram_gib:
+                raise RuntimeError("HW_INFO did not report a usable DRAM size")
+            total_bytes = int(dram_gib) * 1024 ** 3
+        if total_bytes <= 0:
+            raise ValueError("total_bytes must be positive")
         ue = user_dma_core.UnifiedEngine()           # bare engine: opens device, self-tests
         gen = torch.Generator().manual_seed(seed)
         bpe = 2
@@ -73,7 +86,7 @@ def randomize_dram(seed: int = 0, dev: str = "xdma0",
                 )
             offset += take * bpe
         print(f"[randomize_dram] wrote {total_bytes / 1024**3:.2f} GiB of random bf16 poison data to "
-              f"DRAM [0x00000000..{total_bytes - 1:#010x}]", flush=True)
+              f"DRAM [0x00000000..0x{total_bytes - 1:X}]", flush=True)
         del ue                                       # release (dma ops already open/close per call)
         return True
     except Exception as e:
@@ -228,7 +241,9 @@ def _score_coherence(decoded):
 
 def _check_vlm(text, model_name, keywords, minimum_hits=4):
     """Require coherent generated text and enough image-scene keyword hits."""
-    decoded = _extract_decode_text(text)
+    decoded = _test_result_field(text, "decoded_text")
+    if not isinstance(decoded, str) or not decoded.strip():
+        decoded = _extract_decode_text(text)
     coherent, reason = _score_coherence(decoded)
     if not coherent:
         return False, reason
@@ -301,6 +316,44 @@ def _check_parakeet(text):
             f"missing: {', '.join(missing)}"
         )
     return True, f"all expected transcription keywords found: {decoded!r}"
+
+def _check_qwen_omni_audio(text):
+    """Check the shipped apex.wav transcription without requiring one phrasing.
+
+    Omni may answer with a literal transcript or wrap it in a short sentence, so
+    test concepts rather than an exact string. Restrict the check to generated
+    text from TEST_RESULT (or a known decode marker as a compatibility fallback)
+    so model/banner log lines cannot satisfy it accidentally.
+    """
+    decoded = _test_result_field(text, "decoded_text")
+    if not isinstance(decoded, str) or not decoded.strip():
+        decoded = _extract_decode_text(text)
+    coherent, reason = _score_coherence(decoded)
+    if not coherent:
+        return False, reason
+
+    concepts = {
+        "apex": r"\bapex\b",
+        "unified engine": r"\bunified\s+engine\b",
+        "inference": r"\binference\b",
+        "accelerator": r"\baccelerator\b",
+    }
+    hits = [name for name, pattern in concepts.items()
+            if re.search(pattern, decoded, re.IGNORECASE)]
+    if len(hits) < 2:
+        return False, (
+            f"coherent audio response matched only {len(hits)} expected concept(s) "
+            f"{hits}; decoded preview: {decoded[:160]!r}"
+        )
+    return True, f"{reason}; audio concepts: {', '.join(hits)}"
+
+def _check_qwen_omni_joint(text):
+    """Require evidence that both media towers contributed to the response."""
+    audio_ok, audio_reason = _check_qwen_omni_audio(text)
+    image_ok, image_reason = _check_vlm(
+        text, "qwen omni joint", QWEN_VLM_KEYWORDS, minimum_hits=2
+    )
+    return audio_ok and image_ok, f"{image_reason}; {audio_reason}"
 
 def _check_swin(text):
     decoded = _test_result_field(text, "decoded_text")
@@ -419,6 +472,15 @@ TESTS = [
     # on yosemite.jpg; gemma4-style criteria (coherent decode + scene keywords).
     {"name": "qwen3.5_2b_vlm", "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",        "pass_check": _check_qwen_vlm, "extra_args": ["--vision-enable", "--vision-on-hardware"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe what you see in this image. (default)"},
     {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py", "pass_check": _check_qwen_vlm, "extra_args": ["--image"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the picture in details. (default)", "no_device": True},
+
+    # Qwen2.5-Omni-7B Thinker-only modes. The model requires the 8 GiB Alveo U55
+    # eight-engine layout; unlike scripts that expose --engines, --multi-core is
+    # not auto-populated by this harness.
+    {"name": "qwen2.5_omni_7b", "script": "models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "extra_args": ["--multi-core", "8"], "mode": "LM/Thinker (8 engines)", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8},
+    {"name": "qwen2.5_omni_7b_vlm", "script": "models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py", "pass_check": _check_qwen_vlm, "extra_args": ["--image", "--multi-core", "8"], "mode": "VLM/Thinker (8 engines)", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the picture in detail. (default)", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8},
+    {"name": "qwen2.5_omni_7b_audio", "script": "models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py", "prompt": "Transcribe the speech exactly.", "pass_check": _check_qwen_omni_audio, "extra_args": ["--audio", "test_samples/apex.wav", "--multi-core", "8"], "mode": "Audio/Thinker (8 engines)", "audio": "test_samples/apex.wav", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8},
+    {"name": "qwen2.5_omni_7b_joint", "script": "models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py", "pass_check": _check_qwen_omni_joint, "extra_args": ["--image", "--audio", "test_samples/apex.wav", "--multi-core", "8"], "mode": "Image+audio/Thinker (8 engines)", "image": "test_samples/yosemite.jpg", "audio": "test_samples/apex.wav", "prompt_desc": "First transcribe the audio. Then briefly describe the image. (default)", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8},
+
     # SmolVLM2 has a read-before-write defect and depends on clean, zero-filled
     # DRAM. Rather than special-casing it in the harness, SmolVLM2 is poisoned
     # before its run like every other model; smolvlm2_test.py zeroes DRAM itself
@@ -474,6 +536,31 @@ def reset_device(dev: str = "xdma0") -> None:
 # ---------------------------------------------------------------------------
 
 _CI_MAX_ENGINES = "unset"          # sentinel: not probed yet (None means "unknown")
+_CI_CAPACITY = "unset"             # (device, engines, dram_gib), or None
+
+
+def _device_capacity(dev: str):
+    """Return the selected board's HW_INFO engine/DRAM tuple, if readable."""
+    global _CI_CAPACITY
+    if _CI_CAPACITY is None:
+        return None, None
+    if _CI_CAPACITY != "unset" and _CI_CAPACITY is not None:
+        cached_dev, cores, dram_gib = _CI_CAPACITY
+        if cached_dev == dev:
+            return cores, dram_gib
+    try:
+        import user_dma_core
+        user_dma_core.set_dma_device(dev)
+        user_dma_core.configure_clock_from_hardware()
+        cores = user_dma_core.ANDROMEDA_CORE_COUNT
+        dram_gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
+        _CI_CAPACITY = (dev, cores, dram_gib)
+        return cores, dram_gib
+    except Exception as exc:
+        print(f"[ci] could not read board capacity ({exc!r}); "
+              "model entry points will validate their own requirements")
+        _CI_CAPACITY = None
+        return None, None
 
 
 def _device_max_engines():
@@ -582,6 +669,8 @@ def run_test(test: dict, verbose: bool = False,
     print("Execution    : FPGA")
     if test.get("image"):
         print(f"Image        : {test['image']}")
+    if test.get("audio"):
+        print(f"Audio        : {test['audio']}")
     if test.get("prompt_desc"):
         print(f"Prompt       : {test['prompt_desc']}")
     if unsupported:
@@ -590,8 +679,41 @@ def run_test(test: dict, verbose: bool = False,
         print(f"Prompt       : {test['prompt']}")
     print(f"{'='*60}\n", flush=True)
 
+    required_engines = test.get("required_engines")
+    minimum_engines = test.get("minimum_engines")
+    required_dram_gib = test.get("required_dram_gib")
+    if (required_engines is not None or minimum_engines is not None
+            or required_dram_gib is not None):
+        actual_engines, actual_dram_gib = _device_capacity(dev or DMA_DEV)
+        mismatch = (
+            actual_engines is not None
+            and required_engines is not None
+            and actual_engines != required_engines
+        ) or (
+            actual_engines is not None
+            and minimum_engines is not None
+            and actual_engines < minimum_engines
+        ) or (
+            actual_dram_gib is not None
+            and required_dram_gib is not None
+            and actual_dram_gib != required_dram_gib
+        )
+        if mismatch:
+            engine_requirement = (
+                str(required_engines) if required_engines is not None
+                else f">={minimum_engines}"
+            )
+            reason = (
+                f"requires {engine_requirement} engines/{required_dram_gib} GiB; "
+                f"HW_INFO reports {actual_engines} engines/{actual_dram_gib} GiB"
+            )
+            print(f"SKIP         : {reason}\n", flush=True)
+            result = _parse_output(test, "", 0, 0.0)
+            result.update(passed=True, skipped=True, pass_reason=reason)
+            return result
+
     # Check immediately before poisoning. Model worktrees are sometimes updated
-    # while a long suite is running; do not spend time writing 4 GiB when the
+    # while a long suite is running; do not spend time writing all device DRAM when the
     # subprocess entry point is no longer present.
     if not os.path.isfile(script):
         result = _parse_output(test, "", 1, 0.0)
@@ -613,13 +735,14 @@ def run_test(test: dict, verbose: bool = False,
             result = _parse_output(test, "", 1, clear_elapsed)
             result["pass_reason"] = "DRAM zero-fill failed; model was not run"
             return result
-    # Normal models start from full 4 GiB of 0xFF poison so setup must rewrite
-    # every byte it reads.
+    # Normal models start from random data across the full HW-reported DRAM, so
+    # setup must rewrite every byte it reads. On U55 this includes the upper
+    # 4 GiB used by 8 GiB model layouts.
     elif RANDOMIZE_DRAM:
         model_seed = (
             RANDOM_DRAM_SEED + zlib.crc32(test["name"].encode("utf-8"))
         ) & 0xFFFFFFFF
-        print(f"[randomize_dram] poisoning full 4 GiB DRAM "
+        print(f"[randomize_dram] poisoning full HW-reported DRAM "
               f"(seed={model_seed}) before {test['name']} ...", flush=True)
         poison_start = time.perf_counter()
         poisoned = randomize_dram(seed=model_seed, dev=DMA_DEV)
@@ -689,6 +812,7 @@ def _parse_output(test: dict, stdout: str, returncode: int, elapsed: float) -> d
         "decode_speed_tok_s": None,
         "prefill_size_kb": None,
         "decoder_size_kb": None,
+        "skipped": False,
         "passed": False,
         "pass_reason": "",
     }
@@ -741,7 +865,7 @@ def write_summary(results: list, output_path: str) -> None:
     ]
 
     for r in results:
-        status = "PASS" if r["passed"] else "FAIL"
+        status = "SKIP" if r.get("skipped") else ("PASS" if r["passed"] else "FAIL")
         decoded_preview = r["decoded_text"]
         if decoded_preview and len(decoded_preview) > 300:
             decoded_preview = decoded_preview[:300] + "..."
@@ -783,11 +907,15 @@ def write_summary(results: list, output_path: str) -> None:
             "",
         ]
 
-    total = len(results)
-    passed = sum(1 for r in results if r["passed"])
+    skipped = sum(1 for r in results if r.get("skipped"))
+    tested = len(results) - skipped
+    passed = sum(1 for r in results if r["passed"] and not r.get("skipped"))
+    overall = f"Overall: {passed}/{tested} tested passed"
+    if skipped:
+        overall += f", {skipped} skipped"
     lines += [
         "=" * 60,
-        f"Overall: {passed}/{total} passed",
+        overall,
     ]
 
     text = "\n".join(lines) + "\n"
@@ -867,7 +995,10 @@ def main():
             result = run_test(test, verbose=args.verbose,
                               dev=args.dev, device=args.device)
             results.append(result)
-            status = "PASS" if result["passed"] else "FAIL"
+            status = (
+                "SKIP" if result.get("skipped")
+                else ("PASS" if result["passed"] else "FAIL")
+            )
             print(f"\n>>> {test['name']}: {status} — {result['pass_reason']}\n")
             if not result["passed"]:
                 if not args.verbose and result.get("stdout"):

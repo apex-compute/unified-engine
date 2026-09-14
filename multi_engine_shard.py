@@ -221,6 +221,7 @@ on first use and refuses a mix (see ``_latch_rendezvous``).
 from __future__ import annotations
 
 import hashlib
+import math
 import struct
 import time
 from dataclasses import dataclass, field, replace
@@ -245,6 +246,9 @@ SHARDED_OP_ALLOWLIST = frozenset({
     "matmat_mul_core",
     "matmat_mul_core_dynamic",
     "matmat_mul_core_legacy",
+    # One-pass IF4/IF8/TQ4 projection. The caller must row-offset A/output;
+    # weights and scales remain shared read-only, exactly like matmat_mul_core.
+    "quantized_matmat_core",
     "quantized_matmat_mul_core",
     # Standalone pointwise activation implemented through matmat_mul_core with
     # a shared read-only identity matrix. Each M row remains independent.
@@ -1384,9 +1388,14 @@ class MultiEngineScheduler:
         #   "four_phase" -- SET / CHECK_SET(others) / CLEAR / CHECK_CLEAR(others).
         #                   Same symmetric contract, no timing margin. Strictly more
         #                   robust; ``barrier_margin_nops`` is ignored in this mode.
-        # Independent of release()/join(), which are always four-phase.
-        assert handshake in ("nops", "four_phase"), \
-            f"handshake must be 'nops' or 'four_phase', got {handshake!r}"
+        #   "host_segmented" -- legacy-build compatibility for master/worker
+        #                   programs. Each round ends in HALT after SET/CHECK_SET;
+        #                   the host clears all flags and relaunches the next segment.
+        #                   This never emits CHECK_CLEAR, which older FPGA images do
+        #                   not implement. It is valid only with master_worker regions.
+        assert handshake in ("nops", "four_phase", "host_segmented"), \
+            ("handshake must be 'nops', 'four_phase', or 'host_segmented', "
+             f"got {handshake!r}")
         self.handshake = handshake
 
         # HOW A REGION SYNCHRONISES. The region API (sharded_region,
@@ -1412,6 +1421,10 @@ class MultiEngineScheduler:
             f"region_rendezvous must be 'symmetric' or 'master_worker', "
             f"got {region_rendezvous!r}")
         self.region_rendezvous = region_rendezvous
+        if handshake == "host_segmented" and region_rendezvous != "master_worker":
+            raise ValueError(
+                "handshake='host_segmented' requires "
+                "region_rendezvous='master_worker'")
         self._mw_round_open = False
         # Latched by the first rendezvous emitted; see _latch_rendezvous().
         self._rendezvous_mode: Optional[str] = None
@@ -1524,6 +1537,12 @@ class MultiEngineScheduler:
         self._region_count = 0
         self._program_open = False
         self._worker_prog_addrs: list[int] = []
+        # host_segmented records one aligned entry point per engine and segment.
+        # Index 0 is the initial program entry; every completed rendezvous appends
+        # the instruction immediately after its HALT. The final entries therefore
+        # execute the master tail and one empty worker HALT tail in lockstep.
+        self._host_segment_starts: list[list[int]] = []
+        self._host_clear_program_addrs: Optional[list[int]] = None
 
         # --- master/worker sharding state (all unused by the region API) ---
         # Allocation lives in self.arena (a PrivateArena), never in the scheduler:
@@ -2094,6 +2113,19 @@ class MultiEngineScheduler:
             w.reset_isa_reg_counter()
             w.reset_inst_ptr_counter()
             w.start_capture()
+        if self.handshake == "host_segmented":
+            starts = [self.primary.get_program_dram_addr()]
+            starts.extend(w.get_program_dram_addr() for w in self.workers)
+            if any(addr % 64 for addr in starts):
+                raise ValueError(
+                    "host-segmented program entries must be 64-byte aligned: "
+                    + ", ".join(f"engine {i}=0x{addr:X}"
+                                for i, addr in enumerate(starts)))
+            self._host_segment_starts = [[int(addr)] for addr in starts]
+            self._host_clear_program_addrs = None
+        else:
+            self._host_segment_starts = []
+            self._host_clear_program_addrs = None
         # THE RENDEZVOUS LATCH IS PER PROGRAM. What must agree on a topology is
         # the pair of streams that RUN TOGETHER; two programs compiled on one
         # scheduler and launched separately never rendezvous with each other. A
@@ -2102,6 +2134,29 @@ class MultiEngineScheduler:
         # nothing wrong, so each begin_program() starts the choice afresh.
         self._rendezvous_mode = None
         self._program_open = True
+
+    def abort_program(self) -> None:
+        """Discard a partially emitted worker program and reset scheduler state.
+
+        Model compilers own the primary capture session, so this method touches
+        workers only. It is safe to call after a partial ``begin_program()`` or
+        a failed ``finalize()``.
+        """
+        for w in self.workers:
+            if getattr(w, "is_capture_on", False):
+                w.stop_capture()
+            w.clear_capture_buffer()
+            w.reset_isa_reg_counter()
+            w.reset_inst_ptr_counter()
+        self._program_open = False
+        self._in_region = False
+        self._mw_round_open = False
+        self._rendezvous_mode = None
+        self._worker_prog_addrs = []
+        self._host_segment_starts = []
+        self._host_clear_program_addrs = None
+        self._m_regs.clear()
+        self._n_regs.clear()
 
     def finalize(self) -> list[int]:
         """Halt, close and flush every worker program to DRAM; return the worker
@@ -2117,52 +2172,81 @@ class MultiEngineScheduler:
         """
         assert self._program_open, "finalize() without begin_program()"
         assert not self._in_region, "finalize() inside an open sharded region"
-        if self._mw_round_open:
-            # The last region closed with join=False. In the symmetric shape that
-            # is harmless (no trailing barrier); here it would leave the master's
-            # release standing with no join, and every worker waiting on a close
-            # that never comes. Shut the round before the HALT.
-            self._region_exit(join=True)
-        self._worker_prog_addrs = []
-        for wi, w in enumerate(self.workers):
-            w.generate_instruction_halt()
-            w.stop_capture()
-            addr = w.get_program_dram_addr()
-            try:
-                w.write_captured_instructions_to_dram(addr)
-            except TypeError:
-                # DIAGNOSTIC (temporary): Instructions.get_bytes() has been seen
-                # failing with "cannot convert '_struct.Struct' object to
-                # bytearray", which means a non-int landed in inst.words. Report
-                # WHICH worker/instruction and what the bad word actually is --
-                # the bare traceback names neither.
-                import struct as _s
-                print(f"    [finalize] worker {wi} FAILED flushing "
-                      f"{w.capture_count} instructions to 0x{addr:x}")
-                print(f"    [finalize] struct.pack is {_s.pack!r} -> "
-                      f"{type(_s.pack('<I', 1))}")
-                for k, inst in enumerate(w.capture_buffer):
-                    bad = [(j, type(x).__name__, repr(x))
-                           for j, x in enumerate(inst.words)
-                           if not isinstance(x, int)]
-                    if bad:
-                        print(f"    [finalize] inst #{k} has non-int words: {bad}")
-                        # NOT inst!r -- Instructions.__repr__ formats every word
-                        # with 0x{w:08X} and would raise on the non-int itself.
-                        print(f"    [finalize] inst #{k} words = {inst.words}")
-                        break
-                else:
-                    print("    [finalize] every word is an int -- the failure is "
-                          "in struct.pack itself, not the instruction stream")
-                raise
-            w.allocate_program_dram(w.get_capture_instruction_size_bytes())
-            self._worker_prog_addrs.append(addr)
-        self._program_open = False
-        return list(self._worker_prog_addrs)
+        cursor_before = [w.get_program_dram_addr() for w in self.workers]
+        prepared: list[tuple[UnifiedEngine, int, bytes]] = []
+        try:
+            if self._mw_round_open:
+                # The last region closed with join=False. In the symmetric shape that
+                # is harmless (no trailing barrier); here it would leave the master's
+                # release standing with no join, and every worker waiting on a close
+                # that never comes. Shut the round before the HALT.
+                self._region_exit(join=True)
+
+            # Serialize and bounds-check EVERY worker before the first DMA. An
+            # ISA overflow does not fault in hardware: it overwrites the next
+            # slice, so checking after write is already data corruption.
+            for wi, w in enumerate(self.workers):
+                w.generate_instruction_halt()
+                w.stop_capture()
+                # HALT currently pads itself, but make the preflight invariant
+                # explicit: the blob checked here must be byte-identical to the
+                # one the generic flush helper will write below.
+                w.pad_capture_to_64b_boundary()
+                addr = w.get_program_dram_addr()
+                try:
+                    blob = b"".join(inst.get_bytes() for inst in w.capture_buffer)
+                except TypeError:
+                    # Instructions.get_bytes() has occasionally exposed a
+                    # non-integer word. Identify the precise worker/instruction.
+                    import struct as _s
+                    print(f"    [finalize] worker {wi + 1} FAILED serializing "
+                          f"{w.capture_count} instructions for 0x{addr:x}")
+                    print(f"    [finalize] struct.pack is {_s.pack!r} -> "
+                          f"{type(_s.pack('<I', 1))}")
+                    for k, inst in enumerate(w.capture_buffer):
+                        bad = [(j, type(x).__name__, repr(x))
+                               for j, x in enumerate(inst.words)
+                               if not isinstance(x, int)]
+                        if bad:
+                            print(f"    [finalize] inst #{k} has non-int words: {bad}")
+                            print(f"    [finalize] inst #{k} words = {inst.words}")
+                            break
+                    else:
+                        print("    [finalize] every word is an int -- the failure is "
+                              "in struct.pack itself, not the instruction stream")
+                    raise
+                expected = w.get_capture_instruction_size_bytes()
+                if len(blob) != expected:
+                    raise RuntimeError(
+                        f"worker {wi + 1} serialized {len(blob)} bytes, expected "
+                        f"{expected}")
+                if self.arena is not None:
+                    self._check_isa_fits(wi + 1, addr, len(blob))
+                prepared.append((w, addr, blob))
+
+            # All images are now known-safe. Flush first, then advance every
+            # allocator, so a failed write cannot leave only a prefix allocated.
+            for wi, (w, addr, blob) in enumerate(prepared, start=1):
+                written = w.write_captured_instructions_to_dram(addr)
+                if written != len(blob):
+                    raise IOError(
+                        f"worker {wi} ISA write returned {written} of {len(blob)} bytes")
+            for w, _addr, blob in prepared:
+                w.allocate_program_dram(len(blob))
+
+            self._worker_prog_addrs = [addr for _w, addr, _blob in prepared]
+            self._program_open = False
+            return list(self._worker_prog_addrs)
+        except Exception:
+            for w, cursor in zip(self.workers, cursor_before):
+                w._next_program_dram_addr = cursor
+            self.abort_program()
+            raise
 
     def start_workers(self, prog_addrs: Optional[list[int]] = None,
                       aligned_seq_len: Optional[int] = None,
-                      gpr_sets_by_worker: Optional[list[list[tuple[int, int]]]] = None) -> None:
+                      gpr_sets_by_worker: Optional[list[list[tuple[int, int]]]] = None,
+                      *, launch: bool = True) -> list[int]:
         """Launch every worker program. Call BEFORE launching the primary's
         program, on EVERY execution (each run ends with the workers halted).
 
@@ -2185,6 +2269,7 @@ class MultiEngineScheduler:
         primes its own folded decode program. Ignored by workers that have no such
         register.
         """
+        entries: list[int] = []
         if self._persistent_prog and prog_addrs is None:
             # Persistent (master/worker) workers: addresses are per engine index and
             # the entry point may be a per-token preamble rather than the body itself.
@@ -2199,7 +2284,7 @@ class MultiEngineScheduler:
                 if aligned_seq_len is not None and reg is not None:
                     sets.append((reg, aligned_seq_len))
                 if not sets:
-                    ue.start_execute_from_dram(self._persistent_prog[idx])
+                    entries.append(self._persistent_prog[idx])
                     continue
                 ue.clear_inst_id()
                 ue.start_capture()
@@ -2207,10 +2292,21 @@ class MultiEngineScheduler:
                     ue.generate_instruction_add_set(_reg, _val)
                 ue.generate_instruction_jump_abs(self._persistent_body_word[idx])
                 ue.stop_capture()
-                ue.write_captured_instructions_to_dram(self._persistent_preamble[idx])
-                ue.clear_capture_buffer()
-                ue.start_execute_from_dram(self._persistent_preamble[idx])
-            return
+                try:
+                    written = ue.write_captured_instructions_to_dram(
+                        self._persistent_preamble[idx])
+                    expected = ue.get_capture_instruction_size_bytes()
+                    if written != expected:
+                        raise IOError(
+                            f"engine {idx} runtime preamble write returned "
+                            f"{written} of {expected} bytes")
+                finally:
+                    ue.clear_capture_buffer()
+                entries.append(self._persistent_preamble[idx])
+            if launch:
+                for ue, entry in zip(self.workers, entries):
+                    ue.start_execute_from_dram(entry)
+            return entries
         addrs = self._worker_prog_addrs if prog_addrs is None else prog_addrs
         assert len(addrs) == len(self.workers), \
             f"start_workers: {len(addrs)} program address(es) for {len(self.workers)} worker(s)"
@@ -2225,7 +2321,7 @@ class MultiEngineScheduler:
             reg_sets = (gpr_sets_by_worker[wi]
                         if gpr_sets_by_worker is not None else [])
             if not reg_sets:
-                w.start_execute_from_dram(addr)
+                entries.append(addr)
                 continue
             # Reserve one aligned slot after the loaded image on first use, then
             # rewrite that same slot every launch. This keeps the preamble from
@@ -2234,12 +2330,19 @@ class MultiEngineScheduler:
             preamble_key = (wi, int(addr), tuple(reg for reg, _ in reg_sets))
             preamble_addr = preambles.get(preamble_key)
             if preamble_addr is None:
-                preamble_bytes = ((len(reg_sets) + 1)
-                                  * user_dma_core.INSTRUCTION_SIZE_BYTES)
-                preamble_addr = w.allocate_program_dram(
-                    preamble_bytes,
+                raw_preamble_bytes = ((len(reg_sets) + 1)
+                                      * user_dma_core.INSTRUCTION_SIZE_BYTES)
+                preamble_bytes = ((raw_preamble_bytes + 63) // 64) * 64
+                preamble_addr = w.get_program_dram_addr()
+                if self.arena is not None:
+                    self._check_isa_fits(wi + 1, preamble_addr, preamble_bytes)
+                allocated_addr = w.allocate_program_dram(
+                    raw_preamble_bytes,
                     label=f"worker{wi + 1}_runtime_preamble")
-                self._check_isa_fits(wi + 1, preamble_addr, preamble_bytes)
+                if allocated_addr != preamble_addr:
+                    raise AssertionError(
+                        f"worker {wi + 1} runtime preamble moved from preflight "
+                        f"0x{preamble_addr:X} to 0x{allocated_addr:X}")
                 preambles[preamble_key] = preamble_addr
             w.clear_inst_id()
             w.start_capture()
@@ -2248,9 +2351,20 @@ class MultiEngineScheduler:
             w.generate_instruction_jump_abs(
                 user_dma_core.ue_35bit_addr_shifter(addr))
             w.stop_capture()
-            w.write_captured_instructions_to_dram(preamble_addr)
-            w.clear_capture_buffer()
-            w.start_execute_from_dram(preamble_addr)
+            try:
+                written = w.write_captured_instructions_to_dram(preamble_addr)
+                expected = w.get_capture_instruction_size_bytes()
+                if written != expected:
+                    raise IOError(
+                        f"worker {wi + 1} runtime preamble write returned "
+                        f"{written} of {expected} bytes")
+            finally:
+                w.clear_capture_buffer()
+            entries.append(preamble_addr)
+        if launch:
+            for w, entry in zip(self.workers, entries):
+                w.start_execute_from_dram(entry)
+        return entries
 
     def worker_program_bytes(self) -> int:
         return sum(w.get_capture_instruction_size_bytes() for w in self.workers)
@@ -2427,6 +2541,23 @@ class MultiEngineScheduler:
         for idx in self.worker_indices():
             self.primary.generate_instruction_flag_check_set(target_engine_idx=idx)    # 2
         self.primary.generate_instruction_flag_clear()                                 # 3
+        if self.handshake == "host_segmented":
+            # E7-era U55 images implement SET/CLEAR/CHECK_SET but not
+            # CHECK_CLEAR. End this one-shot round on every engine and let the
+            # host clear the flags only after all eight queues are idle. That
+            # gives the next round a real observed zero without a timing margin.
+            self.primary.generate_instruction_halt()
+            for engine_idx, ue in enumerate(self.engines):
+                next_addr = (
+                    ue.get_program_dram_addr()
+                    + ue.capture_count * user_dma_core.INSTRUCTION_SIZE_BYTES
+                )
+                if next_addr % 64:
+                    raise AssertionError(
+                        f"engine {engine_idx} host-segment resume 0x{next_addr:X} "
+                        "is not 64-byte aligned")
+                self._host_segment_starts[engine_idx].append(int(next_addr))
+            return
         for idx in self.worker_indices():
             self.primary.generate_instruction_flag_check_clear(target_engine_idx=idx)  # 4
 
@@ -2458,15 +2589,38 @@ class MultiEngineScheduler:
         self._latch_rendezvous("master_worker")
         ue = self.engines[engine_idx]
         ue.generate_instruction_flag_set()                             # 2: done
+        if self.handshake == "host_segmented":
+            # Leave the done flag raised until the master has observed it. The
+            # reusable host clear segment runs only after every queue HALTs.
+            ue.generate_instruction_halt()
+            return
         ue.generate_instruction_flag_check_clear(target_engine_idx=0)  # 3: closed
         ue.generate_instruction_flag_clear()                           # 4: re-armed
 
-    def preclear_flags(self, timeout_seconds: float = 5.0) -> None:
-        """Run a tiny program on every engine that just clears its flag.
+    @property
+    def host_segmented(self) -> bool:
+        """Whether this program uses host-separated one-shot flag rounds."""
+        return self.handshake == "host_segmented"
 
-        Call once before the first execution: a flag left set by an earlier
-        program would make the first CHECK pass spuriously.
-        """
+    def host_segment_starts(self) -> list[list[int]]:
+        """Return immutable-by-convention copies of captured segment entries."""
+        if not self.host_segmented:
+            raise RuntimeError(
+                "host_segment_starts() requires handshake='host_segmented'")
+        if not self._host_segment_starts:
+            raise RuntimeError("no host-segmented program has been captured")
+        counts = {len(starts) for starts in self._host_segment_starts}
+        if len(counts) != 1:
+            raise RuntimeError(
+                "host-segmented engine streams have different segment counts: "
+                + ", ".join(
+                    f"engine {i}={len(starts)}"
+                    for i, starts in enumerate(self._host_segment_starts)
+                ))
+        return [list(starts) for starts in self._host_segment_starts]
+
+    def _recover_stuck_engines(self) -> None:
+        """Reset only queues left busy by an interrupted earlier process."""
         # STALE-BUSY RECOVERY. The FPGA is not reset between processes, so a run
         # that died mid-execution leaves its workers spin-waiting at a FLAG_CHECK
         # (which has no timeout) with queue_busy still asserted. The next process
@@ -2498,18 +2652,180 @@ class MultiEngineScheduler:
                 f"rendezvous on stale flags -- producing fast, WRONG results rather "
                 f"than a hang. Power-cycle or reload the bitstream.")
 
-        for ue in self.engines:
+    def _prepare_host_clear_programs(self) -> list[int]:
+        """Allocate one reusable CLEAR+HALT image per engine."""
+        self._recover_stuck_engines()
+        cached = (None if self._host_clear_program_addrs is None
+                  else list(self._host_clear_program_addrs))
+        clear_addrs: list[int] = []
+        for engine_idx, ue in enumerate(self.engines):
+            assert not ue.is_capture_on, (
+                "host clear program must be prepared outside capture")
+            ue.clear_inst_id()
+            ue.start_capture()
+            ue.generate_instruction_flag_clear()
+            ue.generate_instruction_halt()
+            ue.stop_capture()
+            addr = (ue.get_program_dram_addr()
+                    if cached is None else cached[engine_idx])
+            size = ue.get_capture_instruction_size_bytes()
+            try:
+                if engine_idx > 0 and self.arena is not None:
+                    self._check_isa_fits(engine_idx, addr, size)
+                written = ue.write_captured_instructions_to_dram(addr)
+                if written != size:
+                    raise IOError(
+                        f"engine {engine_idx} reusable flag-clear write returned "
+                        f"{written} of {size} bytes")
+                if cached is None:
+                    allocated = ue.allocate_program_dram(
+                        size, label=f"engine{engine_idx}_host_segment_clear")
+                    if allocated != addr:
+                        raise AssertionError(
+                            f"engine {engine_idx} clear program moved from "
+                            f"0x{addr:X} to 0x{allocated:X}")
+            finally:
+                ue.clear_capture_buffer()
+            clear_addrs.append(int(addr))
+        self._host_clear_program_addrs = clear_addrs
+        return list(clear_addrs)
+
+    def _execute_host_clear_programs(
+        self, clear_addrs: list[int], timeout_seconds: float
+    ) -> None:
+        if len(clear_addrs) != self.num_engines:
+            raise ValueError(
+                f"need {self.num_engines} clear addresses, got {len(clear_addrs)}")
+        for ue, addr in zip(self.engines, clear_addrs):
+            ue.start_execute_from_dram(addr)
+        for engine_idx, ue in enumerate(self.engines):
+            ue.wait_queue(float(timeout_seconds))
+            if ue.is_queue_busy():
+                raise TimeoutError(
+                    f"engine {engine_idx} flag-clear segment is still busy after "
+                    f"{timeout_seconds:.1f}s")
+
+    def run_host_segmented(
+        self,
+        master_entry: int,
+        worker_program_addrs: Optional[list[int]] = None,
+        *,
+        gpr_sets_by_worker: Optional[list[list[tuple[int, int]]]] = None,
+        master_reserved_end: Optional[int] = None,
+        timeout_seconds: float = 600.0,
+    ) -> float:
+        """Run one captured legacy-compatible program, segment by segment.
+
+        Learned arithmetic remains in the captured FPGA streams. The host only
+        executes CLEAR+HALT control images between one-shot rendezvous and
+        relaunches the aligned continuation addresses recorded at compile time.
+        The returned value is the sum of engine-0 hardware latency counters.
+        """
+        if not self.host_segmented:
+            raise RuntimeError(
+                "run_host_segmented() requires handshake='host_segmented'")
+        if not math.isfinite(float(timeout_seconds)) or timeout_seconds <= 0:
+            raise ValueError(
+                f"timeout_seconds must be finite and positive, got "
+                f"{timeout_seconds!r}")
+
+        segments = self.host_segment_starts()
+        addrs = (self._worker_prog_addrs
+                 if worker_program_addrs is None else worker_program_addrs)
+        if len(addrs) != len(self.workers):
+            raise ValueError(
+                f"need {len(self.workers)} worker program addresses, got "
+                f"{len(addrs)}")
+        expected_first = [segments[0][0]] + [s[0] for s in segments[1:]]
+        supplied_first = [int(segments[0][0])] + [int(a) for a in addrs]
+        if supplied_first != expected_first:
+            raise ValueError(
+                "host-segmented launch addresses do not match the captured "
+                f"program entries: supplied={supplied_first}, "
+                f"captured={expected_first}")
+
+        worker_entries = self.start_workers(
+            list(addrs), gpr_sets_by_worker=gpr_sets_by_worker, launch=False)
+        if master_reserved_end is not None:
+            reserved_end = int(master_reserved_end)
+            if reserved_end < int(master_entry):
+                raise ValueError(
+                    f"master_reserved_end 0x{reserved_end:X} precedes entry "
+                    f"0x{int(master_entry):X}")
+            self.primary._next_program_dram_addr = max(
+                self.primary.get_program_dram_addr(), reserved_end)
+        clear_addrs = self._prepare_host_clear_programs()
+
+        segment_count = len(segments[0])
+        total_master_us = 0.0
+        for segment_idx in range(segment_count):
+            self._execute_host_clear_programs(clear_addrs, timeout_seconds)
+            if segment_idx == 0:
+                master_start = int(master_entry)
+                starts = worker_entries
+            else:
+                master_start = segments[0][segment_idx]
+                starts = [segments[i][segment_idx]
+                          for i in range(1, self.num_engines)]
+
+            # Workers first: each reaches CHECK_SET(0) before engine 0 raises
+            # the release flag, including on a heavily loaded host.
+            for worker, start in zip(self.workers, starts):
+                worker.start_execute_from_dram(start)
+            self.primary.start_execute_from_dram(master_start)
+
+            self.primary.wait_queue(float(timeout_seconds))
+            if self.primary.is_queue_busy():
+                raise TimeoutError(
+                    f"host-segmented master segment {segment_idx + 1}/"
+                    f"{segment_count} is still busy after "
+                    f"{timeout_seconds:.1f}s")
+            total_master_us += float(self.primary.report_latency_in_us())
+            for engine_idx, worker in enumerate(self.workers, start=1):
+                worker.wait_queue(float(timeout_seconds))
+                if worker.is_queue_busy():
+                    raise TimeoutError(
+                        f"host-segmented worker {engine_idx}, segment "
+                        f"{segment_idx + 1}/{segment_count}, is still busy after "
+                        f"{timeout_seconds:.1f}s")
+        return total_master_us
+
+    def preclear_flags(self, timeout_seconds: float = 5.0) -> None:
+        """Run a tiny program on every engine that just clears its flag.
+
+        Call once before the first execution: a flag left set by an earlier
+        program would make the first CHECK pass spuriously.
+        """
+        self._recover_stuck_engines()
+
+        for engine_idx, ue in enumerate(self.engines):
             assert not ue.is_capture_on, "preclear_flags() must run outside capture"
             ue.start_capture()
             ue.generate_instruction_flag_clear()
             ue.generate_instruction_halt()
             ue.stop_capture()
             addr = ue.get_program_dram_addr()
-            ue.write_captured_instructions_to_dram(addr)
-            ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
-            ue.clear_capture_buffer()
+            size = ue.get_capture_instruction_size_bytes()
+            try:
+                # Engine 0's master ISA is outside PrivateArena's worker
+                # slices and is checked by the concrete model. Workers can be
+                # protected here, before this runtime write occurs.
+                if engine_idx > 0 and self.arena is not None:
+                    self._check_isa_fits(engine_idx, addr, size)
+                written = ue.write_captured_instructions_to_dram(addr)
+                if written != size:
+                    raise IOError(
+                        f"engine {engine_idx} flag-preclear write returned "
+                        f"{written} of {size} bytes")
+                ue.allocate_program_dram(size)
+            finally:
+                ue.clear_capture_buffer()
             ue.start_execute_from_dram(addr)
             ue.wait_queue(timeout_seconds)
+            if ue.is_queue_busy():
+                raise TimeoutError(
+                    f"engine {engine_idx} flag-preclear program is still busy "
+                    f"after {timeout_seconds:.1f}s")
 
     def sharded_region(self, M: int, body: Callable[[ShardContext], None],
                        join: bool = True) -> None:
@@ -3206,9 +3522,15 @@ class MultiEngineScheduler:
             addr = ue.get_program_dram_addr()
             size = ue.get_capture_instruction_size_bytes()
             self._check_isa_fits(idx, addr, size)
-            ue.write_captured_instructions_to_dram(addr)
+            try:
+                written = ue.write_captured_instructions_to_dram(addr)
+                if written != size:
+                    raise IOError(
+                        f"engine {idx} persistent program upload wrote "
+                        f"{written} of {size} bytes")
+            finally:
+                ue.clear_capture_buffer()
             ue.allocate_program_dram(size)
-            ue.clear_capture_buffer()
             self._persistent_prog[idx] = addr
             self._persistent_body_word[idx] = user_dma_core.ue_35bit_addr_shifter(addr)
             # Slot for the per-token preamble, rewritten by start_workers when a runtime
@@ -3216,7 +3538,10 @@ class MultiEngineScheduler:
             self._persistent_preamble[idx] = ue.get_program_dram_addr()
             # One add_set per runtime register plus the jump into the body.
             _pre = 2 + (4 if gpr_tr else 0) + len(gpr_cm)
-            ue.allocate_program_dram(max(4, _pre) * user_dma_core.INSTRUCTION_SIZE_BYTES)
+            preamble_bytes = max(4, _pre) * user_dma_core.INSTRUCTION_SIZE_BYTES
+            self._check_isa_fits(
+                idx, self._persistent_preamble[idx], preamble_bytes)
+            ue.allocate_program_dram(preamble_bytes)
 
     def reset_workers(self) -> None:
         """Clear stale flags left set by an aborted run, so the next rendezvous is clean.
@@ -3237,8 +3562,16 @@ class MultiEngineScheduler:
             ue.generate_instruction_halt()
             ue.stop_capture()
             addr = ue.get_program_dram_addr()
-            ue.write_captured_instructions_to_dram(addr)
-            ue.clear_capture_buffer()
+            size = ue.get_capture_instruction_size_bytes()
+            try:
+                if self.arena is not None:
+                    self._check_isa_fits(idx, addr, size)
+                written = ue.write_captured_instructions_to_dram(addr)
+                if written != size:
+                    raise IOError(
+                        f"engine {idx} reset write returned {written} of {size} bytes")
+            finally:
+                ue.clear_capture_buffer()
             ue.program_execute(addr, timeout=1.0)
 
     # -- cross-engine argmax ------------------------------------------------
