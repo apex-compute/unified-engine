@@ -1,0 +1,49 @@
+{
+  "date": "2026-09-14",
+  "hardware": {
+    "host": "italy",
+    "build": "0xdf0749de",
+    "matching_source_commit": "df0749de3d4787b51a86a4d0a235e819a6fb52b7",
+    "axi_bits": 256,
+    "clock_mhz": 333.25,
+    "configuration_source": "user-programmed board; register identity verified"
+  },
+  "environment": {
+    "cpu": "Intel Core Ultra 9 285K",
+    "fpga_host_cpu_affinity": [
+      6
+    ],
+    "reference_cpu_affinity": [
+      7
+    ],
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "onnx_runtime_threads": 1,
+    "trace": false,
+    "clock_override": false
+  },
+  "validation": {
+    "native8k_host_tests": 89,
+    "existing16k_host_tests": 71,
+    "all_passed": true,
+    "spectral_frames_per_model": 7369,
+    "additional_audio_frames_per_model": 6007,
+    "contract_audit_frames_per_model": 2
+  },
+  "report_sha256": {
+    "audio_run_16k.json": "68fbf588e0198576471589595f0722bb7915664c43cd4c2637d8d945754344f0",
+    "audio_run_8k.json": "de418d1908d9b8cd43e5a6f4d1029171debdb83eb87e5684753bc41a0a2a54b2",
+    "comparison.json": "1e307568d36cbe786de468cfdb8fce8996efb32e3d00168a5f77eca85ec33c81",
+    "cpu_reference_16k.json": "dee65e6561ec94ca4a33ee952fdcf1060e38cf3d2f76ac0275711d811dd77edf",
+    "cpu_reference_8k.json": "b832f6264a28bf02310d56d369a5e5da34eb1a257d5fbfa312d85edcf3783097",
+    "cpu_summary.json": "be25e4bcedaa458f315b5991831b470514687c65d578b4fac078f6fc98bfd582",
+    "deployment_sections.json": "ae548a8cf2f7aeeba4e7d860b01c388e6130a32f12b02ec803f69a821d9f9f52",
+    "final_summary.json": "0c81e011e9a4001bacff844d396f836245548ce0f7a42b888c8a892d2e21eebf",
+    "frame_contract.json": "8b72406763239fffe936a0ab1bff85de2857cc3326175ddcc4f8d488082b8cef",
+    "listening_samples.json": "c129dfef62fe7176f9440183cee469204426c0e9e6fa9956e28ae8d22554e977",
+    "precision_audit.json": "e80dd18a1df354e95471d1872bc1e588682fb15cd3a4c02322ff9ff5f82a2d00",
+    "quality_sample_comparison.json": "108aaefa33497f4f269de8d83e0c54643791c56482e89c26be63919979f61d01",
+    "source_manifest.json": "c0583cf05ca69492997319340e265c55541dd1a829e5f8e512fafb4f3dbf37c4"
+  },
+  "reproduction_note": "Generated binaries and full recordings remain local build products. Listening sample copies are checked in with their own hash manifest."
+}

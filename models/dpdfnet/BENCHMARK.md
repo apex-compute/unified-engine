@@ -1,5 +1,9 @@
 # DPDFNet2 validation on Italy RK-256
 
+This page retains the September 13 measurements. The current matched-input
+8-kHz/16-kHz comparison on build `df0749de`, including audio real-time factors
+and a DRAM execution audit, is in [DUAL_RATE_BENCHMARK.md](DUAL_RATE_BENCHMARK.md).
+
 Measured on 2026-09-13 with the optimized `streaming-v2` artifact. Software
 lowering changes reduce FPGA frame latency from **23.981 to 13.447 ms**
 (43.93%, 1.78x throughput) with bit-identical output. Host frame latency falls

@@ -1,0 +1,145 @@
+{
+  "case": "p257_018",
+  "scope": "One matched clip, common 8 kHz band only; not full 16 kHz bandwidth or corpus quality qualification",
+  "corpus_quality_qualified": false,
+  "evaluation_sample_rate": 8000,
+  "method": "All complete source-rate 48 kHz waveforms independently resampled directly to 8 kHz using the same torchaudio filter; no preprocessing gain fitting, alignment fitting, normalization or trimming. Standard PESQ/STOI internals remain unchanged.",
+  "source_samples": 212093,
+  "evaluation_samples": 35349,
+  "source_provenance": {
+    "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/provenance.json",
+    "sha256": "da2ec363b41431af3aaa1446f4d05eb3232fb8b36e8dc0f769aff9c6ffd11a3d",
+    "cases_file_sha256": "81655a2033c2cc8fad20e461861a8ced41de927f1cef8c0fd05787ceced16d4c",
+    "dataset": "VoiceBank-DEMAND official test set (deterministic 20-pair subset)",
+    "dataset_doi": "https://doi.org/10.7488/ds/2117",
+    "case": {
+      "id": "p257_018",
+      "noise": "psquare",
+      "snr_db": 17.5,
+      "speaker": "p257",
+      "clean": "clean/p257_018.wav",
+      "noisy": "noisy/p257_018.wav",
+      "duration_s": 4.418604166666666,
+      "sample_rate": 48000,
+      "clean_sha256": "69adfee6f87adedd77a5a084dff8d5c627067ddb6e02448477595fad0c3713f0",
+      "noisy_sha256": "c2cc60d1fcd5386cb2ed6d2801fa6855fc66fe10ca9f1d8c7772b6e01a7cae1d",
+      "clean_source": {
+        "path": "clean/p257_018.wav",
+        "sha256": "69adfee6f87adedd77a5a084dff8d5c627067ddb6e02448477595fad0c3713f0",
+        "archive_member": "clean_testset_wav/p257_018.wav",
+        "archive_url": "https://datashare.ed.ac.uk/server/api/core/bitstreams/dec213d3-bf57-4777-9663-c24bdce92d5e/content",
+        "archive_member_crc32": "e4e7596b",
+        "bytes": 424230,
+        "samples": 212093,
+        "sample_rate": 48000,
+        "channels": 1,
+        "subtype": "PCM_16",
+        "duration_s": 4.418604166666666
+      },
+      "noisy_source": {
+        "path": "noisy/p257_018.wav",
+        "sha256": "c2cc60d1fcd5386cb2ed6d2801fa6855fc66fe10ca9f1d8c7772b6e01a7cae1d",
+        "archive_member": "noisy_testset_wav/p257_018.wav",
+        "archive_url": "https://datashare.ed.ac.uk/server/api/core/bitstreams/13c1bfbf-14a6-41db-9b41-8f7310f01ad5/content",
+        "archive_member_crc32": "a81e0583",
+        "bytes": 424230,
+        "samples": 212093,
+        "sample_rate": 48000,
+        "channels": 1,
+        "subtype": "PCM_16",
+        "duration_s": 4.418604166666666
+      }
+    }
+  },
+  "clean_reference": {
+    "waveform": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p257_018.wav",
+    "waveform_sha256": "69adfee6f87adedd77a5a084dff8d5c627067ddb6e02448477595fad0c3713f0",
+    "evaluation_float32_samples_sha256": "fb3a5ab3a600639ce086e2c8ec7499be76c9037ded2c368981c741b3a1b1f8a4"
+  },
+  "packages": {
+    "pesq": "0.0.4",
+    "pystoi": "0.4.1",
+    "torchaudio": "2.11.0.dev20260402+cu128",
+    "numpy": "2.4.2",
+    "soundfile": "0.14.0"
+  },
+  "script_sha256": "b8acafb765f56fb52ecf892094730c610aa24eba2de5cecc2b38be726c61140e",
+  "fpga_reconstruction_verification": {
+    "fpga8": {
+      "cpu_reference_manifest_sha256": "b832f6264a28bf02310d56d369a5e5da34eb1a257d5fbfa312d85edcf3783097",
+      "input_spectrum_sha256": "d4693976976548903cb39715ac9f89ca3eafbedcf95df9ea669fdfdcd243478d",
+      "output_spectrum_sha256": "c1b3ff6d227a213e553971705f9dbb88d338148c94cd0ce13053e01328c91a0a",
+      "onnx_sha256": "6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d",
+      "waveform_sample_bits_match_independent_synthesis": true
+    },
+    "fpga16": {
+      "cpu_reference_manifest_sha256": "dee65e6561ec94ca4a33ee952fdcf1060e38cf3d2f76ac0275711d811dd77edf",
+      "input_spectrum_sha256": "0ea84704889f72adedb4c1d377a683b4bffc32bb2cc6ec2392770f7b8bd2efdc",
+      "output_spectrum_sha256": "3901a54ec9040e1471660d5c109ad0219c8ffef6607d3e183a8e82fe08ec7543",
+      "onnx_sha256": "4f0ee28935b4a32abecc717d745416976565834d839601acf43031094b4dc94c",
+      "waveform_sample_bits_match_independent_synthesis": true
+    }
+  },
+  "scores": {
+    "noisy": {
+      "waveform": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_018.wav",
+      "waveform_sha256": "c2cc60d1fcd5386cb2ed6d2801fa6855fc66fe10ca9f1d8c7772b6e01a7cae1d",
+      "original_rate": 48000,
+      "original_samples": 212093,
+      "evaluation_samples": 35349,
+      "evaluation_float32_samples_sha256": "187ca7fd588b24f9887e702c779555849ac6c4d3701c96fd72a5d7b4bbd8df03",
+      "pesq_nb": 3.6701011657714844,
+      "stoi": 0.9883736212333033,
+      "delta_pesq_nb_vs_noisy": 0.0,
+      "delta_stoi_vs_noisy": 0.0
+    },
+    "cpu8": {
+      "waveform": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/reference/p257_018_cpu.wav",
+      "waveform_sha256": "d8717423453bf2f0abfe47ea441a1f93aa26c3b53f848a36b13c77bf7c53c6f0",
+      "original_rate": 48000,
+      "original_samples": 212093,
+      "evaluation_samples": 35349,
+      "evaluation_float32_samples_sha256": "6ef8b5681cf7d6a204223e13350709d6c5095eee1fe1882fa60542307dc1eed7",
+      "pesq_nb": 4.229587554931641,
+      "stoi": 0.9889288038222379,
+      "delta_pesq_nb_vs_noisy": 0.5594863891601562,
+      "delta_stoi_vs_noisy": 0.0005551825889346107
+    },
+    "fpga8": {
+      "waveform": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/p257_018_fpga.wav",
+      "waveform_sha256": "906d7408793b3b78d86f5d791dda801daf52be5b00835132a33b4534ea892659",
+      "original_rate": 48000,
+      "original_samples": 212093,
+      "evaluation_samples": 35349,
+      "evaluation_float32_samples_sha256": "b0587801f9c1f617fe108ab409136bd47cc0c121e72bb72ab3cd9b9c73d74c58",
+      "pesq_nb": 4.126782417297363,
+      "stoi": 0.988384745418837,
+      "delta_pesq_nb_vs_noisy": 0.4566812515258789,
+      "delta_stoi_vs_noisy": 1.1124185533728514e-05
+    },
+    "cpu16": {
+      "waveform": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/reference/p257_018_cpu.wav",
+      "waveform_sha256": "eebf57e374821d4bf79aa0598a04b8119e147cd77df047282f511e679e16fccd",
+      "original_rate": 48000,
+      "original_samples": 212093,
+      "evaluation_samples": 35349,
+      "evaluation_float32_samples_sha256": "a54b118ec9ab1e607a1b763263c947cb2fdfc7d1e6aa57f496878572ad3db83e",
+      "pesq_nb": 3.9165210723876953,
+      "stoi": 0.9658681893467904,
+      "delta_pesq_nb_vs_noisy": 0.24641990661621094,
+      "delta_stoi_vs_noisy": -0.022505431886512883
+    },
+    "fpga16": {
+      "waveform": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/p257_018_fpga.wav",
+      "waveform_sha256": "d2d4fafc0201e566c3d94cd0724defb6ed40f17afc1d9af4aaaf9bcbe4f2470d",
+      "original_rate": 48000,
+      "original_samples": 212093,
+      "evaluation_samples": 35349,
+      "evaluation_float32_samples_sha256": "f6b6844f3b7e1bafdd4e674d55977f5cf8f9cdfafe85a70e505507e007fd884c",
+      "pesq_nb": 3.637667179107666,
+      "stoi": 0.9620721201414432,
+      "delta_pesq_nb_vs_noisy": -0.03243398666381836,
+      "delta_stoi_vs_noisy": -0.026301501091860136
+    }
+  }
+}

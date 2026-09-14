@@ -13,6 +13,9 @@ This meets average throughput on the measured recording; individual host
 frames still exceed 10 ms. The optimized IF8 output matches the corrected
 baseline on 1,362 frames, including exact-zero silence. See
 [validation results](VALIDATION.md) for the sustained test and CPU agreement.
+The [matched 8-kHz/16-kHz benchmark](../dpdfnet/DUAL_RATE_BENCHMARK.md) compares
+both deployed bins on the same source recordings and verifies their per-hop
+DRAM transfer and execution sequence.
 
 Install the model-specific dependencies from the repository root, using an
 environment with the repository's matching `torch` and `torchaudio` packages:

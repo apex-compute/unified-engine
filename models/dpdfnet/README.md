@@ -7,10 +7,15 @@ FP32 `[1, 1, 161, 2]` plus a flat 45,424-element recurrent state, and returns
 one enhanced frame plus the next state. STFT and iSTFT are intentionally host
 operations and are not present in the ONNX graph.
 
+For the current comparison with the native 8-kHz model, including measured
+real-time factors, CPU agreement, listening samples and the verified DRAM
+execution sequence, see [DUAL_RATE_BENCHMARK.md](DUAL_RATE_BENCHMARK.md).
+
 Enhance a WAV directly using an existing bin on RK-256, from the repository root:
 
 ```bash
-python models/dpdfnet/dpdfnet_run_from_bin.py --device rk --dev xdma0 \
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python models/dpdfnet/dpdfnet_run_from_bin.py \
+  --device rk --dev xdma0 --cpu-core 6 \
   --input test_samples/apex.wav \
   --output models/dpdfnet/dpdfnet_bin/apex_enhanced_fpga.wav
 ```
@@ -27,6 +32,12 @@ reference uses the same audio framing and reconstruction.
 The file runner also accepts the existing `.npy` spectrum format. Each mode
 uploads the model once and uses one START/HALT per spectrum frame, including
 frames needed to flush audio at the end. No bin rebuild is needed to use WAV I/O.
+The runner writes `OUTPUT.metrics.json` with every frame's FPGA/host timing,
+deadline misses, real-time factor and hashes for the model, input and output.
+`--report` selects another report path. `--cpu-core` is optional; core 6 is
+used for the current Italy measurements. Both model runners reuse the same
+scalar DMA handle implementation and release device handles on completion
+or failure.
 
 The deployment contract is hardware-only for the complete ONNX neural graph:
 the compiler may use ONNX/PyTorch while building the artifact, but the eventual
@@ -44,7 +55,9 @@ uses no CPU neural-network operators and performs no intermediate host tensor
 transfers. The model image is uploaded once; each spectrum frame uses one input
 write, one program kick, one HALT and one output read.
 
-The checked-in source supports AXI-256 and AXI-512 devices. The generated ONNX
+The resident-bin compiler targets AXI-256. The runner checks the live transport
+before reset or upload; legacy v2 artifacts without explicit width metadata
+retain their compiler's AXI-256 contract. The generated ONNX
 and `dpdfnet2-andromeda.bin` files remain local build products under the ignored
 `dpdfnet_bin/` directory.
 
@@ -219,6 +232,5 @@ python models/dpdfnet/dpdfnet_eltwise_smoke.py \
   --device rk --dev xdma0
 ```
 
-The commands above select RK-256. AXI-512 hardware can be selected with
-`--device bittware_512`; the reported current benchmarks are from Italy's
-RK-256 device.
+The resident-bin commands above require RK-256 with compatible queue-CONFIG
+convolution hardware. The device label does not change the compiled transport.
