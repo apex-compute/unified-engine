@@ -21,6 +21,94 @@ class MemoryEngine(DmaMemoryEngine):
         self._isa_reg_counter = 1
         self.registers = {}
         self.dynamic_launches = 0
+        self._inst_ptr_counter = 1
+        self.pointers = {}
+        self.loop = None
+        self.capture_count = 0
+
+    def alloc_inst_ptr(self):
+        value = self._inst_ptr_counter
+        self._inst_ptr_counter += 1
+        return value
+
+    def release_inst_ptr(self, pointer):
+        self._inst_ptr_counter -= 1
+        self.pointers.pop(pointer)
+
+    def generate_instruction_pbi_init(self, inst_pointer_idx, **kwargs):
+        self.pointers[inst_pointer_idx] = kwargs.copy()
+
+    def get_program_dram_addr(self):
+        return 0xA0000000
+
+    def generate_instruction_jump_abs(self, address):
+        pass
+
+    def loop_start(self, loop_cnt):
+        assert self.loop is None
+        self.loop = (loop_cnt, [])
+
+    def loop_end(self):
+        count, operations = self.loop
+        self.loop = None
+        for operation, kwargs in operations:
+            if operation == self._dot:
+                pointer = self.pointers[kwargs["inst_pointer_idx"]]
+                self.launches.append((count, pointer["uram_length"] * 64, pointer["output_size"]))
+        for _ in range(count):
+            for operation, kwargs in operations:
+                operation(**kwargs)
+
+    def _submit(self, operation, kwargs):
+        if self.loop is not None:
+            self.loop[1].append((operation, kwargs.copy()))
+        else:
+            operation(**kwargs)
+
+    def start_queue_for_bf16_matvec_operation(self, **kwargs):
+        self._submit(self._dot, kwargs)
+
+    def _dot(self, *, vector_sram_start_addr, matrix_sram_start_addr,
+             output_sram_wb_addr, K, N, bias_enable=False,
+             inst_pointer_idx=None, **kwargs):
+        if inst_pointer_idx is None:
+            source, matrix, destination = vector_sram_start_addr, matrix_sram_start_addr, output_sram_wb_addr
+            self.launches.append((1, K, N))
+        else:
+            pointer = self.pointers[inst_pointer_idx]
+            source = pointer.get("uram_a_start_addr", 0) * 128
+            matrix = 0x80000 + pointer.get("uram_b_start_addr", 0) * 128
+            destination = pointer.get("uram_wb_addr", 0) * 128
+            K, N = pointer["uram_length"] * 64, pointer["output_size"]
+            pointer["uram_a_start_addr"] = source // 128 + vector_sram_start_addr // 128
+            pointer["uram_wb_addr"] = destination // 128 + output_sram_wb_addr // 128
+        assert source + K * 2 <= destination
+        assert destination + conv.shared._align_up(N, 64) * 2 <= conv.udc.URAM_NEAR_FULL_SIZE
+        vector = self.floats(source, K, sram=True)
+        weights = self.floats(matrix, N * K, sram=True).reshape(N, K)
+        output = weights @ vector
+        if bias_enable:
+            output += self.bias
+        packed = np.zeros(conv.shared._align_up(N, 64), dtype=np.float32)
+        packed[:N] = output
+        data = np.frombuffer(bf16_bytes(packed), dtype=np.uint8)
+        self.sram[destination:destination + data.size] = data
+
+    def sram_to_accelerator_memory(self, source, destination, elements,
+                                   *, inst_pointer_idx=None, **kwargs):
+        self._submit(self._write, dict(source=source, destination=destination,
+                                      elements=elements, inst_pointer_idx=inst_pointer_idx, **kwargs))
+
+    def _write(self, *, source, destination, elements, inst_pointer_idx=None, **kwargs):
+        if inst_pointer_idx is not None:
+            pointer = self.pointers[inst_pointer_idx]
+            actual_source = pointer.get("uram_a_start_addr", 0) * 128
+            actual_destination = pointer["dram_shared_addr"]
+            kwargs["memcpy_length_bytes"] = pointer["dma_length"]
+            pointer["uram_a_start_addr"] = (actual_source + source) // 128
+            pointer["dram_shared_addr"] += destination
+            source, destination = actual_source, actual_destination
+        super().sram_to_accelerator_memory(source, destination, elements, **kwargs)
 
     def alloc_isa_reg(self):
         register = self._isa_reg_counter
@@ -83,9 +171,11 @@ class Bf16ConvTests(unittest.TestCase):
         output = engine.floats(self.OUTPUT, conv.packed_bytes(plan["output_shape"]) // 2).reshape(length, -1)
         np.testing.assert_array_equal(output[:, channels:], 0)
         self.assertTrue(np.isfinite(output).all())
-        self.assertTrue(all(1 <= row[0] <= 64 for row in engine.launches))
+        self.assertTrue(all(1 <= row[0] <= 1024 for row in engine.launches))
         self.assertEqual(engine._isa_reg_counter, 1)
         self.assertEqual(engine.registers, {})
+        self.assertEqual(engine._inst_ptr_counter, 1)
+        self.assertEqual(engine.pointers, {})
         return torch.from_numpy(output[:, :channels].copy()), engine
 
     def test_regular_im2col_padding_stride_dilation_and_tail(self):
@@ -111,7 +201,7 @@ class Bf16ConvTests(unittest.TestCase):
                 expected = F.conv1d(padded, weight, bias, stride=stride, dilation=dilation)[0].T.bfloat16().float()
                 torch.testing.assert_close(actual, expected, rtol=.008, atol=1e-6)
                 if length == 131 and stride == 1:
-                    self.assertEqual([item[0] for item in engine.launches], [64, 64, 3])
+                    self.assertEqual([item[0] for item in engine.launches], [131])
 
     def test_patch_dma_is_byte_exact_with_compact_native_capture(self):
         generator = np.random.default_rng(9741)
@@ -151,11 +241,65 @@ class Bf16ConvTests(unittest.TestCase):
         bias = (torch.randn(65) * .01).bfloat16().float()
         plan = conv.prepare_conv1d("dynamic", weight, bias,
                                    **self.args(values.shape), padding=27, dilation=9)
+        plan["use_sram"] = False
         actual, engine = self.execute(plan, values)
         expected = F.conv1d(values.T[None], weight, bias, padding=27, dilation=9)[0].T.bfloat16().float()
         torch.testing.assert_close(actual, expected, rtol=.008, atol=1e-6)
         self.assertEqual(engine.dynamic_launches, 1)
         self.assertEqual([row[0] for row in engine.launches], [64, 3])
+
+    def test_sram_windows_cross_tile_limits_and_skip_patch_dram(self):
+        for length, inputs, outputs, kernel, stride, dilation, padding in (
+                (2051, 48, 65, 7, 1, 1, 3),
+                (635, 768, 65, 7, 1, 1, 3),
+                (151, 65, 48, 7, 6, 9, 27),
+                (95, 768, 65, 7, 1, 9, 27)):
+            with self.subTest(length=length, inputs=inputs, dilation=dilation):
+                values = torch.randn(length, inputs).bfloat16().float()
+                weight = (torch.randn(outputs, inputs, kernel) * .01).bfloat16().float()
+                bias = (torch.randn(outputs) * .01).bfloat16().float()
+                plan = conv.prepare_conv1d("sram", weight, bias, **self.args(values.shape),
+                                           stride=stride, dilation=dilation, padding=padding)
+                actual, engine = self.execute(plan, values)
+                expected = F.conv1d(values.T[None], weight, bias, stride=stride,
+                                    dilation=dilation, padding=padding)[0].T.bfloat16().float()
+                torch.testing.assert_close(actual, expected, rtol=.008, atol=1e-6)
+                self.assertFalse(any(kind == "write" and plan["patch_address"] <= destination
+                                     < plan["scratch_address"] + plan["scratch_bytes"]
+                                     for kind, _, destination, _ in engine.transfers))
+                if length > 600:
+                    self.assertGreater(max(item[0] for item in engine.launches), 64)
+
+    def test_sram_capture_reuses_weights_and_bounds_all_jump_targets(self):
+        old = conv.udc.UE_AXI_DATA_WIDTH_BITS
+        conv.udc.UE_AXI_DATA_WIDTH_BITS = 256
+        try:
+            for shape, weight_shape, options in (
+                    ((2051, 48), (48, 48, 7), dict(padding=3)),
+                    ((635, 768), (768, 768, 7), dict(padding=3)),
+                    ((635, 768), (768, 768, 7), dict(padding=27, dilation=9))):
+                with self.subTest(shape=shape, options=options):
+                    plan = conv.prepare_conv1d("capture_sram", torch.zeros(weight_shape),
+                                               **self.args(shape), **options)
+                    counts = {}
+                    for fast in (False, True):
+                        plan["use_sram"] = fast
+                        engine = conv.shared._WholeGraphEngine(self.image.align(128))
+                        engine.start_capture()
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            conv.emit_conv(engine, plan, zero_address=self.zero)
+                        counts[fast] = engine.capture_count
+                        self.assertEqual(conv.udc.check_isa_jumps(engine.capture_buffer, engine._program_dram_base), [])
+                        self.assertEqual(engine._isa_reg_counter, 1)
+                        self.assertEqual(engine._inst_ptr_counter, 1)
+                    if options.get("dilation", 1) == 1:
+                        self.assertLess(counts[True], counts[False])
+                    else:
+                        # Dilation residues trade a few more static loop
+                        # headers for fewer weight loads and no patch DRAM.
+                        self.assertLess(counts[True], 4096)
+        finally:
+            conv.udc.UE_AXI_DATA_WIDTH_BITS = old
 
     def test_transpose_polyphases_include_padding_and_last_samples(self):
         for length, inputs, outputs, stride, padding, extra in (

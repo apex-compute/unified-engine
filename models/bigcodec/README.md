@@ -13,6 +13,8 @@
 
 The CPU reference uses the pinned official FP32 checkpoint. The FPGA implementation runs the complete encoder, quantizer and decoder using either IF8 or BF16 convolution weights. It remains **experimental**: token choices and reconstructed waveforms differ from FP32, and both measured FPGA modes are slower than real time. See the [benchmarks and audio samples](validation/20260914_italy/README.md).
 
+The current compiler includes an SRAM optimization candidate. Software tests and compilation pass, but its FPGA RTF and accuracy are **not yet measured** because Italy's board interface changed after the baseline run. The linked audio benchmarks describe the earlier implementation. See the [optimization status](validation/20260914_optimization/README.md).
+
 ## Setup
 
 From the repository root, in a Python environment with the FPGA driver's dependencies:
@@ -37,7 +39,9 @@ python models/bigcodec/bigcodec_run_from_bin.py \
   --input input.wav --output reconstructed_fpga.wav
 ```
 
-Use `--force` to replace an existing compiled bin. `--conv-precision bf16` uses device im2col and BF16 matrix multiplication; `--conv-precision if8` uses native IF8 convolutions and is the CLI default. BF16 was faster and had lower end-to-end waveform error on the reported samples. Compilation is offline and requires the checkpoint. Execution needs only the deployment bin and input audio. The bin contains both packed parameters and the captured instruction program.
+Use `--force` to replace an existing compiled bin. `--conv-precision bf16` reuses overlapping input windows in SRAM for BF16 matrix multiplication; `--conv-precision if8` uses native IF8 convolutions and is the CLI default. BF16 was faster and had lower end-to-end waveform error in the baseline measurements. Compilation is offline and requires the checkpoint. Execution needs only the deployment bin and input audio. The bin contains both packed parameters and the captured instruction program.
+
+Recurrent weights default to BF16. Add `--lstm-precision encoder-if8` to stream IF8 recurrent weights in the encoder, or `--lstm-precision if8` for both encoder and decoder. Input projections and gate/state arithmetic remain BF16. These options reduce recurrent weight traffic and introduce an additional quantization tradeoff; their FPGA accuracy and timing are pending validation.
 
 The runner uploads the model image once, writes the padded input to DRAM, issues one START, waits for the terminal HALT, then reads one output bundle containing the waveform and tokens. All neural operations, including recurrent state updates and codebook selection, execute on the FPGA. Host processing reads/resamples the input and writes the output WAV and token NPZ.
 
@@ -81,4 +85,4 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m unittest discover \
 
 Tests cover upstream source integrity, token/audio metadata, convolution padding and transpose phases, activation math, LSTM gates/state reset, quantizer selection, graph memory planning and the single START/HALT runtime protocol. Hardware results are reported separately from software emulation.
 
-The FPGA Snake approximation folds its BF16 argument into a sine period and evaluates a degree-10 sine-squared polynomial, clamping argument magnitude at 32π. Quantized alias filters preserve symmetry and exact unit DC gain. Tanh uses an odd Padé [7/6] approximation with arguments clamped to ±4 and output to ±1, preserving quiet values that `2*sigmoid(2*x)-1` loses in BF16. Codebook comparisons use BF16 scores and choose the lowest token ID on ties; positive BF16 subnormal differences flush to zero on this board. These precision changes can alter tokens and reconstructed audio.
+The FPGA Snake approximation folds its BF16 argument into a sine period and evaluates a degree-10 sine-squared polynomial, clamping argument magnitude at 32π. Quantized alias filters preserve symmetry and exact unit DC gain. Tanh uses an odd Padé [7/6] approximation with arguments clamped to ±4 and output to ±1, preserving quiet values that `2*sigmoid(2*x)-1` loses in BF16. Codebook comparisons use BF16 scores and choose the lowest token ID on ties. The baseline comparison flushed positive BF16 subnormal differences to zero; the new MAXPOOL path needs separate hardware validation. These precision changes can alter tokens and reconstructed audio.

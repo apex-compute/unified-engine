@@ -1,0 +1,107 @@
+[
+  {
+    "variant": "bf16",
+    "bin": "models/bigcodec/bigcodec_bin/bigcodec-p232_007-sram-v2-bf16.bin",
+    "bin_sha256": "a79679475b984161eab06dd2510e7cb0929256d2ed3f0d1f80dfd22de38b272d",
+    "serialized_bytes": 414949807,
+    "resident_bytes": 414909248,
+    "parameter_bytes": 331251584,
+    "program_bytes": 83657664,
+    "instructions": 2614302,
+    "instructions_by_type": {
+      "conv1d": 65070,
+      "activation": 1440798,
+      "add": 1464,
+      "lstm": 508072,
+      "quantizer": 567133,
+      "conv_transpose1d": 5960,
+      "tanh": 25804
+    },
+    "precision": {
+      "convolutions": "BF16",
+      "activations": "BF16",
+      "lstm_input_weights": "BF16",
+      "lstm_recurrent_weights": {
+        "encoder": "BF16",
+        "decoder": "BF16"
+      }
+    },
+    "compiled_samples": 63400,
+    "code_frames": 317,
+    "operations": 180,
+    "model_sha256": "a4a10be9c7fb0b38ca28df515981657b28d8c6f103e790317749a0e8a031a35c",
+    "program_sha256": "c990a7b376e254276ba0a94c462055b76b76a75f2b14146001c58cece6ee8394",
+    "software_artifact_validation": "passed",
+    "hardware_validation": "pending compatible FPGA and PCIe rescan"
+  },
+  {
+    "variant": "encoder-if8",
+    "bin": "models/bigcodec/bigcodec_bin/bigcodec-p232_007-sram-encoder-if8.bin",
+    "bin_sha256": "8c2b0dba1846abce2fda2e9e0da547e99c8d2f48c2fdf9bb87d226b41d00b339",
+    "serialized_bytes": 394961071,
+    "resident_bytes": 394920512,
+    "parameter_bytes": 312967040,
+    "program_bytes": 81953472,
+    "instructions": 2561046,
+    "instructions_by_type": {
+      "conv1d": 65070,
+      "activation": 1440798,
+      "add": 1464,
+      "lstm": 454816,
+      "quantizer": 567133,
+      "conv_transpose1d": 5960,
+      "tanh": 25804
+    },
+    "precision": {
+      "convolutions": "BF16",
+      "activations": "BF16",
+      "lstm_input_weights": "BF16",
+      "lstm_recurrent_weights": {
+        "encoder": "IF8-INT",
+        "decoder": "BF16"
+      }
+    },
+    "compiled_samples": 63400,
+    "code_frames": 317,
+    "operations": 180,
+    "model_sha256": "1be0c1a93984b44802f9de3f7c74ce74e7ced9bc74a7dbf71b8032debed2a9dc",
+    "program_sha256": "791b548d0e604dbcc4e6c1a16df3aa9098635047d806da7070fbef13fd373cf6",
+    "software_artifact_validation": "passed",
+    "hardware_validation": "pending compatible FPGA and PCIe rescan"
+  },
+  {
+    "variant": "if8",
+    "bin": "models/bigcodec/bigcodec_bin/bigcodec-p232_007-sram-lstm-if8.bin",
+    "bin_sha256": "3041ba1d0b40c749c6be33316e0576ddbfe8507f345d13d670de5a1564564a6c",
+    "serialized_bytes": 374972335,
+    "resident_bytes": 374931776,
+    "parameter_bytes": 294682496,
+    "program_bytes": 80249280,
+    "instructions": 2507790,
+    "instructions_by_type": {
+      "conv1d": 65070,
+      "activation": 1440798,
+      "add": 1464,
+      "lstm": 401560,
+      "quantizer": 567133,
+      "conv_transpose1d": 5960,
+      "tanh": 25804
+    },
+    "precision": {
+      "convolutions": "BF16",
+      "activations": "BF16",
+      "lstm_input_weights": "BF16",
+      "lstm_recurrent_weights": {
+        "encoder": "IF8-INT",
+        "decoder": "IF8-INT"
+      }
+    },
+    "compiled_samples": 63400,
+    "code_frames": 317,
+    "operations": 180,
+    "model_sha256": "98aa313e189d3f6d771f6897123e0f7a53d13241cc048b65e63d3dae44f304c3",
+    "program_sha256": "34162a19f6a75da2cf5fd86330f58e7902e3f672ff7361867630ee5de903bc5f",
+    "software_artifact_validation": "passed",
+    "hardware_validation": "pending compatible FPGA and PCIe rescan"
+  }
+]

@@ -5,9 +5,10 @@ pointwise arithmetic. A 13-level hard tournament replaces dynamic argmax and
 embedding gather. Tokens use two BF16 integers (low 8 bits, high 5 bits), since a
 single BF16 value cannot represent all 8192 integer token IDs exactly.
 
-The RK 256-bit build 0xdf0749de flushes positive subnormal score differences
-(less than 2**-126) to zero. The tournament treats those differences as ties
-and keeps the left candidate; normal finite differences compare correctly.
+The original identity-dot comparison on RK 256-bit build 0xdf0749de flushed
+positive subnormal score differences (less than 2**-126) to zero. The SRAM
+MAXPOOL comparison needs separate hardware validation of subnormal behavior;
+software tests cover both ideal BF16 and input-flushing arithmetic.
 """
 from __future__ import annotations
 
@@ -85,6 +86,7 @@ class QuantizerPlan:
     scratch: dict[str, int]
     constants: dict[str, int]
     small_gathers: dict[int, tuple[int, int]]
+    use_sram_tournament: bool = True
 
 
 def prepare_quantizer(quantizer, image, *, source_address: int,
@@ -175,13 +177,22 @@ def prepare_quantizer(quantizer, image, *, source_address: int,
                          constants, gathers)
 
 
+def _sram_positive_mask(engine, source, elements, *, scratch_address):
+    from bigcodec_device import sram_clamp, sram_scale
+    for scalar in (2.0 ** 126, 128.0, None):
+        sram_clamp(engine, source, source, elements,
+                   scratch_address=scratch_address, lo=0.0, hi=1.0)
+        if scalar is not None:
+            sram_scale(engine, source, source, elements, scalar)
+
+
 def emit_positive_mask(engine, *, source: int, destination: int, elements: int,
                        identity_address: int) -> None:
     """Emit a finite 0/1 comparison mask, subject to device subnormal flushing.
 
     Clamping before each scale keeps every intermediate finite. 2**126 followed
     by 2**7 also covers subnormals when the arithmetic preserves them. Exhaustive
-    RK 256-bit build 0xdf0749de testing found exactly 127 mismatches against
+    Testing the original identity-dot mask on RK build 0xdf0749de found 127 mismatches against
     IEEE x > 0: every positive BF16 subnormal was flushed to zero. All normal
     finite inputs and zeros matched. Consequently a positive score gap below
     2**-126 is treated as a tie, keeping the left candidate. This is a measured
@@ -189,18 +200,54 @@ def emit_positive_mask(engine, *, source: int, destination: int, elements: int,
     """
     if elements < WIDTH or elements % WIDTH:
         raise ValueError("Mask element count must be a positive multiple of 64")
-    for scalar in (2.0 ** 126, 128.0, None):
-        engine.activation_core(
-            M=elements // WIDTH, N=WIDTH,
-            A_DRAM_ADDR=source, OUTPUT_DRAM_ADDR=destination,
-            IDENTITY_DRAM_ADDR=identity_address, activation="clamp",
-            clamp_min=0.0, clamp_max=1.0)
-        if scalar is not None:
-            engine.eltwise_core_dram(
-                M=1, N=elements, dram_a=destination, dram_b=None,
-                dram_out=destination, mode=udc.UE_MODE.MUL_BROADCAST,
-                scalar=scalar)
-        source = destination
+    # Keep every rounding boundary, but load/store each tile only once. The
+    # native wide MAXPOOL comparator replaces the three identity-matrix dots.
+    # identity_address remains part of the public interface for existing plans.
+    for offset in range(0, elements, 32768):
+        take = min(32768, elements - offset)
+        engine.accelerator_memory_to_sram(source + offset * 2, 0, take)
+        _sram_positive_mask(engine, 0, take, scratch_address=0x20000)
+        engine.sram_to_accelerator_memory(0, destination + offset * 2, take)
+
+
+def _emit_sram_tournament(engine, plan):
+    """Reduce 8192 candidates to 64 entirely in SRAM, preserving BF16 choices.
+
+    The last six rounds retain the existing gather-matrix implementation for
+    sub-vector candidate counts. A/B banks and all temporary ranges are fixed
+    and disjoint; each multiply and addition still writes BF16 independently.
+    """
+    from bigcodec_device import sram_copy, sram_scale, sram_shift
+    current, following = 0, 0x30000
+    mask, clamp_work, inverse, work = 0x60000, 0x62000, 0x66000, 0x68000
+    mask_b, inverse_b, product_b = 0x80000, 0x82000, 0x84000
+    engine.accelerator_memory_to_sram(plan.constants['payload'], current,
+                                      (PAYLOAD_ROWS - 1) * CODEBOOK_SIZE)
+    engine.accelerator_memory_to_sram(
+        plan.scratch['ping'] + SCORE_ROW * CODEBOOK_SIZE * 2,
+        current + SCORE_ROW * CODEBOOK_SIZE * 2, CODEBOOK_SIZE)
+    count = CODEBOOK_SIZE
+    while count > WIDTH:
+        half = count // 2
+        left_score = current + SCORE_ROW * count * 2
+        right_score = left_score + half * 2
+        sram_copy(engine, left_score, mask_b, half)
+        engine.eltwise_sub_core(right_score, mask_b, mask, half)
+        _sram_positive_mask(engine, mask, half, scratch_address=clamp_work)
+        sram_copy(engine, mask, mask_b, half)
+        # The mask is exactly 0 or 1, so this matches rounded(1-mask) exactly.
+        sram_scale(engine, mask, inverse, half, -1)
+        sram_shift(engine, inverse, inverse, half, 1)
+        sram_copy(engine, inverse, inverse_b, half)
+        for row in range(PAYLOAD_ROWS):
+            left = current + row * count * 2
+            right = left + half * 2
+            engine.eltwise_mul_core(left, inverse_b, product_b, half)
+            engine.eltwise_mul_core(right, mask_b, work, half)
+            engine.eltwise_add_core(work, product_b, following + row * half * 2, half)
+        current, following = following, current
+        count = half
+    engine.sram_to_accelerator_memory(current, plan.scratch['ping'], PAYLOAD_ROWS * WIDTH)
 
 
 def _emit_rsqrt(engine, source: int, destination: int, rows: int, identity: int):
@@ -242,14 +289,18 @@ def emit_quantizer(engine, plan: QuantizerPlan) -> None:
 
     for frame in range(frames):
         current, following = s["ping"], s["pong"]
-        engine.accelerator_memcpy(c["payload"], current,
-                                  (PAYLOAD_ROWS - 1) * CODEBOOK_SIZE * 2)
+        if not plan.use_sram_tournament:
+            engine.accelerator_memcpy(c["payload"], current,
+                                      (PAYLOAD_ROWS - 1) * CODEBOOK_SIZE * 2)
         engine.matmat_mul_core(
             M=1, K=WIDTH, N=CODEBOOK_SIZE,
             A_DRAM_ADDR=s["normalized"] + frame * WIDTH * 2,
             B_DRAM_ADDR=c["score_weight"],
             OUTPUT_DRAM_ADDR=current + SCORE_ROW * CODEBOOK_SIZE * 2)
         count = CODEBOOK_SIZE
+        if plan.use_sram_tournament:
+            _emit_sram_tournament(engine, plan)
+            count = WIDTH
         while count > 1:
             half = count // 2
             next_stride = max(WIDTH, half)

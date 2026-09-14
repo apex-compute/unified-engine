@@ -15,9 +15,11 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from bigcodec_activation import (SNAKE_ARGUMENT_LIMIT, activation_scratch_bytes,
-                                emit_activation, prepare_activation,
+                                emit_activation, emit_activation_dram, prepare_activation,
                                 quantize_filter_dc, sine_squared)
-from bigcodec_device import channels, clamp, gather_rows, scale, scatter_rows, shift, udc
+from bigcodec_device import (channels, clamp, clamp_wide, gather_rows, scale,
+                            scatter_rows, shift, sram_clamp, sram_copy,
+                            sram_maximum, udc)
 from bigcodec_vq.activations import SnakeBeta
 from bigcodec_vq.alias_free_torch.act import Activation1d
 from test_bigcodec_quantizer import MemoryEngine as QuantizerMemoryEngine
@@ -63,6 +65,8 @@ class MemoryEngine(QuantizerMemoryEngine):
         chunk = stride_bytes_per_chunk or size
         jump = stride_jump_bytes or size
         assert chunk % 128 == jump % 128 == 0 and size % chunk == 0
+        if self.watch is not None and read and source == self.watch.alpha and 'upsampled' not in self.snapshots:
+            self.snapshots['upsampled'] = self.view(self.watch.scratch, 2 * self.watch.rows * self.watch.width).float().clone()
         for i in range(size // chunk):
             if read:
                 value = self.view(source + i * jump, chunk // 2)
@@ -71,6 +75,9 @@ class MemoryEngine(QuantizerMemoryEngine):
                 value = self.sram[(source + i * chunk) // 2:][:chunk // 2]
                 self.view(destination + i * jump, chunk // 2).copy_(value)
         self.transfers.append((read, source, destination, size, chunk, jump))
+        if (self.watch is not None and not read and source == 0
+                and self.watch.scratch <= destination < self.watch.scratch + 4 * self.watch.rows * self.watch.width):
+            self.snapshots['snake'] = self.view(self.watch.scratch, 2 * self.watch.rows * self.watch.width).float().clone()
 
     def accelerator_memory_to_sram(self, source, destination, elements, *,
                                    memcpy_length_bytes=None,
@@ -194,8 +201,78 @@ class ActivationTests(unittest.TestCase):
                     expected = module(x)
                     self.assertLess(float(torch.linalg.vector_norm(out - expected) / torch.linalg.vector_norm(expected)), .025)
                     self.assertEqual(engine._isa_reg_counter, 1)
-                    if length == 65:
-                        self.assertEqual(engine.dynamic_clamps, 10)
+                    self.assertEqual(engine.dynamic_clamps, 0)
+
+    def test_sram_activation_is_bf16_exact_against_original_lowering_across_tiles(self):
+        for length, logical in ((1, 48), (17, 65), (259, 65), (45, 1536)):
+            with self.subTest(length=length, channels=logical):
+                fast, fast_plan, _, _ = fixture(length, logical)
+                reference, reference_plan, _, _ = fixture(length, logical)
+                emit_activation(fast, fast_plan)
+                emit_activation_dram(reference, reference_plan)
+                count = length * fast_plan.width
+                torch.testing.assert_close(fast.view(fast_plan.destination, count),
+                    reference.view(reference_plan.destination, count), rtol=0, atol=0)
+                self.assertEqual(fast.matmul_shapes, [])
+
+    def test_wide_clamp_finite_bf16_values_and_inplace_workspace(self):
+        bits = torch.arange(65536).to(torch.uint16)
+        values = bits.view(torch.bfloat16)
+        values[~torch.isfinite(values)] = 0
+        for lower, upper in ((0, float('inf')), (-.25, .5), (0, 1)):
+            for inplace in (False, True):
+                engine = MemoryEngine()
+                source = engine.allocate(values)
+                output = source if inplace else engine.allocate(torch.full_like(values, float('nan')))
+                clamp_wide(engine, source, output, values.numel(), lower, upper)
+                torch.testing.assert_close(engine.view(output, values.numel()),
+                    values.clamp(lower, upper), rtol=0, atol=0)
+                self.assertEqual(engine.matmul_shapes, [])
+        # A bounded SRAM clamp must preserve unrelated gate/state workspaces.
+        engine = MemoryEngine()
+        engine.sram.fill_(3.5)
+        engine.sram[:4096].copy_(torch.linspace(-4, 4, 4096).bfloat16())
+        before = engine.sram.clone()
+        sram_clamp(engine, 0, 0, 4096, scratch_address=0x20000, lo=-1, hi=1)
+        torch.testing.assert_close(engine.sram[:4096], before[:4096].clamp(-1, 1), rtol=0, atol=0)
+        untouched = torch.ones_like(before, dtype=torch.bool)
+        untouched[:4096] = False
+        untouched[0x20000 // 2:0x20000 // 2 + 8192] = False
+        torch.testing.assert_close(engine.sram[untouched], before[untouched], rtol=0, atol=0)
+
+    def test_sram_maximum_and_copy_validate_geometry_and_preserve_finite_bits(self):
+        engine = MemoryEngine()
+        bits = torch.arange(65536).to(torch.uint16)
+        values = bits.view(torch.bfloat16)
+        values[~torch.isfinite(values)] = 0
+        engine.sram[:values.numel()].copy_(values)
+        sram_copy(engine, 0, 0x80000, values.numel())
+        torch.testing.assert_close(engine.sram[0x80000 // 2:][:values.numel()].view(torch.uint16),
+                                   values.view(torch.uint16), rtol=0, atol=0)
+        for left, right, destination, count in ((0, 128, 0, 128),
+                (0, 0x80000, 0, 64), (0, 0x10000, 128, 128),
+                (0, 0x10000, 0, 131072), (0, 0x7FF80, 0, 128)):
+            with self.assertRaises(ValueError):
+                sram_maximum(engine, left, right, destination, count)
+
+    def test_sram_activation_capture_reduces_instructions_without_identity_dots(self):
+        _, plan, _, _ = fixture(1024, 64)
+        counts = []
+        for operation in (emit_activation_dram, emit_activation):
+            engine = _WholeGraphEngine(0x98000000)
+            with patch.object(udc, 'UE_AXI_DATA_WIDTH_BITS', 256), contextlib.redirect_stdout(io.StringIO()):
+                engine.start_capture()
+                operation(engine, plan)
+                engine.generate_instruction_halt()
+                engine.stop_capture()
+            self.assertEqual(udc.check_isa_jumps(engine.capture_buffer, 0x98000000, name='activation SRAM'), [])
+            counts.append(engine.capture_count)
+            if operation is emit_activation:
+                modes = [udc._inst_desc_bits(inst.words, 172, 175) for inst in engine.capture_buffer
+                         if (inst.words[0] >> 8) & 15 == udc.INSTRUCTION_UE_OP]
+                self.assertNotIn(udc.UE_MODE.BF16_DOT_PRODUCT, modes)
+                self.assertIn(udc.UE_MODE.MAXPOOL, modes)
+        self.assertLess(counts[1], counts[0] // 2)
 
     def test_clamp_dynamic_rows_keep_values_inplace_and_release_register(self):
         for rows in (1, 127, 128, 800, 4097):
