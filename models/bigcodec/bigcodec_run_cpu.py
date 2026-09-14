@@ -42,7 +42,10 @@ def main() -> None:
     args.metrics = args.metrics or (args.output or args.tokens).with_suffix(".metrics.json")
     output_paths = [p.resolve() for p in (args.output, args.metrics, args.tokens if args.mode != "decode" else None) if p is not None]
     input_paths = [p.resolve() for p in (args.input, args.checkpoint, args.tokens if args.mode == "decode" else None) if p is not None]
-    if len(set(output_paths)) != len(output_paths) or set(output_paths) & set(input_paths):
+    hardlink_collision = any(output.exists() and other.exists() and output.samefile(other)
+        for index, output in enumerate(output_paths)
+        for other in input_paths + output_paths[index + 1:])
+    if len(set(output_paths)) != len(output_paths) or set(output_paths) & set(input_paths) or hardlink_collision:
         parser.error("Input, checkpoint, token and output files must have distinct paths")
     if args.cpu_core is not None:
         if args.cpu_core not in os.sched_getaffinity(0):

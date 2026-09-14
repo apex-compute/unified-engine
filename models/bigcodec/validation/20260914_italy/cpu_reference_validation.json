@@ -1,0 +1,140 @@
+{
+  "format": "bigcodec-cpu-reference-validation-v1",
+  "upstream_revision": "09845ab1f5bc7a3d1589c16de820ef15bc2afefe",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "torch_version": "2.12.0.dev20260405+cu128",
+  "threads": 1,
+  "cpu_affinity": [
+    7
+  ],
+  "source_file": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p232_005.wav",
+  "source_sha256": "89b1ebdeabff150a3cc12629178e5b98a2366e052f3e8028ea853c2059f69494",
+  "cases": [
+    {
+      "case": "zero_200",
+      "input_samples": 200,
+      "padded_samples": 400,
+      "token_count": 2,
+      "tokens": [
+        2550,
+        6023
+      ],
+      "encoder_max_abs": 0.0,
+      "tokens_equal": true,
+      "official_waveform": {
+        "max_abs": 0.0,
+        "relative_l2": 0.0
+      },
+      "token_decode_vs_official": {
+        "max_abs": 5.35146682523191e-09,
+        "relative_l2": 5.561714984793202e-05
+      },
+      "finite": true
+    },
+    {
+      "case": "speech_6400",
+      "input_samples": 6400,
+      "padded_samples": 6600,
+      "token_count": 33,
+      "tokens": [
+        4563,
+        3899,
+        180,
+        7286,
+        4701,
+        1689,
+        1961,
+        317,
+        2062,
+        5179,
+        6241,
+        6129,
+        1730,
+        3644,
+        5868,
+        2983,
+        4718,
+        5370,
+        7159,
+        2944,
+        5027,
+        79,
+        6928,
+        7423,
+        867,
+        4800,
+        6336,
+        4667,
+        5850,
+        5427,
+        3425,
+        3949,
+        1986
+      ],
+      "encoder_max_abs": 0.0,
+      "tokens_equal": true,
+      "official_waveform": {
+        "max_abs": 0.0,
+        "relative_l2": 0.0
+      },
+      "token_decode_vs_official": {
+        "max_abs": 2.9569491744041443e-08,
+        "relative_l2": 9.971213016300356e-07
+      },
+      "finite": true
+    },
+    {
+      "case": "speech_6401",
+      "input_samples": 6401,
+      "padded_samples": 6600,
+      "token_count": 33,
+      "tokens": [
+        4563,
+        3899,
+        180,
+        7286,
+        4701,
+        1689,
+        1961,
+        317,
+        2062,
+        5179,
+        6241,
+        6129,
+        1730,
+        3644,
+        5868,
+        2983,
+        4718,
+        5370,
+        7159,
+        2944,
+        5027,
+        79,
+        6928,
+        7423,
+        867,
+        4800,
+        6336,
+        4667,
+        5850,
+        5427,
+        3425,
+        3949,
+        1986
+      ],
+      "encoder_max_abs": 0.0,
+      "tokens_equal": true,
+      "official_waveform": {
+        "max_abs": 0.0,
+        "relative_l2": 0.0
+      },
+      "token_decode_vs_official": {
+        "max_abs": 1.909211277961731e-08,
+        "relative_l2": 9.70493558796625e-07
+      },
+      "finite": true
+    }
+  ],
+  "passed": true
+}

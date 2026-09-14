@@ -1,0 +1,15 @@
+[
+  {
+    "name": "clamp_126800",
+    "instructions": 114,
+    "model_bytes": 11840,
+    "program_sha256": "bf148ace71d8ffe7fdb1684235841fd7a99a41b5794ffa24e89c46010684f7c6",
+    "model_sha256": "84e0da7bcffebaf58bc3ca1949d318ef195c3abfc88f103b228fe716cd2509d7",
+    "host_s": 0.06352449900077772,
+    "fpga_s": 0.049276495123780954,
+    "finite": true,
+    "hardware_version": "0xdf0749de",
+    "axi_data_width_bits": 256,
+    "mismatches": 0
+  }
+]
