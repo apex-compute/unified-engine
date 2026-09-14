@@ -2,7 +2,7 @@
   "model": "dpdfnet2_8khz",
   "reference_manifest": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/cpu_reference_manifest.json",
   "reference_manifest_sha256": "b76f71c5c9d145b3c5ae0ece4c50516f685ea9bdb770fb6c0c2d12d59690e17a",
-  "fpga_directory": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_rk256/optimized_if8_fused",
+  "fpga_directory": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_df0749de/shared_full",
   "deadline_ms": 10.0,
   "expected_axi_data_width_bits": 256,
   "accuracy_screen": {
@@ -19,23 +19,23 @@
   "cases_smoke_pass": 0,
   "host_timing": {
     "frames": 1362,
-    "mean_ms": 10.33937075477623,
-    "p95_ms": 10.738085348566528,
-    "p99_ms": 10.971675770560978,
-    "max_ms": 13.36754800286144,
-    "deadline_misses": 1292,
-    "deadline_miss_fraction": 0.9486049926578561,
-    "rtf_at_10ms_hop": 1.033937075477623
+    "mean_ms": 9.805072232746099,
+    "p95_ms": 10.078992299997935,
+    "p99_ms": 10.20456155991724,
+    "max_ms": 12.723592999918765,
+    "deadline_misses": 175,
+    "deadline_miss_fraction": 0.12848751835535976,
+    "rtf_at_10ms_hop": 0.9805072232746099
   },
   "fpga_timing": {
     "frames": 1362,
-    "mean_ms": 9.455930185189468,
-    "p95_ms": 9.46042670667667,
-    "p99_ms": 9.462549797449363,
-    "max_ms": 9.464798199549888,
+    "mean_ms": 9.069726955968068,
+    "p95_ms": 9.074172543135784,
+    "p99_ms": 9.07525569392348,
+    "max_ms": 9.076525131282821,
     "deadline_misses": 0,
     "deadline_miss_fraction": 0.0,
-    "rtf_at_10ms_hop": 0.9455930185189467
+    "rtf_at_10ms_hop": 0.9069726955968068
   },
   "cases": [
     {
@@ -55,23 +55,23 @@
       "timing": {
         "host": {
           "frames": 402,
-          "mean_ms": 10.333534554887937,
-          "p95_ms": 10.741855248488719,
-          "p99_ms": 10.95118339304463,
-          "max_ms": 11.183686001459137,
-          "deadline_misses": 380,
-          "deadline_miss_fraction": 0.945273631840796,
-          "rtf_at_10ms_hop": 1.0333534554887938
+          "mean_ms": 9.805103427870607,
+          "p95_ms": 10.0502908499152,
+          "p99_ms": 10.211611649963288,
+          "max_ms": 12.723592999918765,
+          "deadline_misses": 47,
+          "deadline_miss_fraction": 0.11691542288557213,
+          "rtf_at_10ms_hop": 0.9805103427870607
         },
         "fpga": {
           "frames": 402,
-          "mean_ms": 9.455950375653615,
-          "p95_ms": 9.460330682670667,
-          "p99_ms": 9.461628927231807,
-          "max_ms": 9.462829707426856,
+          "mean_ms": 9.06979091041417,
+          "p95_ms": 9.074410202550638,
+          "p99_ms": 9.075708447111777,
+          "max_ms": 9.076525131282821,
           "deadline_misses": 0,
           "deadline_miss_fraction": 0.0,
-          "rtf_at_10ms_hop": 0.9455950375653615
+          "rtf_at_10ms_hop": 0.906979091041417
         },
         "qualification_exclusions": [],
         "observed_deadline_pass": false
@@ -81,12 +81,12 @@
       "cpu_sha256": "25d49ccf65c80a06377ec92d10c8debed98d35141ed4e427a9c96aa750ae56e3",
       "fpga_sha256": "0caf8c5b3aa6e648f0d0d1ca2c409aa222e2ed6397786063c126a33e0fe7f5bd",
       "cpu_neural_ms_per_frame": 0.6417693162006234,
-      "log_sha256": "d875acd4b26534232a2ad9e9bb5310ce8aaa522eb61db0eb02e2161e21c49170",
-      "metrics_sha256": "ef85774ec05706d5b21e4b05adcf8f92799f838cdfb98d999a7cb83508a66cf9",
+      "log_sha256": "b3297444a0aa436d79f6886491b53896883ee69bbb339437d289004c78363019",
+      "metrics_sha256": "85e7fbccfb4c314eb335f36378fa2f6196294d21d5cdf0e9346d09b0d50e5d0c",
       "hardware": {
         "axi_data_width_bits": 256,
-        "hardware_version": "0x5fbbfbf0",
-        "bin_sha256": "37bdf8af02858343366b20c950183e2849e1983aa9ea68730584fca225dc500d"
+        "hardware_version": "0xdf0749de",
+        "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d"
       }
     },
     {
@@ -106,23 +106,23 @@
       "timing": {
         "host": {
           "frames": 448,
-          "mean_ms": 10.335600307923544,
-          "p95_ms": 10.661034247459611,
-          "p99_ms": 10.847188192274189,
-          "max_ms": 11.021367012290284,
-          "deadline_misses": 429,
-          "deadline_miss_fraction": 0.9575892857142857,
-          "rtf_at_10ms_hop": 1.0335600307923545
+          "mean_ms": 9.821772366065217,
+          "p95_ms": 10.098357849960848,
+          "p99_ms": 10.190670189995217,
+          "max_ms": 10.741861000042263,
+          "deadline_misses": 72,
+          "deadline_miss_fraction": 0.16071428571428573,
+          "rtf_at_10ms_hop": 0.9821772366065217
         },
         "fpga": {
           "frames": 448,
-          "mean_ms": 9.455721787589754,
-          "p95_ms": 9.460124231057764,
-          "p99_ms": 9.461968372093024,
-          "max_ms": 9.463453863465867,
+          "mean_ms": 9.069665845032686,
+          "p95_ms": 9.074028507126782,
+          "p99_ms": 9.074729002250564,
+          "max_ms": 9.076093023255813,
           "deadline_misses": 0,
           "deadline_miss_fraction": 0.0,
-          "rtf_at_10ms_hop": 0.9455721787589754
+          "rtf_at_10ms_hop": 0.9069665845032686
         },
         "qualification_exclusions": [],
         "observed_deadline_pass": false
@@ -132,12 +132,12 @@
       "cpu_sha256": "2cc480b9e5816a82399d80687098af5531a68ec95c65b3f9f48fc75dafeb4c07",
       "fpga_sha256": "c1b3ff6d227a213e553971705f9dbb88d338148c94cd0ce13053e01328c91a0a",
       "cpu_neural_ms_per_frame": 0.6466552854687636,
-      "log_sha256": "4e81ebcbeb7100480c3b6db6e4e32d20127606085253bce271e7187497d0336f",
-      "metrics_sha256": "b697cc2518a0f57d2e8b57006a0deabc18b3a24dc3a0dc795f0c307b4f166200",
+      "log_sha256": "94aa8d627ee081eab32d428a43b090a4be4b261f49d527c2f12db72e3b0918d4",
+      "metrics_sha256": "32d32087498e56a039f14808cab019cc5fad632ee0c71141a4d9144a0c63a449",
       "hardware": {
         "axi_data_width_bits": 256,
-        "hardware_version": "0x5fbbfbf0",
-        "bin_sha256": "37bdf8af02858343366b20c950183e2849e1983aa9ea68730584fca225dc500d"
+        "hardware_version": "0xdf0749de",
+        "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d"
       }
     },
     {
@@ -157,23 +157,23 @@
       "timing": {
         "host": {
           "frames": 128,
-          "mean_ms": 10.387677874405199,
-          "p95_ms": 10.948471701703966,
-          "p99_ms": 11.105796901247231,
-          "max_ms": 13.36754800286144,
-          "deadline_misses": 121,
-          "deadline_miss_fraction": 0.9453125,
-          "rtf_at_10ms_hop": 1.03876778744052
+          "mean_ms": 9.798047117175912,
+          "p95_ms": 10.0585867998916,
+          "p99_ms": 10.297834520042672,
+          "max_ms": 11.616163000098823,
+          "deadline_misses": 11,
+          "deadline_miss_fraction": 0.0859375,
+          "rtf_at_10ms_hop": 0.9798047117175912
         },
         "fpga": {
           "frames": 128,
-          "mean_ms": 9.455906226556639,
-          "p95_ms": 9.460683570892725,
-          "p99_ms": 9.46303615903976,
-          "max_ms": 9.464366091522882,
+          "mean_ms": 9.069676669167292,
+          "p95_ms": 9.074122130532633,
+          "p99_ms": 9.074591687921982,
+          "max_ms": 9.075948987246813,
           "deadline_misses": 0,
           "deadline_miss_fraction": 0.0,
-          "rtf_at_10ms_hop": 0.9455906226556638
+          "rtf_at_10ms_hop": 0.9069676669167291
         },
         "qualification_exclusions": [],
         "observed_deadline_pass": false
@@ -183,12 +183,12 @@
       "cpu_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee",
       "fpga_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee",
       "cpu_neural_ms_per_frame": 0.6621606877388331,
-      "log_sha256": "a34dbbfb4c3bca291d91eb9992ab8a0ec513a70c23b753c316600a4623450735",
-      "metrics_sha256": "31a21a42658e7753bd4aec7f19422a56fef75c5d147b2aeffc302ce77023f0a9",
+      "log_sha256": "50ea141fed671dbbd870a28a0294eb2d5ebf2fb8210d9e2c96c1f6f100fda1dd",
+      "metrics_sha256": "06191c17123f801e9bd9f0bd25944ff6ebadd12d912cb382feee521d3d8d2cc8",
       "hardware": {
         "axi_data_width_bits": 256,
-        "hardware_version": "0x5fbbfbf0",
-        "bin_sha256": "37bdf8af02858343366b20c950183e2849e1983aa9ea68730584fca225dc500d"
+        "hardware_version": "0xdf0749de",
+        "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d"
       }
     },
     {
@@ -208,23 +208,23 @@
       "timing": {
         "host": {
           "frames": 384,
-          "mean_ms": 10.3337770079861,
-          "p95_ms": 10.711369905766333,
-          "p99_ms": 10.922530760144582,
-          "max_ms": 11.140457005240023,
-          "deadline_misses": 362,
-          "deadline_miss_fraction": 0.9427083333333334,
-          "rtf_at_10ms_hop": 1.03337770079861
+          "mean_ms": 9.787897791667888,
+          "p95_ms": 10.07724420002205,
+          "p99_ms": 10.194886709887214,
+          "max_ms": 10.236055999939708,
+          "deadline_misses": 45,
+          "deadline_miss_fraction": 0.1171875,
+          "rtf_at_10ms_hop": 0.9787897791667888
         },
         "fpga": {
           "frames": 384,
-          "mean_ms": 9.45616016504126,
-          "p95_ms": 9.460976444111028,
-          "p99_ms": 9.462837869467366,
-          "max_ms": 9.464798199549888,
+          "mean_ms": 9.069748062015504,
+          "p95_ms": 9.074316579144787,
+          "p99_ms": 9.07512654163541,
+          "max_ms": 9.076381095273819,
           "deadline_misses": 0,
           "deadline_miss_fraction": 0.0,
-          "rtf_at_10ms_hop": 0.945616016504126
+          "rtf_at_10ms_hop": 0.9069748062015505
         },
         "qualification_exclusions": [],
         "observed_deadline_pass": false
@@ -234,12 +234,12 @@
       "cpu_sha256": "56348582c9f4b5ea535edf4d3a6afa1fd459c7908accb36802a0137d61c58dd5",
       "fpga_sha256": "a9fcdff49b33d04b5dcd3a514370affab1440d66d44737c2b49a3b5b72869466",
       "cpu_neural_ms_per_frame": 0.6303088621658995,
-      "log_sha256": "0c5513a15502e13e276a2cee9b42ee0874a36ccfd17884c9c6449f390189f70c",
-      "metrics_sha256": "7a24ecf1165f6873016b7f7d779451bb978a8a6af8943d59fa1b1908c4a80fe5",
+      "log_sha256": "4b41b71455ed3088326bc623d7207585f4cde23c71f370bcd089dd56ac4b49f6",
+      "metrics_sha256": "a429ced70d6112ec61564572db177b84dfd7ec4d2cffaa580802c0c0260596f3",
       "hardware": {
         "axi_data_width_bits": 256,
-        "hardware_version": "0x5fbbfbf0",
-        "bin_sha256": "37bdf8af02858343366b20c950183e2849e1983aa9ea68730584fca225dc500d"
+        "hardware_version": "0xdf0749de",
+        "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d"
       }
     }
   ]

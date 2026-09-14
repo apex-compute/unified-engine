@@ -474,16 +474,19 @@ from dpdfnet8khz_conv import ConvTransposeOptimizationMixin
 from dpdfnet8khz_pack import PairPackOptimizationMixin
 from dpdfnet8khz_reduce import ReductionOptimizationMixin
 from dpdfnet8khz_state_shift import StateShiftOptimizationMixin
+from dpdfnet8khz_reshape import CoefficientReshapeOptimizationMixin
+from dpdfnet8khz_reshape80 import Reshape80OptimizationMixin
 
 
-class OptimizedGraphCompiler(StateShiftOptimizationMixin, PairPackOptimizationMixin,
+class OptimizedGraphCompiler(CoefficientReshapeOptimizationMixin, Reshape80OptimizationMixin,
+                             StateShiftOptimizationMixin, PairPackOptimizationMixin,
                              ReductionOptimizationMixin, ConvTransposeOptimizationMixin,
                              CopyOptimizationMixin, GraphCompiler):
     """Native IF8 compiler with fused arithmetic and SRAM layout operations."""
 
     optimization_names = ("conv-transpose-n2", "conv-relu", "state-copy-batching",
                           "state-shift128", "complex-pair-unpack", "complex-pair-pack",
-                          "complex-reduce")
+                          "complex-reduce", "coefficient-reshape128", "row80-unpadding")
 
 
 def main():
