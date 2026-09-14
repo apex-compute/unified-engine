@@ -1,0 +1,36 @@
+{
+  "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/validation/speech_6400_cpu.wav",
+  "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/validation/speech_6400_fpga_bf16_final.wav",
+  "reference_sha256": "4d8c87fa7b269854be9f4971b8ad838dede23a415effc0b0d144e2690143714f",
+  "actual_sha256": "58171292749aea942c87a244e2ef38ac8b80f20d2df9573cd06f3b6bf6367567",
+  "sample_rate": 16000,
+  "samples": 6400,
+  "channels": 1,
+  "duration_s": 0.4,
+  "finite": true,
+  "alignment": "original sample indices; no gain, delay or polarity fitting",
+  "metric_status": {
+    "relative_l2": "finite",
+    "snr_db": "finite",
+    "cosine_similarity": "finite"
+  },
+  "relative_l2": 0.2726717091585794,
+  "snr_db": 11.287198392152833,
+  "max_abs_error": 0.008740013465285301,
+  "rmse": 0.0011662774619031068,
+  "reference_rms": 0.004277222105300361,
+  "actual_rms": 0.0038950327102761605,
+  "cosine_similarity": 0.9635612180670959,
+  "tokens": {
+    "count": 33,
+    "equal": 22,
+    "mismatches": 11,
+    "match_fraction": 0.6666666666666666,
+    "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/validation/speech_6400.tokens.npz",
+    "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/validation/speech_6400_fpga_bf16_final.tokens.npz",
+    "reference_sha256": "4f75ba51f6e5ba9aac6851dbe2f7b16054aef0021ad90c483de104520032b440",
+    "actual_sha256": "71a107b6d20f04d0e37ffc0bfafe579be95c99bedae298bf970bb5e22e3b7b22",
+    "source_sha256": "66ada5357392310b69bbf6a01868b172d581dda9f4a4d9ffa0f5425d7d53fb10",
+    "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9"
+  }
+}

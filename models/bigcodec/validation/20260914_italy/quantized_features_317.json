@@ -1,0 +1,9 @@
+{
+  "scope": "hardware program prefix through quantizer; comparison on exact selected token IDs",
+  "frames": 317,
+  "tokens_repeat_identical": true,
+  "relative_l2": 0.0029087194707244635,
+  "maximum_frame_relative_l2": 0.004069704562425613,
+  "frames_above_1_percent": [],
+  "finite": true
+}
