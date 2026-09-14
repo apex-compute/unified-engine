@@ -1,0 +1,40 @@
+{
+  "recorded_at_utc": "2026-09-14T18:26:25.880736+00:00",
+  "host": "italy",
+  "initial_build_register": "0x364c8440",
+  "initial_hw_info": "0xdeadbeef",
+  "bitstream": "/home/hunlu/apexcompute/andromeda/pcie_utils/andromeda_pcie_bit-df0749de3d4787b51a86a4d0a235e819a6fb52b7/andromeda_wrapper.bit",
+  "bitstream_sha256": "c55a1136dcabcef519242368c69ef68fb78c282e4ebefbc8e5d03038fddeb11c",
+  "jtag_target": "localhost:3121/xilinx_tcf/Xilinx/0ABC01A",
+  "device": "xcku5p_0",
+  "programming_method": "JTAG volatile configuration",
+  "programming_succeeded": true,
+  "expected_build": "0xdf0749de",
+  "expected_hw_info": "0x80214d40",
+  "programming_log_sha256": "bc141df66fb2a580016f21584be350e8b2926061181a0b271c84456ec606dbe8",
+  "post_program_registers": "0xffffffff",
+  "runtime_verified": false,
+  "status": "Following CI update, PCIe and both BF16 frame contracts passed on build 40519e0a",
+  "latest_retry": {
+    "at_utc": "2026-09-14T20:10:42.209683+00:00",
+    "pci_device": "0000:85:00.0",
+    "device_node": "/dev/xdma0_user",
+    "vendor_device": "0x903410ee",
+    "pci_command": "0x0",
+    "bar0_config": "0x0",
+    "bar1_config": "0x0",
+    "core_registers": "0xffffffff",
+    "rescan_attempt": "rescan_xilinx.sh: /sys/bus/pci/devices/0000:85:00.0/remove: Permission denied",
+    "rtf_measured": false
+  },
+  "post_ci_validation": {
+    "recorded_at_utc": "2026-09-14T21:06:28.951635+00:00",
+    "observed_build": "0x40519e0a",
+    "hw_info_raw": "0x80214d40",
+    "axi_data_width_bits": 256,
+    "frequency_mhz": 333.25,
+    "pci_access_restored": true,
+    "bf16_frame_contract_passed": true,
+    "source_identity_scope": "Register build stamp observed after user/CI update; matching bitstream/source not independently inspected."
+  }
+}

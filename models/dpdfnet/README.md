@@ -12,11 +12,13 @@ real-time factors, CPU agreement, listening samples and the verified DRAM
 execution sequence, see [DUAL_RATE_BENCHMARK.md](DUAL_RATE_BENCHMARK.md).
 The [noisy-audio report](validation/20260914_noisy20s/README.md) includes eight
 tests over 20 seconds, both models’ FPGA WAVs, and KU5P resource utilization.
+The [BF16 comparison](validation/20260914_bf16/README.md) measures both models
+against their quantized bins on the same FPGA build and noisy recordings.
 
 Enhance a WAV directly using an existing bin on RK-256, from the repository root:
 
 ```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python models/dpdfnet/dpdfnet_run_from_bin.py \
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python models/dpdfnet/dpdfnet16khz_if4_if8_weights_test.py \
   --device rk --dev xdma0 --cpu-core 6 \
   --input test_samples/apex.wav \
   --output models/dpdfnet/dpdfnet_bin/apex_enhanced_fpga.wav
@@ -134,10 +136,38 @@ Compile the pinned ONNX graph into one stateful Andromeda image:
 python models/dpdfnet/dpdfnet_compile.py --force
 ```
 
+Choose the test file for the dense convolution weight precision:
+
+| Dense weights | Test entry point |
+| --- | --- |
+| BF16 | [dpdfnet16khz_bf16_weights_test.py](dpdfnet16khz_bf16_weights_test.py) |
+| IF4/IF8 (12 IF4, 3 IF8 convolutions) | [dpdfnet16khz_if4_if8_weights_test.py](dpdfnet16khz_if4_if8_weights_test.py) |
+
+Other learned weights and activations use BF16. Each named test selects its
+matching bin, checks the encoded precision before FPGA access, and uses a
+distinct default output filename. `--bin` accepts another artifact only with
+the same precision. The generic `dpdfnet_run_from_bin.py` is shared by these tests.
+
+For BF16 convolution weights, build a separate bin and select it explicitly:
+
+```bash
+python models/dpdfnet/dpdfnet_compile.py --conv-precision bf16
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python models/dpdfnet/dpdfnet16khz_bf16_weights_test.py \
+  --device rk --dev xdma0 --cpu-core 6 \
+  --input path/to/noisy.wav --output /tmp/dpdfnet_16khz_bf16.wav
+```
+
+This retains BF16 weights and activations throughout the graph. Dense
+convolutions use device im2col and BF16 matrix instructions; the existing
+internal arithmetic and single START/HALT per hop remain unchanged. The
+default compiler still uses the existing IF4/IF8 convolution policy.
+Read `steady_audio_rtf` in the output metrics: values below 1 mean average
+processing is faster than audio arrival. Check deadline misses separately.
+
 Run one or more precomputed spectrum frames entirely through the FPGA graph:
 
 ```bash
-python models/dpdfnet/dpdfnet_run_from_bin.py \
+python models/dpdfnet/dpdfnet16khz_if4_if8_weights_test.py \
   --input /tmp/dpdfnet_apex_16.npy \
   --output /tmp/dpdfnet_apex_16_hw.npy \
   --device rk --dev xdma0
@@ -146,7 +176,7 @@ python models/dpdfnet/dpdfnet_run_from_bin.py \
 Export the final frame's chronological 8192-event trace tail:
 
 ```bash
-python models/dpdfnet/dpdfnet_run_from_bin.py \
+python models/dpdfnet/dpdfnet16khz_if4_if8_weights_test.py \
   --input /tmp/dpdfnet_apex_16.npy \
   --output /tmp/dpdfnet_apex_16_hw.npy \
   --device rk --dev xdma0 \

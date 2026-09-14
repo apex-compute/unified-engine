@@ -27,6 +27,7 @@ for search_path in (ROOT, YOLO_HELPERS):
 
 import user_dma_core as udc
 import yolov5_precompiled as shared
+import dpdfnet_bf16_conv as bf16_conv
 from yolov5_common import quantize_conv_for_andromeda
 from nn_lib import tanh_core_dram
 from dpdfnet_common import (
@@ -43,7 +44,10 @@ from dpdfnet_precompiled import (
 class GraphCompiler:
     """Static-shape ONNX-to-Andromeda compiler for the pinned DPDFNet2 graph."""
 
-    def __init__(self, onnx, model, digest: str):
+    def __init__(self, onnx, model, digest: str, *, conv_precision="auto"):
+        if conv_precision not in ("auto", "bf16"):
+            raise ValueError("conv_precision must be auto or bf16")
+        self.conv_precision = conv_precision
         self.onnx = onnx
         self.model = onnx.shape_inference.infer_shapes(model)
         self.digest = digest
@@ -484,6 +488,13 @@ class GraphCompiler:
                     "output_transposed": output_transposed,
                     "output_rows": output_rows,
                 }
+                if (self.conv_precision == "bf16"
+                        and int(attrs.get("group", 1)) == 1):
+                    self.conv_aux[index]["bf16_workspace"] = self._allocate_aux(
+                        f"@conv/{index}/bf16_patches",
+                        bf16_conv.workspace_shape(
+                            packed_source, packed_output,
+                            self.initializers[node.input[1]].shape))
             if node.op_type == "GRU":
                 attrs = {
                     value.name: self.onnx.helper.get_attribute_value(value)
@@ -760,6 +771,11 @@ class GraphCompiler:
                     self.initializers[node.input[2]], dtype=np.float32))
             group = int(attrs.get("group", 1))
             if group == 1:
+                if self.conv_precision == "bf16":
+                    resources[index] = bf16_conv.prepare_conv(
+                        self.emitter, packed_source_layout, packed_output_layout,
+                        attrs, weight, bias, aux["bf16_workspace"])
+                    continue
                 conv = torch.nn.Conv2d(
                     weight.shape[1], weight.shape[0], tuple(weight.shape[2:]),
                     stride=tuple(attrs.get("strides", (1, 1))), padding=0,
@@ -1666,6 +1682,8 @@ class GraphCompiler:
             shared._emit_conv(
                 self.emitter.engine, resource["plan"],
                 self.emitter.zero_address)
+        elif resource["kind"] == "dense_bf16":
+            bf16_conv.emit_conv(self.emitter.engine, resource)
         else:
             self._emit_depthwise_conv(index, node, resource)
         self._unstage_conv_output(index, node)
@@ -1896,7 +1914,15 @@ class GraphCompiler:
         return {
             "format": FORMAT,
             "onnx_sha256": self.digest,
-            "precision": "BF16/IF8-INT",
+            "precision": ("BF16" if self.conv_precision == "bf16"
+                          else "BF16/IF4/IF8"),
+            "dense_convolution_precision": ("BF16" if self.conv_precision == "bf16"
+                                            else "IF4/IF8"),
+            "dense_convolutions": [
+                {"node_index": index, **resource}
+                for index, resource in self.conv_resources.items()
+                if resource["kind"] == "dense_bf16"
+            ],
             "full_graph": True,
             "one_halt": True,
             "stateful": True,
@@ -1918,11 +1944,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--download", action="store_true")
-    parser.add_argument(
-        "--output", type=Path,
-        default=HERE / "dpdfnet_bin" / "dpdfnet2-andromeda.bin")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--conv-precision", choices=("auto", "bf16"), default="auto",
+                        help="dense convolution weights: existing IF4/IF8 policy or BF16")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
+    if args.output is None:
+        suffix = "-bf16" if args.conv_precision == "bf16" else ""
+        args.output = HERE / "dpdfnet_bin" / f"dpdfnet2{suffix}-andromeda.bin"
     try:
         import onnx
     except ImportError:
@@ -1941,7 +1970,8 @@ def main() -> None:
     # lines.  Keep the CLI deterministic and concise; exceptions still escape.
     diagnostics = io.StringIO()
     with contextlib.redirect_stdout(diagnostics):
-        hardware = GraphCompiler(onnx, model, digest).compile()
+        hardware = GraphCompiler(
+            onnx, model, digest, conv_precision=args.conv_precision).compile()
     payload = {
         "format": FORMAT,
         "model": "dpdfnet2",
