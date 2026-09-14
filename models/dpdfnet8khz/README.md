@@ -7,10 +7,12 @@ hop, 81 frequency bins and 37,860 recurrent-state values. The ONNX graph
 has 492 operations. The existing 16-kHz port remains under `models/dpdfnet/`.
 
 CPU and FPGA audio execution are verified on Italy's RK AXI-256 with
-queue-CONFIG convolution, build `0x5fbbfbf0` from run `34787221985`.
-The optimized IF8 output matches the corrected baseline on 1,362 frames,
-including exact-zero silence. See [validation results](VALIDATION.md) for
-CPU waveform agreement and the measured 10-ms deadline results.
+queue-CONFIG convolution, current build `0xdf0749de`. A 60-second audio file
+took 59.21 seconds to process, including host audio framing and reconstruction.
+This meets average throughput on the measured recording; individual host
+frames still exceed 10 ms. The optimized IF8 output matches the corrected
+baseline on 1,362 frames, including exact-zero silence. See
+[validation results](VALIDATION.md) for the sustained test and CPU agreement.
 
 Install the model-specific dependencies from the repository root, using an
 environment with the repository's matching `torch` and `torchaudio` packages:
@@ -55,8 +57,8 @@ python models/dpdfnet8khz/dpdfnet8khz_compile.py --download --optimize --force
 On a compatible RK-256 queue-CONFIG build, run audio from that bin:
 
 ```bash
-python models/dpdfnet8khz/dpdfnet8khz_run_from_bin.py \
-  --device rk --dev xdma0 \
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python models/dpdfnet8khz/dpdfnet8khz_run_from_bin.py \
+  --device rk --dev xdma0 --cpu-core 6 \
   --input test_samples/p232_007.wav \
   --output models/dpdfnet8khz/dpdfnet8khz_bin/enhanced_fpga.wav
 ```
@@ -67,9 +69,15 @@ hop. Neural operations stay on the FPGA; audio framing and reconstruction run
 on the host. The runner verifies the artifact checksum and compiled AXI width
 before resetting or uploading. `--device rk` labels the target; it cannot
 change the physical FPGA build. Incompatible AXI-512 builds are rejected.
+The measured Italy runs use one host math thread and pin the runner to CPU
+core 6. `--cpu-core` is
+optional; choose an available core on another machine or omit it. Pinning
+does not guarantee every frame finishes within 10 ms.
 
 The optimized compiler uses IF8 dense convolution weights, fuses eligible
 convolution/ReLU operations, and rearranges state and complex values in SRAM.
+The native runner reuses DMA handles with scalar read/write transfers and
+closes them on completion or failure.
 Keep a separate artifact when comparing further compiler changes:
 
 ```bash

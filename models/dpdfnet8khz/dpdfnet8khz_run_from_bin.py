@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -28,6 +29,7 @@ for search_path in (HERE, ROOT, YOLO_HELPERS):
 import user_dma_core as udc
 from dpdfnet8khz_precompiled import WholeGraphBackend, load_artifact, validate_runtime_hardware
 from dpdfnet8khz_common import sha256
+from dpdfnet8khz_engine import StreamingEngine
 from yolov5_common import configure_hardware_runtime
 
 
@@ -67,12 +69,20 @@ def main() -> None:
     parser.add_argument("--dev", default="xdma0")
     parser.add_argument("--cycle", type=float, default=None)
     parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--cpu-core", type=int,
+                        help="pin the host thread to an available CPU core for stable timing")
     parser.add_argument("--report", type=Path,
                         help="summary and per-frame timings JSON; default: OUTPUT.metrics.json")
     parser.add_argument(
         "--trace-tail", type=Path, metavar="DIR",
         help="export the final frame's last 8192 hardware events")
     args = parser.parse_args()
+    if args.cpu_core is not None:
+        if not hasattr(os, "sched_setaffinity"):
+            parser.error("--cpu-core requires CPU affinity support")
+        if args.cpu_core not in os.sched_getaffinity(0):
+            parser.error("--cpu-core is not available to this process")
+        os.sched_setaffinity(0, {args.cpu_core})
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--timeout must be finite and positive")
     audio_mode = args.input.suffix.lower() != ".npy"
@@ -120,27 +130,30 @@ def main() -> None:
     if audio_input is not None:
         print(f"Audio: {audio_input.source_samples / audio_input.source_sample_rate:.3f} s, "
               f"{audio_input.source_sample_rate} Hz; host STFT/iSTFT, mono output")
-    engine = udc.UnifiedEngine(
+    engine = StreamingEngine(
         clock_period_ns=clock,
         conv_geometry_mode=udc.CONV_GEOMETRY_QUEUE_CONFIG)
-    engine.software_reset(run_dram_self_test=False)
-    backend = WholeGraphBackend(
-        engine, payload, axi_data_width_bits=hw_info.axi_data_width_bits,
-        timeout_s=args.timeout)
-
-    outputs, frame_seconds, frame_cycles = [], [], []
-    started = time.perf_counter()
-    with torch.inference_mode():
-        for frame_index, frame in enumerate(frames):
-            # Trace export is deliberately armed only for the final kick.
-            if args.trace_tail is not None and frame_index + 1 == len(frames):
-                backend.trace_tail_path = args.trace_tail
-            frame_started = time.perf_counter()
-            cycles_before = backend.cycles
-            outputs.append(backend.execute(frame).float().numpy())
-            frame_seconds.append(time.perf_counter() - frame_started)
-            frame_cycles.append(backend.cycles - cycles_before)
-    execution_s = time.perf_counter() - started
+    try:
+        engine.software_reset(run_dram_self_test=False)
+        backend = WholeGraphBackend(
+            engine, payload, axi_data_width_bits=hw_info.axi_data_width_bits,
+            timeout_s=args.timeout)
+        outputs, frame_seconds, frame_cycles = [], [], []
+        started = time.perf_counter()
+        with torch.inference_mode():
+            for frame_index, frame in enumerate(frames):
+                # Trace export is deliberately armed only for the final kick.
+                if args.trace_tail is not None and frame_index + 1 == len(frames):
+                    backend.trace_tail_path = args.trace_tail
+                frame_started = time.perf_counter()
+                cycles_before = backend.cycles
+                outputs.append(backend.execute(frame).float().numpy())
+                frame_seconds.append(time.perf_counter() - frame_started)
+                frame_cycles.append(backend.cycles - cycles_before)
+        execution_s = time.perf_counter() - started
+        hardware_version = f"0x{engine.get_hardware_version():08x}"
+    finally:
+        engine.close()
     output = np.stack(outputs)
     postprocess_started = time.perf_counter()
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -165,7 +178,10 @@ def main() -> None:
         "bin_sha256": bin_digest,
         "input_sha256": input_digest,
         "output_sha256": sha256(args.output),
-        "hardware_version": f"0x{engine.get_hardware_version():08x}",
+        "hardware_version": hardware_version,
+        "dma_io": "cached-scalar-read-write",
+        "host_cpu_affinity": (sorted(os.sched_getaffinity(0))
+                              if hasattr(os, "sched_getaffinity") else None),
         "axi_data_width_bits": hw_info.axi_data_width_bits,
         "hw_info_raw": f"0x{hw_info.raw:08x}",
         "detected_clock_ns": detected_clock,
