@@ -1,0 +1,1079 @@
+{
+  "comparison": "Matched-source native 8 kHz and existing 16 kHz DPDFNet2 deployments",
+  "source_manifest_sha256": "c0583cf05ca69492997319340e265c55541dd1a829e5f8e512fafb4f3dbf37c4",
+  "scope": "Each FPGA is compared with its own pinned CPU model. Different sample rates/models and existing weight precision prevent interpreting cross-rate waveform differences as numerical error. No warmup frames are dropped. Host frame timing includes packing/DMA/wait/readback; separate audio run measures framing/reconstruction as well. No fitted alignment, gain normalization, or sample trimming.",
+  "rates": {
+    "8000": {
+      "model": "dpdfnet2_8khz",
+      "model_sample_rate": 8000,
+      "onnx_sha256": "6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d",
+      "manifest_sha256": "b832f6264a28bf02310d56d369a5e5da34eb1a257d5fbfa312d85edcf3783097",
+      "cpu_affinity": [
+        7
+      ],
+      "cpu_threads": 1,
+      "cases": [
+        {
+          "id": "p232_007",
+          "frames": 402,
+          "provenance": {
+            "log_sha256": "34717ec6f9802a0358b5d85342ecd11c07c9097b7edfa9e83615cd218da64c77",
+            "metrics_sha256": "a9640a820cdb7c07d94b827045f4dae5aae6b2791e7346f7f4fbba32ee7057db",
+            "input_sha256": "ba9a1f5caade2b3859d7f39a43135397eb2b175fd9de2cfcb82be20592e1e891",
+            "output_sha256": "fb7745d49edc3d08710bc944525b833fe24718412db1276bd9f99be4429fb1a0"
+          },
+          "cpu_spectrum_sha256": "ae5049b9133e9a30a9252c6fa30245de850ebf20b820f79e1879d776d9ae96a7",
+          "spectrum_error": {
+            "finite": true,
+            "elements": 65124,
+            "sum_squared_error": 3.0612995439061685,
+            "cpu_energy": 13212.668225930145,
+            "relative_l2": 0.015221506885254327,
+            "rmse": 0.006856182663012216,
+            "max_abs_error": 0.19084930419921875
+          },
+          "host_timing": {
+            "frames": 402,
+            "mean_ms": 9.828555793516369,
+            "p95_ms": 10.098874400364366,
+            "p99_ms": 10.213031199591569,
+            "max_ms": 12.286440000025323,
+            "deadline_misses": 52,
+            "deadline_miss_fraction": 0.12935323383084577,
+            "rtf_at_10ms_hop": 0.9828555793516369
+          },
+          "fpga_timing": {
+            "frames": 402,
+            "mean_ms": 9.069736090739102,
+            "p95_ms": 9.074362190547637,
+            "p99_ms": 9.074988267066766,
+            "max_ms": 9.075948987246813,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.9069736090739102
+          },
+          "cpu_timing": {
+            "frames": 402,
+            "mean_ms": 0.6503323532238549,
+            "p95_ms": 0.6535306494697579,
+            "p99_ms": 0.6886779897467932,
+            "max_ms": 1.3950519996797084,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.06503323532238549
+          },
+          "execution_elapsed_s": 3.952265377999538,
+          "fpga_execution_s_sum": 3.64603390847712,
+          "host_cpu_affinity": [
+            6
+          ],
+          "coarse_cpu_accuracy_screen_pass": true,
+          "source": "/home/hunlu/apexcompute/unified-engine/test_samples/p232_007.wav",
+          "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+          "audio_duration_s": 3.9558958333333334,
+          "waveform_error": {
+            "finite": true,
+            "elements": 189883,
+            "sum_squared_error": 0.15544106713804054,
+            "cpu_energy": 975.780969563117,
+            "relative_l2": 0.012621376224687692,
+            "rmse": 0.0009047734380263295,
+            "max_abs_error": 0.007169842720031738
+          },
+          "cpu_waveform_reconstruction_bit_identical": true,
+          "output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/p232_007_fpga.wav",
+            "sha256": "f264217820a63f5326e10363d34b72ddeae78cc37695fb4791d4dd101a763d33",
+            "sample_rate": 48000,
+            "samples": 189883,
+            "float32_samples_sha256": "5eacd22083e5a8a8894132d2762f8747d58849c1c5bd165923ea2b325c9cb539"
+          },
+          "cpu_output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/reference/p232_007_cpu.wav",
+            "sha256": "e73f60dd1a4093e010f30a35e1840102f07d5c850685d3716bd8395a2b8a7a8f"
+          },
+          "cpu_steady_audio_processing_s": 0.2843829609992099,
+          "cpu_steady_audio_rtf": 0.0718883845734588,
+          "native_output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/p232_007_fpga_native8k.wav",
+            "sha256": "1128e577caa05755cb3dade264c1c5b983df14719e123b4da7b44126d971be9b",
+            "sample_rate": 8000,
+            "samples": 31648,
+            "float32_samples_sha256": "ebb3c48fc78c79a56ac6533f473a6b9d3bfc760615da0a7d9c51dffe6555c234"
+          },
+          "native_waveform_error": {
+            "finite": true,
+            "elements": 31648,
+            "sum_squared_error": 0.02742462607872142,
+            "cpu_energy": 162.74669932916413,
+            "relative_l2": 0.01298118271303687,
+            "rmse": 0.000930887551169414,
+            "max_abs_error": 0.0073287831619381905
+          }
+        },
+        {
+          "id": "p257_018",
+          "frames": 448,
+          "provenance": {
+            "log_sha256": "bfb008e48ed5596778a132b80dfbc841945f3b5b7d43050a89a936af6d00c595",
+            "metrics_sha256": "5085f95e4580509e3f67b95aad19f3bc2ed260c44bad3965222a2079b94b25b8",
+            "input_sha256": "d4693976976548903cb39715ac9f89ca3eafbedcf95df9ea669fdfdcd243478d",
+            "output_sha256": "c1b3ff6d227a213e553971705f9dbb88d338148c94cd0ce13053e01328c91a0a"
+          },
+          "cpu_spectrum_sha256": "2cc480b9e5816a82399d80687098af5531a68ec95c65b3f9f48fc75dafeb4c07",
+          "spectrum_error": {
+            "finite": true,
+            "elements": 72576,
+            "sum_squared_error": 0.7825056294329247,
+            "cpu_energy": 5549.183170655639,
+            "relative_l2": 0.011874879328300718,
+            "rmse": 0.0032835771214370095,
+            "max_abs_error": 0.09094667434692383
+          },
+          "host_timing": {
+            "frames": 448,
+            "mean_ms": 9.827690406234117,
+            "p95_ms": 10.077044249965184,
+            "p99_ms": 10.234037789659851,
+            "max_ms": 11.145118999593251,
+            "deadline_misses": 69,
+            "deadline_miss_fraction": 0.15401785714285715,
+            "rtf_at_10ms_hop": 0.9827690406234117
+          },
+          "fpga_timing": {
+            "frames": 448,
+            "mean_ms": 9.069434251419997,
+            "p95_ms": 9.074090922730683,
+            "p99_ms": 9.075460705176294,
+            "max_ms": 9.07642910727682,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.9069434251419997
+          },
+          "cpu_timing": {
+            "frames": 448,
+            "mean_ms": 0.6519634107381275,
+            "p95_ms": 0.659967050250998,
+            "p99_ms": 0.7369923596888829,
+            "max_ms": 0.9535269991829409,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.06519634107381275
+          },
+          "execution_elapsed_s": 4.404183253000156,
+          "fpga_execution_s_sum": 4.06310654463616,
+          "host_cpu_affinity": [
+            6
+          ],
+          "coarse_cpu_accuracy_screen_pass": true,
+          "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_018.wav",
+          "source_sha256": "c2cc60d1fcd5386cb2ed6d2801fa6855fc66fe10ca9f1d8c7772b6e01a7cae1d",
+          "audio_duration_s": 4.418604166666666,
+          "waveform_error": {
+            "finite": true,
+            "elements": 212093,
+            "sum_squared_error": 0.02786018217016884,
+            "cpu_energy": 413.1874730743625,
+            "relative_l2": 0.008211422584661218,
+            "rmse": 0.00036243389667640457,
+            "max_abs_error": 0.004987388849258423
+          },
+          "cpu_waveform_reconstruction_bit_identical": true,
+          "output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/p257_018_fpga.wav",
+            "sha256": "906d7408793b3b78d86f5d791dda801daf52be5b00835132a33b4534ea892659",
+            "sample_rate": 48000,
+            "samples": 212093,
+            "float32_samples_sha256": "7a7dedc704fc3b87cc4328b9685c180ab4049d5a32e207000dd58498f1852b64"
+          },
+          "cpu_output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/reference/p257_018_cpu.wav",
+            "sha256": "d8717423453bf2f0abfe47ea441a1f93aa26c3b53f848a36b13c77bf7c53c6f0"
+          },
+          "cpu_steady_audio_processing_s": 0.3030272750002041,
+          "cpu_steady_audio_rtf": 0.0685798644934524,
+          "native_output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/p257_018_fpga_native8k.wav",
+            "sha256": "839b9faf9e553f711b9ffcd1589ee7fb4c826a06559c3a50ce0a62b9f32e872d",
+            "sample_rate": 8000,
+            "samples": 35349,
+            "float32_samples_sha256": "50d19b0d4d11cc271be8b081a972bc12ee932657aca3bc0b9f07aa5e55ace24a"
+          },
+          "native_waveform_error": {
+            "finite": true,
+            "elements": 35349,
+            "sum_squared_error": 0.0046494911323002016,
+            "cpu_energy": 68.90188954843973,
+            "relative_l2": 0.008214613713294882,
+            "rmse": 0.00036267209886765774,
+            "max_abs_error": 0.004546701908111572
+          }
+        },
+        {
+          "id": "sustained60_16k",
+          "frames": 6007,
+          "provenance": {
+            "log_sha256": "608b1c6e6ddcf977ae0f9d112f4c83e9eb0ca913fcbad71a2f24f0ba9b5cdf3b",
+            "metrics_sha256": "f2eaaf05f181d29a5b466e0ddbad5c222005a79a7ab9083579dc738840b0d678",
+            "input_sha256": "676b9c575b8d7bfc4527645794552aacd5eabc10e411432eb190c2d3bb920c93",
+            "output_sha256": "a8f87ec92f1f5ab8e76f62e8561e08e39d347478394e603436c90b0b26acc09e"
+          },
+          "cpu_spectrum_sha256": "9a03c791849d48df7010ba9d2625df9854e62efe1506245edd57fa04282f3cf1",
+          "spectrum_error": {
+            "finite": true,
+            "elements": 973134,
+            "sum_squared_error": 61.47060644491743,
+            "cpu_energy": 130217.78419879313,
+            "relative_l2": 0.021726941665434086,
+            "rmse": 0.007947809071774638,
+            "max_abs_error": 0.8323416709899902
+          },
+          "host_timing": {
+            "frames": 6007,
+            "mean_ms": 9.850825082896362,
+            "p95_ms": 10.129155600043305,
+            "p99_ms": 10.224074020279659,
+            "max_ms": 13.405030000285478,
+            "deadline_misses": 1156,
+            "deadline_miss_fraction": 0.19244215082403862,
+            "rtf_at_10ms_hop": 0.9850825082896362
+          },
+          "fpga_timing": {
+            "frames": 6007,
+            "mean_ms": 9.069699042539892,
+            "p95_ms": 9.07446061515379,
+            "p99_ms": 9.075420855213803,
+            "max_ms": 9.07700525131283,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.9069699042539892
+          },
+          "cpu_timing": {
+            "frames": 6007,
+            "mean_ms": 0.6514387619389479,
+            "p95_ms": 0.6633629996031232,
+            "p99_ms": 0.6784314800461287,
+            "max_ms": 0.9628540001358488,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.06514387619389479
+          },
+          "execution_elapsed_s": 59.19342411599973,
+          "fpga_execution_s_sum": 54.481682148537146,
+          "host_cpu_affinity": [
+            6
+          ],
+          "coarse_cpu_accuracy_screen_pass": true,
+          "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/sources/sustained60_16k.wav",
+          "source_sha256": "cdcbf33701ac44e930d33a916db098dc8278b4d1b7ef3a8189a30bf6f7628091",
+          "audio_duration_s": 60.0,
+          "waveform_error": {
+            "finite": true,
+            "elements": 960000,
+            "sum_squared_error": 1.1489222895422646,
+            "cpu_energy": 3215.01227597711,
+            "relative_l2": 0.018904013106555918,
+            "rmse": 0.001093980827805737,
+            "max_abs_error": 0.03169902879744768
+          },
+          "cpu_waveform_reconstruction_bit_identical": true,
+          "output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/sustained60_16k_fpga.wav",
+            "sha256": "3dbc66a9ac9cd610acc51850f0ba4c77d580f05369dbe7f4b06c8c8ae44d5a79",
+            "sample_rate": 16000,
+            "samples": 960000,
+            "float32_samples_sha256": "8cf9577e8c16e7dfccb05c5fbbafe0d456799a931b1f74f0fb2fc2bb6de93f20"
+          },
+          "cpu_output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/reference/sustained60_16k_cpu.wav",
+            "sha256": "665140843729927d0b3bfb01533878e80e80a433110d85ffaa2444b605fc6eb4"
+          },
+          "cpu_steady_audio_processing_s": 4.008282726998914,
+          "cpu_steady_audio_rtf": 0.06680471211664857,
+          "native_output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/sustained60_16k_fpga_native8k.wav",
+            "sha256": "abe03e4a9081e1f0e3e2662b764b70a1910651e624ec0c5c9884168f37b62368",
+            "sample_rate": 8000,
+            "samples": 480000,
+            "float32_samples_sha256": "ad1a5bc1a90bbb7a394cad00bdc2c6ae92aadbbc7ea94c3e6a0af3ec2317b1d0"
+          },
+          "native_waveform_error": {
+            "finite": true,
+            "elements": 480000,
+            "sum_squared_error": 0.5867856853351987,
+            "cpu_energy": 1608.5883348923312,
+            "relative_l2": 0.01909929329078752,
+            "rmse": 0.0011056537332192497,
+            "max_abs_error": 0.031705369241535664
+          },
+          "separate_audio_run": {
+            "provenance": {
+              "log_sha256": "f8aef2462b42fdcd45e857cd4b3bf43f0f9b70fdba412231dd0e29ab5cbdfbfe",
+              "metrics_sha256": "b58176c7eae8cfa798391d1868568e7f6997c061a74b795c627d4d440144b6a5",
+              "input_sha256": "cdcbf33701ac44e930d33a916db098dc8278b4d1b7ef3a8189a30bf6f7628091",
+              "output_sha256": "de0fcd6a12f807b13fc4dbe14d3efd93a97fc4d5e6a260a3e8347ef5b28f83c0"
+            },
+            "output": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/sustained60_audio_fpga.wav",
+            "samples": 960000,
+            "sample_rate": 16000,
+            "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+            "hardware_version": "0xdf0749de",
+            "bit_identical_to_spectrum_reconstruction": true,
+            "host_timing": {
+              "frames": 6007,
+              "mean_ms": 9.847695125687641,
+              "p95_ms": 10.118745300042065,
+              "p99_ms": 10.224980399907508,
+              "max_ms": 13.500203999683436,
+              "deadline_misses": 1099,
+              "deadline_miss_fraction": 0.18295322124188446,
+              "rtf_at_10ms_hop": 0.9847695125687641
+            },
+            "fpga_timing": {
+              "frames": 6007,
+              "mean_ms": 9.069691977014564,
+              "p95_ms": 9.074316579144787,
+              "p99_ms": 9.075180795198799,
+              "max_ms": 9.077149287321832,
+              "deadline_misses": 0,
+              "deadline_miss_fraction": 0.0,
+              "rtf_at_10ms_hop": 0.9069691977014565
+            },
+            "steady_audio_processing_s": 59.21555228499983,
+            "steady_audio_rtf": 0.9869258714166639,
+            "total_elapsed_s": 59.363436088000526,
+            "audio_preprocess_s": 0.025773620999643754,
+            "audio_postprocess_s": 0.015793378000125813,
+            "execution_elapsed_s": 59.17398528600006,
+            "fpga_execution_s_sum": 54.48163970592649
+          }
+        },
+        {
+          "id": "silence_128",
+          "frames": 128,
+          "provenance": {
+            "log_sha256": "a0b2c5f17f86ed272cd1db47cbdde16017246bab08cdbdf417f0d39ed06647be",
+            "metrics_sha256": "1f9cb8a5f7e24f6321d22252ef698b1c0b98e2b431fd7c1147b54070747073de",
+            "input_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee",
+            "output_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee"
+          },
+          "cpu_spectrum_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee",
+          "spectrum_error": {
+            "finite": true,
+            "elements": 20736,
+            "sum_squared_error": 0.0,
+            "cpu_energy": 0.0,
+            "relative_l2": null,
+            "rmse": 0.0,
+            "max_abs_error": 0.0
+          },
+          "host_timing": {
+            "frames": 128,
+            "mean_ms": 9.875525882762304,
+            "p95_ms": 10.086257749981087,
+            "p99_ms": 10.131218479564268,
+            "max_ms": 10.21404099992651,
+            "deadline_misses": 22,
+            "deadline_miss_fraction": 0.171875,
+            "rtf_at_10ms_hop": 0.9875525882762304
+          },
+          "fpga_timing": {
+            "frames": 128,
+            "mean_ms": 9.069788447111778,
+            "p95_ms": 9.07446061515379,
+            "p99_ms": 9.074844711177795,
+            "max_ms": 9.075852963240811,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.9069788447111777
+          },
+          "cpu_timing": {
+            "frames": 128,
+            "mean_ms": 0.6586751718629102,
+            "p95_ms": 0.6679506997443241,
+            "p99_ms": 0.9053009099716294,
+            "max_ms": 1.04979000025196,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.06586751718629102
+          },
+          "execution_elapsed_s": 1.264496746000077,
+          "fpga_execution_s_sum": 1.1609329212303077,
+          "host_cpu_affinity": [
+            6
+          ],
+          "coarse_cpu_accuracy_screen_pass": true
+        },
+        {
+          "id": "audio_silence_audio_384",
+          "frames": 384,
+          "provenance": {
+            "log_sha256": "113bcab9e4135a1ae2925583b37671804f2bb015d5c33ef161b1a9e17a23779a",
+            "metrics_sha256": "c16975727fa9f0e569a5dac8c4d2c3d1c622f75798c8471aec68629d6458b127",
+            "input_sha256": "a825caab282ea28030ab7aae2708a17084da396fa2eeda7e447e2e043c10f8cb",
+            "output_sha256": "77bc72f64447c5966eff3fb6607b99979c99166f675e587c512d5a8c566f609e"
+          },
+          "cpu_spectrum_sha256": "fd57cc2cc811fc636f7d45bfd38c3042ba145131d87a3cebf59399a741e6af19",
+          "spectrum_error": {
+            "finite": true,
+            "elements": 62208,
+            "sum_squared_error": 1.5456408022697479,
+            "cpu_energy": 8204.152522360191,
+            "relative_l2": 0.013725792339988361,
+            "rmse": 0.004984609805494272,
+            "max_abs_error": 0.19084930419921875
+          },
+          "host_timing": {
+            "frames": 384,
+            "mean_ms": 9.813346281236571,
+            "p95_ms": 10.113240350347041,
+            "p99_ms": 10.171381539930735,
+            "max_ms": 10.482858999239397,
+            "deadline_misses": 50,
+            "deadline_miss_fraction": 0.13020833333333334,
+            "rtf_at_10ms_hop": 0.9813346281236571
+          },
+          "fpga_timing": {
+            "frames": 384,
+            "mean_ms": 9.06992685671418,
+            "p95_ms": 9.074206151537885,
+            "p99_ms": 9.075677239309828,
+            "max_ms": 9.076381095273819,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.9069926856714179
+          },
+          "cpu_timing": {
+            "frames": 384,
+            "mean_ms": 0.6517083906511326,
+            "p95_ms": 0.656220299697452,
+            "p99_ms": 0.6793336900409486,
+            "max_ms": 0.9286100003009778,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.06517083906511326
+          },
+          "execution_elapsed_s": 3.76950325100006,
+          "fpga_execution_s_sum": 3.482851912978245,
+          "host_cpu_affinity": [
+            6
+          ],
+          "coarse_cpu_accuracy_screen_pass": true
+        }
+      ],
+      "pending_cases": [],
+      "validation_errors": [],
+      "complete": true,
+      "coarse_cpu_accuracy_screen": {
+        "max_spectrum_relative_l2": 0.25,
+        "max_zero_reference_abs_error": 1e-06,
+        "scope": "Gross-error screening only; not speech-quality acceptance"
+      },
+      "all_coarse_cpu_accuracy_screens_pass": true,
+      "same_deployment": true,
+      "deployments": [
+        {
+          "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+          "hardware_version": "0xdf0749de",
+          "clock_ns": 3.000750187546887
+        }
+      ],
+      "host_timing": {
+        "frames": 7369,
+        "mean_ms": 9.846679778658343,
+        "p95_ms": 10.123963999831176,
+        "p99_ms": 10.22235256008571,
+        "max_ms": 13.405030000285478,
+        "deadline_misses": 1349,
+        "deadline_miss_fraction": 0.18306418781381462,
+        "rtf_at_10ms_hop": 0.9846679778658343
+      },
+      "fpga_timing": {
+        "frames": 7369,
+        "mean_ms": 9.069698389993075,
+        "p95_ms": 9.074412603150789,
+        "p99_ms": 9.075436219054763,
+        "max_ms": 9.07700525131283,
+        "deadline_misses": 0,
+        "deadline_miss_fraction": 0.0,
+        "rtf_at_10ms_hop": 0.9069698389993075
+      },
+      "cpu_timing": {
+        "frames": 7369,
+        "mean_ms": 0.6515500476295859,
+        "p95_ms": 0.6630917998336372,
+        "p99_ms": 0.6838016005349342,
+        "max_ms": 1.3950519996797084,
+        "deadline_misses": 0,
+        "deadline_miss_fraction": 0.0,
+        "rtf_at_10ms_hop": 0.06515500476295859
+      },
+      "strict_all_host_frames_meet_10ms": false,
+      "strict_all_fpga_frames_meet_10ms": true,
+      "fpga_compute_over_cpu_neural": 13.920186826767463,
+      "host_fpga_over_cpu_neural": 15.112699038978967,
+      "cpu_times_realtime": 15.348015146927164,
+      "fpga_times_realtime": 1.1025724969017008,
+      "host_times_realtime": 1.015570753267915,
+      "pooled_waveform_error": {
+        "case_ids": [
+          "p232_007",
+          "p257_018",
+          "sustained60_16k"
+        ],
+        "scope": "Sample-weighted source-rate output error; clip WAVs are 48 kHz and composite WAV is 16 kHz",
+        "samples": 1361976,
+        "relative_l2": 0.017010685034364766,
+        "rmse": 0.0009890171535079835
+      },
+      "pooled_native_waveform_error": {
+        "case_ids": [
+          "p232_007",
+          "p257_018",
+          "sustained60_16k"
+        ],
+        "sample_rate": 8000,
+        "scope": "All audio cases reconstructed at one common model-native sample rate",
+        "samples": 546997,
+        "relative_l2": 0.018338308184544395,
+        "rmse": 0.0010636620512128403
+      }
+    },
+    "16000": {
+      "model": "dpdfnet2",
+      "model_sample_rate": 16000,
+      "onnx_sha256": "4f0ee28935b4a32abecc717d745416976565834d839601acf43031094b4dc94c",
+      "manifest_sha256": "dee65e6561ec94ca4a33ee952fdcf1060e38cf3d2f76ac0275711d811dd77edf",
+      "cpu_affinity": [
+        7
+      ],
+      "cpu_threads": 1,
+      "cases": [
+        {
+          "id": "p232_007",
+          "frames": 402,
+          "provenance": {
+            "log_sha256": "d646f4e062a129511bf9255d87f2a605005402a3745a81ff5662eebe75f10b65",
+            "metrics_sha256": "6ca8190150083c0b241b89268763d6705bfb11e99f13ad4ac376fa34320537e5",
+            "input_sha256": "9e566ffed6f5034b926d20d05fa269fb671d2ab7cfc42a8888ceff3876f85c24",
+            "output_sha256": "43e598f1d4c9f1492d31375609a573afea750bac09ffa426251a74203be78afb"
+          },
+          "cpu_spectrum_sha256": "242e711cdb9d7f1541c772aaa8bb41314ad1cf59f6fe27cedc76e89b2602ed3d",
+          "spectrum_error": {
+            "finite": true,
+            "elements": 129444,
+            "sum_squared_error": 763.0894729077824,
+            "cpu_energy": 54494.97066845063,
+            "relative_l2": 0.11833399306139816,
+            "rmse": 0.07677976327567058,
+            "max_abs_error": 9.746106147766113
+          },
+          "host_timing": {
+            "frames": 402,
+            "mean_ms": 14.275537902990006,
+            "p95_ms": 14.580583699626004,
+            "p99_ms": 14.675335710116997,
+            "max_ms": 14.80039400030364,
+            "deadline_misses": 402,
+            "deadline_miss_fraction": 1.0,
+            "rtf_at_10ms_hop": 1.4275537902990005
+          },
+          "fpga_timing": {
+            "frames": 402,
+            "mean_ms": 13.447088816980365,
+            "p95_ms": 13.452905626406602,
+            "p99_ms": 13.455890532633157,
+            "max_ms": 13.458196549137284,
+            "deadline_misses": 402,
+            "deadline_miss_fraction": 1.0,
+            "rtf_at_10ms_hop": 1.3447088816980366
+          },
+          "cpu_timing": {
+            "frames": 402,
+            "mean_ms": 0.668932798502491,
+            "p95_ms": 0.6727923499056487,
+            "p99_ms": 0.7372239200230981,
+            "max_ms": 1.2762270007442567,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.0668932798502491
+          },
+          "execution_elapsed_s": 5.740309005000199,
+          "fpga_execution_s_sum": 5.405729704426107,
+          "host_cpu_affinity": [
+            6
+          ],
+          "coarse_cpu_accuracy_screen_pass": true,
+          "source": "/home/hunlu/apexcompute/unified-engine/test_samples/p232_007.wav",
+          "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+          "audio_duration_s": 3.9558958333333334,
+          "waveform_error": {
+            "finite": true,
+            "elements": 189883,
+            "sum_squared_error": 12.640021233999796,
+            "cpu_energy": 1004.3671123628077,
+            "relative_l2": 0.11218315764469808,
+            "rmse": 0.00815888589596134,
+            "max_abs_error": 0.10583648085594177
+          },
+          "cpu_waveform_reconstruction_bit_identical": true,
+          "output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/p232_007_fpga.wav",
+            "sha256": "65ffbd3b12b8d399844b36e37d3d84b25aa0e870617217c01acf1757b11edaea",
+            "sample_rate": 48000,
+            "samples": 189883,
+            "float32_samples_sha256": "cb61a2ff65a5d98d593038b9ed5b238d0e1b5254d8668565f483a553137bd33a"
+          },
+          "cpu_output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/reference/p232_007_cpu.wav",
+            "sha256": "a1070760a5735c67a20901e1600fe37fa235a85f74fe695a49f9f970c420351a"
+          },
+          "cpu_steady_audio_processing_s": 0.2800656559993513,
+          "cpu_steady_audio_rtf": 0.07079702494677703,
+          "native_output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/p232_007_fpga_native16k.wav",
+            "sha256": "791488e23835b21e875283cace31e1a3ac17bd3d0f7db9996228b69ce012b9b3",
+            "sample_rate": 16000,
+            "samples": 63295,
+            "float32_samples_sha256": "58dd12f0e2c96219ed3b90f226f1b944d023d43f39ee67a62c6f841e4cc7b9a6"
+          },
+          "native_waveform_error": {
+            "finite": true,
+            "elements": 63295,
+            "sum_squared_error": 4.212050495137176,
+            "cpu_energy": 334.61743246023343,
+            "relative_l2": 0.11219474174609805,
+            "rmse": 0.008157593915887154,
+            "max_abs_error": 0.1055675558745861
+          }
+        },
+        {
+          "id": "p257_018",
+          "frames": 448,
+          "provenance": {
+            "log_sha256": "1de3adc537411228e66d37ee5f8eab3b36312d4540fd05fdb524ba8360d34dcd",
+            "metrics_sha256": "1d114f2b85e32d7d7b2ddc53f1da557eb4419854a51377deb87af3ee14c97f1f",
+            "input_sha256": "0ea84704889f72adedb4c1d377a683b4bffc32bb2cc6ec2392770f7b8bd2efdc",
+            "output_sha256": "3901a54ec9040e1471660d5c109ad0219c8ffef6607d3e183a8e82fe08ec7543"
+          },
+          "cpu_spectrum_sha256": "c98178afdf59345ae4337fc2959e32c8fe37a3ca17957192420983f407b1d3fb",
+          "spectrum_error": {
+            "finite": true,
+            "elements": 144256,
+            "sum_squared_error": 1432.4824984102702,
+            "cpu_energy": 22237.88697586293,
+            "relative_l2": 0.25380367310020785,
+            "rmse": 0.09965009554879499,
+            "max_abs_error": 7.005087852478027
+          },
+          "host_timing": {
+            "frames": 448,
+            "mean_ms": 14.296009587046196,
+            "p95_ms": 14.594916550277048,
+            "p99_ms": 14.67875073997675,
+            "max_ms": 14.763967000362754,
+            "deadline_misses": 448,
+            "deadline_miss_fraction": 1.0,
+            "rtf_at_10ms_hop": 1.4296009587046197
+          },
+          "fpga_timing": {
+            "frames": 448,
+            "mean_ms": 13.44736384096024,
+            "p95_ms": 13.454401200300074,
+            "p99_ms": 13.457024576144036,
+            "max_ms": 13.458820705176295,
+            "deadline_misses": 448,
+            "deadline_miss_fraction": 1.0,
+            "rtf_at_10ms_hop": 1.344736384096024
+          },
+          "cpu_timing": {
+            "frames": 448,
+            "mean_ms": 0.6691498169573151,
+            "p95_ms": 0.673179950172198,
+            "p99_ms": 0.7072668498676646,
+            "max_ms": 0.927222999962396,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.06691498169573151
+          },
+          "execution_elapsed_s": 6.406321641999966,
+          "fpga_execution_s_sum": 6.024419000750188,
+          "host_cpu_affinity": [
+            6
+          ],
+          "coarse_cpu_accuracy_screen_pass": false,
+          "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_018.wav",
+          "source_sha256": "c2cc60d1fcd5386cb2ed6d2801fa6855fc66fe10ca9f1d8c7772b6e01a7cae1d",
+          "audio_duration_s": 4.418604166666666,
+          "waveform_error": {
+            "finite": true,
+            "elements": 212093,
+            "sum_squared_error": 25.347088493224373,
+            "cpu_energy": 413.1862542754427,
+            "relative_l2": 0.24768009635851476,
+            "rmse": 0.010932031463585757,
+            "max_abs_error": 0.2764310762286186
+          },
+          "cpu_waveform_reconstruction_bit_identical": true,
+          "output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/p257_018_fpga.wav",
+            "sha256": "d2d4fafc0201e566c3d94cd0724defb6ed40f17afc1d9af4aaaf9bcbe4f2470d",
+            "sample_rate": 48000,
+            "samples": 212093,
+            "float32_samples_sha256": "5925025f89885c687082fd122628933ab164a504f563e4808c879ac7a4646799"
+          },
+          "cpu_output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/reference/p257_018_cpu.wav",
+            "sha256": "eebf57e374821d4bf79aa0598a04b8119e147cd77df047282f511e679e16fccd"
+          },
+          "cpu_steady_audio_processing_s": 0.31100989900005516,
+          "cpu_steady_audio_rtf": 0.07038645854414172,
+          "native_output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/p257_018_fpga_native16k.wav",
+            "sha256": "5495e214a1ae43886cd3e1dc9959422304285ff96b351b9bc423c8ef3bde0c5c",
+            "sample_rate": 16000,
+            "samples": 70698,
+            "float32_samples_sha256": "471552643058ee5d1ecd650ecd07dbbc75d9ebd3e2edb02ed26575aeaff5bb88"
+          },
+          "native_waveform_error": {
+            "finite": true,
+            "elements": 70698,
+            "sum_squared_error": 8.453084015094353,
+            "cpu_energy": 137.72545633507175,
+            "relative_l2": 0.24774248112402655,
+            "rmse": 0.010934628400835984,
+            "max_abs_error": 0.2699652127921581
+          }
+        },
+        {
+          "id": "sustained60_16k",
+          "frames": 6007,
+          "provenance": {
+            "log_sha256": "c60ff77f7af2960597ce973284cb3b306e9339f6ea5c83d17bc8ce49655f2ca7",
+            "metrics_sha256": "c2d0d2b9b8be96025a1066b1dc2798b19f9f1f56db0d7b5e1140d873db438c6d",
+            "input_sha256": "f31b1d4c037d39b6ab95d9bea0e47830f6bab98169f9a8b8a36bc2e0ebd5bd17",
+            "output_sha256": "a4eceff5d3b9a9010b906da1ac2085f4f250dda35dc6b6f661d439f736245580"
+          },
+          "cpu_spectrum_sha256": "4e050e84a1b836837e6c3a256fdf45da50c8a5c918f562457d19f71e089f5433",
+          "spectrum_error": {
+            "finite": true,
+            "elements": 1934254,
+            "sum_squared_error": 5234.308139297014,
+            "cpu_energy": 531491.0072750866,
+            "relative_l2": 0.09923884074433972,
+            "rmse": 0.052020304617178846,
+            "max_abs_error": 12.220174789428711
+          },
+          "host_timing": {
+            "frames": 6007,
+            "mean_ms": 14.300637855174552,
+            "p95_ms": 14.615545600008772,
+            "p99_ms": 14.733570519620116,
+            "max_ms": 20.02845399965736,
+            "deadline_misses": 6007,
+            "deadline_miss_fraction": 1.0,
+            "rtf_at_10ms_hop": 1.4300637855174552
+          },
+          "fpga_timing": {
+            "frames": 6007,
+            "mean_ms": 13.447027144500456,
+            "p95_ms": 13.453587396849212,
+            "p99_ms": 13.45665728432108,
+            "max_ms": 13.462565641410352,
+            "deadline_misses": 6007,
+            "deadline_miss_fraction": 1.0,
+            "rtf_at_10ms_hop": 1.3447027144500456
+          },
+          "cpu_timing": {
+            "frames": 6007,
+            "mean_ms": 0.6686600569283724,
+            "p95_ms": 0.6745254002453294,
+            "p99_ms": 0.71164945991768,
+            "max_ms": 0.967924999713432,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.06686600569283724
+          },
+          "execution_elapsed_s": 85.92608469799961,
+          "fpga_execution_s_sum": 80.77629205701427,
+          "host_cpu_affinity": [
+            6
+          ],
+          "coarse_cpu_accuracy_screen_pass": true,
+          "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/sources/sustained60_16k.wav",
+          "source_sha256": "cdcbf33701ac44e930d33a916db098dc8278b4d1b7ef3a8189a30bf6f7628091",
+          "audio_duration_s": 60.0,
+          "waveform_error": {
+            "finite": true,
+            "elements": 960000,
+            "sum_squared_error": 28.067330306608937,
+            "cpu_energy": 3273.6303965451934,
+            "relative_l2": 0.09259461505070811,
+            "rmse": 0.005407106657235239,
+            "max_abs_error": 0.14184653759002686
+          },
+          "cpu_waveform_reconstruction_bit_identical": true,
+          "output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/sustained60_16k_fpga.wav",
+            "sha256": "588567d5abb10b3968bc8022f1d7e8ddf46be8b3c66440c0e10d47d21b93230f",
+            "sample_rate": 16000,
+            "samples": 960000,
+            "float32_samples_sha256": "bb58ce51abb386479023f340d5d0412ce6ef4f338977471bdffa4236be673625"
+          },
+          "cpu_output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/reference/sustained60_16k_cpu.wav",
+            "sha256": "f37844ebdf12852b047906b84f98cf6e9b5ada3f985b9571ab0b2ca50d90ee6d"
+          },
+          "cpu_steady_audio_processing_s": 4.113260404999892,
+          "cpu_steady_audio_rtf": 0.06855434008333153,
+          "native_output": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/sustained60_16k_fpga_native16k.wav",
+            "sha256": "588567d5abb10b3968bc8022f1d7e8ddf46be8b3c66440c0e10d47d21b93230f",
+            "sample_rate": 16000,
+            "samples": 960000,
+            "float32_samples_sha256": "bb58ce51abb386479023f340d5d0412ce6ef4f338977471bdffa4236be673625"
+          },
+          "native_waveform_error": {
+            "finite": true,
+            "elements": 960000,
+            "sum_squared_error": 28.067330306608937,
+            "cpu_energy": 3273.6303965451934,
+            "relative_l2": 0.09259461505070811,
+            "rmse": 0.005407106657235239,
+            "max_abs_error": 0.14184653759002686
+          },
+          "separate_audio_run": {
+            "provenance": {
+              "log_sha256": "978f1746bff7c192d8ec1148b0aec99014b5774fdb31e9f7296073b91b5a8573",
+              "metrics_sha256": "b891bca50037817f6ae3b7f697f3e68d55fe096b5d62769eead5829e11bce1be",
+              "input_sha256": "cdcbf33701ac44e930d33a916db098dc8278b4d1b7ef3a8189a30bf6f7628091",
+              "output_sha256": "43b9c3044024b13dcca599e615945abe25cf07fcaf2966826917365f423d0fca"
+            },
+            "output": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/sustained60_audio_fpga.wav",
+            "samples": 960000,
+            "sample_rate": 16000,
+            "bin_sha256": "4f540ae650c27d822f4da24cfb0a0ac7f9cf33e53e84cbd9ce2fc7f1cdd5fc77",
+            "hardware_version": "0xdf0749de",
+            "bit_identical_to_spectrum_reconstruction": true,
+            "host_timing": {
+              "frames": 6007,
+              "mean_ms": 14.299668797560745,
+              "p95_ms": 14.613089000249602,
+              "p99_ms": 15.300455900305634,
+              "max_ms": 18.2496440002069,
+              "deadline_misses": 6007,
+              "deadline_miss_fraction": 1.0,
+              "rtf_at_10ms_hop": 1.4299668797560745
+            },
+            "fpga_timing": {
+              "frames": 6007,
+              "mean_ms": 13.44695165367836,
+              "p95_ms": 13.453587396849212,
+              "p99_ms": 13.45665728432108,
+              "max_ms": 13.463189797449363,
+              "deadline_misses": 6007,
+              "deadline_miss_fraction": 1.0,
+              "rtf_at_10ms_hop": 1.344695165367836
+            },
+            "steady_audio_processing_s": 85.95599540100011,
+            "steady_audio_rtf": 1.4325999233500017,
+            "total_elapsed_s": 86.1263381789995,
+            "audio_preprocess_s": 0.013036923999607097,
+            "audio_postprocess_s": 0.02310050800042518,
+            "execution_elapsed_s": 85.91985796900008,
+            "fpga_execution_s_sum": 80.77583858364592
+          }
+        },
+        {
+          "id": "silence_128",
+          "frames": 128,
+          "provenance": {
+            "log_sha256": "25fe35a2d05cda1f29043726d8bd6bfff6f8557868ed7e977b459da67cade04e",
+            "metrics_sha256": "99d32e405c253cd3fd3d5f4676b070c80f87c5ca4a24ba7a47c8063c1c18cab5",
+            "input_sha256": "18d0e916c3f7cfdfc51dc522476400350ce04fab4d764fcf040a0f7eae4dd4ca",
+            "output_sha256": "18d0e916c3f7cfdfc51dc522476400350ce04fab4d764fcf040a0f7eae4dd4ca"
+          },
+          "cpu_spectrum_sha256": "18d0e916c3f7cfdfc51dc522476400350ce04fab4d764fcf040a0f7eae4dd4ca",
+          "spectrum_error": {
+            "finite": true,
+            "elements": 41216,
+            "sum_squared_error": 0.0,
+            "cpu_energy": 0.0,
+            "relative_l2": null,
+            "rmse": 0.0,
+            "max_abs_error": 0.0
+          },
+          "host_timing": {
+            "frames": 128,
+            "mean_ms": 14.263429460918076,
+            "p95_ms": 14.592404550057836,
+            "p99_ms": 14.891549569729252,
+            "max_ms": 15.711523999925703,
+            "deadline_misses": 128,
+            "deadline_miss_fraction": 1.0,
+            "rtf_at_10ms_hop": 1.4263429460918076
+          },
+          "fpga_timing": {
+            "frames": 128,
+            "mean_ms": 13.447498499624906,
+            "p95_ms": 13.454929332333084,
+            "p99_ms": 13.45660207051763,
+            "max_ms": 13.461701425356338,
+            "deadline_misses": 128,
+            "deadline_miss_fraction": 1.0,
+            "rtf_at_10ms_hop": 1.3447498499624906
+          },
+          "cpu_timing": {
+            "frames": 128,
+            "mean_ms": 0.6725296640510692,
+            "p95_ms": 0.6758698000794539,
+            "p99_ms": 0.8399704700059382,
+            "max_ms": 1.0398530002930784,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.06725296640510692
+          },
+          "execution_elapsed_s": 1.82613944699915,
+          "fpga_execution_s_sum": 1.7212798079519884,
+          "host_cpu_affinity": [
+            6
+          ],
+          "coarse_cpu_accuracy_screen_pass": true
+        },
+        {
+          "id": "audio_silence_audio_384",
+          "frames": 384,
+          "provenance": {
+            "log_sha256": "1d9b596c93812817cb78fc1d7d928f18e9715b7c347a39fc9f52514e1fe2f32e",
+            "metrics_sha256": "d5032c5a4d1f48bd204d402826510b9923a4c9f706a73a10494d1ef85389ae43",
+            "input_sha256": "d1f9f0d3298d9c7696a807256a2ddc29f50713d32803d189fc54b2e6e1871291",
+            "output_sha256": "eb2bdfeb7db26c8e1be709739797ba7da609be19ed49ba7a6f6164b2eb799397"
+          },
+          "cpu_spectrum_sha256": "614fb5c7f60932726476b2c3742788e48ae003bd3d623633457c05f3a48637a9",
+          "spectrum_error": {
+            "finite": true,
+            "elements": 123648,
+            "sum_squared_error": 3196.575824954154,
+            "cpu_energy": 33140.61976969253,
+            "relative_l2": 0.31057192385806376,
+            "rmse": 0.16078626887019642,
+            "max_abs_error": 10.389259338378906
+          },
+          "host_timing": {
+            "frames": 384,
+            "mean_ms": 14.407984604126511,
+            "p95_ms": 15.872436499967078,
+            "p99_ms": 17.47549588961192,
+            "max_ms": 19.720883999980288,
+            "deadline_misses": 384,
+            "deadline_miss_fraction": 1.0,
+            "rtf_at_10ms_hop": 1.4407984604126511
+          },
+          "fpga_timing": {
+            "frames": 384,
+            "mean_ms": 13.447144161040262,
+            "p95_ms": 13.454307576894223,
+            "p99_ms": 13.45719645911478,
+            "max_ms": 13.458868717179296,
+            "deadline_misses": 384,
+            "deadline_miss_fraction": 1.0,
+            "rtf_at_10ms_hop": 1.344714416104026
+          },
+          "cpu_timing": {
+            "frames": 384,
+            "mean_ms": 0.6678936536512007,
+            "p95_ms": 0.673197549986071,
+            "p99_ms": 0.7027209698844674,
+            "max_ms": 0.8580720004829345,
+            "deadline_misses": 0,
+            "deadline_miss_fraction": 0.0,
+            "rtf_at_10ms_hop": 0.06678936536512006
+          },
+          "execution_elapsed_s": 5.533746983000128,
+          "fpga_execution_s_sum": 5.163703357839461,
+          "host_cpu_affinity": [
+            6
+          ],
+          "coarse_cpu_accuracy_screen_pass": false
+        }
+      ],
+      "pending_cases": [],
+      "validation_errors": [],
+      "complete": true,
+      "coarse_cpu_accuracy_screen": {
+        "max_spectrum_relative_l2": 0.25,
+        "max_zero_reference_abs_error": 1e-06,
+        "scope": "Gross-error screening only; not speech-quality acceptance"
+      },
+      "all_coarse_cpu_accuracy_screens_pass": false,
+      "same_deployment": true,
+      "deployments": [
+        {
+          "bin_sha256": "4f540ae650c27d822f4da24cfb0a0ac7f9cf33e53e84cbd9ce2fc7f1cdd5fc77",
+          "hardware_version": "0xdf0749de",
+          "clock_ns": 3.000750187546887
+        }
+      ],
+      "host_timing": {
+        "frames": 7369,
+        "mean_ms": 14.30393475193572,
+        "p95_ms": 14.615914600290125,
+        "p99_ms": 14.80617707977217,
+        "max_ms": 20.02845399965736,
+        "deadline_misses": 7369,
+        "deadline_miss_fraction": 1.0,
+        "rtf_at_10ms_hop": 1.430393475193572
+      },
+      "fpga_timing": {
+        "frames": 7369,
+        "mean_ms": 13.447065263669696,
+        "p95_ms": 13.453683420855214,
+        "p99_ms": 13.456804201050263,
+        "max_ms": 13.462565641410352,
+        "deadline_misses": 7369,
+        "deadline_miss_fraction": 1.0,
+        "rtf_at_10ms_hop": 1.3447065263669695
+      },
+      "cpu_timing": {
+        "frames": 7369,
+        "mean_ms": 0.6687319887317423,
+        "p95_ms": 0.6743579999238136,
+        "p99_ms": 0.7142620797458221,
+        "max_ms": 1.2762270007442567,
+        "deadline_misses": 0,
+        "deadline_miss_fraction": 0.0,
+        "rtf_at_10ms_hop": 0.06687319887317424
+      },
+      "strict_all_host_frames_meet_10ms": false,
+      "strict_all_fpga_frames_meet_10ms": false,
+      "fpga_compute_over_cpu_neural": 20.10830271357619,
+      "host_fpga_over_cpu_neural": 21.389637392796615,
+      "cpu_times_realtime": 14.953673771408948,
+      "fpga_times_realtime": 0.7436566867134402,
+      "host_times_realtime": 0.6991083344145373,
+      "pooled_waveform_error": {
+        "case_ids": [
+          "p232_007",
+          "p257_018",
+          "sustained60_16k"
+        ],
+        "scope": "Sample-weighted source-rate output error; clip WAVs are 48 kHz and composite WAV is 16 kHz",
+        "samples": 1361976,
+        "relative_l2": 0.11866148659378428,
+        "rmse": 0.006964120550614454
+      },
+      "pooled_native_waveform_error": {
+        "case_ids": [
+          "p232_007",
+          "p257_018",
+          "sustained60_16k"
+        ],
+        "sample_rate": 16000,
+        "scope": "All audio cases reconstructed at one common model-native sample rate",
+        "samples": 1093993,
+        "relative_l2": 0.10427687499444571,
+        "rmse": 0.006101871730603444
+      }
+    }
+  }
+}

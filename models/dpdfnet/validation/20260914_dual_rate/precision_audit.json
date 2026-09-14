@@ -1,0 +1,348 @@
+{
+  "method": "read-only decode of hash-verified resident instruction image; CONV2D mode and encoded weight data_type, grouped by graph operation manifest",
+  "hardware_executed": false,
+  "notes": [
+    "The legacy precision string BF16/IF8-INT omits the 16 kHz IF4 dense convolution layers.",
+    "IF4/IF8 name the encoded weight formats; block scales can select integer or floating variants, which this instruction-level audit does not resolve.",
+    "Depthwise weights and recurrent/linear weights use the existing BF16 lowering.",
+    "This compares deployed models with different dense convolution weight precision; it is not an equal-precision architecture-only comparison."
+  ],
+  "models": [
+    {
+      "model": "dpdfnet2_8khz",
+      "bin": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz-andromeda.bin",
+      "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+      "program_sha256": "d826270ad182dbf7fb79b0f37d07b4d38b8d87fab081c4a0fed02b12282baba3",
+      "onnx_sha256": "6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d",
+      "declared_precision": "BF16/IF8-INT",
+      "dense_convolution_nodes": 15,
+      "dense_nodes_by_weight_format": {
+        "IF8": 15
+      },
+      "decoded_conv_instruction_counts": {
+        "IF8": 15
+      },
+      "nodes": [
+        {
+          "node_index": 46,
+          "name": "/model/enc/erb_conv0/erb_conv0.1/Conv",
+          "resident_instruction_indices": [
+            1727
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 49,
+          "name": "/model/enc/erb_conv1/erb_conv1.1/Conv",
+          "resident_instruction_indices": [
+            2142
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 52,
+          "name": "/model/enc/erb_conv2/erb_conv2.1/Conv",
+          "resident_instruction_indices": [
+            2426
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 55,
+          "name": "/model/enc/erb_conv3/erb_conv3.1/Conv",
+          "resident_instruction_indices": [
+            2650
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 141,
+          "name": "/model/enc/df_conv0/df_conv0.1/convs.0/Conv",
+          "resident_instruction_indices": [
+            5384
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 142,
+          "name": "/model/enc/df_conv0/df_conv0.1/convs.1/Conv",
+          "resident_instruction_indices": [
+            5674
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 144,
+          "name": "/model/enc/df_conv0/df_conv0.2/Conv",
+          "resident_instruction_indices": [
+            5807
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 147,
+          "name": "/model/enc/df_conv1/df_conv1.1/Conv",
+          "resident_instruction_indices": [
+            6222
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 339,
+          "name": "/model/erb_dec/convt3/convt3.1/Conv",
+          "resident_instruction_indices": [
+            16256
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 350,
+          "name": "/model/erb_dec/convt2/convt2.1/Conv",
+          "resident_instruction_indices": [
+            16976
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 361,
+          "name": "/model/erb_dec/convt1/convt1.1/Conv",
+          "resident_instruction_indices": [
+            17963
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 366,
+          "name": "/model/erb_dec/conv0_out/conv0_out.0/Conv",
+          "resident_instruction_indices": [
+            18376
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 425,
+          "name": "/model/df_dec/df_convp/df_convp.1/convs.0/Conv",
+          "resident_instruction_indices": [
+            20482
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 426,
+          "name": "/model/df_dec/df_convp/df_convp.1/convs.1/Conv",
+          "resident_instruction_indices": [
+            20906
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 428,
+          "name": "/model/df_dec/df_convp/df_convp.2/Conv",
+          "resident_instruction_indices": [
+            21013
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        }
+      ]
+    },
+    {
+      "model": "dpdfnet2",
+      "bin": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/dpdfnet2-andromeda.bin",
+      "bin_sha256": "4f540ae650c27d822f4da24cfb0a0ac7f9cf33e53e84cbd9ce2fc7f1cdd5fc77",
+      "program_sha256": "899b85840eacc47bb0c8206dc908dbb7e10de35e54de500e5b06c757a79ae897",
+      "onnx_sha256": "4f0ee28935b4a32abecc717d745416976565834d839601acf43031094b4dc94c",
+      "declared_precision": "BF16/IF8-INT",
+      "dense_convolution_nodes": 15,
+      "dense_nodes_by_weight_format": {
+        "IF8": 3,
+        "IF4": 12
+      },
+      "decoded_conv_instruction_counts": {
+        "IF8": 3,
+        "IF4": 12
+      },
+      "nodes": [
+        {
+          "node_index": 45,
+          "name": "/model/enc/erb_conv0/erb_conv0.1/Conv",
+          "resident_instruction_indices": [
+            2494
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 48,
+          "name": "/model/enc/erb_conv1/erb_conv1.1/Conv",
+          "resident_instruction_indices": [
+            3187
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF4": 1
+          }
+        },
+        {
+          "node_index": 51,
+          "name": "/model/enc/erb_conv2/erb_conv2.1/Conv",
+          "resident_instruction_indices": [
+            3856
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF4": 1
+          }
+        },
+        {
+          "node_index": 54,
+          "name": "/model/enc/erb_conv3/erb_conv3.1/Conv",
+          "resident_instruction_indices": [
+            4525
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF4": 1
+          }
+        },
+        {
+          "node_index": 140,
+          "name": "/model/enc/df_conv0/df_conv0.1/convs.0/Conv",
+          "resident_instruction_indices": [
+            7285
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 141,
+          "name": "/model/enc/df_conv0/df_conv0.1/convs.1/Conv",
+          "resident_instruction_indices": [
+            7826
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF8": 1
+          }
+        },
+        {
+          "node_index": 143,
+          "name": "/model/enc/df_conv0/df_conv0.2/Conv",
+          "resident_instruction_indices": [
+            8238
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF4": 1
+          }
+        },
+        {
+          "node_index": 146,
+          "name": "/model/enc/df_conv1/df_conv1.1/Conv",
+          "resident_instruction_indices": [
+            9178
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF4": 1
+          }
+        },
+        {
+          "node_index": 319,
+          "name": "/model/erb_dec/convt3/convt3.1/Conv",
+          "resident_instruction_indices": [
+            19663
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF4": 1
+          }
+        },
+        {
+          "node_index": 330,
+          "name": "/model/erb_dec/convt2/convt2.1/Conv",
+          "resident_instruction_indices": [
+            21413
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF4": 1
+          }
+        },
+        {
+          "node_index": 341,
+          "name": "/model/erb_dec/convt1/convt1.1/Conv",
+          "resident_instruction_indices": [
+            23219
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF4": 1
+          }
+        },
+        {
+          "node_index": 346,
+          "name": "/model/erb_dec/conv0_out/conv0_out.0/Conv",
+          "resident_instruction_indices": [
+            23970
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF4": 1
+          }
+        },
+        {
+          "node_index": 404,
+          "name": "/model/df_dec/df_convp/df_convp.1/convs.0/Conv",
+          "resident_instruction_indices": [
+            26726
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF4": 1
+          }
+        },
+        {
+          "node_index": 405,
+          "name": "/model/df_dec/df_convp/df_convp.1/convs.1/Conv",
+          "resident_instruction_indices": [
+            27473
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF4": 1
+          }
+        },
+        {
+          "node_index": 407,
+          "name": "/model/df_dec/df_convp/df_convp.2/Conv",
+          "resident_instruction_indices": [
+            27723
+          ],
+          "decoded_conv_instruction_counts": {
+            "IF4": 1
+          }
+        }
+      ]
+    }
+  ]
+}

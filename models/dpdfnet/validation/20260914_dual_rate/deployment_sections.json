@@ -1,0 +1,142 @@
+[
+  {
+    "model": "dpdfnet2_8khz",
+    "sample_rate": 8000,
+    "onnx_sha256": "6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d",
+    "format": "andromeda.dpdfnet2_8khz.streaming-v2",
+    "single_bin": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz-andromeda.bin",
+    "single_bin_bytes": 23721269,
+    "single_bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+    "resident_bytes": 23594048,
+    "resident_sha256": "a0940e29d81aedc1860f20ddd60b630f3241e81c0064a4c3877ee861c7d3627f",
+    "instructions": 27118,
+    "model_base": "0x90000000",
+    "program_address": "0x915ac680",
+    "tensors": {
+      "spec": {
+        "name": "spec",
+        "shape": [
+          1,
+          1,
+          81,
+          2
+        ],
+        "address": 2147483648,
+        "padded_last": 64,
+        "size_bytes": 10368
+      },
+      "spec_e": {
+        "name": "spec_e",
+        "shape": [
+          1,
+          1,
+          81,
+          2
+        ],
+        "address": 2956826880,
+        "padded_last": 64,
+        "size_bytes": 10368
+      },
+      "state_in": {
+        "name": "state_in",
+        "shape": [
+          37860
+        ],
+        "address": 2415919104,
+        "padded_last": 37888,
+        "size_bytes": 75776
+      },
+      "state_out": {
+        "name": "state_out",
+        "shape": [
+          37860
+        ],
+        "address": 2956751104,
+        "padded_last": 37888,
+        "size_bytes": 75776
+      }
+    },
+    "sections": {
+      "instructions": {
+        "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz.instructions.bin",
+        "bytes": 867776,
+        "sha256": "d826270ad182dbf7fb79b0f37d07b4d38b8d87fab081c4a0fed02b12282baba3"
+      },
+      "parameters": {
+        "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz.parameters.bin",
+        "bytes": 22726272,
+        "sha256": "aafd0ed42e4428cf71c23cee1e08950c70814958b86f603905d66e08f28dd812"
+      }
+    }
+  },
+  {
+    "model": "dpdfnet2",
+    "sample_rate": 16000,
+    "onnx_sha256": "4f0ee28935b4a32abecc717d745416976565834d839601acf43031094b4dc94c",
+    "format": "andromeda.dpdfnet2.streaming-v2",
+    "single_bin": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/dpdfnet2-andromeda.bin",
+    "single_bin_bytes": 17984019,
+    "single_bin_sha256": "4f540ae650c27d822f4da24cfb0a0ac7f9cf33e53e84cbd9ce2fc7f1cdd5fc77",
+    "resident_bytes": 17863808,
+    "resident_sha256": "c997284c3c8ef0a4a82078b3abaf2fa6d33754640b18c061845bf68ee958b59d",
+    "instructions": 40264,
+    "model_base": "0x90000000",
+    "program_address": "0x90fceb80",
+    "tensors": {
+      "spec": {
+        "name": "spec",
+        "shape": [
+          1,
+          1,
+          161,
+          2
+        ],
+        "address": 2147483648,
+        "padded_last": 64,
+        "size_bytes": 20608
+      },
+      "spec_e": {
+        "name": "spec_e",
+        "shape": [
+          1,
+          1,
+          161,
+          2
+        ],
+        "address": 2957011328,
+        "padded_last": 64,
+        "size_bytes": 20608
+      },
+      "state_in": {
+        "name": "state_in",
+        "shape": [
+          45424
+        ],
+        "address": 2415919104,
+        "padded_last": 45440,
+        "size_bytes": 90880
+      },
+      "state_out": {
+        "name": "state_out",
+        "shape": [
+          45424
+        ],
+        "address": 2956920448,
+        "padded_last": 45440,
+        "size_bytes": 90880
+      }
+    },
+    "sections": {
+      "instructions": {
+        "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/dpdfnet2.instructions.bin",
+        "bytes": 1288448,
+        "sha256": "899b85840eacc47bb0c8206dc908dbb7e10de35e54de500e5b06c757a79ae897"
+      },
+      "parameters": {
+        "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/dpdfnet2.parameters.bin",
+        "bytes": 16575360,
+        "sha256": "487efdca08cc3d60638a4309604743a685f55077414e4a99857af221f9b73948"
+      }
+    }
+  }
+]
