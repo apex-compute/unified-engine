@@ -65,7 +65,13 @@ def sram_shift(engine, source, destination, elements, value):
 
 
 def sram_copy(engine, source, destination, elements):
-    """Copy finite BF16 lanes from URAM_A using a 1x1 native MAXPOOL walk."""
+    """Copy finite BF16 lanes from URAM_A using multiplication by exact one.
+
+    Native 1x1 MAXPOOL shifts the source by one 64-lane row on RK 0x40519e0a.
+    Broadcast multiplication preserves all normal values and signed zeros;
+    exhaustive hardware tests found magnitudes below 2^-127 flush to signed
+    zero. The upper half of the BF16 subnormal range remains exact.
+    """
     size = elements * 2
     if (elements <= 0 or elements % 64 or elements // 64 > 0xFFF
             or any(address % 128 for address in (source, destination))
@@ -78,10 +84,7 @@ def sram_copy(engine, source, destination, elements):
         return
     if destination < source + size and source < destination + size:
         raise ValueError('SRAM copy ranges partially overlap')
-    engine.start_queue_for_maxpool2d_operation(
-        act_sram_start_addr=source, output_sram_wb_addr=destination,
-        kernel_w=1, kernel_h=1, out_w=elements // 64, out_h=1,
-        w_pad=1, stride_s=1)
+    engine.broadcast_mul(1.0, source, destination, elements)
 
 
 def sram_maximum(engine, left, right, destination, elements):

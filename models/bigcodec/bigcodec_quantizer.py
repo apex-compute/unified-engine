@@ -6,9 +6,12 @@ embedding gather. Tokens use two BF16 integers (low 8 bits, high 5 bits), since 
 single BF16 value cannot represent all 8192 integer token IDs exactly.
 
 The original identity-dot comparison on RK 256-bit build 0xdf0749de flushed
-positive subnormal score differences (less than 2**-126) to zero. The SRAM
-MAXPOOL comparison needs separate hardware validation of subnormal behavior;
-software tests cover both ideal BF16 and input-flushing arithmetic.
+positive subnormal score differences (less than 2**-126) to zero. Exhaustive
+finite-pattern testing of the SRAM mask on build 0x40519e0a instead found 63
+positive gaps below 2**-127 flushed to zero; larger gaps were classified
+correctly. Flushed gaps retain the left candidate as a tie. Zero outputs may
+have a negative sign bit, so this is a numeric contract, not IEEE bit equality.
+Software tests also cover ideal BF16 and input-flushing arithmetic models.
 """
 from __future__ import annotations
 
@@ -192,11 +195,12 @@ def emit_positive_mask(engine, *, source: int, destination: int, elements: int,
 
     Clamping before each scale keeps every intermediate finite. 2**126 followed
     by 2**7 also covers subnormals when the arithmetic preserves them. Exhaustive
-    Testing the original identity-dot mask on RK build 0xdf0749de found 127 mismatches against
-    IEEE x > 0: every positive BF16 subnormal was flushed to zero. All normal
-    finite inputs and zeros matched. Consequently a positive score gap below
-    2**-126 is treated as a tie, keeping the left candidate. This is a measured
-    device arithmetic limit, not a CPU selection fallback.
+    finite-pattern testing on RK build 0x40519e0a found 63 value mismatches
+    against x > 0: positive BF16 encodings 0x0001..0x003f, below 2**-127, become
+    zero. All larger positive gaps, negative inputs and zeros were classified
+    correctly. Some zero results have a negative sign bit. A flushed positive
+    gap therefore keeps the left candidate as a tie. The older identity-dot
+    mask on 0xdf0749de flushed all 127 positive BF16 subnormals below 2**-126.
     """
     if elements < WIDTH or elements % WIDTH:
         raise ValueError("Mask element count must be a positive multiple of 64")
