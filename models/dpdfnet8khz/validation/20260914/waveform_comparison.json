@@ -1,0 +1,43 @@
+{
+  "method": "Native8k shared STFT/iSTFT; CPU reconstruction exactly matches stored CPU WAV; no gain/time fitting or trimming; each original sample retained",
+  "pooled_relative_l2": 0.011583238748905064,
+  "pooled_rmse": 0.0006814961442407401,
+  "cases": [
+    {
+      "id": "p232_007",
+      "variant": "baseline_if8",
+      "sample_rate": 8000,
+      "samples": 31648,
+      "duration_s": 3.956,
+      "all_finite": true,
+      "relative_l2": 0.01274209627245239,
+      "rmse": 0.0009144800876787261,
+      "max_abs_error": 0.007579386234283447,
+      "cpu_peak": 0.49513670802116394,
+      "fpga_peak": 0.4993385076522827,
+      "cpu_wav_sha256": "5336d2cb51bb95126041d6f3caf0bd2d4eff9873f4d08ddb22e802cc90b5b63d",
+      "noisy_wav_sha256": "d3c6531d4a3eaf8d02c45d86bd9860a27b22112b5cae08b92645bc996ce9538b",
+      "fpga_spectrum_sha256": "0caf8c5b3aa6e648f0d0d1ca2c409aa222e2ed6397786063c126a33e0fe7f5bd",
+      "output_wav": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_rk256/baseline_if8/p232_007_enhanced_8khz.wav",
+      "output_wav_sha256": "6bcff37d042def9b78cf5c8cec939e047b1686fa2b26a1413cba6943f0a5c694"
+    },
+    {
+      "id": "p257_018",
+      "variant": "baseline_if8",
+      "sample_rate": 8000,
+      "samples": 35349,
+      "duration_s": 4.418625,
+      "all_finite": true,
+      "relative_l2": 0.008214613713294877,
+      "rmse": 0.0003626720988676575,
+      "max_abs_error": 0.004546701908111572,
+      "cpu_peak": 0.42682209610939026,
+      "fpga_peak": 0.43136879801750183,
+      "cpu_wav_sha256": "90811b54e1068590a7a035f72920e0bb5c16b85ba46083dcbf25c65e72f0f164",
+      "noisy_wav_sha256": "3f197727de68daf06cb88c751268718d964e571679997fd229bd4de7940edb52",
+      "fpga_spectrum_sha256": "c1b3ff6d227a213e553971705f9dbb88d338148c94cd0ce13053e01328c91a0a",
+      "output_wav": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_rk256/baseline_if8/p257_018_enhanced_8khz.wav",
+      "output_wav_sha256": "274183aca24fa6971b62af2bd3e063b135bd3c1f6d6df52c9fd2fb8bbe002553"
+    }
+  ]
+}

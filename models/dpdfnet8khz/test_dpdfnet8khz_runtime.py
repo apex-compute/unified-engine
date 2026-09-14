@@ -32,6 +32,11 @@ class NativeRuntimeTest(unittest.TestCase):
             dp.validate_hardware({"format": "andromeda.dpdfnet2.streaming-v2",
                                   "model": "dpdfnet2"})
 
+    def test_old_native_artifact_requires_corrected_compiler(self):
+        with self.assertRaisesRegex(RuntimeError, "rebuild"):
+            dp.validate_hardware({"format": "andromeda.dpdfnet2_8khz.streaming-v1",
+                                  "model": "dpdfnet2_8khz"})
+
     def test_wrong_source_model_is_rejected_even_with_native_format(self):
         with self.assertRaisesRegex(RuntimeError, "source-model checksum"):
             dp.validate_hardware({"format": dp.FORMAT, "model": "dpdfnet2_8khz",

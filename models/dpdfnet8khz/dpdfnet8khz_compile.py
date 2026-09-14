@@ -24,6 +24,8 @@ for path in (HERE, SHARED, HERE.parents[1]):
 
 import user_dma_core as udc
 from dpdfnet_compile import GraphCompiler as SharedGraphCompiler
+import yolov5_precompiled as shared
+from yolov5_common import quantize_conv_gather_if8
 from dpdfnet_precompiled import (
     DeviceEmitter, copy_patterns, padded_row_patterns, physical_indices,
     transform_source_indices,
@@ -185,6 +187,40 @@ class GraphCompiler(SharedGraphCompiler):
                 matrices.append(self.emitter.allocate_constant(selector))
             self.pixel8_selectors[index] = matrices
 
+    def _prepare_conv_resources(self):
+        resources = super()._prepare_conv_resources()
+        for index, resource in resources.items():
+            if resource["kind"] != "dense" or resource["plan"]["data_type"] != udc.TYPE.IF4:
+                continue
+            # The shared YOLO policy favors IF4 for pointwise/channel layouts.
+            # Native speech enhancement is sensitive to that weight error.
+            # Every pinned 8-kHz dense kernel fits the existing IF8 gather
+            # format; reuse its quantizer and precision-aware tile planner.
+            node = self.model.graph.node[index]
+            weight = torch.from_numpy(np.asarray(self.initializers[node.input[1]], dtype=np.float32))
+            bias = (torch.from_numpy(np.asarray(self.initializers[node.input[2]], dtype=np.float32))
+                    if len(node.input) > 2 else None)
+            conv = torch.nn.Conv2d(weight.shape[1], weight.shape[0], tuple(weight.shape[2:]),
+                                   bias=bias is not None)
+            with torch.no_grad():
+                conv.weight.copy_(weight)
+                if bias is not None:
+                    conv.bias.copy_(bias)
+            prepared = quantize_conv_gather_if8(conv, None)
+            encoded = {
+                "precision": "if8", "layout": "gather",
+                "codes_packed": self._pack_quantized_codes(prepared.codes, "if8"),
+                "codes_shape": list(prepared.codes.shape),
+                "block_scales": prepared.block_scales,
+                "bias": (torch.empty(0, dtype=torch.bfloat16)
+                         if prepared.bias is None else prepared.bias),
+            }
+            original = resource["plan"]
+            resource["plan"] = shared._prepare_conv_plan(
+                original["operation"], encoded, original["source"], original["destination"],
+                self.emitter.image, allow_half_vector_output=True)
+        return resources
+
     def _plan_auxiliary_layouts(self):
         super()._plan_auxiliary_layouts()
         self.mapping_scratch = self._allocate_aux("@native8/copy", (64,))
@@ -275,6 +311,8 @@ class GraphCompiler(SharedGraphCompiler):
             udc.UE_AXI_DATA_WIDTH_BITS = previous_width
         hardware["format"] = FORMAT
         hardware["axi_data_width_bits"] = 256
+        hardware["dense_convolution_precision"] = "IF8"
+        hardware["optimizations"] = list(getattr(self, "optimization_names", ()))
         return hardware
 
 
@@ -293,10 +331,102 @@ class CopyOptimizationMixin:
                 self.split10_aux[index] = self._allocate_aux(
                     f"@native8/split10/{index}", source.shape)
 
-    def emit_view(self, index, node):
-        super().emit_view(index, node)
-        if index in self.split10_aux:
+    def emit_binary(self, index, node, mode):
+        super().emit_binary(index, node, mode)
+        if mode in (udc.UE_MODE.ELTWISE_ADD, udc.UE_MODE.ELTWISE_SUB):
+            output = self.layout(node.output[0])
+            inputs = [self.layout(name) for name in node.input]
+            if all(value.shape == output.shape and (
+                    value.logical_last == value.padded_last
+                    or value.name in self.emitter._zero_padding) for value in inputs):
+                self.emitter.mark_padding_zero(output)
+
+    def emit_transpose(self, index, node):
+        super().emit_transpose(index, node)
+        resource = self.transpose_aux.get(index)
+        if resource is not None and resource["direction"] == "wide_channels":
+            # The shared lowering clears its 64-row input tile before loading
+            # the logical channels. Unused output channels are exactly zero.
             self.emitter.mark_padding_zero(self.layout(node.output[0]))
+
+    def _load_pair_vector(self, address, valid_lanes, *, zero_padding_known):
+        engine = self.emitter.engine
+        if valid_lanes == 64 or zero_padding_known:
+            engine.accelerator_memory_to_sram(address, 0, 64)
+            return
+        # A one-hot product still propagates NaN from unselected lanes. Copy
+        # only the logical prefix into a zeroed, aligned DRAM row first.
+        scratch = self.emitter.source_scratch
+        self.emitter.emit_zero(scratch)
+        engine.accelerator_memory_to_sram(address, 0, 0, memcpy_length_bytes=valid_lanes * 2)
+        engine.sram_to_accelerator_memory(
+            0, scratch.address, 0, memcpy_length_bytes=valid_lanes * 2)
+        engine.accelerator_memory_to_sram(scratch.address, 0, 64)
+
+    def _emit_pair_rows(self, source, output, *, split10):
+        engine = self.emitter.engine
+        identity_sram, output_sram = 0x80000, 0x2000
+        engine.accelerator_memory_to_sram(self.identity_address, identity_sram, 64 * 64)
+        zero_known = source.name in self.emitter._zero_padding
+        bulk_bytes = source.size_bytes + output.size_bytes
+        if (bulk_bytes <= udc.URAM_NEAR_FULL_SIZE
+                and (not split10 or zero_known)):
+            # Keep the complete input before the complete output in URAM_A.
+            # The identity occupies only URAM_B. This retains identical N=2
+            # matvecs while removing a DMA pair per input row/tile.
+            tail = source.logical_elements % 64
+            patch_tail = not split10 and tail != 0 and not zero_known
+            if patch_tail:
+                self._load_pair_vector(
+                    source.address + source.size_bytes - 128, tail,
+                    zero_padding_known=False)
+            engine.accelerator_memory_to_sram(
+                source.address, 0, 0, memcpy_length_bytes=source.size_bytes)
+            if patch_tail:
+                engine.accelerator_memory_to_sram(
+                    self.emitter.source_scratch.address, source.size_bytes - 128, 64)
+            pairs_per_source = 5 if split10 else 32
+            for row in range(output.rows):
+                source_row, pair = divmod(row, pairs_per_source)
+                engine.start_queue_for_bf16_matvec_operation(
+                    max_clear_en=0, fmax_context_addr=0,
+                    vector_sram_start_addr=source_row * 128,
+                    matrix_sram_start_addr=identity_sram + pair * 256,
+                    output_sram_wb_addr=source.size_bytes + row * 128,
+                    K=64, N=2, stride_z=64)
+            engine.sram_to_accelerator_memory(
+                source.size_bytes, output.address, 0,
+                memcpy_length_bytes=output.size_bytes)
+            self.emitter.mark_padding_zero(output)
+            return
+        if split10:
+            groups = ((row, row * 5, 5, 10) for row in range(source.rows))
+        else:
+            groups = ((chunk, row, min(32, output.rows - row),
+                       min(32, output.rows - row) * 2)
+                      for chunk, row in enumerate(range(0, output.rows, 32)))
+        for source_row, destination_row, pairs, valid_lanes in groups:
+            self._load_pair_vector(
+                source.address + source_row * 128, valid_lanes,
+                zero_padding_known=zero_known)
+            for pair in range(pairs):
+                engine.start_queue_for_bf16_matvec_operation(
+                    max_clear_en=0, fmax_context_addr=0,
+                    vector_sram_start_addr=0,
+                    matrix_sram_start_addr=identity_sram + pair * 256,
+                    output_sram_wb_addr=output_sram + pair * 128,
+                    K=64, N=2, stride_z=64)
+            engine.sram_to_accelerator_memory(
+                output_sram, output.address + destination_row * 128, 0,
+                memcpy_length_bytes=pairs * 128)
+        self.emitter.mark_padding_zero(output)
+
+    def emit_view(self, index, node):
+        if index in self.pair_unpack_aux or index in self.split10_aux:
+            return self._emit_pair_rows(
+                self.layout(node.input[0]), self.layout(node.output[0]),
+                split10=index in self.split10_aux)
+        super().emit_view(index, node)
 
     def emit_state_copy(self, resource):
         # prepare_state_copy advances complete destination rows by 64 source
@@ -341,10 +471,19 @@ class CopyOptimizationMixin:
 
 
 from dpdfnet8khz_conv import ConvTransposeOptimizationMixin
+from dpdfnet8khz_pack import PairPackOptimizationMixin
+from dpdfnet8khz_reduce import ReductionOptimizationMixin
+from dpdfnet8khz_state_shift import StateShiftOptimizationMixin
 
 
-class OptimizedGraphCompiler(ConvTransposeOptimizationMixin, CopyOptimizationMixin, GraphCompiler):
-    """Opt-in lowering pending comparison with the native baseline on hardware."""
+class OptimizedGraphCompiler(StateShiftOptimizationMixin, PairPackOptimizationMixin,
+                             ReductionOptimizationMixin, ConvTransposeOptimizationMixin,
+                             CopyOptimizationMixin, GraphCompiler):
+    """Native IF8 compiler with fused arithmetic and SRAM layout operations."""
+
+    optimization_names = ("conv-transpose-n2", "conv-relu", "state-copy-batching",
+                          "state-shift128", "complex-pair-unpack", "complex-pair-pack",
+                          "complex-reduce")
 
 
 def main():
@@ -354,8 +493,11 @@ def main():
     parser.add_argument("--output", type=Path,
                         default=HERE / "dpdfnet8khz_bin/dpdfnet2_8khz-andromeda.bin")
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--optimize", action="store_true",
-                        help="enable convolution transpose pruning and batched layout copies")
+    lowering = parser.add_mutually_exclusive_group()
+    lowering.add_argument("--optimize", dest="optimize", action="store_true", default=True,
+                          help="use fused native layout and convolution lowering (default)")
+    lowering.add_argument("--baseline", dest="optimize", action="store_false",
+                          help="build the unoptimized IF8 reference for compiler comparisons")
     args = parser.parse_args()
     if args.output.expanduser().resolve() == args.model.expanduser().resolve():
         parser.error("--output must differ from the source ONNX model")

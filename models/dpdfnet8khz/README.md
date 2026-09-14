@@ -6,11 +6,11 @@ Its native sample rate is 8 kHz, with a 160-sample Vorbis window, 80-sample
 hop, 81 frequency bins and 37,860 recurrent-state values. The ONNX graph
 has 492 operations. The existing 16-kHz port remains under `models/dpdfnet/`.
 
-Status: CPU audio-to-audio execution is verified. The initial whole-graph FPGA
-compiler and runner target RK AXI-256 with queue-CONFIG convolution. FPGA
-accuracy and the 10-ms real-time deadline are **not yet verified**: Italy's
-device changed to an incompatible AXI-512 build during implementation.
-See [validation results](VALIDATION.md).
+CPU and FPGA audio execution are verified on Italy's RK AXI-256 with
+queue-CONFIG convolution, build `0x5fbbfbf0` from run `34787221985`.
+The optimized IF8 output matches the corrected baseline on 1,362 frames,
+including exact-zero silence. See [validation results](VALIDATION.md) for
+CPU waveform agreement and the measured 10-ms deadline results.
 
 Install the model-specific dependencies from the repository root, using an
 environment with the repository's matching `torch` and `torchaudio` packages:
@@ -49,7 +49,7 @@ initial values; the remaining recurrent state starts at zero.
 Build a single deployment bin without accessing the FPGA:
 
 ```bash
-python models/dpdfnet8khz/dpdfnet8khz_compile.py --download --force
+python models/dpdfnet8khz/dpdfnet8khz_compile.py --download --optimize --force
 ```
 
 On a compatible RK-256 queue-CONFIG build, run audio from that bin:
@@ -66,19 +66,23 @@ state, with one input upload, START/HALT sequence and output read per 80-sample
 hop. Neural operations stay on the FPGA; audio framing and reconstruction run
 on the host. The runner verifies the artifact checksum and compiled AXI width
 before resetting or uploading. `--device rk` labels the target; it cannot
-change the physical FPGA build. The current AXI-512 build is rejected.
+change the physical FPGA build. Incompatible AXI-512 builds are rejected.
 
-An opt-in compiler optimization batches packed-state copies and reduces
-convolution transpose work. Keep a separate artifact for comparison:
+The optimized compiler uses IF8 dense convolution weights, fuses eligible
+convolution/ReLU operations, and rearranges state and complex values in SRAM.
+Keep a separate artifact when comparing further compiler changes:
 
 ```bash
 python models/dpdfnet8khz/dpdfnet8khz_compile.py --optimize --force \
   --output models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz-optimized.bin
 ```
 
-This reduces the initial program from 53,890 to 33,342 instructions. It remains
-experimental until baseline and optimized outputs match on compatible hardware.
+The unoptimized compiler is available with `--baseline`. Both compilers
+use the same IF8 dense weights and BF16 depthwise/recurrent arithmetic.
 Instruction count alone does not establish latency.
+
+Current deployments use format `streaming-v2`. Older native bins must be
+rebuilt to include the IF8 policy and corrected single-channel transpose.
 
 The runner writes per-frame hardware and host timings beside its output as
 `OUTPUT.metrics.json`; `--report` selects another path. Its final `TEST_RESULT`

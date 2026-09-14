@@ -1,0 +1,19 @@
+{
+  "run_id": 34787221985,
+  "run_url": "https://github.com/apex-compute/andromeda/actions/runs/34787221985",
+  "source_commit": "5fbbfbf095ae7d2f30175b723a4c0a00330ee246",
+  "artifact_sha256": "427db367bdf7bbfdce6de0392b967eb551960efdfd6d38110601363713392e2a",
+  "bit_sha256": "86dadaca4716127cce0ebb07838457527b860d3dffe747653f9edd7ce0b63e27",
+  "device": "xcku5p_0",
+  "target": "RK-256",
+  "jtag_target": "localhost:3121/xilinx_tcf/Xilinx/0ABC01A",
+  "programming_method": "JTAG volatile configuration",
+  "programmed": true,
+  "programming_log_sha256": "c2afe272e2aaf6529b119a290f712c32e844af5fe11f730f94d93038e0170a25",
+  "expected_hardware_version": "0x5fbbfbf0",
+  "expected_hw_info": "0x80214d40",
+  "runtime_verified": false,
+  "status": "reloaded after host reset; awaiting manual PCIe rescan",
+  "updated_at_utc": "2026-09-14T00:24:02.332563+00:00",
+  "programmed_at_utc": "2026-09-14T02:44:27+00:00"
+}

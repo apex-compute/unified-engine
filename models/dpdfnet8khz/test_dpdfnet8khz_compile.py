@@ -1,6 +1,8 @@
 """Independent memory-model checks for native 8-kHz compiler layout operators."""
 
 import sys
+import contextlib
+import io
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,17 +14,25 @@ import torch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from dpdfnet8khz_compile import AlignedMappingEmitter, GraphCompiler, OptimizedGraphCompiler
+from dpdfnet8khz_compile import AlignedMappingEmitter, CopyOptimizationMixin, GraphCompiler
+from dpdfnet8khz_common import DEFAULT_MODEL_PATH, validate_digest
 from dpdfnet_precompiled import make_layout, physical_indices
 import user_dma_core as udc
+
+
+class CopyCompiler(CopyOptimizationMixin, GraphCompiler):
+    """Isolate copy lowering; other mixins have their own SRAM interpreters."""
 
 
 class MemoryEngine:
     def __init__(self):
         self.regions = {}
-        self.sram = np.zeros(262144, dtype=np.float32)
+        self.sram = np.zeros(524288, dtype=np.float32)
         self.constant_cursor = 0x10000000
         self.matmul_shapes = []
+        self.matvec_calls = []
+        self.dma_reads = []
+        self.dma_writes = []
 
     def view(self, address, elements):
         for base, data in self.regions.items():
@@ -42,6 +52,8 @@ class MemoryEngine:
                                    stride_bytes_per_chunk=0, stride_jump_bytes=0):
         assert address % 32 == 0 and sram % 128 == 0
         count = elements if memcpy_length_bytes is None else memcpy_length_bytes // 2
+        assert sram % 0x80000 + count * 2 <= udc.URAM_NEAR_FULL_SIZE
+        self.dma_reads.append((address, sram, count))
         if stride_jump_bytes:
             chunk = stride_bytes_per_chunk // 2
             for offset in range(0, count, chunk):
@@ -54,6 +66,8 @@ class MemoryEngine:
                                    stride_bytes_per_chunk=0, stride_jump_bytes=0):
         assert address % 32 == 0 and sram % 128 == 0
         count = elements if memcpy_length_bytes is None else memcpy_length_bytes // 2
+        assert sram % 0x80000 + count * 2 <= udc.URAM_NEAR_FULL_SIZE
+        self.dma_writes.append((sram, address, count))
         if stride_jump_bytes:
             chunk = stride_bytes_per_chunk // 2
             for offset in range(0, count, chunk):
@@ -80,6 +94,29 @@ class MemoryEngine:
     def accelerator_memcpy(self, source, destination, size):
         assert source % 32 == destination % 32 == 0
         self.view(destination, size // 2)[:] = self.view(source, size // 2).copy()
+
+    def start_queue_for_bf16_matvec_operation(self, **call):
+        self.matvec_calls.append(call)
+        self.assert_sram_ranges(call)
+        source = self.sram[call["vector_sram_start_addr"] // 2:][:call["K"]].copy()
+        weight = np.stack([
+            self.sram[(call["matrix_sram_start_addr"] // 2 + row * call["stride_z"]):][
+                :call["K"]] for row in range(call["N"])])
+        value = torch.from_numpy(source @ weight.T).bfloat16().float().numpy()
+        output = self.sram[call["output_sram_wb_addr"] // 2:][:64]
+        # The tested N=2 hardware writeback clears all unused lanes.
+        output[:] = 0
+        output[:call["N"]] = value
+
+    @staticmethod
+    def assert_sram_ranges(call):
+        assert call["K"] == 64 and call["N"] == 2
+        assert 0 <= call["vector_sram_start_addr"] < 0x80000
+        assert 0x80000 <= call["matrix_sram_start_addr"] < 0x100000
+        assert call["output_sram_wb_addr"] >= call["vector_sram_start_addr"] + call["K"] * 2
+        assert call["output_sram_wb_addr"] + 128 <= 0x80000
+        assert all(call[key] % 128 == 0 for key in (
+            "vector_sram_start_addr", "matrix_sram_start_addr", "output_sram_wb_addr"))
 
 
 class NativeCompilerLayoutTest(unittest.TestCase):
@@ -208,10 +245,13 @@ class NativeCompilerLayoutTest(unittest.TestCase):
         self.assert_logical(destination, logical.transpose(0, 2, 3, 4, 1).reshape(destination.shape))
 
     def optimized_compiler(self):
-        compiler = OptimizedGraphCompiler.__new__(OptimizedGraphCompiler)
+        compiler = CopyCompiler.__new__(CopyCompiler)
         compiler.__dict__.update(self.compiler.__dict__)
         compiler.state_copy_scratch = self.layout("@state_copy", (64,), 0x700000)
         compiler.state_batch_scratch = self.layout("@state_batch", (128, 64), 0x800000)
+        compiler.identity_address = self.engine.allocate_constant(torch.eye(64, dtype=torch.bfloat16))
+        compiler.pair_unpack_aux = {}
+        compiler.split10_aux = {}
         return compiler
 
     def test_batched_state_copy_handles_long_shift_and_partial_boundaries(self):
@@ -244,6 +284,7 @@ class NativeCompilerLayoutTest(unittest.TestCase):
         compiler.pack60_aux = {}
         compiler.unpack10_aux = {}
         compiler.split10_aux = {0: temporary}
+        self.emitter.mark_padding_zero(source)
         compiler.split10_addresses = []
         for pair in range(5):
             selector = torch.zeros(64, 64, dtype=torch.bfloat16)
@@ -251,8 +292,81 @@ class NativeCompilerLayoutTest(unittest.TestCase):
             compiler.split10_addresses.append(self.engine.allocate_constant(selector))
         compiler.emit_view(0, SimpleNamespace(input=["source"], output=["destination"]))
         self.assert_logical(destination, logical.reshape(destination.shape))
-        self.assertEqual(self.engine.matmul_shapes, [(80, 64, 64)] * 5)
+        self.assertEqual(len(self.engine.matvec_calls), 400)
+        self.assertEqual(self.engine.matmul_shapes, [])
+        self.assertEqual(sum(address == source.address for address, _, _ in self.engine.dma_reads), 1)
+        self.assertEqual(sum(address == destination.address for _, address, _ in self.engine.dma_writes), 1)
+        self.assertTrue(all(call["output_sram_wb_addr"] >= source.size_bytes
+                            for call in self.engine.matvec_calls))
         self.assertIn(destination.name, self.emitter._zero_padding)
+
+    def test_direct_pair_unpack_handles_tails_and_nan_source_padding(self):
+        compiler = self.optimized_compiler()
+        compiler.pair_unpack_aux = {0: {}}
+        for count in (1, 31, 32, 33, 405, 1200):
+            with self.subTest(pairs=count):
+                source = self.layout("source", (count * 2,), 0x400000, padding=np.nan)
+                destination = self.layout("destination", (count, 2), 0x500000, padding=np.nan)
+                self.emitter._zero_padding.discard(source.name)
+                self.emitter._zero_padding.discard(destination.name)
+                logical = self.seed(source)
+                self.engine.sram[:] = np.nan
+                self.engine.matvec_calls.clear()
+                self.engine.dma_writes.clear()
+                compiler.emit_view(0, SimpleNamespace(input=["source"], output=["destination"]))
+                self.assert_logical(destination, logical.reshape(count, 2))
+                self.assertEqual(len(self.engine.matvec_calls), count)
+                self.assertEqual(sum(address == destination.address
+                                     for _, address, _ in self.engine.dma_writes), 1)
+                self.assertTrue(all(call["output_sram_wb_addr"] >= source.size_bytes
+                                    for call in self.engine.matvec_calls))
+
+    def test_direct_split10_ignores_nan_padding_without_a_zero_fact(self):
+        compiler = self.optimized_compiler()
+        source = self.layout("source", (80, 10), 0x400000, padding=np.nan)
+        destination = self.layout("destination", (400, 2), 0x500000, padding=np.nan)
+        logical = self.seed(source)
+        compiler.split10_aux = {0: None}
+        self.engine.sram[:] = np.nan
+        compiler.emit_view(0, SimpleNamespace(input=["source"], output=["destination"]))
+        self.assert_logical(destination, logical.reshape(400, 2))
+        self.assertEqual(len(self.engine.matvec_calls), 400)
+
+    def test_pair_unpack_falls_back_when_bulk_buffers_exceed_uram(self):
+        compiler = self.optimized_compiler()
+        count = 5001
+        source = self.layout("source", (count * 2,), 0x400000, padding=np.nan)
+        destination = self.layout("destination", (count, 2), 0x500000, padding=np.nan)
+        logical = self.seed(source)
+        self.assertGreater(source.size_bytes + destination.size_bytes, udc.URAM_NEAR_FULL_SIZE)
+        compiler.pair_unpack_aux = {0: {}}
+        compiler.emit_view(0, SimpleNamespace(input=["source"], output=["destination"]))
+        self.assert_logical(destination, logical.reshape(count, 2))
+        output_writes = [address for _, address, _ in self.engine.dma_writes
+                         if destination.address <= address < destination.address + destination.size_bytes]
+        self.assertGreater(len(output_writes), 1)
+        self.assertTrue(all(call["output_sram_wb_addr"] + 128 <= udc.URAM_NEAR_FULL_SIZE
+                            for call in self.engine.matvec_calls))
+
+
+class PinnedModelPrecisionTest(unittest.TestCase):
+    @unittest.skipUnless(DEFAULT_MODEL_PATH.is_file(), "pinned native8k model is not cached")
+    def test_pointwise_and_other_dense_convolutions_use_if8(self):
+        digest = validate_digest(DEFAULT_MODEL_PATH)
+        with patch.object(udc, "UE_AXI_DATA_WIDTH_BITS", 256), contextlib.redirect_stdout(io.StringIO()):
+            compiler = GraphCompiler(onnx, onnx.load(DEFAULT_MODEL_PATH), digest)
+        pointwise = []
+        for index, resource in compiler.conv_resources.items():
+            if resource["kind"] != "dense":
+                continue
+            plan = resource["plan"]
+            self.assertEqual(plan["data_type"], udc.TYPE.IF8, index)
+            self.assertTrue(plan["use_gather"], index)
+            self.assertGreater(plan["gather_chunks"], 0)
+            self.assertLessEqual(plan["gather_chunks"], 4)
+            if (plan["kernel_h"], plan["kernel_w"]) == (1, 1):
+                pointwise.append(index)
+        self.assertEqual(pointwise, [49, 52, 55, 144, 147, 339, 350, 361, 428])
 
 
 if __name__ == "__main__":

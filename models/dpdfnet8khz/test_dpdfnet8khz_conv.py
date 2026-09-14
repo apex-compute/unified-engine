@@ -30,6 +30,11 @@ class MemoryEngine:
         self.sram = np.full(0x100000 // 2, 0x7FC0, dtype=np.uint16)
         self.matvecs = []
         self.dmas = []
+        self.previous_scalar = np.uint16(0)
+        self.nops = 0
+
+    def generate_instruction_nop(self):
+        self.nops += 1
 
     def view(self, address, size):
         assert address % 2 == 0 and size % 2 == 0
@@ -71,6 +76,18 @@ class MemoryEngine:
         for row in range(kwargs["N"]):
             address = matrix_address + row * kwargs["stride_z"] * 2
             values.append(self.sram_view(address, 128)[selected[0]])
+        # Hardware capture on RK build 5fbbfbf0 showed that consecutive N=1
+        # matvecs return the previous scalar, shifting Conv46's packed input
+        # by one spatial position. Model that observed case so the old lowering
+        # fails this independent tensor-permutation test.
+        if kwargs["N"] == 1:
+            values, self.previous_scalar = [self.previous_scalar], values[0]
+        else:
+            self.previous_scalar = values[-1]
+        if kwargs.get("lalu_mode") == udc.LALU_MODE.CLAMP:
+            assert kwargs["lalu_a"] == udc.LALU_CLAMP_RELU_A
+            assert kwargs["lalu_b"] == udc.LALU_CLAMP_RELU_B
+            values = [0 if value & 0x8000 else value for value in values]
         self.sram_view(output_address, kwargs["N"] * 2)[:] = values
 
 
@@ -83,6 +100,10 @@ class Baseline:
 
 
 class Compiler(ConvTransposeOptimizationMixin, Baseline):
+    @property
+    def layouts(self):
+        return self.emitter.layouts
+
     def layout(self, name):
         return self.emitter.layouts[name]
 
@@ -142,7 +163,7 @@ class ConvLayoutTest(unittest.TestCase):
         self.assert_tensor(packed, expected)
         self.assertEqual(self.compiler.fallbacks, [])
         self.assertEqual(len(self.engine.matvecs), height * width)
-        self.assertTrue(all(call["N"] == channels for call in self.engine.matvecs))
+        self.assertTrue(all(call["N"] == max(2, channels) for call in self.engine.matvecs))
         self.assertEqual(sum(address == source.address for kind, address, size
                              in self.engine.dmas if kind == "read"), 1)
 
@@ -161,6 +182,13 @@ class ConvLayoutTest(unittest.TestCase):
 
     def test_input_spatial_padding_and_three_column_blocks(self):
         self.stage(5, 3, 129, (1, 2, 2, 3))
+
+    def test_single_channel_uses_zero_dummy_channel_to_avoid_scalar_delay(self):
+        self.stage(1, 3, 80, (0, 1, 0, 1))
+        source = self.compiler.layout("source")
+        second_channel = self.engine.sram_view(0x80000 + source.size_bytes, source.size_bytes)
+        np.testing.assert_array_equal(second_channel, 0)
+        self.assertTrue(all(call["N"] == 2 for call in self.engine.matvecs))
 
     def test_all_native_output_shapes_and_padding(self):
         for channels, width in ([(64, width) for width in (10, 20, 40, 80)]
@@ -203,6 +231,44 @@ class ConvLayoutTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "channel mismatch"):
             self.compiler._stage_conv_input(0, self.node)
         self.assertEqual(self.engine.dmas, [])
+
+    def fusion_graph(self, *, extra_use=False, exposed=False, state_use=False):
+        packed = self.layout("packed", (1, 20, 64))
+        self.layout("conv", (1, 64, 1, 20))
+        output = self.layout("output", (1, 64, 1, 20))
+        conv = SimpleNamespace(op_type="Conv", input=["source"], output=["conv"])
+        relu = SimpleNamespace(op_type="Relu", input=["conv"], output=["output"])
+        nodes = [conv, relu]
+        if extra_use or state_use:
+            nodes.append(SimpleNamespace(op_type="Concat" if state_use else "Identity",
+                                         input=["conv"], output=["state_out" if state_use else "extra"]))
+        self.compiler.model = SimpleNamespace(graph=SimpleNamespace(
+            node=nodes, output=[SimpleNamespace(name="conv" if exposed else "output")]))
+        self.compiler.conv_aux = {0: {"output": packed}}
+        self.compiler._plan_conv_relu_fusions()
+        return packed, output, conv, relu
+
+    def test_single_consumer_relu_fuses_transpose_and_keeps_padding_zero(self):
+        packed, output, conv, relu = self.fusion_graph()
+        pattern = np.array([0xC040, 0xBF80, 0x8000, 0, 0x3F80, 0x4080], dtype=np.uint16)
+        logical = np.resize(pattern, packed.logical_elements).reshape(packed.shape)
+        self.engine.regions[packed.address][:] = logical.reshape(-1)
+        expected = logical.transpose(2, 0, 1)[None].copy()
+        expected[(expected & 0x8000) != 0] = 0
+        self.compiler._unstage_conv_output(0, conv)
+        self.compiler.emit_node(1, relu)
+        self.assert_tensor(output, expected)
+        self.assertEqual(self.engine.nops, 1)
+        self.assertEqual(self.compiler.conv_relu_fusions, {0: "output"})
+        self.assertTrue(all(call["lalu_mode"] == udc.LALU_MODE.CLAMP for call in self.engine.matvecs))
+
+    def test_relu_fusion_preserves_other_consumers_graph_outputs_and_state(self):
+        for option in ("extra_use", "exposed", "state_use"):
+            with self.subTest(option=option):
+                self.setUp()
+                self.fusion_graph(**{option: True})
+                self.assertEqual(self.compiler.conv_relu_fusions, {})
+                self.assertEqual(self.compiler.conv_relu_skips, set())
 
 
 if __name__ == "__main__":

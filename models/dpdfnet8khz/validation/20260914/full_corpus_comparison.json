@@ -1,0 +1,246 @@
+{
+  "model": "dpdfnet2_8khz",
+  "reference_manifest": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/cpu_reference_manifest.json",
+  "reference_manifest_sha256": "b76f71c5c9d145b3c5ae0ece4c50516f685ea9bdb770fb6c0c2d12d59690e17a",
+  "fpga_directory": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_rk256/optimized_if8_fused",
+  "deadline_ms": 10.0,
+  "expected_axi_data_width_bits": 256,
+  "accuracy_screen": {
+    "max_relative_l2": 0.25,
+    "max_silence_abs": 1e-06,
+    "description": "CPU spectrum agreement without gain or delay fitting; gross-error screening, not perceptual quality certification"
+  },
+  "timing_scope": "every measured host neural frame, including DMA/wait; excludes upload, audio STFT/iSTFT, file I/O; no warmup frames discarded",
+  "qualification_scope": "observed corpus only; does not establish hard real-time guarantees or end-to-end audio latency",
+  "speech_quality_qualified": false,
+  "same_deployment": true,
+  "realtime_smoke_pass": false,
+  "cases_total": 4,
+  "cases_smoke_pass": 0,
+  "host_timing": {
+    "frames": 1362,
+    "mean_ms": 10.33937075477623,
+    "p95_ms": 10.738085348566528,
+    "p99_ms": 10.971675770560978,
+    "max_ms": 13.36754800286144,
+    "deadline_misses": 1292,
+    "deadline_miss_fraction": 0.9486049926578561,
+    "rtf_at_10ms_hop": 1.033937075477623
+  },
+  "fpga_timing": {
+    "frames": 1362,
+    "mean_ms": 9.455930185189468,
+    "p95_ms": 9.46042670667667,
+    "p99_ms": 9.462549797449363,
+    "max_ms": 9.464798199549888,
+    "deadline_misses": 0,
+    "deadline_miss_fraction": 0.0,
+    "rtf_at_10ms_hop": 0.9455930185189467
+  },
+  "cases": [
+    {
+      "id": "p232_007",
+      "validation_errors": [],
+      "accuracy": {
+        "passed": true,
+        "finite": true,
+        "relative_l2": 0.01506311903388604,
+        "relative_l2_reason": null,
+        "rmse": 0.006789982228163041,
+        "max_abs_error": 0.19190669059753418,
+        "sum_squared_error": 3.002467691293733,
+        "cpu_energy": 13232.701828407633,
+        "elements": 65124
+      },
+      "timing": {
+        "host": {
+          "frames": 402,
+          "mean_ms": 10.333534554887937,
+          "p95_ms": 10.741855248488719,
+          "p99_ms": 10.95118339304463,
+          "max_ms": 11.183686001459137,
+          "deadline_misses": 380,
+          "deadline_miss_fraction": 0.945273631840796,
+          "rtf_at_10ms_hop": 1.0333534554887938
+        },
+        "fpga": {
+          "frames": 402,
+          "mean_ms": 9.455950375653615,
+          "p95_ms": 9.460330682670667,
+          "p99_ms": 9.461628927231807,
+          "max_ms": 9.462829707426856,
+          "deadline_misses": 0,
+          "deadline_miss_fraction": 0.0,
+          "rtf_at_10ms_hop": 0.9455950375653615
+        },
+        "qualification_exclusions": [],
+        "observed_deadline_pass": false
+      },
+      "realtime_smoke_pass": false,
+      "input_sha256": "1efe2b515779e5e962276e7f609c031912ad30a714c2052ade87c8de71355f3f",
+      "cpu_sha256": "25d49ccf65c80a06377ec92d10c8debed98d35141ed4e427a9c96aa750ae56e3",
+      "fpga_sha256": "0caf8c5b3aa6e648f0d0d1ca2c409aa222e2ed6397786063c126a33e0fe7f5bd",
+      "cpu_neural_ms_per_frame": 0.6417693162006234,
+      "log_sha256": "d875acd4b26534232a2ad9e9bb5310ce8aaa522eb61db0eb02e2161e21c49170",
+      "metrics_sha256": "ef85774ec05706d5b21e4b05adcf8f92799f838cdfb98d999a7cb83508a66cf9",
+      "hardware": {
+        "axi_data_width_bits": 256,
+        "hardware_version": "0x5fbbfbf0",
+        "bin_sha256": "37bdf8af02858343366b20c950183e2849e1983aa9ea68730584fca225dc500d"
+      }
+    },
+    {
+      "id": "p257_018",
+      "validation_errors": [],
+      "accuracy": {
+        "passed": true,
+        "finite": true,
+        "relative_l2": 0.011874879328300718,
+        "relative_l2_reason": null,
+        "rmse": 0.0032835771214370095,
+        "max_abs_error": 0.09094667434692383,
+        "sum_squared_error": 0.7825056294329247,
+        "cpu_energy": 5549.183170655639,
+        "elements": 72576
+      },
+      "timing": {
+        "host": {
+          "frames": 448,
+          "mean_ms": 10.335600307923544,
+          "p95_ms": 10.661034247459611,
+          "p99_ms": 10.847188192274189,
+          "max_ms": 11.021367012290284,
+          "deadline_misses": 429,
+          "deadline_miss_fraction": 0.9575892857142857,
+          "rtf_at_10ms_hop": 1.0335600307923545
+        },
+        "fpga": {
+          "frames": 448,
+          "mean_ms": 9.455721787589754,
+          "p95_ms": 9.460124231057764,
+          "p99_ms": 9.461968372093024,
+          "max_ms": 9.463453863465867,
+          "deadline_misses": 0,
+          "deadline_miss_fraction": 0.0,
+          "rtf_at_10ms_hop": 0.9455721787589754
+        },
+        "qualification_exclusions": [],
+        "observed_deadline_pass": false
+      },
+      "realtime_smoke_pass": false,
+      "input_sha256": "d4693976976548903cb39715ac9f89ca3eafbedcf95df9ea669fdfdcd243478d",
+      "cpu_sha256": "2cc480b9e5816a82399d80687098af5531a68ec95c65b3f9f48fc75dafeb4c07",
+      "fpga_sha256": "c1b3ff6d227a213e553971705f9dbb88d338148c94cd0ce13053e01328c91a0a",
+      "cpu_neural_ms_per_frame": 0.6466552854687636,
+      "log_sha256": "4e81ebcbeb7100480c3b6db6e4e32d20127606085253bce271e7187497d0336f",
+      "metrics_sha256": "b697cc2518a0f57d2e8b57006a0deabc18b3a24dc3a0dc795f0c307b4f166200",
+      "hardware": {
+        "axi_data_width_bits": 256,
+        "hardware_version": "0x5fbbfbf0",
+        "bin_sha256": "37bdf8af02858343366b20c950183e2849e1983aa9ea68730584fca225dc500d"
+      }
+    },
+    {
+      "id": "silence_128",
+      "validation_errors": [],
+      "accuracy": {
+        "passed": true,
+        "finite": true,
+        "relative_l2": null,
+        "relative_l2_reason": "zero-energy CPU reference",
+        "rmse": 0.0,
+        "max_abs_error": 0.0,
+        "sum_squared_error": 0.0,
+        "cpu_energy": 0.0,
+        "elements": 20736
+      },
+      "timing": {
+        "host": {
+          "frames": 128,
+          "mean_ms": 10.387677874405199,
+          "p95_ms": 10.948471701703966,
+          "p99_ms": 11.105796901247231,
+          "max_ms": 13.36754800286144,
+          "deadline_misses": 121,
+          "deadline_miss_fraction": 0.9453125,
+          "rtf_at_10ms_hop": 1.03876778744052
+        },
+        "fpga": {
+          "frames": 128,
+          "mean_ms": 9.455906226556639,
+          "p95_ms": 9.460683570892725,
+          "p99_ms": 9.46303615903976,
+          "max_ms": 9.464366091522882,
+          "deadline_misses": 0,
+          "deadline_miss_fraction": 0.0,
+          "rtf_at_10ms_hop": 0.9455906226556638
+        },
+        "qualification_exclusions": [],
+        "observed_deadline_pass": false
+      },
+      "realtime_smoke_pass": false,
+      "input_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee",
+      "cpu_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee",
+      "fpga_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee",
+      "cpu_neural_ms_per_frame": 0.6621606877388331,
+      "log_sha256": "a34dbbfb4c3bca291d91eb9992ab8a0ec513a70c23b753c316600a4623450735",
+      "metrics_sha256": "31a21a42658e7753bd4aec7f19422a56fef75c5d147b2aeffc302ce77023f0a9",
+      "hardware": {
+        "axi_data_width_bits": 256,
+        "hardware_version": "0x5fbbfbf0",
+        "bin_sha256": "37bdf8af02858343366b20c950183e2849e1983aa9ea68730584fca225dc500d"
+      }
+    },
+    {
+      "id": "audio_silence_audio_384",
+      "validation_errors": [],
+      "accuracy": {
+        "passed": true,
+        "finite": true,
+        "relative_l2": 0.014418736773842505,
+        "relative_l2_reason": null,
+        "rmse": 0.005238355147774363,
+        "max_abs_error": 0.19190669059753418,
+        "sum_squared_error": 1.7070102044093551,
+        "cpu_energy": 8210.728472688923,
+        "elements": 62208
+      },
+      "timing": {
+        "host": {
+          "frames": 384,
+          "mean_ms": 10.3337770079861,
+          "p95_ms": 10.711369905766333,
+          "p99_ms": 10.922530760144582,
+          "max_ms": 11.140457005240023,
+          "deadline_misses": 362,
+          "deadline_miss_fraction": 0.9427083333333334,
+          "rtf_at_10ms_hop": 1.03337770079861
+        },
+        "fpga": {
+          "frames": 384,
+          "mean_ms": 9.45616016504126,
+          "p95_ms": 9.460976444111028,
+          "p99_ms": 9.462837869467366,
+          "max_ms": 9.464798199549888,
+          "deadline_misses": 0,
+          "deadline_miss_fraction": 0.0,
+          "rtf_at_10ms_hop": 0.945616016504126
+        },
+        "qualification_exclusions": [],
+        "observed_deadline_pass": false
+      },
+      "realtime_smoke_pass": false,
+      "input_sha256": "aebb45383d60063fd696c7c7747ef120c8215fa1ca702faeea1e825d8aaf51ff",
+      "cpu_sha256": "56348582c9f4b5ea535edf4d3a6afa1fd459c7908accb36802a0137d61c58dd5",
+      "fpga_sha256": "a9fcdff49b33d04b5dcd3a514370affab1440d66d44737c2b49a3b5b72869466",
+      "cpu_neural_ms_per_frame": 0.6303088621658995,
+      "log_sha256": "0c5513a15502e13e276a2cee9b42ee0874a36ccfd17884c9c6449f390189f70c",
+      "metrics_sha256": "7a24ecf1165f6873016b7f7d779451bb978a8a6af8943d59fa1b1908c4a80fe5",
+      "hardware": {
+        "axi_data_width_bits": 256,
+        "hardware_version": "0x5fbbfbf0",
+        "bin_sha256": "37bdf8af02858343366b20c950183e2849e1983aa9ea68730584fca225dc500d"
+      }
+    }
+  ]
+}
