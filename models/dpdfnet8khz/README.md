@@ -6,6 +6,10 @@ Its native sample rate is 8 kHz, with a 160-sample Vorbis window, 80-sample
 hop, 81 frequency bins and 37,860 recurrent-state values. The ONNX graph
 has 492 operations. The existing 16-kHz port remains under `models/dpdfnet/`.
 
+The [four-variant RK-256 performance report](../dpdfnet/RK256_PRECISION_BENCHMARK.md)
+compares 8-kHz BF16/IF8 and 16-kHz BF16/IF4/IF8 on build `40519e0a`, including
+audio RTF, 10-ms deadlines, CPU agreement, bin sizes and noisy WAV outputs.
+
 CPU and FPGA audio execution are verified on Italy's RK AXI-256 with
 queue-CONFIG convolution, build `0xdf0749de`. A 60-second audio file
 took 59.21 seconds to process, including host audio framing and reconstruction.
