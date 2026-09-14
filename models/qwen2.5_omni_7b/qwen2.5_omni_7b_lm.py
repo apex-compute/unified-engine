@@ -903,9 +903,25 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
         if not hasattr(self, "tokenizer"):
             from transformers import AutoTokenizer
 
+            processor_dir = getattr(self, "_runtime_processor_dir", None)
+            if not processor_dir:
+                params_path = self._cfg["paths"]["params"]
+                if not os.path.isabs(params_path):
+                    params_path = os.path.join(self.script_dir, params_path)
+                processor_dir = os.path.join(
+                    os.path.dirname(params_path), "processor"
+                )
+            processor_dir = os.path.realpath(processor_dir)
+            if not os.path.isdir(processor_dir):
+                raise FileNotFoundError(
+                    "bundled Qwen2.5-Omni tokenizer metadata is missing at "
+                    f"{processor_dir}; run the model README script once to "
+                    "materialize params.bin and its processor bundle"
+                )
             self.tokenizer = AutoTokenizer.from_pretrained(
-                os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"]),
+                processor_dir,
                 trust_remote_code=True,
+                local_files_only=True,
             )
         return self.tokenizer
 

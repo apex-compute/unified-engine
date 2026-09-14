@@ -18,7 +18,9 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import sys
+import tempfile
 from collections.abc import Callable
 
 import torch
@@ -39,6 +41,24 @@ DATA_BYTES = 32
 WIRE_BYTES = SCALE_BYTES + DATA_BYTES
 SCHEMA_VERSION = 6
 GENERATION_TAG_BYTES = 32
+
+# Keep the host-only tokenizer/media preprocessing assets beside params.bin so
+# a deployed runtime does not need the multi-gigabyte Hugging Face checkpoint.
+# This is deliberately an allowlist: weight files and their index must never be
+# copied into the stripped runtime bundle.
+PROCESSOR_BUNDLE_SCHEMA_VERSION = 1
+PROCESSOR_BUNDLE_MANIFEST = ".processor_bundle.json"
+PROCESSOR_BUNDLE_FILES = (
+    "added_tokens.json",
+    "chat_template.json",
+    "config.json",
+    "merges.txt",
+    "preprocessor_config.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+)
 
 
 def _load_config(script_dir: str) -> dict:
@@ -67,6 +87,213 @@ def _checkpoint_revision(cfg: dict) -> str:
             "Hugging Face commit SHA"
         )
     return revision
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as file_obj:
+        while chunk := file_obj.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _processor_bundle_path(script_dir: str, cfg: dict) -> str:
+    params_path = os.path.join(script_dir, cfg["paths"]["params"])
+    return os.path.join(os.path.dirname(os.path.abspath(params_path)), "processor")
+
+
+def _validate_processor_files(directory: str, cfg: dict) -> list[str]:
+    """Validate files that materially define Omni preprocessing/token IDs."""
+    errors: list[str] = []
+    for name in PROCESSOR_BUNDLE_FILES:
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            errors.append(f"missing {name}")
+        elif os.path.getsize(path) == 0:
+            errors.append(f"empty {name}")
+    if errors:
+        return errors
+
+    parsed: dict[str, dict] = {}
+    for name in (
+        "chat_template.json",
+        "config.json",
+        "preprocessor_config.json",
+        "tokenizer_config.json",
+    ):
+        try:
+            with open(os.path.join(directory, name), encoding="utf-8") as file_obj:
+                value = json.load(file_obj)
+            if not isinstance(value, dict):
+                raise ValueError("top level is not an object")
+            parsed[name] = value
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"invalid {name}: {exc}")
+    if errors:
+        return errors
+
+    if parsed["config.json"].get("model_type") != "qwen2_5_omni":
+        errors.append("config.json is not Qwen2.5-Omni")
+    expected_processor = "Qwen2_5OmniProcessor"
+    for name in ("preprocessor_config.json", "tokenizer_config.json"):
+        if parsed[name].get("processor_class") != expected_processor:
+            errors.append(f"{name} does not declare {expected_processor}")
+    if not isinstance(parsed["chat_template.json"].get("chat_template"), str):
+        errors.append("chat_template.json has no chat_template string")
+
+    token_config = parsed["tokenizer_config.json"]
+    decoder = token_config.get("added_tokens_decoder")
+    if not isinstance(decoder, dict):
+        errors.append("tokenizer_config.json has no added_tokens_decoder")
+    else:
+        expected_tokens = {
+            "eos_token_id": "<|im_end|>",
+            "audio_token_id": "<|AUDIO|>",
+            "image_token_id": "<|IMAGE|>",
+        }
+        for config_key, content in expected_tokens.items():
+            token_id = cfg["tokens"][config_key]
+            entry = decoder.get(str(token_id))
+            if not isinstance(entry, dict) or entry.get("content") != content:
+                errors.append(
+                    f"tokenizer token {token_id} does not match {content!r}"
+                )
+    return errors
+
+
+def _processor_bundle_errors(directory: str, cfg: dict) -> list[str]:
+    errors = _validate_processor_files(directory, cfg)
+    manifest_path = os.path.join(directory, PROCESSOR_BUNDLE_MANIFEST)
+    try:
+        with open(manifest_path, encoding="utf-8") as file_obj:
+            manifest = json.load(file_obj)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        errors.append(f"invalid {PROCESSOR_BUNDLE_MANIFEST}: {exc}")
+        return errors
+
+    if manifest.get("schema_version") != PROCESSOR_BUNDLE_SCHEMA_VERSION:
+        errors.append("processor bundle schema differs")
+    if manifest.get("model_repo") != cfg["paths"]["hf_model_repo"]:
+        errors.append("processor bundle model repository differs")
+    if manifest.get("model_revision") != _checkpoint_revision(cfg):
+        errors.append("processor bundle model revision differs")
+    files = manifest.get("files")
+    if not isinstance(files, dict) or set(files) != set(PROCESSOR_BUNDLE_FILES):
+        errors.append("processor bundle file manifest differs")
+        return errors
+    if errors:
+        return errors
+    for name in PROCESSOR_BUNDLE_FILES:
+        path = os.path.join(directory, name)
+        metadata = files[name]
+        if not isinstance(metadata, dict):
+            errors.append(f"invalid processor file metadata for {name}")
+            continue
+        if metadata.get("size") != os.path.getsize(path):
+            errors.append(f"processor file size differs for {name}")
+        elif metadata.get("sha256") != _sha256_file(path):
+            errors.append(f"processor file digest differs for {name}")
+    for root, _, filenames in os.walk(directory):
+        for name in filenames:
+            lower = name.lower()
+            if lower.endswith(".safetensors") or lower.endswith(".safetensors.index.json"):
+                errors.append(
+                    f"weight artifact is forbidden in processor bundle: "
+                    f"{os.path.relpath(os.path.join(root, name), directory)}"
+                )
+    return errors
+
+
+def _atomic_copy_file(source: str, destination: str) -> None:
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(destination)}.",
+        suffix=".building",
+        dir=os.path.dirname(destination),
+    )
+    try:
+        with open(source, "rb") as src, os.fdopen(fd, "wb") as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+        shutil.copystat(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def ensure_processor_bundle(
+    script_dir: str | None = None, verbose: bool = True
+) -> str:
+    """Return a validated, local-only AutoProcessor directory.
+
+    Existing bundles are reused without inspecting checkpoint indexes or
+    safetensors. Missing/corrupt bundles are rebuilt from the already-local HF
+    metadata using atomic per-file replacements, with the manifest committed
+    last.
+    """
+    script_dir = os.path.abspath(script_dir or _THIS_DIR)
+    cfg = _load_config(script_dir)
+    destination = _processor_bundle_path(script_dir, cfg)
+    if os.path.isdir(destination) and not _processor_bundle_errors(destination, cfg):
+        return destination
+
+    source = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
+    source_errors = _validate_processor_files(source, cfg)
+    if source_errors:
+        raise RuntimeError(
+            "cannot build the Qwen2.5-Omni processor bundle from local files "
+            f"in {source} ({'; '.join(source_errors)})"
+        )
+    os.makedirs(destination, exist_ok=True)
+    file_manifest: dict[str, dict[str, object]] = {}
+    for name in PROCESSOR_BUNDLE_FILES:
+        src = os.path.join(source, name)
+        dst = os.path.join(destination, name)
+        _atomic_copy_file(src, dst)
+        file_manifest[name] = {
+            "size": os.path.getsize(dst),
+            "sha256": _sha256_file(dst),
+        }
+
+    manifest = {
+        "schema_version": PROCESSOR_BUNDLE_SCHEMA_VERSION,
+        "model_repo": cfg["paths"]["hf_model_repo"],
+        "model_revision": _checkpoint_revision(cfg),
+        "files": file_manifest,
+    }
+    manifest_path = os.path.join(destination, PROCESSOR_BUNDLE_MANIFEST)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{PROCESSOR_BUNDLE_MANIFEST}.",
+        suffix=".building",
+        dir=destination,
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file_obj:
+            json.dump(manifest, file_obj, indent=2, sort_keys=True)
+            file_obj.write("\n")
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
+        os.replace(temporary, manifest_path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+    errors = _processor_bundle_errors(destination, cfg)
+    if errors:
+        raise RuntimeError(
+            f"generated Qwen2.5-Omni processor bundle is invalid "
+            f"({'; '.join(errors)})"
+        )
+    if verbose:
+        total = sum(item["size"] for item in file_manifest.values())
+        print(
+            f"Bundled local Omni processor metadata: "
+            f"{len(file_manifest)} files, {total / 2**20:.1f} MiB -> "
+            f"{destination}"
+        )
+    return destination
 
 
 def _decode_bf16_projections(cfg: dict) -> tuple[str, ...]:
@@ -802,6 +1029,7 @@ def weight_bin_generate(script_dir: str | None = None, output_params: str | None
                     for name, region in regions.items())
         + f" -> {params_path}"
     )
+    ensure_processor_bundle(script_dir, verbose=True)
     return params_path
 
 
@@ -885,6 +1113,7 @@ def ensure_params_bin(script_dir: str, verbose: bool = True) -> str:
                 errors.append("payload and manifest are from different generations")
 
         if not errors:
+            ensure_processor_bundle(script_dir, verbose=verbose)
             return params_path
         raise RuntimeError(
             f"cached Qwen2.5-Omni params are incompatible ({'; '.join(errors)}). "

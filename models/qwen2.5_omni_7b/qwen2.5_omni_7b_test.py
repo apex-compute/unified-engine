@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import argparse
 import builtins
+import fcntl
+import hashlib
 import importlib.util
 import json
 import math
 import os
 import sys
 import time
+from contextlib import contextmanager
 from typing import Any
 
 
@@ -112,11 +115,15 @@ _position_mod = _load_sibling(
 _weight_mod = _load_sibling(
     "qwen2_5_omni_7b_weights", "qwen2.5_omni_7b_weights.py"
 )
+_program_mod = _load_sibling(
+    "qwen2_5_omni_7b_programs", "qwen2.5_omni_7b_programs.py"
+)
 
 Qwen25OmniLMMixin = _lm_mod.Qwen25OmniLMMixin
 Qwen25OmniVisionMixin = _vision_mod.Qwen25OmniVisionMixin
 Qwen25OmniAudioMixin = _audio_mod.Qwen25OmniAudioMixin
 build_multimodal_positions = _position_mod.build_multimodal_positions
+ProgramBundle = _program_mod.ProgramBundle
 
 
 REQUIRED_ENGINES = 8
@@ -128,12 +135,18 @@ PREFILL_INPUT_TOKEN_LIMIT = 384
 # execution padding and do not become visible context tokens.
 PREFILL_MAX_SEQ_LEN = REQUIRED_ENGINES * 64
 
-# All three U55 images share the non-CONV arithmetic ISA used by Omni. The E7
+# These supported U55 images share the non-CONV arithmetic ISA used by Omni. The E7
 # image predates CHECK_CLEAR, so its runner uses host-separated one-shot flag
 # rounds; it is intentionally supported without changing the FPGA image.
 LEGACY_HOST_SEGMENTED_BUILD = 0xE7AC2CAF
+CURRENT_U55C_BUILD = 0xB3ED9175
 SUPPORTED_FPGA_BUILDS = frozenset(
-    {0xFE984D16, 0x0305D87D, LEGACY_HOST_SEGMENTED_BUILD}
+    {
+        0xFE984D16,
+        0x0305D87D,
+        CURRENT_U55C_BUILD,
+        LEGACY_HOST_SEGMENTED_BUILD,
+    }
 )
 ENGINE_BASE_STRIDE = 0x00010000
 RESET_PROBE_ISA_ADDR = 0x1FA000000
@@ -144,6 +157,49 @@ DEFAULT_IMAGE = os.path.normpath(
 DEFAULT_AUDIO = os.path.normpath(
     os.path.join(PROJECT_ROOT, "test_samples", "apex.wav")
 )
+RUN_LOCK_PATH = "/tmp/apexcompute-qwen2.5-omni-7b.lock"
+
+# Every file that can change captured Omni instructions is bound into the
+# programs artifact identity.  Paths are explicit so generated checkpoints,
+# caches, logs, and program images can never enter the fingerprint by accident.
+_PROGRAM_CODE_FILES = (
+    os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_test.py"),
+    os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_lm.py"),
+    os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_vision.py"),
+    os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_audio.py"),
+    os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_positions.py"),
+    os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_programs.py"),
+    os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_weights.py"),
+    os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_config.json"),
+    os.path.join(PROJECT_ROOT, "models", "qwen2.5_vl_3b", "qwen2.5_vl_3b_lm.py"),
+    os.path.join(PROJECT_ROOT, "models", "qwen2.5_vl_3b", "qwen2.5_vl_3b_vision.py"),
+    os.path.join(PROJECT_ROOT, "andromeda_hw_info.py"),
+    os.path.join(PROJECT_ROOT, "multi_engine_shard.py"),
+    os.path.join(PROJECT_ROOT, "user_dma_core.py"),
+)
+
+
+def _acquire_run_lock() -> int:
+    """Hold one process-wide lock across params, programs.bin, and FPGA use."""
+    fd = os.open(RUN_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise SystemExit(
+            "another Qwen2.5-Omni process is already converting artifacts or "
+            "using the FPGA; wait for it to finish before retrying"
+        ) from None
+    return fd
+
+
+@contextmanager
+def _exclusive_run_lock():
+    fd = _acquire_run_lock()
+    try:
+        yield
+    finally:
+        os.close(fd)
 
 
 class Qwen25OmniUnifiedEngine(
@@ -182,6 +238,12 @@ class Qwen25OmniUnifiedEngine(
         self._multi_core_schedulers: dict[str, MultiEngineScheduler] = {}
         self._worker_isa_used: dict[int, dict[str, int]] = {}
         self._params_regions: dict[str, dict[str, Any]] | None = None
+        self._program_bundle: ProgramBundle | None = None
+        self._packaged_program_stages: set[str] = set()
+        self._loaded_program_stages: set[str] = set()
+        self._executed_program_stages: set[str] = set()
+        self._program_stage_profiles: dict[str, bool] = {}
+        self._runtime_processor_dir: str | None = None
 
         # U55 8-GiB DRAM map
         #
@@ -384,6 +446,560 @@ class Qwen25OmniUnifiedEngine(
                 f"{sorted(self._params_regions)}"
             ) from None
 
+    @staticmethod
+    def _sha256_path(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as file_obj:
+            while chunk := file_obj.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def configure_runtime_artifacts(
+        self, params_path: str, processor_dir: str
+    ) -> None:
+        """Bind program packaging to the exact params, code, and U55 image.
+
+        This is deliberately called only after HW_INFO and every engine's FPGA
+        build stamp have been read.  A program captured for a different build,
+        AXI width, topology, params generation, source tree, or DRAM map must
+        fail validation rather than reach a queue.
+        """
+        params_path = os.path.realpath(params_path)
+        configured_params = os.path.realpath(
+            os.path.join(self.script_dir, self._cfg["paths"]["params"])
+        )
+        if params_path != configured_params:
+            raise ValueError(
+                f"runtime params path {params_path!r} differs from configured "
+                f"artifact {configured_params!r}"
+            )
+        processor_dir = os.path.realpath(processor_dir)
+        if not os.path.isdir(processor_dir):
+            raise FileNotFoundError(
+                f"validated runtime processor bundle is absent: {processor_dir}"
+            )
+        if self.fpga_build is None:
+            raise RuntimeError(
+                "FPGA build must be read from all eight engines before creating "
+                "the programs.bin identity"
+            )
+        if user_dma_core.HW_INFO_RAW is None:
+            raise RuntimeError(
+                "HW_INFO must be read before creating the programs.bin identity"
+            )
+
+        params_json = params_path.rsplit(".", 1)[0] + ".json"
+        with open(params_json, "rb") as file_obj:
+            params_manifest_bytes = file_obj.read()
+        params_manifest = json.loads(params_manifest_bytes)
+        code_files: dict[str, str] = {}
+        for path in _PROGRAM_CODE_FILES:
+            if not os.path.isfile(path):
+                raise FileNotFoundError(
+                    f"program identity source file is absent: {path}"
+                )
+            relative = os.path.relpath(path, PROJECT_ROOT)
+            code_files[relative] = self._sha256_path(path)
+        code_canonical = json.dumps(
+            code_files, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("ascii")
+        handshake = (
+            "host_segmented"
+            if self.fpga_build == LEGACY_HOST_SEGMENTED_BUILD
+            else "four_phase"
+        )
+        identity = {
+            "model": "Qwen2.5-Omni-7B-Thinker",
+            "program_abi": 1,
+            "params": {
+                "manifest_sha256": hashlib.sha256(
+                    params_manifest_bytes
+                ).hexdigest(),
+                "schema_version": params_manifest["schema_version"],
+                "config_sha256": params_manifest["config_sha256"],
+                "generation_id": params_manifest["generation_id"],
+                "params_size": params_manifest["params_size"],
+                "model_revision": params_manifest["model_revision"],
+                "generation_trailer_bytes": params_manifest[
+                    "generation_trailer_bytes"
+                ],
+                "regions_sha256": hashlib.sha256(
+                    json.dumps(
+                        params_manifest["regions"],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    ).encode("ascii")
+                ).hexdigest(),
+            },
+            "code": {
+                "aggregate_sha256": hashlib.sha256(code_canonical).hexdigest(),
+                "files": code_files,
+            },
+            "hardware": {
+                "fpga_build": f"0x{self.fpga_build:08X}",
+                "hw_info_raw": f"0x{int(user_dma_core.HW_INFO_RAW):08X}",
+                "engines": REQUIRED_ENGINES,
+                "dram_gib": REQUIRED_DRAM_GIB,
+                "axi_data_width_bits": int(user_dma_core.UE_AXI_DATA_WIDTH_BITS),
+                "reported_core_count": int(user_dma_core.ANDROMEDA_CORE_COUNT),
+                "queue_mode": bool(user_dma_core.QUEUE_MODE_ENABLED),
+                "engine_zero_base": int(user_dma_core.UE_0_BASE_ADDR),
+                "engine_base_stride": ENGINE_BASE_STRIDE,
+                "instruction_size_bytes": int(
+                    user_dma_core.INSTRUCTION_SIZE_BYTES
+                ),
+                "vector_size": int(user_dma_core.UE_VECTOR_SIZE),
+                "handshake": handshake,
+                "region_rendezvous": "master_worker",
+                "barrier_margin_nops": 32,
+                "dram_map": {
+                    "private_base": 0,
+                    "params_base": self.PARAMS_BASE,
+                    "params_limit": self.PARAMS_LIMIT,
+                    "tensor_base": self.TENSOR_BASE,
+                    "tensor_limit": self.TENSOR_LIMIT,
+                    "master_isa_base": self.ISA_BASE,
+                    "worker_isa_base": self.WORKER_ISA_BASE,
+                    "worker_isa_stride": self.WORKER_ISA_STRIDE,
+                    "dram_end": self.DRAM_END,
+                },
+            },
+        }
+        self._program_bundle = ProgramBundle(
+            os.path.dirname(params_path), identity, stem="programs"
+        )
+        self._packaged_program_stages.clear()
+        self._loaded_program_stages.clear()
+        self._executed_program_stages.clear()
+        self._program_stage_profiles.clear()
+        self._runtime_processor_dir = processor_dir
+        self._loud(
+            f"Program artifact: {self._program_bundle.bin_path} "
+            "(fresh compile -> atomic store -> validated reload)"
+        )
+
+    def _invalidate_program_stage(self, *stages: str) -> None:
+        for stage in stages:
+            self._packaged_program_stages.discard(stage)
+            self._loaded_program_stages.discard(stage)
+            self._executed_program_stages.discard(stage)
+
+    # Capture wrappers invalidate the disk-execution proof before changing any
+    # in-memory ISA.  A caller cannot compile a new shape and accidentally run
+    # an older section that happened to remain in programs.bin.
+    def compile_vision_encoder(self, profile: bool = False) -> int:
+        self._invalidate_program_stage("vision")
+        result = super().compile_vision_encoder(profile=profile)
+        self._program_stage_profiles["vision"] = bool(profile)
+        return result
+
+    def compile_audio_encoder(self) -> int:
+        self._invalidate_program_stage("audio")
+        result = super().compile_audio_encoder()
+        self._program_stage_profiles["audio"] = False
+        return result
+
+    def compile_prefill(
+        self, seq_len: int, layer_size: int | None = None,
+        profile: bool = False,
+    ) -> int:
+        # Decoder addresses are allocated after this exact prefill image.
+        self._invalidate_program_stage("prefill", "decode")
+        result = super().compile_prefill(
+            seq_len, layer_size=layer_size, profile=profile
+        )
+        self._program_stage_profiles["prefill"] = bool(profile)
+        return result
+
+    def compile_decoder(
+        self, layer_size: int | None = None, profile: bool = False
+    ) -> int:
+        self._invalidate_program_stage("decode")
+        result = super().compile_decoder(
+            layer_size=layer_size, profile=profile
+        )
+        self._decoder_layers_compiled = (
+            int(self._lm_dims()["NL"])
+            if layer_size is None
+            else int(layer_size)
+        )
+        self._program_stage_profiles["decode"] = bool(profile)
+        return result
+
+    def _program_stage_state(self, stage: str):
+        if stage == "vision":
+            return (
+                int(self._vis_program_addr),
+                bytes(self._vis_program_bytes),
+                self._vis_worker_programs,
+            )
+        if stage == "audio":
+            return (
+                int(self._audio_program_addr),
+                bytes(self._audio_program_bytes),
+                self._audio_worker_programs,
+            )
+        if stage == "prefill":
+            base, blob = self._prefill_program
+            return int(base), bytes(blob), self._prefill_workers
+        if stage == "decode":
+            base, blob = self._decoder_program
+            return int(base), bytes(blob), self._decoder_workers
+        raise ValueError(f"unknown program stage {stage!r}")
+
+    def _program_stage_metadata(self, stage: str) -> dict[str, Any]:
+        common: dict[str, Any] = {
+            "engines": REQUIRED_ENGINES,
+            "profile": bool(self._program_stage_profiles.get(stage, False)),
+        }
+        scheduler = self._multi_core_schedulers.get(stage)
+        if scheduler is not None and scheduler.host_segmented:
+            common["host_segment_starts"] = scheduler.host_segment_starts()
+        if stage == "vision":
+            grid = torch.as_tensor(self._image_grid_thw, dtype=torch.long)
+            return {
+                **common,
+                "grid_thw": grid.tolist(),
+                "patch_k": int(self._vis_patch_k),
+                "encoder_size": len(self._vis_encoder_program_bytes),
+                "patch_size": len(self._vis_patch_program_bytes),
+                "patch_program_addr": f"0x{self._vis_patch_program_addr:X}",
+                "aligned_sequence_rows": int(self._vis_aligned_S),
+                "cu_window_seqlens": list(self._cu_window_seqlens),
+                "checkpoints": list(getattr(self, "_vis_checkpoints", ())),
+                "total_flops": int(self._vis_total_flops),
+            }
+        if stage == "audio":
+            return {
+                **common,
+                "feature_lengths": list(self._audio_feature_lens),
+                "chunk_feature_lengths": list(self._audio_chunk_feature_lens),
+                "aftercnn_lengths": list(self._audio_aftercnn_lens),
+                "chunk_aftercnn_lengths": list(
+                    self._audio_chunk_aftercnn_lens
+                ),
+                "output_lengths": list(self._audio_output_lengths),
+                "cu_seqlens": torch.as_tensor(
+                    self._audio_cu_seqlens, dtype=torch.long
+                ).tolist(),
+                "conv1_rows": int(self._audio_conv1_input.shape[0]),
+                "sequence_rows": int(self._audio_seq_len),
+                "aligned_sequence_rows": int(self._audio_aligned_seq_len),
+                "output_tokens": int(self._audio_num_tokens),
+                "audio_dimensions": self._audio_dims(),
+                "input_generation": int(self._audio_input_generation),
+                "tensor_generation": int(self._audio_tensor_generation),
+                "total_flops": int(self._audio_total_flops),
+            }
+        if stage == "prefill":
+            return {
+                **common,
+                "logical_sequence_length": int(self._prefill_seq_len),
+                "execution_rows": int(
+                    self._prefill_execution_rows_compiled
+                ),
+                "layers": int(self._prefill_layers),
+                "output_address": f"0x{int(self.LM_PREFILL_OUT):X}",
+                "aligned_execution_rows": (
+                    (int(self._prefill_execution_rows_compiled) + 63) // 64
+                ) * 64,
+                "checkpoints": list(getattr(self, "_prefill_checkpoints", ())),
+                "total_flops": int(self._prefill_flops),
+            }
+        if stage == "decode":
+            worker_regs = [
+                {str(key): int(value) for key, value in registers.items()}
+                for registers in getattr(self, "_decode_attn_worker_regs", ())
+            ]
+            prefill_base, prefill_blob = self._prefill_program
+            decode_base, decode_blob = self._decoder_program
+            expected_decode_base = (
+                (int(prefill_base) + len(prefill_blob) + 63) // 64
+            ) * 64
+            expected_preamble = (
+                (int(decode_base) + len(decode_blob) + 63) // 64
+            ) * 64
+            if int(decode_base) != expected_decode_base:
+                raise RuntimeError(
+                    f"decoder base 0x{int(decode_base):X} does not immediately "
+                    f"follow prefill at 0x{expected_decode_base:X}"
+                )
+            if int(self._decoder_preamble) != expected_preamble:
+                raise RuntimeError(
+                    f"decoder preamble 0x{int(self._decoder_preamble):X} does not "
+                    f"immediately follow decoder at 0x{expected_preamble:X}"
+                )
+            return {
+                **common,
+                "layers": int(self._decoder_layers_compiled),
+                "max_context_size": int(self.MAX_CONTEXT_SIZE),
+                "runtime_preamble_addr": f"0x{int(self._decoder_preamble):X}",
+                "runtime_preamble_reserve": 512,
+                "decode_output_address": f"0x{int(self.LM_DECODE_OUT):X}",
+                "total_flops": int(self._decoder_flops),
+                "fixed_flops": int(self._decoder_flops_fixed),
+                "attention_flops_per_aligned_row": float(
+                    self._decoder_attn_per_aligned
+                ),
+                "attention_worker_registers": worker_regs,
+                "checkpoints": list(getattr(self, "_decoder_checkpoints", ())),
+                "fpga_global_argmax": bool(self._fpga_global_argmax_emitted),
+                "embedding_precision": self._cfg["precision"]["embedding"],
+                "decode_bf16_projections": list(
+                    self._cfg["precision"]["decode_bf16_projections"]
+                ),
+                "prefill_program_base": f"0x{int(prefill_base):X}",
+                "prefill_program_size": len(prefill_blob),
+                "prefill_program_sha256": hashlib.sha256(
+                    prefill_blob
+                ).hexdigest(),
+                "prefill_sequence_length": int(self._prefill_seq_len),
+            }
+        raise ValueError(f"unknown program stage {stage!r}")
+
+    def _program_stage_sections(self, stage: str) -> list[dict[str, Any]]:
+        """Return the compiled master + seven worker section descriptors."""
+        master_addr, master_blob, workers = self._program_stage_state(stage)
+        sections: list[dict[str, Any]] = [
+            {
+                "engine_index": 0,
+                "dram_base": master_addr,
+                "bytes": master_blob,
+            }
+        ]
+        for engine_index, _worker, address, blob in workers:
+            sections.append(
+                {
+                    "engine_index": int(engine_index),
+                    "dram_base": int(address),
+                    "bytes": bytes(blob),
+                }
+            )
+        engines = [section["engine_index"] for section in sections]
+        if engines != list(range(REQUIRED_ENGINES)):
+            raise RuntimeError(
+                f"{stage} must package ordered master + workers for engines "
+                f"0-7; got {engines}"
+            )
+        return sections
+
+    def store_program_stages(self, *stages: str) -> None:
+        """Publish one or more complete stages in one artifact generation."""
+        if self._program_bundle is None:
+            raise RuntimeError(
+                "configure_runtime_artifacts() must run before packaging ISA"
+            )
+        if not stages or len(set(stages)) != len(stages):
+            raise ValueError("program stage transaction must be non-empty and unique")
+        requests = {
+            stage: {
+                "sections": self._program_stage_sections(stage),
+                "metadata": self._program_stage_metadata(stage),
+            }
+            for stage in stages
+        }
+        disk_stages = self._program_bundle.store_stages(requests)
+        for stage in stages:
+            disk_sections = disk_stages[stage]
+            # Reopen the complete sidecar as well as the binary. ProgramBundle's
+            # store return proves byte publication; this second boundary also
+            # proves persisted bases and compile metadata before authorization.
+            if disk_sections != self._read_program_stage_from_disk(stage):
+                raise RuntimeError(
+                    f"programs.bin stage {stage!r} changed after atomic publication"
+                )
+            self._install_program_stage(stage, disk_sections)
+        self._packaged_program_stages.update(stages)
+        detail = ", ".join(
+            f"{stage}={sum(len(blob) for blob in disk_stages[stage].values()) / 2**20:.2f} MiB"
+            for stage in stages
+        )
+        self._loud(
+            f"  [Program bin] atomically stored {len(stages)} stage(s), "
+            f"8 engine images each: {detail}"
+        )
+
+    def store_program_stage(self, stage: str) -> None:
+        """Backward-friendly one-stage program artifact transaction."""
+        self.store_program_stages(stage)
+
+    def _install_program_stage(
+        self, stage: str, disk_sections: dict[int, bytes]
+    ) -> None:
+        if set(disk_sections) != set(range(REQUIRED_ENGINES)):
+            raise RuntimeError(
+                f"programs.bin stage {stage!r} is incomplete; engines are "
+                f"{sorted(disk_sections)}"
+            )
+        master_addr, compiled_master, workers = self._program_stage_state(stage)
+        master = bytes(disk_sections[0])
+        if master != compiled_master:
+            raise RuntimeError(
+                f"programs.bin {stage} master differs from the ISA compiled "
+                "for this request"
+            )
+        reloaded_workers = []
+        for engine_index, worker, address, compiled_blob in workers:
+            disk_blob = bytes(disk_sections[int(engine_index)])
+            if disk_blob != bytes(compiled_blob):
+                raise RuntimeError(
+                    f"programs.bin {stage} worker {engine_index} differs from "
+                    "the ISA compiled for this request"
+                )
+            reloaded_workers.append(
+                (int(engine_index), worker, int(address), disk_blob)
+            )
+
+        if stage == "vision":
+            encoder_size = len(self._vis_encoder_program_bytes)
+            patch_size = len(self._vis_patch_program_bytes)
+            if encoder_size + patch_size != len(master):
+                raise RuntimeError(
+                    "programs.bin vision composite no longer matches its "
+                    "encoder/patch boundaries"
+                )
+            if self._vis_patch_program_addr != master_addr + encoder_size:
+                raise RuntimeError("vision patch entry is not contiguous with encoder")
+            self._vis_program_bytes = master
+            self._vis_encoder_program_bytes = master[:encoder_size]
+            self._vis_patch_program_bytes = master[encoder_size:]
+            self._vis_worker_programs = reloaded_workers
+        elif stage == "audio":
+            self._audio_program_bytes = master
+            self._audio_worker_programs = reloaded_workers
+        elif stage == "prefill":
+            self._prefill_program = (master_addr, master)
+            self._prefill_workers = reloaded_workers
+        elif stage == "decode":
+            self._decoder_program = (master_addr, master)
+            self._decoder_workers = reloaded_workers
+        else:
+            raise ValueError(f"unknown program stage {stage!r}")
+        self._loaded_program_stages.add(stage)
+
+    def _read_program_stage_from_disk(self, stage: str) -> dict[int, bytes]:
+        """Validate bytes, DRAM bases, and metadata for one compiled stage."""
+        if self._program_bundle is None:
+            raise RuntimeError("program bundle has not been configured")
+        master_addr, _master_blob, workers = self._program_stage_state(stage)
+        worker_indices = [int(item[0]) for item in workers]
+        if worker_indices != list(range(1, REQUIRED_ENGINES)):
+            raise RuntimeError(
+                f"compiled {stage} worker order must be engines 1-7, got "
+                f"{worker_indices}"
+            )
+        expected_bases = {0: int(master_addr)}
+        expected_bases.update(
+            {int(index): int(address) for index, _worker, address, _blob in workers}
+        )
+        expected_metadata = json.loads(
+            json.dumps(
+                self._program_stage_metadata(stage),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+        )
+        manifest, payload = self._program_bundle.load()
+        records = {}
+        for section in manifest["sections"]:
+            if section["name"] != stage:
+                continue
+            engine_index = int(section["engine_index"])
+            persisted_base = int(section["dram_base"], 16)
+            if persisted_base != expected_bases.get(engine_index):
+                raise RuntimeError(
+                    f"programs.json {stage} engine {engine_index} base "
+                    f"0x{persisted_base:X} differs from compiled base "
+                    f"{expected_bases.get(engine_index)!r}"
+                )
+            if section["metadata"] != expected_metadata:
+                raise RuntimeError(
+                    f"programs.json {stage} engine {engine_index} compile "
+                    "metadata differs from the live compiler state"
+                )
+            start = int(section["file_offset"])
+            records[engine_index] = payload[start:start + int(section["size"])]
+        if set(records) != set(range(REQUIRED_ENGINES)):
+            raise RuntimeError(
+                f"programs.bin stage {stage!r} has engines {sorted(records)}, "
+                "expected 0-7"
+            )
+        return records
+
+    def _reload_program_stage(self, stage: str) -> None:
+        if self._program_bundle is None or stage not in self._packaged_program_stages:
+            raise RuntimeError(
+                f"{stage} execution is forbidden until its master + seven "
+                "worker images have been stored in programs.bin"
+            )
+        disk_sections = self._read_program_stage_from_disk(stage)
+        self._install_program_stage(stage, disk_sections)
+        total = sum(len(blob) for blob in disk_sections.values())
+        self._loud(
+            f"  [Program bin] reloaded + validated {stage}: "
+            f"{total / 2**20:.2f} MiB"
+        )
+
+    # The disk reload is part of execution, not optional diagnostics.  Dynamic
+    # token/media payloads and tiny flag/decode dispatch preambles are still
+    # generated at run time; every stable learned stage image comes from disk.
+    def run_vision_encoder(self, *args, **kwargs):
+        self._reload_program_stage("vision")
+        result = super().run_vision_encoder(*args, **kwargs)
+        self._executed_program_stages.add("vision")
+        return result
+
+    def run_audio_encoder(self, *args, **kwargs):
+        self._reload_program_stage("audio")
+        result = super().run_audio_encoder(*args, **kwargs)
+        self._executed_program_stages.add("audio")
+        return result
+
+    def run_prefill(self, *args, **kwargs):
+        self._reload_program_stage("prefill")
+        result = super().run_prefill(*args, **kwargs)
+        self._executed_program_stages.add("prefill")
+        return result
+
+    def run_decode_step_profiled(
+        self, token: int, program, checkpoints, workers=None,
+        timeout_s: float = 60.0,
+    ):
+        self._reload_program_stage("decode")
+        if program != self._decoder_program:
+            raise RuntimeError(
+                "profiled decode refused an in-memory program that is not the "
+                "validated programs.bin decoder section"
+            )
+        if workers is not None:
+            supplied = [(idx, addr, bytes(blob)) for idx, _w, addr, blob in workers]
+            loaded = [
+                (idx, addr, bytes(blob))
+                for idx, _w, addr, blob in self._decoder_workers
+            ]
+            if supplied != loaded:
+                raise RuntimeError(
+                    "profiled decode worker images do not match programs.bin"
+                )
+        result = super().run_decode_step_profiled(
+            token,
+            self._decoder_program,
+            checkpoints,
+            workers=self._decoder_workers,
+            timeout_s=timeout_s,
+        )
+        self._executed_program_stages.add("decode")
+        return result
+
+    def run_decoder(self, *args, **kwargs):
+        self._reload_program_stage("decode")
+        result = super().run_decoder(*args, **kwargs)
+        self._executed_program_stages.add("decode")
+        return result
+
     def _loud(self, *args, **kwargs) -> None:
         _ORIGINAL_PRINT(*args, **kwargs)
 
@@ -522,8 +1138,8 @@ def reset_selected_engines(cores: int = REQUIRED_ENGINES) -> int:
     ``user_hw_test.software_reset_test`` intentionally initializes through the
     release-only ``0xfe984d16`` gate and writes a destructive DRAM self-test at
     a legacy fixed address.  Omni has its own explicit map and also supports
-    the newer ``0x0305d87d`` queue-CONFIG image, whose backward-compatible
-    matmul/dequantize/argmax path is used here.  Validate every build stamp
+    the newer queue-CONFIG images, whose backward-compatible
+    matmul/dequantize/argmax path is used here. Validate every build stamp
     before touching hardware, then reset and execute a bare HALT on cores 0-7.
     """
     if cores != REQUIRED_ENGINES:
@@ -662,13 +1278,16 @@ def _default_prompt(args) -> str:
     return "Explain why the sky is blue in one sentence."
 
 
-def _prepare_processor_inputs(args, cfg: dict):
-    """Use the official processor for placeholder expansion and feature masks."""
+def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
+    """Use the stripped local processor for placeholders and feature masks."""
     from PIL import Image
     from transformers import AutoProcessor
 
-    model_dir = os.path.join(SCRIPT_DIR, cfg["paths"]["hf_model_dir"])
-    processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(
+        processor_dir,
+        trust_remote_code=True,
+        local_files_only=True,
+    )
     prompt = _default_prompt(args)
     content: list[dict[str, Any]] = []
     images = None
@@ -736,6 +1355,7 @@ def _run_vision(ue: Qwen25OmniUnifiedEngine, processed) -> torch.Tensor:
     ue.vision_tensor_init()
     ue.compile_vision_encoder()
     ue.check_master_isa()
+    ue.store_program_stage("vision")
     embeddings = ue.run_vision_encoder()
     print(
         f"  vision -> {tuple(embeddings.shape)} in "
@@ -755,6 +1375,7 @@ def _run_audio(ue: Qwen25OmniUnifiedEngine, processed):
     ue.audio_tensor_init()
     ue.compile_audio_encoder()
     ue.check_master_isa()
+    ue.store_program_stage("audio")
     embeddings = ue.run_audio_encoder()
     print(
         f"  audio -> {tuple(embeddings.shape)} in "
@@ -824,6 +1445,12 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
+    with _exclusive_run_lock():
+        _main_locked(parser, args)
+
+
+def _main_locked(parser: argparse.ArgumentParser, args) -> None:
+    """Run artifact preparation and FPGA execution under the global lock."""
     args.image = _resolve_sample(args.image, DEFAULT_IMAGE, "--image")
     args.audio = _resolve_sample(args.audio, DEFAULT_AUDIO, "--audio")
     engine_kwargs = resolve_engine_config(parser, args)
@@ -832,9 +1459,12 @@ def main() -> None:
     # Fetch/convert before constructing a device-owning engine.  The conversion
     # streams Thinker shards and skips Talker/token2wav-only checkpoint shards.
     params_path = _weight_mod.ensure_params_bin(SCRIPT_DIR)
+    processor_dir = _weight_mod.ensure_processor_bundle(
+        SCRIPT_DIR, verbose=False
+    )
     print(f"Thinker params: {params_path}")
     processor, processed, tokens, prompt, rendered = _prepare_processor_inputs(
-        args, cfg
+        args, cfg, processor_dir
     )
     if len(tokens) < 2:
         raise ValueError("chat template produced fewer than two tokens")
@@ -855,6 +1485,7 @@ def main() -> None:
     ue = Qwen25OmniUnifiedEngine(
         script_dir=SCRIPT_DIR, fpga_build=fpga_build, **engine_kwargs
     )
+    ue.configure_runtime_artifacts(params_path, processor_dir)
     ue.tokenizer = processor.tokenizer
     ue.processor = processor
     ue._prompt_text = prompt
@@ -898,6 +1529,9 @@ def main() -> None:
     # now, but their shared overlay is deliberately deferred until prefill.
     ue.compile_decoder()
     ue.check_master_isa()
+    # These bodies are address-coupled: decoder starts immediately after this
+    # exact prefill image. Publish both in one programs.bin generation.
+    ue.store_program_stages("prefill", "decode")
     for line in ue.isa_usage_lines():
         print(line)
     ue.run_prefill(
@@ -918,9 +1552,35 @@ def main() -> None:
     prefill_wall = float(getattr(ue, "_prefill_wall_s", 0.0))
     prefill_us = float(getattr(ue, "_latency_prefill_us", 0.0))
     decode_tok_s = generated / decode_wall if decode_wall > 0 else None
+    expected_program_stages = {"prefill", "decode"}
+    if args.image:
+        expected_program_stages.add("vision")
+    if args.audio:
+        expected_program_stages.add("audio")
+    if ue._executed_program_stages != expected_program_stages:
+        raise RuntimeError(
+            "not every model stage completed from programs.bin: expected "
+            f"{sorted(expected_program_stages)}, executed "
+            f"{sorted(ue._executed_program_stages)}"
+        )
+    program_manifest, program_payload = ue._program_bundle.load()
+    if program_manifest["section_count"] != REQUIRED_ENGINES * len(
+        expected_program_stages
+    ):
+        raise RuntimeError(
+            "combined programs.bin does not contain one master + seven worker "
+            "sections for every executed stage"
+        )
     result = {
         "model": "qwen2.5_omni_7b",
         "mode": _result_mode(args),
+        "params_source": "params.bin",
+        "program_source": "programs.bin",
+        "program_stages": sorted(ue._executed_program_stages),
+        "programs_bin": str(ue._program_bundle.bin_path),
+        "programs_size_bytes": int(program_manifest["programs_size"]),
+        "program_payload_bytes": len(program_payload),
+        "program_section_count": int(program_manifest["section_count"]),
         "decoded_text": decoded_text,
         # Canonical model_auto_test fields.
         "prefill_tokens": len(context),
