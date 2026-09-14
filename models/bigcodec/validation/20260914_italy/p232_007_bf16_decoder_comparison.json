@@ -1,0 +1,24 @@
+{
+  "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/validation/p232_007_bf16_tokens_cpu_decoder.wav",
+  "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/validation/p232_007_fpga_bf16.wav",
+  "reference_sha256": "6958d200ea1442687c0e27108795ae9393250be1abdca6e741c657bcd24be6df",
+  "actual_sha256": "9c1845870fdbccfa3625136e8df66b001ef5fb096a34e86dfe2dcdd16388ffca",
+  "sample_rate": 48000,
+  "samples": 189883,
+  "channels": 1,
+  "duration_s": 3.9558958333333334,
+  "finite": true,
+  "alignment": "original sample indices; no gain, delay or polarity fitting",
+  "metric_status": {
+    "relative_l2": "finite",
+    "snr_db": "finite",
+    "cosine_similarity": "finite"
+  },
+  "relative_l2": 0.3495386700687309,
+  "snr_db": 9.130095410186039,
+  "max_abs_error": 0.20637844130396843,
+  "rmse": 0.02571026046390592,
+  "reference_rms": 0.07355483860727177,
+  "actual_rms": 0.07164305588479553,
+  "cosine_similarity": 0.9376280052336631
+}

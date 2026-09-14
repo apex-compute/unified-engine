@@ -1,0 +1,32 @@
+{
+  "file": "models/bigcodec/bigcodec_bin/bigcodec-p232_007-final-andromeda.bin",
+  "sha256": "2d783d8154bedaf904d83666ef4c03a20098ccf2592217f737d53ed387da0394",
+  "bytes": 492668127,
+  "validated": true,
+  "validation_scope": "full artifact; added descriptive approximation strings only after validation; model/program bytes unchanged",
+  "model_sha256": "ae7730d46db212d18a64c9e44aed72cf8d67b18c91b729546f62649e16238e9e",
+  "program_sha256": "1408b8ab0922c6378135ecbffc97cd60191fcbdfb6f4852eb2f34492a6406bf5",
+  "compiled_samples": 63400,
+  "code_frames": 317,
+  "instructions": 6407280,
+  "parameters_bytes": 287594880,
+  "program_bytes": 205032960,
+  "resident_bytes": 492627840,
+  "tensor_end": 3066443392,
+  "scratch_bytes": 73036800,
+  "approximation": {
+    "snake_argument_clamp": 100.53096491487338,
+    "snake_sine_squared_polynomial_degree": 10,
+    "snake_storage": "BF16",
+    "tanh": "BF16 odd Pade [7/6] with native reciprocal",
+    "tanh_argument_clamp": 4.0,
+    "tanh_output_clamp": [
+      -1,
+      1
+    ],
+    "quantizer": "BF16 nearest normalized-codebook tournament",
+    "accuracy_status": "requires comparison with the official CPU model",
+    "alias_free_filters": "symmetric BF16, exact unit DC, nearest L2 within +/-2 ULP",
+    "broadcast_scalars": "BF16 round-to-nearest-even before device encoding"
+  }
+}
