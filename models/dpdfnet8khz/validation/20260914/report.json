@@ -1,0 +1,79 @@
+{
+  "model": "dpdfnet2_8khz",
+  "date": "2026-09-14",
+  "status": "CPU agreement verified; total frame deadline not yet met; post-reset board rescan pending",
+  "current_deployment": {
+    "format": "andromeda.dpdfnet2_8khz.streaming-v2",
+    "file": "models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz-andromeda.bin",
+    "sha256": "89d0cedf32ebcadfad2550372754072bc45e623a357942278dd3a07447952b9e",
+    "serialized_bytes": 23931957,
+    "resident_bytes": 23804800,
+    "instructions": 28072,
+    "program_sha256": "791e059cae4aeab6170321ef01ca0bf29b69769e8ee4d3f7bb5e71532291298d",
+    "image_sha256": "8ced262e2a410f7330d47b911d4a1a721d46a8542d667cec99a45f1ed0459ac0",
+    "image_identical_to_64_frame_candidate": true,
+    "sections": {
+      "parameters": {
+        "file": "models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz.parameters.bin",
+        "bytes": 22906496,
+        "sha256": "c097e98518288eb44be932e51ef38d8f7a5e0a4eaefc4f7c23ceb1d3407c62ae"
+      },
+      "instructions": {
+        "file": "models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz.instructions.bin",
+        "bytes": 898304,
+        "sha256": "791e059cae4aeab6170321ef01ca0bf29b69769e8ee4d3f7bb5e71532291298d"
+      }
+    }
+  },
+  "last_full_corpus": {
+    "candidate_bin_sha256": "37bdf8af02858343366b20c950183e2849e1983aa9ea68730584fca225dc500d",
+    "frames": 1362,
+    "all_spectra_bit_identical_to_corrected_IF8_baseline": true,
+    "host_timing": {
+      "frames": 1362,
+      "mean_ms": 10.33937075477623,
+      "p95_ms": 10.738085348566528,
+      "p99_ms": 10.971675770560978,
+      "max_ms": 13.36754800286144,
+      "deadline_misses": 1292,
+      "deadline_miss_fraction": 0.9486049926578561,
+      "rtf_at_10ms_hop": 1.033937075477623
+    },
+    "fpga_timing": {
+      "frames": 1362,
+      "mean_ms": 9.455930185189468,
+      "p95_ms": 9.46042670667667,
+      "p99_ms": 9.462549797449363,
+      "max_ms": 9.464798199549888,
+      "deadline_misses": 0,
+      "deadline_miss_fraction": 0.0,
+      "rtf_at_10ms_hop": 0.9455930185189467
+    },
+    "realtime_smoke_pass": false
+  },
+  "current_deployment_smoke": {
+    "frames": 64,
+    "bin_sha256": "6ea050018736153b3b57e0b5ba97e9192f59d086efa5b9ac716cf80919747b15",
+    "hardware_version": "0x5fbbfbf0",
+    "host_frame_ms_mean": 10.198569202202634,
+    "host_frame_ms_p95": 10.525179552496411,
+    "host_frame_ms_p99": 11.061149726156144,
+    "host_frame_ms_max": 11.639570991974324,
+    "host_frame_deadline_misses": 50,
+    "fpga_frame_ms_mean": 9.294738184546137,
+    "fpga_frame_ms_max": 9.303861965491373
+  },
+  "pooled_waveform_relative_l2": 0.011583238748905064,
+  "pooled_waveform_rmse": 0.0006814961442407401,
+  "speech_quality_qualified": false,
+  "verification": {
+    "native_host_tests": 70,
+    "existing_16khz_tests": 63,
+    "note": "Counts cover production compiler/runtime tests; unintegrated candidate tests excluded."
+  },
+  "excluded_host_experiment": {
+    "vector_dma_production_enabled": false,
+    "kernel_fault": "fs/read_write.c:742 do_iter_readv_writev -> do_pwritev, 2026-09-14 02:09:27 UTC",
+    "status": "vector I/O rejected; production retains scalar DMA"
+  }
+}

@@ -29,7 +29,9 @@ from dpdfnet_precompiled import (
 )
 from dpdfnet8khz_common import load_config
 
-FORMAT = "andromeda.dpdfnet2_8khz.streaming-v1"
+# v1 included the inherited IF4 policy and an unvalidated N=1 transpose.
+# Require a rebuild so older bins cannot silently bypass the native fixes.
+FORMAT = "andromeda.dpdfnet2_8khz.streaming-v2"
 
 
 def validate_hardware(payload: dict) -> None:
