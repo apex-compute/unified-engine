@@ -9,6 +9,7 @@ import torch
 
 from bigcodec_common import DEFAULT_CHECKPOINT, load_models
 from bigcodec_compile import Arena, build_graph, compiled_sample_count, plan_memory, convolution_reuse_pixels, _prepare_operation, emit_operation, shared
+from bigcodec_layout import LEGACY_LAYOUT, EXTENDED_LAYOUT, layout_for_hardware
 from bigcodec_vq.module import ResidualUnit
 
 
@@ -22,6 +23,55 @@ def tiny_models():
 
 
 class BigCodecGraphTest(unittest.TestCase):
+    def test_legacy_addresses_remain_default_and_shared_bounds_are_unchanged(self):
+        constants = (shared.MODEL_BASE, shared.MODEL_LIMIT, shared.TENSOR_BASE, shared.TENSOR_LIMIT)
+        models = tiny_models()
+        automatic = plan_memory(build_graph(*models, 400))
+        explicit = plan_memory(build_graph(*models, 400), layout=LEGACY_LAYOUT)
+        self.assertEqual(automatic.layout, LEGACY_LAYOUT)
+        self.assertEqual(vars(automatic), vars(explicit))
+        self.assertEqual(constants, (shared.MODEL_BASE, shared.MODEL_LIMIT,
+                                    shared.TENSOR_BASE, shared.TENSOR_LIMIT))
+
+    def test_model_capacity_retries_only_a_legacy_layout(self):
+        import bigcodec_compile as compiler
+        result = object()
+        failure = compiler._ModelCapacityError('model arena full', LEGACY_LAYOUT)
+        with patch.object(compiler, '_compile_models', side_effect=(failure, result)) as compile_graph:
+            self.assertIs(compiler.compile_models('encoder', 'decoder', samples=1000), result)
+            self.assertEqual(compile_graph.call_args.kwargs['memory_layout'], EXTENDED_LAYOUT)
+        with patch.object(compiler, '_compile_models', side_effect=compiler._ModelCapacityError(
+                'model arena full', EXTENDED_LAYOUT)) as compile_graph:
+            with self.assertRaisesRegex(ValueError, 'model arena full'):
+                compiler.compile_models('encoder', 'decoder', samples=1000)
+            self.assertEqual(compile_graph.call_count, 1)
+        with patch.object(compiler, '_compile_models', side_effect=ValueError('invalid weights')) as compile_graph:
+            with self.assertRaisesRegex(ValueError, 'invalid weights'):
+                compiler.compile_models('encoder', 'decoder', samples=1000)
+            self.assertEqual(compile_graph.call_count, 1)
+
+    @unittest.skipUnless(DEFAULT_CHECKPOINT.exists(), 'official checkpoint not downloaded')
+    def test_longest_noisy_file_fits_extended_layout_without_live_aliases(self):
+        torch.set_num_threads(1)
+        encoder, decoder = load_models(remove_weight_norm=True)
+        graph = build_graph(encoder, decoder, 379000, conv_precision='bf16')
+        with self.assertRaisesRegex(ValueError, 'tensors/workspace'):
+            plan_memory(graph, layout=LEGACY_LAYOUT)
+        graph = plan_memory(graph)
+        self.assertEqual(graph.layout, EXTENDED_LAYOUT)
+        self.assertEqual(graph.tensor_end - graph.layout.tensor_base, 679410560)
+        self.assertLessEqual(graph.tensor_end, 0x100000000)
+        self.assertEqual(graph.output_address, 0xD0000000)
+        self.assertEqual(graph.tokens_address, graph.output_address + 379000 * 128)
+        for index in range(len(graph.operations)):
+            live = [tensor for tensor in graph.tensors.values() if tensor.first <= index <= tensor.last]
+            for left_index, left in enumerate(live):
+                for right in live[left_index + 1:]:
+                    self.assertFalse(left.address < right.address + right.size_bytes
+                        and right.address < left.address + left.size_bytes)
+        self.assertEqual(layout_for_hardware({key: getattr(graph.layout, key) for key in
+            ('model_base', 'model_limit', 'tensor_base', 'tensor_limit')}), EXTENDED_LAYOUT)
+
     def test_official_padding_dimensions(self):
         for samples, expected in ((1, 200), (199, 200), (200, 400), (201, 400), (3200, 3400)):
             self.assertEqual(compiled_sample_count(samples), expected)
