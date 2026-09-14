@@ -7,14 +7,14 @@ inputs and actual FPGA outputs from the 8-kHz and 16-kHz models.
 
 | Test | SNR | Duration | Noisy input | FPGA 8 kHz | FPGA 16 kHz |
 | --- | ---: | ---: | --- | --- | --- |
-| Bus | 2.5–17.5 dB | 23.682 s | [WAV](noisy/bus.wav) | [WAV](fpga8k/bus.wav) | [WAV](fpga16k/bus.wav) |
-| Café | 2.5–17.5 dB | 20.509 s | [WAV](noisy/cafe.wav) | [WAV](fpga8k/cafe.wav) | [WAV](fpga16k/cafe.wav) |
-| Office | 2.5–17.5 dB | 21.980 s | [WAV](noisy/office.wav) | [WAV](fpga8k/office.wav) | [WAV](fpga16k/office.wav) |
-| Public square | 2.5–17.5 dB | 21.473 s | [WAV](noisy/psquare.wav) | [WAV](fpga8k/psquare.wav) | [WAV](fpga16k/psquare.wav) |
-| Bus | 2.5 dB | 20.879 s | [WAV](noisy/bus_low_snr.wav) | [WAV](fpga8k/bus_low_snr.wav) | [WAV](fpga16k/bus_low_snr.wav) |
-| Café | 2.5 dB | 21.466 s | [WAV](noisy/cafe_low_snr.wav) | [WAV](fpga8k/cafe_low_snr.wav) | [WAV](fpga16k/cafe_low_snr.wav) |
-| Office | 2.5 dB | 21.494 s | [WAV](noisy/office_low_snr.wav) | [WAV](fpga8k/office_low_snr.wav) | [WAV](fpga16k/office_low_snr.wav) |
-| Public square | 2.5 dB | 21.525 s | [WAV](noisy/psquare_low_snr.wav) | [WAV](fpga8k/psquare_low_snr.wav) | [WAV](fpga16k/psquare_low_snr.wav) |
+| Bus | 2.5–17.5 dB | 23.682 s | [bus.wav](noisy/bus.wav) | [bus.wav](fpga8k/bus.wav) | [bus.wav](fpga16k/bus.wav) |
+| Café | 2.5–17.5 dB | 20.509 s | [cafe.wav](noisy/cafe.wav) | [cafe.wav](fpga8k/cafe.wav) | [cafe.wav](fpga16k/cafe.wav) |
+| Office | 2.5–17.5 dB | 21.980 s | [office.wav](noisy/office.wav) | [office.wav](fpga8k/office.wav) | [office.wav](fpga16k/office.wav) |
+| Public square | 2.5–17.5 dB | 21.473 s | [psquare.wav](noisy/psquare.wav) | [psquare.wav](fpga8k/psquare.wav) | [psquare.wav](fpga16k/psquare.wav) |
+| Bus | 2.5 dB | 20.879 s | [bus_low_snr.wav](noisy/bus_low_snr.wav) | [bus_low_snr.wav](fpga8k/bus_low_snr.wav) | [bus_low_snr.wav](fpga16k/bus_low_snr.wav) |
+| Café | 2.5 dB | 21.466 s | [cafe_low_snr.wav](noisy/cafe_low_snr.wav) | [cafe_low_snr.wav](fpga8k/cafe_low_snr.wav) | [cafe_low_snr.wav](fpga16k/cafe_low_snr.wav) |
+| Office | 2.5 dB | 21.494 s | [office_low_snr.wav](noisy/office_low_snr.wav) | [office_low_snr.wav](fpga8k/office_low_snr.wav) | [office_low_snr.wav](fpga16k/office_low_snr.wav) |
+| Public square | 2.5 dB | 21.525 s | [psquare_low_snr.wav](noisy/psquare_low_snr.wav) | [psquare_low_snr.wav](fpga8k/psquare_low_snr.wav) | [psquare_low_snr.wav](fpga16k/psquare_low_snr.wav) |
 
 Tests join complete VoiceBank-DEMAND utterances with 250-ms silence gaps.
 The four 2.5-dB tests use additional source utterances. All WAVs are mono
