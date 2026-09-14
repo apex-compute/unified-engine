@@ -1,10 +1,10 @@
 {
   "format": "bigcodec-optimization-candidate-manifest-v1",
-  "scope": "Software-validated candidates; FPGA timing and accuracy pending hardware readiness",
+  "scope": "Historical software candidate records, superseded by validation/20260914_optimized_italy; source hashes describe the initial implementation.",
   "files": {
     "README.md": {
-      "bytes": 5238,
-      "sha256": "e59c8a25b222ad953e3ee9db9eabe54e4e7ff8db7e5d30e988fb38157f930b74"
+      "bytes": 5689,
+      "sha256": "a7f02e02b956e9f4104f1990cbdfd47c49d54b1115cdfcdbf85da5da2afaab32"
     },
     "candidate_artifacts.json": {
       "bytes": 3485,

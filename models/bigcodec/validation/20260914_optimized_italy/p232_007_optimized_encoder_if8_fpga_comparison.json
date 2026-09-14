@@ -1,0 +1,119 @@
+{
+  "format": "bigcodec-optimized-comparison-v1",
+  "hardware_metrics": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_optimized_italy/p232_007_optimized_encoder_if8_fpga.metrics.json",
+  "hardware_metrics_sha256": "4a514e7ed5a97be3d0eaa48c2aff8c20af10267392f248dee5d41ddf0abf1ea6",
+  "hardware_version": "0x40519e0a",
+  "bin_sha256": "7ec9247f6042359cde7ee207ba925ca2b5bf67d371f1e0b56c331a160c02af67",
+  "precision": {
+    "convolutions": "BF16",
+    "activations": "BF16",
+    "lstm_input_weights": "BF16",
+    "lstm_recurrent_weights": {
+      "encoder": "IF8-INT",
+      "decoder": "BF16"
+    }
+  },
+  "audio_processing_s": 18.27477428599923,
+  "audio_rtf": 4.619629802183255,
+  "fpga_execution_s": 18.102358421605405,
+  "end_to_end_vs_cpu": {
+    "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_optimized_italy/p232_007_cpu.wav",
+    "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_optimized_italy/p232_007_optimized_encoder_if8_fpga.wav",
+    "reference_sha256": "08b449c8be5bad1fabb6cde8cd91736162532144fc30c2b31d279cbfef229c99",
+    "actual_sha256": "1606d6842907114a5cc66d4cfb2174fa6f556c285027aacb134a7e6c30efed61",
+    "sample_rate": 48000,
+    "samples": 189883,
+    "channels": 1,
+    "duration_s": 3.9558958333333334,
+    "finite": true,
+    "alignment": "original sample indices; no gain, delay or polarity fitting",
+    "metric_status": {
+      "relative_l2": "finite",
+      "snr_db": "finite",
+      "cosine_similarity": "finite"
+    },
+    "relative_l2": 0.21349209454512788,
+    "snr_db": 13.412364038914353,
+    "max_abs_error": 0.3648624010384083,
+    "rmse": 0.01563104805867681,
+    "reference_rms": 0.0732160508892882,
+    "actual_rms": 0.07175885649885708,
+    "cosine_similarity": 0.9769498616446776,
+    "tokens": {
+      "count": 317,
+      "equal": 303,
+      "mismatches": 14,
+      "match_fraction": 0.9558359621451105,
+      "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_optimized_italy/p232_007_cpu.tokens.npz",
+      "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_optimized_italy/p232_007_optimized_encoder_if8_fpga.tokens.npz",
+      "reference_sha256": "dbd0b73fab28be43a6edd208948a61629bba3a6812107ef7654fe412a87b295f",
+      "actual_sha256": "c2544a1f16c0d39241eeb2897d4ac1f188321ce1ce04687a30bd9a86b97b329c",
+      "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+      "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9"
+    }
+  },
+  "current_cpu_reference_sample_bits_match_previous": true,
+  "same_token_decoder": {
+    "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/optimization_20260914/comparisons/p232_007_optimized_encoder_if8_fpga_same_tokens_cpu.wav",
+    "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_optimized_italy/p232_007_optimized_encoder_if8_fpga.wav",
+    "reference_sha256": "d5873e9e42d6082b43e0a4c2530aeda60277440621c42c5d7520955cb9727e0f",
+    "actual_sha256": "1606d6842907114a5cc66d4cfb2174fa6f556c285027aacb134a7e6c30efed61",
+    "sample_rate": 48000,
+    "samples": 189883,
+    "channels": 1,
+    "duration_s": 3.9558958333333334,
+    "finite": true,
+    "alignment": "original sample indices; no gain, delay or polarity fitting",
+    "metric_status": {
+      "relative_l2": "finite",
+      "snr_db": "finite",
+      "cosine_similarity": "finite"
+    },
+    "relative_l2": 0.3126924676202257,
+    "snr_db": 10.097651605097955,
+    "max_abs_error": 0.19504862651228905,
+    "rmse": 0.023009984965401655,
+    "reference_rms": 0.07358663014981214,
+    "actual_rms": 0.07175885649885708,
+    "cosine_similarity": 0.9501828041372127
+  },
+  "same_token_decoder_metrics": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/optimization_20260914/comparisons/p232_007_optimized_encoder_if8_fpga_same_tokens_cpu.metrics.json",
+  "comparison_scope": "Same original samples; no gain, delay, polarity, or alignment fitting. End-to-end and same-token errors use different references and do not add.",
+  "previous_fpga_bf16_baseline": {
+    "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_italy/p232_007_fpga_bf16.wav",
+    "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_optimized_italy/p232_007_optimized_encoder_if8_fpga.wav",
+    "reference_sha256": "9c1845870fdbccfa3625136e8df66b001ef5fb096a34e86dfe2dcdd16388ffca",
+    "actual_sha256": "1606d6842907114a5cc66d4cfb2174fa6f556c285027aacb134a7e6c30efed61",
+    "sample_rate": 48000,
+    "samples": 189883,
+    "channels": 1,
+    "duration_s": 3.9558958333333334,
+    "finite": true,
+    "alignment": "original sample indices; no gain, delay or polarity fitting",
+    "metric_status": {
+      "relative_l2": "finite",
+      "snr_db": "finite",
+      "cosine_similarity": "finite"
+    },
+    "relative_l2": 0.11678060375471684,
+    "snr_db": 18.652585675603838,
+    "max_abs_error": 0.16153216361999512,
+    "rmse": 0.008366519321059342,
+    "reference_rms": 0.07164305588479553,
+    "actual_rms": 0.07175885649885708,
+    "cosine_similarity": 0.993193453391019,
+    "sample_bits_identical": false,
+    "tokens": {
+      "count": 317,
+      "equal": 309,
+      "mismatches": 8,
+      "match_fraction": 0.9747634069400631,
+      "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_italy/p232_007_fpga_bf16.tokens.npz",
+      "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_optimized_italy/p232_007_optimized_encoder_if8_fpga.tokens.npz",
+      "reference_sha256": "34da5227f77c3f643159facff138f27827176c9555631c81629032ecf9d07044",
+      "actual_sha256": "c2544a1f16c0d39241eeb2897d4ac1f188321ce1ce04687a30bd9a86b97b329c",
+      "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+      "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9"
+    }
+  }
+}

@@ -1,0 +1,53 @@
+[
+  {
+    "bin": "models/bigcodec/bigcodec_bin/bigcodec-p232_007-sram-v4-bf16.bin",
+    "bin_bytes": 415291119,
+    "bin_sha256": "884e3ba74075e5b5b344e6c834894d7a7c8a30fd437835cbd47a9fe41ba70706",
+    "code_frames": 317,
+    "compile_s": 17.466076994000105,
+    "compiled_samples": 63400,
+    "convolution_precision": "bf16",
+    "instructions": 2624968,
+    "lstm_recurrent_precision": "bf16",
+    "native_samples": 63295,
+    "operations": 180,
+    "parameter_bytes": 331251584,
+    "program_bytes": 83998976,
+    "resident_bytes": 415250560,
+    "scratch_bytes": 73036800
+  },
+  {
+    "bin": "models/bigcodec/bigcodec_bin/bigcodec-p232_007-sram-v4-encoder-if8.bin",
+    "bin_bytes": 395302383,
+    "bin_sha256": "7ec9247f6042359cde7ee207ba925ca2b5bf67d371f1e0b56c331a160c02af67",
+    "code_frames": 317,
+    "compile_s": 23.785216338999817,
+    "compiled_samples": 63400,
+    "convolution_precision": "bf16",
+    "instructions": 2571712,
+    "lstm_recurrent_precision": "encoder-if8",
+    "native_samples": 63295,
+    "operations": 180,
+    "parameter_bytes": 312967040,
+    "program_bytes": 82294784,
+    "resident_bytes": 395261824,
+    "scratch_bytes": 73036800
+  },
+  {
+    "bin": "models/bigcodec/bigcodec_bin/bigcodec-p232_007-sram-v4-lstm-if8.bin",
+    "bin_bytes": 375313647,
+    "bin_sha256": "91c55eb5441c037464e3bf75f1155fde41da6c399ff004d3eded91f6f1987cf5",
+    "code_frames": 317,
+    "compile_s": 23.082562150999365,
+    "compiled_samples": 63400,
+    "convolution_precision": "bf16",
+    "instructions": 2518456,
+    "lstm_recurrent_precision": "if8",
+    "native_samples": 63295,
+    "operations": 180,
+    "parameter_bytes": 294682496,
+    "program_bytes": 80590592,
+    "resident_bytes": 375273088,
+    "scratch_bytes": 73036800
+  }
+]

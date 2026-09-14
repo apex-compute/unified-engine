@@ -1,0 +1,24 @@
+{
+  "a": {
+    "mismatch_classification": "copy source",
+    "ieee_value_comparison_pass": false,
+    "ieee_bit_comparison_pass": false,
+    "observed_tiny_subnormal_flushes": 126,
+    "unexplained_value_mismatches": 0,
+    "unexplained_bit_mismatches": 0,
+    "selected_normal_value_mismatches": 0,
+    "selected_upper_subnormal_value_mismatches": 0,
+    "subnormal_exception": "Only selected BF16 magnitudes bits0x0001..0x003f may flush to matching-sign zero; all other results stay exact."
+  },
+  "b": {
+    "mismatch_classification": "copy source",
+    "ieee_value_comparison_pass": false,
+    "ieee_bit_comparison_pass": false,
+    "observed_tiny_subnormal_flushes": 126,
+    "unexplained_value_mismatches": 0,
+    "unexplained_bit_mismatches": 0,
+    "selected_normal_value_mismatches": 0,
+    "selected_upper_subnormal_value_mismatches": 0,
+    "subnormal_exception": "Only selected BF16 magnitudes bits0x0001..0x003f may flush to matching-sign zero; all other results stay exact."
+  }
+}
