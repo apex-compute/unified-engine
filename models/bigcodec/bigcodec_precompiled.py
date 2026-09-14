@@ -13,6 +13,7 @@ import torch
 
 from bigcodec_common import CHECKPOINT_SHA256, HOP_LENGTH, SAMPLE_RATE
 from bigcodec_device import ROOT, shared, udc
+from bigcodec_layout import layout_for_hardware
 from bigcodec_quantizer import decode_split_tokens
 
 path = ROOT / 'models/dpdfnet8khz'
@@ -121,20 +122,22 @@ def validate_artifact(payload):
         'tensor_end', 'scratch_address', 'scratch_bytes', 'identity_address', 'zero_address')
     if any(not _integer(h.get(key)) for key in integer_fields):
         raise ValueError('Hardware addresses, counts and bounds must be integers')
+    # Exact supported arena tuples preserve legacy bins while allowing the
+    # longer-utterance layout inside the board's visible 2 GiB DRAM window.
+    layout = layout_for_hardware(h)
     image = h.get('model_image')
     if (not isinstance(image, torch.Tensor) or image.dtype != torch.uint8
             or image.ndim != 1 or image.device.type != 'cpu' or not image.is_contiguous()
-            or not 0 < image.numel() <= shared.MODEL_LIMIT - shared.MODEL_BASE):
+            or not 0 < image.numel() <= layout.model_limit - layout.model_base):
         raise ValueError('Invalid model image')
     raw = image_bytes(image)
     if hashlib.sha256(raw).hexdigest() != h.get('model_sha256'):
         raise ValueError('Model image checksum mismatch')
     offset, size = h.get('program_offset'), h.get('program_size')
-    if (h.get('model_base') != shared.MODEL_BASE or h.get('model_limit') != shared.MODEL_LIMIT
-            or not _integer(offset) or offset < 0 or offset % 128
+    if (not _integer(offset) or offset < 0 or offset % 128
             or not _integer(size) or size <= 0 or size % 64
             or offset + size != len(raw)
-            or h.get('program_address') != shared.MODEL_BASE + offset):
+            or h.get('program_address') != layout.model_base + offset):
         raise ValueError('Invalid resident instruction bounds')
     program = raw[offset:offset + size]
     if hashlib.sha256(program).hexdigest() != h.get('program_sha256'):
@@ -154,7 +157,7 @@ def validate_artifact(payload):
     for name, length in (('zero_address', udc.URAM_NEAR_FULL_SIZE), ('identity_address', 64 * 64 * 2)):
         address = h.get(name)
         if (not _integer(address) or address % 128
-                or not shared.MODEL_BASE <= address < address + length <= shared.MODEL_BASE + parameters):
+                or not layout.model_base <= address < address + length <= layout.model_base + parameters):
             raise ValueError('Invalid resident constant range')
     if any(op != udc.INSTRUCTION_NOP for op in kinds[halt + 1:]):
         raise ValueError('HALT must be terminal')
@@ -188,19 +191,19 @@ def validate_artifact(payload):
             or payload.get('all_neural_operations_on_device') is not True):
         raise ValueError('Invalid BigCodec sample/token dimensions')
     wave_bytes = samples * 64 * 2
-    if (h.get('input_address') != shared.INPUT_BASE or h.get('input_bytes') != wave_bytes
-            or wave_bytes > shared.INPUT_LIMIT - shared.INPUT_BASE
-            or h.get('output_address') != shared.TENSOR_BASE
+    if (h.get('input_address') != layout.input_base or h.get('input_bytes') != wave_bytes
+            or wave_bytes > layout.input_limit - layout.input_base
+            or h.get('output_address') != layout.tensor_base
             or h.get('tokens_offset') != wave_bytes
-            or h.get('tokens_address') != shared.TENSOR_BASE + wave_bytes
+            or h.get('tokens_address') != layout.tensor_base + wave_bytes
             or h.get('output_bytes') != wave_bytes + frames * 64 * 2
-            or shared.TENSOR_BASE + h['output_bytes'] > shared.TENSOR_LIMIT
-            or h.get('tensor_base') != shared.TENSOR_BASE or h.get('tensor_limit') != shared.TENSOR_LIMIT
+            or layout.tensor_base + h['output_bytes'] > layout.tensor_limit
+            or h.get('tensor_base') != layout.tensor_base or h.get('tensor_limit') != layout.tensor_limit
             or not _integer(h.get('scratch_address')) or h['scratch_address'] % 128
             or not _integer(h.get('scratch_bytes')) or h['scratch_bytes'] <= 0 or h['scratch_bytes'] % 128
             or not _integer(h.get('tensor_end'))
             or h['tensor_end'] != h['scratch_address'] + h['scratch_bytes']
-            or not shared.TENSOR_BASE + h['output_bytes'] <= h['scratch_address'] < h['tensor_end'] <= shared.TENSOR_LIMIT):
+            or not layout.tensor_base + h['output_bytes'] <= h['scratch_address'] < h['tensor_end'] <= layout.tensor_limit):
         raise ValueError('Invalid audio/token DRAM bounds')
     _validate_tensor_inventory(h, samples, operations)
     shared._scan_queue_configs(program, 0, len(program))

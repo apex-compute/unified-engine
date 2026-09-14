@@ -23,13 +23,14 @@ import bigcodec_precompiled as runtime
 import bigcodec_run_from_bin as runner
 from bigcodec_common import CHECKPOINT_SHA256, SAMPLE_RATE, HOP_LENGTH, sha256_file
 from bigcodec_device import shared, udc
+from bigcodec_layout import LEGACY_LAYOUT, EXTENDED_LAYOUT
 
 
-def fixture_payload():
+def fixture_payload(layout=LEGACY_LAYOUT):
     """Small real captured queue with a synthetic but valid tensor inventory."""
     parameters = udc.URAM_NEAR_FULL_SIZE + 64 * 64 * 2
     offset = (parameters + 127) // 128 * 128
-    engine = shared._WholeGraphEngine(shared.MODEL_BASE + offset)
+    engine = shared._WholeGraphEngine(layout.model_base + offset)
     engine.start_capture()
     for _ in range(3):
         engine.generate_instruction_nop()
@@ -40,7 +41,7 @@ def fixture_payload():
     samples, frames = 200, 1
     wave_bytes = samples * 128
     output_bytes = wave_bytes + frames * 128
-    encoded = shared.TENSOR_BASE + output_bytes
+    encoded = layout.tensor_base + output_bytes
     quantized = encoded + 1024 * 2
     scratch = quantized + 1024 * 2
     operations = [
@@ -58,25 +59,25 @@ def fixture_payload():
                 sample_rate=SAMPLE_RATE, hop_length=HOP_LENGTH, native_samples=199,
                 full_utterance=True, all_neural_operations_on_device=True,
                 hardware=dict(
-                    model_base=shared.MODEL_BASE, model_limit=shared.MODEL_LIMIT,
+                    model_base=layout.model_base, model_limit=layout.model_limit,
                     model_image=torch.frombuffer(raw, dtype=torch.uint8).clone(),
                     model_sha256=hashlib.sha256(raw).hexdigest(),
-                    program_address=shared.MODEL_BASE + offset, program_offset=offset,
+                    program_address=layout.model_base + offset, program_offset=offset,
                     program_size=len(program), program_sha256=hashlib.sha256(program).hexdigest(),
                     parameter_bytes=parameters, instructions=len(engine.capture_buffer), halt_index=3,
                     axi_data_width_bits=256, compiled_samples=samples, code_frames=frames,
-                    input_address=shared.INPUT_BASE, input_bytes=wave_bytes,
-                    output_address=shared.TENSOR_BASE, output_bytes=output_bytes,
-                    tokens_address=shared.TENSOR_BASE + wave_bytes, tokens_offset=wave_bytes,
-                    tensor_base=shared.TENSOR_BASE, tensor_limit=shared.TENSOR_LIMIT,
+                    input_address=layout.input_base, input_bytes=wave_bytes,
+                    output_address=layout.tensor_base, output_bytes=output_bytes,
+                    tokens_address=layout.tensor_base + wave_bytes, tokens_offset=wave_bytes,
+                    tensor_base=layout.tensor_base, tensor_limit=layout.tensor_limit,
                     scratch_address=scratch, scratch_bytes=128, tensor_end=scratch + 128,
-                    zero_address=shared.MODEL_BASE,
-                    identity_address=shared.MODEL_BASE + udc.URAM_NEAR_FULL_SIZE,
+                    zero_address=layout.model_base,
+                    identity_address=layout.model_base + udc.URAM_NEAR_FULL_SIZE,
                     operations=operations, tensors={
-                        'input': tensor([samples, 1], shared.INPUT_BASE, -1, 0),
+                        'input': tensor([samples, 1], layout.input_base, -1, 0),
                         'encoded': tensor([frames, 1024], encoded, 0, 1),
                         'quantized': tensor([frames, 1024], quantized, 1, 2),
-                        'waveform': tensor([samples, 1], shared.TENSOR_BASE, 2, 3)}))
+                        'waveform': tensor([samples, 1], layout.tensor_base, 2, 3)}))
 
 
 def replace_program(payload, kinds):
@@ -171,6 +172,162 @@ class RuntimeTests(unittest.TestCase):
             torch.save(payload, path)
             actual = runtime.load_artifact(path)
             self.assertEqual(actual['hardware']['model_sha256'], payload['hardware']['model_sha256'])
+
+    def test_extended_layout_loads_and_executes_with_the_existing_waveform_abi(self):
+        payload = fixture_payload(EXTENDED_LAYOUT)
+        h = runtime.validate_artifact(payload)
+        self.assertEqual(h['model_limit'], 0xD0000000)
+        self.assertEqual(h['output_address'], 0xD0000000)
+        self.assertEqual(h['tensor_limit'], 0x100000000)
+        self.assertNotIn('memory_layout', payload)  # Bounds alone identify both formats.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'extended.bin'
+            torch.save(payload, path)
+            loaded = runtime.load_artifact(path)
+        engine = FakeEngine(loaded)
+        backend = runtime.WholeGraphBackend(engine, loaded, axi_data_width_bits=256)
+        wave, tokens = backend.execute(np.zeros(200, dtype=np.float32))
+        np.testing.assert_array_equal(wave, np.full(200, .25, dtype=np.float32))
+        np.testing.assert_array_equal(tokens, [8191])
+        self.assertIn(('read', 0xD0000000, 201 * 128), engine.events)
+        self.assertEqual(backend.model_upload_writes, 1)
+        self.assertEqual(backend.program_kicks, 1)
+        self.assertEqual(backend.halts, 1)
+        self.assertEqual(backend.output_reads, 1)
+
+    def test_layouts_accept_their_last_byte_and_reject_any_tensor_overrun(self):
+        for layout in (LEGACY_LAYOUT, EXTENDED_LAYOUT):
+            with self.subTest(layout=layout.name):
+                payload = fixture_payload(layout)
+                h = payload['hardware']
+                h.update(scratch_address=layout.tensor_limit - 128,
+                         scratch_bytes=128, tensor_end=layout.tensor_limit)
+                h['tensors']['encoded']['address'] = h['scratch_address'] - 4096
+                h['tensors']['quantized']['address'] = h['scratch_address'] - 2048
+                runtime.validate_artifact(payload)
+                h['scratch_bytes'] += 128
+                h['tensor_end'] += 128
+                with self.assertRaisesRegex(ValueError, 'DRAM bounds'):
+                    runtime.validate_artifact(payload)
+                h['scratch_bytes'] -= 128
+                h['tensor_end'] -= 128
+                h['tensors']['quantized']['address'] = layout.tensor_limit - 128
+                with self.assertRaisesRegex(ValueError, 'workspace'):
+                    runtime.validate_artifact(payload)
+
+    def test_mixed_layouts_and_bounds_outside_visible_two_gib_are_rejected(self):
+        for changes in (
+                {'model_limit': LEGACY_LAYOUT.model_limit},
+                {'tensor_base': LEGACY_LAYOUT.tensor_base},
+                {'tensor_limit': 0x100000080},
+                {'model_base': 0x7FFFFF80},
+                {'model_limit': 0x100000000},
+                {'input_address': 0x7FFFFF80},
+                {'program_address': 0x100000000},
+                {'output_address': 0x100000000}):
+            with self.subTest(changes=changes):
+                payload = fixture_payload(EXTENDED_LAYOUT)
+                payload['hardware'].update(changes)
+                with self.assertRaises(ValueError):
+                    runtime.validate_artifact(payload)
+
+    def test_dma_encodes_upper_visible_addresses_without_signed_truncation(self):
+        engine = shared._WholeGraphEngine(0xCFFFFF00)
+        with patch.object(udc, 'UE_AXI_DATA_WIDTH_BITS', 256), contextlib.redirect_stdout(io.StringIO()):
+            engine.start_capture()
+            engine.accelerator_memory_to_sram(0xFFFFFF80, 0, 64)
+            engine.sram_to_accelerator_memory(0, 0xFFFFFF00, 64)
+            engine.generate_instruction_halt()
+            engine.stop_capture()
+        for instruction, address in zip(engine.capture_buffer, (0xFFFFFF80, 0xFFFFFF00)):
+            self.assertEqual(instruction.words[1] << 3, address)
+            self.assertEqual(instruction.words[2], 128)
+            self.assertEqual(len(instruction.get_bytes()), 32)
+        # Exercise the host offset plumbing without opening a device.
+        engine = object.__new__(udc.UnifiedEngine)
+        buffer = torch.zeros(64, dtype=torch.bfloat16)
+        with patch.object(udc.os, 'open', return_value=101), \
+             patch.object(udc.os, 'close'), \
+             patch.object(udc.os, 'lseek') as seek, \
+             patch.object(udc.os, 'write', return_value=128), \
+             patch.object(udc.os, 'read', return_value=bytes(128)):
+            self.assertEqual(engine.dma_write('fake-h2c', 0xFFFFFF80, buffer, 128), 128)
+            self.assertEqual(engine.dma_read('fake-c2h', 0xFFFFFF80, buffer, 128), 128)
+        self.assertEqual(seek.call_args_list[0].args, (101, 0xFFFFFF80, os.SEEK_SET))
+        self.assertEqual(seek.call_args_list[1].args, (101, 0xFFFFFF80, os.SEEK_SET))
+
+    def test_detected_capacity_uses_actual_extents_and_preserves_legacy_bins(self):
+        legacy = fixture_payload()['hardware']
+        # The reserved legacy arena ends above 1 GiB, but this bin uses less.
+        self.assertGreater(legacy['tensor_limit'] - udc.DRAM_START_ADDR, 2**30)
+        report = runner.validate_dram_capacity(legacy, 1)
+        self.assertEqual(report['memory_layout'], 'legacy')
+        self.assertEqual(report['dram_addressable_bytes'], 2**30)
+        self.assertEqual(report['dram_required_bytes'], legacy['tensor_end'] - udc.DRAM_START_ADDR)
+        extended = fixture_payload(EXTENDED_LAYOUT)['hardware']
+        with self.assertRaisesRegex(ValueError, 'requires.*reported 1 GiB'):
+            runner.validate_dram_capacity(extended, 1)
+        report = runner.validate_dram_capacity(extended, 2)
+        self.assertEqual(report['memory_layout'], 'extended')
+        self.assertEqual(report['detected_dram_size_gib'], 2)
+        self.assertEqual(report['dram_required_bytes'], extended['tensor_end'] - udc.DRAM_START_ADDR)
+
+    def test_detected_capacity_checks_all_used_extents_and_caps_visible_addresses(self):
+        h = fixture_payload(EXTENDED_LAYOUT)['hardware']
+        for key in ('tensor_end', 'model_image', 'input_bytes'):
+            with self.subTest(extent=key):
+                changed = dict(h)
+                if key == 'tensor_end':
+                    changed[key] = 0x100000000
+                elif key == 'model_image':
+                    changed[key] = SimpleNamespace(numel=lambda: 0x100000000 - h['model_base'])
+                else:
+                    changed[key] = 0x100000000 - h['input_address']
+                self.assertEqual(runner.validate_dram_capacity(changed, 4)['dram_required_bytes'], 2**31)
+                if key == 'model_image':
+                    changed[key] = SimpleNamespace(numel=lambda: 0x100000080 - h['model_base'])
+                else:
+                    changed[key] += 128
+                with self.assertRaisesRegex(ValueError, 'requires'):
+                    runner.validate_dram_capacity(changed, 4)
+        for bad_report in (0, -1, True, 2.0, None, '2'):
+            with self.subTest(reported_capacity=bad_report):
+                with self.assertRaisesRegex(ValueError, 'positive integer'):
+                    runner.validate_dram_capacity(h, bad_report)
+
+    def test_cli_rejects_insufficient_ddr_before_engine_reset_or_upload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, binary, output = root / 'source.wav', root / 'codec.bin', root / 'output.wav'
+            sf.write(source, np.zeros(199, dtype=np.float32), SAMPLE_RATE, subtype='FLOAT')
+            torch.save(fixture_payload(EXTENDED_LAYOUT), binary)
+            source_hash, bin_hash = sha256_file(source), sha256_file(binary)
+            hostname = f'bigcodec-capacity-test-{os.getpid()}'
+            lockfile = Path(f'/tmp/pcie_ci_hw_{hostname}.lock')
+            error_output = io.StringIO()
+            try:
+                with patch.object(sys, 'argv', ['bigcodec', '--bin', str(binary), '--input', str(source),
+                                                '--output', str(output), '--cpu-core', '6']), \
+                     patch.object(runner, 'StreamingEngine') as engine, \
+                     patch.object(runner, 'WholeGraphBackend') as backend, \
+                     patch.object(runner, 'configure_hardware_runtime', return_value=(3.0,
+                         SimpleNamespace(axi_data_width_bits=256, dram_size_gb=1), 3.0)), \
+                     patch.object(runner.socket, 'gethostname', return_value=hostname), \
+                     patch.object(runner.os, 'sched_getaffinity', return_value={6}), \
+                     patch.object(runner.os, 'sched_setaffinity'), \
+                     contextlib.redirect_stderr(error_output):
+                    with self.assertRaises(SystemExit) as error:
+                        runner.main()
+                    self.assertEqual(error.exception.code, 2)
+                    engine.assert_not_called()
+                    backend.assert_not_called()
+            finally:
+                lockfile.unlink(missing_ok=True)
+            self.assertIn('reported 1 GiB', error_output.getvalue())
+            self.assertEqual(source_hash, sha256_file(source))
+            self.assertEqual(bin_hash, sha256_file(binary))
+            for path in (output, output.with_suffix('.tokens.npz'), output.with_suffix('.metrics.json')):
+                self.assertFalse(path.exists())
 
     def test_reject_malformed_identity_dimensions_and_memory_metadata(self):
         changes = [
@@ -357,7 +514,8 @@ class RuntimeTests(unittest.TestCase):
                 with patch.object(sys, 'argv', ['bigcodec', '--bin', str(binary), '--input', str(source),
                                                 '--output', str(output), '--cpu-core', '6']), \
                      patch.object(runner, 'StreamingEngine', return_value=engine), \
-                     patch.object(runner, 'configure_hardware_runtime', return_value=(3.0, SimpleNamespace(axi_data_width_bits=256), 3.0)), \
+                     patch.object(runner, 'configure_hardware_runtime', return_value=(3.0,
+                         SimpleNamespace(axi_data_width_bits=256, dram_size_gb=2), 3.0)), \
                      patch.object(runner.socket, 'gethostname', return_value=hostname), \
                      patch.object(runner.os, 'sched_getaffinity', return_value={6}), \
                      patch.object(runner.os, 'sched_setaffinity'), \
@@ -377,6 +535,10 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(report['output_sha256'], sha256_file(output))
             self.assertEqual(report['hardware_version'], '0xdf0749de')
             self.assertEqual(report['cpu_neural_ops'], 0)
+            self.assertEqual(report['memory_layout'], 'legacy')
+            self.assertEqual(report['detected_dram_size_gib'], 2)
+            self.assertEqual(report['dram_addressable_bytes'], 2**31)
+            self.assertEqual(report['dram_required_bytes'], payload['hardware']['tensor_end'] - udc.DRAM_START_ADDR)
 
 
 class FileProtectionTests(unittest.TestCase):

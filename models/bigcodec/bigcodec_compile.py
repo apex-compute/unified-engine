@@ -27,6 +27,7 @@ from bigcodec_conv import (
 )
 from bigcodec_lstm import scratch_bytes as lstm_scratch_bytes, prepare_lstm, emit_lstm, tanh_identity, tanh_scratch_bytes, TANH_ARGUMENT_LIMIT, TANH_CHUNK_ELEMENTS, _tanh_sram
 from bigcodec_quantizer import quantizer_scratch_bytes, prepare_quantizer, emit_quantizer
+from bigcodec_layout import MemoryLayout, LEGACY_LAYOUT, EXTENDED_LAYOUT, LAYOUTS
 
 FORMAT = "andromeda.bigcodec.whole-utterance-v1"
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "bigcodec_bin" / "bigcodec-andromeda.bin"
@@ -80,6 +81,7 @@ class Graph:
     scratch_address: int = 0
     scratch_bytes: int = 0
     tensor_end: int = 0
+    layout: MemoryLayout = LEGACY_LAYOUT
 
 
 def compiled_sample_count(samples: int) -> int:
@@ -214,6 +216,16 @@ def emit_waveform_tanh(engine, source, destination, rows, identity_address,
             chunk=WAVEFORM_ROW_BYTES, jump=WAVEFORM_ROW_BYTES)
 
 
+class _TensorCapacityError(ValueError):
+    pass
+
+
+class _ModelCapacityError(ValueError):
+    def __init__(self, message, layout):
+        super().__init__(message)
+        self.layout = layout
+
+
 class Arena:
     """Best-fit free blocks; source buffers remain live until their op completes."""
     def __init__(self, start, limit):
@@ -232,7 +244,7 @@ class Arena:
         start = aligned(self.cursor)
         self.cursor = start + size
         if self.cursor > self.limit:
-            raise ValueError("BigCodec intermediate tensors exceed the FPGA tensor arena")
+            raise _TensorCapacityError("BigCodec intermediate tensors exceed the FPGA tensor arena")
         return start
 
     def release(self, start, size):
@@ -246,14 +258,32 @@ class Arena:
         self.free = merged
 
 
-def plan_memory(graph: Graph) -> Graph:
-    if graph.tensors["input"].size_bytes > shared.INPUT_LIMIT - shared.INPUT_BASE:
+def plan_memory(graph: Graph, *, layout: MemoryLayout | None = None) -> Graph:
+    """Preserve legacy addresses when possible; use the larger RK arenas if needed."""
+    if layout is not None:
+        if layout not in LAYOUTS:
+            raise ValueError("Unsupported BigCodec memory layout")
+        return _plan_memory(graph, layout)
+    for candidate in LAYOUTS:
+        try:
+            return _plan_memory(graph, candidate)
+        except _TensorCapacityError:
+            if candidate is LAYOUTS[-1]:
+                raise
+    raise AssertionError("No BigCodec layouts configured")
+
+
+def _plan_memory(graph: Graph, layout: MemoryLayout) -> Graph:
+    graph.layout = layout
+    graph.output_address = layout.tensor_base
+    graph.tensors["input"].address = layout.input_base
+    if graph.tensors["input"].size_bytes > layout.input_limit - layout.input_base:
         raise ValueError("BigCodec packed input exceeds the FPGA input arena")
     graph.tokens_offset = packed_bytes((graph.compiled_samples, 1))
     graph.tokens_address = graph.output_address + graph.tokens_offset
     graph.output_bytes = graph.tokens_offset + packed_bytes((graph.code_frames, 2))
     graph.tensors[graph.output].address = graph.output_address
-    arena = Arena(aligned(graph.output_address + graph.output_bytes), shared.TENSOR_LIMIT)
+    arena = Arena(aligned(graph.output_address + graph.output_bytes), layout.tensor_limit)
     uses = Counter(name for operation in graph.operations for name in operation.inputs)
     scratch = 0
     for index, operation in enumerate(graph.operations):
@@ -302,8 +332,8 @@ def plan_memory(graph: Graph) -> Graph:
     graph.scratch_address = aligned(arena.cursor)
     graph.scratch_bytes = aligned(scratch)
     graph.tensor_end = graph.scratch_address + graph.scratch_bytes
-    if graph.tensor_end > shared.TENSOR_LIMIT:
-        raise ValueError(f"BigCodec tensors/workspace need {graph.tensor_end - shared.TENSOR_BASE} bytes; arena holds {shared.TENSOR_LIMIT - shared.TENSOR_BASE}")
+    if graph.tensor_end > layout.tensor_limit:
+        raise _TensorCapacityError(f"BigCodec tensors/workspace need {graph.tensor_end - layout.tensor_base} bytes; arena holds {layout.tensor_limit - layout.tensor_base}")
     return graph
 
 
@@ -402,6 +432,21 @@ def emit_operation(engine, graph, operation, identity_address, zero_address):
 
 
 def compile_models(encoder, decoder, *, samples: int, conv_precision="if8", lstm_precision="bf16") -> dict:
+    try:
+        return _compile_models(encoder, decoder, samples=samples,
+            conv_precision=conv_precision, lstm_precision=lstm_precision)
+    except _ModelCapacityError as error:
+        if error.layout != LEGACY_LAYOUT:
+            raise
+    # Replan all addresses before recapturing. Existing short bins retain
+    # their exact parameters/instructions; no shared model constants change.
+    return _compile_models(encoder, decoder, samples=samples,
+        conv_precision=conv_precision, lstm_precision=lstm_precision,
+        memory_layout=EXTENDED_LAYOUT)
+
+
+def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
+                    lstm_precision="bf16", memory_layout=None) -> dict:
     if encoder.training or decoder.training:
         raise ValueError("Compile eval models loaded with remove_weight_norm=True")
     if any(name.endswith(("weight_g", "weight_v"))
@@ -409,8 +454,10 @@ def compile_models(encoder, decoder, *, samples: int, conv_precision="if8", lstm
         raise ValueError("Remove all weight normalization before reading compile-time weights")
     compiled_samples = compiled_sample_count(samples)
     graph = plan_memory(build_graph(encoder, decoder, compiled_samples,
-                                   conv_precision=conv_precision, lstm_precision=lstm_precision))
-    image = shared._ImageBuilder(shared.MODEL_BASE, shared.MODEL_LIMIT)
+                                   conv_precision=conv_precision, lstm_precision=lstm_precision),
+                        layout=memory_layout)
+    layout = graph.layout
+    image = shared._ImageBuilder(layout.model_base, layout.model_limit)
     zero_address = image.allocate(torch.zeros(udc.URAM_NEAR_FULL_SIZE // 2, dtype=torch.bfloat16), alignment=128)
     identity_address = image.allocate(torch.eye(64, dtype=torch.bfloat16), alignment=128)
     previous_axi_width = udc.UE_AXI_DATA_WIDTH_BITS
@@ -431,13 +478,13 @@ def compile_models(encoder, decoder, *, samples: int, conv_precision="if8", lstm
             operations.append({"name": operation.name, "op": operation.op,
                 "start": start, "stop": stop, "inputs": list(operation.inputs),
                 "output": operation.output, "weight_reuse_pixels": operation.weight_reuse_pixels})
-            if program_address + (stop + 2) * udc.INSTRUCTION_SIZE_BYTES > shared.MODEL_LIMIT:
+            if program_address + (stop + 2) * udc.INSTRUCTION_SIZE_BYTES > layout.model_limit:
                 counts = Counter()
                 for entry in operations:
                     counts[entry["op"]] += entry["stop"] - entry["start"]
-                raise ValueError(f"BigCodec model/program image exceeds {shared.MODEL_LIMIT - shared.MODEL_BASE} bytes at {operation.name}; "
+                raise _ModelCapacityError(f"BigCodec model/program image exceeds {layout.model_limit - layout.model_base} bytes at {operation.name}; "
                     f"parameters={parameter_bytes}, captured_instructions={stop}, "
-                    f"instructions_by_type={dict(counts)}")
+                    f"instructions_by_type={dict(counts)}", layout)
         halt_index = engine.capture_count
         engine.generate_instruction_halt()
         engine.stop_capture()
@@ -456,18 +503,18 @@ def compile_models(encoder, decoder, *, samples: int, conv_precision="if8", lstm
         udc.UE_AXI_DATA_WIDTH_BITS = previous_axi_width
     model_image = torch.frombuffer(image.data, dtype=torch.uint8).clone()
     hardware = {
-        "model_base": shared.MODEL_BASE, "model_limit": shared.MODEL_LIMIT,
+        "model_base": layout.model_base, "model_limit": layout.model_limit,
         "model_image": model_image,
         "model_sha256": hashlib.sha256(image.data).hexdigest(),
-        "program_address": program_address, "program_offset": program_address - shared.MODEL_BASE,
+        "program_address": program_address, "program_offset": program_address - layout.model_base,
         "program_size": len(program), "program_sha256": hashlib.sha256(program).hexdigest(),
         "parameter_bytes": parameter_bytes, "instructions": len(engine.capture_buffer),
         "halt_index": halt_index, "axi_data_width_bits": 256,
         "compiled_samples": compiled_samples, "code_frames": graph.code_frames,
-        "input_address": shared.INPUT_BASE, "input_bytes": graph.tensors["input"].size_bytes,
+        "input_address": layout.input_base, "input_bytes": graph.tensors["input"].size_bytes,
         "output_address": graph.output_address, "output_bytes": graph.output_bytes,
         "tokens_address": graph.tokens_address, "tokens_offset": graph.tokens_offset,
-        "tensor_base": shared.TENSOR_BASE, "tensor_limit": shared.TENSOR_LIMIT,
+        "tensor_base": layout.tensor_base, "tensor_limit": layout.tensor_limit,
         "tensor_end": graph.tensor_end, "scratch_address": graph.scratch_address,
         "scratch_bytes": graph.scratch_bytes, "identity_address": identity_address,
         "zero_address": zero_address, "operations": operations,
