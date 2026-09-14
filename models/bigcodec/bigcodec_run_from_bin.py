@@ -18,6 +18,7 @@ from bigcodec_common import (DEFAULT_CHECKPOINT, pad_audio, read_audio, restore_
                              sha256_file, save_tokens)
 from bigcodec_precompiled import (DEFAULT_BIN, StreamingEngine, WholeGraphBackend,
                                   load_artifact, udc)
+from bigcodec_layout import layout_for_hardware
 from yolov5_common import configure_hardware_runtime
 
 
@@ -34,6 +35,33 @@ def validate_output_paths(input_path, bin_path, output_path, tokens_path, report
             raise ValueError('Input, bin, output, tokens and report paths must be distinct files')
     if any(aliases(path, DEFAULT_CHECKPOINT) for path in paths[2:]):
         raise ValueError('Output files must not overwrite the pinned BigCodec checkpoint')
+
+
+def validate_dram_capacity(hardware, dram_size_gb):
+    """Check a validated artifact's used addresses against detected, visible DDR.
+
+    The controller exposes DDR starting at 0x80000000, within a 32-bit byte
+    address window. Reserved arena limits are not allocation sizes: legacy
+    artifacts can fit a smaller board when their actual tensor extent fits.
+    """
+    if (not isinstance(dram_size_gb, int) or isinstance(dram_size_gb, bool)
+            or dram_size_gb <= 0):
+        raise ValueError('FPGA must report a positive integer DRAM capacity in GiB')
+    base = udc.DRAM_START_ADDR
+    addressable_bytes = min(dram_size_gb * 2**30, 0x100000000 - base)
+    required_end = max(hardware['model_base'] + hardware['model_image'].numel(),
+                       hardware['tensor_end'],
+                       hardware['input_address'] + hardware['input_bytes'])
+    required_bytes = required_end - base
+    if required_bytes <= 0 or required_bytes > addressable_bytes:
+        raise ValueError(
+            f'BigCodec bin requires {required_bytes} bytes of addressable DRAM '
+            f'(end 0x{required_end:x}); FPGA provides {addressable_bytes} visible bytes '
+            f'from its reported {dram_size_gb} GiB')
+    return dict(memory_layout=layout_for_hardware(hardware).name,
+                detected_dram_size_gib=dram_size_gb,
+                dram_addressable_bytes=addressable_bytes,
+                dram_required_bytes=required_bytes)
 
 
 def main():
@@ -93,6 +121,10 @@ def main():
             device=args.device, dev=args.dev, cycle_override_ns=None)
         if info.axi_data_width_bits != 256:
             parser.error('BigCodec bin requires an AXI256 FPGA')
+        try:
+            capacity = validate_dram_capacity(payload['hardware'], info.dram_size_gb)
+        except ValueError as error:
+            parser.error(str(error))
         with StreamingEngine(clock_period_ns=clock,
                              conv_geometry_mode=udc.CONV_GEOMETRY_QUEUE_CONFIG) as engine:
             if engine.is_queue_busy():
@@ -114,6 +146,7 @@ def main():
     duration = metadata['source_samples'] / metadata['source_rate']
     audio_s = preprocess_s + execute_s + postprocess_s
     report = dict(backend.last_metrics)
+    report.update(capacity)
     report.update(model='bigcodec', backend='hardware', execution_scope='whole utterance',
                   checkpoint_sha256=payload['checkpoint_sha256'], bin_sha256=bin_sha256,
                   precision=payload.get('precision'),
