@@ -8,10 +8,10 @@ native rate. The 8-kHz copies therefore have lower audio bandwidth.
 
 | Model rate | Recording | Noisy | CPU | FPGA |
 | --- | --- | --- | --- | --- |
-| 8 kHz | `p232_007`, café, 3.956 s | [WAV](8k/p232_007_noisy.wav) | [WAV](8k/p232_007_cpu.wav) | [WAV](8k/p232_007_fpga.wav) |
-| 8 kHz | `p257_018`, public square, 4.419 s | [WAV](8k/p257_018_noisy.wav) | [WAV](8k/p257_018_cpu.wav) | [WAV](8k/p257_018_fpga.wav) |
-| 16 kHz | `p232_007`, café, 3.956 s | [WAV](16k/p232_007_noisy.wav) | [WAV](16k/p232_007_cpu.wav) | [WAV](16k/p232_007_fpga.wav) |
-| 16 kHz | `p257_018`, public square, 4.419 s | [WAV](16k/p257_018_noisy.wav) | [WAV](16k/p257_018_cpu.wav) | [WAV](16k/p257_018_fpga.wav) |
+| 8 kHz | `p232_007`, café, 3.956 s | [p232_007_noisy.wav](8k/p232_007_noisy.wav) | [p232_007_cpu.wav](8k/p232_007_cpu.wav) | [p232_007_fpga.wav](8k/p232_007_fpga.wav) |
+| 8 kHz | `p257_018`, public square, 4.419 s | [p257_018_noisy.wav](8k/p257_018_noisy.wav) | [p257_018_cpu.wav](8k/p257_018_cpu.wav) | [p257_018_fpga.wav](8k/p257_018_fpga.wav) |
+| 16 kHz | `p232_007`, café, 3.956 s | [p232_007_noisy.wav](16k/p232_007_noisy.wav) | [p232_007_cpu.wav](16k/p232_007_cpu.wav) | [p232_007_fpga.wav](16k/p232_007_fpga.wav) |
+| 16 kHz | `p257_018`, public square, 4.419 s | [p257_018_noisy.wav](16k/p257_018_noisy.wav) | [p257_018_cpu.wav](16k/p257_018_cpu.wav) | [p257_018_fpga.wav](16k/p257_018_fpga.wav) |
 
 Every enhanced file is reconstructed from the saved streaming spectrum output
 of its corresponding pinned CPU model or resident FPGA bin. Source-rate
