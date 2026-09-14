@@ -256,8 +256,9 @@ class Qwen25OmniUnifiedEngine(
         # Prefill Q/K/O/GATE/UP/DOWN and the untied head are IF4; V stays BF16
         # for attention accuracy, putting shared device LM weights at ~3655 MiB.
         # Decode omits O from its private shards and phase-loads the 686-MiB BF16
-        # O overlay only after full prefill. The distinct IF8 embedding is loaded
-        # after decode sharding. The measured private total is 501.27 MiB/core
+        # O overlay as eight 85.75-MiB upper-PARAMS stripes only after full
+        # prefill. The distinct IF8 embedding is loaded after decode sharding.
+        # The measured private total is 501.27 MiB/core
         # (434.0 MiB decoder + 67.29 MiB embedding), leaving 2.73 MiB guarded
         # headroom inside the 504-MiB weight arena; lookup/dequantization remains
         # on the FPGA.
@@ -712,6 +713,25 @@ class Qwen25OmniUnifiedEngine(
                 {str(key): int(value) for key, value in registers.items()}
                 for registers in getattr(self, "_decode_attn_worker_regs", ())
             ]
+            dims = self._lm_dims()
+            stripes = getattr(self, "_decode_o_stripes", None)
+            if stripes is None or len(stripes) != REQUIRED_ENGINES:
+                raise RuntimeError(
+                    "decode programs.bin metadata requires eight BF16 O stripes"
+                )
+            stripe_bytes = {
+                int(stripe["end"]) - int(stripe["base"])
+                for stripe in stripes
+            }
+            stripe_cols = {int(stripe["cols"]) for stripe in stripes}
+            layer_bytes = {int(stripe["layer_bytes"]) for stripe in stripes}
+            if (
+                len(stripe_bytes) != 1
+                or len(stripe_cols) != 1
+                or len(layer_bytes) != 1
+            ):
+                raise RuntimeError("BF16 O stripe geometry is not uniform")
+            kv_groups = int(dims["KVH"])
             prefill_base, prefill_blob = self._prefill_program
             decode_base, decode_blob = self._decoder_program
             expected_decode_base = (
@@ -749,6 +769,26 @@ class Qwen25OmniUnifiedEngine(
                 "decode_bf16_projections": list(
                     self._cfg["precision"]["decode_bf16_projections"]
                 ),
+                "decode_attention": {
+                    "mode": "one_complete_gqa_group_per_engine",
+                    "kv_groups": kv_groups,
+                    "heads_per_group": int(dims["G"]),
+                    "head_dim": int(dims["AHD"]),
+                    "active_engines": list(range(kv_groups)),
+                    "idle_handshake_engines": list(
+                        range(kv_groups, REQUIRED_ENGINES)
+                    ),
+                },
+                "decode_o_layout": {
+                    "mode": "upper_params_column_stripes",
+                    "precision": "bf16",
+                    "engines": len(stripes),
+                    "columns_per_engine": next(iter(stripe_cols)),
+                    "layer_bytes_per_engine": next(iter(layer_bytes)),
+                    "stripe_bytes_per_engine": next(iter(stripe_bytes)),
+                    "slot_stride_bytes": int(self.mc_arena.stride),
+                    "extent_end": f"0x{max(int(s['end']) for s in stripes):X}",
+                },
                 "prefill_program_base": f"0x{int(prefill_base):X}",
                 "prefill_program_size": len(prefill_blob),
                 "prefill_program_sha256": hashlib.sha256(

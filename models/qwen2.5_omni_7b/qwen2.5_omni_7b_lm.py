@@ -38,9 +38,9 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
     for attention accuracy, following Qwen2.5-VL. Prefill uses IF4 Q/K/O and
     MLP projections; after full prefill, decode replaces O with a time-shared
     BF16 overlay while the other projections keep their prefill precision.
-    Only region discovery differs from the shared runtime; the emitted RMSNorm,
-    biased Q/K/V, GQA attention, SwiGLU and multimodal RoPE operations are the
-    same architecture.
+    The numerical architecture remains RMSNorm, biased Q/K/V, GQA attention,
+    SwiGLU, and multimodal RoPE. Omni additionally selects its eight-way BF16 O
+    layout, one-round decode-GQA schedule, and device-wide FPGA argmax.
     """
 
     def compile_decoder(self, layer_size: int = None,
@@ -213,6 +213,7 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
         self._decode_bf16_o_planned = False
         self._decode_bf16_o_loaded = False
         self._decode_o_plan = None
+        self._decode_o_stripes = None
         # A completed prefill belongs to the exact LM image that produced its
         # KV cache.  It cannot authorize a later overlay after that image has
         # been replaced by vision, audio, or a fresh LM load.
@@ -277,20 +278,167 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
             )
         return values
 
+    def _decode_use_one_round_group_attention(self) -> bool:
+        """Run Omni's four complete GQA groups concurrently on engines 0..3."""
+        d = self._lm_dims()
+        geometry = (int(d["KVH"]), int(d["G"]), int(d["AHD"]), int(d["QH"]))
+        if geometry != (4, 7, 128, 28):
+            raise ValueError(
+                "Omni one-round GQA requires (KVH,G,AHD,QH)=(4,7,128,28), "
+                f"got {geometry}"
+            )
+        if int(getattr(self, "multi_core", 0)) != 8:
+            raise ValueError("Omni one-round GQA requires all eight engines")
+        return True
+
     def _decode_projection_is_quantized(self, tag: str) -> bool:
         if tag in self._decode_bf16_projections():
             return False
         return super()._decode_projection_is_quantized(tag)
 
     def _decode_projection_should_shard(self, tag: str, layer: int) -> bool:
-        # BF16 O is loaded into the shared params window after all remaining
-        # projections have been sharded. Running this narrow M=1 projection on
-        # the master avoids another 686 MiB of private duplication.
+        # The ordinary materializer can only allocate from the already-full
+        # private windows. BF16 O is installed separately by
+        # _prepare_decode_shared_weights: each engine gets a column shard in its
+        # own 512-MiB-spaced slot of the reclaimed PARAMS phase.
         return tag not in self._decode_bf16_projections()
 
     def _decode_projection_uses_static_bf16(self, tag: str) -> bool:
-        """Keep the phase-shared BF16 O projection on the proven M=1 tiler."""
+        """Keep a fail-safe unsharded O fallback on the proven static tiler.
+
+        The normal eight-engine path never reaches it: ``_emit_dec_shard`` also
+        emits the compile-time dense-BF16 kernel, one 448-column block per core.
+        """
         return tag in self._decode_bf16_projections()
+
+    def _plan_decode_o_stripes(self, layer_size: int, hidden_size: int):
+        """Describe BF16 O column shards in eight upper-PARAMS stripes.
+
+        The private low-DRAM arenas are deliberately not involved: IF4 decoder
+        shards plus the IF8 embedding already consume 501.27 of their 504 MiB.
+        Prefill releases the much larger PARAMS phase before decode, so use the
+        same 512-MiB spacing that gives private shards independent memory
+        streams while retaining BF16 O exactly.
+
+        This method only performs address arithmetic. No PARAMS byte is touched
+        until :meth:`activate_decode_shared_weights`, after a successful full
+        prefill has made the phase transition legal.
+        """
+        import multi_engine_shard as mes
+
+        scheduler = getattr(self, "_multi_core_schedulers", {}).get("decode")
+        if scheduler is None:
+            raise RuntimeError("BF16 O striping requires the decode scheduler")
+        engines = int(scheduler.num_engines)
+        if engines != 8:
+            raise ValueError(
+                f"BF16 O striping requires eight engines, got {engines}"
+            )
+        if layer_size <= 0:
+            raise ValueError(f"BF16 O striping needs positive layers, got {layer_size}")
+        if hidden_size <= 0 or hidden_size % 64:
+            raise ValueError(
+                f"BF16 O hidden size must be positive and 64-aligned, got "
+                f"{hidden_size}"
+            )
+        if int(self.bytes_per_element) != 2:
+            raise ValueError(
+                f"BF16 O striping requires two-byte elements, got "
+                f"{self.bytes_per_element}"
+            )
+
+        slot_stride = int(self.mc_arena.stride)
+        expected_stride = 0x20000000
+        if slot_stride != expected_stride:
+            raise ValueError(
+                f"BF16 O stripes require 512-MiB spacing, got "
+                f"0x{slot_stride:X}"
+            )
+        splits = scheduler.split_cols(hidden_size)
+        if len(splits) != engines:
+            raise AssertionError(
+                f"BF16 O split produced {len(splits)} shards for {engines} engines"
+            )
+
+        expected_cols = hidden_size // engines
+        expected_splits = [
+            (engine_idx * expected_cols, expected_cols)
+            for engine_idx in range(engines)
+        ]
+        if splits != expected_splits:
+            raise ValueError(
+                f"BF16 O needs equal contiguous column shards, got {splits}"
+            )
+
+        layer_bytes = expected_cols * hidden_size * self.bytes_per_element
+        stripe_bytes = layer_size * layer_bytes
+        if layer_bytes % 128 or stripe_bytes % 128:
+            raise AssertionError("BF16 O stripe sizes must be 128-byte aligned")
+
+        stripes = []
+        for engine_idx, (col_offset, cols) in enumerate(splits):
+            base = int(self.PARAMS_BASE) + engine_idx * slot_stride
+            end = base + stripe_bytes
+            slot_end = min(base + slot_stride, int(self.PARAMS_LIMIT))
+            if base < int(self.PARAMS_BASE) or end > slot_end:
+                raise MemoryError(
+                    f"decode BF16 O core {engine_idx} stripe "
+                    f"[0x{base:X}, 0x{end:X}) exceeds its PARAMS slot ending "
+                    f"at 0x{slot_end:X}"
+                )
+            stripes.append(
+                {
+                    "engine": engine_idx,
+                    "col_offset": col_offset,
+                    "cols": cols,
+                    "base": base,
+                    "end": end,
+                    "layer_bytes": layer_bytes,
+                }
+            )
+
+        # Pairwise disjointness is an explicit invariant rather than an
+        # accidental consequence of today's constants. The final, truncated
+        # PARAMS slot still has 42.25 MiB of guard space before TENSOR_BASE.
+        for left, right in zip(stripes, stripes[1:]):
+            if left["end"] > right["base"]:
+                raise MemoryError(
+                    f"decode BF16 O stripes overlap: core {left['engine']} ends "
+                    f"at 0x{left['end']:X}, core {right['engine']} starts at "
+                    f"0x{right['base']:X}"
+                )
+        if stripes[-1]["end"] > int(self.TENSOR_BASE):
+            raise MemoryError("decode BF16 O stripes overlap the tensor arena")
+
+        by_layer = {}
+        for layer in range(layer_size):
+            sharded = mes.ShardedWeight(
+                name=f"o_proj_L{layer}",
+                K=hidden_size,
+                N=hidden_size,
+                layers=1,
+                data_type=mes.DENSE_BF16,
+            )
+            for stripe in stripes:
+                address = stripe["base"] + layer * layer_bytes
+                sharded.shards.append(
+                    mes.WeightShard(
+                        engine_idx=stripe["engine"],
+                        col_offset=stripe["col_offset"],
+                        cols=stripe["cols"],
+                        weight_addr=address,
+                        scale_addr=0,
+                        layer_stride=layer_bytes,
+                        scale_layer_stride=0,
+                    )
+                )
+            if sum(shard.cols for shard in sharded.shards) != hidden_size:
+                raise AssertionError(
+                    f"decode BF16 O layer {layer} shards do not cover N={hidden_size}"
+                )
+            by_layer[("o", layer)] = sharded
+
+        return tuple(stripes), by_layer
 
     def _prepare_decode_shared_weights(self, layer_size: int) -> None:
         """Plan BF16 O addresses and preserve auxiliaries without touching prefill.
@@ -383,6 +531,25 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
                 "than the shared params window"
             )
 
+        # Resolve and validate every future decode address before uploading the
+        # auxiliary tensors below. A bad stripe geometry must not leave a
+        # half-planned phase behind in otherwise valid tensor memory.
+        stripes, o_shards = self._plan_decode_o_stripes(layer_size, h)
+        decode_shards = getattr(self, "_decode_shards", None)
+        if decode_shards is None:
+            raise RuntimeError("decoder shards disappeared while planning BF16 O")
+        unexpected = [key for key in o_shards if key in decode_shards]
+        if unexpected:
+            # Replanning after a params-phase invalidation is valid only when the
+            # cached descriptors are byte-for-byte identical to this geometry.
+            for key in unexpected:
+                old = decode_shards[key]
+                new = o_shards[key]
+                if old != new:
+                    raise RuntimeError(
+                        f"cached decode shard {key!r} conflicts with BF16 O stripe plan"
+                    )
+
         # Validate the complete tensor allocation before the first write so a
         # geometry error cannot partially destroy the resident prefill weights.
         tensor_cursor = self.get_tensor_dram_addr()
@@ -456,19 +623,21 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
             self._decode_o_plan = None
             raise
 
-        for li, (_name, section) in enumerate(o_plan):
-            self.lm_layer_addrs[li]["o_weight"] = (
-                self.PARAMS_BASE + int(section["offset"])
-            )
+        decode_shards.update(o_shards)
+        self._decode_o_stripes = stripes
         self._decode_o_plan = (decode_region, tuple(o_plan))
         self._decode_bf16_o_planned = True
         self._loud(
             f"  [Decode] BF16 O phase planned: {decode_region['size'] / 2**20:.1f} "
-            "MiB will replace shared IF4 prefill weights after prefill"
+            f"MiB across 8 x "
+            f"{(stripes[0]['end'] - stripes[0]['base']) / 2**20:.2f} "
+            "MiB PARAMS stripes after prefill"
         )
 
     def activate_decode_shared_weights(self) -> None:
         """Atomically transition the shared params window from prefill to decode."""
+        import multi_engine_shard as mes
+
         if getattr(self, "_decode_bf16_o_loaded", False):
             return
         if not getattr(self, "_decode_bf16_o_planned", False):
@@ -479,6 +648,7 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
                 "weight image to be resident"
             )
         d = self._lm_dims()
+        h = int(d["H"])
         compiled_seq_len = getattr(self, "_prefill_seq_len", None)
         completed_seq_len = getattr(self, "_prefill_seq_len_run", None)
         if (
@@ -495,9 +665,22 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
                 "BF16 decode O activation requires a full-layer prefill"
             )
         decode_region, o_plan = self._decode_o_plan
+        stripes = getattr(self, "_decode_o_stripes", None)
+        if stripes is None or len(stripes) != 8:
+            raise RuntimeError("BF16 decode O stripe plan is unavailable")
+        extent_end = max(int(stripe["end"]) for stripe in stripes)
 
         self.reset_params_dram_addr()
         try:
+            reserved = self.allocate_params_dram(
+                extent_end - self.PARAMS_BASE, label="decode.bf16_o_stripes"
+            )
+            if reserved != self.PARAMS_BASE or extent_end > self.PARAMS_LIMIT:
+                raise MemoryError(
+                    f"BF16 O stripe extent [0x{reserved:X}, 0x{extent_end:X}) "
+                    f"is outside PARAMS [0x{self.PARAMS_BASE:X}, "
+                    f"0x{self.PARAMS_LIMIT:X})"
+                )
             with open(decode_region["bin_path"], "rb") as file_obj:
                 for li, (name, section) in enumerate(o_plan):
                     file_obj.seek(
@@ -506,27 +689,82 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
                     blob = file_obj.read(int(section["size"]))
                     if len(blob) != int(section["size"]):
                         raise RuntimeError(f"truncated artifact read for {name}")
-                    address = self.allocate_params_dram(
-                        len(blob), label=f"decode.{name}"
-                    )
-                    expected = int(self.lm_layer_addrs[li]["o_weight"])
-                    if address != expected:
+                    sharded = self._decode_shards.get(("o", li))
+                    if sharded is None or len(sharded.shards) != 8:
+                        raise RuntimeError(
+                            f"{name}: expected eight compiled BF16 O shards"
+                        )
+                    if (
+                        sharded.name != f"o_proj_L{li}"
+                        or sharded.K != h
+                        or sharded.N != h
+                        or sharded.layers != 1
+                        or sharded.data_type is not mes.DENSE_BF16
+                    ):
+                        raise RuntimeError(
+                            f"{name}: compiled BF16 O descriptor no longer "
+                            "matches the validated stripe plan"
+                        )
+                    copied = 0
+                    for stripe, shard in zip(stripes, sharded.shards):
+                        expected_descriptor = (
+                            int(stripe["engine"]),
+                            int(stripe["col_offset"]),
+                            int(stripe["cols"]),
+                            int(stripe["base"]) + li * int(stripe["layer_bytes"]),
+                            0,
+                            int(stripe["layer_bytes"]),
+                            0,
+                        )
+                        live_descriptor = (
+                            int(shard.engine_idx),
+                            int(shard.col_offset),
+                            int(shard.cols),
+                            int(shard.weight_addr),
+                            int(shard.scale_addr),
+                            int(shard.layer_stride),
+                            int(shard.scale_layer_stride),
+                        )
+                        if live_descriptor != expected_descriptor:
+                            raise RuntimeError(
+                                f"{name}: core {stripe['engine']} descriptor "
+                                f"{live_descriptor!r} differs from validated "
+                                f"stripe {expected_descriptor!r}"
+                            )
+                        source = shard.col_offset * h * self.bytes_per_element
+                        size = shard.cols * h * self.bytes_per_element
+                        if source != copied or size != shard.layer_stride:
+                            raise AssertionError(
+                                f"{name}: non-contiguous shard {shard.engine_idx} "
+                                f"source={source}, copied={copied}, size={size}, "
+                                f"stride={shard.layer_stride}"
+                            )
+                        payload = blob[source:source + size]
+                        if len(payload) != size:
+                            raise RuntimeError(
+                                f"{name}: source slice for core {shard.engine_idx} "
+                                f"has {len(payload)} of {size} bytes"
+                            )
+                        written = self.dma_write(
+                            _vl_lm.DMA_DEVICE_H2C,
+                            shard.weight_addr,
+                            payload,
+                            size,
+                        )
+                        if written != size:
+                            raise IOError(
+                                f"{name} core {shard.engine_idx}: params DMA wrote "
+                                f"{written} of {size} bytes"
+                            )
+                        copied += size
+                    if copied != len(blob):
                         raise AssertionError(
-                            f"{name} allocated at 0x{address:X}, decoder expects "
-                            f"0x{expected:X}"
+                            f"{name}: BF16 O shards cover {copied} of {len(blob)} bytes"
                         )
-                    written = self.dma_write(
-                        _vl_lm.DMA_DEVICE_H2C, address, blob, len(blob)
-                    )
-                    if written != len(blob):
-                        raise IOError(
-                            f"{name}: params DMA wrote {written} of {len(blob)} bytes"
-                        )
-            expected_end = self.PARAMS_BASE + int(decode_region["size"])
-            if self.get_params_dram_addr() != expected_end:
+            if self.get_params_dram_addr() != extent_end:
                 raise AssertionError(
-                    f"decode BF16 O ends at 0x{self.get_params_dram_addr():X}, "
-                    f"expected 0x{expected_end:X}"
+                    f"decode BF16 O extent ends at "
+                    f"0x{self.get_params_dram_addr():X}, expected 0x{extent_end:X}"
                 )
         except Exception:
             # A short overlay DMA destroys the prefill image without producing
@@ -539,7 +777,8 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
         self._lm_weight_init_done = False
         self._loud(
             f"  [Decode] BF16 O phase active: {decode_region['size'] / 2**20:.1f} "
-            "MiB in shared params DRAM; IF4 prefill weights reclaimed"
+            "MiB payload in eight engine-striped PARAMS slots; IF4 prefill "
+            "weights reclaimed"
         )
 
     def _prefill_use_streaming_quantized_projection(self, tag: str) -> bool:

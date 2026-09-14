@@ -99,6 +99,16 @@ class Qwen25VLLMMixin:
         """
         return False
 
+    def _decode_use_one_round_group_attention(self) -> bool:
+        """Whether decode assigns each complete GQA group to one engine.
+
+        The shared Qwen path keeps its established two-round transpose/PV
+        split.  A model whose KV-group count fits the engine topology may opt
+        into the one-round path: one engine owns each complete group while
+        every otherwise-idle engine still participates in the rendezvous.
+        """
+        return False
+
     def _prepare_decode_shared_weights(self, layer_size: int) -> None:
         """Optional post-sharding hook for phase-shared decoder weights."""
         return None
@@ -367,7 +377,9 @@ class Qwen25VLLMMixin:
         re-carved for the LM.
         """
         d = self._lm_dims()
-        H, AHD, KVH, QH = d["H"], d["AHD"], d["KVH"], d["QH"]
+        H, AHD, KVH, QH, G = (
+            d["H"], d["AHD"], d["KVH"], d["QH"], d["G"]
+        )
         MLP, NL = d["MLP"], d["NL"]
         C, P = self.MAX_CONTEXT_SIZE, self.PREFILL_MAX_SEQ_LEN
         bpe = self.bytes_per_element
@@ -441,9 +453,17 @@ class Qwen25VLLMMixin:
         self.LM_ATTN_SCRATCH_PER_ENGINE = [self.LM_SCRATCH]
         if getattr(self, "multi_core", 1) > 1:
             n_pref = (AHD + aligned_P) * aligned_P + aligned_P * AHD
+            if self._decode_use_one_round_group_attention():
+                # Compact one-group decode scratch: V.T [AHD,A], probabilities
+                # [G,A], and scaled Q [G,AHD].  Unlike unified_attention_core's
+                # general scratch this does not reserve an unused [A,A] score
+                # matrix when the live decode batch is only one GQA group.
+                n_group_decode = AHD * aligned_C + G * aligned_C + G * AHD
+                n_pref = max(n_pref, n_group_decode)
             self.LM_ATTN_SCRATCH_PER_ENGINE.extend(
                 self.mc_arena.alloc_tensor(e, n_pref * bpe, "lm prefill attn scratch")
                 for e in range(1, self.multi_core))
+            self._lm_worker_attn_scratch_elements = n_pref
         self.LM_IDENTITY = alloc(UE_VECTOR_SIZE * UE_VECTOR_SIZE, "lm.identity")
         # One row per position; every head reads the same rows.
         self.LM_ROPE_PRE = alloc(P * 2 * AHD, "lm.rope_prefill")
@@ -717,11 +737,14 @@ class Qwen25VLLMMixin:
                  (r["aligned"], aligned)]
                 for r, off, cnt in zip(regs, offsets, counts)]
 
-    def _start_decode_workers(self, dec_sched, worker_addrs, aligned: int) -> None:
+    def _start_decode_workers(self, dec_sched, worker_addrs,
+                              aligned: int) -> list[int]:
         """THE only way to start the decode workers. Both the run loop and the
         profile path go through here so they cannot drift: a worker entering with
-        a stale row count transposes the wrong rows."""
-        dec_sched.start_workers(
+        a stale row count transposes the wrong rows. Return the runtime-preamble
+        entries so a caller may relaunch those exact bytes while ``aligned`` is
+        unchanged."""
+        return dec_sched.start_workers(
             worker_addrs,
             gpr_sets_by_worker=self._decode_attn_worker_gpr_sets(dec_sched, aligned))
 
@@ -734,6 +757,142 @@ class Qwen25VLLMMixin:
         """
         blocks = [(g, n, 64) for g in range(KVH) for n in range(0, AHD, 64)]
         return [blocks[e::num_engines] for e in range(num_engines)]
+
+    @staticmethod
+    def _one_round_group_assignments(groups, num_engines: int) -> tuple:
+        """Map one complete GQA group to each leading engine.
+
+        ``None`` entries are intentional idle participants.  They must still
+        emit the worker-side release/join protocol; dropping them would shift
+        their flag stream by one round and deadlock the next rendezvous.
+        """
+        if num_engines < 1:
+            raise ValueError(f"attention needs at least one engine, got {num_engines}")
+        groups = tuple(groups)
+        if not groups or len(groups) > num_engines:
+            raise ValueError(
+                f"cannot place {len(groups)} GQA group(s) on {num_engines} engine(s)"
+            )
+        return groups + (None,) * (num_engines - len(groups))
+
+    def _emit_one_round_group_attention(
+        self, ue, *, group, aligned_kv: int, aligned_kv_reg: int,
+        k_base: int, v_base: int, scratch: int,
+    ) -> tuple[int, int]:
+        """Emit one complete decode GQA group on ``ue``.
+
+        The general attention helper reserves an ``aligned_kv**2`` score
+        matrix even though decode has only ``G`` query rows.  This compact form
+        uses exactly V.T ``[AHD,A]``, score/P ``[G,A]``, and scaled-Q
+        ``[G,AHD]``.  It returns ``(all_flops, kv_length_scaled_flops)`` so the
+        decode reporter can keep the fixed Q scaling out of its context term.
+        """
+        d = self._lm_dims()
+        AHD, G = int(d["AHD"]), int(d["G"])
+        bpe = self.bytes_per_element
+        kv_h, plane_off, batch = group
+        if batch != G:
+            raise ValueError(
+                f"decode GQA group {kv_h} has batch {batch}, expected G={G}"
+            )
+        if aligned_kv_reg is None:
+            raise ValueError("one-round decode attention needs runtime aligned KV")
+
+        v_t = scratch
+        score = v_t + AHD * aligned_kv * bpe
+        scaled_q = score + G * aligned_kv * bpe
+        batch_reg = ue.alloc_isa_reg()
+        head_dim_reg = ue.alloc_isa_reg()
+        ue.generate_instruction_add_set(batch_reg, G)
+        ue.generate_instruction_add_set(head_dim_reg, AHD)
+        try:
+            ue.bf16_transpose_core(
+                M=aligned_kv, N=AHD,
+                INPUT_DRAM_ADDR=v_base + kv_h * self.KV_STRIDE_HEAD,
+                OUTPUT_DRAM_ADDR=v_t,
+                IDENTITY_DRAM_ADDR=self.LM_IDENTITY,
+                gpr_M_reg=aligned_kv_reg,
+            )
+            fixed = ue.eltwise_core_dram(
+                M=G, N=AHD,
+                dram_a=self.LM_Q_HM + plane_off,
+                dram_b=None, dram_out=scaled_q,
+                mode=UE_MODE.MUL_BROADCAST,
+                scalar=1.0 / math.sqrt(AHD),
+                gpr_M_reg=batch_reg,
+            ) or 0
+            score_flops = ue.matmat_mul_core(
+                M=G, K=AHD, N=aligned_kv,
+                A_DRAM_ADDR=scaled_q,
+                B_DRAM_ADDR=k_base + kv_h * self.KV_STRIDE_HEAD,
+                OUTPUT_DRAM_ADDR=score,
+                softmax_enable=True,
+                C_DRAM_ADDR=self.LM_BIAS,
+                bias_mode="full_matrix",
+                gpr_M_reg=batch_reg,
+                gpr_K_reg=head_dim_reg,
+                gpr_N_reg=aligned_kv_reg,
+            ) or 0
+            pv_flops = ue.matmat_mul_core(
+                M=G, K=aligned_kv, N=AHD,
+                A_DRAM_ADDR=score,
+                B_DRAM_ADDR=v_t,
+                OUTPUT_DRAM_ADDR=self.LM_ATTN_HM + plane_off,
+                gpr_M_reg=batch_reg,
+                gpr_K_reg=aligned_kv_reg,
+                gpr_N_reg=head_dim_reg,
+            ) or 0
+        finally:
+            ue.release_isa_reg()  # head_dim_reg
+            ue.release_isa_reg()  # batch_reg
+        scaled = score_flops + pv_flops
+        return fixed + scaled, scaled
+
+    def _emit_one_round_group_attention_round(
+        self, dec_sched, assignments, *, aligned_kv: int,
+        aligned_kv_reg: int, k_base: int, v_base: int,
+    ) -> tuple[int, int]:
+        """Emit one complete eight-participant group-attention rendezvous."""
+        if len(assignments) != dec_sched.num_engines:
+            raise ValueError(
+                f"attention assignment count {len(assignments)} does not match "
+                f"{dec_sched.num_engines} engines"
+            )
+        total_flops = 0
+        scaled_flops = 0
+        dec_sched.release()
+        total, scaled = self._emit_one_round_group_attention(
+            self,
+            group=assignments[0],
+            aligned_kv=aligned_kv,
+            aligned_kv_reg=aligned_kv_reg,
+            k_base=k_base,
+            v_base=v_base,
+            scratch=self.LM_ATTN_SCRATCH_PER_ENGINE[0],
+        )
+        total_flops += total
+        scaled_flops += scaled
+        for e in dec_sched.worker_indices():
+            dec_sched.begin_worker_round(e)
+            group = assignments[e]
+            if group is not None:
+                total, scaled = self._emit_one_round_group_attention(
+                    dec_sched.engines[e],
+                    group=group,
+                    aligned_kv=aligned_kv,
+                    aligned_kv_reg=self._decode_attn_worker_regs[e - 1][
+                        "aligned"
+                    ],
+                    k_base=k_base,
+                    v_base=v_base,
+                    scratch=self.LM_ATTN_SCRATCH_PER_ENGINE[e],
+                )
+                total_flops += total
+                scaled_flops += scaled
+            # All workers close the round, including deliberately idle ones.
+            dec_sched.end_worker_round(e)
+        dec_sched.join()
+        return total_flops, scaled_flops
 
     def _dec_round(self, dec_sched, ops, master_emit, worker_extra=None) -> int:
         """One decode rendezvous: release, master's work, workers' rounds, join.
@@ -859,11 +1018,15 @@ class Qwen25VLLMMixin:
             # rides ONE rendezvous for the layer; an op that cannot split runs
             # full-width on the master inside that same round, overlapping the
             # workers rather than serialising after them.
+            # At decode M=1, token-major [1, QH, AHD] and head-major
+            # [QH, 1, AHD] have the exact same byte layout.  Land Q directly in
+            # its attention input buffer so the serial token->head permute below
+            # can be omitted without changing either values or ordering.
             projs = tuple(
                 (tag, out, width, bias,
                  self._decode_projection_is_quantized(tag))
                 for tag, out, width, bias in (
-                    ("q", self.LM_Q, QH * AHD, la["q_bias"]),
+                    ("q", self.LM_Q_HM, QH * AHD, la["q_bias"]),
                     ("k", self.LM_K, KVH * AHD, la["k_bias"]),
                     ("v", self.LM_V, KVH * AHD, la["v_bias"]),
                 ))
@@ -890,7 +1053,9 @@ class Qwen25VLLMMixin:
 
             flops += self._dec_round(dec_sched, round_ops, _master_qkv)
         elif sched is None:
-            flops += mm(H, QH * AHD, self.LM_PRE_NORM, "q", self.LM_Q, bias=la["q_bias"])
+            q_out = self.LM_Q_HM if decode else self.LM_Q
+            flops += mm(H, QH * AHD, self.LM_PRE_NORM, "q", q_out,
+                        bias=la["q_bias"])
             flops += mm(H, KVH * AHD, self.LM_PRE_NORM, "k", self.LM_K, bias=la["k_bias"])
             flops += mm(
                 H, KVH * AHD, self.LM_PRE_NORM, "v", self.LM_V,
@@ -960,28 +1125,47 @@ class Qwen25VLLMMixin:
         # Head-plane stride. Prefill uses the 64-ALIGNED length because
         # HeadShardContext.q_addr/out_addr index planes as head*seq_len*head_dim
         # -- a plane strided by M would put every head past 0 in the wrong
-        # place. Decode keeps M=1 so its 16 planes stay contiguous, which is
+        # place. Decode keeps M=1 so its QH planes stay contiguous, which is
         # what makes the grouped decode call free.
         head_rows = M if decode else ((M + 63) // 64) * 64
 
         ckpt(f"L{li}:qkv_proj", flops)
 
-        # Q token-major [M, QH, AHD] -> head-major [QH, M, AHD].
-        self.bf16_permute_dram_core(QH, M, AHD, self.LM_Q, self.LM_Q_HM,
-                                    write_grouped=True, group_stride_rows=head_rows)
-        # RoPE PER HEAD, M live rows each. The head planes are head_rows apart,
-        # so they are not contiguous and one M=QH*head_rows call would run over
-        # the padding -- which is exactly how head 1 filled with NaN when the
-        # table was tiled at the live length but the stride was larger. Per-head
-        # calls also mean the table needs no per-head tiling at all: every head
-        # reads rows 0..M-1 for positions 0..M-1.
-        for qh in range(QH):
-            flops += self.rope_hf_core_dram(
-                M=M, N=AHD,
-                input_dram_addr=self.LM_Q_HM + qh * head_rows * AHD * bpe,
-                output_dram_addr=self.LM_Q_HM + qh * head_rows * AHD * bpe,
-                cos_dram_addr=rope_cos, sin_dram_addr=rope_sin,
-                gpr_M_reg=m_reg) or 0
+        # Q token-major [M, QH, AHD] -> head-major [QH, M, AHD].  Decode's
+        # M=1 projection already wrote LM_Q_HM because these layouts are then
+        # byte-identical; prefill retains the real permutation and padded plane
+        # stride it needs.
+        if decode:
+            if M != 1:
+                raise ValueError(f"decode Q layout requires M=1, got M={M}")
+        else:
+            self.bf16_permute_dram_core(
+                QH, M, AHD, self.LM_Q, self.LM_Q_HM,
+                write_grouped=True, group_stride_rows=head_rows)
+        # Prefill RoPE stays per-head: the planes are head_rows apart, so one
+        # flattened call would run over their padding. Decode has no padding at
+        # M=1 and may instead reuse its one table row across contiguous heads.
+        grouped_decode_rope = decode and AHD >= 128 and AHD % 128 == 0
+        if grouped_decode_rope:
+            # Every decode head contains the same one position and the planes
+            # are contiguous at M=1.  The static grouped primitive loads the
+            # [cos|sin] row once and reuses it across all heads.  Passing no GPR
+            # is intentional: it avoids emitting the general runtime-M/N RoPE
+            # setup once per head in a position-agnostic decoder whose M is
+            # nevertheless fixed at one.
+            flops += self.rope_hf_core_dram_gqa(
+                M=1, group_size=QH, N=AHD,
+                input_dram_addr=self.LM_Q_HM,
+                output_dram_addr=self.LM_Q_HM,
+                cos_dram_addr=rope_cos, sin_dram_addr=rope_sin) or 0
+        else:
+            for qh in range(QH):
+                flops += self.rope_hf_core_dram(
+                    M=M, N=AHD,
+                    input_dram_addr=self.LM_Q_HM + qh * head_rows * AHD * bpe,
+                    output_dram_addr=self.LM_Q_HM + qh * head_rows * AHD * bpe,
+                    cos_dram_addr=rope_cos, sin_dram_addr=rope_sin,
+                    gpr_M_reg=m_reg) or 0
         self.generate_instruction_add_set(m_reg, M)
 
         # K/V straight into the cache at their head planes. In prefill the
@@ -992,17 +1176,23 @@ class Qwen25VLLMMixin:
         if decode:
             # Rotate K BEFORE storing: the cache row address is computed at
             # runtime from gf_seq_len, so it cannot be a RoPE operand.
-            # PER HEAD, one row each. Both KV heads share the single decode
-            # position, so both must read table row 0. A single M=KVH call would
-            # walk to row 1 -- past the end of a one-row table -- and rotate K
-            # head 1 with whatever bytes follow it.
-            for h in range(KVH):
-                flops += self.rope_hf_core_dram(
-                    M=1, N=AHD,
-                    input_dram_addr=self.LM_K + h * AHD * bpe,
-                    output_dram_addr=self.LM_K + h * AHD * bpe,
-                    cos_dram_addr=rope_cos, sin_dram_addr=rope_sin,
-                    gpr_M_reg=m_reg) or 0
+            # All KV heads share the same single decode position. Grouped RoPE
+            # broadcasts table row 0 across them; retain the general per-head
+            # path for a future model whose head width cannot use static GQA.
+            if grouped_decode_rope:
+                flops += self.rope_hf_core_dram_gqa(
+                    M=1, group_size=KVH, N=AHD,
+                    input_dram_addr=self.LM_K,
+                    output_dram_addr=self.LM_K,
+                    cos_dram_addr=rope_cos, sin_dram_addr=rope_sin) or 0
+            else:
+                for h in range(KVH):
+                    flops += self.rope_hf_core_dram(
+                        M=1, N=AHD,
+                        input_dram_addr=self.LM_K + h * AHD * bpe,
+                        output_dram_addr=self.LM_K + h * AHD * bpe,
+                        cos_dram_addr=rope_cos, sin_dram_addr=rope_sin,
+                        gpr_M_reg=m_reg) or 0
             # One token: write at row gf_seq_len, computed at runtime.
             for h in range(KVH):
                 for src, base, sram in ((self.LM_K, k_base, 0x10000),
@@ -1090,6 +1280,60 @@ class Qwen25VLLMMixin:
                                       gqa_ratio=G, mode="qheads")
             flops += attn_acc[0]
             self.generate_instruction_add_set(m_reg, M)   # restore gf_seq_len
+            groups = []
+
+        if (
+            decode
+            and dec_sched is not None
+            and groups
+            and self._decode_use_one_round_group_attention()
+        ):
+            # ONE ROUND, ONE COMPLETE GQA GROUP PER LEADING ENGINE.  This is
+            # intentionally an opt-in model policy: it trades the shared path's
+            # two fine-grained transpose/PV rounds for four independent full
+            # attention pipelines.  Omni has four KV groups, so engines 0..3
+            # each own one while 4..7 execute an idle handshake.  The latter is
+            # part of the protocol, not optional work.
+            if dec_sched.num_engines != 8:
+                raise ValueError(
+                    "one-round decode GQA currently requires eight engines, "
+                    f"got {dec_sched.num_engines}"
+                )
+            expected_groups = [
+                (kv, kv * G * AHD * bpe, G) for kv in range(KVH)
+            ]
+            if groups != expected_groups:
+                raise AssertionError(
+                    f"decode GQA layout changed: {groups!r} != "
+                    f"{expected_groups!r}"
+                )
+            assignments = self._one_round_group_assignments(
+                groups, dec_sched.num_engines
+            )
+            if len(self.LM_ATTN_SCRATCH_PER_ENGINE) != dec_sched.num_engines:
+                raise RuntimeError(
+                    "one-round decode GQA needs one scratch address per engine"
+                )
+            scratch_elems = AHD * aligned_kv + G * aligned_kv + G * AHD
+            worker_capacity = int(getattr(
+                self, "_lm_worker_attn_scratch_elements", 0
+            ))
+            if any(assignments[1:]) and worker_capacity < scratch_elems:
+                raise MemoryError(
+                    f"decode GQA needs {scratch_elems} worker scratch elements, "
+                    f"allocated {worker_capacity}"
+                )
+
+            total, scaled = self._emit_one_round_group_attention_round(
+                dec_sched,
+                assignments,
+                aligned_kv=aligned_kv,
+                aligned_kv_reg=aligned_kv_reg,
+                k_base=k_base,
+                v_base=v_base,
+            )
+            flops += total
+            self._emit_attn_flops += scaled
             groups = []
 
         if decode and dec_sched is not None and groups:
@@ -1271,9 +1515,14 @@ class Qwen25VLLMMixin:
 
         ckpt(f"L{li}:attention", flops)
 
-        self.bf16_permute_dram_core(QH, M, AHD, self.LM_ATTN_HM,
-                                    self.LM_ATTN_RESULT, write_grouped=False,
-                                    group_stride_rows=head_rows)
+        # At decode M=1, [QH, 1, AHD] and [1, QH, AHD] are byte-identical.
+        # Feed O directly from the head-major attention buffer and retain the
+        # actual head->token permutation only for prefill.
+        attn_result_addr = self.LM_ATTN_HM if decode else self.LM_ATTN_RESULT
+        if not decode:
+            self.bf16_permute_dram_core(
+                QH, M, AHD, self.LM_ATTN_HM, self.LM_ATTN_RESULT,
+                write_grouped=False, group_stride_rows=head_rows)
         ckpt(f"L{li}:attn_permute", flops)
         o_sw = dec_shards.get(("o", li)) if (decode and dec_shards) else None
         if o_sw is not None:
@@ -1282,16 +1531,16 @@ class Qwen25VLLMMixin:
             # of 64 -- an even 4 blocks per engine at 8 cores. No bias.
             def _master_o(o_sw=o_sw):
                 return (self._emit_dec_shard(self, o_sw, 0, self.LM_ATTN_PROJ,
-                                             self.LM_ATTN_RESULT)
+                                             attn_result_addr)
                         + dec_sched.worker_flops(o_sw, M=1))
 
             flops += self._dec_round(
                 dec_sched,
-                [(o_sw, self.LM_ATTN_PROJ, self.LM_ATTN_RESULT, None, False)],
+                [(o_sw, self.LM_ATTN_PROJ, attn_result_addr, None, False)],
                 _master_o)
         elif sched is None:
             flops += mm(
-                QH * AHD, H, self.LM_ATTN_RESULT, "o", self.LM_ATTN_PROJ,
+                QH * AHD, H, attn_result_addr, "o", self.LM_ATTN_PROJ,
                 quant=(self._decode_projection_is_quantized("o") if decode
                        else self._lm_projection_is_quantized("o")))
         else:
@@ -1571,10 +1820,25 @@ class Qwen25VLLMMixin:
         return results
 
     @staticmethod
-    def _wait_lm_queue(engine, timeout_s: float, what: str) -> None:
+    def _wait_lm_queue(engine, timeout_s: float, what: str,
+                       poll_interval_s: float | None = None) -> None:
         if not math.isfinite(float(timeout_s)) or timeout_s <= 0:
             raise ValueError(f"timeout_s must be finite and positive, got {timeout_s!r}")
-        engine.wait_queue(float(timeout_s))
+        if poll_interval_s is None:
+            engine.wait_queue(float(timeout_s))
+        else:
+            if (
+                not math.isfinite(float(poll_interval_s))
+                or poll_interval_s <= 0
+            ):
+                raise ValueError(
+                    "poll_interval_s must be finite and positive, got "
+                    f"{poll_interval_s!r}"
+                )
+            engine.wait_queue(
+                timeout_seconds=float(timeout_s),
+                poll_interval_seconds=float(poll_interval_s),
+            )
         if engine.is_queue_busy():
             raise TimeoutError(f"{what} is still busy after {timeout_s:.1f}s")
 
@@ -2234,6 +2498,16 @@ class Qwen25VLLMMixin:
         self._decode_step_us = []
         t0 = time.perf_counter()
 
+        # Worker preambles contain only runtime attention dimensions.  Those
+        # dimensions change at a 64-token alignment boundary, not every token.
+        # Keep this cache local to one decode run: while ``aligned`` is stable,
+        # relaunch all seven workers from the exact preambles already written to
+        # DRAM instead of rebuilding and DMA-writing seven identical images.
+        # Every worker is still launched for every token and participates in
+        # every rendezvous; only redundant host control traffic is removed.
+        worker_preamble_aligned = None
+        worker_preamble_entries = None
+
         # Live status bar: pin the bottom terminal row via an ANSI scroll region
         # so generated tokens stream above it while the counter refreshes in
         # place. Everything is on stdout -- tokens scroll inside rows 1..rows-1,
@@ -2339,10 +2613,31 @@ class Qwen25VLLMMixin:
                 )
             else:
                 if dec_sched is not None:
-                    self._start_decode_workers(
-                        dec_sched, dec_worker_addrs, aligned)
+                    if (
+                        worker_preamble_aligned == aligned
+                        and worker_preamble_entries is not None
+                    ):
+                        if len(worker_preamble_entries) != len(dec_sched.workers):
+                            raise RuntimeError(
+                                "cached decode worker preambles no longer match "
+                                "the scheduler topology"
+                            )
+                        for worker, entry in zip(
+                            dec_sched.workers, worker_preamble_entries
+                        ):
+                            worker.start_execute_from_dram(entry)
+                    else:
+                        worker_preamble_entries = self._start_decode_workers(
+                            dec_sched, dec_worker_addrs, aligned)
+                        worker_preamble_aligned = aligned
                 self.start_execute_from_dram(self._decoder_preamble)
-                self._wait_lm_queue(self, 30.0, "decode master")
+                # Native decode is only about 100 ms/token.  The generic 1-ms
+                # queue poll can therefore hide roughly half a percent of real
+                # throughput after the FPGA has already halted.  A decode-only
+                # 250-us sleep keeps polling bounded (no busy-spin) while
+                # leaving all long-running stage waits at the global default.
+                self._wait_lm_queue(
+                    self, 30.0, "decode master", poll_interval_s=0.00025)
                 for idx, w in enumerate(
                     dec_sched.workers if dec_sched is not None else [], start=1
                 ):

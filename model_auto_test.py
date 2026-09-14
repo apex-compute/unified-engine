@@ -476,10 +476,10 @@ TESTS = [
     # Qwen2.5-Omni-7B Thinker-only modes. The model requires the 8 GiB Alveo U55
     # eight-engine layout; unlike scripts that expose --engines, --multi-core is
     # not auto-populated by this harness.
-    {"name": "qwen2.5_omni_7b", "script": "models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "extra_args": ["--multi-core", "8"], "mode": "LM/Thinker (8 engines)", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8},
-    {"name": "qwen2.5_omni_7b_vlm", "script": "models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py", "pass_check": _check_qwen_vlm, "extra_args": ["--image", "--multi-core", "8"], "mode": "VLM/Thinker (8 engines)", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the picture in detail. (default)", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8},
-    {"name": "qwen2.5_omni_7b_audio", "script": "models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py", "prompt": "Transcribe the speech exactly.", "pass_check": _check_qwen_omni_audio, "extra_args": ["--audio", "test_samples/apex.wav", "--multi-core", "8"], "mode": "Audio/Thinker (8 engines)", "audio": "test_samples/apex.wav", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8},
-    {"name": "qwen2.5_omni_7b_joint", "script": "models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py", "pass_check": _check_qwen_omni_joint, "extra_args": ["--image", "--audio", "test_samples/apex.wav", "--multi-core", "8"], "mode": "Image+audio/Thinker (8 engines)", "image": "test_samples/yosemite.jpg", "audio": "test_samples/apex.wav", "prompt_desc": "First transcribe the audio. Then briefly describe the image. (default)", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8},
+    {"name": "qwen2.5_omni_7b", "script": "models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "extra_args": ["--multi-core", "8"], "mode": "LM/Thinker (8 engines)", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8, "self_resets": True},
+    {"name": "qwen2.5_omni_7b_vlm", "script": "models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py", "pass_check": _check_qwen_vlm, "extra_args": ["--image", "--multi-core", "8"], "mode": "VLM/Thinker (8 engines)", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the picture in detail. (default)", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8, "self_resets": True},
+    {"name": "qwen2.5_omni_7b_audio", "script": "models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py", "prompt": "Transcribe the speech exactly.", "pass_check": _check_qwen_omni_audio, "extra_args": ["--audio", "test_samples/apex.wav", "--multi-core", "8"], "mode": "Audio/Thinker (8 engines)", "audio": "test_samples/apex.wav", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8, "self_resets": True},
+    {"name": "qwen2.5_omni_7b_joint", "script": "models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py", "pass_check": _check_qwen_omni_joint, "extra_args": ["--image", "--audio", "test_samples/apex.wav", "--multi-core", "8"], "mode": "Image+audio/Thinker (8 engines)", "image": "test_samples/yosemite.jpg", "audio": "test_samples/apex.wav", "prompt_desc": "First transcribe the audio. Then briefly describe the image. (default)", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8, "self_resets": True},
 
     # SmolVLM2 has a read-before-write defect and depends on clean, zero-filled
     # DRAM. Rather than special-casing it in the harness, SmolVLM2 is poisoned
@@ -987,8 +987,18 @@ def main():
         if hoisted:
             print(f"[order] hoisted to front: {' '.join(t['name'] for t in hoisted)}")
 
-    # Initialize the FPGA once before running any model (software reset).
-    reset_device(DMA_DEV)
+    # Most models rely on the harness's release-image initialization. Models
+    # that support multiple installed builds validate and reset their selected
+    # engines themselves; constructing the generic engine first would reject a
+    # valid image and misleadingly ask the user to replace it.
+    if any(not test.get("self_resets", False) for test in tests):
+        reset_device(DMA_DEV)
+    else:
+        print(
+            "[reset_device] selected model entrypoint(s) validate and reset "
+            "their own engines; preserving the installed FPGA image",
+            flush=True,
+        )
 
     try:
         for test in tests:
