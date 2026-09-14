@@ -47,11 +47,13 @@ the extra rows cannot affect live-token attention.
 
 Vision, audio, and Thinker weights are phase-shared in DRAM. Each input encoder
 runs first, its soft-token output is retained, and the Thinker weights then reuse
-the same model-weight window for prefill and decode. The transformer towers,
-attention, Thinker prefill, and sharded Thinker decode operations distribute
-their heavy work over all eight engines. Layout/merge operations and the
-phase-shared decode O projection execute on engine 0, still on the FPGA;
-engines 8-11 remain unused.
+the same model-weight window for prefill and decode. The transformer towers and
+Thinker prefill use all eight engines. Decode's sharded projections and LM head,
+including the BF16 O column stripes, also use engines 0-7. The optimized
+one-round GQA path assigns its four complete KV groups to engines 0-3; engines
+4-7 remain required handshake participants. Remaining serial layout/merge work
+and the final global argmax run on engine 0, still on the FPGA. Engines 8-11
+remain unused.
 
 All learned inference arithmetic runs on the U55: vision patch projection,
 audio conv1/conv2 and GELU, the vision/audio transformer towers, IF8 token
@@ -74,17 +76,25 @@ embedding row or logits vector is evaluated on the host.
 The Thinker follows Qwen2.5-VL's mixed projection policy during prefill: V is
 BF16 for attention accuracy, while Q/K/O and GATE/UP/DOWN are IF4. After a
 successful full 28-layer prefill, the runtime reclaims the shared prefill image
-and loads the 686-MiB decode-only BF16 O region. Decode therefore uses BF16 V/O;
-O runs on engine 0 through the proven static M=1 FPGA tiler used by Gemma4 E2B,
-while the remaining decoder projections and head retain their eight-engine
+and scatters the 686-MiB decode-only BF16 O region into eight 85.75-MiB
+upper-PARAMS stripes: one 448-column shard per engine across all 28 layers.
+Decode therefore uses BF16 V/O; O runs across engines 0-7 through the dense M=1
+sharded tiler, while the remaining decoder projections and head retain their
 private shards. This phase change moves no learned arithmetic to the host and
-remains within the unchanged 8-GiB map. The LM head remains 64-column aligned
-at 152064 rows, while its 399 rows beyond the tokenizer's 151665 valid IDs
-receive a device-side minimum-BF16 bias and therefore cannot win the FPGA
-global argmax.
+remains within the unchanged 8-GiB map. The LM head remains 64-column aligned at
+152064 rows, while its 399 rows beyond the tokenizer's 151665 valid IDs receive
+a device-side minimum-BF16 bias and therefore cannot win the FPGA global argmax.
 Greedy generation stops only on Omni's declared `<|im_end|>` EOS (151645); its
 distinct
 `<|endoftext|>` padding ID (151643) is not treated as EOS.
+
+## Measured decode performance
+
+On U55C build `0x0305d87d` at 300 MHz, an eight-engine text run at short context
+measures 10.04 tokens/s end to end and 10.26 tokens/s for the first FPGA decode
+step. A 115-step arithmetic response measures 9.85 tokens/s as the KV history
+grows. These rates include host control, DMA, FPGA argmax readback, and
+detokenization; learned inference arithmetic remains on the FPGA.
 
 ## Build and run
 
