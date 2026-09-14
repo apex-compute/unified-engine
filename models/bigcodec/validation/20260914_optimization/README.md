@@ -1,8 +1,10 @@
-# BigCodec optimization candidate
+# Initial BigCodec optimization estimates
+
+**Superseded by the [validated hardware results](../20260914_optimized_italy/README.md): RTF 4.84 with bit-identical BF16 output, or 4.40 with IF8 recurrence.** The initial bins recorded below predate the hardware fixes for SRAM copy and final waveform layout. Recompile with the current source instead of deploying these initial candidates. This page preserves their original software measurements and traffic estimates.
 
 Target: **RTF 4–5**, or **15.82–19.78 seconds** to process the same 3.955896-second recording. The [measured BF16 baseline](../20260914_italy/README.md) is **60.61 seconds / RTF 15.32**.
 
-**The new FPGA RTF and waveform accuracy are not yet measured.** Italy initially reported a different image, `0x364c8440`, with invalid hardware-info value `0xdeadbeef`. PCIe memory decoding subsequently became disabled. [Hardware readiness](hardware_readiness.json) records the readbacks; the baseline image was `0xdf0749de`, RK AXI256. A compatible image and PCIe rescan are needed to finish hardware validation.
+At this initial compilation stage, FPGA RTF and waveform accuracy were unmeasured. Italy reported image `0x364c8440` with invalid hardware-info value `0xdeadbeef`, and PCIe memory decoding subsequently became disabled. [Hardware readiness](hardware_readiness.json) preserves those readbacks. Hardware access was later restored on build `0x40519e0a`; the linked validated results cover the corrected implementation.
 
 ## Changes
 
@@ -58,4 +60,4 @@ python models/bigcodec/bigcodec_compare.py \
   --report /tmp/bigcodec-optimized-comparison.json
 ```
 
-Use `--lstm-precision encoder-if8` or `--lstm-precision if8` with a separate output bin to evaluate the recurrent-weight tradeoff. Generated bins are excluded from Git. The three candidates listed above are already compiled locally on Italy at the paths in their records.
+Use `--lstm-precision encoder-if8` or `--lstm-precision if8` with a separate output bin to evaluate the recurrent-weight tradeoff. Generated bins are excluded from Git. The initial candidate paths above remain historical records; use the current compiler and the validated report's commands.

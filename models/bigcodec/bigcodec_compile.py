@@ -33,8 +33,9 @@ DEFAULT_OUTPUT = Path(__file__).resolve().parent / "bigcodec_bin" / "bigcodec-an
 CONV_SCATTER_BYTES = 512 * 1024
 CONV_STREAM_BUDGET_PER_64_OUTPUTS = 256 * 1024
 CONV_MAX_REUSE_PIXELS = 32
-WAVEFORM_BEAT_LANES = 16  # One32-byte AXI256 beat carries16 BF16 values.
-WAVEFORM_TILE_ROWS = TANH_CHUNK_ELEMENTS // WAVEFORM_BEAT_LANES
+WAVEFORM_ROW_LANES = 64  # SRAM DMA advances in complete 128-byte rows.
+WAVEFORM_ROW_BYTES = WAVEFORM_ROW_LANES * 2
+WAVEFORM_TILE_ROWS = TANH_CHUNK_ELEMENTS // WAVEFORM_ROW_LANES
 
 
 @dataclass
@@ -174,27 +175,27 @@ def _bf16_convolutions():
     return bigcodec_conv_bf16
 
 
-def _compact_waveform_tanh(graph, operation):
+def _waveform_tanh(graph, operation):
     return (operation.op == 'tanh' and operation.output == graph.output
             and graph.tensors[operation.output].shape[1] == 1)
 
 
 def emit_waveform_tanh(engine, source, destination, rows, identity_address,
                        zero_address, mask_address):
-    """Evaluate the mono waveform on one AXI beat per pad64 source row.
+    """Evaluate mono Tanh in SRAM while preserving complete pad64 sample rows.
 
-    Strided32-byte DMA compacts16 lanes per time sample into SRAM, reducing
-    Padé/reciprocal work fourfold. The mask keeps the first lane of each beat;
-    prezeroing the destination and scattering those beats restores pad64 rows.
-    Both source and workspace stay off the host; no DRAM scratch is needed.
+    Native strided writes with 32/64-byte chunks advance by a full 128-byte SRAM
+    row on RK 0x40519e0a, so sub-row scattering corrupts the sample sequence.
+    Full-row contiguous transfers preserve the layout. A mask retains each
+    row's first lane and zeros its padding; no DRAM scratch is needed.
     """
-    if not isinstance(rows, int) or isinstance(rows, bool) or rows <= 0 or rows % 4:
-        raise ValueError('Waveform tanh needs a positive multiple of four rows')
+    if not isinstance(rows, int) or isinstance(rows, bool) or rows <= 0:
+        raise ValueError('Waveform tanh needs a positive row count')
     size = rows * 128
     if (any(address < 0 or address % 128 for address in
                    (source, destination, identity_address, zero_address, mask_address))
             or source < destination + size and destination < source + size):
-        raise ValueError('Waveform tanh needs aligned, disjoint pad64 tensors and rows divisible by four')
+        raise ValueError('Waveform tanh needs aligned, disjoint pad64 tensors')
     zero(engine, destination, size, zero_address)
     engine.accelerator_memory_to_sram(identity_address, 0x80000, 64 * 64)
     # _tanh_sram uses B[0x80000:0x82000] and B[0x90000:0x96000].
@@ -202,15 +203,15 @@ def emit_waveform_tanh(engine, source, destination, rows, identity_address,
     engine.accelerator_memory_to_sram(mask_address, mask_sram, TANH_CHUNK_ELEMENTS)
     for first in range(0, rows, WAVEFORM_TILE_ROWS):
         take = min(WAVEFORM_TILE_ROWS, rows - first)
-        elements = take * WAVEFORM_BEAT_LANES
+        elements = take * WAVEFORM_ROW_LANES
         shared._copy_contiguous_or_strided_read(engine,
             source=source + first * 128, sram=0, total=elements * 2,
-            chunk=32, jump=128)
+            chunk=WAVEFORM_ROW_BYTES, jump=WAVEFORM_ROW_BYTES)
         _tanh_sram(engine, 0, 0, elements)
         engine.eltwise_mul_core(0, mask_sram, 0, elements)
         shared._copy_contiguous_or_strided_write(engine, sram=0,
             destination=destination + first * 128, total=elements * 2,
-            chunk=32, jump=128)
+            chunk=WAVEFORM_ROW_BYTES, jump=WAVEFORM_ROW_BYTES)
 
 
 class Arena:
@@ -278,7 +279,7 @@ def plan_memory(graph: Graph) -> Graph:
         elif operation.op == "quantizer":
             operation.scratch_bytes = quantizer_scratch_bytes(shape[0])
         elif operation.op == "tanh":
-            operation.scratch_bytes = (0 if _compact_waveform_tanh(graph, operation)
+            operation.scratch_bytes = (0 if _waveform_tanh(graph, operation)
                 else tanh_scratch_bytes(output.size_bytes // 2))
         elif operation.op == "conv1d":
             if graph.conv_precision == "bf16":
@@ -347,9 +348,9 @@ def _prepare_operation(graph, image, identity_address, zero_address, operation):
         operation.plan = prepare_quantizer(module, image, frames=source.shape[0],
             source_address=source.address, destination_address=output.address,
             scratch_address=graph.scratch_address, token_address=graph.tokens_address)
-    elif _compact_waveform_tanh(graph, operation):
+    elif _waveform_tanh(graph, operation):
         mask = torch.zeros(TANH_CHUNK_ELEMENTS, dtype=torch.bfloat16)
-        mask[::WAVEFORM_BEAT_LANES] = 1
+        mask[::WAVEFORM_ROW_LANES] = 1
         operation.plan = {'mask_address': image.allocate(mask, alignment=128)}
     elif operation.op not in ("add", "tanh"):
         raise AssertionError(operation.op)
@@ -390,7 +391,7 @@ def emit_operation(engine, graph, operation, identity_address, zero_address):
         elementwise(engine, udc.UE_MODE.ELTWISE_ADD, source.address,
                     other.address, output.address, output.size_bytes // 2)
     elif operation.op == "tanh":
-        if _compact_waveform_tanh(graph, operation):
+        if _waveform_tanh(graph, operation):
             emit_waveform_tanh(engine, source.address, output.address, source.shape[0],
                 identity_address, zero_address, operation.plan['mask_address'])
         else:
@@ -491,7 +492,7 @@ def compile_models(encoder, decoder, *, samples: int, conv_precision="if8", lstm
             "activation": "SRAM FIR and Snake tiles; native wide MAXPOOL clamp",
             "lstm": "SRAM recurrent gates and state updates with BF16 Pade tanh",
             "quantizer": "SRAM comparison masks and first seven tournament rounds",
-            "waveform_tanh": "compact AXI beats; evaluate 16 lanes instead of 64 per sample",
+            "waveform_tanh": "SRAM Pade evaluation with full 128-byte sample rows and explicit zero padding",
         },
         "approximation": {"snake_argument_clamp": SNAKE_ARGUMENT_LIMIT,
             "snake_sine_squared_polynomial_degree": 10, "snake_storage": "BF16",

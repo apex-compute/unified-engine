@@ -1,0 +1,268 @@
+{
+  "format": "bigcodec-validated-optimization-manifest-v1",
+  "scope": "Measured whole-utterance FPGA runs and CPU comparisons on Italy build40519e0a; source content identified by SHA256",
+  "files": {
+    "README.md": {
+      "bytes": 7319,
+      "sha256": "fac20ee7503a1ca04405c635436a3b8e385c23a43668732d9d5e32f834cec788"
+    },
+    "compiled_artifacts.json": {
+      "bytes": 1757,
+      "sha256": "dd63c41679dabc0862311569b1e83ac38a188dee962e1b06aaf7f0d93a0e4737"
+    },
+    "conv_sram_smoke.py": {
+      "bytes": 9231,
+      "sha256": "bf9f85168c8f5a0f636b078c4ea412c5cf1b229b531753ff85819b6c19aef767"
+    },
+    "convolution_checks.json": {
+      "bytes": 5396,
+      "sha256": "1bcdc1aebb759ef5fa22c65fdf15de267622002fd7c7b8b5682aa25427af0700"
+    },
+    "copy_fix_analysis.json": {
+      "bytes": 995,
+      "sha256": "1ac966dd81e558cb2d0c76ef4b4ffa7b1440acce891ddf03f0330b3a0e0260c2"
+    },
+    "execution_contract_audit.json": {
+      "bytes": 2829,
+      "sha256": "81f24848693cab295f1c8cd8433198d86c0f333062a76acb65cbbbb25f3f21d2"
+    },
+    "lstm_checks.json": {
+      "bytes": 7516,
+      "sha256": "554ce9e1ae91357677490d3e2207d7b92f24faf4e6327fc5b16c1a6d4331c5bc"
+    },
+    "lstm_stream_smoke.py": {
+      "bytes": 15204,
+      "sha256": "700588a30138afb84f81eb968632d4104e98fd6fd771d9fc8bc7df1514756833"
+    },
+    "native_sram_checks.json": {
+      "bytes": 13004,
+      "sha256": "1429fd9050ea890dba616693e1b3e642d35d7d71f24e97c775ea33a539d90ebd"
+    },
+    "native_sram_smoke.py": {
+      "bytes": 16583,
+      "sha256": "2518b9a74f2dab9bf7b46ce34d9d67cd24f08c54ee025929fff3fddd0d586165"
+    },
+    "p232_007_baseline_fpga.metrics.json": {
+      "bytes": 2702,
+      "sha256": "50e25b6fb30588c4aa8d996fb8e46528f12f7ef2734740306c133a243193ccf8"
+    },
+    "p232_007_baseline_fpga.tokens.npz": {
+      "bytes": 1386,
+      "sha256": "34da5227f77c3f643159facff138f27827176c9555631c81629032ecf9d07044"
+    },
+    "p232_007_baseline_fpga.wav": {
+      "bytes": 759612,
+      "sha256": "2242c825814ab7eb0cb73436150cd14f558a7d064271401c180130783e36ac83"
+    },
+    "p232_007_baseline_fpga_comparison.json": {
+      "bytes": 5842,
+      "sha256": "c4f2544835f6b65e9bf03fd7256b57c1d9c7feb1f6a8b74f83a2edac6a322702"
+    },
+    "p232_007_baseline_fpga_same_tokens_cpu.metrics.json": {
+      "bytes": 1347,
+      "sha256": "ca66b1b29b1f87e68ad8238448738bc2bf5cedeebe3422392ad23e77eccfc704"
+    },
+    "p232_007_baseline_fpga_same_tokens_cpu.wav": {
+      "bytes": 759612,
+      "sha256": "ca5f96d096e69cc780377a72526666b105bc63e3dbfcc41a3deef3e17d821fdd"
+    },
+    "p232_007_cpu.metrics.json": {
+      "bytes": 1848,
+      "sha256": "ea8b1b300b3e8e92df4682c57383b7de5534e05c35bd3254cc4f6c06b683120c"
+    },
+    "p232_007_cpu.tokens.npz": {
+      "bytes": 1387,
+      "sha256": "dbd0b73fab28be43a6edd208948a61629bba3a6812107ef7654fe412a87b295f"
+    },
+    "p232_007_cpu.wav": {
+      "bytes": 759612,
+      "sha256": "08b449c8be5bad1fabb6cde8cd91736162532144fc30c2b31d279cbfef229c99"
+    },
+    "p232_007_optimized_bf16_fpga.metrics.json": {
+      "bytes": 2826,
+      "sha256": "1394840a37b53c07cd5942951edfdce1577a413bc11271fd6c88cf38b3715c0b"
+    },
+    "p232_007_optimized_bf16_fpga.tokens.npz": {
+      "bytes": 1386,
+      "sha256": "34da5227f77c3f643159facff138f27827176c9555631c81629032ecf9d07044"
+    },
+    "p232_007_optimized_bf16_fpga.wav": {
+      "bytes": 759612,
+      "sha256": "9cba6c51c5466319b7397233f51c12fbedb9595735db6488922cbed714c77994"
+    },
+    "p232_007_optimized_bf16_fpga_comparison.json": {
+      "bytes": 6004,
+      "sha256": "e0f751cb0f4c505f6fc988b6348acd4671ce0be0a6370afe17c8305f9e7be7a0"
+    },
+    "p232_007_optimized_bf16_fpga_same_tokens_cpu.metrics.json": {
+      "bytes": 1359,
+      "sha256": "a2e373eb336adc96f8b917ee38fdbea5543debe3cfe084498315614d6b86f7ff"
+    },
+    "p232_007_optimized_bf16_fpga_same_tokens_cpu.wav": {
+      "bytes": 759612,
+      "sha256": "2b885e5b66011bb0f8da6774ff7857612d61f7d8e78dd7b139705897029439a5"
+    },
+    "p232_007_optimized_encoder_if8_fpga.metrics.json": {
+      "bytes": 2831,
+      "sha256": "4a514e7ed5a97be3d0eaa48c2aff8c20af10267392f248dee5d41ddf0abf1ea6"
+    },
+    "p232_007_optimized_encoder_if8_fpga.tokens.npz": {
+      "bytes": 1383,
+      "sha256": "c2544a1f16c0d39241eeb2897d4ac1f188321ce1ce04687a30bd9a86b97b329c"
+    },
+    "p232_007_optimized_encoder_if8_fpga.wav": {
+      "bytes": 759612,
+      "sha256": "1606d6842907114a5cc66d4cfb2174fa6f556c285027aacb134a7e6c30efed61"
+    },
+    "p232_007_optimized_encoder_if8_fpga_comparison.json": {
+      "bytes": 6131,
+      "sha256": "3b6fa15a5626d1348a4d9d64fc4fe2f25172dbd4db058784859ea1382e54ebe4"
+    },
+    "p232_007_optimized_encoder_if8_fpga_same_tokens_cpu.metrics.json": {
+      "bytes": 1373,
+      "sha256": "8600e185702dbf1877f2f135c389ac9ea0814c66b35856b5cf98eaf0330223f7"
+    },
+    "p232_007_optimized_encoder_if8_fpga_same_tokens_cpu.wav": {
+      "bytes": 759612,
+      "sha256": "d5873e9e42d6082b43e0a4c2530aeda60277440621c42c5d7520955cb9727e0f"
+    },
+    "p232_007_optimized_lstm_if8_fpga.metrics.json": {
+      "bytes": 2833,
+      "sha256": "a8a31bcf27a220f4b4f2cf107d48de9f1e3676a4b62623b41b29c543f51d7d67"
+    },
+    "p232_007_optimized_lstm_if8_fpga.tokens.npz": {
+      "bytes": 1383,
+      "sha256": "c2544a1f16c0d39241eeb2897d4ac1f188321ce1ce04687a30bd9a86b97b329c"
+    },
+    "p232_007_optimized_lstm_if8_fpga.wav": {
+      "bytes": 759612,
+      "sha256": "adf9151265d82fb199a4645dd287e308a5f5224e0bfb5476749d4d8cd6e7c4b2"
+    },
+    "p232_007_optimized_lstm_if8_fpga_comparison.json": {
+      "bytes": 6108,
+      "sha256": "085e6047d586685479138e4035765d5afb6bb3c83f6c3e84e091fba3ca89e926"
+    },
+    "p232_007_optimized_lstm_if8_fpga_same_tokens_cpu.metrics.json": {
+      "bytes": 1367,
+      "sha256": "738145a5ade1b06879f4815274ec813fa22c0e536952bd368ea761a258ee0089"
+    },
+    "p232_007_optimized_lstm_if8_fpga_same_tokens_cpu.wav": {
+      "bytes": 759612,
+      "sha256": "2d68e28c3fa2b3638620bd282800330d97c67986252b9350f8fa7b4180b9e711"
+    },
+    "software_tests.txt": {
+      "bytes": 440,
+      "sha256": "ef3e7a56b3181e8740877fb4cfb8eb5fc606deec40d881d29acbc22f5d0e0bb7"
+    },
+    "summary.json": {
+      "bytes": 1961,
+      "sha256": "24875803157fd979c553a804c267c5072bddf91e0a7b6e74d40421e807ffdab3"
+    },
+    "waveform_layout_checks.json": {
+      "bytes": 9443,
+      "sha256": "a7c6486cb707afbf64d1d6f587c4f574b81605fffab767ab42bc1c9ef105bbd7"
+    },
+    "waveform_tanh_smoke.py": {
+      "bytes": 5383,
+      "sha256": "4ba9a497c2cec7f51b5f8c793e7c9d5a4cb4f259e8d0d00ca48c19496607cb1a"
+    }
+  },
+  "source_files": {
+    "models/bigcodec/bigcodec_activation.py": {
+      "bytes": 12201,
+      "sha256": "614fc7eef0a0dc77ed69500ef58d3797f4299a5b6986811a79d470bcd4678794"
+    },
+    "models/bigcodec/bigcodec_common.py": {
+      "bytes": 7451,
+      "sha256": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6"
+    },
+    "models/bigcodec/bigcodec_compare.py": {
+      "bytes": 6108,
+      "sha256": "42219382a6031722f89f4530ac2f1b4e028be391e5f1da5ab62ffcf6fed6c9e2"
+    },
+    "models/bigcodec/bigcodec_compile.py": {
+      "bytes": 31151,
+      "sha256": "4eebd1c3bca10e7f0d12091b87bc88c5dba7f25ebc0ca542639c6b9de391653b"
+    },
+    "models/bigcodec/bigcodec_conv.py": {
+      "bytes": 24176,
+      "sha256": "8718ec8441ad9195ebcdf232ffe21ccfb3bc55d836cef1c25098f98b9e632b53"
+    },
+    "models/bigcodec/bigcodec_conv_bf16.py": {
+      "bytes": 18212,
+      "sha256": "e60caa1cc611160db23de9e8590c18111c2cf283f414b34651e8ddd1943d87a7"
+    },
+    "models/bigcodec/bigcodec_device.py": {
+      "bytes": 12438,
+      "sha256": "ef719dd88d1530d9ce59bf1626c683bc352e90b6fd0122e7a6dab32c7b8589eb"
+    },
+    "models/bigcodec/bigcodec_fetch.py": {
+      "bytes": 1757,
+      "sha256": "d8c2404b53ed5dda2866e7883042af7f37ed0067f84d4393f28222beb9cd7a0e"
+    },
+    "models/bigcodec/bigcodec_lstm.py": {
+      "bytes": 21012,
+      "sha256": "7b2ae83dbe918816fda8cc2ce80781c79712e7427fff33a8afd49b3ef29efbb2"
+    },
+    "models/bigcodec/bigcodec_precompiled.py": {
+      "bytes": 16788,
+      "sha256": "10dfa6a07320d746e5f8b3bbb7f63463cb55faa1770244ddf635c4736ff9ee23"
+    },
+    "models/bigcodec/bigcodec_quantizer.py": {
+      "bytes": 17886,
+      "sha256": "0acde30dc2758b1fdd74a63658248dfb600fb0dfc6edaad4d8dd6765044574b0"
+    },
+    "models/bigcodec/bigcodec_run_cpu.py": {
+      "bytes": 6293,
+      "sha256": "d6b5abd1fe8beb3bdb11f90f6b7e7004469fac0baa35206007274093687dd37f"
+    },
+    "models/bigcodec/bigcodec_run_from_bin.py": {
+      "bytes": 7921,
+      "sha256": "313215d46003a9068939dd8821bd2a88a851a219506831a72cd759bfcb7efbe1"
+    },
+    "models/bigcodec/test_bigcodec_activation.py": {
+      "bytes": 21027,
+      "sha256": "00f44584798161b3e094b127f33584507bab4c78e0d47dbca03ab09c45aef9c9"
+    },
+    "models/bigcodec/test_bigcodec_common.py": {
+      "bytes": 3812,
+      "sha256": "1a96d2eef10afec5ab1f4c9b04ab39ae8f3f629788944b0958b557951c2bea9a"
+    },
+    "models/bigcodec/test_bigcodec_compare.py": {
+      "bytes": 11470,
+      "sha256": "d27bb6f18fd8bf53748820feb29e2ddaa3e51a1e4708fdbd79872e828ac72903"
+    },
+    "models/bigcodec/test_bigcodec_compile.py": {
+      "bytes": 7021,
+      "sha256": "e9944219d2043ff518598feb756380e6ef5216a864cc4a57661dbc0e02349fa2"
+    },
+    "models/bigcodec/test_bigcodec_conv.py": {
+      "bytes": 17024,
+      "sha256": "d1dcedb22dca7fe59df3c3dd9e93ea11d13ffc5ee56198eb7f95ab1c9a39b65b"
+    },
+    "models/bigcodec/test_bigcodec_conv_bf16.py": {
+      "bytes": 23754,
+      "sha256": "a5ef4fdab941aa396b3dc96a277fdb04a3d484769756e909e0def44e54433132"
+    },
+    "models/bigcodec/test_bigcodec_device.py": {
+      "bytes": 3090,
+      "sha256": "88bdfec547a605acb77931cf0c3987025150df229cfff0fc4ab801d241f47d59"
+    },
+    "models/bigcodec/test_bigcodec_lstm.py": {
+      "bytes": 23388,
+      "sha256": "252e9c1d9aedcd7cbb07aea0c928c96cd619e6ed5ba29fc8891d316ff6f5d1d8"
+    },
+    "models/bigcodec/test_bigcodec_quantizer.py": {
+      "bytes": 16361,
+      "sha256": "ae8e0027635fb13b2916bf97601a2b836d5d6586fda4abf9aa25b94dc2439c0e"
+    },
+    "models/bigcodec/test_bigcodec_runtime.py": {
+      "bytes": 21364,
+      "sha256": "e25dcd1b8fca7c55ed1230e06b5fc3b4a9b48c5215592e90953e05bbe885867e"
+    },
+    "models/bigcodec/test_bigcodec_waveform_tanh.py": {
+      "bytes": 9567,
+      "sha256": "312253d69d409ee71b783288be31b3822b08918142aac8792f1539ecf04a3361"
+    }
+  }
+}

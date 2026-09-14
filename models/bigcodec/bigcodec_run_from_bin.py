@@ -78,7 +78,13 @@ def main():
                      f"input needs {len(padded)}. Compile with bigcodec_compile.py --input {args.input}")
     preprocess_s = time.perf_counter() - preprocessing
     lock_path = Path(f'/tmp/pcie_ci_hw_{socket.gethostname()}.lock')
-    with lock_path.open('a') as lock:
+    try:
+        lock = lock_path.open('a')
+    except PermissionError:
+        # An existing shared lock may be owned by the CI account. flock
+        # works on a read-only descriptor and still locks the same inode.
+        lock = lock_path.open('r')
+    with lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

@@ -1,0 +1,54 @@
+[
+  {
+    "run": "p232_007_baseline_fpga",
+    "hardware_version": "0x40519e0a",
+    "audio_processing_s": 60.61455036100051,
+    "rtf": 15.322585051468664,
+    "waveform_relative_l2_percent": 19.286676445996907,
+    "cpu_tokens_equal": 301,
+    "tokens": 317,
+    "same_token_decoder_relative_l2_percent": 34.95386712495839,
+    "report": "p232_007_baseline_fpga_comparison.json",
+    "old_baseline_sample_bits_identical": true,
+    "speedup_vs_baseline": 1.0
+  },
+  {
+    "run": "p232_007_optimized_bf16_fpga",
+    "hardware_version": "0x40519e0a",
+    "audio_processing_s": 19.146231733000604,
+    "rtf": 4.839923127315394,
+    "waveform_relative_l2_percent": 19.286676445996907,
+    "cpu_tokens_equal": 301,
+    "tokens": 317,
+    "same_token_decoder_relative_l2_percent": 34.95386712495839,
+    "report": "p232_007_optimized_bf16_fpga_comparison.json",
+    "old_baseline_sample_bits_identical": true,
+    "speedup_vs_baseline": 3.1658736406352364
+  },
+  {
+    "run": "p232_007_optimized_encoder_if8_fpga",
+    "hardware_version": "0x40519e0a",
+    "audio_processing_s": 18.27477428599923,
+    "rtf": 4.619629802183255,
+    "waveform_relative_l2_percent": 21.34920945451279,
+    "cpu_tokens_equal": 303,
+    "tokens": 317,
+    "same_token_decoder_relative_l2_percent": 31.26924676202257,
+    "report": "p232_007_optimized_encoder_if8_fpga_comparison.json",
+    "old_baseline_sample_bits_identical": false,
+    "speedup_vs_baseline": 3.3168426275688048
+  },
+  {
+    "run": "p232_007_optimized_lstm_if8_fpga",
+    "hardware_version": "0x40519e0a",
+    "audio_processing_s": 17.410541861998354,
+    "rtf": 4.401162870693643,
+    "waveform_relative_l2_percent": 17.445956955031043,
+    "cpu_tokens_equal": 303,
+    "tokens": 317,
+    "same_token_decoder_relative_l2_percent": 45.47181055162411,
+    "report": "p232_007_optimized_lstm_if8_fpga_comparison.json",
+    "old_baseline_sample_bits_identical": false,
+    "speedup_vs_baseline": 3.481485575891391
+  }
+]

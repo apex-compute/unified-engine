@@ -11,9 +11,9 @@
 | Parameters | 159,436,290, counting upstream weight normalization parameters |
 | Execution | Complete utterance; centered convolutions and two residual LSTM stacks |
 
-The CPU reference uses the pinned official FP32 checkpoint. The FPGA implementation runs the complete encoder, quantizer and decoder using either IF8 or BF16 convolution weights. It remains **experimental**: token choices and reconstructed waveforms differ from FP32, and both measured FPGA modes are slower than real time. See the [benchmarks and audio samples](validation/20260914_italy/README.md).
+The CPU reference uses the pinned official FP32 checkpoint. The FPGA implementation runs the complete encoder, quantizer and decoder. On Italy, optimized BF16 reaches **RTF 4.84**, down from **15.32**, with waveform samples and tokens bit-identical to the previous FPGA implementation. IF8 recurrent weights reach **RTF 4.40** with different reconstruction errors. These measurements use the 3.956-second noisy speech sample; see the [current benchmarks and audio](validation/20260914_optimized_italy/README.md).
 
-The current compiler includes an SRAM optimization candidate. Software tests and compilation pass, but its FPGA RTF and accuracy are **not yet measured** because Italy's board interface changed after the baseline run. The linked audio benchmarks describe the earlier implementation. See the [optimization status](validation/20260914_optimization/README.md).
+The port remains experimental: optimized BF16 differs from the official FP32 waveform by 19.29% relative L2, and real time requires RTF ≤ 1. The [earlier benchmarks](validation/20260914_italy/README.md) and [initial optimization estimates](validation/20260914_optimization/README.md) retain their original measurements.
 
 ## Setup
 
@@ -41,7 +41,7 @@ python models/bigcodec/bigcodec_run_from_bin.py \
 
 Use `--force` to replace an existing compiled bin. `--conv-precision bf16` reuses overlapping input windows in SRAM for BF16 matrix multiplication; `--conv-precision if8` uses native IF8 convolutions and is the CLI default. BF16 was faster and had lower end-to-end waveform error in the baseline measurements. Compilation is offline and requires the checkpoint. Execution needs only the deployment bin and input audio. The bin contains both packed parameters and the captured instruction program.
 
-Recurrent weights default to BF16. Add `--lstm-precision encoder-if8` to stream IF8 recurrent weights in the encoder, or `--lstm-precision if8` for both encoder and decoder. Input projections and gate/state arithmetic remain BF16. These options reduce recurrent weight traffic and introduce an additional quantization tradeoff; their FPGA accuracy and timing are pending validation.
+Recurrent weights default to BF16. Add `--lstm-precision encoder-if8` to stream IF8 recurrent weights in the encoder, or `--lstm-precision if8` for both encoder and decoder. Input projections and gate/state arithmetic remain BF16. Measured RTF is 4.62 for encoder-only IF8 and 4.40 for both stacks; the benchmark report records their waveform and same-token decoder errors separately. BF16 preserves the previous FPGA output and is the prepared default bin on Italy.
 
 The runner uploads the model image once, writes the padded input to DRAM, issues one START, waits for the terminal HALT, then reads one output bundle containing the waveform and tokens. All neural operations, including recurrent state updates and codebook selection, execute on the FPGA. Host processing reads/resamples the input and writes the output WAV and token NPZ.
 
@@ -85,4 +85,4 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m unittest discover \
 
 Tests cover upstream source integrity, token/audio metadata, convolution padding and transpose phases, activation math, LSTM gates/state reset, quantizer selection, graph memory planning and the single START/HALT runtime protocol. Hardware results are reported separately from software emulation.
 
-The FPGA Snake approximation folds its BF16 argument into a sine period and evaluates a degree-10 sine-squared polynomial, clamping argument magnitude at 32π. Quantized alias filters preserve symmetry and exact unit DC gain. Tanh uses an odd Padé [7/6] approximation with arguments clamped to ±4 and output to ±1, preserving quiet values that `2*sigmoid(2*x)-1` loses in BF16. Codebook comparisons use BF16 scores and choose the lowest token ID on ties. The baseline comparison flushed positive BF16 subnormal differences to zero; the new MAXPOOL path needs separate hardware validation. These precision changes can alter tokens and reconstructed audio.
+The FPGA Snake approximation folds its BF16 argument into a sine period and evaluates a degree-10 sine-squared polynomial, clamping argument magnitude at 32π. Quantized alias filters preserve symmetry and exact unit DC gain. Tanh uses an odd Padé [7/6] approximation with arguments clamped to ±4 and output to ±1, preserving quiet values that `2*sigmoid(2*x)-1` loses in BF16. Codebook comparisons use BF16 scores and choose the lowest token ID on ties. On build `0x40519e0a`, positive score gaps below 2⁻¹²⁷ become ties; zero signs can differ. These precision changes can alter tokens and reconstructed audio.
