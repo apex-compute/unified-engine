@@ -1,0 +1,1774 @@
+{
+  "format": "bigcodec-noisy20s-results-v1",
+  "generated_utc": "2026-09-14T22:43:50.575079+00:00",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "summary": "summary.json",
+  "cases": [
+    {
+      "case": "bus",
+      "environment": "Public transit bus (TBUS)",
+      "cohort": "retained_mixed_snr",
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "duration_s": 23.68225,
+      "samples": 378916,
+      "compiled_samples": 379000,
+      "input": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus_noisy.wav",
+        "sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+        "bytes": 1515744,
+        "case": "bus",
+        "role": "input",
+        "zip_member": "noisy/bus_noisy.wav",
+        "samples": 378916,
+        "sample_rate": 16000
+      },
+      "utterance_ids": [
+        "p232_005",
+        "p257_003",
+        "p232_148",
+        "p257_324",
+        "p257_324"
+      ],
+      "cpu": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+          "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+          "bytes": 1515744,
+          "case": "bus",
+          "role": "cpu",
+          "zip_member": "cpu/bus.wav",
+          "samples": 378916,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz",
+          "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+          "bytes": 4178
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.metrics.json",
+          "sha256": "d80002b4d5d2ffbb36499801db0f2db7684d61e7ac9d1e418fe3d2ca662bab2e",
+          "bytes": 1973
+        },
+        "processing_s": 55.175157690999185,
+        "rtf": 2.3298106257217617,
+        "duration_s": 23.68225,
+        "finite": true,
+        "tokens_total": 1895,
+        "neural_s": 55.16949249499885,
+        "model_load_s": 1.1214895110006182
+      },
+      "bf16": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus.wav",
+          "sha256": "bff0a4e91d8d1f7520a4d2dec2821ac3dd52d76d9c2ddd9fc472f129ad16e21f",
+          "bytes": 1515744,
+          "case": "bus",
+          "role": "fpga_bf16",
+          "zip_member": "fpga_bf16/bus.wav",
+          "samples": 378916,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus.tokens.npz",
+          "sha256": "75fefe9df0f99df2bb734d1c44228492cd762ed89703cf904afe5176a715bb99",
+          "bytes": 4179
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus.metrics.json",
+          "sha256": "9eed59398f8d74d32333cafbb7f5821b094db597bf1eee84434e4f4266e64f1b",
+          "bytes": 2839
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus.comparison.json",
+          "sha256": "43f8c4c2775514d6b7665303a3e5a9ab087a0b5a306365faab6917db616351d4",
+          "bytes": 1699
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/bus_bf16.bin",
+          "sha256": "1b55d7bc4bf552415e8f96870196fd0b097ec565873cd0416fdb9183f61120a7",
+          "bytes": 831305455
+        },
+        "compile": {
+          "bin": "models/bigcodec/bigcodec_bin/noisy20s/bus_bf16.bin",
+          "bin_bytes": 831305455,
+          "bin_sha256": "1b55d7bc4bf552415e8f96870196fd0b097ec565873cd0416fdb9183f61120a7",
+          "code_frames": 1895,
+          "compile_s": 124.8407531289995,
+          "compiled_samples": 379000,
+          "convolution_precision": "bf16",
+          "instructions": 15625408,
+          "lstm_recurrent_precision": "bf16",
+          "native_samples": 378916,
+          "operations": 180,
+          "parameter_bytes": 331251584,
+          "program_bytes": 500013056,
+          "resident_bytes": 831264640,
+          "scratch_bytes": 436608000
+        },
+        "duration_s": 23.68225,
+        "processing_s": 113.59055456100214,
+        "rtf": 4.796442675886039,
+        "fpga_execution_s": 113.32920562940737,
+        "artifact_load_s": 22.063986316999944,
+        "model_upload_s": 0.286684635999336,
+        "total_elapsed_s": 155.21713787799854,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.2809025853262052,
+        "energy": {
+          "reference_energy": 1854.575545013583,
+          "error_energy": 146.33762467511139,
+          "actual_energy": 1714.8862713382941,
+          "samples": 378916
+        },
+        "tokens_equal": 1714,
+        "tokens_total": 1895,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "BF16",
+            "decoder": "BF16"
+          }
+        },
+        "source_hash_overrides": {
+          "models/bigcodec/bigcodec_run_from_bin.py": "313215d46003a9068939dd8821bd2a88a851a219506831a72cd759bfcb7efbe1"
+        },
+        "source_note": "Initial pilot used the rebased runner before the added capacity preflight; board capacity was verified independently by the high-DRAM hardware probe."
+      },
+      "if8": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus.wav",
+          "sha256": "8e9c024f4f2c1e5b9226904ffbb2dedb1d79a3f74e024a9d61ed96372cc71e8c",
+          "bytes": 1515744,
+          "case": "bus",
+          "role": "fpga_if8",
+          "zip_member": "fpga_if8/bus.wav",
+          "samples": 378916,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus.tokens.npz",
+          "sha256": "322f7b1e855e420de62bd99e812d8742897df18e674b32e3a69e99a4bb4e89e2",
+          "bytes": 4184
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus.metrics.json",
+          "sha256": "d362af48156b52393233c4bdcb58115dec4bf14d512874a2700eb760f4806a12",
+          "bytes": 2983
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus.comparison.json",
+          "sha256": "a14b70d332f65ba16d30c30a6de63c1cfd916950871f877ab97420b1ca944519",
+          "bytes": 1697
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/bus_if8.bin",
+          "sha256": "dda7381c3043d13c7625e6bd5e78db15c3925fe9ce1c6db0737e688856522423",
+          "bytes": 774361327
+        },
+        "compile": {
+          "bin": "models/bigcodec/bigcodec_bin/noisy20s/bus_if8.bin",
+          "bin_bytes": 774361327,
+          "bin_sha256": "dda7381c3043d13c7625e6bd5e78db15c3925fe9ce1c6db0737e688856522423",
+          "code_frames": 1895,
+          "compile_s": 125.73938275299952,
+          "compiled_samples": 379000,
+          "convolution_precision": "bf16",
+          "instructions": 14988688,
+          "lstm_recurrent_precision": "if8",
+          "native_samples": 378916,
+          "operations": 180,
+          "parameter_bytes": 294682496,
+          "program_bytes": 479638016,
+          "resident_bytes": 774320512,
+          "scratch_bytes": 436608000
+        },
+        "duration_s": 23.68225,
+        "processing_s": 103.13637211900277,
+        "rtf": 4.355007320630547,
+        "fpga_execution_s": 102.88500337884471,
+        "artifact_load_s": 21.28803558800064,
+        "model_upload_s": 0.2667968429996108,
+        "total_elapsed_s": 142.84256142899903,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.27450835464771367,
+        "energy": {
+          "reference_energy": 1854.575545013583,
+          "error_energy": 139.75123747471935,
+          "actual_energy": 1739.7109188083175,
+          "samples": 378916
+        },
+        "tokens_equal": 1708,
+        "tokens_total": 1895,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "IF8-INT",
+            "decoder": "IF8-INT"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      }
+    },
+    {
+      "case": "cafe",
+      "environment": "Cafe terrace at a public square (SCAFE)",
+      "cohort": "retained_mixed_snr",
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "duration_s": 20.509125,
+      "samples": 328146,
+      "compiled_samples": 328200,
+      "input": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_noisy.wav",
+        "sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868",
+        "bytes": 1312664,
+        "case": "cafe",
+        "role": "input",
+        "zip_member": "noisy/cafe_noisy.wav",
+        "samples": 328146,
+        "sample_rate": 16000
+      },
+      "utterance_ids": [
+        "p257_009",
+        "p232_009",
+        "p257_007",
+        "p257_007",
+        "p232_006"
+      ],
+      "cpu": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav",
+          "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e",
+          "bytes": 1312664,
+          "case": "cafe",
+          "role": "cpu",
+          "zip_member": "cpu/cafe.wav",
+          "samples": 328146,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.tokens.npz",
+          "sha256": "c48df28ed8b8998368cca7e603405a6389f68d60cf0ecc7bf9a09af7c20394c4",
+          "bytes": 3699
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.metrics.json",
+          "sha256": "77c5ef1281692f38ab0331ca53ddd158a75bf1c85921dbdb76614fd051115356",
+          "bytes": 1979
+        },
+        "processing_s": 47.514891925000484,
+        "rtf": 2.316768361643926,
+        "duration_s": 20.509125,
+        "finite": true,
+        "tokens_total": 1641,
+        "neural_s": 47.509901078998155,
+        "model_load_s": 1.1318884400006937
+      },
+      "bf16": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe.wav",
+          "sha256": "ab0f591a0461f2f9e1e1e0322763bc64b4144662ab24f6ec78abad96d81158f1",
+          "bytes": 1312664,
+          "case": "cafe",
+          "role": "fpga_bf16",
+          "zip_member": "fpga_bf16/cafe.wav",
+          "samples": 328146,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe.tokens.npz",
+          "sha256": "c2de26f3033ee688e3847137fecca3d6252e8f1be90cf5e17d72817542d4de7e",
+          "bytes": 3703
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe.metrics.json",
+          "sha256": "41b2e5e741842612ba23b6307123e522a0a537d837ae33649f0d2eb1bb01d9f3",
+          "bytes": 2977
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe.comparison.json",
+          "sha256": "9092552b09bc569e1568786323dfabf4f03cee9bbd2f808da51170e39abfe9dc",
+          "bytes": 1707
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/cafe_bf16.bin",
+          "sha256": "46eb37f256b286bb761309de7047e74d5d71d7bfa47226496c3351ac2131e413",
+          "bytes": 764219183
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/cafe_bf16.bin",
+          "bin_bytes": 764219183,
+          "bin_sha256": "46eb37f256b286bb761309de7047e74d5d71d7bfa47226496c3351ac2131e413",
+          "code_frames": 1641,
+          "compile_s": 110.18103726999834,
+          "compiled_samples": 328200,
+          "convolution_precision": "bf16",
+          "instructions": 13528962,
+          "lstm_recurrent_precision": "bf16",
+          "native_samples": 328146,
+          "operations": 180,
+          "parameter_bytes": 331251584,
+          "program_bytes": 432926784,
+          "resident_bytes": 764178368,
+          "scratch_bytes": 378086400
+        },
+        "duration_s": 20.509125,
+        "processing_s": 98.33547912200083,
+        "rtf": 4.794718405685314,
+        "fpga_execution_s": 98.11870890922731,
+        "artifact_load_s": 18.159592280000652,
+        "model_upload_s": 0.2664359320006042,
+        "total_elapsed_s": 134.24628380800277,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.21960814798900385,
+        "energy": {
+          "reference_energy": 1810.7900888599197,
+          "error_energy": 87.33031117937688,
+          "actual_energy": 1729.8566314821821,
+          "samples": 328146
+        },
+        "tokens_equal": 1503,
+        "tokens_total": 1641,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "BF16",
+            "decoder": "BF16"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      },
+      "if8": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe.wav",
+          "sha256": "5ae9693a871e825ab466853904901f12e5e95bf12a68ab42942a473058206867",
+          "bytes": 1312664,
+          "case": "cafe",
+          "role": "fpga_if8",
+          "zip_member": "fpga_if8/cafe.wav",
+          "samples": 328146,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe.tokens.npz",
+          "sha256": "212e0bf262841db3151ba9ff0d108828d7c5d273600f67d732df35154d23c1d7",
+          "bytes": 3708
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe.metrics.json",
+          "sha256": "38bd75409ae6744758ed43ae3338abbdebd13d1bc107d57d517d1a620edf0b4d",
+          "bytes": 2985
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe.comparison.json",
+          "sha256": "8946c1c3fde497df487870aa642a3b4d4c9ac7064e3ce3427121558fff45ebe2",
+          "bytes": 1704
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/cafe_if8.bin",
+          "sha256": "e42ef8c528ebb8f44ecdff9aa1f8e1db471f4bd5163209a3fb24bc37239d7d84",
+          "bytes": 710006063
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/cafe_if8.bin",
+          "bin_bytes": 710006063,
+          "bin_sha256": "e42ef8c528ebb8f44ecdff9aa1f8e1db471f4bd5163209a3fb24bc37239d7d84",
+          "code_frames": 1641,
+          "compile_s": 107.44179945600263,
+          "compiled_samples": 328200,
+          "convolution_precision": "bf16",
+          "instructions": 12977586,
+          "lstm_recurrent_precision": "if8",
+          "native_samples": 328146,
+          "operations": 180,
+          "parameter_bytes": 294682496,
+          "program_bytes": 415282752,
+          "resident_bytes": 709965248,
+          "scratch_bytes": 378086400
+        },
+        "duration_s": 20.509125,
+        "processing_s": 89.29582454799674,
+        "rtf": 4.353955839071474,
+        "fpga_execution_s": 89.07480702175545,
+        "artifact_load_s": 17.594216073001007,
+        "model_upload_s": 0.24394684500293806,
+        "total_elapsed_s": 124.20523682899875,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.24749989219993312,
+        "energy": {
+          "reference_energy": 1810.7900888599197,
+          "error_energy": 110.92211375511663,
+          "actual_energy": 1718.7285077319286,
+          "samples": 328146
+        },
+        "tokens_equal": 1514,
+        "tokens_total": 1641,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "IF8-INT",
+            "decoder": "IF8-INT"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      }
+    },
+    {
+      "case": "office",
+      "environment": "Small office with three people using computers (OOFFICE)",
+      "cohort": "retained_mixed_snr",
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "duration_s": 21.9805,
+      "samples": 351688,
+      "compiled_samples": 351800,
+      "input": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/office_noisy.wav",
+        "sha256": "b5dc82530929875863ebb564cc892c64c4e1cf5c5cead6b17a34c368593d6f73",
+        "bytes": 1406832,
+        "case": "office",
+        "role": "input",
+        "zip_member": "noisy/office_noisy.wav",
+        "samples": 351688,
+        "sample_rate": 16000
+      },
+      "utterance_ids": [
+        "p257_199",
+        "p232_372",
+        "p232_372",
+        "p257_015",
+        "p232_015"
+      ],
+      "cpu": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.wav",
+          "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad",
+          "bytes": 1406832,
+          "case": "office",
+          "role": "cpu",
+          "zip_member": "cpu/office.wav",
+          "samples": 351688,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.tokens.npz",
+          "sha256": "a1060ccbbb1a6007e718fbfaa9cbda024a8a1da12554d3051ec7599bdacaa430",
+          "bytes": 3871
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.metrics.json",
+          "sha256": "a64507d55cdc583f22aa18e8bbfdd9faad574dec95d24883087381bb6bec0e17",
+          "bytes": 1982
+        },
+        "processing_s": 51.485763919999954,
+        "rtf": 2.342338159732488,
+        "duration_s": 21.9805,
+        "finite": true,
+        "tokens_total": 1759,
+        "neural_s": 51.48005212099997,
+        "model_load_s": 1.1299032200004149
+      },
+      "bf16": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office.wav",
+          "sha256": "2617b86e92957d95459e045baed28f28d44474d53f4b43f3c2fae4d882cebf5b",
+          "bytes": 1406832,
+          "case": "office",
+          "role": "fpga_bf16",
+          "zip_member": "fpga_bf16/office.wav",
+          "samples": 351688,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office.tokens.npz",
+          "sha256": "53e74e6ec32f6d720349b2f5f2dc2699cf2969817b9343bb81cd6adf407bb38b",
+          "bytes": 3874
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office.metrics.json",
+          "sha256": "8ca45390984fc21a53745c41ccce562e4051e5fcb0fd32e16a68c4cded627765",
+          "bytes": 2985
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office.comparison.json",
+          "sha256": "123063205b0b7c63fba15503393afa7a15630ff7d838ec6e23a7892d6127c4aa",
+          "bytes": 1713
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/office_bf16.bin",
+          "sha256": "944e924e61bd54f9b90265c0c608892d4f7dbe1360d4979b030ccba753d58f74",
+          "bytes": 795476335
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/office_bf16.bin",
+          "bin_bytes": 795476335,
+          "bin_sha256": "944e924e61bd54f9b90265c0c608892d4f7dbe1360d4979b030ccba753d58f74",
+          "code_frames": 1759,
+          "compile_s": 117.90901445599957,
+          "compiled_samples": 351800,
+          "convolution_precision": "bf16",
+          "instructions": 14505748,
+          "lstm_recurrent_precision": "bf16",
+          "native_samples": 351688,
+          "operations": 180,
+          "parameter_bytes": 331251584,
+          "program_bytes": 464183936,
+          "resident_bytes": 795435520,
+          "scratch_bytes": 405273600
+        },
+        "duration_s": 21.9805,
+        "processing_s": 105.42844558599973,
+        "rtf": 4.7964534740337905,
+        "fpga_execution_s": 105.19542560840212,
+        "artifact_load_s": 19.059488876002433,
+        "model_upload_s": 0.27399517700177967,
+        "total_elapsed_s": 144.31821125900024,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.23844481566992895,
+        "energy": {
+          "reference_energy": 2243.7508500261993,
+          "error_energy": 127.5705415354804,
+          "actual_energy": 2089.288044692483,
+          "samples": 351688
+        },
+        "tokens_equal": 1576,
+        "tokens_total": 1759,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "BF16",
+            "decoder": "BF16"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      },
+      "if8": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office.wav",
+          "sha256": "efe25788a9fd67a6af579a99c571bb005c5f49ce3cc4aca8ba7f5adfc81346e5",
+          "bytes": 1406832,
+          "case": "office",
+          "role": "fpga_if8",
+          "zip_member": "fpga_if8/office.wav",
+          "samples": 351688,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office.tokens.npz",
+          "sha256": "be2ba2df25477094c7a9e8e6ccb9a1328bd33d773b588766c2255583a43251fa",
+          "bytes": 3880
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office.metrics.json",
+          "sha256": "c424cda37910c8439eb610fcf51421c9ab857222ad347375cb905dbc407bb1c0",
+          "bytes": 2986
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office.comparison.json",
+          "sha256": "6312bda2517589c04da3e8cea2badfc22a873c40bfd6c4324997e1230dde1b5d",
+          "bytes": 1711
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/office_if8.bin",
+          "sha256": "f645981095dec2c2c78f191ef89f953f89b3d6f9c42b335143758c79f0470123",
+          "bytes": 739994479
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/office_if8.bin",
+          "bin_bytes": 739994479,
+          "bin_sha256": "f645981095dec2c2c78f191ef89f953f89b3d6f9c42b335143758c79f0470123",
+          "code_frames": 1759,
+          "compile_s": 114.82570807699813,
+          "compiled_samples": 351800,
+          "convolution_precision": "bf16",
+          "instructions": 13914724,
+          "lstm_recurrent_precision": "if8",
+          "native_samples": 351688,
+          "operations": 180,
+          "parameter_bytes": 294682496,
+          "program_bytes": 445271168,
+          "resident_bytes": 739953664,
+          "scratch_bytes": 405273600
+        },
+        "duration_s": 21.9805,
+        "processing_s": 95.73789598400253,
+        "rtf": 4.355583175269103,
+        "fpga_execution_s": 95.50232361290323,
+        "artifact_load_s": 19.008490110998537,
+        "model_upload_s": 0.25419141999736894,
+        "total_elapsed_s": 132.91144796200024,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.22176883287605254,
+        "energy": {
+          "reference_energy": 2243.7508500261993,
+          "error_energy": 110.3508422394861,
+          "actual_energy": 2111.683983492641,
+          "samples": 351688
+        },
+        "tokens_equal": 1567,
+        "tokens_total": 1759,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "IF8-INT",
+            "decoder": "IF8-INT"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      }
+    },
+    {
+      "case": "psquare",
+      "environment": "Public town square with tourists (SPSQUARE)",
+      "cohort": "retained_mixed_snr",
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "duration_s": 21.473375,
+      "samples": 343574,
+      "compiled_samples": 343600,
+      "input": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_noisy.wav",
+        "sha256": "a20d68e238fb9acae1044ced9e05581535764ef2942d2efad5d3a7c1bf1cb26e",
+        "bytes": 1374376,
+        "case": "psquare",
+        "role": "input",
+        "zip_member": "noisy/psquare_noisy.wav",
+        "samples": 343574,
+        "sample_rate": 16000
+      },
+      "utterance_ids": [
+        "p232_409",
+        "p257_101",
+        "p232_188",
+        "p232_188",
+        "p257_018"
+      ],
+      "cpu": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.wav",
+          "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059",
+          "bytes": 1374376,
+          "case": "psquare",
+          "role": "cpu",
+          "zip_member": "cpu/psquare.wav",
+          "samples": 343574,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.tokens.npz",
+          "sha256": "c4f0e9c95822161d75be03e1debace66bf229c78ea433b031dd983a2e9cd0a34",
+          "bytes": 3855
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.metrics.json",
+          "sha256": "fae50433a72850806be3a64606664ad5fb5ec6cc28c46ea61c262ee31af5a45d",
+          "bytes": 1989
+        },
+        "processing_s": 48.947402970999974,
+        "rtf": 2.2794461965573634,
+        "duration_s": 21.473375,
+        "finite": true,
+        "tokens_total": 1718,
+        "neural_s": 48.94128304399965,
+        "model_load_s": 1.1285128719991917
+      },
+      "bf16": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare.wav",
+          "sha256": "418f2664b6b4b94ae783821730e9b3309dc13985b2a048b9550a2aa9ca968f9f",
+          "bytes": 1374376,
+          "case": "psquare",
+          "role": "fpga_bf16",
+          "zip_member": "fpga_bf16/psquare.wav",
+          "samples": 343574,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare.tokens.npz",
+          "sha256": "e3e916f2cc268fab5dafc99bf62b8eecf26cb70160dcd9b6298821925f29a0f6",
+          "bytes": 3870
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare.metrics.json",
+          "sha256": "3f79769bf992035ff4a88c8f3fe93e7fda2d36c9394f5dd2236e554d74407b3f",
+          "bytes": 2987
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare.comparison.json",
+          "sha256": "579e8112423dc37f13e00b7dd2ab0ced3fcde2dcdd2d0f54f3b012db84232ba0",
+          "bytes": 1716
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/psquare_bf16.bin",
+          "sha256": "d93441bf5a19aee9d34c57c7f9b570d4d4213fe7c7321a1b4a74fcd2d86ce5f2",
+          "bytes": 784728751
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/psquare_bf16.bin",
+          "bin_bytes": 784728751,
+          "bin_sha256": "d93441bf5a19aee9d34c57c7f9b570d4d4213fe7c7321a1b4a74fcd2d86ce5f2",
+          "code_frames": 1718,
+          "compile_s": 114.30185328199877,
+          "compiled_samples": 343600,
+          "convolution_precision": "bf16",
+          "instructions": 14169886,
+          "lstm_recurrent_precision": "bf16",
+          "native_samples": 343574,
+          "operations": 180,
+          "parameter_bytes": 331251584,
+          "program_bytes": 453436352,
+          "resident_bytes": 784687936,
+          "scratch_bytes": 395827200
+        },
+        "duration_s": 21.473375,
+        "processing_s": 102.9790195720052,
+        "rtf": 4.7956606528785155,
+        "fpga_execution_s": 102.74473314328583,
+        "artifact_load_s": 19.000271091001196,
+        "model_upload_s": 0.27305636899836827,
+        "total_elapsed_s": 141.59713209300025,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.33448952331509124,
+        "energy": {
+          "reference_energy": 1804.0364112958182,
+          "error_energy": 201.84144095222547,
+          "actual_energy": 1690.9510061347562,
+          "samples": 343574
+        },
+        "tokens_equal": 1546,
+        "tokens_total": 1718,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "BF16",
+            "decoder": "BF16"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      },
+      "if8": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare.wav",
+          "sha256": "5e40326bd2d884e7a505c3626ba3344e828b18cbb21ead00e2f9f2bfa0ec5879",
+          "bytes": 1374376,
+          "case": "psquare",
+          "role": "fpga_if8",
+          "zip_member": "fpga_if8/psquare.wav",
+          "samples": 343574,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare.tokens.npz",
+          "sha256": "2c00f864db579261bd28e0dba9c92bec9e85832304106d3ff786c5cf4e487eb5",
+          "bytes": 3864
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare.metrics.json",
+          "sha256": "e112ffe9e4cc137f67f9073fd1f44556b796725bc4f533fd5c2b1abed27a87e9",
+          "bytes": 2987
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare.comparison.json",
+          "sha256": "d0f190b067fa0ba286b687af9c5b752d1186e123e9dcc70ae499b750fef97162",
+          "bytes": 1715
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/psquare_if8.bin",
+          "sha256": "a158cfd1dd8f29c691cb69318af9ff0916cf0442cadf79bb509693b53e25c2ed",
+          "bytes": 729687727
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/psquare_if8.bin",
+          "bin_bytes": 729687727,
+          "bin_sha256": "a158cfd1dd8f29c691cb69318af9ff0916cf0442cadf79bb509693b53e25c2ed",
+          "code_frames": 1718,
+          "compile_s": 112.17823936900095,
+          "compiled_samples": 343600,
+          "convolution_precision": "bf16",
+          "instructions": 13592638,
+          "lstm_recurrent_precision": "if8",
+          "native_samples": 343574,
+          "operations": 180,
+          "parameter_bytes": 294682496,
+          "program_bytes": 434964416,
+          "resident_bytes": 729646912,
+          "scratch_bytes": 395827200
+        },
+        "duration_s": 21.473375,
+        "processing_s": 93.51513060599973,
+        "rtf": 4.354933987135219,
+        "fpga_execution_s": 93.27586030907727,
+        "artifact_load_s": 18.48688552400199,
+        "model_upload_s": 0.2823148310017132,
+        "total_elapsed_s": 129.5377429550026,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.3486127610779719,
+        "energy": {
+          "reference_energy": 1804.0364112958182,
+          "error_energy": 219.24609146027046,
+          "actual_energy": 1678.1688042724036,
+          "samples": 343574
+        },
+        "tokens_equal": 1538,
+        "tokens_total": 1718,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "IF8-INT",
+            "decoder": "IF8-INT"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      }
+    },
+    {
+      "case": "bus_low_snr",
+      "environment": "Public transit bus (TBUS)",
+      "cohort": "low_snr_new_sources",
+      "nominal_snr_db": [
+        2.5
+      ],
+      "duration_s": 20.8791875,
+      "samples": 334067,
+      "compiled_samples": 334200,
+      "input": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus_low_snr_noisy.wav",
+        "sha256": "6ffae073e5549f58e19127bfcc701616baca9bc68d299103c01aeec7a8e0d288",
+        "bytes": 1336348,
+        "case": "bus_low_snr",
+        "role": "input",
+        "zip_member": "noisy/bus_low_snr_noisy.wav",
+        "samples": 334067,
+        "sample_rate": 16000
+      },
+      "utterance_ids": [
+        "p232_216",
+        "p257_004",
+        "p257_207",
+        "p257_247",
+        "p257_307",
+        "p257_367"
+      ],
+      "cpu": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.wav",
+          "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6",
+          "bytes": 1336348,
+          "case": "bus_low_snr",
+          "role": "cpu",
+          "zip_member": "cpu/bus_low_snr.wav",
+          "samples": 334067,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.tokens.npz",
+          "sha256": "c7fde3db4b89fca566160bf035ae191ebb53f0e36ca14ff6a9be25fe1b84cb08",
+          "bytes": 3732
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.metrics.json",
+          "sha256": "021ecf0eefef7927d39361f93e99ec7346845da24c7d0612400bdc2e76f661c3",
+          "bytes": 1999
+        },
+        "processing_s": 48.87914914199973,
+        "rtf": 2.3410465154355133,
+        "duration_s": 20.8791875,
+        "finite": true,
+        "tokens_total": 1671,
+        "neural_s": 48.87385906500094,
+        "model_load_s": 1.1311918629999127
+      },
+      "bf16": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus_low_snr.wav",
+          "sha256": "2b9fcbedb52f30103b210670fe09a385ed54e65e0c84247d8c5df6f72b18cd79",
+          "bytes": 1336348,
+          "case": "bus_low_snr",
+          "role": "fpga_bf16",
+          "zip_member": "fpga_bf16/bus_low_snr.wav",
+          "samples": 334067,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus_low_snr.tokens.npz",
+          "sha256": "7e41f56290307a028ad23c6855dab58dca08f1ed302f193477e0b179b9a73ee9",
+          "bytes": 3740
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus_low_snr.metrics.json",
+          "sha256": "69494a19a0ad0af907a89037618622a0ce01a6ff2c8a70b95f1fd09a15fd3406",
+          "bytes": 2995
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus_low_snr.comparison.json",
+          "sha256": "d5d5a3e902126c924d3b63dae3e9f36f704f98325f5ab4e5b10beac1bcf1ff7c",
+          "bytes": 1735
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/bus_low_snr_bf16.bin",
+          "sha256": "5cddb77c7e444686f46bcbc0daf1a2236a7a884745709b746a2209d3f441e74d",
+          "bytes": 772240687
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/bus_low_snr_bf16.bin",
+          "bin_bytes": 772240687,
+          "bin_sha256": "5cddb77c7e444686f46bcbc0daf1a2236a7a884745709b746a2209d3f441e74d",
+          "code_frames": 1671,
+          "compile_s": 109.98108127299929,
+          "compiled_samples": 334200,
+          "convolution_precision": "bf16",
+          "instructions": 13779634,
+          "lstm_recurrent_precision": "bf16",
+          "native_samples": 334067,
+          "operations": 180,
+          "parameter_bytes": 331251584,
+          "program_bytes": 440948288,
+          "resident_bytes": 772199872,
+          "scratch_bytes": 384998400
+        },
+        "duration_s": 20.8791875,
+        "processing_s": 100.16510153700074,
+        "rtf": 4.79736587149288,
+        "fpga_execution_s": 99.93273475168793,
+        "artifact_load_s": 18.519059185000515,
+        "model_upload_s": 0.26849704699998256,
+        "total_elapsed_s": 136.60038378099853,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.22796243955008294,
+        "energy": {
+          "reference_energy": 1193.0449569423322,
+          "error_energy": 61.99881676958154,
+          "actual_energy": 1108.294614789856,
+          "samples": 334067
+        },
+        "tokens_equal": 1529,
+        "tokens_total": 1671,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "BF16",
+            "decoder": "BF16"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      },
+      "if8": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus_low_snr.wav",
+          "sha256": "caebe81d6dc682df234ec6c5f69afd8bdd6d501d457c86defe1997e711e46869",
+          "bytes": 1336348,
+          "case": "bus_low_snr",
+          "role": "fpga_if8",
+          "zip_member": "fpga_if8/bus_low_snr.wav",
+          "samples": 334067,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus_low_snr.tokens.npz",
+          "sha256": "8fdea8ae96d24cea2769e42fb2db4981651f7718991c92f7427a8a20df88ed73",
+          "bytes": 3742
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus_low_snr.metrics.json",
+          "sha256": "d264819820da540f05c80ce62c8f4ec856bf06b0ea994d430f7a7b1d8bdb42a7",
+          "bytes": 2996
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus_low_snr.comparison.json",
+          "sha256": "b2a5d7c148b4a805b41eb8f5ed5872a10d39de0d61d3955dd2c682c432ce8970",
+          "bytes": 1734
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/bus_low_snr_if8.bin",
+          "sha256": "8ecad421f267c42f849d0f16be5d8bcb46a0e2a723467a2155907c0cf125d64c",
+          "bytes": 717705007
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/bus_low_snr_if8.bin",
+          "bin_bytes": 717705007,
+          "bin_sha256": "8ecad421f267c42f849d0f16be5d8bcb46a0e2a723467a2155907c0cf125d64c",
+          "code_frames": 1671,
+          "compile_s": 108.54067189700072,
+          "compiled_samples": 334200,
+          "convolution_precision": "bf16",
+          "instructions": 13218178,
+          "lstm_recurrent_precision": "if8",
+          "native_samples": 334067,
+          "operations": 180,
+          "parameter_bytes": 294682496,
+          "program_bytes": 422981696,
+          "resident_bytes": 717664192,
+          "scratch_bytes": 384998400
+        },
+        "duration_s": 20.8791875,
+        "processing_s": 90.95306304500627,
+        "rtf": 4.356159119937319,
+        "fpga_execution_s": 90.72302763690924,
+        "artifact_load_s": 18.131033143999957,
+        "model_upload_s": 0.2767445610006689,
+        "total_elapsed_s": 125.8824683519997,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.2414116171072295,
+        "energy": {
+          "reference_energy": 1193.0449569423322,
+          "error_energy": 69.53014573828983,
+          "actual_energy": 1109.3372883715888,
+          "samples": 334067
+        },
+        "tokens_equal": 1531,
+        "tokens_total": 1671,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "IF8-INT",
+            "decoder": "IF8-INT"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      }
+    },
+    {
+      "case": "cafe_low_snr",
+      "environment": "Cafe terrace at a public square (SCAFE)",
+      "cohort": "low_snr_new_sources",
+      "nominal_snr_db": [
+        2.5
+      ],
+      "duration_s": 21.465625,
+      "samples": 343450,
+      "compiled_samples": 343600,
+      "input": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_low_snr_noisy.wav",
+        "sha256": "e61711a17c0ee70e99377efde0f7ff1010cbc4673d76b4914e468529cc8ba915",
+        "bytes": 1373880,
+        "case": "cafe_low_snr",
+        "role": "input",
+        "zip_member": "noisy/cafe_low_snr_noisy.wav",
+        "samples": 343450,
+        "sample_rate": 16000
+      },
+      "utterance_ids": [
+        "p232_032",
+        "p232_220",
+        "p232_303",
+        "p257_130",
+        "p257_251",
+        "p257_411"
+      ],
+      "cpu": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.wav",
+          "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c",
+          "bytes": 1373880,
+          "case": "cafe_low_snr",
+          "role": "cpu",
+          "zip_member": "cpu/cafe_low_snr.wav",
+          "samples": 343450,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.tokens.npz",
+          "sha256": "a6c30c5a077a9f0c06f2e3bb45b5d06a28d2be2d0efdbc144ab8196cf6f8ac21",
+          "bytes": 3825
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.metrics.json",
+          "sha256": "b15593ad68ae6c05624baf4a2f1730e0f020fa133ff65b961afc34de7268f97c",
+          "bytes": 2000
+        },
+        "processing_s": 49.84167173199967,
+        "rtf": 2.321929677426102,
+        "duration_s": 21.465625,
+        "finite": true,
+        "tokens_total": 1718,
+        "neural_s": 49.83648778200222,
+        "model_load_s": 1.1297588479992555
+      },
+      "bf16": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe_low_snr.wav",
+          "sha256": "0fa21cd5e7d54901f9c2552487deb113466966bb886a1ae3baba02cfa8009503",
+          "bytes": 1373880,
+          "case": "cafe_low_snr",
+          "role": "fpga_bf16",
+          "zip_member": "fpga_bf16/cafe_low_snr.wav",
+          "samples": 343450,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe_low_snr.tokens.npz",
+          "sha256": "2a623d20a183e361f60bcec997a5fe9132bf69b63aef81eb5a62191ce11802a5",
+          "bytes": 3831
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe_low_snr.metrics.json",
+          "sha256": "6b56c8adf515d24ad55461ad99a7386dfd4ff3986514eecc57724f886021e5a7",
+          "bytes": 2998
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe_low_snr.comparison.json",
+          "sha256": "1b7a526e90d3cc98624d3a8158625c7388ea11f75675e831b1a3520d5df575fc",
+          "bytes": 1737
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/cafe_low_snr_bf16.bin",
+          "sha256": "dc00f87274931730a9bb8b13c9f0d724841ef125487ba933178242acf3fc1abc",
+          "bytes": 784728751
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/cafe_low_snr_bf16.bin",
+          "bin_bytes": 784728751,
+          "bin_sha256": "dc00f87274931730a9bb8b13c9f0d724841ef125487ba933178242acf3fc1abc",
+          "code_frames": 1718,
+          "compile_s": 114.50334946300063,
+          "compiled_samples": 343600,
+          "convolution_precision": "bf16",
+          "instructions": 14169886,
+          "lstm_recurrent_precision": "bf16",
+          "native_samples": 343450,
+          "operations": 180,
+          "parameter_bytes": 331251584,
+          "program_bytes": 453436352,
+          "resident_bytes": 784687936,
+          "scratch_bytes": 395827200
+        },
+        "duration_s": 21.465625,
+        "processing_s": 102.98250868099785,
+        "rtf": 4.79755463355937,
+        "fpga_execution_s": 102.74484342685672,
+        "artifact_load_s": 19.093756107002264,
+        "model_upload_s": 0.3036589750008716,
+        "total_elapsed_s": 141.87532315000135,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.3698864120327447,
+        "energy": {
+          "reference_energy": 1744.519854172468,
+          "error_energy": 238.67815476098752,
+          "actual_energy": 1624.4864791669993,
+          "samples": 343450
+        },
+        "tokens_equal": 1598,
+        "tokens_total": 1718,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "BF16",
+            "decoder": "BF16"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      },
+      "if8": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe_low_snr.wav",
+          "sha256": "bb6e39ddf13aaecc715dc82cad8cdaeca5e8e8e6bfeac435620b520d767e1dae",
+          "bytes": 1373880,
+          "case": "cafe_low_snr",
+          "role": "fpga_if8",
+          "zip_member": "fpga_if8/cafe_low_snr.wav",
+          "samples": 343450,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe_low_snr.tokens.npz",
+          "sha256": "96f9df445e049cabbd1e557e4696c8d2d21b66d11b15ef684c94f4023f006da2",
+          "bytes": 3839
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe_low_snr.metrics.json",
+          "sha256": "0f127d5438096f9583e97bd0cbe365ec72c9ecfed253cb2362e263885385fcfb",
+          "bytes": 2999
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe_low_snr.comparison.json",
+          "sha256": "b3399eed120b2a81bd0dac8ea4b6612049b69ca4d20658e6613a631448a91751",
+          "bytes": 1734
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/cafe_low_snr_if8.bin",
+          "sha256": "65d0a6341dd73faa7d7d598749db0e904d5cb7d5fd713298c718c4c045d4d6d2",
+          "bytes": 729687727
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/cafe_low_snr_if8.bin",
+          "bin_bytes": 729687727,
+          "bin_sha256": "65d0a6341dd73faa7d7d598749db0e904d5cb7d5fd713298c718c4c045d4d6d2",
+          "code_frames": 1718,
+          "compile_s": 110.46308184100053,
+          "compiled_samples": 343600,
+          "convolution_precision": "bf16",
+          "instructions": 13592638,
+          "lstm_recurrent_precision": "if8",
+          "native_samples": 343450,
+          "operations": 180,
+          "parameter_bytes": 294682496,
+          "program_bytes": 434964416,
+          "resident_bytes": 729646912,
+          "scratch_bytes": 395827200
+        },
+        "duration_s": 21.465625,
+        "processing_s": 93.51270256899807,
+        "rtf": 4.356393189995543,
+        "fpga_execution_s": 93.27596838409602,
+        "artifact_load_s": 18.433226003002346,
+        "model_upload_s": 0.2784633470000699,
+        "total_elapsed_s": 129.40412340700277,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.3599434254799226,
+        "energy": {
+          "reference_energy": 1744.519854172468,
+          "error_energy": 226.01871801546423,
+          "actual_energy": 1635.7253352850776,
+          "samples": 343450
+        },
+        "tokens_equal": 1596,
+        "tokens_total": 1718,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "IF8-INT",
+            "decoder": "IF8-INT"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      }
+    },
+    {
+      "case": "office_low_snr",
+      "environment": "Small office with three people using computers (OOFFICE)",
+      "cohort": "low_snr_new_sources",
+      "nominal_snr_db": [
+        2.5
+      ],
+      "duration_s": 21.494375,
+      "samples": 343910,
+      "compiled_samples": 344000,
+      "input": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/office_low_snr_noisy.wav",
+        "sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620",
+        "bytes": 1375720,
+        "case": "office_low_snr",
+        "role": "input",
+        "zip_member": "noisy/office_low_snr_noisy.wav",
+        "samples": 343910,
+        "sample_rate": 16000
+      },
+      "utterance_ids": [
+        "p232_019",
+        "p232_121",
+        "p257_118",
+        "p257_279",
+        "p257_379"
+      ],
+      "cpu": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.wav",
+          "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708",
+          "bytes": 1375720,
+          "case": "office_low_snr",
+          "role": "cpu",
+          "zip_member": "cpu/office_low_snr.wav",
+          "samples": 343910,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.tokens.npz",
+          "sha256": "8c9f828f1cb6d43d0c997af3554fc89f3603577ffa5067dce2ced15ca1e949cc",
+          "bytes": 3847
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.metrics.json",
+          "sha256": "0b81731dbe85f6d5e18f81de09e3d780ff2a11e4cb352a968779078f08b73561",
+          "bytes": 2009
+        },
+        "processing_s": 49.771177397999054,
+        "rtf": 2.3155442946351803,
+        "duration_s": 21.494375,
+        "finite": true,
+        "tokens_total": 1720,
+        "neural_s": 49.766016705001675,
+        "model_load_s": 1.1144509349996952
+      },
+      "bf16": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office_low_snr.wav",
+          "sha256": "5bec2f29e29a90fc25da07749f210198a4566908f040559eca016d39b840bc83",
+          "bytes": 1375720,
+          "case": "office_low_snr",
+          "role": "fpga_bf16",
+          "zip_member": "fpga_bf16/office_low_snr.wav",
+          "samples": 343910,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office_low_snr.tokens.npz",
+          "sha256": "199e5c2c7ca088e0bc9cf3e7ecc8382867e4cc155428c066d67092349d3a2f81",
+          "bytes": 3845
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office_low_snr.metrics.json",
+          "sha256": "0cd7d90668616d95cc67f1f6e45de74ae0e36a7e824b629233723bb398351883",
+          "bytes": 3003
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office_low_snr.comparison.json",
+          "sha256": "0ff9f3e325d36b0770bf2cab9a2eda4a3a422a18d4df6978e04d7e66feca2f60",
+          "bytes": 1748
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/office_low_snr_bf16.bin",
+          "sha256": "e628d359f0acf3517fa1738ecdcc7870270d369ca355f34b00c18f5a20058303",
+          "bytes": 785099375
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/office_low_snr_bf16.bin",
+          "bin_bytes": 785099375,
+          "bin_sha256": "e628d359f0acf3517fa1738ecdcc7870270d369ca355f34b00c18f5a20058303",
+          "code_frames": 1720,
+          "compile_s": 116.53833405299883,
+          "compiled_samples": 344000,
+          "convolution_precision": "bf16",
+          "instructions": 14181468,
+          "lstm_recurrent_precision": "bf16",
+          "native_samples": 343910,
+          "operations": 180,
+          "parameter_bytes": 331251584,
+          "program_bytes": 453806976,
+          "resident_bytes": 785058560,
+          "scratch_bytes": 396288000
+        },
+        "duration_s": 21.494375,
+        "processing_s": 103.09834732099625,
+        "rtf": 4.796526873705155,
+        "fpga_execution_s": 102.86280560540135,
+        "artifact_load_s": 18.879756202000863,
+        "model_upload_s": 0.2731876359976013,
+        "total_elapsed_s": 140.74135058800312,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.19636180733206593,
+        "energy": {
+          "reference_energy": 1951.9118176410761,
+          "error_energy": 75.26173657543912,
+          "actual_energy": 1799.7304155491336,
+          "samples": 343910
+        },
+        "tokens_equal": 1551,
+        "tokens_total": 1720,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "BF16",
+            "decoder": "BF16"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      },
+      "if8": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office_low_snr.wav",
+          "sha256": "bc886065e084a91de896936088455261cc559d4332aff5f217d90c28e096692f",
+          "bytes": 1375720,
+          "case": "office_low_snr",
+          "role": "fpga_if8",
+          "zip_member": "fpga_if8/office_low_snr.wav",
+          "samples": 343910,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office_low_snr.tokens.npz",
+          "sha256": "e228de6673bed167465c929f96a6fe489c4ef92827c3fc0a213843a31813375d",
+          "bytes": 3839
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office_low_snr.metrics.json",
+          "sha256": "a87cb55c1fc36076b8f36d72c07d5619273594be6c56eb5729ace5ca04b49014",
+          "bytes": 3003
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office_low_snr.comparison.json",
+          "sha256": "0605a9bc8782d1acb152950d38d9baa53f94685fdfa7a7d0bbcb27a793fa5efc",
+          "bytes": 1742
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/office_low_snr_if8.bin",
+          "sha256": "429ad5ded4f1f487cbb1fbbe50121c30a01d1b7a689223792779fb9a396597b9",
+          "bytes": 730036847
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/office_low_snr_if8.bin",
+          "bin_bytes": 730036847,
+          "bin_sha256": "429ad5ded4f1f487cbb1fbbe50121c30a01d1b7a689223792779fb9a396597b9",
+          "code_frames": 1720,
+          "compile_s": 111.97667093400014,
+          "compiled_samples": 344000,
+          "convolution_precision": "bf16",
+          "instructions": 13603548,
+          "lstm_recurrent_precision": "if8",
+          "native_samples": 343910,
+          "operations": 180,
+          "parameter_bytes": 294682496,
+          "program_bytes": 435313536,
+          "resident_bytes": 729996032,
+          "scratch_bytes": 396288000
+        },
+        "duration_s": 21.494375,
+        "processing_s": 93.62012252599379,
+        "rtf": 4.355563840585911,
+        "fpga_execution_s": 93.3835183915979,
+        "artifact_load_s": 18.374704281002778,
+        "model_upload_s": 0.2827943660013261,
+        "total_elapsed_s": 130.20258076200116,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.19878503037180362,
+        "energy": {
+          "reference_energy": 1951.9118176410761,
+          "error_energy": 77.13074859246936,
+          "actual_energy": 1811.994324869493,
+          "samples": 343910
+        },
+        "tokens_equal": 1571,
+        "tokens_total": 1720,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "IF8-INT",
+            "decoder": "IF8-INT"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      }
+    },
+    {
+      "case": "psquare_low_snr",
+      "environment": "Public town square with tourists (SPSQUARE)",
+      "cohort": "low_snr_new_sources",
+      "nominal_snr_db": [
+        2.5
+      ],
+      "duration_s": 21.525375,
+      "samples": 344406,
+      "compiled_samples": 344600,
+      "input": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_low_snr_noisy.wav",
+        "sha256": "e44f139883a4570596b455d50eba708ab5e013b86eb6979880da3c6f769f78a8",
+        "bytes": 1377704,
+        "case": "psquare_low_snr",
+        "role": "input",
+        "zip_member": "noisy/psquare_low_snr_noisy.wav",
+        "samples": 344406,
+        "sample_rate": 16000
+      },
+      "utterance_ids": [
+        "p232_023",
+        "p232_275",
+        "p232_295",
+        "p257_022"
+      ],
+      "cpu": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.wav",
+          "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b",
+          "bytes": 1377704,
+          "case": "psquare_low_snr",
+          "role": "cpu",
+          "zip_member": "cpu/psquare_low_snr.wav",
+          "samples": 344406,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.tokens.npz",
+          "sha256": "a72b391be15694edd578b02df15f42df6dbceb65adf34bc2adfab9dbfec0c466",
+          "bytes": 3866
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.metrics.json",
+          "sha256": "dce237107bb012774449af0beb10ec51f46c8c3f452895c21d1f16e96c07be04",
+          "bytes": 2010
+        },
+        "processing_s": 50.406133610000325,
+        "rtf": 2.34170757118054,
+        "duration_s": 21.525375,
+        "finite": true,
+        "tokens_total": 1723,
+        "neural_s": 50.40075613500085,
+        "model_load_s": 1.1364653969994833
+      },
+      "bf16": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare_low_snr.wav",
+          "sha256": "2168a78f5f4280ef38650ad2f424f6c3d6c4dfe5cf3273c53900c77e395987af",
+          "bytes": 1377704,
+          "case": "psquare_low_snr",
+          "role": "fpga_bf16",
+          "zip_member": "fpga_bf16/psquare_low_snr.wav",
+          "samples": 344406,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare_low_snr.tokens.npz",
+          "sha256": "a9f0c9ba2f5c813f72abe11f8f4ccf98364412548ab96ac29d6fed59c135ea1b",
+          "bytes": 3886
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare_low_snr.metrics.json",
+          "sha256": "494fb28b1f87c0ca674ecbe878caaa51cdd58876780803298f514130439149bd",
+          "bytes": 3005
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare_low_snr.comparison.json",
+          "sha256": "607f2747214e866b82faeefeba0ff07be9502ecea4c82905b55e73c8f2946fe6",
+          "bytes": 1749
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/psquare_low_snr_bf16.bin",
+          "sha256": "744b54d8d42c7610797a41289b0cd555feb5bcfea522dda5fbb485cb94d10edd",
+          "bytes": 786040495
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/psquare_low_snr_bf16.bin",
+          "bin_bytes": 786040495,
+          "bin_sha256": "744b54d8d42c7610797a41289b0cd555feb5bcfea522dda5fbb485cb94d10edd",
+          "code_frames": 1723,
+          "compile_s": 114.68938459499986,
+          "compiled_samples": 344600,
+          "convolution_precision": "bf16",
+          "instructions": 14210878,
+          "lstm_recurrent_precision": "bf16",
+          "native_samples": 344406,
+          "operations": 180,
+          "parameter_bytes": 331251584,
+          "program_bytes": 454748096,
+          "resident_bytes": 785999680,
+          "scratch_bytes": 396979200
+        },
+        "duration_s": 21.525375,
+        "processing_s": 103.26765518100365,
+        "rtf": 4.797484605076736,
+        "fpga_execution_s": 103.03281404351088,
+        "artifact_load_s": 19.168949218001217,
+        "model_upload_s": 0.3060875119990669,
+        "total_elapsed_s": 141.57248353400064,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.3217720662442141,
+        "energy": {
+          "reference_energy": 2138.47296125845,
+          "error_energy": 221.41163658504456,
+          "actual_energy": 1973.7857224034346,
+          "samples": 344406
+        },
+        "tokens_equal": 1590,
+        "tokens_total": 1723,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "BF16",
+            "decoder": "BF16"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      },
+      "if8": {
+        "wave": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare_low_snr.wav",
+          "sha256": "f1219516b0d8cf1ebdad77a772d62b2e95cd17f3207986293fa1b235d531273f",
+          "bytes": 1377704,
+          "case": "psquare_low_snr",
+          "role": "fpga_if8",
+          "zip_member": "fpga_if8/psquare_low_snr.wav",
+          "samples": 344406,
+          "sample_rate": 16000
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare_low_snr.tokens.npz",
+          "sha256": "0de2634728de8793a19c3cf16eb3e538c4bbfe0682dd1b8dff9c68eda4536ef4",
+          "bytes": 3887
+        },
+        "metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare_low_snr.metrics.json",
+          "sha256": "e423c4544140360d7755ec9f3dcb784c4569b8668979a7e29fa00d2a26b668ac",
+          "bytes": 3005
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare_low_snr.comparison.json",
+          "sha256": "0c2876a0eba4f751d1c3c936931e5cda299d567e69ce31d7959e3e63e0b080df",
+          "bytes": 1747
+        },
+        "bin": {
+          "path": "models/bigcodec/bigcodec_bin/noisy20s/psquare_low_snr_if8.bin",
+          "sha256": "6d614d06976050af767c89bb6cb2ccc1401ffc41c500bd02ae8c2712a0ab6031",
+          "bytes": 730945711
+        },
+        "compile": {
+          "bin": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/noisy20s/psquare_low_snr_if8.bin",
+          "bin_bytes": 730945711,
+          "bin_sha256": "6d614d06976050af767c89bb6cb2ccc1401ffc41c500bd02ae8c2712a0ab6031",
+          "code_frames": 1723,
+          "compile_s": 110.26335039499827,
+          "compiled_samples": 344600,
+          "convolution_precision": "bf16",
+          "instructions": 13631950,
+          "lstm_recurrent_precision": "if8",
+          "native_samples": 344406,
+          "operations": 180,
+          "parameter_bytes": 294682496,
+          "program_bytes": 436222400,
+          "resident_bytes": 730904896,
+          "scratch_bytes": 396979200
+        },
+        "duration_s": 21.525375,
+        "processing_s": 93.77300134799953,
+        "rtf": 4.3563933891046975,
+        "fpga_execution_s": 93.53606135933984,
+        "artifact_load_s": 18.67053247900185,
+        "model_upload_s": 0.28403098300259444,
+        "total_elapsed_s": 130.0295319680008,
+        "finite": true,
+        "single_start_halt": true,
+        "waveform_relative_l2": 0.24162185479559653,
+        "energy": {
+          "reference_energy": 2138.47296125845,
+          "error_energy": 124.84644809670297,
+          "actual_energy": 1965.1054862260585,
+          "samples": 344406
+        },
+        "tokens_equal": 1592,
+        "tokens_total": 1723,
+        "precision": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "IF8-INT",
+            "decoder": "IF8-INT"
+          }
+        },
+        "source_hash_overrides": {},
+        "source_note": null
+      }
+    }
+  ],
+  "evidence": {
+    "cpu_reference_manifest.json": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu_reference_manifest.json",
+      "sha256": "e43e5618382d2625aa76a4345782459f5a33ed909a27dfd36fa2339b083cc28c",
+      "bytes": 25779
+    },
+    "hardware_runs.json": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/hardware_runs.json",
+      "sha256": "3332b3eaa02e58343729f303be4ab054b7078ed88533de867fdd2f44f3a939fa",
+      "bytes": 37243
+    },
+    "hardware_source_hashes.json": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/hardware_source_hashes.json",
+      "sha256": "aa27f5cd9655b88b0a0f7b2eabfc174e75dd8d3de5db775a9e616f2b1fea0164",
+      "bytes": 3107
+    },
+    "validation_provenance.json": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/validation_provenance.json",
+      "sha256": "0ca8878b246d1a17d684d82be67e41078cadd951bda67a40a2bbde4b23f3e0a7",
+      "bytes": 964
+    },
+    "software_tests.log": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/software_tests.log",
+      "sha256": "466644f56979e8920081c0582e2518ca641a1abb4d9937d97518b5d32c2c62ff",
+      "bytes": 451
+    },
+    "high_dram_smoke.json": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/high_dram_smoke.json",
+      "sha256": "8b1a08d6c771aa3773c9ab349dadae8508df0d27402457647a8da2712c0e7c5d",
+      "bytes": 464
+    },
+    "legacy_layout_hash_verification.json": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/legacy_layout_hash_verification.json",
+      "sha256": "3f15a80a1691cb6626b0dc5ac729d7064d35904fea07ef318f15fdaab7a6527e",
+      "bytes": 670
+    },
+    "independent_audit.json": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/independent_audit.json",
+      "sha256": "5c4b7497e6aa1a7f8b96d8461167ea12c0f9bd4c4da060ee8dc81fda7466ed91",
+      "bytes": 46418
+    }
+  },
+  "generator": {
+    "path": "models/bigcodec/bigcodec_bin/noisy20s/build_report.py",
+    "sha256": "915f6d3e1851cc1cdbb292e3abc3346cf59958e61f36a673f9c271d9c94fb375",
+    "bytes": 30615
+  }
+}

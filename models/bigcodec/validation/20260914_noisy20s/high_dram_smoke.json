@@ -1,0 +1,16 @@
+{
+  "hardware_version": "0x40519e0a",
+  "hw_info_raw": "0x80214d40",
+  "clock_ns": 3.000750187546887,
+  "dram_size_gb": 2,
+  "program_address": 3472883712,
+  "source_address": 3489665024,
+  "output_address": 4294966272,
+  "output_end_exclusive": 4294967296,
+  "instructions": 4,
+  "cycles": 768,
+  "output_bits_match": true,
+  "low_canary_unchanged": true,
+  "program_sha256": "656c055460a16af90d0ba67380f37bdf79b3704d5a884613ad10b43cc3d0f784",
+  "passed": true
+}

@@ -1,0 +1,710 @@
+{
+  "selected_utc": "2026-09-14T06:17:51.199222+00:00",
+  "status": "frozen before selected WAV downloads or model evaluation",
+  "rule": "For each bus,cafe,office,psquare select the minimum number n>=4 of DISTINCT 2.5 dB utterances absent the original twenty. Estimate mono PCM16 duration as (clean ZIP member uncompressed bytes minus44)/96000; require matching clean/noisy member byte lengths and each utterance3..10s. Require at least one p232 and one p257 if any valid combination exists; otherwise allow one speaker. Among minimum-n eligible combinations whose sum plus(n-1)*250ms gaps lies inclusively20..24s, minimize absolute distance to21.5s using integer48k sample counts; ties use lexicographically sorted utterance IDs. Environment order bus,cafe,office,psquare. No repeats, quality scores or model outputs used. The original infeasible four-clip/2+2 preference was relaxed before any selected WAV download.",
+  "source_condition_metadata": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/log_testset.txt",
+  "source_condition_metadata_sha256": "6cb8dc69aac3473bbe8709357411fc9a63c8c1d273938893129300df647d67c0",
+  "source_condition_metadata_url": "https://datashare.ed.ac.uk/server/api/core/bitstreams/11185dc8-9cf1-405b-b858-35bd6a04aedd/content",
+  "excluded_source_manifest": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/cases.json",
+  "excluded_source_manifest_sha256": "81655a2033c2cc8fad20e461861a8ced41de927f1cef8c0fd05787ceced16d4c",
+  "excluded_ids": [
+    "p232_005",
+    "p232_006",
+    "p232_009",
+    "p232_012",
+    "p232_014",
+    "p232_015",
+    "p232_148",
+    "p232_188",
+    "p232_372",
+    "p232_409",
+    "p257_003",
+    "p257_007",
+    "p257_009",
+    "p257_015",
+    "p257_018",
+    "p257_101",
+    "p257_199",
+    "p257_232",
+    "p257_234",
+    "p257_324"
+  ],
+  "original_provenance_sha256": "da2ec363b41431af3aaa1446f4d05eb3232fb8b36e8dc0f769aff9c6ffd11a3d",
+  "acquisition_script_sha256": "7f793447c248d96d5cadc2b870d565ddbf8630b618a14485a066a1022ba0126b",
+  "range_helper_script": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/acquire_voicebank.py",
+  "range_helper_script_sha256": "1d88f68eb09c8eb11c9a2e1ab945e34dda9f09aa585d83c51bf3cef97e09533a",
+  "archive_catalogs_sha256": "c821a7cb94f2ba52dd886869576800ccfc308f42cfc1331c3f8f966ff0aaa661",
+  "archives": {
+    "clean": {
+      "url": "https://datashare.ed.ac.uk/server/api/core/bitstreams/dec213d3-bf57-4777-9663-c24bdce92d5e/content",
+      "bytes": 154332064,
+      "etag": "\"34eb1c0ba7ef667e9b966866c542fc16\"",
+      "member_count": 824
+    },
+    "noisy": {
+      "url": "https://datashare.ed.ac.uk/server/api/core/bitstreams/13c1bfbf-14a6-41db-9b41-8f7310f01ad5/content",
+      "bytes": 170578854,
+      "etag": "\"fb1b86caa31e8ba5b506c0c64da9aab5\"",
+      "member_count": 824
+    }
+  },
+  "environments": [
+    {
+      "environment": "bus",
+      "snr_db": 2.5,
+      "ids": [
+        "p232_216",
+        "p257_004",
+        "p257_207",
+        "p257_247",
+        "p257_307",
+        "p257_367"
+      ],
+      "eligible_counts": {
+        "p232": 1,
+        "p257": 7
+      },
+      "selected_count": 6,
+      "distinct_utterances": true,
+      "speaker_counts": {
+        "p232": 1,
+        "p257": 5
+      },
+      "valid_combinations_at_selected_count": 20,
+      "gap_count": 5,
+      "gap_s": 0.25,
+      "estimated_samples_48k_with_gaps": 1002194,
+      "estimated_duration_s_with_gaps": 20.879041666666666,
+      "distance_to_21_5s": 0.6209583333333333
+    },
+    {
+      "environment": "cafe",
+      "snr_db": 2.5,
+      "ids": [
+        "p232_032",
+        "p232_220",
+        "p232_303",
+        "p257_130",
+        "p257_251",
+        "p257_411"
+      ],
+      "eligible_counts": {
+        "p232": 3,
+        "p257": 4
+      },
+      "selected_count": 6,
+      "distinct_utterances": true,
+      "speaker_counts": {
+        "p232": 3,
+        "p257": 3
+      },
+      "valid_combinations_at_selected_count": 7,
+      "gap_count": 5,
+      "gap_s": 0.25,
+      "estimated_samples_48k_with_gaps": 1030348,
+      "estimated_duration_s_with_gaps": 21.465583333333335,
+      "distance_to_21_5s": 0.034416666666666665
+    },
+    {
+      "environment": "office",
+      "snr_db": 2.5,
+      "ids": [
+        "p232_019",
+        "p232_121",
+        "p257_118",
+        "p257_279",
+        "p257_379"
+      ],
+      "eligible_counts": {
+        "p232": 4,
+        "p257": 8
+      },
+      "selected_count": 5,
+      "distinct_utterances": true,
+      "speaker_counts": {
+        "p232": 2,
+        "p257": 3
+      },
+      "valid_combinations_at_selected_count": 330,
+      "gap_count": 4,
+      "gap_s": 0.25,
+      "estimated_samples_48k_with_gaps": 1031723,
+      "estimated_duration_s_with_gaps": 21.494229166666667,
+      "distance_to_21_5s": 0.0057708333333333335
+    },
+    {
+      "environment": "psquare",
+      "snr_db": 2.5,
+      "ids": [
+        "p232_023",
+        "p232_275",
+        "p232_295",
+        "p257_022"
+      ],
+      "eligible_counts": {
+        "p232": 5,
+        "p257": 3
+      },
+      "selected_count": 4,
+      "distinct_utterances": true,
+      "speaker_counts": {
+        "p232": 3,
+        "p257": 1
+      },
+      "valid_combinations_at_selected_count": 31,
+      "gap_count": 3,
+      "gap_s": 0.25,
+      "estimated_samples_48k_with_gaps": 1033216,
+      "estimated_duration_s_with_gaps": 21.525333333333332,
+      "distance_to_21_5s": 0.025333333333333333
+    }
+  ],
+  "cases": [
+    {
+      "id": "p232_216",
+      "noise": "bus",
+      "snr_db": 2.5,
+      "speaker": "p232",
+      "estimated_samples_48k": 144050,
+      "estimated_duration_s": 3.0010416666666666,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p232_216.wav",
+          "crc32": "410bdc4f",
+          "uncompressed_bytes": 288144,
+          "compressed_bytes": 220875,
+          "compression_type": 8,
+          "local_header_offset": 40324448
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p232_216.wav",
+          "crc32": "74fe3075",
+          "uncompressed_bytes": 288144,
+          "compressed_bytes": 252736,
+          "compression_type": 8,
+          "local_header_offset": 44676364
+        }
+      }
+    },
+    {
+      "id": "p257_004",
+      "noise": "bus",
+      "snr_db": 2.5,
+      "speaker": "p257",
+      "estimated_samples_48k": 174308,
+      "estimated_duration_s": 3.6314166666666665,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p257_004.wav",
+          "crc32": "b5925707",
+          "uncompressed_bytes": 348660,
+          "compressed_bytes": 266149,
+          "compression_type": 8,
+          "local_header_offset": 76282349
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p257_004.wav",
+          "crc32": "77d54162",
+          "uncompressed_bytes": 348660,
+          "compressed_bytes": 301814,
+          "compression_type": 8,
+          "local_header_offset": 84725642
+        }
+      }
+    },
+    {
+      "id": "p257_207",
+      "noise": "bus",
+      "snr_db": 2.5,
+      "speaker": "p257",
+      "estimated_samples_48k": 169431,
+      "estimated_duration_s": 3.5298125,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p257_207.wav",
+          "crc32": "38274659",
+          "uncompressed_bytes": 338906,
+          "compressed_bytes": 268953,
+          "compression_type": 8,
+          "local_header_offset": 114507177
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p257_207.wav",
+          "crc32": "16b8cdd9",
+          "uncompressed_bytes": 338906,
+          "compressed_bytes": 296958,
+          "compression_type": 8,
+          "local_header_offset": 126443211
+        }
+      }
+    },
+    {
+      "id": "p257_247",
+      "noise": "bus",
+      "snr_db": 2.5,
+      "speaker": "p257",
+      "estimated_samples_48k": 148315,
+      "estimated_duration_s": 3.0898958333333333,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p257_247.wav",
+          "crc32": "c2679624",
+          "uncompressed_bytes": 296674,
+          "compressed_bytes": 233299,
+          "compression_type": 8,
+          "local_header_offset": 122107437
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p257_247.wav",
+          "crc32": "b29fbba4",
+          "uncompressed_bytes": 296674,
+          "compressed_bytes": 259587,
+          "compression_type": 8,
+          "local_header_offset": 134737860
+        }
+      }
+    },
+    {
+      "id": "p257_307",
+      "noise": "bus",
+      "snr_db": 2.5,
+      "speaker": "p257",
+      "estimated_samples_48k": 150362,
+      "estimated_duration_s": 3.1325416666666666,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p257_307.wav",
+          "crc32": "6ff9d714",
+          "uncompressed_bytes": 300768,
+          "compressed_bytes": 228271,
+          "compression_type": 8,
+          "local_header_offset": 132691120
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p257_307.wav",
+          "crc32": "cdb4c231",
+          "uncompressed_bytes": 300768,
+          "compressed_bytes": 257485,
+          "compression_type": 8,
+          "local_header_offset": 146504904
+        }
+      }
+    },
+    {
+      "id": "p257_367",
+      "noise": "bus",
+      "snr_db": 2.5,
+      "speaker": "p257",
+      "estimated_samples_48k": 155728,
+      "estimated_duration_s": 3.2443333333333335,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p257_367.wav",
+          "crc32": "41348c37",
+          "uncompressed_bytes": 311500,
+          "compressed_bytes": 235505,
+          "compression_type": 8,
+          "local_header_offset": 142865679
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p257_367.wav",
+          "crc32": "9d70e3ee",
+          "uncompressed_bytes": 311500,
+          "compressed_bytes": 261295,
+          "compression_type": 8,
+          "local_header_offset": 157805972
+        }
+      }
+    },
+    {
+      "id": "p232_032",
+      "noise": "cafe",
+      "snr_db": 2.5,
+      "speaker": "p232",
+      "estimated_samples_48k": 167522,
+      "estimated_duration_s": 3.4900416666666665,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p232_032.wav",
+          "crc32": "926e22bd",
+          "uncompressed_bytes": 335088,
+          "compressed_bytes": 280615,
+          "compression_type": 8,
+          "local_header_offset": 9706760
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p232_032.wav",
+          "crc32": "bae48a2d",
+          "uncompressed_bytes": 335088,
+          "compressed_bytes": 312848,
+          "compression_type": 8,
+          "local_header_offset": 10447888
+        }
+      }
+    },
+    {
+      "id": "p232_220",
+      "noise": "cafe",
+      "snr_db": 2.5,
+      "speaker": "p232",
+      "estimated_samples_48k": 175752,
+      "estimated_duration_s": 3.6615,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p232_220.wav",
+          "crc32": "39d429c5",
+          "uncompressed_bytes": 351548,
+          "compressed_bytes": 268464,
+          "compression_type": 8,
+          "local_header_offset": 41083705
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p232_220.wav",
+          "crc32": "e257c137",
+          "uncompressed_bytes": 351548,
+          "compressed_bytes": 302786,
+          "compression_type": 8,
+          "local_header_offset": 45521336
+        }
+      }
+    },
+    {
+      "id": "p232_303",
+      "noise": "cafe",
+      "snr_db": 2.5,
+      "speaker": "p232",
+      "estimated_samples_48k": 176298,
+      "estimated_duration_s": 3.672875,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p232_303.wav",
+          "crc32": "2009079b",
+          "uncompressed_bytes": 352640,
+          "compressed_bytes": 273676,
+          "compression_type": 8,
+          "local_header_offset": 56313311
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p232_303.wav",
+          "crc32": "dc0dabe2",
+          "uncompressed_bytes": 352640,
+          "compressed_bytes": 314736,
+          "compression_type": 8,
+          "local_header_offset": 62467285
+        }
+      }
+    },
+    {
+      "id": "p257_130",
+      "noise": "cafe",
+      "snr_db": 2.5,
+      "speaker": "p257",
+      "estimated_samples_48k": 152208,
+      "estimated_duration_s": 3.171,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p257_130.wav",
+          "crc32": "8f64210f",
+          "uncompressed_bytes": 304460,
+          "compressed_bytes": 230630,
+          "compression_type": 8,
+          "local_header_offset": 100708777
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p257_130.wav",
+          "crc32": "bd2a3045",
+          "uncompressed_bytes": 304460,
+          "compressed_bytes": 267338,
+          "compression_type": 8,
+          "local_header_offset": 111259526
+        }
+      }
+    },
+    {
+      "id": "p257_251",
+      "noise": "cafe",
+      "snr_db": 2.5,
+      "speaker": "p257",
+      "estimated_samples_48k": 146363,
+      "estimated_duration_s": 3.0492291666666667,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p257_251.wav",
+          "crc32": "8661eea7",
+          "uncompressed_bytes": 292770,
+          "compressed_bytes": 237415,
+          "compression_type": 8,
+          "local_header_offset": 122888677
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p257_251.wav",
+          "crc32": "ed0e071e",
+          "uncompressed_bytes": 292770,
+          "compressed_bytes": 260697,
+          "compression_type": 8,
+          "local_header_offset": 135584270
+        }
+      }
+    },
+    {
+      "id": "p257_411",
+      "noise": "cafe",
+      "snr_db": 2.5,
+      "speaker": "p257",
+      "estimated_samples_48k": 152205,
+      "estimated_duration_s": 3.1709375,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p257_411.wav",
+          "crc32": "d483bb78",
+          "uncompressed_bytes": 304454,
+          "compressed_bytes": 242660,
+          "compression_type": 8,
+          "local_header_offset": 150349849
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p257_411.wav",
+          "crc32": "b8f37e8b",
+          "uncompressed_bytes": 304454,
+          "compressed_bytes": 270274,
+          "compression_type": 8,
+          "local_header_offset": 166129827
+        }
+      }
+    },
+    {
+      "id": "p232_019",
+      "noise": "office",
+      "snr_db": 2.5,
+      "speaker": "p232",
+      "estimated_samples_48k": 323307,
+      "estimated_duration_s": 6.7355625,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p232_019.wav",
+          "crc32": "dbd7b899",
+          "uncompressed_bytes": 646658,
+          "compressed_bytes": 522920,
+          "compression_type": 8,
+          "local_header_offset": 5253712
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p232_019.wav",
+          "crc32": "7db66312",
+          "uncompressed_bytes": 646658,
+          "compressed_bytes": 572979,
+          "compression_type": 8,
+          "local_header_offset": 5654572
+        }
+      }
+    },
+    {
+      "id": "p232_121",
+      "noise": "office",
+      "snr_db": 2.5,
+      "speaker": "p232",
+      "estimated_samples_48k": 147112,
+      "estimated_duration_s": 3.0648333333333335,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p232_121.wav",
+          "crc32": "1b695d3d",
+          "uncompressed_bytes": 294268,
+          "compressed_bytes": 248482,
+          "compression_type": 8,
+          "local_header_offset": 24857446
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p232_121.wav",
+          "crc32": "49628ed4",
+          "uncompressed_bytes": 294268,
+          "compressed_bytes": 268122,
+          "compression_type": 8,
+          "local_header_offset": 27368925
+        }
+      }
+    },
+    {
+      "id": "p257_118",
+      "noise": "office",
+      "snr_db": 2.5,
+      "speaker": "p257",
+      "estimated_samples_48k": 169375,
+      "estimated_duration_s": 3.5286458333333335,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p257_118.wav",
+          "crc32": "8c150398",
+          "uncompressed_bytes": 338794,
+          "compressed_bytes": 262738,
+          "compression_type": 8,
+          "local_header_offset": 98627517
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p257_118.wav",
+          "crc32": "ff8e0f44",
+          "uncompressed_bytes": 338794,
+          "compressed_bytes": 293049,
+          "compression_type": 8,
+          "local_header_offset": 108978552
+        }
+      }
+    },
+    {
+      "id": "p257_279",
+      "noise": "office",
+      "snr_db": 2.5,
+      "speaker": "p257",
+      "estimated_samples_48k": 175040,
+      "estimated_duration_s": 3.6466666666666665,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p257_279.wav",
+          "crc32": "a65083c9",
+          "uncompressed_bytes": 350124,
+          "compressed_bytes": 264648,
+          "compression_type": 8,
+          "local_header_offset": 127978338
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p257_279.wav",
+          "crc32": "331c6ff1",
+          "uncompressed_bytes": 350124,
+          "compressed_bytes": 297781,
+          "compression_type": 8,
+          "local_header_offset": 141227224
+        }
+      }
+    },
+    {
+      "id": "p257_379",
+      "noise": "office",
+      "snr_db": 2.5,
+      "speaker": "p257",
+      "estimated_samples_48k": 168889,
+      "estimated_duration_s": 3.5185208333333335,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p257_379.wav",
+          "crc32": "ef021a30",
+          "uncompressed_bytes": 337822,
+          "compressed_bytes": 266347,
+          "compression_type": 8,
+          "local_header_offset": 144820092
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p257_379.wav",
+          "crc32": "fb562833",
+          "uncompressed_bytes": 337822,
+          "compressed_bytes": 303063,
+          "compression_type": 8,
+          "local_header_offset": 160003813
+        }
+      }
+    },
+    {
+      "id": "p232_023",
+      "noise": "psquare",
+      "snr_db": 2.5,
+      "speaker": "p232",
+      "estimated_samples_48k": 468905,
+      "estimated_duration_s": 9.768854166666667,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p232_023.wav",
+          "crc32": "1f9efe6e",
+          "uncompressed_bytes": 937854,
+          "compressed_bytes": 759827,
+          "compression_type": 8,
+          "local_header_offset": 7181286
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p232_023.wav",
+          "crc32": "e32a9517",
+          "uncompressed_bytes": 937854,
+          "compressed_bytes": 844330,
+          "compression_type": 8,
+          "local_header_offset": 7704065
+        }
+      }
+    },
+    {
+      "id": "p232_275",
+      "noise": "psquare",
+      "snr_db": 2.5,
+      "speaker": "p232",
+      "estimated_samples_48k": 147534,
+      "estimated_duration_s": 3.073625,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p232_275.wav",
+          "crc32": "ecff4548",
+          "uncompressed_bytes": 295112,
+          "compressed_bytes": 229079,
+          "compression_type": 8,
+          "local_header_offset": 51280335
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p232_275.wav",
+          "crc32": "62849d09",
+          "uncompressed_bytes": 295112,
+          "compressed_bytes": 260467,
+          "compression_type": 8,
+          "local_header_offset": 56841633
+        }
+      }
+    },
+    {
+      "id": "p232_295",
+      "noise": "psquare",
+      "snr_db": 2.5,
+      "speaker": "p232",
+      "estimated_samples_48k": 147704,
+      "estimated_duration_s": 3.077166666666667,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p232_295.wav",
+          "crc32": "9384b31c",
+          "uncompressed_bytes": 295452,
+          "compressed_bytes": 237082,
+          "compression_type": 8,
+          "local_header_offset": 55107660
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p232_295.wav",
+          "crc32": "6d5497fd",
+          "uncompressed_bytes": 295452,
+          "compressed_bytes": 272846,
+          "compression_type": 8,
+          "local_header_offset": 61107837
+        }
+      }
+    },
+    {
+      "id": "p257_022",
+      "noise": "psquare",
+      "snr_db": 2.5,
+      "speaker": "p257",
+      "estimated_samples_48k": 233073,
+      "estimated_duration_s": 4.8556875,
+      "archives": {
+        "clean": {
+          "archive_member": "clean_testset_wav/p257_022.wav",
+          "crc32": "45fadcce",
+          "uncompressed_bytes": 466190,
+          "compressed_bytes": 374511,
+          "compression_type": 8,
+          "local_header_offset": 81216340
+        },
+        "noisy": {
+          "archive_member": "noisy_testset_wav/p257_022.wav",
+          "crc32": "0ae70fd7",
+          "uncompressed_bytes": 466190,
+          "compressed_bytes": 404997,
+          "compression_type": 8,
+          "local_header_offset": 89967144
+        }
+      }
+    }
+  ]
+}
