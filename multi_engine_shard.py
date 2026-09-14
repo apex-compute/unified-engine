@@ -1980,7 +1980,7 @@ class MultiEngineScheduler:
         self.end_sharded(join=join)
 
     def reduce_add(self, partial_addrs: list[int], out_addr: int, M: int, N: int,
-                   join: bool = True, parallel: bool = True) -> None:
+                   join: bool = True, parallel: bool = False) -> None:
         """Cross-engine SUM of per-engine partial [M, N] results (K-split join).
 
         Deliberately explicit and deliberately named: this is the ONLY place in
@@ -1991,7 +1991,7 @@ class MultiEngineScheduler:
         Emits: barrier -> (n-1) ``eltwise_core_dram`` ELTWISE_ADD of M*N bf16
         -> barrier (if ``join``).
 
-        ``parallel=True`` (default) SPLITS THOSE ADDS ACROSS EVERY ENGINE by
+        ``parallel=True`` (opt-in; pi05 uses it) SPLITS THOSE ADDS ACROSS EVERY ENGINE by
         row block, so each engine reduces ``M/n`` rows of all n partials and
         the step costs ``(n-1)`` adds of ``M/n x N`` instead of ``(n-1)`` adds
         of ``M x N`` on one engine while the rest idle. At pi05's denoise shape
@@ -2006,17 +2006,16 @@ class MultiEngineScheduler:
         a contiguous ``[M, N]`` buffer, so any row range works and a row slice
         is contiguous (offset ``row * N * bpe``), never strided.
 
-        NUMERICALLY BIT-IDENTICAL to the serial path, which is why this is the
-        default rather than an opt-in. Every output element is still summed
+        NUMERICALLY BIT-IDENTICAL to the serial path. Every output element is still summed
         ``partial[0] + partial[1] + ... + partial[n-1]`` in that exact order;
         only WHICH ENGINE evaluates a given row changes. (A tree reduction
         would be faster still -- log2(n) rounds -- but reassociates, and bf16
         addition is not associative, so it would move results.)
 
         Falls back to the serial path when the split is not expressible: fewer
-        rows than engines, or a row pitch that is not AXI-beat aligned. Pass
-        ``parallel=False`` to force the serial path (A/B measurement, or to
-        reproduce a historical numeric stream exactly).
+        rows than engines, or a row pitch that is not AXI-beat aligned. The
+        serial path is the default so existing callers' emitted programs are
+        unchanged; pass ``parallel=True`` to opt in.
 
         ``partial_addrs[0]`` may alias ``out_addr`` (accumulate in place).
         """
@@ -2078,7 +2077,7 @@ class MultiEngineScheduler:
         # join=False was a statement about the SERIAL emission's guarantees, and
         # those no longer hold. Cost is one rendezvous per reduce (~2 us at ne=12
         # against ~110 us saved on the adds), and it is what makes the optimization
-        # safe to enable by default.
+        # safe to opt into.
         if join or split_ok:
             self.barrier()
 

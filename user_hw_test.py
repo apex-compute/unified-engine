@@ -7592,7 +7592,7 @@ def multi_engine_barrier_latency_test(M: int = 768, K: int = 768, N: int = 768,
                 if ne == 1:
                     pass                       # the single partial IS the result
                 elif barriers:
-                    sched.reduce_add(part_addrs, OUT_ADDR, M, N)
+                    sched.reduce_add(part_addrs, OUT_ADDR, M, N, parallel=True)
                 else:
                     # reduce_add's arithmetic without its two rendezvous, so the
                     # no-barrier leg does the SAME work (its output is garbage by

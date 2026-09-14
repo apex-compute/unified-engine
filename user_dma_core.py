@@ -7406,7 +7406,17 @@ class UnifiedEngine:
         gpr_identity_addr: int = None,
         q_scale: float = None,
         q_pre_scaled: bool = False,
+        V_T_DRAM_ADDR: int = None,
     ) -> int:
+        """``V_T_DRAM_ADDR`` (optional, static-address path only): DRAM address of an
+        ALREADY-TRANSPOSED V, laid out ``[head_dim, aligned_seq_len]`` row-major --
+        exactly what this core's own ``bf16_transpose_core`` step writes into the
+        head of ``SCRATCH_DRAM_ADDR``. When given, that transpose is SKIPPED and the
+        context matmul reads its B operand from here instead; the scratch layout
+        (score plane, scaled Q) is unchanged and the V^T slot of the scratch is
+        simply left unused. The caller owns the buffer's contents and coherence.
+        Use when the same V is attended by many calls (several engines, several
+        steps) so the transpose is done once instead of once per call."""
         bytes_per_element = 2
         if batch > aligned_seq_len:
             raise ValueError(f"unified_attention_core_dynamic: batch must be <= aligned_seq_len, got batch={batch}, aligned_seq_len={aligned_seq_len}")
@@ -7454,18 +7464,24 @@ class UnifiedEngine:
             score_reg = _alloc();   self.generate_instruction_add_imm(src_reg_idx=gpr_scratch_addr, immediate_value=off_score_w, dst_reg_idx=score_reg)
             scaled_q_reg = _alloc(); self.generate_instruction_add_imm(src_reg_idx=gpr_scratch_addr, immediate_value=off_scaled_q_w, dst_reg_idx=scaled_q_reg)
 
-        self.bf16_transpose_core(
-            M=aligned_seq_len,
-            N=head_dim,
-            INPUT_DRAM_ADDR=V_DRAM_ADDR,
-            OUTPUT_DRAM_ADDR=v_t_dram_addr,
-            IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-            gpr_M_reg=gpr_aligned_seq_len_reg,
-            gpr_N_reg=sub_hd_n_reg,
-            gpr_input_addr=gpr_v_addr,
-            gpr_out_addr=v_t_reg,
-            gpr_identity_addr=gpr_identity_addr,
-        )
+        if V_T_DRAM_ADDR is not None:
+            assert gpr_scratch_addr is None and gpr_v_addr is None, (
+                "unified_attention_core_dynamic: V_T_DRAM_ADDR is a static-address "
+                "option; it cannot be combined with gpr_scratch_addr / gpr_v_addr")
+            v_t_dram_addr = V_T_DRAM_ADDR      # caller-built V^T; skip the transpose
+        else:
+            self.bf16_transpose_core(
+                M=aligned_seq_len,
+                N=head_dim,
+                INPUT_DRAM_ADDR=V_DRAM_ADDR,
+                OUTPUT_DRAM_ADDR=v_t_dram_addr,
+                IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+                gpr_M_reg=gpr_aligned_seq_len_reg,
+                gpr_N_reg=sub_hd_n_reg,
+                gpr_input_addr=gpr_v_addr,
+                gpr_out_addr=v_t_reg,
+                gpr_identity_addr=gpr_identity_addr,
+            )
         if q_pre_scaled:
             total_flops = 0
         else:

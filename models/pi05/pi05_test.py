@@ -4801,7 +4801,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # from the previous layer-step). Substitute the never-written zero
             # buffer so the reduce sums exactly the worker partials.
             partials[0] = self.AE_O_PROJ_ZERO_DRAM
-        sched.reduce_add(partials, self.AE_O_PROJ_DRAM, M, H, join=False)
+        sched.reduce_add(partials, self.AE_O_PROJ_DRAM, M, H, join=False, parallel=True)
 
     def _ae_gated_mlp_sharded(self, sched, M, x_dram, la, out_dram, gpr_M_regs, partial_name):
         H, I = self.AE_HIDDEN, self.AE_INTERMEDIATE
@@ -4861,7 +4861,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # NEXT region's opening rendezvous, so the exit barrier is redundant. That
         # halves the barrier count over 180 layer executions (360 instead of 540).
         sched.reduce_add([sched.per_engine_addr(partial_name, i) for i in range(ne)],
-                         out_dram, M, H, join=False)
+                         out_dram, M, H, join=False, parallel=True)
 
     def _ae_sincos_time_embed(self, t_scalar):
         """Host-computed sincos timestep embedding (dim=AE_HIDDEN, matches
