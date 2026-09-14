@@ -7441,6 +7441,330 @@ def llama32_1b_if8_inference_test() -> None:
     )
 
 
+
+class _BarrierStall(RuntimeError):
+    """An engine was left spinning in a FLAG_CHECK (which has no timeout)."""
+
+
+def _sw_reset_engines(engines):
+    """Bare SW_RESET register write on every engine, to recover from a missed
+    rendezvous. Deliberately NOT UnifiedEngine.software_reset(), whose wait_queue()
+    is guaranteed to time out on a still-draining engine and whose
+    init_unified_engine() would land a 16 KB DRAM self-test on live buffers."""
+    import user_dma_core
+    SW_RESET_CMD = 0x80008000
+    for i, ue in enumerate(engines):
+        ue.write_reg32(user_dma_core.UE_QUEUE_CTRL_ADDR, SW_RESET_CMD)
+    for i, ue in enumerate(engines):
+        for _ in range(50):                        # ~0.5 s at 10 ms granularity
+            if not ue.is_queue_busy():
+                break
+            time.sleep(0.01)
+        if ue.is_queue_busy():
+            print(f"     engine {i} STILL busy after SW_RESET -- power-cycle needed")
+
+
+# ---------------------------------------------------------------------------
+# Multi-engine sharding: end-to-end latency vs. rendezvous (barrier) cost
+# ---------------------------------------------------------------------------
+def multi_engine_barrier_latency_test(M: int = 768, K: int = 768, N: int = 768,
+                                      engine_counts=(1, 2, 4, 8, 12),
+                                      modes=("m_split", "n_split", "k_split"),
+                                      rounds: int = 4,
+                                      snr_threshold_db: float = 40.0,
+                                      timeout_seconds: float = 15.0):
+    """Time every multi-engine sharding technique AND the cost of the rendezvous.
+
+    Runs one bf16 ``A @ B^T`` (M x K x N) sharded three ways -- the three modes
+    ``multi_engine_shard.MultiEngineScheduler`` actually implements -- over a
+    sweep of engine counts, and reports where the wall clock goes.
+
+      ``m_split``  row shard.  Engine i owns rows [m0, m0+rows) of A and writes
+                   the matching rows of OUT. Disjoint writes, no reduction.
+      ``n_split``  output-column shard.  Every engine reads all of A; B is
+                   N x K row-major so columns [n0, n0+cols) are a CONTIGUOUS row
+                   block of B, and each engine writes its own dense [M, cols]
+                   buffer (``alloc_col_output``). Host concatenates to check.
+      ``k_split``  reduction shard.  A K-slice of A and of B is strided in DRAM,
+                   so both are PRE-SLICED ON THE HOST and uploaded per engine.
+                   Every engine produces a full [M, N] PARTIAL, combined by
+                   ``reduce_add`` (barrier + (ne-1) eltwise adds on the primary).
+
+    MEASUREMENT.  Each configuration is compiled and run TWICE: once with the
+    symmetric FLAG rendezvous the scheduler normally emits, once with every
+    barrier removed. Both legs execute byte-identical matmuls, so the delta is
+    the rendezvous and nothing else. Three numbers come out of it:
+
+      hw_us       per-engine hardware latency counter (UE_LATENCY_COUNT, reg
+                  0x30). A FLAG_CHECK spin-wait is the engine sitting in one
+                  instruction, so the barrier wait is INSIDE this number.
+      barrier_us  hw_us(with barriers) - hw_us(without), per engine. This is
+                  the answer to "how long is this engine waiting on its peers".
+      host_us     wall clock - max(hw_us). The host side: ne sequential AXI-Lite
+                  launch writes, wait_queue()'s 1 ms poll granularity, and the
+                  Python around it. It is an upper bound on the scheduling
+                  overhead, not a pure measurement -- interpreter time is in it.
+
+    ``spread_us`` (max hw_us - min hw_us) is the load imbalance the barriers are
+    forced to absorb: with a perfectly balanced split it goes to zero and so
+    does barrier_us. A ``blocks``-mode row split at ne=8 over 12 blocks is
+    deliberately uneven (4 engines get 128 rows, 4 get 64), so a non-zero
+    spread here is the expected result, not a bug.
+    """
+    import user_dma_core
+    from multi_engine_shard import MultiEngineScheduler, SRAM_ROW_BYTES
+
+    engine_counts = [int(n) for n in engine_counts]
+    peak = max(engine_counts)
+    assert peak <= 12, f"engine_counts max {peak} exceeds the 12 engines exercised on this device"
+    assert K % UE_VECTOR_SIZE == 0 and N % UE_VECTOR_SIZE == 0, "K and N must be multiples of 64"
+
+    # 12 x 128 MB arenas -> 0x80000000..0xE0000000, inside the 2 GB DRAM window.
+    ARENA        = 0x08000000
+    TENSOR_OFF   = 0x01000000
+    PROGRAM_OFF  = 0x07000000
+    base0 = user_dma_core.DRAM_START_ADDR
+
+    primary = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
+                            params_dram_base=base0,
+                            tensor_dram_base=base0 + TENSOR_OFF,
+                            program_dram_base=base0 + PROGRAM_OFF)
+    # ONE worker pool for the whole sweep: the DRAM allocators live inside these
+    # objects, so rebuilding them per configuration would restart every cursor
+    # and stack config 2's programs on top of config 1's.
+    pool = [UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * 0x00010000,
+                          params_dram_base=base0 + i * ARENA,
+                          tensor_dram_base=base0 + i * ARENA + TENSOR_OFF,
+                          program_dram_base=base0 + i * ARENA + PROGRAM_OFF)
+            for i in range(1, peak)]
+
+    a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
+    b = torch.randn(N, K, dtype=torch.bfloat16)
+    ref = a @ b.T
+
+    rows = []
+
+    def _reset(engines):
+        for ue in engines:
+            ue.reset_tensor_dram_addr()
+            ue.reset_program_dram_addr()
+            ue.clear_capture_buffer()
+
+    def _run(sched, mode, ne, barriers, addrs):
+        """Compile one leg (barriers on/off), execute it, return (wall_us, hw_us[])."""
+        A_ADDR, B_ADDR, OUT_ADDR, part_addrs, bk_addrs, ak_addrs = addrs
+        engines = sched.engines
+
+        for ue in engines:
+            ue.reset_program_dram_addr()
+        primary.start_capture()
+        sched.begin_program()
+        # EXACTLY ONE barrier between consecutive work units, never two in a row.
+        # Adjacent barriers are the re-arming hazard itself: engine A clears for
+        # barrier N and immediately sets for N+1, so engine B -- still walking
+        # barrier N's CHECKs -- sees that NEW 1, passes N spuriously and then
+        # deadlocks at N+1 on a flag that is already gone. k_split hits it first
+        # because reduce_add contributes two more barriers per round.
+        for _round in range(rounds):
+            if barriers and _round > 0 and mode != "k_split":
+                sched.barrier()          # k_split: reduce_add's join IS the separator
+            if mode == "m_split":
+                for i, ue in enumerate(engines):
+                    off, cnt = sched.split_rows(M, mode="blocks")[i]
+                    ue.matmat_mul_core(M=cnt, K=K, N=N,
+                                       A_DRAM_ADDR=A_ADDR + off * K * 2,
+                                       B_DRAM_ADDR=B_ADDR,
+                                       OUTPUT_DRAM_ADDR=OUT_ADDR + off * N * 2)
+            elif mode == "n_split":
+                for i, ue in enumerate(engines):
+                    off, cols = sched.split_cols(N)[i]
+                    ue.matmat_mul_core(M=M, K=K, N=cols,
+                                       A_DRAM_ADDR=A_ADDR,
+                                       B_DRAM_ADDR=B_ADDR + off * K * 2,
+                                       OUTPUT_DRAM_ADDR=sched.col_output_addr("out", i))
+            elif mode == "k_split":
+                for i, ue in enumerate(engines):
+                    _, kc = sched.split_k(K)[i]
+                    ue.matmat_mul_core(M=M, K=kc, N=N,
+                                       A_DRAM_ADDR=ak_addrs[i],
+                                       B_DRAM_ADDR=bk_addrs[i],
+                                       OUTPUT_DRAM_ADDR=part_addrs[i])
+                if ne == 1:
+                    pass                       # the single partial IS the result
+                elif barriers:
+                    sched.reduce_add(part_addrs, OUT_ADDR, M, N, parallel=True)
+                else:
+                    # reduce_add's arithmetic without its two rendezvous, so the
+                    # no-barrier leg does the SAME work (its output is garbage by
+                    # construction and is not checked).
+                    acc = part_addrs[0]
+                    for src in part_addrs[1:]:
+                        primary.eltwise_core_dram(M=M, N=N, dram_a=acc, dram_b=src,
+                                                  dram_out=OUT_ADDR,
+                                                  mode=UE_MODE.ELTWISE_ADD)
+                        acc = OUT_ADDR
+        if barriers and mode != "k_split":
+            sched.barrier()              # single exit join
+        worker_addrs = sched.finalize()
+        primary.generate_instruction_halt()
+        primary.stop_capture()
+        prog = primary.get_program_dram_addr()
+        primary.write_captured_instructions_to_dram(prog)
+        primary.allocate_program_dram(primary.get_capture_instruction_size_bytes())
+
+        t0 = time.perf_counter()
+        sched.start_workers(worker_addrs)
+        primary.start_execute_from_dram(prog)
+        primary.wait_queue(timeout_seconds)
+        for w in sched.workers:
+            w.wait_queue(2.0)     # the primary already absorbed the real wait; a
+                                  # worker still busy here is stuck, not slow
+
+        wall_us = (time.perf_counter() - t0) * 1e6
+        hw_us = [ue.report_latency_in_us() for ue in engines]
+
+        # A missed rendezvous parks an engine in a FLAG_CHECK that has NO timeout,
+        # so the sweep must diagnose and recover rather than stall. UE_INSTRUCTION_CTL
+        # is the retired-instruction count: it says exactly WHERE each engine stopped.
+        stuck = [i for i, ue in enumerate(engines) if ue.is_queue_busy()]
+        if stuck:
+            print(f"  !! {mode} ne={ne} barriers={barriers}: engine(s) {stuck} still busy "
+                  f"after {timeout_seconds:g}s ({len(worker_addrs) + 1} programs, "
+                  f"{primary.get_capture_count()} inst each)")
+            for i, ue in enumerate(engines):
+                print(f"     engine {i}: queue_ctrl=0x{ue.read_reg32(user_dma_core.UE_QUEUE_CTRL_ADDR):08X} "
+                      f"busy={int(ue.is_queue_busy())} "
+                      f"retired={ue.read_reg32(user_dma_core.UE_INSTRUCTION_CTL_ADDR)} "
+                      f"latency={hw_us[i]:.1f}us")
+            _sw_reset_engines(engines)
+            raise _BarrierStall(f"{mode} ne={ne} barriers={barriers}: engines {stuck} "
+                               f"missed a rendezvous")
+        return wall_us, hw_us
+
+    for mode in modes:
+        for ne in engine_counts:
+            if mode == "m_split" and M // UE_VECTOR_SIZE < ne:
+                print(f"[skip] {mode} ne={ne}: M={M} is only {M // UE_VECTOR_SIZE} row block(s)")
+                continue
+            if mode == "n_split" and N // UE_VECTOR_SIZE < ne:
+                print(f"[skip] {mode} ne={ne}: N={N} is only {N // UE_VECTOR_SIZE} col block(s)")
+                continue
+            if mode == "k_split" and K // UE_VECTOR_SIZE < ne:
+                print(f"[skip] {mode} ne={ne}: K={K} is only {K // UE_VECTOR_SIZE} block(s)")
+                continue
+
+            print(f"\n=== multi_engine_barrier_latency: {mode}, {ne} engine(s), "
+                  f"M={M} K={K} N={N}, {rounds} round(s) ===")
+            _reset([primary] + pool)
+            # CLEAR margin. The rendezvous is SET / CHECK(every peer) / margin / CLEAR,
+            # and the window it has to cover is the LAST-arriving engine still walking
+            # its own ne-1 CHECKs after we saw its SET. That window grows with ne, so a
+            # fixed 32 (tuned at ne=2) is not enough at 8 -- clear too early and the
+            # straggler's CHECK never sees our 1 and it spins forever.
+            margin = max(32, 64 * ne)
+            sched = MultiEngineScheduler(primary, num_engines=ne,
+                                         allow_more_than_two_engines=True,
+                                         split_mode="blocks",
+                                         barrier_margin_nops=margin,
+                                         workers=pool[:ne - 1])
+            # A flag left set by an earlier program makes the first CHECK pass
+            # spuriously; this also clears an engine left spinning by a dead run.
+            sched.preclear_flags()
+
+            A_ADDR = primary.allocate_tensor_dram(M * K * 2, align_bytes=SRAM_ROW_BYTES)
+            B_ADDR = primary.allocate_tensor_dram(N * K * 2, align_bytes=SRAM_ROW_BYTES)
+            OUT_ADDR = primary.allocate_tensor_dram(M * N * 2, align_bytes=SRAM_ROW_BYTES)
+            primary.dma_to_accelerator_memory(A_ADDR, a)
+            primary.dma_to_accelerator_memory(B_ADDR, b)
+
+            part_addrs, bk_addrs, ak_addrs = [], [], []
+            if mode == "n_split":
+                sched.alloc_col_output("out", M, N)
+            elif mode == "k_split":
+                # K-slices of A (M x K) and B (N x K) are STRIDED in DRAM -- one gap
+                # per row -- so they cannot be reached by shifting a base address.
+                # Slice and upload them on the host, one contiguous blob per engine.
+                for i, ue in enumerate(sched.engines):
+                    k0, kc = sched.split_k(K)[i]
+                    ak = ue.allocate_tensor_dram(M * kc * 2, align_bytes=SRAM_ROW_BYTES)
+                    bk = ue.allocate_tensor_dram(N * kc * 2, align_bytes=SRAM_ROW_BYTES)
+                    pa = ue.allocate_tensor_dram(M * N * 2, align_bytes=SRAM_ROW_BYTES)
+                    primary.dma_to_accelerator_memory(ak, a[:, k0:k0 + kc].contiguous())
+                    primary.dma_to_accelerator_memory(bk, b[:, k0:k0 + kc].contiguous())
+                    ak_addrs.append(ak); bk_addrs.append(bk); part_addrs.append(pa)
+                if ne == 1:
+                    OUT_ADDR = part_addrs[0]
+            addrs = (A_ADDR, B_ADDR, OUT_ADDR, part_addrs, bk_addrs, ak_addrs)
+
+            try:
+                wall_b, hw_b = _run(sched, mode, ne, True, addrs)
+            except _BarrierStall as e:
+                print(f"  [FAIL] {e}")
+                rows.append((mode, ne, float('nan'), float('nan'), float('nan'),
+                             float('nan'), float('nan'), float('nan'), float('nan')))
+                continue
+
+            # Correctness of the sharding itself, on the barriered (real) leg.
+            if mode == "n_split":
+                cols = [sched.split_cols(N)[i][1] for i in range(ne)]
+                out = torch.cat([sched.engines[i].dma_from_accelerator_memory(
+                    sched.col_output_addr("out", i), (M, cols[i])) for i in range(ne)], dim=1)
+            else:
+                out = primary.dma_from_accelerator_memory(OUT_ADDR, (M, N))
+            snr = calculate_snr(ref, out)
+            print(f"  {mode} ne={ne} SNR: {snr:.2f} dB")
+            assert snr >= snr_threshold_db or snr == float("inf"), \
+                f"{mode} ne={ne} SNR {snr:.2f} dB below {snr_threshold_db:g} dB -- sharding is wrong"
+
+            sched.preclear_flags()      # leg 2 must not inherit leg 1's flag state
+            try:
+                wall_n, hw_n = _run(sched, mode, ne, False, addrs)
+            except _BarrierStall as e:
+                print(f"  [FAIL] {e}")
+                continue
+
+            if min(hw_b) <= 0.0:
+                print(f"  [FAIL] {mode} ne={ne}: engine(s) reported 0 us latency -- the run "
+                      f"was reset out from under it; discarding this row")
+                continue
+            hw_max_b, hw_min_b = max(hw_b), min(hw_b)
+            barrier_us = [hb - hn for hb, hn in zip(hw_b, hw_n)]
+            host_us = wall_b - hw_max_b
+            spread_us = hw_max_b - hw_min_b
+            pct = 100.0 * max(barrier_us) / hw_max_b if hw_max_b else 0.0
+
+            print(f"  wall {wall_b:9.1f} us | hw max {hw_max_b:9.1f} us | "
+                  f"host+poll {host_us:8.1f} us")
+            print(f"  hw per engine (barriers on) : "
+                  f"{', '.join(f'{v:.1f}' for v in hw_b)}")
+            print(f"  hw per engine (barriers off): "
+                  f"{', '.join(f'{v:.1f}' for v in hw_n)}")
+            print(f"  BARRIER WAIT per engine     : "
+                  f"{', '.join(f'{v:.1f}' for v in barrier_us)}")
+            print(f"  imbalance spread {spread_us:.1f} us | worst engine spends "
+                  f"{pct:.1f}% of its runtime in the rendezvous")
+
+            rows.append((mode, ne, wall_b, hw_max_b, host_us, spread_us,
+                         max(barrier_us), pct, snr))
+            record_test(
+                f"multi_engine_barrier_latency+{mode}",
+                f"M={M}, K={K}, N={N}, engines={ne}, rounds={rounds}, "
+                f"wall={wall_b:.0f}us, hw={hw_max_b:.0f}us, host={host_us:.0f}us, "
+                f"barrier={max(barrier_us):.0f}us ({pct:.1f}%), spread={spread_us:.0f}us",
+                snr_db=snr)
+
+    print("\n=== multi-engine sharding latency summary "
+          f"(M={M} K={K} N={N}, {rounds} rounds) ===")
+    print(f"{'mode':<9} {'ne':>3} {'wall us':>10} {'hw us':>10} {'host us':>9} "
+          f"{'spread us':>10} {'barrier us':>11} {'bar %':>7} {'SNR dB':>8}")
+    for r in rows:
+        print(f"{r[0]:<9} {r[1]:>3} {r[2]:>10.1f} {r[3]:>10.1f} {r[4]:>9.1f} "
+              f"{r[5]:>10.1f} {r[6]:>11.1f} {r[7]:>7.1f} {r[8]:>8.2f}")
+
+    _reset([primary] + pool)
+    return rows
+
+
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='User DMA Operations for Unified Engine')
@@ -7452,6 +7776,21 @@ if __name__ == "__main__":
         '--ext',
         action='store_true',
         help='Run the large nested-loop sweeps at the end of the suite (slow).',
+    )
+    parser.add_argument(
+        '--barrier-latency', action='store_true',
+        help='Run ONLY multi_engine_barrier_latency_test: times every multi-engine '
+             'sharding mode (m/n/k split) end to end and reports how much of the '
+             'runtime is the FLAG rendezvous vs. host scheduling, then exits.',
+    )
+    parser.add_argument(
+        '--barrier-engines', type=str, default='1,2,4,8,12',
+        help='Comma-separated engine counts for --barrier-latency. Default: 1,2,4,8,12.',
+    )
+    parser.add_argument(
+        '--barrier-shape', type=str, default='768,768,768',
+        help='M,K,N for --barrier-latency. Default: 768,768,768 (12 blocks of 64 on '
+             'every axis, so all three modes shard 12 ways).',
     )
     parser.add_argument(
         '--multi-core', type=int, default=1,
@@ -7509,6 +7848,16 @@ if __name__ == "__main__":
         write_test_summary(_USER_HW_TEST_SUMMARY)
 
     atexit.register(_atexit_write_test_summary)
+
+    if args.barrier_latency:
+        _bl_M, _bl_K, _bl_N = (int(v) for v in args.barrier_shape.split(','))
+        multi_engine_barrier_latency_test(
+            M=_bl_M, K=_bl_K, N=_bl_N,
+            engine_counts=[int(v) for v in args.barrier_engines.split(',')])
+        write_test_summary(_USER_HW_TEST_SUMMARY)
+        atexit.unregister(_atexit_write_test_summary)
+        sys.stdout.flush()
+        os._exit(0)
 
     software_reset_test(cores=args.multi_core)
     dram_read_write_speed_test()
@@ -7826,6 +8175,15 @@ if __name__ == "__main__":
         multi_core_dram_speed_test(data_size_kB=512, num_engines=engine_count)
         matmat_mul_multi_cores_unified_test(runtime_list=[(6144, 1024, 1024)], num_engines=engine_count)
         quantized_matmat_mul_multi_cores_test(runtime_list=[(1, 1536, 6144)], num_engines=engine_count)
+        # Each engine reads its own DRAM buffer, then all engines hammer the
+        # same DRAM buffer (concurrent reads to a single memory location).
+        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=engine_count)
+        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=engine_count,
+                                                shared_read=True)
+        # Where the wall clock goes once the work is sharded: end-to-end latency
+        # per sharding mode, minus the same program with every barrier removed.
+        multi_engine_barrier_latency_test(
+            engine_counts=tuple(c for c in (1, 2, 4, 8, 12) if c <= engine_count))
 
     # --- Systolic core tests are disabled until HW_INFO exposes systolic presence ---
     # Run last, after all andromeda-core coverage, so a systolic-specific

@@ -628,8 +628,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         d1_k, d1_b = _load(f"{pfx}.MlpBlock_0.Dense_1.kernel"), _load(f"{pfx}.MlpBlock_0.Dense_1.bias")
 
         self.vis_layer_addrs = []
+        # Packed q4_64 wire bytes of every layer matmul weight, kept on the host so
+        # _vis_alloc_weight_copies can re-upload them as private per-engine sets
+        # WITHOUT re-quantizing (the copies are byte-identical to set 0).
+        self._vis_packed_layer_blobs = []
+
+        def _store_q4_keep(blobs, key, mat_nk):
+            packed, _ = _mlc_quantize_q4_64(mat_nk.to(torch.bfloat16).contiguous())
+            blobs[key] = bytes(packed.tobytes() if hasattr(packed, "tobytes") else packed)
+            return store_quantized_weight(self, packed)
+
         for l in range(27):
             la = {}
+            blobs = {}
             la['ln0_w'] = store_weight(self, ln0_w[l])
             la['ln0_b'] = store_weight(self, ln0_b[l])
             la['ln1_w'] = store_weight(self, ln1_w[l])
@@ -650,12 +661,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 return k_pad.reshape(H, NH * DP).T, b_pad.reshape(NH * DP)  # (N,K), (N)
 
             qk, qb = _pad_proj(q_k[l], q_b[l], q_scale)
-            la['q_scale'], la['q_data'] = _store_q4(qk)
+            la['q_scale'], la['q_data'] = _store_q4_keep(blobs, 'q', qk)
             la['q_bias'] = store_weight(self, qb)
 
             for short, kk_l, kb_l in (('k', k_k[l], k_b[l]), ('v', v_k[l], v_b[l])):
                 kk, kb = _pad_proj(kk_l, kb_l)
-                la[f'{short}_scale'], la[f'{short}_data'] = _store_q4(kk)
+                la[f'{short}_scale'], la[f'{short}_data'] = _store_q4_keep(blobs, short, kk)
                 la[f'{short}_bias'] = store_weight(self, kb)
 
             # Out projection: pad each head's INPUT block D->DP (zero rows) to match the
@@ -665,7 +676,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             o_pad = torch.zeros(NH, DP, H, dtype=o3d.dtype)
             o_pad[:, :D, :] = o3d
             ok = o_pad.reshape(NH * DP, H).T                    # (N=H, K=NH*DP)
-            la['o_scale'], la['o_data'] = _store_q4(ok)
+            la['o_scale'], la['o_data'] = _store_q4_keep(blobs, 'o', ok)
             la['o_bias'] = store_weight(self, o_b[l])
 
             # fc1 (Dense_0): pad OUTPUT width I->IP with zero columns/bias so fc1's own
@@ -675,19 +686,20 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             d0k_pad[:, :I] = d0_k[l]
             d0b_pad = torch.zeros(IP, dtype=d0_b.dtype)
             d0b_pad[:I] = d0_b[l]
-            la['fc1_scale'], la['fc1_data'] = _store_q4(d0k_pad.T)          # [4352,1152] (N,K)
+            la['fc1_scale'], la['fc1_data'] = _store_q4_keep(blobs, 'fc1', d0k_pad.T)   # [4352,1152] (N,K)
             la['fc1_bias'] = store_weight(self, d0b_pad)
 
             # fc2 (Dense_1): pad INPUT (K) I->IP with zero rows (fc1's padded zero columns
             # contribute exactly 0 through these zero weight rows).
             d1k_pad = torch.zeros(IP, H, dtype=d1_k.dtype)
             d1k_pad[:I] = d1_k[l]
-            la['fc2_scale'], la['fc2_data'] = _store_q4(d1k_pad.T)          # [1152,4352] (N,K)
+            la['fc2_scale'], la['fc2_data'] = _store_q4_keep(blobs, 'fc2', d1k_pad.T)   # [1152,4352] (N,K)
             la['fc2_bias'] = store_weight(self, d1_b[l])
             if _vis_nk > 1:
                 la['fc2_k'] = _store_q4_k(d1k_pad.T.contiguous())
 
             self.vis_layer_addrs.append(la)
+            self._vis_packed_layer_blobs.append(blobs)
 
         self.vis_encoder_norm_w = store_weight(self, _load("PaliGemma.img.Transformer.encoder_norm.scale"))
         self.vis_encoder_norm_b = store_weight(self, _load("PaliGemma.img.Transformer.encoder_norm.bias"))
@@ -784,8 +796,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # gate/up slice along N (whole output rows of the (N,K) matrix), so the
             # q4_64 blocking -- which runs along K -- is untouched. down slices along
             # K, and each lane is re-quantized over its OWN K-slice; that is exactly
-            # what the lo/hi code already did, and FF_LANE % 64 == 0 (enforced in
-            # _prefix_mlp_lanes) guarantees no scale block is ever cut in half.
+            # what the lo/hi code already did, and every lane boundary being a whole
+            # 64-block (guaranteed by _col_split inside _prefix_mlp_lane_split, however
+            # uneven the widths) means no scale block is ever cut in half.
             #
             # STORE ORDER IS LOAD-BEARING: all gates, then all ups, then all downs.
             # At lanes == 2 that reproduces the historical
@@ -795,16 +808,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             up_2d = gate_up_all[l, 1].transpose(0, 1)
             down_2d = down_all[l].transpose(0, 1)         # (2048,16384) = (N,K)
             lanes, _ = self._prefix_mlp_lanes()
-            FF_LANE = gate_2d.shape[0] // lanes
-            for i in range(lanes):
-                sl = slice(i * FF_LANE, (i + 1) * FF_LANE)
-                la[f"gate_l{i}_scale"], la[f"gate_l{i}_data"] = self._quant_store(gate_2d[sl].contiguous())
-            for i in range(lanes):
-                sl = slice(i * FF_LANE, (i + 1) * FF_LANE)
-                la[f"up_l{i}_scale"], la[f"up_l{i}_data"] = self._quant_store(up_2d[sl].contiguous())
-            for i in range(lanes):
-                sl = slice(i * FF_LANE, (i + 1) * FF_LANE)
-                la[f"down_l{i}_scale"], la[f"down_l{i}_data"] = self._quant_store(down_2d[:, sl].contiguous())
+            lane_split = self._prefix_mlp_lane_split(lanes)
+            assert sum(w for _, w in lane_split) == gate_2d.shape[0]
+            # gate/up cut along N (axis 0 of the (N,K) matrix -- whole output rows),
+            # down cuts along K (axis 1 of ITS (N,K) = the 16384 side). Do NOT swap.
+            for i, (c0, w) in enumerate(lane_split):
+                la[f"gate_l{i}_scale"], la[f"gate_l{i}_data"] = self._quant_store(gate_2d[c0:c0 + w].contiguous())
+            for i, (c0, w) in enumerate(lane_split):
+                la[f"up_l{i}_scale"], la[f"up_l{i}_data"] = self._quant_store(up_2d[c0:c0 + w].contiguous())
+            for i, (c0, w) in enumerate(lane_split):
+                la[f"down_l{i}_scale"], la[f"down_l{i}_data"] = self._quant_store(down_2d[:, c0:c0 + w].contiguous())
 
             self.lm_layer_addrs.append(la)
         print(f"_weight_init_lm_prefix: {self.NUM_LAYERS} layers loaded")
@@ -853,11 +866,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # Total gate/up/mult bytes are INVARIANT in the lane count (lanes *
         # S*(I/lanes) == S*I); only the partials grow, by (lanes-2) * S*H*bpe.
         lanes, mlp_col_split = self._prefix_mlp_lanes()
-        FF_LANE = I // lanes
+        lane_split = self._prefix_mlp_lane_split(lanes)
         self.PREFIX_MLP_LANES_RESOLVED = lanes
-        self.LAYER0_MLP_GATE_DRAM = [self.allocate_tensor_dram(S * FF_LANE * bpe) for _ in range(lanes)]
-        self.LAYER0_MLP_UP_DRAM   = [self.allocate_tensor_dram(S * FF_LANE * bpe) for _ in range(lanes)]
-        self.LAYER0_MLP_MULT_DRAM = [self.allocate_tensor_dram(S * FF_LANE * bpe) for _ in range(lanes)]
+        self.PREFIX_MLP_LANE_SPLIT_RESOLVED = lane_split
+        # Each lane buffer is sized by ITS OWN width -- widths are non-uniform when
+        # lanes does not divide I evenly. The TOTAL is still S*I whatever the count.
+        self.LAYER0_MLP_GATE_DRAM = [self.allocate_tensor_dram(S * w * bpe) for _, w in lane_split]
+        self.LAYER0_MLP_UP_DRAM   = [self.allocate_tensor_dram(S * w * bpe) for _, w in lane_split]
+        self.LAYER0_MLP_MULT_DRAM = [self.allocate_tensor_dram(S * w * bpe) for _, w in lane_split]
         self.LAYER0_MLP_PARTIAL_DRAM = [self.allocate_tensor_dram(S * H * bpe) for _ in range(lanes)]
         # Ping-pong accumulators for the lanes-1 partial adds. eltwise with OUT
         # aliasing either input is a CONFIRMED HANG (see compile_prefix), so the
@@ -1539,9 +1555,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         _lanes, _csplit = self._prefix_mlp_lanes(ne)
         if _csplit:
+            _w = [w for _, w in self._prefix_mlp_lane_split(_lanes)]
+            _wdesc = (f"{_w[0]}" if len(set(_w)) == 1
+                      else f"{min(_w)}-{max(_w)} (" + "+".join(
+                          f"{_w.count(v)}x{v}" for v in sorted(set(_w), reverse=True)) + ")")
             print(f"    [prefix] MLP COLUMN-LANE split: {_lanes} lanes of "
-                  f"{self.INTERMEDIATE_SIZE // _lanes} cols, one per engine, each at "
-                  f"full S={S} -> perfectly balanced (vs the {[c for _, c in splits]} "
+                  f"{_wdesc} cols, one per engine, each at "
+                  f"full S={S} -> {100.0 * (self.INTERMEDIATE_SIZE / _lanes) / max(_w):.0f}% "
+                  f"balanced (vs the {[c for _, c in splits]} "
                   f"row split); {_lanes - 1} partial adds + 2 rendezvous/layer")
         else:
             print(f"    [prefix] MLP column lanes: {_lanes} (walked per-engine over "
@@ -1614,6 +1635,32 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 self._dram_copy(head_bytes, self.LAYER0_ATTN_OUT_DRAM + h * head_bytes,
                                  self.PREFIX_L0_SNAPSHOT_DRAM[f"head{h}"])
 
+    def _prefix_permute_rows(self, ue, S, NH, D, rows, row_offset, src, dst, to_head_major):
+        """THIS engine's rows [row_offset, row_offset+rows) of the (S, NH, D) <->
+        (NH, S, D) permute, as NH strided DMAs through SRAM (64-row chunks).
+        to_head_major=True : src token-major (S, NH*D) -> dst head-major (NH, S, D)
+        to_head_major=False: src head-major (NH, S, D) -> dst token-major (S, NH*D)
+        Bit-exact data movement; every DRAM base below is a multiple of D*2 bytes."""
+        bpe = 2
+        H = NH * D
+        for h in range(NH):
+            for r0 in range(0, rows, 64):
+                take = min(64, rows - r0)
+                n = take * D
+                tm = src if to_head_major else dst
+                hm = dst if to_head_major else src
+                tm_addr = tm + (row_offset + r0) * H * bpe + h * D * bpe      # strided rows
+                hm_addr = hm + h * S * D * bpe + (row_offset + r0) * D * bpe   # contiguous block
+                assert tm_addr % 32 == 0 and hm_addr % 32 == 0, "strided DMA base must be AXI-beat aligned"
+                if to_head_major:
+                    ue.accelerator_memory_to_sram(tm_addr, 0x00000, n,
+                                                  stride_bytes_per_chunk=D * bpe, stride_jump_bytes=H * bpe)
+                    ue.sram_to_accelerator_memory(0x00000, hm_addr, n)
+                else:
+                    ue.accelerator_memory_to_sram(hm_addr, 0x00000, n)
+                    ue.sram_to_accelerator_memory(0x00000, tm_addr, n,
+                                                  stride_bytes_per_chunk=D * bpe, stride_jump_bytes=H * bpe)
+
     def _emit_prefix_body(self, ue, engine_idx, ne, row_offset, rows, S, prefix_attn_scratch):
         """Emit ONE engine's complete prefix program over rows
         [row_offset, row_offset+rows) of the S prefix tokens.
@@ -1632,7 +1679,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
               RH = row_offset*H*2      INPUT, LAYER_OUT, PRE_NORM, Q, ATTN_RESULT,
                                        O_PROJ, ATTN_RESIDUAL, MLP_DOWN*
               RK = row_offset*KV*2     K_PROJ, V_PROJ            (KV = 256 -> 512B)
-              RF = row_offset*FF_LANE*2  MLP_{GATE,UP,MULT}[lane] (-> 16KB)
+              LF = row_offset*width[lane]*2  MLP_{GATE,UP,MULT}[lane]
+                                       (computed inline; per-lane widths are
+                                       NOT uniform -- see _prefix_mlp_lane_split)
           PER_ENGINE               ``prefix_attn_scratch``, a LIST indexed by
                                    engine_idx: the head-sharded attention core
                                    WRITES its scratch, so one shared buffer would
@@ -1645,10 +1694,30 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         HEADS, NOT ROWS, for attention: a row block of Q needs ALL S rows of K/V,
         so the row split does not apply. See _emit_prefix_attention.
         """
-        H, I, D = self.HIDDEN_SIZE, self.INTERMEDIATE_SIZE, self.HEAD_DIM
+        H, D = self.HIDDEN_SIZE, self.HEAD_DIM
         NH, KV = self.NUM_HEADS, self.NUM_KV_HEADS * self.HEAD_DIM
         lanes, mlp_col_split = self._prefix_mlp_lanes(ne)
-        FF_LANE = I // lanes
+        # The gate/up/down blobs were SLICED host-side at weight-init using this same
+        # lane count (PREFIX_MLP_LANES_RESOLVED). If anything moved PREFIX_NUM_ENGINES
+        # or PREFIX_MLP_LANES between then and now -- a reconfigure, a run_from_bin
+        # with different flags -- we would index an 8192-wide gate_l0 blob as if it
+        # were 2048 wide. Silent wrong math, not an error. Same guard the action
+        # expert's mlp_down_k slices carry.
+        _resolved = getattr(self, "PREFIX_MLP_LANES_RESOLVED", None)
+        assert _resolved is None or lanes == _resolved, (
+            f"prefix MLP lane count changed after weight-init: blobs were sliced for "
+            f"{_resolved} lane(s), emission wants {lanes}. The host slice and the "
+            f"runtime shard must agree exactly.")
+        widths = [w for _, w in self._prefix_mlp_lane_split(lanes)]
+        # A matching lane COUNT is not enough now that widths can be non-uniform:
+        # compare the actual BOUNDARY LISTS, exactly as the action expert's
+        # _ae_mlp_down_k_split guard does. A boundary disagreement is finite-but-
+        # wrong output, never a crash.
+        _resolved_split = getattr(self, "PREFIX_MLP_LANE_SPLIT_RESOLVED", None)
+        assert (_resolved_split is None
+                or list(map(tuple, _resolved_split)) == self._prefix_mlp_lane_split(lanes)), (
+            f"prefix MLP lane boundaries changed after weight-init: blobs were cut at "
+            f"{_resolved_split} but emission shards by {self._prefix_mlp_lane_split(lanes)}.")
         bpe = 2
         is_primary = engine_idx == 0
 
@@ -1656,10 +1725,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # literal -- never a runtime GPR (the ue_selector _addr_tmp clobber class).
         RH = row_offset * H * bpe
         RK = row_offset * KV * bpe
-        # Lane-buffer row offset. Used only on the NON-column-split path, where every
-        # engine walks all lanes over its own row shard; when mlp_col_split is on the
-        # lanes run at full S and the offset is 0 (computed inline as LF).
-        RF = row_offset * FF_LANE * bpe
+        # NOTE: there is no single lane-buffer row pitch any more -- lanes have
+        # DIFFERENT widths, so the offset is per-lane and computed inline as LF in
+        # the lane loop below (0 on the column-split path, which runs at full S).
         assert rows % self.PREFIX_ROW_ALIGN == 0, (
             f"shard row count {rows} must be {self.PREFIX_ROW_ALIGN}-aligned")
 
@@ -1687,6 +1755,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # Only the matmul-RoPE path is sharded; the legacy per-row cores stay whole
         # on the primary (they are DMA-latency bound and being retired anyway).
         rope_shard = bool(self.PREFIX_ROPE_SHARD and ne > 1 and self.USE_MATMUL_ROPE)
+        # PREFIX_SHARD_PRIMARY (see the class attribute): the default-RoPE primary
+        # region becomes per-engine row work; the output permute does in both modes.
+        shard_primary = bool(self.PREFIX_SHARD_PRIMARY and ne > 1 and not self.USE_MATMUL_ROPE)
+        shard_out_permute = bool(self.PREFIX_SHARD_PRIMARY and ne > 1)
+        if is_primary and shard_out_permute:
+            _original_print(f"    [prefix] primary-only region row-sharded: rope/Q-permute/KV-staging="
+                            f"{'yes' if shard_primary else 'no (matmul RoPE path keeps PREFIX_ROPE_SHARD)'}, "
+                            f"attn-out permute=yes; barriers per layer -{1 if shard_primary else 0}"
+                            f"{' -1' if mlp_col_split else ''}")
         if rope_shard:
             q_off, q_rows = self._col_split(NH * S, ne, align=self.PREFIX_ROW_ALIGN)[engine_idx]
             k_off, k_rows = self._col_split(S, ne, align=self.PREFIX_ROW_ALIGN)[engine_idx]
@@ -1749,15 +1826,46 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     self._dram_copy(S * KV * bpe, self.LAYER0_K_PROJ_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["k_proj"])
                     self._dram_copy(S * KV * bpe, self.LAYER0_V_PROJ_DRAM, self.PREFIX_L0_SNAPSHOT_DRAM["v_proj"])
 
+                if shard_primary:
+                    # ---- [ROW-SHARDED] RoPE on Q (gqa) and K, Q permute, KV staging:
+                    # every operand is THIS engine's own rows (just written above), so
+                    # no rendezvous is needed here; #A before attention fences it all.
+                    # The rope table is one [cos|sin] row of 2*D per position.
+                    _rt = row_offset * 2 * D * bpe
+                    ue.rope_hf_core_dram_gqa(
+                        M=rows, group_size=NH, N=D,
+                        input_dram_addr=self.LAYER0_Q_DRAM + RH,
+                        output_dram_addr=self.LAYER0_Q_ROPE_DRAM + RH,
+                        cos_dram_addr=self.PREFIX_ROPE_ADDR + _rt,
+                        sin_dram_addr=self.PREFIX_ROPE_ADDR + _rt + self.ROPE_SIN_OFFSET,
+                        gpr_M_reg=prefix_R_reg)
+                    ue.rope_hf_core_dram(
+                        M=rows, N=D,
+                        input_dram_addr=self.LAYER0_K_PROJ_DRAM + RK,
+                        output_dram_addr=self.LAYER0_K_ROPE_DRAM + RK,
+                        cos_dram_addr=self.PREFIX_ROPE_ADDR + _rt,
+                        sin_dram_addr=self.PREFIX_ROPE_ADDR + _rt + self.ROPE_SIN_OFFSET,
+                        gpr_M_reg=prefix_R_reg)
+                    self._prefix_permute_rows(ue, S, NH, D, rows, row_offset,
+                                              self.LAYER0_Q_ROPE_DRAM, self.LAYER0_Q_PERM_DRAM,
+                                              to_head_major=True)
+                    _kc = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE
+                    _vc = self.LAYER0_V_DRAM + layer_idx * self.KV_LAYER_STRIDE
+                    self._dram_copy(rows * KV * bpe, self.LAYER0_K_ROPE_DRAM + RK, _kc + RK, ue=ue)
+                    self._dram_copy(rows * KV * bpe, self.LAYER0_V_PROJ_DRAM + RK, _vc + RK, ue=ue)
+
                 # ---- RENDEZVOUS #1: everything below reads ALL S rows of Q /
                 # K_PROJ / V_PROJ, which were just written SHARDED.
-                self._vis_barrier(ue, engine_idx, ne)
+                # (Not needed under shard_primary: nothing reads a peer's rows
+                # before rendezvous #A.)
+                if not shard_primary:
+                    self._vis_barrier(ue, engine_idx, ne)
 
                 # ---- SINGLE-ENGINE REGION (primary, full S) ------------------
                 # RoPE, the Q permute and the KV-cache staging. Attention itself
                 # is head-sharded below (rendezvous #A/#B); the attn-output
                 # permute after it returns to the primary.
-                if is_primary:
+                if is_primary and not shard_primary:
                     # 2b/3. PERMUTE-THEN-RoPE on Q, and RoPE on K (Gemma rotates
                     # BOTH, every layer -- openpi gemma.py:203/206). Positions come
                     # from cumsum(mask)-1, so the masked image slot freezes the
@@ -1843,7 +1951,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                                       rot_dram=self.PREFIX_ROPE_ROT_K_DRAM + _kb,
                                       gpr_M_reg=prefix_KR_reg, ue=ue)
 
-                if rope_shard or is_primary:
+                if (rope_shard or is_primary) and not shard_primary:
                     # 4. stage this layer's K/V into the persistent KV cache. Each engine
                     # copies ONLY its own K row range, to the SAME absolute addresses the
                     # single-engine build used, so the cache layout stays byte-identical
@@ -1900,7 +2008,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # disjoint slice of (RAW).
                 self._vis_barrier(ue, engine_idx, ne)
 
-                if is_primary:
+                if shard_out_permute:
+                    # 6. [ROW-SHARDED] permute attn output (heads, seq, head_dim) ->
+                    #    (seq, heads*head_dim) for THIS engine's rows: reads every
+                    #    head's block (fenced by #B above), writes only its own rows
+                    #    of ATTN_RESULT, which only its own o-projection reads.
+                    self._prefix_permute_rows(ue, S, NH, D, rows, row_offset,
+                                              self.LAYER0_ATTN_OUT_DRAM, self.LAYER0_ATTN_RESULT_DRAM,
+                                              to_head_major=False)
+                elif is_primary:
                     # 6. permute attn output (heads, seq, head_dim) -> (seq, heads*head_dim)
                     smart_bf16_permute_core(ue, (NH, S, D), [1, 0, 2],
                                              self.LAYER0_ATTN_OUT_DRAM, self.LAYER0_ATTN_RESULT_DRAM)
@@ -1912,7 +2028,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # ATTN_RESULT, written by the primary above (RAW); it is also the
                 # WAR fence keeping a worker out of layer i+1's Q/K/V projections
                 # while the primary is still reading layer i's.
-                self._vis_barrier(ue, engine_idx, ne)
+                # Under shard_out_permute the o-projection reads rows this engine
+                # wrote itself, and the MLP's #C/#D rendezvous (column-split path)
+                # already fence layer i+1's projections against layer i's readers.
+                if not (shard_out_permute and mlp_col_split):
+                    self._vis_barrier(ue, engine_idx, ne)
 
                 # 7. output projection + residual  [SHARDED]
                 # (non-aliased: OUT distinct from both inputs -- in-place eltwise is a
@@ -1948,7 +2068,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 #                        the historical FF_HALF code.
                 #   mlp_col_split True   engine e computes ONLY lane e, at FULL S. The
                 #                        row imbalance disappears because every engine
-                #                        does exactly S x FF_LANE of work.
+                #                        does exactly S x width[e] of work.
                 if mlp_col_split:
                     # RENDEZVOUS #C: the lanes read ALL S rows of LAYER0_PRE_NORM_DRAM,
                     # which was just written ROW-SHARDED by every engine (RAW).
@@ -1958,19 +2078,20 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     lane_ids, lane_M, lane_row, lane_Mreg = range(lanes), rows, RH, prefix_R_reg
 
                 for i in lane_ids:
-                    LF = 0 if mlp_col_split else row_offset * FF_LANE * bpe
-                    self._matmul(M=lane_M, K=H, N=FF_LANE, A=self.LAYER0_PRE_NORM_DRAM + lane_row,
+                    w = widths[i]           # THIS lane's width; NOT uniform in general
+                    LF = 0 if mlp_col_split else row_offset * w * bpe
+                    self._matmul(M=lane_M, K=H, N=w, A=self.LAYER0_PRE_NORM_DRAM + lane_row,
                                  proj=f"gate_l{i}", la=la,
                                  OUT=self.LAYER0_MLP_GATE_DRAM[i] + LF, gelu_enable=True,
                                  gpr_M_reg=lane_Mreg, ue=ue)
-                    self._matmul(M=lane_M, K=H, N=FF_LANE, A=self.LAYER0_PRE_NORM_DRAM + lane_row,
+                    self._matmul(M=lane_M, K=H, N=w, A=self.LAYER0_PRE_NORM_DRAM + lane_row,
                                  proj=f"up_l{i}", la=la,
                                  OUT=self.LAYER0_MLP_UP_DRAM[i] + LF, gpr_M_reg=lane_Mreg, ue=ue)
-                    eltwise_mul_core_dram(ue, lane_M * FF_LANE,
+                    eltwise_mul_core_dram(ue, lane_M * w,
                                           self.LAYER0_MLP_GATE_DRAM[i] + LF,
                                           self.LAYER0_MLP_UP_DRAM[i] + LF,
                                           self.LAYER0_MLP_MULT_DRAM[i] + LF)
-                    self._matmul(M=lane_M, K=FF_LANE, N=H, A=self.LAYER0_MLP_MULT_DRAM[i] + LF,
+                    self._matmul(M=lane_M, K=w, N=H, A=self.LAYER0_MLP_MULT_DRAM[i] + LF,
                                  proj=f"down_l{i}", la=la,
                                  OUT=self.LAYER0_MLP_PARTIAL_DRAM[i] + lane_row,
                                  gpr_M_reg=lane_Mreg, ue=ue)
@@ -2084,21 +2205,69 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     NUM_ENGINES = 1
 
     # What `--engines max` resolves to. Each is a different limit:
-    #   VIS      8 -- 2D: 4 row groups x 2 K lanes (_vis_grid) BY DEFAULT. The "rows
+    #   VIS     12 -- 2D: 6 row groups x 2 K lanes (_vis_grid) BY DEFAULT. The "rows
     #                 cap at 4" this works around is a CONVENTION (the 64-row block),
     #                 NOT an architectural ceiling -- see VIS_M_SHARD / --vis_m_shard,
-    #                 which row-shards all 8 at 32 rows and MEASURES FASTER. Under the
-    #                 2D grid the 5th-8th engines split the MLP's K instead: fc1 N-split -> GELU in lane
-    #                 -> fc2 K-split -> 2-way reduce. The attention block stays
-    #                 row-parallel and redundant across lanes, because its A operands
-    #                 are shared row-major buffers and matmat_mul_core has no
+    #                 which row-shards at 32 rows and MEASURES FASTER. Note S=256/slot
+    #                 is only 8 blocks of 32, so a pure row split at THAT granularity
+    #                 saturates at 8 -- which is why VIS_ROW_ALIGN is now DERIVED from
+    #                 the engine count (_vis_row_align) and drops to 4 at ne=12: 64
+    #                 blocks -> 4x24 + 8x20 rows, 89% balanced, and attention stays
+    #                 row-parallel so it shards 12-wide too. M alignment is free
+    #                 because an M-split hands each engine [rows, FULL_N]; the 64 that
+    #                 is real applies to N/K, not M.
+    #                 The 2D grid (VIS_M_SHARD=False) remains available: its second
+    #                 lane's engines split the MLP's K instead: fc1 N-split -> GELU in
+    #                 lane -> fc2 K-split -> 2-way reduce. There the attention block
+    #                 stays row-parallel and redundant across lanes, because its A
+    #                 operands are shared row-major buffers and matmat_mul_core has no
     #                 A-stride, so a K-split of those is not expressible.
-    #   PREFIX   8 -- device cap. S=832 is 13 blocks and 13 is prime, so 8 is uneven
-    #                 (5x128 + 3x64) at ~81% efficiency. Shorter prefixes degrade:
-    #                 S=576 is 56%, S=320 falls back to 1 engine (_prefix_num_engines).
-    #   DENOISE  8 -- device cap. M=64 is ONE row block so this is a COLUMN (N) split;
-    #                 the binding dim is o proj N=1024 = 16 blocks, comfortably >8.
-    STAGE_MAX_ENGINES = {"VIS": 8, "PREFIX": 8, "DENOISE": 8}
+    #   PREFIX  12 -- raised cap. PREFIX_ROW_ALIGN=8 makes every real length split 12
+    #                 ways with no fallback (832/8=104, 576/8=72, 320/8=40 blocks,
+    #                 all >= 12); _col_split takes the remainder, so balance is 100%
+    #                 at S=576, 96% at 832, 83% at 320. Attention alone caps at 8
+    #                 (NUM_HEADS), leaving 4 engines head-less -- see
+    #                 _prefix_head_split.
+    #   DENOISE 12 -- raised cap. M=64 is ONE row block so this is a COLUMN (N) split;
+    #                 the binding dim is o proj N=1024 = 16 blocks, comfortably >12
+    #                 (2,2,2,2 + 1x8 at 64-col align = 67% balanced; the align stays
+    #                 64 because a 32-wide bf16 shard is 64 B, half an SRAM row).
+    #                 The gated MLP is the bulk and splits 88.9% balanced. Attention
+    #                 is HEAD-split and CAPS at 8 (AE_HEADS); engines 8-11 own zero
+    #                 heads and idle between barriers -- see _ae_head_split.
+    STAGE_MAX_ENGINES = {"VIS": 12, "PREFIX": 12, "DENOISE": 12}
+
+    # Why this is NOT just max(STAGE_MAX_ENGINES.values()): the caps above describe
+    # what the PARTITIONING MATH supports. This constant describes what the HARDWARE
+    # can ADDRESS -- the FLAG rendezvous index width. They are allowed to differ; this
+    # one is the one a real run must obey.
+    #
+    # 12 (not 16) because that is what has actually been RUN on this device. The FLAG
+    # index decodes 4 bits, so 16 is the architectural ceiling, but engines 12-15 have
+    # never been exercised. Do not raise this past what has been observed to work.
+    ENGINE_INDEX_LIMIT = 12
+
+    # RESOLVED -- what used to block a 12-engine run, and how:
+    #   (a) The ISA flag-check bound was a SOFTWARE artifact of a 3-bit decode mask,
+    #       not an encoding limit: ue_isa_descriptor has always packed src_reg_idx as
+    #       6 bits (& 0x3F). generate_instruction_flag_check now accepts 0-15 and
+    #       RAISES on out-of-range instead of print-and-return, because the old soft
+    #       fail emitted a rendezvous with one CHECK missing -- a hung device, not an
+    #       error. The MMIO stride is unchanged (UE_0_BASE_ADDR + i * 0x10000); engines
+    #       8-11 land at 0x02080000..0x020B0000 in the same BAR.
+    #   (b) _ae_head_split no longer asserts NH % ne == 0; it CAPS at NH=8, so engines
+    #       8-11 own zero heads. They still emit every barrier slice.
+    #   (c) _prefix_head_split has only 8 heads to give out, so 4 of 12 engines own
+    #       ZERO heads and sit idle through prefix attention (they still emit every
+    #       rendezvous, so this costs time, not correctness). Everything else in the
+    #       prefix -- projections, MLP, RoPE/KV staging -- stays 12-wide.
+    #   (d) VIS_M_SHARD is fine at 12: VIS_ROW_ALIGN is DERIVED from the engine
+    #       count (_vis_row_align) and drops 32 -> 4 at ne=12, giving 256/4 = 64
+    #       blocks -> 4x24 + 8x20 rows, 89% balanced. RESOLVED.
+    #   (e) PREFIX_ROW_ALIGN = 8 splits every real prefix length 12 ways without
+    #       falling back: _prefix_num_engines only falls back when S // 8 < ne, and
+    #       832/8 = 104, 576/8 = 72, 320/8 = 40 are all >= 12. _col_split absorbs
+    #       the remainder (S=576 100%, S=832 96%, S=320 83% balanced). RESOLVED.
 
     # Prefix row-split granularity. 8, not 64, for the SAME reason vision drops to
     # 32 (see VIS_M_SHARD): nothing in _emit_prefix_body consumes a row count as
@@ -2135,6 +2304,20 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # COSTS ONE EXTRA BARRIER per layer (#1a): the Q permute is a primary-only
     # producer that the sharded RoPE consumes.
     PREFIX_ROPE_SHARD = True
+    # ROW-SHARD THE PREFIX'S PRIMARY-ONLY REGION (default RoPE path, PI05_MATMUL_ROPE
+    # unset). Per layer the primary alone ran: gqa RoPE over all S rows of Q, RoPE
+    # on K, the (S,NH,D)->(NH,S,D) Q permute, the K/V cache staging copies, and
+    # after attention the (NH,S,D)->(S,NH*D) output permute -- five ops on 3.4 MB
+    # tensors with 11 engines parked at a rendezvous on each side. Every one of
+    # them is row-independent: RoPE is per (token, head), the permutes are pure
+    # gathers, the copies are contiguous. So each engine now does them for ITS
+    # row shard (same math on the same rows -> bit-identical), and two barriers
+    # per layer disappear (#1, no longer needed before attention's own fence, and
+    # #2, since the o-projection reads rows the same engine just wrote). The
+    # permutes become NH strided DMAs per engine (_prefix_permute_rows). The
+    # matmul-RoPE path keeps its own PREFIX_ROPE_SHARD for the RoPE and gets only
+    # the output-permute half of this. --no-prefix_shard_primary for the A/B.
+    PREFIX_SHARD_PRIMARY = True
 
     VIS_NUM_ENGINES = None       # per-stage override; None -> NUM_ENGINES
     # Pure M (row) sharding for the vision encoder instead of the 2D rows x K grid
@@ -2154,11 +2337,113 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # the arithmetic intensity per weight byte, where a K-split halves B instead.
     # Same compute per engine either way (256/8*K*N == 64*(K/2)*N); the whole trade
     # is attention redundancy vs weight bandwidth. MEASURE IT, don't derive it.
+    #
+    # THE ROW ALIGN IS A CONVENTION, NOT A HARDWARE REQUIREMENT. The real 64-rule
+    # is a LAYOUT rule on N and K: a 128-byte SRAM row holds 64 bf16 elements, and
+    # q4_64 quantisation blocks run along K. It says nothing about M. Under a pure
+    # M-split every engine gets a [rows, FULL_N] shard -- the columns are never
+    # cut, and K is never cut -- so N/K 64-alignment is preserved BY CONSTRUCTION
+    # no matter how few rows a shard has. The only M-side constraint left is the
+    # strided-DMA AXI beat, and row_offset*X*2 stays a comfortable multiple of it
+    # even at 4 rows. Precedent in this same file: PREFIX_ROW_ALIGN was dropped
+    # from 64 to 8 for exactly this reason, with a measured win.
+    #
+    # SO THE ALIGN IS DERIVED FROM THE ENGINE COUNT (_vis_row_align), not fixed:
+    # 32 is kept whenever 256/32 = 8 blocks still feeds every engine (ne <= 8, i.e.
+    # everything that runs today, byte-identical), and we only descend when it
+    # cannot. At ne=12:
+    #   align 32 -> 8 blocks  -> fewer blocks than engines, ILLEGAL
+    #   align 16 -> 16 blocks -> 4x2 + 8x1 blocks, max 2 vs ideal 1.33 = 67%
+    #               (still effectively 8 engines' worth of work -- no gain)
+    #   align  4 -> 64 blocks -> 4x6 + 8x5 blocks = 4x24 + 8x20 ROWS,
+    #               max 6 vs ideal 5.33 = 89% BALANCED  <-- chosen
+    # (align 8 ties align 4 on that ratio but spreads 24 vs 16 rows instead of
+    # 24 vs 20, and cost tracks the LARGEST shard.)
     VIS_M_SHARD = True
+    # Vision attention split by HEADS (each engine owns whole heads over all S rows)
+    # instead of by query rows with every engine looping all NH heads. See the
+    # attention block in the encoder body. --no-vis_attn_head_shard for the A/B.
+    VIS_ATTN_HEAD_SHARD = True
+    # PRIVATE PER-ENGINE COPIES OF THE VISION LAYER WEIGHTS (q/k/v/o/fc1/fc2, all
+    # 27 layers, ~280 MB per copy). MEASURED on this board (user_hw_test
+    # matmat_mul_multi_engine_flag_check_test, 1 MB DRAM->SRAM read per engine):
+    #   12 engines reading ONE shared address : 10.6 GB/s aggregate (0.9/engine)
+    #   12 engines reading PRIVATE addresses  : 42.6 GB/s aggregate (3.5/engine)
+    # Concurrent reads of one address range serialize to ~10.5 GB/s however many
+    # engines issue them. Under the row split every engine streams the FULL
+    # weight matrix of every projection from the same address, so the whole
+    # stage's weight traffic sits behind that one-stream ceiling.
+    # "auto" = as many extra copies as fit (params headroom first, then tensor
+    # DRAM left over after the action-expert reserve and a per-worker arena
+    # floor), capped at one set per vision engine. An int N = at most N sets
+    # in total (1 = no copies, the A/B baseline). Engine e reads set e % n_sets.
+    # Norms, biases, patch-embed and the head projection stay shared (tiny).
+    # Only the M-shard path (nk == 1) uses copies; the 2D grid keeps set 0.
+    VIS_WEIGHT_COPIES = "auto"
+    # Tensor DRAM that must stay free PER WORKER for its arena after copies are
+    # carved out. _resolve_worker_arena_profile needs ~28 MB per worker with all
+    # three stages sharded (4 MB window + 6 + 14 + 4 MB of programs); 40 leaves
+    # margin, and dram_region_map still hard-asserts the final layout.
+    VIS_WEIGHT_COPY_ARENA_FLOOR = 40 << 20
+    # Params headroom kept free below the tensor base: compile_prefix and
+    # tensor_init allocate a few MB of params (bias planes, identity, tables).
+    VIS_WEIGHT_COPY_PARAMS_MARGIN = 64 << 20
+
+    # Row-split granularity candidates for VIS_M_SHARD, coarsest first. The
+    # starting point is 32 (M-shard) / 64 (2D grid); _vis_row_align only DESCENDS
+    # below the start when the start cannot feed every engine (S // align < ne),
+    # so every engine count that runs today keeps its exact shape.
+    VIS_ROW_ALIGN_CANDIDATES = (64, 32, 16, 8, 4)
+    # Hard floor. 4 rows is 4*H*2 bytes per shard offset, still far above the AXI
+    # beat the strided vision DMAs need; going finer buys nothing (the imbalance
+    # is already <=1.125 at 64 blocks) and multiplies per-engine program size.
+    VIS_ROW_ALIGN_FLOOR = 4
 
     @property
     def VIS_ROW_ALIGN(self):
-        return 32 if self.VIS_M_SHARD else 64
+        return self._vis_row_align()
+
+    def _vis_row_align(self, ne=None):
+        """Row-block granularity for the vision M-split, DERIVED from engine count.
+
+        Start at 32 under VIS_M_SHARD (64 under the 2D grid) -- today's value. If
+        that many blocks can feed `ne` engines, return it unchanged: this is what
+        pins ne=1..8 at 32 and keeps every currently-running shape byte-identical.
+
+        Only when S // start < ne (e.g. 12 engines vs 256/32 = 8 blocks) do we walk
+        VIS_ROW_ALIGN_CANDIDATES down to VIS_ROW_ALIGN_FLOOR and pick the align that
+        minimises the imbalance ratio max_shard_blocks / (blocks / ne). Ties are
+        broken by the smallest ROW spread between the fattest and thinnest shard
+        (cost tracks the largest shard, so a tighter spread is strictly better),
+        then by the largest align. At S=256, ne=12 that selects align 4: 64 blocks
+        -> 4x24 + 8x20 rows, max/ideal = 1.125 (89% balanced), where align 8 ties on
+        ratio but spreads 24 vs 16 and align 16 is only 67%.
+        """
+        start = 32 if self.VIS_M_SHARD else 64
+        if not self.VIS_M_SHARD:
+            return start
+        if ne is None:
+            ne = self._num_engines("VIS")
+        S = self.VIS_S
+        if S // start >= ne:
+            return start
+        best = None
+        for align in self.VIS_ROW_ALIGN_CANDIDATES:
+            if align > start or align < self.VIS_ROW_ALIGN_FLOOR:
+                continue
+            if S % align:
+                continue
+            blocks = S // align
+            if blocks < ne:
+                continue
+            base, rem = divmod(blocks, ne)
+            parts = [base + (1 if i < rem else 0) for i in range(ne)]
+            key = (max(parts) / (blocks / ne),
+                   (max(parts) - min(parts)) * align,
+                   -align)
+            if best is None or key < best[0]:
+                best = (key, align)
+        return best[1] if best is not None else start
     # The prefix LM is row-sharded too (projections / RMSNorms / MLP; RoPE, the
     # two permutes and attention stay on the primary), so it follows --engines.
     # Set to an int to pin the stage independently of the encoder.
@@ -2208,23 +2493,56 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                  byte-identical to the historical FF_HALF code.
           True   engine e computes ONLY lane e, at FULL S -- the balanced path.
                  Requires lanes == resolved_ne exactly.
+
+        Lane WIDTHS need not be uniform: the boundaries come from
+        _prefix_mlp_lane_split (_col_split), which balances whole 64-blocks, so
+        lane counts that do not divide INTERMEDIATE_SIZE evenly (e.g. 12 -> four
+        lanes of 1408 + eight of 1344, 97% balanced) are legal. Only the lane
+        COUNT is fixed by this function; widths are read from the split.
         """
         raw = self._num_engines("PREFIX")
         override = self.PREFIX_MLP_LANES
         lanes = (raw if override is None else int(override)) if raw > 1 else 2
         if override is not None:
             lanes = int(override)
-        I = self.INTERMEDIATE_SIZE
-        # Every lane must be a whole number of 64-element blocks: that is the matmul
-        # N/K granularity AND the q4_64 block size. q4_64 blocks run along K, so a
-        # lane boundary off a 64-multiple would cut a down_proj scale block in half.
-        # The down_proj K per lane must also clear the URAM cap that forced this
-        # split to exist at all (matmat_mul_core_pbi: K*16 <= URAM_NEAR_FULL_ELEMENTS).
-        if (lanes < 2 or I % lanes != 0 or (I // lanes) % 64 != 0
-                or (I // lanes) * 16 > URAM_NEAR_FULL_ELEMENTS):
+        if not self._prefix_mlp_lanes_ok(lanes):
             lanes = 2
         col_split = (resolved_ne is not None and resolved_ne > 1 and lanes == resolved_ne)
         return lanes, col_split
+
+    def _prefix_mlp_lanes_ok(self, lanes):
+        """Is ``lanes`` a legal lane count for the prefix gated MLP?
+
+        NOT "divides I evenly" -- that was stricter than the hardware needs and cost
+        the 12-engine configuration its column split (16384 % 12 == 4 -> fell back to
+        2 lanes, so every engine streamed the FULL 16384-wide gate/up/down weights
+        for ~69 rows: 402M weight elements of traffic instead of 33.5M). The real
+        constraints are only:
+          * at least 2 lanes;
+          * enough whole 64-blocks for _col_split to give every lane at least one
+            (that is the matmul N/K granularity AND the q4_64 block size -- q4_64
+            blocks run along K, so a lane boundary off a 64-multiple would cut a
+            down_proj scale block in half; _col_split cuts on whole 64-blocks by
+            construction, so every lane is 64-aligned however uneven the widths);
+          * the WIDEST lane's down_proj K clears the URAM cap that forced this split
+            to exist at all (matmat_mul_core_pbi: K*16 <= URAM_NEAR_FULL_ELEMENTS).
+        """
+        I = self.INTERMEDIATE_SIZE
+        if lanes < 2 or I // 64 < lanes:
+            return False
+        return max(w for _, w in self._col_split(I, lanes)) * 16 <= URAM_NEAR_FULL_ELEMENTS
+
+    def _prefix_mlp_lane_split(self, lanes):
+        """[(col_offset, width)] per lane -- THE single source of lane boundaries.
+
+        Every consumer (weight-init slicing, tensor_init buffer sizing, and
+        _emit_prefix_body's per-lane matmul shapes) derives its widths and offsets
+        from HERE, so the host slice and the runtime emission cannot disagree.
+        Widths are non-uniform whenever lanes does not divide INTERMEDIATE_SIZE
+        evenly; at lanes in (2, 4, 8) this reproduces the old i*(I//lanes) geometry
+        exactly, so every currently-working configuration is byte-identical.
+        """
+        return self._col_split(self.INTERMEDIATE_SIZE, lanes)
 
     def _num_engines(self, stage="VIS"):
         override = getattr(self, f"{stage}_NUM_ENGINES", None)
@@ -2304,11 +2622,22 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # Free at 64 MB arenas -- program space only drops 62 -> 60 MB.
     VIS_WORKER_PROGRAM_OFFSET_MANY = 0x00400000   #  4 MB
 
-    # Tensor DRAM allocated AFTER the arenas, by tensor_init_action_expert
-    # (measured 44.97 MB). Reserved up front because the arenas are allocated at
-    # encoder-compile time, long before the action expert asks -- see
+    # Tensor DRAM allocated AFTER the arenas. Reserved up front because the arenas
+    # are allocated at encoder-compile time, long before these allocators ask -- see
     # _resolve_worker_arena_profile.
-    VIS_WORKER_AE_TENSOR_RESERVE = 0x03000000     # 48 MB
+    #
+    # Covers three things, and TWO OF THEM SCALE WITH THE ENGINE COUNT:
+    #   tensor_init_action_expert   ~45 MB   fixed
+    #   prefix_attn_scratch         ~2.2 MB * ne   (compile_prefix, one per engine)
+    #   AE_UATTN_SCRATCH_SHARDED    ~2.0 MB * ne   (compile_denoise_loop, per engine)
+    # so the real demand is ~45 + 4.2*ne MB: ~79 MB at ne=8, ~95 MB at ne=12. The
+    # historical 48 MB was measured at 8 engines against the AE term ALONE and was
+    # already optimistic; at 12 it under-reserves by enough to trip dram_region_map's
+    # overlap assert on first compile. 112 MB covers ne=12 with margin and costs
+    # nothing real -- the tensor region is 1.5 GB (0x80000000..0xE0000000) and the
+    # arenas are sized from whatever is left, so over-reserving here only trims
+    # arena headroom that is not needed (11 workers need ~28 MB each, cap is 64).
+    VIS_WORKER_AE_TENSOR_RESERVE = 0x07000000     # 112 MB
     # Floor for the computed arena: 2 MB offset + 16 MB program space. A worker's
     # encoder+prefix program measured 15.11 MB (5.48 + 9.64), so anything under
     # this cannot hold both stages and would only fail later, deeper in.
@@ -2474,6 +2803,104 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             raise AssertionError("DRAM region overlap [" + label + "]:\n  " + "\n  ".join(errs))
         return errs
 
+    _VIS_COPY_KEYS = ("q", "k", "v", "o", "fc1", "fc2")
+
+    def _vis_store_q4_blob(self, raw, region):
+        """Upload one packed q4_64 blob (scales then data, like
+        nn_lib.store_quantized_weight) from the params or tensor allocator."""
+        n_blocks = len(raw) // 34
+        scales_size, data_size = n_blocks * 2, n_blocks * 32
+        alloc = self.allocate_params_dram if region == "params" else self.allocate_tensor_dram
+        scale_addr = alloc(scales_size)
+        self.dma_write(DMA_DEVICE_H2C, scale_addr,
+                       torch.from_numpy(np.frombuffer(raw, dtype=np.uint8, count=scales_size).copy()),
+                       scales_size)
+        data_addr = alloc(data_size)
+        self.dma_write(DMA_DEVICE_H2C, data_addr,
+                       torch.from_numpy(np.frombuffer(raw, dtype=np.uint8, count=data_size,
+                                                      offset=scales_size).copy()),
+                       data_size)
+        return scale_addr, data_addr
+
+    def _vis_alloc_weight_copies(self, workers):
+        """Upload the private per-engine vision weight sets (see VIS_WEIGHT_COPIES).
+
+        Runs ONCE, from _vis_worker_arena_base, i.e. after tensor_init and before
+        the worker arenas are sized -- the one point where the tensor cursor is
+        live, the arena has not been carved yet, and no program has executed.
+        Set 0 is the original blobs in params; extra sets go to params headroom
+        first (keeps params.bin self-contained), then tensor DRAM. Everything is
+        printed so a run log shows exactly which engine reads which addresses.
+        """
+        if getattr(self, "_vis_weight_sets", None) is not None:
+            return
+        if getattr(self, "vis_layer_addrs", None) is None:
+            # Bin replay (Pi05Libero_Run): no weight unpack, nothing to duplicate.
+            self._vis_weight_sets = []
+            return
+        self._vis_weight_sets = [self.vis_layer_addrs]
+        MB = 1 << 20
+        ne_vis = self._num_engines("VIS")
+        want = self.VIS_WEIGHT_COPIES
+        blobs = getattr(self, "_vis_packed_layer_blobs", None)
+        want_sets = ne_vis if want == "auto" else int(want)
+        max_extra = max(0, min(want_sets, ne_vis) - 1)
+        if ne_vis <= 1 or max_extra == 0 or not blobs:
+            _original_print(f"    [vis] weight copies: none (VIS engines={ne_vis}, "
+                            f"VIS_WEIGHT_COPIES={want!r}); every engine reads set 0")
+            return
+        if self._vis_grid(ne_vis)[1] > 1:
+            _original_print("    [vis] weight copies: skipped -- the 2D rows x K grid slices "
+                            "fc2 per lane; copies are only wired for the M-shard path")
+            return
+        # Exact bytes per set: every blob is 64-aligned by the allocator; the
+        # scale/data sizes are multiples of 128 for these shapes, so no slack.
+        copy_bytes = sum(len(b[k]) for b in blobs for k in self._VIS_COPY_KEYS)
+        params_free = (self._tensor_dram_base - self._next_params_dram_addr
+                       - self.VIS_WEIGHT_COPY_PARAMS_MARGIN)
+        # <=3 workers keep the fixed 48 MB arena layout (no resize), so hold that
+        # back per worker instead of the smaller resized floor.
+        arena_floor = max(self.VIS_WEIGHT_COPY_ARENA_FLOOR,
+                          self.VIS_WORKER_ARENA_BYTES if workers <= 3 else 0)
+        tensor_free = (self._program_dram_base - self._tensor_dram_addr
+                       - self.VIS_WORKER_AE_TENSOR_RESERVE
+                       - workers * arena_floor)
+        n_params = max(0, params_free // copy_bytes)
+        n_tensor = max(0, tensor_free // copy_bytes)
+        plan = (["params"] * n_params + ["tensor"] * n_tensor)[:max_extra]
+        _original_print(
+            f"    [vis] weight copies: {copy_bytes / MB:.1f} MB per set "
+            f"(27 layers x q/k/v/o/fc1/fc2, IF4). params headroom "
+            f"{params_free / MB:.0f} MB after a {self.VIS_WEIGHT_COPY_PARAMS_MARGIN // MB} MB "
+            f"margin -> {n_params} fit; tensor headroom {tensor_free / MB:.0f} MB after the "
+            f"{self.VIS_WORKER_AE_TENSOR_RESERVE // MB} MB AE reserve + {workers} x "
+            f"{arena_floor // MB} MB arena floor -> {n_tensor} fit; "
+            f"wanted {max_extra} extra -> uploading {len(plan)}")
+        for c, region in enumerate(plan, start=1):
+            t0 = time.perf_counter()
+            first = None
+            wset = []
+            for l, lb in enumerate(blobs):
+                la = dict(self.vis_layer_addrs[l])      # norms / biases stay shared
+                for k in self._VIS_COPY_KEYS:
+                    la[f"{k}_scale"], la[f"{k}_data"] = self._vis_store_q4_blob(lb[k], region)
+                    first = la[f"{k}_scale"] if first is None else first
+                wset.append(la)
+            last = wset[-1]["fc2_data"] + len(blobs[-1]["fc2"]) * 32 // 34
+            self._vis_weight_sets.append(wset)
+            _original_print(f"    [vis] weight set {c}: {region:<6s} 0x{first:08X}..0x{last:08X} "
+                            f"uploaded in {time.perf_counter() - t0:.1f}s")
+        n_sets = len(self._vis_weight_sets)
+        assign = {e: e % n_sets for e in range(ne_vis)}
+        _original_print(f"    [vis] {n_sets} weight set(s) for {ne_vis} vision engines -> "
+                        f"{max(assign.values()) + 1} address streams, engine->set "
+                        + " ".join(f"{e}:{s}" for e, s in assign.items()))
+
+    def _vis_layer_addrs_for_engine(self, engine_idx):
+        """(layer address list, set index) THIS engine streams its weights from."""
+        sets = getattr(self, "_vis_weight_sets", None) or [self.vis_layer_addrs]
+        return sets[engine_idx % len(sets)], engine_idx % len(sets)
+
     def _vis_worker_arena_base(self, num_engines):
         """Allocate (once) the worker arenas and return the base of the first.
 
@@ -2489,9 +2916,18 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         """
         peak = max([int(num_engines)]
                    + [self._num_engines(s) for s in ("VIS", "PREFIX", "DENOISE")])
+        assert peak <= self.ENGINE_INDEX_LIMIT, (
+            f"peak engine count {peak} exceeds ENGINE_INDEX_LIMIT "
+            f"{self.ENGINE_INDEX_LIMIT}, the highest engine index exercised on this "
+            f"device. See the full explanation on the same assert in "
+            f"_worker_engine_pool.")
         if peak <= 1:
             return None
         workers = peak - 1
+        # Private vision weight sets come out of the SAME free space the arenas
+        # are sized from, so they must be carved first (their budget keeps
+        # VIS_WEIGHT_COPY_ARENA_FLOOR per worker back for the arena).
+        self._vis_alloc_weight_copies(workers)
         self._resolve_worker_arena_profile(workers)
         if num_engines == 1 and getattr(self, "_vis_worker_arena", None) is None:
             # A single-engine stage needs no arena of its own, but must not
@@ -2547,6 +2983,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 f"needed; the pool is sized from the peak stage count at first use, "
                 f"so a stage raising its count afterwards is not supported.")
             return pool
+        assert peak <= self.ENGINE_INDEX_LIMIT, (
+            f"requested peak engine count {peak} exceeds ENGINE_INDEX_LIMIT "
+            f"{self.ENGINE_INDEX_LIMIT}, the highest engine index that has actually "
+            f"been exercised on this device. The FLAG rendezvous index decodes 4 bits, "
+            f"so 16 is the architectural ceiling and generate_instruction_flag_check "
+            f"accepts 0-15 -- but engines 12-15 have never been run, and the MMIO "
+            f"window above UE_0_BASE_ADDR + {self.ENGINE_INDEX_LIMIT}*0x10000 is "
+            f"unverified. Constructing a UnifiedEngine there writes control registers "
+            f"into a possibly-unmapped window. Raise this constant only alongside a "
+            f"run that demonstrates the higher count.")
         if peak <= 1:
             return []
 
@@ -2690,7 +3136,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             _nr = num_engines // _nk
             _rows_max = max(c for _, c in self._col_split(S, _nr))
             _IP = self.VIS_I_PAD                       # padded 4352, NOT VIS_I=4304
-            _lane_n = _rows_max * (_IP // _nk)         # fc1 out: [rows, IP/nk] dense
+            # Size from the WIDEST _col_split lane, not IP//nk. _col_split hands out
+            # whole 64-blocks with a remainder, so the lanes are only equal when nk
+            # divides the block count: at nk=3 (ne=12) IP=4352 is 68 blocks ->
+            # 1472/1472/1408, and IP//nk = 1450 would let lanes 0 and 1 write 2816 B
+            # past the end of this buffer into vis_mlp_partial. Finite, plausible,
+            # wrong -- no NaN, no assert. Unreachable at nk in (1,2); reachable at 12.
+            _lane_cols = max(c for _, c in self._col_split(_IP, _nk))
+            _lane_n = _rows_max * _lane_cols           # fc1 out: [rows, IP/nk] dense
             _part_n = _rows_max * H                    # fc2 out: FULL [rows, H] partial
             sched.register_per_engine("vis_mlp_lane", self.VIS_MLP_INTER_DRAM, _lane_n * bpe,
                                       init_tensor=torch.zeros(_lane_n, dtype=torch.bfloat16))
@@ -2759,10 +3212,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         NH = self.NUM_HEADS
         if ne <= 1:
             return [(0, NH)]
-        assert ne <= NH, (
-            f"_prefix_head_split: {ne} engines for only {NH} attention head(s). "
-            f"Row sharding scales past NH but head sharding cannot; give the "
-            f"surplus engines a different axis or lower --engines.")
+        if ne >= NH:
+            # HEAD SHARDING CAPS AT NH. Past one head per engine there is nothing
+            # left to split (split_heads asserts H >= n), so engines NH..ne-1 own
+            # ZERO heads: they emit no attention work, but they still emit EVERY
+            # rendezvous, because the _vis_barrier calls in _emit_prefix_body are
+            # unconditional on the head count. Skipping one on a zero-head engine
+            # would deadlock every peer waiting on its flag.
+            # Only ATTENTION is capped here. The row split and the RoPE/KV-staging
+            # split (PREFIX_ROPE_SHARD, over NH*S and S ROWS) stay ne-wide.
+            # Not routed through split_heads: one head each IS its "qheads" answer
+            # at n == NH, and asking for an NH-engine scheduler would carve a
+            # second worker arena over the live one (see _make_stage_scheduler).
+            return [(i, 1) if i < NH else (NH, 0) for i in range(ne)]
         # split_heads is a pure function of (H, gqa_ratio, num_engines) -- no
         # emission, no allocator touch -- so calling it on the stage scheduler
         # here (and again inside the body) is free and side-effect-free.
@@ -3022,7 +3484,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 B_DRAM_ADDR=self.vis_pos_embed + RH, OUTPUT_DRAM_ADDR=self.VIS_IO_A_DRAM + RH)
             self._debug_op("patch_embed_pos", self.VIS_IO_A_DRAM, S * H, shape=(S, H), ue=ue)
 
-            for layer_idx, la in enumerate(self.vis_layer_addrs):
+            _wset, _wset_idx = self._vis_layer_addrs_for_engine(engine_idx)
+            if len(getattr(self, "_vis_weight_sets", None) or []) > 1:
+                _original_print(f"    [vis] engine {engine_idx}: layer weights from set {_wset_idx} "
+                                f"(L0 q_data 0x{_wset[0]['q_data']:08X})")
+            for layer_idx, la in enumerate(_wset):
                 h_in  = self.VIS_IO_A_DRAM if layer_idx % 2 == 0 else self.VIS_IO_B_DRAM
                 h_out = self.VIS_IO_B_DRAM if layer_idx % 2 == 0 else self.VIS_IO_A_DRAM
                 # NOTE: no barrier at the layer boundary. Layer i writes h_out+RH for
@@ -3050,18 +3516,43 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # Per-head bidirectional flash attention (no mask, no RoPE). Each head's
                 # block is a full DP=128-wide (256B) column slice -> every DMA stride
                 # below is AXI-beat (32B) aligned, unlike a bare D=72 (144B) slice.
-                elems_q  = rows * DP    # THIS engine's query rows
+                #
+                # SPLIT AXIS (VIS_ATTN_HEAD_SHARD): by HEADS, not by query rows. The
+                # row split ran every one of the NH heads on EVERY engine, each call
+                # rebuilding the (S x DP) V^T and re-gathering the full K/V -- NH
+                # duplicated transposes per engine per layer, about equal to the
+                # engine's real score/context work at 12 engines. Owning whole heads
+                # over ALL S query rows does each V^T and each gather exactly once
+                # machine-wide. The Q gather then reads rows other engines projected
+                # (covered by the rendezvous above, exactly like K/V) and the result
+                # scatter writes head columns the peers' O projection reads (covered
+                # by the WAR rendezvous below, which this path REQUIRES rather than
+                # merely benefits from). 16 heads over 12 engines is 2/2/2/2 + 1x8.
+                # ne == 1 and the 2D grid (nk > 1) keep the historical row path.
+                head_shard = self.VIS_ATTN_HEAD_SHARD and ne > 1 and nk == 1
+                if head_shard:
+                    assert self.VIS_BARRIER_AFTER_ATTN, (
+                        "head-sharded vision attention needs the post-attention rendezvous")
+                    assert ne <= NH, f"vision head shard: {ne} engines for {NH} heads"
+                    _base, _rem = divmod(NH, ne)
+                    _counts = [_base + (1 if i < _rem else 0) for i in range(ne)]
+                    h0, nh = sum(_counts[:engine_idx]), _counts[engine_idx]
+                    q_rows, q_ofs = S, 0
+                else:
+                    h0, nh = 0, NH
+                    q_rows, q_ofs = rows, RP
+                elems_q  = q_rows * DP  # query rows per call (all S when head-sharded)
                 elems_kv = S * DP       # FULL K/V -- both shards, on every engine
                 col_stride = DP * bpe   # one head's column block width (aligned)
                 row_jump = HP * bpe     # full [S, HP] row stride
-                for h in range(NH):
+                for h in range(h0, h0 + nh):
                     col = h * col_stride
-                    # TRAP: the Q gather and the result scatter carry +RP; the K/V
-                    # gathers must NOT. Omitting RP on the scatter makes both engines
+                    # TRAP: the Q gather and the result scatter carry +q_ofs; the K/V
+                    # gathers must NOT. Omitting it on the scatter makes both engines
                     # write rows 0..127 -> finite, NaN-free, structurally plausible
                     # SCRAMBLED output (project_pi05_denoise_strided_copy_bugs).
-                    assert (RP + col) % 32 == 0, "strided DMA base must be AXI-beat aligned"
-                    for src, dst, n in ((self.VIS_Q_DRAM + RP + col, FQ, elems_q),
+                    assert (q_ofs + col) % 32 == 0, "strided DMA base must be AXI-beat aligned"
+                    for src, dst, n in ((self.VIS_Q_DRAM + q_ofs + col, FQ, elems_q),
                                         (self.VIS_K_DRAM + col,      FK, elems_kv),
                                         (self.VIS_V_DRAM + col,      FV, elems_kv)):
                         ue.accelerator_memory_to_sram(src, 0x00000, n,
@@ -3079,14 +3570,14 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     # PBI back-to-back corruption. Don't re-litigate this -- bisect the
                     # encoder body against pi05_torch_ref.vision_encode_checkpoints.
                     ue.unified_attention_core_dynamic(
-                        batch=rows, aligned_seq_len=S, head_dim=DP,
+                        batch=q_rows, aligned_seq_len=S, head_dim=DP,
                         Q_DRAM_ADDR=FQ, K_DRAM_ADDR=FK, V_DRAM_ADDR=FV,
                         BIAS_DRAM_ADDR=self.VIS_ZERO_BIAS_DRAM,
                         OUTPUT_DRAM_ADDR=FO,
                         SCRATCH_DRAM_ADDR=ATTN_SCRATCH,
                         IDENTITY_DRAM_ADDR=self.identity_addr)
                     ue.accelerator_memory_to_sram(FO, 0x00000, elems_q)
-                    ue.sram_to_accelerator_memory(0x00000, self.VIS_ATTN_RESULT_DRAM + RP + col,
+                    ue.sram_to_accelerator_memory(0x00000, self.VIS_ATTN_RESULT_DRAM + q_ofs + col,
                         elems_q, stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
 
                 # WAR rendezvous: nothing else stops this engine from racing ahead into
@@ -3222,11 +3713,65 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     AE_INTERMEDIATE = 4096
     AE_LAYERS = 18
     AE_HEADS = 8
+    # CACHE V^T ACROSS ENGINES AND STEPS. unified_attention_core_dynamic transposes
+    # its V operand ([Tkv, D] -> [D, Tkv]) at the top of EVERY call, and the denoise
+    # stage issues one call per engine per layer per step: 12 engines x 18 layers x
+    # 10 steps = 2160 transposes of the same 896 x 256 V through the identity-matvec
+    # trick, on a stage that is latency-bound on its op chain (time was flat from
+    # 8 to 12 engines). But 832 of those 896 rows are the PREFIX V cache, constant
+    # for all 10 steps, and MQA means every engine sees the same V. So: one shared
+    # [D, Tkv] V^T buffer per layer, built in full by the primary at step 0 (18
+    # transposes total), then only the 64 suffix rows re-transposed per step and
+    # scattered into columns [P:P+S] (a 64-row transpose + one strided DMA). The
+    # core is handed the buffer via V_T_DRAM_ADDR and skips its own transpose.
+    # Coherence: the primary writes before the attention region's opening
+    # rendezvous; the buffer is read-only past it. --no-ae_vt_cache for the A/B.
+    AE_VT_CACHE = True
+    # MEASURED per-op cost at denoise shapes, one engine (scratch denoise_opcost.py,
+    # 2026-09-13): eltwise add [6,1024] 4.6 us; IF4 matmul M=10 K=1024 N=256 150 us
+    # (~35 GFLOP/s, i.e. near peak even at 10 rows); M=1 K=1024 N=3072 331 us;
+    # attention batch=10 with cached V^T 338 us; rms_norm 11 us. So the reduce
+    # chains (2 x 11 adds = ~100 us/layer-step) are NOT the cost. The cost is
+    # that the PRIMARY carries every serial op (2 x 331 us AdaRMS conditioning
+    # dense, k/v proj, K RoPE, V^T update) AND a full share of the sharded ops
+    # (a head + an MLP lane), so every rendezvous waits on it.
+    #
+    # AE_PRIMARY_NO_HEAD: at ne > AE_HEADS give the 8 heads to engines 1..8 and
+    # none to the primary, which then carries only the serial part + its lane.
+    # Takes ~700 us (q proj + RoPE + attention + o proj) off the critical path
+    # per layer-step. Only applies above 8 engines (at <= 8 every engine has a
+    # head). Output is unaffected: the same head math lands at the same address.
+    # DEFAULT OFF (2026-09-13): with this on, the 12-engine denoise program never
+    # halts. Bisected on hardware: the AdaRMS hoist alone runs (0.8 s, bit-identical);
+    # engine 8 owning a head with the primary keeping one runs (PI05_AE_HEAD_ENGINES=
+    # 0,1,2,3,4,5,6,8); only "primary owns no head" hangs. Static checks found no
+    # program/arena/tensor overflow and no register or PBI-pointer drift. Open
+    # suspects: the reduce's first add reading AE_O_PROJ_ZERO_DRAM instead of
+    # accumulating in place (PI05_AE_NOZERO=1 isolates it), and the primary sitting
+    # idle across six back-to-back rendezvous (flag clear immediately followed by
+    # the next flag set) -- the barrier's documented re-arm race. Expected gain was
+    # only ~0.13 s, so it is parked rather than chased. --ae_primary_no_head re-enables.
+    AE_PRIMARY_NO_HEAD = False
+    # AE_HOIST_ADARMS_DENSE: the AdaRMSNorm conditioning dense (cond(1,H) @ W
+    # (H,3H) + b) depends only on the STEP's time embedding, not on the layer
+    # input, yet it ran on the primary inside every layer: 37 x 331 us per step
+    # on the critical path. Hoisted: once per step, all 37 rows (18 layers x
+    # pre-attn/pre-ffw + final) are computed in ONE column-sharded region across
+    # every engine (N=3072 -> 256 columns each at 12) into AE_MOD_TABLE_DRAM; each
+    # layer's AdaRMSNorm then just reads its row. Same matmuls, same weights, same
+    # bias, so each output element is bit-identical; only who computes it moves.
+    AE_HOIST_ADARMS_DENSE = True
     AE_KV_HEADS = 1
     AE_ACTION_DIM_PADDED = 32
     AE_XT_WIDTH = 64  # physical width of x_t/v_t buffers (action_dim 32 padded to 64-align)
     # --- roofline / FLOP-util reporting -------------------------------------
-    CYCLE_NS = 5.63          # HW clock period (config defaults.cycle_ns) -> ~177.6 MHz
+    # Alveo U55C (HW 0x68f0c76c) runs at 300 MHz -> 3.3333333 ns. The old 5.63
+    # (~177.6 MHz) was the config default for a different board; see
+    # gemma4_e2b_test.py::_clock_ns_default_for_device, which maps alveo_u55c to
+    # 3.3333333 and rk/rk_256 (HW 0x3d04c689, the previous device) to 3.0.
+    # This is REPORTING ONLY -- CLOCK_CYCLE_TIME_NS drives no timeout or spin count,
+    # and barrier_margin_nops is an instruction count, so it scales with the clock.
+    CYCLE_NS = 3.3333333     # HW clock period, Alveo U55C @ 300 MHz
     MACS_PER_CYCLE = 64      # ASSUMPTION: 64-ALU vector unit = 64 MACs/cycle. If the
                              # matmul core is a 64xN systolic array this is higher --
                              # set to the real MAC/cycle to get an accurate %-of-peak.
@@ -3236,7 +3781,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # emitters issue, NOT that the silicon beat its own ceiling. That check is what
     # caught the denoise stage reporting 401 GFLOP/s (see _denoise_flops).
     # Set to None to fall back to the MACS_PER_CYCLE x engine-count estimate.
-    DEVICE_PEAK_GFLOPS = 375.0
+    #
+    # None on purpose now. The 375.0 was a whole-device measurement on the PREVIOUS
+    # board and does not scale with engine count, so at 12 engines it reported a
+    # ceiling ~23% too low and inflated every %-of-peak. The repo's own per-core
+    # formula is freq_MHz * 0.128 GFLOPS/core (gemma4_e2b_test.py:1348), which the
+    # MACS_PER_CYCLE fallback below reproduces exactly: 64 MACs * 2 flops / 3.3333 ns
+    # = 38.4 GFLOPS/engine at 300 MHz, i.e. 307.2 at 8 engines and 460.8 at 12 --
+    # matching PR #152's measured table for this device. Re-pin this to a real
+    # measured number if you take one, but pin it PER DEVICE, not as a bare constant.
+    DEVICE_PEAK_GFLOPS = None
     AE_ACTION_HORIZON = 10
     AE_ACTION_HORIZON_PADDED = 64  # padded for 64-alignment (see AE_M_PROBE)
 
@@ -3274,6 +3828,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # the compact layout (Q/attn-out stride, the tiled RoPE tables, and the
     # (batch, Tkv) bias all move together). NOT done here.
     AE_TRIM_PAD_ROWS = os.environ.get("PI05_AE_TRIM", "1") not in ("0", "", "false", "False")
+    # TRIM THE ATTENTION BATCH TOO. AE_TRIM_PAD_ROWS left attention at the padded
+    # 64 query rows per head, on the belief that the core needs 64-aligned rows.
+    # It does not: unified_attention_core_dynamic constrains aligned_seq_len (the
+    # KEY length, still Tkv=896) to 64-multiples, and tiles the query batch one
+    # row at a time. Head h's queries sit at rows [h*S, h*S+S) of the head-major
+    # Q blob and only the first AE_ACTION_HORIZON are real, so each head runs ONE
+    # call at batch=10 from its own row offset; the output lands in the same
+    # [h*S, h*S+10) rows the o-projection already reads (it runs at the trimmed
+    # gpr M). Rows 10..63 of each head block are left stale, exactly like every
+    # other trimmed buffer. Score + context work per head drops 6.4x. Requires
+    # AE_TRIM_PAD_ROWS; per-head calls are cheap because AE_VT_CACHE removes the
+    # per-call V^T (with the cache off, each extra call re-transposes V).
+    AE_TRIM_ATTN_BATCH = True
     AE_NUM_DENOISE_STEPS = 10
     AE_LOOP_TRIP_OVERRIDE = None  # debug knob, see compile_denoise_loop's loop_start call
     DENOISE_STEP0_PROBE = False  # if True, snapshot step-0 intermediates for reference diff
@@ -3318,10 +3885,17 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         """
         S = s or self.VIS_S
         if self.VIS_M_SHARD:
-            # Pure row split at 32-row granularity (see VIS_M_SHARD).
-            assert ne <= S // self.VIS_ROW_ALIGN, (
-                f"VIS_M_SHARD: {ne} engines needs {ne} row groups but S={S} is only "
-                f"{S // self.VIS_ROW_ALIGN} block(s) of {self.VIS_ROW_ALIGN}")
+            # Pure row split at the DERIVED granularity (see VIS_M_SHARD and
+            # _vis_row_align): 32 rows whenever that still feeds every engine,
+            # finer (down to VIS_ROW_ALIGN_FLOOR) only when it cannot.
+            align = self._vis_row_align(ne)
+            assert ne <= S // align, (
+                f"VIS_M_SHARD: {ne} engines needs {ne} row groups but S={S} splits "
+                f"into only {S // align} block(s) at the {align}-row granularity "
+                f"chosen by _vis_row_align (candidates "
+                f"{self.VIS_ROW_ALIGN_CANDIDATES}, floor {self.VIS_ROW_ALIGN_FLOOR}). "
+                f"The align is a convention, not a hardware limit -- lower "
+                f"VIS_ROW_ALIGN_FLOOR, or run this stage with fewer engines")
             return ne, 1
         max_rows = S // 64
         nr = max(d for d in range(1, max_rows + 1) if ne % d == 0)
@@ -3514,7 +4088,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # blocks coincide exactly with a subset of the full weight's blocks
                 # and re-quantizing the slice reproduces those scales bit-for-bit.
                 la["mlp_down_k"] = []
-                for k0, kc in self._col_split(self.AE_INTERMEDIATE, _ne_denoise):
+                self._ae_mlp_down_k_split = self._col_split(self.AE_INTERMEDIATE, _ne_denoise)
+                for k0, kc in self._ae_mlp_down_k_split:
                     sl = dn_w[:, k0:k0 + kc].contiguous()
                     sdata, _ = _mlc_quantize_q4_64(sl)
                     la["mlp_down_k"].append(store_quantized_weight(self, sdata.tobytes()))
@@ -3719,6 +4294,30 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # ae_v_combined's prefix rows never actually got written on hardware,
         # leaving stale/garbage DRAM content that fed straight into the first
         # suffix layer's attention and NaN'd immediately.
+        # Shared per-layer V^T cache (AE_VT_CACHE): [D, Tkv] per layer, plus one
+        # [D, S] staging block for the per-step suffix transpose. Allocated after
+        # every critical AE buffer so nothing above moves. Zeroed once so the
+        # columns of never-written rows can never be NaN (same reason as K/V).
+        self.ae_vt_cache = [self.allocate_tensor_dram(D * Tkv * bpe) for _ in range(self.AE_LAYERS)]
+        self.ae_vt_suffix_tmp = self.allocate_tensor_dram(D * S * bpe)
+        # AdaRMSNorm modulation table (AE_HOIST_ADARMS_DENSE): one (1, 3H) row per
+        # norm -- 2 per layer + the final norm -- recomputed per step.
+        self.AE_MOD_ROWS = 2 * self.AE_LAYERS + 1
+        self.AE_MOD_TABLE_DRAM = self.allocate_tensor_dram(self.AE_MOD_ROWS * 3 * H * bpe)
+        self._ae_mod_hoisted = False
+        # All-zero [S, H] stand-in for the primary's o-proj partial when it owns no
+        # head (AE_PRIMARY_NO_HEAD). The primary's "partial" is AE_O_PROJ_DRAM
+        # itself, which after a reduce holds the previous SUM; feeding that back in
+        # as partial 0 would double-count. Never written by any program.
+        self.AE_O_PROJ_ZERO_DRAM = self.allocate_tensor_dram(S * H * bpe)
+        self.dma_write(DMA_DEVICE_H2C, self.AE_O_PROJ_ZERO_DRAM,
+                       torch.zeros(S * H, dtype=torch.bfloat16).contiguous(), S * H * bpe)
+        _zero_vt = torch.zeros(D * Tkv, dtype=torch.bfloat16).contiguous()
+        for _addr in self.ae_vt_cache:
+            self.dma_write(DMA_DEVICE_H2C, _addr, _zero_vt, D * Tkv * bpe)
+        print(f"    [ae] V^T cache: {self.AE_LAYERS} x {D * Tkv * bpe >> 10} KB at "
+              f"0x{self.ae_vt_cache[0]:X}.. (+{S * D * bpe >> 10} KB suffix staging)"
+              + ("" if self.AE_VT_CACHE else "  [allocated but DISABLED: AE_VT_CACHE=False]"))
         # Step-0 probe snapshot buffers (allocated LAST so they can't shift the
         # addresses of any critical AE buffer -- address layout is load-bearing
         # here, see the DRAM-layout NaN bug). Each holds one step-0 intermediate
@@ -3771,8 +4370,51 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             OUTPUT_DRAM_ADDR=OUT, is_B_quantized=True, data_type=TYPE.IF4,
             SCALE_DRAM_ADDR=scale_addr, C_DRAM_ADDR=bias_addr, gpr_M_reg=gpr_M_reg, **kw)
 
+    def _ae_mod_row(self, n):
+        """DRAM address of modulation row ``n`` (2*layer, 2*layer+1, or
+        2*AE_LAYERS for the final norm) when the table was emitted for this
+        step, else None (-> _ae_ada_rms_norm runs the dense itself)."""
+        if not getattr(self, "_ae_mod_hoisted", False):
+            return None
+        return self.AE_MOD_TABLE_DRAM + n * 3 * self.AE_HIDDEN * 2
+
+    def _ae_emit_modulation_table(self, sched):
+        """All AE_MOD_ROWS conditioning rows for the current step, column-sharded
+        across every engine (see AE_HOIST_ADARMS_DENSE). Reads AE_COND_DRAM (the
+        primary wrote it before this region's opening rendezvous) and leaves the
+        table complete at the region's join, before any layer reads a row."""
+        H = self.AE_HIDDEN
+        bpe = 2
+        N = 3 * H
+        rows = []
+        for l in range(self.AE_LAYERS):
+            la = self.ae_layer_addrs[l]
+            rows.append((la["pre_attn_norm_dense_scale"], la["pre_attn_norm_dense_data"],
+                         la["pre_attn_norm_dense_bias"]))
+            rows.append((la["pre_ffw_norm_dense_scale"], la["pre_ffw_norm_dense_data"],
+                         la["pre_ffw_norm_dense_bias"]))
+        rows.append((self.ae_final_norm_dense_scale, self.ae_final_norm_dense_data,
+                     self.ae_final_norm_dense_bias))
+        assert len(rows) == self.AE_MOD_ROWS
+
+        def _body(ctx):
+            raw = ctx.unsafe_ue
+            r = raw.alloc_isa_reg()
+            raw.generate_instruction_add_set(r, 1)           # M == 1: the folded dynamic path
+            for n, (sc, da, bi) in enumerate(rows):
+                raw.matmat_mul_core(
+                    M=1, K=H, N=ctx.cols, A_DRAM_ADDR=self.AE_COND_DRAM,
+                    B_DRAM_ADDR=ctx.b_addr(da, H, TYPE.IF4),
+                    SCALE_DRAM_ADDR=ctx.scale_addr(sc, H),
+                    OUTPUT_DRAM_ADDR=self.AE_MOD_TABLE_DRAM + (n * N + ctx.col_offset) * bpe,
+                    C_DRAM_ADDR=bi + ctx.col_offset * bpe, bias_mode="broadcast_N",
+                    is_B_quantized=True, data_type=TYPE.IF4, gpr_M_reg=r)
+            raw.release_isa_reg()
+        sched.col_sharded_region(N, _body)                   # join=True: table complete on exit
+
     def _ae_ada_rms_norm(self, M, x_dram, dense_scale, dense_data, dense_bias,
-                          norm_out_dram, gate_bcast_dram, apply_gate=True, gpr_M_reg=None):
+                          norm_out_dram, gate_bcast_dram, apply_gate=True, gpr_M_reg=None,
+                          modulation_dram=None):
         """AdaRMSNorm: plain RMSNorm (no gamma) on x, then a conditioning Dense
         (cond(1,1024) -> (1,3*1024)) split into scale/shift/gate, broadcast over
         the M suffix rows, applied as normed*(1+scale)+shift. Writes the gate
@@ -3795,13 +4437,17 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # pointer row instead. See _ae_cond_M_reg in compile_denoise_loop.
         # Falls back to the legacy path when the reg is absent, so the standalone
         # callers (_ae_sincos_time_embed, the torch-ref harness) still work.
-        self._ae_matmul(1, H, 3 * H, self.AE_COND_DRAM, dense_scale, dense_data,
-                         self.AE_MODULATION_DRAM, bias_addr=dense_bias,
-                         gpr_M_reg=getattr(self, "_ae_cond_M_reg", None))
+        # ``modulation_dram`` (AE_HOIST_ADARMS_DENSE): this norm's (1, 3H) row was
+        # already computed for the step in _ae_emit_modulation_table; skip the dense.
+        if modulation_dram is None:
+            self._ae_matmul(1, H, 3 * H, self.AE_COND_DRAM, dense_scale, dense_data,
+                             self.AE_MODULATION_DRAM, bias_addr=dense_bias,
+                             gpr_M_reg=getattr(self, "_ae_cond_M_reg", None))
+            modulation_dram = self.AE_MODULATION_DRAM
         # 3. split scale/shift/gate (each H wide) and broadcast each to M rows
-        scale_addr = self.AE_MODULATION_DRAM
-        shift_addr = self.AE_MODULATION_DRAM + H * bpe
-        gate_addr = self.AE_MODULATION_DRAM + 2 * H * bpe
+        scale_addr = modulation_dram
+        shift_addr = modulation_dram + H * bpe
+        gate_addr = modulation_dram + 2 * H * bpe
         self._ae_broadcast_row(scale_addr, self.AE_SCALE_BCAST_DRAM, M, H)
         self._ae_broadcast_row(shift_addr, self.AE_SHIFT_BCAST_DRAM, M, H)
         if apply_gate:
@@ -3847,27 +4493,58 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     def _ae_attn_shardable(self, sched):
         """True iff the head-parallel attention block can run on this engine count.
 
-        The block partitions AE_HEADS=8 whole heads, so it needs ne | 8 (1/2/4/8).
-        Other counts (3, 5, 6, 7) keep the SERIAL attention path and shard only the
-        gated MLP -- degrade rather than assert, so --engines 6 still works exactly
-        as it did before this block existed.
+        The block partitions AE_HEADS=8 whole heads, so it needs ne | 8 (1/2/4/8),
+        or ne > 8 -- above the head count the split is CAPPED at one head per engine
+        and the surplus engines own none (see _ae_head_split). Other counts
+        (3, 5, 6, 7) keep the SERIAL attention path and shard only the gated MLP --
+        degrade rather than assert, so --engines 6 still works exactly as it did
+        before this block existed.
         """
-        return (sched is not None and sched.num_engines > 1
-                and self.AE_HEADS % sched.num_engines == 0)
+        if sched is None or sched.num_engines <= 1:
+            return False
+        ne = sched.num_engines
+        return ne > self.AE_HEADS or self.AE_HEADS % ne == 0
 
     def _ae_head_split(self, ne):
-        """Per-engine [first_head, head_count] over AE_HEADS. Requires ne | AE_HEADS.
+        """Per-engine [first_head, head_count] over AE_HEADS.
+
+        Legal for ne | AE_HEADS (an even split) or ne > AE_HEADS (the capped split
+        below); other counts are refused by the assert and take the serial path via
+        _ae_attn_shardable.
 
         The attention block is parallel over HEADS, not rows or columns of one
-        matmul: q/o weights are already stored per head (la["q_data"][h]), every
-        head's attention is independent (MQA -- they share one K/V), and there are
-        exactly AE_HEADS=8 of them, which is the device engine count. So the natural
-        unit here is the head, and the split must land on head boundaries.
+        matmul: q/o weights are already stored per head (la["q_data"][h]) and every
+        head's attention is independent (MQA -- they share one K/V). So the natural
+        unit here is the head, and the split must land on head boundaries. AE_HEADS=8
+        used to equal the device engine count; above 8 engines it no longer does,
+        which is what the cap exists for.
         """
         NH = self.AE_HEADS
+        if ne > NH:
+            # CAPPED: one head each for engines 0..NH-1, ZERO heads for the rest.
+            # A head cannot be split (q/o weights are stored per head and the
+            # attention call is per head range), and M=64 with 10 real action rows
+            # is far too thin to split the query axis instead, so the surplus
+            # engines simply do no attention work. They STILL take part in every
+            # rendezvous: the barriers here are emitted by MultiEngineScheduler
+            # over ALL engines (barrier() / col_sharded_region iterate
+            # self.engines), so a zero-head engine emits its full barrier slice
+            # and merely has nothing between the barriers.
+            _dbg = os.environ.get("PI05_AE_HEAD_ENGINES")
+            if _dbg:
+                # DEBUG ONLY: explicit engine list for heads 0..NH-1, e.g. "0,1,2,3,4,5,6,8".
+                eng = [int(x) for x in _dbg.split(",")]
+                assert len(eng) == NH and len(set(eng)) == NH and max(eng) < ne
+                return [(eng.index(e), 1) if e in eng else (NH, 0) for e in range(ne)]
+            if self.AE_PRIMARY_NO_HEAD:
+                # Heads 0..NH-1 on engines 1..NH; the primary (serial-op carrier)
+                # and engines NH+1.. own none. See AE_PRIMARY_NO_HEAD.
+                return [(NH, 0)] + [(e - 1, 1) if e <= NH else (NH, 0) for e in range(1, ne)]
+            return [(e, 1) if e < NH else (NH, 0) for e in range(ne)]
         assert NH % ne == 0, (
             f"denoise attention is HEAD-parallel: engines={ne} must divide "
-            f"AE_HEADS={NH} (use 1, 2, 4 or 8) so each engine owns whole heads")
+            f"AE_HEADS={NH} (use 1, 2, 4 or 8) or exceed it (9+ takes the capped "
+            f"path above) so each engine owns whole heads")
         per = NH // ne
         return [(e * per, per) for e in range(ne)]
 
@@ -3934,10 +4611,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         def _body(ctx):
             i = ctx.engine_idx
             h0, nh = heads[i]
-            assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
-                f"head shard mismatch on engine {i}: scheduler gives "
-                f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
-                f"{(h0 * D, nh * D)}")
+            if nh == 0:
+                return   # capped head split (ne > AE_HEADS): no attention work on
+                         # this engine. Its barrier slice is emitted by the
+                         # scheduler regardless, so the rendezvous stays symmetric.
+            # The scheduler's own column split only coincides with the head
+            # boundaries while ne divides AE_HEADS; above that the region's N is
+            # just a vehicle for the rendezvous and every address below is formed
+            # from the head index directly.
+            if self.AE_HEADS % sched.num_engines == 0:
+                assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
+                    f"head shard mismatch on engine {i}: scheduler gives "
+                    f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
+                    f"{(h0 * D, nh * D)}")
             raw, mreg = ctx.unsafe_ue, gpr_M_regs[i]
             for h in range(h0, h0 + nh):
                 self._ae_matmul(M, H, D, self.AE_NORM_DRAM, la["q_scale"][h], la["q_data"][h],
@@ -3985,7 +4671,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # attention over the FULL NH*M batch, which reads rows every worker wrote.
         sched.col_sharded_region(NH * D, _body, join=True)
 
-    def _ae_attention_sharded(self, sched, S, Tkv, k_combined, v_combined):
+    def _ae_attention_sharded(self, sched, S, Tkv, k_combined, v_combined, v_t=None):
         """HEAD-PARALLEL rectangular attention -- the middle of the q/attn/o block.
 
         The serial path issues ONE call at batch=AE_HEADS*S over the whole Q blob.
@@ -4025,20 +4711,36 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         def _body(ctx):
             i = ctx.engine_idx
             h0, nh = heads[i]
-            assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
-                f"head shard mismatch on engine {i}: scheduler gives "
-                f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
-                f"{(h0 * D, nh * D)}")
-            row0 = h0 * S
-            ctx.unsafe_ue.unified_attention_core_dynamic(
-                batch=nh * S, aligned_seq_len=Tkv, head_dim=D,
-                Q_DRAM_ADDR=self.AE_Q_ROPE_DRAM + row0 * D * bpe,
-                K_DRAM_ADDR=k_combined,          # MQA: shared, read-only
-                V_DRAM_ADDR=v_combined,
-                BIAS_DRAM_ADDR=self.AE_UATTN_BIAS_DRAM + row0 * Tkv * bpe,
-                OUTPUT_DRAM_ADDR=self.AE_ATTN_OUT_DRAM + row0 * D * bpe,
-                SCRATCH_DRAM_ADDR=self.AE_UATTN_SCRATCH_SHARDED[i],
-                IDENTITY_DRAM_ADDR=self.identity_addr)
+            if nh == 0:
+                return   # capped head split (ne > AE_HEADS): no attention work on
+                         # this engine. Its barrier slice is emitted by the
+                         # scheduler regardless, so the rendezvous stays symmetric.
+            # The scheduler's own column split only coincides with the head
+            # boundaries while ne divides AE_HEADS; above that the region's N is
+            # just a vehicle for the rendezvous and every address below is formed
+            # from the head index directly.
+            if self.AE_HEADS % sched.num_engines == 0:
+                assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
+                    f"head shard mismatch on engine {i}: scheduler gives "
+                    f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
+                    f"{(h0 * D, nh * D)}")
+            # (row0, query rows) per call. AE_TRIM_ATTN_BATCH: one call per head at
+            # the S_M real rows; otherwise one call over the contiguous nh*S rows.
+            if self.AE_TRIM_PAD_ROWS and self.AE_TRIM_ATTN_BATCH:
+                calls = [(h * S, self.AE_ACTION_HORIZON) for h in range(h0, h0 + nh)]
+            else:
+                calls = [(h0 * S, nh * S)]
+            for row0, nrows in calls:
+                ctx.unsafe_ue.unified_attention_core_dynamic(
+                    batch=nrows, aligned_seq_len=Tkv, head_dim=D,
+                    Q_DRAM_ADDR=self.AE_Q_ROPE_DRAM + row0 * D * bpe,
+                    K_DRAM_ADDR=k_combined,          # MQA: shared, read-only
+                    V_DRAM_ADDR=v_combined,
+                    BIAS_DRAM_ADDR=self.AE_UATTN_BIAS_DRAM + row0 * Tkv * bpe,
+                    OUTPUT_DRAM_ADDR=self.AE_ATTN_OUT_DRAM + row0 * D * bpe,
+                    SCRATCH_DRAM_ADDR=self.AE_UATTN_SCRATCH_SHARDED[i],
+                    IDENTITY_DRAM_ADDR=self.identity_addr,
+                    V_T_DRAM_ADDR=v_t)               # shared V^T cache (None -> core transposes)
 
         # join=True: _ae_o_proj_sharded's own opening rendezvous already fences
         # AE_ATTN_OUT_DRAM, but the o-proj is only ONE of this buffer's readers --
@@ -4068,10 +4770,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         def _body(ctx):
             i = ctx.engine_idx
             h0, nh = heads[i]
-            assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
-                f"head shard mismatch on engine {i}: scheduler gives "
-                f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
-                f"{(h0 * D, nh * D)}")
+            if nh == 0:
+                return   # capped head split (ne > AE_HEADS): no attention work on
+                         # this engine. Its barrier slice is emitted by the
+                         # scheduler regardless, so the rendezvous stays symmetric.
+            # The scheduler's own column split only coincides with the head
+            # boundaries while ne divides AE_HEADS; above that the region's N is
+            # just a vehicle for the rendezvous and every address below is formed
+            # from the head index directly.
+            if self.AE_HEADS % sched.num_engines == 0:
+                assert (ctx.col_offset, ctx.cols) == (h0 * D, nh * D), (
+                    f"head shard mismatch on engine {i}: scheduler gives "
+                    f"{(ctx.col_offset, ctx.cols)}, heads {h0}..{h0 + nh - 1} need "
+                    f"{(h0 * D, nh * D)}")
             raw, mreg = ctx.unsafe_ue, gpr_M_regs[i]
             part = sched.per_engine_addr(partial_name, i)
             # Same C_DRAM_ADDR chain as the serial path, over a subset of heads.
@@ -4088,8 +4799,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # join=False: reduce_add opens with its own rendezvous and the partials are
         # meaningless until it runs, so joining here would just add a barrier.
         sched.col_sharded_region(NH * D, _body, join=False)
-        sched.reduce_add([sched.per_engine_addr(partial_name, i) for i in range(ne)],
-                         self.AE_O_PROJ_DRAM, M, H, join=False)
+        partials = [sched.per_engine_addr(partial_name, i) for i in range(ne)]
+        if heads[0][1] == 0 and not os.environ.get("PI05_AE_NOZERO"):   # env: DEBUG bisect only
+            # Primary owns no head: its partial slot IS AE_O_PROJ_DRAM (stale sum
+            # from the previous layer-step). Substitute the never-written zero
+            # buffer so the reduce sums exactly the worker partials.
+            partials[0] = self.AE_O_PROJ_ZERO_DRAM
+        sched.reduce_add(partials, self.AE_O_PROJ_DRAM, M, H, join=False, parallel=True)
 
     def _ae_gated_mlp_sharded(self, sched, M, x_dram, la, out_dram, gpr_M_regs, partial_name):
         H, I = self.AE_HIDDEN, self.AE_INTERMEDIATE
@@ -4149,7 +4865,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # NEXT region's opening rendezvous, so the exit barrier is redundant. That
         # halves the barrier count over 180 layer executions (360 instead of 540).
         sched.reduce_add([sched.per_engine_addr(partial_name, i) for i in range(ne)],
-                         out_dram, M, H, join=False)
+                         out_dram, M, H, join=False, parallel=True)
 
     def _ae_sincos_time_embed(self, t_scalar):
         """Host-computed sincos timestep embedding (dim=AE_HIDDEN, matches
@@ -4379,11 +5095,18 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         v_combined = self.ae_v_combined[layer_idx]
 
         _pfx = f"step{step}_layer{layer_idx}" if step is not None else f"layer{layer_idx}"
+        # MEASUREMENT HOOK: PI05_AE_EXTRA_BARRIERS=N adds N all-engine rendezvous per
+        # layer-step (N x 180 per inference). Diff the denoise time against N=0 for the
+        # per-rendezvous cost at this engine count under real conditions.
+        _xb = int(os.environ.get("PI05_AE_EXTRA_BARRIERS", "0"))
+        if _xb and sched is not None and sched.num_engines > 1:
+            for _ in range(_xb):
+                sched.barrier()
 
         # 1. AdaRMSNorm (attention conditioning)
         self._ae_ada_rms_norm(S, x_in_dram, la["pre_attn_norm_dense_scale"], la["pre_attn_norm_dense_data"],
                                la["pre_attn_norm_dense_bias"], self.AE_NORM_DRAM, self.AE_GATE_BCAST_DRAM,
-                               gpr_M_reg=gpr_M_reg)
+                               gpr_M_reg=gpr_M_reg, modulation_dram=self._ae_mod_row(2 * layer_idx))
         self._debug_op(f"{_pfx}_preattn_norm", self.AE_NORM_DRAM, S * H, shape=(S, H))
         self._debug_op(f"{_pfx}_attn_gate", self.AE_GATE_BCAST_DRAM, S * H, shape=(S, H))
         _p0l0 = self.DENOISE_STEP0_PROBE and step == 0 and layer_idx == 0
@@ -4418,6 +5141,34 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 gpr_M_reg=gpr_M_reg)
         self._ae_matmul(S, H, D, self.AE_NORM_DRAM, la["v_scale"], la["v_data"],
                          v_combined + P * D * 2, gpr_M_reg=gpr_M_reg)
+        # 2b. V^T cache (AE_VT_CACHE, see the class attribute). Emitted on the
+        #     PRIMARY, before the attention region's opening rendezvous, so every
+        #     engine's context matmul reads a complete [D, Tkv] V^T.
+        vt_addr = None
+        if layer_idx == 0 and (step is None or step == 0):
+            _trim_attn = self.AE_TRIM_PAD_ROWS and self.AE_TRIM_ATTN_BATCH
+            _original_print(f"  [denoise] attention batch: {S_M if _trim_attn else S} query rows per "
+                            f"head per call over Tkv={Tkv} ({'TRIMMED' if _trim_attn else 'padded'}); "
+                            f"V^T cache {'ON' if self.AE_VT_CACHE else 'OFF'}; heads on engines "
+                            f"{[i for i, (_, nh) in enumerate(self._ae_head_split(sched.num_engines)) if nh] if sched is not None and sched.num_engines > 1 else [0]}")
+        if self.AE_VT_CACHE:
+            vt_addr = self.ae_vt_cache[layer_idx]
+            if step is None or step == 0:
+                # Full transpose once per layer: prefix rows (seeded at program
+                # start) + this step's suffix rows (written just above).
+                self.bf16_transpose_core(M=Tkv, N=D, INPUT_DRAM_ADDR=v_combined,
+                                         OUTPUT_DRAM_ADDR=vt_addr,
+                                         IDENTITY_DRAM_ADDR=self.identity_addr)
+            else:
+                # Only the S suffix rows changed: transpose them to a [D, S] block
+                # and scatter it into columns [P:P+S] (row stride Tkv) of the cache.
+                self.bf16_transpose_core(M=S, N=D, INPUT_DRAM_ADDR=v_combined + P * D * 2,
+                                         OUTPUT_DRAM_ADDR=self.ae_vt_suffix_tmp,
+                                         IDENTITY_DRAM_ADDR=self.identity_addr)
+                self.accelerator_memory_to_sram(self.ae_vt_suffix_tmp, 0x00000, D * S)
+                self.sram_to_accelerator_memory(0x00000, vt_addr + P * 2, D * S,
+                                                stride_bytes_per_chunk=S * 2,
+                                                stride_jump_bytes=Tkv * 2)
         self._debug_op(f"{_pfx}_kv_proj", k_combined + P * D * 2, S * D, shape=(S, D))
         if _p0l0:
             self._dram_copy(S * D * 2, k_combined + P * D * 2, self.AE_P0_L0_KSUF)
@@ -4491,13 +5242,21 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         #    same call over its own slice (see _ae_attention_sharded). Otherwise the
         #    single full-batch call below, byte-identical to the serial path.
         if _proj_sharded:
-            self._ae_attention_sharded(sched, S, Tkv, k_combined, v_combined)
+            self._ae_attention_sharded(sched, S, Tkv, k_combined, v_combined, v_t=vt_addr)
         else:
-            self.unified_attention_core_dynamic(
-                batch=self.AE_UATTN_BATCH, aligned_seq_len=Tkv, head_dim=D,
-                Q_DRAM_ADDR=self.AE_Q_ROPE_DRAM, K_DRAM_ADDR=k_combined, V_DRAM_ADDR=v_combined,
-                BIAS_DRAM_ADDR=self.AE_UATTN_BIAS_DRAM, OUTPUT_DRAM_ADDR=self.AE_ATTN_OUT_DRAM,
-                SCRATCH_DRAM_ADDR=self.AE_UATTN_SCRATCH_DRAM, IDENTITY_DRAM_ADDR=self.identity_addr)
+            if self.AE_TRIM_PAD_ROWS and self.AE_TRIM_ATTN_BATCH:
+                _calls = [(h * S, S_M) for h in range(self.AE_HEADS)]   # see AE_TRIM_ATTN_BATCH
+            else:
+                _calls = [(0, self.AE_UATTN_BATCH)]
+            for _row0, _nrows in _calls:
+                self.unified_attention_core_dynamic(
+                    batch=_nrows, aligned_seq_len=Tkv, head_dim=D,
+                    Q_DRAM_ADDR=self.AE_Q_ROPE_DRAM + _row0 * D * 2,
+                    K_DRAM_ADDR=k_combined, V_DRAM_ADDR=v_combined,
+                    BIAS_DRAM_ADDR=self.AE_UATTN_BIAS_DRAM + _row0 * Tkv * 2,
+                    OUTPUT_DRAM_ADDR=self.AE_ATTN_OUT_DRAM + _row0 * D * 2,
+                    SCRATCH_DRAM_ADDR=self.AE_UATTN_SCRATCH_DRAM, IDENTITY_DRAM_ADDR=self.identity_addr,
+                    V_T_DRAM_ADDR=vt_addr)
         self._debug_op(f"{_pfx}_flash_attn_out", self.AE_ATTN_OUT_DRAM, S * D, shape=(S, D))
         if getattr(self, "DENOISE_STEP0_PROBE", False) and step == 0 and layer_idx == 0:
             self._dram_copy(self.AE_HEADS * S * D * 2, self.AE_ATTN_OUT_DRAM, self.AE_P0_L0_ATTNRAW)  # all heads raw attn
@@ -4543,7 +5302,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # 7. AdaRMSNorm (mlp conditioning)
         self._ae_ada_rms_norm(S, self.AE_RESIDUAL_DRAM, la["pre_ffw_norm_dense_scale"],
                                la["pre_ffw_norm_dense_data"], la["pre_ffw_norm_dense_bias"],
-                               self.AE_NORM_DRAM, self.AE_GATE_BCAST_DRAM, gpr_M_reg=gpr_M_reg)
+                               self.AE_NORM_DRAM, self.AE_GATE_BCAST_DRAM, gpr_M_reg=gpr_M_reg,
+                               modulation_dram=self._ae_mod_row(2 * layer_idx + 1))
         self._debug_op(f"{_pfx}_preffw_norm", self.AE_NORM_DRAM, S * H, shape=(S, H))
 
         # 8. gated MLP + gated residual
@@ -4630,6 +5390,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     "the denoise stage is sharded but weight_init_action_expert did not "
                     "store the K-sliced mlp-down blobs -- DENOISE_NUM_ENGINES must be "
                     "resolvable to the same value at weight-init time as it is here.")
+            # The blobs were CUT at weight-init time against the engine count as it
+            # was resolvable THEN. If that split disagrees with the one this compile
+            # will shard by, every engine multiplies the wrong K-slice: finite,
+            # plausible, wrong -- never a crash. Compare the actual boundaries.
+            assert getattr(self, "_ae_mlp_down_k_split", None) == self._col_split(
+                    self.AE_INTERMEDIATE, ne), (
+                f"mlp_down K-slice mismatch: weight-init cut the blobs for "
+                f"{getattr(self, '_ae_mlp_down_k_split', None)} but this compile shards "
+                f"by {self._col_split(self.AE_INTERMEDIATE, ne)}")
             # Per-engine [S, I/ne] lanes for gate / up / gelu-mult. matmat_mul_core's
             # writeback stride is N*bpe for the N IT WAS GIVEN, so calling it with
             # N=cols writes a DENSE [S, cols] block -- each engine owns its own
@@ -4659,7 +5428,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # Plain allocate_tensor_dram (not register_per_engine): these are
                 # pure scratch that no engine reads across a barrier and that never
                 # needs a primary-address alias or an init tensor.
-                _nh = self.AE_HEADS // ne
+                # Sized from the LARGEST per-engine head count, not AE_HEADS//ne:
+                # above 8 engines that division is 0 while engines 0..7 still own
+                # one head each. Engines with no heads get a buffer they never
+                # touch (harmless waste); an engine that DOES write one and has no
+                # buffer would be silent DRAM corruption.
+                _nh = max(nh for _, nh in self._ae_head_split(ne))
                 _D, _Tkv = self.HEAD_DIM, self.AE_TKV
                 _ushard = _D * _Tkv + _Tkv * _Tkv + _nh * S * _D
                 self.AE_UATTN_SCRATCH_SHARDED = [
@@ -4671,7 +5445,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             else:
                 print(f"    [denoise] engines={ne} does not divide AE_HEADS="
                       f"{self.AE_HEADS}; attention stays SERIAL, only the gated MLP is "
-                      f"sharded (~60% coverage). Use 2, 4 or 8 for the full ~97%.")
+                      f"sharded (~60% coverage). Use 2, 4 or 8 -- or more than "
+                      f"{self.AE_HEADS}, which takes the capped head split -- for the "
+                      f"full ~97%.")
             self.dram_region_map(f"denoise sharded x{ne}")
             sched.begin_program()
 
@@ -4704,7 +5480,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # ae_S_regs, so it needs its own per-engine register (same reasoning: a
         # worker's register indices are its own).
         ne_ae = sched.num_engines if sched is not None else 1
-        nh_per = (self.AE_HEADS // ne_ae) if self._ae_attn_shardable(sched) else self.AE_HEADS
+        nh_per = (max(nh for _, nh in self._ae_head_split(ne_ae))
+                  if self._ae_attn_shardable(sched) else self.AE_HEADS)
         self._ae_rope_M_regs = []
         for eng in ([self] + list(sched.workers if sched is not None else [])):
             r = eng.alloc_isa_reg()
@@ -4794,6 +5571,17 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 if self.DENOISE_STEP0_PROBE and step == 0:
                     self._dram_copy(1 * H * 2, self.AE_COND_DRAM, self.AE_P0_TIME_EMB)
 
+                # Hoisted AdaRMSNorm conditioning for this step (AE_HOIST_ADARMS_DENSE):
+                # every engine computes a column slice of all 37 rows, once, instead
+                # of the primary running 37 M=1 denses inside the layers.
+                self._ae_mod_hoisted = False
+                if self.AE_HOIST_ADARMS_DENSE and sched is not None and sched.num_engines > 1:
+                    self._ae_emit_modulation_table(sched)
+                    self._ae_mod_hoisted = True
+                    if step == 0:
+                        _original_print(f"  [denoise] AdaRMS conditioning hoisted: {self.AE_MOD_ROWS} rows x "
+                                        f"N={3 * H} per step, column-sharded over {sched.num_engines} engines")
+
                 # 18 action-expert layers
                 x_cur = self.AE_ACTION_TOK_DRAM
                 for layer_idx in range(self.AE_LAYERS):
@@ -4812,7 +5600,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 self._ae_ada_rms_norm(S, x_cur, self.ae_final_norm_dense_scale,
                                        self.ae_final_norm_dense_data, self.ae_final_norm_dense_bias,
                                        self.AE_NORM_DRAM, self.AE_GATE_BCAST_DRAM, apply_gate=False,
-                                       gpr_M_reg=ae_S_reg)
+                                       gpr_M_reg=ae_S_reg,
+                                       modulation_dram=self._ae_mod_row(2 * self.AE_LAYERS))
                 self._debug_op(f"step{step}_final_ada_rms_norm", self.AE_NORM_DRAM, S * H, shape=(S, H))
 
                 # action_out_proj: (S,H) -> v_t (S,64). Output N padded 32->64 (weight
@@ -5989,8 +6778,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         if seconds <= 0:
             return
         eff, hw = flops if isinstance(flops, (tuple, list)) else (flops, flops)
+        # Engine count for the ceiling: the PEAK across stages, not NUM_ENGINES.
+        # The per-stage flags (--vis_4 / --pref_8 / --dns_8) leave NUM_ENGINES at 1
+        # while a stage really runs on 4-8, which would report a 38.4 GFLOP/s ceiling
+        # and print several hundred %-of-peak. That %-check is the only self-check on
+        # the issued-FLOP model, so a ceiling that low makes it useless.
+        _peak_ne = max([self.NUM_ENGINES]
+                       + [self._num_engines(s) for s in ("VIS", "PREFIX", "DENOISE")])
         peak = self.DEVICE_PEAK_GFLOPS or (
-            self.MACS_PER_CYCLE * 2 / (self.CYCLE_NS * 1e-9) / 1e9 * self.NUM_ENGINES)
+            self.MACS_PER_CYCLE * 2 / (self.CYCLE_NS * 1e-9) / 1e9 * _peak_ne)
         rate = hw / seconds / 1e9
         pct = 100 * rate / peak
         print(f"  ⚡ {label:<18} {seconds:6.1f}s")
@@ -6070,7 +6866,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         real, pad = self.AE_ACTION_HORIZON, self.AE_ACTION_HORIZON_PADDED
         eff = one(real, real, self.AE_ACTION_DIM_REAL, P + real)
         # Attention always runs the padded batch; the rest only when the trim is off.
-        hw = one(real if self.AE_TRIM_PAD_ROWS else pad, pad, self.AE_XT_WIDTH, P + pad)
+        _attn_rows = real if (self.AE_TRIM_PAD_ROWS and self.AE_TRIM_ATTN_BATCH) else pad
+        hw = one(real if self.AE_TRIM_PAD_ROWS else pad, _attn_rows, self.AE_XT_WIDTH, P + pad)
         return eff, hw
 
     def precompile_all(self):
@@ -7360,7 +8157,7 @@ def configure_engines(engines=1, vis_4=False, pref_8=False, dns_8=False, vis_m_s
     what the caller thought, because the knobs are class attributes that only
     main()'s argument parsing ever wrote.
 
-    `engines` is an int 1-8 or the literal "max"; normalize ONCE here so no
+    `engines` is an int 1-12 or the literal "max"; normalize ONCE here so no
     downstream comparison has to know which it got.
     """
     eng_max = (engines == "max")
@@ -7501,11 +8298,11 @@ def main():
             n = int(value)
         except ValueError:
             raise argparse.ArgumentTypeError(
-                f"--engines takes an integer 1-8 or 'max', got {value!r}")
-        if not 1 <= n <= 8:
+                f"--engines takes an integer 1-12 or 'max', got {value!r}")
+        if not 1 <= n <= 12:
             raise argparse.ArgumentTypeError(
-                f"--engines must be 1-8 (the ISA's flag-check addresses engines 0-7), "
-                f"got {n}")
+                f"--engines must be 1-12 (12 is the highest engine count exercised on "
+                f"this device; see ENGINE_INDEX_LIMIT), got {n}")
         return n
 
     ap.add_argument("--clean", action="store_true",
@@ -7517,18 +8314,55 @@ def main():
                      help="Number of accelerator engines to row-shard across. DEFAULT 1 = "
                           "the single-engine path, byte-identical to before; only an "
                           "explicit --engines N>1 enables sharding. Applies to the vision "
-                          "encoder (M=256 -> N blocks of 256/N rows) AND the prefix LM "
-                          "(S rows -> N uneven-but-64-aligned block groups); the denoise "
-                          "stage will adopt the same knob. 8 is the device max (the ISA's "
-                          "flag-check addresses engine 0-7).\n"
+                          "encoder (M=256 rows, split at a granularity DERIVED from the "
+                          "engine count -- 32 rows at ne<=8, 4 at ne=12) AND the prefix LM "
+                          "(S rows -> N 8-row block groups); the denoise stage is column/"
+                          "head-split instead (M=64 is one row block). 12 is the max, and "
+                          "is the highest count actually exercised on this device.\n"
+                          "NOTE above 8 engines: both attention blocks are HEAD-split and "
+                          "there are only 8 heads (NUM_HEADS / AE_HEADS), so engines 8-11 "
+                          "own zero heads and idle through attention. They still emit every "
+                          "rendezvous slice, so this costs time, not correctness. "
+                          "Everything else -- projections, MLP, RoPE/KV staging -- is "
+                          "12-wide.\n"
                           "--engines max applies EACH STAGE'S OWN CEILING rather than one "
-                          "number: vision 4, prefix 8, denoise 8 (STAGE_MAX_ENGINES). A flat "
-                          "--engines 8 is NOT the same thing and is wrong for vision, which "
-                          "asserts above 4 -- S=256/slot is only 4 blocks of 64. This is the "
-                          "recommended way to run fully sharded; it is exactly equivalent to "
-                          "--vis_4 --pref_8 --dns_8. Those three still exist for isolating one "
+                          "number: vision 12, prefix 12, denoise 12 (STAGE_MAX_ENGINES). "
+                          "The three per-stage flags still exist for isolating one "
                           "stage at a time (e.g. --vis_4 alone gives a single-engine prefix "
                           "baseline) and take precedence over this flag.")
+    ap.add_argument("--prefix_shard_primary", action=argparse.BooleanOptionalAction, default=None,
+                     help="Prefix: run RoPE, the Q permute, the KV-cache staging and the attention-"
+                          "output permute per engine over its own rows instead of on the primary "
+                          "alone, dropping two rendezvous per layer (default on; bit-identical). "
+                          "--no-prefix_shard_primary for the A/B.")
+    ap.add_argument("--ae_primary_no_head", action=argparse.BooleanOptionalAction, default=None,
+                     help="Denoise, >8 engines: keep the primary free of attention heads so the "
+                          "serial ops it carries are not stacked on a head's work (default on).")
+    ap.add_argument("--ae_hoist_adarms", action=argparse.BooleanOptionalAction, default=None,
+                     help="Denoise: compute all 37 AdaRMSNorm conditioning rows once per step, "
+                          "column-sharded over every engine, instead of 37 M=1 matmuls on the "
+                          "primary inside the layers (default on; bit-identical).")
+    ap.add_argument("--ae_trim_attn_batch", action=argparse.BooleanOptionalAction, default=None,
+                     help="Denoise: run attention on the 10 real query rows per head instead of the "
+                          "64 padded ones (default on; one call per head). --no-ae_trim_attn_batch "
+                          "restores the padded batch for the A/B.")
+    ap.add_argument("--ae_vt_cache", action=argparse.BooleanOptionalAction, default=None,
+                     help="Denoise: build each layer's V^T once (primary, step 0) and update only "
+                          "the 64 suffix columns per step, instead of every engine transposing the "
+                          "full 896-row V on every one of the 180 layer-steps (default on). "
+                          "--no-ae_vt_cache restores the per-call transpose for the A/B.")
+    ap.add_argument("--vis_weight_copies", default=None, metavar="N|auto",
+                     help="Private per-engine copies of the vision layer weights (default auto = "
+                          "as many as fit, capped at one set per vision engine). Engine e streams "
+                          "q/k/v/o/fc1/fc2 from set e %% n_sets, so concurrent reads spread over "
+                          "n_sets address streams instead of serializing on one (measured 10.6 vs "
+                          "42.6 GB/s at 12 engines). Pass 1 for the no-copy A/B baseline.")
+    ap.add_argument("--vis_attn_head_shard", action=argparse.BooleanOptionalAction, default=None,
+                     help="Split the VISION encoder's attention block by HEADS (default on): "
+                          "each engine owns whole heads over all 256 query rows, so V^T and the "
+                          "K/V gathers happen once per head machine-wide instead of once per head "
+                          "PER ENGINE. --no-vis_attn_head_shard restores the row split (every "
+                          "engine loops all 16 heads on its own row slice) for the A/B.")
     ap.add_argument("--vis_m_shard", action=argparse.BooleanOptionalAction, default=None,
                      help="Shard the VISION encoder by ROWS ONLY (32 rows/engine at 8), "
                           "instead of the default 2D 4-row-groups x 2-K-lanes grid. The "
@@ -7635,6 +8469,28 @@ def main():
     _multi = configure_engines(args.engines, vis_4=args.vis_4, pref_8=args.pref_8,
                                vis_m_shard=args.vis_m_shard,
                                dns_8=args.dns_8, tag="main")
+    if args.vis_attn_head_shard is not None:
+        Pi05Libero_UnifiedEngine.VIS_ATTN_HEAD_SHARD = bool(args.vis_attn_head_shard)
+        print(f"[main] vision attention split: {'HEADS' if args.vis_attn_head_shard else 'ROWS'}")
+    if args.prefix_shard_primary is not None:
+        Pi05Libero_UnifiedEngine.PREFIX_SHARD_PRIMARY = bool(args.prefix_shard_primary)
+        print(f"[main] prefix primary-only region sharded: {bool(args.prefix_shard_primary)}")
+    if args.ae_primary_no_head is not None:
+        Pi05Libero_UnifiedEngine.AE_PRIMARY_NO_HEAD = bool(args.ae_primary_no_head)
+        print(f"[main] denoise primary owns a head: {not args.ae_primary_no_head}")
+    if args.ae_hoist_adarms is not None:
+        Pi05Libero_UnifiedEngine.AE_HOIST_ADARMS_DENSE = bool(args.ae_hoist_adarms)
+        print(f"[main] denoise AdaRMS conditioning hoisted: {bool(args.ae_hoist_adarms)}")
+    if args.ae_trim_attn_batch is not None:
+        Pi05Libero_UnifiedEngine.AE_TRIM_ATTN_BATCH = bool(args.ae_trim_attn_batch)
+        print(f"[main] denoise attention batch: {'TRIMMED to real rows' if args.ae_trim_attn_batch else 'padded 64'}")
+    if args.ae_vt_cache is not None:
+        Pi05Libero_UnifiedEngine.AE_VT_CACHE = bool(args.ae_vt_cache)
+        print(f"[main] denoise V^T cache: {'ON' if args.ae_vt_cache else 'OFF (per-call transpose)'}")
+    if args.vis_weight_copies is not None:
+        _v = args.vis_weight_copies.strip().lower()
+        Pi05Libero_UnifiedEngine.VIS_WEIGHT_COPIES = "auto" if _v == "auto" else int(_v)
+        print(f"[main] vision weight sets: {Pi05Libero_UnifiedEngine.VIS_WEIGHT_COPIES}")
 
     PREFIX_KV_DUMP_PATH = os.path.join(os.path.dirname(__file__), "debug_prefix_kv.npz")
 
@@ -7686,7 +8542,11 @@ def main():
     if args.clean:
         clean_bins(BIN_DIR)
     _bin_ok = not (args.debug or args.sanity_check or args.probe_step0
-                   or args.vis_m_shard is not None
+                   or args.vis_m_shard is not None or args.vis_attn_head_shard is not None
+                   or args.vis_weight_copies is not None or args.ae_vt_cache is not None
+                   or args.ae_trim_attn_batch is not None
+                   or args.ae_primary_no_head is not None or args.ae_hoist_adarms is not None
+                   or args.prefix_shard_primary is not None
                    or args.encoderend or args.prefixend)
     _stem = _programs_stem(_configured_engines(Pi05Libero_UnifiedEngine))
     bins_exist = _bin_ok and os.path.exists(os.path.join(BIN_DIR, "params.bin")) \
