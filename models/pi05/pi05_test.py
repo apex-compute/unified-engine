@@ -2834,6 +2834,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         """
         if getattr(self, "_vis_weight_sets", None) is not None:
             return
+        if getattr(self, "vis_layer_addrs", None) is None:
+            # Bin replay (Pi05Libero_Run): no weight unpack, nothing to duplicate.
+            self._vis_weight_sets = []
+            return
         self._vis_weight_sets = [self.vis_layer_addrs]
         MB = 1 << 20
         ne_vis = self._num_engines("VIS")
