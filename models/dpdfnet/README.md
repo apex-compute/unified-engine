@@ -7,9 +7,12 @@ FP32 `[1, 1, 161, 2]` plus a flat 45,424-element recurrent state, and returns
 one enhanced frame plus the next state. STFT and iSTFT are intentionally host
 operations and are not present in the ONNX graph.
 
-For the current comparison with the native 8-kHz model, including measured
-real-time factors, CPU agreement, listening samples and the verified DRAM
-execution sequence, see [DUAL_RATE_BENCHMARK.md](DUAL_RATE_BENCHMARK.md).
+The [four-variant RK-256 performance report](RK256_PRECISION_BENCHMARK.md)
+compares 8-kHz BF16, 8-kHz IF8, 16-kHz BF16 and 16-kHz IF4/IF8 on build
+`40519e0a`: audio RTF, 10-ms deadlines, CPU agreement, all four bin sizes,
+listening samples and single-bin DRAM execution.
+The earlier [dual-rate benchmark](DUAL_RATE_BENCHMARK.md) covers the default
+8-kHz and 16-kHz bins.
 The [noisy-audio report](validation/20260914_noisy20s/README.md) includes eight
 tests over 20 seconds, both models’ FPGA WAVs, and KU5P resource utilization.
 The [BF16 comparison](validation/20260914_bf16/README.md) measures both models

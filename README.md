@@ -181,7 +181,7 @@ engine today; each folder has its own README/config, and most LLMs ship a
 | YOLOv5s | [`models/yolov5s`](models/yolov5s) | Object detection (conv-enabled FPGA image required) |
 | Parakeet | [`models/parakeet`](models/parakeet) | Speech recognition (incl. streaming) |
 | UNET | [`models/unet`](models/unet) | Segmentation (conv-enabled FPGA image required) |
-| DPDFnet | [`models/dpdfnet`](models/dpdfnet) | Streaming speech enhancement (conv-enabled FPGA image required) |
+| DPDFnet | [`models/dpdfnet`](models/dpdfnet) | Streaming speech enhancement; [four-variant RK-256 performance report](models/dpdfnet/RK256_PRECISION_BENCHMARK.md) (conv-enabled FPGA image required) |
 | MobileSAM | [`models/mobilesam`](models/mobilesam) | Segmentation |
 | Swin | [`models/swin`](models/swin) | Image classification |
 
