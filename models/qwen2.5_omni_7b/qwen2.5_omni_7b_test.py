@@ -181,7 +181,19 @@ _PROGRAM_CODE_FILES = (
 
 def _acquire_run_lock() -> int:
     """Hold one process-wide lock across params, programs.bin, and FPGA use."""
-    fd = os.open(RUN_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o666)
+    # The lock guards one shared FPGA, so every user must take the same file.
+    # Whoever creates it first owns it, and their umask can leave it
+    # unwritable for the next user; flock() only needs an open descriptor, so
+    # fall back to read-only when write access is denied.
+    try:
+        fd = os.open(RUN_LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o666)
+    except PermissionError:
+        fd = os.open(RUN_LOCK_PATH, os.O_RDONLY)
+    else:
+        try:
+            os.fchmod(fd, 0o666)
+        except OSError:
+            pass
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -1040,6 +1052,449 @@ class Qwen25OmniUnifiedEngine(
         self._executed_program_stages.add("decode")
         return result
 
+    # ---- Run summary ------------------------------------------------------
+    # Same contract as gemma4_e2b_test.write_run_summary and the qwen2.5_vl_3b
+    # writer this model inherits its stages from: everything below reads an
+    # attribute a stage already stashed plus cheap host bookkeeping (file
+    # sizes, a program manifest, one register read), so writing a summary
+    # after a run launches no FPGA program and cannot perturb what it reports.
+
+    def per_core_peak_gflops(self) -> float:
+        """One engine's peak -- the denominator for anything core-0-only."""
+        cores = getattr(self, "multi_core", 1) or 1
+        return self.vis_peak_gflops() / cores
+
+    def stage_metrics(self, args) -> list[dict]:
+        """Work, FPGA time and wall time for every stage this run executed.
+
+        One row per stage in execution order. ``flops`` is the stage's own
+        reported FLOP count, ``us`` its HW-counter latency, and ``wall`` the
+        CPU timer around it; the difference between the last two is host
+        overhead (DMA, layout, detokenize), which is what to attack when
+        utilisation already looks good.
+        """
+        rows: list[dict] = []
+        if getattr(self, "_vis_latency_us", None):
+            dims = self._vision_dims()
+            rows.append({
+                "stage": "Vision encoder",
+                "detail": f"{dims['VS']} patches -> "
+                          f"{dims['NUM_MERGED_TOKENS']} soft tokens",
+                "flops": float(self._vis_total_flops),
+                "us": float(self._vis_latency_us),
+                "wall": float(getattr(self, "_vis_wall_s", 0.0)),
+            })
+        if getattr(self, "_audio_latency_us", None):
+            rows.append({
+                "stage": "Audio encoder",
+                "detail": f"{getattr(self, '_audio_num_tokens', 0)} soft tokens",
+                "flops": float(getattr(self, "_audio_total_flops", 0.0)),
+                "us": float(self._audio_latency_us),
+                "wall": float(getattr(self, "_audio_wall_s", 0.0)),
+            })
+        if getattr(self, "_latency_prefill_us", None):
+            rows.append({
+                "stage": "Prefill",
+                "detail": f"{getattr(self, '_prefill_seq_len_run', 0)} tokens",
+                "flops": float(getattr(self, "_prefill_flops", 0.0)),
+                "us": float(self._latency_prefill_us),
+                "wall": float(getattr(self, "_prefill_wall_s", 0.0)),
+            })
+        steps = getattr(self, "_decode_step_us", None)
+        if steps:
+            rows.append({
+                "stage": "Decode",
+                "detail": f"{len(steps)} steps, "
+                          f"{getattr(self, '_decode_n', len(steps))} tokens kept",
+                "flops": float(getattr(self, "_decode_step_flops", 0.0)),
+                "us": float(getattr(self, "_decode_total_us", 0.0)),
+                "wall": float(getattr(self, "_decode_wall_s", 0.0)),
+            })
+        peak = self.vis_peak_gflops()
+        core_peak = self.per_core_peak_gflops()
+        for row in rows:
+            row["gflops"] = row["flops"] / (row["us"] * 1e3) if row["us"] else 0.0
+            row["util_pct"] = 100.0 * row["gflops"] / peak if peak else 0.0
+            row["speedup"] = row["gflops"] / core_peak if core_peak else 0.0
+        return rows
+
+    def _stage_table(self, rows: list[dict]) -> list[str]:
+        """Headline table: work, time, throughput, % of peak, core scaling."""
+        cores = getattr(self, "multi_core", 1) or 1
+        out = [
+            "| Stage | Shape | Work (GFLOP) | FPGA time (ms) | Throughput "
+            "(GFLOPS) | % of peak | x 1-engine peak | CPU wall (s) |",
+            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for row in rows:
+            out.append(
+                f"| {row['stage']} | {row['detail']} | {row['flops'] / 1e9:.2f} | "
+                f"{row['us'] / 1e3:.1f} | {row['gflops']:.1f} | "
+                f"{row['util_pct']:.1f}% | {row['speedup']:.2f}x | "
+                f"{row['wall']:.2f} |"
+            )
+        total_flops = sum(row["flops"] for row in rows)
+        total_us = sum(row["us"] for row in rows)
+        total_wall = sum(row["wall"] for row in rows)
+        peak = self.vis_peak_gflops()
+        core_peak = self.per_core_peak_gflops()
+        total_gflops = total_flops / (total_us * 1e3) if total_us else 0.0
+        out.append(
+            f"| **TOTAL** | {cores} engines | **{total_flops / 1e9:.2f}** | "
+            f"**{total_us / 1e3:.1f}** | **{total_gflops:.1f}** | "
+            f"**{(100.0 * total_gflops / peak if peak else 0.0):.1f}%** | "
+            f"**{(total_gflops / core_peak if core_peak else 0.0):.2f}x** | "
+            f"**{total_wall:.2f}** |"
+        )
+        return out
+
+    def _profile_tables(self, stages) -> list[str]:
+        """Per-phase markdown tables, one per profiled stage.
+
+        Aggregation, the serial-phase peak guard and the column set are shared
+        with the terminal breakdown (print_profile_table), so the .md and the
+        console can never disagree about a phase.
+        """
+        peak = self.vis_peak_gflops()
+        out: list[str] = []
+        for title, note, results in stages:
+            if not results:
+                continue
+            rows = self._aggregate_vis_profile(results)
+            total = sum(row["ms"] for row in rows) or 1.0
+            out += [f"### {title}", ""]
+            if note:
+                out += [note, ""]
+            out += [
+                "| Phase | Calls | Total ms | Share | GFLOP | GFLOPS | % of peak |",
+                "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+            for name, n, ms, share, gflop, gflops, util in self._vis_profile_table(
+                rows, total
+            ):
+                out.append(
+                    f"| {name} | {n} | {ms:.2f} | {share:.1f}% | {gflop:.2f} | "
+                    f"{gflops:.1f} | {util:.1f}% |"
+                )
+            total_gflop = sum(row["flops"] for row in rows) / 1e9
+            total_rate = total_gflop / (total / 1e3) if total else 0.0
+            out.append(
+                f"| **TOTAL** | {len(results)} | **{total:.2f}** | 100.0% | "
+                f"**{total_gflop:.2f}** | **{total_rate:.1f}** | "
+                f"**{(100.0 * total_rate / peak if peak else 0.0):.1f}%** |"
+            )
+            out.append("")
+        return out
+
+    def _program_section_lines(self) -> list[str]:
+        """Per-stage programs.bin section sizes, read from the manifest."""
+        bundle = getattr(self, "_program_bundle", None)
+        if bundle is None:
+            return []
+        try:
+            manifest, _payload = bundle.load()
+        except Exception as exc:
+            return [f"- **programs.bin:** (manifest unreadable: {exc})"]
+        bin_path = bundle.bin_path
+        lines = [
+            f"- **Program bin:** `{os.path.basename(str(bin_path))}` — "
+            f"{os.path.getsize(bin_path) / 2**20:.2f} MiB "
+            f"({manifest['section_count']} sections)"
+        ]
+        per_stage: dict[str, list[int]] = {}
+        for section in manifest["sections"]:
+            per_stage.setdefault(section["name"], []).append(int(section["size"]))
+        for stage in sorted(per_stage):
+            sizes = per_stage[stage]
+            lines.append(
+                f"  - **{stage}:** {sum(sizes) / 2**20:.2f} MiB across "
+                f"{len(sizes)} engine sections "
+                f"(master {sizes[0] / 1024:.1f} KiB)"
+            )
+        return lines
+
+    def _multi_core_lines(self, rows: list[dict], profiles=None) -> list[str]:
+        """How well each stage actually used the engine split.
+
+        ``x 1-engine peak`` is the same measurement as ``% of peak``, just
+        expressed as a speedup, so restating it as an efficiency column would
+        add nothing.  What the table adds is the IMPLIED SERIAL FRACTION: solve
+        Amdahl for s given the achieved speedup S over N engines,
+        ``s = (N/S - 1) / (N - 1)``.  It is an upper bound on the truly serial
+        work, because everything else that costs time -- rendezvous waits, DMA
+        stalls, tiles that do not fill the MAC array -- lands in it too.  A
+        --profile run is what separates those: phases marked ``*`` there are
+        the genuinely engine-0-only ones.
+        """
+        cores = getattr(self, "multi_core", 1) or 1
+        core_peak = self.per_core_peak_gflops()
+        out = [
+            "## Multi-core scaling",
+            "",
+            f"This model requires exactly {REQUIRED_ENGINES} engines, so no "
+            f"1-engine baseline can be measured for comparison.  Speedup is "
+            f"therefore taken against one engine's PEAK "
+            f"({core_peak:.1f} GFLOPS), which makes it a lower bound on the "
+            f"sharding's true benefit: a stage that is inefficient for reasons "
+            f"unrelated to sharding is charged for that here as well.",
+            "",
+            f"| Stage | Throughput (GFLOPS) | x 1-engine peak (max "
+            f"{cores}.00x) | Implied serial fraction |",
+            "| :--- | ---: | ---: | ---: |",
+        ]
+        for row in rows:
+            speedup = row["speedup"]
+            if speedup > 0 and cores > 1:
+                serial = (cores / speedup - 1.0) / (cores - 1)
+                serial_s = f"{100.0 * max(0.0, min(1.0, serial)):.1f}%"
+            else:
+                serial_s = "n/a"
+            out.append(
+                f"| {row['stage']} | {row['gflops']:.1f} | {speedup:.2f}x | "
+                f"{serial_s} |"
+            )
+        out.append("")
+
+        # With profile data the engine-0-only phases can be named outright,
+        # which is the actionable half: those are what sharding has to remove.
+        serial_rows = []
+        for title, _note, results in (profiles or []):
+            if not results:
+                continue
+            aggregated = self._aggregate_vis_profile(results)
+            total_ms = sum(row["ms"] for row in aggregated) or 1.0
+            for row in aggregated:
+                if row.get("serial"):
+                    serial_rows.append(
+                        (title, row["phase"], row["ms"],
+                         100.0 * row["ms"] / total_ms)
+                    )
+        if serial_rows:
+            out += [
+                "Phases that ran on engine 0 alone, and their share of their "
+                "stage's FPGA time:",
+                "",
+                "| Stage | Phase | ms | Share of stage |",
+                "| :--- | :--- | ---: | ---: |",
+            ]
+            for title, phase, ms, share in serial_rows:
+                out.append(f"| {title} | {phase} | {ms:.2f} | {share:.1f}% |")
+            out.append("")
+        elif not profiles:
+            out += [
+                "Run with `--profile` to attribute that serial fraction to "
+                "named phases.",
+                "",
+            ]
+        return out
+
+    def write_run_summary(self, out_path: str, args, profiles=None) -> str:
+        """Write the per-run Markdown summary and return the path.
+
+        Two clocks are reported on purpose. The HW counter times the program on
+        the engines; the CPU timer wraps the whole stage including host work
+        (media preprocessing, embedding gather, RoPE and bias DMA, preamble
+        write, argmax readback, detokenize). Their ratio is the host overhead.
+        """
+        clock_ns = (getattr(self, "_clock_period_ns", None)
+                    or user_dma_core.CLOCK_CYCLE_TIME_NS)
+        freq_mhz = 1000.0 / clock_ns if clock_ns else 0.0
+        cores = getattr(self, "multi_core", 1) or 1
+        peak = self.vis_peak_gflops()
+        core_peak = self.per_core_peak_gflops()
+        try:
+            hw = (f"0x{self.user_read_reg32(user_dma_core.UE_FPGA_VERSION_ADDR) & 0xFFFFFFFF:08x}")
+        except Exception as exc:
+            hw = f"(read failed: {exc})"
+
+        params_bin = os.path.join(self.script_dir, self._cfg["paths"]["params"])
+        lines = [
+            "# qwen2.5_omni_7b run summary",
+            "",
+            f"- **Mode:** {_result_mode(args)}",
+            "",
+            "## Hardware",
+            "",
+            f"- **HW version:** {hw}",
+            f"- **Device:** {args.dev}",
+            f"- **Clock:** {clock_ns:.4f} ns ({freq_mhz:.1f} MHz)",
+            f"- **AXI data width:** {user_dma_core.UE_AXI_DATA_WIDTH_BITS} bits",
+            f"- **DRAM:** {user_dma_core.AVAILABLE_DRAM_SIZE_GB} GiB",
+            f"- **Engines in use:** {cores} of "
+            f"{user_dma_core.ANDROMEDA_CORE_COUNT} reported",
+            f"- **Peak throughput:** {peak:.1f} GFLOPS "
+            f"({freq_mhz:.1f} MHz x 128 FLOP/cycle x {cores} engines)",
+            f"- **Per-engine peak:** {core_peak:.1f} GFLOPS",
+            "",
+            "## Weights and programs",
+            "",
+        ]
+        if os.path.exists(params_bin):
+            lines.append(
+                f"- **Weight bin:** `{os.path.basename(params_bin)}` — "
+                f"{os.path.getsize(params_bin) / 2**20:.1f} MiB (validated "
+                f"against params.json)"
+            )
+        if getattr(self, "_lm_weight_init_done", False):
+            lines.append(
+                f"- **LM weight DRAM:** "
+                f"{(self._lm_weight_end - self.PARAMS_BASE) / 2**20:.1f} MiB "
+                f"(IF4 + BF16 V/O, IF8 embedding)"
+            )
+        lines += self._program_section_lines()
+        isa = self.isa_usage_lines()
+        if isa:
+            lines += ["", "### ISA usage", "", "```"]
+            lines += [line.rstrip() for line in isa]
+            lines += ["```"]
+        lines.append("")
+
+        rows = self.stage_metrics(args)
+        if rows:
+            lines += [
+                "## Stage summary",
+                "",
+                "FPGA time is the HW counter; CPU wall is the host-side timer "
+                "around the same stage. `x 1-engine peak` is the achieved rate "
+                "divided by ONE engine's peak: the effective speedup the "
+                f"{cores}-engine split delivered, against a ceiling of "
+                f"{cores}.00x.",
+                "",
+            ]
+            lines += self._stage_table(rows)
+            lines.append("")
+
+        if getattr(self, "_vis_latency_us", None):
+            dims = self._vision_dims()
+            lines += [
+                "## Vision",
+                "",
+                f"- **Image:** `{os.path.basename(getattr(args, 'image', '') or '')}` "
+                f"-> {dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens",
+                f"- **Work:** {self._vis_total_flops / 1e9:.1f} GFLOP",
+                f"- **HW latency:** {self._vis_latency_us / 1e3:.1f} ms",
+                f"- **Throughput:** {self._vis_gflops:.1f} GFLOPS "
+                f"({100.0 * self._vis_gflops / peak if peak else 0.0:.1f}% of peak)",
+                f"- **End-to-end (CPU timer):** "
+                f"{getattr(self, '_vis_wall_s', 0.0):.2f} s",
+                "",
+            ]
+
+        if getattr(self, "_audio_latency_us", None):
+            audio_gflops = getattr(self, "_audio_gflops", 0.0)
+            lines += [
+                "## Audio",
+                "",
+                f"- **Audio:** `{os.path.basename(getattr(args, 'audio', '') or '')}` "
+                f"-> {getattr(self, '_audio_num_tokens', 0)} soft tokens",
+                f"- **Work:** {getattr(self, '_audio_total_flops', 0) / 1e9:.1f} GFLOP",
+                f"- **HW latency:** {self._audio_latency_us / 1e3:.1f} ms",
+                f"- **Throughput:** {audio_gflops:.1f} GFLOPS "
+                f"({100.0 * audio_gflops / peak if peak else 0.0:.1f}% of peak)",
+                f"- **End-to-end (CPU timer):** "
+                f"{getattr(self, '_audio_wall_s', 0.0):.2f} s",
+                "",
+            ]
+
+        if getattr(self, "_latency_prefill_us", None):
+            prefill_gflops = getattr(self, "_prefill_gflops", 0.0)
+            lines += [
+                "## Prefill",
+                "",
+                f"- **Sequence length:** "
+                f"{getattr(self, '_prefill_seq_len_run', 0)} tokens",
+                f"- **Work:** {getattr(self, '_prefill_flops', 0) / 1e9:.1f} GFLOP",
+                f"- **HW latency:** {self._latency_prefill_us / 1e3:.1f} ms",
+                f"- **Throughput:** {prefill_gflops:.1f} GFLOPS "
+                f"({100.0 * prefill_gflops / peak if peak else 0.0:.1f}% of peak)",
+                f"- **End-to-end (CPU timer):** "
+                f"{getattr(self, '_prefill_wall_s', 0.0):.2f} s",
+                "",
+            ]
+
+        # TTFT ends at the decode-ready state, so it carries whichever encoders
+        # this request ran plus prefill.
+        pre_hw_us = float(getattr(self, "_latency_prefill_us", 0.0) or 0.0)
+        pre_wall = float(getattr(self, "_prefill_wall_s", 0.0) or 0.0)
+        if pre_hw_us or pre_wall:
+            enc_hw_us = float(getattr(self, "_vis_latency_us", 0.0) or 0.0)
+            enc_hw_us += float(getattr(self, "_audio_latency_us", 0.0) or 0.0)
+            enc_wall = float(getattr(self, "_vis_wall_s", 0.0) or 0.0)
+            enc_wall += float(getattr(self, "_audio_wall_s", 0.0) or 0.0)
+            covered = [name for name, seen in (
+                ("vision", getattr(self, "_vis_latency_us", None)),
+                ("audio", getattr(self, "_audio_latency_us", None)),
+            ) if seen] + ["prefill"]
+            lines += [
+                "## Time to first token",
+                "",
+                f"- **TTFT (HW counter; {' + '.join(covered)}):** "
+                f"{(enc_hw_us + pre_hw_us) / 1e3:.1f} ms",
+                f"- **TTFT (CPU timer; {' + '.join(covered)}):** "
+                f"{enc_wall + pre_wall:.2f} s",
+                "",
+            ]
+
+        steps = getattr(self, "_decode_step_us", None)
+        if steps:
+            n = len(steps)
+            first_us = steps[0]
+            total_us = float(getattr(self, "_decode_total_us", 0.0))
+            wall = float(getattr(self, "_decode_wall_s", 0.0))
+            hw_avg_us = total_us / n if n else 0.0
+            decode_gflops = getattr(self, "_decode_gflops", 0.0)
+            lines += [
+                "## Decode",
+                "",
+                f"- **Steps:** {n} (kept {getattr(self, '_decode_n', n)} tokens, "
+                f"sequence total {self.seq_len})",
+                f"- **First-token speed (HW counter):** {1e6 / first_us:.2f} tok/s "
+                f"({first_us / 1e3:.1f} ms)",
+                f"- **Average speed (HW counter):** "
+                f"{(1e6 / hw_avg_us if hw_avg_us else 0.0):.2f} tok/s "
+                f"({hw_avg_us / 1e3:.1f} ms/token)",
+                f"- **Average speed (CPU timer):** "
+                f"{(n / wall if wall else 0.0):.2f} tok/s "
+                f"({(1e3 * wall / n if n else 0.0):.1f} ms/token)",
+                f"- **Host overhead:** "
+                f"{(100.0 * (1 - total_us / 1e6 / wall) if wall else 0.0):.1f}% "
+                f"of wall time outside the engines",
+                f"- **Work per token:** "
+                f"{getattr(self, '_decode_step_flops', 0) / n / 1e9:.2f} GFLOP",
+                f"- **Throughput:** {decode_gflops:.1f} GFLOPS "
+                f"({100.0 * decode_gflops / peak if peak else 0.0:.1f}% of peak)",
+                f"- **End-to-end (CPU timer):** {wall:.2f} s",
+                "",
+            ]
+
+        if rows:
+            lines += self._multi_core_lines(rows, profiles)
+
+        if profiles:
+            lines += [
+                "## Per-phase profile",
+                "",
+                "Phase latencies come from the HW counter between per-phase "
+                "HALTs: they exclude host time but include one stop/restart per "
+                "phase, so the SHARE column is the number to act on -- it says "
+                "which phase is worth sharding next. `*` marks phases that run "
+                "on engine 0 only, whose % of peak is measured against ONE "
+                "engine.",
+                "",
+            ]
+            lines += self._profile_tables(profiles)
+
+        prompt = getattr(self, "_prompt_text", None)
+        if prompt is not None:
+            lines += ["## Prompt & output", "", "### Prompt", "", "```",
+                      prompt, "```", ""]
+            lines += ["### Decoded text", "", "```",
+                      getattr(self, "_decoded_text", "") or "(none)", "```", ""]
+
+        with open(out_path, "w") as handle:
+            handle.write("\n".join(lines))
+        return out_path
+
     def _loud(self, *args, **kwargs) -> None:
         _ORIGINAL_PRINT(*args, **kwargs)
 
@@ -1377,7 +1832,9 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
     return processor, processed, tokens, prompt, rendered
 
 
-def _run_vision(ue: Qwen25OmniUnifiedEngine, processed) -> torch.Tensor:
+def _run_vision(
+    ue: Qwen25OmniUnifiedEngine, processed, profile: bool = False
+) -> torch.Tensor:
     grid = processed["image_grid_thw"]
     if tuple(grid.shape) != (1, 3):
         raise ValueError(f"only one image is supported, got grid {tuple(grid.shape)}")
@@ -1393,10 +1850,10 @@ def _run_vision(ue: Qwen25OmniUnifiedEngine, processed) -> torch.Tensor:
     ue.prepare_encoder_input(processed["pixel_values"], grid)
     ue._tensor_dram_addr = ue._tensor_dram_base
     ue.vision_tensor_init()
-    ue.compile_vision_encoder()
+    ue.compile_vision_encoder(profile=profile)
     ue.check_master_isa()
     ue.store_program_stage("vision")
-    embeddings = ue.run_vision_encoder()
+    embeddings = ue.run_vision_encoder(profile=profile)
     print(
         f"  vision -> {tuple(embeddings.shape)} in "
         f"{time.perf_counter() - started:.2f}s wall"
@@ -1477,7 +1934,53 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=128,
         help="greedy generation cap (default 128)",
     )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="compile the vision encoder, prefill and decoder with per-phase "
+             "HALT checkpoints and report a per-phase FPGA-latency breakdown "
+             "instead of generating. Read the share column: it says which "
+             "phase is worth sharding next. The audio encoder has no "
+             "checkpoints and is reported at stage level only.",
+    )
+    parser.add_argument(
+        "--profile-ctx",
+        type=int,
+        default=MAX_CONTEXT_SIZE,
+        help=f"context length for the SECOND profiled decode step (default "
+             f"{MAX_CONTEXT_SIZE}, the full context). The first is taken right "
+             f"after prefill, so the pair brackets decode cost from the "
+             f"shortest to the longest KV history. --profile only.",
+    )
+    parser.add_argument(
+        "--summary",
+        default=None,
+        metavar="PATH",
+        help="write the run-summary Markdown here instead of the default "
+             "config-named file next to this script",
+    )
+    parser.add_argument(
+        "--no-summary",
+        action="store_true",
+        help="skip writing the run-summary Markdown",
+    )
     return parser
+
+
+def run_summary_filename(args) -> str:
+    """Per-run summary filename encoding the CLI config, e.g.
+
+    ``--dev xdma0 --image --multi-core 8`` ->
+    ``qwen2.5_omni_7b_test_xdma0_image_multi-core_8.md``.
+
+    Device and mode are always present, in that order; a profile run is tagged
+    so its phase breakdown never overwrites a generation run's summary.
+    """
+    parts = ["qwen2.5_omni_7b_test", args.dev, _result_mode(args)]
+    if getattr(args, "profile", False):
+        parts.append("profile")
+    parts.append(f"multi-core_{args.multi_core}")
+    return "_".join(parts) + ".md"
 
 
 def main() -> None:
@@ -1485,6 +1988,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
+    if args.profile_ctx < 2 or args.profile_ctx > MAX_CONTEXT_SIZE:
+        parser.error(f"--profile-ctx must be between 2 and {MAX_CONTEXT_SIZE}")
+    if args.no_summary and args.summary:
+        parser.error("--summary and --no-summary are mutually exclusive")
     with _exclusive_run_lock():
         _main_locked(parser, args)
 
@@ -1535,7 +2042,7 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     audio_embeddings = None
     audio_metadata = None
     if args.image:
-        image_embeddings = _run_vision(ue, processed)
+        image_embeddings = _run_vision(ue, processed, profile=args.profile)
     if args.audio:
         audio_embeddings, audio_metadata = _run_audio(ue, processed)
 
@@ -1559,15 +2066,26 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         f"mRoPE delta {rope_delta}, prompt {prompt!r}"
     )
 
+    def _write_summary(profiles=None) -> None:
+        """Render the run summary; a reporting failure never fails the run."""
+        if args.no_summary:
+            return
+        out = args.summary or os.path.join(SCRIPT_DIR, run_summary_filename(args))
+        try:
+            ue.write_run_summary(out, args, profiles=profiles or None)
+            print(f"\nWrote run summary: {out}")
+        except Exception as exc:  # noqa: BLE001 - reporting is best effort
+            print(f"[warn] failed to write run summary: {exc}")
+
     print("\n--- Thinker LM stage ---")
     started = time.perf_counter()
     ue.lm_weight_init()
     ue.lm_tensor_init()
-    ue.compile_prefill(len(context))
+    ue.compile_prefill(len(context), profile=args.profile)
     # Decoder setup installs the device-side embedding and copies every
     # reusable projection into private windows. BF16 O addresses are compiled
     # now, but their shared overlay is deliberately deferred until prefill.
-    ue.compile_decoder()
+    ue.compile_decoder(profile=args.profile)
     ue.check_master_isa()
     # These bodies are address-coupled: decoder starts immediately after this
     # exact prefill image. Publish both in one programs.bin generation.
@@ -1579,8 +2097,61 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         image_embeddings=image_embeddings,
         audio_embeddings=audio_embeddings,
         positions=positions[: len(context)],
+        profile=args.profile,
     )
     ue.activate_decode_shared_weights()
+
+    if args.profile:
+        # The checkpointed decoder is the one published in programs.bin, so it
+        # is also the one that must run: run_decode_step_profiled refuses any
+        # other image.  Two steps bracket decode cost -- one at the prompt's
+        # own context, one at --profile-ctx -- because a step's price is set by
+        # the KV length, while the projections stay the same size.
+        prof_program = ue._decoder_program
+        prof_checkpoints = list(ue._decoder_checkpoints)
+        prof_workers = list(getattr(ue, "_decoder_workers", []))
+        print(f"\n--- Profiled decode: 1st token (ctx {ue.seq_len}) ---")
+        first_results, next_token, aligned_first = ue.run_decode_step_profiled(
+            seed, prof_program, prof_checkpoints, workers=prof_workers
+        )
+        ctx_first = ue.seq_len
+        if args.profile_ctx - 1 > ue.seq_len:
+            # --profile measures TIME, not numerics.  Forcing the position is
+            # how the long-context step is reached at all: the model hits EOS
+            # long before the context fills, and a checkpointed program costs
+            # one host round trip per phase per token.  KV rows past the prompt
+            # are zeros, which does not change latency.
+            ue.seq_len = args.profile_ctx - 1
+            print(f"  forcing ctx {args.profile_ctx} (timing only)")
+        print(f"\n--- Profiled decode: at context (ctx {ue.seq_len}) ---")
+        ctx_results, _token, aligned_ctx = ue.run_decode_step_profiled(
+            next_token, prof_program, prof_checkpoints, workers=prof_workers
+        )
+        profiles = []
+        if args.image:
+            dims = ue._vision_dims()
+            profiles.append((
+                "Vision encoder",
+                f"{dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens.",
+                getattr(ue, "_vis_profile", None),
+            ))
+        profiles += [
+            ("Prefill", f"{len(context)} tokens.",
+             getattr(ue, "_prefill_profile", None)),
+            ("Decode - 1st token",
+             f"Context {ctx_first} tokens (aligned {aligned_first}).",
+             first_results),
+            ("Decode - at context",
+             f"Context {ue.seq_len} tokens (aligned {aligned_ctx}).",
+             ctx_results),
+        ]
+        for title, note, results in profiles:
+            if results:
+                ue.print_profile_table(title, results, note=note)
+        print(f"\nThinker profile done in {time.perf_counter() - started:.2f}s wall")
+        _write_summary(profiles)
+        return
+
     print("\n--- Decode run ---")
     _, decoded_text = ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)
     lm_wall = time.perf_counter() - started
@@ -1657,6 +2228,7 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         "rope_delta": rope_delta,
     }
     print("TEST_RESULT: " + json.dumps(result, ensure_ascii=False))
+    _write_summary()
 
 
 if __name__ == "__main__":
