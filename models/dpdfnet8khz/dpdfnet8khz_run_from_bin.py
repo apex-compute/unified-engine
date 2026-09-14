@@ -30,6 +30,7 @@ import user_dma_core as udc
 from dpdfnet8khz_precompiled import WholeGraphBackend, load_artifact, validate_runtime_hardware
 from dpdfnet8khz_common import sha256
 from dpdfnet8khz_engine import StreamingEngine
+from dpdfnet_precision import PRECISION_LABELS, validate_weight_precision
 from yolov5_common import configure_hardware_runtime
 
 
@@ -54,11 +55,14 @@ def _load_frames(path: Path) -> np.ndarray:
     return value
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv=None, *, default_bin=None, expected_precision=None) -> None:
+    description = __doc__
+    if expected_precision is not None:
+        description += f"\nThis test requires {PRECISION_LABELS[expected_precision]} dense convolution weights."
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--bin", type=Path,
-        default=HERE / "dpdfnet8khz_bin" / "dpdfnet2_8khz-andromeda.bin")
+        default=default_bin or HERE / "dpdfnet8khz_bin" / "dpdfnet2_8khz-andromeda.bin")
     parser.add_argument(
         "--input", type=Path, required=True,
         help="audio file (WAV/FLAC), or NumPy spectra [T,1,1,81,2]")
@@ -76,7 +80,7 @@ def main() -> None:
     parser.add_argument(
         "--trace-tail", type=Path, metavar="DIR",
         help="export the final frame's last 8192 hardware events")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.cpu_core is not None:
         if not hasattr(os, "sched_setaffinity"):
             parser.error("--cpu-core requires CPU affinity support")
@@ -87,8 +91,9 @@ def main() -> None:
         parser.error("--timeout must be finite and positive")
     audio_mode = args.input.suffix.lower() != ".npy"
     if args.output is None:
-        args.output = HERE / "dpdfnet8khz_bin" / (
-            "enhanced.wav" if audio_mode else "enhanced_spec.npy")
+        stem = (f"enhanced_8khz_{expected_precision}" if expected_precision
+                else "enhanced")
+        args.output = HERE / "dpdfnet8khz_bin" / (stem + (".wav" if audio_mode else "_spec.npy"))
     if audio_mode and args.output.suffix.lower() != ".wav":
         parser.error("audio input requires a .wav output")
     if not audio_mode and args.output.suffix.lower() != ".npy":
@@ -107,6 +112,10 @@ def main() -> None:
     load_started = time.perf_counter()
     bin_digest = sha256(args.bin)
     payload = load_artifact(args.bin)
+    try:
+        dense_precision = validate_weight_precision(payload, expected_precision)
+    except ValueError as exc:
+        parser.error(str(exc))
     artifact_load_s = time.perf_counter() - load_started
     preprocess_started = time.perf_counter()
     input_digest = sha256(args.input)
@@ -126,6 +135,7 @@ def main() -> None:
         f"DPDFNet2 8 kHz FPGA neural inference, frames={frames.shape[0]}, "
         f"AXI={hw_info.axi_data_width_bits}, clock={detected_clock:.4f} ns")
     print(f"Single bin: {args.bin.expanduser().resolve()}")
+    print(f"Weights: dense convolution {dense_precision}; other weights and activations BF16")
     print("Contract: resident recurrent state, one input write/kick/HALT/output read per frame")
     if audio_input is not None:
         print(f"Audio: {audio_input.source_samples / audio_input.source_sample_rate:.3f} s, "
@@ -174,6 +184,10 @@ def main() -> None:
 
     result = {
         "model": "dpdfnet2_8khz",
+        "dense_convolution_precision": dense_precision,
+        "other_weight_precision": "BF16",
+        "activation_precision": "BF16",
+        "precision_source": "program-instructions",
         "onnx_sha256": payload["onnx_sha256"],
         "bin_sha256": bin_digest,
         "input_sha256": input_digest,

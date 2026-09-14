@@ -38,11 +38,15 @@ class RunnerContractTest(unittest.TestCase):
         output = dp.make_layout("spec_e", spec.shape, dp.TENSOR_BASE)
         self.expected = torch.linspace(-2, 2, 322).reshape(spec.shape).bfloat16()
         packed = dp.pack_tensor(self.expected, output)
+        program = ((int(dp.udc.UE_MODE.BF16_DOT_PRODUCT) << 172).to_bytes(32, "little")
+                   + (dp.udc.INSTRUCTION_HALT << 8).to_bytes(32, "little"))
         self.payload = {
             "onnx_sha256": "a" * 64,
             "hardware": {
                 "model_base": dp.MODEL_BASE,
-                "model_image": torch.zeros(64, dtype=torch.uint8),
+                "model_image": torch.frombuffer(bytearray(program), dtype=torch.uint8).clone(),
+                "program_offset": 0,
+                "program_size": len(program),
                 "program_address": dp.MODEL_BASE + 128,
                 "tensors": {"spec": spec.manifest(), "spec_e": output.manifest()},
             },
@@ -157,6 +161,8 @@ class RunnerContractTest(unittest.TestCase):
         self.assertEqual(result["host_cpu_affinity"], [6])
         self.assertEqual(result["frame_hop_ms"], 10)
         self.assertEqual(result["model_upload_writes"], 1)
+        self.assertEqual(result["dense_convolution_precision"], "BF16")
+        self.assertEqual(result["precision_source"], "program-instructions")
         for key in ("input_upload_writes", "program_kicks", "halts", "output_reads"):
             self.assertEqual(result[key], 3)
 

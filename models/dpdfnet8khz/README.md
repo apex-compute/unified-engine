@@ -7,7 +7,7 @@ hop, 81 frequency bins and 37,860 recurrent-state values. The ONNX graph
 has 492 operations. The existing 16-kHz port remains under `models/dpdfnet/`.
 
 CPU and FPGA audio execution are verified on Italy's RK AXI-256 with
-queue-CONFIG convolution, current build `0xdf0749de`. A 60-second audio file
+queue-CONFIG convolution, build `0xdf0749de`. A 60-second audio file
 took 59.21 seconds to process, including host audio framing and reconstruction.
 This meets average throughput on the measured recording; individual host
 frames still exceed 10 ms. The optimized IF8 output matches the corrected
@@ -18,6 +18,8 @@ both deployed bins on the same source recordings and verifies their per-hop
 DRAM transfer and execution sequence.
 The [noisy-audio report](../dpdfnet/validation/20260914_noisy20s/README.md)
 includes eight tests over 20 seconds, both FPGA outputs, and KU5P resources.
+The [BF16 comparison](../dpdfnet/validation/20260914_bf16/README.md) measures
+BF16 and quantized bins on build `40519e0a`, including audio RTF and CPU error.
 
 Install the model-specific dependencies from the repository root, using an
 environment with the repository's matching `torch` and `torchaudio` packages:
@@ -62,7 +64,7 @@ python models/dpdfnet8khz/dpdfnet8khz_compile.py --download --optimize --force
 On a compatible RK-256 queue-CONFIG build, run audio from that bin:
 
 ```bash
-OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python models/dpdfnet8khz/dpdfnet8khz_run_from_bin.py \
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python models/dpdfnet8khz/dpdfnet8khz_if8_weights_test.py \
   --device rk --dev xdma0 --cpu-core 6 \
   --input test_samples/p232_007.wav \
   --output models/dpdfnet8khz/dpdfnet8khz_bin/enhanced_fpga.wav
@@ -79,7 +81,7 @@ core 6. `--cpu-core` is
 optional; choose an available core on another machine or omit it. Pinning
 does not guarantee every frame finishes within 10 ms.
 
-The optimized compiler uses IF8 dense convolution weights, fuses eligible
+The optimized compiler defaults to IF8 dense convolution weights, fuses eligible
 convolution/ReLU operations, and rearranges state and complex values in SRAM.
 The native runner reuses DMA handles with scalar read/write transfers and
 closes them on completion or failure.
@@ -91,8 +93,36 @@ python models/dpdfnet8khz/dpdfnet8khz_compile.py --optimize --force \
 ```
 
 The unoptimized compiler is available with `--baseline`. Both compilers
-use the same IF8 dense weights and BF16 depthwise/recurrent arithmetic.
+default to IF8 dense weights and BF16 depthwise/recurrent arithmetic.
 Instruction count alone does not establish latency.
+
+Choose the test file for the dense convolution weight precision:
+
+| Dense weights | Test entry point |
+| --- | --- |
+| BF16 | [dpdfnet8khz_bf16_weights_test.py](dpdfnet8khz_bf16_weights_test.py) |
+| IF8 | [dpdfnet8khz_if8_weights_test.py](dpdfnet8khz_if8_weights_test.py) |
+
+Other learned weights and activations use BF16. Each named test selects its
+matching bin, checks the encoded precision before FPGA access, and uses a
+distinct default output filename. `--bin` accepts another artifact only with
+the same precision. The generic `dpdfnet8khz_run_from_bin.py` is shared by these tests.
+
+To use BF16 convolution weights, build a separate bin and run it explicitly:
+
+```bash
+python models/dpdfnet8khz/dpdfnet8khz_compile.py --conv-precision bf16
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 python models/dpdfnet8khz/dpdfnet8khz_bf16_weights_test.py \
+  --device rk --dev xdma0 --cpu-core 6 \
+  --input path/to/noisy.wav --output /tmp/dpdfnet_8khz_bf16.wav
+```
+
+BF16 dense convolutions use device im2col and matrix instructions. Weights and
+activations remain BF16; internal arithmetic, native layout optimizations,
+and the single START/HALT per 10-ms hop are retained. `steady_audio_rtf` in
+the output metrics includes host audio processing and excludes startup;
+values below 1 mean average processing is faster than audio arrival.
+Deadline misses show whether individual frames exceed 10 ms.
 
 Current deployments use format `streaming-v2`. Older native bins must be
 rebuilt to include the IF8 policy and corrected single-channel transpose.
@@ -126,7 +156,7 @@ compatible FPGA, run all saved inputs from the same deployment bin:
 ```bash
 for input in models/dpdfnet8khz/dpdfnet8khz_bin/validation/*_input.npy; do
   case_base="${input%_input.npy}"
-  python models/dpdfnet8khz/dpdfnet8khz_run_from_bin.py \
+  python models/dpdfnet8khz/dpdfnet8khz_if8_weights_test.py \
     --device rk --dev xdma0 --input "$input" --output "${case_base}_fpga.npy" \
     > "${case_base}_fpga.log" 2>&1 || break
 done

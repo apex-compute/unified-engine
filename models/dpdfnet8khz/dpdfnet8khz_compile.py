@@ -172,8 +172,8 @@ class AlignedMappingEmitter(DeviceEmitter):
 class GraphCompiler(SharedGraphCompiler):
     """Reuse the convolution/recurrent compiler with native 8-kHz geometry."""
 
-    def __init__(self, onnx, model, digest):
-        super().__init__(onnx, model, digest)
+    def __init__(self, onnx, model, digest, *, conv_precision="auto"):
+        super().__init__(onnx, model, digest, conv_precision=conv_precision)
         self.emitter = AlignedMappingEmitter.adopt(
             self.emitter, self.mapping_scratch, self.mapping_source_scratch)
         self.pixel8_selectors = {}
@@ -311,7 +311,9 @@ class GraphCompiler(SharedGraphCompiler):
             udc.UE_AXI_DATA_WIDTH_BITS = previous_width
         hardware["format"] = FORMAT
         hardware["axi_data_width_bits"] = 256
-        hardware["dense_convolution_precision"] = "IF8"
+        hardware["dense_convolution_precision"] = (
+            "BF16" if self.conv_precision == "bf16" else "IF8")
+        hardware["precision"] = "BF16" if self.conv_precision == "bf16" else "BF16/IF8"
         hardware["optimizations"] = list(getattr(self, "optimization_names", ()))
         return hardware
 
@@ -482,7 +484,7 @@ class OptimizedGraphCompiler(CoefficientReshapeOptimizationMixin, Reshape80Optim
                              StateShiftOptimizationMixin, PairPackOptimizationMixin,
                              ReductionOptimizationMixin, ConvTransposeOptimizationMixin,
                              CopyOptimizationMixin, GraphCompiler):
-    """Native IF8 compiler with fused arithmetic and SRAM layout operations."""
+    """Native compiler with fused arithmetic and SRAM layout operations."""
 
     optimization_names = ("conv-transpose-n2", "conv-relu", "state-copy-batching",
                           "state-shift128", "complex-pair-unpack", "complex-pair-pack",
@@ -493,15 +495,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--download", action="store_true")
-    parser.add_argument("--output", type=Path,
-                        default=HERE / "dpdfnet8khz_bin/dpdfnet2_8khz-andromeda.bin")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--conv-precision", choices=("if8", "bf16"), default="if8",
+                        help="dense convolution weights: IF8 (default) or BF16")
     parser.add_argument("--force", action="store_true")
     lowering = parser.add_mutually_exclusive_group()
     lowering.add_argument("--optimize", dest="optimize", action="store_true", default=True,
                           help="use fused native layout and convolution lowering (default)")
     lowering.add_argument("--baseline", dest="optimize", action="store_false",
-                          help="build the unoptimized IF8 reference for compiler comparisons")
+                          help="build without native layout optimizations")
     args = parser.parse_args()
+    if args.output is None:
+        suffix = "-bf16" if args.conv_precision == "bf16" else ""
+        args.output = HERE / "dpdfnet8khz_bin" / f"dpdfnet2_8khz{suffix}-andromeda.bin"
     if args.output.expanduser().resolve() == args.model.expanduser().resolve():
         parser.error("--output must differ from the source ONNX model")
     if args.output.exists() and not args.force:
@@ -516,7 +522,9 @@ def main():
     digest = validate_digest(model_path)
     with contextlib.redirect_stdout(io.StringIO()):
         compiler = OptimizedGraphCompiler if args.optimize else GraphCompiler
-        hardware = compiler(onnx, onnx.load(model_path), digest).compile()
+        hardware = compiler(
+            onnx, onnx.load(model_path), digest,
+            conv_precision="bf16" if args.conv_precision == "bf16" else "auto").compile()
     payload = {
         "format": FORMAT, "model": "dpdfnet2_8khz", "onnx_sha256": digest,
         "streaming_abi": {"inputs": {"spec": [1, 1, 81, 2], "state_in": [37860]},
