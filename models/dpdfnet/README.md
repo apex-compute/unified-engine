@@ -10,9 +10,8 @@ operations and are not present in the ONNX graph.
 For the current comparison with the native 8-kHz model, including measured
 real-time factors, CPU agreement, listening samples and the verified DRAM
 execution sequence, see [DUAL_RATE_BENCHMARK.md](DUAL_RATE_BENCHMARK.md).
-Five longer noisy tests, each **20.5–23.7 seconds**, include input WAVs and
-both models' actual FPGA output WAVs in the
-[20-second listening collection](validation/20260914_noisy20s/README.md).
+The [noisy-audio report](validation/20260914_noisy20s/README.md) includes eight
+tests over 20 seconds, both models’ FPGA WAVs, and KU5P resource utilization.
 
 Enhance a WAV directly using an existing bin on RK-256, from the repository root:
 

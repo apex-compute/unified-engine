@@ -1,17 +1,19 @@
 {
-  "source_manifest_sha256": "f791535241f8430ef581780a15404cee188bb4ffdf5793fbbd9bbc42e6bd7e2f",
-  "audio_comparison_sha256": "98df5caca8ee188c8a1a4cb0a20fae624bf9e0bb2c0ca26d0db5073e208aa743",
+  "source_manifest_sha256": "33449f2faa883d49198ebdf1f74065f279a9d1174004fb0609eab40988c109f8",
+  "audio_comparison_sha256": "638c9f1082da5100eae518178017ba3e28c193fdbfd2cd8499fbf04981ec760c",
   "hardware": "RK AXI-256 build 0xdf0749de",
-  "case_count": 5,
-  "outputs": 10,
+  "case_count": 8,
+  "outputs": 16,
   "sample_rate_of_all_input_output_wavs": 16000,
   "all_outputs_finite": true,
   "all_output_sample_counts_preserved": true,
-  "duration_s_per_model": 108.2705,
-  "frames_per_model": 10860,
+  "duration_s_per_model": 173.0098125,
+  "samples_per_model": 2768157,
+  "frames_per_model": 17353,
   "cases": [
     {
       "id": "bus",
+      "cohort": "retained_mixed_snr",
       "duration_s": 23.68225,
       "samples": 378916,
       "frames": 2375,
@@ -22,6 +24,7 @@
     },
     {
       "id": "cafe",
+      "cohort": "retained_mixed_snr",
       "duration_s": 20.509125,
       "samples": 328146,
       "frames": 2057,
@@ -31,17 +34,8 @@
       "waveform_relative_l2_16k": 0.04011518141342262
     },
     {
-      "id": "living",
-      "duration_s": 20.62525,
-      "samples": 330004,
-      "frames": 2069,
-      "rtf_8k": 0.9883412997175361,
-      "rtf_16k": 1.4377442477545883,
-      "waveform_relative_l2_8k": 0.015407604957067939,
-      "waveform_relative_l2_16k": 0.030899562378036125
-    },
-    {
       "id": "office",
+      "cohort": "retained_mixed_snr",
       "duration_s": 21.9805,
       "samples": 351688,
       "frames": 2205,
@@ -52,6 +46,7 @@
     },
     {
       "id": "psquare",
+      "cohort": "retained_mixed_snr",
       "duration_s": 21.473375,
       "samples": 343574,
       "frames": 2154,
@@ -59,84 +54,128 @@
       "rtf_16k": 1.4366487028704273,
       "waveform_relative_l2_8k": 0.011992467714242087,
       "waveform_relative_l2_16k": 0.05474308995821534
+    },
+    {
+      "id": "bus_low_snr",
+      "cohort": "low_snr_new_sources",
+      "duration_s": 20.8791875,
+      "samples": 334067,
+      "frames": 2094,
+      "rtf_8k": 0.9880827826274818,
+      "rtf_16k": 1.4374318405830027,
+      "waveform_relative_l2_8k": 0.015927127745281124,
+      "waveform_relative_l2_16k": 0.027258541767270463
+    },
+    {
+      "id": "cafe_low_snr",
+      "cohort": "low_snr_new_sources",
+      "duration_s": 21.465625,
+      "samples": 343450,
+      "frames": 2153,
+      "rtf_8k": 0.988646271981395,
+      "rtf_16k": 1.436672295216154,
+      "waveform_relative_l2_8k": 0.03236474676238339,
+      "waveform_relative_l2_16k": 0.061877379544094814
+    },
+    {
+      "id": "office_low_snr",
+      "cohort": "low_snr_new_sources",
+      "duration_s": 21.494375,
+      "samples": 343910,
+      "frames": 2156,
+      "rtf_8k": 0.9905387931028465,
+      "rtf_16k": 1.4358218713034818,
+      "waveform_relative_l2_8k": 0.0096893629609517,
+      "waveform_relative_l2_16k": 0.022035538173217916
+    },
+    {
+      "id": "psquare_low_snr",
+      "cohort": "low_snr_new_sources",
+      "duration_s": 21.525375,
+      "samples": 344406,
+      "frames": 2159,
+      "rtf_8k": 0.9910200466658667,
+      "rtf_16k": 1.4369784491094324,
+      "waveform_relative_l2_8k": 0.019914401983689083,
+      "waveform_relative_l2_16k": 0.03585524968424142
     }
   ],
   "rates": {
     "8000": {
-      "aggregate_audio_rtf": 0.9897672928544696,
-      "aggregate_cpu_audio_rtf": 0.06730644489497527,
-      "steady_audio_processing_s_sum": 107.16259968099985,
+      "aggregate_audio_rtf": 0.9898466279940196,
+      "aggregate_cpu_audio_rtf": 0.06740105336509077,
+      "steady_audio_processing_s_sum": 171.25317951300258,
       "host_timing": {
-        "frames": 10860,
-        "mean_ms": 9.849806076702007,
-        "p95_ms": 10.116691249550058,
-        "p99_ms": 10.660047880337514,
+        "frames": 17353,
+        "mean_ms": 9.848888802399857,
+        "p95_ms": 10.120219199961866,
+        "p99_ms": 10.255293880036334,
         "max_ms": 15.046639000502182,
-        "deadline_misses": 1699,
-        "deadline_miss_fraction": 0.15644567219152855,
-        "rtf_at_10ms_hop": 0.9849806076702008
+        "deadline_misses": 3005,
+        "deadline_miss_fraction": 0.17316890451218808,
+        "rtf_at_10ms_hop": 0.9848888802399858
       },
       "fpga_timing": {
-        "frames": 10860,
-        "mean_ms": 9.069715910745641,
+        "frames": 17353,
+        "mean_ms": 9.069709958464086,
         "p95_ms": 9.074412603150789,
-        "p99_ms": 9.075296504126031,
+        "p99_ms": 9.0752768192048,
         "max_ms": 9.077341335333832,
         "deadline_misses": 0,
         "deadline_miss_fraction": 0.0,
-        "rtf_at_10ms_hop": 0.9069715910745642
+        "rtf_at_10ms_hop": 0.9069709958464086
       },
       "cpu_timing": {
-        "frames": 10860,
-        "mean_ms": 0.651968357094989,
-        "p95_ms": 0.659715149549811,
-        "p99_ms": 0.6803569297426292,
+        "frames": 17353,
+        "mean_ms": 0.6502313378759482,
+        "p95_ms": 0.6580658005987061,
+        "p99_ms": 0.6799466404117992,
         "max_ms": 1.3977150001664995,
         "deadline_misses": 0,
         "deadline_miss_fraction": 0.0,
-        "rtf_at_10ms_hop": 0.0651968357094989
+        "rtf_at_10ms_hop": 0.06502313378759482
       },
-      "pooled_source_rate_waveform_relative_l2": 0.013408205658650642,
-      "pooled_source_rate_waveform_rmse": 0.0008772782514259438,
+      "pooled_source_rate_waveform_relative_l2": 0.016830513721680762,
+      "pooled_source_rate_waveform_rmse": 0.0010528890831201527,
       "strict_all_host_frames_meet_10ms": false,
       "strict_all_fpga_frames_meet_10ms": true
     },
     "16000": {
-      "aggregate_audio_rtf": 1.4363417020333462,
-      "aggregate_cpu_audio_rtf": 0.06876127286746857,
-      "steady_audio_processing_s_sum": 155.5134342500014,
+      "aggregate_audio_rtf": 1.436361715483627,
+      "aggregate_cpu_audio_rtf": 0.07042926991783781,
+      "steady_audio_processing_s_sum": 248.50467107800068,
       "host_timing": {
-        "frames": 10860,
-        "mean_ms": 14.30884865479717,
-        "p95_ms": 14.600903700556955,
-        "p99_ms": 14.815659490050162,
+        "frames": 17353,
+        "mean_ms": 14.309584144420564,
+        "p95_ms": 14.606483199531795,
+        "p99_ms": 14.722230119514279,
         "max_ms": 21.584982000604214,
-        "deadline_misses": 10860,
+        "deadline_misses": 17353,
         "deadline_miss_fraction": 1.0,
-        "rtf_at_10ms_hop": 1.430884865479717
+        "rtf_at_10ms_hop": 1.4309584144420564
       },
       "fpga_timing": {
-        "frames": 10860,
-        "mean_ms": 13.447038029120542,
-        "p95_ms": 13.453731432858214,
-        "p99_ms": 13.456852213053264,
+        "frames": 17353,
+        "mean_ms": 13.447011235434342,
+        "p95_ms": 13.453683420855214,
+        "p99_ms": 13.45666016504126,
         "max_ms": 13.462901725431358,
-        "deadline_misses": 10860,
+        "deadline_misses": 17353,
         "deadline_miss_fraction": 1.0,
-        "rtf_at_10ms_hop": 1.3447038029120542
+        "rtf_at_10ms_hop": 1.3447011235434343
       },
       "cpu_timing": {
-        "frames": 10860,
-        "mean_ms": 0.6696528548779446,
-        "p95_ms": 0.6762832498679927,
-        "p99_ms": 0.6984819195804447,
-        "max_ms": 1.2607620001290343,
+        "frames": 17353,
+        "mean_ms": 0.6861309433468631,
+        "p95_ms": 0.7075669993355405,
+        "p99_ms": 0.7303129600040846,
+        "max_ms": 3.056624000237207,
         "deadline_misses": 0,
         "deadline_miss_fraction": 0.0,
-        "rtf_at_10ms_hop": 0.06696528548779446
+        "rtf_at_10ms_hop": 0.0686130943346863
       },
-      "pooled_source_rate_waveform_relative_l2": 0.039830224482845254,
-      "pooled_source_rate_waveform_rmse": 0.0026389917731954103,
+      "pooled_source_rate_waveform_relative_l2": 0.040528574404646356,
+      "pooled_source_rate_waveform_rmse": 0.00256605940904248,
       "strict_all_host_frames_meet_10ms": false,
       "strict_all_fpga_frames_meet_10ms": false
     }
