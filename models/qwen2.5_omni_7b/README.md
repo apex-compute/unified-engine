@@ -14,7 +14,7 @@ Thinker, vision, and audio stages in the current hardware layout.
 
 ## Hardware target
 
-This model targets the 8 GiB Alveo U55 configuration and uses exactly eight
+This model targets the 8 GiB Alveo U55C configuration and uses exactly eight
 Unified Engine cores. Hardware topology, DRAM capacity, AXI width, and clock are
 read from HW_INFO; startup fails rather than compiling an incompatible program
 when the board does not report 8 GiB of DRAM and at least eight available
@@ -23,9 +23,10 @@ engines. On a 12-engine image, engines 0-7 are used and engines 8-11 remain idle
 Always pass `--multi-core 8`.
 
 The runner detects the installed image and does not reprogram the FPGA. Builds
-`0xfe984d16` and `0x0305d87d` use their native four-phase in-program handshake.
-The older `0xe7ac2caf` build is also supported through host-separated one-shot
-rendezvous. Both paths use the same FPGA kernels and numerical policy.
+`0xfe984d16`, `0x0305d87d`, and `0xb3ed9175` use their native four-phase
+in-program handshake. Build `0xe7ac2caf` is also supported through
+host-separated one-shot rendezvous. Both paths use the same FPGA kernels and
+numerical policy.
 
 ## Input limits
 
@@ -94,18 +95,52 @@ created by the root README:
 source ~/my_torch_env/bin/activate
 ```
 
-The first test invocation downloads only
-the checkpoint shards used by the Thinker and converts them into the cached
-`qwen2.5_omni_7b_bin/params.bin` bundle. To perform that one-time conversion
-separately, run:
+The first test invocation downloads the checkpoint shards used by the Thinker,
+vision encoder, and audio encoder, then performs a one-time conversion into the
+cached `qwen2.5_omni_7b_bin/params.bin` bundle. `params.json` records the model
+revision, configuration fingerprint, region bounds, and tensor manifest used to
+validate that bundle before inference. The converter also creates
+`qwen2.5_omni_7b_bin/processor/`, a minimal tokenizer/processor metadata bundle.
+After conversion, a normal inference run reads all learned tensors from the
+validated `params.bin` and loads preprocessing metadata locally from that
+minimal bundle; it does not need the safetensor shards or full checkpoint
+directory. To perform the one-time conversion separately, run:
 
 ```bash
 python models/qwen2.5_omni_7b/qwen2.5_omni_7b_weights.py
 ```
 
-The test entrypoint reuses a compatible parameter bundle, compiles the requested
-encoder and Thinker programs for the live eight-engine topology, and runs the
-sanity check. It does not expose a program-bin reuse mode.
+The test entrypoint follows the default Gemma4 E2B program-image flow. On every
+normal invocation it freshly compiles the stable ISA for the requested encoder
+and Thinker stages against the live eight-engine topology, atomically stores the
+master and seven worker sections in the combined
+`qwen2.5_omni_7b_bin/programs.bin` plus `programs.json`, reopens and validates
+those on-disk bytes, and executes the reloaded sections. It does not execute the
+compiler's in-memory copy and does not currently expose a `--bin-reuse` mode.
+The address-coupled prefill and decoder groups are published together in one
+artifact generation. An inter-process file lock also rejects concurrent Omni
+runs before they can race the artifact files or the FPGA queues.
+
+Request-specific embedding, decode-dispatch, and rendezvous/flag ISA remains
+runtime-generated because it contains token-, position-, address-, or
+request-state values. This includes token-specific IF8 embedding lookup and
+dequantization, which still executes entirely on the FPGA. This is the same
+boundary used by the Gemma4 E2B flow: stable stage programs execute from the
+validated program image, while per-request FPGA control/embedding ISA is
+generated at runtime. All learned arithmetic remains FPGA-only.
+
+The deploy-time artifacts are therefore:
+
+- `params.bin` + `params.json` -- all learned Thinker, vision, audio, embedding,
+  and LM-head tensors plus their validated manifest
+- `programs.bin` + `programs.json` -- the freshly compiled, atomically packaged,
+  and reloaded eight-engine stable stage ISA
+- `processor/` -- the minimal local tokenizer and multimodal processor metadata
+
+None of this changes or reloads the FPGA image. The runner requires the existing
+U55C 8-GiB image, uses exactly engines 0-7, and leaves any additional engines
+idle. CPU and GPU are not used for learned inference compute; the host duties
+remain the preprocessing, layout, DMA, and control operations listed above.
 
 ```bash
 # Text sanity check
