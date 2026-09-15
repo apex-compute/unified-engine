@@ -2,6 +2,8 @@
 
 [BigCodec](https://github.com/Aria-K-Alethia/BigCodec) compresses speech into discrete tokens and reconstructs speech from those tokens.
 
+**BigCodec is not trained for background-noise suppression.** Noisy input can produce a noisy reconstruction on both the official CPU model and FPGA. For speech enhancement, use [DPDFNet and its noisy/denoised audio examples](../dpdfnet/validation/20260914_noisy20s/README.md). The waveform errors below measure FPGA agreement with the CPU codec, not noise removal. See the [implementation and clean-reference check](validation/20260915_accuracy/filtering_check/README.md).
+
 | Property | Value |
 | --- | --- |
 | Native sample rate | 16,000 Hz |

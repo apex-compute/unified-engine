@@ -217,7 +217,9 @@ def csv_text(report):
 
 def readme(report):
     complete=report['status']=='complete';title='BigCodec noisy-audio accuracy comparison' if complete else 'BigCodec accuracy preview — incomplete'
-    lines=['# '+title,'',f"{report['completed_runs']}/16 runs completed across eight noisy test cases. Results compare FPGA reconstructions with the frozen official FP32 CPU reconstructions.",'']
+    lines=['# '+title,'',
+      'BigCodec reconstructs audio; it is not trained for background-noise suppression. These errors measure FPGA agreement with the CPU codec, not noise removal. See the [background-noise implementation check](../filtering_check/README.md).','',
+      f"{report['completed_runs']}/16 runs completed across eight noisy test cases. Results compare FPGA reconstructions with the frozen official FP32 CPU reconstructions.",'']
     if not complete:lines+=['This preview is provisional. Final report files require all 16 runs.','']
     lines += ['| Recurrent weights | Processing RTF, before → after | Pooled waveform error, before → after | Token agreement, before → after | Cases improved / regressed / unchanged |',
               '| --- | ---: | ---: | ---: | ---: |']

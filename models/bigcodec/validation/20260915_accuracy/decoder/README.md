@@ -1,5 +1,7 @@
 # BigCodec noisy-audio accuracy comparison
 
+BigCodec reconstructs audio; it is not trained for background-noise suppression. These errors measure FPGA agreement with the CPU codec, not noise removal. See the [background-noise implementation check](../filtering_check/README.md).
+
 16/16 runs completed across eight noisy test cases. Results compare FPGA reconstructions with the frozen official FP32 CPU reconstructions.
 
 | Recurrent weights | Processing RTF, before → after | Pooled waveform error, before → after | Token agreement, before → after | Cases improved / regressed / unchanged |
