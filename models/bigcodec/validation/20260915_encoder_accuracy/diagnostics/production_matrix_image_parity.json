@@ -1,0 +1,33 @@
+{
+  "model_image_equal": true,
+  "images": {
+    "prototype": "9398741d2015a39f556835635df0e69f04961c02ec2f497eee76b00ce5918a42",
+    "production": "9398741d2015a39f556835635df0e69f04961c02ec2f497eee76b00ce5918a42"
+  },
+  "addresses": {
+    "input_address": [
+      2147483648,
+      2147483648
+    ],
+    "scratch_address": [
+      3530277504,
+      3530277504
+    ],
+    "scratch_bytes": [
+      73036800,
+      73036800
+    ],
+    "program_address": [
+      2548219776,
+      2548219776
+    ],
+    "tensor_end": [
+      3603314304,
+      3603314304
+    ],
+    "output_address": [
+      3489660928,
+      3489660928
+    ]
+  }
+}

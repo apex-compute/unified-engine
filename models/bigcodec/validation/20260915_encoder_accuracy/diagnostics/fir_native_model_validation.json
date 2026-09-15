@@ -1,0 +1,114 @@
+{
+  "status": "complete",
+  "hardware_executed_by_this_script": false,
+  "cpu_core": 13,
+  "math_threads": 1,
+  "script_sha256": "bfc4866c321e8fe6f3be64fb3d027934e670e5d4589e30c32e3cc59afcf9ae82",
+  "model_sha256": "f1f53b617ad5d7fb72db78d49e5cc9b018ce14bf981a288f966d376ae0e3e066",
+  "captured_report_sha256": "9b02aeb35f47ac030436b8800f54a620633cfcc0389e59627f267009a74f16a2",
+  "filter_parameters_sha256": "ca969382ed62ba8b1a5fa2ce265c82ffc76626e783f8b8d2ab53295e5cb5e021",
+  "source": "Actual captured post-Snake BF16 values; no preceding upsample/Snake approximation is used.",
+  "scope": "Three 64-output tiles (first/interior/last) and eight predetermined channels, separately for K192 DC and K384 split coefficients. Endpoints clamp against all 634 captured source rows. Independent matrix geometry is constructed here without prepare_fir or emit_fir.",
+  "selected_channels": [
+    0,
+    1,
+    31,
+    63,
+    127,
+    383,
+    767,
+    1535
+  ],
+  "selected_tile_starts": [
+    0,
+    128,
+    256
+  ],
+  "variants": [
+    {
+      "precision": "dc",
+      "K": 192,
+      "capture_file_sha256": "79337f15332bd7187216885d95b576245a2aae1dc21ff7d7def3e0e905a51755",
+      "actual_sha256": "a44d2a396008cd7b165528e9a9a6a696f61268391bc825ac0cb20293e052dbec",
+      "snake_sha256": "d73b40ea9d7c39118866125ed9de6ec3c55b6137fc028892332fa75bee31fb8b",
+      "weights_sha256": "f166c8cfabf92d48b0039a7e3918ff7079b0fce2b31a7eecc52e5d12a195e1ae",
+      "tiles": [
+        {
+          "first": 0,
+          "rows": 64,
+          "elements": 512,
+          "bit_mismatches": 0,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "first_mismatches": []
+        },
+        {
+          "first": 128,
+          "rows": 64,
+          "elements": 512,
+          "bit_mismatches": 0,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "first_mismatches": []
+        },
+        {
+          "first": 256,
+          "rows": 61,
+          "elements": 488,
+          "bit_mismatches": 0,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "first_mismatches": []
+        }
+      ],
+      "elements": 1512,
+      "bit_mismatches": 0,
+      "relative_l2": 0.0,
+      "max_abs": 0.0,
+      "bitexact": true
+    },
+    {
+      "precision": "split",
+      "K": 384,
+      "capture_file_sha256": "bb0908213f42bf80f614daffa7e82c1a7b2c430cd52c2c5ed1a21e5dd994464d",
+      "actual_sha256": "fa2e73ff0bd21f1935b027f7ad3e0ee8333db3b233d4113842a731cc8088943d",
+      "snake_sha256": "32847b7ba0cde139728d8e139e83fdb6eb95c49eae1fe55bf0e13a4d0026d0a8",
+      "weights_sha256": "907769efeb26d197ae6a1f81553ba49cfb7f2f090c310d81e3908a5f1fbde60c",
+      "tiles": [
+        {
+          "first": 0,
+          "rows": 64,
+          "elements": 512,
+          "bit_mismatches": 0,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "first_mismatches": []
+        },
+        {
+          "first": 128,
+          "rows": 64,
+          "elements": 512,
+          "bit_mismatches": 0,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "first_mismatches": []
+        },
+        {
+          "first": 256,
+          "rows": 61,
+          "elements": 488,
+          "bit_mismatches": 0,
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "first_mismatches": []
+        }
+      ],
+      "elements": 1512,
+      "bit_mismatches": 0,
+      "relative_l2": 0.0,
+      "max_abs": 0.0,
+      "bitexact": true
+    }
+  ],
+  "all_selected_outputs_bitexact": true
+}

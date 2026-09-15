@@ -1,0 +1,32 @@
+{
+  "format": "bigcodec-resident-program-parity-v1",
+  "hardware_executed": false,
+  "method": "Read existing saved artifacts with torch.load(weights_only=True, mmap=True); SHA256 every resident image byte, its declared program slice and the containing bin. No compilation or native execution.",
+  "scope": "Prototype and production wrapper differ in serialized metadata, but their uploaded resident images and programs are byte-identical.",
+  "model_image_equal": true,
+  "program_equal": true,
+  "artifacts": [
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_encoder_loop.bin",
+      "bin_sha256": "d3de591cd227d612dc39f78c2e47e902ec9dba6502d7da69052b3b144442999b",
+      "model_sha256": "9398741d2015a39f556835635df0e69f04961c02ec2f497eee76b00ce5918a42",
+      "program_sha256": "7ed620dd6e71f4754bd6796f72626d655d66f4952a7fce4789e2a0dd97c7cc45",
+      "resident_bytes": 443979712,
+      "parameter_bytes": 333627264,
+      "program_bytes": 110352448,
+      "program_offset": 333627264,
+      "instructions": 3448514
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_production.bin",
+      "bin_sha256": "53d7e7eb89e5ae821248502de47497c447b9c5657c5030d32fd26131fef2f5d8",
+      "model_sha256": "9398741d2015a39f556835635df0e69f04961c02ec2f497eee76b00ce5918a42",
+      "program_sha256": "7ed620dd6e71f4754bd6796f72626d655d66f4952a7fce4789e2a0dd97c7cc45",
+      "resident_bytes": 443979712,
+      "parameter_bytes": 333627264,
+      "program_bytes": 110352448,
+      "program_offset": 333627264,
+      "instructions": 3448514
+    }
+  ]
+}

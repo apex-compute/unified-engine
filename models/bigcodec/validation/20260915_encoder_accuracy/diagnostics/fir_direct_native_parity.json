@@ -1,0 +1,26 @@
+[
+  {
+    "variant": "baseline",
+    "original_s": 0.007707654913728433,
+    "direct_s": 0.007703669917479371,
+    "output_sha256": "a74302ab595b4c4a87d028f4e61f73588f0961fa5fbf82ddf957a524d8351f48",
+    "output_bit_identical": true,
+    "relative_l2": 0.0068881372875337545
+  },
+  {
+    "variant": "dc",
+    "original_s": 0.03384428507126782,
+    "direct_s": 0.025246295573893476,
+    "output_sha256": "a44d2a396008cd7b165528e9a9a6a696f61268391bc825ac0cb20293e052dbec",
+    "output_bit_identical": true,
+    "relative_l2": 0.004632554885000571
+  },
+  {
+    "variant": "split",
+    "original_s": 0.04497615603900976,
+    "direct_s": 0.03610555438859715,
+    "output_sha256": "fa2e73ff0bd21f1935b027f7ad3e0ee8333db3b233d4113842a731cc8088943d",
+    "output_bit_identical": true,
+    "relative_l2": 0.0045166372427883714
+  }
+]

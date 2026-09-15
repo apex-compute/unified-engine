@@ -1,0 +1,132 @@
+{
+  "format": "bigcodec-diagnostic-verbatim-copies-v1",
+  "scope": "Historical source paths are retained for provenance; ignored tensor/bin files and research scripts are not bundled. The REJECTED file is an invalid harness run despite its original PASS field.",
+  "files": [
+    {
+      "file": "op087_native_corrected.json",
+      "bytes": 19056,
+      "sha256": "9b02aeb35f47ac030436b8800f54a620633cfcc0389e59627f267009a74f16a2",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/precision_activation_op087_native_bf16_identity/results.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "op087_native_direct.json",
+      "bytes": 19356,
+      "sha256": "7dbb32b7fb4bed5ea3f5bf9882316cf6b92b935dce48000f76472eb9cee06083",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/precision_activation_op087_native_direct/results.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "op087_native_loop.json",
+      "bytes": 19500,
+      "sha256": "aeb824f463f6d96ac0d14424cf2c3721695b4aaa02386f050379a07e44dd87aa",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/precision_activation_op087_native_loop/results.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "REJECTED_op087_invalid_identity.json",
+      "bytes": 17908,
+      "sha256": "b47678ef44a9c1b7cdb57f046b0e44029312daf6006bcb717ad85bea70e4424b",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/precision_activation_op087_native/results.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "fir_direct_native_parity.json",
+      "bytes": 824,
+      "sha256": "30ba9cb1b3bb7d779ff299ddab35985b6c7b0f13677d7d75ad61735e4249de38",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/precision_fir_direct_native_parity.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "fir_loop_native_parity.json",
+      "bytes": 813,
+      "sha256": "ce40fbc5cf43e1e9ec1324c1bcf55d5e2bd5ab8965ef1be678e01b69230df870",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/precision_fir_loop_native_parity.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "fir_native_model_validation.json",
+      "bytes": 3502,
+      "sha256": "2af9d6de3f3156049580703c63ece6d9e292184985dd640351d43a0701bee7d7",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/fir_native_model_validation.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "fir_native_model_provenance.json",
+      "bytes": 3096,
+      "sha256": "1902b976e6fd0e7d6313dfedcf697e136a14e2e5a21b6f3deadb33e425c2eab0",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/fir_native_model.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "production_matrix_image_parity.json",
+      "bytes": 630,
+      "sha256": "0e302a2e32a9947fbe9562bb21015dfbecd4692d148748b5a2c82571a41f52a8",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/production_matrix_image_parity.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "production_artifact_review.json",
+      "bytes": 1166,
+      "sha256": "cca82b78acd12ce1bf5e1fe70466837b8090030834b57bafb727a02fc1ef08c8",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/production_artifact_review.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "production_integration_review.json",
+      "bytes": 50760,
+      "sha256": "45be38a396d4d682de965258ccc2ad9416921bece6b37c0f6f703ee7822ac726",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/production_integration_review.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "production_filter_tests.log",
+      "bytes": 1126,
+      "sha256": "06cc695076b858ad65fbe35c9c1890276fa50cf3cabff03a82330ab54d76c58b",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/production_filter_tests.log",
+      "copy": "verbatim"
+    },
+    {
+      "file": "production_core_tests.log",
+      "bytes": 499,
+      "sha256": "318f6785325a640b2fe62863c023f13df302c6eac7946befcaaa07a71923fa05",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/production_core_tests.log",
+      "copy": "verbatim"
+    },
+    {
+      "file": "production_compile_tests.log",
+      "bytes": 363,
+      "sha256": "5726077e3b09dc7286ef83a0da5edc5636105ceaf056dbad123e35817d961d91",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/production_compile_tests.log",
+      "copy": "verbatim"
+    },
+    {
+      "file": "short_matrix_prototype_compile.json",
+      "bytes": 3924,
+      "sha256": "0d0110f534c15596dd0f75774ad28dc28e56ae96b702ac702283f1857eb6449d",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_encoder_loop.compile.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "bus_matrix_prototype.comparison.json",
+      "bytes": 1735,
+      "sha256": "e22badc94d7ac85c3843765b8d06b6d442d7b2c3e6703ac44530184960bff774",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/bus_matrix_both_loop.comparison.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "bus_matrix_prototype.metrics.json",
+      "bytes": 3992,
+      "sha256": "89e109eb3031b7c55088d08d3c1f5c03d8bc6c21defa786ede1e03af4342f363",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/bus_matrix_both_loop.metrics.json",
+      "copy": "verbatim"
+    },
+    {
+      "file": "production_long_image_parity.json",
+      "bytes": 1158,
+      "sha256": "db0b36a37b94e28d50db03c30684ecb884e79976db2fa81f41a99d20aaea20dc",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/production_long_image_parity.json",
+      "copy": "verbatim"
+    }
+  ]
+}
