@@ -9,8 +9,8 @@ import torch
 
 from bigcodec_common import DEFAULT_CHECKPOINT, load_models
 from bigcodec_compile import Arena, build_graph, compiled_sample_count, plan_memory, convolution_reuse_pixels, _prepare_operation, emit_operation, shared
-from bigcodec_layout import LEGACY_LAYOUT, EXTENDED_LAYOUT, layout_for_hardware
-from bigcodec_vq.module import ResidualUnit
+from bigcodec_layout import LEGACY_LAYOUT, EXTENDED_LAYOUT, LARGE_PROGRAM_LAYOUT, layout_for_hardware
+from bigcodec_vq.module import ResidualUnit, ResLSTM
 
 
 def tiny_models():
@@ -33,15 +33,20 @@ class BigCodecGraphTest(unittest.TestCase):
         self.assertEqual(constants, (shared.MODEL_BASE, shared.MODEL_LIMIT,
                                     shared.TENSOR_BASE, shared.TENSOR_LIMIT))
 
-    def test_model_capacity_retries_only_a_legacy_layout(self):
+    def test_model_capacity_replans_each_supported_arena_and_then_fails(self):
         import bigcodec_compile as compiler
         result = object()
         failure = compiler._ModelCapacityError('model arena full', LEGACY_LAYOUT)
         with patch.object(compiler, '_compile_models', side_effect=(failure, result)) as compile_graph:
             self.assertIs(compiler.compile_models('encoder', 'decoder', samples=1000), result)
             self.assertEqual(compile_graph.call_args.kwargs['memory_layout'], EXTENDED_LAYOUT)
+        failures = (failure, compiler._ModelCapacityError('model arena full', EXTENDED_LAYOUT), result)
+        with patch.object(compiler, '_compile_models', side_effect=failures) as compile_graph:
+            self.assertIs(compiler.compile_models('encoder', 'decoder', samples=1000), result)
+            self.assertEqual(compile_graph.call_args.kwargs['memory_layout'], LARGE_PROGRAM_LAYOUT)
+            self.assertEqual(compile_graph.call_count, 3)
         with patch.object(compiler, '_compile_models', side_effect=compiler._ModelCapacityError(
-                'model arena full', EXTENDED_LAYOUT)) as compile_graph:
+                'model arena full', LARGE_PROGRAM_LAYOUT)) as compile_graph:
             with self.assertRaisesRegex(ValueError, 'model arena full'):
                 compiler.compile_models('encoder', 'decoder', samples=1000)
             self.assertEqual(compile_graph.call_count, 1)
@@ -49,6 +54,35 @@ class BigCodecGraphTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'invalid weights'):
                 compiler.compile_models('encoder', 'decoder', samples=1000)
             self.assertEqual(compile_graph.call_count, 1)
+        with patch.object(compiler, '_compile_models', side_effect=failure) as compile_graph:
+            with self.assertRaisesRegex(ValueError, 'model arena full'):
+                compiler.compile_models('encoder', 'decoder', samples=1000, memory_layout=LEGACY_LAYOUT)
+            self.assertEqual(compile_graph.call_count, 1)
+        with self.assertRaisesRegex(ValueError, 'Unsupported'):
+            compiler.compile_models('encoder', 'decoder', samples=1000, memory_layout='unknown')
+
+    def test_large_program_arena_cannot_overlap_packed_audio(self):
+        graph = build_graph(*tiny_models(), 524400)
+        with self.assertRaisesRegex(ValueError, 'input arena'):
+            plan_memory(graph, layout=LARGE_PROGRAM_LAYOUT)
+
+    def test_offline_capture_limit_covers_large_program_and_restores_on_failure(self):
+        import bigcodec_compile as compiler
+        models = tiny_models()
+        for model in models:
+            model.training = False
+            model.named_parameters = lambda: iter(())
+        old_width = compiler.udc.UE_AXI_DATA_WIDTH_BITS
+        def fail(*args):
+            self.assertEqual(compiler.udc.UE_AXI_DATA_WIDTH_BITS, 256)
+            self.assertGreaterEqual(compiler.udc.MAX_DECODER_INSTRUCTIONS, 2 * 1024**3 // 32)
+            raise RuntimeError("stop offline capture")
+        with patch.object(compiler.udc, "MAX_DECODER_INSTRUCTIONS", 1024):
+            with patch.object(compiler, "prepare_operations", side_effect=fail):
+                with self.assertRaisesRegex(RuntimeError, "stop offline capture"):
+                    compiler._compile_models(*models, samples=399, memory_layout=LARGE_PROGRAM_LAYOUT)
+            self.assertEqual(compiler.udc.MAX_DECODER_INSTRUCTIONS, 1024)
+            self.assertEqual(compiler.udc.UE_AXI_DATA_WIDTH_BITS, old_width)
 
     @unittest.skipUnless(DEFAULT_CHECKPOINT.exists(), 'official checkpoint not downloaded')
     def test_longest_noisy_file_fits_extended_layout_without_live_aliases(self):
@@ -71,6 +105,13 @@ class BigCodecGraphTest(unittest.TestCase):
                         and right.address < left.address + left.size_bytes)
         self.assertEqual(layout_for_hardware({key: getattr(graph.layout, key) for key in
             ('model_base', 'model_limit', 'tensor_base', 'tensor_limit')}), EXTENDED_LAYOUT)
+        graph = plan_memory(graph, layout=LARGE_PROGRAM_LAYOUT)
+        self.assertEqual(graph.tensor_end - graph.layout.tensor_base, 679410560)
+        self.assertLessEqual(graph.tensors['input'].address + graph.tensors['input'].size_bytes,
+                             graph.layout.model_base)
+        self.assertEqual(graph.layout.model_limit - graph.layout.model_base, 1216 * 1024 * 1024)
+        self.assertEqual(layout_for_hardware({key: getattr(graph.layout, key) for key in
+            ('model_base', 'model_limit', 'tensor_base', 'tensor_limit')}), LARGE_PROGRAM_LAYOUT)
 
     def test_official_padding_dimensions(self):
         for samples, expected in ((1, 200), (199, 200), (200, 400), (201, 400), (3200, 3400)):
@@ -120,6 +161,59 @@ class BigCodecGraphTest(unittest.TestCase):
             self.assertTrue(any(call.kwargs.get("transpose") for call in backend.conv_scratch_bytes.call_args_list))
         with self.assertRaises(ValueError):
             build_graph(*tiny_models(), 400, conv_precision="fp16")
+
+    def test_compensated_cell_reserves_residual_and_reaches_lstm_plan(self):
+        models = tiny_models()
+        models[0].block.insert(1, ResLSTM(64))
+        legacy = plan_memory(build_graph(*models, 400))
+        compensated = plan_memory(build_graph(*models, 400, lstm_cell_precision="compensated"))
+        old = next(op for op in legacy.operations if op.op == "lstm")
+        new = next(op for op in compensated.operations if op.op == "lstm")
+        self.assertEqual(new.scratch_bytes - old.scratch_bytes, 64 * 2)
+        with patch("bigcodec_compile.prepare_lstm") as prepare:
+            _prepare_operation(compensated, object(), 0x90000000, 0x90002000, new)
+            self.assertTrue(prepare.call_args.kwargs["compensated_cell"])
+            _prepare_operation(legacy, object(), 0x90000000, 0x90002000, old)
+            self.assertFalse(prepare.call_args.kwargs["compensated_cell"])
+        for graph in (legacy, compensated):
+            self.assertLessEqual(graph.tensor_end, graph.layout.tensor_limit)
+        with self.assertRaisesRegex(ValueError, "cell precision"):
+            build_graph(*models, 400, lstm_cell_precision="fp32")
+
+    def test_selected_stack_gets_fused_and_compensated_arithmetic(self):
+        models = tiny_models()
+        models[0].block.insert(1, ResLSTM(64))
+        models[1].model.insert(1, ResLSTM(1))
+        for scope in ("encoder", "decoder", "both"):
+            graph = plan_memory(build_graph(*models, 400, lstm_cell_precision="products",
+                lstm_tanh_precision="compensated", lstm_fused_gates=True, lstm_math_scope=scope))
+            for op in (op for op in graph.operations if op.op == "lstm"):
+                with patch("bigcodec_compile.prepare_lstm") as prepare:
+                    _prepare_operation(graph, object(), 0x90000000, 0x90002000, op)
+                    selected = scope == "both" or op.name.startswith(scope + ".")
+                    for flag in ("compensated_cell", "compensated_tanh", "fused_projection"):
+                        self.assertEqual(prepare.call_args.kwargs[flag], selected)
+                    self.assertFalse(prepare.call_args.kwargs["preserve_cell_residual"])
+        for kwargs in (dict(lstm_tanh_precision="fp32"), dict(lstm_math_scope="neither"),
+                       dict(lstm_fused_gates=1)):
+            with self.assertRaises(ValueError):
+                build_graph(*models, 400, **kwargs)
+
+    def test_quantizer_precision_flags_reach_packing_without_changing_memory_shape(self):
+        plain = plan_memory(build_graph(*tiny_models(), 400))
+        precise = plan_memory(build_graph(*tiny_models(), 400, center_quantizer_scores=True,
+                                         compensated_codebook=True))
+        self.assertEqual(plain.scratch_bytes, precise.scratch_bytes)
+        self.assertEqual(plain.output_bytes, precise.output_bytes)
+        for graph, enabled in ((plain, False), (precise, True)):
+            op = next(op for op in graph.operations if op.op == "quantizer")
+            with patch("bigcodec_compile.prepare_quantizer") as prepare:
+                _prepare_operation(graph, object(), 0x90000000, 0x90002000, op)
+                self.assertEqual(prepare.call_args.kwargs["center_scores"], enabled)
+                self.assertEqual(prepare.call_args.kwargs["compensated_codebook"], enabled)
+        for flag in ("center_quantizer_scores", "compensated_codebook"):
+            with self.assertRaises(ValueError):
+                build_graph(*tiny_models(), 400, **{flag: 1})
 
     def test_live_tensors_never_alias_and_outputs_are_contiguous(self):
         graph = plan_memory(build_graph(*tiny_models(), 400))

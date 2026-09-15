@@ -1,0 +1,3044 @@
+{
+  "started_utc": "2026-09-15T01:52:45.679581+00:00",
+  "output_root": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder",
+  "cpu_core": 7,
+  "threads": 1,
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "torch_version": "2.12.0.dev20260405+cu128",
+  "source_files_sha256": {
+    "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+    "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+    "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+    "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+    "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+    "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+    "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+    "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+  },
+  "generator": {
+    "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/run_conditional_decomposition.py",
+    "sha256": "0d9feff359af8e0e82838991d73d4e947f0adaaafa0d1d5a378ceef15e1c821a",
+    "bytes": 16799
+  },
+  "decomposition_helper": {
+    "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition.py",
+    "sha256": "edb7f3bdcd9b7e8728a101a479a543abb9537686e2a82237e74690dd58c20574",
+    "bytes": 8052
+  },
+  "reference_manifest": {
+    "path": "models/bigcodec/validation/20260914_noisy20s/cpu_reference_manifest.json",
+    "sha256": "e43e5618382d2625aa76a4345782459f5a33ed909a27dfd36fa2339b083cc28c",
+    "bytes": 25779
+  },
+  "batch_freeze": {
+    "path": "models/bigcodec/validation/20260915_accuracy/decoder/batch_freeze.json",
+    "sha256": "ae128e54f3e489d57540d5b201e345a7779e78c389ee7a4e78aa3c32d6496373",
+    "bytes": 20009
+  },
+  "model_load_s": 1.169442071000958,
+  "format": "bigcodec.noisy20s-conditional-error-decomposition-v1",
+  "status": "complete",
+  "finished_utc": "2026-09-15T02:17:37.517927+00:00",
+  "evaluation_only": true,
+  "hardware_access": false,
+  "neural_runtime_fallback": false,
+  "method": "Official FP32 decoder independently decodes each saved FPGA token sequence as a complete utterance; original sample indices, no gain/delay/polarity fitting. Frozen official CPU reconstruction is the reference. Token and conditional decoder components sum as vectors, not scalar percentages.",
+  "normalization": {
+    "token_only": "sqrt(sum token_error_energy / sum reference_energy)",
+    "conditional_decoder": "sqrt(sum decoder_error_energy / sum same_token_cpu_energy)",
+    "common_reference_decoder": "sqrt(sum decoder_error_energy / sum reference_energy)",
+    "total": "sqrt(sum full_error_energy / sum reference_energy)",
+    "energy_identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+  },
+  "comparison_scope": "Conditional decoder error includes embedding and decoder arithmetic at the same saved FPGA tokens. Before/after token sequences differ, so these conditional inputs differ between variants.",
+  "selected_settings": {
+    "lstm_math_scope": "decoder",
+    "lstm_cell_precision": "compensated",
+    "lstm_tanh_precision": "compensated",
+    "lstm_fused_gates": true,
+    "convolution_precision": "bf16",
+    "memory_layout": "large-program",
+    "center_quantizer_scores": true,
+    "compensated_codebook": true,
+    "expected_version": 1079090698
+  },
+  "hardware_runs": {
+    "path": "models/bigcodec/validation/20260915_accuracy/decoder/hardware_runs.json",
+    "sha256": "0ff85f140de14c8c91b8e14799972d5cf17e5347d7169d6bc8460a7444d9cac8",
+    "bytes": 147136
+  },
+  "cases": [
+    {
+      "case": "bus",
+      "recurrent_precision": "bf16",
+      "baseline": {
+        "case": "bus",
+        "recurrent_precision": "bf16",
+        "variant": "baseline",
+        "samples": 378916,
+        "sample_rate": 16000,
+        "padded_samples": 379000,
+        "frames": 1895,
+        "tokens_matching_official": 1714,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.2809025853262052,
+          "token_only_cpu_vs_official_l2": 0.2966529095588056,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.05734735448968282,
+          "decoder_error_relative_to_official_energy": 0.05648146709901383,
+          "reference_energy": 1854.575545013583,
+          "same_token_cpu_energy": 1798.9938985205097,
+          "full_error_energy": 146.33762467511139,
+          "token_error_energy": 163.20811664028636,
+          "decoder_error_energy": 5.916385535418717,
+          "two_error_cross_term": -22.786877500593693,
+          "two_error_cross_term_relative_to_reference_energy": -0.012286842432415877,
+          "token_decoder_error_cosine": -0.366653396160995,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.13473433599183746,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 28.485194975000923,
+        "cpu_decode_rtf": 1.2028077980344318,
+        "cache_reuse": "verified_bus_cache",
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus.wav",
+            "sha256": "bff0a4e91d8d1f7520a4d2dec2821ac3dd52d76d9c2ddd9fc472f129ad16e21f",
+            "bytes": 1515744
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus.tokens.npz",
+            "sha256": "75fefe9df0f99df2bb734d1c44228492cd762ed89703cf904afe5176a715bb99",
+            "bytes": 4179
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus.metrics.json",
+            "sha256": "9eed59398f8d74d32333cafbb7f5821b094db597bf1eee84434e4f4266e64f1b",
+            "bytes": 2839
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus.comparison.json",
+            "sha256": "43f8c4c2775514d6b7665303a3e5a9ab087a0b5a306365faab6917db616351d4",
+            "bytes": 1699
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition/old_baseline_same_tokens_cpu.wav",
+            "sha256": "928c50eea7241e22d5751e8e1541b2bb99c28418bb0426c9550c04946a7b5560",
+            "bytes": 1515744
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+            "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+            "bytes": 1515744
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz",
+            "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+            "bytes": 4178
+          }
+        },
+        "fpga_rtf": 4.796442675886039,
+        "fpga_audio_processing_s": 113.59055456100214,
+        "cache_provenance": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition/three_variants.json",
+          "sha256": "bbdca0ca67038f4e1cd1aa7f6d0ef5275f6ddc187a8e6cc693e105890fc3fba1",
+          "bytes": 13445
+        }
+      },
+      "selected": {
+        "case": "bus",
+        "recurrent_precision": "bf16",
+        "variant": "selected",
+        "samples": 378916,
+        "sample_rate": 16000,
+        "padded_samples": 379000,
+        "frames": 1895,
+        "tokens_matching_official": 1736,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.2055055276659087,
+          "token_only_cpu_vs_official_l2": 0.19566882200325023,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.04628410070736978,
+          "decoder_error_relative_to_official_energy": 0.045888051719590386,
+          "reference_energy": 1854.575545013583,
+          "same_token_cpu_energy": 1822.9724580646744,
+          "full_error_energy": 78.32340232229689,
+          "token_error_energy": 71.00481325636669,
+          "decoder_error_energy": 3.9052043735935644,
+          "two_error_cross_term": 3.413384692336638,
+          "two_error_cross_term_relative_to_reference_energy": 0.0018405207064841557,
+          "token_decoder_error_cosine": 0.10249188073884143,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.04556646494462251,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 27.861222240000643,
+        "cpu_decode_rtf": 1.176460101552878,
+        "cache_reuse": "verified_bus_cache",
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.wav",
+            "sha256": "2cdb24367220760833115a108983cc9315eb12fdf16ecd03e9026e877dd904cb",
+            "bytes": 1515744
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.tokens.npz",
+            "sha256": "3a419e9624d515598da2f88fd834d7f88db17e2e6efb151f9db8ed4aa0fe99b5",
+            "bytes": 4183
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.metrics.json",
+            "sha256": "8e2b5f869ac3600a9348967e4c7f0d51ddff272b363be8e733e2ebf903b104af",
+            "bytes": 3396
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.comparison.json",
+            "sha256": "97981740d20fc2daa7b8b3ef450d13615f07f5353aa5521fc6b2c628cda09ede",
+            "bytes": 1741
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition/decoder_scope_same_tokens_cpu.wav",
+            "sha256": "1327256dc183bb2b289052574c91572e67b4e8c0151999b92689b66a14ca7e9f",
+            "bytes": 1515744
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+            "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+            "bytes": 1515744
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz",
+            "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+            "bytes": 4178
+          }
+        },
+        "fpga_rtf": 4.823954804378569,
+        "fpga_audio_processing_s": 114.24210366599436,
+        "cache_provenance": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition/three_variants.json",
+          "sha256": "bbdca0ca67038f4e1cd1aa7f6d0ef5275f6ddc187a8e6cc693e105890fc3fba1",
+          "bytes": 13445
+        }
+      }
+    },
+    {
+      "case": "cafe",
+      "recurrent_precision": "bf16",
+      "baseline": {
+        "case": "cafe",
+        "recurrent_precision": "bf16",
+        "variant": "baseline",
+        "samples": 328146,
+        "sample_rate": 16000,
+        "padded_samples": 328200,
+        "frames": 1641,
+        "tokens_matching_official": 1503,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.21960814798900385,
+          "token_only_cpu_vs_official_l2": 0.21830175236315388,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.03892349671344419,
+          "decoder_error_relative_to_official_energy": 0.038970787686474766,
+          "reference_energy": 1810.7900888599197,
+          "same_token_cpu_energy": 1815.1928817217445,
+          "full_error_energy": 87.33031117937688,
+          "token_error_energy": 86.2943879057257,
+          "decoder_error_energy": 2.7500872757217065,
+          "two_error_cross_term": -1.7141640020705278,
+          "two_error_cross_term_relative_to_reference_energy": -0.0009466387145678337,
+          "token_decoder_error_cosine": -0.05563625132172837,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.01925064972955983,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 24.425050666999596,
+        "cpu_decode_rtf": 1.190935774539362,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe.wav",
+            "sha256": "ab0f591a0461f2f9e1e1e0322763bc64b4144662ab24f6ec78abad96d81158f1",
+            "bytes": 1312664
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe.tokens.npz",
+            "sha256": "c2de26f3033ee688e3847137fecca3d6252e8f1be90cf5e17d72817542d4de7e",
+            "bytes": 3703
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe.metrics.json",
+            "sha256": "41b2e5e741842612ba23b6307123e522a0a537d837ae33649f0d2eb1bb01d9f3",
+            "bytes": 2977
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe.comparison.json",
+            "sha256": "9092552b09bc569e1568786323dfabf4f03cee9bbd2f808da51170e39abfe9dc",
+            "bytes": 1707
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_bf16_baseline_same_tokens_cpu.wav",
+            "sha256": "953c79db67d19d9b3d778a5fa0ef10444c82f5939b5cab4cde494ef2577c1362",
+            "bytes": 1312664
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav",
+            "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e",
+            "bytes": 1312664
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.tokens.npz",
+            "sha256": "c48df28ed8b8998368cca7e603405a6389f68d60cf0ecc7bf9a09af7c20394c4",
+            "bytes": 3699
+          }
+        },
+        "fpga_rtf": 4.794718405685314,
+        "fpga_audio_processing_s": 98.33547912200083
+      },
+      "selected": {
+        "case": "cafe",
+        "recurrent_precision": "bf16",
+        "variant": "selected",
+        "samples": 328146,
+        "sample_rate": 16000,
+        "padded_samples": 328200,
+        "frames": 1641,
+        "tokens_matching_official": 1528,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.21331369652185916,
+          "token_only_cpu_vs_official_l2": 0.2143004281042057,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.02792129114471986,
+          "decoder_error_relative_to_official_energy": 0.027804444453780938,
+          "reference_energy": 1810.7900888599197,
+          "same_token_cpu_energy": 1795.6659957553657,
+          "full_error_energy": 82.39589815665093,
+          "token_error_energy": 83.15994358193541,
+          "decoder_error_energy": 1.3998985153341885,
+          "two_error_cross_term": -2.16394394061866,
+          "two_error_cross_term_relative_to_reference_energy": -0.0011950274932093798,
+          "token_decoder_error_cosine": -0.10027914918620523,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.02559068095384408,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 24.63499127599789,
+        "cpu_decode_rtf": 1.201172223388267,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.wav",
+            "sha256": "f3cbcc9aeaccc3f8c4fe61825a6b373b58bf2b658f240a1163c5c71f33d18011",
+            "bytes": 1312664
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.tokens.npz",
+            "sha256": "5062896d4073cf2fc2b6050363766733c6755037777d30b74c1599772bdf36dd",
+            "bytes": 3704
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.metrics.json",
+            "sha256": "35863400b809c03e67f1dfc6f4eef860a740266d865382fb3dcee2a358793145",
+            "bytes": 3379
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.comparison.json",
+            "sha256": "767a0cf6fc2f5e06997507b0127b83210d623bf78aa060ee439188a7911909a0",
+            "bytes": 1720
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_bf16_selected_same_tokens_cpu.wav",
+            "sha256": "5c7328483ac42b72b06369c3c30d5981312a2252429a5d8e5893b518f088228a",
+            "bytes": 1312664
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav",
+            "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e",
+            "bytes": 1312664
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.tokens.npz",
+            "sha256": "c48df28ed8b8998368cca7e603405a6389f68d60cf0ecc7bf9a09af7c20394c4",
+            "bytes": 3699
+          }
+        },
+        "fpga_rtf": 4.822355456558907,
+        "fpga_audio_processing_s": 98.9022908529987
+      }
+    },
+    {
+      "case": "office",
+      "recurrent_precision": "bf16",
+      "baseline": {
+        "case": "office",
+        "recurrent_precision": "bf16",
+        "variant": "baseline",
+        "samples": 351688,
+        "sample_rate": 16000,
+        "padded_samples": 351800,
+        "frames": 1759,
+        "tokens_matching_official": 1576,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.23844481566992895,
+          "token_only_cpu_vs_official_l2": 0.23839334422024572,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.049422988590893134,
+          "decoder_error_relative_to_official_energy": 0.0488932536335241,
+          "reference_energy": 2243.7508500261993,
+          "same_token_cpu_energy": 2195.9098193463205,
+          "full_error_energy": 127.5705415354804,
+          "token_error_energy": 127.51547192126759,
+          "decoder_error_energy": 5.363799157424658,
+          "two_error_cross_term": -5.308729543211831,
+          "two_error_cross_term_relative_to_reference_energy": -0.0023660066995182835,
+          "token_decoder_error_cosine": -0.10149459378037663,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.03995152517105512,
+          "scalar_identity_residual": -2.842170943040401e-14,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 26.334662837001815,
+        "cpu_decode_rtf": 1.1980920742022163,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office.wav",
+            "sha256": "2617b86e92957d95459e045baed28f28d44474d53f4b43f3c2fae4d882cebf5b",
+            "bytes": 1406832
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office.tokens.npz",
+            "sha256": "53e74e6ec32f6d720349b2f5f2dc2699cf2969817b9343bb81cd6adf407bb38b",
+            "bytes": 3874
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office.metrics.json",
+            "sha256": "8ca45390984fc21a53745c41ccce562e4051e5fcb0fd32e16a68c4cded627765",
+            "bytes": 2985
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office.comparison.json",
+            "sha256": "123063205b0b7c63fba15503393afa7a15630ff7d838ec6e23a7892d6127c4aa",
+            "bytes": 1713
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_bf16_baseline_same_tokens_cpu.wav",
+            "sha256": "039f42a8dc81d57efd0f5965aec45abc0af46b8c9f905c3a73b7fcd60022e371",
+            "bytes": 1406832
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.wav",
+            "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad",
+            "bytes": 1406832
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.tokens.npz",
+            "sha256": "a1060ccbbb1a6007e718fbfaa9cbda024a8a1da12554d3051ec7599bdacaa430",
+            "bytes": 3871
+          }
+        },
+        "fpga_rtf": 4.7964534740337905,
+        "fpga_audio_processing_s": 105.42844558599973
+      },
+      "selected": {
+        "case": "office",
+        "recurrent_precision": "bf16",
+        "variant": "selected",
+        "samples": 351688,
+        "sample_rate": 16000,
+        "padded_samples": 351800,
+        "frames": 1759,
+        "tokens_matching_official": 1583,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.22477939430919133,
+          "token_only_cpu_vs_official_l2": 0.22096929175964092,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.03503446413674172,
+          "decoder_error_relative_to_official_energy": 0.034555872479844506,
+          "reference_energy": 2243.7508500261993,
+          "same_token_cpu_energy": 2182.867613297678,
+          "full_error_energy": 113.36725308608645,
+          "token_error_energy": 109.55658285691717,
+          "decoder_error_energy": 2.679281564402957,
+          "two_error_cross_term": 1.1313886647663312,
+          "two_error_cross_term_relative_to_reference_energy": 0.0005042398824063377,
+          "token_decoder_error_cosine": 0.03301820128887268,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.010080455749146566,
+          "scalar_identity_residual": -1.4210854715202004e-14,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 26.146102155002154,
+        "cpu_decode_rtf": 1.1895135304020452,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.wav",
+            "sha256": "966600affcbf213051cb96deaac30004c9c51c524ef2c2d2e9d758678c430884",
+            "bytes": 1406832
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.tokens.npz",
+            "sha256": "6e87aa6694c194c3ec9dc19f811442dadff1adb0edb5aa6ed9c209dd4c27160d",
+            "bytes": 3870
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.metrics.json",
+            "sha256": "606e03dfee4a83dbeeeddc7f9c27bd5a4cb53a8ab2b67cbe5d6d29e73ffba8d8",
+            "bytes": 3389
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.comparison.json",
+            "sha256": "acc47598a5c8bf902ab40c2caac82560af540b4b7ae8f3c67014a8ed538589f0",
+            "bytes": 1729
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_bf16_selected_same_tokens_cpu.wav",
+            "sha256": "df3c5d2f96c3a1a918565e24522928d88837013acbe2e25b444c0c673ddf3e5c",
+            "bytes": 1406832
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.wav",
+            "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad",
+            "bytes": 1406832
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.tokens.npz",
+            "sha256": "a1060ccbbb1a6007e718fbfaa9cbda024a8a1da12554d3051ec7599bdacaa430",
+            "bytes": 3871
+          }
+        },
+        "fpga_rtf": 4.824129456518061,
+        "fpga_audio_processing_s": 106.03677751899522
+      }
+    },
+    {
+      "case": "psquare",
+      "recurrent_precision": "bf16",
+      "baseline": {
+        "case": "psquare",
+        "recurrent_precision": "bf16",
+        "variant": "baseline",
+        "samples": 343574,
+        "sample_rate": 16000,
+        "padded_samples": 343600,
+        "frames": 1718,
+        "tokens_matching_official": 1546,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.33448952331509124,
+          "token_only_cpu_vs_official_l2": 0.31551035453817877,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.054154114466196925,
+          "decoder_error_relative_to_official_energy": 0.05368262729969177,
+          "reference_energy": 1804.0364112958182,
+          "same_token_cpu_energy": 1772.759848805575,
+          "full_error_energy": 201.84144095222547,
+          "token_error_energy": 179.58602264012978,
+          "decoder_error_energy": 5.198916281694304,
+          "two_error_cross_term": 17.056502030401404,
+          "two_error_cross_term_relative_to_reference_energy": 0.009454632912952083,
+          "token_decoder_error_cosine": 0.27910479427357754,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.09230461167410078,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.924113281002064,
+        "cpu_decode_rtf": 1.2072677574439072,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare.wav",
+            "sha256": "418f2664b6b4b94ae783821730e9b3309dc13985b2a048b9550a2aa9ca968f9f",
+            "bytes": 1374376
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare.tokens.npz",
+            "sha256": "e3e916f2cc268fab5dafc99bf62b8eecf26cb70160dcd9b6298821925f29a0f6",
+            "bytes": 3870
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare.metrics.json",
+            "sha256": "3f79769bf992035ff4a88c8f3fe93e7fda2d36c9394f5dd2236e554d74407b3f",
+            "bytes": 2987
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare.comparison.json",
+            "sha256": "579e8112423dc37f13e00b7dd2ab0ced3fcde2dcdd2d0f54f3b012db84232ba0",
+            "bytes": 1716
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_bf16_baseline_same_tokens_cpu.wav",
+            "sha256": "49b1b3f2eb9c0bcd66d7bff6c654cee71ca24be90418d225be10b0e095387889",
+            "bytes": 1374376
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.wav",
+            "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059",
+            "bytes": 1374376
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.tokens.npz",
+            "sha256": "c4f0e9c95822161d75be03e1debace66bf229c78ea433b031dd983a2e9cd0a34",
+            "bytes": 3855
+          }
+        },
+        "fpga_rtf": 4.7956606528785155,
+        "fpga_audio_processing_s": 102.9790195720052
+      },
+      "selected": {
+        "case": "psquare",
+        "recurrent_precision": "bf16",
+        "variant": "selected",
+        "samples": 343574,
+        "sample_rate": 16000,
+        "padded_samples": 343600,
+        "frames": 1718,
+        "tokens_matching_official": 1569,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.2977152406717768,
+          "token_only_cpu_vs_official_l2": 0.30925817131132316,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.036875694545520664,
+          "decoder_error_relative_to_official_energy": 0.03638617221930439,
+          "reference_energy": 1804.0364112958182,
+          "same_token_cpu_energy": 1756.457405205663,
+          "full_error_energy": 159.89962090103668,
+          "token_error_energy": 172.53915460595442,
+          "decoder_error_energy": 2.3884603727698583,
+          "two_error_cross_term": -15.027994077687605,
+          "two_error_cross_term_relative_to_reference_energy": -0.00833020552334261,
+          "token_decoder_error_cosine": -0.37014182893916836,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.08590978662525867,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.495465713000158,
+        "cpu_decode_rtf": 1.1873059411014877,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.wav",
+            "sha256": "4009d7328effcb55386baba76ce981204fba52bf4987d3fe8c330e15e2076b8b",
+            "bytes": 1374376
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.tokens.npz",
+            "sha256": "7cb20922586f2e819d068e3bc6b031b3ffe38a3b1d1516db9b8401e236e41008",
+            "bytes": 3863
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.metrics.json",
+            "sha256": "585877f3cb9458d3d4629d063528bb05310c9b82ef137f20717724ea7d6eb3f5",
+            "bytes": 3394
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.comparison.json",
+            "sha256": "4d1b829f8c6376274c54fce68ffdfc7be2dbbb46c96872ea13748e900d1298d6",
+            "bytes": 1735
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_bf16_selected_same_tokens_cpu.wav",
+            "sha256": "de5354c87e8b7bb055e4b188fa1b04f684fd307a3b3775710e20703950ec2c88",
+            "bytes": 1374376
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.wav",
+            "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059",
+            "bytes": 1374376
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.tokens.npz",
+            "sha256": "c4f0e9c95822161d75be03e1debace66bf229c78ea433b031dd983a2e9cd0a34",
+            "bytes": 3855
+          }
+        },
+        "fpga_rtf": 4.8239108874593475,
+        "fpga_audio_processing_s": 103.58564745299736
+      }
+    },
+    {
+      "case": "bus_low_snr",
+      "recurrent_precision": "bf16",
+      "baseline": {
+        "case": "bus_low_snr",
+        "recurrent_precision": "bf16",
+        "variant": "baseline",
+        "samples": 334067,
+        "sample_rate": 16000,
+        "padded_samples": 334200,
+        "frames": 1671,
+        "tokens_matching_official": 1529,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.22796243955008294,
+          "token_only_cpu_vs_official_l2": 0.22060448089011217,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.06968575300974474,
+          "decoder_error_relative_to_official_energy": 0.06894205377429848,
+          "reference_energy": 1193.0449569423322,
+          "same_token_cpu_energy": 1167.716046870326,
+          "full_error_energy": 61.99881676958154,
+          "token_error_energy": 58.06112791733899,
+          "decoder_error_energy": 5.670550767543238,
+          "two_error_cross_term": -1.7328619153006923,
+          "two_error_cross_term_relative_to_reference_energy": -0.001452469921788918,
+          "token_decoder_error_cosine": -0.04775057500052609,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.027189961900560198,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 24.832386250996933,
+        "cpu_decode_rtf": 1.1893368097296377,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus_low_snr.wav",
+            "sha256": "2b9fcbedb52f30103b210670fe09a385ed54e65e0c84247d8c5df6f72b18cd79",
+            "bytes": 1336348
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus_low_snr.tokens.npz",
+            "sha256": "7e41f56290307a028ad23c6855dab58dca08f1ed302f193477e0b179b9a73ee9",
+            "bytes": 3740
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus_low_snr.metrics.json",
+            "sha256": "69494a19a0ad0af907a89037618622a0ce01a6ff2c8a70b95f1fd09a15fd3406",
+            "bytes": 2995
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus_low_snr.comparison.json",
+            "sha256": "d5d5a3e902126c924d3b63dae3e9f36f704f98325f5ab4e5b10beac1bcf1ff7c",
+            "bytes": 1735
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/bus_low_snr_bf16_baseline_same_tokens_cpu.wav",
+            "sha256": "cba896e2e5327c1f89ea8de6fd4dc7e1925d7991eedcda4cbef559c3501980e2",
+            "bytes": 1336348
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.wav",
+            "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6",
+            "bytes": 1336348
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.tokens.npz",
+            "sha256": "c7fde3db4b89fca566160bf035ae191ebb53f0e36ca14ff6a9be25fe1b84cb08",
+            "bytes": 3732
+          }
+        },
+        "fpga_rtf": 4.79736587149288,
+        "fpga_audio_processing_s": 100.16510153700074
+      },
+      "selected": {
+        "case": "bus_low_snr",
+        "recurrent_precision": "bf16",
+        "variant": "selected",
+        "samples": 334067,
+        "sample_rate": 16000,
+        "padded_samples": 334200,
+        "frames": 1671,
+        "tokens_matching_official": 1556,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.21441814768528678,
+          "token_only_cpu_vs_official_l2": 0.2095158998818367,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.03979012309650321,
+          "decoder_error_relative_to_official_energy": 0.03907985956158839,
+          "reference_energy": 1193.0449569423322,
+          "same_token_cpu_energy": 1150.832803543853,
+          "full_error_energy": 54.85041137555997,
+          "token_error_energy": 52.37098984878689,
+          "decoder_error_energy": 1.8220605198955468,
+          "two_error_cross_term": 0.6573610068775362,
+          "two_error_cross_term_relative_to_reference_energy": 0.0005509943301401599,
+          "token_decoder_error_cosine": 0.03364706237701919,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.01212998719218466,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.134980462000385,
+        "cpu_decode_rtf": 1.203829433592681,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.wav",
+            "sha256": "8cdfe2a7ccb04e954efb3809a19fb8ce5a2de526dc0688e2a7037c27ddb73c2a",
+            "bytes": 1336348
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.tokens.npz",
+            "sha256": "a59d6049df6fb0892e535429ab8694525778e14c44ad8f52147c9900f905cf45",
+            "bytes": 3742
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.metrics.json",
+            "sha256": "1296954c3ffb67964aa77427187c769a9fa1a563003319a28fba1535abc0563a",
+            "bytes": 3401
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.comparison.json",
+            "sha256": "2fc6d38ec59f98d2f8323a06a72c32197044d28bc3dc1c130c06501a5fa6ad4b",
+            "bytes": 1751
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/bus_low_snr_bf16_selected_same_tokens_cpu.wav",
+            "sha256": "35a3beaef410e5ac9a1b99fbb3d7695a1f93675f9eff68819a1d4e93ae84c3e9",
+            "bytes": 1336348
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.wav",
+            "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6",
+            "bytes": 1336348
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.tokens.npz",
+            "sha256": "c7fde3db4b89fca566160bf035ae191ebb53f0e36ca14ff6a9be25fe1b84cb08",
+            "bytes": 3732
+          }
+        },
+        "fpga_rtf": 4.824875235063554,
+        "fpga_audio_processing_s": 100.73947469699851
+      }
+    },
+    {
+      "case": "cafe_low_snr",
+      "recurrent_precision": "bf16",
+      "baseline": {
+        "case": "cafe_low_snr",
+        "recurrent_precision": "bf16",
+        "variant": "baseline",
+        "samples": 343450,
+        "sample_rate": 16000,
+        "padded_samples": 343600,
+        "frames": 1718,
+        "tokens_matching_official": 1598,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.3698864120327447,
+          "token_only_cpu_vs_official_l2": 0.3708323719381935,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.08535665600046208,
+          "decoder_error_relative_to_official_energy": 0.08454044127903178,
+          "reference_energy": 1744.519854172468,
+          "same_token_cpu_energy": 1711.315769400484,
+          "full_error_energy": 238.67815476098752,
+          "token_error_energy": 239.90052285010967,
+          "decoder_error_energy": 12.468233795711683,
+          "two_error_cross_term": -13.690601884833796,
+          "two_error_cross_term_relative_to_reference_energy": -0.007847776482502735,
+          "token_decoder_error_cosine": -0.1251625723027923,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.05424840248370135,
+          "scalar_identity_residual": -2.842170943040401e-14,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.145306831000198,
+        "cpu_decode_rtf": 1.171422068120551,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe_low_snr.wav",
+            "sha256": "0fa21cd5e7d54901f9c2552487deb113466966bb886a1ae3baba02cfa8009503",
+            "bytes": 1373880
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe_low_snr.tokens.npz",
+            "sha256": "2a623d20a183e361f60bcec997a5fe9132bf69b63aef81eb5a62191ce11802a5",
+            "bytes": 3831
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe_low_snr.metrics.json",
+            "sha256": "6b56c8adf515d24ad55461ad99a7386dfd4ff3986514eecc57724f886021e5a7",
+            "bytes": 2998
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/cafe_low_snr.comparison.json",
+            "sha256": "1b7a526e90d3cc98624d3a8158625c7388ea11f75675e831b1a3520d5df575fc",
+            "bytes": 1737
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_low_snr_bf16_baseline_same_tokens_cpu.wav",
+            "sha256": "1a61db5a194f0d9f511fe9b40276d0cb4d9a152b4e6e7b707ca920e5e92baf3a",
+            "bytes": 1373880
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.wav",
+            "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c",
+            "bytes": 1373880
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.tokens.npz",
+            "sha256": "a6c30c5a077a9f0c06f2e3bb45b5d06a28d2be2d0efdbc144ab8196cf6f8ac21",
+            "bytes": 3825
+          }
+        },
+        "fpga_rtf": 4.79755463355937,
+        "fpga_audio_processing_s": 102.98250868099785
+      },
+      "selected": {
+        "case": "cafe_low_snr",
+        "recurrent_precision": "bf16",
+        "variant": "selected",
+        "samples": 343450,
+        "sample_rate": 16000,
+        "padded_samples": 343600,
+        "frames": 1718,
+        "tokens_matching_official": 1622,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.328890471772619,
+          "token_only_cpu_vs_official_l2": 0.3310496403344517,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.03667265736462107,
+          "decoder_error_relative_to_official_energy": 0.03618403199355308,
+          "reference_energy": 1744.519854172468,
+          "same_token_cpu_energy": 1698.3416966513619,
+          "full_error_energy": 188.70286766144085,
+          "token_error_energy": 191.18867228122113,
+          "decoder_error_energy": 2.284072231604867,
+          "two_error_cross_term": -4.769876851385156,
+          "two_error_cross_term_relative_to_reference_energy": -0.0027342061140644336,
+          "token_decoder_error_cosine": -0.11412772897239372,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.024653999008469867,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.697720211999695,
+        "cpu_decode_rtf": 1.1971568594904503,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.wav",
+            "sha256": "1f9b7599d217db008f9d89d52f565535a9559eb18a13524d6ee2d68ffb11d39e",
+            "bytes": 1373880
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.tokens.npz",
+            "sha256": "2663f7cead2378cdd5222ffe8ef158d53861af4298560847f7ecd5649174c4f4",
+            "bytes": 3826
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.metrics.json",
+            "sha256": "e9dbb9637d7c25d987e05ba542d97816928170538d64bdf1f7c52bf928b2a17f",
+            "bytes": 3401
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.comparison.json",
+            "sha256": "1cc52139067ad1e3761f8ec1f6750d560bab18b80fcc459bb53bf7d33214a1b1",
+            "bytes": 1750
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_low_snr_bf16_selected_same_tokens_cpu.wav",
+            "sha256": "12fad5b97d482d3b061aa6f8046e22b62e6089144ec65e9b3a431c25938ce222",
+            "bytes": 1373880
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.wav",
+            "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c",
+            "bytes": 1373880
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.tokens.npz",
+            "sha256": "a6c30c5a077a9f0c06f2e3bb45b5d06a28d2be2d0efdbc144ab8196cf6f8ac21",
+            "bytes": 3825
+          }
+        },
+        "fpga_rtf": 4.825032333137393,
+        "fpga_audio_processing_s": 103.57233467600236
+      }
+    },
+    {
+      "case": "office_low_snr",
+      "recurrent_precision": "bf16",
+      "baseline": {
+        "case": "office_low_snr",
+        "recurrent_precision": "bf16",
+        "variant": "baseline",
+        "samples": 343910,
+        "sample_rate": 16000,
+        "padded_samples": 344000,
+        "frames": 1720,
+        "tokens_matching_official": 1551,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.19636180733206593,
+          "token_only_cpu_vs_official_l2": 0.19102880319800064,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.03951792660317397,
+          "decoder_error_relative_to_official_energy": 0.0388841723110156,
+          "reference_energy": 1951.9118176410761,
+          "same_token_cpu_energy": 1889.8076856797263,
+          "full_error_energy": 75.26173657543912,
+          "token_error_energy": 71.22917317629658,
+          "decoder_error_energy": 2.951249397660299,
+          "two_error_cross_term": 1.081314001482235,
+          "two_error_cross_term_relative_to_reference_energy": 0.000553976871142173,
+          "token_decoder_error_cosine": 0.037289788795434056,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.014576811023207363,
+          "scalar_identity_residual": -1.4210854715202004e-14,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.84890224099945,
+        "cpu_decode_rtf": 1.2025891537204245,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office_low_snr.wav",
+            "sha256": "5bec2f29e29a90fc25da07749f210198a4566908f040559eca016d39b840bc83",
+            "bytes": 1375720
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office_low_snr.tokens.npz",
+            "sha256": "199e5c2c7ca088e0bc9cf3e7ecc8382867e4cc155428c066d67092349d3a2f81",
+            "bytes": 3845
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office_low_snr.metrics.json",
+            "sha256": "0cd7d90668616d95cc67f1f6e45de74ae0e36a7e824b629233723bb398351883",
+            "bytes": 3003
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/office_low_snr.comparison.json",
+            "sha256": "0ff9f3e325d36b0770bf2cab9a2eda4a3a422a18d4df6978e04d7e66feca2f60",
+            "bytes": 1748
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_low_snr_bf16_baseline_same_tokens_cpu.wav",
+            "sha256": "647ccc47b3400e3971ea6cb24c645d9986d477f1fce50cc7a1d5ef895d2dde33",
+            "bytes": 1375720
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.wav",
+            "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708",
+            "bytes": 1375720
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.tokens.npz",
+            "sha256": "8c9f828f1cb6d43d0c997af3554fc89f3603577ffa5067dce2ced15ca1e949cc",
+            "bytes": 3847
+          }
+        },
+        "fpga_rtf": 4.796526873705155,
+        "fpga_audio_processing_s": 103.09834732099625
+      },
+      "selected": {
+        "case": "office_low_snr",
+        "recurrent_precision": "bf16",
+        "variant": "selected",
+        "samples": 343910,
+        "sample_rate": 16000,
+        "padded_samples": 344000,
+        "frames": 1720,
+        "tokens_matching_official": 1582,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.17179032410354408,
+          "token_only_cpu_vs_official_l2": 0.16683810768689947,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.03466477082266184,
+          "decoder_error_relative_to_official_energy": 0.03439229264286576,
+          "reference_energy": 1951.9118176410761,
+          "same_token_cpu_energy": 1921.3468906278329,
+          "full_error_energy": 57.60465653901137,
+          "token_error_energy": 54.33137600069691,
+          "decoder_error_energy": 2.3087794516685025,
+          "two_error_cross_term": 0.9645010866459685,
+          "two_error_cross_term_relative_to_reference_energy": 0.0004941314858227494,
+          "token_decoder_error_cosine": 0.04305822762284445,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.017028574143959006,
+          "scalar_identity_residual": -7.105427357601002e-15,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.86660004499936,
+        "cpu_decode_rtf": 1.2034125228111707,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.wav",
+            "sha256": "8abd0e806ef8b5fc7b2561480646a027a0337ab5365d2202804abd823a3d9be7",
+            "bytes": 1375720
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.tokens.npz",
+            "sha256": "0319a6fb1660016dfede451e615e58819ce98051eda85d58d92e18485f33a9ce",
+            "bytes": 3847
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.metrics.json",
+            "sha256": "5bb2299731b3922c138d5f7764e002a9308bdbdd050befcfe1e4d43a5d1bf7b0",
+            "bytes": 3407
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.comparison.json",
+            "sha256": "9e469fea35748a8b6bc4bd3f2bd0e509583c155d4e131230fe426e53596de656",
+            "bytes": 1763
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_low_snr_bf16_selected_same_tokens_cpu.wav",
+            "sha256": "e34ad616a612cf0953806e05d2ab12ae4a27689ccacbe3858f7f144b3b65694b",
+            "bytes": 1375720
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.wav",
+            "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708",
+            "bytes": 1375720
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.tokens.npz",
+            "sha256": "8c9f828f1cb6d43d0c997af3554fc89f3603577ffa5067dce2ced15ca1e949cc",
+            "bytes": 3847
+          }
+        },
+        "fpga_rtf": 4.8238156618184584,
+        "fpga_audio_processing_s": 103.68490276599914
+      }
+    },
+    {
+      "case": "psquare_low_snr",
+      "recurrent_precision": "bf16",
+      "baseline": {
+        "case": "psquare_low_snr",
+        "recurrent_precision": "bf16",
+        "variant": "baseline",
+        "samples": 344406,
+        "sample_rate": 16000,
+        "padded_samples": 344600,
+        "frames": 1723,
+        "tokens_matching_official": 1590,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.3217720662442141,
+          "token_only_cpu_vs_official_l2": 0.29956776142363944,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.05709215493244408,
+          "decoder_error_relative_to_official_energy": 0.056339227978609865,
+          "reference_energy": 2138.47296125845,
+          "same_token_cpu_energy": 2082.4408529928864,
+          "full_error_energy": 221.41163658504456,
+          "token_error_energy": 191.90836773954757,
+          "decoder_error_energy": 6.787745436926986,
+          "two_error_cross_term": 22.71552340856998,
+          "two_error_cross_term_relative_to_reference_energy": 0.010622310321474596,
+          "token_decoder_error_cosine": 0.31469005877489226,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.11432293790465287,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.67881968799702,
+        "cpu_decode_rtf": 1.1929557412122678,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare_low_snr.wav",
+            "sha256": "2168a78f5f4280ef38650ad2f424f6c3d6c4dfe5cf3273c53900c77e395987af",
+            "bytes": 1377704
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare_low_snr.tokens.npz",
+            "sha256": "a9f0c9ba2f5c813f72abe11f8f4ccf98364412548ab96ac29d6fed59c135ea1b",
+            "bytes": 3886
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare_low_snr.metrics.json",
+            "sha256": "494fb28b1f87c0ca674ecbe878caaa51cdd58876780803298f514130439149bd",
+            "bytes": 3005
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_bf16/psquare_low_snr.comparison.json",
+            "sha256": "607f2747214e866b82faeefeba0ff07be9502ecea4c82905b55e73c8f2946fe6",
+            "bytes": 1749
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_low_snr_bf16_baseline_same_tokens_cpu.wav",
+            "sha256": "8539dc2a393757e722f0a4e2a9cfe0cd5cc754541e7f353d4282fea91c9f8d20",
+            "bytes": 1377704
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.wav",
+            "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b",
+            "bytes": 1377704
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.tokens.npz",
+            "sha256": "a72b391be15694edd578b02df15f42df6dbceb65adf34bc2adfab9dbfec0c466",
+            "bytes": 3866
+          }
+        },
+        "fpga_rtf": 4.797484605076736,
+        "fpga_audio_processing_s": 103.26765518100365
+      },
+      "selected": {
+        "case": "psquare_low_snr",
+        "recurrent_precision": "bf16",
+        "variant": "selected",
+        "samples": 344406,
+        "sample_rate": 16000,
+        "padded_samples": 344600,
+        "frames": 1723,
+        "tokens_matching_official": 1620,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.22653435945610625,
+          "token_only_cpu_vs_official_l2": 0.222751843313172,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.038054292128088175,
+          "decoder_error_relative_to_official_energy": 0.037492091202514885,
+          "reference_energy": 2138.47296125845,
+          "same_token_cpu_energy": 2075.7535891179627,
+          "full_error_energy": 109.7417619771777,
+          "token_error_energy": 106.10757192254798,
+          "decoder_error_energy": 3.005959279310858,
+          "two_error_cross_term": 0.6282307753188593,
+          "two_error_cross_term_relative_to_reference_energy": 0.00029377541203474354,
+          "token_decoder_error_cosine": 0.017588324797697067,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.005757588159773138,
+          "scalar_identity_residual": 1.4210854715202004e-14,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.858873155000765,
+        "cpu_decode_rtf": 1.201320448772705,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.wav",
+            "sha256": "02595b5fd28067eb36e3cc61becef89b209ee9aa9c9ccae3f0772322fa037dd9",
+            "bytes": 1377704
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.tokens.npz",
+            "sha256": "c8c8e552cab65740bc71e440be1eaa12b1c6418dd5e0a26c18c3865bf3505327",
+            "bytes": 3886
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.metrics.json",
+            "sha256": "3c852754f2c9a2576256d2296bc5719d2a4d0561e65af40d312445b088c3cf63",
+            "bytes": 3404
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.comparison.json",
+            "sha256": "9b1eb4192c4be99b13bbc9c2466dbd66d088826cf0a856b86aa9feea44edcf2e",
+            "bytes": 1765
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_low_snr_bf16_selected_same_tokens_cpu.wav",
+            "sha256": "b6244d8b6f27394e04574f69fdfc597c1c255df8d4ba03d7e6061d875628b6ff",
+            "bytes": 1377704
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.wav",
+            "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b",
+            "bytes": 1377704
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.tokens.npz",
+            "sha256": "a72b391be15694edd578b02df15f42df6dbceb65adf34bc2adfab9dbfec0c466",
+            "bytes": 3866
+          }
+        },
+        "fpga_rtf": 4.82517178413874,
+        "fpga_audio_processing_s": 103.86363209300544
+      }
+    },
+    {
+      "case": "bus",
+      "recurrent_precision": "if8",
+      "baseline": {
+        "case": "bus",
+        "recurrent_precision": "if8",
+        "variant": "baseline",
+        "samples": 378916,
+        "sample_rate": 16000,
+        "padded_samples": 379000,
+        "frames": 1895,
+        "tokens_matching_official": 1708,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.27450835464771367,
+          "token_only_cpu_vs_official_l2": 0.2851129109896699,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.050582649122993456,
+          "decoder_error_relative_to_official_energy": 0.05017509316482757,
+          "reference_energy": 1854.575545013583,
+          "same_token_cpu_energy": 1824.8104644897999,
+          "full_error_energy": 139.75123747471935,
+          "token_error_energy": 150.75728140482775,
+          "decoder_error_energy": 4.668968069558369,
+          "two_error_cross_term": -15.675011999666777,
+          "two_error_cross_term_relative_to_reference_energy": -0.00845207521570763,
+          "token_decoder_error_cosine": -0.29541210396227263,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.10085176765620908,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 28.278418477999367,
+        "cpu_decode_rtf": 1.1940765120712502,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus.wav",
+            "sha256": "8e9c024f4f2c1e5b9226904ffbb2dedb1d79a3f74e024a9d61ed96372cc71e8c",
+            "bytes": 1515744
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus.tokens.npz",
+            "sha256": "322f7b1e855e420de62bd99e812d8742897df18e674b32e3a69e99a4bb4e89e2",
+            "bytes": 4184
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus.metrics.json",
+            "sha256": "d362af48156b52393233c4bdcb58115dec4bf14d512874a2700eb760f4806a12",
+            "bytes": 2983
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus.comparison.json",
+            "sha256": "a14b70d332f65ba16d30c30a6de63c1cfd916950871f877ab97420b1ca944519",
+            "bytes": 1697
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/bus_if8_baseline_same_tokens_cpu.wav",
+            "sha256": "a1e273e906c8bdfeee385b6a30d2373d8ad4785c03a4d99c42a9346faf2c485e",
+            "bytes": 1515744
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+            "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+            "bytes": 1515744
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz",
+            "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+            "bytes": 4178
+          }
+        },
+        "fpga_rtf": 4.355007320630547,
+        "fpga_audio_processing_s": 103.13637211900277
+      },
+      "selected": {
+        "case": "bus",
+        "recurrent_precision": "if8",
+        "variant": "selected",
+        "samples": 378916,
+        "sample_rate": 16000,
+        "padded_samples": 379000,
+        "frames": 1895,
+        "tokens_matching_official": 1738,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.22220126972302304,
+          "token_only_cpu_vs_official_l2": 0.20072832392216805,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.06877431221966851,
+          "decoder_error_relative_to_official_energy": 0.06791284939103184,
+          "reference_energy": 1854.575545013583,
+          "same_token_cpu_energy": 1808.4059266262177,
+          "full_error_energy": 91.56670812676403,
+          "token_error_energy": 74.72429826473876,
+          "decoder_error_energy": 8.553590081283058,
+          "two_error_cross_term": 8.288819780742193,
+          "two_error_cross_term_relative_to_reference_energy": 0.004469389129511834,
+          "token_decoder_error_cosine": 0.1639296690394798,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.09953206001456145,
+          "scalar_identity_residual": 1.4210854715202004e-14,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 28.15961683799833,
+        "cpu_decode_rtf": 1.189060027573323,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus.wav",
+            "sha256": "96fb7315f257713f7aabb84dc35c96c65264bc647fa6c8d44ab0eb44198301a7",
+            "bytes": 1515744
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus.tokens.npz",
+            "sha256": "205a384009d45d33ba2e3d8688479ae61e3ac8432098150b7b707fa24a19833e",
+            "bytes": 4184
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus.metrics.json",
+            "sha256": "374cd7f16a0c405ee15521602f8e0e9a9a607991348cb46873257ab5f84fb3bb",
+            "bytes": 3382
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus.comparison.json",
+            "sha256": "c34c1ee533606a0e5a2789d9b7ca589119978c50b5b748bccdc90a5a9a576c92",
+            "bytes": 1716
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/bus_if8_selected_same_tokens_cpu.wav",
+            "sha256": "9c58786bc248248bb30c2c5ff097aeab2a0aa3a7942114a82913d1548b8c63e8",
+            "bytes": 1515744
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+            "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+            "bytes": 1515744
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz",
+            "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+            "bytes": 4178
+          }
+        },
+        "fpga_rtf": 4.382166351803569,
+        "fpga_audio_processing_s": 103.77955908500007
+      }
+    },
+    {
+      "case": "cafe",
+      "recurrent_precision": "if8",
+      "baseline": {
+        "case": "cafe",
+        "recurrent_precision": "if8",
+        "variant": "baseline",
+        "samples": 328146,
+        "sample_rate": 16000,
+        "padded_samples": 328200,
+        "frames": 1641,
+        "tokens_matching_official": 1514,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.24749989219993312,
+          "token_only_cpu_vs_official_l2": 0.24862856626598917,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.040749899521441126,
+          "decoder_error_relative_to_official_energy": 0.040684774029943076,
+          "reference_energy": 1810.7900888599197,
+          "same_token_cpu_energy": 1805.0067931647309,
+          "full_error_energy": 110.92211375511663,
+          "token_error_energy": 111.93609703641178,
+          "decoder_error_energy": 2.9973118117876023,
+          "two_error_cross_term": -4.011295093082748,
+          "two_error_cross_term_relative_to_reference_energy": -0.002215218162370369,
+          "token_decoder_error_cosine": -0.10949734125630317,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.034901036463477274,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 24.670715145999566,
+        "cpu_decode_rtf": 1.2029140758564574,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe.wav",
+            "sha256": "5ae9693a871e825ab466853904901f12e5e95bf12a68ab42942a473058206867",
+            "bytes": 1312664
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe.tokens.npz",
+            "sha256": "212e0bf262841db3151ba9ff0d108828d7c5d273600f67d732df35154d23c1d7",
+            "bytes": 3708
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe.metrics.json",
+            "sha256": "38bd75409ae6744758ed43ae3338abbdebd13d1bc107d57d517d1a620edf0b4d",
+            "bytes": 2985
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe.comparison.json",
+            "sha256": "8946c1c3fde497df487870aa642a3b4d4c9ac7064e3ce3427121558fff45ebe2",
+            "bytes": 1704
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_if8_baseline_same_tokens_cpu.wav",
+            "sha256": "6b01fbe2509fedfc577a07ff472be875f285c1f9f32693d1471fbe985b2327f3",
+            "bytes": 1312664
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav",
+            "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e",
+            "bytes": 1312664
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.tokens.npz",
+            "sha256": "c48df28ed8b8998368cca7e603405a6389f68d60cf0ecc7bf9a09af7c20394c4",
+            "bytes": 3699
+          }
+        },
+        "fpga_rtf": 4.353955839071474,
+        "fpga_audio_processing_s": 89.29582454799674
+      },
+      "selected": {
+        "case": "cafe",
+        "recurrent_precision": "if8",
+        "variant": "selected",
+        "samples": 328146,
+        "sample_rate": 16000,
+        "padded_samples": 328200,
+        "frames": 1641,
+        "tokens_matching_official": 1520,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.2215289637740579,
+          "token_only_cpu_vs_official_l2": 0.22265565462077558,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.028322395749452667,
+          "decoder_error_relative_to_official_energy": 0.0282736923031208,
+          "reference_energy": 1810.7900888599197,
+          "same_token_cpu_energy": 1804.5677416365343,
+          "full_error_energy": 88.86467171678478,
+          "token_error_energy": 89.77089744993792,
+          "decoder_error_energy": 1.447548632736475,
+          "two_error_cross_term": -2.353774365889617,
+          "two_error_cross_term_relative_to_reference_energy": -0.0012998604202497939,
+          "token_decoder_error_cosine": -0.10324058766052857,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.02580371040037572,
+          "scalar_identity_residual": 1.4210854715202004e-14,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 24.583625289997144,
+        "cpu_decode_rtf": 1.198667680361651,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe.wav",
+            "sha256": "c72adf60f2facfc942c00351dc64ea2c8f1bdb0e758ac68d6bba31a67c310a50",
+            "bytes": 1312664
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe.tokens.npz",
+            "sha256": "5ea48d774bf0691b8b9dd606fb422e631796fecd7c141b7dabef1597799934f0",
+            "bytes": 3704
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe.metrics.json",
+            "sha256": "59d0a5efc09a55f748c179f0c3cf7852e1862960afddfa594a2049bd3f37e0d3",
+            "bytes": 3387
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe.comparison.json",
+            "sha256": "cc04ed04093632f9436404a98e8dc0cd50fb9f369b8c227e55e3675bc4ac3bc1",
+            "bytes": 1720
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_if8_selected_same_tokens_cpu.wav",
+            "sha256": "8330fc1a0f556db903d641178342e2811a7e2dcf328ba79c6dbbeb8cf0018846",
+            "bytes": 1312664
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav",
+            "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e",
+            "bytes": 1312664
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.tokens.npz",
+            "sha256": "c48df28ed8b8998368cca7e603405a6389f68d60cf0ecc7bf9a09af7c20394c4",
+            "bytes": 3699
+          }
+        },
+        "fpga_rtf": 4.381012088180486,
+        "fpga_audio_processing_s": 89.85072454300462
+      }
+    },
+    {
+      "case": "office",
+      "recurrent_precision": "if8",
+      "baseline": {
+        "case": "office",
+        "recurrent_precision": "if8",
+        "variant": "baseline",
+        "samples": 351688,
+        "sample_rate": 16000,
+        "padded_samples": 351800,
+        "frames": 1759,
+        "tokens_matching_official": 1567,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.22176883287605254,
+          "token_only_cpu_vs_official_l2": 0.2180118101563545,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.044568365072304994,
+          "decoder_error_relative_to_official_energy": 0.04443454007112693,
+          "reference_energy": 2243.7508500261993,
+          "same_token_cpu_energy": 2230.2965018220043,
+          "full_error_energy": 110.3508422394861,
+          "token_error_energy": 106.6435692946877,
+          "decoder_error_energy": 4.430125291618316,
+          "two_error_cross_term": -0.7228523468199208,
+          "two_error_cross_term_relative_to_reference_energy": -0.00032216248377643197,
+          "token_decoder_error_cosine": -0.016628162463290824,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.0065078626358129575,
+          "scalar_identity_residual": 1.4210854715202004e-14,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 26.259448968998186,
+        "cpu_decode_rtf": 1.1946702290210953,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office.wav",
+            "sha256": "efe25788a9fd67a6af579a99c571bb005c5f49ce3cc4aca8ba7f5adfc81346e5",
+            "bytes": 1406832
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office.tokens.npz",
+            "sha256": "be2ba2df25477094c7a9e8e6ccb9a1328bd33d773b588766c2255583a43251fa",
+            "bytes": 3880
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office.metrics.json",
+            "sha256": "c424cda37910c8439eb610fcf51421c9ab857222ad347375cb905dbc407bb1c0",
+            "bytes": 2986
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office.comparison.json",
+            "sha256": "6312bda2517589c04da3e8cea2badfc22a873c40bfd6c4324997e1230dde1b5d",
+            "bytes": 1711
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_if8_baseline_same_tokens_cpu.wav",
+            "sha256": "0399023852a62b94fc9d0f874fc35ee8004e90d4f71585df20dd2d9010173d47",
+            "bytes": 1406832
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.wav",
+            "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad",
+            "bytes": 1406832
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.tokens.npz",
+            "sha256": "a1060ccbbb1a6007e718fbfaa9cbda024a8a1da12554d3051ec7599bdacaa430",
+            "bytes": 3871
+          }
+        },
+        "fpga_rtf": 4.355583175269103,
+        "fpga_audio_processing_s": 95.73789598400253
+      },
+      "selected": {
+        "case": "office",
+        "recurrent_precision": "if8",
+        "variant": "selected",
+        "samples": 351688,
+        "sample_rate": 16000,
+        "padded_samples": 351800,
+        "frames": 1759,
+        "tokens_matching_official": 1580,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.22886489528119133,
+          "token_only_cpu_vs_official_l2": 0.2223010175850047,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.04105625243060937,
+          "decoder_error_relative_to_official_energy": 0.04060454117068292,
+          "reference_energy": 2243.7508500261993,
+          "same_token_cpu_energy": 2194.6498278509976,
+          "full_error_energy": 117.52574055397513,
+          "token_error_energy": 110.88110155974425,
+          "decoder_error_energy": 3.6993365649734242,
+          "two_error_cross_term": 2.945302429257455,
+          "two_error_cross_term_relative_to_reference_energy": 0.0013126691090604217,
+          "token_decoder_error_cosine": 0.07271252254176672,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.025705107062442663,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 26.123782033999305,
+        "cpu_decode_rtf": 1.1884980793885174,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office.wav",
+            "sha256": "e2fd4759b344d12df59966559ec408ce03ed8f3e20ca1d9017f17983da63e221",
+            "bytes": 1406832
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office.tokens.npz",
+            "sha256": "eaa3a12ba6e3e66c671dd2790698a2786b71d3ea7c202f3e3caa727edadcc194",
+            "bytes": 3871
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office.metrics.json",
+            "sha256": "6096b6ef58c25aaa034204063dcfb3b5e58169b22d26a7455c5fe4a20ec8b830",
+            "bytes": 3391
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office.comparison.json",
+            "sha256": "315752ef26fab77f39b6efd8878d867de90b79e61acdfd56fcda9d2b6827bec0",
+            "bytes": 1727
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_if8_selected_same_tokens_cpu.wav",
+            "sha256": "6f6a6da42dbc3e5aae7fbcddebc03808a0438c27b01777490807c2dfcdb8d4b5",
+            "bytes": 1406832
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.wav",
+            "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad",
+            "bytes": 1406832
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.tokens.npz",
+            "sha256": "a1060ccbbb1a6007e718fbfaa9cbda024a8a1da12554d3051ec7599bdacaa430",
+            "bytes": 3871
+          }
+        },
+        "fpga_rtf": 4.382653351925687,
+        "fpga_audio_processing_s": 96.33291200200256
+      }
+    },
+    {
+      "case": "psquare",
+      "recurrent_precision": "if8",
+      "baseline": {
+        "case": "psquare",
+        "recurrent_precision": "if8",
+        "variant": "baseline",
+        "samples": 343574,
+        "sample_rate": 16000,
+        "padded_samples": 343600,
+        "frames": 1718,
+        "tokens_matching_official": 1538,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.3486127610779719,
+          "token_only_cpu_vs_official_l2": 0.34105360928937567,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.050791852295204706,
+          "decoder_error_relative_to_official_energy": 0.05018290627540802,
+          "reference_energy": 1804.0364112958182,
+          "same_token_cpu_energy": 1761.0383557751425,
+          "full_error_energy": 219.24609146027046,
+          "token_error_energy": 209.84112146764198,
+          "decoder_error_energy": 4.543148339815605,
+          "two_error_cross_term": 4.8618216528128695,
+          "two_error_cross_term_relative_to_reference_energy": 0.00269496869485061,
+          "token_decoder_error_cosine": 0.0787309097542728,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.02267807081731957,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.673664410998754,
+        "cpu_decode_rtf": 1.1956045293764372,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare.wav",
+            "sha256": "5e40326bd2d884e7a505c3626ba3344e828b18cbb21ead00e2f9f2bfa0ec5879",
+            "bytes": 1374376
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare.tokens.npz",
+            "sha256": "2c00f864db579261bd28e0dba9c92bec9e85832304106d3ff786c5cf4e487eb5",
+            "bytes": 3864
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare.metrics.json",
+            "sha256": "e112ffe9e4cc137f67f9073fd1f44556b796725bc4f533fd5c2b1abed27a87e9",
+            "bytes": 2987
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare.comparison.json",
+            "sha256": "d0f190b067fa0ba286b687af9c5b752d1186e123e9dcc70ae499b750fef97162",
+            "bytes": 1715
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_if8_baseline_same_tokens_cpu.wav",
+            "sha256": "3bfddabb7af5b942ca1bdcb6a315b4eb59caf2c34f7a6214c8b0bfb6c86272df",
+            "bytes": 1374376
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.wav",
+            "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059",
+            "bytes": 1374376
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.tokens.npz",
+            "sha256": "c4f0e9c95822161d75be03e1debace66bf229c78ea433b031dd983a2e9cd0a34",
+            "bytes": 3855
+          }
+        },
+        "fpga_rtf": 4.354933987135219,
+        "fpga_audio_processing_s": 93.51513060599973
+      },
+      "selected": {
+        "case": "psquare",
+        "recurrent_precision": "if8",
+        "variant": "selected",
+        "samples": 343574,
+        "sample_rate": 16000,
+        "padded_samples": 343600,
+        "frames": 1718,
+        "tokens_matching_official": 1566,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.2927970961992516,
+          "token_only_cpu_vs_official_l2": 0.30551124030634097,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.036698676653959185,
+          "decoder_error_relative_to_official_energy": 0.03627766884318761,
+          "reference_energy": 1804.0364112958182,
+          "same_token_cpu_energy": 1762.8819657507188,
+          "full_error_energy": 154.6602932805271,
+          "token_error_energy": 168.38355931356057,
+          "decoder_error_energy": 2.3742368588665803,
+          "two_error_cross_term": -16.097502891900078,
+          "two_error_cross_term_relative_to_reference_energy": -0.008923047667501028,
+          "token_decoder_error_cosine": -0.4025470533405514,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.09427096889705232,
+          "scalar_identity_residual": 2.842170943040401e-14,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.714435386998957,
+        "cpu_decode_rtf": 1.1975032051086034,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare.wav",
+            "sha256": "98328fe6fd09a57c56927e419396e1f738a6c9bb29f409488260f2c760e717e4",
+            "bytes": 1374376
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare.tokens.npz",
+            "sha256": "b109fa07af101bfe3ba11a19ad53df7ff2b117d74420bed2d3f1c607c19b27ba",
+            "bytes": 3863
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare.metrics.json",
+            "sha256": "99750be14309573565463a8b0986cb40a76ecf555d92ae390077c66e793db8ad",
+            "bytes": 3391
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare.comparison.json",
+            "sha256": "94769756c72e9649473cc7b84ecf764ed350716bf2b710be30b557972f9925be",
+            "bytes": 1731
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_if8_selected_same_tokens_cpu.wav",
+            "sha256": "d6f74b8bd449996e0cf2dfd8bfdd195e6beaa450d2ed83b3b37502b22226d4ab",
+            "bytes": 1374376
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.wav",
+            "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059",
+            "bytes": 1374376
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.tokens.npz",
+            "sha256": "c4f0e9c95822161d75be03e1debace66bf229c78ea433b031dd983a2e9cd0a34",
+            "bytes": 3855
+          }
+        },
+        "fpga_rtf": 4.382179750318693,
+        "fpga_audio_processing_s": 94.10018909599967
+      }
+    },
+    {
+      "case": "bus_low_snr",
+      "recurrent_precision": "if8",
+      "baseline": {
+        "case": "bus_low_snr",
+        "recurrent_precision": "if8",
+        "variant": "baseline",
+        "samples": 334067,
+        "sample_rate": 16000,
+        "padded_samples": 334200,
+        "frames": 1671,
+        "tokens_matching_official": 1531,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.2414116171072295,
+          "token_only_cpu_vs_official_l2": 0.23440117094405694,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.05806585899730217,
+          "decoder_error_relative_to_official_energy": 0.057477430289955056,
+          "reference_energy": 1193.0449569423322,
+          "same_token_cpu_energy": 1168.9872805853784,
+          "full_error_energy": 69.53014573828983,
+          "token_error_energy": 65.55055347550011,
+          "decoder_error_energy": 3.941408928561809,
+          "two_error_cross_term": 0.03818333422791298,
+          "two_error_cross_term_relative_to_reference_energy": 3.2004941645932155e-05,
+          "token_decoder_error_cosine": 0.0011877633591891325,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.0005494640373788192,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 24.713887525002065,
+        "cpu_decode_rtf": 1.183661362541146,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus_low_snr.wav",
+            "sha256": "caebe81d6dc682df234ec6c5f69afd8bdd6d501d457c86defe1997e711e46869",
+            "bytes": 1336348
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus_low_snr.tokens.npz",
+            "sha256": "8fdea8ae96d24cea2769e42fb2db4981651f7718991c92f7427a8a20df88ed73",
+            "bytes": 3742
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus_low_snr.metrics.json",
+            "sha256": "d264819820da540f05c80ce62c8f4ec856bf06b0ea994d430f7a7b1d8bdb42a7",
+            "bytes": 2996
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/bus_low_snr.comparison.json",
+            "sha256": "b2a5d7c148b4a805b41eb8f5ed5872a10d39de0d61d3955dd2c682c432ce8970",
+            "bytes": 1734
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/bus_low_snr_if8_baseline_same_tokens_cpu.wav",
+            "sha256": "f881db827cd732dd395ca6e455fa6afefda08df8a1eed8b970e49be5e41c8d89",
+            "bytes": 1336348
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.wav",
+            "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6",
+            "bytes": 1336348
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.tokens.npz",
+            "sha256": "c7fde3db4b89fca566160bf035ae191ebb53f0e36ca14ff6a9be25fe1b84cb08",
+            "bytes": 3732
+          }
+        },
+        "fpga_rtf": 4.356159119937319,
+        "fpga_audio_processing_s": 90.95306304500627
+      },
+      "selected": {
+        "case": "bus_low_snr",
+        "recurrent_precision": "if8",
+        "variant": "selected",
+        "samples": 334067,
+        "sample_rate": 16000,
+        "padded_samples": 334200,
+        "frames": 1671,
+        "tokens_matching_official": 1553,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.21512756470169747,
+          "token_only_cpu_vs_official_l2": 0.21800622504391093,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.04265257497666854,
+          "decoder_error_relative_to_official_energy": 0.04192941750157296,
+          "reference_energy": 1193.0449569423322,
+          "same_token_cpu_energy": 1152.9327007497793,
+          "full_error_energy": 55.21396443112428,
+          "token_error_energy": 56.70150664611797,
+          "decoder_error_energy": 2.097463767784993,
+          "two_error_cross_term": -3.5850059827786787,
+          "two_error_cross_term_relative_to_reference_energy": -0.0030049211154345172,
+          "token_decoder_error_cosine": -0.16436727528970768,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.06097055709552029,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 24.988936861002003,
+        "cpu_decode_rtf": 1.1968347360739973,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus_low_snr.wav",
+            "sha256": "1afe541832507b33e36a48dafd15e49d6c208d573bf2ee738ef0681d4c3d4683",
+            "bytes": 1336348
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus_low_snr.tokens.npz",
+            "sha256": "d7b4985b14f5942d9261aafa8e6053ba3efb6e123eaef0373457f9fe45659d03",
+            "bytes": 3743
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus_low_snr.metrics.json",
+            "sha256": "5559fe114aff14fe76c305b1b9f59727d32287c5051994785cf52523b3abaae5",
+            "bytes": 3403
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus_low_snr.comparison.json",
+            "sha256": "0f0a175d7229db3a63d26efe531f6e2a511d9f3d53eb1aba1624ed826474740f",
+            "bytes": 1750
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/bus_low_snr_if8_selected_same_tokens_cpu.wav",
+            "sha256": "f68bb1b48bfcf4d307a3784ce3e29ef2e0882b86cd81ab0e861e5d8564911079",
+            "bytes": 1336348
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.wav",
+            "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6",
+            "bytes": 1336348
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.tokens.npz",
+            "sha256": "c7fde3db4b89fca566160bf035ae191ebb53f0e36ca14ff6a9be25fe1b84cb08",
+            "bytes": 3732
+          }
+        },
+        "fpga_rtf": 4.383520085922783,
+        "fpga_audio_processing_s": 91.52433778399791
+      }
+    },
+    {
+      "case": "cafe_low_snr",
+      "recurrent_precision": "if8",
+      "baseline": {
+        "case": "cafe_low_snr",
+        "recurrent_precision": "if8",
+        "variant": "baseline",
+        "samples": 343450,
+        "sample_rate": 16000,
+        "padded_samples": 343600,
+        "frames": 1718,
+        "tokens_matching_official": 1596,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.3599434254799226,
+          "token_only_cpu_vs_official_l2": 0.3604876585597743,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.08133043470924976,
+          "decoder_error_relative_to_official_energy": 0.08083001118312409,
+          "reference_energy": 1744.519854172468,
+          "same_token_cpu_energy": 1723.1179518376975,
+          "full_error_energy": 226.01871801546423,
+          "token_error_energy": 226.70271359503778,
+          "decoder_error_energy": 11.39780425692002,
+          "two_error_cross_term": -12.081799836493555,
+          "two_error_cross_term_relative_to_reference_energy": -0.006925573135551781,
+          "token_decoder_error_cosine": -0.11884001125506322,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.050742434100901776,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.536257664000004,
+        "cpu_decode_rtf": 1.189634947223759,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe_low_snr.wav",
+            "sha256": "bb6e39ddf13aaecc715dc82cad8cdaeca5e8e8e6bfeac435620b520d767e1dae",
+            "bytes": 1373880
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe_low_snr.tokens.npz",
+            "sha256": "96f9df445e049cabbd1e557e4696c8d2d21b66d11b15ef684c94f4023f006da2",
+            "bytes": 3839
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe_low_snr.metrics.json",
+            "sha256": "0f127d5438096f9583e97bd0cbe365ec72c9ecfed253cb2362e263885385fcfb",
+            "bytes": 2999
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/cafe_low_snr.comparison.json",
+            "sha256": "b3399eed120b2a81bd0dac8ea4b6612049b69ca4d20658e6613a631448a91751",
+            "bytes": 1734
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_low_snr_if8_baseline_same_tokens_cpu.wav",
+            "sha256": "6595a8847d1da36510f21bb09ccf5c23a18e599f5c645e886f342fdb4726a353",
+            "bytes": 1373880
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.wav",
+            "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c",
+            "bytes": 1373880
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.tokens.npz",
+            "sha256": "a6c30c5a077a9f0c06f2e3bb45b5d06a28d2be2d0efdbc144ab8196cf6f8ac21",
+            "bytes": 3825
+          }
+        },
+        "fpga_rtf": 4.356393189995543,
+        "fpga_audio_processing_s": 93.51270256899807
+      },
+      "selected": {
+        "case": "cafe_low_snr",
+        "recurrent_precision": "if8",
+        "variant": "selected",
+        "samples": 343450,
+        "sample_rate": 16000,
+        "padded_samples": 343600,
+        "frames": 1718,
+        "tokens_matching_official": 1620,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.3349936419972858,
+          "token_only_cpu_vs_official_l2": 0.3377415361424199,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.0382594002739786,
+          "decoder_error_relative_to_official_energy": 0.037814968517298035,
+          "reference_energy": 1744.519854172468,
+          "same_token_cpu_energy": 1704.2256074195748,
+          "full_error_energy": 195.77130929150763,
+          "token_error_energy": 198.99623751637918,
+          "decoder_error_energy": 2.4946142727032337,
+          "two_error_cross_term": -5.719542497574793,
+          "two_error_cross_term_relative_to_reference_energy": -0.003278576901200084,
+          "token_decoder_error_cosine": -0.1283533362440977,
+          "error_interaction": "cancellation",
+          "fraction_of_component_energy_cancelled": 0.028386115035941795,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.721632576998672,
+        "cpu_decode_rtf": 1.1982708435928922,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe_low_snr.wav",
+            "sha256": "ab41cc2d34de8ac606c3e65dacfbaab37f5bab9ea014ace9b0537467130be9ee",
+            "bytes": 1373880
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe_low_snr.tokens.npz",
+            "sha256": "d078f7eb4cd409fe022a1202e1ecdb3e97814c77338a70a8396331afab97c24d",
+            "bytes": 3829
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe_low_snr.metrics.json",
+            "sha256": "a39241ab4f71593e179bc61af7bddc59d1563945bbca76d43bea6079fc860a45",
+            "bytes": 3402
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe_low_snr.comparison.json",
+            "sha256": "c0f9033ec6c604a114aea4c380613f555262f1872d4dd041fa2ac1bbc2ec99fe",
+            "bytes": 1749
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_low_snr_if8_selected_same_tokens_cpu.wav",
+            "sha256": "c3d175f9d9b1bd8969194f306d9e44a740c5ea6f2aa30b133f6396acb0239105",
+            "bytes": 1373880
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.wav",
+            "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c",
+            "bytes": 1373880
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.tokens.npz",
+            "sha256": "a6c30c5a077a9f0c06f2e3bb45b5d06a28d2be2d0efdbc144ab8196cf6f8ac21",
+            "bytes": 3825
+          }
+        },
+        "fpga_rtf": 4.38351396872894,
+        "fpga_audio_processing_s": 94.09486703499715
+      }
+    },
+    {
+      "case": "office_low_snr",
+      "recurrent_precision": "if8",
+      "baseline": {
+        "case": "office_low_snr",
+        "recurrent_precision": "if8",
+        "variant": "baseline",
+        "samples": 343910,
+        "sample_rate": 16000,
+        "padded_samples": 344000,
+        "frames": 1720,
+        "tokens_matching_official": 1571,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.19878503037180362,
+          "token_only_cpu_vs_official_l2": 0.19309521170617888,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.043233920726455516,
+          "decoder_error_relative_to_official_energy": 0.04268369184266031,
+          "reference_energy": 1951.9118176410761,
+          "same_token_cpu_energy": 1902.5448405356317,
+          "full_error_energy": 77.13074859246936,
+          "token_error_energy": 72.77851710374289,
+          "decoder_error_energy": 3.556183357047435,
+          "two_error_cross_term": 0.7960481316790324,
+          "two_error_cross_term_relative_to_reference_energy": 0.00040782996674566596,
+          "token_decoder_error_cosine": 0.02474090934629215,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.010428391372124745,
+          "scalar_identity_residual": 1.4210854715202004e-14,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.39902606599935,
+        "cpu_decode_rtf": 1.1816592046058259,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office_low_snr.wav",
+            "sha256": "bc886065e084a91de896936088455261cc559d4332aff5f217d90c28e096692f",
+            "bytes": 1375720
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office_low_snr.tokens.npz",
+            "sha256": "e228de6673bed167465c929f96a6fe489c4ef92827c3fc0a213843a31813375d",
+            "bytes": 3839
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office_low_snr.metrics.json",
+            "sha256": "a87cb55c1fc36076b8f36d72c07d5619273594be6c56eb5729ace5ca04b49014",
+            "bytes": 3003
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/office_low_snr.comparison.json",
+            "sha256": "0605a9bc8782d1acb152950d38d9baa53f94685fdfa7a7d0bbcb27a793fa5efc",
+            "bytes": 1742
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_low_snr_if8_baseline_same_tokens_cpu.wav",
+            "sha256": "648431cefbed51cb0b5484fde5a5002a1a733b9c8fed42808881eb57d00f2090",
+            "bytes": 1375720
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.wav",
+            "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708",
+            "bytes": 1375720
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.tokens.npz",
+            "sha256": "8c9f828f1cb6d43d0c997af3554fc89f3603577ffa5067dce2ced15ca1e949cc",
+            "bytes": 3847
+          }
+        },
+        "fpga_rtf": 4.355563840585911,
+        "fpga_audio_processing_s": 93.62012252599379
+      },
+      "selected": {
+        "case": "office_low_snr",
+        "recurrent_precision": "if8",
+        "variant": "selected",
+        "samples": 343910,
+        "sample_rate": 16000,
+        "padded_samples": 344000,
+        "frames": 1720,
+        "tokens_matching_official": 1582,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.17012883542408608,
+          "token_only_cpu_vs_official_l2": 0.16391476614559805,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.039157081819371276,
+          "decoder_error_relative_to_official_energy": 0.03890886621648199,
+          "reference_energy": 1951.9118176410761,
+          "same_token_cpu_energy": 1927.244025946466,
+          "full_error_energy": 56.495785560278705,
+          "token_error_energy": 52.444065406146905,
+          "decoder_error_energy": 2.954999047470354,
+          "two_error_cross_term": 1.0967211066614513,
+          "two_error_cross_term_relative_to_reference_energy": 0.0005618702119375763,
+          "token_decoder_error_cosine": 0.044049335184541884,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.019796744177506438,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.744049566001195,
+        "cpu_decode_rtf": 1.197711008857024,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office_low_snr.wav",
+            "sha256": "400d202622fbbb1896914272938ff8c41f558351bb42a19c16e7fc172704fa97",
+            "bytes": 1375720
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office_low_snr.tokens.npz",
+            "sha256": "51d571bdc87c4146aba255fd68f93851fd26ee41867daa664bdab000ff011b35",
+            "bytes": 3843
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office_low_snr.metrics.json",
+            "sha256": "99f86d2c56791a4d6085cec62c5066721713fb5a34433bb05525ca54a5e074a3",
+            "bytes": 3406
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office_low_snr.comparison.json",
+            "sha256": "73ff5911ac0d1299b50353ba2c64a667a3aa19cb5b497285d50f60a5a2438fd7",
+            "bytes": 1759
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_low_snr_if8_selected_same_tokens_cpu.wav",
+            "sha256": "5a7103ae7db78738068150a24fa5d6ee1e36b71277ebb36216e2bbf2305cd6bf",
+            "bytes": 1375720
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.wav",
+            "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708",
+            "bytes": 1375720
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.tokens.npz",
+            "sha256": "8c9f828f1cb6d43d0c997af3554fc89f3603577ffa5067dce2ced15ca1e949cc",
+            "bytes": 3847
+          }
+        },
+        "fpga_rtf": 4.3828014889012,
+        "fpga_audio_processing_s": 94.20557875300074
+      }
+    },
+    {
+      "case": "psquare_low_snr",
+      "recurrent_precision": "if8",
+      "baseline": {
+        "case": "psquare_low_snr",
+        "recurrent_precision": "if8",
+        "variant": "baseline",
+        "samples": 344406,
+        "sample_rate": 16000,
+        "padded_samples": 344600,
+        "frames": 1723,
+        "tokens_matching_official": 1592,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.24162185479559653,
+          "token_only_cpu_vs_official_l2": 0.22691524162521468,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.0581151863112824,
+          "decoder_error_relative_to_official_energy": 0.05729359593974293,
+          "reference_energy": 2138.47296125845,
+          "same_token_cpu_energy": 2078.436001167773,
+          "full_error_energy": 124.84644809670297,
+          "token_error_energy": 110.11109949774388,
+          "decoder_error_energy": 7.0196575400214325,
+          "two_error_cross_term": 7.715691058937658,
+          "two_error_cross_term_relative_to_reference_energy": 0.003608037697328248,
+          "token_decoder_error_cosine": 0.13876224641700294,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.06587245958335235,
+          "scalar_identity_residual": 0.0,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.650579027002095,
+        "cpu_decode_rtf": 1.191643770526743,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare_low_snr.wav",
+            "sha256": "f1219516b0d8cf1ebdad77a772d62b2e95cd17f3207986293fa1b235d531273f",
+            "bytes": 1377704
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare_low_snr.tokens.npz",
+            "sha256": "0de2634728de8793a19c3cf16eb3e538c4bbfe0682dd1b8dff9c68eda4536ef4",
+            "bytes": 3887
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare_low_snr.metrics.json",
+            "sha256": "e423c4544140360d7755ec9f3dcb784c4569b8668979a7e29fa00d2a26b668ac",
+            "bytes": 3005
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/fpga_if8/psquare_low_snr.comparison.json",
+            "sha256": "0c2876a0eba4f751d1c3c936931e5cda299d567e69ce31d7959e3e63e0b080df",
+            "bytes": 1747
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_low_snr_if8_baseline_same_tokens_cpu.wav",
+            "sha256": "826dfc3cd062ea9531e08c3889cca66aef2f97c9104ba32eca8159aa0d84f093",
+            "bytes": 1377704
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.wav",
+            "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b",
+            "bytes": 1377704
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.tokens.npz",
+            "sha256": "a72b391be15694edd578b02df15f42df6dbceb65adf34bc2adfab9dbfec0c466",
+            "bytes": 3866
+          }
+        },
+        "fpga_rtf": 4.3563933891046975,
+        "fpga_audio_processing_s": 93.77300134799953
+      },
+      "selected": {
+        "case": "psquare_low_snr",
+        "recurrent_precision": "if8",
+        "variant": "selected",
+        "samples": 344406,
+        "sample_rate": 16000,
+        "padded_samples": 344600,
+        "frames": 1723,
+        "tokens_matching_official": 1619,
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "source_files_sha256": {
+          "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+          "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+          "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+          "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+          "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+          "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+          "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+          "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+          "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+        },
+        "metrics": {
+          "full_fpga_vs_official_l2": 0.23078653603733373,
+          "token_only_cpu_vs_official_l2": 0.22623129691789307,
+          "same_token_fpga_decoder_vs_cpu_l2": 0.03953299658598137,
+          "decoder_error_relative_to_official_energy": 0.039117660314112,
+          "reference_energy": 2138.47296125845,
+          "same_token_cpu_energy": 2093.7751241923697,
+          "full_error_energy": 113.90025617570481,
+          "token_error_energy": 109.44832861045953,
+          "decoder_error_energy": 3.272272824212473,
+          "two_error_cross_term": 1.179654741032829,
+          "two_error_cross_term_relative_to_reference_energy": 0.0005516341625094128,
+          "token_decoder_error_cosine": 0.031167043137870137,
+          "error_interaction": "reinforcement",
+          "fraction_of_component_energy_cancelled": -0.010465298499285475,
+          "scalar_identity_residual": -2.842170943040401e-14,
+          "vector_identity_max_abs_residual": 0.0,
+          "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+        },
+        "cpu_decode_s": 25.744963308003207,
+        "cpu_decode_rtf": 1.1960285620112638,
+        "cache_reuse": null,
+        "files": {
+          "fpga_wav": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare_low_snr.wav",
+            "sha256": "9f5b20c41c64a2eb6c222521a05205c74bc0bdd732541a954e2a3ad6bbada586",
+            "bytes": 1377704
+          },
+          "actual_tokens": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare_low_snr.tokens.npz",
+            "sha256": "bfa239db6dc09f9687f4d44096b5b031f20de388ad0fc0737280105863d77f28",
+            "bytes": 3884
+          },
+          "fpga_metrics": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare_low_snr.metrics.json",
+            "sha256": "a90d5fbba584f72d0e129e36cd7fe26e2c6615c5956238170d132f902d704a75",
+            "bytes": 3407
+          },
+          "fpga_comparison": {
+            "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare_low_snr.comparison.json",
+            "sha256": "8bd52a612e52528e889d2481ff55ebb83d6c9314b13cb72b92333d0c251e337e",
+            "bytes": 1765
+          },
+          "same_token_cpu_wav": {
+            "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_low_snr_if8_selected_same_tokens_cpu.wav",
+            "sha256": "023298a747b857ce401908b7629afdc3c552e07f25f16946063d3ec1a3d7b0c3",
+            "bytes": 1377704
+          },
+          "reference_wav": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.wav",
+            "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b",
+            "bytes": 1377704
+          },
+          "official_tokens": {
+            "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.tokens.npz",
+            "sha256": "a72b391be15694edd578b02df15f42df6dbceb65adf34bc2adfab9dbfec0c466",
+            "bytes": 3866
+          }
+        },
+        "fpga_rtf": 4.38349873235664,
+        "fpga_audio_processing_s": 94.3564540260013
+      }
+    }
+  ],
+  "pooled": {
+    "bf16": {
+      "baseline": {
+        "cases": 8,
+        "samples": 2768157,
+        "duration_s": 173.0098125,
+        "tokens": 13845,
+        "tokens_matching_official": 12607,
+        "full_fpga_vs_official_l2": 0.2805721372349953,
+        "token_only_cpu_vs_official_l2": 0.2753583575916796,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.05712775609800631,
+        "decoder_error_relative_to_official_energy": 0.05652981857677785,
+        "token_decoder_error_cosine": -0.009543944912704458,
+        "scalar_identity_residual": -3.552713678800501e-14,
+        "reference_energy": 14741.102485209847,
+        "same_token_cpu_energy": 14434.136803337573,
+        "full_error_energy": 1160.4302630332468,
+        "token_error_energy": 1117.7031907907021,
+        "decoder_error_energy": 47.106967648101595,
+        "two_error_cross_term": -4.379895405556923
+      },
+      "selected": {
+        "cases": 8,
+        "samples": 2768157,
+        "duration_s": 173.0098125,
+        "tokens": 13845,
+        "tokens_matching_official": 12796,
+        "full_fpga_vs_official_l2": 0.23940545465201862,
+        "token_only_cpu_vs_official_l2": 0.23874903815774204,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.037069652907799976,
+        "decoder_error_relative_to_official_energy": 0.03664364676128377,
+        "token_decoder_error_cosine": -0.05880279053898272,
+        "scalar_identity_residual": -2.1316282072803006e-14,
+        "reference_energy": 14741.102485209847,
+        "same_token_cpu_energy": 14404.238452264392,
+        "full_error_energy": 844.8858720192609,
+        "token_error_energy": 840.2591043544267,
+        "decoder_error_energy": 19.793716308580343,
+        "two_error_cross_term": -15.166948643746089
+      },
+      "changes": {
+        "full_fpga_vs_official_l2": {
+          "before": 0.2805721372349953,
+          "after": 0.23940545465201862,
+          "reduction_fraction": 0.14672405816439715,
+          "cases_improved": 8,
+          "cases_regressed": 0
+        },
+        "token_only_cpu_vs_official_l2": {
+          "before": 0.2753583575916796,
+          "after": 0.23874903815774204,
+          "reduction_fraction": 0.13295154631995731,
+          "cases_improved": 8,
+          "cases_regressed": 0
+        },
+        "same_token_fpga_decoder_vs_cpu_l2": {
+          "before": 0.05712775609800631,
+          "after": 0.037069652907799976,
+          "reduction_fraction": 0.35110959295855027,
+          "cases_improved": 8,
+          "cases_regressed": 0
+        },
+        "decoder_error_relative_to_official_energy": {
+          "before": 0.05652981857677785,
+          "after": 0.03664364676128377,
+          "reduction_fraction": 0.3517819854398616,
+          "cases_improved": 8,
+          "cases_regressed": 0
+        }
+      }
+    },
+    "if8": {
+      "baseline": {
+        "cases": 8,
+        "samples": 2768157,
+        "duration_s": 173.0098125,
+        "tokens": 13845,
+        "tokens_matching_official": 12617,
+        "full_fpga_vs_official_l2": 0.270397934947358,
+        "token_only_cpu_vs_official_l2": 0.2674369655684784,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.05418456586596354,
+        "decoder_error_relative_to_official_energy": 0.05372894490995226,
+        "token_decoder_error_cosine": -0.04503713907897617,
+        "scalar_identity_residual": 1.6697754290362354e-13,
+        "reference_energy": 14741.102485209847,
+        "same_token_cpu_energy": 14494.238189378158,
+        "full_error_energy": 1077.796345372519,
+        "token_error_energy": 1054.3209528755938,
+        "decoder_error_energy": 42.55460759533059,
+        "two_error_cross_term": -19.07921509840553
+      },
+      "selected": {
+        "cases": 8,
+        "samples": 2768157,
+        "duration_s": 173.0098125,
+        "tokens": 13845,
+        "tokens_matching_official": 12778,
+        "full_fpga_vs_official_l2": 0.2434952074900681,
+        "token_only_cpu_vs_official_l2": 0.24172682341434681,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.04314337054457179,
+        "decoder_error_relative_to_official_energy": 0.042713309095016305,
+        "token_decoder_error_cosine": -0.04679769029741381,
+        "scalar_identity_residual": 1.0835776720341528e-13,
+        "reference_energy": 14741.102485209847,
+        "same_token_cpu_energy": 14448.682920172658,
+        "full_error_energy": 873.9987291366665,
+        "token_error_energy": 861.349994767085,
+        "decoder_error_energy": 26.89406205003059,
+        "two_error_cross_term": -14.245327680449238
+      },
+      "changes": {
+        "full_fpga_vs_official_l2": {
+          "before": 0.270397934947358,
+          "after": 0.2434952074900681,
+          "reduction_fraction": 0.09949309510269522,
+          "cases_improved": 7,
+          "cases_regressed": 1
+        },
+        "token_only_cpu_vs_official_l2": {
+          "before": 0.2674369655684784,
+          "after": 0.24172682341434681,
+          "reduction_fraction": 0.09613533454315382,
+          "cases_improved": 7,
+          "cases_regressed": 1
+        },
+        "same_token_fpga_decoder_vs_cpu_l2": {
+          "before": 0.05418456586596354,
+          "after": 0.04314337054457179,
+          "reduction_fraction": 0.20377011691307767,
+          "cases_improved": 7,
+          "cases_regressed": 1
+        },
+        "decoder_error_relative_to_official_energy": {
+          "before": 0.05372894490995226,
+          "after": 0.042713309095016305,
+          "reduction_fraction": 0.20502237357159636,
+          "cases_improved": 7,
+          "cases_regressed": 1
+        }
+      }
+    }
+  }
+}

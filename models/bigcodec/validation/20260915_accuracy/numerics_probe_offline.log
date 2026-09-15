@@ -1,0 +1,158 @@
+{
+  "mode": "offline_capture",
+  "hostname": "italy",
+  "torch_version": "2.12.0.dev20260405+cu128",
+  "cpu_core": 9,
+  "source_sha256": {
+    "andromeda_hw_info.py": "a9f4b9f4f59c6a78cbc4e1211f0c1c13a1202468bf136ffe99d5b81f0fd22f7a",
+    "models/bigcodec/bigcodec_device.py": "ef719dd88d1530d9ce59bf1626c683bc352e90b6fd0122e7a6dab32c7b8589eb",
+    "models/bigcodec/bigcodec_lstm.py": "7c4c08b31b4cdd55f318ddb6dd9546ddf6a58ce3e6d8ec801f4c35e3216259c2",
+    "models/bigcodec/bigcodec_tanh.py": "998f37fc5c982933ca0cd0eded6a075f20d85b33b3ffaa67aed07f6fc5dc7df5",
+    "models/bigcodec/test_bigcodec_lstm.py": "ee9569219c6637ebb5691abd18d5b4cd60b564955c4ccb4f0e662dcdade70834",
+    "models/bigcodec/test_bigcodec_tanh.py": "c763caf245718a7a60f0765a6a9a3922163d383e6a385f6ce5ccca66f703d445",
+    "models/bigcodec/validation/20260915_accuracy/numerics_probe.py": "f7f680495e0d7b30a9feeca558d66f1dad269349449b38533671c2d9d66994d7",
+    "models/dpdfnet8khz/dpdfnet8khz_engine.py": "02dd0ac0f6ad02a0418fa43bf584180bc0c7f80ac5e3306f8ab130690de72086",
+    "models/yolov5s/yolov5_precompiled.py": "3fe19cd7d559c0bf15cd54723cd3e4279b2d681d4d2566c9353a593e27e1dc32",
+    "user_dma_core.py": "b213f8dcd0a94fba6d60196d134e2506dc578c3e961672242989640c6484a992"
+  },
+  "native_arithmetic_model": "RNE to 10 fraction bits, then RNE to BF16; finite normal arithmetic. This is not a complete matmul/SFU/underflow emulator.",
+  "cases": [
+    {
+      "name": "two_product_and_approximate_sum",
+      "instructions": 1652,
+      "program_bytes": 52864,
+      "program_sha256": "5b619d88ba3350959c4b8385d8b0507e785f4821fd60639b6935ee19789cea35",
+      "resident_bytes": 52864,
+      "resident_sha256": "5b619d88ba3350959c4b8385d8b0507e785f4821fd60639b6935ee19789cea35",
+      "input_sha256": "eddda75aae826b942c4579d96c75d800cd78e5900c3fb5b9a272526afca5ea23",
+      "modeled_sha256": "1020886561dcd4a28acf5538fdddfa3009c959857248b44e679b2211ae83da32",
+      "program_address": 2415919104,
+      "model_base": 2415919104,
+      "input_address": 2147483776,
+      "output_address": 2952790144,
+      "halt_index": 1650,
+      "hardware_executed": false,
+      "offline_guards": {
+        "input_unchanged": true,
+        "guards_intact": true
+      },
+      "offline_contract": {
+        "finite": true,
+        "components_vs_native_double_rne_model": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        },
+        "product_recovered_vs_exact_fp32": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        },
+        "sum_recovered_vs_exact_fp32": {
+          "relative_l2": 6.628713754641543e-07,
+          "max_abs": 0.0009765625,
+          "exact_mismatches": 154,
+          "bf16_bit_mismatches": 10
+        },
+        "passed": true
+      },
+      "random_pairs": 100352,
+      "mantissa_grid_pairs": 32768,
+      "total_pairs": 133120,
+      "contract": "Native double-RNE numerical components must match; high+low products must equal FP32 products. Recovered sums are approximate: relative L2 <= 1e-6, max absolute error <= 0.001. Signed-zero bit differences are reported separately."
+    },
+    {
+      "name": "cell_small_updates",
+      "instructions": 6152,
+      "program_bytes": 196864,
+      "program_sha256": "b258e27e1c98c2c039daac02ead24c53f5d8cf09a7c8a709fc1a7c61a93c0f63",
+      "resident_bytes": 196864,
+      "resident_sha256": "b258e27e1c98c2c039daac02ead24c53f5d8cf09a7c8a709fc1a7c61a93c0f63",
+      "input_sha256": "0eff2aa45b3c2b217ed36100317b2da4372f36f41b8bb5adc73e8a3e509a8690",
+      "modeled_sha256": "2072b617088b9ece4343070d241847a63c64210bfdb4d74dba7b9facc9eb38db",
+      "program_address": 2415919104,
+      "model_base": 2415919104,
+      "input_address": 2147483776,
+      "output_address": 2952790144,
+      "halt_index": 6151,
+      "hardware_executed": false,
+      "offline_guards": {
+        "input_unchanged": true,
+        "guards_intact": true
+      },
+      "offline_contract": {
+        "finite": true,
+        "components_vs_native_double_rne_model": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        },
+        "recovered_vs_exact_fp32": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        },
+        "passed": true
+      },
+      "steps": 64,
+      "initial_cell": 16.0,
+      "increment": 0.00390625,
+      "contract": "64 high+low cell updates must recover exactly 16.25; compare native components with double-RNE model."
+    },
+    {
+      "name": "compensated_tanh_grid",
+      "instructions": 8382,
+      "program_bytes": 268224,
+      "program_sha256": "ee26e6e7f82c80500e07550bf3a4e501ec18e6e2462e9f8c7fead38aca421c4a",
+      "resident_bytes": 276416,
+      "resident_sha256": "dea381604647d8575755e04878035631f449d38db8f85a39ebb47ea7ed486918",
+      "input_sha256": "a872857e77a365eccd085e0787ec5feba46321f3d7bd0236ab3f59c0f76c144c",
+      "modeled_sha256": "ae3095a8cb8a7214baff3ed737a9188ba662cdb523c20c174b5c6842e6149546",
+      "program_address": 2415927296,
+      "model_base": 2415919104,
+      "input_address": 2147483776,
+      "output_address": 2952790144,
+      "halt_index": 8380,
+      "hardware_executed": false,
+      "offline_guards": {
+        "input_unchanged": true,
+        "guards_intact": true
+      },
+      "offline_contract": {
+        "finite": true,
+        "baseline_vs_fp32": {
+          "relative_l2": 0.0028811355170486677,
+          "max_abs": 0.01516580581665039,
+          "exact_mismatches": 3760,
+          "bf16_bit_mismatches": 840
+        },
+        "compensated_vs_fp32": {
+          "relative_l2": 0.0009139404075676054,
+          "max_abs": 0.0022106170654296875,
+          "exact_mismatches": 3760,
+          "bf16_bit_mismatches": 103
+        },
+        "ideal_bf16_vs_fp32": {
+          "relative_l2": 0.0008882914124033774,
+          "max_abs": 0.0019394755363464355,
+          "exact_mismatches": 3760,
+          "bf16_bit_mismatches": 0
+        },
+        "quiet_exact_mismatches": 0,
+        "odd_symmetry": true,
+        "passed": true
+      },
+      "count": 33600,
+      "positive_normal_bf16_codes": [
+        "0x0080",
+        "0x4200"
+      ],
+      "contract": "Independent Torch FP32 tanh reference; compensated error <= 1.2 times ideal BF16 rounding floor, max absolute error < 0.0023, <= 35% of baseline error, exact quiet normal values <= 2^-10, odd symmetry and output in [-1,1]. No bit-exact reciprocal/SFU assertion; subnormals excluded."
+    }
+  ],
+  "passed": true
+}

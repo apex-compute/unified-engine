@@ -90,11 +90,15 @@ class QuantizerPlan:
     constants: dict[str, int]
     small_gathers: dict[int, tuple[int, int]]
     use_sram_tournament: bool = True
+    center_scores: bool = False
+    compensated_codebook: bool = False
 
 
 def prepare_quantizer(quantizer, image, *, source_address: int,
                       destination_address: int, scratch_address: int,
-                      frames: int, token_address: int) -> QuantizerPlan:
+                      frames: int, token_address: int,
+                      center_scores: bool = False,
+                      compensated_codebook: bool = False) -> QuantizerPlan:
     """Pack constants; reserve ``quantizer_scratch_bytes(frames)`` externally.
 
     ``quantizer`` is the single FactorizedVectorQuantize module, or its one-layer
@@ -102,7 +106,18 @@ def prepare_quantizer(quantizer, image, *, source_address: int,
     ``image.allocate(tensor, alignment=128)`` must store BF16
     tensors. Source/output are [frames, 1024] BF16; tokens are [frames, 64] with
     low/high bytes in lanes 0/1 and zero padding. All four buffers must be disjoint.
+    ``center_scores`` subtracts one in the score dot's native bias epilogue,
+    before BF16 writeback. The common shift preserves mathematical argmax and
+    retains more score precision near cosine similarity one.
+    ``compensated_codebook`` duplicates the projected query in spare lanes and
+    packs a BF16 residual of each normalized codebook coordinate alongside its
+    BF16 high part. Only the original eight lanes contribute to normalization.
+    Matrix dimensions and the emitted instruction sequence stay unchanged.
     """
+    if not isinstance(center_scores, bool):
+        raise ValueError("center_scores must be a bool")
+    if not isinstance(compensated_codebook, bool):
+        raise ValueError("compensated_codebook must be a bool")
     if hasattr(quantizer, "layers"):
         if len(quantizer.layers) != 1:
             raise ValueError("Only BigCodec's single codebook is supported")
@@ -146,10 +161,19 @@ def prepare_quantizer(quantizer, image, *, source_address: int,
     weight_in[:CODE_DIM] = w_in
     bias_in = torch.zeros(WIDTH)
     bias_in[:CODE_DIM] = b_in
+    if compensated_codebook:
+        weight_in[CODE_DIM:2 * CODE_DIM] = w_in
+        bias_in[CODE_DIM:2 * CODE_DIM] = b_in
     weight_out = torch.zeros(FEATURE_DIM, WIDTH)
     weight_out[:, :CODE_DIM] = w_out
     score_weights = torch.zeros(CODEBOOK_SIZE, WIDTH)
-    score_weights[:, :CODE_DIM] = F.normalize(codebook, dim=1)[order]
+    normalized_codebook = F.normalize(codebook, dim=1)[order]
+    score_weights[:, :CODE_DIM] = normalized_codebook
+    sum_weight = torch.ones(WIDTH, WIDTH)
+    if compensated_codebook:
+        score_weights[:, CODE_DIM:2 * CODE_DIM] = (
+            normalized_codebook - normalized_codebook.to(torch.bfloat16).float())
+        sum_weight[:, CODE_DIM:] = 0
     payload = torch.zeros(PAYLOAD_ROWS - 1, CODEBOOK_SIZE)
     payload[:CODE_DIM] = codebook[order].t()
     payload[CODE_DIM] = order & 255
@@ -161,10 +185,12 @@ def prepare_quantizer(quantizer, image, *, source_address: int,
             ("in_weight", weight_in), ("in_bias", bias_in),
             ("out_weight", weight_out), ("out_bias", b_out),
             ("score_weight", score_weights), ("payload", payload),
-            ("identity", torch.eye(WIDTH)), ("sum_weight", torch.ones(WIDTH, WIDTH)),
+            ("identity", torch.eye(WIDTH)), ("sum_weight", sum_weight),
             ("ones", torch.ones(CODEBOOK_SIZE)),
             ("zeros", torch.zeros(WIDTH, WIDTH)), ("token_weight", tokens)):
         allocate(name, value)
+    if center_scores:
+        allocate("score_bias", -torch.ones(CODEBOOK_SIZE))
     gathers = {}
     for count in (64, 32, 16, 8, 4, 2):
         pair = []
@@ -177,7 +203,8 @@ def prepare_quantizer(quantizer, image, *, source_address: int,
     return QuantizerPlan(frames, source_address, destination_address, token_address,
                          scratch_address, scratch_bytes,
                          {k: scratch_address + v for k, v in offsets.items()},
-                         constants, gathers)
+                         constants, gathers, center_scores=center_scores,
+                         compensated_codebook=compensated_codebook)
 
 
 def _sram_positive_mask(engine, source, elements, *, scratch_address):
@@ -276,8 +303,9 @@ def emit_quantizer(engine, plan: QuantizerPlan) -> None:
     engine.eltwise_core_dram(
         M=frames, N=WIDTH, dram_a=s["projected"], dram_b=s["projected"],
         dram_out=s["norm_work"], mode=udc.UE_MODE.ELTWISE_MUL)
-    # The padded lanes are zero. Repeating the sum in every lane permits a
-    # pointwise rsqrt and multiply, including the upstream zero-input epsilon.
+    # sum_weight includes exactly the original eight logical coordinates:
+    # duplicated coordinates, when enabled, do not double the norm. Repeating
+    # the sum permits pointwise rsqrt/multiply, including the zero-input epsilon.
     engine.matmat_mul_core(
         M=frames, K=WIDTH, N=WIDTH, A_DRAM_ADDR=s["norm_work"],
         B_DRAM_ADDR=c["sum_weight"], OUTPUT_DRAM_ADDR=s["norm_work"],
@@ -296,11 +324,13 @@ def emit_quantizer(engine, plan: QuantizerPlan) -> None:
         if not plan.use_sram_tournament:
             engine.accelerator_memcpy(c["payload"], current,
                                       (PAYLOAD_ROWS - 1) * CODEBOOK_SIZE * 2)
+        score_bias = {"C_DRAM_ADDR": c["score_bias"]} if plan.center_scores else {}
         engine.matmat_mul_core(
             M=1, K=WIDTH, N=CODEBOOK_SIZE,
             A_DRAM_ADDR=s["normalized"] + frame * WIDTH * 2,
             B_DRAM_ADDR=c["score_weight"],
-            OUTPUT_DRAM_ADDR=current + SCORE_ROW * CODEBOOK_SIZE * 2)
+            OUTPUT_DRAM_ADDR=current + SCORE_ROW * CODEBOOK_SIZE * 2,
+            **score_bias)
         count = CODEBOOK_SIZE
         if plan.use_sram_tournament:
             _emit_sram_tournament(engine, plan)

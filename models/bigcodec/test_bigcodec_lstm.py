@@ -3,10 +3,14 @@
 import contextlib
 import io
 import unittest
+from unittest import mock
+import sys
 
 import torch
 
 from bigcodec_lstm import emit_lstm, prepare_lstm, scratch_bytes, tanh_identity, tanh_scratch_bytes, pade_tanh, quantize_recurrent_if8, udc
+from bigcodec_lstm import _two_product_sram, _two_sum_sram, _compensated_cell_sram
+from bigcodec_lstm import _tanh_sram
 
 
 class MemoryImage:
@@ -24,11 +28,13 @@ class MemoryImage:
 
 
 class MemoryEngine:
+    """Direct BF16 boundary interpreter, not the native BF19 arithmetic model."""
     def __init__(self):
         self.regions = {}
         self.matmul_calls = []
         self.native_calls = []
         self.quantized_calls = []
+        self.projection_calls = []
         self.dma_calls = []
         self.sram = torch.zeros(0x100000 // 2, dtype=torch.bfloat16)
 
@@ -91,6 +97,7 @@ class MemoryEngine:
     def accelerator_memory_to_bias_sram(self, address, count):
         self.dma_calls.append(("bias", address, count * 2))
         self.bias = self.view(address, count).float().clone()
+        self.bias_address = address
 
     def accelerator_memory_to_scale_sram(self, address, count):
         assert count <= udc.SCALE_BRAM_ELEMENTS
@@ -99,7 +106,7 @@ class MemoryEngine:
 
     def start_queue_for_dot_product_operation(self, *, max_clear_en, fmax_context_addr,
             vector_sram_start_addr, output_sram_wb_addr, K, N, dma_start_addr,
-            data_type, bias_enable=False):
+            data_type, bias_enable=False, lalu_mode=udc.LALU_MODE.BYPASS, lalu_a=0, lalu_b=0):
         assert data_type == udc.TYPE.IF8 and bool((self.scales < 0).all())
         assert K % 64 == N % 64 == 0 and self.scales.numel() == N * K // 64
         self.quantized_calls.append((K, N, dma_start_addr, output_sram_wb_addr))
@@ -110,6 +117,13 @@ class MemoryEngine:
         result = (self.sram_view(vector_sram_start_addr, K).float()[None] @ weights.T)[0]
         if bias_enable:
             result += self.bias[:N]
+            self.projection_calls.append(dict(K=K, N=N, output=output_sram_wb_addr,
+                bias=self.bias_address, mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b))
+        if lalu_mode == udc.LALU_MODE.ACT_NO_X:
+            assert lalu_a == udc.LALU_ACT_SIGMOID_A and lalu_b == udc.LALU_ACT_SIGMOID_B
+            result = result.sigmoid()
+        else:
+            assert lalu_mode == udc.LALU_MODE.BYPASS
         self.sram_view(output_sram_wb_addr, N).copy_(result)
 
     def sram_to_accelerator_memory(self, sram_address, address, count):
@@ -141,6 +155,10 @@ class MemoryEngine:
         assert a // 0x80000 != b // 0x80000
         self.sram_view(output, count).copy_(self.sram_view(a, count).float() + self.sram_view(b, count).float())
 
+    def eltwise_sub_core(self, a, b, output, count):
+        assert a < 0x80000 <= b
+        self.sram_view(output, count).copy_(self.sram_view(a, count).float() - self.sram_view(b, count).float())
+
     def start_queue_for_maxpool2d_operation(self, *, act_sram_start_addr,
             output_sram_wb_addr, kernel_w, kernel_h, out_w, out_h, w_pad, stride_s):
         assert kernel_w == out_h == stride_s == 1 and kernel_h == 2
@@ -164,6 +182,8 @@ class MemoryEngine:
         result = (self.sram_view(vector_sram_start_addr, K).float()[None] @ matrix.T)[0]
         if bias_enable:
             result += self.bias[:N]
+            self.projection_calls.append(dict(K=K, N=N, output=output_sram_wb_addr,
+                bias=self.bias_address, mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b))
         if lalu_mode == udc.LALU_MODE.MODE_RECIP:
             assert lalu_scalar == 1.0
             result = 1 / result
@@ -177,7 +197,47 @@ class MemoryEngine:
         self.sram_view(output_sram_wb_addr, N).copy_(result)
 
 
-def manual_lstm(module, source, *, bf16=False, skip=True):
+def native_round(value):
+    """Native finite normal arithmetic: FP32 ->10 fraction bits ->BF16, RNE.
+
+    This models the elementwise operations used by the compensated cell. It
+    does not model matrix accumulation, LALU activation tables, or underflow.
+    """
+    value = torch.as_tensor(value, dtype=torch.float32).contiguous()
+    bits = value.view(torch.int32)
+    rounded = (bits + 0xFFF + ((bits >> 13) & 1)) & ~0x1FFF
+    return rounded.view(torch.float32).bfloat16().float()
+
+
+class NativeArithmeticMemoryEngine(MemoryEngine):
+    """Model the measured BF19-to-BF16 double rounding for scalar/vector ALU."""
+    def broadcast_mul(self, scalar, sram_start_addr, sram_wb_addr, element_size):
+        assert sram_start_addr < 0x80000
+        self.sram_view(sram_wb_addr, element_size).copy_(native_round(
+            self.sram_view(sram_start_addr, element_size).float() * scalar))
+
+    def broadcast_add(self, scalar, sram_start_addr, sram_wb_addr, element_size):
+        assert sram_start_addr < 0x80000
+        self.sram_view(sram_wb_addr, element_size).copy_(native_round(
+            self.sram_view(sram_start_addr, element_size).float() + scalar))
+
+    def _binary(self, a, b, output, count, operation):
+        assert a < 0x80000 <= b
+        self.sram_view(output, count).copy_(native_round(operation(
+            self.sram_view(a, count).float(), self.sram_view(b, count).float())))
+
+    def eltwise_mul_core(self, a, b, output, count):
+        self._binary(a, b, output, count, torch.mul)
+
+    def eltwise_add_core(self, a, b, output, count):
+        self._binary(a, b, output, count, torch.add)
+
+    def eltwise_sub_core(self, a, b, output, count):
+        self._binary(a, b, output, count, torch.sub)
+
+
+def manual_lstm(module, source, *, bf16=False, skip=True, compensated_cell=False,
+                preserve_cell_residual=True, fused_projection=False):
     """Independent PyTorch gate unroll, optionally rounding at device boundaries."""
     rounded = (lambda x: x.to(torch.bfloat16).float()) if bf16 else (lambda x: x)
     def tanh(value):
@@ -200,16 +260,41 @@ def manual_lstm(module, source, *, bf16=False, skip=True):
         w_h = rounded(getattr(module, f"weight_hh_l{layer}"))
         b_i = rounded(getattr(module, f"bias_ih_l{layer}"))
         b_h = rounded(getattr(module, f"bias_hh_l{layer}"))
+        if fused_projection:
+            b_i = rounded(getattr(module, f"bias_ih_l{layer}").float()
+                          + getattr(module, f"bias_hh_l{layer}").float())
         projections = rounded(source @ w_i.T + b_i)
         hidden = torch.zeros(source.shape[-1])
         cell = torch.zeros_like(hidden)
+        cell_low = torch.zeros_like(hidden)
         rows = []
         for projection in projections:
-            recurrent = rounded(hidden @ w_h.T + b_h)
-            i, f, g, o = rounded(projection + recurrent).chunk(4)
+            if fused_projection:
+                # Independent fused epilogue reference: no gate BF16 boundary
+                # between the recurrent dot, projected-input bias, and sigmoid.
+                i, f, g, o = (hidden @ w_h.T + projection).chunk(4)
+                g = rounded(g)
+            else:
+                recurrent = rounded(hidden @ w_h.T + b_h)
+                i, f, g, o = rounded(projection + recurrent).chunk(4)
             i, f, o = (rounded(torch.sigmoid(v)) for v in (i, f, o))
             g = rounded(tanh(g))
-            cell = rounded(rounded(f * cell) + rounded(i * g))
+            if compensated_cell:
+                # Independent oracle: obtain exact residuals with FP32 rather
+                # than reproducing the emitted Dekker/TwoSum instruction chain.
+                left_exact, right_exact = f * cell, i * g
+                left, right = rounded(left_exact), rounded(right_exact)
+                left_error, right_error = left_exact - left, right_exact - right
+                total = rounded(left + right)
+                total_error = (left + right) - total
+                correction = rounded(rounded(left_error + right_error) + total_error)
+                if preserve_cell_residual:
+                    correction = rounded(correction + rounded(f * cell_low))
+                cell = rounded(total + correction)
+                if preserve_cell_residual:
+                    cell_low = rounded((total + correction) - cell)
+            else:
+                cell = rounded(rounded(f * cell) + rounded(i * g))
             hidden = rounded(o * rounded(tanh(cell)))
             rows.append(hidden)
         source = torch.stack(rows)
@@ -225,7 +310,8 @@ class BigCodecLSTMTest(unittest.TestCase):
                 parameter.mul_(0.3)
         return module
 
-    def prepare(self, module, source, skip=True, recurrent_precision="bf16"):
+    def prepare(self, module, source, skip=True, recurrent_precision="bf16", compensated_cell=False,
+                preserve_cell_residual=True, compensated_tanh=False, fused_projection=False):
         sequence, width = source.shape
         padded = (width + 63) // 64 * 64
         engine = MemoryEngine()
@@ -236,15 +322,256 @@ class BigCodecLSTMTest(unittest.TestCase):
         packed[:, :width] = source
         engine.regions[input_address] = packed.flatten().clone()
         engine.regions[output_address] = torch.full((sequence * padded,), float("nan"), dtype=torch.bfloat16)
-        engine.regions[scratch_address] = torch.full((scratch_bytes(source.shape) // 2,), float("nan"), dtype=torch.bfloat16)
+        engine.regions[scratch_address] = torch.full((scratch_bytes(source.shape,
+            compensated_cell=compensated_cell, preserve_cell_residual=preserve_cell_residual) // 2,), float("nan"), dtype=torch.bfloat16)
         engine.regions[identity_address] = torch.eye(64, dtype=torch.bfloat16).flatten()
         engine.regions[zero_address] = torch.zeros(64, dtype=torch.bfloat16)
         plan = prepare_lstm(module, image, input_shape=source.shape,
                             input_address=input_address, output_address=output_address,
                             scratch_address=scratch_address, identity_address=identity_address,
                             zero_address=zero_address, skip=skip,
-                            recurrent_precision=recurrent_precision)
+                            recurrent_precision=recurrent_precision, compensated_cell=compensated_cell,
+                            preserve_cell_residual=preserve_cell_residual, compensated_tanh=compensated_tanh,
+                            fused_projection=fused_projection)
         return engine, image, plan
+
+    def test_compensated_products_recover_exact_bf16_products_and_preserve_sram(self):
+        gen = torch.Generator().manual_seed(15092026)
+        for count in (64, 1536, 4096):
+            engine = MemoryEngine()
+            engine.sram.fill_(-13.)
+            left = (torch.randn(count, generator=gen) * 20.).bfloat16()
+            right = (torch.rand(count, generator=gen) * 2. - 1.).bfloat16()
+            left[:4] = torch.tensor([1.0078125, -1.0078125, 16., 0.])
+            right[:4] = torch.tensor([.99609375, .99609375, .00390625, -1.])
+            engine.sram_view(0, count).copy_(left)
+            engine.sram_view(0x2000, count).copy_(right)
+            before = engine.sram.clone()
+            _two_product_sram(engine, 0, 0x2000, 0x4000, 0x6000, count)
+            high, low = (engine.sram_view(address, count).float() for address in (0x4000, 0x6000))
+            torch.testing.assert_close(high + low, left.float() * right.float(), rtol=0, atol=0)
+            allowed = torch.zeros(engine.sram.numel(), dtype=torch.bool)
+            for address in (0x4000, 0x6000, *(0x50000 + n * 0x2000 for n in range(7)), 0xF0000):
+                allowed[address // 2:address // 2 + count] = True
+            torch.testing.assert_close(engine.sram[~allowed], before[~allowed], rtol=0, atol=0)
+
+    def test_compensated_sum_preserves_cancellation_and_both_operand_orders(self):
+        engine = MemoryEngine()
+        left = torch.tensor([16., 1., 1.0078125, .00390625, -16., -1., 0., -0.]).repeat(8).bfloat16()
+        right = torch.tensor([.00390625, -1., -1., 16., -.00390625, 1., 0., 0.]).repeat(8).bfloat16()
+        for a, b in ((left, right), (right, left)):
+            engine.sram_view(0, 64).copy_(a)
+            engine.sram_view(0x2000, 64).copy_(b)
+            _two_sum_sram(engine, 0, 0x2000, 0x4000, 0x6000, 64)
+            high = engine.sram_view(0x4000, 64).float()
+            low = engine.sram_view(0x6000, 64).float()
+            torch.testing.assert_close(high + low, a.float() + b.float(), rtol=0, atol=0)
+
+    def test_native_double_rounding_product_residuals_recover_exact_products(self):
+        engine = NativeArithmeticMemoryEngine()
+        values = torch.arange(128, 256).float() / 128.
+        left = values[:, None].expand(128, 128).flatten()
+        right = (values[None, :] / 2.).expand(128, 128).flatten()
+        different_from_direct_rounding = 0
+        for start in range(0, left.numel(), 4096):
+            a, b = left[start:start + 4096], right[start:start + 4096]
+            engine.sram_view(0, 4096).copy_(a)
+            engine.sram_view(0x2000, 4096).copy_(b)
+            _two_product_sram(engine, 0, 0x2000, 0x4000, 0x6000, 4096)
+            high = engine.sram_view(0x4000, 4096).float()
+            low = engine.sram_view(0x6000, 4096).float()
+            torch.testing.assert_close(high, native_round(a * b), rtol=0, atol=0)
+            torch.testing.assert_close(high + low, a * b, rtol=0, atol=0)
+            different_from_direct_rounding += int((high != (a * b).bfloat16().float()).sum())
+        self.assertGreater(different_from_direct_rounding, 0)
+
+    def test_native_double_rounding_sum_residual_is_approximate_and_bounded(self):
+        engine = NativeArithmeticMemoryEngine()
+        gen = torch.Generator().manual_seed(15092026)
+        left = (torch.randn(4096, generator=gen) * 20.).bfloat16().float()
+        right = (torch.rand(4096, generator=gen) * 2. - 1.).bfloat16().float()
+        left[0], right[0] = 1.0078125, -.0034332275390625
+        engine.sram_view(0, 4096).copy_(left)
+        engine.sram_view(0x2000, 4096).copy_(right)
+        _two_sum_sram(engine, 0, 0x2000, 0x4000, 0x6000, 4096)
+        high, low = (engine.sram_view(address, 4096).float() for address in (0x4000, 0x6000))
+        # This counterexample fails the ordinary exact-TwoSum assumption:
+        # native double rounding picks1.0; the remaining error needs9bits.
+        self.assertEqual(float(high[0]), 1.)
+        self.assertEqual(float(low[0]), .00439453125)
+        self.assertNotEqual(float(high[0] + low[0]), float(left[0] + right[0]))
+        expected = left.double() + right.double()
+        recovered = high.double() + low.double()
+        self.assertLess(float((recovered - expected).norm() / expected.norm()), 2e-6)
+        self.assertLess(float((recovered - expected).abs().max()), .002)
+        self.assertLess(float((recovered - expected).norm()), float((high.double() - expected).norm()) / 100)
+
+    def test_compensated_cell_keeps_updates_smaller_than_cell_ulp(self):
+        engine = MemoryEngine()
+        for address, value in ((0, 1.), (0x2000, 1.), (0x4000, 1. / 256), (0x6000, 16.), (0x8000, 0.)):
+            engine.sram_view(address, 64).fill_(value)
+        for _ in range(64):
+            _compensated_cell_sram(engine, 0, 0x2000, 0x4000, 0x6000, 0x8000, 64)
+        torch.testing.assert_close(engine.sram_view(0x6000, 64).float()
+            + engine.sram_view(0x8000, 64).float(), torch.full((64,), 16.25), rtol=0, atol=0)
+        self.assertEqual(float((torch.tensor(16.) + 1. / 256).bfloat16()), 16.)
+        for address, value in ((0, 1.), (0x2000, 1.), (0x4000, 1. / 256)):
+            self.assertTrue(bool((engine.sram_view(address, 64) == value).all()))
+
+    def test_compensated_recurrence_matches_independent_residual_oracle_and_resets(self):
+        for width, sequence in ((65, 4), (1536, 2)):
+            module = self.model(width)
+            source = (torch.randn(sequence, width) * .2).bfloat16().float()
+            engine, _, plan = self.prepare(module, source, compensated_cell=True)
+            self.assertTrue(plan.compensated_cell)
+            self.assertEqual(plan.scratch_bytes - scratch_bytes(source.shape), plan.padded_width * 2)
+            self.assertIn("cell_low", plan.regions)
+            emit_lstm(engine, plan)
+            actual = engine.regions[plan.output_address].reshape(sequence, plan.padded_width).float().clone()
+            expected = manual_lstm(module, source, bf16=True, compensated_cell=True)
+            torch.testing.assert_close(actual[:, :width], expected, rtol=0, atol=0)
+            self.assertTrue(bool((actual[:, width:] == 0).all()))
+            engine.view(plan.regions["cell_low"][0], plan.padded_width).fill_(123.)
+            emit_lstm(engine, plan)
+            torch.testing.assert_close(engine.regions[plan.output_address].float(), actual.flatten(), rtol=0, atol=0)
+
+    def test_product_compensation_has_no_persistent_low_cell_and_matches_oracle(self):
+        source = (torch.randn(4, 65) * .2).bfloat16().float()
+        module = self.model(65)
+        engine, _, plan = self.prepare(module, source, compensated_cell=True, preserve_cell_residual=False)
+        self.assertEqual(plan.scratch_bytes, scratch_bytes(source.shape))
+        self.assertNotIn("cell_low", plan.regions)
+        emit_lstm(engine, plan)
+        actual = engine.regions[plan.output_address].reshape(4, 128).float()
+        expected = manual_lstm(module, source, bf16=True, compensated_cell=True, preserve_cell_residual=False)
+        torch.testing.assert_close(actual[:, :65], expected, rtol=0, atol=0)
+        self.assertTrue(bool((actual[:, 65:] == 0).all()))
+
+    def test_tanh_precision_dispatch_applies_to_candidate_and_cell_of_both_layers(self):
+        source = torch.zeros(2, 64)
+        engine, _, plan = self.prepare(self.model(64), source, compensated_tanh=True)
+        replacement = mock.Mock(side_effect=_tanh_sram)
+        module = mock.Mock(compensated_tanh_sram=replacement)
+        with mock.patch.dict(sys.modules, {"bigcodec_tanh": module}):
+            emit_lstm(engine, plan)
+        self.assertEqual(replacement.call_count, 2 * 2 * 2)
+        self.assertTrue(all(call.args[4 - 1] == 64 for call in replacement.call_args_list))
+
+    def test_fused_projection_folds_biases_before_bf16_packing_without_mutation(self):
+        module = self.model(65)
+        with torch.no_grad():
+            for layer in range(2):
+                getattr(module, f"bias_ih_l{layer}").fill_(1.00390625)
+                getattr(module, f"bias_hh_l{layer}").fill_(.00390625)
+        before = {name: value.detach().clone() for name, value in module.named_parameters()}
+        engine, _, plan = self.prepare(module, torch.zeros(2, 65), fused_projection=True)
+        for layer in plan.layers:
+            packed = engine.regions[layer.input_bias].reshape(4, 128)
+            self.assertTrue(bool((packed[:, :65] == 1.0078125).all()))
+            self.assertTrue(bool((packed[:, 65:] == 0).all()))
+            self.assertTrue(bool((engine.regions[layer.recurrent_bias] == 0).all()))
+        separately_rounded = (torch.tensor(1.00390625).bfloat16().float()
+                              + torch.tensor(.00390625).bfloat16().float()).bfloat16().float()
+        self.assertNotEqual(float(separately_rounded), 1.0078125)
+        for name, value in module.named_parameters():
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+    def test_fused_projection_matches_oracle_and_keeps_gate_tiles_separate(self):
+        for width, precision, compensated in ((65, "bf16", True), (1536, "if8", False)):
+            with self.subTest(width=width, precision=precision):
+                module = self.model(width)
+                source = (torch.randn(2, width) * .2).bfloat16().float()
+                engine, _, plan = self.prepare(module, source, recurrent_precision=precision,
+                    fused_projection=True, compensated_cell=compensated)
+                if precision == "if8":
+                    for index, layer in enumerate(plan.layers):
+                        codes = engine.regions[layer.recurrent_weights].view(torch.int8).reshape(-1, 64)
+                        scales = engine.regions[layer.recurrent_scales]
+                        effective = (codes.float() * scales.float().abs()[:, None]).bfloat16()
+                        effective = effective.reshape(4, plan.padded_width, plan.padded_width)[:, :width, :width]
+                        with torch.no_grad():
+                            getattr(module, f"weight_hh_l{index}").copy_(effective.reshape(4 * width, width))
+                emit_lstm(engine, plan)
+                actual = engine.regions[plan.output_address].reshape(2, plan.padded_width).float()
+                expected = manual_lstm(module, source, bf16=True, fused_projection=True,
+                                        compensated_cell=compensated)
+                torch.testing.assert_close(actual[:, :width], expected, rtol=0, atol=0)
+                self.assertTrue(bool((actual[:, width:] == 0).all()))
+                row_bytes = 4 * plan.padded_width * 2
+                rows_seen = set()
+                for call in engine.projection_calls:
+                    first = (call["output"] - 0x8000) // 2
+                    gate = first // plan.padded_width
+                    self.assertEqual((first + call["N"] - 1) // plan.padded_width, gate)
+                    row_address = call["bias"] - first * 2
+                    self.assertIn(row_address, {plan.regions["input_gates"][0],
+                                               plan.regions["input_gates"][0] + row_bytes})
+                    rows_seen.add(row_address)
+                    mode = udc.LALU_MODE.BYPASS if gate == 2 else udc.LALU_MODE.ACT_NO_X
+                    self.assertEqual(call["mode"], mode)
+                    self.assertEqual(call["lalu_a"], 0 if gate == 2 else udc.LALU_ACT_SIGMOID_A)
+                    self.assertEqual(call["lalu_b"], 0 if gate == 2 else udc.LALU_ACT_SIGMOID_B)
+                self.assertEqual(len(rows_seen), 2)
+                # There are no separate64x64 identity sigmoid passes after fusion.
+                expected_native_sigmoids = sum(call["mode"] == udc.LALU_MODE.ACT_NO_X
+                                              for call in engine.projection_calls) if precision == "bf16" else 0
+                self.assertEqual(engine.native_calls.count(udc.LALU_MODE.ACT_NO_X), expected_native_sigmoids)
+                if precision == "if8":
+                    self.assertIn(256, [call["N"] for call in engine.projection_calls])
+
+    def test_explicit_disabled_projection_fusion_preserves_legacy_capture(self):
+        from bigcodec_device import shared
+        source = torch.zeros(2, 64)
+        module = self.model(64)
+        first_engine, _, first = self.prepare(module, source)
+        second_engine, _, second = self.prepare(module, source, fused_projection=False)
+        self.assertEqual(first, second)
+        for address in first_engine.regions:
+            a, b = first_engine.regions[address], second_engine.regions[address]
+            torch.testing.assert_close(a, b, rtol=0, atol=0, equal_nan=True)
+        previous_width = udc.UE_AXI_DATA_WIDTH_BITS
+        try:
+            udc.UE_AXI_DATA_WIDTH_BITS = 256
+            programs = []
+            for plan in (first, second):
+                capture = shared._WholeGraphEngine(0xA0000000)
+                capture.start_capture()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    emit_lstm(capture, plan)
+                capture.generate_instruction_halt()
+                capture.stop_capture()
+                programs.append(b''.join(instruction.get_bytes() for instruction in capture.capture_buffer))
+            self.assertEqual(programs[0], programs[1])
+        finally:
+            udc.UE_AXI_DATA_WIDTH_BITS = previous_width
+
+    def test_compensated_workspace_rejects_overlap_and_unsupported_width(self):
+        engine = MemoryEngine()
+        for helper in (_two_product_sram, _two_sum_sram):
+            for addresses in ((0, 0x2000, 0, 0x6000), (0, 0x2000, 0x4000, 0x4000),
+                              (0x50000, 0x2000, 0x4000, 0x6000), (1, 0x2000, 0x4000, 0x6000)):
+                with self.assertRaises(ValueError):
+                    helper(engine, *addresses, 64)
+        with self.assertRaises(ValueError):
+            scratch_bytes((2, 4097), compensated_cell=True)
+        with self.assertRaises(ValueError):
+            scratch_bytes((2, 64), compensated_cell=1)
+        with self.assertRaises(ValueError):
+            scratch_bytes((2, 64), preserve_cell_residual=1)
+        # At4096 columns a64-row BF16 recurrent tile is one URAM row too big.
+        # Meta tensors let us validate dispatch without allocating1GiB weights.
+        module = torch.nn.LSTM(4096, 4096, num_layers=2, batch_first=True, device="meta").eval()
+        with self.assertRaisesRegex(ValueError, "SRAM recurrent projection"):
+            self.prepare(module, torch.zeros(1, 4096), compensated_cell=True)
+        with self.assertRaisesRegex(ValueError, "SRAM recurrent projection"):
+            self.prepare(module, torch.zeros(1, 4096), compensated_tanh=True)
+        with self.assertRaisesRegex(ValueError, "SRAM recurrent projection"):
+            self.prepare(module, torch.zeros(1, 4096), fused_projection=True)
+        with self.assertRaisesRegex(ValueError, "fused_projection must be a bool"):
+            self.prepare(self.model(64), torch.zeros(1, 64), fused_projection=1)
+        _, _, plan = self.prepare(self.model(64), torch.zeros(2, 64))
+        self.assertFalse(plan.compensated_cell)
+        self.assertNotIn("cell_low", plan.regions)
 
     def test_manual_gate_order_and_whole_stack_skip_match_torch(self):
         for width in (7, 64):
@@ -314,10 +641,10 @@ class BigCodecLSTMTest(unittest.TestCase):
                 quantize_recurrent_if8(invalid)
 
     def test_if8_streaming_matches_dequantized_recurrent_reference(self):
-        for width in (65, 1536):
+        for width, compensated in ((65, False), (1536, False), (65, True)):
             module = self.model(width)
             source = (torch.randn(2, width) * .2).bfloat16().float()
-            engine, _, plan = self.prepare(module, source, recurrent_precision="if8")
+            engine, _, plan = self.prepare(module, source, recurrent_precision="if8", compensated_cell=compensated)
             self.assertEqual(plan.recurrent_precision, "if8")
             for index, layer in enumerate(plan.layers):
                 self.assertEqual(engine.regions[layer.input_weights].dtype, torch.bfloat16)
@@ -330,7 +657,8 @@ class BigCodecLSTMTest(unittest.TestCase):
                     getattr(module, f"weight_hh_l{index}").copy_(effective.reshape(4 * width, width))
             emit_lstm(engine, plan)
             actual = engine.view(plan.output_address, 2 * plan.padded_width).reshape(2, plan.padded_width)
-            torch.testing.assert_close(actual[:, :width].float(), manual_lstm(module, source, bf16=True), rtol=0, atol=0)
+            torch.testing.assert_close(actual[:, :width].float(), manual_lstm(module, source,
+                bf16=True, compensated_cell=compensated), rtol=0, atol=0)
             self.assertTrue(bool((actual[:, width:] == 0).all()))
             self.assertTrue(engine.quantized_calls)
             # Every layer streams exactly its entire packed matrix per timestep;
