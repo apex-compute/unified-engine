@@ -1,0 +1,41 @@
+/home/hunlu/my_torch_env/lib/python3.12/site-packages/torch/nn/utils/weight_norm.py:144: FutureWarning: `torch.nn.utils.weight_norm` is deprecated in favor of `torch.nn.utils.parametrizations.weight_norm`.
+  WeightNorm.apply(module, name, dim)
+/dev/xdma0_user register access...
+HW version via user device: 0x40519e0a
+address 0x00000000 = 0x40519e0a
+address 0x00000030 = 0x00000000
+address 0x00000054 = 0x00000000
+address 0x00000070 = 0x00000000
+address 0x00000078 = 0x00000000
+address 0x00000084 = 0x00000000
+address 0x00000088 = 0x8d8049a1
+address 0x0000008c = 0x00003345
+address 0x00000090 = 0x00003451
+address 0x00000094 = 0x0000c03d
+address 0x00000098 = 0x0000c3de
+address 0x0000009c = 0x00000000
+address 0x000000a0 = 0x80214d40
+FPGA DRAM read/write test skipped
+init_unified_engine()
+Unified Engine initialization completed successfully!
+Software reset complete.
+/dev/xdma0_user register access...
+HW version via user device: 0x40519e0a
+address 0x00000000 = 0x40519e0a
+address 0x00000030 = 0x00000000
+address 0x00000054 = 0x00000000
+address 0x00000070 = 0x00000000
+address 0x00000078 = 0x00000000
+address 0x00000084 = 0x00000000
+address 0x00000088 = 0x0246ff78
+address 0x0000008c = 0x00004545
+address 0x00000090 = 0x00007cbc
+address 0x00000094 = 0x0000e9a8
+address 0x00000098 = 0x00011da6
+address 0x0000009c = 0x00000000
+address 0x000000a0 = 0x80214d40
+FPGA DRAM read/write test skipped
+init_unified_engine()
+Unified Engine initialization completed successfully!
+Software reset complete.
+{"mode": "native", "passed": true, "report": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/lstm_probe/native.json", "error_reduction_fraction": {"lstm_vs_official_fp32": 0.5531709236608296, "fp32_tail_waveform_vs_official": 0.5554656054846829}}

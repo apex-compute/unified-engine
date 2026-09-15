@@ -27,7 +27,7 @@ from bigcodec_conv import (
 )
 from bigcodec_lstm import scratch_bytes as lstm_scratch_bytes, prepare_lstm, emit_lstm, tanh_identity, tanh_scratch_bytes, TANH_ARGUMENT_LIMIT, TANH_CHUNK_ELEMENTS, _tanh_sram
 from bigcodec_quantizer import quantizer_scratch_bytes, prepare_quantizer, emit_quantizer
-from bigcodec_layout import MemoryLayout, LEGACY_LAYOUT, EXTENDED_LAYOUT, LAYOUTS
+from bigcodec_layout import MemoryLayout, LEGACY_LAYOUT, EXTENDED_LAYOUT, LARGE_PROGRAM_LAYOUT, LAYOUTS
 
 FORMAT = "andromeda.bigcodec.whole-utterance-v1"
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "bigcodec_bin" / "bigcodec-andromeda.bin"
@@ -74,6 +74,12 @@ class Graph:
     output: str
     conv_precision: str = "if8"
     lstm_precision: str = "bf16"
+    lstm_cell_precision: str = "bf16"
+    lstm_tanh_precision: str = "bf16"
+    lstm_math_scope: str = "both"
+    lstm_fused_gates: bool = False
+    center_quantizer_scores: bool = False
+    compensated_codebook: bool = False
     output_address: int = shared.TENSOR_BASE
     output_bytes: int = 0
     tokens_address: int = 0
@@ -105,7 +111,9 @@ def convolution_reuse_pixels(module) -> int:
     return max(1, min(CONV_MAX_REUSE_PIXELS, CONV_STREAM_BUDGET_PER_64_OUTPUTS // bytes_per_pixel))
 
 
-def build_graph(encoder, decoder, compiled_samples: int, *, conv_precision="if8", lstm_precision="bf16") -> Graph:
+def build_graph(encoder, decoder, compiled_samples: int, *, conv_precision="if8", lstm_precision="bf16",
+                lstm_cell_precision="bf16", lstm_tanh_precision="bf16", lstm_math_scope="both",
+                lstm_fused_gates=False, center_quantizer_scores=False, compensated_codebook=False) -> Graph:
     """Trace module structure and exact lengths without executing neural layers."""
     if compiled_samples < HOP_LENGTH or compiled_samples % HOP_LENGTH:
         raise ValueError("compiled_samples must be a positive multiple of 200")
@@ -113,6 +121,18 @@ def build_graph(encoder, decoder, compiled_samples: int, *, conv_precision="if8"
         raise ValueError("convolution precision must be if8 or bf16")
     if lstm_precision not in ("bf16", "encoder-if8", "if8"):
         raise ValueError("LSTM precision must be bf16, encoder-if8 or if8")
+    if lstm_cell_precision not in ("bf16", "products", "compensated"):
+        raise ValueError("LSTM cell precision must be bf16, products or compensated")
+    if lstm_tanh_precision not in ("bf16", "compensated"):
+        raise ValueError("LSTM tanh precision must be bf16 or compensated")
+    if lstm_math_scope not in ("encoder", "decoder", "both"):
+        raise ValueError("LSTM math scope must be encoder, decoder or both")
+    if not isinstance(lstm_fused_gates, bool):
+        raise ValueError("LSTM fused gates must be a bool")
+    if not isinstance(center_quantizer_scores, bool):
+        raise ValueError("Centered quantizer scores must be a bool")
+    if not isinstance(compensated_codebook, bool):
+        raise ValueError("Compensated codebook must be a bool")
     tensors = {"input": Tensor("input", (compiled_samples, 1), shared.INPUT_BASE)}
     operations = []
 
@@ -169,7 +189,16 @@ def build_graph(encoder, decoder, compiled_samples: int, *, conv_precision="if8"
     if tensors[output].shape != (compiled_samples, 1):
         raise ValueError(f"Decoder output is {tensors[output].shape}, expected {(compiled_samples, 1)}")
     return Graph(compiled_samples, expected_codes[0], tensors, operations, output,
-                 conv_precision, lstm_precision)
+                 conv_precision, lstm_precision, lstm_cell_precision, lstm_tanh_precision, lstm_math_scope,
+                 lstm_fused_gates, center_quantizer_scores, compensated_codebook)
+
+
+def _lstm_numerics(graph, operation):
+    selected = graph.lstm_math_scope == "both" or operation.name.startswith(graph.lstm_math_scope + ".")
+    return dict(compensated_cell=selected and graph.lstm_cell_precision != "bf16",
+                preserve_cell_residual=graph.lstm_cell_precision != "products",
+                compensated_tanh=selected and graph.lstm_tanh_precision == "compensated",
+                fused_projection=selected and graph.lstm_fused_gates)
 
 
 def _bf16_convolutions():
@@ -264,11 +293,11 @@ def plan_memory(graph: Graph, *, layout: MemoryLayout | None = None) -> Graph:
         if layout not in LAYOUTS:
             raise ValueError("Unsupported BigCodec memory layout")
         return _plan_memory(graph, layout)
-    for candidate in LAYOUTS:
+    for candidate in (LEGACY_LAYOUT, EXTENDED_LAYOUT):
         try:
             return _plan_memory(graph, candidate)
         except _TensorCapacityError:
-            if candidate is LAYOUTS[-1]:
+            if candidate is EXTENDED_LAYOUT:
                 raise
     raise AssertionError("No BigCodec layouts configured")
 
@@ -305,7 +334,10 @@ def _plan_memory(graph: Graph, layout: MemoryLayout) -> Graph:
         if operation.op == "activation":
             operation.scratch_bytes = activation_scratch_bytes(shape)
         elif operation.op == "lstm":
-            operation.scratch_bytes = lstm_scratch_bytes(shape)
+            numerics = _lstm_numerics(graph, operation)
+            operation.scratch_bytes = lstm_scratch_bytes(shape,
+                compensated_cell=numerics["compensated_cell"],
+                preserve_cell_residual=numerics["preserve_cell_residual"])
         elif operation.op == "quantizer":
             operation.scratch_bytes = quantizer_scratch_bytes(shape[0])
         elif operation.op == "tanh":
@@ -373,11 +405,12 @@ def _prepare_operation(graph, image, identity_address, zero_address, operation):
             input_address=source.address, output_address=output.address,
             scratch_address=graph.scratch_address, identity_address=identity_address,
             zero_address=zero_address, skip=module.skip,
-            recurrent_precision=recurrent_precision)
+            recurrent_precision=recurrent_precision, **_lstm_numerics(graph, operation))
     elif operation.op == "quantizer":
         operation.plan = prepare_quantizer(module, image, frames=source.shape[0],
             source_address=source.address, destination_address=output.address,
-            scratch_address=graph.scratch_address, token_address=graph.tokens_address)
+            scratch_address=graph.scratch_address, token_address=graph.tokens_address,
+            center_scores=graph.center_quantizer_scores, compensated_codebook=graph.compensated_codebook)
     elif _waveform_tanh(graph, operation):
         mask = torch.zeros(TANH_CHUNK_ELEMENTS, dtype=torch.bfloat16)
         mask[::WAVEFORM_ROW_LANES] = 1
@@ -431,22 +464,41 @@ def emit_operation(engine, graph, operation, identity_address, zero_address):
         raise AssertionError(operation.op)
 
 
-def compile_models(encoder, decoder, *, samples: int, conv_precision="if8", lstm_precision="bf16") -> dict:
-    try:
-        return _compile_models(encoder, decoder, samples=samples,
-            conv_precision=conv_precision, lstm_precision=lstm_precision)
-    except _ModelCapacityError as error:
-        if error.layout != LEGACY_LAYOUT:
-            raise
-    # Replan all addresses before recapturing. Existing short bins retain
-    # their exact parameters/instructions; no shared model constants change.
-    return _compile_models(encoder, decoder, samples=samples,
-        conv_precision=conv_precision, lstm_precision=lstm_precision,
-        memory_layout=EXTENDED_LAYOUT)
+def compile_models(encoder, decoder, *, samples: int, conv_precision="if8", lstm_precision="bf16",
+                   lstm_cell_precision="bf16", lstm_tanh_precision="bf16", lstm_math_scope="both",
+                   lstm_fused_gates=False, center_quantizer_scores=False, compensated_codebook=False,
+                   memory_layout=None) -> dict:
+    if memory_layout is not None and memory_layout not in LAYOUTS:
+        raise ValueError("Unsupported BigCodec memory layout")
+    layout = memory_layout
+    while True:
+        try:
+            return _compile_models(encoder, decoder, samples=samples,
+                conv_precision=conv_precision, lstm_precision=lstm_precision,
+                lstm_cell_precision=lstm_cell_precision, lstm_tanh_precision=lstm_tanh_precision,
+                lstm_math_scope=lstm_math_scope, lstm_fused_gates=lstm_fused_gates,
+                center_quantizer_scores=center_quantizer_scores,
+                compensated_codebook=compensated_codebook,
+                memory_layout=layout)
+        except _ModelCapacityError as error:
+            if memory_layout is not None:
+                raise
+            if layout is not None and error.layout != layout:
+                raise
+            if error.layout == LEGACY_LAYOUT:
+                layout = EXTENDED_LAYOUT
+            elif error.layout == EXTENDED_LAYOUT:
+                layout = LARGE_PROGRAM_LAYOUT
+            else:
+                raise
+        # Replan every address before recapturing into the next accepted arena.
 
 
 def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
-                    lstm_precision="bf16", memory_layout=None) -> dict:
+                    lstm_precision="bf16", lstm_cell_precision="bf16", lstm_tanh_precision="bf16",
+                    lstm_math_scope="both", lstm_fused_gates=False, center_quantizer_scores=False,
+                    compensated_codebook=False,
+                    memory_layout=None) -> dict:
     if encoder.training or decoder.training:
         raise ValueError("Compile eval models loaded with remove_weight_norm=True")
     if any(name.endswith(("weight_g", "weight_v"))
@@ -454,15 +506,26 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
         raise ValueError("Remove all weight normalization before reading compile-time weights")
     compiled_samples = compiled_sample_count(samples)
     graph = plan_memory(build_graph(encoder, decoder, compiled_samples,
-                                   conv_precision=conv_precision, lstm_precision=lstm_precision),
+                                   conv_precision=conv_precision, lstm_precision=lstm_precision,
+                                   lstm_cell_precision=lstm_cell_precision,
+                                   lstm_tanh_precision=lstm_tanh_precision, lstm_math_scope=lstm_math_scope,
+                                   lstm_fused_gates=lstm_fused_gates,
+                                   center_quantizer_scores=center_quantizer_scores,
+                                   compensated_codebook=compensated_codebook),
                         layout=memory_layout)
     layout = graph.layout
     image = shared._ImageBuilder(layout.model_base, layout.model_limit)
     zero_address = image.allocate(torch.zeros(udc.URAM_NEAR_FULL_SIZE // 2, dtype=torch.bfloat16), alignment=128)
     identity_address = image.allocate(torch.eye(64, dtype=torch.bfloat16), alignment=128)
     previous_axi_width = udc.UE_AXI_DATA_WIDTH_BITS
+    previous_capture_limit = udc.MAX_DECODER_INSTRUCTIONS
     try:
         udc.UE_AXI_DATA_WIDTH_BITS = 256
+        # The shared emitter's 768 MiB default predates these long programs.
+        # Keep an offline upper bound for the visible DRAM span; the exact
+        # model-arena check below still rejects overflow after each operation.
+        udc.MAX_DECODER_INSTRUCTIONS = max(previous_capture_limit,
+            (layout.tensor_limit - layout.input_base) // udc.INSTRUCTION_SIZE_BYTES)
         prepare_operations(graph, image, identity_address, zero_address)
         parameter_bytes = len(image.data)
         program_address = image.align(128)
@@ -478,7 +541,7 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
             operations.append({"name": operation.name, "op": operation.op,
                 "start": start, "stop": stop, "inputs": list(operation.inputs),
                 "output": operation.output, "weight_reuse_pixels": operation.weight_reuse_pixels})
-            if program_address + (stop + 2) * udc.INSTRUCTION_SIZE_BYTES > layout.model_limit:
+            if program_address + aligned((stop + 1) * udc.INSTRUCTION_SIZE_BYTES, 64) > layout.model_limit:
                 counts = Counter()
                 for entry in operations:
                     counts[entry["op"]] += entry["stop"] - entry["start"]
@@ -501,8 +564,10 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
         image.write(program_address, program)
     finally:
         udc.UE_AXI_DATA_WIDTH_BITS = previous_axi_width
+        udc.MAX_DECODER_INSTRUCTIONS = previous_capture_limit
     model_image = torch.frombuffer(image.data, dtype=torch.uint8).clone()
     hardware = {
+        "memory_layout": layout.name,
         "model_base": layout.model_base, "model_limit": layout.model_limit,
         "model_image": model_image,
         "model_sha256": hashlib.sha256(image.data).hexdigest(),
@@ -527,6 +592,11 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
         "full_utterance": True, "all_neural_operations_on_device": True,
         "precision": {"convolutions": "IF8-INT" if conv_precision == "if8" else "BF16",
             "activations": "BF16", "lstm_input_weights": "BF16",
+            "lstm_cell": lstm_cell_precision,
+            "lstm_tanh": lstm_tanh_precision, "lstm_math_scope": lstm_math_scope,
+            "lstm_fused_gates": lstm_fused_gates,
+            "center_quantizer_scores": center_quantizer_scores,
+            "compensated_codebook": compensated_codebook,
             "lstm_recurrent_weights": {
                 "encoder": "BF16" if lstm_precision == "bf16" else "IF8-INT",
                 "decoder": "IF8-INT" if lstm_precision == "if8" else "BF16"}},
@@ -537,7 +607,12 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
                   "maximum_output_rows_per_tile": 1024}),
         "execution_optimizations": {
             "activation": "SRAM FIR and Snake tiles; native wide MAXPOOL clamp",
-            "lstm": "SRAM recurrent gates and state updates with BF16 Pade tanh",
+            "lstm": {
+                "math_scope": lstm_math_scope,
+                "cell_arithmetic": lstm_cell_precision,
+                "tanh_arithmetic": lstm_tanh_precision,
+                "fused_projection_bias_sigmoid": lstm_fused_gates,
+            },
             "quantizer": "SRAM comparison masks and first seven tournament rounds",
             "waveform_tanh": "SRAM Pade evaluation with full 128-byte sample rows and explicit zero padding",
         },
@@ -546,8 +621,12 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
             "alias_free_filters": "symmetric BF16, exact unit DC, nearest L2 within +/-2 ULP",
             "broadcast_scalars": "BF16 round-to-nearest-even before device encoding",
             "tanh": "BF16 odd Pade [7/6] with native reciprocal",
+            "lstm_tanh": ("BF16 high/low Pade coefficients, products and sums with reciprocal refinement"
+                if lstm_tanh_precision == "compensated" else "BF16 Pade"),
             "tanh_argument_clamp": TANH_ARGUMENT_LIMIT, "tanh_output_clamp": [-1, 1],
             "quantizer": "BF16 nearest normalized-codebook tournament",
+            "quantizer_score_offset_before_writeback": -1 if center_quantizer_scores else 0,
+            "quantizer_codebook_residual_lanes": 8 if compensated_codebook else 0,
             "accuracy_status": "requires comparison with the official CPU model"},
         "hardware": hardware}
 
@@ -561,6 +640,20 @@ def main():
     parser.add_argument("--conv-precision", choices=("if8", "bf16"), default="if8")
     parser.add_argument("--lstm-precision", choices=("bf16", "encoder-if8", "if8"), default="bf16",
                         help="Recurrent weight precision; input projections and gate/state math stay BF16")
+    parser.add_argument("--lstm-cell-precision", choices=("bf16", "products", "compensated"), default="bf16",
+                        help="Cell update arithmetic; products corrects product rounding, compensated also carries a cell residual")
+    parser.add_argument("--lstm-tanh-precision", choices=("bf16", "compensated"), default="bf16",
+                        help="LSTM tanh arithmetic; compensated preserves intermediate residuals")
+    parser.add_argument("--lstm-math-scope", choices=("encoder", "decoder", "both"), default="both",
+                        help="LSTM stacks that use the selected cell/tanh arithmetic")
+    parser.add_argument("--lstm-fused-gates", action=argparse.BooleanOptionalAction, default=False,
+                        help="Fuse recurrent dot, input projection bias and sigmoid before BF16 writeback")
+    parser.add_argument("--center-quantizer-scores", action=argparse.BooleanOptionalAction, default=False,
+                        help="Subtract one inside the codebook dot product to preserve close score differences")
+    parser.add_argument("--compensated-codebook", action=argparse.BooleanOptionalAction, default=False,
+                        help="Use spare dot-product lanes for BF16 codebook residuals")
+    parser.add_argument("--memory-layout", choices=("auto", *(layout.name for layout in LAYOUTS)),
+                        default="auto", help="Auto replans larger programs; an explicit arena avoids retrying compilation")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--cpu-core", type=int)
@@ -587,7 +680,13 @@ def main():
     # Shared planners print per-tile diagnostics; retain a quiet compile command.
     with contextlib.redirect_stdout(io.StringIO()):
         payload = compile_models(encoder, decoder, samples=samples,
-                                 conv_precision=args.conv_precision, lstm_precision=args.lstm_precision)
+                                 conv_precision=args.conv_precision, lstm_precision=args.lstm_precision,
+                                 lstm_cell_precision=args.lstm_cell_precision,
+                                 lstm_tanh_precision=args.lstm_tanh_precision,
+                                 lstm_math_scope=args.lstm_math_scope, lstm_fused_gates=args.lstm_fused_gates,
+                                 center_quantizer_scores=args.center_quantizer_scores,
+                                 compensated_codebook=args.compensated_codebook,
+                                 memory_layout=next((layout for layout in LAYOUTS if layout.name == args.memory_layout), None))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(prefix="bigcodec-", suffix=".tmp", dir=args.output.parent)
     os.close(fd)
@@ -601,6 +700,12 @@ def main():
     report = {"bin": str(args.output), "bin_sha256": sha256_file(args.output),
         "convolution_precision": args.conv_precision,
         "lstm_recurrent_precision": args.lstm_precision,
+        "lstm_cell_precision": args.lstm_cell_precision,
+        "lstm_tanh_precision": args.lstm_tanh_precision, "lstm_math_scope": args.lstm_math_scope,
+        "lstm_fused_gates": args.lstm_fused_gates,
+        "center_quantizer_scores": args.center_quantizer_scores,
+        "compensated_codebook": args.compensated_codebook,
+        "memory_layout": payload["hardware"]["memory_layout"],
         "bin_bytes": args.output.stat().st_size, "native_samples": samples,
         "compiled_samples": hardware["compiled_samples"], "code_frames": hardware["code_frames"],
         "operations": len(hardware["operations"]), "instructions": hardware["instructions"],

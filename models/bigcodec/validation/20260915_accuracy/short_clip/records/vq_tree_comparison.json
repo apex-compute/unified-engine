@@ -1,0 +1,44 @@
+{
+  "scope": "CPU translation of inspectedlocal5fbb/df0749 RTL finite-normal product tree, compared againstsaved40519 tokens. No newhardwareexecution.",
+  "datasets": [
+    {
+      "name": "baseline",
+      "matches_actual": 317,
+      "matches_official": 310,
+      "mismatched_frames": [],
+      "frame125": {
+        "ids": [
+          5975,
+          6855
+        ],
+        "plain_sum": [
+          0.9338372349739075,
+          0.9340975880622864
+        ],
+        "tree_sum": [
+          0.9338455200195312,
+          0.9341049194335938
+        ],
+        "plain_bf19": [
+          0.93359375,
+          0.93408203125
+        ],
+        "tree_bf19": [
+          0.93408203125,
+          0.93408203125
+        ],
+        "tree_centered_scores": [
+          -0.06591796875,
+          -0.06591796875
+        ]
+      }
+    },
+    {
+      "name": "accurate",
+      "matches_actual": 317,
+      "matches_official": 307,
+      "mismatched_frames": []
+    }
+  ],
+  "status": "complete"
+}

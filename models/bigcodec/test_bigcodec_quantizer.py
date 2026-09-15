@@ -158,7 +158,7 @@ class MemoryEngine:
         self.view(OUTPUT_DRAM_ADDR, M * N).copy_(value.flatten())
 
 
-def fixture(codebook=None, frames=3):
+def fixture(codebook=None, frames=3, *, center_scores=False, compensated_codebook=False):
     generator = torch.Generator().manual_seed(417)
     if codebook is None:
         codebook = torch.randn(CODEBOOK_SIZE, 8, generator=generator)
@@ -172,7 +172,9 @@ def fixture(codebook=None, frames=3):
     engine = MemoryEngine()
     plan = prepare_quantizer(module, engine, source_address=0xA0000000,
                              destination_address=0xA0100000, token_address=0xA0200000,
-                             scratch_address=0xB0000000, frames=frames)
+                             scratch_address=0xB0000000, frames=frames,
+                             center_scores=center_scores,
+                             compensated_codebook=compensated_codebook)
     for address, count in ((plan.source_address, frames * FEATURE_DIM),
                            (plan.destination_address, frames * FEATURE_DIM),
                            (plan.token_address, frames * WIDTH),
@@ -279,6 +281,109 @@ class QuantizerTests(unittest.TestCase):
         torch.testing.assert_close(engine.view(plan.destination_address, expected.numel()).float().reshape_as(expected),
                                    expected, rtol=0, atol=0)
         self.assertTrue(torch.isfinite(expected).all())
+
+    def test_centered_score_epilogue_resolves_rounding_tie_and_keeps_true_ties(self):
+        codebook = torch.zeros(CODEBOOK_SIZE, 8)
+        codebook[:, 0] = -1
+        angles = torch.tensor([0.14371448755264282, 0.14611472189426422])
+        codebook[5:7, 0] = angles.cos()
+        codebook[5:7, 1] = angles.sin()
+        codebook[7] = codebook[6]  # A genuine tie still selects the lower ID.
+        normalized_query = bf16(torch.tensor([1., 1.]) / 2 ** .5)
+        scores = normalized_query @ bf16(F.normalize(codebook[5:7], dim=1))[:, :2].T
+        self.assertGreater(float(scores[1]), float(scores[0]))
+        self.assertEqual(float(bf16(scores)[0]), float(bf16(scores)[1]))
+        for centered, expected in ((False, [5, 0]), (True, [6, 0])):
+            with self.subTest(centered=centered):
+                engine, plan, _ = fixture(codebook, frames=2, center_scores=centered)
+                source = torch.zeros(2, FEATURE_DIM)
+                source[0, :2] = 1
+                engine.view(plan.source_address, source.numel()).copy_(source.flatten())
+                emit_quantizer(engine, plan)
+                ids = decode_split_tokens(engine.view(plan.token_address, 2 * WIDTH).reshape(2, WIDTH))
+                torch.testing.assert_close(ids, torch.tensor(expected))
+                self.assertEqual("score_bias" in plan.constants, centered)
+                if centered:
+                    self.assertTrue((engine.view(plan.constants["score_bias"], CODEBOOK_SIZE) == -1).all())
+
+    def test_centering_default_preserves_legacy_image_and_validates_flag(self):
+        old, old_plan, _ = fixture(frames=1)
+        explicit, explicit_plan, module = fixture(frames=1, center_scores=False)
+        self.assertEqual(old.cursor, explicit.cursor)
+        self.assertEqual(old_plan.constants, explicit_plan.constants)
+        self.assertEqual(old.regions.keys(), explicit.regions.keys())
+        for address in old.regions:
+            torch.testing.assert_close(old.regions[address], explicit.regions[address],
+                                       rtol=0, atol=0, equal_nan=True)
+        before = explicit.cursor
+        with self.assertRaisesRegex(ValueError, "center_scores must be a bool"):
+            prepare_quantizer(module, explicit, source_address=old_plan.source_address,
+                              destination_address=old_plan.destination_address,
+                              token_address=old_plan.token_address,
+                              scratch_address=old_plan.scratch_address, frames=1,
+                              center_scores=1)
+        self.assertEqual(explicit.cursor, before)
+
+    def test_compensated_codebook_packing_and_normalization(self):
+        old, old_plan, _ = fixture(frames=3, center_scores=True)
+        engine, plan, module = fixture(frames=3, center_scores=True, compensated_codebook=True)
+        self.assertEqual(old.cursor, engine.cursor)
+        self.assertEqual(old_plan.constants, plan.constants)
+        weights = engine.view(plan.constants["in_weight"], WIDTH * FEATURE_DIM).reshape(WIDTH, FEATURE_DIM)
+        biases = engine.view(plan.constants["in_bias"], WIDTH)
+        torch.testing.assert_close(weights[:8], weights[8:16], rtol=0, atol=0)
+        torch.testing.assert_close(biases[:8], biases[8:16], rtol=0, atol=0)
+        self.assertTrue((weights[16:] == 0).all())
+        sum_weight = engine.view(plan.constants["sum_weight"], WIDTH * WIDTH).reshape(WIDTH, WIDTH)
+        self.assertTrue((sum_weight[:, :8] == 1).all())
+        self.assertTrue((sum_weight[:, 8:] == 0).all())
+        score_weight = engine.view(plan.constants["score_weight"], CODEBOOK_SIZE * WIDTH).float().reshape(CODEBOOK_SIZE, WIDTH)
+        original = F.normalize(module.codebook.weight, dim=1)[bit_reversed_indices()]
+        original_error = (score_weight[:, :8] - original).double().norm()
+        residual_error = (score_weight[:, :8] + score_weight[:, 8:16] - original).double().norm()
+        self.assertLess(float(residual_error), float(original_error) / 100)
+        self.assertTrue((score_weight[:, 16:] == 0).all())
+
+        source = torch.zeros(3, FEATURE_DIM)
+        source[1:, :8] = torch.randn(2, 8, generator=torch.Generator().manual_seed(913))
+        engine.view(plan.source_address, source.numel()).copy_(source.flatten())
+        emit_quantizer(engine, plan)
+        normalized = engine.view(plan.scratch["normalized"], 3 * WIDTH).float().reshape(3, WIDTH)
+        torch.testing.assert_close(normalized[:, :8], normalized[:, 8:16], rtol=0, atol=0)
+        # A duplicated query must retain the norm of eight coordinates.
+        projected = bf16(source[:, :8])
+        inverse = bf16(torch.rsqrt(bf16(bf16(projected.square()).sum(1, keepdim=True)).clamp_min(1e-24)))
+        expected_query = bf16(projected * inverse)
+        torch.testing.assert_close(normalized[:, :8], expected_query, rtol=0, atol=0)
+        scores = bf16(normalized @ score_weight.T - 1)
+        ordered_ids = bit_reversed_indices()
+        # Undo storage order before argmax so equal scores choose the lowest ID.
+        expected_ids = scores[:, ordered_ids].argmax(1)
+        actual_ids = decode_split_tokens(engine.view(plan.token_address, 3 * WIDTH).reshape(3, WIDTH))
+        torch.testing.assert_close(actual_ids, expected_ids)
+        self.assertEqual(int(actual_ids[0]), 0)
+
+    def test_compensated_codebook_changes_no_instructions_and_rejects_invalid_flag(self):
+        programs = []
+        for compensated in (False, True):
+            image, plan, module = fixture(frames=1, center_scores=True,
+                                          compensated_codebook=compensated)
+            engine = _WholeGraphEngine(0x98000000)
+            with patch.object(udc, "UE_AXI_DATA_WIDTH_BITS", 256), contextlib.redirect_stdout(io.StringIO()):
+                engine.start_capture()
+                emit_quantizer(engine, plan)
+                engine.generate_instruction_halt()
+                engine.stop_capture()
+            programs.append(b"".join(instruction.get_bytes() for instruction in engine.capture_buffer))
+        self.assertEqual(programs[0], programs[1])
+        before = image.cursor
+        with self.assertRaisesRegex(ValueError, "compensated_codebook must be a bool"):
+            prepare_quantizer(module, image, source_address=plan.source_address,
+                              destination_address=plan.destination_address,
+                              token_address=plan.token_address,
+                              scratch_address=plan.scratch_address, frames=1,
+                              compensated_codebook=1)
+        self.assertEqual(image.cursor, before)
 
     def test_order_scratch_bounds_and_reject_overlap(self):
         order = bit_reversed_indices()

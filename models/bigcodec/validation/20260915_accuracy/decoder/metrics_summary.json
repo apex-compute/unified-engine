@@ -1,0 +1,1799 @@
+{
+  "format": "bigcodec-accuracy-comparison-v1",
+  "status": "complete",
+  "generated_utc": "2026-09-15T02:17:18.744999+00:00",
+  "expected_cases": 8,
+  "expected_runs": 16,
+  "completed_runs": 16,
+  "pending": [],
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "settings": {
+    "lstm_math_scope": "decoder",
+    "lstm_cell_precision": "compensated",
+    "lstm_tanh_precision": "compensated",
+    "lstm_fused_gates": true,
+    "convolution_precision": "bf16",
+    "memory_layout": "large-program",
+    "center_quantizer_scores": true,
+    "compensated_codebook": true,
+    "expected_version": 1079090698
+  },
+  "cpu_fp32": {
+    "cases": 8,
+    "duration_s": 173.00981249999998,
+    "processing_s": 402.0213483889984,
+    "processing_rtf": 2.323691024108811,
+    "threads": 1,
+    "core": 7,
+    "precision": "FP32",
+    "tokens_total": 13845
+  },
+  "baseline_all_cases": {
+    "bf16": {
+      "cases": 8,
+      "duration_s": 173.0098125,
+      "processing_s": 829.8471115610064,
+      "processing_rtf": 4.796532055434754,
+      "reference_energy": 14741.102485209847,
+      "error_energy": 1160.4302630332468,
+      "waveform_relative_l2": 0.2805721372349953,
+      "tokens_equal": 12607,
+      "tokens_total": 13845,
+      "token_match_fraction": 0.9105814373420007,
+      "fpga_execution_s": 827.9612711177795,
+      "native_timing_complete": true,
+      "total_elapsed_s": 1136.1683060910054,
+      "total_elapsed_rtf": 6.567074373836486,
+      "bin_ranges": {
+        "parameter_bytes": {
+          "min": 331251584,
+          "max": 331251584
+        },
+        "program_bytes": {
+          "min": 432926784,
+          "max": 500013056
+        },
+        "instructions": {
+          "min": 13528962,
+          "max": 15625408
+        },
+        "resident_bytes": {
+          "min": 764178368,
+          "max": 831264640
+        }
+      }
+    },
+    "if8": {
+      "cases": 8,
+      "duration_s": 173.0098125,
+      "processing_s": 753.5441127449994,
+      "processing_rtf": 4.355499274036838,
+      "reference_energy": 14741.102485209847,
+      "error_energy": 1077.796345372519,
+      "waveform_relative_l2": 0.270397934947358,
+      "tokens_equal": 12617,
+      "tokens_total": 13845,
+      "token_match_fraction": 0.9113037197544239,
+      "fpga_execution_s": 751.6565700945237,
+      "native_timing_complete": true,
+      "total_elapsed_s": 1045.015693664005,
+      "total_elapsed_rtf": 6.040210543919323,
+      "bin_ranges": {
+        "parameter_bytes": {
+          "min": 294682496,
+          "max": 294682496
+        },
+        "program_bytes": {
+          "min": 415282752,
+          "max": 479638016
+        },
+        "instructions": {
+          "min": 12977586,
+          "max": 14988688
+        },
+        "resident_bytes": {
+          "min": 709965248,
+          "max": 774320512
+        }
+      }
+    }
+  },
+  "precision_summaries": {
+    "bf16": {
+      "cases": [
+        "bus",
+        "cafe",
+        "office",
+        "psquare",
+        "bus_low_snr",
+        "cafe_low_snr",
+        "office_low_snr",
+        "psquare_low_snr"
+      ],
+      "before": {
+        "cases": 8,
+        "duration_s": 173.0098125,
+        "processing_s": 829.8471115610064,
+        "processing_rtf": 4.796532055434754,
+        "reference_energy": 14741.102485209847,
+        "error_energy": 1160.4302630332468,
+        "waveform_relative_l2": 0.2805721372349953,
+        "tokens_equal": 12607,
+        "tokens_total": 13845,
+        "token_match_fraction": 0.9105814373420007,
+        "fpga_execution_s": 827.9612711177795,
+        "native_timing_complete": true,
+        "total_elapsed_s": 1136.1683060910054,
+        "total_elapsed_rtf": 6.567074373836486,
+        "bin_ranges": {
+          "parameter_bytes": {
+            "min": 331251584,
+            "max": 331251584
+          },
+          "program_bytes": {
+            "min": 432926784,
+            "max": 500013056
+          },
+          "instructions": {
+            "min": 13528962,
+            "max": 15625408
+          },
+          "resident_bytes": {
+            "min": 764178368,
+            "max": 831264640
+          }
+        }
+      },
+      "after": {
+        "cases": 8,
+        "duration_s": 173.0098125,
+        "processing_s": 834.6271637229911,
+        "processing_rtf": 4.824160847657072,
+        "reference_energy": 14741.102485209847,
+        "error_energy": 844.8858720192609,
+        "waveform_relative_l2": 0.23940545465201862,
+        "tokens_equal": 12796,
+        "tokens_total": 13845,
+        "token_match_fraction": 0.9242325749368003,
+        "fpga_execution_s": 832.7215999039761,
+        "native_timing_complete": true,
+        "total_elapsed_s": 1241.6261813570018,
+        "total_elapsed_rtf": 7.1766228944789,
+        "bin_ranges": {
+          "parameter_bytes": {
+            "min": 331267968,
+            "max": 331267968
+          },
+          "program_bytes": {
+            "min": 589888192,
+            "max": 681269056
+          },
+          "instructions": {
+            "min": 18434006,
+            "max": 21289658
+          },
+          "resident_bytes": {
+            "min": 921156160,
+            "max": 1012537024
+          }
+        }
+      },
+      "waveform_case_counts": {
+        "improved": 8,
+        "regressed": 0,
+        "unchanged": 0
+      },
+      "regressed_cases": [],
+      "improved_cases": [
+        "bus",
+        "cafe",
+        "office",
+        "psquare",
+        "bus_low_snr",
+        "cafe_low_snr",
+        "office_low_snr",
+        "psquare_low_snr"
+      ]
+    },
+    "if8": {
+      "cases": [
+        "bus",
+        "cafe",
+        "office",
+        "psquare",
+        "bus_low_snr",
+        "cafe_low_snr",
+        "office_low_snr",
+        "psquare_low_snr"
+      ],
+      "before": {
+        "cases": 8,
+        "duration_s": 173.0098125,
+        "processing_s": 753.5441127449994,
+        "processing_rtf": 4.355499274036838,
+        "reference_energy": 14741.102485209847,
+        "error_energy": 1077.796345372519,
+        "waveform_relative_l2": 0.270397934947358,
+        "tokens_equal": 12617,
+        "tokens_total": 13845,
+        "token_match_fraction": 0.9113037197544239,
+        "fpga_execution_s": 751.6565700945237,
+        "native_timing_complete": true,
+        "total_elapsed_s": 1045.015693664005,
+        "total_elapsed_rtf": 6.040210543919323,
+        "bin_ranges": {
+          "parameter_bytes": {
+            "min": 294682496,
+            "max": 294682496
+          },
+          "program_bytes": {
+            "min": 415282752,
+            "max": 479638016
+          },
+          "instructions": {
+            "min": 12977586,
+            "max": 14988688
+          },
+          "resident_bytes": {
+            "min": 709965248,
+            "max": 774320512
+          }
+        }
+      },
+      "after": {
+        "cases": 8,
+        "duration_s": 173.0098125,
+        "processing_s": 758.244622324004,
+        "processing_rtf": 4.3826683086198015,
+        "reference_energy": 14741.102485209847,
+        "error_energy": 873.9987291366665,
+        "waveform_relative_l2": 0.2434952074900681,
+        "tokens_equal": 12778,
+        "tokens_total": 13845,
+        "token_match_fraction": 0.9229324665944384,
+        "fpga_execution_s": 756.3458212873219,
+        "native_timing_complete": true,
+        "total_elapsed_s": 1153.6643821610014,
+        "total_elapsed_rtf": 6.66820202559899,
+        "bin_ranges": {
+          "parameter_bytes": {
+            "min": 294698880,
+            "max": 294698880
+          },
+          "program_bytes": {
+            "min": 572244160,
+            "max": 660894016
+          },
+          "instructions": {
+            "min": 17882630,
+            "max": 20652938
+          },
+          "resident_bytes": {
+            "min": 866943040,
+            "max": 955592896
+          }
+        }
+      },
+      "waveform_case_counts": {
+        "improved": 7,
+        "regressed": 1,
+        "unchanged": 0
+      },
+      "regressed_cases": [
+        "office"
+      ],
+      "improved_cases": [
+        "bus",
+        "cafe",
+        "psquare",
+        "bus_low_snr",
+        "cafe_low_snr",
+        "office_low_snr",
+        "psquare_low_snr"
+      ]
+    }
+  },
+  "runs": [
+    {
+      "case": "bus",
+      "precision": "bf16",
+      "environment": "Public transit bus (TBUS)",
+      "cohort": "retained_mixed_snr",
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "duration_s": 23.68225,
+      "samples": 378916,
+      "cpu_processing_s": 55.175157690999185,
+      "cpu_rtf": 2.3298106257217617,
+      "before": {
+        "reference_energy": 1854.575545013583,
+        "error_energy": 146.33762467511139,
+        "relative_l2": 0.2809025853262052,
+        "tokens_equal": 1714,
+        "tokens_total": 1895,
+        "finite": true,
+        "duration_s": 23.68225,
+        "processing_s": 113.59055456100214,
+        "rtf": 4.796442675886039,
+        "fpga_execution_s": 113.32920562940737,
+        "total_elapsed_s": 155.21713787799854,
+        "parameter_bytes": 331251584,
+        "program_bytes": 500013056,
+        "instructions": 15625408,
+        "resident_bytes": 831264640
+      },
+      "after": {
+        "reference_energy": 1854.575545013583,
+        "error_energy": 78.32340232229689,
+        "relative_l2": 0.2055055276659087,
+        "tokens_equal": 1736,
+        "tokens_total": 1895,
+        "finite": true,
+        "duration_s": 23.68225,
+        "processing_s": 114.24210366599436,
+        "rtf": 4.823954804378569,
+        "fpga_execution_s": 113.98120330082521,
+        "total_elapsed_s": 169.2787206210014,
+        "parameter_bytes": 331267968,
+        "program_bytes": 681269056,
+        "instructions": 21289658,
+        "resident_bytes": 1012537024
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.0753970576602965,
+      "tokens_equal_change": 22,
+      "rtf_change": 0.027512128492530152,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 1012578351,
+      "after_bin_sha256": "82bc6f6441b461ea46e5db7d4d3855b200f973c399376be2ad4cb17bee71a1a9",
+      "after_scratch_bytes": 436608000
+    },
+    {
+      "case": "bus",
+      "precision": "if8",
+      "environment": "Public transit bus (TBUS)",
+      "cohort": "retained_mixed_snr",
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "duration_s": 23.68225,
+      "samples": 378916,
+      "cpu_processing_s": 55.175157690999185,
+      "cpu_rtf": 2.3298106257217617,
+      "before": {
+        "reference_energy": 1854.575545013583,
+        "error_energy": 139.75123747471935,
+        "relative_l2": 0.27450835464771367,
+        "tokens_equal": 1708,
+        "tokens_total": 1895,
+        "finite": true,
+        "duration_s": 23.68225,
+        "processing_s": 103.13637211900277,
+        "rtf": 4.355007320630547,
+        "fpga_execution_s": 102.88500337884471,
+        "total_elapsed_s": 142.84256142899903,
+        "parameter_bytes": 294682496,
+        "program_bytes": 479638016,
+        "instructions": 14988688,
+        "resident_bytes": 774320512
+      },
+      "after": {
+        "reference_energy": 1854.575545013583,
+        "error_energy": 91.56670812676403,
+        "relative_l2": 0.22220126972302304,
+        "tokens_equal": 1738,
+        "tokens_total": 1895,
+        "finite": true,
+        "duration_s": 23.68225,
+        "processing_s": 103.77955908500007,
+        "rtf": 4.382166351803569,
+        "fpga_execution_s": 103.5266414523631,
+        "total_elapsed_s": 157.69114920599895,
+        "parameter_bytes": 294698880,
+        "program_bytes": 660894016,
+        "instructions": 20652938,
+        "resident_bytes": 955592896
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.05230708492469063,
+      "tokens_equal_change": 30,
+      "rtf_change": 0.02715903117302254,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 955634223,
+      "after_bin_sha256": "6eba27db0855d2ff4c1e0592aef00e48866690d2a4bd3e7b4a9371e4dd699f53",
+      "after_scratch_bytes": 436608000
+    },
+    {
+      "case": "cafe",
+      "precision": "bf16",
+      "environment": "Cafe terrace at a public square (SCAFE)",
+      "cohort": "retained_mixed_snr",
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "duration_s": 20.509125,
+      "samples": 328146,
+      "cpu_processing_s": 47.514891925000484,
+      "cpu_rtf": 2.316768361643926,
+      "before": {
+        "reference_energy": 1810.7900888599197,
+        "error_energy": 87.33031117937688,
+        "relative_l2": 0.21960814798900385,
+        "tokens_equal": 1503,
+        "tokens_total": 1641,
+        "finite": true,
+        "duration_s": 20.509125,
+        "processing_s": 98.33547912200083,
+        "rtf": 4.794718405685314,
+        "fpga_execution_s": 98.11870890922731,
+        "total_elapsed_s": 134.24628380800277,
+        "parameter_bytes": 331251584,
+        "program_bytes": 432926784,
+        "instructions": 13528962,
+        "resident_bytes": 764178368
+      },
+      "after": {
+        "reference_energy": 1810.7900888599197,
+        "error_energy": 82.39589815665093,
+        "relative_l2": 0.21331369652185916,
+        "tokens_equal": 1528,
+        "tokens_total": 1641,
+        "finite": true,
+        "duration_s": 20.509125,
+        "processing_s": 98.9022908529987,
+        "rtf": 4.822355456558907,
+        "fpga_execution_s": 98.68311516279071,
+        "total_elapsed_s": 145.69039171400073,
+        "parameter_bytes": 331267968,
+        "program_bytes": 589888192,
+        "instructions": 18434006,
+        "resident_bytes": 921156160
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.0062944514671446905,
+      "tokens_equal_change": 25,
+      "rtf_change": 0.027637050873592806,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 921197487,
+      "after_bin_sha256": "95c69ffd96b96a77c83c52329249618f1b82894b04c15ac216024911ddc18fd6",
+      "after_scratch_bytes": 378086400
+    },
+    {
+      "case": "cafe",
+      "precision": "if8",
+      "environment": "Cafe terrace at a public square (SCAFE)",
+      "cohort": "retained_mixed_snr",
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "duration_s": 20.509125,
+      "samples": 328146,
+      "cpu_processing_s": 47.514891925000484,
+      "cpu_rtf": 2.316768361643926,
+      "before": {
+        "reference_energy": 1810.7900888599197,
+        "error_energy": 110.92211375511663,
+        "relative_l2": 0.24749989219993312,
+        "tokens_equal": 1514,
+        "tokens_total": 1641,
+        "finite": true,
+        "duration_s": 20.509125,
+        "processing_s": 89.29582454799674,
+        "rtf": 4.353955839071474,
+        "fpga_execution_s": 89.07480702175545,
+        "total_elapsed_s": 124.20523682899875,
+        "parameter_bytes": 294682496,
+        "program_bytes": 415282752,
+        "instructions": 12977586,
+        "resident_bytes": 709965248
+      },
+      "after": {
+        "reference_energy": 1810.7900888599197,
+        "error_energy": 88.86467171678478,
+        "relative_l2": 0.2215289637740579,
+        "tokens_equal": 1520,
+        "tokens_total": 1641,
+        "finite": true,
+        "duration_s": 20.509125,
+        "processing_s": 89.85072454300462,
+        "rtf": 4.381012088180486,
+        "fpga_execution_s": 89.62982183945986,
+        "total_elapsed_s": 136.7312828239992,
+        "parameter_bytes": 294698880,
+        "program_bytes": 572244160,
+        "instructions": 17882630,
+        "resident_bytes": 866943040
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.025970928425875228,
+      "tokens_equal_change": 6,
+      "rtf_change": 0.027056249109012498,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 866984367,
+      "after_bin_sha256": "1a2347a9ae059535d09f5f7c3a5c002a0746e4eb02e20cda9e3fc3cc819d8b61",
+      "after_scratch_bytes": 378086400
+    },
+    {
+      "case": "office",
+      "precision": "bf16",
+      "environment": "Small office with three people using computers (OOFFICE)",
+      "cohort": "retained_mixed_snr",
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "duration_s": 21.9805,
+      "samples": 351688,
+      "cpu_processing_s": 51.485763919999954,
+      "cpu_rtf": 2.342338159732488,
+      "before": {
+        "reference_energy": 2243.7508500261993,
+        "error_energy": 127.5705415354804,
+        "relative_l2": 0.23844481566992895,
+        "tokens_equal": 1576,
+        "tokens_total": 1759,
+        "finite": true,
+        "duration_s": 21.9805,
+        "processing_s": 105.42844558599973,
+        "rtf": 4.7964534740337905,
+        "fpga_execution_s": 105.19542560840212,
+        "total_elapsed_s": 144.31821125900024,
+        "parameter_bytes": 331251584,
+        "program_bytes": 464183936,
+        "instructions": 14505748,
+        "resident_bytes": 795435520
+      },
+      "after": {
+        "reference_energy": 2243.7508500261993,
+        "error_energy": 113.36725308608645,
+        "relative_l2": 0.22477939430919133,
+        "tokens_equal": 1583,
+        "tokens_total": 1759,
+        "finite": true,
+        "duration_s": 21.9805,
+        "processing_s": 106.03677751899522,
+        "rtf": 4.824129456518061,
+        "fpga_execution_s": 105.80325862265568,
+        "total_elapsed_s": 156.44332667400158,
+        "parameter_bytes": 331267968,
+        "program_bytes": 632431808,
+        "instructions": 19763494,
+        "resident_bytes": 963699776
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.013665421360737617,
+      "tokens_equal_change": 7,
+      "rtf_change": 0.02767598248427028,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 963741103,
+      "after_bin_sha256": "60aa1c454552cb37378b1c272544ef1daf952bcf934148120b0adb6ba3a717fe",
+      "after_scratch_bytes": 405273600
+    },
+    {
+      "case": "office",
+      "precision": "if8",
+      "environment": "Small office with three people using computers (OOFFICE)",
+      "cohort": "retained_mixed_snr",
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "duration_s": 21.9805,
+      "samples": 351688,
+      "cpu_processing_s": 51.485763919999954,
+      "cpu_rtf": 2.342338159732488,
+      "before": {
+        "reference_energy": 2243.7508500261993,
+        "error_energy": 110.3508422394861,
+        "relative_l2": 0.22176883287605254,
+        "tokens_equal": 1567,
+        "tokens_total": 1759,
+        "finite": true,
+        "duration_s": 21.9805,
+        "processing_s": 95.73789598400253,
+        "rtf": 4.355583175269103,
+        "fpga_execution_s": 95.50232361290323,
+        "total_elapsed_s": 132.91144796200024,
+        "parameter_bytes": 294682496,
+        "program_bytes": 445271168,
+        "instructions": 13914724,
+        "resident_bytes": 739953664
+      },
+      "after": {
+        "reference_energy": 2243.7508500261993,
+        "error_energy": 117.52574055397513,
+        "relative_l2": 0.22886489528119133,
+        "tokens_equal": 1580,
+        "tokens_total": 1759,
+        "finite": true,
+        "duration_s": 21.9805,
+        "processing_s": 96.33291200200256,
+        "rtf": 4.382653351925687,
+        "fpga_execution_s": 96.09823078169543,
+        "total_elapsed_s": 144.98526412999854,
+        "parameter_bytes": 294698880,
+        "program_bytes": 613519040,
+        "instructions": 19172470,
+        "resident_bytes": 908217920
+      },
+      "waveform_result": "regressed",
+      "waveform_relative_l2_change": 0.007096062405138798,
+      "tokens_equal_change": 13,
+      "rtf_change": 0.027070176656583733,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 908259247,
+      "after_bin_sha256": "877920cd14e5d6d4b2c217e3ea35fd94e4d6efbed831d150e73395a707966d9e",
+      "after_scratch_bytes": 405273600
+    },
+    {
+      "case": "psquare",
+      "precision": "bf16",
+      "environment": "Public town square with tourists (SPSQUARE)",
+      "cohort": "retained_mixed_snr",
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "duration_s": 21.473375,
+      "samples": 343574,
+      "cpu_processing_s": 48.947402970999974,
+      "cpu_rtf": 2.2794461965573634,
+      "before": {
+        "reference_energy": 1804.0364112958182,
+        "error_energy": 201.84144095222547,
+        "relative_l2": 0.33448952331509124,
+        "tokens_equal": 1546,
+        "tokens_total": 1718,
+        "finite": true,
+        "duration_s": 21.473375,
+        "processing_s": 102.9790195720052,
+        "rtf": 4.7956606528785155,
+        "fpga_execution_s": 102.74473314328583,
+        "total_elapsed_s": 141.59713209300025,
+        "parameter_bytes": 331251584,
+        "program_bytes": 453436352,
+        "instructions": 14169886,
+        "resident_bytes": 784687936
+      },
+      "after": {
+        "reference_energy": 1804.0364112958182,
+        "error_energy": 159.89962090103668,
+        "relative_l2": 0.2977152406717768,
+        "tokens_equal": 1569,
+        "tokens_total": 1718,
+        "finite": true,
+        "duration_s": 21.473375,
+        "processing_s": 103.58564745299736,
+        "rtf": 4.8239108874593475,
+        "fpga_execution_s": 103.33358173143286,
+        "total_elapsed_s": 154.46381712999937,
+        "parameter_bytes": 331267968,
+        "program_bytes": 617762688,
+        "instructions": 19305084,
+        "resident_bytes": 949030656
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.03677428264331445,
+      "tokens_equal_change": 23,
+      "rtf_change": 0.02825023458083198,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 949071983,
+      "after_bin_sha256": "42874acc576521bdcc617e3c9714308cfdcfb8e22bd4ed1507b852447ab89409",
+      "after_scratch_bytes": 395827200
+    },
+    {
+      "case": "psquare",
+      "precision": "if8",
+      "environment": "Public town square with tourists (SPSQUARE)",
+      "cohort": "retained_mixed_snr",
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "duration_s": 21.473375,
+      "samples": 343574,
+      "cpu_processing_s": 48.947402970999974,
+      "cpu_rtf": 2.2794461965573634,
+      "before": {
+        "reference_energy": 1804.0364112958182,
+        "error_energy": 219.24609146027046,
+        "relative_l2": 0.3486127610779719,
+        "tokens_equal": 1538,
+        "tokens_total": 1718,
+        "finite": true,
+        "duration_s": 21.473375,
+        "processing_s": 93.51513060599973,
+        "rtf": 4.354933987135219,
+        "fpga_execution_s": 93.27586030907727,
+        "total_elapsed_s": 129.5377429550026,
+        "parameter_bytes": 294682496,
+        "program_bytes": 434964416,
+        "instructions": 13592638,
+        "resident_bytes": 729646912
+      },
+      "after": {
+        "reference_energy": 1804.0364112958182,
+        "error_energy": 154.6602932805271,
+        "relative_l2": 0.2927970961992516,
+        "tokens_equal": 1566,
+        "tokens_total": 1718,
+        "finite": true,
+        "duration_s": 21.473375,
+        "processing_s": 94.10018909599967,
+        "rtf": 4.382179750318693,
+        "fpga_execution_s": 93.85789148087022,
+        "total_elapsed_s": 144.05622301900075,
+        "parameter_bytes": 294698880,
+        "program_bytes": 599290752,
+        "instructions": 18727836,
+        "resident_bytes": 893989632
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.055815664878720306,
+      "tokens_equal_change": 28,
+      "rtf_change": 0.02724576318347438,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 894030959,
+      "after_bin_sha256": "71f8f2d7897eeb873369915bc6fb23c2147154c16bbeae8afffc0fd8a66734eb",
+      "after_scratch_bytes": 395827200
+    },
+    {
+      "case": "bus_low_snr",
+      "precision": "bf16",
+      "environment": "Public transit bus (TBUS)",
+      "cohort": "low_snr_new_sources",
+      "nominal_snr_db": [
+        2.5
+      ],
+      "duration_s": 20.8791875,
+      "samples": 334067,
+      "cpu_processing_s": 48.87914914199973,
+      "cpu_rtf": 2.3410465154355133,
+      "before": {
+        "reference_energy": 1193.0449569423322,
+        "error_energy": 61.99881676958154,
+        "relative_l2": 0.22796243955008294,
+        "tokens_equal": 1529,
+        "tokens_total": 1671,
+        "finite": true,
+        "duration_s": 20.8791875,
+        "processing_s": 100.16510153700074,
+        "rtf": 4.79736587149288,
+        "fpga_execution_s": 99.93273475168793,
+        "total_elapsed_s": 136.60038378099853,
+        "parameter_bytes": 331251584,
+        "program_bytes": 440948288,
+        "instructions": 13779634,
+        "resident_bytes": 772199872
+      },
+      "after": {
+        "reference_energy": 1193.0449569423322,
+        "error_energy": 54.85041137555997,
+        "relative_l2": 0.21441814768528678,
+        "tokens_equal": 1556,
+        "tokens_total": 1671,
+        "finite": true,
+        "duration_s": 20.8791875,
+        "processing_s": 100.73947469699851,
+        "rtf": 4.824875235063554,
+        "fpga_execution_s": 100.5087168912228,
+        "total_elapsed_s": 150.58942115199898,
+        "parameter_bytes": 331267968,
+        "program_bytes": 600779136,
+        "instructions": 18774348,
+        "resident_bytes": 932047104
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.013544291864796165,
+      "tokens_equal_change": 27,
+      "rtf_change": 0.02750936357067424,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 932088431,
+      "after_bin_sha256": "e087c8cdd47aa35fcb794620c2dd88408171d4b9ded6283d67bbfd5b1b4c5b67",
+      "after_scratch_bytes": 384998400
+    },
+    {
+      "case": "bus_low_snr",
+      "precision": "if8",
+      "environment": "Public transit bus (TBUS)",
+      "cohort": "low_snr_new_sources",
+      "nominal_snr_db": [
+        2.5
+      ],
+      "duration_s": 20.8791875,
+      "samples": 334067,
+      "cpu_processing_s": 48.87914914199973,
+      "cpu_rtf": 2.3410465154355133,
+      "before": {
+        "reference_energy": 1193.0449569423322,
+        "error_energy": 69.53014573828983,
+        "relative_l2": 0.2414116171072295,
+        "tokens_equal": 1531,
+        "tokens_total": 1671,
+        "finite": true,
+        "duration_s": 20.8791875,
+        "processing_s": 90.95306304500627,
+        "rtf": 4.356159119937319,
+        "fpga_execution_s": 90.72302763690924,
+        "total_elapsed_s": 125.8824683519997,
+        "parameter_bytes": 294682496,
+        "program_bytes": 422981696,
+        "instructions": 13218178,
+        "resident_bytes": 717664192
+      },
+      "after": {
+        "reference_energy": 1193.0449569423322,
+        "error_energy": 55.21396443112428,
+        "relative_l2": 0.21512756470169747,
+        "tokens_equal": 1553,
+        "tokens_total": 1671,
+        "finite": true,
+        "duration_s": 20.8791875,
+        "processing_s": 91.52433778399791,
+        "rtf": 4.383520085922783,
+        "fpga_execution_s": 91.28957229707429,
+        "total_elapsed_s": 139.49658935800107,
+        "parameter_bytes": 294698880,
+        "program_bytes": 582812544,
+        "instructions": 18212892,
+        "resident_bytes": 877511424
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.026284052405532027,
+      "tokens_equal_change": 22,
+      "rtf_change": 0.02736096598546478,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 877552751,
+      "after_bin_sha256": "2b027c8ce84b90ee9a2857cac00cf4408d38dd13cc4a021d6762c70d69da06fc",
+      "after_scratch_bytes": 384998400
+    },
+    {
+      "case": "cafe_low_snr",
+      "precision": "bf16",
+      "environment": "Cafe terrace at a public square (SCAFE)",
+      "cohort": "low_snr_new_sources",
+      "nominal_snr_db": [
+        2.5
+      ],
+      "duration_s": 21.465625,
+      "samples": 343450,
+      "cpu_processing_s": 49.84167173199967,
+      "cpu_rtf": 2.321929677426102,
+      "before": {
+        "reference_energy": 1744.519854172468,
+        "error_energy": 238.67815476098752,
+        "relative_l2": 0.3698864120327447,
+        "tokens_equal": 1598,
+        "tokens_total": 1718,
+        "finite": true,
+        "duration_s": 21.465625,
+        "processing_s": 102.98250868099785,
+        "rtf": 4.79755463355937,
+        "fpga_execution_s": 102.74484342685672,
+        "total_elapsed_s": 141.87532315000135,
+        "parameter_bytes": 331251584,
+        "program_bytes": 453436352,
+        "instructions": 14169886,
+        "resident_bytes": 784687936
+      },
+      "after": {
+        "reference_energy": 1744.519854172468,
+        "error_energy": 188.70286766144085,
+        "relative_l2": 0.328890471772619,
+        "tokens_equal": 1622,
+        "tokens_total": 1718,
+        "finite": true,
+        "duration_s": 21.465625,
+        "processing_s": 103.57233467600236,
+        "rtf": 4.825032333137393,
+        "fpga_execution_s": 103.3333726871718,
+        "total_elapsed_s": 155.42063476399926,
+        "parameter_bytes": 331267968,
+        "program_bytes": 617762688,
+        "instructions": 19305084,
+        "resident_bytes": 949030656
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.04099594026012571,
+      "tokens_equal_change": 24,
+      "rtf_change": 0.027477699578023262,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 949071983,
+      "after_bin_sha256": "404a12e241b7a388833c7d386d34071db288446563ce27d0156edd97ac6243df",
+      "after_scratch_bytes": 395827200
+    },
+    {
+      "case": "cafe_low_snr",
+      "precision": "if8",
+      "environment": "Cafe terrace at a public square (SCAFE)",
+      "cohort": "low_snr_new_sources",
+      "nominal_snr_db": [
+        2.5
+      ],
+      "duration_s": 21.465625,
+      "samples": 343450,
+      "cpu_processing_s": 49.84167173199967,
+      "cpu_rtf": 2.321929677426102,
+      "before": {
+        "reference_energy": 1744.519854172468,
+        "error_energy": 226.01871801546423,
+        "relative_l2": 0.3599434254799226,
+        "tokens_equal": 1596,
+        "tokens_total": 1718,
+        "finite": true,
+        "duration_s": 21.465625,
+        "processing_s": 93.51270256899807,
+        "rtf": 4.356393189995543,
+        "fpga_execution_s": 93.27596838409602,
+        "total_elapsed_s": 129.40412340700277,
+        "parameter_bytes": 294682496,
+        "program_bytes": 434964416,
+        "instructions": 13592638,
+        "resident_bytes": 729646912
+      },
+      "after": {
+        "reference_energy": 1744.519854172468,
+        "error_energy": 195.77130929150763,
+        "relative_l2": 0.3349936419972858,
+        "tokens_equal": 1620,
+        "tokens_total": 1718,
+        "finite": true,
+        "duration_s": 21.465625,
+        "processing_s": 94.09486703499715,
+        "rtf": 4.38351396872894,
+        "fpga_execution_s": 93.85795303225807,
+        "total_elapsed_s": 143.50302607900085,
+        "parameter_bytes": 294698880,
+        "program_bytes": 599290752,
+        "instructions": 18727836,
+        "resident_bytes": 893989632
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.024949783482636767,
+      "tokens_equal_change": 24,
+      "rtf_change": 0.0271207787333978,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 894030959,
+      "after_bin_sha256": "e3af4fe432e9029ba66eea69ce564b41205cc7d38a99720c50638889be90501b",
+      "after_scratch_bytes": 395827200
+    },
+    {
+      "case": "office_low_snr",
+      "precision": "bf16",
+      "environment": "Small office with three people using computers (OOFFICE)",
+      "cohort": "low_snr_new_sources",
+      "nominal_snr_db": [
+        2.5
+      ],
+      "duration_s": 21.494375,
+      "samples": 343910,
+      "cpu_processing_s": 49.771177397999054,
+      "cpu_rtf": 2.3155442946351803,
+      "before": {
+        "reference_energy": 1951.9118176410761,
+        "error_energy": 75.26173657543912,
+        "relative_l2": 0.19636180733206593,
+        "tokens_equal": 1551,
+        "tokens_total": 1720,
+        "finite": true,
+        "duration_s": 21.494375,
+        "processing_s": 103.09834732099625,
+        "rtf": 4.796526873705155,
+        "fpga_execution_s": 102.86280560540135,
+        "total_elapsed_s": 140.74135058800312,
+        "parameter_bytes": 331251584,
+        "program_bytes": 453806976,
+        "instructions": 14181468,
+        "resident_bytes": 785058560
+      },
+      "after": {
+        "reference_energy": 1951.9118176410761,
+        "error_energy": 57.60465653901137,
+        "relative_l2": 0.17179032410354408,
+        "tokens_equal": 1582,
+        "tokens_total": 1720,
+        "finite": true,
+        "duration_s": 21.494375,
+        "processing_s": 103.68490276599914,
+        "rtf": 4.8238156618184584,
+        "fpga_execution_s": 103.45215236609154,
+        "total_elapsed_s": 154.28999178400045,
+        "parameter_bytes": 331267968,
+        "program_bytes": 618324608,
+        "instructions": 19322644,
+        "resident_bytes": 949592576
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.024571483228521845,
+      "tokens_equal_change": 31,
+      "rtf_change": 0.027288788113303042,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 949633903,
+      "after_bin_sha256": "d1e134480dca2a9b7b7d3227f6e4fe4160c621459dc99178a656ac51f4535d53",
+      "after_scratch_bytes": 396288000
+    },
+    {
+      "case": "office_low_snr",
+      "precision": "if8",
+      "environment": "Small office with three people using computers (OOFFICE)",
+      "cohort": "low_snr_new_sources",
+      "nominal_snr_db": [
+        2.5
+      ],
+      "duration_s": 21.494375,
+      "samples": 343910,
+      "cpu_processing_s": 49.771177397999054,
+      "cpu_rtf": 2.3155442946351803,
+      "before": {
+        "reference_energy": 1951.9118176410761,
+        "error_energy": 77.13074859246936,
+        "relative_l2": 0.19878503037180362,
+        "tokens_equal": 1571,
+        "tokens_total": 1720,
+        "finite": true,
+        "duration_s": 21.494375,
+        "processing_s": 93.62012252599379,
+        "rtf": 4.355563840585911,
+        "fpga_execution_s": 93.3835183915979,
+        "total_elapsed_s": 130.20258076200116,
+        "parameter_bytes": 294682496,
+        "program_bytes": 435313536,
+        "instructions": 13603548,
+        "resident_bytes": 729996032
+      },
+      "after": {
+        "reference_energy": 1951.9118176410761,
+        "error_energy": 56.495785560278705,
+        "relative_l2": 0.17012883542408608,
+        "tokens_equal": 1582,
+        "tokens_total": 1720,
+        "finite": true,
+        "duration_s": 21.494375,
+        "processing_s": 94.20557875300074,
+        "rtf": 4.3828014889012,
+        "fpga_execution_s": 93.96610174943736,
+        "total_elapsed_s": 143.57207460000063,
+        "parameter_bytes": 294698880,
+        "program_bytes": 599831168,
+        "instructions": 18744724,
+        "resident_bytes": 894530048
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.02865619494771754,
+      "tokens_equal_change": 11,
+      "rtf_change": 0.027237648315288965,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 894571375,
+      "after_bin_sha256": "a23c6a273c87454f131a02734b8b68310bdbbfcf249ff308651af0708d749953",
+      "after_scratch_bytes": 396288000
+    },
+    {
+      "case": "psquare_low_snr",
+      "precision": "bf16",
+      "environment": "Public town square with tourists (SPSQUARE)",
+      "cohort": "low_snr_new_sources",
+      "nominal_snr_db": [
+        2.5
+      ],
+      "duration_s": 21.525375,
+      "samples": 344406,
+      "cpu_processing_s": 50.406133610000325,
+      "cpu_rtf": 2.34170757118054,
+      "before": {
+        "reference_energy": 2138.47296125845,
+        "error_energy": 221.41163658504456,
+        "relative_l2": 0.3217720662442141,
+        "tokens_equal": 1590,
+        "tokens_total": 1723,
+        "finite": true,
+        "duration_s": 21.525375,
+        "processing_s": 103.26765518100365,
+        "rtf": 4.797484605076736,
+        "fpga_execution_s": 103.03281404351088,
+        "total_elapsed_s": 141.57248353400064,
+        "parameter_bytes": 331251584,
+        "program_bytes": 454748096,
+        "instructions": 14210878,
+        "resident_bytes": 785999680
+      },
+      "after": {
+        "reference_energy": 2138.47296125845,
+        "error_energy": 109.7417619771777,
+        "relative_l2": 0.22653435945610625,
+        "tokens_equal": 1620,
+        "tokens_total": 1723,
+        "finite": true,
+        "duration_s": 21.525375,
+        "processing_s": 103.86363209300544,
+        "rtf": 4.82517178413874,
+        "fpga_execution_s": 103.62619914178546,
+        "total_elapsed_s": 155.449877518,
+        "parameter_bytes": 331267968,
+        "program_bytes": 619552640,
+        "instructions": 19361020,
+        "resident_bytes": 950820608
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.09523770678810786,
+      "tokens_equal_change": 30,
+      "rtf_change": 0.027687179062003686,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 950861935,
+      "after_bin_sha256": "5aad53e694c18ddd08d5eaa3bad1063a93582727d2631da030069f6fb1daec64",
+      "after_scratch_bytes": 396979200
+    },
+    {
+      "case": "psquare_low_snr",
+      "precision": "if8",
+      "environment": "Public town square with tourists (SPSQUARE)",
+      "cohort": "low_snr_new_sources",
+      "nominal_snr_db": [
+        2.5
+      ],
+      "duration_s": 21.525375,
+      "samples": 344406,
+      "cpu_processing_s": 50.406133610000325,
+      "cpu_rtf": 2.34170757118054,
+      "before": {
+        "reference_energy": 2138.47296125845,
+        "error_energy": 124.84644809670297,
+        "relative_l2": 0.24162185479559653,
+        "tokens_equal": 1592,
+        "tokens_total": 1723,
+        "finite": true,
+        "duration_s": 21.525375,
+        "processing_s": 93.77300134799953,
+        "rtf": 4.3563933891046975,
+        "fpga_execution_s": 93.53606135933984,
+        "total_elapsed_s": 130.0295319680008,
+        "parameter_bytes": 294682496,
+        "program_bytes": 436222400,
+        "instructions": 13631950,
+        "resident_bytes": 730904896
+      },
+      "after": {
+        "reference_energy": 2138.47296125845,
+        "error_energy": 113.90025617570481,
+        "relative_l2": 0.23078653603733373,
+        "tokens_equal": 1619,
+        "tokens_total": 1723,
+        "finite": true,
+        "duration_s": 21.525375,
+        "processing_s": 94.3564540260013,
+        "rtf": 4.38349873235664,
+        "fpga_execution_s": 94.11960865416354,
+        "total_elapsed_s": 143.6287729450014,
+        "parameter_bytes": 294698880,
+        "program_bytes": 601026944,
+        "instructions": 18782092,
+        "resident_bytes": 895725824
+      },
+      "waveform_result": "improved",
+      "waveform_relative_l2_change": -0.010835318758262796,
+      "tokens_equal_change": 27,
+      "rtf_change": 0.027105343251942138,
+      "memory_layout": "large-program",
+      "lstm_math_scope": "decoder",
+      "center_quantizer_scores": true,
+      "compensated_codebook": true,
+      "after_bin_bytes": 895767151,
+      "after_bin_sha256": "27b6f738d8da071b733eb11f3f3e041ad69d143c0e74f1c5086dacc0da7d9a14",
+      "after_scratch_bytes": 396979200
+    }
+  ],
+  "all_completed_runs_pass_execution_contract": true,
+  "aggregation": "RTF=sum processing_s/sum audio_s; waveform relativeL2=sqrt(sum error_energy/sum CPU reference_energy); tokens=sum matching IDs/sum token IDs.",
+  "waveform_scope": "Official CPU codec reconstruction at original sample indices; no gain/delay/polarity fitting. This is not denoising quality or error against clean speech.",
+  "processing_scope": "Preprocessing, one input upload, native execution, one output read, postprocessing and output WAV/token writes; excludes compilation, artifact load and resident program/parameter upload.",
+  "total_elapsed_scope": "Runner total also includes artifact load/validation and resident upload; excludes compilation, Python startup and final report serialization.",
+  "execution": "Whole utterance per bin; one resident upload, one input upload, one START, one HALT and one output bundle read; zero CPU neural operations. States reset between files.",
+  "hardware": {
+    "platform": "Italy / Kintex UltraScale+ KU5P",
+    "version": "0x40519e0a",
+    "axi_data_width_bits": 256,
+    "clock_mhz": 333.25,
+    "visible_dram_bytes": 2147483648
+  },
+  "evidence": {
+    "batch_manifest": {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/hardware_runs.json",
+      "sha256": "0ff85f140de14c8c91b8e14799972d5cf17e5347d7169d6bc8460a7444d9cac8",
+      "bytes": 147136
+    },
+    "batch_freeze": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/batch_freeze.json",
+      "sha256": "ae128e54f3e489d57540d5b201e345a7779e78c389ee7a4e78aa3c32d6496373",
+      "bytes": 20009
+    },
+    "cpu_manifest": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu_reference_manifest.json",
+      "sha256": "e43e5618382d2625aa76a4345782459f5a33ed909a27dfd36fa2339b083cc28c",
+      "bytes": 25779
+    },
+    "generator": {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/build_accuracy_report.py",
+      "sha256": "fef0afe405ea701b33e384febf9cd13ecdd2139bea499618077ce6a56311ae12",
+      "bytes": 23341
+    },
+    "run_evidence": {
+      "bus_bf16": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.metrics.json",
+          "sha256": "8e2b5f869ac3600a9348967e4c7f0d51ddff272b363be8e733e2ebf903b104af",
+          "bytes": 3396
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.comparison.json",
+          "sha256": "97981740d20fc2daa7b8b3ef450d13615f07f5353aa5521fc6b2c628cda09ede",
+          "bytes": 1741
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/bus_bf16/compile.log",
+          "sha256": "a140f27ac48f76eb4bf3511195b7f6f1bb22c62bb414cde171ce36c5da9621ed",
+          "bytes": 1083
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.wav",
+          "sha256": "2cdb24367220760833115a108983cc9315eb12fdf16ecd03e9026e877dd904cb",
+          "bytes": 1515744
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.tokens.npz",
+          "sha256": "3a419e9624d515598da2f88fd834d7f88db17e2e6efb151f9db8ed4aa0fe99b5",
+          "bytes": 4183
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/bus_bf16/model.bin",
+          "sha256": "82bc6f6441b461ea46e5db7d4d3855b200f973c399376be2ad4cb17bee71a1a9",
+          "bytes": 1012578351
+        }
+      },
+      "bus_if8": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus.metrics.json",
+          "sha256": "374cd7f16a0c405ee15521602f8e0e9a9a607991348cb46873257ab5f84fb3bb",
+          "bytes": 3382
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus.comparison.json",
+          "sha256": "c34c1ee533606a0e5a2789d9b7ca589119978c50b5b748bccdc90a5a9a576c92",
+          "bytes": 1716
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/bus_if8/compile.log",
+          "sha256": "b5e2d4ef0ac5d9c122c59c9586b99113279f6a8ff5b425912321993f2e4ea729",
+          "bytes": 1069
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus.wav",
+          "sha256": "96fb7315f257713f7aabb84dc35c96c65264bc647fa6c8d44ab0eb44198301a7",
+          "bytes": 1515744
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus.tokens.npz",
+          "sha256": "205a384009d45d33ba2e3d8688479ae61e3ac8432098150b7b707fa24a19833e",
+          "bytes": 4184
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/bus_if8/model.bin",
+          "sha256": "6eba27db0855d2ff4c1e0592aef00e48866690d2a4bd3e7b4a9371e4dd699f53",
+          "bytes": 955634223
+        }
+      },
+      "cafe_bf16": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.metrics.json",
+          "sha256": "35863400b809c03e67f1dfc6f4eef860a740266d865382fb3dcee2a358793145",
+          "bytes": 3379
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.comparison.json",
+          "sha256": "767a0cf6fc2f5e06997507b0127b83210d623bf78aa060ee439188a7911909a0",
+          "bytes": 1720
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/cafe_bf16/compile.log",
+          "sha256": "0bf6614b27e097c5ea7efd54a2876f9bdd74ae4a96c23f756f8d821060b031fc",
+          "bytes": 1072
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.wav",
+          "sha256": "f3cbcc9aeaccc3f8c4fe61825a6b373b58bf2b658f240a1163c5c71f33d18011",
+          "bytes": 1312664
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.tokens.npz",
+          "sha256": "5062896d4073cf2fc2b6050363766733c6755037777d30b74c1599772bdf36dd",
+          "bytes": 3704
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/cafe_bf16/model.bin",
+          "sha256": "95c69ffd96b96a77c83c52329249618f1b82894b04c15ac216024911ddc18fd6",
+          "bytes": 921197487
+        }
+      },
+      "cafe_if8": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe.metrics.json",
+          "sha256": "59d0a5efc09a55f748c179f0c3cf7852e1862960afddfa594a2049bd3f37e0d3",
+          "bytes": 3387
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe.comparison.json",
+          "sha256": "cc04ed04093632f9436404a98e8dc0cd50fb9f369b8c227e55e3675bc4ac3bc1",
+          "bytes": 1720
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/cafe_if8/compile.log",
+          "sha256": "35129694166198ba6d1e878c5454bc42f3d7c537f349d653d3229e58df88bea7",
+          "bytes": 1070
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe.wav",
+          "sha256": "c72adf60f2facfc942c00351dc64ea2c8f1bdb0e758ac68d6bba31a67c310a50",
+          "bytes": 1312664
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe.tokens.npz",
+          "sha256": "5ea48d774bf0691b8b9dd606fb422e631796fecd7c141b7dabef1597799934f0",
+          "bytes": 3704
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/cafe_if8/model.bin",
+          "sha256": "1a2347a9ae059535d09f5f7c3a5c002a0746e4eb02e20cda9e3fc3cc819d8b61",
+          "bytes": 866984367
+        }
+      },
+      "office_bf16": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.metrics.json",
+          "sha256": "606e03dfee4a83dbeeeddc7f9c27bd5a4cb53a8ab2b67cbe5d6d29e73ffba8d8",
+          "bytes": 3389
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.comparison.json",
+          "sha256": "acc47598a5c8bf902ab40c2caac82560af540b4b7ae8f3c67014a8ed538589f0",
+          "bytes": 1729
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/office_bf16/compile.log",
+          "sha256": "91de241630cb28e73e6e1ee9ebe6915c0bd40d75a649d2d1c8dfbef2f3b71a10",
+          "bytes": 1074
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.wav",
+          "sha256": "966600affcbf213051cb96deaac30004c9c51c524ef2c2d2e9d758678c430884",
+          "bytes": 1406832
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.tokens.npz",
+          "sha256": "6e87aa6694c194c3ec9dc19f811442dadff1adb0edb5aa6ed9c209dd4c27160d",
+          "bytes": 3870
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/office_bf16/model.bin",
+          "sha256": "60aa1c454552cb37378b1c272544ef1daf952bcf934148120b0adb6ba3a717fe",
+          "bytes": 963741103
+        }
+      },
+      "office_if8": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office.metrics.json",
+          "sha256": "6096b6ef58c25aaa034204063dcfb3b5e58169b22d26a7455c5fe4a20ec8b830",
+          "bytes": 3391
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office.comparison.json",
+          "sha256": "315752ef26fab77f39b6efd8878d867de90b79e61acdfd56fcda9d2b6827bec0",
+          "bytes": 1727
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/office_if8/compile.log",
+          "sha256": "163ceb473103d1198490c7f3e9beaa7461b4c6aa0be9023d001c441502c30717",
+          "bytes": 1072
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office.wav",
+          "sha256": "e2fd4759b344d12df59966559ec408ce03ed8f3e20ca1d9017f17983da63e221",
+          "bytes": 1406832
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office.tokens.npz",
+          "sha256": "eaa3a12ba6e3e66c671dd2790698a2786b71d3ea7c202f3e3caa727edadcc194",
+          "bytes": 3871
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/office_if8/model.bin",
+          "sha256": "877920cd14e5d6d4b2c217e3ea35fd94e4d6efbed831d150e73395a707966d9e",
+          "bytes": 908259247
+        }
+      },
+      "psquare_bf16": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.metrics.json",
+          "sha256": "585877f3cb9458d3d4629d063528bb05310c9b82ef137f20717724ea7d6eb3f5",
+          "bytes": 3394
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.comparison.json",
+          "sha256": "4d1b829f8c6376274c54fce68ffdfc7be2dbbb46c96872ea13748e900d1298d6",
+          "bytes": 1735
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/psquare_bf16/compile.log",
+          "sha256": "bd1a97424ea2896165e1dc60c0bfe045a46127f4811083cea0bd9708d8126f33",
+          "bytes": 1074
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.wav",
+          "sha256": "4009d7328effcb55386baba76ce981204fba52bf4987d3fe8c330e15e2076b8b",
+          "bytes": 1374376
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.tokens.npz",
+          "sha256": "7cb20922586f2e819d068e3bc6b031b3ffe38a3b1d1516db9b8401e236e41008",
+          "bytes": 3863
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/psquare_bf16/model.bin",
+          "sha256": "42874acc576521bdcc617e3c9714308cfdcfb8e22bd4ed1507b852447ab89409",
+          "bytes": 949071983
+        }
+      },
+      "psquare_if8": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare.metrics.json",
+          "sha256": "99750be14309573565463a8b0986cb40a76ecf555d92ae390077c66e793db8ad",
+          "bytes": 3391
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare.comparison.json",
+          "sha256": "94769756c72e9649473cc7b84ecf764ed350716bf2b710be30b557972f9925be",
+          "bytes": 1731
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/psquare_if8/compile.log",
+          "sha256": "09071f9664802812f2bb13c86e01ed21cea347f976abff8d1ed8a6040d79694c",
+          "bytes": 1072
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare.wav",
+          "sha256": "98328fe6fd09a57c56927e419396e1f738a6c9bb29f409488260f2c760e717e4",
+          "bytes": 1374376
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare.tokens.npz",
+          "sha256": "b109fa07af101bfe3ba11a19ad53df7ff2b117d74420bed2d3f1c607c19b27ba",
+          "bytes": 3863
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/psquare_if8/model.bin",
+          "sha256": "71f8f2d7897eeb873369915bc6fb23c2147154c16bbeae8afffc0fd8a66734eb",
+          "bytes": 894030959
+        }
+      },
+      "bus_low_snr_bf16": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.metrics.json",
+          "sha256": "1296954c3ffb67964aa77427187c769a9fa1a563003319a28fba1535abc0563a",
+          "bytes": 3401
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.comparison.json",
+          "sha256": "2fc6d38ec59f98d2f8323a06a72c32197044d28bc3dc1c130c06501a5fa6ad4b",
+          "bytes": 1751
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/bus_low_snr_bf16/compile.log",
+          "sha256": "b0758ea6dd64911763f3d73e55c2e4bd735f6fc584192cb163d878133ab49561",
+          "bytes": 1078
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.wav",
+          "sha256": "8cdfe2a7ccb04e954efb3809a19fb8ce5a2de526dc0688e2a7037c27ddb73c2a",
+          "bytes": 1336348
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.tokens.npz",
+          "sha256": "a59d6049df6fb0892e535429ab8694525778e14c44ad8f52147c9900f905cf45",
+          "bytes": 3742
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/bus_low_snr_bf16/model.bin",
+          "sha256": "e087c8cdd47aa35fcb794620c2dd88408171d4b9ded6283d67bbfd5b1b4c5b67",
+          "bytes": 932088431
+        }
+      },
+      "bus_low_snr_if8": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus_low_snr.metrics.json",
+          "sha256": "5559fe114aff14fe76c305b1b9f59727d32287c5051994785cf52523b3abaae5",
+          "bytes": 3403
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus_low_snr.comparison.json",
+          "sha256": "0f0a175d7229db3a63d26efe531f6e2a511d9f3d53eb1aba1624ed826474740f",
+          "bytes": 1750
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/bus_low_snr_if8/compile.log",
+          "sha256": "fcd27c1e0c842f7218c1713938ea60781e69b5096d191a1d19608430e3ef2b2b",
+          "bytes": 1077
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus_low_snr.wav",
+          "sha256": "1afe541832507b33e36a48dafd15e49d6c208d573bf2ee738ef0681d4c3d4683",
+          "bytes": 1336348
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/bus_low_snr.tokens.npz",
+          "sha256": "d7b4985b14f5942d9261aafa8e6053ba3efb6e123eaef0373457f9fe45659d03",
+          "bytes": 3743
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/bus_low_snr_if8/model.bin",
+          "sha256": "2b027c8ce84b90ee9a2857cac00cf4408d38dd13cc4a021d6762c70d69da06fc",
+          "bytes": 877552751
+        }
+      },
+      "cafe_low_snr_bf16": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.metrics.json",
+          "sha256": "e9dbb9637d7c25d987e05ba542d97816928170538d64bdf1f7c52bf928b2a17f",
+          "bytes": 3401
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.comparison.json",
+          "sha256": "1cc52139067ad1e3761f8ec1f6750d560bab18b80fcc459bb53bf7d33214a1b1",
+          "bytes": 1750
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/cafe_low_snr_bf16/compile.log",
+          "sha256": "d51f370ff5b1cebae5e77d094c7faafe6d638bf014fe314e8df7905e8932bd22",
+          "bytes": 1079
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.wav",
+          "sha256": "1f9b7599d217db008f9d89d52f565535a9559eb18a13524d6ee2d68ffb11d39e",
+          "bytes": 1373880
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.tokens.npz",
+          "sha256": "2663f7cead2378cdd5222ffe8ef158d53861af4298560847f7ecd5649174c4f4",
+          "bytes": 3826
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/cafe_low_snr_bf16/model.bin",
+          "sha256": "404a12e241b7a388833c7d386d34071db288446563ce27d0156edd97ac6243df",
+          "bytes": 949071983
+        }
+      },
+      "cafe_low_snr_if8": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe_low_snr.metrics.json",
+          "sha256": "a39241ab4f71593e179bc61af7bddc59d1563945bbca76d43bea6079fc860a45",
+          "bytes": 3402
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe_low_snr.comparison.json",
+          "sha256": "c0f9033ec6c604a114aea4c380613f555262f1872d4dd041fa2ac1bbc2ec99fe",
+          "bytes": 1749
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/cafe_low_snr_if8/compile.log",
+          "sha256": "f3d91ad1f7c93f0a8db67c4d37787d45f01cab4bd601eea5d7d6be6685ac1793",
+          "bytes": 1078
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe_low_snr.wav",
+          "sha256": "ab41cc2d34de8ac606c3e65dacfbaab37f5bab9ea014ace9b0537467130be9ee",
+          "bytes": 1373880
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/cafe_low_snr.tokens.npz",
+          "sha256": "d078f7eb4cd409fe022a1202e1ecdb3e97814c77338a70a8396331afab97c24d",
+          "bytes": 3829
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/cafe_low_snr_if8/model.bin",
+          "sha256": "e3af4fe432e9029ba66eea69ce564b41205cc7d38a99720c50638889be90501b",
+          "bytes": 894030959
+        }
+      },
+      "office_low_snr_bf16": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.metrics.json",
+          "sha256": "5bb2299731b3922c138d5f7764e002a9308bdbdd050befcfe1e4d43a5d1bf7b0",
+          "bytes": 3407
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.comparison.json",
+          "sha256": "9e469fea35748a8b6bc4bd3f2bd0e509583c155d4e131230fe426e53596de656",
+          "bytes": 1763
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/office_low_snr_bf16/compile.log",
+          "sha256": "3b5d362927c1be5cb45497993b8da7c89fd8d419ec480b3261697da8c6a0fb33",
+          "bytes": 1082
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.wav",
+          "sha256": "8abd0e806ef8b5fc7b2561480646a027a0337ab5365d2202804abd823a3d9be7",
+          "bytes": 1375720
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.tokens.npz",
+          "sha256": "0319a6fb1660016dfede451e615e58819ce98051eda85d58d92e18485f33a9ce",
+          "bytes": 3847
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/office_low_snr_bf16/model.bin",
+          "sha256": "d1e134480dca2a9b7b7d3227f6e4fe4160c621459dc99178a656ac51f4535d53",
+          "bytes": 949633903
+        }
+      },
+      "office_low_snr_if8": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office_low_snr.metrics.json",
+          "sha256": "99f86d2c56791a4d6085cec62c5066721713fb5a34433bb05525ca54a5e074a3",
+          "bytes": 3406
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office_low_snr.comparison.json",
+          "sha256": "73ff5911ac0d1299b50353ba2c64a667a3aa19cb5b497285d50f60a5a2438fd7",
+          "bytes": 1759
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/office_low_snr_if8/compile.log",
+          "sha256": "1d1ecd69eda0dd96ffb929fcad63eaf03e3f140e3b719c6f9f5fc97f53be3b9a",
+          "bytes": 1080
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office_low_snr.wav",
+          "sha256": "400d202622fbbb1896914272938ff8c41f558351bb42a19c16e7fc172704fa97",
+          "bytes": 1375720
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/office_low_snr.tokens.npz",
+          "sha256": "51d571bdc87c4146aba255fd68f93851fd26ee41867daa664bdab000ff011b35",
+          "bytes": 3843
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/office_low_snr_if8/model.bin",
+          "sha256": "a23c6a273c87454f131a02734b8b68310bdbbfcf249ff308651af0708d749953",
+          "bytes": 894571375
+        }
+      },
+      "psquare_low_snr_bf16": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.metrics.json",
+          "sha256": "3c852754f2c9a2576256d2296bc5719d2a4d0561e65af40d312445b088c3cf63",
+          "bytes": 3404
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.comparison.json",
+          "sha256": "9b1eb4192c4be99b13bbc9c2466dbd66d088826cf0a856b86aa9feea44edcf2e",
+          "bytes": 1765
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/psquare_low_snr_bf16/compile.log",
+          "sha256": "3ff540ab81aaaf92056638f348a900e49148a6b44fa99a49a6588e8e2b755c30",
+          "bytes": 1083
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.wav",
+          "sha256": "02595b5fd28067eb36e3cc61becef89b209ee9aa9c9ccae3f0772322fa037dd9",
+          "bytes": 1377704
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.tokens.npz",
+          "sha256": "c8c8e552cab65740bc71e440be1eaa12b1c6418dd5e0a26c18c3865bf3505327",
+          "bytes": 3886
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/psquare_low_snr_bf16/model.bin",
+          "sha256": "5aad53e694c18ddd08d5eaa3bad1063a93582727d2631da030069f6fb1daec64",
+          "bytes": 950861935
+        }
+      },
+      "psquare_low_snr_if8": {
+        "metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare_low_snr.metrics.json",
+          "sha256": "a90d5fbba584f72d0e129e36cd7fe26e2c6615c5956238170d132f902d704a75",
+          "bytes": 3407
+        },
+        "comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare_low_snr.comparison.json",
+          "sha256": "8bd52a612e52528e889d2481ff55ebb83d6c9314b13cb72b92333d0c251e337e",
+          "bytes": 1765
+        },
+        "compile_log": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/psquare_low_snr_if8/compile.log",
+          "sha256": "dc27231b62c5cddf427ff04622902b955503e7b0e44696cb9f997e04602342d7",
+          "bytes": 1079
+        },
+        "output": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare_low_snr.wav",
+          "sha256": "9f5b20c41c64a2eb6c222521a05205c74bc0bdd732541a954e2a3ad6bbada586",
+          "bytes": 1377704
+        },
+        "tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_if8/psquare_low_snr.tokens.npz",
+          "sha256": "bfa239db6dc09f9687f4d44096b5b031f20de388ad0fc0737280105863d77f28",
+          "bytes": 3884
+        },
+        "bin": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/batch/decoder-f30d7a0ed048/psquare_low_snr_if8/model.bin",
+          "sha256": "27b6f738d8da071b733eb11f3f3e041ad69d143c0e74f1c5086dacc0da7d9a14",
+          "bytes": 895767151
+        }
+      }
+    }
+  }
+}

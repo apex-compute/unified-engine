@@ -1,0 +1,36 @@
+{
+  "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+  "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/bus_decoder_pilot/fpga_bf16/bus.wav",
+  "reference_sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+  "actual_sha256": "2cdb24367220760833115a108983cc9315eb12fdf16ecd03e9026e877dd904cb",
+  "sample_rate": 16000,
+  "samples": 378916,
+  "channels": 1,
+  "duration_s": 23.68225,
+  "finite": true,
+  "alignment": "original sample indices; no gain, delay or polarity fitting",
+  "metric_status": {
+    "relative_l2": "finite",
+    "snr_db": "finite",
+    "cosine_similarity": "finite"
+  },
+  "relative_l2": 0.20550552766590874,
+  "snr_db": 13.74352984047691,
+  "max_abs_error": 0.6049027442932129,
+  "rmse": 0.014377199540071075,
+  "reference_rms": 0.06996015972594251,
+  "actual_rms": 0.06809074616711872,
+  "cosine_similarity": 0.9786708082641487,
+  "tokens": {
+    "count": 1895,
+    "equal": 1736,
+    "mismatches": 159,
+    "match_fraction": 0.9160949868073879,
+    "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz",
+    "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/bus_decoder_pilot/fpga_bf16/bus.tokens.npz",
+    "reference_sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+    "actual_sha256": "3a419e9624d515598da2f88fd834d7f88db17e2e6efb151f9db8ed4aa0fe99b5",
+    "source_sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+    "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9"
+  }
+}

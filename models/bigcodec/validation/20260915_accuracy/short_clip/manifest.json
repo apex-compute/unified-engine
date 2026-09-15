@@ -1,0 +1,151 @@
+{
+  "format": "bigcodec-short-clip-manifest-v1",
+  "scope": "Every packaged file except this manifest itself.",
+  "files": [
+    {
+      "path": "ATTRIBUTION.md",
+      "bytes": 1919,
+      "sha256": "18b70f41ed4d41083018610eb1fc742ca78a712d2462cb85c166a41258e8a414"
+    },
+    {
+      "path": "README.md",
+      "bytes": 6725,
+      "sha256": "adf56b4e49f916e1d2d152c4158af37365cb0c860aafeca6929e883d49e51c83"
+    },
+    {
+      "path": "audio/input.wav",
+      "bytes": 379810,
+      "sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211"
+    },
+    {
+      "path": "audio/official_cpu.wav",
+      "bytes": 759612,
+      "sha256": "08b449c8be5bad1fabb6cde8cd91736162532144fc30c2b31d279cbfef229c99"
+    },
+    {
+      "path": "audio/old_baseline_fpga.wav",
+      "bytes": 759612,
+      "sha256": "9cba6c51c5466319b7397233f51c12fbedb9595735db6488922cbed714c77994"
+    },
+    {
+      "path": "audio/old_baseline_same_tokens_cpu.wav",
+      "bytes": 759612,
+      "sha256": "2b885e5b66011bb0f8da6774ff7857612d61f7d8e78dd7b139705897029439a5"
+    },
+    {
+      "path": "audio/split_both_fpga.wav",
+      "bytes": 759612,
+      "sha256": "ee90316c67ca9bda6bd64552df10f4c98effe858eca2803c38fe3e42e98f1b78"
+    },
+    {
+      "path": "audio/split_both_same_tokens_cpu.wav",
+      "bytes": 759612,
+      "sha256": "5349ef9fd5103190ca151bafbc90da2620626f70d34891d35170aa6dd5d5556a"
+    },
+    {
+      "path": "audio/split_decoder_fpga.wav",
+      "bytes": 759612,
+      "sha256": "674638d90e55d7d67f921c807d6c7fbf9799e8028a63f970aad5b2c9e755ca8d"
+    },
+    {
+      "path": "audio/split_decoder_same_tokens_cpu.wav",
+      "bytes": 759612,
+      "sha256": "96c6a2bcbeb7df0a7bc7967a79517d10bdfdda9f93bc364e739f88dc60bf9ccb"
+    },
+    {
+      "path": "p232_007.LICENSE.txt",
+      "bytes": 17416,
+      "sha256": "b34e17103bfb246f2549fc82a279e6ba28834e0cb42f76a92efc14b72e3a3723"
+    },
+    {
+      "path": "records/actual_split_error_decomposition.json",
+      "bytes": 5781,
+      "sha256": "32bc1f71f9d02fab1ec7741b95d1966f82b2fa93ffdc179641c59cd7b7a0da6b"
+    },
+    {
+      "path": "records/official_cpu.metrics.json",
+      "bytes": 1848,
+      "sha256": "ea8b1b300b3e8e92df4682c57383b7de5534e05c35bd3254cc4f6c06b683120c"
+    },
+    {
+      "path": "records/old_baseline.compile.json",
+      "bytes": 544,
+      "sha256": "8271e4255e4387bd62f02a742954d6efd1e16bdcf890132fd236915ed2ac5e3a"
+    },
+    {
+      "path": "records/old_baseline_fpga.metrics.json",
+      "bytes": 2826,
+      "sha256": "1394840a37b53c07cd5942951edfdce1577a413bc11271fd6c88cf38b3715c0b"
+    },
+    {
+      "path": "records/old_baseline_same_tokens_cpu.metrics.json",
+      "bytes": 1359,
+      "sha256": "a2e373eb336adc96f8b917ee38fdbea5543debe3cfe084498315614d6b86f7ff"
+    },
+    {
+      "path": "records/split_both.compile.json",
+      "bytes": 789,
+      "sha256": "02d3eb22c241f5580f619423fb3f01fa179b190d3b9acf5f28babeb20f8c5843"
+    },
+    {
+      "path": "records/split_both_fpga.metrics.json",
+      "bytes": 3340,
+      "sha256": "4024b5424e7a06e19abcb7b22d7b99bb3096eb08258b1e4a8714df47343afb07"
+    },
+    {
+      "path": "records/split_both_same_tokens_cpu.metrics.json",
+      "bytes": 1834,
+      "sha256": "060902fb3b8fa87911b1d5ec9ca681da0ae0898e05691243c16b781c1d7e6faa"
+    },
+    {
+      "path": "records/split_decoder.compile.json",
+      "bytes": 794,
+      "sha256": "43500b8ce9e713b7faac95529f2ded8c853347910bec8ada1f7cfa953ab1705d"
+    },
+    {
+      "path": "records/split_decoder_fpga.metrics.json",
+      "bytes": 3343,
+      "sha256": "9310756b6afa51550106c53d19e6be7a3e9953a50c5ce6430bc4ab5bb66cc8f8"
+    },
+    {
+      "path": "records/split_decoder_same_tokens_cpu.metrics.json",
+      "bytes": 1838,
+      "sha256": "b074aefeaac5f91cda04d84c04e4a9e6a73954b45c0fe9a0cec0d575f5b71770"
+    },
+    {
+      "path": "records/vq_tree_comparison.json",
+      "bytes": 988,
+      "sha256": "ffee2f4c9b6ae2ef5552bacf65325e3ebe4b9f1291120049595cfdfcdcac9192"
+    },
+    {
+      "path": "reproduce.py",
+      "bytes": 7102,
+      "sha256": "a998de153c406b97963be7ae7214bc467fe073c6662fac5e4096d6a2ff93ca6e"
+    },
+    {
+      "path": "results.json",
+      "bytes": 21826,
+      "sha256": "074d64c6746d2c3dfcfbd9625bfaf682617d6eeb4dd1fa9d7e473da83219ec09"
+    },
+    {
+      "path": "tokens/official_cpu.tokens.npz",
+      "bytes": 1387,
+      "sha256": "dbd0b73fab28be43a6edd208948a61629bba3a6812107ef7654fe412a87b295f"
+    },
+    {
+      "path": "tokens/old_baseline.tokens.npz",
+      "bytes": 1386,
+      "sha256": "34da5227f77c3f643159facff138f27827176c9555631c81629032ecf9d07044"
+    },
+    {
+      "path": "tokens/split_both.tokens.npz",
+      "bytes": 1387,
+      "sha256": "b973ee1e0ae06eeb2b697a1d6ba0a9cd949a104be6d9c0d91cb70e5b774efb07"
+    },
+    {
+      "path": "tokens/split_decoder.tokens.npz",
+      "bytes": 1387,
+      "sha256": "7d2a292de36b75c56863194c3a6b0b54bcdc1946b7a1210940feab5bb0522fe0"
+    }
+  ]
+}

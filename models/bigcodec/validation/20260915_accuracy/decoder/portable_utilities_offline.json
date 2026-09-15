@@ -1,0 +1,68 @@
+{
+  "format": "bigcodec-portable-validation-offline-check-v1",
+  "status": "PASS",
+  "tests": 12,
+  "planned_jobs": 16,
+  "default_lstm_math_scope": "decoder",
+  "native_execution": false,
+  "model_compilation": false,
+  "default_preview_created_output_directories": false,
+  "original_frozen_batch_script_hash_verified": true,
+  "files_sha256": {
+    "run_validation.py": "8d47fcfb1f73173beeb9ecfd28c7f7e9b2f18474a2c6a19b1ad6b3df299dcb1c",
+    "build_report.py": "8c74e65f845317de652ed4ec3e95bb59d8303d97440041ede24deef6b4e95f29",
+    "test_reproduction_utilities.py": "b2a0c52c40f605d17af6dabb2dc2ec1953696f34d27fb06da3854cf8dd32d69f",
+    "reproduction.md": "16f258adcae9514f1fa53e3d9810fa3193bee465024aa9b1cbdace0a1f5622f1"
+  },
+  "commands": [
+    {
+      "command": [
+        "/home/hunlu/my_torch_env/bin/python",
+        "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/run_validation.py",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "13e218adbbc8e8958dde9394b1c57f6a935ff5fe6258d26af5a3d123dff4ad47",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "command": [
+        "/home/hunlu/my_torch_env/bin/python",
+        "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/build_report.py",
+        "--help"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "de4db2dc3157eb687bd3d0cf23baed71c1c4e53d412589be6f63482630495ffa",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "command": [
+        "/home/hunlu/my_torch_env/bin/python",
+        "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/run_validation.py"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "88eece035d78412fe552b4e5a11b01abfd40a3713135cd1ab8d1263ef5249fda",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "command": [
+        "/home/hunlu/my_torch_env/bin/python",
+        "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/build_report.py"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "d58b9f2cc7379a3180c9d686f448831f6e2a779e4d95fe44bbebef904f43b8c5",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "command": [
+        "/home/hunlu/my_torch_env/bin/python",
+        "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/test_reproduction_utilities.py"
+      ],
+      "exit_code": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "353aaba837b341526775d2f99527db8cfdef034f2a85d4c5d541bd024c0875bd"
+    }
+  ],
+  "limitations": "Offline tests and command previews only. The copied utilities have not executed a new hardware batch; native measurements belong to the original recorded runner.",
+  "independent_review": "Read-only CPU-agent review passed root/path discovery, fresh freeze/resume binding and default no-device branches. Its version-override issue was fixed and covered by an offline regression test. The 333.25 MHz clock check remains explicit."
+}
