@@ -44,7 +44,9 @@ builtins.print = quiet_print
 
 import user_dma_core
 from user_dma_core import UnifiedEngine, UE_VECTOR_SIZE, set_dma_device
-from multi_engine_shard import MultiEngineScheduler, PrivateArena
+from multi_engine_shard import (MULTICORE_WINDOW_BYTES, MultiEngineScheduler,
+                                PrivateArena, multicore_arena_bytes,
+                                require_multicore_dram)
 
 # The sibling mixin file is named for the model (qwen2.5_vl_3b_vision.py), and
 # "2.5" makes that an invalid module name, so it is loaded by path rather than
@@ -82,9 +84,19 @@ DEFAULT_IMAGE = os.path.normpath(
 MAX_CONTEXT_SIZE = 2048
 MIN_CONTEXT_SIZE = 512
 
-# Engine ceiling for this model's private map: 8 cores x 256 MiB fills the low
-# 2 GB exactly, which is the interleave granularity the DRAM controller wants.
+# Engine ceiling for this model's private map: 8 cores x a FIXED 512 MiB window
+# fills [0, 4 GiB), which is the granularity the DRAM controller interleaves on.
 MAX_ENGINES = 8
+
+# MULTI-CORE MAP (>= 8 GB device; single core keeps the historical 4 GB map):
+#   [0, N x 512 MiB) -- one fixed private window per engine
+#   [6 GiB, 8 GiB)   -- this model's own 2 GB map, rebased wholesale. Every
+#                       internal offset is unchanged, and the map sits at the
+#                       TOP at every engine count, so adding cores moves no
+#                       model address. Same arrangement as gemma3/gemma4_e2b.
+MULTI_CORE_MODEL_BASE = 0x180000000
+MULTI_CORE_DRAM_LIMIT = 0x200000000
+MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - 0x80000000
 
 
 class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine):
@@ -125,10 +137,17 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
         # explicit (reset_params_dram_addr) rather than implied by a cursor that
         # happens to be low, so the handover is visible at the call site.
         #
-        # MULTI-CORE PRIVATE SPACE, the whole lower 2 GB -- empty at 1 core, and
-        # handed to PrivateArena, which splits it into one window per engine laid
-        # out [ weights | tensor ]:
-        #   8 engines -> 256 MiB/window: 240 MiB weights + 16 MiB tensor
+        # MULTI-CORE PRIVATE SPACE, one FIXED 512 MiB window per engine from
+        # address 0 upward -- empty at 1 core, and handed to PrivateArena, which
+        # lays each window out as [ weights | tensor ]:
+        #   any engine count -> 512 MiB/window: 496 MiB weights + 16 MiB tensor
+        #
+        # THE WINDOW SIZE IS CONSTANT, NOT AN ARENA DIVIDED N WAYS. The DRAM
+        # controller interleaves across these windows, so a stride that shrank
+        # with the engine count would give up the concurrent bandwidth the extra
+        # engines were added for. The arena grows instead -- 4 GiB at 8 cores --
+        # which is why multi-core rebases this map to [6 GiB, 8 GiB) and needs a
+        # device of at least 8 GB.
         #
         # WORKER ISA LIVES IN THE MODEL MAP, NOT THE PRIVATE WINDOWS. A worker
         # program is a few MB, so a 16 MiB private slice per core bought little
@@ -137,15 +156,21 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
         # has the room instead: the 80 MiB ISA window holds only the master's
         # vision/prefill/decoder images (~9 MiB together at 8 cores). So the
         # workers take the TOP of that window and the master keeps the bottom.
-        # The model map begins at 0x8000_0000 and allocates upward, so a window
-        # carved from the low 2 GB cannot alias model memory however the model's
-        # cursors move. Same arrangement as gemma4_e2b and gemma3.
+        # The model map allocates upward from its own base and the private
+        # windows start at 0, so a window cannot alias model memory however the
+        # model's cursors move. Same arrangement as gemma4_e2b and gemma3.
         # ------------------------------------------------------------------
-        self.DRAM_END = 0x100000000
-        self.PARAMS_BASE = 0x80000000
-        self.PARAMS_LIMIT = 0xF1000000        # 1808 MiB, > the 1801.7 MiB LM needs
+        # Whole-map rebase for multi-core. Every address below keeps its offset
+        # from the map base, so nothing in the model, the mixins or a compiled
+        # program needs to know which map it is running on.
+        if multi_core > 1:
+            require_multicore_dram(multi_core, "Qwen2.5-VL-3B")
+        _rebase = MULTI_CORE_MODEL_REBASE if multi_core > 1 else 0
+        self.DRAM_END = 0x100000000 + _rebase
+        self.PARAMS_BASE = 0x80000000 + _rebase
+        self.PARAMS_LIMIT = 0xF1000000 + _rebase   # 1808 MiB, > the 1801.7 MiB LM needs
         self.TENSOR_BASE = self.PARAMS_LIMIT
-        self.ISA_BASE = 0xFB000000
+        self.ISA_BASE = 0xFB000000 + _rebase
         self.TENSOR_LIMIT = self.ISA_BASE
         # Vision loads at the base of the same window (see the note above).
         self.VISION_WEIGHT_BASE = self.PARAMS_BASE
@@ -163,12 +188,22 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
             ((self.DRAM_END - self.WORKER_ISA_BASE) // n_workers) & ~(2**20 - 1))
         # Engine 0's slice is never used (the master allocates from ISA_BASE
         # through the normal program cursor), so index the stride from engine 1.
-        self.mc_arena = (PrivateArena(
-            multi_core, arena_base=0x00000000, arena_bytes=self.PARAMS_BASE,
-            external_isa=(self.WORKER_ISA_BASE - self.WORKER_ISA_STRIDE,
-                          self.WORKER_ISA_STRIDE),
-            verbose=True)
-            if multi_core > 1 else None)
+        if multi_core > 1:
+            _arena_bytes = multicore_arena_bytes(multi_core)
+            assert _arena_bytes <= MULTI_CORE_MODEL_BASE, (
+                f"{multi_core} x {MULTICORE_WINDOW_BYTES // 2**20} MiB private "
+                f"windows reach 0x{_arena_bytes:X}, into the model map at "
+                f"0x{MULTI_CORE_MODEL_BASE:X}")
+            assert self.DRAM_END == MULTI_CORE_DRAM_LIMIT, (
+                f"multi-core model map ends at 0x{self.DRAM_END:X}, not at the "
+                f"8 GB device limit 0x{MULTI_CORE_DRAM_LIMIT:X}")
+            self.mc_arena = PrivateArena(
+                multi_core, arena_base=0x00000000, arena_bytes=_arena_bytes,
+                external_isa=(self.WORKER_ISA_BASE - self.WORKER_ISA_STRIDE,
+                              self.WORKER_ISA_STRIDE),
+                verbose=True)
+        else:
+            self.mc_arena = None
         # Exact per-core worker image sizes, filled in as each stage compiles.
         self._worker_isa_used = {}
 
@@ -238,7 +273,7 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
             return []
         st = self.WORKER_ISA_STRIDE
         master_end = self.get_program_dram_addr()
-        out = [f"  ISA window 0x{self.ISA_BASE:08X}-0x{self.DRAM_END:09X} "
+        out = [f"  ISA window 0x{self.ISA_BASE:09X}-0x{self.DRAM_END:09X} "
                f"({(self.DRAM_END - self.ISA_BASE) / 2**20:.0f} MiB): "
                f"master reserve {self.MASTER_ISA_RESERVE / 2**20:.0f} MiB, "
                f"then {self.multi_core - 1} worker slice(s) of {st / 2**20:.0f} MiB",
@@ -507,13 +542,13 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
 
     def describe_dram_map(self) -> str:
         lines = [
-            "  model map (upper 2 GB):",
-            f"    PARAMS  0x{self.PARAMS_BASE:08X} - 0x{self.PARAMS_LIMIT:08X}  "
+            f"  model map (2 GB at 0x{self.PARAMS_BASE:X}):",
+            f"    PARAMS  0x{self.PARAMS_BASE:09X} - 0x{self.PARAMS_LIMIT:09X}  "
             f"{(self.PARAMS_LIMIT - self.PARAMS_BASE) / 2**20:6.0f} MiB  "
             f"(time-shared: vision, then LM)",
-            f"    TENSOR  0x{self.TENSOR_BASE:08X} - 0x{self.TENSOR_LIMIT:08X}  "
+            f"    TENSOR  0x{self.TENSOR_BASE:09X} - 0x{self.TENSOR_LIMIT:09X}  "
             f"{(self.TENSOR_LIMIT - self.TENSOR_BASE) / 2**20:6.0f} MiB",
-            f"    ISA     0x{self.ISA_BASE:08X} - 0x{self.DRAM_END:09X}  "
+            f"    ISA     0x{self.ISA_BASE:09X} - 0x{self.DRAM_END:09X}  "
             f"{(self.DRAM_END - self.ISA_BASE) / 2**20:6.0f} MiB",
         ]
         if self.mc_arena is not None:
@@ -565,6 +600,13 @@ def resolve_engine_config(parser, args) -> dict:
         parser.error(
             f"--multi-core {args.multi_core} exceeds the {cores} engine(s) this "
             f"board reports in HW_INFO")
+    # Fail here rather than in the constructor: the caller software-resets and
+    # cleans DRAM in between, and both are wasted work if the map cannot fit.
+    if args.multi_core > 1:
+        try:
+            require_multicore_dram(args.multi_core, "Qwen2.5-VL-3B")
+        except (ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
 
     print(user_dma_core.hardware_info_summary())
     print(f"Using DMA device: {args.dev}")
@@ -611,8 +653,8 @@ qwen2.5_vl_3b_numeric.py.""")
     return parser
 
 
-def clean_dram_4gb(ue=None, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
-    """Fill the whole 32-bit DRAM space with 0xFF, both halves.
+def clean_dram(ue=None, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
+    """Fill every byte of reported DRAM with 0xFF, from address 0.
 
     Runs AFTER the software reset and BEFORE the model allocates or uploads
     anything, so every region this run then reads is either something it wrote
@@ -620,9 +662,12 @@ def clean_dram_4gb(ue=None, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
     next process and would leave this run inheriting the last one's memory --
     which is the failure mode worth preventing.
 
-    UnifiedEngine.clear_dram() only walks from DRAM_START_ADDR (0x8000_0000)
-    upward, i.e. the 2 GB model map. This model also uses the low 2 GB for the
-    per-engine private arena, so the low half is cleared here as well.
+    UnifiedEngine.clear_dram() walks only from DRAM_START_ADDR (0x8000_0000)
+    upward and stops at the 32-bit ceiling, so it covers neither the per-engine
+    private arena at 0 nor a multi-core model map at 6 GiB. This walks the whole
+    device instead, sized from HW_INFO -- which on the current Alveo means
+    running with UE_FORCE_DRAM_SIZE_GB=8, the same override the multi-core map
+    itself requires.
 
     0xFF (not zero) is deliberate, matching clear_dram: it decodes to NaN in
     bf16, so an uninitialised read shows up as NaN and propagates, instead of
@@ -631,24 +676,27 @@ def clean_dram_4gb(ue=None, chunk_size_bytes: int = 64 * 1024 * 1024) -> None:
     ``ue`` is optional -- pass the model's engine once it exists, or leave it
     None to open a bare one just for this (as gemma4_e2b's poison_dram does).
     """
+    gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
+    if not gib:
+        raise RuntimeError(
+            "HW_INFO has not been read, so DRAM size is unknown; call "
+            "user_dma_core.configure_clock_from_hardware() first")
     owned = ue is None
     if owned:
         ue = UnifiedEngine()          # bare engine: opens the device, self-tests
     fill = b"\xff" * chunk_size_bytes
-    low_bytes = user_dma_core.DRAM_START_ADDR
-    print(f"Clearing low DRAM [0x0..0x{low_bytes - 1:X}] "
-          f"({low_bytes / 1024**3:.2f} GiB)")
+    total = gib * 1024 ** 3
+    print(f"Clearing DRAM [0x0..0x{total - 1:X}] ({gib:.2f} GiB)")
     offset = 0
-    while offset < low_bytes:
-        n = min(chunk_size_bytes, low_bytes - offset)
+    while offset < total:
+        n = min(chunk_size_bytes, total - offset)
         ue.dma_write(user_dma_core.DMA_DEVICE_H2C, offset, fill[:n], n)
         offset += n
-        pct = offset / low_bytes
+        pct = offset / total
         bar = "\u2588" * int(40 * pct) + "\u2591" * (40 - int(40 * pct))
         print(f"\r  [{bar}] {pct * 100:5.1f}%  "
-              f"{offset / 1024**2:.0f}/{low_bytes / 1024**2:.0f} MB", end="", flush=True)
+              f"{offset / 1024**2:.0f}/{total / 1024**2:.0f} MB", end="", flush=True)
     print()
-    ue.clear_dram(chunk_size_bytes=chunk_size_bytes)
     if owned:
         del ue
 
@@ -707,8 +755,8 @@ def main():
     software_reset_test(cores=cores)
 
     # Establish known DRAM state before the model allocates or uploads anything.
-    print(f"\n--- Cleaning DRAM (4 GiB) ---")
-    clean_dram_4gb()
+    print(f"\n--- Cleaning DRAM ({user_dma_core.AVAILABLE_DRAM_SIZE_GB} GiB) ---")
+    clean_dram()
 
     print(f"\n--- Building engine ---")
     ue = Qwen25VL_UnifiedEngine(**engine_kwargs)
@@ -838,8 +886,8 @@ def main():
     if not args.image:
         _run_lm()
         _write_summary()
-        print(f"\n--- Cleaning DRAM (4 GiB) ---")
-        clean_dram_4gb(ue)
+        print(f"\n--- Cleaning DRAM ({user_dma_core.AVAILABLE_DRAM_SIZE_GB} GiB) ---")
+        clean_dram(ue)
         return
 
     # Resolve a bare filename against the shipped test_samples directory.
@@ -918,8 +966,8 @@ def main():
     _run_lm(image_embeddings=embeddings, prefill_tokens=tokens, positions=positions)
     _write_summary()
 
-    print(f"\n--- Cleaning DRAM (4 GiB) ---")
-    clean_dram_4gb(ue)
+    print(f"\n--- Cleaning DRAM ({user_dma_core.AVAILABLE_DRAM_SIZE_GB} GiB) ---")
+    clean_dram(ue)
     print("\nVLM run complete.")
 
 

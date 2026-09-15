@@ -45,16 +45,25 @@ import time
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, calculate_snr
 from user_dma_core import UnifiedEngine
+from multi_engine_shard import (MULTICORE_WINDOW_BYTES, multicore_arena_bytes,
+                                require_multicore_dram)
 
-# On hardware whose HW_INFO reports 12 cores, multi-core Gemma3 owns the full
-# 8 GB map as two non-overlapping arenas, regardless of how many cores the run
-# activates:
-#   [0, 6 GB) -- twelve fixed 512 MB private engine windows
-#   [6, 8 GB) -- the primary's original 2 GB params/tensor/program layout,
-#                rebased upward without changing its internal offsets.
-# Other hardware keeps the historical Gemma3 DRAM layout.
+# ANY multi-core Gemma3 run owns the full 8 GB map as two non-overlapping
+# arenas:
+#   [0, N x 512 MB) -- one FIXED 512 MB private window per engine. The size is
+#                      constant, not the arena divided by the engine count: the
+#                      DRAM controller interleaves across these windows, so a
+#                      shrinking stride would cost exactly the concurrent
+#                      bandwidth multi-core exists to buy.
+#   [6, 8 GB)       -- the primary's original 2 GB params/tensor/program layout,
+#                      rebased upward without changing its internal offsets. It
+#                      sits at the TOP at every engine count, so the model's own
+#                      addresses never move when cores are added.
+# Single-core keeps the historical Gemma3 DRAM layout at DRAM_START_ADDR.
 MULTI_CORE_MAX_ENGINES = 12
-MULTI_CORE_ENGINE_WINDOW_BYTES = 0x20000000
+# One source of truth for the window size: the library owns the policy
+# (multi_engine_shard.MULTICORE_WINDOW_BYTES); this is the local name.
+MULTI_CORE_ENGINE_WINDOW_BYTES = MULTICORE_WINDOW_BYTES
 MULTI_CORE_MODEL_BASE = 0x180000000
 MULTI_CORE_DRAM_LIMIT = 0x200000000
 MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
@@ -287,17 +296,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             raise ValueError(
                 f"multi_core must be in [1, {MULTI_CORE_MAX_ENGINES}], "
                 f"got {self.multi_core}")
-        self._use_hw12_dram_layout = (
-            self.multi_core > 1
-            and user_dma_core.ANDROMEDA_CORE_COUNT == MULTI_CORE_MAX_ENGINES
-        )
-        if (self._use_hw12_dram_layout
-                and user_dma_core.AVAILABLE_DRAM_SIZE_GB is not None
-                and user_dma_core.AVAILABLE_DRAM_SIZE_GB < 8):
-            raise ValueError(
-                "12-core Gemma3 multicore layout requires the 8 GB DRAM map; "
-                f"HW_INFO reports {user_dma_core.AVAILABLE_DRAM_SIZE_GB} GB")
-        _rebase = MULTI_CORE_MODEL_REBASE if self._use_hw12_dram_layout else 0
+        # The multi-core map is keyed on the ENGINE COUNT, not on what core
+        # count the bitstream reports: an 8-core board running --multi-core 8
+        # wants the same fixed 512 MB windows a 12-core board does.
+        self._use_multicore_dram_layout = self.multi_core > 1
+        if self._use_multicore_dram_layout:
+            require_multicore_dram(self.multi_core, "Gemma3")
+        _rebase = MULTI_CORE_MODEL_REBASE if self._use_multicore_dram_layout else 0
         super().__init__(
             BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
             params_dram_base=user_dma_core.DRAM_START_ADDR + _rebase,
@@ -365,7 +370,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._weights_bin_rel = "gemma3_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
         self.weight_init()
         self.tensor_init()
-        if self._use_hw12_dram_layout:
+        if self._use_multicore_dram_layout:
             if self.get_params_dram_addr() > self._tensor_dram_base:
                 raise MemoryError(
                     f"Gemma3 params end at 0x{self.get_params_dram_addr():X}, "
@@ -1628,8 +1633,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         """
         if self.multi_core <= 1:
             return ""
-        layout_tag = "_hw12" if self._use_hw12_dram_layout else ""
-        return f"_mc{self.multi_core}{layout_tag}"
+        # The map tag is constant now that every multi-core run uses the fixed
+        # 512 MB window layout, but it stays in the path so images cached by an
+        # older build against the legacy low-2-GB map are never replayed here.
+        return f"_mc{self.multi_core}_mcmap"
 
     def setup_multi_core(self) -> None:
         """Bring up the worker engines and copy each one's column block of the MLP gate.
@@ -1642,21 +1649,20 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         from multi_engine_shard import MultiEngineScheduler, PrivateArena
 
         print(f"\n--- Multi-core setup ({self.multi_core} engines) ---")
-        # The 12-core HW layout always reserves all twelve physical 512 MB slots.
-        # A --multi-core 6 run uses regions 0..5 and leaves 6..11 unused; it does
-        # not resize the six active regions to 1 GB or move the primary model map.
-        if self._use_hw12_dram_layout:
-            _arena = PrivateArena(
-                MULTI_CORE_MAX_ENGINES,
-                arena_base=0,
-                arena_bytes=(MULTI_CORE_MAX_ENGINES
-                             * MULTI_CORE_ENGINE_WINDOW_BYTES),
-            )
-            _scheduler_map = {"arena": _arena}
-        else:
-            # Preserve the pre-existing low-2-GB dynamically divided map on
-            # hardware that does not report twelve cores.
-            _scheduler_map = {"worker_map": "private_low"}
+        # One FIXED 512 MB window per engine from 0 upward. A --multi-core 6 run
+        # claims [0, 3 GB) and leaves the rest of the low map unused; it does NOT
+        # grow the six windows to 1 GB each, because the window size is what the
+        # DRAM controller interleaves on. Engine i therefore owns the same
+        # addresses at every engine count, and the model map above never moves.
+        _arena_bytes = multicore_arena_bytes(self.multi_core)
+        assert _arena_bytes <= MULTI_CORE_MODEL_BASE, (
+            f"{self.multi_core} x "
+            f"{MULTI_CORE_ENGINE_WINDOW_BYTES // 2**20} MB private windows reach "
+            f"0x{_arena_bytes:X}, into the model map at "
+            f"0x{MULTI_CORE_MODEL_BASE:X}")
+        _scheduler_map = {"arena": PrivateArena(self.multi_core,
+                                               arena_base=0,
+                                               arena_bytes=_arena_bytes)}
         # handshake="four_phase": see release()/join() -- the master/worker rendezvous is
         # always four-phase; this also makes any symmetric barrier() margin-free.
         self.shard_group = MultiEngineScheduler(
@@ -2771,7 +2777,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         assert len(instruction_bytes) % 64 == 0, (
             "combined instruction image must be 64-byte aligned (HALT emits trailing NOP via generate_instruction_halt)"
         )
-        if (self._use_hw12_dram_layout
+        if (self._use_multicore_dram_layout
                 and instruction_base_addr + len(instruction_bytes) > MULTI_CORE_DRAM_LIMIT):
             raise MemoryError(
                 f"Gemma3 program ends at "

@@ -374,8 +374,8 @@ def _run_lm_check(ue, args):
         print(f"\n=== vs HF (adds IF4 loss) ===")
         report("HOSTSIM vs HF", ref, sim)
         report("FPGA vs HF", ref, got)
-    print(f"\n--- Cleaning DRAM (4 GiB) ---")
-    _qt.clean_dram_4gb(ue)
+    print(f"\n--- Cleaning DRAM ({user_dma_core.AVAILABLE_DRAM_SIZE_GB} GiB) ---")
+    _qt.clean_dram(ue)
 
 
 class _HostOnlyEngine:
@@ -430,8 +430,8 @@ def main():
         cores = args.multi_core or 1
         print(f"\n--- Software-resetting {cores} core(s) ---")
         software_reset_test(cores=cores)
-        print(f"\n--- Cleaning DRAM (4 GiB) ---")
-        _qt.clean_dram_4gb()
+        print(f"\n--- Cleaning DRAM ({user_dma_core.AVAILABLE_DRAM_SIZE_GB} GiB) ---")
+        _qt.clean_dram()
     else:
         # The allocators and the emitter still need the AXI width and clock that
         # HW_INFO would supply; nothing here reaches the device.
