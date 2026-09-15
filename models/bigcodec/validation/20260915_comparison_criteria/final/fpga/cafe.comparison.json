@@ -1,0 +1,377 @@
+{
+  "case": "cafe",
+  "frozen_inputs": {
+    "models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_noisy.wav": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868",
+    "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e",
+    "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.tokens.npz": "c48df28ed8b8998368cca7e603405a6389f68d60cf0ecc7bf9a09af7c20394c4",
+    "models/bigcodec/validation/20260915_comparison_criteria/decomposition/audio/cafe_same_tokens_cpu.wav": "5c7328483ac42b72b06369c3c30d5981312a2252429a5d8e5893b518f088228a",
+    "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.wav": "f3cbcc9aeaccc3f8c4fe61825a6b373b58bf2b658f240a1163c5c71f33d18011",
+    "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.tokens.npz": "5062896d4073cf2fc2b6050363766733c6755037777d30b74c1599772bdf36dd"
+  },
+  "comparison": {
+    "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav",
+    "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_comparison_criteria/final/fpga/cafe.wav",
+    "reference_sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e",
+    "actual_sha256": "19e226e350d67b8888512fb9b5ba69f7815aa7e04d80ddd619af26673b309db7",
+    "sample_rate": 16000,
+    "samples": 328146,
+    "channels": 1,
+    "duration_s": 20.509125,
+    "finite": true,
+    "alignment": "original sample indices; no gain, delay or polarity fitting",
+    "metric_status": {
+      "relative_l2": "finite",
+      "snr_db": "finite",
+      "cosine_similarity": "finite"
+    },
+    "relative_l2": 0.21266492433030912,
+    "snr_db": 13.446082682054527,
+    "max_abs_error": 0.43052028119564056,
+    "rmse": 0.01579779096312596,
+    "reference_rms": 0.07428489212724607,
+    "actual_rms": 0.07259417371764569,
+    "cosine_similarity": 0.9771251931855622,
+    "tokens": {
+      "count": 1641,
+      "equal": 1528,
+      "mismatches": 113,
+      "match_fraction": 0.931139549055454,
+      "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe.tokens.npz",
+      "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_comparison_criteria/final/fpga/cafe.tokens.npz",
+      "reference_sha256": "c48df28ed8b8998368cca7e603405a6389f68d60cf0ecc7bf9a09af7c20394c4",
+      "actual_sha256": "5062896d4073cf2fc2b6050363766733c6755037777d30b74c1599772bdf36dd",
+      "source_sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868",
+      "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9"
+    }
+  },
+  "conditional": {
+    "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_comparison_criteria/decomposition/audio/cafe_same_tokens_cpu.wav",
+    "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_comparison_criteria/final/fpga/cafe.wav",
+    "reference_sha256": "5c7328483ac42b72b06369c3c30d5981312a2252429a5d8e5893b518f088228a",
+    "actual_sha256": "19e226e350d67b8888512fb9b5ba69f7815aa7e04d80ddd619af26673b309db7",
+    "sample_rate": 16000,
+    "samples": 328146,
+    "channels": 1,
+    "duration_s": 20.509125,
+    "finite": true,
+    "alignment": "original sample indices; no gain, delay or polarity fitting",
+    "metric_status": {
+      "relative_l2": "finite",
+      "snr_db": "finite",
+      "cosine_similarity": "finite"
+    },
+    "relative_l2": 0.02847191004207375,
+    "snr_db": 30.911667943391805,
+    "max_abs_error": 0.029747791588306427,
+    "rmse": 0.0021061816503771405,
+    "reference_rms": 0.07397402026294604,
+    "actual_rms": 0.07259417371764569,
+    "cosine_similarity": 0.9997642471528335
+  },
+  "quality_vs_cpu": {
+    "format": "bigcodec-audio-quality-v1",
+    "waveform": {
+      "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav",
+      "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_comparison_criteria/final/fpga/cafe.wav",
+      "reference_sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e",
+      "actual_sha256": "19e226e350d67b8888512fb9b5ba69f7815aa7e04d80ddd619af26673b309db7",
+      "sample_rate": 16000,
+      "samples": 328146,
+      "channels": 1,
+      "duration_s": 20.509125,
+      "finite": true,
+      "alignment": "original sample indices; no gain, delay or polarity fitting",
+      "metric_status": {
+        "relative_l2": "finite",
+        "snr_db": "finite",
+        "cosine_similarity": "finite"
+      },
+      "relative_l2": 0.21266492433030912,
+      "snr_db": 13.446082682054527,
+      "max_abs_error": 0.43052028119564056,
+      "rmse": 0.01579779096312596,
+      "reference_rms": 0.07428489212724607,
+      "actual_rms": 0.07259417371764569,
+      "cosine_similarity": 0.9771251931855622
+    },
+    "quality": {
+      "sample_rate": 16000,
+      "samples": 328146,
+      "metric_status": {
+        "pesq_wb": "finite",
+        "pesq_nb": "finite",
+        "stoi": "finite",
+        "estoi": "finite"
+      },
+      "spectral": [
+        {
+          "fft_size": 512,
+          "frames": 2565,
+          "spectral_error_energy": 0.13624556824505413,
+          "spectral_reference_energy": 11.03275547395998,
+          "spectral_convergence": 0.1111268991038356,
+          "spectral_convergence_status": "finite",
+          "log_magnitude_mae_db": 1.7567360022960665,
+          "log_spectral_distance_db": 2.661793543805933
+        },
+        {
+          "fft_size": 1024,
+          "frames": 1283,
+          "spectral_error_energy": 0.06471766553779654,
+          "spectral_reference_energy": 5.402299862298616,
+          "spectral_convergence": 0.10945159084737237,
+          "spectral_convergence_status": "finite",
+          "log_magnitude_mae_db": 1.6921680628560496,
+          "log_spectral_distance_db": 2.5283839935911305
+        },
+        {
+          "fft_size": 2048,
+          "frames": 642,
+          "spectral_error_energy": 0.03373170870241471,
+          "spectral_reference_energy": 2.6628153696268058,
+          "spectral_convergence": 0.11255081472985196,
+          "spectral_convergence_status": "finite",
+          "log_magnitude_mae_db": 1.6186741701797673,
+          "log_spectral_distance_db": 2.429455926615374
+        }
+      ],
+      "mr_spectral_convergence": 0.11104310156035331,
+      "mr_log_magnitude_mae_db": 1.689192745110628,
+      "mr_log_spectral_distance_db": 2.539877821337479,
+      "pesq_wb": 4.1382975578308105,
+      "pesq_nb": 4.227662086486816,
+      "stoi": 0.9867036840585138,
+      "estoi": 0.9743894724659162
+    },
+    "analysis": {
+      "original_sample_rate": 16000,
+      "resampling": {
+        "applied": false,
+        "up": 1,
+        "down": 1,
+        "method": "scipy.signal.resample_poly",
+        "window": [
+          "kaiser",
+          5.0
+        ],
+        "padtype": "constant",
+        "scope": "Both signals identically, for speech and spectral metrics only"
+      },
+      "external_alignment": "none; no delay, gain or polarity fitting",
+      "pesq": "MOS-LQO; standard internal level and time processing retained",
+      "stoi": "Standard silence removal, resampling and envelope normalization retained; not percent words understood",
+      "spectral": {
+        "windows": [
+          512,
+          1024,
+          2048
+        ],
+        "hops": [
+          128,
+          256,
+          512
+        ],
+        "window": "periodic Hann",
+        "scaling": "spectrum",
+        "onesided": true,
+        "boundary": "zeros",
+        "padded": true,
+        "minimum_length_padding": "zero-pad to window length",
+        "magnitude_floor": 1e-05,
+        "convergence": "Frobenius magnitude difference / reference magnitude norm; no phase",
+        "log_magnitude": "20 log10(max(magnitude,1e-5))",
+        "log_spectral_distance": "Mean frame RMS dB difference across bins",
+        "multi_resolution": "Arithmetic mean of the three per-resolution values"
+      },
+      "reference_scope": "Noisy or codec references measure agreement, not validated clean-reference quality",
+      "threshold": "No equivalence to a waveform-error threshold is asserted"
+    },
+    "dependencies": {
+      "numpy": "2.4.2",
+      "soundfile": "0.14.0",
+      "scipy": "1.18.0",
+      "pesq": "0.0.4",
+      "pystoi": "0.4.1"
+    },
+    "source_sha256": {
+      "bigcodec_audio_quality.py": "8136f819f079cf0192de8d1078cd8121cbda2310c6cec04318360cfb48ef6442",
+      "bigcodec_compare.py": "42219382a6031722f89f4530ac2f1b4e028be391e5f1da5ab62ffcf6fed6c9e2",
+      "bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6"
+    }
+  },
+  "quality_vs_input": {
+    "format": "bigcodec-audio-quality-v1",
+    "waveform": {
+      "reference": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_noisy.wav",
+      "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_comparison_criteria/final/fpga/cafe.wav",
+      "reference_sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868",
+      "actual_sha256": "19e226e350d67b8888512fb9b5ba69f7815aa7e04d80ddd619af26673b309db7",
+      "sample_rate": 16000,
+      "samples": 328146,
+      "channels": 1,
+      "duration_s": 20.509125,
+      "finite": true,
+      "alignment": "original sample indices; no gain, delay or polarity fitting",
+      "metric_status": {
+        "relative_l2": "finite",
+        "snr_db": "finite",
+        "cosine_similarity": "finite"
+      },
+      "relative_l2": 0.7583400195683258,
+      "snr_db": 2.4027204912648514,
+      "max_abs_error": 0.9366782903671265,
+      "rmse": 0.058226409534619564,
+      "reference_rms": 0.07678140152456166,
+      "actual_rms": 0.07259417371764569,
+      "cosine_similarity": 0.6974476990895632
+    },
+    "quality": {
+      "sample_rate": 16000,
+      "samples": 328146,
+      "metric_status": {
+        "pesq_wb": "finite",
+        "pesq_nb": "finite",
+        "stoi": "finite",
+        "estoi": "finite"
+      },
+      "spectral": [
+        {
+          "fft_size": 512,
+          "frames": 2565,
+          "spectral_error_energy": 1.7587289806569077,
+          "spectral_reference_energy": 11.874223026353501,
+          "spectral_convergence": 0.3848547570951241,
+          "spectral_convergence_status": "finite",
+          "log_magnitude_mae_db": 6.396716040322912,
+          "log_spectral_distance_db": 8.283609876013891
+        },
+        {
+          "fft_size": 1024,
+          "frames": 1283,
+          "spectral_error_energy": 0.8565502324981287,
+          "spectral_reference_energy": 5.803995144406375,
+          "spectral_convergence": 0.3841606684814318,
+          "spectral_convergence_status": "finite",
+          "log_magnitude_mae_db": 6.289160323605411,
+          "log_spectral_distance_db": 8.099633989123904
+        },
+        {
+          "fft_size": 2048,
+          "frames": 642,
+          "spectral_error_energy": 0.4190550323005566,
+          "spectral_reference_energy": 2.855660075786078,
+          "spectral_convergence": 0.3830736460327749,
+          "spectral_convergence_status": "finite",
+          "log_magnitude_mae_db": 6.058983188636787,
+          "log_spectral_distance_db": 7.819366796292597
+        }
+      ],
+      "mr_spectral_convergence": 0.3840296905364436,
+      "mr_log_magnitude_mae_db": 6.248286517521703,
+      "mr_log_spectral_distance_db": 8.067536887143463,
+      "pesq_wb": 1.8250422477722168,
+      "pesq_nb": 2.5794007778167725,
+      "stoi": 0.8217199970515786,
+      "estoi": 0.6768816228666743
+    },
+    "analysis": {
+      "original_sample_rate": 16000,
+      "resampling": {
+        "applied": false,
+        "up": 1,
+        "down": 1,
+        "method": "scipy.signal.resample_poly",
+        "window": [
+          "kaiser",
+          5.0
+        ],
+        "padtype": "constant",
+        "scope": "Both signals identically, for speech and spectral metrics only"
+      },
+      "external_alignment": "none; no delay, gain or polarity fitting",
+      "pesq": "MOS-LQO; standard internal level and time processing retained",
+      "stoi": "Standard silence removal, resampling and envelope normalization retained; not percent words understood",
+      "spectral": {
+        "windows": [
+          512,
+          1024,
+          2048
+        ],
+        "hops": [
+          128,
+          256,
+          512
+        ],
+        "window": "periodic Hann",
+        "scaling": "spectrum",
+        "onesided": true,
+        "boundary": "zeros",
+        "padded": true,
+        "minimum_length_padding": "zero-pad to window length",
+        "magnitude_floor": 1e-05,
+        "convergence": "Frobenius magnitude difference / reference magnitude norm; no phase",
+        "log_magnitude": "20 log10(max(magnitude,1e-5))",
+        "log_spectral_distance": "Mean frame RMS dB difference across bins",
+        "multi_resolution": "Arithmetic mean of the three per-resolution values"
+      },
+      "reference_scope": "Noisy or codec references measure agreement, not validated clean-reference quality",
+      "threshold": "No equivalence to a waveform-error threshold is asserted"
+    },
+    "dependencies": {
+      "numpy": "2.4.2",
+      "soundfile": "0.14.0",
+      "scipy": "1.18.0",
+      "pesq": "0.0.4",
+      "pystoi": "0.4.1"
+    },
+    "source_sha256": {
+      "bigcodec_audio_quality.py": "8136f819f079cf0192de8d1078cd8121cbda2310c6cec04318360cfb48ef6442",
+      "bigcodec_compare.py": "42219382a6031722f89f4530ac2f1b4e028be391e5f1da5ab62ffcf6fed6c9e2",
+      "bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6"
+    }
+  },
+  "encoder_tokens_unchanged": true,
+  "compile_command": [
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_compile.py",
+    "--input",
+    "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_noisy.wav",
+    "--output",
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_next_20260915/cafe_paired_production.bin",
+    "--conv-precision",
+    "bf16",
+    "--lstm-cell-precision",
+    "compensated",
+    "--lstm-tanh-precision",
+    "compensated",
+    "--lstm-fused-gates",
+    "--lstm-math-scope",
+    "decoder",
+    "--center-quantizer-scores",
+    "--compensated-codebook",
+    "--memory-layout",
+    "large-program",
+    "--cpu-core",
+    "13"
+  ],
+  "run_command": [
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_run_from_bin.py",
+    "--bin",
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_next_20260915/cafe_paired_production.bin",
+    "--input",
+    "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_noisy.wav",
+    "--output",
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_comparison_criteria/final/fpga/cafe.wav",
+    "--cpu-core",
+    "6",
+    "--expected-version",
+    "0x90f1f464"
+  ],
+  "bin": {
+    "path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/cafe_paired_production.bin",
+    "sha256": "3ab4b3bb1773e42a35980585f6ae9e56edd8d30f7472737e329c37c5e42a7d1c",
+    "bytes": 691308527
+  },
+  "metrics_path": "models/bigcodec/validation/20260915_comparison_criteria/final/fpga/cafe.metrics.json",
+  "metrics_sha256": "1a2647a87dafe57f9e4d9d80942a56617724345371309c27f3a243142fcdb63a",
+  "short_matches_unrolled_native": null
+}

@@ -1,0 +1,11 @@
+{
+  "status": "PASS",
+  "files_copied": 38,
+  "ignored_bin_directory_absent": true,
+  "checkpoint_absent": true,
+  "default_and_quality_dependency_scope": "Only manifest input files, frozen snapshots/receipts, and three tracked metric helpers",
+  "quality_and_waveform_metrics_match": true,
+  "all_files_unchanged_after_read_only_recheck": true,
+  "command": "python reproduce.py --quality --cpu-core 12",
+  "rechecker_sha256": "a3c0d8b9fa1df1d0698d096e25c25752a4ee7d510fcb9c6c029199b1463b2920"
+}

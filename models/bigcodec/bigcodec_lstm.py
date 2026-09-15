@@ -76,6 +76,7 @@ class LSTMPlan:
     preserve_cell_residual: bool = True
     compensated_tanh: bool = False
     fused_projection: bool = False
+    paired_sigmoid: bool = False
 
 
 def scratch_bytes(input_shape: tuple[int, int], *, compensated_cell: bool = False,
@@ -117,7 +118,7 @@ def prepare_lstm(lstm_module, image, *, input_shape: tuple[int, int],
                  identity_address: int, zero_address: int, skip: bool = True,
                  recurrent_precision: str = "bf16", compensated_cell: bool = False,
                  preserve_cell_residual: bool = True, compensated_tanh: bool = False,
-                 fused_projection: bool = False) -> LSTMPlan:
+                 fused_projection: bool = False, paired_sigmoid: bool = False) -> LSTMPlan:
     """Pack PyTorch i/f/g/o parameters with optional IF8 recurrent matrices.
 
     Inputs/outputs are time-major [T, pad64(D)], with zero padding lanes. The
@@ -127,7 +128,9 @@ def prepare_lstm(lstm_module, image, *, input_shape: tuple[int, int],
     and signed BF16 scale blocks; it does not change pointwise gate/state math.
     Fused projection folds the two biases in FP32 before BF16 packing; runtime
     input projections become recurrent matvec biases, with i/f/o sigmoid in
-    the matvec epilogue before the first gate BF16 writeback.
+    the matvec epilogue before the first gate BF16 writeback. The corrected
+    1536-wide BF16 decoder can instead retain sigmoid high/low parts through
+    the cell and hidden products, after a BF16 logit writeback.
     """
     workspace_bytes = scratch_bytes(input_shape, compensated_cell=compensated_cell,
                                     preserve_cell_residual=preserve_cell_residual)
@@ -135,6 +138,8 @@ def prepare_lstm(lstm_module, image, *, input_shape: tuple[int, int],
         raise ValueError("compensated_tanh must be a bool")
     if not isinstance(fused_projection, bool):
         raise ValueError("fused_projection must be a bool")
+    if not isinstance(paired_sigmoid, bool):
+        raise ValueError("paired_sigmoid must be a bool")
     sequence, width = map(int, input_shape)
     if recurrent_precision not in ("bf16", "if8"):
         raise ValueError("LSTM recurrent precision must be bf16 or if8")
@@ -145,6 +150,9 @@ def prepare_lstm(lstm_module, image, *, input_shape: tuple[int, int],
             or not lstm_module.bias or lstm_module.training):
         raise ValueError("Expected an eval two-layer, unidirectional, batch-first LSTM with equal input/hidden width and biases")
     padded = (width + 63) // 64 * 64
+    if paired_sigmoid and not (width == padded == 1536 and recurrent_precision == "bf16"
+            and compensated_cell and preserve_cell_residual and compensated_tanh and fused_projection):
+        raise ValueError("Paired sigmoid requires a 1536-wide BF16 fused LSTM with compensated cell and tanh")
     if recurrent_precision == "if8" and padded > TANH_CHUNK_ELEMENTS:
         raise ValueError("IF8 recurrent streaming requires padded hidden width <=4096")
     if (compensated_cell or compensated_tanh or fused_projection) and recurrent_precision == "bf16" and padded * 64 > udc.URAM_NEAR_FULL_ELEMENTS:
@@ -218,7 +226,8 @@ def prepare_lstm(lstm_module, image, *, input_shape: tuple[int, int],
     return LSTMPlan(sequence, width, padded, input_address, output_address,
                     scratch_address, workspace_bytes, identity_address,
                     zero_address, bool(skip), tuple(layers), regions, recurrent_precision,
-                    compensated_cell, preserve_cell_residual, compensated_tanh, fused_projection)
+                    compensated_cell, preserve_cell_residual, compensated_tanh, fused_projection,
+                    paired_sigmoid)
 
 
 def _copy(engine, source: int, output: int, count: int) -> None:
@@ -345,7 +354,7 @@ def _recurrent_projection_sram(engine, plan, layer, hidden, projection):
     for first, take, gate in tiles:
         kwargs = {}
         if plan.fused_projection:
-            sigmoid = gate != 2
+            sigmoid = gate != 2 and not plan.paired_sigmoid
             kwargs = dict(lalu_mode=udc.LALU_MODE.ACT_NO_X if sigmoid else udc.LALU_MODE.BYPASS,
                           lalu_a=udc.LALU_ACT_SIGMOID_A if sigmoid else 0,
                           lalu_b=udc.LALU_ACT_SIGMOID_B if sigmoid else 0)
@@ -479,6 +488,9 @@ def _lstm_tanh_sram(engine, plan, source, output, count):
 
 def _lstm_step_sram(engine, plan, projection, previous_cell, output):
     """Fuse pointwise gate/state math after one recurrent projection."""
+    if plan.paired_sigmoid:
+        from bigcodec_sigmoid import paired_lstm_step_sram
+        return paired_lstm_step_sram(engine, plan, projection, previous_cell, output)
     width = plan.padded_width
     if plan.fused_projection:
         engine.broadcast_mul(1., 0x8000, 0, 4 * width)
@@ -518,6 +530,16 @@ def _lstm_step_sram(engine, plan, projection, previous_cell, output):
 
 def emit_lstm(engine, plan: LSTMPlan) -> None:
     """Emit all recurrence into the device program; no host tensor computation."""
+    width = plan.padded_width
+    if (width <= TANH_CHUNK_ELEMENTS
+            and (plan.recurrent_precision == "if8" or width * 64 <= udc.URAM_NEAR_FULL_ELEMENTS)):
+        from bigcodec_lstm_loop import emit_lstm as emit_loop
+        return emit_loop(engine, plan)
+    _emit_lstm_unrolled(engine, plan)
+
+
+def _emit_lstm_unrolled(engine, plan: LSTMPlan) -> None:
+    """Fallback for wide DRAM recurrence; also the loop's arithmetic reference."""
     width = plan.padded_width
     address = {name: region[0] for name, region in plan.regions.items()}
 

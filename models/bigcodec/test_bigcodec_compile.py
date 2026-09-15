@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from bigcodec_common import DEFAULT_CHECKPOINT, load_models
-from bigcodec_compile import Arena, build_graph, compiled_sample_count, plan_memory, convolution_reuse_pixels, _prepare_operation, emit_operation, shared
+from bigcodec_compile import Arena, build_graph, compiled_sample_count, plan_memory, convolution_reuse_pixels, _prepare_operation, emit_operation, _lstm_numerics, shared
 from bigcodec_layout import LEGACY_LAYOUT, EXTENDED_LAYOUT, LARGE_PROGRAM_LAYOUT, layout_for_hardware
 from bigcodec_vq.activations import SnakeBeta
 from bigcodec_vq.alias_free_torch import Activation1d
@@ -214,6 +214,27 @@ class BigCodecGraphTest(unittest.TestCase):
                        dict(lstm_fused_gates=1)):
             with self.assertRaises(ValueError):
                 build_graph(*models, 400, **kwargs)
+
+    def test_paired_sigmoid_is_limited_to_corrected_bf16_decoder(self):
+        graph = SimpleNamespace(lstm_math_scope="decoder", lstm_precision="bf16",
+            lstm_cell_precision="compensated", lstm_tanh_precision="compensated",
+            lstm_fused_gates=True, tensors={"source": SimpleNamespace(shape=(317, 1536))})
+        decoder = SimpleNamespace(name="decoder.model.1", inputs=("source",))
+        encoder = SimpleNamespace(name="encoder.block.6", inputs=("source",))
+        self.assertTrue(_lstm_numerics(graph, decoder)["paired_sigmoid"])
+        self.assertFalse(_lstm_numerics(graph, encoder)["paired_sigmoid"])
+        for scope in ("both", "decoder"):
+            for precision in ("bf16", "encoder-if8"):
+                variant = SimpleNamespace(**(vars(graph) | dict(lstm_math_scope=scope, lstm_precision=precision)))
+                self.assertTrue(_lstm_numerics(variant, decoder)["paired_sigmoid"])
+                self.assertFalse(_lstm_numerics(variant, encoder)["paired_sigmoid"])
+        for override in (dict(lstm_math_scope="encoder"), dict(lstm_precision="if8"),
+                dict(lstm_cell_precision="products"), dict(lstm_cell_precision="bf16"),
+                dict(lstm_tanh_precision="bf16"), dict(lstm_fused_gates=False),
+                dict(tensors={"source": SimpleNamespace(shape=(317, 64))})):
+            with self.subTest(override=override):
+                variant = SimpleNamespace(**(vars(graph) | override))
+                self.assertFalse(_lstm_numerics(variant, decoder)["paired_sigmoid"])
 
     def test_quantizer_precision_flags_reach_packing_without_changing_memory_shape(self):
         plain = plan_memory(build_graph(*tiny_models(), 400))

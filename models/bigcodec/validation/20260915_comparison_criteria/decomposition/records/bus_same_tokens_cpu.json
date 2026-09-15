@@ -1,0 +1,91 @@
+{
+  "case": "bus",
+  "recurrent_precision": "bf16",
+  "variant": "selected",
+  "samples": 378916,
+  "sample_rate": 16000,
+  "padded_samples": 379000,
+  "frames": 1895,
+  "tokens_matching_official": 1736,
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "source_files_sha256": {
+    "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+    "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+    "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+    "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+    "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+    "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+    "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+    "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+  },
+  "metrics": {
+    "full_fpga_vs_official_l2": 0.2055055276659087,
+    "token_only_cpu_vs_official_l2": 0.19566882200325023,
+    "same_token_fpga_decoder_vs_cpu_l2": 0.04628410070736978,
+    "decoder_error_relative_to_official_energy": 0.045888051719590386,
+    "reference_energy": 1854.575545013583,
+    "same_token_cpu_energy": 1822.9724580646744,
+    "full_error_energy": 78.32340232229689,
+    "token_error_energy": 71.00481325636669,
+    "decoder_error_energy": 3.9052043735935644,
+    "two_error_cross_term": 3.413384692336638,
+    "two_error_cross_term_relative_to_reference_energy": 0.0018405207064841557,
+    "token_decoder_error_cosine": 0.10249188073884143,
+    "error_interaction": "reinforcement",
+    "fraction_of_component_energy_cancelled": -0.04556646494462251,
+    "scalar_identity_residual": 0.0,
+    "vector_identity_max_abs_residual": 0.0,
+    "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+  },
+  "cpu_decode_s": 27.861222240000643,
+  "cpu_decode_rtf": 1.176460101552878,
+  "cache_reuse": "verified_bus_cache",
+  "files": {
+    "fpga_wav": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.wav",
+      "sha256": "2cdb24367220760833115a108983cc9315eb12fdf16ecd03e9026e877dd904cb",
+      "bytes": 1515744
+    },
+    "actual_tokens": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.tokens.npz",
+      "sha256": "3a419e9624d515598da2f88fd834d7f88db17e2e6efb151f9db8ed4aa0fe99b5",
+      "bytes": 4183
+    },
+    "fpga_metrics": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.metrics.json",
+      "sha256": "8e2b5f869ac3600a9348967e4c7f0d51ddff272b363be8e733e2ebf903b104af",
+      "bytes": 3396
+    },
+    "fpga_comparison": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.comparison.json",
+      "sha256": "97981740d20fc2daa7b8b3ef450d13615f07f5353aa5521fc6b2c628cda09ede",
+      "bytes": 1741
+    },
+    "same_token_cpu_wav": {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition/decoder_scope_same_tokens_cpu.wav",
+      "sha256": "1327256dc183bb2b289052574c91572e67b4e8c0151999b92689b66a14ca7e9f",
+      "bytes": 1515744
+    },
+    "reference_wav": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+      "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+      "bytes": 1515744
+    },
+    "official_tokens": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz",
+      "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+      "bytes": 4178
+    }
+  },
+  "fpga_rtf": 4.823954804378569,
+  "fpga_audio_processing_s": 114.24210366599436,
+  "cache_provenance": {
+    "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition/three_variants.json",
+    "sha256": "bbdca0ca67038f4e1cd1aa7f6d0ef5275f6ddc187a8e6cc693e105890fc3fba1",
+    "bytes": 13445
+  }
+}

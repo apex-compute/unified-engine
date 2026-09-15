@@ -8,7 +8,9 @@ import sys
 
 import torch
 
-from bigcodec_lstm import emit_lstm, prepare_lstm, scratch_bytes, tanh_identity, tanh_scratch_bytes, pade_tanh, quantize_recurrent_if8, udc
+# Numeric emulators execute straight-line primitives; ISA loop expansion and
+# public dispatch are independently checked in test_bigcodec_lstm_loop.py.
+from bigcodec_lstm import _emit_lstm_unrolled as emit_lstm, prepare_lstm, scratch_bytes, tanh_identity, tanh_scratch_bytes, pade_tanh, quantize_recurrent_if8, udc
 from bigcodec_lstm import _two_product_sram, _two_sum_sram, _compensated_cell_sram
 from bigcodec_lstm import _tanh_sram
 
@@ -707,6 +709,11 @@ class BigCodecLSTMTest(unittest.TestCase):
             prepare_lstm(torch.nn.LSTM(64, 64, bidirectional=True, batch_first=True).eval(), MemoryImage(engine), **kwargs)
         with self.assertRaisesRegex(ValueError, "precision"):
             prepare_lstm(module.eval(), MemoryImage(engine), recurrent_precision="fp8", **kwargs)
+        with self.assertRaisesRegex(ValueError, "paired_sigmoid must be a bool"):
+            prepare_lstm(module.eval(), MemoryImage(engine), paired_sigmoid=1, **kwargs)
+        with self.assertRaisesRegex(ValueError, "Paired sigmoid requires a 1536-wide"):
+            prepare_lstm(module.eval(), MemoryImage(engine), paired_sigmoid=True,
+                compensated_cell=True, compensated_tanh=True, fused_projection=True, **kwargs)
 
     def test_pade_tanh_preserves_tiny_values_and_bounds_full_range(self):
         tiny = torch.tensor([-1e-5, -1e-3, 0, 1e-3, 1e-5]).bfloat16().float()

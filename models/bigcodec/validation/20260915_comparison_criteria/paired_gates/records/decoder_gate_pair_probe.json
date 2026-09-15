@@ -1,0 +1,192 @@
+{
+  "scope": "Offline control for retaining sigmoid gate residuals. Native BF19/BF20 matrix reduction is NOT modeled.",
+  "source_sha256": "c0c87fef98989b446b02bcaeaa9b300642586c397d27563e6ddea17e7c6873f2",
+  "reference_sha256": "f730f5ac802876a506bdb14fab98e5f6de5ce5ca02dc3ab73e9af51885191f9b",
+  "script_sha256": "15d57b68ca510132246af5cb063061a896c532aad242db4a730b340761c66d75",
+  "native_samples": 63295,
+  "cpu_core": 12,
+  "threads": 1,
+  "variants": [
+    {
+      "name": "native_like_current",
+      "lstm_vs_official": {
+        "relative_l2": 0.009170461840928781,
+        "max_abs": 0.1250990629196167,
+        "rmse": 0.0025269265687701266,
+        "finite": true
+      },
+      "downstream_wave_vs_official": {
+        "relative_l2": 0.0972220522433274,
+        "max_abs": 0.05816113203763962,
+        "rmse": 0.007151164785022124,
+        "finite": true
+      },
+      "stats": [
+        {
+          "layer": 0,
+          "gate_relative_l2": 0.0015361988567083123,
+          "gate_abs_over8": 175,
+          "gate_count": 1460736
+        },
+        {
+          "layer": 1,
+          "gate_relative_l2": 0.0015442021948273961,
+          "gate_abs_over8": 194,
+          "gate_count": 1460736
+        }
+      ],
+      "elapsed_s": 15.015480821999518
+    },
+    {
+      "name": "ideal_fused_bf16",
+      "lstm_vs_official": {
+        "relative_l2": 0.005833090090486248,
+        "max_abs": 0.05982077121734619,
+        "rmse": 0.0016073116690692492,
+        "finite": true
+      },
+      "downstream_wave_vs_official": {
+        "relative_l2": 0.04089262883598547,
+        "max_abs": 0.023740436881780624,
+        "rmse": 0.003007855939586493,
+        "finite": true
+      },
+      "stats": [
+        {
+          "layer": 0,
+          "gate_relative_l2": 0.0014798109022911782,
+          "gate_abs_over8": 174,
+          "gate_count": 1460736
+        },
+        {
+          "layer": 1,
+          "gate_relative_l2": 0.0014872251309220957,
+          "gate_abs_over8": 195,
+          "gate_count": 1460736
+        }
+      ],
+      "elapsed_s": 14.923971222999171
+    },
+    {
+      "name": "ideal_rounded_bf16",
+      "lstm_vs_official": {
+        "relative_l2": 0.005337353834380486,
+        "max_abs": 0.058233603835105896,
+        "rmse": 0.0014707112297036593,
+        "finite": true
+      },
+      "downstream_wave_vs_official": {
+        "relative_l2": 0.029807473845486827,
+        "max_abs": 0.018593136221170425,
+        "rmse": 0.0021924877368441017,
+        "finite": true
+      },
+      "stats": [
+        {
+          "layer": 0,
+          "gate_relative_l2": 0.0015866764463774304,
+          "gate_abs_over8": 174,
+          "gate_count": 1460736
+        },
+        {
+          "layer": 1,
+          "gate_relative_l2": 0.0015780441999449463,
+          "gate_abs_over8": 194,
+          "gate_count": 1460736
+        }
+      ],
+      "elapsed_s": 14.737300774999312
+    },
+    {
+      "name": "pade_rounded_bf16",
+      "lstm_vs_official": {
+        "relative_l2": 0.009937046364006762,
+        "max_abs": 0.14834225177764893,
+        "rmse": 0.0027381594196531586,
+        "finite": true
+      },
+      "downstream_wave_vs_official": {
+        "relative_l2": 0.11404560122951832,
+        "max_abs": 0.06952449679374695,
+        "rmse": 0.008388620365244036,
+        "finite": true
+      },
+      "stats": [
+        {
+          "layer": 0,
+          "gate_relative_l2": 0.0016259055697842384,
+          "gate_abs_over8": 172,
+          "gate_count": 1460736
+        },
+        {
+          "layer": 1,
+          "gate_relative_l2": 0.0016173458294663186,
+          "gate_abs_over8": 195,
+          "gate_count": 1460736
+        }
+      ],
+      "elapsed_s": 31.49585341599959
+    },
+    {
+      "name": "pade_rounded_pair",
+      "lstm_vs_official": {
+        "relative_l2": 0.0038498046348899345,
+        "max_abs": 0.03585502505302429,
+        "rmse": 0.0010608161055814342,
+        "finite": true
+      },
+      "downstream_wave_vs_official": {
+        "relative_l2": 0.01004166710607461,
+        "max_abs": 0.006198016926646233,
+        "rmse": 0.0007386144864762813,
+        "finite": true
+      },
+      "stats": [
+        {
+          "layer": 0,
+          "gate_relative_l2": 0.000568165749566016,
+          "gate_abs_over8": 174,
+          "gate_count": 1460736
+        },
+        {
+          "layer": 1,
+          "gate_relative_l2": 0.0005218490873632348,
+          "gate_abs_over8": 194,
+          "gate_count": 1460736
+        }
+      ],
+      "elapsed_s": 32.09541581399935
+    },
+    {
+      "name": "ideal_rounded_pair",
+      "lstm_vs_official": {
+        "relative_l2": 0.003980562439099129,
+        "max_abs": 0.03390190005302429,
+        "rmse": 0.0010968465013523009,
+        "finite": true
+      },
+      "downstream_wave_vs_official": {
+        "relative_l2": 0.013514306469178684,
+        "max_abs": 0.008082674350589514,
+        "rmse": 0.0009940443581103236,
+        "finite": true
+      },
+      "stats": [
+        {
+          "layer": 0,
+          "gate_relative_l2": 0.0005679218806359708,
+          "gate_abs_over8": 173,
+          "gate_count": 1460736
+        },
+        {
+          "layer": 1,
+          "gate_relative_l2": 0.000521695193408908,
+          "gate_abs_over8": 194,
+          "gate_count": 1460736
+        }
+      ],
+      "elapsed_s": 15.34221641899967
+    }
+  ],
+  "status": "complete"
+}

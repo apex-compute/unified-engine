@@ -1,0 +1,41 @@
+{
+  "scope": "Historical diagnostic source snapshots and native receipts; original helper imports/paths retained. Production source is in models/bigcodec.",
+  "files": {
+    "loop_decoder_baseline_native.json": {
+      "sha256": "af9e09890cbec9610ac39f647c14cf55388b83d7dbc62116000b809f14c0ce3b",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/loop_decoder_baseline_native.json"
+    },
+    "loop_decoder_candidate_native.json": {
+      "sha256": "8a61c33dc081495b68b856c6a90b4d0cd38615aff084f742654092a8df9b52ba",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/loop_decoder_candidate_native.json"
+    },
+    "loop_lstm_tests.json": {
+      "sha256": "1cb83044588c0832219639070b2c00e5b5c44bdd3f2f2a54e7b17c07d8492be4",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/loop_lstm_tests.json"
+    },
+    "production_sigmoid_capture_parity.json": {
+      "sha256": "19d63b50c5cc8a433f02be5b561224fae316e5ae4e738731fb2ee627ec600de9",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/production_sigmoid_capture_parity.json"
+    },
+    "bus_baseline_image_parity.json": {
+      "sha256": "4e5e887510a34d7d6d143dc41c3a0261a5e772e5d5521d74b519946b934ba6e6",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/bus_baseline_image_parity.json"
+    },
+    "loop_lstm.py": {
+      "sha256": "51fb7ef22981a95e4df3d3e16dd6e41d586a490408ed3213a029712421af8d56",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/loop_lstm.py"
+    },
+    "loop_native.py": {
+      "sha256": "b3fb4bd1dd85c24bbfed693b81715049c463f09427a1e065d756c679a5f2a516",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/loop_native.py"
+    },
+    "loop_port_check.json": {
+      "sha256": "b7383f469e18056e04c2a63245d608e5ce93c08e1e87011e6aa92490fc8483c0",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/loop_port_check.json"
+    },
+    "loop_production_tests.log": {
+      "sha256": "04be62caaa50016ea68dd847579d8eeb81f8f17320d43a1fc45e4979948a50c4",
+      "source": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/loop_production_tests.log"
+    }
+  }
+}

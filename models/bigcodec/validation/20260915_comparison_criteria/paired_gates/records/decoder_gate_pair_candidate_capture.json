@@ -1,0 +1,16 @@
+{
+  "name": "decoder_gate_pair_candidate",
+  "instructions": 2915032,
+  "halt_index": 2915030,
+  "program_bytes": 93281024,
+  "resident_bytes": 168835968,
+  "program_sha256": "dfb9c5476426b764a7bb900b0985a78de992fdf727996e99d5ddea1160cd6909",
+  "resident_sha256": "ef8d4adf4de01ed7d464f7b0a4f87269e252483f1f08ee6e78dfc6c02297f99a",
+  "input_sha256": "66242b3fbc6279796be42664c97e58c00a740d69e6a7773aade20ed42dbd4cd9",
+  "hardware_executed": false,
+  "scope": "Diagnostic only: paired sigmoid gates; no production source is modified.\n\nOffline self-test/capture is default. Root alone may explicitly pass --execute.\nDots store BF16 logits before paired sigmoid, unlike the current fused SFU path.\n",
+  "mode": "candidate",
+  "source_fp32_sha256": "c0c87fef98989b446b02bcaeaa9b300642586c397d27563e6ddea17e7c6873f2",
+  "expected_model": "FP32 accumulation approximation, not native dot parity",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9"
+}

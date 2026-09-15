@@ -212,10 +212,17 @@ def _filter_numerics(graph, operation):
 
 def _lstm_numerics(graph, operation):
     selected = graph.lstm_math_scope == "both" or operation.name.startswith(graph.lstm_math_scope + ".")
+    # The validated decoder correction retains gate residuals as well as cell
+    # residuals. Keep encoder/IF8/other-width arithmetic unchanged.
+    paired_sigmoid = (selected and operation.name.startswith("decoder.")
+        and graph.tensors[operation.inputs[0]].shape[1] == 1536
+        and graph.lstm_precision != "if8" and graph.lstm_cell_precision == "compensated"
+        and graph.lstm_tanh_precision == "compensated" and graph.lstm_fused_gates)
     return dict(compensated_cell=selected and graph.lstm_cell_precision != "bf16",
                 preserve_cell_residual=graph.lstm_cell_precision != "products",
                 compensated_tanh=selected and graph.lstm_tanh_precision == "compensated",
-                fused_projection=selected and graph.lstm_fused_gates)
+                fused_projection=selected and graph.lstm_fused_gates,
+                paired_sigmoid=paired_sigmoid)
 
 
 def _bf16_convolutions():
@@ -590,6 +597,8 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
         udc.UE_AXI_DATA_WIDTH_BITS = previous_axi_width
         udc.MAX_DECODER_INSTRUCTIONS = previous_capture_limit
     model_image = torch.frombuffer(image.data, dtype=torch.uint8).clone()
+    paired_operations = [op.name for op in graph.operations
+                         if op.op == "lstm" and op.plan.paired_sigmoid]
     hardware = {
         "memory_layout": layout.name,
         "model_base": layout.model_base, "model_limit": layout.model_limit,
@@ -619,6 +628,8 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
             "lstm_cell": lstm_cell_precision,
             "lstm_tanh": lstm_tanh_precision, "lstm_math_scope": lstm_math_scope,
             "lstm_fused_gates": lstm_fused_gates,
+            "lstm_sigmoid": {op.name: ("compensated-pade-high-low" if op.plan.paired_sigmoid
+                else "native-bf16") for op in graph.operations if op.op == "lstm"},
             "center_quantizer_scores": center_quantizer_scores,
             "compensated_codebook": compensated_codebook,
             "filter_accumulation": filter_accumulation, "filter_math_scope": filter_math_scope,
@@ -637,7 +648,9 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
                 "math_scope": lstm_math_scope,
                 "cell_arithmetic": lstm_cell_precision,
                 "tanh_arithmetic": lstm_tanh_precision,
-                "fused_projection_bias_sigmoid": lstm_fused_gates,
+                "fused_projection_bias": lstm_fused_gates,
+                "timestep_program": "Counted device loop for SRAM recurrence; unrolled DRAM fallback",
+                "paired_sigmoid_operations": paired_operations,
             },
             "quantizer": "SRAM comparison masks and first seven tournament rounds",
             "waveform_tanh": "SRAM Pade evaluation with full 128-byte sample rows and explicit zero padding",
@@ -655,6 +668,9 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
             "tanh": "BF16 odd Pade [7/6] with native reciprocal",
             "lstm_tanh": ("BF16 high/low Pade coefficients, products and sums with reciprocal refinement"
                 if lstm_tanh_precision == "compensated" else "BF16 Pade"),
+            "lstm_sigmoid": ("Selected 1536-wide BF16 decoder: BF16 logits, sigmoid via compensated "
+                "tanh(x/2) clamped to [-8,8], gate high/low retained in cell and hidden products; "
+                "other LSTMs use the native sigmoid" if paired_operations else "Native sigmoid with BF16 gate storage"),
             "tanh_argument_clamp": TANH_ARGUMENT_LIMIT, "tanh_output_clamp": [-1, 1],
             "quantizer": "BF16 nearest normalized-codebook tournament",
             "quantizer_score_offset_before_writeback": -1 if center_quantizer_scores else 0,
@@ -679,7 +695,7 @@ def main():
     parser.add_argument("--lstm-math-scope", choices=("encoder", "decoder", "both"), default="both",
                         help="LSTM stacks that use the selected cell/tanh arithmetic")
     parser.add_argument("--lstm-fused-gates", action=argparse.BooleanOptionalAction, default=False,
-                        help="Fuse recurrent dot, input projection bias and sigmoid before BF16 writeback")
+                        help="Fuse recurrent dot and input projection bias; corrected BF16 decoder retains sigmoid gate residuals")
     parser.add_argument("--center-quantizer-scores", action=argparse.BooleanOptionalAction, default=False,
                         help="Subtract one inside the codebook dot product to preserve close score differences")
     parser.add_argument("--compensated-codebook", action=argparse.BooleanOptionalAction, default=False,
