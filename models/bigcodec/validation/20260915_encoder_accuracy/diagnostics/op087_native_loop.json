@@ -1,0 +1,426 @@
+{
+  "status": "PASS",
+  "mode": "execute",
+  "cpu_core": 6,
+  "threads": 1,
+  "command": [
+    "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/run_precision_loop.py",
+    "--execute",
+    "--cpu-core",
+    "6",
+    "--ops",
+    "87",
+    "--variants",
+    "baseline",
+    "dc",
+    "split",
+    "--expected-version",
+    "0x90f1f464",
+    "--output-dir",
+    "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/precision_activation_op087_native_loop"
+  ],
+  "expected_version": "0x90f1f464",
+  "scope": "Isolated activation with fixed official FP32 teacher input rounded BF16; no cumulative encoder or token claim.",
+  "cases": [
+    {
+      "name": "op_087_baseline",
+      "coefficient_precision": "baseline",
+      "shape": [
+        317,
+        1536
+      ],
+      "padded_width": 1536,
+      "scratch_bytes": 1947648,
+      "instructions": 3278,
+      "program_bytes": 104896,
+      "program_sha256": "255b21994615dca88718f4ef28ab735d0e2783a2b8d5e655dd7e3be85b662f62",
+      "resident_bytes": 242112,
+      "resident_sha256": "dd1f00ec9e625a9fc23d9722531fff29649e042f6e36c4fc4e3363a8f79d1dc4",
+      "program_address": 2416056320,
+      "input_sha256": "31023b68b03bd4dd50fe1fa40c1e738adc40b5f325c1c9f2b606b25cb4b47f1f",
+      "hardware_executed": true,
+      "packed_identity": {
+        "address": 2415919104,
+        "bytes": 8192,
+        "dtype": "bfloat16",
+        "packed_sha256": "e2d2dee1fb26990620f163c977e8044e35a0c9cc1ad83360a21b52650ed6e398",
+        "checked": true
+      },
+      "offline_guards_intact": true,
+      "offline_input_unchanged": true,
+      "offline_finite": true,
+      "offline_padding_zero": true,
+      "independent_grouped_conv_oracle": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "exact_mismatches": 0,
+        "bf16_bit_mismatches": 0
+      },
+      "independent_same_input_stage_oracles": {
+        "upsample": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        },
+        "same_input_snake": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        },
+        "same_input_downsample": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        }
+      },
+      "modeled_vs_official_fp32": {
+        "relative_l2": 0.0068881372875337545,
+        "max_abs": 0.0553743839263916,
+        "exact_mismatches": 486910,
+        "bf16_bit_mismatches": 346930
+      },
+      "model_scope": "FP64 matrix dots/BF16 storage; native BF19-to-BF16 elementwise. Grouped-convolution oracle uses FP64 effective taps, rounded BF16 once per FIR. Native BF20 ladder is not emulated.",
+      "index": 87,
+      "module": "encoder.block.7",
+      "teacher_input_file": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_encoder_fp32/op_086.pt",
+      "teacher_input_sha256": "054be43a887466e05e1a770275df194a0b683a9cfb8480a6e78da0573bebe5a1",
+      "teacher_reference_file": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_encoder_fp32/op_087.pt",
+      "teacher_reference_sha256": "f78bb8f4d8493bdb00c694e8b8bdec423a9a4e416623617dd91d17d2e227349c",
+      "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+      "historical_native_teacher_file": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/native_teacher/op_087.pt",
+      "historical_native_teacher_sha256": "51f39e1ecd75400942aac13e324ddbb07303c99115120efd5c3e956fd96234cf",
+      "historical_native_vs_official_fp32": {
+        "relative_l2": 0.0068881372875337545,
+        "max_abs": 0.0553743839263916,
+        "exact_mismatches": 486910,
+        "bf16_bit_mismatches": 346930
+      },
+      "historical_note": "Stored prior teacher replay; fresh baseline variant provides same-board comparison.",
+      "baseline_model_bitexact_historical_native": true,
+      "starts": 1,
+      "hardware_version": "0x90f1f464",
+      "halts": 1,
+      "host_s": 0.007744350004941225,
+      "fpga_cycles": 2568192,
+      "fpga_s": 0.007706502625656415,
+      "guards_intact": true,
+      "input_unchanged": true,
+      "finite": true,
+      "padding_zero": true,
+      "version_unchanged": true,
+      "output_sha256": "a74302ab595b4c4a87d028f4e61f73588f0961fa5fbf82ddf957a524d8351f48",
+      "numerical_controls": {
+        "nonzero_output_for_nonzero_reference": true,
+        "baseline_bitexact_historical_native": true
+      },
+      "comparison": {
+        "native_vs_official_fp32": {
+          "relative_l2": 0.0068881372875337545,
+          "max_abs": 0.0553743839263916,
+          "exact_mismatches": 486910,
+          "bf16_bit_mismatches": 346930
+        },
+        "native_vs_fp64_dot_oracle": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        },
+        "native_snake_vs_fp64_dot_oracle": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        },
+        "native_vs_historical_native": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        }
+      }
+    },
+    {
+      "name": "op_087_dc",
+      "coefficient_precision": "dc",
+      "shape": [
+        317,
+        1536
+      ],
+      "padded_width": 1536,
+      "scratch_bytes": 3520512,
+      "instructions": 16772,
+      "program_bytes": 536704,
+      "program_sha256": "9ca52c3f3a24dd16bead1768dded29b16bc568cf16234d6336ce4b7dd9992f80",
+      "resident_bytes": 706688,
+      "resident_sha256": "089d8a8e2951ab6edf34f0fa615c5444555e2ebb0420628f89643003c75667c1",
+      "program_address": 2416089088,
+      "input_sha256": "31023b68b03bd4dd50fe1fa40c1e738adc40b5f325c1c9f2b606b25cb4b47f1f",
+      "hardware_executed": true,
+      "packed_identity": {
+        "address": 2415919104,
+        "bytes": 8192,
+        "dtype": "bfloat16",
+        "packed_sha256": "e2d2dee1fb26990620f163c977e8044e35a0c9cc1ad83360a21b52650ed6e398",
+        "checked": true
+      },
+      "offline_guards_intact": true,
+      "offline_input_unchanged": true,
+      "offline_finite": true,
+      "offline_padding_zero": true,
+      "independent_grouped_conv_oracle": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "exact_mismatches": 0,
+        "bf16_bit_mismatches": 0
+      },
+      "independent_same_input_stage_oracles": {
+        "upsample": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        },
+        "same_input_snake": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        },
+        "same_input_downsample": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        }
+      },
+      "modeled_vs_official_fp32": {
+        "relative_l2": 0.004616707964703984,
+        "max_abs": 0.03640854358673096,
+        "exact_mismatches": 486909,
+        "bf16_bit_mismatches": 284115
+      },
+      "model_scope": "FP64 matrix dots/BF16 storage; native BF19-to-BF16 elementwise. Grouped-convolution oracle uses FP64 effective taps, rounded BF16 once per FIR. Native BF20 ladder is not emulated.",
+      "index": 87,
+      "module": "encoder.block.7",
+      "teacher_input_file": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_encoder_fp32/op_086.pt",
+      "teacher_input_sha256": "054be43a887466e05e1a770275df194a0b683a9cfb8480a6e78da0573bebe5a1",
+      "teacher_reference_file": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_encoder_fp32/op_087.pt",
+      "teacher_reference_sha256": "f78bb8f4d8493bdb00c694e8b8bdec423a9a4e416623617dd91d17d2e227349c",
+      "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+      "historical_native_teacher_file": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/native_teacher/op_087.pt",
+      "historical_native_teacher_sha256": "51f39e1ecd75400942aac13e324ddbb07303c99115120efd5c3e956fd96234cf",
+      "historical_native_vs_official_fp32": {
+        "relative_l2": 0.0068881372875337545,
+        "max_abs": 0.0553743839263916,
+        "exact_mismatches": 486910,
+        "bf16_bit_mismatches": 346930
+      },
+      "historical_note": "Stored prior teacher replay; fresh baseline variant provides same-board comparison.",
+      "starts": 1,
+      "hardware_version": "0x90f1f464",
+      "halts": 1,
+      "host_s": 0.02542649100359995,
+      "fpga_cycles": 8453824,
+      "fpga_s": 0.02536781395348837,
+      "guards_intact": true,
+      "input_unchanged": true,
+      "finite": true,
+      "padding_zero": true,
+      "version_unchanged": true,
+      "output_sha256": "a44d2a396008cd7b165528e9a9a6a696f61268391bc825ac0cb20293e052dbec",
+      "numerical_controls": {
+        "nonzero_output_for_nonzero_reference": true
+      },
+      "comparison": {
+        "native_vs_official_fp32": {
+          "relative_l2": 0.004632554885000571,
+          "max_abs": 0.03640854358673096,
+          "exact_mismatches": 486909,
+          "bf16_bit_mismatches": 285054
+        },
+        "native_vs_fp64_dot_oracle": {
+          "relative_l2": 0.002258266026716536,
+          "max_abs": 0.03125,
+          "exact_mismatches": 81215,
+          "bf16_bit_mismatches": 81215
+        },
+        "native_snake_vs_fp64_dot_oracle": {
+          "relative_l2": 0.002201371616580662,
+          "max_abs": 0.046875,
+          "exact_mismatches": 64311,
+          "bf16_bit_mismatches": 64311
+        },
+        "native_vs_historical_native": {
+          "relative_l2": 0.006415228733133358,
+          "max_abs": 0.0625,
+          "exact_mismatches": 318514,
+          "bf16_bit_mismatches": 318514
+        }
+      }
+    },
+    {
+      "name": "op_087_split",
+      "coefficient_precision": "split",
+      "shape": [
+        317,
+        1536
+      ],
+      "padded_width": 1536,
+      "scratch_bytes": 4700160,
+      "instructions": 16934,
+      "program_bytes": 541888,
+      "program_sha256": "95e7cb1ddd19bc9295ea93ff2daa0028d11f9c6da83b8d23fff104ec765aa7b1",
+      "resident_bytes": 744640,
+      "resident_sha256": "da277c5579976f18ac9b7ed152d6d483ef0d81f22fb97a25a8f18bb85a9cae3e",
+      "program_address": 2416121856,
+      "input_sha256": "31023b68b03bd4dd50fe1fa40c1e738adc40b5f325c1c9f2b606b25cb4b47f1f",
+      "hardware_executed": true,
+      "packed_identity": {
+        "address": 2415919104,
+        "bytes": 8192,
+        "dtype": "bfloat16",
+        "packed_sha256": "e2d2dee1fb26990620f163c977e8044e35a0c9cc1ad83360a21b52650ed6e398",
+        "checked": true
+      },
+      "offline_guards_intact": true,
+      "offline_input_unchanged": true,
+      "offline_finite": true,
+      "offline_padding_zero": true,
+      "independent_grouped_conv_oracle": {
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "exact_mismatches": 0,
+        "bf16_bit_mismatches": 0
+      },
+      "independent_same_input_stage_oracles": {
+        "upsample": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        },
+        "same_input_snake": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        },
+        "same_input_downsample": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0,
+          "bf16_bit_mismatches": 0
+        }
+      },
+      "modeled_vs_official_fp32": {
+        "relative_l2": 0.0044662096116695246,
+        "max_abs": 0.03640854358673096,
+        "exact_mismatches": 486907,
+        "bf16_bit_mismatches": 260089
+      },
+      "model_scope": "FP64 matrix dots/BF16 storage; native BF19-to-BF16 elementwise. Grouped-convolution oracle uses FP64 effective taps, rounded BF16 once per FIR. Native BF20 ladder is not emulated.",
+      "index": 87,
+      "module": "encoder.block.7",
+      "teacher_input_file": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_encoder_fp32/op_086.pt",
+      "teacher_input_sha256": "054be43a887466e05e1a770275df194a0b683a9cfb8480a6e78da0573bebe5a1",
+      "teacher_reference_file": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_encoder_fp32/op_087.pt",
+      "teacher_reference_sha256": "f78bb8f4d8493bdb00c694e8b8bdec423a9a4e416623617dd91d17d2e227349c",
+      "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+      "historical_native_teacher_file": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/native_teacher/op_087.pt",
+      "historical_native_teacher_sha256": "51f39e1ecd75400942aac13e324ddbb07303c99115120efd5c3e956fd96234cf",
+      "historical_native_vs_official_fp32": {
+        "relative_l2": 0.0068881372875337545,
+        "max_abs": 0.0553743839263916,
+        "exact_mismatches": 486910,
+        "bf16_bit_mismatches": 346930
+      },
+      "historical_note": "Stored prior teacher replay; fresh baseline variant provides same-board comparison.",
+      "starts": 1,
+      "hardware_version": "0x90f1f464",
+      "halts": 1,
+      "host_s": 0.037742438005807344,
+      "fpga_cycles": 12069344,
+      "fpga_s": 0.036217086271567896,
+      "guards_intact": true,
+      "input_unchanged": true,
+      "finite": true,
+      "padding_zero": true,
+      "version_unchanged": true,
+      "output_sha256": "fa2e73ff0bd21f1935b027f7ad3e0ee8333db3b233d4113842a731cc8088943d",
+      "numerical_controls": {
+        "nonzero_output_for_nonzero_reference": true
+      },
+      "comparison": {
+        "native_vs_official_fp32": {
+          "relative_l2": 0.0045166372427883714,
+          "max_abs": 0.03640854358673096,
+          "exact_mismatches": 486908,
+          "bf16_bit_mismatches": 262780
+        },
+        "native_vs_fp64_dot_oracle": {
+          "relative_l2": 0.0023926884132613553,
+          "max_abs": 0.03125,
+          "exact_mismatches": 87160,
+          "bf16_bit_mismatches": 87160
+        },
+        "native_snake_vs_fp64_dot_oracle": {
+          "relative_l2": 0.002307538259347753,
+          "max_abs": 0.046875,
+          "exact_mismatches": 68772,
+          "bf16_bit_mismatches": 68772
+        },
+        "native_vs_historical_native": {
+          "relative_l2": 0.006532443545663385,
+          "max_abs": 0.0625,
+          "exact_mismatches": 327324,
+          "bf16_bit_mismatches": 327324
+        }
+      }
+    }
+  ],
+  "clock_period_ns": 3.000750187546887,
+  "dram_gib": 2,
+  "source_sha256": {
+    "andromeda_hw_info.py": "a9f4b9f4f59c6a78cbc4e1211f0c1c13a1202468bf136ffe99d5b81f0fd22f7a",
+    "models/bigcodec/bigcodec_activation.py": "68727823e6054024f9f12c9a01e573a64576a745c4ac1b4cee48ef89f776d2ce",
+    "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/precision_activation.py": "462d82c3c21761f97920164a5a8ded58dcb152140d3ce69ad6a368986cac71d1",
+    "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/precision_fir.py": "d49c1008756f6e12154bace657a053251f276ae0248d61626c37201c7a23e385",
+    "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/precision_fir_direct.py": "e124ec37037c7d270f13e3ad8d0746b1224777cb75771a543b6275c6945a2d37",
+    "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/precision_fir_loop.py": "534c1785c161ff5614e0dfef265514c39d6503b882330de38fe3d6ec326ee0f1",
+    "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/run_precision_loop.py": "79f1c2463203a39adacda4191b028e79c19a7a1cb58e8f2cddad6613b2b23ceb",
+    "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+    "models/bigcodec/bigcodec_compile.py": "5da1bc7738ab1f3b7475e022551d61693351a0d66b560c2a2d89f16daea4faab",
+    "models/bigcodec/bigcodec_conv.py": "8718ec8441ad9195ebcdf232ffe21ccfb3bc55d836cef1c25098f98b9e632b53",
+    "models/bigcodec/bigcodec_device.py": "ef719dd88d1530d9ce59bf1626c683bc352e90b6fd0122e7a6dab32c7b8589eb",
+    "models/bigcodec/bigcodec_layout.py": "f2209cb8aef693d924de99e82d9acbdf701509bb9c344decb02b01a1fee379fd",
+    "models/bigcodec/bigcodec_lstm.py": "7c4c08b31b4cdd55f318ddb6dd9546ddf6a58ce3e6d8ec801f4c35e3216259c2",
+    "models/bigcodec/bigcodec_precompiled.py": "365be814cd3b40bc4436ab0809929cf8dd4b5791a60257f7cf63c31d1879c425",
+    "models/bigcodec/bigcodec_quantizer.py": "96e86120b7e4824d3361c44383eea06ec572559e4db743a23d0c0293068ac50d",
+    "models/bigcodec/bigcodec_tanh.py": "998f37fc5c982933ca0cd0eded6a075f20d85b33b3ffaa67aed07f6fc5dc7df5",
+    "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+    "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+    "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+    "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+    "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+    "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+    "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+    "models/bigcodec/test_bigcodec_activation.py": "fef5a7b3af908e7313e6ec9cb37299731da3c9de539653cf31dbb608565c389e",
+    "models/bigcodec/test_bigcodec_lstm.py": "ee9569219c6637ebb5691abd18d5b4cd60b564955c4ccb4f0e662dcdade70834",
+    "models/bigcodec/test_bigcodec_quantizer.py": "3f5af728636f7ee5ac43aec4d335258ba0c256ffeb78102c81ea322b8522fc19",
+    "models/bigcodec/test_bigcodec_tanh.py": "c763caf245718a7a60f0765a6a9a3922163d383e6a385f6ce5ccca66f703d445",
+    "models/bigcodec/validation/20260915_accuracy/numerics_probe.py": "f7f680495e0d7b30a9feeca558d66f1dad269349449b38533671c2d9d66994d7",
+    "models/dpdfnet8khz/dpdfnet8khz_engine.py": "02dd0ac0f6ad02a0418fa43bf584180bc0c7f80ac5e3306f8ab130690de72086",
+    "models/yolov5s/yolov5_common.py": "9a2009b2d5d5118cb4aaff3394caefa4a5d7d8db6738c8c70339b341655ca3f5",
+    "models/yolov5s/yolov5_precompiled.py": "3fe19cd7d559c0bf15cd54723cd3e4279b2d681d4d2566c9353a593e27e1dc32",
+    "quant_lib.py": "8ea8c322e832d0096820e4b24bd08f0717b4b672e0318e02cd8af348b3367e58",
+    "user_dma_core.py": "b213f8dcd0a94fba6d60196d134e2506dc578c3e961672242989640c6484a992"
+  }
+}

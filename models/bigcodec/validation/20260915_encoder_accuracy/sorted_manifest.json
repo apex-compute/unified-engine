@@ -1,0 +1,568 @@
+{
+  "format": "bigcodec-accuracy-inputs-v1",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "baseline": "serial_baseline",
+  "profiles": [
+    {
+      "name": "serial_baseline",
+      "hardware_version": "0x40519e0a",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_input_weights": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        }
+      }
+    },
+    {
+      "name": "sorted_encoder",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_input_weights": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "fuse_encoder_projection": false,
+        "filter_accumulation": "sorted",
+        "filter_math_scope": "encoder",
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        }
+      }
+    }
+  ],
+  "cases": [
+    {
+      "name": "bus",
+      "input": {
+        "path": "../../../dpdfnet/validation/20260914_noisy20s/noisy/bus_noisy.wav",
+        "sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7"
+      },
+      "reference": {
+        "wave": {
+          "path": "../20260914_noisy20s/cpu/bus.wav",
+          "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947"
+        },
+        "tokens": {
+          "path": "../20260914_noisy20s/cpu/bus.tokens.npz",
+          "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1"
+        },
+        "metrics": {
+          "path": "../20260914_noisy20s/cpu/bus.metrics.json",
+          "sha256": "d80002b4d5d2ffbb36499801db0f2db7684d61e7ac9d1e418fe3d2ca662bab2e"
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "wave": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/bus.wav",
+            "sha256": "2cdb24367220760833115a108983cc9315eb12fdf16ecd03e9026e877dd904cb"
+          },
+          "tokens": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/bus.tokens.npz",
+            "sha256": "3a419e9624d515598da2f88fd834d7f88db17e2e6efb151f9db8ed4aa0fe99b5"
+          },
+          "metrics": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/bus.metrics.json",
+            "sha256": "8e2b5f869ac3600a9348967e4c7f0d51ddff272b363be8e733e2ebf903b104af"
+          }
+        },
+        "sorted_encoder": {
+          "wave": {
+            "path": "sorted/bus.wav",
+            "sha256": "c375a68e83ae5ae6ac872db5450e788aff0897a4c01121151d340390074cc5be"
+          },
+          "tokens": {
+            "path": "sorted/bus.tokens.npz",
+            "sha256": "8910fbbc69cda389affc47ea7c073be32bf83fc86c21c560f82b7fb84fff8d18"
+          },
+          "metrics": {
+            "path": "sorted/bus.metrics.json",
+            "sha256": "9a1489ebdb1b7a933d3535b8f214d871b30d9789dbad2aca7c49e2baa56e2316"
+          }
+        }
+      }
+    },
+    {
+      "name": "cafe",
+      "input": {
+        "path": "../../../dpdfnet/validation/20260914_noisy20s/noisy/cafe_noisy.wav",
+        "sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868"
+      },
+      "reference": {
+        "wave": {
+          "path": "../20260914_noisy20s/cpu/cafe.wav",
+          "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e"
+        },
+        "tokens": {
+          "path": "../20260914_noisy20s/cpu/cafe.tokens.npz",
+          "sha256": "c48df28ed8b8998368cca7e603405a6389f68d60cf0ecc7bf9a09af7c20394c4"
+        },
+        "metrics": {
+          "path": "../20260914_noisy20s/cpu/cafe.metrics.json",
+          "sha256": "77c5ef1281692f38ab0331ca53ddd158a75bf1c85921dbdb76614fd051115356"
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "wave": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/cafe.wav",
+            "sha256": "f3cbcc9aeaccc3f8c4fe61825a6b373b58bf2b658f240a1163c5c71f33d18011"
+          },
+          "tokens": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/cafe.tokens.npz",
+            "sha256": "5062896d4073cf2fc2b6050363766733c6755037777d30b74c1599772bdf36dd"
+          },
+          "metrics": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/cafe.metrics.json",
+            "sha256": "35863400b809c03e67f1dfc6f4eef860a740266d865382fb3dcee2a358793145"
+          }
+        },
+        "sorted_encoder": {
+          "wave": {
+            "path": "sorted/cafe.wav",
+            "sha256": "6d3333e622018a7133ef44b62864577af1f2c051a3eb91accbb1a6e59a870311"
+          },
+          "tokens": {
+            "path": "sorted/cafe.tokens.npz",
+            "sha256": "719e0a12efa1af5d5321b3f6dc5172f04982b012664d1dcd57fbf6a67708c1a4"
+          },
+          "metrics": {
+            "path": "sorted/cafe.metrics.json",
+            "sha256": "b3e8ff5c7114cfda950eb01f7985577fc04a12a61ca01ac2a16a5033d8f8689c"
+          }
+        }
+      }
+    },
+    {
+      "name": "office",
+      "input": {
+        "path": "../../../dpdfnet/validation/20260914_noisy20s/noisy/office_noisy.wav",
+        "sha256": "b5dc82530929875863ebb564cc892c64c4e1cf5c5cead6b17a34c368593d6f73"
+      },
+      "reference": {
+        "wave": {
+          "path": "../20260914_noisy20s/cpu/office.wav",
+          "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad"
+        },
+        "tokens": {
+          "path": "../20260914_noisy20s/cpu/office.tokens.npz",
+          "sha256": "a1060ccbbb1a6007e718fbfaa9cbda024a8a1da12554d3051ec7599bdacaa430"
+        },
+        "metrics": {
+          "path": "../20260914_noisy20s/cpu/office.metrics.json",
+          "sha256": "a64507d55cdc583f22aa18e8bbfdd9faad574dec95d24883087381bb6bec0e17"
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "wave": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/office.wav",
+            "sha256": "966600affcbf213051cb96deaac30004c9c51c524ef2c2d2e9d758678c430884"
+          },
+          "tokens": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/office.tokens.npz",
+            "sha256": "6e87aa6694c194c3ec9dc19f811442dadff1adb0edb5aa6ed9c209dd4c27160d"
+          },
+          "metrics": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/office.metrics.json",
+            "sha256": "606e03dfee4a83dbeeeddc7f9c27bd5a4cb53a8ab2b67cbe5d6d29e73ffba8d8"
+          }
+        },
+        "sorted_encoder": {
+          "wave": {
+            "path": "sorted/office.wav",
+            "sha256": "97ed4e58b08cac6f00b5cdb63979349efc04eb2e7d3b5f667892f4e16fc70f39"
+          },
+          "tokens": {
+            "path": "sorted/office.tokens.npz",
+            "sha256": "d7241ad3985ce734db95ad50d904de78b512eb8b3c53687658cf48607e4729ca"
+          },
+          "metrics": {
+            "path": "sorted/office.metrics.json",
+            "sha256": "af1fb4c3c1b879b6f0e29054c5015b29bcba7d8ba24b9da119d4a1e6c2b63e27"
+          }
+        }
+      }
+    },
+    {
+      "name": "psquare",
+      "input": {
+        "path": "../../../dpdfnet/validation/20260914_noisy20s/noisy/psquare_noisy.wav",
+        "sha256": "a20d68e238fb9acae1044ced9e05581535764ef2942d2efad5d3a7c1bf1cb26e"
+      },
+      "reference": {
+        "wave": {
+          "path": "../20260914_noisy20s/cpu/psquare.wav",
+          "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059"
+        },
+        "tokens": {
+          "path": "../20260914_noisy20s/cpu/psquare.tokens.npz",
+          "sha256": "c4f0e9c95822161d75be03e1debace66bf229c78ea433b031dd983a2e9cd0a34"
+        },
+        "metrics": {
+          "path": "../20260914_noisy20s/cpu/psquare.metrics.json",
+          "sha256": "fae50433a72850806be3a64606664ad5fb5ec6cc28c46ea61c262ee31af5a45d"
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "wave": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/psquare.wav",
+            "sha256": "4009d7328effcb55386baba76ce981204fba52bf4987d3fe8c330e15e2076b8b"
+          },
+          "tokens": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/psquare.tokens.npz",
+            "sha256": "7cb20922586f2e819d068e3bc6b031b3ffe38a3b1d1516db9b8401e236e41008"
+          },
+          "metrics": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/psquare.metrics.json",
+            "sha256": "585877f3cb9458d3d4629d063528bb05310c9b82ef137f20717724ea7d6eb3f5"
+          }
+        },
+        "sorted_encoder": {
+          "wave": {
+            "path": "sorted/psquare.wav",
+            "sha256": "db4ed19c6e82cb9e2626be3b69bc241ed5bec4339f0bbe6cd810b0266adae9c2"
+          },
+          "tokens": {
+            "path": "sorted/psquare.tokens.npz",
+            "sha256": "87fb02c94a6f29fc8c4fbef3b09479d6bd2bf2e26e1af9fe90ed5fce3135e4d2"
+          },
+          "metrics": {
+            "path": "sorted/psquare.metrics.json",
+            "sha256": "61dd2e84f32def4cf2048b13a59cceb6a643450475c1024222226286fda6ea08"
+          }
+        }
+      }
+    },
+    {
+      "name": "bus_low_snr",
+      "input": {
+        "path": "../../../dpdfnet/validation/20260914_noisy20s/noisy/bus_low_snr_noisy.wav",
+        "sha256": "6ffae073e5549f58e19127bfcc701616baca9bc68d299103c01aeec7a8e0d288"
+      },
+      "reference": {
+        "wave": {
+          "path": "../20260914_noisy20s/cpu/bus_low_snr.wav",
+          "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6"
+        },
+        "tokens": {
+          "path": "../20260914_noisy20s/cpu/bus_low_snr.tokens.npz",
+          "sha256": "c7fde3db4b89fca566160bf035ae191ebb53f0e36ca14ff6a9be25fe1b84cb08"
+        },
+        "metrics": {
+          "path": "../20260914_noisy20s/cpu/bus_low_snr.metrics.json",
+          "sha256": "021ecf0eefef7927d39361f93e99ec7346845da24c7d0612400bdc2e76f661c3"
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "wave": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/bus_low_snr.wav",
+            "sha256": "8cdfe2a7ccb04e954efb3809a19fb8ce5a2de526dc0688e2a7037c27ddb73c2a"
+          },
+          "tokens": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/bus_low_snr.tokens.npz",
+            "sha256": "a59d6049df6fb0892e535429ab8694525778e14c44ad8f52147c9900f905cf45"
+          },
+          "metrics": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/bus_low_snr.metrics.json",
+            "sha256": "1296954c3ffb67964aa77427187c769a9fa1a563003319a28fba1535abc0563a"
+          }
+        },
+        "sorted_encoder": {
+          "wave": {
+            "path": "sorted/bus_low_snr.wav",
+            "sha256": "4212880ad9f106aee05a5c564070e6c93cecbf6be5f975d0ec4eb128ce2415b6"
+          },
+          "tokens": {
+            "path": "sorted/bus_low_snr.tokens.npz",
+            "sha256": "5fd004b2e99eb416b07fad8754a31d7da4e7d53433eacbf351c1a4642489f92e"
+          },
+          "metrics": {
+            "path": "sorted/bus_low_snr.metrics.json",
+            "sha256": "5a3c50822fad5d8423a29562febe3c2aa8c21e32f3349f371babfe4511d7088b"
+          }
+        }
+      }
+    },
+    {
+      "name": "cafe_low_snr",
+      "input": {
+        "path": "../../../dpdfnet/validation/20260914_noisy20s/noisy/cafe_low_snr_noisy.wav",
+        "sha256": "e61711a17c0ee70e99377efde0f7ff1010cbc4673d76b4914e468529cc8ba915"
+      },
+      "reference": {
+        "wave": {
+          "path": "../20260914_noisy20s/cpu/cafe_low_snr.wav",
+          "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c"
+        },
+        "tokens": {
+          "path": "../20260914_noisy20s/cpu/cafe_low_snr.tokens.npz",
+          "sha256": "a6c30c5a077a9f0c06f2e3bb45b5d06a28d2be2d0efdbc144ab8196cf6f8ac21"
+        },
+        "metrics": {
+          "path": "../20260914_noisy20s/cpu/cafe_low_snr.metrics.json",
+          "sha256": "b15593ad68ae6c05624baf4a2f1730e0f020fa133ff65b961afc34de7268f97c"
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "wave": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.wav",
+            "sha256": "1f9b7599d217db008f9d89d52f565535a9559eb18a13524d6ee2d68ffb11d39e"
+          },
+          "tokens": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.tokens.npz",
+            "sha256": "2663f7cead2378cdd5222ffe8ef158d53861af4298560847f7ecd5649174c4f4"
+          },
+          "metrics": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.metrics.json",
+            "sha256": "e9dbb9637d7c25d987e05ba542d97816928170538d64bdf1f7c52bf928b2a17f"
+          }
+        },
+        "sorted_encoder": {
+          "wave": {
+            "path": "sorted/cafe_low_snr.wav",
+            "sha256": "14fd26e30b85cb2fc9ea6bb80d72c3de06710e7b8a66b1d80999cda9fd86c948"
+          },
+          "tokens": {
+            "path": "sorted/cafe_low_snr.tokens.npz",
+            "sha256": "219b6f3db6b442ca9fd4cf726dfc4f847d635477ee74ebb0a975a35134ba43bf"
+          },
+          "metrics": {
+            "path": "sorted/cafe_low_snr.metrics.json",
+            "sha256": "8cffa4a20eeef453b8e1c61b8e21cc0d5c53b731dfbc4d97812578de6766e109"
+          }
+        }
+      }
+    },
+    {
+      "name": "office_low_snr",
+      "input": {
+        "path": "../../../dpdfnet/validation/20260914_noisy20s/noisy/office_low_snr_noisy.wav",
+        "sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620"
+      },
+      "reference": {
+        "wave": {
+          "path": "../20260914_noisy20s/cpu/office_low_snr.wav",
+          "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708"
+        },
+        "tokens": {
+          "path": "../20260914_noisy20s/cpu/office_low_snr.tokens.npz",
+          "sha256": "8c9f828f1cb6d43d0c997af3554fc89f3603577ffa5067dce2ced15ca1e949cc"
+        },
+        "metrics": {
+          "path": "../20260914_noisy20s/cpu/office_low_snr.metrics.json",
+          "sha256": "0b81731dbe85f6d5e18f81de09e3d780ff2a11e4cb352a968779078f08b73561"
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "wave": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/office_low_snr.wav",
+            "sha256": "8abd0e806ef8b5fc7b2561480646a027a0337ab5365d2202804abd823a3d9be7"
+          },
+          "tokens": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/office_low_snr.tokens.npz",
+            "sha256": "0319a6fb1660016dfede451e615e58819ce98051eda85d58d92e18485f33a9ce"
+          },
+          "metrics": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/office_low_snr.metrics.json",
+            "sha256": "5bb2299731b3922c138d5f7764e002a9308bdbdd050befcfe1e4d43a5d1bf7b0"
+          }
+        },
+        "sorted_encoder": {
+          "wave": {
+            "path": "sorted/office_low_snr.wav",
+            "sha256": "98fde86024a4895d020dab564f6d552783ef1007233091448f2b90726e8be048"
+          },
+          "tokens": {
+            "path": "sorted/office_low_snr.tokens.npz",
+            "sha256": "15c67f85da5a81777e10ce51cb4f0ca7db1d4634777b848f5aadeea41cbcf98c"
+          },
+          "metrics": {
+            "path": "sorted/office_low_snr.metrics.json",
+            "sha256": "f6b73c13c760d1ef66c1b0a21804720ca6b3662b9fae4116d9b61a9dfb6878b7"
+          }
+        }
+      }
+    },
+    {
+      "name": "psquare_low_snr",
+      "input": {
+        "path": "../../../dpdfnet/validation/20260914_noisy20s/noisy/psquare_low_snr_noisy.wav",
+        "sha256": "e44f139883a4570596b455d50eba708ab5e013b86eb6979880da3c6f769f78a8"
+      },
+      "reference": {
+        "wave": {
+          "path": "../20260914_noisy20s/cpu/psquare_low_snr.wav",
+          "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b"
+        },
+        "tokens": {
+          "path": "../20260914_noisy20s/cpu/psquare_low_snr.tokens.npz",
+          "sha256": "a72b391be15694edd578b02df15f42df6dbceb65adf34bc2adfab9dbfec0c466"
+        },
+        "metrics": {
+          "path": "../20260914_noisy20s/cpu/psquare_low_snr.metrics.json",
+          "sha256": "dce237107bb012774449af0beb10ec51f46c8c3f452895c21d1f16e96c07be04"
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "wave": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.wav",
+            "sha256": "02595b5fd28067eb36e3cc61becef89b209ee9aa9c9ccae3f0772322fa037dd9"
+          },
+          "tokens": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.tokens.npz",
+            "sha256": "c8c8e552cab65740bc71e440be1eaa12b1c6418dd5e0a26c18c3865bf3505327"
+          },
+          "metrics": {
+            "path": "../20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.metrics.json",
+            "sha256": "3c852754f2c9a2576256d2296bc5719d2a4d0561e65af40d312445b088c3cf63"
+          }
+        },
+        "sorted_encoder": {
+          "wave": {
+            "path": "sorted/psquare_low_snr.wav",
+            "sha256": "790fa3ebfbe98e2f6c93cf217d32412f3578ac15ecc6433a46e7065452f77f69"
+          },
+          "tokens": {
+            "path": "sorted/psquare_low_snr.tokens.npz",
+            "sha256": "4d492a333d49408c23c8db571f57c10f6eb1aae2bafbac4545fc35688c7738bd"
+          },
+          "metrics": {
+            "path": "sorted/psquare_low_snr.metrics.json",
+            "sha256": "794b1ae6548b147d3721c3b727e084eff6e48ed8b85171786764e3bc1dc9501f"
+          }
+        }
+      }
+    }
+  ],
+  "evidence": [
+    {
+      "path": "sorted_batch_sources.json",
+      "sha256": "3b5858a1b3dbea2b305fade22f3f251b58eaeb4c3ade3dfdb8008750fb12ac6e"
+    },
+    {
+      "path": "sorted_batch_results.json",
+      "sha256": "7ab5d88e1f567da1420f134f8e57329b04ab81cfc8254a3755c844965c0fcaca"
+    },
+    {
+      "path": "../20260915_accuracy/decoder/fpga_bf16/bus.comparison.json",
+      "sha256": "97981740d20fc2daa7b8b3ef450d13615f07f5353aa5521fc6b2c628cda09ede"
+    },
+    {
+      "path": "sorted/bus.comparison.json",
+      "sha256": "ca3ac2492029bd2b7c4923819ef6bf4aa6edbc45e04ac0d1d75cc0932b6d8fe3"
+    },
+    {
+      "path": "../20260915_accuracy/decoder/fpga_bf16/cafe.comparison.json",
+      "sha256": "767a0cf6fc2f5e06997507b0127b83210d623bf78aa060ee439188a7911909a0"
+    },
+    {
+      "path": "sorted/cafe.comparison.json",
+      "sha256": "aaa850774728c0d8e1ed4893cc7599513e6996935ab72fb613408b49759bf93a"
+    },
+    {
+      "path": "../20260915_accuracy/decoder/fpga_bf16/office.comparison.json",
+      "sha256": "acc47598a5c8bf902ab40c2caac82560af540b4b7ae8f3c67014a8ed538589f0"
+    },
+    {
+      "path": "sorted/office.comparison.json",
+      "sha256": "c862196830787d44964145b0f9284a06f26c674a1c3cfd0aee44eed85045975c"
+    },
+    {
+      "path": "../20260915_accuracy/decoder/fpga_bf16/psquare.comparison.json",
+      "sha256": "4d1b829f8c6376274c54fce68ffdfc7be2dbbb46c96872ea13748e900d1298d6"
+    },
+    {
+      "path": "sorted/psquare.comparison.json",
+      "sha256": "df041777714740b77b3d664163dd24946647f3f58e1b45918f1f8ab49b0173cc"
+    },
+    {
+      "path": "../20260915_accuracy/decoder/fpga_bf16/bus_low_snr.comparison.json",
+      "sha256": "2fc6d38ec59f98d2f8323a06a72c32197044d28bc3dc1c130c06501a5fa6ad4b"
+    },
+    {
+      "path": "sorted/bus_low_snr.comparison.json",
+      "sha256": "2cbcc559f920f3eae01776e7a75fb0deb38b4a52362a3968ad7de445ab179381"
+    },
+    {
+      "path": "../20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.comparison.json",
+      "sha256": "1cc52139067ad1e3761f8ec1f6750d560bab18b80fcc459bb53bf7d33214a1b1"
+    },
+    {
+      "path": "sorted/cafe_low_snr.comparison.json",
+      "sha256": "484ec50742dd8c82dfdd652dea1c113031b565bd2bd5f1fd12a3f0aa869c09e7"
+    },
+    {
+      "path": "../20260915_accuracy/decoder/fpga_bf16/office_low_snr.comparison.json",
+      "sha256": "9e469fea35748a8b6bc4bd3f2bd0e509583c155d4e131230fe426e53596de656"
+    },
+    {
+      "path": "sorted/office_low_snr.comparison.json",
+      "sha256": "94da3505efdf2df43669cc78e270bb8f2f047b06fbd2486b0a788845c56b3fde"
+    },
+    {
+      "path": "../20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.comparison.json",
+      "sha256": "9b1eb4192c4be99b13bbc9c2466dbd66d088826cf0a856b86aa9feea44edcf2e"
+    },
+    {
+      "path": "sorted/psquare_low_snr.comparison.json",
+      "sha256": "260d46f165b669cbe293e1fad6b050a11dbffe81de11dbb9767ce95fb7799ce8"
+    },
+    {
+      "path": "short/sorted.wav",
+      "sha256": "189bd0b4078c5b694a72d4eabb18dbbb59197dd4c29ebe935629029676bbb884"
+    },
+    {
+      "path": "short/sorted.tokens.npz",
+      "sha256": "ddfb81d930526480dc73bf776934e939ec07eb80f5b007b2f89a59ac6da432e8"
+    },
+    {
+      "path": "short/sorted.metrics.json",
+      "sha256": "126a0649688d5cf874baea40b729767a4d26067aaea091225329922ab3d04d12"
+    },
+    {
+      "path": "short/sorted.comparison.json",
+      "sha256": "256836e273ad358b81217ba3b0bb8dd6a5c1aff70b7a03e19e23906db2b5f9ae"
+    },
+    {
+      "path": "../20260915_accuracy/short_clip/audio/official_cpu.wav",
+      "sha256": "08b449c8be5bad1fabb6cde8cd91736162532144fc30c2b31d279cbfef229c99"
+    },
+    {
+      "path": "../20260915_accuracy/short_clip/audio/split_decoder_fpga.wav",
+      "sha256": "674638d90e55d7d67f921c807d6c7fbf9799e8028a63f970aad5b2c9e755ca8d"
+    },
+    {
+      "path": "../20260915_accuracy/short_clip/tokens/official_cpu.tokens.npz",
+      "sha256": "dbd0b73fab28be43a6edd208948a61629bba3a6812107ef7654fe412a87b295f"
+    },
+    {
+      "path": "../20260915_accuracy/short_clip/tokens/split_decoder.tokens.npz",
+      "sha256": "7d2a292de36b75c56863194c3a6b0b54bcdc1946b7a1210940feab5bb0522fe0"
+    },
+    {
+      "path": "../20260915_accuracy/short_clip/records/split_decoder_fpga.metrics.json",
+      "sha256": "9310756b6afa51550106c53d19e6be7a3e9953a50c5ce6430bc4ab5bb66cc8f8"
+    }
+  ]
+}

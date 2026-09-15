@@ -1,0 +1,92 @@
+{
+  "status": "complete",
+  "cpu_core": 13,
+  "math_threads": 1,
+  "hardware_executed": false,
+  "script_sha256": "f1f53b617ad5d7fb72db78d49e5cc9b018ce14bf981a288f966d376ae0e3e066",
+  "scope": "Finite-normal sparse FIR dot model inferred from local BF19/BF20 RTL.\n\nThe K64 product/tree part has prior native VQ validation. The K128/K384 ladder\nextension is newly inferred, and must be checked against captured hardware.\n",
+  "rtl_scope": "Local Vivado RTL and cached df0749 source; exact 0x90f1f464 source is not established. K128/K384 grouping/rounding is an inference requiring a native comparison.",
+  "cases": [
+    {
+      "kind": "up",
+      "precision": "bf16",
+      "shape": [
+        79,
+        3
+      ],
+      "K": 64,
+      "modeled_relative_l2_to_original_fp64": 0.0019782151031374493,
+      "modeled_vs_fp64_dot_bf16_bit_mismatches": 35,
+      "changed_outputs_vs_bf16_weights": 0,
+      "logical_output_elements": 474,
+      "padding_zero": true,
+      "coefficient_error": {
+        "max_abs": 0.0003336668014526367,
+        "l2": 0.0005222419858910143,
+        "sum": 1.001129150390625
+      }
+    },
+    {
+      "kind": "up",
+      "precision": "split",
+      "shape": [
+        79,
+        3
+      ],
+      "K": 128,
+      "modeled_relative_l2_to_original_fp64": 0.0017908884904618276,
+      "modeled_vs_fp64_dot_bf16_bit_mismatches": 48,
+      "changed_outputs_vs_bf16_weights": 122,
+      "logical_output_elements": 474,
+      "padding_zero": true,
+      "coefficient_error": {
+        "max_abs": 1.4901161193847656e-07,
+        "l2": 3.0293065833575383e-07,
+        "sum": 0.9999992102384567
+      }
+    },
+    {
+      "kind": "down",
+      "precision": "bf16",
+      "shape": [
+        158,
+        65
+      ],
+      "K": 192,
+      "modeled_relative_l2_to_original_fp64": 0.0019135611681224344,
+      "modeled_vs_fp64_dot_bf16_bit_mismatches": 598,
+      "changed_outputs_vs_bf16_weights": 0,
+      "logical_output_elements": 5135,
+      "padding_zero": true,
+      "coefficient_error": {
+        "max_abs": 0.0003336668014526367,
+        "l2": 0.0005222419858910143,
+        "sum": 1.001129150390625
+      }
+    },
+    {
+      "kind": "down",
+      "precision": "split",
+      "shape": [
+        158,
+        65
+      ],
+      "K": 384,
+      "modeled_relative_l2_to_original_fp64": 0.0017574148786458326,
+      "modeled_vs_fp64_dot_bf16_bit_mismatches": 625,
+      "changed_outputs_vs_bf16_weights": 1379,
+      "logical_output_elements": 5135,
+      "padding_zero": true,
+      "coefficient_error": {
+        "max_abs": 1.4901161193847656e-07,
+        "l2": 3.0293065833575383e-07,
+        "sum": 0.9999992102384567
+      }
+    }
+  ],
+  "rtl_sha256": {
+    "/home/hunlu/apexcompute/andromeda/Vivado/hdl/bf20_adder_unit.sv": "08142820061dd606aa2c86e5564b3b67aa256cdc10654b704de876a81147f1b7",
+    "/home/hunlu/apexcompute/andromeda/Vivado/hdl/bf20_add.sv": "9d3f11f44268acb2073970c629557e260c401b565a316245e52fdf850146eb49",
+    "/home/hunlu/apexcompute/andromeda/Vivado/hdl/adder_tree.sv": "a46df40c0cda16b1b953b29292d75213b45c1c7c3752c30293c6793e89621871"
+  }
+}

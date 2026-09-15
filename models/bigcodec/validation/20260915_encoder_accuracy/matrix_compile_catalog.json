@@ -1,0 +1,581 @@
+{
+  "format": "bigcodec-matrix-compile-catalog-v1",
+  "created_utc": "2026-09-15T10:50:02.319123+00:00",
+  "audit_scope": "Static artifact and source verification only; this catalog does not record hardware execution or audio accuracy.",
+  "implementation_commit": "5bdf10f37643ffa20bd4dffb569cc765639f1bb6",
+  "section_definitions": {
+    "bin": "Serialized torch.save file: metadata plus the model_image tensor. File offsets differ from model-image offsets.",
+    "model_image": "Contiguous bytes uploaded once to DRAM: parameter prefix, final alignment padding, instruction stream.",
+    "parameters": "model_image[0:parameter_bytes]. Includes weights, biases, FIR matrices, lookup tables, constants and internal allocation padding; not learned weights alone.",
+    "padded_parameter_prefix": "model_image[0:program_offset], including the zero-filled final alignment gap.",
+    "program": "model_image[program_offset:program_offset+program_size], including the sole terminal HALT and optional fetch-alignment NOP.",
+    "addresses": "Absolute device DRAM byte addresses; offsets are relative to model_image. Hashes are SHA-256 of exact section bytes."
+  },
+  "source_verification": {
+    "manifest_path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/matrix_batch_sources.json",
+    "manifest_sha256": "2429f53d2f4cff15adb40182c434710897bc3a95bcff9c50d0ef6465512ab6f3",
+    "manifest_sources_sha256": {
+      "models/bigcodec/bigcodec_fetch.py": "d8c2404b53ed5dda2866e7883042af7f37ed0067f84d4393f28222beb9cd7a0e",
+      "models/bigcodec/bigcodec_tanh.py": "998f37fc5c982933ca0cd0eded6a075f20d85b33b3ffaa67aed07f6fc5dc7df5",
+      "models/bigcodec/bigcodec_run_from_bin.py": "363684a6934e121113f325c84381a0859cdd51b78f3df4ee0412e405df67db79",
+      "models/bigcodec/bigcodec_precompiled.py": "365be814cd3b40bc4436ab0809929cf8dd4b5791a60257f7cf63c31d1879c425",
+      "models/bigcodec/bigcodec_compare.py": "42219382a6031722f89f4530ac2f1b4e028be391e5f1da5ab62ffcf6fed6c9e2",
+      "models/bigcodec/bigcodec_conv.py": "8718ec8441ad9195ebcdf232ffe21ccfb3bc55d836cef1c25098f98b9e632b53",
+      "models/bigcodec/bigcodec_filter.py": "aab7ee99b7199e02d75efc1b30725279739808c414a94e0d552ed55d5f9e1fb1",
+      "models/bigcodec/bigcodec_compile.py": "30147e52ab4270b567c429a3c9f30da732ed3f351ae2574e3c016b1921ad8bd8",
+      "models/bigcodec/bigcodec_activation.py": "d84eeca2201a5ab54cd4761bf2bfa8079f247625e6262dfae7ba1136790d1371",
+      "models/bigcodec/bigcodec_quantizer.py": "d5c3f4d9ae4511a6648c928f68ee71c8d1422de5c1d1df9285289d0ec11f3353",
+      "models/bigcodec/bigcodec_lstm.py": "7c4c08b31b4cdd55f318ddb6dd9546ddf6a58ce3e6d8ec801f4c35e3216259c2",
+      "models/bigcodec/bigcodec_layout.py": "f2209cb8aef693d924de99e82d9acbdf701509bb9c344decb02b01a1fee379fd",
+      "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+      "models/bigcodec/bigcodec_device.py": "ef719dd88d1530d9ce59bf1626c683bc352e90b6fd0122e7a6dab32c7b8589eb",
+      "models/bigcodec/bigcodec_conv_bf16.py": "e60caa1cc611160db23de9e8590c18111c2cf283f414b34651e8ddd1943d87a7",
+      "models/bigcodec/bigcodec_run_cpu.py": "d6b5abd1fe8beb3bdb11f90f6b7e7004469fac0baa35206007274093687dd37f"
+    },
+    "all_manifest_sources_match_commit_and_worktree": true,
+    "additional_dependencies_sha256_checked_at_catalog_time": {
+      "user_dma_core.py": "b213f8dcd0a94fba6d60196d134e2506dc578c3e961672242989640c6484a992",
+      "models/yolov5s/yolov5_precompiled.py": "3fe19cd7d559c0bf15cd54723cd3e4279b2d681d4d2566c9353a593e27e1dc32"
+    },
+    "additional_dependencies_match_commit_and_worktree": true
+  },
+  "compile_log": {
+    "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/compile_matrix_batch.log",
+    "sha256": "af1cccf3a9e22ff10078956cd6bcf70c2531cefdb9d7f7317fa6f3bb9aea1a70"
+  },
+  "required_runtime": {
+    "axi_data_width_bits": 256,
+    "memory_layout": "large-program",
+    "dram_base": 2147483648,
+    "dram_limit": 4294967296,
+    "dram_capacity_bytes": 2147483648,
+    "single_model_upload": true,
+    "single_start": true,
+    "single_halt": true,
+    "single_packed_waveform_and_token_read": true,
+    "host_neural_operations": 0,
+    "hardware_execution_verified_by_this_catalog": false
+  },
+  "memory_arenas": {
+    "input_base": 2147483648,
+    "input_limit": 2214592512,
+    "model_base": 2214592512,
+    "model_limit": 3489660928,
+    "tensor_base": 3489660928,
+    "tensor_limit": 4294967296
+  },
+  "cases": [
+    {
+      "case": "bus",
+      "input_wav": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus_noisy.wav",
+        "sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+        "native_samples": 378916
+      },
+      "compiled_samples": 379000,
+      "code_frames": 1895,
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/bus_matrix_production.bin",
+        "bytes": 971608623,
+        "sha256": "61fc828ba2f8019f1227ec5c8af278fdab1498e194af5d7500419dbd1a767d32"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 971567040,
+        "sha256": "6d0709901a259e2c476b54c83ecb6f4e9a839a58e3cbb2e22b025de555dd98fd"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 637939776,
+        "sha256": "87edaa8ef6f80d6cbb16d3c9384443a4348ec67b531a32b59522eae3a3cb2464",
+        "instructions": 19935618,
+        "halt_index": 19935617,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 63072
+      },
+      "dram": {
+        "input_address": 2147483648,
+        "input_bytes": 48512000,
+        "output_address": 3489660928,
+        "output_bytes": 48754560,
+        "tokens_address": 3538172928,
+        "tokens_offset": 48512000,
+        "scratch_address": 3732463488,
+        "scratch_bytes": 436608000,
+        "tensor_end": 4169071488
+      },
+      "checks": {
+        "compile_log_hash_matches": true,
+        "model_and_program_hashes_match_payload": true,
+        "single_terminal_halt_no_swi": true,
+        "closed_jump_targets": true,
+        "operation_ranges_contiguous": true,
+        "live_tensor_ranges_disjoint": true,
+        "input_output_scratch_and_model_bounds_valid": true,
+        "identity_and_zero_constants_valid": true,
+        "input_wav_length_matches": true
+      }
+    },
+    {
+      "case": "bus_low_snr",
+      "input_wav": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus_low_snr_noisy.wav",
+        "sha256": "6ffae073e5549f58e19127bfcc701616baca9bc68d299103c01aeec7a8e0d288",
+        "native_samples": 334067
+      },
+      "compiled_samples": 334200,
+      "code_frames": 1671,
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/bus_low_snr_matrix_production.bin",
+        "bytes": 896484143,
+        "sha256": "c71a097952ed39bb09c08e2165b46e123740d76512bea7a143fc13aa38634b22"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 896442560,
+        "sha256": "c69b6c62f74fad42306215869a981c633598de0c9ab4a2081765df4ad9accd56"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 562815296,
+        "sha256": "5490f47c5cba2f9366e130dec1f7e9c1b81c3363c706926d05d21dbdcfca3ea4",
+        "instructions": 17587978,
+        "halt_index": 17587977,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 55930
+      },
+      "dram": {
+        "input_address": 2147483648,
+        "input_bytes": 42777600,
+        "output_address": 3489660928,
+        "output_bytes": 42991488,
+        "tokens_address": 3532438528,
+        "tokens_offset": 42777600,
+        "scratch_address": 3703762816,
+        "scratch_bytes": 384998400,
+        "tensor_end": 4088761216
+      },
+      "checks": {
+        "compile_log_hash_matches": true,
+        "model_and_program_hashes_match_payload": true,
+        "single_terminal_halt_no_swi": true,
+        "closed_jump_targets": true,
+        "operation_ranges_contiguous": true,
+        "live_tensor_ranges_disjoint": true,
+        "input_output_scratch_and_model_bounds_valid": true,
+        "identity_and_zero_constants_valid": true,
+        "input_wav_length_matches": true
+      }
+    },
+    {
+      "case": "cafe",
+      "input_wav": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_noisy.wav",
+        "sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868",
+        "native_samples": 328146
+      },
+      "compiled_samples": 328200,
+      "code_frames": 1641,
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/cafe_matrix_production.bin",
+        "bytes": 887059887,
+        "sha256": "e9e3155b75154844d845dfacccea70c35a275481070febc7ff05a6bce887dcb2"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 887018304,
+        "sha256": "61ceca88e8864bc9a7cb66c0cfb71a8fc41faaa7d08a4c01c390855ee9f0d16a"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 553391040,
+        "sha256": "36de5d1f797ae0012c739fbcd0f4229f3a860649bcc532cc51f397593f0aad8e",
+        "instructions": 17293470,
+        "halt_index": 17293469,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 53446
+      },
+      "dram": {
+        "input_address": 2147483648,
+        "input_bytes": 42009600,
+        "output_address": 3489660928,
+        "output_bytes": 42219648,
+        "tokens_address": 3531670528,
+        "tokens_offset": 42009600,
+        "scratch_address": 3699918976,
+        "scratch_bytes": 378086400,
+        "tensor_end": 4078005376
+      },
+      "checks": {
+        "compile_log_hash_matches": true,
+        "model_and_program_hashes_match_payload": true,
+        "single_terminal_halt_no_swi": true,
+        "closed_jump_targets": true,
+        "operation_ranges_contiguous": true,
+        "live_tensor_ranges_disjoint": true,
+        "input_output_scratch_and_model_bounds_valid": true,
+        "identity_and_zero_constants_valid": true,
+        "input_wav_length_matches": true
+      }
+    },
+    {
+      "case": "cafe_low_snr",
+      "input_wav": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_low_snr_noisy.wav",
+        "sha256": "e61711a17c0ee70e99377efde0f7ff1010cbc4673d76b4914e468529cc8ba915",
+        "native_samples": 343450
+      },
+      "compiled_samples": 343600,
+      "code_frames": 1718,
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/cafe_low_snr_matrix_production.bin",
+        "bytes": 912801775,
+        "sha256": "dbda51ddfdb97d777455621fd14fc1cc2a8fe1193bbcf0bd8c4652fe68ded010"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 912760192,
+        "sha256": "ac62693d3b4e6354aa9a6c8612e7e00901273073fdca2cf159ecae6d1e4aee98"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 579132928,
+        "sha256": "933594335478b7fc3e1f6d7e9cd585055b4c62b6f9bbfdf01bd0eecabe99030d",
+        "instructions": 18097904,
+        "halt_index": 18097903,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 57880
+      },
+      "dram": {
+        "input_address": 2147483648,
+        "input_bytes": 43980800,
+        "output_address": 3489660928,
+        "output_bytes": 44200704,
+        "tokens_address": 3533641728,
+        "tokens_offset": 43980800,
+        "scratch_address": 3709784832,
+        "scratch_bytes": 395827200,
+        "tensor_end": 4105612032
+      },
+      "checks": {
+        "compile_log_hash_matches": true,
+        "model_and_program_hashes_match_payload": true,
+        "single_terminal_halt_no_swi": true,
+        "closed_jump_targets": true,
+        "operation_ranges_contiguous": true,
+        "live_tensor_ranges_disjoint": true,
+        "input_output_scratch_and_model_bounds_valid": true,
+        "identity_and_zero_constants_valid": true,
+        "input_wav_length_matches": true
+      }
+    },
+    {
+      "case": "office",
+      "input_wav": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/office_noisy.wav",
+        "sha256": "b5dc82530929875863ebb564cc892c64c4e1cf5c5cead6b17a34c368593d6f73",
+        "native_samples": 351688
+      },
+      "compiled_samples": 351800,
+      "code_frames": 1759,
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/office_matrix_production.bin",
+        "bytes": 926323631,
+        "sha256": "c6145af17973f73cf79d87a22ebe43b8bb383553ab7e8b8eeb21ad8acd181b25"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 926282048,
+        "sha256": "6e086a7af7e817de714fdbf6e0314cf0ad21abe65952187cb832395606599ec0"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 592654784,
+        "sha256": "cbeb1056581349435fead4876ac4580c0a4724ef12a80c8155b574227d122234",
+        "instructions": 18520462,
+        "halt_index": 18520461,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 58876
+      },
+      "dram": {
+        "input_address": 2147483648,
+        "input_bytes": 45030400,
+        "output_address": 3489660928,
+        "output_bytes": 45255552,
+        "tokens_address": 3534691328,
+        "tokens_offset": 45030400,
+        "scratch_address": 3715038080,
+        "scratch_bytes": 405273600,
+        "tensor_end": 4120311680
+      },
+      "checks": {
+        "compile_log_hash_matches": true,
+        "model_and_program_hashes_match_payload": true,
+        "single_terminal_halt_no_swi": true,
+        "closed_jump_targets": true,
+        "operation_ranges_contiguous": true,
+        "live_tensor_ranges_disjoint": true,
+        "input_output_scratch_and_model_bounds_valid": true,
+        "identity_and_zero_constants_valid": true,
+        "input_wav_length_matches": true
+      }
+    },
+    {
+      "case": "office_low_snr",
+      "input_wav": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/office_low_snr_noisy.wav",
+        "sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620",
+        "native_samples": 343910
+      },
+      "compiled_samples": 344000,
+      "code_frames": 1720,
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/office_low_snr_matrix_production.bin",
+        "bytes": 912870383,
+        "sha256": "34bb9d68c2cb50d8e396168c7013c0f4c75ecbd0416b83e35d5c95271be9bb98"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 912828800,
+        "sha256": "742477be121ffcd7bcd3d279add1a313ced0a61a6f92f3ce80fe7e343d180895"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 579201536,
+        "sha256": "30f67e1a6e6f1cbe9d1b57684d214f1861d6bd1e173c2f924b9b109fe2729847",
+        "instructions": 18100048,
+        "halt_index": 18100047,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 57918
+      },
+      "dram": {
+        "input_address": 2147483648,
+        "input_bytes": 44032000,
+        "output_address": 3489660928,
+        "output_bytes": 44252160,
+        "tokens_address": 3533692928,
+        "tokens_offset": 44032000,
+        "scratch_address": 3710041088,
+        "scratch_bytes": 396288000,
+        "tensor_end": 4106329088
+      },
+      "checks": {
+        "compile_log_hash_matches": true,
+        "model_and_program_hashes_match_payload": true,
+        "single_terminal_halt_no_swi": true,
+        "closed_jump_targets": true,
+        "operation_ranges_contiguous": true,
+        "live_tensor_ranges_disjoint": true,
+        "input_output_scratch_and_model_bounds_valid": true,
+        "identity_and_zero_constants_valid": true,
+        "input_wav_length_matches": true
+      }
+    },
+    {
+      "case": "psquare",
+      "input_wav": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_noisy.wav",
+        "sha256": "a20d68e238fb9acae1044ced9e05581535764ef2942d2efad5d3a7c1bf1cb26e",
+        "native_samples": 343574
+      },
+      "compiled_samples": 343600,
+      "code_frames": 1718,
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/psquare_matrix_production.bin",
+        "bytes": 912801775,
+        "sha256": "41f334e2fcfa9360c03cee24547f6ccb88d2a995fbf2b8731600d207a2fd74c2"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 912760192,
+        "sha256": "ac62693d3b4e6354aa9a6c8612e7e00901273073fdca2cf159ecae6d1e4aee98"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 579132928,
+        "sha256": "933594335478b7fc3e1f6d7e9cd585055b4c62b6f9bbfdf01bd0eecabe99030d",
+        "instructions": 18097904,
+        "halt_index": 18097903,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 57880
+      },
+      "dram": {
+        "input_address": 2147483648,
+        "input_bytes": 43980800,
+        "output_address": 3489660928,
+        "output_bytes": 44200704,
+        "tokens_address": 3533641728,
+        "tokens_offset": 43980800,
+        "scratch_address": 3709784832,
+        "scratch_bytes": 395827200,
+        "tensor_end": 4105612032
+      },
+      "checks": {
+        "compile_log_hash_matches": true,
+        "model_and_program_hashes_match_payload": true,
+        "single_terminal_halt_no_swi": true,
+        "closed_jump_targets": true,
+        "operation_ranges_contiguous": true,
+        "live_tensor_ranges_disjoint": true,
+        "input_output_scratch_and_model_bounds_valid": true,
+        "identity_and_zero_constants_valid": true,
+        "input_wav_length_matches": true
+      }
+    },
+    {
+      "case": "psquare_low_snr",
+      "input_wav": {
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_low_snr_noisy.wav",
+        "sha256": "e44f139883a4570596b455d50eba708ab5e013b86eb6979880da3c6f769f78a8",
+        "native_samples": 344406
+      },
+      "compiled_samples": 344600,
+      "code_frames": 1723,
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/psquare_low_snr_matrix_production.bin",
+        "bytes": 914343599,
+        "sha256": "4ca16802350f17a48b016f864773dd89d3daf1409fd5612a71b504b05474a275"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 914302016,
+        "sha256": "32d7c8f91d4307cdd889e7d7d82a3ae502ee85880d13a69298726cb3c79e51a1"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 580674752,
+        "sha256": "5505a68e105439788550feeafbd53c061fafc465190d7db85b293f2dbd39346f",
+        "instructions": 18146086,
+        "halt_index": 18146085,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 58054
+      },
+      "dram": {
+        "input_address": 2147483648,
+        "input_bytes": 44108800,
+        "output_address": 3489660928,
+        "output_bytes": 44329344,
+        "tokens_address": 3533769728,
+        "tokens_offset": 44108800,
+        "scratch_address": 3710425472,
+        "scratch_bytes": 396979200,
+        "tensor_end": 4107404672
+      },
+      "checks": {
+        "compile_log_hash_matches": true,
+        "model_and_program_hashes_match_payload": true,
+        "single_terminal_halt_no_swi": true,
+        "closed_jump_targets": true,
+        "operation_ranges_contiguous": true,
+        "live_tensor_ranges_disjoint": true,
+        "input_output_scratch_and_model_bounds_valid": true,
+        "identity_and_zero_constants_valid": true,
+        "input_wav_length_matches": true
+      }
+    }
+  ],
+  "precision": {
+    "convolutions": "BF16",
+    "activations": "BF16",
+    "lstm_input_weights": "BF16",
+    "lstm_cell": "compensated",
+    "lstm_tanh": "compensated",
+    "lstm_math_scope": "decoder",
+    "lstm_fused_gates": true,
+    "center_quantizer_scores": true,
+    "compensated_codebook": true,
+    "filter_accumulation": "matrix",
+    "filter_math_scope": "encoder",
+    "filter_stage": "both",
+    "lstm_recurrent_weights": {
+      "encoder": "BF16",
+      "decoder": "BF16"
+    }
+  },
+  "checks_summary": {
+    "cases": 8,
+    "all_checks_passed": true,
+    "method": "SHA-256 rehash; NumPy instruction type/closed-jump scan; exact tensor inventory and lifetime checks; source blob hashes against pinned Git commit. No full instruction-object reparse."
+  },
+  "audit_generator_script_sha256": "29aa8b8a192457a6fe79bdf07bc7b799641b7ebfc476adeaaffece4c9883bdb9"
+}

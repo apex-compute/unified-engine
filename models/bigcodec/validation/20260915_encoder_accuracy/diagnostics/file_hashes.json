@@ -1,0 +1,126 @@
+{
+  "format": "bigcodec-diagnostic-package-sha256-v1",
+  "scope": "All diagnostic package files except this self-referential inventory.",
+  "files": [
+    {
+      "path": "REJECTED_op087_invalid_identity.json",
+      "sha256": "b47678ef44a9c1b7cdb57f046b0e44029312daf6006bcb717ad85bea70e4424b",
+      "bytes": 17908
+    },
+    {
+      "path": "bus_matrix_prototype.comparison.json",
+      "sha256": "e22badc94d7ac85c3843765b8d06b6d442d7b2c3e6703ac44530184960bff774",
+      "bytes": 1735
+    },
+    {
+      "path": "bus_matrix_prototype.metrics.json",
+      "sha256": "89e109eb3031b7c55088d08d3c1f5c03d8bc6c21defa786ede1e03af4342f363",
+      "bytes": 3992
+    },
+    {
+      "path": "coefficient_representation.json",
+      "sha256": "b32571e0fdac96bf19a87e281fed48ef6eb77f9ad4656d307a0d4d35877f83b0",
+      "bytes": 1165
+    },
+    {
+      "path": "copied_records.json",
+      "sha256": "a4e0eaa048f15039e6f498f6f03fc6994cf7c6d035e54e51f9bdd48715b0807a",
+      "bytes": 5737
+    },
+    {
+      "path": "diagnostics.md",
+      "sha256": "e524c1d65916b0123082d58d8b7012302f6f0de16a7110f951aeaaf0f4b0d74b",
+      "bytes": 6828
+    },
+    {
+      "path": "fir_direct_native_parity.json",
+      "sha256": "30ba9cb1b3bb7d779ff299ddab35985b6c7b0f13677d7d75ad61735e4249de38",
+      "bytes": 824
+    },
+    {
+      "path": "fir_loop_native_parity.json",
+      "sha256": "ce40fbc5cf43e1e9ec1324c1bcf55d5e2bd5ab8965ef1be678e01b69230df870",
+      "bytes": 813
+    },
+    {
+      "path": "fir_native_model_provenance.json",
+      "sha256": "1902b976e6fd0e7d6313dfedcf697e136a14e2e5a21b6f3deadb33e425c2eab0",
+      "bytes": 3096
+    },
+    {
+      "path": "fir_native_model_validation.json",
+      "sha256": "2af9d6de3f3156049580703c63ece6d9e292184985dd640351d43a0701bee7d7",
+      "bytes": 3502
+    },
+    {
+      "path": "op087_native_corrected.json",
+      "sha256": "9b02aeb35f47ac030436b8800f54a620633cfcc0389e59627f267009a74f16a2",
+      "bytes": 19056
+    },
+    {
+      "path": "op087_native_direct.json",
+      "sha256": "7dbb32b7fb4bed5ea3f5bf9882316cf6b92b935dce48000f76472eb9cee06083",
+      "bytes": 19356
+    },
+    {
+      "path": "op087_native_loop.json",
+      "sha256": "aeb824f463f6d96ac0d14424cf2c3721695b4aaa02386f050379a07e44dd87aa",
+      "bytes": 19500
+    },
+    {
+      "path": "production_artifact_review.json",
+      "sha256": "cca82b78acd12ce1bf5e1fe70466837b8090030834b57bafb727a02fc1ef08c8",
+      "bytes": 1166
+    },
+    {
+      "path": "production_compile_tests.log",
+      "sha256": "5726077e3b09dc7286ef83a0da5edc5636105ceaf056dbad123e35817d961d91",
+      "bytes": 363
+    },
+    {
+      "path": "production_core_tests.log",
+      "sha256": "318f6785325a640b2fe62863c023f13df302c6eac7946befcaaa07a71923fa05",
+      "bytes": 499
+    },
+    {
+      "path": "production_filter_tests.log",
+      "sha256": "06cc695076b858ad65fbe35c9c1890276fa50cf3cabff03a82330ab54d76c58b",
+      "bytes": 1126
+    },
+    {
+      "path": "production_integration_review.json",
+      "sha256": "45be38a396d4d682de965258ccc2ad9416921bece6b37c0f6f703ee7822ac726",
+      "bytes": 50760
+    },
+    {
+      "path": "production_long_image_parity.json",
+      "sha256": "db0b36a37b94e28d50db03c30684ecb884e79976db2fa81f41a99d20aaea20dc",
+      "bytes": 1158
+    },
+    {
+      "path": "production_matrix_image_parity.json",
+      "sha256": "0e302a2e32a9947fbe9562bb21015dfbecd4692d148748b5a2c82571a41f52a8",
+      "bytes": 630
+    },
+    {
+      "path": "production_program_parity.json",
+      "sha256": "ae3c1834b6fc1a8318cb21c45bae75902a518af50efc9cddc1f20ab8b24276b1",
+      "bytes": 1632
+    },
+    {
+      "path": "short_baseline_current.comparison.json",
+      "sha256": "eb19a294ac0fa7355556257a2c09409a26e73021e9436edc0502ccc049d9d1e5",
+      "bytes": 1796
+    },
+    {
+      "path": "short_candidate_summary.json",
+      "sha256": "13153462d13beab0ec9d920b55368e1d5129fa28e01aea6d14d937ba02738096",
+      "bytes": 5279
+    },
+    {
+      "path": "short_matrix_prototype_compile.json",
+      "sha256": "0d0110f534c15596dd0f75774ad28dc28e56ae96b702ac702283f1857eb6449d",
+      "bytes": 3924
+    }
+  ]
+}

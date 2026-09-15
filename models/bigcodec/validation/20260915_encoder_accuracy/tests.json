@@ -1,0 +1,9 @@
+{
+  "command": "PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python -m unittest discover -s models/bigcodec -p 'test_bigcodec_*.py'",
+  "implementation_commit": "5bdf10f37643ffa20bd4dffb569cc765639f1bb6",
+  "tests": 161,
+  "result": "PASS",
+  "elapsed_s": 10.422,
+  "log": "production_tests.log",
+  "log_sha256": "3b3e80a7d5762efd1460439975133247f8c102a3543a6d49143dc25fbbf3e3cb"
+}

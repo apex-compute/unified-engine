@@ -1,0 +1,40 @@
+{
+  "format": "bigcodec-fir-coefficient-extract-v1",
+  "hardware_executed": false,
+  "source": {
+    "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/precision_fir.json",
+    "sha256": "38417e70d484600fac8902bf8d858784dc48bf6c6366799e9f93d775f7084885"
+  },
+  "original_fp32_taps": [
+    0.0020289646927267313,
+    0.009389465674757957,
+    -0.0255434587597847,
+    -0.057657383382320404,
+    0.12857258319854736,
+    0.44320979714393616,
+    0.44320979714393616,
+    0.12857258319854736,
+    -0.057657383382320404,
+    -0.0255434587597847,
+    0.009389465674757957,
+    0.0020289646927267313
+  ],
+  "errors": {
+    "dc": {
+      "max_abs": 0.0003336668014526367,
+      "l2": 0.0006688189459964633,
+      "sum": 1.0
+    },
+    "bf16": {
+      "max_abs": 0.0003336668014526367,
+      "l2": 0.0005222419858910143,
+      "sum": 1.001129150390625
+    },
+    "split": {
+      "max_abs": 1.4901161193847656e-07,
+      "l2": 3.0293065833575383e-07,
+      "sum": 0.9999992102384567
+    }
+  },
+  "scope": "Absolute coefficient-vector errors to original FP32 taps; split is BF16 high plus BF16 residual, not exact FP32. These are not waveform error metrics."
+}
