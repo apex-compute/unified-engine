@@ -1,0 +1,6 @@
+# Optional offline comparison metrics; inference dependencies remain unchanged.
+numpy>=1.26,<3
+soundfile>=0.12,<1
+scipy>=1.11,<2
+pesq==0.0.4
+pystoi==0.4.1

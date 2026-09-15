@@ -1,0 +1,740 @@
+{
+  "format": "bigcodec-stft-error-decomposition-v1",
+  "manifest": "../../20260915_encoder_accuracy/matrix_manifest.json",
+  "manifest_sha256": "41a24d2037b97e90c54ba23111f01123c36fe3a592086b34f4866457b769007d",
+  "generator_sha256": "d7421b46c630982b6b927af45813469c105c14380f6acab540cd4828795f936b",
+  "wave_paths_relative_to": "../../20260915_encoder_accuracy",
+  "scope": "Eight long files; original sample positions, no resampling, gain/polarity fitting or applied delay.",
+  "definition": "One-sided scipy STFT, periodic Hann, 1024-sample FFT/window, 256-sample hop, zero boundaries and padded tail; magnitude and phase error energies sum to complex STFT error.",
+  "limitation": "A phase error contribution is not proof of inaudibility or a structural time shift. These percentages divide error energy, not waveform amplitude.",
+  "rows": [
+    {
+      "case": "bus",
+      "profile": "serial_baseline",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/bus.wav",
+        "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947"
+      },
+      "actual": {
+        "path": "../20260915_accuracy/decoder/fpga_bf16/bus.wav",
+        "sha256": "2cdb24367220760833115a108983cc9315eb12fdf16ecd03e9026e877dd904cb"
+      },
+      "samples": 378916,
+      "duration_s": 23.68225,
+      "stft_reference_energy": 5.61090983061499,
+      "stft_complex_error_energy": 0.2332064793359822,
+      "stft_magnitude_error_energy": 0.05344862390857047,
+      "stft_phase_error_energy": 0.17975785542741174,
+      "stft_complex_relative_l2": 0.20387015895586102,
+      "stft_magnitude_relative_l2": 0.09760040491187756,
+      "phase_share_of_stft_error_energy": 0.7708098674584137,
+      "magnitude_share_of_stft_error_energy": 0.2291901325415863,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "bus",
+      "profile": "sorted_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/bus.wav",
+        "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947"
+      },
+      "actual": {
+        "path": "sorted/bus.wav",
+        "sha256": "c375a68e83ae5ae6ac872db5450e788aff0897a4c01121151d340390074cc5be"
+      },
+      "samples": 378916,
+      "duration_s": 23.68225,
+      "stft_reference_energy": 5.61090983061499,
+      "stft_complex_error_energy": 0.3490015624282412,
+      "stft_magnitude_error_energy": 0.05340838297643259,
+      "stft_phase_error_energy": 0.29559317945180863,
+      "stft_complex_relative_l2": 0.24940033981076432,
+      "stft_magnitude_relative_l2": 0.09756365681144434,
+      "phase_share_of_stft_error_energy": 0.8469680691260115,
+      "magnitude_share_of_stft_error_energy": 0.1530319308739885,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "bus",
+      "profile": "matrix_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/bus.wav",
+        "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947"
+      },
+      "actual": {
+        "path": "matrix/bus.wav",
+        "sha256": "5ce75d10c35d3adbec14256e3f1bc28f864c6561dcdc87c6db8a8a30c1155135"
+      },
+      "samples": 378916,
+      "duration_s": 23.68225,
+      "stft_reference_energy": 5.61090983061499,
+      "stft_complex_error_energy": 0.23088555897736976,
+      "stft_magnitude_error_energy": 0.060642911597264,
+      "stft_phase_error_energy": 0.17024264738010572,
+      "stft_complex_relative_l2": 0.2028531427010576,
+      "stft_magnitude_relative_l2": 0.1039617011921587,
+      "phase_share_of_stft_error_energy": 0.7373464504845539,
+      "magnitude_share_of_stft_error_energy": 0.26265354951544595,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "cafe",
+      "profile": "serial_baseline",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/cafe.wav",
+        "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e"
+      },
+      "actual": {
+        "path": "../20260915_accuracy/decoder/fpga_bf16/cafe.wav",
+        "sha256": "f3cbcc9aeaccc3f8c4fe61825a6b373b58bf2b658f240a1163c5c71f33d18011"
+      },
+      "samples": 328146,
+      "duration_s": 20.509125,
+      "stft_reference_energy": 5.402299862298616,
+      "stft_complex_error_energy": 0.24625977013668982,
+      "stft_magnitude_error_energy": 0.06508466141550462,
+      "stft_phase_error_energy": 0.1811751087211852,
+      "stft_complex_relative_l2": 0.21350467626334071,
+      "stft_magnitude_relative_l2": 0.10976148689676604,
+      "phase_share_of_stft_error_energy": 0.7357072924279167,
+      "magnitude_share_of_stft_error_energy": 0.26429270757208334,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "cafe",
+      "profile": "sorted_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/cafe.wav",
+        "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e"
+      },
+      "actual": {
+        "path": "sorted/cafe.wav",
+        "sha256": "6d3333e622018a7133ef44b62864577af1f2c051a3eb91accbb1a6e59a870311"
+      },
+      "samples": 328146,
+      "duration_s": 20.509125,
+      "stft_reference_energy": 5.402299862298616,
+      "stft_complex_error_energy": 0.2407565086960227,
+      "stft_magnitude_error_energy": 0.06430117034021805,
+      "stft_phase_error_energy": 0.1764553383558046,
+      "stft_complex_relative_l2": 0.21110556164445846,
+      "stft_magnitude_relative_l2": 0.10909883057992464,
+      "phase_share_of_stft_error_energy": 0.7329203239883983,
+      "magnitude_share_of_stft_error_energy": 0.2670796760116015,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "cafe",
+      "profile": "matrix_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/cafe.wav",
+        "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e"
+      },
+      "actual": {
+        "path": "matrix/cafe.wav",
+        "sha256": "daa40fcfed672aff954d210984951b0643b2af64819b8344035608a84da74f03"
+      },
+      "samples": 328146,
+      "duration_s": 20.509125,
+      "stft_reference_energy": 5.402299862298616,
+      "stft_complex_error_energy": 0.19386347641964619,
+      "stft_magnitude_error_energy": 0.062192466720526876,
+      "stft_phase_error_energy": 0.1316710096991193,
+      "stft_complex_relative_l2": 0.1894343162978535,
+      "stft_magnitude_relative_l2": 0.10729501576118254,
+      "phase_share_of_stft_error_energy": 0.6791945142575382,
+      "magnitude_share_of_stft_error_energy": 0.32080548574246176,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "office",
+      "profile": "serial_baseline",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/office.wav",
+        "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad"
+      },
+      "actual": {
+        "path": "../20260915_accuracy/decoder/fpga_bf16/office.wav",
+        "sha256": "966600affcbf213051cb96deaac30004c9c51c524ef2c2d2e9d758678c430884"
+      },
+      "samples": 351688,
+      "duration_s": 21.9805,
+      "stft_reference_energy": 7.037263077508255,
+      "stft_complex_error_energy": 0.3388973936594332,
+      "stft_magnitude_error_energy": 0.10539156801685737,
+      "stft_phase_error_energy": 0.23350582564257585,
+      "stft_complex_relative_l2": 0.2194483000950169,
+      "stft_magnitude_relative_l2": 0.12237734859256191,
+      "phase_share_of_stft_error_energy": 0.689016292279993,
+      "magnitude_share_of_stft_error_energy": 0.3109837077200071,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "office",
+      "profile": "sorted_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/office.wav",
+        "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad"
+      },
+      "actual": {
+        "path": "sorted/office.wav",
+        "sha256": "97ed4e58b08cac6f00b5cdb63979349efc04eb2e7d3b5f667892f4e16fc70f39"
+      },
+      "samples": 351688,
+      "duration_s": 21.9805,
+      "stft_reference_energy": 7.037263077508255,
+      "stft_complex_error_energy": 0.32829182843933186,
+      "stft_magnitude_error_energy": 0.10225903456928585,
+      "stft_phase_error_energy": 0.22603279387004604,
+      "stft_complex_relative_l2": 0.21598726394647436,
+      "stft_magnitude_relative_l2": 0.12054493044941998,
+      "phase_share_of_stft_error_energy": 0.6885117882604159,
+      "magnitude_share_of_stft_error_energy": 0.3114882117395842,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "office",
+      "profile": "matrix_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/office.wav",
+        "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad"
+      },
+      "actual": {
+        "path": "matrix/office.wav",
+        "sha256": "539bfdf079d00d1ba537e4198e1c2dbd2b07d0874132e305edf76acadbdf9417"
+      },
+      "samples": 351688,
+      "duration_s": 21.9805,
+      "stft_reference_energy": 7.037263077508255,
+      "stft_complex_error_energy": 0.35594457898479415,
+      "stft_magnitude_error_energy": 0.10776832430030797,
+      "stft_phase_error_energy": 0.24817625468448617,
+      "stft_complex_relative_l2": 0.22489991854064784,
+      "stft_magnitude_relative_l2": 0.12374956233045452,
+      "phase_share_of_stft_error_energy": 0.6972328540367746,
+      "magnitude_share_of_stft_error_energy": 0.30276714596322535,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "psquare",
+      "profile": "serial_baseline",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/psquare.wav",
+        "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059"
+      },
+      "actual": {
+        "path": "../20260915_accuracy/decoder/fpga_bf16/psquare.wav",
+        "sha256": "4009d7328effcb55386baba76ce981204fba52bf4987d3fe8c330e15e2076b8b"
+      },
+      "samples": 343574,
+      "duration_s": 21.473375,
+      "stft_reference_energy": 5.451221495413891,
+      "stft_complex_error_energy": 0.47650139987809403,
+      "stft_magnitude_error_energy": 0.07719055616275265,
+      "stft_phase_error_energy": 0.3993108437153414,
+      "stft_complex_relative_l2": 0.2956549646277647,
+      "stft_magnitude_relative_l2": 0.11899676929189562,
+      "phase_share_of_stft_error_energy": 0.8380056046372567,
+      "magnitude_share_of_stft_error_energy": 0.1619943953627434,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "psquare",
+      "profile": "sorted_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/psquare.wav",
+        "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059"
+      },
+      "actual": {
+        "path": "sorted/psquare.wav",
+        "sha256": "db4ed19c6e82cb9e2626be3b69bc241ed5bec4339f0bbe6cd810b0266adae9c2"
+      },
+      "samples": 343574,
+      "duration_s": 21.473375,
+      "stft_reference_energy": 5.451221495413891,
+      "stft_complex_error_energy": 0.2493666264676204,
+      "stft_magnitude_error_energy": 0.07129096551104493,
+      "stft_phase_error_energy": 0.17807566095657545,
+      "stft_complex_relative_l2": 0.21388102199225545,
+      "stft_magnitude_relative_l2": 0.11435899600248291,
+      "phase_share_of_stft_error_energy": 0.7141118419857924,
+      "magnitude_share_of_stft_error_energy": 0.2858881580142075,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "psquare",
+      "profile": "matrix_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/psquare.wav",
+        "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059"
+      },
+      "actual": {
+        "path": "matrix/psquare.wav",
+        "sha256": "98aa7416a4ba0f35b07c360aef5a0fc36c5d4ecc360f32e2871f12beb7294eb9"
+      },
+      "samples": 343574,
+      "duration_s": 21.473375,
+      "stft_reference_energy": 5.451221495413891,
+      "stft_complex_error_energy": 0.7293123482061455,
+      "stft_magnitude_error_energy": 0.06129630651423316,
+      "stft_phase_error_energy": 0.6680160416919123,
+      "stft_complex_relative_l2": 0.36577150480357457,
+      "stft_magnitude_relative_l2": 0.106040126902575,
+      "phase_share_of_stft_error_energy": 0.9159532857698066,
+      "magnitude_share_of_stft_error_energy": 0.08404671423019332,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "bus_low_snr",
+      "profile": "serial_baseline",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/bus_low_snr.wav",
+        "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6"
+      },
+      "actual": {
+        "path": "../20260915_accuracy/decoder/fpga_bf16/bus_low_snr.wav",
+        "sha256": "8cdfe2a7ccb04e954efb3809a19fb8ce5a2de526dc0688e2a7037c27ddb73c2a"
+      },
+      "samples": 334067,
+      "duration_s": 20.8791875,
+      "stft_reference_energy": 3.726745240710489,
+      "stft_complex_error_energy": 0.16866024680757832,
+      "stft_magnitude_error_energy": 0.05189691458793058,
+      "stft_phase_error_energy": 0.11676333221964776,
+      "stft_complex_relative_l2": 0.21273625662994777,
+      "stft_magnitude_relative_l2": 0.11800649644324958,
+      "phase_share_of_stft_error_energy": 0.6922990712379373,
+      "magnitude_share_of_stft_error_energy": 0.3077009287620628,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "bus_low_snr",
+      "profile": "sorted_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/bus_low_snr.wav",
+        "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6"
+      },
+      "actual": {
+        "path": "sorted/bus_low_snr.wav",
+        "sha256": "4212880ad9f106aee05a5c564070e6c93cecbf6be5f975d0ec4eb128ce2415b6"
+      },
+      "samples": 334067,
+      "duration_s": 20.8791875,
+      "stft_reference_energy": 3.726745240710489,
+      "stft_complex_error_energy": 0.15191049182261318,
+      "stft_magnitude_error_energy": 0.045382105760787515,
+      "stft_phase_error_energy": 0.10652838606182569,
+      "stft_complex_relative_l2": 0.20189661245381482,
+      "stft_magnitude_relative_l2": 0.11035130388033977,
+      "phase_share_of_stft_error_energy": 0.7012575944143447,
+      "magnitude_share_of_stft_error_energy": 0.2987424055856555,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "bus_low_snr",
+      "profile": "matrix_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/bus_low_snr.wav",
+        "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6"
+      },
+      "actual": {
+        "path": "matrix/bus_low_snr.wav",
+        "sha256": "47332f1a5543d43726c33b9e6614f4aea37fc00104f40e5bf01200f229c9b54b"
+      },
+      "samples": 334067,
+      "duration_s": 20.8791875,
+      "stft_reference_energy": 3.726745240710489,
+      "stft_complex_error_energy": 0.10718033676280501,
+      "stft_magnitude_error_energy": 0.043272353453559426,
+      "stft_phase_error_energy": 0.06390798330924558,
+      "stft_complex_relative_l2": 0.1695870579152508,
+      "stft_magnitude_relative_l2": 0.10775573787399483,
+      "phase_share_of_stft_error_energy": 0.5962659312283826,
+      "magnitude_share_of_stft_error_energy": 0.4037340687716173,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "cafe_low_snr",
+      "profile": "serial_baseline",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/cafe_low_snr.wav",
+        "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c"
+      },
+      "actual": {
+        "path": "../20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.wav",
+        "sha256": "1f9b7599d217db008f9d89d52f565535a9559eb18a13524d6ee2d68ffb11d39e"
+      },
+      "samples": 343450,
+      "duration_s": 21.465625,
+      "stft_reference_energy": 5.304378696219677,
+      "stft_complex_error_energy": 0.5600986586072725,
+      "stft_magnitude_error_energy": 0.193393127794175,
+      "stft_phase_error_energy": 0.3667055308130975,
+      "stft_complex_relative_l2": 0.3249488506590097,
+      "stft_magnitude_relative_l2": 0.19094278717388136,
+      "phase_share_of_stft_error_energy": 0.6547159597291992,
+      "magnitude_share_of_stft_error_energy": 0.34528404027080084,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "cafe_low_snr",
+      "profile": "sorted_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/cafe_low_snr.wav",
+        "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c"
+      },
+      "actual": {
+        "path": "sorted/cafe_low_snr.wav",
+        "sha256": "14fd26e30b85cb2fc9ea6bb80d72c3de06710e7b8a66b1d80999cda9fd86c948"
+      },
+      "samples": 343450,
+      "duration_s": 21.465625,
+      "stft_reference_energy": 5.304378696219677,
+      "stft_complex_error_energy": 0.3428916703285424,
+      "stft_magnitude_error_energy": 0.09802369956835616,
+      "stft_phase_error_energy": 0.24486797076018618,
+      "stft_complex_relative_l2": 0.25425014338353025,
+      "stft_magnitude_relative_l2": 0.13594031866703862,
+      "phase_share_of_stft_error_energy": 0.7141263318690868,
+      "magnitude_share_of_stft_error_energy": 0.28587366813091303,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "cafe_low_snr",
+      "profile": "matrix_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/cafe_low_snr.wav",
+        "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c"
+      },
+      "actual": {
+        "path": "matrix/cafe_low_snr.wav",
+        "sha256": "5c57e804d721c5a39fbbc1276c16738d5c6405fd3f2f320b838b4d794b4726e7"
+      },
+      "samples": 343450,
+      "duration_s": 21.465625,
+      "stft_reference_energy": 5.304378696219677,
+      "stft_complex_error_energy": 0.41288927490309757,
+      "stft_magnitude_error_energy": 0.1251916179146415,
+      "stft_phase_error_energy": 0.28769765698845606,
+      "stft_complex_relative_l2": 0.2789970041532576,
+      "stft_magnitude_relative_l2": 0.1536279958322869,
+      "phase_share_of_stft_error_energy": 0.6967913057465027,
+      "magnitude_share_of_stft_error_energy": 0.3032086942534973,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "office_low_snr",
+      "profile": "serial_baseline",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/office_low_snr.wav",
+        "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708"
+      },
+      "actual": {
+        "path": "../20260915_accuracy/decoder/fpga_bf16/office_low_snr.wav",
+        "sha256": "8abd0e806ef8b5fc7b2561480646a027a0337ab5365d2202804abd823a3d9be7"
+      },
+      "samples": 343910,
+      "duration_s": 21.494375,
+      "stft_reference_energy": 6.391599184676897,
+      "stft_complex_error_energy": 0.18037762579111233,
+      "stft_magnitude_error_energy": 0.06644079103607858,
+      "stft_phase_error_energy": 0.11393683475503373,
+      "stft_complex_relative_l2": 0.16799121331257855,
+      "stft_magnitude_relative_l2": 0.10195596297070307,
+      "phase_share_of_stft_error_energy": 0.6316572482608189,
+      "magnitude_share_of_stft_error_energy": 0.368342751739181,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "office_low_snr",
+      "profile": "sorted_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/office_low_snr.wav",
+        "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708"
+      },
+      "actual": {
+        "path": "sorted/office_low_snr.wav",
+        "sha256": "98fde86024a4895d020dab564f6d552783ef1007233091448f2b90726e8be048"
+      },
+      "samples": 343910,
+      "duration_s": 21.494375,
+      "stft_reference_energy": 6.391599184676897,
+      "stft_complex_error_energy": 0.1554795446960811,
+      "stft_magnitude_error_energy": 0.06118285274147869,
+      "stft_phase_error_energy": 0.09429669195460243,
+      "stft_complex_relative_l2": 0.15596669298262844,
+      "stft_magnitude_relative_l2": 0.09783856967768798,
+      "phase_share_of_stft_error_energy": 0.6064893754282984,
+      "magnitude_share_of_stft_error_energy": 0.3935106245717017,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "office_low_snr",
+      "profile": "matrix_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/office_low_snr.wav",
+        "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708"
+      },
+      "actual": {
+        "path": "matrix/office_low_snr.wav",
+        "sha256": "513bd4a3420243f90a1b09db4ea60b4977393c862e1ae5903600638e5aa54690"
+      },
+      "samples": 343910,
+      "duration_s": 21.494375,
+      "stft_reference_energy": 6.391599184676897,
+      "stft_complex_error_energy": 0.15455887554607523,
+      "stft_magnitude_error_energy": 0.05956609132652837,
+      "stft_phase_error_energy": 0.09499278421954688,
+      "stft_complex_relative_l2": 0.15550423045574663,
+      "stft_magnitude_relative_l2": 0.09653721932537651,
+      "phase_share_of_stft_error_energy": 0.6146058185524828,
+      "magnitude_share_of_stft_error_energy": 0.38539418144751736,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "psquare_low_snr",
+      "profile": "serial_baseline",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/psquare_low_snr.wav",
+        "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b"
+      },
+      "actual": {
+        "path": "../20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.wav",
+        "sha256": "02595b5fd28067eb36e3cc61becef89b209ee9aa9c9ccae3f0772322fa037dd9"
+      },
+      "samples": 344406,
+      "duration_s": 21.525375,
+      "stft_reference_energy": 6.609873406779748,
+      "stft_complex_error_energy": 0.3327245073494279,
+      "stft_magnitude_error_energy": 0.09274689315145757,
+      "stft_phase_error_energy": 0.23997761419797037,
+      "stft_complex_relative_l2": 0.22436020305849985,
+      "stft_magnitude_relative_l2": 0.11845492287083095,
+      "phase_share_of_stft_error_energy": 0.7212501901639168,
+      "magnitude_share_of_stft_error_energy": 0.27874980983608344,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "psquare_low_snr",
+      "profile": "sorted_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/psquare_low_snr.wav",
+        "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b"
+      },
+      "actual": {
+        "path": "sorted/psquare_low_snr.wav",
+        "sha256": "790fa3ebfbe98e2f6c93cf217d32412f3578ac15ecc6433a46e7065452f77f69"
+      },
+      "samples": 344406,
+      "duration_s": 21.525375,
+      "stft_reference_energy": 6.609873406779748,
+      "stft_complex_error_energy": 0.4550161419721515,
+      "stft_magnitude_error_energy": 0.07998088003156642,
+      "stft_phase_error_energy": 0.3750352619405852,
+      "stft_complex_relative_l2": 0.2623716043617043,
+      "stft_magnitude_relative_l2": 0.11000097086393908,
+      "phase_share_of_stft_error_energy": 0.8242240820624306,
+      "magnitude_share_of_stft_error_energy": 0.1757759179375696,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    },
+    {
+      "case": "psquare_low_snr",
+      "profile": "matrix_encoder",
+      "reference": {
+        "path": "../20260914_noisy20s/cpu/psquare_low_snr.wav",
+        "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b"
+      },
+      "actual": {
+        "path": "matrix/psquare_low_snr.wav",
+        "sha256": "fbff15bec6420c372fcd8683d855ab8ba00c75e971a19c1aecfe331f3d0b7974"
+      },
+      "samples": 344406,
+      "duration_s": 21.525375,
+      "stft_reference_energy": 6.609873406779748,
+      "stft_complex_error_energy": 0.32356200143982816,
+      "stft_magnitude_error_energy": 0.07808514253077045,
+      "stft_phase_error_energy": 0.24547685890905777,
+      "stft_complex_relative_l2": 0.22124944279511302,
+      "stft_magnitude_relative_l2": 0.10868951047174572,
+      "phase_share_of_stft_error_energy": 0.7586702326500114,
+      "magnitude_share_of_stft_error_energy": 0.24132976734998873,
+      "diagnostic_global_cross_correlation_lag_samples": 0,
+      "lag_search_samples": [
+        -160,
+        160
+      ],
+      "applied_lag_samples": 0
+    }
+  ],
+  "pooled": {
+    "serial_baseline": {
+      "cases": 8,
+      "stft_reference_energy": 45.534290794222564,
+      "stft_complex_error_energy": 2.53672608156559,
+      "stft_magnitude_error_energy": 0.7055931360733269,
+      "stft_phase_error_energy": 1.8311329454922636,
+      "phase_share_of_stft_error_energy": 0.7218489054845623,
+      "diagnostic_global_lags": {
+        "bus": 0,
+        "cafe": 0,
+        "office": 0,
+        "psquare": 0,
+        "bus_low_snr": 0,
+        "cafe_low_snr": 0,
+        "office_low_snr": 0,
+        "psquare_low_snr": 0
+      }
+    },
+    "sorted_encoder": {
+      "cases": 8,
+      "stft_reference_energy": 45.534290794222564,
+      "stft_complex_error_energy": 2.2727143748506045,
+      "stft_magnitude_error_energy": 0.5758290914991702,
+      "stft_phase_error_energy": 1.6968852833514343,
+      "phase_share_of_stft_error_energy": 0.7466337618703089,
+      "diagnostic_global_lags": {
+        "bus": 0,
+        "cafe": 0,
+        "office": 0,
+        "psquare": 0,
+        "bus_low_snr": 0,
+        "cafe_low_snr": 0,
+        "office_low_snr": 0,
+        "psquare_low_snr": 0
+      }
+    },
+    "matrix_encoder": {
+      "cases": 8,
+      "stft_reference_energy": 45.534290794222564,
+      "stft_complex_error_energy": 2.5081964512397614,
+      "stft_magnitude_error_energy": 0.5980152143578318,
+      "stft_phase_error_energy": 1.9101812368819298,
+      "phase_share_of_stft_error_energy": 0.7615756078188205,
+      "diagnostic_global_lags": {
+        "bus": 0,
+        "cafe": 0,
+        "office": 0,
+        "psquare": 0,
+        "bus_low_snr": 0,
+        "cafe_low_snr": 0,
+        "office_low_snr": 0,
+        "psquare_low_snr": 0
+      }
+    }
+  }
+}

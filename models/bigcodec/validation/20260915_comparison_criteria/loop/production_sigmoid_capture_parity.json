@@ -1,0 +1,20 @@
+[
+  {
+    "case": "primitive64",
+    "prototype_and_production_instruction_bytes_equal": true,
+    "bytes": 26944,
+    "sha256": "33087b2bbc7f6b44c5d4d457f09db44066c32478ef86af141571755c53fd0d06"
+  },
+  {
+    "case": "primitive1536",
+    "prototype_and_production_instruction_bytes_equal": true,
+    "bytes": 27968,
+    "sha256": "2c2075cb36de2a285b8f5d85d71e26aae58fa9cb08910bb2fa1f2d65a0547449"
+  },
+  {
+    "case": "step",
+    "prototype_and_production_instruction_bytes_equal": true,
+    "bytes": 140928,
+    "sha256": "84efefdf06b33726cd1e9f150ad8db88687038c760149eed4822c3396fc1bd09"
+  }
+]

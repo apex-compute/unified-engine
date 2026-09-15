@@ -1,0 +1,14 @@
+test_48khz_raw_metrics_preserved_and_quality_uses_shared_16khz (test_bigcodec_audio_quality.QualityTests.test_48khz_raw_metrics_preserved_and_quality_uses_shared_16khz) ... ok
+test_cli_report_is_reproducible_and_cannot_overwrite_aliases (test_bigcodec_audio_quality.QualityTests.test_cli_report_is_reproducible_and_cannot_overwrite_aliases) ... ok
+test_gain_is_not_fitted_out_of_raw_or_spectral_error (test_bigcodec_audio_quality.QualityTests.test_gain_is_not_fitted_out_of_raw_or_spectral_error) ... ok
+test_identity_has_raw_and_spectral_zero_without_json_infinity (test_bigcodec_audio_quality.QualityTests.test_identity_has_raw_and_spectral_zero_without_json_infinity) ... ok
+test_invalid_inputs_fail_without_implicit_rate_or_channel_conversion (test_bigcodec_audio_quality.QualityTests.test_invalid_inputs_fail_without_implicit_rate_or_channel_conversion) ... ok
+test_original_delay_stays_in_raw_comparison (test_bigcodec_audio_quality.QualityTests.test_original_delay_stays_in_raw_comparison) ... ok
+test_phase_geometry_is_explicit_not_disguised_as_waveform_agreement (test_bigcodec_audio_quality.QualityTests.test_phase_geometry_is_explicit_not_disguised_as_waveform_agreement) ... ok
+test_short_and_silent_audio_has_explicit_status_not_success_sentinel (test_bigcodec_audio_quality.QualityTests.test_short_and_silent_audio_has_explicit_status_not_success_sentinel) ... ok
+test_spectral_windows_match_independent_numpy_dft (test_bigcodec_audio_quality.QualityTests.test_spectral_windows_match_independent_numpy_dft) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.624s
+
+OK

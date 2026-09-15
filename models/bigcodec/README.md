@@ -13,11 +13,15 @@
 | Parameters | 159,436,290, counting upstream weight normalization parameters |
 | Execution | Complete utterance; centered convolutions and two residual LSTM stacks |
 
-The corrected FPGA implementation runs the complete encoder, quantizer and decoder. On the [eight 20–24-second noisy files previously tested with DPDFNet](validation/20260915_accuracy/decoder/README.md), pooled waveform error against the official FP32 CPU model falls from **28.06% to 23.94% with BF16 recurrence**, and from **27.04% to 24.35% with IF8 recurrence**. BF16 improves on all eight files; IF8 improves on seven. The separate short diagnostic clip regresses slightly, as documented in the [accuracy report](validation/20260915_accuracy/README.md).
+The FPGA implementation runs the complete encoder, quantizer and decoder. The [latest decoder correction and comparison criteria](validation/20260915_comparison_criteria/README.md) retain sigmoid-gate residuals as well as cell residuals. The short clip's waveform error falls **20.01% → 16.23%**, while error against CPU decoding of identical tokens falls **12.29% → 6.12%**, at RTF **4.92**. [Final noisy-file measurements and WAVs](validation/20260915_comparison_criteria/final/README.md) report full error, conditional decoder error, PESQ/STOI, runtime and bin sizes. Full-model waveform error remains above 10%.
 
-Processing RTF is **4.82 for BF16**, **4.38 for IF8 recurrence** and **2.32 for one-thread CPU FP32**. Each FPGA run uses one bin and one START/HALT per complete file. Processing RTF excludes startup; including measured runner startup gives **7.18** and **6.67**, respectively. Real time requires RTF ≤ 1. The remaining waveform error is material; this port does not match FP32 exactly.
+Across eight noisy files, the latest implementation has **23.91% pooled full waveform error**, **3.09% same-token decoder error**, and processing RTF **4.879**. Including runner startup gives RTF **6.335**. Three files have small full-error regressions, recorded in the report; the same-token decoder stays below 10% on all nine tested files.
 
-The [encoder precision study](validation/20260915_encoder_accuracy/README.md) adds optional FIR kernels. Sorted accumulation gives the best eight-file pooled error, **22.64%** at RTF **4.825**, with two noisy-case regressions and a short-clip regression. Matrix accumulation with split original coefficients reaches **23.85%** at RTF **6.409**. Its separate short-clip improvement from **20.01% to 16.10%** does not generalize: public-square error rises from **29.77% to 37.05%**. [All eight inputs, CPU/FPGA WAVs and exact comparisons](validation/20260915_encoder_accuracy/matrix_comparison.md) are recorded. Existing deployment defaults remain unchanged.
+The preceding correction on the [eight 20–24-second noisy files previously tested with DPDFNet](validation/20260915_accuracy/decoder/README.md) reduced pooled waveform error against the official FP32 CPU model from **28.06% to 23.94% with BF16 recurrence**, and from **27.04% to 24.35% with IF8 recurrence**. BF16 improved on all eight files; IF8 improved on seven. Its separate short diagnostic clip regressed slightly, as documented in the [earlier accuracy report](validation/20260915_accuracy/README.md).
+
+The preceding implementation's processing RTF was **4.82 for BF16**, **4.38 for IF8 recurrence** and **2.32 for one-thread CPU FP32**. Each FPGA run uses one bin and one START/HALT per complete file. Processing RTF excludes startup; including measured runner startup gave **7.18** and **6.67**, respectively. Real time requires RTF ≤ 1.
+
+The [encoder precision study](validation/20260915_encoder_accuracy/README.md) adds optional FIR kernels. Sorted accumulation gives the best eight-file pooled error, **22.64%** at RTF **4.825**, with two noisy-case regressions and a short-clip regression. Matrix accumulation with split original coefficients reaches **23.85%** at RTF **6.409**. Its separate short-clip improvement from **20.01% to 16.10%** does not generalize: public-square error rises from **29.77% to 37.05%**. [All eight inputs, CPU/FPGA WAVs and exact comparisons](validation/20260915_encoder_accuracy/matrix_comparison.md) are recorded. That FIR study retained serial accumulation for deployment; the later gate correction also keeps serial FIR.
 
 The [previous 3.956-second benchmark](validation/20260914_optimized_italy/README.md) measured the optimization from RTF 15.32 to 4.84 with BF16 waveform samples and tokens bit-identical to the earlier FPGA implementation; IF8 recurrence reached 4.40. The [earlier benchmarks](validation/20260914_italy/README.md) and [initial optimization estimates](validation/20260914_optimization/README.md) retain their original measurements.
 
@@ -50,9 +54,9 @@ python models/bigcodec/bigcodec_run_from_bin.py \
 
 Use `--force` to replace an existing compiled bin. `--conv-precision bf16` reuses overlapping input windows in SRAM for BF16 matrix multiplication; `--conv-precision if8` uses native IF8 convolutions and is the CLI default. BF16 was faster and had lower end-to-end waveform error in the baseline measurements. Compilation is offline and requires the checkpoint. Execution needs only the deployment bin and input audio. The bin contains both packed parameters and the captured instruction program.
 
-The command selects the [corrected numerical implementation](validation/20260915_accuracy/README.md). Decoder LSTM updates retain a BF16 high and low cell value, tanh retains intermediate residuals, and recurrent projection, bias and sigmoid share one writeback. Centered codebook scores retain close differences; spare matrix lanes hold codebook weight residuals. These corrections execute on the FPGA and require no new bitstream. Omitting these numerical options retains the original arithmetic.
+The command selects the [corrected numerical implementation](validation/20260915_comparison_criteria/README.md). Decoder LSTM updates retain BF16 high/low cell and sigmoid-gate values, and tanh retains intermediate residuals. Recurrent projection and bias store BF16 logits before the paired sigmoid calculation. Centered codebook scores retain close differences; spare matrix lanes hold codebook weight residuals. These corrections execute on the FPGA. Omitting these numerical options retains the original arithmetic. Counted device loops reduce the LSTM instruction program without changing timestep arithmetic or adding host execution commands.
 
-The prepared default bin on Italy uses this BF16 profile for the 63,400-sample padded `p232_007` input. [Deployment hashes and the preserved original bin](validation/20260915_accuracy/deployment.json) are recorded. Recompile for another padded input length.
+The prepared default bin on Italy uses this BF16 correction for the 63,400-sample padded `p232_007` input. It contains **331,267,968 parameter bytes** and **70,428,352 instruction bytes**. [Deployment hashes and the preserved previous bin](validation/20260915_comparison_criteria/deployment.json) are recorded. Recompile for another padded input length.
 
 Recurrent weights default to BF16. Add `--lstm-precision encoder-if8` to stream IF8 recurrent weights in the encoder, or `--lstm-precision if8` for both encoder and decoder. Input projections remain BF16. The earlier short-sample benchmark records RTF 4.62 for encoder-only IF8 and 4.40 for both stacks, before the numerical corrections.
 
@@ -88,6 +92,17 @@ python models/bigcodec/bigcodec_compare.py \
   --reference-tokens reconstructed_cpu.tokens.npz \
   --actual-tokens reconstructed_fpga.tokens.npz --report comparison.json
 ```
+
+For PESQ-WB/NB, STOI, ESTOI and magnitude-spectrum comparisons alongside unchanged waveform L2:
+
+```bash
+python -m pip install -r models/bigcodec/requirements-quality.txt
+python models/bigcodec/bigcodec_audio_quality.py \
+  --reference reconstructed_cpu.wav --actual reconstructed_fpga.wav \
+  --report quality.json
+```
+
+These optional dependencies are needed only for quality evaluation. Scores against CPU reconstruction measure agreement with that reference; they do not certify waveform error below 10%. [Metric definitions and measured comparisons](validation/20260915_comparison_criteria/README.md).
 
 RTF is processing time divided by input audio duration; a value below 1 means faster than real time. The FPGA report's `audio_rtf` includes preprocessing, input/output DMA, FPGA execution and output restoration/write. It excludes bin loading, model upload and compilation. Hardware cycle timing and upload time are recorded separately.
 

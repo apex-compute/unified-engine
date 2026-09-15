@@ -1,0 +1,63 @@
+{
+  "name": "loop_decoder_baseline",
+  "instructions": 39290,
+  "halt_index": 39288,
+  "program_bytes": 1257280,
+  "resident_bytes": 76812224,
+  "program_sha256": "fd4f7efeeb2d7e1ff19d8a3b69d742971763846342f20733685bf4101cfa99db",
+  "resident_sha256": "9c8d6b14488abb6d199a60e8fcfc7b769839126603a4e90b9c684b7e223f3794",
+  "input_sha256": "66242b3fbc6279796be42664c97e58c00a740d69e6a7773aade20ed42dbd4cd9",
+  "hardware_executed": true,
+  "scope": "Guarded native parity harness for counted decoder LSTM loops.\n\nOffline capture by default. Root alone may pass --execute. Reuses the original\npaired-gate guarded harness and recorded unrolled native tensors without editing\nany existing script, reference, parameter layout or arithmetic implementation.\n",
+  "mode": "baseline",
+  "source_fp32_sha256": "c0c87fef98989b446b02bcaeaa9b300642586c397d27563e6ddea17e7c6873f2",
+  "expected_model": "Recorded unrolled native FPGA output tensor",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "source_sha256": {
+    "models/bigcodec/bigcodec_bin/accuracy_next_20260915/loop_native.py": "b3fb4bd1dd85c24bbfed693b81715049c463f09427a1e065d756c679a5f2a516",
+    "models/bigcodec/bigcodec_bin/accuracy_next_20260915/loop_lstm.py": "51fb7ef22981a95e4df3d3e16dd6e41d586a490408ed3213a029712421af8d56",
+    "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_native.py": "1567450f47b1229d9bee8aebc48ee3f7deb4a447a8f5aa64741b2712c6deb5b6",
+    "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_probe.py": "15d57b68ca510132246af5cb063061a896c532aad242db4a730b340761c66d75",
+    "models/bigcodec/bigcodec_bin/accuracy_20260915/native_compensated_smoke.py": "f2dc3852359d8e4c6e6cf4da1fb4a66b0f7a1e81a3fe1b07e6dd7bbb8e5e82c6",
+    "models/bigcodec/bigcodec_lstm.py": "7c4c08b31b4cdd55f318ddb6dd9546ddf6a58ce3e6d8ec801f4c35e3216259c2",
+    "models/bigcodec/bigcodec_tanh.py": "998f37fc5c982933ca0cd0eded6a075f20d85b33b3ffaa67aed07f6fc5dc7df5",
+    "user_dma_core.py": "b213f8dcd0a94fba6d60196d134e2506dc578c3e961672242989640c6484a992",
+    "models/yolov5s/yolov5_precompiled.py": "3fe19cd7d559c0bf15cd54723cd3e4279b2d681d4d2566c9353a593e27e1dc32"
+  },
+  "unrolled_native_reference": {
+    "path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_baseline_native.pt",
+    "sha256": "04a72b0113fb75dfa67d1e65a6262ff709ff4a56c22e0d0cda4520cb9e65a08f",
+    "output_sha256": "d1a820c062c51057c3d76a9c7f7dde988f9b442c8ff37cb1489e36b96b8bef9d",
+    "input_sha256": "66242b3fbc6279796be42664c97e58c00a740d69e6a7773aade20ed42dbd4cd9",
+    "hardware_version": "0x90f1f464"
+  },
+  "expected_label": "Exact bit parity with the recorded unrolled native LSTM, not an FP32 approximation",
+  "loop_helper_sha256": "51fb7ef22981a95e4df3d3e16dd6e41d586a490408ed3213a029712421af8d56",
+  "native_parity_accepted": true,
+  "hardware_version": "0x90f1f464",
+  "host_s": 1.9498955449998903,
+  "fpga_s": 1.950274784696174,
+  "fpga_cycles": 649929072,
+  "starts": 1,
+  "halts": 1,
+  "finite": true,
+  "guards_intact": true,
+  "input_unchanged": true,
+  "output_sha256": "d1a820c062c51057c3d76a9c7f7dde988f9b442c8ff37cb1489e36b96b8bef9d",
+  "vs_unrolled_native": {
+    "relative_l2": 0.0,
+    "max_abs": 0.0,
+    "exact_mismatches": 0
+  },
+  "vs_official_fp32": {
+    "relative_l2": 0.00954106338714414,
+    "max_abs": 0.1368178129196167,
+    "exact_mismatches": 486908
+  },
+  "passed": true,
+  "version_unchanged": true,
+  "unrolled_native_bit_mismatches": 0,
+  "sources_unchanged": true,
+  "unrolled_reference_unchanged": true,
+  "saved_native_artifact_sha256": "bc98180c29ed9d5d4091807a56d7778d185fba7175218a3c4b86a8e0ab621025"
+}

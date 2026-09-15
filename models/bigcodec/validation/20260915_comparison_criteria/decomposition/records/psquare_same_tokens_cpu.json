@@ -1,0 +1,86 @@
+{
+  "case": "psquare",
+  "recurrent_precision": "bf16",
+  "variant": "selected",
+  "samples": 343574,
+  "sample_rate": 16000,
+  "padded_samples": 343600,
+  "frames": 1718,
+  "tokens_matching_official": 1569,
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "source_files_sha256": {
+    "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+    "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+    "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+    "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+    "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+    "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+    "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+    "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+  },
+  "metrics": {
+    "full_fpga_vs_official_l2": 0.2977152406717768,
+    "token_only_cpu_vs_official_l2": 0.30925817131132316,
+    "same_token_fpga_decoder_vs_cpu_l2": 0.036875694545520664,
+    "decoder_error_relative_to_official_energy": 0.03638617221930439,
+    "reference_energy": 1804.0364112958182,
+    "same_token_cpu_energy": 1756.457405205663,
+    "full_error_energy": 159.89962090103668,
+    "token_error_energy": 172.53915460595442,
+    "decoder_error_energy": 2.3884603727698583,
+    "two_error_cross_term": -15.027994077687605,
+    "two_error_cross_term_relative_to_reference_energy": -0.00833020552334261,
+    "token_decoder_error_cosine": -0.37014182893916836,
+    "error_interaction": "cancellation",
+    "fraction_of_component_energy_cancelled": 0.08590978662525867,
+    "scalar_identity_residual": 0.0,
+    "vector_identity_max_abs_residual": 0.0,
+    "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+  },
+  "cpu_decode_s": 25.495465713000158,
+  "cpu_decode_rtf": 1.1873059411014877,
+  "cache_reuse": null,
+  "files": {
+    "fpga_wav": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.wav",
+      "sha256": "4009d7328effcb55386baba76ce981204fba52bf4987d3fe8c330e15e2076b8b",
+      "bytes": 1374376
+    },
+    "actual_tokens": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.tokens.npz",
+      "sha256": "7cb20922586f2e819d068e3bc6b031b3ffe38a3b1d1516db9b8401e236e41008",
+      "bytes": 3863
+    },
+    "fpga_metrics": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.metrics.json",
+      "sha256": "585877f3cb9458d3d4629d063528bb05310c9b82ef137f20717724ea7d6eb3f5",
+      "bytes": 3394
+    },
+    "fpga_comparison": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.comparison.json",
+      "sha256": "4d1b829f8c6376274c54fce68ffdfc7be2dbbb46c96872ea13748e900d1298d6",
+      "bytes": 1735
+    },
+    "same_token_cpu_wav": {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_bf16_selected_same_tokens_cpu.wav",
+      "sha256": "de5354c87e8b7bb055e4b188fa1b04f684fd307a3b3775710e20703950ec2c88",
+      "bytes": 1374376
+    },
+    "reference_wav": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.wav",
+      "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059",
+      "bytes": 1374376
+    },
+    "official_tokens": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.tokens.npz",
+      "sha256": "c4f0e9c95822161d75be03e1debace66bf229c78ea433b031dd983a2e9cd0a34",
+      "bytes": 3855
+    }
+  },
+  "fpga_rtf": 4.8239108874593475,
+  "fpga_audio_processing_s": 103.58564745299736
+}

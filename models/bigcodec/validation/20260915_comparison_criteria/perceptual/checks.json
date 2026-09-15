@@ -1,0 +1,24 @@
+{
+  "status": "pass",
+  "eight_case_pairs": 72,
+  "separate_short_clip_pairs": 9,
+  "all_source_hashes_verified": true,
+  "tracked_wav_inputs_only": true,
+  "original_rate_raw_waveform_pool_matches_existing_report": true,
+  "short_original_48khz_preserved": true,
+  "short_quality_shared_16khz_resampling_explicit": true,
+  "all_speech_metric_statuses_finite": true,
+  "independent_research_max_abs_metric_difference": {
+    "pesq_wb": 0,
+    "pesq_nb": 0,
+    "stoi": 0,
+    "estoi": 2.220446049250313e-16,
+    "mr_spectral_convergence": 1.1102230246251565e-16,
+    "mr_log_magnitude_mae_db": 0,
+    "mr_log_spectral_distance_db": 0
+  },
+  "research_comparison_tolerance": 1e-12,
+  "quality_unit_tests": 9,
+  "quality_tests_sha256": "cc3c7a5055624c94109dab4a491799510f419c16d18bafef61bfd1e4c525b992",
+  "unit_test_source_sha256": "2d3cf6882b2770a24e49e840a444d6565b565b9975579743e62b96b36e423aa1"
+}

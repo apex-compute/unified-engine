@@ -1,0 +1,265 @@
+{
+  "scope": "Read saved native paired-gate probes; compare recovered values and frozen FP32 decoder tail. No hardware.",
+  "script_sha256": "01f52122ca6e2ac447b01090e34820aed72d26967a6375351497b5828af8bf7d",
+  "cpu_core": 12,
+  "threads": 1,
+  "native_outputs": {
+    "primitive": {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_primitive_native.pt",
+      "sha256": "b7f1259f292a1e6a41e93fb8877f75c76d68d53ba8a2c3d0a1d0ffbc51008f34",
+      "record": {
+        "name": "decoder_gate_pair_primitive",
+        "instructions": 1752,
+        "halt_index": 1751,
+        "program_bytes": 56064,
+        "resident_bytes": 64256,
+        "program_sha256": "afb1156bd0dff679fca1edd2bc9f58c785c2891afffe32e3e18f51753cf42df7",
+        "resident_sha256": "595bf0c976b775952d42c5098e95d9e480be64206cf6f7f5b8cffc4199561596",
+        "input_sha256": "ab5815549f9127a14bac1113cde756edd7bce392253620f9a4ff70db69858c1f",
+        "hardware_executed": true,
+        "hardware_version": "0x90f1f464",
+        "host_s": 0.00033212199923582375,
+        "fpga_s": 0.0002266166541635409,
+        "fpga_cycles": 75520,
+        "starts": 1,
+        "halts": 1,
+        "finite": true,
+        "guards_intact": true,
+        "input_unchanged": true,
+        "output_sha256": "c8e3f9b44652eec8a6324c90a90d5db46e6c3b590dbb814f19bc027ed75fa156",
+        "components_vs_native_rounding_model": {
+          "relative_l2": 0.0,
+          "max_abs": 0.0,
+          "exact_mismatches": 0
+        },
+        "vs_official_fp32": {
+          "relative_l2": 0.001208296937820231,
+          "max_abs": 0.00391387939453125,
+          "exact_mismatches": 3589
+        },
+        "passed": true
+      }
+    },
+    "baseline": {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_baseline_native.pt",
+      "sha256": "04a72b0113fb75dfa67d1e65a6262ff709ff4a56c22e0d0cda4520cb9e65a08f",
+      "record": {
+        "name": "decoder_gate_pair_baseline",
+        "instructions": 1200696,
+        "halt_index": 1200694,
+        "program_bytes": 38422272,
+        "resident_bytes": 113977216,
+        "program_sha256": "26ce0712e877ef3f0872298aabd0be141b99bb60fd3f6ab3cb931f897087622a",
+        "resident_sha256": "279428c1c09a3f111b78bd73161cc8e2d20c82cbd3d4d924ed584f55add2986f",
+        "input_sha256": "66242b3fbc6279796be42664c97e58c00a740d69e6a7773aade20ed42dbd4cd9",
+        "hardware_executed": true,
+        "scope": "Diagnostic only: paired sigmoid gates; no production source is modified.\n\nOffline self-test/capture is default. Root alone may explicitly pass --execute.\nDots store BF16 logits before paired sigmoid, unlike the current fused SFU path.\n",
+        "mode": "baseline",
+        "source_fp32_sha256": "c0c87fef98989b446b02bcaeaa9b300642586c397d27563e6ddea17e7c6873f2",
+        "expected_model": "FP32 accumulation approximation, not native dot parity",
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "hardware_version": "0x90f1f464",
+        "host_s": 1.9493373069999507,
+        "fpga_s": 1.9497696504126034,
+        "fpga_cycles": 649760736,
+        "starts": 1,
+        "halts": 1,
+        "finite": true,
+        "guards_intact": true,
+        "input_unchanged": true,
+        "output_sha256": "d1a820c062c51057c3d76a9c7f7dde988f9b442c8ff37cb1489e36b96b8bef9d",
+        "vs_offline_fp32_dot_control": {
+          "relative_l2": 0.003856134792801504,
+          "max_abs": 0.03515625,
+          "exact_mismatches": 183859
+        },
+        "vs_official_fp32": {
+          "relative_l2": 0.00954106338714414,
+          "max_abs": 0.1368178129196167,
+          "exact_mismatches": 486908
+        },
+        "passed": true,
+        "guarded_execution_passed": true,
+        "accuracy_accepted": false,
+        "pass_scope": "Finite guarded execution and broad offline-control sanity bound only; not an accuracy acceptance",
+        "baseline_matches_corrected_native_golden": true,
+        "baseline_golden_sha256": "2a4fa842a9cc56ccd4343d7a31628e884dfdb1c9224ed3ec515480f2c0091d94"
+      }
+    },
+    "candidate": {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_candidate_native.pt",
+      "sha256": "5d0f48a949a111b96b786166f857ed9b750e5079f0451839b55a564a83abe014",
+      "record": {
+        "name": "decoder_gate_pair_candidate",
+        "instructions": 2915032,
+        "halt_index": 2915030,
+        "program_bytes": 93281024,
+        "resident_bytes": 168835968,
+        "program_sha256": "dfb9c5476426b764a7bb900b0985a78de992fdf727996e99d5ddea1160cd6909",
+        "resident_sha256": "ef8d4adf4de01ed7d464f7b0a4f87269e252483f1f08ee6e78dfc6c02297f99a",
+        "input_sha256": "66242b3fbc6279796be42664c97e58c00a740d69e6a7773aade20ed42dbd4cd9",
+        "hardware_executed": true,
+        "scope": "Diagnostic only: paired sigmoid gates; no production source is modified.\n\nOffline self-test/capture is default. Root alone may explicitly pass --execute.\nDots store BF16 logits before paired sigmoid, unlike the current fused SFU path.\n",
+        "mode": "candidate",
+        "source_fp32_sha256": "c0c87fef98989b446b02bcaeaa9b300642586c397d27563e6ddea17e7c6873f2",
+        "expected_model": "FP32 accumulation approximation, not native dot parity",
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "hardware_version": "0x90f1f464",
+        "host_s": 2.165703722001126,
+        "fpga_s": 2.166216882220555,
+        "fpga_cycles": 721891776,
+        "starts": 1,
+        "halts": 1,
+        "finite": true,
+        "guards_intact": true,
+        "input_unchanged": true,
+        "output_sha256": "ed2c5f4dfceeebf913023fe78c1ab28d1577eadb81579f7e82bac8a21ab12083",
+        "vs_offline_fp32_dot_control": {
+          "relative_l2": 0.003960129778238318,
+          "max_abs": 0.05859375,
+          "exact_mismatches": 178391
+        },
+        "vs_official_fp32": {
+          "relative_l2": 0.004681856436375682,
+          "max_abs": 0.060186728835105896,
+          "exact_mismatches": 486909
+        },
+        "passed": true,
+        "guarded_execution_passed": true,
+        "accuracy_accepted": false,
+        "pass_scope": "Finite guarded execution and broad offline-control sanity bound only; not an accuracy acceptance"
+      }
+    }
+  },
+  "limitations": [
+    "Fixed historical FPGA token sequence, same input for both native decoder LSTMs; encoder/token selection is not rerun.",
+    "Native LSTM outputs feed the unchanged official FP32 decoder tail; this is not full-model FPGA acceptance.",
+    "Primitive sigmoid logits clamp to [-8,8]; recovered pair error includes the resulting tail saturation approximation."
+  ],
+  "primitive": {
+    "component_mismatches": 0,
+    "recovered_vs_fp32": {
+      "relative_l2": 0.00022513535665759235,
+      "max_abs": 0.0003257344878875301,
+      "rmse": 0.00015242235872213678,
+      "finite": true
+    },
+    "high_only_vs_fp32": {
+      "relative_l2": 0.0010088705153299038,
+      "max_abs": 0.0022080540657043457,
+      "rmse": 0.00068303098133838,
+      "finite": true
+    },
+    "inrange_recovered_vs_fp32": {
+      "relative_l2": 1.24689227795059e-05,
+      "max_abs": 2.9807910323143005e-05,
+      "rmse": 8.250506715836963e-06,
+      "finite": true
+    },
+    "input_abs_max": 12.0,
+    "input_count": 3072
+  },
+  "reference_sha256": "f730f5ac802876a506bdb14fab98e5f6de5ce5ca02dc3ab73e9af51885191f9b",
+  "variants": [
+    {
+      "name": "baseline",
+      "lstm_vs_official": {
+        "relative_l2": 0.00954106338714414,
+        "max_abs": 0.1368178129196167,
+        "rmse": 0.0026290460595660187,
+        "finite": true
+      },
+      "fp32_tail_vs_official": {
+        "relative_l2": 0.10476847554296455,
+        "max_abs": 0.06309614051133394,
+        "rmse": 0.007706241697183675,
+        "finite": true
+      },
+      "native_lstm_s": 1.9497696504126034,
+      "cpu_tail_s": 2.9570847539998795
+    },
+    {
+      "name": "candidate",
+      "lstm_vs_official": {
+        "relative_l2": 0.004681856436375682,
+        "max_abs": 0.060186728835105896,
+        "rmse": 0.0012900885064962599,
+        "finite": true
+      },
+      "fp32_tail_vs_official": {
+        "relative_l2": 0.027248196531895325,
+        "max_abs": 0.016884466633200645,
+        "rmse": 0.002004240180062897,
+        "finite": true
+      },
+      "native_lstm_s": 2.166216882220555,
+      "cpu_tail_s": 2.9446849710002425
+    }
+  ],
+  "baseline_matches_frozen_native_golden": true,
+  "size_projection": {
+    "arena_bytes": 1275068416,
+    "additional_instructions_per_layer_timestep": 2704,
+    "additional_program_bytes_per_frame": 173056,
+    "method": "Exact isolated 317-frame capture difference; whole-graph size is projected, not compiled",
+    "cases": [
+      {
+        "case": "bus",
+        "serial_resident_bytes": 1012537024,
+        "additional_bytes": 327941120,
+        "predicted_resident_bytes": 1340478144,
+        "arena_remaining_bytes": -65409728
+      },
+      {
+        "case": "cafe",
+        "serial_resident_bytes": 921156160,
+        "additional_bytes": 283984896,
+        "predicted_resident_bytes": 1205141056,
+        "arena_remaining_bytes": 69927360
+      },
+      {
+        "case": "office",
+        "serial_resident_bytes": 963699776,
+        "additional_bytes": 304405504,
+        "predicted_resident_bytes": 1268105280,
+        "arena_remaining_bytes": 6963136
+      },
+      {
+        "case": "psquare",
+        "serial_resident_bytes": 949030656,
+        "additional_bytes": 297310208,
+        "predicted_resident_bytes": 1246340864,
+        "arena_remaining_bytes": 28727552
+      },
+      {
+        "case": "bus_low_snr",
+        "serial_resident_bytes": 932047104,
+        "additional_bytes": 289176576,
+        "predicted_resident_bytes": 1221223680,
+        "arena_remaining_bytes": 53844736
+      },
+      {
+        "case": "cafe_low_snr",
+        "serial_resident_bytes": 949030656,
+        "additional_bytes": 297310208,
+        "predicted_resident_bytes": 1246340864,
+        "arena_remaining_bytes": 28727552
+      },
+      {
+        "case": "office_low_snr",
+        "serial_resident_bytes": 949592576,
+        "additional_bytes": 297656320,
+        "predicted_resident_bytes": 1247248896,
+        "arena_remaining_bytes": 27819520
+      },
+      {
+        "case": "psquare_low_snr",
+        "serial_resident_bytes": 950820608,
+        "additional_bytes": 298175488,
+        "predicted_resident_bytes": 1248996096,
+        "arena_remaining_bytes": 26072320
+      }
+    ]
+  },
+  "status": "complete"
+}

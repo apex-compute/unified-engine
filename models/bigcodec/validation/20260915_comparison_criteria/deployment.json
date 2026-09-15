@@ -1,0 +1,76 @@
+{
+  "status": "Prepared local default bin replaced after nine native validations; previous bin preserved",
+  "default_bin": {
+    "path": "models/bigcodec/bigcodec_bin/bigcodec-andromeda.bin",
+    "sha256": "07ef87e7b337a65680c0ecd19a5ff4a185a926fb8dd48e07aa8704f40602772e",
+    "bytes": 401738031
+  },
+  "source_bin": {
+    "path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/p232_007_paired_production.bin",
+    "sha256": "07ef87e7b337a65680c0ecd19a5ff4a185a926fb8dd48e07aa8704f40602772e"
+  },
+  "previous_bin": {
+    "path": "models/bigcodec/bigcodec_bin/bigcodec-andromeda.before-paired-gates-20260915.bin",
+    "sha256": "200351f4fab341135fcd9675522ce68dae5d2b40190b7398329591b9a67076dc",
+    "bytes": 445631471
+  },
+  "hardware_version": "0x90f1f464",
+  "compiled_samples": 63400,
+  "native_sample_rate": 16000,
+  "parameter_bytes": 331267968,
+  "program_bytes": 70428352,
+  "instructions": 2200886,
+  "precision": {
+    "convolutions": "BF16",
+    "activations": "BF16",
+    "lstm_input_weights": "BF16",
+    "lstm_cell": "compensated",
+    "lstm_tanh": "compensated",
+    "lstm_math_scope": "decoder",
+    "lstm_fused_gates": true,
+    "lstm_sigmoid": {
+      "encoder.block.6": "native-bf16",
+      "decoder.model.1": "compensated-pade-high-low"
+    },
+    "center_quantizer_scores": true,
+    "compensated_codebook": true,
+    "filter_accumulation": "serial",
+    "filter_math_scope": "both",
+    "filter_stage": "both",
+    "lstm_recurrent_weights": {
+      "encoder": "BF16",
+      "decoder": "BF16"
+    }
+  },
+  "validated_native_receipt": "models/bigcodec/validation/20260915_comparison_criteria/final/fpga/p232_007.metrics.json",
+  "validated_native_receipt_sha256": "212a5d03e39d8db811bd10cd973c88c79f6277669249cba51355f78d73d7b6cd",
+  "all_cases_results": "models/bigcodec/validation/20260915_comparison_criteria/final/results.json",
+  "all_cases_results_sha256": "a80789966dd33abc9d6a793b1abf3e0eec158f0f8dd545a782c74f62fc149c1c",
+  "production_sources": {
+    "models/bigcodec/bigcodec_accuracy_report.py": "ece0d50f0a9012cd57578979117252eec87f70182b453394a28c2b1160161c46",
+    "models/bigcodec/bigcodec_activation.py": "d84eeca2201a5ab54cd4761bf2bfa8079f247625e6262dfae7ba1136790d1371",
+    "models/bigcodec/bigcodec_audio_quality.py": "8136f819f079cf0192de8d1078cd8121cbda2310c6cec04318360cfb48ef6442",
+    "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+    "models/bigcodec/bigcodec_compare.py": "42219382a6031722f89f4530ac2f1b4e028be391e5f1da5ab62ffcf6fed6c9e2",
+    "models/bigcodec/bigcodec_compile.py": "d82a12986dfa243c2fcce7132547a9170d8c39a77528584e2568f5f621d7efcb",
+    "models/bigcodec/bigcodec_conv.py": "8718ec8441ad9195ebcdf232ffe21ccfb3bc55d836cef1c25098f98b9e632b53",
+    "models/bigcodec/bigcodec_conv_bf16.py": "e60caa1cc611160db23de9e8590c18111c2cf283f414b34651e8ddd1943d87a7",
+    "models/bigcodec/bigcodec_device.py": "ef719dd88d1530d9ce59bf1626c683bc352e90b6fd0122e7a6dab32c7b8589eb",
+    "models/bigcodec/bigcodec_fetch.py": "d8c2404b53ed5dda2866e7883042af7f37ed0067f84d4393f28222beb9cd7a0e",
+    "models/bigcodec/bigcodec_filter.py": "aab7ee99b7199e02d75efc1b30725279739808c414a94e0d552ed55d5f9e1fb1",
+    "models/bigcodec/bigcodec_layout.py": "f2209cb8aef693d924de99e82d9acbdf701509bb9c344decb02b01a1fee379fd",
+    "models/bigcodec/bigcodec_lstm.py": "29c825ab0e34bf242b1649ebe622e775b24db1f5657226f96a0fd36cbe7e9bdc",
+    "models/bigcodec/bigcodec_lstm_loop.py": "50ee2f20f3399a7c09b076bf4651ca929e1d4848c8571830d47f2ad45455a65f",
+    "models/bigcodec/bigcodec_precompiled.py": "365be814cd3b40bc4436ab0809929cf8dd4b5791a60257f7cf63c31d1879c425",
+    "models/bigcodec/bigcodec_quantizer.py": "d5c3f4d9ae4511a6648c928f68ee71c8d1422de5c1d1df9285289d0ec11f3353",
+    "models/bigcodec/bigcodec_run_cpu.py": "d6b5abd1fe8beb3bdb11f90f6b7e7004469fac0baa35206007274093687dd37f",
+    "models/bigcodec/bigcodec_run_from_bin.py": "363684a6934e121113f325c84381a0859cdd51b78f3df4ee0412e405df67db79",
+    "models/bigcodec/bigcodec_sigmoid.py": "bbc061f44f5001cc9e3e6405499c1ab509be650ddaf1a7a9ac0b0721f7df2b78",
+    "models/bigcodec/bigcodec_tanh.py": "998f37fc5c982933ca0cd0eded6a075f20d85b33b3ffaa67aed07f6fc5dc7df5",
+    "user_dma_core.py": "b213f8dcd0a94fba6d60196d134e2506dc578c3e961672242989640c6484a992",
+    "quant_lib.py": "8ea8c322e832d0096820e4b24bd08f0717b4b672e0318e02cd8af348b3367e58",
+    "models/yolov5s/yolov5_precompiled.py": "3fe19cd7d559c0bf15cd54723cd3e4279b2d681d4d2566c9353a593e27e1dc32",
+    "models/yolov5s/yolov5_common.py": "9a2009b2d5d5118cb4aaff3394caefa4a5d7d8db6738c8c70339b341655ca3f5"
+  },
+  "scope": "Full utterance with one START/HALT; compile a matching padded length for another WAV. No new CLI profile or runtime CPU neural work."
+}

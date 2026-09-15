@@ -1,0 +1,86 @@
+{
+  "case": "office",
+  "recurrent_precision": "bf16",
+  "variant": "selected",
+  "samples": 351688,
+  "sample_rate": 16000,
+  "padded_samples": 351800,
+  "frames": 1759,
+  "tokens_matching_official": 1583,
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "source_files_sha256": {
+    "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+    "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+    "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+    "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+    "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+    "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+    "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+    "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+  },
+  "metrics": {
+    "full_fpga_vs_official_l2": 0.22477939430919133,
+    "token_only_cpu_vs_official_l2": 0.22096929175964092,
+    "same_token_fpga_decoder_vs_cpu_l2": 0.03503446413674172,
+    "decoder_error_relative_to_official_energy": 0.034555872479844506,
+    "reference_energy": 2243.7508500261993,
+    "same_token_cpu_energy": 2182.867613297678,
+    "full_error_energy": 113.36725308608645,
+    "token_error_energy": 109.55658285691717,
+    "decoder_error_energy": 2.679281564402957,
+    "two_error_cross_term": 1.1313886647663312,
+    "two_error_cross_term_relative_to_reference_energy": 0.0005042398824063377,
+    "token_decoder_error_cosine": 0.03301820128887268,
+    "error_interaction": "reinforcement",
+    "fraction_of_component_energy_cancelled": -0.010080455749146566,
+    "scalar_identity_residual": -1.4210854715202004e-14,
+    "vector_identity_max_abs_residual": 0.0,
+    "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+  },
+  "cpu_decode_s": 26.146102155002154,
+  "cpu_decode_rtf": 1.1895135304020452,
+  "cache_reuse": null,
+  "files": {
+    "fpga_wav": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.wav",
+      "sha256": "966600affcbf213051cb96deaac30004c9c51c524ef2c2d2e9d758678c430884",
+      "bytes": 1406832
+    },
+    "actual_tokens": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.tokens.npz",
+      "sha256": "6e87aa6694c194c3ec9dc19f811442dadff1adb0edb5aa6ed9c209dd4c27160d",
+      "bytes": 3870
+    },
+    "fpga_metrics": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.metrics.json",
+      "sha256": "606e03dfee4a83dbeeeddc7f9c27bd5a4cb53a8ab2b67cbe5d6d29e73ffba8d8",
+      "bytes": 3389
+    },
+    "fpga_comparison": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.comparison.json",
+      "sha256": "acc47598a5c8bf902ab40c2caac82560af540b4b7ae8f3c67014a8ed538589f0",
+      "bytes": 1729
+    },
+    "same_token_cpu_wav": {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_bf16_selected_same_tokens_cpu.wav",
+      "sha256": "df3c5d2f96c3a1a918565e24522928d88837013acbe2e25b444c0c673ddf3e5c",
+      "bytes": 1406832
+    },
+    "reference_wav": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.wav",
+      "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad",
+      "bytes": 1406832
+    },
+    "official_tokens": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.tokens.npz",
+      "sha256": "a1060ccbbb1a6007e718fbfaa9cbda024a8a1da12554d3051ec7599bdacaa430",
+      "bytes": 3871
+    }
+  },
+  "fpga_rtf": 4.824129456518061,
+  "fpga_audio_processing_s": 106.03677751899522
+}

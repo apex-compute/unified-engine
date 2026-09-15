@@ -1,0 +1,30 @@
+{
+  "path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/p232_007_paired_gates.bin",
+  "sha256": "20e6ae6487491b9bcfa8a8e1130e4c3d757bf1a41ccbb2aa6df0ca5d75524199",
+  "bytes": 500495727,
+  "verification": "Bin file rehashed at packaging; omitted generated binary",
+  "parameter_bytes": 331267968,
+  "program_bytes": 169181184,
+  "resident_bytes": 500449152,
+  "instructions": 5286912,
+  "precision": {
+    "convolutions": "BF16",
+    "activations": "BF16",
+    "lstm_input_weights": "BF16",
+    "lstm_cell": "compensated",
+    "lstm_tanh": "compensated",
+    "lstm_math_scope": "decoder",
+    "lstm_fused_gates": true,
+    "center_quantizer_scores": true,
+    "compensated_codebook": true,
+    "filter_accumulation": "serial",
+    "filter_math_scope": "both",
+    "filter_stage": "both",
+    "lstm_recurrent_weights": {
+      "encoder": "BF16",
+      "decoder": "BF16"
+    },
+    "lstm_sigmoid": "compensated-pade-high-low-decoder"
+  },
+  "compiler_receipt": "records/p232_007_paired_gates.paired_compile.json"
+}

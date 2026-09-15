@@ -1,0 +1,7 @@
+........................................................../home/hunlu/my_torch_env/lib/python3.12/site-packages/torch/nn/utils/weight_norm.py:144: FutureWarning: `torch.nn.utils.weight_norm` is deprecated in favor of `torch.nn.utils.parametrizations.weight_norm`.
+  WeightNorm.apply(module, name, dim)
+...........................................................................................................................
+----------------------------------------------------------------------
+Ran 181 tests in 23.252s
+
+OK
