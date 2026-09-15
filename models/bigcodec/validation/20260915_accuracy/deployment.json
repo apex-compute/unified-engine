@@ -1,0 +1,20 @@
+{
+  "installed_utc": "2026-09-15T02:16:16.042430+00:00",
+  "host": "italy",
+  "deployment_bin": "models/bigcodec/bigcodec_bin/bigcodec-andromeda.bin",
+  "deployment_sha256": "200351f4fab341135fcd9675522ce68dae5d2b40190b7398329591b9a67076dc",
+  "source_bin": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_split_decoder_bf16.bin",
+  "preserved_original_bin": "models/bigcodec/bigcodec_bin/bigcodec-before-accuracy-20260915.bin",
+  "preserved_original_sha256": "884e3ba74075e5b5b344e6c834894d7a7c8a30fd437835cbd47a9fe41ba70706",
+  "compiled_samples": 63400,
+  "model_sample_rate": 16000,
+  "recurrent_weights": "BF16",
+  "lstm_math_scope": "decoder",
+  "lstm_cell": "compensated",
+  "lstm_tanh": "compensated",
+  "lstm_fused_gates": true,
+  "center_quantizer_scores": true,
+  "compensated_codebook": true,
+  "validation": "short_clip/records/split_decoder_fpga.metrics.json",
+  "note": "Fixed-length deployment for p232_007. Recompile for a different padded input length. The short-clip full-waveform regression is documented in short_clip/README.md."
+}

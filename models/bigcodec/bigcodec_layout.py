@@ -21,7 +21,13 @@ LEGACY_LAYOUT = MemoryLayout(
 EXTENDED_LAYOUT = MemoryLayout(
     "extended", 0x80000000, 0x90000000, 0x90000000, 0xD0000000,
     0xD0000000, 0x100000000)
-LAYOUTS = (LEGACY_LAYOUT, EXTENDED_LAYOUT)
+# Compensated arithmetic emits a larger program. The 20–24 second test inputs
+# need less than 64 MiB of pad64 audio, leaving 192 MiB more for that program.
+# The tensor arena stays at 768 MiB and every address remains within 2 GiB.
+LARGE_PROGRAM_LAYOUT = MemoryLayout(
+    "large-program", 0x80000000, 0x84000000, 0x84000000, 0xD0000000,
+    0xD0000000, 0x100000000)
+LAYOUTS = (LEGACY_LAYOUT, EXTENDED_LAYOUT, LARGE_PROGRAM_LAYOUT)
 
 
 def layout_for_hardware(hardware):
