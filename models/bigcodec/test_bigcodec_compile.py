@@ -10,6 +10,8 @@ import torch
 from bigcodec_common import DEFAULT_CHECKPOINT, load_models
 from bigcodec_compile import Arena, build_graph, compiled_sample_count, plan_memory, convolution_reuse_pixels, _prepare_operation, emit_operation, shared
 from bigcodec_layout import LEGACY_LAYOUT, EXTENDED_LAYOUT, LARGE_PROGRAM_LAYOUT, layout_for_hardware
+from bigcodec_vq.activations import SnakeBeta
+from bigcodec_vq.alias_free_torch import Activation1d
 from bigcodec_vq.module import ResidualUnit, ResLSTM
 
 
@@ -20,6 +22,20 @@ def tiny_models():
     decoder = SimpleNamespace(quantizer=torch.nn.Identity(), model=torch.nn.Sequential(
         torch.nn.ConvTranspose1d(1024, 1, kernel_size=200, stride=200), torch.nn.Tanh()))
     return encoder, decoder
+
+
+def projection_models(code_dimensions=8):
+    """Small temporal graph with the official 1024-channel VQ boundary."""
+    encoder = torch.nn.Module()
+    encoder.block = torch.nn.Sequential(
+        torch.nn.Conv1d(1, 2, 200, stride=200), torch.nn.Tanh(),
+        torch.nn.Conv1d(2, 1024, 3, padding=1))
+    decoder = torch.nn.Module()
+    decoder.quantizer = torch.nn.Module()
+    decoder.quantizer.in_proj = torch.nn.Linear(1024, code_dimensions)
+    decoder.model = torch.nn.Sequential(
+        torch.nn.ConvTranspose1d(1024, 1, 200, stride=200), torch.nn.Tanh())
+    return encoder.eval(), decoder.eval()
 
 
 class BigCodecGraphTest(unittest.TestCase):
@@ -214,6 +230,100 @@ class BigCodecGraphTest(unittest.TestCase):
         for flag in ("center_quantizer_scores", "compensated_codebook"):
             with self.assertRaises(ValueError):
                 build_graph(*tiny_models(), 400, **{flag: 1})
+
+    def test_filter_scope_selects_activation_plans_without_changing_buffers(self):
+        models = projection_models()
+        models[0].block[1] = Activation1d(activation=SnakeBeta(2, alpha_logscale=True))
+        models[1].model.insert(1, Activation1d(activation=SnakeBeta(1, alpha_logscale=True)))
+        default = plan_memory(build_graph(*models, 400, conv_precision='bf16'))
+        explicit = plan_memory(build_graph(*models, 400, conv_precision='bf16',
+            filter_accumulation='serial', filter_math_scope='both'))
+        self.assertEqual(vars(default), vars(explicit))
+        cases = (
+            ('serial', 'both', {'encoder': 'serial', 'decoder': 'serial'}),
+            ('sorted', 'encoder', {'encoder': 'sorted', 'decoder': 'serial'}),
+            ('sorted', 'decoder', {'encoder': 'serial', 'decoder': 'sorted'}),
+            ('sorted', 'both', {'encoder': 'sorted', 'decoder': 'sorted'}),
+        )
+        for accumulation, scope, expected in cases:
+            with self.subTest(accumulation=accumulation, scope=scope):
+                graph = plan_memory(build_graph(*models, 400, conv_precision='bf16',
+                    filter_accumulation=accumulation, filter_math_scope=scope,
+                    lstm_math_scope='decoder' if scope == 'encoder' else 'encoder'))
+                self.assertEqual(graph.tensors, default.tensors)
+                self.assertEqual((graph.scratch_bytes, graph.tensor_end, graph.output_bytes),
+                                 (default.scratch_bytes, default.tensor_end, default.output_bytes))
+                observed = {}
+                for operation in (op for op in graph.operations if op.op == 'activation'):
+                    plan = object()
+                    with patch('bigcodec_compile.prepare_activation', return_value=plan) as prepare:
+                        _prepare_operation(graph, object(), 0x90000000, 0x90002000, operation)
+                    self.assertIs(operation.plan, plan)
+                    stack = operation.name.split('.', 1)[0]
+                    observed[stack] = prepare.call_args.kwargs['filter_accumulation']
+                    self.assertEqual(prepare.call_args.kwargs['input_shape'],
+                                     graph.tensors[operation.inputs[0]].shape)
+                self.assertEqual(observed, expected)
+
+    def test_filter_configuration_rejects_unknown_orders_and_scopes(self):
+        models = projection_models()
+        for value in ('fp32', 'pairwise', '', None, True):
+            with self.subTest(order=value), self.assertRaisesRegex(ValueError, 'Filter accumulation'):
+                build_graph(*models, 400, filter_accumulation=value)
+        for value in ('neither', 'encoder.block', '', None, True):
+            with self.subTest(scope=value), self.assertRaisesRegex(ValueError, 'Filter math scope'):
+                build_graph(*models, 400, filter_math_scope=value)
+
+    def test_filter_configuration_survives_compile_arena_retry(self):
+        import bigcodec_compile as compiler
+        failure = compiler._ModelCapacityError('model arena full', LEGACY_LAYOUT)
+        result = object()
+        with patch.object(compiler, '_compile_models', side_effect=(failure, result)) as compile_graph:
+            self.assertIs(compiler.compile_models(*projection_models(), samples=399,
+                filter_accumulation='sorted', filter_math_scope='encoder'), result)
+            self.assertEqual(compile_graph.call_count, 2)
+            for call in compile_graph.call_args_list:
+                self.assertEqual(call.kwargs['filter_accumulation'], 'sorted')
+                self.assertEqual(call.kwargs['filter_math_scope'], 'encoder')
+
+    def test_matrix_filter_scope_reserves_exact_workspace_and_reaches_packer(self):
+        from bigcodec_activation import activation_scratch_bytes
+        encoder, decoder = projection_models()
+        encoder.block.insert(1, Activation1d(SnakeBeta(2, alpha_logscale=True)))
+        decoder.model.insert(0, Activation1d(SnakeBeta(1024, alpha_logscale=True)))
+        for scope in ('encoder', 'decoder', 'both'):
+            for stage in ('up', 'down', 'both'):
+                graph = plan_memory(build_graph(encoder, decoder, 400, conv_precision='bf16',
+                    filter_accumulation='matrix', filter_math_scope=scope, filter_stage=stage))
+                for operation in (op for op in graph.operations if op.op == 'activation'):
+                    stack = operation.name.split('.', 1)[0]
+                    mode = 'matrix' if scope in (stack, 'both') else 'serial'
+                    shape = graph.tensors[operation.inputs[0]].shape
+                    self.assertEqual(operation.scratch_bytes, activation_scratch_bytes(shape,
+                        filter_accumulation=mode, filter_stage=stage))
+                    self.assertLessEqual(operation.scratch_bytes, graph.scratch_bytes)
+                    with patch('bigcodec_compile.prepare_activation') as prepare:
+                        _prepare_operation(graph, object(), 0x90000000, 0x90002000, operation)
+                    self.assertEqual(prepare.call_args.kwargs['filter_accumulation'], mode)
+                    self.assertEqual(prepare.call_args.kwargs['filter_stage'], stage)
+                    self.assertEqual(prepare.call_args.kwargs['workspace_bytes'], graph.scratch_bytes)
+                for tensor in graph.tensors.values():
+                    self.assertLessEqual(tensor.address + tensor.size_bytes, graph.scratch_address)
+
+    def test_matrix_stage_validation_and_compile_retry(self):
+        import bigcodec_compile as compiler
+        for stage in ('neither', '', None, True):
+            with self.assertRaisesRegex(ValueError, 'Filter stage'):
+                build_graph(*projection_models(), 400, filter_stage=stage)
+        failure = compiler._ModelCapacityError('model arena full', LEGACY_LAYOUT)
+        result = object()
+        with patch.object(compiler, '_compile_models', side_effect=(failure, result)) as compile_graph:
+            self.assertIs(compiler.compile_models(*projection_models(), samples=399,
+                filter_accumulation='matrix', filter_math_scope='encoder', filter_stage='down'), result)
+            for call in compile_graph.call_args_list:
+                self.assertEqual(call.kwargs['filter_accumulation'], 'matrix')
+                self.assertEqual(call.kwargs['filter_math_scope'], 'encoder')
+                self.assertEqual(call.kwargs['filter_stage'], 'down')
 
     def test_live_tensors_never_alias_and_outputs_are_contiguous(self):
         graph = plan_memory(build_graph(*tiny_models(), 400))
