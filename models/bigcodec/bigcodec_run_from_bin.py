@@ -75,6 +75,8 @@ def main():
     parser.add_argument('--dev', default='xdma0')
     parser.add_argument('--cpu-core', type=int, default=6)
     parser.add_argument('--timeout', type=float, default=300)
+    parser.add_argument('--expected-version', type=lambda value: int(value, 0),
+                        help='Require this FPGA build before reset/upload (for controlled comparisons)')
     args = parser.parse_args()
     if args.output.suffix.lower() != '.wav':
         parser.error('--output must be a WAV file')
@@ -90,6 +92,8 @@ def main():
         parser.error('--cpu-core is not available')
     if not np.isfinite(args.timeout) or args.timeout <= 0:
         parser.error('--timeout must be positive and finite')
+    if args.expected_version is not None and not 0 <= args.expected_version <= 0xFFFFFFFF:
+        parser.error('--expected-version must be a 32-bit unsigned build value')
     torch.set_num_threads(1)
     os.sched_setaffinity(0, {args.cpu_core})
     began = time.perf_counter()
@@ -129,13 +133,20 @@ def main():
                              conv_geometry_mode=udc.CONV_GEOMETRY_QUEUE_CONFIG) as engine:
             if engine.is_queue_busy():
                 raise RuntimeError('FPGA queue is already busy')
+            version_before = engine.get_hardware_version()
+            if args.expected_version is not None and version_before != args.expected_version:
+                raise RuntimeError(f'FPGA build 0x{version_before:08x} differs from required '
+                                   f'0x{args.expected_version:08x}; no reset/upload performed')
             engine.software_reset(run_dram_self_test=False)
             backend = WholeGraphBackend(engine, payload, axi_data_width_bits=256,
                                         timeout_s=args.timeout)
             execute_started = time.perf_counter()
             waveform, tokens = backend.execute(padded)
             execute_s = time.perf_counter() - execute_started
-            hardware_version = f'0x{engine.get_hardware_version():08x}'
+            version_after = engine.get_hardware_version()
+            if version_after != version_before:
+                raise RuntimeError('FPGA build changed during execution; output is not a valid comparison')
+            hardware_version = f'0x{version_after:08x}'
     postprocessing = time.perf_counter()
     reconstructed = restore_audio(waveform, metadata)
     for path in (args.output, args.tokens, args.report):
