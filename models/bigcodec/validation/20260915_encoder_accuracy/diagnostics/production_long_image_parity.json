@@ -1,0 +1,38 @@
+{
+  "bus": {
+    "model_image_equal": true,
+    "model_image_sha256": "6d0709901a259e2c476b54c83ecb6f4e9a839a58e3cbb2e22b025de555dd98fd",
+    "hardware": {
+      "compiled_samples": 379000,
+      "input_address": 2147483648,
+      "input_bytes": 48512000,
+      "output_address": 3489660928,
+      "output_bytes": 48754560,
+      "scratch_address": 3732463488,
+      "scratch_bytes": 436608000,
+      "tensor_end": 4169071488,
+      "program_address": 2548219776,
+      "parameter_bytes": 333627264,
+      "program_size": 637939776,
+      "instructions": 19935618
+    }
+  },
+  "cafe_low_snr": {
+    "model_image_equal": true,
+    "model_image_sha256": "ac62693d3b4e6354aa9a6c8612e7e00901273073fdca2cf159ecae6d1e4aee98",
+    "hardware": {
+      "compiled_samples": 343600,
+      "input_address": 2147483648,
+      "input_bytes": 43980800,
+      "output_address": 3489660928,
+      "output_bytes": 44200704,
+      "scratch_address": 3709784832,
+      "scratch_bytes": 395827200,
+      "tensor_end": 4105612032,
+      "program_address": 2548219776,
+      "parameter_bytes": 333627264,
+      "program_size": 579132928,
+      "instructions": 18097904
+    }
+  }
+}

@@ -1,0 +1,11 @@
+test_filters_match_independent_geometry_at_edges_loops_and_padding (test_bigcodec_filter.FilterTests.test_filters_match_independent_geometry_at_edges_loops_and_padding) ... ok
+test_fir_program_size_does_not_grow_with_interior_clip_length (test_bigcodec_filter.FilterTests.test_fir_program_size_does_not_grow_with_interior_clip_length) ... ok
+test_identity_contract_checks_actual_image_bytes (test_bigcodec_filter.FilterTests.test_identity_contract_checks_actual_image_bytes) ... ok
+test_native_capture_matches_validated_loop_program_and_has_bounded_registers (test_bigcodec_filter.FilterTests.test_native_capture_matches_validated_loop_program_and_has_bounded_registers) ... ok
+test_original_asymmetric_taps_and_split_coefficients_use_fp32_residuals (test_bigcodec_filter.FilterTests.test_original_asymmetric_taps_and_split_coefficients_use_fp32_residuals) ... ok
+test_validation_rejects_unsupported_geometry_ranges_and_taps (test_bigcodec_filter.FilterTests.test_validation_rejects_unsupported_geometry_ranges_and_taps) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 4.503s
+
+OK

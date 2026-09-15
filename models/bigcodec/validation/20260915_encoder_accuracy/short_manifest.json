@@ -1,0 +1,199 @@
+{
+  "format": "bigcodec-accuracy-inputs-v1",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "baseline": "baseline_current_board",
+  "profiles": [
+    {
+      "name": "baseline_current_board",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        }
+      }
+    },
+    {
+      "name": "sorted",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        },
+        "filter_accumulation": "sorted",
+        "filter_math_scope": "encoder"
+      }
+    },
+    {
+      "name": "matrix",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        },
+        "alias_free_fir": "original-tap BF16 high/residual matrix FIR"
+      }
+    },
+    {
+      "name": "matrix_up",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        },
+        "alias_free_fir": "original-tap BF16 high/residual matrix FIR",
+        "precise_filter_stage": "up"
+      }
+    },
+    {
+      "name": "matrix_down",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        },
+        "alias_free_fir": "original-tap BF16 high/residual matrix FIR",
+        "precise_filter_stage": "down"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "name": "p232_007",
+      "input": {
+        "path": "../20260915_accuracy/short_clip/audio/input.wav",
+        "sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211"
+      },
+      "reference": {
+        "wave": {
+          "path": "../20260915_accuracy/short_clip/audio/official_cpu.wav",
+          "sha256": "08b449c8be5bad1fabb6cde8cd91736162532144fc30c2b31d279cbfef229c99"
+        },
+        "tokens": {
+          "path": "../20260915_accuracy/short_clip/tokens/official_cpu.tokens.npz",
+          "sha256": "dbd0b73fab28be43a6edd208948a61629bba3a6812107ef7654fe412a87b295f"
+        },
+        "metrics": {
+          "path": "../20260915_accuracy/short_clip/records/official_cpu.metrics.json",
+          "sha256": "ea8b1b300b3e8e92df4682c57383b7de5534e05c35bd3254cc4f6c06b683120c"
+        }
+      },
+      "profiles": {
+        "baseline_current_board": {
+          "wave": {
+            "path": "short/baseline_current_board.wav",
+            "sha256": "11fe762bdd8b87cc7d3ffb3e9bdae45acace88cde14b2e10f5d69a54c6acb74c"
+          },
+          "tokens": {
+            "path": "short/baseline_current_board.tokens.npz",
+            "sha256": "7d2a292de36b75c56863194c3a6b0b54bcdc1946b7a1210940feab5bb0522fe0"
+          },
+          "metrics": {
+            "path": "short/baseline_current_board.metrics.json",
+            "sha256": "c937d946834db5cac03afc465eebb01c3e06dfcec15b1d3ce1623d47d9dfd024"
+          }
+        },
+        "sorted": {
+          "wave": {
+            "path": "short/sorted.wav",
+            "sha256": "189bd0b4078c5b694a72d4eabb18dbbb59197dd4c29ebe935629029676bbb884"
+          },
+          "tokens": {
+            "path": "short/sorted.tokens.npz",
+            "sha256": "ddfb81d930526480dc73bf776934e939ec07eb80f5b007b2f89a59ac6da432e8"
+          },
+          "metrics": {
+            "path": "short/sorted.metrics.json",
+            "sha256": "126a0649688d5cf874baea40b729767a4d26067aaea091225329922ab3d04d12"
+          }
+        },
+        "matrix": {
+          "wave": {
+            "path": "short/matrix.wav",
+            "sha256": "983d983568d2970e865d945cc36adacccb366ee0ab7b60198b5692d95e7599de"
+          },
+          "tokens": {
+            "path": "short/matrix.tokens.npz",
+            "sha256": "c75185e70b2de38cd8ded776e5084e20d026e77c0b0db24334f4b6cef6567af1"
+          },
+          "metrics": {
+            "path": "short/matrix.metrics.json",
+            "sha256": "7dbd8202d17a8af3b027d7c11a7fc142815b927fc1d233c1c5acab8d3b64348c"
+          }
+        },
+        "matrix_up": {
+          "wave": {
+            "path": "short/matrix_up.wav",
+            "sha256": "383caa8a753cb7005d9d161e26c6ac67b87ff1ce0e0206f5599b6b9c5a8e107e"
+          },
+          "tokens": {
+            "path": "short/matrix_up.tokens.npz",
+            "sha256": "3607fd96b1f3241fee47f3d0211c4bc2ddf4c57a86f7b0ae684fa969f8e596a6"
+          },
+          "metrics": {
+            "path": "short/matrix_up.metrics.json",
+            "sha256": "0a8e8c6623f9b4178df2b6acb6ca47e23a38169c0bf819d8996151f643835074"
+          }
+        },
+        "matrix_down": {
+          "wave": {
+            "path": "short/matrix_down.wav",
+            "sha256": "4d1d3eadb7d9444c16c1185e99093339f2b398dd46739f65f11f1e55625b6b12"
+          },
+          "tokens": {
+            "path": "short/matrix_down.tokens.npz",
+            "sha256": "12c90751c6702e6bfc79b0144d22de334d7b50d1e14577a431d9f72291d5dd01"
+          },
+          "metrics": {
+            "path": "short/matrix_down.metrics.json",
+            "sha256": "00b76cec58caf02a06f1bd9ace10e558332c119b3c0f098fc17805564844fd6c"
+          }
+        }
+      }
+    }
+  ]
+}
