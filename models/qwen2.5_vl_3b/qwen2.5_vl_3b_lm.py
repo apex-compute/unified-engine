@@ -28,6 +28,7 @@ _SD = os.path.dirname(os.path.abspath(__file__))
 if os.path.dirname(os.path.dirname(_SD)) not in sys.path:
     sys.path.insert(0, os.path.dirname(os.path.dirname(_SD)))
 
+import numpy as np
 import torch
 
 import user_dma_core
@@ -123,6 +124,123 @@ class Qwen25VLLMMixin:
         prefill implementation.
         """
         return False
+
+    def _prefill_mlp_k_lanes(self) -> int:
+        """K-lane count for the prefill gated MLP (1 = one full-width chain).
+
+        ``down_proj`` contracts over the MLP intermediate, so its K is the
+        model's intermediate size.  ``matmat_mul_core_dynamic`` dequantizes a
+        K x N_chunk strip of B into URAM, so a >=64-wide column strip needs
+        ``K <= URAM_NEAR_FULL_ELEMENTS // 64`` (4095), and it refuses outright
+        at ``K // 64 > 255``.  Past that the only kernel left is
+        ``quantized_matmat_core``, whose M>1 path re-streams B once PER ROW --
+        correct, but it turns down_proj into a weight-bandwidth wall.
+
+        Models whose intermediate exceeds the cap split down's K into lanes
+        instead.  gate/up are sliced along N -- a contiguous ROW slice of the
+        (N, K) weight, so the along-K quant blocking is untouched and no
+        repack is needed -- each lane's activation lands in its own dense
+        [rows, LANE] plane, and the per-lane down partials are summed.  Only
+        down_proj's weight needs a lane-major repack, because K is its inner
+        dimension; :meth:`_prefill_down_lane` supplies it.
+
+        Returning 1 keeps the historical single full-width chain byte for byte.
+        """
+        return 1
+
+    def _prefill_down_lane(self, la: dict, lane: int, lanes: int) -> tuple:
+        """(data, scale) DRAM addresses for one K-lane of down_proj.
+
+        A K-lane is a COLUMN slice of the (N, K) weight, and no matmul kernel
+        has a B row-stride override -- B's row stride is derived from K -- so
+        the slice cannot be addressed inside the as-loaded image.  The lanes
+        are therefore dense planes laid end to end over the SAME allocation,
+        written by :meth:`repack_down_to_k_lanes`, and a lane is a plain
+        offset.  The addresses are correct from compile time; only the BYTES
+        behind them are, until the repack runs.  Compilation happens first by
+        design, so the repack is ordered at prefill execution instead.
+        """
+        if lanes == 1:
+            return la["down_data"], la["down_scale"]
+        d = self._lm_dims()
+        lane_k = d["MLP"] // lanes
+        return (la["down_data"] + lane * d["H"] * (lane_k // 2),
+                la["down_scale"] + lane * d["H"]
+                * (lane_k // UE_VECTOR_SIZE) * self.bytes_per_element)
+
+    def _prefill_mlp_lane_geometry(self) -> tuple:
+        """(lanes, LANE, lane_plane_bytes) for the K-split prefill MLP.
+
+        ``lane_plane_bytes`` is the stride between lane planes inside the
+        existing [P, MLP] gate/up/mult buffers, so lane c of GATE lives at
+        ``LM_MLP_GATE + c * lane_plane_bytes`` with a ``LANE * bpe`` row
+        stride -- exactly what the matmul wants for an A operand of K == LANE.
+        """
+        lanes = int(self._prefill_mlp_k_lanes())
+        MLP = self._lm_dims()["MLP"]
+        if lanes < 1:
+            raise ValueError(f"_prefill_mlp_k_lanes() returned {lanes}")
+        if MLP % lanes or (MLP // lanes) % UE_VECTOR_SIZE:
+            # A lane boundary off a UE_VECTOR_SIZE multiple would cut an IF4
+            # scale block in half: the blocks run along K, which is what is
+            # being sliced.
+            raise ValueError(
+                f"MLP intermediate {MLP} does not split into {lanes} lanes of "
+                f"whole {UE_VECTOR_SIZE}-element blocks")
+        LANE = MLP // lanes
+        return lanes, LANE, self.PREFILL_MAX_SEQ_LEN * LANE * self.bytes_per_element
+
+    def repack_down_to_k_lanes(self) -> None:
+        """Rewrite every layer's down_proj image in place as dense K-lanes.
+
+        The loaded image is (N, K) row major -- scales as (N, K/64) bf16, then
+        nibbles as (N, K/2) -- so a K-lane is a column slice of each, byte
+        aligned because a lane is a whole number of 64-element blocks.  This
+        re-groups those same bytes into ``lanes`` dense (N, K/lanes) planes
+        end to end, so lane c starts at a fixed offset and has a row stride
+        equal to its own K.  Same allocation, same total bytes; no extra DRAM.
+
+        IN PLACE AND ONE WAY.  Anything that reads down_proj as one full-width
+        image -- notably the decode column shards, which copy card -> host ->
+        card out of this exact allocation -- must already have run.  Call it
+        once, immediately before prefill executes.
+        """
+        lanes = self._prefill_mlp_k_lanes()
+        if lanes == 1 or getattr(self, "_down_k_lanes_packed", False):
+            return
+        d = self._lm_dims()
+        N, K = d["H"], d["MLP"]
+        blocks_k = K // UE_VECTOR_SIZE
+        scale_bytes, data_bytes = N * blocks_k * 2, N * (K // 2)
+        t0 = time.perf_counter()
+        for la in self.lm_layer_addrs:
+            for addr, nbytes, dtype, width in (
+                    (la["down_scale"], scale_bytes, "<u2", blocks_k),
+                    (la["down_data"], data_bytes, np.uint8, K // 2)):
+                # A bytearray keeps dma_read on its raw-bytes path; a typed
+                # buffer would go through a NUMERIC cast instead (see
+                # multi_engine_shard._save_dram_selftest_region).
+                buf = bytearray(nbytes)
+                got = self.dma_read(
+                    user_dma_core.DMA_DEVICE_C2H, addr, buf, nbytes)
+                if got != nbytes:
+                    raise IOError(
+                        f"down_proj repack read {got} of {nbytes} bytes")
+                plane = np.frombuffer(bytes(buf), dtype=dtype).reshape(N, width)
+                # (N, lanes, width/lanes) -> (lanes, N, width/lanes)
+                packed = np.ascontiguousarray(
+                    plane.reshape(N, lanes, width // lanes).transpose(1, 0, 2)
+                ).tobytes()
+                written = self.dma_write(
+                    user_dma_core.DMA_DEVICE_H2C, addr, packed, nbytes)
+                if written != nbytes:
+                    raise IOError(
+                        f"down_proj repack wrote {written} of {nbytes} bytes")
+        self._down_k_lanes_packed = True
+        self._loud(
+            f"  [LM] down_proj repacked into {lanes} K-lanes of "
+            f"{K // lanes} across {len(self.lm_layer_addrs)} layers "
+            f"({time.perf_counter() - t0:.1f}s)")
 
     def _lm_dims(self) -> dict:
         fi = self._cfg["file_info"]
@@ -410,6 +528,11 @@ class Qwen25VLLMMixin:
         self.LM_MLP_UP = alloc(P * MLP, "lm.mlp_up")
         self.LM_MLP_MULT = alloc(P * MLP, "lm.mlp_mult")
         self.LM_MLP_DOWN = alloc(P * H, "lm.mlp_down")
+        # K-lane split only: one lane's down partial before it is summed into
+        # LM_MLP_DOWN.  GATE/UP/MULT need no extra space -- the lanes are a
+        # re-interpretation of the same [P, MLP] planes as lanes x [P, LANE].
+        if self._prefill_mlp_k_lanes() > 1:
+            self.LM_MLP_DOWN_PART = alloc(P * H, "lm.mlp_down_part")
         self.LM_OUT_NORM = alloc(H, "lm.out_norm")
         self.LOGITS = alloc(d["VOCAB"], "lm.logits")
         # Repetition-penalty bias: the LM-head matmul's C term, so the HW argmax
@@ -528,6 +651,13 @@ class Qwen25VLLMMixin:
 
     def _ensure_decode_shards(self, sched, layer_size: int) -> dict:
         """Build the complete decode shard set atomically."""
+        if getattr(self, "_down_k_lanes_packed", False):
+            # The shards are COLUMN blocks of the full-width (N, K) images.
+            # After repack_down_to_k_lanes() down_proj is no longer full width,
+            # so slicing it here would silently produce transposed garbage.
+            raise RuntimeError(
+                "decode shards must be built before repack_down_to_k_lanes(); "
+                "the down_proj image is now lane-major")
         missing = object()
         arena_cursors_before = list(sched.arena._weight_cursor)
         scheduler_weights_before = dict(sched._weights)
@@ -1680,6 +1810,13 @@ class Qwen25VLLMMixin:
                 M=M, N=MLP, dram_a=self.LM_MLP_GATE, dram_b=self.LM_MLP_UP,
                 dram_out=self.LM_MLP_MULT, mode=UE_MODE.ELTWISE_MUL,
                 gpr_M_reg=m_reg) or 0
+            if self._prefill_mlp_k_lanes() > 1:
+                # The lane split lives in the sharded path only; this
+                # single-engine chain would read the repacked down_proj image
+                # as though it were still full width.
+                raise RuntimeError(
+                    "the prefill MLP K-lane split requires the row-sharded "
+                    "path; no scheduler was supplied")
             flops += mm(MLP, H, self.LM_MLP_MULT, "down", self.LM_MLP_DOWN)
         else:
             # The SwiGLU MLP has no biases, so only the activations are sliced.
@@ -1689,11 +1826,14 @@ class Qwen25VLLMMixin:
             # contract, it prevents a very long resumed queue from spanning
             # several independent PBI loop nests.
             mlp_acc = [0]
+            lanes, LANE, lane_plane = self._prefill_mlp_lane_geometry()
 
             def _mlp_step(ctx, step, la=la, mlp_acc=mlp_acc,
                           in_addr=in_addr, out_addr=out_addr):
                 m = gate_m_regs[ctx.engine_idx]
-                h_row, mlp_row = H * bpe, MLP * bpe
+                h_row, mlp_row = H * bpe, LANE * bpe
+                lane = step[1] if isinstance(step, tuple) else 0
+                step = step[0] if isinstance(step, tuple) else step
                 ctx.ue.generate_instruction_add_set(m, ctx.rows)
                 if step == "residual1":
                     mlp_acc[0] += ctx.ue.eltwise_core_dram(
@@ -1710,29 +1850,47 @@ class Qwen25VLLMMixin:
                         GAMMA_DRAM_ADDR=la["ln2"], gpr_M_reg=m) or 0
                 elif step in ("gate", "up"):
                     out = (self.LM_MLP_GATE if step == "gate"
-                           else self.LM_MLP_UP)
+                           else self.LM_MLP_UP) + lane * lane_plane
                     a = ctx.rows_addr(self.LM_MLP_NORM, h_row)
+                    # A K-lane of down is an N-slice of gate/up, and N slices
+                    # the (N, K) weight by whole rows -- contiguous, so the
+                    # lane weight is pure address arithmetic on the unsliced
+                    # blob (K/2 data bytes and K/64 bf16 scales per row).
                     mlp_acc[0] += ctx.ue.matmat_mul_core(
-                        M=ctx.rows, K=H, N=MLP, A_DRAM_ADDR=a,
-                        B_DRAM_ADDR=la[f"{step}_data"], is_B_quantized=True,
+                        M=ctx.rows, K=H, N=LANE, A_DRAM_ADDR=a,
+                        B_DRAM_ADDR=la[f"{step}_data"] + lane * LANE * (H // 2),
+                        is_B_quantized=True,
                         data_type=TYPE.IF4,
-                        SCALE_DRAM_ADDR=la[f"{step}_scale"],
+                        SCALE_DRAM_ADDR=(la[f"{step}_scale"]
+                                         + lane * LANE * (H // UE_VECTOR_SIZE) * bpe),
                         OUTPUT_DRAM_ADDR=ctx.rows_addr(out, mlp_row),
                         silu_enable=(step == "gate"), gpr_M_reg=m) or 0
                 elif step == "multiply":
+                    off = lane * lane_plane
                     mlp_acc[0] += ctx.ue.eltwise_core_dram(
-                        M=ctx.rows, N=MLP,
-                        dram_a=ctx.rows_addr(self.LM_MLP_GATE, mlp_row),
-                        dram_b=ctx.rows_addr(self.LM_MLP_UP, mlp_row),
-                        dram_out=ctx.rows_addr(self.LM_MLP_MULT, mlp_row),
+                        M=ctx.rows, N=LANE,
+                        dram_a=ctx.rows_addr(self.LM_MLP_GATE + off, mlp_row),
+                        dram_b=ctx.rows_addr(self.LM_MLP_UP + off, mlp_row),
+                        dram_out=ctx.rows_addr(self.LM_MLP_MULT + off, mlp_row),
                         mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=m) or 0
                 elif step == "down":
+                    # Lane 0 writes the accumulator; every later lane writes a
+                    # partial that is summed in.  An in-place full_matrix-bias
+                    # accumulate would save the adds, but the adds are [rows, H]
+                    # against a [rows, LANE] x [LANE, H] matmul -- under 1% --
+                    # and this needs no aliasing assumption about C and OUT.
+                    first = (lane == 0)
+                    down_data, down_scale = self._prefill_down_lane(
+                        la, lane, lanes)
+                    dst = (self.LM_MLP_DOWN if first
+                           else self.LM_MLP_DOWN_PART)
                     down_kw = dict(
-                        M=ctx.rows, K=MLP, N=H,
-                        A_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_MULT, mlp_row),
-                        B_DRAM_ADDR=la["down_data"],
-                        data_type=TYPE.IF4, SCALE_DRAM_ADDR=la["down_scale"],
-                        OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_DOWN, h_row),
+                        M=ctx.rows, K=LANE, N=H,
+                        A_DRAM_ADDR=ctx.rows_addr(
+                            self.LM_MLP_MULT + lane * lane_plane, mlp_row),
+                        B_DRAM_ADDR=down_data,
+                        data_type=TYPE.IF4, SCALE_DRAM_ADDR=down_scale,
+                        OUTPUT_DRAM_ADDR=ctx.rows_addr(dst, h_row),
                     )
                     if self._prefill_use_streaming_quantized_projection("down"):
                         # Keep M in the engine-local row-count register. This
@@ -1744,6 +1902,13 @@ class Qwen25VLLMMixin:
                     else:
                         down_kw.update(is_B_quantized=True, gpr_M_reg=m)
                         mlp_acc[0] += ctx.ue.matmat_mul_core(**down_kw) or 0
+                    if not first:
+                        mlp_acc[0] += ctx.ue.eltwise_core_dram(
+                            M=ctx.rows, N=H,
+                            dram_a=ctx.rows_addr(self.LM_MLP_DOWN, h_row),
+                            dram_b=ctx.rows_addr(self.LM_MLP_DOWN_PART, h_row),
+                            dram_out=ctx.rows_addr(self.LM_MLP_DOWN, h_row),
+                            mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
                 elif step == "residual2":
                     mlp_acc[0] += ctx.ue.eltwise_core_dram(
                         M=ctx.rows, N=H,
@@ -1754,10 +1919,16 @@ class Qwen25VLLMMixin:
                 else:
                     raise AssertionError(f"unknown prefill MLP step {step!r}")
 
-            mlp_steps = (
-                "residual1", "norm", "gate", "up", "multiply", "down",
-                "residual2",
-            )
+            # One lane's gate/up/multiply/down runs back to back so the lane's
+            # [rows, LANE] intermediate is consumed while it is still the most
+            # recently written thing in DRAM. At lanes == 1 this is the
+            # historical step list, tuple wrappers aside.
+            mlp_steps = ["residual1", "norm"]
+            for _lane in range(lanes):
+                mlp_steps += [("gate", _lane), ("up", _lane),
+                              ("multiply", _lane), ("down", _lane)]
+            mlp_steps.append("residual2")
+            mlp_steps = tuple(mlp_steps)
             if sched.host_segmented:
                 for step in mlp_steps:
                     sched.sharded_region(
@@ -2159,6 +2330,12 @@ class Qwen25VLLMMixin:
         so compatible Qwen multimodal decoders do not inherit this model's
         image-only assumptions.
         """
+        # The K-lane repack rewrites the shared down_proj image in place, so
+        # it must follow compile_decoder(), whose column shards copy that image
+        # card -> host -> card, and precede any prefill read of a lane. Prefill
+        # execution is the one point both hold; it is a no-op at lanes == 1 and
+        # after the first call.
+        self.repack_down_to_k_lanes()
         d = self._lm_dims()
         seq_len = len(tokens)
         compiled_seq_len = getattr(self, "_prefill_seq_len", None)

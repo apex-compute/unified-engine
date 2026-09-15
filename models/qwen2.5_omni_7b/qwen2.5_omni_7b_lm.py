@@ -782,14 +782,39 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
         )
 
     def _prefill_use_streaming_quantized_projection(self, tag: str) -> bool:
-        """Stream Omni's large-K MLP down projection on every FPGA engine.
+        """Never: the K-lane split puts down_proj back on the general tiler.
 
-        Omni has K=18944 here, beyond the general dynamic matmat tiler's
-        12-bit Z-row field.  Gemma4 E2B's runtime-row, one-pass IF4 path supports
-        its 16-column strips without expanding one copy per prompt row, and
-        keeps all learned arithmetic on the FPGA.
+        Omni's down_proj contracts over K=18944.  That is past the general
+        dynamic matmat tiler's 12-bit Z-row field, so this used to route the
+        projection to the one-pass streaming core -- correct, but its M>1 path
+        re-streams B once PER ROW, which made down_proj the single dominant
+        cost of the whole prefill (mlp_proj was 94% of prefill FPGA time at
+        29.5% of peak, while every other phase ran at 83-89%).
+
+        :meth:`_prefill_mlp_k_lanes` splits K instead, which both clears the
+        tiler's ceiling and restores B reuse across the tile's rows.
         """
-        return tag == "down"
+        return False
+
+    def _prefill_mlp_k_lanes(self) -> int:
+        """Eight K-lanes of 2368 for the prefill gated MLP.
+
+        EIGHT IS THE MINIMUM THAT HELPS, and the binding constraint is URAM,
+        not the tiler's hard ceiling.  matmat_mul_core_dynamic dequantizes a
+        K x N_chunk strip of B into URAM, so a >=64-wide column strip needs
+        ``K <= URAM_NEAR_FULL_ELEMENTS // 64`` = 4095.  Lanes of 2, 4 (K=9472,
+        4736) clear the ``K // 64 > 255`` refusal but still collapse to the
+        sub-64 strip fallback with its per-row writeback -- most of the
+        bandwidth problem survives.  At 8 lanes K=2368 gives
+        ``262080 // 2368 = 110`` rows of URAM headroom, so N_chunk lands at 64
+        with the strided writeback, and 2368 = 37 x 64 keeps every IF4 scale
+        block whole (they run along K, the axis being cut).
+
+        18944 / 8 = 2368 and the resulting A operand per lane is dense, so the
+        activation side costs nothing; only down's weight is repacked, in
+        place, by :meth:`repack_down_to_k_lanes`.
+        """
+        return 8
 
     def _prefill_execution_rows(self, seq_len: int) -> int:
         """Choose the eight-engine prefill tile for the active U55 image.
