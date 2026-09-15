@@ -1,0 +1,141 @@
+{
+  "format": "bigcodec-accuracy-inputs-v1",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "baseline": "baseline_restored",
+  "profiles": [
+    {
+      "name": "baseline_restored",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_input_weights": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        }
+      }
+    },
+    {
+      "name": "matrix_production",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_input_weights": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "filter_accumulation": "matrix",
+        "filter_math_scope": "encoder",
+        "filter_stage": "both",
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        }
+      }
+    },
+    {
+      "name": "matrix_bf16_rejected",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_input_weights": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "filter_accumulation": "matrix",
+        "filter_math_scope": "encoder",
+        "filter_stage": "both",
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        },
+        "fir_coefficient_precision": "bf16",
+        "alias_free_fir": "original FP32 taps rounded RNE to BF16, one coefficient lane",
+        "fir_direct_output": true,
+        "fir_time_loop": true
+      }
+    }
+  ],
+  "cases": [
+    {
+      "name": "p232_007",
+      "input": {
+        "path": "../20260915_accuracy/short_clip/audio/input.wav",
+        "sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211"
+      },
+      "reference": {
+        "wave": {
+          "path": "../20260915_accuracy/short_clip/audio/official_cpu.wav",
+          "sha256": "08b449c8be5bad1fabb6cde8cd91736162532144fc30c2b31d279cbfef229c99"
+        },
+        "tokens": {
+          "path": "../20260915_accuracy/short_clip/tokens/official_cpu.tokens.npz",
+          "sha256": "dbd0b73fab28be43a6edd208948a61629bba3a6812107ef7654fe412a87b295f"
+        },
+        "metrics": {
+          "path": "../20260915_accuracy/short_clip/records/official_cpu.metrics.json",
+          "sha256": "ea8b1b300b3e8e92df4682c57383b7de5534e05c35bd3254cc4f6c06b683120c"
+        }
+      },
+      "profiles": {
+        "baseline_restored": {
+          "wave": {
+            "path": "short/baseline_restored.wav",
+            "sha256": "affe9c72bd0eb192af7a745a68a702c996f6b715443e1011cc1c3e4139c72a04"
+          },
+          "tokens": {
+            "path": "short/baseline_restored.tokens.npz",
+            "sha256": "7d2a292de36b75c56863194c3a6b0b54bcdc1946b7a1210940feab5bb0522fe0"
+          },
+          "metrics": {
+            "path": "short/baseline_restored.metrics.json",
+            "sha256": "67a3e0227bab9bad7cc37f3e78932901e3f23014fa54e14d2f7914624055c0c2"
+          }
+        },
+        "matrix_production": {
+          "wave": {
+            "path": "short/matrix_production.wav",
+            "sha256": "685aa8e347ab2b770a34c1007f1cf1b494dc81157e7e162845e7f4dfa995c011"
+          },
+          "tokens": {
+            "path": "short/matrix_production.tokens.npz",
+            "sha256": "c75185e70b2de38cd8ded776e5084e20d026e77c0b0db24334f4b6cef6567af1"
+          },
+          "metrics": {
+            "path": "short/matrix_production.metrics.json",
+            "sha256": "b667522c69d9b1baba78d08c3fb8acb6e1b605d9cf3a952ff7a2220f8eee7d0c"
+          }
+        },
+        "matrix_bf16_rejected": {
+          "wave": {
+            "path": "short/matrix_bf16_rejected.wav",
+            "sha256": "05ad1ae53d010546626f6b071db5bbc02bf6004f6da37db6c3566f3d005da4ce"
+          },
+          "tokens": {
+            "path": "short/matrix_bf16_rejected.tokens.npz",
+            "sha256": "8db7d5372774dba711dc84d070a9fda1ab87ee31dd2ad54c4c402e41a67c095f"
+          },
+          "metrics": {
+            "path": "short/matrix_bf16_rejected.metrics.json",
+            "sha256": "5710ea291dacfe4e60756ffd148f6833ebc0c7362337e94f691a20196f3be294"
+          }
+        }
+      }
+    }
+  ]
+}

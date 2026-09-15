@@ -1,0 +1,14 @@
+{
+  "name": "p232_007_matrix_fused_write",
+  "relative_l2": 0.1610445867445814,
+  "processing_rtf": 6.3599205224272275,
+  "startup_inclusive_rtf": 8.784945970307984,
+  "native_s": 24.98755562490623,
+  "tokens_equal": 307,
+  "tokens": 317,
+  "matrix_production_samples_bitidentical": true,
+  "matrix_production_tokens_bitidentical": true,
+  "bin_sha256": "24cdb44dd6d0aea9b6915ebc2004a43126e0a4311a34118a23267a689a4c7f02",
+  "metrics_sha256": "04422ac4a2c406424023363f37e12e925500962684e47c645fedeb4be74b7832",
+  "comparison_sha256": "70610a319bcf59e522c3d1ccdbaa6b9059c31cdfe6a596c8abfd7e2148a605e5"
+}

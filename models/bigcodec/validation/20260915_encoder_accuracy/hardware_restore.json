@@ -11,6 +11,14 @@
   "programmed": true,
   "method": "JTAG volatile configuration",
   "programmed_at_utc": "2026-09-15T10:46:13.822372+00:00",
-  "status": "JTAG restored; PCIe verification pending",
-  "programming_log_sha256": "4811744fdc45f9c03feeb2f25705504fff67bd5155ba027c4be1638f11bb985c"
+  "status": "Verified after user restored the AXI256 image and PCIe access",
+  "programming_log_sha256": "4811744fdc45f9c03feeb2f25705504fff67bd5155ba027c4be1638f11bb985c",
+  "verified_at_utc": "2026-09-15T20:33:02.197281+00:00",
+  "verified_build": "0x90f1f464",
+  "axi_data_width_bits": 256,
+  "dram_size_gib": 2,
+  "clock_ns": 3.000750187546887,
+  "baseline_metrics": "short/baseline_restored.metrics.json",
+  "baseline_metrics_sha256": "67a3e0227bab9bad7cc37f3e78932901e3f23014fa54e14d2f7914624055c0c2",
+  "baseline_waveform_and_tokens_bitidentical": true
 }

@@ -1,0 +1,3482 @@
+{
+  "format": "bigcodec-accuracy-report-v1",
+  "status": "complete",
+  "baseline": "serial_baseline",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "profiles": [
+    {
+      "name": "serial_baseline",
+      "hardware_version": "0x40519e0a",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_input_weights": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        }
+      }
+    },
+    {
+      "name": "sorted_encoder",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_input_weights": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "fuse_encoder_projection": false,
+        "filter_accumulation": "sorted",
+        "filter_math_scope": "encoder",
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        }
+      }
+    },
+    {
+      "name": "matrix_encoder",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_input_weights": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "filter_accumulation": "matrix",
+        "filter_math_scope": "encoder",
+        "filter_stage": "both",
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        }
+      }
+    }
+  ],
+  "cases": [
+    {
+      "case": "bus",
+      "input": {
+        "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/bus_noisy.wav",
+        "sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+        "bytes": 1515744
+      },
+      "reference": {
+        "wave": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+          "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+          "bytes": 1515744
+        },
+        "tokens": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz",
+          "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+          "bytes": 4178
+        },
+        "metrics": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus.metrics.json",
+          "sha256": "d80002b4d5d2ffbb36499801db0f2db7684d61e7ac9d1e418fe3d2ca662bab2e",
+          "bytes": 1973
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "processing_s": 114.24210366599436,
+          "processing_rtf": 4.823954804378569,
+          "startup_inclusive_s": 169.2787206210014,
+          "startup_inclusive_rtf": 7.147915448109931,
+          "native_s": 113.98120330082521,
+          "native_rtf": 4.812938099244168,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x40519e0a",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 681269056,
+          "instructions": 21289658,
+          "resident_bytes": 1012537024,
+          "bin_sha256": "82bc6f6441b461ea46e5db7d4d3855b200f973c399376be2ad4cb17bee71a1a9",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 23.68225,
+          "samples": 378916,
+          "sample_rate": 16000,
+          "error_energy": 78.32340232229689,
+          "reference_energy": 1854.575545013583,
+          "relative_l2": 0.20550552766590874,
+          "relative_l2_status": "finite",
+          "token_matches": 1736,
+          "token_count": 1895,
+          "source_sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.wav",
+              "sha256": "2cdb24367220760833115a108983cc9315eb12fdf16ecd03e9026e877dd904cb",
+              "bytes": 1515744
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.tokens.npz",
+              "sha256": "3a419e9624d515598da2f88fd834d7f88db17e2e6efb151f9db8ed4aa0fe99b5",
+              "bytes": 4183
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.metrics.json",
+              "sha256": "8e2b5f869ac3600a9348967e4c7f0d51ddff272b363be8e733e2ebf903b104af",
+              "bytes": 3396
+            }
+          }
+        },
+        "sorted_encoder": {
+          "processing_s": 114.26686798300216,
+          "processing_rtf": 4.825000495434435,
+          "startup_inclusive_s": 175.42525398100406,
+          "startup_inclusive_rtf": 7.407457229824196,
+          "native_s": 113.98190946136536,
+          "native_rtf": 4.812967917379698,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "fuse_encoder_projection": false,
+            "filter_accumulation": "sorted",
+            "filter_math_scope": "encoder",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 681269056,
+          "instructions": 21289658,
+          "resident_bytes": 1012537024,
+          "bin_sha256": "9cb851c5fe574980f36c5940ef93c153c8f2c92f5510e1505f7c33f508f29500",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 23.68225,
+          "samples": 378916,
+          "sample_rate": 16000,
+          "error_energy": 117.21228343706343,
+          "reference_energy": 1854.575545013583,
+          "relative_l2": 0.2513994359384396,
+          "relative_l2_status": "finite",
+          "token_matches": 1758,
+          "token_count": 1895,
+          "source_sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus.wav",
+              "sha256": "c375a68e83ae5ae6ac872db5450e788aff0897a4c01121151d340390074cc5be",
+              "bytes": 1515744
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus.tokens.npz",
+              "sha256": "8910fbbc69cda389affc47ea7c073be32bf83fc86c21c560f82b7fb84fff8d18",
+              "bytes": 4178
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus.metrics.json",
+              "sha256": "9a1489ebdb1b7a933d3535b8f214d871b30d9789dbad2aca7c49e2baa56e2316",
+              "bytes": 3502
+            }
+          }
+        },
+        "matrix_encoder": {
+          "processing_s": 151.7707155119997,
+          "processing_rtf": 6.408627369105541,
+          "startup_inclusive_s": 203.4917378690002,
+          "startup_inclusive_rtf": 8.59258465175396,
+          "native_s": 151.5242577524381,
+          "native_rtf": 6.398220513356548,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "filter_accumulation": "matrix",
+            "filter_math_scope": "encoder",
+            "filter_stage": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 333627264,
+          "program_bytes": 637939776,
+          "instructions": 19935618,
+          "resident_bytes": 971567040,
+          "bin_sha256": "61fc828ba2f8019f1227ec5c8af278fdab1498e194af5d7500419dbd1a767d32",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 23.68225,
+          "samples": 378916,
+          "sample_rate": 16000,
+          "error_energy": 76.88009049531613,
+          "reference_energy": 1854.575545013583,
+          "relative_l2": 0.20360323708416653,
+          "relative_l2_status": "finite",
+          "token_matches": 1747,
+          "token_count": 1895,
+          "source_sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus.wav",
+              "sha256": "5ce75d10c35d3adbec14256e3f1bc28f864c6561dcdc87c6db8a8a30c1155135",
+              "bytes": 1515744
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus.tokens.npz",
+              "sha256": "10a050836cfcbcea859f126c5fe9a89ef917f4306751eb81122e5bd5e828da9a",
+              "bytes": 4170
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus.metrics.json",
+              "sha256": "be57874af733e345fa6112be182f1f4e48a885f758217a224b7b6781b424568e",
+              "bytes": 3660
+            }
+          },
+          "packaging_bin_hash_verification": "Cached bin, resident image, parameter and instruction sections rehashed against catalog; the standard offline report does not require cached bins"
+        }
+      },
+      "changes": {
+        "serial_baseline": {
+          "waveform": "unchanged",
+          "tokens": "unchanged",
+          "processing": "unchanged",
+          "waveform_sse_delta": 0.0,
+          "token_matches_delta": 0,
+          "processing_rtf_delta": 0.0
+        },
+        "sorted_encoder": {
+          "waveform": "regressed",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": 38.88888111476655,
+          "token_matches_delta": 22,
+          "processing_rtf_delta": 0.0010456910558662713
+        },
+        "matrix_encoder": {
+          "waveform": "improved",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": -1.4433118269807608,
+          "token_matches_delta": 11,
+          "processing_rtf_delta": 1.5846725647269722
+        }
+      }
+    },
+    {
+      "case": "cafe",
+      "input": {
+        "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_noisy.wav",
+        "sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868",
+        "bytes": 1312664
+      },
+      "reference": {
+        "wave": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav",
+          "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e",
+          "bytes": 1312664
+        },
+        "tokens": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe.tokens.npz",
+          "sha256": "c48df28ed8b8998368cca7e603405a6389f68d60cf0ecc7bf9a09af7c20394c4",
+          "bytes": 3699
+        },
+        "metrics": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe.metrics.json",
+          "sha256": "77c5ef1281692f38ab0331ca53ddd158a75bf1c85921dbdb76614fd051115356",
+          "bytes": 1979
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "processing_s": 98.9022908529987,
+          "processing_rtf": 4.822355456558907,
+          "startup_inclusive_s": 145.69039171400073,
+          "startup_inclusive_rtf": 7.10368636955505,
+          "native_s": 98.68311516279071,
+          "native_rtf": 4.811668716378232,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x40519e0a",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 589888192,
+          "instructions": 18434006,
+          "resident_bytes": 921156160,
+          "bin_sha256": "95c69ffd96b96a77c83c52329249618f1b82894b04c15ac216024911ddc18fd6",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 20.509125,
+          "samples": 328146,
+          "sample_rate": 16000,
+          "error_energy": 82.39589815665093,
+          "reference_energy": 1810.7900888599197,
+          "relative_l2": 0.2133136965218592,
+          "relative_l2_status": "finite",
+          "token_matches": 1528,
+          "token_count": 1641,
+          "source_sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.wav",
+              "sha256": "f3cbcc9aeaccc3f8c4fe61825a6b373b58bf2b658f240a1163c5c71f33d18011",
+              "bytes": 1312664
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.tokens.npz",
+              "sha256": "5062896d4073cf2fc2b6050363766733c6755037777d30b74c1599772bdf36dd",
+              "bytes": 3704
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.metrics.json",
+              "sha256": "35863400b809c03e67f1dfc6f4eef860a740266d865382fb3dcee2a358793145",
+              "bytes": 3379
+            }
+          }
+        },
+        "sorted_encoder": {
+          "processing_s": 98.92228520000208,
+          "processing_rtf": 4.8233303566096595,
+          "startup_inclusive_s": 147.64826390500093,
+          "startup_inclusive_rtf": 7.1991498372066545,
+          "native_s": 98.68432448912229,
+          "native_rtf": 4.81172768165986,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "fuse_encoder_projection": false,
+            "filter_accumulation": "sorted",
+            "filter_math_scope": "encoder",
+            "snake_polynomial": "legacy",
+            "snake_math_scope": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 589888192,
+          "instructions": 18434006,
+          "resident_bytes": 921156160,
+          "bin_sha256": "de40d1430126e25dfe9c50fbfb7408dc3a450b8208682d3ea3f3af6707f916a2",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 20.509125,
+          "samples": 328146,
+          "sample_rate": 16000,
+          "error_energy": 80.81479484143854,
+          "reference_energy": 1810.7900888599197,
+          "relative_l2": 0.21125713366647328,
+          "relative_l2_status": "finite",
+          "token_matches": 1557,
+          "token_count": 1641,
+          "source_sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe.wav",
+              "sha256": "6d3333e622018a7133ef44b62864577af1f2c051a3eb91accbb1a6e59a870311",
+              "bytes": 1312664
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe.tokens.npz",
+              "sha256": "719e0a12efa1af5d5321b3f6dc5172f04982b012664d1dcd57fbf6a67708c1a4",
+              "bytes": 3706
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe.metrics.json",
+              "sha256": "b3e8ff5c7114cfda950eb01f7985577fc04a12a61ca01ac2a16a5033d8f8689c",
+              "bytes": 3635
+            }
+          }
+        },
+        "matrix_encoder": {
+          "processing_s": 131.4170177169999,
+          "processing_rtf": 6.40773400703345,
+          "startup_inclusive_s": 176.97571238299997,
+          "startup_inclusive_rtf": 8.629120568673699,
+          "native_s": 131.2012977644411,
+          "native_rtf": 6.397215764419062,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "filter_accumulation": "matrix",
+            "filter_math_scope": "encoder",
+            "filter_stage": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 333627264,
+          "program_bytes": 553391040,
+          "instructions": 17293470,
+          "resident_bytes": 887018304,
+          "bin_sha256": "e9e3155b75154844d845dfacccea70c35a275481070febc7ff05a6bce887dcb2",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 20.509125,
+          "samples": 328146,
+          "sample_rate": 16000,
+          "error_energy": 65.3756459809424,
+          "reference_energy": 1810.7900888599197,
+          "relative_l2": 0.19000889932801615,
+          "relative_l2_status": "finite",
+          "token_matches": 1557,
+          "token_count": 1641,
+          "source_sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe.wav",
+              "sha256": "daa40fcfed672aff954d210984951b0643b2af64819b8344035608a84da74f03",
+              "bytes": 1312664
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe.tokens.npz",
+              "sha256": "ad40af1ffdfa22aafcd3bbce598e5d22e14bb92d2d82a6fda68972377aebcd38",
+              "bytes": 3701
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe.metrics.json",
+              "sha256": "77845b6ab07feebcf79f8d0e8cd994a6b1ba8c88689dbefce80e44f98e822dd8",
+              "bytes": 3663
+            }
+          },
+          "packaging_bin_hash_verification": "Cached bin, resident image, parameter and instruction sections rehashed against catalog; the standard offline report does not require cached bins"
+        }
+      },
+      "changes": {
+        "serial_baseline": {
+          "waveform": "unchanged",
+          "tokens": "unchanged",
+          "processing": "unchanged",
+          "waveform_sse_delta": 0.0,
+          "token_matches_delta": 0,
+          "processing_rtf_delta": 0.0
+        },
+        "sorted_encoder": {
+          "waveform": "improved",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": -1.5811033152123883,
+          "token_matches_delta": 29,
+          "processing_rtf_delta": 0.000974900050752403
+        },
+        "matrix_encoder": {
+          "waveform": "improved",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": -17.020252175708535,
+          "token_matches_delta": 29,
+          "processing_rtf_delta": 1.5853785504745428
+        }
+      }
+    },
+    {
+      "case": "office",
+      "input": {
+        "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/office_noisy.wav",
+        "sha256": "b5dc82530929875863ebb564cc892c64c4e1cf5c5cead6b17a34c368593d6f73",
+        "bytes": 1406832
+      },
+      "reference": {
+        "wave": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/office.wav",
+          "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad",
+          "bytes": 1406832
+        },
+        "tokens": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/office.tokens.npz",
+          "sha256": "a1060ccbbb1a6007e718fbfaa9cbda024a8a1da12554d3051ec7599bdacaa430",
+          "bytes": 3871
+        },
+        "metrics": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/office.metrics.json",
+          "sha256": "a64507d55cdc583f22aa18e8bbfdd9faad574dec95d24883087381bb6bec0e17",
+          "bytes": 1982
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "processing_s": 106.03677751899522,
+          "processing_rtf": 4.824129456518061,
+          "startup_inclusive_s": 156.44332667400158,
+          "startup_inclusive_rtf": 7.117368880325816,
+          "native_s": 105.80325862265568,
+          "native_rtf": 4.813505544580682,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x40519e0a",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 632431808,
+          "instructions": 19763494,
+          "resident_bytes": 963699776,
+          "bin_sha256": "60aa1c454552cb37378b1c272544ef1daf952bcf934148120b0adb6ba3a717fe",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.9805,
+          "samples": 351688,
+          "sample_rate": 16000,
+          "error_energy": 113.36725308608645,
+          "reference_energy": 2243.7508500261993,
+          "relative_l2": 0.22477939430919133,
+          "relative_l2_status": "finite",
+          "token_matches": 1583,
+          "token_count": 1759,
+          "source_sha256": "b5dc82530929875863ebb564cc892c64c4e1cf5c5cead6b17a34c368593d6f73",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.wav",
+              "sha256": "966600affcbf213051cb96deaac30004c9c51c524ef2c2d2e9d758678c430884",
+              "bytes": 1406832
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.tokens.npz",
+              "sha256": "6e87aa6694c194c3ec9dc19f811442dadff1adb0edb5aa6ed9c209dd4c27160d",
+              "bytes": 3870
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.metrics.json",
+              "sha256": "606e03dfee4a83dbeeeddc7f9c27bd5a4cb53a8ab2b67cbe5d6d29e73ffba8d8",
+              "bytes": 3389
+            }
+          }
+        },
+        "sorted_encoder": {
+          "processing_s": 106.07381852800609,
+          "processing_rtf": 4.825814632424471,
+          "startup_inclusive_s": 160.5629057240003,
+          "startup_inclusive_rtf": 7.304788595527868,
+          "native_s": 105.8036992288072,
+          "native_rtf": 4.8135255899004665,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "fuse_encoder_projection": false,
+            "filter_accumulation": "sorted",
+            "filter_math_scope": "encoder",
+            "snake_polynomial": "legacy",
+            "snake_math_scope": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 632431808,
+          "instructions": 19763494,
+          "resident_bytes": 963699776,
+          "bin_sha256": "0022f2aeba15763fe32ac156ee267bfac98b4a5f8b8d1e53a56a5c9a8a007d6f",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.9805,
+          "samples": 351688,
+          "sample_rate": 16000,
+          "error_energy": 109.26740298701571,
+          "reference_energy": 2243.7508500261993,
+          "relative_l2": 0.22067746952580475,
+          "relative_l2_status": "finite",
+          "token_matches": 1623,
+          "token_count": 1759,
+          "source_sha256": "b5dc82530929875863ebb564cc892c64c4e1cf5c5cead6b17a34c368593d6f73",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office.wav",
+              "sha256": "97ed4e58b08cac6f00b5cdb63979349efc04eb2e7d3b5f667892f4e16fc70f39",
+              "bytes": 1406832
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office.tokens.npz",
+              "sha256": "d7241ad3985ce734db95ad50d904de78b512eb8b3c53687658cf48607e4729ca",
+              "bytes": 3875
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office.metrics.json",
+              "sha256": "af1fb4c3c1b879b6f0e29054c5015b29bcba7d8ba24b9da119d4a1e6c2b63e27",
+              "bytes": 3638
+            }
+          }
+        },
+        "matrix_encoder": {
+          "processing_s": 140.8650057789996,
+          "processing_rtf": 6.408635189326885,
+          "startup_inclusive_s": 188.25561081900014,
+          "startup_inclusive_rtf": 8.564664626327888,
+          "native_s": 140.63571785746439,
+          "native_rtf": 6.398203765040122,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "filter_accumulation": "matrix",
+            "filter_math_scope": "encoder",
+            "filter_stage": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 333627264,
+          "program_bytes": 592654784,
+          "instructions": 18520462,
+          "resident_bytes": 926282048,
+          "bin_sha256": "c6145af17973f73cf79d87a22ebe43b8bb383553ab7e8b8eeb21ad8acd181b25",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.9805,
+          "samples": 351688,
+          "sample_rate": 16000,
+          "error_energy": 119.01002719597402,
+          "reference_energy": 2243.7508500261993,
+          "relative_l2": 0.23030558080608476,
+          "relative_l2_status": "finite",
+          "token_matches": 1621,
+          "token_count": 1759,
+          "source_sha256": "b5dc82530929875863ebb564cc892c64c4e1cf5c5cead6b17a34c368593d6f73",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office.wav",
+              "sha256": "539bfdf079d00d1ba537e4198e1c2dbd2b07d0874132e305edf76acadbdf9417",
+              "bytes": 1406832
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office.tokens.npz",
+              "sha256": "b6c37ac8a7c3290a73468aab5138897a3ca41771b0fefcf9cb05653c4472ed32",
+              "bytes": 3871
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office.metrics.json",
+              "sha256": "f0fb30fd0e06b9fdcfe62eaa9354f1cb779d0d8433185e6cec410fbe0d2f619a",
+              "bytes": 3667
+            }
+          },
+          "packaging_bin_hash_verification": "Cached bin, resident image, parameter and instruction sections rehashed against catalog; the standard offline report does not require cached bins"
+        }
+      },
+      "changes": {
+        "serial_baseline": {
+          "waveform": "unchanged",
+          "tokens": "unchanged",
+          "processing": "unchanged",
+          "waveform_sse_delta": 0.0,
+          "token_matches_delta": 0,
+          "processing_rtf_delta": 0.0
+        },
+        "sorted_encoder": {
+          "waveform": "improved",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": -4.099850099070736,
+          "token_matches_delta": 40,
+          "processing_rtf_delta": 0.0016851759064104854
+        },
+        "matrix_encoder": {
+          "waveform": "regressed",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": 5.642774109887569,
+          "token_matches_delta": 38,
+          "processing_rtf_delta": 1.5845057328088243
+        }
+      }
+    },
+    {
+      "case": "psquare",
+      "input": {
+        "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_noisy.wav",
+        "sha256": "a20d68e238fb9acae1044ced9e05581535764ef2942d2efad5d3a7c1bf1cb26e",
+        "bytes": 1374376
+      },
+      "reference": {
+        "wave": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/psquare.wav",
+          "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059",
+          "bytes": 1374376
+        },
+        "tokens": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/psquare.tokens.npz",
+          "sha256": "c4f0e9c95822161d75be03e1debace66bf229c78ea433b031dd983a2e9cd0a34",
+          "bytes": 3855
+        },
+        "metrics": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/psquare.metrics.json",
+          "sha256": "fae50433a72850806be3a64606664ad5fb5ec6cc28c46ea61c262ee31af5a45d",
+          "bytes": 1989
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "processing_s": 103.58564745299736,
+          "processing_rtf": 4.8239108874593475,
+          "startup_inclusive_s": 154.46381712999937,
+          "startup_inclusive_rtf": 7.193271534167282,
+          "native_s": 103.33358173143286,
+          "native_rtf": 4.81217236374966,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x40519e0a",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 617762688,
+          "instructions": 19305084,
+          "resident_bytes": 949030656,
+          "bin_sha256": "42874acc576521bdcc617e3c9714308cfdcfb8e22bd4ed1507b852447ab89409",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.473375,
+          "samples": 343574,
+          "sample_rate": 16000,
+          "error_energy": 159.89962090103668,
+          "reference_energy": 1804.0364112958182,
+          "relative_l2": 0.29771524067177685,
+          "relative_l2_status": "finite",
+          "token_matches": 1569,
+          "token_count": 1718,
+          "source_sha256": "a20d68e238fb9acae1044ced9e05581535764ef2942d2efad5d3a7c1bf1cb26e",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.wav",
+              "sha256": "4009d7328effcb55386baba76ce981204fba52bf4987d3fe8c330e15e2076b8b",
+              "bytes": 1374376
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.tokens.npz",
+              "sha256": "7cb20922586f2e819d068e3bc6b031b3ffe38a3b1d1516db9b8401e236e41008",
+              "bytes": 3863
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.metrics.json",
+              "sha256": "585877f3cb9458d3d4629d063528bb05310c9b82ef137f20717724ea7d6eb3f5",
+              "bytes": 3394
+            }
+          }
+        },
+        "sorted_encoder": {
+          "processing_s": 103.59529572499741,
+          "processing_rtf": 4.824360200713554,
+          "startup_inclusive_s": 158.0034179899958,
+          "startup_inclusive_rtf": 7.358108261509697,
+          "native_s": 103.3363453023256,
+          "native_rtf": 4.81230106130618,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "fuse_encoder_projection": false,
+            "filter_accumulation": "sorted",
+            "filter_math_scope": "encoder",
+            "snake_polynomial": "legacy",
+            "snake_math_scope": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 617762688,
+          "instructions": 19305084,
+          "resident_bytes": 949030656,
+          "bin_sha256": "6c262d64af0e8d467977701b25f52f968de8e6f0749e205e6f871ed19015b37d",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.473375,
+          "samples": 343574,
+          "sample_rate": 16000,
+          "error_energy": 83.24985400144593,
+          "reference_energy": 1804.0364112958182,
+          "relative_l2": 0.21481721946128576,
+          "relative_l2_status": "finite",
+          "token_matches": 1604,
+          "token_count": 1718,
+          "source_sha256": "a20d68e238fb9acae1044ced9e05581535764ef2942d2efad5d3a7c1bf1cb26e",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare.wav",
+              "sha256": "db4ed19c6e82cb9e2626be3b69bc241ed5bec4339f0bbe6cd810b0266adae9c2",
+              "bytes": 1374376
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare.tokens.npz",
+              "sha256": "87fb02c94a6f29fc8c4fbef3b09479d6bd2bf2e26e1af9fe90ed5fce3135e4d2",
+              "bytes": 3861
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare.metrics.json",
+              "sha256": "61dd2e84f32def4cf2048b13a59cceb6a643450475c1024222226286fda6ea08",
+              "bytes": 3641
+            }
+          }
+        },
+        "matrix_encoder": {
+          "processing_s": 137.59447329300065,
+          "processing_rtf": 6.407678033518282,
+          "startup_inclusive_s": 184.08647433199985,
+          "startup_inclusive_rtf": 8.572777885730577,
+          "native_s": 137.3640556219055,
+          "native_rtf": 6.396947644322585,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "filter_accumulation": "matrix",
+            "filter_math_scope": "encoder",
+            "filter_stage": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 333627264,
+          "program_bytes": 579132928,
+          "instructions": 18097904,
+          "resident_bytes": 912760192,
+          "bin_sha256": "41f334e2fcfa9360c03cee24547f6ccb88d2a995fbf2b8731600d207a2fd74c2",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.473375,
+          "samples": 343574,
+          "sample_rate": 16000,
+          "error_energy": 247.57667646308414,
+          "reference_energy": 1804.0364112958182,
+          "relative_l2": 0.37045223124477805,
+          "relative_l2_status": "finite",
+          "token_matches": 1614,
+          "token_count": 1718,
+          "source_sha256": "a20d68e238fb9acae1044ced9e05581535764ef2942d2efad5d3a7c1bf1cb26e",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare.wav",
+              "sha256": "98aa7416a4ba0f35b07c360aef5a0fc36c5d4ecc360f32e2871f12beb7294eb9",
+              "bytes": 1374376
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare.tokens.npz",
+              "sha256": "34d140bc4a1ec3252418e04f6a6ad73ce4a366cf26e3557a5dc8a20e6ae09fa1",
+              "bytes": 3856
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare.metrics.json",
+              "sha256": "db04f1d54d8358c6cfbcf7979d9014d0b2d1fbcfcae4d69504e1f93d82fc01f0",
+              "bytes": 3669
+            }
+          },
+          "packaging_bin_hash_verification": "Cached bin, resident image, parameter and instruction sections rehashed against catalog; the standard offline report does not require cached bins"
+        }
+      },
+      "changes": {
+        "serial_baseline": {
+          "waveform": "unchanged",
+          "tokens": "unchanged",
+          "processing": "unchanged",
+          "waveform_sse_delta": 0.0,
+          "token_matches_delta": 0,
+          "processing_rtf_delta": 0.0
+        },
+        "sorted_encoder": {
+          "waveform": "improved",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": -76.64976689959076,
+          "token_matches_delta": 35,
+          "processing_rtf_delta": 0.0004493132542062739
+        },
+        "matrix_encoder": {
+          "waveform": "regressed",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": 87.67705556204746,
+          "token_matches_delta": 45,
+          "processing_rtf_delta": 1.5837671460589346
+        }
+      }
+    },
+    {
+      "case": "bus_low_snr",
+      "input": {
+        "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/bus_low_snr_noisy.wav",
+        "sha256": "6ffae073e5549f58e19127bfcc701616baca9bc68d299103c01aeec7a8e0d288",
+        "bytes": 1336348
+      },
+      "reference": {
+        "wave": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.wav",
+          "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6",
+          "bytes": 1336348
+        },
+        "tokens": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.tokens.npz",
+          "sha256": "c7fde3db4b89fca566160bf035ae191ebb53f0e36ca14ff6a9be25fe1b84cb08",
+          "bytes": 3732
+        },
+        "metrics": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.metrics.json",
+          "sha256": "021ecf0eefef7927d39361f93e99ec7346845da24c7d0612400bdc2e76f661c3",
+          "bytes": 1999
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "processing_s": 100.73947469699851,
+          "processing_rtf": 4.824875235063554,
+          "startup_inclusive_s": 150.58942115199898,
+          "startup_inclusive_rtf": 7.212417683973525,
+          "native_s": 100.5087168912228,
+          "native_rtf": 4.813823185946426,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x40519e0a",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 600779136,
+          "instructions": 18774348,
+          "resident_bytes": 932047104,
+          "bin_sha256": "e087c8cdd47aa35fcb794620c2dd88408171d4b9ded6283d67bbfd5b1b4c5b67",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 20.8791875,
+          "samples": 334067,
+          "sample_rate": 16000,
+          "error_energy": 54.85041137555997,
+          "reference_energy": 1193.0449569423322,
+          "relative_l2": 0.21441814768528675,
+          "relative_l2_status": "finite",
+          "token_matches": 1556,
+          "token_count": 1671,
+          "source_sha256": "6ffae073e5549f58e19127bfcc701616baca9bc68d299103c01aeec7a8e0d288",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.wav",
+              "sha256": "8cdfe2a7ccb04e954efb3809a19fb8ce5a2de526dc0688e2a7037c27ddb73c2a",
+              "bytes": 1336348
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.tokens.npz",
+              "sha256": "a59d6049df6fb0892e535429ab8694525778e14c44ad8f52147c9900f905cf45",
+              "bytes": 3742
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.metrics.json",
+              "sha256": "1296954c3ffb67964aa77427187c769a9fa1a563003319a28fba1535abc0563a",
+              "bytes": 3401
+            }
+          }
+        },
+        "sorted_encoder": {
+          "processing_s": 100.76336635000189,
+          "processing_rtf": 4.826019515845714,
+          "startup_inclusive_s": 154.02547456199682,
+          "startup_inclusive_rtf": 7.376986032717835,
+          "native_s": 100.51035169992498,
+          "native_rtf": 4.81390148442917,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "fuse_encoder_projection": false,
+            "filter_accumulation": "sorted",
+            "filter_math_scope": "encoder",
+            "snake_polynomial": "legacy",
+            "snake_math_scope": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 600779136,
+          "instructions": 18774348,
+          "resident_bytes": 932047104,
+          "bin_sha256": "9814f1e5f526f3c066aad4347a42e4345e86e2192f56af292ac744cca15a0897",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 20.8791875,
+          "samples": 334067,
+          "sample_rate": 16000,
+          "error_energy": 49.28678548061438,
+          "reference_energy": 1193.0449569423322,
+          "relative_l2": 0.20325294286871262,
+          "relative_l2_status": "finite",
+          "token_matches": 1583,
+          "token_count": 1671,
+          "source_sha256": "6ffae073e5549f58e19127bfcc701616baca9bc68d299103c01aeec7a8e0d288",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus_low_snr.wav",
+              "sha256": "4212880ad9f106aee05a5c564070e6c93cecbf6be5f975d0ec4eb128ce2415b6",
+              "bytes": 1336348
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus_low_snr.tokens.npz",
+              "sha256": "5fd004b2e99eb416b07fad8754a31d7da4e7d53433eacbf351c1a4642489f92e",
+              "bytes": 3728
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus_low_snr.metrics.json",
+              "sha256": "5a3c50822fad5d8423a29562febe3c2aa8c21e32f3349f371babfe4511d7088b",
+              "bytes": 3652
+            }
+          }
+        },
+        "matrix_encoder": {
+          "processing_s": 133.8284765579997,
+          "processing_rtf": 6.409659214852096,
+          "startup_inclusive_s": 180.23485425599984,
+          "startup_inclusive_rtf": 8.632273370599302,
+          "native_s": 133.61016716579147,
+          "native_rtf": 6.399203377324499,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "filter_accumulation": "matrix",
+            "filter_math_scope": "encoder",
+            "filter_stage": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 333627264,
+          "program_bytes": 562815296,
+          "instructions": 17587978,
+          "resident_bytes": 896442560,
+          "bin_sha256": "c71a097952ed39bb09c08e2165b46e123740d76512bea7a143fc13aa38634b22",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 20.8791875,
+          "samples": 334067,
+          "sample_rate": 16000,
+          "error_energy": 34.23847645587628,
+          "reference_energy": 1193.0449569423322,
+          "relative_l2": 0.16940600893215269,
+          "relative_l2_status": "finite",
+          "token_matches": 1595,
+          "token_count": 1671,
+          "source_sha256": "6ffae073e5549f58e19127bfcc701616baca9bc68d299103c01aeec7a8e0d288",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus_low_snr.wav",
+              "sha256": "47332f1a5543d43726c33b9e6614f4aea37fc00104f40e5bf01200f229c9b54b",
+              "bytes": 1336348
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus_low_snr.tokens.npz",
+              "sha256": "71e0447d625ebdb6379a2b20c797acf85e67507b74db4a5efecca3c5b849671a",
+              "bytes": 3729
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus_low_snr.metrics.json",
+              "sha256": "ab5fd8d27e80ca3a6edc2355834b7221d3661b3657298e29ee7ff8f1201fafa8",
+              "bytes": 3682
+            }
+          },
+          "packaging_bin_hash_verification": "Cached bin, resident image, parameter and instruction sections rehashed against catalog; the standard offline report does not require cached bins"
+        }
+      },
+      "changes": {
+        "serial_baseline": {
+          "waveform": "unchanged",
+          "tokens": "unchanged",
+          "processing": "unchanged",
+          "waveform_sse_delta": 0.0,
+          "token_matches_delta": 0,
+          "processing_rtf_delta": 0.0
+        },
+        "sorted_encoder": {
+          "waveform": "improved",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": -5.563625894945595,
+          "token_matches_delta": 27,
+          "processing_rtf_delta": 0.001144280782160223
+        },
+        "matrix_encoder": {
+          "waveform": "improved",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": -20.61193491968369,
+          "token_matches_delta": 39,
+          "processing_rtf_delta": 1.5847839797885417
+        }
+      }
+    },
+    {
+      "case": "cafe_low_snr",
+      "input": {
+        "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_low_snr_noisy.wav",
+        "sha256": "e61711a17c0ee70e99377efde0f7ff1010cbc4673d76b4914e468529cc8ba915",
+        "bytes": 1373880
+      },
+      "reference": {
+        "wave": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.wav",
+          "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c",
+          "bytes": 1373880
+        },
+        "tokens": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.tokens.npz",
+          "sha256": "a6c30c5a077a9f0c06f2e3bb45b5d06a28d2be2d0efdbc144ab8196cf6f8ac21",
+          "bytes": 3825
+        },
+        "metrics": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.metrics.json",
+          "sha256": "b15593ad68ae6c05624baf4a2f1730e0f020fa133ff65b961afc34de7268f97c",
+          "bytes": 2000
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "processing_s": 103.57233467600236,
+          "processing_rtf": 4.825032333137393,
+          "startup_inclusive_s": 155.42063476399926,
+          "startup_inclusive_rtf": 7.240443022926156,
+          "native_s": 103.3333726871718,
+          "native_rtf": 4.813900023277767,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x40519e0a",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 617762688,
+          "instructions": 19305084,
+          "resident_bytes": 949030656,
+          "bin_sha256": "404a12e241b7a388833c7d386d34071db288446563ce27d0156edd97ac6243df",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.465625,
+          "samples": 343450,
+          "sample_rate": 16000,
+          "error_energy": 188.70286766144085,
+          "reference_energy": 1744.519854172468,
+          "relative_l2": 0.328890471772619,
+          "relative_l2_status": "finite",
+          "token_matches": 1622,
+          "token_count": 1718,
+          "source_sha256": "e61711a17c0ee70e99377efde0f7ff1010cbc4673d76b4914e468529cc8ba915",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.wav",
+              "sha256": "1f9b7599d217db008f9d89d52f565535a9559eb18a13524d6ee2d68ffb11d39e",
+              "bytes": 1373880
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.tokens.npz",
+              "sha256": "2663f7cead2378cdd5222ffe8ef158d53861af4298560847f7ecd5649174c4f4",
+              "bytes": 3826
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.metrics.json",
+              "sha256": "e9dbb9637d7c25d987e05ba542d97816928170538d64bdf1f7c52bf928b2a17f",
+              "bytes": 3401
+            }
+          }
+        },
+        "sorted_encoder": {
+          "processing_s": 103.57887471700815,
+          "processing_rtf": 4.825337008217005,
+          "startup_inclusive_s": 157.6677726889975,
+          "startup_inclusive_rtf": 7.345128440890843,
+          "native_s": 103.33519493473369,
+          "native_rtf": 4.813984914705894,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "fuse_encoder_projection": false,
+            "filter_accumulation": "sorted",
+            "filter_math_scope": "encoder",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 617762688,
+          "instructions": 19305084,
+          "resident_bytes": 949030656,
+          "bin_sha256": "de09aba0fac0a33abac0dba11f25aee237bdf9967cdc883beb5c166773ebb276",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.465625,
+          "samples": 343450,
+          "sample_rate": 16000,
+          "error_energy": 115.14230911441877,
+          "reference_energy": 1744.519854172468,
+          "relative_l2": 0.2569091126676859,
+          "relative_l2_status": "finite",
+          "token_matches": 1641,
+          "token_count": 1718,
+          "source_sha256": "e61711a17c0ee70e99377efde0f7ff1010cbc4673d76b4914e468529cc8ba915",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe_low_snr.wav",
+              "sha256": "14fd26e30b85cb2fc9ea6bb80d72c3de06710e7b8a66b1d80999cda9fd86c948",
+              "bytes": 1373880
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe_low_snr.tokens.npz",
+              "sha256": "219b6f3db6b442ca9fd4cf726dfc4f847d635477ee74ebb0a975a35134ba43bf",
+              "bytes": 3831
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe_low_snr.metrics.json",
+              "sha256": "8cffa4a20eeef453b8e1c61b8e21cc0d5c53b731dfbc4d97812578de6766e109",
+              "bytes": 3520
+            }
+          }
+        },
+        "matrix_encoder": {
+          "processing_s": 137.58828103800033,
+          "processing_rtf": 6.409703003662849,
+          "startup_inclusive_s": 184.0215956279999,
+          "startup_inclusive_rtf": 8.572850575187067,
+          "native_s": 137.36340712378097,
+          "native_rtf": 6.3992270024180975,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "filter_accumulation": "matrix",
+            "filter_math_scope": "encoder",
+            "filter_stage": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 333627264,
+          "program_bytes": 579132928,
+          "instructions": 18097904,
+          "resident_bytes": 912760192,
+          "bin_sha256": "dbda51ddfdb97d777455621fd14fc1cc2a8fe1193bbcf0bd8c4652fe68ded010",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.465625,
+          "samples": 343450,
+          "sample_rate": 16000,
+          "error_energy": 139.1425205339048,
+          "reference_energy": 1744.519854172468,
+          "relative_l2": 0.2824177410067398,
+          "relative_l2_status": "finite",
+          "token_matches": 1637,
+          "token_count": 1718,
+          "source_sha256": "e61711a17c0ee70e99377efde0f7ff1010cbc4673d76b4914e468529cc8ba915",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe_low_snr.wav",
+              "sha256": "5c57e804d721c5a39fbbc1276c16738d5c6405fd3f2f320b838b4d794b4726e7",
+              "bytes": 1373880
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe_low_snr.tokens.npz",
+              "sha256": "a4ec483ee6f233be90961a55d201d2f23b880790e9fbf535cdc944d6ce7173cc",
+              "bytes": 3828
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe_low_snr.metrics.json",
+              "sha256": "eac9977cd7b1e62eaba1b0b73ed42e414594dcbd09666d47c4c351c31cd655eb",
+              "bytes": 3678
+            }
+          },
+          "packaging_bin_hash_verification": "Cached bin, resident image, parameter and instruction sections rehashed against catalog; the standard offline report does not require cached bins"
+        }
+      },
+      "changes": {
+        "serial_baseline": {
+          "waveform": "unchanged",
+          "tokens": "unchanged",
+          "processing": "unchanged",
+          "waveform_sse_delta": 0.0,
+          "token_matches_delta": 0,
+          "processing_rtf_delta": 0.0
+        },
+        "sorted_encoder": {
+          "waveform": "improved",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": -73.56055854702208,
+          "token_matches_delta": 19,
+          "processing_rtf_delta": 0.0003046750796116271
+        },
+        "matrix_encoder": {
+          "waveform": "improved",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": -49.56034712753606,
+          "token_matches_delta": 15,
+          "processing_rtf_delta": 1.5846706705254556
+        }
+      }
+    },
+    {
+      "case": "office_low_snr",
+      "input": {
+        "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/office_low_snr_noisy.wav",
+        "sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620",
+        "bytes": 1375720
+      },
+      "reference": {
+        "wave": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.wav",
+          "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708",
+          "bytes": 1375720
+        },
+        "tokens": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.tokens.npz",
+          "sha256": "8c9f828f1cb6d43d0c997af3554fc89f3603577ffa5067dce2ced15ca1e949cc",
+          "bytes": 3847
+        },
+        "metrics": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.metrics.json",
+          "sha256": "0b81731dbe85f6d5e18f81de09e3d780ff2a11e4cb352a968779078f08b73561",
+          "bytes": 2009
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "processing_s": 103.68490276599914,
+          "processing_rtf": 4.8238156618184584,
+          "startup_inclusive_s": 154.28999178400045,
+          "startup_inclusive_rtf": 7.178156693739662,
+          "native_s": 103.45215236609154,
+          "native_rtf": 4.81298722880249,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x40519e0a",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 618324608,
+          "instructions": 19322644,
+          "resident_bytes": 949592576,
+          "bin_sha256": "d1e134480dca2a9b7b7d3227f6e4fe4160c621459dc99178a656ac51f4535d53",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.494375,
+          "samples": 343910,
+          "sample_rate": 16000,
+          "error_energy": 57.60465653901137,
+          "reference_energy": 1951.9118176410761,
+          "relative_l2": 0.17179032410354408,
+          "relative_l2_status": "finite",
+          "token_matches": 1582,
+          "token_count": 1720,
+          "source_sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.wav",
+              "sha256": "8abd0e806ef8b5fc7b2561480646a027a0337ab5365d2202804abd823a3d9be7",
+              "bytes": 1375720
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.tokens.npz",
+              "sha256": "0319a6fb1660016dfede451e615e58819ce98051eda85d58d92e18485f33a9ce",
+              "bytes": 3847
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.metrics.json",
+              "sha256": "5bb2299731b3922c138d5f7764e002a9308bdbdd050befcfe1e4d43a5d1bf7b0",
+              "bytes": 3407
+            }
+          }
+        },
+        "sorted_encoder": {
+          "processing_s": 103.69528096799331,
+          "processing_rtf": 4.824298495210645,
+          "startup_inclusive_s": 157.112820782997,
+          "startup_inclusive_rtf": 7.309485425047111,
+          "native_s": 103.45276495123782,
+          "native_rtf": 4.813015728591216,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "fuse_encoder_projection": false,
+            "filter_accumulation": "sorted",
+            "filter_math_scope": "encoder",
+            "snake_polynomial": "legacy",
+            "snake_math_scope": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 618324608,
+          "instructions": 19322644,
+          "resident_bytes": 949592576,
+          "bin_sha256": "8652a746c24b0dac0462c2b28470ac420e2e202fac49deb8a38d9cf5003f2268",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.494375,
+          "samples": 343910,
+          "sample_rate": 16000,
+          "error_energy": 49.39373163693671,
+          "reference_energy": 1951.9118176410761,
+          "relative_l2": 0.15907642494971555,
+          "relative_l2_status": "finite",
+          "token_matches": 1624,
+          "token_count": 1720,
+          "source_sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office_low_snr.wav",
+              "sha256": "98fde86024a4895d020dab564f6d552783ef1007233091448f2b90726e8be048",
+              "bytes": 1375720
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office_low_snr.tokens.npz",
+              "sha256": "15c67f85da5a81777e10ce51cb4f0ca7db1d4634777b848f5aadeea41cbcf98c",
+              "bytes": 3840
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office_low_snr.metrics.json",
+              "sha256": "f6b73c13c760d1ef66c1b0a21804720ca6b3662b9fae4116d9b61a9dfb6878b7",
+              "bytes": 3655
+            }
+          }
+        },
+        "matrix_encoder": {
+          "processing_s": 137.7369905710002,
+          "processing_rtf": 6.408048178697924,
+          "startup_inclusive_s": 184.4635712180002,
+          "startup_inclusive_rtf": 8.581946263522441,
+          "native_s": 137.51291794148537,
+          "native_rtf": 6.397623468534691,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "filter_accumulation": "matrix",
+            "filter_math_scope": "encoder",
+            "filter_stage": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 333627264,
+          "program_bytes": 579201536,
+          "instructions": 18100048,
+          "resident_bytes": 912828800,
+          "bin_sha256": "34bb9d68c2cb50d8e396168c7013c0f4c75ecbd0416b83e35d5c95271be9bb98",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.494375,
+          "samples": 343910,
+          "sample_rate": 16000,
+          "error_energy": 49.27093091624924,
+          "reference_energy": 1951.9118176410761,
+          "relative_l2": 0.1588785571667583,
+          "relative_l2_status": "finite",
+          "token_matches": 1623,
+          "token_count": 1720,
+          "source_sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office_low_snr.wav",
+              "sha256": "513bd4a3420243f90a1b09db4ea60b4977393c862e1ae5903600638e5aa54690",
+              "bytes": 1375720
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office_low_snr.tokens.npz",
+              "sha256": "46c4d2722ca33cb275ca7657bfca949b2df9844c6058e4869dfbd48c9221f0d8",
+              "bytes": 3847
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office_low_snr.metrics.json",
+              "sha256": "b145c09cb5659088a75650a565c4eb888b9f6389f7184c793d13fce3e71e5cd2",
+              "bytes": 3684
+            }
+          },
+          "packaging_bin_hash_verification": "Cached bin, resident image, parameter and instruction sections rehashed against catalog; the standard offline report does not require cached bins"
+        }
+      },
+      "changes": {
+        "serial_baseline": {
+          "waveform": "unchanged",
+          "tokens": "unchanged",
+          "processing": "unchanged",
+          "waveform_sse_delta": 0.0,
+          "token_matches_delta": 0,
+          "processing_rtf_delta": 0.0
+        },
+        "sorted_encoder": {
+          "waveform": "improved",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": -8.210924902074666,
+          "token_matches_delta": 42,
+          "processing_rtf_delta": 0.00048283339218624377
+        },
+        "matrix_encoder": {
+          "waveform": "improved",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": -8.333725622762131,
+          "token_matches_delta": 41,
+          "processing_rtf_delta": 1.5842325168794655
+        }
+      }
+    },
+    {
+      "case": "psquare_low_snr",
+      "input": {
+        "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_low_snr_noisy.wav",
+        "sha256": "e44f139883a4570596b455d50eba708ab5e013b86eb6979880da3c6f769f78a8",
+        "bytes": 1377704
+      },
+      "reference": {
+        "wave": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.wav",
+          "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b",
+          "bytes": 1377704
+        },
+        "tokens": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.tokens.npz",
+          "sha256": "a72b391be15694edd578b02df15f42df6dbceb65adf34bc2adfab9dbfec0c466",
+          "bytes": 3866
+        },
+        "metrics": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.metrics.json",
+          "sha256": "dce237107bb012774449af0beb10ec51f46c8c3f452895c21d1f16e96c07be04",
+          "bytes": 2010
+        }
+      },
+      "profiles": {
+        "serial_baseline": {
+          "processing_s": 103.86363209300544,
+          "processing_rtf": 4.82517178413874,
+          "startup_inclusive_s": 155.449877518,
+          "startup_inclusive_rtf": 7.221703571621864,
+          "native_s": 103.62619914178546,
+          "native_rtf": 4.814141409466059,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x40519e0a",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 619552640,
+          "instructions": 19361020,
+          "resident_bytes": 950820608,
+          "bin_sha256": "5aad53e694c18ddd08d5eaa3bad1063a93582727d2631da030069f6fb1daec64",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.525375,
+          "samples": 344406,
+          "sample_rate": 16000,
+          "error_energy": 109.7417619771777,
+          "reference_energy": 2138.47296125845,
+          "relative_l2": 0.22653435945610628,
+          "relative_l2_status": "finite",
+          "token_matches": 1620,
+          "token_count": 1723,
+          "source_sha256": "e44f139883a4570596b455d50eba708ab5e013b86eb6979880da3c6f769f78a8",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.wav",
+              "sha256": "02595b5fd28067eb36e3cc61becef89b209ee9aa9c9ccae3f0772322fa037dd9",
+              "bytes": 1377704
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.tokens.npz",
+              "sha256": "c8c8e552cab65740bc71e440be1eaa12b1c6418dd5e0a26c18c3865bf3505327",
+              "bytes": 3886
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.metrics.json",
+              "sha256": "3c852754f2c9a2576256d2296bc5719d2a4d0561e65af40d312445b088c3cf63",
+              "bytes": 3404
+            }
+          }
+        },
+        "sorted_encoder": {
+          "processing_s": 103.87115224199806,
+          "processing_rtf": 4.825521146182032,
+          "startup_inclusive_s": 156.63786087599874,
+          "startup_inclusive_rtf": 7.276893474608397,
+          "native_s": 103.62632920630159,
+          "native_rtf": 4.814147451847022,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "fuse_encoder_projection": false,
+            "filter_accumulation": "sorted",
+            "filter_math_scope": "encoder",
+            "snake_polynomial": "legacy",
+            "snake_math_scope": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 331267968,
+          "program_bytes": 619552640,
+          "instructions": 19361020,
+          "resident_bytes": 950820608,
+          "bin_sha256": "21d28005c6f639a962f97880ee7c5517e7f1a7fdee737d068417ec3ce276959f",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.525375,
+          "samples": 344406,
+          "sample_rate": 16000,
+          "error_energy": 151.212477545825,
+          "reference_energy": 2138.47296125845,
+          "relative_l2": 0.265914446933494,
+          "relative_l2_status": "finite",
+          "token_matches": 1637,
+          "token_count": 1723,
+          "source_sha256": "e44f139883a4570596b455d50eba708ab5e013b86eb6979880da3c6f769f78a8",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare_low_snr.wav",
+              "sha256": "790fa3ebfbe98e2f6c93cf217d32412f3578ac15ecc6433a46e7065452f77f69",
+              "bytes": 1377704
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare_low_snr.tokens.npz",
+              "sha256": "4d492a333d49408c23c8db571f57c10f6eb1aae2bafbac4545fc35688c7738bd",
+              "bytes": 3870
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare_low_snr.metrics.json",
+              "sha256": "794b1ae6548b147d3721c3b727e084eff6e48ed8b85171786764e3bc1dc9501f",
+              "bytes": 3658
+            }
+          }
+        },
+        "matrix_encoder": {
+          "processing_s": 137.9814452950004,
+          "processing_rtf": 6.4101761430405,
+          "startup_inclusive_s": 184.20184964100008,
+          "startup_inclusive_rtf": 8.557428134980231,
+          "native_s": 137.752559387847,
+          "native_rtf": 6.3995428366682106,
+          "clock_ns": 3.000750187546887,
+          "hardware_version": "0x90f1f464",
+          "precision": {
+            "convolutions": "BF16",
+            "activations": "BF16",
+            "lstm_input_weights": "BF16",
+            "lstm_cell": "compensated",
+            "lstm_tanh": "compensated",
+            "lstm_math_scope": "decoder",
+            "lstm_fused_gates": true,
+            "center_quantizer_scores": true,
+            "compensated_codebook": true,
+            "filter_accumulation": "matrix",
+            "filter_math_scope": "encoder",
+            "filter_stage": "both",
+            "lstm_recurrent_weights": {
+              "encoder": "BF16",
+              "decoder": "BF16"
+            }
+          },
+          "parameter_bytes": 333627264,
+          "program_bytes": 580674752,
+          "instructions": 18146086,
+          "resident_bytes": 914302016,
+          "bin_sha256": "4ca16802350f17a48b016f864773dd89d3daf1409fd5612a71b504b05474a275",
+          "execution_counts": {
+            "model_upload_writes": 1,
+            "input_upload_writes": 1,
+            "program_kicks": 1,
+            "halts": 1,
+            "output_reads": 1,
+            "cpu_neural_ops": 0
+          },
+          "duration_s": 21.525375,
+          "samples": 344406,
+          "sample_rate": 16000,
+          "error_energy": 106.78721094652958,
+          "reference_energy": 2138.47296125845,
+          "relative_l2": 0.22346408841590557,
+          "relative_l2_status": "finite",
+          "token_matches": 1641,
+          "token_count": 1723,
+          "source_sha256": "e44f139883a4570596b455d50eba708ab5e013b86eb6979880da3c6f769f78a8",
+          "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+          "bin_hash_verification": "runner-recorded only",
+          "artifacts": {
+            "wave": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare_low_snr.wav",
+              "sha256": "fbff15bec6420c372fcd8683d855ab8ba00c75e971a19c1aecfe331f3d0b7974",
+              "bytes": 1377704
+            },
+            "tokens": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare_low_snr.tokens.npz",
+              "sha256": "cea4993c29d236e61d4045b82588c87b427bc24ac5a8a86039ad986b44e2ebb9",
+              "bytes": 3871
+            },
+            "metrics": {
+              "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare_low_snr.metrics.json",
+              "sha256": "75c481b66845df0716b8d67a6b23cb7a9756b359af8ae087404ea085260357f6",
+              "bytes": 3683
+            }
+          },
+          "packaging_bin_hash_verification": "Cached bin, resident image, parameter and instruction sections rehashed against catalog; the standard offline report does not require cached bins"
+        }
+      },
+      "changes": {
+        "serial_baseline": {
+          "waveform": "unchanged",
+          "tokens": "unchanged",
+          "processing": "unchanged",
+          "waveform_sse_delta": 0.0,
+          "token_matches_delta": 0,
+          "processing_rtf_delta": 0.0
+        },
+        "sorted_encoder": {
+          "waveform": "regressed",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": 41.47071556864731,
+          "token_matches_delta": 17,
+          "processing_rtf_delta": 0.00034936204329216736
+        },
+        "matrix_encoder": {
+          "waveform": "improved",
+          "tokens": "improved",
+          "processing": "regressed",
+          "waveform_sse_delta": -2.954551030648119,
+          "token_matches_delta": 21,
+          "processing_rtf_delta": 1.5850043589017604
+        }
+      }
+    }
+  ],
+  "pooled": {
+    "serial_baseline": {
+      "duration_s": 173.0098125,
+      "error_energy": 844.8858720192609,
+      "reference_energy": 14741.102485209847,
+      "processing_s": 834.6271637229911,
+      "startup_inclusive_s": 1241.6261813570018,
+      "native_s": 832.7215999039761,
+      "processing_rtf": 4.824160847657072,
+      "startup_inclusive_rtf": 7.1766228944789,
+      "native_rtf": 4.813146652615302,
+      "cases": 8,
+      "samples": 2768157,
+      "token_matches": 12796,
+      "token_count": 13845,
+      "token_match_fraction": 0.9242325749368003,
+      "relative_l2": 0.23940545465201862,
+      "relative_l2_status": "finite"
+    },
+    "sorted_encoder": {
+      "duration_s": 173.0098125,
+      "error_energy": 755.5796390447584,
+      "reference_energy": 14741.102485209847,
+      "processing_s": 834.7669417130091,
+      "startup_inclusive_s": 1267.0837705099912,
+      "native_s": 832.7309192738186,
+      "processing_rtf": 4.824968767092382,
+      "startup_inclusive_rtf": 7.323768242971716,
+      "native_rtf": 4.813200518749874,
+      "cases": 8,
+      "samples": 2768157,
+      "token_matches": 13027,
+      "token_count": 13845,
+      "token_match_fraction": 0.9409172986637775,
+      "relative_l2": 0.22639933160223896,
+      "relative_l2_status": "finite"
+    },
+    "matrix_encoder": {
+      "duration_s": 173.0098125,
+      "error_energy": 838.2815789878766,
+      "reference_energy": 14741.102485209847,
+      "processing_s": 1108.7824057630005,
+      "startup_inclusive_s": 1485.7314061460002,
+      "native_s": 1106.964380615154,
+      "processing_rtf": 6.4087833501524685,
+      "startup_inclusive_rtf": 8.587555726909999,
+      "native_rtf": 6.398275130291548,
+      "cases": 8,
+      "samples": 2768157,
+      "token_matches": 13035,
+      "token_count": 13845,
+      "token_match_fraction": 0.9414951245937161,
+      "relative_l2": 0.23846792820516352,
+      "relative_l2_status": "finite"
+    }
+  },
+  "pooled_changes": {
+    "serial_baseline": {
+      "waveform": "unchanged",
+      "tokens": "unchanged",
+      "processing": "unchanged",
+      "waveform_sse_delta": 0.0,
+      "token_matches_delta": 0,
+      "processing_rtf_delta": 0.0
+    },
+    "sorted_encoder": {
+      "waveform": "improved",
+      "tokens": "improved",
+      "processing": "regressed",
+      "waveform_sse_delta": -89.30623297450245,
+      "token_matches_delta": 231,
+      "processing_rtf_delta": 0.0008079194353101116
+    },
+    "matrix_encoder": {
+      "waveform": "improved",
+      "tokens": "improved",
+      "processing": "regressed",
+      "waveform_sse_delta": -6.604293031384259,
+      "token_matches_delta": 239,
+      "processing_rtf_delta": 1.5846225024953968
+    }
+  },
+  "regressions": {
+    "serial_baseline": {
+      "waveform": [],
+      "tokens": [],
+      "processing": []
+    },
+    "sorted_encoder": {
+      "waveform": [
+        "bus",
+        "psquare_low_snr"
+      ],
+      "tokens": [],
+      "processing": [
+        "bus",
+        "cafe",
+        "office",
+        "psquare",
+        "bus_low_snr",
+        "cafe_low_snr",
+        "office_low_snr",
+        "psquare_low_snr"
+      ]
+    },
+    "matrix_encoder": {
+      "waveform": [
+        "office",
+        "psquare"
+      ],
+      "tokens": [],
+      "processing": [
+        "bus",
+        "cafe",
+        "office",
+        "psquare",
+        "bus_low_snr",
+        "cafe_low_snr",
+        "office_low_snr",
+        "psquare_low_snr"
+      ]
+    }
+  },
+  "cpu": {
+    "cases": [
+      {
+        "case": "bus",
+        "duration_s": 23.68225,
+        "processing_s": 55.175157690999185,
+        "threads": 1,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "case": "cafe",
+        "duration_s": 20.509125,
+        "processing_s": 47.514891925000484,
+        "threads": 1,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "case": "office",
+        "duration_s": 21.9805,
+        "processing_s": 51.485763919999954,
+        "threads": 1,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "case": "psquare",
+        "duration_s": 21.473375,
+        "processing_s": 48.947402970999974,
+        "threads": 1,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "case": "bus_low_snr",
+        "duration_s": 20.8791875,
+        "processing_s": 48.87914914199973,
+        "threads": 1,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "case": "cafe_low_snr",
+        "duration_s": 21.465625,
+        "processing_s": 49.84167173199967,
+        "threads": 1,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "case": "office_low_snr",
+        "duration_s": 21.494375,
+        "processing_s": 49.771177397999054,
+        "threads": 1,
+        "affinity": [
+          7
+        ]
+      },
+      {
+        "case": "psquare_low_snr",
+        "duration_s": 21.525375,
+        "processing_s": 50.406133610000325,
+        "threads": 1,
+        "affinity": [
+          7
+        ]
+      }
+    ],
+    "duration_s": 173.0098125,
+    "processing_s": 402.0213483889984,
+    "processing_rtf": 2.323691024108811
+  },
+  "definitions": {
+    "waveform": "sqrt(sum waveform SSE / sum CPU reference energy); original sample indices, no gain/delay/polarity fitting",
+    "tokens": "sum identical token IDs / sum token counts",
+    "rtf": "sum measured seconds / sum source duration; RTF 1 is real time",
+    "processing": "Audio preprocessing, input upload, execution, output read and output serialization; excludes model load/upload",
+    "startup_inclusive": "Runner total_elapsed_s, including artifact load/validation and model upload; excludes compilation, Python startup and final metrics serialization",
+    "scope": "Whole-utterance codec reconstruction agreement, not denoising quality; no profile is selected automatically",
+    "build": "hardware_version is the runner-recorded 32-bit FPGA build ID, not a full bitstream SHA256"
+  },
+  "report_source": [
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_accuracy_report.py",
+      "sha256": "ece0d50f0a9012cd57578979117252eec87f70182b453394a28c2b1160161c46",
+      "bytes": 21224
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_compare.py",
+      "sha256": "42219382a6031722f89f4530ac2f1b4e028be391e5f1da5ab62ffcf6fed6c9e2",
+      "bytes": 6108
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_common.py",
+      "sha256": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+      "bytes": 7451
+    }
+  ],
+  "artifact_inventory": [
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix_manifest.json",
+      "sha256": "41a24d2037b97e90c54ba23111f01123c36fe3a592086b34f4866457b769007d",
+      "bytes": 28968
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_accuracy_report.py",
+      "sha256": "ece0d50f0a9012cd57578979117252eec87f70182b453394a28c2b1160161c46",
+      "bytes": 21224
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_compare.py",
+      "sha256": "42219382a6031722f89f4530ac2f1b4e028be391e5f1da5ab62ffcf6fed6c9e2",
+      "bytes": 6108
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_common.py",
+      "sha256": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+      "bytes": 7451
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted_batch_sources.json",
+      "sha256": "3b5858a1b3dbea2b305fade22f3f251b58eaeb4c3ade3dfdb8008750fb12ac6e",
+      "bytes": 1640
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted_batch_results.json",
+      "sha256": "7ab5d88e1f567da1420f134f8e57329b04ab81cfc8254a3755c844965c0fcaca",
+      "bytes": 3573
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.comparison.json",
+      "sha256": "97981740d20fc2daa7b8b3ef450d13615f07f5353aa5521fc6b2c628cda09ede",
+      "bytes": 1741
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus.comparison.json",
+      "sha256": "ca3ac2492029bd2b7c4923819ef6bf4aa6edbc45e04ac0d1d75cc0932b6d8fe3",
+      "bytes": 1731
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.comparison.json",
+      "sha256": "767a0cf6fc2f5e06997507b0127b83210d623bf78aa060ee439188a7911909a0",
+      "bytes": 1720
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe.comparison.json",
+      "sha256": "aaa850774728c0d8e1ed4893cc7599513e6996935ab72fb613408b49759bf93a",
+      "bytes": 1735
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.comparison.json",
+      "sha256": "acc47598a5c8bf902ab40c2caac82560af540b4b7ae8f3c67014a8ed538589f0",
+      "bytes": 1729
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office.comparison.json",
+      "sha256": "c862196830787d44964145b0f9284a06f26c674a1c3cfd0aee44eed85045975c",
+      "bytes": 1741
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.comparison.json",
+      "sha256": "4d1b829f8c6376274c54fce68ffdfc7be2dbbb46c96872ea13748e900d1298d6",
+      "bytes": 1735
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare.comparison.json",
+      "sha256": "df041777714740b77b3d664163dd24946647f3f58e1b45918f1f8ab49b0173cc",
+      "bytes": 1748
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.comparison.json",
+      "sha256": "2fc6d38ec59f98d2f8323a06a72c32197044d28bc3dc1c130c06501a5fa6ad4b",
+      "bytes": 1751
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus_low_snr.comparison.json",
+      "sha256": "2cbcc559f920f3eae01776e7a75fb0deb38b4a52362a3968ad7de445ab179381",
+      "bytes": 1766
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.comparison.json",
+      "sha256": "1cc52139067ad1e3761f8ec1f6750d560bab18b80fcc459bb53bf7d33214a1b1",
+      "bytes": 1750
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe_low_snr.comparison.json",
+      "sha256": "484ec50742dd8c82dfdd652dea1c113031b565bd2bd5f1fd12a3f0aa869c09e7",
+      "bytes": 1766
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.comparison.json",
+      "sha256": "9e469fea35748a8b6bc4bd3f2bd0e509583c155d4e131230fe426e53596de656",
+      "bytes": 1763
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office_low_snr.comparison.json",
+      "sha256": "94da3505efdf2df43669cc78e270bb8f2f047b06fbd2486b0a788845c56b3fde",
+      "bytes": 1776
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.comparison.json",
+      "sha256": "9b1eb4192c4be99b13bbc9c2466dbd66d088826cf0a856b86aa9feea44edcf2e",
+      "bytes": 1765
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare_low_snr.comparison.json",
+      "sha256": "260d46f165b669cbe293e1fad6b050a11dbffe81de11dbb9767ce95fb7799ce8",
+      "bytes": 1775
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/short/sorted.wav",
+      "sha256": "189bd0b4078c5b694a72d4eabb18dbbb59197dd4c29ebe935629029676bbb884",
+      "bytes": 759612
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/short/sorted.tokens.npz",
+      "sha256": "ddfb81d930526480dc73bf776934e939ec07eb80f5b007b2f89a59ac6da432e8",
+      "bytes": 1387
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/short/sorted.metrics.json",
+      "sha256": "126a0649688d5cf874baea40b729767a4d26067aaea091225329922ab3d04d12",
+      "bytes": 3461
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/short/sorted.comparison.json",
+      "sha256": "256836e273ad358b81217ba3b0bb8dd6a5c1aff70b7a03e19e23906db2b5f9ae",
+      "bytes": 1790
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/short_clip/audio/official_cpu.wav",
+      "sha256": "08b449c8be5bad1fabb6cde8cd91736162532144fc30c2b31d279cbfef229c99",
+      "bytes": 759612
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/short_clip/audio/split_decoder_fpga.wav",
+      "sha256": "674638d90e55d7d67f921c807d6c7fbf9799e8028a63f970aad5b2c9e755ca8d",
+      "bytes": 759612
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/short_clip/tokens/official_cpu.tokens.npz",
+      "sha256": "dbd0b73fab28be43a6edd208948a61629bba3a6812107ef7654fe412a87b295f",
+      "bytes": 1387
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/short_clip/tokens/split_decoder.tokens.npz",
+      "sha256": "7d2a292de36b75c56863194c3a6b0b54bcdc1946b7a1210940feab5bb0522fe0",
+      "bytes": 1387
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/short_clip/records/split_decoder_fpga.metrics.json",
+      "sha256": "9310756b6afa51550106c53d19e6be7a3e9953a50c5ce6430bc4ab5bb66cc8f8",
+      "bytes": 3343
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix_compile_catalog.json",
+      "sha256": "ed0b7d2f5baea1141e2d3cf35c44a3c0cebf3124353b546d7a1b8891ac2a7f36",
+      "bytes": 23696
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus.comparison.json",
+      "sha256": "bbbe9f908666523c42bdfbd690eecac3ae3d52d0c4d41bf660162535b6a1c64a",
+      "bytes": 1737
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe.comparison.json",
+      "sha256": "341b4230b8bdf333bd2935d784bfa0e86db4602a85472f97232c76e87c2a48ff",
+      "bytes": 1741
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office.comparison.json",
+      "sha256": "f1bfe70beec08cfebf7912cfc1cc12081373f0d0ffa1206cdc0248fff2d5d351",
+      "bytes": 1749
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare.comparison.json",
+      "sha256": "e134524a2f189769a82724e875d9957d2d4710f44be5bf8952d2e58ffe01868f",
+      "bytes": 1754
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus_low_snr.comparison.json",
+      "sha256": "3d4dbcb97c09502c40c3f1fd24a4a2ffe23f98b5f9cf6dbc46e781715e012867",
+      "bytes": 1771
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe_low_snr.comparison.json",
+      "sha256": "ce59829fe7d79d40ccda9058daa2f996b2c01331abbcfc3288cd14c2faac22a3",
+      "bytes": 1772
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office_low_snr.comparison.json",
+      "sha256": "1e852a24a90031e6f962756cea3d48b9e9d111ef051d98be2620d5ebf81de777",
+      "bytes": 1781
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare_low_snr.comparison.json",
+      "sha256": "83bb66f0aead244d2c60dccb93b6f1d734666a9a0e9bc62fa41bab0fd5202493",
+      "bytes": 1786
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/bus_noisy.wav",
+      "sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+      "bytes": 1515744
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+      "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+      "bytes": 1515744
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz",
+      "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+      "bytes": 4178
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus.metrics.json",
+      "sha256": "d80002b4d5d2ffbb36499801db0f2db7684d61e7ac9d1e418fe3d2ca662bab2e",
+      "bytes": 1973
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.wav",
+      "sha256": "2cdb24367220760833115a108983cc9315eb12fdf16ecd03e9026e877dd904cb",
+      "bytes": 1515744
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.tokens.npz",
+      "sha256": "3a419e9624d515598da2f88fd834d7f88db17e2e6efb151f9db8ed4aa0fe99b5",
+      "bytes": 4183
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.metrics.json",
+      "sha256": "8e2b5f869ac3600a9348967e4c7f0d51ddff272b363be8e733e2ebf903b104af",
+      "bytes": 3396
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus.wav",
+      "sha256": "c375a68e83ae5ae6ac872db5450e788aff0897a4c01121151d340390074cc5be",
+      "bytes": 1515744
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus.tokens.npz",
+      "sha256": "8910fbbc69cda389affc47ea7c073be32bf83fc86c21c560f82b7fb84fff8d18",
+      "bytes": 4178
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus.metrics.json",
+      "sha256": "9a1489ebdb1b7a933d3535b8f214d871b30d9789dbad2aca7c49e2baa56e2316",
+      "bytes": 3502
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus.wav",
+      "sha256": "5ce75d10c35d3adbec14256e3f1bc28f864c6561dcdc87c6db8a8a30c1155135",
+      "bytes": 1515744
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus.tokens.npz",
+      "sha256": "10a050836cfcbcea859f126c5fe9a89ef917f4306751eb81122e5bd5e828da9a",
+      "bytes": 4170
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus.metrics.json",
+      "sha256": "be57874af733e345fa6112be182f1f4e48a885f758217a224b7b6781b424568e",
+      "bytes": 3660
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_noisy.wav",
+      "sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868",
+      "bytes": 1312664
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav",
+      "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e",
+      "bytes": 1312664
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe.tokens.npz",
+      "sha256": "c48df28ed8b8998368cca7e603405a6389f68d60cf0ecc7bf9a09af7c20394c4",
+      "bytes": 3699
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe.metrics.json",
+      "sha256": "77c5ef1281692f38ab0331ca53ddd158a75bf1c85921dbdb76614fd051115356",
+      "bytes": 1979
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.wav",
+      "sha256": "f3cbcc9aeaccc3f8c4fe61825a6b373b58bf2b658f240a1163c5c71f33d18011",
+      "bytes": 1312664
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.tokens.npz",
+      "sha256": "5062896d4073cf2fc2b6050363766733c6755037777d30b74c1599772bdf36dd",
+      "bytes": 3704
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.metrics.json",
+      "sha256": "35863400b809c03e67f1dfc6f4eef860a740266d865382fb3dcee2a358793145",
+      "bytes": 3379
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe.wav",
+      "sha256": "6d3333e622018a7133ef44b62864577af1f2c051a3eb91accbb1a6e59a870311",
+      "bytes": 1312664
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe.tokens.npz",
+      "sha256": "719e0a12efa1af5d5321b3f6dc5172f04982b012664d1dcd57fbf6a67708c1a4",
+      "bytes": 3706
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe.metrics.json",
+      "sha256": "b3e8ff5c7114cfda950eb01f7985577fc04a12a61ca01ac2a16a5033d8f8689c",
+      "bytes": 3635
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe.wav",
+      "sha256": "daa40fcfed672aff954d210984951b0643b2af64819b8344035608a84da74f03",
+      "bytes": 1312664
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe.tokens.npz",
+      "sha256": "ad40af1ffdfa22aafcd3bbce598e5d22e14bb92d2d82a6fda68972377aebcd38",
+      "bytes": 3701
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe.metrics.json",
+      "sha256": "77845b6ab07feebcf79f8d0e8cd994a6b1ba8c88689dbefce80e44f98e822dd8",
+      "bytes": 3663
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/office_noisy.wav",
+      "sha256": "b5dc82530929875863ebb564cc892c64c4e1cf5c5cead6b17a34c368593d6f73",
+      "bytes": 1406832
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/office.wav",
+      "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad",
+      "bytes": 1406832
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/office.tokens.npz",
+      "sha256": "a1060ccbbb1a6007e718fbfaa9cbda024a8a1da12554d3051ec7599bdacaa430",
+      "bytes": 3871
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/office.metrics.json",
+      "sha256": "a64507d55cdc583f22aa18e8bbfdd9faad574dec95d24883087381bb6bec0e17",
+      "bytes": 1982
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.wav",
+      "sha256": "966600affcbf213051cb96deaac30004c9c51c524ef2c2d2e9d758678c430884",
+      "bytes": 1406832
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.tokens.npz",
+      "sha256": "6e87aa6694c194c3ec9dc19f811442dadff1adb0edb5aa6ed9c209dd4c27160d",
+      "bytes": 3870
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.metrics.json",
+      "sha256": "606e03dfee4a83dbeeeddc7f9c27bd5a4cb53a8ab2b67cbe5d6d29e73ffba8d8",
+      "bytes": 3389
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office.wav",
+      "sha256": "97ed4e58b08cac6f00b5cdb63979349efc04eb2e7d3b5f667892f4e16fc70f39",
+      "bytes": 1406832
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office.tokens.npz",
+      "sha256": "d7241ad3985ce734db95ad50d904de78b512eb8b3c53687658cf48607e4729ca",
+      "bytes": 3875
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office.metrics.json",
+      "sha256": "af1fb4c3c1b879b6f0e29054c5015b29bcba7d8ba24b9da119d4a1e6c2b63e27",
+      "bytes": 3638
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office.wav",
+      "sha256": "539bfdf079d00d1ba537e4198e1c2dbd2b07d0874132e305edf76acadbdf9417",
+      "bytes": 1406832
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office.tokens.npz",
+      "sha256": "b6c37ac8a7c3290a73468aab5138897a3ca41771b0fefcf9cb05653c4472ed32",
+      "bytes": 3871
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office.metrics.json",
+      "sha256": "f0fb30fd0e06b9fdcfe62eaa9354f1cb779d0d8433185e6cec410fbe0d2f619a",
+      "bytes": 3667
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_noisy.wav",
+      "sha256": "a20d68e238fb9acae1044ced9e05581535764ef2942d2efad5d3a7c1bf1cb26e",
+      "bytes": 1374376
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/psquare.wav",
+      "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059",
+      "bytes": 1374376
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/psquare.tokens.npz",
+      "sha256": "c4f0e9c95822161d75be03e1debace66bf229c78ea433b031dd983a2e9cd0a34",
+      "bytes": 3855
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/psquare.metrics.json",
+      "sha256": "fae50433a72850806be3a64606664ad5fb5ec6cc28c46ea61c262ee31af5a45d",
+      "bytes": 1989
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.wav",
+      "sha256": "4009d7328effcb55386baba76ce981204fba52bf4987d3fe8c330e15e2076b8b",
+      "bytes": 1374376
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.tokens.npz",
+      "sha256": "7cb20922586f2e819d068e3bc6b031b3ffe38a3b1d1516db9b8401e236e41008",
+      "bytes": 3863
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.metrics.json",
+      "sha256": "585877f3cb9458d3d4629d063528bb05310c9b82ef137f20717724ea7d6eb3f5",
+      "bytes": 3394
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare.wav",
+      "sha256": "db4ed19c6e82cb9e2626be3b69bc241ed5bec4339f0bbe6cd810b0266adae9c2",
+      "bytes": 1374376
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare.tokens.npz",
+      "sha256": "87fb02c94a6f29fc8c4fbef3b09479d6bd2bf2e26e1af9fe90ed5fce3135e4d2",
+      "bytes": 3861
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare.metrics.json",
+      "sha256": "61dd2e84f32def4cf2048b13a59cceb6a643450475c1024222226286fda6ea08",
+      "bytes": 3641
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare.wav",
+      "sha256": "98aa7416a4ba0f35b07c360aef5a0fc36c5d4ecc360f32e2871f12beb7294eb9",
+      "bytes": 1374376
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare.tokens.npz",
+      "sha256": "34d140bc4a1ec3252418e04f6a6ad73ce4a366cf26e3557a5dc8a20e6ae09fa1",
+      "bytes": 3856
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare.metrics.json",
+      "sha256": "db04f1d54d8358c6cfbcf7979d9014d0b2d1fbcfcae4d69504e1f93d82fc01f0",
+      "bytes": 3669
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/bus_low_snr_noisy.wav",
+      "sha256": "6ffae073e5549f58e19127bfcc701616baca9bc68d299103c01aeec7a8e0d288",
+      "bytes": 1336348
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.wav",
+      "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6",
+      "bytes": 1336348
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.tokens.npz",
+      "sha256": "c7fde3db4b89fca566160bf035ae191ebb53f0e36ca14ff6a9be25fe1b84cb08",
+      "bytes": 3732
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.metrics.json",
+      "sha256": "021ecf0eefef7927d39361f93e99ec7346845da24c7d0612400bdc2e76f661c3",
+      "bytes": 1999
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.wav",
+      "sha256": "8cdfe2a7ccb04e954efb3809a19fb8ce5a2de526dc0688e2a7037c27ddb73c2a",
+      "bytes": 1336348
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.tokens.npz",
+      "sha256": "a59d6049df6fb0892e535429ab8694525778e14c44ad8f52147c9900f905cf45",
+      "bytes": 3742
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.metrics.json",
+      "sha256": "1296954c3ffb67964aa77427187c769a9fa1a563003319a28fba1535abc0563a",
+      "bytes": 3401
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus_low_snr.wav",
+      "sha256": "4212880ad9f106aee05a5c564070e6c93cecbf6be5f975d0ec4eb128ce2415b6",
+      "bytes": 1336348
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus_low_snr.tokens.npz",
+      "sha256": "5fd004b2e99eb416b07fad8754a31d7da4e7d53433eacbf351c1a4642489f92e",
+      "bytes": 3728
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus_low_snr.metrics.json",
+      "sha256": "5a3c50822fad5d8423a29562febe3c2aa8c21e32f3349f371babfe4511d7088b",
+      "bytes": 3652
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus_low_snr.wav",
+      "sha256": "47332f1a5543d43726c33b9e6614f4aea37fc00104f40e5bf01200f229c9b54b",
+      "bytes": 1336348
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus_low_snr.tokens.npz",
+      "sha256": "71e0447d625ebdb6379a2b20c797acf85e67507b74db4a5efecca3c5b849671a",
+      "bytes": 3729
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus_low_snr.metrics.json",
+      "sha256": "ab5fd8d27e80ca3a6edc2355834b7221d3661b3657298e29ee7ff8f1201fafa8",
+      "bytes": 3682
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_low_snr_noisy.wav",
+      "sha256": "e61711a17c0ee70e99377efde0f7ff1010cbc4673d76b4914e468529cc8ba915",
+      "bytes": 1373880
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.wav",
+      "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c",
+      "bytes": 1373880
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.tokens.npz",
+      "sha256": "a6c30c5a077a9f0c06f2e3bb45b5d06a28d2be2d0efdbc144ab8196cf6f8ac21",
+      "bytes": 3825
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.metrics.json",
+      "sha256": "b15593ad68ae6c05624baf4a2f1730e0f020fa133ff65b961afc34de7268f97c",
+      "bytes": 2000
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.wav",
+      "sha256": "1f9b7599d217db008f9d89d52f565535a9559eb18a13524d6ee2d68ffb11d39e",
+      "bytes": 1373880
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.tokens.npz",
+      "sha256": "2663f7cead2378cdd5222ffe8ef158d53861af4298560847f7ecd5649174c4f4",
+      "bytes": 3826
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.metrics.json",
+      "sha256": "e9dbb9637d7c25d987e05ba542d97816928170538d64bdf1f7c52bf928b2a17f",
+      "bytes": 3401
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe_low_snr.wav",
+      "sha256": "14fd26e30b85cb2fc9ea6bb80d72c3de06710e7b8a66b1d80999cda9fd86c948",
+      "bytes": 1373880
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe_low_snr.tokens.npz",
+      "sha256": "219b6f3db6b442ca9fd4cf726dfc4f847d635477ee74ebb0a975a35134ba43bf",
+      "bytes": 3831
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe_low_snr.metrics.json",
+      "sha256": "8cffa4a20eeef453b8e1c61b8e21cc0d5c53b731dfbc4d97812578de6766e109",
+      "bytes": 3520
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe_low_snr.wav",
+      "sha256": "5c57e804d721c5a39fbbc1276c16738d5c6405fd3f2f320b838b4d794b4726e7",
+      "bytes": 1373880
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe_low_snr.tokens.npz",
+      "sha256": "a4ec483ee6f233be90961a55d201d2f23b880790e9fbf535cdc944d6ce7173cc",
+      "bytes": 3828
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe_low_snr.metrics.json",
+      "sha256": "eac9977cd7b1e62eaba1b0b73ed42e414594dcbd09666d47c4c351c31cd655eb",
+      "bytes": 3678
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/office_low_snr_noisy.wav",
+      "sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620",
+      "bytes": 1375720
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.wav",
+      "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708",
+      "bytes": 1375720
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.tokens.npz",
+      "sha256": "8c9f828f1cb6d43d0c997af3554fc89f3603577ffa5067dce2ced15ca1e949cc",
+      "bytes": 3847
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.metrics.json",
+      "sha256": "0b81731dbe85f6d5e18f81de09e3d780ff2a11e4cb352a968779078f08b73561",
+      "bytes": 2009
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.wav",
+      "sha256": "8abd0e806ef8b5fc7b2561480646a027a0337ab5365d2202804abd823a3d9be7",
+      "bytes": 1375720
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.tokens.npz",
+      "sha256": "0319a6fb1660016dfede451e615e58819ce98051eda85d58d92e18485f33a9ce",
+      "bytes": 3847
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.metrics.json",
+      "sha256": "5bb2299731b3922c138d5f7764e002a9308bdbdd050befcfe1e4d43a5d1bf7b0",
+      "bytes": 3407
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office_low_snr.wav",
+      "sha256": "98fde86024a4895d020dab564f6d552783ef1007233091448f2b90726e8be048",
+      "bytes": 1375720
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office_low_snr.tokens.npz",
+      "sha256": "15c67f85da5a81777e10ce51cb4f0ca7db1d4634777b848f5aadeea41cbcf98c",
+      "bytes": 3840
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/office_low_snr.metrics.json",
+      "sha256": "f6b73c13c760d1ef66c1b0a21804720ca6b3662b9fae4116d9b61a9dfb6878b7",
+      "bytes": 3655
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office_low_snr.wav",
+      "sha256": "513bd4a3420243f90a1b09db4ea60b4977393c862e1ae5903600638e5aa54690",
+      "bytes": 1375720
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office_low_snr.tokens.npz",
+      "sha256": "46c4d2722ca33cb275ca7657bfca949b2df9844c6058e4869dfbd48c9221f0d8",
+      "bytes": 3847
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/office_low_snr.metrics.json",
+      "sha256": "b145c09cb5659088a75650a565c4eb888b9f6389f7184c793d13fce3e71e5cd2",
+      "bytes": 3684
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_low_snr_noisy.wav",
+      "sha256": "e44f139883a4570596b455d50eba708ab5e013b86eb6979880da3c6f769f78a8",
+      "bytes": 1377704
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.wav",
+      "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b",
+      "bytes": 1377704
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.tokens.npz",
+      "sha256": "a72b391be15694edd578b02df15f42df6dbceb65adf34bc2adfab9dbfec0c466",
+      "bytes": 3866
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.metrics.json",
+      "sha256": "dce237107bb012774449af0beb10ec51f46c8c3f452895c21d1f16e96c07be04",
+      "bytes": 2010
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.wav",
+      "sha256": "02595b5fd28067eb36e3cc61becef89b209ee9aa9c9ccae3f0772322fa037dd9",
+      "bytes": 1377704
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.tokens.npz",
+      "sha256": "c8c8e552cab65740bc71e440be1eaa12b1c6418dd5e0a26c18c3865bf3505327",
+      "bytes": 3886
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.metrics.json",
+      "sha256": "3c852754f2c9a2576256d2296bc5719d2a4d0561e65af40d312445b088c3cf63",
+      "bytes": 3404
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare_low_snr.wav",
+      "sha256": "790fa3ebfbe98e2f6c93cf217d32412f3578ac15ecc6433a46e7065452f77f69",
+      "bytes": 1377704
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare_low_snr.tokens.npz",
+      "sha256": "4d492a333d49408c23c8db571f57c10f6eb1aae2bafbac4545fc35688c7738bd",
+      "bytes": 3870
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare_low_snr.metrics.json",
+      "sha256": "794b1ae6548b147d3721c3b727e084eff6e48ed8b85171786764e3bc1dc9501f",
+      "bytes": 3658
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare_low_snr.wav",
+      "sha256": "fbff15bec6420c372fcd8683d855ab8ba00c75e971a19c1aecfe331f3d0b7974",
+      "bytes": 1377704
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare_low_snr.tokens.npz",
+      "sha256": "cea4993c29d236e61d4045b82588c87b427bc24ac5a8a86039ad986b44e2ebb9",
+      "bytes": 3871
+    },
+    {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare_low_snr.metrics.json",
+      "sha256": "75c481b66845df0716b8d67a6b23cb7a9756b359af8ae087404ea085260357f6",
+      "bytes": 3683
+    }
+  ],
+  "matrix_against_sorted": {
+    "pooled_change": {
+      "waveform": "regressed",
+      "tokens": "improved",
+      "processing": "regressed",
+      "waveform_sse_delta": 82.70193994311819,
+      "token_matches_delta": 8,
+      "processing_rtf_delta": 1.5838145830600867
+    },
+    "cases": {
+      "bus": {
+        "waveform": "improved",
+        "tokens": "regressed",
+        "processing": "regressed",
+        "waveform_sse_delta": -40.33219294174731,
+        "token_matches_delta": -11,
+        "processing_rtf_delta": 1.5836268736711059
+      },
+      "cafe": {
+        "waveform": "improved",
+        "tokens": "unchanged",
+        "processing": "regressed",
+        "waveform_sse_delta": -15.439148860496147,
+        "token_matches_delta": 0,
+        "processing_rtf_delta": 1.5844036504237904
+      },
+      "office": {
+        "waveform": "regressed",
+        "tokens": "regressed",
+        "processing": "regressed",
+        "waveform_sse_delta": 9.742624208958304,
+        "token_matches_delta": -2,
+        "processing_rtf_delta": 1.5828205569024139
+      },
+      "psquare": {
+        "waveform": "regressed",
+        "tokens": "improved",
+        "processing": "regressed",
+        "waveform_sse_delta": 164.32682246163822,
+        "token_matches_delta": 10,
+        "processing_rtf_delta": 1.5833178328047284
+      },
+      "bus_low_snr": {
+        "waveform": "improved",
+        "tokens": "improved",
+        "processing": "regressed",
+        "waveform_sse_delta": -15.048309024738096,
+        "token_matches_delta": 12,
+        "processing_rtf_delta": 1.5836396990063815
+      },
+      "cafe_low_snr": {
+        "waveform": "regressed",
+        "tokens": "regressed",
+        "processing": "regressed",
+        "waveform_sse_delta": 24.00021141948602,
+        "token_matches_delta": -4,
+        "processing_rtf_delta": 1.584365995445844
+      },
+      "office_low_snr": {
+        "waveform": "improved",
+        "tokens": "regressed",
+        "processing": "regressed",
+        "waveform_sse_delta": -0.12280072068746506,
+        "token_matches_delta": -1,
+        "processing_rtf_delta": 1.5837496834872793
+      },
+      "psquare_low_snr": {
+        "waveform": "improved",
+        "tokens": "improved",
+        "processing": "regressed",
+        "waveform_sse_delta": -44.425266599295426,
+        "token_matches_delta": 4,
+        "processing_rtf_delta": 1.5846549968584682
+      }
+    },
+    "regressions": {
+      "waveform": [
+        "office",
+        "psquare",
+        "cafe_low_snr"
+      ],
+      "tokens": [
+        "bus",
+        "office",
+        "cafe_low_snr",
+        "office_low_snr"
+      ],
+      "processing": [
+        "bus",
+        "cafe",
+        "office",
+        "psquare",
+        "bus_low_snr",
+        "cafe_low_snr",
+        "office_low_snr",
+        "psquare_low_snr"
+      ]
+    }
+  },
+  "matrix_sections": {
+    "bus": {
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/bus_matrix_production.bin",
+        "bytes": 971608623,
+        "sha256": "61fc828ba2f8019f1227ec5c8af278fdab1498e194af5d7500419dbd1a767d32"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 971567040,
+        "sha256": "6d0709901a259e2c476b54c83ecb6f4e9a839a58e3cbb2e22b025de555dd98fd"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 637939776,
+        "sha256": "87edaa8ef6f80d6cbb16d3c9384443a4348ec67b531a32b59522eae3a3cb2464",
+        "instructions": 19935618,
+        "halt_index": 19935617,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 63072
+      }
+    },
+    "cafe": {
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/cafe_matrix_production.bin",
+        "bytes": 887059887,
+        "sha256": "e9e3155b75154844d845dfacccea70c35a275481070febc7ff05a6bce887dcb2"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 887018304,
+        "sha256": "61ceca88e8864bc9a7cb66c0cfb71a8fc41faaa7d08a4c01c390855ee9f0d16a"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 553391040,
+        "sha256": "36de5d1f797ae0012c739fbcd0f4229f3a860649bcc532cc51f397593f0aad8e",
+        "instructions": 17293470,
+        "halt_index": 17293469,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 53446
+      }
+    },
+    "office": {
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/office_matrix_production.bin",
+        "bytes": 926323631,
+        "sha256": "c6145af17973f73cf79d87a22ebe43b8bb383553ab7e8b8eeb21ad8acd181b25"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 926282048,
+        "sha256": "6e086a7af7e817de714fdbf6e0314cf0ad21abe65952187cb832395606599ec0"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 592654784,
+        "sha256": "cbeb1056581349435fead4876ac4580c0a4724ef12a80c8155b574227d122234",
+        "instructions": 18520462,
+        "halt_index": 18520461,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 58876
+      }
+    },
+    "psquare": {
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/psquare_matrix_production.bin",
+        "bytes": 912801775,
+        "sha256": "41f334e2fcfa9360c03cee24547f6ccb88d2a995fbf2b8731600d207a2fd74c2"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 912760192,
+        "sha256": "ac62693d3b4e6354aa9a6c8612e7e00901273073fdca2cf159ecae6d1e4aee98"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 579132928,
+        "sha256": "933594335478b7fc3e1f6d7e9cd585055b4c62b6f9bbfdf01bd0eecabe99030d",
+        "instructions": 18097904,
+        "halt_index": 18097903,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 57880
+      }
+    },
+    "bus_low_snr": {
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/bus_low_snr_matrix_production.bin",
+        "bytes": 896484143,
+        "sha256": "c71a097952ed39bb09c08e2165b46e123740d76512bea7a143fc13aa38634b22"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 896442560,
+        "sha256": "c69b6c62f74fad42306215869a981c633598de0c9ab4a2081765df4ad9accd56"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 562815296,
+        "sha256": "5490f47c5cba2f9366e130dec1f7e9c1b81c3363c706926d05d21dbdcfca3ea4",
+        "instructions": 17587978,
+        "halt_index": 17587977,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 55930
+      }
+    },
+    "cafe_low_snr": {
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/cafe_low_snr_matrix_production.bin",
+        "bytes": 912801775,
+        "sha256": "dbda51ddfdb97d777455621fd14fc1cc2a8fe1193bbcf0bd8c4652fe68ded010"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 912760192,
+        "sha256": "ac62693d3b4e6354aa9a6c8612e7e00901273073fdca2cf159ecae6d1e4aee98"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 579132928,
+        "sha256": "933594335478b7fc3e1f6d7e9cd585055b4c62b6f9bbfdf01bd0eecabe99030d",
+        "instructions": 18097904,
+        "halt_index": 18097903,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 57880
+      }
+    },
+    "office_low_snr": {
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/office_low_snr_matrix_production.bin",
+        "bytes": 912870383,
+        "sha256": "34bb9d68c2cb50d8e396168c7013c0f4c75ecbd0416b83e35d5c95271be9bb98"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 912828800,
+        "sha256": "742477be121ffcd7bcd3d279add1a313ced0a61a6f92f3ce80fe7e343d180895"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 579201536,
+        "sha256": "30f67e1a6e6f1cbe9d1b57684d214f1861d6bd1e173c2f924b9b109fe2729847",
+        "instructions": 18100048,
+        "halt_index": 18100047,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 57918
+      }
+    },
+    "psquare_low_snr": {
+      "bin": {
+        "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/psquare_low_snr_matrix_production.bin",
+        "bytes": 914343599,
+        "sha256": "4ca16802350f17a48b016f864773dd89d3daf1409fd5612a71b504b05474a275"
+      },
+      "model_image": {
+        "address": 2214592512,
+        "bytes": 914302016,
+        "sha256": "32d7c8f91d4307cdd889e7d7d82a3ae502ee85880d13a69298726cb3c79e51a1"
+      },
+      "parameters": {
+        "offset_bytes": 0,
+        "address": 2214592512,
+        "bytes": 333627264,
+        "sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "padded_prefix_bytes": 333627264,
+        "padded_prefix_sha256": "e7adbc9ad660945b61d7b6910086831b240d2a5df6cd697484c3c7fc016f4530",
+        "final_alignment_padding_bytes": 0
+      },
+      "program": {
+        "offset_bytes": 333627264,
+        "address": 2548219776,
+        "bytes": 580674752,
+        "sha256": "5505a68e105439788550feeafbd53c061fafc465190d7db85b293f2dbd39346f",
+        "instructions": 18146086,
+        "halt_index": 18146085,
+        "trailing_nop_instructions": 0,
+        "jump_instructions": 58054
+      }
+    }
+  },
+  "matrix_audit": {
+    "full_precision_metadata_matches_payload": true,
+    "bin_model_parameters_program_rehashed": true,
+    "saved_comparisons_recomputed_exactly": true,
+    "bin_rehash_scope": "Packaging-time audit of ignored deployment cache",
+    "standard_report_scope": "Tracked WAV, token, metric, manifest and catalog artifacts; cached binaries are not required",
+    "copied_artifacts_byte_identical": true,
+    "generator_sha256": "08e0dcfd2a108038e8de4a95264c8d16568f6a8266ddaaffcbab9167465cdf6c",
+    "catalog_sha256": "ed0b7d2f5baea1141e2d3cf35c44a3c0cebf3124353b546d7a1b8891ac2a7f36"
+  }
+}
