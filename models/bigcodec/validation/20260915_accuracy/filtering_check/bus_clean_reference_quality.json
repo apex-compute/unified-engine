@@ -1,0 +1,53 @@
+{
+  "case": "bus",
+  "sample_rate": 16000,
+  "samples": 378916,
+  "duration_seconds": 23.68225,
+  "method": "Existing clean-reference evaluator; full waveforms, no fitted gain or delay, no additional trimming/resampling. DPDFNet output has its documented fixed model delay compensated by its runner. Metrics combine speech distortion and noise; they are not isolated noise attenuation.",
+  "files": {
+    "clean": {
+      "path": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/clean/bus.wav",
+      "sha256": "86e2b7d17c7e2eb5ecf658f2a6c52aacca23b2b9f7f6dd7849ee131e2ffafaf0"
+    },
+    "noisy": {
+      "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus_noisy.wav",
+      "sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+      "quality_against_clean": {
+        "si_sdr_db": 4.779484840193322,
+        "stoi": 0.9401342276688198,
+        "pesq_wb": 2.0588455200195312,
+        "reasons": {}
+      }
+    },
+    "bigcodec_cpu": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+      "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+      "quality_against_clean": {
+        "si_sdr_db": -1.0248610508877842,
+        "stoi": 0.8830538697608025,
+        "pesq_wb": 1.6508890390396118,
+        "reasons": {}
+      }
+    },
+    "bigcodec_fpga_bf16": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.wav",
+      "sha256": "2cdb24367220760833115a108983cc9315eb12fdf16ecd03e9026e877dd904cb",
+      "quality_against_clean": {
+        "si_sdr_db": -1.5054014861486609,
+        "stoi": 0.8839263840672685,
+        "pesq_wb": 1.6326627731323242,
+        "reasons": {}
+      }
+    },
+    "dpdfnet16k_fpga_recorded_20260914": {
+      "path": "models/dpdfnet/validation/20260914_noisy20s/fpga16k/bus_fpga_16khz.wav",
+      "sha256": "0094f190b4841ffa683762299dbf7ac8b0c6e0792f5e5e9e5ce637540db7ac3b",
+      "quality_against_clean": {
+        "si_sdr_db": 18.111872417448954,
+        "stoi": 0.9360085269217757,
+        "pesq_wb": 2.7558681964874268,
+        "reasons": {}
+      }
+    }
+  }
+}

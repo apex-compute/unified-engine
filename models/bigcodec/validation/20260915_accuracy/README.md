@@ -1,5 +1,7 @@
 # BigCodec numerical accuracy
 
+BigCodec reconstructs audio; it is not trained for background-noise suppression. These errors measure FPGA agreement with the CPU codec. See the [background-noise implementation check and DPDFNet comparison](filtering_check/README.md).
+
 The corrected profile uses compensated decoder LSTM cell/tanh arithmetic, fused gate projections, centered codebook scores and BF16 codebook weight residuals. The encoder LSTM retains the original arithmetic. Model structure and checkpoint are unchanged; all neural operations run on the existing FPGA bitstream.
 
 [Eight-file BF16/IF8 comparison and reconstructed audio](decoder/README.md) · [Numerical diagnosis](debugging.md) · [Software tests](software_tests.log)
