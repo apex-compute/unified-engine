@@ -75,7 +75,9 @@ def _reject_visible_torch_accelerators() -> None:
 _reject_visible_torch_accelerators()
 
 import user_dma_core
-from multi_engine_shard import MultiEngineScheduler, PrivateArena
+from multi_engine_shard import (MULTICORE_WINDOW_BYTES, MultiEngineScheduler,
+                                PrivateArena, multicore_arena_bytes,
+                                require_multicore_dram)
 from user_dma_core import UnifiedEngine, set_dma_device
 
 
@@ -225,17 +227,15 @@ class Qwen25OmniUnifiedEngine(
                 f"got {multi_core}"
             )
         reported_cores = user_dma_core.ANDROMEDA_CORE_COUNT
-        reported_dram = user_dma_core.AVAILABLE_DRAM_SIZE_GB
         if reported_cores is not None and reported_cores < REQUIRED_ENGINES:
             raise ValueError(
                 f"the U55 image must report at least {REQUIRED_ENGINES} engines; "
                 f"HW_INFO reports {reported_cores}"
             )
-        if reported_dram is not None and reported_dram != REQUIRED_DRAM_GIB:
-            raise ValueError(
-                f"the U55 image must report exactly {REQUIRED_DRAM_GIB} GiB DRAM; "
-                f"HW_INFO reports {reported_dram} GiB"
-            )
+        # At LEAST 8 GiB, not exactly: the map needs 8 GiB and a larger device
+        # simply leaves the top unused. The check lives in the library so every
+        # multi-core model states the same requirement the same way.
+        require_multicore_dram(multi_core, "Qwen2.5-Omni-7B")
 
         self.multi_core = multi_core
         self.fpga_build = None if fpga_build is None else int(fpga_build)
@@ -288,10 +288,14 @@ class Qwen25OmniUnifiedEngine(
         # Engine 0 uses the master ISA area.  PrivateArena still keeps window 0
         # reserved for its decode weight shard, hence the external-ISA base is
         # one stride before the first actually used worker slice.
+        assert multicore_arena_bytes(REQUIRED_ENGINES) == self.PARAMS_BASE, (
+            f"{REQUIRED_ENGINES} x {MULTICORE_WINDOW_BYTES // 2**20} MiB private "
+            f"windows end at 0x{multicore_arena_bytes(REQUIRED_ENGINES):X}, not "
+            f"at the params base 0x{self.PARAMS_BASE:X}")
         self.mc_arena = PrivateArena(
             REQUIRED_ENGINES,
             arena_base=0,
-            arena_bytes=self.PARAMS_BASE,
+            arena_bytes=multicore_arena_bytes(REQUIRED_ENGINES),
             tensor_bytes=8 * 2**20,
             external_isa=(
                 self.WORKER_ISA_BASE - self.WORKER_ISA_STRIDE,
@@ -1832,10 +1836,10 @@ def resolve_engine_config(parser: argparse.ArgumentParser, args) -> dict[str, in
             f"Qwen2.5-Omni needs at least 8 available engines; "
             f"HW_INFO reports {cores!r}"
         )
-    if dram != REQUIRED_DRAM_GIB:
-        parser.error(
-            f"Qwen2.5-Omni requires the 8-GiB U55 map; HW_INFO reports {dram!r} GiB"
-        )
+    try:
+        require_multicore_dram(REQUIRED_ENGINES, "Qwen2.5-Omni-7B")
+    except (ValueError, RuntimeError) as exc:
+        parser.error(str(exc))
     print(user_dma_core.hardware_info_summary())
     print(
         f"Using engines 0-{REQUIRED_ENGINES - 1} of {cores} available on "

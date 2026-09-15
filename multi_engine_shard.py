@@ -386,6 +386,62 @@ def private_total() -> int:
     return user_dma_core.DRAM_START_ADDR
 
 
+# ==========================================================================
+# THE MULTI-CORE WINDOW IS A FIXED 512 MB, NOT A DIVIDED ARENA
+# ==========================================================================
+# The DRAM controller reaches full concurrent bandwidth only when each engine
+# drives its own 512 MB-aligned window -- the windows are what the hardware
+# interleaves across, so a stride that shrinks with the engine count throws
+# away the very concurrency multi-core is for. The window size is therefore a
+# CONSTANT and the ARENA grows with the engine count:
+#
+#     arena = [0, num_engines * 512 MB)      engine i -> [i*512MB, (i+1)*512MB)
+#
+# which costs 4 GB at 8 engines and 6 GB at 12, so the model's own map cannot
+# stay at DRAM_START_ADDR: a multi-core model rebases its map above the arena
+# (the top 2 GB of an 8 GB device) and the whole layout needs >= 8 GB.
+#
+# NOTE ON THE CURRENT ALVEO BOARD. Its HW_INFO reports 8 cores / 4 GB, but the
+# 4 GB is stale register content -- the board is physically 8 GB. Until the
+# bitstream reports it correctly, run these models with
+# ``UE_FORCE_DRAM_SIZE_GB=8`` (see ``user_dma_core._dram_size_override_code``),
+# which patches the decoded HW_INFO and satisfies the check below.
+MULTICORE_WINDOW_BYTES = 0x2000_0000      # 512 MB per engine, fixed
+MULTICORE_MIN_DRAM_GIB = 8
+
+
+def multicore_arena_bytes(num_engines: int) -> int:
+    """Private arena spanned by ``num_engines`` fixed 512 MB windows."""
+    if num_engines < 1:
+        raise ValueError(f"num_engines must be >= 1, got {num_engines}")
+    return num_engines * MULTICORE_WINDOW_BYTES
+
+
+def require_multicore_dram(num_engines: int, what: str) -> None:
+    """Fail before any allocation if the device is too small for the map.
+
+    Multi-core needs the >= 8 GB map whatever the engine count: the model's own
+    window sits above a private arena that starts at 0 and the two together do
+    not fit a 4 GB device. Raised as a hard error rather than a silent fallback
+    to a divided arena -- a run that quietly halves its window would look fine
+    and simply lose the bandwidth.
+    """
+    gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
+    if gib is None:
+        raise RuntimeError(
+            f"{what}: HW_INFO has not been read, so DRAM size is unknown; call "
+            f"user_dma_core.configure_clock_from_hardware() first")
+    if gib < MULTICORE_MIN_DRAM_GIB:
+        raise ValueError(
+            f"{what}: multi-core ({num_engines} engines) needs the "
+            f"{MULTICORE_MIN_DRAM_GIB} GB DRAM map -- "
+            f"{num_engines} x {MULTICORE_WINDOW_BYTES // 2**20} MB private "
+            f"windows plus the model's own 2 GB map above them -- but HW_INFO "
+            f"reports {gib} GB. On a board whose HW_INFO under-reports a "
+            f"physically larger DRAM (the current Alveo reports 4 GB for an "
+            f"8 GB device), set UE_FORCE_DRAM_SIZE_GB=8 to override it.")
+
+
 def private_stride(num_engines: int, arena_bytes: Optional[int] = None,
                    isa_bytes: int = PRIVATE_ISA_BYTES,
                    tensor_bytes: int = PRIVATE_TENSOR_BYTES) -> int:

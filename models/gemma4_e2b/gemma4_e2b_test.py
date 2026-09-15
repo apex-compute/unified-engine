@@ -50,18 +50,26 @@ from user_dma_core import UnifiedEngine
 from user_dma_core import ue_35bit_addr_shifter
 from user_dma_core import INSTRUCTION_SIZE_BYTES
 from user_dma_core import UE_MODE
-from multi_engine_shard import MultiEngineScheduler, PrivateArena
+from multi_engine_shard import (MULTICORE_WINDOW_BYTES, MultiEngineScheduler,
+                                PrivateArena, multicore_arena_bytes,
+                                require_multicore_dram)
 
-# On hardware whose HW_INFO reports 12 cores, multi-core Gemma4 E2B owns the
-# full 8 GB map as two non-overlapping arenas, regardless of how many cores the
-# run activates:
-#   [0, 6 GB) -- twelve fixed 512 MB private engine windows
-#   [6, 8 GB) -- the primary's original 2 GB params/tensor/ISA layout, rebased
-#                upward without changing a single internal offset.
-# Other hardware keeps the historical Gemma4 layout (model in the upper 2 GB,
-# private windows carved out of the low 2 GB).
+# ANY multi-core Gemma4 E2B run owns the full 8 GB map as two non-overlapping
+# arenas:
+#   [0, N x 512 MB) -- one FIXED 512 MB private window per engine. Constant, not
+#                      an arena divided by the engine count: the DRAM controller
+#                      interleaves across these windows, so shrinking the stride
+#                      would cost the concurrent bandwidth multi-core buys.
+#   [6, 8 GB)       -- the primary's original 2 GB params/tensor/ISA layout,
+#                      rebased upward without changing a single internal offset.
+#                      It sits at the TOP at every engine count, so no model
+#                      address moves when cores are added.
+# Single-core keeps the historical Gemma4 layout (model in the upper 2 GB, no
+# private windows at all).
 MULTI_CORE_MAX_ENGINES = 12
-MULTI_CORE_ENGINE_WINDOW_BYTES = 0x20000000
+# One source of truth for the window size: the library owns the policy
+# (multi_engine_shard.MULTICORE_WINDOW_BYTES); this is the local name.
+MULTI_CORE_ENGINE_WINDOW_BYTES = MULTICORE_WINDOW_BYTES
 MULTI_CORE_MODEL_BASE = 0x180000000
 MULTI_CORE_DRAM_LIMIT = 0x200000000
 MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
@@ -833,26 +841,21 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._multi_core_schedulers = {}
         self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
-        # A multicore run on a 12-core bitstream uses twelve fixed 512 MB slots
-        # below 6 GB and moves the primary's unchanged 2 GB model map to
-        # [6, 8 GB). Other hardware, and single-core runs, retain the historical
-        # addresses.
-        self._use_hw12_dram_layout = (
-            multi_core > 1
-            and user_dma_core.ANDROMEDA_CORE_COUNT == MULTI_CORE_MAX_ENGINES
-        )
-        if (self._use_hw12_dram_layout
-                and user_dma_core.AVAILABLE_DRAM_SIZE_GB is not None
-                and user_dma_core.AVAILABLE_DRAM_SIZE_GB < 8):
-            raise ValueError(
-                "12-core Gemma4 multicore layout requires the 8 GB DRAM map; "
-                f"HW_INFO reports {user_dma_core.AVAILABLE_DRAM_SIZE_GB} GB")
-        _rebase = MULTI_CORE_MODEL_REBASE if self._use_hw12_dram_layout else 0
+        # Any multicore run uses one fixed 512 MB slot per engine from 0 upward
+        # and moves the primary's unchanged 2 GB model map to [6, 8 GB).
+        # Single-core runs retain the historical addresses.
+        # Keyed on the ENGINE COUNT, not on the core count the bitstream
+        # reports: an 8-core board running --multi-core 8 wants the same fixed
+        # 512 MB windows a 12-core board does.
+        self._use_multicore_dram_layout = multi_core > 1
+        if self._use_multicore_dram_layout:
+            require_multicore_dram(multi_core, "Gemma4 E2B")
+        _rebase = MULTI_CORE_MODEL_REBASE if self._use_multicore_dram_layout else 0
         # Every DRAM address in a compiled program image is a literal baked
         # against the map below, so a cached section is only reusable by a run
         # with the SAME layout. The program bin/meta path -- run and profile,
         # compiler and loader -- must agree on this tag.
-        self.dram_layout = "hw12" if self._use_hw12_dram_layout else "legacy"
+        self.dram_layout = "mcmap" if self._use_multicore_dram_layout else "legacy"
         # Gemma4 DRAM layout. ONE model map, used at EVERY engine count: the
         # original 2 GB window, unchanged from the single-core path apart from
         # the whole-map rebase above. Adding engines does not move a single
@@ -906,24 +909,24 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self.VISION_ISA_BASE             = 0xFF000000 + _rebase
         self.VISION_WORKER_ISA_BASE      = 0xFF400000 + _rebase
         self.LM_ISA_BASE                 = 0xFF620000 + _rebase
-        assert not self._use_hw12_dram_layout or self.DRAM_END == MULTI_CORE_DRAM_LIMIT, (
-            f"12-core model map ends at 0x{self.DRAM_END:X}, not at the 8 GB "
+        assert not self._use_multicore_dram_layout or self.DRAM_END == MULTI_CORE_DRAM_LIMIT, (
+            f"multi-core model map ends at 0x{self.DRAM_END:X}, not at the 8 GB "
             f"device limit 0x{MULTI_CORE_DRAM_LIMIT:X}")
-        # Per-engine private windows, split by the library. Uniform at EVERY
+        # Per-engine private windows, laid out by the library. Uniform at EVERY
         # engine count -- vision and prefill are sequential and share one arena,
-        # so engine i always owns the same window in both. On 12-core HW the
-        # arena is the FIXED [0, 6 GB) twelve-slot map (see above); elsewhere it
-        # is the low 2 GB divided by the run's engine count.
-        if self._use_hw12_dram_layout:
+        # so engine i always owns the same window in both, and the window is a
+        # fixed 512 MB whatever the engine count (the arena grows instead).
+        if self._use_multicore_dram_layout:
+            _arena_bytes = multicore_arena_bytes(multi_core)
+            assert _arena_bytes <= MULTI_CORE_MODEL_BASE, (
+                f"{multi_core} x "
+                f"{MULTI_CORE_ENGINE_WINDOW_BYTES // 2**20} MB private windows reach "
+                f"0x{_arena_bytes:X}, into the model map at "
+                f"0x{MULTI_CORE_MODEL_BASE:X}")
             self.mc_arena = PrivateArena(
-                MULTI_CORE_MAX_ENGINES,
-                arena_base=0,
-                arena_bytes=(MULTI_CORE_MAX_ENGINES
-                             * MULTI_CORE_ENGINE_WINDOW_BYTES),
-                verbose=True)
+                multi_core, arena_base=0, arena_bytes=_arena_bytes, verbose=True)
         else:
-            self.mc_arena = (PrivateArena(multi_core, verbose=True)
-                             if multi_core > 1 else None)
+            self.mc_arena = None
         # Top of the vision tensor arena (vision weights are top-placed against
         # it; scratch stays below). In the multi-core layout every worker ISA
         # lives in the dedicated ISA region, so the tensor arena simply runs up
@@ -1509,8 +1512,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         lines.append(f"- **Cores (--multi-core):** {cores}")
         lines.append(f"- **DRAM layout:** {self.dram_layout} "
                      f"(model map 0x{self._params_dram_base:X}..0x{self.DRAM_END:X}"
-                     + (f", {MULTI_CORE_MAX_ENGINES} x 512 MB private windows "
-                        f"from 0x0" if self._use_hw12_dram_layout else "") + ")")
+                     + (f", {cores} x "
+                        f"{MULTI_CORE_ENGINE_WINDOW_BYTES // 2**20} MB private "
+                        f"windows from 0x0"
+                        if self._use_multicore_dram_layout else "") + ")")
         lines.append(f"- **Peak throughput:** {peak_gflops:.1f} GFLOPS "
                      f"({freq_mhz:.1f} MHz × 128 × {cores} core(s))")
         dram_read_speed = getattr(self, "_dram_read_speed_mbps", None)
