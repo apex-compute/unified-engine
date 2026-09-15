@@ -66,6 +66,11 @@ del_find() {
         while IFS= read -r -d '' f; do
             rel="${f#./}"
             grep -qxF -- "$rel" <<<"$TRACKED" && continue
+            # Model configs are source even before their first commit. Without
+            # this structural guard, adding a model and immediately running
+            # `make model_test` deletes its untracked *_config.json as though it
+            # were a generated log.
+            [[ "$rel" == models/*/*_config.json ]] && continue
             del "$rel"
         done < <(find . \
                      \( -name .git -o -name myvenv -o -name venv -o -name .venv \
@@ -151,6 +156,12 @@ del models/pi05/pi05_bin/programs.json
 # --- qwen2.5_vl_3b: keep params.* ; drop programs ---------------------------
 del models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.bin
 del models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.json
+
+# --- qwen2.5_omni_7b: keep expensive params/HF assets; drop compiled ISA -----
+del models/qwen2.5_omni_7b/qwen2.5_omni_7b_bin/*program*.bin
+del models/qwen2.5_omni_7b/qwen2.5_omni_7b_bin/*program*.json
+del models/qwen2.5_omni_7b/qwen2.5_omni_7b_bin/*instruction*.bin
+del models/qwen2.5_omni_7b/qwen2.5_omni_7b_bin/*instruction*.json
 
 # --- qwen3 0.6b / 1.7b / 4b: keep params.* ; drop programs/instruction -------
 del models/qwen3_0.6b/qwen3_0.6b_bin/qwen3_0.6b_instruction*

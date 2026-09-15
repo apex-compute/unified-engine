@@ -1,0 +1,121 @@
+{
+  "_template_note": "Qwen2.5-Omni-7B Thinker (text/image/audio input to text output) for the 8-engine, 8-GiB U55 layout.",
+  "fixed_isa_regs": {
+    "TMP_REG": 1,
+    "GF_SEQ_LEN_REG": 2,
+    "GF_Q_SEQ_LEN_REG": 3,
+    "GF_ALIGNED_SEQ_LEN_REG": 4
+  },
+  "file_info": {
+    "layer_size": 126524416,
+    "num_layers": 28,
+    "head_dim": 128,
+    "actual_head_dim": 128,
+    "num_kv_heads": 4,
+    "hidden_size": 3584,
+    "embedding_vocab": 152064,
+    "group_size": 7,
+    "mlp_elements": 18944,
+    "bytes_per_element": 2
+  },
+  "model": {
+    "max_context_size": 2048,
+    "prefill_max_seq_len": 384,
+    "end_of_turn_token_id": 151645,
+    "rope_global_layers": []
+  },
+  "vision": {
+    "hidden_size": 1280,
+    "num_heads": 16,
+    "head_dim": 80,
+    "intermediate_size": 3420,
+    "depth": 32,
+    "patch_size": 14,
+    "temporal_patch_size": 2,
+    "spatial_merge_size": 2,
+    "out_hidden_size": 3584,
+    "window_size": 112,
+    "fullatt_block_indexes": [7, 15, 23, 31],
+    "image_size": 336,
+    "num_patches": 576,
+    "num_merged_tokens": 144,
+    "rope_theta": 10000.0,
+    "tokens_per_second": 25
+  },
+  "audio": {
+    "sample_rate": 16000,
+    "num_mel_bins": 128,
+    "hidden_size": 1280,
+    "num_heads": 20,
+    "head_dim": 64,
+    "intermediate_size": 5120,
+    "depth": 32,
+    "max_source_positions": 1500,
+    "n_window": 100,
+    "max_mel_frames": 600,
+    "max_encoder_tokens": 300,
+    "max_output_tokens": 150,
+    "out_hidden_size": 3584,
+    "activation": "gelu",
+    "position_theta": 10000.0
+  },
+  "precision": {
+    "lm": "if4",
+    "embedding": "if8",
+    "vision": "if4",
+    "audio": "if4",
+    "decode_bf16_projections": [
+      "o"
+    ],
+    "lm_quantized_projections": [
+      "q", "k", "o", "gate", "up", "down"
+    ]
+  },
+  "tokens": {
+    "pad_token_id": 151643,
+    "bos_token_id": 151644,
+    "eos_token_id": 151645,
+    "audio_token_id": 151646,
+    "audio_bos_token_id": 151647,
+    "audio_eos_token_id": 151648,
+    "vision_bos_token_id": 151652,
+    "vision_eos_token_id": 151653,
+    "vision_pad_token_id": 151654,
+    "image_token_id": 151655,
+    "video_token_id": 151656
+  },
+  "special": {
+    "rope": {
+      "head_dim": 128,
+      "actual_head_dim": 128,
+      "num_positions": 2048,
+      "theta": 1000000.0,
+      "mrope_section": [16, 24, 24]
+    },
+    "rms_norm": {
+      "gamma_offset": 0.0
+    }
+  },
+  "image_processing": {
+    "resize": 336,
+    "normalize_mean": [0.48145466, 0.4578275, 0.40821073],
+    "normalize_std": [0.26862954, 0.26130258, 0.27577711]
+  },
+  "paths": {
+    "params": "qwen2.5_omni_7b_bin/params.bin",
+    "hf_model_dir": "qwen2.5_omni_7b_bin/Qwen2.5-Omni-7B",
+    "hf_model_repo": "Qwen/Qwen2.5-Omni-7B",
+    "hf_model_revision": "ae9e1690543ffd5c0221dc27f79834d0294cba00"
+  },
+  "hardware": {
+    "required_engines": 8,
+    "required_dram_gib": 8,
+    "private_arena_base": "0x000000000",
+    "private_arena_bytes": "0x100000000",
+    "private_window_bytes": "0x20000000",
+    "model_base": "0x100000000",
+    "params_limit": "0x1E8000000",
+    "tensor_limit": "0x1FA000000",
+    "dram_limit": "0x200000000"
+  }
+}

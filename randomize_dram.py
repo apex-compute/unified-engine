@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """DRAM reset with random bf16 values (not zeros, not small numbers).
 
-Populates the full 4 GB DRAM space [0x00000000..0x100000000) with random
-bfloat16 data via DMA writes. Useful before running HW tests so that
-uninitialised reads hit random data rather than stale NaN/zero patterns.
+Populates the full HW_INFO-reported DRAM space with random bfloat16 data via
+DMA writes. Useful before running HW tests so that uninitialised reads hit
+random data rather than stale NaN/zero patterns.
 
 Usage:
-    python dram_reset_test.py [--dev xdma0] [--chunk-mb 64]
+    python randomize_dram.py [--dev xdma0] [--chunk-mb 64]
 """
 
 import argparse
@@ -17,6 +17,7 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C,
     DMA_DEVICE_C2H,
@@ -25,13 +26,12 @@ from user_dma_core import (
 )
 
 DRAM_BASE = 0x00000000
-DRAM_END  = 0x100000000  # 4 GB
 BPE = 2
 
 
 def dram_random_fill(ue: UnifiedEngine, chunk_elements: int = 32 * 1024 * 1024,
-                     value: str = "random") -> None:
-    """Fill the whole 4 GB DRAM so an uninitialised read downstream is obvious.
+                     value: str = "random", dram_end: int | None = None) -> None:
+    """Fill all HW-reported DRAM so an uninitialised read is obvious.
 
     ``value``:
       ``random``  bf16 in [-8, 8]. Every read-before-write yields a
@@ -45,7 +45,13 @@ def dram_random_fill(ue: UnifiedEngine, chunk_elements: int = 32 * 1024 * 1024,
                   model that decodes under ``zero`` but not ``ff`` is reading
                   something it never fully wrote.
     """
-    dram_total_bytes = DRAM_END - DRAM_BASE
+    if dram_end is None:
+        if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
+            user_dma_core.configure_clock_from_hardware()
+        dram_end = int(user_dma_core.AVAILABLE_DRAM_SIZE_GB) * 1024 ** 3
+    if dram_end <= DRAM_BASE:
+        raise ValueError(f"invalid DRAM end address 0x{dram_end:X}")
+    dram_total_bytes = dram_end - DRAM_BASE
     total_elements = dram_total_bytes // BPE
     chunk_bytes = chunk_elements * BPE
     offset = 0
@@ -53,7 +59,7 @@ def dram_random_fill(ue: UnifiedEngine, chunk_elements: int = 32 * 1024 * 1024,
 
     what = {"random": "random bf16 values", "ff": "0xFF bytes (bf16 NaN)",
             "zero": "0x00 bytes"}[value]
-    print(f"Resetting DRAM [{hex(DRAM_BASE)}..{hex(DRAM_END)}) with {what} "
+    print(f"Resetting DRAM [{hex(DRAM_BASE)}..{hex(dram_end)}) with {what} "
           f"({dram_total_bytes / 1024**3:.2f} GB, chunk={chunk_bytes / 1024**2:.0f} MB)")
 
     while offset < total_elements:
@@ -77,7 +83,7 @@ def dram_random_fill(ue: UnifiedEngine, chunk_elements: int = 32 * 1024 * 1024,
 
     # Quick verification: read back first and last elements
     v0 = ue.dma_from_accelerator_memory(DRAM_BASE, (2,))
-    vN = ue.dma_from_accelerator_memory(DRAM_END - 4, (2,))
+    vN = ue.dma_from_accelerator_memory(dram_end - 4, (2,))
     print(f"  First element: {v0[0].item():.4f}  Last element: {vN[0].item():.4f}")
     print("DRAM reset done.")
 
@@ -94,6 +100,7 @@ def main():
     args = parser.parse_args()
 
     set_dma_device(args.dev)
+    user_dma_core.configure_clock_from_hardware()
 
     ue = UnifiedEngine()
 

@@ -241,8 +241,36 @@ def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
                     pass
 
 
+_DRAM_OVERRIDE_ANNOUNCED = False
+
+
+def _dram_size_override_code() -> Optional[int]:
+    """Decode ``UE_FORCE_DRAM_SIZE_GB`` into a HW_INFO DRAM size code.
+
+    Escape hatch for boards whose bitstream reports a stale DRAM size in
+    HW_INFO. The register stays the default source; this only applies when the
+    environment variable is set, and it does not widen the 32-bit DMA address.
+    """
+    value = os.environ.get("UE_FORCE_DRAM_SIZE_GB")
+    if value is None or value == "":
+        return None
+    gib = int(value, 0)
+    code = 0
+    encoded = 2
+    while encoded < gib and code < 7:
+        encoded *= 2
+        code += 1
+    if encoded != gib:
+        raise RuntimeError(
+            f"UE_FORCE_DRAM_SIZE_GB={value!r} is not an encodable DRAM size "
+            f"(must be 2, 4, 8, ... up to 256 GiB)"
+        )
+    return code
+
+
 def read_hardware_info() -> HardwareInfo:
     """Read and decode the Andromeda hardware-info register."""
+    global _DRAM_OVERRIDE_ANNOUNCED
     fd = os.open(DMA_DEVICE_USER, os.O_RDONLY)
     try:
         offset = UE_0_BASE_ADDR + UE_HW_INFO_ADDR - AXI_LITE_TRANSLATION_OFFSET
@@ -251,7 +279,16 @@ def read_hardware_info() -> HardwareInfo:
         os.close(fd)
     if len(raw) != 4:
         raise OSError(f"Short read from {DMA_DEVICE_USER} HW_INFO register: expected 4 bytes, got {len(raw)}")
-    return decode_hardware_info(struct.unpack("<I", raw)[0])
+    raw_value = struct.unpack("<I", raw)[0]
+    override_code = _dram_size_override_code()
+    if override_code is not None:
+        patched = (raw_value & ~(0x7 << 26)) | (override_code << 26)
+        if patched != raw_value and not _DRAM_OVERRIDE_ANNOUNCED:
+            print(f"WARNING: UE_FORCE_DRAM_SIZE_GB overrides HW_INFO DRAM size: "
+                  f"0x{raw_value:08x} -> 0x{patched:08x} ({2 << override_code} GiB)")
+            _DRAM_OVERRIDE_ANNOUNCED = True
+        raw_value = patched
+    return decode_hardware_info(raw_value)
 
 
 def configured_hardware_info() -> HardwareInfo:
@@ -5749,6 +5786,19 @@ class UnifiedEngine:
         # get dedicated registers so both bias modes work with softmax.
         # N and M totals are aliased onto the caller's gpr regs when provided (read-only).
         # ----------------------------------------------------------------------
+        # A strip narrower than 16 columns cannot satisfy both the 12-bit Z-row
+        # field and the 32-byte DMA alignment used by this two-pass kernel.  The
+        # old fallback aligned such a width down to zero and emitted a runtime
+        # N loop that could never make progress.  Reject that geometry while it
+        # is still a compile-time model error; large quantized projections must
+        # use quantized_matmat_core's one-pass 16-column streaming path.
+        if K // UE_VECTOR_SIZE > 4095 // 16:
+            raise ValueError(
+                "matmat_mul_core_dynamic: K is too large for a nonzero "
+                f"16-column strip (K={K}); use quantized_matmat_core for "
+                "quantized weights"
+            )
+
         _alloc_list = []
         def _alloc():
             r = self.alloc_isa_reg()
