@@ -1,0 +1,24 @@
+DPDFNet2 8 kHz FPGA neural inference, frames=2156, AXI=256, clock=3.0008 ns
+Single bin: /home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz-andromeda.bin
+Contract: resident recurrent state, one input write/kick/HALT/output read per frame
+Audio: 21.494 s, 16000 Hz; host STFT/iSTFT, mono output
+/dev/xdma0_user register access...
+HW version via user device: 0xdf0749de
+address 0x00000000 = 0xdf0749de
+address 0x00000030 = 0x00000000
+address 0x00000054 = 0x00000000
+address 0x00000070 = 0x00000000
+address 0x00000078 = 0x00000000
+address 0x00000084 = 0x00000000
+address 0x00000088 = 0x00035691
+address 0x0000008c = 0x00000000
+address 0x00000090 = 0x00000001
+address 0x00000094 = 0x00000002
+address 0x00000098 = 0x00000003
+address 0x0000009c = 0x00000000
+address 0x000000a0 = 0x80214d40
+FPGA DRAM read/write test skipped
+init_unified_engine()
+Unified Engine initialization completed successfully!
+Software reset complete.
+TEST_RESULT:{"model": "dpdfnet2_8khz", "onnx_sha256": "6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d", "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d", "input_sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620", "output_sha256": "eaa06ef12eedd5ab9228b27b28ae32d01bf8b15674ac30ec724b09d49e394fca", "hardware_version": "0xdf0749de", "dma_io": "cached-scalar-read-write", "host_cpu_affinity": [6], "axi_data_width_bits": 256, "hw_info_raw": "0x80214d40", "detected_clock_ns": 3.000750187546887, "effective_clock_ns": 3.000750187546887, "trace_enabled": false, "clock_override_enabled": false, "cycle_override_ns": null, "frame_hop_ms": 10.0, "deadline_ms": 10.0, "fpga_frame_ms_mean": 9.0696933751063, "fpga_frame_ms_max": 9.076621155288823, "host_frame_ms_mean": 9.847663044997033, "host_frame_ms_p95": 10.147261999463808, "host_frame_ms_p99": 10.550343199611229, "host_frame_ms_max": 13.20446499994432, "host_frame_deadline_misses": 441, "host_neural_rtf": 0.9850625502319396, "frame_timing_excludes": "one-time load/upload, host STFT/iSTFT and file I/O", "backend": "hardware", "cpu_neural_ops": 0, "frames": 2156, "full_graph": true, "state_resident": true, "artifact_load_s": 0.08559047000017017, "model_upload_s": 0.008502103000864736, "model_upload_bytes": 23594048, "model_upload_writes": 1, "input_upload_writes": 2156, "program_kicks": 2156, "halts": 2156, "output_reads": 2156, "intermediate_upload_writes": 0, "intermediate_output_reads": 0, "execution_elapsed_s": 21.237948583000616, "fpga_cycles_sum": 6516456784, "fpga_execution_s_sum": 19.554258916729186, "output": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/fpga8k/office_low_snr.wav", "input": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/noisy/office_low_snr.wav", "audio_duration_s": 21.494375, "sample_rate": 16000, "model_sample_rate": 8000, "output_samples": 343910, "output_channels": 1, "audio_preprocess_s": 0.03141197200056922, "audio_postprocess_s": 0.021651715998814325, "total_elapsed_s": 21.433344224000393, "steady_audio_processing_s": 21.291012271, "steady_audio_rtf": 0.9905387931028465, "metrics_file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/validation/20260914_noisy20s/fpga8k/office_low_snr.metrics.json", "metrics_sha256": "46f42450b5a194794bb15cf6898de9f9c10a7cf2153bf70c9bc26d3743ef9ce7"}

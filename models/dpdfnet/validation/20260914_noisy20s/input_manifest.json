@@ -1,0 +1,1135 @@
+{
+  "format": "dpdfnet.noisy-environment-sequences-v2",
+  "sample_rate": 16000,
+  "channels": 1,
+  "wav_subtype": "FLOAT",
+  "minimum_duration_s": 20,
+  "method": "Retained bus/cafe/office/psquare sequences are unchanged: all four nominal SNR conditions, with the shortest complete utterance repeated once to exceed 20 seconds. Added *_low_snr sequences use the minimum count of distinct, previously unused original utterances at nominal 2.5 dB needed to reach 20-24 seconds (at least four), with both speakers where available. Utterances are ordered by ID and selected before model evaluation. All sequences use 250 ms zero gaps and direct 48-to-16 kHz resampling, without utterance truncation, gain normalization, crossfade, or newly mixed noise.",
+  "source_cases": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/cases.json",
+  "source_cases_sha256": "81655a2033c2cc8fad20e461861a8ced41de927f1cef8c0fd05787ceced16d4c",
+  "source_provenance": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/provenance.json",
+  "source_provenance_sha256": "da2ec363b41431af3aaa1446f4d05eb3232fb8b36e8dc0f769aff9c6ffd11a3d",
+  "dataset": "VoiceBank-DEMAND official test set: retained mixed-SNR cases and newly selected 2.5 dB cases",
+  "dataset_doi": "https://doi.org/10.7488/ds/2117",
+  "mixture_description": "Original dataset mixtures of recorded clean speech and recorded environmental noise; these are paired synthetic mixtures, not live recordings of a speaker in the environment.",
+  "nominal_snr_definition": "Nominal SNR label provided by the original dataset log; not recomputed or relabeled here.",
+  "attribution": "Valentini-Botinhao, Cassia (2017). Noisy speech database for training speech enhancement algorithms and TTS models, 2016. University of Edinburgh, CSTR.",
+  "license": "CC BY 4.0",
+  "license_url": "https://creativecommons.org/licenses/by/4.0/",
+  "noise_origin": {
+    "dataset": "DEMAND: Diverse Environments Multichannel Acoustic Noise Database",
+    "url": "https://zenodo.org/records/1227121",
+    "attribution": "Joachim Thiemann, Nobutaka Ito, Emmanuel Vincent (2013).",
+    "license": "CC BY-SA 3.0",
+    "license_url": "https://creativecommons.org/licenses/by-sa/3.0/",
+    "documentation_url": "https://zenodo.org/records/1227121/files/DEMAND.pdf?download=1",
+    "documentation_sha256": "debec0d9de603c800a062108a065efb61d87b56cd1718b0b61566e2fed6b4800",
+    "environment_descriptions": {
+      "bus": "Public transit bus (TBUS)",
+      "cafe": "Cafe terrace at a public square (SCAFE)",
+      "office": "Small office with three people using computers (OOFFICE)",
+      "psquare": "Public town square with tourists (SPSQUARE)"
+    }
+  },
+  "cases": [
+    {
+      "id": "bus",
+      "environment": "Public transit bus (TBUS)",
+      "sample_rate": 16000,
+      "samples": 378916,
+      "duration_s": 23.68225,
+      "utterances": 5,
+      "unique_utterances": 4,
+      "repeated_utterances": 1,
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "noisy": {
+        "file": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus.wav",
+        "sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+        "float32_samples_sha256": "c99f3de8882ffacbf9e29371d7b3e29c7f8ed3f4bea7e218e3a722a42cd342b7"
+      },
+      "clean": {
+        "file": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/clean/bus.wav",
+        "sha256": "86e2b7d17c7e2eb5ecf658f2a6c52aacca23b2b9f7f6dd7849ee131e2ffafaf0",
+        "float32_samples_sha256": "53b20462d4616804de6698bbad0848176ddf4c8b9f174ed7487929aae40d2e8f"
+      },
+      "segments": [
+        {
+          "kind": "complete_utterance",
+          "id": "p232_005",
+          "speaker": "p232",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 0,
+          "samples": 99946,
+          "duration_s": 6.246625,
+          "source_samples": 299838,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p232_005.wav",
+          "noisy_source_sha256": "de6caa84eeaf24977976dbd43c728f0305671465d17db7e4db428def5b1d5276",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p232_005.wav",
+          "clean_source_sha256": "89b1ebdeabff150a3cc12629178e5b98a2366e052f3e8028ea853c2059f69494"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 99946,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_003",
+          "speaker": "p257",
+          "nominal_snr_db": 7.5,
+          "occurrence": 1,
+          "start_sample": 103946,
+          "samples": 88343,
+          "duration_s": 5.5214375,
+          "source_samples": 265028,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_003.wav",
+          "noisy_source_sha256": "715d32978b82857886e2fa1f95b56d64e8436410b135e79313a65506b1c12cc1",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p257_003.wav",
+          "clean_source_sha256": "394acaaf0d1bf55678ed10e4ce5f09cc691dcd4e0e99d0d66809637dbb37e197"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 192289,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p232_148",
+          "speaker": "p232",
+          "nominal_snr_db": 12.5,
+          "occurrence": 1,
+          "start_sample": 196289,
+          "samples": 61969,
+          "duration_s": 3.8730625,
+          "source_samples": 185905,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p232_148.wav",
+          "noisy_source_sha256": "9a09a32f1288e94d9400d9b8c803e44021a76d8786bf702ecb82fc80e5888528",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p232_148.wav",
+          "clean_source_sha256": "04d62357e7cf31699ba3442cdcdb06484a4910ce5b274caa35d7e4b6c4458b0d"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 258258,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_324",
+          "speaker": "p257",
+          "nominal_snr_db": 17.5,
+          "occurrence": 1,
+          "start_sample": 262258,
+          "samples": 56329,
+          "duration_s": 3.5205625,
+          "source_samples": 168987,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_324.wav",
+          "noisy_source_sha256": "cfb5aff9d0fef292fb7ac0c7085c29fb3a18749d43fa59dc170a28e652a60576",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p257_324.wav",
+          "clean_source_sha256": "34934467a1ca8be6471e2620da63ccb29d50cabe49ffae10f39b6cfd60d2181a"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 318587,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_324",
+          "speaker": "p257",
+          "nominal_snr_db": 17.5,
+          "occurrence": 2,
+          "start_sample": 322587,
+          "samples": 56329,
+          "duration_s": 3.5205625,
+          "source_samples": 168987,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_324.wav",
+          "noisy_source_sha256": "cfb5aff9d0fef292fb7ac0c7085c29fb3a18749d43fa59dc170a28e652a60576",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p257_324.wav",
+          "clean_source_sha256": "34934467a1ca8be6471e2620da63ccb29d50cabe49ffae10f39b6cfd60d2181a"
+        }
+      ],
+      "cohort": "retained_mixed_snr"
+    },
+    {
+      "id": "cafe",
+      "environment": "Cafe terrace at a public square (SCAFE)",
+      "sample_rate": 16000,
+      "samples": 328146,
+      "duration_s": 20.509125,
+      "utterances": 5,
+      "unique_utterances": 4,
+      "repeated_utterances": 1,
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "noisy": {
+        "file": "models/dpdfnet/validation/20260914_noisy20s/noisy/cafe.wav",
+        "sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868",
+        "float32_samples_sha256": "8b741a9b7b3f488501ef81b125d15f0eada0d32bcb8b34b1d4d56692bfed5626"
+      },
+      "clean": {
+        "file": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/clean/cafe.wav",
+        "sha256": "0d2ab0ee6a88d2918ee744b20caf5c599cf1a3ca49fe327f45138d5656a12ab4",
+        "float32_samples_sha256": "977b5465bf3330c1e0974575134130910572b8db9887588c59101c3d0fb12b7f"
+      },
+      "segments": [
+        {
+          "kind": "complete_utterance",
+          "id": "p257_009",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 0,
+          "samples": 55242,
+          "duration_s": 3.452625,
+          "source_samples": 165726,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_009.wav",
+          "noisy_source_sha256": "7d42a8d76ec6e770a3dce189901619e1a1f0b49c7505558f4e57c5e6130e1d28",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p257_009.wav",
+          "clean_source_sha256": "d7157be0fdc8a3719ec53fadd592c8fdb2e3593b2642858722b7a06803a2cc54"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 55242,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p232_009",
+          "speaker": "p232",
+          "nominal_snr_db": 7.5,
+          "occurrence": 1,
+          "start_sample": 59242,
+          "samples": 66522,
+          "duration_s": 4.157625,
+          "source_samples": 199566,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p232_009.wav",
+          "noisy_source_sha256": "f7957a28f677cbefd4c3f3eac57b9858d46531f0130c77e98385562a779604c6",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p232_009.wav",
+          "clean_source_sha256": "a659b948b1f4f79dcd9f8282bcb9b05587fddfd577ed9a8ccbe582a915ab5c16"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 125764,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_007",
+          "speaker": "p257",
+          "nominal_snr_db": 12.5,
+          "occurrence": 1,
+          "start_sample": 129764,
+          "samples": 54363,
+          "duration_s": 3.3976875,
+          "source_samples": 163088,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_007.wav",
+          "noisy_source_sha256": "9e0429a9765e9be5b82654579938d8f8f23ad16ae7518b148352596be792306d",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p257_007.wav",
+          "clean_source_sha256": "422f5f0d43ad411d811188e2dc4dfafe8784ab793759f22dd3ee784089976587"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 184127,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_007",
+          "speaker": "p257",
+          "nominal_snr_db": 12.5,
+          "occurrence": 2,
+          "start_sample": 188127,
+          "samples": 54363,
+          "duration_s": 3.3976875,
+          "source_samples": 163088,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_007.wav",
+          "noisy_source_sha256": "9e0429a9765e9be5b82654579938d8f8f23ad16ae7518b148352596be792306d",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p257_007.wav",
+          "clean_source_sha256": "422f5f0d43ad411d811188e2dc4dfafe8784ab793759f22dd3ee784089976587"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 242490,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p232_006",
+          "speaker": "p232",
+          "nominal_snr_db": 17.5,
+          "occurrence": 1,
+          "start_sample": 246490,
+          "samples": 81656,
+          "duration_s": 5.1035,
+          "source_samples": 244968,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p232_006.wav",
+          "noisy_source_sha256": "53b9be9b754b28c4907469333a1d938bc3d6ae7e513e7b371c999f337720d095",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p232_006.wav",
+          "clean_source_sha256": "337d07d33650b223ec973413db1e455aa907dc21a94e49f0544f561e2bce600c"
+        }
+      ],
+      "cohort": "retained_mixed_snr"
+    },
+    {
+      "id": "office",
+      "environment": "Small office with three people using computers (OOFFICE)",
+      "sample_rate": 16000,
+      "samples": 351688,
+      "duration_s": 21.9805,
+      "utterances": 5,
+      "unique_utterances": 4,
+      "repeated_utterances": 1,
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "noisy": {
+        "file": "models/dpdfnet/validation/20260914_noisy20s/noisy/office.wav",
+        "sha256": "b5dc82530929875863ebb564cc892c64c4e1cf5c5cead6b17a34c368593d6f73",
+        "float32_samples_sha256": "6fb0ebde67cf1b7089eeb8b46ec3566d88711825133c45c1be910dfc6719d86a"
+      },
+      "clean": {
+        "file": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/clean/office.wav",
+        "sha256": "df81d64b22996442aef1d86207af903e6ab3d47b0fbaad61a37db4c32ca91965",
+        "float32_samples_sha256": "f6d989fc985d8f63a458d8c2bdee0b2197c94a6f2920e947b99dd556c1ffe1c3"
+      },
+      "segments": [
+        {
+          "kind": "complete_utterance",
+          "id": "p257_199",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 0,
+          "samples": 67604,
+          "duration_s": 4.22525,
+          "source_samples": 202811,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_199.wav",
+          "noisy_source_sha256": "66952f94d840095a8b06a32abcdeb7ae3a1827751326d98c338e22fd9f29d586",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p257_199.wav",
+          "clean_source_sha256": "06fa9aca5006ead4b7cfb4098970864250678ca4eddb4f5580692e2bbf514595"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 67604,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p232_372",
+          "speaker": "p232",
+          "nominal_snr_db": 7.5,
+          "occurrence": 1,
+          "start_sample": 71604,
+          "samples": 53940,
+          "duration_s": 3.37125,
+          "source_samples": 161819,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p232_372.wav",
+          "noisy_source_sha256": "2abc707c2ed9cd2e700a322c134e753d8238f6ed6d2114e84bb19ea62997100e",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p232_372.wav",
+          "clean_source_sha256": "2ca3b18ef374771e8d8c73995b68ccb2f3446b525f0e61233833bb08c167efc5"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 125544,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p232_372",
+          "speaker": "p232",
+          "nominal_snr_db": 7.5,
+          "occurrence": 2,
+          "start_sample": 129544,
+          "samples": 53940,
+          "duration_s": 3.37125,
+          "source_samples": 161819,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p232_372.wav",
+          "noisy_source_sha256": "2abc707c2ed9cd2e700a322c134e753d8238f6ed6d2114e84bb19ea62997100e",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p232_372.wav",
+          "clean_source_sha256": "2ca3b18ef374771e8d8c73995b68ccb2f3446b525f0e61233833bb08c167efc5"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 183484,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_015",
+          "speaker": "p257",
+          "nominal_snr_db": 12.5,
+          "occurrence": 1,
+          "start_sample": 187484,
+          "samples": 75085,
+          "duration_s": 4.6928125,
+          "source_samples": 225254,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_015.wav",
+          "noisy_source_sha256": "e45e305c340e8198d886c4295059cb3f0351a2f350ab23e70215cf65f06ea8ba",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p257_015.wav",
+          "clean_source_sha256": "d1497184213de7921930cf1605bbbf8d13d1146ab5a2b958e1832cd8637fdf51"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 262569,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p232_015",
+          "speaker": "p232",
+          "nominal_snr_db": 17.5,
+          "occurrence": 1,
+          "start_sample": 266569,
+          "samples": 85119,
+          "duration_s": 5.3199375,
+          "source_samples": 255357,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p232_015.wav",
+          "noisy_source_sha256": "7177a64933032243582d310ac87ee54e36a30a15bb28d81471582ec5aa2d4933",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p232_015.wav",
+          "clean_source_sha256": "a77c7fc0b13f449ba1fecd7dafbde4b60e79aa51c6bc51732c97a3218289ffa6"
+        }
+      ],
+      "cohort": "retained_mixed_snr"
+    },
+    {
+      "id": "psquare",
+      "environment": "Public town square with tourists (SPSQUARE)",
+      "sample_rate": 16000,
+      "samples": 343574,
+      "duration_s": 21.473375,
+      "utterances": 5,
+      "unique_utterances": 4,
+      "repeated_utterances": 1,
+      "nominal_snr_db": [
+        2.5,
+        7.5,
+        12.5,
+        17.5
+      ],
+      "noisy": {
+        "file": "models/dpdfnet/validation/20260914_noisy20s/noisy/psquare.wav",
+        "sha256": "a20d68e238fb9acae1044ced9e05581535764ef2942d2efad5d3a7c1bf1cb26e",
+        "float32_samples_sha256": "011973fdcc7d5a3fd18c344c85daacc809877f50ffbf64a7f46d1dcd44aec40d"
+      },
+      "clean": {
+        "file": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/clean/psquare.wav",
+        "sha256": "ca7ea357138f16a2b9ee8111d83a013a7d9bc966eecba15e310879887c4951a1",
+        "float32_samples_sha256": "82884c2a6e186a9f3205115b5e157487bbb626c8dec71ee8d6940d72e461b0b3"
+      },
+      "segments": [
+        {
+          "kind": "complete_utterance",
+          "id": "p232_409",
+          "speaker": "p232",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 0,
+          "samples": 65440,
+          "duration_s": 4.09,
+          "source_samples": 196320,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p232_409.wav",
+          "noisy_source_sha256": "00df6a739e2f33526e9e0da8c305d199a46868a2f934307850a075023b2ba6d9",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p232_409.wav",
+          "clean_source_sha256": "5b38de5f84f51054df695e789f768d4a664833028d274341a46765be257b5369"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 65440,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_101",
+          "speaker": "p257",
+          "nominal_snr_db": 7.5,
+          "occurrence": 1,
+          "start_sample": 69440,
+          "samples": 68876,
+          "duration_s": 4.30475,
+          "source_samples": 206626,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_101.wav",
+          "noisy_source_sha256": "f6c87926433639c0642e4ab252240f7aea578e43f65d85a38522649cfd00e1f1",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p257_101.wav",
+          "clean_source_sha256": "0fa86831ee5532ba6b6f6070eb5b58e5383460d645d0551cd4bc14a795717717"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 138316,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p232_188",
+          "speaker": "p232",
+          "nominal_snr_db": 12.5,
+          "occurrence": 1,
+          "start_sample": 142316,
+          "samples": 61280,
+          "duration_s": 3.83,
+          "source_samples": 183839,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p232_188.wav",
+          "noisy_source_sha256": "797e8ceecc5060d683a3683023a2afd11129c77a709aeb9ca8f05b9eadb2a743",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p232_188.wav",
+          "clean_source_sha256": "52017299a16169fedc9e54e5c836e9484af5af01dc4bab67ee47374856406c64"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 203596,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p232_188",
+          "speaker": "p232",
+          "nominal_snr_db": 12.5,
+          "occurrence": 2,
+          "start_sample": 207596,
+          "samples": 61280,
+          "duration_s": 3.83,
+          "source_samples": 183839,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p232_188.wav",
+          "noisy_source_sha256": "797e8ceecc5060d683a3683023a2afd11129c77a709aeb9ca8f05b9eadb2a743",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p232_188.wav",
+          "clean_source_sha256": "52017299a16169fedc9e54e5c836e9484af5af01dc4bab67ee47374856406c64"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 268876,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_018",
+          "speaker": "p257",
+          "nominal_snr_db": 17.5,
+          "occurrence": 1,
+          "start_sample": 272876,
+          "samples": 70698,
+          "duration_s": 4.418625,
+          "source_samples": 212093,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_018.wav",
+          "noisy_source_sha256": "c2cc60d1fcd5386cb2ed6d2801fa6855fc66fe10ca9f1d8c7772b6e01a7cae1d",
+          "clean_source": "models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/clean/p257_018.wav",
+          "clean_source_sha256": "69adfee6f87adedd77a5a084dff8d5c627067ddb6e02448477595fad0c3713f0"
+        }
+      ],
+      "cohort": "retained_mixed_snr"
+    },
+    {
+      "id": "bus_low_snr",
+      "cohort": "low_snr_new_sources",
+      "noise": "bus",
+      "environment": "Public transit bus (TBUS)",
+      "sample_rate": 16000,
+      "samples": 334067,
+      "duration_s": 20.8791875,
+      "utterances": 6,
+      "unique_utterances": 6,
+      "repeated_utterances": 0,
+      "nominal_snr_db": [
+        2.5
+      ],
+      "noisy": {
+        "file": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus_low_snr.wav",
+        "sha256": "6ffae073e5549f58e19127bfcc701616baca9bc68d299103c01aeec7a8e0d288",
+        "float32_samples_sha256": "f01ebb6ffe211edb0de15edbb545bde3b611a7bc8c35f74b3d52823f051537b0"
+      },
+      "clean": {
+        "file": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/clean/bus_low_snr.wav",
+        "sha256": "7b241d7c60d6639d592df002a2411e002853f359d31a969a5edb67fa14621a36",
+        "float32_samples_sha256": "13c5131f02487ff6db7e456b3f28873a9776489fda796aba9cbff4aa87e9de48"
+      },
+      "segments": [
+        {
+          "kind": "complete_utterance",
+          "id": "p232_216",
+          "speaker": "p232",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 0,
+          "samples": 48017,
+          "duration_s": 3.0010625,
+          "source_samples": 144050,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p232_216.wav",
+          "noisy_source_sha256": "cf9ec7804990d5fe76d5101075a100347446bd9cb22143cc4c67b4864b9f73f7",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p232_216.wav",
+          "clean_source_sha256": "20fd117c0de9b2159a9e45b3ceb797f8a7e56387bb36e413bfa5e199e9783cab"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 48017,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_004",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 52017,
+          "samples": 58103,
+          "duration_s": 3.6314375,
+          "source_samples": 174308,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p257_004.wav",
+          "noisy_source_sha256": "181ffdee8734d13195da4948eb2326ad8b70043faf0ec5b8122e3dbd06e974b2",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p257_004.wav",
+          "clean_source_sha256": "d2bb1c605d416df5fafa2aea4d4fb83df78bd3f9a46260606f5e3d1b58042f2e"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 110120,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_207",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 114120,
+          "samples": 56477,
+          "duration_s": 3.5298125,
+          "source_samples": 169431,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p257_207.wav",
+          "noisy_source_sha256": "7c8aaadee66572045d1659d218210b3c1d45b4536829a8b7f36451b7a22b98b7",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p257_207.wav",
+          "clean_source_sha256": "8af942d9aa5567d2e500a427b4f3249ae98aadf28bd8b2a99f9f0076acdf5e11"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 170597,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_247",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 174597,
+          "samples": 49439,
+          "duration_s": 3.0899375,
+          "source_samples": 148315,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p257_247.wav",
+          "noisy_source_sha256": "efa8340318bacf34925cf271713b6ae233d9e6f2cc44d6ebbcf5772fdf256c49",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p257_247.wav",
+          "clean_source_sha256": "fad0ca16d400e51d5924c49d837e63ae801d0342cbbe904a238b6e00f25f1c82"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 224036,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_307",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 228036,
+          "samples": 50121,
+          "duration_s": 3.1325625,
+          "source_samples": 150362,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p257_307.wav",
+          "noisy_source_sha256": "0d666ff7ad21adf58366bbebc66bfcb1f32426cde316373fe91e3d9bf5c5066d",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p257_307.wav",
+          "clean_source_sha256": "012844de4a4c6a2fa8875d66c3d4d526b85da29805d6632d6fcd4999af6dc7ce"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 278157,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_367",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 282157,
+          "samples": 51910,
+          "duration_s": 3.244375,
+          "source_samples": 155728,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p257_367.wav",
+          "noisy_source_sha256": "a694444e72a1425c969d127bd882dfdd8b33a4cee7e8b3a6496aa34318d5d80c",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p257_367.wav",
+          "clean_source_sha256": "dc3c30830bf250c8d0c4e88461592748864b285c8bd4a557f81213629625e071"
+        }
+      ]
+    },
+    {
+      "id": "cafe_low_snr",
+      "cohort": "low_snr_new_sources",
+      "noise": "cafe",
+      "environment": "Cafe terrace at a public square (SCAFE)",
+      "sample_rate": 16000,
+      "samples": 343450,
+      "duration_s": 21.465625,
+      "utterances": 6,
+      "unique_utterances": 6,
+      "repeated_utterances": 0,
+      "nominal_snr_db": [
+        2.5
+      ],
+      "noisy": {
+        "file": "models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_low_snr.wav",
+        "sha256": "e61711a17c0ee70e99377efde0f7ff1010cbc4673d76b4914e468529cc8ba915",
+        "float32_samples_sha256": "384239155fc04983b95c0873d3320e323efd4ef4a89abe4c17e00625a6fead9c"
+      },
+      "clean": {
+        "file": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/clean/cafe_low_snr.wav",
+        "sha256": "bf900f3a748e87740adc7201a13a6d5c91cf6a968e21b8efafe5c62c47e6d422",
+        "float32_samples_sha256": "0eee47151b45f774b04ef7eb34ba7912c3b2151b4a321ac58e92d889f04e40da"
+      },
+      "segments": [
+        {
+          "kind": "complete_utterance",
+          "id": "p232_032",
+          "speaker": "p232",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 0,
+          "samples": 55841,
+          "duration_s": 3.4900625,
+          "source_samples": 167522,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p232_032.wav",
+          "noisy_source_sha256": "09e1ef6e9b893347c11b7bdfb6e60f07085e1c9ad2d60e50efe89e9506a8fa35",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p232_032.wav",
+          "clean_source_sha256": "43caf2c1fd9578e2d322b00dece8293c82d1e188c73733799c95dd0f7aeb65be"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 55841,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p232_220",
+          "speaker": "p232",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 59841,
+          "samples": 58584,
+          "duration_s": 3.6615,
+          "source_samples": 175752,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p232_220.wav",
+          "noisy_source_sha256": "1f643a36088f6ab2379596d05d6ed1a5e4ab01455b41a33473e7ffc5b07262ce",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p232_220.wav",
+          "clean_source_sha256": "3ac22e77b452fa50a79f022bcc680be78e9e0d5fe0e2678c35357356a9f08b77"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 118425,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p232_303",
+          "speaker": "p232",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 122425,
+          "samples": 58766,
+          "duration_s": 3.672875,
+          "source_samples": 176298,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p232_303.wav",
+          "noisy_source_sha256": "e55a708402ebdc3f511f94730570ab14b8ef31ec5a5d4bff2ac405800e91d8d4",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p232_303.wav",
+          "clean_source_sha256": "f4947308600803b14b788a5a04b825445311c0fd88b678a5cb17ef65ee455835"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 181191,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_130",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 185191,
+          "samples": 50736,
+          "duration_s": 3.171,
+          "source_samples": 152208,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p257_130.wav",
+          "noisy_source_sha256": "ee56bd51e73c27608ef1c34c5f056802841bde2a8cd408f33e401e44229e382a",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p257_130.wav",
+          "clean_source_sha256": "b865ac2ef07d53971ab88893d79fc476f5fd6aa8110625a344803a8e9272ab5f"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 235927,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_251",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 239927,
+          "samples": 48788,
+          "duration_s": 3.04925,
+          "source_samples": 146363,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p257_251.wav",
+          "noisy_source_sha256": "2d9096f984478f4798b4da46fcc9322a13500da8a2c9025d7aecb4e6dd53e355",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p257_251.wav",
+          "clean_source_sha256": "1ce372a57f185d520a101571e5ea8ddd6330f088bbae51d4ad3c1c78285d5c5b"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 288715,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_411",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 292715,
+          "samples": 50735,
+          "duration_s": 3.1709375,
+          "source_samples": 152205,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p257_411.wav",
+          "noisy_source_sha256": "560e9715aaccfacb93964632c8c297da1b5bf5c520e3021f457cf307ba203742",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p257_411.wav",
+          "clean_source_sha256": "2526dee5e1434af0540f722ba5933711ce213658c0c1240a61c66b0d1b0fd229"
+        }
+      ]
+    },
+    {
+      "id": "office_low_snr",
+      "cohort": "low_snr_new_sources",
+      "noise": "office",
+      "environment": "Small office with three people using computers (OOFFICE)",
+      "sample_rate": 16000,
+      "samples": 343910,
+      "duration_s": 21.494375,
+      "utterances": 5,
+      "unique_utterances": 5,
+      "repeated_utterances": 0,
+      "nominal_snr_db": [
+        2.5
+      ],
+      "noisy": {
+        "file": "models/dpdfnet/validation/20260914_noisy20s/noisy/office_low_snr.wav",
+        "sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620",
+        "float32_samples_sha256": "cdbf9f8bfed8ba0c7aa8863743459a704913c4545ea43a32fadcf8d7ca56747a"
+      },
+      "clean": {
+        "file": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/clean/office_low_snr.wav",
+        "sha256": "a2f6b7162751c19a930699a8a3c5cee6ca27a788f9b138539f95cdb3602adbe7",
+        "float32_samples_sha256": "d47ff33ab4e22bb07ec2a0bbcd394113d0fbff2c59990cf81c4e047e93cd2e59"
+      },
+      "segments": [
+        {
+          "kind": "complete_utterance",
+          "id": "p232_019",
+          "speaker": "p232",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 0,
+          "samples": 107769,
+          "duration_s": 6.7355625,
+          "source_samples": 323307,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p232_019.wav",
+          "noisy_source_sha256": "a48d16b180983c0a4c3bcb439753921dece9ee50bd31b166bc21d769c02fddb7",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p232_019.wav",
+          "clean_source_sha256": "2268caefff20ce9658a154c1481cc37ebf89347b3ef848b8a07115be3ec9c069"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 107769,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p232_121",
+          "speaker": "p232",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 111769,
+          "samples": 49038,
+          "duration_s": 3.064875,
+          "source_samples": 147112,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p232_121.wav",
+          "noisy_source_sha256": "c09d22f2eb77a0c58dfe4ad002061f687508192d7a446e2da995bd529afd9bf4",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p232_121.wav",
+          "clean_source_sha256": "dc34d9dc674bff9dae4d5c8981fcab70cf2eb265cc3e008159bc4666db3b7af0"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 160807,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_118",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 164807,
+          "samples": 56459,
+          "duration_s": 3.5286875,
+          "source_samples": 169375,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p257_118.wav",
+          "noisy_source_sha256": "28b7f64d26322e81c143e54f9923cfce7c72212a66624ae808024b961a301474",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p257_118.wav",
+          "clean_source_sha256": "af8962d01e3dd0badf228bf79e2f37c1f5febe6f2d6242edf92668921de0b199"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 221266,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_279",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 225266,
+          "samples": 58347,
+          "duration_s": 3.6466875,
+          "source_samples": 175040,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p257_279.wav",
+          "noisy_source_sha256": "3ba4cd1b368a4080b8add4f6c52d18813eb25b89d050e000c06b5e5412029669",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p257_279.wav",
+          "clean_source_sha256": "8110fb3a1a690fb5c734c52a8d4071c061367dbe05026bd7ea224af133367fcb"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 283613,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_379",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 287613,
+          "samples": 56297,
+          "duration_s": 3.5185625,
+          "source_samples": 168889,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p257_379.wav",
+          "noisy_source_sha256": "0e6fbcf23bfe4a1daadf38fdb6f7e571b622dc394d386084d60dcd95e54db6bf",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p257_379.wav",
+          "clean_source_sha256": "bc607a09c40c903fd382fca38a1fc95072f416ca4d2714a1229011f32f5a7080"
+        }
+      ]
+    },
+    {
+      "id": "psquare_low_snr",
+      "cohort": "low_snr_new_sources",
+      "noise": "psquare",
+      "environment": "Public town square with tourists (SPSQUARE)",
+      "sample_rate": 16000,
+      "samples": 344406,
+      "duration_s": 21.525375,
+      "utterances": 4,
+      "unique_utterances": 4,
+      "repeated_utterances": 0,
+      "nominal_snr_db": [
+        2.5
+      ],
+      "noisy": {
+        "file": "models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_low_snr.wav",
+        "sha256": "e44f139883a4570596b455d50eba708ab5e013b86eb6979880da3c6f769f78a8",
+        "float32_samples_sha256": "3d5a59ec4a15a3077df847ec2f1692f64ea781bc93c57b6ca0f166ee630aa1ee"
+      },
+      "clean": {
+        "file": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/clean/psquare_low_snr.wav",
+        "sha256": "ec3fd22f30f232cb3cfc1869cdacd84ce7d3e4d5b0872b1139ab09ccde4d5b21",
+        "float32_samples_sha256": "f24060a1e004af3729507326aea8947a3b4d8e85c737a32f7c0ea14c66d619ac"
+      },
+      "segments": [
+        {
+          "kind": "complete_utterance",
+          "id": "p232_023",
+          "speaker": "p232",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 0,
+          "samples": 156302,
+          "duration_s": 9.768875,
+          "source_samples": 468905,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p232_023.wav",
+          "noisy_source_sha256": "4d27e4b214aab4926d23fb97a7df643ea9697e7059cd36b3c13293dae845daf9",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p232_023.wav",
+          "clean_source_sha256": "4da8d61da2c09d2eb0222ab474fe483e374bb9cc2a0d9c9f0f7437d28b74d095"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 156302,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p232_275",
+          "speaker": "p232",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 160302,
+          "samples": 49178,
+          "duration_s": 3.073625,
+          "source_samples": 147534,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p232_275.wav",
+          "noisy_source_sha256": "974eb4a270efd00f9428eb74bb6601fb07223b6cf518b89ab89391488a93d571",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p232_275.wav",
+          "clean_source_sha256": "f291d33a31baa6c5651312b6e2173a54464c0111674f6882501c4216f4db9553"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 209480,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p232_295",
+          "speaker": "p232",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 213480,
+          "samples": 49235,
+          "duration_s": 3.0771875,
+          "source_samples": 147704,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p232_295.wav",
+          "noisy_source_sha256": "a5cf5e7b2e8bf61c78d5f719fd81868508b13b20e7be641ddb89d7841cc90b2b",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p232_295.wav",
+          "clean_source_sha256": "8bfbe6156fd155aff152e02365c08f7365e693fb775c0868a6a49924ae2735b1"
+        },
+        {
+          "kind": "zero_silence",
+          "start_sample": 262715,
+          "samples": 4000,
+          "duration_s": 0.25
+        },
+        {
+          "kind": "complete_utterance",
+          "id": "p257_022",
+          "speaker": "p257",
+          "nominal_snr_db": 2.5,
+          "occurrence": 1,
+          "start_sample": 266715,
+          "samples": 77691,
+          "duration_s": 4.8556875,
+          "source_samples": 233073,
+          "source_sample_rate": 48000,
+          "noisy_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/noisy/p257_022.wav",
+          "noisy_source_sha256": "8c51f91a3707b8032d0276226ea74938b71fd051828dbd461272b012ab10f6b4",
+          "clean_source": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/clean/p257_022.wav",
+          "clean_source_sha256": "626c08c22a795356ed297f011d8d602ccf5d6fc0cf38d5f3eb9234da2def687d"
+        }
+      ]
+    }
+  ],
+  "historical_source_scope": "source_cases and source_provenance preserve the original pinned subset; additional sources are recorded separately.",
+  "additional_source_cases": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/cases.json",
+  "additional_source_cases_sha256": "a36ba7b09d512d5111ccc8d4725dbd4005fbee3451aa7c809803d5a4b667039a",
+  "additional_source_provenance": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/provenance.json",
+  "additional_source_provenance_sha256": "a36ba7b09d512d5111ccc8d4725dbd4005fbee3451aa7c809803d5a4b667039a",
+  "selection_before_evaluation": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_noisy20s/additional_sources/selection_before_evaluation.json",
+  "selection_before_evaluation_sha256": "65197672cec79e97dedfbcffd500e5fc0aecca46c66d6c8a14cf84e9395589b7",
+  "additional_source_archives": {
+    "clean": {
+      "url": "https://datashare.ed.ac.uk/server/api/core/bitstreams/dec213d3-bf57-4777-9663-c24bdce92d5e/content",
+      "bytes": 154332064,
+      "etag": "\"34eb1c0ba7ef667e9b966866c542fc16\"",
+      "member_count": 824
+    },
+    "noisy": {
+      "url": "https://datashare.ed.ac.uk/server/api/core/bitstreams/13c1bfbf-14a6-41db-9b41-8f7310f01ad5/content",
+      "bytes": 170578854,
+      "etag": "\"fb1b86caa31e8ba5b506c0c64da9aab5\"",
+      "member_count": 824
+    }
+  }
+}

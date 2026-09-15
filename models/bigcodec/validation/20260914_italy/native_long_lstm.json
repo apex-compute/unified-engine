@@ -1,0 +1,112 @@
+[
+  {
+    "name": "encoder_lstm_317",
+    "instructions": 446140,
+    "model_bytes": 90355456,
+    "program_sha256": "f61c3a1cb0ff2ac4557787a25a7a0c396fb2a1e23a3fd57b2591be7b009b31f1",
+    "model_sha256": "2b9c8385c7a54de36f2831a44272f97827a245d2625d5515b1d4c434fa9e3c93",
+    "host_s": 1.911743414000739,
+    "fpga_s": 1.911157149287322,
+    "finite": true,
+    "hardware_version": "0xdf0749de",
+    "axi_data_width_bits": 256,
+    "relative_l2": 0.007772653829306364,
+    "blocks": [
+      {
+        "start": 0,
+        "relative_l2": 0.0076469616033136845
+      },
+      {
+        "start": 32,
+        "relative_l2": 0.006039022002369165
+      },
+      {
+        "start": 64,
+        "relative_l2": 0.0064373016357421875
+      },
+      {
+        "start": 96,
+        "relative_l2": 0.007141180336475372
+      },
+      {
+        "start": 128,
+        "relative_l2": 0.00730464281514287
+      },
+      {
+        "start": 160,
+        "relative_l2": 0.007492611650377512
+      },
+      {
+        "start": 192,
+        "relative_l2": 0.007962862960994244
+      },
+      {
+        "start": 224,
+        "relative_l2": 0.008728740736842155
+      },
+      {
+        "start": 256,
+        "relative_l2": 0.008890852332115173
+      },
+      {
+        "start": 288,
+        "relative_l2": 0.009397382847964764
+      }
+    ]
+  },
+  {
+    "name": "decoder_lstm_317",
+    "instructions": 446140,
+    "model_bytes": 90355456,
+    "program_sha256": "f61c3a1cb0ff2ac4557787a25a7a0c396fb2a1e23a3fd57b2591be7b009b31f1",
+    "model_sha256": "93f24bd0e53350412c5953ca9153444fa3f02170f7474de1b424e87c1506f8de",
+    "host_s": 1.91169702300067,
+    "fpga_s": 1.911143369842461,
+    "finite": true,
+    "hardware_version": "0xdf0749de",
+    "axi_data_width_bits": 256,
+    "relative_l2": 0.008206302300095558,
+    "blocks": [
+      {
+        "start": 0,
+        "relative_l2": 0.008296357467770576
+      },
+      {
+        "start": 32,
+        "relative_l2": 0.007027479819953442
+      },
+      {
+        "start": 64,
+        "relative_l2": 0.006714991293847561
+      },
+      {
+        "start": 96,
+        "relative_l2": 0.008577733300626278
+      },
+      {
+        "start": 128,
+        "relative_l2": 0.007404936943203211
+      },
+      {
+        "start": 160,
+        "relative_l2": 0.007812224328517914
+      },
+      {
+        "start": 192,
+        "relative_l2": 0.0074307541362941265
+      },
+      {
+        "start": 224,
+        "relative_l2": 0.010355652309954166
+      },
+      {
+        "start": 256,
+        "relative_l2": 0.009319650009274483
+      },
+      {
+        "start": 288,
+        "relative_l2": 0.008464224636554718
+      }
+    ]
+  }
+]

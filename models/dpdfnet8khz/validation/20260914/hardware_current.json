@@ -1,0 +1,27 @@
+{
+  "date": "2026-09-14",
+  "status": "PCIe and native8k model execution verified after user board update",
+  "observed_build_stamp": "0xdf0749de",
+  "matching_local_andromeda_commit": "df0749de3d4787b51a86a4d0a235e819a6fb52b7",
+  "source_identity_scope": "Register build stamp matches local git commit prefix; user supplied programmed image, its bitstream bytes were not independently hashed",
+  "configuration_actor": "user",
+  "hw_info_raw": "0x80214d40",
+  "axi_data_width_bits": 256,
+  "core_count": 1,
+  "dram_bytes": 2147483648,
+  "clock_mhz": 333.25,
+  "detected_clock_ns": 3.000750187546887,
+  "clock_override_enabled": false,
+  "trace_enabled": false,
+  "validation_bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+  "current_run_is_from_34787221985": false,
+  "previous_hardware_receipts": [
+    "hardware_update.json",
+    "hardware_reload_after_reset.json"
+  ],
+  "evidence": [
+    "full_corpus_comparison.json",
+    "sustained_comparison.json",
+    "audio_run_summary.json"
+  ]
+}

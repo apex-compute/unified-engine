@@ -1,0 +1,404 @@
+{
+  "hardware_version": "0xdf0749de",
+  "axi_data_width_bits": 256,
+  "clock_ns": 3.000750187546887,
+  "source_manifest_sha256": "c0583cf05ca69492997319340e265c55541dd1a829e5f8e512fafb4f3dbf37c4",
+  "comparison_sha256": "1e307568d36cbe786de468cfdb8fce8996efb32e3d00168a5f77eca85ec33c81",
+  "quality_sample_comparison_sha256": "108aaefa33497f4f269de8d83e0c54643791c56482e89c26be63919979f61d01",
+  "rates": {
+    "8000": {
+      "model": "dpdfnet2_8khz",
+      "model_sample_rate": 8000,
+      "deployments": [
+        {
+          "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+          "hardware_version": "0xdf0749de",
+          "clock_ns": 3.000750187546887
+        }
+      ],
+      "host_timing": {
+        "frames": 7369,
+        "mean_ms": 9.846679778658343,
+        "p95_ms": 10.123963999831176,
+        "p99_ms": 10.22235256008571,
+        "max_ms": 13.405030000285478,
+        "deadline_misses": 1349,
+        "deadline_miss_fraction": 0.18306418781381462,
+        "rtf_at_10ms_hop": 0.9846679778658343
+      },
+      "fpga_timing": {
+        "frames": 7369,
+        "mean_ms": 9.069698389993075,
+        "p95_ms": 9.074412603150789,
+        "p99_ms": 9.075436219054763,
+        "max_ms": 9.07700525131283,
+        "deadline_misses": 0,
+        "deadline_miss_fraction": 0.0,
+        "rtf_at_10ms_hop": 0.9069698389993075
+      },
+      "cpu_timing": {
+        "frames": 7369,
+        "mean_ms": 0.6515500476295859,
+        "p95_ms": 0.6630917998336372,
+        "p99_ms": 0.6838016005349342,
+        "max_ms": 1.3950519996797084,
+        "deadline_misses": 0,
+        "deadline_miss_fraction": 0.0,
+        "rtf_at_10ms_hop": 0.06515500476295859
+      },
+      "cpu_times_realtime": 15.348015146927164,
+      "host_times_realtime": 1.015570753267915,
+      "fpga_times_realtime": 1.1025724969017008,
+      "fpga_compute_over_cpu_neural": 13.920186826767463,
+      "host_fpga_over_cpu_neural": 15.112699038978967,
+      "all_coarse_cpu_accuracy_screens_pass": true,
+      "pooled_native_waveform_error": {
+        "case_ids": [
+          "p232_007",
+          "p257_018",
+          "sustained60_16k"
+        ],
+        "sample_rate": 8000,
+        "scope": "All audio cases reconstructed at one common model-native sample rate",
+        "samples": 546997,
+        "relative_l2": 0.018338308184544395,
+        "rmse": 0.0010636620512128403
+      },
+      "audio_60s": {
+        "duration_s": 60,
+        "samples": 960000,
+        "output_sample_rate": 16000,
+        "cpu_processing_s": 4.008282726998914,
+        "cpu_rtf": 0.06680471211664857,
+        "fpga_host_processing_s": 59.21555228499983,
+        "fpga_host_rtf": 0.9869258714166639,
+        "fpga_host_total_elapsed_s": 59.363436088000526,
+        "fpga_host_times_realtime": 1.0132473258245516,
+        "fpga_host_timing": {
+          "frames": 6007,
+          "mean_ms": 9.847695125687641,
+          "p95_ms": 10.118745300042065,
+          "p99_ms": 10.224980399907508,
+          "max_ms": 13.500203999683436,
+          "deadline_misses": 1099,
+          "deadline_miss_fraction": 0.18295322124188446,
+          "rtf_at_10ms_hop": 0.9847695125687641
+        },
+        "fpga_compute_timing": {
+          "frames": 6007,
+          "mean_ms": 9.069691977014564,
+          "p95_ms": 9.074316579144787,
+          "p99_ms": 9.075180795198799,
+          "max_ms": 9.077149287321832,
+          "deadline_misses": 0,
+          "deadline_miss_fraction": 0.0,
+          "rtf_at_10ms_hop": 0.9069691977014565
+        },
+        "bit_identical_to_spectrum_reconstruction": true
+      },
+      "audio_examples": [
+        {
+          "id": "p232_007",
+          "spectrum_relative_l2": 0.015221506885254327,
+          "source_rate_waveform_relative_l2": 0.012621376224687692,
+          "native_rate_waveform_relative_l2": 0.01298118271303687,
+          "original_rate_fpga_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/p232_007_fpga.wav",
+            "sha256": "f264217820a63f5326e10363d34b72ddeae78cc37695fb4791d4dd101a763d33",
+            "sample_rate": 48000,
+            "samples": 189883,
+            "float32_samples_sha256": "5eacd22083e5a8a8894132d2762f8747d58849c1c5bd165923ea2b325c9cb539"
+          },
+          "native_rate_fpga_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/p232_007_fpga_native8k.wav",
+            "sha256": "1128e577caa05755cb3dade264c1c5b983df14719e123b4da7b44126d971be9b",
+            "sample_rate": 8000,
+            "samples": 31648,
+            "float32_samples_sha256": "ebb3c48fc78c79a56ac6533f473a6b9d3bfc760615da0a7d9c51dffe6555c234"
+          },
+          "cpu_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/reference/p232_007_cpu.wav",
+            "sha256": "e73f60dd1a4093e010f30a35e1840102f07d5c850685d3716bd8395a2b8a7a8f"
+          }
+        },
+        {
+          "id": "p257_018",
+          "spectrum_relative_l2": 0.011874879328300718,
+          "source_rate_waveform_relative_l2": 0.008211422584661218,
+          "native_rate_waveform_relative_l2": 0.008214613713294882,
+          "original_rate_fpga_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/p257_018_fpga.wav",
+            "sha256": "906d7408793b3b78d86f5d791dda801daf52be5b00835132a33b4534ea892659",
+            "sample_rate": 48000,
+            "samples": 212093,
+            "float32_samples_sha256": "7a7dedc704fc3b87cc4328b9685c180ab4049d5a32e207000dd58498f1852b64"
+          },
+          "native_rate_fpga_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/p257_018_fpga_native8k.wav",
+            "sha256": "839b9faf9e553f711b9ffcd1589ee7fb4c826a06559c3a50ce0a62b9f32e872d",
+            "sample_rate": 8000,
+            "samples": 35349,
+            "float32_samples_sha256": "50d19b0d4d11cc271be8b081a972bc12ee932657aca3bc0b9f07aa5e55ace24a"
+          },
+          "cpu_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/reference/p257_018_cpu.wav",
+            "sha256": "d8717423453bf2f0abfe47ea441a1f93aa26c3b53f848a36b13c77bf7c53c6f0"
+          }
+        },
+        {
+          "id": "sustained60_16k",
+          "spectrum_relative_l2": 0.021726941665434086,
+          "source_rate_waveform_relative_l2": 0.018904013106555918,
+          "native_rate_waveform_relative_l2": 0.01909929329078752,
+          "original_rate_fpga_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/sustained60_16k_fpga.wav",
+            "sha256": "3dbc66a9ac9cd610acc51850f0ba4c77d580f05369dbe7f4b06c8c8ae44d5a79",
+            "sample_rate": 16000,
+            "samples": 960000,
+            "float32_samples_sha256": "8cf9577e8c16e7dfccb05c5fbbafe0d456799a931b1f74f0fb2fc2bb6de93f20"
+          },
+          "native_rate_fpga_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/fpga/sustained60_16k_fpga_native8k.wav",
+            "sha256": "abe03e4a9081e1f0e3e2662b764b70a1910651e624ec0c5c9884168f37b62368",
+            "sample_rate": 8000,
+            "samples": 480000,
+            "float32_samples_sha256": "ad1a5bc1a90bbb7a394cad00bdc2c6ae92aadbbc7ea94c3e6a0af3ec2317b1d0"
+          },
+          "cpu_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native8k/reference/sustained60_16k_cpu.wav",
+            "sha256": "665140843729927d0b3bfb01533878e80e80a433110d85ffaa2444b605fc6eb4"
+          }
+        }
+      ],
+      "protocol": {
+        "model_uploads_per_run": 1,
+        "input_uploads_per_frame": 1,
+        "start_halt_per_frame": 1,
+        "output_reads_per_frame": 1,
+        "state_resident": true,
+        "cpu_neural_ops": 0,
+        "dma_io": "cached-scalar-read-write",
+        "host_cpu_affinity": [
+          6
+        ],
+        "cpu_reference_affinity": [
+          7
+        ],
+        "cpu_reference_threads": 1
+      }
+    },
+    "16000": {
+      "model": "dpdfnet2",
+      "model_sample_rate": 16000,
+      "deployments": [
+        {
+          "bin_sha256": "4f540ae650c27d822f4da24cfb0a0ac7f9cf33e53e84cbd9ce2fc7f1cdd5fc77",
+          "hardware_version": "0xdf0749de",
+          "clock_ns": 3.000750187546887
+        }
+      ],
+      "host_timing": {
+        "frames": 7369,
+        "mean_ms": 14.30393475193572,
+        "p95_ms": 14.615914600290125,
+        "p99_ms": 14.80617707977217,
+        "max_ms": 20.02845399965736,
+        "deadline_misses": 7369,
+        "deadline_miss_fraction": 1.0,
+        "rtf_at_10ms_hop": 1.430393475193572
+      },
+      "fpga_timing": {
+        "frames": 7369,
+        "mean_ms": 13.447065263669696,
+        "p95_ms": 13.453683420855214,
+        "p99_ms": 13.456804201050263,
+        "max_ms": 13.462565641410352,
+        "deadline_misses": 7369,
+        "deadline_miss_fraction": 1.0,
+        "rtf_at_10ms_hop": 1.3447065263669695
+      },
+      "cpu_timing": {
+        "frames": 7369,
+        "mean_ms": 0.6687319887317423,
+        "p95_ms": 0.6743579999238136,
+        "p99_ms": 0.7142620797458221,
+        "max_ms": 1.2762270007442567,
+        "deadline_misses": 0,
+        "deadline_miss_fraction": 0.0,
+        "rtf_at_10ms_hop": 0.06687319887317424
+      },
+      "cpu_times_realtime": 14.953673771408948,
+      "host_times_realtime": 0.6991083344145373,
+      "fpga_times_realtime": 0.7436566867134402,
+      "fpga_compute_over_cpu_neural": 20.10830271357619,
+      "host_fpga_over_cpu_neural": 21.389637392796615,
+      "all_coarse_cpu_accuracy_screens_pass": false,
+      "pooled_native_waveform_error": {
+        "case_ids": [
+          "p232_007",
+          "p257_018",
+          "sustained60_16k"
+        ],
+        "sample_rate": 16000,
+        "scope": "All audio cases reconstructed at one common model-native sample rate",
+        "samples": 1093993,
+        "relative_l2": 0.10427687499444571,
+        "rmse": 0.006101871730603444
+      },
+      "audio_60s": {
+        "duration_s": 60,
+        "samples": 960000,
+        "output_sample_rate": 16000,
+        "cpu_processing_s": 4.113260404999892,
+        "cpu_rtf": 0.06855434008333153,
+        "fpga_host_processing_s": 85.95599540100011,
+        "fpga_host_rtf": 1.4325999233500017,
+        "fpga_host_total_elapsed_s": 86.1263381789995,
+        "fpga_host_times_realtime": 0.6980315883736703,
+        "fpga_host_timing": {
+          "frames": 6007,
+          "mean_ms": 14.299668797560745,
+          "p95_ms": 14.613089000249602,
+          "p99_ms": 15.300455900305634,
+          "max_ms": 18.2496440002069,
+          "deadline_misses": 6007,
+          "deadline_miss_fraction": 1.0,
+          "rtf_at_10ms_hop": 1.4299668797560745
+        },
+        "fpga_compute_timing": {
+          "frames": 6007,
+          "mean_ms": 13.44695165367836,
+          "p95_ms": 13.453587396849212,
+          "p99_ms": 13.45665728432108,
+          "max_ms": 13.463189797449363,
+          "deadline_misses": 6007,
+          "deadline_miss_fraction": 1.0,
+          "rtf_at_10ms_hop": 1.344695165367836
+        },
+        "bit_identical_to_spectrum_reconstruction": true
+      },
+      "audio_examples": [
+        {
+          "id": "p232_007",
+          "spectrum_relative_l2": 0.11833399306139816,
+          "source_rate_waveform_relative_l2": 0.11218315764469808,
+          "native_rate_waveform_relative_l2": 0.11219474174609805,
+          "original_rate_fpga_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/p232_007_fpga.wav",
+            "sha256": "65ffbd3b12b8d399844b36e37d3d84b25aa0e870617217c01acf1757b11edaea",
+            "sample_rate": 48000,
+            "samples": 189883,
+            "float32_samples_sha256": "cb61a2ff65a5d98d593038b9ed5b238d0e1b5254d8668565f483a553137bd33a"
+          },
+          "native_rate_fpga_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/p232_007_fpga_native16k.wav",
+            "sha256": "791488e23835b21e875283cace31e1a3ac17bd3d0f7db9996228b69ce012b9b3",
+            "sample_rate": 16000,
+            "samples": 63295,
+            "float32_samples_sha256": "58dd12f0e2c96219ed3b90f226f1b944d023d43f39ee67a62c6f841e4cc7b9a6"
+          },
+          "cpu_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/reference/p232_007_cpu.wav",
+            "sha256": "a1070760a5735c67a20901e1600fe37fa235a85f74fe695a49f9f970c420351a"
+          }
+        },
+        {
+          "id": "p257_018",
+          "spectrum_relative_l2": 0.25380367310020785,
+          "source_rate_waveform_relative_l2": 0.24768009635851476,
+          "native_rate_waveform_relative_l2": 0.24774248112402655,
+          "original_rate_fpga_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/p257_018_fpga.wav",
+            "sha256": "d2d4fafc0201e566c3d94cd0724defb6ed40f17afc1d9af4aaaf9bcbe4f2470d",
+            "sample_rate": 48000,
+            "samples": 212093,
+            "float32_samples_sha256": "5925025f89885c687082fd122628933ab164a504f563e4808c879ac7a4646799"
+          },
+          "native_rate_fpga_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/p257_018_fpga_native16k.wav",
+            "sha256": "5495e214a1ae43886cd3e1dc9959422304285ff96b351b9bc423c8ef3bde0c5c",
+            "sample_rate": 16000,
+            "samples": 70698,
+            "float32_samples_sha256": "471552643058ee5d1ecd650ecd07dbbc75d9ebd3e2edb02ed26575aeaff5bb88"
+          },
+          "cpu_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/reference/p257_018_cpu.wav",
+            "sha256": "eebf57e374821d4bf79aa0598a04b8119e147cd77df047282f511e679e16fccd"
+          }
+        },
+        {
+          "id": "sustained60_16k",
+          "spectrum_relative_l2": 0.09923884074433972,
+          "source_rate_waveform_relative_l2": 0.09259461505070811,
+          "native_rate_waveform_relative_l2": 0.09259461505070811,
+          "original_rate_fpga_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/sustained60_16k_fpga.wav",
+            "sha256": "588567d5abb10b3968bc8022f1d7e8ddf46be8b3c66440c0e10d47d21b93230f",
+            "sample_rate": 16000,
+            "samples": 960000,
+            "float32_samples_sha256": "bb58ce51abb386479023f340d5d0412ce6ef4f338977471bdffa4236be673625"
+          },
+          "native_rate_fpga_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/fpga/sustained60_16k_fpga_native16k.wav",
+            "sha256": "588567d5abb10b3968bc8022f1d7e8ddf46be8b3c66440c0e10d47d21b93230f",
+            "sample_rate": 16000,
+            "samples": 960000,
+            "float32_samples_sha256": "bb58ce51abb386479023f340d5d0412ce6ef4f338977471bdffa4236be673625"
+          },
+          "cpu_wav": {
+            "file": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/native16k/reference/sustained60_16k_cpu.wav",
+            "sha256": "f37844ebdf12852b047906b84f98cf6e9b5ada3f985b9571ab0b2ca50d90ee6d"
+          }
+        }
+      ],
+      "protocol": {
+        "model_uploads_per_run": 1,
+        "input_uploads_per_frame": 1,
+        "start_halt_per_frame": 1,
+        "output_reads_per_frame": 1,
+        "state_resident": true,
+        "cpu_neural_ops": 0,
+        "dma_io": "cached-scalar-read-write",
+        "host_cpu_affinity": [
+          6
+        ],
+        "cpu_reference_affinity": [
+          7
+        ],
+        "cpu_reference_threads": 1
+      }
+    }
+  },
+  "quality_sample": {
+    "case": "p257_018",
+    "scope": "One matched clip, common 8 kHz band only; not full 16 kHz bandwidth or corpus quality qualification",
+    "scores": {
+      "noisy": {
+        "pesq_nb": 3.6701011657714844,
+        "stoi": 0.9883736212333033
+      },
+      "cpu8": {
+        "pesq_nb": 4.229587554931641,
+        "stoi": 0.9889288038222379
+      },
+      "fpga8": {
+        "pesq_nb": 4.126782417297363,
+        "stoi": 0.988384745418837
+      },
+      "cpu16": {
+        "pesq_nb": 3.9165210723876953,
+        "stoi": 0.9658681893467904
+      },
+      "fpga16": {
+        "pesq_nb": 3.637667179107666,
+        "stoi": 0.9620721201414432
+      }
+    }
+  },
+  "limitations": [
+    "The two rates use different official models and different deployed weight precision; the 16 kHz artifact was not changed by this comparison.",
+    "CPU and FPGA outputs are finite; CPU state is checked every frame. These dual-rate timing runs do not read intermediate FPGA state.",
+    "Average throughput and strict per-frame deadlines are distinct. All frames, including frontend flush frames, are counted.",
+    "PESQ-NB/STOI cover one p257 clip evaluated at common 8 kHz and do not establish wideband or corpus speech-quality acceptance."
+  ]
+}

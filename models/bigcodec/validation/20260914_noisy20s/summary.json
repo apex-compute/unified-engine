@@ -1,0 +1,137 @@
+{
+  "format": "bigcodec-noisy20s-summary-v1",
+  "cases": 8,
+  "fpga_runs": 16,
+  "audio_duration_s": 173.0098125,
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "model": "BigCodec speech codec, encoder/quantizer/decoder; no denoising objective",
+  "hardware": {
+    "host": "italy",
+    "version": "0x40519e0a",
+    "axi_data_width_bits": 256,
+    "clock_mhz": 333.25,
+    "fpga": "Kintex UltraScale+ KU5P",
+    "visible_dram_bytes": 2147483648
+  },
+  "cpu": {
+    "model": "Intel(R) Core(TM) Ultra 9 285K",
+    "core": 7,
+    "threads": 1,
+    "precision": "FP32"
+  },
+  "precision_labels": {
+    "bf16": "BF16 convolutions, activations and both LSTM recurrences",
+    "if8": "BF16 convolutions/activations; IF8-INT recurrent weights in both LSTMs"
+  },
+  "timing_scope": "Audio processing includes input/output transfer, preprocessing and output file writes; excludes compiler, model/artifact loading and resident image upload.",
+  "total_elapsed_scope": "Measured runner total includes artifact loading, validation and resident upload in addition to audio processing. Excludes compilation, Python startup and final report serialization. Total RTF = sum total_elapsed_s / sum audio duration.",
+  "aggregation": "Pooled RTF = sum processing seconds / sum source-audio seconds. Pooled waveform relative L2 = sqrt(sum error energy / sum CPU waveform energy). Token agreement sums matching IDs and token counts.",
+  "waveform_comparison": "Official CPU reconstruction at original sample indices; no gain, delay or polarity fitting. Not error versus clean speech and not a speech-quality score.",
+  "execution": "One complete WAV per bin execution; one resident program/parameter upload, one complete input upload, one START, one HALT and one output bundle read. State resets between files, not at concatenation gaps.",
+  "cpu_fp32": {
+    "files": 8,
+    "duration_s": 173.0098125,
+    "processing_s": 402.0213483889984,
+    "processing_rtf": 2.323691024108811,
+    "rtf_min": 2.2794461965573634,
+    "rtf_max": 2.342338159732488,
+    "finite": true,
+    "total_tokens": 13845
+  },
+  "bf16": {
+    "files": 8,
+    "duration_s": 173.0098125,
+    "processing_s": 829.8471115610064,
+    "processing_rtf": 4.796532055434754,
+    "rtf_min": 4.794718405685314,
+    "rtf_max": 4.79755463355937,
+    "finite": true,
+    "total_tokens": 13845,
+    "reference_energy": 14741.102485209847,
+    "error_energy": 1160.4302630332468,
+    "waveform_relative_l2": 0.2805721372349953,
+    "waveform_relative_l2_status": "finite",
+    "tokens_equal": 12607,
+    "token_match_fraction": 0.9105814373420007,
+    "fpga_execution_s": 827.9612711177795,
+    "artifact_load_s": 153.94485927600908,
+    "model_upload_s": 2.2516032839976106,
+    "total_elapsed_s": 1136.1683060910054,
+    "total_elapsed_rtf": 6.567074373836486,
+    "all_single_start_halt": true,
+    "bin_ranges": {
+      "parameter_bytes": {
+        "min": 331251584,
+        "max": 331251584
+      },
+      "program_bytes": {
+        "min": 432926784,
+        "max": 500013056
+      },
+      "resident_bytes": {
+        "min": 764178368,
+        "max": 831264640
+      },
+      "instructions": {
+        "min": 13528962,
+        "max": 15625408
+      },
+      "scratch_bytes": {
+        "min": 378086400,
+        "max": 436608000
+      },
+      "bin_bytes": {
+        "min": 764219183,
+        "max": 831305455
+      }
+    }
+  },
+  "if8": {
+    "files": 8,
+    "duration_s": 173.0098125,
+    "processing_s": 753.5441127449994,
+    "processing_rtf": 4.355499274036838,
+    "rtf_min": 4.353955839071474,
+    "rtf_max": 4.3563933891046975,
+    "finite": true,
+    "total_tokens": 13845,
+    "reference_energy": 14741.102485209847,
+    "error_energy": 1077.796345372519,
+    "waveform_relative_l2": 0.270397934947358,
+    "waveform_relative_l2_status": "finite",
+    "tokens_equal": 12617,
+    "token_match_fraction": 0.9113037197544239,
+    "fpga_execution_s": 751.6565700945237,
+    "artifact_load_s": 149.9871232030091,
+    "model_upload_s": 2.1692831960062904,
+    "total_elapsed_s": 1045.015693664005,
+    "total_elapsed_rtf": 6.040210543919323,
+    "all_single_start_halt": true,
+    "bin_ranges": {
+      "parameter_bytes": {
+        "min": 294682496,
+        "max": 294682496
+      },
+      "program_bytes": {
+        "min": 415282752,
+        "max": 479638016
+      },
+      "resident_bytes": {
+        "min": 709965248,
+        "max": 774320512
+      },
+      "instructions": {
+        "min": 12977586,
+        "max": 14988688
+      },
+      "scratch_bytes": {
+        "min": 378086400,
+        "max": 436608000
+      },
+      "bin_bytes": {
+        "min": 710006063,
+        "max": 774361327
+      }
+    }
+  }
+}

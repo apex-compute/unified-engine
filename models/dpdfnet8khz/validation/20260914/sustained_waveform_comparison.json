@@ -1,0 +1,105 @@
+{
+  "model": "dpdfnet2_8khz",
+  "reference_manifest": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_df0749de/sustained_cpu/reference/cpu_reference_manifest.json",
+  "reference_manifest_sha256": "465c874fa6dedecf212f84246ded188add67dbd62dba3c6557b07225f538a2a0",
+  "cpu_spectrum_comparison": "comparison.json",
+  "cpu_spectrum_comparison_sha256": "dc20b3d3109f0db5a5cea9fb2e6b46c70fa7f03b86c430e7fe066476b6ad14d7",
+  "id": "sustained60",
+  "frames": 6007,
+  "sample_rate": 8000,
+  "samples": 480000,
+  "duration_s": 60.0,
+  "method": "Standard native8k synthesis with fixed model delay compensation; no fitted alignment, gain adjustment, normalization, or sample trimming. All 480,000 source samples retained.",
+  "regenerated_input_bit_identical": true,
+  "regenerated_cpu_wav_bit_identical": true,
+  "all_finite": true,
+  "relative_l2": 0.02266767303325453,
+  "rmse": 0.0013118726635311484,
+  "max_abs_error": 0.03247060254216194,
+  "sum_squared_error": 0.8260847449537487,
+  "cpu_energy": 1607.7211426337535,
+  "cpu_peak": 0.4961225390434265,
+  "fpga_peak": 0.5006154179573059,
+  "noisy_wav_sha256": "1ff0fda12ad4f4edfa598a50d97ddc590a256f35c8149a8b633ab90eca4e403e",
+  "cpu_wav_sha256": "9cf8b055ae2b897e8e7c52dd59e2488dc0ef4ca7eced6773d43f99a6bf100992",
+  "fpga_spectrum_sha256": "ed9b3a459229a5a22071a2d00f8c8e448ff7d9e510283c620098e5ea01e9f041",
+  "reconstructed_wav": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_df0749de/sustained_shared/sustained60_reconstructed_enhanced.wav",
+  "reconstructed_wav_sha256": "479779557139d65ee7ad198d27850900220501bdc6fa9be30b2dbeafc3469e66",
+  "reconstructed_float32_samples_sha256": "7656452a1ee80dcfd4d98ff20504e16cb4a3670c35d38f0782bd4374f4f3a950",
+  "hardware": {
+    "axi_data_width_bits": 256,
+    "hardware_version": "0xdf0749de",
+    "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d"
+  },
+  "final_state_checks": {
+    "all_finite": true,
+    "scope": "Only final recurrent state read after each spectral run; not a per-frame FPGA state audit.",
+    "cases": [
+      {
+        "file": "audio_silence_audio_384_final_state.json",
+        "sha256": "18502e4509c77e3bec6560658d74788702d1b69510779bca15187f406f866a12",
+        "case": "audio_silence_audio_384",
+        "scope": "final state only, read after benchmark without reset",
+        "state_in_finite": true,
+        "state_out_finite": true
+      },
+      {
+        "file": "silence_128_final_state.json",
+        "sha256": "5f9b3cefe78fb0eab12838dcc0b73dc8e9e8ce443bb93ae8b344b92061a20779",
+        "case": "silence_128",
+        "scope": "final state only, read after benchmark without reset",
+        "state_in_finite": true,
+        "state_out_finite": true
+      },
+      {
+        "file": "sustained60_final_state.json",
+        "sha256": "9801845b61fe935cffae08bc7efea092b64f4568ddae580e2830e700b2ca226b",
+        "case": "sustained60",
+        "scope": "final state only, read after benchmark without reset",
+        "state_in_finite": true,
+        "state_out_finite": true
+      }
+    ]
+  },
+  "audio_cli_verification": {
+    "input": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_df0749de/sustained_cpu/sustained60.wav",
+    "input_sha256": "f62b7c35620a298fef6205332ca68238ec579505a8f4626788f79d79e0aa41ec",
+    "output": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_df0749de/sustained_shared/sustained60_enhanced.wav",
+    "output_sha256": "45586d95140346c4ad2d3b954e7f757c057516f86df446ffde20982df67f5a42",
+    "log_sha256": "17996e02c6aa8913012d39a5a11d7c40cde25a5f7512179c17f326f44482cbb4",
+    "metrics_sha256": "46cd8d45dd3c19d421a9e2f586ce5cfbe069d061f12e099ada184708ccec6381",
+    "samples": 480000,
+    "sample_rate": 8000,
+    "all_finite": true,
+    "bit_identical_to_spectrum_reconstruction": true,
+    "float32_samples_sha256": "7656452a1ee80dcfd4d98ff20504e16cb4a3670c35d38f0782bd4374f4f3a950",
+    "host_timing": {
+      "frames": 6007,
+      "mean_ms": 9.850779990511931,
+      "p95_ms": 10.121274499942956,
+      "p99_ms": 10.2222976600342,
+      "max_ms": 29.366674000129933,
+      "deadline_misses": 1062,
+      "deadline_miss_fraction": 0.17679374063592476,
+      "rtf_at_10ms_hop": 0.9850779990511931
+    },
+    "fpga_timing": {
+      "frames": 6007,
+      "mean_ms": 9.06966745548548,
+      "p95_ms": 9.074316579144787,
+      "p99_ms": 9.075321950487622,
+      "max_ms": 9.076957239309829,
+      "deadline_misses": 0,
+      "deadline_miss_fraction": 0.0,
+      "rtf_at_10ms_hop": 0.906966745548548
+    },
+    "audio_duration_s": 60.0,
+    "steady_audio_processing_s": 59.210184907999974,
+    "steady_audio_rtf": 0.9868364151333329,
+    "total_elapsed_s": 59.337830863000136,
+    "audio_preprocess_s": 0.006320499999901585,
+    "audio_postprocess_s": 0.011475275000066176,
+    "includes_all_frames": true,
+    "qualification": "Average file-to-file throughput is below audio duration; per-frame host deadline misses remain."
+  }
+}

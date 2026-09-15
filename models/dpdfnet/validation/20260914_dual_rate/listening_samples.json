@@ -1,0 +1,137 @@
+{
+  "method": "Mono FLOAT WAV at each model native rate, all samples retained, no gain normalization or fitted alignment; enhanced samples reconstructed from the recorded CPU/FPGA spectrum outputs",
+  "files": [
+    {
+      "file": "samples/8k/p232_007_noisy.wav",
+      "kind": "noisy",
+      "case": "p232_007",
+      "model_sample_rate": 8000,
+      "sample_rate": 8000,
+      "samples": 31648,
+      "sha256": "e6ea2554f0eb456a827188990f33adb2475be0822f5f6134cc585597a8061d82",
+      "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+      "float32_samples_sha256": "2e720efb106088399a8f12bbd6c0461e5134e5019ba8c7e5e8ee4745248d3038"
+    },
+    {
+      "file": "samples/8k/p232_007_cpu.wav",
+      "kind": "cpu",
+      "case": "p232_007",
+      "model_sample_rate": 8000,
+      "sample_rate": 8000,
+      "samples": 31648,
+      "sha256": "d21aa329e864e82aa699f0064789adcfd247e2f35b7077081c0f8b6e08f40c5c",
+      "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+      "float32_samples_sha256": "916de2863c1bbba089cbb0888e0b17fe0d746bdf3461de35648006d387249d08"
+    },
+    {
+      "file": "samples/8k/p232_007_fpga.wav",
+      "kind": "fpga",
+      "case": "p232_007",
+      "model_sample_rate": 8000,
+      "sample_rate": 8000,
+      "samples": 31648,
+      "sha256": "1128e577caa05755cb3dade264c1c5b983df14719e123b4da7b44126d971be9b",
+      "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+      "float32_samples_sha256": "ebb3c48fc78c79a56ac6533f473a6b9d3bfc760615da0a7d9c51dffe6555c234"
+    },
+    {
+      "file": "samples/8k/p257_018_noisy.wav",
+      "kind": "noisy",
+      "case": "p257_018",
+      "model_sample_rate": 8000,
+      "sample_rate": 8000,
+      "samples": 35349,
+      "sha256": "68049d5358e2a7bca27e69716d15680158b73e84cacd051710149a5745206f96",
+      "source_sha256": "c2cc60d1fcd5386cb2ed6d2801fa6855fc66fe10ca9f1d8c7772b6e01a7cae1d",
+      "float32_samples_sha256": "187ca7fd588b24f9887e702c779555849ac6c4d3701c96fd72a5d7b4bbd8df03"
+    },
+    {
+      "file": "samples/8k/p257_018_cpu.wav",
+      "kind": "cpu",
+      "case": "p257_018",
+      "model_sample_rate": 8000,
+      "sample_rate": 8000,
+      "samples": 35349,
+      "sha256": "93bd39b50df11122f5832a2fa498e35a8b41180cfbeec418c0f7438039393a0f",
+      "source_sha256": "c2cc60d1fcd5386cb2ed6d2801fa6855fc66fe10ca9f1d8c7772b6e01a7cae1d",
+      "float32_samples_sha256": "105d18acf34a7a45729f5fe2ade6cdf454d32e4fdad9f2e3767643f4963987d3"
+    },
+    {
+      "file": "samples/8k/p257_018_fpga.wav",
+      "kind": "fpga",
+      "case": "p257_018",
+      "model_sample_rate": 8000,
+      "sample_rate": 8000,
+      "samples": 35349,
+      "sha256": "839b9faf9e553f711b9ffcd1589ee7fb4c826a06559c3a50ce0a62b9f32e872d",
+      "source_sha256": "c2cc60d1fcd5386cb2ed6d2801fa6855fc66fe10ca9f1d8c7772b6e01a7cae1d",
+      "float32_samples_sha256": "50d19b0d4d11cc271be8b081a972bc12ee932657aca3bc0b9f07aa5e55ace24a"
+    },
+    {
+      "file": "samples/16k/p232_007_noisy.wav",
+      "kind": "noisy",
+      "case": "p232_007",
+      "model_sample_rate": 16000,
+      "sample_rate": 16000,
+      "samples": 63295,
+      "sha256": "a8d527101f283efe3a2c230c5ec2bb37c1e6cb98af572d3290ddfc6a9bb21bd1",
+      "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+      "float32_samples_sha256": "f52984ea1876c237c72c7851c86b5cf6984d3fda87e0186d9881fee4c310bb37"
+    },
+    {
+      "file": "samples/16k/p232_007_cpu.wav",
+      "kind": "cpu",
+      "case": "p232_007",
+      "model_sample_rate": 16000,
+      "sample_rate": 16000,
+      "samples": 63295,
+      "sha256": "c5a23be7d627b2ef793495a8a0261ba183d56c2e2e2a7ba6d5ac3e98e4eb2640",
+      "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+      "float32_samples_sha256": "a2891f29c1c8219650447c18da21eb0e753c4826c07cd53aebe339cfbc84a19d"
+    },
+    {
+      "file": "samples/16k/p232_007_fpga.wav",
+      "kind": "fpga",
+      "case": "p232_007",
+      "model_sample_rate": 16000,
+      "sample_rate": 16000,
+      "samples": 63295,
+      "sha256": "791488e23835b21e875283cace31e1a3ac17bd3d0f7db9996228b69ce012b9b3",
+      "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+      "float32_samples_sha256": "58dd12f0e2c96219ed3b90f226f1b944d023d43f39ee67a62c6f841e4cc7b9a6"
+    },
+    {
+      "file": "samples/16k/p257_018_noisy.wav",
+      "kind": "noisy",
+      "case": "p257_018",
+      "model_sample_rate": 16000,
+      "sample_rate": 16000,
+      "samples": 70698,
+      "sha256": "42981773c29ab8148c1ad332fa46e360304e1bc1270398716b870bb09caf2d3e",
+      "source_sha256": "c2cc60d1fcd5386cb2ed6d2801fa6855fc66fe10ca9f1d8c7772b6e01a7cae1d",
+      "float32_samples_sha256": "75e8826f0de6d5332907fe2f8ebf7782d993da1f8c80510ff670701332fcf5a7"
+    },
+    {
+      "file": "samples/16k/p257_018_cpu.wav",
+      "kind": "cpu",
+      "case": "p257_018",
+      "model_sample_rate": 16000,
+      "sample_rate": 16000,
+      "samples": 70698,
+      "sha256": "fe76c3eba54b4c6315d3c77917b8f326f9614442970cd1604a9d0abffb07a3b2",
+      "source_sha256": "c2cc60d1fcd5386cb2ed6d2801fa6855fc66fe10ca9f1d8c7772b6e01a7cae1d",
+      "float32_samples_sha256": "57d6d5a760623abbe58be0fa7ab9732e5663e8a6e8199390302921cd4181d847"
+    },
+    {
+      "file": "samples/16k/p257_018_fpga.wav",
+      "kind": "fpga",
+      "case": "p257_018",
+      "model_sample_rate": 16000,
+      "sample_rate": 16000,
+      "samples": 70698,
+      "sha256": "5495e214a1ae43886cd3e1dc9959422304285ff96b351b9bc423c8ef3bde0c5c",
+      "source_sha256": "c2cc60d1fcd5386cb2ed6d2801fa6855fc66fe10ca9f1d8c7772b6e01a7cae1d",
+      "float32_samples_sha256": "471552643058ee5d1ecd650ecd07dbbc75d9ebd3e2edb02ed26575aeaff5bb88"
+    }
+  ]
+}

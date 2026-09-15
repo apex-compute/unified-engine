@@ -1,0 +1,25 @@
+{
+  "scope": "three independent utterances, one resident image upload, no resets between STARTs",
+  "host_execute_s": 0.41081423399919004,
+  "fpga_cycles": 136641216,
+  "finite": true,
+  "model_upload_writes": 1,
+  "input_upload_writes": 3,
+  "program_kicks": 3,
+  "halts": 3,
+  "output_reads": 3,
+  "waveform_padding_finite": true,
+  "waveform_padding_nonzero": 0,
+  "cpu_neural_ops": 0,
+  "repeated_waveform_identical": true,
+  "repeated_tokens_identical": true,
+  "silence_finite": true,
+  "speech_tokens": [
+    7352,
+    2215
+  ],
+  "silence_tokens": [
+    2550,
+    6023
+  ]
+}

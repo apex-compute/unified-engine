@@ -17,11 +17,22 @@ Example:
     python3 read_trace.py --output trace.csv
 
 """
-import sys
+import csv
 import os
+from pathlib import Path
+import sys
 import torch
 
-from user_dma_core import UnifiedEngine, UE_TRACE_BRAM_ADDR, UE_TRACE_BRAM_DATA, UE_TRACE_SIZE
+from user_dma_core import (
+    INSTRUCTION_HALT,
+    INSTRUCTION_JUMP,
+    INSTRUCTION_SIZE_BYTES,
+    UE_PIPELINE_COUNTER_CLK_DIV,
+    UE_TRACE_BRAM_ADDR,
+    UE_TRACE_BRAM_DATA,
+    UE_TRACE_SIZE,
+    UnifiedEngine,
+)
 
 
 def read_trace(ue: UnifiedEngine, instruction_count: int = None):
@@ -36,6 +47,15 @@ def read_trace(ue: UnifiedEngine, instruction_count: int = None):
         val = ue.read_reg32(UE_TRACE_BRAM_DATA)
         trace.append(val)
     return trace
+
+
+def read_trace_addresses(ue: UnifiedEngine, addresses):
+    """Read trace BRAM slots in the requested physical order."""
+    values = []
+    for address in addresses:
+        ue.write_reg32(UE_TRACE_BRAM_ADDR, int(address))
+        values.append(ue.read_reg32(UE_TRACE_BRAM_DATA))
+    return values
 
 def _pb_encode_varint(value):
     if value < 0:
@@ -90,32 +110,63 @@ def _pf_packet(timestamp_ns=None, track_event=None, track_descriptor=None, seq_i
     return msg
 
 
-def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str):
+def decode_windows(instructions, indices, timestamps_ns):
+    """Upper-bound UE windows from decode to the next non-prefetchable decode.
+
+    Only ISA types 2 and 6 bypass engine_busy in STATE_PREFETCH_HANDLE.
+    These are not measured busy intervals: fetch/dispatch overhead is included.
+    None means the completion boundary is outside the retained trace.
+    """
+    boundary = None
+    ends = [None] * len(indices)
+    for row in range(len(indices)-1, -1, -1):
+        ends[row] = boundary
+        kind = (int(instructions[indices[row]].words[0]) >> 8) & 15
+        if kind not in (2, 6):
+            boundary = timestamps_ns[row]
+    return ends
+
+
+def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str,
+                   *, instructions=None, instruction_indices=None,
+                   program_dram_addr=None, timestamp_offset_ns=0,
+                   event_prefix="", include_queue_loading=True,
+                   instruction_labels=None):
     import io
     import contextlib
     events = []
 
     clock_period_ns = ue._clock_period_ns
 
-    # Get captured instructions (must be present in memory)
-    insts = ue.get_captured_instructions()
+    # Legacy callers decode the in-memory capture. Precompiled callers supply
+    # the instructions recovered from their deployment artifact.
+    insts = (list(instructions) if instructions is not None
+             else ue.get_captured_instructions())
     if not insts:
-        print("No captured instructions found in `ue.capture_buffer`. Run capture before decoding.")
+        print("No instructions are available for trace decoding.")
         return False
 
-    n = min(len(trace_values), len(insts))
+    indices = (list(instruction_indices) if instruction_indices is not None
+               else list(range(len(trace_values))))
+    n = min(len(trace_values), len(indices))
+    if any(index < 0 or index >= len(insts) for index in indices[:n]):
+        raise ValueError("trace instruction index is outside the program")
     # Precompute timestamps in integer nanoseconds first. Perfetto internally
     # quantizes to ns; deriving ts/dur from the same ns grid avoids visual
     # 1ns gaps caused by float rounding.
     timestamps_ns = []
     for i in range(n):
         counter = trace_values[i]
-        ts_ns = int(round(counter * clock_period_ns))
+        ts_ns = int(round(
+            counter * UE_PIPELINE_COUNTER_CLK_DIV * clock_period_ns))
         timestamps_ns.append(ts_ns)
 
     # Print confirmation of conversion
     preview = [(trace_values[i], timestamps_ns[i] / 1000.0) for i in range(min(3, n))]
-    print(f"Using clock period = {clock_period_ns:.6f} ns -> timestamps in microseconds. Example: cycle->us for first entries: {preview}")
+    print(
+        f"Using clock period = {clock_period_ns:.6f} ns and trace divider "
+        f"{UE_PIPELINE_COUNTER_CLK_DIV} -> timestamps in microseconds. "
+        f"Example counter->us values: {preview}")
 
     # Keep absolute timestamps (do not rebase to 0). This preserves the
     # original hardware timebase even when earlier textual rows are skipped.
@@ -130,10 +181,10 @@ def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str):
         "HALT":        4,
     }
     TRACK_LABELS = {
-        0: "1-QUEUE",
-        1: "2-DMA_FROM_DRAM",
-        2: "4-DMA_TO_DRAM",
-        3: "3-COMPUTE",
+        0: "1-DECODE_GAPS (not execution time)",
+        1: "2-DMA_FROM_DRAM (inferred window)",
+        2: "4-DMA_TO_DRAM (inferred window)",
+        3: "3-COMPUTE (inferred window)",
         4: "5-HALT",
     }
 
@@ -154,11 +205,12 @@ def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str):
         return [0]
 
     collected = []
+    window_ends = decode_windows(insts, indices[:n], timestamps_ns)
 
     first_ts_ns = max(0, timestamps_ns[0])
-    if first_ts_ns > 0:
+    if first_ts_ns > 0 and include_queue_loading:
         collected.append({
-            "name": "UE_QUEUE_LOADING",
+            "name": "BEFORE_FIRST_DECODE (not measured queue busy)",
             "track": 0,
             "ts_ns": 0,
             "dur_ns": first_ts_ns,
@@ -171,19 +223,27 @@ def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str):
 
         is_last = (i == n - 1)
         if is_last:
-            dur_ns = int(round(clock_period_ns))
+            dur_ns = 0
         elif i < n - 1:
             dur_ns = max(0, timestamps_ns[i+1] - timestamps_ns[i])
         else:
             dur_ns = 0
 
+        static_index = indices[i]
+        instruction_address = (
+            (ue.get_program_dram_addr()
+             if program_dram_addr is None
+             and hasattr(ue, "get_program_dram_addr")
+             else (program_dram_addr or 0))
+            + static_index * INSTRUCTION_SIZE_BYTES)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             try:
-                ue.parse_instruction(insts[i], i, ue.get_program_dram_addr() if hasattr(ue, 'get_program_dram_addr') else 0)
+                ue.parse_instruction(
+                    insts[static_index], static_index, instruction_address)
             except Exception:
                 try:
-                    ue.parse_instruction(insts[i], i, 0)
+                    ue.parse_instruction(insts[static_index], static_index, 0)
                 except Exception:
                     pass
         parsed = buf.getvalue().splitlines()
@@ -191,7 +251,7 @@ def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str):
         hexdump = None
         detail_lines = []
         for line in parsed:
-            s = line.rstrip()
+            s = line.strip()
             if not s:
                 continue
             if hexdump is None and s.startswith('[') and '=' in s and '0x' in s:
@@ -204,8 +264,9 @@ def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str):
         if detail_lines:
             mnemonic = None
             for dl in detail_lines:
-                if re.match(r"^[A-Z][A-Z0-9_ ()-]+$", dl):
-                    mnemonic = dl
+                match = re.match(r"^((?:UE_|ISA_)[A-Z0-9_]+|PBI_SET)(?:\s+\([^)]*\))?", dl)
+                if match:
+                    mnemonic = match.group(0)
                     break
             if mnemonic:
                 token = mnemonic.strip()
@@ -225,14 +286,23 @@ def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str):
         else:
             name = f"inst_{i}"
 
-        if is_last:
+        instruction_type = (int(insts[static_index].words[0]) >> 8) & 0xF
+        if instruction_type == INSTRUCTION_HALT:
             name = "UE_HALT_INST"
+        if instruction_labels is not None:
+            layer_label = instruction_labels[static_index]
+        else:
+            layer_label = ''
 
         args = {
-            "index": i,
+            "trace_row": i,
+            "instruction_index": static_index,
+            "instruction_address": instruction_address,
             "counter": counter,
             "hexdump": hexdump if hexdump is not None else "",
             "decoded_text": "\n".join(detail_lines),
+            "timing_semantics": "adjacent decode gap; NOT instruction execution duration",
+            "layer": layer_label,
         }
         for dl in detail_lines[1:]:
             if ':' in dl:
@@ -265,18 +335,33 @@ def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str):
             suffix = paren.group(1) if paren else mt
             name = f"{name} ({suffix})"
 
-        for track_id in _pick_tracks(name):
+        # Raw decode gaps always live on a separate track. A prefetched ISA
+        # instruction can hold almost the entire wait for a preceding CONV.
+        display_name = (layer_label + ': ' if layer_label else '') + name
+        collected.append(dict(name=display_name + ' [decode gap]', track=0,
+                              ts_ns=ts_ns, dur_ns=dur_ns, args=args))
+        tracks = _pick_tracks(name, args) if instruction_type in (0, 5, 9) else []
+        end = window_ends[i]
+        for track_id in tracks:
+            if track_id == 0:
+                continue
+            inferred_args = dict(args, timing_semantics=(
+                'decode instant' if instruction_type == INSTRUCTION_HALT else
+                'inferred decode-to-next-nonprefetch-decode window; includes overhead, not measured busy'),
+                completion_boundary_present=end is not None)
             collected.append({
-                "name": name,
+                "name": display_name,
                 "track": track_id,
                 "ts_ns": ts_ns,
-                "dur_ns": dur_ns,
-                "args": args,
+                "dur_ns": max(0, end-ts_ns) if end is not None and instruction_type != INSTRUCTION_HALT else 0,
+                "args": inferred_args,
             })
 
     # --- Generate native Perfetto protobuf trace (.pftrace) ---
     TRACK_UUIDS = {tid: 1000 + tid for tid in TRACK_LABELS}
-    trace_bytes = b''
+    # Avoid quadratic copying when a large whole-graph tail produces tens
+    # of thousands of packets (raw decode + inferred compute/DMA tracks).
+    trace_bytes = bytearray()
 
     for tid, label in TRACK_LABELS.items():
         td = _pf_track_descriptor(TRACK_UUIDS[tid], label)
@@ -287,12 +372,12 @@ def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str):
         uuid = TRACK_UUIDS[ev['track']]
         annotations = [_pf_debug_annotation(k, v) for k, v in ev['args'].items()]
 
-        te = _pf_track_event_begin(uuid, ev['name'], annotations)
-        pkt = _pf_packet(timestamp_ns=ev['ts_ns'], track_event=te)
+        te = _pf_track_event_begin(uuid, event_prefix + ev['name'], annotations)
+        pkt = _pf_packet(timestamp_ns=timestamp_offset_ns + ev['ts_ns'], track_event=te)
         trace_bytes += _pb_field_bytes(1, pkt)
 
         te = _pf_track_event_end(uuid)
-        pkt = _pf_packet(timestamp_ns=ev['ts_ns'] + ev['dur_ns'], track_event=te)
+        pkt = _pf_packet(timestamp_ns=timestamp_offset_ns + ev['ts_ns'] + ev['dur_ns'], track_event=te)
         trace_bytes += _pb_field_bytes(1, pkt)
 
     try:
@@ -303,6 +388,72 @@ def build_perfetto(trace_values: list[int], ue: UnifiedEngine, out_path: str):
     except OSError as e:
         print(f"Failed to write Perfetto trace: {e}")
         return False
+
+
+def generate_circular_tail_trace(ue: UnifiedEngine,
+                                 file_path: str | Path, *,
+                                 instructions, program_dram_addr: int,
+                                 instruction_labels=None):
+    """Export the chronological tail of one linear, HALT-terminated run."""
+    insts = list(instructions)
+    instruction_types = [
+        (int(instruction.words[0]) >> 8) & 0xF for instruction in insts]
+    halt_positions = [
+        index for index, value in enumerate(instruction_types)
+        if value == INSTRUCTION_HALT]
+    if len(halt_positions) != 1:
+        raise RuntimeError("trace export requires exactly one HALT")
+    halt_index = halt_positions[0]
+    if INSTRUCTION_JUMP in instruction_types[:halt_index]:
+        raise RuntimeError(
+            "tail trace decoding does not support control-flow instructions")
+
+    executed_events = halt_index + 1
+    retained_events = min(executed_events, UE_TRACE_SIZE)
+    write_pointer = int(ue.read_reg32(UE_TRACE_BRAM_ADDR))
+    expected_pointer = executed_events % UE_TRACE_SIZE
+    if write_pointer != expected_pointer:
+        raise RuntimeError(
+            "trace write pointer does not match the whole-graph program: "
+            f"read {write_pointer}, expected {expected_pointer} after "
+            f"{executed_events} decode events")
+
+    if executed_events < UE_TRACE_SIZE:
+        physical_addresses = list(range(retained_events))
+    else:
+        physical_addresses = (
+            list(range(write_pointer, UE_TRACE_SIZE))
+            + list(range(write_pointer)))
+    instruction_indices = list(range(
+        executed_events - retained_events, executed_events))
+    trace_values = read_trace_addresses(ue, physical_addresses)
+
+    csv_path = Path(file_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("trace_row", "physical_address",
+                         "instruction_index", "counter"))
+        writer.writerows(zip(range(retained_events), physical_addresses,
+                             instruction_indices, trace_values))
+
+    perfetto_path = csv_path.with_name(csv_path.stem + "_perfetto.pftrace")
+    if not build_perfetto(
+            trace_values, ue, str(perfetto_path), instructions=insts,
+            instruction_indices=instruction_indices,
+            instruction_labels=instruction_labels,
+            include_queue_loading=executed_events == retained_events,
+            program_dram_addr=int(program_dram_addr)):
+        raise RuntimeError("Perfetto tail trace generation failed")
+    return {
+        "csv": str(csv_path.resolve()),
+        "perfetto": str(perfetto_path.resolve()),
+        "retained_events": retained_events,
+        "executed_events": executed_events,
+        "write_pointer": write_pointer,
+        "first_instruction_index": instruction_indices[0],
+        "last_instruction_index": instruction_indices[-1],
+    }
 
 
 def generate_trace(ue: UnifiedEngine, file_path: str):

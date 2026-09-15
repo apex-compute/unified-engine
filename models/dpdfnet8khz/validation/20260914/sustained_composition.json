@@ -1,0 +1,206 @@
+{
+  "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_df0749de/sustained_cpu/sustained60.wav",
+  "sha256": "f62b7c35620a298fef6205332ca68238ec579505a8f4626788f79d79e0aa41ec",
+  "sample_rate": 8000,
+  "samples": 480000,
+  "duration_s": 60.0,
+  "format": "WAV FLOAT",
+  "gain_or_normalization": false,
+  "composition": "Alternate p232_007 and p257_018 in source order with 0.25-second exact-zero gaps; only final clip trimmed to exactly 60 seconds.",
+  "segments": [
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p232_007_noisy8k.wav",
+      "source_sha256": "d3c6531d4a3eaf8d02c45d86bd9860a27b22112b5cae08b92645bc996ce9538b",
+      "source_samples": 31648,
+      "start_sample": 0,
+      "samples": 31648,
+      "complete_clip": true
+    },
+    {
+      "kind": "exact_zero_silence",
+      "start_sample": 31648,
+      "samples": 2000
+    },
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p257_018_noisy8k.wav",
+      "source_sha256": "3f197727de68daf06cb88c751268718d964e571679997fd229bd4de7940edb52",
+      "source_samples": 35349,
+      "start_sample": 33648,
+      "samples": 35349,
+      "complete_clip": true
+    },
+    {
+      "kind": "exact_zero_silence",
+      "start_sample": 68997,
+      "samples": 2000
+    },
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p232_007_noisy8k.wav",
+      "source_sha256": "d3c6531d4a3eaf8d02c45d86bd9860a27b22112b5cae08b92645bc996ce9538b",
+      "source_samples": 31648,
+      "start_sample": 70997,
+      "samples": 31648,
+      "complete_clip": true
+    },
+    {
+      "kind": "exact_zero_silence",
+      "start_sample": 102645,
+      "samples": 2000
+    },
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p257_018_noisy8k.wav",
+      "source_sha256": "3f197727de68daf06cb88c751268718d964e571679997fd229bd4de7940edb52",
+      "source_samples": 35349,
+      "start_sample": 104645,
+      "samples": 35349,
+      "complete_clip": true
+    },
+    {
+      "kind": "exact_zero_silence",
+      "start_sample": 139994,
+      "samples": 2000
+    },
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p232_007_noisy8k.wav",
+      "source_sha256": "d3c6531d4a3eaf8d02c45d86bd9860a27b22112b5cae08b92645bc996ce9538b",
+      "source_samples": 31648,
+      "start_sample": 141994,
+      "samples": 31648,
+      "complete_clip": true
+    },
+    {
+      "kind": "exact_zero_silence",
+      "start_sample": 173642,
+      "samples": 2000
+    },
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p257_018_noisy8k.wav",
+      "source_sha256": "3f197727de68daf06cb88c751268718d964e571679997fd229bd4de7940edb52",
+      "source_samples": 35349,
+      "start_sample": 175642,
+      "samples": 35349,
+      "complete_clip": true
+    },
+    {
+      "kind": "exact_zero_silence",
+      "start_sample": 210991,
+      "samples": 2000
+    },
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p232_007_noisy8k.wav",
+      "source_sha256": "d3c6531d4a3eaf8d02c45d86bd9860a27b22112b5cae08b92645bc996ce9538b",
+      "source_samples": 31648,
+      "start_sample": 212991,
+      "samples": 31648,
+      "complete_clip": true
+    },
+    {
+      "kind": "exact_zero_silence",
+      "start_sample": 244639,
+      "samples": 2000
+    },
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p257_018_noisy8k.wav",
+      "source_sha256": "3f197727de68daf06cb88c751268718d964e571679997fd229bd4de7940edb52",
+      "source_samples": 35349,
+      "start_sample": 246639,
+      "samples": 35349,
+      "complete_clip": true
+    },
+    {
+      "kind": "exact_zero_silence",
+      "start_sample": 281988,
+      "samples": 2000
+    },
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p232_007_noisy8k.wav",
+      "source_sha256": "d3c6531d4a3eaf8d02c45d86bd9860a27b22112b5cae08b92645bc996ce9538b",
+      "source_samples": 31648,
+      "start_sample": 283988,
+      "samples": 31648,
+      "complete_clip": true
+    },
+    {
+      "kind": "exact_zero_silence",
+      "start_sample": 315636,
+      "samples": 2000
+    },
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p257_018_noisy8k.wav",
+      "source_sha256": "3f197727de68daf06cb88c751268718d964e571679997fd229bd4de7940edb52",
+      "source_samples": 35349,
+      "start_sample": 317636,
+      "samples": 35349,
+      "complete_clip": true
+    },
+    {
+      "kind": "exact_zero_silence",
+      "start_sample": 352985,
+      "samples": 2000
+    },
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p232_007_noisy8k.wav",
+      "source_sha256": "d3c6531d4a3eaf8d02c45d86bd9860a27b22112b5cae08b92645bc996ce9538b",
+      "source_samples": 31648,
+      "start_sample": 354985,
+      "samples": 31648,
+      "complete_clip": true
+    },
+    {
+      "kind": "exact_zero_silence",
+      "start_sample": 386633,
+      "samples": 2000
+    },
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p257_018_noisy8k.wav",
+      "source_sha256": "3f197727de68daf06cb88c751268718d964e571679997fd229bd4de7940edb52",
+      "source_samples": 35349,
+      "start_sample": 388633,
+      "samples": 35349,
+      "complete_clip": true
+    },
+    {
+      "kind": "exact_zero_silence",
+      "start_sample": 423982,
+      "samples": 2000
+    },
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p232_007_noisy8k.wav",
+      "source_sha256": "d3c6531d4a3eaf8d02c45d86bd9860a27b22112b5cae08b92645bc996ce9538b",
+      "source_samples": 31648,
+      "start_sample": 425982,
+      "samples": 31648,
+      "complete_clip": true
+    },
+    {
+      "kind": "exact_zero_silence",
+      "start_sample": 457630,
+      "samples": 2000
+    },
+    {
+      "kind": "noisy_audio",
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/p257_018_noisy8k.wav",
+      "source_sha256": "3f197727de68daf06cb88c751268718d964e571679997fd229bd4de7940edb52",
+      "source_samples": 35349,
+      "start_sample": 459630,
+      "samples": 20370,
+      "complete_clip": false
+    }
+  ],
+  "complete_clips": 13,
+  "peak_abs": 0.506539523601532,
+  "finite": true
+}

@@ -1,0 +1,20 @@
+{
+  "date_utc": "2026-09-14T18:41:27.550702+00:00",
+  "scope": "read-only hardware readiness check; no candidate executed",
+  "device": "/dev/xdma0_user",
+  "registers": {
+    "version": "0xffffffff",
+    "hardware_info": "0xffffffff"
+  },
+  "earlier_this_session": {
+    "version": "0x364c8440",
+    "hardware_info": "0xdeadbeef"
+  },
+  "pci_command_readback": "0x0000; memory decoding and bus mastering disabled",
+  "required_state": "compatible RK AXI256 image and working PCIe memory decoding",
+  "baseline_version": "0xdf0749de",
+  "baseline_hardware_info": "0x80214d40",
+  "saved_baseline_image_sha256": "c55a1136dcabcef519242368c69ef68fb78c282e4ebefbc8e5d03038fddeb11c",
+  "new_fpga_rtf": null,
+  "rtf_4_to_5_verified": false
+}

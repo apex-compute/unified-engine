@@ -1,0 +1,55 @@
+
+****** Vivado v2024.2 (64-bit)
+  **** SW Build 5239630 on Fri Nov 08 22:34:34 MST 2024
+  **** IP Build 5239520 on Sun Nov 10 16:12:51 MST 2024
+  **** SharedData Build 5239561 on Fri Nov 08 14:39:27 MST 2024
+  **** Start of session at: Mon Sep 14 18:23:21 2026
+    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+    ** Copyright 2022-2024 Advanced Micro Devices, Inc. All Rights Reserved.
+
+source /tmp/dpdfnet_restore_df0749de.tcl
+# set bitfile "/home/hunlu/apexcompute/andromeda/pcie_utils/andromeda_pcie_bit-df0749de3d4787b51a86a4d0a235e819a6fb52b7/andromeda_wrapper.bit"
+# open_hw_manager
+# connect_hw_server -url localhost:3121
+INFO: [Labtools 27-2285] Connecting to hw_server url TCP:localhost:3121
+INFO: [Labtools 27-2222] Launching hw_server...
+INFO: [Labtools 27-2221] Launch Output:
+
+****** Xilinx hw_server v2024.2
+  **** Build date : Oct 29 2024 at 10:16:47
+    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+
+
+INFO: [Labtools 27-3415] Connecting to cs_server url TCP:localhost:0
+INFO: [Labtools 27-3417] Launching cs_server...
+INFO: [Labtools 27-2221] Launch Output:
+
+
+******** Xilinx cs_server v2024.2.0
+  ****** Build date   : Oct 30 2024-18:19:07
+    **** Build number : 2024.2.1730312347
+      ** Copyright 2017-2022 Xilinx, Inc. All Rights Reserved.
+      ** Copyright 2022-2026 Advanced Micro Devices, Inc. All Rights Reserved.
+
+
+
+# set targets [get_hw_targets *0ABC01A]
+# if {[llength $targets] != 1} { error "Expected one known RK JTAG target 0ABC01A" }
+# open_hw_target [lindex $targets 0]
+INFO: [Labtoolstcl 44-466] Opening hw_target localhost:3121/xilinx_tcf/Xilinx/0ABC01A
+# set devices [get_hw_devices -filter {PART =~ xcku5p*}]
+# if {[llength $devices] != 1} { error "Expected exactly one KU5P device" }
+# current_hw_device [lindex $devices 0]
+# puts "RESTORE_DEVICE [current_hw_device] PART [get_property PART [current_hw_device]]"
+RESTORE_DEVICE xcku5p_0 PART xcku5p
+# set_property PROGRAM.FILE $bitfile [current_hw_device]
+# program_hw_devices [current_hw_device]
+INFO: [Labtools 27-3164] End of startup status: HIGH
+program_hw_devices: Time (s): cpu = 00:00:07 ; elapsed = 00:00:07 . Memory (MB): peak = 1553.062 ; gain = 0.000 ; free physical = 88482 ; free virtual = 102047
+# puts "DPDFNET_RESTORE_SUCCESS"
+DPDFNET_RESTORE_SUCCESS
+# close_hw_target
+INFO: [Labtoolstcl 44-464] Closing hw_target localhost:3121/xilinx_tcf/Xilinx/0ABC01A
+# disconnect_hw_server
+# close_hw_manager
+INFO: [Common 17-206] Exiting Vivado at Mon Sep 14 18:23:35 2026...

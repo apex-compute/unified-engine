@@ -1,0 +1,44 @@
+{
+  "validated": "models/bigcodec/bigcodec_bin/bigcodec-p232_007-bf16-tap-andromeda.bin",
+  "sha256": "7a30dc631cf4afea45022629ddf1e402f474cd87a709043ebe67f9a7c9378afa",
+  "native_samples": 63295,
+  "compiled_samples": 63400,
+  "tokens": 317,
+  "instructions": 5173150,
+  "parameters": 324165504,
+  "program_bytes": 165540800,
+  "resident_bytes": 489706304,
+  "serialized_bytes": 489746351,
+  "scratch_bytes": 73036800,
+  "tensor_end": 3066443392,
+  "precision": {
+    "convolutions": "BF16",
+    "lstm_and_activations": "BF16"
+  },
+  "approximation": {
+    "snake_argument_clamp": 100.53096491487338,
+    "snake_sine_squared_polynomial_degree": 10,
+    "snake_storage": "BF16",
+    "alias_free_filters": "symmetric BF16, exact unit DC, nearest L2 within +/-2 ULP",
+    "broadcast_scalars": "BF16 round-to-nearest-even before device encoding",
+    "tanh": "BF16 odd Pade [7/6] with native reciprocal",
+    "tanh_argument_clamp": 4.0,
+    "tanh_output_clamp": [
+      -1,
+      1
+    ],
+    "quantizer": "BF16 nearest normalized-codebook tournament",
+    "accuracy_status": "requires comparison with the official CPU model"
+  },
+  "model_sha256": "162e05fafe76bd73b1658fa2f31bd8236602a9553aaab765027d7b394d4cc43a",
+  "program_sha256": "f56723ef3c91009c51e0541a7690c4b9377546f2a538718d9e611182d7ec3cd5",
+  "instructions_by_type": {
+    "conv1d": 2028360,
+    "activation": 876927,
+    "add": 1464,
+    "lstm": 892276,
+    "quantizer": 849263,
+    "conv_transpose1d": 149390,
+    "tanh": 375469
+  }
+}

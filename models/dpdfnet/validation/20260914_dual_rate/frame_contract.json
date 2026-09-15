@@ -1,0 +1,174 @@
+{
+  "benchmark": false,
+  "method": "observed driver API DMA/start calls and HALT/queue registers",
+  "input": "/home/hunlu/apexcompute/unified-engine/test_samples/p232_007.wav",
+  "input_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+  "axi_data_width_bits": 256,
+  "detected_clock_ns": 3.000750187546887,
+  "models": [
+    {
+      "model": "dpdfnet2_8khz",
+      "bin": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz-andromeda.bin",
+      "bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+      "hardware_version": "0xdf0749de",
+      "sample_rate": 8000,
+      "new_samples_per_hop": 80,
+      "hop_ms": 10,
+      "input_boundary": "host STFT spectrum, padded BF16",
+      "output_boundary": "enhanced spectrum, host iSTFT follows",
+      "graph_nodes": 492,
+      "validated_single_terminal_halt_no_swi": true,
+      "initial_model_uploads": 1,
+      "audited_frames": 2,
+      "program_and_parameter_uploads_per_frame": 0,
+      "intermediate_host_dram_transfers": 0,
+      "resident_image_bytes": 23594048,
+      "program_bytes": 867776,
+      "parameter_data_bytes": 22726272,
+      "state_resident": true,
+      "passed": true,
+      "events": [
+        {
+          "phase": "model_upload",
+          "kind": "dram_write",
+          "address": "0x90000000",
+          "bytes": 23594048,
+          "transferred": 23594048,
+          "sha256": "a0940e29d81aedc1860f20ddd60b630f3241e81c0064a4c3877ee861c7d3627f"
+        },
+        {
+          "phase": "frame_0",
+          "kind": "dram_write",
+          "address": "0x80000000",
+          "bytes": 10368,
+          "transferred": 10368
+        },
+        {
+          "phase": "frame_0",
+          "kind": "start",
+          "program_address": "0x915ac680"
+        },
+        {
+          "phase": "frame_0",
+          "kind": "halt_observed",
+          "interrupt_cause": 2,
+          "queue_busy": false
+        },
+        {
+          "phase": "frame_0",
+          "kind": "dram_read",
+          "address": "0xb03d9900",
+          "bytes": 10368,
+          "transferred": 10368
+        },
+        {
+          "phase": "frame_1",
+          "kind": "dram_write",
+          "address": "0x80000000",
+          "bytes": 10368,
+          "transferred": 10368
+        },
+        {
+          "phase": "frame_1",
+          "kind": "start",
+          "program_address": "0x915ac680"
+        },
+        {
+          "phase": "frame_1",
+          "kind": "halt_observed",
+          "interrupt_cause": 2,
+          "queue_busy": false
+        },
+        {
+          "phase": "frame_1",
+          "kind": "dram_read",
+          "address": "0xb03d9900",
+          "bytes": 10368,
+          "transferred": 10368
+        }
+      ]
+    },
+    {
+      "model": "dpdfnet2",
+      "bin": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/dpdfnet2-andromeda.bin",
+      "bin_sha256": "4f540ae650c27d822f4da24cfb0a0ac7f9cf33e53e84cbd9ce2fc7f1cdd5fc77",
+      "hardware_version": "0xdf0749de",
+      "sample_rate": 16000,
+      "new_samples_per_hop": 160,
+      "hop_ms": 10,
+      "input_boundary": "host STFT spectrum, padded BF16",
+      "output_boundary": "enhanced spectrum, host iSTFT follows",
+      "graph_nodes": 472,
+      "validated_single_terminal_halt_no_swi": true,
+      "initial_model_uploads": 1,
+      "audited_frames": 2,
+      "program_and_parameter_uploads_per_frame": 0,
+      "intermediate_host_dram_transfers": 0,
+      "resident_image_bytes": 17863808,
+      "program_bytes": 1288448,
+      "parameter_data_bytes": 16575360,
+      "state_resident": true,
+      "passed": true,
+      "events": [
+        {
+          "phase": "model_upload",
+          "kind": "dram_write",
+          "address": "0x90000000",
+          "bytes": 17863808,
+          "transferred": 17863808,
+          "sha256": "c997284c3c8ef0a4a82078b3abaf2fa6d33754640b18c061845bf68ee958b59d"
+        },
+        {
+          "phase": "frame_0",
+          "kind": "dram_write",
+          "address": "0x80000000",
+          "bytes": 20608,
+          "transferred": 20608
+        },
+        {
+          "phase": "frame_0",
+          "kind": "start",
+          "program_address": "0x90fceb80"
+        },
+        {
+          "phase": "frame_0",
+          "kind": "halt_observed",
+          "interrupt_cause": 2,
+          "queue_busy": false
+        },
+        {
+          "phase": "frame_0",
+          "kind": "dram_read",
+          "address": "0xb0406980",
+          "bytes": 20608,
+          "transferred": 20608
+        },
+        {
+          "phase": "frame_1",
+          "kind": "dram_write",
+          "address": "0x80000000",
+          "bytes": 20608,
+          "transferred": 20608
+        },
+        {
+          "phase": "frame_1",
+          "kind": "start",
+          "program_address": "0x90fceb80"
+        },
+        {
+          "phase": "frame_1",
+          "kind": "halt_observed",
+          "interrupt_cause": 2,
+          "queue_busy": false
+        },
+        {
+          "phase": "frame_1",
+          "kind": "dram_read",
+          "address": "0xb0406980",
+          "bytes": 20608,
+          "transferred": 20608
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,263 @@
+{
+  "format": "bigcodec-bus-pilot-error-decomposition-v1",
+  "status": "complete_single_case",
+  "selected_for_full_batch": "decoder_scope",
+  "scope": "Actual saved FPGA WAVs and tokens; official FP32 same-token decoding. One complete23.68225s utterance, no segmentation, alignment, gain or polarity fitting. No hardware execution.",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "source_audio_sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+  "source_samples": 378916,
+  "sample_rate": 16000,
+  "duration_s": 23.68225,
+  "frames": 1895,
+  "cpu_core": 7,
+  "threads": 1,
+  "torch_version": "2.12.0.dev20260405+cu128",
+  "reference": {
+    "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+    "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+    "bytes": 1515744
+  },
+  "official_tokens": {
+    "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz",
+    "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+    "bytes": 4178
+  },
+  "definitions": {
+    "token_error": "CPU(FPGA token IDs) - frozen official CPU reconstruction",
+    "decoder_error": "recorded FPGA waveform - CPU(the same FPGA token IDs)",
+    "total_error": "recorded FPGA waveform - frozen official CPU reconstruction",
+    "normalization": "Total and token-only relativeL2 use frozen official CPU energy; conditional decoder relativeL2 uses same-token CPU energy. Common-reference decoder normalization is also included.",
+    "identity": "||total||2^2 = ||token_error||2^2 + ||decoder_error||2^2 + 2*dot(token_error, decoder_error)"
+  },
+  "limitations": [
+    "Conditional decoder inputs differ between variants because their token sequences differ. This is not a same-input decoder comparison across variants.",
+    "This is one bus case, and selection does not establish improvement across the full batch or undo the documented short-clip regression."
+  ],
+  "variants": [
+    {
+      "name": "old_baseline",
+      "tokens_matching_official": 1714,
+      "frames": 1895,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.2809025853262052,
+        "token_only_cpu_vs_official_l2": 0.2966529095588056,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.05734735448968282,
+        "decoder_error_relative_to_official_energy": 0.05648146709901383,
+        "reference_energy": 1854.575545013583,
+        "same_token_cpu_energy": 1798.9938985205097,
+        "full_error_energy": 146.33762467511139,
+        "token_error_energy": 163.20811664028636,
+        "decoder_error_energy": 5.916385535418717,
+        "two_error_cross_term": -22.786877500593693,
+        "two_error_cross_term_relative_to_reference_energy": -0.012286842432415877,
+        "token_decoder_error_cosine": -0.366653396160995,
+        "error_interaction": "cancellation",
+        "fraction_of_component_energy_cancelled": 0.13473433599183746,
+        "scalar_identity_residual": 0.0,
+        "vector_identity_max_abs_residual": 0.0,
+        "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+      },
+      "cpu_decode_s": 28.485194975000923,
+      "cpu_decode_rtf": 1.2028077980344318,
+      "fpga_audio_processing_s": 113.59055456100214,
+      "fpga_rtf": 4.796442675886039,
+      "files": {
+        "fpga_wav": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus.wav",
+          "sha256": "bff0a4e91d8d1f7520a4d2dec2821ac3dd52d76d9c2ddd9fc472f129ad16e21f",
+          "bytes": 1515744
+        },
+        "actual_tokens": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus.tokens.npz",
+          "sha256": "75fefe9df0f99df2bb734d1c44228492cd762ed89703cf904afe5176a715bb99",
+          "bytes": 4179
+        },
+        "same_token_cpu_wav": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition/old_baseline_same_tokens_cpu.wav",
+          "sha256": "928c50eea7241e22d5751e8e1541b2bb99c28418bb0426c9550c04946a7b5560",
+          "bytes": 1515744
+        },
+        "fpga_metrics": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus.metrics.json",
+          "sha256": "9eed59398f8d74d32333cafbb7f5821b094db597bf1eee84434e4f4266e64f1b",
+          "bytes": 2839
+        },
+        "fpga_comparison": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_noisy20s/fpga_bf16/bus.comparison.json",
+          "sha256": "43f8c4c2775514d6b7665303a3e5a9ab087a0b5a306365faab6917db616351d4",
+          "bytes": 1699
+        }
+      }
+    },
+    {
+      "name": "both_scope",
+      "tokens_matching_official": 1725,
+      "frames": 1895,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.24707523478455173,
+        "token_only_cpu_vs_official_l2": 0.23253765852222974,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.04963602146579806,
+        "decoder_error_relative_to_official_energy": 0.04876159483687453,
+        "reference_energy": 1854.575545013583,
+        "same_token_cpu_energy": 1789.8078332480472,
+        "full_error_energy": 113.21473704736982,
+        "token_error_energy": 100.28387780232403,
+        "decoder_error_energy": 4.409611534365232,
+        "two_error_cross_term": 8.521247710680587,
+        "two_error_cross_term_relative_to_reference_energy": 0.004594715881804738,
+        "token_decoder_error_cosine": 0.20260841039039035,
+        "error_interaction": "reinforcement",
+        "fraction_of_component_energy_cancelled": -0.08139233647353812,
+        "scalar_identity_residual": -1.4210854715202004e-14,
+        "vector_identity_max_abs_residual": 0.0,
+        "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+      },
+      "cpu_decode_s": 28.011538265000127,
+      "cpu_decode_rtf": 1.1828073035712454,
+      "fpga_audio_processing_s": 114.87570308299837,
+      "fpga_rtf": 4.85070899441558,
+      "files": {
+        "fpga_wav": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/fpga_bf16/bus.wav",
+          "sha256": "064dd52b2bd56286bb90061e534e9e13809f73d76019a81eca7220e2969e02e5",
+          "bytes": 1515744
+        },
+        "actual_tokens": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/fpga_bf16/bus.tokens.npz",
+          "sha256": "0d1e7448f29121348ea730a3807c0c410ee1edaa5f282406fb10f79a1afccd25",
+          "bytes": 4185
+        },
+        "same_token_cpu_wav": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition/new_candidate_same_tokens_cpu.wav",
+          "sha256": "726ac17120565876c43b1275140cac0ef90b648949f91a62e63ee696c810d5fc",
+          "bytes": 1515744
+        },
+        "fpga_metrics": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/fpga_bf16/bus.metrics.json",
+          "sha256": "3c5938bead67950ae8063d3b77d74ee4534e7a934c40d15b82d9f95759d8362b",
+          "bytes": 3373
+        },
+        "fpga_comparison": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/fpga_bf16/bus.comparison.json",
+          "sha256": "a82e3665046c9f5e3080449b3b675ee24fe60e99e98b31ca31772b4a2791a612",
+          "bytes": 1701
+        }
+      }
+    },
+    {
+      "name": "decoder_scope",
+      "tokens_matching_official": 1736,
+      "frames": 1895,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.2055055276659087,
+        "token_only_cpu_vs_official_l2": 0.19566882200325023,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.04628410070736978,
+        "decoder_error_relative_to_official_energy": 0.045888051719590386,
+        "reference_energy": 1854.575545013583,
+        "same_token_cpu_energy": 1822.9724580646744,
+        "full_error_energy": 78.32340232229689,
+        "token_error_energy": 71.00481325636669,
+        "decoder_error_energy": 3.9052043735935644,
+        "two_error_cross_term": 3.413384692336638,
+        "two_error_cross_term_relative_to_reference_energy": 0.0018405207064841557,
+        "token_decoder_error_cosine": 0.10249188073884143,
+        "error_interaction": "reinforcement",
+        "fraction_of_component_energy_cancelled": -0.04556646494462251,
+        "scalar_identity_residual": 0.0,
+        "vector_identity_max_abs_residual": 0.0,
+        "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+      },
+      "cpu_decode_s": 27.861222240000643,
+      "cpu_decode_rtf": 1.176460101552878,
+      "fpga_audio_processing_s": 114.24210366599436,
+      "fpga_rtf": 4.823954804378569,
+      "files": {
+        "fpga_wav": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.wav",
+          "sha256": "2cdb24367220760833115a108983cc9315eb12fdf16ecd03e9026e877dd904cb",
+          "bytes": 1515744
+        },
+        "actual_tokens": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.tokens.npz",
+          "sha256": "3a419e9624d515598da2f88fd834d7f88db17e2e6efb151f9db8ed4aa0fe99b5",
+          "bytes": 4183
+        },
+        "same_token_cpu_wav": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition/decoder_scope_same_tokens_cpu.wav",
+          "sha256": "1327256dc183bb2b289052574c91572e67b4e8c0151999b92689b66a14ca7e9f",
+          "bytes": 1515744
+        },
+        "fpga_metrics": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.metrics.json",
+          "sha256": "8e2b5f869ac3600a9348967e4c7f0d51ddff272b363be8e733e2ebf903b104af",
+          "bytes": 3396
+        },
+        "fpga_comparison": {
+          "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.comparison.json",
+          "sha256": "97981740d20fc2daa7b8b3ef450d13615f07f5353aa5521fc6b2c628cda09ede",
+          "bytes": 1741
+        }
+      }
+    }
+  ],
+  "changes": {
+    "both_scope": {
+      "full_fpga_vs_official_l2": {
+        "before": 0.2809025853262052,
+        "after": 0.24707523478455173,
+        "reduction_fraction": 0.12042377788146952
+      },
+      "token_only_cpu_vs_official_l2": {
+        "before": 0.2966529095588056,
+        "after": 0.23253765852222974,
+        "reduction_fraction": 0.21612884610479866
+      },
+      "same_token_fpga_decoder_vs_cpu_l2": {
+        "before": 0.05734735448968282,
+        "after": 0.04963602146579806,
+        "reduction_fraction": 0.13446710999148315
+      },
+      "decoder_error_relative_to_official_energy": {
+        "before": 0.05648146709901383,
+        "after": 0.04876159483687453,
+        "reduction_fraction": 0.1366797404289466
+      }
+    },
+    "decoder_scope": {
+      "full_fpga_vs_official_l2": {
+        "before": 0.2809025853262052,
+        "after": 0.2055055276659087,
+        "reduction_fraction": 0.26840998124933513
+      },
+      "token_only_cpu_vs_official_l2": {
+        "before": 0.2966529095588056,
+        "after": 0.19566882200325023,
+        "reduction_fraction": 0.3404115864083148
+      },
+      "same_token_fpga_decoder_vs_cpu_l2": {
+        "before": 0.05734735448968282,
+        "after": 0.04628410070736978,
+        "reduction_fraction": 0.19291655004422903
+      },
+      "decoder_error_relative_to_official_energy": {
+        "before": 0.05648146709901383,
+        "after": 0.045888051719590386,
+        "reduction_fraction": 0.1875555987391908
+      }
+    }
+  },
+  "evidence": {
+    "full_results_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition/three_variants.json",
+    "full_results_sha256": "bbdca0ca67038f4e1cd1aa7f6d0ef5275f6ddc187a8e6cc693e105890fc3fba1",
+    "initial_generator": {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition.py",
+      "sha256": "edb7f3bdcd9b7e8728a101a479a543abb9537686e2a82237e74690dd58c20574",
+      "bytes": 8052
+    },
+    "decoder_scope_generator": {
+      "path": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_20260915/bus_decoder_scope_decomposition.py",
+      "sha256": "7040a513ef24e94984b9b97b48d8bc2bcae5a7a7acffd6103de29f1112fc7182",
+      "bytes": 3171
+    }
+  }
+}

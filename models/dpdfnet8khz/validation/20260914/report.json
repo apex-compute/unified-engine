@@ -1,0 +1,173 @@
+{
+  "model": "dpdfnet2_8khz",
+  "date": "2026-09-14",
+  "status": "Average measured audio throughput is realtime; strict 10ms host deadline remains unmet; no NaNs in tested output or final state",
+  "current_hardware": {
+    "date": "2026-09-14",
+    "status": "PCIe and native8k model execution verified after user board update",
+    "observed_build_stamp": "0xdf0749de",
+    "matching_local_andromeda_commit": "df0749de3d4787b51a86a4d0a235e819a6fb52b7",
+    "source_identity_scope": "Register build stamp matches local git commit prefix; user supplied programmed image, its bitstream bytes were not independently hashed",
+    "configuration_actor": "user",
+    "hw_info_raw": "0x80214d40",
+    "axi_data_width_bits": 256,
+    "core_count": 1,
+    "dram_bytes": 2147483648,
+    "clock_mhz": 333.25,
+    "detected_clock_ns": 3.000750187546887,
+    "clock_override_enabled": false,
+    "trace_enabled": false,
+    "validation_bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+    "current_run_is_from_34787221985": false,
+    "previous_hardware_receipts": [
+      "hardware_update.json",
+      "hardware_reload_after_reset.json"
+    ],
+    "evidence": [
+      "full_corpus_comparison.json",
+      "sustained_comparison.json",
+      "audio_run_summary.json"
+    ]
+  },
+  "current_deployment": {
+    "format": "andromeda.dpdfnet2_8khz.streaming-v2",
+    "file": "models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz-andromeda.bin",
+    "sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+    "serialized_bytes": 23721269,
+    "resident_bytes": 23594048,
+    "instructions": 27118,
+    "program_sha256": "d826270ad182dbf7fb79b0f37d07b4d38b8d87fab081c4a0fed02b12282baba3",
+    "image_sha256": "a0940e29d81aedc1860f20ddd60b630f3241e81c0064a4c3877ee861c7d3627f",
+    "sections": {
+      "parameters": {
+        "file": "models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz.parameters.bin",
+        "bytes": 22726272,
+        "sha256": "aafd0ed42e4428cf71c23cee1e08950c70814958b86f603905d66e08f28dd812"
+      },
+      "instructions": {
+        "file": "models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz.instructions.bin",
+        "bytes": 867776,
+        "sha256": "d826270ad182dbf7fb79b0f37d07b4d38b8d87fab081c4a0fed02b12282baba3"
+      }
+    }
+  },
+  "runtime": {
+    "dma_io": "cached-scalar-read-write",
+    "halt_polling": "shared 100us sleep; 1ms queue-drain sleep",
+    "host_cpu_affinity": [
+      6
+    ],
+    "cpu_neural_ops": 0,
+    "state_resident": true,
+    "model_upload_writes": 1,
+    "per_frame": {
+      "input_writes": 1,
+      "program_kicks": 1,
+      "halts": 1,
+      "output_reads": 1
+    },
+    "environment": {
+      "OMP_NUM_THREADS": "1",
+      "MKL_NUM_THREADS": "1"
+    }
+  },
+  "original_corpus": {
+    "frames": 1362,
+    "all_spectra_bit_identical_to_corrected_IF8_baseline": true,
+    "all_outputs_finite": true,
+    "host_timing": {
+      "frames": 1362,
+      "mean_ms": 9.805072232746099,
+      "p95_ms": 10.078992299997935,
+      "p99_ms": 10.20456155991724,
+      "max_ms": 12.723592999918765,
+      "deadline_misses": 175,
+      "deadline_miss_fraction": 0.12848751835535976,
+      "rtf_at_10ms_hop": 0.9805072232746099
+    },
+    "fpga_timing": {
+      "frames": 1362,
+      "mean_ms": 9.069726955968068,
+      "p95_ms": 9.074172543135784,
+      "p99_ms": 9.07525569392348,
+      "max_ms": 9.076525131282821,
+      "deadline_misses": 0,
+      "deadline_miss_fraction": 0.0,
+      "rtf_at_10ms_hop": 0.9069726955968068
+    },
+    "realtime_smoke_pass": false,
+    "pooled_waveform_relative_l2": 0.011583238748905064
+  },
+  "sustained_corpus": {
+    "frames": 6519,
+    "all_outputs_finite": true,
+    "all_final_logical_state_finite": true,
+    "host_timing": {
+      "frames": 6519,
+      "mean_ms": 9.847847805643653,
+      "p95_ms": 10.121181700014859,
+      "p99_ms": 10.211141579966352,
+      "max_ms": 13.677626999879067,
+      "deadline_misses": 1147,
+      "deadline_miss_fraction": 0.1759472311704249,
+      "rtf_at_10ms_hop": 0.9847847805643652
+    },
+    "fpga_timing": {
+      "frames": 6519,
+      "mean_ms": 9.069672774843506,
+      "p95_ms": 9.074412603150789,
+      "p99_ms": 9.075132783195798,
+      "max_ms": 9.077149287321832,
+      "deadline_misses": 0,
+      "deadline_miss_fraction": 0.0,
+      "rtf_at_10ms_hop": 0.9069672774843506
+    },
+    "realtime_smoke_pass": false,
+    "audio60_waveform_relative_l2": 0.02266767303325453
+  },
+  "audio_file_run": {
+    "frames": 6007,
+    "duration_s": 60,
+    "sample_rate": 8000,
+    "output_samples": 480000,
+    "steady_audio_processing_s": 59.210184907999974,
+    "steady_audio_rtf": 0.9868364151333329,
+    "total_elapsed_s": 59.337830863000136,
+    "host_frame_ms_mean": 9.85077999051193,
+    "host_frame_ms_p95": 10.121274499942956,
+    "host_frame_ms_p99": 10.2222976600342,
+    "host_frame_ms_max": 29.366674000129933,
+    "host_frame_deadline_misses": 1062,
+    "output_bit_identical_to_independent_spectrum_reconstruction": true
+  },
+  "speech_quality_qualified": false,
+  "verification": {
+    "native_host_tests": 89,
+    "existing_16khz_tests": 63,
+    "all_passed": true
+  },
+  "rejected_experiments": {
+    "vector_dma": {
+      "production_enabled": false,
+      "reason": "Kernel BUG in fs/read_write.c:742 do_iter_readv_writev -> do_pwritev, 2026-09-14 02:09:27 UTC; removed in favor of scalar DMA"
+    },
+    "adaptive_halt_polling": {
+      "production_enabled": false,
+      "reason": "Preserved output but increased host time on current hardware; restored shared wait"
+    }
+  },
+  "reports": {
+    "audio_run_summary.json": "9d4125b79db7a8b2637cfe3ede3ae30964aafd5ae4cd6d3b5b52ad8611bc657b",
+    "baseline_equivalence.json": "531f3d5f0010dbc20ae383600151ea5161fb23a20d61ec473342aed0cc265608",
+    "final_state_checks.json": "e3f7ef446ab20ad3939221d08c79ced42c4711c4b82bd0b99c80e77164e239bb",
+    "full_corpus_comparison.json": "64223c9708211c2afb3292df84b8a26d6a6a452c6f1ea35d75b0808ce5680919",
+    "hardware_current.json": "28f2dba8ec61849240771950741734f04db3ff89663d6aa64f7c45896612744e",
+    "hardware_reload_after_reset.json": "c0a3fbbab83d231872c73cecc1573bcfe8882e18e21bc2f870722cdad1de19c6",
+    "hardware_update.json": "1ee52fee2f82d3dec3d4701760deb1791bb3f8acebffb46ddd66b6ebabfd171c",
+    "sustained_comparison.json": "dc20b3d3109f0db5a5cea9fb2e6b46c70fa7f03b86c430e7fe066476b6ad14d7",
+    "sustained_composition.json": "06a87f4251a1731efec83d07ebe692b70c70e33ade55ff93a7028395faae5de4",
+    "sustained_cpu_reference_manifest.json": "465c874fa6dedecf212f84246ded188add67dbd62dba3c6557b07225f538a2a0",
+    "sustained_waveform_comparison.json": "58fde823f12e31706bb7e77870c346971219279ff39f36ad4aa6a3bb81796ed5",
+    "waveform_comparison.json": "0660f08c786f7d211f1b18dd3e1098996463240b92a366ff21470c155ff9a054"
+  }
+}

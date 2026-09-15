@@ -1,0 +1,399 @@
+{
+  "passed": true,
+  "hardware_accessed": false,
+  "results_sha256": "2fb325c11fde0e4714e91ab588fdb9edd3f41f5a4e5208381925020fb6d5ec7a",
+  "frame_contract_sha256": "2ed7a837cd9e791d6340bc1157af367446b3fd35c0c1dfda27f2e0d3fb2f65b1",
+  "prior_results_sha256": "638c9f1082da5100eae518178017ba3e28c193fdbfd2cd8499fbf04981ec760c",
+  "audited_runs": [
+    {
+      "rate": 8000,
+      "precision": "bf16",
+      "case": "bus_low_snr",
+      "source_samples": 334067,
+      "frames": 2094,
+      "steady_audio_processing_s": 21.815217434999795,
+      "rtf": 1.044830764367617,
+      "waveform_relative_l2": 0.015704996902479177,
+      "host": {
+        "frames": 2094,
+        "mean_ms": 10.401834476592649,
+        "p95_ms": 10.70054220062957,
+        "p99_ms": 10.788789319904026,
+        "max_ms": 15.301994999390445,
+        "over_10ms": 2033
+      },
+      "fpga": {
+        "frames": 2094,
+        "mean_ms": 9.590703807757096,
+        "p95_ms": 9.59476669167292,
+        "p99_ms": 9.59548687171793,
+        "max_ms": 9.600720180045013,
+        "over_10ms": 0
+      },
+      "all_waveforms_finite": true,
+      "all_hashes_and_contract_counts_verified": true
+    },
+    {
+      "rate": 8000,
+      "precision": "quantized",
+      "case": "bus_low_snr",
+      "source_samples": 334067,
+      "frames": 2094,
+      "steady_audio_processing_s": 20.713970670998606,
+      "rtf": 0.9920870087017805,
+      "waveform_relative_l2": 0.015927127745281124,
+      "host": {
+        "frames": 2094,
+        "mean_ms": 9.876321245915152,
+        "p95_ms": 10.138915400239057,
+        "p99_ms": 11.252359229965812,
+        "max_ms": 13.907926000683801,
+        "over_10ms": 416
+      },
+      "fpga": {
+        "frames": 2094,
+        "mean_ms": 9.06982005100129,
+        "p95_ms": 9.074556639159791,
+        "p99_ms": 9.075616264066017,
+        "max_ms": 9.07719729932483,
+        "over_10ms": 0
+      },
+      "all_waveforms_finite": true,
+      "all_hashes_and_contract_counts_verified": true,
+      "prior_df0749de_comparison": {
+        "prior_file_sha256": "6d73eb75e55cea8b55286a462e011f5b850ff30130cf62c6f94038b7764a1ad9",
+        "current_file_sha256": "23ce36b4051cc8eea78ca3c74f5027c8e2db14a774898dd2d675a9acbc435943",
+        "files_identical": false,
+        "float32_samples_identical": true,
+        "changed_samples": 0,
+        "max_abs_sample_difference": 0.0,
+        "relative_l2": 0.0,
+        "container_difference": {
+          "only_peak_timestamp_differs": true,
+          "peak_timestamp_unix_s": {
+            "prior": 1789366775,
+            "current": 1789419927
+          },
+          "all_other_container_and_audio_bytes_identical": true
+        }
+      }
+    },
+    {
+      "rate": 8000,
+      "precision": "bf16",
+      "case": "cafe_low_snr",
+      "source_samples": 343450,
+      "frames": 2153,
+      "steady_audio_processing_s": 22.41312664900397,
+      "rtf": 1.0441404174816233,
+      "waveform_relative_l2": 0.03319348003784983,
+      "host": {
+        "frames": 2153,
+        "mean_ms": 10.394275081759318,
+        "p95_ms": 10.6842979996145,
+        "p99_ms": 10.763763519498752,
+        "max_ms": 13.335651001398219,
+        "over_10ms": 2067
+      },
+      "fpga": {
+        "frames": 2153,
+        "mean_ms": 9.590904189586645,
+        "p95_ms": 9.59491072768192,
+        "p99_ms": 9.59548687171793,
+        "max_ms": 9.595870967741936,
+        "over_10ms": 0
+      },
+      "all_waveforms_finite": true,
+      "all_hashes_and_contract_counts_verified": true
+    },
+    {
+      "rate": 8000,
+      "precision": "quantized",
+      "case": "cafe_low_snr",
+      "source_samples": 343450,
+      "frames": 2153,
+      "steady_audio_processing_s": 21.250797263001004,
+      "rtf": 0.9899920110875413,
+      "waveform_relative_l2": 0.03236474676238339,
+      "host": {
+        "frames": 2153,
+        "mean_ms": 9.854624761263109,
+        "p95_ms": 10.126459999810322,
+        "p99_ms": 10.34523467940744,
+        "max_ms": 13.41259800028638,
+        "over_10ms": 422
+      },
+      "fpga": {
+        "frames": 2153,
+        "mean_ms": 9.069768350587417,
+        "p95_ms": 9.07447981995499,
+        "p99_ms": 9.075683960990247,
+        "max_ms": 9.076957239309829,
+        "over_10ms": 0
+      },
+      "all_waveforms_finite": true,
+      "all_hashes_and_contract_counts_verified": true,
+      "prior_df0749de_comparison": {
+        "prior_file_sha256": "ec4554b717bf419deced3a794456cd981e5f81c2c30f731e5a7b4e4bc9743526",
+        "current_file_sha256": "d6b41d5bfef5b3280023b3378c0a85231fa1beb36574864913a7758aca68d24c",
+        "files_identical": false,
+        "float32_samples_identical": true,
+        "changed_samples": 0,
+        "max_abs_sample_difference": 0.0,
+        "relative_l2": 0.0,
+        "container_difference": {
+          "only_peak_timestamp_differs": true,
+          "peak_timestamp_unix_s": {
+            "prior": 1789366828,
+            "current": 1789419972
+          },
+          "all_other_container_and_audio_bytes_identical": true
+        }
+      }
+    },
+    {
+      "rate": 16000,
+      "precision": "bf16",
+      "case": "bus_low_snr",
+      "source_samples": 334067,
+      "frames": 2094,
+      "steady_audio_processing_s": 31.304503797997313,
+      "rtf": 1.4993161873754577,
+      "waveform_relative_l2": 0.013971550193589682,
+      "host": {
+        "frames": 2094,
+        "mean_ms": 14.938205279358328,
+        "p95_ms": 15.220764350033278,
+        "p99_ms": 15.65114631073814,
+        "max_ms": 19.45875999990676,
+        "over_10ms": 2094
+      },
+      "fpga": {
+        "frames": 2094,
+        "mean_ms": 14.08481220591681,
+        "p95_ms": 14.090754688672167,
+        "p99_ms": 14.09397149287322,
+        "max_ms": 14.098676669167293,
+        "over_10ms": 2094
+      },
+      "all_waveforms_finite": true,
+      "all_hashes_and_contract_counts_verified": true
+    },
+    {
+      "rate": 16000,
+      "precision": "quantized",
+      "case": "bus_low_snr",
+      "source_samples": 334067,
+      "frames": 2094,
+      "steady_audio_processing_s": 29.942977643999257,
+      "rtf": 1.4341064585965932,
+      "waveform_relative_l2": 0.027258541767270463,
+      "host": {
+        "frames": 2094,
+        "mean_ms": 14.28817917669704,
+        "p95_ms": 14.571029449871276,
+        "p99_ms": 14.679139390191267,
+        "max_ms": 16.54194799994002,
+        "over_10ms": 2094
+      },
+      "fpga": {
+        "frames": 2094,
+        "mean_ms": 13.446916135910769,
+        "p95_ms": 13.453604201050263,
+        "p99_ms": 13.456756189047262,
+        "max_ms": 13.462853713428357,
+        "over_10ms": 2094
+      },
+      "all_waveforms_finite": true,
+      "all_hashes_and_contract_counts_verified": true,
+      "prior_df0749de_comparison": {
+        "prior_file_sha256": "dfd80196a804c5a3efbace5bf0113df54061149c80fbe220fc9e1dc5f20e8403",
+        "current_file_sha256": "1b2fcdf737a89da0efc7f578a51d2c957aa1667e8c059b0b1189d0f35c1f9923",
+        "files_identical": false,
+        "float32_samples_identical": true,
+        "changed_samples": 0,
+        "max_abs_sample_difference": 0.0,
+        "relative_l2": 0.0,
+        "container_difference": {
+          "only_peak_timestamp_differs": true,
+          "peak_timestamp_unix_s": {
+            "prior": 1789366806,
+            "current": 1789420035
+          },
+          "all_other_container_and_audio_bytes_identical": true
+        }
+      }
+    },
+    {
+      "rate": 16000,
+      "precision": "bf16",
+      "case": "cafe_low_snr",
+      "source_samples": 343450,
+      "frames": 2153,
+      "steady_audio_processing_s": 32.17679274299917,
+      "rtf": 1.4989916549366333,
+      "waveform_relative_l2": 0.04012331899489682,
+      "host": {
+        "frames": 2153,
+        "mean_ms": 14.933754533668218,
+        "p95_ms": 15.198644799602334,
+        "p99_ms": 15.28571812035807,
+        "max_ms": 17.95993400082807,
+        "over_10ms": 2153
+      },
+      "fpga": {
+        "frames": 2153,
+        "mean_ms": 14.084885784381534,
+        "p95_ms": 14.090629857464368,
+        "p99_ms": 14.094447771942987,
+        "max_ms": 14.099060765191297,
+        "over_10ms": 2153
+      },
+      "all_waveforms_finite": true,
+      "all_hashes_and_contract_counts_verified": true
+    },
+    {
+      "rate": 16000,
+      "precision": "quantized",
+      "case": "cafe_low_snr",
+      "source_samples": 343450,
+      "frames": 2153,
+      "steady_audio_processing_s": 30.797248124998077,
+      "rtf": 1.4347240355218205,
+      "waveform_relative_l2": 0.061877379544094814,
+      "host": {
+        "frames": 2153,
+        "mean_ms": 14.293090575464454,
+        "p95_ms": 14.587587599089602,
+        "p99_ms": 14.76130004033621,
+        "max_ms": 17.854538999017677,
+        "over_10ms": 2153
+      },
+      "fpga": {
+        "frames": 2153,
+        "mean_ms": 13.447050583825705,
+        "p95_ms": 13.453923480870218,
+        "p99_ms": 13.457092273068268,
+        "max_ms": 13.462853713428357,
+        "over_10ms": 2153
+      },
+      "all_waveforms_finite": true,
+      "all_hashes_and_contract_counts_verified": true,
+      "prior_df0749de_comparison": {
+        "prior_file_sha256": "0370668a51e116652f7f36890b5dff5e7a31f78bf3e452347a46e62bc1e9128e",
+        "current_file_sha256": "0c53ecf46ead98bf99c53e8e63b42674d8b5b222f6bbf764883eeda0f16b0876",
+        "files_identical": false,
+        "float32_samples_identical": true,
+        "changed_samples": 0,
+        "max_abs_sample_difference": 0.0,
+        "relative_l2": 0.0,
+        "container_difference": {
+          "only_peak_timestamp_differs": true,
+          "peak_timestamp_unix_s": {
+            "prior": 1789366859,
+            "current": 1789420100
+          },
+          "all_other_container_and_audio_bytes_identical": true
+        }
+      }
+    }
+  ],
+  "aggregate": [
+    {
+      "rate": 8000,
+      "precision": "bf16",
+      "duration_s": 42.3448125,
+      "processing_s": 44.228344084003766,
+      "rtf": 1.0444808105834396,
+      "pooled_waveform_relative_l2": 0.027276404988273193,
+      "host": {
+        "frames": 4247,
+        "mean_ms": 10.398002271017852,
+        "p95_ms": 10.691647000567173,
+        "p99_ms": 10.776446579802723,
+        "max_ms": 15.301994999390445,
+        "over_10ms": 4100
+      },
+      "fpga": {
+        "frames": 4247,
+        "mean_ms": 9.590805390540007,
+        "p95_ms": 9.59486271567892,
+        "p99_ms": 9.59548687171793,
+        "max_ms": 9.600720180045013,
+        "over_10ms": 0
+      }
+    },
+    {
+      "rate": 8000,
+      "precision": "quantized",
+      "duration_s": 42.3448125,
+      "processing_s": 41.96476793399961,
+      "rtf": 0.9910250029799897,
+      "pooled_waveform_relative_l2": 0.026745916867261084,
+      "host": {
+        "frames": 4247,
+        "mean_ms": 9.86532229808001,
+        "p95_ms": 10.13427169964416,
+        "p99_ms": 10.601769639652046,
+        "max_ms": 13.907926000683801,
+        "over_10ms": 838
+      },
+      "fpga": {
+        "frames": 4247,
+        "mean_ms": 9.069793841679163,
+        "p95_ms": 9.07450862715679,
+        "p99_ms": 9.075660915228807,
+        "max_ms": 9.07719729932483,
+        "over_10ms": 0
+      }
+    },
+    {
+      "rate": 16000,
+      "precision": "bf16",
+      "duration_s": 42.3448125,
+      "processing_s": 63.48129654099648,
+      "rtf": 1.49915167391511,
+      "pooled_waveform_relative_l2": 0.03188634666363032,
+      "host": {
+        "frames": 4247,
+        "mean_ms": 14.935948991279494,
+        "p95_ms": 15.208595999138197,
+        "p99_ms": 15.339144359895727,
+        "max_ms": 19.45875999990676,
+        "over_10ms": 4247
+      },
+      "fpga": {
+        "frames": 4247,
+        "mean_ms": 14.084849506231043,
+        "p95_ms": 14.090706676669168,
+        "p99_ms": 14.094259564891225,
+        "max_ms": 14.099060765191297,
+        "over_10ms": 4247
+      }
+    },
+    {
+      "rate": 16000,
+      "precision": "quantized",
+      "duration_s": 42.3448125,
+      "processing_s": 60.740225768997334,
+      "rtf": 1.4344195235011923,
+      "pooled_waveform_relative_l2": 0.050348902930081506,
+      "host": {
+        "frames": 4247,
+        "mean_ms": 14.290668991047463,
+        "p95_ms": 14.576032800505345,
+        "p99_ms": 14.705213599481795,
+        "max_ms": 17.854538999017677,
+        "over_10ms": 4247
+      },
+      "fpga": {
+        "frames": 4247,
+        "mean_ms": 13.446984293754154,
+        "p95_ms": 13.453779444861215,
+        "p99_ms": 13.456948237059265,
+        "max_ms": 13.462853713428357,
+        "over_10ms": 4247
+      }
+    }
+  ]
+}

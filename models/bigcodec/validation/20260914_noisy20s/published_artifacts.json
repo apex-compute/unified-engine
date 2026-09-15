@@ -1,0 +1,56 @@
+{
+  "format": "bigcodec-noisy20s-published-v1",
+  "generated_utc": "2026-09-14T22:43:50.575079+00:00",
+  "zip": {
+    "path": "bigcodec_noisy_audio_wavs.zip",
+    "sha256": "40b3a18ef7f64078071b2230394eda09474629164f9cad0a868335ea48be97d2",
+    "bytes": 30291741,
+    "wav_files": 32
+  },
+  "files": {
+    "input_published_artifacts.json": {
+      "sha256": "f3630adc5a93251c51de408a2a3ac364615d1dec1d80a1e96cf57e799bc82248",
+      "bytes": 19096
+    },
+    "ATTRIBUTION.md": {
+      "sha256": "d7056e8ce211a99650d49aeeac4de70195bc6fd2fd43f5fd87553c6e26968298",
+      "bytes": 2661
+    },
+    "summary.json": {
+      "sha256": "acec71db7e8980db06c08c2d1ab9bed97765fe8abbf9bcf617b37739aafe4707",
+      "bytes": 4706
+    },
+    "high_dram_smoke.json": {
+      "sha256": "8b1a08d6c771aa3773c9ab349dadae8508df0d27402457647a8da2712c0e7c5d",
+      "bytes": 464
+    },
+    "additional_sources.json": {
+      "sha256": "a36ba7b09d512d5111ccc8d4725dbd4005fbee3451aa7c809803d5a4b667039a",
+      "bytes": 39204
+    },
+    "audio_manifest.json": {
+      "sha256": "4cd1daaccfb3e389a2a8304a494f56e0f71c8fc81fa3c1bd0be2628a2bfb5c84",
+      "bytes": 11459
+    },
+    "README.md": {
+      "sha256": "d502826207d0eb1a8a6776e5121bb1718f44090da81fa57fd5bb7152b86dd0aa",
+      "bytes": 6950
+    },
+    "results.json": {
+      "sha256": "31faea99cf34e7552e5fa842774e724d0a22d5d4464a4fe9b44f348e59a84894",
+      "bytes": 67805
+    },
+    "legacy_layout_hash_verification.json": {
+      "sha256": "3f15a80a1691cb6626b0dc5ac729d7064d35904fea07ef318f15fdaab7a6527e",
+      "bytes": 670
+    },
+    "additional_source_selection.json": {
+      "sha256": "65197672cec79e97dedfbcffd500e5fc0aecca46c66d6c8a14cf84e9395589b7",
+      "bytes": 21783
+    },
+    "input_manifest.json": {
+      "sha256": "33449f2faa883d49198ebdf1f74065f279a9d1174004fb0609eab40988c109f8",
+      "bytes": 49255
+    }
+  }
+}
