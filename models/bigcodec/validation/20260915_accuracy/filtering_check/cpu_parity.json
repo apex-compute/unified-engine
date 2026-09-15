@@ -1,0 +1,326 @@
+{
+  "status": "complete",
+  "scope": "One full 23.68225-second bus utterance; CPU core 7, one thread, FP32; no hardware.",
+  "upstream_revision": "09845ab1f5bc7a3d1589c16de820ef15bc2afefe",
+  "upstream_inference_url": "https://github.com/Aria-K-Alethia/BigCodec/blob/09845ab1f5bc7a3d1589c16de820ef15bc2afefe/inference.py#L24-L48",
+  "upstream_readme_url": "https://github.com/Aria-K-Alethia/BigCodec/blob/09845ab1f5bc7a3d1589c16de820ef15bc2afefe/README.md#L20-L26",
+  "source_checks": {
+    "__init__.py": {
+      "upstream_sha256": "f3008a83bbbb66ad6c5e88387397b6e7a7a3fdc92660006072385b9e8398a83c",
+      "vendored_sha256": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+      "identical": false
+    },
+    "activations.py": {
+      "upstream_sha256": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+      "vendored_sha256": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+      "identical": true
+    },
+    "alias_free_torch/__init__.py": {
+      "upstream_sha256": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+      "vendored_sha256": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+      "identical": true
+    },
+    "alias_free_torch/act.py": {
+      "upstream_sha256": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac",
+      "vendored_sha256": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac",
+      "identical": true
+    },
+    "alias_free_torch/filter.py": {
+      "upstream_sha256": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+      "vendored_sha256": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+      "identical": true
+    },
+    "alias_free_torch/resample.py": {
+      "upstream_sha256": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+      "vendored_sha256": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+      "identical": true
+    },
+    "codec_decoder.py": {
+      "upstream_sha256": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+      "vendored_sha256": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+      "identical": true
+    },
+    "codec_encoder.py": {
+      "upstream_sha256": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+      "vendored_sha256": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+      "identical": true
+    },
+    "factorized_vector_quantize.py": {
+      "upstream_sha256": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+      "vendored_sha256": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+      "identical": true
+    },
+    "module.py": {
+      "upstream_sha256": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+      "vendored_sha256": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+      "identical": true
+    },
+    "residual_vq.py": {
+      "upstream_sha256": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+      "vendored_sha256": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+      "identical": true
+    }
+  },
+  "upstream_source_verification": {
+    "inference.py": {
+      "url": "https://raw.githubusercontent.com/Aria-K-Alethia/BigCodec/09845ab1f5bc7a3d1589c16de820ef15bc2afefe/inference.py",
+      "sha256": "f2158d28c30b9d00b61ea553f1860ef84988e7b1293dfff2fb205f79a3edf207",
+      "bytes": 1824,
+      "matches_cached_source": true
+    },
+    "README.md": {
+      "url": "https://raw.githubusercontent.com/Aria-K-Alethia/BigCodec/09845ab1f5bc7a3d1589c16de820ef15bc2afefe/README.md",
+      "sha256": "6c0ef81f6484e3ab2c7d5844f99bcfbf3be4b7e8b63103fe3cdbaaf838148451",
+      "bytes": 3260,
+      "matches_cached_source": true
+    }
+  },
+  "checkpoint": {
+    "path": "models/bigcodec/bigcodec_bin/bigcodec.pt",
+    "sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+    "bytes": 637937326
+  },
+  "input": {
+    "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus_noisy.wav",
+    "sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+    "bytes": 1515744
+  },
+  "generator": {
+    "path": "models/bigcodec/bigcodec_bin/filtering_check_20260915/check_literal_upstream.py",
+    "sha256": "83161e4ec6f4d9db96d90711dd1db526bb19b156c7dc3ffd2b510a152da7d218",
+    "bytes": 9834
+  },
+  "placement_adaptation": {
+    "removed_cuda_call_lines": [
+      28,
+      31,
+      42
+    ],
+    "description": "Only three .cuda() device placements removed from the parsed upstream AST; all neural, audio-loading, padding and WAV-writing statements executed unchanged."
+  },
+  "runtime": {
+    "torch": "2.12.0.dev20260405+cu128",
+    "numpy": "2.4.2",
+    "soundfile": "0.14.0",
+    "cpu_affinity": [
+      7
+    ],
+    "torch_threads": 1,
+    "torch_interop_threads": 1
+  },
+  "literal_upstream_wall_s": 56.814189526005066,
+  "literal_output": {
+    "full_samples": 379000,
+    "source_samples": 378916,
+    "padding_samples": 84,
+    "tokens": 1895,
+    "finite": true,
+    "wav_format": "PCM_16"
+  },
+  "wrapper_source": {
+    "bigcodec_common.py": {
+      "path": "models/bigcodec/bigcodec_common.py",
+      "sha256": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+      "bytes": 7451
+    },
+    "bigcodec_run_cpu.py": {
+      "path": "models/bigcodec/bigcodec_run_cpu.py",
+      "sha256": "d6b5abd1fe8beb3bdb11f90f6b7e7004469fac0baa35206007274093687dd37f",
+      "bytes": 6293
+    }
+  },
+  "wrapper_model_load_s": 1.114589139004238,
+  "all_encoder_decoder_state_tensors_equal": true,
+  "input_and_padding": {
+    "samples": 379000,
+    "array_equal": true,
+    "max_abs_error": 0.0,
+    "relative_l2": 0.0,
+    "error_energy": 0.0,
+    "reference_energy": 2118.5914064791295
+  },
+  "wrapper_encode_s": 27.37996356000076,
+  "encoder_features": {
+    "samples": 1940480,
+    "array_equal": true,
+    "max_abs_error": 0.0,
+    "relative_l2": 0.0,
+    "error_energy": 0.0,
+    "reference_energy": 2036702.3327806788
+  },
+  "quantizer_direct_output": {
+    "samples": 1940480,
+    "array_equal": true,
+    "max_abs_error": 0.0,
+    "relative_l2": 0.0,
+    "error_energy": 0.0,
+    "reference_energy": 166151.47604936926
+  },
+  "tokens": {
+    "count": 1895,
+    "equal": 1895,
+    "array_equal": true
+  },
+  "token_reembedding_vs_direct_quantizer": {
+    "samples": 1940480,
+    "array_equal": false,
+    "max_abs_error": 4.76837158203125e-07,
+    "relative_l2": 1.9263039041883613e-08,
+    "error_energy": 6.165294315018207e-11,
+    "reference_energy": 166151.47604936926
+  },
+  "wrapper_decode_s": 28.044722448998073,
+  "wrapper_full_vs_literal_neural": {
+    "samples": 379000,
+    "array_equal": false,
+    "max_abs_error": 7.897615432739258e-07,
+    "relative_l2": 6.98812302660627e-07,
+    "error_energy": 9.056609371401914e-10,
+    "reference_energy": 1854.5756436943552
+  },
+  "wrapper_cropped_vs_literal_neural": {
+    "samples": 378916,
+    "array_equal": false,
+    "max_abs_error": 7.897615432739258e-07,
+    "relative_l2": 6.98812013052257e-07,
+    "error_energy": 9.056601124347679e-10,
+    "reference_energy": 1854.575492077055
+  },
+  "wrapper_output": {
+    "samples": 378916,
+    "full_decoder_samples": 379000,
+    "wav_format": "FLOAT",
+    "finite": true
+  },
+  "wrapper_vs_frozen_cpu_wave": {
+    "samples": 378916,
+    "array_equal": true,
+    "max_abs_error": 0.0,
+    "relative_l2": 0.0,
+    "error_energy": 0.0,
+    "reference_energy": 1854.5755450136244
+  },
+  "wrapper_vs_frozen_cpu_tokens": {
+    "equal": 1895,
+    "count": 1895,
+    "array_equal": true
+  },
+  "upstream_pcm16_quantization_only": {
+    "samples": 379000,
+    "array_equal": false,
+    "max_abs_error": 3.051722887903452e-05,
+    "relative_l2": 0.0002488250617038877,
+    "error_energy": 0.00011482403196207438,
+    "reference_energy": 1854.5756436943552
+  },
+  "literal_pcm16_cropped_vs_wrapper_float": {
+    "samples": 378916,
+    "array_equal": false,
+    "max_abs_error": 3.1188130378723145e-05,
+    "relative_l2": 0.0002487968554763957,
+    "error_energy": 0.00011479799496139342,
+    "reference_energy": 1854.5755450136244
+  },
+  "literal_vs_input": {
+    "samples": 378916,
+    "array_equal": false,
+    "max_abs_error": 0.7144068777561188,
+    "relative_l2": 0.76868942840431,
+    "error_energy": 1251.8405725805278,
+    "reference_energy": 2118.59140647913
+  },
+  "wrapper_vs_input": {
+    "samples": 378916,
+    "array_equal": false,
+    "max_abs_error": 0.7144069373607635,
+    "relative_l2": 0.7686894402274826,
+    "error_energy": 1251.8406110895194,
+    "reference_energy": 2118.59140647913
+  },
+  "padding_boundary_checks": [
+    {
+      "samples": 1,
+      "padded_samples": 200,
+      "matches_literal_formula": true
+    },
+    {
+      "samples": 199,
+      "padded_samples": 200,
+      "matches_literal_formula": true
+    },
+    {
+      "samples": 200,
+      "padded_samples": 400,
+      "matches_literal_formula": true
+    },
+    {
+      "samples": 201,
+      "padded_samples": 400,
+      "matches_literal_formula": true
+    },
+    {
+      "samples": 400,
+      "padded_samples": 600,
+      "matches_literal_formula": true
+    },
+    {
+      "samples": 378916,
+      "padded_samples": 379000,
+      "matches_literal_formula": true
+    }
+  ],
+  "artifacts": {
+    "literal_upstream_full.npy": {
+      "path": "models/bigcodec/bigcodec_bin/filtering_check_20260915/literal_upstream_full.npy",
+      "sha256": "c2c31130ad4b80f311628e0c296546232318d89d6dfc18a3508811bdf508e9a1",
+      "bytes": 1516128
+    },
+    "literal_upstream_tokens.npy": {
+      "path": "models/bigcodec/bigcodec_bin/filtering_check_20260915/literal_upstream_tokens.npy",
+      "sha256": "177b977e2bc043201155f5ef1bbf6acfe5b221f6aa36e7b12088e2ef6bd758ca",
+      "bytes": 15288
+    },
+    "literal_upstream_cropped_float.wav": {
+      "path": "models/bigcodec/bigcodec_bin/filtering_check_20260915/literal_upstream_cropped_float.wav",
+      "sha256": "d56bf9038e9360c078436277d12c44c2da34592f9ba8b01b3c08508453279fb1",
+      "bytes": 1515744
+    },
+    "literal_pcm16/bus_noisy.wav": {
+      "path": "models/bigcodec/bigcodec_bin/filtering_check_20260915/literal_pcm16/bus_noisy.wav",
+      "sha256": "707ea9e87a8f1ed66283c88009d6441ba584275eb1fc83a127a3c4c40915c0f2",
+      "bytes": 758044
+    },
+    "wrapper_float.wav": {
+      "path": "models/bigcodec/bigcodec_bin/filtering_check_20260915/wrapper_float.wav",
+      "sha256": "5db5af4c1e490822162c13108e462cbd28069a90cdd90fc13f1db9e117d17117",
+      "bytes": 1515744
+    },
+    "wrapper_full.npy": {
+      "path": "models/bigcodec/bigcodec_bin/filtering_check_20260915/wrapper_full.npy",
+      "sha256": "9c83254521dcc5edf95917db8c22280adcff35682af794460d4a831a7059825b",
+      "bytes": 1516128
+    },
+    "wrapper.tokens.npz": {
+      "path": "models/bigcodec/bigcodec_bin/filtering_check_20260915/wrapper.tokens.npz",
+      "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+      "bytes": 4178
+    },
+    "upstream_cpu_placement_only.py": {
+      "path": "models/bigcodec/bigcodec_bin/filtering_check_20260915/upstream_cpu_placement_only.py",
+      "sha256": "86325738c87164442f1a79541c0bdbdc54cf0c05a978cf8605734aeea4cee283",
+      "bytes": 1780
+    }
+  },
+  "frozen_reference_artifacts": {
+    "wave": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+      "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+      "bytes": 1515744
+    },
+    "tokens": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz",
+      "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+      "bytes": 4178
+    }
+  }
+}
