@@ -1,7 +1,9 @@
 """Independent alias-filter geometry and BF16 activation memory execution."""
 
 import contextlib
+from dataclasses import replace
 import io
+import hashlib
 import math
 from pathlib import Path
 import sys
@@ -15,6 +17,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from bigcodec_activation import (SNAKE_ARGUMENT_LIMIT, activation_scratch_bytes,
+                                _ordered_filter_taps, _sine_polynomial_sram,
                                 emit_activation, emit_activation_dram, prepare_activation,
                                 quantize_filter_dc, sine_squared)
 from bigcodec_device import (channels, clamp, clamp_wide, gather_rows, scale,
@@ -23,6 +26,7 @@ from bigcodec_device import (channels, clamp, clamp_wide, gather_rows, scale,
 from bigcodec_vq.activations import SnakeBeta
 from bigcodec_vq.alias_free_torch.act import Activation1d
 from test_bigcodec_quantizer import MemoryEngine as QuantizerMemoryEngine
+from test_bigcodec_lstm import NativeArithmeticMemoryEngine, native_round
 from yolov5_precompiled import _WholeGraphEngine, _instruction_types
 
 
@@ -112,28 +116,121 @@ class MemoryEngine(QuantizerMemoryEngine):
             self.snapshots["snake"] = self.view(dram_out, 2 * self.watch.rows * self.watch.width).float().clone()
 
 
-def fixture(length, logical_channels):
+class NativeMemoryEngine(MemoryEngine):
+    """Use the separately validated native ALU model for both memory paths."""
+    broadcast_mul = NativeArithmeticMemoryEngine.broadcast_mul
+    broadcast_add = NativeArithmeticMemoryEngine.broadcast_add
+    _binary = NativeArithmeticMemoryEngine._binary
+    eltwise_mul_core = NativeArithmeticMemoryEngine.eltwise_mul_core
+    eltwise_add_core = NativeArithmeticMemoryEngine.eltwise_add_core
+    eltwise_sub_core = NativeArithmeticMemoryEngine.eltwise_sub_core
+
+    def eltwise_core_dram(self, *, M, N, dram_a, dram_b, dram_out, mode, scalar=None):
+        left = self.view(dram_a, M * N).float()
+        if mode in (udc.UE_MODE.MUL_BROADCAST, udc.UE_MODE.ADD_BROADCAST):
+            assert dram_b is None
+            result = left * scalar if mode == udc.UE_MODE.MUL_BROADCAST else left + scalar
+        else:
+            right = self.view(dram_b, M * N).float()
+            operation = {udc.UE_MODE.ELTWISE_MUL: torch.mul,
+                         udc.UE_MODE.ELTWISE_ADD: torch.add,
+                         udc.UE_MODE.ELTWISE_SUB: torch.sub}[mode]
+            result = operation(left, right)
+        self.view(dram_out, M * N).copy_(native_round(result))
+
+
+def fixture(length, logical_channels, *, filter_accumulation=None,
+            snake_polynomial=None, filter_stage=None, engine_type=MemoryEngine):
     module = Activation1d(SnakeBeta(logical_channels, alpha_logscale=True))
     generator = torch.Generator().manual_seed(728)
     with torch.no_grad():
         module.act.alpha.copy_(torch.randn(logical_channels, generator=generator) * .15)
         module.act.beta.copy_(torch.randn(logical_channels, generator=generator) * .15)
     module.eval().requires_grad_(False)
-    engine = MemoryEngine()
-    identity = engine.allocate(torch.eye(64))
+    engine = engine_type()
+    identity = engine.allocate(torch.eye(64, dtype=torch.bfloat16))
     width = channels(logical_channels)
     source, destination, scratch = 0xB0000000, 0xB1000000, 0xB2000000
+    options = {}
+    if filter_accumulation is not None:
+        options['filter_accumulation'] = filter_accumulation
+    if filter_stage is not None:
+        options['filter_stage'] = filter_stage
+    scratch_bytes = activation_scratch_bytes((length, logical_channels), **options)
     plan = prepare_activation(module, engine, input_shape=(length, logical_channels),
                               input_address=source, output_address=destination,
-                              scratch_address=scratch, identity_address=identity)
+                              scratch_address=scratch, identity_address=identity,
+                              workspace_bytes=scratch_bytes, **options,
+                              **({} if snake_polynomial is None else
+                                 {'snake_polynomial': snake_polynomial}))
     for address, count in ((source, length * width), (destination, length * width),
-                           (scratch, activation_scratch_bytes((length, logical_channels)) // 2)):
+                           (scratch, scratch_bytes // 2)):
         engine.regions[address] = torch.full((count,), float("nan"), dtype=torch.bfloat16)
     packed = torch.zeros(length, width, dtype=torch.bfloat16)
     packed[:, :logical_channels] = torch.randn(length, logical_channels, generator=generator) * .35
     engine.view(source, packed.numel()).copy_(packed.flatten())
     engine.watch = plan
     return engine, plan, module, packed.float()
+
+
+def matrix_engine_type():
+    # Import after this module initializes: the independent FIR test engine
+    # extends the shared memory interpreter above. No experimental imports.
+    from test_bigcodec_filter import FilterEngine
+
+    class MatrixActivationEngine(FilterEngine, NativeMemoryEngine):
+        """FP64 dot geometry with the measured native pointwise rounding."""
+
+    return MatrixActivationEngine
+
+
+def filter_reference(source, taps, kind, *, matrix):
+    """Independent grouped-convolution equation with explicit store rounding."""
+    from test_bigcodec_filter import reference
+    if matrix:
+        high = taps.bfloat16().float()
+        effective = high.double() + (taps - high).bfloat16().double()
+        return reference(source, effective, kind).bfloat16().float()
+    coefficients = quantize_filter_dc(tuple(taps.tolist()))
+    terms = []
+    for index, coefficient in enumerate(coefficients):
+        kernel = torch.zeros(12, dtype=torch.float64)
+        kernel[index] = coefficient
+        terms.append(native_round(reference(source, kernel, kind).float()))
+    if kind == 'down':
+        result = terms[0]
+        for term in terms[1:]:
+            result = native_round(result + term)
+        return result
+    result = torch.zeros_like(terms[0])
+    for phase in (0, 1):
+        nonzero = [terms[tap][phase::2] for tap in range(12)
+                   if (phase + 15 - tap) % 2 == 0]
+        value = nonzero[0]
+        for term in nonzero[1:]:
+            value = native_round(value + term)
+        result[phase::2] = value
+    return result
+
+
+def native_snake_reference(source, module):
+    """Scalar formula, independent of the emitted SRAM allocation/schedule."""
+    q = native_round
+    scalar = lambda x: float(torch.tensor(x).bfloat16())
+    alpha = torch.zeros(source.shape[1])
+    inverse = torch.zeros_like(alpha)
+    logical = module.act.alpha.numel()
+    alpha[:logical] = module.act.alpha.detach().exp().bfloat16().float()
+    inverse[:logical] = (1 / (module.act.beta.detach().exp() + 1e-9)).bfloat16().float()
+    theta = q(source * alpha).abs().clamp(max=scalar(SNAKE_ARGUMENT_LIMIT))
+    for exponent in range(5, -1, -1):
+        delta = q(theta - scalar((math.pi / 2) * 2 ** exponent)).clamp_min(0)
+        theta = q(theta - q(2 * delta))
+    square = q(theta * theta)
+    value = q(square * scalar(2 / 14175))
+    for coefficient in (-1 / 315, 2 / 45, -1 / 3, 1.):
+        value = q(q(value + scalar(coefficient)) * square)
+    return q(q(value.clamp(0, 1) * inverse) + source)
 
 
 class ActivationTests(unittest.TestCase):
@@ -214,6 +311,172 @@ class ActivationTests(unittest.TestCase):
                 torch.testing.assert_close(fast.view(fast_plan.destination, count),
                     reference.view(reference_plan.destination, count), rtol=0, atol=0)
                 self.assertEqual(fast.matmul_shapes, [])
+
+    def test_sorted_filters_match_independent_tap_convolutions_at_endpoints(self):
+        for length, logical in ((1, 1), (2, 65), (17, 48), (65, 65)):
+            with self.subTest(length=length, logical=logical):
+                engine, plan, _, packed = fixture(length, logical, filter_accumulation='sorted')
+                emit_activation(engine, plan)
+                x = F.pad(packed[:, :logical].T[None], (5, 5), mode='replicate')
+                # Evaluate each tap with ordinary grouped convolution. Its
+                # indexing is independent of the emitter's polyphase offsets.
+                up = None
+                for tap in sorted(range(12), key=lambda i: abs(plan.up_filter[i])):
+                    weight = torch.zeros(1, 1, 12); weight[..., tap] = plan.up_filter[tap]
+                    term = (2 * F.conv_transpose1d(x, weight.expand(logical, 1, 12),
+                            stride=2, groups=logical)[..., 15:-15]).bfloat16().float()
+                    up = term if up is None else (up + term).bfloat16().float()
+                actual_up = engine.snapshots['upsampled'].reshape(2 * length, plan.width)[:, :logical].T[None]
+                torch.testing.assert_close(actual_up, up, rtol=0, atol=0)
+                snake = engine.snapshots['snake'].reshape(2 * length, plan.width)[:, :logical].T[None]
+                padded_snake = F.pad(snake, (5, 6), mode='replicate')
+                down = None
+                for tap in sorted(range(12), key=lambda i: abs(plan.down_filter[i])):
+                    weight = torch.zeros(1, 1, 12); weight[..., tap] = plan.down_filter[tap]
+                    term = F.conv1d(padded_snake, weight.expand(logical, 1, 12),
+                                    stride=2, groups=logical).bfloat16().float()
+                    down = term if down is None else (down + term).bfloat16().float()
+                actual = engine.view(plan.destination, length * plan.width).float().reshape(length, plan.width)
+                torch.testing.assert_close(actual[:, :logical].T[None], down, rtol=0, atol=0)
+                self.assertTrue(torch.isfinite(actual).all())
+                self.assertTrue((actual[:, logical:] == 0).all())
+
+    def test_sorted_sram_and_dram_paths_agree_across_tiles(self):
+        for length, logical in ((1, 48), (17, 65), (259, 65), (45, 1536)):
+            with self.subTest(length=length, logical=logical):
+                fast, plan, _, _ = fixture(length, logical, filter_accumulation='sorted')
+                slow, reference, _, _ = fixture(length, logical, filter_accumulation='sorted')
+                emit_activation(fast, plan); emit_activation_dram(slow, reference)
+                torch.testing.assert_close(fast.view(plan.destination, length * plan.width),
+                                           slow.view(reference.destination, length * plan.width), rtol=0, atol=0)
+
+    def test_filter_order_is_stable_and_reduces_a_bf16_rounding_case(self):
+        taps = [(20, .5), (-3, -.125), (7, .125), (1, -.5)]
+        self.assertEqual(_ordered_filter_taps(iter(taps), 'serial'), taps)
+        self.assertEqual(_ordered_filter_taps(iter(taps), 'sorted'), [taps[1], taps[2], taps[0], taps[3]])
+        errors = []
+        for mode in ('serial', 'sorted'):
+            engine, plan, _, packed = fixture(65, 48, filter_accumulation=mode)
+            emit_activation(engine, plan)
+            source = F.pad(packed[:, :48].T[None], (5, 5), mode='replicate')
+            weights = torch.tensor(plan.up_filter).reshape(1, 1, 12)
+            reference = 2 * F.conv_transpose1d(source, weights.expand(48, 1, 12),
+                                              stride=2, groups=48)[..., 15:-15]
+            actual = engine.snapshots['upsampled'].reshape(130, plan.width)[:, :48].T[None]
+            errors.append(float(torch.linalg.vector_norm(actual - reference)))
+        self.assertLess(errors[1], .8 * errors[0])
+
+    def test_filter_accumulation_default_image_and_instruction_count(self):
+        image, default, module, _ = fixture(17, 65)
+        explicit_image, serial, _, _ = fixture(17, 65, filter_accumulation='serial')
+        sorted_image, ordered, _, _ = fixture(17, 65, filter_accumulation='sorted')
+        self.assertEqual(default.filter_accumulation, 'serial')
+        self.assertEqual(default, serial)
+        self.assertEqual(replace(ordered, filter_accumulation='serial'), default)
+        for other in (explicit_image, sorted_image):
+            self.assertEqual(image.regions.keys(), other.regions.keys())
+            for address in image.regions:
+                torch.testing.assert_close(image.regions[address], other.regions[address],
+                                           rtol=0, atol=0, equal_nan=True)
+        for operation in (emit_activation, emit_activation_dram):
+            programs = []
+            for plan in (default, serial, ordered):
+                engine = _WholeGraphEngine(0x98000000)
+                with patch.object(udc, 'UE_AXI_DATA_WIDTH_BITS', 256), contextlib.redirect_stdout(io.StringIO()):
+                    engine.start_capture(); operation(engine, plan)
+                    engine.generate_instruction_halt(); engine.stop_capture()
+                self.assertEqual(udc.check_isa_jumps(engine.capture_buffer, 0x98000000, name='FIR ordering'), [])
+                raw = b''.join(inst.get_bytes() for inst in engine.capture_buffer)
+                self.assertEqual(_instruction_types(raw).count(udc.INSTRUCTION_HALT), 1)
+                programs.append(raw)
+            self.assertEqual(programs[0], programs[1])
+            self.assertEqual(len(programs[0]), len(programs[2]))
+        before = image.cursor
+        for mode in (None, True, 1, 'ascending'):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'filter_accumulation'):
+                prepare_activation(module, image, input_shape=(17, 65), input_address=default.source,
+                                   output_address=default.destination, scratch_address=default.scratch,
+                                   identity_address=default.identity, filter_accumulation=mode)
+        self.assertEqual(image.cursor, before)
+
+    def test_legacy_snake_complete_bf16_grid_and_preserved_sram(self):
+        encodings = torch.arange(65536).to(torch.uint16).view(torch.bfloat16)
+        source = encodings[torch.isfinite(encodings) & (encodings.float().abs() <= math.pi / 2)]
+        self.assertEqual(source.numel(), 32660)  # Both signs, including signed zero.
+        count = (source.numel() + 63) // 64 * 64
+        reference = source.double().sin().square()
+        engine = NativeArithmeticMemoryEngine()
+        engine.sram.fill_(-13.)
+        engine.sram_view(0, count).zero_()
+        engine.sram_view(0, count)[:source.numel()].copy_(source)
+        before = engine.sram.clone()
+        _sine_polynomial_sram(engine, count, 'legacy')
+        output = engine.sram_view(0x10000, count)[:source.numel()].double().clamp(0, 1)
+        self.assertTrue(torch.isfinite(output).all())
+        torch.testing.assert_close(output[:len(source) // 2], output[len(source) // 2:], rtol=0, atol=0)
+        self.assertLess(float((output - reference).abs().max()), .0081)
+        writable = torch.zeros(engine.sram.numel(), dtype=torch.bool)
+        for address in (0, 0x10000, 0x90000):
+            writable[address // 2:address // 2 + count] = True
+        torch.testing.assert_close(engine.sram[~writable], before[~writable], rtol=0, atol=0)
+        for invalid_count in (0, 63, 32769, True):
+            with self.assertRaisesRegex(ValueError, 'SRAM tile'):
+                _sine_polynomial_sram(NativeArithmeticMemoryEngine(), invalid_count, 'legacy')
+
+    def test_legacy_snake_matches_dram_sram_with_native_rounding_across_tiles(self):
+        for order in ('serial', 'sorted'):
+            for length, logical in ((1, 1), (259, 65), (45, 1536)):
+                with self.subTest(order=order, length=length, channels=logical):
+                    kwargs = dict(filter_accumulation=order, engine_type=NativeMemoryEngine)
+                    fast, plan, _, packed = fixture(length, logical, **kwargs)
+                    slow, reference, _, _ = fixture(length, logical, **kwargs)
+                    guard = 0xBF000000
+                    for engine in (fast, slow):
+                        engine.regions[guard] = torch.full((64,), -9.5, dtype=torch.bfloat16)
+                    emit_activation(fast, plan)
+                    emit_activation_dram(slow, reference)
+                    count = length * plan.width
+                    actual = fast.view(plan.destination, count)
+                    torch.testing.assert_close(actual, slow.view(reference.destination, count), rtol=0, atol=0)
+                    self.assertTrue(torch.isfinite(actual).all())
+                    self.assertTrue((actual.reshape(length, plan.width)[:, logical:] == 0).all())
+                    for engine in (fast, slow):
+                        torch.testing.assert_close(engine.view(plan.source, count).float(),
+                                                   packed.flatten(), rtol=0, atol=0)
+                        self.assertTrue((engine.regions[guard] == -9.5).all())
+
+    def test_snake_default_preserves_recorded_legacy_programs_and_parameter_image(self):
+        original, default, module, _ = fixture(17, 65)
+        captures = {
+            emit_activation: '9138f5f12d47b29c3ac4e4ec8f2240405954c6c98ac9689bbe9fedd0d84232f5',
+            emit_activation_dram: '7db7e3248bb5ee629895f3bec4f6547b3a5d75727a9cbcb13d93f476c6fadd12',
+        }  # Captured on AXI256 before optional polynomials were introduced.
+        for emit, legacy_sha256 in captures.items():
+            instructions = {}
+            for mode in (None, 'legacy'):
+                image, plan, _, _ = fixture(17, 65, snake_polynomial=mode)
+                self.assertEqual(replace(plan, snake_polynomial='legacy'), default)
+                for address in original.regions:
+                    torch.testing.assert_close(original.regions[address], image.regions[address],
+                                               rtol=0, atol=0, equal_nan=True)
+                engine = _WholeGraphEngine(0x98000000)
+                with patch.object(udc, 'UE_AXI_DATA_WIDTH_BITS', 256), contextlib.redirect_stdout(io.StringIO()):
+                    engine.start_capture(); emit(engine, plan)
+                    engine.generate_instruction_halt(); engine.stop_capture()
+                raw = b''.join(inst.get_bytes() for inst in engine.capture_buffer)
+                self.assertEqual(udc.check_isa_jumps(engine.capture_buffer, 0x98000000, name='Snake polynomial'), [])
+                if mode in (None, 'legacy'):
+                    self.assertEqual(hashlib.sha256(raw).hexdigest(), legacy_sha256)
+                instructions[mode] = _instruction_types(raw).count(udc.INSTRUCTION_UE_OP)
+        before = original.cursor
+        for mode in (None, True, 1, 'tuned', 'estrin', 'minimax', []):
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, 'snake_polynomial'):
+                prepare_activation(module, original, input_shape=(17, 65), input_address=default.source,
+                    output_address=default.destination, scratch_address=default.scratch,
+                    identity_address=default.identity, snake_polynomial=mode)
+            with self.assertRaisesRegex(ValueError, 'snake_polynomial'):
+                sine_squared(torch.zeros(64), snake_polynomial=mode)
+        self.assertEqual(original.cursor, before)
 
     def test_wide_clamp_finite_bf16_values_and_inplace_workspace(self):
         bits = torch.arange(65536).to(torch.uint16)
@@ -359,6 +622,112 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(types.count(udc.INSTRUCTION_HALT), 1)
         self.assertNotIn(udc.INSTRUCTION_SWI, types)
         self.assertGreater(len(types), 100)
+
+    def test_matrix_stages_match_independent_filter_and_snake_equations(self):
+        # Single samples, both FIR tile tails, an interior ISA loop, and the
+        # official 1536-channel width cross the distinct workspace boundaries.
+        for stage in ('up', 'down', 'both'):
+            for rows, logical in ((1, 1), (79, 65), (317, 3), (45, 1536)):
+                with self.subTest(stage=stage, rows=rows, logical=logical):
+                    engine, plan, module, packed = fixture(rows, logical,
+                        filter_accumulation='matrix', filter_stage=stage,
+                        engine_type=matrix_engine_type())
+                    parameters = {address: value.clone() for address, value in engine.regions.items()
+                                  if address not in (plan.source, plan.destination, plan.scratch)}
+                    # Surround exactly the advertised tensor/workspace extents.
+                    for address in (plan.source, plan.destination, plan.scratch):
+                        value = engine.regions.pop(address)
+                        guarded = torch.full((value.numel() + 128,), -9.5, dtype=torch.bfloat16)
+                        guarded[64:-64] = value
+                        engine.regions[address - 128] = guarded
+                    emit_activation(engine, plan)
+                    up = filter_reference(packed, module.upsample.filter.flatten(), 'up',
+                                          matrix=stage in ('up', 'both'))
+                    snake = native_snake_reference(up, module)
+                    expected = filter_reference(snake, module.downsample.lowpass.filter.flatten(),
+                                                'down', matrix=stage in ('down', 'both'))
+                    actual = engine.view(plan.destination, rows * plan.width).reshape(rows, plan.width)
+                    torch.testing.assert_close(engine.snapshots['upsampled'].reshape_as(up), up,
+                                               rtol=0, atol=0)
+                    torch.testing.assert_close(engine.view(plan.scratch, snake.numel()).float().reshape_as(snake),
+                                               snake, rtol=0, atol=0)
+                    torch.testing.assert_close(actual.float(), expected, rtol=0, atol=0)
+                    self.assertTrue(torch.isfinite(actual).all())
+                    self.assertFalse(actual[:, logical:].count_nonzero())
+                    torch.testing.assert_close(engine.view(plan.source, packed.numel()).float(),
+                                               packed.flatten(), rtol=0, atol=0)
+                    for address in (plan.source, plan.destination, plan.scratch):
+                        guarded = engine.regions[address - 128]
+                        self.assertTrue((guarded[:64] == -9.5).all() and (guarded[-64:] == -9.5).all())
+                    for address, value in parameters.items():
+                        torch.testing.assert_close(engine.regions[address], value, rtol=0, atol=0)
+                    self.assertEqual(engine._isa_reg_counter, 1)
+
+    def test_matrix_workspace_and_stage_plan_contract(self):
+        from bigcodec_filter import scratch_bytes as fir_scratch_bytes
+        shape = (79, 65)
+        for stage in ('up', 'down', 'both'):
+            image, plan, module, _ = fixture(*shape, filter_accumulation='matrix', filter_stage=stage)
+            selected = []
+            if stage in ('up', 'both'):
+                selected.append(fir_scratch_bytes(shape, kind='up'))
+            if stage in ('down', 'both'):
+                selected.append(fir_scratch_bytes((2 * shape[0], shape[1]), kind='down'))
+            needed = 2 * shape[0] * channels(shape[1]) * 2 + max(selected)
+            self.assertEqual(activation_scratch_bytes(shape, filter_accumulation='matrix', filter_stage=stage), needed)
+            self.assertEqual(plan.up_fir is not None, stage in ('up', 'both'))
+            self.assertEqual(plan.down_fir is not None, stage in ('down', 'both'))
+            for fir in (plan.up_fir, plan.down_fir):
+                if fir is not None:
+                    self.assertEqual(fir.coefficient_precision, 'split')
+                    self.assertEqual(fir.scratch, plan.scratch + 4 * plan.rows * plan.width)
+                    self.assertLessEqual(fir.scratch + fir.scratch_bytes, plan.scratch + needed)
+            kwargs = dict(input_shape=shape, input_address=plan.source, output_address=plan.destination,
+                          scratch_address=plan.scratch, identity_address=plan.identity,
+                          filter_accumulation='matrix', filter_stage=stage)
+            before = image.cursor
+            for size in (needed - 1, 0, -1, True, float(needed)):
+                with self.assertRaisesRegex(ValueError, 'scratch bytes'):
+                    prepare_activation(module, image, workspace_bytes=size, **kwargs)
+            self.assertEqual(image.cursor, before)
+            # A compiler may provide its larger graph-wide shared workspace.
+            prepare_activation(module, image, workspace_bytes=needed + 4096, **kwargs)
+            with self.assertRaisesRegex(ValueError, 'SRAM activation emitter'):
+                emit_activation_dram(image, plan)
+            malformed = replace(plan, up_fir=None) if plan.up_fir is not None else replace(plan, down_fir=None)
+            with self.assertRaisesRegex(ValueError, 'selected stage'):
+                emit_activation(image, malformed)
+        for order in ('serial', 'sorted'):
+            for stage in ('up', 'down', 'both'):
+                self.assertEqual(activation_scratch_bytes(shape, filter_accumulation=order, filter_stage=stage),
+                                 9 * shape[0] * channels(shape[1]) * 2)
+        for stage in (None, True, 1, 'encoder', []):
+            with self.assertRaisesRegex(ValueError, 'filter_stage'):
+                activation_scratch_bytes(shape, filter_stage=stage)
+        for shape in ((0, 1), (-1, 1), (1, 0), (True, 1), (1., 1), (1,), None):
+            with self.assertRaisesRegex(ValueError, 'shape'):
+                activation_scratch_bytes(shape)
+        with self.assertRaisesRegex(ValueError, 'SRAM capacity'):
+            activation_scratch_bytes((1, 4096), filter_accumulation='matrix')
+
+    def test_matrix_activation_capture_is_one_closed_program_for_each_stage(self):
+        for stage in ('up', 'down', 'both'):
+            _, plan, _, _ = fixture(317, 65, filter_accumulation='matrix', filter_stage=stage)
+            engine = _WholeGraphEngine(0x98000000)
+            with patch.object(udc, 'UE_AXI_DATA_WIDTH_BITS', 256), contextlib.redirect_stdout(io.StringIO()):
+                engine.start_capture()
+                emit_activation(engine, plan)
+                halt = engine.capture_count
+                engine.generate_instruction_halt()
+                engine.stop_capture()
+            self.assertEqual(engine._isa_reg_counter, 1)
+            self.assertFalse(engine._capture_loop_stack)
+            self.assertEqual(udc.check_isa_jumps(engine.capture_buffer, 0x98000000, name='Matrix activation'), [])
+            raw = b''.join(inst.get_bytes() for inst in engine.capture_buffer)
+            types = _instruction_types(raw)
+            self.assertEqual(types.count(udc.INSTRUCTION_HALT), 1)
+            self.assertNotIn(udc.INSTRUCTION_SWI, types)
+            self.assertTrue(all(kind == udc.INSTRUCTION_NOP for kind in types[halt + 1:]))
 
 
 if __name__ == "__main__":

@@ -80,6 +80,9 @@ class Graph:
     lstm_fused_gates: bool = False
     center_quantizer_scores: bool = False
     compensated_codebook: bool = False
+    filter_accumulation: str = "serial"
+    filter_math_scope: str = "both"
+    filter_stage: str = "both"
     output_address: int = shared.TENSOR_BASE
     output_bytes: int = 0
     tokens_address: int = 0
@@ -113,7 +116,8 @@ def convolution_reuse_pixels(module) -> int:
 
 def build_graph(encoder, decoder, compiled_samples: int, *, conv_precision="if8", lstm_precision="bf16",
                 lstm_cell_precision="bf16", lstm_tanh_precision="bf16", lstm_math_scope="both",
-                lstm_fused_gates=False, center_quantizer_scores=False, compensated_codebook=False) -> Graph:
+                lstm_fused_gates=False, center_quantizer_scores=False, compensated_codebook=False,
+                filter_accumulation="serial", filter_math_scope="both", filter_stage="both") -> Graph:
     """Trace module structure and exact lengths without executing neural layers."""
     if compiled_samples < HOP_LENGTH or compiled_samples % HOP_LENGTH:
         raise ValueError("compiled_samples must be a positive multiple of 200")
@@ -133,6 +137,12 @@ def build_graph(encoder, decoder, compiled_samples: int, *, conv_precision="if8"
         raise ValueError("Centered quantizer scores must be a bool")
     if not isinstance(compensated_codebook, bool):
         raise ValueError("Compensated codebook must be a bool")
+    if filter_accumulation not in ("serial", "sorted", "matrix"):
+        raise ValueError("Filter accumulation must be serial, sorted or matrix")
+    if filter_math_scope not in ("encoder", "decoder", "both"):
+        raise ValueError("Filter math scope must be encoder, decoder or both")
+    if filter_stage not in ("up", "down", "both"):
+        raise ValueError("Filter stage must be up, down or both")
     tensors = {"input": Tensor("input", (compiled_samples, 1), shared.INPUT_BASE)}
     operations = []
 
@@ -190,7 +200,14 @@ def build_graph(encoder, decoder, compiled_samples: int, *, conv_precision="if8"
         raise ValueError(f"Decoder output is {tensors[output].shape}, expected {(compiled_samples, 1)}")
     return Graph(compiled_samples, expected_codes[0], tensors, operations, output,
                  conv_precision, lstm_precision, lstm_cell_precision, lstm_tanh_precision, lstm_math_scope,
-                 lstm_fused_gates, center_quantizer_scores, compensated_codebook)
+                 lstm_fused_gates, center_quantizer_scores, compensated_codebook,
+                 filter_accumulation, filter_math_scope, filter_stage)
+
+
+def _filter_numerics(graph, operation):
+    selected = graph.filter_math_scope == "both" or operation.name.startswith(graph.filter_math_scope + ".")
+    return dict(filter_accumulation=graph.filter_accumulation if selected else "serial",
+                filter_stage=graph.filter_stage)
 
 
 def _lstm_numerics(graph, operation):
@@ -332,7 +349,7 @@ def _plan_memory(graph: Graph, layout: MemoryLayout) -> Graph:
         shape = graph.tensors[operation.inputs[0]].shape
         module = operation.module
         if operation.op == "activation":
-            operation.scratch_bytes = activation_scratch_bytes(shape)
+            operation.scratch_bytes = activation_scratch_bytes(shape, **_filter_numerics(graph, operation))
         elif operation.op == "lstm":
             numerics = _lstm_numerics(graph, operation)
             operation.scratch_bytes = lstm_scratch_bytes(shape,
@@ -396,7 +413,8 @@ def _prepare_operation(graph, image, identity_address, zero_address, operation):
     elif operation.op == "activation":
         operation.plan = prepare_activation(module, image, input_shape=source.shape,
             input_address=source.address, output_address=output.address,
-            scratch_address=graph.scratch_address, identity_address=identity_address)
+            scratch_address=graph.scratch_address, identity_address=identity_address,
+            workspace_bytes=graph.scratch_bytes, **_filter_numerics(graph, operation))
     elif operation.op == "lstm":
         recurrent_precision = ('if8' if graph.lstm_precision == 'if8'
             or (graph.lstm_precision == 'encoder-if8' and operation.name.startswith('encoder.'))
@@ -467,6 +485,7 @@ def emit_operation(engine, graph, operation, identity_address, zero_address):
 def compile_models(encoder, decoder, *, samples: int, conv_precision="if8", lstm_precision="bf16",
                    lstm_cell_precision="bf16", lstm_tanh_precision="bf16", lstm_math_scope="both",
                    lstm_fused_gates=False, center_quantizer_scores=False, compensated_codebook=False,
+                   filter_accumulation="serial", filter_math_scope="both", filter_stage="both",
                    memory_layout=None) -> dict:
     if memory_layout is not None and memory_layout not in LAYOUTS:
         raise ValueError("Unsupported BigCodec memory layout")
@@ -479,6 +498,8 @@ def compile_models(encoder, decoder, *, samples: int, conv_precision="if8", lstm
                 lstm_math_scope=lstm_math_scope, lstm_fused_gates=lstm_fused_gates,
                 center_quantizer_scores=center_quantizer_scores,
                 compensated_codebook=compensated_codebook,
+                filter_accumulation=filter_accumulation, filter_math_scope=filter_math_scope,
+                filter_stage=filter_stage,
                 memory_layout=layout)
         except _ModelCapacityError as error:
             if memory_layout is not None:
@@ -498,6 +519,7 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
                     lstm_precision="bf16", lstm_cell_precision="bf16", lstm_tanh_precision="bf16",
                     lstm_math_scope="both", lstm_fused_gates=False, center_quantizer_scores=False,
                     compensated_codebook=False,
+                    filter_accumulation="serial", filter_math_scope="both", filter_stage="both",
                     memory_layout=None) -> dict:
     if encoder.training or decoder.training:
         raise ValueError("Compile eval models loaded with remove_weight_norm=True")
@@ -511,7 +533,9 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
                                    lstm_tanh_precision=lstm_tanh_precision, lstm_math_scope=lstm_math_scope,
                                    lstm_fused_gates=lstm_fused_gates,
                                    center_quantizer_scores=center_quantizer_scores,
-                                   compensated_codebook=compensated_codebook),
+                                   compensated_codebook=compensated_codebook,
+                                   filter_accumulation=filter_accumulation, filter_math_scope=filter_math_scope,
+                                   filter_stage=filter_stage),
                         layout=memory_layout)
     layout = graph.layout
     image = shared._ImageBuilder(layout.model_base, layout.model_limit)
@@ -597,6 +621,8 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
             "lstm_fused_gates": lstm_fused_gates,
             "center_quantizer_scores": center_quantizer_scores,
             "compensated_codebook": compensated_codebook,
+            "filter_accumulation": filter_accumulation, "filter_math_scope": filter_math_scope,
+            "filter_stage": filter_stage,
             "lstm_recurrent_weights": {
                 "encoder": "BF16" if lstm_precision == "bf16" else "IF8-INT",
                 "decoder": "IF8-INT" if lstm_precision == "if8" else "BF16"}},
@@ -617,8 +643,14 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
             "waveform_tanh": "SRAM Pade evaluation with full 128-byte sample rows and explicit zero padding",
         },
         "approximation": {"snake_argument_clamp": SNAKE_ARGUMENT_LIMIT,
-            "snake_sine_squared_polynomial_degree": 10, "snake_storage": "BF16",
-            "alias_free_filters": "symmetric BF16, exact unit DC, nearest L2 within +/-2 ULP",
+            "snake_sine_squared_polynomial_degree": 10,
+            "snake_storage": "BF16",
+            "alias_free_filters": (
+                "Original taps split into BF16 high/residual lanes; native BF19/BF20 dot reduction, one BF16 output store"
+                if filter_accumulation == "matrix" else
+                "Symmetric BF16, exact unit DC, nearest L2 within +/-2 ULP"),
+            "filter_math_scope": filter_math_scope, "filter_stage": filter_stage,
+            "remaining_filter_stages": "Legacy serial BF16 FIR",
             "broadcast_scalars": "BF16 round-to-nearest-even before device encoding",
             "tanh": "BF16 odd Pade [7/6] with native reciprocal",
             "lstm_tanh": ("BF16 high/low Pade coefficients, products and sums with reciprocal refinement"
@@ -652,6 +684,12 @@ def main():
                         help="Subtract one inside the codebook dot product to preserve close score differences")
     parser.add_argument("--compensated-codebook", action=argparse.BooleanOptionalAction, default=False,
                         help="Use spare dot-product lanes for BF16 codebook residuals")
+    parser.add_argument("--filter-accumulation", choices=("serial", "sorted", "matrix"), default="serial",
+                        help="FIR taps: legacy order, ascending magnitude, or original high/residual matrix dot")
+    parser.add_argument("--filter-math-scope", choices=("encoder", "decoder", "both"), default="both",
+                        help="Select the stack that uses the requested FIR accumulation")
+    parser.add_argument("--filter-stage", choices=("up", "down", "both"), default="both",
+                        help="Select resampling stages for matrix FIR; remaining stages use legacy FIR")
     parser.add_argument("--memory-layout", choices=("auto", *(layout.name for layout in LAYOUTS)),
                         default="auto", help="Auto replans larger programs; an explicit arena avoids retrying compilation")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
@@ -686,6 +724,8 @@ def main():
                                  lstm_math_scope=args.lstm_math_scope, lstm_fused_gates=args.lstm_fused_gates,
                                  center_quantizer_scores=args.center_quantizer_scores,
                                  compensated_codebook=args.compensated_codebook,
+                                 filter_accumulation=args.filter_accumulation, filter_math_scope=args.filter_math_scope,
+                                 filter_stage=args.filter_stage,
                                  memory_layout=next((layout for layout in LAYOUTS if layout.name == args.memory_layout), None))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(prefix="bigcodec-", suffix=".tmp", dir=args.output.parent)
@@ -705,6 +745,8 @@ def main():
         "lstm_fused_gates": args.lstm_fused_gates,
         "center_quantizer_scores": args.center_quantizer_scores,
         "compensated_codebook": args.compensated_codebook,
+        "filter_accumulation": args.filter_accumulation, "filter_math_scope": args.filter_math_scope,
+        "filter_stage": args.filter_stage,
         "memory_layout": payload["hardware"]["memory_layout"],
         "bin_bytes": args.output.stat().st_size, "native_samples": samples,
         "compiled_samples": hardware["compiled_samples"], "code_frames": hardware["code_frames"],

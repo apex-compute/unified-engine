@@ -540,6 +540,42 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(report['dram_addressable_bytes'], 2**31)
             self.assertEqual(report['dram_required_bytes'], payload['hardware']['tensor_end'] - udc.DRAM_START_ADDR)
 
+    def test_cli_rejects_wrong_or_changing_build_without_publishing_audio(self):
+        for expected, versions, message in (
+                ('0x90f1f464', [0xdf0749de], 'differs from required'),
+                ('0xdf0749de', [0xdf0749de, 0x90f1f464], 'changed during execution')):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, binary, output = root/'source.wav', root/'codec.bin', root/'output.wav'
+                sf.write(source, np.full(199, .5, dtype=np.float32), SAMPLE_RATE, subtype='FLOAT')
+                payload = fixture_payload()
+                torch.save(payload, binary)
+                engine = FakeEngine(payload)
+                hostname = f'bigcodec-build-test-{os.getpid()}'
+                lockfile = Path(f'/tmp/pcie_ci_hw_{hostname}.lock')
+                try:
+                    with patch.object(sys, 'argv', ['bigcodec', '--bin', str(binary), '--input', str(source),
+                            '--output', str(output), '--cpu-core', '6', '--expected-version', expected]), \
+                         patch.object(runner, 'StreamingEngine', return_value=engine), \
+                         patch.object(engine, 'get_hardware_version', side_effect=versions), \
+                         patch.object(runner, 'configure_hardware_runtime', return_value=(3.0,
+                             SimpleNamespace(axi_data_width_bits=256, dram_size_gb=2), 3.0)), \
+                         patch.object(runner.socket, 'gethostname', return_value=hostname), \
+                         patch.object(runner.os, 'sched_getaffinity', return_value={6}), \
+                         patch.object(runner.os, 'sched_setaffinity'), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                        with self.assertRaisesRegex(RuntimeError, message):
+                            runner.main()
+                finally:
+                    lockfile.unlink(missing_ok=True)
+                self.assertFalse(output.exists())
+                self.assertFalse(output.with_suffix('.tokens.npz').exists())
+                self.assertFalse(output.with_suffix('.metrics.json').exists())
+                if len(versions) == 1:
+                    self.assertNotIn('reset', engine.events)
+                    self.assertFalse(any(isinstance(event, tuple) and event[0] == 'write'
+                                         for event in engine.events))
+
 
 class FileProtectionTests(unittest.TestCase):
     def test_resolved_symlink_hardlink_and_checkpoint_aliases_rejected(self):
