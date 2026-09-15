@@ -1,0 +1,136 @@
+{
+  "format": "bigcodec-fir-speed-pilot-decision-v1",
+  "scope": "Two unpromoted single-clip FPGA experiments; no eight-case speed-pilot evaluation",
+  "baseline": "matrix_production",
+  "profile_selected_for_default": null,
+  "production_implementation_changed": false,
+  "samples": 189883,
+  "sample_rate": 48000,
+  "duration_s": 3.9558958333333334,
+  "hardware_version": "0x90f1f464",
+  "axi_data_width_bits": 256,
+  "results": {
+    "matrix_compact": {
+      "waveform_relative_l2": 0.19142382414239245,
+      "processing_rtf": 6.584129623821261,
+      "startup_inclusive_rtf": 9.025099458171765,
+      "native_s": 25.8762111327832,
+      "token_matches": 308,
+      "token_count": 317,
+      "samples_bitidentical_to_matrix_production": false,
+      "tokens_and_metadata_identical_to_matrix_production": false,
+      "processing_time_reduction_fraction": -0.019642014267840624,
+      "bin_sha256": "c55ac7f9a6f238dd04020fc2dcf8f37edf7fd3eebead7625d906509ace2461ee",
+      "cached_bin_rehashed_at_packaging": true,
+      "full_precision_matches_compile_receipt": true,
+      "compile_sources_rehashed_at_packaging": true
+    },
+    "matrix_fused_write": {
+      "waveform_relative_l2": 0.1610445867445814,
+      "processing_rtf": 6.3599205224272275,
+      "startup_inclusive_rtf": 8.784945970307984,
+      "native_s": 24.98755562490623,
+      "token_matches": 307,
+      "token_count": 317,
+      "samples_bitidentical_to_matrix_production": true,
+      "tokens_and_metadata_identical_to_matrix_production": true,
+      "processing_time_reduction_fraction": 0.015079814253802892,
+      "bin_sha256": "24cdb44dd6d0aea9b6915ebc2004a43126e0a4311a34118a23267a689a4c7f02",
+      "cached_bin_rehashed_at_packaging": true,
+      "full_precision_matches_compile_receipt": true,
+      "compile_sources_rehashed_at_packaging": true
+    }
+  },
+  "decisions": {
+    "matrix_compact": "Rejected: waveform disagreement and processing time both increase versus production matrix FIR.",
+    "matrix_fused_write": "Not promoted: decoded samples and tokens equal production matrix FIR on this clip; about 1.5% lower processing time does not establish an eight-case improvement or resolve the matrix profile accuracy/runtime tradeoff."
+  },
+  "checks": {
+    "comparisons_recomputed_exactly": true,
+    "execution_contracts_verified": true,
+    "copied_artifacts_byte_identical": true,
+    "finite_audio_and_zero_waveform_padding": true,
+    "source_hashes_reverified": true,
+    "fused_sample_bits_and_token_metadata_equal": true
+  },
+  "binary_hash_scope": "Cached experiment bins rehashed at packaging; standard offline reports use tracked artifacts only",
+  "full_set_context": {
+    "path": "matrix_results.json",
+    "sha256": "b94a77e1199aae6b585cf2115a97d88c12149666e723c9832fbf76ec16fce528",
+    "note": "Only the original production matrix profile has the eight-case results; do not substitute short-clip fused timings into that report."
+  },
+  "copies": [
+    {
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_compact.wav",
+      "destination": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix_compact.wav",
+      "sha256": "a5e409760a2fd402056339f8b4252494c81a3c5e1cefea83cbd2ffa90fbe6b0e",
+      "bytes": 759612
+    },
+    {
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_compact.tokens.npz",
+      "destination": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix_compact.tokens.npz",
+      "sha256": "1209b1780411b6bdf0f24a598222ac98e2ba0e44d2f705bd8bec395db66fe5d1",
+      "bytes": 1388
+    },
+    {
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_compact.metrics.json",
+      "destination": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix_compact.metrics.json",
+      "sha256": "99d441ba37818699bb076c66ab76afb95971bec6d7efcc1cc34768987aafe908",
+      "bytes": 3819
+    },
+    {
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_compact.comparison.json",
+      "destination": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix_compact.comparison.json",
+      "sha256": "70a6058269c221438bee2d02856116002401a105e05f9bf7bfc62b877be94101",
+      "bytes": 1792
+    },
+    {
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_compact.pilot.json",
+      "destination": "models/bigcodec/validation/20260915_encoder_accuracy/diagnostics/fir_speed_matrix_compact.pilot.json",
+      "sha256": "bf7e0c9921e088fbf996208d1427ebe6f39d3787f4348d19d871e41a6b2f855d",
+      "bytes": 599
+    },
+    {
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_compact.compile.json",
+      "destination": "models/bigcodec/validation/20260915_encoder_accuracy/diagnostics/fir_speed_matrix_compact.compile.json",
+      "sha256": "91566095ebcc4c9a0634436715b0f20e9df136f0ba1a09dc5ff3e9fbf7c9eb38",
+      "bytes": 3687
+    },
+    {
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_fused_write.wav",
+      "destination": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix_fused_write.wav",
+      "sha256": "92f0c142b0be6e07988cb30d28cbcaa0e1a86de08795a9be3cdecb4262aaf163",
+      "bytes": 759612
+    },
+    {
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_fused_write.tokens.npz",
+      "destination": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix_fused_write.tokens.npz",
+      "sha256": "c75185e70b2de38cd8ded776e5084e20d026e77c0b0db24334f4b6cef6567af1",
+      "bytes": 1384
+    },
+    {
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_fused_write.metrics.json",
+      "destination": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix_fused_write.metrics.json",
+      "sha256": "04422ac4a2c406424023363f37e12e925500962684e47c645fedeb4be74b7832",
+      "bytes": 3852
+    },
+    {
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_fused_write.comparison.json",
+      "destination": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix_fused_write.comparison.json",
+      "sha256": "70610a319bcf59e522c3d1ccdbaa6b9059c31cdfe6a596c8abfd7e2148a605e5",
+      "bytes": 1800
+    },
+    {
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_fused_write.pilot.json",
+      "destination": "models/bigcodec/validation/20260915_encoder_accuracy/diagnostics/fir_speed_matrix_fused_write.pilot.json",
+      "sha256": "7b5018ae19df57ffb917e0d43a12b688ad0aa089d8b1f9459586080e4ef3967f",
+      "bytes": 602
+    },
+    {
+      "source": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_matrix_fused_write.compile.json",
+      "destination": "models/bigcodec/validation/20260915_encoder_accuracy/diagnostics/fir_speed_matrix_fused_write.compile.json",
+      "sha256": "98be76d22ca90399d425559e3f74bb16e30101fe25e8e7fe38bb0818ea8af7f2",
+      "bytes": 3703
+    }
+  ]
+}
