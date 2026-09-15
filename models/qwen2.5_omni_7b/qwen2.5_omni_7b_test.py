@@ -138,19 +138,11 @@ PREFILL_INPUT_TOKEN_LIMIT = 384
 # execution padding and do not become visible context tokens.
 PREFILL_MAX_SEQ_LEN = REQUIRED_ENGINES * 64
 
-# These supported U55 images share the non-CONV arithmetic ISA used by Omni. The E7
-# image predates CHECK_CLEAR, so its runner uses host-separated one-shot flag
-# rounds; it is intentionally supported without changing the FPGA image.
+# The build ID read from UE_FPGA_VERSION is recorded and used to pick the flag
+# protocol, but it is not checked against an allowlist: any image that carries
+# the arithmetic ISA Omni needs is allowed to run. The E7 image predates
+# CHECK_CLEAR, so its runner uses host-separated one-shot flag rounds.
 LEGACY_HOST_SEGMENTED_BUILD = 0xE7AC2CAF
-CURRENT_U55C_BUILD = 0xB3ED9175
-SUPPORTED_FPGA_BUILDS = frozenset(
-    {
-        0xFE984D16,
-        0x0305D87D,
-        CURRENT_U55C_BUILD,
-        LEGACY_HOST_SEGMENTED_BUILD,
-    }
-)
 ENGINE_BASE_STRIDE = 0x00010000
 RESET_PROBE_ISA_ADDR = 0x1FA000000
 
@@ -247,9 +239,6 @@ class Qwen25OmniUnifiedEngine(
 
         self.multi_core = multi_core
         self.fpga_build = None if fpga_build is None else int(fpga_build)
-        if self.fpga_build is not None and self.fpga_build not in SUPPORTED_FPGA_BUILDS:
-            raise ValueError(
-                f"unsupported Qwen2.5-Omni FPGA build 0x{self.fpga_build:08x}")
         self._multi_core_schedulers: dict[str, MultiEngineScheduler] = {}
         self._worker_isa_used: dict[int, dict[str, int]] = {}
         self._params_regions: dict[str, dict[str, Any]] | None = None
@@ -1793,16 +1782,6 @@ def reset_selected_engines(cores: int = REQUIRED_ENGINES) -> int:
         & 0xFFFFFFFF
         for engine in engines
     ]
-    unsupported = sorted(set(versions).difference(SUPPORTED_FPGA_BUILDS))
-    if unsupported:
-        supported = ", ".join(
-            f"0x{version:08x}" for version in sorted(SUPPORTED_FPGA_BUILDS)
-        )
-        got = ", ".join(f"core {core}=0x{version:08x}"
-                        for core, version in enumerate(versions))
-        raise RuntimeError(
-            f"unsupported FPGA build(s): {got}; supported builds: {supported}"
-        )
     if len(set(versions)) != 1:
         got = ", ".join(f"core {core}=0x{version:08x}"
                         for core, version in enumerate(versions))
