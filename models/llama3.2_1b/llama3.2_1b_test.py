@@ -1931,7 +1931,6 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         L.append(f"- **HW version:** {hw_version_str}")
         L.append(f"- **Hardware info register:** {user_dma_core.hardware_info_summary()}")
         L.append(f"- **--dev:** {args.dev}")
-        L.append(f"- **--device:** {args.device}")
         L.append(f"- **Clock / frequency:** {clock_ns:.4f} ns ({freq_mhz:.1f} MHz)")
         L.append(f"- **Cores:** {cores}")
         L.append(f"- **Prefill kernel:** {run_result.get('prefill_kernel', 'n/a')}")
@@ -2155,8 +2154,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 def llama_run_summary_filename(args, prefix: str = "llama3.2_1b_test") -> str:
     """Per-run summary .md filename encoding the CLI config, e.g.
     ``llama3.2_1b_test_xdma1_kintex7.md`` or ``..._xdma0_alveo_puregreedy.md``.
-    dev/device are always present; other knobs are appended only when non-default."""
-    tokens = [args.dev, args.device]
+    dev and HW_INFO are present when available; other knobs are appended only when non-default."""
+    tokens = [args.dev]
+    if user_dma_core.HW_INFO_RAW is not None:
+        tokens.append(f"hw{user_dma_core.HW_INFO_RAW:08x}")
     if getattr(args, "multi_core", 1) and args.multi_core > 1:
         tokens.append(f"multi-core-{args.multi_core}")
     if getattr(args, "pure_greedy", False):
@@ -2180,7 +2181,6 @@ def main():
     )
     parser.add_argument("--local-weights", action="store_true", help="Use llama3.2_1b_bin/full_model_weights.bin")  # legacy dev path; not in standard bin set
     parser.add_argument('--dev', type=str, default='xdma0', help='DMA device name (default: xdma0)')
-    parser.add_argument('--device', type=str, default='kintex7', help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument(
         '--prefill-kernel',
         choices=Llama32_1b_UnifiedEngine.VALID_KERNELS,
@@ -2224,13 +2224,12 @@ def main():
                              'special tokens). Default 256.')
     args = parser.parse_args()
 
-    set_dma_device("efinix" if args.device == "efinix" else args.dev)
+    set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     DMA_DEVICE_H2C = user_dma_core.DMA_DEVICE_H2C
     DMA_DEVICE_C2H = user_dma_core.DMA_DEVICE_C2H
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
     user_dma_core.configure_clock_from_hardware()
-    print(f"FPGA profile: device={args.device}")
     print(user_dma_core.hardware_info_summary())
 
     prefill_kernel = args.prefill_kernel or Llama32_1b_UnifiedEngine.DEFAULT_PREFILL_KERNEL

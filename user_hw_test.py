@@ -18,14 +18,23 @@ import random
 from re import S
 import time
 import threading
-from read_trace import generate_trace
+from read_trace import (
+    INST_LINE_WORDS,
+    TRACE_QUEUE_BIT,
+    TRACE_TICK_MASK,
+    _queue_loading_reason,
+    generate_trace,
+    split_trace_bram_words,
+)
 import torch
 
 from user_dma_core import (
+    ALU_MODE_SET,
     DMA_DEVICE_C2H,
     DMA_DEVICE_H2C,
     DMA_DEVICE_USER,
     DRAM_ACTIVATION_ADDR,
+    INSTRUCTION_REG_ALU_NONPREFETCH,
     INSTRUCTION_SIZE_BYTES,
     INT_CAUSE_HALT,
     INT_CAUSE_NONE,
@@ -47,6 +56,10 @@ from user_dma_core import (
     set_dma_device,
     UnifiedEngine,
     UE_FMAX_CONTEXT_SIZE,
+    UE_PIPELINE_COUNTER_CLK_DIV,
+    UE_TRACE_BRAM_ADDR,
+    UE_TRACE_BRAM_DATA,
+    UE_TRACE_SIZE,
     UE_VECTOR_SIZE,
     ue_35bit_addr_shifter,
     ue_axi_beat_bf16_elems,
@@ -1543,6 +1556,14 @@ def unified_attention_test(batch: int = 256, aligned_seq_len: int = 256, head_di
             inst_bytes=instruction_size_bytes,
         )
 
+        # Placed after `tag` is built and before clear_capture_buffer(): every
+        # leg runs this same _run_case, so without the tag each leg would
+        # overwrite the previous one's trace for the same shape.
+        generate_trace(
+            ue,
+            f"unified_attention_trace_{batch}_{aligned_seq_len}_{head_dim}{tag}.csv",
+        )
+
         ue.clear_capture_buffer()
         ue.reset_tensor_dram_addr()
         ue.reset_program_dram_addr()
@@ -1681,6 +1702,9 @@ def matmat_mul_unified_test(
         main_program_dram_addr = ue.get_program_dram_addr()
         main_instruction_size  = ue.write_captured_instructions_to_dram(main_program_dram_addr)
         ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        # Preamble capture replaces this buffer; keep the PBI body as a
+        # generate_trace fallback. write_captured also records both images.
+        main_captured = list(ue.get_captured_instructions())
 
         # Preamble: prime dim GPRs (M,K,N) + optional address GPRs, then jump into the main body.
         PREAMBLE_RESERVED_BYTES = (16 if dynamic_addr else 8) * INSTRUCTION_SIZE_BYTES
@@ -1728,6 +1752,17 @@ def matmat_mul_unified_test(
         ue.start_execute_from_dram(preamble_dram_addr)
         ue.wait_queue(10.0)
         ue.report_timing_and_instruction_count()
+
+        # TRACE starts at the preamble (ADD_SET M/K/N + abs jump). Both images
+        # were recorded by write_captured_instructions_to_dram(); restore the
+        # main body only as a fallback if image tracking is unavailable.
+        ue.capture_buffer = main_captured
+        ue._last_program_write_addr = main_program_dram_addr
+        ue._last_execute_addr = preamble_dram_addr
+        generate_trace(
+            ue,
+            f"matmat_mul_pbi_unified_trace_{m}_{k}_{n}{_flags(f'dynamic_{tag}')}.csv",
+        )
 
         iter_flops = _runtime_flops(m, k, n)
 
@@ -1831,6 +1866,14 @@ def matmat_mul_unified_test(
         ue.start_execute_from_dram(program_dram_addr)
         ue.wait_queue(10.0)
         ue.report_timing_and_instruction_count()
+
+        # Legacy unrolls the tiling at compile time, so its retire count is much
+        # larger than the dynamic PBI body's -- generate_trace skips itself past
+        # UE_TRACE_SIZE, which is the usual outcome for anything but small shapes.
+        generate_trace(
+            ue,
+            f"matmat_mul_legacy_unified_trace_{m}_{k}_{n}{_flags('legacy')}.csv",
+        )
 
         iter_flops = _runtime_flops(m, k, n)
 
@@ -4453,7 +4496,21 @@ def quantized_matmat_mul_unified_test(M: int, K: int, N: int, data_type: TYPE = 
         ue.wait_queue(10.0) # 10 seconds timeout
         ue.report_timing_and_instruction_count()
 
-        generate_trace(ue, f"quantized_matmat_mul_core_trace_{M}_{K}_{N}_{'bias_enabled' if bias_enable else 'bias_disabled'}_{'bias_mode_{bias_mode}' if bias_mode else 'bias_mode_none'}_{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_{'silu_enabled' if silu_enable else 'silu_disabled'}_{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}.csv")
+        # bias_mode was inside a plain literal, so every bias-enabled run wrote to
+        # the same "bias_mode_{bias_mode}" filename and broadcast_N/full_matrix
+        # overwrote each other.
+        trace_flags = (
+            f"{'bias_enabled' if bias_enable else 'bias_disabled'}_"
+            f"{('bias_mode_' + str(bias_mode)) if bias_mode else 'bias_mode_none'}_"
+            f"{'gelu_enabled' if gelu_enable else 'gelu_disabled'}_"
+            f"{'silu_enabled' if silu_enable else 'silu_disabled'}_"
+            f"{'sigmoid_enabled' if sigmoid_enable else 'sigmoid_disabled'}_"
+            # Both legs of the RNG-matched pair run this same _run_case, so the
+            # leg has to be in the name or the dynamic run overwrites the legacy
+            # run's trace for the identical shape.
+            f"{'dynaddr' if dynamic_addr else ('dynamic' if dynamic else 'legacy')}"
+        )
+        generate_trace(ue, f"quantized_matmat_mul_core_trace_{M}_{K}_{N}_{trace_flags}.csv")
 
         report_flop_rate_gflops, flops_ratio = ue.report_flop_rate_gflops(total_flops_from_dequantize)
         print(f"Report FLOPS for Quantize Matrix-Matrix Multiply dot-product: {report_flop_rate_gflops:.2f} GFLOPS, {flops_ratio:.2f}% peak throughput for M={M}, N={N}")
@@ -6220,6 +6277,14 @@ def isa_rela_loop_test() -> None:
 
     got = ue.dma_from_accelerator_memory(dram_16bit_output, (n_elem,))
     assert torch.equal(got.view(-1), in2 + 1), "output must equal sequential B plus ones row"
+
+    # Dump TRACE after the data checks but before clear_capture_buffer(): the
+    # offline PC replay reads the captured instructions back out of the engine,
+    # so the capture buffer has to still hold this program. verify_trace_loop_map
+    # is what earns this call -- it checks the retire rows against the loop
+    # structure, which pc_reg alone cannot localize when a RELA_JNZ miscounts.
+    generate_trace(ue, "isa_rela_loop_trace.csv")
+
     print(
         f"isa_rela_loop_test_transplant: PASS ({n_elem} elements, _inst_id_after_halt={inst_index_after_halt}, "
         f"pc_reg={pc_reg}, pbi_stream={pointer_idx_input}, pbi_out={pointer_idx_out}, loop_level={loop_reg})"
@@ -6356,6 +6421,8 @@ def isa_abs_loop_test() -> None:
         f"_inst_id_after_halt={inst_index_after_halt})"
     )
 
+    generate_trace(ue, "isa_abs_loop_trace.csv")
+
     print(
         f"isa_abs_loop_test: PASS (loop_cnt={loop_cnt}, pc_reg={pc_reg}, "
         f"loop_reg={loop_reg}, loop_body_size={loop_body_size}, program_dram=0x{program_dram_addr:x})"
@@ -6437,6 +6504,9 @@ def isa_abs_loop_test() -> None:
         f"loop_body_word=0x{loop_body_word_addr:x}, n_align_nops={n_align_nops})"
     )
     record_test("isa_abs_loop_reg_abs", f"loop_cnt={loop_cnt_reg_abs}")
+
+    generate_trace(ue2, "isa_abs_loop_reg_abs_trace.csv")
+
     ue2.clear_capture_buffer()
     ue2.reset_isa_reg_counter()
 
@@ -6578,6 +6648,8 @@ def isa_reg_min_sub_mul_test() -> None:
     )
 
     record_test("isa_reg_min_sub_mul")
+
+    generate_trace(ue, "isa_reg_min_sub_mul_trace.csv")
 
     ue.clear_capture_buffer()
     ue.reset_inst_ptr_counter()
@@ -6724,7 +6796,514 @@ def isa_mult_div_shift_test() -> None:
 
     record_test("isa_new_alu_ops")
 
+    generate_trace(ue, "isa_mult_div_shift_trace.csv")
+
     ue.clear_capture_buffer()
+    ue.reset_inst_ptr_counter()
+    ue.reset_isa_reg_counter()
+
+
+def _trace_word_tick(word: int) -> int:
+    """Pipeline-counter tick stored in a TRACE_BRAM word (fill events are tagged)."""
+    w = int(word) & 0xFFFFFFFF
+    if w & TRACE_QUEUE_BIT:
+        return w & TRACE_TICK_MASK
+    return w
+
+
+def _read_ue_trace_ticks(ue: UnifiedEngine, expected_count: int, label: str) -> list[int]:
+    """Read TRACE_BRAM timestamps. ``UE_TRACE_BRAM_ADDR`` is the write pointer
+    (row count) on read, and the index to sample on write.
+
+    Queue i-cache DMA writes tagged fill start/done rows (bit 31). Those are
+    not ISA retires; ``expected_count`` is the retire count (``pc_reg``), not
+    the raw write pointer. Legacy bitstreams never tag, so pointer == retires.
+    """
+    trace_count = ue.read_reg32(UE_TRACE_BRAM_ADDR)
+    raw = []
+    for i in range(trace_count):
+        ue.write_reg32(UE_TRACE_BRAM_ADDR, i)
+        raw.append(int(ue.read_reg32(UE_TRACE_BRAM_DATA)))
+    retire_ticks, fills = split_trace_bram_words(raw)
+    n_tagged = sum(1 for w in raw if (int(w) & TRACE_QUEUE_BIT))
+    assert len(retire_ticks) == expected_count, (
+        f"{label}: expected {expected_count} TRACE retires, got {len(retire_ticks)} "
+        f"(TRACE_BRAM rows={trace_count}, fill_stamps={n_tagged}, fills={len(fills)})"
+    )
+    assert len(raw) == n_tagged + len(retire_ticks), (
+        f"{label}: TRACE rows {len(raw)} != tagged {n_tagged} + retires {len(retire_ticks)}"
+    )
+    ticks_in_order = [_trace_word_tick(w) for w in raw]
+    for i in range(1, len(ticks_in_order)):
+        assert ticks_in_order[i] >= ticks_in_order[i - 1], (
+            f"{label}: non-monotonic TRACE_BRAM ticks {ticks_in_order} (raw={raw})"
+        )
+    return retire_ticks
+
+
+def _assert_icache_fill_sites(
+    ticks: list[int],
+    raw: list[int],
+    expected_starts: list[int],
+    label: str,
+    min_gap_ticks: int = 2,
+) -> list[dict]:
+    """Check i-cache ``RAM_DMA`` sites from tagged TRACE, or tick holes if untagged.
+
+    Newer RTL writes bit-31 start/done stamps. This FPGA image may omit them
+    (``TRACE_BRAM`` rows == ``pc_reg``). The DMA still stalls FETCH, so the
+    retire after the fill has a pipeline-counter gap of at least
+    ``min_gap_ticks`` (start-of-program uses ``ticks[0]``).
+    """
+    _retire_ticks, fills = split_trace_bram_words(raw)
+    if fills:
+        rb = [int(ev.get("retires_before", -1)) for ev in fills]
+        for want in expected_starts:
+            assert want in rb, (
+                f"{label}: expected fill retires_before={want}, got {rb}"
+            )
+        return fills
+    assert ticks, f"{label}: empty TRACE (untagged, no ticks)"
+    for want in expected_starts:
+        if want <= 0:
+            gap = int(ticks[0])
+        else:
+            assert want < len(ticks), (
+                f"{label}: need TRACE retire {want} for DMA hole, len={len(ticks)}"
+            )
+            gap = int(ticks[want]) - int(ticks[want - 1])
+        assert gap >= min_gap_ticks, (
+            f"{label}: expected i-cache DMA hole at retire {want} "
+            f"(gap={gap} ticks, min={min_gap_ticks}); TRACE has no fill tags"
+        )
+    return []
+
+
+def isa_trace_commit_semantics_test() -> None:
+    """
+    Verify TRACE_BRAM timestamps after the prefetch pipeline-counter fix.
+
+    Only prefetchable instructions (REG_ALU_PREFETCH / PBI_SET_PREFETCH) may
+    decode while a UE op is still in the engine. Every other instruction,
+    including UE_OP and non-prefetch ALU, waits on ``engine_busy`` before
+    decode. HALT waits for the engine to finish before going idle.
+
+    Each instruction still writes its own TRACE row (prefetch does not collapse
+    two ops into one stamp). TRACE ticks are in UE_PIPELINE_COUNTER_CLK_DIV
+    (16-cycle) units, so back-to-back retires often share the same tick.
+
+    Prefetch TRACE may commit at decode (overlap) or be held until
+    ``engine_done`` and drained one per cycle. Either way the two prefetch
+    rows stamp together and HALT is still after the memcpy, not at decode.
+    """
+    n_chunks = 64
+    n_elem = UE_VECTOR_SIZE * n_chunks
+    memcpy_len_bytes = n_elem * 2
+    max_small_gap_ticks = 4
+
+    def _run_memcpy_program(label: str, extra_insts, expected_rows: int, expected_pc: int):
+        ue = UnifiedEngine()
+        dram_src = ue.allocate_tensor_dram(memcpy_len_bytes)
+        src = torch.arange(1, n_elem + 1, dtype=torch.bfloat16)
+        ue.dma_to_accelerator_memory(dram_src, src)
+
+        scratch = ue.alloc_isa_reg()
+
+        ue.start_capture()
+        ue.accelerator_memory_to_sram(
+            accelerator_dram_address=dram_src,
+            sram_address=0x00000,
+            element_size=UE_VECTOR_SIZE,
+            memcpy_length_bytes=memcpy_len_bytes,
+        )
+        extra_insts(ue, scratch)
+        ue.generate_instruction_halt()
+        ue.stop_capture()
+
+        program_dram_addr = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(program_dram_addr)
+        ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+        ue.start_execute_from_dram(program_dram_addr)
+        ue.wait_queue(30.0)
+
+        latency_cycles, pc_reg = ue.report_timing_and_instruction_count()
+        assert pc_reg == expected_pc, (
+            f"{label}: pc_reg mismatch: got {pc_reg}, expected {expected_pc}"
+        )
+        ticks = _read_ue_trace_ticks(ue, expected_rows, label)
+        latency_ticks = latency_cycles // UE_PIPELINE_COUNTER_CLK_DIV
+        # ticks[0] is memcpy decode after I-fetch. Total latency includes that
+        # fetch, which can exceed the 64-chunk memcpy (observed 36 vs 21), so
+        # latency_ticks // 2 false-fails a correct UE→HALT gap. Floor the
+        # "large" gap against the post-decode span instead.
+        assert latency_ticks >= ticks[0], (
+            f"{label}: first TRACE tick {ticks[0]} is after latency_ticks={latency_ticks}"
+        )
+        memcpy_span_ticks = latency_ticks - ticks[0]
+        assert memcpy_span_ticks > max_small_gap_ticks + 2, (
+            f"{label}: memcpy runtime too short to distinguish prefetch hold; "
+            f"latency_ticks={latency_ticks}, ticks={ticks}, pc_reg={pc_reg}"
+        )
+        min_large_gap_ticks = max(memcpy_span_ticks // 2, max_small_gap_ticks + 1)
+
+        ue.clear_capture_buffer()
+        ue.reset_inst_ptr_counter()
+        ue.reset_isa_reg_counter()
+        return ticks, latency_cycles, latency_ticks, min_large_gap_ticks, pc_reg
+
+    def _no_extra(_ue, _scratch):
+        pass
+
+    def _prefetchable(ue, scratch):
+        # May decode while memcpy is still in the engine; TRACE write is held.
+        # generate_instruction_add_set uses INSTRUCTION_REG_ALU_PREFETCH.
+        ue.generate_instruction_add_set(scratch, 1)
+        # generate_instruction_pbi_init uses INSTRUCTION_PBI_SET_PREFETCH.
+        ue.generate_instruction_pbi_init(inst_pointer_idx=ue.alloc_inst_ptr())
+
+    def _nonprefetch_alu(ue, scratch):
+        # Decode already waits on engine_busy; TRACE writes at that later decode.
+        ue.ue_isa_descriptor(
+            INSTRUCTION_REG_ALU_NONPREFETCH,
+            immediate_value=1,
+            isa_mode=ALU_MODE_SET,
+            src_reg_idx=scratch,
+            dst_reg_idx=scratch,
+        )
+
+    # 1) memcpy + HALT (2 TRACE rows).
+    #    UE_OP stamps at decode; HALT stamps after engine_done. Observed on
+    #    puzhi: [36, 57] — tick 36 is I-fetch + memcpy decode, 57 is HALT.
+    #    The large gap is the memcpy itself, not half of total latency
+    #    (I-fetch can be longer than the 64-chunk copy).
+    ticks, latency_cycles, latency_ticks, min_large_gap, pc_reg = _run_memcpy_program(
+        "memcpy_halt", _no_extra, expected_rows=2, expected_pc=2
+    )
+    ue_halt_gap = ticks[1] - ticks[0]
+    assert ue_halt_gap >= min_large_gap, (
+        "isa_trace_commit_semantics_test: memcpy+HALT expected a large UE→HALT gap "
+        "(UE retires at decode, HALT after engine_done); "
+        f"got gap={ue_halt_gap} ticks, min={min_large_gap} "
+        f"(ticks={ticks}, latency_ticks={latency_ticks})"
+    )
+
+    # 2) memcpy + prefetch ALU + prefetch PBI + HALT (4 TRACE rows, not 1).
+    #    Prefetch ops decode during memcpy. TRACE may stamp at that decode
+    #    (observed [36, 37, 37, 57]) or be held until engine_done and drained
+    #    ([36, 66, 66, 66]). Require: own rows, ALU+PBI together, HALT late.
+    ticks_pf, _, latency_ticks_pf, min_large_gap_pf, pc_reg_pf = _run_memcpy_program(
+        "memcpy_prefetch_halt", _prefetchable, expected_rows=4, expected_pc=4
+    )
+    memcpy_to_alu = ticks_pf[1] - ticks_pf[0]
+    alu_to_pbi = ticks_pf[2] - ticks_pf[1]
+    pbi_to_halt = ticks_pf[3] - ticks_pf[2]
+    memcpy_to_halt_pf = ticks_pf[3] - ticks_pf[0]
+    assert alu_to_pbi <= max_small_gap_ticks, (
+        "isa_trace_commit_semantics_test: prefetch ALU and PBI should stamp together; "
+        f"ALU→PBI gap={alu_to_pbi} ticks (ticks={ticks_pf})"
+    )
+    assert memcpy_to_halt_pf >= min_large_gap_pf, (
+        "isa_trace_commit_semantics_test: HALT must wait for engine_done after prefetch; "
+        f"memcpy→HALT gap={memcpy_to_halt_pf} ticks, min={min_large_gap_pf} "
+        f"(ticks={ticks_pf}, latency_ticks={latency_ticks_pf})"
+    )
+
+    # 3) memcpy + non-prefetch ALU + HALT (3 TRACE rows; control).
+    #    Decode waits on engine_busy, so the first gap is large even without
+    #    the hold. ALU then HALT stamp back-to-back. Observed: [36, 57, 57].
+    ticks_np, _, latency_ticks_np, min_large_gap_np, _ = _run_memcpy_program(
+        "memcpy_nonprefetch_halt", _nonprefetch_alu, expected_rows=3, expected_pc=3
+    )
+    memcpy_to_np = ticks_np[1] - ticks_np[0]
+    np_to_halt = ticks_np[2] - ticks_np[1]
+    assert memcpy_to_np >= min_large_gap_np, (
+        "isa_trace_commit_semantics_test: non-prefetch ALU should wait for engine_busy; "
+        f"memcpy→ALU gap={memcpy_to_np} ticks, min={min_large_gap_np} "
+        f"(ticks={ticks_np}, latency_ticks={latency_ticks_np})"
+    )
+    assert np_to_halt <= max_small_gap_ticks, (
+        "isa_trace_commit_semantics_test: HALT should follow non-prefetch ALU closely; "
+        f"ALU→HALT gap={np_to_halt} ticks (ticks={ticks_np})"
+    )
+
+    print(
+        "isa_trace_commit_semantics_test: PASS "
+        f"(memcpy_halt ticks={ticks} gap={ue_halt_gap}, "
+        f"prefetch ticks={ticks_pf} memcpy→alu={memcpy_to_alu} alu→pbi={alu_to_pbi} "
+        f"memcpy→halt={memcpy_to_halt_pf} pbi→halt={pbi_to_halt}, nonprefetch ticks={ticks_np}, "
+        f"latency_cycles={latency_cycles}, pc_reg={pc_reg}/{pc_reg_pf})"
+    )
+    record_test(
+        "isa_trace_commit_semantics",
+        f"prefetch_memcpy_alu_gap={memcpy_to_alu}, bytes={memcpy_len_bytes}",
+    )
+
+
+def isa_icache_multiline_test() -> None:
+    """Static program longer than one 512-word i-cache line (not a looping TRACE).
+
+    ``INST_LINE_WORDS`` NOPs fill the first DRAM line; more NOPs + HALT sit on the
+    next line so FETCH hits ``inst_ram_empty`` and does a sequential ``RAM_DMA``.
+    ``pc_reg`` equals the executed instruction count (no RELA replay). TRACE must
+    show the start-of-program fill and the empty-line reload (tagged bit-31
+    stamps, or the same sites as pipeline-counter holes on untagged images).
+    """
+    n_nop = INST_LINE_WORDS + 1  # 513 NOPs; + HALT => 514 static, even, no pad NOP
+    ue = UnifiedEngine()
+    ue.start_capture()
+    for _ in range(n_nop):
+        ue.generate_instruction_nop()
+    ue.generate_instruction_halt()
+    ue.stop_capture()
+
+    n_static = len(ue.get_captured_instructions())
+    assert n_static > INST_LINE_WORDS, (
+        f"isa_icache_multiline_test: static image {n_static} must exceed "
+        f"INST_LINE_WORDS={INST_LINE_WORDS}"
+    )
+
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    n_static = len(ue.get_captured_instructions())
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(30.0)
+
+    _, pc_reg = ue.report_timing_and_instruction_count()
+    assert pc_reg == n_static, (
+        f"isa_icache_multiline_test: pc_reg={pc_reg} != static image {n_static}"
+    )
+    assert pc_reg > INST_LINE_WORDS, (
+        f"isa_icache_multiline_test: executed {pc_reg} instructions, "
+        f"need more than one i-cache line ({INST_LINE_WORDS})"
+    )
+
+    ticks = _read_ue_trace_ticks(ue, pc_reg, "isa_icache_multiline")
+    trace_count = ue.read_reg32(UE_TRACE_BRAM_ADDR)
+    raw = []
+    for i in range(trace_count):
+        ue.write_reg32(UE_TRACE_BRAM_ADDR, i)
+        raw.append(int(ue.read_reg32(UE_TRACE_BRAM_DATA)))
+    fills = _assert_icache_fill_sites(
+        ticks,
+        raw,
+        [0, INST_LINE_WORDS],
+        "isa_icache_multiline_test",
+    )
+
+    generate_trace(ue, "isa_icache_multiline_trace.csv")
+    print(
+        f"isa_icache_multiline_test: PASS (static={n_static}, pc_reg={pc_reg}, "
+        f"fills={len(fills)}, TRACE_rows={trace_count}, retire_ticks[0]={ticks[0]})"
+    )
+    record_test(
+        "isa_icache_multiline",
+        f"static={n_static}, fills={len(fills)}, line={INST_LINE_WORDS}",
+    )
+    ue.clear_capture_buffer()
+    ue.reset_inst_ptr_counter()
+    ue.reset_isa_reg_counter()
+
+
+def isa_icache_miss_conditions_test() -> None:
+    """One static TRACE that hits both i-cache ``RAM_DMA`` paths.
+
+    1. **icache empty** — start of program, then ``FETCH`` ``inst_ram_empty`` after
+       exactly ``INST_LINE_WORDS`` NOPs (sequential next-line DMA).
+    2. **absolute jump** — ``JUMP_MODE_ABSOLUTE`` after that line, which always
+       enters ``STATE_RAM_DMA_START`` even when the target is on the same line.
+
+    Relative jumps are not used. ``pc_reg`` is the executed count (the 64 B
+    align NOP between the jump and HALT is skipped).
+    """
+    align = 2 * INSTRUCTION_SIZE_BYTES
+    ue = UnifiedEngine()
+    program_dram_addr = ue.get_program_dram_addr()
+
+    ue.start_capture()
+    for _ in range(INST_LINE_WORDS):
+        ue.generate_instruction_nop()
+    jump_idx = ue.capture_count
+    ue.generate_instruction_jump_abs(0)
+    while (
+        program_dram_addr + ue.capture_count * INSTRUCTION_SIZE_BYTES
+    ) % align != 0:
+        ue.generate_instruction_nop()
+    halt_idx = ue.capture_count
+    ue.generate_instruction_halt()
+    ue.stop_capture()
+
+    halt_word_addr = ue_35bit_addr_shifter(
+        program_dram_addr + halt_idx * INSTRUCTION_SIZE_BYTES
+    )
+    ue._patch_jump_immediate(jump_idx, halt_word_addr)
+
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(30.0)
+
+    expected_pc = INST_LINE_WORDS + 2  # NOPs + JUMP_ABS + HALT (align NOP skipped)
+    _, pc_reg = ue.report_timing_and_instruction_count()
+    assert pc_reg == expected_pc, (
+        f"isa_icache_miss_conditions_test: pc_reg={pc_reg} != {expected_pc} "
+        f"(jump_idx={jump_idx}, halt_idx={halt_idx})"
+    )
+
+    ticks = _read_ue_trace_ticks(ue, pc_reg, "isa_icache_miss_conditions")
+    trace_count = ue.read_reg32(UE_TRACE_BRAM_ADDR)
+    raw = []
+    for i in range(trace_count):
+        ue.write_reg32(UE_TRACE_BRAM_ADDR, i)
+        raw.append(int(ue.read_reg32(UE_TRACE_BRAM_DATA)))
+    fills = _assert_icache_fill_sites(
+        ticks,
+        raw,
+        [0, INST_LINE_WORDS, INST_LINE_WORDS + 1],
+        "isa_icache_miss_conditions_test",
+    )
+    retires_before_each_fill = [int(ev.get("retires_before", -1)) for ev in fills]
+    reasons: list[str]
+    if fills:
+        pc_rows = (
+            [{"jump_mode": "", "taken": ""}] * INST_LINE_WORDS
+            + [{"jump_mode": "ABSOLUTE", "taken": "taken"}]
+            + [{"jump_mode": "", "taken": ""}]
+        )
+        reasons = [_queue_loading_reason(ev, pc_rows) for ev in fills[:3]]
+        assert reasons == ["icache empty", "icache empty", "absolute jump"], (
+            f"isa_icache_miss_conditions_test: fill reasons {reasons} "
+            f"(retires_before={retires_before_each_fill[:3]})"
+        )
+    else:
+        reasons = ["icache empty", "icache empty", "absolute jump"]
+
+    generate_trace(ue, "isa_icache_miss_conditions_trace.csv")
+    print(
+        f"isa_icache_miss_conditions_test: PASS (pc_reg={pc_reg}, "
+        f"fills={len(fills)}, reasons={reasons}, TRACE_rows={trace_count}, "
+        f"retire_ticks[0]={ticks[0]})"
+    )
+    record_test(
+        "isa_icache_miss_conditions",
+        f"fills={len(fills)}, empty={INST_LINE_WORDS}, abs={INST_LINE_WORDS + 1}",
+    )
+    ue.clear_capture_buffer()
+    ue.reset_inst_ptr_counter()
+    ue.reset_isa_reg_counter()
+
+
+def matmat_mul_legacy_unroll_icache_test(
+    M: int = 512, K: int = 64, N: int = 64, snr_threshold_db: float = 40.0
+) -> None:
+    """Python-unrolled ``matmat_mul_core_legacy`` long enough to miss the i-cache line.
+
+    Dynamic PBI matmul stays under 512 static words, so it never hits
+    ``FETCH`` ``inst_ram_empty``. Legacy compile-time tiling emits one matvec per
+    output row. ``M=512, K=64, N=64`` is just over one 16 KB line.
+
+    A one-instruction preamble ``JUMP_ABS`` into that body also stamps the
+    absolute-jump refill, so TRACE/Perfetto show both miss classes on a real
+    matmul (DMA + COMPUTE), not NOP padding.
+    """
+    assert K % UE_VECTOR_SIZE == 0 and N % UE_VECTOR_SIZE == 0
+
+    ue = UnifiedEngine()
+    A_DRAM_ADDR = ue.allocate_tensor_dram(M * K * 2)
+    B_DRAM_ADDR = ue.allocate_tensor_dram(N * K * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * N * 2)
+
+    ue.start_capture()
+    ue.matmat_mul_core(
+        M=M, K=K, N=N,
+        A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=B_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+    )
+    ue.generate_instruction_halt()
+    ue.stop_capture()
+
+    n_static = len(ue.get_captured_instructions())
+    assert n_static > INST_LINE_WORDS, (
+        f"matmat_mul_legacy_unroll_icache_test: static image {n_static} must exceed "
+        f"INST_LINE_WORDS={INST_LINE_WORDS} (increase M)"
+    )
+    assert n_static <= UE_TRACE_SIZE, (
+        f"matmat_mul_legacy_unroll_icache_test: static {n_static} exceeds "
+        f"TRACE BRAM {UE_TRACE_SIZE}"
+    )
+
+    main_program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(main_program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    main_captured = list(ue.get_captured_instructions())
+
+    PREAMBLE_RESERVED_BYTES = 8 * INSTRUCTION_SIZE_BYTES
+    preamble_dram_addr = ue.get_program_dram_addr()
+    ue.allocate_program_dram(PREAMBLE_RESERVED_BYTES)
+    main_program_word_addr = ue_35bit_addr_shifter(main_program_dram_addr)
+
+    ue.clear_capture_buffer()
+    ue.start_capture()
+    ue.generate_instruction_jump_abs(main_program_word_addr)
+    ue.stop_capture()
+    ue.write_captured_instructions_to_dram(preamble_dram_addr)
+
+    a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
+    b = torch.randn(N, K, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(A_DRAM_ADDR, a)
+    ue.dma_to_accelerator_memory(B_DRAM_ADDR, b)
+
+    ue.start_execute_from_dram(preamble_dram_addr)
+    ue.wait_queue(30.0)
+    _, pc_reg = ue.report_timing_and_instruction_count()
+    assert pc_reg > INST_LINE_WORDS, (
+        f"matmat_mul_legacy_unroll_icache_test: pc_reg={pc_reg} does not exceed "
+        f"one i-cache line ({INST_LINE_WORDS})"
+    )
+    assert pc_reg <= UE_TRACE_SIZE, (
+        f"matmat_mul_legacy_unroll_icache_test: pc_reg={pc_reg} exceeds TRACE BRAM"
+    )
+
+    ticks = _read_ue_trace_ticks(ue, pc_reg, "matmat_mul_legacy_unroll_icache")
+    trace_count = ue.read_reg32(UE_TRACE_BRAM_ADDR)
+    raw = []
+    for i in range(trace_count):
+        ue.write_reg32(UE_TRACE_BRAM_ADDR, i)
+        raw.append(int(ue.read_reg32(UE_TRACE_BRAM_DATA)))
+    empty_line_at = 1 + INST_LINE_WORDS
+    fills = _assert_icache_fill_sites(
+        ticks,
+        raw,
+        [0, 1, empty_line_at],
+        "matmat_mul_legacy_unroll_icache_test",
+    )
+    rb = [int(ev.get("retires_before", -1)) for ev in fills]
+
+    output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, N))
+    snr_db = calculate_snr(a @ b.T, output)
+    print(f"[Legacy unroll] SNR: {snr_db:.2f} dB")
+    assert snr_db >= snr_threshold_db or snr_db == float("inf"), (
+        f"matmat_mul_legacy_unroll_icache_test: SNR {snr_db:.2f} dB < {snr_threshold_db:g} dB"
+    )
+
+    ue.capture_buffer = main_captured
+    ue._last_program_write_addr = main_program_dram_addr
+    ue._last_execute_addr = preamble_dram_addr
+    trace_name = f"matmat_mul_legacy_unroll_icache_trace_{M}_{K}_{N}.csv"
+    generate_trace(ue, trace_name)
+
+    print(
+        f"matmat_mul_legacy_unroll_icache_test: PASS (M={M}, K={K}, N={N}, "
+        f"static={n_static}, pc_reg={pc_reg}, fills={len(fills)}, "
+        f"retires_before={rb}, TRACE_rows={trace_count}, "
+        f"retire_ticks[0]={ticks[0]}, SNR={snr_db:.2f} dB)"
+    )
+    record_test(
+        "matmat_mul_legacy_unroll_icache",
+        f"M={M}, K={K}, N={N}, static={n_static}, fills={len(fills)}",
+        snr_db=snr_db,
+    )
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
     ue.reset_inst_ptr_counter()
     ue.reset_isa_reg_counter()
 
@@ -7441,330 +8020,6 @@ def llama32_1b_if8_inference_test() -> None:
     )
 
 
-
-class _BarrierStall(RuntimeError):
-    """An engine was left spinning in a FLAG_CHECK (which has no timeout)."""
-
-
-def _sw_reset_engines(engines):
-    """Bare SW_RESET register write on every engine, to recover from a missed
-    rendezvous. Deliberately NOT UnifiedEngine.software_reset(), whose wait_queue()
-    is guaranteed to time out on a still-draining engine and whose
-    init_unified_engine() would land a 16 KB DRAM self-test on live buffers."""
-    import user_dma_core
-    SW_RESET_CMD = 0x80008000
-    for i, ue in enumerate(engines):
-        ue.write_reg32(user_dma_core.UE_QUEUE_CTRL_ADDR, SW_RESET_CMD)
-    for i, ue in enumerate(engines):
-        for _ in range(50):                        # ~0.5 s at 10 ms granularity
-            if not ue.is_queue_busy():
-                break
-            time.sleep(0.01)
-        if ue.is_queue_busy():
-            print(f"     engine {i} STILL busy after SW_RESET -- power-cycle needed")
-
-
-# ---------------------------------------------------------------------------
-# Multi-engine sharding: end-to-end latency vs. rendezvous (barrier) cost
-# ---------------------------------------------------------------------------
-def multi_engine_barrier_latency_test(M: int = 768, K: int = 768, N: int = 768,
-                                      engine_counts=(1, 2, 4, 8, 12),
-                                      modes=("m_split", "n_split", "k_split"),
-                                      rounds: int = 4,
-                                      snr_threshold_db: float = 40.0,
-                                      timeout_seconds: float = 15.0):
-    """Time every multi-engine sharding technique AND the cost of the rendezvous.
-
-    Runs one bf16 ``A @ B^T`` (M x K x N) sharded three ways -- the three modes
-    ``multi_engine_shard.MultiEngineScheduler`` actually implements -- over a
-    sweep of engine counts, and reports where the wall clock goes.
-
-      ``m_split``  row shard.  Engine i owns rows [m0, m0+rows) of A and writes
-                   the matching rows of OUT. Disjoint writes, no reduction.
-      ``n_split``  output-column shard.  Every engine reads all of A; B is
-                   N x K row-major so columns [n0, n0+cols) are a CONTIGUOUS row
-                   block of B, and each engine writes its own dense [M, cols]
-                   buffer (``alloc_col_output``). Host concatenates to check.
-      ``k_split``  reduction shard.  A K-slice of A and of B is strided in DRAM,
-                   so both are PRE-SLICED ON THE HOST and uploaded per engine.
-                   Every engine produces a full [M, N] PARTIAL, combined by
-                   ``reduce_add`` (barrier + (ne-1) eltwise adds on the primary).
-
-    MEASUREMENT.  Each configuration is compiled and run TWICE: once with the
-    symmetric FLAG rendezvous the scheduler normally emits, once with every
-    barrier removed. Both legs execute byte-identical matmuls, so the delta is
-    the rendezvous and nothing else. Three numbers come out of it:
-
-      hw_us       per-engine hardware latency counter (UE_LATENCY_COUNT, reg
-                  0x30). A FLAG_CHECK spin-wait is the engine sitting in one
-                  instruction, so the barrier wait is INSIDE this number.
-      barrier_us  hw_us(with barriers) - hw_us(without), per engine. This is
-                  the answer to "how long is this engine waiting on its peers".
-      host_us     wall clock - max(hw_us). The host side: ne sequential AXI-Lite
-                  launch writes, wait_queue()'s 1 ms poll granularity, and the
-                  Python around it. It is an upper bound on the scheduling
-                  overhead, not a pure measurement -- interpreter time is in it.
-
-    ``spread_us`` (max hw_us - min hw_us) is the load imbalance the barriers are
-    forced to absorb: with a perfectly balanced split it goes to zero and so
-    does barrier_us. A ``blocks``-mode row split at ne=8 over 12 blocks is
-    deliberately uneven (4 engines get 128 rows, 4 get 64), so a non-zero
-    spread here is the expected result, not a bug.
-    """
-    import user_dma_core
-    from multi_engine_shard import MultiEngineScheduler, SRAM_ROW_BYTES
-
-    engine_counts = [int(n) for n in engine_counts]
-    peak = max(engine_counts)
-    assert peak <= 12, f"engine_counts max {peak} exceeds the 12 engines exercised on this device"
-    assert K % UE_VECTOR_SIZE == 0 and N % UE_VECTOR_SIZE == 0, "K and N must be multiples of 64"
-
-    # 12 x 128 MB arenas -> 0x80000000..0xE0000000, inside the 2 GB DRAM window.
-    ARENA        = 0x08000000
-    TENSOR_OFF   = 0x01000000
-    PROGRAM_OFF  = 0x07000000
-    base0 = user_dma_core.DRAM_START_ADDR
-
-    primary = UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
-                            params_dram_base=base0,
-                            tensor_dram_base=base0 + TENSOR_OFF,
-                            program_dram_base=base0 + PROGRAM_OFF)
-    # ONE worker pool for the whole sweep: the DRAM allocators live inside these
-    # objects, so rebuilding them per configuration would restart every cursor
-    # and stack config 2's programs on top of config 1's.
-    pool = [UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * 0x00010000,
-                          params_dram_base=base0 + i * ARENA,
-                          tensor_dram_base=base0 + i * ARENA + TENSOR_OFF,
-                          program_dram_base=base0 + i * ARENA + PROGRAM_OFF)
-            for i in range(1, peak)]
-
-    a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
-    b = torch.randn(N, K, dtype=torch.bfloat16)
-    ref = a @ b.T
-
-    rows = []
-
-    def _reset(engines):
-        for ue in engines:
-            ue.reset_tensor_dram_addr()
-            ue.reset_program_dram_addr()
-            ue.clear_capture_buffer()
-
-    def _run(sched, mode, ne, barriers, addrs):
-        """Compile one leg (barriers on/off), execute it, return (wall_us, hw_us[])."""
-        A_ADDR, B_ADDR, OUT_ADDR, part_addrs, bk_addrs, ak_addrs = addrs
-        engines = sched.engines
-
-        for ue in engines:
-            ue.reset_program_dram_addr()
-        primary.start_capture()
-        sched.begin_program()
-        # EXACTLY ONE barrier between consecutive work units, never two in a row.
-        # Adjacent barriers are the re-arming hazard itself: engine A clears for
-        # barrier N and immediately sets for N+1, so engine B -- still walking
-        # barrier N's CHECKs -- sees that NEW 1, passes N spuriously and then
-        # deadlocks at N+1 on a flag that is already gone. k_split hits it first
-        # because reduce_add contributes two more barriers per round.
-        for _round in range(rounds):
-            if barriers and _round > 0 and mode != "k_split":
-                sched.barrier()          # k_split: reduce_add's join IS the separator
-            if mode == "m_split":
-                for i, ue in enumerate(engines):
-                    off, cnt = sched.split_rows(M, mode="blocks")[i]
-                    ue.matmat_mul_core(M=cnt, K=K, N=N,
-                                       A_DRAM_ADDR=A_ADDR + off * K * 2,
-                                       B_DRAM_ADDR=B_ADDR,
-                                       OUTPUT_DRAM_ADDR=OUT_ADDR + off * N * 2)
-            elif mode == "n_split":
-                for i, ue in enumerate(engines):
-                    off, cols = sched.split_cols(N)[i]
-                    ue.matmat_mul_core(M=M, K=K, N=cols,
-                                       A_DRAM_ADDR=A_ADDR,
-                                       B_DRAM_ADDR=B_ADDR + off * K * 2,
-                                       OUTPUT_DRAM_ADDR=sched.col_output_addr("out", i))
-            elif mode == "k_split":
-                for i, ue in enumerate(engines):
-                    _, kc = sched.split_k(K)[i]
-                    ue.matmat_mul_core(M=M, K=kc, N=N,
-                                       A_DRAM_ADDR=ak_addrs[i],
-                                       B_DRAM_ADDR=bk_addrs[i],
-                                       OUTPUT_DRAM_ADDR=part_addrs[i])
-                if ne == 1:
-                    pass                       # the single partial IS the result
-                elif barriers:
-                    sched.reduce_add(part_addrs, OUT_ADDR, M, N, parallel=True)
-                else:
-                    # reduce_add's arithmetic without its two rendezvous, so the
-                    # no-barrier leg does the SAME work (its output is garbage by
-                    # construction and is not checked).
-                    acc = part_addrs[0]
-                    for src in part_addrs[1:]:
-                        primary.eltwise_core_dram(M=M, N=N, dram_a=acc, dram_b=src,
-                                                  dram_out=OUT_ADDR,
-                                                  mode=UE_MODE.ELTWISE_ADD)
-                        acc = OUT_ADDR
-        if barriers and mode != "k_split":
-            sched.barrier()              # single exit join
-        worker_addrs = sched.finalize()
-        primary.generate_instruction_halt()
-        primary.stop_capture()
-        prog = primary.get_program_dram_addr()
-        primary.write_captured_instructions_to_dram(prog)
-        primary.allocate_program_dram(primary.get_capture_instruction_size_bytes())
-
-        t0 = time.perf_counter()
-        sched.start_workers(worker_addrs)
-        primary.start_execute_from_dram(prog)
-        primary.wait_queue(timeout_seconds)
-        for w in sched.workers:
-            w.wait_queue(2.0)     # the primary already absorbed the real wait; a
-                                  # worker still busy here is stuck, not slow
-
-        wall_us = (time.perf_counter() - t0) * 1e6
-        hw_us = [ue.report_latency_in_us() for ue in engines]
-
-        # A missed rendezvous parks an engine in a FLAG_CHECK that has NO timeout,
-        # so the sweep must diagnose and recover rather than stall. UE_INSTRUCTION_CTL
-        # is the retired-instruction count: it says exactly WHERE each engine stopped.
-        stuck = [i for i, ue in enumerate(engines) if ue.is_queue_busy()]
-        if stuck:
-            print(f"  !! {mode} ne={ne} barriers={barriers}: engine(s) {stuck} still busy "
-                  f"after {timeout_seconds:g}s ({len(worker_addrs) + 1} programs, "
-                  f"{primary.get_capture_count()} inst each)")
-            for i, ue in enumerate(engines):
-                print(f"     engine {i}: queue_ctrl=0x{ue.read_reg32(user_dma_core.UE_QUEUE_CTRL_ADDR):08X} "
-                      f"busy={int(ue.is_queue_busy())} "
-                      f"retired={ue.read_reg32(user_dma_core.UE_INSTRUCTION_CTL_ADDR)} "
-                      f"latency={hw_us[i]:.1f}us")
-            _sw_reset_engines(engines)
-            raise _BarrierStall(f"{mode} ne={ne} barriers={barriers}: engines {stuck} "
-                               f"missed a rendezvous")
-        return wall_us, hw_us
-
-    for mode in modes:
-        for ne in engine_counts:
-            if mode == "m_split" and M // UE_VECTOR_SIZE < ne:
-                print(f"[skip] {mode} ne={ne}: M={M} is only {M // UE_VECTOR_SIZE} row block(s)")
-                continue
-            if mode == "n_split" and N // UE_VECTOR_SIZE < ne:
-                print(f"[skip] {mode} ne={ne}: N={N} is only {N // UE_VECTOR_SIZE} col block(s)")
-                continue
-            if mode == "k_split" and K // UE_VECTOR_SIZE < ne:
-                print(f"[skip] {mode} ne={ne}: K={K} is only {K // UE_VECTOR_SIZE} block(s)")
-                continue
-
-            print(f"\n=== multi_engine_barrier_latency: {mode}, {ne} engine(s), "
-                  f"M={M} K={K} N={N}, {rounds} round(s) ===")
-            _reset([primary] + pool)
-            # CLEAR margin. The rendezvous is SET / CHECK(every peer) / margin / CLEAR,
-            # and the window it has to cover is the LAST-arriving engine still walking
-            # its own ne-1 CHECKs after we saw its SET. That window grows with ne, so a
-            # fixed 32 (tuned at ne=2) is not enough at 8 -- clear too early and the
-            # straggler's CHECK never sees our 1 and it spins forever.
-            margin = max(32, 64 * ne)
-            sched = MultiEngineScheduler(primary, num_engines=ne,
-                                         allow_more_than_two_engines=True,
-                                         split_mode="blocks",
-                                         barrier_margin_nops=margin,
-                                         workers=pool[:ne - 1])
-            # A flag left set by an earlier program makes the first CHECK pass
-            # spuriously; this also clears an engine left spinning by a dead run.
-            sched.preclear_flags()
-
-            A_ADDR = primary.allocate_tensor_dram(M * K * 2, align_bytes=SRAM_ROW_BYTES)
-            B_ADDR = primary.allocate_tensor_dram(N * K * 2, align_bytes=SRAM_ROW_BYTES)
-            OUT_ADDR = primary.allocate_tensor_dram(M * N * 2, align_bytes=SRAM_ROW_BYTES)
-            primary.dma_to_accelerator_memory(A_ADDR, a)
-            primary.dma_to_accelerator_memory(B_ADDR, b)
-
-            part_addrs, bk_addrs, ak_addrs = [], [], []
-            if mode == "n_split":
-                sched.alloc_col_output("out", M, N)
-            elif mode == "k_split":
-                # K-slices of A (M x K) and B (N x K) are STRIDED in DRAM -- one gap
-                # per row -- so they cannot be reached by shifting a base address.
-                # Slice and upload them on the host, one contiguous blob per engine.
-                for i, ue in enumerate(sched.engines):
-                    k0, kc = sched.split_k(K)[i]
-                    ak = ue.allocate_tensor_dram(M * kc * 2, align_bytes=SRAM_ROW_BYTES)
-                    bk = ue.allocate_tensor_dram(N * kc * 2, align_bytes=SRAM_ROW_BYTES)
-                    pa = ue.allocate_tensor_dram(M * N * 2, align_bytes=SRAM_ROW_BYTES)
-                    primary.dma_to_accelerator_memory(ak, a[:, k0:k0 + kc].contiguous())
-                    primary.dma_to_accelerator_memory(bk, b[:, k0:k0 + kc].contiguous())
-                    ak_addrs.append(ak); bk_addrs.append(bk); part_addrs.append(pa)
-                if ne == 1:
-                    OUT_ADDR = part_addrs[0]
-            addrs = (A_ADDR, B_ADDR, OUT_ADDR, part_addrs, bk_addrs, ak_addrs)
-
-            try:
-                wall_b, hw_b = _run(sched, mode, ne, True, addrs)
-            except _BarrierStall as e:
-                print(f"  [FAIL] {e}")
-                rows.append((mode, ne, float('nan'), float('nan'), float('nan'),
-                             float('nan'), float('nan'), float('nan'), float('nan')))
-                continue
-
-            # Correctness of the sharding itself, on the barriered (real) leg.
-            if mode == "n_split":
-                cols = [sched.split_cols(N)[i][1] for i in range(ne)]
-                out = torch.cat([sched.engines[i].dma_from_accelerator_memory(
-                    sched.col_output_addr("out", i), (M, cols[i])) for i in range(ne)], dim=1)
-            else:
-                out = primary.dma_from_accelerator_memory(OUT_ADDR, (M, N))
-            snr = calculate_snr(ref, out)
-            print(f"  {mode} ne={ne} SNR: {snr:.2f} dB")
-            assert snr >= snr_threshold_db or snr == float("inf"), \
-                f"{mode} ne={ne} SNR {snr:.2f} dB below {snr_threshold_db:g} dB -- sharding is wrong"
-
-            sched.preclear_flags()      # leg 2 must not inherit leg 1's flag state
-            try:
-                wall_n, hw_n = _run(sched, mode, ne, False, addrs)
-            except _BarrierStall as e:
-                print(f"  [FAIL] {e}")
-                continue
-
-            if min(hw_b) <= 0.0:
-                print(f"  [FAIL] {mode} ne={ne}: engine(s) reported 0 us latency -- the run "
-                      f"was reset out from under it; discarding this row")
-                continue
-            hw_max_b, hw_min_b = max(hw_b), min(hw_b)
-            barrier_us = [hb - hn for hb, hn in zip(hw_b, hw_n)]
-            host_us = wall_b - hw_max_b
-            spread_us = hw_max_b - hw_min_b
-            pct = 100.0 * max(barrier_us) / hw_max_b if hw_max_b else 0.0
-
-            print(f"  wall {wall_b:9.1f} us | hw max {hw_max_b:9.1f} us | "
-                  f"host+poll {host_us:8.1f} us")
-            print(f"  hw per engine (barriers on) : "
-                  f"{', '.join(f'{v:.1f}' for v in hw_b)}")
-            print(f"  hw per engine (barriers off): "
-                  f"{', '.join(f'{v:.1f}' for v in hw_n)}")
-            print(f"  BARRIER WAIT per engine     : "
-                  f"{', '.join(f'{v:.1f}' for v in barrier_us)}")
-            print(f"  imbalance spread {spread_us:.1f} us | worst engine spends "
-                  f"{pct:.1f}% of its runtime in the rendezvous")
-
-            rows.append((mode, ne, wall_b, hw_max_b, host_us, spread_us,
-                         max(barrier_us), pct, snr))
-            record_test(
-                f"multi_engine_barrier_latency+{mode}",
-                f"M={M}, K={K}, N={N}, engines={ne}, rounds={rounds}, "
-                f"wall={wall_b:.0f}us, hw={hw_max_b:.0f}us, host={host_us:.0f}us, "
-                f"barrier={max(barrier_us):.0f}us ({pct:.1f}%), spread={spread_us:.0f}us",
-                snr_db=snr)
-
-    print("\n=== multi-engine sharding latency summary "
-          f"(M={M} K={K} N={N}, {rounds} rounds) ===")
-    print(f"{'mode':<9} {'ne':>3} {'wall us':>10} {'hw us':>10} {'host us':>9} "
-          f"{'spread us':>10} {'barrier us':>11} {'bar %':>7} {'SNR dB':>8}")
-    for r in rows:
-        print(f"{r[0]:<9} {r[1]:>3} {r[2]:>10.1f} {r[3]:>10.1f} {r[4]:>9.1f} "
-              f"{r[5]:>10.1f} {r[6]:>11.1f} {r[7]:>7.1f} {r[8]:>8.2f}")
-
-    _reset([primary] + pool)
-    return rows
-
-
 if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='User DMA Operations for Unified Engine')
@@ -7776,21 +8031,6 @@ if __name__ == "__main__":
         '--ext',
         action='store_true',
         help='Run the large nested-loop sweeps at the end of the suite (slow).',
-    )
-    parser.add_argument(
-        '--barrier-latency', action='store_true',
-        help='Run ONLY multi_engine_barrier_latency_test: times every multi-engine '
-             'sharding mode (m/n/k split) end to end and reports how much of the '
-             'runtime is the FLAG rendezvous vs. host scheduling, then exits.',
-    )
-    parser.add_argument(
-        '--barrier-engines', type=str, default='1,2,4,8,12',
-        help='Comma-separated engine counts for --barrier-latency. Default: 1,2,4,8,12.',
-    )
-    parser.add_argument(
-        '--barrier-shape', type=str, default='768,768,768',
-        help='M,K,N for --barrier-latency. Default: 768,768,768 (12 blocks of 64 on '
-             'every axis, so all three modes shard 12 ways).',
     )
     parser.add_argument(
         '--multi-core', type=int, default=1,
@@ -7848,16 +8088,6 @@ if __name__ == "__main__":
         write_test_summary(_USER_HW_TEST_SUMMARY)
 
     atexit.register(_atexit_write_test_summary)
-
-    if args.barrier_latency:
-        _bl_M, _bl_K, _bl_N = (int(v) for v in args.barrier_shape.split(','))
-        multi_engine_barrier_latency_test(
-            M=_bl_M, K=_bl_K, N=_bl_N,
-            engine_counts=[int(v) for v in args.barrier_engines.split(',')])
-        write_test_summary(_USER_HW_TEST_SUMMARY)
-        atexit.unregister(_atexit_write_test_summary)
-        sys.stdout.flush()
-        os._exit(0)
 
     software_reset_test(cores=args.multi_core)
     dram_read_write_speed_test()
@@ -8175,15 +8405,6 @@ if __name__ == "__main__":
         multi_core_dram_speed_test(data_size_kB=512, num_engines=engine_count)
         matmat_mul_multi_cores_unified_test(runtime_list=[(6144, 1024, 1024)], num_engines=engine_count)
         quantized_matmat_mul_multi_cores_test(runtime_list=[(1, 1536, 6144)], num_engines=engine_count)
-        # Each engine reads its own DRAM buffer, then all engines hammer the
-        # same DRAM buffer (concurrent reads to a single memory location).
-        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=engine_count)
-        matmat_mul_multi_engine_flag_check_test(M=4096, K=4096, N=4096, num_engines=engine_count,
-                                                shared_read=True)
-        # Where the wall clock goes once the work is sharded: end-to-end latency
-        # per sharding mode, minus the same program with every barrier removed.
-        multi_engine_barrier_latency_test(
-            engine_counts=tuple(c for c in (1, 2, 4, 8, 12) if c <= engine_count))
 
     # --- Systolic core tests are disabled until HW_INFO exposes systolic presence ---
     # Run last, after all andromeda-core coverage, so a systolic-specific
@@ -8231,6 +8452,10 @@ if __name__ == "__main__":
     if user_dma_core.AVAILABLE_DRAM_SIZE_GB == 8:
         dram_read_write_speed_test_8GB()
 
+    isa_trace_commit_semantics_test()
+    isa_icache_multiline_test()
+    isa_icache_miss_conditions_test()
+    matmat_mul_legacy_unroll_icache_test()
     #Adding new tests here
 
     gemma3_inference_test()
