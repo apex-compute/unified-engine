@@ -61,6 +61,14 @@ from multi_engine_shard import (MULTICORE_WINDOW_BYTES, multicore_arena_bytes,
 #                      addresses never move when cores are added.
 # Single-core keeps the historical Gemma3 DRAM layout at DRAM_START_ADDR.
 MULTI_CORE_MAX_ENGINES = 12
+# Engine count at which the fixed-window map replaces the divided low-2-GB one.
+# The fixed map pins the model at MULTI_CORE_MODEL_BASE (6 GB) whatever the
+# engine count, so it needs the 8 GB device REGARDLESS of how many windows are
+# actually claimed -- a 2-engine run would demand 8 GB to use 1 GB of arena.
+# Boards that report 4 GB (p2's kintex7: HW_INFO cores=2, DRAM=4 GiB) therefore
+# keep the divided private_low map, which is what they ran before and what
+# user_hw_test.py's gemma3_multi_core_inference_test still expects there.
+MULTI_CORE_FIXED_MAP_MIN_ENGINES = 8
 # One source of truth for the window size: the library owns the policy
 # (multi_engine_shard.MULTICORE_WINDOW_BYTES); this is the local name.
 MULTI_CORE_ENGINE_WINDOW_BYTES = MULTICORE_WINDOW_BYTES
@@ -298,8 +306,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 f"got {self.multi_core}")
         # The multi-core map is keyed on the ENGINE COUNT, not on what core
         # count the bitstream reports: an 8-core board running --multi-core 8
-        # wants the same fixed 512 MB windows a 12-core board does.
-        self._use_multicore_dram_layout = self.multi_core > 1
+        # wants the same fixed 512 MB windows a 12-core board does. Below
+        # MULTI_CORE_FIXED_MAP_MIN_ENGINES the fixed map buys nothing and costs
+        # the 8 GB requirement, so small splits keep the divided private_low map.
+        self._use_multicore_dram_layout = (
+            self.multi_core >= MULTI_CORE_FIXED_MAP_MIN_ENGINES)
         if self._use_multicore_dram_layout:
             require_multicore_dram(self.multi_core, "Gemma3")
         _rebase = MULTI_CORE_MODEL_REBASE if self._use_multicore_dram_layout else 0
@@ -1633,10 +1644,13 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         """
         if self.multi_core <= 1:
             return ""
-        # The map tag is constant now that every multi-core run uses the fixed
-        # 512 MB window layout, but it stays in the path so images cached by an
-        # older build against the legacy low-2-GB map are never replayed here.
-        return f"_mc{self.multi_core}_mcmap"
+        # Two maps again, so the tag has to name which one: _mcmap for the fixed
+        # 512 MB windows, bare _mc{N} for the divided private_low map. A bare
+        # _mc{N} image built before the fixed map existed used private_low too,
+        # so reusing that tag for it replays only compatible bodies.
+        if self._use_multicore_dram_layout:
+            return f"_mc{self.multi_core}_mcmap"
+        return f"_mc{self.multi_core}"
 
     def setup_multi_core(self) -> None:
         """Bring up the worker engines and copy each one's column block of the MLP gate.
@@ -1654,15 +1668,21 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # grow the six windows to 1 GB each, because the window size is what the
         # DRAM controller interleaves on. Engine i therefore owns the same
         # addresses at every engine count, and the model map above never moves.
-        _arena_bytes = multicore_arena_bytes(self.multi_core)
-        assert _arena_bytes <= MULTI_CORE_MODEL_BASE, (
-            f"{self.multi_core} x "
-            f"{MULTI_CORE_ENGINE_WINDOW_BYTES // 2**20} MB private windows reach "
-            f"0x{_arena_bytes:X}, into the model map at "
-            f"0x{MULTI_CORE_MODEL_BASE:X}")
-        _scheduler_map = {"arena": PrivateArena(self.multi_core,
-                                               arena_base=0,
-                                               arena_bytes=_arena_bytes)}
+        if self._use_multicore_dram_layout:
+            _arena_bytes = multicore_arena_bytes(self.multi_core)
+            assert _arena_bytes <= MULTI_CORE_MODEL_BASE, (
+                f"{self.multi_core} x "
+                f"{MULTI_CORE_ENGINE_WINDOW_BYTES // 2**20} MB private windows reach "
+                f"0x{_arena_bytes:X}, into the model map at "
+                f"0x{MULTI_CORE_MODEL_BASE:X}")
+            _scheduler_map = {"arena": PrivateArena(self.multi_core,
+                                                   arena_base=0,
+                                                   arena_bytes=_arena_bytes)}
+        else:
+            # Fewer engines than MULTI_CORE_FIXED_MAP_MIN_ENGINES: the dynamically
+            # divided low-2-GB arena, which fits a 4 GB device and leaves the
+            # model at its original base.
+            _scheduler_map = {"worker_map": "private_low"}
         # handshake="four_phase": see release()/join() -- the master/worker rendezvous is
         # always four-phase; this also makes any symmetric barrier() margin-free.
         self.shard_group = MultiEngineScheduler(

@@ -715,6 +715,14 @@ class UnifiedEngine:
         # (counter_reg, body_start_inst_id, relative, program_dram_addr)
         # per nested loop_start/loop_end.
         self._capture_loop_stack: list[tuple[int, int, bool, int]] = []
+        # Byte address of the last write_captured_instructions_to_dram();
+        # generate_trace uses this as capture_buffer[0]'s DRAM base.
+        self._last_program_write_addr: Optional[int] = None
+        # Every successful program DRAM write: (start_byte, padded inst list).
+        # Dynamic PBI runs write a main body then a preamble that abs-jumps
+        # into it; TRACE replay needs both images plus the execute start addr.
+        self._program_images: list[tuple[int, list]] = []
+        self._last_execute_addr: Optional[int] = None
         # Preserve the existing API override while using HW_INFO as the default
         # source when the caller does not provide a period explicitly.
         if clock_period_ns is None and CLOCK_CYCLE_TIME_NS is None:
@@ -962,7 +970,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xfe984d16, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xfe984d16. Please update FPGA with commit update_fe984d16.bin using update_flash.py (public release v1.4)"
+        assert hw_version == 0xf9303071, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xf9303071. Please update FPGA with commit update_f9303071.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -5884,6 +5892,16 @@ class UnifiedEngine:
         # so the output DRAM address (cols_done >> 2 words) stays word-aligned every iteration.
         cur = self.capture_count
         skip_target = ue_35bit_addr_shifter(program_dram_start_addr + (cur + 7) * INSTRUCTION_SIZE_BYTES)
+        # TODO(perf, needs RTL): make this a relative jump. Absolute jumps route
+        # through STATE_RAM_DMA_START and refetch the whole i-cache line just to
+        # step over 6 instructions that are already resident -- 688 cycles in the
+        # 128x512x512 trace, once per program. It cannot be relative today:
+        # queue_state_module computes jump_imm_diff_r = inst_ram_read_ptr -
+        # immediate (saturating at 0), so every RELA_* mode is backward-only.
+        # REQUEST: forward (signed) relative jump support in the RTL, then switch
+        # this and _emit_forward_skip_jz over to it. Alternative with no RTL work:
+        # run the sub-64 fallback unconditionally and select with MIN/SUB, which
+        # removes the branch entirely (~36 cycles + one div_reg vs 688).
         self.generate_instruction_jump_abs_jnz(skip_target, N_chunk_reg)
         self.generate_instruction_add_set(s2, 4095)
         self.generate_instruction_div_reg(s2, s2, K_rows_reg)  # floor(4095 / K_rows)
@@ -5980,6 +5998,15 @@ class UnifiedEngine:
         # ===== Phase 3: M while-loop body ===================================
         # Absolute jump re-anchors the i-cache so all relative backward jumps in the
         # loop body are within 512 slots of a known unconditional anchor.
+        # TODO(perf): drop this anchor when the program already fits one i-cache
+        # line. INST_LINE_WORDS is 16384/32 = 512 and this program is ~146
+        # instructions, so the caller's absolute jump into the body already left
+        # every RELA_JNZ target resident -- the anchor then buys nothing and costs
+        # a full line refetch (624 cycles measured in the 128x512x512 trace). It
+        # jumps to the very next instruction, so it does not even need to become
+        # relative; gate emission on (instructions since the last anchor) <
+        # INST_LINE_WORDS and keep it only for programs that overflow a line.
+        # NOTE: matmat_mul_two_cores has the same anchor; fix both together.
         _prog_base = self.get_program_dram_addr()
         self.generate_instruction_jump_abs(
             ue_35bit_addr_shifter(_prog_base + (self.capture_count + 1) * INSTRUCTION_SIZE_BYTES)
@@ -9728,6 +9755,12 @@ class UnifiedEngine:
 
         if bytes_written == total_bytes:
             print(f"Successfully wrote {bytes_written} bytes ({self.capture_count} instructions) to DRAM")
+            start_addr = int(start_addr)
+            self._last_program_write_addr = start_addr
+            self._program_images = [
+                (addr, insts) for addr, insts in self._program_images if addr != start_addr
+            ]
+            self._program_images.append((start_addr, list(self.capture_buffer)))
         else:
             print(f"Warning: Expected to write {total_bytes} bytes, but only wrote {bytes_written} bytes")
 
@@ -9745,6 +9778,7 @@ class UnifiedEngine:
             instruction_addr: DRAM address where instructions are stored
                             (default: DRAM_INSTRUCTION_ADDR)
         """
+        self._last_execute_addr = int(instruction_addr)
         self.write_reg32(UE_INSTRUCTION_ADDR, ue_35bit_addr_shifter(instruction_addr))
 
     def program_execute(self, program_start_addr: int = DRAM_INSTRUCTION_ADDR, timeout: float = 50.0, flops: float = None) -> None:
