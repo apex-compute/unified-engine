@@ -147,6 +147,28 @@ PREFILL_MAX_SEQ_LEN = MAX_CONTEXT_SIZE
 # image is 144; the allocation carries 1024 so larger inputs need no re-carve.
 VISION_MAX_SOFT_TOKENS = 1024
 
+# ==========================================================================
+# THIS MAP IS FOR THE ALVEO U55C ONLY (HW_INFO cores == 12)
+# ==========================================================================
+# The 1 GiB-per-core layout below is not a portable arrangement -- it is built
+# around one board's HBM wiring. On the U55C the andromeda engines sit on the
+# EVEN HBM AXI ports, so engines 0-7 own memory controllers MC0-MC7 one each,
+# and a 1 GiB private window maps exactly onto its controller's two 512 MiB
+# pseudo-channels. That correspondence is the whole reason a window is 1 GiB.
+#
+# On a board that wires the ports differently the same map is actively harmful.
+# Measured on the pre-reorder U55C bitstream, where all twelve engines crowded
+# onto MC0-MC3 and MC4-MC7 (which own the upper 4 GiB) had no engine adjacent
+# to them, decode ran at 77.3 GFLOPS against 140.1 for the old 512 MiB map --
+# every barrier waited on the cores whose windows landed on the far side of the
+# lateral switch. With the ports reordered the same map gives 190.2.
+#
+# HW_INFO's core count is the board signature used to gate it: the U55C build
+# instantiates twelve engines (of which Omni uses eight), while the 8-core
+# Alveo image reports eight. A board reporting anything else has not been
+# characterised for this layout, so the model refuses rather than guessing.
+OMNI_LAYOUT_BOARD_CORES = 12
+
 # The private window geometry this map is built for. It is deliberately NOT
 # multi_engine_shard.MULTICORE_WINDOW_BYTES: that constant is 512 MiB and three
 # other multi-core models are validated against it, so Omni carries its own.
@@ -272,6 +294,17 @@ class Qwen25OmniUnifiedEngine(
             raise ValueError(
                 f"the U55 image must report at least {REQUIRED_ENGINES} engines; "
                 f"HW_INFO reports {reported_cores}"
+            )
+        # The 1 GiB window map is U55C-specific -- see OMNI_LAYOUT_BOARD_CORES.
+        if reported_cores is not None and reported_cores != OMNI_LAYOUT_BOARD_CORES:
+            raise ValueError(
+                f"the Qwen2.5-Omni 1 GiB-per-core map targets the Alveo U55C, "
+                f"whose image reports {OMNI_LAYOUT_BOARD_CORES} engines; HW_INFO "
+                f"reports {reported_cores}. The window size is tied to this "
+                f"board's HBM port assignment (engines 0-7 on the even AXI "
+                f"ports, one memory controller each) and is not portable: on a "
+                f"board that maps the ports differently this layout measured "
+                f"77.3 GFLOPS at decode against 140.1 for the 512 MiB map."
             )
         # At LEAST 8 GiB, not exactly: the map needs 8 GiB and a larger device
         # simply leaves the top unused. The check lives in the library so every
