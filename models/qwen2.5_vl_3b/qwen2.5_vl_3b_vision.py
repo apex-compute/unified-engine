@@ -541,8 +541,12 @@ class Qwen25VLVisionMixin:
             raise MemoryError(
                 f"vision tensors overflow the tensor region: end 0x{end:X} > "
                 f"limit 0x{self.TENSOR_LIMIT:X}")
+        # Report bytes, not an address range: a model whose tensors are carved
+        # per buffer from a pool has no single extent to name, and printing the
+        # accounting origin as though it were a base address is worse than
+        # printing nothing.
         self._loud(f"  Vision tensors: {self.get_tensor_dram_usage() / 2**20:.1f} MiB "
-                   f"at 0x{self._tensor_dram_base:X}..0x{end:X}")
+                   f"in {len(self._vis_pending_dmas)} staged buffer(s)")
 
     # ---- compile -----------------------------------------------------------
 
