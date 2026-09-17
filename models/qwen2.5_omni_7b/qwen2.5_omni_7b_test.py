@@ -1847,14 +1847,15 @@ class Qwen25OmniUnifiedEngine(
         for idx in range(1, REQUIRED_ENGINES):
             per_stage = self._worker_isa_used.get(idx, {})
             # Stage programs are uploaded immediately before their phase and
-            # deliberately overwrite the same 8-MiB worker slice.
+            # deliberately overwrite the same worker slice.
             peak = max(per_stage.values(), default=0)
             details = ", ".join(
                 f"{name} {size / 2**20:.2f}"
                 for name, size in sorted(per_stage.items())
             )
             lines.append(
-                f"  core {idx} ISA peak: {peak / 2**20:.2f} / 8 MiB"
+                f"  core {idx} ISA peak: {peak / 2**20:.2f} / "
+                f"{self.mc_arena.isa_bytes / 2**20:.0f} MiB"
                 + (f" ({details} MiB)" if details else "")
             )
         return lines
