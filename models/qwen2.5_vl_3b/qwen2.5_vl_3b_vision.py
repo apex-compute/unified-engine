@@ -444,6 +444,17 @@ class Qwen25VLVisionMixin:
 
     # ---- tensor allocation -------------------------------------------------
 
+    def _alloc_per_engine_attn_scratch(self, engine_idx: int, size_bytes: int) -> int:
+        """One engine's private vision attention scratch.
+
+        Default: the per-engine tensor slice, which is where it has always come
+        from. A model whose scratch outgrows that slice overrides this -- the
+        buffer scales as aligned_S^2, so at a large patch count it is tens of
+        MiB and no longer belongs in a fixed-size per-core slice.
+        """
+        return self.mc_arena.alloc_tensor(
+            engine_idx, size_bytes, "vision attn scratch")
+
     def vision_tensor_init(self) -> None:
         """Allocate the encoder's intermediates in the tensor region and queue
         the host-built inputs for upload at run time."""
@@ -496,7 +507,7 @@ class Qwen25VLVisionMixin:
         if getattr(self, "multi_core", 1) > 1:
             scratch_bytes = scratch_elems * bpe
             self.VIS_ATTN_SCRATCH_PER_ENGINE.extend(
-                self.mc_arena.alloc_tensor(e, scratch_bytes, "vision attn scratch")
+                self._alloc_per_engine_attn_scratch(e, scratch_bytes)
                 for e in range(1, self.multi_core))
             spans = sorted((a, a + scratch_bytes)
                            for a in self.VIS_ATTN_SCRATCH_PER_ENGINE)

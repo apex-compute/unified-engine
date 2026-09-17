@@ -76,13 +76,26 @@ def _load_config(script_dir: str) -> dict:
 _PARAMS_IDENTITY_KEYS = ("file_info", "model", "precision", "paths",
                          "vision", "audio")
 
+# INPUT GEOMETRY IS NOT WEIGHT IDENTITY. How big an image is, how many patches
+# it makes and how many soft tokens they merge into are properties of the RUN,
+# not of the tensors: the encoder is a transformer over a patch sequence and
+# nothing in this module reads these. Only patch_embed.proj is patch-shaped and
+# it is per-patch ([1280, 1216]), while position information is computed mRoPE,
+# not a learned table sized by patch count. Leaving them in the fingerprint
+# meant raising the image size invalidated 5.9 GB of bit-identical weights.
+_VISION_RUNTIME_KEYS = ("image_size", "num_patches", "num_merged_tokens")
+
 
 def _config_fingerprint(cfg: dict) -> str:
     """Identify the exact geometry, precision policy, and artifact paths.
 
-    Deliberately EXCLUDES `hardware`: see :data:`_PARAMS_IDENTITY_KEYS`.
+    Deliberately EXCLUDES `hardware` and the vision input geometry: see
+    :data:`_PARAMS_IDENTITY_KEYS` and :data:`_VISION_RUNTIME_KEYS`.
     """
     identity = {k: cfg[k] for k in _PARAMS_IDENTITY_KEYS if k in cfg}
+    if "vision" in identity:
+        identity["vision"] = {k: v for k, v in identity["vision"].items()
+                              if k not in _VISION_RUNTIME_KEYS}
     canonical = json.dumps(
         identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")

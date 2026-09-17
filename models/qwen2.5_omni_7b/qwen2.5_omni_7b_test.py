@@ -143,9 +143,50 @@ PREFILL_INPUT_TOKEN_LIMIT = MAX_CONTEXT_SIZE
 # for the longest prompt the context allows, it does not force that shape.
 PREFILL_MAX_SEQ_LEN = MAX_CONTEXT_SIZE
 
-# Vision soft tokens (post spatial-merge) the encoder is sized for. A 336x336
-# image is 144; the allocation carries 1024 so larger inputs need no re-carve.
-VISION_MAX_SOFT_TOKENS = 1024
+# SELECTABLE VISION INPUT RESOLUTION. The encoder is carved for ONE patch
+# count -- its tensors and attention bias are sized for it -- so the resolution
+# is chosen before the engine is built, not per image. Each entry is
+# self-consistent: (image_size / patch_size)^2 == num_patches, and
+# num_patches / spatial_merge_size^2 == num_merged_tokens.
+#
+# The soft-token count is what reaches the LM and is charged against the
+# context, so "medium" spends 1024 of the 2048-token budget on one image.
+VISION_RESOLUTIONS = {
+    "small":  {"image_size": 336, "num_patches":  576, "num_merged_tokens":  144},
+    "medium": {"image_size": 896, "num_patches": 4096, "num_merged_tokens": 1024},
+}
+DEFAULT_VISION_RES = "small"
+VISION_MAX_SOFT_TOKENS = max(
+    r["num_merged_tokens"] for r in VISION_RESOLUTIONS.values()
+)
+
+
+def apply_vision_resolution(cfg: dict, name: str) -> dict:
+    """Stamp one VISION_RESOLUTIONS entry into a loaded config, in place.
+
+    params.bin does NOT depend on these -- the encoder is a transformer over a
+    patch sequence, only patch_embed.proj is patch-shaped and it is per-patch,
+    and position information is computed mRoPE rather than a learned table.
+    qwen2.5_omni_7b_weights._VISION_RUNTIME_KEYS excludes them from the weight
+    fingerprint for exactly that reason, so switching resolution never forces a
+    re-quantization.
+    """
+    try:
+        preset = VISION_RESOLUTIONS[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown vision resolution {name!r}; choose from "
+            f"{sorted(VISION_RESOLUTIONS)}"
+        ) from None
+    vision = cfg["vision"]
+    side = preset["image_size"] // int(vision["patch_size"])
+    merge = int(vision["spatial_merge_size"]) ** 2
+    if side * side != preset["num_patches"]:
+        raise AssertionError(f"vision preset {name!r} patch count is inconsistent")
+    if preset["num_patches"] // merge != preset["num_merged_tokens"]:
+        raise AssertionError(f"vision preset {name!r} soft-token count is inconsistent")
+    vision.update(preset)
+    return cfg
 
 # ==========================================================================
 # THIS MAP IS FOR THE ALVEO U55C ONLY (HW_INFO cores == 12)
@@ -182,6 +223,10 @@ OMNI_ISA_BYTES = 16 * 2**20                # per-core ISA slice, inside the wind
 # ONE private scratch per engine, (AHD + aligned_P) * aligned_P + aligned_P *
 # AHD elements -- 9.44 MiB at the 2048-row prefill allocation, so 8 MiB no
 # longer covers it.
+# 48 MiB, not 16: the head-sharded VISION attention also keeps one private
+# scratch per engine, (VD_PAD + aligned_S) * aligned_S + aligned_S * VD_PAD
+# elements, which is 35.65 MiB at the 4096-patch (1024 soft token) allocation.
+# The LM's own per-engine scratch needs 9.44 MiB at a 2048-row prefill.
 OMNI_PRIVATE_TENSOR_BYTES = 16 * 2**20
 
 # What the private shards need per core, declared BEFORE any shared byte is
@@ -283,7 +328,8 @@ class Qwen25OmniUnifiedEngine(
     """Concrete Thinker engine and its fixed eight-engine U55 memory map."""
 
     def __init__(self, script_dir: str | None = None, multi_core: int = 8,
-                 fpga_build: int | None = None):
+                 fpga_build: int | None = None,
+                 vision_res: str = DEFAULT_VISION_RES):
         if multi_core != REQUIRED_ENGINES:
             raise ValueError(
                 f"Qwen2.5-Omni-7B requires exactly {REQUIRED_ENGINES} engines, "
@@ -422,7 +468,9 @@ class Qwen25OmniUnifiedEngine(
         )
 
         self.script_dir = script_dir or SCRIPT_DIR
-        self._cfg = self.load_config(script_dir=self.script_dir)
+        self._cfg = apply_vision_resolution(
+            self.load_config(script_dir=self.script_dir), vision_res)
+        self.vision_res = vision_res
         self._validate_config_and_map()
 
         fi = self._cfg["file_info"]
@@ -462,6 +510,19 @@ class Qwen25OmniUnifiedEngine(
     # whichever window has room, and the "cursor" becomes a byte counter so that
     # every caller's `end - PARAMS_BASE` accounting still reports what it always
     # reported -- bytes staged.
+
+    def _alloc_per_engine_attn_scratch(self, engine_idx: int, size_bytes: int) -> int:
+        """From the shared pool, pinned to the engine's own window.
+
+        At 4096 patches this is 35.65 MiB per engine -- far past the per-core
+        tensor slice, and growing the slice to fit would shrink every window's
+        gap below the 260 MiB the untied head needs contiguously. The pool has
+        the room, and pinning engine_idx keeps each engine reading its own
+        window exactly as the private slice did. It is released with the rest
+        of the vision tensors.
+        """
+        return self.mc_arena.alloc_shared_up(
+            size_bytes, f"vis.attn_scratch.e{engine_idx}", engine_idx=engine_idx)
 
     def _reserved_extent_for(self, label: str | None):
         """The dedicated extent a label is served from, or None for the pool."""
@@ -2295,11 +2356,26 @@ def _run_vision(
     grid = processed["image_grid_thw"]
     if tuple(grid.shape) != (1, 3):
         raise ValueError(f"only one image is supported, got grid {tuple(grid.shape)}")
-    expected_grid = torch.tensor([[1, 24, 24]], dtype=grid.dtype)
+    # The encoder is compiled for ONE patch count -- the tensors and the
+    # attention bias are carved for it -- so the grid is checked, but the
+    # expected value comes from the configured image geometry rather than a
+    # literal: image_size / patch_size per side, squared, is num_patches.
+    vis_cfg = ue._cfg["vision"]
+    side = int(vis_cfg["image_size"]) // int(vis_cfg["patch_size"])
+    if side * side != int(vis_cfg["num_patches"]):
+        raise ValueError(
+            f"vision config is inconsistent: image_size "
+            f"{vis_cfg['image_size']} / patch_size {vis_cfg['patch_size']} "
+            f"gives {side}x{side} = {side * side} patches, but num_patches is "
+            f"{vis_cfg['num_patches']}"
+        )
+    expected_grid = torch.tensor([[1, side, side]], dtype=grid.dtype)
     if not torch.equal(grid.cpu(), expected_grid):
         raise ValueError(
-            f"the fixed 336x336 encoder requires image_grid_thw [1,24,24], "
-            f"got {grid.tolist()}"
+            f"the encoder is carved for {vis_cfg['image_size']}x"
+            f"{vis_cfg['image_size']} (image_grid_thw [1,{side},{side}], "
+            f"{vis_cfg['num_patches']} patches -> "
+            f"{vis_cfg['num_merged_tokens']} soft tokens), got {grid.tolist()}"
         )
     print("\n--- Vision stage ---")
     started = time.perf_counter()
@@ -2362,6 +2438,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 """,
     )
     parser.add_argument("--dev", default="xdma0", help="DMA device (default xdma0)")
+    parser.add_argument(
+        "--vision-res",
+        choices=sorted(VISION_RESOLUTIONS),
+        default=DEFAULT_VISION_RES,
+        help=(
+            "vision input resolution; the encoder is carved for one patch "
+            "count. small=336x336 -> 144 soft tokens (default), "
+            "medium=896x896 -> 1024 soft tokens. The soft tokens are charged "
+            "against the context, so medium spends half of it on one image."
+        ),
+    )
     parser.add_argument(
         "--multi-core",
         nargs="?",
@@ -2459,7 +2546,10 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     args.audio = _resolve_sample(args.audio, DEFAULT_AUDIO, "--audio")
     engine_kwargs = resolve_engine_config(parser, args)
 
-    cfg = Qwen25OmniUnifiedEngine.load_config(script_dir=SCRIPT_DIR)
+    cfg = apply_vision_resolution(
+        Qwen25OmniUnifiedEngine.load_config(script_dir=SCRIPT_DIR),
+        args.vision_res,
+    )
     # Fetch/convert before constructing a device-owning engine.  The conversion
     # streams Thinker shards and skips Talker/token2wav-only checkpoint shards.
     params_path = _weight_mod.ensure_params_bin(SCRIPT_DIR)
@@ -2487,7 +2577,8 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     )
     print("\n--- Building U55 engine ---")
     ue = Qwen25OmniUnifiedEngine(
-        script_dir=SCRIPT_DIR, fpga_build=fpga_build, **engine_kwargs
+        script_dir=SCRIPT_DIR, fpga_build=fpga_build,
+        vision_res=args.vision_res, **engine_kwargs
     )
     ue.configure_runtime_artifacts(params_path, processor_dir)
     ue.tokenizer = processor.tokenizer
