@@ -283,10 +283,10 @@ class Qwen25OmniVisionMixin(_vl_vision.Qwen25VLVisionMixin):
         # the encoder HALT prevents fall-through into the appended patch image.
         self._vis_program_bytes = encoder_blob + patch_blob
         self._vis_total_flops += int(patch_flops)
-        if encoder_addr + len(self._vis_program_bytes) > self.WORKER_ISA_BASE:
+        if encoder_addr + len(self._vis_program_bytes) > self.MASTER_ISA_LIMIT:
             raise MemoryError(
                 "vision encoder plus patch projection exceeds the master ISA "
-                f"reserve at 0x{self.WORKER_ISA_BASE:X}"
+                f"reserve at 0x{self.MASTER_ISA_LIMIT:X}"
             )
         self._loud(
             f"  [Vision] FPGA patch projection compiled: "

@@ -1280,7 +1280,7 @@ class Qwen25OmniAudioMixin:
         if not program:
             raise RuntimeError("audio encoder capture produced an empty program")
         master_limit = getattr(
-            self, "WORKER_ISA_BASE", getattr(self, "DRAM_END", None)
+            self, "MASTER_ISA_LIMIT", getattr(self, "DRAM_END", None)
         )
         master_end = program_addr + len(program) + FLAG_PRECLEAR_PROGRAM_BYTES
         if master_limit is not None and master_end > master_limit:

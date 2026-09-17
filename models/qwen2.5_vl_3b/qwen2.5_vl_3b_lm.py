@@ -205,6 +205,12 @@ class Qwen25VLLMMixin:
         card out of this exact allocation -- must already have run.  Call it
         once, immediately before prefill executes.
         """
+        if self._prefill_mlp_tp_engines():
+            # Tensor-parallel prefill never reads a shared down_proj image --
+            # its K-shards were sliced into the private windows at load time --
+            # so there is nothing here to repack, and doing it would rewrite
+            # bytes the decode column shards still own.
+            return
         lanes = self._prefill_mlp_k_lanes()
         if lanes == 1 or getattr(self, "_down_k_lanes_packed", False):
             return
@@ -320,7 +326,14 @@ class Qwen25VLLMMixin:
                     ("down", "mlp.down_proj"),
                 )
                 for tag, key in projections:
-                    if tag in quantized:
+                    if self._lm_projection_is_private(tag):
+                        # Staged per-engine instead of into the shared image;
+                        # the subclass owns the slicing and records its own
+                        # addresses in `la`.
+                        self._stage_private_lm_projection(
+                            f, need(f"{pre}.{key}.weight.{sfx}"), base, la,
+                            tag, i, f"{pre}.{key}")
+                    elif tag in quantized:
                         la[f"{tag}_scale"], la[f"{tag}_data"] = self._dma_if4(
                             f, need(f"{pre}.{key}.weight.{sfx}"), base,
                             f"{pre}.{key}")
@@ -394,6 +407,137 @@ class Qwen25VLLMMixin:
                    f"(embedding {embedding_desc})")
 
         self._ensure_tokenizer()
+
+    def _prefill_mlp_tp_engines(self) -> int:
+        """Engines the prefill MLP is TENSOR-PARALLEL over, or 0 for row-shard.
+
+        Row-sharding splits the sequence and needs every weight on every engine.
+        Tensor-parallel splits the weights instead -- gate/up by output column,
+        down by its contraction dim -- so each engine holds 1/n of the MLP and
+        one cross-engine reduce_add per layer joins the result. A model whose
+        map cannot hold a shared MLP copy returns its engine count here and
+        stages the shards via :meth:`_lm_projection_is_private`.
+        """
+        return 0
+
+    def _emit_prefill_mlp_tp(self, sched, la, M, in_addr, out_addr,
+                             m_regs) -> int:
+        """One layer's MLP, tensor-parallel. Returns FLOPs emitted.
+
+        Four regions, and the boundaries are where the dataflow actually turns:
+
+          1. residual1 + norm   ROW-sharded -- pure elementwise/row-wise, and it
+                                must JOIN because step 2 reads every row.
+          2. gate/up/mult/down  COLUMN-sharded -- engine e runs ALL M rows for
+                                lane e alone. The SiLU-multiply never leaves the
+                                lane, so the whole chain is one region.
+          3. reduce_add         the only cross-engine arithmetic in the layer.
+          4. residual2          ROW-sharded again over the reduced result.
+        """
+        d = self._lm_dims()
+        H, MLP = d["H"], d["MLP"]
+        ne = int(sched.num_engines)
+        if MLP % ne:
+            raise ValueError(f"MLP={MLP} does not split {ne} ways")
+        LANE = MLP // ne
+        if LANE % UE_VECTOR_SIZE:
+            raise ValueError(f"MLP lane {LANE} is not {UE_VECTOR_SIZE}-aligned")
+        bpe = self.bytes_per_element
+        h_row = H * bpe
+        lane_plane = M * LANE * bpe
+        acc = [0]
+
+        def _pre(ctx):
+            m = m_regs[ctx.engine_idx]
+            ctx.ue.generate_instruction_add_set(m, ctx.rows)
+            acc[0] += ctx.ue.eltwise_core_dram(
+                M=ctx.rows, N=H,
+                dram_a=ctx.rows_addr(in_addr, h_row),
+                dram_b=ctx.rows_addr(self.LM_ATTN_PROJ, h_row),
+                dram_out=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
+            acc[0] += ctx.ue.rms_norm_core_dram(
+                M=ctx.rows, N=H,
+                A_DRAM_ADDR=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_NORM, h_row),
+                GAMMA_DRAM_ADDR=la["ln2"], gpr_M_reg=m) or 0
+
+        sched.sharded_region(M, _pre, join=True)
+
+        def _tp(ctx):
+            e = ctx.engine_idx
+            m = m_regs[e]
+            if ctx.cols != LANE:
+                raise AssertionError(
+                    f"column split gave {ctx.cols}, expected lane {LANE}")
+            ctx.ue.generate_instruction_add_set(m, M)
+            for tag, plane in (("gate", self.LM_MLP_GATE),
+                               ("up", self.LM_MLP_UP)):
+                data, scale = la[f"{tag}_tp"][e]
+                acc[0] += ctx.ue.matmat_mul_core(
+                    M=M, K=H, N=LANE, A_DRAM_ADDR=self.LM_MLP_NORM,
+                    B_DRAM_ADDR=data, SCALE_DRAM_ADDR=scale,
+                    is_B_quantized=True, data_type=TYPE.IF4,
+                    OUTPUT_DRAM_ADDR=plane + e * lane_plane,
+                    silu_enable=(tag == "gate"), gpr_M_reg=m) or 0
+            acc[0] += ctx.ue.eltwise_core_dram(
+                M=M, N=LANE,
+                dram_a=self.LM_MLP_GATE + e * lane_plane,
+                dram_b=self.LM_MLP_UP + e * lane_plane,
+                dram_out=self.LM_MLP_MULT + e * lane_plane,
+                mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=m) or 0
+            data, scale = la["down_tp"][e]
+            acc[0] += ctx.ue.matmat_mul_core(
+                M=M, K=LANE, N=H,
+                A_DRAM_ADDR=self.LM_MLP_MULT + e * lane_plane,
+                B_DRAM_ADDR=data, SCALE_DRAM_ADDR=scale,
+                is_B_quantized=True, data_type=TYPE.IF4,
+                OUTPUT_DRAM_ADDR=self.LM_MLP_DOWN_TP + e * M * h_row,
+                gpr_M_reg=m) or 0
+
+        sched.col_sharded_region(MLP, _tp, join=True)
+        sched.reduce_add(
+            [self.LM_MLP_DOWN_TP + e * M * h_row for e in range(ne)],
+            self.LM_MLP_DOWN, M=M, N=H, parallel=True)
+
+        def _post(ctx):
+            m = m_regs[ctx.engine_idx]
+            ctx.ue.generate_instruction_add_set(m, ctx.rows)
+            acc[0] += ctx.ue.eltwise_core_dram(
+                M=ctx.rows, N=H,
+                dram_a=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                dram_b=ctx.rows_addr(self.LM_MLP_DOWN, h_row),
+                dram_out=ctx.rows_addr(out_addr, h_row),
+                mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
+
+        sched.sharded_region(M, _post, join=True)
+        return acc[0]
+
+    def _decode_shard_override(self, op: str, layer: int):
+        """A ShardedWeight already staged privately, or None to shard normally.
+
+        Companion to :meth:`_lm_projection_is_private`: a projection that never
+        entered the shared image has no source address for
+        ``shard_quantized_weight`` to copy FROM, so the subclass hands over the
+        shards it staged itself.
+        """
+        return None
+
+    def _lm_projection_is_private(self, tag: str) -> bool:
+        """Whether this projection is staged PER ENGINE instead of shared.
+
+        Default: nothing is, so the shared params image is built exactly as
+        before. A model whose map cannot hold a shared copy of a projection
+        overrides this and :meth:`_stage_private_lm_projection` together.
+        """
+        return False
+
+    def _stage_private_lm_projection(self, file_obj, section: dict,
+                                     base_offset: int, la: dict, tag: str,
+                                     layer: int, what: str) -> None:
+        raise NotImplementedError(
+            f"{type(self).__name__} says {tag!r} is private but does not "
+            f"implement _stage_private_lm_projection()")
 
     def _ensure_tokenizer(self):
         """Load the tokenizer on demand.
@@ -533,6 +677,12 @@ class Qwen25VLLMMixin:
         # re-interpretation of the same [P, MLP] planes as lanes x [P, LANE].
         if self._prefill_mlp_k_lanes() > 1:
             self.LM_MLP_DOWN_PART = alloc(P * H, "lm.mlp_down_part")
+        tp_ne = self._prefill_mlp_tp_engines()
+        if tp_ne:
+            # Tensor-parallel down contracts over the LANE dim, so every engine
+            # produces a FULL-width [P, H] partial and reduce_add sums all of
+            # them. The K-lane accumulator above is the single-engine analogue.
+            self.LM_MLP_DOWN_TP = alloc(tp_ne * P * H, "lm.mlp_down_tp")
         self.LM_OUT_NORM = alloc(H, "lm.out_norm")
         self.LOGITS = alloc(d["VOCAB"], "lm.logits")
         # Repetition-penalty bias: the LM-head matmul's C term, so the HW argmax
@@ -729,6 +879,12 @@ class Qwen25VLLMMixin:
                              ("gate", d["H"], d["MLP"]),
                              ("up", d["H"], d["MLP"]),
                              ("down", d["MLP"], d["H"])):
+                pre_staged = self._decode_shard_override(op, li)
+                if pre_staged is not None:
+                    # Already sliced into the private windows at weight-load
+                    # time -- re-sharding it would copy the same bytes twice.
+                    shards[(op, li)] = pre_staged
+                    continue
                 if not self._decode_projection_should_shard(op, li):
                     skipped.append((op, li))
                     continue
@@ -1923,6 +2079,12 @@ class Qwen25VLLMMixin:
             # [rows, LANE] intermediate is consumed while it is still the most
             # recently written thing in DRAM. At lanes == 1 this is the
             # historical step list, tuple wrappers aside.
+            if self._prefill_mlp_tp_engines():
+                flops += self._emit_prefill_mlp_tp(
+                    sched, la, M, in_addr, out_addr, gate_m_regs)
+                self.generate_instruction_add_set(m_reg, M)
+                ckpt(f"L{li}:mlp_proj", flops)
+                return flops
             mlp_steps = ["residual1", "norm"]
             for _lane in range(lanes):
                 mlp_steps += [("gate", _lane), ("up", _lane),

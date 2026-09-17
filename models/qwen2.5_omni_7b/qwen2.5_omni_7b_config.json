@@ -111,11 +111,11 @@
     "required_engines": 8,
     "required_dram_gib": 8,
     "private_arena_base": "0x000000000",
-    "private_arena_bytes": "0x100000000",
-    "private_window_bytes": "0x20000000",
-    "model_base": "0x100000000",
-    "params_limit": "0x1E8000000",
-    "tensor_limit": "0x1FA000000",
+    "private_arena_bytes": "0x200000000",
+    "private_window_bytes": "0x40000000",
+    "private_isa_bytes": "0x1000000",
+    "private_tensor_bytes": "0x800000",
+    "shared_tensor_bytes": "0x10000000",
     "dram_limit": "0x200000000"
   }
 }

@@ -591,6 +591,22 @@ class PrivateArena:
                             for i, r in enumerate(self.regions)]
         self._weight_cursor = [r.weight_base for r in self.regions]
         self._tensor_cursor = [r.tensor_base for r in self.regions]
+        # THE SHARED POOL GROWS DOWN FROM THE TOP OF EACH WEIGHT ARENA, while
+        # private weights bump UP from its base.  The two cursors meet in the
+        # middle and every allocation on either side checks the other, so the
+        # empty tail of a private window can host data every core reads without
+        # a second allocator that could place it on top of live weights.
+        self._shared_cursor = [r.weight_limit for r in self.regions]
+        self._shared_allocs: list[dict] = []
+        # A FLOOR THE SHARED POOL MAY NOT LEND BELOW. alloc_shared places into
+        # whichever window has the most room RIGHT NOW, which is the correct
+        # rule only if every private allocation has already happened. It has
+        # not: a model stages shared weights while its private shards are still
+        # to come, so without a floor one window can be lent space a later
+        # private allocation needs, and the failure surfaces on an unrelated
+        # engine much later. Declaring the private footprint up front is what
+        # "private first, shared uses the rest" actually requires.
+        self._private_reserve = [0] * num_engines
         if verbose:
             print(self.describe())
 
@@ -634,13 +650,17 @@ class PrivateArena:
         """Bump-allocate in an engine's WEIGHT arena, 64 B aligned."""
         addr = (self._weight_cursor[engine_idx] + 63) & ~63
         end = addr + size_bytes
-        limit = self.regions[engine_idx].weight_limit
+        limit = self._shared_cursor[engine_idx]
         if end > limit:
+            window_limit = self.regions[engine_idx].weight_limit
+            borrowed = window_limit - limit
+            detail = (f", {borrowed / 2**20:.1f} MB of it lent to the shared pool"
+                      if borrowed else "")
             raise MemoryError(
                 f"{what}: engine {engine_idx} private weight arena overflow -- needs "
-                f"0x{end:X}, window ends at 0x{limit:X} "
+                f"0x{end:X}, usable arena ends at 0x{limit:X} "
                 f"({self.weight_bytes() // 2**20} MB per core at "
-                f"num_engines={self.num_engines})")
+                f"num_engines={self.num_engines}{detail})")
         self._weight_cursor[engine_idx] = end
         return addr
 
@@ -668,6 +688,148 @@ class PrivateArena:
         of the same thing, and the caller wants a list it can index by engine.
         """
         return [self.alloc_tensor(i, size_bytes, what) for i in range(self.num_engines)]
+
+    # -- the shared pool inside the private windows --------------------------
+    #
+    # WHY SHARED DATA LIVES IN PRIVATE WINDOWS. When the windows tile the WHOLE
+    # device there is no "elsewhere" left: a map of N x 1 GB over an N GB board
+    # has no region above the arena for the weights and tensors that every core
+    # must read. The empty tail of each window is exactly the space that is
+    # free, so shared data is carved from there -- downward, against the private
+    # weight cursor, so the arena itself arbitrates between the two and neither
+    # can silently land on the other.
+    #
+    # A shared allocation is CONTIGUOUS and lives inside ONE window. It is not
+    # striped across the per-core gaps: the matvec unit consumes a contiguous
+    # row block, so a weight section that straddled two windows would need a
+    # gather the hardware does not have. The consequence for callers is that the
+    # largest single shared object is bounded by the largest single gap, not by
+    # the total free bytes -- ``shared_free()`` reports both.
+
+    def reserve_private(self, bytes_per_engine: int) -> None:
+        """Declare how much of each window private shards will need.
+
+        Call once, before any :meth:`alloc_shared`. The pool then lends only
+        what is left over, so a large shared section cannot strand a private
+        allocation that has not been made yet.
+        """
+        if bytes_per_engine < 0:
+            raise ValueError(f"private reserve must be >= 0, got {bytes_per_engine}")
+        capacity = self.weight_bytes()
+        if bytes_per_engine > capacity:
+            raise ValueError(
+                f"private reserve {bytes_per_engine / 2**20:.1f} MiB exceeds the "
+                f"{capacity / 2**20:.1f} MiB weight arena per core")
+        for i in range(self.num_engines):
+            lent = self.regions[i].weight_limit - self._shared_cursor[i]
+            if lent and self._shared_cursor[i] < self.regions[i].weight_base + bytes_per_engine:
+                raise ValueError(
+                    f"engine {i} has already lent {lent / 2**20:.1f} MiB below the "
+                    f"requested reserve; declare it before allocating shared space")
+        self._private_reserve = [bytes_per_engine] * self.num_engines
+
+    def shared_free(self) -> list[int]:
+        """Free bytes per window the shared pool may still take."""
+        return [max(0, self._shared_cursor[i]
+                    - max(self._weight_cursor[i],
+                          self.regions[i].weight_base + self._private_reserve[i]))
+                for i in range(self.num_engines)]
+
+    def alloc_shared(self, size_bytes: int, what: str,
+                     align: int = SRAM_ROW_BYTES,
+                     engine_idx: Optional[int] = None) -> int:
+        """Carve ``size_bytes`` of every-core-readable DRAM from a window tail.
+
+        Returns one contiguous, ``align``-aligned address. Placement goes to the
+        window with the MOST room left (or ``engine_idx`` when the caller needs a
+        specific one), which keeps the gaps evenly drained instead of filling
+        core 0 and then failing on a large section that would still have fit
+        elsewhere.
+        """
+        if size_bytes <= 0:
+            raise ValueError(f"{what}: shared allocation must be positive, got {size_bytes}")
+        if align <= 0 or align & (align - 1):
+            raise ValueError(f"{what}: align must be a power of two, got {align}")
+        if engine_idx is None:
+            free = self.shared_free()
+            engine_idx = max(range(self.num_engines), key=lambda i: free[i])
+        elif not 0 <= engine_idx < self.num_engines:
+            raise ValueError(f"engine_idx {engine_idx} outside [0, {self.num_engines})")
+
+        addr = (self._shared_cursor[engine_idx] - size_bytes) & ~(align - 1)
+        floor = max(self._weight_cursor[engine_idx],
+                    self.regions[engine_idx].weight_base
+                    + self._private_reserve[engine_idx])
+        if addr < floor:
+            free = self.shared_free()
+            raise MemoryError(
+                f"{what}: no private window can host {size_bytes / 2**20:.2f} MB of "
+                f"shared data. Largest gap is {max(free) / 2**20:.2f} MB on core "
+                f"{max(range(self.num_engines), key=lambda i: free[i])}; "
+                f"{sum(free) / 2**20:.2f} MB free in total but a shared object must "
+                f"be contiguous inside ONE window.")
+        self._shared_cursor[engine_idx] = addr
+        self._shared_allocs.append(
+            {"engine": engine_idx, "base": addr, "size": size_bytes, "what": what}
+        )
+        return addr
+
+    def shared_mark(self) -> tuple:
+        """Snapshot the shared cursors so a later phase can reclaim the space.
+
+        The model's vision, audio and LM weights TIME-SHARE one pool: each stage
+        stages its own weights, is consumed, and hands the bytes to the next.
+        With one bump cursor per window that reclamation is just restoring the
+        cursors, so the mark is the cursors -- not a free list. Allocations are
+        released in strict reverse order (everything after the mark goes), which
+        is exactly the phase structure and nothing more.
+        """
+        return (tuple(self._shared_cursor), len(self._shared_allocs))
+
+    def shared_release(self, mark: tuple) -> int:
+        """Give every shared byte carved since ``mark`` back to the windows.
+
+        Returns the bytes reclaimed. The caller is asserting that nothing still
+        in use lives above the mark -- the DMA that overwrites them comes next,
+        so releasing a region a live program still reads is silent corruption,
+        not a fault. Release only at a phase boundary.
+        """
+        cursors, alloc_count = mark
+        if len(cursors) != self.num_engines:
+            raise ValueError("shared_release: mark is from a different arena")
+        reclaimed = 0
+        for i, want in enumerate(cursors):
+            have = self._shared_cursor[i]
+            if want < have:
+                raise ValueError(
+                    f"shared_release: engine {i} cursor 0x{have:X} is already below "
+                    f"the mark 0x{want:X}; marks release in reverse order only")
+            if want > self.regions[i].weight_limit:
+                raise ValueError(f"shared_release: engine {i} mark is outside its window")
+            reclaimed += want - have
+            self._shared_cursor[i] = want
+        del self._shared_allocs[alloc_count:]
+        return reclaimed
+
+    def shared_usage(self) -> list[int]:
+        """Bytes lent to the shared pool per window."""
+        return [self.regions[i].weight_limit - self._shared_cursor[i]
+                for i in range(self.num_engines)]
+
+    def shared_allocations(self) -> list[dict]:
+        """Every shared carve, in allocation order -- the audit trail for the map."""
+        return list(self._shared_allocs)
+
+    def describe_shared(self) -> str:
+        used, free = self.shared_usage(), self.shared_free()
+        lines = [f"  Shared pool inside the private windows "
+                 f"({sum(used) / 2**20:.1f} MB placed, "
+                 f"{sum(free) / 2**20:.1f} MB still free):"]
+        for i in range(self.num_engines):
+            lines.append(
+                f"    core {i}: shared {used[i] / 2**20:7.2f} MB at "
+                f"0x{self._shared_cursor[i]:09X}   free {free[i] / 2**20:7.2f} MB")
+        return "\n".join(lines)
 
     # -- protection ---------------------------------------------------------
     def check_isa_fits(self, engine_idx: int, addr: int, size_bytes: int) -> None:
@@ -702,11 +864,14 @@ class PrivateArena:
         for i, region in enumerate(self.regions):
             used = self._weight_cursor[i] - region.weight_base
             cap = region.weight_capacity
-            if self._weight_cursor[i] > region.weight_limit:
+            if self._weight_cursor[i] > self._shared_cursor[i]:
+                shared = region.weight_limit - self._shared_cursor[i]
+                spill = (f"the shared pool at 0x{self._shared_cursor[i]:X} "
+                         f"({shared / 2**20:.1f} MB)" if shared else
+                         f"its ISA slice at 0x{region.isa_base:X}")
                 raise MemoryError(
                     f"engine {i} weight arena overflow: {used / 2**20:.1f} MB used of "
-                    f"{cap / 2**20:.1f} MB, spilling into its ISA slice at "
-                    f"0x{region.isa_base:X}")
+                    f"{cap / 2**20:.1f} MB, spilling into {spill}")
             isa_used = None
             if engines is not None and i < len(engines) and engines[i] is not None:
                 isa_used = engines[i].get_program_dram_addr() - region.isa_base
@@ -719,10 +884,12 @@ class PrivateArena:
                 tensor_used = self._tensor_cursor[i] - region.tensor_base
                 isa_txt = (f"{isa_used / 1024:7.1f} KB" if isa_used is not None and i > 0
                            else "     (main map)")
+                shared = region.weight_limit - self._shared_cursor[i]
+                shared_txt = (f"   shared {shared / 2**20:6.1f} MB" if shared else "")
                 print(f"    core {i}: weights {used / 2**20:6.1f} / {cap / 2**20:.0f} MB"
                       f"   isa {isa_txt} / {self.isa_bytes // 2**20} MB"
                       f"   tensor {tensor_used / 2**20:5.2f} / "
-                      f"{self.tensor_bytes // 2**20} MB")
+                      f"{self.tensor_bytes // 2**20} MB{shared_txt}")
 
 
 def can_split(N: int, num_engines: int) -> bool:

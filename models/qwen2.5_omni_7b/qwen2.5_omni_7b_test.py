@@ -140,6 +140,37 @@ PREFILL_INPUT_TOKEN_LIMIT = 384
 # execution padding and do not become visible context tokens.
 PREFILL_MAX_SEQ_LEN = REQUIRED_ENGINES * 64
 
+# The private window geometry this map is built for. It is deliberately NOT
+# multi_engine_shard.MULTICORE_WINDOW_BYTES: that constant is 512 MiB and three
+# other multi-core models are validated against it, so Omni carries its own.
+OMNI_WINDOW_BYTES = 0x4000_0000            # 1 GiB per core, 8 GiB total
+# Measured worst case is core 0: 4.28 MiB of tensor-parallel prefill + 1.02 MiB
+# of decoder, plus the vision/audio encoder programs. 16 MiB is ~3x that, and
+# every MiB here is a MiB the window whose gap hosts the shared tensor extent
+# does not have -- that core carries the extent AND a full private shard set.
+OMNI_ISA_BYTES = 16 * 2**20                # per-core ISA slice, inside the window
+OMNI_PRIVATE_TENSOR_BYTES = 8 * 2**20      # per-core scratch, inside the window
+OMNI_SHARED_TENSOR_BYTES = 256 * 2**20     # one contiguous activation/KV extent
+
+# What the private shards need per core, declared BEFORE any shared byte is
+# lent. Measured on the 8-engine map:
+#   gate/up N-shards (both phases)  240.8   down N-shard (decode)  120.4
+#   down K-shard (prefill TP)       120.4   attn decode shard       38.3
+#   lm_head shard                    34.5   embedding shard         67.3
+#   decode BF16 O shard              85.8                        = 707.5 MiB
+# Asserted against actual usage after loading, so drift fails loudly instead of
+# silently eating the pool.
+OMNI_PRIVATE_RESERVE_BYTES = 712 * 2**20
+
+# THE TWO OBJECTS THAT CANNOT BE SCATTERED. Weight sections are placed one at a
+# time into whichever window has room, which works for the 196 attention
+# sections (max 6.5 MiB) and the encoders (max 13.3 MiB). It does not work for
+# the untied head: one 276 MiB IF4 blob that must be contiguous, and that no
+# window can still host once attention has been spread over them. It gets a
+# dedicated extent carved at init, next to the tensor extent, before anything
+# competes for the space.
+OMNI_LM_HEAD_BYTES = 280 * 2**20
+
 # The build ID read from UE_FPGA_VERSION is recorded and used to pick the flag
 # protocol, but it is not checked against an allowlist: any image that carries
 # the arithmetic ISA Omni needs is allowed to run. The E7 image predates
@@ -254,55 +285,86 @@ class Qwen25OmniUnifiedEngine(
         # the list has to exist from construction.
         self._fpga_decode_token_ids: list[int] = []
 
-        # U55 8-GiB DRAM map
+        # U55 8-GiB DRAM map -- EIGHT 1-GiB PRIVATE WINDOWS THAT TILE THE DEVICE
         #
-        #   [0, 4 GiB)       8 x 512-MiB private engine windows
-        #                     (504 MiB weight shards + 8 MiB scratch each)
-        #   [4 GiB, 7.625)   transient params (vision, audio, then LM)
-        #   [7.625, 7.90625) activations/KV cache
-        #   [7.90625, 8 GiB) ISA: 40 MiB master + 7 x 8 MiB workers
+        #   core i -> [i GiB, (i+1) GiB), and inside each window, low to high:
+        #     weights  984 MiB   private shards, bump-allocated UP from the base
+        #     (gap)               the shared pool, bump-allocated DOWN from 984
+        #     ISA       32 MiB
+        #     tensor     8 MiB   per-engine scratch
         #
-        # Prefill Q/K/O/GATE/UP/DOWN and the untied head are IF4; V stays BF16
-        # for attention accuracy, putting shared device LM weights at ~3655 MiB.
-        # Decode omits O from its private shards and phase-loads the 686-MiB BF16
-        # O overlay as eight 85.75-MiB upper-PARAMS stripes only after full
-        # prefill. The distinct IF8 embedding is loaded after decode sharding.
-        # The measured private total is 501.27 MiB/core
-        # (434.0 MiB decoder + 67.29 MiB embedding), leaving 2.73 MiB guarded
-        # headroom inside the 504-MiB weight arena; lookup/dequantization remains
-        # on the FPGA.
+        # WHY THE WHOLE DEVICE IS PRIVATE WINDOWS. At 1 GiB per core the windows
+        # span all 8 GiB, so there is no region left ABOVE the arena to hold the
+        # weights and tensors every core reads. The empty tail of each window is
+        # the only space there is, so shared data is carved from there and the
+        # arena arbitrates between the two cursors (PrivateArena.alloc_shared).
+        #
+        # WHY THE PREFILL MLP IS TENSOR-PARALLEL. A shared copy of the decoder
+        # is 3655 MiB and does not fit beside the private shards: it packs into
+        # the gaps with only 8 x ~42 MiB left, and the 112-MiB KV cache then has
+        # nowhere contiguous to go. Sharding the MLP -- 2889 MiB, 79% of the
+        # decoder -- over the engines is what makes this map fit, and it is also
+        # FASTER at the real prefill tile (see
+        # qwen2.5_omni_7b_mlp_tp_prototype.md: +14.2% at M=64, the size a
+        # <=64-token prompt runs). Only attention, the untied head and the norms
+        # stay shared, 765 MiB placed section by section across the gaps.
+        #
+        # Vision, audio and the shared LM weights still TIME-SHARE the pool, now
+        # via shared_mark()/shared_release() instead of one contiguous window.
         self.DRAM_END = 0x200000000
-        self.PARAMS_BASE = 0x100000000
-        self.PARAMS_LIMIT = 0x1E8000000
-        self.TENSOR_BASE = self.PARAMS_LIMIT
-        self.TENSOR_LIMIT = 0x1FA000000
-        self.ISA_BASE = self.TENSOR_LIMIT
-        self.VISION_WEIGHT_BASE = self.PARAMS_BASE
-
-        self.MASTER_ISA_RESERVE = 40 * 2**20
-        self.WORKER_ISA_BASE = self.ISA_BASE + self.MASTER_ISA_RESERVE
-        self.WORKER_ISA_STRIDE = 8 * 2**20
-        if self.WORKER_ISA_BASE + 7 * self.WORKER_ISA_STRIDE != self.DRAM_END:
-            raise AssertionError("worker ISA slices do not terminate at 8 GiB")
-
-        # Engine 0 uses the master ISA area.  PrivateArena still keeps window 0
-        # reserved for its decode weight shard, hence the external-ISA base is
-        # one stride before the first actually used worker slice.
-        assert multicore_arena_bytes(REQUIRED_ENGINES) == self.PARAMS_BASE, (
-            f"{REQUIRED_ENGINES} x {MULTICORE_WINDOW_BYTES // 2**20} MiB private "
-            f"windows end at 0x{multicore_arena_bytes(REQUIRED_ENGINES):X}, not "
-            f"at the params base 0x{self.PARAMS_BASE:X}")
+        self.WINDOW_BYTES = OMNI_WINDOW_BYTES
         self.mc_arena = PrivateArena(
             REQUIRED_ENGINES,
             arena_base=0,
-            arena_bytes=multicore_arena_bytes(REQUIRED_ENGINES),
-            tensor_bytes=8 * 2**20,
-            external_isa=(
-                self.WORKER_ISA_BASE - self.WORKER_ISA_STRIDE,
-                self.WORKER_ISA_STRIDE,
-            ),
+            arena_bytes=REQUIRED_ENGINES * OMNI_WINDOW_BYTES,
+            isa_bytes=OMNI_ISA_BYTES,
+            tensor_bytes=OMNI_PRIVATE_TENSOR_BYTES,
             verbose=True,
         )
+        if self.mc_arena.stride != OMNI_WINDOW_BYTES:
+            raise AssertionError(
+                f"private windows are 0x{self.mc_arena.stride:X}, not the "
+                f"0x{OMNI_WINDOW_BYTES:X} this map is built for")
+        if REQUIRED_ENGINES * OMNI_WINDOW_BYTES != self.DRAM_END:
+            raise AssertionError(
+                f"{REQUIRED_ENGINES} x {OMNI_WINDOW_BYTES // 2**20} MiB windows do "
+                f"not tile the 8 GiB device")
+
+        # ISA lives INSIDE the windows now. Engine 0's slice is the master area;
+        # every worker's is arena.isa_base(i), one window stride apart. The old
+        # WORKER_ISA_BASE was only ever used as the master's upper bound, so that
+        # bound is now named for what it is.
+        self.ISA_BASE = self.mc_arena.isa_base(0)
+        self.MASTER_ISA_RESERVE = OMNI_ISA_BYTES
+        self.MASTER_ISA_LIMIT = self.mc_arena.isa_limit(0)
+        self.WORKER_ISA_STRIDE = OMNI_WINDOW_BYTES
+
+        # PRIVATE SPACE IS CLAIMED BEFORE ANY SHARED BYTE IS LENT. The shard
+        # sizes are known from the manifest; the pool is whatever is left.
+        self.mc_arena.reserve_private(OMNI_PRIVATE_RESERVE_BYTES)
+
+        # ONE CONTIGUOUS SHARED TENSOR EXTENT, CARVED FIRST. Activations and the
+        # KV cache are addressed as whole [M, N] buffers, so unlike weight
+        # sections they cannot be scattered across windows -- they are taken
+        # while the largest contiguous run is still available.
+        self.TENSOR_BASE = self.mc_arena.alloc_shared(
+            OMNI_SHARED_TENSOR_BYTES, "TENSOR.window")
+        self.TENSOR_LIMIT = self.TENSOR_BASE + OMNI_SHARED_TENSOR_BYTES
+        head_base = self.mc_arena.alloc_shared(OMNI_LM_HEAD_BYTES, "LM_HEAD.window")
+        self._reserved_extents = {
+            "lm_head": [head_base, head_base + OMNI_LM_HEAD_BYTES, head_base],
+        }
+
+        # PARAMS IS NO LONGER A WINDOW, IT IS AN ACCOUNTING ORIGIN. Weight
+        # sections are placed individually by alloc_shared, so there is no
+        # params cursor to walk; PARAMS_BASE/_LIMIT keep the bookkeeping that
+        # every caller already does ("bytes staged so far", "capacity left")
+        # working against the pool instead of against a contiguous range.
+        self.PARAMS_BASE = 0
+        self.PARAMS_LIMIT = sum(self.mc_arena.shared_free())
+        self.VISION_WEIGHT_BASE = self.PARAMS_BASE
+        self._params_staged = 0
+        self._params_phase_mark = self.mc_arena.shared_mark()
 
         super().__init__(
             BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
@@ -344,6 +406,72 @@ class Qwen25OmniUnifiedEngine(
         self._end_of_turn_token_id = int(model["end_of_turn_token_id"])
         self.causal_mask_upper = False
 
+    # -- params allocation against the shared pool ---------------------------
+    #
+    # The base class walks one cursor through a contiguous params window. There
+    # is no such window in this map, so these four methods redirect the same API
+    # at PrivateArena's shared pool: each section is placed individually in
+    # whichever window has room, and the "cursor" becomes a byte counter so that
+    # every caller's `end - PARAMS_BASE` accounting still reports what it always
+    # reported -- bytes staged.
+
+    def _reserved_extent_for(self, label: str | None):
+        """The dedicated extent a label is served from, or None for the pool."""
+        if not label:
+            return None
+        for name, extent in self._reserved_extents.items():
+            if label.startswith(name):
+                return extent
+        return None
+
+    def allocate_params_dram(self, size_bytes: int, label: str | None = None,
+                             align_bytes: int = 64) -> int:
+        align = max(align_bytes, 128)
+        extent = self._reserved_extent_for(label)
+        if extent is not None:
+            base, limit, cursor = extent
+            addr = (cursor + align - 1) & ~(align - 1)
+            if addr + size_bytes > limit:
+                raise MemoryError(
+                    f"{label}: needs 0x{addr + size_bytes:X}, past its reserved "
+                    f"extent ending at 0x{limit:X} "
+                    f"({(limit - base) / 2**20:.0f} MiB)")
+            extent[2] = addr + size_bytes
+            self._params_staged += size_bytes
+            self._dram_addresses[label] = addr
+            return addr
+        # 128 B, not the caller's 64: a shared section can land anywhere in a
+        # window, and the SRAM row is the alignment every DMA base owes.
+        addr = self.mc_arena.alloc_shared(
+            size_bytes, label or "params", align=align)
+        self._params_staged += size_bytes
+        if label is not None:
+            self._dram_addresses[label] = addr
+        return addr
+
+    def get_params_dram_addr(self) -> int:
+        """Bytes staged into the pool, as an address in the PARAMS_BASE origin."""
+        return self.PARAMS_BASE + self._params_staged
+
+    def get_params_dram_usage(self) -> int:
+        return self._params_staged
+
+    def reset_params_dram_addr(self) -> None:
+        """Hand the previous phase's weights back to the windows.
+
+        Vision, audio and the shared LM weights time-share the pool. The base
+        class reclaims by rewinding one cursor; here it is a release back to the
+        mark taken when the phase began. The caller must already have
+        invalidated its cached addresses -- the next DMA overwrites these bytes.
+        """
+        reclaimed = self.mc_arena.shared_release(self._params_phase_mark)
+        for extent in self._reserved_extents.values():
+            extent[2] = extent[0]
+        self._params_staged = 0
+        if reclaimed:
+            self._loud(f"  [map] reclaimed {reclaimed / 2**20:.1f} MiB of shared "
+                       f"pool from the previous phase")
+
     def dma_to_accelerator_memory(
         self, dma_address: int, data: torch.Tensor
     ) -> None:
@@ -382,11 +510,11 @@ class Qwen25OmniUnifiedEngine(
             "required_engines": REQUIRED_ENGINES,
             "required_dram_gib": REQUIRED_DRAM_GIB,
             "private_arena_base": 0,
-            "private_arena_bytes": self.PARAMS_BASE,
-            "private_window_bytes": 0x20000000,
-            "model_base": self.PARAMS_BASE,
-            "params_limit": self.PARAMS_LIMIT,
-            "tensor_limit": self.TENSOR_LIMIT,
+            "private_arena_bytes": REQUIRED_ENGINES * OMNI_WINDOW_BYTES,
+            "private_window_bytes": OMNI_WINDOW_BYTES,
+            "private_isa_bytes": OMNI_ISA_BYTES,
+            "private_tensor_bytes": OMNI_PRIVATE_TENSOR_BYTES,
+            "shared_tensor_bytes": OMNI_SHARED_TENSOR_BYTES,
             "dram_limit": self.DRAM_END,
         }
         for name, wanted in expected.items():
@@ -397,9 +525,14 @@ class Qwen25OmniUnifiedEngine(
                     f"config hardware.{name}={raw!r}, expected 0x{wanted:X}"
                 )
         if self.mc_arena.stride != int(hw["private_window_bytes"], 0):
-            raise AssertionError("PrivateArena did not produce 512-MiB windows")
-        if self.mc_arena.weight_bytes() != 504 * 2**20:
-            raise AssertionError("each engine must have 504 MiB for decode shards")
+            raise AssertionError("PrivateArena did not produce 1-GiB windows")
+        expected_weight_bytes = (OMNI_WINDOW_BYTES - OMNI_ISA_BYTES
+                                 - OMNI_PRIVATE_TENSOR_BYTES)
+        if self.mc_arena.weight_bytes() != expected_weight_bytes:
+            raise AssertionError(
+                f"each engine must have {expected_weight_bytes // 2**20} MiB for its "
+                f"private shards and the shared pool, got "
+                f"{self.mc_arena.weight_bytes() // 2**20} MiB")
         if self._cfg["file_info"]["hidden_size"] != 3584:
             raise ValueError("this runtime is compiled only for the 3584-wide 7B Thinker")
         if set(self._cfg["precision"]["lm_quantized_projections"]) != {
@@ -574,7 +707,7 @@ class Qwen25OmniUnifiedEngine(
                     "tensor_base": self.TENSOR_BASE,
                     "tensor_limit": self.TENSOR_LIMIT,
                     "master_isa_base": self.ISA_BASE,
-                    "worker_isa_base": self.WORKER_ISA_BASE,
+                    "worker_isa_base": self.MASTER_ISA_LIMIT,
                     "worker_isa_stride": self.WORKER_ISA_STRIDE,
                     "dram_end": self.DRAM_END,
                 },
@@ -1697,10 +1830,10 @@ class Qwen25OmniUnifiedEngine(
     def check_master_isa(self) -> None:
         programs = self._master_isa_program_ends()
         stage, end = max(programs, key=lambda item: item[1])
-        if end > self.WORKER_ISA_BASE:
+        if end > self.MASTER_ISA_LIMIT:
             raise MemoryError(
                 f"{stage} master program ends at 0x{end:X}, beyond the worker ISA base "
-                f"0x{self.WORKER_ISA_BASE:X}"
+                f"0x{self.MASTER_ISA_LIMIT:X}"
             )
 
     def isa_usage_lines(self) -> list[str]:

@@ -7,6 +7,7 @@ import importlib.util
 import os
 import sys
 
+import numpy as np
 import torch
 
 
@@ -29,6 +30,12 @@ def _load_vl_lm():
 
 
 _vl_lm = _load_vl_lm()
+
+# The IF4 on-disk block: one bf16 scale per 64 elements, then those 64 elements
+# packed two nibbles to a byte.
+IF4_SCALE_BYTES = 2
+IF4_DATA_BYTES = 32
+IF4_BLOCK_BYTES = IF4_SCALE_BYTES + IF4_DATA_BYTES
 
 
 class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
@@ -74,6 +81,7 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
             # Decoder column shards are allocated first. The IF8 embedding then
             # fills only the audited remainder of each private weight window.
             self._ensure_fpga_embedding()
+            self._audit_private_reserve()
             return base
         except Exception:
             # The shared compiler's transaction ends before the embedding
@@ -347,13 +355,6 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
                 f"{self.bytes_per_element}"
             )
 
-        slot_stride = int(self.mc_arena.stride)
-        expected_stride = 0x20000000
-        if slot_stride != expected_stride:
-            raise ValueError(
-                f"BF16 O stripes require 512-MiB spacing, got "
-                f"0x{slot_stride:X}"
-            )
         splits = scheduler.split_cols(hidden_size)
         if len(splits) != engines:
             raise AssertionError(
@@ -375,40 +376,27 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
         if layer_bytes % 128 or stripe_bytes % 128:
             raise AssertionError("BF16 O stripe sizes must be 128-byte aligned")
 
+        # EACH STRIPE IS A PRIVATE ALLOCATION NOW, not a slot in a shared PARAMS
+        # window. The old plan spaced the stripes 512 MiB apart inside PARAMS
+        # because the private windows were full; at 1 GiB per core the overlay
+        # (85.75 MiB per engine) fits in the window that reads it, which is also
+        # where it belongs -- decode streams it per token and wants its own
+        # memory. Disjointness is the arena's invariant, so the pairwise and
+        # tensor-overlap checks this used to carry are gone with the slots.
         stripes = []
         for engine_idx, (col_offset, cols) in enumerate(splits):
-            base = int(self.PARAMS_BASE) + engine_idx * slot_stride
-            end = base + stripe_bytes
-            slot_end = min(base + slot_stride, int(self.PARAMS_LIMIT))
-            if base < int(self.PARAMS_BASE) or end > slot_end:
-                raise MemoryError(
-                    f"decode BF16 O core {engine_idx} stripe "
-                    f"[0x{base:X}, 0x{end:X}) exceeds its PARAMS slot ending "
-                    f"at 0x{slot_end:X}"
-                )
+            base = self.mc_arena.alloc_weights(
+                engine_idx, stripe_bytes, f"decode.bf16_o.core{engine_idx}")
             stripes.append(
                 {
                     "engine": engine_idx,
                     "col_offset": col_offset,
                     "cols": cols,
                     "base": base,
-                    "end": end,
+                    "end": base + stripe_bytes,
                     "layer_bytes": layer_bytes,
                 }
             )
-
-        # Pairwise disjointness is an explicit invariant rather than an
-        # accidental consequence of today's constants. The final, truncated
-        # PARAMS slot still has 42.25 MiB of guard space before TENSOR_BASE.
-        for left, right in zip(stripes, stripes[1:]):
-            if left["end"] > right["base"]:
-                raise MemoryError(
-                    f"decode BF16 O stripes overlap: core {left['engine']} ends "
-                    f"at 0x{left['end']:X}, core {right['engine']} starts at "
-                    f"0x{right['base']:X}"
-                )
-        if stripes[-1]["end"] > int(self.TENSOR_BASE):
-            raise MemoryError("decode BF16 O stripes overlap the tensor arena")
 
         by_layer = {}
         for layer in range(layer_size):
@@ -668,19 +656,12 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
         stripes = getattr(self, "_decode_o_stripes", None)
         if stripes is None or len(stripes) != 8:
             raise RuntimeError("BF16 decode O stripe plan is unavailable")
-        extent_end = max(int(stripe["end"]) for stripe in stripes)
-
+        # The stripes are PRIVATE arena allocations now, one per engine, made
+        # when the plan was built. There is nothing to reserve out of the shared
+        # pool here: the old code claimed the whole PARAMS span the stripes
+        # covered, which under this map is neither needed nor expressible.
         self.reset_params_dram_addr()
         try:
-            reserved = self.allocate_params_dram(
-                extent_end - self.PARAMS_BASE, label="decode.bf16_o_stripes"
-            )
-            if reserved != self.PARAMS_BASE or extent_end > self.PARAMS_LIMIT:
-                raise MemoryError(
-                    f"BF16 O stripe extent [0x{reserved:X}, 0x{extent_end:X}) "
-                    f"is outside PARAMS [0x{self.PARAMS_BASE:X}, "
-                    f"0x{self.PARAMS_LIMIT:X})"
-                )
             with open(decode_region["bin_path"], "rb") as file_obj:
                 for li, (name, section) in enumerate(o_plan):
                     file_obj.seek(
@@ -761,11 +742,20 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
                         raise AssertionError(
                             f"{name}: BF16 O shards cover {copied} of {len(blob)} bytes"
                         )
-            if self.get_params_dram_addr() != extent_end:
-                raise AssertionError(
-                    f"decode BF16 O extent ends at "
-                    f"0x{self.get_params_dram_addr():X}, expected 0x{extent_end:X}"
-                )
+            # The overlay no longer advances a params cursor -- it writes into
+            # eight private stripes -- so the completeness check is that every
+            # stripe stayed inside the window it was allocated from. Per-layer
+            # byte coverage is asserted in the loop above.
+            for stripe in stripes:
+                region = self.mc_arena.region(int(stripe["engine"]))
+                if (int(stripe["base"]) < region.weight_base
+                        or int(stripe["end"]) > region.weight_limit):
+                    raise AssertionError(
+                        f"decode BF16 O core {stripe['engine']} stripe "
+                        f"[0x{stripe['base']:X}, 0x{stripe['end']:X}) left its "
+                        f"private window [0x{region.weight_base:X}, "
+                        f"0x{region.weight_limit:X})"
+                    )
         except Exception:
             # A short overlay DMA destroys the prefill image without producing
             # a complete decode image, so neither phase may be retried in place.
@@ -777,9 +767,159 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
         self._lm_weight_init_done = False
         self._loud(
             f"  [Decode] BF16 O phase active: {decode_region['size'] / 2**20:.1f} "
-            "MiB payload in eight engine-striped PARAMS slots; IF4 prefill "
+            "MiB payload in eight private engine stripes; IF4 prefill "
             "weights reclaimed"
         )
+
+    # ======================================================================
+    # PRIVATE MLP SHARDS -- staged once, used by BOTH phases
+    # ======================================================================
+    # The 1 GiB map has no room for a shared copy of the MLP (2889 MiB, 79% of
+    # the decoder), so gate/up/down never enter the shared pool at all: they are
+    # sliced host-side straight into the per-engine private windows.
+    #
+    # gate/up are N-sharded [MLP/8, H] and that ONE shard serves both phases --
+    # prefill's tensor-parallel lane and decode's column block want the same
+    # bytes. `down` does not agree with itself: prefill must split the
+    # CONTRACTION dim to match gate/up's column split, decode splits the OUTPUT
+    # dim so its M=1 result concatenates. A K-slice is strided, so it cannot be
+    # re-derived from the N-slice by address arithmetic -- both layouts are
+    # staged, 120.4 MiB per core each. The budget carries it (see
+    # qwen2.5_omni_7b_1gib_map_notes.md); duplicating gate/up per phase would
+    # not.
+    #
+    # NOTHING IS RE-QUANTIZED. The IF4 image is [N, K/64] bf16 scales followed
+    # by [N, K/2] packed nibbles, so an N-slice is a contiguous byte range and a
+    # K-slice is a fixed byte window of every row -- exact in both directions,
+    # because the lane is 2368 = 37 whole 64-element scale blocks and an even
+    # number of nibbles.
+
+    MLP_PRIVATE_TAGS = frozenset({"gate", "up", "down"})
+
+    def _lm_projection_is_private(self, tag: str) -> bool:
+        return tag in self.MLP_PRIVATE_TAGS
+
+    def _audit_private_reserve(self) -> None:
+        """Check the declared private reserve against what was actually used.
+
+        The reserve is what stops the shared pool lending away space the private
+        shards still need, and it is a CONSTANT while the shard sizes come from
+        the manifest. If a precision policy or projection set changes, the two
+        drift apart -- silently over-reserving (wasting pool) or, worse, under-
+        reserving and turning a load-order change into a mysterious overflow on
+        an unrelated engine. Checking it once, after the last private
+        allocation, keeps the constant honest.
+        """
+        arena = self.mc_arena
+        reserve = arena._private_reserve[0]
+        used = arena.usage()
+        peak = max(used)
+        if peak > reserve:
+            raise MemoryError(
+                f"private shards used {peak / 2**20:.1f} MiB on engine "
+                f"{used.index(peak)}, past the {reserve / 2**20:.0f} MiB declared "
+                f"by OMNI_PRIVATE_RESERVE_BYTES. Raise it: the shared pool was "
+                f"sized against the old number.")
+        self._loud(
+            f"  [map] private shards {peak / 2**20:.1f} / "
+            f"{reserve / 2**20:.0f} MiB reserved per core; shared pool holds "
+            f"{sum(arena.shared_usage()) / 2**20:.1f} MiB, "
+            f"{sum(arena.shared_free()) / 2**20:.1f} MiB free")
+
+    def _prefill_mlp_tp_engines(self) -> int:
+        """All eight engines: the 1 GiB map has no shared MLP copy to read."""
+        return int(self.multi_core)
+
+    def _decode_shard_override(self, op: str, layer: int):
+        """Decode reuses the N-shard staged at weight-load time.
+
+        gate/up/down each already have their output-column block in every
+        engine's window; `down`'s prefill K-shard is a separate image and is
+        deliberately NOT returned here.
+        """
+        return getattr(self, "_mlp_private_shards", {}).get((op, layer))
+
+    @staticmethod
+    def _if4_split(blob: bytes, N: int, K: int):
+        """Return ([N, K/64] scale view, [N, K/2] data view) over one IF4 blob."""
+        if K % 64:
+            raise ValueError(f"IF4 K={K} is not a whole 64-element block")
+        blocks = N * K // 64
+        expected = blocks * IF4_BLOCK_BYTES
+        if len(blob) != expected:
+            raise ValueError(
+                f"IF4 blob is {len(blob)} bytes, expected {expected} for [{N}, {K}]")
+        scale_bytes = blocks * IF4_SCALE_BYTES
+        scales = np.frombuffer(blob[:scale_bytes], dtype=np.uint8).reshape(N, K // 64 * 2)
+        data = np.frombuffer(blob[scale_bytes:], dtype=np.uint8).reshape(N, K // 2)
+        return scales, data
+
+    def _stage_shard_pair(self, engine_idx: int, scales, data, what: str):
+        """DMA one engine's (scale, data) block into its private window."""
+        s_blob = np.ascontiguousarray(scales).tobytes()
+        d_blob = np.ascontiguousarray(data).tobytes()
+        s_addr = self.mc_arena.alloc_weights(engine_idx, len(s_blob), f"{what}.scale")
+        if self.dma_write(_vl_lm.DMA_DEVICE_H2C, s_addr, s_blob, len(s_blob)) != len(s_blob):
+            raise IOError(f"{what}.scale: short private DMA")
+        d_addr = self.mc_arena.alloc_weights(engine_idx, len(d_blob), f"{what}.data")
+        if self.dma_write(_vl_lm.DMA_DEVICE_H2C, d_addr, d_blob, len(d_blob)) != len(d_blob):
+            raise IOError(f"{what}.data: short private DMA")
+        return d_addr, s_addr
+
+    def _stage_private_lm_projection(self, file_obj, section: dict,
+                                     base_offset: int, la: dict, tag: str,
+                                     layer: int, what: str) -> None:
+        import multi_engine_shard as mes
+
+        ne = int(self.multi_core)
+        d = self._lm_dims()
+        N, K = ((d["MLP"], d["H"]) if tag in ("gate", "up") else (d["H"], d["MLP"]))
+        file_obj.seek(base_offset + int(section["offset"]))
+        blob = file_obj.read(int(section["size"]))
+        if len(blob) != int(section["size"]):
+            raise RuntimeError(f"truncated artifact read for {what}")
+        scales, data = self._if4_split(blob, N, K)
+
+        if not hasattr(self, "_mlp_private_shards"):
+            self._mlp_private_shards = {}
+
+        # ---- the N-shard: gate/up for both phases, down for decode ----------
+        if N % ne or (N // ne) % mes.COL_ALIGN:
+            raise ValueError(f"{what}: N={N} does not give {ne} 64-aligned blocks")
+        rows = N // ne
+        shards = []
+        n_addrs = []
+        for e in range(ne):
+            sl = slice(e * rows, (e + 1) * rows)
+            d_addr, s_addr = self._stage_shard_pair(
+                e, scales[sl], data[sl], f"{tag}_L{layer}.n{e}")
+            n_addrs.append((d_addr, s_addr))
+            shards.append(mes.WeightShard(
+                engine_idx=e, col_offset=e * rows, cols=rows,
+                weight_addr=d_addr, scale_addr=s_addr,
+                layer_stride=0, scale_layer_stride=0))
+        self._mlp_private_shards[(tag, layer)] = mes.ShardedWeight(
+            name=f"{tag}_proj_L{layer}", K=K, N=N, layers=1,
+            data_type=_vl_lm.TYPE.IF4, shards=shards)
+        la[f"{tag}_n_shards"] = n_addrs
+
+        if tag in ("gate", "up"):
+            # Prefill's lane IS the N-shard; nothing further to stage.
+            la[f"{tag}_tp"] = n_addrs
+            return
+
+        # ---- down also needs the K-shard that prefill contracts over --------
+        lane = d["MLP"] // ne
+        if lane % 64:
+            raise ValueError(f"{what}: K lane {lane} is not a whole scale block")
+        k_addrs = []
+        for e in range(ne):
+            s_lo, s_hi = e * (lane // 64) * 2, (e + 1) * (lane // 64) * 2
+            d_lo, d_hi = e * (lane // 2), (e + 1) * (lane // 2)
+            d_addr, s_addr = self._stage_shard_pair(
+                e, scales[:, s_lo:s_hi], data[:, d_lo:d_hi], f"down_L{layer}.k{e}")
+            k_addrs.append((d_addr, s_addr))
+        la["down_tp"] = k_addrs
 
     def _prefill_use_streaming_quantized_projection(self, tag: str) -> bool:
         """Never: the K-lane split puts down_proj back on the general tiler.
@@ -948,7 +1088,7 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
             lookup_program_addr = self.allocate_program_dram(
                 program_bytes, label="lm.embedding_lookup"
             )
-            if lookup_program_addr + program_bytes > self.WORKER_ISA_BASE:
+            if lookup_program_addr + program_bytes > self.MASTER_ISA_LIMIT:
                 raise MemoryError(
                     "embedding lookup program reserve exceeds the 40-MiB master ISA slice"
                 )

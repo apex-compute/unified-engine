@@ -66,10 +66,25 @@ def _load_config(script_dir: str) -> dict:
         return json.load(f)
 
 
+# What params.bin's CONTENT actually depends on. This used to hash the whole
+# config, which made the artifact's identity include `hardware` -- the DRAM map.
+# Nothing in this module reads `hardware`: the map decides WHERE weights are
+# loaded, never WHAT they are, so a map change was invalidating 5.9 GB of
+# bit-identical weights and forcing a re-quantization that could not alter a
+# single byte. The fingerprint is therefore an explicit allowlist: adding a
+# section here is a deliberate statement that it changes the payload.
+_PARAMS_IDENTITY_KEYS = ("file_info", "model", "precision", "paths",
+                         "vision", "audio")
+
+
 def _config_fingerprint(cfg: dict) -> str:
-    """Identify the exact geometry, precision policy, and artifact paths."""
+    """Identify the exact geometry, precision policy, and artifact paths.
+
+    Deliberately EXCLUDES `hardware`: see :data:`_PARAMS_IDENTITY_KEYS`.
+    """
+    identity = {k: cfg[k] for k in _PARAMS_IDENTITY_KEYS if k in cfg}
     canonical = json.dumps(
-        cfg, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
 
