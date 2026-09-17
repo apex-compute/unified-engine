@@ -559,7 +559,7 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
                 raise RuntimeError(f"truncated artifact read for {label}")
             return blob
 
-        tensor_cursor_before = self.get_tensor_dram_addr()
+        tensor_mark_before = self.tensor_phase_mark()
         dram_addresses_before = dict(self._dram_addresses)
         pointer_values_before = [
             (la, attr, la.get(attr)) for la, attr, _, _, _ in auxiliary
@@ -593,7 +593,7 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
                     )
                 self.final_norm_addr = address
         except Exception:
-            self._tensor_dram_addr = tensor_cursor_before
+            self.tensor_phase_restore(tensor_mark_before)
             self._dram_addresses.clear()
             self._dram_addresses.update(dram_addresses_before)
             for la, attr, old_value in pointer_values_before:

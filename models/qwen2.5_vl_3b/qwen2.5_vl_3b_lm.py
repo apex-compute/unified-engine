@@ -645,7 +645,7 @@ class Qwen25VLLMMixin:
         MLP, NL = d["MLP"], d["NL"]
         C, P = self.MAX_CONTEXT_SIZE, self.PREFILL_MAX_SEQ_LEN
         bpe = self.bytes_per_element
-        self._tensor_dram_addr = self._tensor_dram_base
+        self.reset_tensor_dram_addr()
 
         def alloc(n, what):
             return self.allocate_tensor_dram(n * bpe, label=what)

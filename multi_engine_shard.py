@@ -590,6 +590,8 @@ class PrivateArena:
             self.regions = [replace(r, isa_base=ext_base + i * ext_stride)
                             for i, r in enumerate(self.regions)]
         self._weight_cursor = [r.weight_base for r in self.regions]
+        # Audit trail for the layout report: what each private carve was for.
+        self._weight_allocs: list[dict] = []
         self._tensor_cursor = [r.tensor_base for r in self.regions]
         # THE SHARED POOL GROWS DOWN FROM THE TOP OF EACH WEIGHT ARENA, while
         # private weights bump UP from its base.  The two cursors meet in the
@@ -607,6 +609,15 @@ class PrivateArena:
         # engine much later. Declaring the private footprint up front is what
         # "private first, shared uses the rest" actually requires.
         self._private_reserve = [0] * num_engines
+        # TWO SHARED CURSORS, GROWING TOWARDS EACH OTHER. The pool serves two
+        # populations with INTERLEAVED lifetimes: weight sections (staged, then
+        # released at a phase change) and tensors (carved after the weights,
+        # released at their own phase change). One stack cannot express that --
+        # releasing the weights would have to pop the tensors above them -- so
+        # weights bump DOWN from the window top and tensors bump UP from the
+        # private reserve. Each is LIFO within itself and they are independent.
+        self._shared_up_cursor = [r.weight_base for r in self.regions]
+        self._shared_up_allocs: list[dict] = []
         if verbose:
             print(self.describe())
 
@@ -622,6 +633,10 @@ class PrivateArena:
 
     def weight_bytes(self) -> int:
         return self.stride - self._carve_isa_bytes - self.tensor_bytes
+
+    def weight_allocations(self) -> list[dict]:
+        """Every private carve, in order -- the audit trail for the map."""
+        return list(self._weight_allocs)
 
     def usage(self) -> list[int]:
         """Bytes of weight arena used per engine."""
@@ -662,6 +677,8 @@ class PrivateArena:
                 f"({self.weight_bytes() // 2**20} MB per core at "
                 f"num_engines={self.num_engines}{detail})")
         self._weight_cursor[engine_idx] = end
+        self._weight_allocs.append(
+            {"engine": engine_idx, "base": addr, "size": size_bytes, "what": what})
         return addr
 
     def alloc_tensor(self, engine_idx: int, size_bytes: int, what: str) -> int:
@@ -727,11 +744,15 @@ class PrivateArena:
                     f"engine {i} has already lent {lent / 2**20:.1f} MiB below the "
                     f"requested reserve; declare it before allocating shared space")
         self._private_reserve = [bytes_per_engine] * self.num_engines
+        for i in range(self.num_engines):
+            floor = self.regions[i].weight_base + bytes_per_engine
+            if self._shared_up_cursor[i] < floor:
+                self._shared_up_cursor[i] = floor
 
     def shared_free(self) -> list[int]:
         """Free bytes per window the shared pool may still take."""
         return [max(0, self._shared_cursor[i]
-                    - max(self._weight_cursor[i],
+                    - max(self._weight_cursor[i], self._shared_up_cursor[i],
                           self.regions[i].weight_base + self._private_reserve[i]))
                 for i in range(self.num_engines)]
 
@@ -758,6 +779,7 @@ class PrivateArena:
 
         addr = (self._shared_cursor[engine_idx] - size_bytes) & ~(align - 1)
         floor = max(self._weight_cursor[engine_idx],
+                    self._shared_up_cursor[engine_idx],
                     self.regions[engine_idx].weight_base
                     + self._private_reserve[engine_idx])
         if addr < floor:
@@ -810,6 +832,63 @@ class PrivateArena:
             self._shared_cursor[i] = want
         del self._shared_allocs[alloc_count:]
         return reclaimed
+
+    def alloc_shared_up(self, size_bytes: int, what: str,
+                        align: int = SRAM_ROW_BYTES,
+                        engine_idx: Optional[int] = None) -> int:
+        """Carve shared space growing UP from the private reserve.
+
+        Same contract as :meth:`alloc_shared` -- contiguous, inside one window --
+        but on the other cursor, so its lifetime is independent of the weight
+        sections carved downward from the window top.
+        """
+        if size_bytes <= 0:
+            raise ValueError(f"{what}: allocation must be positive, got {size_bytes}")
+        if align <= 0 or align & (align - 1):
+            raise ValueError(f"{what}: align must be a power of two, got {align}")
+        if engine_idx is None:
+            free = self.shared_free()
+            engine_idx = max(range(self.num_engines), key=lambda i: free[i])
+        elif not 0 <= engine_idx < self.num_engines:
+            raise ValueError(f"engine_idx {engine_idx} outside [0, {self.num_engines})")
+        addr = (self._shared_up_cursor[engine_idx] + align - 1) & ~(align - 1)
+        if addr + size_bytes > self._shared_cursor[engine_idx]:
+            free = self.shared_free()
+            raise MemoryError(
+                f"{what}: no private window can host {size_bytes / 2**20:.2f} MB. "
+                f"Largest gap is {max(free) / 2**20:.2f} MB on core "
+                f"{max(range(self.num_engines), key=lambda i: free[i])}; "
+                f"{sum(free) / 2**20:.2f} MB free in total but an allocation must "
+                f"be contiguous inside ONE window.")
+        self._shared_up_cursor[engine_idx] = addr + size_bytes
+        self._shared_up_allocs.append(
+            {"engine": engine_idx, "base": addr, "size": size_bytes, "what": what})
+        return addr
+
+    def shared_up_mark(self) -> tuple:
+        return (tuple(self._shared_up_cursor), len(self._shared_up_allocs))
+
+    def shared_up_release(self, mark: tuple) -> int:
+        cursors, alloc_count = mark
+        if len(cursors) != self.num_engines:
+            raise ValueError("shared_up_release: mark is from a different arena")
+        reclaimed = 0
+        for i, want in enumerate(cursors):
+            have = self._shared_up_cursor[i]
+            if want > have:
+                raise ValueError(
+                    f"shared_up_release: engine {i} cursor 0x{have:X} is already "
+                    f"below the mark 0x{want:X}; marks release in reverse order only")
+            reclaimed += have - want
+            self._shared_up_cursor[i] = want
+        del self._shared_up_allocs[alloc_count:]
+        return reclaimed
+
+    def shared_up_usage(self) -> list[int]:
+        return [self._shared_up_cursor[i]
+                - max(self.regions[i].weight_base + self._private_reserve[i],
+                      self._weight_cursor[i])
+                for i in range(self.num_engines)]
 
     def shared_usage(self) -> list[int]:
         """Bytes lent to the shared pool per window."""

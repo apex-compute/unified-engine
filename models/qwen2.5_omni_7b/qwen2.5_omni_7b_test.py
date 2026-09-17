@@ -133,12 +133,19 @@ ProgramBundle = _program_mod.ProgramBundle
 
 REQUIRED_ENGINES = 8
 REQUIRED_DRAM_GIB = 8
+# CONTEXT AND PREFILL ARE ONE BUDGET. Prefill and decode read the same KV
+# cache, so MAX_CONTEXT_SIZE bounds both: a prompt (vision soft tokens + text)
+# may fill it, and generation continues inside it.
 MAX_CONTEXT_SIZE = 2048
-PREFILL_INPUT_TOKEN_LIMIT = 384
-# Eight row-sharded engines require one full 64-row hardware block apiece.
-# Logical prompts stay capped at 384; the remaining rows are finite, masked
-# execution padding and do not become visible context tokens.
-PREFILL_MAX_SEQ_LEN = REQUIRED_ENGINES * 64
+PREFILL_INPUT_TOKEN_LIMIT = MAX_CONTEXT_SIZE
+# Allocation bound only. Prefill runs ceil(seq_len/64)*64 rows for the ACTUAL
+# prompt -- a 29-token prompt runs 64 rows -- so this sizes the [P, *] planes
+# for the longest prompt the context allows, it does not force that shape.
+PREFILL_MAX_SEQ_LEN = MAX_CONTEXT_SIZE
+
+# Vision soft tokens (post spatial-merge) the encoder is sized for. A 336x336
+# image is 144; the allocation carries 1024 so larger inputs need no re-carve.
+VISION_MAX_SOFT_TOKENS = 1024
 
 # The private window geometry this map is built for. It is deliberately NOT
 # multi_engine_shard.MULTICORE_WINDOW_BYTES: that constant is 512 MiB and three
@@ -149,8 +156,11 @@ OMNI_WINDOW_BYTES = 0x4000_0000            # 1 GiB per core, 8 GiB total
 # every MiB here is a MiB the window whose gap hosts the shared tensor extent
 # does not have -- that core carries the extent AND a full private shard set.
 OMNI_ISA_BYTES = 16 * 2**20                # per-core ISA slice, inside the window
-OMNI_PRIVATE_TENSOR_BYTES = 8 * 2**20      # per-core scratch, inside the window
-OMNI_SHARED_TENSOR_BYTES = 256 * 2**20     # one contiguous activation/KV extent
+# Per-core scratch, inside the window. The head-sharded prefill attention keeps
+# ONE private scratch per engine, (AHD + aligned_P) * aligned_P + aligned_P *
+# AHD elements -- 9.44 MiB at the 2048-row prefill allocation, so 8 MiB no
+# longer covers it.
+OMNI_PRIVATE_TENSOR_BYTES = 16 * 2**20
 
 # What the private shards need per core, declared BEFORE any shared byte is
 # lent. Measured on the 8-engine map:
@@ -343,13 +353,18 @@ class Qwen25OmniUnifiedEngine(
         # sizes are known from the manifest; the pool is whatever is left.
         self.mc_arena.reserve_private(OMNI_PRIVATE_RESERVE_BYTES)
 
-        # ONE CONTIGUOUS SHARED TENSOR EXTENT, CARVED FIRST. Activations and the
-        # KV cache are addressed as whole [M, N] buffers, so unlike weight
-        # sections they cannot be scattered across windows -- they are taken
-        # while the largest contiguous run is still available.
-        self.TENSOR_BASE = self.mc_arena.alloc_shared(
-            OMNI_SHARED_TENSOR_BYTES, "TENSOR.window")
-        self.TENSOR_LIMIT = self.TENSOR_BASE + OMNI_SHARED_TENSOR_BYTES
+        # TENSORS ARE CARVED PER BUFFER, NOT FROM ONE EXTENT. Only an individual
+        # buffer has to be contiguous -- the KV cache, an [M, N] activation
+        # plane -- and the largest of those is ~112 MiB at ctx 4096, well inside
+        # one window's gap. Reserving a single extent big enough for ALL of them
+        # (604 MiB at ctx 2048, 740 at 4096) is what used to cap the prefill
+        # allocation, because no window can offer that much contiguously and
+        # even merging two adjacent gaps tops out near 576 MiB. Carving each
+        # buffer on its own spreads them over the whole 2304 MiB pool instead.
+        self.TENSOR_BASE = 0
+        self.TENSOR_LIMIT = sum(self.mc_arena.shared_free())
+        self._tensor_staged = 0
+        self._tensor_phase_mark = self.mc_arena.shared_up_mark()
         head_base = self.mc_arena.alloc_shared(OMNI_LM_HEAD_BYTES, "LM_HEAD.window")
         self._reserved_extents = {
             "lm_head": [head_base, head_base + OMNI_LM_HEAD_BYTES, head_base],
@@ -472,6 +487,44 @@ class Qwen25OmniUnifiedEngine(
             self._loud(f"  [map] reclaimed {reclaimed / 2**20:.1f} MiB of shared "
                        f"pool from the previous phase")
 
+    # -- tensor allocation against the shared pool ---------------------------
+
+    def allocate_tensor_dram(self, size_bytes: int, label: str | None = None,
+                             align_bytes: int = 64) -> int:
+        addr = self.mc_arena.alloc_shared_up(
+            size_bytes, label or "tensor", align=max(align_bytes, 128))
+        self._tensor_staged += size_bytes
+        if label is not None:
+            self._dram_addresses[label] = addr
+        return addr
+
+    def get_tensor_dram_addr(self) -> int:
+        """Bytes staged, in the TENSOR_BASE origin -- see allocate_params_dram."""
+        return self.TENSOR_BASE + self._tensor_staged
+
+    def get_tensor_dram_usage(self) -> int:
+        return self._tensor_staged
+
+    def reset_tensor_dram_addr(self) -> None:
+        """Release every tensor carved since the phase mark back to the pool.
+
+        Vision, audio and the LM each re-carve the whole tensor set: vision runs
+        to completion and its output is on the host, so nothing it allocated
+        outlives it. With one extent that was a cursor rewind; here it is a
+        release, and the bytes genuinely return to the pool for the next phase.
+        """
+        self.mc_arena.shared_up_release(self._tensor_phase_mark)
+        self._tensor_staged = 0
+
+    def tensor_phase_mark(self):
+        """A rollback point for a partially-built tensor set."""
+        return (self.mc_arena.shared_up_mark(), self._tensor_staged)
+
+    def tensor_phase_restore(self, mark) -> None:
+        arena_mark, staged = mark
+        self.mc_arena.shared_up_release(arena_mark)
+        self._tensor_staged = staged
+
     def dma_to_accelerator_memory(
         self, dma_address: int, data: torch.Tensor
     ) -> None:
@@ -514,7 +567,6 @@ class Qwen25OmniUnifiedEngine(
             "private_window_bytes": OMNI_WINDOW_BYTES,
             "private_isa_bytes": OMNI_ISA_BYTES,
             "private_tensor_bytes": OMNI_PRIVATE_TENSOR_BYTES,
-            "shared_tensor_bytes": OMNI_SHARED_TENSOR_BYTES,
             "dram_limit": self.DRAM_END,
         }
         for name, wanted in expected.items():
@@ -1605,11 +1657,34 @@ class Qwen25OmniUnifiedEngine(
                 f"(IF4 + BF16 V/O, IF8 embedding)"
             )
         lines += self._program_section_lines()
-        isa = self.isa_usage_lines()
-        if isa:
-            lines += ["", "### ISA usage", "", "```"]
-            lines += [line.rstrip() for line in isa]
-            lines += ["```"]
+        layout = self.dram_layout_lines()
+        if layout:
+            # The per-core table is real Markdown; everything else is an aligned
+            # listing that only survives inside a fence. Emit each contiguous run
+            # in the form it needs.
+            lines += ["", "## DRAM layout"]
+            run: list[str] = []
+            run_is_table = False
+
+            def _flush(target=lines):
+                if not run:
+                    return
+                if run_is_table:
+                    target.append("")
+                    target.extend(run)
+                else:
+                    target += ["", "```"] + run + ["```"]
+                run.clear()
+
+            for line in layout:
+                stripped = line.rstrip()
+                is_table = stripped.startswith("|")
+                if is_table != run_is_table:
+                    _flush()
+                    run_is_table = is_table
+                if stripped or not is_table:
+                    run.append(stripped)
+            _flush()
         lines.append("")
 
         rows = self.stage_metrics(args)
@@ -1835,6 +1910,100 @@ class Qwen25OmniUnifiedEngine(
                 f"{stage} master program ends at 0x{end:X}, beyond the worker ISA base "
                 f"0x{self.MASTER_ISA_LIMIT:X}"
             )
+
+    @staticmethod
+    def _group_allocs(allocs: list[dict]) -> list[tuple[str, int, int]]:
+        """Collapse per-layer carves into one row per kind.
+
+        A 28-layer model makes hundreds of allocations whose names differ only
+        by a layer index; the map is only legible once they are summed.
+        """
+        import re
+        groups: dict[str, list[int]] = {}
+        for a in allocs:
+            key = str(a["what"])
+            key = re.sub(r"_L\d+", "", key)            # layer index
+            key = re.sub(r"\.n\d+", " N-shard", key)   # per-engine N shard
+            key = re.sub(r"\.k\d+", " K-shard", key)   # per-engine K shard
+            key = re.sub(r"[._]?core\d+", "", key)      # per-engine stripe
+            key = re.sub(r"\.(data|scale)$", "", key)   # blob halves are one thing
+            key = re.sub(r"[._]\d+$", "", key)
+            key = key.replace("_", " ").strip(". ") or "?"
+            groups.setdefault(key, []).append(int(a["size"]))
+        rows = [(k, sum(v), len(v)) for k, v in groups.items()]
+        rows.sort(key=lambda r: -r[1])
+        return rows
+
+    def dram_layout_lines(self) -> list[str]:
+        """The whole 8 GiB: windows, private shards, shared pool, tensors.
+
+        Replaces the old per-core ISA table. The ISA slice is 16 MiB of a 1 GiB
+        window and was never the interesting number; where the weights, the KV
+        cache and the scratch actually sit is.
+        """
+        MiB = float(2**20)
+        arena = self.mc_arena
+        ne = arena.num_engines
+        win = arena.stride
+        out = [
+            f"Device: {arena.arena_bytes / 2**30:.0f} GiB, {ne} x "
+            f"{win / MiB:.0f} MiB private windows tiling [0x0, 0x{arena.arena_bytes:X}).",
+            "",
+            "Inside every window, low to high:",
+            f"  private weight arena   {arena.weight_bytes() / MiB:7.0f} MiB   "
+            f"shards grow UP; shared tensors grow UP above the reserve",
+            f"  (shared pool)                      shared weights grow DOWN "
+            f"from the top of the arena",
+            f"  ISA slice              {arena.isa_bytes / MiB:7.0f} MiB",
+            f"  tensor scratch         {arena.tensor_bytes / MiB:7.0f} MiB   "
+            f"per-engine private attention scratch",
+            "",
+            "| core | window base | private | shared wts | tensors | free |",
+            "| ---: | :--- | ---: | ---: | ---: | ---: |",
+        ]
+        priv, sdown, sup, free = (arena.usage(), arena.shared_usage(),
+                                  arena.shared_up_usage(), arena.shared_free())
+        for i in range(ne):
+            out.append(
+                f"| {i} | 0x{arena.region(i).base:09X} | {priv[i] / MiB:.1f} MiB "
+                f"| {sdown[i] / MiB:.1f} MiB | {sup[i] / MiB:.1f} MiB "
+                f"| {free[i] / MiB:.1f} MiB |")
+        out.append(
+            f"| **all** | | **{sum(priv) / MiB:.0f}** | **{sum(sdown) / MiB:.0f}** "
+            f"| **{sum(sup) / MiB:.0f}** | **{sum(free) / MiB:.0f}** |")
+
+        rows = self._group_allocs(arena.weight_allocations())
+        if rows:
+            out += ["", "PRIVATE per core -- one shard of each weight, never duplicated:", ""]
+            for name, total, n in rows[:16]:
+                out.append(f"  {name:34s} {total / ne / MiB:8.2f} MiB/core"
+                           f"  {total / MiB:9.1f} MiB total  ({n} carves)")
+            out.append(f"  {'-' * 34} {'':>8}          {'':>9}")
+            out.append(f"  {'in use':34s} {sum(priv) / ne / MiB:8.2f} MiB/core"
+                       f"  {sum(priv) / MiB:9.1f} MiB total")
+            out.append(f"  {'reserved':34s} "
+                       f"{arena._private_reserve[0] / MiB:8.2f} MiB/core")
+
+        rows = self._group_allocs(arena.shared_allocations())
+        if rows:
+            out += ["", "SHARED WEIGHTS -- read by every core, placed section by "
+                    "section across the window tails:", ""]
+            for name, total, n in rows[:12]:
+                out.append(f"  {name:34s} {total / MiB:9.2f} MiB"
+                           f"   ({n} section{'s' if n != 1 else ''})")
+
+        rows = self._group_allocs(arena._shared_up_allocs)
+        if rows:
+            out += ["", "TENSORS -- KV cache, activations and scratch, carved "
+                    "per buffer from the same pool:", ""]
+            for name, total, n in rows[:14]:
+                out.append(f"  {name:34s} {total / MiB:9.2f} MiB"
+                           f"   ({n} buffer{'s' if n != 1 else ''})")
+        out += ["",
+                f"Context {self.MAX_CONTEXT_SIZE} tokens (prefill and decode share "
+                f"one KV cache); prefill allocation {self.PREFILL_MAX_SEQ_LEN} rows, "
+                f"run at ceil(seq_len/64)*64."]
+        return out
 
     def isa_usage_lines(self) -> list[str]:
         _stage, end = max(
@@ -2103,7 +2272,7 @@ def _run_vision(
     started = time.perf_counter()
     ue.vision_weight_init()
     ue.prepare_encoder_input(processed["pixel_values"], grid)
-    ue._tensor_dram_addr = ue._tensor_dram_base
+    ue.reset_tensor_dram_addr()
     ue.vision_tensor_init()
     ue.compile_vision_encoder(profile=profile)
     ue.check_master_isa()
@@ -2123,7 +2292,7 @@ def _run_audio(ue: Qwen25OmniUnifiedEngine, processed):
     metadata = ue.prepare_audio_input(
         processed["input_features"], processed["feature_attention_mask"]
     )
-    ue._tensor_dram_addr = ue._tensor_dram_base
+    ue.reset_tensor_dram_addr()
     ue.audio_tensor_init()
     ue.compile_audio_encoder()
     ue.check_master_isa()
