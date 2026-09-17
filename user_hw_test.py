@@ -8090,11 +8090,6 @@ if __name__ == "__main__":
     atexit.register(_atexit_write_test_summary)
 
     software_reset_test(cores=args.multi_core)
-    if engine_count >= 8: # alveo and alveo_u55c only
-            multi_core_dram_speed_test(data_size_kB=512, num_engines=engine_count)
-            matmat_mul_multi_cores_unified_test(runtime_list=[(6144, 1024, 1024)], num_engines=engine_count)
-            quantized_matmat_mul_multi_cores_test(runtime_list=[(1, 1536, 6144)], num_engines=engine_count)
-    assert False, "Stop on purpose"
     dram_read_write_speed_test()
     isa_rela_loop_test()
     isa_abs_loop_test()
