@@ -401,9 +401,8 @@ class Qwen25OmniUnifiedEngine(
         # the gaps with only 8 x ~42 MiB left, and the 112-MiB KV cache then has
         # nowhere contiguous to go. Sharding the MLP -- 2889 MiB, 79% of the
         # decoder -- over the engines is what makes this map fit, and it is also
-        # FASTER at the real prefill tile (see
-        # qwen2.5_omni_7b_mlp_tp_prototype.md: +14.2% at M=64, the size a
-        # <=64-token prompt runs). Only attention, the untied head and the norms
+        # FASTER at the real prefill tile: +14.2% measured at M=64, the size a
+        # <=64-token prompt runs. Only attention, the untied head and the norms
         # stay shared, 765 MiB placed section by section across the gaps.
         #
         # Vision, audio and the shared LM weights still TIME-SHARE the pool, now
