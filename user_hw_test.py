@@ -152,13 +152,78 @@ _GEMMA3_MULTI_CORE_MAX_CYCLES_PER_TOKEN = {
 KINTEX7_SYSTOLIC_CSR_BASE_ADDR = 0x02020000
 
 
-def _multi_engine_dram_layout(num_engines: int):
-    """Return per-engine DRAM bases for multi-engine tests.
+# Alveo U50 contention-free HBM allocation (full concurrent bandwidth).
+# ALVEO TARGET ONLY: use this map only when HW_INFO reports core_count == 8.
+# It does not describe Kintex-7, U55C, or any other target/core-count layout.
+# Each engine owns one 512 MiB memory-controller region on EACH 4 GiB stack,
+# for 1 GiB of private DRAM total.  HBM1 is the matching HBM0 range + 4 GiB.
+# The engine-to-controller order follows build_alveo.tcl's dedicated SAXI-port
+# wiring, so it is deliberately not a simple ``core * stride`` permutation:
+#
+#   core  SAXI/MC  HBM0 private range              HBM1 private range
+#     0    00 / 0  0x000000000 - 0x01FFFFFFF      0x100000000 - 0x11FFFFFFF
+#     1    04 / 2  0x040000000 - 0x05FFFFFFF      0x140000000 - 0x15FFFFFFF
+#     2    08 / 4  0x080000000 - 0x09FFFFFFF      0x180000000 - 0x19FFFFFFF
+#     3    06 / 3  0x060000000 - 0x07FFFFFFF      0x160000000 - 0x17FFFFFFF
+#     4    02 / 1  0x020000000 - 0x03FFFFFFF      0x120000000 - 0x13FFFFFFF
+#     5    14 / 7  0x0E0000000 - 0x0FFFFFFFF      0x1E0000000 - 0x1FFFFFFFF
+#     6    12 / 6  0x0C0000000 - 0x0DFFFFFFF      0x1C0000000 - 0x1DFFFFFFF
+#     7    10 / 5  0x0A0000000 - 0x0BFFFFFFF      0x1A0000000 - 0x1BFFFFFFF
+#
+# 512 MiB is the per-stack controller stride; 4 GiB is the stack stride.  The
+# linear test allocator below only guarantees non-overlap.  Code that requires
+# full HBM concurrency must use the controller-aligned bases above (and the
+# matching +0x1_0000_0000 range when it also uses HBM1).
+#
+# Alveo U55C HBM ownership for the u55c/hbm-port-reorder Tcl design.
+# ALVEO_U55C TARGET ONLY: use this map only when HW_INFO reports core_count == 12.
+# The single 8 GiB HBM address space has eight memory controllers (MCs).  Each
+# MC owns two adjacent 512 MiB HBM_MEM segments, hence one contiguous 1 GiB
+# range; SAXI ports 2k and 2k+1 share MC k.  The reordered engine wiring is:
+#
+#   core  SAXI / MC  controller-aligned range          bandwidth ownership
+#     0     00 / 0   0x000000000 - 0x03FFFFFFF        shared with core 8
+#     1     02 / 1   0x040000000 - 0x07FFFFFFF        shared with core 9
+#     2     04 / 2   0x080000000 - 0x0BFFFFFFF        shared with core 10
+#     3     06 / 3   0x0C0000000 - 0x0FFFFFFFF        shared with core 11
+#     4     08 / 4   0x100000000 - 0x13FFFFFFF        shared with XDMA (SAXI 09)
+#     5     10 / 5   0x140000000 - 0x17FFFFFFF        exclusive for core 5
+#     6     12 / 6   0x180000000 - 0x1BFFFFFFF        exclusive for core 6
+#     7     14 / 7   0x1C0000000 - 0x1FFFFFFFF        exclusive for core 7
+#     8     01 / 0   0x000000000 - 0x03FFFFFFF        shared with core 0
+#     9     03 / 1   0x040000000 - 0x07FFFFFFF        shared with core 1
+#    10     05 / 2   0x080000000 - 0x0BFFFFFFF        shared with core 2
+#    11     07 / 3   0x0C0000000 - 0x0FFFFFFFF        shared with core 3
+
+# The U55C map above, as per-core bases: core k < 8 takes the FIRST 512 MiB
+# segment of its own 1 GiB controller range, and core 8+k the SECOND segment of
+# controller k, so the two cores that share a controller never share a segment.
+# Measured on the reordered bitstream (0xc3ee417c) with 512 kB per engine:
+# 12 engines on these bases read at 108.1 GB/s (12 x 9.0, the per-port limit),
+# against 56.4 GB/s for the old flat 512 MiB-per-core stride, which left most
+# cores reading across the HBM lateral switch.
+ALVEO_U55C_MC_STRIDE = 0x40000000            # one memory controller: 1 GiB
+ALVEO_U55C_SEGMENT_STRIDE = 0x20000000       # one HBM_MEM segment: 512 MiB
+ALVEO_U55C_CORE_BASES = tuple(
+    (core % 8) * ALVEO_U55C_MC_STRIDE + (core // 8) * ALVEO_U55C_SEGMENT_STRIDE
+    for core in range(12)
+)
+
+# What one engine uses above its base: tensors at +0x08000000, program at
+# +0x0F000000. Every layout below must leave this much room per engine.
+MULTI_ENGINE_PRIVATE_BYTES = 0x0F100000
+
+
+def _multi_engine_dram_layout(num_engines: int) -> list[int]:
+    """Return the per-engine private DRAM base of each multi-engine test engine.
 
     Alveo HBM designs expose at least 4 GB and map HBM from address 0. The
-    8-engine U50C build uses 256 MB windows; the 12-engine U55C build uses
-    512 MB windows. Smaller DDR designs keep the legacy DRAM_START_ADDR base,
-    but still use non-overlapping 256 MB windows for private multi-engine tests.
+    12-engine U55C build uses the controller-aligned ALVEO_U55C_CORE_BASES:
+    concurrent bandwidth there depends on WHICH segment an engine reads, not on
+    how much DRAM the engines span, so a flat stride costs roughly half of it.
+    The 8-engine U50C build keeps 256 MB windows and smaller DDR designs keep
+    the legacy DRAM_START_ADDR base with the same 256 MB windows -- neither is
+    controller-aligned, so both guarantee non-overlap only.
     """
     import user_dma_core
 
@@ -168,40 +233,45 @@ def _multi_engine_dram_layout(num_engines: int):
         raise ValueError(f"num_engines must be >= 1, got {num_engines}")
 
     is_hbm = user_dma_core.AVAILABLE_DRAM_SIZE_GB >= 4
+    if is_hbm and user_dma_core.ANDROMEDA_CORE_COUNT == 12:
+        if num_engines > len(ALVEO_U55C_CORE_BASES):
+            raise ValueError(
+                f"num_engines={num_engines} exceeds the {len(ALVEO_U55C_CORE_BASES)} "
+                f"cores the U55C HBM map describes"
+            )
+        bases = list(ALVEO_U55C_CORE_BASES[:num_engines])
+    elif is_hbm:
+        bases = [i * 0x10000000 for i in range(num_engines)]
+    else:
+        bases = [user_dma_core.DRAM_START_ADDR + i * 0x10000000
+                 for i in range(num_engines)]
+
     if is_hbm:
-        dram_start_addr = 0x0
-        dram_base_stride = (
-            0x10000000 if user_dma_core.ANDROMEDA_CORE_COUNT == 8 else 0x20000000
-        )
-        layout_end = dram_start_addr + (num_engines - 1) * dram_base_stride + 0x0F100000
         dram_end = user_dma_core.AVAILABLE_DRAM_SIZE_GB * 1024 * 1024 * 1024
+        layout_end = max(bases) + MULTI_ENGINE_PRIVATE_BYTES
         if layout_end > dram_end:
             raise ValueError(
                 f"num_engines={num_engines} needs 0x{layout_end:x} of DRAM, "
                 f"but HW_INFO reports only 0x{dram_end:x} bytes"
             )
-    else:
-        dram_start_addr = user_dma_core.DRAM_START_ADDR
-        dram_base_stride = 0x10000000
 
-    return dram_start_addr, dram_base_stride
+    return bases
 
 
 def _make_multi_engine_ues(num_engines: int):
     import user_dma_core
 
     engine_base_stride = 0x00010000
-    dram_start_addr, dram_base_stride = _multi_engine_dram_layout(num_engines)
+    bases = _multi_engine_dram_layout(num_engines)
     ues = []
-    for i in range(num_engines):
-        engine_dram_base = dram_start_addr + i * dram_base_stride
+    for i, engine_dram_base in enumerate(bases):
         ues.append(UnifiedEngine(
             BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride,
             params_dram_base=engine_dram_base,
             tensor_dram_base=engine_dram_base + 0x08000000,
             program_dram_base=engine_dram_base + 0x0F000000,
         ))
-    return ues, dram_start_addr, dram_base_stride
+    return ues, bases
 
 
 def _rng_state_fingerprint() -> str:
@@ -443,7 +513,7 @@ def matmat_mul_two_engine_flag_check_test(
     M_three_fourth = M * 3 // 4
     M_one_fourth = M // 4
 
-    ues, _dram_start_addr, _dram_base_stride = _make_multi_engine_ues(2)
+    ues, _dram_bases = _make_multi_engine_ues(2)
     ue0, ue1 = ues
 
     e0_a_addr = ue0.allocate_tensor_dram(M_three_fourth * K * 2)
@@ -541,7 +611,7 @@ def matmat_mul_multi_engine_flag_check_test(M: int, K: int, N: int, num_engines:
     """
     import user_dma_core
 
-    ues, _dram_start_addr, _dram_base_stride = _make_multi_engine_ues(num_engines)
+    ues, _dram_bases = _make_multi_engine_ues(num_engines)
 
     a_addrs = []
     for i, ue in enumerate(ues):
@@ -622,7 +692,8 @@ def multi_core_dram_speed_test(data_size_kB: int = 512, num_engines: int = 4):
     read.
 
     HBM hardware only: the layout is based at 0x0 and uses the shared
-    _multi_engine_dram_layout() policy. Engines are NOT software-reset here.
+    _multi_engine_dram_layout() policy, which on the U55C is controller-
+    aligned so the engines do not contend. Engines are NOT software-reset here.
     """
     import user_dma_core
 
@@ -650,7 +721,7 @@ def multi_core_dram_speed_test(data_size_kB: int = 512, num_engines: int = 4):
             f"data_size_kB={data_size_kB} ({element_size} elements) exceeds the "
             f"{URAM_FULL_ELEMENTS}-element URAM ({URAM_FULL_ELEMENTS * 2 // 1024} kB)"
         )
-    ues, dram_start_addr, dram_base_stride = _make_multi_engine_ues(num_engines)
+    ues, dram_bases = _make_multi_engine_ues(num_engines)
 
     # Each engine reads from its own window: no shared source buffer.
     a_addrs = [ue.allocate_tensor_dram(transfer_bytes) for ue in ues]
@@ -698,8 +769,8 @@ def multi_core_dram_speed_test(data_size_kB: int = 512, num_engines: int = 4):
     total_bytes_transferred = num_engines * transfer_bytes
     speed_mb_per_s = total_bytes_transferred / latency_us
     print(f"multi_core_dram_speed_test: {num_engines} engines x {data_size_kB} kB "
-          f"({element_size} elements each), base=0x{dram_start_addr:x}, "
-          f"stride=0x{dram_base_stride:x}")
+          f"({element_size} elements each), bases="
+          + " ".join(f"0x{b:x}" for b in dram_bases))
     print(f"Total latency: {latency_us} us")
     print(f"speed {speed_mb_per_s:.2f} MB/s")
     # for i in range(num_engines):
@@ -736,7 +807,7 @@ def matmat_mul_two_cores_unified_test(
     assert runtime_list, "runtime_list must be non-empty"
 
     def _run_case(M, K, N, dynamic):
-        ues, _dram_start_addr, _dram_base_stride = _make_multi_engine_ues(2)
+        ues, _dram_bases = _make_multi_engine_ues(2)
         ue0, ue1 = ues
         bytes_per_element = 2
         m_engine0 = M // 2
@@ -8033,10 +8104,14 @@ if __name__ == "__main__":
         help='Run the large nested-loop sweeps at the end of the suite (slow).',
     )
     parser.add_argument(
-        '--multi-core', type=int, default=1,
-        help='Number of AXI cores (1..12) to software-reset in software_reset_test. '
-             'Use N to clear all engines a hung multi-core run left spin-waiting '
-             '(e.g. llama3.2_1b --multi-core 2 -> --multi-core 2). Default: 1.',
+        '--multi-core', type=int, default=None,
+        help='Number of AXI cores to run the multi-engine tests (and '
+             'software_reset_test) on. Default: every engine HW_INFO reports. '
+             'Pass N to use only the first N of them -- e.g. --multi-core 8 on '
+             'the 12-core U55C build -- or to clear all engines a hung '
+             'multi-core run left spin-waiting (llama3.2_1b --multi-core 2 -> '
+             '--multi-core 2). It does NOT change the board signature: the '
+             'DRAM layout still follows the engine count HW_INFO reports.',
     )
     parser.add_argument(
         '--single-core-only', action='store_true',
@@ -8068,6 +8143,23 @@ if __name__ == "__main__":
     engine_count = user_dma_core.ANDROMEDA_CORE_COUNT
     assert engine_count is not None
 
+    # --multi-core N runs on the FIRST N engines of the board HW_INFO reports,
+    # so the 12-core U55C build can be exercised 8 engines at a time. Only the
+    # count used by the tests moves: ANDROMEDA_CORE_COUNT stays the board
+    # signature that _multi_engine_dram_layout() keys its HBM map on, so the
+    # engines that do run keep their controller-aligned bases.
+    if args.multi_core is not None:
+        if not 1 <= args.multi_core <= engine_count:
+            parser.error(
+                f"--multi-core must be 1..{engine_count} on this board "
+                f"(HW_INFO reports {engine_count} engines), got {args.multi_core}"
+            )
+        if args.multi_core != engine_count:
+            print(f"--multi-core {args.multi_core}: running the multi-engine "
+                  f"tests on engines 0-{args.multi_core - 1} of the "
+                  f"{engine_count} HW_INFO reports")
+        engine_count = args.multi_core
+
     # Fix RNG seed so SNR numbers are reproducible across runs and easy to
     # compare across HDL changes (e.g. exp/LALU tweaks).
     _RNG_SEED = 0
@@ -8089,7 +8181,7 @@ if __name__ == "__main__":
 
     atexit.register(_atexit_write_test_summary)
 
-    software_reset_test(cores=args.multi_core)
+    software_reset_test(cores=engine_count)
     dram_read_write_speed_test()
     isa_rela_loop_test()
     isa_abs_loop_test()
