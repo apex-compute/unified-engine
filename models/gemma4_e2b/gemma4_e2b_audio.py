@@ -289,11 +289,12 @@ class Gemma4AudioMixin:
         sections = meta["sections"]
 
         # Route audio weight uploads to the dedicated Weight Audio params
-        # region (0x6c000000–0x78000000); restore the tensor cursor at the
-        # end so encoder intermediates start from the LM tensor end. Same
-        # contract as audio_weight_init (HF path).
+        # region; restore the tensor cursor at the end so encoder intermediates
+        # start from the LM tensor end. Same contract as audio_weight_init
+        # (HF path).
         _aud_weight_tensor_cursor_save = self._tensor_dram_addr
-        self._tensor_dram_addr = 0x6c000000
+        _aud_base, _aud_end = self._audio_weight_region()
+        self._tensor_dram_addr = _aud_base
 
         print(f"\n[Audio] Loading pre-quantized audio weights from combined weights bin "
               f"({AUDIO_QUANT_PRECISION.upper()} block=64 + BF16 norms) ...")
@@ -424,17 +425,16 @@ class Gemma4AudioMixin:
         finally:
             f.close()
 
-        # Sanity: assert audio weights fit in the 192 MB region.
+        # Sanity: assert audio weights fit the dedicated region.
         audio_weight_end = self._tensor_dram_addr
-        AUDIO_WEIGHT_REGION_END = 0x78000000
-        assert audio_weight_end <= AUDIO_WEIGHT_REGION_END, (
+        assert audio_weight_end <= _aud_end, (
             f"Audio weights overflowed dedicated region: cursor="
-            f"0x{audio_weight_end:X} > 0x{AUDIO_WEIGHT_REGION_END:X}")
+            f"0x{audio_weight_end:X} > 0x{_aud_end:X}")
         self._tensor_dram_addr = _aud_weight_tensor_cursor_save
 
         print(f"[Audio] uploaded {self.AUD_LAYERS} layers + subsample + projector "
-              f"(weights in params region 0x6c000000-0x{audio_weight_end:X}, "
-              f"{(audio_weight_end - 0x6c000000)/(1024*1024):.1f} MB from bin; "
+              f"(weights in params region 0x{_aud_base:X}-0x{audio_weight_end:X}, "
+              f"{(audio_weight_end - _aud_base)/(1024*1024):.1f} MB from bin; "
               f"tensor cursor restored to 0x{self._tensor_dram_addr:X})")
 
     def audio_weight_init(self) -> None:
