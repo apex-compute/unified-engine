@@ -222,6 +222,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import struct
 import time
 from dataclasses import dataclass, field, replace
@@ -401,11 +402,10 @@ def private_total() -> int:
 # stay at DRAM_START_ADDR: a multi-core model rebases its map above the arena
 # (the top 2 GB of an 8 GB device) and the whole layout needs >= 8 GB.
 #
-# NOTE ON THE CURRENT ALVEO BOARD. Its HW_INFO reports 8 cores / 4 GB, but the
-# 4 GB is stale register content -- the board is physically 8 GB. Until the
-# bitstream reports it correctly, run these models with
-# ``UE_FORCE_DRAM_SIZE_GB=8`` (see ``user_dma_core._dram_size_override_code``),
-# which patches the decoded HW_INFO and satisfies the check below.
+# NOTE ON THE CURRENT ALVEO BOARD. Its HW_INFO now reports 8 cores / 8 GB
+# correctly (HW_INFO 0x89016eab), so the check below passes on its own and
+# ``UE_FORCE_DRAM_SIZE_GB=8`` is NO LONGER NEEDED here. The override stays in
+# user_dma_core for any board still shipping a stale DRAM size in HW_INFO.
 MULTICORE_WINDOW_BYTES = 0x2000_0000      # 512 MB per engine, fixed
 MULTICORE_MIN_DRAM_GIB = 8
 
@@ -438,8 +438,8 @@ def require_multicore_dram(num_engines: int, what: str) -> None:
             f"{num_engines} x {MULTICORE_WINDOW_BYTES // 2**20} MB private "
             f"windows plus the model's own 2 GB map above them -- but HW_INFO "
             f"reports {gib} GB. On a board whose HW_INFO under-reports a "
-            f"physically larger DRAM (the current Alveo reports 4 GB for an "
-            f"8 GB device), set UE_FORCE_DRAM_SIZE_GB=8 to override it.")
+            f"physically larger DRAM, set UE_FORCE_DRAM_SIZE_GB to the true "
+            f"size to override it.")
 
 
 # ==========================================================================
@@ -479,6 +479,34 @@ def require_multicore_dram(num_engines: int, what: str) -> None:
 # full HBM concurrency must use the controller-aligned bases above (and the
 # matching +0x1_0000_0000 range when it also uses HBM1).
 #
+# WHAT ACTUALLY CONTENDS ON THE U50 is the 1 GiB four-pseudo-channel SWITCH
+# REGION, not the 512 MiB controller.  Measured with multi_core_dram_speed_test
+# at 512 kB per engine, one engine alone reads 10.7 GB/s (91% of the 11.7 GB/s
+# its own 256-bit AXI port can carry at 366.67 MHz), and:
+#
+#   engines in one 1 GiB region   per-engine rate
+#     1                             10.7 GB/s
+#     2                             10.7 GB/s   <- still full rate
+#     3                              5.7 GB/s   <- halves, and stays halved
+#     4                              5.7 GB/s
+#
+# So the rule is AT MOST TWO ENGINES PER 1 GiB REGION, and the 512 MiB
+# controller stride satisfies it with room to spare.  Aggregate over all eight
+# engines, same test:
+#
+#   flat 0x1000_0000 (256 MiB) stride   45.8 GB/s   4 engines per region
+#   flat 0x2000_0000 (512 MiB) stride   85.2 GB/s   2 engines per region
+#   ALVEO_CORE_MC_ORDER bases           85.2 GB/s   2 engines per region
+#   ALVEO_CORE_MC_ORDER bases, HBM1     84.4 GB/s
+#
+# Note the SAXI permutation buys nothing over a plain 512 MiB stride at this
+# transfer size -- both hit the per-engine AXI port ceiling -- so the map above
+# is about which region each engine OWNS, not about shortening its path.  What
+# the layout is worth downstream, same 8 engines:
+#
+#   M=1 K=1536 N=6144 IF4 (memory bound)  174.9 -> 309.2 GFLOPS, 4.37x -> 7.74x
+#   M=6144 K=1024 N=1024 bf16 (compute)   349.0 -> 357.1 GFLOPS, 7.84x -> 8.03x
+#
 # Alveo U55C HBM ownership for the u55c/hbm-port-reorder Tcl design.
 # ALVEO_U55C TARGET ONLY: use this map only when HW_INFO reports core_count == 12.
 # The single 8 GiB HBM address space has eight memory controllers (MCs).  Each
@@ -499,6 +527,7 @@ def require_multicore_dram(num_engines: int, what: str) -> None:
 #    10     05 / 2   0x080000000 - 0x0BFFFFFFF        shared with core 2
 #    11     07 / 3   0x0C0000000 - 0x0FFFFFFFF        shared with core 3
 
+KINTEX7_BOARD_CORES = 2                     # HW_INFO signature of the kintex7 image
 ALVEO_BOARD_CORES = 8                       # HW_INFO signature of the U50 image
 ALVEO_U55C_BOARD_CORES = 12                 # HW_INFO signature of the U55C image
 
@@ -557,26 +586,361 @@ def is_alveo_u55c() -> bool:
     return user_dma_core.ANDROMEDA_CORE_COUNT == ALVEO_U55C_BOARD_CORES
 
 
-def require_alveo_u55c(what: str) -> None:
-    """Fail unless this board is the U55C the 1 GiB-per-core maps target.
+# ==========================================================================
+# WHOLE-BOARD PRIVATE WINDOWS (the hardware test suite's map)
+# ==========================================================================
+# THIS IS NOT THE MODEL ARENA POLICY. Two different maps coexist and they are
+# not interchangeable:
+#
+#   model runs   engines share the device with the model's own 2 GB map, so
+#                they get the LOW arena only -- multicore_arena_bytes() +
+#                private_region(), fixed 512 MB windows from 0 upward, model
+#                rebased above them. See "THE MULTI-CORE WINDOW IS A FIXED
+#                512 MB" above.
+#   test runs    user_hw_test.py owns the whole device; nothing else is
+#                resident. So the engines divide ALL of DRAM -- 1 GB per core
+#                on both Alveo boards, instead of the model map's 512 MB.
+#
+# A U50 engine's 1 GiB is NOT ONE CONTIGUOUS RANGE, and that is the point of
+# EngineWindow. The board has two 4 GiB stacks and each engine has its own
+# dedicated SAXI port on BOTH (``SAXI_xx`` on hbm_0, ``SAXI_xx_RT`` on hbm_1,
+# see build_alveo.tcl:908-938). The 512 MB region an engine owns outright on
+# each stack is therefore the SAME controller offset 4 GiB apart, so its
+# private DRAM is two segments: ``B`` and ``B + 0x1_0000_0000``. Splicing them
+# into one 1 GiB range is impossible -- the addresses in between belong to
+# other engines -- so callers get the segments and must not assume contiguity.
+#
+# Every byte of a U50 window is reached over that engine's own port with no
+# lateral switch hop, and the eight windows together consume all 8 GiB.
 
-    The core count is the board signature: the U55C build instantiates twelve
-    engines, the 8-core Alveo image eight. A window size tied to one board's
-    HBM port assignment is actively harmful on a board that wires the ports
-    differently, so the caller refuses rather than guessing.
+ENGINE_TENSOR_OFFSET = 0x0800_0000    # tensor scratch, from the window base
+ENGINE_PROGRAM_OFFSET = 0x0F00_0000   # ISA program, from the window base
+ENGINE_FOOTPRINT_BYTES = 0x0F10_0000  # what one engine actually uses above base
+DDR_WINDOW_BYTES = 0x1000_0000        # 256 MB, the legacy single-controller map
+
+
+@dataclass(frozen=True)
+class EngineWindow:
+    """One engine's private DRAM, as one or more non-contiguous segments.
+
+    ``segments`` is ascending ``(base, nbytes)``. ``base`` is the FIRST
+    segment and is where the engine's allocator cursors live, so a caller that
+    only needs ENGINE_FOOTPRINT_BYTES can ignore the rest; a caller that wants
+    the whole window must walk ``segments`` and must not assume the segments
+    join up.
+    """
+
+    engine_idx: int
+    segments: tuple[tuple[int, int], ...]
+
+    @property
+    def base(self) -> int:
+        """Primary segment base -- the engine's params/tensor/program origin."""
+        return self.segments[0][0]
+
+    @property
+    def primary_bytes(self) -> int:
+        return self.segments[0][1]
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(nbytes for _, nbytes in self.segments)
+
+    @property
+    def is_contiguous(self) -> bool:
+        return len(self.segments) == 1
+
+    def ranges(self) -> list[tuple[int, int]]:
+        """Half-open ``(start, end)`` per segment."""
+        return [(b, b + n) for b, n in self.segments]
+
+    def describe(self) -> str:
+        segs = " + ".join(f"0x{b:09X}..0x{b + n:09X} ({n // 2**20} MB)"
+                          for b, n in self.segments)
+        return f"core {self.engine_idx}: {self.total_bytes // 2**20} MB = {segs}"
+
+
+def board_private_windows(num_engines: int) -> list[EngineWindow]:
+    """THE multi-core DRAM layout. One handler, three boards, keyed on HW_INFO.
+
+    Nothing else in the tree decides where a multi-core engine's private DRAM
+    lives -- callers ask here. The board is identified by its HW_INFO CORE
+    COUNT, which is the image signature (see is_alveo_u55c):
+
+      2 cores   kintex7      the legacy map, reproduced from origin/main
+                             unchanged: 512 MB per core from 0 on a >= 4 GB
+                             report, else 256 MB per core from DRAM_START_ADDR.
+      8 cores   alveo U50    TWO 512 MB segments per core -- the controller
+                             region it owns on EACH of the two 4 GiB HBM
+                             stacks. 1 GB per core, all 8 GiB claimed.
+      12 cores  alveo U55C   one CONSECUTIVE 1 GiB per core, which is its whole
+                             memory controller (two adjacent 512 MB segments).
+
+    Any other core count raises: a window map guessed for hardware nobody has
+    measured is worse than no map at all.
+
+    For the model-side low-arena map use multicore_arena_bytes() and
+    private_region() instead -- see the comment block above.
+    """
+    if num_engines < 1:
+        raise ValueError(f"num_engines must be >= 1, got {num_engines}")
+    if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
+        user_dma_core.configure_clock_from_hardware()
+
+    cores = user_dma_core.ANDROMEDA_CORE_COUNT
+    gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
+    if num_engines > cores:
+        raise ValueError(
+            f"num_engines={num_engines} exceeds the {cores} engines HW_INFO reports")
+
+    if cores == ALVEO_BOARD_CORES:
+        # U50. Each engine has its own SAXI port on BOTH stacks, so the 512 MB
+        # it owns outright is the same controller offset 4 GiB apart -- its
+        # 1 GB is two segments and CANNOT be spliced (other engines hold the
+        # addresses in between).
+        lo = alveo_core_bases(num_engines, stack=0)
+        hi = alveo_core_bases(num_engines, stack=1)
+        windows = [EngineWindow(i, ((lo[i], ALVEO_MC_STRIDE), (hi[i], ALVEO_MC_STRIDE)))
+                   for i in range(num_engines)]
+    elif cores == ALVEO_U55C_BOARD_CORES:
+        # U55C. One MC owns two adjacent 512 MB segments, so a core's 1 GiB is
+        # consecutive. Only EIGHT fit: 8 GiB / 1 GiB. Past that the board's own
+        # 512 MB-per-core map (ALVEO_U55C_CORE_BASES) is the only option, and
+        # the caller has to ask for it deliberately rather than be silently
+        # given half of what this function promises.
+        if num_engines > ALVEO_U55C_MC_COUNT:
+            raise ValueError(
+                f"num_engines={num_engines} x 1 GiB does not fit the U55C's "
+                f"{gib} GiB; at most {ALVEO_U55C_MC_COUNT} cores get a "
+                f"consecutive 1 GiB. For all {cores} engines use the 512 MB "
+                f"segment map, alveo_u55c_core_bases().")
+        windows = [EngineWindow(i, ((i * ALVEO_U55C_MC_STRIDE, ALVEO_U55C_MC_STRIDE),))
+                   for i in range(num_engines)]
+    elif cores == KINTEX7_BOARD_CORES:
+        if gib >= 4:
+            base, size = 0x0, MULTICORE_WINDOW_BYTES
+        else:
+            base, size = user_dma_core.DRAM_START_ADDR, DDR_WINDOW_BYTES
+        windows = [EngineWindow(i, ((base + i * size, size),))
+                   for i in range(num_engines)]
+    else:
+        raise ValueError(
+            f"no multi-core DRAM map for a {cores}-core board (HW_INFO reports "
+            f"{gib} GB). The maps here are measured per board: "
+            f"{KINTEX7_BOARD_CORES} cores = kintex7, {ALVEO_BOARD_CORES} = "
+            f"Alveo U50, {ALVEO_U55C_BOARD_CORES} = Alveo U55C. Measure the "
+            f"new board's HBM ownership and add it above.")
+
+    _validate_windows(windows, gib, is_hbm=gib >= 4)
+    return windows
+
+
+def _validate_windows(windows: list[EngineWindow], gib: int, is_hbm: bool) -> None:
+    """Every segment in range, big enough, and owned by exactly one engine."""
+    dram_end = gib * 1024 * 1024 * 1024
+    for w in windows:
+        if w.primary_bytes < ENGINE_FOOTPRINT_BYTES:
+            raise ValueError(
+                f"core {w.engine_idx}: primary segment is 0x{w.primary_bytes:X} "
+                f"bytes, below the 0x{ENGINE_FOOTPRINT_BYTES:X} one engine uses "
+                f"above its base")
+        if is_hbm:
+            for base, nbytes in w.segments:
+                if base + nbytes > dram_end:
+                    raise ValueError(
+                        f"core {w.engine_idx}: segment 0x{base:X}..0x{base + nbytes:X} "
+                        f"runs past the 0x{dram_end:X} bytes HW_INFO reports")
+    spans = sorted((b, b + n, w.engine_idx)
+                   for w in windows for b, n in w.segments)
+    for (b0, e0, i0), (b1, _e1, i1) in zip(spans, spans[1:]):
+        if b1 < e0:
+            raise ValueError(
+                f"cores {i0} and {i1} overlap at 0x{b1:X} "
+                f"(core {i0} owns 0x{b0:X}..0x{e0:X})")
+
+
+def describe_board_windows(num_engines: int) -> str:
+    windows = board_private_windows(num_engines)
+    total = sum(w.total_bytes for w in windows)
+    lines = [f"  whole-board private map, {num_engines} core(s), "
+             f"{total // 2**20} MB claimed:"]
+    lines += ["    " + w.describe() for w in windows]
+    return "\n".join(lines)
+
+
+# ==========================================================================
+# THE 1 GiB WINDOW MAP FOR MODELS WHOSE WINDOWS TILE THE WHOLE DEVICE
+# ==========================================================================
+# A 512 MiB window (MULTICORE_WINDOW_BYTES) leaves the model's own map above the
+# arena. Qwen2.5-Omni cannot do that -- its private shards are ~708 MiB per core
+# -- so its windows are 1 GiB and they TILE the whole 8 GiB device, with the
+# shared pool carved from their tails. That map asks the board for exactly one
+# guarantee: CONCURRENT READS FROM THE EIGHT WINDOWS MUST NOT CONTEND.
+#
+# Both Alveo boards give it, for DIFFERENT reasons, and both end up at the SAME
+# bases -- core i at i GiB:
+#
+#   U55C (12 cores)  a memory controller owns one contiguous 1 GiB, and the
+#                    reordered SAXI wiring puts core i on controller i for
+#                    i < 8. The window IS the controller. ALVEO_U55C_CORE_BASES'
+#                    first eight entries are exactly i * 1 GiB.
+#   U50  (8 cores)   the contended unit here is NOT the 512 MiB controller but
+#                    the 1 GiB four-pseudo-channel SWITCH REGION: measured
+#                    above, two engines reading one region each still get the
+#                    full 10.7 GB/s, three drop to 5.7. A 1 GiB window IS one
+#                    switch region, so eight windows over 8 GiB give every core
+#                    a region to ITSELF -- one engine per region, half the
+#                    occupancy the board tolerates.
+#
+# WHAT THE U50 DOES NOT NEED HERE. An engine owns two 512 MiB segments outright
+# -- one per stack, reached through its own SAXI port (alveo_core_bases,
+# board_private_windows) -- and it is tempting to conclude that a 1 GiB private
+# window must therefore be those two segments rather than one contiguous range.
+# It must not: port ownership is about reaching a region without a lateral hop,
+# and at these transfer sizes that hop costs nothing. The MC-ordered bases and a
+# flat 512 MiB stride both measure 85.2 GB/s, which is the per-engine AXI port
+# ceiling, not a switch effect. What costs bandwidth is CROWDING -- three or
+# more engines in one 1 GiB region -- and a contiguous 1 GiB window per core
+# cannot crowd. So the model keeps one contiguous window and the allocator stays
+# a single bump arena; splitting it into two port-owned segments would buy
+# nothing and would cost the map its contiguity (the untied head alone needs
+# 276 MiB in one piece, which no 512 MiB segment can still offer once ~708 MiB
+# of private shards have been placed).
+SWITCH_REGION_BYTES = 0x4000_0000        # 1 GiB: four pseudo-channels, one switch
+MAX_ENGINES_PER_SWITCH_REGION = 2        # measured: 3 halves the per-engine rate
+
+# THE WINDOW SIZE IS PER BOARD, NOT SHARED. Today both boards land on 1 GiB and
+# therefore on identical bases, which is a coincidence of two different facts --
+# a U55C window is one MEMORY CONTROLLER, a U50 window is one SWITCH REGION --
+# and it is about to stop being true: the U55C moves to 2 GiB per core when its
+# HBM is upgraded. Keep the two constants apart so that upgrade is one edit in
+# the U55C branch and cannot silently redefine the U50's window, whose 1 GiB is
+# fixed by the fabric and does not move.
+ALVEO_WINDOW_BYTES = SWITCH_REGION_BYTES        # U50: one switch region. Fixed.
+ALVEO_U55C_WINDOW_BYTES = ALVEO_U55C_MC_STRIDE  # U55C: one controller. -> 2 GiB on upgrade.
+# THE U55C UPGRADE, when it lands, is ALVEO_U55C_MC_STRIDE and
+# ALVEO_U55C_SEGMENT_STRIDE together: the window follows the controller, and the
+# second-segment offset that cores 8+ take (ALVEO_U55C_CORE_BASES) is half of
+# it. Everything else here -- the bases, the window size, the validator -- is
+# derived, and the U50 side must not move at all.
+
+
+def board_window_bytes(what: str) -> int:
+    """The per-core private window this board hands a tiling map."""
+    reported = user_dma_core.ANDROMEDA_CORE_COUNT
+    if reported == ALVEO_U55C_BOARD_CORES:
+        return ALVEO_U55C_WINDOW_BYTES
+    if reported == ALVEO_BOARD_CORES:
+        return ALVEO_WINDOW_BYTES
+    raise ValueError(
+        f"{what}: no tiling window map for a {reported}-core board. The maps "
+        f"here are measured per board: {ALVEO_BOARD_CORES} cores = Alveo U50, "
+        f"{ALVEO_U55C_BOARD_CORES} = Alveo U55C. Measure the new board's HBM "
+        f"behaviour and add it above rather than inheriting a map built around "
+        f"different wiring.")
+
+
+def tiled_window_bases(num_engines: int, window_bytes: int, what: str) -> list[int]:
+    """Private window bases for a model whose windows tile the whole device.
+
+    The board is identified by HW_INFO's core count, which is the image
+    signature (see :func:`is_alveo_u55c`), and the result is validated against
+    the board rather than assumed: in range, non-overlapping, and with no
+    1 GiB switch region carrying more engines than it can serve at full rate.
+    A board nobody has characterised is refused rather than guessed at.
     """
     reported = user_dma_core.ANDROMEDA_CORE_COUNT
-    if reported is None:
+    if reported is None or user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
         raise RuntimeError(
             f"{what}: HW_INFO has not been read, so the board is unknown; call "
             f"user_dma_core.configure_clock_from_hardware() first")
-    if reported != ALVEO_U55C_BOARD_CORES:
+    if num_engines < 1:
+        raise ValueError(f"{what}: num_engines must be >= 1, got {num_engines}")
+    board_window = board_window_bytes(what)
+    if window_bytes != board_window:
         raise ValueError(
-            f"{what}: the controller-aligned 1 GiB-per-core map targets the "
-            f"Alveo U55C, whose image reports {ALVEO_U55C_BOARD_CORES} engines; "
-            f"HW_INFO reports {reported}. The window size is tied to this "
-            f"board's HBM port assignment (engines 0-7 on the even AXI ports, "
-            f"one memory controller each) and is not portable.")
+            f"{what}: this board hands out {board_window // 2**20} MiB windows "
+            f"but the map asks for {window_bytes // 2**20} MiB. The two are not "
+            f"interchangeable -- a smaller window leaves part of the board's "
+            f"unit of bandwidth to somebody else, a larger one overlaps a "
+            f"neighbour. Re-tune the map's reserves and extents for this "
+            f"board's window rather than passing the other board's number.")
+    if num_engines > reported:
+        raise ValueError(
+            f"{what}: needs {num_engines} engines; HW_INFO reports {reported}")
+    # THE DRAM SIZE OVERRIDE IS NOT ACCEPTABLE FOR A TILING MAP. For a model
+    # whose windows sit in the low arena, UE_FORCE_DRAM_SIZE_GB being wrong is
+    # merely optimistic. Here the windows COVER the device, so a forced size the
+    # bitstream does not actually map does not fault -- the upper windows alias
+    # the lower ones and four cores silently scribble over the other four's
+    # weights. The U50 shipped exactly that combination for a while: HW_INFO
+    # said 4 GiB and build_alveo.tcl mapped a single stack.
+    if os.environ.get("UE_FORCE_DRAM_SIZE_GB"):
+        raise ValueError(
+            f"{what}: windows that tile the whole device must be backed by DRAM "
+            f"the board REPORTS, but UE_FORCE_DRAM_SIZE_GB is set "
+            f"({os.environ['UE_FORCE_DRAM_SIZE_GB']!r}). If the bitstream does "
+            f"not map the size being forced, the upper windows alias the lower "
+            f"ones and half the cores overwrite the other half. Run an image "
+            f"whose HW_INFO reports the full size instead.")
+
+    if reported == ALVEO_U55C_BOARD_CORES:
+        if num_engines > ALVEO_U55C_MC_COUNT:
+            raise ValueError(
+                f"{what}: only {ALVEO_U55C_MC_COUNT} of the U55C's {reported} "
+                f"cores get a controller to themselves; cores 8+ share one with "
+                f"cores 0-3 and would halve their bandwidth.")
+        bases = alveo_u55c_core_bases(num_engines)
+    elif reported == ALVEO_BOARD_CORES:
+        # One contiguous switch region per core. The SAXI permutation that
+        # alveo_core_bases applies is deliberately NOT used: it decides which
+        # port reaches a region directly, and the measurements above show that
+        # does not move the number. Occupancy does, and this map is 1 per region.
+        bases = [i * window_bytes for i in range(num_engines)]
+    else:  # unreachable: board_window_bytes() already refused the board
+        raise ValueError(f"{what}: no tiling window map for {reported} cores")
+
+    require_uncontended_windows(bases, window_bytes, what)
+    return bases
+
+
+def require_uncontended_windows(bases: list[int], window_bytes: int,
+                                what: str) -> None:
+    """Fail unless the windows are in range, disjoint, and free of crowding."""
+    if window_bytes <= 0 or window_bytes % SWITCH_REGION_BYTES:
+        raise ValueError(
+            f"{what}: a window must be whole switch regions "
+            f"({SWITCH_REGION_BYTES // 2**20} MiB each), got 0x{window_bytes:X}")
+    dram_end = user_dma_core.AVAILABLE_DRAM_SIZE_GB * 2**30
+    for i, base in enumerate(bases):
+        if base % SWITCH_REGION_BYTES:
+            raise ValueError(
+                f"{what}: core {i}'s window at 0x{base:X} does not start on a "
+                f"{SWITCH_REGION_BYTES // 2**20} MiB switch-region boundary")
+        if base + window_bytes > dram_end:
+            raise ValueError(
+                f"{what}: core {i}'s window 0x{base:X}..0x{base + window_bytes:X} "
+                f"runs past the 0x{dram_end:X} bytes HW_INFO reports")
+    spans = sorted((b, i) for i, b in enumerate(bases))
+    for (b0, i0), (b1, i1) in zip(spans, spans[1:]):
+        if b1 < b0 + window_bytes:
+            raise ValueError(
+                f"{what}: cores {i0} and {i1} overlap at 0x{b1:X} "
+                f"(core {i0} owns 0x{b0:X}..0x{b0 + window_bytes:X})")
+    occupancy: dict[int, list[int]] = {}
+    for i, base in enumerate(bases):
+        for region in range(base // SWITCH_REGION_BYTES,
+                            (base + window_bytes) // SWITCH_REGION_BYTES):
+            occupancy.setdefault(region, []).append(i)
+    crowded = {r: e for r, e in occupancy.items()
+               if len(e) > MAX_ENGINES_PER_SWITCH_REGION}
+    if crowded:
+        detail = "; ".join(
+            f"region {r} (0x{r * SWITCH_REGION_BYTES:X}) holds cores {e}"
+            for r, e in sorted(crowded.items()))
+        raise ValueError(
+            f"{what}: more than {MAX_ENGINES_PER_SWITCH_REGION} engines share an "
+            f"HBM switch region, which halves their read bandwidth -- {detail}")
 
 
 def private_stride(num_engines: int, arena_bytes: Optional[int] = None,

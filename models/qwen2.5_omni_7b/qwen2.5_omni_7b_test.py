@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qwen2.5-Omni-7B Thinker on the eight-engine, 8-GiB U55 map.
+"""Qwen2.5-Omni-7B Thinker on the eight-engine, 8-GiB Alveo map.
 
 This entry point implements text, image, and audio understanding with text
 generation.  The speech Talker/token2wav path is deliberately not part of this
@@ -75,10 +75,8 @@ def _reject_visible_torch_accelerators() -> None:
 _reject_visible_torch_accelerators()
 
 import user_dma_core
-from multi_engine_shard import (ALVEO_U55C_MC_STRIDE, MULTICORE_WINDOW_BYTES,
-                                MultiEngineScheduler, PrivateArena,
-                                alveo_u55c_core_bases, multicore_arena_bytes,
-                                require_alveo_u55c, require_multicore_dram)
+from multi_engine_shard import (MultiEngineScheduler, PrivateArena,
+                                require_multicore_dram, tiled_window_bases)
 from user_dma_core import UnifiedEngine, set_dma_device
 
 
@@ -190,35 +188,47 @@ def apply_vision_resolution(cfg: dict, name: str) -> dict:
     return cfg
 
 # ==========================================================================
-# THIS MAP IS FOR THE ALVEO U55C ONLY (HW_INFO cores == 12)
+# THE WINDOW IS ONE HBM SWITCH REGION (Alveo U50 and U55C)
 # ==========================================================================
-# The 1 GiB-per-core layout below is not a portable arrangement -- it is built
-# around one board's HBM wiring. On the U55C the andromeda engines sit on the
-# EVEN HBM AXI ports, so engines 0-7 own memory controllers MC0-MC7 one each,
-# and a 1 GiB private window maps exactly onto its controller's two 512 MiB
-# pseudo-channels. That correspondence is the whole reason a window is 1 GiB.
+# A window is 1 GiB because that is the granularity the HBM fabric arbitrates
+# on, and eight of them tile the 8 GiB device so every core reads its own.
+# Which board is underneath decides only WHY 1 GiB is the right number:
 #
-# On a board that wires the ports differently the same map is actively harmful.
-# Measured on the pre-reorder U55C bitstream, where all twelve engines crowded
-# onto MC0-MC3 and MC4-MC7 (which own the upper 4 GiB) had no engine adjacent
-# to them, decode ran at 77.3 GFLOPS against 140.1 for the old 512 MiB map --
-# every barrier waited on the cores whose windows landed on the far side of the
-# lateral switch. With the ports reordered the same map gives 190.2.
+#   U55C (HW_INFO cores == 12)  one memory controller owns one contiguous
+#       1 GiB, and the reordered SAXI wiring puts core i on controller i for
+#       i < 8. The window IS the controller. Measured on the PRE-reorder
+#       bitstream, where all twelve engines crowded onto MC0-MC3, decode ran at
+#       77.3 GFLOPS against 140.1 for the old 512 MiB map; with the ports
+#       reordered the same map gives 190.2.
+#   U50 (HW_INFO cores == 8)    the contended unit is the 1 GiB four-pseudo-
+#       channel switch region, not the 512 MiB controller: two engines in one
+#       region still read at the full per-engine rate, three halve it. A 1 GiB
+#       window IS one switch region, so this map puts ONE engine in each.
 #
-# HW_INFO's core count is the board signature used to gate it: the U55C build
-# instantiates twelve engines (of which Omni uses eight), while the 8-core
-# Alveo image reports eight. A board reporting anything else has not been
-# characterised for this layout, so the model refuses rather than guessing --
-# multi_engine_shard.require_alveo_u55c() is that gate, and
-# ALVEO_U55C_BOARD_CORES the signature it checks.
+# The U50 is where the map looks portable but is not obviously so, because an
+# engine owns two 512 MiB segments outright -- one per 4 GiB stack, on its own
+# SAXI port -- and its 1 GiB window here is neither of them. That is deliberate.
+# Port ownership decides whether a read takes a lateral hop, and at these
+# transfer sizes the hop is free: the port-ordered bases and a flat 512 MiB
+# stride both measure 85.2 GB/s, the per-engine AXI ceiling. Crowding is what
+# costs bandwidth, and a contiguous 1 GiB window per core cannot crowd. Keeping
+# the window contiguous is also what keeps the map feasible at all -- the untied
+# head needs 276 MiB in one piece (OMNI_LM_HEAD_BYTES), which no 512 MiB segment
+# could still offer beside ~708 MiB of private shards.
+#
+# multi_engine_shard.tiled_window_bases() owns both boards' answers and
+# validates the result (in range, disjoint, no crowded region); a board it has
+# not characterised is refused rather than guessed at.
 
 # The private window geometry this map is built for. It is deliberately NOT
 # multi_engine_shard.MULTICORE_WINDOW_BYTES: that constant is 512 MiB and three
-# other multi-core models are validated against it. It is the U55C's CONTROLLER
-# stride, taken from the library that documents this board's HBM ownership, so
-# engine i's window is exactly the controller it owns -- which is the whole
-# reason a window is 1 GiB.
-OMNI_WINDOW_BYTES = ALVEO_U55C_MC_STRIDE   # 1 GiB per core, 8 GiB total
+# other multi-core models are validated against it. Nor does it track either
+# board's constant: it is THIS MAP's geometry, and every number below --
+# OMNI_PRIVATE_RESERVE_BYTES, OMNI_LM_HEAD_BYTES, the ISA and tensor slices --
+# is tuned against it. tiled_window_bases() refuses a board whose own window
+# differs (the U55C's becomes 2 GiB when its HBM is upgraded), so the map gets
+# re-tuned deliberately instead of silently running at the wrong size.
+OMNI_WINDOW_BYTES = 0x4000_0000            # 1 GiB per core, 8 GiB total
 # Measured worst case is core 0: 4.28 MiB of tensor-parallel prefill + 1.02 MiB
 # of decoder, plus the vision/audio encoder programs. 16 MiB is ~3x that, and
 # every MiB here is a MiB the window whose gap hosts the shared tensor extent
@@ -330,7 +340,7 @@ class Qwen25OmniUnifiedEngine(
     Qwen25OmniAudioMixin,
     UnifiedEngine,
 ):
-    """Concrete Thinker engine and its fixed eight-engine U55 memory map."""
+    """Concrete Thinker engine and its fixed eight-engine, 8-GiB memory map."""
 
     def __init__(self, script_dir: str | None = None, multi_core: int = 8,
                  fpga_build: int | None = None,
@@ -343,17 +353,17 @@ class Qwen25OmniUnifiedEngine(
         reported_cores = user_dma_core.ANDROMEDA_CORE_COUNT
         if reported_cores is not None and reported_cores < REQUIRED_ENGINES:
             raise ValueError(
-                f"the U55 image must report at least {REQUIRED_ENGINES} engines; "
+                f"the board image must report at least {REQUIRED_ENGINES} engines; "
                 f"HW_INFO reports {reported_cores}"
             )
-        # The 1 GiB window map is U55C-specific: on a board that maps the HBM
-        # ports differently it measured 77.3 GFLOPS at decode against 140.1 for
-        # the 512 MiB map. The board signature check is the library's.
-        require_alveo_u55c("Qwen2.5-Omni-7B")
         # At LEAST 8 GiB, not exactly: the map needs 8 GiB and a larger device
         # simply leaves the top unused. The check lives in the library so every
         # multi-core model states the same requirement the same way.
         require_multicore_dram(multi_core, "Qwen2.5-Omni-7B")
+        # THE BOARD GATE, taken before a single byte is laid out: the library
+        # answers with this board's window bases or refuses the board outright.
+        expected_bases = tiled_window_bases(
+            REQUIRED_ENGINES, OMNI_WINDOW_BYTES, "Qwen2.5-Omni-7B")
 
         self.multi_core = multi_core
         self.fpga_build = None if fpga_build is None else int(fpga_build)
@@ -413,16 +423,15 @@ class Qwen25OmniUnifiedEngine(
                 f"private windows are 0x{self.mc_arena.stride:X}, not the "
                 f"0x{OMNI_WINDOW_BYTES:X} this map is built for")
         # The arena is built from a base and a stride; the library map is built
-        # from this board's SAXI-to-controller wiring. They agree only because
-        # engines 0-7 own controllers 0-7 in order -- assert it rather than
-        # assume it, so a re-wired image fails here instead of quietly losing
-        # half its bandwidth.
-        expected_bases = alveo_u55c_core_bases(REQUIRED_ENGINES)
+        # from the board HW_INFO reports. They agree only because each board
+        # hands core i the 1 GiB at i GiB -- assert it rather than assume it, so
+        # an image whose HBM is wired differently fails HERE, at init, instead
+        # of quietly losing half its bandwidth.
         actual_bases = [self.mc_arena.window_base(i) for i in range(REQUIRED_ENGINES)]
         if actual_bases != expected_bases:
             raise AssertionError(
-                "private windows are not controller-aligned for this board: "
-                f"{[hex(a) for a in actual_bases]} against the U55C map "
+                "private windows do not match this board's map: "
+                f"{[hex(a) for a in actual_bases]} against "
                 f"{[hex(b) for b in expected_bases]}")
         if REQUIRED_ENGINES * OMNI_WINDOW_BYTES != self.DRAM_END:
             raise AssertionError(
@@ -2245,6 +2254,10 @@ def resolve_engine_config(parser: argparse.ArgumentParser, args) -> dict[str, in
         )
     try:
         require_multicore_dram(REQUIRED_ENGINES, "Qwen2.5-Omni-7B")
+        # Same board gate the constructor takes, asked here so an unsupported
+        # image fails at argparse like every other hardware requirement rather
+        # than after the run lock and the weight cache have been opened.
+        tiled_window_bases(REQUIRED_ENGINES, OMNI_WINDOW_BYTES, "Qwen2.5-Omni-7B")
     except (ValueError, RuntimeError) as exc:
         parser.error(str(exc))
     print(user_dma_core.hardware_info_summary())
