@@ -41,8 +41,10 @@ Section status:
       iSTFT -> audio (GeneratorFPGA._istft).
 
 Weights are pulled directly from the loaded CPU `model`'s state dict at call
-time (no bin-dump step yet -- that's a later optimization once the full
-pipeline is ported, following the pattern in models/parakeet).
+time, but a compiled image (params.bin/programs.bin/programs.json, see
+FROZEN_IMAGE_FILES / dump_bin_cache / load_bin_cache below) is frozen and
+replayed on subsequent runs, following the pattern in models/parakeet, so the
+weight pull + emission pass only happens once per cache-key.
 
 ALBERT weight sharing: the checkpoint only has ONE transformer layer's
 weights (`encoder.albert_layer_groups.0.albert_layers.0.*`, num_hidden_groups=1),
@@ -59,10 +61,14 @@ import hashlib
 import json
 import math
 import os
+import sys
 import time
 from contextlib import contextmanager
 
 import torch
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))  # repo root, for user_dma_core
 
 # set_dma_device() REBINDS user_dma_core.DMA_DEVICE_H2C/C2H at runtime (user_dma_core.py:216-222),
 # so those two must be read through the module at call time, never imported by value.
@@ -70,6 +76,14 @@ import user_dma_core as _udc
 from user_dma_core import (UnifiedEngine, UE_MODE, UE_VECTOR_SIZE, set_dma_device,
                            ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES,
                            DRAM_ACTIVATION_ADDR, DRAM_INSTRUCTION_ADDR)
+
+# Model dims / ISA register assignment / DRAM map / capacity caps, externalized so retuning any
+# of them is a JSON edit, not a source edit. Loaded once at import; every module-level constant
+# below that used to be a literal is now a binding straight off this dict, so the ~4000 lines of
+# call sites elsewhere in this file need no changes.
+_CONFIG_PATH = os.path.join(SCRIPT_DIR, "kokoro_config.json")
+with open(_CONFIG_PATH, "r") as _f:
+    _CFG = json.load(_f)
 
 # ---------------------------------------------------------------------------
 # Compile-print suppression + per-section timing
@@ -224,8 +238,8 @@ _ENGINES = [1]                 # engine count for this run (kokoro_test --engine
 _SCHED = [None]                # MultiEngineScheduler when _ENGINES > 1
 _SHARD_WORKER_SETS = [None]    # per-worker [(reg, value)] register sets for the current run
 _TENSOR_END = [None]           # activation-region ceiling for the allocator guard (set below)
-KOKORO_WORKER_BASE = 0x90000000    # worker arenas: above the activation high-water, below programs
-KOKORO_WORKER_STRIDE = 0x03000000  # 48 MB per engine window: weights | 16 MB ISA | 16 MB tensor
+KOKORO_WORKER_BASE = int(_CFG["dram"]["worker_base"], 16)      # worker arenas: above the activation high-water, below programs
+KOKORO_WORKER_STRIDE = int(_CFG["dram"]["worker_stride"], 16)  # 48 MB per engine window: weights | 16 MB ISA | 16 MB tensor
 
 
 def set_shard_dims(level_rows):
@@ -397,8 +411,10 @@ _LOADED_PROGRAMS: "dict" = {}   # name -> compiled address, from a loaded manife
 def _cache_key():
     """What the compiled image actually depends on. A change in any of these invalidates it."""
     src = open(os.path.abspath(__file__), "rb").read()
+    cfg_src = open(_CONFIG_PATH, "rb").read()
     return {
         "source_sha1": hashlib.sha1(src).hexdigest(),
+        "config_sha1": hashlib.sha1(cfg_src).hexdigest(),
         "max_T": MAX_T,
         "max_frames": MAX_FRAMES,
         "vector_size": UE_VECTOR_SIZE,
@@ -681,15 +697,15 @@ def _upload_const(ue, tensor: torch.Tensor) -> int:
 # exactly what llama does with MAX_CONTEXT_SIZE (llama3.2_1b_test.py:459) while carrying the real
 # length in GPRs. 64-byte alignment does NOT solve this: it rounds each allocation up, it does not
 # make different sizes land on the same addresses.
-MAX_T = 512          # phoneme context; PL-BERT's max_position_embeddings
+MAX_T = _CFG["hardware"]["max_t"]          # phoneme context; PL-BERT's max_position_embeddings
 # Ceiling set by the hardware, not by taste: an AdainResBlk1d that upsamples runs its
 # InstanceNorm transpose at 2x the frame cap, and bf16_transpose_core_dynamic caps N at 4032
 # (eff_z = M_chunk * N/64 must fit a 12-bit URAM_ROW_SIZE_Z field, user_dma_core.py:6687).
 # So 2 * F_CAP <= 4032, i.e. MAX_FRAMES <= 2016, rounded down to a multiple of the vector size.
-MAX_FRAMES = 1984    # duration-expanded frames (n_frames = pred_dur.sum()); ~49 s of audio
+MAX_FRAMES = _CFG["hardware"]["max_frames"]    # duration-expanded frames (n_frames = pred_dur.sum()); ~49 s of audio
 T_CAP = _round_up(MAX_T, UE_VECTOR_SIZE)
 F_CAP = _round_up(MAX_FRAMES, UE_VECTOR_SIZE)
-_TRANSPOSE_N_MAX = 4032
+_TRANSPOSE_N_MAX = _CFG["hardware"]["transpose_n_max"]
 assert 2 * F_CAP <= _TRANSPOSE_N_MAX, (
     f"2*F_CAP={2 * F_CAP} exceeds the transpose cap {_TRANSPOSE_N_MAX}: an upsampling AdaIN block "
     f"would fail mid-run. Lower MAX_FRAMES.")
@@ -721,10 +737,10 @@ assert 2 * F_CAP <= _TRANSPOSE_N_MAX, (
 # allocate_tensor_dram has no overflow guard of its own -- gemma4 documents the same hazard at
 # gemma4_e4b_test.py:1035-1038 ("silently scribbles into the audio ISA -> corruption / board
 # hang"), which is why _instrument() wraps it below.
-KOKORO_PARAMS_BASE = 0x00000000
-KOKORO_TENSOR_BASE = 0x10000000
-KOKORO_PROGRAM_BASE = 0xF0000000
-KOKORO_PROGRAM_END = 0x100000000   # end of physical DRAM; see the warning above
+KOKORO_PARAMS_BASE = int(_CFG["dram"]["params_base"], 16)
+KOKORO_TENSOR_BASE = int(_CFG["dram"]["tensor_base"], 16)
+KOKORO_PROGRAM_BASE = int(_CFG["dram"]["program_base"], 16)
+KOKORO_PROGRAM_END = int(_CFG["dram"]["program_end"], 16)   # end of physical DRAM; see the warning above
 KOKORO_TENSOR_END = KOKORO_PROGRAM_BASE
 _TENSOR_END[0] = KOKORO_TENSOR_END
 
@@ -2195,22 +2211,23 @@ GPR_M, GPR_K, GPR_N = 1, 2, 3
 # Register budget: gpr_M_reg is a PBI loop-count field validated to 1..15, so scratch row-count
 # registers must stay low. GPR_T/GPR_F are used directly as gpr_M_reg when M is exactly the count,
 # hence they too must be <= 15.
-GPR_T = 4        # real phoneme count      (preamble-primed)
-GPR_F = 5        # real frame count        (preamble-primed)
-GPR_TMP = 6      # address / derivation scratch
-GPR_MSCRATCH = (7, 8, 9)   # derived row counts; round-robin so nested derivations don't alias
+_ISA = _CFG["fixed_isa_regs"]
+GPR_T = _ISA["GPR_T"]        # real phoneme count      (preamble-primed)
+GPR_F = _ISA["GPR_F"]        # real frame count        (preamble-primed)
+GPR_TMP = _ISA["GPR_TMP"]      # address / derivation scratch
+GPR_MSCRATCH = tuple(_ISA["GPR_MSCRATCH"])   # derived row counts; round-robin so nested derivations don't alias
 # T rounded up to the 64-element vector size. Not derivable from GPR_T in one instruction
 # (it needs add+shr+shl), and Section 1 uses it on every one of its 144 attention calls, so it
 # earns a register of its own rather than being recomputed.
-GPR_TPAD = 10
+GPR_TPAD = _ISA["GPR_TPAD"]
 # Frame count rounded up to the vector size. Sections 3 and 5a both work in padded frames
 # (Section 5a's `T` IS the frame count), so they share this register.
-GPR_NFPAD = 11
+GPR_NFPAD = _ISA["GPR_NFPAD"]
 # (padded frames - real frames), the conv zero-pad row count. NOT derivable from the other two in
 # one instruction -- it is a difference of two registers, and the ISA's reg-ALU takes an immediate,
 # not a second register, for subtraction. Every conv that needs it wants (nf_pad - n_frames)
 # scaled by that level's upsample factor, so one primed register covers all of them.
-GPR_PADROWS = 12
+GPR_PADROWS = _ISA["GPR_PADROWS"]
 
 # --- Multi-engine row shards (generator only) -------------------------------------------------
 # Engine e owns rows [off_e, off_e + cnt_e) of each generator time level (0: 2*nf rows, 1: 20*nf,
@@ -2219,14 +2236,14 @@ GPR_PADROWS = 12
 # dynamic kernels' gpr_M_reg, which must be a 1..15 index, so they sit inside the low block; the
 # offsets and the address scratch live past the normalisation pool. Every engine runs the SAME
 # body with these registers as the only difference.
-GPR_SHARD_CNT = (13, 14, 15)      # rows in this engine's shard, per level (gpr_M_reg-legal)
-GPR_SHARD_OFF = (28, 29, 30)      # first row of this engine's shard, per level
-GPR_SHARD_TMP = (31, 32, 33)      # A / OUT / C word-address scratch for the sharded bodies
-SHARD_ALIGN = 128                 # shard boundary granularity in rows (see set_shard_dims)
+GPR_SHARD_CNT = tuple(_ISA["GPR_SHARD_CNT"])  # rows in this engine's shard, per level (gpr_M_reg-legal)
+GPR_SHARD_OFF = tuple(_ISA["GPR_SHARD_OFF"])  # first row of this engine's shard, per level
+GPR_SHARD_TMP = tuple(_ISA["GPR_SHARD_TMP"])  # A / OUT / C word-address scratch for the sharded bodies
+SHARD_ALIGN = _CFG["hardware"]["shard_align"]  # shard boundary granularity in rows (see set_shard_dims)
 _SHARD_STAT_CHUNKS = 2            # per-engine AdaIN staging: up to 2 x GEN_IN_CHUNK rows (cap/12 + align)
 _RESERVED_GPRS = (GPR_M, GPR_K, GPR_N, GPR_T, GPR_F, GPR_TMP, GPR_TPAD, GPR_NFPAD,
                   GPR_PADROWS) + GPR_MSCRATCH + GPR_SHARD_CNT
-_NREG_POOL_SIZE = 12   # 6 distinct normalisation axes (N reg + sqrt(N) reg each)
+_NREG_POOL_SIZE = _ISA["_NREG_POOL_SIZE"]   # 6 distinct normalisation axes (N reg + sqrt(N) reg each)
 
 # Registers carrying a runtime NORMALISATION length. InstanceNorm reduces over the TIME axis, so
 # its length lands in the kernel's N, not its M -- no row register can express it. The dynamic
@@ -3155,12 +3172,12 @@ class DecoderFPGA:
 # The generator's own capacity. It runs at 20x and 120x the frame count, so a buffer at the
 # model-wide MAX_FRAMES would be 61 MB and the section would need ~3 GB even with scratch reuse.
 # 512 frames is ~12.8 s of audio.
-MAX_GEN_FRAMES = 512
+MAX_GEN_FRAMES = _CFG["generator"]["max_gen_frames"]
 GEN_T0_CAP = 2 * MAX_GEN_FRAMES                                  # decoder-front output rows
 GEN_T1_CAP = 20 * MAX_GEN_FRAMES                                 # after ups[0] (x10)
-GEN_IN_CHUNK = 4096                                              # InstanceNorm reduction chunk
+GEN_IN_CHUNK = _CFG["generator"]["gen_in_chunk"]                 # InstanceNorm reduction chunk
 GEN_T2_CAP = _round_up(120 * MAX_GEN_FRAMES + 64, GEN_IN_CHUNK)  # after ups[1] (x6) + reflection pad
-GEN_STEP_RAMP = 4096.0
+GEN_STEP_RAMP = _CFG["generator"]["gen_step_ramp"]
 # Snake range reduction: cos(2*a*x) = sin(2*pi*(a*x/pi + 0.25 mod 1)). The operand reaches ~15
 # turns (measured on the CPU oracle), so the integer part is split off by MAGIC ROUNDING instead of
 # a clamp staircase: n = (p + GEN_MAGIC) - GEN_MAGIC. With magic 192 and |p| < 64, p + magic lies in
@@ -3168,7 +3185,7 @@ GEN_STEP_RAMP = 4096.0
 # |p - n| <= 1 whether the unit rounds or truncates. HW-MEASURED (magic_round_test): the eltwise
 # unit TRUNCATES -- with 256 the positive half sat on the grid-2 region and |p - n| reached 2.
 # The residual is then shifted by +1 and wrapped once at 1.
-GEN_MAGIC = 192.0
+GEN_MAGIC = _CFG["generator"]["gen_magic"]
 
 
 class GeneratorFPGA:

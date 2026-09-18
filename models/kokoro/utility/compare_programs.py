@@ -8,7 +8,7 @@ Instruction COUNT being equal is necessary but not sufficient -- a baked loop tr
 ADD_SET immediate, or a DRAM base that shifted because buffers are sized by T_pad all change the
 digest while leaving the count alone. This reports both so they can be told apart.
 
-    python models/kokoro/compare_programs.py short.json long.json
+    python models/kokoro/utility/compare_programs.py short.json long.json
 """
 import json
 import sys

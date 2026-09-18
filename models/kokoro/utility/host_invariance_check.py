@@ -2,16 +2,16 @@
 different frame counts -- INCLUDING a count that is an exact multiple of 64 (zero pad rows), which
 is the case the two-prompt compare_programs run can miss.
 
-    python models/kokoro/host_invariance_check.py
+    python models/kokoro/utility/host_invariance_check.py
 
 UnifiedEngine captures fine without hardware; only DMA is stubbed. Every differing instruction is
-traced to the fpga_forward.py line that emitted it.
+traced to the kokoro_fpga.py line that emitted it.
 """
 import sys, os, traceback, functools
 say = functools.partial(print, file=sys.stderr, flush=True)
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 import torch
-import models.kokoro.fpga_forward as F
+import models.kokoro.kokoro_fpga as F
 from user_dma_core import UnifiedEngine
 
 
