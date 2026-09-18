@@ -152,67 +152,35 @@ _GEMMA3_MULTI_CORE_MAX_CYCLES_PER_TOKEN = {
 KINTEX7_SYSTOLIC_CSR_BASE_ADDR = 0x02020000
 
 
-# What one engine uses above its base: tensors at +0x08000000, program at
-# +0x0F000000. Every layout below must leave this much room per engine.
-MULTI_ENGINE_PRIVATE_BYTES = 0x0F100000
+# The per-engine DRAM map is board policy and lives in multi_engine_shard
+# (board_private_windows / EngineWindow), next to the HBM controller maps it is
+# derived from -- not here. This module only consumes it.
 
 
-def _multi_engine_dram_layout(num_engines: int) -> list[int]:
-    """Return the private DRAM base of each multi-engine test engine.
+def _make_multi_engine_ues(num_engines: int):
+    """Build ``num_engines`` engines on their board-assigned private windows.
 
-    Alveo HBM designs expose at least 4 GB and map HBM from address 0. Which
-    base an engine gets is a property of the BOARD, not of this test file --
-    concurrent bandwidth depends on the HBM controller a window lands in -- so
-    the U55C map comes from multi_engine_shard, the one place that documents
-    every board's controller ownership. The 8-engine U50C build keeps 256 MB
-    windows and smaller DDR designs keep the legacy DRAM_START_ADDR base with
-    the same 256 MB windows; neither is controller-aligned, so both guarantee
-    non-overlap only (see multi_engine_shard.alveo_core_bases for the U50 map
-    a bandwidth-bound caller would want instead).
+    Returns the engines and their PRIMARY segment bases. An engine's window may
+    be several non-contiguous segments (a U50 owns one 512 MB controller region
+    on each of the two HBM stacks); the allocator cursors below all live in the
+    primary segment, so callers that only need ENGINE_FOOTPRINT_BYTES are fine
+    with the bases alone. Anything wanting the whole window must ask
+    multi_engine_shard.board_private_windows() for the segments.
     """
     import user_dma_core
     import multi_engine_shard
 
-    if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
-        user_dma_core.configure_clock_from_hardware()
-    if num_engines < 1:
-        raise ValueError(f"num_engines must be >= 1, got {num_engines}")
-
-    is_hbm = user_dma_core.AVAILABLE_DRAM_SIZE_GB >= 4
-    if is_hbm and multi_engine_shard.is_alveo_u55c():
-        bases = multi_engine_shard.alveo_u55c_core_bases(num_engines)
-    elif is_hbm:
-        bases = [i * 0x10000000 for i in range(num_engines)]
-    else:
-        bases = [user_dma_core.DRAM_START_ADDR + i * 0x10000000
-                 for i in range(num_engines)]
-
-    if is_hbm:
-        dram_end = user_dma_core.AVAILABLE_DRAM_SIZE_GB * 1024 * 1024 * 1024
-        layout_end = max(bases) + MULTI_ENGINE_PRIVATE_BYTES
-        if layout_end > dram_end:
-            raise ValueError(
-                f"num_engines={num_engines} needs 0x{layout_end:x} of DRAM, "
-                f"but HW_INFO reports only 0x{dram_end:x} bytes"
-            )
-
-    return bases
-
-
-def _make_multi_engine_ues(num_engines: int):
-    import user_dma_core
-
     engine_base_stride = 0x00010000
-    bases = _multi_engine_dram_layout(num_engines)
+    windows = multi_engine_shard.board_private_windows(num_engines)
     ues = []
-    for i, engine_dram_base in enumerate(bases):
+    for i, window in enumerate(windows):
         ues.append(UnifiedEngine(
             BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + i * engine_base_stride,
-            params_dram_base=engine_dram_base,
-            tensor_dram_base=engine_dram_base + 0x08000000,
-            program_dram_base=engine_dram_base + 0x0F000000,
+            params_dram_base=window.base,
+            tensor_dram_base=window.base + multi_engine_shard.ENGINE_TENSOR_OFFSET,
+            program_dram_base=window.base + multi_engine_shard.ENGINE_PROGRAM_OFFSET,
         ))
-    return ues, bases
+    return ues, [w.base for w in windows]
 
 
 def _rng_state_fingerprint() -> str:
@@ -633,7 +601,7 @@ def multi_core_dram_speed_test(data_size_kB: int = 512, num_engines: int = 4):
     read.
 
     HBM hardware only: the layout is based at 0x0 and uses the shared
-    _multi_engine_dram_layout() policy, which on the U55C is controller-
+    multi_engine_shard.board_private_windows() policy, which is controller-
     aligned so the engines do not contend. Engines are NOT software-reset here.
     """
     import user_dma_core
@@ -8087,7 +8055,7 @@ if __name__ == "__main__":
     # --multi-core N runs on the FIRST N engines of the board HW_INFO reports,
     # so the 12-core U55C build can be exercised 8 engines at a time. Only the
     # count used by the tests moves: ANDROMEDA_CORE_COUNT stays the board
-    # signature that _multi_engine_dram_layout() keys its HBM map on, so the
+    # signature that board_private_windows() keys its HBM map on, so the
     # engines that do run keep their controller-aligned bases.
     if args.multi_core is not None:
         if not 1 <= args.multi_core <= engine_count:
