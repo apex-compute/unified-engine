@@ -442,6 +442,143 @@ def require_multicore_dram(num_engines: int, what: str) -> None:
             f"8 GB device), set UE_FORCE_DRAM_SIZE_GB=8 to override it.")
 
 
+# ==========================================================================
+# WHICH HBM CONTROLLER EACH ENGINE OWNS (per board)
+# ==========================================================================
+# The window SIZE above is only half of the contract: on HBM the concurrent
+# bandwidth an engine gets depends on WHICH controller region its window lands
+# in, because an engine reaches its own controller at full rate and anything
+# further away shares the lateral switch. Measured on the U55C
+# (bitstream 0xc3ee417c, 512 kB per engine): 12 engines on the bases below read
+# at 108.1 GB/s -- 12 x 9.0, the per-port limit, and the same latency one engine
+# alone takes -- against 56.4 GB/s for a flat 512 MiB-per-core stride, which
+# leaves most cores reading across that switch. The contended unit is a 512 MiB
+# segment, not a 1 GiB controller: two engines in one segment take 2x the time,
+# while the two halves of one controller run at the full 18.1 GB/s.
+#
+# Alveo U50 contention-free HBM allocation (full concurrent bandwidth).
+# ALVEO TARGET ONLY: use this map only when HW_INFO reports core_count == 8.
+# It does not describe Kintex-7, U55C, or any other target/core-count layout.
+# Each engine owns one 512 MiB memory-controller region on EACH 4 GiB stack,
+# for 1 GiB of private DRAM total.  HBM1 is the matching HBM0 range + 4 GiB.
+# The engine-to-controller order follows build_alveo.tcl's dedicated SAXI-port
+# wiring, so it is deliberately not a simple ``core * stride`` permutation:
+#
+#   core  SAXI/MC  HBM0 private range              HBM1 private range
+#     0    00 / 0  0x000000000 - 0x01FFFFFFF      0x100000000 - 0x11FFFFFFF
+#     1    04 / 2  0x040000000 - 0x05FFFFFFF      0x140000000 - 0x15FFFFFFF
+#     2    08 / 4  0x080000000 - 0x09FFFFFFF      0x180000000 - 0x19FFFFFFF
+#     3    06 / 3  0x060000000 - 0x07FFFFFFF      0x160000000 - 0x17FFFFFFF
+#     4    02 / 1  0x020000000 - 0x03FFFFFFF      0x120000000 - 0x13FFFFFFF
+#     5    14 / 7  0x0E0000000 - 0x0FFFFFFFF      0x1E0000000 - 0x1FFFFFFFF
+#     6    12 / 6  0x0C0000000 - 0x0DFFFFFFF      0x1C0000000 - 0x1DFFFFFFF
+#     7    10 / 5  0x0A0000000 - 0x0BFFFFFFF      0x1A0000000 - 0x1BFFFFFFF
+#
+# 512 MiB is the per-stack controller stride; 4 GiB is the stack stride.  The
+# linear test allocator below only guarantees non-overlap.  Code that requires
+# full HBM concurrency must use the controller-aligned bases above (and the
+# matching +0x1_0000_0000 range when it also uses HBM1).
+#
+# Alveo U55C HBM ownership for the u55c/hbm-port-reorder Tcl design.
+# ALVEO_U55C TARGET ONLY: use this map only when HW_INFO reports core_count == 12.
+# The single 8 GiB HBM address space has eight memory controllers (MCs).  Each
+# MC owns two adjacent 512 MiB HBM_MEM segments, hence one contiguous 1 GiB
+# range; SAXI ports 2k and 2k+1 share MC k.  The reordered engine wiring is:
+#
+#   core  SAXI / MC  controller-aligned range          bandwidth ownership
+#     0     00 / 0   0x000000000 - 0x03FFFFFFF        shared with core 8
+#     1     02 / 1   0x040000000 - 0x07FFFFFFF        shared with core 9
+#     2     04 / 2   0x080000000 - 0x0BFFFFFFF        shared with core 10
+#     3     06 / 3   0x0C0000000 - 0x0FFFFFFFF        shared with core 11
+#     4     08 / 4   0x100000000 - 0x13FFFFFFF        shared with XDMA (SAXI 09)
+#     5     10 / 5   0x140000000 - 0x17FFFFFFF        exclusive for core 5
+#     6     12 / 6   0x180000000 - 0x1BFFFFFFF        exclusive for core 6
+#     7     14 / 7   0x1C0000000 - 0x1FFFFFFFF        exclusive for core 7
+#     8     01 / 0   0x000000000 - 0x03FFFFFFF        shared with core 0
+#     9     03 / 1   0x040000000 - 0x07FFFFFFF        shared with core 1
+#    10     05 / 2   0x080000000 - 0x0BFFFFFFF        shared with core 2
+#    11     07 / 3   0x0C0000000 - 0x0FFFFFFFF        shared with core 3
+
+ALVEO_BOARD_CORES = 8                       # HW_INFO signature of the U50 image
+ALVEO_U55C_BOARD_CORES = 12                 # HW_INFO signature of the U55C image
+
+ALVEO_MC_STRIDE = 0x2000_0000               # U50: 512 MiB per controller, per stack
+ALVEO_STACK_STRIDE = 0x1_0000_0000          # U50: HBM1 is HBM0 + 4 GiB
+# build_alveo.tcl's SAXI wiring, core -> controller. NOT core * stride.
+ALVEO_CORE_MC_ORDER = (0, 2, 4, 3, 1, 7, 6, 5)
+
+ALVEO_U55C_MC_STRIDE = 0x4000_0000          # U55C: one controller, two segments
+ALVEO_U55C_SEGMENT_STRIDE = 0x2000_0000     # U55C: one HBM_MEM segment, 512 MiB
+ALVEO_U55C_MC_COUNT = 8
+# Core k < 8 takes the FIRST segment of its own controller, core 8+k the SECOND
+# segment of controller k, so the two cores that share a controller never share
+# a segment. A model that uses only the first eight engines therefore gets one
+# whole controller each, which is what the 1 GiB-per-core model maps do.
+ALVEO_U55C_CORE_BASES = tuple(
+    (core % ALVEO_U55C_MC_COUNT) * ALVEO_U55C_MC_STRIDE
+    + (core // ALVEO_U55C_MC_COUNT) * ALVEO_U55C_SEGMENT_STRIDE
+    for core in range(ALVEO_U55C_BOARD_CORES)
+)
+
+
+def alveo_core_bases(num_engines: int, stack: int = 0) -> list[int]:
+    """U50 controller-aligned private bases, ``num_engines`` of them.
+
+    ``stack`` selects HBM0 (0) or HBM1 (1); each engine owns the SAME 512 MiB
+    controller region on both, so the HBM1 base is the HBM0 base + 4 GiB.
+    """
+    if not 1 <= num_engines <= len(ALVEO_CORE_MC_ORDER):
+        raise ValueError(
+            f"num_engines must be 1..{len(ALVEO_CORE_MC_ORDER)} for the Alveo "
+            f"HBM map, got {num_engines}")
+    if stack not in (0, 1):
+        raise ValueError(f"stack must be 0 (HBM0) or 1 (HBM1), got {stack}")
+    return [ALVEO_CORE_MC_ORDER[core] * ALVEO_MC_STRIDE + stack * ALVEO_STACK_STRIDE
+            for core in range(num_engines)]
+
+
+def alveo_u55c_core_bases(num_engines: int) -> list[int]:
+    """U55C controller-aligned private bases, ``num_engines`` of them.
+
+    Engine i's base is the start of the 512 MiB segment it owns outright, so
+    concurrent reads from these bases never contend. Use them for anything
+    bandwidth-bound; a flat ``core * stride`` costs roughly half the bandwidth
+    on this board however large the stride is.
+    """
+    if not 1 <= num_engines <= len(ALVEO_U55C_CORE_BASES):
+        raise ValueError(
+            f"num_engines must be 1..{len(ALVEO_U55C_CORE_BASES)} for the U55C "
+            f"HBM map, got {num_engines}")
+    return list(ALVEO_U55C_CORE_BASES[:num_engines])
+
+
+def is_alveo_u55c() -> bool:
+    """True when HW_INFO's core count is the U55C image's signature."""
+    return user_dma_core.ANDROMEDA_CORE_COUNT == ALVEO_U55C_BOARD_CORES
+
+
+def require_alveo_u55c(what: str) -> None:
+    """Fail unless this board is the U55C the 1 GiB-per-core maps target.
+
+    The core count is the board signature: the U55C build instantiates twelve
+    engines, the 8-core Alveo image eight. A window size tied to one board's
+    HBM port assignment is actively harmful on a board that wires the ports
+    differently, so the caller refuses rather than guessing.
+    """
+    reported = user_dma_core.ANDROMEDA_CORE_COUNT
+    if reported is None:
+        raise RuntimeError(
+            f"{what}: HW_INFO has not been read, so the board is unknown; call "
+            f"user_dma_core.configure_clock_from_hardware() first")
+    if reported != ALVEO_U55C_BOARD_CORES:
+        raise ValueError(
+            f"{what}: the controller-aligned 1 GiB-per-core map targets the "
+            f"Alveo U55C, whose image reports {ALVEO_U55C_BOARD_CORES} engines; "
+            f"HW_INFO reports {reported}. The window size is tied to this "
+            f"board's HBM port assignment (engines 0-7 on the even AXI ports, "
+            f"one memory controller each) and is not portable.")
+
+
 def private_stride(num_engines: int, arena_bytes: Optional[int] = None,
                    isa_bytes: int = PRIVATE_ISA_BYTES,
                    tensor_bytes: int = PRIVATE_TENSOR_BYTES) -> int:
@@ -624,6 +761,15 @@ class PrivateArena:
     # -- introspection ------------------------------------------------------
     def region(self, engine_idx: int) -> PrivateRegion:
         return self.regions[engine_idx]
+
+    def window_base(self, engine_idx: int) -> int:
+        """Where one engine's private window starts.
+
+        On HBM this is the address a board map is checked against: which
+        controller a window lands in is what the concurrent bandwidth depends
+        on (see alveo_u55c_core_bases).
+        """
+        return self.regions[engine_idx].base
 
     def isa_base(self, engine_idx: int) -> int:
         return self.regions[engine_idx].isa_base

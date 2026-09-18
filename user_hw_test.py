@@ -152,80 +152,26 @@ _GEMMA3_MULTI_CORE_MAX_CYCLES_PER_TOKEN = {
 KINTEX7_SYSTOLIC_CSR_BASE_ADDR = 0x02020000
 
 
-# Alveo U50 contention-free HBM allocation (full concurrent bandwidth).
-# ALVEO TARGET ONLY: use this map only when HW_INFO reports core_count == 8.
-# It does not describe Kintex-7, U55C, or any other target/core-count layout.
-# Each engine owns one 512 MiB memory-controller region on EACH 4 GiB stack,
-# for 1 GiB of private DRAM total.  HBM1 is the matching HBM0 range + 4 GiB.
-# The engine-to-controller order follows build_alveo.tcl's dedicated SAXI-port
-# wiring, so it is deliberately not a simple ``core * stride`` permutation:
-#
-#   core  SAXI/MC  HBM0 private range              HBM1 private range
-#     0    00 / 0  0x000000000 - 0x01FFFFFFF      0x100000000 - 0x11FFFFFFF
-#     1    04 / 2  0x040000000 - 0x05FFFFFFF      0x140000000 - 0x15FFFFFFF
-#     2    08 / 4  0x080000000 - 0x09FFFFFFF      0x180000000 - 0x19FFFFFFF
-#     3    06 / 3  0x060000000 - 0x07FFFFFFF      0x160000000 - 0x17FFFFFFF
-#     4    02 / 1  0x020000000 - 0x03FFFFFFF      0x120000000 - 0x13FFFFFFF
-#     5    14 / 7  0x0E0000000 - 0x0FFFFFFFF      0x1E0000000 - 0x1FFFFFFFF
-#     6    12 / 6  0x0C0000000 - 0x0DFFFFFFF      0x1C0000000 - 0x1DFFFFFFF
-#     7    10 / 5  0x0A0000000 - 0x0BFFFFFFF      0x1A0000000 - 0x1BFFFFFFF
-#
-# 512 MiB is the per-stack controller stride; 4 GiB is the stack stride.  The
-# linear test allocator below only guarantees non-overlap.  Code that requires
-# full HBM concurrency must use the controller-aligned bases above (and the
-# matching +0x1_0000_0000 range when it also uses HBM1).
-#
-# Alveo U55C HBM ownership for the u55c/hbm-port-reorder Tcl design.
-# ALVEO_U55C TARGET ONLY: use this map only when HW_INFO reports core_count == 12.
-# The single 8 GiB HBM address space has eight memory controllers (MCs).  Each
-# MC owns two adjacent 512 MiB HBM_MEM segments, hence one contiguous 1 GiB
-# range; SAXI ports 2k and 2k+1 share MC k.  The reordered engine wiring is:
-#
-#   core  SAXI / MC  controller-aligned range          bandwidth ownership
-#     0     00 / 0   0x000000000 - 0x03FFFFFFF        shared with core 8
-#     1     02 / 1   0x040000000 - 0x07FFFFFFF        shared with core 9
-#     2     04 / 2   0x080000000 - 0x0BFFFFFFF        shared with core 10
-#     3     06 / 3   0x0C0000000 - 0x0FFFFFFFF        shared with core 11
-#     4     08 / 4   0x100000000 - 0x13FFFFFFF        shared with XDMA (SAXI 09)
-#     5     10 / 5   0x140000000 - 0x17FFFFFFF        exclusive for core 5
-#     6     12 / 6   0x180000000 - 0x1BFFFFFFF        exclusive for core 6
-#     7     14 / 7   0x1C0000000 - 0x1FFFFFFFF        exclusive for core 7
-#     8     01 / 0   0x000000000 - 0x03FFFFFFF        shared with core 0
-#     9     03 / 1   0x040000000 - 0x07FFFFFFF        shared with core 1
-#    10     05 / 2   0x080000000 - 0x0BFFFFFFF        shared with core 2
-#    11     07 / 3   0x0C0000000 - 0x0FFFFFFFF        shared with core 3
-
-# The U55C map above, as per-core bases: core k < 8 takes the FIRST 512 MiB
-# segment of its own 1 GiB controller range, and core 8+k the SECOND segment of
-# controller k, so the two cores that share a controller never share a segment.
-# Measured on the reordered bitstream (0xc3ee417c) with 512 kB per engine:
-# 12 engines on these bases read at 108.1 GB/s (12 x 9.0, the per-port limit),
-# against 56.4 GB/s for the old flat 512 MiB-per-core stride, which left most
-# cores reading across the HBM lateral switch.
-ALVEO_U55C_MC_STRIDE = 0x40000000            # one memory controller: 1 GiB
-ALVEO_U55C_SEGMENT_STRIDE = 0x20000000       # one HBM_MEM segment: 512 MiB
-ALVEO_U55C_CORE_BASES = tuple(
-    (core % 8) * ALVEO_U55C_MC_STRIDE + (core // 8) * ALVEO_U55C_SEGMENT_STRIDE
-    for core in range(12)
-)
-
 # What one engine uses above its base: tensors at +0x08000000, program at
 # +0x0F000000. Every layout below must leave this much room per engine.
 MULTI_ENGINE_PRIVATE_BYTES = 0x0F100000
 
 
 def _multi_engine_dram_layout(num_engines: int) -> list[int]:
-    """Return the per-engine private DRAM base of each multi-engine test engine.
+    """Return the private DRAM base of each multi-engine test engine.
 
-    Alveo HBM designs expose at least 4 GB and map HBM from address 0. The
-    12-engine U55C build uses the controller-aligned ALVEO_U55C_CORE_BASES:
-    concurrent bandwidth there depends on WHICH segment an engine reads, not on
-    how much DRAM the engines span, so a flat stride costs roughly half of it.
-    The 8-engine U50C build keeps 256 MB windows and smaller DDR designs keep
-    the legacy DRAM_START_ADDR base with the same 256 MB windows -- neither is
-    controller-aligned, so both guarantee non-overlap only.
+    Alveo HBM designs expose at least 4 GB and map HBM from address 0. Which
+    base an engine gets is a property of the BOARD, not of this test file --
+    concurrent bandwidth depends on the HBM controller a window lands in -- so
+    the U55C map comes from multi_engine_shard, the one place that documents
+    every board's controller ownership. The 8-engine U50C build keeps 256 MB
+    windows and smaller DDR designs keep the legacy DRAM_START_ADDR base with
+    the same 256 MB windows; neither is controller-aligned, so both guarantee
+    non-overlap only (see multi_engine_shard.alveo_core_bases for the U50 map
+    a bandwidth-bound caller would want instead).
     """
     import user_dma_core
+    import multi_engine_shard
 
     if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
         user_dma_core.configure_clock_from_hardware()
@@ -233,13 +179,8 @@ def _multi_engine_dram_layout(num_engines: int) -> list[int]:
         raise ValueError(f"num_engines must be >= 1, got {num_engines}")
 
     is_hbm = user_dma_core.AVAILABLE_DRAM_SIZE_GB >= 4
-    if is_hbm and user_dma_core.ANDROMEDA_CORE_COUNT == 12:
-        if num_engines > len(ALVEO_U55C_CORE_BASES):
-            raise ValueError(
-                f"num_engines={num_engines} exceeds the {len(ALVEO_U55C_CORE_BASES)} "
-                f"cores the U55C HBM map describes"
-            )
-        bases = list(ALVEO_U55C_CORE_BASES[:num_engines])
+    if is_hbm and multi_engine_shard.is_alveo_u55c():
+        bases = multi_engine_shard.alveo_u55c_core_bases(num_engines)
     elif is_hbm:
         bases = [i * 0x10000000 for i in range(num_engines)]
     else:
