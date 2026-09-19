@@ -12,6 +12,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import time
 
@@ -37,6 +38,21 @@ CONV_MAX_REUSE_PIXELS = 32
 WAVEFORM_ROW_LANES = 64  # SRAM DMA advances in complete 128-byte rows.
 WAVEFORM_ROW_BYTES = WAVEFORM_ROW_LANES * 2
 WAVEFORM_TILE_ROWS = TANH_CHUNK_ELEMENTS // WAVEFORM_ROW_LANES
+
+
+def ensure_checkpoint(checkpoint: Path) -> Path:
+    """Fetch the pinned official checkpoint when the default asset is absent."""
+    checkpoint = Path(checkpoint)
+    if checkpoint.exists():
+        return checkpoint
+    if checkpoint.resolve() != DEFAULT_CHECKPOINT.resolve():
+        raise FileNotFoundError(
+            f"BigCodec checkpoint not found: {checkpoint}. "
+            "Provide an existing --checkpoint path or run bigcodec_fetch.py.")
+    from bigcodec_fetch import fetch
+    print(f"BigCodec checkpoint is missing; downloading pinned asset to {checkpoint}",
+          file=sys.stderr)
+    return fetch(checkpoint)
 
 
 @dataclass
@@ -80,8 +96,8 @@ class Graph:
     lstm_fused_gates: bool = False
     center_quantizer_scores: bool = False
     compensated_codebook: bool = False
-    filter_accumulation: str = "serial"
-    filter_math_scope: str = "both"
+    filter_accumulation: str = "sorted"
+    filter_math_scope: str = "encoder"
     filter_stage: str = "both"
     output_address: int = shared.TENSOR_BASE
     output_bytes: int = 0
@@ -117,7 +133,7 @@ def convolution_reuse_pixels(module) -> int:
 def build_graph(encoder, decoder, compiled_samples: int, *, conv_precision="if8", lstm_precision="bf16",
                 lstm_cell_precision="bf16", lstm_tanh_precision="bf16", lstm_math_scope="both",
                 lstm_fused_gates=False, center_quantizer_scores=False, compensated_codebook=False,
-                filter_accumulation="serial", filter_math_scope="both", filter_stage="both") -> Graph:
+                filter_accumulation="sorted", filter_math_scope="encoder", filter_stage="both") -> Graph:
     """Trace module structure and exact lengths without executing neural layers."""
     if compiled_samples < HOP_LENGTH or compiled_samples % HOP_LENGTH:
         raise ValueError("compiled_samples must be a positive multiple of 200")
@@ -492,7 +508,7 @@ def emit_operation(engine, graph, operation, identity_address, zero_address):
 def compile_models(encoder, decoder, *, samples: int, conv_precision="if8", lstm_precision="bf16",
                    lstm_cell_precision="bf16", lstm_tanh_precision="bf16", lstm_math_scope="both",
                    lstm_fused_gates=False, center_quantizer_scores=False, compensated_codebook=False,
-                   filter_accumulation="serial", filter_math_scope="both", filter_stage="both",
+                   filter_accumulation="sorted", filter_math_scope="encoder", filter_stage="both",
                    memory_layout=None) -> dict:
     if memory_layout is not None and memory_layout not in LAYOUTS:
         raise ValueError("Unsupported BigCodec memory layout")
@@ -526,7 +542,7 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
                     lstm_precision="bf16", lstm_cell_precision="bf16", lstm_tanh_precision="bf16",
                     lstm_math_scope="both", lstm_fused_gates=False, center_quantizer_scores=False,
                     compensated_codebook=False,
-                    filter_accumulation="serial", filter_math_scope="both", filter_stage="both",
+                    filter_accumulation="sorted", filter_math_scope="encoder", filter_stage="both",
                     memory_layout=None) -> dict:
     if encoder.training or decoder.training:
         raise ValueError("Compile eval models loaded with remove_weight_norm=True")
@@ -700,9 +716,9 @@ def main():
                         help="Subtract one inside the codebook dot product to preserve close score differences")
     parser.add_argument("--compensated-codebook", action=argparse.BooleanOptionalAction, default=False,
                         help="Use spare dot-product lanes for BF16 codebook residuals")
-    parser.add_argument("--filter-accumulation", choices=("serial", "sorted", "matrix"), default="serial",
+    parser.add_argument("--filter-accumulation", choices=("serial", "sorted", "matrix"), default="sorted",
                         help="FIR taps: legacy order, ascending magnitude, or original high/residual matrix dot")
-    parser.add_argument("--filter-math-scope", choices=("encoder", "decoder", "both"), default="both",
+    parser.add_argument("--filter-math-scope", choices=("encoder", "decoder", "both"), default="encoder",
                         help="Select the stack that uses the requested FIR accumulation")
     parser.add_argument("--filter-stage", choices=("up", "down", "both"), default="both",
                         help="Select resampling stages for matrix FIR; remaining stages use legacy FIR")
@@ -729,8 +745,12 @@ def main():
         compiled_sample_count(samples)
     except ValueError as error:
         parser.error(str(error))
+    try:
+        checkpoint = ensure_checkpoint(args.checkpoint)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     started = time.perf_counter()
-    encoder, decoder = load_models(args.checkpoint, remove_weight_norm=True)
+    encoder, decoder = load_models(checkpoint, remove_weight_norm=True)
     # Shared planners print per-tile diagnostics; retain a quiet compile command.
     with contextlib.redirect_stdout(io.StringIO()):
         payload = compile_models(encoder, decoder, samples=samples,

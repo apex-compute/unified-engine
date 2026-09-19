@@ -1,6 +1,8 @@
 """Whole-model graph semantics and liveness planning without hardware access."""
 
 from collections import Counter
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -8,7 +10,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from bigcodec_common import DEFAULT_CHECKPOINT, load_models
-from bigcodec_compile import Arena, build_graph, compiled_sample_count, plan_memory, convolution_reuse_pixels, _prepare_operation, emit_operation, _lstm_numerics, shared
+from bigcodec_compile import Arena, build_graph, compiled_sample_count, ensure_checkpoint, plan_memory, convolution_reuse_pixels, _prepare_operation, emit_operation, _lstm_numerics, shared
 from bigcodec_layout import LEGACY_LAYOUT, EXTENDED_LAYOUT, LARGE_PROGRAM_LAYOUT, layout_for_hardware
 from bigcodec_vq.activations import SnakeBeta
 from bigcodec_vq.alias_free_torch import Activation1d
@@ -39,6 +41,17 @@ def projection_models(code_dimensions=8):
 
 
 class BigCodecGraphTest(unittest.TestCase):
+    def test_missing_default_checkpoint_is_fetched_but_custom_path_is_not(self):
+        import bigcodec_compile as compiler
+        with tempfile.TemporaryDirectory() as root:
+            default = Path(root) / 'bigcodec.pt'
+            with patch.object(compiler, 'DEFAULT_CHECKPOINT', default):
+                with patch('bigcodec_fetch.fetch', return_value=default) as fetch:
+                    self.assertEqual(ensure_checkpoint(default), default)
+                    fetch.assert_called_once_with(default)
+                with self.assertRaisesRegex(FileNotFoundError, 'Provide an existing --checkpoint'):
+                    ensure_checkpoint(Path(root) / 'custom-missing.pt')
+
     def test_legacy_addresses_remain_default_and_shared_bounds_are_unchanged(self):
         constants = (shared.MODEL_BASE, shared.MODEL_LIMIT, shared.TENSOR_BASE, shared.TENSOR_LIMIT)
         models = tiny_models()
@@ -258,7 +271,7 @@ class BigCodecGraphTest(unittest.TestCase):
         models[1].model.insert(1, Activation1d(activation=SnakeBeta(1, alpha_logscale=True)))
         default = plan_memory(build_graph(*models, 400, conv_precision='bf16'))
         explicit = plan_memory(build_graph(*models, 400, conv_precision='bf16',
-            filter_accumulation='serial', filter_math_scope='both'))
+            filter_accumulation='sorted', filter_math_scope='encoder'))
         self.assertEqual(vars(default), vars(explicit))
         cases = (
             ('serial', 'both', {'encoder': 'serial', 'decoder': 'serial'}),
