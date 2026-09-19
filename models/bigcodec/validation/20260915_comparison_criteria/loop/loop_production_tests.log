@@ -1,0 +1,9 @@
+test_bias_pointer_has_zero_address_and_length_descriptor_deltas (test_bigcodec_lstm_loop.LSTMLoopTests.test_bias_pointer_has_zero_address_and_length_descriptor_deltas) ... ok
+test_capture_has_valid_absolute_loops_one_halt_and_no_register_leaks (test_bigcodec_lstm_loop.LSTMLoopTests.test_capture_has_valid_absolute_loops_one_halt_and_no_register_leaks) ... ok
+test_expanded_arithmetic_and_all_dram_addresses_match_unrolled (test_bigcodec_lstm_loop.LSTMLoopTests.test_expanded_arithmetic_and_all_dram_addresses_match_unrolled) ... ok
+test_public_dispatch_and_dynamic_arithmetic_callbacks (test_bigcodec_lstm_loop.LSTMLoopTests.test_public_dispatch_and_dynamic_arithmetic_callbacks) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 12.354s
+
+OK

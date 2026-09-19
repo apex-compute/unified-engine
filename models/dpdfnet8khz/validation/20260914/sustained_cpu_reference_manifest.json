@@ -1,0 +1,57 @@
+{
+  "model": "dpdfnet2_8khz",
+  "onnx_sha256": "6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d",
+  "model_sample_rate": 8000,
+  "cpu_threads": 1,
+  "cases": [
+    {
+      "id": "sustained60",
+      "frames": 6007,
+      "input": "sustained60_input.npy",
+      "cpu": "sustained60_cpu.npy",
+      "input_sha256": "d9a835d4bc74a5957a78b26488b424c75c6f9eee04f01f88ab9d3e53e83ab59f",
+      "cpu_sha256": "9966f82e548fb10968e7c7f5338dbeb1847e062e1fa24f254fa4116c8184d897",
+      "neural_inference_s": 3.7641824430013457,
+      "cpu_ms_per_frame": 0.6266326690529957,
+      "finite_spec_and_state": true,
+      "state_reset": true,
+      "source": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_df0749de/sustained_cpu/sustained60.wav",
+      "source_sha256": "f62b7c35620a298fef6205332ca68238ec579505a8f4626788f79d79e0aa41ec",
+      "source_sample_rate": 8000,
+      "source_samples": 480000,
+      "model_sample_rate": 8000,
+      "model_samples": 480000,
+      "noisy_wav": "sustained60_noisy8k.wav",
+      "cpu_wav": "sustained60_cpu8k.wav",
+      "audio_duration_s": 60.0,
+      "noisy_wav_sha256": "1ff0fda12ad4f4edfa598a50d97ddc590a256f35c8149a8b633ab90eca4e403e",
+      "cpu_wav_sha256": "9cf8b055ae2b897e8e7c52dd59e2488dc0ef4ca7eced6773d43f99a6bf100992"
+    },
+    {
+      "id": "silence_128",
+      "frames": 128,
+      "input": "silence_128_input.npy",
+      "cpu": "silence_128_cpu.npy",
+      "input_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee",
+      "cpu_sha256": "e284c69430d1961f293bfce4c7fbe2c57c8476f9ac14162c8fb9325b783a6cee",
+      "neural_inference_s": 0.08036653599998544,
+      "cpu_ms_per_frame": 0.6278635624998863,
+      "finite_spec_and_state": true,
+      "state_reset": true,
+      "description": "128 exact-zero spectrum frames from fresh model state"
+    },
+    {
+      "id": "audio_silence_audio_384",
+      "frames": 384,
+      "input": "audio_silence_audio_384_input.npy",
+      "cpu": "audio_silence_audio_384_cpu.npy",
+      "input_sha256": "30215081c24a3103809b9230a92a5c3610bb89afc52326547ae7f21d846ca3d5",
+      "cpu_sha256": "ac754de7e7364abe00be7f009096790972e7184b3b3f31f6e965a616f6477d97",
+      "neural_inference_s": 0.23937951800024848,
+      "cpu_ms_per_frame": 0.6233841614589805,
+      "finite_spec_and_state": true,
+      "state_reset": true,
+      "description": "sustained60 first128 frames +128 zero frames +sustained60 first128 frames; recurrent state retained across all384frames; short clips zero-padded to128frames"
+    }
+  ]
+}

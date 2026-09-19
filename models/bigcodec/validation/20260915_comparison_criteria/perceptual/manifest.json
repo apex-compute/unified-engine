@@ -1,0 +1,316 @@
+{
+  "format": "bigcodec-quality-manifest-v1",
+  "datasets": {
+    "eight_noisy": [
+      {
+        "case": "bus",
+        "role": "input",
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus_noisy.wav",
+        "sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7"
+      },
+      {
+        "case": "bus",
+        "role": "official_cpu",
+        "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+        "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947"
+      },
+      {
+        "case": "bus",
+        "role": "serial_baseline",
+        "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.wav",
+        "sha256": "2cdb24367220760833115a108983cc9315eb12fdf16ecd03e9026e877dd904cb"
+      },
+      {
+        "case": "bus",
+        "role": "sorted_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus.wav",
+        "sha256": "c375a68e83ae5ae6ac872db5450e788aff0897a4c01121151d340390074cc5be"
+      },
+      {
+        "case": "bus",
+        "role": "matrix_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus.wav",
+        "sha256": "5ce75d10c35d3adbec14256e3f1bc28f864c6561dcdc87c6db8a8a30c1155135"
+      },
+      {
+        "case": "cafe",
+        "role": "input",
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_noisy.wav",
+        "sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868"
+      },
+      {
+        "case": "cafe",
+        "role": "official_cpu",
+        "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav",
+        "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e"
+      },
+      {
+        "case": "cafe",
+        "role": "serial_baseline",
+        "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.wav",
+        "sha256": "f3cbcc9aeaccc3f8c4fe61825a6b373b58bf2b658f240a1163c5c71f33d18011"
+      },
+      {
+        "case": "cafe",
+        "role": "sorted_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe.wav",
+        "sha256": "6d3333e622018a7133ef44b62864577af1f2c051a3eb91accbb1a6e59a870311"
+      },
+      {
+        "case": "cafe",
+        "role": "matrix_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe.wav",
+        "sha256": "daa40fcfed672aff954d210984951b0643b2af64819b8344035608a84da74f03"
+      },
+      {
+        "case": "office",
+        "role": "input",
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/office_noisy.wav",
+        "sha256": "b5dc82530929875863ebb564cc892c64c4e1cf5c5cead6b17a34c368593d6f73"
+      },
+      {
+        "case": "office",
+        "role": "official_cpu",
+        "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.wav",
+        "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad"
+      },
+      {
+        "case": "office",
+        "role": "serial_baseline",
+        "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.wav",
+        "sha256": "966600affcbf213051cb96deaac30004c9c51c524ef2c2d2e9d758678c430884"
+      },
+      {
+        "case": "office",
+        "role": "sorted_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/sorted/office.wav",
+        "sha256": "97ed4e58b08cac6f00b5cdb63979349efc04eb2e7d3b5f667892f4e16fc70f39"
+      },
+      {
+        "case": "office",
+        "role": "matrix_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/matrix/office.wav",
+        "sha256": "539bfdf079d00d1ba537e4198e1c2dbd2b07d0874132e305edf76acadbdf9417"
+      },
+      {
+        "case": "psquare",
+        "role": "input",
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_noisy.wav",
+        "sha256": "a20d68e238fb9acae1044ced9e05581535764ef2942d2efad5d3a7c1bf1cb26e"
+      },
+      {
+        "case": "psquare",
+        "role": "official_cpu",
+        "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.wav",
+        "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059"
+      },
+      {
+        "case": "psquare",
+        "role": "serial_baseline",
+        "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.wav",
+        "sha256": "4009d7328effcb55386baba76ce981204fba52bf4987d3fe8c330e15e2076b8b"
+      },
+      {
+        "case": "psquare",
+        "role": "sorted_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare.wav",
+        "sha256": "db4ed19c6e82cb9e2626be3b69bc241ed5bec4339f0bbe6cd810b0266adae9c2"
+      },
+      {
+        "case": "psquare",
+        "role": "matrix_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare.wav",
+        "sha256": "98aa7416a4ba0f35b07c360aef5a0fc36c5d4ecc360f32e2871f12beb7294eb9"
+      },
+      {
+        "case": "bus_low_snr",
+        "role": "input",
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus_low_snr_noisy.wav",
+        "sha256": "6ffae073e5549f58e19127bfcc701616baca9bc68d299103c01aeec7a8e0d288"
+      },
+      {
+        "case": "bus_low_snr",
+        "role": "official_cpu",
+        "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.wav",
+        "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6"
+      },
+      {
+        "case": "bus_low_snr",
+        "role": "serial_baseline",
+        "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.wav",
+        "sha256": "8cdfe2a7ccb04e954efb3809a19fb8ce5a2de526dc0688e2a7037c27ddb73c2a"
+      },
+      {
+        "case": "bus_low_snr",
+        "role": "sorted_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/sorted/bus_low_snr.wav",
+        "sha256": "4212880ad9f106aee05a5c564070e6c93cecbf6be5f975d0ec4eb128ce2415b6"
+      },
+      {
+        "case": "bus_low_snr",
+        "role": "matrix_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/matrix/bus_low_snr.wav",
+        "sha256": "47332f1a5543d43726c33b9e6614f4aea37fc00104f40e5bf01200f229c9b54b"
+      },
+      {
+        "case": "cafe_low_snr",
+        "role": "input",
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_low_snr_noisy.wav",
+        "sha256": "e61711a17c0ee70e99377efde0f7ff1010cbc4673d76b4914e468529cc8ba915"
+      },
+      {
+        "case": "cafe_low_snr",
+        "role": "official_cpu",
+        "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.wav",
+        "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c"
+      },
+      {
+        "case": "cafe_low_snr",
+        "role": "serial_baseline",
+        "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.wav",
+        "sha256": "1f9b7599d217db008f9d89d52f565535a9559eb18a13524d6ee2d68ffb11d39e"
+      },
+      {
+        "case": "cafe_low_snr",
+        "role": "sorted_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/sorted/cafe_low_snr.wav",
+        "sha256": "14fd26e30b85cb2fc9ea6bb80d72c3de06710e7b8a66b1d80999cda9fd86c948"
+      },
+      {
+        "case": "cafe_low_snr",
+        "role": "matrix_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/matrix/cafe_low_snr.wav",
+        "sha256": "5c57e804d721c5a39fbbc1276c16738d5c6405fd3f2f320b838b4d794b4726e7"
+      },
+      {
+        "case": "office_low_snr",
+        "role": "input",
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/office_low_snr_noisy.wav",
+        "sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620"
+      },
+      {
+        "case": "office_low_snr",
+        "role": "official_cpu",
+        "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.wav",
+        "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708"
+      },
+      {
+        "case": "office_low_snr",
+        "role": "serial_baseline",
+        "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.wav",
+        "sha256": "8abd0e806ef8b5fc7b2561480646a027a0337ab5365d2202804abd823a3d9be7"
+      },
+      {
+        "case": "office_low_snr",
+        "role": "sorted_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/sorted/office_low_snr.wav",
+        "sha256": "98fde86024a4895d020dab564f6d552783ef1007233091448f2b90726e8be048"
+      },
+      {
+        "case": "office_low_snr",
+        "role": "matrix_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/matrix/office_low_snr.wav",
+        "sha256": "513bd4a3420243f90a1b09db4ea60b4977393c862e1ae5903600638e5aa54690"
+      },
+      {
+        "case": "psquare_low_snr",
+        "role": "input",
+        "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_low_snr_noisy.wav",
+        "sha256": "e44f139883a4570596b455d50eba708ab5e013b86eb6979880da3c6f769f78a8"
+      },
+      {
+        "case": "psquare_low_snr",
+        "role": "official_cpu",
+        "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.wav",
+        "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b"
+      },
+      {
+        "case": "psquare_low_snr",
+        "role": "serial_baseline",
+        "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.wav",
+        "sha256": "02595b5fd28067eb36e3cc61becef89b209ee9aa9c9ccae3f0772322fa037dd9"
+      },
+      {
+        "case": "psquare_low_snr",
+        "role": "sorted_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/sorted/psquare_low_snr.wav",
+        "sha256": "790fa3ebfbe98e2f6c93cf217d32412f3578ac15ecc6433a46e7065452f77f69"
+      },
+      {
+        "case": "psquare_low_snr",
+        "role": "matrix_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/matrix/psquare_low_snr.wav",
+        "sha256": "fbff15bec6420c372fcd8683d855ab8ba00c75e971a19c1aecfe331f3d0b7974"
+      }
+    ],
+    "short_clip": [
+      {
+        "case": "p232_007",
+        "role": "input",
+        "path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/input.wav",
+        "sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211"
+      },
+      {
+        "case": "p232_007",
+        "role": "official_cpu",
+        "path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/official_cpu.wav",
+        "sha256": "08b449c8be5bad1fabb6cde8cd91736162532144fc30c2b31d279cbfef229c99"
+      },
+      {
+        "case": "p232_007",
+        "role": "serial_baseline",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/baseline_restored.wav",
+        "sha256": "affe9c72bd0eb192af7a745a68a702c996f6b715443e1011cc1c3e4139c72a04"
+      },
+      {
+        "case": "p232_007",
+        "role": "sorted_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/sorted.wav",
+        "sha256": "189bd0b4078c5b694a72d4eabb18dbbb59197dd4c29ebe935629029676bbb884"
+      },
+      {
+        "case": "p232_007",
+        "role": "matrix_encoder",
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix_production.wav",
+        "sha256": "685aa8e347ab2b770a34c1007f1cf1b494dc81157e7e162845e7f4dfa995c011"
+      }
+    ]
+  },
+  "source_manifests": [
+    {
+      "path": "models/bigcodec/validation/20260915_encoder_accuracy/matrix_manifest.json",
+      "sha256": "41a24d2037b97e90c54ba23111f01123c36fe3a592086b34f4866457b769007d"
+    },
+    {
+      "path": "models/bigcodec/validation/20260915_encoder_accuracy/restored_short_manifest.json",
+      "sha256": "895933a41b11e651533f16cc7f3db9f9c282e704a7cf754f10a9a1aff4d0fc17"
+    },
+    {
+      "path": "models/bigcodec/validation/20260915_encoder_accuracy/short_manifest.json",
+      "sha256": "e2c8945633402bbb430b5cf09a38f87777e0e4265ed8a7ffce28f7f6b9edccb2"
+    }
+  ],
+  "generator_sha256": "7d0606cb847695686e45cc440608fee78b317c403edd8fcc02a31ec1c087ef60",
+  "analysis_source_sha256": {
+    "bigcodec_audio_quality.py": "8136f819f079cf0192de8d1078cd8121cbda2310c6cec04318360cfb48ef6442",
+    "bigcodec_compare.py": "42219382a6031722f89f4530ac2f1b4e028be391e5f1da5ab62ffcf6fed6c9e2",
+    "bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6"
+  },
+  "dependencies": {
+    "numpy": "2.4.2",
+    "soundfile": "0.14.0",
+    "scipy": "1.18.0",
+    "pesq": "0.0.4",
+    "pystoi": "0.4.1"
+  },
+  "results": {
+    "eight_noisy": {
+      "path": "eight_noisy_results.json",
+      "sha256": "8813590181815f71897bb1a44ab6cac0daa3bcfe208bcb8dc83d9e27f9207497"
+    },
+    "short_clip": {
+      "path": "short_clip_results.json",
+      "sha256": "e8c6a20e88530c4f8548ed80378ec3ed98fc3cf4ba996d1bd90ab4a78239f396"
+    }
+  }
+}

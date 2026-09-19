@@ -1,0 +1,31 @@
+{
+  "backend": "pytorch-cpu-fp32",
+  "mode": "decode",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "torch_version": "2.12.0.dev20260405+cu128",
+  "cpu_affinity": [
+    8
+  ],
+  "threads": 1,
+  "tokens_file": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/validation/20260914_optimized_italy/p232_007_optimized_encoder_if8_fpga.tokens.npz",
+  "tokens_sha256": "c2544a1f16c0d39241eeb2897d4ac1f188321ce1ce04687a30bd9a86b97b329c",
+  "output_file": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/optimization_20260914/comparisons/p232_007_optimized_encoder_if8_fpga_same_tokens_cpu.wav",
+  "output_sha256": "d5873e9e42d6082b43e0a4c2530aeda60277440621c42c5d7520955cb9727e0f",
+  "token_count": 317,
+  "audio": {
+    "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+    "format": "bigcodec-tokens-v1",
+    "hop_length": 200,
+    "native_samples": 63295,
+    "padded_samples": 63400,
+    "sample_rate": 16000,
+    "source_channels": 1,
+    "source_rate": 48000,
+    "source_samples": 189883,
+    "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211"
+  },
+  "decode_s": 4.257331417000387,
+  "output_samples": 189883,
+  "output_finite": true,
+  "purpose": "FP32 decoder of the exact FPGA token IDs; CPU diagnostic, not FPGA timing"
+}

@@ -1,0 +1,44 @@
+{
+  "format": "bigcodec-audio-provenance-v1",
+  "attribution": "Cassia Valentini-Botinhao (2017), University of Edinburgh/CSTR, Noisy speech database for training speech enhancement algorithms and TTS models, 2016",
+  "dataset_doi": "https://doi.org/10.7488/ds/2117",
+  "dataset_license": "CC-BY-4.0",
+  "files": {
+    "p232_007_input.wav": {
+      "archive_url": "https://datashare.ed.ac.uk/server/api/core/bitstreams/13c1bfbf-14a6-41db-9b41-8f7310f01ad5/content",
+      "archive_member": "noisy_testset_wav/p232_007.wav",
+      "condition": "cafe noise at 12.5 dB nominal SNR",
+      "changes": "none",
+      "samples": 189883,
+      "sample_rate": 48000,
+      "sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+      "source_notice": "../../../../test_samples/p232_007.README.md",
+      "derived_files": "p232_007_*.wav reconstructions"
+    },
+    "quiet_400ms_input.wav": {
+      "archive_url": "https://datashare.ed.ac.uk/server/api/core/bitstreams/dec213d3-bf57-4777-9663-c24bdce92d5e/content",
+      "archive_member": "clean_testset_wav/p232_005.wav",
+      "source_sha256": "89b1ebdeabff150a3cc12629178e5b98a2366e052f3e8028ea853c2059f69494",
+      "source_bytes": 599720,
+      "source_samples": 299838,
+      "source_sample_rate": 48000,
+      "source_format": "mono PCM16 WAV",
+      "changes": "Read as float32; resample complete recording from 48000 to 16000 Hz with librosa.resample res_type=soxr_hq; crop [0:6400); save FLOAT WAV. No gain adjustment or added noise.",
+      "samples": 6400,
+      "sample_rate": 16000,
+      "bytes": 25680,
+      "sha256": "66ada5357392310b69bbf6a01868b172d581dda9f4a4d9ffa0f5425d7d53fb10",
+      "float32_le_samples_sha256": "ae70515db82511f72fba566e2de9187629d06bad5352ac04b3a0560cc06f30b8",
+      "wave_peak_metadata_timestamp_utc": "2026-09-14T06:43:30Z",
+      "verification": "All 6400 regenerated float32 samples match exactly. WAV bytes match after preserving the original PEAK timestamp.",
+      "verification_versions": {
+        "numpy": "2.4.2",
+        "librosa": "1.0.0",
+        "soxr": "1.1.0",
+        "soundfile": "0.14.0",
+        "libsndfile": "1.2.2"
+      },
+      "derived_files": "quiet_400ms_*.wav reconstructions"
+    }
+  }
+}

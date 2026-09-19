@@ -1,0 +1,115 @@
+{
+  "format": "bigcodec-encoder-short-diagnostic-v1",
+  "scope": "Native whole-utterance p232_007 outputs compared with frozen official FP32 CPU; all candidates keep legacy Snake and the same decoder math profile.",
+  "alignment": "original sample indices; no gain, delay or polarity fitting",
+  "rtf_definition": "Recorded audio_processing_s / audio_duration_s; excludes artifact loading and model upload. RTF <= 1 is real time.",
+  "hardware_executed_by_summary": false,
+  "comparison_source_sha256": "42219382a6031722f89f4530ac2f1b4e028be391e5f1da5ab62ffcf6fed6c9e2",
+  "rows": [
+    {
+      "profile": "Serial baseline",
+      "relative_l2": 0.20006853400886435,
+      "waveform_error_percent": 20.006853400886435,
+      "matching_tokens": 310,
+      "tokens": 317,
+      "duration_s": 3.9558958333333334,
+      "processing_s": 19.253773408992856,
+      "processing_rtf": 4.867108291061639,
+      "native_fpga_s": 19.085674442610653,
+      "hardware_version": "0x90f1f464",
+      "bin_sha256": "200351f4fab341135fcd9675522ce68dae5d2b40190b7398329591b9a67076dc",
+      "comparison": {
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/diagnostics/short_baseline_current.comparison.json",
+        "sha256": "eb19a294ac0fa7355556257a2c09409a26e73021e9436edc0502ccc049d9d1e5"
+      },
+      "metrics": {
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/baseline_current_board.metrics.json",
+        "sha256": "c937d946834db5cac03afc465eebb01c3e06dfcec15b1d3ce1623d47d9dfd024"
+      }
+    },
+    {
+      "profile": "Matrix original split, both stages",
+      "relative_l2": 0.1610445867445814,
+      "waveform_error_percent": 16.10445867445814,
+      "matching_tokens": 307,
+      "tokens": 317,
+      "duration_s": 3.9558958333333334,
+      "processing_s": 25.547583072991983,
+      "processing_rtf": 6.458103081916839,
+      "native_fpga_s": 25.37318798499625,
+      "hardware_version": "0x90f1f464",
+      "bin_sha256": "d3de591cd227d612dc39f78c2e47e902ec9dba6502d7da69052b3b144442999b",
+      "comparison": {
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix.comparison.json",
+        "sha256": "3d28d506a7352da693fe32b48a38c78a5e72c8918b489a02045889c6ecac0056"
+      },
+      "metrics": {
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix.metrics.json",
+        "sha256": "7dbd8202d17a8af3b027d7c11a7fc142815b927fc1d233c1c5acab8d3b64348c"
+      }
+    },
+    {
+      "profile": "Matrix original split, up only",
+      "relative_l2": 0.26038804656128056,
+      "waveform_error_percent": 26.038804656128058,
+      "matching_tokens": 307,
+      "tokens": 317,
+      "duration_s": 3.9558958333333334,
+      "processing_s": 22.37292286400043,
+      "processing_rtf": 5.6555894812701535,
+      "native_fpga_s": 22.19151853563391,
+      "hardware_version": "0x90f1f464",
+      "bin_sha256": "f9667ac14b4315af37658e13382aa38398cef71a1d5d1c52cdc20ab97d3722a9",
+      "comparison": {
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix_up.comparison.json",
+        "sha256": "486e6c90918d5179bfca57f4dcc7db30841b20d499166f7860a0c2953b745184"
+      },
+      "metrics": {
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix_up.metrics.json",
+        "sha256": "0a8e8c6623f9b4178df2b6acb6ca47e23a38169c0bf819d8996151f643835074"
+      }
+    },
+    {
+      "profile": "Matrix original split, down only",
+      "relative_l2": 0.2849495903431356,
+      "waveform_error_percent": 28.49495903431356,
+      "matching_tokens": 307,
+      "tokens": 317,
+      "duration_s": 3.9558958333333334,
+      "processing_s": 22.442699989005632,
+      "processing_rtf": 5.673228248301693,
+      "native_fpga_s": 22.267161158289575,
+      "hardware_version": "0x90f1f464",
+      "bin_sha256": "589e801ede2fba1572ad381249f838c9175902b3eb64e118914a930f75d7d9c9",
+      "comparison": {
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix_down.comparison.json",
+        "sha256": "6d06fbd8111e2c664a4e6a213fa166d0cdb3c507803390de4eb71f3ddb7fb130"
+      },
+      "metrics": {
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/matrix_down.metrics.json",
+        "sha256": "00b76cec58caf02a06f1bd9ace10e558332c119b3c0f098fc17805564844fd6c"
+      }
+    },
+    {
+      "profile": "Sorted DC, both stages",
+      "relative_l2": 0.31771502155745335,
+      "waveform_error_percent": 31.771502155745335,
+      "matching_tokens": 303,
+      "tokens": 317,
+      "duration_s": 3.9558958333333334,
+      "processing_s": 19.277395183999033,
+      "processing_rtf": 4.873079574432433,
+      "native_fpga_s": 19.085556573143286,
+      "hardware_version": "0x90f1f464",
+      "bin_sha256": "8709b31d4cabf6c9ff819de7a904c8303351c302e08b4a97b7ac348c239bfd3d",
+      "comparison": {
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/sorted.comparison.json",
+        "sha256": "256836e273ad358b81217ba3b0bb8dd6a5c1aff70b7a03e19e23906db2b5f9ae"
+      },
+      "metrics": {
+        "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/sorted.metrics.json",
+        "sha256": "126a0649688d5cf874baea40b729767a4d26067aaea091225329922ab3d04d12"
+      }
+    }
+  ]
+}

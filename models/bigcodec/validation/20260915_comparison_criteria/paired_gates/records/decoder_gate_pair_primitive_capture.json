@@ -1,0 +1,11 @@
+{
+  "name": "decoder_gate_pair_primitive",
+  "instructions": 1752,
+  "halt_index": 1751,
+  "program_bytes": 56064,
+  "resident_bytes": 64256,
+  "program_sha256": "afb1156bd0dff679fca1edd2bc9f58c785c2891afffe32e3e18f51753cf42df7",
+  "resident_sha256": "595bf0c976b775952d42c5098e95d9e480be64206cf6f7f5b8cffc4199561596",
+  "input_sha256": "ab5815549f9127a14bac1113cde756edd7bce392253620f9a4ff70db69858c1f",
+  "hardware_executed": false
+}

@@ -1,0 +1,15 @@
+{
+  "tests": 174,
+  "passed": true,
+  "runner": "unittest discovery: models/dpdfnet and models/dpdfnet8khz test_*.py",
+  "environment": {
+    "python": "/home/hunlu/my_torch_env/bin/python",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1"
+  },
+  "elapsed_s": 0.754,
+  "precision_selection_tests": 8,
+  "named_entrypoint_help_checks": 4,
+  "actual_deployment_precision_checks": 4
+}

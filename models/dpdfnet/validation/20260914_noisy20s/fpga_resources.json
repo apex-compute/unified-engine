@@ -1,0 +1,23 @@
+{
+  "target_fpga": "Kintex UltraScale+ KU5P",
+  "scope": "Andromeda Core",
+  "source": "Resource utilization and timing supplied by the user on 2026-09-14; no new implementation run performed for this report.",
+  "resources": {
+    "total_luts": 79639,
+    "logic_luts": 77410,
+    "lutrams": 784,
+    "srls": 1445,
+    "flip_flops": 73514,
+    "ramb36": 19,
+    "ramb18": 3,
+    "uram": 34,
+    "dsp_blocks": 136
+  },
+  "reported_timing": {
+    "constraint_ns": 3.0,
+    "approximate_frequency_mhz": 333.3,
+    "wns_ns": 0.008,
+    "tns_ns": 0.0,
+    "meets_constraint": true
+  }
+}

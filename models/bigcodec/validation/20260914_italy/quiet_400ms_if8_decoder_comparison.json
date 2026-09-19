@@ -1,0 +1,24 @@
+{
+  "reference": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/validation/speech_6400_fpga_tokens_cpu_decoder.wav",
+  "actual": "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/validation/speech_6400_fpga.wav",
+  "reference_sha256": "ab15526d7533ac8866a618ba738856d794d01664afecacf7f4cc9d269d0becae",
+  "actual_sha256": "8e3c5b361d5353671909f24b8a7cdd098aecac43447eadb9a3e9e01f36961209",
+  "sample_rate": 16000,
+  "samples": 6400,
+  "channels": 1,
+  "duration_s": 0.4,
+  "finite": true,
+  "alignment": "original sample indices; no gain, delay or polarity fitting",
+  "metric_status": {
+    "relative_l2": "finite",
+    "snr_db": "finite",
+    "cosine_similarity": "finite"
+  },
+  "relative_l2": 0.03569364940329994,
+  "snr_db": 28.94818092954475,
+  "max_abs_error": 0.0010154771152883768,
+  "rmse": 0.00013506775000966887,
+  "reference_rms": 0.003784083506944,
+  "actual_rms": 0.003753209179387857,
+  "cosine_similarity": 0.9993912999332849
+}

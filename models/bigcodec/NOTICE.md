@@ -1,0 +1,7 @@
+The model source in `bigcodec_vq` is copied from [BigCodec](https://github.com/Aria-K-Alethia/BigCodec/tree/09845ab1f5bc7a3d1589c16de820ef15bc2afefe), commit `09845ab1f5bc7a3d1589c16de820ef15bc2afefe`, copyright 2024 Xin Detai, under the [MIT license](licenses/BigCodec-MIT.txt). The two imports in `bigcodec_vq/__init__.py` use relative names to keep this package independent of other models. The inference math is unchanged.
+
+Upstream credits [Snake](https://github.com/EdwardDixon/snake) ([MIT](licenses/Snake-MIT.txt)), [alias-free-torch](https://github.com/junjun3518/alias-free-torch) ([Apache-2.0](licenses/alias-free-torch-Apache-2.0.txt)), and [julius](https://github.com/adefossez/julius) ([MIT](licenses/julius-MIT.txt)). Their license texts are included here because upstream source references an absent `incl_licenses` directory.
+
+The separately downloaded [official checkpoint](https://huggingface.co/Alethia/BigCodec/tree/c6548832eda95a09dcc3485d9b8ef097ce15f387) is identified as **CC-BY-SA-4.0** by its model card. It is not covered by the source code's MIT license. `upstream_manifest.json` pins its revision, size and SHA256. Checkpoint and generated model binaries are not committed.
+
+Reference: Detai Xin, Xu Tan, Shinnosuke Takamichi, Hiroshi Saruwatari, *BigCodec: Pushing the Limits of Low-Bitrate Neural Speech Codec*, 2024, [arXiv:2409.05377](https://arxiv.org/abs/2409.05377).

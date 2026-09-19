@@ -1,0 +1,14 @@
+{
+  "p232_007_restored_board_baseline": {
+    "samples_bitidentical": true,
+    "tokens_bitidentical": true,
+    "current_wav_sha256": "affe9c72bd0eb192af7a745a68a702c996f6b715443e1011cc1c3e4139c72a04",
+    "prior_wav_sha256": "11fe762bdd8b87cc7d3ffb3e9bdae45acace88cde14b2e10f5d69a54c6acb74c"
+  },
+  "p232_007_matrix_production": {
+    "samples_bitidentical": true,
+    "tokens_bitidentical": true,
+    "current_wav_sha256": "685aa8e347ab2b770a34c1007f1cf1b494dc81157e7e162845e7f4dfa995c011",
+    "prior_wav_sha256": "983d983568d2970e865d945cc36adacccb366ee0ab7b60198b5692d95e7599de"
+  }
+}

@@ -1,0 +1,199 @@
+{
+  "method": "Original48k source clips independently resampled once to16k; alternate complete clips with250mszero gaps; trim finalclip toexactly60s. Both model frontends receive this identical16kfile; native8k frontend downsamples. No gain or normalization.",
+  "sources": [
+    {
+      "id": "p232_007",
+      "path": "/home/hunlu/apexcompute/unified-engine/test_samples/p232_007.wav",
+      "sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+      "sample_rate": 48000,
+      "samples": 189883,
+      "resampled_16k_samples": 63295
+    },
+    {
+      "id": "p257_018",
+      "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_018.wav",
+      "sha256": "c2cc60d1fcd5386cb2ed6d2801fa6855fc66fe10ca9f1d8c7772b6e01a7cae1d",
+      "sample_rate": 48000,
+      "samples": 212093,
+      "resampled_16k_samples": 70698
+    }
+  ],
+  "composite": {
+    "id": "sustained60_16k",
+    "path": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/sources/sustained60_16k.wav",
+    "sha256": "cdcbf33701ac44e930d33a916db098dc8278b4d1b7ef3a8189a30bf6f7628091",
+    "sample_rate": 16000,
+    "samples": 960000,
+    "duration_s": 60.0,
+    "segments": [
+      {
+        "kind": "noisy_audio",
+        "source_id": "p232_007",
+        "start_sample": 0,
+        "samples": 63295,
+        "complete_clip": true
+      },
+      {
+        "kind": "zero_silence",
+        "start_sample": 63295,
+        "samples": 4000
+      },
+      {
+        "kind": "noisy_audio",
+        "source_id": "p257_018",
+        "start_sample": 67295,
+        "samples": 70698,
+        "complete_clip": true
+      },
+      {
+        "kind": "zero_silence",
+        "start_sample": 137993,
+        "samples": 4000
+      },
+      {
+        "kind": "noisy_audio",
+        "source_id": "p232_007",
+        "start_sample": 141993,
+        "samples": 63295,
+        "complete_clip": true
+      },
+      {
+        "kind": "zero_silence",
+        "start_sample": 205288,
+        "samples": 4000
+      },
+      {
+        "kind": "noisy_audio",
+        "source_id": "p257_018",
+        "start_sample": 209288,
+        "samples": 70698,
+        "complete_clip": true
+      },
+      {
+        "kind": "zero_silence",
+        "start_sample": 279986,
+        "samples": 4000
+      },
+      {
+        "kind": "noisy_audio",
+        "source_id": "p232_007",
+        "start_sample": 283986,
+        "samples": 63295,
+        "complete_clip": true
+      },
+      {
+        "kind": "zero_silence",
+        "start_sample": 347281,
+        "samples": 4000
+      },
+      {
+        "kind": "noisy_audio",
+        "source_id": "p257_018",
+        "start_sample": 351281,
+        "samples": 70698,
+        "complete_clip": true
+      },
+      {
+        "kind": "zero_silence",
+        "start_sample": 421979,
+        "samples": 4000
+      },
+      {
+        "kind": "noisy_audio",
+        "source_id": "p232_007",
+        "start_sample": 425979,
+        "samples": 63295,
+        "complete_clip": true
+      },
+      {
+        "kind": "zero_silence",
+        "start_sample": 489274,
+        "samples": 4000
+      },
+      {
+        "kind": "noisy_audio",
+        "source_id": "p257_018",
+        "start_sample": 493274,
+        "samples": 70698,
+        "complete_clip": true
+      },
+      {
+        "kind": "zero_silence",
+        "start_sample": 563972,
+        "samples": 4000
+      },
+      {
+        "kind": "noisy_audio",
+        "source_id": "p232_007",
+        "start_sample": 567972,
+        "samples": 63295,
+        "complete_clip": true
+      },
+      {
+        "kind": "zero_silence",
+        "start_sample": 631267,
+        "samples": 4000
+      },
+      {
+        "kind": "noisy_audio",
+        "source_id": "p257_018",
+        "start_sample": 635267,
+        "samples": 70698,
+        "complete_clip": true
+      },
+      {
+        "kind": "zero_silence",
+        "start_sample": 705965,
+        "samples": 4000
+      },
+      {
+        "kind": "noisy_audio",
+        "source_id": "p232_007",
+        "start_sample": 709965,
+        "samples": 63295,
+        "complete_clip": true
+      },
+      {
+        "kind": "zero_silence",
+        "start_sample": 773260,
+        "samples": 4000
+      },
+      {
+        "kind": "noisy_audio",
+        "source_id": "p257_018",
+        "start_sample": 777260,
+        "samples": 70698,
+        "complete_clip": true
+      },
+      {
+        "kind": "zero_silence",
+        "start_sample": 847958,
+        "samples": 4000
+      },
+      {
+        "kind": "noisy_audio",
+        "source_id": "p232_007",
+        "start_sample": 851958,
+        "samples": 63295,
+        "complete_clip": true
+      },
+      {
+        "kind": "zero_silence",
+        "start_sample": 915253,
+        "samples": 4000
+      },
+      {
+        "kind": "noisy_audio",
+        "source_id": "p257_018",
+        "start_sample": 919253,
+        "samples": 40747,
+        "complete_clip": false
+      }
+    ]
+  },
+  "audio_inputs": [
+    "/home/hunlu/apexcompute/unified-engine/test_samples/p232_007.wav",
+    "/home/hunlu/apexcompute/unified-engine/models/dpdfnet/dpdfnet_bin/noisy_eval_20260913/sources/noisy/p257_018.wav",
+    "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260914_dual_rate/sources/sustained60_16k.wav"
+  ]
+}

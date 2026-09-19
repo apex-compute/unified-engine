@@ -24,10 +24,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ---------------------------------------------------------------------------
 # DRAM Prewriting Tests
 # ---------------------------------------------------------------------------
-# When enabled, the harness DMA-writes test data across the FULL DRAM capacity
-# reported by HW_INFO (4 GiB on the U50 build, 8 GiB on the U55 build, etc.)
-# right before launching each model, so the model (loaded from its bin) starts
-# on poisoned DRAM. A PASS then proves model setup writes every byte it reads.
+# When enabled, the harness DMA-writes test data across the selected board's
+# HW_INFO-reported DRAM capacity before launching each model. The 2 GiB RK
+# aperture starts at DRAM_START_ADDR; the larger U50/U55 apertures start at zero.
+# A PASS then proves model setup writes every byte it reads.
 # Toggle off with RANDOMIZE_DRAM=0 in the env to run on clean DRAM.
 RANDOMIZE_DRAM   = os.environ.get("RANDOMIZE_DRAM", "1") != "0"
 RANDOM_DRAM_SEED = int(os.environ.get("RANDOM_DRAM_SEED", "0"))
@@ -36,14 +36,14 @@ DMA_DEV          = os.environ.get("DMA_DEV", "xdma0")
 
 def randomize_dram(seed: int = 0, dev: str = "xdma0",
                    chunk_bytes: int = 64 * 1024 * 1024,
+                   start_address: int | None = None,
                    total_bytes: int | None = None) -> bool:
-    """DMA-write random bf16 values across all HW-reported DRAM, then release the
-    device, so the model launched next starts on poisoned DRAM.
+    """DMA-write random bf16 values across the selected board's model DRAM.
 
-    By default the byte count comes from HW_INFO. This matters on the 8 GiB U55
-    layout: limiting poison to the historical low 4 GiB leaves the model map in
-    the upper half carrying stale state. ``total_bytes`` remains injectable for
-    focused tests.
+    The 2 GiB RK aperture is [DRAM_START_ADDR, 4 GiB); larger U50/U55
+    apertures begin at zero and include their full HW_INFO-reported capacity.
+    In particular, the U55 model's upper 4 GiB must also be poisoned. Explicit
+    start/count overrides remain available for focused software tests.
 
     Uses random bf16 values in [-8, 8] (same method as randomize_dram.py), NOT an
     all-0xFF fill — 0xFF bytes decode to bf16 NaN, which corrupts any DRAM region
@@ -54,39 +54,44 @@ def randomize_dram(seed: int = 0, dev: str = "xdma0",
     run the model because that would not exercise the required poisoned-DRAM state.
     """
     try:
-        if chunk_bytes <= 0:
-            raise ValueError("chunk_bytes must be positive")
+        if chunk_bytes <= 0 or chunk_bytes % 2:
+            raise ValueError("chunk_bytes must be a positive multiple of 2")
         import torch
         import user_dma_core
         user_dma_core.set_dma_device(dev)
-        if total_bytes is None:
-            # UnifiedEngine only reads HW_INFO automatically when the process has
-            # not configured a clock yet. Read it explicitly here so a long-lived
-            # harness and a freshly selected --dev always agree on DRAM capacity.
+        if start_address is None or total_bytes is None:
+            # Refresh even in a long-lived harness or after changing --dev.
             user_dma_core.configure_clock_from_hardware()
             dram_gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
             if not dram_gib:
                 raise RuntimeError("HW_INFO did not report a usable DRAM size")
-            total_bytes = int(dram_gib) * 1024 ** 3
-        if total_bytes <= 0:
-            raise ValueError("total_bytes must be positive")
+            dram_bytes = int(dram_gib) * 1024 ** 3
+            aperture_start = user_dma_core.DRAM_START_ADDR if dram_gib == 2 else 0
+            if start_address is None:
+                start_address = aperture_start
+            if total_bytes is None:
+                total_bytes = aperture_start + dram_bytes - int(start_address)
+        start_address, total_bytes = int(start_address), int(total_bytes)
+        if start_address < 0 or total_bytes <= 0 or start_address % 2 or total_bytes % 2:
+            raise ValueError("invalid model DRAM poison range")
         ue = user_dma_core.UnifiedEngine()           # bare engine: opens device, self-tests
         gen = torch.Generator().manual_seed(seed)
         bpe = 2
-        chunk_elements = chunk_bytes // bpe
         offset = 0
         while offset < total_bytes:
             n = min(chunk_bytes, total_bytes - offset)
             take = n // bpe
             data = torch.empty(take, dtype=torch.bfloat16).uniform_(-8.0, 8.0, generator=gen)
-            wrote = ue.dma_write(user_dma_core.DMA_DEVICE_H2C, offset, data, take * bpe)
+            address = start_address + offset
+            wrote = ue.dma_write(user_dma_core.DMA_DEVICE_H2C, address, data, take * bpe)
             if wrote != take * bpe:
                 raise RuntimeError(
-                    f"dma_write wrote {wrote} of {take * bpe} bytes at offset {offset:#x}"
+                    f"dma_write wrote {wrote} of {take * bpe} bytes at address {address:#x}"
                 )
             offset += take * bpe
-        print(f"[randomize_dram] wrote {total_bytes / 1024**3:.2f} GiB of random bf16 poison data to "
-              f"DRAM [0x00000000..0x{total_bytes - 1:X}]", flush=True)
+        print(f"[randomize_dram] wrote {total_bytes / 1024**3:.2f} GiB of random bf16 "
+              f"poison data to DRAM [{start_address:#010x}.."
+              f"{start_address + total_bytes - 1:#010x}]", flush=True)
         del ue                                       # release (dma ops already open/close per call)
         return True
     except Exception as e:
@@ -428,6 +433,112 @@ def _check_verapulse(text):
         return False, "action chunk is all zeros (absmax=0) -- a stage wrote nothing"
     return True, f"finite action chunk ({chunk}x{dof}, absmax={hi})"
 
+def _check_yolov5_variant(text, *, expected_model, expected_label):
+    """Validate one direct-bin YOLOv5 hardware run on its fixture."""
+    n = _test_result_field(text, "n_detections")
+    labels = _test_result_field(text, "decoded_text")
+    if not isinstance(n, int) or isinstance(n, bool):
+        return False, "missing integer n_detections in TEST_RESULT"
+    if not isinstance(labels, str):
+        return False, "missing decoded_text in TEST_RESULT"
+    if n <= 0:
+        return False, "no detections above threshold"
+    backend = _test_result_field(text, "backend")
+    model = _test_result_field(text, "model")
+    geometry_abi = _test_result_field(text, "geometry_abi")
+    hardware_version = _test_result_field(text, "hardware_version")
+    if backend != "hardware":
+        return False, f"YOLOv5 test used unexpected backend {backend!r}"
+    if model != expected_model:
+        return False, (
+            f"YOLOv5 test reported model {model!r}, expected "
+            f"{expected_model!r}"
+        )
+    if geometry_abi != "conv-config-inst-v1":
+        return False, f"YOLOv5 test used unexpected geometry ABI {geometry_abi!r}"
+    if not isinstance(hardware_version, str) or not re.fullmatch(
+            r"0x[0-9a-fA-F]{8}", hardware_version):
+        return False, "YOLOv5 test did not report an FPGA build hash"
+    found = bool(re.search(
+        rf"\b{re.escape(expected_label)}\b", labels, re.IGNORECASE))
+    return found, (
+        f"{n} detection(s), including {expected_label}: {labels}; "
+        f"{geometry_abi} on {hardware_version}"
+        if found
+        else f"{n} detection(s), but expected {expected_label}: {labels}"
+    )
+
+def _check_yolov5_single_bin_variant(
+        text, *, expected_model, expected_label, expected_artifact):
+    """Validate detection plus the direct single-artifact runtime contract."""
+    passed, reason = _check_yolov5_variant(
+        text, expected_model=expected_model, expected_label=expected_label)
+    if not passed:
+        return passed, reason
+    backend = _test_result_field(text, "backend")
+    precompiled = _test_result_field(text, "precompiled")
+    artifact_version = _test_result_field(text, "artifact_version")
+    geometry_abi = _test_result_field(text, "geometry_abi")
+    artifact = _test_result_field(text, "artifact")
+    input_resolution = _test_result_field(text, "input_resolution")
+    input_shape = _test_result_field(text, "input_shape")
+    full_graph = _test_result_field(text, "full_graph")
+    if backend != "hardware":
+        return False, f"single-bin test used unexpected backend {backend!r}"
+    if precompiled is not True:
+        return False, "single-bin runtime did not report precompiled=true"
+    if artifact_version != 6:
+        return False, (
+            f"single-bin runtime reported artifact version "
+            f"{artifact_version!r}, expected 6"
+        )
+    if full_graph is not True:
+        return False, "single-bin runtime did not report full_graph=true"
+    expected_transports = {
+        "model_upload_writes": 1,
+        "input_upload_writes": 1,
+        "program_kicks": 1,
+        "output_reads": 1,
+        "intermediate_upload_writes": 0,
+        "intermediate_output_reads": 0,
+    }
+    actual_transports = {
+        key: _test_result_field(text, key) for key in expected_transports}
+    if actual_transports != expected_transports:
+        return False, (
+            "single-bin runtime violated whole-graph transport accounting: "
+            f"{actual_transports!r}"
+        )
+    if geometry_abi != "conv-config-inst-v1":
+        return False, f"single-bin runtime used unexpected geometry ABI {geometry_abi!r}"
+    if input_resolution != "256x256" or input_shape != [3, 256, 256]:
+        return False, (
+            f"single-bin default profile was {input_resolution!r}/{input_shape!r}, "
+            "expected 256x256/[3, 256, 256]")
+    if (not isinstance(artifact, str)
+            or os.path.basename(artifact) != expected_artifact):
+        return False, f"missing {expected_artifact} artifact in TEST_RESULT"
+    return True, (
+        f"{reason}; precompiled v{artifact_version} "
+        f"{geometry_abi} artifact={os.path.basename(artifact)}"
+    )
+
+
+def _check_yolov5_single_bin(text):
+    return _check_yolov5_single_bin_variant(
+        text,
+        expected_model="yolov5s",
+        expected_label="car",
+        expected_artifact="yolov5s-andromeda.bin")
+
+
+def _check_yolov5n_single_bin(text):
+    return _check_yolov5_single_bin_variant(
+        text,
+        expected_model="yolov5n",
+        expected_label="person",
+        expected_artifact="yolov5n-andromeda.bin")
+
 
 # Shared algebra prompt: a single-answer math question whose correct result is
 # "x = 2" (checked by _check_x_equals_2). Used for all LM/decoder models below.
@@ -494,6 +605,28 @@ TESTS = [
     {"name": "locateanything_3b", "script": "models/locateanything_3b/locateanything_3b_test.py",            "pass_check": _check_locateanything},
     {"name": "mobilenetv2_224",   "script": "models/mobilenetv2/mobilenetv2_224_test.py",                    "pass_check": _check_mbv2_224},
     {"name": "mobilenetv2_ssd",   "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",        "pass_check": _check_mbv2_ssd},
+    {
+        "name": "yolov5s",
+        "script": "models/yolov5s/yolov5s_run_from_bin.py",
+        "compile_script": "models/yolov5s/yolov5s_compile.py",
+        "pass_check": _check_yolov5_single_bin,
+        "extra_args": ["--image", "test_samples/vette.jpg"],
+        "mode": "compile + direct-bin detection",
+        "image": "test_samples/vette.jpg",
+        # No compatible update image is bundled; explicit --only still runs it.
+        "opt_in": True,
+    },
+    {
+        "name": "yolov5n",
+        "script": "models/yolov5n/yolov5n_run_from_bin.py",
+        "compile_script": "models/yolov5n/yolov5n_compile.py",
+        "pass_check": _check_yolov5n_single_bin,
+        "extra_args": ["--image", "test_samples/people.jpg"],
+        "mode": "compile + direct-bin detection",
+        "image": "test_samples/people.jpg",
+        # No compatible update image is bundled; explicit --only still runs it.
+        "opt_in": True,
+    },
 
     # Encoder models take no --prompt and emit non-LM output (ASR transcription /
     # segmentation).
@@ -619,6 +752,50 @@ def _script_supports_flag(script_path: str, flag: str) -> bool:
     return f"'{flag}'" in src or f'"{flag}"' in src
 
 
+def _run_captured_subprocess(cmd: list[str], *, verbose: bool,
+                             activity: str) -> tuple[str, int, float]:
+    """Run one compiler/model command and retain its merged output.
+
+    Verbose mode tees raw output to the console as soon as bytes arrive. Concise
+    mode keeps output quiet but emits a heartbeat every ten seconds so a long
+    compile or hardware run does not look stalled.
+    """
+    started = time.perf_counter()
+    if verbose:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            bufsize=0, cwd=SCRIPT_DIR,
+        )
+        captured = []
+        fd = proc.stdout.fileno()
+        while True:
+            chunk = os.read(fd, 4096)
+            if not chunk:                       # EOF — child closed stdout
+                break
+            text = chunk.decode("utf-8", errors="replace")
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            captured.append(text)
+        proc.wait()
+        stdout, returncode = "".join(captured), proc.returncode
+    else:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=SCRIPT_DIR,
+        )
+        heartbeat_s = 10.0
+        while True:
+            try:
+                stdout, _ = proc.communicate(timeout=heartbeat_s)
+                break
+            except subprocess.TimeoutExpired:
+                elapsed_now = time.perf_counter() - started
+                print(f"[{activity}] still running ... {elapsed_now:.0f}s",
+                      flush=True)
+        returncode = proc.returncode
+    return stdout, returncode, time.perf_counter() - started
+
+
 def run_test(test: dict, verbose: bool = False,
              dev: str = None, device: str = None) -> dict:
     """Run one model test as a subprocess.
@@ -632,9 +809,15 @@ def run_test(test: dict, verbose: bool = False,
     """
     rel_script = test["script"]
     script = os.path.join(SCRIPT_DIR, rel_script)
+    python_executable = sys.executable
+    compile_rel_script = test.get("compile_script")
+    compile_script = (os.path.join(SCRIPT_DIR, compile_rel_script)
+                      if compile_rel_script else None)
+    compile_cmd = ([python_executable, "-u", compile_script]
+                   if compile_script else None)
     # -u: force the child's stdout unbuffered so verbose mode streams live
     # instead of arriving in big blocks (its stdout is a pipe, not a TTY).
-    cmd = [sys.executable, "-u", script]
+    cmd = [python_executable, "-u", script]
     if test.get("prompt"):
         cmd += ["--prompt", test["prompt"]]
     cmd += test.get("extra_args", [])
@@ -662,8 +845,12 @@ def run_test(test: dict, verbose: bool = False,
     print(f"\n{'='*60}")
     print(f"Running test : {test['name']}")
     print(f"Script       : {rel_script}")
-    display_cmd = [os.path.basename(sys.executable), "-u", rel_script] + cmd[3:]
+    display_cmd = [os.path.basename(python_executable), "-u", rel_script] + cmd[3:]
     print(f"Command      : {shlex.join(display_cmd)}")
+    if compile_rel_script:
+        compile_display_cmd = [
+            os.path.basename(python_executable), "-u", compile_rel_script]
+        print(f"Compile      : {shlex.join(compile_display_cmd)}")
     if test.get("mode"):
         print(f"Mode         : {test['mode']}")
     print("Execution    : FPGA")
@@ -720,6 +907,35 @@ def run_test(test: dict, verbose: bool = False,
         result["pass_reason"] = f"model script not found: {rel_script}"
         return result
 
+    # Compiler-backed entries always validate or build their artifact before
+    # inference. This happens before DRAM poisoning because compilation is an
+    # offline host step and the runtime must be the only process touching the
+    # freshly poisoned model arena.
+    if compile_script:
+        if not os.path.isfile(compile_script):
+            result = _parse_output(test, "", 1, 0.0)
+            result["pass_reason"] = (
+                f"model compile script not found: {compile_rel_script}")
+            return result
+        print(f"[compile] validating/building artifact for {test['name']} ...",
+              flush=True)
+        try:
+            compile_stdout, compile_returncode, compile_elapsed = \
+                _run_captured_subprocess(
+                    compile_cmd, verbose=verbose,
+                    activity=f"compiling {test['name']}")
+        except OSError as exc:
+            compile_elapsed = 0.0
+            compile_stdout = f"could not start compiler: {exc}\n"
+            compile_returncode = 1
+        if compile_returncode != 0:
+            result = _parse_output(
+                test, compile_stdout, compile_returncode, compile_elapsed)
+            result["pass_reason"] = (
+                f"compile step exited with code {compile_returncode}")
+            return result
+        print(f"[compile] artifact ready in {compile_elapsed:.1f}s", flush=True)
+
     # Dormant per-test escape hatch: a test may set clear_dram_zero to start from
     # zero instead of the suite's normal 0xFF poison (for a model with a known
     # read-before-write defect that cannot self-zero). No test currently uses it —
@@ -735,14 +951,13 @@ def run_test(test: dict, verbose: bool = False,
             result = _parse_output(test, "", 1, clear_elapsed)
             result["pass_reason"] = "DRAM zero-fill failed; model was not run"
             return result
-    # Normal models start from random data across the full HW-reported DRAM, so
-    # setup must rewrite every byte it reads. On U55 this includes the upper
-    # 4 GiB used by 8 GiB model layouts.
+    # Normal models start from poisoned data across the selected board's full
+    # DRAM aperture, including the upper 4 GiB used by the U55 model layout.
     elif RANDOMIZE_DRAM:
         model_seed = (
             RANDOM_DRAM_SEED + zlib.crc32(test["name"].encode("utf-8"))
         ) & 0xFFFFFFFF
-        print(f"[randomize_dram] poisoning full HW-reported DRAM "
+        print(f"[randomize_dram] poisoning HW-reported model DRAM "
               f"(seed={model_seed}) before {test['name']} ...", flush=True)
         poison_start = time.perf_counter()
         poisoned = randomize_dram(seed=model_seed, dev=DMA_DEV)
@@ -753,47 +968,8 @@ def run_test(test: dict, verbose: bool = False,
             result["pass_reason"] = "DRAM poisoning failed; model was not run"
             return result
 
-    t_start = time.perf_counter()
-    if verbose:
-        # Stream live while still capturing for the pass-check / summary. Read raw
-        # bytes: os.read() returns as soon as ANY data is available (it does NOT wait
-        # for a newline), so partial lines and \r progress updates appear the instant
-        # the child emits them. If the screen stops updating, the child is genuinely
-        # stalled — not just buffered behind a missing newline.
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            bufsize=0, cwd=SCRIPT_DIR,
-        )
-        captured = []
-        fd = proc.stdout.fileno()
-        while True:
-            chunk = os.read(fd, 4096)
-            if not chunk:                       # EOF — child closed stdout
-                break
-            text = chunk.decode("utf-8", errors="replace")
-            sys.stdout.write(text)
-            sys.stdout.flush()
-            captured.append(text)
-        proc.wait()
-        stdout, returncode = "".join(captured), proc.returncode
-    else:
-        # concise: capture but do not echo the model's run log. Still print a
-        # heartbeat so a long compile / prefill / decode does not look hung.
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, cwd=SCRIPT_DIR,
-        )
-        heartbeat_s = 10.0
-        while True:
-            try:
-                stdout, _ = proc.communicate(timeout=heartbeat_s)
-                break
-            except subprocess.TimeoutExpired:
-                elapsed_now = time.perf_counter() - t_start
-                print(f"[running] {test['name']} still running ... {elapsed_now:.0f}s",
-                      flush=True)
-        returncode = proc.returncode
-    elapsed = time.perf_counter() - t_start
+    stdout, returncode, elapsed = _run_captured_subprocess(
+        cmd, verbose=verbose, activity=f"running {test['name']}")
 
     return _parse_output(test, stdout, returncode, elapsed)
 
@@ -974,7 +1150,9 @@ def main():
             ap.error(f"unknown test name(s): {', '.join(unknown)}")
         tests = [test for test in TESTS if test["name"] in args.only]
     else:
-        tests = list(TESTS)
+        # Models whose required FPGA image is not part of this repository stay
+        # explicitly runnable with --only, but do not break the default suite.
+        tests = [test for test in TESTS if not test.get("opt_in")]
 
     # --first: hoist without reordering the registry. Validated against the SAME
     # known_names set as --only so a typo fails fast, before the device is touched.

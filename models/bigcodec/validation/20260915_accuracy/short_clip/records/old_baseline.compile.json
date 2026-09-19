@@ -1,0 +1,17 @@
+{
+  "bin": "models/bigcodec/bigcodec_bin/bigcodec-p232_007-sram-v4-bf16.bin",
+  "bin_bytes": 415291119,
+  "bin_sha256": "884e3ba74075e5b5b344e6c834894d7a7c8a30fd437835cbd47a9fe41ba70706",
+  "code_frames": 317,
+  "compile_s": 17.466076994000105,
+  "compiled_samples": 63400,
+  "convolution_precision": "bf16",
+  "instructions": 2624968,
+  "lstm_recurrent_precision": "bf16",
+  "native_samples": 63295,
+  "operations": 180,
+  "parameter_bytes": 331251584,
+  "program_bytes": 83998976,
+  "resident_bytes": 415250560,
+  "scratch_bytes": 73036800
+}

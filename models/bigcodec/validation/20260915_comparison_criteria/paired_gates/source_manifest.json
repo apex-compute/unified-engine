@@ -1,0 +1,244 @@
+{
+  "format": "bigcodec-paired-gates-source-snapshot-v1",
+  "scope": "Byte-identical historical source snapshots and receipts. Snapshot scripts retain original paths/imports for forensic provenance; execute reproduce.py for the portable offline metric recheck, not these snapshots.",
+  "copies": [
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_probe.json",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/decoder_gate_pair_probe.json",
+      "sha256": "5fa58414cf82340589dae659101b6639f7e6100ff0a4570e9b2d3d90d32f3419",
+      "bytes": 5357
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_self_test.json",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/decoder_gate_pair_self_test.json",
+      "sha256": "036dd2c955dd2845ca08be2b5742fe5158767a583765b68ff653907a9fb94d8f",
+      "bytes": 1297
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_primitive_capture.json",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/decoder_gate_pair_primitive_capture.json",
+      "sha256": "8678a83cbae56161e5d06cc4729d84e4c5574f9e69b54799e16c8f80b9371e21",
+      "bytes": 436
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_primitive_native.json",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/decoder_gate_pair_primitive_native.json",
+      "sha256": "60f80553caa50bcfa859d1cb3caef2ba92f2a97a908031860c81b6ef147b0bbe",
+      "bytes": 1023
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_baseline_capture.json",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/decoder_gate_pair_baseline_capture.json",
+      "sha256": "c2c151e881ec8732642e1aea5596841d997fe611331fb302d143ab78378bffb2",
+      "bytes": 985
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_baseline_native.json",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/decoder_gate_pair_baseline_native.json",
+      "sha256": "f84a918b731f23cc1de53b183840935ea346fcfd40e0d18009111e9520b763bc",
+      "bytes": 1920
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_candidate_capture.json",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/decoder_gate_pair_candidate_capture.json",
+      "sha256": "e1b346a3945e2e4fa345f140242a2e558b4aefff59c7a97cd685f72d98cf3407",
+      "bytes": 987
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_candidate_native.json",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/decoder_gate_pair_candidate_native.json",
+      "sha256": "6651b3936ed725a7d164b7ffbe95ed035666e4554fa0093763f3ddfd6e49d6fc",
+      "bytes": 1775
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_native_evaluation.json",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/decoder_gate_pair_native_evaluation.json",
+      "sha256": "708ebddd01156f582556d45746fa2dd546e3e748c632180e2993a501a951a3a0",
+      "bytes": 10706
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/encoder_gate_pair_control.json",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/encoder_gate_pair_control.json",
+      "sha256": "48762faa3841159a27936b70153e94f025101bffe9659bf968eae1fe2a7c0dd9",
+      "bytes": 17162
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_probe.py",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/source_snapshots/decoder_gate_pair_probe.py",
+      "sha256": "15d57b68ca510132246af5cb063061a896c532aad242db4a730b340761c66d75",
+      "bytes": 4555
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_native.py",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/source_snapshots/decoder_gate_pair_native.py",
+      "sha256": "1567450f47b1229d9bee8aebc48ee3f7deb4a447a8f5aa64741b2712c6deb5b6",
+      "bytes": 12731
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/compile_paired_gates.py",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/source_snapshots/compile_paired_gates.py",
+      "sha256": "5da17c5bd04d77452ca99c45b474fbcd445c16dff020bb75f5a3488f0d8fed97",
+      "bytes": 4382
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/evaluate_decoder_gate_pair.py",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/source_snapshots/evaluate_decoder_gate_pair.py",
+      "sha256": "01f52122ca6e2ac447b01090e34820aed72d26967a6375351497b5828af8bf7d",
+      "bytes": 4107
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/encoder_gate_pair_control.py",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/source_snapshots/encoder_gate_pair_control.py",
+      "sha256": "6253164d0b3ddb58193925dba03b92c889c342b3307710b582ac1be3f929cee7",
+      "bytes": 3326
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_primitive_native.pt",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/tensors/decoder_gate_pair_primitive_native.pt",
+      "sha256": "b7f1259f292a1e6a41e93fb8877f75c76d68d53ba8a2c3d0a1d0ffbc51008f34",
+      "bytes": 27366
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_baseline_native.pt",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/tensors/decoder_gate_pair_baseline_native.pt",
+      "sha256": "04a72b0113fb75dfa67d1e65a6262ff709ff4a56c22e0d0cda4520cb9e65a08f",
+      "bytes": 1951327
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_candidate_native.pt",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/tensors/decoder_gate_pair_candidate_native.pt",
+      "sha256": "5d0f48a949a111b96b786166f857ed9b750e5079f0451839b55a564a83abe014",
+      "bytes": 1951206
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/p232_007_paired_gates.metrics.json",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/p232_007_paired_gates.metrics.json",
+      "sha256": "95712b8c7e2c816be879510794d4164c524903a75eced02e355d00ff46c690a3",
+      "bytes": 3807
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/p232_007_paired_gates.compare.json",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/p232_007_paired_gates.compare.json",
+      "sha256": "8cc554db8bcec45af33bd2d9a64e37b095466ac1ec7c079a7f676c7164130d25",
+      "bytes": 1782
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/p232_007_paired_gates.paired_compile.json",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/p232_007_paired_gates.paired_compile.json",
+      "sha256": "5a523889f3eeff3a51edf39553b23948b1975aae54af4dc6a5b077cae21cfe1e",
+      "bytes": 10886
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/p232_007_paired_gates.wav",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/audio/p232_007_paired_gates.wav",
+      "sha256": "cf15ade181a988fbbf1ffa414496051cd404a6e0a0d36743202538fdd93e710f",
+      "bytes": 759612
+    },
+    {
+      "original_path": "models/bigcodec/bigcodec_bin/accuracy_next_20260915/p232_007_paired_gates.tokens.npz",
+      "packaged_path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/audio/p232_007_paired_gates.tokens.npz",
+      "sha256": "7d2a292de36b75c56863194c3a6b0b54bcdc1946b7a1210940feab5bb0522fe0",
+      "bytes": 1387
+    }
+  ],
+  "omitted_original_dependencies": [
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/lstm_native_rounding_ablation.py",
+      "sha256": "72628816fdd6308c3c8d22b5ac6fa8c03c531eb0e53a8d26628092b3da3a4913",
+      "bytes": 5688,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/lstm_fused_sigmoid_ablation.py",
+      "sha256": "5884dad5d095c005f538635ec51c79f7723796b1add7aa45bbd5d54ce52dd69e",
+      "bytes": 4215,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/probe_tanh_compensated.py",
+      "sha256": "c7d89837be4c5a19e122b282ac90a4079f5ed1f6bfad41707a0f2598480bbfcf",
+      "bytes": 3336,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/probe_bf19_rounding.py",
+      "sha256": "8d33e02b8fd96ebbb4e8e02f3b48be68becf5403afddc7cadba0beef8272b87b",
+      "bytes": 1904,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/native_tanh_grid.py",
+      "sha256": "417f6270ac611378f4d6705fa1ccf5fd7e83e0989cd7c284b4b01eae4441cb02",
+      "bytes": 5208,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/probe_tanh_native_tuning.py",
+      "sha256": "33539057f487d626fa039220dbd0387f80bfbd39a8993ad3039aaa26b893a36b",
+      "bytes": 2465,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/lstm_native_lookup_ablation.py",
+      "sha256": "fe3f156b365bdb3d61b91095745a89bc0cb4ce995e665ed70bc6c65bfa9a4fa8",
+      "bytes": 3349,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/native_compensated_smoke.py",
+      "sha256": "f2dc3852359d8e4c6e6cf4da1fb4a66b0f7a1e81a3fe1b07e6dd7bbb8e5e82c6",
+      "bytes": 17283,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_decoder_fp32/op_090.pt",
+      "sha256": "c0c87fef98989b446b02bcaeaa9b300642586c397d27563e6ddea17e7c6873f2",
+      "bytes": 1949538,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_decoder_fp32/op_091.pt",
+      "sha256": "f730f5ac802876a506bdb14fab98e5f6de5ce5ca02dc3ab73e9af51885191f9b",
+      "bytes": 1949538,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/fused_compensated_compensated_native.pt",
+      "sha256": "2a4fa842a9cc56ccd4343d7a31628e884dfdb1c9224ed3ec515480f2c0091d94",
+      "bytes": 1951156,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/encoder_lstm_ablation.py",
+      "sha256": "adf1b7793c687b6e83e2d58c2ec0a1e7bdd95bb3ecd4dd509e8775dba2a5f8bd",
+      "bytes": 18357,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/native_cumulative/op_085.pt",
+      "sha256": "8549f9c3b6acc92233f9848369763e72a0b991a792d6c6895c84b44a6a10191f",
+      "bytes": 1949154,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/native_cumulative/op_086.pt",
+      "sha256": "3b4fadac53e3ac74c0475c48969cb0aa32721351b932b61d70e0ce136e0ff4bd",
+      "bytes": 1949154,
+      "storage": "ignored historical dependency; not copied"
+    },
+    {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_encoder_20260915/p232_007_encoder_fp32/trace.json",
+      "sha256": "a84987b1aa1e41c4c84ef82f2240c94e581ec2d95465bd1602986e8c713c6f2c",
+      "bytes": 93761,
+      "storage": "ignored historical dependency; not copied"
+    }
+  ],
+  "compile_sources_before_and_after_equal": true,
+  "compile_sources_matched_at_packaging": true,
+  "portable_recheck": "reproduce.py uses repository-relative paths and tracked model utilities; optional isolated-tail recheck requires the official checkpoint but no ignored diagnostics",
+  "limitations": [
+    "Frozen emitter snapshots depend on the omitted historical modules/tensors above and are not standalone native reproduction.",
+    "Original JSON records retain their original absolute filesystem paths and all recorded facts. The package manifest maps local evidence to portable repository-relative paths.",
+    "No deployment default is changed by this evidence package."
+  ]
+}

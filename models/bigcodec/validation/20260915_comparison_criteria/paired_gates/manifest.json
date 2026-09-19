@@ -1,0 +1,106 @@
+{
+  "format": "bigcodec-paired-gates-inputs-v1",
+  "path_base": "repository root",
+  "inputs": {
+    "input_wave": {
+      "path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/input.wav",
+      "sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+      "bytes": 379810
+    },
+    "official_wave": {
+      "path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/official_cpu.wav",
+      "sha256": "08b449c8be5bad1fabb6cde8cd91736162532144fc30c2b31d279cbfef229c99",
+      "bytes": 759612
+    },
+    "official_tokens": {
+      "path": "models/bigcodec/validation/20260915_accuracy/short_clip/tokens/official_cpu.tokens.npz",
+      "sha256": "dbd0b73fab28be43a6edd208948a61629bba3a6812107ef7654fe412a87b295f",
+      "bytes": 1387
+    },
+    "same_token_wave": {
+      "path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/split_decoder_same_tokens_cpu.wav",
+      "sha256": "96c6a2bcbeb7df0a7bc7967a79517d10bdfdda9f93bc364e739f88dc60bf9ccb",
+      "bytes": 759612
+    },
+    "same_token_receipt": {
+      "path": "models/bigcodec/validation/20260915_accuracy/short_clip/records/split_decoder_same_tokens_cpu.metrics.json",
+      "sha256": "b074aefeaac5f91cda04d84c04e4a9e6a73954b45c0fe9a0cec0d575f5b71770",
+      "bytes": 1838
+    },
+    "baseline_wave": {
+      "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/baseline_restored.wav",
+      "sha256": "affe9c72bd0eb192af7a745a68a702c996f6b715443e1011cc1c3e4139c72a04",
+      "bytes": 759612
+    },
+    "baseline_tokens": {
+      "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/baseline_restored.tokens.npz",
+      "sha256": "7d2a292de36b75c56863194c3a6b0b54bcdc1946b7a1210940feab5bb0522fe0",
+      "bytes": 1387
+    },
+    "baseline_metrics": {
+      "path": "models/bigcodec/validation/20260915_encoder_accuracy/short/baseline_restored.metrics.json",
+      "sha256": "67a3e0227bab9bad7cc37f3e78932901e3f23014fa54e14d2f7914624055c0c2",
+      "bytes": 3359
+    },
+    "candidate_wave": {
+      "path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/audio/p232_007_paired_gates.wav",
+      "sha256": "cf15ade181a988fbbf1ffa414496051cd404a6e0a0d36743202538fdd93e710f",
+      "bytes": 759612
+    },
+    "candidate_tokens": {
+      "path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/audio/p232_007_paired_gates.tokens.npz",
+      "sha256": "7d2a292de36b75c56863194c3a6b0b54bcdc1946b7a1210940feab5bb0522fe0",
+      "bytes": 1387
+    },
+    "candidate_metrics": {
+      "path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/records/p232_007_paired_gates.metrics.json",
+      "sha256": "95712b8c7e2c816be879510794d4164c524903a75eced02e355d00ff46c690a3",
+      "bytes": 3807
+    },
+    "primitive_tensor": {
+      "path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/tensors/decoder_gate_pair_primitive_native.pt",
+      "sha256": "b7f1259f292a1e6a41e93fb8877f75c76d68d53ba8a2c3d0a1d0ffbc51008f34",
+      "bytes": 27366
+    },
+    "baseline_tensor": {
+      "path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/tensors/decoder_gate_pair_baseline_native.pt",
+      "sha256": "04a72b0113fb75dfa67d1e65a6262ff709ff4a56c22e0d0cda4520cb9e65a08f",
+      "bytes": 1951327
+    },
+    "candidate_tensor": {
+      "path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/tensors/decoder_gate_pair_candidate_native.pt",
+      "sha256": "5d0f48a949a111b96b786166f857ed9b750e5079f0451839b55a564a83abe014",
+      "bytes": 1951206
+    },
+    "source_manifest": {
+      "path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/source_manifest.json",
+      "sha256": "63922529550dfa43cde7b0baa3b38947029b08f84e5679d0aef433e4c88789ad",
+      "bytes": 13664
+    },
+    "bin_manifest": {
+      "path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/bin_manifest.json",
+      "sha256": "dd47ef6453e02b009e459d83d9f43ba34f436f739d2ccdc5f65f31eff13953de",
+      "bytes": 1021
+    },
+    "rechecker_source": {
+      "path": "models/bigcodec/validation/20260915_comparison_criteria/paired_gates/reproduce.py",
+      "sha256": "a3c0d8b9fa1df1d0698d096e25c25752a4ee7d510fcb9c6c029199b1463b2920",
+      "bytes": 9125
+    },
+    "compare_source": {
+      "path": "models/bigcodec/bigcodec_compare.py",
+      "sha256": "42219382a6031722f89f4530ac2f1b4e028be391e5f1da5ab62ffcf6fed6c9e2",
+      "bytes": 6108
+    },
+    "common_source": {
+      "path": "models/bigcodec/bigcodec_common.py",
+      "sha256": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+      "bytes": 7451
+    },
+    "quality_source": {
+      "path": "models/bigcodec/bigcodec_audio_quality.py",
+      "sha256": "8136f819f079cf0192de8d1078cd8121cbda2310c6cec04318360cfb48ef6442",
+      "bytes": 9658
+    }
+  }
+}

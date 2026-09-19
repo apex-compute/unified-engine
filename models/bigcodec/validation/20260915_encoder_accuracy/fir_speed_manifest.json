@@ -1,0 +1,186 @@
+{
+  "format": "bigcodec-accuracy-inputs-v1",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "baseline": "matrix_production",
+  "profiles": [
+    {
+      "name": "matrix_production",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_input_weights": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "filter_accumulation": "matrix",
+        "filter_math_scope": "encoder",
+        "filter_stage": "both",
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        }
+      }
+    },
+    {
+      "name": "matrix_compact",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_input_weights": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "filter_accumulation": "matrix",
+        "filter_math_scope": "encoder",
+        "filter_stage": "both",
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        },
+        "experimental_fir_tile_outputs": 32,
+        "experimental_fir_up_K": 64,
+        "experimental_fir_down_K": 192,
+        "experimental_fir_duplicate_before_transpose": true
+      }
+    },
+    {
+      "name": "matrix_fused_write",
+      "hardware_version": "0x90f1f464",
+      "precision": {
+        "convolutions": "BF16",
+        "activations": "BF16",
+        "lstm_input_weights": "BF16",
+        "lstm_cell": "compensated",
+        "lstm_tanh": "compensated",
+        "lstm_math_scope": "decoder",
+        "lstm_fused_gates": true,
+        "center_quantizer_scores": true,
+        "compensated_codebook": true,
+        "filter_accumulation": "matrix",
+        "filter_math_scope": "encoder",
+        "filter_stage": "both",
+        "lstm_recurrent_weights": {
+          "encoder": "BF16",
+          "decoder": "BF16"
+        },
+        "experimental_fir_tile_outputs": 64,
+        "experimental_fir_up_K": 128,
+        "experimental_fir_down_K": 384,
+        "experimental_fir_duplicate_transpose_writeback": true
+      }
+    }
+  ],
+  "cases": [
+    {
+      "name": "p232_007",
+      "input": {
+        "path": "../20260915_accuracy/short_clip/audio/input.wav",
+        "sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211"
+      },
+      "reference": {
+        "wave": {
+          "path": "../20260915_accuracy/short_clip/audio/official_cpu.wav",
+          "sha256": "08b449c8be5bad1fabb6cde8cd91736162532144fc30c2b31d279cbfef229c99"
+        },
+        "tokens": {
+          "path": "../20260915_accuracy/short_clip/tokens/official_cpu.tokens.npz",
+          "sha256": "dbd0b73fab28be43a6edd208948a61629bba3a6812107ef7654fe412a87b295f"
+        },
+        "metrics": {
+          "path": "../20260915_accuracy/short_clip/records/official_cpu.metrics.json",
+          "sha256": "ea8b1b300b3e8e92df4682c57383b7de5534e05c35bd3254cc4f6c06b683120c"
+        }
+      },
+      "profiles": {
+        "matrix_production": {
+          "wave": {
+            "path": "short/matrix_production.wav",
+            "sha256": "685aa8e347ab2b770a34c1007f1cf1b494dc81157e7e162845e7f4dfa995c011"
+          },
+          "tokens": {
+            "path": "short/matrix_production.tokens.npz",
+            "sha256": "c75185e70b2de38cd8ded776e5084e20d026e77c0b0db24334f4b6cef6567af1"
+          },
+          "metrics": {
+            "path": "short/matrix_production.metrics.json",
+            "sha256": "b667522c69d9b1baba78d08c3fb8acb6e1b605d9cf3a952ff7a2220f8eee7d0c"
+          }
+        },
+        "matrix_compact": {
+          "wave": {
+            "path": "short/matrix_compact.wav",
+            "sha256": "a5e409760a2fd402056339f8b4252494c81a3c5e1cefea83cbd2ffa90fbe6b0e"
+          },
+          "tokens": {
+            "path": "short/matrix_compact.tokens.npz",
+            "sha256": "1209b1780411b6bdf0f24a598222ac98e2ba0e44d2f705bd8bec395db66fe5d1"
+          },
+          "metrics": {
+            "path": "short/matrix_compact.metrics.json",
+            "sha256": "99d441ba37818699bb076c66ab76afb95971bec6d7efcc1cc34768987aafe908"
+          }
+        },
+        "matrix_fused_write": {
+          "wave": {
+            "path": "short/matrix_fused_write.wav",
+            "sha256": "92f0c142b0be6e07988cb30d28cbcaa0e1a86de08795a9be3cdecb4262aaf163"
+          },
+          "tokens": {
+            "path": "short/matrix_fused_write.tokens.npz",
+            "sha256": "c75185e70b2de38cd8ded776e5084e20d026e77c0b0db24334f4b6cef6567af1"
+          },
+          "metrics": {
+            "path": "short/matrix_fused_write.metrics.json",
+            "sha256": "04422ac4a2c406424023363f37e12e925500962684e47c645fedeb4be74b7832"
+          }
+        }
+      }
+    }
+  ],
+  "evidence": [
+    {
+      "path": "short/matrix_compact.comparison.json",
+      "sha256": "70a6058269c221438bee2d02856116002401a105e05f9bf7bfc62b877be94101"
+    },
+    {
+      "path": "diagnostics/fir_speed_matrix_compact.pilot.json",
+      "sha256": "bf7e0c9921e088fbf996208d1427ebe6f39d3787f4348d19d871e41a6b2f855d"
+    },
+    {
+      "path": "diagnostics/fir_speed_matrix_compact.compile.json",
+      "sha256": "91566095ebcc4c9a0634436715b0f20e9df136f0ba1a09dc5ff3e9fbf7c9eb38"
+    },
+    {
+      "path": "short/matrix_fused_write.comparison.json",
+      "sha256": "70610a319bcf59e522c3d1ccdbaa6b9059c31cdfe6a596c8abfd7e2148a605e5"
+    },
+    {
+      "path": "diagnostics/fir_speed_matrix_fused_write.pilot.json",
+      "sha256": "7b5018ae19df57ffb917e0d43a12b688ad0aa089d8b1f9459586080e4ef3967f"
+    },
+    {
+      "path": "diagnostics/fir_speed_matrix_fused_write.compile.json",
+      "sha256": "98be76d22ca90399d425559e3f74bb16e30101fe25e8e7fe38bb0818ea8af7f2"
+    },
+    {
+      "path": "diagnostics/fir_speed_decision.json",
+      "sha256": "b031113db11e291ecc74681f5e1d511c36f580f249ede6d5f467aa8a14b94a8e"
+    },
+    {
+      "path": "diagnostics/fir_speed_source_hashes.json",
+      "sha256": "e0cdce551e7761ade478eeccfa8464c913da931b55f6224340cb65a3d6251586"
+    },
+    {
+      "path": "short/matrix_production.comparison.json",
+      "sha256": "6bc32b038b344b2007e1bbeaaa6391a9cb40baa5a8c48195433add7e57b6cf9b"
+    }
+  ]
+}

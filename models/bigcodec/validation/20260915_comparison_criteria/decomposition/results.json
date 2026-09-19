@@ -1,0 +1,1411 @@
+{
+  "format": "bigcodec-repository-baseline-error-decomposition-v2",
+  "status": "complete",
+  "profile": "Current decoder-corrected BF16 baseline; older decomposition label selected/bf16. Legacy serial encoder FIR.",
+  "settings": {
+    "lstm_math_scope": "decoder",
+    "lstm_cell_precision": "compensated",
+    "lstm_tanh_precision": "compensated",
+    "lstm_fused_gates": true,
+    "convolution_precision": "bf16",
+    "memory_layout": "large-program",
+    "center_quantizer_scores": true,
+    "compensated_codebook": true,
+    "expected_version": 1079090698
+  },
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "method": "Whole utterances, original sample indices, no delay/gain/polarity fit. Recorded FPGA output and tokens; verified cached official FP32 CPU decodes. No new inference.",
+  "definitions": {
+    "full": "||f-y||2/||y||2",
+    "token_induced": "||z-y||2/||y||2",
+    "conditional_decoder": "||f-z||2/||z||2",
+    "error_cosine": "dot(t,d)/(||t||2||d||2)",
+    "error_pearson": "Centered correlation of error vectors, diagnostic only; primary errors use unmodified samples",
+    "energy_identity": "||f-y||2^2 = ||t||2^2 + ||d||2^2 + 2*dot(t,d)"
+  },
+  "symbols": {
+    "y": "Frozen official full-model CPU waveform",
+    "z": "Official FP32 CPU decoder output for actual FPGA token IDs",
+    "f": "Recorded FPGA waveform",
+    "t": "z-y",
+    "d": "f-z"
+  },
+  "provenance": {
+    "original_long_file_decomposition": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/conditional_error_decomposition.json",
+      "sha256": "ea523647900081524299b7670cda93e7b33077e8ccb649416e636115a5d36b13",
+      "bytes": 176285,
+      "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/conditional_error_decomposition.json"
+    },
+    "frozen_cpu_manifest": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu_reference_manifest.json",
+      "sha256": "e43e5618382d2625aa76a4345782459f5a33ed909a27dfd36fa2339b083cc28c",
+      "bytes": 25779,
+      "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu_reference_manifest.json"
+    },
+    "original_short_file_decomposition": {
+      "path": "models/bigcodec/validation/20260915_accuracy/short_clip/results.json",
+      "sha256": "074d64c6746d2c3dfcfbd9625bfaf682617d6eeb4dd1fa9d7e473da83219ec09",
+      "bytes": 21826,
+      "original_repository_path": "models/bigcodec/validation/20260915_accuracy/short_clip/results.json"
+    }
+  },
+  "cases": [
+    {
+      "case": "bus",
+      "samples": 378916,
+      "sample_rate": 16000,
+      "duration_s": 23.68225,
+      "tokens": 1895,
+      "tokens_matching_official": 1736,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.20550552766590646,
+        "token_only_cpu_vs_official_l2": 0.19566882200324798,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.046284100707368575,
+        "decoder_error_relative_to_official_energy": 0.04588805171958914,
+        "reference_energy": 1854.5755450136244,
+        "same_token_cpu_energy": 1822.9724580647119,
+        "token_error_energy": 71.00481325636665,
+        "decoder_error_energy": 3.9052043735934396,
+        "full_error_energy": 78.3234023222969,
+        "two_error_cross_term": 3.413384692336638,
+        "token_decoder_error_cosine": 0.10249188073884309,
+        "token_decoder_error_pearson": 0.10258796383121285,
+        "error_interaction": "reinforcement",
+        "component_energy_cancelled_fraction": 0.0,
+        "component_energy_reinforced_fraction": 0.04556646494462262,
+        "scalar_identity_residual": 1.7674750552032492e-13,
+        "vector_identity_max_abs_residual": 0.0
+      },
+      "conditional_decoder_below_10pct": true,
+      "token_induced_below_10pct": false,
+      "end_to_end_below_10pct": false,
+      "original_cpu_decode_s": 27.861222240000643,
+      "cache_reuse": "All token/source/checkpoint/waveform hashes verified; no new neural decode",
+      "files": {
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+          "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+          "bytes": 1515744,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav"
+        },
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.wav",
+          "sha256": "2cdb24367220760833115a108983cc9315eb12fdf16ecd03e9026e877dd904cb",
+          "bytes": 1515744,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.wav"
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/audio/bus_same_tokens_cpu.wav",
+          "sha256": "1327256dc183bb2b289052574c91572e67b4e8c0151999b92689b66a14ca7e9f",
+          "bytes": 1515744,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition/decoder_scope_same_tokens_cpu.wav"
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz",
+          "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+          "bytes": 4178,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz"
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.tokens.npz",
+          "sha256": "3a419e9624d515598da2f88fd834d7f88db17e2e6efb151f9db8ed4aa0fe99b5",
+          "bytes": 4183,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.tokens.npz"
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.metrics.json",
+          "sha256": "8e2b5f869ac3600a9348967e4c7f0d51ddff272b363be8e733e2ebf903b104af",
+          "bytes": 3396,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.metrics.json"
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/records/bus_same_tokens_cpu.json",
+          "sha256": "cfbd07a7f78b5eb3299e852289de8b3af42d96a2596e5a32e7f946b11ddd5991",
+          "bytes": 4822,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/bus_bf16_selected.json"
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.metrics.json",
+          "sha256": "d80002b4d5d2ffbb36499801db0f2db7684d61e7ac9d1e418fe3d2ca662bab2e",
+          "bytes": 1973,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.metrics.json"
+        }
+      },
+      "metadata": {
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "format": "bigcodec-tokens-v1",
+        "hop_length": 200,
+        "native_samples": 378916,
+        "padded_samples": 379000,
+        "sample_rate": 16000,
+        "source_channels": 1,
+        "source_rate": 16000,
+        "source_samples": 378916,
+        "source_sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7"
+      },
+      "included_in_eight_file_pool": true,
+      "decode_record_format": "long_cached_decomposition",
+      "original_artifact_provenance": {
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.wav",
+          "sha256": "2cdb24367220760833115a108983cc9315eb12fdf16ecd03e9026e877dd904cb",
+          "bytes": 1515744
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.tokens.npz",
+          "sha256": "3a419e9624d515598da2f88fd834d7f88db17e2e6efb151f9db8ed4aa0fe99b5",
+          "bytes": 4183
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.metrics.json",
+          "sha256": "8e2b5f869ac3600a9348967e4c7f0d51ddff272b363be8e733e2ebf903b104af",
+          "bytes": 3396
+        },
+        "fpga_comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus.comparison.json",
+          "sha256": "97981740d20fc2daa7b8b3ef450d13615f07f5353aa5521fc6b2c628cda09ede",
+          "bytes": 1741
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/bus_error_decomposition/decoder_scope_same_tokens_cpu.wav",
+          "sha256": "1327256dc183bb2b289052574c91572e67b4e8c0151999b92689b66a14ca7e9f",
+          "bytes": 1515744
+        },
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.wav",
+          "sha256": "039018becabf04c53f7ce5c526453672ae4157afbccbaf4bc39c3a96f3e1f947",
+          "bytes": 1515744
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.tokens.npz",
+          "sha256": "6b78f7dbf5c624be5dbaff458c2af0ad64547ceb12c3e7359e8c9583451460a1",
+          "bytes": 4178
+        },
+        "noisy_input": {
+          "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus_noisy.wav",
+          "sha256": "2c1ad3c2dbe96f95d972ce7a1ce091491dbc7b953d7c9c0fb4c01df590fde2c7",
+          "bytes": 1515744
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/bus_bf16_selected.json",
+          "sha256": "cfbd07a7f78b5eb3299e852289de8b3af42d96a2596e5a32e7f946b11ddd5991",
+          "bytes": 4822
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus.metrics.json",
+          "sha256": "d80002b4d5d2ffbb36499801db0f2db7684d61e7ac9d1e418fe3d2ca662bab2e",
+          "bytes": 1973
+        }
+      }
+    },
+    {
+      "case": "cafe",
+      "samples": 328146,
+      "sample_rate": 16000,
+      "duration_s": 20.509125,
+      "tokens": 1641,
+      "tokens_matching_official": 1528,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.2133136965218586,
+        "token_only_cpu_vs_official_l2": 0.21430042810420508,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.02792129114471912,
+        "decoder_error_relative_to_official_energy": 0.0278044444537802,
+        "reference_energy": 1810.7900888599545,
+        "same_token_cpu_energy": 1795.6659957553995,
+        "token_error_energy": 83.15994358193655,
+        "decoder_error_energy": 1.399898515334141,
+        "full_error_energy": 82.39589815665207,
+        "two_error_cross_term": -2.163943940618662,
+        "token_decoder_error_cosine": -0.10027914918620633,
+        "token_decoder_error_pearson": -0.1005203261462324,
+        "error_interaction": "cancellation",
+        "component_energy_cancelled_fraction": 0.025590680953843772,
+        "component_energy_reinforced_fraction": 0.0,
+        "scalar_identity_residual": 4.1744385725905886e-14,
+        "vector_identity_max_abs_residual": 0.0
+      },
+      "conditional_decoder_below_10pct": true,
+      "token_induced_below_10pct": false,
+      "end_to_end_below_10pct": false,
+      "original_cpu_decode_s": 24.63499127599789,
+      "cache_reuse": "All token/source/checkpoint/waveform hashes verified; no new neural decode",
+      "files": {
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav",
+          "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e",
+          "bytes": 1312664,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav"
+        },
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.wav",
+          "sha256": "f3cbcc9aeaccc3f8c4fe61825a6b373b58bf2b658f240a1163c5c71f33d18011",
+          "bytes": 1312664,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.wav"
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/audio/cafe_same_tokens_cpu.wav",
+          "sha256": "5c7328483ac42b72b06369c3c30d5981312a2252429a5d8e5893b518f088228a",
+          "bytes": 1312664,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_bf16_selected_same_tokens_cpu.wav"
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.tokens.npz",
+          "sha256": "c48df28ed8b8998368cca7e603405a6389f68d60cf0ecc7bf9a09af7c20394c4",
+          "bytes": 3699,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.tokens.npz"
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.tokens.npz",
+          "sha256": "5062896d4073cf2fc2b6050363766733c6755037777d30b74c1599772bdf36dd",
+          "bytes": 3704,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.tokens.npz"
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.metrics.json",
+          "sha256": "35863400b809c03e67f1dfc6f4eef860a740266d865382fb3dcee2a358793145",
+          "bytes": 3379,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.metrics.json"
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/records/cafe_same_tokens_cpu.json",
+          "sha256": "340f5aa85f2edcb9970d7ec63bc423726d7574c994a6d441a8e996142856de1b",
+          "bytes": 4577,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_bf16_selected.json"
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.metrics.json",
+          "sha256": "77c5ef1281692f38ab0331ca53ddd158a75bf1c85921dbdb76614fd051115356",
+          "bytes": 1979,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.metrics.json"
+        }
+      },
+      "metadata": {
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "format": "bigcodec-tokens-v1",
+        "hop_length": 200,
+        "native_samples": 328146,
+        "padded_samples": 328200,
+        "sample_rate": 16000,
+        "source_channels": 1,
+        "source_rate": 16000,
+        "source_samples": 328146,
+        "source_sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868"
+      },
+      "included_in_eight_file_pool": true,
+      "decode_record_format": "long_cached_decomposition",
+      "original_artifact_provenance": {
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.wav",
+          "sha256": "f3cbcc9aeaccc3f8c4fe61825a6b373b58bf2b658f240a1163c5c71f33d18011",
+          "bytes": 1312664
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.tokens.npz",
+          "sha256": "5062896d4073cf2fc2b6050363766733c6755037777d30b74c1599772bdf36dd",
+          "bytes": 3704
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.metrics.json",
+          "sha256": "35863400b809c03e67f1dfc6f4eef860a740266d865382fb3dcee2a358793145",
+          "bytes": 3379
+        },
+        "fpga_comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe.comparison.json",
+          "sha256": "767a0cf6fc2f5e06997507b0127b83210d623bf78aa060ee439188a7911909a0",
+          "bytes": 1720
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_bf16_selected_same_tokens_cpu.wav",
+          "sha256": "5c7328483ac42b72b06369c3c30d5981312a2252429a5d8e5893b518f088228a",
+          "bytes": 1312664
+        },
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.wav",
+          "sha256": "3010f691b5a5f826cd9305fb1e9f6690d62a911ca7525530ad0a4639fb02206e",
+          "bytes": 1312664
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.tokens.npz",
+          "sha256": "c48df28ed8b8998368cca7e603405a6389f68d60cf0ecc7bf9a09af7c20394c4",
+          "bytes": 3699
+        },
+        "noisy_input": {
+          "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_noisy.wav",
+          "sha256": "bd6c0a5266cdc364005717a157c67c3f310e54f096ddb5e216d03a4d34bd7868",
+          "bytes": 1312664
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_bf16_selected.json",
+          "sha256": "340f5aa85f2edcb9970d7ec63bc423726d7574c994a6d441a8e996142856de1b",
+          "bytes": 4577
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe.metrics.json",
+          "sha256": "77c5ef1281692f38ab0331ca53ddd158a75bf1c85921dbdb76614fd051115356",
+          "bytes": 1979
+        }
+      }
+    },
+    {
+      "case": "office",
+      "samples": 351688,
+      "sample_rate": 16000,
+      "duration_s": 21.9805,
+      "tokens": 1759,
+      "tokens_matching_official": 1583,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.22477939430918922,
+        "token_only_cpu_vs_official_l2": 0.2209692917596386,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.03503446413674065,
+        "decoder_error_relative_to_official_energy": 0.034555872479843416,
+        "reference_energy": 2243.7508500262393,
+        "same_token_cpu_energy": 2182.8676132977143,
+        "token_error_energy": 109.55658285691682,
+        "decoder_error_energy": 2.6792815644028365,
+        "full_error_energy": 113.36725308608632,
+        "two_error_cross_term": 1.1313886647663298,
+        "token_decoder_error_cosine": 0.033018201288873436,
+        "token_decoder_error_pearson": 0.03304830913236925,
+        "error_interaction": "reinforcement",
+        "component_energy_cancelled_fraction": 0.0,
+        "component_energy_reinforced_fraction": 0.010080455749146598,
+        "scalar_identity_residual": 3.3661962106634746e-13,
+        "vector_identity_max_abs_residual": 0.0
+      },
+      "conditional_decoder_below_10pct": true,
+      "token_induced_below_10pct": false,
+      "end_to_end_below_10pct": false,
+      "original_cpu_decode_s": 26.146102155002154,
+      "cache_reuse": "All token/source/checkpoint/waveform hashes verified; no new neural decode",
+      "files": {
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.wav",
+          "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad",
+          "bytes": 1406832,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.wav"
+        },
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.wav",
+          "sha256": "966600affcbf213051cb96deaac30004c9c51c524ef2c2d2e9d758678c430884",
+          "bytes": 1406832,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.wav"
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/audio/office_same_tokens_cpu.wav",
+          "sha256": "df3c5d2f96c3a1a918565e24522928d88837013acbe2e25b444c0c673ddf3e5c",
+          "bytes": 1406832,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_bf16_selected_same_tokens_cpu.wav"
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.tokens.npz",
+          "sha256": "a1060ccbbb1a6007e718fbfaa9cbda024a8a1da12554d3051ec7599bdacaa430",
+          "bytes": 3871,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.tokens.npz"
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.tokens.npz",
+          "sha256": "6e87aa6694c194c3ec9dc19f811442dadff1adb0edb5aa6ed9c209dd4c27160d",
+          "bytes": 3870,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.tokens.npz"
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.metrics.json",
+          "sha256": "606e03dfee4a83dbeeeddc7f9c27bd5a4cb53a8ab2b67cbe5d6d29e73ffba8d8",
+          "bytes": 3389,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.metrics.json"
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/records/office_same_tokens_cpu.json",
+          "sha256": "c2cf030e40f29e4df3019a79e51e862c337cbc3bf3d70b5c8d9898bc5812708f",
+          "bytes": 4620,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_bf16_selected.json"
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.metrics.json",
+          "sha256": "a64507d55cdc583f22aa18e8bbfdd9faad574dec95d24883087381bb6bec0e17",
+          "bytes": 1982,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.metrics.json"
+        }
+      },
+      "metadata": {
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "format": "bigcodec-tokens-v1",
+        "hop_length": 200,
+        "native_samples": 351688,
+        "padded_samples": 351800,
+        "sample_rate": 16000,
+        "source_channels": 1,
+        "source_rate": 16000,
+        "source_samples": 351688,
+        "source_sha256": "b5dc82530929875863ebb564cc892c64c4e1cf5c5cead6b17a34c368593d6f73"
+      },
+      "included_in_eight_file_pool": true,
+      "decode_record_format": "long_cached_decomposition",
+      "original_artifact_provenance": {
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.wav",
+          "sha256": "966600affcbf213051cb96deaac30004c9c51c524ef2c2d2e9d758678c430884",
+          "bytes": 1406832
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.tokens.npz",
+          "sha256": "6e87aa6694c194c3ec9dc19f811442dadff1adb0edb5aa6ed9c209dd4c27160d",
+          "bytes": 3870
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.metrics.json",
+          "sha256": "606e03dfee4a83dbeeeddc7f9c27bd5a4cb53a8ab2b67cbe5d6d29e73ffba8d8",
+          "bytes": 3389
+        },
+        "fpga_comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office.comparison.json",
+          "sha256": "acc47598a5c8bf902ab40c2caac82560af540b4b7ae8f3c67014a8ed538589f0",
+          "bytes": 1729
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_bf16_selected_same_tokens_cpu.wav",
+          "sha256": "df3c5d2f96c3a1a918565e24522928d88837013acbe2e25b444c0c673ddf3e5c",
+          "bytes": 1406832
+        },
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.wav",
+          "sha256": "8ac1dbae1adb3f6312bac1859028c38e4c05024961462e35b1d72b48978370ad",
+          "bytes": 1406832
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.tokens.npz",
+          "sha256": "a1060ccbbb1a6007e718fbfaa9cbda024a8a1da12554d3051ec7599bdacaa430",
+          "bytes": 3871
+        },
+        "noisy_input": {
+          "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/office_noisy.wav",
+          "sha256": "b5dc82530929875863ebb564cc892c64c4e1cf5c5cead6b17a34c368593d6f73",
+          "bytes": 1406832
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_bf16_selected.json",
+          "sha256": "c2cf030e40f29e4df3019a79e51e862c337cbc3bf3d70b5c8d9898bc5812708f",
+          "bytes": 4620
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office.metrics.json",
+          "sha256": "a64507d55cdc583f22aa18e8bbfdd9faad574dec95d24883087381bb6bec0e17",
+          "bytes": 1982
+        }
+      }
+    },
+    {
+      "case": "psquare",
+      "samples": 343574,
+      "sample_rate": 16000,
+      "duration_s": 21.473375,
+      "tokens": 1718,
+      "tokens_matching_official": 1569,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.29771524067177385,
+        "token_only_cpu_vs_official_l2": 0.3092581713113206,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.036875694545519255,
+        "decoder_error_relative_to_official_energy": 0.03638617221930296,
+        "reference_energy": 1804.0364112958541,
+        "same_token_cpu_energy": 1756.4574052056948,
+        "token_error_energy": 172.539154605955,
+        "decoder_error_energy": 2.3884603727697185,
+        "full_error_energy": 159.8996209010367,
+        "two_error_cross_term": -15.027994077687621,
+        "token_decoder_error_cosine": -0.370141828939179,
+        "token_decoder_error_pearson": -0.37018623427539854,
+        "error_interaction": "cancellation",
+        "component_energy_cancelled_fraction": 0.08590978662525856,
+        "component_energy_reinforced_fraction": 0.0,
+        "scalar_identity_residual": -3.7481129311345285e-13,
+        "vector_identity_max_abs_residual": 0.0
+      },
+      "conditional_decoder_below_10pct": true,
+      "token_induced_below_10pct": false,
+      "end_to_end_below_10pct": false,
+      "original_cpu_decode_s": 25.495465713000158,
+      "cache_reuse": "All token/source/checkpoint/waveform hashes verified; no new neural decode",
+      "files": {
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.wav",
+          "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059",
+          "bytes": 1374376,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.wav"
+        },
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.wav",
+          "sha256": "4009d7328effcb55386baba76ce981204fba52bf4987d3fe8c330e15e2076b8b",
+          "bytes": 1374376,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.wav"
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/audio/psquare_same_tokens_cpu.wav",
+          "sha256": "de5354c87e8b7bb055e4b188fa1b04f684fd307a3b3775710e20703950ec2c88",
+          "bytes": 1374376,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_bf16_selected_same_tokens_cpu.wav"
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.tokens.npz",
+          "sha256": "c4f0e9c95822161d75be03e1debace66bf229c78ea433b031dd983a2e9cd0a34",
+          "bytes": 3855,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.tokens.npz"
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.tokens.npz",
+          "sha256": "7cb20922586f2e819d068e3bc6b031b3ffe38a3b1d1516db9b8401e236e41008",
+          "bytes": 3863,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.tokens.npz"
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.metrics.json",
+          "sha256": "585877f3cb9458d3d4629d063528bb05310c9b82ef137f20717724ea7d6eb3f5",
+          "bytes": 3394,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.metrics.json"
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/records/psquare_same_tokens_cpu.json",
+          "sha256": "d89eb292d82d4e7fe53d20007eeb46da5558b38b39101f12f49910a098f342ca",
+          "bytes": 4607,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_bf16_selected.json"
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.metrics.json",
+          "sha256": "fae50433a72850806be3a64606664ad5fb5ec6cc28c46ea61c262ee31af5a45d",
+          "bytes": 1989,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.metrics.json"
+        }
+      },
+      "metadata": {
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "format": "bigcodec-tokens-v1",
+        "hop_length": 200,
+        "native_samples": 343574,
+        "padded_samples": 343600,
+        "sample_rate": 16000,
+        "source_channels": 1,
+        "source_rate": 16000,
+        "source_samples": 343574,
+        "source_sha256": "a20d68e238fb9acae1044ced9e05581535764ef2942d2efad5d3a7c1bf1cb26e"
+      },
+      "included_in_eight_file_pool": true,
+      "decode_record_format": "long_cached_decomposition",
+      "original_artifact_provenance": {
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.wav",
+          "sha256": "4009d7328effcb55386baba76ce981204fba52bf4987d3fe8c330e15e2076b8b",
+          "bytes": 1374376
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.tokens.npz",
+          "sha256": "7cb20922586f2e819d068e3bc6b031b3ffe38a3b1d1516db9b8401e236e41008",
+          "bytes": 3863
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.metrics.json",
+          "sha256": "585877f3cb9458d3d4629d063528bb05310c9b82ef137f20717724ea7d6eb3f5",
+          "bytes": 3394
+        },
+        "fpga_comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare.comparison.json",
+          "sha256": "4d1b829f8c6376274c54fce68ffdfc7be2dbbb46c96872ea13748e900d1298d6",
+          "bytes": 1735
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_bf16_selected_same_tokens_cpu.wav",
+          "sha256": "de5354c87e8b7bb055e4b188fa1b04f684fd307a3b3775710e20703950ec2c88",
+          "bytes": 1374376
+        },
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.wav",
+          "sha256": "d7fa56d3a10fd9e8188c95fd3fe57c5c14517edf37168cd7252d0d9504dbf059",
+          "bytes": 1374376
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.tokens.npz",
+          "sha256": "c4f0e9c95822161d75be03e1debace66bf229c78ea433b031dd983a2e9cd0a34",
+          "bytes": 3855
+        },
+        "noisy_input": {
+          "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_noisy.wav",
+          "sha256": "a20d68e238fb9acae1044ced9e05581535764ef2942d2efad5d3a7c1bf1cb26e",
+          "bytes": 1374376
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_bf16_selected.json",
+          "sha256": "d89eb292d82d4e7fe53d20007eeb46da5558b38b39101f12f49910a098f342ca",
+          "bytes": 4607
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare.metrics.json",
+          "sha256": "fae50433a72850806be3a64606664ad5fb5ec6cc28c46ea61c262ee31af5a45d",
+          "bytes": 1989
+        }
+      }
+    },
+    {
+      "case": "bus_low_snr",
+      "samples": 334067,
+      "sample_rate": 16000,
+      "duration_s": 20.8791875,
+      "tokens": 1671,
+      "tokens_matching_official": 1556,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.21441814768528292,
+        "token_only_cpu_vs_official_l2": 0.20951589988183358,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.039790123096501984,
+        "decoder_error_relative_to_official_energy": 0.039079859561587146,
+        "reference_energy": 1193.0449569423554,
+        "same_token_cpu_energy": 1150.8328035438733,
+        "token_error_energy": 52.37098984878636,
+        "decoder_error_energy": 1.8220605198954667,
+        "full_error_energy": 54.85041137555906,
+        "two_error_cross_term": 0.6573610068775362,
+        "token_decoder_error_cosine": 0.0336470623770201,
+        "token_decoder_error_pearson": 0.03370310782094457,
+        "error_interaction": "reinforcement",
+        "component_energy_cancelled_fraction": 0.0,
+        "component_energy_reinforced_fraction": 0.012129987192184798,
+        "scalar_identity_residual": -2.9887203822909214e-13,
+        "vector_identity_max_abs_residual": 0.0
+      },
+      "conditional_decoder_below_10pct": true,
+      "token_induced_below_10pct": false,
+      "end_to_end_below_10pct": false,
+      "original_cpu_decode_s": 25.134980462000385,
+      "cache_reuse": "All token/source/checkpoint/waveform hashes verified; no new neural decode",
+      "files": {
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.wav",
+          "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6",
+          "bytes": 1336348,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.wav"
+        },
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.wav",
+          "sha256": "8cdfe2a7ccb04e954efb3809a19fb8ce5a2de526dc0688e2a7037c27ddb73c2a",
+          "bytes": 1336348,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.wav"
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/audio/bus_low_snr_same_tokens_cpu.wav",
+          "sha256": "35a3beaef410e5ac9a1b99fbb3d7695a1f93675f9eff68819a1d4e93ae84c3e9",
+          "bytes": 1336348,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/bus_low_snr_bf16_selected_same_tokens_cpu.wav"
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.tokens.npz",
+          "sha256": "c7fde3db4b89fca566160bf035ae191ebb53f0e36ca14ff6a9be25fe1b84cb08",
+          "bytes": 3732,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.tokens.npz"
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.tokens.npz",
+          "sha256": "a59d6049df6fb0892e535429ab8694525778e14c44ad8f52147c9900f905cf45",
+          "bytes": 3742,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.tokens.npz"
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.metrics.json",
+          "sha256": "1296954c3ffb67964aa77427187c769a9fa1a563003319a28fba1535abc0563a",
+          "bytes": 3401,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.metrics.json"
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/records/bus_low_snr_same_tokens_cpu.json",
+          "sha256": "925847f7a5233906a57a32eabf9adecc8bbc7936871929bd4f4e4e246c35bf76",
+          "bytes": 4635,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/bus_low_snr_bf16_selected.json"
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.metrics.json",
+          "sha256": "021ecf0eefef7927d39361f93e99ec7346845da24c7d0612400bdc2e76f661c3",
+          "bytes": 1999,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.metrics.json"
+        }
+      },
+      "metadata": {
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "format": "bigcodec-tokens-v1",
+        "hop_length": 200,
+        "native_samples": 334067,
+        "padded_samples": 334200,
+        "sample_rate": 16000,
+        "source_channels": 1,
+        "source_rate": 16000,
+        "source_samples": 334067,
+        "source_sha256": "6ffae073e5549f58e19127bfcc701616baca9bc68d299103c01aeec7a8e0d288"
+      },
+      "included_in_eight_file_pool": true,
+      "decode_record_format": "long_cached_decomposition",
+      "original_artifact_provenance": {
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.wav",
+          "sha256": "8cdfe2a7ccb04e954efb3809a19fb8ce5a2de526dc0688e2a7037c27ddb73c2a",
+          "bytes": 1336348
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.tokens.npz",
+          "sha256": "a59d6049df6fb0892e535429ab8694525778e14c44ad8f52147c9900f905cf45",
+          "bytes": 3742
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.metrics.json",
+          "sha256": "1296954c3ffb67964aa77427187c769a9fa1a563003319a28fba1535abc0563a",
+          "bytes": 3401
+        },
+        "fpga_comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/bus_low_snr.comparison.json",
+          "sha256": "2fc6d38ec59f98d2f8323a06a72c32197044d28bc3dc1c130c06501a5fa6ad4b",
+          "bytes": 1751
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/bus_low_snr_bf16_selected_same_tokens_cpu.wav",
+          "sha256": "35a3beaef410e5ac9a1b99fbb3d7695a1f93675f9eff68819a1d4e93ae84c3e9",
+          "bytes": 1336348
+        },
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.wav",
+          "sha256": "be410d450accdaad3f344af8e5674969a5044aba5249a00ac0002335bb2754a6",
+          "bytes": 1336348
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.tokens.npz",
+          "sha256": "c7fde3db4b89fca566160bf035ae191ebb53f0e36ca14ff6a9be25fe1b84cb08",
+          "bytes": 3732
+        },
+        "noisy_input": {
+          "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/bus_low_snr_noisy.wav",
+          "sha256": "6ffae073e5549f58e19127bfcc701616baca9bc68d299103c01aeec7a8e0d288",
+          "bytes": 1336348
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/bus_low_snr_bf16_selected.json",
+          "sha256": "925847f7a5233906a57a32eabf9adecc8bbc7936871929bd4f4e4e246c35bf76",
+          "bytes": 4635
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/bus_low_snr.metrics.json",
+          "sha256": "021ecf0eefef7927d39361f93e99ec7346845da24c7d0612400bdc2e76f661c3",
+          "bytes": 1999
+        }
+      }
+    },
+    {
+      "case": "cafe_low_snr",
+      "samples": 343450,
+      "sample_rate": 16000,
+      "duration_s": 21.465625,
+      "tokens": 1718,
+      "tokens_matching_official": 1622,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.3288904717726164,
+        "token_only_cpu_vs_official_l2": 0.33104964033444945,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.036672657364619686,
+        "decoder_error_relative_to_official_energy": 0.036184031993551725,
+        "reference_energy": 1744.5198541725063,
+        "same_token_cpu_energy": 1698.3416966514,
+        "token_error_energy": 191.18867228122272,
+        "decoder_error_energy": 2.284072231604746,
+        "full_error_energy": 188.702867661442,
+        "two_error_cross_term": -4.769876851385164,
+        "token_decoder_error_cosine": -0.11412772897239645,
+        "token_decoder_error_pearson": -0.11467069459035709,
+        "error_interaction": "cancellation",
+        "component_energy_cancelled_fraction": 0.02465399900846972,
+        "component_energy_reinforced_fraction": 0.0,
+        "scalar_identity_residual": -2.9043434324194095e-13,
+        "vector_identity_max_abs_residual": 0.0
+      },
+      "conditional_decoder_below_10pct": true,
+      "token_induced_below_10pct": false,
+      "end_to_end_below_10pct": false,
+      "original_cpu_decode_s": 25.697720211999695,
+      "cache_reuse": "All token/source/checkpoint/waveform hashes verified; no new neural decode",
+      "files": {
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.wav",
+          "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c",
+          "bytes": 1373880,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.wav"
+        },
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.wav",
+          "sha256": "1f9b7599d217db008f9d89d52f565535a9559eb18a13524d6ee2d68ffb11d39e",
+          "bytes": 1373880,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.wav"
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/audio/cafe_low_snr_same_tokens_cpu.wav",
+          "sha256": "12fad5b97d482d3b061aa6f8046e22b62e6089144ec65e9b3a431c25938ce222",
+          "bytes": 1373880,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_low_snr_bf16_selected_same_tokens_cpu.wav"
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.tokens.npz",
+          "sha256": "a6c30c5a077a9f0c06f2e3bb45b5d06a28d2be2d0efdbc144ab8196cf6f8ac21",
+          "bytes": 3825,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.tokens.npz"
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.tokens.npz",
+          "sha256": "2663f7cead2378cdd5222ffe8ef158d53861af4298560847f7ecd5649174c4f4",
+          "bytes": 3826,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.tokens.npz"
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.metrics.json",
+          "sha256": "e9dbb9637d7c25d987e05ba542d97816928170538d64bdf1f7c52bf928b2a17f",
+          "bytes": 3401,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.metrics.json"
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/records/cafe_low_snr_same_tokens_cpu.json",
+          "sha256": "e666df06e4033f65aa4101ad58b51c8558ee0b25bb769a19ad2d63d3b0e962f0",
+          "bytes": 4644,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_low_snr_bf16_selected.json"
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.metrics.json",
+          "sha256": "b15593ad68ae6c05624baf4a2f1730e0f020fa133ff65b961afc34de7268f97c",
+          "bytes": 2000,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.metrics.json"
+        }
+      },
+      "metadata": {
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "format": "bigcodec-tokens-v1",
+        "hop_length": 200,
+        "native_samples": 343450,
+        "padded_samples": 343600,
+        "sample_rate": 16000,
+        "source_channels": 1,
+        "source_rate": 16000,
+        "source_samples": 343450,
+        "source_sha256": "e61711a17c0ee70e99377efde0f7ff1010cbc4673d76b4914e468529cc8ba915"
+      },
+      "included_in_eight_file_pool": true,
+      "decode_record_format": "long_cached_decomposition",
+      "original_artifact_provenance": {
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.wav",
+          "sha256": "1f9b7599d217db008f9d89d52f565535a9559eb18a13524d6ee2d68ffb11d39e",
+          "bytes": 1373880
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.tokens.npz",
+          "sha256": "2663f7cead2378cdd5222ffe8ef158d53861af4298560847f7ecd5649174c4f4",
+          "bytes": 3826
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.metrics.json",
+          "sha256": "e9dbb9637d7c25d987e05ba542d97816928170538d64bdf1f7c52bf928b2a17f",
+          "bytes": 3401
+        },
+        "fpga_comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/cafe_low_snr.comparison.json",
+          "sha256": "1cc52139067ad1e3761f8ec1f6750d560bab18b80fcc459bb53bf7d33214a1b1",
+          "bytes": 1750
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_low_snr_bf16_selected_same_tokens_cpu.wav",
+          "sha256": "12fad5b97d482d3b061aa6f8046e22b62e6089144ec65e9b3a431c25938ce222",
+          "bytes": 1373880
+        },
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.wav",
+          "sha256": "00a47bf10fda19ce9422bccb103da5240783b7e6661d1e2bfba3d7f70bfeb59c",
+          "bytes": 1373880
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.tokens.npz",
+          "sha256": "a6c30c5a077a9f0c06f2e3bb45b5d06a28d2be2d0efdbc144ab8196cf6f8ac21",
+          "bytes": 3825
+        },
+        "noisy_input": {
+          "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/cafe_low_snr_noisy.wav",
+          "sha256": "e61711a17c0ee70e99377efde0f7ff1010cbc4673d76b4914e468529cc8ba915",
+          "bytes": 1373880
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/cafe_low_snr_bf16_selected.json",
+          "sha256": "e666df06e4033f65aa4101ad58b51c8558ee0b25bb769a19ad2d63d3b0e962f0",
+          "bytes": 4644
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/cafe_low_snr.metrics.json",
+          "sha256": "b15593ad68ae6c05624baf4a2f1730e0f020fa133ff65b961afc34de7268f97c",
+          "bytes": 2000
+        }
+      }
+    },
+    {
+      "case": "office_low_snr",
+      "samples": 343910,
+      "sample_rate": 16000,
+      "duration_s": 21.494375,
+      "tokens": 1720,
+      "tokens_matching_official": 1582,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.17179032410353967,
+        "token_only_cpu_vs_official_l2": 0.16683810768689558,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.034664770822660444,
+        "decoder_error_relative_to_official_energy": 0.03439229264286438,
+        "reference_energy": 1951.9118176411182,
+        "same_token_cpu_energy": 1921.3468906278752,
+        "token_error_energy": 54.33137600069556,
+        "decoder_error_energy": 2.3087794516683675,
+        "full_error_energy": 57.60465653900965,
+        "two_error_cross_term": 0.9645010866459681,
+        "token_decoder_error_cosine": 0.043058227622846224,
+        "token_decoder_error_pearson": 0.04265942084884396,
+        "error_interaction": "reinforcement",
+        "component_energy_cancelled_fraction": 0.0,
+        "component_energy_reinforced_fraction": 0.017028574143959446,
+        "scalar_identity_residual": -2.4569235534954714e-13,
+        "vector_identity_max_abs_residual": 0.0
+      },
+      "conditional_decoder_below_10pct": true,
+      "token_induced_below_10pct": false,
+      "end_to_end_below_10pct": false,
+      "original_cpu_decode_s": 25.86660004499936,
+      "cache_reuse": "All token/source/checkpoint/waveform hashes verified; no new neural decode",
+      "files": {
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.wav",
+          "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708",
+          "bytes": 1375720,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.wav"
+        },
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.wav",
+          "sha256": "8abd0e806ef8b5fc7b2561480646a027a0337ab5365d2202804abd823a3d9be7",
+          "bytes": 1375720,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.wav"
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/audio/office_low_snr_same_tokens_cpu.wav",
+          "sha256": "e34ad616a612cf0953806e05d2ab12ae4a27689ccacbe3858f7f144b3b65694b",
+          "bytes": 1375720,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_low_snr_bf16_selected_same_tokens_cpu.wav"
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.tokens.npz",
+          "sha256": "8c9f828f1cb6d43d0c997af3554fc89f3603577ffa5067dce2ced15ca1e949cc",
+          "bytes": 3847,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.tokens.npz"
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.tokens.npz",
+          "sha256": "0319a6fb1660016dfede451e615e58819ce98051eda85d58d92e18485f33a9ce",
+          "bytes": 3847,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.tokens.npz"
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.metrics.json",
+          "sha256": "5bb2299731b3922c138d5f7764e002a9308bdbdd050befcfe1e4d43a5d1bf7b0",
+          "bytes": 3407,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.metrics.json"
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/records/office_low_snr_same_tokens_cpu.json",
+          "sha256": "5baaa8ba1a0b7a5275e1b87d759f259736d10a2b51cc7d1edbf427411a35e7a4",
+          "bytes": 4682,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_low_snr_bf16_selected.json"
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.metrics.json",
+          "sha256": "0b81731dbe85f6d5e18f81de09e3d780ff2a11e4cb352a968779078f08b73561",
+          "bytes": 2009,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.metrics.json"
+        }
+      },
+      "metadata": {
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "format": "bigcodec-tokens-v1",
+        "hop_length": 200,
+        "native_samples": 343910,
+        "padded_samples": 344000,
+        "sample_rate": 16000,
+        "source_channels": 1,
+        "source_rate": 16000,
+        "source_samples": 343910,
+        "source_sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620"
+      },
+      "included_in_eight_file_pool": true,
+      "decode_record_format": "long_cached_decomposition",
+      "original_artifact_provenance": {
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.wav",
+          "sha256": "8abd0e806ef8b5fc7b2561480646a027a0337ab5365d2202804abd823a3d9be7",
+          "bytes": 1375720
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.tokens.npz",
+          "sha256": "0319a6fb1660016dfede451e615e58819ce98051eda85d58d92e18485f33a9ce",
+          "bytes": 3847
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.metrics.json",
+          "sha256": "5bb2299731b3922c138d5f7764e002a9308bdbdd050befcfe1e4d43a5d1bf7b0",
+          "bytes": 3407
+        },
+        "fpga_comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/office_low_snr.comparison.json",
+          "sha256": "9e469fea35748a8b6bc4bd3f2bd0e509583c155d4e131230fe426e53596de656",
+          "bytes": 1763
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_low_snr_bf16_selected_same_tokens_cpu.wav",
+          "sha256": "e34ad616a612cf0953806e05d2ab12ae4a27689ccacbe3858f7f144b3b65694b",
+          "bytes": 1375720
+        },
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.wav",
+          "sha256": "a1ce86c159a016b2f196c87586c4cddc5086d31fe1121d8e8f14512c54c15708",
+          "bytes": 1375720
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.tokens.npz",
+          "sha256": "8c9f828f1cb6d43d0c997af3554fc89f3603577ffa5067dce2ced15ca1e949cc",
+          "bytes": 3847
+        },
+        "noisy_input": {
+          "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/office_low_snr_noisy.wav",
+          "sha256": "08eace4a1b9a00b5a451d67f4df1e5618e844ba333552d9b9b7733df8f304620",
+          "bytes": 1375720
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/office_low_snr_bf16_selected.json",
+          "sha256": "5baaa8ba1a0b7a5275e1b87d759f259736d10a2b51cc7d1edbf427411a35e7a4",
+          "bytes": 4682
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/office_low_snr.metrics.json",
+          "sha256": "0b81731dbe85f6d5e18f81de09e3d780ff2a11e4cb352a968779078f08b73561",
+          "bytes": 2009
+        }
+      }
+    },
+    {
+      "case": "psquare_low_snr",
+      "samples": 344406,
+      "sample_rate": 16000,
+      "duration_s": 21.525375,
+      "tokens": 1723,
+      "tokens_matching_official": 1620,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.22653435945610467,
+        "token_only_cpu_vs_official_l2": 0.22275184331317063,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.038054292128086364,
+        "decoder_error_relative_to_official_energy": 0.037492091202513164,
+        "reference_energy": 2138.4729612584915,
+        "same_token_cpu_energy": 2075.75358911801,
+        "token_error_energy": 106.10757192254874,
+        "decoder_error_energy": 3.0059592793106393,
+        "full_error_energy": 109.7417619771783,
+        "two_error_cross_term": 0.628230775318859,
+        "token_decoder_error_cosine": 0.017588324797697636,
+        "token_decoder_error_pearson": 0.01783522977004205,
+        "error_interaction": "reinforcement",
+        "component_energy_cancelled_fraction": 0.0,
+        "component_energy_reinforced_fraction": 0.0057575881597731055,
+        "scalar_identity_residual": 5.795364188543317e-14,
+        "vector_identity_max_abs_residual": 0.0
+      },
+      "conditional_decoder_below_10pct": true,
+      "token_induced_below_10pct": false,
+      "end_to_end_below_10pct": false,
+      "original_cpu_decode_s": 25.858873155000765,
+      "cache_reuse": "All token/source/checkpoint/waveform hashes verified; no new neural decode",
+      "files": {
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.wav",
+          "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b",
+          "bytes": 1377704,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.wav"
+        },
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.wav",
+          "sha256": "02595b5fd28067eb36e3cc61becef89b209ee9aa9c9ccae3f0772322fa037dd9",
+          "bytes": 1377704,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.wav"
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/audio/psquare_low_snr_same_tokens_cpu.wav",
+          "sha256": "b6244d8b6f27394e04574f69fdfc597c1c255df8d4ba03d7e6061d875628b6ff",
+          "bytes": 1377704,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_low_snr_bf16_selected_same_tokens_cpu.wav"
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.tokens.npz",
+          "sha256": "a72b391be15694edd578b02df15f42df6dbceb65adf34bc2adfab9dbfec0c466",
+          "bytes": 3866,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.tokens.npz"
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.tokens.npz",
+          "sha256": "c8c8e552cab65740bc71e440be1eaa12b1c6418dd5e0a26c18c3865bf3505327",
+          "bytes": 3886,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.tokens.npz"
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.metrics.json",
+          "sha256": "3c852754f2c9a2576256d2296bc5719d2a4d0561e65af40d312445b088c3cf63",
+          "bytes": 3404,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.metrics.json"
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/validation/20260915_comparison_criteria/decomposition/records/psquare_low_snr_same_tokens_cpu.json",
+          "sha256": "14cd533d5f4fb75c89e24986c607ad5ac2bd0adddb36f4f66d68e3f1c184246c",
+          "bytes": 4688,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_low_snr_bf16_selected.json"
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.metrics.json",
+          "sha256": "dce237107bb012774449af0beb10ec51f46c8c3f452895c21d1f16e96c07be04",
+          "bytes": 2010,
+          "original_repository_path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.metrics.json"
+        }
+      },
+      "metadata": {
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+        "format": "bigcodec-tokens-v1",
+        "hop_length": 200,
+        "native_samples": 344406,
+        "padded_samples": 344600,
+        "sample_rate": 16000,
+        "source_channels": 1,
+        "source_rate": 16000,
+        "source_samples": 344406,
+        "source_sha256": "e44f139883a4570596b455d50eba708ab5e013b86eb6979880da3c6f769f78a8"
+      },
+      "included_in_eight_file_pool": true,
+      "decode_record_format": "long_cached_decomposition",
+      "original_artifact_provenance": {
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.wav",
+          "sha256": "02595b5fd28067eb36e3cc61becef89b209ee9aa9c9ccae3f0772322fa037dd9",
+          "bytes": 1377704
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.tokens.npz",
+          "sha256": "c8c8e552cab65740bc71e440be1eaa12b1c6418dd5e0a26c18c3865bf3505327",
+          "bytes": 3886
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.metrics.json",
+          "sha256": "3c852754f2c9a2576256d2296bc5719d2a4d0561e65af40d312445b088c3cf63",
+          "bytes": 3404
+        },
+        "fpga_comparison": {
+          "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.comparison.json",
+          "sha256": "9b1eb4192c4be99b13bbc9c2466dbd66d088826cf0a856b86aa9feea44edcf2e",
+          "bytes": 1765
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_low_snr_bf16_selected_same_tokens_cpu.wav",
+          "sha256": "b6244d8b6f27394e04574f69fdfc597c1c255df8d4ba03d7e6061d875628b6ff",
+          "bytes": 1377704
+        },
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.wav",
+          "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b",
+          "bytes": 1377704
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.tokens.npz",
+          "sha256": "a72b391be15694edd578b02df15f42df6dbceb65adf34bc2adfab9dbfec0c466",
+          "bytes": 3866
+        },
+        "noisy_input": {
+          "path": "models/dpdfnet/validation/20260914_noisy20s/noisy/psquare_low_snr_noisy.wav",
+          "sha256": "e44f139883a4570596b455d50eba708ab5e013b86eb6979880da3c6f769f78a8",
+          "bytes": 1377704
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_low_snr_bf16_selected.json",
+          "sha256": "14cd533d5f4fb75c89e24986c607ad5ac2bd0adddb36f4f66d68e3f1c184246c",
+          "bytes": 4688
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.metrics.json",
+          "sha256": "dce237107bb012774449af0beb10ec51f46c8c3f452895c21d1f16e96c07be04",
+          "bytes": 2010
+        }
+      }
+    },
+    {
+      "case": "p232_007",
+      "samples": 189883,
+      "sample_rate": 48000,
+      "duration_s": 3.9558958333333334,
+      "tokens": 317,
+      "tokens_matching_official": 310,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.20006853400886163,
+        "token_only_cpu_vs_official_l2": 0.14180114564594393,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.1228742458222464,
+        "decoder_error_relative_to_official_energy": 0.1228387769513902,
+        "reference_energy": 1017.8849314437322,
+        "same_token_cpu_energy": 1017.2973710780831,
+        "token_error_energy": 20.46718732635539,
+        "decoder_error_energy": 15.359237383666143,
+        "full_error_energy": 40.743305932628246,
+        "two_error_cross_term": 4.916881222606768,
+        "token_decoder_error_cosine": 0.13865828136110003,
+        "token_decoder_error_pearson": 0.1387327465669569,
+        "error_interaction": "reinforcement",
+        "component_energy_cancelled_fraction": 0.0,
+        "component_energy_reinforced_fraction": 0.13724174997655836,
+        "scalar_identity_residual": -5.417888360170764e-14,
+        "vector_identity_max_abs_residual": 0.0
+      },
+      "conditional_decoder_below_10pct": false,
+      "token_induced_below_10pct": false,
+      "end_to_end_below_10pct": false,
+      "metadata": {
+        "format": "bigcodec-tokens-v1",
+        "sample_rate": 16000,
+        "hop_length": 200,
+        "source_rate": 48000,
+        "source_channels": 1,
+        "source_samples": 189883,
+        "native_samples": 63295,
+        "padded_samples": 63400,
+        "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+        "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9"
+      },
+      "included_in_eight_file_pool": false,
+      "decode_record_format": "short_cpu_run",
+      "original_cpu_decode_s": 9.024692971997865,
+      "files": {
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/official_cpu.wav",
+          "sha256": "08b449c8be5bad1fabb6cde8cd91736162532144fc30c2b31d279cbfef229c99",
+          "bytes": 759612,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/official_cpu.wav"
+        },
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/split_decoder_fpga.wav",
+          "sha256": "674638d90e55d7d67f921c807d6c7fbf9799e8028a63f970aad5b2c9e755ca8d",
+          "bytes": 759612,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/split_decoder_fpga.wav"
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/split_decoder_same_tokens_cpu.wav",
+          "sha256": "96c6a2bcbeb7df0a7bc7967a79517d10bdfdda9f93bc364e739f88dc60bf9ccb",
+          "bytes": 759612,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/split_decoder_same_tokens_cpu.wav"
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/tokens/official_cpu.tokens.npz",
+          "sha256": "dbd0b73fab28be43a6edd208948a61629bba3a6812107ef7654fe412a87b295f",
+          "bytes": 1387,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/short_clip/tokens/official_cpu.tokens.npz"
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/tokens/split_decoder.tokens.npz",
+          "sha256": "7d2a292de36b75c56863194c3a6b0b54bcdc1946b7a1210940feab5bb0522fe0",
+          "bytes": 1387,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/short_clip/tokens/split_decoder.tokens.npz"
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/records/split_decoder_fpga.metrics.json",
+          "sha256": "9310756b6afa51550106c53d19e6be7a3e9953a50c5ce6430bc4ab5bb66cc8f8",
+          "bytes": 3343,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/short_clip/records/split_decoder_fpga.metrics.json"
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/records/split_decoder_same_tokens_cpu.metrics.json",
+          "sha256": "b074aefeaac5f91cda04d84c04e4a9e6a73954b45c0fe9a0cec0d575f5b71770",
+          "bytes": 1838,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/short_clip/records/split_decoder_same_tokens_cpu.metrics.json"
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/records/official_cpu.metrics.json",
+          "sha256": "ea8b1b300b3e8e92df4682c57383b7de5534e05c35bd3254cc4f6c06b683120c",
+          "bytes": 1848,
+          "original_repository_path": "models/bigcodec/validation/20260915_accuracy/short_clip/records/official_cpu.metrics.json"
+        }
+      },
+      "original_artifact_provenance": {
+        "reference_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/official_cpu.wav",
+          "sha256": "08b449c8be5bad1fabb6cde8cd91736162532144fc30c2b31d279cbfef229c99",
+          "bytes": 759612
+        },
+        "official_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/tokens/official_cpu.tokens.npz",
+          "sha256": "dbd0b73fab28be43a6edd208948a61629bba3a6812107ef7654fe412a87b295f",
+          "bytes": 1387
+        },
+        "fpga_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/split_decoder_fpga.wav",
+          "sha256": "674638d90e55d7d67f921c807d6c7fbf9799e8028a63f970aad5b2c9e755ca8d",
+          "bytes": 759612
+        },
+        "same_token_cpu_wav": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/audio/split_decoder_same_tokens_cpu.wav",
+          "sha256": "96c6a2bcbeb7df0a7bc7967a79517d10bdfdda9f93bc364e739f88dc60bf9ccb",
+          "bytes": 759612
+        },
+        "actual_tokens": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/tokens/split_decoder.tokens.npz",
+          "sha256": "7d2a292de36b75c56863194c3a6b0b54bcdc1946b7a1210940feab5bb0522fe0",
+          "bytes": 1387
+        },
+        "fpga_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/records/split_decoder_fpga.metrics.json",
+          "sha256": "9310756b6afa51550106c53d19e6be7a3e9953a50c5ce6430bc4ab5bb66cc8f8",
+          "bytes": 3343
+        },
+        "cached_decode_record": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/records/split_decoder_same_tokens_cpu.metrics.json",
+          "sha256": "b074aefeaac5f91cda04d84c04e4a9e6a73954b45c0fe9a0cec0d575f5b71770",
+          "bytes": 1838
+        },
+        "reference_metrics": {
+          "path": "models/bigcodec/validation/20260915_accuracy/short_clip/records/official_cpu.metrics.json",
+          "sha256": "ea8b1b300b3e8e92df4682c57383b7de5534e05c35bd3254cc4f6c06b683120c",
+          "bytes": 1848
+        }
+      }
+    }
+  ],
+  "eight_noisy_files_pooled": {
+    "cases": 8,
+    "samples": 2768157,
+    "duration_s": 173.0098125,
+    "tokens": 13845,
+    "tokens_matching_official": 12796,
+    "full_fpga_vs_official_l2": 0.23940545465201624,
+    "token_only_cpu_vs_official_l2": 0.23874903815773987,
+    "same_token_fpga_decoder_vs_cpu_l2": 0.03706965290779868,
+    "decoder_error_relative_to_official_energy": 0.03664364676128248,
+    "token_decoder_error_cosine": -0.058802790538984226,
+    "error_interaction": "cancellation",
+    "component_energy_cancelled_fraction": 0.017634903670281598,
+    "component_energy_reinforced_fraction": 0.0,
+    "reference_energy": 14741.102485210144,
+    "same_token_cpu_energy": 14404.238452264679,
+    "token_error_energy": 840.2591043544284,
+    "decoder_error_energy": 19.793716308579356,
+    "full_error_energy": 844.885872019261,
+    "two_error_cross_term": -15.166948643746116
+  },
+  "eight_noisy_files_threshold_counts": {
+    "conditional_decoder_below_10pct": 8,
+    "token_induced_below_10pct": 0,
+    "end_to_end_below_10pct": 0
+  },
+  "short_clip_separate": true,
+  "conclusions": [
+    "All eight long noisy files have conditional decoder L2 below 10%; pooled 3.7070%.",
+    "The separate p232_007 short clip has 12.2874% conditional decoder error, so below 10% is not a universal property.",
+    "None of the nine files achieves below 10% full-model waveform L2.",
+    "Conditional decoder L2 is a component diagnostic, not an alternative success claim for the end-to-end 10% target.",
+    "Exact downstream matching at the existing long-file FPGA tokens would leave 23.8749% pooled token-induced waveform error."
+  ],
+  "artifact_paths": "Every files/provenance path is relative to the repository root. New same-token CPU decodes and their records are stored here; existing tracked validation artifacts are reused by SHA256. Historical original_artifact_provenance paths are informational and are never loaded by the reproducer."
+}

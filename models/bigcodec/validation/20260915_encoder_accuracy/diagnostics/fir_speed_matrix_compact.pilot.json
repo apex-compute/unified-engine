@@ -1,0 +1,14 @@
+{
+  "name": "p232_007_matrix_compact",
+  "relative_l2": 0.19142382414239245,
+  "processing_rtf": 6.584129623821261,
+  "startup_inclusive_rtf": 9.025099458171765,
+  "native_s": 25.8762111327832,
+  "tokens_equal": 308,
+  "tokens": 317,
+  "matrix_production_samples_bitidentical": false,
+  "matrix_production_tokens_bitidentical": false,
+  "bin_sha256": "c55ac7f9a6f238dd04020fc2dcf8f37edf7fd3eebead7625d906509ace2461ee",
+  "metrics_sha256": "99d441ba37818699bb076c66ab76afb95971bec6d7efcc1cc34768987aafe908",
+  "comparison_sha256": "70a6058269c221438bee2d02856116002401a105e05f9bf7bfc62b877be94101"
+}

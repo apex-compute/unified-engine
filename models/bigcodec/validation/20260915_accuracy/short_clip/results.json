@@ -1,0 +1,431 @@
+{
+  "format": "bigcodec-short-clip-error-decomposition-v1",
+  "conclusion": "Both candidates regress full waveform L2 versus the old optimized BF16 run on this clip; lower component errors do not imply lower total error.",
+  "selected_for_long_noisy_evaluation": "split_decoder",
+  "scope": "Measured saved FPGA waveforms and actual FPGA token IDs; official FP32 CPU reference and conditional CPU decodes. Whole utterance, original sample indices, no delay, gain or polarity fit.",
+  "audio": {
+    "format": "bigcodec-tokens-v1",
+    "sample_rate": 16000,
+    "hop_length": 200,
+    "source_rate": 48000,
+    "source_channels": 1,
+    "source_samples": 189883,
+    "native_samples": 63295,
+    "padded_samples": 63400,
+    "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+    "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9"
+  },
+  "input": {
+    "path": "audio/input.wav",
+    "sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211",
+    "bytes": 379810,
+    "original_repository_path": "test_samples/p232_007.wav"
+  },
+  "reference": {
+    "wav": {
+      "path": "audio/official_cpu.wav",
+      "sha256": "08b449c8be5bad1fabb6cde8cd91736162532144fc30c2b31d279cbfef229c99",
+      "bytes": 759612,
+      "original_repository_path": "models/bigcodec/validation/20260914_optimized_italy/p232_007_cpu.wav"
+    },
+    "tokens": {
+      "path": "tokens/official_cpu.tokens.npz",
+      "sha256": "dbd0b73fab28be43a6edd208948a61629bba3a6812107ef7654fe412a87b295f",
+      "bytes": 1387,
+      "original_repository_path": "models/bigcodec/validation/20260914_optimized_italy/p232_007_cpu.tokens.npz"
+    },
+    "run_record": {
+      "path": "records/official_cpu.metrics.json",
+      "sha256": "ea8b1b300b3e8e92df4682c57383b7de5534e05c35bd3254cc4f6c06b683120c",
+      "bytes": 1848,
+      "original_repository_path": "models/bigcodec/validation/20260914_optimized_italy/p232_007_cpu.metrics.json"
+    }
+  },
+  "checkpoint": {
+    "repository": "https://huggingface.co/Alethia/BigCodec",
+    "revision": "c6548832eda95a09dcc3485d9b8ef097ce15f387",
+    "file": "bigcodec.pt",
+    "bytes": 637937326,
+    "sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+    "license": "CC-BY-SA-4.0",
+    "url": "https://huggingface.co/Alethia/BigCodec/resolve/c6548832eda95a09dcc3485d9b8ef097ce15f387/bigcodec.pt",
+    "sha256_verified_from_local_file": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9"
+  },
+  "official_model_source": {
+    "repository": "https://github.com/Aria-K-Alethia/BigCodec",
+    "revision": "09845ab1f5bc7a3d1589c16de820ef15bc2afefe",
+    "license": "MIT",
+    "source_directory": "vq",
+    "vendored_directory": "bigcodec_vq",
+    "upstream_sha256": {
+      "__init__.py": "f3008a83bbbb66ad6c5e88387397b6e7a7a3fdc92660006072385b9e8398a83c",
+      "activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+      "alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+      "alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac",
+      "alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+      "alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+      "codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+      "codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+      "factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+      "module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+      "residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656"
+    },
+    "vendored_sha256": {
+      "__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+      "activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+      "alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+      "alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac",
+      "alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+      "alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+      "codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+      "codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+      "factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+      "module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+      "residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656"
+    },
+    "modifications": {
+      "__init__.py": "Replace two absolute vq imports with relative imports."
+    }
+  },
+  "source_decomposition_record": {
+    "path": "records/actual_split_error_decomposition.json",
+    "sha256": "32bc1f71f9d02fab1ec7741b95d1966f82b2fa93ffdc179641c59cd7b7a0da6b",
+    "bytes": 5781,
+    "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/actual_split_error_decomposition.json"
+  },
+  "hardware": {
+    "location": "Italy",
+    "target": "Kintex UltraScale+ KU5P",
+    "board": "RK",
+    "axi_data_width_bits": 256,
+    "version": "0x40519e0a",
+    "execution": "One whole-utterance START/HALT; one resident model/program upload, one input upload, one bundled output read; zero CPU neural operations."
+  },
+  "definitions": {
+    "y": "Official FP32 encoder/quantizer/decoder reconstruction from the input.",
+    "z": "Official FP32 CPU decoder reconstruction from this variant's actual FPGA token IDs.",
+    "f": "Saved actual FPGA waveform for this variant.",
+    "full_fpga_vs_official_l2": "sqrt(sum((f-y)^2) / sum(y^2))",
+    "token_only_cpu_vs_official_l2": "sqrt(sum((z-y)^2) / sum(y^2))",
+    "same_token_fpga_decoder_vs_cpu_l2": "sqrt(sum((f-z)^2) / sum(z^2))",
+    "decoder_error_relative_to_official_energy": "sqrt(sum((f-z)^2) / sum(y^2))",
+    "two_error_cross_term": "2 * sum((z-y) * (f-z))",
+    "token_decoder_error_cosine": "sum((z-y)*(f-z)) / sqrt(sum((z-y)^2) * sum((f-z)^2))",
+    "energy_identity": "sum((f-y)^2) = sum((z-y)^2) + sum((f-z)^2) + 2*sum((z-y)*(f-z))",
+    "waveform_units": "SoundFile normalized amplitude; exact stored samples loaded float32, then all metric calculations float64.",
+    "tokens_matching_official": "Equal integer code IDs at the same frame index, out of all 317 frames; no token sequence alignment."
+  },
+  "limitations": [
+    "The conditional decoder comparison uses a different z in each row because token sequences differ; it does not hold decoder inputs fixed across variants.",
+    "f includes device codebook-feature/projection rounding as well as decoder arithmetic. Thus same-token error measures the complete downstream device path conditional on the code IDs.",
+    "Error percentages have different denominators and do not add. Cancellation can lower total error despite large component errors.",
+    "This is one short noisy speech clip and measures agreement with the CPU codec, not denoising quality, perceptual quality, or generalization to longer audio.",
+    "Large checkpoint/bin files are hash-bound but not included; the packaged metric reproduction requires no model or hardware."
+  ],
+  "variants": [
+    {
+      "name": "old_baseline",
+      "tokens_matching_official": 301,
+      "frames": 317,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.19286676445996756,
+        "token_only_cpu_vs_official_l2": 0.4312044303736015,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.34953867124958404,
+        "decoder_error_relative_to_official_energy": 0.35115606803857435,
+        "reference_energy": 1017.8849314437322,
+        "same_token_cpu_energy": 1027.3267066586575,
+        "full_error_energy": 37.86286515941154,
+        "token_error_energy": 189.2627359355973,
+        "decoder_error_energy": 125.5159854635902,
+        "two_error_cross_term": -276.91585623977335,
+        "token_decoder_error_cosine": -0.8983296860127663,
+        "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+      },
+      "files": {
+        "fpga_wav": {
+          "path": "audio/old_baseline_fpga.wav",
+          "sha256": "9cba6c51c5466319b7397233f51c12fbedb9595735db6488922cbed714c77994",
+          "bytes": 759612,
+          "original_repository_path": "models/bigcodec/validation/20260914_optimized_italy/p232_007_optimized_bf16_fpga.wav"
+        },
+        "same_token_cpu_wav": {
+          "path": "audio/old_baseline_same_tokens_cpu.wav",
+          "sha256": "2b885e5b66011bb0f8da6774ff7857612d61f7d8e78dd7b139705897029439a5",
+          "bytes": 759612,
+          "original_repository_path": "models/bigcodec/validation/20260914_optimized_italy/p232_007_optimized_bf16_fpga_same_tokens_cpu.wav"
+        },
+        "actual_tokens": {
+          "path": "tokens/old_baseline.tokens.npz",
+          "sha256": "34da5227f77c3f643159facff138f27827176c9555631c81629032ecf9d07044",
+          "bytes": 1386,
+          "original_repository_path": "models/bigcodec/validation/20260914_optimized_italy/p232_007_optimized_bf16_fpga.tokens.npz"
+        }
+      },
+      "artifact": {
+        "repository_path": "models/bigcodec/bigcodec_bin/bigcodec-p232_007-sram-v4-bf16.bin",
+        "sha256": "884e3ba74075e5b5b344e6c834894d7a7c8a30fd437835cbd47a9fe41ba70706",
+        "file_bytes": 415291119,
+        "included_in_package": false,
+        "sha256_verified_from_local_file": true,
+        "parameter_bytes": 331251584,
+        "program_bytes": 83998976,
+        "resident_bytes": 415250560,
+        "instructions": 2624968,
+        "settings": {
+          "lstm_cell": "bf16",
+          "lstm_tanh": "bf16",
+          "lstm_math_scope": null,
+          "lstm_fused_gates": false,
+          "center_quantizer_scores": false,
+          "compensated_codebook": false,
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_recurrent_weights": {
+            "encoder": "BF16",
+            "decoder": "BF16"
+          }
+        },
+        "approximation": {
+          "snake_argument_clamp": 100.53096491487338,
+          "snake_sine_squared_polynomial_degree": 10,
+          "snake_storage": "BF16",
+          "alias_free_filters": "symmetric BF16, exact unit DC, nearest L2 within +/-2 ULP",
+          "broadcast_scalars": "BF16 round-to-nearest-even before device encoding",
+          "tanh": "BF16 odd Pade [7/6] with native reciprocal",
+          "tanh_argument_clamp": 4.0,
+          "tanh_output_clamp": [
+            -1,
+            1
+          ],
+          "quantizer": "BF16 nearest normalized-codebook tournament",
+          "accuracy_status": "requires comparison with the official CPU model"
+        }
+      },
+      "fpga_run_record": {
+        "path": "records/old_baseline_fpga.metrics.json",
+        "sha256": "1394840a37b53c07cd5942951edfdce1577a413bc11271fd6c88cf38b3715c0b",
+        "bytes": 2826,
+        "original_repository_path": "models/bigcodec/validation/20260914_optimized_italy/p232_007_optimized_bf16_fpga.metrics.json"
+      },
+      "same_token_cpu_run_record": {
+        "path": "records/old_baseline_same_tokens_cpu.metrics.json",
+        "sha256": "a2e373eb336adc96f8b917ee38fdbea5543debe3cfe084498315614d6b86f7ff",
+        "bytes": 1359,
+        "original_repository_path": "models/bigcodec/validation/20260914_optimized_italy/p232_007_optimized_bf16_fpga_same_tokens_cpu.metrics.json"
+      },
+      "compile_record": {
+        "path": "records/old_baseline.compile.json",
+        "sha256": "8271e4255e4387bd62f02a742954d6efd1e16bdcf890132fd236915ed2ac5e3a"
+      }
+    },
+    {
+      "name": "split_both",
+      "tokens_matching_official": 307,
+      "frames": 317,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.2186707225415156,
+        "token_only_cpu_vs_official_l2": 0.16619494124843395,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.12472497687689564,
+        "decoder_error_relative_to_official_energy": 0.12435638028508059,
+        "reference_energy": 1017.8849314437322,
+        "same_token_cpu_energy": 1011.8775617447427,
+        "full_error_energy": 48.67208660506111,
+        "token_error_energy": 28.11475386870546,
+        "decoder_error_energy": 15.74109100656395,
+        "two_error_cross_term": 4.816241729791798,
+        "token_decoder_error_cosine": 0.11447053769496093,
+        "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+      },
+      "files": {
+        "fpga_wav": {
+          "path": "audio/split_both_fpga.wav",
+          "sha256": "ee90316c67ca9bda6bd64552df10f4c98effe858eca2803c38fe3e42e98f1b78",
+          "bytes": 759612,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_split_both_bf16.wav"
+        },
+        "same_token_cpu_wav": {
+          "path": "audio/split_both_same_tokens_cpu.wav",
+          "sha256": "5349ef9fd5103190ca151bafbc90da2620626f70d34891d35170aa6dd5d5556a",
+          "bytes": 759612,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_split_both_same_tokens_cpu.wav"
+        },
+        "actual_tokens": {
+          "path": "tokens/split_both.tokens.npz",
+          "sha256": "b973ee1e0ae06eeb2b697a1d6ba0a9cd949a104be6d9c0d91cb70e5b774efb07",
+          "bytes": 1387,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_split_both_bf16.tokens.npz"
+        }
+      },
+      "artifact": {
+        "repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_split_both_bf16.bin",
+        "sha256": "3921b10dfd5a0d8575af0a9c6422fb20f7e6363770a8d816fc07ee1420962aab",
+        "file_bytes": 475924527,
+        "included_in_package": false,
+        "sha256_verified_from_local_file": true,
+        "parameter_bytes": 331267968,
+        "program_bytes": 144615488,
+        "resident_bytes": 475883456,
+        "instructions": 4519234,
+        "settings": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_cell": "compensated",
+          "lstm_tanh": "compensated",
+          "lstm_math_scope": "both",
+          "lstm_fused_gates": true,
+          "center_quantizer_scores": true,
+          "compensated_codebook": true,
+          "lstm_recurrent_weights": {
+            "encoder": "BF16",
+            "decoder": "BF16"
+          }
+        },
+        "approximation": {
+          "snake_argument_clamp": 100.53096491487338,
+          "snake_sine_squared_polynomial_degree": 10,
+          "snake_storage": "BF16",
+          "alias_free_filters": "symmetric BF16, exact unit DC, nearest L2 within +/-2 ULP",
+          "broadcast_scalars": "BF16 round-to-nearest-even before device encoding",
+          "tanh": "BF16 odd Pade [7/6] with native reciprocal",
+          "lstm_tanh": "BF16 high/low Pade coefficients, products and sums with reciprocal refinement",
+          "tanh_argument_clamp": 4.0,
+          "tanh_output_clamp": [
+            -1,
+            1
+          ],
+          "quantizer": "BF16 nearest normalized-codebook tournament",
+          "quantizer_score_offset_before_writeback": -1,
+          "quantizer_codebook_residual_lanes": 8,
+          "accuracy_status": "requires comparison with the official CPU model"
+        }
+      },
+      "fpga_run_record": {
+        "path": "records/split_both_fpga.metrics.json",
+        "sha256": "4024b5424e7a06e19abcb7b22d7b99bb3096eb08258b1e4a8714df47343afb07",
+        "bytes": 3340,
+        "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_split_both_bf16.metrics.json"
+      },
+      "same_token_cpu_run_record": {
+        "path": "records/split_both_same_tokens_cpu.metrics.json",
+        "sha256": "060902fb3b8fa87911b1d5ec9ca681da0ae0898e05691243c16b781c1d7e6faa",
+        "bytes": 1834,
+        "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_split_both_same_tokens_cpu.metrics.json"
+      },
+      "compile_record": {
+        "path": "records/split_both.compile.json",
+        "sha256": "02d3eb22c241f5580f619423fb3f01fa179b190d3b9acf5f28babeb20f8c5843"
+      }
+    },
+    {
+      "name": "split_decoder",
+      "tokens_matching_official": 310,
+      "frames": 317,
+      "metrics": {
+        "full_fpga_vs_official_l2": 0.20006853400886163,
+        "token_only_cpu_vs_official_l2": 0.14180114564594393,
+        "same_token_fpga_decoder_vs_cpu_l2": 0.1228742458222464,
+        "decoder_error_relative_to_official_energy": 0.1228387769513902,
+        "reference_energy": 1017.8849314437322,
+        "same_token_cpu_energy": 1017.2973710780831,
+        "full_error_energy": 40.743305932628246,
+        "token_error_energy": 20.46718732635539,
+        "decoder_error_energy": 15.359237383666143,
+        "two_error_cross_term": 4.916881222606768,
+        "token_decoder_error_cosine": 0.13865828136110003,
+        "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+      },
+      "files": {
+        "fpga_wav": {
+          "path": "audio/split_decoder_fpga.wav",
+          "sha256": "674638d90e55d7d67f921c807d6c7fbf9799e8028a63f970aad5b2c9e755ca8d",
+          "bytes": 759612,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_split_decoder_bf16.wav"
+        },
+        "same_token_cpu_wav": {
+          "path": "audio/split_decoder_same_tokens_cpu.wav",
+          "sha256": "96c6a2bcbeb7df0a7bc7967a79517d10bdfdda9f93bc364e739f88dc60bf9ccb",
+          "bytes": 759612,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_split_decoder_same_tokens_cpu.wav"
+        },
+        "actual_tokens": {
+          "path": "tokens/split_decoder.tokens.npz",
+          "sha256": "7d2a292de36b75c56863194c3a6b0b54bcdc1946b7a1210940feab5bb0522fe0",
+          "bytes": 1387,
+          "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_split_decoder_bf16.tokens.npz"
+        }
+      },
+      "artifact": {
+        "repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_split_decoder_bf16.bin",
+        "sha256": "200351f4fab341135fcd9675522ce68dae5d2b40190b7398329591b9a67076dc",
+        "file_bytes": 445631471,
+        "included_in_package": false,
+        "sha256_verified_from_local_file": true,
+        "parameter_bytes": 331267968,
+        "program_bytes": 114322432,
+        "resident_bytes": 445590400,
+        "instructions": 3572576,
+        "settings": {
+          "convolutions": "BF16",
+          "activations": "BF16",
+          "lstm_input_weights": "BF16",
+          "lstm_cell": "compensated",
+          "lstm_tanh": "compensated",
+          "lstm_math_scope": "decoder",
+          "lstm_fused_gates": true,
+          "center_quantizer_scores": true,
+          "compensated_codebook": true,
+          "lstm_recurrent_weights": {
+            "encoder": "BF16",
+            "decoder": "BF16"
+          }
+        },
+        "approximation": {
+          "snake_argument_clamp": 100.53096491487338,
+          "snake_sine_squared_polynomial_degree": 10,
+          "snake_storage": "BF16",
+          "alias_free_filters": "symmetric BF16, exact unit DC, nearest L2 within +/-2 ULP",
+          "broadcast_scalars": "BF16 round-to-nearest-even before device encoding",
+          "tanh": "BF16 odd Pade [7/6] with native reciprocal",
+          "lstm_tanh": "BF16 high/low Pade coefficients, products and sums with reciprocal refinement",
+          "tanh_argument_clamp": 4.0,
+          "tanh_output_clamp": [
+            -1,
+            1
+          ],
+          "quantizer": "BF16 nearest normalized-codebook tournament",
+          "quantizer_score_offset_before_writeback": -1,
+          "quantizer_codebook_residual_lanes": 8,
+          "accuracy_status": "requires comparison with the official CPU model"
+        }
+      },
+      "fpga_run_record": {
+        "path": "records/split_decoder_fpga.metrics.json",
+        "sha256": "9310756b6afa51550106c53d19e6be7a3e9953a50c5ce6430bc4ab5bb66cc8f8",
+        "bytes": 3343,
+        "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_split_decoder_bf16.metrics.json"
+      },
+      "same_token_cpu_run_record": {
+        "path": "records/split_decoder_same_tokens_cpu.metrics.json",
+        "sha256": "b074aefeaac5f91cda04d84c04e4a9e6a73954b45c0fe9a0cec0d575f5b71770",
+        "bytes": 1838,
+        "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/p232_007_split_decoder_same_tokens_cpu.metrics.json"
+      },
+      "compile_record": {
+        "path": "records/split_decoder.compile.json",
+        "sha256": "43500b8ce9e713b7faac95529f2ded8c853347910bec8ada1f7cfa953ab1705d"
+      }
+    }
+  ],
+  "supplemental_score_tree_diagnostic": {
+    "path": "records/vq_tree_comparison.json",
+    "sha256": "ffee2f4c9b6ae2ef5552bacf65325e3ebe4b9f1291120049595cfdfcdcac9192",
+    "original_repository_path": "models/bigcodec/bigcodec_bin/accuracy_20260915/vq_tree_comparison.json",
+    "dataset_mapping": {
+      "baseline": "split_decoder",
+      "accurate": "split_both"
+    },
+    "scope": "CPU translation of local 5fbb/df0749 RTL, validated against saved 0x40519e0a token IDs; no new hardware. Intermediate input tensors are excluded from this compact package. This supplemental model calculation is not rerun by reproduce.py."
+  }
+}

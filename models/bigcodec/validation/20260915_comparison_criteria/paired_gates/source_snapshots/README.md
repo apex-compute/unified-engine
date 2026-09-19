@@ -1,0 +1,3 @@
+These files are byte-identical snapshots of the experimental scripts listed in `../source_manifest.json`. Their original relative path calculations and ignored-helper imports are deliberately preserved. They document the exact arithmetic and compiler used for the saved artifacts, but moving them into this directory does not make them directly runnable.
+
+Use `../reproduce.py` for the portable offline evidence check. The source manifest explicitly lists omitted historical modules/tensors needed by the original native harness and CPU controls. No native rerun or full-bin reproduction from these snapshots alone is claimed.

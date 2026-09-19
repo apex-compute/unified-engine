@@ -1,0 +1,42 @@
+{
+  "name": "decoder_gate_pair_baseline",
+  "instructions": 1200696,
+  "halt_index": 1200694,
+  "program_bytes": 38422272,
+  "resident_bytes": 113977216,
+  "program_sha256": "26ce0712e877ef3f0872298aabd0be141b99bb60fd3f6ab3cb931f897087622a",
+  "resident_sha256": "279428c1c09a3f111b78bd73161cc8e2d20c82cbd3d4d924ed584f55add2986f",
+  "input_sha256": "66242b3fbc6279796be42664c97e58c00a740d69e6a7773aade20ed42dbd4cd9",
+  "hardware_executed": true,
+  "scope": "Diagnostic only: paired sigmoid gates; no production source is modified.\n\nOffline self-test/capture is default. Root alone may explicitly pass --execute.\nDots store BF16 logits before paired sigmoid, unlike the current fused SFU path.\n",
+  "mode": "baseline",
+  "source_fp32_sha256": "c0c87fef98989b446b02bcaeaa9b300642586c397d27563e6ddea17e7c6873f2",
+  "expected_model": "FP32 accumulation approximation, not native dot parity",
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "hardware_version": "0x90f1f464",
+  "host_s": 1.9493373069999507,
+  "fpga_s": 1.9497696504126034,
+  "fpga_cycles": 649760736,
+  "starts": 1,
+  "halts": 1,
+  "finite": true,
+  "guards_intact": true,
+  "input_unchanged": true,
+  "output_sha256": "d1a820c062c51057c3d76a9c7f7dde988f9b442c8ff37cb1489e36b96b8bef9d",
+  "vs_offline_fp32_dot_control": {
+    "relative_l2": 0.003856134792801504,
+    "max_abs": 0.03515625,
+    "exact_mismatches": 183859
+  },
+  "vs_official_fp32": {
+    "relative_l2": 0.00954106338714414,
+    "max_abs": 0.1368178129196167,
+    "exact_mismatches": 486908
+  },
+  "passed": true,
+  "guarded_execution_passed": true,
+  "accuracy_accepted": false,
+  "pass_scope": "Finite guarded execution and broad offline-control sanity bound only; not an accuracy acceptance",
+  "baseline_matches_corrected_native_golden": true,
+  "baseline_golden_sha256": "2a4fa842a9cc56ccd4343d7a31628e884dfdb1c9224ed3ec515480f2c0091d94"
+}

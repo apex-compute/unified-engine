@@ -1,0 +1,61 @@
+{
+  "passed": true,
+  "scope": "offline exact raw ISA port equivalence; not a new hardware run",
+  "prototype_native_validation": "loop_decoder_baseline_native.json and loop_decoder_candidate_native.json",
+  "source_sha256": {
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_lstm_loop.py": "50ee2f20f3399a7c09b076bf4651ca929e1d4848c8571830d47f2ad45455a65f",
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_next_20260915/loop_lstm.py": "51fb7ef22981a95e4df3d3e16dd6e41d586a490408ed3213a029712421af8d56",
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_lstm.py": "29c825ab0e34bf242b1649ebe622e775b24db1f5657226f96a0fd36cbe7e9bdc",
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_sigmoid.py": "bbc061f44f5001cc9e3e6405499c1ab509be650ddaf1a7a9ac0b0721f7df2b78",
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_tanh.py": "998f37fc5c982933ca0cd0eded6a075f20d85b33b3ffaa67aed07f6fc5dc7df5",
+    "/home/hunlu/apexcompute/unified-engine/user_dma_core.py": "b213f8dcd0a94fba6d60196d134e2506dc578c3e961672242989640c6484a992",
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_next_20260915/loop_port_check.py": "284b5d6d2c22eb894a2f2f3c9f4663dfc1ddc65ced79f5b8074b80a777811529"
+  },
+  "cases": [
+    {
+      "width": 65,
+      "sequence": 5,
+      "mode": "legacy",
+      "program_bytes": 10944,
+      "parameter_bytes": 528384,
+      "instruction_sha256": "44a987909ad8d24e70f0b46408ec173010815863c87c771e5db63b7c80871bfe",
+      "exact_all_instruction_bytes": true
+    },
+    {
+      "width": 64,
+      "sequence": 5,
+      "mode": "current",
+      "program_bytes": 211392,
+      "parameter_bytes": 133120,
+      "instruction_sha256": "14a4d72ed46b8b70c75cf26511d3765a6ee84707264b0d4d312f50ad077f2872",
+      "exact_all_instruction_bytes": true
+    },
+    {
+      "width": 1536,
+      "sequence": 317,
+      "mode": "current",
+      "program_bytes": 1257280,
+      "parameter_bytes": 75546624,
+      "instruction_sha256": "04a9fb8f0a6a0c669054c97d27ffd2594e636dc6dd072f1bca6c17e3f09b8337",
+      "exact_all_instruction_bytes": true
+    },
+    {
+      "width": 1536,
+      "sequence": 317,
+      "mode": "paired",
+      "program_bytes": 1603392,
+      "parameter_bytes": 75546624,
+      "instruction_sha256": "03c5293b49279805947aadfc8034adf7ff7cc1ad4f8506442325f5e4faa57b2f",
+      "exact_all_instruction_bytes": true
+    },
+    {
+      "width": 1536,
+      "sequence": 1895,
+      "mode": "paired",
+      "program_bytes": 6545088,
+      "parameter_bytes": 75546624,
+      "instruction_sha256": "8b9a39c15c34d3d33b5e77d0a07b27e697d46d0d0cb11d8323769f270ddd2f40",
+      "exact_all_instruction_bytes": true
+    }
+  ]
+}

@@ -1,0 +1,216 @@
+{
+  "scope": "Offline recompilation after BF16 integration and precision naming. All executable model/program bytes, tensor/state ABI and operation manifests match unchanged deployed bins. Serialized files differ in added metadata, corrected descriptive precision labels and serialization container details; no hardware access or deployment overwrite.",
+  "verified": true,
+  "compile_commands": [
+    "PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 /home/hunlu/my_torch_env/bin/python models/dpdfnet8khz/dpdfnet8khz_compile.py --output /tmp/dpdfnet-named-default-check-8k.bin",
+    "PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 /home/hunlu/my_torch_env/bin/python models/dpdfnet/dpdfnet_compile.py --output /tmp/dpdfnet-named-default-check-16k.bin"
+  ],
+  "compiler_source_sha256": {
+    "models/dpdfnet/dpdfnet_compile.py": "643dde7866aec6e35fdf7307f6035b1065b6ce279eaec6782d47b6ff2fd9a592",
+    "models/dpdfnet8khz/dpdfnet8khz_compile.py": "c5805115f426425570165ce5c424f89b0a30453ff280ccadf0e0060e2e53e1fc",
+    "models/dpdfnet/dpdfnet_bf16_conv.py": "d8fdf37d616a5db88fd2ede7d1d984bffa5573994c0b9018d88bd2e1ad845103"
+  },
+  "models": [
+    {
+      "model_sample_rate": 8000,
+      "model": "dpdfnet2_8khz",
+      "deployed_bin": "models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz-andromeda.bin",
+      "deployed_bin_sha256": "905a12a58b6a556386f225bd9b4d5493013a172200d2de6cd875fdd42cf2637d",
+      "rebuilt_bin": "/tmp/dpdfnet-named-default-check-8k.bin",
+      "rebuilt_bin_sha256": "97fb63cb4b760ca23e58df75ecb652073bc15de05cb618c86f35ed77b453a06a",
+      "serialized_files_identical": false,
+      "model_image_identical": true,
+      "model_image_sha256": "a0940e29d81aedc1860f20ddd60b630f3241e81c0064a4c3877ee861c7d3627f",
+      "program_identical": true,
+      "program_sha256": "d826270ad182dbf7fb79b0f37d07b4d38b8d87fab081c4a0fed02b12282baba3",
+      "program_instructions": 27118,
+      "program_bytes": 867776,
+      "resident_bytes": 23594048,
+      "parameter_and_data_bytes": 22726272,
+      "program_address": 2438645376,
+      "tensor_end": 2960625664,
+      "streaming_abi_identical": true,
+      "streaming_abi": {
+        "inputs": {
+          "spec": [
+            1,
+            1,
+            81,
+            2
+          ],
+          "state_in": [
+            37860
+          ]
+        },
+        "outputs": {
+          "spec_e": [
+            1,
+            1,
+            81,
+            2
+          ],
+          "state_out": [
+            37860
+          ]
+        }
+      },
+      "tensor_manifest_identical": true,
+      "tensor_manifest_sha256": "5c1279e77b114f5fdefad406c5cc8ceae66dd93d1ee61cadafb34aa962f858b8",
+      "state_layouts": {
+        "state_in": {
+          "name": "state_in",
+          "shape": [
+            37860
+          ],
+          "address": 2415919104,
+          "padded_last": 37888,
+          "size_bytes": 75776
+        },
+        "state_out": {
+          "name": "state_out",
+          "shape": [
+            37860
+          ],
+          "address": 2956751104,
+          "padded_last": 37888,
+          "size_bytes": 75776
+        }
+      },
+      "operations_identical": true,
+      "operation_manifest_sha256": "21c7104f7dc511cca64b184a36a00cdf4f4c220cc75b57a4f4fbe7e742c3ad29",
+      "operation_count": 493,
+      "existing_hardware_fields_identical": {
+        "format": true,
+        "onnx_sha256": true,
+        "precision": false,
+        "full_graph": true,
+        "one_halt": true,
+        "stateful": true,
+        "model_base": true,
+        "model_image": true,
+        "model_sha256": true,
+        "program_address": true,
+        "program_offset": true,
+        "program_size": true,
+        "program_sha256": true,
+        "tensor_end": true,
+        "tensors": true,
+        "operations": true,
+        "graph_operations": true,
+        "axi_data_width_bits": true,
+        "dense_convolution_precision": true,
+        "optimizations": true
+      },
+      "added_hardware_metadata": {
+        "dense_convolutions": []
+      },
+      "both_artifacts_pass_loader_validation": true,
+      "changed_descriptive_metadata": {
+        "precision": {
+          "deployed": "BF16/IF8-INT",
+          "rebuilt": "BF16/IF8"
+        }
+      }
+    },
+    {
+      "model_sample_rate": 16000,
+      "model": "dpdfnet2",
+      "deployed_bin": "models/dpdfnet/dpdfnet_bin/dpdfnet2-andromeda.bin",
+      "deployed_bin_sha256": "4f540ae650c27d822f4da24cfb0a0ac7f9cf33e53e84cbd9ce2fc7f1cdd5fc77",
+      "rebuilt_bin": "/tmp/dpdfnet-named-default-check-16k.bin",
+      "rebuilt_bin_sha256": "47e8a09094edaf4e1c8ef6144e9ed870a02b50f54658084ce553d5c61102d27c",
+      "serialized_files_identical": false,
+      "model_image_identical": true,
+      "model_image_sha256": "c997284c3c8ef0a4a82078b3abaf2fa6d33754640b18c061845bf68ee958b59d",
+      "program_identical": true,
+      "program_sha256": "899b85840eacc47bb0c8206dc908dbb7e10de35e54de500e5b06c757a79ae897",
+      "program_instructions": 40264,
+      "program_bytes": 1288448,
+      "resident_bytes": 17863808,
+      "parameter_and_data_bytes": 16575360,
+      "program_address": 2432494464,
+      "tensor_end": 2959968000,
+      "streaming_abi_identical": true,
+      "streaming_abi": {
+        "inputs": {
+          "spec": [
+            1,
+            1,
+            161,
+            2
+          ],
+          "state_in": [
+            45424
+          ]
+        },
+        "outputs": {
+          "spec_e": [
+            1,
+            1,
+            161,
+            2
+          ],
+          "state_out": [
+            45424
+          ]
+        }
+      },
+      "tensor_manifest_identical": true,
+      "tensor_manifest_sha256": "81baa1bb9939cde9a5066c4f8e05fff7faba2366b437eb705cce3fa36b7a464e",
+      "state_layouts": {
+        "state_in": {
+          "name": "state_in",
+          "shape": [
+            45424
+          ],
+          "address": 2415919104,
+          "padded_last": 45440,
+          "size_bytes": 90880
+        },
+        "state_out": {
+          "name": "state_out",
+          "shape": [
+            45424
+          ],
+          "address": 2956920448,
+          "padded_last": 45440,
+          "size_bytes": 90880
+        }
+      },
+      "operations_identical": true,
+      "operation_manifest_sha256": "4483ad56d08523d0f8a3e5bc373d9ffbbabb5d5d6398cbad7368c619af9a858b",
+      "operation_count": 473,
+      "existing_hardware_fields_identical": {
+        "format": true,
+        "onnx_sha256": true,
+        "precision": false,
+        "full_graph": true,
+        "one_halt": true,
+        "stateful": true,
+        "model_base": true,
+        "model_image": true,
+        "model_sha256": true,
+        "program_address": true,
+        "program_offset": true,
+        "program_size": true,
+        "program_sha256": true,
+        "tensor_end": true,
+        "tensors": true,
+        "operations": true,
+        "graph_operations": true
+      },
+      "added_hardware_metadata": {
+        "dense_convolution_precision": "IF4/IF8",
+        "dense_convolutions": []
+      },
+      "both_artifacts_pass_loader_validation": true,
+      "changed_descriptive_metadata": {
+        "precision": {
+          "deployed": "BF16/IF8-INT",
+          "rebuilt": "BF16/IF4/IF8"
+        }
+      }
+    }
+  ],
+  "updated_at_utc": "2026-09-14T21:21:57.073940+00:00"
+}

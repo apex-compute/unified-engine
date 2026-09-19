@@ -1,0 +1,86 @@
+{
+  "case": "psquare_low_snr",
+  "recurrent_precision": "bf16",
+  "variant": "selected",
+  "samples": 344406,
+  "sample_rate": 16000,
+  "padded_samples": 344600,
+  "frames": 1723,
+  "tokens_matching_official": 1620,
+  "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+  "source_files_sha256": {
+    "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+    "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+    "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+    "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+    "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+    "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+    "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+    "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac"
+  },
+  "metrics": {
+    "full_fpga_vs_official_l2": 0.22653435945610625,
+    "token_only_cpu_vs_official_l2": 0.222751843313172,
+    "same_token_fpga_decoder_vs_cpu_l2": 0.038054292128088175,
+    "decoder_error_relative_to_official_energy": 0.037492091202514885,
+    "reference_energy": 2138.47296125845,
+    "same_token_cpu_energy": 2075.7535891179627,
+    "full_error_energy": 109.7417619771777,
+    "token_error_energy": 106.10757192254798,
+    "decoder_error_energy": 3.005959279310858,
+    "two_error_cross_term": 0.6282307753188593,
+    "two_error_cross_term_relative_to_reference_energy": 0.00029377541203474354,
+    "token_decoder_error_cosine": 0.017588324797697067,
+    "error_interaction": "reinforcement",
+    "fraction_of_component_energy_cancelled": -0.005757588159773138,
+    "scalar_identity_residual": 1.4210854715202004e-14,
+    "vector_identity_max_abs_residual": 0.0,
+    "identity": "full_error_energy = token_error_energy + decoder_error_energy + two_error_cross_term"
+  },
+  "cpu_decode_s": 25.858873155000765,
+  "cpu_decode_rtf": 1.201320448772705,
+  "cache_reuse": null,
+  "files": {
+    "fpga_wav": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.wav",
+      "sha256": "02595b5fd28067eb36e3cc61becef89b209ee9aa9c9ccae3f0772322fa037dd9",
+      "bytes": 1377704
+    },
+    "actual_tokens": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.tokens.npz",
+      "sha256": "c8c8e552cab65740bc71e440be1eaa12b1c6418dd5e0a26c18c3865bf3505327",
+      "bytes": 3886
+    },
+    "fpga_metrics": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.metrics.json",
+      "sha256": "3c852754f2c9a2576256d2296bc5719d2a4d0561e65af40d312445b088c3cf63",
+      "bytes": 3404
+    },
+    "fpga_comparison": {
+      "path": "models/bigcodec/validation/20260915_accuracy/decoder/fpga_bf16/psquare_low_snr.comparison.json",
+      "sha256": "9b1eb4192c4be99b13bbc9c2466dbd66d088826cf0a856b86aa9feea44edcf2e",
+      "bytes": 1765
+    },
+    "same_token_cpu_wav": {
+      "path": "models/bigcodec/bigcodec_bin/accuracy_20260915/conditional_noisy20s/psquare_low_snr_bf16_selected_same_tokens_cpu.wav",
+      "sha256": "b6244d8b6f27394e04574f69fdfc597c1c255df8d4ba03d7e6061d875628b6ff",
+      "bytes": 1377704
+    },
+    "reference_wav": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.wav",
+      "sha256": "826e7429ed6117f0cff4e08d85b488c357272ce007b7410f8b113293f7d8385b",
+      "bytes": 1377704
+    },
+    "official_tokens": {
+      "path": "models/bigcodec/validation/20260914_noisy20s/cpu/psquare_low_snr.tokens.npz",
+      "sha256": "a72b391be15694edd578b02df15f42df6dbceb65adf34bc2adfab9dbfec0c466",
+      "bytes": 3866
+    }
+  },
+  "fpga_rtf": 4.82517178413874,
+  "fpga_audio_processing_s": 103.86363209300544
+}

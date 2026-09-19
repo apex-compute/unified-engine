@@ -1,0 +1,53 @@
+{
+  "status": "PASS",
+  "cases": [
+    {
+      "width": 64,
+      "source": 0,
+      "exact_components": true,
+      "preserved_other_sram": true,
+      "max_abs": 0.00032573449425399303
+    },
+    {
+      "width": 64,
+      "source": 3072,
+      "exact_components": true,
+      "preserved_other_sram": true,
+      "max_abs": 0.00032573449425399303
+    },
+    {
+      "width": 64,
+      "source": 9216,
+      "exact_components": true,
+      "preserved_other_sram": true,
+      "max_abs": 0.00032573449425399303
+    },
+    {
+      "width": 1536,
+      "source": 0,
+      "exact_components": true,
+      "preserved_other_sram": true,
+      "max_abs": 0.00032573449425399303
+    },
+    {
+      "width": 1536,
+      "source": 3072,
+      "exact_components": true,
+      "preserved_other_sram": true,
+      "max_abs": 0.00032573449425399303
+    },
+    {
+      "width": 1536,
+      "source": 9216,
+      "exact_components": true,
+      "preserved_other_sram": true,
+      "max_abs": 0.00032573449425399303
+    },
+    {
+      "width": 1536,
+      "joint_step_exact": true,
+      "cell_high_low_and_hidden_verified": true
+    }
+  ],
+  "scope": "Paired sigmoid components and joint gate/cell/hidden step versus independent BF19-to-BF16 CPU equations; actual identity bytes and SRAM preservation checked"
+}

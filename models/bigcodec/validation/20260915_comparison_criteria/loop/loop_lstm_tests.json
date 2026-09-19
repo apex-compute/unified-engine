@@ -1,0 +1,403 @@
+{
+  "status": "PASS",
+  "hardware_executed": false,
+  "scope": "Offline exact primitive-trace equivalence and native ISA capture for timestep loops.",
+  "cases": [
+    {
+      "mode": "legacy",
+      "width": 65,
+      "sequence": 1,
+      "parameter_bytes": 528384,
+      "exact_primitive_trace_and_addresses": true,
+      "all_output_rows_once": true,
+      "primitive_events": 155,
+      "trace_sha256": "e6d56eae1006913852064200de419863d4c3a2d3356d780060d0ebceef1576f5",
+      "capture": {
+        "instructions": 168,
+        "bytes": 5376,
+        "sha256": "b7ee5a3b29b56d9bbfd1ded37da2ea030090f795abebbabebf1505363e09cbbc",
+        "max_register": 0,
+        "outer_loops": 0,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      },
+      "unrolled": {
+        "instructions": 168,
+        "bytes": 5376,
+        "sha256": "b7ee5a3b29b56d9bbfd1ded37da2ea030090f795abebbabebf1505363e09cbbc",
+        "max_register": 0,
+        "outer_loops": 0,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    },
+    {
+      "mode": "legacy",
+      "width": 65,
+      "sequence": 2,
+      "parameter_bytes": 528384,
+      "exact_primitive_trace_and_addresses": true,
+      "all_output_rows_once": true,
+      "primitive_events": 291,
+      "trace_sha256": "5c0af3848f9f8af5fb33af0825d42e8833217822bb81a1435cbb8bc475bcde0c",
+      "capture": {
+        "instructions": 336,
+        "bytes": 10752,
+        "sha256": "5615967ba5530ee66db2d0b9d7ccd03d1f9173b1150e66331d90f80630ba9d67",
+        "max_register": 5,
+        "outer_loops": 2,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      },
+      "unrolled": {
+        "instructions": 306,
+        "bytes": 9792,
+        "sha256": "10c6926924d3f948362cc3858687ecf3e49be6d36be6623287a9f91e91c5fb18",
+        "max_register": 0,
+        "outer_loops": 0,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    },
+    {
+      "mode": "legacy",
+      "width": 65,
+      "sequence": 5,
+      "parameter_bytes": 528384,
+      "exact_primitive_trace_and_addresses": true,
+      "all_output_rows_once": true,
+      "primitive_events": 699,
+      "trace_sha256": "ed81c51e1c887207059c841f3ca734da97697a3c24aed177a96a6359adae3efb",
+      "capture": {
+        "instructions": 342,
+        "bytes": 10944,
+        "sha256": "44a987909ad8d24e70f0b46408ec173010815863c87c771e5db63b7c80871bfe",
+        "max_register": 5,
+        "outer_loops": 2,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      },
+      "unrolled": {
+        "instructions": 720,
+        "bytes": 23040,
+        "sha256": "e9b598645c849beb90eed66da6467bc84caae37f94c28cb1ed8db62cfc3c46ba",
+        "max_register": 0,
+        "outer_loops": 0,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    },
+    {
+      "mode": "current",
+      "width": 64,
+      "sequence": 1,
+      "parameter_bytes": 133120,
+      "exact_primitive_trace_and_addresses": true,
+      "all_output_rows_once": true,
+      "primitive_events": 3275,
+      "trace_sha256": "0443ab2961810d43e30eae33c234d81eccc2eb84aa8c663a235a10535b02beef",
+      "capture": {
+        "instructions": 3288,
+        "bytes": 105216,
+        "sha256": "6c6c8a02cd607c0728e80fd3200e87fe3df2309ad86815ade63b22835797723f",
+        "max_register": 0,
+        "outer_loops": 0,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      },
+      "unrolled": {
+        "instructions": 3288,
+        "bytes": 105216,
+        "sha256": "6c6c8a02cd607c0728e80fd3200e87fe3df2309ad86815ade63b22835797723f",
+        "max_register": 0,
+        "outer_loops": 0,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    },
+    {
+      "mode": "current",
+      "width": 64,
+      "sequence": 2,
+      "parameter_bytes": 133120,
+      "exact_primitive_trace_and_addresses": true,
+      "all_output_rows_once": true,
+      "primitive_events": 6535,
+      "trace_sha256": "cffdfdc35e3bdee36cc13ae05be747a0a95d0c608be42dfa44a1da74f76c5faf",
+      "capture": {
+        "instructions": 6598,
+        "bytes": 211136,
+        "sha256": "851e97d9d32280a70b21538c628f8009a4a60b8ff157e1caa37b7a1f29bba15d",
+        "max_register": 5,
+        "outer_loops": 2,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      },
+      "unrolled": {
+        "instructions": 6550,
+        "bytes": 209600,
+        "sha256": "fb9734e619b9fbef960b05ddbbe40f05df8dd43f963a9a7f2b039ca9a4ecd1b1",
+        "max_register": 0,
+        "outer_loops": 0,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    },
+    {
+      "mode": "current",
+      "width": 64,
+      "sequence": 5,
+      "parameter_bytes": 133120,
+      "exact_primitive_trace_and_addresses": true,
+      "all_output_rows_once": true,
+      "primitive_events": 16315,
+      "trace_sha256": "83ed3a7bed58aef6aead2bac8e08c8319293f261bcf2f272d31b6e94a25de008",
+      "capture": {
+        "instructions": 6606,
+        "bytes": 211392,
+        "sha256": "14a4d72ed46b8b70c75cf26511d3765a6ee84707264b0d4d312f50ad077f2872",
+        "max_register": 5,
+        "outer_loops": 2,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      },
+      "unrolled": {
+        "instructions": 16336,
+        "bytes": 522752,
+        "sha256": "e3cb99dea5bab3701725366da85973a7df75911e5c12e064a3d25a25fb5ad158",
+        "max_register": 0,
+        "outer_loops": 0,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    },
+    {
+      "mode": "current",
+      "width": 1536,
+      "sequence": 2,
+      "parameter_bytes": 75546624,
+      "exact_primitive_trace_and_addresses": true,
+      "all_output_rows_once": true,
+      "primitive_events": 7635,
+      "trace_sha256": "920f1f0338353e1254ecdd7863d0b3963770aa2290b172f447a8d0cd96990e73",
+      "capture": {
+        "instructions": 8466,
+        "bytes": 270912,
+        "sha256": "4f360433ca6b585a87e9b77905fef2e187567a8ef1ed9ca456340e98e142b880",
+        "max_register": 5,
+        "outer_loops": 2,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      },
+      "unrolled": {
+        "instructions": 8152,
+        "bytes": 260864,
+        "sha256": "e0c5a8a0dc45341347c6f965007b360552c653bdf738f7a05aa5ff995bb89474",
+        "max_register": 0,
+        "outer_loops": 0,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    },
+    {
+      "mode": "current",
+      "width": 1536,
+      "sequence": 3,
+      "parameter_bytes": 75546624,
+      "exact_primitive_trace_and_addresses": true,
+      "all_output_rows_once": true,
+      "primitive_events": 11307,
+      "trace_sha256": "f7fa70afef37f982e1b9b471eac4978f251f960f4e8db68284de0cf02fffba6b",
+      "capture": {
+        "instructions": 8562,
+        "bytes": 273984,
+        "sha256": "f35272a8043f09604906b62b6002ba787414324e8575d16175fe09e65df9d606",
+        "max_register": 5,
+        "outer_loops": 2,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      },
+      "unrolled": {
+        "instructions": 11936,
+        "bytes": 381952,
+        "sha256": "1509114d59fd47ece5ce1da6051fe3406be546290dae205aab1d7454ae1a0f33",
+        "max_register": 0,
+        "outer_loops": 0,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    },
+    {
+      "mode": "paired",
+      "width": 1536,
+      "sequence": 2,
+      "parameter_bytes": 75546624,
+      "exact_primitive_trace_and_addresses": true,
+      "all_output_rows_once": true,
+      "primitive_events": 18427,
+      "trace_sha256": "5b0ceb932f8142d70a2e339b52cbf276e30ece39d471a371f8b50c63387adc2b",
+      "capture": {
+        "instructions": 19282,
+        "bytes": 617024,
+        "sha256": "925e62471eda7acff2bc7446f0e276772ba1546a9c64fb74f4e74a25ea32b1c3",
+        "max_register": 5,
+        "outer_loops": 2,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      },
+      "unrolled": {
+        "instructions": 18968,
+        "bytes": 606976,
+        "sha256": "b9d269b411996687238406010cb36deba9bb425bdedc3db011109496d9864018",
+        "max_register": 0,
+        "outer_loops": 0,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    },
+    {
+      "mode": "paired",
+      "width": 1536,
+      "sequence": 3,
+      "parameter_bytes": 75546624,
+      "exact_primitive_trace_and_addresses": true,
+      "all_output_rows_once": true,
+      "primitive_events": 27495,
+      "trace_sha256": "353a98eb0b45eae86677b77dd0f2d8819fbb56227b2f6677a068eda5bdf85bac",
+      "capture": {
+        "instructions": 19378,
+        "bytes": 620096,
+        "sha256": "3f63c4f4f91bc14c6f3c3885c23757d01565b0158ca2d24c0a2c183f13b6b40b",
+        "max_register": 5,
+        "outer_loops": 2,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      },
+      "unrolled": {
+        "instructions": 28160,
+        "bytes": 901120,
+        "sha256": "498c39d4764385c73e3c17d4f0e560cd4e2167a630e51e02813b54454ecddf5a",
+        "max_register": 0,
+        "outer_loops": 0,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    }
+  ],
+  "capacity": [
+    {
+      "mode": "current",
+      "sequence": 317,
+      "parameter_bytes": 75546624,
+      "capture": {
+        "instructions": 39290,
+        "bytes": 1257280,
+        "sha256": "04a9fb8f0a6a0c669054c97d27ffd2594e636dc6dd072f1bca6c17e3f09b8337",
+        "max_register": 5,
+        "outer_loops": 2,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    },
+    {
+      "mode": "current",
+      "sequence": 1895,
+      "parameter_bytes": 75546624,
+      "capture": {
+        "instructions": 193718,
+        "bytes": 6198976,
+        "sha256": "454cf6ce4c1d51d852d5a633e0ac9723ac16d2f28fe85c6be5d24c900d37604a",
+        "max_register": 5,
+        "outer_loops": 2,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    },
+    {
+      "mode": "paired",
+      "sequence": 317,
+      "parameter_bytes": 75546624,
+      "capture": {
+        "instructions": 50106,
+        "bytes": 1603392,
+        "sha256": "03c5293b49279805947aadfc8034adf7ff7cc1ad4f8506442325f5e4faa57b2f",
+        "max_register": 5,
+        "outer_loops": 2,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    },
+    {
+      "mode": "paired",
+      "sequence": 1895,
+      "parameter_bytes": 75546624,
+      "capture": {
+        "instructions": 204534,
+        "bytes": 6545088,
+        "sha256": "8b9a39c15c34d3d33b5e77d0a07b27e697d46d0d0cb11d8323769f270ddd2f40",
+        "max_register": 5,
+        "outer_loops": 2,
+        "one_halt_no_swi": true,
+        "absolute_back_edges_valid": true,
+        "registers_released": true
+      }
+    }
+  ],
+  "bias_descriptor_cases": [
+    {
+      "projection_offset": 0,
+      "bytes": 256,
+      "address_register": 2,
+      "zero_descriptor_deltas": true
+    },
+    {
+      "projection_offset": 256,
+      "bytes": 256,
+      "address_register": 4,
+      "zero_descriptor_deltas": true
+    },
+    {
+      "projection_offset": 3072,
+      "bytes": 256,
+      "address_register": 4,
+      "zero_descriptor_deltas": true
+    },
+    {
+      "projection_offset": 11776,
+      "bytes": 256,
+      "address_register": 4,
+      "zero_descriptor_deltas": true
+    }
+  ],
+  "source_sha256": {
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_next_20260915/loop_lstm_test.py": "d61e06c6d95ed4192bd46c0f21c1bd2ef7373179303e8a2e21a4df44053773fa",
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_next_20260915/loop_lstm.py": "51fb7ef22981a95e4df3d3e16dd6e41d586a490408ed3213a029712421af8d56",
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_bin/accuracy_next_20260915/decoder_gate_pair_native.py": "1567450f47b1229d9bee8aebc48ee3f7deb4a447a8f5aa64741b2712c6deb5b6",
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_lstm.py": "7c4c08b31b4cdd55f318ddb6dd9546ddf6a58ce3e6d8ec801f4c35e3216259c2",
+    "/home/hunlu/apexcompute/unified-engine/models/bigcodec/bigcodec_tanh.py": "998f37fc5c982933ca0cd0eded6a075f20d85b33b3ffaa67aed07f6fc5dc7df5",
+    "/home/hunlu/apexcompute/unified-engine/user_dma_core.py": "b213f8dcd0a94fba6d60196d134e2506dc578c3e961672242989640c6484a992"
+  }
+}

@@ -1,0 +1,222 @@
+[
+  {
+    "case": "stem",
+    "module": "encoder.block.0",
+    "backend": "im2col",
+    "shape": [
+      400,
+      1
+    ],
+    "output_shape": [
+      400,
+      48
+    ],
+    "instructions": 532,
+    "resident_bytes": 172800,
+    "program_sha256": "0d7f880b56ecea3df84ef98b47954efbc51cf769fe3981f4bc3c67587e970282",
+    "fpga_cycles": 301792,
+    "fpga_s": 0.0009056024006001501,
+    "finite": true,
+    "padded_channels_zero": true,
+    "cpu_bf16_relative_l2": 0.0016068639233708382
+  },
+  {
+    "case": "stem",
+    "module": "encoder.block.0",
+    "backend": "sram",
+    "shape": [
+      400,
+      1
+    ],
+    "output_shape": [
+      400,
+      48
+    ],
+    "instructions": 16,
+    "resident_bytes": 156288,
+    "program_sha256": "ed4e2a16fa2296b48327eec68a486580115bf5e375fae3e038de3a614bb0054c",
+    "fpga_cycles": 214784,
+    "fpga_s": 0.0006445131282820705,
+    "finite": true,
+    "padded_channels_zero": true,
+    "cpu_bf16_relative_l2": 0.0016068639233708382,
+    "bit_mismatches": 0,
+    "speedup": 1.4050953516090585
+  },
+  {
+    "case": "small_tile_cross",
+    "module": "block.1.block.0.block.1",
+    "backend": "im2col",
+    "shape": [
+      2051,
+      48
+    ],
+    "output_shape": [
+      2051,
+      48
+    ],
+    "instructions": 2650,
+    "resident_bytes": 240576,
+    "program_sha256": "50f7558b44e9766823e2e9a698e3005ca1c2858f521fff722dacc83deba3d38d",
+    "fpga_cycles": 1537040,
+    "fpga_s": 0.0046122730682670665,
+    "finite": true,
+    "padded_channels_zero": true,
+    "cpu_bf16_relative_l2": 0.0016986122354865074
+  },
+  {
+    "case": "small_tile_cross",
+    "module": "block.1.block.0.block.1",
+    "backend": "sram",
+    "shape": [
+      2051,
+      48
+    ],
+    "output_shape": [
+      2051,
+      48
+    ],
+    "instructions": 42,
+    "resident_bytes": 157120,
+    "program_sha256": "2c85ac136400ae1efbbec5a7b3e8c66b58f8109afcd0b7354f0d6c7fa4c914d5",
+    "fpga_cycles": 1091536,
+    "fpga_s": 0.003275426856714179,
+    "finite": true,
+    "padded_channels_zero": true,
+    "cpu_bf16_relative_l2": 0.0016986122354865074,
+    "bit_mismatches": 0,
+    "speedup": 1.4081441198457951
+  },
+  {
+    "case": "deep_n32_tile_cross",
+    "module": "block.5.block.0.block.1",
+    "backend": "im2col",
+    "shape": [
+      635,
+      768
+    ],
+    "output_shape": [
+      635,
+      768
+    ],
+    "instructions": 1384,
+    "resident_bytes": 8401664,
+    "program_sha256": "5b92278fe21c49b440c6870c74bca4ed5b995f0510e9800992102b0aa04da18d",
+    "fpga_cycles": 49441472,
+    "fpga_s": 0.14836150637659415,
+    "finite": true,
+    "padded_channels_zero": true,
+    "cpu_bf16_relative_l2": 0.0017510002944618464
+  },
+  {
+    "case": "deep_n32_tile_cross",
+    "module": "block.5.block.0.block.1",
+    "backend": "sram",
+    "shape": [
+      635,
+      768
+    ],
+    "output_shape": [
+      635,
+      768
+    ],
+    "instructions": 1058,
+    "resident_bytes": 8391232,
+    "program_sha256": "763850a71243120cbea01f15e977d91a7702672b879d50b41f0e558146a4cbce",
+    "fpga_cycles": 43558544,
+    "fpga_s": 0.13070830907726932,
+    "finite": true,
+    "padded_channels_zero": true,
+    "cpu_bf16_relative_l2": 0.0017510002944618464,
+    "bit_mismatches": 0,
+    "speedup": 1.1350579578601157
+  },
+  {
+    "case": "deep_dilation9",
+    "module": "block.5.block.2.block.1",
+    "backend": "im2col",
+    "shape": [
+      95,
+      768
+    ],
+    "output_shape": [
+      95,
+      768
+    ],
+    "instructions": 280,
+    "resident_bytes": 8366336,
+    "program_sha256": "6bfc4da66affaff0de2105eb83361850055e36907635963b40bb4ef53111b57f",
+    "fpga_cycles": 7405952,
+    "fpga_s": 0.022223411852963244,
+    "finite": true,
+    "padded_channels_zero": true,
+    "cpu_bf16_relative_l2": 0.001763583510182798
+  },
+  {
+    "case": "deep_dilation9",
+    "module": "block.5.block.2.block.1",
+    "backend": "sram",
+    "shape": [
+      95,
+      768
+    ],
+    "output_shape": [
+      95,
+      768
+    ],
+    "instructions": 3054,
+    "resident_bytes": 8455104,
+    "program_sha256": "84bbde19032a4e2640571bdb9fb2615659d9529961618aeaa721f78528089064",
+    "fpga_cycles": 9197216,
+    "fpga_s": 0.027598547636909228,
+    "finite": true,
+    "padded_channels_zero": true,
+    "cpu_bf16_relative_l2": 0.001763583510182798,
+    "bit_mismatches": 0,
+    "speedup": 0.8052384547671818
+  },
+  {
+    "case": "transpose_tile_cross",
+    "module": "decoder.model.2.block.1",
+    "backend": "im2col",
+    "shape": [
+      173,
+      1536
+    ],
+    "output_shape": [
+      865,
+      768
+    ],
+    "instructions": 1982,
+    "resident_bytes": 23762368,
+    "program_sha256": "d4e5ce2edb97ee076fb04825d51d06514a06b59eea32102efde1ce1a17cb0280",
+    "fpga_cycles": 36233088,
+    "fpga_s": 0.10872644561140285,
+    "finite": true,
+    "padded_channels_zero": true,
+    "cpu_bf16_relative_l2": 0.0017263744957745075
+  },
+  {
+    "case": "transpose_tile_cross",
+    "module": "decoder.model.2.block.1",
+    "backend": "sram",
+    "shape": [
+      173,
+      1536
+    ],
+    "output_shape": [
+      865,
+      768
+    ],
+    "instructions": 1322,
+    "resident_bytes": 23741248,
+    "program_sha256": "64e7dbbf3598a737671d54d9f897fb59ba442f80cc638cde9bca0989a7556738",
+    "fpga_cycles": 34758480,
+    "fpga_s": 0.10430151537884472,
+    "finite": true,
+    "padded_channels_zero": true,
+    "cpu_bf16_relative_l2": 0.0017263744957745075,
+    "bit_mismatches": 0,
+    "speedup": 1.0424244098130873
+  }
+]

@@ -1,0 +1,17 @@
+{
+  "source_commit": "b7ed8a688f9fc85802aa0f1806f21b4e49b56a0f",
+  "rebase_base_commit": "3578d8dbfef62e7dc17af6cdfb1d58acced91cef",
+  "pre_rebase_branch_commit": "92abfef623002ad7f3a567e0637347a6b91992fb",
+  "branch": "agent/yolov5-queued-config",
+  "software_tests": {
+    "command": "PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 taskset -c 7 /home/hunlu/my_torch_env/bin/python -m unittest discover -s models/bigcodec -p 'test_bigcodec_*.py'",
+    "count": 107,
+    "passed": true,
+    "log": "software_tests.log"
+  },
+  "hardware_probe": "high_dram_smoke.json",
+  "legacy_compatibility": "legacy_layout_hash_verification.json",
+  "hardware_sources": "hardware_source_hashes.json",
+  "cpu_sources": "cpu_reference_manifest.json",
+  "source_note": "Source commit identifies the capacity-layout change. Per-run source overrides in hardware_runs.json preserve the initial BF16 bus pilot runner; CPU references record their own source snapshot."
+}

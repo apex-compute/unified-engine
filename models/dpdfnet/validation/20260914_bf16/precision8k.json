@@ -1,0 +1,588 @@
+{
+  "format": "dpdfnet.bf16-precision-audit-v1",
+  "passed": true,
+  "hardware_accessed": false,
+  "model": "dpdfnet2_8khz",
+  "onnx_sha256": "6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d",
+  "resident_image_sha256": "ae1c9fad33f32954b90c13cea015d0de1c480f18265a284abe33f51c0d06d62d",
+  "resident_image_bytes": 15436224,
+  "program_sha256": "ef2f1cd1159166d2ad82b00a0d15af3975fdb12cca74fd48f4475648fdaa4ebb",
+  "program_bytes": 897856,
+  "program_instructions": 28058,
+  "graph_operations": 492,
+  "halt_instruction_index": 28057,
+  "halt_count": 1,
+  "swi_count": 0,
+  "instruction_type_counts": {
+    "0": 28040,
+    "9": 1,
+    "10": 17
+  },
+  "ue_mode_counts": {
+    "2": 688,
+    "4": 1252,
+    "5": 200,
+    "6": 866,
+    "7": 14112,
+    "8": 3881,
+    "10": 533,
+    "11": 200,
+    "13": 211,
+    "15": 6097
+  },
+  "quantized_compute_descriptors": 0,
+  "bf16_matvec_data_type": 0,
+  "dense_convolutions_audited": 15,
+  "dense_convolutions": [
+    {
+      "node_index": 46,
+      "name": "/model/enc/erb_conv0/erb_conv0.1/Conv",
+      "instruction_range": [
+        1474,
+        1893
+      ],
+      "M": 80,
+      "K": 576,
+      "N": 64,
+      "source_weight_shape": [
+        64,
+        1,
+        3,
+        3
+      ],
+      "weight_address": 2429252224,
+      "weight_bytes": 73728,
+      "weight_sha256": "db1d5b7da858b53d2bec5d1b7ce3126049ed80ad199694844bffa1c2a75444a1",
+      "bias_address": 2421751936,
+      "bias_bytes": 128,
+      "bias_sha256": "0610438032c22e64f527577365971f3b86da0410a84ae42a2b4cb48a794693ef",
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 384,
+        "8": 15,
+        "15": 20
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 1741,
+        "matvec_start": 1744,
+        "matvec_stop": 1824,
+        "matvec_descriptors": 80,
+        "output_write_index": 1824
+      }
+    },
+    {
+      "node_index": 49,
+      "name": "/model/enc/erb_conv1/erb_conv1.1/Conv",
+      "instruction_range": [
+        2189,
+        2346
+      ],
+      "M": 40,
+      "K": 64,
+      "N": 64,
+      "source_weight_shape": [
+        64,
+        64,
+        1,
+        1
+      ],
+      "weight_address": 2429342336,
+      "weight_bytes": 8192,
+      "weight_sha256": "cd98c2aacace6f3cb2d26b4a6b8fcc665efac33c6207c99f07482905a5d10bd3",
+      "bias_address": 2422276352,
+      "bias_bytes": 128,
+      "bias_sha256": "31f8a394fe167e5e14dfeef5908001f5a384edc8eb41a6a0f93571389ab8ae2a",
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 144,
+        "8": 4,
+        "15": 9
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 2234,
+        "matvec_start": 2237,
+        "matvec_stop": 2277,
+        "matvec_descriptors": 40,
+        "output_write_index": 2277
+      }
+    },
+    {
+      "node_index": 52,
+      "name": "/model/enc/erb_conv2/erb_conv2.1/Conv",
+      "instruction_range": [
+        2531,
+        2648
+      ],
+      "M": 20,
+      "K": 64,
+      "N": 64,
+      "source_weight_shape": [
+        64,
+        64,
+        1,
+        1
+      ],
+      "weight_address": 2429360768,
+      "weight_bytes": 8192,
+      "weight_sha256": "f5f3f164352c5f29d12013a257b813064640666e4ddcb85551e197b0d14c32ec",
+      "bias_address": 2422800768,
+      "bias_bytes": 128,
+      "bias_sha256": "926ad19932596d45530507ba4db9ee150e1fa3733a9d45614d129841825d159a",
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 104,
+        "8": 4,
+        "15": 9
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 2556,
+        "matvec_start": 2559,
+        "matvec_stop": 2579,
+        "matvec_descriptors": 20,
+        "output_write_index": 2579
+      }
+    },
+    {
+      "node_index": 55,
+      "name": "/model/enc/erb_conv3/erb_conv3.1/Conv",
+      "instruction_range": [
+        2783,
+        2880
+      ],
+      "M": 10,
+      "K": 64,
+      "N": 64,
+      "source_weight_shape": [
+        64,
+        64,
+        1,
+        1
+      ],
+      "weight_address": 2429374080,
+      "weight_bytes": 8192,
+      "weight_sha256": "15c39484e78342d1926bd0f8efd50b9cf15219dce641dd443ecd6a0aa50743c5",
+      "bias_address": 2423325184,
+      "bias_bytes": 128,
+      "bias_sha256": "5cfa302012cffe34779e81207a76e817bce7051e2c5138aa9658342ad6a7f17a",
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 84,
+        "8": 4,
+        "15": 9
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 2798,
+        "matvec_start": 2801,
+        "matvec_stop": 2811,
+        "matvec_descriptors": 10,
+        "output_write_index": 2811
+      }
+    },
+    {
+      "node_index": 141,
+      "name": "/model/enc/df_conv0/df_conv0.1/convs.0/Conv",
+      "instruction_range": [
+        5292,
+        5678
+      ],
+      "M": 80,
+      "K": 576,
+      "N": 64,
+      "source_weight_shape": [
+        32,
+        1,
+        3,
+        3
+      ],
+      "weight_address": 2429382272,
+      "weight_bytes": 73728,
+      "weight_sha256": "335b82453ced860c7b67d9e95db85fb7c6e6960f9d9ff05488401e9c0aca4b15",
+      "bias_address": null,
+      "bias_bytes": 0,
+      "bias_sha256": null,
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 352,
+        "8": 15,
+        "15": 19
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 5559,
+        "matvec_start": 5561,
+        "matvec_stop": 5641,
+        "matvec_descriptors": 80,
+        "output_write_index": 5641
+      }
+    },
+    {
+      "node_index": 142,
+      "name": "/model/enc/df_conv0/df_conv0.1/convs.1/Conv",
+      "instruction_range": [
+        5678,
+        6064
+      ],
+      "M": 80,
+      "K": 576,
+      "N": 64,
+      "source_weight_shape": [
+        32,
+        1,
+        3,
+        3
+      ],
+      "weight_address": 2429456000,
+      "weight_bytes": 73728,
+      "weight_sha256": "8e7b963e8e768b22643d69abb81574b93f7bb6e3ce949b53a8aaff71906d6790",
+      "bias_address": null,
+      "bias_bytes": 0,
+      "bias_sha256": null,
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 352,
+        "8": 15,
+        "15": 19
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 5945,
+        "matvec_start": 5947,
+        "matvec_stop": 6027,
+        "matvec_descriptors": 80,
+        "output_write_index": 6027
+      }
+    },
+    {
+      "node_index": 144,
+      "name": "/model/enc/df_conv0/df_conv0.2/Conv",
+      "instruction_range": [
+        6070,
+        6307
+      ],
+      "M": 80,
+      "K": 64,
+      "N": 64,
+      "source_weight_shape": [
+        64,
+        64,
+        1,
+        1
+      ],
+      "weight_address": 2429529728,
+      "weight_bytes": 8192,
+      "weight_sha256": "cd618e3d11cc92624f39aa7126b018dbf4a25071fc7af11fa003b0e1f5526ac0",
+      "bias_address": 2423849600,
+      "bias_bytes": 128,
+      "bias_sha256": "605f02781c9f68d5452aad13a5c4d369c95a98a9247785eea066d319926476b4",
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 224,
+        "8": 4,
+        "15": 9
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 6155,
+        "matvec_start": 6158,
+        "matvec_stop": 6238,
+        "matvec_descriptors": 80,
+        "output_write_index": 6238
+      }
+    },
+    {
+      "node_index": 147,
+      "name": "/model/enc/df_conv1/df_conv1.1/Conv",
+      "instruction_range": [
+        6603,
+        6760
+      ],
+      "M": 40,
+      "K": 64,
+      "N": 64,
+      "source_weight_shape": [
+        64,
+        64,
+        1,
+        1
+      ],
+      "weight_address": 2429550208,
+      "weight_bytes": 8192,
+      "weight_sha256": "4053ed462283b39b5ad082c1c6bf2bb3edd553424f04a0244df67be5999c4d5b",
+      "bias_address": 2424374016,
+      "bias_bytes": 128,
+      "bias_sha256": "5aae23191bccf4cb08262f3d3dbb94e77a8a4c4d8d0af839b2946c7340037bde",
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 144,
+        "8": 4,
+        "15": 9
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 6648,
+        "matvec_start": 6651,
+        "matvec_stop": 6691,
+        "matvec_descriptors": 40,
+        "output_write_index": 6691
+      }
+    },
+    {
+      "node_index": 339,
+      "name": "/model/erb_dec/convt3/convt3.1/Conv",
+      "instruction_range": [
+        16695,
+        16812
+      ],
+      "M": 20,
+      "K": 64,
+      "N": 64,
+      "source_weight_shape": [
+        64,
+        64,
+        1,
+        1
+      ],
+      "weight_address": 2429568640,
+      "weight_bytes": 8192,
+      "weight_sha256": "df1e54e9c88e2ad68d7ce5eb69752d73de23bec76b5eb9e568abea36f7e6c369",
+      "bias_address": 2424906752,
+      "bias_bytes": 128,
+      "bias_sha256": "fe25f18de2c08ca4c4e03956007d28c7556c2a0704827ca4a1aefda5aa332993",
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 104,
+        "8": 4,
+        "15": 9
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 16720,
+        "matvec_start": 16723,
+        "matvec_stop": 16743,
+        "matvec_descriptors": 20,
+        "output_write_index": 16743
+      }
+    },
+    {
+      "node_index": 350,
+      "name": "/model/erb_dec/convt2/convt2.1/Conv",
+      "instruction_range": [
+        17413,
+        17570
+      ],
+      "M": 40,
+      "K": 64,
+      "N": 64,
+      "source_weight_shape": [
+        64,
+        64,
+        1,
+        1
+      ],
+      "weight_address": 2429597312,
+      "weight_bytes": 8192,
+      "weight_sha256": "bc389e388277772e77d1f53cc2a6d06659acc6712bad1f8f5be3a36c0cf151f8",
+      "bias_address": 2425439488,
+      "bias_bytes": 128,
+      "bias_sha256": "9345bc7e8aea9dc95b28e6606dd303b20c611c28a5455e1ab97f784020df797b",
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 144,
+        "8": 4,
+        "15": 9
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 17458,
+        "matvec_start": 17461,
+        "matvec_stop": 17501,
+        "matvec_descriptors": 40,
+        "output_write_index": 17501
+      }
+    },
+    {
+      "node_index": 361,
+      "name": "/model/erb_dec/convt1/convt1.1/Conv",
+      "instruction_range": [
+        18398,
+        18635
+      ],
+      "M": 80,
+      "K": 64,
+      "N": 64,
+      "source_weight_shape": [
+        64,
+        64,
+        1,
+        1
+      ],
+      "weight_address": 2429638272,
+      "weight_bytes": 8192,
+      "weight_sha256": "7f9e3ead0991b72d93879beee8d9ea5f79a9a5c4923d1bbd43c2deef65b7c730",
+      "bias_address": 2425972224,
+      "bias_bytes": 128,
+      "bias_sha256": "181251daf6d4c2228aec90606533ee043df103ab4bda1f3bd8741a5b5866017a",
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 224,
+        "8": 4,
+        "15": 9
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 18483,
+        "matvec_start": 18486,
+        "matvec_stop": 18566,
+        "matvec_descriptors": 80,
+        "output_write_index": 18566
+      }
+    },
+    {
+      "node_index": 366,
+      "name": "/model/erb_dec/conv0_out/conv0_out.0/Conv",
+      "instruction_range": [
+        18889,
+        19069
+      ],
+      "M": 80,
+      "K": 192,
+      "N": 64,
+      "source_weight_shape": [
+        1,
+        64,
+        1,
+        3
+      ],
+      "weight_address": 2429654656,
+      "weight_bytes": 24576,
+      "weight_sha256": "fb8135ec6d46f89933e684510321f4ee9680b44228a9e5f45be75a7cd4fce543",
+      "bias_address": 2425988864,
+      "bias_bytes": 128,
+      "bias_sha256": "1373d25c827468176d61685fd89909686289b341a9555e2397c37c9969c87940",
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 161,
+        "8": 7,
+        "15": 12
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 18980,
+        "matvec_start": 18983,
+        "matvec_stop": 19063,
+        "matvec_descriptors": 80,
+        "output_write_index": 19063
+      }
+    },
+    {
+      "node_index": 425,
+      "name": "/model/df_dec/df_convp/df_convp.1/convs.0/Conv",
+      "instruction_range": [
+        20755,
+        21267
+      ],
+      "M": 80,
+      "K": 320,
+      "N": 64,
+      "source_weight_shape": [
+        5,
+        32,
+        5,
+        1
+      ],
+      "weight_address": 2429679232,
+      "weight_bytes": 40960,
+      "weight_sha256": "ff301bf271c32c0b95644fbb7a2a106abe084480966ec0a61313a7bb68e3b4b9",
+      "bias_address": null,
+      "bias_bytes": 0,
+      "bias_sha256": null,
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 485,
+        "8": 13,
+        "15": 14
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 21175,
+        "matvec_start": 21177,
+        "matvec_stop": 21257,
+        "matvec_descriptors": 80,
+        "output_write_index": 21257
+      }
+    },
+    {
+      "node_index": 426,
+      "name": "/model/df_dec/df_convp/df_convp.1/convs.1/Conv",
+      "instruction_range": [
+        21267,
+        21779
+      ],
+      "M": 80,
+      "K": 320,
+      "N": 64,
+      "source_weight_shape": [
+        5,
+        32,
+        5,
+        1
+      ],
+      "weight_address": 2429720192,
+      "weight_bytes": 40960,
+      "weight_sha256": "b8072632e4a74290cbccc16fe7a0d10811a7ac49664549d98e7103914427ffa6",
+      "bias_address": null,
+      "bias_bytes": 0,
+      "bias_sha256": null,
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 485,
+        "8": 13,
+        "15": 14
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 21687,
+        "matvec_start": 21689,
+        "matvec_stop": 21769,
+        "matvec_descriptors": 80,
+        "output_write_index": 21769
+      }
+    },
+    {
+      "node_index": 428,
+      "name": "/model/df_dec/df_convp/df_convp.2/Conv",
+      "instruction_range": [
+        21785,
+        21969
+      ],
+      "M": 80,
+      "K": 64,
+      "N": 64,
+      "source_weight_shape": [
+        10,
+        10,
+        1,
+        1
+      ],
+      "weight_address": 2429761152,
+      "weight_bytes": 8192,
+      "weight_sha256": "39b32a9d12f4cd2159db94b9f202081a536d54212dc6befb491e5fbd880b7a63",
+      "bias_address": 2426001792,
+      "bias_bytes": 128,
+      "bias_sha256": "91b790ad17a436e3cf3124f3327be1d0ea697e15f9a6c95da1a2959ea606e788",
+      "weight_and_bias_match_rounded_onnx_including_padding": true,
+      "ue_mode_counts": {
+        "7": 170,
+        "8": 4,
+        "15": 10
+      },
+      "static_matmul_sequence": {
+        "input_weight_load_start": 21871,
+        "matvec_start": 21874,
+        "matvec_stop": 21954,
+        "matvec_descriptors": 80,
+        "output_write_index": 21954
+      }
+    }
+  ],
+  "limitations": [
+    "This is an offline storage and instruction audit, not hardware execution, accuracy or RTF measurement.",
+    "BF16 describes stored weights/activations; the hardware's internal accumulation precision is unchanged.",
+    "Per-node UE mode counts include layout selectors; static_matmul_sequence identifies the dense arithmetic.",
+    "Weight/bias byte counts include zero padding and may reference deduplicated constants; they are not unique learned parameter bytes."
+  ],
+  "bin_file": "models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz-bf16-andromeda.bin",
+  "bin_sha256": "42a00f84f9886a6269e6523933df4227acdb82cfeb31d948d7f2748064d38eb1",
+  "model_file": "models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz.onnx",
+  "auditor_sha256": "c7ba6ea94d1b592f97703a3cd78d98be2bf55979c0d6b785aae05df2d43e977e"
+}

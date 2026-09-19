@@ -1,0 +1,173 @@
+{
+  "mode": "native",
+  "hostname": "italy",
+  "cpu_core": 6,
+  "torch_version": "2.12.0.dev20260405+cu128",
+  "source_sha256": {
+    "andromeda_hw_info.py": "a9f4b9f4f59c6a78cbc4e1211f0c1c13a1202468bf136ffe99d5b81f0fd22f7a",
+    "models/bigcodec/bigcodec_common.py": "f471409d538c3cf875617318cf9397adbd5aa4ab0725e3f42b01377c752c89e6",
+    "models/bigcodec/bigcodec_device.py": "ef719dd88d1530d9ce59bf1626c683bc352e90b6fd0122e7a6dab32c7b8589eb",
+    "models/bigcodec/bigcodec_layout.py": "f2209cb8aef693d924de99e82d9acbdf701509bb9c344decb02b01a1fee379fd",
+    "models/bigcodec/bigcodec_lstm.py": "7c4c08b31b4cdd55f318ddb6dd9546ddf6a58ce3e6d8ec801f4c35e3216259c2",
+    "models/bigcodec/bigcodec_precompiled.py": "365be814cd3b40bc4436ab0809929cf8dd4b5791a60257f7cf63c31d1879c425",
+    "models/bigcodec/bigcodec_quantizer.py": "d5c3f4d9ae4511a6648c928f68ee71c8d1422de5c1d1df9285289d0ec11f3353",
+    "models/bigcodec/bigcodec_tanh.py": "998f37fc5c982933ca0cd0eded6a075f20d85b33b3ffaa67aed07f6fc5dc7df5",
+    "models/bigcodec/bigcodec_vq/__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+    "models/bigcodec/bigcodec_vq/activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+    "models/bigcodec/bigcodec_vq/alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+    "models/bigcodec/bigcodec_vq/codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+    "models/bigcodec/bigcodec_vq/codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+    "models/bigcodec/bigcodec_vq/factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+    "models/bigcodec/bigcodec_vq/module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+    "models/bigcodec/bigcodec_vq/residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656",
+    "models/bigcodec/test_bigcodec_lstm.py": "ee9569219c6637ebb5691abd18d5b4cd60b564955c4ccb4f0e662dcdade70834",
+    "models/bigcodec/test_bigcodec_tanh.py": "c763caf245718a7a60f0765a6a9a3922163d383e6a385f6ce5ccca66f703d445",
+    "models/bigcodec/validation/20260915_accuracy/lstm_probe/reproduce.py": "71d5c01829b0bbd22113e7b9b489082cbe96db4d4eb46d7c81ab9e89a6406ebf",
+    "models/bigcodec/validation/20260915_accuracy/numerics_probe.py": "f7f680495e0d7b30a9feeca558d66f1dad269349449b38533671c2d9d66994d7",
+    "models/dpdfnet8khz/dpdfnet8khz_engine.py": "02dd0ac0f6ad02a0418fa43bf584180bc0c7f80ac5e3306f8ab130690de72086",
+    "models/yolov5s/yolov5_common.py": "9a2009b2d5d5118cb4aaff3394caefa4a5d7d8db6738c8c70339b341655ca3f5",
+    "models/yolov5s/yolov5_precompiled.py": "3fe19cd7d559c0bf15cd54723cd3e4279b2d681d4d2566c9353a593e27e1dc32",
+    "quant_lib.py": "8ea8c322e832d0096820e4b24bd08f0717b4b672e0318e02cd8af348b3367e58",
+    "user_dma_core.py": "b213f8dcd0a94fba6d60196d134e2506dc578c3e961672242989640c6484a992"
+  },
+  "provenance": {
+    "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+    "tokens": "models/bigcodec/validation/20260914_optimized_italy/p232_007_optimized_bf16_fpga.tokens.npz",
+    "tokens_sha256": "34da5227f77c3f643159facff138f27827176c9555631c81629032ecf9d07044",
+    "token_count": 317,
+    "source_audio": {
+      "checkpoint_sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+      "format": "bigcodec-tokens-v1",
+      "hop_length": 200,
+      "native_samples": 63295,
+      "padded_samples": 63400,
+      "sample_rate": 16000,
+      "source_channels": 1,
+      "source_rate": 48000,
+      "source_samples": 189883,
+      "source_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211"
+    },
+    "input_bf16_sha256": "66242b3fbc6279796be42664c97e58c00a740d69e6a7773aade20ed42dbd4cd9",
+    "reference_fp32_sha256": "01f5ae1c5305e95b236164acb3e9d0359a5a1d26590244c0b7108ba2f7406f4b",
+    "reference_wave_fp32_sha256": "9adfc29b6703d96cd6109b7fe107c30d7385a0eeb38226046b2541fa195adc45",
+    "native_shape": [
+      317,
+      1536
+    ],
+    "native_samples": 63295,
+    "sample_rate": 16000,
+    "input_rounding_only": {
+      "lstm": {
+        "relative_l2": 0.001235918267118224,
+        "max_abs": 0.018267720937728882,
+        "exact_mismatches": 486891,
+        "bf16_bit_mismatches": 132574
+      },
+      "fp32_tail_waveform": {
+        "relative_l2": 0.003697178652685711,
+        "max_abs": 0.003057282418012619,
+        "exact_mismatches": 63294,
+        "bf16_bit_mismatches": 33254
+      }
+    }
+  },
+  "scope": "Two-layer decoder ResLSTM including skip, zero initial hidden/cell state. Frozen FPGA-selected token IDs feed official vq2emb and first convolution. Native kernels receive the same BF16 input; reference ResLSTM receives the original FP32 input. Both native outputs feed the unchanged official FP32 decoder tail. No encoder or token selection rerun.",
+  "metric": "Relative L2 = ||actual-reference||2 / ||reference||2. Waveform uses the first 63,295 native 16 kHz samples, without resampling, alignment, gain or polarity fitting. Isolated LSTM timings exclude all other operators and host transfers; they are not whole-model RTF.",
+  "variants": [
+    {
+      "variant": "baseline",
+      "input_sha256": "66242b3fbc6279796be42664c97e58c00a740d69e6a7773aade20ed42dbd4cd9",
+      "program_bytes": 8129216,
+      "program_sha256": "80db314e007b2bc5af0d14c36b314f1a9fa8838f3daf0d2ee96dbd6034c90b25",
+      "resident_bytes": 83684160,
+      "resident_sha256": "2e9ed6ac6356b8aebcdaab5a844f501178a84b84c9e89944c9c8f08ec8cfb321",
+      "scratch_bytes": 4902912,
+      "instructions": 254038,
+      "halt_index": 254036,
+      "compensated_cell": false,
+      "compensated_tanh": false,
+      "fused_projection": false,
+      "recurrent_precision": "bf16",
+      "hardware_executed": true,
+      "starts": 1,
+      "hardware_version": "0x40519e0a",
+      "halts": 1,
+      "host_s": 1.8417353590011771,
+      "fpga_cycles": 613861984,
+      "fpga_s": 1.8420464636159042,
+      "guards_intact": true,
+      "input_unchanged": true,
+      "finite": true,
+      "output_sha256": "c5d3603613d49a13b6469ec02862230bd18bdd11d0ce70523fd92a9a2c78b6ff",
+      "comparison": {
+        "lstm_vs_official_fp32": {
+          "relative_l2": 0.021352825705330543,
+          "max_abs": 0.2911146879196167,
+          "exact_mismatches": 486911,
+          "bf16_bit_mismatches": 379845
+        },
+        "fp32_tail_waveform_vs_official": {
+          "relative_l2": 0.23568137820311694,
+          "max_abs": 0.13764578849077225,
+          "exact_mismatches": 63295,
+          "bf16_bit_mismatches": 60780
+        },
+        "native_output_fp32_sha256": "c5d3603613d49a13b6469ec02862230bd18bdd11d0ce70523fd92a9a2c78b6ff",
+        "tail_wave_fp32_sha256": "f63d830d9e89352387f85ec96bfe56e795f43946450c10c96b6183adc106dd6d"
+      }
+    },
+    {
+      "variant": "fused_compensated_cell_tanh",
+      "input_sha256": "66242b3fbc6279796be42664c97e58c00a740d69e6a7773aade20ed42dbd4cd9",
+      "program_bytes": 38422272,
+      "program_sha256": "26ce0712e877ef3f0872298aabd0be141b99bb60fd3f6ab3cb931f897087622a",
+      "resident_bytes": 113977216,
+      "resident_sha256": "279428c1c09a3f111b78bd73161cc8e2d20c82cbd3d4d924ed584f55add2986f",
+      "scratch_bytes": 4905984,
+      "instructions": 1200696,
+      "halt_index": 1200694,
+      "compensated_cell": true,
+      "compensated_tanh": true,
+      "fused_projection": true,
+      "recurrent_precision": "bf16",
+      "hardware_executed": true,
+      "starts": 1,
+      "hardware_version": "0x40519e0a",
+      "halts": 1,
+      "host_s": 1.9494151859980775,
+      "fpga_cycles": 649760816,
+      "fpga_s": 1.9497698904726184,
+      "guards_intact": true,
+      "input_unchanged": true,
+      "finite": true,
+      "output_sha256": "d1a820c062c51057c3d76a9c7f7dde988f9b442c8ff37cb1489e36b96b8bef9d",
+      "comparison": {
+        "lstm_vs_official_fp32": {
+          "relative_l2": 0.00954106338714414,
+          "max_abs": 0.1368178129196167,
+          "exact_mismatches": 486908,
+          "bf16_bit_mismatches": 326349
+        },
+        "fp32_tail_waveform_vs_official": {
+          "relative_l2": 0.10476847875805802,
+          "max_abs": 0.06309636775404215,
+          "exact_mismatches": 63295,
+          "bf16_bit_mismatches": 58437
+        },
+        "native_output_fp32_sha256": "d1a820c062c51057c3d76a9c7f7dde988f9b442c8ff37cb1489e36b96b8bef9d",
+        "tail_wave_fp32_sha256": "4ec6889373ec281284c7de2d7c18ca0714565e689a6453450481b15b3f03d98a"
+      }
+    }
+  ],
+  "passed": true,
+  "clock_period_ns": 3.000750187546887,
+  "detected_dram_gib": 2,
+  "required_dram_end": 2958670208,
+  "error_reduction_fraction": {
+    "lstm_vs_official_fp32": 0.5531709236608296,
+    "fp32_tail_waveform_vs_official": 0.5554656054846829
+  }
+}

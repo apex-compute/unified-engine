@@ -1,0 +1,98 @@
+{
+  "date_utc": "2026-09-13",
+  "hostname": "italy",
+  "target": "RK AXI-256 queue-CONFIG",
+  "fpga_accuracy_verified": false,
+  "fpga_realtime_verified": false,
+  "artifacts": {
+    "baseline": {
+      "file": "models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz-andromeda.bin",
+      "file_sha256": "420dfd4e40645dcb5b2c2a9f9f7407abd496d2ec631f32c79e9999bd7f35556c",
+      "file_bytes": 19929077,
+      "onnx_sha256": "6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d",
+      "axi_data_width_bits": 256,
+      "resident_image_bytes": 19802304,
+      "resident_image_sha256": "8202cc0cbdf4075f2964e346fc4d28b7104b87a2e943ade0ad2f940a7acb9a14",
+      "instruction_count": 53890,
+      "instruction_bytes": 1724480,
+      "instruction_sha256": "9305489158cf13b5d6d6b7ac5cbcaef419e67badfa25196c91a865bd2554fdc6",
+      "parameter_data_bytes": 18077824,
+      "parameter_data_sha256": "a62a28ebf18ad65a1c26749208f2a9c8eb4b646ce8135216890048685e676d5a",
+      "graph_operations": 492,
+      "operations_including_state_commit": 493
+    },
+    "optimized": {
+      "file": "models/dpdfnet8khz/dpdfnet8khz_bin/validation_20260913/optimized_native8k.bin",
+      "file_sha256": "3beeae2f8705dbe533f4546d3ba27931c5305d63f8459cf3e2302996fc84ec20",
+      "file_bytes": 19271634,
+      "onnx_sha256": "6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d",
+      "axi_data_width_bits": 256,
+      "resident_image_bytes": 19144768,
+      "resident_image_sha256": "235dfc640313e1d438f4793c9de483ea850e6eca8efe033d607d54fc62431cb4",
+      "instruction_count": 33342,
+      "instruction_bytes": 1066944,
+      "instruction_sha256": "3961225e94c082177cdfa054bc8e7e040b395e7df41da0cc3a6dad833f290e7f",
+      "parameter_data_bytes": 18077824,
+      "parameter_data_sha256": "93be4b10f290d45a152a63e3c3cb38d17c0ba13b589054506626df14abe57514",
+      "graph_operations": 492,
+      "operations_including_state_commit": 493
+    }
+  },
+  "cpu_audio_check": {
+    "model": "dpdfnet2_8khz",
+    "backend": "onnxruntime-cpu",
+    "onnx_sha256": "6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d",
+    "input": "/home/hunlu/apexcompute/unified-engine/test_samples/p232_007.wav",
+    "output": "/home/hunlu/apexcompute/unified-engine/models/dpdfnet8khz/dpdfnet8khz_bin/p232_007_native8k_cpu.wav",
+    "sample_rate": 48000,
+    "model_sample_rate": 8000,
+    "audio_duration_s": 3.9558958333333334,
+    "output_samples": 189883,
+    "output_channels": 1,
+    "frames": 402,
+    "state_size": 37860,
+    "cpu_intra_op_threads": 1,
+    "cpu_inter_op_threads": 1,
+    "neural_inference_s": 0.2532013171876315,
+    "average_frame_ms": 0.6298540228548047,
+    "neural_rtf": 0.06298540228548048,
+    "session_load_s": 0.04325029900064692,
+    "audio_preprocess_s": 0.01428875100100413,
+    "audio_postprocess_s": 0.004764327997690998,
+    "total_elapsed_s": 0.32285578800656367,
+    "output_finite": true,
+    "output_sha256": "3b8c2d1c299af226d6024cb9f54037dec245ed137da9b3a428cc44d5bf013554",
+    "input_sha256": "4d36133cdfd72c5de9379bae4139fc534ae5498a7b788d6c1f346feeeffec211"
+  },
+  "cpu_reference_corpus": {
+    "frames": 1362,
+    "cases": 4,
+    "finite_spec_and_state": true,
+    "mean_neural_frame_ms": 0.6420616770227113
+  },
+  "hardware_blocker": {
+    "previous_build": "0xb97c477a",
+    "previous_axi_bits": 256,
+    "current_build": "0x0305d87d",
+    "current_axi_bits": 512,
+    "current_hw_info": "0xa0214d40",
+    "clock_mhz": 333.25,
+    "invalid_native_smoke_frames": 64,
+    "invalid_native_smoke_all_frames_identical": true,
+    "invalid_native_smoke_peak": 1.5618428950472762e+38,
+    "control": "Previously tested 16 kHz bin also returned identical output for 16 varying input frames on this build.",
+    "timing_accepted": false,
+    "guard": "Native runner now rejects AXI-512 before device reset or model upload."
+  },
+  "host_tests": {
+    "native8k": 49,
+    "existing16k": 63,
+    "all_passed": true,
+    "hardware_exercised_by_tests": false
+  },
+  "cpu_reference_preparer_reproduction": {
+    "frames": 1362,
+    "input_bit_identical": true,
+    "cpu_output_bit_identical": true
+  }
+}
