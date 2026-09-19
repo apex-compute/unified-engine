@@ -129,6 +129,13 @@ Qwen25OmniAudioMixin = _audio_mod.Qwen25OmniAudioMixin
 build_multimodal_positions = _position_mod.build_multimodal_positions
 ProgramBundle = _program_mod.ProgramBundle
 
+# Speech output is optional: the Talker/Token2Wav weights live in the HF
+# checkpoint, not in params.bin, so a tree without them must still run text.
+try:
+    _talker_mod = _load_sibling("qwen2_5_omni_7b_talker", "qwen2.5_omni_7b_talker.py")
+except Exception:                                    # pragma: no cover
+    _talker_mod = None
+
 
 REQUIRED_ENGINES = 8
 REQUIRED_DRAM_GIB = 8
@@ -415,6 +422,7 @@ DEFAULT_AUDIO = os.path.normpath(
     os.path.join(PROJECT_ROOT, "test_samples", "apex.wav")
 )
 RUN_LOCK_PATH = "/tmp/apexcompute-qwen2.5-omni-7b.lock"
+DEFAULT_SPEAKER = "Chelsie"
 
 # Every file that can change captured Omni instructions is bound into the
 # programs artifact identity.  Paths are explicit so generated checkpoints,
@@ -503,6 +511,7 @@ class Qwen25OmniUnifiedEngine(
             REQUIRED_ENGINES, OMNI_WINDOW_BYTES, "Qwen2.5-Omni-7B")
 
         self.multi_core = multi_core
+        self.speak_as: str | None = None      # set before weight/tensor init
         self.fpga_build = None if fpga_build is None else int(fpga_build)
         self._multi_core_schedulers: dict[str, MultiEngineScheduler] = {}
         self._worker_isa_used: dict[int, dict[str, int]] = {}
@@ -656,6 +665,10 @@ class Qwen25OmniUnifiedEngine(
 
         self._end_of_turn_token_id = int(model["end_of_turn_token_id"])
         self.causal_mask_upper = False
+
+    def _export_prefill_hidden(self) -> bool:
+        """Speech needs the Thinker's final hidden for every prompt row."""
+        return self.speak_as is not None
 
     # -- params allocation against the shared pool ---------------------------
     #
@@ -2619,6 +2632,59 @@ def apply_run_preset(args) -> None:
         args.vision_res = spec["vision_res"]
 
 
+def _synthesize_speech(ue, args, cfg: dict, prompt_tokens: list[int]) -> dict:
+    """Thinker state off the accelerator -> Talker -> Token2Wav -> .wav.
+
+    The FPGA supplies the conditioning and nothing else: the final hidden for
+    every prompt row (LM_PREFILL_NORM, produced by the extra prefill norm) and
+    one final hidden per generated token. The embedding stream comes from the
+    checkpoint table, because on this model the embeddings live on the device
+    and a row cannot be read back after the step that used it.
+    """
+    import torch as _torch
+
+    steps = ue._speech_steps or []
+    if not steps:
+        raise RuntimeError("--speak: no decode steps were captured")
+    H = int(ue.vector_length)
+    T = len(prompt_tokens)
+    model_dir = os.path.join(SCRIPT_DIR, cfg["paths"]["hf_model_dir"])
+
+    t0 = time.perf_counter()
+    prefill_hidden = ue.dma_from_accelerator_memory(
+        ue.LM_PREFILL_NORM, (T, H)).float().unsqueeze(0)
+    step_hidden = _torch.cat([h.float() for _, h in steps], dim=0).unsqueeze(0)
+    readback_s = time.perf_counter() - t0
+
+    emb = _talker_mod.ThinkerEmbeddings(model_dir)
+    media = {int(cfg["tokens"]["image_token_id"]), int(cfg["tokens"]["audio_token_id"]),
+             int(cfg["tokens"]["video_token_id"])}
+    prefill_embeds = emb.rows(
+        prompt_tokens, zero_at=[i for i, t in enumerate(prompt_tokens) if t in media])
+    step_embeds = emb.rows([t for t, _ in steps])
+
+    hs = _talker_mod.HostSpeech(model_dir, speaker=args.speak)
+    t1 = time.perf_counter()
+    wav = hs.speak(
+        input_ids=_torch.tensor([prompt_tokens], dtype=_torch.long),
+        prefill_hidden=prefill_hidden, prefill_embeds=prefill_embeds,
+        step_hidden=step_hidden, step_embeds=step_embeds,
+        embed_lookup=lambda ids: emb.rows(ids.flatten().tolist()),
+    )
+    speak_s = time.perf_counter() - t1
+    w = wav[0] if isinstance(wav, (tuple, list)) else wav
+    out = os.path.join(SCRIPT_DIR, run_summary_filename(args).replace(".md", ".wav"))
+    _talker_mod.write_wav(out, w)
+    n = int(w.reshape(-1).shape[0])
+    print(f"\n[Speak] {args.speak}: {n} samples = "
+          f"{n / _talker_mod.SAMPLE_RATE:.2f}s @ {_talker_mod.SAMPLE_RATE} Hz "
+          f"-> {os.path.basename(out)}  (FPGA readback {readback_s:.2f}s, "
+          f"host talker+vocoder {speak_s:.1f}s)")
+    return {"speaker": args.speak, "wav": out, "samples": n,
+            "seconds": n / _talker_mod.SAMPLE_RATE,
+            "readback_s": readback_s, "host_s": speak_s}
+
+
 def _result_mode(args) -> str:
     if args.image and args.audio:
         return "image+audio"
@@ -2663,6 +2729,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="engine count; this model requires exactly 8",
     )
     parser.add_argument("--prompt", default=None, help="user text prompt")
+    parser.add_argument(
+        "--speak", nargs="?", const=DEFAULT_SPEAKER, default=None,
+        metavar="SPEAKER",
+        help=("synthesise speech for the reply (Talker + Token2Wav). Bare "
+              f"--speak uses {DEFAULT_SPEAKER}; the other voice is Ethan. "
+              "Writes a .wav next to the run summary."),
+    )
     presets = parser.add_mutually_exclusive_group()
     presets.add_argument(
         "--low", dest="preset", action="store_const", const="low",
@@ -2807,6 +2880,9 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         script_dir=SCRIPT_DIR, fpga_build=fpga_build,
         vision_res=args.vision_res, **engine_kwargs
     )
+    ue.speak_as = args.speak          # before lm_tensor_init sizes the buffers
+    if args.speak is not None and _talker_mod is None:
+        raise SystemExit("--speak needs qwen2.5_omni_7b_talker.py, which failed to import")
     ue.configure_runtime_artifacts(params_path, processor_dir)
     ue.tokenizer = processor.tokenizer
     ue.processor = processor
@@ -2928,7 +3004,12 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         return
 
     print("\n--- Decode run ---")
+    if args.speak is not None:
+        ue._speech_steps = []
     _, decoded_text = ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)
+    speech = None
+    if args.speak is not None:
+        speech = _synthesize_speech(ue, args, cfg, tokens)
     lm_wall = time.perf_counter() - started
     print(f"\nThinker stage done in {lm_wall:.2f}s wall")
 
