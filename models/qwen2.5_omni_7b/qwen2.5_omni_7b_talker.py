@@ -244,3 +244,49 @@ def write_wav(path: str, waveform: torch.Tensor, sample_rate: int = SAMPLE_RATE)
     audio = waveform.detach().float().cpu().reshape(-1).numpy()
     sf.write(path, audio, sample_rate)
     return path
+
+
+class ThinkerEmbeddings:
+    """Row lookups into the Thinker's embedding table, straight from the shards.
+
+    The accelerator keeps this table on-device, IF8 and sharded across cores,
+    and materialises a row INSIDE the decode program -- where it is promptly
+    overwritten, because with an even layer count the final layer writes the
+    same buffer the embedding was placed in. So the rows cannot be read back
+    after a step, and reconstructing them from the quantized shards would mean
+    dequantizing IF8 host-side for no benefit.
+
+    Reading the bf16 table directly is exact, costs no device time, and is what
+    the reference implementation conditions the Talker on. Rows are fetched
+    lazily by slice, so a few hundred of them never materialise the 1 GiB table.
+    """
+
+    def __init__(self, model_dir: str, name: str = "thinker.model.embed_tokens.weight"):
+        from safetensors import safe_open
+        index = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))
+        shard = index["weight_map"][name]
+        self._f = safe_open(os.path.join(model_dir, shard), framework="pt")
+        self._name = name
+        self._cache: dict[int, torch.Tensor] = {}
+        self.hidden = self._f.get_slice(name).get_shape()[1]
+
+    def rows(self, ids, zero_at=()) -> torch.Tensor:
+        """[1, N, H] embeddings for ``ids``; positions in ``zero_at`` come back 0.
+
+        MEDIA POSITIONS ARE ZEROED, not looked up. A vision or audio placeholder
+        has no meaningful embedding -- the encoder output was substituted for it
+        downstream -- and the reference zeroes exactly those rows before handing
+        the stream to the Talker.
+        """
+        sl = self._f.get_slice(self._name)
+        zero = set(zero_at)
+        out = torch.zeros(len(ids), self.hidden, dtype=torch.float32)
+        for i, tok in enumerate(ids):
+            if i in zero:
+                continue
+            t = self._cache.get(tok)
+            if t is None:
+                t = sl[tok:tok + 1].to(torch.float32).reshape(-1)
+                self._cache[tok] = t
+            out[i] = t
+        return out.unsqueeze(0)
