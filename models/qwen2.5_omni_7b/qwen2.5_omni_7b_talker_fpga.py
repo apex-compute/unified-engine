@@ -352,15 +352,9 @@ class TalkerRunner:
         self.ue.dma_to_accelerator_memory(self.ROPE, table.reshape(-1))
         self._rope_row_bytes = 2 * self.AHD * 2
 
-    def emit_rope(self, pos_reg: int, tmp_reg: int) -> int:
-        """Rotate every q head and every k head at the current position."""
+    def emit_rope_k(self, pos_reg: int, tmp_reg: int) -> int:
+        """Rotate the four key heads in the staging buffer, before caching."""
         f = 0
-        for h in range(self.QH):
-            f += self.ue.rope_hf_core_decode(
-                N=self.AHD, input_dram_addr=self.Q + h * self.AHD * 2,
-                output_dram_addr=self.Q + h * self.AHD * 2,
-                cos_dram_addr=self.ROPE, sin_dram_addr=self.ROPE + self.AHD * 2,
-                rope_size_reg=pos_reg, tmp_reg=tmp_reg) or 0
         for h in range(self.KV_HEADS):
             f += self.ue.rope_hf_core_decode(
                 N=self.AHD, input_dram_addr=self.K + h * self.AHD * 2,
@@ -369,10 +363,55 @@ class TalkerRunner:
                 rope_size_reg=pos_reg, tmp_reg=tmp_reg) or 0
         return f
 
+    def emit_rope_q(self, pos_reg: int, tmp_reg: int) -> int:
+        """Rotate every query head at the current position."""
+        f = 0
+        for h in range(self.QH):
+            f += self.ue.rope_hf_core_decode(
+                N=self.AHD, input_dram_addr=self.Q + h * self.AHD * 2,
+                output_dram_addr=self.Q + h * self.AHD * 2,
+                cos_dram_addr=self.ROPE, sin_dram_addr=self.ROPE + self.AHD * 2,
+                rope_size_reg=pos_reg, tmp_reg=tmp_reg) or 0
+        return f
+
+    KV_SRAM = 0x10000
+
+    def emit_kv_to_cache(self, li: int, kv_off_reg: int, addr_reg: int) -> int:
+        """Copy this step's K and V heads into their cache planes, on device.
+
+        ONE MATMUL CANNOT SCATTER: k_proj writes [1, 512] contiguously while the
+        four KV heads live in four separate planes. Rather than route that
+        through the host -- 48 round trips per codec token at 24 layers -- each
+        head takes an SRAM round to its plane, with the position carried in a
+        register. The same pattern the per-layer injection loop uses.
+
+        K is copied AFTER RoPE, so the cache holds rotated keys and attention
+        reads them directly.
+        """
+        for src, cache in ((self.K, self.K_CACHE), (self.V, self.V_CACHE)):
+            for h in range(self.KV_HEADS):
+                self.ue.accelerator_memory_to_sram(
+                    src + h * self.AHD * 2, self.KV_SRAM, self.AHD)
+                # add_imm is (SRC, IMM, DST): addr = kv_off + plane_base.
+                self.ue.generate_instruction_add_imm(
+                    kv_off_reg,
+                    user_dma_core.ue_35bit_addr_shifter(self._kv_plane(cache, li, h)),
+                    addr_reg)
+                self.ue.sram_to_accelerator_memory(
+                    self.KV_SRAM, 0, self.AHD, general_reg_src=addr_reg)
+        return 0
+
     # -- a whole layer ----------------------------------------------------
     def emit_layer(self, li: int, src: int, dst: int, *, live_aligned: int,
-                   pos_reg: int, tmp_reg: int) -> int:
-        """One Talker decoder layer at M=1: norm, GQA, residual, MLP, residual."""
+                   pos_reg: int, kv_off_reg: int, addr_reg: int,
+                   tmp_reg: int) -> int:
+        """One Talker decoder layer at M=1, as a single uninterrupted program.
+
+        K and V land in their cache planes directly, so nothing leaves the
+        device between the projections and the attention that consumes them.
+        RoPE is applied to Q here and to K inside the cache, at the row this
+        step just wrote.
+        """
         pre = f"model.layers.{li}."
         f = self._rms(M=1, N=self.H, src=src, dst=self.NORM,
                       gamma=pre + "input_layernorm.weight")
@@ -382,8 +421,9 @@ class TalkerRunner:
                         wname=pre + "self_attn.k_proj.weight", dst=self.K)
         f += self._proj(M=1, K=self.H, N=self.KV_SIZE, src=self.NORM,
                         wname=pre + "self_attn.v_proj.weight", dst=self.V)
-        f += self.emit_rope(pos_reg, tmp_reg)
-        # K/V reach their cache planes from the host between steps; see run().
+        f += self.emit_rope_q(pos_reg, tmp_reg)
+        f += self.emit_rope_k(pos_reg, tmp_reg)
+        f += self.emit_kv_to_cache(li, kv_off_reg, addr_reg)
         f += self.emit_attention(li, live_aligned)
         f += self._proj(M=1, K=self.Q_SIZE, N=self.H, src=self.ATTN,
                         wname=pre + "self_attn.o_proj.weight", dst=self.PROJ,
@@ -391,4 +431,17 @@ class TalkerRunner:
         self.ue.eltwise_core_dram(M=1, N=self.H, dram_a=src, dram_b=self.PROJ,
                                   dram_out=self.RESID, mode=UE_MODE.ELTWISE_ADD)
         f += self.emit_mlp(li, self.RESID, dst)
+        return f
+
+    def emit_step(self, *, layers: int, live_aligned: int, pos_reg: int,
+                  kv_off_reg: int, addr_reg: int, tmp_reg: int) -> int:
+        """The whole Talker for one codec step: projection, layers, head."""
+        f = self.emit_input_projection()
+        src, dst = self.IO_A, self.IO_B
+        for li in range(layers):
+            f += self.emit_layer(li, src, dst, live_aligned=live_aligned,
+                                 pos_reg=pos_reg, kv_off_reg=kv_off_reg,
+                                 addr_reg=addr_reg, tmp_reg=tmp_reg)
+            src, dst = dst, src
+        f += self.emit_head(src)
         return f
