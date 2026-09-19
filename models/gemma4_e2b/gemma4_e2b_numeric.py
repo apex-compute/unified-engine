@@ -338,12 +338,26 @@ def build_fpga_mimic_lm_reference(ue, inputs_embeds, prepared_per_layer_inputs):
     seq_len = x.shape[0]
     kv_cache = {}
     num_pos = ue._cfg["special"]["rope"]["num_positions"]
-    rope_local = _bf16_region(
-        ue, "ROPE_LOCAL", (num_pos, ue.head_dim_sliding * 2))
     global_rotary_dim = int(
         ue.head_dim * ue._cfg["special"]["rope"]["partial_rotary_factor_global"])
-    rope_global_raw = _bf16_region(
-        ue, "ROPE_GLOBAL", (num_pos, global_rotary_dim * 2))
+    # ROPE COMES FROM DRAM, NOT params.bin. _load_rope_host() GENERATES both
+    # tables on the host ([cos, cos, -sin, sin]) and DMAs them straight to DRAM,
+    # and weight_init deliberately skips the ROPE_LOCAL/ROPE_GLOBAL regions when
+    # loading the file. So those regions are never written and reading them back
+    # yields uninitialised bytes -- values like -2.3e+38 and NaN where a cos/sin
+    # table must be in [-1, 1]. One NaN in the consumed rows poisons q at the
+    # first global-rope layer, and from there every later stage of the oracle is
+    # NaN, which is what "no finite overlap" was reporting. Read the bytes the
+    # FPGA actually uses instead.
+    rope_local = ue.dma_from_accelerator_memory(
+        ue.DRAM_ADDR_ROPE_LOCAL, (num_pos, ue.head_dim_sliding * 2)).cpu()
+    rope_global_raw = ue.dma_from_accelerator_memory(
+        ue.DRAM_ADDR_ROPE_GLOBAL, (num_pos, global_rotary_dim * 2)).cpu()
+    for _name, _t in (("ROPE_LOCAL", rope_local), ("ROPE_GLOBAL", rope_global_raw)):
+        if not torch.isfinite(_t).all():
+            raise RuntimeError(
+                f"{_name} read back from DRAM is not finite; the oracle cannot "
+                f"mimic RoPE from it")
 
     for layer_idx in range(ue.LAYER_SIZE):
         head_dim, q_size, k_size = ue._get_layer_attention_dims(layer_idx)

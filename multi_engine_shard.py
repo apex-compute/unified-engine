@@ -222,6 +222,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import struct
 import time
 from dataclasses import dataclass, field, replace
@@ -401,11 +402,10 @@ def private_total() -> int:
 # stay at DRAM_START_ADDR: a multi-core model rebases its map above the arena
 # (the top 2 GB of an 8 GB device) and the whole layout needs >= 8 GB.
 #
-# NOTE ON THE CURRENT ALVEO BOARD. Its HW_INFO reports 8 cores / 4 GB, but the
-# 4 GB is stale register content -- the board is physically 8 GB. Until the
-# bitstream reports it correctly, run these models with
-# ``UE_FORCE_DRAM_SIZE_GB=8`` (see ``user_dma_core._dram_size_override_code``),
-# which patches the decoded HW_INFO and satisfies the check below.
+# NOTE ON THE CURRENT ALVEO BOARD. Its HW_INFO now reports 8 cores / 8 GB
+# correctly (HW_INFO 0x89016eab), so the check below passes on its own and
+# ``UE_FORCE_DRAM_SIZE_GB=8`` is NO LONGER NEEDED here. The override stays in
+# user_dma_core for any board still shipping a stale DRAM size in HW_INFO.
 MULTICORE_WINDOW_BYTES = 0x2000_0000      # 512 MB per engine, fixed
 MULTICORE_MIN_DRAM_GIB = 8
 
@@ -438,8 +438,509 @@ def require_multicore_dram(num_engines: int, what: str) -> None:
             f"{num_engines} x {MULTICORE_WINDOW_BYTES // 2**20} MB private "
             f"windows plus the model's own 2 GB map above them -- but HW_INFO "
             f"reports {gib} GB. On a board whose HW_INFO under-reports a "
-            f"physically larger DRAM (the current Alveo reports 4 GB for an "
-            f"8 GB device), set UE_FORCE_DRAM_SIZE_GB=8 to override it.")
+            f"physically larger DRAM, set UE_FORCE_DRAM_SIZE_GB to the true "
+            f"size to override it.")
+
+
+# ==========================================================================
+# WHICH HBM CONTROLLER EACH ENGINE OWNS (per board)
+# ==========================================================================
+# The window SIZE above is only half of the contract: on HBM the concurrent
+# bandwidth an engine gets depends on WHICH controller region its window lands
+# in, because an engine reaches its own controller at full rate and anything
+# further away shares the lateral switch. Measured on the U55C
+# (bitstream 0xc3ee417c, 512 kB per engine): 12 engines on the bases below read
+# at 108.1 GB/s -- 12 x 9.0, the per-port limit, and the same latency one engine
+# alone takes -- against 56.4 GB/s for a flat 512 MiB-per-core stride, which
+# leaves most cores reading across that switch. The contended unit is a 512 MiB
+# segment, not a 1 GiB controller: two engines in one segment take 2x the time,
+# while the two halves of one controller run at the full 18.1 GB/s.
+#
+# Alveo U50 contention-free HBM allocation (full concurrent bandwidth).
+# ALVEO TARGET ONLY: use this map only when HW_INFO reports core_count == 8.
+# It does not describe Kintex-7, U55C, or any other target/core-count layout.
+# Each engine owns one 512 MiB memory-controller region on EACH 4 GiB stack,
+# for 1 GiB of private DRAM total.  HBM1 is the matching HBM0 range + 4 GiB.
+# The engine-to-controller order follows build_alveo.tcl's dedicated SAXI-port
+# wiring, so it is deliberately not a simple ``core * stride`` permutation:
+#
+#   core  SAXI/MC  HBM0 private range              HBM1 private range
+#     0    00 / 0  0x000000000 - 0x01FFFFFFF      0x100000000 - 0x11FFFFFFF
+#     1    04 / 2  0x040000000 - 0x05FFFFFFF      0x140000000 - 0x15FFFFFFF
+#     2    08 / 4  0x080000000 - 0x09FFFFFFF      0x180000000 - 0x19FFFFFFF
+#     3    06 / 3  0x060000000 - 0x07FFFFFFF      0x160000000 - 0x17FFFFFFF
+#     4    02 / 1  0x020000000 - 0x03FFFFFFF      0x120000000 - 0x13FFFFFFF
+#     5    14 / 7  0x0E0000000 - 0x0FFFFFFFF      0x1E0000000 - 0x1FFFFFFFF
+#     6    12 / 6  0x0C0000000 - 0x0DFFFFFFF      0x1C0000000 - 0x1DFFFFFFF
+#     7    10 / 5  0x0A0000000 - 0x0BFFFFFFF      0x1A0000000 - 0x1BFFFFFFF
+#
+# 512 MiB is the per-stack controller stride; 4 GiB is the stack stride.  The
+# linear test allocator below only guarantees non-overlap.  Code that requires
+# full HBM concurrency must use the controller-aligned bases above (and the
+# matching +0x1_0000_0000 range when it also uses HBM1).
+#
+# WHAT ACTUALLY CONTENDS ON THE U50 is the 1 GiB four-pseudo-channel SWITCH
+# REGION, not the 512 MiB controller.  Measured with multi_core_dram_speed_test
+# at 512 kB per engine, one engine alone reads 10.7 GB/s (91% of the 11.7 GB/s
+# its own 256-bit AXI port can carry at 366.67 MHz), and:
+#
+#   engines in one 1 GiB region   per-engine rate
+#     1                             10.7 GB/s
+#     2                             10.7 GB/s   <- still full rate
+#     3                              5.7 GB/s   <- halves, and stays halved
+#     4                              5.7 GB/s
+#
+# So the rule is AT MOST TWO ENGINES PER 1 GiB REGION, and the 512 MiB
+# controller stride satisfies it with room to spare.  Aggregate over all eight
+# engines, same test:
+#
+#   flat 0x1000_0000 (256 MiB) stride   45.8 GB/s   4 engines per region
+#   flat 0x2000_0000 (512 MiB) stride   85.2 GB/s   2 engines per region
+#   ALVEO_CORE_MC_ORDER bases           85.2 GB/s   2 engines per region
+#   ALVEO_CORE_MC_ORDER bases, HBM1     84.4 GB/s
+#
+# Note the SAXI permutation buys nothing over a plain 512 MiB stride at this
+# transfer size -- both hit the per-engine AXI port ceiling -- so the map above
+# is about which region each engine OWNS, not about shortening its path.  What
+# the layout is worth downstream, same 8 engines:
+#
+#   M=1 K=1536 N=6144 IF4 (memory bound)  174.9 -> 309.2 GFLOPS, 4.37x -> 7.74x
+#   M=6144 K=1024 N=1024 bf16 (compute)   349.0 -> 357.1 GFLOPS, 7.84x -> 8.03x
+#
+# Alveo U55C HBM ownership for the u55c/hbm-port-reorder Tcl design.
+# ALVEO_U55C TARGET ONLY: use this map only when HW_INFO reports core_count == 12.
+# The single 8 GiB HBM address space has eight memory controllers (MCs).  Each
+# MC owns two adjacent 512 MiB HBM_MEM segments, hence one contiguous 1 GiB
+# range; SAXI ports 2k and 2k+1 share MC k.  The reordered engine wiring is:
+#
+#   core  SAXI / MC  controller-aligned range          bandwidth ownership
+#     0     00 / 0   0x000000000 - 0x03FFFFFFF        shared with core 8
+#     1     02 / 1   0x040000000 - 0x07FFFFFFF        shared with core 9
+#     2     04 / 2   0x080000000 - 0x0BFFFFFFF        shared with core 10
+#     3     06 / 3   0x0C0000000 - 0x0FFFFFFFF        shared with core 11
+#     4     08 / 4   0x100000000 - 0x13FFFFFFF        shared with XDMA (SAXI 09)
+#     5     10 / 5   0x140000000 - 0x17FFFFFFF        exclusive for core 5
+#     6     12 / 6   0x180000000 - 0x1BFFFFFFF        exclusive for core 6
+#     7     14 / 7   0x1C0000000 - 0x1FFFFFFFF        exclusive for core 7
+#     8     01 / 0   0x000000000 - 0x03FFFFFFF        shared with core 0
+#     9     03 / 1   0x040000000 - 0x07FFFFFFF        shared with core 1
+#    10     05 / 2   0x080000000 - 0x0BFFFFFFF        shared with core 2
+#    11     07 / 3   0x0C0000000 - 0x0FFFFFFFF        shared with core 3
+
+KINTEX7_BOARD_CORES = 2                     # HW_INFO signature of the kintex7 image
+ALVEO_BOARD_CORES = 8                       # HW_INFO signature of the U50 image
+ALVEO_U55C_BOARD_CORES = 12                 # HW_INFO signature of the U55C image
+
+ALVEO_MC_STRIDE = 0x2000_0000               # U50: 512 MiB per controller, per stack
+ALVEO_STACK_STRIDE = 0x1_0000_0000          # U50: HBM1 is HBM0 + 4 GiB
+# build_alveo.tcl's SAXI wiring, core -> controller. NOT core * stride.
+ALVEO_CORE_MC_ORDER = (0, 2, 4, 3, 1, 7, 6, 5)
+
+ALVEO_U55C_MC_STRIDE = 0x4000_0000          # U55C: one controller, two segments
+ALVEO_U55C_SEGMENT_STRIDE = 0x2000_0000     # U55C: one HBM_MEM segment, 512 MiB
+ALVEO_U55C_MC_COUNT = 8
+# Core k < 8 takes the FIRST segment of its own controller, core 8+k the SECOND
+# segment of controller k, so the two cores that share a controller never share
+# a segment. A model that uses only the first eight engines therefore gets one
+# whole controller each, which is what the 1 GiB-per-core model maps do.
+ALVEO_U55C_CORE_BASES = tuple(
+    (core % ALVEO_U55C_MC_COUNT) * ALVEO_U55C_MC_STRIDE
+    + (core // ALVEO_U55C_MC_COUNT) * ALVEO_U55C_SEGMENT_STRIDE
+    for core in range(ALVEO_U55C_BOARD_CORES)
+)
+
+
+def alveo_core_bases(num_engines: int, stack: int = 0) -> list[int]:
+    """U50 controller-aligned private bases, ``num_engines`` of them.
+
+    ``stack`` selects HBM0 (0) or HBM1 (1); each engine owns the SAME 512 MiB
+    controller region on both, so the HBM1 base is the HBM0 base + 4 GiB.
+    """
+    if not 1 <= num_engines <= len(ALVEO_CORE_MC_ORDER):
+        raise ValueError(
+            f"num_engines must be 1..{len(ALVEO_CORE_MC_ORDER)} for the Alveo "
+            f"HBM map, got {num_engines}")
+    if stack not in (0, 1):
+        raise ValueError(f"stack must be 0 (HBM0) or 1 (HBM1), got {stack}")
+    return [ALVEO_CORE_MC_ORDER[core] * ALVEO_MC_STRIDE + stack * ALVEO_STACK_STRIDE
+            for core in range(num_engines)]
+
+
+def alveo_u55c_core_bases(num_engines: int) -> list[int]:
+    """U55C controller-aligned private bases, ``num_engines`` of them.
+
+    Engine i's base is the start of the 512 MiB segment it owns outright, so
+    concurrent reads from these bases never contend. Use them for anything
+    bandwidth-bound; a flat ``core * stride`` costs roughly half the bandwidth
+    on this board however large the stride is.
+    """
+    if not 1 <= num_engines <= len(ALVEO_U55C_CORE_BASES):
+        raise ValueError(
+            f"num_engines must be 1..{len(ALVEO_U55C_CORE_BASES)} for the U55C "
+            f"HBM map, got {num_engines}")
+    return list(ALVEO_U55C_CORE_BASES[:num_engines])
+
+
+def is_alveo_u55c() -> bool:
+    """True when HW_INFO's core count is the U55C image's signature."""
+    return user_dma_core.ANDROMEDA_CORE_COUNT == ALVEO_U55C_BOARD_CORES
+
+
+# ==========================================================================
+# WHOLE-BOARD PRIVATE WINDOWS (the hardware test suite's map)
+# ==========================================================================
+# THIS IS NOT THE MODEL ARENA POLICY. Two different maps coexist and they are
+# not interchangeable:
+#
+#   model runs   engines share the device with the model's own 2 GB map, so
+#                they get the LOW arena only -- multicore_arena_bytes() +
+#                private_region(), fixed 512 MB windows from 0 upward, model
+#                rebased above them. See "THE MULTI-CORE WINDOW IS A FIXED
+#                512 MB" above.
+#   test runs    user_hw_test.py owns the whole device; nothing else is
+#                resident. So the engines divide ALL of DRAM -- 1 GB per core
+#                on both Alveo boards, instead of the model map's 512 MB.
+#
+# A U50 engine's 1 GiB is NOT ONE CONTIGUOUS RANGE, and that is the point of
+# EngineWindow. The board has two 4 GiB stacks and each engine has its own
+# dedicated SAXI port on BOTH (``SAXI_xx`` on hbm_0, ``SAXI_xx_RT`` on hbm_1,
+# see build_alveo.tcl:908-938). The 512 MB region an engine owns outright on
+# each stack is therefore the SAME controller offset 4 GiB apart, so its
+# private DRAM is two segments: ``B`` and ``B + 0x1_0000_0000``. Splicing them
+# into one 1 GiB range is impossible -- the addresses in between belong to
+# other engines -- so callers get the segments and must not assume contiguity.
+#
+# Every byte of a U50 window is reached over that engine's own port with no
+# lateral switch hop, and the eight windows together consume all 8 GiB.
+
+ENGINE_TENSOR_OFFSET = 0x0800_0000    # tensor scratch, from the window base
+ENGINE_PROGRAM_OFFSET = 0x0F00_0000   # ISA program, from the window base
+ENGINE_FOOTPRINT_BYTES = 0x0F10_0000  # what one engine actually uses above base
+DDR_WINDOW_BYTES = 0x1000_0000        # 256 MB, the legacy single-controller map
+
+
+@dataclass(frozen=True)
+class EngineWindow:
+    """One engine's private DRAM, as one or more non-contiguous segments.
+
+    ``segments`` is ascending ``(base, nbytes)``. ``base`` is the FIRST
+    segment and is where the engine's allocator cursors live, so a caller that
+    only needs ENGINE_FOOTPRINT_BYTES can ignore the rest; a caller that wants
+    the whole window must walk ``segments`` and must not assume the segments
+    join up.
+    """
+
+    engine_idx: int
+    segments: tuple[tuple[int, int], ...]
+
+    @property
+    def base(self) -> int:
+        """Primary segment base -- the engine's params/tensor/program origin."""
+        return self.segments[0][0]
+
+    @property
+    def primary_bytes(self) -> int:
+        return self.segments[0][1]
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(nbytes for _, nbytes in self.segments)
+
+    @property
+    def is_contiguous(self) -> bool:
+        return len(self.segments) == 1
+
+    def ranges(self) -> list[tuple[int, int]]:
+        """Half-open ``(start, end)`` per segment."""
+        return [(b, b + n) for b, n in self.segments]
+
+    def describe(self) -> str:
+        segs = " + ".join(f"0x{b:09X}..0x{b + n:09X} ({n // 2**20} MB)"
+                          for b, n in self.segments)
+        return f"core {self.engine_idx}: {self.total_bytes // 2**20} MB = {segs}"
+
+
+def board_private_windows(num_engines: int) -> list[EngineWindow]:
+    """THE multi-core DRAM layout. One handler, three boards, keyed on HW_INFO.
+
+    Nothing else in the tree decides where a multi-core engine's private DRAM
+    lives -- callers ask here. The board is identified by its HW_INFO CORE
+    COUNT, which is the image signature (see is_alveo_u55c):
+
+      2 cores   kintex7      the legacy map, reproduced from origin/main
+                             unchanged: 512 MB per core from 0 on a >= 4 GB
+                             report, else 256 MB per core from DRAM_START_ADDR.
+      8 cores   alveo U50    TWO 512 MB segments per core -- the controller
+                             region it owns on EACH of the two 4 GiB HBM
+                             stacks. 1 GB per core, all 8 GiB claimed.
+      12 cores  alveo U55C   one CONSECUTIVE 1 GiB per core, which is its whole
+                             memory controller (two adjacent 512 MB segments).
+
+    Any other core count raises: a window map guessed for hardware nobody has
+    measured is worse than no map at all.
+
+    For the model-side low-arena map use multicore_arena_bytes() and
+    private_region() instead -- see the comment block above.
+    """
+    if num_engines < 1:
+        raise ValueError(f"num_engines must be >= 1, got {num_engines}")
+    if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
+        user_dma_core.configure_clock_from_hardware()
+
+    cores = user_dma_core.ANDROMEDA_CORE_COUNT
+    gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
+    if num_engines > cores:
+        raise ValueError(
+            f"num_engines={num_engines} exceeds the {cores} engines HW_INFO reports")
+
+    if cores == ALVEO_BOARD_CORES:
+        # U50. Each engine has its own SAXI port on BOTH stacks, so the 512 MB
+        # it owns outright is the same controller offset 4 GiB apart -- its
+        # 1 GB is two segments and CANNOT be spliced (other engines hold the
+        # addresses in between).
+        lo = alveo_core_bases(num_engines, stack=0)
+        hi = alveo_core_bases(num_engines, stack=1)
+        windows = [EngineWindow(i, ((lo[i], ALVEO_MC_STRIDE), (hi[i], ALVEO_MC_STRIDE)))
+                   for i in range(num_engines)]
+    elif cores == ALVEO_U55C_BOARD_CORES:
+        # U55C. One MC owns two adjacent 512 MB segments, so a core's 1 GiB is
+        # consecutive. Only EIGHT fit: 8 GiB / 1 GiB. Past that the board's own
+        # 512 MB-per-core map (ALVEO_U55C_CORE_BASES) is the only option, and
+        # the caller has to ask for it deliberately rather than be silently
+        # given half of what this function promises.
+        if num_engines > ALVEO_U55C_MC_COUNT:
+            raise ValueError(
+                f"num_engines={num_engines} x 1 GiB does not fit the U55C's "
+                f"{gib} GiB; at most {ALVEO_U55C_MC_COUNT} cores get a "
+                f"consecutive 1 GiB. For all {cores} engines use the 512 MB "
+                f"segment map, alveo_u55c_core_bases().")
+        windows = [EngineWindow(i, ((i * ALVEO_U55C_MC_STRIDE, ALVEO_U55C_MC_STRIDE),))
+                   for i in range(num_engines)]
+    elif cores == KINTEX7_BOARD_CORES:
+        if gib >= 4:
+            base, size = 0x0, MULTICORE_WINDOW_BYTES
+        else:
+            base, size = user_dma_core.DRAM_START_ADDR, DDR_WINDOW_BYTES
+        windows = [EngineWindow(i, ((base + i * size, size),))
+                   for i in range(num_engines)]
+    else:
+        raise ValueError(
+            f"no multi-core DRAM map for a {cores}-core board (HW_INFO reports "
+            f"{gib} GB). The maps here are measured per board: "
+            f"{KINTEX7_BOARD_CORES} cores = kintex7, {ALVEO_BOARD_CORES} = "
+            f"Alveo U50, {ALVEO_U55C_BOARD_CORES} = Alveo U55C. Measure the "
+            f"new board's HBM ownership and add it above.")
+
+    _validate_windows(windows, gib, is_hbm=gib >= 4)
+    return windows
+
+
+def _validate_windows(windows: list[EngineWindow], gib: int, is_hbm: bool) -> None:
+    """Every segment in range, big enough, and owned by exactly one engine."""
+    dram_end = gib * 1024 * 1024 * 1024
+    for w in windows:
+        if w.primary_bytes < ENGINE_FOOTPRINT_BYTES:
+            raise ValueError(
+                f"core {w.engine_idx}: primary segment is 0x{w.primary_bytes:X} "
+                f"bytes, below the 0x{ENGINE_FOOTPRINT_BYTES:X} one engine uses "
+                f"above its base")
+        if is_hbm:
+            for base, nbytes in w.segments:
+                if base + nbytes > dram_end:
+                    raise ValueError(
+                        f"core {w.engine_idx}: segment 0x{base:X}..0x{base + nbytes:X} "
+                        f"runs past the 0x{dram_end:X} bytes HW_INFO reports")
+    spans = sorted((b, b + n, w.engine_idx)
+                   for w in windows for b, n in w.segments)
+    for (b0, e0, i0), (b1, _e1, i1) in zip(spans, spans[1:]):
+        if b1 < e0:
+            raise ValueError(
+                f"cores {i0} and {i1} overlap at 0x{b1:X} "
+                f"(core {i0} owns 0x{b0:X}..0x{e0:X})")
+
+
+def describe_board_windows(num_engines: int) -> str:
+    windows = board_private_windows(num_engines)
+    total = sum(w.total_bytes for w in windows)
+    lines = [f"  whole-board private map, {num_engines} core(s), "
+             f"{total // 2**20} MB claimed:"]
+    lines += ["    " + w.describe() for w in windows]
+    return "\n".join(lines)
+
+
+# ==========================================================================
+# THE 1 GiB WINDOW MAP FOR MODELS WHOSE WINDOWS TILE THE WHOLE DEVICE
+# ==========================================================================
+# A 512 MiB window (MULTICORE_WINDOW_BYTES) leaves the model's own map above the
+# arena. Qwen2.5-Omni cannot do that -- its private shards are ~708 MiB per core
+# -- so its windows are 1 GiB and they TILE the whole 8 GiB device, with the
+# shared pool carved from their tails. That map asks the board for exactly one
+# guarantee: CONCURRENT READS FROM THE EIGHT WINDOWS MUST NOT CONTEND.
+#
+# Both Alveo boards give it, for DIFFERENT reasons, and both end up at the SAME
+# bases -- core i at i GiB:
+#
+#   U55C (12 cores)  a memory controller owns one contiguous 1 GiB, and the
+#                    reordered SAXI wiring puts core i on controller i for
+#                    i < 8. The window IS the controller. ALVEO_U55C_CORE_BASES'
+#                    first eight entries are exactly i * 1 GiB.
+#   U50  (8 cores)   the contended unit here is NOT the 512 MiB controller but
+#                    the 1 GiB four-pseudo-channel SWITCH REGION: measured
+#                    above, two engines reading one region each still get the
+#                    full 10.7 GB/s, three drop to 5.7. A 1 GiB window IS one
+#                    switch region, so eight windows over 8 GiB give every core
+#                    a region to ITSELF -- one engine per region, half the
+#                    occupancy the board tolerates.
+#
+# WHAT THE U50 DOES NOT NEED HERE. An engine owns two 512 MiB segments outright
+# -- one per stack, reached through its own SAXI port (alveo_core_bases,
+# board_private_windows) -- and it is tempting to conclude that a 1 GiB private
+# window must therefore be those two segments rather than one contiguous range.
+# It must not: port ownership is about reaching a region without a lateral hop,
+# and at these transfer sizes that hop costs nothing. The MC-ordered bases and a
+# flat 512 MiB stride both measure 85.2 GB/s, which is the per-engine AXI port
+# ceiling, not a switch effect. What costs bandwidth is CROWDING -- three or
+# more engines in one 1 GiB region -- and a contiguous 1 GiB window per core
+# cannot crowd. So the model keeps one contiguous window and the allocator stays
+# a single bump arena; splitting it into two port-owned segments would buy
+# nothing and would cost the map its contiguity (the untied head alone needs
+# 276 MiB in one piece, which no 512 MiB segment can still offer once ~708 MiB
+# of private shards have been placed).
+SWITCH_REGION_BYTES = 0x4000_0000        # 1 GiB: four pseudo-channels, one switch
+MAX_ENGINES_PER_SWITCH_REGION = 2        # measured: 3 halves the per-engine rate
+
+# THE WINDOW SIZE IS PER BOARD, NOT SHARED. Today both boards land on 1 GiB and
+# therefore on identical bases, which is a coincidence of two different facts --
+# a U55C window is one MEMORY CONTROLLER, a U50 window is one SWITCH REGION --
+# and it is about to stop being true: the U55C moves to 2 GiB per core when its
+# HBM is upgraded. Keep the two constants apart so that upgrade is one edit in
+# the U55C branch and cannot silently redefine the U50's window, whose 1 GiB is
+# fixed by the fabric and does not move.
+ALVEO_WINDOW_BYTES = SWITCH_REGION_BYTES        # U50: one switch region. Fixed.
+ALVEO_U55C_WINDOW_BYTES = ALVEO_U55C_MC_STRIDE  # U55C: one controller. -> 2 GiB on upgrade.
+# THE U55C UPGRADE, when it lands, is ALVEO_U55C_MC_STRIDE and
+# ALVEO_U55C_SEGMENT_STRIDE together: the window follows the controller, and the
+# second-segment offset that cores 8+ take (ALVEO_U55C_CORE_BASES) is half of
+# it. Everything else here -- the bases, the window size, the validator -- is
+# derived, and the U50 side must not move at all.
+
+
+def board_window_bytes(what: str) -> int:
+    """The per-core private window this board hands a tiling map."""
+    reported = user_dma_core.ANDROMEDA_CORE_COUNT
+    if reported == ALVEO_U55C_BOARD_CORES:
+        return ALVEO_U55C_WINDOW_BYTES
+    if reported == ALVEO_BOARD_CORES:
+        return ALVEO_WINDOW_BYTES
+    raise ValueError(
+        f"{what}: no tiling window map for a {reported}-core board. The maps "
+        f"here are measured per board: {ALVEO_BOARD_CORES} cores = Alveo U50, "
+        f"{ALVEO_U55C_BOARD_CORES} = Alveo U55C. Measure the new board's HBM "
+        f"behaviour and add it above rather than inheriting a map built around "
+        f"different wiring.")
+
+
+def tiled_window_bases(num_engines: int, window_bytes: int, what: str) -> list[int]:
+    """Private window bases for a model whose windows tile the whole device.
+
+    The board is identified by HW_INFO's core count, which is the image
+    signature (see :func:`is_alveo_u55c`), and the result is validated against
+    the board rather than assumed: in range, non-overlapping, and with no
+    1 GiB switch region carrying more engines than it can serve at full rate.
+    A board nobody has characterised is refused rather than guessed at.
+    """
+    reported = user_dma_core.ANDROMEDA_CORE_COUNT
+    if reported is None or user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
+        raise RuntimeError(
+            f"{what}: HW_INFO has not been read, so the board is unknown; call "
+            f"user_dma_core.configure_clock_from_hardware() first")
+    if num_engines < 1:
+        raise ValueError(f"{what}: num_engines must be >= 1, got {num_engines}")
+    board_window = board_window_bytes(what)
+    if window_bytes != board_window:
+        raise ValueError(
+            f"{what}: this board hands out {board_window // 2**20} MiB windows "
+            f"but the map asks for {window_bytes // 2**20} MiB. The two are not "
+            f"interchangeable -- a smaller window leaves part of the board's "
+            f"unit of bandwidth to somebody else, a larger one overlaps a "
+            f"neighbour. Re-tune the map's reserves and extents for this "
+            f"board's window rather than passing the other board's number.")
+    if num_engines > reported:
+        raise ValueError(
+            f"{what}: needs {num_engines} engines; HW_INFO reports {reported}")
+    # THE DRAM SIZE OVERRIDE IS NOT ACCEPTABLE FOR A TILING MAP. For a model
+    # whose windows sit in the low arena, UE_FORCE_DRAM_SIZE_GB being wrong is
+    # merely optimistic. Here the windows COVER the device, so a forced size the
+    # bitstream does not actually map does not fault -- the upper windows alias
+    # the lower ones and four cores silently scribble over the other four's
+    # weights. The U50 shipped exactly that combination for a while: HW_INFO
+    # said 4 GiB and build_alveo.tcl mapped a single stack.
+    if os.environ.get("UE_FORCE_DRAM_SIZE_GB"):
+        raise ValueError(
+            f"{what}: windows that tile the whole device must be backed by DRAM "
+            f"the board REPORTS, but UE_FORCE_DRAM_SIZE_GB is set "
+            f"({os.environ['UE_FORCE_DRAM_SIZE_GB']!r}). If the bitstream does "
+            f"not map the size being forced, the upper windows alias the lower "
+            f"ones and half the cores overwrite the other half. Run an image "
+            f"whose HW_INFO reports the full size instead.")
+
+    if reported == ALVEO_U55C_BOARD_CORES:
+        if num_engines > ALVEO_U55C_MC_COUNT:
+            raise ValueError(
+                f"{what}: only {ALVEO_U55C_MC_COUNT} of the U55C's {reported} "
+                f"cores get a controller to themselves; cores 8+ share one with "
+                f"cores 0-3 and would halve their bandwidth.")
+        bases = alveo_u55c_core_bases(num_engines)
+    elif reported == ALVEO_BOARD_CORES:
+        # One contiguous switch region per core. The SAXI permutation that
+        # alveo_core_bases applies is deliberately NOT used: it decides which
+        # port reaches a region directly, and the measurements above show that
+        # does not move the number. Occupancy does, and this map is 1 per region.
+        bases = [i * window_bytes for i in range(num_engines)]
+    else:  # unreachable: board_window_bytes() already refused the board
+        raise ValueError(f"{what}: no tiling window map for {reported} cores")
+
+    require_uncontended_windows(bases, window_bytes, what)
+    return bases
+
+
+def require_uncontended_windows(bases: list[int], window_bytes: int,
+                                what: str) -> None:
+    """Fail unless the windows are in range, disjoint, and free of crowding."""
+    if window_bytes <= 0 or window_bytes % SWITCH_REGION_BYTES:
+        raise ValueError(
+            f"{what}: a window must be whole switch regions "
+            f"({SWITCH_REGION_BYTES // 2**20} MiB each), got 0x{window_bytes:X}")
+    dram_end = user_dma_core.AVAILABLE_DRAM_SIZE_GB * 2**30
+    for i, base in enumerate(bases):
+        if base % SWITCH_REGION_BYTES:
+            raise ValueError(
+                f"{what}: core {i}'s window at 0x{base:X} does not start on a "
+                f"{SWITCH_REGION_BYTES // 2**20} MiB switch-region boundary")
+        if base + window_bytes > dram_end:
+            raise ValueError(
+                f"{what}: core {i}'s window 0x{base:X}..0x{base + window_bytes:X} "
+                f"runs past the 0x{dram_end:X} bytes HW_INFO reports")
+    spans = sorted((b, i) for i, b in enumerate(bases))
+    for (b0, i0), (b1, i1) in zip(spans, spans[1:]):
+        if b1 < b0 + window_bytes:
+            raise ValueError(
+                f"{what}: cores {i0} and {i1} overlap at 0x{b1:X} "
+                f"(core {i0} owns 0x{b0:X}..0x{b0 + window_bytes:X})")
+    occupancy: dict[int, list[int]] = {}
+    for i, base in enumerate(bases):
+        for region in range(base // SWITCH_REGION_BYTES,
+                            (base + window_bytes) // SWITCH_REGION_BYTES):
+            occupancy.setdefault(region, []).append(i)
+    crowded = {r: e for r, e in occupancy.items()
+               if len(e) > MAX_ENGINES_PER_SWITCH_REGION}
+    if crowded:
+        detail = "; ".join(
+            f"region {r} (0x{r * SWITCH_REGION_BYTES:X}) holds cores {e}"
+            for r, e in sorted(crowded.items()))
+        raise ValueError(
+            f"{what}: more than {MAX_ENGINES_PER_SWITCH_REGION} engines share an "
+            f"HBM switch region, which halves their read bandwidth -- {detail}")
 
 
 def private_stride(num_engines: int, arena_bytes: Optional[int] = None,
@@ -590,13 +1091,49 @@ class PrivateArena:
             self.regions = [replace(r, isa_base=ext_base + i * ext_stride)
                             for i, r in enumerate(self.regions)]
         self._weight_cursor = [r.weight_base for r in self.regions]
+        # Audit trail for the layout report: what each private carve was for.
+        self._weight_allocs: list[dict] = []
         self._tensor_cursor = [r.tensor_base for r in self.regions]
+        # THE SHARED POOL GROWS DOWN FROM THE TOP OF EACH WEIGHT ARENA, while
+        # private weights bump UP from its base.  The two cursors meet in the
+        # middle and every allocation on either side checks the other, so the
+        # empty tail of a private window can host data every core reads without
+        # a second allocator that could place it on top of live weights.
+        self._shared_cursor = [r.weight_limit for r in self.regions]
+        self._shared_allocs: list[dict] = []
+        # A FLOOR THE SHARED POOL MAY NOT LEND BELOW. alloc_shared places into
+        # whichever window has the most room RIGHT NOW, which is the correct
+        # rule only if every private allocation has already happened. It has
+        # not: a model stages shared weights while its private shards are still
+        # to come, so without a floor one window can be lent space a later
+        # private allocation needs, and the failure surfaces on an unrelated
+        # engine much later. Declaring the private footprint up front is what
+        # "private first, shared uses the rest" actually requires.
+        self._private_reserve = [0] * num_engines
+        # TWO SHARED CURSORS, GROWING TOWARDS EACH OTHER. The pool serves two
+        # populations with INTERLEAVED lifetimes: weight sections (staged, then
+        # released at a phase change) and tensors (carved after the weights,
+        # released at their own phase change). One stack cannot express that --
+        # releasing the weights would have to pop the tensors above them -- so
+        # weights bump DOWN from the window top and tensors bump UP from the
+        # private reserve. Each is LIFO within itself and they are independent.
+        self._shared_up_cursor = [r.weight_base for r in self.regions]
+        self._shared_up_allocs: list[dict] = []
         if verbose:
             print(self.describe())
 
     # -- introspection ------------------------------------------------------
     def region(self, engine_idx: int) -> PrivateRegion:
         return self.regions[engine_idx]
+
+    def window_base(self, engine_idx: int) -> int:
+        """Where one engine's private window starts.
+
+        On HBM this is the address a board map is checked against: which
+        controller a window lands in is what the concurrent bandwidth depends
+        on (see alveo_u55c_core_bases).
+        """
+        return self.regions[engine_idx].base
 
     def isa_base(self, engine_idx: int) -> int:
         return self.regions[engine_idx].isa_base
@@ -606,6 +1143,10 @@ class PrivateArena:
 
     def weight_bytes(self) -> int:
         return self.stride - self._carve_isa_bytes - self.tensor_bytes
+
+    def weight_allocations(self) -> list[dict]:
+        """Every private carve, in order -- the audit trail for the map."""
+        return list(self._weight_allocs)
 
     def usage(self) -> list[int]:
         """Bytes of weight arena used per engine."""
@@ -634,14 +1175,20 @@ class PrivateArena:
         """Bump-allocate in an engine's WEIGHT arena, 64 B aligned."""
         addr = (self._weight_cursor[engine_idx] + 63) & ~63
         end = addr + size_bytes
-        limit = self.regions[engine_idx].weight_limit
+        limit = self._shared_cursor[engine_idx]
         if end > limit:
+            window_limit = self.regions[engine_idx].weight_limit
+            borrowed = window_limit - limit
+            detail = (f", {borrowed / 2**20:.1f} MB of it lent to the shared pool"
+                      if borrowed else "")
             raise MemoryError(
                 f"{what}: engine {engine_idx} private weight arena overflow -- needs "
-                f"0x{end:X}, window ends at 0x{limit:X} "
+                f"0x{end:X}, usable arena ends at 0x{limit:X} "
                 f"({self.weight_bytes() // 2**20} MB per core at "
-                f"num_engines={self.num_engines})")
+                f"num_engines={self.num_engines}{detail})")
         self._weight_cursor[engine_idx] = end
+        self._weight_allocs.append(
+            {"engine": engine_idx, "base": addr, "size": size_bytes, "what": what})
         return addr
 
     def alloc_tensor(self, engine_idx: int, size_bytes: int, what: str) -> int:
@@ -668,6 +1215,210 @@ class PrivateArena:
         of the same thing, and the caller wants a list it can index by engine.
         """
         return [self.alloc_tensor(i, size_bytes, what) for i in range(self.num_engines)]
+
+    # -- the shared pool inside the private windows --------------------------
+    #
+    # WHY SHARED DATA LIVES IN PRIVATE WINDOWS. When the windows tile the WHOLE
+    # device there is no "elsewhere" left: a map of N x 1 GB over an N GB board
+    # has no region above the arena for the weights and tensors that every core
+    # must read. The empty tail of each window is exactly the space that is
+    # free, so shared data is carved from there -- downward, against the private
+    # weight cursor, so the arena itself arbitrates between the two and neither
+    # can silently land on the other.
+    #
+    # A shared allocation is CONTIGUOUS and lives inside ONE window. It is not
+    # striped across the per-core gaps: the matvec unit consumes a contiguous
+    # row block, so a weight section that straddled two windows would need a
+    # gather the hardware does not have. The consequence for callers is that the
+    # largest single shared object is bounded by the largest single gap, not by
+    # the total free bytes -- ``shared_free()`` reports both.
+
+    def reserve_private(self, bytes_per_engine: int) -> None:
+        """Declare how much of each window private shards will need.
+
+        Call once, before any :meth:`alloc_shared`. The pool then lends only
+        what is left over, so a large shared section cannot strand a private
+        allocation that has not been made yet.
+        """
+        if bytes_per_engine < 0:
+            raise ValueError(f"private reserve must be >= 0, got {bytes_per_engine}")
+        capacity = self.weight_bytes()
+        if bytes_per_engine > capacity:
+            raise ValueError(
+                f"private reserve {bytes_per_engine / 2**20:.1f} MiB exceeds the "
+                f"{capacity / 2**20:.1f} MiB weight arena per core")
+        for i in range(self.num_engines):
+            lent = self.regions[i].weight_limit - self._shared_cursor[i]
+            if lent and self._shared_cursor[i] < self.regions[i].weight_base + bytes_per_engine:
+                raise ValueError(
+                    f"engine {i} has already lent {lent / 2**20:.1f} MiB below the "
+                    f"requested reserve; declare it before allocating shared space")
+        self._private_reserve = [bytes_per_engine] * self.num_engines
+        for i in range(self.num_engines):
+            floor = self.regions[i].weight_base + bytes_per_engine
+            if self._shared_up_cursor[i] < floor:
+                self._shared_up_cursor[i] = floor
+
+    def shared_free(self) -> list[int]:
+        """Free bytes per window the shared pool may still take."""
+        return [max(0, self._shared_cursor[i]
+                    - max(self._weight_cursor[i], self._shared_up_cursor[i],
+                          self.regions[i].weight_base + self._private_reserve[i]))
+                for i in range(self.num_engines)]
+
+    def alloc_shared(self, size_bytes: int, what: str,
+                     align: int = SRAM_ROW_BYTES,
+                     engine_idx: Optional[int] = None) -> int:
+        """Carve ``size_bytes`` of every-core-readable DRAM from a window tail.
+
+        Returns one contiguous, ``align``-aligned address. Placement goes to the
+        window with the MOST room left (or ``engine_idx`` when the caller needs a
+        specific one), which keeps the gaps evenly drained instead of filling
+        core 0 and then failing on a large section that would still have fit
+        elsewhere.
+        """
+        if size_bytes <= 0:
+            raise ValueError(f"{what}: shared allocation must be positive, got {size_bytes}")
+        if align <= 0 or align & (align - 1):
+            raise ValueError(f"{what}: align must be a power of two, got {align}")
+        if engine_idx is None:
+            free = self.shared_free()
+            engine_idx = max(range(self.num_engines), key=lambda i: free[i])
+        elif not 0 <= engine_idx < self.num_engines:
+            raise ValueError(f"engine_idx {engine_idx} outside [0, {self.num_engines})")
+
+        addr = (self._shared_cursor[engine_idx] - size_bytes) & ~(align - 1)
+        floor = max(self._weight_cursor[engine_idx],
+                    self._shared_up_cursor[engine_idx],
+                    self.regions[engine_idx].weight_base
+                    + self._private_reserve[engine_idx])
+        if addr < floor:
+            free = self.shared_free()
+            raise MemoryError(
+                f"{what}: no private window can host {size_bytes / 2**20:.2f} MB of "
+                f"shared data. Largest gap is {max(free) / 2**20:.2f} MB on core "
+                f"{max(range(self.num_engines), key=lambda i: free[i])}; "
+                f"{sum(free) / 2**20:.2f} MB free in total but a shared object must "
+                f"be contiguous inside ONE window.")
+        self._shared_cursor[engine_idx] = addr
+        self._shared_allocs.append(
+            {"engine": engine_idx, "base": addr, "size": size_bytes, "what": what}
+        )
+        return addr
+
+    def shared_mark(self) -> tuple:
+        """Snapshot the shared cursors so a later phase can reclaim the space.
+
+        The model's vision, audio and LM weights TIME-SHARE one pool: each stage
+        stages its own weights, is consumed, and hands the bytes to the next.
+        With one bump cursor per window that reclamation is just restoring the
+        cursors, so the mark is the cursors -- not a free list. Allocations are
+        released in strict reverse order (everything after the mark goes), which
+        is exactly the phase structure and nothing more.
+        """
+        return (tuple(self._shared_cursor), len(self._shared_allocs))
+
+    def shared_release(self, mark: tuple) -> int:
+        """Give every shared byte carved since ``mark`` back to the windows.
+
+        Returns the bytes reclaimed. The caller is asserting that nothing still
+        in use lives above the mark -- the DMA that overwrites them comes next,
+        so releasing a region a live program still reads is silent corruption,
+        not a fault. Release only at a phase boundary.
+        """
+        cursors, alloc_count = mark
+        if len(cursors) != self.num_engines:
+            raise ValueError("shared_release: mark is from a different arena")
+        reclaimed = 0
+        for i, want in enumerate(cursors):
+            have = self._shared_cursor[i]
+            if want < have:
+                raise ValueError(
+                    f"shared_release: engine {i} cursor 0x{have:X} is already below "
+                    f"the mark 0x{want:X}; marks release in reverse order only")
+            if want > self.regions[i].weight_limit:
+                raise ValueError(f"shared_release: engine {i} mark is outside its window")
+            reclaimed += want - have
+            self._shared_cursor[i] = want
+        del self._shared_allocs[alloc_count:]
+        return reclaimed
+
+    def alloc_shared_up(self, size_bytes: int, what: str,
+                        align: int = SRAM_ROW_BYTES,
+                        engine_idx: Optional[int] = None) -> int:
+        """Carve shared space growing UP from the private reserve.
+
+        Same contract as :meth:`alloc_shared` -- contiguous, inside one window --
+        but on the other cursor, so its lifetime is independent of the weight
+        sections carved downward from the window top.
+        """
+        if size_bytes <= 0:
+            raise ValueError(f"{what}: allocation must be positive, got {size_bytes}")
+        if align <= 0 or align & (align - 1):
+            raise ValueError(f"{what}: align must be a power of two, got {align}")
+        if engine_idx is None:
+            free = self.shared_free()
+            engine_idx = max(range(self.num_engines), key=lambda i: free[i])
+        elif not 0 <= engine_idx < self.num_engines:
+            raise ValueError(f"engine_idx {engine_idx} outside [0, {self.num_engines})")
+        addr = (self._shared_up_cursor[engine_idx] + align - 1) & ~(align - 1)
+        if addr + size_bytes > self._shared_cursor[engine_idx]:
+            free = self.shared_free()
+            raise MemoryError(
+                f"{what}: no private window can host {size_bytes / 2**20:.2f} MB. "
+                f"Largest gap is {max(free) / 2**20:.2f} MB on core "
+                f"{max(range(self.num_engines), key=lambda i: free[i])}; "
+                f"{sum(free) / 2**20:.2f} MB free in total but an allocation must "
+                f"be contiguous inside ONE window.")
+        self._shared_up_cursor[engine_idx] = addr + size_bytes
+        self._shared_up_allocs.append(
+            {"engine": engine_idx, "base": addr, "size": size_bytes, "what": what})
+        return addr
+
+    def shared_up_mark(self) -> tuple:
+        return (tuple(self._shared_up_cursor), len(self._shared_up_allocs))
+
+    def shared_up_release(self, mark: tuple) -> int:
+        cursors, alloc_count = mark
+        if len(cursors) != self.num_engines:
+            raise ValueError("shared_up_release: mark is from a different arena")
+        reclaimed = 0
+        for i, want in enumerate(cursors):
+            have = self._shared_up_cursor[i]
+            if want > have:
+                raise ValueError(
+                    f"shared_up_release: engine {i} cursor 0x{have:X} is already "
+                    f"below the mark 0x{want:X}; marks release in reverse order only")
+            reclaimed += have - want
+            self._shared_up_cursor[i] = want
+        del self._shared_up_allocs[alloc_count:]
+        return reclaimed
+
+    def shared_up_usage(self) -> list[int]:
+        return [self._shared_up_cursor[i]
+                - max(self.regions[i].weight_base + self._private_reserve[i],
+                      self._weight_cursor[i])
+                for i in range(self.num_engines)]
+
+    def shared_usage(self) -> list[int]:
+        """Bytes lent to the shared pool per window."""
+        return [self.regions[i].weight_limit - self._shared_cursor[i]
+                for i in range(self.num_engines)]
+
+    def shared_allocations(self) -> list[dict]:
+        """Every shared carve, in allocation order -- the audit trail for the map."""
+        return list(self._shared_allocs)
+
+    def describe_shared(self) -> str:
+        used, free = self.shared_usage(), self.shared_free()
+        lines = [f"  Shared pool inside the private windows "
+                 f"({sum(used) / 2**20:.1f} MB placed, "
+                 f"{sum(free) / 2**20:.1f} MB still free):"]
+        for i in range(self.num_engines):
+            lines.append(
+                f"    core {i}: shared {used[i] / 2**20:7.2f} MB at "
+                f"0x{self._shared_cursor[i]:09X}   free {free[i] / 2**20:7.2f} MB")
+        return "\n".join(lines)
 
     # -- protection ---------------------------------------------------------
     def check_isa_fits(self, engine_idx: int, addr: int, size_bytes: int) -> None:
@@ -702,11 +1453,14 @@ class PrivateArena:
         for i, region in enumerate(self.regions):
             used = self._weight_cursor[i] - region.weight_base
             cap = region.weight_capacity
-            if self._weight_cursor[i] > region.weight_limit:
+            if self._weight_cursor[i] > self._shared_cursor[i]:
+                shared = region.weight_limit - self._shared_cursor[i]
+                spill = (f"the shared pool at 0x{self._shared_cursor[i]:X} "
+                         f"({shared / 2**20:.1f} MB)" if shared else
+                         f"its ISA slice at 0x{region.isa_base:X}")
                 raise MemoryError(
                     f"engine {i} weight arena overflow: {used / 2**20:.1f} MB used of "
-                    f"{cap / 2**20:.1f} MB, spilling into its ISA slice at "
-                    f"0x{region.isa_base:X}")
+                    f"{cap / 2**20:.1f} MB, spilling into {spill}")
             isa_used = None
             if engines is not None and i < len(engines) and engines[i] is not None:
                 isa_used = engines[i].get_program_dram_addr() - region.isa_base
@@ -719,10 +1473,12 @@ class PrivateArena:
                 tensor_used = self._tensor_cursor[i] - region.tensor_base
                 isa_txt = (f"{isa_used / 1024:7.1f} KB" if isa_used is not None and i > 0
                            else "     (main map)")
+                shared = region.weight_limit - self._shared_cursor[i]
+                shared_txt = (f"   shared {shared / 2**20:6.1f} MB" if shared else "")
                 print(f"    core {i}: weights {used / 2**20:6.1f} / {cap / 2**20:.0f} MB"
                       f"   isa {isa_txt} / {self.isa_bytes // 2**20} MB"
                       f"   tensor {tensor_used / 2**20:5.2f} / "
-                      f"{self.tensor_bytes // 2**20} MB")
+                      f"{self.tensor_bytes // 2**20} MB{shared_txt}")
 
 
 def can_split(N: int, num_engines: int) -> bool:

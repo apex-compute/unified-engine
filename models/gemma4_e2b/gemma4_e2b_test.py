@@ -52,7 +52,7 @@ from user_dma_core import INSTRUCTION_SIZE_BYTES
 from user_dma_core import UE_MODE
 from multi_engine_shard import (MULTICORE_WINDOW_BYTES, MultiEngineScheduler,
                                 PrivateArena, multicore_arena_bytes,
-                                require_multicore_dram)
+                                require_multicore_dram, tiled_window_bases)
 
 # ANY multi-core Gemma4 E2B run owns the full 8 GB map as two non-overlapping
 # arenas:
@@ -73,6 +73,63 @@ MULTI_CORE_ENGINE_WINDOW_BYTES = MULTICORE_WINDOW_BYTES
 MULTI_CORE_MODEL_BASE = 0x180000000
 MULTI_CORE_DRAM_LIMIT = 0x200000000
 MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
+
+# ==========================================================================
+# THE TILED MAP: EIGHT 1 GiB WINDOWS THAT COVER THE WHOLE DEVICE
+# ==========================================================================
+# At --multi-core 8 on an Alveo the map above wastes the board. Its windows are
+# 512 MiB and stop at 4 GiB, the model sits at [6, 8) GiB, and [4, 6) GiB
+# belongs to nobody -- 2 GiB idle. Worse, the window is where decode's private
+# weight shards live, so the size that is capped is the one that matters.
+#
+# The tiled map gives every core one 1 GiB window -- one whole HBM switch
+# region, so the eight of them neither crowd nor leave anything behind
+# (multi_engine_shard.tiled_window_bases owns the per-board answer). The windows
+# then COVER the device, which means there is no separate model map left: the
+# shared weights and the tensor arena are carved from the empty tails of the
+# windows, and PrivateArena arbitrates the private cursor (bumping up) against
+# the shared one (bumping down) so neither can land on the other.
+#
+# WHAT EACH CORE'S 1 GiB HOLDS
+#   weights   992 MiB   private decode shards bump UP from the base;
+#                       the shared pool bumps DOWN from the top
+#   ISA        16 MiB   master (core 0: vision + LM) or worker
+#   tensor     16 MiB   per-engine scratch: vision attn 13.12 + prefill 1.50
+#
+# WHAT IS SHARED, AND WHY IT FITS. Private decode shards are ~193 MiB/core (the
+# whole 1544 MiB weight set, N-sharded eight ways), leaving ~799 MiB of tail per
+# core -- 6.2 GiB of pool against 1544 MiB of shared weights plus one 480 MiB
+# tensor arena. The binding constraint is not the total but CONTIGUITY, since a
+# shared object lives inside ONE window: the largest are the 480 MiB tensor
+# extent and the 192 MiB lm_head blob, both well inside a single tail.
+#
+# THE TENSOR ARENA STAYS ONE CONTIGUOUS EXTENT. Vision top-places its 77.5 MiB
+# of weights at the arena top and grows scratch up from the bottom towards them
+# (gemma4_e2b_vision.py:114), and audio needs 156.4 MiB the same way. That is a
+# contiguous-arena design, so it gets a contiguous extent carved at init rather
+# than per-buffer placement, and every existing tensor address survives.
+TILED_MAP_ENGINES = 8                      # the engine count this map is for
+TILED_WINDOW_BYTES = 0x4000_0000           # 1 GiB per core, 8 GiB total
+TILED_ISA_BYTES = 16 * 2**20               # per-core ISA slice, inside the window
+# 32 MiB, not 16: vision attention scratch is 13.12 MiB and prefill attention
+# 1.50, which fitted 16 with nothing to spare -- and the tensor-parallel prefill
+# MLP adds four per-engine lane buffers (gate, up, product, down partial) at
+# 1.5 MiB each. The 16 MiB comes out of a 992 MiB weight arena that has 549 MiB
+# of contiguous tail free, so this is the cheapest space on the board.
+TILED_TENSOR_BYTES = 32 * 2**20            # per-core private scratch, inside the window
+# Core 0 carries BOTH master programs, resident at disjoint addresses: the
+# vision encoder and the LM (prefill + decoder) images. Measured 1.6 MiB and
+# 4.7 MiB; the split below is the old model map's, kept so the two cannot grow
+# into each other unnoticed.
+TILED_VISION_ISA_BYTES = 4 * 2**20
+# The shared tensor arena, carved contiguous. 480 MiB is exactly what the model
+# map gave it (0xE1000000..0xFF000000), so nothing downstream changes size.
+TILED_TENSOR_EXTENT_BYTES = 480 * 2**20
+# What the private decode shards need per core, declared BEFORE any shared byte
+# is lent -- otherwise the pool lends away space a not-yet-made private
+# allocation still needs, and the failure lands on an unrelated engine much
+# later. 1544 MiB of weights over 8 engines is 193 MiB; 256 is ~1.3x that.
+TILED_PRIVATE_RESERVE_BYTES = 256 * 2**20
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -768,6 +825,67 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     bin, compiles prefill/decoder into one bin, runs prefill + decode. Numeric
     checks live in gemma4_e2b_numeric.py."""
 
+    # -- params allocation against the shared pool ---------------------------
+    #
+    # Under the model map the base class walks ONE cursor through a contiguous
+    # params window. The tiled map has no such window -- the windows cover the
+    # device -- so these redirect the same API at PrivateArena's shared pool:
+    # each section is placed individually in whichever window tail has room, and
+    # the "cursor" becomes a byte counter so that every caller's
+    # `end - PARAMS_BASE` accounting still reports what it always reported.
+
+    def allocate_params_dram(self, size_bytes: int, label: str | None = None,
+                             align_bytes: int = 64) -> int:
+        if not self._tiled_map:
+            return super().allocate_params_dram(size_bytes, label, align_bytes)
+        # 128 B, not the caller's 64: a shared section can land anywhere in a
+        # window, and the SRAM row is the alignment every DMA base owes.
+        addr = self.mc_arena.alloc_shared(
+            size_bytes, label or "params", align=max(align_bytes, 128))
+        self._params_staged += size_bytes
+        if label is not None:
+            self._dram_addresses[label] = addr
+        return addr
+
+    def get_params_dram_addr(self) -> int:
+        if not self._tiled_map:
+            return super().get_params_dram_addr()
+        return self._params_staged
+
+    def get_params_dram_usage(self) -> int:
+        if not self._tiled_map:
+            return super().get_params_dram_usage()
+        return self._params_staged
+
+    def reset_params_dram_addr(self) -> None:
+        if not self._tiled_map:
+            return super().reset_params_dram_addr()
+        raise NotImplementedError(
+            "the tiled map has no params cursor to rewind; a phase that wants "
+            "its weights back must release to a PrivateArena shared_mark()")
+
+    # AUDIO'S 192 MB WEIGHT REGION was a hardcoded 0x6c000000-0x78000000. That
+    # address is only safe under the SINGLE-CORE map, where the low 2 GB is
+    # empty: under the 512 MB multi-core map it lands inside engine 3's private
+    # window, and under the tiled map inside engine 1's. Audio is not exercised
+    # by the image/text paths, so the collision has been latent -- it is a real
+    # bug either way, and the tiled map is not going to add a second one.
+    AUDIO_WEIGHT_LEGACY_BASE = 0x6C000000
+    AUDIO_WEIGHT_REGION_BYTES = 0x0C000000        # 192 MB
+
+    def _audio_weight_region(self) -> tuple[int, int]:
+        """(base, end) of the audio weight region for the active map."""
+        if not self._tiled_map:
+            return (self.AUDIO_WEIGHT_LEGACY_BASE,
+                    self.AUDIO_WEIGHT_LEGACY_BASE + self.AUDIO_WEIGHT_REGION_BYTES)
+        cached = getattr(self, "_audio_weight_extent", None)
+        if cached is None:
+            base = self.mc_arena.alloc_shared(
+                self.AUDIO_WEIGHT_REGION_BYTES, "AUDIO_WEIGHTS.window")
+            cached = (base, base + self.AUDIO_WEIGHT_REGION_BYTES)
+            self._audio_weight_extent = cached
+        return cached
+
     def _ensure_stage_scheduler(self, stage: str):
         """Return the shared scheduler for one stage, over the model-wide arena.
 
@@ -850,12 +968,30 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._use_multicore_dram_layout = multi_core > 1
         if self._use_multicore_dram_layout:
             require_multicore_dram(multi_core, "Gemma4 E2B")
+        # THE TILED MAP IS OPT-IN BY ENGINE COUNT AND BOARD. At 8 engines on a
+        # board the library has characterised, the windows become 1 GiB and
+        # cover the device; anything else keeps the 512 MiB map unchanged. A
+        # board with no tiling map is NOT silently downgraded -- it says so,
+        # because the difference is 2 GiB of arena and the decode shard budget.
+        self._tiled_map = False
+        self._tile_bases = None
+        self._params_staged = 0        # bytes placed into the pool (tiled map only)
+        if multi_core == TILED_MAP_ENGINES:
+            try:
+                self._tile_bases = tiled_window_bases(
+                    multi_core, TILED_WINDOW_BYTES, "Gemma4 E2B")
+                self._tiled_map = True
+            except (ValueError, RuntimeError) as exc:
+                print(f"  [map] tiled 1 GiB map unavailable, using the 512 MiB "
+                      f"windows: {exc}")
         _rebase = MULTI_CORE_MODEL_REBASE if self._use_multicore_dram_layout else 0
         # Every DRAM address in a compiled program image is a literal baked
         # against the map below, so a cached section is only reusable by a run
         # with the SAME layout. The program bin/meta path -- run and profile,
         # compiler and loader -- must agree on this tag.
-        self.dram_layout = "mcmap" if self._use_multicore_dram_layout else "legacy"
+        self.dram_layout = ("tile8" if self._tiled_map
+                            else "mcmap" if self._use_multicore_dram_layout
+                            else "legacy")
         # Gemma4 DRAM layout. ONE model map, used at EVERY engine count: the
         # original 2 GB window, unchanged from the single-core path apart from
         # the whole-map rebase above. Adding engines does not move a single
@@ -916,7 +1052,45 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # engine count -- vision and prefill are sequential and share one arena,
         # so engine i always owns the same window in both, and the window is a
         # fixed 512 MB whatever the engine count (the arena grows instead).
-        if self._use_multicore_dram_layout:
+        if self._tiled_map:
+            # Windows COVER the device, so there is no model map above them: the
+            # ISA moves inside the windows and everything shared is carved from
+            # their tails. See "THE TILED MAP" above.
+            self.mc_arena = PrivateArena(
+                multi_core, arena_base=0,
+                arena_bytes=multi_core * TILED_WINDOW_BYTES,
+                isa_bytes=TILED_ISA_BYTES, tensor_bytes=TILED_TENSOR_BYTES,
+                verbose=True)
+            _actual = [self.mc_arena.window_base(i) for i in range(multi_core)]
+            if _actual != self._tile_bases:
+                raise AssertionError(
+                    "private windows do not match this board's map: "
+                    f"{[hex(a) for a in _actual]} against "
+                    f"{[hex(b) for b in self._tile_bases]}")
+            self.DRAM_END = multi_core * TILED_WINDOW_BYTES
+            # Private space is claimed before a single shared byte is lent.
+            self.mc_arena.reserve_private(TILED_PRIVATE_RESERVE_BYTES)
+            # Core 0 holds both master images at disjoint addresses, exactly as
+            # the model map did; workers use their own windows' slices.
+            self.VISION_ISA_BASE = self.mc_arena.isa_base(0)
+            self.LM_ISA_BASE = self.VISION_ISA_BASE + TILED_VISION_ISA_BYTES
+            self.MASTER_ISA_LIMIT = self.mc_arena.isa_limit(0)
+            if self.LM_ISA_BASE >= self.MASTER_ISA_LIMIT:
+                raise AssertionError(
+                    f"master ISA slice ({TILED_ISA_BYTES // 2**20} MiB) cannot "
+                    f"hold the vision image plus the LM image")
+            self.VISION_WORKER_ISA_BASE = self.LM_ISA_BASE
+            # ONE CONTIGUOUS TENSOR ARENA, carved first, while the largest run is
+            # still free. Vision top-places its weights against the top and grows
+            # scratch up from the base, so this cannot be scattered.
+            _tensor_base = self.mc_arena.alloc_shared(
+                TILED_TENSOR_EXTENT_BYTES, "TENSOR.window")
+            self.TENSOR_LIMIT = _tensor_base + TILED_TENSOR_EXTENT_BYTES
+            # PARAMS IS AN ACCOUNTING ORIGIN, NOT A WINDOW: weight sections are
+            # placed one at a time by allocate_params_dram into whichever window
+            # tail has room.
+            _params_base = 0
+        elif self._use_multicore_dram_layout:
             _arena_bytes = multicore_arena_bytes(multi_core)
             assert _arena_bytes <= MULTI_CORE_MODEL_BASE, (
                 f"{multi_core} x "
@@ -931,7 +1105,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # it; scratch stays below). In the multi-core layout every worker ISA
         # lives in the dedicated ISA region, so the tensor arena simply runs up
         # to VISION_ISA_BASE for any engine count.
-        self.VISION_ARENA_TOP = self.VISION_ISA_BASE
+        # Top of the vision tensor arena. Under the model map that is where the
+        # vision ISA starts; under the tiled map the ISA is elsewhere entirely
+        # and the arena is a standalone extent, so it is the extent's end.
+        self.VISION_ARENA_TOP = (self.TENSOR_LIMIT if self._tiled_map
+                                 else self.VISION_ISA_BASE)
         _program_base = self.LM_ISA_BASE
         super().__init__(BASE_ADDR=engine_base,
                           params_dram_base=_params_base,
@@ -1031,16 +1209,31 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # advances the params cursor (its cursor isn't restored). Used by
         # write_run_summary as the "total weight DRAM" figure (~1540.4 MB).
         self._lm_weight_dram_bytes = self.get_params_dram_usage()
-        if self.get_params_dram_addr() > self._tensor_dram_base:
-            raise MemoryError(
-                f"Gemma4 weights overflow the 2-GB layout: "
-                f"end=0x{self.get_params_dram_addr():X}, "
-                f"tensor_start=0x{self._tensor_dram_base:X}")
-        if self.get_tensor_dram_addr() > self.VISION_ISA_BASE:
-            raise MemoryError(
-                f"Gemma4 tensors overflow the 2-GB layout: "
-                f"end=0x{self.get_tensor_dram_addr():X}, "
-                f"vision_program_start=0x{self.VISION_ISA_BASE:X}")
+        # THESE TWO BOUNDS ARE THE CONTIGUOUS MODEL MAP'S. They compare one
+        # rising cursor against the base of the region above it, which is only
+        # meaningful while params and tensors are adjacent ranges. Under the
+        # tiled map params is an accounting origin (sections are scattered
+        # across window tails, and PrivateArena raises on its own when a tail
+        # cannot host one), and the tensor arena is a carved extent whose real
+        # bound is its end -- not the vision ISA, which now lives in a window.
+        if self._tiled_map:
+            if self.get_tensor_dram_addr() > self.TENSOR_LIMIT:
+                raise MemoryError(
+                    f"Gemma4 tensors overflow the carved arena: "
+                    f"end=0x{self.get_tensor_dram_addr():X}, "
+                    f"extent_end=0x{self.TENSOR_LIMIT:X} "
+                    f"({TILED_TENSOR_EXTENT_BYTES // 2**20} MiB)")
+        else:
+            if self.get_params_dram_addr() > self._tensor_dram_base:
+                raise MemoryError(
+                    f"Gemma4 weights overflow the 2-GB layout: "
+                    f"end=0x{self.get_params_dram_addr():X}, "
+                    f"tensor_start=0x{self._tensor_dram_base:X}")
+            if self.get_tensor_dram_addr() > self.VISION_ISA_BASE:
+                raise MemoryError(
+                    f"Gemma4 tensors overflow the 2-GB layout: "
+                    f"end=0x{self.get_tensor_dram_addr():X}, "
+                    f"vision_program_start=0x{self.VISION_ISA_BASE:X}")
 
     @staticmethod
     def load_config(config_path: str | None = None, script_dir: str | None = None) -> dict:
@@ -1362,11 +1555,17 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # The LM ISA slice runs to the top of the model map, which on the 12-core
         # layout is also the top of the 8 GB device: overrunning it would not
         # fault, so it is checked where the image is written.
-        if instruction_base_addr + len(image_bytes) > self.DRAM_END:
+        # Under the model map the LM ISA runs to the top of the device, so
+        # DRAM_END is the only bound there is. Under the tiled map it is a slice
+        # inside window 0 and DRAM_END is 8 GiB away -- overrunning the slice
+        # would quietly scribble over that window's scratch and then its
+        # neighbour, so the bound is the slice, not the device.
+        _lm_isa_limit = (self.MASTER_ISA_LIMIT if self._tiled_map else self.DRAM_END)
+        if instruction_base_addr + len(image_bytes) > _lm_isa_limit:
             raise MemoryError(
                 f"Gemma4 LM program ends at "
-                f"0x{instruction_base_addr + len(image_bytes):X}, beyond the model "
-                f"map limit 0x{self.DRAM_END:X}")
+                f"0x{instruction_base_addr + len(image_bytes):X}, beyond its ISA "
+                f"limit 0x{_lm_isa_limit:X}")
         self._store_program_section("lm", instruction_base_addr, image_bytes, lm_meta, profile=profile)
         if prefill_scheduler is not None:
             for engine_idx, worker_addr in enumerate(prefill_worker_addrs, start=1):
@@ -1510,12 +1709,22 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         lines.append(f"- **--dev:** {args.dev}")
         lines.append(f"- **Clock / frequency:** {clock_ns:.1f} ns ({freq_mhz:.1f} MHz)")
         lines.append(f"- **Cores (--multi-core):** {cores}")
-        lines.append(f"- **DRAM layout:** {self.dram_layout} "
-                     f"(model map 0x{self._params_dram_base:X}..0x{self.DRAM_END:X}"
-                     + (f", {cores} x "
-                        f"{MULTI_CORE_ENGINE_WINDOW_BYTES // 2**20} MB private "
-                        f"windows from 0x0"
-                        if self._use_multicore_dram_layout else "") + ")")
+        if self._tiled_map:
+            # No model map to report: the windows cover the device and the
+            # shared weights live in their tails.
+            lines.append(
+                f"- **DRAM layout:** {self.dram_layout} ({cores} x "
+                f"{TILED_WINDOW_BYTES // 2**20} MB private windows tiling "
+                f"[0x0, 0x{self.DRAM_END:X}); shared weights and the "
+                f"{TILED_TENSOR_EXTENT_BYTES // 2**20} MB tensor arena carved "
+                f"from their tails)")
+        else:
+            lines.append(f"- **DRAM layout:** {self.dram_layout} "
+                         f"(model map 0x{self._params_dram_base:X}..0x{self.DRAM_END:X}"
+                         + (f", {cores} x "
+                            f"{MULTI_CORE_ENGINE_WINDOW_BYTES // 2**20} MB private "
+                            f"windows from 0x0"
+                            if self._use_multicore_dram_layout else "") + ")")
         lines.append(f"- **Peak throughput:** {peak_gflops:.1f} GFLOPS "
                      f"({freq_mhz:.1f} MHz × 128 × {cores} core(s))")
         dram_read_speed = getattr(self, "_dram_read_speed_mbps", None)

@@ -970,6 +970,59 @@ class Qwen25OmniAudioMixin:
                 gpr_M_reg=rows_reg,
             ) or 0
 
+        def sharded_layer_norm(ctx, m_reg: int, src: int, dst: int,
+                               weight: int, bias: int) -> int:
+            """One engine's row block of a LayerNorm. Rows are independent."""
+            return ctx.ue.layer_norm_core_dram(
+                M=ctx.rows,
+                N=h,
+                A_DRAM_ADDR=ctx.rows_addr(src, h * bpe),
+                OUTPUT_DRAM_ADDR=ctx.rows_addr(dst, h * bpe),
+                GAMMA_DRAM_ADDR=weight,
+                BETA_DRAM_ADDR=bias,
+                ZEROS_DRAM_ADDR=self._audio_ln_zeros,
+                INV_N_DRAM_ADDR=self._audio_ln_inv_n,
+                gpr_M_reg=m_reg,
+            ) or 0
+
+        def sharded_matmul(ctx, m_reg: int, k: int, n: int, src: int,
+                           weights: dict, tag: str, dst: int, *,
+                           bias: bool = True, gelu: bool = False) -> int:
+            """One engine's row block of an IF4 projection.
+
+            M-sharded, not N-sharded: the weight and its scales stay SHARED and
+            read-only, so this needs no private staging and no second layout --
+            each engine simply owns S/ne of the states. Every audio projection
+            is row-independent, which is the only thing an M-shard asks for.
+            """
+            bias_addr = weights.get(f"{tag}_bias") if bias else None
+            return ctx.ue.matmat_mul_core(
+                M=ctx.rows,
+                K=k,
+                N=n,
+                A_DRAM_ADDR=ctx.rows_addr(src, k * bpe),
+                B_DRAM_ADDR=weights[f"{tag}_data"],
+                OUTPUT_DRAM_ADDR=ctx.rows_addr(dst, n * bpe),
+                is_B_quantized=True,
+                data_type=TYPE.IF4,
+                SCALE_DRAM_ADDR=weights[f"{tag}_scale"],
+                C_DRAM_ADDR=bias_addr,
+                bias_mode="broadcast_N" if bias_addr is not None else None,
+                gelu_enable=gelu,
+                gpr_M_reg=m_reg,
+            ) or 0
+
+        def sharded_eltwise(ctx, m_reg: int, a: int, b: int, out: int) -> int:
+            return ctx.ue.eltwise_core_dram(
+                M=ctx.rows,
+                N=h,
+                dram_a=ctx.rows_addr(a, h * bpe),
+                dram_b=ctx.rows_addr(b, h * bpe),
+                dram_out=ctx.rows_addr(out, h * bpe),
+                mode=UE_MODE.ELTWISE_ADD,
+                gpr_M_reg=m_reg,
+            ) or 0
+
         def sharded_bf16_frontend(
             rows: int,
             k: int,
@@ -982,6 +1035,8 @@ class Qwen25OmniAudioMixin:
             total = [0]
 
             def body(ctx) -> None:
+                m_reg = audio_shard_regs[ctx.engine_idx]
+                ctx.ue.generate_instruction_add_set(m_reg, ctx.rows)
                 value = ctx.ue.matmat_mul_core(
                     M=ctx.rows,
                     K=k,
@@ -993,7 +1048,7 @@ class Qwen25OmniAudioMixin:
                     bias_mode="broadcast_N",
                     is_B_quantized=False,
                     gelu_enable=True,
-                    gpr_M_reg=ctx.m_reg,
+                    gpr_M_reg=m_reg,
                 )
                 if isinstance(value, (int, float)):
                     total[0] += int(value)
@@ -1010,6 +1065,13 @@ class Qwen25OmniAudioMixin:
             pool_reg = self.alloc_isa_reg()
             self.generate_instruction_add_set(seq_reg, s)
             self.generate_instruction_add_set(pool_reg, pooled)
+
+            # ONE shard-row register per engine, re-set at each region entry.
+            # ShardContext.m_reg would allocate a fresh GPR per (engine, rows)
+            # pair and never free it, which overflows the 15-register file once
+            # the layer body is sharded as well as the front end.
+            audio_shard_regs = [self.alloc_isa_reg()] + [
+                worker.alloc_isa_reg() for worker in scheduler.workers]
 
             # Learned audio front end: BF16 Conv1/GELU and Conv2/GELU are
             # matmuls over kernel-major im2col rows. Both projections are
@@ -1047,27 +1109,27 @@ class Qwen25OmniAudioMixin:
                 layer_out = self.AUDIO_IO_B if li % 2 == 0 else self.AUDIO_IO_A
 
                 # Pre-norm MHA: q/v/o carry bias, k intentionally does not.
-                flops += layer_norm(
-                    s,
-                    seq_reg,
-                    layer_in,
-                    self.AUDIO_NORM,
-                    weights["ln1_weight"],
-                    weights["ln1_bias"],
-                )
-                flops += matmul(s, seq_reg, h, h, self.AUDIO_NORM, weights, "q", self.AUDIO_Q)
-                flops += matmul(
-                    s,
-                    seq_reg,
-                    h,
-                    h,
-                    self.AUDIO_NORM,
-                    weights,
-                    "k",
-                    self.AUDIO_K,
-                    bias=False,
-                )
-                flops += matmul(s, seq_reg, h, h, self.AUDIO_NORM, weights, "v", self.AUDIO_V)
+                # ROW-SHARDED. Norm and the three projections are all
+                # row-independent, so each engine takes S/ne states and reads
+                # the same shared weights. The region JOINS: the permutes below
+                # rewrite whole [S, H] buffers into head-major order, so every
+                # row has to be present before they run.
+                _pre = [0]
+                def _emit_qkv(ctx):
+                    m_reg = audio_shard_regs[ctx.engine_idx]
+                    ctx.ue.generate_instruction_add_set(m_reg, ctx.rows)
+                    _pre[0] += sharded_layer_norm(
+                        ctx, m_reg, layer_in, self.AUDIO_NORM,
+                        weights["ln1_weight"], weights["ln1_bias"])
+                    _pre[0] += sharded_matmul(
+                        ctx, m_reg, h, h, self.AUDIO_NORM, weights, "q", self.AUDIO_Q)
+                    _pre[0] += sharded_matmul(
+                        ctx, m_reg, h, h, self.AUDIO_NORM, weights, "k",
+                        self.AUDIO_K, bias=False)
+                    _pre[0] += sharded_matmul(
+                        ctx, m_reg, h, h, self.AUDIO_NORM, weights, "v", self.AUDIO_V)
+                scheduler.sharded_region(s, _emit_qkv)
+                flops += _pre[0]
 
                 self.bf16_permute_dram_core(
                     heads,
@@ -1148,65 +1210,34 @@ class Qwen25OmniAudioMixin:
                     write_grouped=False,
                     group_stride_rows=s_aligned,
                 )
-                flops += matmul(
-                    s,
-                    seq_reg,
-                    h,
-                    h,
-                    self.AUDIO_ATTN_RESULT,
-                    weights,
-                    "o",
-                    self.AUDIO_PROJ_OUT,
-                )
-                flops += self.eltwise_core_dram(
-                    M=s,
-                    N=h,
-                    dram_a=layer_in,
-                    dram_b=self.AUDIO_PROJ_OUT,
-                    dram_out=self.AUDIO_RESIDUAL,
-                    mode=UE_MODE.ELTWISE_ADD,
-                    gpr_M_reg=seq_reg,
-                ) or 0
-
-                # Pre-norm GELU FFN and the second residual.
-                flops += layer_norm(
-                    s,
-                    seq_reg,
-                    self.AUDIO_RESIDUAL,
-                    self.AUDIO_NORM,
-                    weights["ln2_weight"],
-                    weights["ln2_bias"],
-                )
-                flops += matmul(
-                    s,
-                    seq_reg,
-                    h,
-                    ff,
-                    self.AUDIO_NORM,
-                    weights,
-                    "fc1",
-                    self.AUDIO_FFN,
-                    gelu=True,
-                )
-                flops += matmul(
-                    s,
-                    seq_reg,
-                    ff,
-                    h,
-                    self.AUDIO_FFN,
-                    weights,
-                    "fc2",
-                    self.AUDIO_FFN_OUT,
-                )
-                flops += self.eltwise_core_dram(
-                    M=s,
-                    N=h,
-                    dram_a=self.AUDIO_RESIDUAL,
-                    dram_b=self.AUDIO_FFN_OUT,
-                    dram_out=layer_out,
-                    mode=UE_MODE.ELTWISE_ADD,
-                    gpr_M_reg=seq_reg,
-                ) or 0
+                # ROW-SHARDED TAIL. o_proj, both residuals, the FFN norm and
+                # the GELU FFN pair are every one of them row-independent, and
+                # the attention region has already joined, so the whole tail
+                # runs as ONE region -- no barrier between o and the FFN.
+                _post = [0]
+                def _emit_tail(ctx):
+                    m_reg = audio_shard_regs[ctx.engine_idx]
+                    ctx.ue.generate_instruction_add_set(m_reg, ctx.rows)
+                    _post[0] += sharded_matmul(
+                        ctx, m_reg, h, h, self.AUDIO_ATTN_RESULT, weights, "o",
+                        self.AUDIO_PROJ_OUT)
+                    _post[0] += sharded_eltwise(
+                        ctx, m_reg, layer_in, self.AUDIO_PROJ_OUT,
+                        self.AUDIO_RESIDUAL)
+                    _post[0] += sharded_layer_norm(
+                        ctx, m_reg, self.AUDIO_RESIDUAL, self.AUDIO_NORM,
+                        weights["ln2_weight"], weights["ln2_bias"])
+                    _post[0] += sharded_matmul(
+                        ctx, m_reg, h, ff, self.AUDIO_NORM, weights, "fc1",
+                        self.AUDIO_FFN, gelu=True)
+                    _post[0] += sharded_matmul(
+                        ctx, m_reg, ff, h, self.AUDIO_FFN, weights, "fc2",
+                        self.AUDIO_FFN_OUT)
+                    _post[0] += sharded_eltwise(
+                        ctx, m_reg, self.AUDIO_RESIDUAL, self.AUDIO_FFN_OUT,
+                        layer_out)
+                scheduler.sharded_region(s, _emit_tail)
+                flops += _post[0]
 
             final_states = (
                 self.AUDIO_IO_A if d["LAYERS"] % 2 == 0 else self.AUDIO_IO_B
@@ -1280,7 +1311,7 @@ class Qwen25OmniAudioMixin:
         if not program:
             raise RuntimeError("audio encoder capture produced an empty program")
         master_limit = getattr(
-            self, "WORKER_ISA_BASE", getattr(self, "DRAM_END", None)
+            self, "MASTER_ISA_LIMIT", getattr(self, "DRAM_END", None)
         )
         master_end = program_addr + len(program) + FLAG_PRECLEAR_PROGRAM_BYTES
         if master_limit is not None and master_end > master_limit:
