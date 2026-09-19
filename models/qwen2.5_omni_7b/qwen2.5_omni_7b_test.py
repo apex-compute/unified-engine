@@ -160,6 +160,143 @@ VISION_MAX_SOFT_TOKENS = max(
 )
 
 
+# ==========================================================================
+# FIXED-SHAPE RUN PRESETS
+# ==========================================================================
+# --low and --medium pin a whole run shape rather than a set of files, so the
+# two are reproducible prefill lengths instead of "whatever this wav happened
+# to be". Each preset fixes the media and then GROWS THE TEXT PROMPT until the
+# assembled prefill reaches its target, because the media contribute a fixed
+# token count and only the text is free:
+#
+#   low     audio at half length (~64 soft tokens) + text  -> ~850 prefill
+#   medium  896x896 image (1024 soft tokens) + full audio
+#           (128 soft tokens) + text                       -> ~1900 prefill
+#
+# Both fit MAX_CONTEXT_SIZE (2048), medium deliberately close to it: it leaves
+# ~148 tokens of decode headroom, which is the point of having a large shape to
+# measure.
+RUN_PRESETS = {
+    "low": {
+        "vision_res": None,
+        "image": False,
+        "audio_fraction": 0.5,
+        "prefill_tokens": 850,
+    },
+    "medium": {
+        "vision_res": "medium",
+        "image": True,
+        "audio_fraction": 1.0,
+        "prefill_tokens": 1900,
+    },
+}
+
+# Filler for the fitted prompts. It has to be REAL INSTRUCTION TEXT, not
+# padding: the point of a long prefill is to measure the shape the model
+# actually runs, and a prompt of repeated nonsense changes what attention does
+# with it. These sentences are cycled and then trimmed to the exact token count
+# the target needs.
+# THE INSTRUCTION IS PER PRESET; THE FILLER IS NOT. A preset's prompt is mostly
+# padding by token count, so whatever the padding says gets repeated two or
+# three times and drowns out the instruction. The first --medium prompt cycled
+# sentences that kept re-asserting "transcribe the audio", and the model did
+# exactly that and stopped -- a correct 1899-token prefill, but only half the
+# answer. The instruction now states the parts once, up front, and the filler
+# is neutral guidance that pushes toward COVERING EVERYTHING rather than toward
+# either modality.
+_PRESET_PROMPT_BASE = {
+    "low": (
+        "Transcribe the speech exactly as it is spoken, preserving the wording "
+        "and the order of the terms."
+    ),
+    "medium": (
+        "Do two things, in this order. First, transcribe the speech exactly as "
+        "it is spoken, preserving the wording and the order of the terms. "
+        "Second, describe the image in detail, covering the lighting, the "
+        "terrain, the vegetation and the sky. Both parts are required."
+    ),
+}
+
+_PRESET_PROMPT_FILLER = (
+    "Address every part of the request before you stop, and do not end the "
+    "answer while any part of it remains uncovered.",
+    "Make the structure of the answer explicit, so the boundary between its "
+    "parts is easy to locate at a glance.",
+    "Keep each observation to a single sentence, so the shape of the response "
+    "stays easy to follow from start to finish.",
+    "Prefer concrete detail over general impression, and name what is actually "
+    "present rather than what would usually be present.",
+    "Stay grounded in the material you were given rather than in background "
+    "knowledge about material of this kind.",
+    "Use plain language throughout, and choose a concrete noun wherever an "
+    "evaluative adjective would otherwise go.",
+    "Do not repeat a point you have already made, and do not pad the answer "
+    "once its subject has been covered.",
+    "Say so briefly if something is genuinely unclear, instead of guessing at "
+    "content that is not actually there.",
+    "Work through the material methodically rather than compressing it into a "
+    "single summarising line.",
+    "Finish only once every part of the request has been addressed, and not "
+    "before that point.",
+)
+
+
+def _preset_filler_words(count: int) -> str:
+    """``count`` words, cycling the filler sentences in order."""
+    words: list[str] = []
+    i = 0
+    while len(words) < count:
+        words.extend(_PRESET_PROMPT_FILLER[i % len(_PRESET_PROMPT_FILLER)].split())
+        i += 1
+    return " ".join(words[:count])
+
+
+def _fit_prompt_to_prefill(tokenizer, render_len, target: int, base: str) -> str:
+    """Build a prompt whose rendered prefill length is ``target`` tokens.
+
+    ``render_len(prompt)`` returns the length of the FULL assembled sequence --
+    chat scaffolding plus expanded media placeholders plus the prompt -- which
+    is the number being targeted. The media contribution is fixed, so the
+    prompt is the only free variable and the length is monotone in the word
+    count: binary-search the words, then correct against a real render, because
+    a token count measured on the prompt alone can differ by a token or two
+    from the same text inside the template.
+    """
+    base_total = render_len(base)
+    if base_total >= target:
+        return base
+    base_prompt_tokens = len(tokenizer(base).input_ids)
+    fixed = base_total - base_prompt_tokens        # media + scaffolding
+    want = target - fixed                          # prompt tokens needed
+
+    def prompt_for(words: int) -> str:
+        return f"{base} {_preset_filler_words(words)}"
+
+    lo, hi = 0, 16
+    while len(tokenizer(prompt_for(hi)).input_ids) < want:
+        hi *= 2
+        if hi > 8192:
+            raise RuntimeError(f"cannot reach {target} prefill tokens")
+    while lo < hi:                                 # smallest words >= want
+        mid = (lo + hi) // 2
+        if len(tokenizer(prompt_for(mid)).input_ids) < want:
+            lo = mid + 1
+        else:
+            hi = mid
+    words = lo
+
+    # Correct against the real render; walk down so the target is never exceeded.
+    for _ in range(64):
+        total = render_len(prompt_for(words))
+        if total == target or (total < target and words == 0):
+            break
+        words += 1 if total < target else -1
+        if words < 0:
+            words = 0
+            break
+    return prompt_for(words)
+
+
 def apply_vision_resolution(cfg: dict, name: str) -> dict:
     """Stamp one VISION_RESOLUTIONS entry into a loaded config, in place.
 
@@ -2282,7 +2419,7 @@ def _resolve_sample(path: str | None, default_path: str, flag: str) -> str | Non
     raise SystemExit(f"{flag}: file not found: {path!r}")
 
 
-def _load_audio(path: str, sample_rate: int) -> np.ndarray:
+def _load_audio(path: str, sample_rate: int, fraction: float = 1.0) -> np.ndarray:
     import soundfile as sf
     import torchaudio.functional as audio_functional
 
@@ -2298,12 +2435,23 @@ def _load_audio(path: str, sample_rate: int) -> np.ndarray:
         mono = audio_functional.resample(mono, source_rate, sample_rate)
     if not torch.isfinite(mono).all().item():
         raise ValueError(f"audio contains NaN or Inf: {path}")
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError(f"audio fraction must be in (0, 1], got {fraction}")
+    if fraction < 1.0:
+        # Truncate at the SOURCE, after resampling: the encoder derives its mel
+        # frame count, and therefore its soft-token count, from the sample
+        # count, so this is what makes a preset's audio contribution fixed.
+        kept = max(int(mono.shape[0] * fraction), sample_rate // 10)
+        mono = mono[:kept]
     return mono.contiguous().numpy().astype(np.float32, copy=False)
 
 
 def _default_prompt(args) -> str:
     if args.prompt:
         return args.prompt
+    if getattr(args, "preset", None):
+        # Fitted later, once the processor can measure the assembled length.
+        return _PRESET_PROMPT_BASE[args.preset]
     if args.image and args.audio:
         return "First transcribe the audio. Then briefly describe the image."
     if args.image:
@@ -2336,7 +2484,10 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
             )
             images = [image.copy()]
     if args.audio:
-        samples = _load_audio(args.audio, int(cfg["audio"]["sample_rate"]))
+        preset = RUN_PRESETS.get(getattr(args, "preset", None) or "", {})
+        samples = _load_audio(
+            args.audio, int(cfg["audio"]["sample_rate"]),
+            fraction=float(preset.get("audio_fraction", 1.0)))
         audio = [samples]
 
     # In the joint case, match media order to the requested answer order. This
@@ -2347,20 +2498,32 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
     if args.image:
         content.append({"type": "image", "image": args.image})
     content.append({"type": "text", "text": prompt})
-    messages = [{"role": "user", "content": content}]
-    rendered = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    call_kwargs: dict[str, Any] = {
-        "text": rendered,
-        "padding": True,
-        "return_tensors": "pt",
-    }
-    if images is not None:
-        call_kwargs["images"] = images
-    if audio is not None:
-        call_kwargs["audio"] = audio
-    processed = processor(**call_kwargs)
+    def _assemble(prompt_text: str):
+        body = [item for item in content if item["type"] != "text"]
+        body.append({"type": "text", "text": prompt_text})
+        text = processor.apply_chat_template(
+            [{"role": "user", "content": body}],
+            tokenize=False, add_generation_prompt=True)
+        call_kwargs: dict[str, Any] = {
+            "text": text, "padding": True, "return_tensors": "pt",
+        }
+        if images is not None:
+            call_kwargs["images"] = images
+        if audio is not None:
+            call_kwargs["audio"] = audio
+        return text, processor(**call_kwargs)
+
+    # A preset fixes the media and then GROWS THE PROMPT to a target prefill
+    # length. It has to happen here: only the processor knows how many tokens
+    # this particular audio clip and image expand to.
+    preset_name = getattr(args, "preset", None)
+    if preset_name and not args.prompt:
+        target = int(RUN_PRESETS[preset_name]["prefill_tokens"])
+        prompt = _fit_prompt_to_prefill(
+            processor.tokenizer,
+            lambda text: int(_assemble(text)[1]["input_ids"].shape[1]),
+            target, _PRESET_PROMPT_BASE[preset_name])
+    rendered, processed = _assemble(prompt)
 
     input_ids = processed["input_ids"]
     if input_ids.ndim != 2 or input_ids.shape[0] != 1:
@@ -2436,6 +2599,26 @@ def _run_audio(ue: Qwen25OmniUnifiedEngine, processed):
     return embeddings, metadata
 
 
+def apply_run_preset(args) -> None:
+    """Turn --low / --medium into the media flags they stand for.
+
+    The preset decides WHICH media are present and at what size; the prompt
+    that brings the prefill up to the target is fitted later, once the
+    processor can measure how many tokens this audio and image expand to. An
+    explicitly passed --image/--audio/--vision-res still wins, so a preset can
+    be used as a starting point.
+    """
+    if not args.preset:
+        return
+    spec = RUN_PRESETS[args.preset]
+    if args.audio is None:
+        args.audio = DEFAULT_AUDIO
+    if spec["image"] and args.image is None:
+        args.image = DEFAULT_IMAGE
+    if spec["vision_res"] and args.vision_res == DEFAULT_VISION_RES:
+        args.vision_res = spec["vision_res"]
+
+
 def _result_mode(args) -> str:
     if args.image and args.audio:
         return "image+audio"
@@ -2480,6 +2663,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="engine count; this model requires exactly 8",
     )
     parser.add_argument("--prompt", default=None, help="user text prompt")
+    presets = parser.add_mutually_exclusive_group()
+    presets.add_argument(
+        "--low", dest="preset", action="store_const", const="low",
+        help=("fixed shape: half-length audio plus a fitted prompt, "
+              f"~{RUN_PRESETS['low']['prefill_tokens']} prefill tokens"),
+    )
+    presets.add_argument(
+        "--medium", dest="preset", action="store_const", const="medium",
+        help=("fixed shape: 896x896 image (1024 soft tokens) plus full audio "
+              f"and a fitted prompt, ~{RUN_PRESETS['medium']['prefill_tokens']} "
+              "prefill tokens"),
+    )
+    parser.set_defaults(preset=None)
     parser.add_argument(
         "--image",
         nargs="?",
@@ -2541,8 +2737,16 @@ def run_summary_filename(args) -> str:
 
     Device and mode are always present, in that order; a profile run is tagged
     so its phase breakdown never overwrites a generation run's summary.
+
+    A PRESET IS PART OF THE NAME because it is not visible in the mode. --low
+    is mode "audio" and --medium is "image+audio", exactly like the plain flags
+    they build on, so without this a preset run and an ad-hoc run of the same
+    mode overwrite each other despite being different shapes -- 849 prefill
+    tokens against 154, which is the whole point of having the preset.
     """
     parts = ["qwen2.5_omni_7b_test", args.dev, _result_mode(args)]
+    if getattr(args, "preset", None):
+        parts.append(args.preset)
     if getattr(args, "profile", False):
         parts.append("profile")
     parts.append(f"multi-core_{args.multi_core}")
@@ -2552,6 +2756,7 @@ def run_summary_filename(args) -> str:
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    apply_run_preset(args)
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
     if args.profile_ctx < 2 or args.profile_ctx > MAX_CONTEXT_SIZE:
