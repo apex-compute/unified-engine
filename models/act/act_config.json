@@ -1,0 +1,42 @@
+{
+  "model": {
+    "name": "ACT (LeRobot, inference graph, 34M)",
+    "dim_model": 512,
+    "n_heads": 8,
+    "head_dim": 64,
+    "dim_feedforward": 3200,
+    "n_encoder_layers": 4,
+    "n_decoder_layers": 1,
+    "chunk_size": 100,
+    "latent_dim": 32,
+    "state_dim": 6,
+    "action_dim": 6,
+    "n_cams": 2,
+    "img_hw": [
+      480,
+      640
+    ],
+    "vision_backbone": "resnet18",
+    "note": "VAE encoder is train-only (latent z=0 at inference) and is not ported."
+  },
+  "paths": {
+    "weights_pt": "act_bin/act_weights.pt",
+    "reference_npz": "act_bin/reference.npz",
+    "export_script": "act_export.py (run in ~/miniconda3/envs/lerobot)"
+  },
+  "dram_layout": {
+    "params_dram_base": "0x00000000",
+    "tensor_dram_base": "0x40000000",
+    "program_dram_base": "0x80000000",
+    "worker_arenas": "0x90000000 + i*0x08000000 (tensor +0x01000000, program +0x04000000)"
+  },
+  "hw_notes": [
+    "Conv activations are HWC padded grids [(H+2)*(W+2), C] with a zero border that is never written; only real pixels are computed.",
+    "Every 3x3 conv is the on-chip window kernel (conv3x3_rows): input rows + halo resident in URAM A, the 3x3 window assembled per pixel by SRAM copies, one matvec per (N-strip, K-group) against resident weights. Bias = ones-column block in the weights; residual and K-group partials go through the bias BRAM; ReLU = matvec clamp epilogue.",
+    "HW quirk: 0*w leaks a ~1e-38 mantissa and CLAMP maps a denormal pre-activation to +inf, so the clamped matvec must always carry real data or a bias (the ones-column guarantees it).",
+    "Stem 7x7/s2 = host space-to-depth(4) of the image (48 -> 64 ch) + 3x3 window conv over the 120x160 super-grid per sub-pixel plane (zero taps dropped); maxpool = 9 plane taps folded on-chip with max(a,b) = b + relu(a-b).",
+    "Multi-engine: MultiEngineScheduler master/worker four-phase barrier; convs shard by grid rows (big-weight convs by output channel x rows), tokens by rows, attention by head (per-engine scratch); the two camera backbones run concurrently on NE/2 engines each.",
+    "Token seq 602 -> 640 rows with -inf key mask; decoder 100 -> 128. state/latent zero-padded to K=64; action head N padded to 64, host reads [:100, :ACTION_DIM].",
+    "Bins: act_bin/params.bin (weights) + act_bin/programs_e<N>/ (per engine count: primary/worker streams + compile-time constants); cache key = weights file + source hash."
+  ]
+}
