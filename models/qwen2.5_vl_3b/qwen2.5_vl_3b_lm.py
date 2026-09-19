@@ -523,6 +523,21 @@ class Qwen25VLLMMixin:
         """
         return None
 
+    # Set to a list to collect (input embedding, final hidden) per decode step.
+    # None means the speech path is not running and the loop pays nothing.
+    _speech_steps = None
+
+    def _export_prefill_hidden(self) -> bool:
+        """Whether prefill final-norms EVERY row, not just the last.
+
+        Off by default because nothing needs it: only the last position's
+        logits pick the first token, which is why LM_OUT_NORM is a single row.
+        The speech path is the exception -- the Talker conditions on the
+        Thinker's final hidden for the WHOLE prompt -- so it turns this on and
+        pays for one extra norm over [seq_len, H] plus the buffer to hold it.
+        """
+        return False
+
     def _lm_projection_is_private(self, tag: str) -> bool:
         """Whether this projection is staged PER ENGINE instead of shared.
 
@@ -718,6 +733,9 @@ class Qwen25VLLMMixin:
         # silent -- it lands on whatever is allocated next. IDENTITY was that
         # neighbour twice.
         self._lm_scratch_guard = alloc(64 * 1024, "lm.scratch_guard")
+        # Final-normed hidden for every prompt row (speech path only).
+        self.LM_PREFILL_NORM = (alloc(P * H, "lm.prefill_norm")
+                                if self._export_prefill_hidden() else None)
         # Head-sharded prefill attention needs ONE PRIVATE scratch per engine:
         # heads run concurrently and each builds its own V.T / scores / scaled_q.
         # Sized for the PREFILL shape, not the decode-worst-case LM_SCRATCH --
@@ -2274,6 +2292,17 @@ class Qwen25VLLMMixin:
                 rope_base=self.LM_ROPE_PRE, ckpt=ckpt,
                 sched=sched, gate_m_regs=gate_m_regs)
             flops_ref[0] = flops
+        if self._export_prefill_hidden():
+            # One norm over the whole prompt, on the master and outside any
+            # sharded region -- the layer loop has closed its last one. The
+            # per-row result is what the Talker conditions on.
+            final_pre = self.LM_IO_A if nl % 2 == 0 else self.LM_IO_B
+            flops += self.rms_norm_core_dram(
+                M=execution_rows, N=d["H"], A_DRAM_ADDR=final_pre,
+                OUTPUT_DRAM_ADDR=self.LM_PREFILL_NORM,
+                GAMMA_DRAM_ADDR=self.final_norm_addr, gpr_M_reg=m_reg) or 0
+            ckpt("prefill_final_norm", flops - flops_ref[0])
+            flops_ref[0] = flops
         self.generate_instruction_halt()
         worker_addrs = sched.finalize() if sched is not None else []
         if sched is not None:
@@ -2894,6 +2923,13 @@ class Qwen25VLLMMixin:
             next_seq_len = step_pos + 1
             aligned = ((next_seq_len + 63) // 64) * 64
 
+            if self._speech_steps is not None:
+                # Record which token this step CONSUMED. Its embedding cannot be
+                # read back -- on the device-embedding path the row is
+                # materialised inside the decode program and the final layer
+                # overwrites that buffer -- so the host looks it up in the
+                # checkpoint table instead.
+                self._speech_steps.append([token, None])
             if not self._device_embedding_enabled():
                 self.dma_to_accelerator_memory(
                     self.LM_IO_A, self.get_embedding_for_tokens([token]).flatten())
@@ -2993,6 +3029,9 @@ class Qwen25VLLMMixin:
             step_flops += (self._decoder_flops_fixed
                            + self._decoder_attn_per_aligned * aligned)
 
+            if self._speech_steps is not None:
+                self._speech_steps[-1][1] = self.dma_from_accelerator_memory(
+                    self.LM_OUT_NORM, (1, d["H"])).clone()
             token = self._decode_token()
             if token in stop:
                 if use_status:
