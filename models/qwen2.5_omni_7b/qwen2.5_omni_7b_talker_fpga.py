@@ -330,3 +330,65 @@ class TalkerRunner:
                 IDENTITY_DRAM_ADDR=self.IDENT)
             f += out if isinstance(out, (int, float)) else 0
         return f
+
+    # -- rotary -----------------------------------------------------------
+    ROPE_THETA = 1_000_000.0
+
+    def build_rope_table(self) -> None:
+        """Host-generated cos/sin for the Talker's own theta.
+
+        Layout per position is [cos(half) | cos(half) | -sin(half) | sin(half)],
+        which is what rope_hf_core_decode expects: the duplicated cos covers
+        both halves and the signed sin carries the rotation's sign, so the
+        kernel needs no branch.
+        """
+        half = self.AHD // 2
+        inv = 1.0 / (self.ROPE_THETA ** (torch.arange(half, dtype=torch.float32) / half))
+        pos = torch.arange(self.max_ctx, dtype=torch.float32)
+        f = torch.outer(pos, inv)
+        cos, sin = f.cos().to(torch.bfloat16), f.sin().to(torch.bfloat16)
+        table = torch.cat([cos, cos, -sin, sin], dim=1)          # [max_ctx, 2*AHD]
+        self.ROPE = self._alloc(self.max_ctx * 2 * self.AHD, "talker.rope")
+        self.ue.dma_to_accelerator_memory(self.ROPE, table.reshape(-1))
+        self._rope_row_bytes = 2 * self.AHD * 2
+
+    def emit_rope(self, pos_reg: int, tmp_reg: int) -> int:
+        """Rotate every q head and every k head at the current position."""
+        f = 0
+        for h in range(self.QH):
+            f += self.ue.rope_hf_core_decode(
+                N=self.AHD, input_dram_addr=self.Q + h * self.AHD * 2,
+                output_dram_addr=self.Q + h * self.AHD * 2,
+                cos_dram_addr=self.ROPE, sin_dram_addr=self.ROPE + self.AHD * 2,
+                rope_size_reg=pos_reg, tmp_reg=tmp_reg) or 0
+        for h in range(self.KV_HEADS):
+            f += self.ue.rope_hf_core_decode(
+                N=self.AHD, input_dram_addr=self.K + h * self.AHD * 2,
+                output_dram_addr=self.K + h * self.AHD * 2,
+                cos_dram_addr=self.ROPE, sin_dram_addr=self.ROPE + self.AHD * 2,
+                rope_size_reg=pos_reg, tmp_reg=tmp_reg) or 0
+        return f
+
+    # -- a whole layer ----------------------------------------------------
+    def emit_layer(self, li: int, src: int, dst: int, *, live_aligned: int,
+                   pos_reg: int, tmp_reg: int) -> int:
+        """One Talker decoder layer at M=1: norm, GQA, residual, MLP, residual."""
+        pre = f"model.layers.{li}."
+        f = self._rms(M=1, N=self.H, src=src, dst=self.NORM,
+                      gamma=pre + "input_layernorm.weight")
+        f += self._proj(M=1, K=self.H, N=self.Q_SIZE, src=self.NORM,
+                        wname=pre + "self_attn.q_proj.weight", dst=self.Q)
+        f += self._proj(M=1, K=self.H, N=self.KV_SIZE, src=self.NORM,
+                        wname=pre + "self_attn.k_proj.weight", dst=self.K)
+        f += self._proj(M=1, K=self.H, N=self.KV_SIZE, src=self.NORM,
+                        wname=pre + "self_attn.v_proj.weight", dst=self.V)
+        f += self.emit_rope(pos_reg, tmp_reg)
+        # K/V reach their cache planes from the host between steps; see run().
+        f += self.emit_attention(li, live_aligned)
+        f += self._proj(M=1, K=self.Q_SIZE, N=self.H, src=self.ATTN,
+                        wname=pre + "self_attn.o_proj.weight", dst=self.PROJ,
+                        bias=False)
+        self.ue.eltwise_core_dram(M=1, N=self.H, dram_a=src, dram_b=self.PROJ,
+                                  dram_out=self.RESID, mode=UE_MODE.ELTWISE_ADD)
+        f += self.emit_mlp(li, self.RESID, dst)
+        return f
