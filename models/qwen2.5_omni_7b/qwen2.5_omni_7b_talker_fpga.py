@@ -240,3 +240,93 @@ class TalkerRunner:
         self.ue.eltwise_core_dram(M=1, N=self.H, dram_a=src, dram_b=self.DOWN,
                                   dram_out=dst, mode=UE_MODE.ELTWISE_ADD)
         return f
+
+    # -- attention --------------------------------------------------------
+    KV_HEADS, GQA = 4, 3          # 12 query heads over 4 KV heads
+
+    def _kv_plane(self, base: int, li: int, h: int) -> int:
+        """Address of layer ``li``, KV head ``h``'s [max_ctx, 128] plane."""
+        return base + ((li * self.KV_HEADS + h) * self.max_ctx) * self.AHD * 2
+
+    def alloc_attention_scratch(self, aligned: int) -> None:
+        """V^T + scores + scaled_q, sized for the longest KV this run allows.
+
+        The score plane is [aligned, aligned], so this grows as the square of
+        the codec context -- the same term that dominates the Thinker's map.
+        """
+        self.ALIGNED = aligned
+        n = (self.AHD + aligned) * aligned + self.GQA * self.AHD
+        self._scratch_bytes = n * 2
+        self.SCRATCH = self._alloc(n, "talker.attn_scratch")
+        self.BIAS = self._alloc(max(aligned * aligned, self.GQA * aligned),
+                                "talker.attn_bias")
+        self.IDENT = self._alloc(64 * 64, "talker.identity")
+        self.ue.dma_to_accelerator_memory(
+            self.IDENT, torch.eye(64, dtype=torch.bfloat16))
+
+    def zero_state(self, layers: int = 24) -> None:
+        """Zero the KV planes and the attention scratch.
+
+        Not hygiene -- correctness. The kernel reads the whole 64-aligned KV
+        tile, so rows past the live context are read whatever they contain, and
+        fresh DRAM is full of 0xFFFF, which is bf16 NaN. The bias masks the
+        SCORES, but V^T is built from every row, and 0 * NaN is NaN, so an
+        unzeroed cache poisons the output even at positions the mask excludes.
+        """
+        import numpy as np
+        for base in (self.K_CACHE, self.V_CACHE):
+            n = layers * self.max_ctx * self.KV_SIZE
+            self.ue.dma_write(DMA_DEVICE_H2C, base, bytes(n * 2), n * 2)
+        self.ue.dma_write(DMA_DEVICE_H2C, self.SCRATCH,
+                          bytes(self._scratch_bytes), self._scratch_bytes)
+
+    def write_kv(self, li: int, pos: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Place one step's K/V into their per-head planes.
+
+        The four KV heads live in separate planes so decode can append to each
+        without walking off the end of head 0, so a step is four small writes
+        rather than one contiguous 512-element store.
+        """
+        for h in range(self.KV_HEADS):
+            off = pos * self.AHD * 2
+            sl = slice(h * self.AHD, (h + 1) * self.AHD)
+            self.ue.dma_to_accelerator_memory(
+                self._kv_plane(self.K_CACHE, li, h) + off, k[sl].to(torch.bfloat16))
+            self.ue.dma_to_accelerator_memory(
+                self._kv_plane(self.V_CACHE, li, h) + off, v[sl].to(torch.bfloat16))
+
+    def set_causal_bias(self, live: int) -> None:
+        """Zero for positions the step may attend to, -inf past the live KV.
+
+        Every row the kernel reads gets the same mask, not just the live query:
+        an all -inf row softmaxes to NaN, and the tile is 64-aligned.
+        """
+        a = self.ALIGNED
+        bias = torch.full((self.GQA, a), float("-inf"), dtype=torch.bfloat16)
+        bias[:, :live] = 0.0
+        self.ue.dma_to_accelerator_memory(self.BIAS, bias.reshape(-1))
+
+    def emit_attention(self, li: int, live_aligned: int) -> int:
+        """GQA over the codec KV cache, one group at a time.
+
+        unified_attention_core does NOT apply the 1/sqrt(head_dim) softmax
+        scale -- its callers pre-scale Q -- so that happens here first.
+        """
+        import math as _math
+        self.ue.eltwise_core_dram(
+            M=1, N=self.Q_SIZE, dram_a=self.Q, dram_b=None, dram_out=self.Q,
+            mode=UE_MODE.MUL_BROADCAST, scalar=1.0 / _math.sqrt(self.AHD))
+        f = 0
+        for g in range(self.KV_HEADS):
+            q_off = g * self.GQA * self.AHD * 2      # 3 contiguous heads at M=1
+            out = self.ue.unified_attention_core(
+                batch=self.GQA, aligned_seq_len=live_aligned, head_dim=self.AHD,
+                Q_DRAM_ADDR=self.Q + q_off,
+                K_DRAM_ADDR=self._kv_plane(self.K_CACHE, li, g),
+                V_DRAM_ADDR=self._kv_plane(self.V_CACHE, li, g),
+                BIAS_DRAM_ADDR=self.BIAS,
+                OUTPUT_DRAM_ADDR=self.ATTN + q_off,
+                SCRATCH_DRAM_ADDR=self.SCRATCH,
+                IDENTITY_DRAM_ADDR=self.IDENT)
+            f += out if isinstance(out, (int, float)) else 0
+        return f
