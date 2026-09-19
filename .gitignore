@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+models/*/*_bin/
+models/kokoro/kokoro_out.wav

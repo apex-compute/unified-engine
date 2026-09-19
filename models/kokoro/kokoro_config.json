@@ -1,0 +1,115 @@
+{
+  "file_info": {
+    "n_token": 178,
+    "hidden_dim": 512,
+    "style_dim": 128,
+    "n_layer": 3,
+    "n_mels": 80,
+    "max_dur": 50,
+    "text_encoder_kernel_size": 5,
+    "plbert": {
+      "hidden_size": 768,
+      "num_attention_heads": 12,
+      "intermediate_size": 2048,
+      "max_position_embeddings": 512,
+      "num_hidden_layers": 12,
+      "dropout": 0.1
+    },
+    "istftnet": {
+      "upsample_kernel_sizes": [
+        20,
+        12
+      ],
+      "upsample_rates": [
+        10,
+        6
+      ],
+      "gen_istft_hop_size": 5,
+      "gen_istft_n_fft": 20,
+      "resblock_dilation_sizes": [
+        [
+          1,
+          3,
+          5
+        ],
+        [
+          1,
+          3,
+          5
+        ],
+        [
+          1,
+          3,
+          5
+        ]
+      ],
+      "resblock_kernel_sizes": [
+        3,
+        7,
+        11
+      ],
+      "upsample_initial_channel": 512
+    }
+  },
+  "fixed_isa_regs": {
+    "GPR_T": 4,
+    "GPR_F": 5,
+    "GPR_TMP": 6,
+    "GPR_MSCRATCH": [
+      7,
+      8,
+      9
+    ],
+    "GPR_TPAD": 10,
+    "GPR_NFPAD": 11,
+    "GPR_PADROWS": 12,
+    "_NREG_POOL_SIZE": 12,
+    "GPR_SHARD_CNT": [
+      13,
+      14,
+      15
+    ],
+    "GPR_SHARD_OFF": [
+      28,
+      29,
+      30
+    ],
+    "GPR_SHARD_TMP": [
+      31,
+      32,
+      33
+    ]
+  },
+  "hardware": {
+    "max_t": 512,
+    "max_frames": 1984,
+    "transpose_n_max": 4032,
+    "comment": "T_CAP/F_CAP are derived at load time via _round_up(MAX_T/MAX_FRAMES, UE_VECTOR_SIZE); 2*F_CAP must stay <= transpose_n_max.",
+    "shard_align": 128
+  },
+  "generator": {
+    "max_gen_frames": 512,
+    "gen_in_chunk": 4096,
+    "gen_step_ramp": 4096.0,
+    "gen_magic": 192.0,
+    "comment": "GEN_T0_CAP/GEN_T1_CAP/GEN_T2_CAP stay derived from max_gen_frames + gen_in_chunk at load time."
+  },
+  "dram": {
+    "params_base": "0x00000000",
+    "tensor_base": "0x10000000",
+    "program_base": "0xF0000000",
+    "program_end": "0x100000000",
+    "worker_base": "0x90000000",
+    "worker_stride": "0x03000000"
+  },
+  "paths": {
+    "weights_bin": "kokoro_bin",
+    "hf_repo": "hexgrad/Kokoro-82M",
+    "model_filename": "kokoro-v1_0.pth"
+  },
+  "defaults": {
+    "text": "Hello, this is Kokoro, an open weight text to speech model with eighty two million parameters.",
+    "voice": "af_heart",
+    "speed": 1.0
+  }
+}
