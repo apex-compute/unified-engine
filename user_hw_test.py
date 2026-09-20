@@ -183,11 +183,15 @@ def _make_multi_engine_ues(num_engines: int):
     return ues, [w.base for w in windows]
 
 
-def _rng_state_fingerprint() -> str:
+def _rng_state_fingerprint(digest_len: int = 12) -> str:
+    """Digest of both RNG streams. ``digest_len`` trades width for collision
+    margin: the start/end block keeps 12, the per-row column uses 6 because it
+    is only ever tested for equality against the same column of another run,
+    and 1500 of them at 31 chars each would dominate the summary's width."""
     py_state = repr(random.getstate()).encode("ascii")
     torch_state = torch.random.get_rng_state().cpu().numpy().tobytes()
-    py_digest = hashlib.sha256(py_state).hexdigest()[:12]
-    torch_digest = hashlib.sha256(torch_state).hexdigest()[:12]
+    py_digest = hashlib.sha256(py_state).hexdigest()[:digest_len]
+    torch_digest = hashlib.sha256(torch_state).hexdigest()[:digest_len]
     return f"py={py_digest},torch={torch_digest}"
 
 
@@ -207,6 +211,11 @@ def record_test(name: str, dims: str = "", snr_db=None, gflops=None, mb_per_s=No
         "mb_per_s": mb_per_s,
         "inst_bytes": inst_bytes,
         "pair_id": _CURRENT_PAIR_ID,
+        # RNG state AFTER this test's draws, so the first row whose fingerprint
+        # differs between two runs is the first test that consumed the stream
+        # differently -- that test is the culprit, not a victim of an earlier
+        # one. Only meaningful compared against the same column of another run.
+        "rng": _rng_state_fingerprint(digest_len=6),
         # End-to-end model rows: fold the (n/a) SNR/GFLOPS/MB-s columns into the
         # Dimensions cell in the summary table (see write_test_summary).
         "merge_metric_cols": merge_metric_cols,
@@ -292,6 +301,7 @@ def write_test_summary(path: str = "user_hw_test_summary.md") -> None:
         "Inst Bytes",
         "SNR diff",
         "GFLOPS diff",
+        "RNG",
     ]
     # End-to-end model/inference rows (merge_metric_cols) fold the SNR / GFLOPS /
     # MB-s columns — all n/a for them — into a single wide Dimensions cell, so the
@@ -311,6 +321,7 @@ def write_test_summary(path: str = "user_hw_test_summary.md") -> None:
             _fmt_metric(r["inst_bytes"], "{:.0f}"),
             _snr_delta(leg["snr_db"], r["snr_db"])    if leg is not None else "",
             _gflops_delta(leg["gflops"], r["gflops"]) if leg is not None else "",
+            r.get("rng", ""),
         ]
         if merge:
             cells[2] = cells[3] = cells[4] = ""  # folded into the Dimensions span
@@ -8090,7 +8101,15 @@ if __name__ == "__main__":
 
     atexit.register(_atexit_write_test_summary)
 
-    software_reset_test(cores=engine_count)
+    # RESET WIDTH IS 1 BY DEFAULT, NOT engine_count. This ran with
+    # cores=args.multi_core (default 1) until f153b449; widening it to the
+    # board's engine count made the suite's FIRST test build 8 engines instead
+    # of 1, which shifted the shared torch RNG stream before any data-sensitive
+    # test ran. Every unseeded test downstream then saw different input data:
+    # run 35435983532 vs its base showed 733 of 1404 finite-SNR rows changed
+    # with no numeric regression behind any of them. --multi-core N still
+    # resets N, exactly as it did before.
+    software_reset_test(cores=args.multi_core if args.multi_core is not None else 1)
     dram_read_write_speed_test()
     isa_rela_loop_test()
     isa_abs_loop_test()
