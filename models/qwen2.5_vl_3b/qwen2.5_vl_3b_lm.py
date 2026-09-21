@@ -780,8 +780,9 @@ class Qwen25VLLMMixin:
         n_scratch = (AHD + A) * A + BATCH * AHD
         self.LM_BIAS = alloc(n_bias, "lm.bias")
         self.LM_SCRATCH = alloc(n_scratch, "lm.attn_scratch")
+        self.KV_CONTEXT_CAPACITY = aligned_C
         self._lm_zero_sizes = dict(
-            kv=NL * KVH * C * AHD, hm=QH * self.LM_HEAD_ROWS * AHD,
+            kv=NL * KVH * aligned_C * AHD, hm=QH * self.LM_HEAD_ROWS * AHD,
             bias=n_bias, scratch=n_scratch)
         # Guard between the attention scratch and IDENTITY. The kernel's scratch
         # extent is derived from its own arguments, so a sizing mistake here is
@@ -814,10 +815,10 @@ class Qwen25VLLMMixin:
 
         # KV cache: [layer][kv_head][C][AHD], head-major so decode attention
         # reads it in place -- no per-step marshalling.
-        self.KV_STRIDE_HEAD = C * AHD * bpe
+        self.KV_STRIDE_HEAD = aligned_C * AHD * bpe
         self.KV_STRIDE_LAYER = KVH * self.KV_STRIDE_HEAD
-        self.LM_K_CACHE = alloc(NL * KVH * C * AHD, "lm.k_cache")
-        self.LM_V_CACHE = alloc(NL * KVH * C * AHD, "lm.v_cache")
+        self.LM_K_CACHE = alloc(NL * KVH * aligned_C * AHD, "lm.k_cache")
+        self.LM_V_CACHE = alloc(NL * KVH * aligned_C * AHD, "lm.v_cache")
 
         end = self.get_tensor_dram_addr()
         if end > self.TENSOR_LIMIT:
@@ -832,7 +833,8 @@ class Qwen25VLLMMixin:
         self.dma_to_accelerator_memory(
             self.PENALTY_BIAS, torch.zeros(d["VOCAB"], dtype=torch.bfloat16))
         self._loud(f"  [LM] tensors: {self.get_tensor_dram_usage() / 2**20:.1f} MiB "
-                   f"(KV {2 * NL * KVH * C * AHD * bpe / 2**20:.1f} MiB at ctx {C})")
+                   f"(KV {2 * NL * KVH * aligned_C * AHD * bpe / 2**20:.1f} MiB "
+                   f"at logical ctx {C}, padded capacity {aligned_C})")
         self.lm_reset_attention_state()
 
     def lm_reset_attention_state(self) -> None:
@@ -1567,12 +1569,12 @@ class Qwen25VLLMMixin:
         else:
             self.bf16_permute_dram_core(
                 KVH, M, AHD, self.LM_K, k_base,
-                write_grouped=True, group_stride_rows=self.MAX_CONTEXT_SIZE)
+                write_grouped=True, group_stride_rows=self.KV_CONTEXT_CAPACITY)
             self.bf16_permute_dram_core(
                 KVH, M, AHD, self.LM_V, v_base,
-                write_grouped=True, group_stride_rows=self.MAX_CONTEXT_SIZE)
+                write_grouped=True, group_stride_rows=self.KV_CONTEXT_CAPACITY)
             # Rotate K inside the cache, ONE HEAD AT A TIME. The heads' planes
-            # are MAX_CONTEXT_SIZE rows apart (that is what reserves room for
+            # are KV_CONTEXT_CAPACITY rows apart (that is what reserves room for
             # decode to append), so they are NOT contiguous and a single
             # M=KVH*M call would walk off head 0's plane into unwritten rows.
             for h in range(KVH):
@@ -1608,7 +1610,7 @@ class Qwen25VLLMMixin:
             def _attn(ctx, k_base=k_base, v_base=v_base, attn_acc=attn_acc):
                 # Q/out come from the context accessors (address discipline);
                 # K/V are computed here because the KV cache planes stride by
-                # MAX_CONTEXT_SIZE, not by seq_len as ctx.kv_addr assumes.
+                # KV_CONTEXT_CAPACITY, not by seq_len as ctx.kv_addr assumes.
                 scratch = self.LM_ATTN_SCRATCH_PER_ENGINE[ctx.engine_idx]
                 for qh in range(ctx.head_off, ctx.head_off + ctx.heads):
                     kv_h = qh // G
@@ -1863,7 +1865,7 @@ class Qwen25VLLMMixin:
             f = f if isinstance(f, (int, float)) else 0
             flops += f
             # Billed separately: the core returns FLOPs for the COMPILE-TIME
-            # aligned_seq_len, which for decode is the MAX_CONTEXT_SIZE bound
+            # aligned_seq_len, which for decode is the padded context bound
             # that sizes the scratch -- not the live KV length the step runs.
             # Counting it as-is reported 45 GFLOP/token and a 194%-of-peak
             # throughput. run_decoder rescales it by the actual length.
@@ -2441,11 +2443,11 @@ class Qwen25VLLMMixin:
             out_addr = self.LM_IO_B if li % 2 == 0 else self.LM_IO_A
             flops += self._emit_layer(
                 li, 1, decode=True, m_reg=m_reg,
-                # aligned_seq_len is DYNAMIC: MAX_CONTEXT_SIZE is only the
-                # compile-time bound that sizes the scratch, while
+                # aligned_seq_len is DYNAMIC: KV_CONTEXT_CAPACITY is only the
+                # compile-time padded bound that sizes the scratch, while
                 # gf_aligned_seq_len carries the live KV length each step, so a
                 # short context does not pay for a full one.
-                aligned_kv=self.MAX_CONTEXT_SIZE,
+                aligned_kv=self.KV_CONTEXT_CAPACITY,
                 aligned_kv_reg=self.gf_aligned_seq_len, in_addr=in_addr,
                 out_addr=out_addr, rope_base=self.LM_ROPE_DEC, ckpt=ckpt,
                 dec_sched=dec_sched, dec_shards=dec_shards)
@@ -2515,8 +2517,8 @@ class Qwen25VLLMMixin:
         # aligned_seq_len.
         self._decoder_flops_fixed = int(flops - self._emit_attn_flops)
         self._decoder_attn_per_aligned = (
-            self._emit_attn_flops / self.MAX_CONTEXT_SIZE
-            if self.MAX_CONTEXT_SIZE else 0.0)
+            self._emit_attn_flops / self.KV_CONTEXT_CAPACITY
+            if self.KV_CONTEXT_CAPACITY else 0.0)
         self.allocate_program_dram(len(blob))
         self._decoder_preamble = self.allocate_program_dram(64 * 8)
         if base + len(blob) > self.DRAM_END:

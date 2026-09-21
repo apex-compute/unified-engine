@@ -36,12 +36,12 @@ numerical policy.
   frames and 150 audio soft tokens per request. Longer processed input is
   rejected.
 - The complete templated prompt, including image and audio soft tokens, must fit
-  the 384-token prefill limit; generation is bounded by the 2048-token context.
+  the 2500-token prefill limit; generation is bounded by the 2500-token context.
 
 Prefill retains the logical prompt length. Current images round execution to a
 64-row multiple, giving the 31-token sanity prompt eight rows on each engine;
 the legacy host-segmented image uses a conservative 512-row tile. The logical
-input remains limited to 384 tokens. Padding embeddings use a finite nonzero
+input remains limited to 2500 tokens. Padding embeddings use a finite nonzero
 sentinel, padding RoPE rows are finite, and padding key columns are masked, so
 the extra rows cannot affect live-token attention.
 
@@ -111,6 +111,20 @@ engine's peak, and the CPU wall time around the same stage. The gap between
 the two clocks is host overhead. TTFT covers whichever encoders the request
 ran plus prefill.
 
+`--high` is a performance-only workload for a multi-camera request that cannot
+fit as one resident context: four 896x896 camera frames (4096 vision tokens),
+a 6-second spoken query (the 600-mel-frame encoder maximum), and 6144 aggregate
+input tokens. Vision, audio, prefill, and decode each run in a fresh process
+with an independent eight-core reset and compilation. Every camera frame runs
+on the FPGA; segmented prefill is projected as three times one isolated
+2048-token FPGA measurement using the 2560-row physical KV allocation. The
+summary reports both the segmented TTFT and an estimated monolithic
+6144-token TTFT derived from static full-context model FLOPs and the measured
+segmented effective GFLOPS. It also reports decode speed at the final resident
+2048-token chunk. Media embeddings and KV history are deliberately not carried
+between chunks, so this benchmark measures performance and does not validate
+numerics or claim that a 6144-token request fits in DRAM.
+
 A second table reports **effective throughput against model FLOPs**: the work
 the architecture owes at its own dimensions -- true prompt length, true
 attention windows, matrix products only -- rather than the padded,
@@ -133,7 +147,7 @@ separates those.
 
 `--profile` compiles the vision encoder, prefill, and decoder with per-phase
 HALT checkpoints, then runs a profiled prefill and two profiled decode steps --
-one at the prompt's own context and one at `--profile-ctx` (default 2048) --
+one at the prompt's own context and one at `--profile-ctx` (default 2500) --
 and reports a per-phase table for each: calls, total ms, share of stage, GFLOP,
 GFLOPS, and percent of peak. Phases marked `*` run on engine 0 alone and are
 scored against one engine's peak. The share column is the one to act on: it
@@ -145,6 +159,9 @@ at stage level only.
 ```bash
 # Generation run + summary
 python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --image
+
+# Performance-only 4-camera / 6-second audio / 6144-token aggregate benchmark
+python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --high
 
 # Per-phase breakdown instead of generation
 python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --image --profile
@@ -223,7 +240,7 @@ python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 \
   --audio test_samples/apex.wav --prompt "Transcribe the speech exactly."
 
 # Joint audio and image understanding (audio is placed first; the combined
-# request fits the 384-token prefill budget)
+# request fits the 2500-token prefill budget)
 python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 \
   --image --audio test_samples/apex.wav
 ```

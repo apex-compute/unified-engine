@@ -18,6 +18,7 @@ import importlib.util
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -135,12 +136,14 @@ REQUIRED_DRAM_GIB = 8
 # CONTEXT AND PREFILL ARE ONE BUDGET. Prefill and decode read the same KV
 # cache, so MAX_CONTEXT_SIZE bounds both: a prompt (vision soft tokens + text)
 # may fill it, and generation continues inside it.
-MAX_CONTEXT_SIZE = 2048
+MAX_CONTEXT_SIZE = 2500
+# Prefill and decode execute whole 64-row attention tiles. Inputs remain bounded
+# by the logical context, while tensors and the KV cache carry the padded tile.
 PREFILL_INPUT_TOKEN_LIMIT = MAX_CONTEXT_SIZE
 # Allocation bound only. Prefill runs ceil(seq_len/64)*64 rows for the ACTUAL
 # prompt -- a 29-token prompt runs 64 rows -- so this sizes the [P, *] planes
 # for the longest prompt the context allows, it does not force that shape.
-PREFILL_MAX_SEQ_LEN = MAX_CONTEXT_SIZE
+PREFILL_MAX_SEQ_LEN = ((MAX_CONTEXT_SIZE + 63) // 64) * 64
 
 # SELECTABLE VISION INPUT RESOLUTION. The encoder is carved for ONE patch
 # count -- its tensors and attention bias are sized for it -- so the resolution
@@ -149,7 +152,7 @@ PREFILL_MAX_SEQ_LEN = MAX_CONTEXT_SIZE
 # num_patches / spatial_merge_size^2 == num_merged_tokens.
 #
 # The soft-token count is what reaches the LM and is charged against the
-# context, so "medium" spends 1024 of the 2048-token budget on one image.
+# context, so "medium" spends 1024 of the 2500-token budget on one image.
 VISION_RESOLUTIONS = {
     "small":  {"image_size": 336, "num_patches":  576, "num_merged_tokens":  144},
     "medium": {"image_size": 896, "num_patches": 4096, "num_merged_tokens": 1024},
@@ -163,7 +166,7 @@ VISION_MAX_SOFT_TOKENS = max(
 # ==========================================================================
 # FIXED-SHAPE RUN PRESETS
 # ==========================================================================
-# --low and --medium pin a whole run shape rather than a set of files, so the
+# --low, --medium and --high pin a whole run shape rather than a set of files, so the
 # two are reproducible prefill lengths instead of "whatever this wav happened
 # to be". Each preset fixes the media and then GROWS THE TEXT PROMPT until the
 # assembled prefill reaches its target, because the media contribute a fixed
@@ -171,11 +174,12 @@ VISION_MAX_SOFT_TOKENS = max(
 #
 #   low     audio at half length (~64 soft tokens) + text  -> ~850 prefill
 #   medium  896x896 image (1024 soft tokens) + full audio
-#           (128 soft tokens) + text                       -> ~1900 prefill
+#           (128 soft tokens) + text                       -> ~2048 prefill
+#   high    4 x 896x896 camera frames + 6 s audio + text   -> 6144 aggregate
+#           performance-only input, executed as 3 x 2048 resident chunks
 #
-# Both fit MAX_CONTEXT_SIZE (2048), medium deliberately close to it: it leaves
-# ~148 tokens of decode headroom, which is the point of having a large shape to
-# measure.
+# Both fit the 2560-row prefill allocation. Medium targets a power-of-two
+# 2048-row run and leaves about 452 tokens of total-context decode headroom.
 RUN_PRESETS = {
     "low": {
         "vision_res": None,
@@ -187,7 +191,20 @@ RUN_PRESETS = {
         "vision_res": "medium",
         "image": True,
         "audio_fraction": 1.0,
-        "prefill_tokens": 1900,
+        "prefill_tokens": 2048,
+    },
+    "high": {
+        "vision_res": "medium",
+        "image": True,
+        "audio_fraction": 1.0,
+        # 600 valid mel frames is the configured audio-encoder maximum.
+        "audio_seconds": 6.0,
+        "vision_runs": 4,
+        "prefill_tokens": 6144,
+        # Processor length includes the final seed token; 2049 renders 2048
+        # rows into the prefill program.
+        "prefill_chunk_tokens": 2049,
+        "prefill_chunks": 3,
     },
 }
 
@@ -214,6 +231,11 @@ _PRESET_PROMPT_BASE = {
         "it is spoken, preserving the wording and the order of the terms. "
         "Second, describe the image in detail, covering the lighting, the "
         "terrain, the vegetation and the sky. Both parts are required."
+    ),
+    "high": (
+        "Benchmark a multi-camera request with a long spoken query and text "
+        "history. Numeric correctness and response coherence are not part of "
+        "this performance-only run."
     ),
 }
 
@@ -373,12 +395,8 @@ OMNI_WINDOW_BYTES = 0x4000_0000            # 1 GiB per core, 8 GiB total
 OMNI_ISA_BYTES = 16 * 2**20                # per-core ISA slice, inside the window
 # Per-core scratch, inside the window. The head-sharded prefill attention keeps
 # ONE private scratch per engine, (AHD + aligned_P) * aligned_P + aligned_P *
-# AHD elements -- 9.44 MiB at the 2048-row prefill allocation, so 8 MiB no
-# longer covers it.
-# 48 MiB, not 16: the head-sharded VISION attention also keeps one private
-# scratch per engine, (VD_PAD + aligned_S) * aligned_S + aligned_S * VD_PAD
-# elements, which is 35.65 MiB at the 4096-patch (1024 soft token) allocation.
-# The LM's own per-engine scratch needs 9.44 MiB at a 2048-row prefill.
+# AHD elements -- 13.75 MiB at the 2560-row prefill allocation. Vision's much
+# larger 4096-patch worker scratch is pinned in the shared pool instead.
 OMNI_PRIVATE_TENSOR_BYTES = 16 * 2**20
 
 # What the private shards need per core, declared BEFORE any shared byte is
@@ -594,12 +612,11 @@ class Qwen25OmniUnifiedEngine(
 
         # TENSORS ARE CARVED PER BUFFER, NOT FROM ONE EXTENT. Only an individual
         # buffer has to be contiguous -- the KV cache, an [M, N] activation
-        # plane -- and the largest of those is ~112 MiB at ctx 4096, well inside
-        # one window's gap. Reserving a single extent big enough for ALL of them
-        # (604 MiB at ctx 2048, 740 at 4096) is what used to cap the prefill
-        # allocation, because no window can offer that much contiguously and
-        # even merging two adjacent gaps tops out near 576 MiB. Carving each
-        # buffer on its own spreads them over the whole 2304 MiB pool instead.
+        # plane. The largest at the current allocation is the 140 MiB TP
+        # down-output scratch, which is also overlaid by shorter-lived Q/K/V,
+        # attention-result and norm tensors. Carving physical buffers separately
+        # spreads them over the shared pool instead of requiring one impossible
+        # contiguous tensor extent.
         self.TENSOR_BASE = 0
         self.TENSOR_LIMIT = sum(self.mc_arena.shared_free())
         self._tensor_staged = 0
@@ -1526,12 +1543,19 @@ class Qwen25OmniUnifiedEngine(
         rows: list[dict] = []
         if getattr(self, "_vis_latency_us", None):
             dims = self._vision_dims()
+            vision_runs = int(getattr(self, "_high_vision_runs", 1))
             rows.append({
                 "stage": "Vision encoder",
-                "detail": f"{dims['VS']} patches -> "
-                          f"{dims['NUM_MERGED_TOKENS']} soft tokens",
+                "detail": (
+                    f"{vision_runs} frames x {dims['VS']} patches -> "
+                    f"{vision_runs * dims['NUM_MERGED_TOKENS']} soft tokens"
+                    if vision_runs > 1 else
+                    f"{dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens"
+                ),
                 "flops": float(self._vis_total_flops),
-                "model_flops": self._model_flops_vision(dims),
+                "model_flops": (
+                    float(self._model_flops_vision(dims) or 0.0) * vision_runs
+                ),
                 "us": float(self._vis_latency_us),
                 "wall": float(getattr(self, "_vis_wall_s", 0.0)),
             })
@@ -1549,7 +1573,10 @@ class Qwen25OmniUnifiedEngine(
                 "stage": "Prefill",
                 "detail": f"{getattr(self, '_prefill_seq_len_run', 0)} tokens",
                 "flops": float(getattr(self, "_prefill_flops", 0.0)),
-                "model_flops": self._model_flops_prefill(),
+                "model_flops": getattr(
+                    self, "_high_segmented_prefill_model_flops",
+                    self._model_flops_prefill(),
+                ),
                 "us": float(self._latency_prefill_us),
                 "wall": float(getattr(self, "_prefill_wall_s", 0.0)),
             })
@@ -1908,6 +1935,26 @@ class Qwen25OmniUnifiedEngine(
             "## Weights and programs",
             "",
         ]
+        high = getattr(self, "_high_benchmark", None)
+        if high:
+            lines[4:4] = [
+                "## High-load benchmark contract",
+                "",
+                f"- **Camera workload:** {high['vision_runs']} independent "
+                f"896x896 frames ({high['vision_soft_tokens']} vision tokens total)",
+                f"- **Spoken query:** {high['audio_seconds']:.1f} s",
+                f"- **Aggregate input:** {high['aggregate_tokens']} tokens",
+                f"- **Measured prefill:** {high['prefill_chunks']} independent x "
+                f"{high['chunk_tokens']} tokens; each pass runs on the FPGA and "
+                "reuses the resident KV allocation",
+                "- **Numerics:** intentionally unchecked; media embeddings and KV "
+                "history do not carry between benchmark chunks",
+                "",
+                "This is a throughput/latency benchmark, not a claim that a "
+                "monolithic 6144-token request fits. The current physical KV "
+                f"capacity remains {self.KV_CONTEXT_CAPACITY} rows.",
+                "",
+            ]
         if os.path.exists(params_bin):
             lines.append(
                 f"- **Weight bin:** `{os.path.basename(params_bin)}` — "
@@ -1969,11 +2016,13 @@ class Qwen25OmniUnifiedEngine(
 
         if getattr(self, "_vis_latency_us", None):
             dims = self._vision_dims()
+            vision_runs = int(getattr(self, "_high_vision_runs", 1))
             lines += [
                 "## Vision",
                 "",
                 f"- **Image:** `{os.path.basename(getattr(args, 'image', '') or '')}` "
-                f"-> {dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens",
+                f"x {vision_runs} frame(s) -> {vision_runs * dims['VS']} patches "
+                f"-> {vision_runs * dims['NUM_MERGED_TOKENS']} soft tokens",
                 f"- **Work:** {self._vis_total_flops / 1e9:.1f} GFLOP",
                 f"- **HW latency:** {self._vis_latency_us / 1e3:.1f} ms",
                 f"- **Throughput:** {self._vis_gflops:.1f} GFLOPS "
@@ -2028,15 +2077,25 @@ class Qwen25OmniUnifiedEngine(
                 ("vision", getattr(self, "_vis_latency_us", None)),
                 ("audio", getattr(self, "_audio_latency_us", None)),
             ) if seen] + ["prefill"]
+            ttft_kind = "measured segmented; " if high else ""
             lines += [
                 "## Time to first token",
                 "",
-                f"- **TTFT (HW counter; {' + '.join(covered)}):** "
+                f"- **TTFT ({ttft_kind}HW counter; {' + '.join(covered)}):** "
                 f"{(enc_hw_us + pre_hw_us) / 1e3:.1f} ms",
-                f"- **TTFT (CPU timer; {' + '.join(covered)}):** "
+                f"- **TTFT ({ttft_kind}CPU timer; {' + '.join(covered)}):** "
                 f"{enc_wall + pre_wall:.2f} s",
-                "",
             ]
+            if high:
+                estimate_us = float(high["monolithic_prefill_estimate_us"])
+                lines += [
+                    f"- **Estimated monolithic prefill:** {estimate_us / 1e3:.1f} ms "
+                    f"for {high['aggregate_tokens']} tokens, using the measured "
+                    "segmented effective GFLOPS and static full-context FLOPs",
+                    f"- **Estimated monolithic TTFT:** "
+                    f"{(enc_hw_us + estimate_us) / 1e3:.1f} ms",
+                ]
+            lines.append("")
 
         steps = getattr(self, "_decode_step_us", None)
         if steps:
@@ -2434,7 +2493,12 @@ def _resolve_sample(path: str | None, default_path: str, flag: str) -> str | Non
     raise SystemExit(f"{flag}: file not found: {path!r}")
 
 
-def _load_audio(path: str, sample_rate: int, fraction: float = 1.0) -> np.ndarray:
+def _load_audio(
+    path: str,
+    sample_rate: int,
+    fraction: float = 1.0,
+    target_seconds: float | None = None,
+) -> np.ndarray:
     import soundfile as sf
     import torchaudio.functional as audio_functional
 
@@ -2458,6 +2522,19 @@ def _load_audio(path: str, sample_rate: int, fraction: float = 1.0) -> np.ndarra
         # count, so this is what makes a preset's audio contribution fixed.
         kept = max(int(mono.shape[0] * fraction), sample_rate // 10)
         mono = mono[:kept]
+    if target_seconds is not None:
+        target_samples = int(round(float(target_seconds) * sample_rate))
+        if target_samples <= 0:
+            raise ValueError(
+                f"audio target duration must be positive, got {target_seconds}"
+            )
+        # The bundled clip is deterministic benchmark material. Repeat it when
+        # it is shorter than the requested camera-query duration, then trim to
+        # exactly the requested number of samples.
+        if mono.shape[0] < target_samples:
+            repeats = (target_samples + mono.shape[0] - 1) // mono.shape[0]
+            mono = mono.repeat(repeats)
+        mono = mono[:target_samples]
     return mono.contiguous().numpy().astype(np.float32, copy=False)
 
 
@@ -2502,7 +2579,8 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
         preset = RUN_PRESETS.get(getattr(args, "preset", None) or "", {})
         samples = _load_audio(
             args.audio, int(cfg["audio"]["sample_rate"]),
-            fraction=float(preset.get("audio_fraction", 1.0)))
+            fraction=float(preset.get("audio_fraction", 1.0)),
+            target_seconds=preset.get("audio_seconds"))
         audio = [samples]
 
     # In the joint case, match media order to the requested answer order. This
@@ -2533,7 +2611,9 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
     # this particular audio clip and image expand to.
     preset_name = getattr(args, "preset", None)
     if preset_name and not args.prompt:
-        target = int(RUN_PRESETS[preset_name]["prefill_tokens"])
+        target = int(RUN_PRESETS[preset_name].get(
+            "prefill_chunk_tokens", RUN_PRESETS[preset_name]["prefill_tokens"]
+        ))
         prompt = _fit_prompt_to_prefill(
             processor.tokenizer,
             lambda text: int(_assemble(text)[1]["input_ids"].shape[1]),
@@ -2615,7 +2695,7 @@ def _run_audio(ue: Qwen25OmniUnifiedEngine, processed):
 
 
 def apply_run_preset(args) -> None:
-    """Turn --low / --medium into the media flags they stand for.
+    """Turn --low / --medium / --high into the media flags they stand for.
 
     The preset decides WHICH media are present and at what size; the prompt
     that brings the prefill up to the target is fitted later, once the
@@ -2690,6 +2770,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
               f"and a fitted prompt, ~{RUN_PRESETS['medium']['prefill_tokens']} "
               "prefill tokens"),
     )
+    presets.add_argument(
+        "--high", dest="preset", action="store_const", const="high",
+        help=("performance-only fixed shape: 4 x 896x896 camera frames, "
+              "6 seconds of audio, and 6144 aggregate input tokens projected "
+              "as 3 x one isolated 2048-token FPGA prefill measurement"),
+    )
     parser.set_defaults(preset=None)
     parser.add_argument(
         "--image",
@@ -2741,6 +2827,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip writing the run-summary Markdown",
     )
+    parser.add_argument(
+        "--_high-phase",
+        dest="high_phase",
+        choices=("vision", "audio", "prefill", "decode"),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -2754,7 +2847,7 @@ def run_summary_filename(args) -> str:
     so its phase breakdown never overwrites a generation run's summary.
 
     A PRESET IS PART OF THE NAME because it is not visible in the mode. --low
-    is mode "audio" and --medium is "image+audio", exactly like the plain flags
+    is mode "audio" and --medium/--high are "image+audio", exactly like the plain flags
     they build on, so without this a preset run and an ad-hoc run of the same
     mode overwrite each other despite being different shapes -- 849 prefill
     tokens against 154, which is the whole point of having the preset.
@@ -2768,6 +2861,149 @@ def run_summary_filename(args) -> str:
     return "_".join(parts) + ".md"
 
 
+def _write_high_summary(args, phases: dict[str, dict], process_wall: dict[str, float]) -> str:
+    """Combine independently executed high-load phase measurements."""
+    vision = phases["vision"]
+    audio = phases["audio"]
+    sample = phases["prefill"]
+    decode = phases["decode"]
+    chunks = int(RUN_PRESETS["high"]["prefill_chunks"])
+    aggregate_tokens = int(sample["tokens"]) * chunks
+    prefill = dict(sample)
+    for key in ("flops", "model_flops", "hw_us", "wall_s"):
+        prefill[key] = float(sample[key]) * chunks
+    prefill["detail"] = (
+        f"{chunks} x {sample['tokens']} independent chunks = "
+        f"{aggregate_tokens} aggregate tokens"
+    )
+    prefill["gflops"] = (
+        prefill["flops"] / (prefill["hw_us"] * 1e3)
+        if prefill["hw_us"] else 0.0
+    )
+    prefill["effective_gflops"] = (
+        prefill["model_flops"] / (prefill["hw_us"] * 1e3)
+        if prefill["hw_us"] else 0.0
+    )
+    mono_flops = float(sample["monolithic_model_flops"])
+    mono_us = (
+        mono_flops / (prefill["effective_gflops"] * 1e3)
+        if prefill["effective_gflops"] else 0.0
+    )
+    rows = [vision, audio, prefill, decode]
+    peak = float(vision["peak_gflops"])
+    enc_us = float(vision["hw_us"]) + float(audio["hw_us"])
+    segmented_ttft_us = enc_us + float(prefill["hw_us"])
+    monolithic_ttft_us = enc_us + mono_us
+
+    lines = [
+        "# qwen2.5_omni_7b high-load benchmark",
+        "",
+        "## Contract",
+        "",
+        "- **Execution:** vision, audio, prefill, and decode each ran in a "
+        "fresh Python process with its own eight-core reset, compilation, and "
+        "FPGA execution.",
+        "- **Camera:** 4 independent 896x896 frames, 4096 vision tokens total.",
+        "- **Audio:** 6.0 seconds, the configured 600-mel-frame maximum.",
+        f"- **Prefill:** {aggregate_tokens} aggregate tokens projected as "
+        f"{chunks} x {sample['tokens']} independent resident chunks.",
+        f"- **Physical KV capacity:** {PREFILL_MAX_SEQ_LEN} rows; history is not "
+        "carried between chunks.",
+        "- **Numerics/coherency:** intentionally unchecked.",
+        "",
+        "## Hardware-counter performance",
+        "",
+        "| Stage | Shape | Work (GFLOP) | FPGA time (ms) | GFLOPS | % peak | CPU execution wall (s) |",
+        "| :--- | :--- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in rows:
+        gflops = float(row["gflops"])
+        lines.append(
+            f"| {row['stage']} | {row['detail']} | {float(row['flops']) / 1e9:.1f} | "
+            f"{float(row['hw_us']) / 1e3:.1f} | {gflops:.1f} | "
+            f"{100.0 * gflops / peak:.1f}% | {float(row['wall_s']):.2f} |"
+        )
+    lines += [
+        "",
+        "## TTFT",
+        "",
+        f"- **Projected segmented TTFT (HW counters):** {segmented_ttft_us / 1e3:.1f} ms",
+        f"- **Projected segmented TTFT (CPU execution timers):** "
+        f"{float(vision['wall_s']) + float(audio['wall_s']) + float(prefill['wall_s']):.2f} s",
+        f"- **Estimated monolithic 6144-token prefill:** {mono_us / 1e3:.1f} ms "
+        f"({mono_flops / 1e9:.1f} model GFLOP at the measured "
+        f"{prefill['effective_gflops']:.1f} effective GFLOPS)",
+        f"- **Estimated monolithic TTFT:** {monolithic_ttft_us / 1e3:.1f} ms",
+        "",
+        "The monolithic figure is an extrapolation calibrated by FPGA-measured "
+        "throughput; it is not a 6144-row hardware execution.",
+        "",
+        "## Decode",
+        "",
+        f"- **Resident context:** {decode['context']} tokens",
+        f"- **Steps:** {decode['steps']}",
+        f"- **First token:** {1e6 / float(decode['first_us']):.2f} tok/s",
+        f"- **Average (HW counter):** {1e6 * int(decode['steps']) / float(decode['hw_us']):.2f} tok/s",
+        f"- **Average (CPU timer):** {int(decode['steps']) / float(decode['wall_s']):.2f} tok/s",
+        f"- **Throughput:** {float(decode['gflops']):.1f} GFLOPS "
+        f"({100.0 * float(decode['gflops']) / peak:.1f}% peak)",
+        "",
+        "## Independent phase process wall time",
+        "",
+        "This includes reset, weight loading, compilation, and execution and is "
+        "reported separately from inference TTFT.",
+        "",
+        "| Phase process | Wall (s) |",
+        "| :--- | ---: |",
+    ]
+    for name in ("vision", "audio", "prefill", "decode"):
+        lines.append(f"| {name} | {process_wall[name]:.2f} |")
+    lines.append("")
+    out = args.summary or os.path.join(SCRIPT_DIR, run_summary_filename(args))
+    with open(out, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+    return out
+
+
+def _run_high_orchestrator(args) -> None:
+    """Run every high-load phase in a fresh process, then combine metrics."""
+    phases: dict[str, dict] = {}
+    process_wall: dict[str, float] = {}
+    for phase in ("vision", "audio", "prefill", "decode"):
+        command = [
+            sys.executable, os.path.abspath(__file__),
+            "--dev", args.dev,
+            "--multi-core", str(args.multi_core),
+            "--high", "--_high-phase", phase,
+            "--max-new-tokens", "32",
+            "--no-summary",
+        ]
+        print(f"\n{'=' * 72}\nHIGH PHASE: {phase}\n{'=' * 72}", flush=True)
+        started = time.perf_counter()
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+        result = None
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+            if line.startswith("HIGH_PHASE_RESULT: "):
+                result = json.loads(line[len("HIGH_PHASE_RESULT: "):])
+        returncode = proc.wait()
+        process_wall[phase] = time.perf_counter() - started
+        if returncode:
+            raise RuntimeError(f"high phase {phase!r} exited with status {returncode}")
+        if result is None:
+            raise RuntimeError(f"high phase {phase!r} produced no metric record")
+        phases[phase] = result
+    out = _write_high_summary(args, phases, process_wall)
+    print(f"\nWrote combined high-load summary: {out}")
+    print("HIGH_RESULT: " + json.dumps({
+        "summary": out, "phases": phases, "process_wall_s": process_wall,
+    }, ensure_ascii=False))
+
+
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -2776,8 +3012,13 @@ def main() -> None:
         parser.error("--max-new-tokens must be positive")
     if args.profile_ctx < 2 or args.profile_ctx > MAX_CONTEXT_SIZE:
         parser.error(f"--profile-ctx must be between 2 and {MAX_CONTEXT_SIZE}")
+    if args.preset == "high" and args.profile:
+        parser.error("--high already performs a multi-pass benchmark; do not combine it with --profile")
     if args.no_summary and args.summary:
         parser.error("--summary and --no-summary are mutually exclusive")
+    if args.preset == "high" and args.high_phase is None:
+        _run_high_orchestrator(args)
+        return
     with _exclusive_run_lock():
         _main_locked(parser, args)
 
@@ -2828,11 +3069,129 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     ue._prompt_text = prompt
     print(ue.describe_dram_map())
 
+    high_phase = getattr(args, "high_phase", None)
+    if high_phase == "vision":
+        runs = int(RUN_PRESETS["high"]["vision_runs"])
+        measurements = []
+        embeddings = None
+        for index in range(runs):
+            print(f"\n=== Camera frame {index + 1}/{runs} ===")
+            if index == 0:
+                embeddings = _run_vision(ue, processed, profile=False)
+            else:
+                started = time.perf_counter()
+                embeddings = ue.run_vision_encoder(profile=False)
+                print(
+                    f"  vision -> {tuple(embeddings.shape)} in "
+                    f"{time.perf_counter() - started:.2f}s wall"
+                )
+            measurements.append((
+                int(ue._vis_total_flops), float(ue._vis_latency_us),
+                float(ue._vis_wall_s),
+            ))
+        ue._high_vision_runs = runs
+        ue._vis_total_flops = sum(item[0] for item in measurements)
+        ue._vis_latency_us = sum(item[1] for item in measurements)
+        ue._vis_wall_s = sum(item[2] for item in measurements)
+        row = ue.stage_metrics(args)[0]
+        print("HIGH_PHASE_RESULT: " + json.dumps({
+            "stage": row["stage"], "detail": row["detail"],
+            "flops": row["flops"], "model_flops": row["model_flops"],
+            "hw_us": row["us"], "wall_s": row["wall"],
+            "gflops": row["gflops"], "peak_gflops": ue.vis_peak_gflops(),
+        }))
+        return
+
+    if high_phase == "audio":
+        _embeddings, _metadata = _run_audio(ue, processed)
+        row = ue.stage_metrics(args)[0]
+        print("HIGH_PHASE_RESULT: " + json.dumps({
+            "stage": row["stage"], "detail": row["detail"],
+            "flops": row["flops"], "model_flops": row["model_flops"],
+            "hw_us": row["us"], "wall_s": row["wall"],
+            "gflops": row["gflops"], "peak_gflops": ue.vis_peak_gflops(),
+        }))
+        return
+
+    if high_phase in ("prefill", "decode"):
+        print(f"\n--- Isolated {high_phase} LM setup ---")
+        ue.lm_weight_init()
+        ue.lm_tensor_init()
+        ue.compile_prefill(len(context), profile=False)
+        # Decoder compilation must precede the first prefill because it copies
+        # the down-projection image before prefill repacks that image in place.
+        ue.compile_decoder(profile=False)
+        ue.check_master_isa()
+        ue.store_program_stages("prefill", "decode")
+        ue.run_prefill(context, positions=torch.arange(len(context)))
+        if high_phase == "prefill":
+            row = next(r for r in ue.stage_metrics(args) if r["stage"] == "Prefill")
+            aggregate = len(context) * int(RUN_PRESETS["high"]["prefill_chunks"])
+            print("HIGH_PHASE_RESULT: " + json.dumps({
+                "stage": row["stage"], "detail": row["detail"],
+                "tokens": len(context),
+                "flops": row["flops"], "model_flops": row["model_flops"],
+                "monolithic_model_flops": float(
+                    _model_flops.prefill_flops(cfg, aggregate)
+                ),
+                "hw_us": row["us"], "wall_s": row["wall"],
+                "gflops": row["gflops"], "peak_gflops": ue.vis_peak_gflops(),
+            }))
+            return
+        ue.activate_decode_shared_weights()
+        resident_context = int(ue.seq_len)
+        # High is explicitly timing-only: force all requested steps even if a
+        # numerically meaningless token happens to equal EOS.
+        ue._decode_stop_token_ids = lambda: set()
+        ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)
+        row = next(r for r in ue.stage_metrics(args) if r["stage"] == "Decode")
+        steps = len(ue._decode_step_us)
+        print("HIGH_PHASE_RESULT: " + json.dumps({
+            "stage": row["stage"], "detail": row["detail"],
+            "context": resident_context, "steps": steps,
+            "first_us": float(ue._decode_step_us[0]),
+            "flops": row["flops"], "model_flops": row["model_flops"],
+            "hw_us": row["us"], "wall_s": row["wall"],
+            "gflops": row["gflops"], "peak_gflops": ue.vis_peak_gflops(),
+        }))
+        return
+
     image_embeddings = None
     audio_embeddings = None
     audio_metadata = None
+    preset_spec = RUN_PRESETS.get(getattr(args, "preset", None) or "", {})
     if args.image:
-        image_embeddings = _run_vision(ue, processed, profile=args.profile)
+        vision_runs = int(preset_spec.get("vision_runs", 1))
+        vision_measurements = []
+        for frame_index in range(vision_runs):
+            if vision_runs > 1:
+                print(f"\n=== High benchmark camera frame {frame_index + 1}/{vision_runs} ===")
+            if frame_index == 0:
+                # Compile and package one shape-specific program. Camera frames
+                # share geometry, so later frames execute the same validated
+                # FPGA image rather than consuming another worker ISA slice.
+                image_embeddings = _run_vision(ue, processed, profile=args.profile)
+            else:
+                frame_started = time.perf_counter()
+                image_embeddings = ue.run_vision_encoder(profile=False)
+                print(
+                    f"  vision -> {tuple(image_embeddings.shape)} in "
+                    f"{time.perf_counter() - frame_started:.2f}s wall"
+                )
+            vision_measurements.append((
+                int(ue._vis_total_flops),
+                float(ue._vis_latency_us),
+                float(getattr(ue, "_vis_wall_s", 0.0)),
+            ))
+        if vision_runs > 1:
+            ue._high_vision_runs = vision_runs
+            ue._vis_total_flops = sum(row[0] for row in vision_measurements)
+            ue._vis_latency_us = sum(row[1] for row in vision_measurements)
+            ue._vis_wall_s = sum(row[2] for row in vision_measurements)
+            ue._vis_gflops = (
+                ue._vis_total_flops / (ue._vis_latency_us * 1e3)
+                if ue._vis_latency_us else 0.0
+            )
     if args.audio:
         audio_embeddings, audio_metadata = _run_audio(ue, processed)
 
@@ -2855,6 +3214,19 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         f"\n[Mode] {_result_mode(args)}: {len(context)} prefill tokens, "
         f"mRoPE delta {rope_delta}, prompt {prompt!r}"
     )
+
+    if args.preset == "high":
+        # Repeated encoder rendezvous leave no useful queue state for the LM.
+        # A software reset clears all eight queues without touching DRAM, so
+        # the final frame/audio embeddings remain available for prefill.
+        print("\n--- High benchmark encoder/LM queue reset ---")
+        reset_build = reset_selected_engines()
+        if reset_build != fpga_build:
+            raise RuntimeError(
+                f"FPGA build changed across high benchmark reset: "
+                f"0x{fpga_build:08x} -> 0x{reset_build:08x}"
+            )
+        print("Software reset + HALT probe passed on engines 0-7; DRAM preserved")
 
     def _write_summary(profiles=None) -> None:
         """Render the run summary; a reporting failure never fails the run."""
@@ -2882,13 +3254,71 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     ue.store_program_stages("prefill", "decode")
     for line in ue.isa_usage_lines():
         print(line)
-    ue.run_prefill(
-        context,
-        image_embeddings=image_embeddings,
-        audio_embeddings=audio_embeddings,
-        positions=positions[: len(context)],
-        profile=args.profile,
-    )
+    prefill_chunks = int(preset_spec.get("prefill_chunks", 1))
+    prefill_measurements = []
+    for chunk_index in range(prefill_chunks):
+        if prefill_chunks > 1:
+            print(
+                f"\n=== High benchmark prefill chunk "
+                f"{chunk_index + 1}/{prefill_chunks} ({len(context)} tokens) ==="
+            )
+        ue.run_prefill(
+            context,
+            image_embeddings=image_embeddings,
+            audio_embeddings=audio_embeddings,
+            positions=positions[: len(context)],
+            profile=args.profile,
+        )
+        prefill_measurements.append((
+            int(ue._prefill_flops),
+            float(ue._latency_prefill_us),
+            float(getattr(ue, "_prefill_wall_s", 0.0)),
+            float(ue._model_flops_prefill() or 0.0),
+        ))
+    if prefill_chunks > 1:
+        aggregate_tokens = len(context) * prefill_chunks
+        ue._prefill_flops = sum(row[0] for row in prefill_measurements)
+        ue._latency_prefill_us = sum(row[1] for row in prefill_measurements)
+        ue._prefill_wall_s = sum(row[2] for row in prefill_measurements)
+        ue._prefill_seq_len_run = aggregate_tokens
+        ue._high_segmented_prefill_model_flops = sum(
+            row[3] for row in prefill_measurements
+        )
+        ue._prefill_gflops = (
+            ue._prefill_flops / (ue._latency_prefill_us * 1e3)
+            if ue._latency_prefill_us else 0.0
+        )
+        monolithic_flops = float(_model_flops.prefill_flops(cfg, aggregate_tokens))
+        segmented_effective_gflops = (
+            ue._high_segmented_prefill_model_flops
+            / (ue._latency_prefill_us * 1e3)
+            if ue._latency_prefill_us else 0.0
+        )
+        monolithic_estimate_us = (
+            monolithic_flops / (segmented_effective_gflops * 1e3)
+            if segmented_effective_gflops else 0.0
+        )
+        dims = ue._vision_dims()
+        ue._high_benchmark = {
+            "vision_runs": int(getattr(ue, "_high_vision_runs", 1)),
+            "vision_soft_tokens": (
+                int(getattr(ue, "_high_vision_runs", 1))
+                * int(dims["NUM_MERGED_TOKENS"])
+            ),
+            "audio_seconds": float(preset_spec["audio_seconds"]),
+            "prefill_chunks": prefill_chunks,
+            "chunk_tokens": len(context),
+            "aggregate_tokens": aggregate_tokens,
+            "segmented_prefill_model_flops": ue._high_segmented_prefill_model_flops,
+            "monolithic_prefill_model_flops": monolithic_flops,
+            "monolithic_prefill_estimate_us": monolithic_estimate_us,
+        }
+        print(
+            f"\n[High benchmark] measured {prefill_chunks} x {len(context)} = "
+            f"{aggregate_tokens} aggregate prefill tokens; monolithic "
+            f"{aggregate_tokens}-token prefill estimate "
+            f"{monolithic_estimate_us / 1e6:.2f}s HW"
+        )
     ue.activate_decode_shared_weights()
 
     if args.profile:
@@ -2976,6 +3406,9 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         _summary_rows = ue.stage_metrics(args)
     except Exception:  # noqa: BLE001 - reporting must not fail a good run
         _summary_rows = []
+    reported_prefill_tokens = int(
+        getattr(ue, "_high_benchmark", {}).get("aggregate_tokens", len(context))
+    )
     result = {
         "model": "qwen2.5_omni_7b",
         "mode": _result_mode(args),
@@ -2988,10 +3421,10 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         "program_section_count": int(program_manifest["section_count"]),
         "decoded_text": decoded_text,
         # Canonical model_auto_test fields.
-        "prefill_tokens": len(context),
+        "prefill_tokens": reported_prefill_tokens,
         "decoded_tokens": generated,
         "prefill_speed_tok_s": (
-            len(context) / prefill_wall if prefill_wall > 0 else None
+            reported_prefill_tokens / prefill_wall if prefill_wall > 0 else None
         ),
         "decode_speed_tok_s": decode_tok_s,
         "prefill_size_kb": len(ue._prefill_program[1]) / 1024,
@@ -3007,7 +3440,7 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         ),
         "decode_tok_s": decode_tok_s,
         "prefill_hw_tok_s": (
-            len(context) / (prefill_us * 1e-6) if prefill_us > 0 else None
+            reported_prefill_tokens / (prefill_us * 1e-6) if prefill_us > 0 else None
         ),
         "first_token_tok_s": (
             1e6 / ue._decode_step_us[0]
@@ -3028,9 +3461,11 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         "decode_gflops": getattr(ue, "_decode_gflops", None),
         "vision_gflops": getattr(ue, "_vis_gflops", None),
         "audio_gflops": getattr(ue, "_audio_gflops", None),
-        "prompt_tokens": len(tokens),
+        "prompt_tokens": reported_prefill_tokens + (prefill_chunks if prefill_chunks > 1 else 1),
         "rope_delta": rope_delta,
     }
+    if getattr(ue, "_high_benchmark", None):
+        result["high_benchmark"] = ue._high_benchmark
     print("TEST_RESULT: " + json.dumps(result, ensure_ascii=False))
     _write_summary()
 
