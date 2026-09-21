@@ -642,6 +642,19 @@ def alveo_u55c_core_bases(num_engines: int, dram_size_gb: int = 8) -> list[int]:
     return list(bases[:num_engines])
 
 
+def alveo_u55c_16gb_pool() -> list[int]:
+    """Every 1 GiB (stack, MC) region of the 16 GiB U55C, in assignment order.
+
+    The twelve preferred regions first -- ALVEO_U55C_16GB_CORE_BASES, which
+    alternates stacks so MC-sharing port pairs land on opposite stacks -- then
+    the four the map leaves spare. A caller that reserves part of the device
+    draws replacements from the tail rather than losing an engine's controller.
+    """
+    preferred = list(ALVEO_U55C_16GB_CORE_BASES)
+    every = [region * ALVEO_U55C_MC_STRIDE for region in range(2 * ALVEO_U55C_MC_COUNT)]
+    return preferred + [base for base in every if base not in preferred]
+
+
 def is_alveo_u55c() -> bool:
     """True when HW_INFO's core count is the U55C image's signature."""
     return user_dma_core.ANDROMEDA_CORE_COUNT == ALVEO_U55C_BOARD_CORES
@@ -721,7 +734,8 @@ class EngineWindow:
         return f"core {self.engine_idx}: {self.total_bytes // 2**20} MB = {segs}"
 
 
-def board_private_windows(num_engines: int) -> list[EngineWindow]:
+def board_private_windows(num_engines: int,
+                          reserve: Optional[tuple[int, int]] = None) -> list[EngineWindow]:
     """THE multi-core DRAM layout. One handler, three boards, keyed on HW_INFO.
 
     Nothing else in the tree decides where a multi-core engine's private DRAM
@@ -741,9 +755,22 @@ def board_private_windows(num_engines: int) -> list[EngineWindow]:
     Any other core count raises: a window map guessed for hardware nobody has
     measured is worse than no map at all.
 
+    ``reserve=(base, bytes)`` keeps a region of the device OUT of the windows,
+    for a caller that also needs a contiguous map of its own there (gemma3's
+    model map is 2 GiB at 6 GiB). It is honoured by CHOOSING which regions the
+    engines get, not by shrinking them: the 16 GiB U55C has sixteen 1 GiB
+    (stack, MC) regions and at most twelve engines, so a 2 GiB reserve still
+    leaves every engine a controller of its own. On a board whose windows are
+    fixed rather than chosen, the reserve is CHECKED against them and a clash
+    raises -- there is nothing to trade.
+
     For the model-side low-arena map use multicore_arena_bytes() and
     private_region() instead -- see the comment block above.
     """
+    if reserve is not None:
+        r_base, r_bytes = reserve
+        if r_bytes <= 0:
+            raise ValueError(f"reserve size must be positive, got {r_bytes}")
     if num_engines < 1:
         raise ValueError(f"num_engines must be >= 1, got {num_engines}")
     if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
@@ -766,7 +793,17 @@ def board_private_windows(num_engines: int) -> list[EngineWindow]:
                    for i in range(num_engines)]
     elif cores == ALVEO_U55C_BOARD_CORES:
         if gib == 16:
-            bases = alveo_u55c_core_bases(num_engines, dram_size_gb=gib)
+            if reserve is None:
+                bases = alveo_u55c_core_bases(num_engines, dram_size_gb=gib)
+            else:
+                usable = [base for base in alveo_u55c_16gb_pool()
+                          if not _overlaps(base, ALVEO_U55C_MC_STRIDE, reserve)]
+                if len(usable) < num_engines:
+                    raise ValueError(
+                        f"{num_engines} engines need {num_engines} x 1 GiB "
+                        f"controller regions, but reserving 0x{reserve[0]:X}.."
+                        f"0x{reserve[0] + reserve[1]:X} leaves only {len(usable)}")
+                bases = usable[:num_engines]
             windows = [EngineWindow(i, ((base, ALVEO_U55C_MC_STRIDE),))
                        for i, base in enumerate(bases)]
             _validate_windows(windows, gib, is_hbm=True)
@@ -802,7 +839,28 @@ def board_private_windows(num_engines: int) -> list[EngineWindow]:
             f"new board's HBM ownership and add it above.")
 
     _validate_windows(windows, gib, is_hbm=gib >= 4)
+    _require_reserve_clear(windows, reserve, f"{cores}-core board")
     return windows
+
+
+def _overlaps(base: int, nbytes: int, reserve: tuple[int, int]) -> bool:
+    r_base, r_bytes = reserve
+    return base < r_base + r_bytes and r_base < base + nbytes
+
+
+def _require_reserve_clear(windows: list[EngineWindow],
+                           reserve: Optional[tuple[int, int]], what: str) -> None:
+    """Fail when a board's fixed windows sit on the region a caller reserved."""
+    if reserve is None:
+        return
+    for w in windows:
+        for base, nbytes in w.segments:
+            if _overlaps(base, nbytes, reserve):
+                raise ValueError(
+                    f"{what}: core {w.engine_idx}'s segment 0x{base:X}.."
+                    f"0x{base + nbytes:X} sits on the reserved region "
+                    f"0x{reserve[0]:X}..0x{reserve[0] + reserve[1]:X}, and this "
+                    f"board's windows are fixed rather than chosen")
 
 
 def _validate_windows(windows: list[EngineWindow], gib: int, is_hbm: bool) -> None:

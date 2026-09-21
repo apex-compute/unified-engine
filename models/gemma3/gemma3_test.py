@@ -127,8 +127,20 @@ def _board_multicore_map(num_engines: int):
     gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
     if (cores, gib) not in BOARD_MAP_PROFILES:
         return None
+    # THE MODEL MAP IS RESERVED, NOT HOPED FOR. The 16 GiB U55C has sixteen
+    # 1 GiB (stack, MC) regions and at most twelve engines, so the four spare
+    # ones can be CHOSEN: reserving the model map's 2 GiB keeps every engine on
+    # a controller of its own AND leaves gemma3's addresses where they have
+    # always been. Without it the library hands out regions 0-4, 6, 8-11, 13, 15
+    # and the two free ones left (5 and 7) are not adjacent, so the model map
+    # has nowhere to go and the whole board map is lost at twelve engines.
+    # The U50's windows are FIXED rather than chosen (two segments per core,
+    # covering all 8 GiB), so it is not asked to reserve anything -- its
+    # primaries sit below 4 GiB and clear the model map already.
+    reserve = ((MULTI_CORE_MODEL_BASE, MULTI_CORE_MODEL_SPAN)
+               if cores == ALVEO_U55C_BOARD_CORES else None)
     try:
-        board = board_private_windows(num_engines)
+        board = board_private_windows(num_engines, reserve=reserve)
     except (ValueError, RuntimeError) as exc:
         print(f"  [map] board window map unavailable, keeping the fixed "
               f"{MULTI_CORE_ENGINE_WINDOW_BYTES // 2**20} MB windows: {exc}")
