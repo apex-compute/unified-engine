@@ -108,8 +108,13 @@ MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
 # (gemma4_e2b_vision.py:114), and audio needs 156.4 MiB the same way. That is a
 # contiguous-arena design, so it gets a contiguous extent carved at init rather
 # than per-buffer placement, and every existing tensor address survives.
-TILED_MAP_ENGINES = 8                      # the engine count this map is for
-TILED_WINDOW_BYTES = 0x4000_0000           # 1 GiB per core, 8 GiB total
+# HOW MANY ENGINES THE TILED MAP SERVES IS THE LIBRARY'S ANSWER, NOT A
+# CONSTANT HERE. multi_engine_shard.tiled_window_bases() knows how many 1 GiB
+# controller regions the board has -- eight on the 8 GiB U55C image, sixteen on
+# the 16 GiB one, which is a region for every engine -- and refuses the counts
+# it cannot serve. This is only the floor below which the map buys nothing.
+TILED_MAP_MIN_ENGINES = 8
+TILED_WINDOW_BYTES = 0x4000_0000           # 1 GiB per core, one memory controller
 TILED_ISA_BYTES = 16 * 2**20               # per-core ISA slice, inside the window
 # 32 MiB, not 16: vision attention scratch is 13.12 MiB and prefill attention
 # 1.50, which fitted 16 with nothing to spare -- and the tensor-parallel prefill
@@ -976,7 +981,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._tiled_map = False
         self._tile_bases = None
         self._params_staged = 0        # bytes placed into the pool (tiled map only)
-        if multi_core == TILED_MAP_ENGINES:
+        if multi_core >= TILED_MAP_MIN_ENGINES:
             try:
                 self._tile_bases = tiled_window_bases(
                     multi_core, TILED_WINDOW_BYTES, "Gemma4 E2B")
@@ -989,7 +994,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # against the map below, so a cached section is only reusable by a run
         # with the SAME layout. The program bin/meta path -- run and profile,
         # compiler and loader -- must agree on this tag.
-        self.dram_layout = ("tile8" if self._tiled_map
+        self.dram_layout = (f"tile{multi_core}" if self._tiled_map
                             else "mcmap" if self._use_multicore_dram_layout
                             else "legacy")
         # Gemma4 DRAM layout. ONE model map, used at EVERY engine count: the
@@ -1056,9 +1061,14 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             # Windows COVER the device, so there is no model map above them: the
             # ISA moves inside the windows and everything shared is carved from
             # their tails. See "THE TILED MAP" above.
+            # THE BASES ARE THE BOARD'S, NOT base-plus-stride. On the 16 GiB
+            # image a core's window is a (stack, MC) region and the assignment
+            # is a permutation -- core 1 at 9 GiB, core 9 at 1 GiB -- so the
+            # arena is built FROM tiled_window_bases() rather than tiling 0 and
+            # checking the result against it.
             self.mc_arena = PrivateArena(
-                multi_core, arena_base=0,
-                arena_bytes=multi_core * TILED_WINDOW_BYTES,
+                multi_core,
+                windows=[(base, TILED_WINDOW_BYTES) for base in self._tile_bases],
                 isa_bytes=TILED_ISA_BYTES, tensor_bytes=TILED_TENSOR_BYTES,
                 verbose=True)
             _actual = [self.mc_arena.window_base(i) for i in range(multi_core)]
@@ -1067,7 +1077,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                     "private windows do not match this board's map: "
                     f"{[hex(a) for a in _actual]} against "
                     f"{[hex(b) for b in self._tile_bases]}")
-            self.DRAM_END = multi_core * TILED_WINDOW_BYTES
+            # The top of the highest window: the windows no longer start at 0
+            # and run up, so this is a bound, not an arena size.
+            self.DRAM_END = max(self._tile_bases) + TILED_WINDOW_BYTES
             # Private space is claimed before a single shared byte is lent.
             self.mc_arena.reserve_private(TILED_PRIVATE_RESERVE_BYTES)
             # Core 0 holds both master images at disjoint addresses, exactly as

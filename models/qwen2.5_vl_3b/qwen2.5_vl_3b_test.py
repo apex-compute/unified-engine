@@ -44,7 +44,9 @@ builtins.print = quiet_print
 
 import user_dma_core
 from user_dma_core import UnifiedEngine, UE_VECTOR_SIZE, set_dma_device
-from multi_engine_shard import (MULTICORE_WINDOW_BYTES, MultiEngineScheduler,
+from multi_engine_shard import (ALVEO_BOARD_CORES, ALVEO_U55C_BOARD_CORES,
+                                MULTICORE_WINDOW_BYTES, MultiEngineScheduler,
+                                board_private_windows,
                                 PrivateArena, multicore_arena_bytes,
                                 require_multicore_dram)
 
@@ -84,9 +86,14 @@ DEFAULT_IMAGE = os.path.normpath(
 MAX_CONTEXT_SIZE = 2048
 MIN_CONTEXT_SIZE = 512
 
-# Engine ceiling for this model's private map: 8 cores x a FIXED 512 MiB window
-# fills [0, 4 GiB), which is the granularity the DRAM controller interleaves on.
-MAX_ENGINES = 8
+# Engine ceiling. The old limit was 8 because a FIXED 512 MiB window per core
+# fills [0, 4 GiB) and the map was written around that. The windows now come
+# from the board (see _board_multicore_map below), which on the 16 GiB U55C has
+# a private memory controller for each of its twelve engines, so the ceiling is
+# the board's: this is the upper bound, and HW_INFO's core count is the real
+# one. Nothing in the LM or vision sharding is written for 8 -- the splits are
+# computed per engine count -- so the ceiling was the map's, not the model's.
+MAX_ENGINES = 12
 
 # MULTI-CORE MAP (>= 8 GB device; single core keeps the historical 4 GB map):
 #   [0, N x 512 MiB) -- one fixed private window per engine
@@ -98,6 +105,64 @@ MULTI_CORE_MODEL_BASE = 0x180000000
 MULTI_CORE_DRAM_LIMIT = 0x200000000
 MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - 0x80000000
 
+# WHERE THE PRIVATE WINDOWS GO IS THE BOARD'S ANSWER, NOT A STRIDE.
+# ==========================================================================
+# A fixed `core * 512 MiB` map was written for one board's HBM wiring. On the
+# reordered U55C it leaves most engines reading across the lateral switch:
+# measured at 512 kB per engine, the flat stride reads 37.6 GB/s at 8 engines
+# and 56.4 at 12, where the board map reads 70.4 and 105.5. So the windows are
+# ASKED FOR, per board, keyed on the HW_INFO signature -- the same two profiles
+# gemma3 uses:
+#
+#   cores == 8,  DRAM == 8 GiB    Alveo U50
+#   cores == 12, DRAM == 16 GiB   Alveo U55C, dual stack
+#
+# Any other signature keeps the fixed map, which is what those boards ran.
+BOARD_MAP_PROFILES = {(ALVEO_BOARD_CORES, 8), (ALVEO_U55C_BOARD_CORES, 16)}
+MULTI_CORE_MODEL_SPAN = MULTI_CORE_DRAM_LIMIT - MULTI_CORE_MODEL_BASE
+
+
+def _board_multicore_map(num_engines: int):
+    """Per-engine ``(base, bytes)`` windows from the board map, or None.
+
+    Two narrowings of what board_private_windows() returns, both the same as
+    gemma3's and for the same reasons:
+
+    * only the PRIMARY segment is claimed -- a U50 window is two 512 MiB
+      segments 4 GiB apart, and claiming both covers all 8 GiB, leaving this
+      model's own 2 GiB map at 6 GiB nowhere to live;
+    * on the U50 the engines are placed in ADDRESS order rather than the SAXI
+      order, which covers the same eight regions and is what every shipped
+      8-core run used. The permutation decides which port reaches a region
+      directly, which the library documents as not moving the measured number.
+
+    On the U55C the model map is RESERVED, so the board hands out regions that
+    avoid it and every engine still gets a controller of its own.
+    """
+    cores = user_dma_core.ANDROMEDA_CORE_COUNT
+    gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
+    if (cores, gib) not in BOARD_MAP_PROFILES:
+        return None
+    reserve = ((MULTI_CORE_MODEL_BASE, MULTI_CORE_MODEL_SPAN)
+               if cores == ALVEO_U55C_BOARD_CORES else None)
+    try:
+        board = board_private_windows(num_engines, reserve=reserve)
+    except (ValueError, RuntimeError) as exc:
+        print(f"  [map] board window map unavailable, keeping the fixed "
+              f"{MULTICORE_WINDOW_BYTES // 2**20} MiB windows: {exc}")
+        return None
+    size = min(w.primary_bytes for w in board)
+    bases = sorted(w.base for w in board) if cores == ALVEO_BOARD_CORES \
+        else [w.base for w in board]
+    windows = [(base, size) for base in bases]
+    for base, nbytes in windows:
+        if base < MULTI_CORE_DRAM_LIMIT and base + nbytes > MULTI_CORE_MODEL_BASE:
+            print(f"  [map] board window 0x{base:X} overlaps the model map, "
+                  f"keeping the fixed windows")
+            return None
+    return windows
+
+
 
 class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine):
     """Qwen2.5-VL-3B engine: DRAM map, weight loading, stage mixins."""
@@ -106,6 +171,11 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
         if not 1 <= multi_core <= MAX_ENGINES:
             raise ValueError(
                 f"multi_core must be between 1 and {MAX_ENGINES}, got {multi_core}")
+        _reported = user_dma_core.ANDROMEDA_CORE_COUNT
+        if _reported is not None and multi_core > _reported:
+            raise ValueError(
+                f"multi_core={multi_core} exceeds the {_reported} engines "
+                f"HW_INFO reports for the loaded bitstream")
         self.multi_core = multi_core
         self._multi_core_schedulers = {}
 
@@ -189,20 +259,30 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
         # Engine 0's slice is never used (the master allocates from ISA_BASE
         # through the normal program cursor), so index the stride from engine 1.
         if multi_core > 1:
-            _arena_bytes = multicore_arena_bytes(multi_core)
-            assert _arena_bytes <= MULTI_CORE_MODEL_BASE, (
-                f"{multi_core} x {MULTICORE_WINDOW_BYTES // 2**20} MiB private "
-                f"windows reach 0x{_arena_bytes:X}, into the model map at "
-                f"0x{MULTI_CORE_MODEL_BASE:X}")
             assert self.DRAM_END == MULTI_CORE_DRAM_LIMIT, (
                 f"multi-core model map ends at 0x{self.DRAM_END:X}, not at the "
                 f"8 GB device limit 0x{MULTI_CORE_DRAM_LIMIT:X}")
-            self.mc_arena = PrivateArena(
-                multi_core, arena_base=0x00000000, arena_bytes=_arena_bytes,
-                external_isa=(self.WORKER_ISA_BASE - self.WORKER_ISA_STRIDE,
-                              self.WORKER_ISA_STRIDE),
-                verbose=True)
+            # The ISA slices live in the MODEL map either way, so a board
+            # window holds only weights and tensors and external_isa is
+            # unchanged by where the windows land.
+            _external_isa = (self.WORKER_ISA_BASE - self.WORKER_ISA_STRIDE,
+                             self.WORKER_ISA_STRIDE)
+            self._board_windows = _board_multicore_map(multi_core)
+            if self._board_windows is not None:
+                self.mc_arena = PrivateArena(
+                    multi_core, windows=self._board_windows,
+                    external_isa=_external_isa, verbose=True)
+            else:
+                _arena_bytes = multicore_arena_bytes(multi_core)
+                assert _arena_bytes <= MULTI_CORE_MODEL_BASE, (
+                    f"{multi_core} x {MULTICORE_WINDOW_BYTES // 2**20} MiB private "
+                    f"windows reach 0x{_arena_bytes:X}, into the model map at "
+                    f"0x{MULTI_CORE_MODEL_BASE:X}")
+                self.mc_arena = PrivateArena(
+                    multi_core, arena_base=0x00000000, arena_bytes=_arena_bytes,
+                    external_isa=_external_isa, verbose=True)
         else:
+            self._board_windows = None
             self.mc_arena = None
         # Exact per-core worker image sizes, filled in as each stage compiles.
         self._worker_isa_used = {}
@@ -586,6 +666,10 @@ def resolve_engine_config(parser, args) -> dict:
     """
     if not 1 <= args.multi_core <= MAX_ENGINES:
         parser.error(f"--multi-core must be between 1 and {MAX_ENGINES}")
+    _reported = user_dma_core.ANDROMEDA_CORE_COUNT
+    if _reported is not None and args.multi_core > _reported:
+        parser.error(f"--multi-core={args.multi_core} exceeds the {_reported} "
+                     f"engines HW_INFO reports for the loaded bitstream")
 
     set_dma_device(args.dev)
     for _name, _mod in list(sys.modules.items()):

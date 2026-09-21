@@ -544,12 +544,17 @@ class Qwen25OmniUnifiedEngine(
         #
         # Vision, audio and the shared LM weights still TIME-SHARE the pool, now
         # via shared_mark()/shared_release() instead of one contiguous window.
-        self.DRAM_END = 0x200000000
+        # The top of the highest window. On the 8 GiB image that is the whole
+        # device; on the 16 GiB one the windows are eight (stack, MC) regions
+        # spread over it, so this is a bound rather than "the device".
+        self.DRAM_END = max(expected_bases) + OMNI_WINDOW_BYTES
         self.WINDOW_BYTES = OMNI_WINDOW_BYTES
+        # BUILT FROM THE BOARD'S BASES, not from base-plus-stride: on the 16 GiB
+        # image the assignment is a permutation (core 1 at 9 GiB, core 9 at
+        # 1 GiB) that no stride expresses.
         self.mc_arena = PrivateArena(
             REQUIRED_ENGINES,
-            arena_base=0,
-            arena_bytes=REQUIRED_ENGINES * OMNI_WINDOW_BYTES,
+            windows=[(base, OMNI_WINDOW_BYTES) for base in expected_bases],
             isa_bytes=OMNI_ISA_BYTES,
             tensor_bytes=OMNI_PRIVATE_TENSOR_BYTES,
             verbose=True,
@@ -558,21 +563,21 @@ class Qwen25OmniUnifiedEngine(
             raise AssertionError(
                 f"private windows are 0x{self.mc_arena.stride:X}, not the "
                 f"0x{OMNI_WINDOW_BYTES:X} this map is built for")
-        # The arena is built from a base and a stride; the library map is built
-        # from the board HW_INFO reports. They agree only because each board
-        # hands core i the 1 GiB at i GiB -- assert it rather than assume it, so
-        # an image whose HBM is wired differently fails HERE, at init, instead
-        # of quietly losing half its bandwidth.
+        # The arena now takes the library's bases verbatim, so this asserts the
+        # construction rather than a coincidence -- it still fails HERE, at
+        # init, if the two ever drift apart.
         actual_bases = [self.mc_arena.window_base(i) for i in range(REQUIRED_ENGINES)]
         if actual_bases != expected_bases:
             raise AssertionError(
                 "private windows do not match this board's map: "
                 f"{[hex(a) for a in actual_bases]} against "
                 f"{[hex(b) for b in expected_bases]}")
-        if REQUIRED_ENGINES * OMNI_WINDOW_BYTES != self.DRAM_END:
+        _device_bytes = user_dma_core.AVAILABLE_DRAM_SIZE_GB * 2**30
+        if self.DRAM_END > _device_bytes:
             raise AssertionError(
-                f"{REQUIRED_ENGINES} x {OMNI_WINDOW_BYTES // 2**20} MiB windows do "
-                f"not tile the 8 GiB device")
+                f"{REQUIRED_ENGINES} x {OMNI_WINDOW_BYTES // 2**20} MiB windows "
+                f"reach 0x{self.DRAM_END:X}, past the "
+                f"{user_dma_core.AVAILABLE_DRAM_SIZE_GB} GiB HW_INFO reports")
 
         # ISA lives INSIDE the windows now. Engine 0's slice is the master area;
         # every worker's is arena.isa_base(i), one window stride apart. The old
@@ -816,7 +821,14 @@ class Qwen25OmniUnifiedEngine(
             "private_window_bytes": OMNI_WINDOW_BYTES,
             "private_isa_bytes": OMNI_ISA_BYTES,
             "private_tensor_bytes": OMNI_PRIVATE_TENSOR_BYTES,
-            "dram_limit": self.DRAM_END,
+            # The DRAM this map CLAIMS, which is eight 1 GiB windows wherever
+            # the board puts them -- not self.DRAM_END. On the 8 GiB image the
+            # windows tile the device and the two are the same number; on the
+            # 16 GiB image they are eight of sixteen (stack, MC) regions and
+            # DRAM_END is the top of the highest, 16 GiB. Checking DRAM_END
+            # here would demand a config edit per board for a contract that
+            # does not change: the map needs 8 GiB of private windows.
+            "dram_limit": REQUIRED_ENGINES * OMNI_WINDOW_BYTES,
         }
         for name, wanted in expected.items():
             raw = hw.get(name)
@@ -1009,7 +1021,10 @@ class Qwen25OmniUnifiedEngine(
                     "tensor_limit": self.TENSOR_LIMIT,
                     "master_isa_base": self.ISA_BASE,
                     "worker_isa_base": self.MASTER_ISA_LIMIT,
-                    "worker_isa_stride": self.WORKER_ISA_STRIDE,
+                    # Per engine, not base + i * stride: on a board map the
+                    # windows are a permutation and no stride reaches them.
+                    "worker_isa_bases": [self.mc_arena.isa_base(i)
+                                         for i in range(REQUIRED_ENGINES)],
                     "dram_end": self.DRAM_END,
                 },
             },
@@ -2288,8 +2303,8 @@ class Qwen25OmniUnifiedEngine(
                 "(vision/audio/LM time-shared)",
                 f"  TENSOR  0x{self.TENSOR_BASE:09X}..0x{self.TENSOR_LIMIT:09X} "
                 f"{(self.TENSOR_LIMIT - self.TENSOR_BASE) / 2**20:.0f} MiB",
-                f"  ISA     0x{self.ISA_BASE:09X}..0x{self.DRAM_END:09X} "
-                f"{(self.DRAM_END - self.ISA_BASE) / 2**20:.0f} MiB",
+                f"  ISA     0x{self.ISA_BASE:09X}..0x{self.MASTER_ISA_LIMIT:09X} "
+                f"{(self.MASTER_ISA_LIMIT - self.ISA_BASE) / 2**20:.0f} MiB",
             ]
         )
 

@@ -642,6 +642,19 @@ def alveo_u55c_core_bases(num_engines: int, dram_size_gb: int = 8) -> list[int]:
     return list(bases[:num_engines])
 
 
+def alveo_u55c_16gb_pool() -> list[int]:
+    """Every 1 GiB (stack, MC) region of the 16 GiB U55C, in assignment order.
+
+    The twelve preferred regions first -- ALVEO_U55C_16GB_CORE_BASES, which
+    alternates stacks so MC-sharing port pairs land on opposite stacks -- then
+    the four the map leaves spare. A caller that reserves part of the device
+    draws replacements from the tail rather than losing an engine's controller.
+    """
+    preferred = list(ALVEO_U55C_16GB_CORE_BASES)
+    every = [region * ALVEO_U55C_MC_STRIDE for region in range(2 * ALVEO_U55C_MC_COUNT)]
+    return preferred + [base for base in every if base not in preferred]
+
+
 def is_alveo_u55c() -> bool:
     """True when HW_INFO's core count is the U55C image's signature."""
     return user_dma_core.ANDROMEDA_CORE_COUNT == ALVEO_U55C_BOARD_CORES
@@ -721,7 +734,8 @@ class EngineWindow:
         return f"core {self.engine_idx}: {self.total_bytes // 2**20} MB = {segs}"
 
 
-def board_private_windows(num_engines: int) -> list[EngineWindow]:
+def board_private_windows(num_engines: int,
+                          reserve: Optional[tuple[int, int]] = None) -> list[EngineWindow]:
     """THE multi-core DRAM layout. One handler, three boards, keyed on HW_INFO.
 
     Nothing else in the tree decides where a multi-core engine's private DRAM
@@ -741,9 +755,22 @@ def board_private_windows(num_engines: int) -> list[EngineWindow]:
     Any other core count raises: a window map guessed for hardware nobody has
     measured is worse than no map at all.
 
+    ``reserve=(base, bytes)`` keeps a region of the device OUT of the windows,
+    for a caller that also needs a contiguous map of its own there (gemma3's
+    model map is 2 GiB at 6 GiB). It is honoured by CHOOSING which regions the
+    engines get, not by shrinking them: the 16 GiB U55C has sixteen 1 GiB
+    (stack, MC) regions and at most twelve engines, so a 2 GiB reserve still
+    leaves every engine a controller of its own. On a board whose windows are
+    fixed rather than chosen, the reserve is CHECKED against them and a clash
+    raises -- there is nothing to trade.
+
     For the model-side low-arena map use multicore_arena_bytes() and
     private_region() instead -- see the comment block above.
     """
+    if reserve is not None:
+        r_base, r_bytes = reserve
+        if r_bytes <= 0:
+            raise ValueError(f"reserve size must be positive, got {r_bytes}")
     if num_engines < 1:
         raise ValueError(f"num_engines must be >= 1, got {num_engines}")
     if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
@@ -766,7 +793,17 @@ def board_private_windows(num_engines: int) -> list[EngineWindow]:
                    for i in range(num_engines)]
     elif cores == ALVEO_U55C_BOARD_CORES:
         if gib == 16:
-            bases = alveo_u55c_core_bases(num_engines, dram_size_gb=gib)
+            if reserve is None:
+                bases = alveo_u55c_core_bases(num_engines, dram_size_gb=gib)
+            else:
+                usable = [base for base in alveo_u55c_16gb_pool()
+                          if not _overlaps(base, ALVEO_U55C_MC_STRIDE, reserve)]
+                if len(usable) < num_engines:
+                    raise ValueError(
+                        f"{num_engines} engines need {num_engines} x 1 GiB "
+                        f"controller regions, but reserving 0x{reserve[0]:X}.."
+                        f"0x{reserve[0] + reserve[1]:X} leaves only {len(usable)}")
+                bases = usable[:num_engines]
             windows = [EngineWindow(i, ((base, ALVEO_U55C_MC_STRIDE),))
                        for i, base in enumerate(bases)]
             _validate_windows(windows, gib, is_hbm=True)
@@ -802,7 +839,28 @@ def board_private_windows(num_engines: int) -> list[EngineWindow]:
             f"new board's HBM ownership and add it above.")
 
     _validate_windows(windows, gib, is_hbm=gib >= 4)
+    _require_reserve_clear(windows, reserve, f"{cores}-core board")
     return windows
+
+
+def _overlaps(base: int, nbytes: int, reserve: tuple[int, int]) -> bool:
+    r_base, r_bytes = reserve
+    return base < r_base + r_bytes and r_base < base + nbytes
+
+
+def _require_reserve_clear(windows: list[EngineWindow],
+                           reserve: Optional[tuple[int, int]], what: str) -> None:
+    """Fail when a board's fixed windows sit on the region a caller reserved."""
+    if reserve is None:
+        return
+    for w in windows:
+        for base, nbytes in w.segments:
+            if _overlaps(base, nbytes, reserve):
+                raise ValueError(
+                    f"{what}: core {w.engine_idx}'s segment 0x{base:X}.."
+                    f"0x{base + nbytes:X} sits on the reserved region "
+                    f"0x{reserve[0]:X}..0x{reserve[0] + reserve[1]:X}, and this "
+                    f"board's windows are fixed rather than chosen")
 
 
 def _validate_windows(windows: list[EngineWindow], gib: int, is_hbm: bool) -> None:
@@ -926,6 +984,7 @@ def tiled_window_bases(num_engines: int, window_bytes: int, what: str) -> list[i
             f"user_dma_core.configure_clock_from_hardware() first")
     if num_engines < 1:
         raise ValueError(f"{what}: num_engines must be >= 1, got {num_engines}")
+    gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
     board_window = board_window_bytes(what)
     if window_bytes != board_window:
         raise ValueError(
@@ -955,12 +1014,19 @@ def tiled_window_bases(num_engines: int, window_bytes: int, what: str) -> list[i
             f"whose HW_INFO reports the full size instead.")
 
     if reported == ALVEO_U55C_BOARD_CORES:
-        if num_engines > ALVEO_U55C_MC_COUNT:
+        # HOW MANY CORES GET A CONTROLLER IS A PROPERTY OF THE IMAGE, not of
+        # the map: the 8 GiB image has eight 1 GiB controller regions and the
+        # 16 GiB image sixteen (stack, MC) regions, enough for all twelve
+        # engines. Both come from alveo_u55c_core_bases(), so a tiling model
+        # and board_private_windows() agree on where a core's window is
+        # instead of each carrying its own answer.
+        if gib == 8 and num_engines > ALVEO_U55C_MC_COUNT:
             raise ValueError(
                 f"{what}: only {ALVEO_U55C_MC_COUNT} of the U55C's {reported} "
-                f"cores get a controller to themselves; cores 8+ share one with "
-                f"cores 0-3 and would halve their bandwidth.")
-        bases = alveo_u55c_core_bases(num_engines)
+                f"cores get a controller to themselves on the {gib} GiB image; "
+                f"cores 8+ share one with cores 0-3 and would halve their "
+                f"bandwidth. The 16 GiB image has a region for every core.")
+        bases = alveo_u55c_core_bases(num_engines, dram_size_gb=gib)
     elif reported == ALVEO_BOARD_CORES:
         # One contiguous switch region per core. The SAXI permutation that
         # alveo_core_bases applies is deliberately NOT used: it decides which
@@ -1126,7 +1192,8 @@ class PrivateArena:
                  isa_bytes: int = PRIVATE_ISA_BYTES,
                  tensor_bytes: int = PRIVATE_TENSOR_BYTES,
                  external_isa: Optional[tuple] = None,
-                 verbose: bool = False):
+                 verbose: bool = False,
+                 windows: Optional[list[tuple[int, int]]] = None):
         """``external_isa=(base, stride)`` moves the per-engine ISA slices OUT of
         the private windows and into a region the model owns elsewhere.
 
@@ -1135,7 +1202,36 @@ class PrivateArena:
         little and costs the weight arena the same 16 MB on every core. With it
         set, a window is just [ weights | tensor ] and the whole reclaimed slice
         goes to weights.
+
+        ``windows=[(base, bytes), ...]`` places the engines on EXPLICIT windows
+        instead of tiling ``arena_base`` by a stride. A board map is a
+        permutation, not an arithmetic progression -- the 16 GiB U55C puts core
+        1 at 9 GiB and core 9 at 1 GiB (board_private_windows) -- and base plus
+        stride cannot express that. The windows must all be the same size, since
+        every shard budget here is per core; they are checked for overlap.
         """
+        if windows is not None:
+            if len(windows) != num_engines:
+                raise ValueError(
+                    f"windows has {len(windows)} entries for {num_engines} engines")
+            sizes = {nbytes for _, nbytes in windows}
+            if len(sizes) != 1:
+                raise ValueError(
+                    f"every private window must be the same size, got "
+                    f"{sorted(sizes)}")
+            spans = sorted(windows)
+            for (b0, n0), (b1, _) in zip(spans, spans[1:]):
+                if b1 < b0 + n0:
+                    raise ValueError(
+                        f"private windows overlap at 0x{b1:X} "
+                        f"(0x{b0:X}..0x{b0 + n0:X} already claimed)")
+            for base, nbytes in windows:
+                if base % PRIVATE_ALIGN:
+                    raise ValueError(
+                        f"window base 0x{base:X} must be "
+                        f"{PRIVATE_ALIGN // 2**20} MB aligned")
+            arena_base = min(base for base, _ in windows)
+            arena_bytes = num_engines * next(iter(sizes))
         if arena_bytes is None:
             arena_bytes = private_total()
         assert arena_base % PRIVATE_ALIGN == 0, (
@@ -1143,6 +1239,7 @@ class PrivateArena:
         self.num_engines = num_engines
         self.arena_base = arena_base
         self.arena_bytes = arena_bytes
+        self.windows = list(windows) if windows is not None else None
         self.external_isa = external_isa
         # What the WINDOW reserves for ISA (0 when the slices live elsewhere)
         # versus how big one engine's ISA slice IS -- the same number only when
@@ -1150,11 +1247,27 @@ class PrivateArena:
         self._carve_isa_bytes = 0 if external_isa is not None else isa_bytes
         self.isa_bytes = external_isa[1] if external_isa is not None else isa_bytes
         self.tensor_bytes = tensor_bytes
-        self.stride = private_stride(num_engines, arena_bytes,
-                                     self._carve_isa_bytes, tensor_bytes)
-        self.regions = [private_region(i, num_engines, arena_base, arena_bytes,
-                                       self._carve_isa_bytes, tensor_bytes)
-                        for i in range(num_engines)]
+        if windows is not None:
+            self.stride = windows[0][1]
+            floor = self._carve_isa_bytes + tensor_bytes + PRIVATE_ALIGN
+            if self.stride < floor:
+                raise ValueError(
+                    f"a 0x{self.stride:X} window is below the 0x{floor:X} needed "
+                    f"for ISA + tensor + at least one weight block")
+            self.regions = []
+            for i, (base, nbytes) in enumerate(windows):
+                tensor_base = base + nbytes - tensor_bytes
+                isa_base = tensor_base - self._carve_isa_bytes
+                self.regions.append(PrivateRegion(
+                    engine_idx=i, base=base, weight_base=base,
+                    weight_limit=isa_base, isa_base=isa_base,
+                    tensor_base=tensor_base))
+        else:
+            self.stride = private_stride(num_engines, arena_bytes,
+                                         self._carve_isa_bytes, tensor_bytes)
+            self.regions = [private_region(i, num_engines, arena_base, arena_bytes,
+                                           self._carve_isa_bytes, tensor_bytes)
+                            for i in range(num_engines)]
         if external_isa is not None:
             ext_base, ext_stride = external_isa
             assert ext_base % 64 == 0, "external ISA base must be 64 B aligned"
@@ -1224,6 +1337,13 @@ class PrivateArena:
                 for i in range(self.num_engines)]
 
     def describe(self) -> str:
+        if self.windows is not None:
+            # Built from self.regions: the windows are a board permutation, so
+            # there is no stride for describe_private_map to walk.
+            lines = [f"  Private map: {self.num_engines} explicit board window(s), "
+                     f"{self.stride / 2**20:.0f} MB/core:"]
+            lines += ["    " + r.describe() for r in self.regions]
+            return "\n".join(lines)
         if self.external_isa is None:
             return describe_private_map(self.num_engines, self.arena_base,
                                         self.arena_bytes, self.isa_bytes,
