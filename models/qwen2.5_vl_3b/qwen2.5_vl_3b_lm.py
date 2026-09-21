@@ -420,6 +420,13 @@ class Qwen25VLLMMixin:
         """
         return 0
 
+    def _reuse_prefill_tp_tensor_scratch(self) -> bool:
+        """Whether the TP down-output plane also owns transient LM storage.
+
+        Opt in only when prefill always takes :meth:`_emit_prefill_mlp_tp`.
+        """
+        return False
+
     def _emit_prefill_mlp_tp(self, sched, la, M, in_addr, out_addr,
                              m_regs) -> int:
         """One layer's MLP, tensor-parallel. Returns FLOPs emitted.
@@ -447,6 +454,10 @@ class Qwen25VLLMMixin:
         lane_plane = M * LANE * bpe
         acc = [0]
 
+        # The ping-pong destination is dead until this layer produces it, so
+        # the scratch-sharing layout keeps residual1 there through residual2.
+        residual_addr = out_addr if self._reuse_prefill_tp_tensor_scratch() else self.LM_RESIDUAL
+
         def _pre(ctx):
             m = m_regs[ctx.engine_idx]
             ctx.ue.generate_instruction_add_set(m, ctx.rows)
@@ -454,11 +465,11 @@ class Qwen25VLLMMixin:
                 M=ctx.rows, N=H,
                 dram_a=ctx.rows_addr(in_addr, h_row),
                 dram_b=ctx.rows_addr(self.LM_ATTN_PROJ, h_row),
-                dram_out=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                dram_out=ctx.rows_addr(residual_addr, h_row),
                 mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
             acc[0] += ctx.ue.rms_norm_core_dram(
                 M=ctx.rows, N=H,
-                A_DRAM_ADDR=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                A_DRAM_ADDR=ctx.rows_addr(residual_addr, h_row),
                 OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_NORM, h_row),
                 GAMMA_DRAM_ADDR=la["ln2"], gpr_M_reg=m) or 0
 
@@ -505,7 +516,7 @@ class Qwen25VLLMMixin:
             ctx.ue.generate_instruction_add_set(m, ctx.rows)
             acc[0] += ctx.ue.eltwise_core_dram(
                 M=ctx.rows, N=H,
-                dram_a=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                dram_a=ctx.rows_addr(residual_addr, h_row),
                 dram_b=ctx.rows_addr(self.LM_MLP_DOWN, h_row),
                 dram_out=ctx.rows_addr(out_addr, h_row),
                 mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
@@ -654,31 +665,90 @@ class Qwen25VLLMMixin:
         # even, and the reverse when odd, so no inter-layer copy is emitted.
         self.LM_IO_A = alloc(P * H, "lm.io_a")
         self.LM_IO_B = alloc(P * H, "lm.io_b")
-        self.LM_PRE_NORM = alloc(P * H, "lm.pre_norm")
-        self.LM_Q = alloc(P * QH * AHD, "lm.q")
-        self.LM_K = alloc(P * KVH * AHD, "lm.k")
-        self.LM_V = alloc(P * KVH * AHD, "lm.v")
+
+        tp_ne = self._prefill_mlp_tp_engines()
+        reuse_tp_scratch = self._reuse_prefill_tp_tensor_scratch()
+        if reuse_tp_scratch and not tp_ne:
+            raise RuntimeError("TP tensor scratch reuse requires a TP prefill MLP")
+
+        if reuse_tp_scratch:
+            # One physical plane has three non-overlapping lifetimes:
+            #
+            #   qkv:       pre_norm | q | k | v
+            #   attention: result   | projected result
+            #   MLP:       norm, then all eight down-projection partials
+            #
+            # Q_HM and ATTN_HM remain dedicated because attention addresses
+            # their padded head planes. Bias, attention scratch and KV caches
+            # are also deliberately outside this overlay.
+            tp_elems = tp_ne * P * H
+            self.LM_MLP_DOWN_TP = alloc(tp_elems, "lm.mlp_down_tp_scratch")
+            scratch_base = self.LM_MLP_DOWN_TP
+            scratch_end = scratch_base + tp_elems * bpe
+
+            self.LM_PRE_NORM = scratch_base
+            self.LM_Q = self.LM_PRE_NORM + P * H * bpe
+            self.LM_K = self.LM_Q + P * QH * AHD * bpe
+            self.LM_V = self.LM_K + P * KVH * AHD * bpe
+            qkv_end = self.LM_V + P * KVH * AHD * bpe
+            if qkv_end > scratch_end:
+                raise MemoryError("Q/K/V transient layout exceeds TP scratch")
+
+            self.LM_ATTN_RESULT = scratch_base
+            self.LM_ATTN_PROJ = self.LM_ATTN_RESULT + P * QH * AHD * bpe
+            if self.LM_ATTN_PROJ + P * H * bpe > scratch_end:
+                raise MemoryError("attention transient layout exceeds TP scratch")
+            self.LM_MLP_NORM = scratch_base
+            for label, address in (
+                ("lm.pre_norm", self.LM_PRE_NORM),
+                ("lm.q", self.LM_Q),
+                ("lm.k", self.LM_K),
+                ("lm.v", self.LM_V),
+                ("lm.attn_result", self.LM_ATTN_RESULT),
+                ("lm.attn_proj", self.LM_ATTN_PROJ),
+                ("lm.mlp_norm", self.LM_MLP_NORM),
+            ):
+                self._dram_addresses[label] = address
+        else:
+            self.LM_PRE_NORM = alloc(P * H, "lm.pre_norm")
+            self.LM_Q = alloc(P * QH * AHD, "lm.q")
+            self.LM_K = alloc(P * KVH * AHD, "lm.k")
+            self.LM_V = alloc(P * KVH * AHD, "lm.v")
         # Sized for the largest program (prefill at PREFILL_MAX_SEQ_LEN); each
         # program strides these planes by its own M.
         head_rows = P
         self.LM_HEAD_ROWS = head_rows
         self.LM_Q_HM = alloc(QH * head_rows * AHD, "lm.q_hm")
         self.LM_ATTN_HM = alloc(QH * head_rows * AHD, "lm.attn_hm")
-        self.LM_ATTN_RESULT = alloc(P * QH * AHD, "lm.attn_result")
-        self.LM_ATTN_PROJ = alloc(P * H, "lm.attn_proj")
-        self.LM_RESIDUAL = alloc(P * H, "lm.residual")
-        self.LM_MLP_NORM = alloc(P * H, "lm.mlp_norm")
+        if not reuse_tp_scratch:
+            self.LM_ATTN_RESULT = alloc(P * QH * AHD, "lm.attn_result")
+            self.LM_ATTN_PROJ = alloc(P * H, "lm.attn_proj")
+            self.LM_RESIDUAL = alloc(P * H, "lm.residual")
+            self.LM_MLP_NORM = alloc(P * H, "lm.mlp_norm")
+        else:
+            # Decode still needs one residual row. TP prefill keeps its
+            # residual in the layer's ping-pong output buffer.
+            self.LM_RESIDUAL = alloc(H, "lm.residual_decode")
         self.LM_MLP_GATE = alloc(P * MLP, "lm.mlp_gate")
         self.LM_MLP_UP = alloc(P * MLP, "lm.mlp_up")
-        self.LM_MLP_MULT = alloc(P * MLP, "lm.mlp_mult")
-        self.LM_MLP_DOWN = alloc(P * H, "lm.mlp_down")
+        if reuse_tp_scratch:
+            # eltwise_core_dram supports an output aliasing input A (the
+            # existing down accumulator already relies on it). Once gate*up
+            # is formed, UP is dead and becomes the down/reduce destination.
+            self.LM_MLP_MULT = self.LM_MLP_GATE
+            self.LM_MLP_DOWN = self.LM_MLP_UP
+            self._dram_addresses["lm.mlp_mult"] = self.LM_MLP_MULT
+            self._dram_addresses["lm.mlp_down"] = self.LM_MLP_DOWN
+        else:
+            self.LM_MLP_MULT = alloc(P * MLP, "lm.mlp_mult")
+            self.LM_MLP_DOWN = alloc(P * H, "lm.mlp_down")
         # K-lane split only: one lane's down partial before it is summed into
         # LM_MLP_DOWN.  GATE/UP/MULT need no extra space -- the lanes are a
         # re-interpretation of the same [P, MLP] planes as lanes x [P, LANE].
         if self._prefill_mlp_k_lanes() > 1:
-            self.LM_MLP_DOWN_PART = alloc(P * H, "lm.mlp_down_part")
-        tp_ne = self._prefill_mlp_tp_engines()
-        if tp_ne:
+            self.LM_MLP_DOWN_PART = (None if reuse_tp_scratch else
+                                     alloc(P * H, "lm.mlp_down_part"))
+        if tp_ne and not reuse_tp_scratch:
             # Tensor-parallel down contracts over the LANE dim, so every engine
             # produces a FULL-width [P, H] partial and reduce_add sums all of
             # them. The K-lane accumulator above is the single-engine analogue.
