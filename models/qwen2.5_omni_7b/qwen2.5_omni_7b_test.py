@@ -821,7 +821,14 @@ class Qwen25OmniUnifiedEngine(
             "private_window_bytes": OMNI_WINDOW_BYTES,
             "private_isa_bytes": OMNI_ISA_BYTES,
             "private_tensor_bytes": OMNI_PRIVATE_TENSOR_BYTES,
-            "dram_limit": self.DRAM_END,
+            # The DRAM this map CLAIMS, which is eight 1 GiB windows wherever
+            # the board puts them -- not self.DRAM_END. On the 8 GiB image the
+            # windows tile the device and the two are the same number; on the
+            # 16 GiB image they are eight of sixteen (stack, MC) regions and
+            # DRAM_END is the top of the highest, 16 GiB. Checking DRAM_END
+            # here would demand a config edit per board for a contract that
+            # does not change: the map needs 8 GiB of private windows.
+            "dram_limit": REQUIRED_ENGINES * OMNI_WINDOW_BYTES,
         }
         for name, wanted in expected.items():
             raw = hw.get(name)
@@ -1014,7 +1021,10 @@ class Qwen25OmniUnifiedEngine(
                     "tensor_limit": self.TENSOR_LIMIT,
                     "master_isa_base": self.ISA_BASE,
                     "worker_isa_base": self.MASTER_ISA_LIMIT,
-                    "worker_isa_stride": self.WORKER_ISA_STRIDE,
+                    # Per engine, not base + i * stride: on a board map the
+                    # windows are a permutation and no stride reaches them.
+                    "worker_isa_bases": [self.mc_arena.isa_base(i)
+                                         for i in range(REQUIRED_ENGINES)],
                     "dram_end": self.DRAM_END,
                 },
             },
@@ -2293,8 +2303,8 @@ class Qwen25OmniUnifiedEngine(
                 "(vision/audio/LM time-shared)",
                 f"  TENSOR  0x{self.TENSOR_BASE:09X}..0x{self.TENSOR_LIMIT:09X} "
                 f"{(self.TENSOR_LIMIT - self.TENSOR_BASE) / 2**20:.0f} MiB",
-                f"  ISA     0x{self.ISA_BASE:09X}..0x{self.DRAM_END:09X} "
-                f"{(self.DRAM_END - self.ISA_BASE) / 2**20:.0f} MiB",
+                f"  ISA     0x{self.ISA_BASE:09X}..0x{self.MASTER_ISA_LIMIT:09X} "
+                f"{(self.MASTER_ISA_LIMIT - self.ISA_BASE) / 2**20:.0f} MiB",
             ]
         )
 
