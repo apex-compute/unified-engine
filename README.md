@@ -152,6 +152,86 @@ Options:
 ./update_fpga.sh --force                     # reflash even if already up to date
 ```
 
+### Kintex-7 encrypted BIN + eFUSE provisioning over JTAG
+
+[`provision_kintex7.py`](provision_kintex7.py) handles the unified-engine
+**XC7K480T + MT28GU512 BPI-x16, 64 MiB** board. Source Vivado's
+`settings64.sh` first; Python 3.8+ and Vivado Hardware Manager are required.
+It works independently of the PCIe/XDMA device numbering.
+
+```bash
+# Inventory all cables and devices; no programming.
+python3 provision_kintex7.py --list
+
+# Read-only preflight (also the default without --check).
+python3 provision_kintex7.py encrypted.bin --key /secure/andromeda_wrapper.nky --check
+
+# Permanently burn the key, protect it, then erase/program/verify BPI flash.
+python3 provision_kintex7.py encrypted.bin --key /secure/andromeda_wrapper.nky --program
+
+# Optional: pin the cable/device/DNA printed by --list or --check, and boot.
+python3 provision_kintex7.py encrypted.bin --key /secure/andromeda_wrapper.nky \
+  --target CABLE_SERIAL --device xc7k480t_0 --dna DEVICE_DNA --program --boot
+
+# Subsequent updates: use an image encrypted for the already-fused key.
+python3 provision_kintex7.py encrypted.bin --flash-only --boot
+
+# Make equivalent: omit PROGRAM=1 for the read-only check.
+make kintex7_efuse_flash BINFILE=encrypted.bin NKY_FILE=/secure/andromeda_wrapper.nky PROGRAM=1
+```
+
+The matching `.nky` is required for provisioning: the AES key cannot be
+extracted from an encrypted `.bin`. If `--key` is omitted, `encrypted.bin`
+uses `encrypted.nky` beside it. Keep both files from the same build. The
+input must be the encrypted flash image generated with
+`write_cfgmem -format bin -size 64 -interface BPIx16 -loadbit "up 0x0 design.bit"`;
+the design must use `BITSTREAM.ENCRYPTION.ENCRYPTKEYSELECT EFUSE`.
+The script checks the BIN's clear encryption header and payload length and
+the NKY's device/key format. These checks **do not prove the key matches the
+ciphertext**, authenticate the image, or identify the part inside its encrypted
+payload. Use the XC7K480T build's matching image/key pair.
+
+Every cable is scanned unless `--target` specifies an exact target path or
+unique serial. Selection must produce exactly one XC7K480T. Unreachable
+cables, failed device reads and ambiguous matches stop the operation.
+The device is identified by cable, device name, part and DNA, then reacquired
+and checked after reopening its cable. No fallback selects the first FPGA.
+`--server HOST:3121` selects a remote hardware server.
+
+**`--program` is irreversible authorization.** It refuses an already-fused
+AES key or locked key/control registers. It uses the existing Andromeda policy:
+`FUSE_USER=0` and `FUSE_CNTL=0x0c` (key write/read protection). Programming
+the AES key consumes the opportunity to provision `FUSE_USER[7:0]`; this
+flow fixes those bits at zero. It leaves `CFG_AES_Only` unset because setting
+that bit prevents Vivado indirect BPI flash programming. This flow does not
+enforce encrypted-only configuration. See AMD's
+[7-series encryption application note, XAPP1239](https://docs.amd.com/api/khub/documents/YQb~HIRtTDxDtDfWt3JdNw/content).
+Use an [eFUSE-capable JTAG cable](https://docs.amd.com/r/en-US/ug908-vivado-programming-debugging/Cable-Support-for-eFUSE-Programming)
+and a powered board with stable supply rails.
+
+Programming replaces the running FPGA configuration with Vivado's flash helper,
+so stop workloads first. The script checks AES-programmed status and protection
+bits after burning, then programs flash with verification enabled. `--boot`
+boots from flash and checks DONE; without it, power-cycle the board to load
+the image. PCIe rescanning is separate. `--flash-only` never burns fuses and
+requires an already-programmed AES key; it cannot compare a read-protected key
+with the input image. A verified flash write alone does not prove successful
+decryption or application operation.
+
+Each run keeps a device record, result JSON and any generated **secret NKZ
+export** in a private directory under `~/.local/state/unified-engine/efuse/`
+(override with `--output-dir`). Input snapshots are deleted on exit; Vivado
+logs/journals are disabled and long key values are redacted from its console
+output. Protect NKZ exports like the original key. If flash fails after the
+fuse burn succeeds, preserve the export and retry with `--flash-only` using
+the same encrypted image. Never attempt to burn a replacement key.
+
+Hardware-independent regression checks:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_provision_kintex7.py'
+```
+
 ---
 
 ## Supported Models
