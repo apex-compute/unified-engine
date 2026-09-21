@@ -984,6 +984,7 @@ def tiled_window_bases(num_engines: int, window_bytes: int, what: str) -> list[i
             f"user_dma_core.configure_clock_from_hardware() first")
     if num_engines < 1:
         raise ValueError(f"{what}: num_engines must be >= 1, got {num_engines}")
+    gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
     board_window = board_window_bytes(what)
     if window_bytes != board_window:
         raise ValueError(
@@ -1013,12 +1014,19 @@ def tiled_window_bases(num_engines: int, window_bytes: int, what: str) -> list[i
             f"whose HW_INFO reports the full size instead.")
 
     if reported == ALVEO_U55C_BOARD_CORES:
-        if num_engines > ALVEO_U55C_MC_COUNT:
+        # HOW MANY CORES GET A CONTROLLER IS A PROPERTY OF THE IMAGE, not of
+        # the map: the 8 GiB image has eight 1 GiB controller regions and the
+        # 16 GiB image sixteen (stack, MC) regions, enough for all twelve
+        # engines. Both come from alveo_u55c_core_bases(), so a tiling model
+        # and board_private_windows() agree on where a core's window is
+        # instead of each carrying its own answer.
+        if gib == 8 and num_engines > ALVEO_U55C_MC_COUNT:
             raise ValueError(
                 f"{what}: only {ALVEO_U55C_MC_COUNT} of the U55C's {reported} "
-                f"cores get a controller to themselves; cores 8+ share one with "
-                f"cores 0-3 and would halve their bandwidth.")
-        bases = alveo_u55c_core_bases(num_engines)
+                f"cores get a controller to themselves on the {gib} GiB image; "
+                f"cores 8+ share one with cores 0-3 and would halve their "
+                f"bandwidth. The 16 GiB image has a region for every core.")
+        bases = alveo_u55c_core_bases(num_engines, dram_size_gb=gib)
     elif reported == ALVEO_BOARD_CORES:
         # One contiguous switch region per core. The SAXI permutation that
         # alveo_core_bases applies is deliberately NOT used: it decides which
