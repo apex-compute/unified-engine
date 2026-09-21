@@ -526,6 +526,44 @@ def require_multicore_dram(num_engines: int, what: str) -> None:
 #     9     03 / 1   0x040000000 - 0x07FFFFFFF        shared with core 1
 #    10     05 / 2   0x080000000 - 0x0BFFFFFFF        shared with core 2
 #    11     07 / 3   0x0C0000000 - 0x0FFFFFFFF        shared with core 3
+#
+# Alveo U55C dual-stack HBM ownership for u55c/hbm_16GB (12 cores, 16 GiB).
+# Select this map only for HW_INFO core_count == 12 AND dram_size_gb == 16.
+# build_alveo_u55c.tcl wires each core to the same SAXI number on both stacks
+# (SAXI_xx_8HI on hbm_0, SAXI_xx_RT_8HI on hbm_1). Each stack has eight MCs,
+# each owning two adjacent 512 MiB segments. Use native HBM addressing:
+#
+#   address [33] = stack, [32:30] = MC (no external address swap)
+#   base = stack * 8 GiB + MC * 1 GiB
+# This map requires the native-map bitstream, not the older swapped image.
+#
+# The test allocator claims ONE 1 GiB controller region per core, not the
+# entire 2 GiB two-stack pair. Cores sharing an MC number use opposite stacks.
+# Ranges below are inclusive native addresses, identical for engines and XDMA.
+#
+#   core  SAXI / MC  stack   private 1 GiB range
+#     0     00 / 0     0     0x000000000 - 0x03FFFFFFF
+#     1     02 / 1     1     0x240000000 - 0x27FFFFFFF
+#     2     04 / 2     0     0x080000000 - 0x0BFFFFFFF
+#     3     06 / 3     1     0x2C0000000 - 0x2FFFFFFFF
+#     4     08 / 4     0     0x100000000 - 0x13FFFFFFF
+#     5     10 / 5     1     0x340000000 - 0x37FFFFFFF
+#     6     12 / 6     0     0x180000000 - 0x1BFFFFFFF
+#     7     14 / 7     1     0x3C0000000 - 0x3FFFFFFFF
+#     8     01 / 0     1     0x200000000 - 0x23FFFFFFF
+#     9     03 / 1     0     0x040000000 - 0x07FFFFFFF
+#    10     05 / 2     1     0x280000000 - 0x2BFFFFFFF
+#    11     07 / 3     0     0x0C0000000 - 0x0FFFFFFFF
+#
+# Six cores per stack; 12 distinct (stack, MC) regions, 12 GiB total claimed.
+# Unclaimed: stack 1/MC4 [0x300000000, 0x33FFFFFFF],
+#            stack 0/MC5 [0x140000000, 0x17FFFFFFF],
+#            stack 1/MC6 [0x380000000, 0x3BFFFFFFF],
+#            stack 0/MC7 [0x1C0000000, 0x1FFFFFFFF].
+# XDMA uses SAXI_09 (MC4) on both stacks and can access the full address space;
+# unique engine controllers do not imply zero contention with host DMA.
+# Per-core cursors: params = base, tensors = base + 0x08000000 (128 MiB),
+#                  program = base + 0x0F000000 (240 MiB).
 
 KINTEX7_BOARD_CORES = 2                     # HW_INFO signature of the kintex7 image
 ALVEO_BOARD_CORES = 8                       # HW_INFO signature of the U50 image
@@ -549,6 +587,21 @@ ALVEO_U55C_CORE_BASES = tuple(
     for core in range(ALVEO_U55C_BOARD_CORES)
 )
 
+# Dual-stack U55C (16 GiB): build_alveo_u55c.tcl connects each engine to the
+# same SAXI port on both stacks. Native address bit 33 selects the stack and
+# bits [32:30] select the MC. No software or hardware address permutation.
+# Give each engine one whole 1 GiB (stack, MC) region. Alternate stacks for
+# cores 0..7; cores 8..11 use the opposite stack from their MC partner 0..3.
+# This gives six engines per stack and twelve distinct physical controllers.
+# The four unused controller regions remain unclaimed; this is a bandwidth-
+# oriented test map, not a policy that packs every byte of model storage.
+ALVEO_U55C_16GB_CORE_BASES = tuple(
+    ((core % ALVEO_U55C_MC_COUNT)
+     + ((core % 2) ^ (core // ALVEO_U55C_MC_COUNT)) * ALVEO_U55C_MC_COUNT)
+    * ALVEO_U55C_MC_STRIDE
+    for core in range(ALVEO_U55C_BOARD_CORES)
+)
+
 
 def alveo_core_bases(num_engines: int, stack: int = 0) -> list[int]:
     """U50 controller-aligned private bases, ``num_engines`` of them.
@@ -566,19 +619,27 @@ def alveo_core_bases(num_engines: int, stack: int = 0) -> list[int]:
             for core in range(num_engines)]
 
 
-def alveo_u55c_core_bases(num_engines: int) -> list[int]:
-    """U55C controller-aligned private bases, ``num_engines`` of them.
+def alveo_u55c_core_bases(num_engines: int, dram_size_gb: int = 8) -> list[int]:
+    """U55C private bases for the explicitly selected 8 or 16 GiB image.
 
-    Engine i's base is the start of the 512 MiB segment it owns outright, so
-    concurrent reads from these bases never contend. Use them for anything
-    bandwidth-bound; a flat ``core * stride`` costs roughly half the bandwidth
-    on this board however large the stride is.
+    8 GiB preserves the legacy 512 MiB segment map. Cores 0..3 and 8..11
+    have disjoint segments but still share memory controllers.
+    16 GiB gives each core a private 1 GiB controller on one stack, with
+    MC-sharing port pairs assigned opposite stacks. Bases are stable across
+    engine counts. The default remains 8 for existing explicit-map callers;
+    board_private_windows passes the capacity reported by HW_INFO.
     """
     if not 1 <= num_engines <= len(ALVEO_U55C_CORE_BASES):
         raise ValueError(
             f"num_engines must be 1..{len(ALVEO_U55C_CORE_BASES)} for the U55C "
             f"HBM map, got {num_engines}")
-    return list(ALVEO_U55C_CORE_BASES[:num_engines])
+    if dram_size_gb == 8:
+        bases = ALVEO_U55C_CORE_BASES
+    elif dram_size_gb == 16:
+        bases = ALVEO_U55C_16GB_CORE_BASES
+    else:
+        raise ValueError(f"U55C HBM map requires 8 or 16 GiB, got {dram_size_gb}")
+    return list(bases[:num_engines])
 
 
 def is_alveo_u55c() -> bool:
@@ -673,8 +734,9 @@ def board_private_windows(num_engines: int) -> list[EngineWindow]:
       8 cores   alveo U50    TWO 512 MB segments per core -- the controller
                              region it owns on EACH of the two 4 GiB HBM
                              stacks. 1 GB per core, all 8 GiB claimed.
-      12 cores  alveo U55C   one CONSECUTIVE 1 GiB per core, which is its whole
-                             memory controller (two adjacent 512 MB segments).
+      12 cores  alveo U55C   16 GiB image: one 1 GiB (stack, MC) per core,
+                             supporting all twelve engines without sharing MCs.
+                             8 GiB image: legacy 1 GiB per core, at most eight.
 
     Any other core count raises: a window map guessed for hardware nobody has
     measured is worse than no map at all.
@@ -703,6 +765,14 @@ def board_private_windows(num_engines: int) -> list[EngineWindow]:
         windows = [EngineWindow(i, ((lo[i], ALVEO_MC_STRIDE), (hi[i], ALVEO_MC_STRIDE)))
                    for i in range(num_engines)]
     elif cores == ALVEO_U55C_BOARD_CORES:
+        if gib == 16:
+            bases = alveo_u55c_core_bases(num_engines, dram_size_gb=gib)
+            windows = [EngineWindow(i, ((base, ALVEO_U55C_MC_STRIDE),))
+                       for i, base in enumerate(bases)]
+            _validate_windows(windows, gib, is_hbm=True)
+            return windows
+        if gib != 8:
+            raise ValueError(f"U55C HBM map requires 8 or 16 GiB, got {gib}")
         # U55C. One MC owns two adjacent 512 MB segments, so a core's 1 GiB is
         # consecutive. Only EIGHT fit: 8 GiB / 1 GiB. Past that the board's own
         # 512 MB-per-core map (ALVEO_U55C_CORE_BASES) is the only option, and
