@@ -16,7 +16,7 @@
 \newcommand{\ue}{Unified~Engine}
 \newcommand{\iffour}{IF4}
 \newcommand{\bfteen}{bf16}
-\newcommand{\alveo}{Alveo~8-engine}
+\newcommand{\alveo}{Alveo~12-engine}
 \newcommand{\numTBD}{{\color{red}--}}
 
 \setlength{\textfloatsep}{6pt}
@@ -36,30 +36,28 @@
 \label{sec:model}
 %=============================================================================
 \pizero{} is a vision--language--action policy: camera views and an instruction
-in, a chunk of future control steps out. It runs as three sequential stages.
+in, a chunk of future control steps out. Three stages run in sequence: a SigLIP
+vision encoder, a Gemma-2B prefix that produces a K/V cache, and a Gemma-300M
+action expert that denoises the action chunk against that cache.
 
-The work is spread unevenly (Table~\ref{tab:budget}). The prefix carries three
-quarters of the arithmetic and sets the compute bound; the expert is trivial
-beside it but is the only sequential stage, so it sets the latency floor.
-
-That expert integrates a learned velocity field over ten Euler steps,
-$x_{t+\Delta t}=x_t+\Delta t\,v_\theta(x_t,t,\mathrm{KV}_{\text{prefix}})$, each
-attending the cached prefix K/V --- so its error compounds from step to step.
+The prefix is three quarters of the arithmetic (Table~\ref{tab:budget}) and
+bounds compute. The expert is small but strictly sequential: ten Euler steps of
+$x_{t+\Delta t}=x_t+\Delta t\,v_\theta(x_t,t,\mathrm{KV}_{\text{prefix}})$, so
+it bounds latency and its error compounds across steps.
 
 \begin{table}[H]
 \centering\small
-\caption{Per-inference budget. \emph{Eff.} is the true model shape;
-\emph{\alveo{}} is what the 64-wide SIMD ALU issues once padded.}
+\caption{Per-inference budget at the model's true shape.}
 \label{tab:budget}
-\begin{tabular}{@{}llrrr@{}}
+\begin{tabular}{@{}llrr@{}}
 \toprule
-\textbf{Stage} & \textbf{Shape} & \textbf{Params} & \textbf{Eff.\ GF} & \textbf{\alveo{} GF} \\
+\textbf{Stage} & \textbf{Shape} & \textbf{Params} & \textbf{GFLOP} \\
 \midrule
-Vision (SigLIP ViT)  & 27\,L, $d$1152, 3$\times$256 tok & $\sim$0.41\,B & 655.9 & 674.9 \\
-Prefix (Gemma-2B)    & 18\,L, $d$2048, 576 tok          & $\sim$2.0\,B  & 2332.0 & 2332.0 \\
-Expert (Gemma-300M)  & 18\,L, $d$1024, 10 steps         & $\sim$0.31\,B & 71.0 & 459.4 \\
+Vision (SigLIP ViT)  & 27\,L, $d$1152, 3$\times$256 tok & $\sim$0.41\,B & 655.9 \\
+Prefix (Gemma-2B)    & 18\,L, $d$2048, 576 tok          & $\sim$2.0\,B  & 2332.0 \\
+Expert (Gemma-300M)  & 18\,L, $d$1024, 10 steps         & $\sim$0.31\,B & 71.0 \\
 \midrule
-\textbf{Total} & & \textbf{$\sim$2.7\,B} & \textbf{3058.9} & \textbf{3466.3} \\
+\textbf{Total} & & \textbf{$\sim$2.7\,B} & \textbf{3058.9} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -68,66 +66,56 @@ Expert (Gemma-300M)  & 18\,L, $d$1024, 10 steps         & $\sim$0.31\,B & 71.0 &
 \section{Porting}
 \label{sec:port}
 %=============================================================================
-The \ue{}~v1 is a soft accelerator IP block, here instanced eight times on one
-AMD Alveo card with $4$\,GB of attached DRAM. It works on $64$-element alignment,
-and those two constraints drive everything below.
+The \ue{}~v1 is a soft accelerator IP, instanced twelve times on one AMD Alveo U55C
+card with $4$\,GB of DRAM. Two constraints shape the port: the DRAM budget and
+the engine's $64$-element alignment.
 
-\textbf{Weights.} The \bfteen{} checkpoint is several times over the DRAM budget,
-so all matmul weights are 4-bit block-quantized --- an $\sim$8$\times$ shrink ---
-and dequantized to \bfteen{} just before each MAC. \iffour{} is a footprint
-enabler, not a speedup.
+\textbf{Weights.} The \bfteen{} checkpoint does not fit, so every matmul weight
+is 4-bit block-quantized ($\sim$8$\times$ smaller) and dequantized to \bfteen{}
+at the MAC. \iffour{} buys footprint, not speed.
 
-\textbf{Vision head-dim pad.} Head-dim $72$ is not $64$-aligned, so the attention
-matmuls are padded to $128$ and contracted back through a precomputed selection
-matrix; the $Q/K/V/O$ projections stay narrow.
+\textbf{Vision head dim.} Head dim $72$ is not $64$-aligned. Attention runs at
+$128$ and is contracted back through a precomputed selection matrix; the
+$Q/K/V/O$ projections stay at $72$.
 
-\textbf{Prefix masking.} Dropping the masked image slot compresses prefill by a
-quarter, bit-identically. Rotary positions come from cumulative-sum-of-mask
-indices rather than \texttt{arange}, so removing a slot does not shift phase.
+\textbf{Prefix masking.} A masked image slot is dropped from prefill, a quarter
+less work with bit-identical output. Rotary positions are cumulative-sum-of-mask
+indices, not \texttt{arange}, so removing a slot does not shift phase.
 
-\textbf{Denoise loop.} All steps unroll into a single program and one execute
+\textbf{Denoise loop.} All ten steps compile into one program and one execute
 call. Every strided SRAM$\to$DRAM copy needs an explicit destination offset; a
-missing one scrambles the output without ever producing a NaN, and fixing these
-recovered the expert entirely.
+missing offset scrambles the output silently, with no NaN.
 
 %=============================================================================
 \section{Quantization}
 \label{sec:quant}
 %=============================================================================
 \subsection{\iffour{}}
-\iffour{} is the accelerator's 4-bit weight format. Every $64$-element block is
-quantized both as signed INT4 and as FP4 E2M1, and whichever reconstructs with
-lower error is the one kept.
+\iffour{} is the accelerator's 4-bit weight format. Each $64$-element block is
+quantized as signed INT4 and as FP4 E2M1, and the lower-error encoding is kept.
 
-The choice rides in the sign of the block's \bfteen{} scale. That scale is an
-absmax quotient and so never negative, which leaves the bit structurally spare:
-\iffour{} carries no side table and costs no more than either format alone.
+The choice is carried by the sign bit of the block's \bfteen{} scale, which is
+an absmax quotient and therefore never negative. No side table, no extra bytes.
+Decode is a $2$:$1$ mux ahead of the MAC over the INT4 and FP4 paths that
+already exist. The per-block search runs once, offline.
 
-Decode is a $2$:$1$ mux one cycle before the MAC, over paths that already exist
-because INT4 and FP4 both ship standalone. The search itself is one-time and
-offline.
+\textbf{Why a hybrid.} INT4 spends its 16 levels uniformly; FP4 spends them
+densely near zero and sparsely at the tails, with a wide gap below its largest
+code. Which one wins is set by the block's crest factor, the ratio of its peak to
+its bulk. Dense blocks fill every uniform level; a single outlier stretches the
+shared scale and starves the rest.
 
-\textbf{Why the hybrid.} The two grids spend the same number of levels in
-opposite ways. INT4 is uniform; FP4 is finer near zero and much coarser out at
-the tails, where it leaves a wide gap below its largest code.
-
-So the winner is set by the block's crest factor --- how far its peak sits above
-its bulk --- and the crossover is sharp. Dense blocks populate every uniform
-level; one outlier stretches the shared scale and collapses the rest.
-
-Table~\ref{tab:if4} makes the case. The extremes go as expected, but the row that
-matters is the Gaussian: the two formats tie, and the hybrid still wins, because
-crest factor varies block to block inside a single tensor.
-
-That variation is structured. The INT4 share climbs with depth through the vision
-tower and bottoms out in the token embedding --- the most heavy-tailed weight in
-the model, and the one pure INT4 handles worst.
+Table~\ref{tab:if4} shows the crossover. The extremes go as expected. The
+Gaussian row is the informative one: INT4 and FP4 tie, yet the hybrid still
+gains, because crest factor varies block to block within a single tensor. The
+INT4 share rises with depth through the vision tower and is lowest in the token
+embedding, the most heavy-tailed weight in the model.
 
 \begin{table}[H]
 \centering\small
-\caption{Weight-domain SNR (dB) for INT4-only, FP4-only, and the \iffour{}
-hybrid, with the share of blocks the hybrid routes to INT4. Synthetic blocks
-above, \pizero{} checkpoint group means below.}
+\caption{Weight-domain SNR (dB): INT4, FP4, and the \iffour{} hybrid, with the
+fraction of blocks the hybrid assigns to INT4. Synthetic blocks above,
+\pizero{} checkpoint group means below.}
 \label{tab:if4}
 \begin{tabular}{@{}lcccc@{}}
 \toprule
@@ -145,22 +133,19 @@ Token embedding & 15.39 & 18.53 & \textbf{18.65} & 17.6 \\
 \end{tabular}
 \end{table}
 
-One scope note: the build measured in the rest of this paper pins the INT4
-branch, so everything below is an INT4-branch number. The hybrid's gain is
-weight-domain and has not been propagated end-to-end.
+Scope: the build measured below pins the INT4 branch. The hybrid's gain is a
+weight-domain result and has not yet been carried end-to-end.
 
 \subsection{The quantization floor}
-Table~\ref{tab:quant} is the accuracy cost against a \bfteen{} reference --- same
-torch run, same inputs and noise, diffed per stage. It isolates the quantizer
-from any hardware effect.
+Table~\ref{tab:quant} is the quantizer's cost in isolation: the same torch run,
+inputs and noise at \iffour{} and at \bfteen{}, diffed per stage, with no
+hardware in the loop.
 
-Vision comes through essentially untouched. The prefix caches degrade with depth
-and V fares worse than K, and denoise takes the largest loss because error
-accumulates through the integrator.
-
-Table~\ref{tab:quant-detail} shows where it lands. The damage sits in the
-low-magnitude action dimensions while the primary axis and the gripper hold; SNR
-is only a diagnostic, and the real gate is Sec.~\ref{sec:libero}.
+Vision is nearly untouched. The prefix caches degrade with depth, V more than K.
+The velocity field degrades over the last Euler steps as the integrator
+accumulates error, and the final action lands at 28.5\,dB. The loss sits in the
+low-magnitude action dimensions; the gripper holds above 50\,dB. SNR is a
+diagnostic; the gate is closed-loop success (Sec.~\ref{sec:libero}).
 
 \begin{table}[H]
 \centering\small
@@ -170,32 +155,12 @@ is only a diagnostic, and the real gate is Sec.~\ref{sec:libero}.
 \toprule
 \textbf{Model section} & \textbf{SNR (dB)} & \textbf{Range (dB)} \\
 \midrule
-Vision encoder (3 cameras)        & 25.37 & 24.3--26.6 \\
-Prefix K-cache (18 layers)        & 15.96 & 12.5--19.6 \\
-Prefix V-cache (18 layers)        & 10.65 & 7.0--15.4 \\
-Denoise velocity $v_t$ (10 steps) & 23.49 & 11.5--26.2 \\
+Vision encoder (3 cameras)        & 25.39 & 24.3--26.6 \\
+Prefix K-cache (18 layers)        & 16.57 & 13.6--19.9 \\
+Prefix V-cache (18 layers)        & 11.40 & 8.1--17.0 \\
+Denoise velocity $v_t$ (10 steps) & 31.51 & 22.2--34.5 \\
 \midrule
-\textbf{End-to-end action (10$\times$7)} & \textbf{16.31} & MSE $4.05{\times}10^{-3}$ \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{table}[H]
-\centering\small
-\caption{Final-action detail: per-dimension SNR (left) and error accumulation of
-the running state $x_t$ across Euler steps (right). Sample~0.}
-\label{tab:quant-detail}
-\begin{tabular}{@{}lc@{\hspace{1.5em}}lc@{}}
-\toprule
-\textbf{Action dim} & \textbf{SNR (dB)} & \textbf{Euler step} & \textbf{$x_t$ SNR (dB)} \\
-\midrule
-dim\,0 (primary) & 24.91 & step 0 & 44.95 \\
-dim\,1           & 1.50  & step 3 & 30.13 \\
-dim\,2           & 10.08 & step 5 & 24.15 \\
-dim\,3           & 6.73  & step 7 & 20.53 \\
-dim\,4           & 4.65  & step 8 & 19.26 \\
-dim\,5           & 17.61 & step 9 & 16.31 \\
-dim\,6 (gripper) & 40.73 & (final) & 16.31 \\
+\textbf{End-to-end action (10$\times$7)} & \textbf{28.47} & MSE $2.22{\times}10^{-4}$ \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -203,27 +168,22 @@ dim\,6 (gripper) & 40.73 & (final) & 16.31 \\
 \subsection{LIBERO}
 \label{sec:libero}
 LIBERO is a tabletop manipulation benchmark for language-conditioned policies,
-scored by closed-loop task success. It supplies two camera views; \pizero{} takes
-three, so the spare slot is fed zeros and masked out.
+scored by closed-loop task success. It provides two camera views; \pizero{}
+takes three, so the third slot is zero-filled and masked. Encoding it costs
+nothing in correctness and keeps the three-camera path exercised.
 
-Encoding a slot that contributes nothing costs no correctness and keeps the full
-three-slot path exercised, which leaves the port drop-in for embodiments that do
-drive a third camera.
-
-An episode is many inferences, not one. The simulator consumes the first ten
-steps of each chunk and then asks for another, so every episode is a dozen or
-more full vision\,+\,prefix\,+\,denoise passes on hardware.
-
-Table~\ref{tab:libero} runs the FPGA policy against the CUDA reference over ten
-prompts, identical seed and fixed denoise noise, so both platforms see
+An episode is many inferences. The simulator executes the first ten steps of
+each chunk and requests the next, so one episode is a dozen or more full passes
+on hardware. Table~\ref{tab:libero} compares the FPGA policy with the CUDA
+reference over ten prompts at a fixed seed and fixed denoise noise, so both see
 byte-identical observations.
 
 \begin{table}[H]
 \centering\small
-\caption{LIBERO closed-loop agreement: FPGA (\iffour{}) vs.\ CUDA (\bfteen{}),
-10 prompts, 1 episode each, fixed seed/noise. \checkmark${=}$success,
-$\times{=}$failure; the number is episode length in sim steps. $\Delta$ is FPGA
-$-$ CUDA steps on successes (failures all run to the cap).}
+\caption{LIBERO closed-loop outcomes, FPGA (\iffour{}) vs.\ CUDA (\bfteen{}):
+10 prompts, one episode each, fixed seed and noise. \checkmark\ success,
+$\times$ failure, number = episode length in sim steps. $\Delta$ = FPGA $-$ CUDA
+steps on successes; failures run to the cap.}
 \label{tab:libero}
 \begin{tabular}{@{}ccccc@{}}
 \toprule
@@ -250,22 +210,34 @@ original \texttt{libero\_spatial} task~5 exercised a denoise-loop compile path
 that crashed the FPGA bring-up, so it is substituted with the next unused prompt.}
 
 \vspace{2pt}
-\noindent\textbf{Takeaway.} The two policies agree on every prompt, and their
-successful episodes differ by a handful of steps. The end-to-end SNR floor reads
-alarmingly in isolation, but it sits in dimensions that do not change what the
-robot does.
+\noindent The two policies agree on every prompt, and successful episodes
+differ by a few steps.
 
 %=============================================================================
 \section{Throughput: \alveo{} vs.\ CUDA}
 \label{sec:throughput}
 %=============================================================================
-Every platform is reported the same way: per-section wall-clock and achieved rate.
-\alveo{} times come from the engine's own instrumentation; the GPU baseline is
-openpi's JAX/XLA deployment path.
+Table~\ref{tab:platforms} lists the three platforms and their power. Each is
+then reported as per-section wall-clock: \alveo{} times come from the engine's
+own counters; the GPU baseline is openpi's JAX/XLA path.
 
-The GPU stages are jitted separately with a device sync at each boundary, so
-their sum slightly exceeds the fused end-to-end (Table~\ref{tab:timing-gpu}). The
-split gives the breakdown, the fused number the headline.
+\begin{table}[H]
+\centering\small
+\caption{Platforms. Power is the board draw during inference.}
+\label{tab:platforms}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Platform} & \textbf{Precision} & \textbf{Runtime} & \textbf{Power} \\
+\midrule
+\alveo{} (AMD Alveo U55C, 12$\times$\ue{}~v1) & \iffour{} weights, \bfteen{} MAC & this work & \numTBD{}\,W \\
+RTX~5070                                   & \bfteen{}                        & openpi JAX/XLA & \numTBD{}\,W \\
+Jetson Orin Nano Super                     & \bfteen{}                        & openpi PyTorch/CUDA & 7\,W mode \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+GPU stages are jitted separately with a device sync at each boundary, so their
+sum slightly exceeds the fused end-to-end time (Table~\ref{tab:timing-gpu}).
 
 \begin{table}[H]
 \centering\small
@@ -286,21 +258,13 @@ Action expert (denoise) & 36.70  & 1\,935  \\
 \end{tabular}
 \end{table}
 
-\noindent\textbf{Edge GPU.} On the Jetson Orin Nano Super the checkpoint's
-footprint is itself the binding constraint --- the weights do not fit in usable
-allocation --- so the model runs staged, as three processes handing off through
-storage.
-
-The prefix alone exceeds the budget and streams its decoder layers a few at a
-time. The sharding is exact: hidden states and every K/V tensor come out
-bit-identical across group sizes.
+\noindent\textbf{Edge GPU.} The Jetson Orin Nano Super runs the same
+checkpoint at \bfteen{} in $7$\,W mode (Table~\ref{tab:timing-jetson}).
 
 \begin{table}[H]
 \centering\small
 \caption{Jetson Orin Nano Super (\bfteen{}, openpi PyTorch/CUDA), 968-token
-prefix, $7$\,W mode. Only one section's weights are resident at a time;
-\emph{weight streaming} is the prefix re-reading its layer weights from storage
-each inference, and is not model compute.}
+prefix, $7$\,W mode.$^{*}$}
 \label{tab:timing-jetson}
 \begin{tabular}{@{}lcc@{}}
 \toprule
@@ -309,7 +273,7 @@ each inference, and is not model compute.}
 Vision encoder          & 480.1    & 1\,366 \\
 Prefix (Gemma-2B)       & 2\,357.8 & 1\,686 \\
 Action expert (denoise) & 1\,427.6 & 53.7   \\
-Weight streaming        & 5\,088.6 & ---    \\
+Weight streaming$^{*}$  & 5\,088.6 & ---    \\
 \midrule
 \textbf{Compute only}   & \textbf{4\,265.5} & \textbf{1\,104} \\
 \textbf{End-to-end}     & \textbf{9\,354.1} & \textbf{503}    \\
@@ -317,78 +281,50 @@ Weight streaming        & 5\,088.6 & ---    \\
 \bottomrule
 \end{tabular}
 \end{table}
+\noindent{\footnotesize $^{*}$The checkpoint exceeds the Jetson's usable memory,
+so sections run staged and the prefix re-reads its layer weights from storage
+each inference. Not model compute.}
 
-That split, in Table~\ref{tab:timing-jetson}, is the result worth reading. Barely
-half the wall-clock is compute and the rest is weight streaming, so the memory
-ceiling rather than arithmetic sets the pace.
+Achieved rates fall as sections shrink. The expert is the extreme case: ten
+short sequential steps against a long K/V cache are latency-bound, and
+arithmetic throughput does not help.
 
-Achieved rates also fall away as the sections shrink. The expert is the extreme
-case here: ten short sequential steps against a long K/V cache is latency-bound,
-and arithmetic throughput does not help.
-
-The Jetson prefix is also longer than the \alveo{}'s, since openpi's PyTorch path
-encodes all three slots and pads the instruction to its full budget. Per-section
-GFLOP counts therefore differ across columns.
+The Jetson prefix is longer than the \alveo{}'s because openpi's PyTorch path
+encodes all three slots and pads the instruction to its full budget, so
+per-section GFLOP counts differ between the GPU and Jetson columns.
 
 \begin{table}[H]
 \centering\small
-\caption{\alveo{} (\iffour{}) --- eight \ue{}~v1 instances on one AMD Alveo card,
-832-token prefix. GFLOP/s is the work the hardware actually issues over the
-measured time, i.e.\ counted on the padded dimensions the engine runs rather than
-the model's nominal shape. Times are pure back-to-back execution; programs are
-compiled once up front and that one-time cost is excluded.}
+\caption{\alveo{} (\iffour{}) --- twelve \ue{}~v1 instances on one AMD Alveo U55C,
+832-token prefix. Times are pure back-to-back execution; programs are compiled
+once up front and that one-time cost is excluded.}
 \label{tab:timing-fpga}
-\begin{tabular}{@{}lcc@{}}
+\begin{tabular}{@{}lc@{}}
 \toprule
-\textbf{Model section} & \textbf{Time (s)} & \textbf{GFLOP/s} \\
+\textbf{Model section} & \textbf{Time (s)} \\
 \midrule
-Vision encoder          & 3.2  & 266.3 \\
-Prefix (Gemma-2B)       & 10.1 & 335.7 \\
-Action expert (denoise) & 1.2  & 121.4 \\
+Vision encoder          & 2.6  \\
+Prefix (Gemma-2B)       & 8.6  \\
+Action expert (denoise) & 0.9  \\
 \midrule
-\textbf{End-to-end}     & 14.5 & \textbf{303.3} \\
-\textbf{Throughput (inf/s)} & \multicolumn{2}{c}{0.0690} \\
+\textbf{End-to-end}     & 12.1 \\
+\textbf{Throughput (inf/s)} & 0.0826 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The expert is the least efficient of the three here for the same reason it is on
-the Jetson: ten short sequential steps against a long K/V cache, where arithmetic
-throughput does not help.
+The expert is the least efficient stage here for the same reason as on the
+Jetson: it is a chain of short sequential steps, not a throughput problem.
 
-\begin{table}[H]
-\centering\small
-\caption{Silicon (\iffour{}, \emph{estimated}) --- projected ASIC implementation
-of the \ue{}~v1 IP. \emph{Skeleton --- fill in.}}
-\label{tab:timing-silicon}
-\begin{tabular}{@{}lcc@{}}
-\toprule
-\textbf{Model section} & \textbf{Time (ms)} & \textbf{GFLOP/s} \\
-\midrule
-Vision encoder          & \numTBD & \numTBD \\
-Prefix (Gemma-2B)       & \numTBD & \numTBD \\
-Action expert (denoise) & \numTBD & \numTBD \\
-\midrule
-\textbf{End-to-end}     & \numTBD & \numTBD \\
-\textbf{Throughput (inf/s)} & \numTBD & \numTBD \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\noindent\textbf{Config.} \alveo{}: eight \ue{}~v1 instances, \iffour{} weights
-and \bfteen{} compute, $4$\,GB DRAM. GPU: RTX~5070, openpi JAX/XLA. Edge GPU:
-Jetson Orin Nano Super, $7$\,W mode, staged. All batch~1, ten denoise steps,
-sample~0.
+\noindent\textbf{Config.} \alveo{}: $4$\,GB DRAM. All platforms batch~1, ten
+denoise steps, sample~0.
 
 \vspace{2pt}
-\noindent The whole \pizero{} policy runs on the \ue{}~v1 --- vision, prefix, and the full
-denoise loop, no host fallback (Table~\ref{tab:timing-fpga}). It lands two orders
-of magnitude off the desktop GPU, within a small factor of the Jetson.
-
-The recurring theme is the split between where the FLOPs concentrate and where
-the latency does, and that \iffour{} buys the footprint at a cost confined to
-dimensions the policy does not act on.
-
-Table~\ref{tab:timing-silicon} projects the same workload onto an ASIC build.
+\noindent The whole \pizero{} policy runs on the \ue{}~v1, vision, prefix and
+the full denoise loop, with no host fallback (Table~\ref{tab:timing-fpga}). It is
+two orders of magnitude behind the desktop GPU and within a small factor of the
+Jetson. FLOPs concentrate in the prefix; latency concentrates in the expert. And
+\iffour{} pays for its footprint only in action dimensions the policy does not
+act on.
 
 \end{document}
