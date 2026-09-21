@@ -1126,7 +1126,8 @@ class PrivateArena:
                  isa_bytes: int = PRIVATE_ISA_BYTES,
                  tensor_bytes: int = PRIVATE_TENSOR_BYTES,
                  external_isa: Optional[tuple] = None,
-                 verbose: bool = False):
+                 verbose: bool = False,
+                 windows: Optional[list[tuple[int, int]]] = None):
         """``external_isa=(base, stride)`` moves the per-engine ISA slices OUT of
         the private windows and into a region the model owns elsewhere.
 
@@ -1135,7 +1136,36 @@ class PrivateArena:
         little and costs the weight arena the same 16 MB on every core. With it
         set, a window is just [ weights | tensor ] and the whole reclaimed slice
         goes to weights.
+
+        ``windows=[(base, bytes), ...]`` places the engines on EXPLICIT windows
+        instead of tiling ``arena_base`` by a stride. A board map is a
+        permutation, not an arithmetic progression -- the 16 GiB U55C puts core
+        1 at 9 GiB and core 9 at 1 GiB (board_private_windows) -- and base plus
+        stride cannot express that. The windows must all be the same size, since
+        every shard budget here is per core; they are checked for overlap.
         """
+        if windows is not None:
+            if len(windows) != num_engines:
+                raise ValueError(
+                    f"windows has {len(windows)} entries for {num_engines} engines")
+            sizes = {nbytes for _, nbytes in windows}
+            if len(sizes) != 1:
+                raise ValueError(
+                    f"every private window must be the same size, got "
+                    f"{sorted(sizes)}")
+            spans = sorted(windows)
+            for (b0, n0), (b1, _) in zip(spans, spans[1:]):
+                if b1 < b0 + n0:
+                    raise ValueError(
+                        f"private windows overlap at 0x{b1:X} "
+                        f"(0x{b0:X}..0x{b0 + n0:X} already claimed)")
+            for base, nbytes in windows:
+                if base % PRIVATE_ALIGN:
+                    raise ValueError(
+                        f"window base 0x{base:X} must be "
+                        f"{PRIVATE_ALIGN // 2**20} MB aligned")
+            arena_base = min(base for base, _ in windows)
+            arena_bytes = num_engines * next(iter(sizes))
         if arena_bytes is None:
             arena_bytes = private_total()
         assert arena_base % PRIVATE_ALIGN == 0, (
@@ -1143,6 +1173,7 @@ class PrivateArena:
         self.num_engines = num_engines
         self.arena_base = arena_base
         self.arena_bytes = arena_bytes
+        self.windows = list(windows) if windows is not None else None
         self.external_isa = external_isa
         # What the WINDOW reserves for ISA (0 when the slices live elsewhere)
         # versus how big one engine's ISA slice IS -- the same number only when
@@ -1150,11 +1181,27 @@ class PrivateArena:
         self._carve_isa_bytes = 0 if external_isa is not None else isa_bytes
         self.isa_bytes = external_isa[1] if external_isa is not None else isa_bytes
         self.tensor_bytes = tensor_bytes
-        self.stride = private_stride(num_engines, arena_bytes,
-                                     self._carve_isa_bytes, tensor_bytes)
-        self.regions = [private_region(i, num_engines, arena_base, arena_bytes,
-                                       self._carve_isa_bytes, tensor_bytes)
-                        for i in range(num_engines)]
+        if windows is not None:
+            self.stride = windows[0][1]
+            floor = self._carve_isa_bytes + tensor_bytes + PRIVATE_ALIGN
+            if self.stride < floor:
+                raise ValueError(
+                    f"a 0x{self.stride:X} window is below the 0x{floor:X} needed "
+                    f"for ISA + tensor + at least one weight block")
+            self.regions = []
+            for i, (base, nbytes) in enumerate(windows):
+                tensor_base = base + nbytes - tensor_bytes
+                isa_base = tensor_base - self._carve_isa_bytes
+                self.regions.append(PrivateRegion(
+                    engine_idx=i, base=base, weight_base=base,
+                    weight_limit=isa_base, isa_base=isa_base,
+                    tensor_base=tensor_base))
+        else:
+            self.stride = private_stride(num_engines, arena_bytes,
+                                         self._carve_isa_bytes, tensor_bytes)
+            self.regions = [private_region(i, num_engines, arena_base, arena_bytes,
+                                           self._carve_isa_bytes, tensor_bytes)
+                            for i in range(num_engines)]
         if external_isa is not None:
             ext_base, ext_stride = external_isa
             assert ext_base % 64 == 0, "external ISA base must be 64 B aligned"
@@ -1224,6 +1271,13 @@ class PrivateArena:
                 for i in range(self.num_engines)]
 
     def describe(self) -> str:
+        if self.windows is not None:
+            # Built from self.regions: the windows are a board permutation, so
+            # there is no stride for describe_private_map to walk.
+            lines = [f"  Private map: {self.num_engines} explicit board window(s), "
+                     f"{self.stride / 2**20:.0f} MB/core:"]
+            lines += ["    " + r.describe() for r in self.regions]
+            return "\n".join(lines)
         if self.external_isa is None:
             return describe_private_map(self.num_engines, self.arena_base,
                                         self.arena_bytes, self.isa_bytes,

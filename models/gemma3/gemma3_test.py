@@ -45,8 +45,9 @@ import time
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, calculate_snr
 from user_dma_core import UnifiedEngine
-from multi_engine_shard import (MULTICORE_WINDOW_BYTES, multicore_arena_bytes,
-                                require_multicore_dram)
+from multi_engine_shard import (ALVEO_BOARD_CORES, ALVEO_U55C_BOARD_CORES,
+                                MULTICORE_WINDOW_BYTES, board_private_windows,
+                                multicore_arena_bytes, require_multicore_dram)
 
 # ANY multi-core Gemma3 run owns the full 8 GB map as two non-overlapping
 # arenas:
@@ -75,6 +76,100 @@ MULTI_CORE_ENGINE_WINDOW_BYTES = MULTICORE_WINDOW_BYTES
 MULTI_CORE_MODEL_BASE = 0x180000000
 MULTI_CORE_DRAM_LIMIT = 0x200000000
 MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
+
+# THE PRIVATE WINDOWS COME FROM THE BOARD, NOT FROM A STRIDE.
+# ==========================================================================
+# A fixed ``core * 512 MB`` map was right for the wiring the fixed map was
+# written against and is wrong for the one shipping now: on the reordered U55C
+# it leaves every engine reading across the HBM lateral switch. Measured on
+# xdma0 (16 GiB, 12 cores, 512 kB per engine): the flat stride reads at
+# 56.4 GB/s at 12 engines and 37.6 at 8, where the board map reads at 105.5 and
+# 70.4 -- half the device's bandwidth, and gemma3's decode is bandwidth-bound
+# enough to show it (171.4 -> 117.3 GFLOPS at 12 engines when the board moved).
+#
+# So the windows are ASKED FOR, per board, keyed on the HW_INFO signature:
+#
+#   cores == 8,  DRAM == 8 GiB    Alveo U50
+#   cores == 12, DRAM == 16 GiB   Alveo U55C, dual stack
+#
+# Any other signature keeps the fixed map, which is what those boards ran
+# before (kintex7's 2-core map above all -- its DRAM layout does not move).
+BOARD_MAP_PROFILES = {(ALVEO_BOARD_CORES, 8), (ALVEO_U55C_BOARD_CORES, 16)}
+# What the model map needs above its base: params at +0, tensors at
+# +0x30000000, instructions at +0x50000000 and up. The budget is the existing
+# MULTI_CORE_MODEL_BASE..MULTI_CORE_DRAM_LIMIT span, so a board map has to
+# leave this much CONTIGUOUS room somewhere or gemma3 keeps the fixed map.
+MULTI_CORE_MODEL_SPAN = MULTI_CORE_DRAM_LIMIT - MULTI_CORE_MODEL_BASE
+
+
+def _board_multicore_map(num_engines: int):
+    """``(windows, model_base)`` from the board map, or None to keep the fixed map.
+
+    ``windows`` is one ``(base, bytes)`` per engine, straight from
+    multi_engine_shard.board_private_windows() -- the single place that knows
+    where a multi-core engine's private DRAM lives on each board.
+
+    TWO DELIBERATE NARROWINGS of what that function returns:
+
+    * Only the PRIMARY segment is claimed. A U50 window is two 512 MB segments
+      4 GiB apart (one per stack) and claiming both would cover all 8 GiB,
+      leaving the model map nowhere to go. gemma3 needs 64 MB per core against
+      the 480 MB it already has, so the second segment buys nothing here.
+    * On the U50 the engines are placed in ADDRESS order rather than in the
+      SAXI order board_private_windows() returns. Both cover the same eight
+      512 MB regions; the permutation only decides which port reaches a region
+      directly, which multi_engine_shard's own tiling map documents as not
+      moving the measured number ("Occupancy does, and this map is 1 per
+      region"). Address order is what every shipped 8-core run used, so this
+      path stays bit-identical to it.
+    """
+    cores = user_dma_core.ANDROMEDA_CORE_COUNT
+    gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
+    if (cores, gib) not in BOARD_MAP_PROFILES:
+        return None
+    try:
+        board = board_private_windows(num_engines)
+    except (ValueError, RuntimeError) as exc:
+        print(f"  [map] board window map unavailable, keeping the fixed "
+              f"{MULTI_CORE_ENGINE_WINDOW_BYTES // 2**20} MB windows: {exc}")
+        return None
+
+    size = min(w.primary_bytes for w in board)
+    bases = [w.base for w in board]
+    if cores == ALVEO_BOARD_CORES:
+        bases = sorted(bases)
+    windows = [(base, size) for base in bases]
+
+    model_base = _free_model_base(windows, gib)
+    if model_base is None:
+        print(f"  [map] board windows leave no {MULTI_CORE_MODEL_SPAN // 2**30} GiB "
+              f"hole for the model map at {num_engines} engines, keeping the fixed "
+              f"{MULTI_CORE_ENGINE_WINDOW_BYTES // 2**20} MB windows")
+        return None
+    return windows, model_base
+
+
+def _free_model_base(windows, dram_gib: int):
+    """Lowest base where the model map clears every private window.
+
+    MULTI_CORE_MODEL_BASE is preferred whenever it is free, so a board whose
+    windows sit below it keeps the addresses it has always used.
+    """
+    taken = [(base, base + nbytes) for base, nbytes in windows]
+
+    def clear(base: int) -> bool:
+        end = base + MULTI_CORE_MODEL_SPAN
+        return (end <= dram_gib * 2**30
+                and all(end <= lo or base >= hi for lo, hi in taken))
+
+    if clear(MULTI_CORE_MODEL_BASE):
+        return MULTI_CORE_MODEL_BASE
+    step = MULTI_CORE_ENGINE_WINDOW_BYTES
+    for base in range(0, dram_gib * 2**30, step):
+        if clear(base):
+            return base
+    return None
+
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -311,9 +406,17 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # the 8 GB requirement, so small splits keep the divided private_low map.
         self._use_multicore_dram_layout = (
             self.multi_core >= MULTI_CORE_FIXED_MAP_MIN_ENGINES)
+        # The board map, when this board has one and it leaves the model map a
+        # home. None means the fixed map below, unchanged.
+        self._board_windows = None
+        self._model_base = MULTI_CORE_MODEL_BASE
         if self._use_multicore_dram_layout:
             require_multicore_dram(self.multi_core, "Gemma3")
-        _rebase = MULTI_CORE_MODEL_REBASE if self._use_multicore_dram_layout else 0
+            _board = _board_multicore_map(self.multi_core)
+            if _board is not None:
+                self._board_windows, self._model_base = _board
+        _rebase = (self._model_base - user_dma_core.DRAM_START_ADDR
+                   if self._use_multicore_dram_layout else 0)
         super().__init__(
             BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
             params_dram_base=user_dma_core.DRAM_START_ADDR + _rebase,
@@ -1668,13 +1771,19 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # grow the six windows to 1 GB each, because the window size is what the
         # DRAM controller interleaves on. Engine i therefore owns the same
         # addresses at every engine count, and the model map above never moves.
-        if self._use_multicore_dram_layout:
+        if self._use_multicore_dram_layout and self._board_windows is not None:
+            # Board windows: a permutation, so PrivateArena takes them verbatim
+            # rather than tiling a base by a stride. Overlap against the model
+            # map was settled when the base was chosen (_free_model_base).
+            _scheduler_map = {"arena": PrivateArena(self.multi_core,
+                                                   windows=self._board_windows)}
+        elif self._use_multicore_dram_layout:
             _arena_bytes = multicore_arena_bytes(self.multi_core)
-            assert _arena_bytes <= MULTI_CORE_MODEL_BASE, (
+            assert _arena_bytes <= self._model_base, (
                 f"{self.multi_core} x "
                 f"{MULTI_CORE_ENGINE_WINDOW_BYTES // 2**20} MB private windows reach "
                 f"0x{_arena_bytes:X}, into the model map at "
-                f"0x{MULTI_CORE_MODEL_BASE:X}")
+                f"0x{self._model_base:X}")
             _scheduler_map = {"arena": PrivateArena(self.multi_core,
                                                    arena_base=0,
                                                    arena_bytes=_arena_bytes)}
@@ -2797,12 +2906,16 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         assert len(instruction_bytes) % 64 == 0, (
             "combined instruction image must be 64-byte aligned (HALT emits trailing NOP via generate_instruction_halt)"
         )
+        # The model map's own top, not a fixed 8 GB: a board map can seat the
+        # model anywhere it leaves MULTI_CORE_MODEL_SPAN free, and the program
+        # must stay inside THAT span or it lands on a private window.
+        _model_limit = self._model_base + MULTI_CORE_MODEL_SPAN
         if (self._use_multicore_dram_layout
-                and instruction_base_addr + len(instruction_bytes) > MULTI_CORE_DRAM_LIMIT):
+                and instruction_base_addr + len(instruction_bytes) > _model_limit):
             raise MemoryError(
                 f"Gemma3 program ends at "
                 f"0x{instruction_base_addr + len(instruction_bytes):X}, beyond the "
-                f"8 GB DRAM limit 0x{MULTI_CORE_DRAM_LIMIT:X}")
+                f"model map limit 0x{_model_limit:X}")
         with open(instruction_bin_path, "wb") as f:
             f.write(instruction_bytes)
         self.clear_capture_buffer()
