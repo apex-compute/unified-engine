@@ -437,12 +437,20 @@ def _check_act(text):
     if not m:
         return False, "no TEST_RESULT line (run did not reach the action head)"
     try:
-        snr = float(json.loads(m.group(1)).get("actions_snr_db", float("nan")))
-    except (ValueError, TypeError):
+        r = json.loads(m.group(1))
+    except ValueError:
         return False, "unparseable TEST_RESULT"
-    if not (snr == snr) or snr < 35.0:
-        return False, f"actions SNR {snr:.1f} dB < 35 dB"
-    return True, f"actions SNR {snr:.1f} dB"
+    if "actions_snr_db" in r:                       # reference.npz present: gate on SNR
+        snr = float(r["actions_snr_db"])
+        if not (snr == snr) or snr < 35.0:
+            return False, f"actions SNR {snr:.1f} dB < 35 dB"
+        return True, f"actions SNR {snr:.1f} dB"
+    # No CPU golden (self-generated weights): finite and non-zero action chunk.
+    if not r.get("actions_finite", False):
+        return False, "action chunk has non-finite values"
+    if float(r.get("actions_absmax", 0.0)) == 0.0:
+        return False, "action chunk is all zeros -- a stage wrote nothing"
+    return True, f"finite action chunk (absmax={float(r['actions_absmax']):.4f})"
 
 def _check_kokoro(text):
     # Kokoro TTS on --fpga prints one "[fpga] Section N ... SNR vs CPU: X dB" line per
