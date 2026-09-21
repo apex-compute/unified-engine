@@ -15,6 +15,12 @@
 #   ./run_ci.sh --clean-bins --only gpt2 swin
 #   ./run_ci.sh --pi05-first      # pi05 first, and the model round BEFORE the HW
 #                                  # op tests (used by the nightly full run)
+#   ./run_ci.sh --shuffle-pass    # after the compile round, re-run every model
+#                                  # FROM ITS CACHED BIN in a seeded random order
+#                                  # (seed = SHUFFLE_SEED env or today's YYYYMMDD),
+#                                  # not stopping on failure, with auto-triage that
+#                                  # classifies each failure as BIN-RELOAD /
+#                                  # CONTAMINATION (prev->model) / FLAKY
 
 set -uo pipefail
 
@@ -37,6 +43,12 @@ if [[ "${1:-}" == "--pi05-first" ]]; then
     shift
 fi
 
+SHUFFLE_PASS=0
+if [[ "${1:-}" == "--shuffle-pass" ]]; then
+    SHUFFLE_PASS=1
+    shift
+fi
+
 ONLY_ARGS=()
 if [[ "${1:-}" == "--only" ]]; then
     shift
@@ -47,7 +59,8 @@ FIRST_ARGS=()
 [[ $PI05_FIRST -eq 1 ]] && FIRST_ARGS=(--first pi05)
 
 STEP_TOTAL=2
-[[ $CLEAN_BINS -eq 1 ]] && STEP_TOTAL=3
+[[ $CLEAN_BINS -eq 1 ]] && STEP_TOTAL=$((STEP_TOTAL + 1))
+[[ $SHUFFLE_PASS -eq 1 ]] && STEP_TOTAL=$((STEP_TOTAL + 1))
 STEP=1
 
 if [[ $CLEAN_BINS -eq 1 ]]; then
@@ -87,6 +100,24 @@ run_model_tests() {
     STEP=$((STEP + 1))
 }
 
+# Pass 2: every bin is now on disk, so re-run the whole round from cached bins in
+# a seeded random order. Cross-model NaN/corruption is state leaking from the
+# PREDECESSOR, so a different order every night covers new (prev -> model) pairs
+# for free. Runs to completion (no stop-on-first-fail) and triages each failure.
+run_shuffle_pass() {
+    local seed="${SHUFFLE_SEED:-$(date +%Y%m%d)}"
+    echo
+    echo "############################################################"
+    echo "# $STEP/$STEP_TOTAL  model_auto_test.py — run-from-bin, shuffled order (seed $seed)"
+    echo "#       (reproduce with: SHUFFLE_SEED=$seed ./run_ci.sh --shuffle-pass)"
+    echo "############################################################"
+    cp -f model_auto_test_results.txt model_auto_test_results_pass1.txt 2>/dev/null || true
+    python model_auto_test.py "${ONLY_ARGS[@]}" --shuffle-seed "$seed" --continue-on-fail --triage
+    SHUFFLE_STATUS=$?
+    cp -f model_auto_test_results.txt model_auto_test_results_shuffle.txt 2>/dev/null || true
+    STEP=$((STEP + 1))
+}
+
 if [[ $PI05_FIRST -eq 1 ]]; then
     # Models FIRST (pi05 hoisted to the head of the round), HW ops after. The
     # model round still runs even if user_hw_test.py would have failed -- that is
@@ -98,10 +129,26 @@ else
     run_model_tests
 fi
 
+SHUFFLE_STATUS=0
+if [[ $SHUFFLE_PASS -eq 1 && $MODEL_STATUS -eq 0 ]]; then
+    run_shuffle_pass
+elif [[ $SHUFFLE_PASS -eq 1 ]]; then
+    echo "!!! compile round failed — skipping the shuffled run-from-bin pass (bins incomplete)."
+fi
+
 echo
 echo "############################################################"
 echo "# CI SUMMARY"
 echo "############################################################"
-sed -n '/Summary table/,/^Overall/p' model_auto_test_results.txt
+if [[ $SHUFFLE_PASS -eq 1 && -f model_auto_test_results_pass1.txt ]]; then
+    echo "--- pass 1: compile + run-from-bin (registry order) ---"
+    sed -n '/Summary table/,/^Overall/p' model_auto_test_results_pass1.txt
+    echo "--- pass 2: run-from-bin, shuffled (seed ${SHUFFLE_SEED:-$(date +%Y%m%d)}) ---"
+    sed -n '/Summary table/,/^Overall/p' model_auto_test_results_shuffle.txt
+    grep -E "^  (Predecessor|Triage) " model_auto_test_results_shuffle.txt | grep -B1 "Triage" || true
+else
+    sed -n '/Summary table/,/^Overall/p' model_auto_test_results.txt
+fi
 
-exit $MODEL_STATUS
+[[ $MODEL_STATUS -ne 0 ]] && exit $MODEL_STATUS
+exit $SHUFFLE_STATUS
