@@ -1712,6 +1712,26 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         except Exception:
             return None
 
+    def _model_flops_vision_by_phase(self) -> dict[str, int] | None:
+        try:
+            return _model_flops.vision_flops_by_phase(
+                num_patches=int(self._vis_num_patches),
+                soft_tokens=int(self._vis_num_soft_tokens),
+            )
+        except Exception:
+            return None
+
+    def _model_flops_prefill_by_phase(self) -> dict[str, int] | None:
+        # See _model_flops_prefill's comment: self.seq_len is not a safe
+        # fallback for the same reason it is not one there.
+        seq_len = getattr(self, "_prefill_seq_len", None)
+        if seq_len is None:
+            return None
+        try:
+            return _model_flops.prefill_flops_by_phase(self._cfg, int(seq_len))
+        except Exception:
+            return None
+
     def write_run_summary(self, out_path: str, args) -> str:
         """Write a per-run Markdown summary (weights/program sizes, per-stage HW
         latency + FLOPS, decode throughput, and the prompt/decoded text) built
@@ -2020,23 +2040,51 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         ])
 
         def _append_profile_section(title: str, results, level: int = 2,
-                                    model_flops: float | None = None) -> None:
+                                    model_phases: dict[str, int] | None = None) -> None:
+            """``model_phases`` keys must match _aggregate_profile_results's
+            phase names exactly (the "L<idx>_" prefix stripped) -- e.g.
+            "attention", "mlp", "o_proj" -- which is what
+            gemma4_e2b_model_flops.py's *_by_phase functions are built to
+            produce, read from the SAME compiled-program checkpoint names.
+            """
             lines.extend([f"{'#' * level} {title}", ""])
             if not results:
                 lines.extend(["Profile data unavailable.", ""])
                 return
             rows = self._aggregate_profile_results(results)
-            lines.extend([
-                "| Phase | Work (GFLOPs) | FPGA execution time (ms) | Throughput (GFLOPS) | Utilization (% peak) | Samples |",
-                "|---|---:|---:|---:|---:|---:|",
-            ])
+            has_model = bool(model_phases)
+            header = ["Phase", "Work (GFLOPs)"]
+            if has_model:
+                header += ["Model (GFLOPs)", "Useful %"]
+            header += ["FPGA execution time (ms)", "Throughput (GFLOPS)",
+                      "Utilization (% peak)", "Samples"]
+            lines.append("| " + " | ".join(header) + " |")
+            lines.append("|" + "|".join(
+                ":--" if h == "Phase" else "--:" for h in header) + "|")
+            model_total = 0
             for row in rows:
                 work_gflops = (f"{row['flops'] / 1e9:.2f}"
                                if row["flops"] is not None else "n/a")
                 gflops = f"{row['gflops']:.1f}" if row["gflops"] is not None else "n/a"
                 util = f"{row['util_pct']:.1f}%" if row["util_pct"] is not None else "n/a"
-                lines.append(f"| {row['phase']} | {work_gflops} | {row['ms']:.1f} | "
-                             f"{gflops} | {util} | {row['n']} |")
+                cells = [row["phase"], work_gflops]
+                if has_model:
+                    # A phase this module prices at 0 by convention (rope,
+                    # permute, q_permute) prints 0.00/0.0% -- a real,
+                    # meaningful "this is all overhead by definition" value,
+                    # not the SAME as a phase key genuinely absent from the
+                    # dict (which would be a real bug in the mapping).
+                    phase_model = model_phases.get(row["phase"])
+                    if phase_model is None:
+                        cells += ["n/a", "n/a"]
+                    else:
+                        model_total += phase_model
+                        model_gflop = phase_model / 1e9
+                        useful = (100.0 * phase_model / row["flops"]
+                                 if row["flops"] else 0.0)
+                        cells += [f"{model_gflop:.2f}", f"{useful:.1f}%"]
+                cells += [f"{row['ms']:.1f}", gflops, util, str(row["n"])]
+                lines.append("| " + " | ".join(cells) + " |")
             total_ms = sum(row["ms"] for row in rows)
             known_flops = [row["flops"] for row in rows if row["flops"] is not None]
             total_flops = sum(known_flops) if len(known_flops) == len(rows) else None
@@ -2044,51 +2092,46 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                           if total_flops is not None and total_ms else None)
             total_util = (100.0 * total_rate / peak_gflops
                           if total_rate is not None and peak_gflops else None)
-            lines.append(
-                f"| **TOTAL** | **{f'{total_flops / 1e9:.1f}' if total_flops is not None else 'n/a'}** | "
-                f"**{total_ms:.1f}** | **{f'{total_rate:.1f}' if total_rate is not None else 'n/a'}** | "
-                f"**{f'{total_util:.1f}%' if total_util is not None else 'n/a'}** | |")
-            # No per-kernel model-FLOP figure exists -- that is only known at
-            # the whole-section level, from the same _model_flops_* helpers
-            # write_run_summary uses. A column would be blank for every row
-            # but TOTAL, so this is one line under the table instead.
-            if model_flops and total_ms:
-                model_gflop = float(model_flops) / 1e9
-                model_rate = model_gflop / (total_ms / 1e3)
-                # total_flops (if known) is RAW FLOPs, matching model_flops --
-                # both must stay in the same unit for this ratio to mean
-                # anything; dividing the GFLOP figure by it directly here
-                # (as an earlier version of this line did) is off by 1e9.
-                useful_pct = (100.0 * float(model_flops) / total_flops
-                             if total_flops else 0.0)
-                lines.append(
-                    f"Model GFLOP: {model_gflop:.2f} -> {model_rate:.1f} effective "
-                    f"GFLOPS ({100.0 * model_rate / peak_gflops if peak_gflops else 0.0:.1f}% "
-                    f"of peak, {useful_pct:.1f}% useful) against the issued total above.")
+            total_cells = [
+                "**TOTAL**",
+                f"**{f'{total_flops / 1e9:.1f}' if total_flops is not None else 'n/a'}**",
+            ]
+            if has_model:
+                total_useful = (100.0 * model_total / total_flops
+                                if total_flops else 0.0)
+                total_cells += [f"**{model_total / 1e9:.2f}**",
+                                f"**{total_useful:.1f}%**"]
+            total_cells += [
+                f"**{total_ms:.1f}**",
+                f"**{f'{total_rate:.1f}' if total_rate is not None else 'n/a'}**",
+                f"**{f'{total_util:.1f}%' if total_util is not None else 'n/a'}**",
+                "",
+            ]
+            lines.append("| " + " | ".join(total_cells) + " |")
             lines.append("")
 
         _append_profile_section(
             "Vision", getattr(self, "_vision_profile_results", None),
-            model_flops=(self._model_flops_vision()
-                        if getattr(args, "image", None) else None))
+            model_phases=(self._model_flops_vision_by_phase()
+                         if getattr(args, "image", None) else None))
         _append_profile_section(
             "Prefill", getattr(self, "_prefill_profile_results", None),
-            model_flops=self._model_flops_prefill())
+            model_phases=self._model_flops_prefill_by_phase())
         lines.extend(["## Decode", ""])
         first_pos = getattr(self, "_decode_first_profile_position", "n/a")
-        first_model = (_model_flops.decode_step_flops(self._cfg, int(first_pos))
+        first_model = (_model_flops.decode_step_flops_by_phase(self._cfg, int(first_pos))
                        if isinstance(first_pos, int) else None)
         _append_profile_section(
             f"First decode step (position {first_pos})",
             getattr(self, "_decode_profile_results", None), level=3,
-            model_flops=first_model)
+            model_phases=first_model)
         target_pos = getattr(self, "_decode_1024_profile_position", 1023)
-        target_model = (_model_flops.decode_step_flops(self._cfg, int(target_pos))
+        target_model = (_model_flops.decode_step_flops_by_phase(self._cfg, int(target_pos))
                         if isinstance(target_pos, int) else None)
         _append_profile_section(
             f"1024th token (position {target_pos})",
             getattr(self, "_decode_1024_profile_results", None), level=3,
-            model_flops=target_model)
+            model_phases=target_model)
 
         with open(out_path, "w") as f:
             f.write("\n".join(lines))
