@@ -362,12 +362,18 @@ def dram_zero_fill(ue: UnifiedEngine, DRAM_ADDR: int, num_elements: int) -> None
     from user_dma_core import URAM_NEAR_FULL_ELEMENTS, URAM_SECTION, URAM_START_ADDR, MEMCPY_TYPE
     bytes_per_element = 2
 
-    # Write zeros to SRAM once (full URAM_A)
+    # Write zeros to SRAM once (full URAM_A). The zero source lives in a tensor-DRAM
+    # buffer that tensor_init() rewrites on EVERY construction (ZEROS_DRAM). It must
+    # not be a compile-time params allocation: dump_params() runs before compile, so
+    # such a chunk never lands in params.bin and a run-from-bin pass on poisoned DRAM
+    # would "zero-fill" with garbage (CI caught this as swin -> 'circle').
     chunk_elems = min(URAM_NEAR_FULL_ELEMENTS, num_elements)
-    zeros = torch.zeros(chunk_elems, dtype=torch.bfloat16)
-    zeros_dram = ue.get_params_dram_addr()
-    ue.allocate_params_dram(chunk_elems * bytes_per_element)
-    ue.dma_write(DMA_DEVICE_H2C, zeros_dram, zeros, chunk_elems * bytes_per_element)
+    zeros_dram = getattr(ue, "ZEROS_DRAM", None)
+    if zeros_dram is None:
+        zeros = torch.zeros(chunk_elems, dtype=torch.bfloat16)
+        zeros_dram = ue.get_params_dram_addr()
+        ue.allocate_params_dram(chunk_elems * bytes_per_element)
+        ue.dma_write(DMA_DEVICE_H2C, zeros_dram, zeros, chunk_elems * bytes_per_element)
     ue.accelerator_memory_to_sram(
         accelerator_dram_address=zeros_dram,
         sram_address=0x00000,
@@ -594,7 +600,7 @@ SWIN_PROGRAM_BASE = 0x80000000   # 2.0 GB — 2 GB for compiled instruction prog
 
 
 class Swin_UnifiedEngine(UnifiedEngine):
-    ARTIFACT_VERSION = 2  # dynamic LayerNorm row-count + persistent zeros/1-N operands
+    ARTIFACT_VERSION = 3  # dynamic LayerNorm row-count + persistent zeros/1-N operands
     """Swin-Large on Unified Engine FPGA accelerator."""
 
     # --- Architecture constants (Swin-Large patch4-window12-384-in22k) ---
@@ -1027,6 +1033,15 @@ class Swin_UnifiedEngine(UnifiedEngine):
         self.dma_to_accelerator_memory(
             self.IDENTITY_64_DRAM,
             torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16).contiguous(),
+        )
+        # Zero source for dram_zero_fill(): same contract as IDENTITY_64_DRAM -- a fixed
+        # tensor-DRAM buffer rewritten on every construction, so a program loaded from
+        # bin finds real zeros here even on poisoned DRAM.
+        from user_dma_core import URAM_NEAR_FULL_ELEMENTS
+        self.ZEROS_DRAM = self._alloc_tensor(URAM_NEAR_FULL_ELEMENTS)
+        self.dma_to_accelerator_memory(
+            self.ZEROS_DRAM,
+            torch.zeros(URAM_NEAR_FULL_ELEMENTS, dtype=torch.bfloat16),
         )
 
     # ------------------------------------------------------------------
