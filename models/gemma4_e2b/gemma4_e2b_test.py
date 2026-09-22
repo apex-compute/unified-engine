@@ -1682,9 +1682,22 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             return None
 
     def _model_flops_prefill(self) -> float | None:
+        # self.seq_len is NOT a safe fallback here: it is live, mutable state
+        # that run_gemma4_profile's decode-position probing (_prepare_decode_
+        # position) overwrites to test positions like 1023 -- so if this ran
+        # after decode profiling, self.seq_len would be the LAST DECODE
+        # PROBE's position, not the real prefill length, and would silently
+        # price a 1023-token prefill instead of a 272-token one (an earlier
+        # version of this fallback did exactly that: 271.7% of peak, an
+        # impossible number that was the only reason it got caught). Require
+        # the dedicated attribute, which both run_gemma4 (after a straight
+        # run) and run_gemma4_profile (right after run_prefill, before any
+        # decode probing) set explicitly and stably.
+        seq_len = getattr(self, "_prefill_seq_len", None)
+        if seq_len is None:
+            return None
         try:
-            return float(_model_flops.prefill_flops(
-                self._cfg, int(self._prefill_seq_len)))
+            return float(_model_flops.prefill_flops(self._cfg, int(seq_len)))
         except Exception:
             return None
 
@@ -2042,11 +2055,16 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             if model_flops and total_ms:
                 model_gflop = float(model_flops) / 1e9
                 model_rate = model_gflop / (total_ms / 1e3)
+                # total_flops (if known) is RAW FLOPs, matching model_flops --
+                # both must stay in the same unit for this ratio to mean
+                # anything; dividing the GFLOP figure by it directly here
+                # (as an earlier version of this line did) is off by 1e9.
+                useful_pct = (100.0 * float(model_flops) / total_flops
+                             if total_flops else 0.0)
                 lines.append(
                     f"Model GFLOP: {model_gflop:.2f} -> {model_rate:.1f} effective "
                     f"GFLOPS ({100.0 * model_rate / peak_gflops if peak_gflops else 0.0:.1f}% "
-                    f"of peak, {100.0 * model_gflop / total_flops if total_flops else 0.0:.1f}% "
-                    "useful) against the issued total above.")
+                    f"of peak, {useful_pct:.1f}% useful) against the issued total above.")
             lines.append("")
 
         _append_profile_section(
@@ -2276,6 +2294,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             prefill_program_addr, flops=meta["prefill_total_flops"],
             profile_checkpoints=prefill_checkpoints)
         self._prefill_profile_results = prefill_results
+        # Captured HERE, before _prepare_decode_position below can overwrite
+        # self.seq_len with a decode probe position -- see the long comment
+        # on _model_flops_prefill for why that ordering matters.
+        self._prefill_seq_len = self.seq_len
         self._print_phase_breakdown("PREFILL", prefill_results, per_token=False)
 
         # Multi-core decode: upload the workers' decode images from the PROFILE
