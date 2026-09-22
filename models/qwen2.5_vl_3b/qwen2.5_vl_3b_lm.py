@@ -420,6 +420,13 @@ class Qwen25VLLMMixin:
         """
         return 0
 
+    def _reuse_prefill_tp_tensor_scratch(self) -> bool:
+        """Whether the TP down-output plane also owns transient LM storage.
+
+        Opt in only when prefill always takes :meth:`_emit_prefill_mlp_tp`.
+        """
+        return False
+
     def _emit_prefill_mlp_tp(self, sched, la, M, in_addr, out_addr,
                              m_regs) -> int:
         """One layer's MLP, tensor-parallel. Returns FLOPs emitted.
@@ -447,6 +454,10 @@ class Qwen25VLLMMixin:
         lane_plane = M * LANE * bpe
         acc = [0]
 
+        # The ping-pong destination is dead until this layer produces it, so
+        # the scratch-sharing layout keeps residual1 there through residual2.
+        residual_addr = out_addr if self._reuse_prefill_tp_tensor_scratch() else self.LM_RESIDUAL
+
         def _pre(ctx):
             m = m_regs[ctx.engine_idx]
             ctx.ue.generate_instruction_add_set(m, ctx.rows)
@@ -454,11 +465,11 @@ class Qwen25VLLMMixin:
                 M=ctx.rows, N=H,
                 dram_a=ctx.rows_addr(in_addr, h_row),
                 dram_b=ctx.rows_addr(self.LM_ATTN_PROJ, h_row),
-                dram_out=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                dram_out=ctx.rows_addr(residual_addr, h_row),
                 mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
             acc[0] += ctx.ue.rms_norm_core_dram(
                 M=ctx.rows, N=H,
-                A_DRAM_ADDR=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                A_DRAM_ADDR=ctx.rows_addr(residual_addr, h_row),
                 OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_MLP_NORM, h_row),
                 GAMMA_DRAM_ADDR=la["ln2"], gpr_M_reg=m) or 0
 
@@ -505,7 +516,7 @@ class Qwen25VLLMMixin:
             ctx.ue.generate_instruction_add_set(m, ctx.rows)
             acc[0] += ctx.ue.eltwise_core_dram(
                 M=ctx.rows, N=H,
-                dram_a=ctx.rows_addr(self.LM_RESIDUAL, h_row),
+                dram_a=ctx.rows_addr(residual_addr, h_row),
                 dram_b=ctx.rows_addr(self.LM_MLP_DOWN, h_row),
                 dram_out=ctx.rows_addr(out_addr, h_row),
                 mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m) or 0
@@ -654,31 +665,90 @@ class Qwen25VLLMMixin:
         # even, and the reverse when odd, so no inter-layer copy is emitted.
         self.LM_IO_A = alloc(P * H, "lm.io_a")
         self.LM_IO_B = alloc(P * H, "lm.io_b")
-        self.LM_PRE_NORM = alloc(P * H, "lm.pre_norm")
-        self.LM_Q = alloc(P * QH * AHD, "lm.q")
-        self.LM_K = alloc(P * KVH * AHD, "lm.k")
-        self.LM_V = alloc(P * KVH * AHD, "lm.v")
+
+        tp_ne = self._prefill_mlp_tp_engines()
+        reuse_tp_scratch = self._reuse_prefill_tp_tensor_scratch()
+        if reuse_tp_scratch and not tp_ne:
+            raise RuntimeError("TP tensor scratch reuse requires a TP prefill MLP")
+
+        if reuse_tp_scratch:
+            # One physical plane has three non-overlapping lifetimes:
+            #
+            #   qkv:       pre_norm | q | k | v
+            #   attention: result   | projected result
+            #   MLP:       norm, then all eight down-projection partials
+            #
+            # Q_HM and ATTN_HM remain dedicated because attention addresses
+            # their padded head planes. Bias, attention scratch and KV caches
+            # are also deliberately outside this overlay.
+            tp_elems = tp_ne * P * H
+            self.LM_MLP_DOWN_TP = alloc(tp_elems, "lm.mlp_down_tp_scratch")
+            scratch_base = self.LM_MLP_DOWN_TP
+            scratch_end = scratch_base + tp_elems * bpe
+
+            self.LM_PRE_NORM = scratch_base
+            self.LM_Q = self.LM_PRE_NORM + P * H * bpe
+            self.LM_K = self.LM_Q + P * QH * AHD * bpe
+            self.LM_V = self.LM_K + P * KVH * AHD * bpe
+            qkv_end = self.LM_V + P * KVH * AHD * bpe
+            if qkv_end > scratch_end:
+                raise MemoryError("Q/K/V transient layout exceeds TP scratch")
+
+            self.LM_ATTN_RESULT = scratch_base
+            self.LM_ATTN_PROJ = self.LM_ATTN_RESULT + P * QH * AHD * bpe
+            if self.LM_ATTN_PROJ + P * H * bpe > scratch_end:
+                raise MemoryError("attention transient layout exceeds TP scratch")
+            self.LM_MLP_NORM = scratch_base
+            for label, address in (
+                ("lm.pre_norm", self.LM_PRE_NORM),
+                ("lm.q", self.LM_Q),
+                ("lm.k", self.LM_K),
+                ("lm.v", self.LM_V),
+                ("lm.attn_result", self.LM_ATTN_RESULT),
+                ("lm.attn_proj", self.LM_ATTN_PROJ),
+                ("lm.mlp_norm", self.LM_MLP_NORM),
+            ):
+                self._dram_addresses[label] = address
+        else:
+            self.LM_PRE_NORM = alloc(P * H, "lm.pre_norm")
+            self.LM_Q = alloc(P * QH * AHD, "lm.q")
+            self.LM_K = alloc(P * KVH * AHD, "lm.k")
+            self.LM_V = alloc(P * KVH * AHD, "lm.v")
         # Sized for the largest program (prefill at PREFILL_MAX_SEQ_LEN); each
         # program strides these planes by its own M.
         head_rows = P
         self.LM_HEAD_ROWS = head_rows
         self.LM_Q_HM = alloc(QH * head_rows * AHD, "lm.q_hm")
         self.LM_ATTN_HM = alloc(QH * head_rows * AHD, "lm.attn_hm")
-        self.LM_ATTN_RESULT = alloc(P * QH * AHD, "lm.attn_result")
-        self.LM_ATTN_PROJ = alloc(P * H, "lm.attn_proj")
-        self.LM_RESIDUAL = alloc(P * H, "lm.residual")
-        self.LM_MLP_NORM = alloc(P * H, "lm.mlp_norm")
+        if not reuse_tp_scratch:
+            self.LM_ATTN_RESULT = alloc(P * QH * AHD, "lm.attn_result")
+            self.LM_ATTN_PROJ = alloc(P * H, "lm.attn_proj")
+            self.LM_RESIDUAL = alloc(P * H, "lm.residual")
+            self.LM_MLP_NORM = alloc(P * H, "lm.mlp_norm")
+        else:
+            # Decode still needs one residual row. TP prefill keeps its
+            # residual in the layer's ping-pong output buffer.
+            self.LM_RESIDUAL = alloc(H, "lm.residual_decode")
         self.LM_MLP_GATE = alloc(P * MLP, "lm.mlp_gate")
         self.LM_MLP_UP = alloc(P * MLP, "lm.mlp_up")
-        self.LM_MLP_MULT = alloc(P * MLP, "lm.mlp_mult")
-        self.LM_MLP_DOWN = alloc(P * H, "lm.mlp_down")
+        if reuse_tp_scratch:
+            # eltwise_core_dram supports an output aliasing input A (the
+            # existing down accumulator already relies on it). Once gate*up
+            # is formed, UP is dead and becomes the down/reduce destination.
+            self.LM_MLP_MULT = self.LM_MLP_GATE
+            self.LM_MLP_DOWN = self.LM_MLP_UP
+            self._dram_addresses["lm.mlp_mult"] = self.LM_MLP_MULT
+            self._dram_addresses["lm.mlp_down"] = self.LM_MLP_DOWN
+        else:
+            self.LM_MLP_MULT = alloc(P * MLP, "lm.mlp_mult")
+            self.LM_MLP_DOWN = alloc(P * H, "lm.mlp_down")
         # K-lane split only: one lane's down partial before it is summed into
         # LM_MLP_DOWN.  GATE/UP/MULT need no extra space -- the lanes are a
         # re-interpretation of the same [P, MLP] planes as lanes x [P, LANE].
         if self._prefill_mlp_k_lanes() > 1:
-            self.LM_MLP_DOWN_PART = alloc(P * H, "lm.mlp_down_part")
-        tp_ne = self._prefill_mlp_tp_engines()
-        if tp_ne:
+            self.LM_MLP_DOWN_PART = (None if reuse_tp_scratch else
+                                     alloc(P * H, "lm.mlp_down_part"))
+        if tp_ne and not reuse_tp_scratch:
             # Tensor-parallel down contracts over the LANE dim, so every engine
             # produces a FULL-width [P, H] partial and reduce_add sums all of
             # them. The K-lane accumulator above is the single-engine analogue.
@@ -710,8 +780,9 @@ class Qwen25VLLMMixin:
         n_scratch = (AHD + A) * A + BATCH * AHD
         self.LM_BIAS = alloc(n_bias, "lm.bias")
         self.LM_SCRATCH = alloc(n_scratch, "lm.attn_scratch")
+        self.KV_CONTEXT_CAPACITY = aligned_C
         self._lm_zero_sizes = dict(
-            kv=NL * KVH * C * AHD, hm=QH * self.LM_HEAD_ROWS * AHD,
+            kv=NL * KVH * aligned_C * AHD, hm=QH * self.LM_HEAD_ROWS * AHD,
             bias=n_bias, scratch=n_scratch)
         # Guard between the attention scratch and IDENTITY. The kernel's scratch
         # extent is derived from its own arguments, so a sizing mistake here is
@@ -744,10 +815,10 @@ class Qwen25VLLMMixin:
 
         # KV cache: [layer][kv_head][C][AHD], head-major so decode attention
         # reads it in place -- no per-step marshalling.
-        self.KV_STRIDE_HEAD = C * AHD * bpe
+        self.KV_STRIDE_HEAD = aligned_C * AHD * bpe
         self.KV_STRIDE_LAYER = KVH * self.KV_STRIDE_HEAD
-        self.LM_K_CACHE = alloc(NL * KVH * C * AHD, "lm.k_cache")
-        self.LM_V_CACHE = alloc(NL * KVH * C * AHD, "lm.v_cache")
+        self.LM_K_CACHE = alloc(NL * KVH * aligned_C * AHD, "lm.k_cache")
+        self.LM_V_CACHE = alloc(NL * KVH * aligned_C * AHD, "lm.v_cache")
 
         end = self.get_tensor_dram_addr()
         if end > self.TENSOR_LIMIT:
@@ -762,7 +833,8 @@ class Qwen25VLLMMixin:
         self.dma_to_accelerator_memory(
             self.PENALTY_BIAS, torch.zeros(d["VOCAB"], dtype=torch.bfloat16))
         self._loud(f"  [LM] tensors: {self.get_tensor_dram_usage() / 2**20:.1f} MiB "
-                   f"(KV {2 * NL * KVH * C * AHD * bpe / 2**20:.1f} MiB at ctx {C})")
+                   f"(KV {2 * NL * KVH * aligned_C * AHD * bpe / 2**20:.1f} MiB "
+                   f"at logical ctx {C}, padded capacity {aligned_C})")
         self.lm_reset_attention_state()
 
     def lm_reset_attention_state(self) -> None:
@@ -1497,12 +1569,12 @@ class Qwen25VLLMMixin:
         else:
             self.bf16_permute_dram_core(
                 KVH, M, AHD, self.LM_K, k_base,
-                write_grouped=True, group_stride_rows=self.MAX_CONTEXT_SIZE)
+                write_grouped=True, group_stride_rows=self.KV_CONTEXT_CAPACITY)
             self.bf16_permute_dram_core(
                 KVH, M, AHD, self.LM_V, v_base,
-                write_grouped=True, group_stride_rows=self.MAX_CONTEXT_SIZE)
+                write_grouped=True, group_stride_rows=self.KV_CONTEXT_CAPACITY)
             # Rotate K inside the cache, ONE HEAD AT A TIME. The heads' planes
-            # are MAX_CONTEXT_SIZE rows apart (that is what reserves room for
+            # are KV_CONTEXT_CAPACITY rows apart (that is what reserves room for
             # decode to append), so they are NOT contiguous and a single
             # M=KVH*M call would walk off head 0's plane into unwritten rows.
             for h in range(KVH):
@@ -1538,7 +1610,7 @@ class Qwen25VLLMMixin:
             def _attn(ctx, k_base=k_base, v_base=v_base, attn_acc=attn_acc):
                 # Q/out come from the context accessors (address discipline);
                 # K/V are computed here because the KV cache planes stride by
-                # MAX_CONTEXT_SIZE, not by seq_len as ctx.kv_addr assumes.
+                # KV_CONTEXT_CAPACITY, not by seq_len as ctx.kv_addr assumes.
                 scratch = self.LM_ATTN_SCRATCH_PER_ENGINE[ctx.engine_idx]
                 for qh in range(ctx.head_off, ctx.head_off + ctx.heads):
                     kv_h = qh // G
@@ -1793,7 +1865,7 @@ class Qwen25VLLMMixin:
             f = f if isinstance(f, (int, float)) else 0
             flops += f
             # Billed separately: the core returns FLOPs for the COMPILE-TIME
-            # aligned_seq_len, which for decode is the MAX_CONTEXT_SIZE bound
+            # aligned_seq_len, which for decode is the padded context bound
             # that sizes the scratch -- not the live KV length the step runs.
             # Counting it as-is reported 45 GFLOP/token and a 194%-of-peak
             # throughput. run_decoder rescales it by the actual length.
@@ -2371,11 +2443,11 @@ class Qwen25VLLMMixin:
             out_addr = self.LM_IO_B if li % 2 == 0 else self.LM_IO_A
             flops += self._emit_layer(
                 li, 1, decode=True, m_reg=m_reg,
-                # aligned_seq_len is DYNAMIC: MAX_CONTEXT_SIZE is only the
-                # compile-time bound that sizes the scratch, while
+                # aligned_seq_len is DYNAMIC: KV_CONTEXT_CAPACITY is only the
+                # compile-time padded bound that sizes the scratch, while
                 # gf_aligned_seq_len carries the live KV length each step, so a
                 # short context does not pay for a full one.
-                aligned_kv=self.MAX_CONTEXT_SIZE,
+                aligned_kv=self.KV_CONTEXT_CAPACITY,
                 aligned_kv_reg=self.gf_aligned_seq_len, in_addr=in_addr,
                 out_addr=out_addr, rope_base=self.LM_ROPE_DEC, ckpt=ckpt,
                 dec_sched=dec_sched, dec_shards=dec_shards)
@@ -2445,8 +2517,8 @@ class Qwen25VLLMMixin:
         # aligned_seq_len.
         self._decoder_flops_fixed = int(flops - self._emit_attn_flops)
         self._decoder_attn_per_aligned = (
-            self._emit_attn_flops / self.MAX_CONTEXT_SIZE
-            if self.MAX_CONTEXT_SIZE else 0.0)
+            self._emit_attn_flops / self.KV_CONTEXT_CAPACITY
+            if self.KV_CONTEXT_CAPACITY else 0.0)
         self.allocate_program_dram(len(blob))
         self._decoder_preamble = self.allocate_program_dram(64 * 8)
         if base + len(blob) > self.DRAM_END:

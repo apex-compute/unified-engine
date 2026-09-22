@@ -830,6 +830,13 @@ class Qwen25OmniLMMixin(_vl_lm.Qwen25VLLMMixin):
         """All eight engines: the 1 GiB map has no shared MLP copy to read."""
         return int(self.multi_core)
 
+    def _reuse_prefill_tp_tensor_scratch(self) -> bool:
+        """Overlay transient LM tensors on the eight-lane down-output plane.
+
+        Omni always takes the tensor-parallel prefill MLP path.
+        """
+        return True
+
     def _decode_shard_override(self, op: str, layer: int):
         """Decode reuses the N-shard staged at weight-load time.
 
