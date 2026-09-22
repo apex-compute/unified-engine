@@ -92,26 +92,28 @@ effective throughput only for prefill, hence the two blanks.
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Low | 862 | 13.32 tok/s | 13.32 tok/s | 75.1 | 14.53 | 193.5 | 51.5% |
 | Medium | 2158 | 8.85 tok/s | 8.74 tok/s | 114.5 | 15.03 | 131.3 | 35.0% |
-| High | 2048 | 9.31 tok/s | 8.96 tok/s | 111.6 | 15.02 | 134.6 | 35.8% |
+| High | 6144 | 5.32 tok/s | 5.32 tok/s | 187.9 | 16.61 | 88.8 | 23.6% |
 
-Generation degrades 34% between 862 and 2158 resident tokens — 13.32 to 8.74
-tok/s, a 52% rise in per-token latency for 2.5x the context.
+Generation degrades 60% from 862 to 6144 resident tokens — 13.32 to 5.32
+tok/s, a 2.5x rise in per-token latency for 7.1x the context.
 
-The cause is not arithmetic. Work per token rises 3.4% against that 52%, while
-efficiency falls from 51.5% to 35.0% of peak. The decoder reads a KV cache
+The cause is not arithmetic. Work per token rises 14% across that range, while
+efficiency falls from 51.5% to 23.6% of peak. The decoder reads a KV cache
 growing linearly with context while its matmul shapes stay fixed, so the added
 time is memory traffic, not compute.
 
 *Derived, not measured:* one decode step streams the full 5.88 GB weight set.
 At Low's 75.1 ms that is 78.3 GB/s, within ~9% of the ~85 GB/s aggregate AXI
 ceiling — short-context decode sits near the DRAM weight-streaming floor, and
-the Medium/High gap above it is attention and KV overhead.
+the gap that opens at Medium and widens at High is attention and KV overhead
+on top of that floor.
 
-**There is no decode measurement at 6144 tokens.** High decodes at its final
-resident 2048-token chunk, which is why it reads faster than Medium despite
-being the larger tier — Medium's 2158 rows is the longest KV measured here.
-Capacity is 2560 rows and history is not carried between chunks, so the
-862 → 2158 slope should not be extrapolated past it.
+High's decode runs at the tier's true 6144-token resident depth, not a
+shorter stand-in. Rows beyond the tier's real prefill chunk (2048 tokens) are
+zero-filled placeholders in the KV cache, so decode's attention shape and DMA
+cost are real at 6144 while its logits are not — consistent with the
+numerics-unchecked contract stated for the High tier throughout this
+document.
 
 ## Quantization
 
