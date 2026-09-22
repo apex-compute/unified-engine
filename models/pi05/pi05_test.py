@@ -2905,6 +2905,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             self._vis_weight_sets = []
             return
         self._vis_weight_sets = [self.vis_layer_addrs]
+        # BIN MANIFEST RECORD. Copies placed in TENSOR DRAM are not in params.bin, and
+        # they move the tensor cursor that the worker arenas are carved from. A bin
+        # replay must restore both, or every worker arena / per-engine buffer lands
+        # ~hundreds of MB away from the addresses the programs bake. Filled below;
+        # consumed by dump_programs_to_file and Pi05Libero_Run._vis_alloc_weight_copies.
+        self._vis_copy_record = {"tensor_before": int(self._tensor_dram_addr),
+                                 "tensor_after": int(self._tensor_dram_addr), "blobs": []}
         MB = 1 << 20
         ne_vis = self._num_engines("VIS")
         want = self.VIS_WEIGHT_COPIES
@@ -2951,11 +2958,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 for k in self._VIS_COPY_KEYS:
                     la[f"{k}_scale"], la[f"{k}_data"] = self._vis_store_q4_blob(lb[k], region)
                     first = la[f"{k}_scale"] if first is None else first
+                    if region == "tensor":
+                        # (dst, src in set 0 / params.bin, bytes) for scale and data.
+                        n_blocks = len(lb[k]) // 34
+                        src = self.vis_layer_addrs[l]
+                        for part, nbytes in (("scale", n_blocks * 2), ("data", n_blocks * 32)):
+                            self._vis_copy_record["blobs"].append(
+                                [int(la[f"{k}_{part}"]), int(src[f"{k}_{part}"]), nbytes])
                 wset.append(la)
             last = wset[-1]["fc2_data"] + len(blobs[-1]["fc2"]) * 32 // 34
             self._vis_weight_sets.append(wset)
             _original_print(f"    [vis] weight set {c}: {region:<6s} 0x{first:08X}..0x{last:08X} "
                             f"uploaded in {time.perf_counter() - t0:.1f}s")
+        self._vis_copy_record["tensor_after"] = int(self._tensor_dram_addr)
         n_sets = len(self._vis_weight_sets)
         assign = {e: e % n_sets for e in range(ne_vis)}
         _original_print(f"    [vis] {n_sets} weight set(s) for {ne_vis} vision engines -> "
@@ -7613,6 +7628,11 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 "worker_program_addr": [w.get_program_dram_addr() for w in _sc.workers],
             }
         manifest["schedulers"] = _sched_state
+        # Tensor-DRAM vision weight copies (see _vis_alloc_weight_copies). Always written
+        # for a sharded set -- an empty record still pins the arena base.
+        _rec = getattr(self, "_vis_copy_record", None)
+        if _rec is not None:
+            manifest["vis_weight_copies"] = _rec
         manifest["sig"] = {
             "engines": _engines,
             # What each stage ACTUALLY ran at, after the board/column clamps. The
@@ -7986,6 +8006,61 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
         self.embedding_table = self._npy(
             "PaliGemma.llm.embedder.input_embedding").to(torch.bfloat16)
         self.load_params()
+
+    def _vis_alloc_weight_copies(self, workers):
+        """Bin replay of the compile run's TENSOR-DRAM vision weight copies.
+
+        Params-region copies are already in params.bin. Tensor-region ones are not, and
+        they also advanced the tensor cursor before the worker arenas were carved -- so
+        skipping them (the old behaviour) put every arena and per-engine buffer at the
+        wrong address and _restore_schedulers asserted. Each copy is byte-identical to a
+        set-0 blob that IS in params.bin, so it is restored from that file here.
+        """
+        if getattr(self, "_vis_weight_sets", None) is not None:
+            return
+        self._vis_weight_sets = []
+        rec = self._manifest.get("vis_weight_copies")
+        if rec is None:
+            if max(_configured_engines(self).values()) > 1:
+                raise RuntimeError(
+                    f"bin set {self._bin_stem} predates the `vis_weight_copies` record: its "
+                    f"worker arenas were placed after tensor-DRAM weight copies this replay "
+                    f"cannot reproduce. Regenerate the bins (--clean).")
+            return
+        here = int(self._tensor_dram_addr)
+        if here != rec["tensor_before"]:
+            raise RuntimeError(
+                f"bin replay tensor cursor 0x{here:X} != 0x{rec['tensor_before']:X} recorded "
+                f"before the vision weight copies -- the tensor layout changed since the "
+                f"bins were dumped. Regenerate the bins (--clean).")
+        blobs = rec["blobs"]
+        if blobs:
+            t0 = time.perf_counter()
+            total = 0
+            with open(os.path.join(self.bin_dir, "params.bin"), "rb") as f:
+                for dst, src, nbytes in blobs:
+                    f.seek(src - self._params_dram_base)
+                    data = f.read(nbytes)
+                    assert len(data) == nbytes, f"params.bin short read at 0x{src:X}"
+                    self._dma_write_retry(DMA_DEVICE_H2C, dst, data, nbytes)
+                    total += nbytes
+            _original_print(f"    [vis] restored {len(blobs)} tensor-DRAM weight-copy blobs "
+                            f"({total / (1 << 20):.1f} MB) from params.bin in "
+                            f"{time.perf_counter() - t0:.1f}s")
+        self._tensor_dram_addr = int(rec["tensor_after"])
+
+    def _resolve_worker_arena_profile(self, workers):
+        """Replay the compile run's arena sizing, then insist it matches the dump.
+
+        The profile is re-derived from the live tensor cursor, which only matches the
+        compile run's once the weight copies above are restored. Check it rather than
+        trust it: the worker programs are loaded at arena-relative addresses."""
+        super()._resolve_worker_arena_profile(workers)
+        want = self._manifest.get("derived", {}).get("VIS_WORKER_ARENA_BYTES")
+        if want is not None and int(self.VIS_WORKER_ARENA_BYTES) != int(want):
+            raise RuntimeError(
+                f"bin replay sized worker arenas at {self.VIS_WORKER_ARENA_BYTES} B but the "
+                f"bins were compiled with {want} B. Regenerate the bins (--clean).")
 
     def load_params(self):
         """Restore the params DRAM snapshot and rewind the params allocator to the
