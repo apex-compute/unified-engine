@@ -37,6 +37,12 @@ program:
 program_flash:
 	@bash -c 'set -o pipefail; vivado -mode batch -source program_flash.tcl -tclargs $(TARGET) $(if $(BITFILE),BITFILE=$(BITFILE),) 2>&1 | grep -v "^#"'
 
+# Read-only by default. PROGRAM=1 permanently burns the AES key and flashes BIN.
+# Extra selectors/options: PROVISION_ARGS='--target <serial> --dna <hex> --boot'
+.PHONY: kintex7_efuse_flash
+kintex7_efuse_flash:
+	@python3 ./provision_kintex7.py "$(BINFILE)" $(if $(NKY_FILE),--key "$(NKY_FILE)",) $(if $(filter 1,$(PROGRAM)),--program,--check) $(PROVISION_ARGS)
+
 # Download artifact from GH Actions, extract bitstream from XSA, program FPGA
 # Usage: make program_with_artifact GITHUB_RUN_ID=123456789 [TARGET=alveo]
 GITHUB_RUN_ID ?= 18294195588
