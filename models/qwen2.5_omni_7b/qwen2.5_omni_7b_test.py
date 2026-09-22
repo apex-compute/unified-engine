@@ -2905,11 +2905,21 @@ def _write_high_summary(args, phases: dict[str, dict], process_wall: dict[str, f
         "FPGA execution.",
         "- **Camera:** 4 independent 896x896 frames, 4096 vision tokens total.",
         "- **Audio:** 6.0 seconds, the configured 600-mel-frame maximum.",
-        f"- **Prefill:** {aggregate_tokens} aggregate tokens projected as "
-        f"{chunks} x {sample['tokens']} independent resident chunks.",
-        f"- **Physical KV capacity:** {PREFILL_MAX_SEQ_LEN} rows; history is not "
-        "carried between chunks.",
-        "- **Numerics/coherency:** intentionally unchecked.",
+        f"- **Prefill:** {aggregate_tokens} aggregate tokens measured as "
+        f"{chunks} x {sample['tokens']} independent resident chunks, real FPGA "
+        "runs replayed -- not a shorter stand-in. A genuine single continuous "
+        f"{aggregate_tokens}-token prefill does not fit: its own buffers "
+        "(down-projection TP scratch) scale with prompt length and collide "
+        "with the ~707 MiB/core of real resident weights in the same 1 GiB "
+        "window, and there is no way to free that room without changing the "
+        "TP degree or the weight residency being measured.",
+        f"- **Decode:** measured with the KV cache pre-filled to the same "
+        f"{aggregate_tokens}-token depth; rows beyond the real prefill chunk "
+        "are zero-filled placeholders, so decode's attention shape and DMA "
+        "cost are real but its logits are not. Decode's own buffers (KV "
+        "cache, attention scratch) are not weight-adjacent, so this one "
+        "fits without the prefill tradeoff above.",
+        "- **Numerics/coherency:** intentionally unchecked throughout.",
         "",
         "## Hardware-counter performance",
         "",
@@ -3025,6 +3035,38 @@ def main() -> None:
 
 def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     """Run artifact preparation and FPGA execution under the global lock."""
+    global MAX_CONTEXT_SIZE
+    if getattr(args, "high_phase", None) == "decode":
+        # The decode phase's whole point is a resident KV depth this map
+        # cannot normally hold (that is why --high chunks prefill at all).
+        # Numerics are already unchecked for --high; widen ONLY the KV/decode
+        # context ceiling (MAX_CONTEXT_SIZE) in THIS ISOLATED SUBPROCESS so
+        # decode's shape and DMA cost are real at the aggregate length instead
+        # of at one 2048-token chunk. PREFILL_MAX_SEQ_LEN stays untouched: it
+        # sizes the PREFILL program's own buffers (I/O, TP-down scratch) to
+        # what this subprocess actually prefills -- one real 2048-token chunk
+        # -- and bloating it alongside MAX_CONTEXT_SIZE ballooned buffers that
+        # have nothing to do with KV depth for no reason.
+        #
+        # A REAL, CONTINUOUS 6144-token prefill was tried and reverted: its
+        # own buffers scale with the compiled length too (TP-down scratch is
+        # tp_ne * P * H, ~339.5 MiB at P=6144), and that has to coexist with
+        # the ~707 MiB/core of REAL resident weights in the same 1 GiB window.
+        # There is no bookkeeping fix for that -- shrinking the declared
+        # private reserve does not help, since shared_free() takes the max
+        # with the ACTUAL weight cursor, which real weight staging advances
+        # regardless of what is declared. The only ways through are reducing
+        # the down-projection's TP degree (understates real prefill
+        # throughput) or shrinking real weight residency (skips real weight
+        # DMA traffic) -- both change what is measured. So prefill keeps its
+        # x3 chunk replay below, which needs neither: the three 2048-token
+        # chunks are independent and identical in shape, so replaying one
+        # real, fully-TP-sharded, fully-resident measurement three times is
+        # the true cost of three of them, not an approximation.
+        aggregate = (int(RUN_PRESETS["high"]["prefill_chunk_tokens"]) - 1) * \
+            int(RUN_PRESETS["high"]["prefill_chunks"])
+        target = ((aggregate + args.max_new_tokens + 63) // 64) * 64
+        MAX_CONTEXT_SIZE = max(MAX_CONTEXT_SIZE, target)
     args.image = _resolve_sample(args.image, DEFAULT_IMAGE, "--image")
     args.audio = _resolve_sample(args.audio, DEFAULT_AUDIO, "--audio")
     engine_kwargs = resolve_engine_config(parser, args)
@@ -3139,6 +3181,30 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
             }))
             return
         ue.activate_decode_shared_weights()
+        real_prefill_rows = int(ue.seq_len)
+        aggregate = (int(RUN_PRESETS["high"]["prefill_chunk_tokens"]) - 1) * \
+            int(RUN_PRESETS["high"]["prefill_chunks"])
+        if aggregate > real_prefill_rows:
+            # SPEED ONLY, NOT NUMERICS: rows [real_prefill_rows:aggregate) were
+            # never actually prefilled. Fill them with finite zeros (matches
+            # lm_reset_attention_state's own convention) so the padding cannot
+            # produce NaN, then claim the position so decode's per-step bias
+            # and KV stride treat all of it as live. This makes decode run its
+            # real attention/matmul shape against the real 6144-token
+            # aggregate length instead of against one 2048-token chunk; the
+            # logits it produces from the fake rows are meaningless, which is
+            # already true of --high generally.
+            AHD, KVH, NL = ue.actual_head_dim, ue.num_kv_heads, ue.LAYER_SIZE
+            pad_rows = aggregate - real_prefill_rows
+            stride = ue.KV_STRIDE_HEAD  # bytes per KV head's full C-row plane
+            for cache in (ue.LM_K_CACHE, ue.LM_V_CACHE):
+                for li in range(NL):
+                    for h in range(KVH):
+                        plane = cache + (li * KVH + h) * stride
+                        off = plane + real_prefill_rows * AHD * ue.bytes_per_element
+                        ue.dma_to_accelerator_memory(
+                            off, torch.zeros(pad_rows * AHD, dtype=torch.bfloat16))
+            ue.seq_len = aggregate
         resident_context = int(ue.seq_len)
         # High is explicitly timing-only: force all requested steps even if a
         # numerically meaningless token happens to equal EOS.
