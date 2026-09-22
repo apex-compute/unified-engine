@@ -74,17 +74,19 @@ the engine's $64$-element alignment.
 is 4-bit block-quantized ($\sim$8$\times$ smaller) and dequantized to \bfteen{}
 at the MAC. \iffour{} buys footprint, not speed.
 
-\textbf{Vision head dim.} Head dim $72$ is not $64$-aligned. Attention runs at
-$128$ and is contracted back through a precomputed selection matrix; the
-$Q/K/V/O$ projections stay at $72$.
+\textbf{Vision head dim.} Head dim $72$ is not $64$-aligned. The $Q/K/V$
+projections write $80$ lanes per head ($72$ real, $8$ zero); each head is padded
+to $128$ only inside the $QK^{\top}$ contraction and compacted back to $80$ for
+the output projection. Bit-identical to the unpadded math.
 
-\textbf{Prefix masking.} A masked image slot is dropped from prefill, a quarter
-less work with bit-identical output. Rotary positions are cumulative-sum-of-mask
-indices, not \texttt{arange}, so removing a slot does not shift phase.
+\textbf{Prefix masking.} A masked image slot is carried as masked placeholder
+rows, so the prefill stays at its full $832$ tokens. Rotary positions are
+cumulative-sum-of-mask indices, not \texttt{arange}, so a masked slot does not
+advance the phase. Dropping the slot instead is supported and cuts prefill by a
+quarter, bit-identically, but is off in the build measured here.
 
 \textbf{Denoise loop.} All ten steps compile into one program and one execute
-call. Every strided SRAM$\to$DRAM copy needs an explicit destination offset; a
-missing offset scrambles the output silently, with no NaN.
+call.
 
 %=============================================================================
 \section{Quantization}
@@ -169,8 +171,7 @@ Denoise velocity $v_t$ (10 steps) & 31.51 & 22.2--34.5 \\
 \label{sec:libero}
 LIBERO is a tabletop manipulation benchmark for language-conditioned policies,
 scored by closed-loop task success. It provides two camera views; \pizero{}
-takes three, so the third slot is zero-filled and masked. Encoding it costs
-nothing in correctness and keeps the three-camera path exercised.
+takes three, so the third slot is zero-filled and masked.
 
 An episode is many inferences. The simulator executes the first ten steps of
 each chunk and requests the next, so one episode is a dozen or more full passes
@@ -205,9 +206,9 @@ steps on successes; failures run to the cap.}
 \end{tabular}
 \end{table}
 
-\noindent{\footnotesize $^\dagger$Prompt~5 is a \texttt{libero\_object} task; the
-original \texttt{libero\_spatial} task~5 exercised a denoise-loop compile path
-that crashed the FPGA bring-up, so it is substituted with the next unused prompt.}
+\noindent{\footnotesize $^\dagger$Prompt~5 is substituted from
+\texttt{libero\_object}; the original \texttt{libero\_spatial} task~5 was
+excluded during bring-up.}
 
 \vspace{2pt}
 \noindent The two policies agree on every prompt, and successful episodes
@@ -296,25 +297,24 @@ per-section GFLOP counts differ between the GPU and Jetson columns.
 \begin{table}[H]
 \centering\small
 \caption{\alveo{} (\iffour{}) --- twelve \ue{}~v1 instances on one AMD Alveo U55C,
-832-token prefix. Times are pure back-to-back execution; programs are compiled
-once up front and that one-time cost is excluded.}
+832-token prefix. GFLOP/s is the work the engines issue over measured time,
+measured by the hardware cycle counter. Peak is $12\times64$ MACs/cycle at
+$300$\,MHz $= 460.8$\,GFLOP/s. Times are pure back-to-back execution;
+programs are compiled once up front and that one-time cost is excluded.}
 \label{tab:timing-fpga}
-\begin{tabular}{@{}lc@{}}
+\begin{tabular}{@{}lccc@{}}
 \toprule
-\textbf{Model section} & \textbf{Time (s)} \\
+\textbf{Model section} & \textbf{Time (s)} & \textbf{GFLOP/s} & \textbf{\% peak} \\
 \midrule
-Vision encoder          & 2.6  \\
-Prefix (Gemma-2B)       & 8.6  \\
-Action expert (denoise) & 0.9  \\
+Vision encoder          & 2.2  & 313.8 & 68 \\
+Prefix (Gemma-2B)       & 8.7  & 389.3 & 84 \\
+Action expert (denoise) & 0.9  & 87.7  & 19 \\
 \midrule
-\textbf{End-to-end}     & 12.1 \\
-\textbf{Throughput (inf/s)} & 0.0826 \\
+\textbf{End-to-end}     & 11.8 & \textbf{353.5} & \textbf{77} \\
+\textbf{Throughput (inf/s)} & \multicolumn{3}{c}{0.0847} \\
 \bottomrule
 \end{tabular}
 \end{table}
-
-The expert is the least efficient stage here for the same reason as on the
-Jetson: it is a chain of short sequential steps, not a throughput problem.
 
 \noindent\textbf{Config.} \alveo{}: $4$\,GB DRAM. All platforms batch~1, ten
 denoise steps, sample~0.
@@ -323,8 +323,6 @@ denoise steps, sample~0.
 \noindent The whole \pizero{} policy runs on the \ue{}~v1, vision, prefix and
 the full denoise loop, with no host fallback (Table~\ref{tab:timing-fpga}). It is
 two orders of magnitude behind the desktop GPU and within a small factor of the
-Jetson. FLOPs concentrate in the prefix; latency concentrates in the expert. And
-\iffour{} pays for its footprint only in action dimensions the policy does not
-act on.
+Jetson. FLOPs concentrate in the prefix; latency concentrates in the expert.
 
 \end{document}
