@@ -218,24 +218,8 @@ differ by a few steps.
 \section{Throughput: \alveo{} vs.\ CUDA}
 \label{sec:throughput}
 %=============================================================================
-Table~\ref{tab:platforms} lists the three platforms and their power. Each is
-then reported as per-section wall-clock: \alveo{} times come from the engine's
-own counters; the GPU baseline is openpi's JAX/XLA path.
-
-\begin{table}[H]
-\centering\small
-\caption{Platforms. Power is the board draw during inference.}
-\label{tab:platforms}
-\begin{tabular}{@{}llll@{}}
-\toprule
-\textbf{Platform} & \textbf{Precision} & \textbf{Runtime} & \textbf{Power} \\
-\midrule
-\alveo{} (AMD Alveo U55C, 12$\times$\ue{}~v1) & \iffour{} weights, \bfteen{} MAC & this work & \numTBD{}\,W \\
-RTX~5070                                   & \bfteen{}                        & openpi JAX/XLA & \numTBD{}\,W \\
-Jetson Orin Nano Super                     & \bfteen{}                        & openpi PyTorch/CUDA & 7\,W mode \\
-\bottomrule
-\end{tabular}
-\end{table}
+Each platform is reported as per-section wall-clock. \alveo{} times come from
+the engine's own counters; the GPU baseline is openpi's JAX/XLA path.
 
 GPU stages are jitted separately with a device sync at each boundary, so their
 sum slightly exceeds the fused end-to-end time (Table~\ref{tab:timing-gpu}).
@@ -247,13 +231,13 @@ separately-jitted; End-to-end is the fused \texttt{policy.infer}.}
 \label{tab:timing-gpu}
 \begin{tabular}{@{}lcc@{}}
 \toprule
-\textbf{Model section} & \textbf{Time (ms)} & \textbf{GFLOP/s} \\
+\textbf{Model section} & \textbf{Time (s)} & \textbf{GFLOP/s} \\
 \midrule
-Vision encoder          & 19.41  & 33\,793 \\
-Prefix (Gemma-2B)       & 79.29  & 29\,411 \\
-Action expert (denoise) & 36.70  & 1\,935  \\
+Vision encoder          & 0.019  & 33\,793 \\
+Prefix (Gemma-2B)       & 0.079  & 29\,411 \\
+Action expert (denoise) & 0.037  & 1\,935  \\
 \midrule
-\textbf{End-to-end}     & 130.15 & 23\,502 \\
+\textbf{End-to-end}     & 0.130  & 23\,502 \\
 \textbf{Throughput (inf/s)} & \multicolumn{2}{c}{7.68} \\
 \bottomrule
 \end{tabular}
@@ -269,15 +253,15 @@ prefix, $7$\,W mode.$^{*}$}
 \label{tab:timing-jetson}
 \begin{tabular}{@{}lcc@{}}
 \toprule
-\textbf{Model section} & \textbf{Time (ms)} & \textbf{GFLOP/s} \\
+\textbf{Model section} & \textbf{Time (s)} & \textbf{GFLOP/s} \\
 \midrule
-Vision encoder          & 480.1    & 1\,366 \\
-Prefix (Gemma-2B)       & 2\,357.8 & 1\,686 \\
-Action expert (denoise) & 1\,427.6 & 53.7   \\
-Weight streaming$^{*}$  & 5\,088.6 & ---    \\
+Vision encoder          & 0.480 & 1\,366 \\
+Prefix (Gemma-2B)       & 2.358 & 1\,686 \\
+Action expert (denoise) & 1.428 & 53.7   \\
+Weight streaming$^{*}$  & 5.089 & ---    \\
 \midrule
-\textbf{Compute only}   & \textbf{4\,265.5} & \textbf{1\,104} \\
-\textbf{End-to-end}     & \textbf{9\,354.1} & \textbf{503}    \\
+\textbf{Compute only}   & \textbf{4.266} & \textbf{1\,104} \\
+\textbf{End-to-end}     & \textbf{9.354} & \textbf{503}    \\
 \textbf{Throughput (inf/s)} & \multicolumn{2}{c}{0.107} \\
 \bottomrule
 \end{tabular}
