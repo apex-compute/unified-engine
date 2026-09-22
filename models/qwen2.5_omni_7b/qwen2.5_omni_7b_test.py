@@ -1655,22 +1655,46 @@ class Qwen25OmniUnifiedEngine(
         except Exception:
             return None
 
+    def _model_flops_decode_step(self, context: int) -> float | None:
+        """Model FLOPs for ONE decode step at an explicit KV depth.
+
+        For a --profile snapshot, which times a single step at a context the
+        caller already knows (ctx_first, or the forced --profile-ctx) rather
+        than the last N steps of a live run, which is what self.seq_len /
+        _model_flops_decode's range assumes.
+        """
+        try:
+            return float(_model_flops.decode_flops(self._cfg, [int(context)]))
+        except Exception:
+            return None
+
     def _stage_table(self, rows: list[dict]) -> list[str]:
-        """Headline table: work, time, throughput, % of peak, core scaling."""
+        """Headline table: work, time, throughput, % of peak, core scaling.
+
+        ``Model GFLOP`` sits right next to the issued ``Work (GFLOP)`` so the
+        padding cost is visible per phase without a reader having to cross-
+        reference the separate Effective-throughput table below. It is
+        ``None`` for a phase stage_metrics() could not price (an exception in
+        the corresponding ``_model_flops_*`` helper), printed as ``n/a``
+        rather than a misleading 0.
+        """
         cores = getattr(self, "multi_core", 1) or 1
         out = [
-            "| Stage | Shape | Work (GFLOP) | FPGA time (ms) | Throughput "
-            "(GFLOPS) | % of peak | x 1-engine peak | CPU wall (s) |",
-            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Stage | Shape | Work (GFLOP) | Model GFLOP | FPGA time (ms) | "
+            "Throughput (GFLOPS) | % of peak | x 1-engine peak | CPU wall (s) |",
+            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
         for row in rows:
+            model = row.get("model_flops")
+            model_s = f"{model / 1e9:.2f}" if model else "n/a"
             out.append(
                 f"| {row['stage']} | {row['detail']} | {row['flops'] / 1e9:.2f} | "
-                f"{row['us'] / 1e3:.1f} | {row['gflops']:.1f} | "
+                f"{model_s} | {row['us'] / 1e3:.1f} | {row['gflops']:.1f} | "
                 f"{row['util_pct']:.1f}% | {row['speedup']:.2f}x | "
                 f"{row['wall']:.2f} |"
             )
         total_flops = sum(row["flops"] for row in rows)
+        total_model_flops = sum(row.get("model_flops") or 0.0 for row in rows)
         total_us = sum(row["us"] for row in rows)
         total_wall = sum(row["wall"] for row in rows)
         peak = self.vis_peak_gflops()
@@ -1678,6 +1702,7 @@ class Qwen25OmniUnifiedEngine(
         total_gflops = total_flops / (total_us * 1e3) if total_us else 0.0
         out.append(
             f"| **TOTAL** | {cores} engines | **{total_flops / 1e9:.2f}** | "
+            f"**{total_model_flops / 1e9:.2f}** | "
             f"**{total_us / 1e3:.1f}** | **{total_gflops:.1f}** | "
             f"**{(100.0 * total_gflops / peak if peak else 0.0):.1f}%** | "
             f"**{(total_gflops / core_peak if core_peak else 0.0):.2f}x** | "
@@ -1760,10 +1785,17 @@ class Qwen25OmniUnifiedEngine(
         Aggregation, the serial-phase peak guard and the column set are shared
         with the terminal breakdown (print_profile_table), so the .md and the
         console can never disagree about a phase.
+
+        The per-kernel rows inside a stage have no notion of the model's true
+        (unpadded) work -- that figure only exists at the whole-stage level,
+        from the same ``_model_flops_*`` helpers ``stage_metrics()`` uses. So
+        Model GFLOP is not a column here (every non-total row would be a
+        fabricated blank); it is one line under each stage's table, next to
+        the issued total it is compared against.
         """
         peak = self.vis_peak_gflops()
         out: list[str] = []
-        for title, note, results in stages:
+        for title, note, results, model_flops in stages:
             if not results:
                 continue
             rows = self._aggregate_vis_profile(results)
@@ -1789,6 +1821,15 @@ class Qwen25OmniUnifiedEngine(
                 f"**{total_gflop:.2f}** | **{total_rate:.1f}** | "
                 f"**{(100.0 * total_rate / peak if peak else 0.0):.1f}%** |"
             )
+            if model_flops:
+                model_gflop = float(model_flops) / 1e9
+                model_rate = model_gflop / (total / 1e3) if total else 0.0
+                out.append(
+                    f"Model GFLOP: {model_gflop:.2f} -> {model_rate:.1f} "
+                    f"effective GFLOPS ({100.0 * model_rate / peak if peak else 0.0:.1f}% "
+                    f"of peak, {100.0 * model_gflop / total_gflop if total_gflop else 0.0:.1f}% "
+                    "useful) against the issued total above."
+                )
             out.append("")
         return out
 
@@ -1864,7 +1905,7 @@ class Qwen25OmniUnifiedEngine(
         # With profile data the engine-0-only phases can be named outright,
         # which is the actionable half: those are what sharding has to remove.
         serial_rows = []
-        for title, _note, results in (profiles or []):
+        for title, _note, results, _model_flops in (profiles or []):
             if not results:
                 continue
             aggregated = self._aggregate_vis_profile(results)
@@ -3426,6 +3467,10 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         ctx_results, _token, aligned_ctx = ue.run_decode_step_profiled(
             next_token, prof_program, prof_checkpoints, workers=prof_workers
         )
+        # A 4th element, model_flops, is the stage's TRUE (unpadded) work at
+        # the shape this profile snapshot actually ran -- computed here, where
+        # the right context/dims are in scope, rather than guessed from the
+        # title string inside _profile_tables.
         profiles = []
         if args.image:
             dims = ue._vision_dims()
@@ -3433,18 +3478,22 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
                 "Vision encoder",
                 f"{dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens.",
                 getattr(ue, "_vis_profile", None),
+                ue._model_flops_vision(dims),
             ))
         profiles += [
             ("Prefill", f"{len(context)} tokens.",
-             getattr(ue, "_prefill_profile", None)),
+             getattr(ue, "_prefill_profile", None),
+             ue._model_flops_prefill()),
             ("Decode - 1st token",
              f"Context {ctx_first} tokens (aligned {aligned_first}).",
-             first_results),
+             first_results,
+             ue._model_flops_decode_step(ctx_first)),
             ("Decode - at context",
              f"Context {ue.seq_len} tokens (aligned {aligned_ctx}).",
-             ctx_results),
+             ctx_results,
+             ue._model_flops_decode_step(ue.seq_len)),
         ]
-        for title, note, results in profiles:
+        for title, note, results, _model_flops in profiles:
             if results:
                 ue.print_profile_table(title, results, note=note)
         print(f"\nThinker profile done in {time.perf_counter() - started:.2f}s wall")
