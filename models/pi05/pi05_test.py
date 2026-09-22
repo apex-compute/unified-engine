@@ -653,13 +653,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # every per-head DMA stride a full DP*bpe=256B (AXI-beat aligned) instead of
             # D*bpe=144B (NOT a multiple of the 32B AXI beat), and needs no separate
             # real-vs-padded strided copy at attention time.
+            # Per-head OUTPUT width is VIS_QKV_LANES (80 by default, 128 = the
+            # original); the gather pads each head to DP=128 for Q.K^T.
+            QL = self.VIS_QKV_LANES
             def _pad_proj(k_l, b_l, scale=1.0):
                 k2d = k_l.reshape(H, NH, D)                    # (K, heads, D)
-                k_pad = torch.zeros(H, NH, DP, dtype=k2d.dtype)
+                k_pad = torch.zeros(H, NH, QL, dtype=k2d.dtype)
                 k_pad[:, :, :D] = k2d * scale
-                b_pad = torch.zeros(NH, DP, dtype=b_l.dtype)
+                b_pad = torch.zeros(NH, QL, dtype=b_l.dtype)
                 b_pad[:, :D] = b_l * scale
-                return k_pad.reshape(H, NH * DP).T, b_pad.reshape(NH * DP)  # (N,K), (N)
+                return k_pad.reshape(H, NH * QL).T, b_pad.reshape(NH * QL)  # (N,K), (N)
 
             qk, qb = _pad_proj(q_k[l], q_b[l], q_scale)
             la['q_scale'], la['q_data'] = _store_q4_keep(blobs, 'q', qk)
@@ -955,9 +958,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # Q/K/V/attn-result are per-head-padded (D->DP=128, see _weight_init_vision's
         # _pad_proj) so every per-head DMA stride is AXI-beat aligned.
         HP = NH * DP
-        self.VIS_Q_DRAM = self.allocate_tensor_dram(S * HP * bpe)
-        self.VIS_K_DRAM = self.allocate_tensor_dram(S * HP * bpe)
-        self.VIS_V_DRAM = self.allocate_tensor_dram(S * HP * bpe)
+        # Q/K/V are NH*VIS_QKV_LANES wide. +DP*bpe slack: the per-head gather reads
+        # a full DP-lane (256 B) chunk from head h's start, so the LAST head of the
+        # LAST row reads (DP - QL) lanes past the end of the buffer.
+        QP = NH * self.VIS_QKV_LANES
+        self.VIS_Q_DRAM = self.allocate_tensor_dram(S * QP * bpe + DP * bpe)
+        self.VIS_K_DRAM = self.allocate_tensor_dram(S * QP * bpe + DP * bpe)
+        self.VIS_V_DRAM = self.allocate_tensor_dram(S * QP * bpe + DP * bpe)
         self.VIS_ATTN_RESULT_DRAM = self.allocate_tensor_dram(S * HP * bpe)
         self.VIS_O_PROJ_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_RESIDUAL_DRAM = self.allocate_tensor_dram(S * H * bpe)
@@ -2414,6 +2421,15 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     #             exact but its 144 B rows scramble on write (-32..7 dB) -- not usable.
     VIS_UNPAD = os.environ.get("PI05_VIS_UNPAD", "split80")
     VIS_UNPAD_LANES = 80        # dma80/split80: lanes kept per head (multiple of 16 = 32 B)
+    # Q/K/V PROJECTION WIDTH PER HEAD. The 128-lane pad is only needed INSIDE the
+    # per-head Q.K^T operand (its contraction must be 64-aligned), not in the
+    # projection output. At 80 the projections write 16 x 80 = 1280 columns (72 real
+    # + 8 zero) instead of 2048, and the per-head gather pads each head to 128 while
+    # copying it into the (zeroed) FQ/FK/FV buffers. Measured single-engine
+    # (pi05_qkv80_bench.py, full slot): projections 80.3 -> 50.3 ms/layer, proj +
+    # gather + attention 100.6 -> 71.2 ms/layer, operands and output bit-identical.
+    # 128 = the original layout, for A/B. Must be a multiple of 16 (32 B) and <= 128.
+    VIS_QKV_LANES = int(os.environ.get("PI05_VIS_QKV_LANES", "80"))
     # PRIVATE PER-ENGINE COPIES OF THE VISION LAYER WEIGHTS (q/k/v/o/fc1/fc2, all
     # 27 layers, ~280 MB per copy). MEASURED on this board (user_hw_test
     # matmat_mul_multi_engine_flag_check_test, 1 MB DRAM->SRAM read per engine):
@@ -3477,6 +3493,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         RH = row_offset * H * bpe                    # [S, H]  buffers
         RP = row_offset * HP * bpe                   # [S, HP] buffers (Q/K/V/attn result)
         RU = row_offset * HR * bpe                   # [S, HR] O-projection input
+        QL = self.VIS_QKV_LANES                      # Q/K/V lanes per head (80 or 128)
+        assert QL % 16 == 0 and D <= QL <= DP, f"VIS_QKV_LANES={QL}"
+        QP = NH * QL                                 # Q/K/V projection width
+        RQ = row_offset * QP * bpe                   # [S, QP] Q/K/V buffers
         RI = row_offset * IP * bpe                   # [S, IP] MLP intermediate
         RK = row_offset * self.VIS_PATCH_K * bpe     # [S, PK] patchified pixels
         RO = row_offset * HO * bpe                   # [S, HO] head output
@@ -3563,7 +3583,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # D->DP=128 (see _weight_init_vision's _pad_proj) so the buffers below are
                 # already head-block-aligned at DP=128, no separate real/padded copy needed.
                 for proj, dst in [('q', self.VIS_Q_DRAM), ('k', self.VIS_K_DRAM), ('v', self.VIS_V_DRAM)]:
-                    vis_matmul(rows, H, HP, self.VIS_LN_OUT_DRAM + RH, la, proj, dst + RP,
+                    vis_matmul(rows, H, QP, self.VIS_LN_OUT_DRAM + RH, la, proj, dst + RQ,
                                bias=la[f'{proj}_bias'])
 
                 # ---- RENDEZVOUS: the ONE point an engine reads rows it did not write.
@@ -3610,12 +3630,26 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     # write rows 0..127 -> finite, NaN-free, structurally plausible
                     # SCRAMBLED output (project_pi05_denoise_strided_copy_bugs).
                     assert (q_ofs + col) % 32 == 0, "strided DMA base must be AXI-beat aligned"
-                    for src, dst, n in ((self.VIS_Q_DRAM + q_ofs + col, FQ, elems_q),
-                                        (self.VIS_K_DRAM + col,      FK, elems_kv),
-                                        (self.VIS_V_DRAM + col,      FV, elems_kv)):
-                        ue.accelerator_memory_to_sram(src, 0x00000, n,
-                            stride_bytes_per_chunk=col_stride, stride_jump_bytes=row_jump)
-                        ue.sram_to_accelerator_memory(0x00000, dst, n)
+                    # Q/K/V live at QL lanes/head (row pitch QP); FQ/FK/FV are DP=128
+                    # wide with lanes QL..127 zero. Read a FULL DP-lane (256 B) chunk
+                    # from the head's start (lanes QL.. are the next head's -- never
+                    # written out) so each row owns a 256 B SRAM slot, then write only
+                    # QL lanes per row. MEASURED: a strided write consumes one whole
+                    # 256 B SRAM slot per chunk, so reading just QL lanes (packed at
+                    # QL*2 B) would shift every row after the first.
+                    qcol = h * QL * bpe
+                    q_src_ofs = 0 if head_shard else RQ
+                    assert (q_src_ofs + qcol) % 32 == 0, "strided DMA base must be AXI-beat aligned"
+                    for src, dst, nrows in ((self.VIS_Q_DRAM + q_src_ofs + qcol, FQ, q_rows),
+                                            (self.VIS_K_DRAM + qcol,             FK, S),
+                                            (self.VIS_V_DRAM + qcol,             FV, S)):
+                        ue.accelerator_memory_to_sram(src, 0x00000, nrows * DP,
+                            stride_bytes_per_chunk=DP * bpe, stride_jump_bytes=QP * bpe)
+                        if QL == DP:
+                            ue.sram_to_accelerator_memory(0x00000, dst, nrows * DP)
+                        else:
+                            ue.sram_to_accelerator_memory(0x00000, dst, nrows * QL,
+                                stride_bytes_per_chunk=QL * bpe, stride_jump_bytes=DP * bpe)
                     # INLINE full-MHA self-attention for this head: batch=THIS engine's
                     # query rows, aligned_seq_len=S (the full K/V), head_dim=DP, zero
                     # (unmasked) bias, standard 1/sqrt(DP) scale. Splitting the QUERY
@@ -6936,6 +6970,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             hw += n * 27 * 2 * S * (NH_ * self.VIS_D) * H
         elif self.VIS_UNPAD in ("dma80", "split80"):
             hw += n * 27 * 2 * S * (NH_ * self.VIS_UNPAD_LANES - NH_ * DP) * H
+        # Q/K/V projections at NH*VIS_QKV_LANES columns instead of NH*DP.
+        hw += n * 27 * 3 * 2 * S * H * NH_ * (self.VIS_QKV_LANES - DP)
         if self.VIS_UNPAD == "split80":   # P.V at N = 80 instead of 128
             hw += n * 27 * 2 * S * S * NH_ * (self.VIS_UNPAD_LANES - DP)
         return eff, hw
@@ -8487,6 +8523,9 @@ def main():
     ap.add_argument("--vis_unpad", choices=("pad128", "sel", "dma80", "split80"), default=None,
                      help="How the vision attention output drops its head-dim pad lanes "
                           "before the O projection (see VIS_UNPAD). Default split80.")
+    ap.add_argument("--vis_qkv_lanes", type=int, choices=(80, 128), default=None,
+                     help="Vision Q/K/V projection lanes per head (see VIS_QKV_LANES). "
+                          "Default 80 (1280 columns); 128 = the original 2048.")
     ap.add_argument("--vis_m_shard", action=argparse.BooleanOptionalAction, default=None,
                      help="Shard the VISION encoder by ROWS ONLY (32 rows/engine at 8), "
                           "instead of the default 2D 4-row-groups x 2-K-lanes grid. The "
@@ -8593,6 +8632,9 @@ def main():
     _multi = configure_engines(args.engines, vis_4=args.vis_4, pref_8=args.pref_8,
                                vis_m_shard=args.vis_m_shard,
                                dns_8=args.dns_8, tag="main")
+    if args.vis_qkv_lanes is not None:
+        Pi05Libero_UnifiedEngine.VIS_QKV_LANES = args.vis_qkv_lanes
+    print(f"[main] vision Q/K/V lanes per head: {Pi05Libero_UnifiedEngine.VIS_QKV_LANES}")
     if args.vis_unpad is not None:
         Pi05Libero_UnifiedEngine.VIS_UNPAD = args.vis_unpad
     print(f"[main] vision attention unpad: {Pi05Libero_UnifiedEngine.VIS_UNPAD}")
@@ -8670,7 +8712,7 @@ def main():
         clean_bins(BIN_DIR)
     _bin_ok = not (args.debug or args.sanity_check or args.probe_step0
                    or args.vis_m_shard is not None or args.vis_attn_head_shard is not None
-                   or args.vis_unpad is not None
+                   or args.vis_unpad is not None or args.vis_qkv_lanes is not None
                    or args.vis_weight_copies is not None or args.ae_vt_cache is not None
                    or args.ae_trim_attn_batch is not None
                    or args.ae_primary_no_head is not None or args.ae_hoist_adarms is not None
