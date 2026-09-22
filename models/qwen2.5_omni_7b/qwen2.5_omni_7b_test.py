@@ -2890,6 +2890,15 @@ def _write_high_summary(args, phases: dict[str, dict], process_wall: dict[str, f
         if prefill["effective_gflops"] else 0.0
     )
     rows = [vision, audio, prefill, decode]
+    # Every phase result already carries model_flops (the unpadded work this
+    # architecture actually owes); turn it into effective GFLOPS for ALL FOUR
+    # stages, not prefill alone -- vision and audio were being captured on the
+    # wire and then dropped when this table got built.
+    for row in rows:
+        row["effective_gflops"] = (
+            float(row["model_flops"]) / (float(row["hw_us"]) * 1e3)
+            if row.get("hw_us") else 0.0
+        )
     peak = float(vision["peak_gflops"])
     enc_us = float(vision["hw_us"]) + float(audio["hw_us"])
     segmented_ttft_us = enc_us + float(prefill["hw_us"])
@@ -2923,15 +2932,19 @@ def _write_high_summary(args, phases: dict[str, dict], process_wall: dict[str, f
         "",
         "## Hardware-counter performance",
         "",
-        "| Stage | Shape | Work (GFLOP) | FPGA time (ms) | GFLOPS | % peak | CPU execution wall (s) |",
-        "| :--- | :--- | ---: | ---: | ---: | ---: | ---: |",
+        "| Stage | Shape | Work (GFLOP) | FPGA time (ms) | Issued GFLOPS | "
+        "% peak (issued) | Effective GFLOPS | % peak (effective) | "
+        "CPU execution wall (s) |",
+        "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         gflops = float(row["gflops"])
+        eff = float(row["effective_gflops"])
         lines.append(
             f"| {row['stage']} | {row['detail']} | {float(row['flops']) / 1e9:.1f} | "
             f"{float(row['hw_us']) / 1e3:.1f} | {gflops:.1f} | "
-            f"{100.0 * gflops / peak:.1f}% | {float(row['wall_s']):.2f} |"
+            f"{100.0 * gflops / peak:.1f}% | {eff:.1f} | "
+            f"{100.0 * eff / peak:.1f}% | {float(row['wall_s']):.2f} |"
         )
     lines += [
         "",

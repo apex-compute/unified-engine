@@ -74,17 +74,21 @@ any other implementation of this model.
 | Prefill | Medium | 338.8 | 90.2% | 328.2 | 87.4% | 96.9% |
 | Prefill | High | 338.9 | 90.3% | 328.6 | 87.5% | 96.9% |
 | Vision | Medium | 290.7 | 77.4% | 155.8 | 41.5% | 53.6% |
-| Vision | High | 289.8 | 77.2% | not reported | | |
+| Vision | High | 288.9 | 77.0% | 154.9 | 41.3% | 53.6% |
 | Audio | Low | 270.6 | 72.1% | 268.6 | 71.5% | 99.3% |
 | Audio | Medium | 288.1 | 76.7% | 281.6 | 75.0% | 97.7% |
-| Audio | High | 285.6 | 76.1% | not reported | | |
+| Audio | High | 279.4 | 74.4% | 270.5 | 72.0% | 96.8% |
 
 Prefill is the best-utilised stage on the board; its share of TTFT is large
 because the work is large, not because it runs badly. The vision encoder issues
 53.6% padding, making that gap the largest recoverable inefficiency in TTFT.
-
-The High tier's combined summary reports issued throughput per stage and
-effective throughput only for prefill, hence the two blanks.
+Vision and audio's High-tier effective figures are not in the harness's own
+printed summary -- `_write_high_summary` only turns `model_flops` into an
+effective-GFLOPS column for prefill's monolithic estimate -- but every
+phase's raw result already carries `model_flops`, so they are derived here
+from the same run rather than left blank. High's per-frame/per-second effective
+rate lands within 1% of Medium's for both stages, as it should: same shape,
+replicated.
 
 ## Decode throughput
 
