@@ -61,7 +61,7 @@ jobs:
     runs-on: self-hosted
     # Leave the two-hour nightly scheduler five minutes to collect and report
     # this job's terminal result if the hardware suite reaches its time limit.
-    timeout-minutes: 115
+    timeout-minutes: 230
     steps:
       - name: Checkout
         # Do NOT let checkout run `git clean -ffdx`: its default wipe deletes the
@@ -97,7 +97,10 @@ jobs:
           BRANCH="${{ github.head_ref || github.ref_name }}"
 
           if [[ "${{ inputs.full_run }}" == "true" ]]; then
-            : # no --only: the whole model_auto_test.py registry, pi05 first
+            # No --only: the whole model_auto_test.py registry. Then a second pass
+            # re-runs every model from its cached bin in a date-seeded shuffled
+            # order (auto-triaged) to catch cross-model NaN / contamination.
+            ARGS+=(--shuffle-pass)
           elif [[ "$BRANCH" == "model/verapulse" ]]; then
             # verapulse bring-up branch: run ONLY verapulse. Same reasoning as pi05
             # below -- the Gemma4 cases add ~15 min of shared-board time and cannot
@@ -127,6 +130,8 @@ jobs:
           name: model-hw-ci-results
           path: |
             model_auto_test_results.txt
+            model_auto_test_results_pass1.txt
+            model_auto_test_results_shuffle.txt
             user_hw_test_summary.md
           if-no-files-found: warn
 

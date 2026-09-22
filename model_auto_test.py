@@ -429,6 +429,58 @@ def _check_verapulse(text):
     return True, f"finite action chunk ({chunk}x{dof}, absmax={hi})"
 
 
+def _check_act(text):
+    # ACT (LeRobot, 34M) prints a TEST_RESULT: JSON line with actions_snr_db vs the CPU
+    # reference. HW-proven at ~38 dB; gate at 35 so a NaN (-inf / nan) or a scrambled
+    # chunk fails while normal bf16 jitter passes.
+    m = re.search(r"TEST_RESULT:(\{.*\})", text)
+    if not m:
+        return False, "no TEST_RESULT line (run did not reach the action head)"
+    try:
+        r = json.loads(m.group(1))
+    except ValueError:
+        return False, "unparseable TEST_RESULT"
+    if "actions_snr_db" in r:                       # reference.npz present: gate on SNR
+        snr = float(r["actions_snr_db"])
+        if not (snr == snr) or snr < 35.0:
+            return False, f"actions SNR {snr:.1f} dB < 35 dB"
+        return True, f"actions SNR {snr:.1f} dB"
+    # No CPU golden (self-generated weights): finite and non-zero action chunk.
+    if not r.get("actions_finite", False):
+        return False, "action chunk has non-finite values"
+    if float(r.get("actions_absmax", 0.0)) == 0.0:
+        return False, "action chunk is all zeros -- a stage wrote nothing"
+    return True, f"finite action chunk (absmax={float(r['actions_absmax']):.4f})"
+
+# Kokoro per-section SNR floors (dB), ~5 dB under the healthy run measured on the CI
+# runner 2026-09-21: S1 25.9, S2 29.8 (pred_dur 25.9), S3 39.8/52.3, S4 44.1, S5a 43.1,
+# S5b 33.0, S5d 18.5 (5d is a waveform SNR; its CPU-vs-CPU noise floor is ~20 dB).
+# A broken run reads S1 at -12 dB, so these separate healthy from broken with margin.
+_KOKORO_SNR_FLOORS = {"1": 20.0, "2": 20.0, "3": 32.0, "4": 35.0, "5": 12.0}
+
+def _check_kokoro(text):
+    # Kokoro TTS on --fpga prints "[fpga] Section N ... SNR vs CPU: X dB" lines per
+    # ported section (1-5d) and finally "Wrote N.NNs of audio".
+    if not re.search(r"Wrote [\d.]+s of audio", text):
+        return False, "no audio written (run did not finish)"
+    sections = re.findall(r"\[fpga\] Section (\d)[^\n]*?SNR[^\n]*?:\s*(-?[\d.]+|nan|inf|-inf) dB", text)
+    if not sections:
+        return False, "no per-section SNR lines found"
+    bad = []
+    for sec, val in sections:
+        try:
+            v = float(val)
+        except ValueError:
+            v = float("nan")
+        floor = _KOKORO_SNR_FLOORS.get(sec, 20.0)
+        if not (v == v) or v < floor:
+            bad.append(f"S{sec}={val}dB(<{floor:.0f})")
+    if bad:
+        return False, "section SNR below floor: " + ", ".join(bad)
+    lo = min(float(v) for _, v in sections)
+    return True, f"{len(sections)} section SNRs ok (min {lo:.1f} dB), audio written"
+
+
 # Shared algebra prompt: a single-answer math question whose correct result is
 # "x = 2" (checked by _check_x_equals_2). Used for all LM/decoder models below.
 MATH_PROMPT = "If x + 3 = 5, what is x?"
@@ -507,6 +559,14 @@ TESTS = [
     # bins are keyed per engine configuration, so pass 1 compiles + dumps and a later pass
     # on the same runner loads them.
     {"name": "verapulse", "script": "models/verapulse/verapulse_test.py",                "pass_check": _check_verapulse},
+
+    # act (LeRobot ACT): 2 cams + 7-dof -> [chunk, 14] actions, SNR vs CPU reference.
+    # --engines is added by the harness generically. Caches params/programs in act_bin/.
+    {"name": "act",     "script": "models/act/act_test.py",         "pass_check": _check_act},
+    # kokoro (TTS): --fpga runs the ported sections on hardware with per-section SNR
+    # bisects vs the CPU reference (on by default) and writes a wav. Bins cached in
+    # kokoro_bin/ (frozen instruction image), reused on the next pass.
+    {"name": "kokoro",  "script": "models/kokoro/kokoro_test.py",   "pass_check": _check_kokoro, "extra_args": ["--fpga"]},
 
 ]
 
@@ -895,6 +955,8 @@ def write_summary(results: list, output_path: str) -> None:
             f"Test             : {r['name']}",
             f"  Result         : {status}",
             f"  Pass reason    : {r['pass_reason']}",
+            f"  Predecessor    : {r.get('predecessor', '-')}",
+            *([f"  Triage         : {r['triage']}"] if r.get('triage') else []),
             f"  Prefill text   : {r['prefill_text']}",
             f"  Prefill tokens : {r['prefill_tokens']}",
             f"  Decoded tokens : {r['decoded_tokens']}",
@@ -930,6 +992,30 @@ def write_summary(results: list, output_path: str) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def triage_failure(prev: dict | None, test: dict, verbose: bool = False,
+                   dev: str = None, device: str = None) -> str:
+    """Classify a failure of `test` that occurred right after `prev`.
+
+    1. reset, run `test` alone      -> FAIL: the model's own bin-reload path is broken
+    2. reset, run prev then test    -> FAIL: confirmed contamination pair prev->test
+                                       PASS: not reproducible (flaky / HW)
+    Bins are already cached, so each step is a run-from-bin inference.
+    """
+    reset_device(dev or DMA_DEV)
+    alone = run_test(test, verbose=verbose, dev=dev, device=device)
+    if not alone["passed"]:
+        return f"BIN-RELOAD: {test['name']} fails alone after reset ({alone['pass_reason']})"
+    if prev is None:
+        return f"FLAKY: {test['name']} passed alone; no predecessor to replay"
+    reset_device(dev or DMA_DEV)
+    run_test(prev, verbose=verbose, dev=dev, device=device)
+    again = run_test(test, verbose=verbose, dev=dev, device=device)
+    if not again["passed"]:
+        return (f"CONTAMINATION: {prev['name']} -> {test['name']} reproduces "
+                f"({again['pass_reason']}); passes alone")
+    return f"FLAKY: {test['name']} passes alone and after {prev['name']} on replay"
+
+
 def main():
     global DMA_DEV
     import argparse
@@ -948,6 +1034,17 @@ def main():
                     help="DMA device name (e.g., xdma0, xdma1). Used for the harness's "
                          "own reset / DRAM poisoning and forwarded to model scripts "
                          f"that accept --dev. Default: {DMA_DEV} (env DMA_DEV)")
+    ap.add_argument("--shuffle-seed", type=int, default=None, metavar="SEED",
+                    help="Run the selected tests in a seeded random order (pass 2 of the "
+                         "nightly: all bins already cached, so this exercises run-from-bin "
+                         "under a fresh predecessor for every model). The order is printed "
+                         "and reproducible from SEED. Default (unset): registry order.")
+    ap.add_argument("--continue-on-fail", action="store_true",
+                    help="Do not stop on the first failure; run every selected test.")
+    ap.add_argument("--triage", action="store_true",
+                    help="On a failure in the run, re-run the failed model ALONE (after reset) "
+                         "and, if that passes, PREDECESSOR->model again, to classify the "
+                         "failure as bin-reload / contamination-pair / flaky.")
     ap.add_argument("--device", type=str, default=None,
                     help="FPGA board / bitstream profile (kintex7, rk, puzhi, bittware, "
                          "bittware_256, alveo): affects UE_AXI_DATA_WIDTH_BITS and default "
@@ -987,6 +1084,16 @@ def main():
         if hoisted:
             print(f"[order] hoisted to front: {' '.join(t['name'] for t in hoisted)}")
 
+    # --shuffle-seed: seeded random order. Cross-model NaN/corruption bugs are almost
+    # always leftover state from the PREDECESSOR (DRAM/URAM/flag leakage), so the unit
+    # of failure is the ordered pair (prev -> model). One shuffle per night with a
+    # date-derived seed covers a new set of adjacent pairs every run at zero extra cost.
+    if args.shuffle_seed is not None:
+        import random
+        random.Random(args.shuffle_seed).shuffle(tests)
+        print(f"[order] shuffled with seed {args.shuffle_seed}: "
+              f"{' '.join(t['name'] for t in tests)}")
+
     # Most models rely on the harness's release-image initialization. Models
     # that support multiple installed builds validate and reset their selected
     # engines themselves; constructing the generic engine first would reject a
@@ -1001,15 +1108,26 @@ def main():
         )
 
     try:
+        prev = None
         for test in tests:
             result = run_test(test, verbose=args.verbose,
                               dev=args.dev, device=args.device)
+            result["predecessor"] = prev["name"] if prev else "-"
             results.append(result)
             status = (
                 "SKIP" if result.get("skipped")
                 else ("PASS" if result["passed"] else "FAIL")
             )
-            print(f"\n>>> {test['name']}: {status} — {result['pass_reason']}\n")
+            print(f"\n>>> {test['name']}: {status} — {result['pass_reason']}"
+                  f"  (after {result['predecessor']})\n")
+            if not result["passed"] and args.triage:
+                result["triage"] = triage_failure(prev, test, verbose=args.verbose,
+                                                  dev=args.dev, device=args.device)
+                print(f">>> triage {test['name']}: {result['triage']}\n")
+            if not result.get("skipped"):
+                prev = test
+            if not result["passed"] and args.continue_on_fail:
+                continue
             if not result["passed"]:
                 if not args.verbose and result.get("stdout"):
                     print(f"{'='*60}")
