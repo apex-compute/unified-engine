@@ -8021,11 +8021,13 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
         self._vis_weight_sets = []
         rec = self._manifest.get("vis_weight_copies")
         if rec is None:
-            if max(_configured_engines(self).values()) > 1:
-                raise RuntimeError(
-                    f"bin set {self._bin_stem} predates the `vis_weight_copies` record: its "
-                    f"worker arenas were placed after tensor-DRAM weight copies this replay "
-                    f"cannot reproduce. Regenerate the bins (--clean).")
+            # Bin set dumped before the record existed. That is only a problem if the
+            # compile run put weight copies in TENSOR DRAM (8 engines does; 2 engines
+            # fits its one copy in params, which params.bin already holds). Replay the
+            # old way; if copies did move the arenas, _restore_schedulers finds every
+            # per-engine address shifted and refuses with a regenerate message.
+            _original_print(f"    [vis] bin set {self._bin_stem} has no vis_weight_copies record "
+                            f"(older dump) -- assuming no tensor-DRAM weight copies")
             return
         here = int(self._tensor_dram_addr)
         if here != rec["tensor_before"]:
@@ -8134,7 +8136,15 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
             if sc is None:
                 continue
             for nm, addrs in st["per_engine"].items():
-                sc.register_per_engine_addrs(nm, [int(a) for a in addrs])
+                try:
+                    sc.register_per_engine_addrs(nm, [int(a) for a in addrs])
+                except AssertionError as ex:
+                    raise RuntimeError(
+                        f"bin set {self._bin_stem}: per-engine buffer {nm!r} was dumped at "
+                        f"{[hex(int(a)) for a in addrs]} but this replay placed it elsewhere "
+                        f"-- the tensor/arena layout changed since the bins were compiled "
+                        f"(e.g. an older dump with tensor-DRAM vision weight copies). "
+                        f"Regenerate the bins (--clean).") from ex
             for nm, addrs in st["col_outputs"].items():
                 # alloc_col_output both allocates and records; there is no public
                 # re-register hook, and the registry is a plain {name: [addr]} map.
