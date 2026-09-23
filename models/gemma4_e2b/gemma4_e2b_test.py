@@ -53,6 +53,7 @@ from user_dma_core import UE_MODE
 from multi_engine_shard import (MULTICORE_WINDOW_BYTES, MultiEngineScheduler,
                                 PrivateArena, multicore_arena_bytes,
                                 require_multicore_dram, tiled_window_bases)
+import gemma4_e2b_model_flops as _model_flops
 
 # ANY multi-core Gemma4 E2B run owns the full 8 GB map as two non-overlapping
 # arenas:
@@ -1666,6 +1667,71 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         return (token_cnt_decoded, latency_hw_prefill, latency_hw_decoder,
                 flop_rate_hw_decoder, latency_prefill, latency_decoder)
 
+    # Model-FLOP counters. Each converts what a stage actually ran into the
+    # logical shape gemma4_e2b_model_flops prices, and returns None rather
+    # than raising if a stage did not record what it needs -- a summary must
+    # never be the reason a completed run fails to write.
+
+    def _model_flops_vision(self) -> float | None:
+        try:
+            return float(_model_flops.vision_flops(
+                num_patches=int(self._vis_num_patches),
+                soft_tokens=int(self._vis_num_soft_tokens),
+            ))
+        except Exception:
+            return None
+
+    def _model_flops_prefill(self) -> float | None:
+        # self.seq_len is NOT a safe fallback here: it is live, mutable state
+        # that run_gemma4_profile's decode-position probing (_prepare_decode_
+        # position) overwrites to test positions like 1023 -- so if this ran
+        # after decode profiling, self.seq_len would be the LAST DECODE
+        # PROBE's position, not the real prefill length, and would silently
+        # price a 1023-token prefill instead of a 272-token one (an earlier
+        # version of this fallback did exactly that: 271.7% of peak, an
+        # impossible number that was the only reason it got caught). Require
+        # the dedicated attribute, which both run_gemma4 (after a straight
+        # run) and run_gemma4_profile (right after run_prefill, before any
+        # decode probing) set explicitly and stably.
+        seq_len = getattr(self, "_prefill_seq_len", None)
+        if seq_len is None:
+            return None
+        try:
+            return float(_model_flops.prefill_flops(self._cfg, int(seq_len)))
+        except Exception:
+            return None
+
+    def _model_flops_decode(self, generated: int, final_seq_len: int) -> float | None:
+        # Step i attended the KV history it actually had: the run ends at
+        # final_seq_len and every step advanced it by one.
+        try:
+            end = int(final_seq_len)
+            n = int(generated)
+            contexts = range(end - n, end)
+            return float(_model_flops.decode_flops(self._cfg, contexts))
+        except Exception:
+            return None
+
+    def _model_flops_vision_by_phase(self) -> dict[str, int] | None:
+        try:
+            return _model_flops.vision_flops_by_phase(
+                num_patches=int(self._vis_num_patches),
+                soft_tokens=int(self._vis_num_soft_tokens),
+            )
+        except Exception:
+            return None
+
+    def _model_flops_prefill_by_phase(self) -> dict[str, int] | None:
+        # See _model_flops_prefill's comment: self.seq_len is not a safe
+        # fallback for the same reason it is not one there.
+        seq_len = getattr(self, "_prefill_seq_len", None)
+        if seq_len is None:
+            return None
+        try:
+            return _model_flops.prefill_flops_by_phase(self._cfg, int(seq_len))
+        except Exception:
+            return None
+
     def write_run_summary(self, out_path: str, args) -> str:
         """Write a per-run Markdown summary (weights/program sizes, per-stage HW
         latency + FLOPS, decode throughput, and the prompt/decoded text) built
@@ -1783,10 +1849,18 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             else:
                 lines.append(f"- **Vision FPGA run time (HW latency):** n/a (host vision)")
             if vis_gflops is not None:
-                lines.append(f"- **Vision reported FLOPS:** {vis_gflops:.1f} GFLOPS")
-                lines.append(f"- **Vision utilization (% peak):** {_util(vis_gflops)}")
+                lines.append(f"- **Vision reported FLOPS (issued):** {vis_gflops:.1f} GFLOPS")
+                lines.append(f"- **Vision utilization (% peak, issued):** {_util(vis_gflops)}")
             else:
                 lines.append(f"- **Vision reported FLOPS:** n/a (host vision)")
+            vis_model = self._model_flops_vision() if is_image else None
+            if vis_model is not None and vis_lat_us:
+                vis_model_gflops = vis_model / (vis_lat_us * 1e3)
+                lines.append(f"- **Vision model FLOPS (effective):** {vis_model_gflops:.1f} GFLOPS")
+                lines.append(f"- **Vision utilization (% peak, effective):** {_util(vis_model_gflops)}")
+                if vis_gflops:
+                    lines.append(f"- **Vision useful (model/issued):** "
+                                 f"{100.0 * vis_model_gflops / vis_gflops:.1f}%")
             _vis_e2e = getattr(self, "_vis_e2e_s", None)
             lines.append(f"- **Vision end-to-end (CPU timer):** "
                          f"{_vis_e2e:.1f} s" if _vis_e2e is not None else
@@ -1805,8 +1879,16 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             lines.append(f"- **Prefill FPGA run time (HW latency):** {pf_lat_us / 1e3:.1f} ms "
                          f"({pf_lat_us:.1f} us)")
         if pf_gflops is not None:
-            lines.append(f"- **Prefill reported FLOPS:** {pf_gflops:.1f} GFLOPS")
-            lines.append(f"- **Prefill utilization (% peak):** {_util(pf_gflops)}")
+            lines.append(f"- **Prefill reported FLOPS (issued):** {pf_gflops:.1f} GFLOPS")
+            lines.append(f"- **Prefill utilization (% peak, issued):** {_util(pf_gflops)}")
+        pf_model = self._model_flops_prefill() if pf_seq is not None else None
+        if pf_model is not None and pf_lat_us:
+            pf_model_gflops = pf_model / (pf_lat_us * 1e3)
+            lines.append(f"- **Prefill model FLOPS (effective):** {pf_model_gflops:.1f} GFLOPS")
+            lines.append(f"- **Prefill utilization (% peak, effective):** {_util(pf_model_gflops)}")
+            if pf_gflops:
+                lines.append(f"- **Prefill useful (model/issued):** "
+                             f"{100.0 * pf_model_gflops / pf_gflops:.1f}%")
         if pf_e2e is not None:
             lines.append(f"- **Prefill end-to-end (CPU timer):** {pf_e2e:.1f} s")
         # TTFT ends when prefill has produced the first decode-ready state.  In
@@ -1843,8 +1925,23 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         if peak_toks is not None:
             lines.append(f"- **First-token speed (peak, HW counter):** {peak_toks:.1f} tok/s")
         if avg_gflops is not None:
-            lines.append(f"- **Average FLOPS:** {avg_gflops:.1f} GFLOPS")
-            lines.append(f"- **Decode utilization (% peak):** {_util(avg_gflops)}")
+            lines.append(f"- **Average FLOPS (issued, mean of per-step rates):** "
+                         f"{avg_gflops:.1f} GFLOPS")
+            lines.append(f"- **Decode utilization (% peak, issued):** {_util(avg_gflops)}")
+        dec_model = (self._model_flops_decode(gen_n, total_tok)
+                    if gen_n else None)
+        dec_hw_us = getattr(self, "_decode_hw_latency_us", None)
+        if dec_model is not None and dec_hw_us:
+            # Total model FLOP over total HW time -- NOT the same basis as
+            # "Average FLOPS" above (a mean of per-step issued rates), so this
+            # is reported as its own number rather than a "useful %" of it;
+            # dividing the two would compare a mean-of-rates against a
+            # total-over-total and mean something other than useful work.
+            dec_model_gflops = dec_model / (dec_hw_us * 1e3)
+            lines.append(f"- **Decode model FLOPS (effective, total/total):** "
+                         f"{dec_model_gflops:.1f} GFLOPS")
+            lines.append(f"- **Decode utilization (% peak, effective):** "
+                         f"{_util(dec_model_gflops)}")
         if dec_e2e is not None:
             lines.append(f"- **Decode end-to-end (CPU timer):** {dec_e2e:.1f} s")
         if avg_toks is not None:
@@ -1942,23 +2039,52 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "",
         ])
 
-        def _append_profile_section(title: str, results, level: int = 2) -> None:
+        def _append_profile_section(title: str, results, level: int = 2,
+                                    model_phases: dict[str, int] | None = None) -> None:
+            """``model_phases`` keys must match _aggregate_profile_results's
+            phase names exactly (the "L<idx>_" prefix stripped) -- e.g.
+            "attention", "mlp", "o_proj" -- which is what
+            gemma4_e2b_model_flops.py's *_by_phase functions are built to
+            produce, read from the SAME compiled-program checkpoint names.
+            """
             lines.extend([f"{'#' * level} {title}", ""])
             if not results:
                 lines.extend(["Profile data unavailable.", ""])
                 return
             rows = self._aggregate_profile_results(results)
-            lines.extend([
-                "| Phase | Work (GFLOPs) | FPGA execution time (ms) | Throughput (GFLOPS) | Utilization (% peak) | Samples |",
-                "|---|---:|---:|---:|---:|---:|",
-            ])
+            has_model = bool(model_phases)
+            header = ["Phase", "Work (GFLOPs)"]
+            if has_model:
+                header += ["Model (GFLOPs)", "Useful %"]
+            header += ["FPGA execution time (ms)", "Throughput (GFLOPS)",
+                      "Utilization (% peak)", "Samples"]
+            lines.append("| " + " | ".join(header) + " |")
+            lines.append("|" + "|".join(
+                ":--" if h == "Phase" else "--:" for h in header) + "|")
+            model_total = 0
             for row in rows:
                 work_gflops = (f"{row['flops'] / 1e9:.2f}"
                                if row["flops"] is not None else "n/a")
                 gflops = f"{row['gflops']:.1f}" if row["gflops"] is not None else "n/a"
                 util = f"{row['util_pct']:.1f}%" if row["util_pct"] is not None else "n/a"
-                lines.append(f"| {row['phase']} | {work_gflops} | {row['ms']:.1f} | "
-                             f"{gflops} | {util} | {row['n']} |")
+                cells = [row["phase"], work_gflops]
+                if has_model:
+                    # A phase this module prices at 0 by convention (rope,
+                    # permute, q_permute) prints 0.00/0.0% -- a real,
+                    # meaningful "this is all overhead by definition" value,
+                    # not the SAME as a phase key genuinely absent from the
+                    # dict (which would be a real bug in the mapping).
+                    phase_model = model_phases.get(row["phase"])
+                    if phase_model is None:
+                        cells += ["n/a", "n/a"]
+                    else:
+                        model_total += phase_model
+                        model_gflop = phase_model / 1e9
+                        useful = (100.0 * phase_model / row["flops"]
+                                 if row["flops"] else 0.0)
+                        cells += [f"{model_gflop:.2f}", f"{useful:.1f}%"]
+                cells += [f"{row['ms']:.1f}", gflops, util, str(row["n"])]
+                lines.append("| " + " | ".join(cells) + " |")
             total_ms = sum(row["ms"] for row in rows)
             known_flops = [row["flops"] for row in rows if row["flops"] is not None]
             total_flops = sum(known_flops) if len(known_flops) == len(rows) else None
@@ -1966,23 +2092,46 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                           if total_flops is not None and total_ms else None)
             total_util = (100.0 * total_rate / peak_gflops
                           if total_rate is not None and peak_gflops else None)
-            lines.append(
-                f"| **TOTAL** | **{f'{total_flops / 1e9:.1f}' if total_flops is not None else 'n/a'}** | "
-                f"**{total_ms:.1f}** | **{f'{total_rate:.1f}' if total_rate is not None else 'n/a'}** | "
-                f"**{f'{total_util:.1f}%' if total_util is not None else 'n/a'}** | |")
+            total_cells = [
+                "**TOTAL**",
+                f"**{f'{total_flops / 1e9:.1f}' if total_flops is not None else 'n/a'}**",
+            ]
+            if has_model:
+                total_useful = (100.0 * model_total / total_flops
+                                if total_flops else 0.0)
+                total_cells += [f"**{model_total / 1e9:.2f}**",
+                                f"**{total_useful:.1f}%**"]
+            total_cells += [
+                f"**{total_ms:.1f}**",
+                f"**{f'{total_rate:.1f}' if total_rate is not None else 'n/a'}**",
+                f"**{f'{total_util:.1f}%' if total_util is not None else 'n/a'}**",
+                "",
+            ]
+            lines.append("| " + " | ".join(total_cells) + " |")
             lines.append("")
 
-        _append_profile_section("Vision", getattr(self, "_vision_profile_results", None))
-        _append_profile_section("Prefill", getattr(self, "_prefill_profile_results", None))
+        _append_profile_section(
+            "Vision", getattr(self, "_vision_profile_results", None),
+            model_phases=(self._model_flops_vision_by_phase()
+                         if getattr(args, "image", None) else None))
+        _append_profile_section(
+            "Prefill", getattr(self, "_prefill_profile_results", None),
+            model_phases=self._model_flops_prefill_by_phase())
         lines.extend(["## Decode", ""])
         first_pos = getattr(self, "_decode_first_profile_position", "n/a")
+        first_model = (_model_flops.decode_step_flops_by_phase(self._cfg, int(first_pos))
+                       if isinstance(first_pos, int) else None)
         _append_profile_section(
             f"First decode step (position {first_pos})",
-            getattr(self, "_decode_profile_results", None), level=3)
+            getattr(self, "_decode_profile_results", None), level=3,
+            model_phases=first_model)
         target_pos = getattr(self, "_decode_1024_profile_position", 1023)
+        target_model = (_model_flops.decode_step_flops_by_phase(self._cfg, int(target_pos))
+                        if isinstance(target_pos, int) else None)
         _append_profile_section(
             f"1024th token (position {target_pos})",
-            getattr(self, "_decode_1024_profile_results", None), level=3)
+            getattr(self, "_decode_1024_profile_results", None), level=3,
+            model_phases=target_model)
 
         with open(out_path, "w") as f:
             f.write("\n".join(lines))
@@ -2188,6 +2337,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             prefill_program_addr, flops=meta["prefill_total_flops"],
             profile_checkpoints=prefill_checkpoints)
         self._prefill_profile_results = prefill_results
+        # Captured HERE, before _prepare_decode_position below can overwrite
+        # self.seq_len with a decode probe position -- see the long comment
+        # on _model_flops_prefill for why that ordering matters.
+        self._prefill_seq_len = self.seq_len
         self._print_phase_breakdown("PREFILL", prefill_results, per_token=False)
 
         # Multi-core decode: upload the workers' decode images from the PROFILE

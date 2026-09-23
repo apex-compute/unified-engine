@@ -707,12 +707,20 @@ class Gemma4VisionMixin:
                 head_stride = aligned_S * HD * bpe
                 for h in range(NH):
                     base = h * head_stride
+                    # batch is the QUERY row count and has no alignment
+                    # requirement of its own -- unified_attention_core_legacy
+                    # only asserts batch <= aligned_seq_len and that
+                    # aligned_seq_len (the K/V plane length) is vector-
+                    # aligned. Using the real S here (not aligned_S) skips
+                    # computing (aligned_S - S) padding-query rows that are
+                    # never read downstream (bf16_permute_dram_core right
+                    # after this only extracts S real rows per head).
                     batch_reg = self.alloc_isa_reg()
-                    self.generate_instruction_add_set(batch_reg, aligned_S)
+                    self.generate_instruction_add_set(batch_reg, S)
                     aligned_seq_reg = self.alloc_isa_reg()
                     self.generate_instruction_add_set(aligned_seq_reg, aligned_S)
                     flops = self.unified_attention_core(
-                        batch=aligned_S, aligned_seq_len=aligned_S, head_dim=HD,
+                        batch=S, aligned_seq_len=aligned_S, head_dim=HD,
                         Q_DRAM_ADDR=self.VIS_FLASH_Q_HM + base, K_DRAM_ADDR=self.VIS_FLASH_K_HM + base,
                         V_DRAM_ADDR=self.VIS_FLASH_V_HM + base, BIAS_DRAM_ADDR=self.VIS_FLASH_BIAS,
                         OUTPUT_DRAM_ADDR=self.VIS_FLASH_OUT_HM + base,
@@ -728,12 +736,20 @@ class Gemma4VisionMixin:
                 attn_flops = [0]
                 def _vision_attention_kernel(ue, head_dim, seq_len, **kwargs):
                     kwargs.pop("num_q_heads", None)  # vision is MHA: one call/head
+                    # seq_len here is aligned_S (what head_sharded_attention's
+                    # own SRAM-row assertion needs, since it sizes the K/V
+                    # plane), but batch -- the query row count -- has no such
+                    # requirement (unified_attention_core_dynamic asserts only
+                    # batch <= aligned_seq_len and aligned_seq_len's own vector
+                    # alignment; scratch offsets depend on aligned_seq_len,
+                    # never on batch). S is the real, unpadded patch count,
+                    # in closure scope from the enclosing compile function.
                     batch_reg = ue.alloc_isa_reg()
-                    ue.generate_instruction_add_set(batch_reg, seq_len)
+                    ue.generate_instruction_add_set(batch_reg, S)
                     aligned_seq_reg = ue.alloc_isa_reg()
                     ue.generate_instruction_add_set(aligned_seq_reg, seq_len)
                     flops = ue.unified_attention_core(
-                        batch=seq_len, aligned_seq_len=seq_len, head_dim=head_dim,
+                        batch=S, aligned_seq_len=seq_len, head_dim=head_dim,
                         gpr_batch_reg=batch_reg,
                         gpr_aligned_seq_len_reg=aligned_seq_reg,
                         q_scale=1.0, **kwargs)

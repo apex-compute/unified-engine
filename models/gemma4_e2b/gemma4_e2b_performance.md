@@ -26,9 +26,9 @@ python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image -
 | DRAM read speed (MB/s) | 10,802.2 | **86,128.9** | 7.97× |
 | **Vision** |
 | Vision soft tokens | 256 | 256 | |
-| Vision throughput (GFLOPS) | 39.5 | **242.8** | 6.15× |
-| — utilization (% peak) | 84.1% | 64.7% | |
-| Vision FPGA execution (s) | 29.1 | **4.7** | 6.15× |
+| Vision throughput (GFLOPS) | 39.5 | **244.5** | 6.19× |
+| — utilization (% peak) | 84.1% | 65.1% | |
+| Vision FPGA execution (s) | 29.1 | **4.7** | 6.19× |
 | Vision end-to-end (CPU) (s) | 29.2 | **4.8** | 6.08× |
 | **LM PREFILL** |
 | LM prefill seq length | 272 | 272 | |
@@ -64,15 +64,32 @@ python models/gemma4_e2b/gemma4_e2b_test.py --device alveo --dev xdma0 --image -
 | proj † | 147.15 | 16 | 3,610.0 | 40.8 | 86.9% | 473.7 | 310.6 | 82.7% |
 | rope † | 8.24 | 16 | 575.1 | 14.3 | 30.5% | 249.8 | 33.0 | 8.8% |
 | permute | 0.00 | 16 | 183.1 | 0.0 | 0.0% | 183.1 | 0.0 | 0.0% |
-| attention † | 329.70 | 16 | 9,052.0 | 36.4 | 77.6% | 1,664.4 | 198.1 | 52.8% |
+| attention †‡ | 329.70 | 16 | 9,052.0 | 36.4 | 77.6% | 1,567.7 | 207.0 | 55.1% |
 | post_attn † | 659.51 | 16 | 15,591.2 | 42.3 | 90.1% | 2,057.6 | 320.5 | 85.4% |
 | pooler_tail | 1.51 | 1 | 40.7 | 37.1 | 79.1% | 40.7 | 37.1 | 9.9% |
-| **TOTAL** | **1149.1** | | **29,119.0** | **39.5** | **84.1%** | **4,736.2** | **242.6** | **64.6%** |
+| **TOTAL** | **1149.1** | | **29,119.0** | **39.5** | **84.1%** | **4,668.8** | **245.0** | **65.3%** |
 
 † Sharded: `proj`, `post_attn` and `rope` are row-sharded, `attention` is
 head-sharded. `patch_embed`, `permute` and `pooler_tail` run on core 0 only — their
 times are identical in both columns, and their 8-core `% peak` is scored against the
 full 375.5 GFLOPS, which is why it collapses.
+
+‡ **8-core `attention` and TOTAL updated after fixing a real overshoot**:
+`unified_attention_core` was called with `batch=aligned_S` (2560) instead of
+the real patch count `S` (2520) -- padding the QUERY row count for no reason,
+since only the K/V side (`aligned_seq_len`) needs 64-row alignment; `batch`
+has no such requirement (confirmed from the kernel's own assertions, not
+assumed). Fixed in `gemma4_e2b_vision.py`. Verified on hardware: decoded
+output is byte-identical to the pre-fix baseline (same image, same
+description). This closes ~1.6% of `attention`'s issued FLOPs (its useful-
+work ratio there rises from 94.7% to 96.2%), which is why the 8-core Work
+column above (329.70) is now slightly stale for `attention`/TOTAL --
+re-verified `attention` issued work is 324.55 GFLOP, TOTAL 1143.9 GFLOP.
+**These two 8-core cells (and the 8-core Vision row in the comparison table
+above) were re-measured on HW version `0x4c560dd6`, not this document's
+stated `0x6e7aca2e`** -- the fix is board-independent (a Python-side kernel
+argument, not an RTL change), but the 1-core column was not re-run this
+session and still reflects the pre-fix, `0x6e7aca2e` baseline.
 
 ## Profile: LM prefill
 
