@@ -1,0 +1,12 @@
+# Kokoro TTS host-side deps (linguistic front-end + weight download + wav out).
+# NOT model weights: kokoro_test.py downloads hexgrad/Kokoro-82M into kokoro_bin/ itself.
+#
+# Install into the HW env on a fresh runner:
+#   pip install -r models/kokoro/kokoro_requirements.txt
+#   sudo apt-get -y install espeak-ng      # system binary, for the OOD-word fallback
+#
+# Versions are the ones validated on the CI runner (p620) 2026-09-21.
+kokoro==0.9.4
+misaki==0.9.4          # phonemizer front-end; pulled in by kokoro, pinned here so it matches
+soundfile
+huggingface_hub

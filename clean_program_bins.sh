@@ -150,8 +150,13 @@ del models/parakeet/parakeet_bin/programs*.json
 # Pi05Libero_Run only checks structural offsets (seq_len, denoise_steps, DRAM
 # bases), so a code change that alters program CONTENT without moving an offset
 # would otherwise be silently replayed from a stale bin.
+# Bins are keyed per engine configuration (programs_e{engines}_{p}_{d}.*); the
+# legacy unsuffixed programs.* name is kept for old bin dirs. Mirrors the
+# programs_e* glob in pi05_test.py clean_bins() (which additionally drops params).
 del models/pi05/pi05_bin/programs.bin
 del models/pi05/pi05_bin/programs.json
+del models/pi05/pi05_bin/programs_e*.bin
+del models/pi05/pi05_bin/programs_e*.json
 
 # --- qwen2.5_vl_3b: keep params.* ; drop programs ---------------------------
 del models/qwen2.5_vl_3b/qwen2.5_vl_3b_bin/programs.bin
