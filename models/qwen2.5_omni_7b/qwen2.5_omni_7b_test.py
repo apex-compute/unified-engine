@@ -1655,18 +1655,68 @@ class Qwen25OmniUnifiedEngine(
         except Exception:
             return None
 
+    def _model_flops_vision_by_phase(self, dims: dict) -> dict[str, int] | None:
+        try:
+            return _model_flops.vision_flops_by_phase(
+                self._cfg,
+                patches=int(dims["VS"]),
+                merged_tokens=int(dims["NUM_MERGED_TOKENS"]),
+            )
+        except Exception:
+            return None
+
+    def _model_flops_prefill_by_phase(self) -> dict[str, int] | None:
+        try:
+            return _model_flops.prefill_flops_by_phase(
+                self._cfg, int(self._prefill_seq_len_run))
+        except Exception:
+            return None
+
     def _stage_table(self, rows: list[dict]) -> list[str]:
-        """Headline table: work, time, throughput, % of peak, core scaling."""
+        """Headline table: work, time, throughput, % of peak, core scaling,
+        and the model's effective throughput against the same measured time.
+
+        `Work`/`Throughput`/`% of peak` are what this engine ISSUED, at the
+        padded and tile-aligned shapes the hardware ran: a 64-row execution
+        multiple for a short prompt, windowed attention widened to a full
+        mask, an aligned head. `Model GFLOP`/`Effective GFLOPS` are what the
+        architecture owes at its own dimensions -- true prompt length, true
+        attention windows, matrix products only -- divided by the SAME
+        measured FPGA time, so `Effective GFLOPS` is comparable to any other
+        implementation of this model on any hardware. `Useful` is how much
+        of the issued work the model needed; `n/a` where a stage's model
+        FLOPs could not be priced, not a misleading 0.
+        """
         cores = getattr(self, "multi_core", 1) or 1
         out = [
-            "| Stage | Shape | Work (GFLOP) | FPGA time (ms) | Throughput "
-            "(GFLOPS) | % of peak | x 1-engine peak | CPU wall (s) |",
-            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Stage | Shape | Work (GFLOP) | Model GFLOP | Useful | FPGA "
+            "time (ms) | Throughput (GFLOPS) | Effective GFLOPS | % of peak "
+            "| x 1-engine peak | CPU wall (s) |",
+            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+            "| ---: | ---: |",
         ]
+        suspect = False
         for row in rows:
+            model = row.get("model_flops")
+            if model:
+                # Above 100% the engine billed FEWER FLOPs than the
+                # architecture requires, which cannot happen: padding and
+                # alignment only ever ADD work. It means that stage's own
+                # accounting is undercounting what it issued, so flag it
+                # rather than printing it deadpan.
+                mark = ""
+                if row["useful_pct"] > 100.5:
+                    mark = " !"
+                    suspect = True
+                model_s = f"{model / 1e9:.2f}"
+                useful_s = f"{row['useful_pct']:.1f}%"
+                eff_s = f"{row['model_gflops']:.1f}"
+            else:
+                mark, model_s, useful_s, eff_s = "", "n/a", "n/a", "n/a"
             out.append(
-                f"| {row['stage']} | {row['detail']} | {row['flops'] / 1e9:.2f} | "
-                f"{row['us'] / 1e3:.1f} | {row['gflops']:.1f} | "
+                f"| {row['stage']}{mark} | {row['detail']} | "
+                f"{row['flops'] / 1e9:.2f} | {model_s} | {useful_s} | "
+                f"{row['us'] / 1e3:.1f} | {row['gflops']:.1f} | {eff_s} | "
                 f"{row['util_pct']:.1f}% | {row['speedup']:.2f}x | "
                 f"{row['wall']:.2f} |"
             )
@@ -1676,81 +1726,33 @@ class Qwen25OmniUnifiedEngine(
         peak = self.vis_peak_gflops()
         core_peak = self.per_core_peak_gflops()
         total_gflops = total_flops / (total_us * 1e3) if total_us else 0.0
+        priced = [row for row in rows if row.get("model_flops")]
+        if priced and len(priced) == len(rows):
+            model_total = sum(row["model_flops"] for row in priced)
+            total_useful_s = (
+                f"{(100.0 * model_total / total_flops if total_flops else 0.0):.1f}%"
+            )
+            total_model_s = f"{model_total / 1e9:.2f}"
+            total_eff_s = f"{(model_total / (total_us * 1e3) if total_us else 0.0):.1f}"
+        else:
+            total_model_s = total_useful_s = total_eff_s = "n/a"
         out.append(
             f"| **TOTAL** | {cores} engines | **{total_flops / 1e9:.2f}** | "
+            f"**{total_model_s}** | **{total_useful_s}** | "
             f"**{total_us / 1e3:.1f}** | **{total_gflops:.1f}** | "
+            f"**{total_eff_s}** | "
             f"**{(100.0 * total_gflops / peak if peak else 0.0):.1f}%** | "
             f"**{(total_gflops / core_peak if core_peak else 0.0):.2f}x** | "
             f"**{total_wall:.2f}** |"
         )
-        return out
-
-    def _effective_table(self, rows: list[dict]) -> list[str]:
-        """Throughput measured against the MODEL's work, not the engine's.
-
-        Every stage bills the FLOPs it issued, at the padded and tile-aligned
-        shapes the hardware ran: a 64-row execution multiple for a 31-token
-        prompt, windowed attention widened to a full mask, an aligned head.
-        Dividing the architecture's own FLOP count by the same measured time
-        gives the effective rate -- useful work per second -- which is what
-        compares across implementations and accelerators.  ``Useful`` is the
-        ratio: how much of what the engine issued the model actually needed.
-        """
-        priced = [row for row in rows if row.get("model_flops")]
-        if not priced:
-            return []
-        peak = self.vis_peak_gflops()
-        out = [
-            "## Effective throughput (model FLOPs)",
-            "",
-            "`Model GFLOP` is what the architecture owes at its own "
-            "dimensions -- true prompt length, true attention windows, matrix "
-            "products only. `Issued GFLOP` is what this engine billed at the "
-            "shapes it actually ran. `Effective GFLOPS` divides the first by "
-            "the measured FPGA time, so it is comparable to any other "
-            "implementation of this model on any hardware; `Useful` is how "
-            "much of the issued work the model needed.",
-            "",
-            "| Stage | Model GFLOP | Issued GFLOP | Useful | FPGA time (ms) | "
-            "Effective GFLOPS | % of peak |",
-            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
-        ]
-        suspect = False
-        for row in priced:
-            # Above 100% the engine billed FEWER FLOPs than the architecture
-            # requires, which cannot happen: padding and alignment only ever
-            # ADD work.  It means that stage's own accounting is undercounting
-            # what it issued, so flag it rather than printing it deadpan.
-            mark = ""
-            if row["useful_pct"] > 100.5:
-                mark = " !"
-                suspect = True
-            out.append(
-                f"| {row['stage']}{mark} | {row['model_flops'] / 1e9:.2f} | "
-                f"{row['flops'] / 1e9:.2f} | {row['useful_pct']:.1f}% | "
-                f"{row['us'] / 1e3:.1f} | {row['model_gflops']:.1f} | "
-                f"{row['model_util_pct']:.1f}% |"
-            )
-        model_total = sum(row["model_flops"] for row in priced)
-        issued_total = sum(row["flops"] for row in priced)
-        us_total = sum(row["us"] for row in priced)
-        rate = model_total / (us_total * 1e3) if us_total else 0.0
-        out.append(
-            f"| **TOTAL** | **{model_total / 1e9:.2f}** | "
-            f"**{issued_total / 1e9:.2f}** | "
-            f"**{(100.0 * model_total / issued_total if issued_total else 0.0):.1f}%** | "
-            f"**{us_total / 1e3:.1f}** | **{rate:.1f}** | "
-            f"**{(100.0 * rate / peak if peak else 0.0):.1f}%** |"
-        )
-        out.append("")
         if suspect:
             out += [
-                "`!` marks a stage whose issued FLOPs came out BELOW the "
-                "model's requirement. Padding and alignment can only add work, "
-                "so that stage's own FLOP accounting is undercounting what it "
-                "issued -- treat its `% of peak` in the stage summary above as "
-                "understated, and the effective rate here as the reliable one.",
                 "",
+                "`!` marks a stage whose issued FLOPs came out BELOW the "
+                "model's requirement. Padding and alignment can only add "
+                "work, so that stage's own FLOP accounting is undercounting "
+                "what it issued -- treat its `% of peak` as understated, and "
+                "`Effective GFLOPS` as the reliable rate.",
             ]
         return out
 
@@ -1760,10 +1762,24 @@ class Qwen25OmniUnifiedEngine(
         Aggregation, the serial-phase peak guard and the column set are shared
         with the terminal breakdown (print_profile_table), so the .md and the
         console can never disagree about a phase.
+
+        ``stages`` entries are ``(title, note, results, model_phases)``.
+        ``model_phases`` (a dict, or None) keys must match
+        ``_aggregate_vis_profile``'s phase names exactly -- the checkpoint
+        name after its "L<idx>:" prefix is stripped, e.g. "attention",
+        "qkv_proj" -- which is what qwen2.5_omni_7b_model_flops.py's
+        ``*_by_phase`` functions are built to produce, read from the same
+        compiled-program checkpoint names. Model GFLOP is not a column here
+        (every non-TOTAL row would need it for a fair table, but a phase's
+        model cost is only known at this per-phase granularity when the
+        by-phase function actually separates it, and some, like
+        "o_proj+mlp", are bundled because the real checkpoint bundles them)
+        -- it is a column, matched by phase name, "n/a" where the mapping
+        has no entry for a phase the results actually contain.
         """
         peak = self.vis_peak_gflops()
         out: list[str] = []
-        for title, note, results in stages:
+        for title, note, results, model_phases in stages:
             if not results:
                 continue
             rows = self._aggregate_vis_profile(results)
@@ -1771,24 +1787,57 @@ class Qwen25OmniUnifiedEngine(
             out += [f"### {title}", ""]
             if note:
                 out += [note, ""]
-            out += [
-                "| Phase | Calls | Total ms | Share | GFLOP | GFLOPS | % of peak |",
-                "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
-            ]
-            for name, n, ms, share, gflop, gflops, util in self._vis_profile_table(
-                rows, total
+            has_model = bool(model_phases)
+            header = ["Phase", "Calls", "Total ms", "Share", "GFLOP"]
+            if has_model:
+                header += ["Model GFLOP", "Useful"]
+            header += ["GFLOPS", "Effective GFLOPS" if has_model else None,
+                      "% of peak"]
+            header = [h for h in header if h is not None]
+            out.append("| " + " | ".join(header) + " |")
+            out.append("|" + "|".join(
+                ":--" if h == "Phase" else "--:" for h in header) + "|")
+            model_total = 0
+            for row_, (name, n, ms, share, gflop, gflops, util) in zip(
+                rows, self._vis_profile_table(rows, total)
             ):
-                out.append(
-                    f"| {name} | {n} | {ms:.2f} | {share:.1f}% | {gflop:.2f} | "
-                    f"{gflops:.1f} | {util:.1f}% |"
-                )
+                cells = [name, str(n), f"{ms:.2f}", f"{share:.1f}%",
+                        f"{gflop:.2f}"]
+                if has_model:
+                    phase_model = model_phases.get(row_["phase"])
+                    if phase_model is None:
+                        cells += ["n/a", "n/a"]
+                        eff_s = "n/a"
+                    else:
+                        model_total += phase_model
+                        model_gflop = phase_model / 1e9
+                        flops = row_["flops"]
+                        useful = 100.0 * phase_model / flops if flops else 0.0
+                        eff = model_gflop / (ms / 1e3) if ms else 0.0
+                        cells += [f"{model_gflop:.2f}", f"{useful:.1f}%"]
+                        eff_s = f"{eff:.1f}"
+                    cells += [f"{gflops:.1f}", eff_s]
+                else:
+                    cells += [f"{gflops:.1f}"]
+                cells += [f"{util:.1f}%"]
+                out.append("| " + " | ".join(cells) + " |")
             total_gflop = sum(row["flops"] for row in rows) / 1e9
             total_rate = total_gflop / (total / 1e3) if total else 0.0
-            out.append(
-                f"| **TOTAL** | {len(results)} | **{total:.2f}** | 100.0% | "
-                f"**{total_gflop:.2f}** | **{total_rate:.1f}** | "
-                f"**{(100.0 * total_rate / peak if peak else 0.0):.1f}%** |"
-            )
+            total_cells = ["**TOTAL**", str(len(results)), f"**{total:.2f}**",
+                          "100.0%", f"**{total_gflop:.2f}**"]
+            if has_model:
+                total_flops = sum(row["flops"] for row in rows)
+                total_useful = (100.0 * model_total / total_flops
+                                if total_flops else 0.0)
+                total_eff = model_total / 1e9 / (total / 1e3) if total else 0.0
+                total_cells += [f"**{model_total / 1e9:.2f}**",
+                                f"**{total_useful:.1f}%**"]
+            total_cells += [f"**{total_rate:.1f}**"]
+            if has_model:
+                total_cells += [f"**{total_eff:.1f}**"]
+            total_cells += [
+                f"**{(100.0 * total_rate / peak if peak else 0.0):.1f}%**"]
+            out.append("| " + " | ".join(total_cells) + " |")
             out.append("")
         return out
 
@@ -1819,80 +1868,6 @@ class Qwen25OmniUnifiedEngine(
             )
         return lines
 
-    def _multi_core_lines(self, rows: list[dict], profiles=None) -> list[str]:
-        """How well each stage actually used the engine split.
-
-        ``x 1-engine peak`` is the same measurement as ``% of peak``, just
-        expressed as a speedup, so restating it as an efficiency column would
-        add nothing.  What the table adds is the IMPLIED SERIAL FRACTION: solve
-        Amdahl for s given the achieved speedup S over N engines,
-        ``s = (N/S - 1) / (N - 1)``.  It is an upper bound on the truly serial
-        work, because everything else that costs time -- rendezvous waits, DMA
-        stalls, tiles that do not fill the MAC array -- lands in it too.  A
-        --profile run is what separates those: phases marked ``*`` there are
-        the genuinely engine-0-only ones.
-        """
-        cores = getattr(self, "multi_core", 1) or 1
-        core_peak = self.per_core_peak_gflops()
-        out = [
-            "## Multi-core scaling",
-            "",
-            f"This model requires exactly {REQUIRED_ENGINES} engines, so no "
-            f"1-engine baseline can be measured for comparison.  Speedup is "
-            f"therefore taken against one engine's PEAK "
-            f"({core_peak:.1f} GFLOPS), which makes it a lower bound on the "
-            f"sharding's true benefit: a stage that is inefficient for reasons "
-            f"unrelated to sharding is charged for that here as well.",
-            "",
-            f"| Stage | Throughput (GFLOPS) | x 1-engine peak (max "
-            f"{cores}.00x) | Implied serial fraction |",
-            "| :--- | ---: | ---: | ---: |",
-        ]
-        for row in rows:
-            speedup = row["speedup"]
-            if speedup > 0 and cores > 1:
-                serial = (cores / speedup - 1.0) / (cores - 1)
-                serial_s = f"{100.0 * max(0.0, min(1.0, serial)):.1f}%"
-            else:
-                serial_s = "n/a"
-            out.append(
-                f"| {row['stage']} | {row['gflops']:.1f} | {speedup:.2f}x | "
-                f"{serial_s} |"
-            )
-        out.append("")
-
-        # With profile data the engine-0-only phases can be named outright,
-        # which is the actionable half: those are what sharding has to remove.
-        serial_rows = []
-        for title, _note, results in (profiles or []):
-            if not results:
-                continue
-            aggregated = self._aggregate_vis_profile(results)
-            total_ms = sum(row["ms"] for row in aggregated) or 1.0
-            for row in aggregated:
-                if row.get("serial"):
-                    serial_rows.append(
-                        (title, row["phase"], row["ms"],
-                         100.0 * row["ms"] / total_ms)
-                    )
-        if serial_rows:
-            out += [
-                "Phases that ran on engine 0 alone, and their share of their "
-                "stage's FPGA time:",
-                "",
-                "| Stage | Phase | ms | Share of stage |",
-                "| :--- | :--- | ---: | ---: |",
-            ]
-            for title, phase, ms, share in serial_rows:
-                out.append(f"| {title} | {phase} | {ms:.2f} | {share:.1f}% |")
-            out.append("")
-        elif not profiles:
-            out += [
-                "Run with `--profile` to attribute that serial fraction to "
-                "named phases.",
-                "",
-            ]
-        return out
 
     def write_run_summary(self, out_path: str, args, profiles=None) -> str:
         """Write the per-run Markdown summary and return the path.
@@ -1968,34 +1943,6 @@ class Qwen25OmniUnifiedEngine(
                 f"(IF4 + BF16 V/O, IF8 embedding)"
             )
         lines += self._program_section_lines()
-        layout = self.dram_layout_lines()
-        if layout:
-            # The per-core table is real Markdown; everything else is an aligned
-            # listing that only survives inside a fence. Emit each contiguous run
-            # in the form it needs.
-            lines += ["", "## DRAM layout"]
-            run: list[str] = []
-            run_is_table = False
-
-            def _flush(target=lines):
-                if not run:
-                    return
-                if run_is_table:
-                    target.append("")
-                    target.extend(run)
-                else:
-                    target += ["", "```"] + run + ["```"]
-                run.clear()
-
-            for line in layout:
-                stripped = line.rstrip()
-                is_table = stripped.startswith("|")
-                if is_table != run_is_table:
-                    _flush()
-                    run_is_table = is_table
-                if stripped or not is_table:
-                    run.append(stripped)
-            _flush()
         lines.append("")
 
         rows = self.stage_metrics(args)
@@ -2007,12 +1954,16 @@ class Qwen25OmniUnifiedEngine(
                 "around the same stage. `x 1-engine peak` is the achieved rate "
                 "divided by ONE engine's peak: the effective speedup the "
                 f"{cores}-engine split delivered, against a ceiling of "
-                f"{cores}.00x.",
+                f"{cores}.00x. `Model GFLOP` is what the architecture owes at "
+                "its own dimensions -- true prompt length, true attention "
+                "windows, matrix products only; `Effective GFLOPS` divides it "
+                "by the same measured FPGA time, so it is comparable to any "
+                "other implementation of this model on any hardware; `Useful` "
+                "is how much of the issued work the model needed.",
                 "",
             ]
             lines += self._stage_table(rows)
             lines.append("")
-            lines += self._effective_table(rows)
 
         if getattr(self, "_vis_latency_us", None):
             dims = self._vision_dims()
@@ -2128,9 +2079,6 @@ class Qwen25OmniUnifiedEngine(
                 f"- **End-to-end (CPU timer):** {wall:.2f} s",
                 "",
             ]
-
-        if rows:
-            lines += self._multi_core_lines(rows, profiles)
 
         if profiles:
             lines += [
@@ -3426,6 +3374,10 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         ctx_results, _token, aligned_ctx = ue.run_decode_step_profiled(
             next_token, prof_program, prof_checkpoints, workers=prof_workers
         )
+        # A 4th element, model_phases, is the stage's TRUE (unpadded) work
+        # broken out by the same checkpoint names the profile results use --
+        # computed here, where the right context/dims are in scope, rather
+        # than guessed from the title string inside _profile_tables.
         profiles = []
         if args.image:
             dims = ue._vision_dims()
@@ -3433,18 +3385,22 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
                 "Vision encoder",
                 f"{dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens.",
                 getattr(ue, "_vis_profile", None),
+                ue._model_flops_vision_by_phase(dims),
             ))
         profiles += [
             ("Prefill", f"{len(context)} tokens.",
-             getattr(ue, "_prefill_profile", None)),
+             getattr(ue, "_prefill_profile", None),
+             ue._model_flops_prefill_by_phase()),
             ("Decode - 1st token",
              f"Context {ctx_first} tokens (aligned {aligned_first}).",
-             first_results),
+             first_results,
+             _model_flops.decode_step_flops_by_phase(ue._cfg, ctx_first)),
             ("Decode - at context",
              f"Context {ue.seq_len} tokens (aligned {aligned_ctx}).",
-             ctx_results),
+             ctx_results,
+             _model_flops.decode_step_flops_by_phase(ue._cfg, ue.seq_len)),
         ]
-        for title, note, results in profiles:
+        for title, note, results, _model_phases in profiles:
             if results:
                 ue.print_profile_table(title, results, note=note)
         print(f"\nThinker profile done in {time.perf_counter() - started:.2f}s wall")
