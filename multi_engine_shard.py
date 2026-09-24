@@ -4023,6 +4023,110 @@ class MultiEngineScheduler:
             print(f"  sharded {sw.summary()}; private arenas used: {', '.join(used)}")
         return sw
 
+    def shard_quantized_weight_from_bytes(
+        self, name: str, weight_bytes, scale_bytes, K: int, N: int, layers: int,
+        layer_stride_bytes: int, data_type=None, remainder: str = "trailing",
+        max_engines: Optional[int] = None, verbose: bool = True,
+    ) -> ShardedWeight:
+        """Same column-sharded materialization as :meth:`shard_quantized_weight`,
+        sourced from HOST bytes instead of an already-resident device blob.
+
+        Use this for a weight with no OTHER reader of the whole, unsharded
+        image -- shard_quantized_weight's source is "the image the model
+        loader already wrote to DRAM" because that image is also read some
+        other way (e.g. a shared per-head matmul); when nothing reads the
+        unsharded image, staging one on the device first is a wasted
+        card->host->card round trip on top of the shard copy's own
+        card->host->card -- three DMAs of the full weight where one would do.
+        This writes each engine's column block directly, host->card, once.
+
+        ``weight_bytes``/``scale_bytes`` are the FULL ``[N, K]`` (row-major in
+        N) quantized data and ``[N, K/64]`` scale blobs, exactly the layout
+        :meth:`shard_quantized_weight` expects already in DRAM, with
+        ``layer_stride_bytes`` between layers (0 for ``layers=1``).
+        """
+        self._require_private_map("shard_quantized_weight_from_bytes")
+        if data_type is None:
+            data_type = user_dma_core.TYPE.IF4
+        if name in self._weights:
+            raise ValueError(f"weight {name!r} already sharded")
+        eb = _weight_elem_bytes(data_type)
+        has_scale = data_type is not DENSE_BF16
+        if has_scale and scale_bytes is None:
+            raise ValueError(f"{name}: {data_type!r} needs scale_bytes")
+        if (K * eb) % 1:
+            raise ValueError(f"{name}: K={K} x {eb} B/elem is not a whole number of bytes")
+        assert not has_scale or K % COL_ALIGN == 0, (
+            f"{name}: K={K} must be a multiple of {COL_ALIGN} -- the scale blob is "
+            f"blocked at whole K-vectors, so a column shard's scale stride is only "
+            f"linear when K is too")
+
+        splits = self.split_cols(N, remainder=remainder, max_engines=max_engines)
+        sw = ShardedWeight(name=name, K=K, N=N, layers=layers, data_type=data_type)
+
+        for engine_idx, (col_offset, cols) in enumerate(splits):
+            need = int(cols * K * eb) * layers
+            if has_scale:
+                need += (cols * K // COL_ALIGN) * 2 * layers
+            free = (self.regions[engine_idx].weight_limit
+                    - self.arena._weight_cursor[engine_idx])
+            if need > free:
+                raise MemoryError(
+                    f"{name}: engine {engine_idx} needs {need / 2**20:.1f} MB for its "
+                    f"{cols}-column shard but only {free / 2**20:.1f} MB is left in its "
+                    f"{self.arena.weight_bytes() / 2**20:.0f} MB weight "
+                    f"arena (num_engines={self.num_engines}). Already allocated: "
+                    f"{', '.join(sorted(self._weights)) or 'nothing'}. Either shard "
+                    f"fewer ops or use fewer cores (bigger window each).")
+
+        for engine_idx, (col_offset, cols) in enumerate(splits):
+            w_stride = int(cols * K * eb)                      # this shard, one layer
+            s_stride = (cols * K // COL_ALIGN) * 2 if has_scale else 0
+            w_addr = self._alloc_private(engine_idx, w_stride * layers, f"{name} weights")
+            s_addr = (self._alloc_private(engine_idx, s_stride * layers, f"{name} scales")
+                      if has_scale else 0)
+            sw.shards.append(WeightShard(
+                engine_idx=engine_idx, col_offset=col_offset, cols=cols,
+                weight_addr=w_addr, scale_addr=s_addr,
+                layer_stride=w_stride, scale_layer_stride=s_stride))
+
+        for layer in range(layers):
+            src_w = layer * layer_stride_bytes
+            src_s = layer * layer_stride_bytes if has_scale else 0
+            for shard in sw.shards:
+                w_off = int(shard.col_offset * K * eb)
+                w_slice = weight_bytes[src_w + w_off:src_w + w_off + shard.layer_stride]
+                if len(w_slice) != shard.layer_stride:
+                    raise ValueError(
+                        f"{name}: weight_bytes too short for engine "
+                        f"{shard.engine_idx}'s layer {layer} shard")
+                dst = shard.weight_addr + layer * shard.layer_stride
+                put = self.primary.dma_write(
+                    user_dma_core.DMA_DEVICE_H2C, dst, w_slice, shard.layer_stride)
+                if put != shard.layer_stride:
+                    raise IOError(f"{name}: shard write to 0x{dst:X} wrote {put} of "
+                                 f"{shard.layer_stride} B")
+                if not has_scale:
+                    continue
+                s_off = (shard.col_offset * K // COL_ALIGN) * 2
+                s_slice = scale_bytes[src_s + s_off:src_s + s_off + shard.scale_layer_stride]
+                if len(s_slice) != shard.scale_layer_stride:
+                    raise ValueError(
+                        f"{name}: scale_bytes too short for engine "
+                        f"{shard.engine_idx}'s layer {layer} shard")
+                dst = shard.scale_addr + layer * shard.scale_layer_stride
+                put = self.primary.dma_write(
+                    user_dma_core.DMA_DEVICE_H2C, dst, s_slice, shard.scale_layer_stride)
+                if put != shard.scale_layer_stride:
+                    raise IOError(f"{name}: scale write to 0x{dst:X} wrote {put} of "
+                                 f"{shard.scale_layer_stride} B")
+
+        self._weights[name] = sw
+        if verbose:
+            used = [f"{u / 2**20:.1f}MB" for u in self.private_usage()]
+            print(f"  sharded {sw.summary()}; private arenas used: {', '.join(used)}")
+        return sw
+
     def shard_bf16_weight(self, name: str, main_weight_addr: int,
                           K: int, N: int, layers: int, main_layer_stride: int,
                           remainder: str = "trailing",

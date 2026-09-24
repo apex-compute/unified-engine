@@ -39,7 +39,7 @@ BLOCK = 64
 SCALE_BYTES = 2
 DATA_BYTES = 32
 WIRE_BYTES = SCALE_BYTES + DATA_BYTES
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 9  # vision attn.qk/attn.v fully compact (no padding at all); runtime pads via gpr_out_row_stride_reg
 GENERATION_TAG_BYTES = 32
 
 # Keep the host-only tokenizer/media preprocessing assets beside params.bin so
@@ -692,20 +692,30 @@ def _write_lm(out, reader: _Checkpoint, cfg: dict) -> dict:
     return w.finish()
 
 
-def _pad_qk(weight: torch.Tensor, bias: torch.Tensor, proj: int, out_w, out_b) -> None:
-    heads, head_dim, hidden = 16, 80, 1280
-    value = weight.reshape(heads, head_dim, hidden)
-    bvalue = bias.reshape(heads, head_dim)
-    half = head_dim // 2
-    for head in range(heads):
-        start = (proj * heads + head) * 128
-        out_w[start:start + half] = value[head, :half]
-        out_w[start + 64:start + 64 + half] = value[head, half:]
-        out_b[start:start + half] = bvalue[head, :half]
-        out_b[start + 64:start + 64 + half] = bvalue[head, half:]
-
-
 def _write_vision(out, reader: _Checkpoint, cfg: dict) -> dict:
+    """Q/K/V are stored fully COMPACT -- ``attn.qk`` ([2h, h], Q's real
+    1280 rows then K's), ``attn.v`` ([h, h]) -- no padding baked into the
+    weight at all, for either projection.
+
+    Replaces the older ``qk_padded``/``v_padded`` layout (16 heads x 80 real
+    dims padded all the way to 128 each, entangled with the RoPE
+    rotate-half swap-matrix layout -- see gemma4_e2b_vision.py's history for
+    why that padding existed at all: the per-head 64-alignment the
+    attention/transpose kernels genuinely need). The runtime
+    (qwen2.5_omni_7b_vision.py's qkv_proj emission) now inserts ALL of that
+    padding itself, with NO extra data movement: one small matmul per head
+    (V) or per RoPE head-half (QK) writes its real-width output directly to
+    its final padded position via the matmul's own gpr_out_row_stride_reg,
+    addressing its weight rows by pure offset arithmetic into this same
+    compact blob (IF4 blocks are along K, not N, so any N-row slice needs no
+    re-quantization). No scatter DMA, no intermediate compact buffer -- the
+    padding is inserted natively, by the same op that already computes the
+    projection, so there is no separate cost for it at all.
+
+    vision_weight_init() detects which key is present and falls back to the
+    old padded layout if this one is absent, so an old, not-yet-reconverted
+    params.bin for this model keeps working during the transition.
+    """
     w = _RegionWriter(out, "vision")
     v = cfg["vision"]
     h, heads, hd = v["hidden_size"], v["num_heads"], v["head_dim"]
@@ -713,24 +723,19 @@ def _write_vision(out, reader: _Checkpoint, cfg: dict) -> dict:
     for li in range(layers):
         src = f"thinker.visual.blocks.{li}"
         dst = f"visual.blocks.{li}"
-        qk_w = torch.zeros(2 * heads * 128, h, dtype=torch.bfloat16)
-        qk_b = torch.zeros(2 * heads * 128, dtype=torch.bfloat16)
-        for proj, tag in enumerate(("q", "k")):
-            wn, bn = f"{src}.attn.{tag}.weight", f"{src}.attn.{tag}.bias"
-            _expect(reader, wn, (h, h)); _expect(reader, bn, (h,))
-            _pad_qk(reader.tensor(wn), reader.tensor(bn), proj, qk_w, qk_b)
-        w.add_if4(f"{dst}.attn.qk_padded.weight", qk_w)
-        w.add_bf16(f"{dst}.attn.qk_padded.bias", qk_b)
+        qn, qbn = f"{src}.attn.q.weight", f"{src}.attn.q.bias"
+        kn, kbn = f"{src}.attn.k.weight", f"{src}.attn.k.bias"
+        _expect(reader, qn, (h, h)); _expect(reader, qbn, (h,))
+        _expect(reader, kn, (h, h)); _expect(reader, kbn, (h,))
+        qk_w = torch.cat([reader.tensor(qn), reader.tensor(kn)], dim=0)
+        qk_b = torch.cat([reader.tensor(qbn), reader.tensor(kbn)], dim=0)
+        w.add_if4(f"{dst}.attn.qk.weight", qk_w)
+        w.add_bf16(f"{dst}.attn.qk.bias", qk_b)
 
         vn, vbn = f"{src}.attn.v.weight", f"{src}.attn.v.bias"
         _expect(reader, vn, (h, h)); _expect(reader, vbn, (h,))
-        raw_v = reader.tensor(vn).reshape(heads, hd, h)
-        raw_vb = reader.tensor(vbn).reshape(heads, hd)
-        vp = torch.zeros(heads, 128, h, dtype=torch.bfloat16)
-        vbp = torch.zeros(heads, 128, dtype=torch.bfloat16)
-        vp[:, :hd] = raw_v; vbp[:, :hd] = raw_vb
-        w.add_if4(f"{dst}.attn.v_padded.weight", vp.reshape(-1, h))
-        w.add_bf16(f"{dst}.attn.v_padded.bias", vbp.flatten())
+        w.add_if4(f"{dst}.attn.v.weight", reader.tensor(vn))
+        w.add_bf16(f"{dst}.attn.v.bias", reader.tensor(vbn))
 
         on, obn = f"{src}.attn.proj.weight", f"{src}.attn.proj.bias"
         _expect(reader, on, (h, h)); _expect(reader, obn, (h,))

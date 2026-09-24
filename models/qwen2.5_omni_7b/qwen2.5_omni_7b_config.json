@@ -113,7 +113,7 @@
     "private_arena_base": "0x000000000",
     "private_arena_bytes": "0x200000000",
     "private_window_bytes": "0x40000000",
-    "private_isa_bytes": "0x1000000",
+    "private_isa_bytes": "0x4000000",
     "private_tensor_bytes": "0x1000000",
     "dram_limit": "0x200000000"
   }

@@ -7308,8 +7308,15 @@ class UnifiedEngine:
         gpr_identity_addr: int = None,
         q_scale: float = None,
         q_pre_scaled: bool = False,
+        pv_head_dim: int = None,
     ) -> int:
         """Scaled dot-product attention with explicit batch and aligned KV length.
+
+        ``pv_head_dim`` (dynamic path only; see unified_attention_core_dynamic's
+        docstring): unpadded output width for the final P @ V matmul alone.
+        ``head_dim`` stays the padded value everywhere else in this core (the
+        score matmul's contraction dim and the V-transpose both need it
+        64-aligned) -- only P @ V's OUTPUT width is unconstrained.
 
         ``q_scale`` overrides the Q pre-scale multiplier. ``None`` (default) keeps
         the standard ``1/sqrt(head_dim)``; pass an explicit value when the model
@@ -7347,6 +7354,11 @@ class UnifiedEngine:
         _addr_gprs = (gpr_q_addr, gpr_k_addr, gpr_v_addr, gpr_bias_addr, gpr_out_addr,
                       gpr_head_dim_reg, gpr_scale_reg, gpr_scratch_addr, gpr_identity_addr)
         if gpr_batch_reg is None and gpr_aligned_seq_len_reg is None and not any(g is not None for g in _addr_gprs):
+            if pv_head_dim is not None:
+                raise ValueError(
+                    "unified_attention_core: pv_head_dim requires the dynamic "
+                    "path (pass gpr_batch_reg/gpr_aligned_seq_len_reg); "
+                    "unified_attention_core_legacy does not implement it")
             return self.unified_attention_core_legacy(
                 batch=batch,
                 aligned_seq_len=aligned_seq_len,
@@ -7387,6 +7399,7 @@ class UnifiedEngine:
             gpr_identity_addr=gpr_identity_addr,
             q_scale=q_scale,
             q_pre_scaled=q_pre_scaled,
+            pv_head_dim=pv_head_dim,
         )
 
     def unified_attention_core_legacy(
@@ -7484,6 +7497,7 @@ class UnifiedEngine:
         q_scale: float = None,
         q_pre_scaled: bool = False,
         V_T_DRAM_ADDR: int = None,
+        pv_head_dim: int = None,
     ) -> int:
         """``V_T_DRAM_ADDR`` (optional, static-address path only): DRAM address of an
         ALREADY-TRANSPOSED V, laid out ``[head_dim, aligned_seq_len]`` row-major --
@@ -7493,7 +7507,31 @@ class UnifiedEngine:
         (score plane, scaled Q) is unchanged and the V^T slot of the scratch is
         simply left unused. The caller owns the buffer's contents and coherence.
         Use when the same V is attended by many calls (several engines, several
-        steps) so the transpose is done once instead of once per call."""
+        steps) so the transpose is done once instead of once per call.
+
+        ``pv_head_dim`` (optional, defaults to ``head_dim``): output width of
+        ONLY the final P @ V context matmul. ``head_dim`` itself must stay
+        padded to a 64-multiple everywhere else in this core -- it is the
+        CONTRACTION dim of the score matmul (Q @ K^T), which the matmul core
+        always requires 64-aligned, and it is what the V-transpose step's own
+        N must be 64-aligned to. But P @ V contracts over aligned_seq_len, not
+        head_dim -- head_dim is only that matmul's OUTPUT width, which has no
+        64-rule unless softmax_enable is set (it never is here) -- so this one
+        matmul can write the real, unpadded head_dim if the caller passes it.
+        V^T is unaffected (still built at the full padded head_dim, since the
+        transpose itself needs that); the context matmul simply reads fewer of
+        its rows as B, and writes fewer output columns, leaving
+        ``OUTPUT_DRAM_ADDR``'s columns [pv_head_dim, head_dim) untouched --
+        the caller must zero those once, since nothing here writes them again
+        (see qwen2.5_omni_7b_vision.py's vision_tensor_init for the pattern:
+        the same one-time zero-init this session already added for VIS_QK/
+        VIS_V's own pad lanes).
+        """
+        pv_n = head_dim if pv_head_dim is None else pv_head_dim
+        if pv_n > head_dim:
+            raise ValueError(
+                f"unified_attention_core_dynamic: pv_head_dim={pv_n} must be "
+                f"<= head_dim={head_dim} (V^T only has head_dim real rows)")
         bytes_per_element = 2
         if batch > aligned_seq_len:
             raise ValueError(f"unified_attention_core_dynamic: batch must be <= aligned_seq_len, got batch={batch}, aligned_seq_len={aligned_seq_len}")
@@ -7599,13 +7637,28 @@ class UnifiedEngine:
         total_flops += self.matmat_mul_core(
             M=batch,
             K=aligned_seq_len,
-            N=head_dim,
+            N=pv_n,
             A_DRAM_ADDR=score_dram_addr,
             B_DRAM_ADDR=v_t_dram_addr,
             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
             gpr_M_reg=gpr_batch_reg,
             gpr_K_reg=gpr_aligned_seq_len_reg,
-            gpr_N_reg=head_dim_reg,
+            # NOT head_dim_reg for N: that holds the full (possibly padded)
+            # head_dim, used by the transpose/pre-scale above. pv_n may be
+            # narrower, so N gets its own GPR -- auto-allocated and released
+            # by the matmat_mul_core dispatcher since gpr_N_reg is left unset
+            # here.
+            # gpr_out_row_stride_reg IS head_dim_reg, though: by API contract
+            # ("out = [batch, head_dim]") the caller's OUTPUT_DRAM_ADDR buffer
+            # has row pitch head_dim regardless of how many columns pv_n
+            # writes -- without this the matmul defaults to a row stride of N
+            # (=pv_n) and packs every row densely at the NARROW width, which
+            # scrambles every row after the first into the wrong caller-buffer
+            # offset (the exact same class of bug the qkv_proj scatter hit
+            # this session: writing a narrower N into a wider destination
+            # needs its own stride, every time, with no exception -- there is
+            # no default that is ever correct here).
+            gpr_out_row_stride_reg=head_dim_reg,
             gpr_a_addr=score_reg,
             gpr_b_addr=v_t_reg,
             gpr_out_addr=gpr_out_addr,

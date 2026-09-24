@@ -111,19 +111,19 @@ engine's peak, and the CPU wall time around the same stage. The gap between
 the two clocks is host overhead. TTFT covers whichever encoders the request
 ran plus prefill.
 
-`--high` is a performance-only workload for a multi-camera request that cannot
-fit as one resident context: four 896x896 camera frames (4096 vision tokens),
-a 6-second spoken query (the 600-mel-frame encoder maximum), and 6144 aggregate
-input tokens. Vision, audio, prefill, and decode each run in a fresh process
-with an independent eight-core reset and compilation. Every camera frame runs
-on the FPGA; segmented prefill is projected as three times one isolated
-2048-token FPGA measurement using the 2560-row physical KV allocation. The
-summary reports both the segmented TTFT and an estimated monolithic
-6144-token TTFT derived from static full-context model FLOPs and the measured
-segmented effective GFLOPS. It also reports decode speed at the final resident
-2048-token chunk. Media embeddings and KV history are deliberately not carried
-between chunks, so this benchmark measures performance and does not validate
-numerics or claim that a 6144-token request fits in DRAM.
+`benchmark.py` drives three fixed workload tiers on top of this script: `--low`
+(voice command), `--medium` (single camera), both real, continuous FPGA runs,
+and `--high` (multi-camera: four 896x896 camera frames, a 6-second spoken
+query, 6144 aggregate input tokens) -- a shape that cannot fit as one resident
+context in the current DRAM map. Rather than faking that context with a padded,
+zero-filled KV cache, `--high` is a derivation: it profiles Medium's real,
+hardware-measured per-op rates (vision per frame, audio per second, each
+prefill/decode phase's own ms-per-model-FLOP or ms-vs-context slope) and
+evaluates `qwen2.5_omni_7b_model_flops.py`'s own phase formulas at High's dims.
+It also profiles Low for real and predicts Low from the Medium calibration,
+so the method's error is measured before it is trusted for the shape that
+cannot be measured directly. See `benchmark.py`'s module docstring and
+`benchmark.md` for the numbers this produces.
 
 A second table reports **effective throughput against model FLOPs**: the work
 the architecture owes at its own dimensions -- true prompt length, true
@@ -160,11 +160,13 @@ at stage level only.
 # Generation run + summary
 python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --image
 
-# Performance-only 4-camera / 6-second audio / 6144-token aggregate benchmark
-python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --high
-
 # Per-phase breakdown instead of generation
 python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --image --profile
+
+# Fixed-shape tiers (see benchmark.py / benchmark.md)
+python models/qwen2.5_omni_7b/benchmark.py --multi-core 8 --low
+python models/qwen2.5_omni_7b/benchmark.py --multi-core 8 --medium
+python models/qwen2.5_omni_7b/benchmark.py --multi-core 8 --high
 ```
 
 ## Build and run
