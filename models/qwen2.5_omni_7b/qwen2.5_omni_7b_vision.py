@@ -1175,6 +1175,7 @@ class Qwen25OmniVisionMixin:
                 f"ISA region). Enlarge the ISA region or shrink the program.")
         self._vis_program_bytes = bytes(enc)
         self._vis_program_addr = base_addr
+        self._vis_encoder_flops = int(flops)
         self._vis_total_flops = int(flops)
         wk_note = ""
         if self._vis_worker_programs:
@@ -1412,7 +1413,7 @@ class Qwen25OmniVisionMixin:
                             f"{timeout_s:.1f}s")
                 latency_us = self.report_latency_in_us()
         wall = time.perf_counter() - t0
-        gflops = (self._vis_total_flops / (latency_us * 1e-6) / 1e9
+        gflops = (self._vis_encoder_flops / (latency_us * 1e-6) / 1e9
                   if latency_us > 0 else 0.0)
         self._vis_latency_us = latency_us
         self._vis_gflops = gflops
@@ -1688,6 +1689,7 @@ class Qwen25OmniVisionMixin:
                 "vision encoder plus patch projection exceeds the master ISA "
                 f"reserve at 0x{self.MASTER_ISA_LIMIT:X}"
             )
+        self._vis_patch_flops = int(patch_flops)
         self._loud(
             f"  [Vision] FPGA patch projection compiled: "
             f"{len(patch_blob) / 2**20:.2f} MiB at 0x{patch_addr:X}"
@@ -1735,6 +1737,13 @@ class Qwen25OmniVisionMixin:
             raise
         finally:
             self._vis_program_bytes = composite
+        if profile:
+            # Patch projection runs in its own FPGA program before the ViT's
+            # first checkpoint. Include its measured counter and issued FLOPs
+            # so profile rows and totals compare like-for-like to model FLOPs.
+            self._vis_profile.insert(
+                0, ("patch_embed", patch_latency_us / 1e3,
+                    self._vis_patch_flops))
         self._vis_latency_us += patch_latency_us
         self._vis_wall_s += patch_wall_s
         self._vis_gflops = (

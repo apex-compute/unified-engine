@@ -33,11 +33,10 @@ invented -- they are the exact checkpoint names the compiled programs use
 qwen2.5_omni_7b_lm.py, read from source), so a dict here lines up directly with
 a row _aggregate_vis_profile prints. Two attribution details worth knowing:
 
-* Vision's patch embedding runs ONCE, before the per-layer loop, but the
-  compiled program has no separate checkpoint for it -- the first real
-  checkpoint boundary is layer 0's "qkv_proj". So the patch-embed matmul is
-  folded into the "qkv_proj" bucket, matching where the hardware actually
-  bills the time.
+* Vision's patch embedding runs ONCE as a separate FPGA program before the
+  checkpointed encoder. Its hardware-counter time and issued FLOPs are
+  reported as a separate ``patch_embed`` profile row, so the model FLOPs
+  must also stay separate from layer 0's ``qkv_proj`` bucket.
 * qkv_proj/o_proj/mlp_gate_up/mlp_proj are real matmuls; rope(+cache),
   permute/unpermute/attn_permute and the norm phases are elementwise and
   priced at 0 by convention -- a real, honest 0% useful for that phase, not
@@ -68,8 +67,8 @@ def _attention(tokens_per_window: Sequence[int], query_dim: int) -> int:
 def vision_flops_by_phase(cfg: dict, patches: int | None = None,
                           merged_tokens: int | None = None) -> dict[str, int]:
     """Same total as vision_flops, broken out by the compiled program's own
-    checkpoint names (qwen2.5_omni_7b_vision.py's ``_ckpt(...)`` calls):
-    qkv_proj (+ the one-time patch embed, see module docstring), permute_qkv
+    checkpoint names (qwen2.5_omni_7b_vision.py's ``_ckpt(...)`` calls), plus
+    the separately executed patch_embed program: qkv_proj, permute_qkv
     (=0), rope (=0), attention, unpermute+trim (=0), o_proj+mlp (bundled --
     matches the real checkpoint, which does not separate them), merger.
     """
@@ -109,7 +108,8 @@ def vision_flops_by_phase(cfg: dict, patches: int | None = None,
               + gemm(merged, merged_dim, int(v["out_hidden_size"])))
 
     return {
-        "qkv_proj": qkv + patch_embed,
+        "patch_embed": patch_embed,
+        "qkv_proj": qkv,
         "permute_qkv": 0,
         "rope": 0,
         "attention": attention,

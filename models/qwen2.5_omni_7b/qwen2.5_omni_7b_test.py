@@ -1712,15 +1712,11 @@ class Qwen25OmniUnifiedEngine(
         ``model_phases`` (a dict, or None) keys must match
         ``_aggregate_vis_profile``'s phase names exactly -- the checkpoint
         name after its "L<idx>:" prefix is stripped, e.g. "attention",
-        "qkv_proj" -- which is what qwen2.5_omni_7b_model_flops.py's
-        ``*_by_phase`` functions are built to produce, read from the same
-        compiled-program checkpoint names. Model GFLOP is not a column here
-        (every non-TOTAL row would need it for a fair table, but a phase's
-        model cost is only known at this per-phase granularity when the
-        by-phase function actually separates it, and some, like
-        "o_proj+mlp", are bundled because the real checkpoint bundles them)
-        -- it is a column, matched by phase name, "n/a" where the mapping
-        has no entry for a phase the results actually contain.
+        "qkv_proj". Vision's separate FPGA patch program contributes a
+        "patch_embed" result before those checkpoints. The ``*_by_phase``
+        functions use these same boundaries; bundled checkpoints such as
+        "o_proj+mlp" remain bundled in the model counts. A missing mapping
+        is shown as "n/a", never silently counted as zero.
         """
         peak = self.vis_peak_gflops()
         out: list[str] = []
@@ -1997,9 +1993,10 @@ class Qwen25OmniUnifiedEngine(
             lines += [
                 "## Per-phase profile",
                 "",
-                "Phase latencies come from the HW counter between per-phase "
-                "HALTs: they exclude host time but include one stop/restart per "
-                "phase, so the SHARE column is the number to act on -- it says "
+                "Phase latencies come from FPGA hardware counters. Vision's "
+                "patch_embed is a separate program; the remaining phases are "
+                "timed between per-phase HALTs and include a stop/restart per "
+                "phase. They exclude host time, so the SHARE column says "
                 "which phase is worth sharding next. `*` marks phases that run "
                 "on engine 0 only, whose % of peak is measured against ONE "
                 "engine.",
@@ -2855,7 +2852,8 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
             dims = ue._vision_dims()
             profiles.append((
                 "Vision encoder",
-                f"{dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens.",
+                f"{dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens. "
+                "patch_embed is a separate FPGA program before the encoder checkpoints.",
                 getattr(ue, "_vis_profile", None),
                 ue._model_flops_vision_by_phase(dims),
             ))
