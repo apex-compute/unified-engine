@@ -61,7 +61,7 @@
   },
   "precision": {
     "lm": "if4",
-    "embedding": "if8",
+    "embedding": "bf16",
     "vision": "if4",
     "audio": "if4",
     "decode_bf16_projections": [

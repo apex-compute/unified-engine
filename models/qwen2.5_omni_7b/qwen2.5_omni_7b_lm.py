@@ -36,6 +36,7 @@ if os.path.dirname(os.path.dirname(_SD)) not in sys.path:
 import numpy as np
 import torch
 
+import quant_lib
 import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, INSTRUCTION_SIZE_BYTES, TYPE, UE_MODE, UE_VECTOR_SIZE,
@@ -58,8 +59,8 @@ class Qwen25OmniLMMixin:
     alloc, decode-round emission, decoder compile/run); the public methods
     of the same un-prefixed name are Omni's own overrides -- most notably
     the mandatory FPGA-wide sharded-head argmax (compile_decoder,
-    _dec_round, _emit_fpga_global_argmax) and the on-device IF8 embedding
-    path (_ensure_fpga_embedding and friends).
+    _dec_round, _emit_fpga_global_argmax). Omni uses the shared host-BF16
+    embedding gather; the optional device embedding helpers are unused.
     """
 
     # Decode attention is sharded two ways, both of which need values that only
@@ -67,14 +68,18 @@ class Qwen25OmniLMMixin:
     DEC_ATTN_REGS = ("row_off", "out_off", "rows", "stride", "aligned")
 
     MLP_PRIVATE_TAGS = frozenset({"gate", "up", "down"})
+    # The existing params.bin already carries IF4 O for prefill. Decode now
+    # shards that image too; the legacy BF16 decode_o region remains in the
+    # artifact for compatibility but is not uploaded.
+    DECODE_O_IF4 = True
 
     def _lm_quantized_projections(self) -> set[str]:
         """Projection tags stored with the configured block-quantized codec.
 
         Qwen2.5-VL-3B keeps V/O in BF16 for accuracy. Larger compatible
         decoders can opt either projection into IF4 independently; notably,
-        Qwen2.5-Omni-7B uses IF4 O during prefill, then switches to a shared
-        BF16 O overlay for decode while retaining BF16 V in both phases.
+        Qwen2.5-Omni-7B uses IF4 O in both phases. V remains BF16 in prefill
+        and gets a separate IF4 image for decode.
         Keeping the choices phase-aware here makes the emitter reusable without
         changing the released 3B bin format.
         """
@@ -95,6 +100,31 @@ class Qwen25OmniLMMixin:
     def _base__decode_projection_is_quantized(self, tag: str) -> bool:
         """Decode storage policy, overridable independently from prefill."""
         return self._lm_projection_is_quantized(tag)
+
+    def _dma_decode_v_if4(self, f, section: dict, base_offset: int,
+                          N: int, K: int, what: str) -> tuple[int, int]:
+        """Quantize BF16 V for decode without changing prefill or params.bin."""
+        expected = N * K * 2
+        if int(section["size"]) != expected or K % UE_VECTOR_SIZE:
+            raise ValueError(f"{what}: expected BF16 [{N}, {K}] ({expected} bytes)")
+        f.seek(base_offset + int(section["offset"]))
+        blob = f.read(expected)
+        if len(blob) != expected:
+            raise RuntimeError(f"truncated read for {what}")
+        weight = torch.frombuffer(bytearray(blob), dtype=torch.bfloat16).reshape(N, K)
+        data, scales = quant_lib.quantize(
+            LM_QUANT_PRECISION, weight, block_size=UE_VECTOR_SIZE)
+        blocks = N * K // UE_VECTOR_SIZE
+        if len(data) != blocks * IF4_DATA_BYTES or len(scales) != blocks * IF4_SCALE_BYTES:
+            raise AssertionError(f"{what}: unexpected IF4 payload size")
+        scale_addr = self.allocate_params_dram(len(scales), label=f"{what}.decode.scale")
+        data_addr = self.allocate_params_dram(len(data), label=f"{what}.decode.data")
+        for addr, payload, label in ((scale_addr, scales, "scale"),
+                                     (data_addr, data, "data")):
+            written = self.dma_write(DMA_DEVICE_H2C, addr, payload, len(payload))
+            if written != len(payload):
+                raise IOError(f"{what}.decode.{label}: short params DMA")
+        return scale_addr, data_addr
 
     def _prefill_down_lane(self, la: dict, lane: int, lanes: int) -> tuple:
         """(data, scale) DRAM addresses for one K-lane of down_proj.
@@ -276,6 +306,13 @@ class Qwen25OmniLMMixin:
                         la[f"{tag}_weight"] = self._dma_bf16(
                             f, need(f"{pre}.{key}.weight"), base,
                             f"{pre}.{key}")
+                        if tag == "v" and self._decode_projection_is_quantized("v"):
+                            # Prefill keeps the BF16 image above; decode uses
+                            # its own IF4 copy and the quantized GEMV kernel.
+                            la["v_scale"], la["v_data"] = self._dma_decode_v_if4(
+                                f, need(f"{pre}.{key}.weight"), base,
+                                d["KVH"] * d["AHD"], d["H"],
+                                f"{pre}.{key}")
                 for tag, key in (("q", "self_attn.q_proj"), ("k", "self_attn.k_proj"),
                                  ("v", "self_attn.v_proj")):
                     la[f"{tag}_bias"] = self._dma_bf16(
@@ -773,24 +810,13 @@ class Qwen25OmniLMMixin:
         would contend and the speedup would cap however evenly N divides.
         Engine i therefore reads from ITS OWN window.
 
-        SCOPE AT 8 ENGINES: q and o over all 8, k and v over 4. q is N=2048 -- 32 blocks of
-        64, i.e. 4 blocks per engine. k is N=256, only 4 blocks, so it CANNOT
-        reach 8 engines; rather than leave it full-width on the master it goes
-        one block to each of engines 0-3 and engines 4-7 emit nothing for it.
-        That is still the right trade: they are already stopped at this layer's
-        rendezvous waiting for q, so k costs them nothing, and the master sheds
-        three quarters of a projection. v shards the same 4 ways: it is BF16, so
-        it carries no scale blob and lands on matmat_mul_core rather than the
-        GEMV kernel, but a column block of a bf16 [N, K] blob is the same
-        contiguous row block, so it materializes into the private arenas too.
-        o is bf16 as well and N=H=2048, so it splits 8 ways like q -- but it
-        consumes the ATTENTION output, so it cannot ride the qkv rendezvous and
-        opens a second one after the permute. gate and up (N=11008, 172 blocks:
-        21 per engine with the last four taking 22) read the same post-norm
-        input and write disjoint buffers, so they share a third; down
-        (N=H=2048) consumes their product and takes a fourth. Four rendezvous
-        per layer is the minimum the dataflow allows -- each one separates a
-        producer from its consumer.
+        Omni's Q has 3584 output columns (448 per engine), while K and V each
+        have 512 (64 per engine). Decode V uses a separate IF4 copy; prefill
+        still reads its shared BF16 image. Decode O reuses prefill's IF4
+        image, copied into eight private column shards. Gate/up use eight
+        output-column shards; down reuses prefill's private K-shards and reduces
+        their full-width partial outputs. Producer/consumer dependencies require separate
+        projection rounds within each layer.
         """
         cached = getattr(self, "_decode_shards", None)
         if cached is not None:
@@ -806,8 +832,7 @@ class Qwen25OmniLMMixin:
                              ("v", d["H"], d["KVH"] * d["AHD"]),
                              ("o", d["QH"] * d["AHD"], d["H"]),
                              ("gate", d["H"], d["MLP"]),
-                             ("up", d["H"], d["MLP"]),
-                             ("down", d["MLP"], d["H"])):
+                             ("up", d["H"], d["MLP"])):
                 pre_staged = self._decode_shard_override(op, li)
                 if pre_staged is not None:
                     # Already sliced into the private windows at weight-load
@@ -1750,8 +1775,8 @@ class Qwen25OmniLMMixin:
         o_sw = dec_shards.get(("o", li)) if (decode and dec_shards) else None
         if o_sw is not None:
             # SECOND rendezvous of the layer: o_proj reads the attention result,
-            # so it cannot ride the qkv round. bf16 and N=H=2048, i.e. 32 blocks
-            # of 64 -- an even 4 blocks per engine at 8 cores. No bias.
+            # so it cannot ride the qkv round. IF4 N=H=3584 splits into eight
+            # 448-column private shards. No bias.
             def _master_o(o_sw=o_sw):
                 return (self._emit_dec_shard(self, o_sw, 0, self.LM_ATTN_PROJ,
                                              attn_result_addr)
@@ -1859,35 +1884,47 @@ class Qwen25OmniLMMixin:
                     dram_out=self.LM_MLP_MULT, mode=UE_MODE.ELTWISE_MUL,
                     gpr_M_reg=m_reg) or 0
 
-            dn = mlp_sw["down"]
-            # The layer-output residual folds into the down round for the same
-            # reason the SwiGLU product folded into the gate/up one: down is
-            # column-sharded over N=H, so engine e adds into exactly the slice
-            # it just wrote.
-            folded_resid2 = dn is not None
-
-            def _resid2_slice(ue, e, dn=dn, out_addr=out_addr):
-                sh = dn.shard(e)
-                off = sh.col_offset * bpe
-                return ue.eltwise_core_dram(
-                    M=1, N=sh.cols,
-                    dram_a=self.LM_RESIDUAL + off, dram_b=self.LM_MLP_DOWN + off,
-                    dram_out=out_addr + off, mode=UE_MODE.ELTWISE_ADD) or 0
-
-            def _master_down(dn=dn):
-                if dn is None:
-                    return mm(MLP, H, self.LM_MLP_MULT, "down", self.LM_MLP_DOWN)
-                return (self._emit_dec_shard(self, dn, 0, self.LM_MLP_DOWN,
-                                             self.LM_MLP_MULT)
-                        + dec_sched.worker_flops(dn)
-                        + _resid2_slice(self, 0))
-
             ckpt(f"L{li}:mlp_gate_up", flops)
-            flops += self._dec_round(
-                dec_sched,
-                [(dn, self.LM_MLP_DOWN, self.LM_MLP_MULT, None, False)] if dn else [],
-                _master_down,
-                worker_extra=_resid2_slice if folded_resid2 else None)
+            # Gate/up already partition MLP over N; those eight lanes are
+            # precisely the K slices consumed by down. Reuse prefill's private
+            # K-sharded weights instead of storing a second N-sharded image.
+            lane = MLP // dec_sched.num_engines
+            if lane * dec_sched.num_engines != MLP or lane % 64:
+                raise ValueError("decode down K lanes must be equal 64-blocks")
+            down_weights = la["down_tp"]
+            if len(down_weights) != dec_sched.num_engines:
+                raise RuntimeError("decode down requires one private K shard per core")
+            # The prefill TP scratch is dead after gate/up in decode. Use one
+            # full-width row per engine, with the original prefill-sized plane
+            # stride to keep all eight partials in disjoint reserved space.
+            partials = [self.LM_MLP_DOWN_TP + e * self.PREFILL_MAX_SEQ_LEN * H * bpe
+                        for e in range(dec_sched.num_engines)]
+            down_flops = [0]
+
+            def _down_k(ctx):
+                e = ctx.engine_idx
+                if ctx.k_offset != e * lane or ctx.k_cols != lane:
+                    raise AssertionError("decode down K split differs from staged weights")
+                data, scale = down_weights[e]
+                down_flops[0] += ctx.ue.quantized_matmat_core(
+                    M=1, K=lane, N=H,
+                    A_DRAM_ADDR=self.LM_MLP_MULT + e * lane * bpe,
+                    B_DRAM_ADDR=data, SCALE_DRAM_ADDR=scale,
+                    data_type=TYPE.IF4, OUTPUT_DRAM_ADDR=partials[e]) or 0
+
+            dec_sched.k_sharded_region(MLP, _down_k, join=True)
+            flops += down_flops[0]
+            acc_addr = partials[0]
+            for src in partials[1:]:
+                flops += self.eltwise_core_dram(
+                    M=1, N=H, dram_a=acc_addr, dram_b=src,
+                    dram_out=self.LM_MLP_DOWN,
+                    mode=UE_MODE.ELTWISE_ADD) or 0
+                acc_addr = self.LM_MLP_DOWN
+            flops += self.eltwise_core_dram(
+                M=1, N=H, dram_a=self.LM_RESIDUAL, dram_b=self.LM_MLP_DOWN,
+                dram_out=out_addr, mode=UE_MODE.ELTWISE_ADD) or 0
+            folded_resid2 = True
         elif sched is None:
             flops += self.eltwise_core_dram(
                 M=M, N=H, dram_a=in_addr, dram_b=self.LM_ATTN_PROJ,
@@ -2168,6 +2205,8 @@ class Qwen25OmniLMMixin:
             raise ValueError(
                 f"prompt is {seq_len} tokens, PREFILL_MAX_SEQ_LEN is "
                 f"{self.PREFILL_MAX_SEQ_LEN}; tensors are sized for the latter")
+        self._decode_if4_o_ready = False
+        self._prefill_seq_len_run = None
         # M is the row count for qkv_proj/o_proj/mlp_proj/permute/RoPE. None of
         # them need it 64-aligned: matmat_mul_core_dynamic has no M assert,
         # bf16_permute_dram_core only constrains row_width (already aligned,
@@ -2460,6 +2499,9 @@ class Qwen25OmniLMMixin:
         so compatible Qwen multimodal decoders do not inherit this model's
         image-only assumptions.
         """
+        stage_started = time.perf_counter()
+        self._decode_if4_o_ready = False
+        self._prefill_seq_len_run = None
         # The K-lane repack rewrites the shared down_proj image in place, so
         # it must follow compile_decoder(), whose column shards copy that image
         # card -> host -> card, and precede any prefill read of a lane. Prefill
@@ -2610,7 +2652,6 @@ class Qwen25OmniLMMixin:
             worker_addrs.append(waddr)
         if sched is not None and not sched.host_segmented:
             sched.preclear_flags()
-        t0 = time.perf_counter()
         if profile:
             if sched is not None and sched.host_segmented:
                 raise RuntimeError(
@@ -2658,10 +2699,10 @@ class Qwen25OmniLMMixin:
         self._loud(f"  [LM] prefill {seq_len} tokens: {us / 1e6:.2f}s HW, "
                    f"{self._prefill_flops / 1e9:.1f} GFLOP, {gflops:.1f} GFLOPS"
                    f"{f' = {100 * gflops / peak:.0f}% of peak' if peak else ''} "
-                   f"({time.perf_counter() - t0:.2f}s wall){warn}")
+                   f"({time.perf_counter() - stage_started:.2f}s wall){warn}")
         self._latency_prefill_us = us
         self._prefill_gflops = gflops
-        self._prefill_wall_s = time.perf_counter() - t0
+        self._prefill_wall_s = time.perf_counter() - stage_started
         self._prefill_seq_len_run = seq_len
 
     def _base_run_decode_step_profiled(self, token: int, program, checkpoints,
@@ -3058,9 +3099,9 @@ class Qwen25OmniLMMixin:
                 raise RuntimeError(
                     "Omni decoder compiled without its FPGA global-argmax tail"
                 )
-            # Decoder column shards are allocated first. The IF8 embedding then
-            # fills only the audited remainder of each private weight window.
-            self._ensure_fpga_embedding()
+            # Host BF16 lookup needs no private embedding shards or FPGA ISA.
+            if self._device_embedding_enabled():
+                self._ensure_fpga_embedding()
             self._audit_private_reserve()
             return base
         except Exception:
@@ -3191,6 +3232,10 @@ class Qwen25OmniLMMixin:
         )
 
     def _require_decode_overlay(self) -> None:
+        if self.DECODE_O_IF4:
+            if not getattr(self, "_decode_if4_o_ready", False):
+                raise RuntimeError("decode refused before a complete LM prefill")
+            return
         if not getattr(self, "_decode_bf16_o_loaded", False):
             raise RuntimeError(
                 "decode refused before the BF16 O shared phase is active"
@@ -3198,6 +3243,7 @@ class Qwen25OmniLMMixin:
 
     def _invalidate_decode_overlay(self) -> None:
         """Forget every fact made stale when another params phase is loaded."""
+        self._decode_if4_o_ready = False
         self._decode_bf16_o_planned = False
         self._decode_bf16_o_loaded = False
         self._decode_o_plan = None
@@ -3262,9 +3308,12 @@ class Qwen25OmniLMMixin:
         )
         if values != {"o"}:
             raise ValueError(
-                "Qwen2.5-Omni decode phase requires BF16 O projections"
+                "the retained params.bin requires the legacy BF16 O "
+                "decode_o artifact declaration"
             )
-        return values
+        # This config field describes the retained decode_o artifact. The
+        # current runtime uses the already-resident IF4 O instead.
+        return set() if self.DECODE_O_IF4 else values
 
     def _decode_use_one_round_group_attention(self) -> bool:
         """Run Omni's four complete GQA groups concurrently on engines 0..3."""
@@ -3280,15 +3329,15 @@ class Qwen25OmniLMMixin:
         return True
 
     def _decode_projection_is_quantized(self, tag: str) -> bool:
+        if tag == "v":
+            return True  # Decode-only IF4 copy; prefill V stays BF16.
         if tag in self._decode_bf16_projections():
             return False
         return self._base__decode_projection_is_quantized(tag)
 
     def _decode_projection_should_shard(self, tag: str, layer: int) -> bool:
-        # The ordinary materializer can only allocate from the already-full
-        # private windows. BF16 O is installed separately by
-        # _prepare_decode_shared_weights: each engine gets a column shard in its
-        # own 512-MiB-spaced slot of the reclaimed PARAMS phase.
+        # IF4 O uses the ordinary private materializer. The legacy BF16 O
+        # overlay, when selected, installs its stripes separately.
         return tag not in self._decode_bf16_projections()
 
     def _decode_projection_uses_static_bf16(self, tag: str) -> bool:
@@ -3303,7 +3352,7 @@ class Qwen25OmniLMMixin:
         """Describe BF16 O column shards in eight upper-PARAMS stripes.
 
         The private low-DRAM arenas are deliberately not involved: IF4 decoder
-        shards plus the IF8 embedding already consume 501.27 of their 504 MiB.
+        shards must remain inside their audited private reserve.
         Prefill releases the much larger PARAMS phase before decode, so use the
         same 512-MiB spacing that gives private shards independent memory
         streams while retaining BF16 O exactly.
@@ -3409,7 +3458,7 @@ class Qwen25OmniLMMixin:
         return tuple(stripes), by_layer
 
     def _prepare_decode_shared_weights(self, layer_size: int) -> None:
-        """Plan BF16 O addresses and preserve auxiliaries without touching prefill.
+        """Plan the legacy BF16 O overlay when selected.
 
         Decoder compilation happens before prefill because device-side token
         embedding is installed with the decode shards. It may assign addresses
@@ -3417,6 +3466,10 @@ class Qwen25OmniLMMixin:
         prefill image. ``activate_decode_shared_weights`` performs that phase
         transition only after prefill has populated the KV cache.
         """
+        if self.DECODE_O_IF4:
+            # Generic decode sharding copied prefill's IF4 O into private
+            # arenas. Keep the shared image resident for norms and biases.
+            return
         if getattr(self, "_decode_bf16_o_planned", False):
             return
         d = self._lm_dims()
@@ -3603,7 +3656,22 @@ class Qwen25OmniLMMixin:
         )
 
     def activate_decode_shared_weights(self) -> None:
-        """Atomically transition the shared params window from prefill to decode."""
+        """Authorize decode after prefill; load legacy BF16 O only if selected."""
+        if self.DECODE_O_IF4:
+            d = self._lm_dims()
+            compiled = getattr(self, "_prefill_seq_len", None)
+            if (not getattr(self, "_lm_weight_init_done", False)
+                    or compiled is None
+                    or getattr(self, "_prefill_seq_len_run", None) != compiled
+                    or getattr(self, "seq_len", None) != compiled
+                    or int(getattr(self, "_prefill_layers", -1)) != int(d["NL"])):
+                raise RuntimeError(
+                    "IF4 decode O activation requires a completed full-layer "
+                    "prefill for the current prompt")
+            self._decode_if4_o_ready = True
+            self._loud("  [Decode] IF4 O private shards active; shared LM "
+                       "norms and biases retained")
+            return
         import multi_engine_shard as mes
 
         if getattr(self, "_decode_bf16_o_loaded", False):
@@ -3793,11 +3861,9 @@ class Qwen25OmniLMMixin:
         return True
 
     def _decode_shard_override(self, op: str, layer: int):
-        """Decode reuses the N-shard staged at weight-load time.
+        """Decode reuses gate/up N-shards staged at weight-load time.
 
-        gate/up/down each already have their output-column block in every
-        engine's window; `down`'s prefill K-shard is a separate image and is
-        deliberately NOT returned here.
+        Down instead reuses the prefill K-shards and reduces partial outputs.
         """
         return getattr(self, "_mlp_private_shards", {}).get((op, layer))
 
@@ -3845,32 +3911,31 @@ class Qwen25OmniLMMixin:
         if not hasattr(self, "_mlp_private_shards"):
             self._mlp_private_shards = {}
 
-        # ---- the N-shard: gate/up for both phases, down for decode ----------
-        if N % ne or (N // ne) % mes.COL_ALIGN:
-            raise ValueError(f"{what}: N={N} does not give {ne} 64-aligned blocks")
-        rows = N // ne
-        shards = []
-        n_addrs = []
-        for e in range(ne):
-            sl = slice(e * rows, (e + 1) * rows)
-            d_addr, s_addr = self._stage_shard_pair(
-                e, scales[sl], data[sl], f"{tag}_L{layer}.n{e}")
-            n_addrs.append((d_addr, s_addr))
-            shards.append(mes.WeightShard(
-                engine_idx=e, col_offset=e * rows, cols=rows,
-                weight_addr=d_addr, scale_addr=s_addr,
-                layer_stride=0, scale_layer_stride=0))
-        self._mlp_private_shards[(tag, layer)] = mes.ShardedWeight(
-            name=f"{tag}_proj_L{layer}", K=K, N=N, layers=1,
-            data_type=TYPE.IF4, shards=shards)
-        la[f"{tag}_n_shards"] = n_addrs
-
         if tag in ("gate", "up"):
+            # The same private N-shard serves prefill and decode.
+            if N % ne or (N // ne) % mes.COL_ALIGN:
+                raise ValueError(f"{what}: N={N} does not give {ne} 64-aligned blocks")
+            rows = N // ne
+            shards = []
+            n_addrs = []
+            for e in range(ne):
+                sl = slice(e * rows, (e + 1) * rows)
+                d_addr, s_addr = self._stage_shard_pair(
+                    e, scales[sl], data[sl], f"{tag}_L{layer}.n{e}")
+                n_addrs.append((d_addr, s_addr))
+                shards.append(mes.WeightShard(
+                    engine_idx=e, col_offset=e * rows, cols=rows,
+                    weight_addr=d_addr, scale_addr=s_addr,
+                    layer_stride=0, scale_layer_stride=0))
+            self._mlp_private_shards[(tag, layer)] = mes.ShardedWeight(
+                name=f"{tag}_proj_L{layer}", K=K, N=N, layers=1,
+                data_type=TYPE.IF4, shards=shards)
+            la[f"{tag}_n_shards"] = n_addrs
             # Prefill's lane IS the N-shard; nothing further to stage.
             la[f"{tag}_tp"] = n_addrs
             return
 
-        # ---- down also needs the K-shard that prefill contracts over --------
+        # ---- down's K-shard serves both prefill and decode -----------------
         lane = d["MLP"] // ne
         if lane % 64:
             raise ValueError(f"{what}: K lane {lane} is not a whole scale block")

@@ -66,7 +66,7 @@ def _reject_visible_torch_accelerators() -> None:
     if detected:
         details = ", ".join(dict.fromkeys(detected))
         raise RuntimeError(
-            f"Qwen2.5-Omni is FPGA-only, but PyTorch reports {details}. "
+            f"Qwen2.5-Omni requires CPU + FPGA execution, but PyTorch reports {details}. "
             "Launch this entry point in a fresh process; GPU "
             "visibility is disabled before torch import."
         )
@@ -346,15 +346,19 @@ OMNI_PRIVATE_TENSOR_BYTES = 16 * 2**20
 
 # What the private shards need per core, declared BEFORE any shared byte is
 # lent. Measured on the 8-engine map:
-#   gate/up N-shards (both phases)  240.8   down N-shard (decode)  120.4
-#   down K-shard (prefill TP)       120.4   attn decode shard       38.3
-#   lm_head shard                    34.5   embedding shard         67.3
-#   decode BF16 O shard              85.8                        = 707.5 MiB
+#   gate/up N-shards (both phases)  240.8   down K-shard (both phases) 120.4
+#   attn decode shard               38.3
+#   lm_head shard                    34.5   embedding stays on host
+#   decode IF4 O shard               22.8; removing the 67.3-MiB embedding
+#   shard reduces the observed 707.4-MiB peak to about 640.1 MiB/core.
+#   The 645-MiB reservation retains the same ~5-MiB headroom and does not
+#   depend on reclaiming the
+#   shared IF4 prefill image after prefill.
 # Asserted against actual usage after loading, so drift fails loudly instead of
 # silently eating the pool. NOTE: "lm_head shard" here is decode's own
 # column-sharded copy (_ensure_decode_shards_impl) -- the separate, now-
 # removed OMNI_LM_HEAD_BYTES extent below was a DIFFERENT, wasted allocation.
-OMNI_PRIVATE_RESERVE_BYTES = 712 * 2**20
+OMNI_PRIVATE_RESERVE_BYTES = 645 * 2**20
 
 # THERE USED TO BE A SECOND UNSCATTERABLE OBJECT HERE: a 280 MiB "dedicated
 # extent" (OMNI_LM_HEAD_BYTES) holding one contiguous, unsharded copy of the
@@ -829,11 +833,11 @@ class Qwen25OmniUnifiedEngine(
             )
         if set(self._cfg["precision"].get("decode_bf16_projections", ())) != {"o"}:
             raise ValueError(
-                "decode requires a time-shared BF16 O projection region"
+                "the retained params.bin requires its legacy BF16 O region"
             )
-        if self._cfg["precision"].get("embedding") != "if8":
+        if self._cfg["precision"].get("embedding") != "bf16":
             raise ValueError(
-                "the FPGA-only runtime requires precision.embedding='if8'"
+                "Qwen2.5-Omni requires host BF16 token embeddings"
             )
 
     def _read_params_region(self, name: str) -> dict[str, Any]:
@@ -1149,23 +1153,54 @@ class Qwen25OmniUnifiedEngine(
                 for registers in getattr(self, "_decode_attn_worker_regs", ())
             ]
             dims = self._lm_dims()
-            stripes = getattr(self, "_decode_o_stripes", None)
-            if stripes is None or len(stripes) != REQUIRED_ENGINES:
-                raise RuntimeError(
-                    "decode programs.bin metadata requires eight BF16 O stripes"
-                )
-            stripe_bytes = {
-                int(stripe["end"]) - int(stripe["base"])
-                for stripe in stripes
-            }
-            stripe_cols = {int(stripe["cols"]) for stripe in stripes}
-            layer_bytes = {int(stripe["layer_bytes"]) for stripe in stripes}
-            if (
-                len(stripe_bytes) != 1
-                or len(stripe_cols) != 1
-                or len(layer_bytes) != 1
-            ):
-                raise RuntimeError("BF16 O stripe geometry is not uniform")
+            if self.DECODE_O_IF4:
+                o_layers = [self._decode_shards.get(("o", layer))
+                            for layer in range(int(self._decoder_layers_compiled))]
+                if (not o_layers or any(weight is None or len(weight.shards) != REQUIRED_ENGINES
+                                        or weight.data_type is not user_dma_core.TYPE.IF4
+                                        for weight in o_layers)):
+                    raise RuntimeError("decode metadata requires eight IF4 O shards per layer")
+                columns = int(dims["H"]) // REQUIRED_ENGINES
+                expected = [(engine * columns, columns)
+                            for engine in range(REQUIRED_ENGINES)]
+                for weight in o_layers:
+                    if [(int(shard.col_offset), int(shard.cols))
+                            for shard in weight.shards] != expected:
+                        raise RuntimeError("decode IF4 O shards do not cover output columns")
+                o_layout = {
+                    "mode": "private_if4_column_shards",
+                    "precision": "if4",
+                    "engines": REQUIRED_ENGINES,
+                    "columns_per_engine": columns,
+                    "weight_bytes_per_layer_per_engine": columns * int(dims["H"]) // 2,
+                    "scale_bytes_per_layer_per_engine": columns * int(dims["H"]) // 64 * 2,
+                    "slot_stride_bytes": int(self.mc_arena.stride),
+                }
+            else:
+                stripes = getattr(self, "_decode_o_stripes", None)
+                if stripes is None or len(stripes) != REQUIRED_ENGINES:
+                    raise RuntimeError(
+                        "decode programs.bin metadata requires eight BF16 O stripes"
+                    )
+                stripe_bytes = {
+                    int(stripe["end"]) - int(stripe["base"])
+                    for stripe in stripes
+                }
+                stripe_cols = {int(stripe["cols"]) for stripe in stripes}
+                layer_bytes = {int(stripe["layer_bytes"]) for stripe in stripes}
+                if (len(stripe_bytes) != 1 or len(stripe_cols) != 1
+                        or len(layer_bytes) != 1):
+                    raise RuntimeError("BF16 O stripe geometry is not uniform")
+                o_layout = {
+                    "mode": "upper_params_column_stripes",
+                    "precision": "bf16",
+                    "engines": len(stripes),
+                    "columns_per_engine": next(iter(stripe_cols)),
+                    "layer_bytes_per_engine": next(iter(layer_bytes)),
+                    "stripe_bytes_per_engine": next(iter(stripe_bytes)),
+                    "slot_stride_bytes": int(self.mc_arena.stride),
+                    "extent_end": f"0x{max(int(s['end']) for s in stripes):X}",
+                }
             kv_groups = int(dims["KVH"])
             prefill_base, prefill_blob = self._prefill_program
             decode_base, decode_blob = self._decoder_program
@@ -1201,9 +1236,7 @@ class Qwen25OmniUnifiedEngine(
                 "checkpoints": list(getattr(self, "_decoder_checkpoints", ())),
                 "fpga_global_argmax": bool(self._fpga_global_argmax_emitted),
                 "embedding_precision": self._cfg["precision"]["embedding"],
-                "decode_bf16_projections": list(
-                    self._cfg["precision"]["decode_bf16_projections"]
-                ),
+                "decode_bf16_projections": sorted(self._decode_bf16_projections()),
                 "decode_attention": {
                     "mode": "one_complete_gqa_group_per_engine",
                     "kv_groups": kv_groups,
@@ -1214,16 +1247,7 @@ class Qwen25OmniUnifiedEngine(
                         range(kv_groups, REQUIRED_ENGINES)
                     ),
                 },
-                "decode_o_layout": {
-                    "mode": "upper_params_column_stripes",
-                    "precision": "bf16",
-                    "engines": len(stripes),
-                    "columns_per_engine": next(iter(stripe_cols)),
-                    "layer_bytes_per_engine": next(iter(layer_bytes)),
-                    "stripe_bytes_per_engine": next(iter(stripe_bytes)),
-                    "slot_stride_bytes": int(self.mc_arena.stride),
-                    "extent_end": f"0x{max(int(s['end']) for s in stripes):X}",
-                },
+                "decode_o_layout": o_layout,
                 "prefill_program_base": f"0x{int(prefill_base):X}",
                 "prefill_program_size": len(prefill_blob),
                 "prefill_program_sha256": hashlib.sha256(
@@ -1861,7 +1885,7 @@ class Qwen25OmniUnifiedEngine(
             lines.append(
                 f"- **LM weight DRAM:** "
                 f"{(self._lm_weight_end - self.PARAMS_BASE) / 2**20:.1f} MiB "
-                f"(IF4 + BF16 V/O, IF8 embedding)"
+                f"(IF4 projections, BF16 prefill V; BF16 embedding on host)"
             )
         lines += self._program_section_lines()
         lines.append("")
@@ -1931,6 +1955,8 @@ class Qwen25OmniUnifiedEngine(
                 f"({100.0 * prefill_gflops / peak if peak else 0.0:.1f}% of peak)",
                 f"- **End-to-end (CPU timer):** "
                 f"{getattr(self, '_prefill_wall_s', 0.0):.2f} s",
+                "- **Embedding:** host BF16 gather and row DMA are included "
+                "in CPU time, not FPGA time",
                 "",
             ]
 
@@ -1954,6 +1980,7 @@ class Qwen25OmniUnifiedEngine(
                 f"{(enc_hw_us + pre_hw_us) / 1e3:.1f} ms",
                 f"- **TTFT (CPU timer; {' + '.join(covered)}):** "
                 f"{enc_wall + pre_wall:.2f} s",
+                "  (includes prefill host embedding lookup and DMA)",
                 "",
             ]
 
@@ -2798,9 +2825,8 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     ue.lm_weight_init()
     ue.lm_tensor_init()
     ue.compile_prefill(len(context), profile=args.profile)
-    # Decoder setup installs the device-side embedding and copies every
-    # reusable projection into private windows. BF16 O addresses are compiled
-    # now, but their shared overlay is deliberately deferred until prefill.
+    # Decoder setup installs IF4 projection shards in private windows; the
+    # BF16 embedding table stays on the host and only selected rows are DMA'd.
     ue.compile_decoder(profile=args.profile)
     ue.check_master_isa()
     # These bodies are address-coupled: decoder starts immediately after this

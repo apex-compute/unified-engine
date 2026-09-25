@@ -49,39 +49,42 @@ Vision, audio, and Thinker weights are phase-shared in DRAM. Each input encoder
 runs first, its soft-token output is retained, and the Thinker weights then reuse
 the same model-weight window for prefill and decode. The transformer towers and
 Thinker prefill use all eight engines. Decode's sharded projections and LM head,
-including the BF16 O column stripes, also use engines 0-7. The optimized
+including the IF4 O column shards, also use engines 0-7. The optimized
 one-round GQA path assigns its four complete KV groups to engines 0-3; engines
 4-7 remain required handshake participants. Remaining serial layout/merge work
 and the final global argmax run on engine 0, still on the FPGA. Engines 8-11
 remain unused.
 
 All learned inference arithmetic runs on the U55: vision patch projection,
-audio conv1/conv2 and GELU, the vision/audio transformer towers, IF8 token
-embedding lookup and dequantization, the Thinker, LM head, and final global
-argmax. The Python host is limited to control/DMA, tokenization, file/media
-decode, resize/resample/log-mel preparation, masking, and layout transforms.
+audio conv1/conv2 and GELU, the vision/audio transformer towers, the Thinker,
+LM head, and final global argmax. The Python host also performs BF16 token
+embedding lookup and transfers the selected feature rows to FPGA tensor DRAM,
+alongside control/DMA, tokenization, file/media decode, resize/resample/log-mel
+preparation, masking, and layout transforms.
 The entrypoint hides CUDA/HIP/ROCm before importing PyTorch and fails closed if
 PyTorch reports another accelerator backend active or visible.
 
-The 152064 x 3584 embedding is distinct from the untied LM head and is preserved
-as its own IF8 table. Its padded accelerator layout occupies 538.31 MiB, split
-equally across the eight private windows (67.29 MiB/core). Decoder weights other
-than O consume about 434.0 MiB/core; together with the embedding they use
-501.27 MiB of each 504-MiB private weight arena, leaving 2.73 MiB/core. Each
-512-MiB engine window reserves the remaining 8 MiB for tensor scratch, and each
-worker has a separate 8-MiB ISA slice. Prompt rows are dequantized directly into
-LM DRAM; a generated token's lookup is inlined into its decoder preamble. No
-embedding row or logits vector is evaluated on the host.
+The 152064 x 3584 embedding is distinct from the untied LM head and is stored
+as BF16 in `params.bin` (1039.5 MiB). The complete table is loaded into host
+RAM, not the eight private FPGA weight windows. The host gathers prompt rows
+and one row per generated token, then DMA-writes those BF16 feature vectors to
+LM tensor DRAM. The IF4 decode O shards still use about 22.8 MiB/core. The
+embedding lookup and DMA are excluded from FPGA hardware counters but included
+in prefill/decode CPU stage timers and the CPU TTFT; logits and argmax remain on
+the FPGA.
 
 The Thinker follows Qwen2.5-VL's mixed projection policy during prefill: V is
-BF16 for attention accuracy, while Q/K/O and GATE/UP/DOWN are IF4. After a
-successful full 28-layer prefill, the runtime reclaims the shared prefill image
-and scatters the 686-MiB decode-only BF16 O region into eight 85.75-MiB
-upper-PARAMS stripes: one 448-column shard per engine across all 28 layers.
-Decode therefore uses BF16 V/O; O runs across engines 0-7 through the dense M=1
-sharded tiler, while the remaining decoder projections and head retain their
-private shards. This phase change moves no learned arithmetic to the host and
-remains within the unchanged 8-GiB map. The LM head remains 64-column aligned at
+BF16, while Q/K/O and GATE/UP/DOWN are IF4. Decode quantizes a separate V
+copy to IF4 and copies the existing IF4 O into eight private 448-column
+shards; prefill still reads its shared BF16 V and IF4 O images.
+MLP down uses the same private eight-way K-sharded IF4 weights in prefill and
+decode; decode sums the eight full-width partial outputs before its residual
+add, so it no longer stages a separate N-sharded down-weight copy. The legacy
+decode-only BF16 O region remains in `params.bin` for artifact compatibility
+but is not uploaded. Shared LM norms and biases stay resident after prefill.
+The host embedding lookup is a gather, not matrix arithmetic, and the remaining
+learned matrix operations remain within the 8-GiB FPGA map.
+The LM head remains 64-column aligned at
 152064 rows, while its 399 rows beyond the tokenizer's 151665 valid IDs receive
 a device-side minimum-BF16 bias and therefore cannot win the FPGA global argmax.
 Greedy generation stops only on Omni's declared `<|im_end|>` EOS (151645); its
@@ -204,13 +207,11 @@ The address-coupled prefill and decoder groups are published together in one
 artifact generation. An inter-process file lock also rejects concurrent Omni
 runs before they can race the artifact files or the FPGA queues.
 
-Request-specific embedding, decode-dispatch, and rendezvous/flag ISA remains
+Request-specific decode-dispatch and rendezvous/flag ISA remains
 runtime-generated because it contains token-, position-, address-, or
-request-state values. This includes token-specific IF8 embedding lookup and
-dequantization, which still executes entirely on the FPGA. This is the same
-boundary used by the Gemma4 E2B flow: stable stage programs execute from the
-validated program image, while per-request FPGA control/embedding ISA is
-generated at runtime. All learned arithmetic remains FPGA-only.
+request-state values. Embedding lookup is instead a host BF16 gather and DMA;
+it emits no FPGA lookup/dequantization ISA. Stable stage programs still execute
+from the validated program image.
 
 The deploy-time artifacts are therefore:
 
@@ -222,8 +223,8 @@ The deploy-time artifacts are therefore:
 
 None of this changes or reloads the FPGA image. The runner requires the existing
 U55C 8-GiB image, uses exactly engines 0-7, and leaves any additional engines
-idle. CPU and GPU are not used for learned inference compute; the host duties
-remain the preprocessing, layout, DMA, and control operations listed above.
+idle. The CPU performs the BF16 embedding gather in addition to the host duties
+listed above; the GPU is not used for inference.
 
 ```bash
 # Text sanity check
