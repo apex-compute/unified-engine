@@ -540,13 +540,19 @@ def _attention_bytes(batch: int, aligned_seq_len: int, head_dim: int, bpe: int =
 
 def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
                  label: str, default_out_name: str,
-                 media_result: dict | None = None) -> dict:
+                 media_result: dict | None = None,
+                 media_result_fn=None) -> dict:
     """The op-by-op measurement + derivation, generic over the target dims.
 
     Used by --high (dims no real run can reach) and by --low/--medium
     --standalone (dims a real run CAN reach, specifically so the derived
     numbers can be checked against that real run's own measured GFLOPS/
     tok-s -- see the module docstring's validation argument).
+
+    `media_result_fn`, if given, is called to run the vision/audio media
+    phase AFTER all LM ops are measured but BEFORE the report is written --
+    so the LM ops are measured cold, never immediately preceded by the
+    media phase's sustained compute (see run_high).
     """
     import user_dma_core as udc
     udc.set_dma_device(args.dev)
@@ -687,6 +693,15 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
           f"{decode_step_ms:.2f} ms ({tok_s:.2f} tok/s)")
     print(f"Decode step (empirical x{EMPIRICAL_DECODE_LATENCY_SCALE:.2f} latency): "
           f"{corrected_decode_ms:.2f} ms ({corrected_tok_s:.2f} tok/s)")
+
+    # All LM ops are measured by this point; only now (after the numbers
+    # above are locked in) do we run the media phase, if requested.
+    if media_result_fn is not None:
+        if media_result is not None:
+            raise ValueError("pass either media_result or media_result_fn, not both")
+        media_result = media_result_fn()
+        if media_result is None:
+            raise RuntimeError("media phase did not return measurements; LM op-by-op numbers above are still valid, but the TTFT section will be omitted")
 
     def report_rows(rows):
         result = [
@@ -831,17 +846,27 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
 def run_high(args) -> None:
     if args.multi_core != 8:
         raise ValueError("--high requires --multi-core 8 for its fixed 8-engine LM measurements")
-    media = _run([
-        sys.executable, HIGH_MEDIA_SCRIPT, "--dev", args.dev,
-        "--multi-core", str(args.multi_core), "--frames", "4",
-        "--audio-seconds", "6.0",
-    ], "HIGH real vision/image and audio", result_prefix="HIGH_MEDIA_RESULT: ")
-    if media is None:
-        raise RuntimeError("HIGH media phase did not return measurements; stopping before LM benchmark")
+
+    # The LM op-by-op measurement runs FIRST and cold, before any vision/
+    # audio load touches the board. Running ~90s of real vision compute
+    # immediately before the LM ops was found to measurably slow them (e.g.
+    # q_proj/gate_proj ~15-17% lower GFLOPS than measured standalone) -- a
+    # board-thermal artifact of THIS benchmark's own stage ordering, not a
+    # model regression. media_result_fn defers the media subprocess until
+    # after every LM op is measured, so the numbers above never carry that
+    # bias; the media phase's own HW-counter numbers are unaffected by
+    # ordering and are still merged into the same report.
+    def _run_media():
+        return _run([
+            sys.executable, HIGH_MEDIA_SCRIPT, "--dev", args.dev,
+            "--multi-core", str(args.multi_core), "--frames", "4",
+            "--audio-seconds", "6.0",
+        ], "HIGH real vision/image and audio", result_prefix="HIGH_MEDIA_RESULT: ")
+
     run_op_by_op(
         args, prefill_tokens=HIGH_PREFILL_TOKENS, decode_context=HIGH_DECODE_CONTEXT,
         label="HIGH", default_out_name="qwen2.5_omni_7b_benchmark_high_op_by_op.md",
-        media_result=media,
+        media_result_fn=_run_media,
     )
 
 

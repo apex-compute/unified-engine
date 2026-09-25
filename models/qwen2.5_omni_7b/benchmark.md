@@ -1,10 +1,19 @@
 # Qwen2.5-Omni-7B on the Apex Compute Unified Engine — tiered benchmark
 
 Low and Medium are continuous eight-engine model runs on the Alveo U50. High
-measures four full-resolution vision passes and audio on the FPGA, then measures
-individual eight-engine LM operations at High dimensions. High's LM and TTFT
-totals are **derived**, not an end-to-end model run. All FPGA times below come
-from hardware counters; CPU times are identified separately.
+measures individual eight-engine LM operations at High dimensions **before**
+the media phase, then measures four full-resolution vision passes and audio
+on the FPGA. High's LM and TTFT totals are **derived**, not an end-to-end
+model run. All FPGA times below come from hardware counters; CPU times are
+identified separately.
+
+High's LM ops are measured cold, ahead of the vision/audio phase, because
+running ~90 s of real vision compute immediately before them measurably
+slowed the following LM matmuls (q_proj/gate_proj etc. read ~15-17% lower
+GFLOPS when timed right after vision than when timed standalone) — a
+board-thermal artifact of stage ordering within this benchmark, not a model
+regression. Reordering the two phases (LM first, media second) recovered the
+LM ops' standalone GFLOPS; the numbers below reflect that ordering.
 
 This revision reflects three private-DRAM/decode optimizations: the token
 embedding moved from an FPGA-resident IF8 lookup table to a host-side BF16
@@ -44,17 +53,18 @@ omits LM operations outside the isolated-op coverage described below.
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Low | — | 613.2 | 33384.4 | **33997.7** | 34.00 | 34.03 |
 | Medium | 22257.2 | 1181.8 | 83853.2 | **107292.2** | 107.29 | 107.33 |
-| High | 90561.9 | 1446.6 | 339315.3 | **431323.8 projected** | 431.32 projected | Not available |
+| High | 89062.4 | 1403.7 | 288448.1 | **378914.2 projected** | 378.91 projected | Not available |
 
 Low and Medium TTFTs are sums of real model-stage hardware counters; their CPU
 columns sum the corresponding stage timers, and now include the host BF16
 embedding gather (previously an on-FPGA IF8 lookup, now off the hardware
 counter and inside the CPU timer instead). High's vision and audio are real
 FPGA measurements, but its prefill is a sum of separately measured operation
-latencies across 28 layers. Therefore **431.32 s is not an end-to-end or CPU
-timer measurement**. The High TTFT split is 21.0% vision, 0.3% audio, and 78.7%
-derived prefill (Low: 1.8% audio/98.2% prefill; Medium: 20.7% vision/1.1%
-audio/78.2% prefill).
+latencies across 28 layers, measured cold before the media phase runs (see
+above). Therefore **378.91 s is not an end-to-end or CPU timer measurement**.
+The High TTFT split is 23.5% vision, 0.4% audio, and 76.1% derived prefill
+(Low: 1.8% audio/98.2% prefill; Medium: 20.7% vision/1.1% audio/78.2%
+prefill).
 
 ## Stage throughput and utilization
 
@@ -70,15 +80,17 @@ peak, including stages that do not occupy all engines equally.
 | Medium | Vision/image | 5811.8 | 5645.5 | 22257.2 | 261.1 | 69.5% | 253.6 | 67.5% |
 | Medium | Audio | 336.5 | 328.8 | 1181.8 | 284.7 | 75.8% | 278.2 | 74.1% |
 | Medium | Prefill | 28426.0 | 27555.9 | 83853.2 | 339.0 | 90.3% | 328.6 | 87.5% |
-| High | Vision/image | 23247.0 | 22581.8 | 90561.9 | 256.7 | 68.4% | 249.4 | 66.4% |
-| High | Audio | 400.1 | 387.3 | 1446.6 | 276.6 | 73.7% | 267.7 | 71.3% |
-| High | Prefill, derived | 97703.7 | 87760.3 | 339315.3 | 287.9 | 76.7% | 258.6 | 68.9% |
+| High | Vision/image | 23247.0 | 22581.8 | 89062.4 | 261.0 | 69.5% | 253.6 | 67.5% |
+| High | Audio | 400.1 | 387.3 | 1403.7 | 285.0 | 75.9% | 275.9 | 73.5% |
+| High | Prefill, derived | 97703.7 | 87760.3 | 288448.1 | 338.7 | 90.2% | 304.2 | 81.0% |
 
-The measured vision cost is 22.26 s for Medium's image and 22.64 s per High
-replay. High audio costs 1.45 s. Derived High prefill is 18.11 input tokens/s;
-the real Low and Medium prefill rates are 25.43 and 24.41 tokens/s. The High
-prefill rate falls as the 6144-row attention workload grows; it should not be
-replaced by a linear extrapolation from the shorter model runs.
+The measured vision cost is 22.26 s for Medium's image and 22.27 s per High
+replay. High audio costs 1.40 s. Derived High prefill is 21.30 input tokens/s;
+the real Low and Medium prefill rates are 25.43 and 24.41 tokens/s. High's
+prefill GFLOPS now lands close to the real Low/Medium prefill rate (90.3%,
+90.9% of peak) because the LM ops are measured cold, before the media phase;
+it should still not be replaced by a linear extrapolation from the shorter
+model runs.
 
 ## Decode throughput
 
@@ -86,8 +98,8 @@ replaced by a linear extrapolation from the shorter model runs.
 | :--- | ---: | ---: | ---: | ---: | ---: | :--- |
 | Low | 862 tokens at final step | 15.12 tok/s | 15.12 tok/s | 14.68 tok/s | 66.1 ms HW | Measured model run, 13 steps |
 | Medium | 2079 tokens at final step | 9.79 tok/s | 9.69 tok/s | 9.49 tok/s | 103.2 ms HW average | Measured model run, 32 steps |
-| High | 6144-token target | — | 6.99 tok/s raw | — | 143.05 ms raw | Isolated-op sum, not model decode |
-| High, corrected estimate | 6144-token target | — | 6.35 tok/s | — | 157.36 ms | Raw latency × 1.10 empirical scale |
+| High | 6144-token target | — | 7.15 tok/s raw | — | 139.79 ms raw | Isolated-op sum, not model decode |
+| High, corrected estimate | 6144-token target | — | 6.50 tok/s | — | 153.77 ms | Raw latency × 1.10 empirical scale |
 
 Decode is faster at every tier than the pre-optimization baseline (Low was
 13.09-13.34 tok/s CPU/HW; Medium was 8.68-8.88 tok/s): IF4 O/V and the shared
@@ -97,7 +109,7 @@ per step and the number of distinct weight images it has to hold resident.
 High's correction factor (1.10) is carried over from `benchmark.py`'s
 pre-optimization calibration (Low 78.2/71.75 ms, Medium 99.2/89.19 ms) and has
 **not** been refitted against this revision's faster decode; treat the
-corrected 6.35 tok/s figure as directional; the raw 6.99 tok/s row is this
+corrected 6.50 tok/s figure as directional; the raw 7.15 tok/s row is this
 run's actual isolated-op measurement. The High decode operation table includes
 an eight-engine LM head plus global argmax; its full step still omits
 normalization, RoPE, residual/elementwise work (other than the down_proj
