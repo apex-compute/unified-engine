@@ -8,6 +8,7 @@
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
 \usepackage{float}
+\usepackage{caption}
 \usepackage{xcolor}
 \usepackage[hidelinks]{hyperref}
 
@@ -16,7 +17,7 @@
 \newcommand{\ue}{Unified~Engine}
 \newcommand{\iffour}{IF4}
 \newcommand{\bfteen}{bf16}
-\newcommand{\alveo}{Alveo~12-engine}
+\newcommand{\alveo}{Alveo~U50}
 \newcommand{\numTBD}{{\color{red}--}}
 
 \setlength{\textfloatsep}{6pt}
@@ -66,8 +67,8 @@ Expert (Gemma-300M)  & 18\,L, $d$1024, 10 steps         & $\sim$0.31\,B & 71.0 \
 \section{Porting}
 \label{sec:port}
 %=============================================================================
-The \ue{}~v1 is a soft accelerator IP, instanced twelve times on one AMD Alveo U55C
-card with $4$\,GB of DRAM. Two constraints shape the port: the DRAM budget and
+The \ue{}~v1 is a soft accelerator IP, instanced eight times on one AMD Alveo U50
+card at $366$\,MHz, with a $4$\,GB DRAM budget. Two constraints shape the port: the DRAM budget and
 the engine's $64$-element alignment.
 
 \textbf{Weights.} The \bfteen{} checkpoint does not fit, so every matmul weight
@@ -214,99 +215,157 @@ excluded during bring-up.}
 \noindent The two policies agree on every prompt, and successful episodes
 differ by a few steps.
 
+
 %=============================================================================
-\section{Throughput: \alveo{} vs.\ CUDA}
+\section{Throughput}
 \label{sec:throughput}
 %=============================================================================
-Each platform is reported as per-section wall-clock. \alveo{} times come from
-the engine's own counters; the GPU baseline is openpi's JAX/XLA path.
+All throughput results are collected on the next page
+(Table~\ref{tab:summary}): NVIDIA platforms on the left, the \ue{} on the
+right, with the ASIC projections in bold. All platforms run batch~1 and ten
+denoise steps.
 
-GPU stages are jitted separately with a device sync at each boundary, so their
-sum slightly exceeds the fused end-to-end time (Table~\ref{tab:timing-gpu}).
+\textbf{FPGA.} Eight \ue{}~v1 instances on one \alveo{} at $366$\,MHz. Times
+come from the engine's own cycle counters and are pure back-to-back execution;
+programs are compiled once up front and that one-time cost is excluded.
 
+\textbf{ASIC projection.} Each section is treated as scaling linearly with
+engine count $\times$ clock. The ASIC rows scale the measured
+\alveo{} times by $(1600\cdot N)/(366\cdot 8)$: $26.2\times$ for $N{=}48$
+engines and $35.0\times$ for $N{=}64$ at $1.6$\,GHz. Utilization is held at the
+measured FPGA value.
+
+\textbf{GPUs.} The RTX~5070 baseline is openpi's JAX/XLA path, measured by us;
+stages are jitted separately with a device sync at each boundary, so their sum
+slightly exceeds the fused end-to-end time. The Jetson Orin Nano was also
+measured by us with openpi's PyTorch path; its 8\,GB cannot hold the \bfteen{}
+checkpoint, so we staged weights from storage and report compute only. Its
+prefix is longer (968 tokens) because that path encodes all three slots and pads
+the instruction to its full budget. Jetson Thor numbers are NVIDIA's published
+figures; we did not measure them.
+
+\clearpage
+%-----------------------------------------------------------------------------
+%  Throughput tables: one page. Left = NVIDIA, right = Unified Engine.
+%-----------------------------------------------------------------------------
 \begin{table}[H]
 \centering\small
-\caption{RTX~5070 (\bfteen{}, openpi JAX/XLA). Per-stage times are
-separately-jitted; End-to-end is the fused \texttt{policy.infer}.}
+\caption{End-to-end latency per inference, batch~1, ten denoise steps.
+ASIC rows (bold) are linear projections from the measured \alveo{}.}
+\label{tab:summary}
+\begin{tabular}{@{}llcrrr@{}}
+\toprule
+\textbf{Platform} & \textbf{Config} & \textbf{Precision} & \textbf{Latency (ms)} & \textbf{inf/s} & \textbf{Price} \\
+\midrule
+AMD Alveo U50           & $8\times$ \ue{}, $366$\,MHz   & \iffour{} & 13\,100 & 0.076 & \\
+\textbf{\ue{} ASIC} & $48\times$ \ue{}, $1.6$\,GHz & \iffour{} & \textbf{500} & \textbf{2.00} & \\
+\textbf{\ue{} ASIC} & $64\times$ \ue{}, $1.6$\,GHz & \iffour{} & \textbf{375} & \textbf{2.67} & \\
+\midrule
+NVIDIA Jetson Thor T5000 & MAXN, $130$\,W                & \bfteen{} & 132    & 7.58  & \$3\,499$^{*}$ \\
+NVIDIA Jetson Orin Nano 8\,GB & $7$\,W mode$^{\ddagger}$ & \bfteen{} & 4\,266 & 0.234 & \$249$^{*}$ \\
+NVIDIA RTX~5070          & $250$\,W                      & \bfteen{} & 130    & 7.68  & \$549 \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+{\footnotesize $^{\ddagger}$Compute only; weight staging from storage excluded.
+$^{*}$Developer-kit price. Prices are NVIDIA launch MSRP.}
+\end{table}
+
+\begin{table}[H]
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{minipage}[t]{0.485\textwidth}
+\centering
+\textbf{NVIDIA}\par\vspace{4pt}
+
+\captionof{table}{RTX~5070 (\bfteen{}, openpi JAX/XLA). Per-stage times are
+separately jitted; end-to-end is the fused \texttt{policy.infer}.}
 \label{tab:timing-gpu}
 \begin{tabular}{@{}lcc@{}}
 \toprule
-\textbf{Model section} & \textbf{Time (s)} & \textbf{GFLOP/s} \\
+\textbf{Section} & \textbf{Time (s)} & \textbf{GFLOP/s} \\
 \midrule
 Vision encoder          & 0.019  & 33\,793 \\
 Prefix (Gemma-2B)       & 0.079  & 29\,411 \\
-Action expert (denoise) & 0.037  & 1\,935  \\
+Action expert           & 0.037  & 1\,935  \\
 \midrule
-\textbf{End-to-end}     & 0.130  & 23\,502 \\
-\textbf{Throughput (inf/s)} & \multicolumn{2}{c}{7.68} \\
+\textbf{End-to-end}     & \textbf{0.130}  & \textbf{23\,502} \\
+\textbf{inf/s}          & \multicolumn{2}{c}{7.68} \\
 \bottomrule
 \end{tabular}
-\end{table}
 
-\noindent\textbf{Edge GPU.} The Jetson Orin Nano Super runs the same
-checkpoint at \bfteen{} in $7$\,W mode (Table~\ref{tab:timing-jetson}).
-
-\begin{table}[H]
-\centering\small
-\caption{Jetson Orin Nano Super (\bfteen{}, openpi PyTorch/CUDA), 968-token
-prefix, $7$\,W mode.$^{*}$}
+\vspace{10pt}
+\captionof{table}{Jetson Orin Nano 8\,GB (\bfteen{}, openpi PyTorch), $7$\,W
+mode, 968-token prefix. Compute only.}
 \label{tab:timing-jetson}
 \begin{tabular}{@{}lcc@{}}
 \toprule
-\textbf{Model section} & \textbf{Time (s)} & \textbf{GFLOP/s} \\
+\textbf{Section} & \textbf{Time (s)} & \textbf{GFLOP/s} \\
 \midrule
 Vision encoder          & 0.480 & 1\,366 \\
 Prefix (Gemma-2B)       & 2.358 & 1\,686 \\
-Action expert (denoise) & 1.428 & 53.7   \\
-Weight streaming$^{*}$  & 5.089 & ---    \\
+Action expert           & 1.428 & 53.7   \\
 \midrule
-\textbf{Compute only}   & \textbf{4.266} & \textbf{1\,104} \\
-\textbf{End-to-end}     & \textbf{9.354} & \textbf{503}    \\
-\textbf{Throughput (inf/s)} & \multicolumn{2}{c}{0.107} \\
+\textbf{Compute}        & \textbf{4.266} & \textbf{1\,104} \\
+\textbf{inf/s}          & \multicolumn{2}{c}{0.234} \\
 \bottomrule
 \end{tabular}
-\end{table}
-\noindent{\footnotesize $^{*}$The checkpoint exceeds the Jetson's usable memory,
-so sections run staged and the prefix re-reads its layer weights from storage
-each inference. Not model compute.}
 
-Achieved rates fall as sections shrink. The expert is the extreme case: ten
-short sequential steps against a long K/V cache are latency-bound, and
-arithmetic throughput does not help.
+\vspace{10pt}
+\captionof{table}{Jetson Thor T5000, MAXN $130$\,W. NVIDIA-published
+figures, not measured by us.}
+\label{tab:timing-thor}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Backend} & \textbf{Total (ms)} & \textbf{Model (ms)} & \textbf{Speedup} \\
+\midrule
+PyTorch \bfteen{} & $\sim$132 & $\sim$128 & $1.0\times$ \\
+\bottomrule
+\end{tabular}
+\end{minipage}%
+\hfill
+\begin{minipage}[t]{0.485\textwidth}
+\centering
+\textbf{\ue{}}\par\vspace{4pt}
 
-The Jetson prefix is longer than the \alveo{}'s because openpi's PyTorch path
-encodes all three slots and pads the instruction to its full budget, so
-per-section GFLOP counts differ between the GPU and Jetson columns.
-
-\begin{table}[H]
-\centering\small
-\caption{\alveo{} (\iffour{}) --- twelve \ue{}~v1 instances on one AMD Alveo U55C,
-832-token prefix. GFLOP/s is the work the engines issue over measured time,
-measured by the hardware cycle counter. Peak is $12\times64$ MACs/cycle at
-$300$\,MHz $= 460.8$\,GFLOP/s. Times are pure back-to-back execution;
-programs are compiled once up front and that one-time cost is excluded.}
+\captionof{table}{\alveo{} (\iffour{}), $8\times$ \ue{}~v1 at $366$\,MHz,
+832-token prefix. Measured. Peak $8\times64$ MACs/cycle $= 374.8$\,GFLOP/s.}
 \label{tab:timing-fpga}
 \begin{tabular}{@{}lccc@{}}
 \toprule
-\textbf{Model section} & \textbf{Time (s)} & \textbf{GFLOP/s} & \textbf{\% peak} \\
+\textbf{Section} & \textbf{Time (s)} & \textbf{GFLOP/s} & \textbf{\% pk} \\
 \midrule
-Vision encoder          & 2.2  & 313.8 & 68 \\
-Prefix (Gemma-2B)       & 8.7  & 389.3 & 84 \\
-Action expert (denoise) & 0.9  & 87.7  & 19 \\
+Vision encoder          & 2.32  & 297.6 & 79 \\
+Prefix (Gemma-2B)       & 10.03 & 340.0 & 91 \\
+Action expert           & 0.75  & 101.9 & 27 \\
 \midrule
-\textbf{End-to-end}     & 11.8 & \textbf{353.5} & \textbf{77} \\
-\textbf{Throughput (inf/s)} & \multicolumn{3}{c}{0.0847} \\
+\textbf{End-to-end}     & \textbf{13.1} & \textbf{318.0} & \textbf{85} \\
+\textbf{inf/s}          & \multicolumn{3}{c}{0.076} \\
 \bottomrule
 \end{tabular}
+
+\vspace{10pt}
+\captionof{table}{\ue{} ASIC projection (\iffour{}), $1.6$\,GHz. Linear
+scaling of Table~\ref{tab:timing-fpga} by engines$\times$clock.}
+\label{tab:timing-asic}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{Section} & \textbf{48 eng (ms)} & \textbf{64 eng (ms)} \\
+\midrule
+Vision encoder          & \textbf{88.4}  & \textbf{66.3}  \\
+Prefix (Gemma-2B)       & \textbf{382.6} & \textbf{286.9} \\
+Action expert           & \textbf{28.5}  & \textbf{21.4}  \\
+\midrule
+\textbf{End-to-end}     & \textbf{499.5} & \textbf{374.6} \\
+\textbf{inf/s}          & \textbf{2.00}  & \textbf{2.67}  \\
+Peak GFLOP/s            & 9\,830  & 13\,107 \\
+Scale vs.\ U50          & $26.2\times$ & $35.0\times$ \\
+\bottomrule
+\end{tabular}
+\end{minipage}
 \end{table}
+\clearpage
 
-\noindent\textbf{Config.} \alveo{}: $4$\,GB DRAM. All platforms batch~1, ten
-denoise steps, sample~0.
-
-\vspace{2pt}
-\noindent The whole \pizero{} policy runs on the \ue{}~v1, vision, prefix and
-the full denoise loop, with no host fallback (Table~\ref{tab:timing-fpga}). It is
-two orders of magnitude behind the desktop GPU and within a small factor of the
-Jetson. FLOPs concentrate in the prefix; latency concentrates in the expert.
 
 \end{document}
