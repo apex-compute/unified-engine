@@ -260,11 +260,14 @@ def _emit_completion_barrier(ue, is_master: bool, ne: int) -> None:
 
 
 def _measure_matmul(dev: str, M: int, K: int, N: int, ne: int, quantized: bool,
-                    k_sharded: bool = False) -> tuple[float, int]:
+                    k_sharded: bool = False,
+                    reduce_k: bool = False) -> tuple[float, int]:
     """``ne`` engines, each computing its real column (or, if ``k_sharded``,
     row) shard of one (M, K, N) projection, barrier-synchronized at the same
     two points the real compiled program is: together at the start, and the
-    master held at completion until every worker is done. Returns the
+    master held at completion until every worker is done. For decode down,
+    ``reduce_k`` additionally times the seven full-width BF16 additions on
+    the master, exactly as the compiled decode path does. Returns the
     MASTER's latency (the group's real completion time, handshake overhead
     included) and the FULL op's total FLOPs.
 
@@ -284,6 +287,8 @@ def _measure_matmul(dev: str, M: int, K: int, N: int, ne: int, quantized: bool,
 
     IF4_SCALE_BYTES, IF4_DATA_BYTES = 2, 32   # one bf16 scale + 32 packed bytes per 64-elem block
     ne = max(1, ne)
+    if reduce_k and not k_sharded:
+        raise ValueError("reduce_k requires K-sharded weights")
     if k_sharded:
         assert K % ne == 0, f"K={K} does not split evenly over {ne} engines"
         k_shard, n_shard = K // ne, N
@@ -292,12 +297,19 @@ def _measure_matmul(dev: str, M: int, K: int, N: int, ne: int, quantized: bool,
         k_shard, n_shard = K, N // ne
 
     ues = _make_multi_engine_ues(dev, ne)
+    # All K-shard partials must be readable by the master after the workers
+    # finish. The real decode uses one shared scratch plane for these rows.
+    partial_base = (ues[0].allocate_tensor_dram(ne * M * N * 2)
+                    if reduce_k else None)
+    reduced_addr = (ues[0].allocate_tensor_dram(M * N * 2)
+                    if reduce_k else None)
     prog_addrs = []
     for i, ue in enumerate(ues):
         is_master = i == 0
         a_addr = ue.allocate_tensor_dram(M * k_shard * 2)
         ue.dma_to_accelerator_memory(a_addr, torch.randn(M, k_shard, dtype=torch.bfloat16))
-        out_addr = ue.allocate_tensor_dram(M * n_shard * 2)
+        out_addr = (partial_base + i * M * N * 2 if reduce_k
+                    else ue.allocate_tensor_dram(M * n_shard * 2))
         ue.start_capture()
         _emit_start_barrier(ue, is_master, ne)
         if quantized:
@@ -317,6 +329,14 @@ def _measure_matmul(dev: str, M: int, K: int, N: int, ne: int, quantized: bool,
             ue.matmat_mul_core(M=M, K=k_shard, N=n_shard, A_DRAM_ADDR=a_addr, B_DRAM_ADDR=b_addr,
                               OUTPUT_DRAM_ADDR=out_addr)
         _emit_completion_barrier(ue, is_master, ne)
+        if reduce_k and is_master:
+            acc_addr = partial_base
+            for j in range(1, ne):
+                ue.eltwise_core_dram(
+                    M=M, N=N, dram_a=acc_addr,
+                    dram_b=partial_base + j * M * N * 2,
+                    dram_out=reduced_addr, mode=udc.UE_MODE.ELTWISE_ADD)
+                acc_addr = reduced_addr
         ue.generate_instruction_halt()
         ue.stop_capture()
         prog_addr = ue.get_program_dram_addr()
@@ -331,7 +351,7 @@ def _measure_matmul(dev: str, M: int, K: int, N: int, ne: int, quantized: bool,
     master_us = ues[0].report_latency_in_us()
     for ue in ues[1:]:
         ue.wait_queue(60.0)
-    return master_us, 2 * M * K * N
+    return master_us, 2 * M * K * N + ((ne - 1) * M * N if reduce_k else 0)
 
 
 def _measure_lm_head_and_argmax(dev: str, hidden: int, vocab: int,
@@ -541,8 +561,11 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
     phase = "prefill"
     print(f"\n{'=' * 72}\n{label} -- op-by-op, derived (dims: {d})\n{'=' * 72}")
 
-    def measure(op_label, M, K, N, ne, quantized, k_sharded=False):
-        us, flops = _measure_matmul(args.dev, M, K, N, ne, quantized, k_sharded=k_sharded)
+    def measure(op_label, M, K, N, ne, quantized, k_sharded=False,
+                reduce_k=False):
+        us, flops = _measure_matmul(
+            args.dev, M, K, N, ne, quantized,
+            k_sharded=k_sharded, reduce_k=reduce_k)
         gflops = flops / (us * 1e3) if us else 0.0
         op_rows[phase].append((op_label, f"{M} x {K} x {N}", ne,
                                "IF4" if quantized else "BF16", us / 1e3, flops))
@@ -615,21 +638,20 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
           f"{prefill_flops / 1e9:.1f} GFLOP)")
 
     # ---- decode: same projections at M=1, attention at the resident context -
-    # Decode column-shards q/o across all 8 engines and k/v across 4 (too
-    # narrow to reach 8 -- see _ensure_decode_shards_impl's "SCOPE AT 8
-    # ENGINES" note), and gate/up/down the same 8-way TP split as prefill
-    # (_decode_shard_override reuses the identical private shards prefill
-    # already staged for gate/up/down) -- every projection is compiled and
-    # run across its real engine count, barrier-synchronized like prefill's.
+    # Decode column-shards q/k/v/o across all 8 engines: K/V each have
+    # KVH * AHD = 512 output columns, or eight 64-column shards. Gate/up
+    # retain their private N-shards; down reuses prefill's private K-shards
+    # and sums eight full-width outputs after the completion barrier.
     phase = "decode"
     print("\n--- Decode op shapes (M=1) ---")
     dq_ms = measure("q_proj", 1, H, query_dim, NE, True)
-    dk_ms = measure("k_proj", 1, H, kv_dim, KVH, True)
-    dv_ms = measure("v_proj", 1, H, kv_dim, KVH, False)
-    do_ms = measure("o_proj (decode, BF16)", 1, query_dim, H, NE, False)
+    dk_ms = measure("k_proj", 1, H, kv_dim, NE, True)
+    dv_ms = measure("v_proj", 1, H, kv_dim, NE, True)
+    do_ms = measure("o_proj (decode, IF4)", 1, query_dim, H, NE, True)
     dgate_ms = measure("gate_proj", 1, H, MLP, NE, True)
     dup_ms = measure("up_proj", 1, H, MLP, NE, True)
-    ddown_ms = measure("down_proj (N-shard)", 1, MLP, H, NE, True)
+    ddown_ms = measure("down_proj (K-shard + reduction)", 1, MLP, H, NE,
+                       True, k_sharded=True, reduce_k=True)
     d_aligned = ((decode_context + 63) // 64) * 64
     # Decode's KVH groups run CONCURRENTLY, one per engine
     # (_decode_use_one_round_group_attention: "four complete GQA groups
@@ -773,7 +795,7 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
         *report_rows(op_rows["decode"]),
         "",
         "`Issued GFLOPS = issued GFLOP / hardware-counter seconds`; `% 8-engine "
-        "peak` uses the board's full peak even for decode rows that use "
+        "peak` uses the board's full peak even for decode attention, which uses "
         f"only {KVH} engines (whose ceiling is {100.0 * KVH / NE:.0f}%). "
         f"Prefill attention measures {heads_per_engine} calls on each of "
         f"{NE} engines ({NE * heads_per_engine} issued head slots), although "
@@ -785,7 +807,8 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
         f"barriers, are summed and multiplied by {NL} layers. Decode then "
         "adds one eight-engine LM head plus FPGA global argmax per token. Other "
         "operations are **omitted**, not measured or silently assigned "
-        "zero cost: normalization, RoPE, residual/elementwise work, "
+        "zero cost: normalization, RoPE, residual/elementwise work other than "
+        "decode down's seven measured reduction additions, "
         "embeddings, KV-cache setup, host transfers, "
         "weight loading, compilation, and inter-op scheduling. The "
         "unified-attention kernel's internal work is included in its row. "
