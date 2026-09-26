@@ -18,7 +18,6 @@ import importlib.util
 import json
 import math
 import os
-import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -67,7 +66,7 @@ def _reject_visible_torch_accelerators() -> None:
     if detected:
         details = ", ".join(dict.fromkeys(detected))
         raise RuntimeError(
-            f"Qwen2.5-Omni is FPGA-only, but PyTorch reports {details}. "
+            f"Qwen2.5-Omni requires CPU + FPGA execution, but PyTorch reports {details}. "
             "Launch this entry point in a fresh process; GPU "
             "visibility is disabled before torch import."
         )
@@ -164,82 +163,22 @@ VISION_MAX_SOFT_TOKENS = max(
 
 
 # ==========================================================================
-# FIXED-SHAPE RUN PRESETS
+# PREFILL-LENGTH FITTING
 # ==========================================================================
-# --low, --medium and --high pin a whole run shape rather than a set of files, so the
-# two are reproducible prefill lengths instead of "whatever this wav happened
-# to be". Each preset fixes the media and then GROWS THE TEXT PROMPT until the
-# assembled prefill reaches its target, because the media contribute a fixed
-# token count and only the text is free:
-#
-#   low     audio at half length (~64 soft tokens) + text  -> ~850 prefill
-#   medium  896x896 image (1024 soft tokens) + full audio
-#           (128 soft tokens) + text                       -> ~2048 prefill
-#   high    4 x 896x896 camera frames + 6 s audio + text   -> 6144 aggregate
-#           performance-only input, executed as 3 x 2048 resident chunks
-#
-# Both fit the 2560-row prefill allocation. Medium targets a power-of-two
-# 2048-row run and leaves about 452 tokens of total-context decode headroom.
-RUN_PRESETS = {
-    "low": {
-        "vision_res": None,
-        "image": False,
-        "audio_fraction": 0.5,
-        "prefill_tokens": 850,
-    },
-    "medium": {
-        "vision_res": "medium",
-        "image": True,
-        "audio_fraction": 1.0,
-        "prefill_tokens": 2048,
-    },
-    "high": {
-        "vision_res": "medium",
-        "image": True,
-        "audio_fraction": 1.0,
-        # 600 valid mel frames is the configured audio-encoder maximum.
-        "audio_seconds": 6.0,
-        "vision_runs": 4,
-        "prefill_tokens": 6144,
-        # Processor length includes the final seed token; 2049 renders 2048
-        # rows into the prefill program.
-        "prefill_chunk_tokens": 2049,
-        "prefill_chunks": 3,
-    },
-}
+# --target-prefill-tokens GROWS THE TEXT PROMPT until the assembled prefill
+# reaches an exact token count, because the media (if any) contribute a fixed
+# token count and only the text is free. Fixed workload shapes (voice-command,
+# single-camera, multi-camera, ...) are the CALLER's business -- see
+# benchmark.py, which drives this flag with its own preset table -- this
+# script only knows how to hit a number.
+DEFAULT_PROMPT_BASE = "Respond to the request in detail."
 
-# Filler for the fitted prompts. It has to be REAL INSTRUCTION TEXT, not
+# Filler for the fitted prompt. It has to be REAL INSTRUCTION TEXT, not
 # padding: the point of a long prefill is to measure the shape the model
 # actually runs, and a prompt of repeated nonsense changes what attention does
 # with it. These sentences are cycled and then trimmed to the exact token count
 # the target needs.
-# THE INSTRUCTION IS PER PRESET; THE FILLER IS NOT. A preset's prompt is mostly
-# padding by token count, so whatever the padding says gets repeated two or
-# three times and drowns out the instruction. The first --medium prompt cycled
-# sentences that kept re-asserting "transcribe the audio", and the model did
-# exactly that and stopped -- a correct 1899-token prefill, but only half the
-# answer. The instruction now states the parts once, up front, and the filler
-# is neutral guidance that pushes toward COVERING EVERYTHING rather than toward
-# either modality.
-_PRESET_PROMPT_BASE = {
-    "low": (
-        "Transcribe the speech exactly as it is spoken, preserving the wording "
-        "and the order of the terms."
-    ),
-    "medium": (
-        "Do two things, in this order. First, transcribe the speech exactly as "
-        "it is spoken, preserving the wording and the order of the terms. "
-        "Second, describe the image in detail, covering the lighting, the "
-        "terrain, the vegetation and the sky. Both parts are required."
-    ),
-    "high": (
-        "Benchmark a multi-camera request with a long spoken query and text "
-        "history. Numeric correctness and response coherence are not part of "
-        "this performance-only run."
-    ),
-}
-
-_PRESET_PROMPT_FILLER = (
+_FIT_FILLER_SENTENCES = (
     "Address every part of the request before you stop, and do not end the "
     "answer while any part of it remains uncovered.",
     "Make the structure of the answer explicit, so the boundary between its "
@@ -263,12 +202,12 @@ _PRESET_PROMPT_FILLER = (
 )
 
 
-def _preset_filler_words(count: int) -> str:
+def _filler_words(count: int) -> str:
     """``count`` words, cycling the filler sentences in order."""
     words: list[str] = []
     i = 0
     while len(words) < count:
-        words.extend(_PRESET_PROMPT_FILLER[i % len(_PRESET_PROMPT_FILLER)].split())
+        words.extend(_FIT_FILLER_SENTENCES[i % len(_FIT_FILLER_SENTENCES)].split())
         i += 1
     return " ".join(words[:count])
 
@@ -292,7 +231,7 @@ def _fit_prompt_to_prefill(tokenizer, render_len, target: int, base: str) -> str
     want = target - fixed                          # prompt tokens needed
 
     def prompt_for(words: int) -> str:
-        return f"{base} {_preset_filler_words(words)}"
+        return f"{base} {_filler_words(words)}"
 
     lo, hi = 0, 16
     while len(tokenizer(prompt_for(hi)).input_ids) < want:
@@ -371,9 +310,9 @@ def apply_vision_resolution(cfg: dict, name: str) -> dict:
 # transfer sizes the hop is free: the port-ordered bases and a flat 512 MiB
 # stride both measure 85.2 GB/s, the per-engine AXI ceiling. Crowding is what
 # costs bandwidth, and a contiguous 1 GiB window per core cannot crowd. Keeping
-# the window contiguous is also what keeps the map feasible at all -- the untied
-# head needs 276 MiB in one piece (OMNI_LM_HEAD_BYTES), which no 512 MiB segment
-# could still offer beside ~708 MiB of private shards.
+# the window contiguous is also what keeps the map feasible at all -- the
+# vision encoder's ISA slice plus a full private shard set (~712 MiB, see
+# OMNI_PRIVATE_RESERVE_BYTES) needs more than a 512 MiB segment offers.
 #
 # multi_engine_shard.tiled_window_bases() owns both boards' answers and
 # validates the result (in range, disjoint, no crowded region); a board it has
@@ -383,40 +322,61 @@ def apply_vision_resolution(cfg: dict, name: str) -> dict:
 # multi_engine_shard.MULTICORE_WINDOW_BYTES: that constant is 512 MiB and three
 # other multi-core models are validated against it. Nor does it track either
 # board's constant: it is THIS MAP's geometry, and every number below --
-# OMNI_PRIVATE_RESERVE_BYTES, OMNI_LM_HEAD_BYTES, the ISA and tensor slices --
-# is tuned against it. tiled_window_bases() refuses a board whose own window
+# OMNI_PRIVATE_RESERVE_BYTES, the ISA and tensor slices -- is tuned against
+# it. tiled_window_bases() refuses a board whose own window
 # differs (the U55C's becomes 2 GiB when its HBM is upgraded), so the map gets
 # re-tuned deliberately instead of silently running at the wrong size.
 OMNI_WINDOW_BYTES = 0x4000_0000            # 1 GiB per core, 8 GiB total
-# Measured worst case is core 0: 4.28 MiB of tensor-parallel prefill + 1.02 MiB
-# of decoder, plus the vision/audio encoder programs. 16 MiB is ~3x that, and
-# every MiB here is a MiB the window whose gap hosts the shared tensor extent
-# does not have -- that core carries the extent AND a full private shard set.
-OMNI_ISA_BYTES = 16 * 2**20                # per-core ISA slice, inside the window
+# Sized for the LARGEST compiled program of any stage, not the LM's (4.28 MiB
+# tensor-parallel prefill + 1.02 MiB decoder): the vision encoder's per-window
+# instruction count scales with attention-window count, and at "medium"
+# resolution (4096 patches, 64 windows against "small"'s 576/9) it needs
+# ~48-50 MiB/engine, confirmed by a real overflow at the old 16 MiB slice
+# (multi_engine_shard.PrivateArena.check_isa_fits: engine 1's program reached
+# 0x80F42E40 against a 0x7F000000 limit). 64 MiB leaves that real number
+# genuine margin. This used to cost the weight arena directly -- see
+# OMNI_LM_HEAD_BYTES's removal below for where the room came from.
+OMNI_ISA_BYTES = 64 * 2**20                # per-core ISA slice, inside the window
 # Per-core scratch, inside the window. The head-sharded prefill attention keeps
 # ONE private scratch per engine, (AHD + aligned_P) * aligned_P + aligned_P *
 # AHD elements -- 13.75 MiB at the 2560-row prefill allocation. Vision's much
-# larger 4096-patch worker scratch is pinned in the shared pool instead.
+# larger 4096-patch worker scratch is pinned in the shared pool instead, so it
+# does not compete with this fixed slice the way the ISA program used to.
 OMNI_PRIVATE_TENSOR_BYTES = 16 * 2**20
 
 # What the private shards need per core, declared BEFORE any shared byte is
 # lent. Measured on the 8-engine map:
-#   gate/up N-shards (both phases)  240.8   down N-shard (decode)  120.4
-#   down K-shard (prefill TP)       120.4   attn decode shard       38.3
-#   lm_head shard                    34.5   embedding shard         67.3
-#   decode BF16 O shard              85.8                        = 707.5 MiB
+#   gate/up N-shards (both phases)  240.8   down K-shard (both phases) 120.4
+#   attn decode shard               38.3
+#   lm_head shard                    34.5   embedding stays on host
+#   decode IF4 O shard               22.8; removing the 67.3-MiB embedding
+#   shard reduces the observed 707.4-MiB peak to about 640.1 MiB/core.
+#   The 645-MiB reservation retains the same ~5-MiB headroom and does not
+#   depend on reclaiming the
+#   shared IF4 prefill image after prefill.
 # Asserted against actual usage after loading, so drift fails loudly instead of
-# silently eating the pool.
-OMNI_PRIVATE_RESERVE_BYTES = 712 * 2**20
+# silently eating the pool. NOTE: "lm_head shard" here is decode's own
+# column-sharded copy (_ensure_decode_shards_impl) -- the separate, now-
+# removed OMNI_LM_HEAD_BYTES extent below was a DIFFERENT, wasted allocation.
+OMNI_PRIVATE_RESERVE_BYTES = 645 * 2**20
 
-# THE TWO OBJECTS THAT CANNOT BE SCATTERED. Weight sections are placed one at a
-# time into whichever window has room, which works for the 196 attention
-# sections (max 6.5 MiB) and the encoders (max 13.3 MiB). It does not work for
-# the untied head: one 276 MiB IF4 blob that must be contiguous, and that no
-# window can still host once attention has been spread over them. It gets a
-# dedicated extent carved at init, next to the tensor extent, before anything
-# competes for the space.
-OMNI_LM_HEAD_BYTES = 280 * 2**20
+# THERE USED TO BE A SECOND UNSCATTERABLE OBJECT HERE: a 280 MiB "dedicated
+# extent" (OMNI_LM_HEAD_BYTES) holding one contiguous, unsharded copy of the
+# untied LM head, loaded via a normal device DMA. It turned out to have
+# exactly one reader: _ensure_decode_shards_impl's shard_quantized_weight
+# call, which immediately re-copied it (card -> host -> card, on top of the
+# blob's own host -> card load) into the SAME eight private per-engine column
+# shards already budgeted above as "lm_head shard 34.5 MiB". Nothing else
+# ever read the unsharded copy -- this model always runs eight engines
+# (REQUIRED_ENGINES), so decode's sharded head path is always taken and the
+# one call site that read the whole-blob fallback is unreachable. Removed:
+# lm_head is now read directly from the host file and column-sharded straight
+# into the private shards it always ended up in (shard_quantized_weight_from_
+# bytes), one host->card DMA per shard instead of three device round trips
+# for the whole weight. That freed 280 MiB from whichever ONE core alloc_
+# shared had picked to host it (always core 0, the only core that previously
+# had ZERO shared-pool slack) -- room now spent on the OMNI_ISA_BYTES growth
+# above, uniformly across every core.
 
 # The build ID read from UE_FPGA_VERSION is recorded and used to pick the flag
 # protocol, but it is not checked against an allowlist: any image that carries
@@ -446,8 +406,6 @@ _PROGRAM_CODE_FILES = (
     os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_programs.py"),
     os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_weights.py"),
     os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_config.json"),
-    os.path.join(PROJECT_ROOT, "models", "qwen2.5_vl_3b", "qwen2.5_vl_3b_lm.py"),
-    os.path.join(PROJECT_ROOT, "models", "qwen2.5_vl_3b", "qwen2.5_vl_3b_vision.py"),
     os.path.join(PROJECT_ROOT, "andromeda_hw_info.py"),
     os.path.join(PROJECT_ROOT, "multi_engine_shard.py"),
     os.path.join(PROJECT_ROOT, "user_dma_core.py"),
@@ -621,10 +579,12 @@ class Qwen25OmniUnifiedEngine(
         self.TENSOR_LIMIT = sum(self.mc_arena.shared_free())
         self._tensor_staged = 0
         self._tensor_phase_mark = self.mc_arena.shared_up_mark()
-        head_base = self.mc_arena.alloc_shared(OMNI_LM_HEAD_BYTES, "LM_HEAD.window")
-        self._reserved_extents = {
-            "lm_head": [head_base, head_base + OMNI_LM_HEAD_BYTES, head_base],
-        }
+        # No dedicated extents left to reserve -- lm_head no longer stages an
+        # unsharded device blob (see OMNI_PRIVATE_RESERVE_BYTES's comment).
+        # _reserved_extent_for/reset_params_dram_addr keep working unchanged
+        # against an empty dict; a future genuinely-unscatterable object would
+        # add its own entry here.
+        self._reserved_extents: dict[str, list[int]] = {}
 
         # PARAMS IS NO LONGER A WINDOW, IT IS AN ACCOUNTING ORIGIN. Weight
         # sections are placed individually by alloc_shared, so there is no
@@ -866,18 +826,18 @@ class Qwen25OmniUnifiedEngine(
         if self._cfg["file_info"]["hidden_size"] != 3584:
             raise ValueError("this runtime is compiled only for the 3584-wide 7B Thinker")
         if set(self._cfg["precision"]["lm_quantized_projections"]) != {
-            "q", "k", "o", "gate", "up", "down"
+            "q", "k", "v", "o", "gate", "up", "down"
         }:
             raise ValueError(
-                "prefill requires BF16 V and IF4 Q/K/O/GATE/UP/DOWN"
+                "prefill requires IF4 Q/K/V/O/GATE/UP/DOWN"
             )
         if set(self._cfg["precision"].get("decode_bf16_projections", ())) != {"o"}:
             raise ValueError(
-                "decode requires a time-shared BF16 O projection region"
+                "the retained params.bin requires its legacy BF16 O region"
             )
-        if self._cfg["precision"].get("embedding") != "if8":
+        if self._cfg["precision"].get("embedding") != "bf16":
             raise ValueError(
-                "the FPGA-only runtime requires precision.embedding='if8'"
+                "Qwen2.5-Omni requires host BF16 token embeddings"
             )
 
     def _read_params_region(self, name: str) -> dict[str, Any]:
@@ -1193,23 +1153,54 @@ class Qwen25OmniUnifiedEngine(
                 for registers in getattr(self, "_decode_attn_worker_regs", ())
             ]
             dims = self._lm_dims()
-            stripes = getattr(self, "_decode_o_stripes", None)
-            if stripes is None or len(stripes) != REQUIRED_ENGINES:
-                raise RuntimeError(
-                    "decode programs.bin metadata requires eight BF16 O stripes"
-                )
-            stripe_bytes = {
-                int(stripe["end"]) - int(stripe["base"])
-                for stripe in stripes
-            }
-            stripe_cols = {int(stripe["cols"]) for stripe in stripes}
-            layer_bytes = {int(stripe["layer_bytes"]) for stripe in stripes}
-            if (
-                len(stripe_bytes) != 1
-                or len(stripe_cols) != 1
-                or len(layer_bytes) != 1
-            ):
-                raise RuntimeError("BF16 O stripe geometry is not uniform")
+            if self.DECODE_O_IF4:
+                o_layers = [self._decode_shards.get(("o", layer))
+                            for layer in range(int(self._decoder_layers_compiled))]
+                if (not o_layers or any(weight is None or len(weight.shards) != REQUIRED_ENGINES
+                                        or weight.data_type is not user_dma_core.TYPE.IF4
+                                        for weight in o_layers)):
+                    raise RuntimeError("decode metadata requires eight IF4 O shards per layer")
+                columns = int(dims["H"]) // REQUIRED_ENGINES
+                expected = [(engine * columns, columns)
+                            for engine in range(REQUIRED_ENGINES)]
+                for weight in o_layers:
+                    if [(int(shard.col_offset), int(shard.cols))
+                            for shard in weight.shards] != expected:
+                        raise RuntimeError("decode IF4 O shards do not cover output columns")
+                o_layout = {
+                    "mode": "private_if4_column_shards",
+                    "precision": "if4",
+                    "engines": REQUIRED_ENGINES,
+                    "columns_per_engine": columns,
+                    "weight_bytes_per_layer_per_engine": columns * int(dims["H"]) // 2,
+                    "scale_bytes_per_layer_per_engine": columns * int(dims["H"]) // 64 * 2,
+                    "slot_stride_bytes": int(self.mc_arena.stride),
+                }
+            else:
+                stripes = getattr(self, "_decode_o_stripes", None)
+                if stripes is None or len(stripes) != REQUIRED_ENGINES:
+                    raise RuntimeError(
+                        "decode programs.bin metadata requires eight BF16 O stripes"
+                    )
+                stripe_bytes = {
+                    int(stripe["end"]) - int(stripe["base"])
+                    for stripe in stripes
+                }
+                stripe_cols = {int(stripe["cols"]) for stripe in stripes}
+                layer_bytes = {int(stripe["layer_bytes"]) for stripe in stripes}
+                if (len(stripe_bytes) != 1 or len(stripe_cols) != 1
+                        or len(layer_bytes) != 1):
+                    raise RuntimeError("BF16 O stripe geometry is not uniform")
+                o_layout = {
+                    "mode": "upper_params_column_stripes",
+                    "precision": "bf16",
+                    "engines": len(stripes),
+                    "columns_per_engine": next(iter(stripe_cols)),
+                    "layer_bytes_per_engine": next(iter(layer_bytes)),
+                    "stripe_bytes_per_engine": next(iter(stripe_bytes)),
+                    "slot_stride_bytes": int(self.mc_arena.stride),
+                    "extent_end": f"0x{max(int(s['end']) for s in stripes):X}",
+                }
             kv_groups = int(dims["KVH"])
             prefill_base, prefill_blob = self._prefill_program
             decode_base, decode_blob = self._decoder_program
@@ -1243,11 +1234,9 @@ class Qwen25OmniUnifiedEngine(
                 ),
                 "attention_worker_registers": worker_regs,
                 "checkpoints": list(getattr(self, "_decoder_checkpoints", ())),
-                "fpga_global_argmax": bool(self._fpga_global_argmax_emitted),
+                "lm_head_argmax_mode": "sharded_host_reduce",
                 "embedding_precision": self._cfg["precision"]["embedding"],
-                "decode_bf16_projections": list(
-                    self._cfg["precision"]["decode_bf16_projections"]
-                ),
+                "decode_bf16_projections": sorted(self._decode_bf16_projections()),
                 "decode_attention": {
                     "mode": "one_complete_gqa_group_per_engine",
                     "kv_groups": kv_groups,
@@ -1258,16 +1247,7 @@ class Qwen25OmniUnifiedEngine(
                         range(kv_groups, REQUIRED_ENGINES)
                     ),
                 },
-                "decode_o_layout": {
-                    "mode": "upper_params_column_stripes",
-                    "precision": "bf16",
-                    "engines": len(stripes),
-                    "columns_per_engine": next(iter(stripe_cols)),
-                    "layer_bytes_per_engine": next(iter(layer_bytes)),
-                    "stripe_bytes_per_engine": next(iter(stripe_bytes)),
-                    "slot_stride_bytes": int(self.mc_arena.stride),
-                    "extent_end": f"0x{max(int(s['end']) for s in stripes):X}",
-                },
+                "decode_o_layout": o_layout,
                 "prefill_program_base": f"0x{int(prefill_base):X}",
                 "prefill_program_size": len(prefill_blob),
                 "prefill_program_sha256": hashlib.sha256(
@@ -1543,19 +1523,11 @@ class Qwen25OmniUnifiedEngine(
         rows: list[dict] = []
         if getattr(self, "_vis_latency_us", None):
             dims = self._vision_dims()
-            vision_runs = int(getattr(self, "_high_vision_runs", 1))
             rows.append({
                 "stage": "Vision encoder",
-                "detail": (
-                    f"{vision_runs} frames x {dims['VS']} patches -> "
-                    f"{vision_runs * dims['NUM_MERGED_TOKENS']} soft tokens"
-                    if vision_runs > 1 else
-                    f"{dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens"
-                ),
+                "detail": f"{dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens",
                 "flops": float(self._vis_total_flops),
-                "model_flops": (
-                    float(self._model_flops_vision(dims) or 0.0) * vision_runs
-                ),
+                "model_flops": float(self._model_flops_vision(dims) or 0.0),
                 "us": float(self._vis_latency_us),
                 "wall": float(getattr(self, "_vis_wall_s", 0.0)),
             })
@@ -1573,10 +1545,7 @@ class Qwen25OmniUnifiedEngine(
                 "stage": "Prefill",
                 "detail": f"{getattr(self, '_prefill_seq_len_run', 0)} tokens",
                 "flops": float(getattr(self, "_prefill_flops", 0.0)),
-                "model_flops": getattr(
-                    self, "_high_segmented_prefill_model_flops",
-                    self._model_flops_prefill(),
-                ),
+                "model_flops": self._model_flops_prefill(),
                 "us": float(self._latency_prefill_us),
                 "wall": float(getattr(self, "_prefill_wall_s", 0.0)),
             })
@@ -1655,18 +1624,68 @@ class Qwen25OmniUnifiedEngine(
         except Exception:
             return None
 
+    def _model_flops_vision_by_phase(self, dims: dict) -> dict[str, int] | None:
+        try:
+            return _model_flops.vision_flops_by_phase(
+                self._cfg,
+                patches=int(dims["VS"]),
+                merged_tokens=int(dims["NUM_MERGED_TOKENS"]),
+            )
+        except Exception:
+            return None
+
+    def _model_flops_prefill_by_phase(self) -> dict[str, int] | None:
+        try:
+            return _model_flops.prefill_flops_by_phase(
+                self._cfg, int(self._prefill_seq_len_run))
+        except Exception:
+            return None
+
     def _stage_table(self, rows: list[dict]) -> list[str]:
-        """Headline table: work, time, throughput, % of peak, core scaling."""
+        """Headline table: work, time, throughput, % of peak, core scaling,
+        and the model's effective throughput against the same measured time.
+
+        `Work`/`Throughput`/`% of peak` are what this engine ISSUED, at the
+        padded and tile-aligned shapes the hardware ran: a 64-row execution
+        multiple for a short prompt, windowed attention widened to a full
+        mask, an aligned head. `Model GFLOP`/`Effective GFLOPS` are what the
+        architecture owes at its own dimensions -- true prompt length, true
+        attention windows, matrix products only -- divided by the SAME
+        measured FPGA time, so `Effective GFLOPS` is comparable to any other
+        implementation of this model on any hardware. `Useful` is how much
+        of the issued work the model needed; `n/a` where a stage's model
+        FLOPs could not be priced, not a misleading 0.
+        """
         cores = getattr(self, "multi_core", 1) or 1
         out = [
-            "| Stage | Shape | Work (GFLOP) | FPGA time (ms) | Throughput "
-            "(GFLOPS) | % of peak | x 1-engine peak | CPU wall (s) |",
-            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Stage | Shape | Work (GFLOP) | Model GFLOP | Useful | FPGA "
+            "time (ms) | Throughput (GFLOPS) | Effective GFLOPS | % of peak "
+            "| x 1-engine peak | CPU wall (s) |",
+            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+            "| ---: | ---: |",
         ]
+        suspect = False
         for row in rows:
+            model = row.get("model_flops")
+            if model:
+                # Above 100% the engine billed FEWER FLOPs than the
+                # architecture requires, which cannot happen: padding and
+                # alignment only ever ADD work. It means that stage's own
+                # accounting is undercounting what it issued, so flag it
+                # rather than printing it deadpan.
+                mark = ""
+                if row["useful_pct"] > 100.5:
+                    mark = " !"
+                    suspect = True
+                model_s = f"{model / 1e9:.2f}"
+                useful_s = f"{row['useful_pct']:.1f}%"
+                eff_s = f"{row['model_gflops']:.1f}"
+            else:
+                mark, model_s, useful_s, eff_s = "", "n/a", "n/a", "n/a"
             out.append(
-                f"| {row['stage']} | {row['detail']} | {row['flops'] / 1e9:.2f} | "
-                f"{row['us'] / 1e3:.1f} | {row['gflops']:.1f} | "
+                f"| {row['stage']}{mark} | {row['detail']} | "
+                f"{row['flops'] / 1e9:.2f} | {model_s} | {useful_s} | "
+                f"{row['us'] / 1e3:.1f} | {row['gflops']:.1f} | {eff_s} | "
                 f"{row['util_pct']:.1f}% | {row['speedup']:.2f}x | "
                 f"{row['wall']:.2f} |"
             )
@@ -1676,81 +1695,33 @@ class Qwen25OmniUnifiedEngine(
         peak = self.vis_peak_gflops()
         core_peak = self.per_core_peak_gflops()
         total_gflops = total_flops / (total_us * 1e3) if total_us else 0.0
+        priced = [row for row in rows if row.get("model_flops")]
+        if priced and len(priced) == len(rows):
+            model_total = sum(row["model_flops"] for row in priced)
+            total_useful_s = (
+                f"{(100.0 * model_total / total_flops if total_flops else 0.0):.1f}%"
+            )
+            total_model_s = f"{model_total / 1e9:.2f}"
+            total_eff_s = f"{(model_total / (total_us * 1e3) if total_us else 0.0):.1f}"
+        else:
+            total_model_s = total_useful_s = total_eff_s = "n/a"
         out.append(
             f"| **TOTAL** | {cores} engines | **{total_flops / 1e9:.2f}** | "
+            f"**{total_model_s}** | **{total_useful_s}** | "
             f"**{total_us / 1e3:.1f}** | **{total_gflops:.1f}** | "
+            f"**{total_eff_s}** | "
             f"**{(100.0 * total_gflops / peak if peak else 0.0):.1f}%** | "
             f"**{(total_gflops / core_peak if core_peak else 0.0):.2f}x** | "
             f"**{total_wall:.2f}** |"
         )
-        return out
-
-    def _effective_table(self, rows: list[dict]) -> list[str]:
-        """Throughput measured against the MODEL's work, not the engine's.
-
-        Every stage bills the FLOPs it issued, at the padded and tile-aligned
-        shapes the hardware ran: a 64-row execution multiple for a 31-token
-        prompt, windowed attention widened to a full mask, an aligned head.
-        Dividing the architecture's own FLOP count by the same measured time
-        gives the effective rate -- useful work per second -- which is what
-        compares across implementations and accelerators.  ``Useful`` is the
-        ratio: how much of what the engine issued the model actually needed.
-        """
-        priced = [row for row in rows if row.get("model_flops")]
-        if not priced:
-            return []
-        peak = self.vis_peak_gflops()
-        out = [
-            "## Effective throughput (model FLOPs)",
-            "",
-            "`Model GFLOP` is what the architecture owes at its own "
-            "dimensions -- true prompt length, true attention windows, matrix "
-            "products only. `Issued GFLOP` is what this engine billed at the "
-            "shapes it actually ran. `Effective GFLOPS` divides the first by "
-            "the measured FPGA time, so it is comparable to any other "
-            "implementation of this model on any hardware; `Useful` is how "
-            "much of the issued work the model needed.",
-            "",
-            "| Stage | Model GFLOP | Issued GFLOP | Useful | FPGA time (ms) | "
-            "Effective GFLOPS | % of peak |",
-            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
-        ]
-        suspect = False
-        for row in priced:
-            # Above 100% the engine billed FEWER FLOPs than the architecture
-            # requires, which cannot happen: padding and alignment only ever
-            # ADD work.  It means that stage's own accounting is undercounting
-            # what it issued, so flag it rather than printing it deadpan.
-            mark = ""
-            if row["useful_pct"] > 100.5:
-                mark = " !"
-                suspect = True
-            out.append(
-                f"| {row['stage']}{mark} | {row['model_flops'] / 1e9:.2f} | "
-                f"{row['flops'] / 1e9:.2f} | {row['useful_pct']:.1f}% | "
-                f"{row['us'] / 1e3:.1f} | {row['model_gflops']:.1f} | "
-                f"{row['model_util_pct']:.1f}% |"
-            )
-        model_total = sum(row["model_flops"] for row in priced)
-        issued_total = sum(row["flops"] for row in priced)
-        us_total = sum(row["us"] for row in priced)
-        rate = model_total / (us_total * 1e3) if us_total else 0.0
-        out.append(
-            f"| **TOTAL** | **{model_total / 1e9:.2f}** | "
-            f"**{issued_total / 1e9:.2f}** | "
-            f"**{(100.0 * model_total / issued_total if issued_total else 0.0):.1f}%** | "
-            f"**{us_total / 1e3:.1f}** | **{rate:.1f}** | "
-            f"**{(100.0 * rate / peak if peak else 0.0):.1f}%** |"
-        )
-        out.append("")
         if suspect:
             out += [
-                "`!` marks a stage whose issued FLOPs came out BELOW the "
-                "model's requirement. Padding and alignment can only add work, "
-                "so that stage's own FLOP accounting is undercounting what it "
-                "issued -- treat its `% of peak` in the stage summary above as "
-                "understated, and the effective rate here as the reliable one.",
                 "",
+                "`!` marks a stage whose issued FLOPs came out BELOW the "
+                "model's requirement. Padding and alignment can only add "
+                "work, so that stage's own FLOP accounting is undercounting "
+                "what it issued -- treat its `% of peak` as understated, and "
+                "`Effective GFLOPS` as the reliable rate.",
             ]
         return out
 
@@ -1760,10 +1731,20 @@ class Qwen25OmniUnifiedEngine(
         Aggregation, the serial-phase peak guard and the column set are shared
         with the terminal breakdown (print_profile_table), so the .md and the
         console can never disagree about a phase.
+
+        ``stages`` entries are ``(title, note, results, model_phases)``.
+        ``model_phases`` (a dict, or None) keys must match
+        ``_aggregate_vis_profile``'s phase names exactly -- the checkpoint
+        name after its "L<idx>:" prefix is stripped, e.g. "attention",
+        "qkv_proj". Vision's separate FPGA patch program contributes a
+        "patch_embed" result before those checkpoints. The ``*_by_phase``
+        functions use these same boundaries; bundled checkpoints such as
+        "o_proj+mlp" remain bundled in the model counts. A missing mapping
+        is shown as "n/a", never silently counted as zero.
         """
         peak = self.vis_peak_gflops()
         out: list[str] = []
-        for title, note, results in stages:
+        for title, note, results, model_phases in stages:
             if not results:
                 continue
             rows = self._aggregate_vis_profile(results)
@@ -1771,24 +1752,57 @@ class Qwen25OmniUnifiedEngine(
             out += [f"### {title}", ""]
             if note:
                 out += [note, ""]
-            out += [
-                "| Phase | Calls | Total ms | Share | GFLOP | GFLOPS | % of peak |",
-                "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
-            ]
-            for name, n, ms, share, gflop, gflops, util in self._vis_profile_table(
-                rows, total
+            has_model = bool(model_phases)
+            header = ["Phase", "Calls", "Total ms", "Share", "GFLOP"]
+            if has_model:
+                header += ["Model GFLOP", "Useful"]
+            header += ["GFLOPS", "Effective GFLOPS" if has_model else None,
+                      "% of peak"]
+            header = [h for h in header if h is not None]
+            out.append("| " + " | ".join(header) + " |")
+            out.append("|" + "|".join(
+                ":--" if h == "Phase" else "--:" for h in header) + "|")
+            model_total = 0
+            for row_, (name, n, ms, share, gflop, gflops, util) in zip(
+                rows, self._vis_profile_table(rows, total)
             ):
-                out.append(
-                    f"| {name} | {n} | {ms:.2f} | {share:.1f}% | {gflop:.2f} | "
-                    f"{gflops:.1f} | {util:.1f}% |"
-                )
+                cells = [name, str(n), f"{ms:.2f}", f"{share:.1f}%",
+                        f"{gflop:.2f}"]
+                if has_model:
+                    phase_model = model_phases.get(row_["phase"])
+                    if phase_model is None:
+                        cells += ["n/a", "n/a"]
+                        eff_s = "n/a"
+                    else:
+                        model_total += phase_model
+                        model_gflop = phase_model / 1e9
+                        flops = row_["flops"]
+                        useful = 100.0 * phase_model / flops if flops else 0.0
+                        eff = model_gflop / (ms / 1e3) if ms else 0.0
+                        cells += [f"{model_gflop:.2f}", f"{useful:.1f}%"]
+                        eff_s = f"{eff:.1f}"
+                    cells += [f"{gflops:.1f}", eff_s]
+                else:
+                    cells += [f"{gflops:.1f}"]
+                cells += [f"{util:.1f}%"]
+                out.append("| " + " | ".join(cells) + " |")
             total_gflop = sum(row["flops"] for row in rows) / 1e9
             total_rate = total_gflop / (total / 1e3) if total else 0.0
-            out.append(
-                f"| **TOTAL** | {len(results)} | **{total:.2f}** | 100.0% | "
-                f"**{total_gflop:.2f}** | **{total_rate:.1f}** | "
-                f"**{(100.0 * total_rate / peak if peak else 0.0):.1f}%** |"
-            )
+            total_cells = ["**TOTAL**", str(len(results)), f"**{total:.2f}**",
+                          "100.0%", f"**{total_gflop:.2f}**"]
+            if has_model:
+                total_flops = sum(row["flops"] for row in rows)
+                total_useful = (100.0 * model_total / total_flops
+                                if total_flops else 0.0)
+                total_eff = model_total / 1e9 / (total / 1e3) if total else 0.0
+                total_cells += [f"**{model_total / 1e9:.2f}**",
+                                f"**{total_useful:.1f}%**"]
+            total_cells += [f"**{total_rate:.1f}**"]
+            if has_model:
+                total_cells += [f"**{total_eff:.1f}**"]
+            total_cells += [
+                f"**{(100.0 * total_rate / peak if peak else 0.0):.1f}%**"]
+            out.append("| " + " | ".join(total_cells) + " |")
             out.append("")
         return out
 
@@ -1819,80 +1833,6 @@ class Qwen25OmniUnifiedEngine(
             )
         return lines
 
-    def _multi_core_lines(self, rows: list[dict], profiles=None) -> list[str]:
-        """How well each stage actually used the engine split.
-
-        ``x 1-engine peak`` is the same measurement as ``% of peak``, just
-        expressed as a speedup, so restating it as an efficiency column would
-        add nothing.  What the table adds is the IMPLIED SERIAL FRACTION: solve
-        Amdahl for s given the achieved speedup S over N engines,
-        ``s = (N/S - 1) / (N - 1)``.  It is an upper bound on the truly serial
-        work, because everything else that costs time -- rendezvous waits, DMA
-        stalls, tiles that do not fill the MAC array -- lands in it too.  A
-        --profile run is what separates those: phases marked ``*`` there are
-        the genuinely engine-0-only ones.
-        """
-        cores = getattr(self, "multi_core", 1) or 1
-        core_peak = self.per_core_peak_gflops()
-        out = [
-            "## Multi-core scaling",
-            "",
-            f"This model requires exactly {REQUIRED_ENGINES} engines, so no "
-            f"1-engine baseline can be measured for comparison.  Speedup is "
-            f"therefore taken against one engine's PEAK "
-            f"({core_peak:.1f} GFLOPS), which makes it a lower bound on the "
-            f"sharding's true benefit: a stage that is inefficient for reasons "
-            f"unrelated to sharding is charged for that here as well.",
-            "",
-            f"| Stage | Throughput (GFLOPS) | x 1-engine peak (max "
-            f"{cores}.00x) | Implied serial fraction |",
-            "| :--- | ---: | ---: | ---: |",
-        ]
-        for row in rows:
-            speedup = row["speedup"]
-            if speedup > 0 and cores > 1:
-                serial = (cores / speedup - 1.0) / (cores - 1)
-                serial_s = f"{100.0 * max(0.0, min(1.0, serial)):.1f}%"
-            else:
-                serial_s = "n/a"
-            out.append(
-                f"| {row['stage']} | {row['gflops']:.1f} | {speedup:.2f}x | "
-                f"{serial_s} |"
-            )
-        out.append("")
-
-        # With profile data the engine-0-only phases can be named outright,
-        # which is the actionable half: those are what sharding has to remove.
-        serial_rows = []
-        for title, _note, results in (profiles or []):
-            if not results:
-                continue
-            aggregated = self._aggregate_vis_profile(results)
-            total_ms = sum(row["ms"] for row in aggregated) or 1.0
-            for row in aggregated:
-                if row.get("serial"):
-                    serial_rows.append(
-                        (title, row["phase"], row["ms"],
-                         100.0 * row["ms"] / total_ms)
-                    )
-        if serial_rows:
-            out += [
-                "Phases that ran on engine 0 alone, and their share of their "
-                "stage's FPGA time:",
-                "",
-                "| Stage | Phase | ms | Share of stage |",
-                "| :--- | :--- | ---: | ---: |",
-            ]
-            for title, phase, ms, share in serial_rows:
-                out.append(f"| {title} | {phase} | {ms:.2f} | {share:.1f}% |")
-            out.append("")
-        elif not profiles:
-            out += [
-                "Run with `--profile` to attribute that serial fraction to "
-                "named phases.",
-                "",
-            ]
-        return out
 
     def write_run_summary(self, out_path: str, args, profiles=None) -> str:
         """Write the per-run Markdown summary and return the path.
@@ -1935,26 +1875,6 @@ class Qwen25OmniUnifiedEngine(
             "## Weights and programs",
             "",
         ]
-        high = getattr(self, "_high_benchmark", None)
-        if high:
-            lines[4:4] = [
-                "## High-load benchmark contract",
-                "",
-                f"- **Camera workload:** {high['vision_runs']} independent "
-                f"896x896 frames ({high['vision_soft_tokens']} vision tokens total)",
-                f"- **Spoken query:** {high['audio_seconds']:.1f} s",
-                f"- **Aggregate input:** {high['aggregate_tokens']} tokens",
-                f"- **Measured prefill:** {high['prefill_chunks']} independent x "
-                f"{high['chunk_tokens']} tokens; each pass runs on the FPGA and "
-                "reuses the resident KV allocation",
-                "- **Numerics:** intentionally unchecked; media embeddings and KV "
-                "history do not carry between benchmark chunks",
-                "",
-                "This is a throughput/latency benchmark, not a claim that a "
-                "monolithic 6144-token request fits. The current physical KV "
-                f"capacity remains {self.KV_CONTEXT_CAPACITY} rows.",
-                "",
-            ]
         if os.path.exists(params_bin):
             lines.append(
                 f"- **Weight bin:** `{os.path.basename(params_bin)}` — "
@@ -1965,37 +1885,9 @@ class Qwen25OmniUnifiedEngine(
             lines.append(
                 f"- **LM weight DRAM:** "
                 f"{(self._lm_weight_end - self.PARAMS_BASE) / 2**20:.1f} MiB "
-                f"(IF4 + BF16 V/O, IF8 embedding)"
+                f"(IF4 projections incl. V; BF16 embedding on host)"
             )
         lines += self._program_section_lines()
-        layout = self.dram_layout_lines()
-        if layout:
-            # The per-core table is real Markdown; everything else is an aligned
-            # listing that only survives inside a fence. Emit each contiguous run
-            # in the form it needs.
-            lines += ["", "## DRAM layout"]
-            run: list[str] = []
-            run_is_table = False
-
-            def _flush(target=lines):
-                if not run:
-                    return
-                if run_is_table:
-                    target.append("")
-                    target.extend(run)
-                else:
-                    target += ["", "```"] + run + ["```"]
-                run.clear()
-
-            for line in layout:
-                stripped = line.rstrip()
-                is_table = stripped.startswith("|")
-                if is_table != run_is_table:
-                    _flush()
-                    run_is_table = is_table
-                if stripped or not is_table:
-                    run.append(stripped)
-            _flush()
         lines.append("")
 
         rows = self.stage_metrics(args)
@@ -2007,22 +1899,24 @@ class Qwen25OmniUnifiedEngine(
                 "around the same stage. `x 1-engine peak` is the achieved rate "
                 "divided by ONE engine's peak: the effective speedup the "
                 f"{cores}-engine split delivered, against a ceiling of "
-                f"{cores}.00x.",
+                f"{cores}.00x. `Model GFLOP` is what the architecture owes at "
+                "its own dimensions -- true prompt length, true attention "
+                "windows, matrix products only; `Effective GFLOPS` divides it "
+                "by the same measured FPGA time, so it is comparable to any "
+                "other implementation of this model on any hardware; `Useful` "
+                "is how much of the issued work the model needed.",
                 "",
             ]
             lines += self._stage_table(rows)
             lines.append("")
-            lines += self._effective_table(rows)
 
         if getattr(self, "_vis_latency_us", None):
             dims = self._vision_dims()
-            vision_runs = int(getattr(self, "_high_vision_runs", 1))
             lines += [
                 "## Vision",
                 "",
                 f"- **Image:** `{os.path.basename(getattr(args, 'image', '') or '')}` "
-                f"x {vision_runs} frame(s) -> {vision_runs * dims['VS']} patches "
-                f"-> {vision_runs * dims['NUM_MERGED_TOKENS']} soft tokens",
+                f"-> {dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens",
                 f"- **Work:** {self._vis_total_flops / 1e9:.1f} GFLOP",
                 f"- **HW latency:** {self._vis_latency_us / 1e3:.1f} ms",
                 f"- **Throughput:** {self._vis_gflops:.1f} GFLOPS "
@@ -2061,6 +1955,8 @@ class Qwen25OmniUnifiedEngine(
                 f"({100.0 * prefill_gflops / peak if peak else 0.0:.1f}% of peak)",
                 f"- **End-to-end (CPU timer):** "
                 f"{getattr(self, '_prefill_wall_s', 0.0):.2f} s",
+                "- **Embedding:** host BF16 gather and row DMA are included "
+                "in CPU time, not FPGA time",
                 "",
             ]
 
@@ -2077,25 +1973,16 @@ class Qwen25OmniUnifiedEngine(
                 ("vision", getattr(self, "_vis_latency_us", None)),
                 ("audio", getattr(self, "_audio_latency_us", None)),
             ) if seen] + ["prefill"]
-            ttft_kind = "measured segmented; " if high else ""
             lines += [
                 "## Time to first token",
                 "",
-                f"- **TTFT ({ttft_kind}HW counter; {' + '.join(covered)}):** "
+                f"- **TTFT (HW counter; {' + '.join(covered)}):** "
                 f"{(enc_hw_us + pre_hw_us) / 1e3:.1f} ms",
-                f"- **TTFT ({ttft_kind}CPU timer; {' + '.join(covered)}):** "
+                f"- **TTFT (CPU timer; {' + '.join(covered)}):** "
                 f"{enc_wall + pre_wall:.2f} s",
+                "  (includes prefill host embedding lookup and DMA)",
+                "",
             ]
-            if high:
-                estimate_us = float(high["monolithic_prefill_estimate_us"])
-                lines += [
-                    f"- **Estimated monolithic prefill:** {estimate_us / 1e3:.1f} ms "
-                    f"for {high['aggregate_tokens']} tokens, using the measured "
-                    "segmented effective GFLOPS and static full-context FLOPs",
-                    f"- **Estimated monolithic TTFT:** "
-                    f"{(enc_hw_us + estimate_us) / 1e3:.1f} ms",
-                ]
-            lines.append("")
 
         steps = getattr(self, "_decode_step_us", None)
         if steps:
@@ -2129,16 +2016,14 @@ class Qwen25OmniUnifiedEngine(
                 "",
             ]
 
-        if rows:
-            lines += self._multi_core_lines(rows, profiles)
-
         if profiles:
             lines += [
                 "## Per-phase profile",
                 "",
-                "Phase latencies come from the HW counter between per-phase "
-                "HALTs: they exclude host time but include one stop/restart per "
-                "phase, so the SHARE column is the number to act on -- it says "
+                "Phase latencies come from FPGA hardware counters. Vision's "
+                "patch_embed is a separate program; the remaining phases are "
+                "timed between per-phase HALTs and include a stop/restart per "
+                "phase. They exclude host time, so the SHARE column says "
                 "which phase is worth sharding next. `*` marks phases that run "
                 "on engine 0 only, whose % of peak is measured against ONE "
                 "engine.",
@@ -2541,9 +2426,9 @@ def _load_audio(
 def _default_prompt(args) -> str:
     if args.prompt:
         return args.prompt
-    if getattr(args, "preset", None):
+    if getattr(args, "target_prefill_tokens", None):
         # Fitted later, once the processor can measure the assembled length.
-        return _PRESET_PROMPT_BASE[args.preset]
+        return args.prompt_base
     if args.image and args.audio:
         return "First transcribe the audio. Then briefly describe the image."
     if args.image:
@@ -2576,11 +2461,10 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
             )
             images = [image.copy()]
     if args.audio:
-        preset = RUN_PRESETS.get(getattr(args, "preset", None) or "", {})
         samples = _load_audio(
             args.audio, int(cfg["audio"]["sample_rate"]),
-            fraction=float(preset.get("audio_fraction", 1.0)),
-            target_seconds=preset.get("audio_seconds"))
+            fraction=float(getattr(args, "audio_fraction", 1.0) or 1.0),
+            target_seconds=getattr(args, "audio_seconds", None))
         audio = [samples]
 
     # In the joint case, match media order to the requested answer order. This
@@ -2606,18 +2490,15 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
             call_kwargs["audio"] = audio
         return text, processor(**call_kwargs)
 
-    # A preset fixes the media and then GROWS THE PROMPT to a target prefill
-    # length. It has to happen here: only the processor knows how many tokens
-    # this particular audio clip and image expand to.
-    preset_name = getattr(args, "preset", None)
-    if preset_name and not args.prompt:
-        target = int(RUN_PRESETS[preset_name].get(
-            "prefill_chunk_tokens", RUN_PRESETS[preset_name]["prefill_tokens"]
-        ))
+    # --target-prefill-tokens GROWS THE PROMPT to a target prefill length. It
+    # has to happen here: only the processor knows how many tokens this
+    # particular audio clip and image expand to.
+    target = getattr(args, "target_prefill_tokens", None)
+    if target and not args.prompt:
         prompt = _fit_prompt_to_prefill(
             processor.tokenizer,
             lambda text: int(_assemble(text)[1]["input_ids"].shape[1]),
-            target, _PRESET_PROMPT_BASE[preset_name])
+            int(target), args.prompt_base)
     rendered, processed = _assemble(prompt)
 
     input_ids = processed["input_ids"]
@@ -2694,26 +2575,6 @@ def _run_audio(ue: Qwen25OmniUnifiedEngine, processed):
     return embeddings, metadata
 
 
-def apply_run_preset(args) -> None:
-    """Turn --low / --medium / --high into the media flags they stand for.
-
-    The preset decides WHICH media are present and at what size; the prompt
-    that brings the prefill up to the target is fitted later, once the
-    processor can measure how many tokens this audio and image expand to. An
-    explicitly passed --image/--audio/--vision-res still wins, so a preset can
-    be used as a starting point.
-    """
-    if not args.preset:
-        return
-    spec = RUN_PRESETS[args.preset]
-    if args.audio is None:
-        args.audio = DEFAULT_AUDIO
-    if spec["image"] and args.image is None:
-        args.image = DEFAULT_IMAGE
-    if spec["vision_res"] and args.vision_res == DEFAULT_VISION_RES:
-        args.vision_res = spec["vision_res"]
-
-
 def _result_mode(args) -> str:
     if args.image and args.audio:
         return "image+audio"
@@ -2758,25 +2619,37 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="engine count; this model requires exactly 8",
     )
     parser.add_argument("--prompt", default=None, help="user text prompt")
-    presets = parser.add_mutually_exclusive_group()
-    presets.add_argument(
-        "--low", dest="preset", action="store_const", const="low",
-        help=("fixed shape: half-length audio plus a fitted prompt, "
-              f"~{RUN_PRESETS['low']['prefill_tokens']} prefill tokens"),
+    parser.add_argument(
+        "--target-prefill-tokens",
+        type=int,
+        default=None,
+        help="grow the prompt (with --prompt-base plus generic filler text) "
+             "until the assembled prefill reaches exactly this many tokens; "
+             "ignored if --prompt is given. Fixed-shape workload presets "
+             "(voice-command / single-camera / multi-camera, ...) live in "
+             "benchmark.py, which drives this flag.",
     )
-    presets.add_argument(
-        "--medium", dest="preset", action="store_const", const="medium",
-        help=("fixed shape: 896x896 image (1024 soft tokens) plus full audio "
-              f"and a fitted prompt, ~{RUN_PRESETS['medium']['prefill_tokens']} "
-              "prefill tokens"),
+    parser.add_argument(
+        "--prompt-base",
+        default=DEFAULT_PROMPT_BASE,
+        help="instruction text --target-prefill-tokens pads with filler to "
+             "reach the target length",
     )
-    presets.add_argument(
-        "--high", dest="preset", action="store_const", const="high",
-        help=("performance-only fixed shape: 4 x 896x896 camera frames, "
-              "6 seconds of audio, and 6144 aggregate input tokens projected "
-              "as 3 x one isolated 2048-token FPGA prefill measurement"),
+    parser.add_argument(
+        "--audio-fraction",
+        type=float,
+        default=1.0,
+        help="trim loaded audio to this fraction of its samples before "
+             "encoding, e.g. 0.5 for half length (default 1.0, full clip)",
     )
-    parser.set_defaults(preset=None)
+    parser.add_argument(
+        "--audio-seconds",
+        type=float,
+        default=None,
+        help="repeat/trim loaded audio to exactly this many seconds before "
+             "encoding (default: use the clip as-is, subject to "
+             "--audio-fraction)",
+    )
     parser.add_argument(
         "--image",
         nargs="?",
@@ -2807,15 +2680,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "checkpoints and is reported at stage level only.",
     )
     parser.add_argument(
-        "--profile-ctx",
-        type=int,
-        default=MAX_CONTEXT_SIZE,
-        help=f"context length for the SECOND profiled decode step (default "
-             f"{MAX_CONTEXT_SIZE}, the full context). The first is taken right "
-             f"after prefill, so the pair brackets decode cost from the "
-             f"shortest to the longest KV history. --profile only.",
-    )
-    parser.add_argument(
         "--summary",
         default=None,
         metavar="PATH",
@@ -2827,13 +2691,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip writing the run-summary Markdown",
     )
-    parser.add_argument(
-        "--_high-phase",
-        dest="high_phase",
-        choices=("vision", "audio", "prefill", "decode"),
-        default=None,
-        help=argparse.SUPPRESS,
-    )
     return parser
 
 
@@ -2844,242 +2701,31 @@ def run_summary_filename(args) -> str:
     ``qwen2.5_omni_7b_test_xdma0_image_multi-core_8.md``.
 
     Device and mode are always present, in that order; a profile run is tagged
-    so its phase breakdown never overwrites a generation run's summary.
-
-    A PRESET IS PART OF THE NAME because it is not visible in the mode. --low
-    is mode "audio" and --medium/--high are "image+audio", exactly like the plain flags
-    they build on, so without this a preset run and an ad-hoc run of the same
-    mode overwrite each other despite being different shapes -- 849 prefill
-    tokens against 154, which is the whole point of having the preset.
+    so its phase breakdown never overwrites a generation run's summary. Callers
+    driving distinct fixed shapes at the same mode (e.g. benchmark.py's
+    presets) pass ``--summary`` explicitly rather than relying on this name.
     """
     parts = ["qwen2.5_omni_7b_test", args.dev, _result_mode(args)]
-    if getattr(args, "preset", None):
-        parts.append(args.preset)
     if getattr(args, "profile", False):
         parts.append("profile")
     parts.append(f"multi-core_{args.multi_core}")
     return "_".join(parts) + ".md"
 
 
-def _write_high_summary(args, phases: dict[str, dict], process_wall: dict[str, float]) -> str:
-    """Combine independently executed high-load phase measurements."""
-    vision = phases["vision"]
-    audio = phases["audio"]
-    sample = phases["prefill"]
-    decode = phases["decode"]
-    chunks = int(RUN_PRESETS["high"]["prefill_chunks"])
-    aggregate_tokens = int(sample["tokens"]) * chunks
-    prefill = dict(sample)
-    for key in ("flops", "model_flops", "hw_us", "wall_s"):
-        prefill[key] = float(sample[key]) * chunks
-    prefill["detail"] = (
-        f"{chunks} x {sample['tokens']} independent chunks = "
-        f"{aggregate_tokens} aggregate tokens"
-    )
-    prefill["gflops"] = (
-        prefill["flops"] / (prefill["hw_us"] * 1e3)
-        if prefill["hw_us"] else 0.0
-    )
-    prefill["effective_gflops"] = (
-        prefill["model_flops"] / (prefill["hw_us"] * 1e3)
-        if prefill["hw_us"] else 0.0
-    )
-    mono_flops = float(sample["monolithic_model_flops"])
-    mono_us = (
-        mono_flops / (prefill["effective_gflops"] * 1e3)
-        if prefill["effective_gflops"] else 0.0
-    )
-    rows = [vision, audio, prefill, decode]
-    # Every phase result already carries model_flops (the unpadded work this
-    # architecture actually owes); turn it into effective GFLOPS for ALL FOUR
-    # stages, not prefill alone -- vision and audio were being captured on the
-    # wire and then dropped when this table got built.
-    for row in rows:
-        row["effective_gflops"] = (
-            float(row["model_flops"]) / (float(row["hw_us"]) * 1e3)
-            if row.get("hw_us") else 0.0
-        )
-    peak = float(vision["peak_gflops"])
-    enc_us = float(vision["hw_us"]) + float(audio["hw_us"])
-    segmented_ttft_us = enc_us + float(prefill["hw_us"])
-    monolithic_ttft_us = enc_us + mono_us
-
-    lines = [
-        "# qwen2.5_omni_7b high-load benchmark",
-        "",
-        "## Contract",
-        "",
-        "- **Execution:** vision, audio, prefill, and decode each ran in a "
-        "fresh Python process with its own eight-core reset, compilation, and "
-        "FPGA execution.",
-        "- **Camera:** 4 independent 896x896 frames, 4096 vision tokens total.",
-        "- **Audio:** 6.0 seconds, the configured 600-mel-frame maximum.",
-        f"- **Prefill:** {aggregate_tokens} aggregate tokens measured as "
-        f"{chunks} x {sample['tokens']} independent resident chunks, real FPGA "
-        "runs replayed -- not a shorter stand-in. A genuine single continuous "
-        f"{aggregate_tokens}-token prefill does not fit: its own buffers "
-        "(down-projection TP scratch) scale with prompt length and collide "
-        "with the ~707 MiB/core of real resident weights in the same 1 GiB "
-        "window, and there is no way to free that room without changing the "
-        "TP degree or the weight residency being measured.",
-        f"- **Decode:** measured with the KV cache pre-filled to the same "
-        f"{aggregate_tokens}-token depth; rows beyond the real prefill chunk "
-        "are zero-filled placeholders, so decode's attention shape and DMA "
-        "cost are real but its logits are not. Decode's own buffers (KV "
-        "cache, attention scratch) are not weight-adjacent, so this one "
-        "fits without the prefill tradeoff above.",
-        "- **Numerics/coherency:** intentionally unchecked throughout.",
-        "",
-        "## Hardware-counter performance",
-        "",
-        "| Stage | Shape | Work (GFLOP) | FPGA time (ms) | Issued GFLOPS | "
-        "% peak (issued) | Effective GFLOPS | % peak (effective) | "
-        "CPU execution wall (s) |",
-        "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for row in rows:
-        gflops = float(row["gflops"])
-        eff = float(row["effective_gflops"])
-        lines.append(
-            f"| {row['stage']} | {row['detail']} | {float(row['flops']) / 1e9:.1f} | "
-            f"{float(row['hw_us']) / 1e3:.1f} | {gflops:.1f} | "
-            f"{100.0 * gflops / peak:.1f}% | {eff:.1f} | "
-            f"{100.0 * eff / peak:.1f}% | {float(row['wall_s']):.2f} |"
-        )
-    lines += [
-        "",
-        "## TTFT",
-        "",
-        f"- **Projected segmented TTFT (HW counters):** {segmented_ttft_us / 1e3:.1f} ms",
-        f"- **Projected segmented TTFT (CPU execution timers):** "
-        f"{float(vision['wall_s']) + float(audio['wall_s']) + float(prefill['wall_s']):.2f} s",
-        f"- **Estimated monolithic 6144-token prefill:** {mono_us / 1e3:.1f} ms "
-        f"({mono_flops / 1e9:.1f} model GFLOP at the measured "
-        f"{prefill['effective_gflops']:.1f} effective GFLOPS)",
-        f"- **Estimated monolithic TTFT:** {monolithic_ttft_us / 1e3:.1f} ms",
-        "",
-        "The monolithic figure is an extrapolation calibrated by FPGA-measured "
-        "throughput; it is not a 6144-row hardware execution.",
-        "",
-        "## Decode",
-        "",
-        f"- **Resident context:** {decode['context']} tokens",
-        f"- **Steps:** {decode['steps']}",
-        f"- **First token:** {1e6 / float(decode['first_us']):.2f} tok/s",
-        f"- **Average (HW counter):** {1e6 * int(decode['steps']) / float(decode['hw_us']):.2f} tok/s",
-        f"- **Average (CPU timer):** {int(decode['steps']) / float(decode['wall_s']):.2f} tok/s",
-        f"- **Throughput:** {float(decode['gflops']):.1f} GFLOPS "
-        f"({100.0 * float(decode['gflops']) / peak:.1f}% peak)",
-        "",
-        "## Independent phase process wall time",
-        "",
-        "This includes reset, weight loading, compilation, and execution and is "
-        "reported separately from inference TTFT.",
-        "",
-        "| Phase process | Wall (s) |",
-        "| :--- | ---: |",
-    ]
-    for name in ("vision", "audio", "prefill", "decode"):
-        lines.append(f"| {name} | {process_wall[name]:.2f} |")
-    lines.append("")
-    out = args.summary or os.path.join(SCRIPT_DIR, run_summary_filename(args))
-    with open(out, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines))
-    return out
-
-
-def _run_high_orchestrator(args) -> None:
-    """Run every high-load phase in a fresh process, then combine metrics."""
-    phases: dict[str, dict] = {}
-    process_wall: dict[str, float] = {}
-    for phase in ("vision", "audio", "prefill", "decode"):
-        command = [
-            sys.executable, os.path.abspath(__file__),
-            "--dev", args.dev,
-            "--multi-core", str(args.multi_core),
-            "--high", "--_high-phase", phase,
-            "--max-new-tokens", "32",
-            "--no-summary",
-        ]
-        print(f"\n{'=' * 72}\nHIGH PHASE: {phase}\n{'=' * 72}", flush=True)
-        started = time.perf_counter()
-        proc = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
-        )
-        result = None
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            print(line, end="", flush=True)
-            if line.startswith("HIGH_PHASE_RESULT: "):
-                result = json.loads(line[len("HIGH_PHASE_RESULT: "):])
-        returncode = proc.wait()
-        process_wall[phase] = time.perf_counter() - started
-        if returncode:
-            raise RuntimeError(f"high phase {phase!r} exited with status {returncode}")
-        if result is None:
-            raise RuntimeError(f"high phase {phase!r} produced no metric record")
-        phases[phase] = result
-    out = _write_high_summary(args, phases, process_wall)
-    print(f"\nWrote combined high-load summary: {out}")
-    print("HIGH_RESULT: " + json.dumps({
-        "summary": out, "phases": phases, "process_wall_s": process_wall,
-    }, ensure_ascii=False))
-
 
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
-    apply_run_preset(args)
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
-    if args.profile_ctx < 2 or args.profile_ctx > MAX_CONTEXT_SIZE:
-        parser.error(f"--profile-ctx must be between 2 and {MAX_CONTEXT_SIZE}")
-    if args.preset == "high" and args.profile:
-        parser.error("--high already performs a multi-pass benchmark; do not combine it with --profile")
     if args.no_summary and args.summary:
         parser.error("--summary and --no-summary are mutually exclusive")
-    if args.preset == "high" and args.high_phase is None:
-        _run_high_orchestrator(args)
-        return
     with _exclusive_run_lock():
         _main_locked(parser, args)
 
 
 def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     """Run artifact preparation and FPGA execution under the global lock."""
-    global MAX_CONTEXT_SIZE
-    if getattr(args, "high_phase", None) == "decode":
-        # The decode phase's whole point is a resident KV depth this map
-        # cannot normally hold (that is why --high chunks prefill at all).
-        # Numerics are already unchecked for --high; widen ONLY the KV/decode
-        # context ceiling (MAX_CONTEXT_SIZE) in THIS ISOLATED SUBPROCESS so
-        # decode's shape and DMA cost are real at the aggregate length instead
-        # of at one 2048-token chunk. PREFILL_MAX_SEQ_LEN stays untouched: it
-        # sizes the PREFILL program's own buffers (I/O, TP-down scratch) to
-        # what this subprocess actually prefills -- one real 2048-token chunk
-        # -- and bloating it alongside MAX_CONTEXT_SIZE ballooned buffers that
-        # have nothing to do with KV depth for no reason.
-        #
-        # A REAL, CONTINUOUS 6144-token prefill was tried and reverted: its
-        # own buffers scale with the compiled length too (TP-down scratch is
-        # tp_ne * P * H, ~339.5 MiB at P=6144), and that has to coexist with
-        # the ~707 MiB/core of REAL resident weights in the same 1 GiB window.
-        # There is no bookkeeping fix for that -- shrinking the declared
-        # private reserve does not help, since shared_free() takes the max
-        # with the ACTUAL weight cursor, which real weight staging advances
-        # regardless of what is declared. The only ways through are reducing
-        # the down-projection's TP degree (understates real prefill
-        # throughput) or shrinking real weight residency (skips real weight
-        # DMA traffic) -- both change what is measured. So prefill keeps its
-        # x3 chunk replay below, which needs neither: the three 2048-token
-        # chunks are independent and identical in shape, so replaying one
-        # real, fully-TP-sharded, fully-resident measurement three times is
-        # the true cost of three of them, not an approximation.
-        aggregate = (int(RUN_PRESETS["high"]["prefill_chunk_tokens"]) - 1) * \
-            int(RUN_PRESETS["high"]["prefill_chunks"])
-        target = ((aggregate + args.max_new_tokens + 63) // 64) * 64
-        MAX_CONTEXT_SIZE = max(MAX_CONTEXT_SIZE, target)
     args.image = _resolve_sample(args.image, DEFAULT_IMAGE, "--image")
     args.audio = _resolve_sample(args.audio, DEFAULT_AUDIO, "--audio")
     engine_kwargs = resolve_engine_config(parser, args)
@@ -3124,153 +2770,11 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     ue._prompt_text = prompt
     print(ue.describe_dram_map())
 
-    high_phase = getattr(args, "high_phase", None)
-    if high_phase == "vision":
-        runs = int(RUN_PRESETS["high"]["vision_runs"])
-        measurements = []
-        embeddings = None
-        for index in range(runs):
-            print(f"\n=== Camera frame {index + 1}/{runs} ===")
-            if index == 0:
-                embeddings = _run_vision(ue, processed, profile=False)
-            else:
-                started = time.perf_counter()
-                embeddings = ue.run_vision_encoder(profile=False)
-                print(
-                    f"  vision -> {tuple(embeddings.shape)} in "
-                    f"{time.perf_counter() - started:.2f}s wall"
-                )
-            measurements.append((
-                int(ue._vis_total_flops), float(ue._vis_latency_us),
-                float(ue._vis_wall_s),
-            ))
-        ue._high_vision_runs = runs
-        ue._vis_total_flops = sum(item[0] for item in measurements)
-        ue._vis_latency_us = sum(item[1] for item in measurements)
-        ue._vis_wall_s = sum(item[2] for item in measurements)
-        row = ue.stage_metrics(args)[0]
-        print("HIGH_PHASE_RESULT: " + json.dumps({
-            "stage": row["stage"], "detail": row["detail"],
-            "flops": row["flops"], "model_flops": row["model_flops"],
-            "hw_us": row["us"], "wall_s": row["wall"],
-            "gflops": row["gflops"], "peak_gflops": ue.vis_peak_gflops(),
-        }))
-        return
-
-    if high_phase == "audio":
-        _embeddings, _metadata = _run_audio(ue, processed)
-        row = ue.stage_metrics(args)[0]
-        print("HIGH_PHASE_RESULT: " + json.dumps({
-            "stage": row["stage"], "detail": row["detail"],
-            "flops": row["flops"], "model_flops": row["model_flops"],
-            "hw_us": row["us"], "wall_s": row["wall"],
-            "gflops": row["gflops"], "peak_gflops": ue.vis_peak_gflops(),
-        }))
-        return
-
-    if high_phase in ("prefill", "decode"):
-        print(f"\n--- Isolated {high_phase} LM setup ---")
-        ue.lm_weight_init()
-        ue.lm_tensor_init()
-        ue.compile_prefill(len(context), profile=False)
-        # Decoder compilation must precede the first prefill because it copies
-        # the down-projection image before prefill repacks that image in place.
-        ue.compile_decoder(profile=False)
-        ue.check_master_isa()
-        ue.store_program_stages("prefill", "decode")
-        ue.run_prefill(context, positions=torch.arange(len(context)))
-        if high_phase == "prefill":
-            row = next(r for r in ue.stage_metrics(args) if r["stage"] == "Prefill")
-            aggregate = len(context) * int(RUN_PRESETS["high"]["prefill_chunks"])
-            print("HIGH_PHASE_RESULT: " + json.dumps({
-                "stage": row["stage"], "detail": row["detail"],
-                "tokens": len(context),
-                "flops": row["flops"], "model_flops": row["model_flops"],
-                "monolithic_model_flops": float(
-                    _model_flops.prefill_flops(cfg, aggregate)
-                ),
-                "hw_us": row["us"], "wall_s": row["wall"],
-                "gflops": row["gflops"], "peak_gflops": ue.vis_peak_gflops(),
-            }))
-            return
-        ue.activate_decode_shared_weights()
-        real_prefill_rows = int(ue.seq_len)
-        aggregate = (int(RUN_PRESETS["high"]["prefill_chunk_tokens"]) - 1) * \
-            int(RUN_PRESETS["high"]["prefill_chunks"])
-        if aggregate > real_prefill_rows:
-            # SPEED ONLY, NOT NUMERICS: rows [real_prefill_rows:aggregate) were
-            # never actually prefilled. Fill them with finite zeros (matches
-            # lm_reset_attention_state's own convention) so the padding cannot
-            # produce NaN, then claim the position so decode's per-step bias
-            # and KV stride treat all of it as live. This makes decode run its
-            # real attention/matmul shape against the real 6144-token
-            # aggregate length instead of against one 2048-token chunk; the
-            # logits it produces from the fake rows are meaningless, which is
-            # already true of --high generally.
-            AHD, KVH, NL = ue.actual_head_dim, ue.num_kv_heads, ue.LAYER_SIZE
-            pad_rows = aggregate - real_prefill_rows
-            stride = ue.KV_STRIDE_HEAD  # bytes per KV head's full C-row plane
-            for cache in (ue.LM_K_CACHE, ue.LM_V_CACHE):
-                for li in range(NL):
-                    for h in range(KVH):
-                        plane = cache + (li * KVH + h) * stride
-                        off = plane + real_prefill_rows * AHD * ue.bytes_per_element
-                        ue.dma_to_accelerator_memory(
-                            off, torch.zeros(pad_rows * AHD, dtype=torch.bfloat16))
-            ue.seq_len = aggregate
-        resident_context = int(ue.seq_len)
-        # High is explicitly timing-only: force all requested steps even if a
-        # numerically meaningless token happens to equal EOS.
-        ue._decode_stop_token_ids = lambda: set()
-        ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)
-        row = next(r for r in ue.stage_metrics(args) if r["stage"] == "Decode")
-        steps = len(ue._decode_step_us)
-        print("HIGH_PHASE_RESULT: " + json.dumps({
-            "stage": row["stage"], "detail": row["detail"],
-            "context": resident_context, "steps": steps,
-            "first_us": float(ue._decode_step_us[0]),
-            "flops": row["flops"], "model_flops": row["model_flops"],
-            "hw_us": row["us"], "wall_s": row["wall"],
-            "gflops": row["gflops"], "peak_gflops": ue.vis_peak_gflops(),
-        }))
-        return
-
     image_embeddings = None
     audio_embeddings = None
     audio_metadata = None
-    preset_spec = RUN_PRESETS.get(getattr(args, "preset", None) or "", {})
     if args.image:
-        vision_runs = int(preset_spec.get("vision_runs", 1))
-        vision_measurements = []
-        for frame_index in range(vision_runs):
-            if vision_runs > 1:
-                print(f"\n=== High benchmark camera frame {frame_index + 1}/{vision_runs} ===")
-            if frame_index == 0:
-                # Compile and package one shape-specific program. Camera frames
-                # share geometry, so later frames execute the same validated
-                # FPGA image rather than consuming another worker ISA slice.
-                image_embeddings = _run_vision(ue, processed, profile=args.profile)
-            else:
-                frame_started = time.perf_counter()
-                image_embeddings = ue.run_vision_encoder(profile=False)
-                print(
-                    f"  vision -> {tuple(image_embeddings.shape)} in "
-                    f"{time.perf_counter() - frame_started:.2f}s wall"
-                )
-            vision_measurements.append((
-                int(ue._vis_total_flops),
-                float(ue._vis_latency_us),
-                float(getattr(ue, "_vis_wall_s", 0.0)),
-            ))
-        if vision_runs > 1:
-            ue._high_vision_runs = vision_runs
-            ue._vis_total_flops = sum(row[0] for row in vision_measurements)
-            ue._vis_latency_us = sum(row[1] for row in vision_measurements)
-            ue._vis_wall_s = sum(row[2] for row in vision_measurements)
-            ue._vis_gflops = (
-                ue._vis_total_flops / (ue._vis_latency_us * 1e3)
-                if ue._vis_latency_us else 0.0
-            )
+        image_embeddings = _run_vision(ue, processed, profile=args.profile)
     if args.audio:
         audio_embeddings, audio_metadata = _run_audio(ue, processed)
 
@@ -3294,19 +2798,6 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         f"mRoPE delta {rope_delta}, prompt {prompt!r}"
     )
 
-    if args.preset == "high":
-        # Repeated encoder rendezvous leave no useful queue state for the LM.
-        # A software reset clears all eight queues without touching DRAM, so
-        # the final frame/audio embeddings remain available for prefill.
-        print("\n--- High benchmark encoder/LM queue reset ---")
-        reset_build = reset_selected_engines()
-        if reset_build != fpga_build:
-            raise RuntimeError(
-                f"FPGA build changed across high benchmark reset: "
-                f"0x{fpga_build:08x} -> 0x{reset_build:08x}"
-            )
-        print("Software reset + HALT probe passed on engines 0-7; DRAM preserved")
-
     def _write_summary(profiles=None) -> None:
         """Render the run summary; a reporting failure never fails the run."""
         if args.no_summary:
@@ -3323,9 +2814,8 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     ue.lm_weight_init()
     ue.lm_tensor_init()
     ue.compile_prefill(len(context), profile=args.profile)
-    # Decoder setup installs the device-side embedding and copies every
-    # reusable projection into private windows. BF16 O addresses are compiled
-    # now, but their shared overlay is deliberately deferred until prefill.
+    # Decoder setup installs IF4 projection shards in private windows; the
+    # BF16 embedding table stays on the host and only selected rows are DMA'd.
     ue.compile_decoder(profile=args.profile)
     ue.check_master_isa()
     # These bodies are address-coupled: decoder starts immediately after this
@@ -3333,118 +2823,52 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     ue.store_program_stages("prefill", "decode")
     for line in ue.isa_usage_lines():
         print(line)
-    prefill_chunks = int(preset_spec.get("prefill_chunks", 1))
-    prefill_measurements = []
-    for chunk_index in range(prefill_chunks):
-        if prefill_chunks > 1:
-            print(
-                f"\n=== High benchmark prefill chunk "
-                f"{chunk_index + 1}/{prefill_chunks} ({len(context)} tokens) ==="
-            )
-        ue.run_prefill(
-            context,
-            image_embeddings=image_embeddings,
-            audio_embeddings=audio_embeddings,
-            positions=positions[: len(context)],
-            profile=args.profile,
-        )
-        prefill_measurements.append((
-            int(ue._prefill_flops),
-            float(ue._latency_prefill_us),
-            float(getattr(ue, "_prefill_wall_s", 0.0)),
-            float(ue._model_flops_prefill() or 0.0),
-        ))
-    if prefill_chunks > 1:
-        aggregate_tokens = len(context) * prefill_chunks
-        ue._prefill_flops = sum(row[0] for row in prefill_measurements)
-        ue._latency_prefill_us = sum(row[1] for row in prefill_measurements)
-        ue._prefill_wall_s = sum(row[2] for row in prefill_measurements)
-        ue._prefill_seq_len_run = aggregate_tokens
-        ue._high_segmented_prefill_model_flops = sum(
-            row[3] for row in prefill_measurements
-        )
-        ue._prefill_gflops = (
-            ue._prefill_flops / (ue._latency_prefill_us * 1e3)
-            if ue._latency_prefill_us else 0.0
-        )
-        monolithic_flops = float(_model_flops.prefill_flops(cfg, aggregate_tokens))
-        segmented_effective_gflops = (
-            ue._high_segmented_prefill_model_flops
-            / (ue._latency_prefill_us * 1e3)
-            if ue._latency_prefill_us else 0.0
-        )
-        monolithic_estimate_us = (
-            monolithic_flops / (segmented_effective_gflops * 1e3)
-            if segmented_effective_gflops else 0.0
-        )
-        dims = ue._vision_dims()
-        ue._high_benchmark = {
-            "vision_runs": int(getattr(ue, "_high_vision_runs", 1)),
-            "vision_soft_tokens": (
-                int(getattr(ue, "_high_vision_runs", 1))
-                * int(dims["NUM_MERGED_TOKENS"])
-            ),
-            "audio_seconds": float(preset_spec["audio_seconds"]),
-            "prefill_chunks": prefill_chunks,
-            "chunk_tokens": len(context),
-            "aggregate_tokens": aggregate_tokens,
-            "segmented_prefill_model_flops": ue._high_segmented_prefill_model_flops,
-            "monolithic_prefill_model_flops": monolithic_flops,
-            "monolithic_prefill_estimate_us": monolithic_estimate_us,
-        }
-        print(
-            f"\n[High benchmark] measured {prefill_chunks} x {len(context)} = "
-            f"{aggregate_tokens} aggregate prefill tokens; monolithic "
-            f"{aggregate_tokens}-token prefill estimate "
-            f"{monolithic_estimate_us / 1e6:.2f}s HW"
-        )
+    ue.run_prefill(
+        context,
+        image_embeddings=image_embeddings,
+        audio_embeddings=audio_embeddings,
+        positions=positions[: len(context)],
+        profile=args.profile,
+    )
     ue.activate_decode_shared_weights()
 
     if args.profile:
         # The checkpointed decoder is the one published in programs.bin, so it
         # is also the one that must run: run_decode_step_profiled refuses any
-        # other image.  Two steps bracket decode cost -- one at the prompt's
-        # own context, one at --profile-ctx -- because a step's price is set by
-        # the KV length, while the projections stay the same size.
+        # other image. Only the 1st-token step is profiled -- it is taken
+        # right after prefill, at the prompt's own context.
         prof_program = ue._decoder_program
         prof_checkpoints = list(ue._decoder_checkpoints)
         prof_workers = list(getattr(ue, "_decoder_workers", []))
         print(f"\n--- Profiled decode: 1st token (ctx {ue.seq_len}) ---")
-        first_results, next_token, aligned_first = ue.run_decode_step_profiled(
+        first_results, _next_token, aligned_first = ue.run_decode_step_profiled(
             seed, prof_program, prof_checkpoints, workers=prof_workers
         )
         ctx_first = ue.seq_len
-        if args.profile_ctx - 1 > ue.seq_len:
-            # --profile measures TIME, not numerics.  Forcing the position is
-            # how the long-context step is reached at all: the model hits EOS
-            # long before the context fills, and a checkpointed program costs
-            # one host round trip per phase per token.  KV rows past the prompt
-            # are zeros, which does not change latency.
-            ue.seq_len = args.profile_ctx - 1
-            print(f"  forcing ctx {args.profile_ctx} (timing only)")
-        print(f"\n--- Profiled decode: at context (ctx {ue.seq_len}) ---")
-        ctx_results, _token, aligned_ctx = ue.run_decode_step_profiled(
-            next_token, prof_program, prof_checkpoints, workers=prof_workers
-        )
+        # A 4th element, model_phases, is the stage's TRUE (unpadded) work
+        # broken out by the same checkpoint names the profile results use --
+        # computed here, where the right context/dims are in scope, rather
+        # than guessed from the title string inside _profile_tables.
         profiles = []
         if args.image:
             dims = ue._vision_dims()
             profiles.append((
                 "Vision encoder",
-                f"{dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens.",
+                f"{dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens. "
+                "patch_embed is a separate FPGA program before the encoder checkpoints.",
                 getattr(ue, "_vis_profile", None),
+                ue._model_flops_vision_by_phase(dims),
             ))
         profiles += [
             ("Prefill", f"{len(context)} tokens.",
-             getattr(ue, "_prefill_profile", None)),
+             getattr(ue, "_prefill_profile", None),
+             ue._model_flops_prefill_by_phase()),
             ("Decode - 1st token",
              f"Context {ctx_first} tokens (aligned {aligned_first}).",
-             first_results),
-            ("Decode - at context",
-             f"Context {ue.seq_len} tokens (aligned {aligned_ctx}).",
-             ctx_results),
+             first_results,
+             _model_flops.decode_step_flops_by_phase(ue._cfg, ctx_first)),
         ]
-        for title, note, results in profiles:
+        for title, note, results, _model_phases in profiles:
             if results:
                 ue.print_profile_table(title, results, note=note)
         print(f"\nThinker profile done in {time.perf_counter() - started:.2f}s wall")
@@ -3485,9 +2909,7 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         _summary_rows = ue.stage_metrics(args)
     except Exception:  # noqa: BLE001 - reporting must not fail a good run
         _summary_rows = []
-    reported_prefill_tokens = int(
-        getattr(ue, "_high_benchmark", {}).get("aggregate_tokens", len(context))
-    )
+    reported_prefill_tokens = len(context)
     result = {
         "model": "qwen2.5_omni_7b",
         "mode": _result_mode(args),
@@ -3540,11 +2962,9 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         "decode_gflops": getattr(ue, "_decode_gflops", None),
         "vision_gflops": getattr(ue, "_vis_gflops", None),
         "audio_gflops": getattr(ue, "_audio_gflops", None),
-        "prompt_tokens": reported_prefill_tokens + (prefill_chunks if prefill_chunks > 1 else 1),
+        "prompt_tokens": reported_prefill_tokens + 1,
         "rope_delta": rope_delta,
     }
-    if getattr(ue, "_high_benchmark", None):
-        result["high_benchmark"] = ue._high_benchmark
     print("TEST_RESULT: " + json.dumps(result, ensure_ascii=False))
     _write_summary()
 

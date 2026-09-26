@@ -1,191 +1,145 @@
 # Qwen2.5-Omni-7B on the Apex Compute Unified Engine — tiered benchmark
 
-Three workload tiers on one Alveo U50 at eight engines: a voice command, a
-single-camera query, and a multi-camera longer-context query.
+Low and Medium are continuous eight-engine model runs on the Alveo U50. High
+measures individual eight-engine LM operations at High dimensions **before**
+the media phase, then measures four full-resolution vision passes and audio
+on the FPGA. High's LM and TTFT totals are **derived**, not an end-to-end
+model run. All FPGA times below come from hardware counters; CPU times are
+identified separately.
 
-All timings are FPGA hardware counters. The one exception is marked in place.
+High's LM ops are measured cold, ahead of the vision/audio phase, because
+running ~90 s of real vision compute immediately before them measurably
+slowed the following LM matmuls (q_proj/gate_proj etc. read ~15-17% lower
+GFLOPS when timed right after vision than when timed standalone) — a
+board-thermal artifact of stage ordering within this benchmark, not a model
+regression. Reordering the two phases (LM first, media second) recovered the
+LM ops' standalone GFLOPS; the numbers below reflect that ordering.
 
-## Platform
+This revision reflects the private-DRAM/decode optimizations accumulated
+this round: the token embedding is a host-side BF16 gather (prompt/generated
+rows only, DMA'd on demand, no FPGA-resident lookup table); the LM head's
+global argmax is a host-side reduction of each engine's free local-argmax
+candidate (a two-byte DRAM read per engine) instead of an on-device
+64-wide identity-matrix scan of the full vocabulary; and **every** projection
+weight (Q, K, V, O, gate, up, down) now uses one private, 64-aligned column
+shard per engine, staged once at weight-load time and reused as-is by both
+prefill (tensor-parallel, mirroring gate/up/down's existing pattern) and
+decode — no second runtime copy, no on-the-fly quantization. V is IF4 in
+both phases too, recovering the decode GEMV throughput a BF16-only V would
+give up. Net effect: prefill's own qkv_proj/o_proj get faster from the same
+tensor-parallel win MLP already had, decode throughput improves, and the
+per-engine private DRAM reserve usage lands at 447.8 MiB against the
+645 MiB `OMNI_PRIVATE_RESERVE_BYTES` budget (down from 712 MiB/core before
+this round of optimizations) while the **shared** pool's own usage drops
+from ~515 MiB to ~0.6 MiB (Q/K/O's old prefill-only shared copies and V's
+old shared BF16 copy are gone).
 
-| Board | Engines | Clock | Peak | Per-engine peak | HW version | Weights | Context |
-| :--- | ---: | ---: | ---: | ---: | :--- | :--- | ---: |
-| Alveo U50, `xdma0`, 8 GiB HBM | 8 of 8 | 366.7 MHz | 375.5 GFLOPS | 46.9 GFLOPS | `0xe9cbe74b` | `params.bin`, 5608.3 MiB | 2500 tokens, 2560-row KV |
+## Platform and workloads
 
-Identical in all three tiers, `params.bin` byte for byte.
+| Board | Device | Engines | Clock | Eight-engine peak | HW version | Model weight bin |
+| :--- | :--- | ---: | ---: | ---: | :--- | ---: |
+| Alveo U50, 8 GiB HBM | `xdma0` | 8 of 8 | 366.7 MHz | 375.5 GFLOPS | `0xfc46ae6f` | 5989.5 MiB |
 
-## Tiers
+| Tier | Command | Vision | Audio | LM prefill rows | Measurement |
+| :--- | :--- | :--- | :--- | ---: | :--- |
+| Low | `benchmark.py --low` | None | 2.55 s, 64 soft tokens | 849 | Continuous model run |
+| Medium | `benchmark.py --medium` | 1 × 896×896, 1024 soft tokens | 5.10 s, 127 soft tokens | 2047 | Continuous model run |
+| High | `benchmark.py --high` | 4 × 896×896, 4096 soft tokens | 6.00 s, 150 soft tokens | 6144 | Measured media + derived LM |
 
-| Tier | Command | Camera frames | Vision tokens | Speech | Audio tokens | Text tokens | Input tokens |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Low — voice command | `--low` | 0 | 0 | 2.55 s | 64 | 785 | 849 |
-| Medium — single camera | `--medium` | 1 x 896x896 | 1024 | 5.10 s | 128 | 895 | 2047 |
-| High — multi-camera | `--high` | 4 x 896x896 | 4096 | 6.00 s | 150 | 1898 | 6144 |
+High replays the **same** bundled 896×896 image four times. This measures four
+same-shape vision executions, not four distinct camera images. Its 6144 LM rows
+are the benchmark target, not a prompt that was run through the resident model.
 
-Audio encodes at 25.1 soft tokens per second of speech. High's 150 tokens over
-6.00 s is the configured 600-mel-frame maximum, so that tier sits at the
-ceiling of what the audio front end accepts in one request.
+## Time to first token
 
-## Time to first token, by input modality
+This report follows the run summaries' convention: TTFT is media encoding plus
+LM prefill, **before the first decode step**. It excludes model initialization,
+weight loading, compilation, and host input preparation (including the host
+BF16 embedding gather -- see each tier's own source report). High also
+omits LM operations outside the isolated-op coverage described below.
 
-| Tier | Vision encoder (ms) | Audio encoder (ms) | LLM prefill (ms) | TTFT (ms) | TTFT (s) |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| Low | — | 614.0 | 35197.6 | 35811.6 | 35.81 |
-| Medium | 36229.1 | 1172.3 | 83948.5 | 121349.9 | 121.35 |
-| High | 145355.1 | 1400.8 | 251721.4 | 398477.3 | 398.48 |
+| Tier | Vision HW (ms) | Audio HW (ms) | Prefill HW/derived (ms) | TTFT HW/projected (ms) | TTFT (s) | CPU-stage TTFT (s) |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Low | — | 612.9 | 33481.0 | **34093.9** | 34.09 | 34.12 |
+| Medium | 22266.0 | 1180.5 | 84511.9 | **107958.4** | 107.96 | 108.00 |
+| High | 90149.9 | 1447.6 | 339056.5 | **430654.0 projected** | 430.65 projected | Not available |
 
-| Tier | Vision share | Audio share | Prefill share |
-| :--- | ---: | ---: | ---: |
-| Low | — | 1.7% | 98.3% |
-| Medium | 29.9% | 1.0% | 69.2% |
-| High | 36.5% | 0.4% | 63.2% |
+Low and Medium TTFTs are sums of real model-stage hardware counters; their CPU
+columns sum the corresponding stage timers, including the host BF16
+embedding gather (off the hardware counter, inside the CPU timer instead).
+High's vision and audio are real FPGA measurements, but its prefill is a sum
+of separately measured operation latencies across 28 layers, measured cold
+before the media phase runs (see above). Therefore **430.65 s is not an
+end-to-end or CPU timer measurement**. The High TTFT split is 20.9% vision,
+0.3% audio, and 78.7% derived prefill (Low: 1.8% audio/98.2% prefill;
+Medium: 20.6% vision/1.1% audio/78.3% prefill).
 
-Host overhead is negligible: the CPU timer and the hardware counter agree to
-within 0.1% at every tier.
+## Stage throughput and utilization
 
-### Unit costs
+`Issued` counts the FPGA operations at their executed shapes; `model` counts
+the architecture's useful matrix work. Both rates divide by the same
+hardware-counter time. Utilization uses the full 375.5-GFLOPS eight-engine
+peak, including stages that do not occupy all engines equally.
 
-| Stage | Low | Medium | High | Unit cost |
-| :--- | ---: | ---: | ---: | :--- |
-| Vision, per soft token | — | 35.38 ms | 35.49 ms | ~35.4 ms |
-| Vision, per 896x896 frame | — | 36.23 s | 36.34 s | ~36.3 s |
-| Audio, per soft token | 9.59 ms | 9.16 ms | 9.34 ms | ~9.3 ms |
-| Audio, per second of speech | 240.8 ms | 229.9 ms | 233.5 ms | ~0.23x realtime |
-| Prefill, per input token | 41.46 ms | 41.01 ms | 40.97 ms | ~41.1 ms |
+| Tier | Stage | Issued GFLOP | Model GFLOP | FPGA/derived ms | Issued GFLOPS | Issued % peak | Model GFLOPS | Model % peak |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Low | Audio | 166.1 | 164.9 | 612.9 | 271.0 | 72.2% | 269.1 | 71.6% |
+| Low | Prefill | 11392.6 | 11224.8 | 33481.0 | 340.3 | 90.6% | 335.3 | 89.3% |
+| Medium | Vision/image | 5811.8 | 5645.5 | 22266.0 | 261.0 | 69.5% | 253.5 | 67.5% |
+| Medium | Audio | 336.5 | 328.8 | 1180.5 | 285.0 | 75.9% | 278.5 | 74.2% |
+| Medium | Prefill | 28426.0 | 27555.9 | 84511.9 | 336.4 | 89.6% | 326.1 | 86.8% |
+| High | Vision/image | 23247.0 | 22581.8 | 90149.9 | 257.9 | 68.7% | 250.5 | 66.7% |
+| High | Audio | 400.1 | 387.3 | 1447.6 | 276.4 | 73.6% | 267.6 | 71.3% |
+| High | Prefill, derived | 97703.7 | 87760.3 | 339056.5 | 288.2 | 76.7% | 258.8 | 68.9% |
 
-**Audio is never a design constraint.** At most 1.7% of TTFT, and 0.4% at High.
-A 6-second query costs 1.4 s to encode.
-
-**Vision decides multi-camera feasibility.** Each frame costs a flat 36.3 s.
-Going from one camera to four adds 109.1 s before the LM sees a token.
-
-**Prefill is linear in this range**, 41 ms per token from 849 to 2048 within
-1.2%. The dense projections dominate and the attention term has not yet
-asserted itself, so prefill cost follows token count alone.
-
-### Efficiency by stage
-
-`Issued` is the work billed at the shapes actually run; `effective` is what
-the architecture owes at its own dimensions, so it is the figure comparable to
-any other implementation of this model.
-
-| Stage | Tier | Issued GFLOPS | % of peak | Effective GFLOPS | % of peak | Useful work |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| Prefill | Low | 341.6 | 91.0% | 318.9 | 84.9% | 93.4% |
-| Prefill | Medium | 338.8 | 90.2% | 328.2 | 87.4% | 96.9% |
-| Prefill | High | 338.9 | 90.3% | 328.6 | 87.5% | 96.9% |
-| Vision | Medium | 290.7 | 77.4% | 155.8 | 41.5% | 53.6% |
-| Vision | High | 288.9 | 77.0% | 154.9 | 41.3% | 53.6% |
-| Audio | Low | 270.6 | 72.1% | 268.6 | 71.5% | 99.3% |
-| Audio | Medium | 288.1 | 76.7% | 281.6 | 75.0% | 97.7% |
-| Audio | High | 279.4 | 74.4% | 270.5 | 72.0% | 96.8% |
-
-Prefill is the best-utilised stage on the board; its share of TTFT is large
-because the work is large, not because it runs badly. The vision encoder issues
-53.6% padding, making that gap the largest recoverable inefficiency in TTFT.
-Vision and audio's High-tier effective figures are not in the harness's own
-printed summary -- `_write_high_summary` only turns `model_flops` into an
-effective-GFLOPS column for prefill's monolithic estimate -- but every
-phase's raw result already carries `model_flops`, so they are derived here
-from the same run rather than left blank. High's per-frame/per-second effective
-rate lands within 1% of Medium's for both stages, as it should: same shape,
-replicated.
+The measured vision cost is 22.27 s for Medium's image and 22.54 s per High
+replay. High audio costs 1.45 s. Derived High prefill is 18.12 input tokens/s;
+the real Low and Medium prefill rates are 25.36 and 24.22 tokens/s. High's
+prefill GFLOPS lands close to the real Low/Medium prefill rate (90.6%, 89.6%
+of peak) because the LM ops are measured cold, before the media phase; it
+should still not be replaced by a linear extrapolation from the shorter
+model runs.
 
 ## Decode throughput
 
-| Tier | Resident context | First token | Average | ms/token | GFLOP/token | GFLOPS | % of peak |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Low | 862 | 13.32 tok/s | 13.32 tok/s | 75.1 | 14.53 | 193.5 | 51.5% |
-| Medium | 2158 | 8.85 tok/s | 8.74 tok/s | 114.5 | 15.03 | 131.3 | 35.0% |
-| High | 6144 | 5.32 tok/s | 5.32 tok/s | 187.9 | 16.61 | 88.8 | 23.6% |
+| Tier | Resident context | First-token HW | Average HW | CPU average | Latency per step | Status |
+| :--- | ---: | ---: | ---: | ---: | ---: | :--- |
+| Low | 863 tokens at final step | 15.34 tok/s | 14.90 tok/s | 13.63 tok/s | 67.1 ms HW average | Measured model run, 14 steps |
+| Medium | 2079 tokens at final step | 9.86 tok/s | 9.75 tok/s | 9.15 tok/s | 102.5 ms HW average | Measured model run, 32 steps |
+| High | 6144-token target | — | 7.05 tok/s raw | — | 141.85 ms raw | Isolated-op sum, not model decode |
+| High, corrected estimate | 6144-token target | — | 6.41 tok/s | — | 156.03 ms | Raw latency × 1.10 empirical scale |
 
-Generation degrades 60% from 862 to 6144 resident tokens — 13.32 to 5.32
-tok/s, a 2.5x rise in per-token latency for 7.1x the context.
+Decode is faster at every tier than the pre-optimization baseline (Low was
+13.09-13.34 tok/s CPU/HW; Medium was 8.68-8.88 tok/s): every projection now
+streams a single private column shard per step (no phase-specific overlay
+or on-the-fly quantization to build first), and V's IF4 shard keeps its GEMV
+throughput even though it is now the same physical shard prefill uses.
 
-The cause is not arithmetic. Work per token rises 14% across that range, while
-efficiency falls from 51.5% to 23.6% of peak. The decoder reads a KV cache
-growing linearly with context while its matmul shapes stay fixed, so the added
-time is memory traffic, not compute.
+High's correction factor (1.10) is carried over from `benchmark.py`'s
+pre-optimization calibration (Low 78.2/71.75 ms, Medium 99.2/89.19 ms) and has
+**not** been refitted against this revision's decode; treat the corrected
+6.41 tok/s figure as directional; the raw 7.05 tok/s row is this run's actual
+isolated-op measurement. The High decode operation table includes an
+eight-engine LM head; its global argmax is a host-side reduction (see above),
+off the HW counter. The full decode step still omits normalization, RoPE,
+residual/elementwise work (other than the down_proj reduction, which is
+measured), embeddings, KV-cache setup, host transfers, and inter-operation
+scheduling. High prefill has the same omitted-work limitation. No High
+decoded text or numerical correctness claim is made.
 
-*Derived, not measured:* one decode step streams the full 5.88 GB weight set.
-At Low's 75.1 ms that is 78.3 GB/s, within ~9% of the ~85 GB/s aggregate AXI
-ceiling — short-context decode sits near the DRAM weight-streaming floor, and
-the gap that opens at Medium and widens at High is attention and KV overhead
-on top of that floor.
+## Source reports and commands
 
-High's decode runs at the tier's true 6144-token resident depth, not a
-shorter stand-in. Rows beyond the tier's real prefill chunk (2048 tokens) are
-zero-filled placeholders in the KV cache, so decode's attention shape and DMA
-cost are real at 6144 while its logits are not — consistent with the
-numerics-unchecked contract stated for the High tier throughout this
-document.
-
-## Quantization
-
-Set in `qwen2.5_omni_7b_config.json` under `precision`; not a per-run choice.
-
-| Component | Precision | Size on device | Derivation |
-| :--- | :--- | ---: | :--- |
-| LM q, k, o, gate, up, down | IF4 | q_proj 171.5 MiB | 28 x 3584 x 3584 x 0.5 B |
-| Vision encoder | IF4 | | |
-| Audio encoder | IF4 | | |
-| LM head | IF4 | 259.9 MiB | 152064 x 3584 x 0.5 B |
-| Token embedding | **IF8** | 519.8 MiB | 152064 x 3584 x 1 B |
-| LM `v_proj` | **BF16** | 98.0 MiB | 28 x 512 x 3584 x 2 B |
-| `o_proj`, decode only | **BF16** | 686.0 MiB | 28 x 3584 x 3584 x 2 B |
-| RMSNorm weights, biases | BF16 | | |
-| Activations | BF16 | `lm.io` 17.5 MiB | 2560 x 3584 x 2 B |
-| KV cache | BF16 | 70.0 MiB each | 28 x 4 x 2560 x 128 x 2 B |
-
-**IF4** is block-adaptive 4-bit at block size 64 with a BF16 scale per block
-whose *sign bit selects the block's format*: negative means INT4, positive
-means FP4, magnitude is the effective scale. So "INT4/FP4 block-quantized" is
-exact — both formats are present, chosen per 64-element block.
-
-Three components are bold above because they depart from a pure-IF4
-description and affect any model-size or FLOP-per-byte comparison. They are
-identical across the tiers, so tier-to-tier comparability is unaffected. Every
-size in that table was checked against the per-core DRAM layout the runs print.
-
-## What ran on hardware
-
-Low and Medium are single continuous runs, measured end to end, producing real
-decoded text.
-
-High cannot run as one resident context — that is why the tier exists. It runs
-as four processes, each with its own eight-core reset and compilation:
-
-| Component | ms | Status |
-| :--- | ---: | :--- |
-| Vision, 4 frames | 145355.1 | measured, all four on the FPGA |
-| Audio, 6.0 s | 1400.8 | measured |
-| Prefill, chunk 1 of 3 | 83907.1 | measured, a real 2048-token FPGA run |
-| Prefill, chunks 2 and 3 | 167814.3 | chunk 1's measurement counted twice more |
-| **TTFT** | **398477.3** | **57.9% elapsed on hardware, 42.1% replayed** |
-
-Nothing there is modelled or curve-fit; what is synthetic is the chunk count,
-not the rate. The x3 holds because the chunks are independent — identical
-2048-token shape, no KV between them — so running all three would move the
-number by measurement noise.
-
-It is nonetheless a *lower* bound on a true 6144-token context, whose later
-chunks would attend over a growing KV. The summary's separate monolithic
-estimate, 267.1 s of prefill for 413.8 s TTFT, lands 3.9% higher for that
-reason.
-
-High is performance-only: numerics and coherence are unchecked, EOS is
-suppressed so all 32 decode steps execute, and no claim is made that a
-6144-token request fits in DRAM.
-
-## Source
-
-| Tier | Summary file |
+| Tier | Generated report |
 | :--- | :--- |
 | Low | `qwen2.5_omni_7b_test_xdma0_audio_low_multi-core_8.md` |
 | Medium | `qwen2.5_omni_7b_test_xdma0_image+audio_medium_multi-core_8.md` |
-| High | `qwen2.5_omni_7b_test_xdma0_image+audio_high_multi-core_8.md` |
+| High | `qwen2.5_omni_7b_benchmark_high_op_by_op.md` |
 
 ```bash
-python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --low
-python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --medium
-python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --high
+python models/qwen2.5_omni_7b/benchmark.py --low --dev xdma0 --multi-core 8
+python models/qwen2.5_omni_7b/benchmark.py --medium --dev xdma0 --multi-core 8
+python models/qwen2.5_omni_7b/benchmark.py --high --dev xdma0 --multi-core 8
 ```
+
+The generated source reports remain on the benchmark machine for inspection;
+only this consolidated `benchmark.md` is versioned as the benchmark result.

@@ -6,9 +6,9 @@ wire format without constructing Talker, Token2Wav, or even the complete
 Thinker in host RAM.  ``params.bin`` contains four time-shared regions: LM,
 vision, audio, and the BF16 attention-output matrices used only by decode.
 Transformer matrices follow the configured mixed IF4/BF16 policy; norms,
-biases, and FPGA media-front-end matrices remain BF16. The embedding is IF8
-with each row's scale vector padded to complete AXI beats so runtime lookup and
-dequantization can stay entirely on the accelerator.
+biases, and FPGA media-front-end matrices remain BF16. The BF16 embedding
+table stays on the host; only selected rows are transferred to accelerator
+tensor DRAM.
 """
 
 from __future__ import annotations
@@ -39,7 +39,10 @@ BLOCK = 64
 SCALE_BYTES = 2
 DATA_BYTES = 32
 WIRE_BYTES = SCALE_BYTES + DATA_BYTES
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 10  # BF16 host embedding; vision attn.qk/attn.v remain compact
+# Q/K/V/O private column-shard loading (qwen2.5_omni_7b_lm.py) and V staying
+# BF16 in both phases are loader-only changes: params.bin's on-disk sections
+# and bytes are unchanged from schema 10, so no version bump/regenerate here.
 GENERATION_TAG_BYTES = 32
 
 # Keep the host-only tokenizer/media preprocessing assets beside params.bin so
@@ -682,30 +685,39 @@ def _write_lm(out, reader: _Checkpoint, cfg: dict) -> dict:
     w.add_if4_source("lm_head.weight", lambda a, b: head[a:b, :], (vocab, h))
     embed_name = "thinker.model.embed_tokens.weight"
     _expect(reader, embed_name, (vocab, h))
-    embedding_precision = cfg["precision"].get("embedding")
-    w.add_quantized_embedding_source(
+    if cfg["precision"].get("embedding") != "bf16":
+        raise ValueError("Qwen2.5-Omni requires a host BF16 embedding")
+    w.add_bf16_source(
         "language_model.embed_tokens.weight",
-        reader.slice(embed_name),
-        (vocab, h),
-        precision=embedding_precision,
+        reader.slice(embed_name), (vocab, h),
     )
     return w.finish()
 
 
-def _pad_qk(weight: torch.Tensor, bias: torch.Tensor, proj: int, out_w, out_b) -> None:
-    heads, head_dim, hidden = 16, 80, 1280
-    value = weight.reshape(heads, head_dim, hidden)
-    bvalue = bias.reshape(heads, head_dim)
-    half = head_dim // 2
-    for head in range(heads):
-        start = (proj * heads + head) * 128
-        out_w[start:start + half] = value[head, :half]
-        out_w[start + 64:start + 64 + half] = value[head, half:]
-        out_b[start:start + half] = bvalue[head, :half]
-        out_b[start + 64:start + 64 + half] = bvalue[head, half:]
-
-
 def _write_vision(out, reader: _Checkpoint, cfg: dict) -> dict:
+    """Q/K/V are stored fully COMPACT -- ``attn.qk`` ([2h, h], Q's real
+    1280 rows then K's), ``attn.v`` ([h, h]) -- no padding baked into the
+    weight at all, for either projection.
+
+    Replaces the older ``qk_padded``/``v_padded`` layout (16 heads x 80 real
+    dims padded all the way to 128 each, entangled with the RoPE
+    rotate-half swap-matrix layout -- see gemma4_e2b_vision.py's history for
+    why that padding existed at all: the per-head 64-alignment the
+    attention/transpose kernels genuinely need). The runtime
+    (qwen2.5_omni_7b_vision.py's qkv_proj emission) now inserts ALL of that
+    padding itself, with NO extra data movement: one small matmul per head
+    (V) or per RoPE head-half (QK) writes its real-width output directly to
+    its final padded position via the matmul's own gpr_out_row_stride_reg,
+    addressing its weight rows by pure offset arithmetic into this same
+    compact blob (IF4 blocks are along K, not N, so any N-row slice needs no
+    re-quantization). No scatter DMA, no intermediate compact buffer -- the
+    padding is inserted natively, by the same op that already computes the
+    projection, so there is no separate cost for it at all.
+
+    vision_weight_init() detects which key is present and falls back to the
+    old padded layout if this one is absent, so an old, not-yet-reconverted
+    params.bin for this model keeps working during the transition.
+    """
     w = _RegionWriter(out, "vision")
     v = cfg["vision"]
     h, heads, hd = v["hidden_size"], v["num_heads"], v["head_dim"]
@@ -713,24 +725,19 @@ def _write_vision(out, reader: _Checkpoint, cfg: dict) -> dict:
     for li in range(layers):
         src = f"thinker.visual.blocks.{li}"
         dst = f"visual.blocks.{li}"
-        qk_w = torch.zeros(2 * heads * 128, h, dtype=torch.bfloat16)
-        qk_b = torch.zeros(2 * heads * 128, dtype=torch.bfloat16)
-        for proj, tag in enumerate(("q", "k")):
-            wn, bn = f"{src}.attn.{tag}.weight", f"{src}.attn.{tag}.bias"
-            _expect(reader, wn, (h, h)); _expect(reader, bn, (h,))
-            _pad_qk(reader.tensor(wn), reader.tensor(bn), proj, qk_w, qk_b)
-        w.add_if4(f"{dst}.attn.qk_padded.weight", qk_w)
-        w.add_bf16(f"{dst}.attn.qk_padded.bias", qk_b)
+        qn, qbn = f"{src}.attn.q.weight", f"{src}.attn.q.bias"
+        kn, kbn = f"{src}.attn.k.weight", f"{src}.attn.k.bias"
+        _expect(reader, qn, (h, h)); _expect(reader, qbn, (h,))
+        _expect(reader, kn, (h, h)); _expect(reader, kbn, (h,))
+        qk_w = torch.cat([reader.tensor(qn), reader.tensor(kn)], dim=0)
+        qk_b = torch.cat([reader.tensor(qbn), reader.tensor(kbn)], dim=0)
+        w.add_if4(f"{dst}.attn.qk.weight", qk_w)
+        w.add_bf16(f"{dst}.attn.qk.bias", qk_b)
 
         vn, vbn = f"{src}.attn.v.weight", f"{src}.attn.v.bias"
         _expect(reader, vn, (h, h)); _expect(reader, vbn, (h,))
-        raw_v = reader.tensor(vn).reshape(heads, hd, h)
-        raw_vb = reader.tensor(vbn).reshape(heads, hd)
-        vp = torch.zeros(heads, 128, h, dtype=torch.bfloat16)
-        vbp = torch.zeros(heads, 128, dtype=torch.bfloat16)
-        vp[:, :hd] = raw_v; vbp[:, :hd] = raw_vb
-        w.add_if4(f"{dst}.attn.v_padded.weight", vp.reshape(-1, h))
-        w.add_bf16(f"{dst}.attn.v_padded.bias", vbp.flatten())
+        w.add_if4(f"{dst}.attn.v.weight", reader.tensor(vn))
+        w.add_bf16(f"{dst}.attn.v.bias", reader.tensor(vbn))
 
         on, obn = f"{src}.attn.proj.weight", f"{src}.attn.proj.bias"
         _expect(reader, on, (h, h)); _expect(reader, obn, (h,))
@@ -927,7 +934,7 @@ def _validate_decode_o_region(region: dict, cfg: dict) -> list[str]:
 
 
 def _validate_embedding_region(region: dict, cfg: dict) -> list[str]:
-    """Validate the schema-6 IF8 embedding descriptor in the LM region."""
+    """Validate the host BF16 embedding in the LM region."""
     errors: list[str] = []
     if not isinstance(region, dict):
         return ["LM region metadata is invalid"]
@@ -936,43 +943,33 @@ def _validate_embedding_region(region: dict, cfg: dict) -> list[str]:
     vocab = int(fi["embedding_vocab"])
     hidden = int(fi["hidden_size"])
     precision = cfg.get("precision", {}).get("embedding")
-    if precision != "if8":
-        return [f"schema-{SCHEMA_VERSION} embedding precision must be 'if8'"]
-    if hidden % BLOCK:
-        return [f"embedding hidden width {hidden} is not divisible by {BLOCK}"]
+    if precision != "bf16":
+        return [f"schema-{SCHEMA_VERSION} embedding precision must be 'bf16'"]
 
     manifest = region.get("manifest")
     if not isinstance(manifest, dict):
         return ["LM tensor manifest is invalid"]
     base_key = "language_model.embed_tokens.weight"
-    expected_key = f"{base_key}.{precision}"
+    expected_key = base_key
     embedding_keys = {
         key for key in manifest
         if key == base_key or key.startswith(f"{base_key}.")
     }
     if embedding_keys != {expected_key}:
-        errors.append("LM embedding tensor set differs from schema-6 IF8 layout")
+        errors.append("LM embedding tensor set differs from host BF16 layout")
         return errors
 
     section = manifest[expected_key]
     if not isinstance(section, dict):
         return ["LM embedding tensor metadata is invalid"]
 
-    scale_values = hidden // BLOCK
-    compact_scale_bytes = scale_values * SCALE_BYTES
-    scale_row_bytes = ((compact_scale_bytes + 63) // 64) * 64
-    data_row_bytes = hidden
-    section_size = vocab * (scale_row_bytes + data_row_bytes)
+    section_size = vocab * hidden * 2
     expected_fields = {
         "size": section_size,
         "shape": [vocab, hidden],
-        "layout": "padded_row_scales_then_data",
-        "precision": "if8",
-        "block_size": BLOCK,
-        "scale_values_per_row": scale_values,
-        "scale_row_bytes": scale_row_bytes,
-        "data_row_bytes": data_row_bytes,
     }
+    if set(section) != {"offset", *expected_fields}:
+        errors.append("LM embedding has unexpected metadata fields")
     for field, expected in expected_fields.items():
         if section.get(field) != expected:
             errors.append(
