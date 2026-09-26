@@ -36,7 +36,6 @@ if os.path.dirname(os.path.dirname(_SD)) not in sys.path:
 import numpy as np
 import torch
 
-import quant_lib
 import user_dma_core
 from user_dma_core import (
     DMA_DEVICE_H2C, INSTRUCTION_SIZE_BYTES, TYPE, UE_MODE, UE_VECTOR_SIZE,
@@ -57,31 +56,35 @@ class Qwen25OmniLMMixin:
 
     _base_* methods are the inherited-decoder baseline (weight init, tensor
     alloc, decode-round emission, decoder compile/run); the public methods
-    of the same un-prefixed name are Omni's own overrides -- most notably
-    the mandatory FPGA-wide sharded-head argmax (compile_decoder,
-    _dec_round, _emit_fpga_global_argmax). Omni uses the shared host-BF16
-    embedding gather; the optional device embedding helpers are unused.
+    of the same un-prefixed name are Omni's own overrides. The LM head's
+    global argmax uses the shared sharded-head pattern (see _decode_token):
+    each engine's local argmax register gives an index into its own column
+    shard, and the host reads back just those eight bf16 candidate values
+    (already in DRAM from the head matmul's own writeback) to find the true
+    winner -- no on-device scan of the full vocabulary. Omni uses the shared
+    host-BF16 embedding gather; the optional device embedding helpers are
+    unused.
     """
 
     # Decode attention is sharded two ways, both of which need values that only
     # exist at run time (the KV length grows every step). See _emit_layer.
     DEC_ATTN_REGS = ("row_off", "out_off", "rows", "stride", "aligned")
 
-    MLP_PRIVATE_TAGS = frozenset({"gate", "up", "down"})
-    # The existing params.bin already carries IF4 O for prefill. Decode now
-    # shards that image too; the legacy BF16 decode_o region remains in the
-    # artifact for compatibility but is not uploaded.
+    # Every projection whose column shards are staged ONCE, at weight-load
+    # time, directly into each engine's private window -- reused by both
+    # prefill (tensor-parallel) and decode as-is, no second runtime copy.
+    LM_PRIVATE_TAGS = frozenset({"q", "k", "v", "o", "gate", "up", "down"})
     DECODE_O_IF4 = True
 
     def _lm_quantized_projections(self) -> set[str]:
         """Projection tags stored with the configured block-quantized codec.
 
         Qwen2.5-VL-3B keeps V/O in BF16 for accuracy. Larger compatible
-        decoders can opt either projection into IF4 independently; notably,
-        Qwen2.5-Omni-7B uses IF4 O in both phases. V remains BF16 in prefill
-        and gets a separate IF4 image for decode.
-        Keeping the choices phase-aware here makes the emitter reusable without
-        changing the released 3B bin format.
+        decoders can opt either projection into IF4 independently; Omni
+        uses IF4 O and V in both phases (one private column shard, shared
+        by prefill and decode -- see LM_PRIVATE_TAGS). Keeping the choices
+        configurable here makes the emitter reusable without changing the
+        released 3B bin format.
         """
         default = ("q", "k", "gate", "up", "down")
         values = self._cfg.get("precision", {}).get(
@@ -100,31 +103,6 @@ class Qwen25OmniLMMixin:
     def _base__decode_projection_is_quantized(self, tag: str) -> bool:
         """Decode storage policy, overridable independently from prefill."""
         return self._lm_projection_is_quantized(tag)
-
-    def _dma_decode_v_if4(self, f, section: dict, base_offset: int,
-                          N: int, K: int, what: str) -> tuple[int, int]:
-        """Quantize BF16 V for decode without changing prefill or params.bin."""
-        expected = N * K * 2
-        if int(section["size"]) != expected or K % UE_VECTOR_SIZE:
-            raise ValueError(f"{what}: expected BF16 [{N}, {K}] ({expected} bytes)")
-        f.seek(base_offset + int(section["offset"]))
-        blob = f.read(expected)
-        if len(blob) != expected:
-            raise RuntimeError(f"truncated read for {what}")
-        weight = torch.frombuffer(bytearray(blob), dtype=torch.bfloat16).reshape(N, K)
-        data, scales = quant_lib.quantize(
-            LM_QUANT_PRECISION, weight, block_size=UE_VECTOR_SIZE)
-        blocks = N * K // UE_VECTOR_SIZE
-        if len(data) != blocks * IF4_DATA_BYTES or len(scales) != blocks * IF4_SCALE_BYTES:
-            raise AssertionError(f"{what}: unexpected IF4 payload size")
-        scale_addr = self.allocate_params_dram(len(scales), label=f"{what}.decode.scale")
-        data_addr = self.allocate_params_dram(len(data), label=f"{what}.decode.data")
-        for addr, payload, label in ((scale_addr, scales, "scale"),
-                                     (data_addr, data, "data")):
-            written = self.dma_write(DMA_DEVICE_H2C, addr, payload, len(payload))
-            if written != len(payload):
-                raise IOError(f"{what}.decode.{label}: short params DMA")
-        return scale_addr, data_addr
 
     def _prefill_down_lane(self, la: dict, lane: int, lanes: int) -> tuple:
         """(data, scale) DRAM addresses for one K-lane of down_proj.
@@ -291,28 +269,20 @@ class Qwen25OmniLMMixin:
                     ("down", "mlp.down_proj"),
                 )
                 for tag, key in projections:
-                    if self._lm_projection_is_private(tag):
-                        # Staged per-engine instead of into the shared image;
-                        # the subclass owns the slicing and records its own
-                        # addresses in `la`.
-                        self._stage_private_lm_projection(
-                            f, need(f"{pre}.{key}.weight.{sfx}"), base, la,
-                            tag, i, f"{pre}.{key}")
-                    elif tag in quantized:
-                        la[f"{tag}_scale"], la[f"{tag}_data"] = self._dma_if4(
-                            f, need(f"{pre}.{key}.weight.{sfx}"), base,
-                            f"{pre}.{key}")
-                    else:
-                        la[f"{tag}_weight"] = self._dma_bf16(
-                            f, need(f"{pre}.{key}.weight"), base,
-                            f"{pre}.{key}")
-                        if tag == "v" and self._decode_projection_is_quantized("v"):
-                            # Prefill keeps the BF16 image above; decode uses
-                            # its own IF4 copy and the quantized GEMV kernel.
-                            la["v_scale"], la["v_data"] = self._dma_decode_v_if4(
-                                f, need(f"{pre}.{key}.weight"), base,
-                                d["KVH"] * d["AHD"], d["H"],
-                                f"{pre}.{key}")
+                    # Every projection is private now (staged per-engine
+                    # directly into each engine's own window; the subclass
+                    # owns the slicing and records its own addresses in
+                    # `la`) -- one copy shared by prefill and decode, no
+                    # second runtime copy or on-the-fly quantization. IF4
+                    # tags carry the ``.{sfx}`` artifact suffix; V (never
+                    # quantized) keeps the plain dense ``.weight`` section.
+                    assert self._lm_projection_is_private(tag), (
+                        f"LM_PRIVATE_TAGS no longer covers {tag!r}")
+                    weight_key = (f"{pre}.{key}.weight.{sfx}"
+                                 if self._lm_projection_is_quantized(tag)
+                                 else f"{pre}.{key}.weight")
+                    self._stage_private_lm_projection(
+                        f, need(weight_key), base, la, tag, i, f"{pre}.{key}")
                 for tag, key in (("q", "self_attn.q_proj"), ("k", "self_attn.k_proj"),
                                  ("v", "self_attn.v_proj")):
                     la[f"{tag}_bias"] = self._dma_bf16(
@@ -800,23 +770,28 @@ class Qwen25OmniLMMixin:
             raise
 
     def _ensure_decode_shards_impl(self, sched, layer_size: int) -> dict:
-        """Copy each engine's COLUMN block of the decode weights into its own
-        private arena. Returns ``{(op, layer): ShardedWeight}``.
+        """Look up each projection's private column shards. Returns
+        ``{(op, layer): ShardedWeight}``.
 
-        WHY COLUMNS, AND WHY A COPY. Decode is M=1, so there are no rows to
-        split -- the only parallel axis is the output width N. And decode is
-        bandwidth-bound: a whole weight block is streamed per token, so if every
-        engine read its block out of the ONE shared weight image their streams
-        would contend and the speedup would cap however evenly N divides.
-        Engine i therefore reads from ITS OWN window.
+        WHY COLUMNS. Decode is M=1, so there are no rows to split -- the
+        only parallel axis is the output width N. And decode is
+        bandwidth-bound: a whole weight block is streamed per token, so if
+        every engine read its block out of the ONE shared weight image
+        their streams would contend and the speedup would cap however
+        evenly N divides. Engine i therefore reads from ITS OWN window.
 
-        Omni's Q has 3584 output columns (448 per engine), while K and V each
-        have 512 (64 per engine). Decode V uses a separate IF4 copy; prefill
-        still reads its shared BF16 image. Decode O reuses prefill's IF4
-        image, copied into eight private column shards. Gate/up use eight
-        output-column shards; down reuses prefill's private K-shards and reduces
-        their full-width partial outputs. Producer/consumer dependencies require separate
-        projection rounds within each layer.
+        Q, K, V, O, gate and up are now ALL staged this way ONCE, at
+        weight-load time (`_stage_private_lm_projection`), into
+        `_mlp_private_shards` -- the `_decode_shard_override` lookup below
+        finds them there and this loop's own shard-building code never
+        runs for them; it survives only as a fallback for any op that
+        isn't pre-staged. Prefill (tensor-parallel) and decode reuse the
+        exact same private shards, no second copy, at whatever precision
+        `lm_quantized_projections` configures per tag; down instead reuses
+        prefill's private K-shards and reduces their full-width partial
+        outputs.
+        Producer/consumer dependencies require separate projection rounds
+        within each layer.
         """
         cached = getattr(self, "_decode_shards", None)
         if cached is not None:
@@ -1303,43 +1278,60 @@ class Qwen25OmniLMMixin:
                        else self._lm_projection_is_quantized("v")),
                 bias=la["v_bias"])
         else:
-            # Row-shard the three projections over tokens: each engine reads its
-            # own rows of LM_PRE_NORM and writes the matching rows of Q/K/V.
-            # Weights and biases are shared read-only -- the bias is per-COLUMN
-            # (broadcast_N), so it is not sliced.
+            # norm1 is still row-sharded (row-independent, cheap) and JOINS
+            # so LM_PRE_NORM is fully populated before any engine reads it.
+            # Q/K/V are then COLUMN-sharded, tensor-parallel like gate/up/down:
+            # engine e computes ALL M rows of its private N/8 column shard
+            # (loaded once at weight-init time, shared with decode -- see
+            # _stage_private_lm_projection), writing directly into the SAME
+            # shared LM_Q/LM_K/LM_V buffers downstream RoPE/permute/attention
+            # already expect -- gpr_out_row_stride_reg makes each engine's
+            # [M, cols] block land at column offset e*cols with the FULL row
+            # stride (n_out), not cols, so the buffer stays true row-major
+            # even though 8 engines wrote disjoint column ranges of it.
             acc = [0]
 
-            def _qkv(ctx, la=la, acc=acc, in_addr=in_addr):
+            def _norm1(ctx, la=la, acc=acc, in_addr=in_addr):
                 m = gate_m_regs[ctx.engine_idx]
-                # norm1 folded in: it is row-independent and feeds the three
-                # projections directly, so it rides the region already here
-                # rather than paying its own entry/exit rendezvous.
                 ctx.ue.generate_instruction_add_set(m, ctx.rows)
                 acc[0] += ctx.ue.rms_norm_core_dram(
                     M=ctx.rows, N=H,
                     A_DRAM_ADDR=ctx.rows_addr(in_addr, H * bpe),
                     OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_PRE_NORM, H * bpe),
                     GAMMA_DRAM_ADDR=la["ln1"], gpr_M_reg=m) or 0
-                for tag, n_out, out, row in (
-                        ("q", QH * AHD, self.LM_Q, QH * AHD * bpe),
-                        ("k", KVH * AHD, self.LM_K, KVH * AHD * bpe),
-                        ("v", KVH * AHD, self.LM_V, KVH * AHD * bpe)):
-                    quant = self._lm_projection_is_quantized(tag)
-                    ctx.ue.generate_instruction_add_set(m, ctx.rows)
-                    kw = dict(M=ctx.rows, K=H, N=n_out,
-                              A_DRAM_ADDR=ctx.rows_addr(self.LM_PRE_NORM, H * bpe),
-                              OUTPUT_DRAM_ADDR=ctx.rows_addr(out, row),
-                              C_DRAM_ADDR=la[f"{tag}_bias"],
-                              bias_mode="broadcast_N", gpr_M_reg=m)
-                    if quant:
-                        kw.update(B_DRAM_ADDR=la[f"{tag}_data"], is_B_quantized=True,
-                                  data_type=TYPE.IF4,
-                                  SCALE_DRAM_ADDR=la[f"{tag}_scale"])
-                    else:
-                        kw.update(B_DRAM_ADDR=la[f"{tag}_weight"])
-                    acc[0] += ctx.ue.matmat_mul_core(**kw) or 0
 
-            sched.sharded_region(M, _qkv)
+            sched.sharded_region(M, _norm1, join=True)
+
+            for tag, n_out, out in (
+                    ("q", QH * AHD, self.LM_Q),
+                    ("k", KVH * AHD, self.LM_K),
+                    ("v", KVH * AHD, self.LM_V)):
+                quant = self._lm_projection_is_quantized(tag)
+
+                def _tp(ctx, la=la, acc=acc, tag=tag, n_out=n_out,
+                       out=out, quant=quant):
+                    e = ctx.engine_idx
+                    m = gate_m_regs[e]
+                    ctx.ue.generate_instruction_add_set(m, M)
+                    stride_reg = ctx.ue.alloc_isa_reg()
+                    ctx.ue.generate_instruction_add_set(stride_reg, n_out)
+                    data, scale = la[f"{tag}_tp"][e]
+                    kw = dict(M=M, K=H, N=ctx.cols,
+                              A_DRAM_ADDR=self.LM_PRE_NORM,
+                              OUTPUT_DRAM_ADDR=out + ctx.col_offset * bpe,
+                              C_DRAM_ADDR=la[f"{tag}_bias"] + ctx.col_offset * bpe,
+                              bias_mode="broadcast_N",
+                              gpr_M_reg=m, gpr_out_row_stride_reg=stride_reg)
+                    if quant:
+                        kw.update(B_DRAM_ADDR=data, is_B_quantized=True,
+                                  data_type=TYPE.IF4, SCALE_DRAM_ADDR=scale)
+                    else:
+                        kw.update(B_DRAM_ADDR=data)
+                    acc[0] += ctx.ue.matmat_mul_core(**kw) or 0
+                    ctx.ue.release_isa_reg()   # stride_reg
+
+                sched.col_sharded_region(n_out, _tp, join=True)
+
             flops += acc[0]
             # ENGINE 0's row register IS gf_seq_len, and the region left it
             # holding that engine's shard row count. Everything after here --
@@ -1792,29 +1784,36 @@ class Qwen25OmniLMMixin:
                 quant=(self._decode_projection_is_quantized("o") if decode
                        else self._lm_projection_is_quantized("o")))
         else:
-            # Same row shard as qkv: each engine takes its own tokens of the
-            # attention result and writes the matching rows of the projection.
-            # The storage policy is per-model; the 3B build keeps o_proj BF16,
-            # while memory-constrained larger decoders opt it into IF4.
+            # Column-sharded, tensor-parallel, same mechanism as Q/K/V above:
+            # engine e computes all M rows of its private H/8 column shard
+            # against the full LM_ATTN_RESULT (already complete -- written by
+            # the single-engine permute just above, and the region's own
+            # entry barrier ensures every engine waits for that write before
+            # reading it), landing its block at column offset e*cols with the
+            # full H row stride so LM_ATTN_PROJ stays true row-major.
             o_acc = [0]
+            quant = self._lm_projection_is_quantized("o")
 
-            def _o(ctx, la=la, o_acc=o_acc):
-                m = gate_m_regs[ctx.engine_idx]
-                ctx.ue.generate_instruction_add_set(m, ctx.rows)
-                kw = dict(
-                    M=ctx.rows, K=QH * AHD, N=H,
-                    A_DRAM_ADDR=ctx.rows_addr(self.LM_ATTN_RESULT, QH * AHD * bpe),
-                    OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LM_ATTN_PROJ, H * bpe),
-                    gpr_M_reg=m)
-                if self._lm_projection_is_quantized("o"):
-                    kw.update(B_DRAM_ADDR=la["o_data"], is_B_quantized=True,
-                              data_type=TYPE.IF4,
-                              SCALE_DRAM_ADDR=la["o_scale"])
+            def _o_tp(ctx, la=la, o_acc=o_acc, quant=quant):
+                e = ctx.engine_idx
+                m = gate_m_regs[e]
+                ctx.ue.generate_instruction_add_set(m, M)
+                stride_reg = ctx.ue.alloc_isa_reg()
+                ctx.ue.generate_instruction_add_set(stride_reg, H)
+                data, scale = la["o_tp"][e]
+                kw = dict(M=M, K=QH * AHD, N=ctx.cols,
+                          A_DRAM_ADDR=self.LM_ATTN_RESULT,
+                          OUTPUT_DRAM_ADDR=self.LM_ATTN_PROJ + ctx.col_offset * bpe,
+                          gpr_M_reg=m, gpr_out_row_stride_reg=stride_reg)
+                if quant:
+                    kw.update(B_DRAM_ADDR=data, is_B_quantized=True,
+                              data_type=TYPE.IF4, SCALE_DRAM_ADDR=scale)
                 else:
-                    kw.update(B_DRAM_ADDR=la["o_weight"])
+                    kw.update(B_DRAM_ADDR=data)
                 o_acc[0] += ctx.ue.matmat_mul_core(**kw) or 0
+                ctx.ue.release_isa_reg()   # stride_reg
 
-            sched.sharded_region(M, _o)
+            sched.col_sharded_region(H, _o_tp, join=True)
             flops += o_acc[0]
             self.generate_instruction_add_set(m_reg, M)   # restore gf_seq_len
         ckpt(f"L{li}:o_proj", flops)
@@ -3073,13 +3072,13 @@ class Qwen25OmniLMMixin:
 
     def compile_decoder(self, layer_size: int = None,
                         profile: bool = False) -> int:
-        """Compile decode with a mandatory FPGA-wide sharded-head argmax.
+        """Compile decode, then ensure the host-BF16 embedding table.
 
-        The shared Qwen runtime normally compares the eight shard winners on
-        the host because each engine's MMIO argmax register exposes an index,
-        not its corresponding value.  Omni is stricter: ``_dec_round`` appends
-        an engine-0 reduction over the already contiguous logits in board DRAM,
-        so the host reads only the final global hardware index.
+        The LM head's global argmax needs no dedicated compile-time
+        emission: the head matmul already writes its shard back to DRAM
+        (required for _decode_token's host-side reduction, see there), and
+        each engine's own MMIO argmax register gives that shard's local
+        winner as a free side effect of the matmul itself.
         """
         master_cursor = self.get_program_dram_addr()
         scheduler_before = getattr(self, "_multi_core_schedulers", {}).get(
@@ -3090,15 +3089,10 @@ class Qwen25OmniLMMixin:
             if scheduler_before is not None
             else None
         )
-        self._fpga_global_argmax_emitted = False
         try:
             base = self._base_compile_decoder(
                 layer_size=layer_size, profile=profile
             )
-            if not self._fpga_global_argmax_emitted:
-                raise RuntimeError(
-                    "Omni decoder compiled without its FPGA global-argmax tail"
-                )
             # Host BF16 lookup needs no private embedding shards or FPGA ISA.
             if self._device_embedding_enabled():
                 self._ensure_fpga_embedding()
@@ -3122,87 +3116,32 @@ class Qwen25OmniLMMixin:
             raise
 
     def _dec_round(self, dec_sched, ops, master_emit, worker_extra=None) -> int:
-        """Append the device-wide reduction immediately after the head join."""
-        flops = self._base__dec_round(
+        return self._base__dec_round(
             dec_sched, ops, master_emit, worker_extra=worker_extra)
-        if (
-            len(ops) == 1
-            and getattr(ops[0][0], "name", None) == "lm_head"
-        ):
-            if self._fpga_global_argmax_emitted:
-                raise RuntimeError("FPGA global argmax emitted more than once")
-            flops += self._emit_fpga_global_argmax()
-            self._fpga_global_argmax_emitted = True
-        return flops
-
-    def _emit_fpga_global_argmax(self) -> int:
-        """Reduce all eight LM-head shards without host logit inspection.
-
-        The sharded head writes one contiguous BF16 vocabulary row to shared
-        board DRAM.  Engine 0 then streams that row in 64-value tiles through
-        the existing 64x64 identity matrix.  ``max_clear_en`` is asserted only
-        for the first tile, so the hardware max/index tracker spans the entire
-        vocabulary and its final argmax register contains the global token ID.
-
-        This extra identity pass is deliberately simple: it adds no parameter
-        storage, transfers no logits over PCIe, and relies on the same
-        cross-strip max accumulation already used by wide quantized matmuls.
-        """
-        d = self._lm_dims()
-        vocab = int(d["VOCAB"])
-        tile = int(UE_VECTOR_SIZE)
-        if vocab <= 0 or vocab % tile:
-            raise ValueError(
-                f"FPGA global argmax requires a positive {tile}-aligned "
-                f"vocabulary, got {vocab}")
-
-        shard = getattr(self, "_decode_lm_shard", None)
-        if shard is None or len(shard.shards) != 8:
-            raise RuntimeError(
-                "FPGA global argmax requires the LM head on all eight engines")
-        cursor = 0
-        for engine_idx, part in enumerate(shard.shards):
-            if part.col_offset != cursor or part.cols <= 0:
-                raise RuntimeError(
-                    f"LM-head shard {engine_idx} does not form a contiguous "
-                    f"vocabulary row at column {cursor}")
-            cursor += part.cols
-        if cursor != vocab:
-            raise RuntimeError(
-                f"LM-head shards cover {cursor} columns, expected {vocab}")
-
-        vector_sram = 0x00000
-        identity_sram = 0x80000
-        self.accelerator_memory_to_sram(
-            accelerator_dram_address=self.LM_IDENTITY,
-            sram_address=identity_sram,
-            element_size=tile * tile,
-        )
-        for column in range(0, vocab, tile):
-            self.accelerator_memory_to_sram(
-                accelerator_dram_address=(
-                    self.LOGITS + column * self.bytes_per_element
-                ),
-                sram_address=vector_sram,
-                element_size=tile,
-            )
-            self.start_queue_for_bf16_matvec_operation(
-                max_clear_en=int(column == 0),
-                fmax_context_addr=0,
-                vector_sram_start_addr=vector_sram,
-                matrix_sram_start_addr=identity_sram,
-                output_sram_wb_addr=vector_sram,
-                K=tile,
-                N=tile,
-            )
-        return 2 * vocab * tile
 
     def _decode_token(self) -> int:
-        """Return only the FPGA's global token index; never read logits."""
-        if not getattr(self, "_fpga_global_argmax_emitted", False):
+        """Reduce the eight LM-head shard winners on the host.
+
+        The head matmul writes one contiguous BF16 vocabulary row to shared
+        board DRAM (required for MultiEngineScheduler.global_argmax's point
+        reads) and, as a free side effect of that same matmul, each engine's
+        MMIO register captures the LOCAL argmax index into its own column
+        shard. global_argmax reads back just those eight bf16 candidates
+        (16 bytes total, not the 297 KiB logits row) and returns whichever
+        has the largest value -- the true global winner, since each shard's
+        local max is by construction >= every other value in that shard.
+        This replaced an on-device 64-wide identity-matrix scan of the full
+        vocabulary that dominated the LM head's latency without changing the
+        result (~5ms of ~2376 tile dispatches for what eight tiny reads and
+        a host compare now do).
+        """
+        shard = getattr(self, "_decode_lm_shard", None)
+        sched = self._multi_core_schedulers.get("decode") if shard is not None else None
+        if shard is None or sched is None:
             raise RuntimeError(
-                "refusing host token selection: FPGA global argmax is absent")
-        token = int(self.get_arg_max_index())
+                "Omni's LM head is always column-sharded across all eight "
+                "engines; decode was reached without that shard/scheduler")
+        token = int(sched.global_argmax(shard, self.LOGITS))
         self._fpga_decode_token_ids.append(token)
         return token
 
@@ -3330,7 +3269,10 @@ class Qwen25OmniLMMixin:
 
     def _decode_projection_is_quantized(self, tag: str) -> bool:
         if tag == "v":
-            return True  # Decode-only IF4 copy; prefill V stays BF16.
+            # One private shard serves both phases now, at whatever
+            # precision lm_quantized_projections configures -- no separate
+            # decode-only policy for V.
+            return self._lm_projection_is_quantized("v")
         if tag in self._decode_bf16_projections():
             return False
         return self._base__decode_projection_is_quantized(tag)
@@ -3820,7 +3762,7 @@ class Qwen25OmniLMMixin:
         )
 
     def _lm_projection_is_private(self, tag: str) -> bool:
-        return tag in self.MLP_PRIVATE_TAGS
+        return tag in self.LM_PRIVATE_TAGS
 
     def _audit_private_reserve(self) -> None:
         """Check the declared private reserve against what was actually used.
@@ -3861,7 +3803,9 @@ class Qwen25OmniLMMixin:
         return True
 
     def _decode_shard_override(self, op: str, layer: int):
-        """Decode reuses gate/up N-shards staged at weight-load time.
+        """Decode reuses the N-shards q/k/v/o/gate/up staged at weight-load
+        time (see _stage_private_lm_projection) -- same physical shards
+        prefill's tensor-parallel path already computes against.
 
         Down instead reuses the prefill K-shards and reduces partial outputs.
         """
@@ -3894,6 +3838,28 @@ class Qwen25OmniLMMixin:
             raise IOError(f"{what}.data: short private DMA")
         return d_addr, s_addr
 
+    # (N, K) for every private tag's N-shard, EXCEPT "down" which shards K
+    # instead (see below). Q/K/V/O join gate/up here: same column-shard
+    # mechanism, just attention-sized dims instead of MLP-sized ones.
+    def _lm_private_projection_dims(self, tag: str) -> tuple[int, int]:
+        d = self._lm_dims()
+        H, AHD, KVH, QH, MLP = d["H"], d["AHD"], d["KVH"], d["QH"], d["MLP"]
+        return {
+            "q": (QH * AHD, H), "k": (KVH * AHD, H), "v": (KVH * AHD, H),
+            "o": (H, QH * AHD), "gate": (MLP, H), "up": (MLP, H),
+        }[tag]
+
+    def _stage_bf16_n_shard(self, engine_idx: int, rows, what: str) -> int:
+        """DMA one engine's [cols, K] BF16 row-block into its private window.
+
+        Same role as ``_stage_shard_pair`` for IF4, but dense: no scale blob.
+        """
+        blob = np.ascontiguousarray(rows).tobytes()
+        addr = self.mc_arena.alloc_weights(engine_idx, len(blob), what)
+        if self.dma_write(DMA_DEVICE_H2C, addr, blob, len(blob)) != len(blob):
+            raise IOError(f"{what}: short private DMA")
+        return addr
+
     def _stage_private_lm_projection(self, file_obj, section: dict,
                                      base_offset: int, la: dict, tag: str,
                                      layer: int, what: str) -> None:
@@ -3901,41 +3867,66 @@ class Qwen25OmniLMMixin:
 
         ne = int(self.multi_core)
         d = self._lm_dims()
-        N, K = ((d["MLP"], d["H"]) if tag in ("gate", "up") else (d["H"], d["MLP"]))
-        file_obj.seek(base_offset + int(section["offset"]))
-        blob = file_obj.read(int(section["size"]))
-        if len(blob) != int(section["size"]):
-            raise RuntimeError(f"truncated artifact read for {what}")
-        scales, data = self._if4_split(blob, N, K)
 
         if not hasattr(self, "_mlp_private_shards"):
             self._mlp_private_shards = {}
 
-        if tag in ("gate", "up"):
-            # The same private N-shard serves prefill and decode.
+        if tag != "down":
+            # ---- N-shard: q/k/v/o/gate/up all take this path -----------
+            N, K = self._lm_private_projection_dims(tag)
+            file_obj.seek(base_offset + int(section["offset"]))
+            blob = file_obj.read(int(section["size"]))
+            if len(blob) != int(section["size"]):
+                raise RuntimeError(f"truncated artifact read for {what}")
+            quantized = self._lm_projection_is_quantized(tag)
             if N % ne or (N // ne) % mes.COL_ALIGN:
                 raise ValueError(f"{what}: N={N} does not give {ne} 64-aligned blocks")
             rows = N // ne
             shards = []
             n_addrs = []
-            for e in range(ne):
-                sl = slice(e * rows, (e + 1) * rows)
-                d_addr, s_addr = self._stage_shard_pair(
-                    e, scales[sl], data[sl], f"{tag}_L{layer}.n{e}")
-                n_addrs.append((d_addr, s_addr))
-                shards.append(mes.WeightShard(
-                    engine_idx=e, col_offset=e * rows, cols=rows,
-                    weight_addr=d_addr, scale_addr=s_addr,
-                    layer_stride=0, scale_layer_stride=0))
+            if quantized:
+                scales, data = self._if4_split(blob, N, K)
+                for e in range(ne):
+                    sl = slice(e * rows, (e + 1) * rows)
+                    d_addr, s_addr = self._stage_shard_pair(
+                        e, scales[sl], data[sl], f"{tag}_L{layer}.n{e}")
+                    n_addrs.append((d_addr, s_addr))
+                    shards.append(mes.WeightShard(
+                        engine_idx=e, col_offset=e * rows, cols=rows,
+                        weight_addr=d_addr, scale_addr=s_addr,
+                        layer_stride=0, scale_layer_stride=0))
+                data_type = TYPE.IF4
+            else:
+                expected = N * K * 2
+                if len(blob) != expected:
+                    raise ValueError(
+                        f"{what}: BF16 blob is {len(blob)} bytes, expected "
+                        f"{expected} for [{N}, {K}]")
+                plane = np.frombuffer(blob, dtype="<u2").reshape(N, K)
+                for e in range(ne):
+                    sl = slice(e * rows, (e + 1) * rows)
+                    d_addr = self._stage_bf16_n_shard(
+                        e, plane[sl], f"{tag}_L{layer}.n{e}")
+                    n_addrs.append((d_addr, None))
+                    shards.append(mes.WeightShard(
+                        engine_idx=e, col_offset=e * rows, cols=rows,
+                        weight_addr=d_addr, scale_addr=None,
+                        layer_stride=0, scale_layer_stride=0))
+                data_type = mes.DENSE_BF16
             self._mlp_private_shards[(tag, layer)] = mes.ShardedWeight(
                 name=f"{tag}_proj_L{layer}", K=K, N=N, layers=1,
-                data_type=TYPE.IF4, shards=shards)
+                data_type=data_type, shards=shards)
             la[f"{tag}_n_shards"] = n_addrs
             # Prefill's lane IS the N-shard; nothing further to stage.
             la[f"{tag}_tp"] = n_addrs
             return
 
         # ---- down's K-shard serves both prefill and decode -----------------
+        file_obj.seek(base_offset + int(section["offset"]))
+        blob = file_obj.read(int(section["size"]))
+        if len(blob) != int(section["size"]):
+            raise RuntimeError(f"truncated artifact read for {what}")
+        scales, data = self._if4_split(blob, d["H"], d["MLP"])
         lane = d["MLP"] // ne
         if lane % 64:
             raise ValueError(f"{what}: K lane {lane} is not a whole scale block")

@@ -40,6 +40,9 @@ SCALE_BYTES = 2
 DATA_BYTES = 32
 WIRE_BYTES = SCALE_BYTES + DATA_BYTES
 SCHEMA_VERSION = 10  # BF16 host embedding; vision attn.qk/attn.v remain compact
+# Q/K/V/O private column-shard loading (qwen2.5_omni_7b_lm.py) and V staying
+# BF16 in both phases are loader-only changes: params.bin's on-disk sections
+# and bytes are unchanged from schema 10, so no version bump/regenerate here.
 GENERATION_TAG_BYTES = 32
 
 # Keep the host-only tokenizer/media preprocessing assets beside params.bin so

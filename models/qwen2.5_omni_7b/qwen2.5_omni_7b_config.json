@@ -68,7 +68,7 @@
       "o"
     ],
     "lm_quantized_projections": [
-      "q", "k", "o", "gate", "up", "down"
+      "q", "k", "v", "o", "gate", "up", "down"
     ]
   },
   "tokens": {

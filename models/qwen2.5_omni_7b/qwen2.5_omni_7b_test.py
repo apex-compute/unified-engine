@@ -826,10 +826,10 @@ class Qwen25OmniUnifiedEngine(
         if self._cfg["file_info"]["hidden_size"] != 3584:
             raise ValueError("this runtime is compiled only for the 3584-wide 7B Thinker")
         if set(self._cfg["precision"]["lm_quantized_projections"]) != {
-            "q", "k", "o", "gate", "up", "down"
+            "q", "k", "v", "o", "gate", "up", "down"
         }:
             raise ValueError(
-                "prefill requires BF16 V and IF4 Q/K/O/GATE/UP/DOWN"
+                "prefill requires IF4 Q/K/V/O/GATE/UP/DOWN"
             )
         if set(self._cfg["precision"].get("decode_bf16_projections", ())) != {"o"}:
             raise ValueError(
@@ -1234,7 +1234,7 @@ class Qwen25OmniUnifiedEngine(
                 ),
                 "attention_worker_registers": worker_regs,
                 "checkpoints": list(getattr(self, "_decoder_checkpoints", ())),
-                "fpga_global_argmax": bool(self._fpga_global_argmax_emitted),
+                "lm_head_argmax_mode": "sharded_host_reduce",
                 "embedding_precision": self._cfg["precision"]["embedding"],
                 "decode_bf16_projections": sorted(self._decode_bf16_projections()),
                 "decode_attention": {
@@ -1885,7 +1885,7 @@ class Qwen25OmniUnifiedEngine(
             lines.append(
                 f"- **LM weight DRAM:** "
                 f"{(self._lm_weight_end - self.PARAMS_BASE) / 2**20:.1f} MiB "
-                f"(IF4 projections, BF16 prefill V; BF16 embedding on host)"
+                f"(IF4 projections incl. V; BF16 embedding on host)"
             )
         lines += self._program_section_lines()
         lines.append("")
@@ -2680,15 +2680,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "checkpoints and is reported at stage level only.",
     )
     parser.add_argument(
-        "--profile-ctx",
-        type=int,
-        default=MAX_CONTEXT_SIZE,
-        help=f"context length for the SECOND profiled decode step (default "
-             f"{MAX_CONTEXT_SIZE}, the full context). The first is taken right "
-             f"after prefill, so the pair brackets decode cost from the "
-             f"shortest to the longest KV history. --profile only.",
-    )
-    parser.add_argument(
         "--summary",
         default=None,
         metavar="PATH",
@@ -2727,8 +2718,6 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
-    if args.profile_ctx < 2 or args.profile_ctx > MAX_CONTEXT_SIZE:
-        parser.error(f"--profile-ctx must be between 2 and {MAX_CONTEXT_SIZE}")
     if args.no_summary and args.summary:
         parser.error("--summary and --no-summary are mutually exclusive")
     with _exclusive_run_lock():
@@ -2846,29 +2835,16 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     if args.profile:
         # The checkpointed decoder is the one published in programs.bin, so it
         # is also the one that must run: run_decode_step_profiled refuses any
-        # other image.  Two steps bracket decode cost -- one at the prompt's
-        # own context, one at --profile-ctx -- because a step's price is set by
-        # the KV length, while the projections stay the same size.
+        # other image. Only the 1st-token step is profiled -- it is taken
+        # right after prefill, at the prompt's own context.
         prof_program = ue._decoder_program
         prof_checkpoints = list(ue._decoder_checkpoints)
         prof_workers = list(getattr(ue, "_decoder_workers", []))
         print(f"\n--- Profiled decode: 1st token (ctx {ue.seq_len}) ---")
-        first_results, next_token, aligned_first = ue.run_decode_step_profiled(
+        first_results, _next_token, aligned_first = ue.run_decode_step_profiled(
             seed, prof_program, prof_checkpoints, workers=prof_workers
         )
         ctx_first = ue.seq_len
-        if args.profile_ctx - 1 > ue.seq_len:
-            # --profile measures TIME, not numerics.  Forcing the position is
-            # how the long-context step is reached at all: the model hits EOS
-            # long before the context fills, and a checkpointed program costs
-            # one host round trip per phase per token.  KV rows past the prompt
-            # are zeros, which does not change latency.
-            ue.seq_len = args.profile_ctx - 1
-            print(f"  forcing ctx {args.profile_ctx} (timing only)")
-        print(f"\n--- Profiled decode: at context (ctx {ue.seq_len}) ---")
-        ctx_results, _token, aligned_ctx = ue.run_decode_step_profiled(
-            next_token, prof_program, prof_checkpoints, workers=prof_workers
-        )
         # A 4th element, model_phases, is the stage's TRUE (unpadded) work
         # broken out by the same checkpoint names the profile results use --
         # computed here, where the right context/dims are in scope, rather
@@ -2891,10 +2867,6 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
              f"Context {ctx_first} tokens (aligned {aligned_first}).",
              first_results,
              _model_flops.decode_step_flops_by_phase(ue._cfg, ctx_first)),
-            ("Decode - at context",
-             f"Context {ue.seq_len} tokens (aligned {aligned_ctx}).",
-             ctx_results,
-             _model_flops.decode_step_flops_by_phase(ue._cfg, ue.seq_len)),
         ]
         for title, note, results, _model_phases in profiles:
             if results:
