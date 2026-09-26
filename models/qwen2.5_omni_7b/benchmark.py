@@ -614,7 +614,7 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
     pm = prefill_tokens
     q_ms = measure("q_proj", pm, H, query_dim, NE, True)
     k_ms = measure("k_proj", pm, H, kv_dim, NE, True)
-    v_ms = measure("v_proj", pm, H, kv_dim, NE, False)
+    v_ms = measure("v_proj", pm, H, kv_dim, NE, True)
     o_ms = measure("o_proj (prefill, IF4)", pm, query_dim, H, NE, True)
     gate_ms = measure("gate_proj", pm, H, MLP, NE, True)
     up_ms = measure("up_proj", pm, H, MLP, NE, True)
