@@ -39,6 +39,7 @@ import argparse
 import json
 import math
 import os
+import struct
 import subprocess
 import sys
 
@@ -357,8 +358,19 @@ def _measure_matmul(dev: str, M: int, K: int, N: int, ne: int, quantized: bool,
 def _measure_lm_head_and_argmax(dev: str, hidden: int, vocab: int,
                                 ne: int) -> tuple[float, int]:
     """Time the real decode head sequence: eight IF4 column shards write one
-    shared logits row, then core 0 scans it for the global argmax. Weights and
-    inputs are synthetic; the measured FPGA instructions and shape are real.
+    shared logits row (matmul writeback ENABLED, as the real model's shard
+    always is). Weights and inputs are synthetic; the measured FPGA
+    instructions and shape are real.
+
+    Global argmax no longer costs any FPGA time: each engine's MMIO argmax
+    register captures its own shard's local winner as a free side effect of
+    the matmul above, and the host reduces the eight candidates by reading
+    just those two-byte values back from the shared logits row (mirrors
+    MultiEngineScheduler.global_argmax / qwen2.5_omni_7b_lm._decode_token).
+    That reduction happens after wait_queue, off the HW counter entirely --
+    it used to be an on-device 64-wide identity-matrix scan of the full
+    vocabulary (~2376 tile dispatches) that dominated this op's latency; the
+    returned time is now just the matmul's.
     """
     import torch
     import user_dma_core as udc
@@ -371,13 +383,10 @@ def _measure_lm_head_and_argmax(dev: str, hidden: int, vocab: int,
     input_addr = master.allocate_tensor_dram(hidden * 2)
     logits_addr = master.allocate_tensor_dram(vocab * 2)
     bias_addr = master.allocate_tensor_dram(vocab * 2)
-    identity_addr = master.allocate_tensor_dram(udc.UE_VECTOR_SIZE**2 * 2)
     master.dma_to_accelerator_memory(
         input_addr, torch.zeros(hidden, dtype=torch.bfloat16))
     master.dma_to_accelerator_memory(
         bias_addr, torch.zeros(vocab, dtype=torch.bfloat16))
-    master.dma_to_accelerator_memory(
-        identity_addr, torch.eye(udc.UE_VECTOR_SIZE, dtype=torch.bfloat16))
 
     prog_addrs = []
     for i, ue in enumerate(ues):
@@ -404,21 +413,6 @@ def _measure_lm_head_and_argmax(dev: str, hidden: int, vocab: int,
             C_DRAM_ADDR=bias_addr + i * shard_n * 2,
             bias_mode="broadcast_N")
         _emit_completion_barrier(ue, i == 0, ne)
-        if i == 0:
-            tile = udc.UE_VECTOR_SIZE
-            vector_sram, identity_sram = 0x00000, 0x80000
-            ue.accelerator_memory_to_sram(
-                accelerator_dram_address=identity_addr,
-                sram_address=identity_sram, element_size=tile * tile)
-            for column in range(0, vocab, tile):
-                ue.accelerator_memory_to_sram(
-                    accelerator_dram_address=logits_addr + column * 2,
-                    sram_address=vector_sram, element_size=tile)
-                ue.start_queue_for_bf16_matvec_operation(
-                    max_clear_en=int(column == 0), fmax_context_addr=0,
-                    vector_sram_start_addr=vector_sram,
-                    matrix_sram_start_addr=identity_sram,
-                    output_sram_wb_addr=vector_sram, K=tile, N=tile)
         ue.generate_instruction_halt()
         ue.stop_capture()
         prog_addr = ue.get_program_dram_addr()
@@ -433,7 +427,30 @@ def _measure_lm_head_and_argmax(dev: str, hidden: int, vocab: int,
     master_us = master.report_latency_in_us()
     for ue in ues[1:]:
         ue.wait_queue(60.0)
-    return master_us, 2 * hidden * vocab + 2 * vocab * udc.UE_VECTOR_SIZE
+
+    # Host-side reduction, off the HW counter: each engine's local argmax
+    # index into its own shard, then one 2-byte DRAM read per engine to
+    # compare values. Exercises the real path; result is unused (synthetic
+    # zero data ties every candidate), matching every other op's zero-fill.
+    best_val = None
+    for i, ue in enumerate(ues):
+        local_idx = ue.get_arg_max_index()
+        if not 0 <= local_idx < shard_n:
+            raise RuntimeError(
+                f"engine {i} argmax index {local_idx} outside its "
+                f"{shard_n}-column shard")
+        buf = bytearray(64)
+        addr = logits_addr + (i * shard_n + local_idx) * 2
+        base = addr & ~0x3F
+        off = addr - base
+        got = master.dma_read(udc.DMA_DEVICE_C2H, base, buf, 64)
+        if got != 64:
+            raise IOError(f"bf16 argmax-candidate read at 0x{base:X} returned {got} of 64 bytes")
+        bits = int.from_bytes(buf[off:off + 2], "little") << 16
+        val = struct.unpack("<f", bits.to_bytes(4, "little"))[0]
+        if best_val is None or val > best_val:
+            best_val = val
+    return master_us, 2 * hidden * vocab
 
 
 def _measure_attention(dev: str, batch: int, aligned_seq_len: int, head_dim: int,
@@ -676,10 +693,10 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
     head_us, head_flops = _measure_lm_head_and_argmax(
         args.dev, H, d["VOCAB"], NE)
     head_ms = head_us / 1e3
-    op_rows["decode"].append(("LM head + global argmax",
-                               f"1 x {H} x {d['VOCAB']} + argmax",
-                               NE, "IF4 + BF16", head_ms, head_flops))
-    print(f"  {'LM head + global argmax':28s} K={H:<6d} vocab={d['VOCAB']:<6d} "
+    op_rows["decode"].append(("LM head (argmax reduce is host-side, no HW cost)",
+                               f"1 x {H} x {d['VOCAB']}",
+                               NE, "IF4", head_ms, head_flops))
+    print(f"  {'LM head':28s} K={H:<6d} vocab={d['VOCAB']:<6d} "
           f"ne={NE:<2d}  {head_ms:8.3f} ms  "
           f"{head_flops / (head_us * 1e3) if head_us else 0.0:7.1f} GFLOPS")
 
@@ -820,7 +837,9 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
         "**Coverage of the derived totals:** the listed projection and "
         "unified-attention group latencies, including their in-group "
         f"barriers, are summed and multiplied by {NL} layers. Decode then "
-        "adds one eight-engine LM head plus FPGA global argmax per token. Other "
+        "adds one eight-engine LM head per token; its global argmax is a "
+        "host-side reduction of the eight shards' local-argmax candidates, "
+        "off the HW counter, so it adds no measured FPGA time. Other "
         "operations are **omitted**, not measured or silently assigned "
         "zero cost: normalization, RoPE, residual/elementwise work other than "
         "decode down's seven measured reduction additions, "
