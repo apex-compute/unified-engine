@@ -135,7 +135,36 @@ REQUIRED_DRAM_GIB = 8
 # CONTEXT AND PREFILL ARE ONE BUDGET. Prefill and decode read the same KV
 # cache, so MAX_CONTEXT_SIZE bounds both: a prompt (vision soft tokens + text)
 # may fill it, and generation continues inside it.
-MAX_CONTEXT_SIZE = 2500
+#
+# 4096 IS THE CEILING FOR THIS MAP, AND THE BINDING CONSTRAINT MOVES ON THE
+# WAY THERE. Prefill rows track the context (PREFILL_MAX_SEQ_LEN below), so
+# every P-shaped buffer grows with it, and three different limits bite in
+# turn. Per engine the 1 GiB window is ISA 64 + private tensor slice T +
+# private shard reserve 645, leaving (315 - T) MiB of shared-pool gap:
+#
+#   1. private tensor slice   holds prefill's per-engine head-sharded attention
+#                             scratch, n_pref = P^2 + 2*AHD*P elements. This is
+#                             what used to stop us at 2752 (15.79 of 16.00 MiB;
+#                             2816 overflowed by exactly 0x80000). It is a
+#                             CONSTANT, so it is also the easy one -- raised to
+#                             OMNI_PRIVATE_TENSOR_BYTES = 40 MiB, which covers
+#                             4096's 34.00 MiB with margin.
+#   2. largest single shared  every shared buffer must be contiguous inside ONE
+#      buffer <= gap          window's gap. The biggest is lm.mlp_down_tp_scratch
+#                             (8 engines x P x H x 2 B). At 4096 that is 224 MiB
+#                             against a 281 MiB gap; at 5120 it is 280 against
+#                             262 and NOTHING about the slice fixes it -- raising
+#                             T shrinks the very gap it has to fit in.
+#   3. total shared <= pool   8 x gap. At 4096, 925 MiB of LM tensors against
+#                             2248 MiB; this one only binds past 6144.
+#
+# So 4096 is where lever 1 runs out and lever 2 takes over. 8192 is not
+# reachable by resizing anything: it wants 132 MiB of slice (gap 183), a
+# 448 MiB single buffer, and 1977 MiB of pool against 1464 available -- over
+# budget on total, not just on contiguity. It needs CHUNKED PREFILL, which
+# decouples P from C (see PREFILL_MAX_SEQ_LEN); with P held at 2048 the
+# P-shaped buffers stop tracking the context and 8192 fits with room to spare.
+MAX_CONTEXT_SIZE = 4096
 # Prefill and decode execute whole 64-row attention tiles. Inputs remain bounded
 # by the logical context, while tensors and the KV cache carry the padded tile.
 PREFILL_INPUT_TOKEN_LIMIT = MAX_CONTEXT_SIZE
@@ -339,10 +368,20 @@ OMNI_WINDOW_BYTES = 0x4000_0000            # 1 GiB per core, 8 GiB total
 OMNI_ISA_BYTES = 64 * 2**20                # per-core ISA slice, inside the window
 # Per-core scratch, inside the window. The head-sharded prefill attention keeps
 # ONE private scratch per engine, (AHD + aligned_P) * aligned_P + aligned_P *
-# AHD elements -- 13.75 MiB at the 2560-row prefill allocation. Vision's much
+# AHD elements -- 34.00 MiB at the 4096-row prefill allocation. Vision's much
 # larger 4096-patch worker scratch is pinned in the shared pool instead, so it
 # does not compete with this fixed slice the way the ISA program used to.
-OMNI_PRIVATE_TENSOR_BYTES = 16 * 2**20
+#
+# SIZE IT FROM MAX_CONTEXT_SIZE, AND SPEND NO MORE THAN THAT. Every MiB here
+# costs one MiB of shared-pool gap in EVERY window, and the gap has its own
+# floor (see MAX_CONTEXT_SIZE, constraint 2), so this is not free headroom --
+# it is taken straight from the buffer that has to fit beside it. 40 MiB is
+# 4096's 34.00 MiB requirement plus margin, leaving a 275 MiB gap.
+# _base_lm_tensor_init checks the requirement against this number up front and
+# names the value to set, so a context bump fails with an instruction rather
+# than a bare overflow. Keep hardware.private_tensor_bytes in the config JSON
+# in step -- _validate_config_and_map asserts they match.
+OMNI_PRIVATE_TENSOR_BYTES = 40 * 2**20
 
 # What the private shards need per core, declared BEFORE any shared byte is
 # lent. Measured on the 8-engine map:

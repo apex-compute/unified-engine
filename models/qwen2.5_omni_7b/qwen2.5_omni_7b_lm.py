@@ -670,6 +670,24 @@ class Qwen25OmniLMMixin:
                 # matrix when the live decode batch is only one GQA group.
                 n_group_decode = AHD * aligned_C + G * aligned_C + G * AHD
                 n_pref = max(n_pref, n_group_decode)
+            # Checked here, not left to alloc_tensor's overflow: this scratch
+            # is the whole content of the private slice and it grows as P^2, so
+            # it is the first thing a context bump breaks. alloc_tensor would
+            # report the overflow but not the number to set, which is how the
+            # ceiling previously had to be found by bisection.
+            slice_bytes = self.mc_arena.tensor_bytes
+            if n_pref * bpe > slice_bytes:
+                need = -(-(n_pref * bpe) // 2**20)
+                raise MemoryError(
+                    f"lm prefill attn scratch needs {n_pref * bpe / 2**20:.2f} MiB "
+                    f"per engine at MAX_CONTEXT_SIZE={self.MAX_CONTEXT_SIZE} "
+                    f"(prefill {aligned_P} rows), but the private tensor slice is "
+                    f"{slice_bytes / 2**20:.2f} MiB. Raise "
+                    f"OMNI_PRIVATE_TENSOR_BYTES to at least {need} MiB and set "
+                    f"hardware.private_tensor_bytes to 0x{need * 2**20:X} in the "
+                    f"config -- but check MAX_CONTEXT_SIZE's note first: past "
+                    f"4096 the shared-pool gap binds before this slice does, and "
+                    f"growing the slice makes that gap smaller, not larger.")
             self.LM_ATTN_SCRATCH_PER_ENGINE.extend(
                 self.mc_arena.alloc_tensor(e, n_pref * bpe, "lm prefill attn scratch")
                 for e in range(1, self.multi_core))
@@ -2125,6 +2143,25 @@ class Qwen25OmniLMMixin:
         self._wait_lm_queue(self, timeout_s, "profile tail")
         return results
 
+    def _prefill_timeout_s(self) -> float:
+        """How long to let a prefill run before calling it hung.
+
+        MUST SCALE WITH THE PREFILL LENGTH. This was a flat 180 s, which was
+        ample while the context was 2048-2752 (115 s of prefill at the measured
+        rate) and silently became a live bug the moment the context grew:
+        prefill runs at 18-25 input tokens/s (benchmark.md), so 4096 rows need
+        164-228 s and 8192 need 328-455 s. A 3799-token prefill duly tripped the
+        180 s wait after completing normally on the board -- reported as
+        "prefill master is still busy", which reads exactly like a hang and is
+        not one.
+
+        PREFILL_MAX_SEQ_LEN, not the live row count: the bound has to cover the
+        longest prompt this build accepts. 15 tok/s is the measured floor with
+        margin, and the 180 s floor keeps short prefills on the old bound.
+        """
+        rows = int(getattr(self, "PREFILL_MAX_SEQ_LEN", 0) or 0)
+        return max(180.0, rows / 15.0)
+
     @staticmethod
     def _wait_lm_queue(engine, timeout_s: float, what: str,
                        poll_interval_s: float | None = None) -> None:
@@ -2661,11 +2698,13 @@ class Qwen25OmniLMMixin:
                 raise RuntimeError("profiled prefill needs compile_prefill(profile=True)")
             if sched is not None:
                 sched.start_workers(worker_addrs)
-            self._prefill_profile = self._run_checkpointed(addr, cps, 180.0)
+            self._prefill_profile = self._run_checkpointed(
+                addr, cps, self._prefill_timeout_s())
             for idx, w in enumerate(
                 sched.workers if sched is not None else [], start=1
             ):
-                self._wait_lm_queue(w, 180.0, f"prefill worker {idx}")
+                self._wait_lm_queue(w, self._prefill_timeout_s(),
+                                    f"prefill worker {idx}")
             us = sum(r[1] for r in self._prefill_profile) * 1e3
         else:
             # Workers first: each parks on its first rendezvous until the master
@@ -2677,11 +2716,13 @@ class Qwen25OmniLMMixin:
                 sched.start_workers(worker_addrs)
             if sched is None or not sched.host_segmented:
                 self.start_execute_from_dram(addr)
-                self._wait_lm_queue(self, 180.0, "prefill master")
+                self._wait_lm_queue(self, self._prefill_timeout_s(),
+                                    "prefill master")
                 for idx, w in enumerate(
                     sched.workers if sched is not None else [], start=1
                 ):
-                    self._wait_lm_queue(w, 180.0, f"prefill worker {idx}")
+                    self._wait_lm_queue(w, self._prefill_timeout_s(),
+                                    f"prefill worker {idx}")
                 us = self.report_latency_in_us()
         # Expose the prompt length only after every engine has completed the
         # cache population. Failed uploads or launches leave host state at the
