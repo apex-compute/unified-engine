@@ -2168,22 +2168,23 @@ class Qwen25OmniLMMixin:
         if not math.isfinite(float(timeout_s)) or timeout_s <= 0:
             raise ValueError(f"timeout_s must be finite and positive, got {timeout_s!r}")
         if poll_interval_s is None:
-            engine.wait_queue(float(timeout_s))
-        else:
-            if (
-                not math.isfinite(float(poll_interval_s))
-                or poll_interval_s <= 0
-            ):
-                raise ValueError(
-                    "poll_interval_s must be finite and positive, got "
-                    f"{poll_interval_s!r}"
-                )
-            engine.wait_queue(
-                timeout_seconds=float(timeout_s),
-                poll_interval_seconds=float(poll_interval_s),
+            poll_interval_s = 0.001
+        if not math.isfinite(float(poll_interval_s)) or poll_interval_s <= 0:
+            raise ValueError(
+                "poll_interval_s must be finite and positive, got "
+                f"{poll_interval_s!r}"
             )
-        if engine.is_queue_busy():
-            raise TimeoutError(f"{what} is still busy after {timeout_s:.1f}s")
+        start = time.monotonic()
+        next_report = 5.0
+        while engine.is_queue_busy():
+            elapsed = time.monotonic() - start
+            if elapsed >= timeout_s:
+                raise TimeoutError(f"{what} is still busy after {timeout_s:.1f}s")
+            if elapsed >= next_report:
+                print(f"  [FPGA wait] {what}: {elapsed:.1f}s CPU elapsed / "
+                      f"{timeout_s:.1f}s timeout (core busy)", flush=True)
+                next_report += 5.0
+            time.sleep(min(poll_interval_s, timeout_s - elapsed))
 
     def _run_lm_compile_transaction(self, stage: str, compiler):
         """Run a capture compiler without leaking partial state on failure."""
