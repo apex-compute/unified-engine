@@ -1114,7 +1114,7 @@ def private_weight_bytes(num_engines: int, arena_bytes: Optional[int] = None,
 
 @dataclass(frozen=True)
 class PrivateRegion:
-    """One engine's private window: weights, then its ISA slice, then tensor scratch."""
+    """One engine's private window with explicit weight, ISA and tensor bounds."""
 
     engine_idx: int
     base: int
@@ -1193,7 +1193,8 @@ class PrivateArena:
                  tensor_bytes: int = PRIVATE_TENSOR_BYTES,
                  external_isa: Optional[tuple] = None,
                  verbose: bool = False,
-                 windows: Optional[list[tuple[int, int]]] = None):
+                 windows: Optional[list[tuple[int, int]]] = None,
+                 isa_guard_bytes: int = 0):
         """``external_isa=(base, stride)`` moves the per-engine ISA slices OUT of
         the private windows and into a region the model owns elsewhere.
 
@@ -1209,7 +1210,17 @@ class PrivateArena:
         1 at 9 GiB and core 9 at 1 GiB (board_private_windows) -- and base plus
         stride cannot express that. The windows must all be the same size, since
         every shard budget here is per core; they are checked for overlap.
+
+        With explicit windows, ``isa_guard_bytes`` selects the protected-tail
+        layout [weights/shared | tensor | unused guard | ISA]. The zero default
+        retains the original [weights/shared | ISA | tensor] layout. The guard
+        is excluded from all allocators; it is not hardware access protection.
         """
+        if isa_guard_bytes < 0 or isa_guard_bytes % PRIVATE_ALIGN:
+            raise ValueError("isa_guard_bytes must be a nonnegative multiple of 16 MiB")
+        if isa_guard_bytes and (windows is None or external_isa is not None):
+            raise ValueError("an ISA guard requires explicit windows and internal ISA")
+        self.isa_guard_bytes = isa_guard_bytes
         if windows is not None:
             if len(windows) != num_engines:
                 raise ValueError(
@@ -1249,18 +1260,25 @@ class PrivateArena:
         self.tensor_bytes = tensor_bytes
         if windows is not None:
             self.stride = windows[0][1]
-            floor = self._carve_isa_bytes + tensor_bytes + PRIVATE_ALIGN
+            floor = (self._carve_isa_bytes + isa_guard_bytes
+                     + tensor_bytes + PRIVATE_ALIGN)
             if self.stride < floor:
                 raise ValueError(
                     f"a 0x{self.stride:X} window is below the 0x{floor:X} needed "
                     f"for ISA + tensor + at least one weight block")
             self.regions = []
             for i, (base, nbytes) in enumerate(windows):
-                tensor_base = base + nbytes - tensor_bytes
-                isa_base = tensor_base - self._carve_isa_bytes
+                if isa_guard_bytes:
+                    isa_base = base + nbytes - self._carve_isa_bytes
+                    tensor_base = isa_base - isa_guard_bytes - tensor_bytes
+                    weight_limit = tensor_base
+                else:
+                    tensor_base = base + nbytes - tensor_bytes
+                    isa_base = tensor_base - self._carve_isa_bytes
+                    weight_limit = isa_base
                 self.regions.append(PrivateRegion(
                     engine_idx=i, base=base, weight_base=base,
-                    weight_limit=isa_base, isa_base=isa_base,
+                    weight_limit=weight_limit, isa_base=isa_base,
                     tensor_base=tensor_base))
         else:
             self.stride = private_stride(num_engines, arena_bytes,
@@ -1325,7 +1343,8 @@ class PrivateArena:
         return self.regions[engine_idx].isa_base + self.isa_bytes
 
     def weight_bytes(self) -> int:
-        return self.stride - self._carve_isa_bytes - self.tensor_bytes
+        return (self.stride - self._carve_isa_bytes - self.tensor_bytes
+                - self.isa_guard_bytes)
 
     def weight_allocations(self) -> list[dict]:
         """Every private carve, in order -- the audit trail for the map."""
@@ -1343,6 +1362,10 @@ class PrivateArena:
             lines = [f"  Private map: {self.num_engines} explicit board window(s), "
                      f"{self.stride / 2**20:.0f} MB/core:"]
             lines += ["    " + r.describe() for r in self.regions]
+            if self.isa_guard_bytes:
+                lines.append(
+                    f"    {self.isa_guard_bytes / 2**20:.0f} MB unused guard "
+                    "between each tensor slice and ISA slice")
             return "\n".join(lines)
         if self.external_isa is None:
             return describe_private_map(self.num_engines, self.arena_base,
@@ -1366,11 +1389,21 @@ class PrivateArena:
         addr = (self._weight_cursor[engine_idx] + 63) & ~63
         end = addr + size_bytes
         limit = self._shared_cursor[engine_idx]
+        if self.isa_guard_bytes and self._private_reserve[engine_idx]:
+            # In the protected-tail map the reserved private section is a
+            # hard boundary, not merely a floor for the shared allocators.
+            limit = min(limit, self.regions[engine_idx].weight_base
+                        + self._private_reserve[engine_idx])
         if end > limit:
-            window_limit = self.regions[engine_idx].weight_limit
-            borrowed = window_limit - limit
-            detail = (f", {borrowed / 2**20:.1f} MB of it lent to the shared pool"
-                      if borrowed else "")
+            if (self.isa_guard_bytes and self._private_reserve[engine_idx]
+                    and limit == self.regions[engine_idx].weight_base
+                    + self._private_reserve[engine_idx]):
+                detail = ", hard private section boundary"
+            else:
+                window_limit = self.regions[engine_idx].weight_limit
+                borrowed = window_limit - limit
+                detail = (f", {borrowed / 2**20:.1f} MB of it lent to the shared pool"
+                          if borrowed else "")
             raise MemoryError(
                 f"{what}: engine {engine_idx} private weight arena overflow -- needs "
                 f"0x{end:X}, usable arena ends at 0x{limit:X} "
@@ -1614,16 +1647,18 @@ class PrivateArena:
     def check_isa_fits(self, engine_idx: int, addr: int, size_bytes: int) -> None:
         """Refuse a program image that would leave its engine's ISA slice.
 
-        The ISA slice sits directly below the tensor slice, which sits directly
-        below the NEXT engine's window. An overrun would not fault -- it would
-        silently scribble instructions over a neighbour's scratch or weights, so
-        it has to be caught where the image is written.
+        The optional guard separates tensor scratch from an ISA slice at the
+        end of a window. An out-of-bounds hardware write still would not fault,
+        so every host-side ISA upload must be checked before DMA.
         """
         region = self.regions[engine_idx]
         limit = self.isa_limit(engine_idx)
         if addr < region.isa_base or addr + size_bytes > limit:
             if self.external_isa is not None:
                 spill = "next engine's ISA slice or the model map"
+            elif self.isa_guard_bytes:
+                spill = ("ISA guard or private tensor slice" if addr < region.isa_base
+                         else "next engine window")
             else:
                 spill = ("tensor slice"
                          if addr + size_bytes <= region.tensor_base + self.tensor_bytes
@@ -1643,11 +1678,16 @@ class PrivateArena:
         for i, region in enumerate(self.regions):
             used = self._weight_cursor[i] - region.weight_base
             cap = region.weight_capacity
+            if (self.isa_guard_bytes and self._private_reserve[i]
+                    and used > self._private_reserve[i]):
+                raise MemoryError(
+                    f"engine {i} private weights use {used / 2**20:.1f} MB, "
+                    f"past their {self._private_reserve[i] / 2**20:.0f} MB section")
             if self._weight_cursor[i] > self._shared_cursor[i]:
                 shared = region.weight_limit - self._shared_cursor[i]
                 spill = (f"the shared pool at 0x{self._shared_cursor[i]:X} "
                          f"({shared / 2**20:.1f} MB)" if shared else
-                         f"its ISA slice at 0x{region.isa_base:X}")
+                         f"its fixed tensor/ISA tail above 0x{region.weight_limit:X}")
                 raise MemoryError(
                     f"engine {i} weight arena overflow: {used / 2**20:.1f} MB used of "
                     f"{cap / 2**20:.1f} MB, spilling into {spill}")
@@ -2510,9 +2550,9 @@ class MultiEngineScheduler:
             guard = self._save_dram_selftest_region() if num_engines > 1 else None
             for i in range(1, num_engines):
                 if self.regions is not None:
-                    # private_low: weights at the window base, then the ISA slice,
-                    # then tensor scratch -- all below DRAM_START_ADDR, so none of
-                    # it can alias the model's own map however the model allocates.
+                    # Use the arena's explicit addresses. The guarded-window
+                    # layout puts tensor scratch before ISA; the legacy layout
+                    # puts ISA first, so no ordering may be inferred here.
                     r = self.regions[i]
                     p_base, t_base, g_base = r.weight_base, r.tensor_base, r.isa_base
                 else:

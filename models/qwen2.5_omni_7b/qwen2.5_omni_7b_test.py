@@ -136,34 +136,13 @@ REQUIRED_DRAM_GIB = 8
 # cache, so MAX_CONTEXT_SIZE bounds both: a prompt (vision soft tokens + text)
 # may fill it, and generation continues inside it.
 #
-# 4096 IS THE CEILING FOR THIS MAP, AND THE BINDING CONSTRAINT MOVES ON THE
-# WAY THERE. Prefill rows track the context (PREFILL_MAX_SEQ_LEN below), so
-# every P-shaped buffer grows with it, and three different limits bite in
-# turn. Per engine the 1 GiB window is ISA 64 + private tensor slice T +
-# private shard reserve 645, leaving (315 - T) MiB of shared-pool gap:
-#
-#   1. private tensor slice   holds prefill's per-engine head-sharded attention
-#                             scratch, n_pref = P^2 + 2*AHD*P elements. This is
-#                             what used to stop us at 2752 (15.79 of 16.00 MiB;
-#                             2816 overflowed by exactly 0x80000). It is a
-#                             CONSTANT, so it is also the easy one -- raised to
-#                             OMNI_PRIVATE_TENSOR_BYTES = 40 MiB, which covers
-#                             4096's 34.00 MiB with margin.
-#   2. largest single shared  every shared buffer must be contiguous inside ONE
-#      buffer <= gap          window's gap. The biggest is lm.mlp_down_tp_scratch
-#                             (8 engines x P x H x 2 B). At 4096 that is 224 MiB
-#                             against a 281 MiB gap; at 5120 it is 280 against
-#                             262 and NOTHING about the slice fixes it -- raising
-#                             T shrinks the very gap it has to fit in.
-#   3. total shared <= pool   8 x gap. At 4096, 925 MiB of LM tensors against
-#                             2248 MiB; this one only binds past 6144.
-#
-# So 4096 is where lever 1 runs out and lever 2 takes over. 8192 is not
-# reachable by resizing anything: it wants 132 MiB of slice (gap 183), a
-# 448 MiB single buffer, and 1977 MiB of pool against 1464 available -- over
-# budget on total, not just on contiguity. It needs CHUNKED PREFILL, which
-# decouples P from C (see PREFILL_MAX_SEQ_LEN); with P held at 2048 the
-# P-shaped buffers stop tracking the context and 8192 fits with room to spare.
+# Allocate for 4096 prefill rows and 4096 KV positions. The per-worker
+# head-sharded attention scratch is 34 MiB at this length and fits the 64 MiB
+# private tensor slice. The largest single shared tensor is the 224 MiB
+# overlaid MLP/QKV/attention plane, within one 352 MiB shared band; all LM
+# shared tensors total about 925 MiB against 8 x 352 MiB of shared capacity.
+# This is an allocation bound, not evidence that a 4096-row hardware prefill
+# completes: the near-limit run timed out and must be investigated separately.
 MAX_CONTEXT_SIZE = 4096
 # Prefill and decode execute whole 64-row attention tiles. Inputs remain bounded
 # by the logical context, while tensors and the KV cache carry the padded tile.
@@ -356,48 +335,19 @@ def apply_vision_resolution(cfg: dict, name: str) -> dict:
 # differs (the U55C's becomes 2 GiB when its HBM is upgraded), so the map gets
 # re-tuned deliberately instead of silently running at the wrong size.
 OMNI_WINDOW_BYTES = 0x4000_0000            # 1 GiB per core, 8 GiB total
-# Sized for the LARGEST compiled program of any stage, not the LM's (4.28 MiB
-# tensor-parallel prefill + 1.02 MiB decoder): the vision encoder's per-window
-# instruction count scales with attention-window count, and at "medium"
-# resolution (4096 patches, 64 windows against "small"'s 576/9) it needs
-# ~48-50 MiB/engine, confirmed by a real overflow at the old 16 MiB slice
-# (multi_engine_shard.PrivateArena.check_isa_fits: engine 1's program reached
-# 0x80F42E40 against a 0x7F000000 limit). 64 MiB leaves that real number
-# genuine margin. This used to cost the weight arena directly -- see
-# OMNI_LM_HEAD_BYTES's removal below for where the room came from.
-OMNI_ISA_BYTES = 64 * 2**20                # per-core ISA slice, inside the window
-# Per-core scratch, inside the window. The head-sharded prefill attention keeps
-# ONE private scratch per engine, (AHD + aligned_P) * aligned_P + aligned_P *
-# AHD elements -- 34.00 MiB at the 4096-row prefill allocation. Vision's much
-# larger 4096-patch worker scratch is pinned in the shared pool instead, so it
-# does not compete with this fixed slice the way the ISA program used to.
-#
-# SIZE IT FROM MAX_CONTEXT_SIZE, AND SPEND NO MORE THAN THAT. Every MiB here
-# costs one MiB of shared-pool gap in EVERY window, and the gap has its own
-# floor (see MAX_CONTEXT_SIZE, constraint 2), so this is not free headroom --
-# it is taken straight from the buffer that has to fit beside it. 40 MiB is
-# 4096's 34.00 MiB requirement plus margin, leaving a 275 MiB gap.
-# _base_lm_tensor_init checks the requirement against this number up front and
-# names the value to set, so a context bump fails with an instruction rather
-# than a bare overflow. Keep hardware.private_tensor_bytes in the config JSON
-# in step -- _validate_config_and_map asserts they match.
-OMNI_PRIVATE_TENSOR_BYTES = 40 * 2**20
+# Medium-resolution vision has a 47.75 MiB master program, so ISA must retain
+# 64 MiB. Place it at the END of each window, with 32 MiB deliberately unused
+# immediately before it. This strip separates any overrun from the 64 MiB
+# private tensor slice; it does not make HBM writes fault or prove the ISA safe.
+OMNI_ISA_BYTES = 64 * 2**20
+OMNI_ISA_GUARD_BYTES = 32 * 2**20
+OMNI_PRIVATE_TENSOR_BYTES = 64 * 2**20
 
-# What the private shards need per core, declared BEFORE any shared byte is
-# lent. Measured on the 8-engine map:
-#   gate/up N-shards (both phases)  240.8   down K-shard (both phases) 120.4
-#   attn decode shard               38.3
-#   lm_head shard                    34.5   embedding stays on host
-#   decode IF4 O shard               22.8; removing the 67.3-MiB embedding
-#   shard reduces the observed 707.4-MiB peak to about 640.1 MiB/core.
-#   The 645-MiB reservation retains the same ~5-MiB headroom and does not
-#   depend on reclaiming the
-#   shared IF4 prefill image after prefill.
-# Asserted against actual usage after loading, so drift fails loudly instead of
-# silently eating the pool. NOTE: "lm_head shard" here is decode's own
-# column-sharded copy (_ensure_decode_shards_impl) -- the separate, now-
-# removed OMNI_LM_HEAD_BYTES extent below was a DIFFERENT, wasted allocation.
-OMNI_PRIVATE_RESERVE_BYTES = 645 * 2**20
+# The measured IF4 projection + LM-head footprint is 447.8 MiB/core. Reserve
+# the first 512 MiB for private shards before lending anything to the shared
+# pool. The remaining 352 MiB of the 864 MiB weight arena is shared capacity;
+# it grows only within [base+0x20000000, base+0x36000000).
+OMNI_PRIVATE_RESERVE_BYTES = 512 * 2**20
 
 # THERE USED TO BE A SECOND UNSCATTERABLE OBJECT HERE: a 280 MiB "dedicated
 # extent" (OMNI_LM_HEAD_BYTES) holding one contiguous, unsharded copy of the
@@ -537,10 +487,8 @@ class Qwen25OmniUnifiedEngine(
         # U55 8-GiB DRAM map -- EIGHT 1-GiB PRIVATE WINDOWS THAT TILE THE DEVICE
         #
         #   core i -> [i GiB, (i+1) GiB), and inside each window, low to high:
-        #     weights  984 MiB   private shards, bump-allocated UP from the base
-        #     (gap)               the shared pool, bump-allocated DOWN from 984
-        #     ISA       32 MiB
-        #     tensor     8 MiB   per-engine scratch
+        #     private weights 512 MiB; shared weights/tensors 352 MiB;
+        #     private tensor 64 MiB; untouched guard 32 MiB; ISA 64 MiB.
         #
         # WHY THE WHOLE DEVICE IS PRIVATE WINDOWS. At 1 GiB per core the windows
         # span all 8 GiB, so there is no region left ABOVE the arena to hold the
@@ -548,14 +496,10 @@ class Qwen25OmniUnifiedEngine(
         # the only space there is, so shared data is carved from there and the
         # arena arbitrates between the two cursors (PrivateArena.alloc_shared).
         #
-        # WHY THE PREFILL MLP IS TENSOR-PARALLEL. A shared copy of the decoder
-        # is 3655 MiB and does not fit beside the private shards: it packs into
-        # the gaps with only 8 x ~42 MiB left, and the 112-MiB KV cache then has
-        # nowhere contiguous to go. Sharding the MLP -- 2889 MiB, 79% of the
-        # decoder -- over the engines is what makes this map fit, and it is also
-        # FASTER at the real prefill tile: +14.2% measured at M=64, the size a
-        # <=64-token prompt runs. Only attention, the untied head and the norms
-        # stay shared, 765 MiB placed section by section across the gaps.
+        # All LM projection weights are private shards shared by prefill and
+        # decode; only the small BF16 biases/norms use the shared pool. LM
+        # tensors are also carved there, between the 512 MiB private reserve
+        # and the private tensor/guard/ISA tail of each window.
         #
         # Vision, audio and the shared LM weights still TIME-SHARE the pool, now
         # via shared_mark()/shared_release() instead of one contiguous window.
@@ -572,6 +516,7 @@ class Qwen25OmniUnifiedEngine(
             windows=[(base, OMNI_WINDOW_BYTES) for base in expected_bases],
             isa_bytes=OMNI_ISA_BYTES,
             tensor_bytes=OMNI_PRIVATE_TENSOR_BYTES,
+            isa_guard_bytes=OMNI_ISA_GUARD_BYTES,
             verbose=True,
         )
         if self.mc_arena.stride != OMNI_WINDOW_BYTES:
@@ -836,7 +781,9 @@ class Qwen25OmniUnifiedEngine(
             "private_arena_bytes": REQUIRED_ENGINES * OMNI_WINDOW_BYTES,
             "private_window_bytes": OMNI_WINDOW_BYTES,
             "private_isa_bytes": OMNI_ISA_BYTES,
+            "private_isa_guard_bytes": OMNI_ISA_GUARD_BYTES,
             "private_tensor_bytes": OMNI_PRIVATE_TENSOR_BYTES,
+            "private_weight_reserve_bytes": OMNI_PRIVATE_RESERVE_BYTES,
             # The DRAM this map CLAIMS, which is eight 1 GiB windows wherever
             # the board puts them -- not self.DRAM_END. On the 8 GiB image the
             # windows tile the device and the two are the same number; on the
@@ -856,12 +803,21 @@ class Qwen25OmniUnifiedEngine(
         if self.mc_arena.stride != int(hw["private_window_bytes"], 0):
             raise AssertionError("PrivateArena did not produce 1-GiB windows")
         expected_weight_bytes = (OMNI_WINDOW_BYTES - OMNI_ISA_BYTES
+                                 - OMNI_ISA_GUARD_BYTES
                                  - OMNI_PRIVATE_TENSOR_BYTES)
         if self.mc_arena.weight_bytes() != expected_weight_bytes:
             raise AssertionError(
                 f"each engine must have {expected_weight_bytes // 2**20} MiB for its "
                 f"private shards and the shared pool, got "
                 f"{self.mc_arena.weight_bytes() // 2**20} MiB")
+        for i in range(REQUIRED_ENGINES):
+            region = self.mc_arena.region(i)
+            base = region.base
+            if not (region.weight_limit == base + 0x3600_0000
+                    and region.tensor_base == base + 0x3600_0000
+                    and region.isa_base == base + 0x3C00_0000
+                    and self.mc_arena.isa_limit(i) == base + OMNI_WINDOW_BYTES):
+                raise AssertionError(f"core {i} is not in the guarded Omni map")
         if self._cfg["file_info"]["hidden_size"] != 3584:
             raise ValueError("this runtime is compiled only for the 3584-wide 7B Thinker")
         if set(self._cfg["precision"]["lm_quantized_projections"]) != {
@@ -2184,9 +2140,7 @@ class Qwen25OmniUnifiedEngine(
     def dram_layout_lines(self) -> list[str]:
         """The whole 8 GiB: windows, private shards, shared pool, tensors.
 
-        Replaces the old per-core ISA table. The ISA slice is 16 MiB of a 1 GiB
-        window and was never the interesting number; where the weights, the KV
-        cache and the scratch actually sit is.
+        Report both payload and the intentionally untouched ISA guard strip.
         """
         MiB = float(2**20)
         arena = self.mc_arena
@@ -2197,13 +2151,11 @@ class Qwen25OmniUnifiedEngine(
             f"{win / MiB:.0f} MiB private windows tiling [0x0, 0x{arena.arena_bytes:X}).",
             "",
             "Inside every window, low to high:",
-            f"  private weight arena   {arena.weight_bytes() / MiB:7.0f} MiB   "
-            f"shards grow UP; shared tensors grow UP above the reserve",
-            f"  (shared pool)                      shared weights grow DOWN "
-            f"from the top of the arena",
+            f"  private weight reserve {arena._private_reserve[0] / MiB:7.0f} MiB",
+            f"  shared weights/tensors {(arena.weight_bytes() - arena._private_reserve[0]) / MiB:7.0f} MiB",
+            f"  private tensor slice   {arena.tensor_bytes / MiB:7.0f} MiB",
+            f"  untouched ISA guard    {arena.isa_guard_bytes / MiB:7.0f} MiB",
             f"  ISA slice              {arena.isa_bytes / MiB:7.0f} MiB",
-            f"  tensor scratch         {arena.tensor_bytes / MiB:7.0f} MiB   "
-            f"per-engine private attention scratch",
             "",
             "| core | window base | private | shared wts | tensors | free |",
             "| ---: | :--- | ---: | ---: | ---: | ---: |",
@@ -2288,6 +2240,8 @@ class Qwen25OmniUnifiedEngine(
                 f"{(self.TENSOR_LIMIT - self.TENSOR_BASE) / 2**20:.0f} MiB",
                 f"  ISA     0x{self.ISA_BASE:09X}..0x{self.MASTER_ISA_LIMIT:09X} "
                 f"{(self.MASTER_ISA_LIMIT - self.ISA_BASE) / 2**20:.0f} MiB",
+                f"  ISA guard (per core): {self.mc_arena.isa_guard_bytes / 2**20:.0f} MiB "
+                "untouched immediately below ISA",
             ]
         )
 
