@@ -970,7 +970,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xe9cbe74b, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xe9cbe74b. Please update FPGA with commit update_e9cbe74b.bin using update_flash.py (public release v1.4)"
+        assert hw_version == 0x26f3eee6, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x26f3eee6. Please update FPGA with commit update_26f3eee6.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -9004,7 +9004,7 @@ class UnifiedEngine:
             return
         if inst_type == INSTRUCTION_FLAG:
             flag_mode = isa_mode
-            target_engine = src_reg_idx & 0xF
+            target_engine = _inst_desc_bits(w, 36, 42)
             flag_mode_names = {
                 FLAG_MODE_SET: "SET",
                 FLAG_MODE_CLEAR: "CLEAR",
@@ -9039,6 +9039,7 @@ class UnifiedEngine:
 
         Header [15:0]: [7:0] instruction index from :attr:`_inst_id`; [11:8] inst_type; [15:12] reserved.
         ISA [85:32]: [35:32] isa_mode; [41:36] src; [47:42] dst; [53:48] rst; [85:54] immediate.
+        SEMAPHORE overrides [42:36] with the 7-bit engine index from src_reg_idx.
 
         After append, :attr:`_inst_id` is incremented (same pattern as :meth:`ue_op_descriptor`).
         """
@@ -9064,6 +9065,9 @@ class UnifiedEngine:
                 ((dst_reg_idx & 0x3F) << 10) |
                 ((rst_reg_idx & 0x3F) << 16) |
                 ((immediate_value & 0x3FF) << 22))
+        if inst_type == INSTRUCTION_FLAG:
+            # Semaphore [42:36] is a 7-bit engine index, not a GPR index.
+            w[1] = (isa_mode & 0xF) | ((src_reg_idx & 0x7F) << 4)
         w[2] = (immediate_value >> 10) & 0x3FFFFF
 
         self.capture_buffer.append(inst)
@@ -9550,10 +9554,10 @@ class UnifiedEngine:
         Spin-wait until target engine's flag is 1 before proceeding.
 
         Args:
-            target_engine_idx: Engine index (0-15) whose flag to wait on
+            target_engine_idx: Engine index (0-127) whose flag to wait on
         """
-        if target_engine_idx < 0 or target_engine_idx > 15:
-            print(f"ERROR: target_engine_idx must be 0-15, got {target_engine_idx}")
+        if target_engine_idx < 0 or target_engine_idx > 127:
+            print(f"ERROR: target_engine_idx must be 0-127, got {target_engine_idx}")
             return
         self.ue_isa_descriptor(INSTRUCTION_FLAG, isa_mode=FLAG_MODE_CHECK_SET,
                                src_reg_idx=target_engine_idx)
@@ -9566,10 +9570,10 @@ class UnifiedEngine:
         Spin-wait until target engine's flag is 0 before proceeding.
 
         Args:
-            target_engine_idx: Engine index (0-15) whose flag to wait on
+            target_engine_idx: Engine index (0-127) whose flag to wait on
         """
-        if target_engine_idx < 0 or target_engine_idx > 15:
-            print(f"ERROR: target_engine_idx must be 0-15, got {target_engine_idx}")
+        if target_engine_idx < 0 or target_engine_idx > 127:
+            print(f"ERROR: target_engine_idx must be 0-127, got {target_engine_idx}")
             return
         self.ue_isa_descriptor(INSTRUCTION_FLAG, isa_mode=FLAG_MODE_CHECK_CLEAR,
                                src_reg_idx=target_engine_idx)
