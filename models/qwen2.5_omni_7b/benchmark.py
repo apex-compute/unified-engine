@@ -1,20 +1,26 @@
 """Fixed-shape benchmark tiers for qwen2.5_omni_7b: a voice command (Low), a
-single-camera query (Medium), and an op-by-op multi-camera estimate (High).
+single-camera query (Medium), and a multi-camera query (High).
 
-Low and Medium own the WORKLOAD SHAPES; qwen2.5_omni_7b_test.py stays generic
+All three tiers own the WORKLOAD SHAPES; qwen2.5_omni_7b_test.py stays generic
 (it only knows "--target-prefill-tokens N", "--prompt-base TEXT",
-"--audio-seconds S" -- not "low"/"medium"). Both are real, continuous FPGA
-runs: this script just builds the right argv and calls the main script,
-once, exactly as a user would from the command line.
+"--audio-seconds S", "--frames N" -- not "low"/"medium"/"high"). All three are
+real, continuous FPGA runs: this script just builds the right argv and calls
+the main script, once, exactly as a user would from the command line. High
+uses --frames 4 for a genuine 4-camera-frame workload (four real,
+back-to-back FPGA vision-encoder invocations spliced into one prompt, each
+its own image placeholder block -- see qwen2.5_omni_7b_test.py's _run_vision/
+--frames), now that the context ceiling (raised to 8192, see
+MAX_CONTEXT_SIZE) fits its ~6144-token aggregate. Before that ceiling was
+raised, High could not run as one continuous pass and instead used an
+op-by-op derivation against synthetic shapes; that path is still available
+via --standalone, at any tier, as a cross-check against the real run's own
+measured numbers.
 
-High runs the real vision and audio encoders in a separate media-only process,
-then measures LM operations separately. A real single continuous ~6144-token
-prefill does not fit the resident model's DRAM map; no such model run is claimed.
-The LM benchmark compiles and runs each real op (qkv/o/gate/up/down projections,
-attention) across the REAL number of engines it uses in the real model, each
-engine on its real per-engine shard, barrier-synchronized at the same two
-points a real compiled layer is: together at the start (workers park on the
-master's flag; the master raises it once every worker has reached this
+--standalone (any tier) compiles and runs each real op (qkv/o/gate/up/down
+projections, attention) across the REAL number of engines it uses in the real
+model, each engine on its real per-engine shard, barrier-synchronized at the
+same two points a real compiled layer is: together at the start (workers park
+on the master's flag; the master raises it once every worker has reached this
 point), and the master held at completion until every worker has finished
 (see _emit_start_barrier/_emit_completion_barrier) -- the same
 flag_set/flag_check primitives user_hw_test.py's own
@@ -25,12 +31,9 @@ prefill/decode cost is then DERIVED: each op's measured group latency (the
 master's own, which already includes real handshake/rendezvous overhead)
 times how many times it really occurs in one forward pass (NL layers,
 sequential) -- NOT times the engine count, since the engines within one op
-already ran concurrently inside the measurement itself.
-
-VALIDATED, NOT ASSUMED: --low/--medium --standalone run this exact method at
-850/2048 tokens, dims a real end-to-end run CAN also reach, specifically so
-the derived numbers can be checked against real ones before trusting this
-method for High's unreachable ~6144.
+already ran concurrently inside the measurement itself. Comparing
+--standalone's derived numbers against a plain (real) run at the same tier is
+the validation that this method is trustworthy at all.
 """
 
 from __future__ import annotations
@@ -45,7 +48,6 @@ import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MAIN_SCRIPT = os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_test.py")
-HIGH_MEDIA_SCRIPT = os.path.join(SCRIPT_DIR, "benchmark_high_media.py")
 PROJECT_ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -54,10 +56,10 @@ if PROJECT_ROOT not in sys.path:
 # ==========================================================================
 # WORKLOAD SHAPES
 # ==========================================================================
-# Low and Medium's own tier definitions -- moved out of qwen2.5_omni_7b_test.py,
-# which no longer knows what "low"/"medium" mean. Audio duration is specified
-# directly (not a fraction of the bundled clip) so the shape is reproducible
-# regardless of what audio file is passed.
+# Low/Medium/High's own tier definitions -- moved out of
+# qwen2.5_omni_7b_test.py, which no longer knows what "low"/"medium"/"high"
+# mean. Audio duration is specified directly (not a fraction of the bundled
+# clip) so the shape is reproducible regardless of what audio file is passed.
 PRESETS = {
     "low": {
         "image": False,
@@ -82,6 +84,21 @@ PRESETS = {
             "parts are required."
         ),
     },
+    "high": {
+        "image": True,
+        "vision_res": "medium",
+        "frames": 4,
+        "audio_seconds": 6.0,
+        "target_prefill_tokens": 6144,
+        "prompt_base": (
+            "Four camera frames and one audio clip are provided. Do two "
+            "things, in this order. First, transcribe the speech exactly "
+            "as it is spoken, preserving the wording and the order of the "
+            "terms. Second, describe each of the four camera frames in "
+            "detail, covering the lighting, the terrain, the vegetation "
+            "and the sky. All parts are required."
+        ),
+    },
 }
 
 
@@ -102,6 +119,8 @@ def _argv_for(spec: dict, *, dev: str, multi_core: int, max_new_tokens: int,
     ]
     if spec.get("image"):
         argv += ["--image", "--vision-res", spec["vision_res"]]
+        if spec.get("frames", 1) != 1:
+            argv += ["--frames", str(spec["frames"])]
     return argv
 
 
@@ -146,15 +165,23 @@ def run_medium(args) -> dict | None:
     return _run(argv, "MEDIUM -- single camera")
 
 
+def run_high(args) -> dict | None:
+    summary = args.summary or os.path.join(
+        SCRIPT_DIR, "qwen2.5_omni_7b_test_xdma0_image_high_multi-core_8.md")
+    argv = _argv_for(
+        PRESETS["high"], dev=args.dev, multi_core=args.multi_core,
+        max_new_tokens=args.max_new_tokens, summary=summary,
+    )
+    return _run(argv, "HIGH -- multi-camera")
+
+
 # ==========================================================================
-# HIGH: OP-BY-OP MICRO-BENCHMARK, DERIVED TOTALS
+# --standalone: OP-BY-OP MICRO-BENCHMARK, DERIVED TOTALS
 # ==========================================================================
 # The real model's own dims, read straight from its config -- no import of
 # any qwen2.5_omni_7b_*.py module, so this never pulls in torch/the DRAM-map
 # machinery those carry. Mirrors _lm_dims() in qwen2.5_omni_7b_lm.py.
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_config.json")
-HIGH_PREFILL_TOKENS = 6144          # 3 x 2048, the aggregate the High tier claims
-HIGH_DECODE_CONTEXT = 6144          # resident KV depth decode reads at
 # One global latency correction for op-by-op decode only. The full-model
 # first-token HW times at matching contexts were 78.2 ms (Low, 850 rows) and
 # 99.2 ms (Medium, 2048 rows); the isolated-op totals were 71.75 and 89.19
@@ -556,20 +583,12 @@ def _attention_bytes(batch: int, aligned_seq_len: int, head_dim: int, bpe: int =
 
 
 def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
-                 label: str, default_out_name: str,
-                 media_result: dict | None = None,
-                 media_result_fn=None) -> dict:
+                 label: str, default_out_name: str) -> dict:
     """The op-by-op measurement + derivation, generic over the target dims.
 
-    Used by --high (dims no real run can reach) and by --low/--medium
-    --standalone (dims a real run CAN reach, specifically so the derived
-    numbers can be checked against that real run's own measured GFLOPS/
-    tok-s -- see the module docstring's validation argument).
-
-    `media_result_fn`, if given, is called to run the vision/audio media
-    phase AFTER all LM ops are measured but BEFORE the report is written --
-    so the LM ops are measured cold, never immediately preceded by the
-    media phase's sustained compute (see run_high).
+    Used by --standalone at any tier's real dims, so the derived numbers can
+    be checked against that tier's own real (--low/--medium/--high) run --
+    see the module docstring's validation argument.
     """
     import user_dma_core as udc
     udc.set_dma_device(args.dev)
@@ -654,7 +673,6 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
     prefill_gflops = prefill_flops / (prefill_total_ms * 1e6) if prefill_total_ms else 0.0
     prefill_tok_s = 1000.0 * prefill_tokens / prefill_total_ms if prefill_total_ms else 0.0
     prefill_pct_peak = 100.0 * prefill_gflops / peak_gflops
-    prefill_issued_flops = NL * sum(row[-1] for row in op_rows["prefill"])
     print(f"\nPrefill (derived): {prefill_total_ms:.1f} ms for {prefill_tokens} tokens "
           f"({prefill_tok_s:.2f} tok/s, {prefill_gflops:.1f} GFLOPS, "
           f"{prefill_pct_peak:.1f}% of {peak_gflops:.1f} GFLOPS peak, "
@@ -711,15 +729,6 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
     print(f"Decode step (empirical x{EMPIRICAL_DECODE_LATENCY_SCALE:.2f} latency): "
           f"{corrected_decode_ms:.2f} ms ({corrected_tok_s:.2f} tok/s)")
 
-    # All LM ops are measured by this point; only now (after the numbers
-    # above are locked in) do we run the media phase, if requested.
-    if media_result_fn is not None:
-        if media_result is not None:
-            raise ValueError("pass either media_result or media_result_fn, not both")
-        media_result = media_result_fn()
-        if media_result is None:
-            raise RuntimeError("media phase did not return measurements; LM op-by-op numbers above are still valid, but the TTFT section will be omitted")
-
     def report_rows(rows):
         result = [
             "| Full operation | Full shape | Engines | Type | HW ms | Issued GFLOP | Issued GFLOPS | % 8-engine peak |",
@@ -734,59 +743,6 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
             )
         return result
 
-    media_lines = []
-    if media_result is not None:
-        media_peak = float(media_result["peak_gflops"])
-        if abs(media_peak - peak_gflops) > 0.01 * peak_gflops:
-            raise RuntimeError(f"media/LM peak mismatch: {media_peak} vs {peak_gflops}")
-        vision = media_result["vision"]
-        audio = media_result["audio"]
-        vision_ms = float(vision["hw_us"]) / 1e3
-        audio_ms = float(audio["hw_us"]) / 1e3
-        ttft_ms = vision_ms + audio_ms + prefill_total_ms
-
-        def stage_row(name, shape, flops, model_flops, ms):
-            issued = flops / (ms * 1e6) if ms else 0.0
-            effective = model_flops / (ms * 1e6) if ms else 0.0
-            return (f"| {name} | {shape} | {flops / 1e9:.1f} | "
-                    f"{model_flops / 1e9:.1f} | {ms:.1f} | {issued:.1f} | "
-                    f"{100 * issued / peak_gflops:.1f}% | {effective:.1f} | "
-                    f"{100 * effective / peak_gflops:.1f}% |")
-
-        media_lines = [
-            "## Vision/image, audio, and projected TTFT",
-            "",
-            f"Vision and audio are **real FPGA media-stage runs** on HW "
-            f"{media_result['hw_version']}; their times come from FPGA counters. "
-            "Four 896 x 896 vision invocations replay the same bundled image "
-            "(same workload shape, not four distinct camera frames). Audio "
-            f"uses the bundled sample trimmed to {float(audio['seconds']):.1f} s. "
-            "The LM prefill time is derived from isolated operation counters, "
-            "not a full-model prefill run.",
-            "",
-            "| Stage | Workload | Issued GFLOP | Model GFLOP | HW/derived ms | Issued GFLOPS | % 8-core peak | Effective GFLOPS | % 8-core peak |",
-            "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-            stage_row("Vision/image", f"{vision['frames']} x {vision['frame_shape']}",
-                      float(vision["flops"]), float(vision["model_flops"]), vision_ms),
-            stage_row("Audio", f"{audio['seconds']} s", float(audio["flops"]),
-                      float(audio["model_flops"]), audio_ms),
-            stage_row("LM prefill (derived)", f"{prefill_tokens} tokens",
-                      prefill_issued_flops, prefill_flops, prefill_total_ms),
-            "",
-            f"- Vision: {vision_ms / vision['frames']:.1f} ms/frame, "
-            f"{1000 * vision['soft_tokens'] / vision_ms:.1f} soft tokens/s "
-            f"({vision['patches_per_frame']} patches/frame, "
-            f"{vision['soft_tokens']} soft tokens total).",
-            f"- Audio: {audio_ms:.1f} ms, {audio['soft_tokens']} soft tokens.",
-            f"- **Projected hardware TTFT: {ttft_ms:.1f} ms** = "
-            f"{vision_ms:.1f} ms vision + {audio_ms:.1f} ms audio + "
-            f"{prefill_total_ms:.1f} ms derived LM prefill. This is **not** "
-            "a measured end-to-end or CPU-timer TTFT. It excludes host "
-            "preparation, weight/program loading, compilation, inter-stage "
-            "scheduling, and LM operations omitted below.",
-            "",
-        ]
-
     out_path = args.summary or os.path.join(SCRIPT_DIR, default_out_name)
     lines = [
         f"# qwen2.5_omni_7b {label} tier -- op-by-op derived benchmark",
@@ -795,9 +751,10 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
         "single-engine shard. Engines execute their shards concurrently; the "
         "master's hardware-counter time includes their start/completion "
         "barriers. The benchmark times isolated operations at full shapes, "
-        "not a compiled multi-layer model run. The `--high` op-by-op path "
-        "uses a fixed 8-engine configuration; its `--multi-core` CLI value "
-        "does not change that configuration.",
+        "not a compiled multi-layer model run. `--standalone` runs this at a "
+        "fixed 8-engine configuration; its `--multi-core` CLI value does not "
+        "change that configuration. Compare against a plain (real) run at "
+        "the same tier to judge how well this method's derived numbers hold up.",
         "",
         f"- **Prefill:** {prefill_tokens} tokens -> "
         f"**{prefill_total_ms:.1f} ms**; **{prefill_tok_s:.2f} tok/s**; "
@@ -814,10 +771,9 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
         "(2048 rows). Sources: `qwen2.5_omni_7b_test_xdma0_audio_low_multi-core_8.md` "
         "and `qwen2.5_omni_7b_test_xdma0_image+audio_medium_multi-core_8.md`. "
         "This is an estimate, not a measured full-model time; the operation "
-        "rows below remain unscaled. Applying it at HIGH's 6144-row context "
-        "is unvalidated extrapolation.",
+        "rows below remain unscaled. Applying it at HIGH's context is "
+        "unvalidated extrapolation beyond Low/Medium's own validated range.",
         "",
-        *media_lines,
         "## Prefill: one layer's measured full operations",
         "",
         *report_rows(op_rows["prefill"]),
@@ -862,38 +818,11 @@ def run_op_by_op(args, *, prefill_tokens: int, decode_context: int,
     }
 
 
-def run_high(args) -> None:
-    if args.multi_core != 8:
-        raise ValueError("--high requires --multi-core 8 for its fixed 8-engine LM measurements")
-
-    # The LM op-by-op measurement runs FIRST and cold, before any vision/
-    # audio load touches the board. Running ~90s of real vision compute
-    # immediately before the LM ops was found to measurably slow them (e.g.
-    # q_proj/gate_proj ~15-17% lower GFLOPS than measured standalone) -- a
-    # board-thermal artifact of THIS benchmark's own stage ordering, not a
-    # model regression. media_result_fn defers the media subprocess until
-    # after every LM op is measured, so the numbers above never carry that
-    # bias; the media phase's own HW-counter numbers are unaffected by
-    # ordering and are still merged into the same report.
-    def _run_media():
-        return _run([
-            sys.executable, HIGH_MEDIA_SCRIPT, "--dev", args.dev,
-            "--multi-core", str(args.multi_core), "--frames", "4",
-            "--audio-seconds", "6.0",
-        ], "HIGH real vision/image and audio", result_prefix="HIGH_MEDIA_RESULT: ")
-
-    run_op_by_op(
-        args, prefill_tokens=HIGH_PREFILL_TOKENS, decode_context=HIGH_DECODE_CONTEXT,
-        label="HIGH", default_out_name="qwen2.5_omni_7b_benchmark_high_op_by_op.md",
-        media_result_fn=_run_media,
-    )
-
-
 def run_standalone(args, tier: str) -> None:
-    """--low/--medium --standalone: the SAME op-by-op method at that tier's
-    real dims, so its derived prefill/decode numbers can be compared directly
-    against a real `benchmark.py --low`/`--medium` run's measured numbers --
-    the check that --high's own (unreachable) dims cannot get."""
+    """--standalone (any tier): the SAME op-by-op method at that tier's real
+    dims, so its derived prefill/decode numbers can be compared directly
+    against a real `benchmark.py --low`/`--medium`/`--high` run's measured
+    numbers -- the cross-check that this method is trustworthy at all."""
     spec = PRESETS[tier]
     tokens = int(spec["target_prefill_tokens"])
     run_op_by_op(
@@ -913,19 +842,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--summary", default=None, metavar="PATH")
     parser.add_argument(
         "--standalone", action="store_true",
-        help="with --low/--medium: run the op-by-op method (see --high) at "
-             "that tier's real dims INSTEAD of a real end-to-end run, so its "
-             "derived numbers can be checked against a plain --low/--medium "
-             "run's real measured GFLOPS/tok-s -- the validation --high's "
-             "own unreachable dims cannot get directly. Ignored with --high.",
+        help="run the op-by-op method (see the module docstring) at the "
+             "chosen tier's real dims INSTEAD of a real end-to-end run, so "
+             "its derived numbers can be checked against that tier's own "
+             "plain (real) run -- the cross-check that this method is "
+             "trustworthy at all.",
     )
     tier = parser.add_mutually_exclusive_group(required=True)
     tier.add_argument("--low", action="store_true", help="voice command: real FPGA run")
     tier.add_argument("--medium", action="store_true", help="single camera: real FPGA run")
     tier.add_argument("--high", action="store_true",
-                      help="four real full-resolution vision invocations and "
-                           "real audio, then isolated 8-core LM operations "
-                           "at HIGH dimensions for a projected TTFT")
+                      help="multi-camera: real FPGA run, 4 camera frames "
+                           "(--frames 4) plus audio, one continuous prefill")
     return parser
 
 
@@ -939,7 +867,7 @@ def main() -> None:
     elif args.medium:
         run_standalone(args, "medium") if args.standalone else run_medium(args)
     elif args.high:
-        run_high(args)
+        run_standalone(args, "high") if args.standalone else run_high(args)
 
 
 if __name__ == "__main__":
