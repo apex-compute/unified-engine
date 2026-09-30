@@ -180,6 +180,9 @@ VISION_MAX_SOFT_TOKENS = max(
 # benchmark.py, which drives this flag with its own preset table -- this
 # script only knows how to hit a number.
 DEFAULT_PROMPT_BASE = "Respond to the request in detail."
+# What the bare --dummy_prompt flag reads; any other file may be named
+# explicitly, which is how the longer saved prompts are replayed.
+DEFAULT_DUMMY_PROMPT = "dummy_prompt.md"
 
 # Filler for the fitted prompt. It has to be REAL INSTRUCTION TEXT, not
 # padding: the point of a long prefill is to measure the shape the model
@@ -2416,7 +2419,31 @@ def _load_audio(
     return mono.contiguous().numpy().astype(np.float32, copy=False)
 
 
+def _resolve_dummy_prompt(path: str) -> str:
+    """Find a --dummy_prompt file: as given, else beside this script.
+
+    Relative paths resolve against the working directory first so a path the
+    shell tab-completed behaves as typed; the script-dir fallback is what makes
+    the bare flag and ``--dummy_prompt dummy_prompt_4072.md`` work from any cwd.
+    """
+    candidates = [path] if os.path.isabs(path) else [
+        path, os.path.join(SCRIPT_DIR, path)]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "--dummy_prompt file not found; tried " + ", ".join(
+            os.path.abspath(candidate) for candidate in candidates))
+
+
 def _default_prompt(args) -> str:
+    if args.dummy_prompt:
+        resolved = _resolve_dummy_prompt(args.dummy_prompt)
+        with open(resolved, encoding="utf-8") as source:
+            text = source.read()
+        if not text.strip():
+            raise ValueError(f"--dummy_prompt file {resolved} is empty")
+        return text
     if args.prompt:
         return args.prompt
     if getattr(args, "target_prefill_tokens", None):
@@ -2491,7 +2518,7 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
         prompt = _fit_prompt_to_prefill(
             processor.tokenizer,
             lambda text: int(_assemble(text)[1]["input_ids"].shape[1]),
-            int(target), args.prompt_base)
+            int(target), prompt if args.dummy_prompt else args.prompt_base)
     rendered, processed = _assemble(prompt)
 
     input_ids = processed["input_ids"]
@@ -2587,6 +2614,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""examples:
   python {os.path.basename(__file__)} --multi-core 8 --prompt "If x + 3 = 5, what is x?"
+  python {os.path.basename(__file__)} --multi-core 8 --dummy_prompt
+  python {os.path.basename(__file__)} --multi-core 8 --dummy_prompt dummy_prompt_4072.md
   python {os.path.basename(__file__)} --multi-core 8 --image
   python {os.path.basename(__file__)} --multi-core 8 --audio
 """,
@@ -2611,7 +2640,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         help="engine count; this model requires exactly 8",
     )
-    parser.add_argument("--prompt", default=None, help="user text prompt")
+    prompt_source = parser.add_mutually_exclusive_group()
+    prompt_source.add_argument("--prompt", default=None, help="user text prompt")
+    prompt_source.add_argument(
+        "--dummy_prompt", "--dummy-prompt",
+        nargs="?", const=DEFAULT_DUMMY_PROMPT, default=None, metavar="FILE",
+        help="read the user text verbatim from a file instead of --prompt. "
+             f"Bare flag uses {DEFAULT_DUMMY_PROMPT} beside this script; pass "
+             "a path to use another file (resolved against the working "
+             "directory first, then beside this script), e.g. "
+             "--dummy_prompt dummy_prompt_4072.md. The file's own token count "
+             "is what gets prefilled -- no filler is added unless "
+             "--target-prefill-tokens is also given.",
+    )
     parser.add_argument(
         "--target-prefill-tokens",
         type=int,
@@ -2620,7 +2661,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "until the assembled prefill reaches exactly this many tokens; "
              "ignored if --prompt is given. Fixed-shape workload presets "
              "(voice-command / single-camera / multi-camera, ...) live in "
-             "benchmark.py, which drives this flag.",
+             "benchmark.py, which drives this flag. With --dummy_prompt, "
+             "grow the contents of dummy_prompt.md instead.",
     )
     parser.add_argument(
         "--prompt-base",
@@ -2699,6 +2741,11 @@ def run_summary_filename(args) -> str:
     presets) pass ``--summary`` explicitly rather than relying on this name.
     """
     parts = ["qwen2.5_omni_7b_test", args.dev, _result_mode(args)]
+    if args.dummy_prompt:
+        # Name the file, so runs from different dummy prompts do not overwrite
+        # one another's summaries.
+        stem = os.path.splitext(os.path.basename(args.dummy_prompt))[0]
+        parts.append("dummy-prompt" if stem == "dummy_prompt" else stem)
     if getattr(args, "profile", False):
         parts.append("profile")
     parts.append(f"multi-core_{args.multi_core}")
