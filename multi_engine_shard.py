@@ -1598,6 +1598,34 @@ class PrivateArena:
             {"engine": engine_idx, "base": addr, "size": size_bytes, "what": what})
         return addr
 
+    def tensor_mark(self) -> tuple:
+        """A rollback point for the PRIVATE per-engine tensor cursors.
+
+        The shared pool has had mark/release since it existed; the private
+        tensor slices never did, so every phase's per-engine scratch stayed
+        allocated for the life of the run. A model that carves vision, then
+        audio, then LM scratch paid for all three at once in a slice sized for
+        one, and nothing ever returned. Each phase re-carves from scratch (its
+        outputs are on the host), so the cursors are safe to rewind between
+        phases -- which is what makes the slice budget per-phase.
+        """
+        return tuple(self._tensor_cursor)
+
+    def tensor_release(self, mark: tuple) -> int:
+        """Rewind the private tensor cursors to ``mark``. Returns bytes freed."""
+        if len(mark) != self.num_engines:
+            raise ValueError("tensor_release: mark is from a different arena")
+        reclaimed = 0
+        for i, want in enumerate(mark):
+            have = self._tensor_cursor[i]
+            if want > have:
+                raise ValueError(
+                    f"tensor_release: engine {i} cursor 0x{have:X} is already below "
+                    f"the mark 0x{want:X}; marks release in reverse order only")
+            reclaimed += have - want
+            self._tensor_cursor[i] = want
+        return reclaimed
+
     def shared_up_mark(self) -> tuple:
         return (tuple(self._shared_up_cursor), len(self._shared_up_allocs))
 
