@@ -32,34 +32,102 @@ THE THINKER->TALKER INTERFACE is the part the accelerator has to satisfy, and
 it is narrow: per token, the Talker wants the Thinker's FINAL HIDDEN STATE plus
 that token's INPUT EMBEDDING, summed, both 3584 wide.
 
-Three of the four tensors are free today:
+Three of the four tensors are already available:
 
   step_embeds     the embedding lookup already happens host-side
   prefill_embeds  likewise
   step_hidden     LM_OUT_NORM holds exactly this after each decode step; it is
                   a 3584-element readback per token
 
-The fourth is not. PREFILL_HIDDEN wants the final norm applied to EVERY prompt
-row, and prefill does not compute it: LM_OUT_NORM is allocated as a SINGLE row
-(`alloc(H, "lm.out_norm")`) because only the last position's logits are needed
-to pick the first token. Supplying it costs one extra
+The fourth, PREFILL_HIDDEN, needs the final norm applied to EVERY prompt row.
+When speech is requested, prefill emits one extra
 `rms_norm_core_dram(M=seq_len, N=H)` over the final layer output into a [T, H]
 buffer, plus a T*3584*2 byte readback -- about 13 MiB at a 1899-token prompt.
-Cheap, but it is real work rather than a readback, and it is the one thing
-standing between this module and speech driven by the accelerator.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import queue
+import time
 from typing import Any
 
 import torch
+from transformers import Qwen2_5OmniTalkerForConditionalGeneration
 
 SPEAKERS = ("Chelsie", "Ethan")
 DEFAULT_SPEAKER = "Chelsie"
 SAMPLE_RATE = 24000
+
+
+class ReplyStream:
+    """Completed Thinker steps, consumed by the host Talker as they arrive."""
+
+    _END = object()
+
+    def __init__(self, embed_lookup, text_eos: int, text_pad: int):
+        self._queue: queue.Queue = queue.Queue()
+        self._embed_lookup = embed_lookup
+        self._text_eos = text_eos
+        self._text_pad = text_pad
+        self._tail = 0
+        self._closed = False
+        self._error: BaseException | None = None
+
+    def push(self, token: int, hidden: torch.Tensor) -> None:
+        if self._closed:
+            raise RuntimeError("cannot publish a Thinker step after speech stream closure")
+        self._queue.put((int(token), hidden.clone()))
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._queue.put(self._END)
+
+    def abort(self, error: BaseException) -> None:
+        self._error = error
+        self.close()
+
+    def next_step(self) -> tuple[int, torch.Tensor] | None:
+        if self._tail:
+            return None
+        try:
+            item = self._queue.get(timeout=60)
+        except queue.Empty as exc:
+            raise TimeoutError("waiting for the next FPGA Thinker step") from exc
+        if item is self._END:
+            self._tail = 1
+            if self._error is not None:
+                raise RuntimeError("FPGA Thinker stopped before speech completed") from self._error
+            return None
+        return item
+
+    def next_condition(self) -> torch.Tensor:
+        item = self.next_step()
+        if item is not None:
+            token, hidden = item
+            embed = self._embed_lookup(torch.tensor([[token]], dtype=torch.long))
+            return hidden.float().reshape(1, 1, -1) + embed.float()
+        token = self._text_eos if self._tail == 1 else self._text_pad
+        self._tail = 2
+        return self._embed_lookup(torch.tensor([[token]], dtype=torch.long)).float()
+
+
+class _StreamingTalker(Qwen2_5OmniTalkerForConditionalGeneration):
+    """Inject each newly available text condition into HF's cached decode."""
+
+    reply_stream = None
+
+    def _update_model_kwargs_for_generation(
+        self, outputs, model_kwargs, is_encoder_decoder=False, num_new_tokens=1
+    ):
+        model_kwargs = super()._update_model_kwargs_for_generation(
+            outputs, model_kwargs, is_encoder_decoder, num_new_tokens
+        )
+        if self.reply_stream is not None:
+            model_kwargs["thinker_reply_part"] = self.reply_stream.next_condition().to(self.dtype)
+        return model_kwargs
 
 
 def _load_submodule_state(model_dir: str, prefix: str) -> dict[str, torch.Tensor]:
@@ -116,7 +184,7 @@ class HostSpeech:
         self.speaker = speaker
         cfg = Qwen2_5OmniConfig.from_pretrained(model_dir)
 
-        self.talker = Qwen2_5OmniTalkerForConditionalGeneration(cfg.talker_config)
+        self.talker = _StreamingTalker(cfg.talker_config)
         self.talker.load_state_dict(_load_submodule_state(model_dir, "talker"),
                                     strict=True)
         self.talker.to(dtype=dtype).eval()
@@ -130,6 +198,19 @@ class HostSpeech:
         spk = torch.load(os.path.join(model_dir, "spk_dict.pt"),
                          map_location="cpu", weights_only=False)
         self.speaker_params = spk[speaker]
+        self.last_metrics: dict[str, float | int | str] | None = None
+
+    def _record_metrics(self, codes: torch.Tensor, waveform: torch.Tensor,
+                        talker_s: float, token2wav_s: float) -> None:
+        audio = waveform[0] if isinstance(waveform, (tuple, list)) else waveform
+        self.last_metrics = {
+            "talker_device": "Host CPU",
+            "talker_wall_s": talker_s,
+            "codec_tokens": int(codes.shape[1]),
+            "token2wav_device": "Host CPU",
+            "token2wav_wall_s": token2wav_s,
+            "audio_samples": int(audio.numel()),
+        }
 
     @property
     def codec_tokens(self) -> dict[str, int]:
@@ -141,7 +222,7 @@ class HostSpeech:
     @torch.no_grad()
     def speak(self, *, input_ids: torch.Tensor, prefill_hidden: torch.Tensor,
               prefill_embeds: torch.Tensor, step_hidden: torch.Tensor,
-              step_embeds: torch.Tensor, embed_lookup,
+              step_embeds: torch.Tensor, first_reply_token: int, embed_lookup,
               max_new_tokens: int = 4096, do_sample: bool = True,
               top_k: int = 40, top_p: float = 0.8, temperature: float = 0.9,
               repetition_penalty: float = 1.05) -> torch.Tensor:
@@ -168,8 +249,10 @@ class HostSpeech:
             raise KeyError("speaker entry has no bos_token; spk_dict.pt is not the "
                            "one this checkpoint expects")
 
-        # Text stream: the prompt, then the speaker's BOS, then the reply.
-        talker_input_text_ids = torch.cat([input_ids, bos], dim=1)
+        # The initial codec prefix includes the first generated text token.
+        # Its length must match the prompt-mask + codec PAD/BOS prefix below.
+        first_reply = torch.tensor([[first_reply_token]], dtype=torch.long, device=dev)
+        talker_input_text_ids = torch.cat([input_ids, bos, first_reply], dim=1)
         # Codec stream: the prompt is masked (there is no speech for it yet),
         # then pad, then the codec BOS the model actually starts decoding from.
         talker_input_ids = torch.cat([
@@ -177,6 +260,12 @@ class HostSpeech:
             torch.tensor([[talker.codec_pad_token]], dtype=torch.long, device=dev),
             torch.tensor([[talker.codec_bos_token]], dtype=torch.long, device=dev),
         ], dim=1)
+        if talker_input_text_ids.shape != talker_input_ids.shape:
+            raise AssertionError("Talker text and codec prefixes must align")
+        # The reference supplies this mask even for an unpadded text prompt.
+        # In Talker.forward it also triggers the codec PAD/BOS embeddings and
+        # multimodal position setup for the two prefix rows.
+        talker_attention_mask = torch.ones_like(talker_input_text_ids)
 
         reply = (step_hidden + step_embeds).to(dt)
         inputs_embeds = (prefill_hidden + prefill_embeds).to(dt)
@@ -194,9 +283,11 @@ class HostSpeech:
                                       device=dev)).to(dt),
         ], dim=1)
 
+        talker_started = time.perf_counter()
         codes = talker.generate(
             input_ids=talker_input_ids,
             input_text_ids=talker_input_text_ids,
+            attention_mask=talker_attention_mask,
             thinker_reply_part=thinker_reply_part,
             inputs_embeds=inputs_embeds,
             suppress_tokens=[talker.codec_bos_token],
@@ -206,7 +297,91 @@ class HostSpeech:
             eos_token_id=[8292, 8294],
         )
         codes = codes[:, talker_input_ids.shape[1]:-1]
-        return self.synthesize(codes)
+        talker_s = time.perf_counter() - talker_started
+        print(f"  [Speak] Talker generated {codes.shape[1]} codec tokens in "
+              f"{talker_s:.1f}s; starting CPU "
+              "Token2Wav", flush=True)
+        vocoder_started = time.perf_counter()
+        waveform = self.synthesize(codes)
+        token2wav_s = time.perf_counter() - vocoder_started
+        self._record_metrics(codes, waveform, talker_s, token2wav_s)
+        print(f"  [Speak] CPU Token2Wav finished in "
+              f"{token2wav_s:.1f}s", flush=True)
+        return waveform
+
+    @torch.no_grad()
+    def speak_stream(self, *, input_ids: torch.Tensor,
+                     prefill_hidden_rows: torch.Tensor,
+                     prefill_embeds: torch.Tensor, reply_stream: ReplyStream,
+                     embed_lookup, max_new_tokens: int = 4096,
+                     do_sample: bool = True, top_k: int = 40,
+                     top_p: float = 0.8, temperature: float = 0.9,
+                     repetition_penalty: float = 1.05) -> torch.Tensor:
+        """Start Talker after the seed and first reply step; await later steps."""
+        seed = reply_stream.next_step()
+        first_reply = reply_stream.next_step()
+        if seed is None or first_reply is None:
+            raise RuntimeError("Thinker ended before it supplied the speech prefix")
+        if seed[0] != int(input_ids[0, -1]):
+            raise RuntimeError("speech stream's first step is not the prompt seed")
+
+        talker = self.talker
+        dt = talker.dtype
+        bos = torch.tensor([[self.speaker_params["bos_token"]]], dtype=torch.long)
+        first_token = torch.tensor([[first_reply[0]]], dtype=torch.long)
+        talker_input_text_ids = torch.cat([input_ids, bos, first_token], dim=1)
+        talker_input_ids = torch.cat([
+            torch.full_like(input_ids, fill_value=talker.codec_mask_token),
+            torch.tensor([[talker.codec_pad_token]], dtype=torch.long),
+            torch.tensor([[talker.codec_bos_token]], dtype=torch.long),
+        ], dim=1)
+        if talker_input_ids.shape != talker_input_text_ids.shape:
+            raise AssertionError("Talker text and codec prefixes must align")
+        prefix_hidden = torch.cat([
+            prefill_hidden_rows.float().reshape(1, -1, prefill_embeds.shape[-1]),
+            seed[1].float().reshape(1, 1, -1),
+        ], dim=1)
+        first_condition = (
+            first_reply[1].float().reshape(1, 1, -1)
+            + embed_lookup(first_token).float()
+        )
+        inputs_embeds = torch.cat([
+            prefix_hidden + prefill_embeds.float(),
+            embed_lookup(bos).float(),
+            first_condition,
+        ], dim=1).to(dt)
+
+        talker.reply_stream = reply_stream
+        started = time.perf_counter()
+        reply_stream.talker_started_at = started
+        try:
+            codes = talker.generate(
+                input_ids=talker_input_ids,
+                input_text_ids=talker_input_text_ids,
+                attention_mask=torch.ones_like(talker_input_text_ids),
+                thinker_reply_part=torch.zeros((1, 1, prefill_embeds.shape[-1]), dtype=dt),
+                inputs_embeds=inputs_embeds,
+                suppress_tokens=[talker.codec_bos_token],
+                max_new_tokens=max_new_tokens, do_sample=do_sample,
+                top_k=top_k, top_p=top_p, temperature=temperature,
+                repetition_penalty=repetition_penalty,
+                eos_token_id=[8292, 8294],
+            )
+        finally:
+            reply_stream.talker_finished_at = time.perf_counter()
+            talker.reply_stream = None
+        codes = codes[:, talker_input_ids.shape[1]:-1]
+        talker_s = reply_stream.talker_finished_at - started
+        print(f"  [Speak] streaming Talker generated {codes.shape[1]} codec tokens "
+              f"in {talker_s:.1f}s; starting CPU Token2Wav",
+              flush=True)
+        vocoder_started = time.perf_counter()
+        waveform = self.synthesize(codes)
+        token2wav_s = time.perf_counter() - vocoder_started
+        self._record_metrics(codes, waveform, talker_s, token2wav_s)
+        print(f"  [Speak] CPU Token2Wav finished in "
+              f"{token2wav_s:.1f}s", flush=True)
+        return waveform
 
     @torch.no_grad()
     def generate_codes(self, **kwargs) -> torch.Tensor:
@@ -249,15 +424,9 @@ def write_wav(path: str, waveform: torch.Tensor, sample_rate: int = SAMPLE_RATE)
 class ThinkerEmbeddings:
     """Row lookups into the Thinker's embedding table, straight from the shards.
 
-    The accelerator keeps this table on-device, IF8 and sharded across cores,
-    and materialises a row INSIDE the decode program -- where it is promptly
-    overwritten, because with an even layer count the final layer writes the
-    same buffer the embedding was placed in. So the rows cannot be read back
-    after a step, and reconstructing them from the quantized shards would mean
-    dequantizing IF8 host-side for no benefit.
-
-    Reading the bf16 table directly is exact, costs no device time, and is what
-    the reference implementation conditions the Talker on. Rows are fetched
+    This model keeps its BF16 Thinker embedding table on the host and sends
+    selected rows to FPGA DRAM. Reading the same checkpoint rows for the
+    Talker is exact and matches the reference implementation. Rows are fetched
     lazily by slice, so a few hundred of them never materialise the 1 GiB table.
     """
 

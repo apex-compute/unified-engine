@@ -2,8 +2,8 @@
 """Qwen2.5-Omni-7B Thinker on the eight-engine, 8-GiB Alveo map.
 
 This entry point implements text, image, and audio understanding with text
-generation.  The speech Talker/token2wav path is deliberately not part of this
-binary. Vision, audio, and LM weights time-share one params window; encoder
+generation. For --speak, host Talker generation overlaps FPGA text decode;
+Token2Wav then renders the completed codec stream. Vision, audio, and LM weights time-share one params window; encoder
 outputs are staged through the host strictly for DMA/layout before the next
 stage reclaims that window. No learned arithmetic executes there.
 """
@@ -19,6 +19,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from typing import Any
@@ -434,6 +435,11 @@ DEFAULT_AUDIO = os.path.normpath(
 )
 RUN_LOCK_PATH = "/tmp/apexcompute-qwen2.5-omni-7b.lock"
 DEFAULT_SPEAKER = "Chelsie"
+SPEECH_SYSTEM_PROMPT = (
+    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+    "capable of perceiving auditory and visual inputs, as well as generating "
+    "text and speech."
+)
 
 # Every file that can change captured Omni instructions is bound into the
 # programs artifact identity.  Paths are explicit so generated checkpoints,
@@ -1985,6 +1991,7 @@ class Qwen25OmniUnifiedEngine(
                 "is how much of the issued work the model needed.",
                 "",
             ]
+
             lines += self._stage_table(rows)
             lines.append("")
 
@@ -2094,6 +2101,40 @@ class Qwen25OmniUnifiedEngine(
                 f"- **Throughput:** {decode_gflops:.1f} GFLOPS "
                 f"({100.0 * decode_gflops / peak if peak else 0.0:.1f}% of peak)",
                 f"- **End-to-end (CPU timer):** {wall:.2f} s",
+                "",
+            ]
+
+        speech = getattr(self, "_speech_result", None)
+        if speech:
+            codec_tokens = int(speech["codec_tokens"])
+            talker_s = float(speech["talker_wall_s"])
+            token2wav_s = float(speech["token2wav_wall_s"])
+            audio_s = float(speech["seconds"])
+            talker_hw = (f"{float(speech['talker_hw_us']) / 1e3:.1f} ms"
+                         if speech.get("talker_hw_us") is not None else "—")
+            token2wav_hw = (f"{float(speech['token2wav_hw_us']) / 1e3:.1f} ms"
+                            if speech.get("token2wav_hw_us") is not None else "—")
+            lines += [
+                "## Speech output",
+                "",
+                "Talker and Token2Wav are measured separately by CPU timers. "
+                "The device column identifies where each stage ran; `—` means "
+                "no FPGA HW counter applies to that stage.",
+                "",
+                "| Stage | Device | Output | HW counter | CPU wall | Rate |",
+                "| :--- | :--- | ---: | ---: | ---: | ---: |",
+                f"| Talker | {speech['talker_device']} | {codec_tokens} codec tokens "
+                f"| {talker_hw} | {talker_s:.1f} s | "
+                f"{codec_tokens / talker_s if talker_s else 0.0:.1f} codec tok/s |",
+                f"| Token2Wav | {speech['token2wav_device']} | {audio_s:.2f} s audio "
+                f"| {token2wav_hw} | {token2wav_s:.1f} s | "
+                f"{audio_s / token2wav_s if token2wav_s else 0.0:.2f}× real time |",
+                "",
+                f"- **Decode/Talker overlap (CPU timer):** "
+                f"{float(speech.get('decode_talker_overlap_s', 0.0)):.2f} s",
+                f"- **Speaker:** {speech['speaker']}",
+                f"- **WAV:** `{os.path.basename(speech['wav'])}` "
+                f"({audio_s:.2f} s at {_talker_mod.SAMPLE_RATE} Hz)",
                 "",
             ]
 
@@ -2588,8 +2629,15 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
     def _assemble(prompt_text: str):
         body = [item for item in content if item["type"] != "text"]
         body.append({"type": "text", "text": prompt_text})
+        messages = []
+        if args.speak is not None:
+            # Qwen's Talker is conditioned on the Thinker's system prompt.
+            # The generic chat-template default yields incoherent speech even
+            # when the Thinker's decoded text is correct.
+            messages.append({"role": "system", "content": SPEECH_SYSTEM_PROMPT})
+        messages.append({"role": "user", "content": body})
         text = processor.apply_chat_template(
-            [{"role": "user", "content": body}],
+            messages,
             tokenize=False, add_generation_prompt=True)
         call_kwargs: dict[str, Any] = {
             "text": text, "padding": True, "return_tensors": "pt",
@@ -2744,25 +2792,29 @@ def _run_audio(ue: Qwen25OmniUnifiedEngine, processed):
 def _synthesize_speech(ue, args, cfg: dict, prompt_tokens: list[int]) -> dict:
     """Thinker state off the accelerator -> Talker -> Token2Wav -> .wav.
 
-    The FPGA supplies the conditioning and nothing else: the final hidden for
-    every prompt row (LM_PREFILL_NORM, produced by the extra prefill norm) and
-    one final hidden per generated token. The embedding stream comes from the
-    checkpoint table, because on this model the embeddings live on the device
-    and a row cannot be read back after the step that used it.
+    Prefill processes all prompt tokens except the seed. Decode's first step
+    consumes that seed, so its hidden completes the prompt hidden stream;
+    subsequent captured steps are the generated reply's hidden stream.
     """
     import torch as _torch
 
     steps = ue._speech_steps or []
     if not steps:
         raise RuntimeError("--speak: no decode steps were captured")
+    if steps[0][0] != prompt_tokens[-1]:
+        raise RuntimeError("--speak: first captured token is not the prompt seed")
+    reply_steps = steps[1:]
+    if not reply_steps:
+        raise RuntimeError("--speak: decoder produced no reply tokens to speak")
     H = int(ue.vector_length)
     T = len(prompt_tokens)
     model_dir = os.path.join(SCRIPT_DIR, cfg["paths"]["hf_model_dir"])
 
     t0 = time.perf_counter()
-    prefill_hidden = ue.dma_from_accelerator_memory(
-        ue.LM_PREFILL_NORM, (T, H)).float().unsqueeze(0)
-    step_hidden = _torch.cat([h.float() for _, h in steps], dim=0).unsqueeze(0)
+    prefill_rows = ue.dma_from_accelerator_memory(
+        ue.LM_PREFILL_NORM, (T - 1, H)).float()
+    prefill_hidden = _torch.cat((prefill_rows, steps[0][1].float()), dim=0).unsqueeze(0)
+    step_hidden = _torch.cat([h.float() for _, h in reply_steps], dim=0).unsqueeze(0)
     readback_s = time.perf_counter() - t0
 
     emb = _talker_mod.ThinkerEmbeddings(model_dir)
@@ -2770,7 +2822,7 @@ def _synthesize_speech(ue, args, cfg: dict, prompt_tokens: list[int]) -> dict:
              int(cfg["tokens"]["video_token_id"])}
     prefill_embeds = emb.rows(
         prompt_tokens, zero_at=[i for i, t in enumerate(prompt_tokens) if t in media])
-    step_embeds = emb.rows([t for t, _ in steps])
+    step_embeds = emb.rows([t for t, _ in reply_steps])
 
     hs = _talker_mod.HostSpeech(model_dir, speaker=args.speak)
     t1 = time.perf_counter()
@@ -2778,6 +2830,7 @@ def _synthesize_speech(ue, args, cfg: dict, prompt_tokens: list[int]) -> dict:
         input_ids=_torch.tensor([prompt_tokens], dtype=_torch.long),
         prefill_hidden=prefill_hidden, prefill_embeds=prefill_embeds,
         step_hidden=step_hidden, step_embeds=step_embeds,
+        first_reply_token=reply_steps[0][0],
         embed_lookup=lambda ids: emb.rows(ids.flatten().tolist()),
     )
     speak_s = time.perf_counter() - t1
@@ -2791,7 +2844,65 @@ def _synthesize_speech(ue, args, cfg: dict, prompt_tokens: list[int]) -> dict:
           f"host talker+vocoder {speak_s:.1f}s)")
     return {"speaker": args.speak, "wav": out, "samples": n,
             "seconds": n / _talker_mod.SAMPLE_RATE,
-            "readback_s": readback_s, "host_s": speak_s}
+            "readback_s": readback_s, "host_s": speak_s,
+            **(hs.last_metrics or {})}
+
+
+def _prepare_streamed_speech(ue, args, cfg: dict, prompt_tokens: list[int]):
+    """Read the prompt state and load Talker before concurrent FPGA decode."""
+    import torch as _torch
+
+    started = time.perf_counter()
+    H = int(ue.vector_length)
+    T = len(prompt_tokens)
+    prefill_rows = ue.dma_from_accelerator_memory(
+        ue.LM_PREFILL_NORM, (T - 1, H)).float()
+    readback_s = time.perf_counter() - started
+    model_dir = os.path.join(SCRIPT_DIR, cfg["paths"]["hf_model_dir"])
+    emb = _talker_mod.ThinkerEmbeddings(model_dir)
+    media = {int(cfg["tokens"]["image_token_id"]),
+             int(cfg["tokens"]["audio_token_id"]),
+             int(cfg["tokens"]["video_token_id"])}
+    prefill_embeds = emb.rows(
+        prompt_tokens,
+        zero_at=[i for i, t in enumerate(prompt_tokens) if t in media],
+    )
+    lookup = lambda ids: emb.rows(ids.flatten().tolist())
+    hs = _talker_mod.HostSpeech(model_dir, speaker=args.speak)
+    stream = _talker_mod.ReplyStream(
+        lookup, hs.talker.text_eos_token, hs.talker.text_pad_token)
+    ue._speech_step_callback = stream.push
+    return (stream, hs, _torch.tensor([prompt_tokens], dtype=_torch.long),
+            prefill_rows, prefill_embeds, lookup, readback_s, started)
+
+
+def _finish_streamed_speech(args, session, wav, decode_started: float,
+                            decode_finished: float) -> dict:
+    stream, hs, _, _, _, _, readback_s, started = session
+    w = wav
+    w = w[0] if isinstance(w, (tuple, list)) else w
+    out = os.path.join(SCRIPT_DIR, run_summary_filename(args).replace(".md", ".wav"))
+    _talker_mod.write_wav(out, w)
+    n = int(w.reshape(-1).shape[0])
+    talker_started = getattr(stream, "talker_started_at", decode_finished)
+    talker_finished = getattr(stream, "talker_finished_at", decode_finished)
+    overlap = max(0.0, min(talker_finished, decode_finished)
+                  - max(talker_started, decode_started))
+    finished = time.perf_counter()
+    host_s = finished - talker_started
+    setup_s = talker_started - started
+    print(f"\n[Speak] {args.speak}: {n} samples = "
+          f"{n / _talker_mod.SAMPLE_RATE:.2f}s @ {_talker_mod.SAMPLE_RATE} Hz "
+          f"-> {os.path.basename(out)}  (FPGA readback {readback_s:.2f}s, "
+          f"host setup {setup_s:.1f}s, Talker + vocoder {host_s:.1f}s, "
+          f"decode/Talker overlap {overlap:.2f}s)")
+    return {"speaker": args.speak, "wav": out, "samples": n,
+            "seconds": n / _talker_mod.SAMPLE_RATE,
+            "readback_s": readback_s,
+            "host_s": host_s,
+            "host_setup_s": setup_s,
+            "decode_talker_overlap_s": overlap,
+            **(hs.last_metrics or {})}
 
 
 def _result_mode(args) -> str:
@@ -2951,6 +3062,8 @@ def run_summary_filename(args) -> str:
 
     ``--dev xdma0 --image --multi-core 8`` ->
     ``qwen2.5_omni_7b_test_xdma0_image_multi-core_8.md``.
+    ``--speak Chelsie`` adds ``speak_Chelsie`` before the core-count tag;
+    the matching WAV uses the same stem.
 
     Device and mode are always present, in that order; a profile run is tagged
     so its phase breakdown never overwrites a generation run's summary. Callers
@@ -2963,6 +3076,8 @@ def run_summary_filename(args) -> str:
         # one another's summaries.
         stem = os.path.splitext(os.path.basename(args.dummy_prompt))[0]
         parts.append("dummy-prompt" if stem == "dummy_prompt" else stem)
+    if getattr(args, "speak", None) is not None:
+        parts.append(f"speak_{args.speak}")
     if getattr(args, "profile", False):
         parts.append("profile")
     parts.append(f"multi-core_{args.multi_core}")
@@ -3140,12 +3255,65 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         return
 
     print("\n--- Decode run ---")
-    if args.speak is not None:
-        ue._speech_steps = []
-    _, decoded_text = ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)
     speech = None
-    if args.speak is not None:
-        speech = _synthesize_speech(ue, args, cfg, tokens)
+    if args.speak is None:
+        _, decoded_text = ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)
+    else:
+        ue._speech_steps = []
+        speech_session = _prepare_streamed_speech(ue, args, cfg, tokens)
+        stream, hs, input_ids, prefill_rows, prefill_embeds, lookup, _, _ = speech_session
+        decoder_result: dict[str, Any] = {}
+
+        def _decode_worker():
+            decoder_result["started"] = time.perf_counter()
+            try:
+                decoder_result["output"] = ue.run_decoder(
+                    seed, max_new_tokens=args.max_new_tokens)
+            except BaseException as exc:
+                decoder_result["error"] = exc
+            finally:
+                decoder_result["finished"] = time.perf_counter()
+                ue._speech_step_callback = None
+                if "error" in decoder_result:
+                    stream.abort(decoder_result["error"])
+                else:
+                    stream.close()
+
+        decoder_thread = threading.Thread(
+            target=_decode_worker, name="omni-fpga-decode", daemon=True)
+        decoder_thread.start()
+        print("  [Speak] FPGA decode and host Talker running in parallel",
+              flush=True)
+        try:
+            wav = hs.speak_stream(
+                input_ids=input_ids,
+                prefill_hidden_rows=prefill_rows,
+                prefill_embeds=prefill_embeds,
+                reply_stream=stream,
+                embed_lookup=lookup,
+            )
+        except Exception as exc:
+            decoder_thread.join(timeout=60)
+            if decoder_thread.is_alive():
+                raise TimeoutError("FPGA decode did not finish after Talker failure") from exc
+            if "error" in decoder_result:
+                raise decoder_result["error"] from exc
+            print(f"[Speak] streaming path failed ({exc}); retrying the "
+                  "completed Thinker response sequentially", flush=True)
+            wav = None
+        decoder_thread.join(timeout=60)
+        if decoder_thread.is_alive():
+            raise TimeoutError("FPGA decoder did not finish within 60 seconds")
+        if "error" in decoder_result:
+            raise decoder_result["error"]
+        _, decoded_text = decoder_result["output"]
+        if wav is None:
+            speech = _synthesize_speech(ue, args, cfg, tokens)
+        else:
+            speech = _finish_streamed_speech(
+                args, speech_session, wav,
+                decoder_result["started"], decoder_result["finished"])
+        ue._speech_result = speech
     lm_wall = time.perf_counter() - started
     print(f"\nThinker stage done in {lm_wall:.2f}s wall")
 
