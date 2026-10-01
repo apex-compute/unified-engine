@@ -668,6 +668,10 @@ class Qwen25OmniLMMixin:
             # accumulator above is the single-engine analogue.
             self.LM_MLP_DOWN_TP = alloc(tp_ne * P * H, "lm.mlp_down_tp")
         self.LM_OUT_NORM = alloc(H, "lm.out_norm")
+        # The Talker needs the final hidden for every prefill row, not just
+        # the last row used by the LM head. Keep it until speech synthesis.
+        self.LM_PREFILL_NORM = (alloc(P * H, "lm.prefill_norm")
+                                if self._export_prefill_hidden() else None)
         self.LOGITS = alloc(d["VOCAB"], "lm.logits")
         # Repetition-penalty bias: the LM-head matmul's C term, so the HW argmax
         # of (logits + bias) is the penalized token and no logits come back.
@@ -2477,6 +2481,14 @@ class Qwen25OmniLMMixin:
                 rope_base=self.LM_ROPE_PRE, ckpt=ckpt,
                 sched=sched, gate_m_regs=gate_m_regs, live_rows=seq_len)
             flops_ref[0] = flops
+        if self._export_prefill_hidden():
+            final_pre = self.LM_IO_A if nl % 2 == 0 else self.LM_IO_B
+            flops += self.rms_norm_core_dram(
+                M=execution_rows, N=d["H"], A_DRAM_ADDR=final_pre,
+                OUTPUT_DRAM_ADDR=self.LM_PREFILL_NORM,
+                GAMMA_DRAM_ADDR=self.final_norm_addr, gpr_M_reg=m_reg) or 0
+            ckpt("prefill_final_norm", flops - flops_ref[0])
+            flops_ref[0] = flops
         self.generate_instruction_halt()
         worker_addrs = sched.finalize() if sched is not None else []
         if sched is not None:
@@ -3221,6 +3233,16 @@ class Qwen25OmniLMMixin:
             step_flops += (self._decoder_flops_fixed
                            + self._decoder_attn_per_aligned * aligned)
 
+            if getattr(self, "_speech_steps", None) is not None:
+                # Record the token this step consumed and its final hidden.
+                # The first step consumes the prompt seed; later steps consume
+                # generated reply tokens. Capture only completed FPGA steps.
+                hidden = self.dma_from_accelerator_memory(
+                    self.LM_OUT_NORM, (1, d["H"])).clone()
+                self._speech_steps.append((token, hidden))
+                callback = getattr(self, "_speech_step_callback", None)
+                if callback is not None:
+                    callback(token, hidden)
             token = self._decode_token()
             if token in stop:
                 if use_status:
