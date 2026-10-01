@@ -135,7 +135,34 @@ REQUIRED_DRAM_GIB = 8
 # CONTEXT AND PREFILL ARE ONE BUDGET. Prefill and decode read the same KV
 # cache, so MAX_CONTEXT_SIZE bounds both: a prompt (vision soft tokens + text)
 # may fill it, and generation continues inside it.
-MAX_CONTEXT_SIZE = 2500
+#
+# Allocate for 8192 prefill rows and 8192 KV positions. Getting here (up from
+# an earlier 4096 ceiling) needed three private-vs-shared DRAM layout changes,
+# all in _base_lm_tensor_init (qwen2.5_omni_7b_lm.py) and the
+# OMNI_PRIVATE_TENSOR_BYTES/OMNI_PRIVATE_RESERVE_BYTES budgets below:
+#   1. The per-engine head-sharded attention scratch is
+#      unified_attention_core's own fixed [aligned_seq_len, aligned_seq_len]
+#      score buffer -- quadratic in context, ~132-188 MiB/engine at 8192 (was
+#      34-62 MiB at 4096) -- a hardware-kernel floor, not something software
+#      tiling can shrink. OMNI_PRIVATE_TENSOR_BYTES grew 64 -> 264 MiB/engine
+#      to fit it.
+#   2. LM_MLP_GATE/UP (296 MiB each at 8192) no longer fit the shared band
+#      that growth left behind, so they became private per-engine
+#      [P, LANE] lanes (LM_MLP_GATE_PER_ENGINE/LM_MLP_UP_PER_ENGINE) instead
+#      of one shared [P, MLP] plane -- same reasoning as the down-projection
+#      partials already were. LM_MLP_DOWN (the reduce_add destination) can no
+#      longer alias UP's memory, so it gets its own small dedicated shared
+#      allocation.
+#   3. LM_K_CACHE/LM_V_CACHE (224 MiB each at 8192) hit the same shared-band
+#      limit; split into one shared allocation PER LAYER (LM_K_CACHE_PER_LAYER/
+#      LM_V_CACHE_PER_LAYER, ~8 MiB each) rather than one contiguous span --
+#      split by layer, not by kv_head, so the per-layer grouped multi-head
+#      prefill store (bf16_permute_dram_core) stays exactly one call, with
+#      zero extra DMA-call cost.
+# None of this changes per-layer kernel-call counts, DMA volume, or compute --
+# it is purely an addressing/allocation change. Verified correct (coherent,
+# fact-checked decode output) at 4096, 4352, 6144 and 8192 on real hardware.
+MAX_CONTEXT_SIZE = 8192
 # Prefill and decode execute whole 64-row attention tiles. Inputs remain bounded
 # by the logical context, while tensors and the KV cache carry the padded tile.
 PREFILL_INPUT_TOKEN_LIMIT = MAX_CONTEXT_SIZE
@@ -172,6 +199,9 @@ VISION_MAX_SOFT_TOKENS = max(
 # benchmark.py, which drives this flag with its own preset table -- this
 # script only knows how to hit a number.
 DEFAULT_PROMPT_BASE = "Respond to the request in detail."
+# What the bare --dummy_prompt flag reads; any other file may be named
+# explicitly, which is how the longer saved prompts are replayed.
+DEFAULT_DUMMY_PROMPT = "dummy_prompt.md"
 
 # Filler for the fitted prompt. It has to be REAL INSTRUCTION TEXT, not
 # padding: the point of a long prefill is to measure the shape the model
@@ -327,38 +357,41 @@ def apply_vision_resolution(cfg: dict, name: str) -> dict:
 # differs (the U55C's becomes 2 GiB when its HBM is upgraded), so the map gets
 # re-tuned deliberately instead of silently running at the wrong size.
 OMNI_WINDOW_BYTES = 0x4000_0000            # 1 GiB per core, 8 GiB total
-# Sized for the LARGEST compiled program of any stage, not the LM's (4.28 MiB
-# tensor-parallel prefill + 1.02 MiB decoder): the vision encoder's per-window
-# instruction count scales with attention-window count, and at "medium"
-# resolution (4096 patches, 64 windows against "small"'s 576/9) it needs
-# ~48-50 MiB/engine, confirmed by a real overflow at the old 16 MiB slice
-# (multi_engine_shard.PrivateArena.check_isa_fits: engine 1's program reached
-# 0x80F42E40 against a 0x7F000000 limit). 64 MiB leaves that real number
-# genuine margin. This used to cost the weight arena directly -- see
-# OMNI_LM_HEAD_BYTES's removal below for where the room came from.
-OMNI_ISA_BYTES = 64 * 2**20                # per-core ISA slice, inside the window
-# Per-core scratch, inside the window. The head-sharded prefill attention keeps
-# ONE private scratch per engine, (AHD + aligned_P) * aligned_P + aligned_P *
-# AHD elements -- 13.75 MiB at the 2560-row prefill allocation. Vision's much
-# larger 4096-patch worker scratch is pinned in the shared pool instead, so it
-# does not compete with this fixed slice the way the ISA program used to.
-OMNI_PRIVATE_TENSOR_BYTES = 16 * 2**20
+# Medium-resolution vision has a 47.75 MiB master program, so ISA must retain
+# 64 MiB. Place it at the END of each window, with 32 MiB deliberately unused
+# immediately before it. This strip separates any overrun from the private
+# tensor slice below it; it does not make HBM writes fault or prove the ISA safe.
+OMNI_ISA_BYTES = 64 * 2**20
+OMNI_ISA_GUARD_BYTES = 32 * 2**20
+# 264 MiB, not 64: past a 4096 context, the per-engine attention scratch
+# (unified_attention_core's [aligned_seq_len, aligned_seq_len] score buffer,
+# quadratic in context -- see lm_attn_scratch's own MemoryError) plus the
+# private MLP down/gate/up lanes (see LM_MLP_*_PER_ENGINE in
+# qwen2.5_omni_7b_lm.py) no longer fit in 64 MiB. 64 MiB was exact for a 4096
+# context (~62 MiB on core 0); 8192 needs ~262 MiB, so this carries a small
+# margin over that, not the old ceiling.
+OMNI_PRIVATE_TENSOR_BYTES = 264 * 2**20
 
-# What the private shards need per core, declared BEFORE any shared byte is
-# lent. Measured on the 8-engine map:
-#   gate/up N-shards (both phases)  240.8   down K-shard (both phases) 120.4
-#   attn decode shard               38.3
-#   lm_head shard                    34.5   embedding stays on host
-#   decode IF4 O shard               22.8; removing the 67.3-MiB embedding
-#   shard reduces the observed 707.4-MiB peak to about 640.1 MiB/core.
-#   The 645-MiB reservation retains the same ~5-MiB headroom and does not
-#   depend on reclaiming the
-#   shared IF4 prefill image after prefill.
-# Asserted against actual usage after loading, so drift fails loudly instead of
-# silently eating the pool. NOTE: "lm_head shard" here is decode's own
-# column-sharded copy (_ensure_decode_shards_impl) -- the separate, now-
-# removed OMNI_LM_HEAD_BYTES extent below was a DIFFERENT, wasted allocation.
-OMNI_PRIVATE_RESERVE_BYTES = 645 * 2**20
+# The measured IF4 projection + LM-head footprint is 447.8 MiB/core. Reserve
+# 464 MiB for private shards before lending anything to the shared pool -- the
+# measured footprint plus 16 MiB. It was 512, which left 64 MiB per core
+# reserved-but-never-used: 513 MiB across the board that the shared pool could
+# not touch. The footprint is deterministic (a fixed model at a fixed eight
+# engines; vision/audio weights are PARAMS, not private shards), and overshoot
+# fails loudly in alloc_shared rather than corrupting, so the slack buys
+# nothing. The remaining 200 MiB of the 664 MiB weight arena is shared
+# capacity; it grows only within [base+0x1D000000, base+0x29800000). (This
+# band shrank from 400 MiB when OMNI_PRIVATE_TENSOR_BYTES grew from 64 to 264
+# MiB above -- the two budgets share the same 1 GiB window and trade off
+# directly.)
+#
+# THE BAND, NOT THE TOTAL, IS WHAT BINDS. A shared object must fit one
+# contiguous per-window gap. GATE/UP used to be the objects that mattered here
+# (296 MiB each at an 8192 context) but are now private per-engine lanes (see
+# OMNI_PRIVATE_TENSOR_BYTES above), so the largest remaining shared object at
+# 8192 is the qkv/attn/mlp overlay or LM_BIAS, 128 MiB each -- comfortably
+# inside 200 MiB.
+OMNI_PRIVATE_RESERVE_BYTES = 464 * 2**20
 
 # THERE USED TO BE A SECOND UNSCATTERABLE OBJECT HERE: a 280 MiB "dedicated
 # extent" (OMNI_LM_HEAD_BYTES) holding one contiguous, unsharded copy of the
@@ -498,10 +531,8 @@ class Qwen25OmniUnifiedEngine(
         # U55 8-GiB DRAM map -- EIGHT 1-GiB PRIVATE WINDOWS THAT TILE THE DEVICE
         #
         #   core i -> [i GiB, (i+1) GiB), and inside each window, low to high:
-        #     weights  984 MiB   private shards, bump-allocated UP from the base
-        #     (gap)               the shared pool, bump-allocated DOWN from 984
-        #     ISA       32 MiB
-        #     tensor     8 MiB   per-engine scratch
+        #     private weights 512 MiB; shared weights/tensors 352 MiB;
+        #     private tensor 64 MiB; untouched guard 32 MiB; ISA 64 MiB.
         #
         # WHY THE WHOLE DEVICE IS PRIVATE WINDOWS. At 1 GiB per core the windows
         # span all 8 GiB, so there is no region left ABOVE the arena to hold the
@@ -509,14 +540,10 @@ class Qwen25OmniUnifiedEngine(
         # the only space there is, so shared data is carved from there and the
         # arena arbitrates between the two cursors (PrivateArena.alloc_shared).
         #
-        # WHY THE PREFILL MLP IS TENSOR-PARALLEL. A shared copy of the decoder
-        # is 3655 MiB and does not fit beside the private shards: it packs into
-        # the gaps with only 8 x ~42 MiB left, and the 112-MiB KV cache then has
-        # nowhere contiguous to go. Sharding the MLP -- 2889 MiB, 79% of the
-        # decoder -- over the engines is what makes this map fit, and it is also
-        # FASTER at the real prefill tile: +14.2% measured at M=64, the size a
-        # <=64-token prompt runs. Only attention, the untied head and the norms
-        # stay shared, 765 MiB placed section by section across the gaps.
+        # All LM projection weights are private shards shared by prefill and
+        # decode; only the small BF16 biases/norms use the shared pool. LM
+        # tensors are also carved there, between the 512 MiB private reserve
+        # and the private tensor/guard/ISA tail of each window.
         #
         # Vision, audio and the shared LM weights still TIME-SHARE the pool, now
         # via shared_mark()/shared_release() instead of one contiguous window.
@@ -533,6 +560,7 @@ class Qwen25OmniUnifiedEngine(
             windows=[(base, OMNI_WINDOW_BYTES) for base in expected_bases],
             isa_bytes=OMNI_ISA_BYTES,
             tensor_bytes=OMNI_PRIVATE_TENSOR_BYTES,
+            isa_guard_bytes=OMNI_ISA_GUARD_BYTES,
             verbose=True,
         )
         if self.mc_arena.stride != OMNI_WINDOW_BYTES:
@@ -579,6 +607,10 @@ class Qwen25OmniUnifiedEngine(
         self.TENSOR_LIMIT = sum(self.mc_arena.shared_free())
         self._tensor_staged = 0
         self._tensor_phase_mark = self.mc_arena.shared_up_mark()
+        # The private per-engine slices are re-carved per phase too, so they
+        # rewind with the shared pool. Without this, vision + audio + LM scratch
+        # accumulated in a slice sized for one phase.
+        self._tensor_phase_private_mark = self.mc_arena.tensor_mark()
         # No dedicated extents left to reserve -- lm_head no longer stages an
         # unsharded device blob (see OMNI_PRIVATE_RESERVE_BYTES's comment).
         # _reserved_extent_for/reset_params_dram_addr keep working unchanged
@@ -745,15 +777,23 @@ class Qwen25OmniUnifiedEngine(
         release, and the bytes genuinely return to the pool for the next phase.
         """
         self.mc_arena.shared_up_release(self._tensor_phase_mark)
+        self.mc_arena.tensor_release(self._tensor_phase_private_mark)
         self._tensor_staged = 0
 
     def tensor_phase_mark(self):
-        """A rollback point for a partially-built tensor set."""
-        return (self.mc_arena.shared_up_mark(), self._tensor_staged)
+        """A rollback point for a partially-built tensor set.
+
+        Covers the private per-engine cursors as well as the shared pool: a
+        partially built set can hold both, so a rollback that reclaimed only the
+        shared half would leak private slice space on every retry.
+        """
+        return (self.mc_arena.shared_up_mark(), self._tensor_staged,
+                self.mc_arena.tensor_mark())
 
     def tensor_phase_restore(self, mark) -> None:
-        arena_mark, staged = mark
+        arena_mark, staged, private_mark = mark
         self.mc_arena.shared_up_release(arena_mark)
+        self.mc_arena.tensor_release(private_mark)
         self._tensor_staged = staged
 
     def dma_to_accelerator_memory(
@@ -797,7 +837,9 @@ class Qwen25OmniUnifiedEngine(
             "private_arena_bytes": REQUIRED_ENGINES * OMNI_WINDOW_BYTES,
             "private_window_bytes": OMNI_WINDOW_BYTES,
             "private_isa_bytes": OMNI_ISA_BYTES,
+            "private_isa_guard_bytes": OMNI_ISA_GUARD_BYTES,
             "private_tensor_bytes": OMNI_PRIVATE_TENSOR_BYTES,
+            "private_weight_reserve_bytes": OMNI_PRIVATE_RESERVE_BYTES,
             # The DRAM this map CLAIMS, which is eight 1 GiB windows wherever
             # the board puts them -- not self.DRAM_END. On the 8 GiB image the
             # windows tile the device and the two are the same number; on the
@@ -817,12 +859,27 @@ class Qwen25OmniUnifiedEngine(
         if self.mc_arena.stride != int(hw["private_window_bytes"], 0):
             raise AssertionError("PrivateArena did not produce 1-GiB windows")
         expected_weight_bytes = (OMNI_WINDOW_BYTES - OMNI_ISA_BYTES
+                                 - OMNI_ISA_GUARD_BYTES
                                  - OMNI_PRIVATE_TENSOR_BYTES)
         if self.mc_arena.weight_bytes() != expected_weight_bytes:
             raise AssertionError(
                 f"each engine must have {expected_weight_bytes // 2**20} MiB for its "
                 f"private shards and the shared pool, got "
                 f"{self.mc_arena.weight_bytes() // 2**20} MiB")
+        # weight_limit/tensor_base is the window minus ISA, its guard and the
+        # private tensor slice -- not a fixed literal, since
+        # OMNI_PRIVATE_TENSOR_BYTES moves it (264 MiB today, 64 MiB before
+        # the 8192-context private-lane GATE/UP/scratch growth).
+        expected_tensor_base = (OMNI_WINDOW_BYTES - OMNI_ISA_BYTES
+                                - OMNI_ISA_GUARD_BYTES - OMNI_PRIVATE_TENSOR_BYTES)
+        for i in range(REQUIRED_ENGINES):
+            region = self.mc_arena.region(i)
+            base = region.base
+            if not (region.weight_limit == base + expected_tensor_base
+                    and region.tensor_base == base + expected_tensor_base
+                    and region.isa_base == base + 0x3C00_0000
+                    and self.mc_arena.isa_limit(i) == base + OMNI_WINDOW_BYTES):
+                raise AssertionError(f"core {i} is not in the guarded Omni map")
         if self._cfg["file_info"]["hidden_size"] != 3584:
             raise ValueError("this runtime is compiled only for the 3584-wide 7B Thinker")
         if set(self._cfg["precision"]["lm_quantized_projections"]) != {
@@ -1523,11 +1580,19 @@ class Qwen25OmniUnifiedEngine(
         rows: list[dict] = []
         if getattr(self, "_vis_latency_us", None):
             dims = self._vision_dims()
+            # frames > 1 (--frames): _vis_total_flops is already the real
+            # N-frame total (_run_vision aggregates it), so the true/model
+            # FLOP count -- computed here from ONE frame's dims -- needs the
+            # same x frames to stay comparable in the "Useful" column.
+            frames = int(getattr(args, "frames", 1) or 1)
+            detail = f"{dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens"
+            if frames > 1:
+                detail = f"{frames} x ({detail})"
             rows.append({
                 "stage": "Vision encoder",
-                "detail": f"{dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens",
+                "detail": detail,
                 "flops": float(self._vis_total_flops),
-                "model_flops": float(self._model_flops_vision(dims) or 0.0),
+                "model_flops": float(self._model_flops_vision(dims) or 0.0) * frames,
                 "us": float(self._vis_latency_us),
                 "wall": float(getattr(self, "_vis_wall_s", 0.0)),
             })
@@ -1912,11 +1977,14 @@ class Qwen25OmniUnifiedEngine(
 
         if getattr(self, "_vis_latency_us", None):
             dims = self._vision_dims()
+            frames = int(getattr(args, "frames", 1) or 1)
+            frame_tag = f"{frames} x " if frames > 1 else ""
             lines += [
                 "## Vision",
                 "",
                 f"- **Image:** `{os.path.basename(getattr(args, 'image', '') or '')}` "
-                f"-> {dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} soft tokens",
+                f"-> {frame_tag}({dims['VS']} patches -> {dims['NUM_MERGED_TOKENS']} "
+                f"soft tokens) = {frames * dims['NUM_MERGED_TOKENS']} soft tokens total",
                 f"- **Work:** {self._vis_total_flops / 1e9:.1f} GFLOP",
                 f"- **HW latency:** {self._vis_latency_us / 1e3:.1f} ms",
                 f"- **Throughput:** {self._vis_gflops:.1f} GFLOPS "
@@ -2145,9 +2213,7 @@ class Qwen25OmniUnifiedEngine(
     def dram_layout_lines(self) -> list[str]:
         """The whole 8 GiB: windows, private shards, shared pool, tensors.
 
-        Replaces the old per-core ISA table. The ISA slice is 16 MiB of a 1 GiB
-        window and was never the interesting number; where the weights, the KV
-        cache and the scratch actually sit is.
+        Report both payload and the intentionally untouched ISA guard strip.
         """
         MiB = float(2**20)
         arena = self.mc_arena
@@ -2158,13 +2224,11 @@ class Qwen25OmniUnifiedEngine(
             f"{win / MiB:.0f} MiB private windows tiling [0x0, 0x{arena.arena_bytes:X}).",
             "",
             "Inside every window, low to high:",
-            f"  private weight arena   {arena.weight_bytes() / MiB:7.0f} MiB   "
-            f"shards grow UP; shared tensors grow UP above the reserve",
-            f"  (shared pool)                      shared weights grow DOWN "
-            f"from the top of the arena",
+            f"  private weight reserve {arena._private_reserve[0] / MiB:7.0f} MiB",
+            f"  shared weights/tensors {(arena.weight_bytes() - arena._private_reserve[0]) / MiB:7.0f} MiB",
+            f"  private tensor slice   {arena.tensor_bytes / MiB:7.0f} MiB",
+            f"  untouched ISA guard    {arena.isa_guard_bytes / MiB:7.0f} MiB",
             f"  ISA slice              {arena.isa_bytes / MiB:7.0f} MiB",
-            f"  tensor scratch         {arena.tensor_bytes / MiB:7.0f} MiB   "
-            f"per-engine private attention scratch",
             "",
             "| core | window base | private | shared wts | tensors | free |",
             "| ---: | :--- | ---: | ---: | ---: | ---: |",
@@ -2249,6 +2313,8 @@ class Qwen25OmniUnifiedEngine(
                 f"{(self.TENSOR_LIMIT - self.TENSOR_BASE) / 2**20:.0f} MiB",
                 f"  ISA     0x{self.ISA_BASE:09X}..0x{self.MASTER_ISA_LIMIT:09X} "
                 f"{(self.MASTER_ISA_LIMIT - self.ISA_BASE) / 2**20:.0f} MiB",
+                f"  ISA guard (per core): {self.mc_arena.isa_guard_bytes / 2**20:.0f} MiB "
+                "untouched immediately below ISA",
             ]
         )
 
@@ -2423,7 +2489,31 @@ def _load_audio(
     return mono.contiguous().numpy().astype(np.float32, copy=False)
 
 
+def _resolve_dummy_prompt(path: str) -> str:
+    """Find a --dummy_prompt file: as given, else beside this script.
+
+    Relative paths resolve against the working directory first so a path the
+    shell tab-completed behaves as typed; the script-dir fallback is what makes
+    the bare flag and ``--dummy_prompt dummy_prompt_4072.md`` work from any cwd.
+    """
+    candidates = [path] if os.path.isabs(path) else [
+        path, os.path.join(SCRIPT_DIR, path)]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "--dummy_prompt file not found; tried " + ", ".join(
+            os.path.abspath(candidate) for candidate in candidates))
+
+
 def _default_prompt(args) -> str:
+    if args.dummy_prompt:
+        resolved = _resolve_dummy_prompt(args.dummy_prompt)
+        with open(resolved, encoding="utf-8") as source:
+            text = source.read()
+        if not text.strip():
+            raise ValueError(f"--dummy_prompt file {resolved} is empty")
+        return text
     if args.prompt:
         return args.prompt
     if getattr(args, "target_prefill_tokens", None):
@@ -2459,7 +2549,8 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
             image = source.convert("RGB").resize(
                 (size, size), Image.Resampling.BILINEAR
             )
-            images = [image.copy()]
+            frames = max(1, int(getattr(args, "frames", 1) or 1))
+            images = [image.copy() for _ in range(frames)]
     if args.audio:
         samples = _load_audio(
             args.audio, int(cfg["audio"]["sample_rate"]),
@@ -2473,7 +2564,13 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
     if args.audio:
         content.append({"type": "audio", "audio": args.audio})
     if args.image:
-        content.append({"type": "image", "image": args.image})
+        # One block per --frames camera frame: each gets its own image
+        # placeholder run in the tokenized prompt, which _run_vision fills
+        # with that frame's own real vision-encoder output, in this same
+        # order (see run_prefill's slot-splicing, which is already
+        # count-agnostic -- it just fills however many image_token_id
+        # positions exist).
+        content.extend({"type": "image", "image": args.image} for _ in images)
     content.append({"type": "text", "text": prompt})
     def _assemble(prompt_text: str):
         body = [item for item in content if item["type"] != "text"]
@@ -2498,7 +2595,7 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
         prompt = _fit_prompt_to_prefill(
             processor.tokenizer,
             lambda text: int(_assemble(text)[1]["input_ids"].shape[1]),
-            int(target), args.prompt_base)
+            int(target), prompt if args.dummy_prompt else args.prompt_base)
     rendered, processed = _assemble(prompt)
 
     input_ids = processed["input_ids"]
@@ -2514,9 +2611,23 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
 def _run_vision(
     ue: Qwen25OmniUnifiedEngine, processed, profile: bool = False
 ) -> torch.Tensor:
+    """Encode 1 or more camera frames and return their embeddings concatenated
+    in frame order (matching the same-order image placeholder blocks
+    _prepare_processor_inputs emitted, which run_prefill's slot-splicing then
+    fills positionally).
+
+    Multiple frames (--frames) currently all carry the SAME --image content --
+    the processor was given N copies of one image, so every frame's grid and
+    pixel patches are identical by construction. The encoder is therefore
+    compiled ONCE, from frame 0's input, and just re-launched (a fresh HALT-
+    resume, no recompile, no re-DMA of patch/rotary/window buffers) for each
+    later frame -- exactly the real cost of a genuine second/third/fourth
+    camera frame of the same shape, which is what --frames is for.
+    """
     grid = processed["image_grid_thw"]
-    if tuple(grid.shape) != (1, 3):
-        raise ValueError(f"only one image is supported, got grid {tuple(grid.shape)}")
+    if grid.ndim != 2 or grid.shape[1] != 3:
+        raise ValueError(f"malformed image_grid_thw, got shape {tuple(grid.shape)}")
+    frames = int(grid.shape[0])
     # The encoder is compiled for ONE patch count -- the tensors and the
     # attention bias are carved for it -- so the grid is checked, but the
     # expected value comes from the configured image geometry rather than a
@@ -2530,24 +2641,66 @@ def _run_vision(
             f"gives {side}x{side} = {side * side} patches, but num_patches is "
             f"{vis_cfg['num_patches']}"
         )
-    expected_grid = torch.tensor([[1, side, side]], dtype=grid.dtype)
-    if not torch.equal(grid.cpu(), expected_grid):
+    vs = int(vis_cfg["num_patches"])
+    expected_row = torch.tensor([1, side, side], dtype=grid.dtype)
+    for f in range(frames):
+        if not torch.equal(grid[f].cpu(), expected_row):
+            raise ValueError(
+                f"frame {f}: the encoder is carved for {vis_cfg['image_size']}x"
+                f"{vis_cfg['image_size']} (image_grid_thw [1,{side},{side}], "
+                f"{vis_cfg['num_patches']} patches -> "
+                f"{vis_cfg['num_merged_tokens']} soft tokens), got {grid[f].tolist()}"
+            )
+    pixel_values = processed["pixel_values"]
+    if pixel_values.shape[0] != frames * vs:
         raise ValueError(
-            f"the encoder is carved for {vis_cfg['image_size']}x"
-            f"{vis_cfg['image_size']} (image_grid_thw [1,{side},{side}], "
-            f"{vis_cfg['num_patches']} patches -> "
-            f"{vis_cfg['num_merged_tokens']} soft tokens), got {grid.tolist()}"
+            f"pixel_values has {pixel_values.shape[0]} patch rows, expected "
+            f"{frames} frame(s) x {vs} patches = {frames * vs}"
         )
-    print("\n--- Vision stage ---")
+    # All frames replay the same --image, so every frame's patch chunk must be
+    # byte-identical to frame 0's -- confirms the processor didn't apply any
+    # per-instance jitter/augmentation that would make the replay-without-
+    # re-DMA shortcut below silently wrong.
+    frame0 = pixel_values[:vs]
+    for f in range(1, frames):
+        if not torch.equal(pixel_values[f * vs:(f + 1) * vs], frame0):
+            raise ValueError(
+                f"frame {f}'s pixel patches differ from frame 0's -- --frames "
+                "only supports replaying identical frames of the same --image"
+            )
+    print(f"\n--- Vision stage ({frames} frame(s)) ---")
     started = time.perf_counter()
     ue.vision_weight_init()
-    ue.prepare_encoder_input(processed["pixel_values"], grid)
+    ue.prepare_encoder_input(frame0, grid[:1])
     ue.reset_tensor_dram_addr()
     ue.vision_tensor_init()
     ue.compile_vision_encoder(profile=profile)
     ue.check_master_isa()
     ue.store_program_stage("vision")
-    embeddings = ue.run_vision_encoder(profile=profile)
+    # run_vision_encoder's own bookkeeping (_vis_latency_us/_vis_wall_s/
+    # _vis_gflops/_vis_num_tokens) is PER CALL -- each call OVERWRITES it, with
+    # no notion of "N frames in one run". Aggregate across the loop ourselves
+    # so write_run_summary (and the TEST_RESULT JSON, which read these same
+    # attrs after this function returns) report the real N-frame totals
+    # instead of silently keeping just the last frame's own single-frame
+    # numbers -- the per-frame FLOP count (fixed at compile time, identical
+    # every call since every frame is the same shape) times the frame count.
+    per_frame_flops = float(ue._vis_total_flops)
+    frame_embeddings = []
+    total_latency_us = 0.0
+    total_wall_s = 0.0
+    for f in range(frames):
+        frame_embeddings.append(ue.run_vision_encoder(profile=profile))
+        total_latency_us += float(ue._vis_latency_us)
+        total_wall_s += float(getattr(ue, "_vis_wall_s", 0.0))
+    embeddings = torch.cat(frame_embeddings, dim=0)
+    if frames > 1:
+        ue._vis_latency_us = total_latency_us
+        ue._vis_total_flops = per_frame_flops * frames
+        ue._vis_wall_s = total_wall_s
+        ue._vis_gflops = (ue._vis_total_flops / (total_latency_us * 1e-6)
+                          if total_latency_us > 0 else 0.0)
+        ue._vis_num_tokens = int(embeddings.shape[0])
     print(
         f"  vision -> {tuple(embeddings.shape)} in "
         f"{time.perf_counter() - started:.2f}s wall"
@@ -2594,6 +2747,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""examples:
   python {os.path.basename(__file__)} --multi-core 8 --prompt "If x + 3 = 5, what is x?"
+  python {os.path.basename(__file__)} --multi-core 8 --dummy_prompt
+  python {os.path.basename(__file__)} --multi-core 8 --dummy_prompt dummy_prompt_4072.md
   python {os.path.basename(__file__)} --multi-core 8 --image
   python {os.path.basename(__file__)} --multi-core 8 --audio
 """,
@@ -2618,7 +2773,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         help="engine count; this model requires exactly 8",
     )
-    parser.add_argument("--prompt", default=None, help="user text prompt")
+    prompt_source = parser.add_mutually_exclusive_group()
+    prompt_source.add_argument("--prompt", default=None, help="user text prompt")
+    prompt_source.add_argument(
+        "--dummy_prompt", "--dummy-prompt",
+        nargs="?", const=DEFAULT_DUMMY_PROMPT, default=None, metavar="FILE",
+        help="read the user text verbatim from a file instead of --prompt. "
+             f"Bare flag uses {DEFAULT_DUMMY_PROMPT} beside this script; pass "
+             "a path to use another file (resolved against the working "
+             "directory first, then beside this script), e.g. "
+             "--dummy_prompt dummy_prompt_4072.md. The file's own token count "
+             "is what gets prefilled -- no filler is added unless "
+             "--target-prefill-tokens is also given.",
+    )
     parser.add_argument(
         "--target-prefill-tokens",
         type=int,
@@ -2627,7 +2794,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "until the assembled prefill reaches exactly this many tokens; "
              "ignored if --prompt is given. Fixed-shape workload presets "
              "(voice-command / single-camera / multi-camera, ...) live in "
-             "benchmark.py, which drives this flag.",
+             "benchmark.py, which drives this flag. With --dummy_prompt, "
+             "grow the contents of dummy_prompt.md instead.",
     )
     parser.add_argument(
         "--prompt-base",
@@ -2656,6 +2824,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         const=DEFAULT_IMAGE,
         default=None,
         help=f"optional image; bare --image uses {os.path.basename(DEFAULT_IMAGE)}",
+    )
+    parser.add_argument(
+        "--frames", type=int, default=1, metavar="N",
+        help="with --image, encode this many camera frames in one real "
+             "continuous run (a multi-camera workload) instead of one. Each "
+             "frame is a genuine separate FPGA vision-encoder invocation "
+             "(real DMA, real compute) and gets its own image placeholder "
+             "block in the prompt; all frames currently replay the SAME "
+             "--image (identical pixel content), not N distinct images -- "
+             "the vision/prefill cost this measures is real either way, "
+             "since each invocation actually runs. Requires --image.",
     )
     parser.add_argument(
         "--audio",
@@ -2706,6 +2885,11 @@ def run_summary_filename(args) -> str:
     presets) pass ``--summary`` explicitly rather than relying on this name.
     """
     parts = ["qwen2.5_omni_7b_test", args.dev, _result_mode(args)]
+    if args.dummy_prompt:
+        # Name the file, so runs from different dummy prompts do not overwrite
+        # one another's summaries.
+        stem = os.path.splitext(os.path.basename(args.dummy_prompt))[0]
+        parts.append("dummy-prompt" if stem == "dummy_prompt" else stem)
     if getattr(args, "profile", False):
         parts.append("profile")
     parts.append(f"multi-core_{args.multi_core}")
@@ -2720,6 +2904,10 @@ def main() -> None:
         parser.error("--max-new-tokens must be positive")
     if args.no_summary and args.summary:
         parser.error("--summary and --no-summary are mutually exclusive")
+    if args.frames < 1:
+        parser.error("--frames must be positive")
+    if args.frames > 1 and not args.image:
+        parser.error("--frames requires --image")
     with _exclusive_run_lock():
         _main_locked(parser, args)
 

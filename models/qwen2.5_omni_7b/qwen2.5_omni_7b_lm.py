@@ -370,6 +370,13 @@ class Qwen25OmniLMMixin:
                                 lane, so the whole chain is one region.
           3. reduce_add         the only cross-engine arithmetic in the layer.
           4. residual2          ROW-sharded again over the reduced result.
+
+        GATE/UP/MULT are private per-engine buffers (LM_MLP_*_PER_ENGINE),
+        not slots of one shared [P, MLP] plane -- engine e is the sole
+        writer AND reader of lane e end to end, same reasoning as the down
+        partials below. DOWN (the reduce_add destination) stays a real
+        shared [P, H] buffer: reduce_add row-shards into it, a different
+        (and incompatible) split from GATE/UP's column sharding.
         """
         d = self._lm_dims()
         H, MLP = d["H"], d["MLP"]
@@ -381,7 +388,6 @@ class Qwen25OmniLMMixin:
             raise ValueError(f"MLP lane {LANE} is not {UE_VECTOR_SIZE}-aligned")
         bpe = self.bytes_per_element
         h_row = H * bpe
-        lane_plane = M * LANE * bpe
         acc = [0]
 
         # The ping-pong destination is dead until this layer produces it, so
@@ -412,33 +418,33 @@ class Qwen25OmniLMMixin:
                 raise AssertionError(
                     f"column split gave {ctx.cols}, expected lane {LANE}")
             ctx.ue.generate_instruction_add_set(m, M)
-            for tag, plane in (("gate", self.LM_MLP_GATE),
-                               ("up", self.LM_MLP_UP)):
+            for tag, plane in (("gate", self.LM_MLP_GATE_PER_ENGINE),
+                               ("up", self.LM_MLP_UP_PER_ENGINE)):
                 data, scale = la[f"{tag}_tp"][e]
                 acc[0] += ctx.ue.matmat_mul_core(
                     M=M, K=H, N=LANE, A_DRAM_ADDR=self.LM_MLP_NORM,
                     B_DRAM_ADDR=data, SCALE_DRAM_ADDR=scale,
                     is_B_quantized=True, data_type=TYPE.IF4,
-                    OUTPUT_DRAM_ADDR=plane + e * lane_plane,
+                    OUTPUT_DRAM_ADDR=plane[e],
                     silu_enable=(tag == "gate"), gpr_M_reg=m) or 0
             acc[0] += ctx.ue.eltwise_core_dram(
                 M=M, N=LANE,
-                dram_a=self.LM_MLP_GATE + e * lane_plane,
-                dram_b=self.LM_MLP_UP + e * lane_plane,
-                dram_out=self.LM_MLP_MULT + e * lane_plane,
+                dram_a=self.LM_MLP_GATE_PER_ENGINE[e],
+                dram_b=self.LM_MLP_UP_PER_ENGINE[e],
+                dram_out=self.LM_MLP_MULT_PER_ENGINE[e],
                 mode=UE_MODE.ELTWISE_MUL, gpr_M_reg=m) or 0
             data, scale = la["down_tp"][e]
             acc[0] += ctx.ue.matmat_mul_core(
                 M=M, K=LANE, N=H,
-                A_DRAM_ADDR=self.LM_MLP_MULT + e * lane_plane,
+                A_DRAM_ADDR=self.LM_MLP_MULT_PER_ENGINE[e],
                 B_DRAM_ADDR=data, SCALE_DRAM_ADDR=scale,
                 is_B_quantized=True, data_type=TYPE.IF4,
-                OUTPUT_DRAM_ADDR=self.LM_MLP_DOWN_TP + e * M * h_row,
+                OUTPUT_DRAM_ADDR=self.LM_MLP_DOWN_TP_PER_ENGINE[e],
                 gpr_M_reg=m) or 0
 
         sched.col_sharded_region(MLP, _tp, join=True)
         sched.reduce_add(
-            [self.LM_MLP_DOWN_TP + e * M * h_row for e in range(ne)],
+            [self.LM_MLP_DOWN_TP_PER_ENGINE[e] for e in range(ne)],
             self.LM_MLP_DOWN, M=M, N=H, parallel=True)
 
         def _post(ctx):
@@ -547,9 +553,31 @@ class Qwen25OmniLMMixin:
             # Q_HM and ATTN_HM remain dedicated because attention addresses
             # their padded head planes. Bias, attention scratch and KV caches
             # are also deliberately outside this overlay.
-            tp_elems = tp_ne * P * H
-            self.LM_MLP_DOWN_TP = alloc(tp_elems, "lm.mlp_down_tp_scratch")
-            scratch_base = self.LM_MLP_DOWN_TP
+            # THE EIGHT TP DOWN PARTIALS ARE PRIVATE, NOT SHARED. Engine e is
+            # the only writer of partial e, which is the arena's definition of
+            # private -- yet they used to be eight slots of ONE shared plane,
+            # making that plane tp_ne * P * H (224 MiB at a 4096 context, 448 at
+            # 8192). It was the largest single shared object in the model, and a
+            # shared object must fit one contiguous per-window band, so it -- not
+            # total capacity -- was what blocked a context past 4096.
+            #
+            # Moving them into the per-engine slices leaves the shared plane
+            # sized by its real shared users (the Q/K/V and attention
+            # transients), and drops it to max(qkv, attn) = 64 MiB at 4096.
+            #
+            # It also removes a genuine address collision: LM_MLP_NORM was
+            # scratch_base and engine 0's partial was scratch_base + 0, so
+            # engine 0 overwrote mlp_norm while engines 1..7 were still reading
+            # it for their gate/up matmuls inside the same concurrent region.
+            # That survived only because all lanes do equal work and finish
+            # together.
+            tp_elems = max(
+                P * H + P * QH * AHD + 2 * P * KVH * AHD,   # pre_norm|q|k|v
+                P * QH * AHD + P * H,                       # result|projected
+                P * H,                                      # mlp_norm
+            )
+            self.LM_MLP_DOWN_TP = None
+            scratch_base = alloc(tp_elems, "lm.qkv_attn_mlp_overlay")
             scratch_end = scratch_base + tp_elems * bpe
 
             self.LM_PRE_NORM = scratch_base
@@ -566,6 +594,7 @@ class Qwen25OmniLMMixin:
                 raise MemoryError("attention transient layout exceeds TP scratch")
             self.LM_MLP_NORM = scratch_base
             for label, address in (
+                ("lm.overlay_base", scratch_base),
                 ("lm.pre_norm", self.LM_PRE_NORM),
                 ("lm.q", self.LM_Q),
                 ("lm.k", self.LM_K),
@@ -595,29 +624,48 @@ class Qwen25OmniLMMixin:
             # Decode still needs one residual row. TP prefill keeps its
             # residual in the layer's ping-pong output buffer.
             self.LM_RESIDUAL = alloc(H, "lm.residual_decode")
-        self.LM_MLP_GATE = alloc(P * MLP, "lm.mlp_gate")
-        self.LM_MLP_UP = alloc(P * MLP, "lm.mlp_up")
-        if reuse_tp_scratch:
-            # eltwise_core_dram supports an output aliasing input A (the
-            # existing down accumulator already relies on it). Once gate*up
-            # is formed, UP is dead and becomes the down/reduce destination.
-            self.LM_MLP_MULT = self.LM_MLP_GATE
-            self.LM_MLP_DOWN = self.LM_MLP_UP
-            self._dram_addresses["lm.mlp_mult"] = self.LM_MLP_MULT
-            self._dram_addresses["lm.mlp_down"] = self.LM_MLP_DOWN
-        else:
-            self.LM_MLP_MULT = alloc(P * MLP, "lm.mlp_mult")
+        if reuse_tp_scratch and getattr(self, "multi_core", 1) > 1:
+            # GATE/UP/MULT become private per-engine lanes (allocated below,
+            # once LANE and mc_arena are in scope) instead of one shared
+            # [P, MLP] plane -- same reasoning as LM_MLP_DOWN_TP_PER_ENGINE:
+            # engine e is the sole writer AND reader of lane e throughout
+            # gate -> up -> mult -> down, so nothing about that chain needs
+            # the eight lanes to be slots of one contiguous shared object.
+            # DOWN can no longer alias UP's memory (UP no longer exists as
+            # one plane), so it gets its own real, always-shared allocation --
+            # reduce_add's row-split is a different partition of the data
+            # than GATE/UP's column split, genuinely incompatible with lane
+            # aliasing.
+            self.LM_MLP_GATE = None
+            self.LM_MLP_UP = None
+            self.LM_MLP_MULT = None
             self.LM_MLP_DOWN = alloc(P * H, "lm.mlp_down")
+        else:
+            self.LM_MLP_GATE = alloc(P * MLP, "lm.mlp_gate")
+            self.LM_MLP_UP = alloc(P * MLP, "lm.mlp_up")
+            if reuse_tp_scratch:
+                # eltwise_core_dram supports an output aliasing input A (the
+                # existing down accumulator already relies on it). Once gate*up
+                # is formed, UP is dead and becomes the down/reduce destination.
+                self.LM_MLP_MULT = self.LM_MLP_GATE
+                self.LM_MLP_DOWN = self.LM_MLP_UP
+                self._dram_addresses["lm.mlp_mult"] = self.LM_MLP_MULT
+                self._dram_addresses["lm.mlp_down"] = self.LM_MLP_DOWN
+            else:
+                self.LM_MLP_MULT = alloc(P * MLP, "lm.mlp_mult")
+                self.LM_MLP_DOWN = alloc(P * H, "lm.mlp_down")
         # K-lane split only: one lane's down partial before it is summed into
         # LM_MLP_DOWN.  GATE/UP/MULT need no extra space -- the lanes are a
         # re-interpretation of the same [P, MLP] planes as lanes x [P, LANE].
         if self._prefill_mlp_k_lanes() > 1:
             self.LM_MLP_DOWN_PART = (None if reuse_tp_scratch else
                                      alloc(P * H, "lm.mlp_down_part"))
-        if tp_ne and not reuse_tp_scratch:
-            # Tensor-parallel down contracts over the LANE dim, so every engine
-            # produces a FULL-width [P, H] partial and reduce_add sums all of
-            # them. The K-lane accumulator above is the single-engine analogue.
+        if tp_ne and not reuse_tp_scratch and getattr(self, "multi_core", 1) <= 1:
+            # Single-engine fallback only. Tensor-parallel down contracts over
+            # the LANE dim, so every engine produces a FULL-width [P, H] partial
+            # and reduce_add sums all of them; with real engines those partials
+            # are private (see LM_MLP_DOWN_TP_PER_ENGINE). The K-lane
+            # accumulator above is the single-engine analogue.
             self.LM_MLP_DOWN_TP = alloc(tp_ne * P * H, "lm.mlp_down_tp")
         self.LM_OUT_NORM = alloc(H, "lm.out_norm")
         self.LOGITS = alloc(d["VOCAB"], "lm.logits")
@@ -645,22 +693,28 @@ class Qwen25OmniLMMixin:
         BATCH = P
         n_scratch = (AHD + A) * A + BATCH * AHD
         self.LM_BIAS = alloc(n_bias, "lm.bias")
-        self.LM_SCRATCH = alloc(n_scratch, "lm.attn_scratch")
+        # CORE 0's ATTENTION SCRATCH COMES FROM CORE 0's PRIVATE TENSOR SLICE,
+        # not the shared pool. Every engine reserves an identically sized slice,
+        # but only workers 1..N-1 ever allocated from theirs -- core 0's slice
+        # sat entirely unused in all three stages while its scratch consumed
+        # n_scratch of the contended shared pool (34 MiB at a 4096 context).
+        # The shared pool is what binds first as the context grows (see
+        # MAX_CONTEXT_SIZE's note), so moving this buffer into space that is
+        # already reserved and otherwise dead costs nothing and buys shared
+        # headroom.
+        #
+        # "Private" here means core-0-owned, not single-writer: the sharded
+        # decode path has the workers write their V^T row slices into disjoint
+        # sub-ranges of this buffer. That was already true when it lived in the
+        # shared map, so the ownership discipline is unchanged.
+        n_core0_scratch = n_scratch
         self.KV_CONTEXT_CAPACITY = aligned_C
         self._lm_zero_sizes = dict(
-            kv=NL * KVH * aligned_C * AHD, hm=QH * self.LM_HEAD_ROWS * AHD,
+            kv=NL * KVH * aligned_C * AHD, kv_per_layer=KVH * aligned_C * AHD,
+            hm=QH * self.LM_HEAD_ROWS * AHD,
             bias=n_bias, scratch=n_scratch)
-        # Guard between the attention scratch and IDENTITY. The kernel's scratch
-        # extent is derived from its own arguments, so a sizing mistake here is
-        # silent -- it lands on whatever is allocated next. IDENTITY was that
-        # neighbour twice.
-        self._lm_scratch_guard = alloc(64 * 1024, "lm.scratch_guard")
         # Head-sharded prefill attention needs ONE PRIVATE scratch per engine:
         # heads run concurrently and each builds its own V.T / scores / scaled_q.
-        # Sized for the PREFILL shape, not the decode-worst-case LM_SCRATCH --
-        # 480 KiB against 8.6 MiB, and 8 copies of the latter would be 69 MiB
-        # for buffers prefill never fills.
-        self.LM_ATTN_SCRATCH_PER_ENGINE = [self.LM_SCRATCH]
         if getattr(self, "multi_core", 1) > 1:
             n_pref = (AHD + aligned_P) * aligned_P + aligned_P * AHD
             if self._decode_use_one_round_group_attention():
@@ -670,10 +724,79 @@ class Qwen25OmniLMMixin:
                 # matrix when the live decode batch is only one GQA group.
                 n_group_decode = AHD * aligned_C + G * aligned_C + G * AHD
                 n_pref = max(n_pref, n_group_decode)
+            # Checked here, not left to alloc_tensor's overflow: this scratch
+            # is the whole content of the private slice and it grows as P^2, so
+            # it is the first thing a context bump breaks. alloc_tensor would
+            # report the overflow but not the number to set, which is how the
+            # ceiling previously had to be found by bisection.
+            slice_bytes = self.mc_arena.tensor_bytes
+            # GATE/UP's private lane width. Same LANE every TP matmul call
+            # uses (_emit_prefill_mlp_tp derives it identically from
+            # sched.num_engines), computed here too because tensor init runs
+            # before any scheduler region is emitted.
+            if MLP % tp_ne:
+                raise ValueError(f"MLP={MLP} does not split {tp_ne} ways")
+            LANE = MLP // tp_ne
+            if LANE % UE_VECTOR_SIZE:
+                raise ValueError(f"MLP lane {LANE} is not {UE_VECTOR_SIZE}-aligned")
+            # Core 0 holds the decode-worst-case scratch as well as its prefill
+            # share, so the slice must fit the larger of the two, plus its guard,
+            # plus the full-width [P, H] down partial AND the two [P, LANE]
+            # gate/up lanes every engine now keeps privately. Checked as one
+            # sum so the error names the real number.
+            n_slice = max(n_pref, n_core0_scratch + 32 * 1024) + P * H + 2 * P * LANE
+            if n_slice * bpe > slice_bytes:
+                need = -(-(n_slice * bpe) // 2**20)
+                raise MemoryError(
+                    f"lm attn scratch needs {n_slice * bpe / 2**20:.2f} MiB "
+                    f"per engine at MAX_CONTEXT_SIZE={self.MAX_CONTEXT_SIZE} "
+                    f"(prefill {aligned_P} rows), but the private tensor slice is "
+                    f"{slice_bytes / 2**20:.2f} MiB. Raise "
+                    f"OMNI_PRIVATE_TENSOR_BYTES to at least {need} MiB and set "
+                    f"hardware.private_tensor_bytes to 0x{need * 2**20:X} in the "
+                    f"config -- but check MAX_CONTEXT_SIZE's note first: past "
+                    f"4096 the shared-pool gap binds before this slice does, and "
+                    f"growing the slice makes that gap smaller, not larger.")
+            self.LM_SCRATCH = self.mc_arena.alloc_tensor(
+                0, n_core0_scratch * bpe, "lm core0 attn scratch")
+            # Guard above core 0's scratch. The kernel's scratch extent is
+            # derived from its own arguments, so a sizing mistake is silent --
+            # it lands on whatever sits next. When this buffer was in the shared
+            # map that neighbour was LM_IDENTITY, twice. Here the guard plus the
+            # slice's unallocated tail absorb an overrun instead.
+            self._lm_scratch_guard = self.mc_arena.alloc_tensor(
+                0, 32 * 1024 * bpe, "lm core0 scratch guard")
+            self.LM_ATTN_SCRATCH_PER_ENGINE = [self.LM_SCRATCH]
             self.LM_ATTN_SCRATCH_PER_ENGINE.extend(
                 self.mc_arena.alloc_tensor(e, n_pref * bpe, "lm prefill attn scratch")
                 for e in range(1, self.multi_core))
             self._lm_worker_attn_scratch_elements = n_pref
+            # One FULL-WIDTH [P, H] down partial per engine, in that engine's own
+            # slice. Engine e is the sole writer; reduce_add takes an arbitrary
+            # address list, so the partials no longer need to be slots of one
+            # contiguous shared plane. Decode reuses the same bases for its
+            # single-row partials.
+            self.LM_MLP_DOWN_TP_PER_ENGINE = [
+                self.mc_arena.alloc_tensor(e, P * H * bpe, "lm mlp down partial")
+                for e in range(self.multi_core)]
+            # GATE/UP as private [P, LANE] lanes, one pair per engine. Same
+            # ownership argument as the down partial above: engine e is the
+            # only reader or writer of lane e from the gate/up matmul through
+            # the SiLU-multiply, so nothing here needs a shared address.
+            self.LM_MLP_GATE_PER_ENGINE = [
+                self.mc_arena.alloc_tensor(e, P * LANE * bpe, "lm mlp gate lane")
+                for e in range(self.multi_core)]
+            self.LM_MLP_UP_PER_ENGINE = [
+                self.mc_arena.alloc_tensor(e, P * LANE * bpe, "lm mlp up lane")
+                for e in range(self.multi_core)]
+            # eltwise_core_dram supports an output aliasing input A (the old
+            # shared-plane overlay relied on the same trick): once gate*up is
+            # formed, gate's lane is dead and becomes the multiply destination.
+            self.LM_MLP_MULT_PER_ENGINE = self.LM_MLP_GATE_PER_ENGINE
+        else:
+            self.LM_SCRATCH = alloc(n_scratch, "lm.attn_scratch")
+            self._lm_scratch_guard = alloc(64 * 1024, "lm.scratch_guard")
+            self.LM_ATTN_SCRATCH_PER_ENGINE = [self.LM_SCRATCH]
         self.LM_IDENTITY = alloc(UE_VECTOR_SIZE * UE_VECTOR_SIZE, "lm.identity")
         # One row per position; every head reads the same rows.
         self.LM_ROPE_PRE = alloc(P * 2 * AHD, "lm.rope_prefill")
@@ -681,10 +804,30 @@ class Qwen25OmniLMMixin:
 
         # KV cache: [layer][kv_head][C][AHD], head-major so decode attention
         # reads it in place -- no per-step marshalling.
+        #
+        # ONE ALLOCATION PER LAYER, not one allocation for the whole cache.
+        # At an 8192 context each of K and V is 224 MiB total -- past a 4096
+        # context that no longer fits as ONE shared object (alloc_shared's
+        # own contiguity rule: "a shared object must be contiguous inside ONE
+        # window"), the same constraint GATE/UP hit (see
+        # LM_MLP_GATE_PER_ENGINE). Splitting by LAYER, not by kv_head, is the
+        # cheap axis: within one layer's chunk the KVH heads stay exactly as
+        # contiguous as before (still KV_STRIDE_HEAD apart), so every
+        # multi-head kernel call that reads/writes a whole layer's heads in
+        # one shot (bf16_permute_dram_core's write_grouped prefill store, the
+        # per-head RoPE loop) is UNCHANGED -- only the per-layer BASE address
+        # becomes a list lookup instead of cache_base + layer*KV_STRIDE_LAYER.
+        # Splitting by kv_head instead would have quartered the object count
+        # but forced that one grouped prefill store into four separate calls
+        # per layer (real, avoidable DMA-count growth); splitting by layer
+        # costs nothing at the kernel-call level, only at zero-fill time
+        # (_base_lm_reset_attention_state loops 28 calls instead of 1, a
+        # one-time host-side cost, not a per-token or per-layer one).
         self.KV_STRIDE_HEAD = aligned_C * AHD * bpe
-        self.KV_STRIDE_LAYER = KVH * self.KV_STRIDE_HEAD
-        self.LM_K_CACHE = alloc(NL * KVH * aligned_C * AHD, "lm.k_cache")
-        self.LM_V_CACHE = alloc(NL * KVH * aligned_C * AHD, "lm.v_cache")
+        self.LM_K_CACHE_PER_LAYER = [
+            alloc(KVH * aligned_C * AHD, f"lm.k_cache_L{li}") for li in range(NL)]
+        self.LM_V_CACHE_PER_LAYER = [
+            alloc(KVH * aligned_C * AHD, f"lm.v_cache_L{li}") for li in range(NL)]
 
         end = self.get_tensor_dram_addr()
         if end > self.TENSOR_LIMIT:
@@ -715,9 +858,16 @@ class Qwen25OmniLMMixin:
         gemma4_e2b does the same before every prefill, for the same reason.
         """
         n = self._lm_zero_sizes
-        kv = torch.zeros(n["kv"], dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.LM_K_CACHE, kv)
-        self.dma_to_accelerator_memory(self.LM_V_CACHE, kv)
+        # One zero-fill DMA per layer, not one covering the whole cache: the
+        # cache itself is now one allocation per layer (see
+        # LM_K_CACHE_PER_LAYER), not one contiguous span. This runs once at
+        # load time, not per token or per layer during inference, so 28x the
+        # call count here is a fixed, one-time host-side cost.
+        kv_layer = torch.zeros(n["kv_per_layer"], dtype=torch.bfloat16)
+        for base in self.LM_K_CACHE_PER_LAYER:
+            self.dma_to_accelerator_memory(base, kv_layer)
+        for base in self.LM_V_CACHE_PER_LAYER:
+            self.dma_to_accelerator_memory(base, kv_layer)
         hm = torch.zeros(n["hm"], dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LM_Q_HM, hm)
         self.dma_to_accelerator_memory(self.LM_ATTN_HM, hm)
@@ -733,7 +883,7 @@ class Qwen25OmniLMMixin:
         self.dma_to_accelerator_memory(
             self.LM_IDENTITY, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16))
         self._loud(f"  [LM] attention state zeroed "
-                   f"(KV {2 * kv.numel() * 2 / 2**20:.0f} MiB + scratch + bias)")
+                   f"(KV {2 * n['kv'] * 2 / 2**20:.0f} MiB + scratch + bias)")
 
     def _ensure_decode_shards(self, sched, layer_size: int) -> dict:
         """Build the complete decode shard set atomically."""
@@ -1145,8 +1295,15 @@ class Qwen25OmniLMMixin:
             dec_sched.join()
         return flops
 
-    def _kv_addr(self, cache_base: int, layer: int, kv_head: int) -> int:
-        return cache_base + layer * self.KV_STRIDE_LAYER + kv_head * self.KV_STRIDE_HEAD
+    def _kv_addr(self, per_layer_cache: list, layer: int, kv_head: int) -> int:
+        """``per_layer_cache`` is LM_K_CACHE_PER_LAYER or LM_V_CACHE_PER_LAYER.
+
+        Only ever called with ``kv_head=0`` (every caller adds its own
+        ``h * KV_STRIDE_HEAD`` afterward for the other heads) -- kept as a
+        parameter, not dropped, so a within-layer head offset here would be
+        additive and obviously wrong twice, not silently dropped once.
+        """
+        return per_layer_cache[layer] + kv_head * self.KV_STRIDE_HEAD
 
     def _emit_layer(self, li: int, M: int, *, decode: bool, m_reg: int,
                     aligned_kv: int, in_addr: int, out_addr: int,
@@ -1403,8 +1560,8 @@ class Qwen25OmniLMMixin:
         # K/V straight into the cache at their head planes. In prefill the
         # permute writes rows 0..M-1 of each head and leaves the rest of the
         # C-row plane untouched, which is exactly what group_stride_rows is for.
-        k_base = self._kv_addr(self.LM_K_CACHE, li, 0)
-        v_base = self._kv_addr(self.LM_V_CACHE, li, 0)
+        k_base = self._kv_addr(self.LM_K_CACHE_PER_LAYER, li, 0)
+        v_base = self._kv_addr(self.LM_V_CACHE_PER_LAYER, li, 0)
         if decode:
             # Rotate K BEFORE storing: the cache row address is computed at
             # runtime from gf_seq_len, so it cannot be a RoPE operand.
@@ -1838,10 +1995,15 @@ class Qwen25OmniLMMixin:
             ckpt(f"L{li}:mlp_norm", flops)
 
             # gate and up read the SAME post-norm row and write disjoint
-            # buffers, so one rendezvous covers both.
-            gu = (("gate", self.LM_MLP_GATE, True), ("up", self.LM_MLP_UP, False))
-            gu_ops = [(mlp_sw[t], out, self.LM_MLP_NORM, None, silu)
-                      for t, out, silu in gu if mlp_sw[t] is not None]
+            # buffers, so one rendezvous covers both. GATE/UP are private
+            # per-engine lanes (LM_MLP_GATE_PER_ENGINE/LM_MLP_UP_PER_ENGINE),
+            # not slots of one shared plane, so each engine's shard writes
+            # straight to its own lane base -- no col_offset to add, unlike
+            # q/k/v/o's _emit_dec_shard (kept as-is for those; it still
+            # writes into ONE shared buffer at a per-shard column offset).
+            import multi_engine_shard as mes
+            gu = (("gate", self.LM_MLP_GATE_PER_ENGINE, True),
+                  ("up", self.LM_MLP_UP_PER_ENGINE, False))
 
             # The SwiGLU product folds INTO that round rather than following
             # it: engine e produced gate[e] and up[e] over the SAME columns, so
@@ -1851,37 +2013,46 @@ class Qwen25OmniLMMixin:
             # capping the MLP speedup.
             fold_mul = (mlp_sw["gate"] is not None and mlp_sw["up"] is not None
                         and len(mlp_sw["gate"].shards) == len(mlp_sw["up"].shards))
+            if not fold_mul:
+                # Every private-lane engine stages gate/up/down identically
+                # (_stage_private_lm_projection's uniform N-shard split), so
+                # this never actually fires for Omni; the full-width fallback
+                # it used to take needed GATE/UP as one shared [P, MLP] plane,
+                # which no longer exists.
+                raise RuntimeError(
+                    "decode gate/up shard counts differ; the private-lane "
+                    "MLP path requires identical N-shard staging for both")
 
-            def _mul_slice(ue, e):
-                sh = mlp_sw["gate"].shard(e)
-                off = sh.col_offset * bpe
-                return ue.eltwise_core_dram(
-                    M=1, N=sh.cols,
-                    dram_a=self.LM_MLP_GATE + off, dram_b=self.LM_MLP_UP + off,
-                    dram_out=self.LM_MLP_MULT + off,
-                    mode=UE_MODE.ELTWISE_MUL) or 0
-
-            def _master_gu():
+            def _emit_gu_engine(ue, e):
                 f = 0
-                for t, out, silu in gu:
+                for t, outs in (("gate", self.LM_MLP_GATE_PER_ENGINE),
+                                ("up", self.LM_MLP_UP_PER_ENGINE)):
                     sw = mlp_sw[t]
-                    if sw is None:
-                        f += mm(H, MLP, self.LM_MLP_NORM, t, out, silu=silu)
+                    sh = sw.shard(e)
+                    kw = dict(M=1, K=sw.K, N=sh.cols, A_DRAM_ADDR=self.LM_MLP_NORM,
+                              B_DRAM_ADDR=sh.weight_addr, OUTPUT_DRAM_ADDR=outs[e])
+                    if t == "gate":
+                        kw["silu_enable"] = True
+                    if sw.data_type is mes.DENSE_BF16:
+                        f += ue.matmat_mul_core(**kw) or 0
                     else:
-                        f += self._emit_dec_shard(self, sw, 0, out,
-                                                  self.LM_MLP_NORM, None, silu)
-                        f += dec_sched.worker_flops(sw)
-                if fold_mul:
-                    f += _mul_slice(self, 0)
+                        kw.update(SCALE_DRAM_ADDR=sh.scale_addr, data_type=TYPE.IF4)
+                        f += ue.quantized_matmat_core(**kw) or 0
+                f += ue.eltwise_core_dram(
+                    M=1, N=mlp_sw["gate"].shard(e).cols,
+                    dram_a=self.LM_MLP_GATE_PER_ENGINE[e],
+                    dram_b=self.LM_MLP_UP_PER_ENGINE[e],
+                    dram_out=self.LM_MLP_MULT_PER_ENGINE[e],
+                    mode=UE_MODE.ELTWISE_MUL) or 0
                 return f
 
-            flops += self._dec_round(dec_sched, gu_ops, _master_gu,
-                                     worker_extra=_mul_slice if fold_mul else None)
-            if not fold_mul:
-                flops += self.eltwise_core_dram(
-                    M=M, N=MLP, dram_a=self.LM_MLP_GATE, dram_b=self.LM_MLP_UP,
-                    dram_out=self.LM_MLP_MULT, mode=UE_MODE.ELTWISE_MUL,
-                    gpr_M_reg=m_reg) or 0
+            dec_sched.release()
+            flops += _emit_gu_engine(self, 0)
+            for e in dec_sched.worker_indices():
+                dec_sched.begin_worker_round(e)
+                flops += _emit_gu_engine(dec_sched.engines[e], e)
+                dec_sched.end_worker_round(e)
+            dec_sched.join()
 
             ckpt(f"L{li}:mlp_gate_up", flops)
             # Gate/up already partition MLP over N; those eight lanes are
@@ -1893,10 +2064,11 @@ class Qwen25OmniLMMixin:
             down_weights = la["down_tp"]
             if len(down_weights) != dec_sched.num_engines:
                 raise RuntimeError("decode down requires one private K shard per core")
-            # The prefill TP scratch is dead after gate/up in decode. Use one
-            # full-width row per engine, with the original prefill-sized plane
-            # stride to keep all eight partials in disjoint reserved space.
-            partials = [self.LM_MLP_DOWN_TP + e * self.PREFILL_MAX_SEQ_LEN * H * bpe
+            # One row at the base of each engine's own private down partial.
+            # These were slots of a shared plane strided by PREFILL_MAX_SEQ_LEN
+            # rows; now each engine writes row 0 of its own buffer, which is
+            # disjoint by construction rather than by arithmetic.
+            partials = [self.LM_MLP_DOWN_TP_PER_ENGINE[e]
                         for e in range(dec_sched.num_engines)]
             down_flops = [0]
 
@@ -1907,7 +2079,7 @@ class Qwen25OmniLMMixin:
                 data, scale = down_weights[e]
                 down_flops[0] += ctx.ue.quantized_matmat_core(
                     M=1, K=lane, N=H,
-                    A_DRAM_ADDR=self.LM_MLP_MULT + e * lane * bpe,
+                    A_DRAM_ADDR=self.LM_MLP_MULT_PER_ENGINE[e],
                     B_DRAM_ADDR=data, SCALE_DRAM_ADDR=scale,
                     data_type=TYPE.IF4, OUTPUT_DRAM_ADDR=partials[e]) or 0
 
@@ -2125,28 +2297,54 @@ class Qwen25OmniLMMixin:
         self._wait_lm_queue(self, timeout_s, "profile tail")
         return results
 
+    def _prefill_timeout_s(self) -> float:
+        """How long to let a prefill run before calling it hung.
+
+        MUST SCALE WITH THE PREFILL LENGTH. This was a flat 180 s, which was
+        ample while the context was 2048-2752 (115 s of prefill at the measured
+        rate) and silently became a live bug the moment the context grew:
+        prefill runs at 18-25 input tokens/s (benchmark.md), so 4096 rows need
+        164-228 s and 8192 need 328-455 s. A 3799-token prefill duly tripped the
+        180 s wait after completing normally on the board -- reported as
+        "prefill master is still busy", which reads exactly like a hang and is
+        not one.
+
+        PREFILL_MAX_SEQ_LEN, not the live row count: the bound has to cover the
+        longest prompt this build accepts. 15 tok/s is the measured floor on
+        faster builds. Also enforce 1.4 times the theoretical minimum from
+        this compiled program's FLOPs and the board's reported clock/peak;
+        otherwise a 200 MHz build can time out before completion is physically
+        possible. The 180 s floor keeps short prefills on the old bound.
+        """
+        rows = int(getattr(self, "PREFILL_MAX_SEQ_LEN", 0) or 0)
+        peak_gflops = self.vis_peak_gflops()
+        work_gflop = float(getattr(self, "_prefill_flops", 0)) / 1e9
+        peak_floor_s = work_gflop / peak_gflops if peak_gflops > 0 else 0.0
+        return max(180.0, rows / 15.0, 1.4 * peak_floor_s)
+
     @staticmethod
     def _wait_lm_queue(engine, timeout_s: float, what: str,
                        poll_interval_s: float | None = None) -> None:
         if not math.isfinite(float(timeout_s)) or timeout_s <= 0:
             raise ValueError(f"timeout_s must be finite and positive, got {timeout_s!r}")
         if poll_interval_s is None:
-            engine.wait_queue(float(timeout_s))
-        else:
-            if (
-                not math.isfinite(float(poll_interval_s))
-                or poll_interval_s <= 0
-            ):
-                raise ValueError(
-                    "poll_interval_s must be finite and positive, got "
-                    f"{poll_interval_s!r}"
-                )
-            engine.wait_queue(
-                timeout_seconds=float(timeout_s),
-                poll_interval_seconds=float(poll_interval_s),
+            poll_interval_s = 0.001
+        if not math.isfinite(float(poll_interval_s)) or poll_interval_s <= 0:
+            raise ValueError(
+                "poll_interval_s must be finite and positive, got "
+                f"{poll_interval_s!r}"
             )
-        if engine.is_queue_busy():
-            raise TimeoutError(f"{what} is still busy after {timeout_s:.1f}s")
+        start = time.monotonic()
+        next_report = 5.0
+        while engine.is_queue_busy():
+            elapsed = time.monotonic() - start
+            if elapsed >= timeout_s:
+                raise TimeoutError(f"{what} is still busy after {timeout_s:.1f}s")
+            if elapsed >= next_report:
+                print(f"  [FPGA wait] {what}: {elapsed:.1f}s CPU elapsed / "
+                      f"{timeout_s:.1f}s timeout (core busy)", flush=True)
+                next_report += 5.0
+            time.sleep(min(poll_interval_s, timeout_s - elapsed))
 
     def _run_lm_compile_transaction(self, stage: str, compiler):
         """Run a capture compiler without leaking partial state on failure."""
@@ -2661,11 +2859,13 @@ class Qwen25OmniLMMixin:
                 raise RuntimeError("profiled prefill needs compile_prefill(profile=True)")
             if sched is not None:
                 sched.start_workers(worker_addrs)
-            self._prefill_profile = self._run_checkpointed(addr, cps, 180.0)
+            self._prefill_profile = self._run_checkpointed(
+                addr, cps, self._prefill_timeout_s())
             for idx, w in enumerate(
                 sched.workers if sched is not None else [], start=1
             ):
-                self._wait_lm_queue(w, 180.0, f"prefill worker {idx}")
+                self._wait_lm_queue(w, self._prefill_timeout_s(),
+                                    f"prefill worker {idx}")
             us = sum(r[1] for r in self._prefill_profile) * 1e3
         else:
             # Workers first: each parks on its first rendezvous until the master
@@ -2677,11 +2877,13 @@ class Qwen25OmniLMMixin:
                 sched.start_workers(worker_addrs)
             if sched is None or not sched.host_segmented:
                 self.start_execute_from_dram(addr)
-                self._wait_lm_queue(self, 180.0, "prefill master")
+                self._wait_lm_queue(self, self._prefill_timeout_s(),
+                                    "prefill master")
                 for idx, w in enumerate(
                     sched.workers if sched is not None else [], start=1
                 ):
-                    self._wait_lm_queue(w, 180.0, f"prefill worker {idx}")
+                    self._wait_lm_queue(w, self._prefill_timeout_s(),
+                                    f"prefill worker {idx}")
                 us = self.report_latency_in_us()
         # Expose the prompt length only after every engine has completed the
         # cache population. Failed uploads or launches leave host state at the
