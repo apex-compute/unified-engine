@@ -2,8 +2,8 @@
 """Qwen2.5-Omni-7B Thinker on the eight-engine, 8-GiB Alveo map.
 
 This entry point implements text, image, and audio understanding with text
-generation.  The speech Talker/token2wav path is deliberately not part of this
-binary. Vision, audio, and LM weights time-share one params window; encoder
+generation. For --speak, host Talker generation overlaps FPGA text decode;
+Token2Wav then renders the completed codec stream. Vision, audio, and LM weights time-share one params window; encoder
 outputs are staged through the host strictly for DMA/layout before the next
 stage reclaims that window. No learned arithmetic executes there.
 """
@@ -19,6 +19,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from typing import Any
@@ -128,6 +129,18 @@ Qwen25OmniVisionMixin = _vision_mod.Qwen25OmniVisionMixin
 Qwen25OmniAudioMixin = _audio_mod.Qwen25OmniAudioMixin
 build_multimodal_positions = _position_mod.build_multimodal_positions
 ProgramBundle = _program_mod.ProgramBundle
+
+# Speech output is optional: the Talker/Token2Wav weights live in the HF
+# checkpoint, not in params.bin, so a tree without them must still run text.
+try:
+    _talker_mod = _load_sibling("qwen2_5_omni_7b_talker", "qwen2.5_omni_7b_talker.py")
+except Exception:                                    # pragma: no cover
+    _talker_mod = None
+try:
+    _talker_fpga_mod = _load_sibling(
+        "qwen2_5_omni_7b_talker_fpga", "qwen2.5_omni_7b_talker_fpga.py")
+except Exception:                                    # pragma: no cover
+    _talker_fpga_mod = None
 
 
 REQUIRED_ENGINES = 8
@@ -393,6 +406,16 @@ OMNI_PRIVATE_TENSOR_BYTES = 264 * 2**20
 # inside 200 MiB.
 OMNI_PRIVATE_RESERVE_BYTES = 464 * 2**20
 
+# FPGA speech keeps the Thinker's private decode shards resident while adding
+# 88.3 MiB of Talker column shards per busy worker. A 544 MiB reserve covers
+# both measured footprints (447.8 + 88.3) with 7.9 MiB left. The Talker
+# selection also narrows the Thinker context to 6144: its worst private tensor
+# requirement then falls below 184 MiB, preserving a 200 MiB shared band and
+# the 32 MiB ISA guard. Host speech and text-only runs retain the 8192 map.
+FPGA_SPEECH_CONTEXT_SIZE = 6144
+FPGA_SPEECH_PRIVATE_TENSOR_BYTES = 184 * 2**20
+FPGA_SPEECH_PRIVATE_RESERVE_BYTES = 544 * 2**20
+
 # THERE USED TO BE A SECOND UNSCATTERABLE OBJECT HERE: a 280 MiB "dedicated
 # extent" (OMNI_LM_HEAD_BYTES) holding one contiguous, unsharded copy of the
 # untied LM head, loaded via a normal device DMA. It turned out to have
@@ -426,6 +449,12 @@ DEFAULT_AUDIO = os.path.normpath(
     os.path.join(PROJECT_ROOT, "test_samples", "apex.wav")
 )
 RUN_LOCK_PATH = "/tmp/apexcompute-qwen2.5-omni-7b.lock"
+DEFAULT_SPEAKER = "Chelsie"
+SPEECH_SYSTEM_PROMPT = (
+    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+    "capable of perceiving auditory and visual inputs, as well as generating "
+    "text and speech."
+)
 
 # Every file that can change captured Omni instructions is bound into the
 # programs artifact identity.  Paths are explicit so generated checkpoints,
@@ -490,7 +519,8 @@ class Qwen25OmniUnifiedEngine(
 
     def __init__(self, script_dir: str | None = None, multi_core: int = 8,
                  fpga_build: int | None = None,
-                 vision_res: str = DEFAULT_VISION_RES):
+                 vision_res: str = DEFAULT_VISION_RES,
+                 fpga_talker: bool = False):
         if multi_core != REQUIRED_ENGINES:
             raise ValueError(
                 f"Qwen2.5-Omni-7B requires exactly {REQUIRED_ENGINES} engines, "
@@ -512,6 +542,14 @@ class Qwen25OmniUnifiedEngine(
             REQUIRED_ENGINES, OMNI_WINDOW_BYTES, "Qwen2.5-Omni-7B")
 
         self.multi_core = multi_core
+        self.fpga_talker = bool(fpga_talker)
+        self._private_tensor_bytes = (
+            FPGA_SPEECH_PRIVATE_TENSOR_BYTES if fpga_talker
+            else OMNI_PRIVATE_TENSOR_BYTES)
+        self._private_reserve_bytes = (
+            FPGA_SPEECH_PRIVATE_RESERVE_BYTES if fpga_talker
+            else OMNI_PRIVATE_RESERVE_BYTES)
+        self.speak_as: str | None = None      # set before weight/tensor init
         self.fpga_build = None if fpga_build is None else int(fpga_build)
         self._multi_core_schedulers: dict[str, MultiEngineScheduler] = {}
         self._worker_isa_used: dict[int, dict[str, int]] = {}
@@ -559,7 +597,7 @@ class Qwen25OmniUnifiedEngine(
             REQUIRED_ENGINES,
             windows=[(base, OMNI_WINDOW_BYTES) for base in expected_bases],
             isa_bytes=OMNI_ISA_BYTES,
-            tensor_bytes=OMNI_PRIVATE_TENSOR_BYTES,
+            tensor_bytes=self._private_tensor_bytes,
             isa_guard_bytes=OMNI_ISA_GUARD_BYTES,
             verbose=True,
         )
@@ -594,7 +632,7 @@ class Qwen25OmniUnifiedEngine(
 
         # PRIVATE SPACE IS CLAIMED BEFORE ANY SHARED BYTE IS LENT. The shard
         # sizes are known from the manifest; the pool is whatever is left.
-        self.mc_arena.reserve_private(OMNI_PRIVATE_RESERVE_BYTES)
+        self.mc_arena.reserve_private(self._private_reserve_bytes)
 
         # TENSORS ARE CARVED PER BUFFER, NOT FROM ONE EXTENT. Only an individual
         # buffer has to be contiguous -- the KV cache, an [M, N] activation
@@ -653,10 +691,11 @@ class Qwen25OmniUnifiedEngine(
         self.bytes_per_element = int(fi["bytes_per_element"])
         self.LAYER_SIZE = int(fi["num_layers"])
         self.EMBEDDING_ELEMENTS = int(fi["embedding_vocab"])
-        self.MAX_CONTEXT_SIZE = MAX_CONTEXT_SIZE
-        self.PREFILL_MAX_SEQ_LEN = PREFILL_MAX_SEQ_LEN
-        model["max_context_size"] = MAX_CONTEXT_SIZE
-        model["prefill_max_seq_len"] = PREFILL_MAX_SEQ_LEN
+        self.MAX_CONTEXT_SIZE = (FPGA_SPEECH_CONTEXT_SIZE if fpga_talker
+                                 else MAX_CONTEXT_SIZE)
+        self.PREFILL_MAX_SEQ_LEN = self.MAX_CONTEXT_SIZE
+        model["max_context_size"] = self.MAX_CONTEXT_SIZE
+        model["prefill_max_seq_len"] = self.PREFILL_MAX_SEQ_LEN
 
         fixed = self._cfg["fixed_isa_regs"]
         self.TMP_REG = int(fixed["TMP_REG"])
@@ -670,6 +709,10 @@ class Qwen25OmniUnifiedEngine(
 
         self._end_of_turn_token_id = int(model["end_of_turn_token_id"])
         self.causal_mask_upper = False
+
+    def _export_prefill_hidden(self) -> bool:
+        """Speech needs the Thinker's final hidden for every prompt row."""
+        return self.speak_as is not None
 
     # -- params allocation against the shared pool ---------------------------
     #
@@ -860,7 +903,7 @@ class Qwen25OmniUnifiedEngine(
             raise AssertionError("PrivateArena did not produce 1-GiB windows")
         expected_weight_bytes = (OMNI_WINDOW_BYTES - OMNI_ISA_BYTES
                                  - OMNI_ISA_GUARD_BYTES
-                                 - OMNI_PRIVATE_TENSOR_BYTES)
+                                 - self._private_tensor_bytes)
         if self.mc_arena.weight_bytes() != expected_weight_bytes:
             raise AssertionError(
                 f"each engine must have {expected_weight_bytes // 2**20} MiB for its "
@@ -871,7 +914,7 @@ class Qwen25OmniUnifiedEngine(
         # OMNI_PRIVATE_TENSOR_BYTES moves it (264 MiB today, 64 MiB before
         # the 8192-context private-lane GATE/UP/scratch growth).
         expected_tensor_base = (OMNI_WINDOW_BYTES - OMNI_ISA_BYTES
-                                - OMNI_ISA_GUARD_BYTES - OMNI_PRIVATE_TENSOR_BYTES)
+                                - OMNI_ISA_GUARD_BYTES - self._private_tensor_bytes)
         for i in range(REQUIRED_ENGINES):
             region = self.mc_arena.region(i)
             base = region.base
@@ -1972,6 +2015,7 @@ class Qwen25OmniUnifiedEngine(
                 "is how much of the issued work the model needed.",
                 "",
             ]
+
             lines += self._stage_table(rows)
             lines.append("")
 
@@ -2083,6 +2127,69 @@ class Qwen25OmniUnifiedEngine(
                 f"- **End-to-end (CPU timer):** {wall:.2f} s",
                 "",
             ]
+
+        speech = getattr(self, "_speech_result", None)
+        if speech:
+            codec_tokens = int(speech["codec_tokens"])
+            talker_s = float(speech["talker_wall_s"])
+            token2wav_s = float(speech["token2wav_wall_s"])
+            audio_s = float(speech["seconds"])
+            talker_hw = (f"{float(speech['talker_hw_us']) / 1e3:.1f} ms"
+                         if speech.get("talker_hw_us") is not None else "—")
+            token2wav_hw = (f"{float(speech['token2wav_hw_us']) / 1e3:.1f} ms"
+                            if speech.get("token2wav_hw_us") is not None else "—")
+            lines += [
+                "## Speech output",
+                "",
+                "Talker and Token2Wav are measured separately by CPU timers. "
+                "The device column identifies where each stage ran; `—` means "
+                "no FPGA HW counter applies to that stage.",
+                "",
+                "| Stage | Device | Output | HW counter | CPU wall | Rate |",
+                "| :--- | :--- | ---: | ---: | ---: | ---: |",
+                f"| Talker | {speech['talker_device']} | {codec_tokens} codec tokens "
+                f"| {talker_hw} | {talker_s:.1f} s | "
+                f"{codec_tokens / talker_s if talker_s else 0.0:.1f} codec tok/s |",
+                f"| Token2Wav | {speech['token2wav_device']} | {audio_s:.2f} s audio "
+                f"| {token2wav_hw} | {token2wav_s:.1f} s | "
+                f"{audio_s / token2wav_s if token2wav_s else 0.0:.2f}× real time |",
+                "",
+                f"- **Decode/Talker overlap (CPU timer):** "
+                f"{float(speech.get('decode_talker_overlap_s', 0.0)):.2f} s",
+                f"- **Speaker:** {speech['speaker']}",
+                f"- **WAV:** `{os.path.basename(speech['wav'])}` "
+                f"({audio_s:.2f} s at {_talker_mod.SAMPLE_RATE} Hz)",
+                "",
+            ]
+            if speech.get("talker_prefix_wall_s") is not None:
+                lines += [
+                    "FPGA Talker runs after Thinker decode because both own the same "
+                    "eight queues; the 0 s overlap is intentional. Talker time "
+                    "includes conditioning over the prompt before codec generation. "
+                    "One-time weight staging and program compilation are reported "
+                    "separately from active Talker execution.",
+                    "",
+                    f"- **FPGA speech context budget:** "
+                    f"{self.MAX_CONTEXT_SIZE} Thinker tokens; "
+                    f"{self.mc_arena.tensor_bytes / 2**20:.0f} MiB private tensors "
+                    f"and {self._private_reserve_bytes / 2**20:.0f} MiB private "
+                    "weight reserve per engine",
+                    f"- **Talker setup (readback, weights, compilation):** "
+                    f"{float(speech['talker_setup_wall_s']):.2f} s CPU",
+                    f"- **Talker prefix:** {float(speech['talker_prefix_wall_s']):.2f} s "
+                    f"CPU, {float(speech['talker_prefix_hw_us']) / 1e6:.2f} s "
+                    "core-0 HW counter",
+                    f"- **Talker codec decode:** "
+                    f"{float(speech['talker_decode_wall_s']):.2f} s CPU, "
+                    f"{float(speech['talker_decode_hw_us']) / 1e6:.2f} s "
+                    "core-0 HW counter",
+                    f"- **Active codec decode speed:** "
+                    f"{codec_tokens / float(speech['talker_decode_wall_s']):.1f} "
+                    "codec tok/s (CPU timer)",
+                    f"- **Talker total including setup:** "
+                    f"{float(speech['talker_total_wall_s']):.2f} s CPU",
+                    "",
+                ]
 
         if profiles:
             lines += [
@@ -2575,8 +2682,15 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
     def _assemble(prompt_text: str):
         body = [item for item in content if item["type"] != "text"]
         body.append({"type": "text", "text": prompt_text})
+        messages = []
+        if args.speak is not None:
+            # Qwen's Talker is conditioned on the Thinker's system prompt.
+            # The generic chat-template default yields incoherent speech even
+            # when the Thinker's decoded text is correct.
+            messages.append({"role": "system", "content": SPEECH_SYSTEM_PROMPT})
+        messages.append({"role": "user", "content": body})
         text = processor.apply_chat_template(
-            [{"role": "user", "content": body}],
+            messages,
             tokenize=False, add_generation_prompt=True)
         call_kwargs: dict[str, Any] = {
             "text": text, "padding": True, "return_tensors": "pt",
@@ -2728,6 +2842,288 @@ def _run_audio(ue: Qwen25OmniUnifiedEngine, processed):
     return embeddings, metadata
 
 
+def _synthesize_speech(ue, args, cfg: dict, prompt_tokens: list[int]) -> dict:
+    """Thinker state off the accelerator -> Talker -> Token2Wav -> .wav.
+
+    Prefill processes all prompt tokens except the seed. Decode's first step
+    consumes that seed, so its hidden completes the prompt hidden stream;
+    subsequent captured steps are the generated reply's hidden stream.
+    """
+    import torch as _torch
+
+    steps = ue._speech_steps or []
+    if not steps:
+        raise RuntimeError("--speak: no decode steps were captured")
+    if steps[0][0] != prompt_tokens[-1]:
+        raise RuntimeError("--speak: first captured token is not the prompt seed")
+    reply_steps = steps[1:]
+    if not reply_steps:
+        raise RuntimeError("--speak: decoder produced no reply tokens to speak")
+    H = int(ue.vector_length)
+    T = len(prompt_tokens)
+    model_dir = os.path.join(SCRIPT_DIR, cfg["paths"]["hf_model_dir"])
+
+    t0 = time.perf_counter()
+    prefill_rows = ue.dma_from_accelerator_memory(
+        ue.LM_PREFILL_NORM, (T - 1, H)).float()
+    prefill_hidden = _torch.cat((prefill_rows, steps[0][1].float()), dim=0).unsqueeze(0)
+    step_hidden = _torch.cat([h.float() for _, h in reply_steps], dim=0).unsqueeze(0)
+    readback_s = time.perf_counter() - t0
+
+    emb = _talker_mod.ThinkerEmbeddings(model_dir)
+    media = {int(cfg["tokens"]["image_token_id"]), int(cfg["tokens"]["audio_token_id"]),
+             int(cfg["tokens"]["video_token_id"])}
+    prefill_embeds = emb.rows(
+        prompt_tokens, zero_at=[i for i, t in enumerate(prompt_tokens) if t in media])
+    step_embeds = emb.rows([t for t, _ in reply_steps])
+
+    hs = _talker_mod.HostSpeech(model_dir, speaker=args.speak)
+    t1 = time.perf_counter()
+    wav = hs.speak(
+        input_ids=_torch.tensor([prompt_tokens], dtype=_torch.long),
+        prefill_hidden=prefill_hidden, prefill_embeds=prefill_embeds,
+        step_hidden=step_hidden, step_embeds=step_embeds,
+        first_reply_token=reply_steps[0][0],
+        embed_lookup=lambda ids: emb.rows(ids.flatten().tolist()),
+    )
+    speak_s = time.perf_counter() - t1
+    w = wav[0] if isinstance(wav, (tuple, list)) else wav
+    out = os.path.join(SCRIPT_DIR, run_summary_filename(args).replace(".md", ".wav"))
+    _talker_mod.write_wav(out, w)
+    n = int(w.reshape(-1).shape[0])
+    print(f"\n[Speak] {args.speak}: {n} samples = "
+          f"{n / _talker_mod.SAMPLE_RATE:.2f}s @ {_talker_mod.SAMPLE_RATE} Hz "
+          f"-> {os.path.basename(out)}  (FPGA readback {readback_s:.2f}s, "
+          f"host talker+vocoder {speak_s:.1f}s)")
+    return {"speaker": args.speak, "wav": out, "samples": n,
+            "seconds": n / _talker_mod.SAMPLE_RATE,
+            "readback_s": readback_s, "host_s": speak_s,
+            **(hs.last_metrics or {})}
+
+
+def _synthesize_speech_fpga(ue, args, cfg: dict, prompt_tokens: list[int]) -> dict:
+    """Run all Talker matmuls on eight engines, then vocode codec IDs on CPU.
+
+    The same eight queues serve Thinker and Talker, so the Talker starts after
+    Thinker decode has finished. This keeps ISA/flag ownership unambiguous and
+    lets the two stages reuse their shared tensor/weight pool safely.
+    """
+    import torch as _torch
+    from transformers import Qwen2_5OmniConfig, Qwen2_5OmniToken2WavModel
+
+    steps = ue._speech_steps or []
+    if not steps or steps[0][0] != prompt_tokens[-1]:
+        raise RuntimeError("FPGA Talker needs the Thinker seed hidden row")
+    replies = steps[1:]
+    if not replies:
+        raise RuntimeError("FPGA Talker needs at least one reply token")
+    model_dir = os.path.join(SCRIPT_DIR, cfg["paths"]["hf_model_dir"])
+    speech_cfg = Qwen2_5OmniConfig.from_pretrained(model_dir).talker_config
+    spk = _torch.load(os.path.join(model_dir, "spk_dict.pt"),
+                      map_location="cpu", weights_only=False)[args.speak]
+    bos = int(spk["bos_token"])
+
+    started = time.perf_counter()
+    H, T = int(ue.vector_length), len(prompt_tokens)
+    prefill_rows = ue.dma_from_accelerator_memory(
+        ue.LM_PREFILL_NORM, (T - 1, H)).float()
+    hidden = _torch.cat((prefill_rows, steps[0][1].float().reshape(1, H)), dim=0)
+    embed = _talker_mod.ThinkerEmbeddings(model_dir)
+    media = {int(cfg["tokens"]["image_token_id"]),
+             int(cfg["tokens"]["audio_token_id"]),
+             int(cfg["tokens"]["video_token_id"])}
+    prefill_embeds = embed.rows(
+        prompt_tokens,
+        zero_at=[i for i, token in enumerate(prompt_tokens) if token in media],
+    ).reshape(T, H)
+    prefix = [row.to(_torch.bfloat16) for row in hidden + prefill_embeds.float()]
+    prefix.append(embed.rows([bos]).reshape(H).to(_torch.bfloat16))
+    first_token, first_hidden = replies[0]
+    prefix.append((first_hidden.float().reshape(H)
+                   + embed.rows([first_token]).float().reshape(H)).to(_torch.bfloat16))
+    readback_s = time.perf_counter() - started
+
+    # After the Thinker finishes, its scratch and shared weights can be
+    # released. Its private projection shards remain resident; the speech map
+    # reserved enough additional private space for Talker's column shards.
+    ue.reset_tensor_dram_addr()
+    ue.reset_params_dram_addr()
+    scheduler = ue._ensure_stage_scheduler("talker")
+    scheduler.preclear_flags()
+    weights = _talker_fpga_mod.TalkerWeights(
+        ue, model_dir, scheduler=scheduler).stage()
+    codec_embed = weights._tensor("talker.model.embed_tokens.weight").to(
+        _torch.bfloat16)
+    prefix[-2] += codec_embed[int(speech_cfg.tts_codec_pad_token_id)]
+    prefix[-1] += codec_embed[int(speech_cfg.tts_codec_start_token_id)]
+
+    prefix_len = len(prefix)
+    max_codec_tokens = min(4096, FPGA_SPEECH_CONTEXT_SIZE - prefix_len)
+    if max_codec_tokens < 1:
+        raise ValueError("prompt leaves no context for FPGA Talker codec tokens")
+    max_ctx = ((prefix_len + max_codec_tokens + 63) // 64) * 64
+    runner = _talker_fpga_mod.TalkerRunner(
+        ue, weights, max_ctx=max_ctx, scheduler=scheduler)
+    runner.alloc_attention_scratch(aligned=max_ctx)
+    runner.zero_state()
+    runner.build_rope_table()
+    runner.compile_reusable_step()
+
+    total_hw_us = 0.0
+    prefix_hw_us = 0.0
+    prefix_started = time.perf_counter()
+    logits = None
+    for pos, row in enumerate(prefix):
+        logits, hw_us = runner.run_step(row, pos)
+        total_hw_us += hw_us
+        prefix_hw_us += hw_us
+        if (pos + 1) % 64 == 0 or pos + 1 == prefix_len:
+            print(f"  [Talker FPGA] conditioned {pos + 1}/{prefix_len} prefix rows",
+                  flush=True)
+    prefix_wall_s = time.perf_counter() - prefix_started
+    setup_wall_s = prefix_started - started
+
+    def sample(logit_row, previous: list[int]) -> int:
+        score = logit_row.float()
+        score[int(speech_cfg.tts_codec_start_token_id)] = -float("inf")
+        for token in set(previous):
+            if score[token] > 0:
+                score[token] /= 1.05
+            else:
+                score[token] *= 1.05
+        values, indices = _torch.topk(score / 0.9, k=40)
+        probs = _torch.softmax(values, dim=0)
+        probs[(probs.cumsum(0) - probs) >= 0.8] = 0
+        probs /= probs.sum()
+        return int(indices[_torch.multinomial(probs, 1)])
+
+    codes: list[int] = []
+    decode_started = time.perf_counter()
+    eos = {8292, 8294}
+    for idx in range(max_codec_tokens):
+        code = sample(logits, codes)
+        if code in eos:
+            break
+        codes.append(code)
+        if idx + 1 >= max_codec_tokens:
+            break
+        if idx + 1 < len(replies):
+            token, next_hidden = replies[idx + 1]
+            condition = next_hidden.float().reshape(H) + embed.rows([token]).float().reshape(H)
+        else:
+            special = (int(speech_cfg.tts_text_end_token_id)
+                       if idx + 1 == len(replies)
+                       else int(speech_cfg.tts_text_pad_token_id))
+            condition = embed.rows([special]).float().reshape(H)
+        row = (codec_embed[code].float() + condition).to(_torch.bfloat16)
+        logits, hw_us = runner.run_step(row, prefix_len + idx)
+        total_hw_us += hw_us
+        if len(codes) % 64 == 0:
+            print(f"  [Talker FPGA] generated {len(codes)} codec tokens",
+                  flush=True)
+    decode_wall_s = time.perf_counter() - decode_started
+    talker_wall_s = prefix_wall_s + decode_wall_s
+    talker_total_wall_s = time.perf_counter() - started
+    if not codes:
+        raise ValueError("FPGA Talker emitted EOS before any codec token")
+    print(f"  [Talker FPGA] {len(codes)} codec tokens in {talker_wall_s:.1f}s "
+          f"active (setup {setup_wall_s:.1f}s, prefix {prefix_wall_s:.1f}s, "
+          f"codec decode {decode_wall_s:.1f}s); "
+          "starting CPU Token2Wav", flush=True)
+
+    vocoder_started = time.perf_counter()
+    config = Qwen2_5OmniConfig.from_pretrained(model_dir)
+    vocoder = Qwen2_5OmniToken2WavModel(config.token2wav_config)
+    vocoder.load_state_dict(
+        _talker_mod._load_submodule_state(model_dir, "token2wav"), strict=True)
+    vocoder.float().eval()
+    with _torch.no_grad():
+        wave = vocoder(
+            _torch.tensor([codes], dtype=_torch.long),
+            conditioning=spk["cond"].float(),
+            reference_mel=spk["ref_mel"].float(),
+        )
+    wav = wave[0] if isinstance(wave, (tuple, list)) else wave
+    token2wav_s = time.perf_counter() - vocoder_started
+    out = os.path.join(SCRIPT_DIR, run_summary_filename(args).replace(".md", ".wav"))
+    _talker_mod.write_wav(out, wav)
+    samples = int(wav.reshape(-1).numel())
+    print(f"  [Speak] wrote {os.path.basename(out)}: "
+          f"{samples / _talker_mod.SAMPLE_RATE:.2f}s audio", flush=True)
+    return {
+        "speaker": args.speak, "wav": out, "samples": samples,
+        "seconds": samples / _talker_mod.SAMPLE_RATE,
+        "readback_s": readback_s,
+        "talker_device": "FPGA (8 cores)", "talker_wall_s": talker_wall_s,
+        "talker_hw_us": total_hw_us, "talker_prefix_wall_s": prefix_wall_s,
+        "talker_setup_wall_s": setup_wall_s,
+        "talker_total_wall_s": talker_total_wall_s,
+        "talker_prefix_hw_us": prefix_hw_us,
+        "talker_decode_wall_s": decode_wall_s,
+        "talker_decode_hw_us": total_hw_us - prefix_hw_us,
+        "codec_tokens": len(codes),
+        "token2wav_device": "Host CPU", "token2wav_wall_s": token2wav_s,
+        "decode_talker_overlap_s": 0.0,
+    }
+
+
+def _prepare_streamed_speech(ue, args, cfg: dict, prompt_tokens: list[int]):
+    """Read the prompt state and load Talker before concurrent FPGA decode."""
+    import torch as _torch
+
+    started = time.perf_counter()
+    H = int(ue.vector_length)
+    T = len(prompt_tokens)
+    prefill_rows = ue.dma_from_accelerator_memory(
+        ue.LM_PREFILL_NORM, (T - 1, H)).float()
+    readback_s = time.perf_counter() - started
+    model_dir = os.path.join(SCRIPT_DIR, cfg["paths"]["hf_model_dir"])
+    emb = _talker_mod.ThinkerEmbeddings(model_dir)
+    media = {int(cfg["tokens"]["image_token_id"]),
+             int(cfg["tokens"]["audio_token_id"]),
+             int(cfg["tokens"]["video_token_id"])}
+    prefill_embeds = emb.rows(
+        prompt_tokens,
+        zero_at=[i for i, t in enumerate(prompt_tokens) if t in media],
+    )
+    lookup = lambda ids: emb.rows(ids.flatten().tolist())
+    hs = _talker_mod.HostSpeech(model_dir, speaker=args.speak)
+    stream = _talker_mod.ReplyStream(
+        lookup, hs.talker.text_eos_token, hs.talker.text_pad_token)
+    ue._speech_step_callback = stream.push
+    return (stream, hs, _torch.tensor([prompt_tokens], dtype=_torch.long),
+            prefill_rows, prefill_embeds, lookup, readback_s, started)
+
+
+def _finish_streamed_speech(args, session, wav, decode_started: float,
+                            decode_finished: float) -> dict:
+    stream, hs, _, _, _, _, readback_s, started = session
+    w = wav
+    w = w[0] if isinstance(w, (tuple, list)) else w
+    out = os.path.join(SCRIPT_DIR, run_summary_filename(args).replace(".md", ".wav"))
+    _talker_mod.write_wav(out, w)
+    n = int(w.reshape(-1).shape[0])
+    talker_started = getattr(stream, "talker_started_at", decode_finished)
+    talker_finished = getattr(stream, "talker_finished_at", decode_finished)
+    overlap = max(0.0, min(talker_finished, decode_finished)
+                  - max(talker_started, decode_started))
+    finished = time.perf_counter()
+    host_s = finished - talker_started
+    setup_s = talker_started - started
+    print(f"\n[Speak] {args.speak}: {n} samples = "
+          f"{n / _talker_mod.SAMPLE_RATE:.2f}s @ {_talker_mod.SAMPLE_RATE} Hz "
+          f"-> {os.path.basename(out)}  (FPGA readback {readback_s:.2f}s, "
+          f"host setup {setup_s:.1f}s, Talker + vocoder {host_s:.1f}s, "
+          f"decode/Talker overlap {overlap:.2f}s)")
+    return {"speaker": args.speak, "wav": out, "samples": n,
+            "seconds": n / _talker_mod.SAMPLE_RATE,
+            "readback_s": readback_s,
+            "host_s": host_s,
+            "host_setup_s": setup_s,
+            "decode_talker_overlap_s": overlap,
+            **(hs.last_metrics or {})}
+
+
 def _result_mode(args) -> str:
     if args.image and args.audio:
         return "image+audio"
@@ -2785,6 +3181,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "--dummy_prompt dummy_prompt_4072.md. The file's own token count "
              "is what gets prefilled -- no filler is added unless "
              "--target-prefill-tokens is also given.",
+    )
+    parser.add_argument(
+        "--speak", nargs="?", const=DEFAULT_SPEAKER, default=None,
+        metavar="SPEAKER",
+        help=("synthesise speech for the reply (8-core FPGA Talker + CPU Token2Wav). Bare "
+              f"--speak uses {DEFAULT_SPEAKER}; the other voice is Ethan. "
+              "Writes a .wav next to the run summary."),
+    )
+    parser.add_argument(
+        "--speak-host", action="store_true",
+        help="use the previous streaming CPU Talker instead of the FPGA Talker",
     )
     parser.add_argument(
         "--target-prefill-tokens",
@@ -2878,6 +3285,8 @@ def run_summary_filename(args) -> str:
 
     ``--dev xdma0 --image --multi-core 8`` ->
     ``qwen2.5_omni_7b_test_xdma0_image_multi-core_8.md``.
+    ``--speak Chelsie`` adds ``speak_Chelsie`` before the core-count tag;
+    the matching WAV uses the same stem.
 
     Device and mode are always present, in that order; a profile run is tagged
     so its phase breakdown never overwrites a generation run's summary. Callers
@@ -2890,6 +3299,10 @@ def run_summary_filename(args) -> str:
         # one another's summaries.
         stem = os.path.splitext(os.path.basename(args.dummy_prompt))[0]
         parts.append("dummy-prompt" if stem == "dummy_prompt" else stem)
+    if getattr(args, "speak", None) is not None:
+        parts.append(f"speak_{args.speak}")
+        if getattr(args, "speak_host", False):
+            parts.append("host")
     if getattr(args, "profile", False):
         parts.append("profile")
     parts.append(f"multi-core_{args.multi_core}")
@@ -2902,6 +3315,10 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
+    if args.speak_host and args.speak is None:
+        parser.error("--speak-host requires --speak")
+    if args.speak is not None and _talker_mod is not None and args.speak not in _talker_mod.SPEAKERS:
+        parser.error(f"--speak speaker must be one of {_talker_mod.SPEAKERS}")
     if args.no_summary and args.summary:
         parser.error("--summary and --no-summary are mutually exclusive")
     if args.frames < 1:
@@ -2935,10 +3352,18 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     if len(tokens) < 2:
         raise ValueError("chat template produced fewer than two tokens")
     context, seed = tokens[:-1], tokens[-1]
-    if len(context) > PREFILL_INPUT_TOKEN_LIMIT:
+    context_limit = (FPGA_SPEECH_CONTEXT_SIZE
+                     if args.speak is not None and not args.speak_host
+                     else PREFILL_INPUT_TOKEN_LIMIT)
+    if len(context) > context_limit:
         raise ValueError(
             f"templated prompt needs {len(context)} prefill tokens; limit is "
-            f"{PREFILL_INPUT_TOKEN_LIMIT}. Shorten the prompt or media input."
+            f"{context_limit}. Shorten the prompt or media input."
+        )
+    if args.speak is not None and not args.speak_host and len(tokens) + 2 >= context_limit:
+        raise ValueError(
+            f"FPGA speech needs prompt + PAD/BOS + at least one codec position "
+            f"inside {context_limit} positions; prompt has {len(tokens)} tokens"
         )
 
     print(f"\n--- Software-resetting {REQUIRED_ENGINES} engines ---")
@@ -2950,8 +3375,15 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     print("\n--- Building U55 engine ---")
     ue = Qwen25OmniUnifiedEngine(
         script_dir=SCRIPT_DIR, fpga_build=fpga_build,
-        vision_res=args.vision_res, **engine_kwargs
+        vision_res=args.vision_res,
+        fpga_talker=args.speak is not None and not args.speak_host,
+        **engine_kwargs
     )
+    ue.speak_as = args.speak          # before lm_tensor_init sizes the buffers
+    if args.speak is not None and _talker_mod is None:
+        raise SystemExit("--speak needs qwen2.5_omni_7b_talker.py, which failed to import")
+    if args.speak is not None and not args.speak_host and _talker_fpga_mod is None:
+        raise SystemExit("--speak needs qwen2.5_omni_7b_talker_fpga.py")
     ue.configure_runtime_artifacts(params_path, processor_dir)
     ue.tokenizer = processor.tokenizer
     ue.processor = processor
@@ -3064,8 +3496,74 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         return
 
     print("\n--- Decode run ---")
-    _, decoded_text = ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)
-    lm_wall = time.perf_counter() - started
+    speech = None
+    if args.speak is None:
+        _, decoded_text = ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)
+        thinker_finished = time.perf_counter()
+    elif not args.speak_host:
+        ue._speech_steps = []
+        _, decoded_text = ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)
+        thinker_finished = time.perf_counter()
+        speech = _synthesize_speech_fpga(ue, args, cfg, tokens)
+        ue._speech_result = speech
+    else:
+        ue._speech_steps = []
+        speech_session = _prepare_streamed_speech(ue, args, cfg, tokens)
+        stream, hs, input_ids, prefill_rows, prefill_embeds, lookup, _, _ = speech_session
+        decoder_result: dict[str, Any] = {}
+
+        def _decode_worker():
+            decoder_result["started"] = time.perf_counter()
+            try:
+                decoder_result["output"] = ue.run_decoder(
+                    seed, max_new_tokens=args.max_new_tokens)
+            except BaseException as exc:
+                decoder_result["error"] = exc
+            finally:
+                decoder_result["finished"] = time.perf_counter()
+                ue._speech_step_callback = None
+                if "error" in decoder_result:
+                    stream.abort(decoder_result["error"])
+                else:
+                    stream.close()
+
+        decoder_thread = threading.Thread(
+            target=_decode_worker, name="omni-fpga-decode", daemon=True)
+        decoder_thread.start()
+        print("  [Speak] FPGA decode and host Talker running in parallel",
+              flush=True)
+        try:
+            wav = hs.speak_stream(
+                input_ids=input_ids,
+                prefill_hidden_rows=prefill_rows,
+                prefill_embeds=prefill_embeds,
+                reply_stream=stream,
+                embed_lookup=lookup,
+            )
+        except Exception as exc:
+            decoder_thread.join(timeout=60)
+            if decoder_thread.is_alive():
+                raise TimeoutError("FPGA decode did not finish after Talker failure") from exc
+            if "error" in decoder_result:
+                raise decoder_result["error"] from exc
+            print(f"[Speak] streaming path failed ({exc}); retrying the "
+                  "completed Thinker response sequentially", flush=True)
+            wav = None
+        decoder_thread.join(timeout=60)
+        if decoder_thread.is_alive():
+            raise TimeoutError("FPGA decoder did not finish within 60 seconds")
+        if "error" in decoder_result:
+            raise decoder_result["error"]
+        _, decoded_text = decoder_result["output"]
+        thinker_finished = decoder_result["finished"]
+        if wav is None:
+            speech = _synthesize_speech(ue, args, cfg, tokens)
+        else:
+            speech = _finish_streamed_speech(
+                args, speech_session, wav,
+                decoder_result["started"], decoder_result["finished"])
+        ue._speech_result = speech
+    lm_wall = thinker_finished - started
     print(f"\nThinker stage done in {lm_wall:.2f}s wall")
 
     visible_generated = int(getattr(ue, "_decode_n", 0))
