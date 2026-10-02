@@ -25,12 +25,8 @@ which the device decode path does not do -- it is argmax only -- and matching
 the reference matters more here than saving a 17 KiB readback. Everything with
 FLOPs in it, the 1.35 B parameters, runs on the board.
 
-WEIGHTS ARE SHARED, NOT PRIVATE, deliberately. The Thinker already holds
-5659 MiB of private shards and core 0's window has no room left, so 644 MiB of
-IF4 Talker weights cannot be copied per core. They go in the shared pool as
-per-layer sections, and the engines take zero-copy column blocks of them --
-ColumnShardContext.b_addr is exactly that, a shifted base into a shared weight
-rather than a duplicated one.
+In multi-engine mode, matrix output columns and their weights are partitioned
+across private engine regions. Small norms and biases remain shared.
 """
 
 from __future__ import annotations
@@ -44,6 +40,7 @@ import torch
 import quant_lib
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE
+from multi_engine_shard import DENSE_BF16
 
 TALKER_PREFIX = "talker."
 BLOCK = 64
@@ -61,8 +58,9 @@ _IF4_SUFFIXES = (
 class TalkerWeights:
     """Talker parameters, quantized once and resident in accelerator DRAM."""
 
-    def __init__(self, ue, model_dir: str, *, verbose: bool = True):
+    def __init__(self, ue, model_dir: str, *, scheduler=None, verbose: bool = True):
         self.ue = ue
+        self.scheduler = scheduler
         self.model_dir = model_dir
         self.verbose = verbose
         index = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))
@@ -71,6 +69,7 @@ class TalkerWeights:
         self.addr: dict[str, int] = {}     # tensor name -> DRAM address
         self.scale: dict[str, int] = {}    # tensor name -> scale blob address
         self.shape: dict[str, tuple] = {}
+        self.shards: dict[str, object] = {}
         self._staged_bytes = 0
 
     def _tensor(self, name: str) -> torch.Tensor:
@@ -101,6 +100,25 @@ class TalkerWeights:
         self.shape[name] = tuple(t.shape)
         self._staged_bytes += len(data) + len(scales)
 
+    def _put_sharded(self, name: str, t: torch.Tensor, *, if4: bool) -> None:
+        """Stage only the materialized column blocks, never a full matrix."""
+        if t.ndim != 2:
+            raise ValueError(f"{name}: expected a matrix, got {tuple(t.shape)}")
+        n, k = map(int, t.shape)
+        if if4:
+            data, scales = quant_lib.quantize("if4", t.float(), block_size=BLOCK)
+            dtype = TYPE.IF4
+        else:
+            data = t.to(torch.bfloat16).contiguous().view(torch.uint8).numpy().tobytes()
+            scales = None
+            dtype = DENSE_BF16
+        self.shards[name] = self.scheduler.shard_quantized_weight_from_bytes(
+            name=f"talker.{name}", weight_bytes=data, scale_bytes=scales,
+            K=k, N=n, layers=1, layer_stride_bytes=0, data_type=dtype,
+            verbose=False)
+        self.shape[name] = (n, k)
+        self._staged_bytes += len(data) + (len(scales) if scales is not None else 0)
+
     def stage(self, layers: int = 24) -> "TalkerWeights":
         t0 = time.perf_counter()
         for name in sorted(self._map):
@@ -115,27 +133,25 @@ class TalkerWeights:
                 # the 57.8 MiB table on the device would buy nothing.
                 continue
             t = self._tensor(name)
-            if short.endswith(_IF4_SUFFIXES):
+            if self.scheduler is not None and t.ndim == 2:
+                self._put_sharded(short, t, if4=short.endswith(_IF4_SUFFIXES))
+            elif short.endswith(_IF4_SUFFIXES):
                 self._put_if4(short, t)
             else:
                 self._put_bf16(short, t)
             del t
         if self.verbose:
-            print(f"  [Talker] staged {len(self.addr)} tensors, "
+            print(f"  [Talker] staged {len(self.addr) + len(self.shards)} tensors, "
                   f"{self._staged_bytes / 2**20:.1f} MiB (IF4 matrices, bf16 norms "
-                  f"and biases) in {time.perf_counter() - t0:.1f}s")
+                  f"and biases) in {time.perf_counter() - t0:.1f}s"
+                  + (f"; private usage: " + ", ".join(
+                      f"{x / 2**20:.1f} MiB" for x in self.scheduler.private_usage())
+                     if self.scheduler is not None else ""))
         return self
 
 
 class TalkerRunner:
-    """Emits and runs the Talker's layers on one engine.
-
-    Single-engine first, and deliberately: the Talker's correctness is the hard
-    part, and a wrong column split looks exactly like a wrong kernel. Once the
-    numbers match the reference, the same bodies take a ColumnShardContext and
-    the weights stay where they are -- they are shared, so an engine's block is
-    a shifted base, not a copy.
-    """
+    """Emit Talker steps on one engine or private, column-sharded engines."""
 
     H = 896
     QH, KVH, AHD = 12, 4, 128
@@ -144,9 +160,11 @@ class TalkerRunner:
     VOCAB = 8448
     THINKER_H = 3584
 
-    def __init__(self, ue, weights: TalkerWeights, *, max_ctx: int = 1024):
+    def __init__(self, ue, weights: TalkerWeights, *, max_ctx: int = 1024,
+                 scheduler=None):
         self.ue = ue
         self.w = weights
+        self.scheduler = scheduler or weights.scheduler
         self.max_ctx = max_ctx
         self._alloc_tensors()
 
@@ -193,6 +211,41 @@ class TalkerRunner:
             bias_mode="broadcast_N" if bias_addr is not None else None,
             silu_enable=silu) or 0
 
+    def _emit_shard(self, engine_idx: int, wname: str, src: int, dst: int,
+                    *, bias: bool = False, silu: bool = False) -> int:
+        sw = self.w.shards[wname]
+        sh = sw.shard_or_none(engine_idx)
+        if sh is None:
+            return 0
+        off = sh.col_offset * 2
+        assert off % 128 == 0
+        kw = dict(M=1, K=sw.K, N=sh.cols, A_DRAM_ADDR=src,
+                  B_DRAM_ADDR=sh.weight_addr, OUTPUT_DRAM_ADDR=dst + off)
+        bias_addr = self.w.addr.get(wname.replace(".weight", ".bias")) if bias else None
+        if bias_addr is not None:
+            kw.update(C_DRAM_ADDR=bias_addr + off, bias_mode="broadcast_N")
+        if silu:
+            kw["silu_enable"] = True
+        engine = self.scheduler.engines[engine_idx]
+        if sw.data_type is DENSE_BF16:
+            return engine.matmat_mul_core(**kw) or 0
+        kw.update(SCALE_DRAM_ADDR=sh.scale_addr, data_type=TYPE.IF4)
+        return engine.quantized_matmat_core(**kw) or 0
+
+    def _sharded_round(self, ops) -> int:
+        """Run independent projections together; join before any consumer."""
+        sched = self.scheduler
+        sched.release()
+        flops = sum(self._emit_shard(0, *op[:3], bias=op[3], silu=op[4])
+                    for op in ops)
+        for e in sched.worker_indices():
+            sched.begin_worker_round(e)
+            for wname, src, dst, bias, silu in ops:
+                self._emit_shard(e, wname, src, dst, bias=bias, silu=silu)
+            sched.end_worker_round(e)
+        sched.join()
+        return flops
+
     def _rms(self, *, M, N, src, dst, gamma):
         return self.ue.rms_norm_core_dram(
             M=M, N=N, A_DRAM_ADDR=src, OUTPUT_DRAM_ADDR=dst,
@@ -200,6 +253,9 @@ class TalkerRunner:
 
     def emit_input_projection(self) -> int:
         """[1, 3584] -> [1, 896]: the Thinker-space input into Talker space."""
+        if self.scheduler is not None:
+            return self._sharded_round([("thinker_to_talker_proj.weight",
+                                         self.IN_3584, self.IO_A, True, False)])
         return self.ue.matmat_mul_core(
             M=1, K=self.THINKER_H, N=self.H, A_DRAM_ADDR=self.IN_3584,
             B_DRAM_ADDR=self.w.addr["thinker_to_talker_proj.weight"],
@@ -210,6 +266,9 @@ class TalkerRunner:
     def emit_head(self, src: int) -> int:
         """[1, 896] -> [1, 8448] codec logits, through the final norm."""
         f = self._rms(M=1, N=self.H, src=src, dst=self.NORM, gamma="model.norm.weight")
+        if self.scheduler is not None:
+            return f + self._sharded_round([("codec_head.weight", self.NORM,
+                                             self.LOGITS, False, False)])
         return f + (self.ue.matmat_mul_core(
             M=1, K=self.H, N=self.VOCAB, A_DRAM_ADDR=self.NORM,
             B_DRAM_ADDR=self.w.addr["codec_head.weight"],
@@ -227,6 +286,19 @@ class TalkerRunner:
         pre = f"model.layers.{li}."
         f = self._rms(M=1, N=self.H, src=src, dst=self.NORM,
                       gamma=pre + "post_attention_layernorm.weight")
+        if self.scheduler is not None:
+            f += self._sharded_round([
+                (pre + "mlp.gate_proj.weight", self.NORM, self.GATE, False, True),
+                (pre + "mlp.up_proj.weight", self.NORM, self.UP, False, False)])
+            self.ue.eltwise_core_dram(M=1, N=self.MLP, dram_a=self.GATE,
+                                      dram_b=self.UP, dram_out=self.GATE,
+                                      mode=UE_MODE.ELTWISE_MUL)
+            f += self._sharded_round([(pre + "mlp.down_proj.weight", self.GATE,
+                                       self.DOWN, False, False)])
+            self.ue.eltwise_core_dram(M=1, N=self.H, dram_a=src,
+                                      dram_b=self.DOWN, dram_out=dst,
+                                      mode=UE_MODE.ELTWISE_ADD)
+            return f
         f += self._proj(M=1, K=self.H, N=self.MLP, src=self.NORM,
                         wname=pre + "mlp.gate_proj.weight", dst=self.GATE,
                         bias=False, silu=True)
@@ -295,18 +367,22 @@ class TalkerRunner:
             self.ue.dma_to_accelerator_memory(
                 self._kv_plane(self.V_CACHE, li, h) + off, v[sl].to(torch.bfloat16))
 
-    def set_causal_bias(self, live: int) -> None:
+    def set_causal_bias(self, live: int, *, aligned: int | None = None) -> None:
         """Zero for positions the step may attend to, -inf past the live KV.
 
         Every row the kernel reads gets the same mask, not just the live query:
         an all -inf row softmaxes to NaN, and the tile is 64-aligned.
         """
-        a = self.ALIGNED
+        a = aligned or self.ALIGNED
+        if a > self.ALIGNED or a % 64 or not 1 <= live <= a:
+            raise ValueError(f"invalid Talker bias shape: live={live}, aligned={a}, "
+                             f"capacity={self.ALIGNED}")
         bias = torch.full((self.GQA, a), float("-inf"), dtype=torch.bfloat16)
         bias[:, :live] = 0.0
         self.ue.dma_to_accelerator_memory(self.BIAS, bias.reshape(-1))
 
-    def emit_attention(self, li: int, live_aligned: int) -> int:
+    def emit_attention(self, li: int, live_aligned: int,
+                       aligned_reg: int | None = None) -> int:
         """GQA over the codec KV cache, one group at a time.
 
         unified_attention_core does NOT apply the 1/sqrt(head_dim) softmax
@@ -327,7 +403,9 @@ class TalkerRunner:
                 BIAS_DRAM_ADDR=self.BIAS,
                 OUTPUT_DRAM_ADDR=self.ATTN + q_off,
                 SCRATCH_DRAM_ADDR=self.SCRATCH,
-                IDENTITY_DRAM_ADDR=self.IDENT)
+                IDENTITY_DRAM_ADDR=self.IDENT,
+                gpr_aligned_seq_len_reg=aligned_reg,
+                q_pre_scaled=aligned_reg is not None)
             f += out if isinstance(out, (int, float)) else 0
         return f
 
@@ -404,7 +482,7 @@ class TalkerRunner:
     # -- a whole layer ----------------------------------------------------
     def emit_layer(self, li: int, src: int, dst: int, *, live_aligned: int,
                    pos_reg: int, kv_off_reg: int, addr_reg: int,
-                   tmp_reg: int) -> int:
+                   tmp_reg: int, aligned_reg: int | None = None) -> int:
         """One Talker decoder layer at M=1, as a single uninterrupted program.
 
         K and V land in their cache planes directly, so nothing leaves the
@@ -415,6 +493,21 @@ class TalkerRunner:
         pre = f"model.layers.{li}."
         f = self._rms(M=1, N=self.H, src=src, dst=self.NORM,
                       gamma=pre + "input_layernorm.weight")
+        if self.scheduler is not None:
+            f += self._sharded_round([
+                (pre + "self_attn.q_proj.weight", self.NORM, self.Q, True, False),
+                (pre + "self_attn.k_proj.weight", self.NORM, self.K, True, False),
+                (pre + "self_attn.v_proj.weight", self.NORM, self.V, True, False)])
+            f += self.emit_rope_q(pos_reg, tmp_reg)
+            f += self.emit_rope_k(pos_reg, tmp_reg)
+            f += self.emit_kv_to_cache(li, kv_off_reg, addr_reg)
+            f += self.emit_attention(li, live_aligned, aligned_reg=aligned_reg)
+            f += self._sharded_round([(pre + "self_attn.o_proj.weight", self.ATTN,
+                                       self.PROJ, False, False)])
+            self.ue.eltwise_core_dram(M=1, N=self.H, dram_a=src,
+                                      dram_b=self.PROJ, dram_out=self.RESID,
+                                      mode=UE_MODE.ELTWISE_ADD)
+            return f + self.emit_mlp(li, self.RESID, dst)
         f += self._proj(M=1, K=self.H, N=self.Q_SIZE, src=self.NORM,
                         wname=pre + "self_attn.q_proj.weight", dst=self.Q)
         f += self._proj(M=1, K=self.H, N=self.KV_SIZE, src=self.NORM,
@@ -424,7 +517,7 @@ class TalkerRunner:
         f += self.emit_rope_q(pos_reg, tmp_reg)
         f += self.emit_rope_k(pos_reg, tmp_reg)
         f += self.emit_kv_to_cache(li, kv_off_reg, addr_reg)
-        f += self.emit_attention(li, live_aligned)
+        f += self.emit_attention(li, live_aligned, aligned_reg=aligned_reg)
         f += self._proj(M=1, K=self.Q_SIZE, N=self.H, src=self.ATTN,
                         wname=pre + "self_attn.o_proj.weight", dst=self.PROJ,
                         bias=False)
@@ -434,14 +527,104 @@ class TalkerRunner:
         return f
 
     def emit_step(self, *, layers: int, live_aligned: int, pos_reg: int,
-                  kv_off_reg: int, addr_reg: int, tmp_reg: int) -> int:
+                  kv_off_reg: int, addr_reg: int, tmp_reg: int,
+                  aligned_reg: int | None = None) -> int:
         """The whole Talker for one codec step: projection, layers, head."""
         f = self.emit_input_projection()
         src, dst = self.IO_A, self.IO_B
         for li in range(layers):
             f += self.emit_layer(li, src, dst, live_aligned=live_aligned,
                                  pos_reg=pos_reg, kv_off_reg=kv_off_reg,
-                                 addr_reg=addr_reg, tmp_reg=tmp_reg)
+                                 addr_reg=addr_reg, tmp_reg=tmp_reg,
+                                 aligned_reg=aligned_reg)
             src, dst = dst, src
         f += self.emit_head(src)
         return f
+
+    def compile_reusable_step(self, *, layers: int = 24) -> None:
+        """Compile one dynamic-length body; runtime preambles set position/length."""
+        if self.scheduler is None:
+            raise ValueError("reusable Talker requires a multi-engine scheduler")
+        ue, sched = self.ue, self.scheduler
+        ue.reset_isa_reg_counter()
+        ue.reset_inst_ptr_counter()
+        self._pos_reg = ue.alloc_isa_reg()
+        self._kv_off_reg = ue.alloc_isa_reg()
+        self._addr_reg = ue.alloc_isa_reg()
+        self._tmp_reg = ue.alloc_isa_reg()
+        self._aligned_reg = ue.alloc_isa_reg()
+        ue.clear_inst_id()
+        ue.clear_capture_buffer()
+        self._program_addr = ue.get_program_dram_addr()
+        ue.start_capture()
+        try:
+            sched.begin_program()
+            self.emit_step(
+                layers=layers, live_aligned=64, pos_reg=self._pos_reg,
+                kv_off_reg=self._kv_off_reg, addr_reg=self._addr_reg,
+                tmp_reg=self._tmp_reg, aligned_reg=self._aligned_reg)
+            ue.generate_instruction_halt()
+            self._worker_addrs = sched.finalize()
+            ue.stop_capture()
+        except Exception:
+            sched.abort_program()
+            if ue.is_capture_on:
+                ue.stop_capture()
+            ue.clear_capture_buffer()
+            raise
+        body_bytes = ue.get_capture_instruction_size_bytes()
+        self._preamble_addr = self._program_addr + body_bytes
+        # The 4-instruction preamble is padded to 128 bytes; neither it nor the
+        # body may consume the protected tail above the master's ISA slice.
+        limit = getattr(ue, "MASTER_ISA_LIMIT", None)
+        if limit is not None and self._preamble_addr + 128 > limit:
+            raise MemoryError("Talker program and preamble exceed master ISA")
+        written = ue.write_captured_instructions_to_dram(self._program_addr)
+        if written != body_bytes:
+            raise IOError("Talker body DMA short write")
+        ue.allocate_program_dram(body_bytes + 128)
+        ue.clear_capture_buffer()
+
+    def run_step(self, x: torch.Tensor, pos: int, *, timeout_s: float = 30.0):
+        """Execute one codec position and return logits plus core-0 HW time."""
+        if not hasattr(self, "_program_addr"):
+            raise RuntimeError("compile_reusable_step must run before run_step")
+        if not 0 <= pos < self.max_ctx:
+            raise ValueError(f"Talker position {pos} exceeds max_ctx={self.max_ctx}")
+        ue, sched = self.ue, self.scheduler
+        aligned = ((pos + 64) // 64) * 64
+        self.set_causal_bias(pos + 1, aligned=aligned)
+        ue.dma_to_accelerator_memory(
+            self.IN_3584, x.reshape(-1).to(torch.bfloat16))
+        ue.clear_inst_id()
+        ue.clear_capture_buffer()
+        ue.start_capture()
+        ue.generate_instruction_add_set(
+            self._pos_reg, user_dma_core.ue_35bit_addr_shifter(
+                pos * self._rope_row_bytes))
+        ue.generate_instruction_add_set(
+            self._kv_off_reg, user_dma_core.ue_35bit_addr_shifter(pos * self.AHD * 2))
+        ue.generate_instruction_add_set(self._aligned_reg, aligned)
+        ue.generate_instruction_jump_abs(
+            user_dma_core.ue_35bit_addr_shifter(self._program_addr))
+        ue.stop_capture()
+        written = ue.write_captured_instructions_to_dram(self._preamble_addr)
+        if written != ue.get_capture_instruction_size_bytes():
+            raise IOError(f"Talker position {pos}: preamble DMA short write")
+        ue.clear_capture_buffer()
+        sched.start_workers(self._worker_addrs)
+        ue.start_execute_from_dram(self._preamble_addr)
+        ue.wait_queue(timeout_s)
+        if ue.is_queue_busy():
+            raise TimeoutError(f"Talker position {pos}: master remained busy")
+        for idx, worker in enumerate(sched.workers, start=1):
+            worker.wait_queue(timeout_s)
+            if worker.is_queue_busy():
+                raise TimeoutError(f"Talker position {pos}: worker {idx} remained busy")
+        hw_us = ue.report_latency_in_us()
+        buf = bytearray(self.VOCAB * 2)
+        read = ue.dma_read(ue.c2h_device, self.LOGITS, buf, len(buf))
+        if read != len(buf):
+            raise IOError(f"Talker position {pos}: logits DMA short read")
+        logits = torch.frombuffer(buf, dtype=torch.bfloat16).clone()
+        return logits, hw_us
