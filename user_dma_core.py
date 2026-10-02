@@ -23,6 +23,8 @@ from re import U
 import struct
 import os
 import sys
+import fcntl
+import getpass
 import time
 from typing import Callable, Optional, Tuple
 from enum import IntEnum
@@ -199,6 +201,236 @@ DMA_DEVICE_H2C = "/dev/xdma0_h2c_0"
 DMA_DEVICE_C2H = "/dev/xdma0_c2h_0"
 DMA_DEVICE_USER = "/dev/xdma0_user"  # AXI-Lite user interface for register access
 
+# ==========================================================================
+# ONE PROCESS PER BOARD
+# ==========================================================================
+# Two runs on one FPGA do not fail cleanly -- they interleave DMA and AXI-Lite
+# writes and corrupt each other's results, which reads downstream as a flaky
+# test rather than as contention. The CI workflow has always taken an flock,
+# but it did so in bash around the whole step, so anything started by hand
+# (a model script, a bare user_hw_test.py) walked straight past it.
+#
+# This claims the board here instead, at the point every caller goes through.
+# It is advisory at the OS level -- `dd` on the char device still wins -- but
+# nothing in this repo reaches the hardware without passing through
+# set_dma_device() or read_hardware_info(), so in practice it is complete.
+#
+# The lock is keyed on the DEVICE (xdma0 vs xdma1), not the host: one machine
+# can carry two independent boards and they should run concurrently.
+#
+# flock is deliberate: the kernel drops it when the holder dies, so a crashed
+# run never leaves a stale lock behind. Nothing needs cleaning up by hand.
+#
+# A busy board WAITS rather than failing on contact. CI has an hour of synthesis
+# already sunk by the time it gets here, so dying because someone opened a shell
+# on the board wastes far more than the wait does. Ten minutes, then it gives up
+# loudly -- long enough to ride out a normal test run, short enough that a
+# forgotten python REPL does not hold a lab host all afternoon. Set
+# UE_DEVICE_LOCK_WAIT=0 to fail immediately instead.
+DEVICE_LOCK_DIR = "/tmp"
+DEVICE_LOCK_DISABLE_ENV = "UE_ALLOW_SHARED_DEVICE"
+# Per-board marker exported to child processes; see claim_dma_device().
+DEVICE_LOCK_INHERIT_ENV_PREFIX = "UE_DEVICE_LOCK_HELD_"
+DEVICE_LOCK_WAIT_ENV = "UE_DEVICE_LOCK_WAIT"
+DEVICE_LOCK_WAIT_SECONDS = 600.0      # 10 minutes
+DEVICE_LOCK_POLL_SECONDS = 2.0
+DEVICE_LOCK_REPORT_SECONDS = 60.0     # how often to say who we are waiting on
+
+_DEVICE_LOCK_FD: Optional[int] = None
+_DEVICE_LOCK_NAME: Optional[str] = None
+
+
+def _device_lock_path(device_name: str) -> str:
+    return os.path.join(DEVICE_LOCK_DIR, f"pcie_dev_{device_name}.lock")
+
+
+def _current_device_name() -> str:
+    """Board name behind the configured char devices, e.g. ``xdma1``."""
+    base = os.path.basename(DMA_DEVICE_USER)
+    return base[:-len("_user")] if base.endswith("_user") else base
+
+
+def _device_lock_inherit_env(device_name: str) -> str:
+    return f"{DEVICE_LOCK_INHERIT_ENV_PREFIX}{device_name}"
+
+
+def _inherited_device_lock_holder(device_name: str) -> Optional[int]:
+    """PID of a LIVE ancestor holding ``device_name``, from the environment.
+
+    A test harness claims the board, then runs each model as a subprocess on
+    that same board (model_auto_test.py poisons DRAM, then Popen()s the model
+    with the same --dev). flock is per open file description, so the child does
+    not inherit the parent's lock -- it opens the file itself and blocks on it.
+    The whole process tree then waits for a lock its own parent will never drop:
+    nightly run 36846050434 sat 600s on "xdma1 is busy (pid=... user=github
+    cmd=model_auto_test.py --dev xdma1 --verbose)" -- its own harness -- and
+    failed at the first model.
+
+    So the claim is recorded in the environment, which subprocess DOES pass on,
+    and a descendant treats the board as already held rather than fighting for
+    it. The PID is checked for liveness so a stale variable in an exported
+    environment cannot wave a later, unrelated process through.
+    """
+    raw = os.environ.get(_device_lock_inherit_env(device_name))
+    if not raw:
+        return None
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    try:
+        os.kill(pid, 0)          # liveness only; signal 0 delivers nothing
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        return pid               # alive, owned by another user
+    return pid
+
+
+def release_dma_device() -> None:
+    """Drop the board lock, if this process holds one."""
+    global _DEVICE_LOCK_FD, _DEVICE_LOCK_NAME
+    if _DEVICE_LOCK_FD is not None:
+        try:
+            fcntl.flock(_DEVICE_LOCK_FD, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(_DEVICE_LOCK_FD)
+        except OSError:
+            pass
+    if _DEVICE_LOCK_NAME is not None:
+        # Only clear the marker we set ourselves: a descendant that releases
+        # must not convince its siblings the board is free while the ancestor
+        # still holds the flock.
+        env = _device_lock_inherit_env(_DEVICE_LOCK_NAME)
+        if os.environ.get(env) == str(os.getpid()):
+            os.environ.pop(env, None)
+    _DEVICE_LOCK_FD = None
+    _DEVICE_LOCK_NAME = None
+
+
+def claim_dma_device(device_name: Optional[str] = None,
+                     wait_seconds: Optional[float] = None) -> None:
+    """Take the exclusive lock on ``device_name``, waiting if it is busy.
+
+    Waits up to ``wait_seconds`` (default :data:`DEVICE_LOCK_WAIT_SECONDS`, or
+    ``UE_DEVICE_LOCK_WAIT``) and raises naming the holder if the board is still
+    busy at the deadline. Pass 0 to fail on contact.
+
+    Idempotent for the board already held, so the many call sites that
+    re-enter set_dma_device()/read_hardware_info() cost nothing. Switching
+    boards releases the previous one.
+
+    Set ``UE_ALLOW_SHARED_DEVICE=1`` to bypass -- for deliberately running two
+    processes against one board, which is a debugging move, not a normal one.
+    """
+    global _DEVICE_LOCK_FD, _DEVICE_LOCK_NAME
+    if os.environ.get(DEVICE_LOCK_DISABLE_ENV):
+        return
+    if device_name is None:
+        device_name = _current_device_name()
+    if _DEVICE_LOCK_NAME == device_name and _DEVICE_LOCK_FD is not None:
+        return
+    if _DEVICE_LOCK_NAME is not None:
+        release_dma_device()
+    holder_pid = _inherited_device_lock_holder(device_name)
+    if holder_pid is not None:
+        # An ancestor in this process tree already owns the board. Taking the
+        # flock here would deadlock against it (see
+        # _inherited_device_lock_holder); the tree holds ONE claim and the
+        # harness is responsible for not running two of its own children on the
+        # board at once, which it already guarantees by running them in series.
+        print(f"[device-lock] {device_name} already held by this process tree "
+              f"(pid {holder_pid}); continuing without a second claim",
+              flush=True)
+        return
+
+    path = _device_lock_path(device_name)
+    # O_CREAT LAST, not first. /tmp is sticky and world-writable, and these lab
+    # hosts run fs.protected_regular=2, under which O_CREAT on a file owned by
+    # ANOTHER user is refused with EACCES even at mode 0666. The lock file
+    # outlives whoever created it, so the second user through here is normally
+    # not the owner -- opening plain O_RDWR (no O_CREAT) is allowed and is what
+    # keeps the holder annotation writable across users. Getting this wrong does
+    # not break the lock (a read-only fd still flocks), it breaks the annotation,
+    # so a blocked run names whoever held it last instead of who holds it now.
+    fd = None
+    for flags in (os.O_RDWR, os.O_CREAT | os.O_RDWR, os.O_RDONLY):
+        try:
+            fd = os.open(path, flags, 0o666)
+            break
+        except OSError:
+            continue
+    if fd is None:
+        raise RuntimeError(f"cannot open the {device_name} lock at {path}")
+    try:
+        os.fchmod(fd, 0o666)   # no-op unless we own it; umask must not shut others out
+    except OSError:
+        pass
+
+    if wait_seconds is None:
+        try:
+            wait_seconds = float(os.environ.get(DEVICE_LOCK_WAIT_ENV,
+                                                DEVICE_LOCK_WAIT_SECONDS))
+        except ValueError:
+            wait_seconds = DEVICE_LOCK_WAIT_SECONDS
+
+    def _holder() -> str:
+        try:
+            return os.pread(fd, 400, 0).decode("utf-8", "replace").strip()
+        except OSError:
+            return ""
+
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    next_report = 0.0        # report the first wait immediately
+    waited = 0.0
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                holder = _holder()
+                os.close(fd)
+                raise RuntimeError(
+                    f"{device_name} is still in use after waiting "
+                    f"{waited:.0f}s" + (f" -- {holder}" if holder else "")
+                    + f".\n  Two processes on one board corrupt each other's "
+                    f"DMA, so this run stops rather than sharing it.\n"
+                    f"  Wait for that run to finish, or pick the other board "
+                    f"with --dev.\n"
+                    f"  Lock: {path}  ({DEVICE_LOCK_WAIT_ENV}=<seconds> to "
+                    f"change the {wait_seconds:.0f}s wait, 0 to fail on "
+                    f"contact; {DEVICE_LOCK_DISABLE_ENV}=1 only if you truly "
+                    f"want them to share)"
+                ) from None
+            if waited >= next_report:
+                print(f"[device-lock] {device_name} is busy"
+                      + (f" ({_holder()})" if _holder() else "")
+                      + f"; waiting up to {remaining:.0f}s more...", flush=True)
+                next_report = waited + DEVICE_LOCK_REPORT_SECONDS
+            time.sleep(min(DEVICE_LOCK_POLL_SECONDS, max(0.05, remaining)))
+            waited = wait_seconds - max(0.0, deadline - time.monotonic())
+    if waited > 0:
+        print(f"[device-lock] acquired {device_name} after {waited:.0f}s",
+              flush=True)
+
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, (f"pid={os.getpid()} user={getpass.getuser()} "
+                      f"host={os.uname().nodename} "
+                      f"cmd={' '.join(sys.argv)}\n").encode())
+    except OSError:
+        pass   # lock-only fd; holding it matters, the annotation does not
+    _DEVICE_LOCK_FD = fd
+    _DEVICE_LOCK_NAME = device_name
+    # Children inherit os.environ through subprocess, so this is what lets a
+    # harness hand the board to the model processes it spawns.
+    os.environ[_device_lock_inherit_env(device_name)] = str(os.getpid())
+
+
 def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
     """Set DMA device paths and an optional AXI-Lite base address.
 
@@ -223,6 +455,8 @@ def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
         DMA_DEVICE_USER = f"/dev/{device_name}_user"
         if base_addr is not None:
             UE_0_BASE_ADDR = int(base_addr)
+    # Claim the board before anything touches it (see ONE PROCESS PER BOARD).
+    claim_dma_device()
     for _mod in list(_sys.modules.values()):
         if _mod is None or _mod is _sys.modules[__name__]:
             continue
@@ -271,6 +505,9 @@ def _dram_size_override_code() -> Optional[int]:
 def read_hardware_info() -> HardwareInfo:
     """Read and decode the Andromeda hardware-info register."""
     global _DRAM_OVERRIDE_ANNOUNCED
+    # Every entry point reads HW_INFO before it does anything else, so this is
+    # the backstop for callers that never called set_dma_device().
+    claim_dma_device()
     fd = os.open(DMA_DEVICE_USER, os.O_RDONLY)
     try:
         offset = UE_0_BASE_ADDR + UE_HW_INFO_ADDR - AXI_LITE_TRANSLATION_OFFSET
@@ -970,7 +1207,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xe9cbe74b, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xe9cbe74b. Please update FPGA with commit update_e9cbe74b.bin using update_flash.py (public release v1.4)"
+        assert hw_version == 0xf6ca9b81, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xf6ca9b81. Please update FPGA with commit update_f6ca9b81.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -9004,7 +9241,7 @@ class UnifiedEngine:
             return
         if inst_type == INSTRUCTION_FLAG:
             flag_mode = isa_mode
-            target_engine = src_reg_idx & 0xF
+            target_engine = _inst_desc_bits(w, 36, 42)
             flag_mode_names = {
                 FLAG_MODE_SET: "SET",
                 FLAG_MODE_CLEAR: "CLEAR",
@@ -9039,6 +9276,7 @@ class UnifiedEngine:
 
         Header [15:0]: [7:0] instruction index from :attr:`_inst_id`; [11:8] inst_type; [15:12] reserved.
         ISA [85:32]: [35:32] isa_mode; [41:36] src; [47:42] dst; [53:48] rst; [85:54] immediate.
+        SEMAPHORE overrides [42:36] with the 7-bit engine index from src_reg_idx.
 
         After append, :attr:`_inst_id` is incremented (same pattern as :meth:`ue_op_descriptor`).
         """
@@ -9064,6 +9302,9 @@ class UnifiedEngine:
                 ((dst_reg_idx & 0x3F) << 10) |
                 ((rst_reg_idx & 0x3F) << 16) |
                 ((immediate_value & 0x3FF) << 22))
+        if inst_type == INSTRUCTION_FLAG:
+            # Semaphore [42:36] is a 7-bit engine index, not a GPR index.
+            w[1] = (isa_mode & 0xF) | ((src_reg_idx & 0x7F) << 4)
         w[2] = (immediate_value >> 10) & 0x3FFFFF
 
         self.capture_buffer.append(inst)
@@ -9550,10 +9791,10 @@ class UnifiedEngine:
         Spin-wait until target engine's flag is 1 before proceeding.
 
         Args:
-            target_engine_idx: Engine index (0-15) whose flag to wait on
+            target_engine_idx: Engine index (0-127) whose flag to wait on
         """
-        if target_engine_idx < 0 or target_engine_idx > 15:
-            print(f"ERROR: target_engine_idx must be 0-15, got {target_engine_idx}")
+        if target_engine_idx < 0 or target_engine_idx > 127:
+            print(f"ERROR: target_engine_idx must be 0-127, got {target_engine_idx}")
             return
         self.ue_isa_descriptor(INSTRUCTION_FLAG, isa_mode=FLAG_MODE_CHECK_SET,
                                src_reg_idx=target_engine_idx)
@@ -9566,10 +9807,10 @@ class UnifiedEngine:
         Spin-wait until target engine's flag is 0 before proceeding.
 
         Args:
-            target_engine_idx: Engine index (0-15) whose flag to wait on
+            target_engine_idx: Engine index (0-127) whose flag to wait on
         """
-        if target_engine_idx < 0 or target_engine_idx > 15:
-            print(f"ERROR: target_engine_idx must be 0-15, got {target_engine_idx}")
+        if target_engine_idx < 0 or target_engine_idx > 127:
+            print(f"ERROR: target_engine_idx must be 0-127, got {target_engine_idx}")
             return
         self.ue_isa_descriptor(INSTRUCTION_FLAG, isa_mode=FLAG_MODE_CHECK_CLEAR,
                                src_reg_idx=target_engine_idx)
