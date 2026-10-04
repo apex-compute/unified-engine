@@ -202,6 +202,9 @@ class Qwen25OmniVisionMixin:
         # params.bin actually has, so an old, not-yet-reconverted params.bin
         # for THIS model keeps working unchanged via the padded path.
         self._vis_qk_compact = f"visual.blocks.0.attn.qk.weight.{sfx}" in sections
+        if getattr(self, "vision_qkv_strip", False) and not self._vis_qk_compact:
+            raise ValueError("--vis-qkv-strip needs compact attn.qk/attn.v weights; "
+                             "rebuild params.bin with the current converter")
         qk_key = "attn.qk" if self._vis_qk_compact else "attn.qk_padded"
         v_key = "attn.v" if self._vis_qk_compact else "attn.v_padded"
 
@@ -492,6 +495,13 @@ class Qwen25OmniVisionMixin:
         self.VIS_MLP_GATE = alloc(VS * VI_PAD, "vis.mlp_gate")
         self.VIS_MLP_UP = alloc(VS * VI_PAD, "vis.mlp_up")
         self.VIS_MLP_MULT = alloc(VS * VI_PAD, "vis.mlp_mult")
+        if getattr(self, "vision_mlp_real_n", False):
+            # gate/up write only VI real lanes into VI_PAD-wide rows. The
+            # untouched tail must remain zero through all 32 layers because
+            # down_proj still contracts over the 64-aligned K=VI_PAD.
+            mlp_zeros = torch.zeros(VS * VI_PAD, dtype=torch.bfloat16)
+            self._vis_pending_dmas.extend((addr, mlp_zeros)
+                                          for addr in (self.VIS_MLP_GATE, self.VIS_MLP_UP))
         self.VIS_MLP_DOWN = alloc(VS * VH, "vis.mlp_down")
 
         # Merger. The 2x2 spatial merge is a pure reinterpretation of
@@ -665,7 +675,16 @@ class Qwen25OmniVisionMixin:
         self.start_capture()
         gate_m_regs = None
         qk_compact = getattr(self, "_vis_qk_compact", False)
+        qkv_strip = bool(getattr(self, "vision_qkv_strip", False))
+        mlp_real_n = bool(getattr(self, "vision_mlp_real_n", False))
+        if qkv_strip and not qk_compact:
+            raise ValueError("vision QKV strip write-back requires compact weights")
+        if qkv_strip and (vis["VD_HALF"] % 2 or VD % 2 or VH != VN * VD):
+            raise ValueError("vision QKV strips require even head halves and VH=VN*VD")
+        if mlp_real_n and vis["VI"] % 4:
+            raise ValueError("vision real MLP width must be a multiple of four")
         qk_out_stride_regs = v_out_stride_regs = None
+        mlp_out_stride_regs = None
         if sched is not None:
             sched.register_per_engine_addrs("vision_attn_scratch",
                                             self.VIS_ATTN_SCRATCH_PER_ENGINE)
@@ -688,11 +707,20 @@ class Qwen25OmniVisionMixin:
                     r2 = eng.alloc_isa_reg()
                     eng.generate_instruction_add_set(r2, VN * VD_PAD)
                     v_out_stride_regs.append(r2)
+            if mlp_real_n:
+                mlp_out_stride_regs = []
+                for eng in (self, *sched.workers):
+                    r = eng.alloc_isa_reg()
+                    eng.generate_instruction_add_set(r, VI_PAD)
+                    mlp_out_stride_regs.append(r)
         elif qk_compact:
             qk_out_stride_regs = [self.alloc_isa_reg()]
             self.generate_instruction_add_set(qk_out_stride_regs[0], 2 * VN * VD_PAD)
             v_out_stride_regs = [self.alloc_isa_reg()]
             self.generate_instruction_add_set(v_out_stride_regs[0], VN * VD_PAD)
+        if sched is None and mlp_real_n:
+            mlp_out_stride_regs = [self.alloc_isa_reg()]
+            self.generate_instruction_add_set(mlp_out_stride_regs[0], VI_PAD)
         prev_silent = self._set_silent(True)
         flops = 0
         self._vis_checkpoints = []
@@ -709,7 +737,9 @@ class Qwen25OmniVisionMixin:
                 [name, resume, int(flops - _ckpt_flops[0])])
             _ckpt_flops[0] = int(flops)
 
-        def matmul(M, K, N, A, w, tag, OUT, *, silu=False, gelu=False, bias=True):
+        def matmul(M, K, N, A, w, tag, OUT, *, silu=False, gelu=False,
+                   bias=True, out_stride_reg=None, strip_cols=None,
+                   strip_out_stride=None):
             return self.matmat_mul_core(
                 M=M, K=K, N=N, A_DRAM_ADDR=A,
                 B_DRAM_ADDR=w[f"{tag}_data"], OUTPUT_DRAM_ADDR=OUT,
@@ -718,10 +748,14 @@ class Qwen25OmniVisionMixin:
                 C_DRAM_ADDR=w[f"{tag}_bias"] if bias else None,
                 bias_mode="broadcast_N" if bias else None,
                 silu_enable=silu, gelu_enable=gelu,
-                gpr_M_reg=self._prime_M(M)) or 0
+                gpr_M_reg=self._prime_M(M),
+                gpr_out_row_stride_reg=out_stride_reg,
+                strip_cols=strip_cols,
+                strip_out_stride=strip_out_stride) or 0
 
         def sh_matmul(ctx, m_reg, K, N, A, A_row, w, tag, OUT, OUT_row,
-                      *, silu=False, gelu=False):
+                      *, silu=False, gelu=False, out_stride_reg=None,
+                      strip_cols=None, strip_out_stride=None):
             """One engine's row-block of a projection. Bias is per-COLUMN
             (broadcast_N), so it is shared, not sliced."""
             ctx.ue.generate_instruction_add_set(m_reg, ctx.rows)
@@ -733,7 +767,10 @@ class Qwen25OmniVisionMixin:
                 is_B_quantized=True, data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=w[f"{tag}_scale"],
                 C_DRAM_ADDR=w[f"{tag}_bias"], bias_mode="broadcast_N",
-                silu_enable=silu, gelu_enable=gelu, gpr_M_reg=m_reg) or 0
+                silu_enable=silu, gelu_enable=gelu, gpr_M_reg=m_reg,
+                gpr_out_row_stride_reg=out_stride_reg,
+                strip_cols=strip_cols,
+                strip_out_stride=strip_out_stride) or 0
 
         def matmul_slot(M, K, N, A, data_addr, scale_addr, bias_addr, OUT,
                         *, stride_reg):
@@ -790,7 +827,20 @@ class Qwen25OmniVisionMixin:
                 flops += self.rms_norm_core_dram(
                     M=VS, N=VH, A_DRAM_ADDR=IN, OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT,
                     GAMMA_DRAM_ADDR=w["norm1_weight"], gpr_M_reg=self._prime_M(VS)) or 0
-                if qk_compact:
+                if qkv_strip:
+                    # One Q+K projection and one V projection per layer.
+                    # The strip writer maps each real RoPE half [40] into a
+                    # 64-lane slot, and each real V head [80] into a 128-lane
+                    # attention slot. The pad lanes were zeroed once above.
+                    flops += matmul(
+                        VS, VH, 2 * VH, self.VIS_NORM_OUT, w, "qk", self.VIS_QK,
+                        out_stride_reg=qk_out_stride_regs[0],
+                        strip_cols=VD_HALF, strip_out_stride=VD_PAD // 2)
+                    flops += matmul(
+                        VS, VH, VH, self.VIS_NORM_OUT, w, "v", self.VIS_V,
+                        out_stride_reg=v_out_stride_regs[0],
+                        strip_cols=VD, strip_out_stride=VD_PAD)
+                elif qk_compact:
                     # Each head (V) / head-half (QK, RoPE) is its own REAL-
                     # width matmul, writing straight to its final padded slot
                     # via gpr_out_row_stride_reg -- no scatter, no compact
@@ -835,7 +885,18 @@ class Qwen25OmniVisionMixin:
                         A_DRAM_ADDR=ctx.rows_addr(IN, h_row),
                         OUTPUT_DRAM_ADDR=ctx.rows_addr(self.VIS_NORM_OUT, h_row),
                         GAMMA_DRAM_ADDR=w["norm1_weight"], gpr_M_reg=m) or 0
-                    if qk_compact:
+                    if qkv_strip:
+                        acc[0] += sh_matmul(
+                            ctx, m, VH, 2 * VH, self.VIS_NORM_OUT, h_row,
+                            w, "qk", self.VIS_QK, qk_row_bytes,
+                            out_stride_reg=qk_out_stride_regs[ctx.engine_idx],
+                            strip_cols=VD_HALF, strip_out_stride=VD_PAD // 2)
+                        acc[0] += sh_matmul(
+                            ctx, m, VH, VH, self.VIS_NORM_OUT, h_row,
+                            w, "v", self.VIS_V, v_row_bytes,
+                            out_stride_reg=v_out_stride_regs[ctx.engine_idx],
+                            strip_cols=VD, strip_out_stride=VD_PAD)
+                    elif qk_compact:
                         sreg_qk = qk_out_stride_regs[ctx.engine_idx]
                         sreg_v = v_out_stride_regs[ctx.engine_idx]
                         for proj in range(2):
@@ -1035,9 +1096,13 @@ class Qwen25OmniVisionMixin:
                     M=VS, N=VH, A_DRAM_ADDR=self.VIS_RESIDUAL,
                     OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT,
                     GAMMA_DRAM_ADDR=w["norm2_weight"], gpr_M_reg=self._prime_M(VS)) or 0
-                flops += matmul(VS, VH, VI_PAD, self.VIS_NORM_OUT, w, "gate",
-                                self.VIS_MLP_GATE, silu=True)
-                flops += matmul(VS, VH, VI_PAD, self.VIS_NORM_OUT, w, "up", self.VIS_MLP_UP)
+                mlp_n = vis["VI"] if mlp_real_n else VI_PAD
+                mlp_stride = mlp_out_stride_regs[0] if mlp_real_n else None
+                flops += matmul(VS, VH, mlp_n, self.VIS_NORM_OUT, w, "gate",
+                                self.VIS_MLP_GATE, silu=True,
+                                out_stride_reg=mlp_stride)
+                flops += matmul(VS, VH, mlp_n, self.VIS_NORM_OUT, w, "up",
+                                self.VIS_MLP_UP, out_stride_reg=mlp_stride)
                 flops += self.eltwise_core_dram(
                     M=VS, N=VI_PAD, dram_a=self.VIS_MLP_GATE, dram_b=self.VIS_MLP_UP,
                     dram_out=self.VIS_MLP_MULT, mode=UE_MODE.ELTWISE_MUL,
@@ -1078,11 +1143,16 @@ class Qwen25OmniVisionMixin:
                         A_DRAM_ADDR=ctx.rows_addr(self.VIS_RESIDUAL, h_row),
                         OUTPUT_DRAM_ADDR=ctx.rows_addr(self.VIS_NORM_OUT, h_row),
                         GAMMA_DRAM_ADDR=w["norm2_weight"], gpr_M_reg=m) or 0
-                    acc[0] += sh_matmul(ctx, m, VH, VI_PAD, self.VIS_NORM_OUT,
+                    mlp_n = vis["VI"] if mlp_real_n else VI_PAD
+                    mlp_stride = (mlp_out_stride_regs[ctx.engine_idx]
+                                  if mlp_real_n else None)
+                    acc[0] += sh_matmul(ctx, m, VH, mlp_n, self.VIS_NORM_OUT,
                                         h_row, w, "gate", self.VIS_MLP_GATE,
-                                        mlp_row, silu=True)
-                    acc[0] += sh_matmul(ctx, m, VH, VI_PAD, self.VIS_NORM_OUT,
-                                        h_row, w, "up", self.VIS_MLP_UP, mlp_row)
+                                        mlp_row, silu=True,
+                                        out_stride_reg=mlp_stride)
+                    acc[0] += sh_matmul(ctx, m, VH, mlp_n, self.VIS_NORM_OUT,
+                                        h_row, w, "up", self.VIS_MLP_UP, mlp_row,
+                                        out_stride_reg=mlp_stride)
                     ctx.ue.generate_instruction_add_set(m, ctx.rows)
                     acc[0] += ctx.ue.eltwise_core_dram(
                         M=ctx.rows, N=VI_PAD,
@@ -1133,6 +1203,10 @@ class Qwen25OmniVisionMixin:
         self.generate_instruction_halt()
         worker_addrs = sched.finalize() if sched is not None else []
         if sched is not None:
+            if mlp_real_n:
+                for wk in reversed(sched.workers):
+                    wk.release_isa_reg()
+                self.release_isa_reg()
             if qk_compact:
                 # Release in exact reverse of the per-engine alloc order
                 # (qk_out_stride_regs then v_out_stride_regs, self then
@@ -1147,9 +1221,12 @@ class Qwen25OmniVisionMixin:
                 self.release_isa_reg()
             for wk in reversed(sched.workers):
                 wk.release_isa_reg()
-        elif qk_compact:
-            self.release_isa_reg()
-            self.release_isa_reg()
+        else:
+            if mlp_real_n:
+                self.release_isa_reg()
+            if qk_compact:
+                self.release_isa_reg()
+                self.release_isa_reg()
         self._set_silent(prev_silent)
         self.stop_capture()
 

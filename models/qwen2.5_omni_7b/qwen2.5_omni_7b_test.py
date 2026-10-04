@@ -438,7 +438,8 @@ class Qwen25OmniUnifiedEngine(
                  fpga_build: int | None = None,
                  vision_res: str = DEFAULT_VISION_RES,
                  fpga_talker: bool = False, layout: str = "windowed",
-                 flat_plan=None):
+                 flat_plan=None, vision_qkv_strip: bool = False,
+                 vision_mlp_real_n: bool = False):
         if multi_core != REQUIRED_ENGINES:
             raise ValueError(
                 f"Qwen2.5-Omni-7B requires exactly {REQUIRED_ENGINES} engines, "
@@ -453,6 +454,10 @@ class Qwen25OmniUnifiedEngine(
         self.multi_core = multi_core
         self.fpga_talker = bool(fpga_talker)
         self.speak_as: str | None = None      # set before weight/tensor init
+        # Software preparation only: these change the vision ISA, never the
+        # default path. Non-64-column writes require an unaligned-DMA image.
+        self.vision_qkv_strip = bool(vision_qkv_strip)
+        self.vision_mlp_real_n = bool(vision_mlp_real_n)
         self.fpga_build = None if fpga_build is None else int(fpga_build)
         self._multi_core_schedulers: dict[str, MultiEngineScheduler] = {}
         self._worker_isa_used: dict[int, dict[str, int]] = {}
@@ -2933,6 +2938,8 @@ def _request_signature(ue, args, context, tokens, processed) -> dict:
             + (["t2w"] if args.speak is not None and not args.speak_host
                and not args.token2wav_host else [])),
         "vision_res": args.vision_res, "frames": int(args.frames),
+        "vision_qkv_strip": bool(args.vis_qkv_strip),
+        "vision_mlp_real_n": bool(args.vis_mlp_real_n),
         "max_context": int(ue.MAX_CONTEXT_SIZE), "profile": bool(args.profile),
         "prefill_tokens": len(context), "prompt_tokens": len(tokens),
         "t2w_max_codes": int(T2W_FPGA_MAX_CODES),
@@ -4020,6 +4027,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"optional image; bare --image uses {os.path.basename(DEFAULT_IMAGE)}",
     )
     parser.add_argument(
+        "--vis-qkv-strip", action="store_true",
+        help="experimental software-only preparation: fuse each vision Q/K "
+             "projection into one real-width matmul (40-column RoPE-half "
+             "strips) and V into one (80-column head strips), writing into "
+             "128-lane attention slots. Requires unaligned-DMA hardware; "
+             "default off and not hardware-verified",
+    )
+    parser.add_argument(
+        "--vis-mlp-real-n", action="store_true",
+        help="experimental software-only preparation: vision gate/up use "
+             "real N=3420 with row pitch 3456; down K remains 3456. "
+             "Requires unaligned-DMA hardware; default off and not "
+             "hardware-verified",
+    )
+    parser.add_argument(
         "--frames", type=int, default=1, metavar="N",
         help="with --image, encode this many camera frames in one real "
              "continuous run (a multi-camera workload) instead of one. Each "
@@ -4154,6 +4176,10 @@ def run_summary_filename(args) -> str:
             parts.append("t2whost")
     if getattr(args, "profile", False):
         parts.append("profile")
+    if getattr(args, "vis_qkv_strip", False):
+        parts.append("vis-qkv-strip")
+    if getattr(args, "vis_mlp_real_n", False):
+        parts.append("vis-mlp-real-n")
     parts.append(f"multi-core_{args.multi_core}")
     return "_".join(parts) + ".md"
 
@@ -4186,6 +4212,8 @@ def main() -> None:
         print("[run_from_bin] only applies to --layout flat; the windowed layout "
               "always builds its programs")
         args.run_from_bin = False
+    if (args.vis_qkv_strip or args.vis_mlp_real_n) and not args.image:
+        parser.error("vision pad-removal switches require --image")
     with _exclusive_run_lock():
         _main_locked(parser, args)
 
@@ -4263,6 +4291,8 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         fpga_talker=args.speak is not None and not args.speak_host,
         layout=args.layout,
         flat_plan=flat_plan,
+        vision_qkv_strip=args.vis_qkv_strip,
+        vision_mlp_real_n=args.vis_mlp_real_n,
         **engine_kwargs
     )
     ue.speak_as = args.speak          # before lm_tensor_init sizes the buffers
