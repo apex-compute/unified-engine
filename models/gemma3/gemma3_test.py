@@ -45,6 +45,9 @@ import time
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, calculate_snr
 from user_dma_core import UnifiedEngine
+
+# Bank B follows 4096 BF16 rows; its byte base grows with the lane count.
+URAM_B_SCRATCH = 4096 * UE_VECTOR_SIZE * 2 + 0x10000
 from multi_engine_shard import (ALVEO_BOARD_CORES, ALVEO_U55C_BOARD_CORES,
                                 MULTICORE_WINDOW_BYTES, board_private_windows,
                                 multicore_arena_bytes, require_multicore_dram)
@@ -402,7 +405,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     run_prefill/run_decoder (numeric checks in gemma3_numeric.py).
     """
 
-    def __init__(self, script_dir: str | None = None, local_weights: bool = False, legacy: bool = False, matmatmul: bool = False, two_pass_prefill: bool = False, multi_core: int = 1):
+    def __init__(self, script_dir: str | None = None, local_weights: bool = False, legacy: bool = False, matmatmul: bool = False, two_pass_prefill: bool = False, multi_core: int = 1, initialize_model: bool = True):
         # A multicore run on a 12-core bitstream uses twelve fixed 512 MB slots
         # below 6 GB and moves the primary's unchanged 2 GB layout to [6, 8 GB).
         # Other hardware, and single-core runs, retain the historical addresses.
@@ -494,6 +497,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.prefill_seq = None 
 
         self._weights_bin_rel = "gemma3_bin/full_model_weights.bin" if local_weights else paths["weights_bin"]
+        # Library callers can supply the existing packed embedding/weights without
+        # loading a second full Hugging Face model or initializing hardware here.
+        if not initialize_model:
+            return
         self.weight_init()
         self.tensor_init()
         if self._use_multicore_dram_layout:
@@ -662,7 +669,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         """
         seq_len = self.MAX_CONTEXT_SIZE
         q_seq_len = seq_len * self.group_size
-        aligned_seq_len_q = ((q_seq_len + 63) // 64) * 64
+        aligned_seq_len_q = ((q_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         self.FLASH_ATTN_ROWS = aligned_seq_len_q
 
         print(f"Allocate tensor dram start at DRAM address: 0x{self.get_tensor_dram_addr():X}")
@@ -814,7 +821,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         ``gpr_aligned_seq_len`` for the actual runtime row count, so the static M only affects FLOPs and
         asserts — not the captured program semantics). The captured program reads the *real*
         seq_len at execute time from three GPRs the **caller must prime before entering this
-        program**: ``self.gpr_seq_len``, ``self.gpr_q_seq_len``, ``self.gpr_aligned_seq_len`` (64-aligned
+        program**: ``self.gpr_seq_len``, ``self.gpr_q_seq_len``, ``self.gpr_aligned_seq_len`` (lane-aligned
         seq_len). This function emits **no** ADD_SETs for these registers, so a single
         cached prefill bin works for any real prefill_seq_len.
 
@@ -845,11 +852,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         count_at_start = self.capture_count
         seq_len = prefill_seq_len
         q_seq_len = seq_len * self.group_size
-        aligned_seq_len_q = ((q_seq_len + 63) // 64) * 64
+        aligned_seq_len_q = ((q_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         # Proper-GQA per-head attention runs over the compact (seq_len-long) KV, so
-        # its static batch/aligned are seq_len / align64(seq_len), not the q_seq_len
+        # its static batch/aligned are seq_len / align_lanes(seq_len), not the q_seq_len
         # values (which only size the token-major Q/OUTPUT scratch buffers).
-        aligned_seq_len = ((seq_len + 63) // 64) * 64
+        aligned_seq_len = ((seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         checkpoints: list[list] = []
 
         # Running FLOPs mark, so each checkpoint can record what the step it closes cost.
@@ -1248,7 +1255,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             # attention cost from O((seq_len*group_size)^2) into
             # group_size * O(seq_len^2) — a group_size-fold reduction.
             head_bytes = self.head_dim * self.bytes_per_element
-            per_head_rows = ((self.PREFILL_MAX_SEQ_LEN + 63) // 64) * 64
+            per_head_rows = ((self.PREFILL_MAX_SEQ_LEN + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
             qhm_head_bytes = per_head_rows * head_bytes
             # Q token-major -> head-major (into freed FLASH_K per-head slots).
             for g in range(self.group_size):
@@ -1263,7 +1270,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             # head_dim is a model constant, so it is kept BAKED (no gpr_head_dim_reg)
             # — the V transpose and Q pre-scale then take their validated
             # dynamic-M / N-baked paths. Only batch (seq_len) and aligned_seq_len
-            # (align64(seq_len)) are runtime. K/V bases are sourced from the
+            # (align_lanes(seq_len)) are runtime. K/V bases are sourced from the
             # per-layer KV GPR (kv_addr — the identical gpr-address path the
             # decoder fold uses); Q/OUT/bias bases are layer-invariant scratch
             # (const_addr); the 1/sqrt(head_dim) scale from gpr_attn_scale.
@@ -1272,7 +1279,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 flash_attention_result = self.unified_attention_core(
                     batch=seq_len,
                     # aligned_seq_len is the compile-time MAX per-head aligned KV
-                    # length (per_head_rows = align64(PREFILL_MAX_SEQ_LEN)); it sizes
+                    # length (per_head_rows = align_lanes(PREFILL_MAX_SEQ_LEN)); it sizes
                     # the core's scratch sub-buffers (Vᵀ / score / scaled_q) so they
                     # never overlap at any runtime length. The real KV length is
                     # primed into gpr_aligned_seq_len at run time (dynamic path), and
@@ -1590,7 +1597,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 # the compact per-layer K/V; head-major OUT permuted back to
                 # token-major FLASH_OUTPUT for the O projection.
                 head_bytes = self.head_dim * self.bytes_per_element
-                per_head_rows = ((self.PREFILL_MAX_SEQ_LEN + 63) // 64) * 64
+                per_head_rows = ((self.PREFILL_MAX_SEQ_LEN + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
                 qhm_head_bytes = per_head_rows * head_bytes
                 k_cache_base = self.LAYER0_K_ROPE_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
                 v_cache_base = self.LAYER0_V_DRAM + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
@@ -1743,9 +1750,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "size_bytes": prefill_program_size,
             "flops": total_flops,
             # Prefill attention is compiled with batch=prefill_seq_len but a FIXED per-head KV
-            # length of align64(PREFILL_MAX_SEQ_LEN) -- the scratch-sizing maximum, not the
+            # length of align_lanes(PREFILL_MAX_SEQ_LEN) -- the scratch-sizing maximum, not the
             # template seq_len. Both are needed to rescale the step to a run's real shape.
-            "attn_aligned_seq_len": ((self.PREFILL_MAX_SEQ_LEN + 63) // 64) * 64,
+            "attn_aligned_seq_len": ((self.PREFILL_MAX_SEQ_LEN + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE,
             "checkpoints": checkpoints,
         }
         
@@ -1906,14 +1913,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             # ``use_pbi is False`` (legacy) fallback.
             return self._compile_decoder_programs_folded(layer_size=layer_size, profile=profile)
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
-        decoder_aligned_seq_len = ((self.MAX_CONTEXT_SIZE + 63) // 64) * 64
+        decoder_aligned_seq_len = ((self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
 
         decoder_count_at_start = self.capture_count
         count_at_start = self.capture_count
         total_flops = 0
         # Attention FLOPs are tracked separately from the rest: they are the ONLY part of a
         # decode step whose cost depends on the KV length, and they are compiled at the
-        # worst case (decoder_aligned_seq_len == align64(MAX_CONTEXT_SIZE)). run_gemma3_decode
+        # worst case (decoder_aligned_seq_len == align_lanes(MAX_CONTEXT_SIZE)). run_gemma3_decode
         # rescales this component by the real aligned KV length of each token.
         attn_flops = 0
         checkpoints: list[list] = []
@@ -2043,8 +2050,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                           OUTPUT_DRAM_ADDR=self.LAYER0_POST_ATTN_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA + layer_off, gpr_M_reg=gpr_rms_m1)
 
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
-            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=URAM_B_SCRATCH, element_size=self.vector_length)
+            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=URAM_B_SCRATCH, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
             if profile:
                 _checkpoint(f"L{layer_idx}_o_proj_post_attn_norm_residual")
@@ -2073,8 +2080,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 )
 
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
-            self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=URAM_B_SCRATCH, element_size=self.mlp_elements)
+            self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=URAM_B_SCRATCH, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
             if profile:
                 _checkpoint(f"L{layer_idx}_mlp_gateup_gelu_mul")
@@ -2091,8 +2098,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                           OUTPUT_DRAM_ADDR=self.LAYER0_POST_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off, gpr_M_reg=gpr_rms_m1)
 
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
-            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_MLP_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
-            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+            self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_MLP_NORM_DRAM, sram_address=URAM_B_SCRATCH, element_size=self.vector_length)
+            self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=URAM_B_SCRATCH, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
             if profile:
                 _checkpoint(f"L{layer_idx}_mlp_down_post_ffn_norm_residual")
@@ -2160,7 +2167,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         """
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         KV_CACHE_LAYER_STRIDE = self.MAX_CONTEXT_SIZE * self.k_size
-        decoder_aligned_seq_len = ((self.MAX_CONTEXT_SIZE + 63) // 64) * 64
+        decoder_aligned_seq_len = ((self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         bpe = self.bytes_per_element
 
         decoder_count_at_start = self.capture_count
@@ -2168,7 +2175,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         total_flops = 0
         # Attention FLOPs are tracked separately from the rest: they are the ONLY part of a
         # decode step whose cost depends on the KV length, and they are compiled at the
-        # worst case (decoder_aligned_seq_len == align64(MAX_CONTEXT_SIZE)). run_gemma3_decode
+        # worst case (decoder_aligned_seq_len == align_lanes(MAX_CONTEXT_SIZE)). run_gemma3_decode
         # rescales this component by the real aligned KV length of each token.
         attn_flops = 0
         checkpoints: list[list] = []
@@ -2581,8 +2588,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         # --- post-attention residual (SRAM-staged; layer-invariant buffers, literal addrs) ---
         self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_INPUT_DRAM, sram_address=0x10000, element_size=self.vector_length)
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
-        self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_NORM_DRAM, sram_address=URAM_B_SCRATCH, element_size=self.vector_length)
+        self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=URAM_B_SCRATCH, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
         self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
         if profile:
             _checkpoint("o_proj_post_attn_norm_residual")
@@ -2634,8 +2641,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         # --- gate * up (SRAM-staged) ---
         self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
-        self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
+        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=URAM_B_SCRATCH, element_size=self.mlp_elements)
+        self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=URAM_B_SCRATCH, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
         self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
         if profile:
             _checkpoint("mlp_gateup_gelu_mul")
@@ -2671,8 +2678,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         # --- post-MLP residual (SRAM-staged) -> LAYER0_OUTPUT_DRAM ---
         self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
-        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_MLP_NORM_DRAM, sram_address=0x90000, element_size=self.vector_length)
-        self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+        self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_MLP_NORM_DRAM, sram_address=URAM_B_SCRATCH, element_size=self.vector_length)
+        self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=URAM_B_SCRATCH, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
         self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
         if profile:
             _checkpoint("mlp_down_post_ffn_norm_residual")
@@ -2836,7 +2843,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         so the same bin works across all prompt lengths and we only need to compile once.
 
         The decoder program is also captured once; grouped attention uses ``gpr_aligned_seq_len``
-        (64-aligned seq_len). Each decode step rebuilds a tiny dispatch stub that sets
+        (lane-aligned seq_len). Each decode step rebuilds a tiny dispatch stub that sets
         ``gpr_aligned_seq_len`` then jumps into the cached decoder program.
 
         By default the image is always recompiled from scratch. Pass ``bin_reuse=True``
@@ -2877,9 +2884,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         print(f"Decode kernel: {'matmat_mul_core (two-pass)' if self.matmatmul else 'quantized_matmat_core (streaming)'}")
         print(f"Prefill kernel: {'two-pass (matmat_mul_core)' if self.two_pass_prefill else 'streaming (quantized_matmat_core)'}")
         if bin_reuse and os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
-            print(f"--bin-reuse: reusing existing instruction image at {instruction_bin_path}")
-            print(f"  delete {instruction_bin_path} (or drop --bin-reuse) to force recompile.")
-            return
+            with open(instruction_meta_path) as stream:
+                cached_geometry = json.load(stream)
+            if (cached_geometry.get("vector_size") == UE_VECTOR_SIZE
+                    and cached_geometry.get("axi_width") == user_dma_core.UE_AXI_DATA_WIDTH_BITS):
+                print(f"--bin-reuse: reusing existing instruction image at {instruction_bin_path}")
+                print(f"  delete {instruction_bin_path} (or drop --bin-reuse) to force recompile.")
+                return
+            print("Recompiling instruction image for the current lane/AXI geometry.")
         print("Compiling instruction image from scratch"
               f"{' (--bin-reuse set but no cached bin found)' if bin_reuse else ''}.")
 
@@ -2959,6 +2971,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "decoder_attn_flops": decoder_program["attn_flops"],
             "decoder_attn_aligned_seq_len": decoder_program["attn_aligned_seq_len"],
         }
+        metadata.update(vector_size=UE_VECTOR_SIZE, axi_width=user_dma_core.UE_AXI_DATA_WIDTH_BITS)
         if profile:
             # Both prefill and decoder are FOLDED (one body hardware-looped `layer_size`×), so each
             # checkpoint fires once per layer at runtime. run_gemma3_profile walks all iterations and
@@ -3142,17 +3155,17 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.seq_len = prefill_seq_len
 
         q_seq_len = prefill_seq_len * self.group_size
-        aligned_seq_len_q = ((q_seq_len + 63) // 64) * 64
+        aligned_seq_len_q = ((q_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         self._zero_kv_cache()
         self._zero_flash_attention_inputs()
 
         # --- Prefill preamble + inputs ---
         self.clear_inst_id()
         self.start_capture()
-        # Proper GQA: prime gpr_aligned_seq_len with align64(seq_len) (compact KV
-        # length), NOT align64(q_seq_len) — the per-head attention loop reads the
+        # Proper GQA: prime gpr_aligned_seq_len with align_lanes(seq_len) (compact KV
+        # length), NOT align_lanes(q_seq_len) — the per-head attention loop reads the
         # un-duplicated K/V cache.
-        aligned_seq_len = ((prefill_seq_len + 63) // 64) * 64
+        aligned_seq_len = ((prefill_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         self.generate_instruction_add_set(self.gpr_seq_len, prefill_seq_len)
         self.generate_instruction_add_set(self.gpr_q_seq_len, q_seq_len)
         self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
@@ -3181,11 +3194,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             # this run (run_gemma3_prefill rescales its total the same way).
             _tmpl_seq = int(meta.get("prefill_template_seq_len", prefill_seq_len)) or prefill_seq_len
             _seq_scale = prefill_seq_len / _tmpl_seq
-            _align = lambda n: ((n + 63) // 64) * 64
+            _align = lambda n: ((n + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
             # Attention carries TWO compile-time shapes, and they rescale differently:
             #   batch = the template seq_len          -> linear, like every other step
-            #   KV    = align64(PREFILL_MAX_SEQ_LEN)  -> a fixed max, and the run's real KV
-            #           length (align64(seq_len), what gpr_aligned_seq_len holds) is smaller.
+            #   KV    = align_lanes(PREFILL_MAX_SEQ_LEN)  -> a fixed max, and the run's real KV
+            #           length (align_lanes(seq_len), what gpr_aligned_seq_len holds) is smaller.
             # Scaling by the seq ratio alone leaves the KV dimension pinned at the max and
             # overstates the step; hence the product.
             _pf_attn_aligned = int(meta.get("prefill_attn_aligned_seq_len", 0))
@@ -3216,7 +3229,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             return (order, step_ms, step_flops, total_ms). Only the shapes matter here — the
             cache below the current position is whatever the previous pass left in DRAM, so the
             logits are meaningless; this measures the latency of a decode at that context length."""
-            aligned = ((token_pos + 63) // 64) * 64
+            aligned = ((token_pos + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
             self.seq_len = token_pos
             self._zero_flash_attention_inputs()
             embedding_tensor = self.get_embedding_for_tokens([token_id])
@@ -3368,9 +3381,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         seq_len = prefill_seq_len
         q_seq_len = seq_len * self.group_size
-        aligned_seq_len_q = ((q_seq_len + 63) // 64) * 64
-        # Proper GQA: gpr_aligned_seq_len holds the compact KV length align64(seq_len).
-        aligned_seq_len = ((seq_len + 63) // 64) * 64
+        aligned_seq_len_q = ((q_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+        # Proper GQA: gpr_aligned_seq_len holds the compact KV length align_lanes(seq_len).
+        aligned_seq_len = ((seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
 
         # ----- Runtime preamble: prime three GPRs, then jump into the cached prefill -----
         self.clear_inst_id()
@@ -3456,7 +3469,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         def _token_flops(aligned_kv_len: int):
             """Decode FLOPs for ONE token at a real 64-aligned KV length.
 
-            The compiled constant costs attention at align64(MAX_CONTEXT_SIZE) — the worst
+            The compiled constant costs attention at align_lanes(MAX_CONTEXT_SIZE) — the worst
             case — because the decoder program is KV-length-agnostic (the real length only
             reaches the hardware through gpr_aligned_seq_len). Everything else in a decode
             step (projections, MLP, LM head; all M=1) is genuinely position-invariant, so
@@ -3539,7 +3552,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             decoder_token_cnt += 1
             _SILENT_MODE = True
             self.seq_len += 1
-            aligned_seq_len_q = ((self.seq_len + 63) // 64) * 64
+            aligned_seq_len_q = ((self.seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
             # Workers run one folded pass per token and HALT, so they are relaunched each
             # token; they immediately block on the primary's first release flag.
             if self.shard_group is not None:

@@ -197,6 +197,16 @@ def ue_assert_axi_beat_aligned_bytes(nbytes: int, what: str, hint: str = "") -> 
 
 
 # DMA device paths (can be overridden by command-line argument)
+# LARGEST SINGLE host->card os.write(). A 714 MB weight load issued as one
+# write makes the driver pin one mapping that large, which fails with ENOMEM on
+# a host whose memory has fragmented under an hour of big transfers -- while a
+# 157 MB write at the same moment succeeds. 64 MiB sits well inside what was
+# observed to work and costs nothing measurable: the transfers are already
+# bandwidth-bound, not syscall-bound. UE_DMA_MAX_CHUNK_MB overrides it.
+DMA_MAX_CHUNK_BYTES = int(os.environ.get("UE_DMA_MAX_CHUNK_MB", "64")) * 1024 * 1024
+if DMA_MAX_CHUNK_BYTES <= 0:
+    raise ValueError("UE_DMA_MAX_CHUNK_MB must be a positive number of MiB")
+
 DMA_DEVICE_H2C = "/dev/xdma0_h2c_0"
 DMA_DEVICE_C2H = "/dev/xdma0_c2h_0"
 DMA_DEVICE_USER = "/dev/xdma0_user"  # AXI-Lite user interface for register access
@@ -1207,7 +1217,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.user_read_reg32(UE_FPGA_VERSION_ADDR)
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xf6ca9b81, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xf6ca9b81. Please update FPGA with commit update_f6ca9b81.bin using update_flash.py (public release v1.4)"
+        assert hw_version == 0xa4b919c2, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xa4b919c2. Please update FPGA with commit update_a4b919c2.bin using update_flash.py (public release v1.4)"
 
         addr = UE_START_ADDR # first reg address offset
         while addr <= UE_LAST_REG_ADDR: # last reg address
@@ -1356,7 +1366,12 @@ class UnifiedEngine:
             size: Size in bytes to write
 
         Returns:
-            Number of bytes written, or -1 on error
+            Number of bytes written, which always equals ``size`` on success.
+
+        Raises:
+            OSError: the transfer failed or was short. It is NOT reported as a
+                -1 return: a caller that ignores the value would then run
+                against DRAM that was never written.
         """
         try:
             # Convert buffer to bytes
@@ -1409,16 +1424,70 @@ class UnifiedEngine:
                 # Seek to address
                 os.lseek(fd, address, os.SEEK_SET)
 
-                # Write data
-                bytes_written = os.write(fd, data_bytes)
+                # CHUNKED, AND SHORT WRITES ARE FATAL.
+                #
+                # This used to be one os.write() of the whole buffer. A 714 MB
+                # weight load then needs the driver to pin one mapping that
+                # large, and on a host that has been running big transfers for
+                # an hour it fails with ENOMEM while a 157 MB write beside it
+                # still succeeds. The failure was caught by the handler below,
+                # printed, and reported as -1 -- which every caller ignored, so
+                # the weights were never written, the engine executed against
+                # whatever DRAM already held, and a model emitted 2548 tokens of
+                # noise 20 minutes later. CI read that as a model-quality
+                # failure ("did not find 'x = 2' in decoded output"); see
+                # andromeda runs 36552402272 and 37114636401.
+                #
+                # Chunking keeps each mapping small enough to survive a
+                # fragmented host, and a short or failed write now RAISES:
+                # continuing with partially written DRAM produces plausible but
+                # wrong results, which is worse than stopping.
+                total = len(data_bytes)
+                written = 0
+                view = memoryview(data_bytes)
+                while written < total:
+                    piece = view[written:written + DMA_MAX_CHUNK_BYTES]
+                    # SEEK BEFORE EVERY CHUNK. The XDMA character device takes
+                    # its card-side target from the file position, and does NOT
+                    # advance that position by the number of bytes written the
+                    # way a regular file does. Relying on the implicit advance
+                    # put every chunk after the first back at `address`: a 200
+                    # MiB write-then-read-back differed from byte 0x4000000 --
+                    # exactly the first chunk boundary -- with chunk 0 correct
+                    # and everything after it wrong.
+                    os.lseek(fd, address + written, os.SEEK_SET)
+                    try:
+                        n = os.write(fd, piece)
+                    except OSError as e:
+                        raise OSError(
+                            e.errno,
+                            f"dma_write to {device} failed {written} of {total} "
+                            f"bytes in at DRAM 0x{address + written:X} "
+                            f"(chunk {len(piece)} B): {e.strerror}. DRAM is now "
+                            f"partially written -- refusing to continue, because "
+                            f"executing against it yields plausible but wrong "
+                            f"results.") from e
+                    if n == 0:
+                        raise OSError(
+                            f"dma_write to {device} wrote 0 bytes at DRAM "
+                            f"0x{address + written:X} with {total - written} of "
+                            f"{total} bytes left; treating as a failed transfer "
+                            f"rather than continuing against partial DRAM.")
+                    written += n
 
-                return bytes_written
+                if written != total:
+                    raise OSError(
+                        f"dma_write to {device} wrote {written} of {total} bytes "
+                        f"at DRAM 0x{address:X}")
+                return written
             finally:
                 os.close(fd)
 
         except Exception as e:
+            # Argument/convert errors (above the device open) still surface as
+            # exceptions; only the legacy pre-open failures return -1.
             print(f"dma_write error: {e}")
-            return -1
+            raise
 
     def dma_read(self, device: str, address: int, buffer, size: int) -> int:
         """
