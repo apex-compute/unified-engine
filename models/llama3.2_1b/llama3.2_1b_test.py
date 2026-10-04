@@ -54,6 +54,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_FMAX_CONTEXT_SIZE, UE_VECTOR_SIZE, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, INSTRUCTION_SIZE_BYTES
 from user_dma_core import UnifiedEngine
+
+# Bank B follows 4096 BF16 rows; its byte base grows with the lane count.
+URAM_B_SCRATCH = 4096 * UE_VECTOR_SIZE * 2 + 0x10000
 # Canonical, HW-aligned 4-bit codec shared across all model templates.
 from quant_lib import quantize_if4
 
@@ -355,7 +358,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None,
                  decoder_matmatmul: bool | None = None, stream_prefill: bool | None = None,
                  matmatmul: bool | None = None, prefill_kernel: str | None = None,
-                 decode_kernel: str | None = None, multi_core: int = 1):
+                 decode_kernel: str | None = None, multi_core: int = 1, initialize_model: bool = True):
         # IF4 uses this low 2 GiB sub-window, independent of the total DRAM size
         # reported by HW_INFO: 0x80000000..0xFFFFFFFF.
         # DRAM is mapped AT 0x80000000 (user_dma_core.DRAM_START_ADDR); there is
@@ -456,6 +459,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         # LLaMA 3.2 1B GQA: 8 KV heads × 64-dim per head = head_dim=512 combined
         self.actual_head_dim = 64
         self.num_kv_heads = self.head_dim // self.actual_head_dim  # = 8
+        # Attention kernels transpose full SRAM rows. On 128 lanes, pad each
+        # 64-element head with zeros; RoPE and Q scaling keep the true width.
+        self.attention_head_dim = max(self.actual_head_dim, UE_VECTOR_SIZE)
+        self.cache_row_bytes = self.num_kv_heads * self.attention_head_dim * self.bytes_per_element
         self.MAX_CONTEXT_SIZE = model["max_context_size"]
         self.PREFILL_CONTEXT_SIZE = model["prefill_context_size"]
         self.LAYER_SIZE = fi["num_layers"]
@@ -481,6 +488,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self._has_post_attn_norm = False  # no post-attention normalization
         self._has_post_mlp_norm = False   # no post-FFN normalization
 
+        # Library callers may load packed embeddings/weights themselves. This
+        # avoids the full HF model and whole-file weight copy in the console host.
+        if not initialize_model:
+            return
         bin_path = weights_bin or paths["weights_bin"]
         full_path = os.path.join(self.script_dir, bin_path)
         if not os.path.exists(full_path):
@@ -612,17 +623,17 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         """Initialize hardware DRAM tensors for Llama-3.2-1B (layer-wise overlap except for kv cache)."""
         seq_len = self.MAX_CONTEXT_SIZE
         q_seq_len = seq_len * self.group_size
-        aligned_seq_len = ((q_seq_len + 63) // 64) * 64
+        aligned_seq_len = ((q_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
 
         print(f"Allocate tensor dram start at DRAM address: 0x{self.get_tensor_dram_addr():X}")
         # Allocate shared memory for k v cache (k rope and v projection) and zero pad for decoder use:
-        self.LAYER0_V_DRAM = self.allocate_tensor_dram(self.LAYER_SIZE * self.MAX_CONTEXT_SIZE * self.k_size)
-        self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(self.LAYER_SIZE * self.MAX_CONTEXT_SIZE * self.k_size)
-        zero_pad = torch.zeros(self.LAYER_SIZE * self.MAX_CONTEXT_SIZE * self.k_size, dtype=torch.bfloat16)
+        self.LAYER0_V_DRAM = self.allocate_tensor_dram(self.LAYER_SIZE * self.MAX_CONTEXT_SIZE * self.cache_row_bytes)
+        self.LAYER0_K_ROPE_DRAM = self.allocate_tensor_dram(self.LAYER_SIZE * self.MAX_CONTEXT_SIZE * self.cache_row_bytes)
+        zero_pad = torch.zeros(self.LAYER_SIZE * self.MAX_CONTEXT_SIZE * self.cache_row_bytes // self.bytes_per_element, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, zero_pad)
         # Allocate memory for constant zero tensor, identity matrix, and bias:
-        zero_add = torch.zeros(seq_len * self.head_dim * self.bytes_per_element, dtype=torch.bfloat16)
+        zero_add = torch.zeros(seq_len * self.head_dim, dtype=torch.bfloat16)
         self.ZERO_DRAM_ADDR = self.allocate_tensor_dram(seq_len * self.head_dim * self.bytes_per_element)
         self.dma_to_accelerator_memory(self.ZERO_DRAM_ADDR, zero_add)
         self.IDENTITY_DRAM_ADDR = self.allocate_tensor_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element)
@@ -631,7 +642,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(aligned_seq_len * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(aligned_seq_len * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_V_DRAM = self.allocate_tensor_dram(aligned_seq_len * self.head_dim * self.bytes_per_element)
-        zero_pad = torch.zeros(aligned_seq_len * self.head_dim * self.bytes_per_element, dtype=torch.bfloat16)
+        zero_pad = torch.zeros(aligned_seq_len * self.head_dim, dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_V_DRAM, zero_pad)
@@ -646,9 +657,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         # Temp buffer: v_proj interleaved output (T, 512) written during prefill before
         # per-head reorganization into the V KV cache (per-head layout).
         self.LAYER0_V_PROJ_TEMP = self.allocate_tensor_dram(seq_len * self.k_size)
-        # Per-head flash output (T*group_size, actual_head_dim); reused across 8 KV heads.
+        # Per-head flash output uses the lane-padded width; reused across 8 KV heads.
         self.LAYER0_FLASH_OUT_HEAD_DRAM = self.allocate_tensor_dram(
-            aligned_seq_len * self.actual_head_dim * self.bytes_per_element)
+            aligned_seq_len * self.attention_head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_OUTPUT_DRAM = self.allocate_tensor_dram(seq_len * self.head_dim * self.group_size * self.bytes_per_element)
         self.LAYER0_FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(max(self.head_dim, UE_FMAX_CONTEXT_SIZE) * aligned_seq_len * 2 + self.head_dim * aligned_seq_len * 2)
         self.LAYER0_FLASH_BIAS_DRAM = self.allocate_tensor_dram(aligned_seq_len * aligned_seq_len * self.bytes_per_element)
@@ -731,7 +742,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         count_at_start = self.capture_count
         seq_len = template_seq_len
         q_seq_len = seq_len * self.group_size
-        aligned_seq_len = ((q_seq_len + 63) // 64) * 64
+        aligned_seq_len = ((q_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         checkpoints: list[list] = []
 
         def _checkpoint(name: str) -> None:
@@ -877,22 +888,22 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             # the 4 query heads in each group. Each query head runs ONE compact SDPA
             # over the un-duplicated per-KV-head K/V (read straight from the KV cache),
             # so there is no group_size replication of K/V and the score matrix is
-            # [S, align64(S)] per head instead of [4S, 4S] per KV head — group_size×
+            # [S, align_lanes(S)] per head instead of [4S, 4S] per KV head — group_size×
             # less attention MAC + KV DMA than the old duplicate-and-batch scheme.
             for kv_h in range(nkvh):
                 k_cache_base = (self.LAYER0_K_ROPE_DRAM
-                                + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
-                                + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
+                                + layer_idx * self.MAX_CONTEXT_SIZE * self.cache_row_bytes
+                                + kv_h * self.MAX_CONTEXT_SIZE * self.attention_head_dim * bpe)
                 v_cache_base = (self.LAYER0_V_DRAM
-                                + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
-                                + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
+                                + layer_idx * self.MAX_CONTEXT_SIZE * self.cache_row_bytes
+                                + kv_h * self.MAX_CONTEXT_SIZE * self.attention_head_dim * bpe)
 
                 # Scatter K_h_roped (64-dim) from [lo|hi] K_DRAM → KV cache ONLY (the
                 # compact cache row is [lo|hi] = 64 contiguous). No FLASH_K duplication.
                 self._emit_pbi_scatter_per_token(
                     read_base=self.LAYER0_K_DRAM + kv_h * half_ahd * bpe,
                     read_stride_bytes=hd * bpe,
-                    write_specs=[(k_cache_base, ahd * bpe)],
+                    write_specs=[(k_cache_base, self.attention_head_dim * bpe)],
                     sram_byte_addr=0x10000,
                     element_count=half_ahd,
                     gpr_seq_len=self.gpr_seq_len,
@@ -901,8 +912,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 self._emit_pbi_scatter_per_token(
                     read_base=self.LAYER0_K_DRAM + (hd // 2 + kv_h * half_ahd) * bpe,
                     read_stride_bytes=hd * bpe,
-                    write_specs=[(k_cache_base + half_ahd * bpe, ahd * bpe)],
-                    sram_byte_addr=0x10080,
+                    write_specs=[(k_cache_base + half_ahd * bpe, self.attention_head_dim * bpe)],
+                    sram_byte_addr=(0x10000 + UE_VECTOR_SIZE * 2),
                     element_count=half_ahd,
                     gpr_seq_len=self.gpr_seq_len,
                     template_seq_len=seq_len,
@@ -912,7 +923,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 self._emit_pbi_scatter_per_token(
                     read_base=self.LAYER0_V_PROJ_TEMP + kv_h * ahd * bpe,
                     read_stride_bytes=nkvh * ahd * bpe,
-                    write_specs=[(v_cache_base, ahd * bpe)],
+                    write_specs=[(v_cache_base, self.attention_head_dim * bpe)],
                     sram_byte_addr=0x20000,
                     element_count=ahd,
                     gpr_seq_len=self.gpr_seq_len,
@@ -923,8 +934,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 local_kv = kv_h % 2
                 for q in range(qpkv):
                     # Scatter this ONE query head (64-dim) from [lo|hi] Q_DRAM into a
-                    # contiguous FLASH_Q [S, 64] (lo at 0, hi at half_ahd) — the layout
-                    # unified_attention_core expects for Q=[batch, head_dim].
+                    # FLASH_Q [S, attention_head_dim] (lo at 0, hi at half_ahd).
+                    # The remaining columns stay zero on 128-lane hardware.
                     sub_idx = local_kv * qpkv + q
                     q_lo_base = (self.LAYER0_Q_DRAM
                                  + g_for_kv * hd * bpe
@@ -935,7 +946,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     self._emit_pbi_scatter_per_token(
                         read_base=q_lo_base,
                         read_stride_bytes=total_q_dim * bpe,
-                        write_specs=[(self.LAYER0_FLASH_Q_DRAM, ahd * bpe)],
+                        write_specs=[(self.LAYER0_FLASH_Q_DRAM, self.attention_head_dim * bpe)],
                         sram_byte_addr=0x30000,
                         element_count=half_ahd,
                         gpr_seq_len=self.gpr_seq_len,
@@ -944,21 +955,21 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     self._emit_pbi_scatter_per_token(
                         read_base=q_hi_base,
                         read_stride_bytes=total_q_dim * bpe,
-                        write_specs=[(self.LAYER0_FLASH_Q_DRAM + half_ahd * bpe, ahd * bpe)],
-                        sram_byte_addr=0x30080,
+                        write_specs=[(self.LAYER0_FLASH_Q_DRAM + half_ahd * bpe, self.attention_head_dim * bpe)],
+                        sram_byte_addr=(0x30000 + UE_VECTOR_SIZE * 2),
                         element_count=half_ahd,
                         gpr_seq_len=self.gpr_seq_len,
                         template_seq_len=seq_len,
                     )
 
-                    # Compact per-head SDPA: Q=[S,64] (FLASH_Q), K/V=[S,64] straight
-                    # from the cache, plain causal bias [S, align64(S)]. Static
+                    # Per-head SDPA uses lane-padded Q/K/V from FLASH_Q and the
+                    # cache, with plain causal bias [S, align_lanes(S)]. Static
                     # batch/aligned pinned to PREFILL_CONTEXT (scratch/instructions
                     # seq_len-agnostic); real per-token counts come from the GPRs.
                     self.unified_attention_core(
                         batch=pc_seq_len,
                         aligned_seq_len=attn_aligned_static,
-                        head_dim=ahd,
+                        head_dim=self.attention_head_dim,
                         Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
                         K_DRAM_ADDR=k_cache_base,
                         V_DRAM_ADDR=v_cache_base,
@@ -973,12 +984,12 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     # FLOP counted at the REAL prompt dims (model-side, see _attn_flops).
                     total_flops += _attn_flops(seq_len, real_aligned, ahd)
 
-                    # Assemble this head's [S, 64] output into FLASH_OUTPUT at its
+                    # Gather this head's 64 valid columns into FLASH_OUTPUT at its
                     # standard-GQA slot: token row = [kv0_q0..q3, kv1_q0..q3, ...].
                     head_pos = (kv_h * qpkv + q) * ahd * bpe
                     self._emit_pbi_scatter_per_token(
                         read_base=self.LAYER0_FLASH_OUT_HEAD_DRAM,
-                        read_stride_bytes=ahd * bpe,
+                        read_stride_bytes=self.attention_head_dim * bpe,
                         write_specs=[(self.LAYER0_FLASH_OUTPUT_DRAM + head_pos, total_q_dim * bpe)],
                         sram_byte_addr=0x40000,
                         element_count=ahd,
@@ -1208,25 +1219,25 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 # Step 3: Per-KV-head scatter K/V to cache + scatter Q → decoder_attention
                 for kv_h in range(nkvh):
                     k_cache_base = (self.LAYER0_K_ROPE_DRAM
-                                    + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
-                                    + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
+                                    + layer_idx * self.MAX_CONTEXT_SIZE * self.cache_row_bytes
+                                    + kv_h * self.MAX_CONTEXT_SIZE * self.attention_head_dim * bpe)
                     v_cache_base = (self.LAYER0_V_DRAM
-                                    + layer_idx * self.MAX_CONTEXT_SIZE * self.k_size
-                                    + kv_h * self.MAX_CONTEXT_SIZE * ahd * bpe)
+                                    + layer_idx * self.MAX_CONTEXT_SIZE * self.cache_row_bytes
+                                    + kv_h * self.MAX_CONTEXT_SIZE * self.attention_head_dim * bpe)
 
                     # Scatter K_h_roped (64-dim) → KV cache at decode position
-                    # lo→SRAM 0x10000, hi→SRAM 0x10080 (128-byte aligned slots)
+                    # lo→SRAM 0x10000, hi→SRAM (0x10000 + UE_VECTOR_SIZE * 2) (separate lane-sized SRAM rows)
                     self.accelerator_memory_to_sram(
                         self.LAYER0_K_DRAM + kv_h * half_ahd * bpe, 0x10000, half_ahd)
                     self.accelerator_memory_to_sram(
                         self.LAYER0_K_DRAM + (hd // 2 + kv_h * half_ahd) * bpe,
-                        0x10080, half_ahd)
+                        (0x10000 + UE_VECTOR_SIZE * 2), half_ahd)
                     self.generate_instruction_add_imm(
                         self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base), self.TMP_REG)
                     self.sram_to_accelerator_memory(0x10000, 0, half_ahd, general_reg_src=self.TMP_REG)
                     self.generate_instruction_add_imm(
                         self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(k_cache_base + half_ahd * bpe), self.TMP_REG)
-                    self.sram_to_accelerator_memory(0x10080, 0, half_ahd, general_reg_src=self.TMP_REG)
+                    self.sram_to_accelerator_memory((0x10000 + UE_VECTOR_SIZE * 2), 0, half_ahd, general_reg_src=self.TMP_REG)
 
                     # Scatter V_h (64-dim, standard layout) → V cache at decode position
                     # v_proj output at LAYER0_FLASH_V_DRAM: [V_KV0(64)..V_KV7(64)] = 512-dim
@@ -1243,35 +1254,44 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     q_g_addr = self.LAYER0_Q_DRAM + g_for_kv * hd * bpe
                     for q in range(qpkv):
                         sub_idx = local_kv * qpkv + q
-                        flash_q_addr = self.LAYER0_FLASH_Q_DRAM + q * ahd * bpe
+                        flash_q_addr = self.LAYER0_FLASH_Q_DRAM + q * self.attention_head_dim * bpe
                         self.accelerator_memory_to_sram(
                             q_g_addr + sub_idx * half_ahd * bpe, 0x30000, half_ahd)
                         self.accelerator_memory_to_sram(
                             q_g_addr + (hd // 2 + sub_idx * half_ahd) * bpe,
-                            0x30080, half_ahd)
+                            (0x30000 + UE_VECTOR_SIZE * 2), half_ahd)
                         self.sram_to_accelerator_memory(0x30000, flash_q_addr, half_ahd)
-                        self.sram_to_accelerator_memory(0x30080, flash_q_addr + half_ahd * bpe, half_ahd)
+                        self.sram_to_accelerator_memory((0x30000 + UE_VECTOR_SIZE * 2), flash_q_addr + half_ahd * bpe, half_ahd)
                     # Each head's K/V cache is already laid out as
-                    # [MAX_CONTEXT_SIZE, actual_head_dim]. Pass its base straight
+                    # [MAX_CONTEXT_SIZE, attention_head_dim], with zero padding. Pass its base
                     # to the read-only attention core; staging the aligned prefix
                     # copied the same contiguous history twice per KV head, per
                     # layer, per token.
                     attn_result = self.unified_attention_core(
                         batch=qpkv,
                         aligned_seq_len=decoder_aligned_seq_len,
-                        head_dim=ahd,
+                        head_dim=self.attention_head_dim,
                         Q_DRAM_ADDR=self.LAYER0_FLASH_Q_DRAM,
                         K_DRAM_ADDR=k_cache_base,
                         V_DRAM_ADDR=v_cache_base,
                         BIAS_DRAM_ADDR=self.LAYER0_FLASH_BIAS_DRAM,
-                        OUTPUT_DRAM_ADDR=(self.LAYER0_FLASH_OUTPUT_DRAM
-                                          + kv_h * qpkv * ahd * bpe),
+                        OUTPUT_DRAM_ADDR=(self.LAYER0_FLASH_OUT_HEAD_DRAM if self.attention_head_dim != ahd
+                                          else self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe),
                         SCRATCH_DRAM_ADDR=self.LAYER0_FLASH_SCRATCH_DRAM,
                         IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                         gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
                         q_pre_scaled=True,
                     )
                     total_flops += attn_result or 0
+                    if self.attention_head_dim != ahd:
+                        # Remove zero padding before the output projection;
+                        # model weights still expect 64 elements per head.
+                        for q in range(qpkv):
+                            self.accelerator_memory_to_sram(
+                                self.LAYER0_FLASH_OUT_HEAD_DRAM + q * self.attention_head_dim * bpe,
+                                0x40000, ahd)
+                            self.sram_to_accelerator_memory(
+                                0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + (kv_h * qpkv + q) * ahd * bpe, ahd)
                 if profile:
                     _checkpoint(f"L{layer_idx}_attention")
                 total_flops += decoder_projection_core(K=self.head_dim * self.group_size, N=self.vector_length,
@@ -1280,8 +1300,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
                 # LLaMA: no post-attention norm; residual directly on o_proj output
                 self.accelerator_memory_to_sram(accelerator_dram_address=layer_input_addr, sram_address=0x10000, element_size=self.vector_length)
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=0x90000, element_size=self.vector_length)
-                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=URAM_B_SCRATCH, element_size=self.vector_length)
+                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=URAM_B_SCRATCH, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
                 if profile:
                     _checkpoint(f"L{layer_idx}_o_proj_residual")
@@ -1300,8 +1320,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4, is_B_quantized=True)
 
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_GATE_DRAM, sram_address=0x10000, element_size=self.mlp_elements)
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
-                self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=URAM_B_SCRATCH, element_size=self.mlp_elements)
+                self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=URAM_B_SCRATCH, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
                 if profile:
                     _checkpoint(f"L{layer_idx}_mlp_gateup_mul")
@@ -1312,8 +1332,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
                 # LLaMA: no post-FFN norm; residual directly on down_proj output
                 self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, sram_address=0x10000, element_size=self.vector_length)
-                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_DOWN_DRAM, sram_address=0x90000, element_size=self.vector_length)
-                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
+                self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_DOWN_DRAM, sram_address=URAM_B_SCRATCH, element_size=self.vector_length)
+                self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=URAM_B_SCRATCH, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
                 if profile:
                     _checkpoint(f"L{layer_idx}_mlp_down_residual")
@@ -1374,6 +1394,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         _pf = self.prefill_seq or tuple(self._cfg["default_prefill_tokens"])
         digest.update(
             f"layers={layer_size};decode_kernel={self.decode_kernel};"
+            f"lanes={UE_VECTOR_SIZE};axi={user_dma_core.UE_AXI_DATA_WIDTH_BITS};"
             f"prefill_kernel={self.prefill_kernel};"
             f"penalty={getattr(self, 'fpga_penalty', False)};"
             f"prefill_len={len(_pf) - 1}".encode())
@@ -1610,7 +1631,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         flops_prefill_template = meta["prefill_template_flops"]
         decoder_flops_per_token = meta["decoder_total_flops"]
         _max_gpr_bucket = (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
-        _kv_stride = self.actual_head_dim * self.bytes_per_element
+        _kv_stride = self.attention_head_dim * self.bytes_per_element
         _rope_row  = self.head_dim * 2 * self.bytes_per_element
 
         prefill_seq = self.prefill_seq
@@ -1624,9 +1645,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         q_seq_len = prefill_seq_len * self.group_size
         # Proper GQA: each query head attends the COMPACT (S-long) per-KV-head K/V,
-        # so the dynamic aligned KV length / flash bucket are align64(S), not
-        # align64(S*group). gpr_q_seq_len is still primed (harmless) for symmetry.
-        aligned_seq_len = ((prefill_seq_len + 63) // 64) * 64
+        # so the dynamic aligned KV length / flash bucket are align_lanes(S), not
+        # align_lanes(S*group). gpr_q_seq_len is still primed (harmless) for symmetry.
+        aligned_seq_len = ((prefill_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         bucket_idx = aligned_seq_len // UE_VECTOR_SIZE
         flops_prefill = flops_prefill_template * prefill_seq_len // max(template_seq_len, 1)
 
@@ -1653,8 +1674,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.start_capture()
         for decode_pos in range(prefill_seq_len, self.MAX_CONTEXT_SIZE):
             runtime_seq_len = decode_pos + 1
-            runtime_aligned_seq_len = ((runtime_seq_len + 63) // 64) * 64
-            runtime_bucket_idx = min((runtime_seq_len + 63) // 64, _max_gpr_bucket)
+            runtime_aligned_seq_len = ((runtime_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+            runtime_bucket_idx = min((runtime_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE, _max_gpr_bucket)
             entry_start = self.capture_count
             self.clear_inst_id()
             self.generate_instruction_add_set(self.gpr_bucket_idx, runtime_bucket_idx)
@@ -1768,7 +1789,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         while self.seq_len < self.MAX_CONTEXT_SIZE:
             _SILENT_MODE = True
             self.seq_len += 1
-            aligned_seq_len = ((self.seq_len + 63) // 64) * 64
+            aligned_seq_len = ((self.seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
             decode_pos = self.seq_len - 1
 
             if 0 <= token_id < self.embedding_weight.shape[0]:
@@ -1778,7 +1799,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
             # unified_attention_core's dynamic path always uses bias_mode="full_matrix" (one bias
             # row per batch item); the decoder attention call's batch=qpkv query heads all share the
-            # same causal mask. Reuse one contiguous buffer within each 64-token bucket.
+            # same causal mask. Reuse one contiguous buffer within each lane-sized token bucket.
             if aligned_seq_len != decode_bias_aligned_seq_len:
                 decode_bias_host = torch.full(
                     (self.group_size, aligned_seq_len), -1e36, dtype=torch.bfloat16)
@@ -2059,7 +2080,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
         prefill_checkpoints  = meta.get("prefill_profile_checkpoints", [])
         decoder_checkpoints  = meta.get("decoder_profile_checkpoints", [])
-        _kv_stride = self.actual_head_dim * self.bytes_per_element
+        _kv_stride = self.attention_head_dim * self.bytes_per_element
         _rope_row  = self.head_dim * 2 * self.bytes_per_element
 
         prefill_seq = self.prefill_seq or tuple(self._cfg["default_prefill_tokens"])
@@ -2070,8 +2091,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.seq_len = prefill_seq_len
 
         q_seq_len = prefill_seq_len * self.group_size
-        # Proper GQA: compact per-head aligned KV length (align64(S)), see run_llama.
-        aligned_seq_len = ((prefill_seq_len + 63) // 64) * 64
+        # Proper GQA: compact per-head aligned KV length (align_lanes(S)), see run_llama.
+        aligned_seq_len = ((prefill_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         bucket_idx = aligned_seq_len // UE_VECTOR_SIZE
 
         # On-FPGA penalty needs a zeroed bias buffer so the profiled decode step is pure-greedy.
@@ -2117,8 +2138,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         # --- Decoder preamble + inputs for the first decoded token (mirrors run_llama) ---
         token_id = self.prefill_seq[-1]
         self.seq_len += 1
-        aligned_dec = ((self.seq_len + 63) // 64) * 64
-        bucket_idx = min((self.seq_len + 63) // 64, (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE)
+        aligned_dec = ((self.seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+        bucket_idx = min((self.seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE, (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE)
         decode_pos = self.seq_len - 1
 
         embedding_tensor = self.get_embedding_for_tokens([token_id])
