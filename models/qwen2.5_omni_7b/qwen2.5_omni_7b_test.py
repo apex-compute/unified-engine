@@ -143,6 +143,11 @@ except Exception:                                    # pragma: no cover
     _talker_fpga_mod = None
 
 
+# FPGA Token2Wav runs on all eight engines, in bf16, after Thinker and Talker are done
+# with the board. Beyond this many codec tokens its BigVGAN activations (rows grow 240x
+# the mel frames) no longer fit the shared activation pool.
+T2W_FPGA_MAX_CODES = 300
+
 REQUIRED_ENGINES = 8
 REQUIRED_DRAM_GIB = 8
 # CONTEXT AND PREFILL ARE ONE BUDGET. Prefill and decode read the same KV
@@ -2154,9 +2159,37 @@ class Qwen25OmniUnifiedEngine(
                 f"| {token2wav_hw} | {token2wav_s:.1f} s | "
                 f"{audio_s / token2wav_s if token2wav_s else 0.0:.2f}× real time |",
                 "",
+                *_speech_performance_lines(speech),
+                *([f"- **Token2Wav breakdown (CPU timer):** setup "
+                   f"{float(speech['token2wav_setup_s']):.1f} s, DiT (36 evaluations) "
+                   f"{float(speech['token2wav_dit_s']):.1f} s, BigVGAN "
+                   f"{float(speech['token2wav_bigvgan_s']):.1f} s"]
+                  if speech.get("token2wav_dit_s") is not None else []),
+                *([f"- **Length cap:** the Talker reached the {T2W_FPGA_MAX_CODES}-codec-token "
+                   "FPGA Token2Wav limit before emitting its end token, so speech is cut "
+                   "there (any remaining text is not spoken)."]
+                  if speech.get("codec_truncated") else []),
                 f"- **Decode/Talker overlap (CPU timer):** "
                 f"{float(speech.get('decode_talker_overlap_s', 0.0)):.2f} s",
                 f"- **Speaker:** {speech['speaker']}",
+                "",
+                "### Workflow",
+                "",
+                "1. **Thinker (Qwen2 7B decoder, IF4 weights, 8 FPGA engines):** prefill the "
+                "prompt, then decode the reply tokens; each step's final hidden state is "
+                "kept for the Talker.",
+                "2. **Talker (24-layer Qwen2 decoder, IF4, 8 FPGA engines):** takes each "
+                "reply token's Thinker hidden state plus its embedding (host adds the two "
+                "3584-wide rows), projects to 896, runs 24 layers over a device-resident KV "
+                "cache and the codec head, and the host samples one codec token per step "
+                "(top-k 40, top-p 0.8, temperature 0.9, repetition penalty 1.05).",
+                f"3. **Token2Wav on {speech['token2wav_device']}:** a flow-matching DiT "
+                "(22 blocks, 36 Runge-Kutta evaluations with a 2-way guidance batch) turns the "
+                "codec tokens into an 80-bin mel spectrogram; a BigVGAN vocoder (6 "
+                "polyphase upsample stages, 18 anti-aliased SnakeBeta residual blocks) turns "
+                "the mel into a 24 kHz waveform. The host only adds the speaker/codec "
+                "constants and the Runge-Kutta bookkeeping.",
+                "4. The waveform is written next to this summary as a `.wav`.",
                 f"- **WAV:** `{os.path.basename(speech['wav'])}` "
                 f"({audio_s:.2f} s at {_talker_mod.SAMPLE_RATE} Hz)",
                 "",
@@ -2901,6 +2934,35 @@ def _synthesize_speech(ue, args, cfg: dict, prompt_tokens: list[int]) -> dict:
             **(hs.last_metrics or {})}
 
 
+def _token2wav_on_fpga(vocoder, codes: list[int], spk: dict):
+    """DiT + BigVGAN on all eight engines, after the Thinker and Talker have finished.
+
+    Neither stage's weights are read again, so this lays its own address map over
+    the whole board (see qwen2.5_omni_7b_t2w_cores.py), overwriting whatever the
+    earlier stages left there. Every engine is software-reset first, and each region
+    of the Token2Wav program is a host-synchronised barrier across the engines.
+    """
+    import torch as _torch
+    t2w_mod = _load_sibling("qwen2_5_omni_7b_token2wav_fpga",
+                            "qwen2.5_omni_7b_token2wav_fpga.py")
+    cores_mod = _load_sibling("qwen2_5_omni_7b_t2w_cores", "qwen2.5_omni_7b_t2w_cores.py")
+    print(f"  [Token2Wav FPGA] {len(codes)} codec tokens -> {len(codes) * 2} mel frames "
+          f"on {REQUIRED_ENGINES} engines", flush=True)
+    started = time.perf_counter()
+    cores = cores_mod.Cores(REQUIRED_ENGINES)
+    pipe = t2w_mod.Token2WavFpga(cores, vocoder, codes=len(codes), verbose=False)
+    setup_s = time.perf_counter() - started
+    wav, info = pipe.synthesize(
+        _torch.tensor([codes], dtype=_torch.long), spk["cond"].float(),
+        spk["ref_mel"].float())
+    print(f"  [Token2Wav FPGA] setup {setup_s:.1f}s, DiT {info['dit_s']:.1f}s, "
+          f"BigVGAN {info['bigvgan_s']:.1f}s", flush=True)
+    return wav.detach(), {"token2wav_setup_s": setup_s,
+                          "token2wav_dit_s": info["dit_s"],
+                          "token2wav_bigvgan_s": info["bigvgan_s"],
+                          **{f"t2w_{k}": v for k, v in info.items() if k != "mel"}}
+
+
 def _synthesize_speech_fpga(ue, args, cfg: dict, prompt_tokens: list[int]) -> dict:
     """Run all Talker matmuls on eight engines, then vocode codec IDs on CPU.
 
@@ -2961,6 +3023,10 @@ def _synthesize_speech_fpga(ue, args, cfg: dict, prompt_tokens: list[int]) -> di
     max_codec_tokens = min(4096, FPGA_SPEECH_CONTEXT_SIZE - prefix_len)
     if max_codec_tokens < 1:
         raise ValueError("prompt leaves no context for FPGA Talker codec tokens")
+    if not args.token2wav_host:
+        # FPGA Token2Wav is verified up to this many codec tokens; speech is cut here
+        # rather than handed to the CPU vocoder.
+        max_codec_tokens = min(max_codec_tokens, T2W_FPGA_MAX_CODES)
     max_ctx = ((prefix_len + max_codec_tokens + 63) // 64) * 64
     runner = _talker_fpga_mod.TalkerRunner(
         ue, weights, max_ctx=max_ctx, scheduler=scheduler)
@@ -2969,12 +3035,33 @@ def _synthesize_speech_fpga(ue, args, cfg: dict, prompt_tokens: list[int]) -> di
     runner.build_rope_table()
     runner.compile_reusable_step()
 
+    R = _talker_fpga_mod.TalkerRunner
+    layer_mm = (2 * R.H * R.Q_SIZE + 2 * 2 * R.H * R.KV_SIZE + 2 * R.Q_SIZE * R.H
+                + 3 * 2 * R.H * R.MLP)
+    step_mm = 2 * R.THINKER_H * R.H + 24 * layer_mm + 2 * R.H * R.VOCAB
+    flops = {"model": 0, "issued": 0, "steps": 0}
+    if abs(runner.step_flops_fixed - step_mm) > 0.01 * step_mm:
+        print(f"  [Talker FPGA] warning: emitted per-step FLOPs {runner.step_flops_fixed:,} "
+              f"differ from the analytic projection count {step_mm:,}", flush=True)
+
+    def count_step(pos: int) -> None:
+        # Attention: QK^T and PV for the 12 query heads over the live KV rows (model) or
+        # over the 64-aligned rows the kernel actually reads (issued).
+        aligned = ((pos + 64) // 64) * 64
+        flops["model"] += step_mm + 24 * 4 * R.QH * R.AHD * (pos + 1)
+        # Issued = what the emitted program reports for every engine's shards plus
+        # attention at the 64-aligned KV length actually read.
+        flops["issued"] += (runner.step_flops_fixed
+                            + runner.attn_flops_per_aligned * aligned)
+        flops["steps"] += 1
+
     total_hw_us = 0.0
     prefix_hw_us = 0.0
     prefix_started = time.perf_counter()
     logits = None
     for pos, row in enumerate(prefix):
         logits, hw_us = runner.run_step(row, pos)
+        count_step(pos)
         total_hw_us += hw_us
         prefix_hw_us += hw_us
         if (pos + 1) % 64 == 0 or pos + 1 == prefix_len:
@@ -3000,12 +3087,14 @@ def _synthesize_speech_fpga(ue, args, cfg: dict, prompt_tokens: list[int]) -> di
     codes: list[int] = []
     decode_started = time.perf_counter()
     eos = {8292, 8294}
+    truncated = False
     for idx in range(max_codec_tokens):
         code = sample(logits, codes)
         if code in eos:
             break
         codes.append(code)
         if idx + 1 >= max_codec_tokens:
+            truncated = not args.token2wav_host and max_codec_tokens == T2W_FPGA_MAX_CODES
             break
         if idx + 1 < len(replies):
             token, next_hidden = replies[idx + 1]
@@ -3017,6 +3106,7 @@ def _synthesize_speech_fpga(ue, args, cfg: dict, prompt_tokens: list[int]) -> di
             condition = embed.rows([special]).float().reshape(H)
         row = (codec_embed[code].float() + condition).to(_torch.bfloat16)
         logits, hw_us = runner.run_step(row, prefix_len + idx)
+        count_step(prefix_len + idx)
         total_hw_us += hw_us
         if len(codes) % 64 == 0:
             print(f"  [Talker FPGA] generated {len(codes)} codec tokens",
@@ -3029,7 +3119,11 @@ def _synthesize_speech_fpga(ue, args, cfg: dict, prompt_tokens: list[int]) -> di
     print(f"  [Talker FPGA] {len(codes)} codec tokens in {talker_wall_s:.1f}s "
           f"active (setup {setup_wall_s:.1f}s, prefix {prefix_wall_s:.1f}s, "
           f"codec decode {decode_wall_s:.1f}s); "
-          "starting CPU Token2Wav", flush=True)
+          f"starting {'CPU' if args.token2wav_host else 'FPGA'} Token2Wav", flush=True)
+    if truncated:
+        print(f"  [Speak] the Talker reached the {T2W_FPGA_MAX_CODES}-token FPGA Token2Wav "
+              f"limit (about {T2W_FPGA_MAX_CODES / 50:.0f} s of audio) before emitting its "
+              "end token; speech is cut here", flush=True)
 
     vocoder_started = time.perf_counter()
     config = Qwen2_5OmniConfig.from_pretrained(model_dir)
@@ -3037,13 +3131,19 @@ def _synthesize_speech_fpga(ue, args, cfg: dict, prompt_tokens: list[int]) -> di
     vocoder.load_state_dict(
         _talker_mod._load_submodule_state(model_dir, "token2wav"), strict=True)
     vocoder.float().eval()
-    with _torch.no_grad():
-        wave = vocoder(
-            _torch.tensor([codes], dtype=_torch.long),
-            conditioning=spk["cond"].float(),
-            reference_mel=spk["ref_mel"].float(),
-        )
-    wav = wave[0] if isinstance(wave, (tuple, list)) else wave
+    token2wav_device = "Host CPU"
+    t2w_detail: dict = {}
+    if not args.token2wav_host:
+        wav, t2w_detail = _token2wav_on_fpga(vocoder, codes, spk)
+        token2wav_device = f"FPGA ({REQUIRED_ENGINES} cores, bf16)"
+    else:
+        with _torch.no_grad():
+            wave = vocoder(
+                _torch.tensor([codes], dtype=_torch.long),
+                conditioning=spk["cond"].float(),
+                reference_mel=spk["ref_mel"].float(),
+            )
+        wav = wave[0] if isinstance(wave, (tuple, list)) else wave
     token2wav_s = time.perf_counter() - vocoder_started
     out = os.path.join(SCRIPT_DIR, run_summary_filename(args).replace(".md", ".wav"))
     _talker_mod.write_wav(out, wav)
@@ -3062,7 +3162,11 @@ def _synthesize_speech_fpga(ue, args, cfg: dict, prompt_tokens: list[int]) -> di
         "talker_decode_wall_s": decode_wall_s,
         "talker_decode_hw_us": total_hw_us - prefix_hw_us,
         "codec_tokens": len(codes),
-        "token2wav_device": "Host CPU", "token2wav_wall_s": token2wav_s,
+        "token2wav_device": token2wav_device, "token2wav_wall_s": token2wav_s,
+        "codec_truncated": truncated,
+        "talker_flops_model": flops["model"], "talker_flops_issued": flops["issued"],
+        "talker_steps": flops["steps"], "peak_gflops": float(ue.vis_peak_gflops()),
+        **t2w_detail,
         "decode_talker_overlap_s": 0.0,
     }
 
@@ -3185,13 +3289,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--speak", nargs="?", const=DEFAULT_SPEAKER, default=None,
         metavar="SPEAKER",
-        help=("synthesise speech for the reply (8-core FPGA Talker + CPU Token2Wav). Bare "
+        help=("synthesise speech for the reply (8-core FPGA Talker + 8-core FPGA Token2Wav). Bare "
               f"--speak uses {DEFAULT_SPEAKER}; the other voice is Ethan. "
               "Writes a .wav next to the run summary."),
     )
     parser.add_argument(
         "--speak-host", action="store_true",
         help="use the previous streaming CPU Talker instead of the FPGA Talker",
+    )
+    parser.add_argument(
+        "--token2wav-host", action="store_true",
+        help=("run Token2Wav (DiT + BigVGAN) on the CPU in FP32 instead of the eight FPGA "
+              f"engines. By default --speak is FPGA end to end, and speech is capped at "
+              f"{T2W_FPGA_MAX_CODES} codec tokens (about {T2W_FPGA_MAX_CODES / 50:.0f} s) "
+              "because that is the length FPGA Token2Wav is verified for."),
     )
     parser.add_argument(
         "--target-prefill-tokens",
@@ -3280,6 +3391,66 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _speech_performance_lines(speech: dict) -> list[str]:
+    """Work, time, throughput and % of peak for the speech stages (empty if not recorded)."""
+    if speech.get("talker_flops_model") is None:
+        return []
+    peak = float(speech["peak_gflops"])
+    rows = []
+
+    def row(name, device, model_f, issued_f, secs, throughput):
+        eff = model_f / secs / 1e9 if secs else 0.0
+        iss = issued_f / secs / 1e9 if secs else 0.0
+        rows.append(
+            f"| {name} | {device} | {model_f / 1e9:,.1f} | {issued_f / 1e9:,.1f} | "
+            f"{secs:.2f} s | {eff:,.1f} | {iss:,.1f} | "
+            f"{100.0 * eff / peak if peak else 0.0:.1f}% | "
+            f"{100.0 * iss / peak if peak else 0.0:.1f}% | {throughput} |")
+        return model_f, issued_f, secs
+
+    tk_secs = float(speech["talker_hw_us"]) / 1e6
+    codec = int(speech["codec_tokens"])
+    dec_secs = float(speech["talker_decode_hw_us"]) / 1e6
+    parts = [row("Talker (prefix + decode)", speech["talker_device"],
+                 float(speech["talker_flops_model"]), float(speech["talker_flops_issued"]),
+                 tk_secs, f"{codec / dec_secs:.1f} codec tok/s (decode, HW)" if dec_secs else "—")]
+    if speech.get("t2w_dit_flops_model") is not None:
+        evals = int(speech["t2w_evaluations"])
+        frames = int(speech["t2w_mel_frames"])
+        dit_s = float(speech["t2w_dit_device_s"])
+        big_s = float(speech["t2w_bigvgan_device_s"])
+        parts.append(row("Token2Wav DiT", speech["token2wav_device"],
+                         float(speech["t2w_dit_flops_model"]),
+                         float(speech["t2w_dit_flops_issued"]), dit_s,
+                         f"{evals / dit_s:.1f} evaluations/s ({frames} frames)" if dit_s else "—"))
+        parts.append(row("Token2Wav BigVGAN", speech["token2wav_device"],
+                         float(speech["t2w_bigvgan_flops_model"]),
+                         float(speech["t2w_bigvgan_flops_issued"]), big_s,
+                         f"{float(speech['seconds']) / big_s:.2f}x real time" if big_s else "—"))
+    tm = sum(p[0] for p in parts)
+    ti = sum(p[1] for p in parts)
+    ts = sum(p[2] for p in parts)
+    row("**Speech total**", "", tm, ti, ts,
+        f"{float(speech['seconds']) / ts:.2f}x real time" if ts else "—")
+    return [
+        "### Performance (matmul-class FLOPs)",
+        "",
+        f"Peak is {peak:.1f} GFLOPS (all eight engines). **Model** FLOPs are the work the "
+        "network defines for this input; **issued** FLOPs include what padding makes the "
+        "engines do (64-row attention windows, 64-aligned channels, rows rounded up to the "
+        "chunk size). Talker time is the on-device latency counter summed over every "
+        "step; Token2Wav time is the wall time the engines spent running regions "
+        "(host-side constants and Runge-Kutta bookkeeping are excluded). Elementwise ops "
+        "(norms, activations, FIR filters) are not counted.",
+        "",
+        "| Stage | Device | Model GFLOP | Issued GFLOP | Device time | Effective GFLOPS "
+        "| Issued GFLOPS | % of peak (effective) | % of peak (issued) | Throughput |",
+        "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |",
+        *rows,
+        "",
+    ]
+
+
 def run_summary_filename(args) -> str:
     """Per-run summary filename encoding the CLI config, e.g.
 
@@ -3303,6 +3474,8 @@ def run_summary_filename(args) -> str:
         parts.append(f"speak_{args.speak}")
         if getattr(args, "speak_host", False):
             parts.append("host")
+        if getattr(args, "token2wav_host", False):
+            parts.append("t2whost")
     if getattr(args, "profile", False):
         parts.append("profile")
     parts.append(f"multi-core_{args.multi_core}")
@@ -3317,6 +3490,8 @@ def main() -> None:
         parser.error("--max-new-tokens must be positive")
     if args.speak_host and args.speak is None:
         parser.error("--speak-host requires --speak")
+    if args.token2wav_host and args.speak is None:
+        parser.error("--token2wav-host requires --speak")
     if args.speak is not None and _talker_mod is not None and args.speak not in _talker_mod.SPEAKERS:
         parser.error(f"--speak speaker must be one of {_talker_mod.SPEAKERS}")
     if args.no_summary and args.summary:
