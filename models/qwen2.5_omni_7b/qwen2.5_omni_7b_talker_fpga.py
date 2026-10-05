@@ -241,7 +241,8 @@ class TalkerRunner:
         for e in sched.worker_indices():
             sched.begin_worker_round(e)
             for wname, src, dst, bias, silu in ops:
-                self._emit_shard(e, wname, src, dst, bias=bias, silu=silu)
+                # Every engine's own shard counts: the work issued is the sum over engines.
+                flops += self._emit_shard(e, wname, src, dst, bias=bias, silu=silu)
             sched.end_worker_round(e)
         sched.join()
         return flops
@@ -407,6 +408,7 @@ class TalkerRunner:
                 gpr_aligned_seq_len_reg=aligned_reg,
                 q_pre_scaled=aligned_reg is not None)
             f += out if isinstance(out, (int, float)) else 0
+        self._attn_flops_emitted = getattr(self, "_attn_flops_emitted", 0) + f
         return f
 
     # -- rotary -----------------------------------------------------------
@@ -559,10 +561,16 @@ class TalkerRunner:
         ue.start_capture()
         try:
             sched.begin_program()
-            self.emit_step(
+            self._attn_flops_emitted = 0
+            total = self.emit_step(
                 layers=layers, live_aligned=64, pos_reg=self._pos_reg,
                 kv_off_reg=self._kv_off_reg, addr_reg=self._addr_reg,
                 tmp_reg=self._tmp_reg, aligned_reg=self._aligned_reg)
+            # FLOPs the emitted program issues per step, split like the Thinker's: everything
+            # except attention is fixed per step, attention scales with the aligned KV length
+            # (the template was emitted at live_aligned=64).
+            self.step_flops_fixed = int(total - self._attn_flops_emitted)
+            self.attn_flops_per_aligned = self._attn_flops_emitted / 64.0
             ue.generate_instruction_halt()
             self._worker_addrs = sched.finalize()
             ue.stop_capture()
