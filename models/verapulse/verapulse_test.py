@@ -10673,9 +10673,25 @@ def main():
                          "already-normalized float); omitted -> deterministic synthetic")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--prompt", default=_CFG["defaults"]["prompt"])
+    # model_auto_test.py poisons DRAM on --dev, then launches this script as a SUBPROCESS
+    # and forwards --dev only to scripts that declare it. Without this flag the child
+    # silently inherited the user_dma_core default (/dev/xdma0_*), i.e. a different board
+    # whenever --dev is not xdma0 (p2: the Alveo, so it "passed" on the wrong FPGA;
+    # dust2: the rk card, whose DMA fails with Errno 512).
+    ap.add_argument("--dev", type=str, default="xdma0",
+                    help="DMA device name (e.g. xdma0, xdma1). Default: xdma0.")
+    ap.add_argument("--base-addr", type=lambda x: int(x, 0), default=None,
+                    help="AXI-Lite register base address (default: device-specific).")
     args = ap.parse_args()
     global VERBOSE
     VERBOSE = args.verbose
+
+    # Select the board before anything can open a device: every engine built after this
+    # (including each worker in the engine pool) binds to it for its lifetime.
+    user_dma_core.set_dma_device(args.dev, base_addr=args.base_addr)
+    print(f"[main] DMA dev={args.dev} (H2C={user_dma_core.DMA_DEVICE_H2C}, "
+          f"C2H={user_dma_core.DMA_DEVICE_C2H}, USER={user_dma_core.DMA_DEVICE_USER}), "
+          f"UE_0_BASE_ADDR={user_dma_core.UE_0_BASE_ADDR:#010x}")
 
     # The variant was already locked in at import time (see _select_variant). Re-derive
     # it from the PARSED args and assert they agree: if these ever diverge, the class
