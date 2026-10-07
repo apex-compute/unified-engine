@@ -17,8 +17,8 @@ Architecture differences vs Gemma3:
   - LM head weight is tied to the embedding weight.
   - gamma_offset = 0.0 (LLaMA uses w directly, not 1+w).
 
-DRAM map (device DRAM is mapped AT 0x80000000; nothing usable below it — see
-__init__ for the authoritative layout + boundary guards):
+Single-engine DRAM map (multi-engine runs relocate this intact 2 GiB region
+using the board's controller-aware layout and copy decode weights per engine):
   params : 0x80000000 .. 0xB0000000   weights
   tensor : 0xB0000000 .. 0xFE000000   activations / KV
   worker : 0xFE000000 .. 0xFF600000   --multi-core prefill worker programs only
@@ -359,14 +359,24 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                  decoder_matmatmul: bool | None = None, stream_prefill: bool | None = None,
                  matmatmul: bool | None = None, prefill_kernel: str | None = None,
                  decode_kernel: str | None = None, multi_core: int = 1, initialize_model: bool = True):
-        # IF4 uses this low 2 GiB sub-window, independent of the total DRAM size
-        # reported by HW_INFO: 0x80000000..0xFFFFFFFF.
-        # DRAM is mapped AT 0x80000000 (user_dma_core.DRAM_START_ADDR); there is
-        # NO usable DRAM below it, so every region — including the multi-core
-        # worker ISA band — must be carved out of THIS window. (The scheduler's
-        # default worker arena is DRAM_START + 0x10000000 = 0x90000000, which
-        # lands ~256 MiB deep inside the weights below; --multi-core therefore
-        # passes an explicit base — see _ensure_prefill_scheduler.)
+        if not isinstance(multi_core, int) or multi_core < 1:
+            raise ValueError("multi_core must be a positive integer")
+        if multi_core > 1 and user_dma_core.ANDROMEDA_CORE_COUNT is None:
+            user_dma_core.configure_clock_from_hardware()
+        available_cores = user_dma_core.ANDROMEDA_CORE_COUNT
+        if available_cores is not None and multi_core > available_cores:
+            raise ValueError(f"multi_core must be 1..{available_cores}, got {multi_core}")
+        self.multi_core = multi_core
+        self._decode_sharder = None
+        self._decode_windows = None
+        model_base = 0x80000000
+        if multi_core > 1:
+            from multi_engine_shard import model_multicore_layout
+            self._decode_windows, model_base = model_multicore_layout(multi_core)
+        self._model_dram_limit = model_base + (2 << 30)
+        self._model_rebase = model_base - 0x80000000
+        # Keep all original model-relative offsets and allocate decode shards
+        # outside this contiguous model region on separate memory controllers.
         # At max_context_size=1024 the loaded params use ~642 MiB and tensors/KV
         # use ~212 MiB. Keep simple aligned boundaries; reserve the final 10 MiB
         # for the master instruction image + preamble, and a 22 MiB band just
@@ -376,9 +386,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         #   worker : 0xFE000000 .. 0xFF600000  (22 MiB, --multi-core only)
         #   program: 0xFF600000 .. 0x100000000 (10 MiB)
         super().__init__(
-            params_dram_base=0x80000000,
-            tensor_dram_base=0xB0000000,
-            program_dram_base=0xFF600000,
+            params_dram_base=model_base,
+            tensor_dram_base=0xB0000000 + self._model_rebase,
+            program_dram_base=0xFF600000 + self._model_rebase,
         )
         # Multi-core prefill worker ISA band (consumed in _ensure_prefill_scheduler).
         # Workers hold ONLY their prefill program here; every data buffer they
@@ -387,8 +397,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         # WORKER_ISA_STRIDE-sized slice and the band ends exactly at the master
         # program base, so the tensor region above and the program region below
         # both bound it. 3 MiB/worker × ≤7 workers (22 MiB) stays under 0xFF600000.
-        self.WORKER_ISA_BASE   = 0xFE000000
-        self.WORKER_ISA_STRIDE = 0x00300000   # 3 MiB / worker
+        self.WORKER_ISA_BASE = 0xFE000000 + self._model_rebase
+        self.WORKER_ISA_STRIDE = min(0x00300000,
+            (0x01600000 // max(1, multi_core - 1)) & ~0xFFFF)
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         # Unified kernel selection. The boolean inputs are legacy constructor
         # aliases retained for callers outside this script.
@@ -428,17 +439,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             )
         self.prefill_kernel = prefill_kernel
         self.decode_kernel = decode_kernel
-        # Multi-core prefill: engine 0 is this (primary); engines 1..N-1 are worker
-        # UnifiedEngines built lazily by the scheduler. N>2 is unverified on this
-        # device (the scheduler asserts unless opted in). See _ensure_prefill_scheduler.
-        available_cores = user_dma_core.ANDROMEDA_CORE_COUNT
-        assert available_cores is not None
-        if not 1 <= multi_core <= min(8, available_cores):
-            raise ValueError(
-                f"multi_core must be between 1 and min(8, HW_INFO cores={available_cores}), "
-                f"got {multi_core}"
-            )
-        self.multi_core = multi_core
+        if multi_core > 1 and self.decode_kernel != "streaming":
+            raise ValueError("multi-core decode requires --decode-kernel streaming")
         self._prefill_scheduler = None
         self._prefill_worker_addrs = []
         self._cfg = _load_config(self.script_dir)
@@ -514,6 +516,56 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 f"tensor_end=0x{self.get_tensor_dram_addr():X}, "
                 f"worker_isa_base=0x{self.WORKER_ISA_BASE:X}"
             )
+
+    def allocate_params_dram(self, size_bytes, label=None, align_bytes=64):
+        end = self._align_up(self.get_params_dram_addr(), align_bytes) + size_bytes
+        if end > self._tensor_dram_base:
+            raise MemoryError("Llama params exceed reserved model weight region")
+        return super().allocate_params_dram(size_bytes, label, align_bytes)
+
+    def allocate_tensor_dram(self, size_bytes, label=None, align_bytes=64):
+        end = self._align_up(self.get_tensor_dram_addr(), align_bytes) + size_bytes
+        if end > self.WORKER_ISA_BASE:
+            raise MemoryError("Llama tensors overlap prefill worker instructions")
+        return super().allocate_tensor_dram(size_bytes, label, align_bytes)
+
+    def allocate_program_dram(self, size_bytes, label=None, align_bytes=64):
+        end = self._align_up(self.get_program_dram_addr(), align_bytes) + size_bytes
+        if end > self._model_dram_limit:
+            raise MemoryError("Llama instructions exceed reserved model region")
+        return super().allocate_program_dram(size_bytes, label, align_bytes)
+
+    def write_captured_instructions_to_dram(self, start_addr=None):
+        address = self.get_program_dram_addr() if start_addr is None else start_addr
+        size = self._align_up(self.get_capture_instruction_size_bytes(), 64)
+        if address < self._program_dram_base or address + size > self._model_dram_limit:
+            raise MemoryError("Llama instruction write exceeds reserved model region")
+        return super().write_captured_instructions_to_dram(address)
+
+    def _ensure_decode_sharder(self):
+        if self.multi_core <= 1:
+            return None
+        if self._decode_sharder is None:
+            from multi_engine_decode import ControllerShardedDecoder
+            decoder = ControllerShardedDecoder(self, self.multi_core, self._decode_windows)
+            for name, prefix, K, N in (
+                ("q_proj", "Q_PROJ", self.vector_length, self.head_dim * self.group_size),
+                ("k_proj", "K_PROJ", self.vector_length, self.head_dim),
+                ("v_proj", "V_PROJ", self.vector_length, self.head_dim),
+                ("attn_proj", "ATTN_PROJ", self.head_dim * self.group_size, self.vector_length),
+                ("mlp_gate", "MLP_GATE", self.vector_length, self.mlp_elements),
+                ("mlp_up", "MLP_UP", self.vector_length, self.mlp_elements),
+                ("mlp_down", "MLP_DOWN", self.mlp_elements, self.vector_length),
+            ):
+                decoder.add_weight(
+                    name, getattr(self, f"DRAM_ADDR_LAYER0_{prefix}_QUANT"),
+                    getattr(self, f"DRAM_ADDR_LAYER0_{prefix}_SCALE"), K, N,
+                    self.LAYER_SIZE, self.weight_defs["LAYER_WEIGHT_SIZE"])
+            decoder.add_weight("lm_head", self.DRAM_ADDR_LM_HEAD_QUANT,
+                               self.DRAM_ADDR_LM_HEAD_SCALE, self.vector_length,
+                               self.EMBEDDING_ELEMENTS, 1, 0)
+            self._decode_sharder = decoder
+        return self._decode_sharder
 
     def get_embedding_for_tokens(self, token_ids: list[int] | tuple) -> torch.Tensor:
         """Return (len(token_ids), vector_length) bfloat16 tensor from self.embedding_weight (HF, scale applied)."""
@@ -719,6 +771,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 worker_dram_stride=self.WORKER_ISA_STRIDE,
                 worker_tensor_offset=0,
                 worker_program_offset=0,
+                handshake="four_phase",
+                region_rendezvous="master_worker",
                 allow_unaligned_rows=True,
                 allow_more_than_two_engines=self.multi_core > 2)
         return self._prefill_scheduler
@@ -1071,13 +1125,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             else:
                 _mlp_flops = [0]
                 def _emit_mlp_shard(ctx, layer_off=layer_off):
-                    # Per-engine row count via a GPR. gpr_q_seq_len (reg 6) is unused
-                    # in prefill after the proper-GQA rewrite, so repurpose it as the
-                    # shard row-count register on every engine (the master's dynamic
-                    # ISA pool is full; the workers set their own). Primed once per
-                    # shard, then reused by every op in the block.
+                    # The primary reserves r6 for this row count. Workers have
+                    # independent register allocators starting at r1: borrowing
+                    # r6 without reserving it lets a kernel overwrite its loop
+                    # bound. Reserve a worker register for this region, then
+                    # release it so later layers keep their M register in 1..15.
                     ue = ctx.unsafe_ue
-                    m = self.gpr_q_seq_len
+                    m = self.gpr_q_seq_len if ctx.is_primary else ue.alloc_isa_reg()
                     ue.generate_instruction_add_set(m, ctx.rows)
                     ue.rms_norm_core_dram(M=ctx.rows, N=self.vector_length,
                         A_DRAM_ADDR=ctx.rows_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, vlb),
@@ -1101,6 +1155,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     ue.eltwise_core_dram(M=ctx.rows, N=self.vector_length,
                         dram_a=ctx.rows_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, vlb), dram_b=ctx.rows_addr(self.LAYER0_MLP_DOWN_DRAM, vlb),
                         dram_out=ctx.rows_addr(self.LAYER0_OUTPUT_DRAM, vlb), mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m)
+                    if not ctx.is_primary:
+                        ue.release_isa_reg()
                 prefill_scheduler.sharded_region(seq_len, _emit_mlp_shard)
                 total_flops += _mlp_flops[0]
         self.generate_instruction_halt()
@@ -1145,6 +1201,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             """
             if self.decode_kernel == "streaming":
                 kwargs.pop("is_B_quantized", None)
+                if self._decode_sharder is not None:
+                    sharded = self._decode_sharder.projection(M=1, K=K, N=N, **kwargs)
+                    if sharded is not None:
+                        return sharded
                 return self.quantized_matmat_core(M=1, K=K, N=N, **kwargs)
             m_reg = self.alloc_isa_reg()
             self.generate_instruction_add_set(m_reg, 1)
@@ -1374,6 +1434,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         if self.prefill_kernel != self.DEFAULT_PREFILL_KERNEL:
             tag += f"_prefill_{self.prefill_kernel}"
         tag += ("" if bool(getattr(self, "fpga_penalty", False)) else "_puregreedy")
+        if self.multi_core > 1:
+            placement = json.dumps([self._params_dram_base, self._decode_windows]).encode()
+            tag += f"_mc{self.multi_core}_{hashlib.sha256(placement).hexdigest()[:12]}"
         if tag:
             b_root, b_ext = os.path.splitext(bin_rel)
             m_root, m_ext = os.path.splitext(meta_rel)
@@ -1384,7 +1447,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         """Hash every local input that can change the captured instruction stream."""
         digest = hashlib.sha256()
         config_path = os.path.join(self.script_dir, "llama3.2_1b_config.json")
-        for source_path in (__file__, user_dma_core.__file__, config_path):
+        import multi_engine_shard
+        import multi_engine_decode
+        for source_path in (__file__, user_dma_core.__file__, config_path,
+                            multi_engine_shard.__file__, multi_engine_decode.__file__):
             digest.update(os.path.abspath(source_path).encode())
             with open(source_path, "rb") as source_file:
                 digest.update(source_file.read())
@@ -1396,6 +1462,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             f"layers={layer_size};decode_kernel={self.decode_kernel};"
             f"lanes={UE_VECTOR_SIZE};axi={user_dma_core.UE_AXI_DATA_WIDTH_BITS};"
             f"prefill_kernel={self.prefill_kernel};"
+            f"multi_core={self.multi_core};model_base={self._params_dram_base};"
+            f"windows={self._decode_windows};"
             f"penalty={getattr(self, 'fpga_penalty', False)};"
             f"prefill_len={len(_pf) - 1}".encode())
         return digest.hexdigest()
@@ -1420,6 +1488,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         """
         if layer_size is None:
             layer_size = self.LAYER_SIZE
+        if profile and self.multi_core > 1:
+            raise ValueError("--profile currently requires --multi-core 1; use normal multicore timing")
+        decode_sharder = self._ensure_decode_sharder()
         if profile:
             instruction_bin_path = os.path.join(self.script_dir, "llama3.2_1b_bin/llama3.2_1b_profile_program.bin")
             instruction_meta_path = os.path.join(self.script_dir, "llama3.2_1b_bin/llama3.2_1b_profile_program.json")
@@ -1508,7 +1579,14 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         print("Compiling decoder...")
         t0 = time.perf_counter()
+        decoder_start_count = self.capture_count
+        if decode_sharder is not None:
+            decode_sharder.begin()
         decoder_prog = self._compile_decoder_program(layer_size=layer_size, profile=profile)
+        if decode_sharder is not None:
+            decode_sharder.finalize()
+        decoder_prog["program_size_bytes"] = (
+            self.capture_count - decoder_start_count) * INSTRUCTION_SIZE_BYTES
         print(f"  decoder compiled: {decoder_prog['program_size_bytes']} bytes, {time.perf_counter() - t0:.1f}s")
 
         self.stop_capture()
@@ -1544,6 +1622,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             "decoder_program_start_addr": f"0x{decoder_program_addr:X}",
             "decoder_program_size": decoder_prog["program_size_bytes"],
             "decoder_total_flops": decoder_prog["total_flops"],
+            "multi_core": self.multi_core,
+            "model_base": self._params_dram_base,
+            "private_windows": self._decode_windows,
         }
         if profile:
             metadata["prefill_profile_checkpoints"] = prefill_prog["checkpoints"]
@@ -1620,7 +1701,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
         preamble_addr = self.get_program_dram_addr()
-        if preamble_addr + 64 * 1024 > 0x100000000:
+        if preamble_addr + 64 * 1024 > self._model_dram_limit:
             raise MemoryError(
                 f"Instruction image exceeds 10 MiB program region: preamble=0x{preamble_addr:X}"
             )
@@ -1720,9 +1801,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             prefill_scheduler.preclear_flags()
             prefill_scheduler.start_workers(self._prefill_worker_addrs)
         hw_lat_prefill_us, prefill_gflops = self.program_execute(preamble_addr, flops=flops_prefill)
+        if self.is_queue_busy():
+            raise TimeoutError("Llama prefill master did not halt")
         if prefill_scheduler is not None:
             for w in prefill_scheduler.workers:
-                w.wait_queue(300.0)
+                w.wait_queue(10.0)
+                if w.is_queue_busy():
+                    raise TimeoutError("Llama prefill worker did not halt")
         latency_prefill = time.perf_counter() - timer
         print(f"Prefill done in {latency_prefill:.2f}s\n")
 
@@ -1821,12 +1906,17 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             if _fpga_penalty and (self.seq_len - prefill_seq_len) > _greedy_until:
                 self._write_penalty_bias(self._generated_tokens)
 
+            if self._decode_sharder is not None:
+                self._decode_sharder.start()
             hw_lat_dec_us, _ = self.program_execute(decoder_step_addr, flops=decoder_flops_per_token)
+            if self._decode_sharder is not None:
+                self._decode_sharder.wait()
             hw_decode_lats_us.append(hw_lat_dec_us)
             # Token selection: read the HW argmax register. In penalty mode the LM-head matmul
             # already added the bias, so the register holds the penalized token; in plain mode it's
             # pure greedy. Either way no logit readback.
-            token_id = self.get_arg_max_index(rank=1)
+            token_id = (self._decode_sharder.global_argmax("lm_head", self.LOGITS_DRAM)
+                        if self._decode_sharder is not None else self.get_arg_max_index(rank=1))
             self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
@@ -1837,6 +1927,11 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 break
             decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
+            if (getattr(self, "max_new_tokens", 0) > 0
+                    and self.seq_len - prefill_seq_len >= self.max_new_tokens):
+                if _use_status:
+                    _status_teardown()
+                break
             if _use_status:
                 _status_update()
         else:
@@ -1875,6 +1970,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             "prefill_tokens": prefill_seq_len,
             "decoded_text": "".join(decoded_chars),
             "decoded_tokens": tokens_decoded,
+            "generated_token_ids": self._generated_tokens[len(self.prefill_seq):],
+            "multi_core": self.multi_core,
+            "private_windows": self._decode_windows,
             # Compatibility aliases shared with Gemma3 and user_hw_test.py.
             "tokens_decoded": tokens_decoded,
             "avg_tokens_per_s": avg_tokens_per_s,
@@ -2071,7 +2169,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
         preamble_addr = self.get_program_dram_addr()
-        if preamble_addr + 64 * 1024 > 0x100000000:
+        if preamble_addr + 64 * 1024 > self._model_dram_limit:
             raise MemoryError(
                 f"Instruction image exceeds 10 MiB program region: preamble=0x{preamble_addr:X}"
             )
@@ -2194,6 +2292,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Llama-3.2-1B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt")
+    parser.add_argument("--max-new-tokens", type=int, default=0,
+                        help="Stop after N generated tokens (0: stop token or context limit)")
     parser.add_argument(
         "--standard-chat-template",
         action="store_true",
@@ -2221,9 +2321,8 @@ def main():
                              'per-step HW-latency table (summed over all layers) for prefill and for '
                              'the first decoded token.')
     parser.add_argument('--multi-core', nargs='?', type=int, const=2, default=1,
-                        help='Row-shard the prefill MLP block across N engines (default 2 when the '
-                             'flag is given with no value). 1 = single-engine. >2 is unverified on '
-                             'this device.')
+                        help='Shard prefill MLP rows and decode weight columns across N engines '
+                             'using the board memory controllers (default 2; 1 = single-engine).')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly — no logit readback,
     # fully deterministic. --pure-greedy disables it entirely.
@@ -2244,6 +2343,9 @@ def main():
                         help='count tokens over the last N (never penalizes punctuation/whitespace/'
                              'special tokens). Default 256.')
     args = parser.parse_args()
+
+    if args.profile and args.multi_core > 1:
+        parser.error('--profile currently requires --multi-core 1')
 
     set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
@@ -2279,8 +2381,8 @@ def main():
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
 
-    ue = UnifiedEngine()
-    ue.software_reset()
+    from multi_engine_decode import reset_engine_queues
+    reset_engine_queues(args.multi_core)
     
     ue = Llama32_1b_UnifiedEngine(
         script_dir=script_dir,
@@ -2313,6 +2415,7 @@ def main():
         prefill_seq = tuple(cfg["default_prefill_tokens"])
 
     ue.prefill_seq = prefill_seq
+    ue.max_new_tokens = max(0, args.max_new_tokens)
 
     # Decode config — deterministic, on-FPGA penalty only. Must be set BEFORE compile_llama() since
     # fpga_penalty changes the compiled LM-head matmul (bias on / writeback off).
@@ -2356,7 +2459,7 @@ def main():
     # next to this script (see llama_run_summary_filename / write_run_summary).
     _summary_path = os.path.join(SCRIPT_DIR, llama_run_summary_filename(args))
     try:
-        ue.write_run_summary(_summary_path, args, run_result)
+        ue.write_run_summary(_summary_path, args, run_result, cores=args.multi_core)
         print(f"Wrote run summary: {_summary_path}")
     except Exception as _e:
         print(f"[warn] failed to write run summary: {_e}")

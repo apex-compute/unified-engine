@@ -10,6 +10,33 @@ opt-in (`GEMMA4_E4B_ALLOW_ENCODER=1` with `--vision-enable`/`--audio-enable`).
 > vision/ISA bug). Run encoder modes with `GEMMA4_PENALTY=1` to improve
 > loop resistance, but do not treat E4B VLM quality as final.
 
+## Controller-private decode
+
+```bash
+GEMMA4_LM_ONLY_BIN=1 python models/gemma4_e4b/gemma4_e4b_test.py \
+  --dev xdma0 --multi-core 8 --max-new-tokens 32 --prompt "x+3=5, what is x?"
+python model_controller_benchmark.py --dev xdma0 --engines 8 --models e4b \
+  --prompt "x+3=5, what is x?" --max-new-tokens 32 \
+  --json e4b-controller-results.json
+```
+
+The U50 comparison passed all 32 generated tokens exactly: average FPGA decode
+latency was **380.95 → 249.47 ms/token (1.53×)** at 333.332 MHz. These are decode
+measurements; the existing padded prefill still runs on the primary engine.
+See `../../alveo_u50_gemma4_e4b_controller_results.json` for tokens and board identity.
+
+Q/K/V/O and MLP gate/up use controller-private weight copies. The original
+shared 0–4 GiB model image stays in place; U50 private shards occupy controller
+windows in 4–8 GiB. Four through eight engines fit. Two or three engines exceed
+the per-engine weight capacity and fail before weight loading. The larger-K
+MLP down projection and LM head retain their original primary kernels. U55C
+maps have offline coverage; no U55C hardware measurement is available.
+
+Multicore runs compile and restore worker programs each time. Program metadata
+records engine count and memory placement, and stale layouts are rejected
+before ISA upload. The standalone execute-only runner supports single-engine
+images and rejects multicore images because it cannot restore their workers.
+
 ## Two scripts, two stages
 
 | Stage | Script | Notes |
@@ -17,8 +44,8 @@ opt-in (`GEMMA4_E4B_ALLOW_ENCODER=1` with `--vision-enable`/`--audio-enable`).
 | Build (once) | `gemma4_e4b_test.py` | Builds `gemma4_instruction.bin` + `weights_gemma4_e4b_hf.bin`, then sanity-runs. Needs the HF model locally. Default build is LM-only; set `GEMMA4_LM_ONLY_BIN=0` and `GEMMA4_E4B_ALLOW_ENCODER=1` to build/test encoder modes. |
 | Deploy (every run after) | `gemma4_e4b_run_from_bin.py` | Loads the bin files and runs. Never touches the HF model. |
 
-After the first `gemma4_e4b_test.py` run, every subsequent invocation
-(either script) skips compilation.
+Single-engine runs reuse matching cached instructions. Multicore runs rebuild
+their workers, and changing layouts rebuilds the primary image.
 
 ## Files
 

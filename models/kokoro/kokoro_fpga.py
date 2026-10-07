@@ -236,6 +236,7 @@ _RT = {}
 # --- multi-engine state (see GPR_SHARD_* and GeneratorFPGA._tap_matmuls) ---
 _ENGINES = [1]                 # engine count for this run (kokoro_test --engines)
 _SCHED = [None]                # MultiEngineScheduler when _ENGINES > 1
+_CONTROLLER_REPLICAS = [None]  # immutable generator tap weights in free HBM windows
 _SHARD_WORKER_SETS = [None]    # per-worker [(reg, value)] register sets for the current run
 _TENSOR_END = [None]           # activation-region ceiling for the allocator guard (set below)
 KOKORO_WORKER_BASE = int(_CFG["dram"]["worker_base"], 16)      # worker arenas: above the activation high-water, below programs
@@ -3402,7 +3403,7 @@ class GeneratorFPGA:
         Sharded form: one barrier-delimited region; engine e runs every tap on its rows
         [off_e, off_e + cnt_e) (GPR_SHARD_OFF/CNT for T's level, primed per engine), sourcing
         the A / OUT / C bases from registers = literal base + off_e * row pitch. B (the weights)
-        and any broadcast_N bias are shared and stay literal. The taps of one conv chain through
+        uses a controller-private replica on Alveo; broadcast_N bias stays shared. The taps of one conv chain through
         the accumulator on the SAME rows, so no engine depends on another inside the region; the
         halo rows the shifted A reads need were written by the primary before the region (the
         entry barrier orders that) and the outputs are complete after the exit barrier.
@@ -3421,9 +3422,13 @@ class GeneratorFPGA:
         ta, to, tc = GPR_SHARD_TMP
         k_words, n_words = ue_35bit_addr_shifter(K * 2), ue_35bit_addr_shifter(N * 2)
 
+        replicas = _CONTROLLER_REPLICAS[0]
+        private_taps = [replicas.copy(B, K * N * 2) if replicas is not None
+                        else [B] * ne for _, B, _, _, _ in taps]
         def body(ctx):
             raw = ctx.unsafe_ue
-            for A, B, O, Cc, mode in taps:
+            for tap_index, (A, B, O, Cc, mode) in enumerate(taps):
+                B = private_taps[tap_index][ctx.engine_idx]
                 raw.generate_instruction_reg_mul_imm(ta, off_reg, k_words)
                 raw.generate_instruction_add_imm(ta, ue_35bit_addr_shifter(A), ta)
                 raw.generate_instruction_reg_mul_imm(to, off_reg, n_words)
@@ -5164,6 +5169,7 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
 
     _ENGINES[0] = int(engines)
     _SCHED[0] = None
+    _CONTROLLER_REPLICAS[0] = None
     _TENSOR_END[0] = KOKORO_TENSOR_END
     if engines > 1:
         from multi_engine_shard import MultiEngineScheduler, PrivateArena
@@ -5188,6 +5194,8 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
             handshake="four_phase", region_rendezvous="master_worker")
         sched.preclear_flags()
         _SCHED[0] = sched
+        from models.controller_replicas import ControllerReplicas
+        _CONTROLLER_REPLICAS[0] = ControllerReplicas(ue, engines)
         _TENSOR_END[0] = KOKORO_WORKER_BASE     # activations must stay below the worker arenas
         report(f"[fpga] multi-engine: {engines} engines, generator conv taps row-sharded")
 

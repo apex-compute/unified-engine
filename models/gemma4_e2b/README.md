@@ -3,6 +3,37 @@
 Gemma4 E2B accelerator inference. Three modes — text only (LM), image +
 text (VLM), and audio + text — run from a single instruction bin.
 
+## Controller placement and current validation
+
+```bash
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 --multi-core 8 \
+  --prefill-kernel matmatmul --max-new-tokens 32 --prompt "x+3=5, what is x?"
+python model_controller_benchmark.py --dev xdma0 --engines 8 --models e2b \
+  --prompt "x+3=5, what is x?" --max-new-tokens 32 \
+  --json e2b-controller-results.json
+```
+
+The existing eight-engine tiled/shared-pool map is preserved. Smaller
+configurations now select private windows by the board's memory-controller map
+and reserve the shared model span. The current implementation requires at least
+8 GiB for multicore E2B. Program sections in `programs.bin`/`programs.json`
+record a placement hash, so equal engine counts on U50 and U55C cannot reuse
+instructions with different baked addresses.
+
+**The latest E2B comparison has not passed correctness validation.** U50 runs
+produced meaningful text at 141.19 ms/token with one engine and 33.79 ms/token
+with eight, but their tokens differed. Repeating the same eight-engine compiler
+also changed the output. The previous and current eight-engine compilers
+produced byte-identical instructions; only the placement metadata changed.
+The measured 4.18× timing ratio is therefore not a validated model speedup.
+See `../../gemma4_e2b_controller_results.json` and
+`../../gemma4_e2b_existing_eight_comparison.json` for the failed comparisons.
+
+`--max-new-tokens` limits generation without changing the compiled context/KV
+layout. The comparison runner rejects empty decoded text and padding-only
+output, even when token lists match. U55C placement has offline coverage;
+U55C hardware results are not available.
+
 ## Two scripts, two stages
 
 | Stage | Script | Notes |

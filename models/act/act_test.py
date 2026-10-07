@@ -188,6 +188,9 @@ class ACT_UnifiedEngine(UnifiedEngine):
         if not self.params_from_bin:
             self.weight_init()
         self.tensor_init()
+        from models.controller_replicas import ControllerReplicas
+        self._controller_replicas = ControllerReplicas(self, num_engines)
+        self._controller_weight_end = self.get_params_dram_addr()
 
     # ------------------------------------------------------------------
     # DRAM helpers
@@ -521,7 +524,8 @@ class ACT_UnifiedEngine(UnifiedEngine):
             json.dump({"engines": self.NE, "primary_addr": program_addr, "primary_size": size,
                        "num_instructions": self.last_num_instructions, "workers": workers,
                        "consts_offset": tail0, "consts_size": tail1 - tail0,
-                       "stamp": self._weights_stamp()}, f)
+                       "stamp": self._weights_stamp(),
+                       "controller_replicas": self._controller_replicas.manifest()}, f)
         tot = size + sum(w["size"] for w in workers)
         _original_print(f"  Programs dumped: {tot / 1024**2:.1f} MB -> act_bin/programs_e{self.NE}/")
 
@@ -534,6 +538,10 @@ class ACT_UnifiedEngine(UnifiedEngine):
             meta = json.load(f)
         if meta.get("stamp") != self._weights_stamp() or meta.get("engines") != self.NE:
             return None
+        try:
+            self._controller_replicas.restore(meta.get("controller_replicas"))
+        except ValueError:
+            return None   # primary/worker ISA must be rebuilt for the live map
         if meta.get("consts_size", 0):
             n = self._dma_load(self._params_dram_base + meta["consts_offset"], os.path.join(d, "primary_consts.bin"))
             self.allocate_params_dram(n)
@@ -593,11 +601,20 @@ class ACT_UnifiedEngine(UnifiedEngine):
         ue.generate_instruction_add_set(dst_reg_idx=r, immediate_value=M)
         return r
 
+    def _controller_weight_address(self, ue, address, size):
+        if self._params_dram_base <= address < address + size <= self._controller_weight_end:
+            engine_index = (ue._base_addr - self._base_addr) // 0x10000
+            return self._controller_replicas.address(engine_index, address, size)
+        return address
+
     def mm(self, ue, M, K, N, A, B, OUT, C=None, mode="broadcast_N", relu=False):
         """OUT = A[M,K] @ B[N,K]^T (+ C) (ReLU). C: bias[N] or full [M,N]."""
         if M <= 0:
             return
         self._flops += 2 * M * K * N
+        # Only immutable weight-phase params are replicated. Attention matrices
+        # and any compile-time/runtime constants retain their original addresses.
+        B = self._controller_weight_address(ue, B, K * N * _BPE)
         r = self._prime_M(ue, M) if M > 1 else None   # M=1 token projections stay on the legacy path
         ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=B, OUTPUT_DRAM_ADDR=OUT,
                            C_DRAM_ADDR=C, bias_mode=mode, clamp_enable=relu, gpr_M_reg=r)
@@ -785,7 +802,9 @@ class ACT_UnifiedEngine(UnifiedEngine):
             for si in strips:
                 for gi, (taps, B_addr, Kg) in enumerate(groups):
                     last_g = gi == len(groups) - 1
-                    ue.accelerator_memory_to_sram(B_addr + si * N_s * Kg * _BPE, B_W, N_s * Kg)
+                    source = B_addr + si * N_s * Kg * _BPE
+                    source = self._controller_weight_address(ue, source, N_s * Kg * _BPE)
+                    ue.accelerator_memory_to_sram(source, B_W, N_s * Kg)
                     for i in range(m):
                         h, w = c0 + i // W, i % W
                         for dy, dx, run, kcol in g_runs[gi]:

@@ -94,6 +94,8 @@ def _instruction_compiler_fingerprint(script_dir: str, execution_sig: str) -> st
     sources = (
         ("model_codegen", os.path.join(script_dir, "qwen3_0.6b_test.py")),
         ("engine_codegen", os.path.join(repo_root, "user_dma_core.py")),
+        ("multi_engine_codegen", os.path.join(repo_root, "multi_engine_shard.py")),
+        ("decode_sharding", os.path.join(repo_root, "multi_engine_decode.py")),
         ("model_config", os.path.join(script_dir, "qwen3_0.6b_config.json")),
     )
     digest = hashlib.sha256()
@@ -1319,6 +1321,9 @@ def main():
     expected_dispatch_size = (
         int(cfg_on_disk["file_info"]["embedding_vocab"])
         * _EMBEDDING_DISPATCH_STRIDE_BYTES)
+    if inst_meta.get("multi_core", 1) != 1:
+        raise SystemExit("Multi-core Qwen images require qwen3_0.6b_test.py --multi-core N "
+                         "to prepare private weights and worker programs.")
     if (inst_meta.get("lm_head_sig") != expected_lm_head_sig
             or inst_meta.get("model_layout_sig") != expected_layout_sig
             or inst_meta.get("compiler_fingerprint") != expected_compiler_fingerprint

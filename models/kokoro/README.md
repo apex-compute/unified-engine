@@ -62,3 +62,14 @@ Inference uses a single frozen instruction image cached in `kokoro_bin/`
 compiler fingerprint and fixed padding caps rather than the exact sequence
 length, so one compiled image serves any prompt without recompiling per
 input.
+
+With `--engines N`, the existing fused generator convolution-tap path now copies
+immutable bf16 tap matrices into free Alveo controller windows above 4 GiB.
+Each engine emits the address of its own replica; output rows, biases, dynamic
+frame registers, and worker programs keep their existing layouts. U50 and
+16 GiB U55C provide one replica per engine; 8 GiB U55C provides four free
+controller regions, shared cyclically by additional engines. Kintex retains
+shared weights because this fixed model layout leaves no external DRAM reserve.
+Multi-engine runs already compile without a frozen program cache. Exact-copy,
+capacity, short-DMA and emitted-address tests pass offline; this change has no
+new measured audio-performance result yet.
