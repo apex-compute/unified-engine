@@ -1,0 +1,132 @@
+{
+  "hostname": "p2",
+  "device": "xdma1",
+  "image": "0x8763d976",
+  "hardware_info": {
+    "raw": 2218837587,
+    "queue_mode": true,
+    "axi_data_width_bits": 256,
+    "dram_size_code": 1,
+    "dram_size_gb": 4,
+    "core_count": 2,
+    "frequency_mhz_q8": 50771,
+    "frequency_mhz": 198.32421875,
+    "frequency_hz": 198324218.75
+  },
+  "timestamp_utc": "2026-10-07T17:51:56.598670+00:00",
+  "prompt": "x+3=5, what is x?",
+  "max_new_tokens": 32,
+  "models": {
+    "qwen_2b": {
+      "runs": [
+        {
+          "token_ids": [
+            1206,
+            11290,
+            279,
+            22868,
+            393,
+            87,
+            478,
+            220,
+            18,
+            283,
+            220,
+            20,
+            3,
+            364,
+            393,
+            87,
+            53031,
+            1732,
+            1439,
+            7123,
+            25,
+            271,
+            16,
+            13,
+            220,
+            2972,
+            3742,
+            31971,
+            279,
+            3759,
+            92217,
+            1394
+          ],
+          "decoded_tokens": 32,
+          "decoded_text_without_special_tokens": "To solve the equation $x + 3 = 5$ for $x$, follow these steps:\n\n1.  **Isolate the variable**: You",
+          "pad_token_id": 248044,
+          "decoded_text": "To solve the equation $x + 3 = 5$ for $x$, follow these steps:\n\n1.  **Isolate the variable**: You",
+          "decode_first_hw_ms": 1271.1414147446376,
+          "decode_avg_hw_ms": 1271.1351818748446,
+          "timed_decode_steps": 31,
+          "model_base": 0,
+          "private_windows": null,
+          "active_engines": 1,
+          "wall_seconds": 74.99037579200376
+        },
+        {
+          "token_ids": [
+            1206,
+            11290,
+            279,
+            22868,
+            393,
+            87,
+            478,
+            220,
+            18,
+            283,
+            220,
+            20,
+            3,
+            364,
+            393,
+            87,
+            53031,
+            1732,
+            1439,
+            7123,
+            25,
+            271,
+            16,
+            13,
+            220,
+            2972,
+            3742,
+            31971,
+            279,
+            3759,
+            92217,
+            1394
+          ],
+          "decoded_tokens": 32,
+          "decoded_text_without_special_tokens": "To solve the equation $x + 3 = 5$ for $x$, follow these steps:\n\n1.  **Isolate the variable**: You",
+          "pad_token_id": 248044,
+          "decoded_text": "To solve the equation $x + 3 = 5$ for $x$, follow these steps:\n\n1.  **Isolate the variable**: You",
+          "decode_first_hw_ms": 1190.321593035394,
+          "decode_avg_hw_ms": 1190.3255071214771,
+          "timed_decode_steps": 31,
+          "model_base": 1073741824,
+          "private_windows": [
+            [
+              0,
+              536870912
+            ],
+            [
+              3221225472,
+              536870912
+            ]
+          ],
+          "active_engines": 2,
+          "wall_seconds": 71.45310331100336
+        }
+      ],
+      "exact_token_match": true,
+      "meaningful_output": true,
+      "first_token_speedup": 1.0678974675265263,
+      "average_token_speedup": 1.0678887197408604
+    }
+  }
+}

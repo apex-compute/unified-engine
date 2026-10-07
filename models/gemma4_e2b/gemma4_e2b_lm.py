@@ -2823,6 +2823,14 @@ class Gemma4LMMixin:
         self._set_silent(False)
         return None, program_sizes, total_flops_list
 
+    def _align_dispatch_entry(self) -> int:
+        """Pad capture before recording an externally dispatched entry."""
+        address = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
+        if address % (2 * INSTRUCTION_SIZE_BYTES):
+            self.generate_instruction_nop()
+            address += INSTRUCTION_SIZE_BYTES
+        return address
+
     def _dispatch_program(self, gpr_sets: list[tuple[int, int]],
                           target_addr: int | None,
                           timeout: float = 50.0, flops: float | None = None):
@@ -2840,6 +2848,8 @@ class Gemma4LMMixin:
         clobber the prefill or decoder programs. Returns program_execute's
         (latency, flop_rate).
         """
+        if target_addr is not None and target_addr % (2 * INSTRUCTION_SIZE_BYTES):
+            raise ValueError(f"Gemma E2B dispatch entry 0x{target_addr:X} must be 64-byte aligned; recompile the program image")
         self.clear_inst_id()
         self.start_capture()
         for reg, val in gpr_sets:
