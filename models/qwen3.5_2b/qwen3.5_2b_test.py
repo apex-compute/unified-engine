@@ -55,12 +55,8 @@ _THIS = Path(__file__).resolve()
 sys.path.insert(0, str(_THIS.parents[2]))
 
 import user_dma_core                                  # noqa: E402
-# Match Gemma3's deployed FPGA clock period (5.62 ns ≈ 178 MHz).  The
-# user_dma_core default is 3 ns (333 MHz), which makes
-# `report_latency_in_us()` under-report HW time by ~1.87× and inflates
-# our GFLOP/s figure by the same factor.  Set BEFORE constructing the
-# engine so `self._clock_period_ns` picks it up.
-user_dma_core.CLOCK_CYCLE_TIME_NS = 5.62
+# The caller selects the device and reads HW_INFO before constructing engines.
+# Importing a model must not replace that measured clock with a board default.
 
 from user_dma_core import (                          # noqa: E402
     UnifiedEngine, DMA_DEVICE_H2C, DMA_DEVICE_C2H,
@@ -199,7 +195,26 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
 
     _IDENTITY_MAT_BYTES = UE_VECTOR_SIZE * UE_VECTOR_SIZE * 2   # 8192 B
 
-    def __init__(self, *args, config_path: str = None, **kwargs):
+    def __init__(self, *args, config_path: str = None, multi_core: int = 1, **kwargs):
+        if not isinstance(multi_core, int) or multi_core < 1:
+            raise ValueError("multi_core must be a positive integer")
+        self.multi_core = multi_core
+        self._decode_sharder = None
+        self.controller_decoder = None
+        self._identity_matrix_cache = {}
+        self._decode_windows = None
+        if multi_core > 1:
+            from multi_engine_shard import model_multicore_layout
+            self._decode_windows, model_base = model_multicore_layout(multi_core)
+            layout = dict(params_dram_base=model_base,
+                          tensor_dram_base=model_base + (1 << 30),
+                          program_dram_base=model_base + (1536 << 20))
+            if any(key in kwargs and kwargs[key] != value for key, value in layout.items()):
+                raise ValueError("multicore requires the controller-reserved model layout")
+            kwargs.update(layout)
+            self._model_end = model_base + (2 << 30)
+        else:
+            self._model_end = 4 << 30
         self._identity_dram_addr = None
         self._identity_dram_written = False
         self._eps_tail_cache: Dict[Tuple[int, float], Tuple[int, int]] = {}
@@ -293,11 +308,142 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         self.tokenizer = None       # set by generate()/run_decoder for the structural scan
         self._struct_ids_cache = None
         self._struct_ids_tensor_cache = None
+        self._params_limit = self._tensor_dram_base
+        self._check_decode_private_capacity()
+
+    def _decode_projection_specs(self):
+        """Original uploaded IF4 operands; fused KV is registered only once."""
+        H, I = self.hidden_size, self.mlp_dim
+        for layer in range(self.num_layers):
+            if layer in self.linear_attn_layers:
+                shapes = (("Q_QKV", H, self.lin_conv_dim),
+                          ("Q_Z", H, self.lin_value_dim),
+                          ("Q_OUT", self.lin_value_dim, H),
+                          ("Q_GATE", H, I), ("Q_UP", H, I), ("Q_DOWN", I, H))
+            else:
+                q = self.full_num_heads * self.full_head_dim
+                kv = self.full_num_kv_heads * self.full_head_dim
+                shapes = (("Q_Q", H, 2 * q), ("Q_KV", H, 2 * kv),
+                          ("Q_O", q, H), ("Q_G", H, I),
+                          ("Q_U", H, I), ("Q_D", I, H))
+            for key, K, N in shapes:
+                yield layer, key, K, N
+        yield None, "lm_head", H, self._cfg["file_info"]["embedding_vocab"]
+
+    def _check_decode_private_capacity(self):
+        if self._decode_windows is None:
+            return
+        from multi_engine_shard import PrivateArena, can_split
+        arena = PrivateArena(self.multi_core, windows=self._decode_windows)
+        # Allocate the real packed-data and scale lengths before any DMA.
+        for _, name, K, N in self._decode_projection_specs():
+            if not can_split(N, self.multi_core):
+                continue
+            blocks, remainder = divmod(N // 64, self.multi_core)
+            for index in range(self.multi_core):
+                columns = (blocks + (index < remainder)) * 64
+                arena.alloc_weights(index, columns * K // 2, name)
+                arena.alloc_weights(index, columns * K // 64 * 2, name + " scale")
+        self._decode_private_weight_bytes = arena.usage()
+
+    def _controller_layout(self):
+        return {"version": 1, "engines": self.multi_core,
+                "params_base": self._params_dram_base,
+                "params_limit": self._params_limit,
+                "program_base": self._program_dram_base, "model_end": self._model_end,
+                "private_windows": ([list(w) for w in self._decode_windows]
+                                    if self._decode_windows is not None else None)}
+
+    def _decoder_cache_key(self):
+        import hashlib
+        root = _THIS.parents[2]
+        sources = [_THIS, root / "user_dma_core.py", root / "multi_engine_decode.py",
+                   root / "multi_engine_shard.py"]
+        digest = hashlib.sha256()
+        for path in sources:
+            digest.update(path.read_bytes())
+        digest.update(json.dumps(self._cfg, sort_keys=True, separators=(",", ":")).encode())
+        return {"source_sha256": digest.hexdigest(), "max_context": self.max_context,
+                "layout": self._controller_layout(),
+                "axi_data_width_bits": user_dma_core.UE_AXI_DATA_WIDTH_BITS,
+                "vector_elements": user_dma_core.UE_VECTOR_SIZE}
+
+    def _ensure_decode_sharder(self):
+        if self.multi_core == 1:
+            return None
+        if self._decode_sharder is None:
+            from multi_engine_decode import ControllerShardedDecoder
+            decoder = ControllerShardedDecoder(self, self.multi_core, self._decode_windows)
+            for layer, name, K, N in self._decode_projection_specs():
+                if layer is None:
+                    scale, weight = self._lm_head_scale_dram, self._lm_head_data_dram
+                else:
+                    scale, weight = self._layer_weights[layer][name]
+                for address, size in ((weight, K * N // 2), (scale, K * N // 64 * 2)):
+                    if not self._params_dram_base <= address < address + size <= self._params_limit:
+                        raise ValueError(f"{name}: decode source escapes shared params")
+                decoder.add_weight(name if layer is None else f"{layer}_{name}",
+                                   weight, scale, K, N, 1, 0)
+            self._decode_sharder = decoder
+            self.controller_decoder = decoder
+        return self._decode_sharder
+
+    def _decode_projection_core(self, **kwargs):
+        if self._compile_mode and self._decode_sharder is not None:
+            result = self._decode_sharder.projection(**kwargs)
+            if result is not None:
+                return result
+        return self.quantized_matmat_core(**kwargs)
+
+    def _execute_decoder_program(self, timeout=300.0):
+        if self._decode_sharder is not None:
+            self._decode_sharder.start()
+        self.start_execute_from_dram(self._decoder_prog_addr)
+        deadline = time.monotonic() + timeout
+        while self.is_queue_busy():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Qwen3.5 decoder did not halt")
+            time.sleep(0.001)
+        latency = self.report_latency_in_us()
+        if self._decode_sharder is not None:
+            self._decode_sharder.wait(timeout)
+        return latency
+
+    def _decoder_argmax(self):
+        if self._decode_sharder is not None:
+            return self._decode_sharder.global_argmax("lm_head", self.LOGITS_DRAM)
+        return self.get_arg_max_index(rank=1)
+
+    def allocate_params_dram(self, size_bytes, label=None, align_bytes=64):
+        limit = getattr(self, "_params_limit", self._tensor_dram_base)
+        start = self._align_up(self._next_params_dram_addr, align_bytes)
+        if size_bytes < 0 or start + size_bytes > limit:
+            raise MemoryError("Qwen3.5 params exceed the reserved model region")
+        return super().allocate_params_dram(size_bytes, label, align_bytes)
+
+    def allocate_tensor_dram(self, size_bytes, label=None, align_bytes=64):
+        start = self._align_up(self._tensor_dram_addr, align_bytes)
+        if size_bytes < 0 or start + size_bytes > self._program_dram_base:
+            raise MemoryError("Qwen3.5 tensors exceed the reserved model region")
+        return super().allocate_tensor_dram(size_bytes, label, align_bytes)
+
+    def allocate_program_dram(self, size_bytes, label=None, align_bytes=64):
+        start = self._align_up(self._next_program_dram_addr, align_bytes)
+        if size_bytes < 0 or start + self._align_up(size_bytes, align_bytes) > self._model_end:
+            raise MemoryError("Qwen3.5 ISA exceeds the reserved model region")
+        return super().allocate_program_dram(size_bytes, label, align_bytes)
+
+    def write_captured_instructions_to_dram(self, start_addr=None):
+        address = self.get_program_dram_addr() if start_addr is None else start_addr
+        size = self._align_up(self.get_capture_instruction_size_bytes(), 64)
+        if not self._program_dram_base <= address <= address + size <= self._model_end:
+            raise MemoryError("Qwen3.5 instruction DMA exceeds the reserved model region")
+        return super().write_captured_instructions_to_dram(address)
 
     def _preallocate_identity_matrix(self) -> None:
         if self._identity_dram_addr is not None:
             return
-        self._identity_dram_addr = super().allocate_params_dram(self._IDENTITY_MAT_BYTES)
+        self._identity_dram_addr = self.allocate_params_dram(self._IDENTITY_MAT_BYTES)
         eye = torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16)
         super().dma_write(DMA_DEVICE_H2C, self._identity_dram_addr,
                           eye, self._IDENTITY_MAT_BYTES)
@@ -453,7 +599,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         tail = torch.zeros(tail_len, dtype=torch.float32)
         tail[0] = math.sqrt(N * eps)
         tail_bf = tail.to(torch.bfloat16).contiguous().cpu()
-        addr = super().allocate_params_dram(tail_len * 2)
+        addr = self.allocate_params_dram(tail_len * 2)
         super().dma_write(DMA_DEVICE_H2C, addr, tail_bf, tail_len * 2)
         self._eps_tail_cache[key] = (addr, tail_len)
         return self._eps_tail_cache[key]
@@ -932,6 +1078,10 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
           - `self._cache_pos`: number of tokens currently in the cache.
         """
         self.max_context = max_context
+        if not isinstance(max_context, int) or not 1 <= max_context <= self._cfg["model"]["max_context_size"]:
+            raise ValueError("max_context is outside the configured recurrent-state capacity")
+        if getattr(self, "_inference_prepared", False):
+            raise RuntimeError("prepare_inference must run exactly once per engine")
         # Decoder binary paths (set here so compile_decoder / load_instructions
         # can be called without passing paths explicitly, matching Gemma3 API).
         _script_dir = str(Path(__file__).parent)
@@ -943,6 +1093,9 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
             _script_dir, "qwen3.5_2b_bin", ".decoder_compile.bin")
         self._decoder_meta_path = os.path.join(
             _script_dir, "qwen3.5_2b_bin", ".decoder_compile.json")
+        if self.multi_core > 1:
+            self._decoder_bin_path = self._decoder_bin_path.replace(".bin", f"_mc{self.multi_core}.bin")
+            self._decoder_meta_path = self._decoder_meta_path.replace(".json", f"_mc{self.multi_core}.json")
         T_aligned = max_context
         if T_aligned < UE_VECTOR_SIZE:
             T_aligned = UE_VECTOR_SIZE
@@ -986,7 +1139,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         self.dma_write(DMA_DEVICE_H2C, eye_addr,
                        _bf(torch.eye(conv_dim, dtype=torch.float32)),
                        eye_bytes)
-        _IDENTITY_DRAM_CACHE[conv_dim] = eye_addr
+        self._identity_matrix_cache[conv_dim] = eye_addr
 
         # S cache: one [num_vh, Dk, Dv] bf16 buffer per linear-attn layer.
         num_vh = self.lin_num_v_heads
@@ -1114,7 +1267,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         # Constant ones vector for β-on-FPGA: UE_VECTOR_SIZE bf16 ones in params DRAM.
         ones_vec = torch.ones(UE_VECTOR_SIZE, dtype=torch.bfloat16)
         ones_bytes = UE_VECTOR_SIZE * BF16
-        self._ones_dram = super().allocate_params_dram(ones_bytes)
+        self._ones_dram = self.allocate_params_dram(ones_bytes)
         super().dma_write(DMA_DEVICE_H2C, self._ones_dram, ones_vec, ones_bytes)
 
         # Selector e_0 = [1, 0, 0, ..., 0] (UE_VECTOR_SIZE bf16) for the
@@ -1124,7 +1277,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         # This replaces the older DMA + RSQRT scalar-load dance.
         e0_vec = torch.zeros(UE_VECTOR_SIZE, dtype=torch.bfloat16)
         e0_vec[0] = 1.0
-        self._e0_dram = super().allocate_params_dram(ones_bytes)
+        self._e0_dram = self.allocate_params_dram(ones_bytes)
         super().dma_write(DMA_DEVICE_H2C, self._e0_dram, e0_vec, ones_bytes)
 
         # Spreader matrix for α/β scatter.  matmat_mul_core does A @ B^T where
@@ -1136,7 +1289,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         for h in range(num_vh):
             alpha_spreader[h * N_us, h] = 1.0
         alpha_spreader_bytes = num_vh * N_us * N_us * BF16
-        self._alpha_spreader_dram = super().allocate_params_dram(alpha_spreader_bytes)
+        self._alpha_spreader_dram = self.allocate_params_dram(alpha_spreader_bytes)
         super().dma_write(DMA_DEVICE_H2C, self._alpha_spreader_dram,
                           _bf(alpha_spreader.contiguous()), alpha_spreader_bytes)
 
@@ -1146,7 +1299,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         for dk in range(Dk):
             k_spreader[dk * N_us, dk] = 1.0
         k_spreader_bytes = Dk * N_us * Dk * BF16
-        self._k_spreader_dram = super().allocate_params_dram(k_spreader_bytes)
+        self._k_spreader_dram = self.allocate_params_dram(k_spreader_bytes)
         super().dma_write(DMA_DEVICE_H2C, self._k_spreader_dram,
                           _bf(k_spreader.contiguous()), k_spreader_bytes)
 
@@ -1231,7 +1384,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         fa_head_dim = self.full_head_dim
         eye_head = _bf(torch.eye(fa_head_dim, dtype=torch.float32))
         eye_head_bytes = fa_head_dim * fa_head_dim * BF16
-        self._fa_eye_head_dram = super().allocate_params_dram(eye_head_bytes)
+        self._fa_eye_head_dram = self.allocate_params_dram(eye_head_bytes)
         super().dma_write(DMA_DEVICE_H2C, self._fa_eye_head_dram, eye_head, eye_head_bytes)
 
         # Per-linear-attn-layer conv1d state ring + scratch tap buffers.
@@ -1279,7 +1432,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         # permanent; reset_tensor_dram_addr() will only reclaim allocations
         # made above this point.
         self._tensor_dram_base = self._tensor_dram_addr
-        reserved_mb = (self._tensor_dram_base - DRAM_ACTIVATION_ADDR) / (1024 * 1024)
+        reserved_mb = (self._tensor_dram_base - self._params_limit) / (1024 * 1024)
         print(f"  Tensor DRAM reserved for caches: {reserved_mb:.0f} MB")
 
         # Final norm gamma (Qwen3_5RMSNorm: (1+w) already folded in by extractor).
@@ -1343,6 +1496,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
                                                 dtype=torch.float32)
 
         self._cache_pos = 0
+        self._inference_prepared = True
 
     def _upload_causal_bias(self, T_aligned: int) -> None:
         """(Re)upload a [T_aligned × T_aligned] causal lower-tri mask into
@@ -1376,14 +1530,18 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         bin_path  = self._decoder_bin_path
         meta_path = self._decoder_meta_path
 
-        if os.path.exists(bin_path) and os.path.exists(meta_path):
+        if self.multi_core == 1 and os.path.exists(bin_path) and os.path.exists(meta_path):
             with open(meta_path) as f:
                 meta = json.load(f)
-            return bin_path, meta["program_sizes"], meta["total_flops"]
+            if meta.get("cache_key") == self._decoder_cache_key():
+                return bin_path, meta["program_sizes"], meta["total_flops"]
 
         print("  compile_decoder: emitting single-binary decoder (Option B) ...",
               flush=True)
         t0 = time.time()
+        # Both streams must be emitted together. Persisted primary-only ISA
+        # cannot recreate the matching worker rounds or private weight copies.
+        decoder = self._ensure_decode_sharder()
 
         # Open ONE global capture and enable compile mode so all inner
         # start_capture / stop_capture / _exec_captured calls become no-ops.
@@ -1396,6 +1554,8 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         self.capture_count  = 0
         self.is_capture_on  = True
         self._compile_mode  = True
+        if decoder is not None:
+            decoder.begin()
 
         # Old S7 shared full-attn flash subroutine used the removed
         # flash_attention_core/gpr_bucket_idx path. Keep full attention inline so
@@ -1425,7 +1585,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
             # penalized decode step.  M=1 ⇒ the fast quantized GEMV path (same as
             # llama3.2/qwen3).  Prefill replays this program per token, so its
             # last-token argmax is the first generated token.
-            self.quantized_matmat_core(
+            self._decode_projection_core(
                 M=1, K=self.hidden_size, N=self.VOCAB,
                 A_DRAM_ADDR=self._decoder_final_norm_dram,
                 B_DRAM_ADDR=self._lm_head_data_dram,
@@ -1436,6 +1596,8 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
                 write_back_disable=True)
 
         self.generate_instruction_halt()
+        if decoder is not None:
+            decoder.finalize()
 
         self._s7_full_attn_active = False
 
@@ -1462,6 +1624,8 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
             "instruction_counts": [n_insts],
             "program_sizes":      [len(bin_bytes)],
             "total_flops":        [int(flops)],
+            "controller_layout":  self._controller_layout(),
+            "cache_key":          self._decoder_cache_key(),
         }
         with open(bin_path, "wb") as f:
             f.write(bin_bytes)
@@ -1490,9 +1654,15 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         if self._decoder_prog_addr != 0:
             # Already compiled into program DRAM this session.
             return self._decoder_prog_addr, self._decoder_prog_size
+        if self.multi_core > 1:
+            raise ValueError("multicore decoder must be compiled with its workers in this process")
 
         with open(meta_path) as f:
             meta = json.load(f)
+        if meta.get("controller_layout", {}).get("engines", 1) != 1:
+            raise ValueError("single-engine loader cannot restore multicore workers")
+        if meta.get("cache_key") != self._decoder_cache_key():
+            raise ValueError("decoder cache is stale; compile for this code, context, and layout")
         with open(bin_path, "rb") as f:
             bin_bytes = f.read()
 
@@ -1539,6 +1709,11 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         useful as a correctness reference while validating new pipelines.
         """
         eot      = self._cfg["model"].get("end_of_turn_token_id", None)
+        if self.multi_core > 1 and not one_shot:
+            raise ValueError("multicore requires the paired one-shot decoder")
+        if max_new_tokens < 1 or self._cache_pos + max_new_tokens - 1 > self.max_context:
+            raise ValueError("requested decode tokens exceed the recurrent-state context capacity")
+        self._decode_step_us = []
         flops    = _theoretical_flops_per_step(self, 1)
         H        = self.hidden_size
         T_al     = self.max_context_aligned
@@ -1653,20 +1828,10 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
                     # (4) ONE FPGA trigger: 24 layers + final_norm + LM head, with
                     # on-chip argmax of (logits + penalty bias); write_back_disable
                     # ⇒ no logit readback.
-                    self.start_execute_from_dram(self._decoder_prog_addr)
-                    # Sleep 1 ms between polls — burns ~1000 PCIe reads per step
-                    # instead of ~240 k, freeing the CPU core without changing
-                    # wall time (FPGA queue_busy is independent of polling rate).
-                    t_wait = time.time()
-                    while self.is_queue_busy():
-                        time.sleep(0.001)
-                        if time.time() - t_wait >= 300.0:
-                            print("  wait_queue timed out")
-                            break
-                    self._step_hw_latency_us = self.report_latency_in_us()
+                    self._step_hw_latency_us = self._execute_decoder_program()
 
                     # (5) Read ONLY the winning token index (HW argmax).
-                    nxt = self.get_arg_max_index(rank=1)
+                    nxt = self._decoder_argmax()
                 else:
                     # Per-layer reference path (one_shot=False): host LM head +
                     # host argmax (numeric reference only; not a shipping path).
@@ -1678,6 +1843,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
             step_dt = time.time() - t0
             step_dts.append(step_dt)
             step_hw_us = self._step_hw_latency_us
+            self._decode_step_us.append(step_hw_us)
             total_dt += step_dt
             total_hw_us += step_hw_us
             out_tokens.append(nxt)
@@ -1715,6 +1881,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
                       f"{avg_gflops:.1f} GFLOP/s")
 
         generated = tokenizer.decode(out_tokens, skip_special_tokens=True)
+        self._decoded_token_ids = out_tokens
         return {
             "token_ids":      out_tokens,
             "generated_text": generated,
@@ -1722,6 +1889,9 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
             "wall_time_s":    total_dt,
             "tok_per_s":      n / max(total_dt, 1e-9),
             "hw_gflops_s":    avg_gflops,
+            "hw_step_us":      list(self._decode_step_us),
+            "decode_first_hw_ms": self._decode_step_us[0] / 1000 if self._decode_step_us else None,
+            "decode_avg_hw_ms": avg_hw_us / 1000 if self._decode_step_us else None,
         }
 
     def reset_state(self) -> None:
@@ -2370,6 +2540,10 @@ def _cached_emit(ue, key, emit_fn) -> None:
     of running emit_fn.  emit_fn must only append to capture_buffer (no
     other side effects).  Used to eliminate the ~50 µs/instruction Python
     emission cost from decode-step hot paths."""
+    if getattr(ue, "_compile_mode", False) and getattr(ue, "multi_core", 1) > 1:
+        # A cached primary span alone would omit its workers' matching rounds.
+        emit_fn()
+        return
     cached = ue._primitive_cache.get(key)
     if cached is None:
         start = ue.capture_count
@@ -2645,14 +2819,11 @@ def run_rms_norm_dram(ue, M: int, N: int, X_DRAM: int, GAMMA_DRAM: int,
     return OUT
 
 
-_IDENTITY_DRAM_CACHE: Dict[int, int] = {}
-
-
 def _get_identity_dram(ue, N: int) -> int:
-    if N in _IDENTITY_DRAM_CACHE:
-        return _IDENTITY_DRAM_CACHE[N]
+    if N in ue._identity_matrix_cache:
+        return ue._identity_matrix_cache[N]
     addr = _upload(ue, torch.eye(N, dtype=torch.float32))
-    _IDENTITY_DRAM_CACHE[N] = addr
+    ue._identity_matrix_cache[N] = addr
     return addr
 
 
@@ -2737,7 +2908,7 @@ def run_fp4_matmul(ue, M, K, N, A_DRAM, B_SCALE, B_DATA,
     use_gemv = (M == 1 and K <= user_dma_core.SCALE_BRAM_ELEMENTS)
     if use_gemv:
         key = ("fp4_gemv", M, K, N, A_DRAM, B_SCALE, B_DATA, OUT, silu, sigmoid, gelu)
-        _cached_emit(ue, key, lambda: ue.quantized_matmat_core(
+        _cached_emit(ue, key, lambda: ue._decode_projection_core(
             M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM, B_DRAM_ADDR=B_DATA,
             OUTPUT_DRAM_ADDR=OUT, SCALE_DRAM_ADDR=B_SCALE, data_type=TYPE.IF4,
             silu_enable=silu, sigmoid_enable=sigmoid, gelu_enable=gelu))
@@ -3701,6 +3872,8 @@ def prefill_via_decode(ue: Qwen3_5_2b_UnifiedEngine,
     runs for every prompt token, and this is the last token's argmax.
     """
     T_prompt = int(token_ids.numel())
+    if not 1 <= T_prompt <= ue.max_context:
+        raise ValueError("prompt length exceeds recurrent-state context capacity")
     H        = ue.hidden_size
     T_al     = ue.max_context_aligned
     row_byt  = ue.full_head_dim * BF16
@@ -3756,13 +3929,8 @@ def prefill_via_decode(ue: Qwen3_5_2b_UnifiedEngine,
             ue.isa_add_set_core(ue._ISA_POS_ROPE_REG, ue_35bit_addr_shifter(pos * rope_byt))
 
             # ONE FPGA trigger per prompt token.
-            ue.start_execute_from_dram(ue._decoder_prog_addr)
-            t_wait = time.time()
-            while ue.is_queue_busy():
-                time.sleep(0.001)
-                if time.time() - t_wait >= 300.0:
-                    break
-            total_hw_us += ue.report_latency_in_us()
+            ue._prefill_last_step_us = ue._execute_decoder_program()
+            total_hw_us += ue._prefill_last_step_us
             ue._cache_pos += 1
 
             if verbose and (i + 1) % 4 == 0:
@@ -3772,7 +3940,7 @@ def prefill_via_decode(ue: Qwen3_5_2b_UnifiedEngine,
     # token; the LAST token's argmax IS the first generated token (no logit
     # readback — write_back_disable).  The penalty bias is zero throughout
     # prefill (the prompt is never penalized), so this is plain greedy.
-    first_token_id = ue.get_arg_max_index(rank=1)
+    first_token_id = ue._decoder_argmax()
 
     # Surface timing through the same field the caller's pretty-printer uses.
     ue._step_hw_latency_us = total_hw_us
@@ -3968,6 +4136,8 @@ def write_unified_bin(ue, bin_dir: str, encoder_bytes: bytes, vis_meta: dict,
     programs["decoder"] = {"offset": encoder_size, "size": decoder_size}
     meta = {
         "layout": "encoder|decoder @base",
+        "controller_layout": ue._controller_layout(),
+        "cache_key": ue._decoder_cache_key(),
         "programs": programs,
         # Back-compat duplicate fields (offset/size pairs) so callers using the
         # flat keys keep working until they migrate to ``programs[...]``.
@@ -4014,6 +4184,19 @@ def load_decoder_from_bin(ue, raw: bytes, meta: dict) -> None:
     0xD0000000 (no recompilation) and restore the transient decode I/O addresses
     so prefill/decode run exactly as a compiled decoder would. Call AFTER the
     single prepare_inference; pair with ``generate(..., decoder_preloaded=True)``."""
+    if ue.multi_core > 1 or meta.get("controller_layout", {}).get("engines", 1) != 1:
+        raise ValueError("multicore decoder requires fresh compilation of matching worker programs")
+    if meta.get("cache_key") != ue._decoder_cache_key():
+        raise ValueError("decoder cache is stale; rebuild for this source, hardware, and context")
+    layout = meta.get("controller_layout")
+    if layout is not None and layout != ue._controller_layout():
+        raise ValueError("decoder cache belongs to a different memory layout")
+    if meta.get("max_context", ue.max_context) != ue.max_context:
+        raise ValueError("decoder cache belongs to a different context capacity")
+    if not 0 <= meta["decoder_off"] <= meta["decoder_off"] + meta["decoder_size"] <= len(raw):
+        raise ValueError("decoder cache is truncated")
+    if ue._program_dram_base + meta["decoder_size"] > ue._model_end:
+        raise MemoryError("decoder cache exceeds the model ISA region")
     ue.reset_program_dram_addr()
     dec_addr = ue.get_program_dram_addr()
     ue.dma_write(DMA_DEVICE_H2C, dec_addr,
@@ -4653,6 +4836,8 @@ def main():
                     help="FPGA board profile. Default: bittware.")
     ap.add_argument("--dev", type=str, default="xdma0",
                     help="DMA device name (default: xdma0).")
+    ap.add_argument("--multi-core", type=int, default=1,
+                    help="Controller-private LM decode engines; Kintex7 supports 2.")
     # VLM opt-in (gemma4 pattern). Default mode is pure LM; vision activates
     # only when --image PATH or --vision-enable is given.  Vision encoder
     # runs on FPGA (Phase 4) by default; the host-side HF path (Phase 1) is
@@ -4692,6 +4877,8 @@ def main():
     _TEST_SAMPLES = os.path.normpath(os.path.join(_HERE, "..", "..", "test_samples"))
     DEFAULT_IMAGE = os.path.join(_TEST_SAMPLES, "yosemite.jpg")
     vision_on = bool(args.image) or args.vision_enable
+    if args.multi_core > 1 and vision_on:
+        raise ValueError("multicore currently supports text-only generation")
     # FPGA vision encoder is the DEFAULT when vision is enabled; --no-fpga-vision
     # falls back to the host HF encoder. (--vision-on-hardware kept as a no-op.)
     use_fpga_vision = vision_on and not args.no_fpga_vision
@@ -4790,9 +4977,21 @@ def main():
 
     print("  FPGA init ...", end=" ", flush=True)
     with _quiet():
-        ue = Qwen3_5_2b_UnifiedEngine(device='cpu')
-        ue.software_reset()
+        ue = Qwen3_5_2b_UnifiedEngine(device='cpu', multi_core=args.multi_core)
+        from multi_engine_decode import reset_engine_queues
+        reset_engine_queues(args.multi_core)
     print("ok.")
+
+    if args.multi_core > 1:
+        # Primary and worker ISA must be compiled together after this load.
+        # Keep legacy unified encoder/decoder bins isolated from this path.
+        with _quiet():
+            ue._preallocate_identity_matrix()
+            ue.prepare_inference(weights, max_context=MAX_CONTEXT)
+            ue.compile_decoder()
+        generate(ue, tokenizer, prompt=args.prompt,
+                 max_new_tokens=args.max_new_tokens, decoder_preloaded=True)
+        return
 
     # VLM-on-hardware: the vision encoder runs FIRST — BEFORE the LM is prepared.
     # Ordering is critical: `prepare_inference` must be called EXACTLY ONCE per
@@ -4819,7 +5018,9 @@ def main():
     want_vision = bool(use_fpga_vision)
     # Build when there is no bin yet, or when an on-FPGA VLM run finds a cached
     # bin that has no encoder section (e.g. an earlier LM-only build).
-    need_build = (_meta is None) or (want_vision and _meta.get("encoder_size", 0) == 0)
+    ue.max_context = MAX_CONTEXT
+    need_build = ((_meta is None) or (_meta.get("cache_key") != ue._decoder_cache_key())
+                  or (want_vision and _meta.get("encoder_size", 0) == 0))
 
     precomputed_vision_tokens = None
     vis_encoder_bytes = None

@@ -12,8 +12,10 @@ from datetime import datetime, timezone
 import gc
 import importlib.util
 import json
+import math
 from pathlib import Path
 import socket
+import tempfile
 import time
 
 import user_dma_core as core
@@ -27,6 +29,7 @@ PROMPT = "Solve 2x + 3 = 7. Reply with only the value of x."
 def load_model(name):
     paths = {"llama": "models/llama3.2_1b/llama3.2_1b_test.py",
              "qwen": "models/qwen3_0.6b/qwen3_0.6b_test.py",
+             "qwen_2b": "models/qwen3.5_2b/qwen3.5_2b_test.py",
              "qwen_vl": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py",
              "gemma": "models/gemma3/gemma3_test.py",
              "e2b": "models/gemma4_e2b/gemma4_e2b_test.py",
@@ -142,6 +145,57 @@ def run_qwen_vl(module, engines, prompt, max_tokens):
                 model_base=ue.PARAMS_BASE, private_windows=ue._board_windows)
 
 
+def run_qwen_2b(module, engines, prompt, max_tokens):
+    import torch
+    from transformers import AutoTokenizer
+
+    script_dir = module.CONFIG_PATH.parent
+    config = json.loads(module.CONFIG_PATH.read_text())
+    model_dir = module._ensure_hf_model(str(script_dir), config)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+    weights_path = script_dir / config["paths"]["weights_bin"]
+    if weights_path.exists():
+        weights = torch.load(weights_path, weights_only=False, map_location="cpu")
+    else:
+        hf, text_model = module._load_hf_model(model_dir)
+        weights = module._extract_all_weights(
+            text_model, set(config["model"]["linear_attn_layer_indices"]))
+        weights_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(weights, weights_path)
+        del hf, text_model
+
+    ue = module.Qwen3_5_2b_UnifiedEngine(
+        device="cpu", init_unified_engine=False, multi_core=engines)
+    ue.fpga_penalty = False
+    ue._preallocate_identity_matrix()
+    ue.prepare_inference(weights, max_context=config["model"]["max_context_size"])
+    # A benchmark must compile both engine counts for this board and context.
+    # Keep transient output separate from the model CLI's packaged programs.
+    with tempfile.TemporaryDirectory(prefix="qwen35-benchmark-") as directory:
+        ue._decoder_bin_path = str(Path(directory) / "decoder.bin")
+        ue._decoder_meta_path = str(Path(directory) / "decoder.json")
+        path, _, _ = ue.compile_decoder()
+        ue.load_instructions(path)
+    ids, _ = module._tokenize_with_chat_template(tokenizer, prompt)
+    if len(ids) + max_tokens > ue.max_context:
+        raise ValueError("Qwen3.5 prompt plus generated tokens exceeds the configured context")
+    first_token = module.prefill_via_decode(ue, ids)
+    result = ue.run_decoder(tokenizer, first_token, max_new_tokens=max_tokens)
+    timings = ue._decode_step_us
+    if not timings:
+        raise RuntimeError("Qwen3.5 2B produced no decode timings")
+    if len(timings) != len(result["token_ids"]) - 1:
+        raise RuntimeError("Qwen3.5 2B tokens and decode timings do not match")
+    if any(not math.isfinite(value) or value <= 0 for value in timings):
+        raise RuntimeError("Qwen3.5 2B reported an invalid hardware timing")
+    return dict(**token_output(ue, result["token_ids"]),
+                decoded_text=result["generated_text"],
+                decode_first_hw_ms=timings[0] / 1000,
+                decode_avg_hw_ms=sum(timings) / len(timings) / 1000,
+                timed_decode_steps=len(timings), model_base=ue._params_dram_base,
+                private_windows=ue._decode_windows)
+
+
 def run_gemma(module, engines, prompt, max_tokens):
     ue = module.Gemma3_UnifiedEngine(multi_core=engines)
     ue.set_prefill_seq(prompt)
@@ -209,7 +263,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dev", default="xdma1")
     parser.add_argument("--engines", type=int, default=2)
-    parser.add_argument("--models", nargs="+", choices=("qwen", "qwen_vl", "llama", "gemma", "e2b", "e4b"),
+    parser.add_argument("--models", nargs="+", choices=("qwen", "qwen_2b", "qwen_vl", "llama", "gemma", "e2b", "e4b"),
                         default=["qwen", "llama", "gemma"])
     parser.add_argument("--prompt", default=PROMPT)
     parser.add_argument("--max-new-tokens", type=int, default=128,
@@ -223,7 +277,7 @@ def main():
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
     info = decode_hardware_info(core.HW_INFO_RAW)
-    version = core.UnifiedEngine().read_reg32(core.UE_FPGA_VERSION_ADDR)
+    version = core.UnifiedEngine(init_unified_engine=False).read_reg32(core.UE_FPGA_VERSION_ADDR)
     payload = dict(hostname=socket.gethostname(), device=args.dev, image=f"0x{version:08x}",
                    hardware_info=asdict(info), timestamp_utc=datetime.now(timezone.utc).isoformat(),
                    prompt=args.prompt, max_new_tokens=args.max_new_tokens, models={})

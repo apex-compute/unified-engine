@@ -58,7 +58,7 @@ import gemma4_e2b_model_flops as _model_flops
 
 # Non-tiled multicore runs reserve a contiguous 2 GiB model map and ask the
 # board allocator for controller-aware private windows. Eight-engine Alveo
-# runs use the existing larger tiled map below, with shared storage carved
+# and two-engine Kintex runs use a tiled map, with shared storage carved
 # from its private-window tails.
 # Single-core keeps the historical Gemma4 layout (model in the upper 2 GB, no
 # private windows at all).
@@ -131,6 +131,11 @@ TILED_TENSOR_EXTENT_BYTES = 480 * 2**20
 # allocation still needs, and the failure lands on an unrelated engine much
 # later. 1544 MiB of weights over 8 engines is 193 MiB; 256 is ~1.3x that.
 TILED_PRIVATE_RESERVE_BYTES = 256 * 2**20
+# Kintex's two controllers each own 2 GiB. Reuse the compact shared-pool
+# loader so MLP weights are only stored in their private shard layouts.
+KINTEX_TILE_BYTES = 2 << 30
+KINTEX_PRIVATE_RESERVE_BYTES = 1 << 30
+KINTEX_PRIVATE_TENSOR_BYTES = 64 << 20
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -826,6 +831,78 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     bin, compiles prefill/decoder into one bin, runs prefill + decode. Numeric
     checks live in gemma4_e2b_numeric.py."""
 
+    def _plan_kintex_capacity(self):
+        """Check the full private and shared allocation before loading weights.
+
+        Count K/V on every layer as a conservative upper bound; the real loader
+        can omit borrowed K/V layers after reading the host manifest. Include
+        both layouts of MLP down (decode N-shards and prefill K-shards).
+        """
+        import copy
+        arena = copy.deepcopy(self.mc_arena)
+        private_bytes = 0
+        for layer in range(self.LAYER_SIZE):
+            _, q, kv = self._get_layer_attention_dims(layer)
+            mlp = self._get_mlp_elements(layer)
+            shapes = [(self.vector_length, q), (q, self.vector_length),
+                      (self.vector_length, kv), (self.vector_length, kv),
+                      (self.vector_length, mlp), (self.vector_length, mlp),
+                      (mlp, self.vector_length)]
+            for K, N in shapes:
+                columns = N // self.multi_core
+                # All supported E2B two-engine widths are full 64-column blocks.
+                if N % self.multi_core or columns % UE_VECTOR_SIZE:
+                    raise ValueError("Kintex E2B projections require whole 64-column shards")
+                private_bytes += ((columns * K // 2 + 63) & ~63)
+                private_bytes += ((columns * K // UE_VECTOR_SIZE * 2 + 63) & ~63)
+            # A second packed copy, K-sharded for prefill's partial reductions.
+            lane = mlp // self.multi_core
+            private_bytes += ((self.vector_length * lane // 2 + 63) & ~63)
+            private_bytes += ((self.vector_length * lane // UE_VECTOR_SIZE * 2 + 63) & ~63)
+        columns = self.EMBEDDING_ELEMENTS // self.multi_core
+        private_bytes += columns * self.vector_length // 2
+        private_bytes += columns * self.vector_length // UE_VECTOR_SIZE * 2
+        if private_bytes > self._tile_private_reserve_bytes:
+            raise MemoryError(
+                f"Kintex E2B private projections need {private_bytes / 2**20:.2f} MiB/core; "
+                f"reserved {self._tile_private_reserve_bytes / 2**20:.0f} MiB")
+        for engine in range(self.multi_core):
+            arena.alloc_weights(engine, private_bytes, "LM private projections (upper bound)")
+
+        # Mirror the actual shared loader's allocation granularity. Contiguity
+        # matters: each compact layer and non-layer region must fit one tail.
+        layer_bytes = sum((self.weight_defs[item["key"] + "_SIZE"] + 127) & ~127
+                          for item in self._cfg["layers"]["structure"]
+                          if item["key"] not in self.MLP_SHARED_REGION_KEYS)
+        for layer in range(self.LAYER_SIZE):
+            arena.alloc_shared(layer_bytes, f"lm.layer{layer}")
+        non_layer = [item["key"] for item in self._cfg["layers"]["non_layer"]
+                     if item["key"] not in ("ROPE_LOCAL", "ROPE_GLOBAL")]
+        for key in [*non_layer, "ROPE_LOCAL", "ROPE_GLOBAL"]:
+            arena.alloc_shared(self.weight_defs[key + "_SIZE"], key)
+        arena.alloc_shared(UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element,
+                           "vision identity")
+
+        rows = max(self.max_prefill_seq_len, 1)
+        mlp_lane = max(self.mlp_elements, self.mlp_elements_wide) // self.multi_core
+        lane_bytes = rows * mlp_lane * self.bytes_per_element
+        partial_bytes = rows * self.vector_length * self.bytes_per_element
+        aligned_rows = ((rows + 63) // 64) * 64
+        attention_bytes = (2 * self.head_dim * aligned_rows + aligned_rows**2) * self.bytes_per_element
+        for engine in range(self.multi_core):
+            for name, size in (("gate", lane_bytes), ("up", lane_bytes),
+                               ("product", lane_bytes), ("down partial", partial_bytes)):
+                arena.alloc_tensor(engine, size, f"prefill {name}")
+            if engine:
+                arena.alloc_tensor(engine, attention_bytes, "prefill attention")
+                # Vision's canonical 2520-patch attention scratch is <16 MiB.
+                arena.alloc_tensor(engine, 16 << 20, "vision attention upper bound")
+        return {"private_weights_upper_bound": private_bytes,
+                "shared_weight_bytes": sum(item["size"] for item in arena._shared_allocs
+                                            if item["what"] != "TENSOR.window"),
+                "shared_free_bytes": arena.shared_free(),
+                "tensor_bytes_per_engine": self._tile_tensor_bytes}
+
     # -- params allocation against the shared pool ---------------------------
     #
     # Under the model map the base class walks ONE cursor through a contiguous
@@ -960,20 +1037,38 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._multi_core_schedulers = {}
         self._prefill_shard_m_regs = None
         engine_base = user_dma_core.UE_0_BASE_ADDR
-        # Preserve the shared-pool map at eight or more engines; smaller runs
-        # reserve the complete model map alongside controller-aware windows.
+        # Preserve Alveo's shared-pool map. Kintex needs the same compact
+        # loader across its two 2 GiB DDR channels to fit the shared model
+        # and all private projections in 4 GiB.
         self._use_multicore_dram_layout = multi_core > 1
-        if self._use_multicore_dram_layout:
+        if self._use_multicore_dram_layout and (
+                user_dma_core.ANDROMEDA_CORE_COUNT is None
+                or user_dma_core.AVAILABLE_DRAM_SIZE_GB is None):
+            user_dma_core.configure_clock_from_hardware()
+        self._kintex_tiled_map = (multi_core == 2
+                                  and user_dma_core.ANDROMEDA_CORE_COUNT == 2
+                                  and user_dma_core.AVAILABLE_DRAM_SIZE_GB == 4)
+        if self._use_multicore_dram_layout and not self._kintex_tiled_map:
             require_multicore_dram(multi_core, "Gemma4 E2B")
-        # THE TILED MAP IS OPT-IN BY ENGINE COUNT AND BOARD. At 8 engines on a
-        # board the library has characterised, the windows become 1 GiB and
+        self._tile_window_bytes = (KINTEX_TILE_BYTES if self._kintex_tiled_map
+                                   else TILED_WINDOW_BYTES)
+        self._tile_tensor_bytes = (KINTEX_PRIVATE_TENSOR_BYTES if self._kintex_tiled_map
+                                   else TILED_TENSOR_BYTES)
+        self._tile_private_reserve_bytes = (KINTEX_PRIVATE_RESERVE_BYTES
+            if self._kintex_tiled_map else TILED_PRIVATE_RESERVE_BYTES)
+        # THE TILED MAP IS SELECTED BY ENGINE COUNT AND BOARD. Kintex uses
+        # its two 2 GiB controller windows. At 8 engines on a characterised
+        # Alveo board, the windows become 1 GiB and
         # cover the device; anything else keeps the 512 MiB map unchanged. A
         # board with no tiling map is NOT silently downgraded -- it says so,
         # because the difference is 2 GiB of arena and the decode shard budget.
         self._tiled_map = False
         self._tile_bases = None
         self._params_staged = 0        # bytes placed into the pool (tiled map only)
-        if multi_core >= TILED_MAP_MIN_ENGINES:
+        if self._kintex_tiled_map:
+            self._tile_bases = [0, KINTEX_TILE_BYTES]
+            self._tiled_map = True
+        elif multi_core >= TILED_MAP_MIN_ENGINES:
             try:
                 self._tile_bases = tiled_window_bases(
                     multi_core, TILED_WINDOW_BYTES, "Gemma4 E2B")
@@ -1063,8 +1158,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             # checking the result against it.
             self.mc_arena = PrivateArena(
                 multi_core,
-                windows=[(base, TILED_WINDOW_BYTES) for base in self._tile_bases],
-                isa_bytes=TILED_ISA_BYTES, tensor_bytes=TILED_TENSOR_BYTES,
+                windows=[(base, self._tile_window_bytes) for base in self._tile_bases],
+                isa_bytes=TILED_ISA_BYTES, tensor_bytes=self._tile_tensor_bytes,
                 verbose=True)
             _actual = [self.mc_arena.window_base(i) for i in range(multi_core)]
             if _actual != self._tile_bases:
@@ -1074,9 +1169,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                     f"{[hex(b) for b in self._tile_bases]}")
             # The top of the highest window: the windows no longer start at 0
             # and run up, so this is a bound, not an arena size.
-            self.DRAM_END = max(self._tile_bases) + TILED_WINDOW_BYTES
+            self.DRAM_END = max(self._tile_bases) + self._tile_window_bytes
             # Private space is claimed before a single shared byte is lent.
-            self.mc_arena.reserve_private(TILED_PRIVATE_RESERVE_BYTES)
+            self.mc_arena.reserve_private(self._tile_private_reserve_bytes)
             # Core 0 holds both master images at disjoint addresses, exactly as
             # the model map did; workers use their own windows' slices.
             self.VISION_ISA_BASE = self.mc_arena.isa_base(0)
@@ -1203,6 +1298,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self.prefill_seq = None
 
         self._weights_bin_rel = paths["weights_bin"]
+        self._kintex_capacity_plan = (self._plan_kintex_capacity()
+                                      if self._kintex_tiled_map else None)
         self.weight_init()
         self.tensor_init()
 
@@ -1354,6 +1451,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             return None, None
         if s.get("dram_layout", "legacy") != self.dram_layout:
             return None, None
+        # Version 2 aligns every dispatch entry to the jump instruction's
+        # 64-byte boundary. Older images skip their first prefill DMA load.
+        if s.get("program_format_version") != 2:
+            return None, None
         return s, data[s["file_offset"]: s["file_offset"] + s["size"]]
 
     def _store_program_section(self, name: str, dram_base: int, section_bytes: bytes,
@@ -1387,7 +1488,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                  for k, s in sections.items()}
         blobs[name] = bytes(section_bytes)
         metas[name] = {"dram_base": f"0x{dram_base:X}", **extra_meta,
-                       "dram_layout": self.dram_layout}
+                       "dram_layout": self.dram_layout,
+                       "program_format_version": 2}
         order = sorted(blobs, key=lambda k: int(metas[k]["dram_base"], 16))
         out = bytearray()
         new_sections = {}
@@ -1472,12 +1574,14 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self.clear_inst_id()
             self.clear_capture_buffer()
             self.start_capture()
-            # Leading flag-clear (instruction 0); both program entries land past
-            # it, matching the standalone prefill/decoder layouts they replace.
+            # The shared absolute-jump emitter rounds a 32-byte-only target
+            # forward by one instruction. Pad entries before recording them so
+            # dispatch cannot silently skip the first DMA or register setup.
             self.generate_instruction_flag_clear()
             instruction_base_addr = self.get_program_dram_addr()
+            self._align_dispatch_entry()
 
-            prefill_count_at_start = self.capture_count          # 1 (after flag-clear)
+            prefill_count_at_start = self.capture_count
             if prefill_scheduler is not None:
                 prefill_scheduler.begin_program()
                 self._prefill_shard_m_regs = [self.alloc_isa_reg()]
@@ -1505,6 +1609,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 self.release_isa_reg()
                 self._prefill_shard_m_regs = None
 
+            self._align_dispatch_entry()
             decoder_count_at_start = self.capture_count
             decoder_accounting_seq_len = (
                 (len(self.prefill_seq) + 63) // 64) * 64
@@ -1792,7 +1897,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             # shared weights live in their tails.
             lines.append(
                 f"- **DRAM layout:** {self.dram_layout} ({cores} x "
-                f"{TILED_WINDOW_BYTES // 2**20} MB private windows tiling "
+                f"{self._tile_window_bytes // 2**20} MB private windows tiling "
                 f"[0x0, 0x{self.DRAM_END:X}); shared weights and the "
                 f"{TILED_TENSOR_EXTENT_BYTES // 2**20} MB tensor arena carved "
                 f"from their tails)")
@@ -2156,6 +2261,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         region boundaries, so a master HALT lands while the worker is parked at the
         next region's entry flag — the master's per-segment counter then measures
         each region's fork-to-join wall-time and the master-only phases directly."""
+        if target_addr % (2 * INSTRUCTION_SIZE_BYTES):
+            raise ValueError(f"Gemma E2B profile entry 0x{target_addr:X} must be 64-byte aligned; recompile the program image")
         self.clear_inst_id()
         self.start_capture()
         for reg, val in gpr_sets:

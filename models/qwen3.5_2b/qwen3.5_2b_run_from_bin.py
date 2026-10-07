@@ -89,9 +89,10 @@ def main():
     T.set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C
     DMA_DEVICE_H2C = T.user_dma_core.DMA_DEVICE_H2C
-    clock = args.cycle if args.cycle is not None else (4.0 if args.device == "efinix" else 5.62)
-    T.user_dma_core.CLOCK_CYCLE_TIME_NS = clock
-    T.user_dma_core.UE_PEAK_GFLOPS = 0.128 / clock
+    T.user_dma_core.configure_clock_from_hardware()
+    if args.cycle is not None:
+        T.user_dma_core.CLOCK_CYCLE_TIME_NS = args.cycle
+        T.user_dma_core.UE_PEAK_GFLOPS = 0.128 / args.cycle
 
     vision_on = bool(args.image) or args.vision_enable
     _TEST_SAMPLES = os.path.normpath(os.path.join(_HERE, "..", "..", "test_samples"))
@@ -119,6 +120,8 @@ def main():
         raise SystemExit(f"Unified bin metadata not found: {uni_meta}")
     with open(uni_meta) as f:
         meta = json.load(f)
+    if meta.get("controller_layout", {}).get("engines", 1) != 1:
+        raise ValueError("runtime-only runner cannot restore multicore workers; use test.py --multi-core")
     with open(uni_bin, "rb") as f:
         raw = f.read()
     print("=" * 78)
@@ -149,7 +152,11 @@ def main():
     print("  FPGA init ...", end=" ", flush=True)
     with T._quiet():
         ue = T.Qwen3_5_2b_UnifiedEngine(device="cpu")
-        ue.software_reset()
+        ue.max_context = int(meta.get("max_context", MAX_CONTEXT))
+        if meta.get("cache_key") != ue._decoder_cache_key():
+            raise ValueError("program cache is stale; rebuild with qwen3.5_2b_test.py")
+        from multi_engine_decode import reset_engine_queues
+        reset_engine_queues(1)
     print("ok.")
 
     # ---- VLM: run the vision-encoder section FIRST (before the LM prepare) ----
@@ -177,11 +184,8 @@ def main():
     # ---- SINGLE prepare_inference (LM), then load the decoder section ----
     with T._quiet():
         ue._preallocate_identity_matrix()
-        ue.prepare_inference(weights, max_context=MAX_CONTEXT)
-        dec_addr = _load_program_section(ue, raw, meta["decoder_off"], meta["decoder_size"])
-        ue._decoder_prog_addr = dec_addr
-        ue._decoder_X_dram = meta["decoder_x_dram"]
-        ue._decoder_final_norm_dram = meta["decoder_final_norm_dram"]
+        ue.prepare_inference(weights, max_context=ue.max_context)
+        T.load_decoder_from_bin(ue, raw, meta)
 
     # ---- prefill + decode (no compilation; decoder is pre-loaded) ----
     _run_inference(ue, tokenizer, args.prompt, args.max_new_tokens,

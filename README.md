@@ -146,14 +146,16 @@ Measured on p2 with 512 KiB per engine, 32 iterations, and three samples:
 
 | Board / engines | Placement | Read GB/s | Write GB/s |
 | --- | --- | ---: | ---: |
-| Kintex-7 / 2 | Private, 512 MiB apart | 6.85 | 7.43 |
-| Kintex-7 / 2 | Private, 2 GiB apart | 12.61 | 11.99 |
+| Kintex-7 / 2 | Adjacent split | 6.87 | 6.97 |
+| Kintex-7 / 2 | Private, 512 MiB apart | 6.87 | 7.43 |
+| Kintex-7 / 2 | Private, 2 GiB apart | 12.60 | 11.99 |
 | U50 / 8 | Adjacent split | 10.66 | 10.67 |
 | U50 / 8 | Private controller windows | 81.02 | 80.57 |
 
 All samples passed exact read/write checks. These are aggregate device-memory
 rates, not PCIe transfer rates or model throughput. U55C placement has offline
-coverage; a U55C board was not available for measurement.
+coverage; a U55C board was not available for measurement. The latest Kintex-7
+results use image `0x8763d976` and are in `kintex7_memory_controller_results.json`.
 
 For Qwen3 0.6B, Llama3.2 1B, and Gemma3 1B, compare single-engine and
 controller-sharded decode with identical-token validation:
@@ -170,13 +172,29 @@ weights. On Kintex-7, private decode shards therefore start at 0 and 3 GiB,
 still on different controllers; the standalone memory test uses exactly 2 GiB
 spacing. Model parameters must be available through each model's normal setup.
 
+The two-engine Kintex-7 path also supports Qwen3.5 2B and Gemma4 E2B within
+4 GiB. Qwen reserves 1 GiB for original parameters, 512 MiB for tensors, and
+512 MiB for instructions; its private weight copies use about 476 MiB per
+engine at 0 and 3 GiB. Recurrent state updates stay on the primary engine.
+Gemma E2B instead uses two complete 2 GiB controller tiles, with private
+weights loaded directly into each tile and shared tensors in the remaining
+space. This avoids keeping a duplicate full MLP weight image.
+
+```bash
+python3 model_controller_benchmark.py --dev xdma1 --engines 2 \
+  --models qwen_2b e2b --prompt 'x+3=5, what is x?' \
+  --max-new-tokens 32 --json kintex7-2b-models.json
+```
+
 Measured average FPGA decode latency for matching token sequences:
 
 | Model | Kintex-7: 1 → 2 engines | U50: 1 → 8 engines |
 | --- | ---: | ---: |
 | Qwen3 0.6B | 93.39 → 67.22 ms (1.39×) | 58.47 → 30.54 ms (1.91×) |
+| Qwen3.5 2B, text | 1271.14 → 1190.33 ms (1.068×) | 776.70 → 689.38 ms (1.127×) |
 | Llama3.2 1B | 118.18 → 64.97 ms (1.82×) | 74.45 → 16.38 ms (4.54×) |
 | Gemma3 1B | 95.77 → 52.16 ms (1.84×) | 60.28 → 13.11 ms (4.60×) |
+| Gemma4 E2B, text | 224.09 → 125.80 ms (1.78×) | 141.18 → 33.79 ms (4.18×) |
 | Qwen2.5 VL-3B, text | Not measured | 211.00 → 33.62 ms (6.28×) |
 | Gemma4 E4B, text | Does not fit this layout | 380.95 → 249.47 ms (1.53×) |
 
@@ -187,18 +205,27 @@ are decode timings, excluding model preparation, prefill, and host processing.
 Use `--models qwen_vl` to repeat the VL text comparison. The `*_controller_results.json`
 files at the repository root preserve token IDs, placement, and board identity.
 
+Qwen3.5 2B uses `x+3=5, what is x?` and matches 32 token IDs on each board.
+The first token comes from prefill; its timings cover the remaining 31 decode
+steps. Its recurrent attention stays on the primary engine, limiting the
+whole-model gain despite concurrent weight reads. Repeat with
+`--models qwen_2b --max-new-tokens 32`.
+
 Gemma4 E4B uses the prompt `x+3=5, what is x?` and matches all 32 generated
 tokens under its cap. Its Q/K/V/O and gate/up projections use private HBM;
 down projection and LM head retain their original primary kernels. Repeat
 with `--models e4b --max-new-tokens 32`. U50 needs at least four active
 engines to fit these copies; eight were measured.
 
-Gemma4 E2B's controller/cache changes are implemented, but its comparison
-remains unvalidated: repeated eight-engine runs produced different tokens
-with identical compiled instruction bytes, including the previous compiler.
-See `gemma4_e2b_existing_eight_comparison.json` for that repeatability check.
-The runner's `--models e2b` case rejects padding-only output and fails on
-token mismatch instead of reporting a correctness pass.
+Gemma4 E2B matches 32 tokens on both boards with `x+3=5, what is x?`.
+Its prefill previously started at a 32-byte offset that the jump emitter
+rounded forward, skipping the first input DMA and producing unstable output.
+Prefill and decoder entry points now align to 64 bytes, and cache format 2
+rejects the old programs. The verified captures are
+`kintex7_gemma4_e2b_controller_results.json` and
+`alveo_u50_gemma4_e2b_controller_results.json`; earlier failed captures remain
+in `gemma4_e2b_controller_results.json` and
+`gemma4_e2b_existing_eight_comparison.json` as diagnostic history.
 
 Existing eight-engine model paths also use controller placement for SmolVLM2
 decode gate/up weights, pi0.5 vision copies, ACT matrix/convolution weights,
@@ -215,16 +242,10 @@ Run the offline tests without opening an FPGA device:
 python3 -m unittest discover -s tests
 ```
 
-Gemma4 E2B preserves its existing eight-engine tiled map; smaller configurations
-now use controller-aware windows, and cached programs record the exact map.
-Its capped U50 runs produced meaningful text at 141.19 → 33.79 ms/token, but
-single/eight-engine tokens differ and repeated eight-engine runs also differ.
-The old and new eight-engine compilers emitted byte-identical instructions;
-only their cache-layout metadata changed. This remains a repeatability failure,
-so the 4.18× timing ratio is **not a validated model speedup**. See
-`gemma4_e2b_controller_results.json` and
-`gemma4_e2b_existing_eight_comparison.json` for the failed checks. The shared
-benchmark rejects matching padding-only or empty decoded output.
+Gemma4 E2B preserves its existing eight-engine tiled map. Kintex-7 uses two
+2 GiB tiles; other smaller configurations use controller-aware windows.
+Cached programs record the exact map. The shared benchmark rejects matching
+padding-only or empty decoded output.
 
 Use `--models e2b` or `--models e4b` with `--max-new-tokens` for bounded Gemma4
 comparisons. E4B retains the original shared 0–4 GiB model image and places
