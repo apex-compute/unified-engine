@@ -14,11 +14,24 @@ Thinker, vision, and audio stages in the current hardware layout.
 
 ## Hardware target
 
-This model targets the 8 GiB Alveo U55C configuration and uses exactly eight
-Unified Engine cores. Hardware topology, DRAM capacity, AXI width, and clock are
-read from HW_INFO; startup fails rather than compiling an incompatible program
-when the board does not report 8 GiB of DRAM and at least eight available
-engines. On a 12-engine image, engines 0-7 are used and engines 8-11 remain idle.
+This model uses exactly eight Unified Engine cores. Its memory policy supports
+the 8 GiB Alveo U50 and the 8 or 16 GiB U55C configurations. Hardware topology,
+DRAM capacity, AXI width, and clock are read from HW_INFO; unsupported or
+overlapping maps fail before allocation. On a 12-engine image, engines 0–7 are
+used and engines 8–11 remain idle.
+
+Omni retains eight private 1 GiB windows from `tiled_window_bases()`. These
+windows also contain the shared weight/tensor pool, private scratch, a 32 MiB
+unused guard, and 64 MiB of ISA storage per engine. The complete private shard
+set and scratch require this capacity, so the smaller models' 512 MiB windows
+plus a separate 2 GiB model region cannot be substituted. U50 uses the measured
+whole-device switch-region layout; U55C uses its per-engine controller mapping.
+Forced DRAM-size overrides are rejected for this layout.
+
+Program artifacts include hardware identity, compiler hashes, and every
+engine's ISA address in their fingerprint. Offline regression tests verify that
+changing controller order invalidates a saved program. This controller audit
+does not constitute a new Omni hardware inference measurement.
 
 Always pass `--multi-core 8`.
 

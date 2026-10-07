@@ -95,6 +95,8 @@ def _instruction_compiler_fingerprint(script_dir: str, execution_sig: str) -> st
     sources = (
         ("model_codegen", os.path.join(script_dir, "qwen3_0.6b_test.py")),
         ("engine_codegen", os.path.join(repo_root, "user_dma_core.py")),
+        ("multi_engine_codegen", os.path.join(repo_root, "multi_engine_shard.py")),
+        ("decode_sharding", os.path.join(repo_root, "multi_engine_decode.py")),
         ("model_config", os.path.join(script_dir, "qwen3_0.6b_config.json")),
     )
     digest = hashlib.sha256()
@@ -134,7 +136,7 @@ def _expected_weight_bin_size(cfg: dict) -> int:
     )
     return max(ends)
 
-def _device_bf16_embedding_layout(cfg: dict) -> tuple[int, int]:
+def _device_bf16_embedding_layout(cfg: dict, model_base: int = 0x80000000) -> tuple[int, int]:
     """Return the fixed top-down device-DRAM slot for the exact BF16 table."""
     embedding = cfg["special"]["embedding"]
     size = (int(embedding["vocab_size"]) * int(embedding["embedding_dim"])
@@ -145,18 +147,20 @@ def _device_bf16_embedding_layout(cfg: dict) -> tuple[int, int]:
             f"Embedding layout mismatch: config region is {configured_size} bytes, "
             f"but vocab/dimension require {size}."
         )
-    base = _DEVICE_DRAM_LIMIT - size
-    if base < _PROGRAM_DRAM_BASE or base % 64:
+    dram_limit = model_base + 2 * 2**30
+    base = dram_limit - size
+    if base < model_base + 0x60000000 or base % 64:
         raise ValueError(
-            f"BF16 embedding slot 0x{base:X}..0x{_DEVICE_DRAM_LIMIT:X} is invalid."
+            f"BF16 embedding slot 0x{base:X}..0x{dram_limit:X} is invalid."
         )
     return base, size
 
 def _validate_program_embedding_separation(
-        program_size: int, embedding_base: int, dispatch_size: int) -> None:
+        program_size: int, embedding_base: int, dispatch_size: int,
+        program_base: int = _PROGRAM_DRAM_BASE) -> None:
     """Keep programs, runtime preamble, and token dispatch below the embedding."""
     aligned_program_size = (int(program_size) + 63) & ~63
-    program_end = (_PROGRAM_DRAM_BASE + aligned_program_size
+    program_end = (program_base + aligned_program_size
                    + _RUNTIME_PREAMBLE_BYTES + int(dispatch_size))
     if program_end > embedding_base:
         raise ValueError(
@@ -490,16 +494,29 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None,
-                 weights_bin: str | None = None, use_bf16_last_layer: bool = False):
+                 weights_bin: str | None = None, use_bf16_last_layer: bool = False,
+                 multi_core: int = 1):
         # Qwen3-0.6B DRAM layout in the 2 GiB accelerator window:
         #   params:       0x80000000 – 0xA0000000 (512 MB)
         #   tensors:      0xA0000000 – 0xE0000000 (KV cache + activations)
         #   programs:     0xE0000000 – 0xED740000 (bin, preamble, dispatch)
         #   embedding:    0xED740000 – 0x100000000 (exact BF16 rows)
+        self.multi_core = int(multi_core)
+        if self.multi_core < 1:
+            raise ValueError("multi_core must be at least 1")
+        self._model_base = 0x80000000
+        self._board_windows = None
+        self.shard_group = None
+        self.controller_decoder = None
+        self.sharded_weights = {}
+        if self.multi_core > 1:
+            from multi_engine_shard import model_multicore_layout
+            self._board_windows, self._model_base = model_multicore_layout(self.multi_core)
+        self._program_base = self._model_base + 0x60000000
         super().__init__(
-            params_dram_base=0x80000000,
-            tensor_dram_base=0xA0000000,
-            program_dram_base=0xE0000000,
+            params_dram_base=self._model_base,
+            tensor_dram_base=self._model_base + 0x20000000,
+            program_dram_base=self._program_base,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self.use_bf16_last_layer = bool(use_bf16_last_layer)
@@ -526,7 +543,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         self.LAYER_SIZE = fi["num_layers"]
         self.EMBEDDING_ELEMENTS = fi["embedding_vocab"]
         (self.DRAM_ADDR_TOKEN_EMBEDDING,
-         self.DEVICE_EMBEDDING_TABLE_SIZE) = _device_bf16_embedding_layout(self._cfg)
+         self.DEVICE_EMBEDDING_TABLE_SIZE) = _device_bf16_embedding_layout(self._cfg, self._model_base)
         self.EMBEDDING_ROW_BYTES = self.vector_length * self.bytes_per_element
         self.EMBEDDING_DISPATCH_STRIDE_BYTES = _EMBEDDING_DISPATCH_STRIDE_BYTES
         self.EMBEDDING_DISPATCH_TABLE_SIZE = (
@@ -564,6 +581,56 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             )
         self.weight_init()
         self.tensor_init()
+        if self.get_params_dram_addr() > self._model_base + 0x20000000:
+            raise MemoryError("Qwen params overlap its tensor region")
+        if self.get_tensor_dram_addr() > self._program_base:
+            raise MemoryError("Qwen tensors overlap its program region")
+        self.setup_multi_core()
+
+    def setup_multi_core(self) -> None:
+        """Copy output-column shards to independent DDR/HBM controllers for decode."""
+        if self.multi_core == 1 or self.shard_group is not None:
+            return
+        from multi_engine_decode import ControllerShardedDecoder
+        self.controller_decoder = ControllerShardedDecoder(
+            self, self.multi_core, self._board_windows)
+        self.shard_group = self.controller_decoder.scheduler
+        layers = self.LAYER_SIZE - int(self.use_bf16_last_layer)
+        for proj, k, n in (
+                ("q", self.vector_length, self.head_dim * self.group_size),
+                ("k", self.vector_length, self.head_dim),
+                ("v", self.vector_length, self.head_dim),
+                ("o", self.head_dim * self.group_size, self.vector_length),
+                ("gate", self.vector_length, self.mlp_elements),
+                ("up", self.vector_length, self.mlp_elements),
+                ("down", self.mlp_elements, self.vector_length)):
+            source = self._matmul_b_kwargs(0, proj)
+            self.sharded_weights[proj] = self.controller_decoder.add_weight(
+                name=proj, main_weight_addr=source["B_DRAM_ADDR"],
+                main_scale_addr=source["SCALE_DRAM_ADDR"], K=k, N=n,
+                layers=layers, main_layer_stride=self.weight_defs["LAYER_WEIGHT_SIZE"],
+                data_type=TYPE.IF4)
+        self.sharded_weights["lm_head"] = self.controller_decoder.add_weight(
+            name="lm_head", main_weight_addr=self.DRAM_ADDR_LM_HEAD_QUANT,
+            main_scale_addr=self.DRAM_ADDR_LM_HEAD_SCALE,
+            K=self.vector_length, N=self.EMBEDDING_ELEMENTS, layers=1,
+            main_layer_stride=0, data_type=TYPE.IF4)
+        self.shard_group.verify_private_space()
+
+    def _multicore_signature(self) -> str:
+        layout = {"cores": self.multi_core, "model_base": self._model_base,
+                  "windows": self._board_windows}
+        return hashlib.sha256(json.dumps(layout, sort_keys=True).encode()).hexdigest()
+
+    def instruction_paths(self) -> tuple[str, str]:
+        paths = self._cfg["paths"]
+        tag = (f"_mc{self.multi_core}_{self._multicore_signature()[:12]}"
+               if self.multi_core > 1 else "")
+        result = []
+        for key in ("instruction_bin", "instruction_meta"):
+            stem, ext = os.path.splitext(paths[key])
+            result.append(os.path.join(self.script_dir, stem + tag + ext))
+        return tuple(result)
 
     # XDMA drivers/bitstreams commonly cap one os.write() well below the large
     # contiguous model regions. Chunk every large H2C transfer so failures are
@@ -735,6 +802,14 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         """
         b = self._matmul_b_kwargs(layer_idx, proj)
         if b.get("is_B_quantized") and K <= SCALE_BRAM_ELEMENTS:
+            if self.controller_decoder is not None:
+                sharded_flops = self.controller_decoder.projection(
+                    M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR,
+                    B_DRAM_ADDR=b["B_DRAM_ADDR"], OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                    SCALE_DRAM_ADDR=b["SCALE_DRAM_ADDR"], data_type=b["data_type"],
+                    **extras)
+                if sharded_flops is not None:
+                    return sharded_flops
             self.quantized_matmat_core(
                 M=M, K=K, N=N,
                 A_DRAM_ADDR=A_DRAM_ADDR,
@@ -1650,7 +1725,9 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             # write_back_disable=True: greedy/argmax needs no 304 KB LOGITS_DRAM writeback
             # (no host logit readback at all). The bias buffer is zero pre-gate / in
             # --pure-greedy, so the same bin serves plain greedy and penalty.
-            self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+            lm_head = (self.controller_decoder.projection if self.controller_decoder is not None
+                       else self.quantized_matmat_core)
+            lm_head(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 data_type=TYPE.IF4, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE,
                 C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
@@ -1695,11 +1772,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         if layer_size is None:
             layer_size = self.LAYER_SIZE
 
-        paths_cfg = self._cfg.get("paths", {})
-        bin_rel  = paths_cfg.get("instruction_bin",  "qwen3_0.6b_bin/programs.bin")
-        meta_rel = paths_cfg.get("instruction_meta", "qwen3_0.6b_bin/programs.json")
-        bin_path  = os.path.join(self.script_dir, bin_rel)
-        meta_path = os.path.join(self.script_dir, meta_rel)
+        bin_path, meta_path = self.instruction_paths()
 
         # The decode LM head is uniform now: write_back_disable=True + the penalty C bias
         # (PENALTY_BIAS_DRAM). Penalty vs --pure-greedy differ only in the runtime bias
@@ -1708,6 +1781,8 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         # detected and recompiled.
         last_layer_sig = "bf16_l27" if self.use_bf16_last_layer else "if4_l27"
         lm_head_sig = f"fused_lm_shared_rope_qscale_bf16_embed_dispatch_v3:{last_layer_sig}"
+        if self.multi_core > 1:
+            lm_head_sig += f":mc:{self._multicore_signature()}"
         model_layout_sig = _model_layout_signature(self._cfg)
         compiler_fingerprint = _instruction_compiler_fingerprint(self.script_dir, lm_head_sig)
 
@@ -1716,7 +1791,9 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         # fixed addresses every invocation, so loading the bin off disk is otherwise
         # sufficient. A bin from an older build (missing/different key) is recompiled.
         bin_cached = os.path.exists(bin_path) and os.path.exists(meta_path)
-        if bin_cached:
+        # Worker images are emitted and uploaded together with the primary. A
+        # cached primary alone cannot reconstruct them, so multi-core recompiles.
+        if bin_cached and self.controller_decoder is None:
             try:
                 with open(meta_path, "r") as f:
                     meta = json.load(f)
@@ -1725,12 +1802,13 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             if (meta.get("lm_head_sig") == lm_head_sig
                     and meta.get("model_layout_sig") == model_layout_sig
                     and meta.get("compiler_fingerprint") == compiler_fingerprint
-                    and meta.get("instruction_base_addr") == f"0x{_PROGRAM_DRAM_BASE:X}"
+                    and meta.get("layer_size") == layer_size
+                    and meta.get("instruction_base_addr") == f"0x{self._program_base:X}"
                     and meta.get("instruction_total_size") == os.path.getsize(bin_path)
                     and meta.get("prefill_program_start_addr")
-                        == f"0x{_PROGRAM_DRAM_BASE:X}"
+                        == f"0x{self._program_base:X}"
                     and _parse_offset(meta.get("decoder_program_start_addr", -1))
-                        == _PROGRAM_DRAM_BASE + int(meta.get("prefill_program_size", -1))
+                        == self._program_base + int(meta.get("prefill_program_size", -1))
                     and (int(meta.get("prefill_program_size", -1))
                          + int(meta.get("decoder_program_size", -1)))
                         == os.path.getsize(bin_path)
@@ -1745,7 +1823,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                         == self.EMBEDDING_DISPATCH_TABLE_SIZE):
                 _validate_program_embedding_separation(
                     os.path.getsize(bin_path), self.DRAM_ADDR_TOKEN_EMBEDDING,
-                    self.EMBEDDING_DISPATCH_TABLE_SIZE)
+                    self.EMBEDDING_DISPATCH_TABLE_SIZE, self._program_base)
                 print(f"compile_instructions: cache hit, skipping compile ({bin_path}).")
                 return meta
             print("compile_instructions: cached program signature does not match "
@@ -1772,7 +1850,18 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
 
         _original_print(f"  Compiling decoder ({layer_size} layers)...")
         decoder_count_at_start = self.capture_count
-        decoder_flops = self._emit_decoder_program(layer_size=layer_size)
+        try:
+            if self.controller_decoder is not None:
+                self.controller_decoder.begin()
+            decoder_flops = self._emit_decoder_program(layer_size=layer_size)
+            if self.controller_decoder is not None:
+                self.controller_decoder.finalize()
+        except Exception:
+            if self.shard_group is not None:
+                self.shard_group.abort_program()
+            self.stop_capture()
+            _SILENT_MODE = False
+            raise
         decoder_program_size = (self.capture_count - decoder_count_at_start) * 32
 
         self.stop_capture()
@@ -1794,14 +1883,14 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         for inst in self.capture_buffer:
             all_bytes.extend(inst.get_bytes())
 
-        if instruction_base_addr != _PROGRAM_DRAM_BASE:
+        if instruction_base_addr != self._program_base:
             raise ValueError(
                 f"Instruction image starts at 0x{instruction_base_addr:X}; expected "
-                f"0x{_PROGRAM_DRAM_BASE:X} for the fixed embedding layout."
+                f"0x{self._program_base:X} for the selected embedding layout."
             )
         _validate_program_embedding_separation(
             len(all_bytes), self.DRAM_ADDR_TOKEN_EMBEDDING,
-            self.EMBEDDING_DISPATCH_TABLE_SIZE)
+            self.EMBEDDING_DISPATCH_TABLE_SIZE, self._program_base)
 
         prefill_program_start_addr = instruction_base_addr
         decoder_program_start_addr = instruction_base_addr + prefill_program_size
@@ -1817,6 +1906,10 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             "decoder_program_size":         decoder_program_size,
             "decoder_total_flops":          decoder_flops,
             "lm_head_sig":                  lm_head_sig,
+            "multi_core":                   self.multi_core,
+            "layer_size":                   layer_size,
+            "multicore_layout_sig":         self._multicore_signature(),
+            "model_base":                   self._model_base,
             "model_layout_sig":             model_layout_sig,
             "compiler_fingerprint":          compiler_fingerprint,
             "device_embedding_base":         f"0x{self.DRAM_ADDR_TOKEN_EMBEDDING:X}",
@@ -1944,12 +2037,17 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                 self._write_penalty_bias(self._generated_tokens)
 
             dispatch_entry_addr = self.get_embedding_dispatch_entry_addr(token_id)
+            if self.controller_decoder is not None:
+                self.controller_decoder.start()
             step_latency_us, _ = self.program_execute(
                 dispatch_entry_addr, timeout=10.0, flops=gflops_per_token)
+            if self.controller_decoder is not None:
+                self.controller_decoder.wait()
             decoder_hw_latency_us += float(step_latency_us)
             # Read the HW argmax register — the LM-head matmul already added the penalty bias
             # on chip, so this is the penalized (or pure-greedy) token. No host logit readback.
-            token_id = self.get_arg_max_index()
+            token_id = (self.controller_decoder.global_argmax("lm_head", self.LOGITS_DRAM)
+                        if self.controller_decoder is not None else self.get_arg_max_index())
             self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
@@ -1985,6 +2083,8 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use qwen3_0.6b_bin/full_model_weights.bin instead of generated params.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
+    parser.add_argument("--multi-core", type=int, default=1, metavar="N",
+                        help="Shard decode projections and LM head across N memory controllers.")
     parser.add_argument('--device', type=str, default='kintex7',
                         help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     # Decode is deterministic, on-FPGA only: token selection is always the HW argmax of
@@ -2059,17 +2159,15 @@ def main():
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
     user_dma_core.configure_clock_from_hardware()
 
-    # Clear stale queue/PBI state before model weights are loaded. The reset's
-    # DRAM self-test touches the params base, so it must happen before creating
-    # Qwen3_0_6b_UnifiedEngine (same boot sequence as Gemma/Llama runners).
-    boot_engine = user_dma_core.UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR)
-    boot_engine.software_reset()
-    del boot_engine
+    # Clear every participating queue before loading model or private weights.
+    from multi_engine_decode import reset_engine_queues
+    reset_engine_queues(args.multi_core)
 
     ue = Qwen3_0_6b_UnifiedEngine(
         script_dir=script_dir,
         weights_bin=weights_bin_rel,
         use_bf16_last_layer=args.bf16_last_layer,
+        multi_core=args.multi_core,
     )
     # Always tokenize via apply_chat_template — no hardcoded ids in the config.
     user_prompt = args.prompt if args.prompt is not None else cfg.get("default_prompt", "What is 3 + 5?")
@@ -2104,17 +2202,15 @@ def main():
     inst_meta = ue.compile_instructions()
     print(f"  compile_instructions done in {time.perf_counter() - timer:.2f}s")
 
-    paths_cfg = cfg.get("paths", {})
-    inst_bin_path = os.path.join(script_dir, paths_cfg.get("instruction_bin",
-                                  "qwen3_0.6b_bin/programs.bin"))
+    inst_bin_path, _ = ue.instruction_paths()
     base_addr, program_size = ue.load_program_instructions_from_file(inst_bin_path)
-    if base_addr != _PROGRAM_DRAM_BASE:
+    if base_addr != ue._program_base:
         raise RuntimeError(
-            f"Program loaded at 0x{base_addr:X}; expected 0x{_PROGRAM_DRAM_BASE:X}."
+            f"Program loaded at 0x{base_addr:X}; expected 0x{ue._program_base:X}."
         )
     _validate_program_embedding_separation(
         program_size, ue.DRAM_ADDR_TOKEN_EMBEDDING,
-        ue.EMBEDDING_DISPATCH_TABLE_SIZE)
+        ue.EMBEDDING_DISPATCH_TABLE_SIZE, ue._program_base)
     # Reserve a slot AFTER the loaded bin for the runtime preamble. Prefill preamble
     # is 4 instructions (3 ADD_SET + JUMP_ABS) = 128 B. The decode bucket preamble
     # is 2 instructions and is reached through a prebuilt 64-byte token dispatch.

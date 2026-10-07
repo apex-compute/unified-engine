@@ -28,6 +28,7 @@ Fixed layout: gemma3_test.py, gemma3_numeric.py, *.json, and gemma3_bin/ live in
 """
 
 import gc
+import hashlib
 import json
 import math
 import os
@@ -49,141 +50,35 @@ from user_dma_core import UnifiedEngine
 # Bank B follows 4096 BF16 rows; its byte base grows with the lane count.
 URAM_B_SCRATCH = 4096 * UE_VECTOR_SIZE * 2 + 0x10000
 from multi_engine_shard import (ALVEO_BOARD_CORES, ALVEO_U55C_BOARD_CORES,
-                                MULTICORE_WINDOW_BYTES, board_private_windows,
-                                multicore_arena_bytes, require_multicore_dram)
+                                KINTEX7_BOARD_CORES, MULTICORE_WINDOW_BYTES,
+                                model_multicore_layout, multicore_arena_bytes,
+                                require_multicore_dram)
 
-# ANY multi-core Gemma3 run owns the full 8 GB map as two non-overlapping
-# arenas:
-#   [0, N x 512 MB) -- one FIXED 512 MB private window per engine. The size is
-#                      constant, not the arena divided by the engine count: the
-#                      DRAM controller interleaves across these windows, so a
-#                      shrinking stride would cost exactly the concurrent
-#                      bandwidth multi-core exists to buy.
-#   [6, 8 GB)       -- the primary's original 2 GB params/tensor/program layout,
-#                      rebased upward without changing its internal offsets. It
-#                      sits at the TOP at every engine count, so the model's own
-#                      addresses never move when cores are added.
-# Single-core keeps the historical Gemma3 DRAM layout at DRAM_START_ADDR.
+# The board-aware layout keeps the original two-GiB model offsets together
+# while placing private weight shards in controller-aware windows.
+# Kintex-7 uses model [1, 3) GiB and private windows at 0 and 3 GiB; Alveo
+# uses its HBM controller map and reserves [6, 8) GiB for the model.
+# Unknown boards retain the historical layout policy below.
 MULTI_CORE_MAX_ENGINES = 12
-# Engine count at which the fixed-window map replaces the divided low-2-GB one.
-# The fixed map pins the model at MULTI_CORE_MODEL_BASE (6 GB) whatever the
-# engine count, so it needs the 8 GB device REGARDLESS of how many windows are
-# actually claimed -- a 2-engine run would demand 8 GB to use 1 GB of arena.
-# Boards that report 4 GB (p2's kintex7: HW_INFO cores=2, DRAM=4 GiB) therefore
-# keep the divided private_low map, which is what they ran before and what
-# user_hw_test.py's gemma3_multi_core_inference_test still expects there.
 MULTI_CORE_FIXED_MAP_MIN_ENGINES = 8
-# One source of truth for the window size: the library owns the policy
-# (multi_engine_shard.MULTICORE_WINDOW_BYTES); this is the local name.
 MULTI_CORE_ENGINE_WINDOW_BYTES = MULTICORE_WINDOW_BYTES
 MULTI_CORE_MODEL_BASE = 0x180000000
 MULTI_CORE_DRAM_LIMIT = 0x200000000
 MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
-
-# THE PRIVATE WINDOWS COME FROM THE BOARD, NOT FROM A STRIDE.
-# ==========================================================================
-# A fixed ``core * 512 MB`` map was right for the wiring the fixed map was
-# written against and is wrong for the one shipping now: on the reordered U55C
-# it leaves every engine reading across the HBM lateral switch. Measured on
-# xdma0 (16 GiB, 12 cores, 512 kB per engine): the flat stride reads at
-# 56.4 GB/s at 12 engines and 37.6 at 8, where the board map reads at 105.5 and
-# 70.4 -- half the device's bandwidth, and gemma3's decode is bandwidth-bound
-# enough to show it (171.4 -> 117.3 GFLOPS at 12 engines when the board moved).
-#
-# So the windows are ASKED FOR, per board, keyed on the HW_INFO signature:
-#
-#   cores == 8,  DRAM == 8 GiB    Alveo U50
-#   cores == 12, DRAM == 16 GiB   Alveo U55C, dual stack
-#
-# Any other signature keeps the fixed map, which is what those boards ran
-# before (kintex7's 2-core map above all -- its DRAM layout does not move).
-BOARD_MAP_PROFILES = {(ALVEO_BOARD_CORES, 8), (ALVEO_U55C_BOARD_CORES, 16)}
-# What the model map needs above its base: params at +0, tensors at
-# +0x30000000, instructions at +0x50000000 and up. The budget is the existing
-# MULTI_CORE_MODEL_BASE..MULTI_CORE_DRAM_LIMIT span, so a board map has to
-# leave this much CONTIGUOUS room somewhere or gemma3 keeps the fixed map.
 MULTI_CORE_MODEL_SPAN = MULTI_CORE_DRAM_LIMIT - MULTI_CORE_MODEL_BASE
+BOARD_MAP_PROFILES = {(KINTEX7_BOARD_CORES, 4), (ALVEO_BOARD_CORES, 8),
+                      (ALVEO_U55C_BOARD_CORES, 8), (ALVEO_U55C_BOARD_CORES, 16)}
 
 
 def _board_multicore_map(num_engines: int):
-    """``(windows, model_base)`` from the board map, or None to keep the fixed map.
-
-    ``windows`` is one ``(base, bytes)`` per engine, straight from
-    multi_engine_shard.board_private_windows() -- the single place that knows
-    where a multi-core engine's private DRAM lives on each board.
-
-    TWO DELIBERATE NARROWINGS of what that function returns:
-
-    * Only the PRIMARY segment is claimed. A U50 window is two 512 MB segments
-      4 GiB apart (one per stack) and claiming both would cover all 8 GiB,
-      leaving the model map nowhere to go. gemma3 needs 64 MB per core against
-      the 480 MB it already has, so the second segment buys nothing here.
-    * On the U50 the engines are placed in ADDRESS order rather than in the
-      SAXI order board_private_windows() returns. Both cover the same eight
-      512 MB regions; the permutation only decides which port reaches a region
-      directly, which multi_engine_shard's own tiling map documents as not
-      moving the measured number ("Occupancy does, and this map is 1 per
-      region"). Address order is what every shipped 8-core run used, so this
-      path stays bit-identical to it.
-    """
-    cores = user_dma_core.ANDROMEDA_CORE_COUNT
-    gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
-    if (cores, gib) not in BOARD_MAP_PROFILES:
+    """Use the shared model-safe controller map, or None on an unknown board."""
+    profile = (user_dma_core.ANDROMEDA_CORE_COUNT,
+               user_dma_core.AVAILABLE_DRAM_SIZE_GB)
+    if profile not in BOARD_MAP_PROFILES:
         return None
-    # THE MODEL MAP IS RESERVED, NOT HOPED FOR. The 16 GiB U55C has sixteen
-    # 1 GiB (stack, MC) regions and at most twelve engines, so the four spare
-    # ones can be CHOSEN: reserving the model map's 2 GiB keeps every engine on
-    # a controller of its own AND leaves gemma3's addresses where they have
-    # always been. Without it the library hands out regions 0-4, 6, 8-11, 13, 15
-    # and the two free ones left (5 and 7) are not adjacent, so the model map
-    # has nowhere to go and the whole board map is lost at twelve engines.
-    # The U50's windows are FIXED rather than chosen (two segments per core,
-    # covering all 8 GiB), so it is not asked to reserve anything -- its
-    # primaries sit below 4 GiB and clear the model map already.
-    reserve = ((MULTI_CORE_MODEL_BASE, MULTI_CORE_MODEL_SPAN)
-               if cores == ALVEO_U55C_BOARD_CORES else None)
-    try:
-        board = board_private_windows(num_engines, reserve=reserve)
-    except (ValueError, RuntimeError) as exc:
-        print(f"  [map] board window map unavailable, keeping the fixed "
-              f"{MULTI_CORE_ENGINE_WINDOW_BYTES // 2**20} MB windows: {exc}")
-        return None
-
-    size = min(w.primary_bytes for w in board)
-    bases = [w.base for w in board]
-    if cores == ALVEO_BOARD_CORES:
-        bases = sorted(bases)
-    windows = [(base, size) for base in bases]
-
-    model_base = _free_model_base(windows, gib)
-    if model_base is None:
-        print(f"  [map] board windows leave no {MULTI_CORE_MODEL_SPAN // 2**30} GiB "
-              f"hole for the model map at {num_engines} engines, keeping the fixed "
-              f"{MULTI_CORE_ENGINE_WINDOW_BYTES // 2**20} MB windows")
-        return None
-    return windows, model_base
-
-
-def _free_model_base(windows, dram_gib: int):
-    """Lowest base where the model map clears every private window.
-
-    MULTI_CORE_MODEL_BASE is preferred whenever it is free, so a board whose
-    windows sit below it keeps the addresses it has always used.
-    """
-    taken = [(base, base + nbytes) for base, nbytes in windows]
-
-    def clear(base: int) -> bool:
-        end = base + MULTI_CORE_MODEL_SPAN
-        return (end <= dram_gib * 2**30
-                and all(end <= lo or base >= hi for lo, hi in taken))
-
-    if clear(MULTI_CORE_MODEL_BASE):
-        return MULTI_CORE_MODEL_BASE
-    step = MULTI_CORE_ENGINE_WINDOW_BYTES
-    for base in range(0, dram_gib * 2**30, step):
-        if clear(base):
-            return base
-    return None
+    return model_multicore_layout(
+        num_engines, model_bytes=MULTI_CORE_MODEL_SPAN,
+        preferred_model_base=MULTI_CORE_MODEL_BASE)
 
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
@@ -406,32 +301,33 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, local_weights: bool = False, legacy: bool = False, matmatmul: bool = False, two_pass_prefill: bool = False, multi_core: int = 1, initialize_model: bool = True):
-        # A multicore run on a 12-core bitstream uses twelve fixed 512 MB slots
-        # below 6 GB and moves the primary's unchanged 2 GB layout to [6, 8 GB).
-        # Other hardware, and single-core runs, retain the historical addresses.
         self.multi_core = int(multi_core)
         if not 1 <= self.multi_core <= MULTI_CORE_MAX_ENGINES:
             raise ValueError(
                 f"multi_core must be in [1, {MULTI_CORE_MAX_ENGINES}], "
                 f"got {self.multi_core}")
-        # The multi-core map is keyed on the ENGINE COUNT, not on what core
-        # count the bitstream reports: an 8-core board running --multi-core 8
-        # wants the same fixed 512 MB windows a 12-core board does. Below
-        # MULTI_CORE_FIXED_MAP_MIN_ENGINES the fixed map buys nothing and costs
-        # the 8 GB requirement, so small splits keep the divided private_low map.
-        self._use_multicore_dram_layout = (
-            self.multi_core >= MULTI_CORE_FIXED_MAP_MIN_ENGINES)
-        # The board map, when this board has one and it leaves the model map a
-        # home. None means the fixed map below, unchanged.
         self._board_windows = None
-        self._model_base = MULTI_CORE_MODEL_BASE
-        if self._use_multicore_dram_layout:
+        self._model_base = user_dma_core.DRAM_START_ADDR
+        # Select by the hardware signature even when only two engines of an
+        # Alveo board are active. A divided low arena can place both shards
+        # behind the same controller on Kintex-7.
+        if self.multi_core > 1:
+            if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
+                user_dma_core.configure_clock_from_hardware()
+            if self.multi_core > user_dma_core.ANDROMEDA_CORE_COUNT:
+                raise ValueError(
+                    f"multi_core={self.multi_core} exceeds the "
+                    f"{user_dma_core.ANDROMEDA_CORE_COUNT} engines HW_INFO reports")
+            board = _board_multicore_map(self.multi_core)
+            if board is not None:
+                self._board_windows, self._model_base = board
+        self._use_multicore_dram_layout = (
+            self._board_windows is not None
+            or self.multi_core >= MULTI_CORE_FIXED_MAP_MIN_ENGINES)
+        if self._use_multicore_dram_layout and self._board_windows is None:
             require_multicore_dram(self.multi_core, "Gemma3")
-            _board = _board_multicore_map(self.multi_core)
-            if _board is not None:
-                self._board_windows, self._model_base = _board
-        _rebase = (self._model_base - user_dma_core.DRAM_START_ADDR
-                   if self._use_multicore_dram_layout else 0)
+            self._model_base = MULTI_CORE_MODEL_BASE
+        _rebase = self._model_base - user_dma_core.DRAM_START_ADDR
         super().__init__(
             BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
             params_dram_base=user_dma_core.DRAM_START_ADDR + _rebase,
@@ -512,6 +408,45 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 raise MemoryError(
                     f"Gemma3 tensors end at 0x{self.get_tensor_dram_addr():X}, "
                     f"crossing program base 0x{self._program_dram_base:X}")
+
+    def _check_model_region(self, kind: str, start: int, size: int,
+                            lower: int, upper: int) -> None:
+        if (self._use_multicore_dram_layout
+                and (size < 0 or start < lower or start + size > upper)):
+            raise MemoryError(
+                f"Gemma3 {kind} range 0x{start:X}..0x{start + size:X} "
+                f"leaves its model region 0x{lower:X}..0x{upper:X}")
+
+    def allocate_params_dram(self, size_bytes: int, label=None,
+                             align_bytes: int = 64) -> int:
+        self._check_model_region(
+            "params", self._align_up(self.get_params_dram_addr(), align_bytes),
+            size_bytes, self._params_dram_base, self._tensor_dram_base)
+        return super().allocate_params_dram(size_bytes, label, align_bytes)
+
+    def allocate_tensor_dram(self, size_bytes: int, label=None,
+                             align_bytes: int = 64) -> int:
+        self._check_model_region(
+            "tensor", self._align_up(self.get_tensor_dram_addr(), align_bytes),
+            size_bytes, self._tensor_dram_base, self._program_dram_base)
+        return super().allocate_tensor_dram(size_bytes, label, align_bytes)
+
+    def allocate_program_dram(self, size_bytes: int, label=None,
+                              align_bytes: int = 64) -> int:
+        self._check_model_region(
+            "program", self._align_up(self.get_program_dram_addr(), align_bytes),
+            self._align_up(size_bytes, align_bytes), self._program_dram_base,
+            self._model_base + MULTI_CORE_MODEL_SPAN)
+        return super().allocate_program_dram(size_bytes, label, align_bytes)
+
+    def write_captured_instructions_to_dram(self, start_addr=DRAM_INSTRUCTION_ADDR) -> int:
+        # Runtime preambles write before advancing the allocator; guard the
+        # padded DMA transfer itself as well as later program reservations.
+        self._check_model_region(
+            "program", start_addr,
+            self._align_up(self.capture_count * INSTRUCTION_SIZE_BYTES, 64),
+            self._program_dram_base, self._model_base + MULTI_CORE_MODEL_SPAN)
+        return super().write_captured_instructions_to_dram(start_addr)
 
     @staticmethod
     def load_config(config_path: str | None = None, script_dir: str | None = None) -> dict:
@@ -1757,19 +1692,16 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         }
         
     def _mc_tag(self) -> str:
-        """Cache-name suffix for the engine count.
-
-        The sharded decoder body bakes in each engine's own N and its private weight
-        bases, so a compiled image is valid ONLY for the core count that built it. Every
-        bin/meta path -- run and profile, compiler and loader -- must agree on this tag,
-        or a --multi-core run replays a body built for a different split.
-        """
+        """Identify every address baked into a multi-engine instruction image."""
         if self.multi_core <= 1:
             return ""
-        # Two maps again, so the tag has to name which one: _mcmap for the fixed
-        # 512 MB windows, bare _mc{N} for the divided private_low map. A bare
-        # _mc{N} image built before the fixed map existed used private_low too,
-        # so reusing that tag for it replays only compatible bodies.
+        if self._board_windows is not None:
+            # Core count alone cannot distinguish DDR/HBM placements, nor a
+            # corrected engine-to-controller assignment on the same board.
+            layout = (self._model_base, MULTI_CORE_MODEL_SPAN,
+                      self._board_windows)
+            digest = hashlib.sha256(json.dumps(layout).encode()).hexdigest()[:12]
+            return f"_mc{self.multi_core}_board_{digest}"
         if self._use_multicore_dram_layout:
             return f"_mc{self.multi_core}_mcmap"
         return f"_mc{self.multi_core}"
@@ -1785,15 +1717,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         from multi_engine_shard import MultiEngineScheduler, PrivateArena
 
         print(f"\n--- Multi-core setup ({self.multi_core} engines) ---")
-        # One FIXED 512 MB window per engine from 0 upward. A --multi-core 6 run
-        # claims [0, 3 GB) and leaves the rest of the low map unused; it does NOT
-        # grow the six windows to 1 GB each, because the window size is what the
-        # DRAM controller interleaves on. Engine i therefore owns the same
-        # addresses at every engine count, and the model map above never moves.
+        # The shared layout reserves the model before assigning any private
+        # window, so uploading a worker shard cannot overwrite its source.
         if self._use_multicore_dram_layout and self._board_windows is not None:
-            # Board windows: a permutation, so PrivateArena takes them verbatim
-            # rather than tiling a base by a stride. Overlap against the model
-            # map was settled when the base was chosen (_free_model_base).
+            # Keep hardware engine order and each window's explicit base.
             _scheduler_map = {"arena": PrivateArena(self.multi_core,
                                                    windows=self._board_windows)}
         elif self._use_multicore_dram_layout:
@@ -1807,9 +1734,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                                                    arena_base=0,
                                                    arena_bytes=_arena_bytes)}
         else:
-            # Fewer engines than MULTI_CORE_FIXED_MAP_MIN_ENGINES: the dynamically
-            # divided low-2-GB arena, which fits a 4 GB device and leaves the
-            # model at its original base.
+            # Compatibility path for an unrecognized hardware signature.
             _scheduler_map = {"worker_map": "private_low"}
         # handshake="four_phase": see release()/join() -- the master/worker rendezvous is
         # always four-phase; this also makes any symmetric barrier() margin-free.
@@ -2847,7 +2772,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         ``gpr_aligned_seq_len`` then jumps into the cached decoder program.
 
         By default the image is always recompiled from scratch. Pass ``bin_reuse=True``
-        (CLI ``--bin-reuse``) to reuse an existing bin + meta sidecar when both are present.
+        (CLI ``--bin-reuse``) to reuse an existing single-engine bin + meta sidecar.
+        Multi-engine compilation also emits and uploads persistent worker programs,
+        so those runs always rebuild the image and workers together.
 
         Writes:
           - paths.instruction_bin : raw 32 B/instruction stream (HALT appends a trailing NOP when
@@ -2883,6 +2810,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             instruction_meta_path = os.path.join(self.script_dir, f"gemma3_bin/gemma3{mc_tag}_program.json")
         print(f"Decode kernel: {'matmat_mul_core (two-pass)' if self.matmatmul else 'quantized_matmat_core (streaming)'}")
         print(f"Prefill kernel: {'two-pass (matmat_mul_core)' if self.two_pass_prefill else 'streaming (quantized_matmat_core)'}")
+        if bin_reuse and self.multi_core > 1:
+            print("--bin-reuse: rebuilding multi-core images to prepare worker programs.")
+            bin_reuse = False
         if bin_reuse and os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
             with open(instruction_meta_path) as stream:
                 cached_geometry = json.load(stream)
@@ -4048,6 +3978,7 @@ def main():
                         help='After prefill and after the first decoded token, compare HW KV cache against host reference and print SNR for K and V.')
     parser.add_argument('--bin-reuse', dest='bin_reuse', action='store_true',
                         help='Reuse a cached program image (gemma3_bin/*_program.bin + .json) if it exists. '
+                             'Multi-core runs rebuild their worker programs and primary image together. '
                              'Default: always recompile the program image from scratch.')
     args = parser.parse_args()
     if not 1 <= args.multi_core <= MULTI_CORE_MAX_ENGINES:
@@ -4069,8 +4000,8 @@ def main():
             f"--multi-core {args.multi_core} exceeds the {_hw_cores} cores "
             "reported by HW_INFO")
 
-    from user_hw_test import software_reset_test
-    software_reset_test(cores=args.multi_core)
+    from multi_engine_decode import reset_engine_queues
+    reset_engine_queues(args.multi_core)
 
     _boot = user_dma_core.UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR)
     _boot.clear_dram()

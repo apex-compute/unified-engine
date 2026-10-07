@@ -111,40 +111,25 @@ GEMMA3_EXPECTED_TEXT = (
 )
 GEMMA3_EXPECTED_TOKENS = 76
 
-# Peak (1st-token) decode floor for the default kernel config, in cycles/token so
-# it is clock-independent. The multi-core test derives its own floor from this
-# one -- floor / cores * coefficient -- so a change here propagates to both.
+# Peak (1st-token) decode ceiling for the default kernel config, in cycles/token
+# so it is clock-independent. Multi-core limits are measured separately below.
 _GEMMA3_SINGLE_CORE_MAX_CYCLES_PER_TOKEN = 20_000_000
 # Multi-core decode floors, MEASURED per core count rather than derived from the
 # single-core floor. Scaling is set by DRAM bandwidth, not by core count, and the
-# two boards differ in kind:
-#
-#   2 cores (kintex7, DDR3)  measured 6,108 MB/s with one engine reading and only
-#       7,149 MB/s with two -- 1.17x aggregate for 2x the readers, i.e. the
-#       controller is already saturated by a single engine. Decode streams ~500 MB
-#       of IF4 weights per token and runs at 81-87% of that ceiling, so 1.09x is
-#       very nearly all the hardware can give. A derived floor (floor/cores, or
-#       even floor/sqrt(cores) = 14.2M) is unreachable here however correct the
-#       sharding is.
-#   8 cores (alveo, HBM)     bandwidth scales with the engines, so decode reaches
-#       4.31x and the floor can be tight enough to catch a real regression.
+# private weight placement must actually select different controllers. Kintex-7
+# now places decode shards at 0 and 3 GiB around the shared [1,3) GiB model;
+# the earlier low-2GiB placement sent both engines to one DDR controller.
 #
 # Values carry deliberate slack over the measurements below, because DRAM speed is
 # the least stable thing being measured here -- it moves with refresh, temperature
 # and whatever else is touching memory:
-#   2 cores: 17,111,832 measured (11.59 tok/s, twice)      -> floor 19,500,000
+#   2 cores: 10,098,816 measured (19.64 tok/s, p2 golden) -> floor 12,000,000
 #   8 cores: 4,561,728 / 4,566,164 / 4,774,495 measured    -> floor  6,500,000
-#
-# NOTE the 2-core floor is a sanity check, not a sharding check: unsharded decode
-# on that board is ~18.7M cycles/tok, only 9% away from the 17.1M a correct run
-# achieves, so no threshold can separate them with slack left over. On DDR3 the
-# exact-text and token-count assertions are what actually guard sharding; here the
-# speed floor only catches gross breakage.
 #
 # Core counts with no entry do not run the test at all -- a floor guessed for
 # hardware nobody has measured is worse than no floor.
 _GEMMA3_MULTI_CORE_MAX_CYCLES_PER_TOKEN = {
-    2: 19_500_000,
+    2: 12_000_000,
     8: 6_500_000,
 }
 
@@ -7764,11 +7749,7 @@ def gemma3_multi_core_inference_test(num_engines: int) -> None:
     from gemma3_test import Gemma3_UnifiedEngine
     import user_dma_core
 
-    # Derived from the single-core floor rather than measured independently, so
-    # the two stay tied: perfect scaling would be floor/cores, and the
-    # coefficient is the slack for the part of a decode step that does not shard
-    # (rope, attention, the norms) plus per-round rendezvous cost.
-    # Measured per core count; see the table for why this is not derived.
+    # Measured per core count with slack for memory timing; see the table above.
     max_cycles_per_token = int(_GEMMA3_MULTI_CORE_MAX_CYCLES_PER_TOKEN[num_engines]
                                * GEMMA3_HARDWARE_PENALTY_FACTOR)
 
@@ -8421,8 +8402,17 @@ if __name__ == "__main__":
                 input_scale=scale,
                 snr_threshold_db=snr_floor,
             )
+    if not args.single_core_only and engine_count >= 2:
+        from multi_engine_memory_test import run_memory_comparison
+        for result in run_memory_comparison(
+                num_engines=engine_count, sizes_kib=(64, 256, 512), iterations=32, samples=3):
+            record_test(
+                f"multi_core_dram_{result['direction']}+{result['layout']}",
+                f"engines={result['engines']}, data_size_kB={result['size_kib']}, "
+                f"spacing_bytes={result['source_spacing_bytes']}, "
+                f"iterations={result['iterations']}, samples={result['samples']}, exact=PASS",
+                mb_per_s=result['mb_per_s'])
     if engine_count >= 8: # alveo and alveo_u55c only
-        multi_core_dram_speed_test(data_size_kB=512, num_engines=engine_count)
         matmat_mul_multi_cores_unified_test(runtime_list=[(6144, 1024, 1024)], num_engines=engine_count)
         quantized_matmat_mul_multi_cores_test(runtime_list=[(1, 1536, 6144)], num_engines=engine_count)
 

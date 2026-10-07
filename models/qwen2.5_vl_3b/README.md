@@ -1,7 +1,8 @@
 # Qwen2.5-VL-3B
 
 Vision-Language Model (VLM) inference on the Apex Compute Unified Engine.
-Vision encoder + LM prefill + decode, single core or up to 8 cores.
+Vision encoder + LM prefill + decode, single core or up to 12 cores when the
+loaded Alveo image and memory capacity support the requested controller map.
 
 ## Layout
 
@@ -67,9 +68,25 @@ step, and the phase that the decode attention shard targets.
 
 See `pr_summary.md` for the per-phase breakdown.
 
+The controller-map regression on 2026-10-07 used U50 image `0xe6703022` at
+333.332 MHz and the text prompt “Solve 2x + 3 = 7. Reply with only the value of
+x.” Both one and eight engines returned `x = 2` with the exact same five token
+IDs, including EOS, under a 128-token cap. First-token hardware time was
+211.01 → 33.62 ms; average time over those five steps was 211.00 → 33.62 ms
+(6.28×). These are decode-only hardware times for a short text request; they
+exclude preparation, prefill, and host-side argmax comparison.
+
+The [measured JSON](../../alveo_u50_qwen_vl_controller_results.json) records the
+tokens, board identity, and controller addresses. Repeat with:
+
+```bash
+python model_controller_benchmark.py --dev xdma0 --engines 8 --models qwen_vl \
+  --max-new-tokens 128 --json alveo_u50_qwen_vl_controller_results.json
+```
+
 ## DRAM map
 
-Upper 2 GB (identical at every core count):
+Single-engine model region (2–4 GiB):
 
 ```
 PARAMS  0x8000_0000 - 0xF100_0000   1808 MiB   time-shared: vision (389.7 MiB)
@@ -79,9 +96,21 @@ TENSOR  0xF100_0000 - 0xFB00_0000    160 MiB   activations + KV cache (122.8 use
 ISA     0xFB00_0000 - 0x1_0000_0000   80 MiB   master 24 MiB, then one slice per worker
 ```
 
-Multi-core private space is the whole lower 2 GB, one window per engine laid out
-`[ weights | tensor ]` — 8 engines → 256 MiB/window (240 MiB weights + 16 MiB
-tensor). Worker ISA lives in the model map above, not in the windows.
+Multi-core execution preserves those relative offsets in the 6–8 GiB region
+and requires at least 8 GiB of memory. Private `[ weights | tensor ]` windows
+come from the shared `model_multicore_layout()` controller policy:
+
+- U50: 512 MiB per engine in hardware SAXI order, leaving 496 MiB for weights.
+- U55C, 16 GiB: one private 1 GiB controller region per engine; all twelve engines
+  fit alongside the shared model region.
+- U55C, 8 GiB: up to six 1 GiB controller windows; seven to twelve engines use
+  disjoint 512 MiB segments that share some controllers.
+
+Worker ISA remains in the model region. Unsupported boards or conflicting maps
+fail before allocation. Address sorting and fallback to a fixed per-core stride
+are not used. Vision, prefill, and decode programs are compiled with the current
+instance's addresses on every run; there is no persistent instruction cache to
+reuse from the previous placement.
 
 ## Multi-core sharding
 
@@ -92,8 +121,8 @@ tensor). Worker ISA lives in the model map above, not in the windows.
 | Decode | q/k/v, o_proj, gate/up + SwiGLU product, down + residual, lm_head, attention (V transpose + P@V^T) | rope, Q@K^T, permute |
 
 Decode weights are duplicated into each engine's private arena (column shards) so
-engines do not contend on one shared weight image; 228.4 MiB of the 240 MiB window
-is used at 8 cores. Ops too narrow to reach every engine shard over a subset
+engines do not contend on one shared weight image; about 228.4 MiB of each
+engine's weight capacity is used at 8 cores. Ops too narrow to reach every engine shard over a subset
 (k and v are N=256 → 4 engines of 8). RoPE is unsharded pending library support.
 
 The largest remaining serial op is **decode attention**, which grows with context:

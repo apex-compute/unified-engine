@@ -40,6 +40,7 @@ Fixed layout: gemma4_e4b_test.py, gemma4_e4b_numeric.py, *.json, and gemma4_e4b_
 """
 
 import json
+import hashlib
 import math
 import os
 import sys
@@ -1005,10 +1006,47 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
 # -----------------------------------------------------------------------------
 # Gemma4 E4B unified engine
 # -----------------------------------------------------------------------------
+def _decode_private_windows(num_engines: int):
+    """Private decode storage above the existing 4 GiB shared model image."""
+    from multi_engine_shard import board_private_windows
+    cores, gib = user_dma_core.ANDROMEDA_CORE_COUNT, user_dma_core.AVAILABLE_DRAM_SIZE_GB
+    if cores is None or gib is None:
+        user_dma_core.configure_clock_from_hardware()
+        cores, gib = user_dma_core.ANDROMEDA_CORE_COUNT, user_dma_core.AVAILABLE_DRAM_SIZE_GB
+    if not 2 <= num_engines <= cores:
+        raise ValueError(f"multi_core must be 2..{cores}, got {num_engines}")
+    if cores == 8 and gib == 8:
+        # U50 owns the same controller on each stack. The low stack already
+        # holds the complete model, so private copies use matching high ports.
+        return [window.segments[1] for window in board_private_windows(num_engines)]
+    if cores == 12 and gib == 16:
+        return [(w.base, w.primary_bytes) for w in
+                board_private_windows(num_engines, reserve=(0, 4 << 30))]
+    if cores == 12 and gib == 8 and num_engines <= 8:
+        # Spread the first four engines over the remaining MCs before reusing
+        # their second halves. Five through eight engines must share MCs.
+        bases = [((4 + i) << 30) + half * (512 << 20)
+                 for half in range(2) for i in range(4)]
+        return [(base, 512 << 20) for base in bases[:num_engines]]
+    raise ValueError("Gemma4 E4B multicore requires U50 8 GiB or U55C 8/16 GiB; "
+                     "the shared model already occupies 4 GiB")
+
+
 class Gemma4_UnifiedEngine(UnifiedEngine):
     """UnifiedEngine with Gemma4 E4B dims: loads config + weight bin, compile_prefill/compile_decoder, run_prefill/run_decoder. Numeric checks in gemma4_e4b_numeric.py."""
 
-    def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False):
+    def __init__(self, script_dir: str | None = None, local_weights: bool = False, dual_engine: bool = False, engine_slave: bool = False,
+                 multi_core: int = 1):
+        if not isinstance(multi_core, int) or multi_core < 1:
+            raise ValueError("multi_core must be a positive integer")
+        if multi_core > 1 and (dual_engine or engine_slave):
+            raise ValueError("multi_core cannot be combined with the legacy dual_engine layout")
+        self.multi_core = multi_core
+        self._decode_sharder = None
+        self._decode_windows = _decode_private_windows(multi_core) if multi_core > 1 else None
+        self.dram_layout = ("legacy" if multi_core == 1 else
+                            f"mc{multi_core}_" + hashlib.sha256(
+                                json.dumps(self._decode_windows).encode()).hexdigest()[:12])
         engine_base = user_dma_core.UE_0_BASE_ADDR + 0x00010000 if engine_slave else user_dma_core.UE_0_BASE_ADDR
         # Gemma4 E4B FIXED DRAM layout v3 (full LM + vision + audio; 4 GB).
         # See notes/notes_gemma4_e4b_scaleup.md. v3 vs v2:
@@ -1133,9 +1171,68 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         self._identity_dram_written = False
 
         self._weights_bin_rel = paths["weights_bin"]
+        self._check_decode_private_capacity()
         self.weight_init()
         self.tensor_init()
         self._preallocate_identity_matrix()
+
+    def _decode_projection_specs(self):
+        """Only projections that already use the IF4 streaming kernel.
+
+        The 10240-wide MLP down projection and the BF16 LM head retain their
+        original primary kernels. Narrow K/V projections may also stay primary
+        when there are fewer 64-column blocks than active engines.
+        """
+        for layer in range(self.LAYER_SIZE):
+            _, q_size, k_size = self._get_layer_attention_dims(layer)
+            for name, prefix, K, N in (
+                    ("q", "Q_PROJ", self.vector_length, q_size),
+                    ("k", "K_PROJ", self.vector_length, k_size),
+                    ("v", "V_PROJ", self.vector_length, k_size),
+                    ("o", "ATTN_PROJ", q_size, self.vector_length),
+                    ("gate", "MLP_GATE", self.vector_length, self._get_mlp_elements(layer)),
+                    ("up", "MLP_UP", self.vector_length, self._get_mlp_elements(layer))):
+                yield name, prefix, K, N, layer
+
+    def _check_decode_private_capacity(self):
+        if self._decode_windows is None:
+            return
+        from multi_engine_shard import PrivateArena, can_split
+        arena = PrivateArena(self.multi_core, windows=self._decode_windows)
+        # Upper bound per core, including an alignment allowance for each blob.
+        required = 0
+        for _, _, K, N, _ in self._decode_projection_specs():
+            if can_split(N, self.multi_core):
+                columns = ((N // 64 + self.multi_core - 1) // self.multi_core) * 64
+                required += columns * K // 2 + columns * K // 64 * 2 + 128
+        if required > arena.weight_bytes():
+            raise MemoryError(
+                f"Gemma4 E4B decode shards need up to {required / 2**20:.1f} MiB "
+                f"per engine, but this layout has {arena.weight_bytes() / 2**20:.1f}; "
+                "use more engines or a board with larger private windows")
+
+    def _ensure_decode_sharder(self):
+        if self.multi_core == 1:
+            return None
+        if self._decode_sharder is None:
+            from multi_engine_decode import ControllerShardedDecoder
+            decoder = ControllerShardedDecoder(self, self.multi_core, self._decode_windows)
+            stride = self.weight_defs["LAYER_WEIGHT_SIZE"]
+            for name, prefix, K, N, layer in self._decode_projection_specs():
+                decoder.add_weight(
+                    f"{name}_{layer}",
+                    getattr(self, f"DRAM_ADDR_LAYER0_{prefix}_QUANT") + layer * stride,
+                    getattr(self, f"DRAM_ADDR_LAYER0_{prefix}_SCALE") + layer * stride,
+                    K, N, 1, 0)
+            self._decode_sharder = decoder
+        return self._decode_sharder
+
+    def _decode_projection_core(self, **kwargs):
+        if self._decode_sharder is not None:
+            result = self._decode_sharder.projection(**kwargs)
+            if result is not None:
+                return result
+        return self.quantized_matmat_core(**kwargs)
 
     # ─── Identity matrix cache (fix for flash_attention_core DRAM leak) ─────
     def unified_attention_core(self, *, q_scale=None, **kwargs) -> int:
@@ -7774,6 +7871,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _original_print(f"  Emitting dynamic-PBI decoder: 1 segment x {layer_size} layers, dec_buckets={dec_num_buckets}")
         seg_t0 = time.perf_counter()
         count_at_start = self.capture_count
+        decoder = self._ensure_decode_sharder()
+        if decoder is not None:
+            decoder.begin()
         total_flops = 0
         gpr_one = self.alloc_isa_reg()
         self.generate_instruction_add_set(gpr_one, 1)
@@ -7815,7 +7915,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 # §3h: decode (M=1) projections use quantized_matmat_core (GEMV),
                 # not matmat_mul_core (GEMM). down_proj + lm_head stay GEMM
                 # (large-K: K=cur_mlp up to 12288 > SCALE_BRAM_ELEMENTS → N_chunk=0).
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=cur_q_size,
+                total_flops += self._decode_projection_core(M=1, K=self.vector_length, N=cur_q_size,
                                                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                                                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
                                                     OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
@@ -7828,7 +7928,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 else:
                     kv_layer_for_attn = layer_idx  # read from own KV cache
                     # K projection — §3h GEMV
-                    total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=cur_k_size,
+                    total_flops += self._decode_projection_core(M=1, K=self.vector_length, N=cur_k_size,
                         A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                         B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off,
                         OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
@@ -7836,7 +7936,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                         SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off,
                         )
                     # V projection — §3h GEMV
-                    total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=cur_k_size,
+                    total_flops += self._decode_projection_core(M=1, K=self.vector_length, N=cur_k_size,
                         A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                         B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off,
                         OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
@@ -7985,7 +8085,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     self.accelerator_memory_to_sram(self.LAYER0_FLASH_OUT_HEAD_DRAM, 0x30000, _qel)
                     self.sram_to_accelerator_memory(0x30000, self.LAYER0_FLASH_OUTPUT_DRAM + q_off, _qel)
                 # O projection: §3h GEMV, K=cur_q_size (actual per-layer attention output dim)
-                total_flops += self.quantized_matmat_core(M=1, K=cur_q_size, N=self.vector_length,
+                total_flops += self._decode_projection_core(M=1, K=cur_q_size, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
@@ -8010,7 +8110,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                               gpr_M_reg=gpr_one)
 
                 # MLP gate (GELU) + up — §3h GEMV
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=cur_mlp,
+                total_flops += self._decode_projection_core(M=1, K=self.vector_length, N=cur_mlp,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
@@ -8018,7 +8118,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off,
                     gelu_enable=True,
                     )
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=cur_mlp,
+                total_flops += self._decode_projection_core(M=1, K=self.vector_length, N=cur_mlp,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off,
                     OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
@@ -8080,6 +8180,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             self.generate_instruction_halt()
             instr_count = self.capture_count - count_at_start
             _original_print(f"    decoder segment ({instr_count} instr) done in {time.perf_counter()-seg_t0:.1f}s")
+        if decoder is not None:
+            decoder.finalize()
         program_sizes = [instr_count * 32]
         total_flops_list = [total_flops]
         _SILENT_MODE = False
@@ -8121,6 +8223,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         bin_path  = os.path.join(bin_dir, "programs.bin")
         meta_path = os.path.join(bin_dir, "programs.json")
 
+        # Weight copies and worker resets must finish before primary capture.
+        self._ensure_decode_sharder()
         prefill_max_seq_len = self._cfg["model"].get("prefill_max_seq_len", 320)
 
         # ------------------------------------------------------------------
@@ -8463,6 +8567,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             cos_b = neg_sin_b = sin_hi_b = rope_blob = b""
 
         final_bytes = bytes(all_bytes) + rope_blob
+        self._validate_program_bounds(instruction_base_addr, len(final_bytes))
 
         bin_tmp  = bin_path  + ".tmp"
         meta_tmp = meta_path + ".tmp"
@@ -8473,6 +8578,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         manifest = {
             "compile_version": INSTRUCTION_BIN_COMPILE_VERSION,
+            "dram_layout": self.dram_layout,
+            "multi_core": self.multi_core,
             "instruction_bin": os.path.relpath(bin_path, self.script_dir),
             "instruction_base_addr": f"0x{instruction_base_addr:X}",
             "instruction_total_size": program_size,
@@ -8555,6 +8662,26 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         print(f"[instr-bin] Manifest: {meta_path}")
         return bin_path, manifest
 
+    def _validate_program_bounds(self, base_addr, size):
+        if base_addr < 0xDA000000 or size < 0 or base_addr + size > 4 << 30:
+            raise MemoryError("Gemma4 E4B instruction image exceeds its shared ISA region")
+
+    def _validate_instruction_manifest(self, manifest):
+        if (manifest.get("dram_layout", "legacy") != self.dram_layout
+                or manifest.get("multi_core", 1) != self.multi_core):
+            raise ValueError("Gemma4 E4B instruction cache uses a different engine/memory layout; rebuild it")
+        if self.multi_core > 1 and (self._decode_sharder is None
+                                    or self._decode_sharder._worker_programs is None):
+            raise ValueError("Gemma4 E4B multicore workers must be compiled in this process before loading")
+        baked = manifest.get("tensor_layout_sig")
+        if baked is not None:
+            live = self._tensor_layout_signature()
+            if any(baked.get(key) != value for key, value in live.items()
+                   if key != "tensor_high_water"):
+                raise ValueError("Gemma4 E4B instruction cache has a stale tensor layout; rebuild it")
+        self._validate_program_bounds(int(manifest["instruction_base_addr"], 16),
+                                      manifest["instruction_total_size"])
+
     def load_instruction_bin(self) -> dict:
         """Load programs.bin into program DRAM at the manifest's
         baked base address. Returns the manifest dict (with int addrs).
@@ -8569,6 +8696,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 f"Instruction bin missing: {bin_path}. Run compile_instruction_bin() first.")
         with open(meta_path, "r") as f:
             manifest = json.load(f)
+        self._validate_instruction_manifest(manifest)
         # Read only the program region (instruction_total_size bytes) via
         # chunked DMA from disk, avoiding a ~1 GB f.read() that would spike
         # host RSS (problematic on 16 GB Raspberry Pi). Read in 64 MB chunks
@@ -8875,7 +9003,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # produces the same DRAM state the LM ISA expects. Idempotent for
         # LM-only-bin runs (just a few small DMAs).
         # ------------------------------------------------------------------
-        self.software_reset()  # clear stuck queue state from any prior failing run
+        # Queue recovery preserves the model image and supports current HW_INFO
+        # builds; full software_reset also invokes a version-pinned DRAM self-test.
+        from multi_engine_decode import reset_engine_queues
+        reset_engine_queues(self.multi_core)
         from user_dma_core import UE_VECTOR_SIZE as _UE_VS
         # Zero ENTIRE K/V cache (0..MAX_CONTEXT_SIZE). Prefill overwrites
         # positions 0..prefill_max-1 with K/V data; positions prefill_max..
@@ -9008,7 +9139,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         return latency, flop_rate
 
-    def run_decoder(self, decoder_program_sizes: list[int], decoder_base_addr: int, token_id: int, flops_per_token: list[int] | None = None) -> dict:
+    def run_decoder(self, decoder_program_sizes: list[int], decoder_base_addr: int, token_id: int, flops_per_token: list[int] | None = None, max_new_tokens: int | None = None) -> dict:
         """Run decode loop with dynamic PBI (E4B). Single decoder program."""
         if token_id is None:
             print("No last token available for decode.")
@@ -9016,9 +9147,14 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
 
         global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
-        _maxdec = os.environ.get("GEMMA4_MAX_DECODE")   # benchmark cap (e.g. 128); default off
-        if _maxdec:
-            max_seq_len = min(max_seq_len, self.seq_len + int(_maxdec))
+        limit = max_new_tokens if max_new_tokens is not None else getattr(self, "max_new_tokens", None)
+        if limit is None and os.environ.get("GEMMA4_MAX_DECODE"):
+            limit = int(os.environ["GEMMA4_MAX_DECODE"])
+        if limit is not None:
+            if not isinstance(limit, int) or limit < 1:
+                raise ValueError("max_new_tokens must be a positive integer")
+            max_seq_len = min(max_seq_len, self.seq_len + limit)
+        self._decode_step_us = []
         total_latency, total_flop_rate = 0, 0
         prog_addr = decoder_base_addr
         flops_per_token_scalar = flops_per_token[0] if flops_per_token else None
@@ -9162,7 +9298,12 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             if not _pen_off and _n_generated >= _greedy_until:
                 self._write_penalty_bias(_gen_tokens)
 
+            if self._decode_sharder is not None:
+                self._decode_sharder.start()
             latency, flop_rate_program = self.program_execute(prog_addr, timeout=300.0, flops=flops_per_token_scalar)
+            if self._decode_sharder is not None:
+                self._decode_sharder.wait()
+            self._decode_step_us.append(latency)
             total_latency += latency
             total_flop_rate += flop_rate_program
             # --- NaN / collapse tripwire (cheap: 5 KB read of the L41 hidden) ---
@@ -9236,6 +9377,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         _avg = (_decoded_n / _elapsed) if _elapsed > 0 else 0.0
         print(f"\nDecode speed: peak (1st token) {_peak:.2f} tok/s, "
               f"average {_avg:.2f} tok/s  ({_decoded_n} tokens in {_elapsed:.2f}s)")
+        self._decoded_token_ids = _gen_tokens
+        self._decoded_text = self.tokenizer.decode(_gen_tokens, skip_special_tokens=True)
         return self.seq_len, total_latency, total_flop_rate
 
 # -----------------------------------------------------------------------------
@@ -9297,7 +9440,15 @@ defaults (sample files in repo-root test_samples/):
                         help='DMA device name for non-Efinix profiles (e.g., xdma0, xdma1). Efinix uses /dev/pcie_dma0_* from its profile.')
     parser.add_argument('--device', type=str, default='kintex7',
                         help='FPGA board / bitstream profile. Use efinix for the Efinix profile.')
+    parser.add_argument('--multi-core', type=int, default=1,
+                        help='Number of engines for controller-private LM decode (U50/U55C).')
+    parser.add_argument('--max-new-tokens', type=int, default=None,
+                        help='Stop generation after this many new tokens without changing KV layout.')
     args = parser.parse_args()
+    if args.multi_core < 1:
+        parser.error('--multi-core must be positive')
+    if args.max_new_tokens is not None and args.max_new_tokens < 1:
+        parser.error('--max-new-tokens must be positive')
 
     if args.fpga_encoder:
         os.environ["GEMMA4_FPGA_AUDIO_FEATURES"] = "1"
@@ -9344,7 +9495,13 @@ defaults (sample files in repo-root test_samples/):
     if audio_on and audio_path and not os.path.exists(audio_path):
         raise SystemExit(f"Audio file not found: {audio_path}")
 
-    ue = Gemma4_UnifiedEngine()
+    if args.multi_core > 1:
+        # Validate memory and count before touching worker registers.
+        _decode_private_windows(args.multi_core)
+        from multi_engine_decode import reset_engine_queues
+        reset_engine_queues(user_dma_core.ANDROMEDA_CORE_COUNT)
+    ue = Gemma4_UnifiedEngine(multi_core=args.multi_core)
+    ue.max_new_tokens = args.max_new_tokens
 
     # ------------------------------------------------------------------
     # Cold-start build: if the unified bin is missing, generate it ONCE
@@ -9358,7 +9515,15 @@ defaults (sample files in repo-root test_samples/):
     bin_dir = os.path.join(SCRIPT_DIR, "gemma4_e4b_bin")
     instr_bin = os.path.join(bin_dir, "programs.bin")
     instr_meta = os.path.join(bin_dir, "programs.json")
-    if not (os.path.exists(instr_bin) and os.path.exists(instr_meta)):
+    rebuild = args.multi_core > 1 or not (os.path.exists(instr_bin) and os.path.exists(instr_meta))
+    if not rebuild:
+        with open(instr_meta) as cached_meta:
+            cached_manifest = json.load(cached_meta)
+        try:
+            ue._validate_instruction_manifest(cached_manifest)
+        except (ValueError, MemoryError):
+            rebuild = True
+    if rebuild:
         # By default build the COMPLETE LM + vision + audio bin: post bin-minimization
         # the full E4B bin is ~15 MiB, the bin holds ISA only, so unused modes cost
         # nothing at runtime. GEMMA4_LM_ONLY_BIN=1 skips vision/audio sections

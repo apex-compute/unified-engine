@@ -390,11 +390,12 @@ def private_total() -> int:
 # ==========================================================================
 # THE MULTI-CORE WINDOW IS A FIXED 512 MB, NOT A DIVIDED ARENA
 # ==========================================================================
-# The DRAM controller reaches full concurrent bandwidth only when each engine
-# drives its own 512 MB-aligned window -- the windows are what the hardware
-# interleaves across, so a stride that shrinks with the engine count throws
-# away the very concurrency multi-core is for. The window size is therefore a
-# CONSTANT and the ARENA grows with the engine count:
+# This is the legacy contiguous model arena. A 512 MiB stride distributes
+# traffic well on the U50, but is not a universal controller-selection rule:
+# Kintex-7 selects its DDR channel with bit 31, and U55C controllers span
+# 1 GiB. New model integrations should use model_multicore_layout(), which
+# reserves the shared model map and chooses private windows for the board.
+# The legacy arena remains available to callers with an explicit layout:
 #
 #     arena = [0, num_engines * 512 MB)      engine i -> [i*512MB, (i+1)*512MB)
 #
@@ -566,6 +567,7 @@ def require_multicore_dram(num_engines: int, what: str) -> None:
 #                  program = base + 0x0F000000 (240 MiB).
 
 KINTEX7_BOARD_CORES = 2                     # HW_INFO signature of the kintex7 image
+KINTEX7_CHANNEL_BYTES = 0x8000_0000          # two 2 GiB DDR3 channels, address bit 31
 ALVEO_BOARD_CORES = 8                       # HW_INFO signature of the U50 image
 ALVEO_U55C_BOARD_CORES = 12                 # HW_INFO signature of the U55C image
 
@@ -663,14 +665,14 @@ def is_alveo_u55c() -> bool:
 # ==========================================================================
 # WHOLE-BOARD PRIVATE WINDOWS (the hardware test suite's map)
 # ==========================================================================
-# THIS IS NOT THE MODEL ARENA POLICY. Two different maps coexist and they are
-# not interchangeable:
+# Whole-board tests can claim more memory than models. model_multicore_layout()
+# below derives a model arena from these board maps while reserving the
+# model's shared weights, activations and programs.
 #
-#   model runs   engines share the device with the model's own 2 GB map, so
-#                they get the LOW arena only -- multicore_arena_bytes() +
-#                private_region(), fixed 512 MB windows from 0 upward, model
-#                rebased above them. See "THE MULTI-CORE WINDOW IS A FIXED
-#                512 MB" above.
+#   model runs   private windows must clear the model's own contiguous map.
+#                U50 uses only each engine's primary 512 MiB segment; Kintex
+#                can move a window within its DDR channel; U55C can select a
+#                free controller on the other stack.
 #   test runs    user_hw_test.py owns the whole device; nothing else is
 #                resident. So the engines divide ALL of DRAM -- 1 GB per core
 #                on both Alveo boards, instead of the model map's 512 MB.
@@ -742,9 +744,9 @@ def board_private_windows(num_engines: int,
     lives -- callers ask here. The board is identified by its HW_INFO CORE
     COUNT, which is the image signature (see is_alveo_u55c):
 
-      2 cores   kintex7      the legacy map, reproduced from origin/main
-                             unchanged: 512 MB per core from 0 on a >= 4 GB
-                             report, else 256 MB per core from DRAM_START_ADDR.
+      2 cores   kintex7      512 MiB at 0 and 2 GiB on a >= 4 GiB report,
+                             one window per DDR3 channel. Older < 4 GiB
+                             images retain 256 MiB from DRAM_START_ADDR.
       8 cores   alveo U50    TWO 512 MB segments per core -- the controller
                              region it owns on EACH of the two 4 GiB HBM
                              stacks. 1 GB per core, all 8 GiB claimed.
@@ -764,13 +766,13 @@ def board_private_windows(num_engines: int,
     fixed rather than chosen, the reserve is CHECKED against them and a clash
     raises -- there is nothing to trade.
 
-    For the model-side low-arena map use multicore_arena_bytes() and
-    private_region() instead -- see the comment block above.
+    Models that also need a contiguous shared region should use
+    model_multicore_layout(), rather than claiming every segment here.
     """
     if reserve is not None:
         r_base, r_bytes = reserve
-        if r_bytes <= 0:
-            raise ValueError(f"reserve size must be positive, got {r_bytes}")
+        if r_base < 0 or r_bytes <= 0:
+            raise ValueError("reserve base must be nonnegative and size positive")
     if num_engines < 1:
         raise ValueError(f"num_engines must be >= 1, got {num_engines}")
     if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
@@ -783,6 +785,8 @@ def board_private_windows(num_engines: int,
             f"num_engines={num_engines} exceeds the {cores} engines HW_INFO reports")
 
     if cores == ALVEO_BOARD_CORES:
+        if gib != 8:
+            raise ValueError(f"U50 HBM map requires 8 GiB, got {gib}")
         # U50. Each engine has its own SAXI port on BOTH stacks, so the 512 MB
         # it owns outright is the same controller offset 4 GiB apart -- its
         # 1 GB is two segments and CANNOT be spliced (other engines hold the
@@ -803,7 +807,19 @@ def board_private_windows(num_engines: int,
                         f"{num_engines} engines need {num_engines} x 1 GiB "
                         f"controller regions, but reserving 0x{reserve[0]:X}.."
                         f"0x{reserve[0] + reserve[1]:X} leaves only {len(usable)}")
-                bases = usable[:num_engines]
+                # Keep every unaffected core on its own MC. Filtering the
+                # pool and taking its first N entries shifts all subsequent
+                # cores when one preferred region is reserved. A displaced
+                # core first tries the same MC on the opposite stack.
+                preferred = alveo_u55c_core_bases(num_engines, dram_size_gb=gib)
+                bases = [base if base in usable else None for base in preferred]
+                available = [base for base in usable if base not in bases]
+                for i, base in enumerate(bases):
+                    if base is None:
+                        partner = preferred[i] ^ (8 << 30)
+                        replacement = partner if partner in available else available[0]
+                        bases[i] = replacement
+                        available.remove(replacement)
             windows = [EngineWindow(i, ((base, ALVEO_U55C_MC_STRIDE),))
                        for i, base in enumerate(bases)]
             _validate_windows(windows, gib, is_hbm=True)
@@ -825,11 +841,13 @@ def board_private_windows(num_engines: int,
                    for i in range(num_engines)]
     elif cores == KINTEX7_BOARD_CORES:
         if gib >= 4:
-            base, size = 0x0, MULTICORE_WINDOW_BYTES
+            windows = [EngineWindow(i, ((i * KINTEX7_CHANNEL_BYTES,
+                                        MULTICORE_WINDOW_BYTES),))
+                       for i in range(num_engines)]
         else:
             base, size = user_dma_core.DRAM_START_ADDR, DDR_WINDOW_BYTES
-        windows = [EngineWindow(i, ((base + i * size, size),))
-                   for i in range(num_engines)]
+            windows = [EngineWindow(i, ((base + i * size, size),))
+                       for i in range(num_engines)]
     else:
         raise ValueError(
             f"no multi-core DRAM map for a {cores}-core board (HW_INFO reports "
@@ -894,6 +912,118 @@ def describe_board_windows(num_engines: int) -> str:
              f"{total // 2**20} MB claimed:"]
     lines += ["    " + w.describe() for w in windows]
     return "\n".join(lines)
+
+
+def model_multicore_layout(num_engines: int, model_bytes: int = 2 << 30,
+                           preferred_model_base: int = 6 << 30
+                           ) -> tuple[list[tuple[int, int]], int]:
+    """Return ``(private_windows, model_base)`` with a disjoint shared model map.
+
+    Pass the returned windows directly to ``PrivateArena(windows=...)`` and
+    rebase all model allocations to ``model_base``. Each private window lies
+    entirely within one board memory-controller region; its size includes
+    the arena's ISA and tensor tails, not only weight storage.
+
+    The default two-engine Kintex-7 layout puts 512 MiB private windows at
+    0 and 3 GiB, and the 2 GiB model at 1 GiB. The private windows therefore
+    use different DDR channels while preserving room for the shared model.
+    Exactly 2 GiB between private windows would leave only a 1.5 GiB hole.
+
+    U50 uses the primary 512 MiB segment in each engine's SAXI order and
+    leaves the second stack for shared storage. U55C uses whole 1 GiB
+    controllers, preferring each engine's own MC on either stack. A 2 GiB
+    model fits alongside all twelve engines on its 16 GiB image. The older
+    8 GiB image supports six whole-controller windows; seven to twelve
+    engines use 512 MiB segments and share some of the six remaining MCs.
+    Those segments are disjoint, but cannot promise twelve independent MCs.
+
+    Unsupported boards and layouts that cannot fit raise ValueError. This
+    function does not change PrivateArena's legacy low-address defaults.
+    """
+    if model_bytes <= 0 or model_bytes % PRIVATE_ALIGN:
+        raise ValueError("model_bytes must be a positive multiple of 16 MiB")
+    if preferred_model_base < 0 or preferred_model_base % PRIVATE_ALIGN:
+        raise ValueError("preferred_model_base must be a nonnegative multiple of 16 MiB")
+    if (user_dma_core.AVAILABLE_DRAM_SIZE_GB is None
+            or user_dma_core.ANDROMEDA_CORE_COUNT is None):
+        user_dma_core.configure_clock_from_hardware()
+    cores = user_dma_core.ANDROMEDA_CORE_COUNT
+    gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
+    if (cores, gib) not in {(KINTEX7_BOARD_CORES, 4), (ALVEO_BOARD_CORES, 8),
+                            (ALVEO_U55C_BOARD_CORES, 8),
+                            (ALVEO_U55C_BOARD_CORES, 16)}:
+        raise ValueError(f"no controller-aware model map for {cores} cores / {gib} GiB")
+    if not 1 <= num_engines <= cores:
+        raise ValueError(f"num_engines must be 1..{cores}, got {num_engines}")
+    dram_bytes = gib << 30
+    if model_bytes > dram_bytes:
+        raise ValueError("shared model map exceeds the device's DRAM capacity")
+
+    segmented_u55c = (cores == ALVEO_U55C_BOARD_CORES and gib == 8
+                     and num_engines > (dram_bytes - model_bytes) // ALVEO_U55C_MC_STRIDE)
+    board = None if segmented_u55c else board_private_windows(num_engines)
+    # These boundaries cover every relevant contiguous gap on the supported
+    # board maps. Try the caller's existing address first to preserve binaries
+    # where possible; the Kintex preference leaves one GiB on each side.
+    if cores == KINTEX7_BOARD_CORES:
+        alternatives = [1 << 30, MULTICORE_WINDOW_BYTES, 0]
+    elif cores == ALVEO_BOARD_CORES:
+        alternatives = [0] + sorted(w.base + w.primary_bytes for w in board)
+    else:
+        alternatives = [i << 30 for i in range(gib)]
+    candidates = dict.fromkeys([preferred_model_base, *alternatives])
+    for model_base in candidates:
+        if model_base + model_bytes > dram_bytes:
+            continue
+        reserve = (model_base, model_bytes)
+        if cores == KINTEX7_BOARD_CORES:
+            windows = []
+            for i in range(num_engines):
+                channel_base = i * KINTEX7_CHANNEL_BYTES
+                base = channel_base
+                if _overlaps(base, MULTICORE_WINDOW_BYTES, reserve):
+                    base = model_base + model_bytes
+                if base + MULTICORE_WINDOW_BYTES > channel_base + KINTEX7_CHANNEL_BYTES:
+                    break
+                windows.append((base, MULTICORE_WINDOW_BYTES))
+            if len(windows) != num_engines:
+                continue
+        elif cores == ALVEO_BOARD_CORES:
+            windows = [(w.base, w.primary_bytes) for w in board]
+            if any(_overlaps(base, size, reserve) for base, size in windows):
+                continue
+        elif segmented_u55c:
+            size = ALVEO_U55C_SEGMENT_STRIDE
+            usable = [base for base in range(0, dram_bytes, size)
+                      if not _overlaps(base, size, reserve)]
+            if len(usable) < num_engines:
+                continue
+            preferred = alveo_u55c_core_bases(num_engines, dram_size_gb=8)
+            bases = [base if base in usable else None for base in preferred]
+            available = [base for base in usable if base not in bases]
+            for i, base in enumerate(bases):
+                if base is not None:
+                    continue
+                occupied_mcs = {b // ALVEO_U55C_MC_STRIDE for b in bases if b is not None}
+                # An unused MC is preferable to a second segment of an MC
+                # another engine already reads. Retain unaffected affinities.
+                replacement = next((b for b in available
+                                    if b // ALVEO_U55C_MC_STRIDE not in occupied_mcs),
+                                   available[0])
+                bases[i] = replacement
+                available.remove(replacement)
+            windows = [(base, size) for base in bases]
+        else:
+            try:
+                selected = board_private_windows(num_engines, reserve=reserve)
+            except ValueError:
+                continue
+            windows = [(w.base, w.primary_bytes) for w in selected]
+        return windows, model_base
+    raise ValueError(
+        f"{num_engines} board-aware private windows and a "
+        f"{model_bytes // 2**20} MiB contiguous model map do not fit on "
+        f"the {cores}-core / {gib} GiB board")
 
 
 # ==========================================================================
@@ -4836,6 +4966,10 @@ class MultiEngineScheduler:
                     f"columns -- the per-engine argmax register did not track this shard")
             gidx = shard.col_offset + local
             val = self._read_bf16(out_addr + gidx * 2)
+            if math.isnan(val):
+                raise FloatingPointError(
+                    f"{sw.name}: engine {i} argmax candidate {gidx} is NaN; "
+                    "the sharded output cannot select a valid token")
             if best_val is None or val > best_val:
                 best_idx, best_val = gidx, val
         return best_idx
