@@ -65,8 +65,9 @@ from user_dma_core import (                          # noqa: E402
     MEMCPY_TYPE, URAM_START_ADDR, URAM_NEAR_FULL_ELEMENTS,
     DRAM_ACTIVATION_ADDR,
     LALU_CLAMP_RELU_A, LALU_CLAMP_RELU_B,
-    ue_35bit_addr_shifter, set_dma_device,
+    ue_35bit_addr_shifter, set_dma_device, INSTRUCTION_SIZE_BYTES,
 )
+from models.profile_report import aggregate_checkpoints, measurement, write_profile_markdown
 
 BF16 = 2
 MODEL_PATH = "/srv/model_files/Qwen3.5-2B-ModelFiles/Qwen3.5-2B"
@@ -254,6 +255,8 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         self._step_hw_latency_us = 0.0
         # Option B: single-hardware-trigger compile mode (Gemma3-compatible API).
         self._compile_mode: bool = False
+        self._profile_compile: bool = False
+        self._profile_checkpoints: list = []
         self._ISA_POS_K_REG    = 1   # reg 1: V_CACHE_SIZE_REG — pos_start * row_bytes
         self._ISA_TMP_REG      = 2   # reg 2: TMP_REG — destination of add_imm / overwrite source
         self._ISA_POS_ROPE_REG = 3   # reg 3: ROPE_SIZE_REG — pos_start * rot_dim * BF16
@@ -408,6 +411,14 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         if self._decode_sharder is not None:
             self._decode_sharder.wait(timeout)
         return latency
+
+    def _profile_checkpoint(self, name: str) -> None:
+        if not self._profile_compile:
+            return
+        self.generate_instruction_halt()
+        self.pad_capture_to_64b_boundary()
+        resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
+        self._profile_checkpoints.append([name, f"0x{resume:X}"])
 
     def _decoder_argmax(self):
         if self._decode_sharder is not None:
@@ -1513,7 +1524,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
     # Gemma3-compatible public decoder API                               #
     # ------------------------------------------------------------------ #
 
-    def compile_decoder(self) -> tuple:
+    def compile_decoder(self, profile: bool = False) -> tuple:
         """Compile the full 24-layer decode pass into a single FPGA binary.
 
         Uses Gemma3's single-hardware-trigger model: one ``start_capture``,
@@ -1529,8 +1540,11 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         """
         bin_path  = self._decoder_bin_path
         meta_path = self._decoder_meta_path
+        if profile:
+            bin_path = bin_path.replace(".bin", "_profile.bin")
+            meta_path = meta_path.replace(".json", "_profile.json")
 
-        if self.multi_core == 1 and os.path.exists(bin_path) and os.path.exists(meta_path):
+        if not profile and self.multi_core == 1 and os.path.exists(bin_path) and os.path.exists(meta_path):
             with open(meta_path) as f:
                 meta = json.load(f)
             if meta.get("cache_key") == self._decoder_cache_key():
@@ -1554,6 +1568,8 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         self.capture_count  = 0
         self.is_capture_on  = True
         self._compile_mode  = True
+        self._profile_compile = profile
+        self._profile_checkpoints = []
         if decoder is not None:
             decoder.begin()
 
@@ -1602,6 +1618,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
         self._s7_full_attn_active = False
 
         self._compile_mode = False
+        self._profile_compile = False
         self.is_capture_on = False
 
         # Write the compiled binary to program DRAM and record addr + size.
@@ -1626,6 +1643,7 @@ class Qwen3_5_2b_UnifiedEngine(UnifiedEngine):
             "total_flops":        [int(flops)],
             "controller_layout":  self._controller_layout(),
             "cache_key":          self._decoder_cache_key(),
+            "profile_checkpoints": self._profile_checkpoints,
         }
         with open(bin_path, "wb") as f:
             f.write(bin_bytes)
@@ -3150,14 +3168,17 @@ def _run_linear_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
         PRENORM_DRAM  = run_rms_norm_dram(ue, M=T, N=H, X_DRAM=X_DRAM,
                                           GAMMA_DRAM=w["GAMMA_INPUT"],
                                           batched=True)
+        ue._profile_checkpoint(f"L{layer_idx}_lin_pre_norm")
         QKV_PROJ_DRAM = run_fp4_matmul(ue, M=T, K=H, N=conv_dim,
                                        A_DRAM=PRENORM_DRAM,
                                        B_SCALE=w["Q_QKV"][0], B_DATA=w["Q_QKV"][1],
                                        batched=True)
+        ue._profile_checkpoint(f"L{layer_idx}_lin_qkv_proj")
         CONV_OUT_DRAM = _emit_conv1d_decode_T1(ue, layer_idx, QKV_PROJ_DRAM)
         POST_SILU_DRAM = run_silu_dram(ue, CONV_OUT_DRAM,
                                        numel=T * conv_dim, N=conv_dim,
                                        batched=True)
+        ue._profile_checkpoint(f"L{layer_idx}_lin_conv_silu")
         # Continue without closing capture — fold everything into one exec.
     else:
         # === PREFILL PATH (T>1): keep the vectorized host-tile conv path
@@ -3239,6 +3260,7 @@ def _run_linear_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
                                  A_DRAM=PRENORM_DRAM,
                                  B_SCALE=w["Q_Z"][0], B_DATA=w["Q_Z"][1],
                                  silu=True, batched=True)
+    ue._profile_checkpoint(f"L{layer_idx}_lin_qk_norm_gates")
     # Persistent S buffer.  Re-zero only on explicit request (first prefill).
     S_DRAM = ue._s_dram[layer_idx]
     if zero_s:
@@ -3298,6 +3320,7 @@ def _run_linear_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
             alpha_on_fpga=True,
             beta_on_fpga=True,
             k_on_fpga=True)
+        ue._profile_checkpoint(f"L{layer_idx}_lin_delta_rule")
     else:
         # === PREFILL: host barrier for α/β/k (T>1 path unchanged). ===
         _exec_captured(ue)
@@ -3328,9 +3351,11 @@ def _run_linear_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
                                    batched=True)
     RESIDUAL_DRAM = run_eltwise_op_dram(ue, X_DRAM, OUT_PROJ_DRAM,
                                         numel=T * H, op="add", batched=True)
+    ue._profile_checkpoint(f"L{layer_idx}_lin_gated_out_proj")
     POST_LN_DRAM = run_rms_norm_dram(ue, M=T, N=H,
                                      X_DRAM=RESIDUAL_DRAM,
                                      GAMMA_DRAM=w["GAMMA_POST"], batched=True)
+    ue._profile_checkpoint(f"L{layer_idx}_lin_pre_ffn_norm")
     GATE_DRAM = run_fp4_matmul(ue, M=T, K=H, N=mlp_dim,
                                A_DRAM=POST_LN_DRAM,
                                B_SCALE=w["Q_GATE"][0], B_DATA=w["Q_GATE"][1],
@@ -3341,12 +3366,14 @@ def _run_linear_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
                              batched=True)
     MULT_DRAM = run_eltwise_op_dram(ue, GATE_DRAM, UP_DRAM,
                                     numel=T * mlp_dim, op="mul", batched=True)
+    ue._profile_checkpoint(f"L{layer_idx}_lin_mlp_gateup_mul")
     DOWN_DRAM = run_fp4_matmul(ue, M=T, K=mlp_dim, N=H,
                                A_DRAM=MULT_DRAM,
                                B_SCALE=w["Q_DOWN"][0], B_DATA=w["Q_DOWN"][1],
                                batched=True)
     FINAL_DRAM = run_eltwise_op_dram(ue, RESIDUAL_DRAM, DOWN_DRAM,
                                      numel=T * H, op="add", batched=True)
+    ue._profile_checkpoint(f"L{layer_idx}_lin_mlp_down_residual")
     _exec_captured(ue, timeout=180.0)
     return FINAL_DRAM
 
@@ -3423,6 +3450,7 @@ def _run_full_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
                                          X_DRAM=X_DRAM,
                                          GAMMA_DRAM=w["GAMMA_INPUT"],
                                          batched=True)
+        ue._profile_checkpoint(f"L{layer_idx}_full_pre_norm")
         Q_PROJ = run_fp4_matmul(ue, M=T, K=H, N=q_proj_out,
                                 A_DRAM=PRENORM_DRAM,
                                 B_SCALE=w["Q_Q"][0], B_DATA=w["Q_Q"][1],
@@ -3434,6 +3462,7 @@ def _run_full_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
                                  B_SCALE=w["Q_KV"][0], B_DATA=w["Q_KV"][1],
                                  batched=True)
         K_PROJ = KV_PROJ
+        ue._profile_checkpoint(f"L{layer_idx}_full_qkv_proj")
         V_PROJ = KV_PROJ + kv_size * BF16
         # Q_PROJ layout: head h occupies [h*head_dim*2 : h*head_dim*2+head_dim]
         # as query, [+head_dim : +2*head_dim] as gate.
@@ -3478,6 +3507,7 @@ def _run_full_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
             _emit_rope_split_64(ue, src_k, out_k,
                                 _cos_arg, _neg_sin_arg, _sin_hi_arg,
                                 rot_dim, pass_len, load_cos_sin=(kh == 0))
+        ue._profile_checkpoint(f"L{layer_idx}_full_qk_norm_rope")
         for kh in range(num_kv_heads):
             src_k = K_ROPE_DRAM + kh * full_head_dim * BF16
             src_v = V_PROJ + kh * full_head_dim * BF16
@@ -3505,6 +3535,7 @@ def _run_full_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
                 ue.sram_to_accelerator_memory(SA_QTMP, dst_base, full_head_dim, general_reg_src=ue._ISA_TMP_REG)
             else:
                 ue.sram_to_accelerator_memory(SA_QTMP, dst_base + pos_start * row_bytes, full_head_dim)
+        ue._profile_checkpoint(f"L{layer_idx}_full_kv_cache_write")
         if getattr(ue, "_s7_full_attn_active", False):
             # §7 shared-subroutine flash: instead of emitting a full flash body
             # per head (8 heads × 6 layers = 48 inline bodies), marshal each
@@ -3547,6 +3578,7 @@ def _run_full_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
                         BIAS_DRAM_ADDR=ue._bias_dram,
                     )
             _cached_emit(ue, key_fa, _emit_flash_T1)
+        ue._profile_checkpoint(f"L{layer_idx}_full_attention")
         SIG_GATE_DRAM = _alloc_tensor(ue, num_q_heads * full_head_dim)
         for h in range(num_q_heads):
             gate_h = Q_PROJ + h * full_head_dim * 2 * BF16 + full_head_dim * BF16
@@ -3579,9 +3611,11 @@ def _run_full_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
                                        batched=True)
         RESIDUAL_DRAM = run_eltwise_op_dram(ue, X_DRAM, OUT_PROJ_DRAM,
                                             numel=T * H, op="add", batched=True)
+        ue._profile_checkpoint(f"L{layer_idx}_full_o_proj_residual")
         POST_LN_DRAM = run_rms_norm_dram(ue, M=T, N=H,
                                          X_DRAM=RESIDUAL_DRAM,
                                          GAMMA_DRAM=w["GAMMA_POST"], batched=True)
+        ue._profile_checkpoint(f"L{layer_idx}_full_pre_ffn_norm")
         GATE_DRAM = run_fp4_matmul(ue, M=T, K=H, N=mlp_dim,
                                    A_DRAM=POST_LN_DRAM,
                                    B_SCALE=w["Q_G"][0], B_DATA=w["Q_G"][1],
@@ -3592,12 +3626,14 @@ def _run_full_attn_layer(ue, X_DRAM: int, layer_idx: int, T: int,
                                  batched=True)
         MULT_DRAM = run_eltwise_op_dram(ue, GATE_DRAM, UP_DRAM,
                                         numel=T * mlp_dim, op="mul", batched=True)
+        ue._profile_checkpoint(f"L{layer_idx}_full_mlp_gateup_mul")
         DOWN_DRAM = run_fp4_matmul(ue, M=T, K=mlp_dim, N=H,
                                    A_DRAM=MULT_DRAM,
                                    B_SCALE=w["Q_D"][0], B_DATA=w["Q_D"][1],
                                    batched=True)
         FINAL_DRAM = run_eltwise_op_dram(ue, RESIDUAL_DRAM, DOWN_DRAM,
                                          numel=T * H, op="add", batched=True)
+        ue._profile_checkpoint(f"L{layer_idx}_full_mlp_down_residual")
         _exec_captured(ue, timeout=300.0)
         return FINAL_DRAM
 
@@ -3827,6 +3863,8 @@ def _forward_range(ue: Qwen3_5_2b_UnifiedEngine, token_ids: torch.Tensor,
                 # Scratch accumulates across layers (24 layers × small T=1 scratch ≪ DRAM cap).
                 NEXT_X = cur_dram
             if idx in ue.linear_attn_layers:
+                # Per-major-op profile checkpoints (lin_*) are emitted inside
+                # the layer; no single whole-layer checkpoint here.
                 cur_dram = _run_linear_attn_layer(
                     ue, NEXT_X, idx, T, zero_s=zero_s)
             else:
@@ -3951,6 +3989,144 @@ def prefill_via_decode(ue: Qwen3_5_2b_UnifiedEngine,
         print(f" done ({dt:.1f}s, {flops/1e9:.1f} GFLOP, "
               f"{gflops_hw:.1f} GFLOP/s HW)")
     return first_token_id
+
+
+def run_qwen35_profile(ue: Qwen3_5_2b_UnifiedEngine, token_ids: torch.Tensor,
+                       args) -> str:
+    """Profile recurrent prefill plus first- and maximum-context decode."""
+    checkpoints = list(ue._profile_checkpoints)
+    if not checkpoints:
+        raise RuntimeError("profile decoder has no checkpoints")
+    peak = user_dma_core.configured_hardware_info().frequency_mhz * 0.128
+    issued_phase = _theoretical_flops_by_phase(ue, 1)
+    # Per-major-op issued FLOPs for ONE layer of each type (keyed by the lin_*/
+    # full_* step names the layer emitters record). aggregate_checkpoints sums
+    # the per-layer samples back up, so these per-one-layer counts reconcile
+    # with the coarse per-phase totals.
+    issued_per = _theoretical_flops_by_substep(ue, 1)
+    issued_linear_silu = 2 * ue.lin_conv_dim * ue.lin_conv_dim
+    effective_linear_silu = 4 * ue.lin_conv_dim
+    issued_full_gate_sigmoid = (
+        ue.full_num_heads * 2 * ue.full_head_dim * ue.full_head_dim)
+    effective_full_gate_sigmoid = 4 * ue.full_num_heads * ue.full_head_dim
+    issued_attn_per_full = ue.full_num_heads * (
+        4 * ue.max_context_aligned * ue.max_context_aligned * ue.full_head_dim
+        + 5 * ue.max_context_aligned * ue.max_context_aligned)
+
+    def _step(tok: int, pos: int) -> tuple[list, float]:
+        end_pos = pos + 1
+        bias = torch.full((ue.max_context_aligned, ue.max_context_aligned),
+                          float("-inf"), dtype=torch.bfloat16)
+        bias.masked_fill_(torch.tril(torch.ones_like(bias, dtype=torch.bool)), 0.0)
+        bias[:, end_pos:] = float("-inf")
+        ue.dma_write(DMA_DEVICE_H2C, ue._bias_dram, _bf(bias),
+                     ue.max_context_aligned * ue.max_context_aligned * BF16)
+        ue.reset_tensor_dram_addr()
+        x = ue._embed_weight[tok].to(torch.bfloat16).reshape(1, ue.hidden_size)
+        ue.dma_write(DMA_DEVICE_H2C, ue._decoder_X_dram, x,
+                     ue.hidden_size * BF16)
+        ue.isa_add_set_core(ue._ISA_POS_K_REG,
+                            ue_35bit_addr_shifter(pos * ue.full_head_dim * BF16))
+        ue.isa_add_set_core(ue._ISA_POS_ROPE_REG,
+                            ue_35bit_addr_shifter(pos * ue.full_rotary_dim * BF16))
+        samples = []
+        cpu_start = time.perf_counter()
+        ue.start_execute_from_dram(ue._decoder_prog_addr)
+        for name, resume_hex in checkpoints:
+            ue.wait_queue(300.0)
+            # Checkpoint names are "L<idx>_<step>"; strip the layer index so all
+            # layers of a type collapse onto one <step> row (e.g. lin_qkv_proj).
+            phase = name.split("_", 1)[1] if name.startswith("L") else name
+            hw_ms = ue.report_latency_in_us() / 1e3
+            issued = issued_per[phase]
+            effective = issued
+            # Route the issued-vs-effective corrections to the specific major op
+            # that contains each identity-matmul workaround / padded attention.
+            if phase == "lin_conv_silu":
+                # conv1d SiLU is emitted as a conv_dim×conv_dim identity matmul.
+                effective = issued - issued_linear_silu + effective_linear_silu
+            elif phase == "full_attention":
+                # Flash attention is issued over the full max-context matrix; the
+                # useful work covers only the live [0, end_pos) KV region.
+                effective_attn = ue.full_num_heads * (
+                    4 * end_pos * ue.full_head_dim + 5 * end_pos)
+                effective = issued - issued_attn_per_full + effective_attn
+            elif phase == "full_o_proj_residual":
+                # Per-head sigmoid gate is emitted as head_dim×head_dim identity
+                # matmuls; the logical op is an elementwise sigmoid.
+                effective = (issued - issued_full_gate_sigmoid
+                             + effective_full_gate_sigmoid)
+            samples.append({"name": phase, "hw_ms": hw_ms,
+                            "issued_flops": issued,
+                            "effective_flops": effective})
+            ue.start_execute_from_dram(int(resume_hex, 16))
+        ue.wait_queue(300.0)
+        tail_ms = ue.report_latency_in_us() / 1e3
+        tail_flops = issued_phase["output_norm_lm_head"]
+        samples.append({"name": "output_norm_lm_head", "hw_ms": tail_ms,
+                        "issued_flops": tail_flops,
+                        "effective_flops": tail_flops})
+        return samples, (time.perf_counter() - cpu_start) * 1e3
+
+    ue.reset_state()
+    prefill_samples = []
+    prefill_cpu = 0.0
+    for pos, tok in enumerate(token_ids.tolist()):
+        samples, cpu_ms = _step(int(tok), pos)
+        prefill_samples.extend(samples)
+        prefill_cpu += cpu_ms
+        ue._cache_pos += 1
+    prefill_rows = aggregate_checkpoints(prefill_samples, peak_gflops=peak)
+    first_token = ue._decoder_argmax()
+    first_samples, first_cpu = _step(first_token, int(token_ids.numel()))
+    first_rows = aggregate_checkpoints(first_samples, peak_gflops=peak)
+    large_pos = ue.max_context - 1
+    large_samples, large_cpu = _step(first_token, large_pos)
+    large_rows = aggregate_checkpoints(large_samples, peak_gflops=peak)
+
+    def _total(rows, key):
+        return sum(row.get(key) or 0 for row in rows)
+
+    overall = []
+    for label, rows, cpu_ms, tokens, position in (
+        ("Prefill", prefill_rows, prefill_cpu, int(token_ids.numel()), None),
+        ("Decode first token", first_rows, first_cpu, 1, int(token_ids.numel())),
+        ("Decode maximum context", large_rows, large_cpu, 1, large_pos),
+    ):
+        hw_ms = sum(row["hw_ms"] for row in rows)
+        overall.append(measurement(
+            label=label, tokens=tokens, position=position, hw_ms=hw_ms,
+            cpu_ms=cpu_ms, issued_flops=_total(rows, "issued_flops"),
+            effective_flops=_total(rows, "effective_flops"), peak_gflops=peak))
+    hw = user_dma_core.configured_hardware_info()
+    out_path = _THIS.parent / (
+        f"qwen3.5_2b_profile_{args.dev}.md")
+    write_profile_markdown(
+        out_path, title="Qwen3.5-2B profile summary",
+        hardware={
+            "HW info": user_dma_core.hardware_info_summary(),
+            "Board profile": args.device,
+            "DMA device": args.dev,
+            "Clock": f"{hw.frequency_mhz:.2f} MHz",
+            "AXI width": f"{user_dma_core.UE_AXI_DATA_WIDTH_BITS} bit",
+            "Engines": args.multi_core,
+            "Peak throughput": f"{peak:.2f} GFLOPS",
+            "Context capacity": ue.max_context,
+            "Prefill implementation": "recurrent decoder replay",
+        },
+        overall=overall,
+        breakdowns=[
+            ("Prefill major-step breakdown", prefill_rows),
+            ("Decode first-token breakdown", first_rows),
+            ("Decode maximum-context breakdown", large_rows),
+        ],
+        notes=["The maximum-context pass is timing-only.",
+               "Effective full-attention FLOPs use the live context; issued FLOPs "
+               "include the fixed max-context attention matrix.",
+               "Effective FLOPs also replace identity-matmul SiLU/sigmoid workarounds "
+               "with their logical elementwise operation counts."],
+    )
+    return str(out_path)
 
 
 # ============================================================================
@@ -4838,6 +5014,9 @@ def main():
                     help="DMA device name (default: xdma0).")
     ap.add_argument("--multi-core", type=int, default=1,
                     help="Controller-private LM decode engines; Kintex7 supports 2.")
+    ap.add_argument("--profile", action="store_true",
+                    help="Generate a checkpointed Markdown profile for recurrent prefill, "
+                         "first-token decode, and maximum-context decode.")
     # VLM opt-in (gemma4 pattern). Default mode is pure LM; vision activates
     # only when --image PATH or --vision-enable is given.  Vision encoder
     # runs on FPGA (Phase 4) by default; the host-side HF path (Phase 1) is
@@ -4857,6 +5036,10 @@ def main():
                          "of the FPGA. FPGA vision is the default with --vision-enable / "
                          "--image.")
     args = ap.parse_args()
+    if args.profile and args.multi_core != 1:
+        ap.error("--profile currently requires --multi-core 1")
+    if args.profile and (args.image or args.vision_enable):
+        ap.error("--profile currently benchmarks the LM path; omit --image/--vision-enable")
 
     set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
@@ -4981,6 +5164,16 @@ def main():
         from multi_engine_decode import reset_engine_queues
         reset_engine_queues(args.multi_core)
     print("ok.")
+
+    if args.profile:
+        with _quiet():
+            ue._preallocate_identity_matrix()
+            ue.prepare_inference(weights, max_context=MAX_CONTEXT)
+            ue.compile_decoder(profile=True)
+        profile_ids, _ = _tokenize_with_chat_template(tokenizer, args.prompt)
+        profile_path = run_qwen35_profile(ue, profile_ids, args)
+        print(f"Wrote profile summary: {profile_path}")
+        return
 
     if args.multi_core > 1:
         # Primary and worker ISA must be compiled together after this load.
@@ -5125,7 +5318,7 @@ def _model_info(text_model) -> str:
 
 
 
-def _theoretical_flops_per_step(ue: Qwen3_5_2b_UnifiedEngine, T: int) -> int:
+def _theoretical_flops_by_phase(ue: Qwen3_5_2b_UnifiedEngine, T: int) -> dict:
     """Analytical FLOP count for one forward pass of `T` tokens on Qwen3.5-2B
     LM.  FP4 / BF16 matmuls count 2 FLOPs per MAC (1 mul + 1 add); rms_norm
     counts ~4·N FLOPs per row (sum-of-squares + rsqrt + normalize + gamma).
@@ -5184,6 +5377,7 @@ def _theoretical_flops_per_step(ue: Qwen3_5_2b_UnifiedEngine, T: int) -> int:
     flops_full += rms(T * num_kv, full_head_d)               # k_norm
     # flash attention per head: Q·Kᵀ (2·T_aligned²·head_dim) + softmax (small) + attn·V
     flops_full += num_q * (4 * T_aligned * T_aligned * full_head_d + 5 * T_aligned * T_aligned)
+    flops_full += num_q * mm(T, full_head_d, full_head_d)   # sigmoid-via-eye matmuls
     flops_full += T * q_size_flat                            # sigmoid(gate) × attn
     flops_full += mm(T, q_size_flat, H)                      # O proj (FP4)
     flops_full += T * H                                      # residual add
@@ -5199,7 +5393,76 @@ def _theoretical_flops_per_step(ue: Qwen3_5_2b_UnifiedEngine, T: int) -> int:
 
     n_lin = len(ue.linear_attn_layers)
     n_full = len(ue.full_attn_layers)
-    return n_lin * flops_lin + n_full * flops_full + flops_tail
+    return {
+        "linear_attention_layer": n_lin * flops_lin,
+        "full_attention_layer": n_full * flops_full,
+        "output_norm_lm_head": flops_tail,
+    }
+
+
+def _theoretical_flops_by_substep(ue: Qwen3_5_2b_UnifiedEngine, T: int) -> dict:
+    """Per-major-op issued FLOPs for ONE linear-attn layer and ONE full-attn
+    layer, keyed by the checkpoint-step name the two layer emitters record
+    (``lin_*`` / ``full_*``).  The buckets partition exactly the same work as
+    :func:`_theoretical_flops_by_phase` (their per-layer sums equal ``flops_lin``
+    / ``flops_full`` there), so the finer breakdown reconciles with the coarse
+    totals.  Matmul FLOPs count 2/MAC; rms ~4·N/row; flash attention uses
+    ``T_aligned`` (the full cache region, early positions bias-masked).  The
+    ``*_cache_write`` step is pure DMA and carries 0 FLOPs by design."""
+    H            = ue.hidden_size
+    conv_dim     = ue.lin_conv_dim
+    value_dim    = ue.lin_value_dim
+    num_vh       = ue.lin_num_v_heads
+    Dk           = ue.lin_head_k_dim
+    Dv           = ue.lin_head_v_dim
+    mlp_dim      = ue.mlp_dim
+    full_head_d  = ue.full_head_dim
+    num_q        = ue.full_num_heads
+    num_kv       = ue.full_num_kv_heads
+    q_proj_out   = 2 * num_q * full_head_d
+    kv_size      = num_kv * full_head_d
+    q_size_flat  = num_q * full_head_d
+    T_aligned    = ue.max_context_aligned
+
+    def rms(T_, N): return 4 * T_ * N
+    def mm(T_, K, N): return 2 * T_ * K * N
+
+    rec_per_head = 4 * Dk * Dv + 4 * Dk * Dv  # recurrence: matvecs + outer + sum
+
+    lin = {
+        "lin_pre_norm":          rms(T, H),
+        "lin_qkv_proj":          mm(T, H, conv_dim),
+        "lin_conv_silu":         2 * T * 4 * conv_dim + mm(T, conv_dim, conv_dim),
+        "lin_qk_norm_gates":     rms(T * num_vh, Dk) * 2 + mm(T, H, UE_VECTOR_SIZE) * 2
+                                 + mm(T, H, value_dim),
+        "lin_delta_rule":        T * num_vh * rec_per_head,
+        "lin_gated_out_proj":    rms(T * num_vh, Dv) + T * value_dim
+                                 + mm(T, value_dim, H) + T * H,
+        "lin_pre_ffn_norm":      rms(T, H),
+        "lin_mlp_gateup_mul":    mm(T, H, mlp_dim) * 2 + T * mlp_dim,
+        "lin_mlp_down_residual": mm(T, mlp_dim, H) + T * H,
+    }
+    full = {
+        "full_pre_norm":          rms(T, H),
+        "full_qkv_proj":          mm(T, H, q_proj_out) + mm(T, H, kv_size) * 2,
+        "full_qk_norm_rope":      rms(T * num_q, full_head_d) + rms(T * num_kv, full_head_d),
+        "full_kv_cache_write":    0,
+        "full_attention":         num_q * (4 * T_aligned * T_aligned * full_head_d
+                                           + 5 * T_aligned * T_aligned),
+        "full_o_proj_residual":   num_q * mm(T, full_head_d, full_head_d)
+                                  + T * q_size_flat + mm(T, q_size_flat, H) + T * H,
+        "full_pre_ffn_norm":      rms(T, H),
+        "full_mlp_gateup_mul":    mm(T, H, mlp_dim) * 2 + T * mlp_dim,
+        "full_mlp_down_residual": mm(T, mlp_dim, H) + T * H,
+    }
+    out = {}
+    out.update(lin)
+    out.update(full)
+    return out
+
+
+def _theoretical_flops_per_step(ue: Qwen3_5_2b_UnifiedEngine, T: int) -> int:
+    return sum(_theoretical_flops_by_phase(ue, T).values())
 
 
 def _tokenize_with_chat_template(tokenizer, prompt: str,

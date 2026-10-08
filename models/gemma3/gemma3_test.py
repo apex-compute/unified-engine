@@ -46,6 +46,7 @@ import time
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, calculate_snr
 from user_dma_core import UnifiedEngine
+from models.profile_report import aggregate_checkpoints, measurement, write_profile_markdown
 
 # Bank B follows 4096 BF16 rows; its byte base grows with the lane count.
 URAM_B_SCRATCH = 4096 * UE_VECTOR_SIZE * 2 + 0x10000
@@ -3118,7 +3119,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         print(f"\n--- Profiling: prefill (seq_len={prefill_seq_len}) ---")
         if prefill_checkpoints:
+            _pf_cpu_start = time.perf_counter()
             pf_order, pf_step_ms = self._profile_execute_folded(preamble_addr, prefill_checkpoints, folded_layers)
+            prefill_cpu_ms = (time.perf_counter() - _pf_cpu_start) * 1e3
             # The prefill program is compiled once at a template seq_len and replayed at the
             # run's seq_len via gpr_seq_len, so its compiled FLOPs describe the template, not
             # this run (run_gemma3_prefill rescales its total the same way).
@@ -3142,6 +3145,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         else:
             pf_order, pf_step_ms, pf_step_flops = [], {}, {}
             prefill_total_ms = 0.0
+            prefill_cpu_ms = 0.0
             print("  (no prefill checkpoints in meta — recompile with --profile to enable)")
 
         # --- Decoder preamble + inputs, run once per profiled token position ---
@@ -3188,8 +3192,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 # is safe -- no checkpoint falls between a flag_set and its matching
                 # flag_check, so the per-layer rendezvous stays intact.
                 self.shard_group.start_workers(aligned_seq_len=aligned)
+            _dec_cpu_start = time.perf_counter()
             order, step_ms = self._profile_execute_folded(
                 preamble_addr, decoder_checkpoints, folded_layers, tail_label="output_norm_lm_head")
+            cpu_ms = (time.perf_counter() - _dec_cpu_start) * 1e3
 
             # Decode FLOPs at the KV length this token actually ran at, not the compiled worst case.
             step_flops = _step_flops(decoder_checkpoints, folded_layers, aligned, _attn_aligned)
@@ -3205,11 +3211,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                                                  step_flops, peak_gflops,
                                                  sharded_steps=sharded_steps,
                                                  peak_1core=peak_gflops)
-            return order, step_ms, step_flops, aligned, total_ms
+            return order, step_ms, step_flops, aligned, total_ms, cpu_ms
 
         self._zero_kv_cache(start_token=prefill_seq_len)
         first_pos = prefill_seq_len + 1
-        order, step_ms, dec_step_flops, aligned_dec, decoder_total_ms = _profile_decode_at(
+        order, step_ms, dec_step_flops, aligned_dec, decoder_total_ms, decoder_cpu_ms = _profile_decode_at(
             first_pos, "first token")
 
         # Second decode pass at a long context: the same folded decoder body, entered at token
@@ -3218,10 +3224,12 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         long_result = None
         if long_pos > first_pos:
             (long_order, long_step_ms, long_step_flops,
-             long_aligned, long_total_ms) = _profile_decode_at(long_pos, f"token {long_pos}")
+             long_aligned, long_total_ms, long_cpu_ms) = _profile_decode_at(
+                 long_pos, f"token {long_pos}")
             long_result = {
                 "decoder_long_pos": long_pos,
                 "decoder_long_total_ms": long_total_ms,
+                "decoder_long_cpu_ms": long_cpu_ms,
                 "decoder_long_steps": [[n, long_step_ms[n], long_step_flops.get(n, 0.0)]
                                        for n in long_order],
                 "decoder_long_aligned_kv": long_aligned,
@@ -3239,8 +3247,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "decoder_size_kb": round(meta["decoder_program_size"] / 1024, 1),
             "prefill_tokens": prefill_seq_len,
             "prefill_total_ms": prefill_total_ms,
+            "prefill_cpu_ms": prefill_cpu_ms,
             "prefill_steps": [[n, pf_step_ms[n], pf_step_flops.get(n, 0.0)] for n in pf_order],
             "decoder_total_ms": decoder_total_ms,
+            "decoder_cpu_ms": decoder_cpu_ms,
             "decoder_steps": [[n, step_ms[n], dec_step_flops.get(n, 0.0)] for n in order],
             "decoder_aligned_kv": aligned_dec,
             # Steps that ran on every engine at once; the summary scores only these against
@@ -4030,7 +4040,78 @@ def main():
         profile_result = ue.run_gemma3_profile()
         _summary_path = os.path.join(SCRIPT_DIR, gemma3_run_summary_filename(args, parser))
         try:
-            ue.write_profile_summary(_summary_path, args, profile_result, cores=args.multi_core)
+            _peak = (user_dma_core.configured_hardware_info().frequency_mhz
+                     * 0.128 * args.multi_core)
+
+            def _profile_rows(items, attention_ratio=1.0):
+                return aggregate_checkpoints(({
+                    "name": name, "hw_ms": ms,
+                    "issued_flops": flops,
+                    "effective_flops": (flops * attention_ratio
+                                        if name == "attention" else flops),
+                } for name, ms, flops in items), peak_gflops=_peak)
+
+            _pf_align = ((profile_result["prefill_tokens"] + UE_VECTOR_SIZE - 1)
+                         // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
+            _first_pos = profile_result["prefill_tokens"] + 1
+            _pf_rows = _profile_rows(
+                profile_result["prefill_steps"],
+                profile_result["prefill_tokens"] / _pf_align)
+            _first_rows = _profile_rows(
+                profile_result["decoder_steps"],
+                _first_pos / profile_result["decoder_aligned_kv"])
+            _long_rows = _profile_rows(
+                profile_result.get("decoder_long_steps", []),
+                (profile_result.get("decoder_long_pos", 0)
+                 / profile_result.get("decoder_long_aligned_kv", 1)))
+            _pf_flops = sum(row.get("issued_flops") or 0 for row in _pf_rows)
+            _first_flops = sum(row.get("issued_flops") or 0 for row in _first_rows)
+            _long_flops = sum(row.get("issued_flops") or 0 for row in _long_rows)
+            _pf_effective = sum(row.get("effective_flops") or 0 for row in _pf_rows)
+            _first_effective = sum(row.get("effective_flops") or 0 for row in _first_rows)
+            _long_effective = sum(row.get("effective_flops") or 0 for row in _long_rows)
+            _overall = [
+                measurement(label="Prefill", tokens=profile_result["prefill_tokens"],
+                            hw_ms=profile_result["prefill_total_ms"],
+                            cpu_ms=profile_result["prefill_cpu_ms"],
+                            issued_flops=_pf_flops, effective_flops=_pf_effective,
+                            peak_gflops=_peak),
+                measurement(label="Decode first token", tokens=1, position=_first_pos,
+                            hw_ms=profile_result["decoder_total_ms"],
+                            cpu_ms=profile_result["decoder_cpu_ms"],
+                            issued_flops=_first_flops, effective_flops=_first_effective,
+                            peak_gflops=_peak),
+            ]
+            if _long_rows:
+                _overall.append(measurement(
+                    label="Decode large context", tokens=1,
+                    position=profile_result["decoder_long_pos"],
+                    hw_ms=profile_result["decoder_long_total_ms"],
+                    cpu_ms=profile_result["decoder_long_cpu_ms"],
+                    issued_flops=_long_flops, effective_flops=_long_effective,
+                    peak_gflops=_peak))
+            _hw = user_dma_core.configured_hardware_info()
+            write_profile_markdown(
+                _summary_path, title="Gemma3-1B profile summary",
+                hardware={
+                    "HW info": user_dma_core.hardware_info_summary(),
+                    "DMA device": args.dev,
+                    "Clock": f"{_hw.frequency_mhz:.2f} MHz",
+                    "AXI width": f"{user_dma_core.UE_AXI_DATA_WIDTH_BITS} bit",
+                    "Engines": args.multi_core,
+                    "Peak throughput": f"{_peak:.2f} GFLOPS",
+                    "Prefill kernel": "matmatmul" if args.two_pass_prefill else "streaming",
+                    "Decode kernel": "matmatmul" if args.matmatmul else "streaming",
+                },
+                overall=_overall,
+                breakdowns=[
+                    ("Prefill major-step breakdown", _pf_rows),
+                    ("Decode first-token breakdown", _first_rows),
+                    ("Decode large-context breakdown", _long_rows),
+                ],
+                notes=["Effective attention FLOPs exclude 64-lane KV padding; other "
+                       "major steps currently have identical issued and effective counts."],
+            )
             print(f"Wrote profile summary: {_summary_path}")
         except Exception as _e:
             print(f"[warn] failed to write profile summary: {_e}")

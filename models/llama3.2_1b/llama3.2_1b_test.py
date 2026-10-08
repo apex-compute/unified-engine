@@ -59,6 +59,7 @@ from user_dma_core import UnifiedEngine
 URAM_B_SCRATCH = 4096 * UE_VECTOR_SIZE * 2 + 0x10000
 # Canonical, HW-aligned 4-bit codec shared across all model templates.
 from quant_lib import quantize_if4
+from models.profile_report import aggregate_checkpoints, measurement, write_profile_markdown
 
 # Map the config's quantization variant string to quantize_if4's int_variant arg.
 # "int" -> pure INT4, "fp" -> pure FP4, "mix"/"mixmse" -> per-block min-MSE.
@@ -798,12 +799,16 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         checkpoints: list[list] = []
+        _checkpoint_flops = 0
 
         def _checkpoint(name: str) -> None:
+            nonlocal _checkpoint_flops
             self.generate_instruction_halt()
             self.pad_capture_to_64b_boundary()
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
-            checkpoints.append([name, f"0x{resume:X}"])
+            checkpoints.append([name, f"0x{resume:X}",
+                                int(total_flops - _checkpoint_flops)])
+            _checkpoint_flops = total_flops
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -1180,12 +1185,16 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         total_flops = 0
         decoder_aligned_seq_len = ((self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         checkpoints: list[list] = []
+        _checkpoint_flops = 0
 
         def _checkpoint(name: str) -> None:
+            nonlocal _checkpoint_flops
             self.generate_instruction_halt()
             self.pad_capture_to_64b_boundary()
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
-            checkpoints.append([name, f"0x{resume:X}"])
+            checkpoints.append([name, f"0x{resume:X}",
+                                int(total_flops - _checkpoint_flops)])
+            _checkpoint_flops = total_flops
 
         def decoder_projection_core(K: int, N: int, **kwargs) -> int:
             """Dispatch every decoder projection through the selected kernel.
@@ -2115,27 +2124,34 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         return out_path
 
     def _profile_execute(self, preamble_addr: int, checkpoints: list,
-                         tail_label: str | None = None, timeout: float = 30.0) -> tuple[list, dict]:
+                         tail_label: str | None = None, tail_flops: int | None = None,
+                         timeout: float = 30.0) -> tuple[list, float]:
         """Walk an unrolled program through its per-layer HALT checkpoints, summing each step's HW
         latency across all layers. Checkpoint names carry an ``L<idx>_`` prefix that is stripped so
         the per-layer HALTs roll up by step type. The post-loop fall-through segment (final norm +
         LM head for decode; the terminating HALT for prefill) is always drained and recorded under
         ``tail_label`` when one is given. Returns ``(ordered_step_names, {step: summed_ms})``.
         """
-        from collections import OrderedDict
-        step_ms: "OrderedDict[str, float]" = OrderedDict()
+        samples = []
+        cpu_start = time.perf_counter()
         self.start_execute_from_dram(preamble_addr)
-        for name, resume_addr_hex in checkpoints:
+        for checkpoint in checkpoints:
+            name, resume_addr_hex = checkpoint[:2]
+            issued_flops = checkpoint[2] if len(checkpoint) > 2 else None
             self.wait_queue(timeout)
             step = name.split("_", 1)[1] if name.startswith("L") and "_" in name else name
-            step_ms[step] = step_ms.get(step, 0.0) + self.report_latency_in_us() / 1e3
+            samples.append({"name": step, "hw_ms": self.report_latency_in_us() / 1e3,
+                            "issued_flops": issued_flops,
+                            "effective_flops": issued_flops})
             self.start_execute_from_dram(int(resume_addr_hex, 16))
         # Drain the post-loop fall-through (final norm + LM head for decode; bare HALT for prefill).
         self.wait_queue(timeout)
         tail_ms = self.report_latency_in_us() / 1e3
         if tail_label is not None:
-            step_ms[tail_label] = tail_ms
-        return list(step_ms.keys()), step_ms
+            samples.append({"name": tail_label, "hw_ms": tail_ms,
+                            "issued_flops": tail_flops,
+                            "effective_flops": tail_flops})
+        return samples, (time.perf_counter() - cpu_start) * 1e3
 
     @staticmethod
     def _print_profile_table(title: str, order: list, step_ms: dict) -> float:
@@ -2156,7 +2172,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         _original_print(f"{'Total':<38} {total_ms:>9.3f}  100.0%")
         return total_ms
 
-    def run_llama_profile(self) -> None:
+    def run_llama_profile(self) -> dict:
         """Load the profile instruction image and print ONE per-step table for prefill and ONE for
         the first decoded token. Each program is walked through its per-layer HALT checkpoints and
         each step is summed across all layers (:meth:`_profile_execute`), so the tables are per-step
@@ -2178,6 +2194,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
         prefill_checkpoints  = meta.get("prefill_profile_checkpoints", [])
         decoder_checkpoints  = meta.get("decoder_profile_checkpoints", [])
+        peak_gflops = user_dma_core.configured_hardware_info().frequency_mhz * 0.128
         _kv_stride = self.attention_head_dim * self.bytes_per_element
         _rope_row  = self.head_dim * 2 * self.bytes_per_element
 
@@ -2227,10 +2244,21 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         _SILENT_MODE = True
         _original_print(f"\n--- Profiling: prefill (seq_len={prefill_seq_len}) ---")
         if prefill_checkpoints:
-            order, step_ms = self._profile_execute(preamble_addr, prefill_checkpoints)
-            prefill_total_ms = self._print_profile_table(f"Prefill  (seq_len={prefill_seq_len})", order, step_ms)
+            prefill_samples, prefill_cpu_ms = self._profile_execute(
+                preamble_addr, prefill_checkpoints)
+            for sample in prefill_samples:
+                if sample["name"] == "attention" and aligned_seq_len:
+                    sample["effective_flops"] = int(
+                        (sample["issued_flops"] or 0)
+                        * prefill_seq_len / aligned_seq_len)
+            prefill_rows = aggregate_checkpoints(prefill_samples, peak_gflops=peak_gflops)
+            step_ms = {row["label"]: row["hw_ms"] for row in prefill_rows}
+            prefill_total_ms = self._print_profile_table(
+                f"Prefill  (seq_len={prefill_seq_len})", list(step_ms), step_ms)
         else:
             prefill_total_ms = 0.0
+            prefill_cpu_ms = 0.0
+            prefill_rows = []
             _original_print("  (no prefill checkpoints in meta — recompile with --profile to enable)")
 
         # --- Decoder preamble + inputs for the first decoded token (mirrors run_llama) ---
@@ -2248,6 +2276,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         self.clear_inst_id()
         self.start_capture()
+        self.generate_instruction_add_set(self.gpr_seq_len, self.seq_len)
         self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
         self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_dec)
         self.generate_instruction_add_set(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(decode_pos * _kv_stride))
@@ -2258,27 +2287,98 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.clear_capture_buffer()
 
         _original_print("\n--- Profiling: decoder (first decoded token) ---")
-        order, step_ms = self._profile_execute(
-            preamble_addr, decoder_checkpoints, tail_label="output_norm_lm_head")
-        decoder_total_ms = self._print_profile_table("Decoder  (first token)", order, step_ms)
+        decoder_tail_flops = max(
+            int(meta["decoder_total_flops"])
+            - sum(int(cp[2]) for cp in decoder_checkpoints if len(cp) > 2), 0)
+        decoder_samples, decoder_cpu_ms = self._profile_execute(
+            preamble_addr, decoder_checkpoints, tail_label="output_norm_lm_head",
+            tail_flops=decoder_tail_flops)
+        decoder_static_aligned = (
+            (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+            * UE_VECTOR_SIZE)
+        for sample in decoder_samples:
+            if sample["name"] == "attention":
+                sample["issued_flops"] = int(
+                    (sample["issued_flops"] or 0) * aligned_dec
+                    / decoder_static_aligned)
+                sample["effective_flops"] = int(
+                    sample["issued_flops"] * self.seq_len / aligned_dec)
+        decoder_rows = aggregate_checkpoints(decoder_samples, peak_gflops=peak_gflops)
+        step_ms = {row["label"]: row["hw_ms"] for row in decoder_rows}
+        decoder_total_ms = self._print_profile_table(
+            "Decoder  (first token)", list(step_ms), step_ms)
+
+        # Timing-only large-context probe. The program is position agnostic;
+        # stale cache values do not change its instruction or memory workload.
+        large_ctx = self.MAX_CONTEXT_SIZE
+        large_pos = large_ctx - 1
+        large_aligned = ((large_ctx + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+        self.dma_to_accelerator_memory(
+            self.LAYER0_FLASH_BIAS_DRAM,
+            torch.zeros((self.group_size, large_aligned), dtype=torch.bfloat16))
+        self.clear_inst_id()
+        self.start_capture()
+        self.generate_instruction_add_set(self.gpr_seq_len, large_ctx)
+        self.generate_instruction_add_set(self.gpr_bucket_idx, large_aligned // UE_VECTOR_SIZE)
+        self.generate_instruction_add_set(self.gpr_aligned_seq_len, large_aligned)
+        self.generate_instruction_add_set(
+            self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(large_pos * _kv_stride))
+        self.generate_instruction_add_set(
+            self.ROPE_SIZE_REG, ue_35bit_addr_shifter(large_pos * _rope_row))
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
+        self.stop_capture()
+        self.write_captured_instructions_to_dram(preamble_addr)
+        self.clear_capture_buffer()
+        _original_print(f"\n--- Profiling: decoder (large context position {large_pos}) ---")
+        large_samples, large_cpu_ms = self._profile_execute(
+            preamble_addr, decoder_checkpoints, tail_label="output_norm_lm_head",
+            tail_flops=decoder_tail_flops)
+        for sample in large_samples:
+            if sample["name"] == "attention":
+                sample["issued_flops"] = int(
+                    (sample["issued_flops"] or 0) * large_aligned
+                    / decoder_static_aligned)
+                sample["effective_flops"] = int(
+                    sample["issued_flops"] * large_ctx / large_aligned)
+        large_rows = aggregate_checkpoints(large_samples, peak_gflops=peak_gflops)
+        step_ms = {row["label"]: row["hw_ms"] for row in large_rows}
+        large_total_ms = self._print_profile_table(
+            f"Decoder  (position {large_pos})", list(step_ms), step_ms)
         _SILENT_MODE = False
 
         if prefill_total_ms > 0:
             _original_print(f"\nPrefill (HW): {prefill_total_ms:.2f} ms  ({prefill_seq_len} tokens)")
         _original_print(f"Decode  (HW): {decoder_total_ms:.2f} ms/tok  ({1000/decoder_total_ms:.2f} tok/s)")
+        return {
+            "peak_gflops": peak_gflops,
+            "prefill_seq_len": prefill_seq_len,
+            "prefill_hw_ms": prefill_total_ms,
+            "prefill_cpu_ms": prefill_cpu_ms,
+            "prefill_rows": prefill_rows,
+            "first_position": decode_pos,
+            "first_hw_ms": decoder_total_ms,
+            "first_cpu_ms": decoder_cpu_ms,
+            "first_rows": decoder_rows,
+            "large_position": large_pos,
+            "large_hw_ms": large_total_ms,
+            "large_cpu_ms": large_cpu_ms,
+            "large_rows": large_rows,
+            "prefill_issued_flops": sum(row.get("issued_flops") or 0 for row in prefill_rows),
+            "decoder_issued_flops": int(meta["decoder_total_flops"]),
+        }
 
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def llama_run_summary_filename(args, prefix: str = "llama3.2_1b_test") -> str:
     """Per-run summary .md filename encoding the CLI config, e.g.
-    ``llama3.2_1b_test_xdma1_kintex7.md`` or ``..._xdma0_alveo_puregreedy.md``.
-    dev and HW_INFO are present when available; other knobs are appended only when non-default."""
+    ``llama3.2_1b_test_xdma1.md`` or ``..._xdma0_puregreedy.md``.
+    dev is always present; other knobs are appended only when non-default."""
     tokens = [args.dev]
-    if user_dma_core.HW_INFO_RAW is not None:
-        tokens.append(f"hw{user_dma_core.HW_INFO_RAW:08x}")
     if getattr(args, "multi_core", 1) and args.multi_core > 1:
         tokens.append(f"multi-core-{args.multi_core}")
+    if getattr(args, "profile", False):
+        tokens.append("profile")
     if getattr(args, "pure_greedy", False):
         tokens.append("puregreedy")
     if getattr(args, "prefill_kernel", None) == "matmatmul":
@@ -2441,7 +2541,51 @@ def main():
         ue.compile_llama(profile=True)
         print(f"Compile done in {time.perf_counter() - timer:.2f}s")
         print("\n--- Running profile ---")
-        ue.run_llama_profile()
+        profile_result = ue.run_llama_profile()
+        peak = profile_result["peak_gflops"]
+        pf_flops = profile_result["prefill_issued_flops"]
+        dec_flops = profile_result["decoder_issued_flops"]
+        overall = [
+            measurement(label="Prefill", tokens=profile_result["prefill_seq_len"],
+                        hw_ms=profile_result["prefill_hw_ms"],
+                        cpu_ms=profile_result["prefill_cpu_ms"],
+                        issued_flops=pf_flops, effective_flops=pf_flops,
+                        peak_gflops=peak),
+            measurement(label="Decode first token", position=profile_result["first_position"],
+                        tokens=1, hw_ms=profile_result["first_hw_ms"],
+                        cpu_ms=profile_result["first_cpu_ms"],
+                        issued_flops=dec_flops, effective_flops=dec_flops,
+                        peak_gflops=peak),
+            measurement(label="Decode large context", position=profile_result["large_position"],
+                        tokens=1, hw_ms=profile_result["large_hw_ms"],
+                        cpu_ms=profile_result["large_cpu_ms"],
+                        issued_flops=dec_flops, effective_flops=dec_flops,
+                        peak_gflops=peak),
+        ]
+        hw = user_dma_core.configured_hardware_info()
+        summary_path = os.path.join(SCRIPT_DIR, llama_run_summary_filename(args))
+        write_profile_markdown(
+            summary_path, title="Llama-3.2-1B profile summary",
+            hardware={
+                "HW info": user_dma_core.hardware_info_summary(),
+                "DMA device": args.dev,
+                "Clock": f"{hw.frequency_mhz:.2f} MHz",
+                "AXI width": f"{user_dma_core.UE_AXI_DATA_WIDTH_BITS} bit",
+                "Engines": args.multi_core,
+                "Peak throughput": f"{peak:.2f} GFLOPS",
+                "Prefill kernel": prefill_kernel,
+                "Decode kernel": decode_kernel,
+            },
+            overall=overall,
+            breakdowns=[
+                ("Prefill major-step breakdown", profile_result["prefill_rows"]),
+                ("Decode first-token breakdown", profile_result["first_rows"]),
+                ("Decode large-context breakdown", profile_result["large_rows"]),
+            ],
+            notes=["Effective attention FLOPs exclude 64-lane KV padding; other "
+                   "major steps currently have identical issued and effective counts."],
+        )
+        print(f"Wrote profile summary: {summary_path}")
         print("Decoder/prefill profile done.")
         return
 
