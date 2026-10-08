@@ -15,6 +15,7 @@ import math
 import os
 import sys
 import random
+from typing import Optional
 from re import S
 import time
 import threading
@@ -33,13 +34,22 @@ from user_dma_core import (
     DMA_DEVICE_C2H,
     DMA_DEVICE_H2C,
     DMA_DEVICE_USER,
+    CONV_GEOMETRY_LIVE_CSR,
+    CONV_GEOMETRY_QUEUE_CONFIG,
+    INSTRUCTION_CONFIG,
     DRAM_ACTIVATION_ADDR,
     INSTRUCTION_REG_ALU_NONPREFETCH,
+    BROADCAST_MODE,
+    INSTRUCTION_PBI_SET,
+    INSTRUCTION_UE_PBI,
     INSTRUCTION_SIZE_BYTES,
     INT_CAUSE_HALT,
     INT_CAUSE_NONE,
     INT_CAUSE_SWI,
     LALU_MODE,
+    MEMCPY_TYPE,
+    PBI_FIELD,
+    PBI_MODE_REG,
     REGFILE_R1_LOOP,
     TYPE,
     UE_MODE,
@@ -53,6 +63,29 @@ from user_dma_core import (
     URAM_WRITE_SRC,
     WB_PADDING_ZERO,
     calculate_snr,
+    conv2d_pack_activation_map,
+    conv2d_pack_weight_stream,
+    conv2d_pack_scale_stream,
+    conv2d_pack_bias_stream,
+    conv2d_unpack_result,
+    maxpool2d_unpack_result,
+    group_norm_cancellation_ratio,
+    group_norm_ref,
+    nn_upsample_2x_ref,
+    nn_upsample_2x_simulate,
+    nn_upsample_2x_unpack_result,
+    nn_upsample_conv3x3_fold,
+    nn_upsample_conv3x3_fold_fits,
+    nn_upsample_conv3x3_ref,
+    silu_mul_add_ref,
+    vae_attention_block_ref,
+    vae_decoder_plan,
+    plan_group_norm,
+    plan_nn_upsample_2x,
+    ue_assert_stride_fields_fit,
+    UE_STRIDE_CHUNK_MAX_BYTES,
+    UE_STRIDE_JUMP_MAX_BYTES,
+    URAM_NEAR_FULL_SIZE,
     set_dma_device,
     UnifiedEngine,
     UE_FMAX_CONTEXT_SIZE,
@@ -202,7 +235,7 @@ def _rng_aligned_randn_2d(rows: int, active_cols: int, max_cols: int, *, dtype=t
 
 
 def record_test(name: str, dims: str = "", snr_db=None, gflops=None, mb_per_s=None, inst_bytes=None,
-                merge_metric_cols: bool = False) -> None:
+                merge_metric_cols: bool = False, cycles=None) -> None:
     TEST_RESULTS.append({
         "name": f"{name}{_TEST_NAME_SUFFIX}",
         "dims": dims,
@@ -210,11 +243,11 @@ def record_test(name: str, dims: str = "", snr_db=None, gflops=None, mb_per_s=No
         "gflops": gflops,
         "mb_per_s": mb_per_s,
         "inst_bytes": inst_bytes,
+        "cycles": cycles,
         "pair_id": _CURRENT_PAIR_ID,
-        # RNG state AFTER this test's draws, so the first row whose fingerprint
-        # differs between two runs is the first test that consumed the stream
-        # differently -- that test is the culprit, not a victim of an earlier
-        # one. Only meaningful compared against the same column of another run.
+        # RNG state AFTER this test's draws. A mismatch can originate in this
+        # test or in an earlier added/skipped test; compare matching rows and
+        # suite order before attributing a difference to a particular test.
         "rng": _rng_state_fingerprint(digest_len=6),
         # End-to-end model rows: fold the (n/a) SNR/GFLOPS/MB-s columns into the
         # Dimensions cell in the summary table (see write_test_summary).
@@ -299,6 +332,7 @@ def write_test_summary(path: str = "user_hw_test_summary.md") -> None:
         "GFLOPS",
         "MB/s",
         "Inst Bytes",
+        "Cycles",
         "SNR diff",
         "GFLOPS diff",
         "RNG",
@@ -319,6 +353,7 @@ def write_test_summary(path: str = "user_hw_test_summary.md") -> None:
             _fmt_metric(r["gflops"], "{:.2f}"),
             _fmt_metric(r["mb_per_s"], "{:.2f}"),
             _fmt_metric(r["inst_bytes"], "{:.0f}"),
+            _fmt_metric(r.get("cycles"), "{:.0f}"),
             _snr_delta(leg["snr_db"], r["snr_db"])    if leg is not None else "",
             _gflops_delta(leg["gflops"], r["gflops"]) if leg is not None else "",
             r.get("rng", ""),
@@ -2673,14 +2708,15 @@ def patching_test():
     ue.generate_instruction_halt()
     program_dram_addr = ue.get_program_dram_addr()
     ue.write_captured_instructions_to_dram(program_dram_addr)
-    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.allocate_program_dram(inst_bytes)
 
     a = torch.randn(C, H, W, dtype=torch.bfloat16)
     ue.dma_to_accelerator_memory(INPUT_DRAM_ADDR, a)
 
     ue.start_execute_from_dram(program_dram_addr)
     ue.wait_queue(10.0)
-    ue.report_timing_and_instruction_count()
+    cycles, _ = ue.report_timing_and_instruction_count()
 
     output = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (96 * 96, N))
 
@@ -2692,12 +2728,13 @@ def patching_test():
            .reshape(-1, 48)
 
     snr_db = calculate_snr(ref[:, :48].flatten(), output[:, :48].flatten())
-    print(f"Patching core SNR Analysis: {snr_db:.2f} dB")
+    print(f"Patching core SNR Analysis: {snr_db:.2f} dB "
+          f"({cycles} cycles, {inst_bytes} inst bytes)")
     assert snr_db >= 40 or snr_db == float('inf'), f"SNR {snr_db:.2f} dB must be at least 40 dB"
 
     record_test("patching",
                 f"C={C} H={H} W={W} patch={patch_h}x{patch_w} K={K} N={N}",
-                snr_db=snr_db)
+                snr_db=snr_db, inst_bytes=inst_bytes, cycles=cycles)
 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
@@ -3900,19 +3937,11 @@ def if4_if8_dot_product_test(K: int = 64, N: int = 64):
     the bf20 adder-tree accumulation in the dot product, which is what
     we want to exercise.
 
-    IF8 (both FP and INT) at multi-block K (K >= 128) is currently skipped.
-    End-to-end runs at K=128 N=128 produced near-zero SNR for both IF8-FP
-    and IF8-INT, while IF4-FP, IF4-INT (and TQ4 via tq4_dot_product_test)
-    all pass at the same K=128 N=128 dimensions. The C-side coverage in
-    Vitis/common/src/andromeda.c only validates IF8-FP at M=1, N=128
-    (a single output row, so the multi-block-K wrap of URAM-A is not
-    exercised) and IF8-INT large cases only check latency (not output
-    values), so the multi-block-K IF8 dot-product path with N > 1 is
-    unvalidated upstream of this test. The IF4 path uses 1 DMA beat per
-    block; IF8 uses 2 beats per block (int8_data_handler.sv), which is
-    the only obvious structural difference between the working IF4 path
-    and the failing IF8 path - the most likely locus of the bug. Needs
-    HW investigation; until then the IF8 coverage here uses K=64 only.
+    Multi-block IF8 is intentionally exercised at K=128 and K=256. The RTL
+    self-test ``dot_product_if8_multiblock`` independently covers K=128,
+    N=128 with distinct values in both K blocks, guarding the two-beat IF8
+    X-stream phase and row/block address wrap. These hardware runs remain the
+    bitstream-level check for both the FP and INT scale-sign variants.
     """
     from user_dma_core import DMA_DEVICE_H2C, LALU_MODE
 
@@ -3968,7 +3997,7 @@ def if4_if8_dot_product_test(K: int = 64, N: int = 64):
         -256.0, -288.0, -320.0, -352.0, -384.0, -416.0, -448.0, -math.nan,
     ]).to(torch.bfloat16)
 
-    # (label, hw data_type, scale_value, value_table, num_codes, max_K)
+    # (label, hw data_type, scale_value, value_table, num_codes)
     # Sign of scale is the per-block FP-vs-INT variant select.
     # Bound IF8 code ranges so the K-wide dot-product stays well inside
     # bf16 dynamic range: full INT8 (up to +/-128) and FP8 E4M3 (up to
@@ -3977,14 +4006,11 @@ def if4_if8_dot_product_test(K: int = 64, N: int = 64):
     # half of each table keeps the geometry meaningful while still hitting
     # both signs and a wide magnitude range. Drops the +/-NaN entries at
     # 0x7F / 0xFF from the FP8 sweep.
-    # ``max_K``: skip the variant entirely when the call's K exceeds this.
-    # Both IF8 variants produce near-zero SNR at K >= 128 on the current
-    # HW build (see the docstring); skip rather than masking the failure.
     configs = [
-        ("IF4-FP",  TYPE.IF4, +1.0, NVFP4_TABLE,        16, None),
-        ("IF4-INT", TYPE.IF4, -1.0, INT4_TABLE,         16, None),
-        ("IF8-FP",  TYPE.IF8, +1.0, FP8_E4M3FN_TABLE,   256, 256),
-        ("IF8-INT", TYPE.IF8, -1.0, INT8_TABLE,         256, 256),
+        ("IF4-FP",  TYPE.IF4, +1.0, NVFP4_TABLE,        16),
+        ("IF4-INT", TYPE.IF4, -1.0, INT4_TABLE,         16),
+        ("IF8-FP",  TYPE.IF8, +1.0, FP8_E4M3FN_TABLE,   256),
+        ("IF8-INT", TYPE.IF8, -1.0, INT8_TABLE,         256),
     ]
 
     blocks_per_row = K // UE_VECTOR_SIZE
@@ -3992,10 +4018,7 @@ def if4_if8_dot_product_test(K: int = 64, N: int = 64):
 
     assert N == K, "We need identity to cover all values in the codebook for a meaningful SNR test"
 
-    for label, data_type, scale_value, value_table, num_codes, max_K in configs:
-        if max_K is not None and K > max_K:
-            print(f"IF4/IF8 Dot Product ({label}) skipped at K={K} > max_K={max_K}")
-            continue
+    for label, data_type, scale_value, value_table, num_codes in configs:
         ue = UnifiedEngine()
 
         scales_bf16 = torch.full((num_blocks,), scale_value, dtype=torch.bfloat16)
@@ -4195,6 +4218,2275 @@ def dequantize_test(data_type=TYPE.IF4, int_variant: bool = True):
 
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
+
+# ---------------------------------------------------------------------------
+# CONV2D / MAXPOOL instruction tests vs PyTorch (bit-exact).
+#
+# The CONV2D (mode 0xE) / MAXPOOL (mode 0x3) instructions map convolution onto
+# the 64-lane dot-product engine: input channels in the URAM lanes, kernel taps
+# on the BF20 accumulator iterations, output channels on the re-streamed
+# quantized X-stream (window replayed per oc). See
+# Vivado/doc/convolution_architecture.md and ue_conv2d()/ue_maxpool2d() in
+# Vitis/common/src/andromeda.c; the geometries below are URAM-sized tiles of
+# the same real-model layers the on-device C tests use (ResNet stem/body,
+# pointwise, AlexNet conv1, YOLO downsample + SPPF).
+#
+# Exactness argument (why torch.equal, not SNR, is the right check):
+#  - conv: activations and biases are small non-negative/small-signed integers
+#    and weights are IF4-INT codes with |scale| = 1.0, bounded so that every
+#    intermediate is an exactly-representable integer at every pipeline stage:
+#    per-64-lane tap dot products stay <= 2048 (BF19 adder tree, 10-bit
+#    mantissa -> integers exact to 2^11) and the window accumulation total
+#    stays <= 2048 (covers the BF20 accumulator and the BF19 bias/LALU legs).
+#    The single rounding step is the final BF19->BF16 convert, which is
+#    round-to-nearest-even — identical to torch's fp32->bf16 cast of the
+#    fp32-exact reference. So hardware and F.conv2d must agree bit-for-bit,
+#    with one IEEE caveat: the sign of zero. A zero activation lane times a
+#    negative weight is -0.0, and the engine can carry that signed zero to
+#    the writeback where fp32 accumulation folds to +0.0. -0.0 == +0.0, so
+#    both sides are canonicalized (_canonicalize_signed_zeros) before the
+#    uint16 bit compare.
+#  - maxpool: pure per-lane compare-select (no arithmetic), so ANY bf16
+#    payload must match F.max_pool2d bit-for-bit; padding is materialised as a
+#    0xFF80 (-inf) halo, matching max_pool2d's implicit -inf padding.
+#
+# Weights are IF4 only because the on-device C conv tests and production conv
+# packer currently target IF4. Multi-block IF8 X-stream phasing is covered by
+# the dedicated dot-product RTL and hardware tests above.
+#
+# Model-family coverage map (vision front ends, NCHW / PyTorch conv semantics):
+#   YOLO v8-v12 stem      Conv(3->64,  k3 s2 p1)          -> yolo_stem_3x3s2
+#   YOLO downsample       Conv(64+,    k3 s2 p1)          -> yolo_down_3x3s2 (CT=1),
+#                                                            yolo_ct2_3x3s2 (C_in=128, CT=2)
+#   YOLO regular          Conv(k3 s1 p1)                  -> resnet_3x3s1 / conv_bias_relu / conv_silu
+#   YOLO pointwise        Conv(k1 s1 p0)                  -> pointwise_1x1 (CT=1),
+#                                                            yolo_ct2_1x1 (C_in=128, add_itr=2)
+#   YOLO Conv+BN+SiLU     BN folds into scales/bias;      -> conv_silu_3x3s1 (SNR-gated:
+#                         SiLU = LALU ACT                    LALU sigmoid is approximate)
+#   YOLO SPPF             MaxPool(k5 s1 p2) x3 + concat   -> maxpool yolo_sppf_5x5s1p2 chain
+#                                                            (concat is host/memcpy, not compute)
+#   Swin/SwinV2 patch     Conv(3->96/128, k4 s4 p0)       -> swin_patch_4x4s4 (oc tile;
+#                                                            launch sits exactly at the
+#                                                            8192-block scale-BRAM cap)
+#   ViT-H/14, SmolVLM(2)  Conv(3->hidden, k14 s14 p0)     -> vit_patch_14x14s14
+#   ViT-B/16, SigLIP      Conv(3->768,  k16 s16 p0)       -> patch_embed_matmul k=16:
+#   ViT-B/32              Conv(3->768,  k32 s32 p0)       -> patch_embed_matmul k=32:
+#                         k=16/32 exceed the 4-bit Kh/Kw geometry fields
+#                         (uram_conv_addr_gen.sv K_WIDTH=4, kernels <= 15), and a
+#                         k=s non-overlapping patch conv IS a reshaped matmul, so
+#                         the deployment path is host im2col (F.unfold order) +
+#                         quantized_matmat_core — tested bit-exact vs F.conv2d.
+#   Whisper conv stem     Conv1d(80/128 mels -> d, 3, s1, p1) + GELU, then
+#                         Conv1d(d -> d, 3, s2, p1) + GELU. Conv1d = CONV2D
+#                         with H=1/Kh=1 (conv1d_core)   -> whisper_conv1_80mel
+#                                                          (CT=2, partial tile),
+#                                                          whisper_conv2_384ch
+#                                                          (CT=6 ct-inner walk),
+#                                                          whisper_conv_gelu
+#                                                          (GELU on LALU ACT,
+#                                                          SNR-gated)
+#   Rect / factorized     H != W input; 7x1 kernel      -> rect_input_3x3s1,
+#                                                          rect_kernel_7x1
+#   Dilated conv          k3 d2 p2 (DeepLab/TCN)        -> dilated_3x3d2
+#                         (dilation rides the kernel-step registers:
+#                         col_stride=d*CT, row_stride=d*W_pad*CT)
+#   SD/SDXL VAE           conv_in/ResNet k3 s1 p1 (see resnet_3x3s1 shape);
+#                         encoder downsample F.pad(0,1,0,1) + k3 s2 p0
+#                                                        -> sd_vae_down_3x3s2_asympad
+#                         (asymmetric pad is host-materialised — padding was
+#                         never a hardware input); decoder upsample =
+#                         nearest 2x (run_nn_upsample_2x, on-device strided
+#                         DMA -> nn_upsample_small, vae_up_64x64_512ch) +
+#                         k3 s1 p1 (same conv shape). DEPLOYMENT FORM for
+#                         [upsample -> conv] pairs is run_nn_upsample_conv3x3
+#                         (nn_upconv_small, nn_upconv_bias,
+#                         vae_up_conv_64x64): folds the pair into four parity
+#                         k2 sub-convs, 4/9 the MACs and the 2x map is never
+#                         built. Constraint: the fold sums up to 4 weight
+#                         codes, so INT4 needs unfolded codes in [-2, 1];
+#                         512-ch decoder convs = the CT=8 depth
+#                                                        -> wav2vec2_mid_512ch
+#                         mid-block AttnBlock -> run_vae_attention_block
+#                         (vae_attn_small, vae_attn_mid_256): pixels are the
+#                         sequence (seq=H*W, head_dim=C, single head). Needs
+#                         NO transpose kernel — for C % 64 == 0 the packed
+#                         conv map IS a row-major (H*W, C) matrix, which is
+#                         exactly the attention core's [batch, head_dim];
+#                         whole decoder -> vae_decoder_plan /
+#                         run_vae_decoder (sd_vae_decoder_512, a pure-host
+#                         structural test). ResnetBlock residual add runs
+#                         on-device via run_eltwise_add_layer. SiLU after each
+#                         GroupNorm runs via run_silu_layer: MAXPOOL over
+#                         interleaved [x,0] lines supplies the 64-lane sign
+#                         split, then wide EXP/mul/add/sub evaluate the stable
+#                         bounded-polynomial construction. The decoder plan
+#                         therefore has no host-side graph nodes.
+#   SD/SDXL UNet          ResNet k3 s1 p1 at 320..1280 ch; downsample k3 s2
+#                         p1; 1x1 proj convs. 1280 ch -> CT=20
+#                                                        -> sd_unet_ct20_3x3s1
+#                         (deterministic sparse acts for exactness); SiLU
+#                         epilogue = conv_silu test; conv_out k3 s1 p1 to 4 ch
+#   SD3/Flux/PixArt DiT   patchify Conv2d(4/16 -> hidden, 2, stride=2)
+#                                                        -> dit_patchify_2x2s2
+#   wav2vec2 / HuBERT     Conv1d(1->512, 10, s5) then k3 stacks at 512 ch
+#                                                        -> wav2vec2_conv0_1x10s5,
+#                                                           wav2vec2_mid_512ch_1x3s2
+#
+# Known out-of-scope (v1 hardware, per Vivado/doc/convolution_architecture.md):
+#   - depthwise conv (YOLOv10 SCDown, YOLOv12 7x7 DW, MobileNet/EfficientNet,
+#     ConvNeXt 7x7 DW, Conformer DW-Conv1d): needs the per-lane accumulator
+#     leg; explicitly a follow-on.
+#   - average pooling (Swin classifier head AdaptiveAvgPool): follow-on
+#     (conv accumulator + reciprocal-count scale).
+#   - Swin patch merging: not conv/pool — 2x2 strided gather (memcpy) +
+#     Linear 4C->2C (existing matmul path).
+#
+# Layer-level drivers (run_conv2d_layer / run_maxpool2d_layer /
+# run_conv_transpose2d_k4s2p1 in user_dma_core.py) make FULL-tensor layers
+# executable: single-launch caps (8192 scale-BRAM blocks, URAM tile budget,
+# 12-bit total-tap field for pooling) are handled by the tiling planner
+# (plan_conv2d_layer_tiles) with halo-overlapped windows and oc chunking.
+# Execution is ONE resident program per tile shape (_capture_conv2d_tile_loop:
+# PBI pointer inits + loop_start/loop_end around [PBI act load -> CONV2D ->
+# PBI writeback]), with bulk-staged windows and a bulk readback — the planner
+# emits an overlap-clamped UNIFORM grid (edge tiles shift to overlap instead
+# of shrinking; overlapped outputs are recomputed bit-identically), so every
+# layer is ALWAYS one capture + one program + one execute — the per-launch
+# UE_CONV_* geometry registers hold that single tile shape. Tested by
+# conv_layer_pytorch_tests:
+#   sd_resblock_32x32      k3 s1 p1, 32x32 out, 2 tiles in one PBI loop
+#   whisper_layer_T384     Conv1d time-tiled layer
+#   yolo_sppf_real_20x20   REAL SPPF size: 128 ch x 20x20 map -> 2 channel
+#                          tiles x 3 row chunks (k5 caps at 163 px/launch)
+#   unet_up_4x4s2p1        ConvTranspose2d(k4 s2 p1) (SAM/UNet/GAN 2x
+#                          upsampler) = 4 interleaved k2 s1 convs on
+#                          per-side-padded input, one shared geometry
+#   nn_upsample_small /    nearest-neighbour 2x upsample (VAE decoder / UNet
+#   vae_up_64x64_512ch     resize-conv) = 4 uniform strided DMA passes, no
+#                          compute unit — bit-exact vs F.interpolate
+#   gn_small / gn_no_affine  GroupNorm (VAE ResNetBlock + norm_out) = lane-wise
+#   vae_gn_mid_512 /         per-channel sum/sumsq accumulation (ELTWISE_ADD +
+#   vae_gn_up1_512           ELTWISE_MUL) -> host fold of group stats into a
+#                          per-channel (A, B) -> y = x*A + B. Channels-in-lanes
+#                          makes the per-channel affine an ordinary eltwise, so
+#                          NO group-planar repack is needed, and the group
+#                          reduction never forms a row (largest VAE group is 1M
+#                          elements, 4x the 262,080 single-row cap). SNR-gated;
+#                          accumulators flush every GROUP_NORM_MAX_ACC_DEPTH
+#                          chunks so accuracy is flat in tensor size.
+#   nn_upconv_small /      FUSED [nearest 2x upsample -> conv k3 s1 p1]
+#   nn_upconv_bias /       (run_nn_upsample_conv3x3) = four parity k2
+#   vae_up_conv_64x64      sub-convs on the ORIGINAL map. Each output parity
+#                          class reads only two distinct source pixels per
+#                          axis, so the k3 taps fold pairwise; 4/9 the MACs
+#                          and the 2x map is never materialised. Bit-exact vs
+#                          the unfused pair. The fold sums up to 4 codes, so
+#                          the tests also assert the driver REJECTS weights
+#                          that would overflow INT4 rather than wrapping.
+#   vae_attn_small /       VAE mid-block AttnBlock (run_vae_attention_block):
+#   vae_attn_seq256 /      GroupNorm -> 3x 1x1 conv -> unified attention over
+#   vae_attn_mid_real_4096 the pixel sequence -> 1x1 proj -> residual. Tests
+#                          the SEAM, not the arithmetic: the conv writeback is
+#                          already the attention core's [batch, head_dim]
+#                          layout, so no transpose kernel exists or is needed.
+#                          vae_attn_mid_real_4096 is the TRUE SD 512x512 shape
+#                          (seq=4096, head_dim=512) — 8x the longest sequence
+#                          any other attention test covers. The score matrix is
+#                          O(seq^2), so run_vae_attention_block refuses shapes
+#                          past VAE_ATTENTION_MAX_FOOTPRINT_MB (SDXL's
+#                          seq=16384 wants ~1.1 GB and needs a tiled attention).
+#   eltwise_add_small /    ResNetBlock residual add via run_eltwise_add_layer:
+#   vae_resid_512x512_128ch  full-tensor ELTWISE_ADD (already a 64-lane HW
+#                          mode) with both operands staged in OPPOSITE URAM
+#                          banks, multi-round. Bit-exact vs torch.
+#   sd_vae_decoder_512     Whole-decoder structural check (vae_decoder_plan).
+#                          PURE HOST — the only test in this file that runs
+#                          without a board. Asserts the op inventory matches
+#                          diffusers' Decoder, every mapped primitive exists,
+#                          every unmapped op is a DECLARED gap, and upsample
+#                          fusion cuts each upsampler to exactly 4/9.
+# ---------------------------------------------------------------------------
+
+def _canonicalize_signed_zeros(t: torch.Tensor) -> torch.Tensor:
+    """Map -0.0 to +0.0 so the uint16 bit compare treats IEEE-equal zeros as
+    equal; every nonzero value keeps its exact bit pattern."""
+    return torch.where(t == 0, t.abs(), t)
+
+
+def conv2d_pytorch_test(name: str, *, c_in: int, oc_count: int,
+                        stride: int, pad: int,
+                        act_max: int, w_max: int,
+                        kernel: Optional[int] = None, in_hw: Optional[int] = None,
+                        kernel_h: Optional[int] = None, kernel_w: Optional[int] = None,
+                        in_h: Optional[int] = None, in_w: Optional[int] = None,
+                        pad_h: Optional[int] = None, dilation: int = 1,
+                        asym_pad: Optional[tuple] = None,
+                        sparse_act_mod: Optional[int] = None,
+                        bias_enable: bool = False,
+                        relu_enable: bool = False,
+                        mixed_scale: bool = False,
+                        wb_uram_addr: int = 0x300) -> None:
+    """Run one CONV2D launch and require bit-exact equality with F.conv2d.
+
+    Activations: random integers in [0, act_max] per (channel, pixel).
+    Weights: random integers in [-w_max, w_max] as IF4-INT codes (block scale
+    negative -> INT4 path, hardware multiplies by |scale|). Optional bias
+    (random ints) and fused ReLU (LALU CLAMP against [0, +inf)) mirror
+    F.conv2d(..., bias) + F.relu.
+
+    Square shorthand: ``kernel`` / ``in_hw``. Rectangular kernels/inputs via
+    ``kernel_h``/``kernel_w`` and ``in_h``/``in_w``; ``pad_h`` overrides the
+    H-axis padding (Conv1d = in_h=1, kernel_h=1, pad_h=0, checked against
+    F.conv2d with padding=(0, p) which equals F.conv1d); ``dilation`` rides
+    the kernel-step registers.
+
+    ``asym_pad=(left, right, top, bottom)``: per-side zero padding, e.g. the
+    SD/SDXL VAE encoder downsample's F.pad(x, (0,1,0,1)) + Conv(k3 s2 p0).
+    Padding was never a hardware input — the host materialises the halo — so
+    asymmetric padding is just the host padding the map before packing;
+    requires pad=0.
+
+    ``sparse_act_mod=m``: deterministic binary activations, nonzero where
+    ``c % m == (r + col) % m``. Caps the per-window nonzero-product count at
+    kh*kw*ceil(c_in/m) so very deep channel counts (e.g. SD UNet's 1280 ->
+    CT=20) stay inside the 2048 integer-exactness budget while every channel
+    tile still carries nonzero lanes. Requires act_max=1.
+
+    ``mixed_scale``: instead of a uniform -1.0 block scale, draw a random
+    per-(oc, tap) magnitude from {1.0, 2.0} (power of two -> dequant stays
+    integer-exact). This covers the channel-CONV scale rewind contract with
+    non-degenerate scales: one [oc][tap] pattern is stored, and
+    bram_raddr_module rewinds it at every output-pixel boundary.
+    """
+    import torch.nn.functional as F
+
+    kh = kernel_h if kernel_h is not None else kernel
+    kw = kernel_w if kernel_w is not None else kernel
+    in_h = in_h if in_h is not None else in_hw
+    in_w = in_w if in_w is not None else in_hw
+    assert None not in (kh, kw, in_h, in_w), "give kernel/in_hw or the per-axis variants"
+    if pad_h is None:
+        pad_h = pad
+    if asym_pad is not None:
+        assert pad == 0 and pad_h == 0, "asym_pad replaces the symmetric pad; pass pad=0"
+
+    if sparse_act_mod is not None:
+        assert act_max == 1, "sparse_act_mod implies binary activations"
+        ch = torch.arange(c_in).view(-1, 1, 1)
+        row = torch.arange(in_h).view(1, -1, 1)
+        col = torch.arange(in_w).view(1, 1, -1)
+        x_int = ((ch % sparse_act_mod) == ((row + col) % sparse_act_mod)).to(torch.int16)
+    else:
+        x_int = torch.randint(0, act_max + 1, (c_in, in_h, in_w), dtype=torch.int16)
+    if asym_pad is not None:
+        # Host-materialised per-side zero padding (the hardware never pads);
+        # from here on the padded map IS the input, run with pad=0.
+        import torch.nn.functional as _F
+        x_int = _F.pad(x_int, asym_pad)
+        in_h += asym_pad[2] + asym_pad[3]
+        in_w += asym_pad[0] + asym_pad[1]
+
+    ct = (c_in + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    h_pad, w_pad = in_h + 2 * pad_h, in_w + 2 * pad
+    eff_kh = dilation * (kh - 1) + 1
+    eff_kw = dilation * (kw - 1) + 1
+    out_h = (h_pad - eff_kh) // stride + 1
+    out_w = (w_pad - eff_kw) // stride + 1
+    taps = kh * kw * ct
+    results = out_h * out_w * oc_count
+    result_lines = (results + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+
+    # Exactness budget (see block comment above): worst-case magnitudes must
+    # stay integer-exact through the BF19 tree (per-block) and the BF19/BF20
+    # accumulate/bias legs (whole window).
+    assert w_max <= 7, "IF4-INT codes span [-8, 7]"
+    scale_max = 2 if mixed_scale else 1
+    bias_max = 8 if bias_enable else 0
+    per_block_bound = min(c_in, UE_VECTOR_SIZE) * act_max * w_max * scale_max
+    if sparse_act_mod is not None:
+        # At most ceil(c_in/m) channels are nonzero at any pixel.
+        active_per_pixel = -(-c_in // sparse_act_mod)
+        total_bound = kh * kw * active_per_pixel * w_max * scale_max + bias_max
+    else:
+        total_bound = kh * kw * c_in * act_max * w_max * scale_max + bias_max
+    assert per_block_bound <= 2048, f"{name}: per-tap dot bound {per_block_bound} breaks BF19 exactness"
+    assert total_bound <= 2048, f"{name}: window total bound {total_bound} breaks BF19/BF20 exactness"
+
+    w_int = torch.randint(-w_max, w_max + 1, (oc_count, c_in, kh, kw), dtype=torch.int16)
+    bias_int = torch.randint(-bias_max, bias_max + 1, (oc_count,), dtype=torch.int16) \
+        if bias_enable else None
+    if mixed_scale:
+        assert ct == 1, "mixed_scale reference below assumes one channel tile"
+        # Per-(oc, tap) magnitude in {1, 2}; negative sign selects the INT4 path.
+        scale_mag = 2.0 ** torch.randint(0, 2, (oc_count, taps), dtype=torch.int16).to(torch.float32)
+        # Effective weight of block (oc, ky, kx) is code * magnitude, same for
+        # every channel lane of the block.
+        w_eff = w_int.to(torch.float32) * scale_mag.view(oc_count, 1, kh, kw)
+    else:
+        scale_mag = None
+        w_eff = w_int.to(torch.float32)
+
+    # Reference: integer-exact fp32 conv, single RNE cast to bf16 at the end
+    # (the same one rounding step the hardware performs at BF19->BF16).
+    ref = F.conv2d(x_int.to(torch.float32).unsqueeze(0),
+                   w_eff,
+                   bias=bias_int.to(torch.float32) if bias_enable else None,
+                   stride=stride, padding=(pad_h, pad), dilation=dilation)[0]
+    if relu_enable:
+        ref = F.relu(ref)
+    ref_bf16 = ref.to(torch.bfloat16).contiguous()
+
+    act_map = conv2d_pack_activation_map(x_int.to(torch.bfloat16), pad, pad_value=0.0,
+                                         pad_h=pad_h)
+    w_stream = conv2d_pack_weight_stream(w_int, out_h, out_w, TYPE.IF4)
+    # Negative block scales: sign selects the INT4 variant, |scale| is the
+    # effective multiplier (uniform 1.0 unless mixed_scale).
+    scale_stream = conv2d_pack_scale_stream(
+        -scale_mag if mixed_scale else -1.0, oc_count, taps, out_h, out_w)
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+
+    ACT_DRAM_ADDR = ue.allocate_params_dram(act_map.numel() * 2)
+    ue.dma_write(DMA_DEVICE_H2C, ACT_DRAM_ADDR, act_map, act_map.numel() * 2)
+    WEIGHTS_DRAM_ADDR = ue.allocate_params_dram(w_stream.numel())
+    ue.dma_write(DMA_DEVICE_H2C, WEIGHTS_DRAM_ADDR, w_stream, w_stream.numel())
+    SCALE_DRAM_ADDR = ue.allocate_params_dram(scale_stream.numel() * 2)
+    ue.dma_write(DMA_DEVICE_H2C, SCALE_DRAM_ADDR, scale_stream, scale_stream.numel() * 2)
+    BIAS_DRAM_ADDR = None
+    if bias_enable:
+        bias_stream = conv2d_pack_bias_stream(bias_int.to(torch.bfloat16), out_h, out_w)
+        BIAS_DRAM_ADDR = ue.allocate_params_dram(bias_stream.numel() * 2)
+        ue.dma_write(DMA_DEVICE_H2C, BIAS_DRAM_ADDR, bias_stream, bias_stream.numel() * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(result_lines * UE_VECTOR_SIZE * 2)
+
+    ue.start_capture()
+    total_flops = ue.conv2d_core(
+        ACT_DRAM_ADDR, WEIGHTS_DRAM_ADDR, SCALE_DRAM_ADDR, OUTPUT_DRAM_ADDR,
+        c_in=c_in, in_h=in_h, in_w=in_w,
+        kernel_h=kh, kernel_w=kw, stride_s=stride, pad=pad, pad_h=pad_h,
+        dilation=dilation,
+        oc_count=oc_count, data_type=TYPE.IF4,
+        BIAS_DRAM_ADDR=BIAS_DRAM_ADDR, relu_enable=relu_enable,
+        wb_uram_addr=wb_uram_addr)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.allocate_program_dram(inst_bytes)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    cycles, _ = ue.report_timing_and_instruction_count()
+
+    out_flat = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (result_lines * UE_VECTOR_SIZE,))
+    hw = conv2d_unpack_result(out_flat, out_h, out_w, oc_count)
+
+    # Zero-sign is the one bit the engine may legitimately differ on (see the
+    # block comment above): fold -0.0 -> +0.0 on both sides.
+    hw = _canonicalize_signed_zeros(hw)
+    ref_bf16 = _canonicalize_signed_zeros(ref_bf16)
+
+    exact = torch.equal(hw.view(torch.uint16), ref_bf16.view(torch.uint16))
+    snr_db = calculate_snr(ref_bf16.to(torch.float32), hw.to(torch.float32))
+    dims = (f"C={c_in}, OC={oc_count}, k={kh}x{kw}, s={stride}, p=({pad_h},{pad}), "
+            f"in={in_h}x{in_w}, out={out_h}x{out_w}"
+            + (f", d={dilation}" if dilation != 1 else "")
+            + (f", asym_pad={asym_pad}" if asym_pad is not None else "")
+            + (f", sparse1/{sparse_act_mod}" if sparse_act_mod is not None else "")
+            + (", bias" if bias_enable else "") + (", relu" if relu_enable else ""))
+    print(f"{name}: {dims} exact={exact} SNR={snr_db:.2f} dB")
+    if not exact:
+        mism = torch.nonzero(hw.view(torch.uint16).view(-1) != ref_bf16.view(torch.uint16).view(-1)).view(-1)
+        print(f"{name}: {mism.numel()}/{results} mismatches; first 8:")
+        for i in mism[:8].tolist():
+            o = i // (out_h * out_w)
+            oy, ox = divmod(i % (out_h * out_w), out_w)
+            print(f"  (oc={o}, oy={oy}, ox={ox}): "
+                  f"exp={ref_bf16[o, oy, ox].item()} got={hw[o, oy, ox].item()}")
+    assert exact, f"{name}: hardware CONV2D must exactly match torch.nn.functional.conv2d"
+    record_test(f"conv2d-{name}", dims, snr_db=snr_db, inst_bytes=inst_bytes, cycles=cycles)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def maxpool2d_pytorch_test(name: str, *, in_hw: int, kernel: int, stride: int,
+                           pad: int, chain: int = 1,
+                           conv_geometry_mode: str = CONV_GEOMETRY_QUEUE_CONFIG) -> None:
+    """Run MAXPOOL launches and require bit-exact equality with F.max_pool2d.
+
+    All 64 lanes carry independent random bf16 values (pooling is per-channel
+    compare-select, so any payload must match exactly). ``pad > 0`` exercises
+    the host-materialised -inf (0xFF80) halo; ``chain > 1`` feeds each stage's
+    output back through host restaging (the YOLO SPPF deployment pattern),
+    checked against the equally-chained torch reference.
+    """
+    import torch.nn.functional as F
+
+    C = UE_VECTOR_SIZE
+    x = torch.randn(C, in_hw, in_hw, dtype=torch.bfloat16)
+
+    ref = x.to(torch.float32)
+    for _ in range(chain):
+        ref = F.max_pool2d(ref.unsqueeze(0), kernel_size=kernel, stride=stride, padding=pad)[0]
+    ref_bf16 = ref.to(torch.bfloat16).contiguous()
+
+    ue = UnifiedEngine(conv_geometry_mode=conv_geometry_mode)
+    hw = x
+    total_cycles = 0
+    inst_bytes = 0
+    for stage in range(chain):
+        in_h = hw.shape[1]
+        h_pad = in_h + 2 * pad
+        out_h = (h_pad - kernel) // stride + 1
+
+        act_map = conv2d_pack_activation_map(hw, pad, pad_value=float('-inf'))
+        ACT_DRAM_ADDR = ue.allocate_params_dram(act_map.numel() * 2)
+        ue.dma_write(DMA_DEVICE_H2C, ACT_DRAM_ADDR, act_map, act_map.numel() * 2)
+        OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(out_h * out_h * UE_VECTOR_SIZE * 2)
+
+        ue.start_capture()
+        ue.maxpool2d_core(
+            ACT_DRAM_ADDR, OUTPUT_DRAM_ADDR,
+            in_h=in_h, in_w=in_h,
+            kernel_h=kernel, kernel_w=kernel, stride_s=stride, pad=pad)
+        ue.stop_capture()
+        ue.generate_instruction_halt()
+        program_dram_addr = ue.get_program_dram_addr()
+        ue.write_captured_instructions_to_dram(program_dram_addr)
+        inst_bytes = ue.get_capture_instruction_size_bytes()
+        ue.allocate_program_dram(inst_bytes)
+
+        ue.start_execute_from_dram(program_dram_addr)
+        ue.wait_queue(10.0)
+        stage_cycles, _ = ue.report_timing_and_instruction_count()
+        total_cycles += stage_cycles
+
+        out_flat = ue.dma_from_accelerator_memory(
+            OUTPUT_DRAM_ADDR, (out_h * out_h * UE_VECTOR_SIZE,))
+        hw = maxpool2d_unpack_result(out_flat, out_h, out_h)
+        ue.clear_capture_buffer()
+
+    # Same zero-sign caveat as conv: a window whose max is a zero can carry
+    # either sign of zero out of the compare-select chain.
+    hw = _canonicalize_signed_zeros(hw)
+    ref_bf16 = _canonicalize_signed_zeros(ref_bf16)
+
+    exact = torch.equal(hw.view(torch.uint16), ref_bf16.view(torch.uint16))
+    dims = (f"C={C}, k={kernel}x{kernel}, s={stride}, p={pad}, in={in_hw}x{in_hw}, "
+            f"out={ref_bf16.shape[1]}x{ref_bf16.shape[2]}"
+            + (f", chain x{chain}" if chain > 1 else ""))
+    print(f"{name}: {dims} exact={exact} ({total_cycles} cycles, {inst_bytes} inst bytes)")
+    if not exact:
+        mism = torch.nonzero(hw.view(torch.uint16).reshape(-1) != ref_bf16.view(torch.uint16).reshape(-1)).view(-1)
+        oh = ref_bf16.shape[1]
+        print(f"{name}: {mism.numel()}/{ref_bf16.numel()} mismatches; first 8:")
+        for i in mism[:8].tolist():
+            c = i // (oh * oh)
+            oy, ox = divmod(i % (oh * oh), oh)
+            print(f"  (c={c}, oy={oy}, ox={ox}): "
+                  f"exp={ref_bf16[c, oy, ox].item()} got={hw[c, oy, ox].item()}")
+    assert exact, f"{name}: hardware MAXPOOL must exactly match torch.nn.functional.max_pool2d"
+    record_test(f"maxpool2d-{name}", dims, snr_db=float('inf') if exact else 0.0,
+                inst_bytes=inst_bytes, cycles=total_cycles)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def maxpool2d_chain_pytorch_test(name: str, *, in_hw: int, kernel: int, pad: int,
+                                 chain: int, c: int = 64) -> None:
+    """Chained MaxPool2d as ONE captured program (single execute).
+
+    YOLO SPPF is MaxPool2d(5, s=1, p=2) x3. maxpool2d_pytorch_test runs it as
+    one launch per stage with a host round-trip between (read back, re-pad the
+    -inf halo, re-upload). run_maxpool2d_chain pre-fills each stage's -inf
+    destination once and lands the writeback STRIDED into its interior, so the
+    halo survives and the whole chain is a single capture + execute with no host
+    in the loop. Bit-exact vs chained F.max_pool2d.
+    """
+    import torch.nn.functional as F
+    assert 2 * pad == kernel - 1, "chained pooling needs out == in"
+    x = torch.randn(c, in_hw, in_hw, dtype=torch.bfloat16)
+    ref = x.to(torch.float32).unsqueeze(0)
+    for _ in range(chain):
+        ref = F.max_pool2d(ref, kernel, stride=1, padding=pad)
+    ref_bf16 = _canonicalize_signed_zeros(ref[0].to(torch.bfloat16).contiguous())
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+    ue.reset_params_dram_addr()
+    ue.reset_tensor_dram_addr()
+    hw = _canonicalize_signed_zeros(
+        ue.run_maxpool2d_chain(x, kernel=kernel, stride_s=1, pad=pad, chain=chain))
+
+    exact = torch.equal(hw.view(torch.uint16), ref_bf16.view(torch.uint16))
+    dims = (f"C={c}, k={kernel}x{kernel}, s=1, p={pad}, in={in_hw}x{in_hw}, "
+            f"chain x{chain} in 1 program (1 execute, no host round-trip)")
+    print(f"{name}: {dims} exact={exact} "
+          f"({ue.last_maxpool_cycles} cycles, {ue.last_maxpool_inst_bytes} inst bytes)")
+    assert exact, f"{name}: chained maxpool must exactly match chained F.max_pool2d"
+    record_test(f"maxpool_chain-{name}", dims, snr_db=float('inf') if exact else 0.0,
+                inst_bytes=ue.last_maxpool_inst_bytes, cycles=ue.last_maxpool_cycles)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def conv2d_act_pytorch_test(name: str, *, c_in: int, oc_count: int, kernel: int,
+                            stride: int, pad: int,
+                            in_hw: Optional[int] = None,
+                            in_h: Optional[int] = None, in_w: Optional[int] = None,
+                            kernel_h: Optional[int] = None,
+                            activation: str = "silu",
+                            snr_threshold_db: float = 40.0) -> None:
+    """Conv + bias + fused activation epilogue vs the torch composition.
+
+    - activation="silu": YOLO Conv module (Conv2d + BN + SiLU; BN folds into
+      the weight scales and bias stream at deploy time). Reference:
+      F.silu(F.conv2d(...)).
+    - activation="gelu": Whisper conv stem (Conv1d + GELU). Reference:
+      y * sigmoid(1.702*y) — the sigmoid-form GELU the LALU implements, the
+      same convention as the matmul gelu tests.
+
+    Both ride the LALU ACT leg, whose sigmoid core is a minimax approximation
+    (~0.07% max relative error), so unlike the other conv tests this one is
+    SNR-gated, not bit-exact. Conv1d geometry (in_h=1, kernel_h=1) routes
+    through conv1d_core.
+    """
+    import torch.nn.functional as F
+
+    kh = kernel_h if kernel_h is not None else kernel
+    kw = kernel
+    in_h = in_h if in_h is not None else in_hw
+    in_w = in_w if in_w is not None else in_hw
+    assert None not in (in_h, in_w), "give in_hw or in_h/in_w"
+    is_conv1d = (in_h == 1 and kh == 1)
+    pad_h = 0 if is_conv1d else pad
+    assert activation in ("silu", "gelu")
+
+    ct = (c_in + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    out_h = (in_h + 2 * pad_h - kh) // stride + 1
+    out_w = (in_w + 2 * pad - kw) // stride + 1
+    taps = kh * kw * ct
+    results = out_h * out_w * oc_count
+    result_lines = (results + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+
+    x = (torch.randn(c_in, in_h, in_w, dtype=torch.bfloat16) * 0.5)
+    w_codes = torch.randint(-7, 8, (oc_count, c_in, kh, kw), dtype=torch.int16)
+    scale_mag = 0.0625  # |block scale|; negative sign selects the INT4 path
+    bias = (torch.randn(oc_count, dtype=torch.bfloat16) * 0.5)
+
+    w_eff = w_codes.to(torch.float32) * scale_mag
+    y = F.conv2d(x.to(torch.float32).unsqueeze(0), w_eff,
+                 bias=bias.to(torch.float32), stride=stride,
+                 padding=(pad_h, pad))[0]
+    ref = F.silu(y) if activation == "silu" else y * torch.sigmoid(1.702 * y)
+
+    act_map = conv2d_pack_activation_map(x, pad, pad_value=0.0, pad_h=pad_h)
+    w_stream = conv2d_pack_weight_stream(w_codes, out_h, out_w, TYPE.IF4)
+    scale_stream = conv2d_pack_scale_stream(-scale_mag, oc_count, taps, out_h, out_w)
+    bias_stream = conv2d_pack_bias_stream(bias, out_h, out_w)
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+    ACT_DRAM_ADDR = ue.allocate_params_dram(act_map.numel() * 2)
+    ue.dma_write(DMA_DEVICE_H2C, ACT_DRAM_ADDR, act_map, act_map.numel() * 2)
+    WEIGHTS_DRAM_ADDR = ue.allocate_params_dram(w_stream.numel())
+    ue.dma_write(DMA_DEVICE_H2C, WEIGHTS_DRAM_ADDR, w_stream, w_stream.numel())
+    SCALE_DRAM_ADDR = ue.allocate_params_dram(scale_stream.numel() * 2)
+    ue.dma_write(DMA_DEVICE_H2C, SCALE_DRAM_ADDR, scale_stream, scale_stream.numel() * 2)
+    BIAS_DRAM_ADDR = ue.allocate_params_dram(bias_stream.numel() * 2)
+    ue.dma_write(DMA_DEVICE_H2C, BIAS_DRAM_ADDR, bias_stream, bias_stream.numel() * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(result_lines * UE_VECTOR_SIZE * 2)
+
+    act_flags = {f"{activation}_enable": True}
+    ue.start_capture()
+    if is_conv1d:
+        ue.conv1d_core(
+            ACT_DRAM_ADDR, WEIGHTS_DRAM_ADDR, SCALE_DRAM_ADDR, OUTPUT_DRAM_ADDR,
+            c_in=c_in, length=in_w, kernel_size=kw, stride_s=stride, pad=pad,
+            oc_count=oc_count, data_type=TYPE.IF4,
+            BIAS_DRAM_ADDR=BIAS_DRAM_ADDR, **act_flags)
+    else:
+        ue.conv2d_core(
+            ACT_DRAM_ADDR, WEIGHTS_DRAM_ADDR, SCALE_DRAM_ADDR, OUTPUT_DRAM_ADDR,
+            c_in=c_in, in_h=in_h, in_w=in_w,
+            kernel_h=kh, kernel_w=kw, stride_s=stride, pad=pad,
+            oc_count=oc_count, data_type=TYPE.IF4,
+            BIAS_DRAM_ADDR=BIAS_DRAM_ADDR, **act_flags)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.allocate_program_dram(inst_bytes)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    cycles, _ = ue.report_timing_and_instruction_count()
+
+    out_flat = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (result_lines * UE_VECTOR_SIZE,))
+    hw = conv2d_unpack_result(out_flat, out_h, out_w, oc_count)
+
+    snr_db = calculate_snr(ref, hw.to(torch.float32))
+    dims = (f"C={c_in}, OC={oc_count}, k={kh}x{kw}, s={stride}, p=({pad_h},{pad}), "
+            f"in={in_h}x{in_w}, bias+{activation}" + (", conv1d" if is_conv1d else ""))
+    print(f"{name}: {dims} SNR={snr_db:.2f} dB")
+    assert snr_db >= snr_threshold_db or snr_db == float('inf'), (
+        f"{name}: SNR {snr_db:.2f} dB must be at least {snr_threshold_db} dB"
+    )
+    record_test(f"conv2d-{name}", dims, snr_db=snr_db, inst_bytes=inst_bytes, cycles=cycles)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def patch_embed_matmul_pytorch_test(name: str, *, patch: int, grid: int,
+                                    c_in: int = 3, oc_count: int = 64,
+                                    act_max: int = 2, w_max: int = 1,
+                                    checkerboard: bool = False) -> None:
+    """ViT/SigLIP patch embedding with k = s > 15, bit-exact vs F.conv2d.
+
+    ViT-B/16, SigLIP (k=16) and ViT-B/32 (k=32) patch kernels exceed the
+    CONV2D geometry fields (uram_conv_addr_gen.sv K_WIDTH=4, kernels <= 15),
+    and a non-overlapping k=s, p=0 patch conv is exactly a reshaped matmul:
+    token(t) = flatten(patch_t) @ W.T with K = C*k*k. This test runs that
+    deployment path — host im2col in F.unfold order (matching the (C, kh, kw)
+    flatten of the conv weight) through quantized_matmat_core — and requires
+    bit-exact equality with F.conv2d, using the same integer/IF4-INT exactness
+    argument as the native conv tests.
+
+    ``checkerboard`` zeroes activations on half the pixels (deterministically)
+    so the K=3072 (k=32) accumulation total stays within the 2048 integer-
+    exactness budget.
+    """
+    import torch.nn.functional as F
+
+    K = c_in * patch * patch
+    M = grid * grid
+    in_hw = patch * grid
+    assert K % UE_VECTOR_SIZE == 0, f"K={K} must be a multiple of {UE_VECTOR_SIZE}"
+    assert oc_count % UE_VECTOR_SIZE == 0, "oc tile must be lane-aligned for the matmul writeback"
+
+    x_int = torch.randint(0, act_max + 1, (c_in, in_hw, in_hw), dtype=torch.int16)
+    if checkerboard:
+        row = torch.arange(in_hw).view(-1, 1)
+        col = torch.arange(in_hw).view(1, -1)
+        x_int = x_int * (((row + col) % 2) == 0).to(torch.int16)
+    w_int = torch.randint(-w_max, w_max + 1, (oc_count, c_in, patch, patch), dtype=torch.int16)
+
+    # Integer-exactness budget: the dot accumulates K/64 blocks in BF20 and the
+    # result rides BF19 legs, so the window total must stay <= 2048.
+    nonzero_per_patch = (K + 1) // 2 if checkerboard else K
+    total_bound = nonzero_per_patch * act_max * w_max
+    assert total_bound <= 2048, f"{name}: total bound {total_bound} breaks BF19/BF20 exactness"
+
+    ref = F.conv2d(x_int.to(torch.float32).unsqueeze(0), w_int.to(torch.float32),
+                   stride=patch)[0]
+    ref_bf16 = _canonicalize_signed_zeros(ref.to(torch.bfloat16).contiguous())
+    assert ref_bf16.shape == (oc_count, grid, grid)
+
+    # Host im2col: F.unfold flattens each patch in (C, kh, kw) order — the same
+    # order as w_int.reshape(oc, K) — so token t's dot against weight row o is
+    # exactly conv output (o, t).
+    patches = F.unfold(x_int.to(torch.float32).unsqueeze(0),
+                       kernel_size=patch, stride=patch)[0].transpose(0, 1).contiguous()
+    A = patches.to(torch.bfloat16)  # (M, K), integer-exact
+
+    codes = w_int.reshape(oc_count, K).to(torch.int16) & 0xF
+    payload = (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8).reshape(-1)
+    num_blocks = (oc_count * K) // UE_VECTOR_SIZE
+    scales = torch.full((num_blocks,), -1.0, dtype=torch.bfloat16)  # INT4, |scale|=1
+
+    ue = UnifiedEngine()
+    A_DRAM_ADDR = ue.allocate_params_dram(A.numel() * 2)
+    ue.dma_write(DMA_DEVICE_H2C, A_DRAM_ADDR, A, A.numel() * 2)
+    B_DRAM_ADDR = ue.allocate_params_dram(payload.numel())
+    ue.dma_write(DMA_DEVICE_H2C, B_DRAM_ADDR, payload, payload.numel())
+    SCALE_DRAM_ADDR = ue.allocate_params_dram(num_blocks * 2)
+    ue.dma_write(DMA_DEVICE_H2C, SCALE_DRAM_ADDR, scales, num_blocks * 2)
+    OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(M * oc_count * 2)
+
+    ue.start_capture()
+    ue.quantized_matmat_core(M, K, oc_count, A_DRAM_ADDR, B_DRAM_ADDR,
+                             OUTPUT_DRAM_ADDR, SCALE_DRAM_ADDR,
+                             data_type=TYPE.IF4)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.allocate_program_dram(inst_bytes)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    cycles, _ = ue.report_timing_and_instruction_count()
+
+    out = ue.dma_from_accelerator_memory(OUTPUT_DRAM_ADDR, (M, oc_count))
+    hw = out.view(grid, grid, oc_count).permute(2, 0, 1).contiguous()
+    hw = _canonicalize_signed_zeros(hw)
+
+    exact = torch.equal(hw.view(torch.uint16), ref_bf16.view(torch.uint16))
+    snr_db = calculate_snr(ref_bf16.to(torch.float32), hw.to(torch.float32))
+    dims = (f"C={c_in}, OC={oc_count}, k=s={patch}, p=0, in={in_hw}x{in_hw}, "
+            f"tokens={M} (im2col+matmul)")
+    print(f"{name}: {dims} exact={exact} SNR={snr_db:.2f} dB "
+          f"({cycles} cycles, {inst_bytes} inst bytes)")
+    if not exact:
+        mism = torch.nonzero(hw.view(torch.uint16).reshape(-1) != ref_bf16.view(torch.uint16).reshape(-1)).view(-1)
+        print(f"{name}: {mism.numel()}/{ref_bf16.numel()} mismatches; first 8:")
+        for i in mism[:8].tolist():
+            o = i // (grid * grid)
+            oy, ox = divmod(i % (grid * grid), grid)
+            print(f"  (oc={o}, oy={oy}, ox={ox}): "
+                  f"exp={ref_bf16[o, oy, ox].item()} got={hw[o, oy, ox].item()}")
+    assert exact, f"{name}: patch-embed matmul must exactly match torch.nn.functional.conv2d"
+    record_test(f"patch_embed-{name}", dims, snr_db=snr_db,
+                inst_bytes=inst_bytes, cycles=cycles)
+
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def patch_embed_conv2d_pytorch_test(name: str, *, patch: int, grid: int,
+                                    c_in: int = 3, oc_count: int = 64,
+                                    act_max: int = 2, w_max: int = 1) -> None:
+    """ViT/SigLIP patch embedding run as a NATIVE Conv2d (patch <= 15).
+
+    A non-overlapping k = s = patch, p = 0 patch embed is exactly
+    Conv2d(C, embed, patch, stride=patch). Unlike vit_b16/b32 (k=16/32, which
+    exceed the 4-bit CONV2D kernel field and deploy as im2col + matmul, see
+    :func:`patch_embed_matmul_pytorch_test`), small patches fit the conv
+    geometry directly and run through the full-tensor ``run_conv2d_layer`` —
+    small-C, so gather mode auto-engages. Bit-exact vs F.conv2d on the same
+    integer / IF4-INT exactness argument as the native conv tests. This is the
+    conv2d twin of :func:`patching_test` (which extracts the same 4x4 patches
+    via the gather-matmul ``patching_core``): the registered case extracts
+    4x4x3 patches for a 3x384x384 image (96x96 grid of tokens -> N=64).
+    """
+    import torch.nn.functional as F
+    assert patch <= 15, "patch > 15 exceeds the 4-bit kernel field; use the matmul path"
+    K = c_in * patch * patch
+    in_hw = patch * grid
+    assert K * act_max * w_max <= 2048, f"{name}: budget breaks exactness"
+
+    x_int = torch.randint(0, act_max + 1, (c_in, in_hw, in_hw), dtype=torch.int16)
+    w_int = torch.randint(-w_max, w_max + 1, (oc_count, c_in, patch, patch), dtype=torch.int16)
+    ref = F.conv2d(x_int.to(torch.float32).unsqueeze(0), w_int.to(torch.float32),
+                   stride=patch)[0]
+    ref_bf16 = _canonicalize_signed_zeros(ref.to(torch.bfloat16).contiguous())
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+    hw = _canonicalize_signed_zeros(ue.run_conv2d_layer(
+        x_int.to(torch.bfloat16), w_int, stride_s=patch, pad=0))
+
+    exact = torch.equal(hw.view(torch.uint16), ref_bf16.view(torch.uint16))
+    snr_db = calculate_snr(ref_bf16.to(torch.float32), hw.to(torch.float32))
+    dims = (f"C={c_in} H={in_hw} W={in_hw} patch={patch}x{patch} K={K} N={oc_count} "
+            f"(native conv2d, gather)")
+    print(f"{name}: {dims} exact={exact} SNR={snr_db:.2f} dB "
+          f"({ue.last_conv_cycles} cycles, {ue.last_conv_inst_bytes} inst bytes)")
+    assert exact, f"{name}: patch-embed conv2d must exactly match torch.nn.functional.conv2d"
+    record_test(f"patching-{name}", dims, snr_db=snr_db,
+                inst_bytes=ue.last_conv_inst_bytes, cycles=ue.last_conv_cycles)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def conv_transpose2d_pytorch_test(name: str, *, c_in: int, oc_count: int,
+                                  in_hw: int, act_max: int, w_max: int) -> None:
+    """ConvTranspose2d(C, OC, 4, stride=2, padding=1) vs F.conv_transpose2d,
+    bit-exact — the standard UNet/GAN/SAM 2x upsampler.
+
+    Runs via run_conv_transpose2d_k4s2p1: sub-pixel decomposition into four
+    k=2 s=1 convs on per-side-padded input (one captured program — all four
+    share a geometry), interleaved 2x2 on the host. Each output element is
+    one 2x2xC_in window dot, so the exactness budget is 4*c_in*act_max*w_max.
+    """
+    import torch.nn.functional as F
+
+    assert 4 * c_in * act_max * w_max <= 2048, f"{name}: budget breaks BF19 exactness"
+    x_int = torch.randint(0, act_max + 1, (c_in, in_hw, in_hw), dtype=torch.int16)
+    # ConvTranspose weight layout: (C_in, C_out, kh, kw)
+    w_int = torch.randint(-w_max, w_max + 1, (c_in, oc_count, 4, 4), dtype=torch.int16)
+
+    ref = F.conv_transpose2d(x_int.to(torch.float32).unsqueeze(0),
+                             w_int.to(torch.float32), stride=2, padding=1)[0]
+    ref_bf16 = _canonicalize_signed_zeros(ref.to(torch.bfloat16).contiguous())
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+    hw = ue.run_conv_transpose2d_k4s2p1(x_int.to(torch.bfloat16), w_int)
+    hw = _canonicalize_signed_zeros(hw)
+
+    exact = torch.equal(hw.view(torch.uint16), ref_bf16.view(torch.uint16))
+    snr_db = calculate_snr(ref_bf16.to(torch.float32), hw.to(torch.float32))
+    dims = (f"C={c_in}, OC={oc_count}, k=4x4, s=2, p=1, in={in_hw}x{in_hw}, "
+            f"out={2*in_hw}x{2*in_hw} (4 sub-convs)")
+    print(f"{name}: {dims} exact={exact} SNR={snr_db:.2f} dB")
+    assert exact, f"{name}: must exactly match torch.nn.functional.conv_transpose2d"
+    record_test(f"conv_transpose-{name}", dims, snr_db=snr_db)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def group_norm_pytorch_test(name: str, *, c: int, in_h: int, in_w: int,
+                            num_groups: int = 32, affine: bool = True,
+                            snr_gate_db: float = 35.0) -> None:
+    """GroupNorm vs F.group_norm — every VAE decoder ResNetBlock + norm_out.
+
+    SNR-gated, not bit-exact: the per-channel sums are accumulated in bf16 on
+    device (BF19 internally, BF16 on writeback) and the variance comes from
+    E[x^2]-E[x]^2, so the result is roundoff-limited rather than exact.
+
+    Inputs are SiLU outputs, which is the adversarial case on purpose: GN in
+    the VAE always follows SiLU, so the data has a nonzero mean and that is
+    exactly what makes E[x^2]-E[x]^2 cancel. ``group_norm_cancellation_ratio``
+    is reported so a regression in conditioning is visible rather than silent.
+
+    Accuracy should be roughly FLAT in tensor size — the accumulators flush to
+    DRAM every GROUP_NORM_MAX_ACC_DEPTH chunks, so a 1M-element group reduces
+    no deeper in bf16 than a small one. A large shape scoring well below a
+    small one means the flush is not working.
+    """
+    import torch.nn.functional as F
+
+    x = F.silu(torch.randn(c, in_h, in_w) * 2.0).to(torch.bfloat16)
+    gamma = (torch.randn(c) * 0.5 + 1).to(torch.bfloat16) if affine else None
+    beta = (torch.randn(c) * 0.1).to(torch.bfloat16) if affine else None
+
+    ref = F.group_norm(x.to(torch.float32).unsqueeze(0), num_groups,
+                       gamma.to(torch.float32) if affine else None,
+                       beta.to(torch.float32) if affine else None,
+                       1e-5)[0].to(torch.bfloat16).contiguous()
+    # The host reference must track torch before the device result is judged.
+    host_snr = calculate_snr(ref.to(torch.float32),
+                             group_norm_ref(x, num_groups, gamma, beta).to(torch.float32))
+    assert host_snr > 40, f"{name}: host reference disagrees with F.group_norm ({host_snr:.1f} dB)"
+
+    ct, slots, slot_lines, n_full, tail, flush_every, n_flushes = \
+        plan_group_norm(c, in_h, in_w, num_groups)
+
+    ue = UnifiedEngine()
+    hw = ue.run_group_norm(x, num_groups=num_groups, gamma=gamma, beta=beta)
+
+    snr = calculate_snr(ref.to(torch.float32), hw.to(torch.float32))
+    ratio = group_norm_cancellation_ratio(x, num_groups)
+    dims = (f"C={c}, in={in_h}x{in_w}, groups={num_groups}, "
+            f"group={(c // num_groups) * in_h * in_w} elems, "
+            f"{slots} slots x {n_full + (1 if tail else 0)} chunks, "
+            f"{n_flushes} flushes @ depth {flush_every}, "
+            f"|mean|/std={ratio:.2f}" + ("" if affine else ", no affine"))
+    print(f"{name}: {dims} SNR={snr:.2f} dB "
+          f"({ue.last_groupnorm_cycles} cycles, {ue.last_groupnorm_inst_bytes} inst bytes)")
+    assert snr > snr_gate_db, \
+        f"{name}: GroupNorm SNR {snr:.2f} dB below the {snr_gate_db} dB gate"
+    record_test(f"group_norm-{name}", dims, snr_db=snr,
+                inst_bytes=ue.last_groupnorm_inst_bytes,
+                cycles=ue.last_groupnorm_cycles)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def nn_upsample_2x_pytorch_test(name: str, *, c: int, in_h: int, in_w: int) -> None:
+    """Nearest-neighbour 2x upsample vs F.interpolate(mode='nearest'),
+    bit-exact — the SD/SDXL VAE decoder and UNet upsample op.
+
+    Runs via run_nn_upsample_2x: four uniform strided DMA passes (two vertical
+    row-doubling into scratch, two horizontal pixel-doubling into the output),
+    each split into URAM-sized rounds, all in one captured program.
+
+    This is pure data movement — no compute unit, no arithmetic on the payload
+    — so every lane carries an independent random bf16 value and the whole
+    tensor must come back bit-identical. There is no exactness budget to
+    respect and no SNR gate to tune: anything short of bit-exact is an
+    addressing bug.
+    """
+    import torch.nn.functional as F
+
+    x = torch.randn(c, in_h, in_w, dtype=torch.bfloat16)
+    ref = F.interpolate(x.to(torch.float32).unsqueeze(0), scale_factor=2,
+                        mode='nearest')[0].to(torch.bfloat16).contiguous()
+    ref_bf16 = _canonicalize_signed_zeros(ref)
+    # The host reference must agree with torch before it is worth running.
+    assert torch.equal(_canonicalize_signed_zeros(nn_upsample_2x_ref(x)).view(torch.uint16),
+                       ref_bf16.view(torch.uint16)), f"{name}: host reference disagrees with torch"
+
+    out_h, out_w, ct, passes = plan_nn_upsample_2x(in_h, in_w, c)
+
+    # Pre-flight: replay the DMA passes in host memory first. If this fails the
+    # bug is in the plan's address arithmetic, not in the hardware — worth
+    # separating, because both surface as a scrambled output image.
+    sim = nn_upsample_2x_unpack_result(
+        nn_upsample_2x_simulate(conv2d_pack_activation_map(x, 0), in_h, in_w, c).reshape(-1),
+        out_h, out_w, c)
+    assert torch.equal(_canonicalize_signed_zeros(sim).view(torch.uint16),
+                       ref_bf16.view(torch.uint16)), \
+        f"{name}: plan_nn_upsample_2x address arithmetic is wrong (host replay mismatched)"
+
+    ue = UnifiedEngine()
+    hw = _canonicalize_signed_zeros(ue.run_nn_upsample_2x(x))
+
+    exact = torch.equal(hw.view(torch.uint16), ref_bf16.view(torch.uint16))
+    moved_mb = sum(p['total_bytes'] for p in passes) / 1e6
+    dims = (f"C={c}, in={in_h}x{in_w}, out={out_h}x{out_w}, ct={ct}, "
+            f"{len(passes)} strided passes, {moved_mb:.2f} MB moved")
+    print(f"{name}: {dims} exact={exact} "
+          f"({ue.last_upsample_cycles} cycles, {ue.last_upsample_inst_bytes} inst bytes)")
+    if not exact:
+        bad = torch.nonzero(hw.view(torch.uint16).reshape(-1)
+                            != ref_bf16.view(torch.uint16).reshape(-1)).reshape(-1)
+        print(f"{name}: {bad.numel()}/{ref_bf16.numel()} mismatches; first 8:")
+        for i in bad[:8].tolist():
+            ch, rem = divmod(i, out_h * out_w)
+            oy, ox = divmod(rem, out_w)
+            print(f"  (c={ch}, oy={oy}, ox={ox}): "
+                  f"exp={ref_bf16[ch, oy, ox].item()} got={hw[ch, oy, ox].item()}")
+    assert exact, f"{name}: upsample must exactly match F.interpolate(mode='nearest')"
+    record_test(f"nn_upsample-{name}", dims,
+                snr_db=float('inf') if exact else 0.0,
+                inst_bytes=ue.last_upsample_inst_bytes,
+                cycles=ue.last_upsample_cycles)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def nn_upsample_conv3x3_pytorch_test(name: str, *, c_in: int, oc_count: int,
+                                     in_h: int, in_w: int,
+                                     act_max: int = 3, w_max: int = 1,
+                                     bias_enable: bool = False,
+                                     scale_mag: float = 1.0) -> None:
+    """Fused ``[nearest 2x upsample -> Conv2d(k3 s1 p1)]`` vs the unfused
+    PyTorch pair, bit-exact — the VAE decoder / UNet resize-conv block.
+
+    Runs via run_nn_upsample_conv3x3, which folds the pair into four parity
+    k=2 convs on the original map (nn_upsample_conv3x3_fold), so the 2x map is
+    never materialised and the conv does 4/9 the MACs.
+
+    Exactness: activations and folded weights are integers whose products sum
+    well inside bf16's 8-bit mantissa, so the result must match F.conv2d on the
+    interpolated map bit-for-bit — same contract as the other conv tests.
+
+    ``w_max`` defaults to 1 because the fold sums up to four codes and INT4
+    tops out at 7; w_max=1 gives folded codes in [-4, 4], which fits. That
+    constraint is the point of the guard, so the test also asserts the driver
+    REJECTS weights that would overflow rather than silently wrapping.
+    """
+    import torch.nn.functional as F
+
+    x = torch.randint(0, act_max + 1, (c_in, in_h, in_w)).to(torch.bfloat16)
+    w = torch.randint(-w_max, w_max + 1, (oc_count, c_in, 3, 3))
+    bias = torch.randint(-3, 4, (oc_count,)).to(torch.bfloat16) if bias_enable else None
+
+    assert nn_upsample_conv3x3_fold_fits(w, TYPE.IF4), \
+        f"{name}: w_max={w_max} folds outside INT4 — pick a smaller w_max"
+
+    ref = nn_upsample_conv3x3_ref(x, w, scale_mag, bias).to(torch.bfloat16)
+    ref_bf16 = _canonicalize_signed_zeros(ref)
+
+    # Pre-flight: replay the fold on the host. A failure here is a weight-fold
+    # bug, not a hardware bug — both show up as a wrong image, so separate them
+    # before touching the device.
+    sim = torch.zeros(oc_count, 2 * in_h, 2 * in_w, dtype=torch.float32)
+    for (a, b, side_pad, w_sub) in nn_upsample_conv3x3_fold(w):
+        xs = F.pad(x.to(torch.float32), side_pad)
+        sim[:, a::2, b::2] = F.conv2d(
+            xs.unsqueeze(0), w_sub.to(torch.float32) * abs(scale_mag),
+            bias=None if bias is None else bias.to(torch.float32),
+            stride=1, padding=0)[0]
+    assert torch.equal(_canonicalize_signed_zeros(sim.to(torch.bfloat16)).view(torch.uint16),
+                       ref_bf16.view(torch.uint16)), \
+        f"{name}: nn_upsample_conv3x3_fold is wrong (host replay mismatched the unfused pair)"
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+    hw = _canonicalize_signed_zeros(
+        ue.run_nn_upsample_conv3x3(x, w, scale_mag=scale_mag, bias=bias))
+
+    # The overflow guard must fire rather than wrap: 4x the max code must not
+    # fit INT4, so a weight tensor of all-3s has to be refused.
+    try:
+        ue.run_nn_upsample_conv3x3(x, torch.full_like(w, 3), scale_mag=scale_mag)
+        raise AssertionError(f"{name}: driver accepted weights that overflow INT4 after folding")
+    except ValueError:
+        pass
+
+    exact = torch.equal(hw.view(torch.uint16), ref_bf16.view(torch.uint16))
+    ct = -(-c_in // UE_VECTOR_SIZE)
+    fused_macs = 4 * (in_h * in_w * oc_count * 4 * ct)
+    unfused_macs = (2 * in_h) * (2 * in_w) * oc_count * 9 * ct
+    dims = (f"C={c_in}, OC={oc_count}, in={in_h}x{in_w}, out={2*in_h}x{2*in_w}, "
+            f"ct={ct}, 4 parity k2 sub-convs, "
+            f"{unfused_macs/fused_macs:.2f}x fewer MACs than unfused"
+            + (", bias" if bias_enable else ""))
+    print(f"{name}: {dims} exact={exact} "
+          f"({ue.last_conv_cycles} cycles, {ue.last_conv_inst_bytes} inst bytes)")
+    if not exact:
+        bad = torch.nonzero(hw.view(torch.uint16).reshape(-1)
+                            != ref_bf16.view(torch.uint16).reshape(-1)).reshape(-1)
+        print(f"{name}: {bad.numel()}/{ref_bf16.numel()} mismatches; first 8:")
+        for i in bad[:8].tolist():
+            oc, rem = divmod(i, 4 * in_h * in_w)
+            oy, ox = divmod(rem, 2 * in_w)
+            print(f"  (oc={oc}, oy={oy}, ox={ox}, parity=({oy%2},{ox%2})): "
+                  f"exp={ref_bf16[oc, oy, ox].item()} got={hw[oc, oy, ox].item()}")
+    assert exact, f"{name}: fused upsample+conv must match the unfused pair exactly"
+    record_test(f"nn_upsample_conv3x3-{name}", dims,
+                snr_db=float('inf') if exact else 0.0,
+                inst_bytes=ue.last_conv_inst_bytes,
+                cycles=ue.last_conv_cycles)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def stride_field_width_test(name: str = "stride_field_widths") -> None:
+    """Guard against the silent strided-DMA field truncation — NO HARDWARE.
+
+    ``stride_bytes_per_chunk`` is packed into 17 bits and ``stride_jump_bytes``
+    into 21. The extra chunk bit is descriptor bit 247, preserving the legacy
+    layout below it. This specifically covers the VAE 512-channel 64x64
+    up-stage's 65536-byte vertical chunk.
+
+    Host simulation missed it because the plan and the round arithmetic were
+    both correct — the corruption happened in descriptor PACKING, below the
+    level being modelled. So this test checks the descriptor field widths
+    directly, which is the layer that actually failed.
+    """
+    bad = [(1 << 17, 4096, "chunk one over the 17-bit field"),
+           (4096, 1 << 21, "jump one over the 21-bit field")]
+    for chunk, jump, why in bad:
+        try:
+            ue_assert_stride_fields_fit(chunk, jump, "test")
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f"{name}: guard accepted an overflowing stride ({why})")
+    for chunk, jump in ((65536, 131072),
+                        (UE_STRIDE_CHUNK_MAX_BYTES, UE_STRIDE_JUMP_MAX_BYTES),
+                        (1792, 3584), (1024, 2048), (0, 0)):
+        ue_assert_stride_fields_fit(chunk, jump, "test")
+
+    # The former failing value must round-trip through the actual descriptor,
+    # including the extension bit rather than merely passing the range guard.
+    ue = UnifiedEngine.__new__(UnifiedEngine)
+    ue._inst_id = 0
+    ue.capture_buffer = []
+    ue.capture_count = 0
+    ue.ue_memcpy_from_dram(
+        0, 2 * 65536, MEMCPY_TYPE.URAM, 0, URAM_SECTION.URAM_A.value,
+        stride_bytes_per_chunk=65536, stride_jump_bytes=131072)
+    w = ue.capture_buffer[-1].words
+    packed_chunk = (((w[7] >> 23) & 1) << 16
+                    | ((w[5] & 0xFFF) << 4)
+                    | ((w[4] >> 28) & 0xF))
+    assert packed_chunk == 65536 and ((w[7] >> 23) & 1) == 1, (
+        f"{name}: 65536-byte chunk encoded as {packed_chunk}, w7=0x{w[7]:08x}")
+
+    # Every upsample shape the VAE decoder actually runs must either fit the
+    # fields or be routed to the unrolled path by run_nn_upsample_2x.
+    shapes = [(128, 5, 7), (512, 64, 64), (512, 128, 128), (256, 256, 256),
+              (128, 512, 512), (512, 1, 1)]
+    n_unrolled = 0
+    for (c, in_h, in_w) in shapes:
+        _, _, ct, passes = plan_nn_upsample_2x(in_h, in_w, c)
+        for p in passes:
+            fits = (p['chunk_bytes'] <= UE_STRIDE_CHUNK_MAX_BYTES
+                    and p['jump_bytes'] <= UE_STRIDE_JUMP_MAX_BYTES)
+            if not fits:
+                n_unrolled += 1
+                # The unrolled path issues contiguous writes, which have no
+                # field limit — but the chunk must still fit the staging bank.
+                assert p['chunk_bytes'] <= URAM_NEAR_FULL_SIZE, (
+                    f"{name}: C={c} {in_h}x{in_w} {p['kind']}-pass chunk "
+                    f"{p['chunk_bytes']} B exceeds the URAM staging budget")
+    dims = (f"{len(shapes)} shapes, {n_unrolled} passes need the unrolled path, "
+            f"chunk field {UE_STRIDE_CHUNK_MAX_BYTES} B / jump field "
+            f"{UE_STRIDE_JUMP_MAX_BYTES} B")
+    print(f"{name}: {dims}")
+    record_test(f"stride_fields-{name}", dims, snr_db=float('inf'))
+
+
+def vae_decoder_plan_test(name: str = "sd_vae_decoder_512", *,
+                          latent_hw: int = 64,
+                          block_out_channels=(128, 256, 512, 512),
+                          layers_per_block: int = 3) -> None:
+    """Structural check of the whole SD/SDXL VAE decoder graph — NO HARDWARE.
+
+    vae_decoder_plan is a pure function, so unlike every other test in this
+    file this one runs anywhere, including CI without a board. It answers the
+    bring-up question — is the decoder fully covered by primitives, and what
+    does it cost — and fails if the graph, the shape chain, or the primitive
+    mapping drifts.
+
+    Checks: the op inventory matches diffusers' Decoder (14 ResnetBlocks x 2
+    convs, 29 GroupNorms, 3 upsamplers, 1 attention, 2 channel-change
+    shortcuts); the shape chain ends at the 8x-upsampled image; every mapped
+    primitive exists on UnifiedEngine; no graph node is host-side; and fusing
+    the upsample cuts each upsampler to exactly 4/9 the MACs.
+    """
+    ops, summary = vae_decoder_plan(latent_h=latent_hw, latent_w=latent_hw,
+                                    block_out_channels=block_out_channels,
+                                    layers_per_block=layers_per_block)
+    n_blocks = len(block_out_channels)
+    exp_resnets = n_blocks * layers_per_block + 2      # up blocks + 2 mid
+    exp_gn = exp_resnets * 2 + 1                       # + conv_norm_out
+    got = {
+        'resnet_convs': sum(1 for o in ops if o['op'].endswith(('.conv1', '.conv2'))),
+        'group_norms': sum(1 for o in ops if o['primitive'] == 'run_group_norm'),
+        'silu': sum(1 for o in ops if o['primitive'] == 'run_silu_layer'),
+        'upsamplers': sum(1 for o in ops if 'upsamplers' in o['op']),
+        'attention': sum(1 for o in ops if o['primitive'] == 'run_vae_attention_block'),
+    }
+    exp = {'resnet_convs': exp_resnets * 2, 'group_norms': exp_gn,
+           'silu': exp_gn, 'upsamplers': n_blocks - 1, 'attention': 1}
+    assert got == exp, f"{name}: decoder graph inventory {got} != diffusers' {exp}"
+
+    assert summary['out_shape'] == (3, latent_hw * 8, latent_hw * 8), \
+        f"{name}: decoder ends at {summary['out_shape']}, expected the 8x-upsampled image"
+
+    for p in (k for k in summary['by_primitive'] if k):
+        assert hasattr(UnifiedEngine, p), f"{name}: plan maps to missing primitive {p}"
+
+    assert summary['n_unmapped'] == 0, \
+        f"{name}: decoder still has host-side graph nodes: {summary['gaps']}"
+
+    # Fusing must cut each upsampler to exactly 4/9 (k2 on H*W vs k3 on 2H*2W).
+    fused = {o['op']: o for o in ops}
+    unfused, _ = vae_decoder_plan(latent_h=latent_hw, latent_w=latent_hw,
+                                  block_out_channels=block_out_channels,
+                                  layers_per_block=layers_per_block,
+                                  fuse_upsample=False)
+    for o in unfused:
+        if o['op'].endswith('.upsamplers.0.conv'):
+            base = o['op'].rsplit('.', 1)[0]
+            ratio = o['macs'] / fused[base]['macs']
+            assert abs(ratio - 2.25) < 1e-9, \
+                f"{name}: {base} fused saving {ratio:.3f}x, expected 2.25x"
+
+    _, s_unfused = vae_decoder_plan(latent_h=latent_hw, latent_w=latent_hw,
+                                    block_out_channels=block_out_channels,
+                                    layers_per_block=layers_per_block,
+                                    fuse_upsample=False)
+    saved = s_unfused['total_macs'] - summary['total_macs']
+    dims = (f"latent {latent_hw}x{latent_hw} -> {summary['out_shape']}, "
+            f"{summary['n_ops']} ops, {summary['total_macs']/1e9:.0f} G MACs, "
+            f"upsample fusion saves {saved/1e9:.0f} G "
+            f"({100*saved/s_unfused['total_macs']:.1f}%), "
+            "all graph nodes mapped to device primitives")
+    print(f"{name}: {dims}")
+    for p, n in sorted((k, v) for k, v in summary['by_primitive'].items() if k):
+        print(f"    {p:<28} {n:>3} ops")
+    for g in summary['gaps']:
+        print(f"    GAP: {g}")
+    record_test(f"vae_decoder_plan-{name}", dims, snr_db=float('inf'))
+
+
+def eltwise_add_layer_pytorch_test(name: str, *, c: int, in_h: int, in_w: int,
+                                   min_snr_db: float = 40.0) -> None:
+    """Full-tensor element-wise add vs torch — the ResNetBlock residual.
+
+    ELTWISE_ADD was already a 64-lane hardware mode; this covers the new
+    DRAM-to-DRAM layer driver over it (multi-round staging, both operands
+    resident in opposite URAM banks).
+
+    The established BF19 hardware path permits a one-code BF16 rounding
+    difference from torch (the RTL self-test uses ``THRES_ELEWISE=1``), so
+    use the same 40 dB quality gate as the generic eltwise DRAM tests. Report
+    exact mismatch statistics as diagnostics so bank/layout failures remain
+    obvious rather than being hidden by the aggregate SNR.
+    """
+    x = torch.randn(c, in_h, in_w, dtype=torch.bfloat16)
+    y = torch.randn(c, in_h, in_w, dtype=torch.bfloat16)
+    ref = _canonicalize_signed_zeros((x.float() + y.float()).to(torch.bfloat16))
+
+    ue = UnifiedEngine()
+    hw = _canonicalize_signed_zeros(ue.run_eltwise_add_layer(x, y))
+
+    ref_bits = ref.view(torch.uint16).reshape(-1)
+    hw_bits = hw.view(torch.uint16).reshape(-1)
+    mismatches = 0
+    max_code_delta = 0
+    stats_chunk = 1 << 20
+    for start in range(0, ref_bits.numel(), stats_chunk):
+        rb = ref_bits[start:start + stats_chunk].to(torch.int32)
+        hb = hw_bits[start:start + stats_chunk].to(torch.int32)
+        mismatches += int(torch.count_nonzero(rb != hb).item())
+        # Map sign-magnitude BF16 encodings into monotonic integer order.
+        # This makes adjacent negative encodings one code apart as well.
+        ro = torch.where((rb & 0x8000) != 0,
+                         0x8000 - (rb & 0x7FFF), 0x8000 + rb)
+        ho = torch.where((hb & 0x8000) != 0,
+                         0x8000 - (hb & 0x7FFF), 0x8000 + hb)
+        max_code_delta = max(
+            max_code_delta, int(torch.max(torch.abs(ro - ho)).item()))
+    exact = mismatches == 0
+    snr = calculate_snr(ref, hw)
+    ct = -(-c // UE_VECTOR_SIZE)
+    lines = in_h * in_w * ct
+    rounds = -(-lines // min(URAM_NEAR_FULL_SIZE // (UE_VECTOR_SIZE * 2), 4096))
+    dims = f"C={c}, {in_h}x{in_w}, ct={ct}, {lines} lines, {rounds} rounds"
+    print(f"{name}: {dims} SNR={snr:.2f} dB, exact={exact}, "
+          f"mismatches={mismatches}/{ref_bits.numel()}, "
+          f"max_code_delta={max_code_delta} "
+          f"({ue.last_eltwise_cycles} cycles, {ue.last_eltwise_inst_bytes} inst bytes)")
+    assert snr >= min_snr_db or snr == float('inf'), \
+        f"{name}: eltwise add SNR {snr:.2f} dB below {min_snr_db:g} dB"
+    record_test(f"eltwise_add_layer-{name}", dims,
+                snr_db=snr,
+                inst_bytes=ue.last_eltwise_inst_bytes,
+                cycles=ue.last_eltwise_cycles)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def silu_mul_add_reference_test(name: str = "silu_mul_add_ref") -> None:
+    """Pure-host accuracy contract for the bounded degree-4 construction."""
+    import torch.nn.functional as F
+
+    x = torch.linspace(-8.0, 8.0, 1 << 16, dtype=torch.float32)
+    x = x.to(torch.bfloat16)
+    got = silu_mul_add_ref(x)
+    exact_bf16 = F.silu(x).to(torch.bfloat16)
+    snr = calculate_snr(exact_bf16, got)
+    assert snr > 54.0, \
+        f"{name}: construction SNR {snr:.2f} dB fell below its 54 dB contract"
+    tails = silu_mul_add_ref(
+        torch.tensor([-60.0, 60.0], dtype=torch.bfloat16))
+    assert abs(tails[0].item()) < 1e-20 and tails[1].item() == 60.0, \
+        f"{name}: stable-tail contract failed: {tails.tolist()}"
+    dims = f"{x.numel()} points on [-8,8] plus +/-60 tails, degree-4 polynomial"
+    print(f"{name}: {dims}, SNR={snr:.2f} dB")
+    record_test(name, dims, snr_db=snr)
+
+
+def silu_descriptor_contract_test(name: str = "silu_descriptor_contract") -> None:
+    """Pure-host encoding check for the two newly exposed queue operations."""
+    ue = UnifiedEngine.__new__(UnifiedEngine)
+    ue._inst_id = 0
+    ue._inst_ptr_counter = 1
+    ue._isa_reg_counter = 1
+    ue.capture_buffer = []
+    ue.capture_count = 0
+    ue.is_capture_on = True
+
+    ue.exp_core(0x00000, 0x00000, 1024)
+    w = ue.capture_buffer[-1].words
+    mode = (w[5] >> 12) & 0xF
+    bcast = (w[7] >> 5) & 0x3
+    rows = w[3] & 0xFFF
+    assert (mode, bcast, rows) == (
+        UE_MODE.EXP.value, BROADCAST_MODE.SCALAR_IN_REG.value, 16), \
+        f"{name}: malformed EXP descriptor {(mode, bcast, rows)}"
+
+    ue.capture_buffer = []
+    ue.capture_count = 0
+    ue._inst_id = 0
+    ue._inst_ptr_counter = 1
+    ue.accelerator_memory_to_sram(
+        0, 0, 0, memcpy_length_bytes=1024,
+        stride_bytes_per_chunk=128, stride_jump_bytes=256,
+        general_reg_src=7)
+    def _stride_fields(words):
+        chunk = ((((words[7] >> 23) & 1) << 16)
+                 | ((words[5] & 0xFFF) << 4)
+                 | ((words[4] >> 28) & 0xF))
+        jump = ((words[6] & 0x7FFF) << 6) | ((words[5] >> 26) & 0x3F)
+        return chunk, jump
+
+    init_w = ue.capture_buffer[0].words
+    reg_w = ue.capture_buffer[1].words
+    exec_w = ue.capture_buffer[-1].words
+    got = (
+        len(ue.capture_buffer),
+        (init_w[0] >> 8) & 0xF,
+        (init_w[0] >> 12) & 0xF,
+        (reg_w[0] >> 8) & 0xF,
+        (reg_w[0] >> 16) & 0xF,
+        (reg_w[0] >> 20) & 0xF,
+        (reg_w[0] >> 24) & 0x3F,
+        (exec_w[0] >> 8) & 0xF,
+        (exec_w[0] >> 12) & 0xF,
+        (exec_w[6] >> 30) & 1,
+        *_stride_fields(init_w),
+        *_stride_fields(exec_w),
+    )
+    expected = (
+        3,
+        INSTRUCTION_PBI_SET, 1,
+        INSTRUCTION_PBI_SET, PBI_MODE_REG, PBI_FIELD.DRAM_ADDR, 7,
+        INSTRUCTION_UE_PBI, 1, 1,
+        128, 256, 0, 0,
+    )
+    assert got == expected, \
+        f"{name}: strided GPR PBI row/descriptor contract {got} != {expected}"
+    dims = "EXP(x+0), plus PBI GPR read with 128-byte chunks / 256-byte stride"
+    print(f"{name}: {dims}")
+    record_test(name, dims, snr_db=float('inf'))
+
+
+def relu_layer_pytorch_test(name: str, *, c: int, in_h: int, in_w: int) -> None:
+    """Per-lane MAXPOOL sign split, bit-exact for finite BF16 inputs."""
+    x = (torch.randn(c, in_h, in_w) * 8.0).to(torch.bfloat16)
+    ref = _canonicalize_signed_zeros(torch.clamp(x, min=0))
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+    hw = _canonicalize_signed_zeros(ue.run_relu_layer(x))
+    exact = torch.equal(hw.view(torch.uint16), ref.view(torch.uint16))
+    ct = -(-c // UE_VECTOR_SIZE)
+    lines = in_h * in_w * ct
+    rounds = -(-lines // min(lines, 0xFFF // 4))
+    dims = f"C={c}, {in_h}x{in_w}, {lines} packed lines, {rounds} rounds"
+    print(f"{name}: {dims}, exact={exact} "
+          f"({ue.last_relu_cycles} cycles, {ue.last_relu_inst_bytes} inst bytes)")
+    assert exact, f"{name}: MAXPOOL [x,0] sign split must be bit-exact"
+    record_test(f"relu_layer-{name}", dims,
+                snr_db=float('inf') if exact else 0.0,
+                inst_bytes=ue.last_relu_inst_bytes,
+                cycles=ue.last_relu_cycles)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def silu_layer_pytorch_test(name: str, *, c: int, in_h: int, in_w: int,
+                            min_snr_db: float = 40.0) -> None:
+    """Device SiLU vs the BF16-rounded construction used by the decoder."""
+    x = (torch.randn(c, in_h, in_w) * 5.0).to(torch.bfloat16)
+    # Exercise both stable tails in addition to the random body.
+    x.reshape(-1)[:4] = torch.tensor(
+        [-60.0, -20.0, 20.0, 60.0], dtype=torch.bfloat16)
+    ref = silu_mul_add_ref(x)
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+    hw = ue.run_silu_layer(x)
+    snr = calculate_snr(ref, hw)
+    ct = -(-c // UE_VECTOR_SIZE)
+    lines = in_h * in_w * ct
+    rounds = -(-lines // min(lines, 0xFFF // 4))
+    dims = (f"C={c}, {in_h}x{in_w}, {lines} packed lines, {rounds} rounds, "
+            f"{ue.last_silu_passes} wide passes")
+    print(f"{name}: {dims}, SNR={snr:.2f} dB "
+          f"({ue.last_silu_cycles} cycles, {ue.last_silu_inst_bytes} inst bytes)")
+    assert snr > min_snr_db, \
+        f"{name}: SiLU SNR {snr:.2f} dB below the {min_snr_db} dB gate"
+    record_test(f"silu_layer-{name}", dims, snr_db=snr,
+                inst_bytes=ue.last_silu_inst_bytes,
+                cycles=ue.last_silu_cycles)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def vae_attention_block_pytorch_test(name: str, *, c: int, in_h: int, in_w: int,
+                                     num_groups: int = 32, w_max: int = 1,
+                                     affine: bool = True,
+                                     min_snr_db: float = 20.0) -> None:
+    """SD/SDXL VAE mid-block ``AttnBlock`` vs a float32 PyTorch reference.
+
+    Composes four already-tested primitives — GroupNorm, three 1x1 convs, the
+    unified attention core, and a projection conv + residual — over the pixel
+    sequence (``seq_len = H*W``, ``head_dim = C``, single head).
+
+    The point of the test is the SEAM, not the arithmetic: it checks that the
+    conv writeback layout feeds the attention core's ``[batch, head_dim]``
+    contract with no transpose (see run_vae_attention_block's layout note), and
+    that the residual adds the block input rather than the normalised tensor —
+    the two things a composition gets wrong.
+
+    Scale the integer weights by a power of two at or below 1/sqrt(C), exactly
+    representable in bf16. Unscaled weights saturate softmax at large C, making
+    its winning index sensitive to bf16 rounding. Check both the full output
+    and the attention branch so the residual cannot hide a broken branch.
+    """
+    x = torch.randn(c, in_h, in_w, dtype=torch.bfloat16)
+    wts = {nm: torch.randint(-w_max, w_max + 1, (c, c, 1, 1))
+           for nm in ('w_q', 'w_k', 'w_v', 'w_proj')}
+    gamma = torch.randn(c, dtype=torch.bfloat16) if affine else None
+    beta = torch.randn(c, dtype=torch.bfloat16) if affine else None
+    scale_mag = 2.0 ** -math.ceil(math.log2(c) / 2)
+
+    ref = vae_attention_block_ref(x, gamma=gamma, beta=beta,
+                                  num_groups=num_groups, scale_mag=scale_mag, **wts)
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+    hw = ue.run_vae_attention_block(x, gamma=gamma, beta=beta,
+                                    num_groups=num_groups, scale_mag=scale_mag, **wts)
+
+    snr = calculate_snr(ref.to(torch.float32), hw.to(torch.float32))
+    branch_snr = calculate_snr(ref.to(torch.float32) - x.float(),
+                               hw.to(torch.float32) - x.float())
+    seq = in_h * in_w
+    dims = (f"C={c}, {in_h}x{in_w}, seq={seq}, head_dim={c}, groups={num_groups}"
+            + ("" if affine else ", no affine"))
+    print(f"{name}: {dims} scale={scale_mag:g} SNR={snr:.2f} dB, "
+          f"branch SNR={branch_snr:.2f} dB "
+          f"({ue.last_attention_cycles} attn cycles, "
+          f"{ue.last_attention_inst_bytes} attn inst bytes)")
+    assert snr >= min_snr_db, \
+        f"{name}: VAE attention block SNR {snr:.2f} dB below {min_snr_db} dB"
+    assert branch_snr >= min_snr_db, \
+        f"{name}: VAE attention branch SNR {branch_snr:.2f} dB below {min_snr_db} dB"
+    record_test(f"vae_attention-{name}", dims, snr_db=snr,
+                inst_bytes=ue.last_attention_inst_bytes,
+                cycles=ue.last_attention_cycles)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+    ue.reset_program_dram_addr()
+
+
+def _conv2d_auto_gather(c_in: int, oc_count: int,
+                        kernel_h: int, kernel_w: int) -> bool:
+    """Mirror run_conv2d_layer's automatic gather selection for reporting."""
+    patch_taps = kernel_h * kernel_w * c_in
+    chunks = -(-patch_taps // UE_VECTOR_SIZE)
+    if c_in > 255 or patch_taps > 256:
+        return False
+    producer_cycles = kernel_h * kernel_w * ((c_in + 3) // 4)
+    gather_cycles = max(producer_cycles, oc_count * chunks)
+    channel_cycles = (
+        oc_count * kernel_h * kernel_w * -(-c_in // UE_VECTOR_SIZE))
+    return gather_cycles < channel_cycles
+
+
+def conv2d_layer_pytorch_test(name: str, *, c_in: int, oc_count: int,
+                              stride: int, pad: int, act_max: int, w_max: int,
+                              kernel: Optional[int] = None,
+                              kernel_h: Optional[int] = None,
+                              kernel_w: Optional[int] = None,
+                              in_h: int, in_w: int,
+                              pad_h: Optional[int] = None) -> None:
+    """Full-tensor conv layer via run_conv2d_layer (tiled multi-launch),
+    bit-exact vs F.conv2d.
+
+    This is what the single-launch tile tests deliberately avoid: output
+    sizes past the 8192-block scale-BRAM cap / URAM tile budget, exercising
+    the tiling planner, halo-overlapped window slicing, oc chunking, and
+    host reassembly end-to-end on hardware.
+    """
+    import torch.nn.functional as F
+    from user_dma_core import plan_conv2d_layer_tiles
+
+    kh = kernel_h if kernel_h is not None else kernel
+    kw = kernel_w if kernel_w is not None else kernel
+    if pad_h is None:
+        pad_h = pad
+    assert kh * kw * c_in * act_max * w_max <= 2048, f"{name}: budget breaks exactness"
+
+    x_int = torch.randint(0, act_max + 1, (c_in, in_h, in_w), dtype=torch.int16)
+    w_int = torch.randint(-w_max, w_max + 1, (oc_count, c_in, kh, kw), dtype=torch.int16)
+    ref = F.conv2d(x_int.to(torch.float32).unsqueeze(0), w_int.to(torch.float32),
+                   stride=stride, padding=(pad_h, pad))[0]
+    ref_bf16 = _canonicalize_signed_zeros(ref.to(torch.bfloat16).contiguous())
+
+    use_gather = _conv2d_auto_gather(c_in, oc_count, kh, kw)
+
+    out_h, out_w, oc_chunk, tiles = plan_conv2d_layer_tiles(
+        c_in=c_in, oc_count=oc_count, in_h=in_h, in_w=in_w,
+        kernel_h=kh, kernel_w=kw, stride_s=stride, pad=pad, pad_h=pad_h,
+        gather=use_gather)
+    n_tiles_total = len(tiles) * (-(-oc_count // oc_chunk))
+    assert n_tiles_total > 1, f"{name}: pick a size that actually tiles ({n_tiles_total} tile)"
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+    hw = ue.run_conv2d_layer(x_int.to(torch.bfloat16), w_int,
+                             stride_s=stride, pad=pad, pad_h=pad_h)
+    hw = _canonicalize_signed_zeros(hw)
+
+    exact = torch.equal(hw.view(torch.uint16), ref_bf16.view(torch.uint16))
+    snr_db = calculate_snr(ref_bf16.to(torch.float32), hw.to(torch.float32))
+    dims = (f"C={c_in}, OC={oc_count}, k={kh}x{kw}, s={stride}, p=({pad_h},{pad}), "
+            f"in={in_h}x{in_w}, out={out_h}x{out_w}, "
+            f"{len(tiles)} tiles x {-(-oc_count // oc_chunk)} oc-chunks, "
+            f"1 resident PBI program")
+    print(f"{name}: {dims} exact={exact} SNR={snr_db:.2f} dB "
+          f"({ue.last_conv_cycles} cycles, {ue.last_conv_inst_bytes} inst bytes)")
+    assert exact, f"{name}: tiled layer must exactly match torch.nn.functional.conv2d"
+    record_test(f"conv2d_layer-{name}", dims, snr_db=snr_db,
+                inst_bytes=ue.last_conv_inst_bytes, cycles=ue.last_conv_cycles)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def maxpool2d_layer_pytorch_test(name: str, *, c: int, in_hw: int, kernel: int,
+                                 stride: int, pad: int) -> None:
+    """Full-tensor MaxPool2d layer via run_maxpool2d_layer, bit-exact vs
+    F.max_pool2d.
+
+    Covers what the single-launch pool tests cannot: channel counts past 64
+    (one launch per 64-lane tile) and output sizes past the 12-bit total-tap
+    field (k*k*pixels <= 4095 — a real YOLO SPPF 20x20 map needs row
+    chunking).
+    """
+    import torch.nn.functional as F
+
+    x = torch.randn(c, in_hw, in_hw, dtype=torch.bfloat16)
+    ref = F.max_pool2d(x.to(torch.float32).unsqueeze(0), kernel,
+                       stride=stride, padding=pad)[0]
+    ref_bf16 = _canonicalize_signed_zeros(ref.to(torch.bfloat16).contiguous())
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+    hw = ue.run_maxpool2d_layer(x, kernel=kernel, stride_s=stride, pad=pad)
+    hw = _canonicalize_signed_zeros(hw)
+
+    exact = torch.equal(hw.view(torch.uint16), ref_bf16.view(torch.uint16))
+    dims = (f"C={c}, k={kernel}x{kernel}, s={stride}, p={pad}, in={in_hw}x{in_hw}, "
+            f"out={ref_bf16.shape[1]}x{ref_bf16.shape[2]} "
+            f"({-(-c // UE_VECTOR_SIZE)} channel tiles, row-chunked)")
+    print(f"{name}: {dims} exact={exact} "
+          f"({ue.last_maxpool_cycles} cycles, {ue.last_maxpool_inst_bytes} inst bytes)")
+    assert exact, f"{name}: tiled maxpool must exactly match torch.nn.functional.max_pool2d"
+    record_test(f"maxpool_layer-{name}", dims, snr_db=float('inf') if exact else 0.0,
+                inst_bytes=ue.last_maxpool_inst_bytes, cycles=ue.last_maxpool_cycles)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def conv2d_fullsize_pytorch_test(name: str, *, c_in: int, oc_count: int,
+                                 stride: int, pad: int, in_h: int, in_w: int,
+                                 act_max: int, w_max: int,
+                                 kernel: Optional[int] = None,
+                                 kernel_h: Optional[int] = None,
+                                 kernel_w: Optional[int] = None,
+                                 pad_h: Optional[int] = None,
+                                 sparse_act_mod: Optional[int] = None) -> None:
+    """FULL model-resolution conv layer (e.g. 512x512, 640x640) via the
+    batched run_conv2d_layer, bit-exact vs F.conv2d.
+
+    Unlike conv2d_layer_pytorch_test (small multi-tile shapes), this runs the
+    actual input tensor sizes from the model matrix, so the tile count is in
+    the thousands and the resident PBI tile-loop program (a ~10-instruction
+    loop the engine iterates once per tile, no host in the loop) is what
+    keeps it tractable. Uses IF4-INT weights
+    with |scale| = 1 and, for high channel counts, the deterministic sparse
+    activation pattern so the whole tensor stays integer-exact.
+    """
+    import torch.nn.functional as F
+    from user_dma_core import plan_conv2d_layer_tiles
+
+    kh = kernel_h if kernel_h is not None else kernel
+    kw = kernel_w if kernel_w is not None else kernel
+    if pad_h is None:
+        pad_h = pad
+
+    if sparse_act_mod is not None:
+        assert act_max == 1
+        ch = torch.arange(c_in).view(-1, 1, 1)
+        row = torch.arange(in_h).view(1, -1, 1)
+        col = torch.arange(in_w).view(1, 1, -1)
+        x_int = ((ch % sparse_act_mod) == ((row + col) % sparse_act_mod)).to(torch.int16)
+        active = -(-c_in // sparse_act_mod)
+    else:
+        x_int = torch.randint(0, act_max + 1, (c_in, in_h, in_w), dtype=torch.int16)
+        active = c_in
+    assert kh * kw * active * w_max <= 2048, f"{name}: budget breaks exactness"
+
+    w_int = torch.randint(-w_max, w_max + 1, (oc_count, c_in, kh, kw), dtype=torch.int16)
+    ref = F.conv2d(x_int.to(torch.float32).unsqueeze(0), w_int.to(torch.float32),
+                   stride=stride, padding=(pad_h, pad))[0]
+    ref_bf16 = _canonicalize_signed_zeros(ref.to(torch.bfloat16).contiguous())
+
+    use_gather = _conv2d_auto_gather(c_in, oc_count, kh, kw)
+    out_h, out_w, oc_chunk, tiles = plan_conv2d_layer_tiles(
+        c_in=c_in, oc_count=oc_count, in_h=in_h, in_w=in_w,
+        kernel_h=kh, kernel_w=kw, stride_s=stride, pad=pad, pad_h=pad_h,
+        gather=use_gather)
+    n_oc_chunks = -(-oc_count // oc_chunk)
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+    t0 = time.time()
+    hw = ue.run_conv2d_layer(x_int.to(torch.bfloat16), w_int,
+                             stride_s=stride, pad=pad, pad_h=pad_h)
+    elapsed = time.time() - t0
+    hw = _canonicalize_signed_zeros(hw)
+
+    exact = torch.equal(hw.view(torch.uint16), ref_bf16.view(torch.uint16))
+    snr_db = calculate_snr(ref_bf16.to(torch.float32), hw.to(torch.float32))
+    dims = (f"C={c_in}, OC={oc_count}, k={kh}x{kw}, s={stride}, p=({pad_h},{pad}), "
+            f"in={in_h}x{in_w}, out={out_h}x{out_w}, {len(tiles)} tiles x "
+            f"{n_oc_chunks} oc-chunks, 1 resident PBI program, {elapsed:.1f}s")
+    print(f"{name}: {dims} exact={exact} SNR={snr_db:.2f} dB "
+          f"({ue.last_conv_cycles} cycles, {ue.last_conv_inst_bytes} inst bytes)")
+    assert exact, f"{name}: full-size tiled conv must exactly match F.conv2d"
+    record_test(f"conv2d_fullsize-{name}", dims, snr_db=snr_db,
+                inst_bytes=ue.last_conv_inst_bytes, cycles=ue.last_conv_cycles)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def conv2d_gather_pytorch_test(name: str, *, c_in: int, oc_count: int,
+                               stride: int, pad: int, in_h: int, in_w: int,
+                               act_max: int, w_max: int,
+                               kernel: Optional[int] = None,
+                               kernel_h: Optional[int] = None,
+                               kernel_w: Optional[int] = None,
+                               pad_h: Optional[int] = None) -> None:
+    """Gather-mode conv (UE_CONV_CTRL[31]) vs channels mode on a small-C layer.
+
+    Runs run_conv2d_layer forced both ways: each must be bit-exact vs F.conv2d,
+    and gather (the small-C utilization fix, doc §9 — whole im2col patch as one
+    dot) must take fewer HW cycles. Records the gather cycle count + speedup.
+    """
+    import torch.nn.functional as F
+    kh = kernel_h if kernel_h is not None else kernel
+    kw = kernel_w if kernel_w is not None else kernel
+    if pad_h is None:
+        pad_h = pad
+    assert kh * kw * c_in * act_max * w_max <= 2048, f"{name}: budget breaks exactness"
+    assert kh * kw * c_in <= 256, f"{name}: gather needs Kh*Kw*C <= 256"
+
+    x_int = torch.randint(0, act_max + 1, (c_in, in_h, in_w), dtype=torch.int16)
+    w_int = torch.randint(-w_max, w_max + 1, (oc_count, c_in, kh, kw), dtype=torch.int16)
+    ref = _canonicalize_signed_zeros(F.conv2d(
+        x_int.to(torch.float32).unsqueeze(0), w_int.to(torch.float32),
+        stride=stride, padding=(pad_h, pad))[0].to(torch.bfloat16).contiguous())
+
+    cycles = {}
+    for mode, flag in (("gather", True), ("channels", False)):
+        ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+        hw = _canonicalize_signed_zeros(ue.run_conv2d_layer(
+            x_int.to(torch.bfloat16), w_int, stride_s=stride, pad=pad, pad_h=pad_h,
+            gather=flag))
+        exact = torch.equal(hw.view(torch.uint16), ref.view(torch.uint16))
+        assert exact, f"{name} [{mode}]: tiled layer must exactly match F.conv2d"
+        cycles[mode] = ue.last_conv_cycles
+        ue.clear_capture_buffer()
+        ue.reset_tensor_dram_addr()
+
+    speedup = cycles["channels"] / max(cycles["gather"], 1)
+    dims = (f"C={c_in}, OC={oc_count}, k={kh}x{kw}, s={stride}, in={in_h}x{in_w}, "
+            f"gather {cycles['gather']} vs channels {cycles['channels']} cyc = {speedup:.1f}x")
+    print(f"{name}: {dims} exact=True")
+    assert speedup > 1.0, (
+        f"{name}: gather ({cycles['gather']} cyc) not faster than channels "
+        f"({cycles['channels']} cyc)")
+    record_test(f"conv2d_gather-{name}", dims, cycles=cycles["gather"])
+
+
+def maxpool2d_fullsize_pytorch_test(name: str, *, c: int, in_hw: int, kernel: int,
+                                    stride: int, pad: int) -> None:
+    """FULL-resolution MaxPool2d layer via run_maxpool2d_layer, bit-exact."""
+    import torch.nn.functional as F
+
+    x = torch.randn(c, in_hw, in_hw, dtype=torch.bfloat16)
+    ref = F.max_pool2d(x.to(torch.float32).unsqueeze(0), kernel,
+                       stride=stride, padding=pad)[0]
+    ref_bf16 = _canonicalize_signed_zeros(ref.to(torch.bfloat16).contiguous())
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+    t0 = time.time()
+    hw = ue.run_maxpool2d_layer(x, kernel=kernel, stride_s=stride, pad=pad)
+    elapsed = time.time() - t0
+    hw = _canonicalize_signed_zeros(hw)
+
+    exact = torch.equal(hw.view(torch.uint16), ref_bf16.view(torch.uint16))
+    dims = (f"C={c}, k={kernel}x{kernel}, s={stride}, p={pad}, in={in_hw}x{in_hw}, "
+            f"out={ref_bf16.shape[1]}x{ref_bf16.shape[2]}, "
+            f"{-(-c // UE_VECTOR_SIZE)} channel tiles, {elapsed:.1f}s")
+    print(f"{name}: {dims} exact={exact} "
+          f"({ue.last_maxpool_cycles} cycles, {ue.last_maxpool_inst_bytes} inst bytes)")
+    assert exact, f"{name}: full-size maxpool must exactly match F.max_pool2d"
+    record_test(f"maxpool_fullsize-{name}", dims, snr_db=float('inf') if exact else 0.0,
+                inst_bytes=ue.last_maxpool_inst_bytes, cycles=ue.last_maxpool_cycles)
+    ue.clear_capture_buffer()
+    ue.reset_tensor_dram_addr()
+
+
+def conv_fullsize_pytorch_tests() -> None:
+    """Real model-resolution conv/pool layers, bit-exact vs torch.
+
+    These run the ACTUAL input tensor sizes from the model matrix (512x512
+    VAE, 640x640 YOLO stem, 64x64 SD latent, ...) through the resident
+    PBI-loop layer driver — thousands of tiles per layer — so full-size execution is
+    demonstrated on hardware, not just proven per-tile. Kept in the default
+    suite (not behind --ext) as requested; each is one representative,
+    largest-practical shape per family rather than the whole matrix.
+    """
+    # SD/SDXL VAE image input V01: Conv2d(3, 128, 3, s1, p1) @ 512x512.
+    conv2d_fullsize_pytorch_test("vae_input_512", c_in=3, oc_count=128,
+                                 kernel=3, stride=1, pad=1, in_h=512, in_w=512,
+                                 act_max=3, w_max=1)
+    # YOLO stem/downsample C06: Conv2d(3, 64, 3, s2, p1) @ 640x640 -> 320x320.
+    conv2d_fullsize_pytorch_test("yolo_stem_640", c_in=3, oc_count=64,
+                                 kernel=3, stride=2, pad=1, in_h=640, in_w=640,
+                                 act_max=3, w_max=4)
+    # SD1.5 UNet input D01 @ 64x64 latent, 4 -> 320 channels.
+    conv2d_fullsize_pytorch_test("sd_unet_in_64", c_in=4, oc_count=320,
+                                 kernel=3, stride=1, pad=1, in_h=64, in_w=64,
+                                 act_max=3, w_max=7)
+    # SD UNet deep block D05-ish @ 32x32, 640 channels (sparse acts for the
+    # deep-channel budget).
+    conv2d_fullsize_pytorch_test("sd_unet_640ch_32", c_in=640, oc_count=64,
+                                 kernel=3, stride=1, pad=1, in_h=32, in_w=32,
+                                 act_max=1, w_max=1, sparse_act_mod=3)
+    # Whisper front conv W01 @ full T=3000: Conv1d(80, 384, 3, s1, p1).
+    conv2d_fullsize_pytorch_test("whisper_front_T3000", c_in=80, oc_count=64,
+                                 kernel_h=1, kernel_w=3, stride=1, pad=1, pad_h=0,
+                                 in_h=1, in_w=3000, act_max=2, w_max=2)
+    # YOLO SPPF C10 @ real 20x20, 512 channels, k5 s1 p2.
+    maxpool2d_fullsize_pytorch_test("yolo_sppf_512_20", c=512, in_hw=20,
+                                    kernel=5, stride=1, pad=2)
+
+
+def conv_layer_pytorch_tests() -> None:
+    """Layer-level (multi-launch) and ConvTranspose coverage.
+
+    These make the full-size model suites executable: the tile tests prove
+    the per-launch math, these prove the tiling planner + halo slicing + oc
+    chunking + host reassembly on real hardware, plus the ConvTranspose2d
+    upsampler mapping.
+    """
+    # After bias/scale reuse, 20x20 legitimately fits in one launch.  Use
+    # 32x32 so this remains a multi-tile halo/reassembly regression: the
+    # 768-line activation partition yields two 16x32 output tiles.
+    conv2d_layer_pytorch_test("sd_resblock_32x32", c_in=64, oc_count=32,
+                              kernel=3, stride=1, pad=1, in_h=32, in_w=32,
+                              act_max=3, w_max=1)
+    # Whisper-style time-tiled Conv1d layer: T=384 splits into two tiles with
+    # the bias-reuse planner (T=128 now fits in one launch).
+    conv2d_layer_pytorch_test("whisper_layer_T384", c_in=80, oc_count=32,
+                              kernel_h=1, kernel_w=3, stride=1, pad=1, pad_h=0,
+                              in_h=1, in_w=384, act_max=2, w_max=2)
+    # REAL-size YOLO SPPF: 20x20 map, 128 channels -> 2 channel tiles x 3 row
+    # chunks (k5 total taps cap = 163 output pixels/launch).
+    maxpool2d_layer_pytorch_test("yolo_sppf_real_20x20", c=128, in_hw=20,
+                                 kernel=5, stride=1, pad=2)
+    # Generic UNet/SAM decoder upsampler: ConvTranspose2d(k4, s2, p1) as four
+    # interleaved k2 convs (U03/U04 class).
+    conv_transpose2d_pytorch_test("unet_up_4x4s2p1", c_in=64, oc_count=16,
+                                  in_hw=4, act_max=3, w_max=2)
+    # SD/SDXL VAE decoder + UNet nearest-neighbour 2x upsample (resize-conv
+    # upsampler, distinct from the learned ConvTranspose above): four uniform
+    # strided DMA passes. Small shape proves the addressing, the 64x64x512
+    # shape is the decoder's first up-stage at true model size (multi-round
+    # staging in both axes).
+    # Pure-host guard first: the 512-ch shape below has a 65536-byte vertical
+    # chunk that silently masked to 0 in the descriptor and scrambled 77% of
+    # the output on hardware. Runs without a board, so it catches a regression
+    # before the DMA does.
+    stride_field_width_test()
+    nn_upsample_2x_pytorch_test("nn_upsample_small", c=128, in_h=5, in_w=7)
+    # 64-lane SiLU plumbing runs early so a later full-size VAE stress failure
+    # cannot hide it. ReLU directly isolates the MAXPOOL [x,0] sign split;
+    # SiLU then covers EXP and the full polynomial schedule. The 128x33x32
+    # shape crosses the 1023-output MAXPOOL geometry boundary.
+    silu_mul_add_reference_test()
+    silu_descriptor_contract_test()
+    relu_layer_pytorch_test("relu_sign_split", c=128, in_h=33, in_w=32)
+    silu_layer_pytorch_test("silu_small", c=64, in_h=8, in_w=8)
+    silu_layer_pytorch_test("silu_round_boundary", c=128, in_h=33, in_w=32)
+    nn_upsample_2x_pytorch_test("vae_up_64x64_512ch", c=512, in_h=64, in_w=64)
+    # GroupNorm (every VAE ResNetBlock + norm_out). The small shape proves the
+    # lane-wise reduction; vae_gn_mid_512 is the mid-block/up-stage-0 shape;
+    # vae_gn_up1_512 crosses the 262,080-element single-row reduction cap that
+    # a LayerNorm-shaped GroupNorm would hit, and must score no worse than the
+    # smaller shapes (that is the accumulator flush doing its job).
+    group_norm_pytorch_test("gn_small", c=64, in_h=8, in_w=8)
+    group_norm_pytorch_test("gn_no_affine", c=128, in_h=16, in_w=16, affine=False)
+    group_norm_pytorch_test("vae_gn_mid_512", c=512, in_h=64, in_w=64)
+    group_norm_pytorch_test("vae_gn_up1_512", c=512, in_h=128, in_w=128)
+    # FUSED [nearest 2x upsample -> conv k3 s1 p1] as four parity k2 sub-convs:
+    # the deployment form of the two ops above it, doing 4/9 the MACs and never
+    # building the 2x map. Small shape proves the fold's parity/padding
+    # bookkeeping; vae_up_conv_64x64 is the decoder's first up-stage geometry.
+    # w_max=1 is forced by the fold summing 4 codes into INT4's [-8, 7].
+    nn_upsample_conv3x3_pytorch_test("nn_upconv_small", c_in=64, oc_count=16,
+                                     in_h=5, in_w=7)
+    nn_upsample_conv3x3_pytorch_test("nn_upconv_bias", c_in=64, oc_count=16,
+                                     in_h=6, in_w=6, bias_enable=True)
+    nn_upsample_conv3x3_pytorch_test("vae_up_conv_64x64", c_in=128, oc_count=64,
+                                     in_h=64, in_w=64)
+    # VAE mid-block AttnBlock: the seam between the conv writeback layout and
+    # the attention core's [batch, head_dim] contract (byte-identical when
+    # C % 64 == 0, so no transpose kernel), plus the residual adding the block
+    # INPUT rather than the normalised tensor.
+    vae_attention_block_pytorch_test("vae_attn_small", c=64, in_h=8, in_w=8,
+                                     num_groups=8)
+    vae_attention_block_pytorch_test("vae_attn_seq256", c=256, in_h=16, in_w=16)
+    # The REAL SD 512x512 mid-block: seq=4096, head_dim=512. 8x the longest
+    # sequence any attention test covers (unified_attention_test tops out at
+    # seq=512), and ~75 MB of bias+scratch, so this is the shape that decides
+    # whether the dense path is deployable at all.
+    vae_attention_block_pytorch_test("vae_attn_mid_real_4096", c=512,
+                                     in_h=64, in_w=64)
+    # ResNetBlock residual add (ELTWISE_ADD layer driver). Small shape proves
+    # the bank split; the 512x512x128 shape is the decoder's last stage and
+    # forces 129 staging rounds.
+    eltwise_add_layer_pytorch_test("eltwise_add_small", c=64, in_h=8, in_w=8)
+    eltwise_add_layer_pytorch_test("vae_resid_512x512_128ch", c=128,
+                                   in_h=512, in_w=512)
+    # Whole-decoder structural check. Pure host function, like the SiLU
+    # approximation contract above.
+    vae_decoder_plan_test("sd_vae_decoder_512")
+    # Gather mode (UE_CONV_CTRL[31]) small-C utilization fix: gather vs channels
+    # both bit-exact, gather fewer cycles. VAE/YOLO stem (C=3) + Whisper (C=80).
+    # The VAE stem runs the head-to-head at TRUE model resolution (512x512), the
+    # same shape conv2d_fullsize-vae_input_512 deploys.
+    conv2d_gather_pytorch_test("vae_stem_512", c_in=3, oc_count=128, kernel=3,
+                               stride=1, pad=1, in_h=512, in_w=512, act_max=3, w_max=1)
+    conv2d_gather_pytorch_test("whisper_gather", c_in=80, oc_count=64,
+                               kernel_h=1, kernel_w=3, stride=1, pad=1, pad_h=0,
+                               in_h=1, in_w=128, act_max=2, w_max=2)
+    # Maximum four-chunk path with a C_in % 4 tail. This rotates the bank
+    # mapping between kernel taps and crosses multiple 64-word boundaries.
+    conv2d_gather_pytorch_test("gather4_tail", c_in=27, oc_count=16,
+                               kernel=3, stride=1, pad=1, in_h=16, in_w=16,
+                               act_max=2, w_max=1)
+
+
+def queued_conv_config_contract_test(name: str = "queued_conv_config_contract") -> None:
+    """Pure-host CONFIG encoding, validation, and conv tile/scale contracts."""
+    import struct
+    import user_dma_core as udc
+
+    def capture_engine(mode):
+        # Bypass hardware setup and constructor RNG draws, as in the other
+        # descriptor contract tests. Capture real production instructions.
+        engine = object.__new__(udc.UnifiedEngine)
+        engine.capture_buffer = []
+        engine.capture_count = 0
+        engine.is_capture_on = True
+        engine._inst_id = 0
+        engine._capture_conv_geometry = None
+        engine.conv_geometry_mode = mode
+        writes = []
+        engine.write_reg32 = lambda address, value: writes.append((address, value))
+        return engine, writes
+
+    geom_a = dict(
+        out_w=4, out_h=4, ct=1, kernel_w=1, kernel_h=1, oc_count=64,
+        row_stride=4, col_stride=1, pix_col_step=1, pix_row_step=4)
+    geom_b = dict(
+        out_w=2, out_h=2, ct=1, kernel_w=2, kernel_h=2, oc_count=1,
+        row_stride=4, col_stride=1, pix_col_step=2, pix_row_step=8)
+
+    # 1. The live geometry CSR map must not overwrite hardware information.
+    assert udc.UE_HW_INFO_ADDR == 0x000000A0, f"{name}: HW_INFO CSR moved"
+    geometry_addrs = (udc.UE_CONV_GEOM_ADDR, udc.UE_CONV_CTRL_ADDR,
+                      udc.UE_CONV_STRIDE_ADDR, udc.UE_CONV_PIXSTEP_ADDR)
+    assert geometry_addrs == (0x0000006C, 0x000000A4, 0x000000A8, 0x000000AC), (
+        f"{name}: live geometry CSR map changed: {geometry_addrs}")
+    assert udc.UE_LAST_REG_ADDR == udc.UE_HW_INFO_ADDR, (
+        f"{name}: register snapshot must end at HW_INFO")
+    engine, writes = capture_engine(CONV_GEOMETRY_LIVE_CSR)
+    words_a = udc.pack_conv2d_geometry_words(**geom_a)
+    engine.write_conv2d_geometry_registers(**geom_a)
+    assert writes == list(zip(geometry_addrs, words_a)), (
+        f"{name}: live geometry writes do not match the packed words")
+
+    # 2. Queue CONFIG is deliberately not deduplicated: each operation site
+    # must re-establish its geometry after a loop backedge or branch join.
+    engine, writes = capture_engine(CONV_GEOMETRY_QUEUE_CONFIG)
+    engine.write_conv2d_geometry_registers(**geom_a)
+    engine.write_conv2d_geometry_registers(**geom_a)
+    engine.write_conv2d_geometry_registers(**geom_b)
+    words_b = udc.pack_conv2d_geometry_words(**geom_b)
+    assert writes == [], f"{name}: captured CONFIG unexpectedly wrote live CSRs"
+    assert engine.capture_count == 3, f"{name}: CONFIG sites were deduplicated"
+    assert [inst.words for inst in engine.capture_buffer] == [
+        [0x00000C00, *words_a, 0, 0, 0],
+        [0x00000C01, *words_a, 0, 0, 0],
+        [0x00000C02, *words_b, 0, 0, 0],
+    ], f"{name}: CONFIG opcode, instruction ID, or geometry payload changed"
+    first_words = struct.unpack("<8I", engine.capture_buffer[0].get_bytes())
+    assert first_words == tuple(engine.capture_buffer[0].words), (
+        f"{name}: CONFIG byte encoding is not little-endian eight-word data")
+
+    # 3. Legacy capture writes one geometry and rejects mixed geometries.
+    engine, writes = capture_engine(CONV_GEOMETRY_LIVE_CSR)
+    engine.write_conv2d_geometry_registers(**geom_a)
+    engine.write_conv2d_geometry_registers(**geom_a)
+    assert len(writes) == 4, f"{name}: legacy capture repeated geometry writes"
+    try:
+        engine.write_conv2d_geometry_registers(**geom_b)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError(f"{name}: legacy capture accepted mixed geometries")
+
+    # 4. Queue mode outside capture retains the live-CSR fallback.
+    engine, writes = capture_engine(CONV_GEOMETRY_QUEUE_CONFIG)
+    engine.is_capture_on = False
+    engine.write_conv2d_geometry_registers(**geom_a)
+    assert len(writes) == 4, f"{name}: uncaptured geometry did not use live CSRs"
+
+    # 5. Reject reserved bits, unsupported gather chunks, inconsistent ceil
+    # counts, and an OC*chunks product that exceeds the capture field.
+    try:
+        udc.validate_conv2d_geometry_words(
+            (words_a[0], words_a[1] | (1 << 24), words_a[2], words_a[3]))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"{name}: geometry accepted a reserved CTRL bit")
+    gather_geom = dict(
+        out_w=1, out_h=1, ct=1, kernel_w=3, kernel_h=3, oc_count=64,
+        row_stride=3, col_stride=1, pix_col_step=1, pix_row_step=3,
+        gather=True)
+    gather4 = udc.pack_conv2d_geometry_words(
+        **gather_geom, c_in=27, blocks_per_pixel=64 * 4, chunks=4)
+    assert (gather4[1] >> 8) & 0xFFFF == 64, f"{name}: gather OC encoding changed"
+    assert (gather4[3] >> 24) & 0x7 == 4, f"{name}: gather chunk encoding changed"
+    try:
+        udc.pack_conv2d_geometry_words(
+            **gather_geom, c_in=33, blocks_per_pixel=64 * 5, chunks=5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"{name}: geometry accepted five gather chunks")
+    try:
+        udc.pack_conv2d_geometry_words(
+            **geom_a, gather=True, c_in=64, blocks_per_pixel=64 * 2, chunks=2)
+    except ValueError as error:
+        assert "ceil" in str(error), f"{name}: unexpected chunk-count error: {error}"
+    else:
+        raise AssertionError(f"{name}: geometry accepted an inconsistent chunk count")
+    overflowing_bpp = list(gather4)
+    overflowing_bpp[1] = (overflowing_bpp[1] & ~0x00FFFF00) | (16384 << 8)
+    try:
+        udc.validate_conv2d_geometry_words(tuple(overflowing_bpp))
+    except ValueError as error:
+        assert "oc_count*chunks" in str(error), (
+            f"{name}: unexpected capture-size error: {error}")
+    else:
+        raise AssertionError(f"{name}: geometry accepted overflowing OC*chunks")
+
+    # 6. CONFIG instruction generation itself requires capture mode.
+    engine, _ = capture_engine(CONV_GEOMETRY_QUEUE_CONFIG)
+    engine.is_capture_on = False
+    try:
+        engine.generate_instruction_conv_config(words_a)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError(f"{name}: CONFIG generation accepted inactive capture")
+
+    # 7. Spatial search covers the YOLO stem exactly once. Short edge tiles
+    # may use a different geometry from the interior; a uniform tile shape
+    # is not part of the queued CONFIG contract.
+    out_h, out_w, oc_chunk, tiles = udc.plan_conv2d_layer_tiles(
+        c_in=3, oc_count=64, in_h=640, in_w=640,
+        kernel_h=3, kernel_w=3, stride_s=2, pad=1, gather=True,
+        act_uram_addr=0, wb_uram_addr=0x300)
+    assert (out_h, out_w, oc_chunk) == (320, 320, 64), (
+        f"{name}: YOLO stem output/channel plan changed")
+    coverage = torch.zeros((out_h, out_w), dtype=torch.int32)
+    for oy0, ox0, th, tw, y0, x0, win_h, win_w in tiles:
+        assert th > 0 and tw > 0 and 0 <= oy0 <= out_h - th and 0 <= ox0 <= out_w - tw, (
+            f"{name}: YOLO stem output tile is out of bounds")
+        assert (y0, x0, win_h, win_w) == (2 * oy0, 2 * ox0, 2 * th + 1, 2 * tw + 1), (
+            f"{name}: YOLO stem input window does not match its output tile")
+        assert y0 + win_h <= 642 and x0 + win_w <= 642, (
+            f"{name}: YOLO stem input window exceeds the padded image")
+        assert win_h * win_w <= 0x300, (
+            f"{name}: YOLO stem activation tile exceeds its URAM allocation")
+        output_elements = th * tw * oc_chunk
+        output_lines = (output_elements + 63) // 64
+        assert output_elements <= 0xFFFF and 0x300 + output_lines <= 4096, (
+            f"{name}: YOLO stem output tile exceeds capture/URAM capacity")
+        coverage[oy0:oy0 + th, ox0:ox0 + tw] += 1
+    assert bool(torch.all(coverage == 1)), (
+        f"{name}: YOLO stem tiles must cover each output pixel exactly once")
+    udc.conv2d_tile_geometry_groups(tiles)  # At most four contiguous CONFIG groups.
+
+    # 8. Channel scales store one reusable [OC][tap] pattern, not one per pixel.
+    scales = torch.arange(6, dtype=torch.float32).view(2, 3)
+    packed = udc.conv2d_pack_scale_stream(
+        scales, oc_count=2, taps=3, out_h=7, out_w=5)
+    assert packed.numel() == 6 and torch.equal(packed.float(), scales.flatten()), (
+        f"{name}: channel scales were spatially replicated or reordered")
+
+    # 9. Reusing scales removes the former spatial scale-BRAM tile limit.
+    _, _, oc_chunk, tiles = udc.plan_conv2d_layer_tiles(
+        c_in=64, oc_count=64, in_h=80, in_w=80,
+        kernel_h=3, kernel_w=3, stride_s=1, pad=1,
+        gather=False, wb_uram_addr=2032)
+    tile_h, tile_w = tiles[0][2:4]
+    assert oc_chunk * 9 <= udc.SCALE_BRAM_ELEMENTS, (
+        f"{name}: channel scale pattern exceeds BRAM capacity")
+    assert tile_h * tile_w * oc_chunk > 910, (
+        f"{name}: tile planner retained the old floor(8192/9) spatial limit")
+
+    dims = "9 host cases: CSR map, CONFIG encoding/capture, geometry guards, tiles/scales"
+    print(f"{name}: {dims}")
+    record_test(name, dims, snr_db=float('inf'))
+
+
+def queued_conv_config_hardware_test() -> None:
+    """Execute two MAXPOOL geometries from one DRAM program.
+
+    This is the hardware acceptance test for CONFIG ordering: the program has
+    exactly one queue start and no host geometry writes between operations.
+    The two bit-exact outputs prove that each operation consumed its adjacent
+    queued geometry rather than the final live CSR value.
+    """
+    import torch.nn.functional as F
+
+    x = torch.arange(1, 17, dtype=torch.float32).reshape(1, 4, 4)
+    x = x.expand(64, -1, -1).to(torch.bfloat16).contiguous()
+    ref_a = F.max_pool2d(x.float().unsqueeze(0), 3, stride=1)[0].to(torch.bfloat16)
+    ref_b = F.max_pool2d(x.float().unsqueeze(0), 2, stride=2)[0].to(torch.bfloat16)
+
+    ue = UnifiedEngine(conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
+    packed = conv2d_pack_activation_map(x, 0)
+    act_addr = ue.allocate_params_dram(packed.numel() * 2, label="queue_cfg_act")
+    out_addr = ue.allocate_tensor_dram(2 * 4 * UE_VECTOR_SIZE * 2, label="queue_cfg_out")
+    ue.dma_to_accelerator_memory(act_addr, packed)
+
+    pool_wb_sram = 0x300 << 7
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=act_addr,
+        sram_address=0,
+        element_size=0,
+        memcpy_length_bytes=packed.numel() * 2)
+    ue.start_queue_for_maxpool2d_operation(
+        act_sram_start_addr=0,
+        output_sram_wb_addr=pool_wb_sram,
+        kernel_w=3,
+        kernel_h=3,
+        out_w=2,
+        out_h=2,
+        w_pad=4,
+        stride_s=1)
+    ue.sram_to_accelerator_memory(
+        sram_address=pool_wb_sram,
+        accelerator_dram_address=out_addr,
+        element_size=0,
+        memcpy_length_bytes=4 * UE_VECTOR_SIZE * 2)
+    ue.start_queue_for_maxpool2d_operation(
+        act_sram_start_addr=0,
+        output_sram_wb_addr=pool_wb_sram,
+        kernel_w=2,
+        kernel_h=2,
+        out_w=2,
+        out_h=2,
+        w_pad=4,
+        stride_s=2)
+    ue.sram_to_accelerator_memory(
+        sram_address=pool_wb_sram,
+        accelerator_dram_address=out_addr + 4 * UE_VECTOR_SIZE * 2,
+        element_size=0,
+        memcpy_length_bytes=4 * UE_VECTOR_SIZE * 2)
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+
+    configs = [
+        inst for inst in ue.get_captured_instructions()
+        if ((int(inst.words[0]) >> 8) & 0xF) == INSTRUCTION_CONFIG
+    ]
+    assert len(configs) == 2, f"expected two queued CONFIG instructions, got {len(configs)}"
+    assert configs[0].words[1:5] != configs[1].words[1:5], (
+        "mixed-geometry smoke accidentally emitted identical CONFIG payloads")
+
+    program_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_addr)
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.allocate_program_dram(inst_bytes, label="queue_cfg_program")
+
+    starts = 0
+    ue.start_execute_from_dram(program_addr)
+    starts += 1
+    ue.wait_queue(timeout_seconds=20.0)
+    assert starts == 1, f"queued mixed-geometry program used {starts} starts"
+
+    got = ue.dma_from_accelerator_memory(
+        out_addr, (2, 4, UE_VECTOR_SIZE)).to(torch.bfloat16)
+    expected_a = ref_a[0].reshape(4, 1).expand(4, UE_VECTOR_SIZE)
+    expected_b = ref_b[0].reshape(4, 1).expand(4, UE_VECTOR_SIZE)
+    assert torch.equal(got[0], expected_a), (
+        f"queued CONFIG A mismatch: expected={expected_a[:, 0].tolist()} "
+        f"got={got[0, :, 0].tolist()}")
+    assert torch.equal(got[1], expected_b), (
+        f"queued CONFIG B mismatch: expected={expected_b[:, 0].tolist()} "
+        f"got={got[1, :, 0].tolist()}")
+
+    print("queued_conv_config: PASS "
+          f"(one start, {len(configs)} configs, {inst_bytes} instruction bytes)")
+    record_test(
+        "queued-conv-config-mixed-geometry",
+        "MAXPOOL 3x3/s1 -> 2x2/s2, one DRAM program",
+        snr_db=float("inf"),
+        inst_bytes=inst_bytes)
+    ue.clear_capture_buffer()
+
+
+def conv_maxpool_pytorch_tests() -> None:
+    """Real-model conv/pool tile geometries, bit-exact vs PyTorch.
+
+    Same layer set as the on-device C tests (andromeda.c test_conv_* /
+    test_maxpool_*), with per-element random data instead of the constructive
+    per-pixel patterns, plus bias and fused-ReLU coverage.
+    """
+    # ResNet-50 stem: Conv2d(3, 64, 7, stride=2, padding=3) tile -> out 4x4.
+    conv2d_pytorch_test("resnet_stem_7x7s2", c_in=3, oc_count=8, kernel=7,
+                        stride=2, pad=3, in_hw=7, act_max=3, w_max=4)
+    # ResNet/VGG body: Conv2d(64, N, 3, stride=1, padding=1), full 64 lanes.
+    conv2d_pytorch_test("resnet_3x3s1", c_in=64, oc_count=16, kernel=3,
+                        stride=1, pad=1, in_hw=6, act_max=3, w_max=1)
+    # Bottleneck / MobileNet pointwise: Conv2d(64, N, 1) (add_itr = 1 edge path).
+    conv2d_pytorch_test("pointwise_1x1", c_in=64, oc_count=16, kernel=1,
+                        stride=1, pad=0, in_hw=8, act_max=3, w_max=7)
+    # AlexNet conv1: Conv2d(3, N, 11, stride=4, padding=2) tile -> out 2x2.
+    conv2d_pytorch_test("alexnet_11x11s4", c_in=3, oc_count=4, kernel=11,
+                        stride=4, pad=2, in_hw=11, act_max=2, w_max=2)
+    # YOLOv8/11 stage downsample: Conv2d(64, N, 3, stride=2, padding=1) tile.
+    conv2d_pytorch_test("yolo_down_3x3s2", c_in=64, oc_count=16, kernel=3,
+                        stride=2, pad=1, in_hw=9, act_max=3, w_max=1)
+    # Fused epilogue: conv + bias + ReLU vs F.relu(F.conv2d(..., bias=b)).
+    conv2d_pytorch_test("conv_bias_relu_3x3s1", c_in=64, oc_count=16, kernel=3,
+                        stride=1, pad=1, in_hw=6, act_max=3, w_max=1,
+                        bias_enable=True, relu_enable=True)
+    # Non-uniform per-(oc,tap) block scales (power-of-two -> still exact):
+    # guards the scale-BRAM stream order + per-pixel rewind contract.
+    conv2d_pytorch_test("conv_mixed_scale_3x3s1", c_in=64, oc_count=16, kernel=3,
+                        stride=1, pad=1, in_hw=6, act_max=1, w_max=1,
+                        mixed_scale=True)
+    # YOLO P1/2 stem: Conv2d(3, 64, 3, stride=2, padding=1) — RGB in lanes.
+    conv2d_pytorch_test("yolo_stem_3x3s2", c_in=3, oc_count=16, kernel=3,
+                        stride=2, pad=1, in_hw=8, act_max=3, w_max=4)
+    # YOLO deeper stages have C_in >= 128 -> CT = 2 (two URAM lines per pixel,
+    # ct-inner walk). First multi-channel-tile coverage on hardware.
+    conv2d_pytorch_test("yolo_ct2_3x3s2", c_in=128, oc_count=16, kernel=3,
+                        stride=2, pad=1, in_hw=9, act_max=1, w_max=1)
+    # CT=2 pointwise: taps = 2 exercises the add_itr=2 accumulator bucket.
+    conv2d_pytorch_test("yolo_ct2_1x1", c_in=128, oc_count=16, kernel=1,
+                        stride=1, pad=0, in_hw=8, act_max=3, w_max=5)
+    # Swin/SwinV2 patch embed: Conv2d(3, 96/128, 4, stride=4) (oc tile of 8).
+    # 32x32 input tile = 1024 map lines (writeback moved to 0x400) and the
+    # launch sits exactly at the 8192-block scale-BRAM cap.
+    conv2d_pytorch_test("swin_patch_4x4s4", c_in=3, oc_count=8, kernel=4,
+                        stride=4, pad=0, in_hw=32, act_max=3, w_max=7,
+                        wb_uram_addr=0x400)
+    # ViT-H/14 & SmolVLM/SmolVLM2 (SigLIP-style, patch_size=14) patch embed:
+    # Conv2d(3, hidden, 14, stride=14) tile; taps = 196 per window.
+    conv2d_pytorch_test("vit_patch_14x14s14", c_in=3, oc_count=8, kernel=14,
+                        stride=14, pad=0, in_hw=28, act_max=3, w_max=1,
+                        wb_uram_addr=0x340)
+    # YOLO Conv+BN+SiLU epilogue (BN folded; SiLU on the LALU ACT leg).
+    conv2d_act_pytorch_test("yolo_conv_silu_3x3s1", c_in=64, oc_count=16,
+                            kernel=3, stride=1, pad=1, in_hw=6, activation="silu")
+    # --- Whisper-style audio conv stem: Conv1d == CONV2D with H=1 / Kh=1
+    # (channels in lanes, time on the W axis, padding on time only). ---
+    # conv1: Conv1d(n_mels=80 -> d_model, 3, stride=1, padding=1). 80 mels ->
+    # CT=2 with a PARTIAL second tile (lanes 16..63 zero-padded) — first
+    # partial-channel-tile coverage.
+    conv2d_pytorch_test("whisper_conv1_80mel_1x3s1", c_in=80, oc_count=16,
+                        kernel_h=1, kernel_w=3, stride=1, pad=1, pad_h=0,
+                        in_h=1, in_w=16, act_max=2, w_max=2)
+    # conv2: Conv1d(d_model -> d_model, 3, stride=2, padding=1) at d=384
+    # (whisper-tiny) -> CT=6, the deepest ct-inner walk in the suite.
+    conv2d_pytorch_test("whisper_conv2_384ch_1x3s2", c_in=384, oc_count=16,
+                        kernel_h=1, kernel_w=3, stride=2, pad=1, pad_h=0,
+                        in_h=1, in_w=30, act_max=1, w_max=1)
+    # Whisper epilogue: Conv1d + GELU on the LALU ACT leg (SNR-gated),
+    # routed through conv1d_core.
+    conv2d_act_pytorch_test("whisper_conv_gelu_1x3s1", c_in=80, oc_count=16,
+                            kernel=3, kernel_h=1, stride=1, pad=1,
+                            in_h=1, in_w=16, activation="gelu")
+    # Rectangular input (H != W): all other 2D cases are square, so this is
+    # what catches an out_h/out_w or row/col geometry-field swap.
+    conv2d_pytorch_test("rect_input_3x3s1", c_in=64, oc_count=16, kernel=3,
+                        stride=1, pad=1, in_h=4, in_w=8, act_max=3, w_max=1)
+    # Factorized / asymmetric kernel (Inception-style 7x1): exercises the
+    # ky-major kernel walk with a single-column window.
+    conv2d_pytorch_test("rect_kernel_7x1", c_in=64, oc_count=16,
+                        kernel_h=7, kernel_w=1, stride=1, pad=0,
+                        in_h=8, in_w=4, act_max=3, w_max=1)
+    # Dilated 3x3, d=2, padding=2 (DeepLab-ASPP / TCN-style, same-size
+    # output): dilation rides the kernel-step registers.
+    conv2d_pytorch_test("dilated_3x3d2", c_in=64, oc_count=16, kernel=3,
+                        stride=1, pad=2, in_hw=6, act_max=3, w_max=1,
+                        dilation=2)
+    # --- Diffusion models (Stable Diffusion 1.5/2/XL, SD3/Flux/PixArt) ---
+    # SD/SDXL VAE encoder downsample: F.pad(x, (0,1,0,1)) + Conv2d(C, C, 3,
+    # stride=2, padding=0) — the right/bottom-only pad is host-materialised.
+    conv2d_pytorch_test("sd_vae_down_3x3s2_asympad", c_in=64, oc_count=16,
+                        kernel=3, stride=2, pad=0, in_hw=9,
+                        asym_pad=(0, 1, 0, 1), act_max=3, w_max=1)
+    # SD3/Flux/PixArt/DiT patchify: Conv2d(latent 4/16 ch -> hidden, 2,
+    # stride=2, padding=0).
+    conv2d_pytorch_test("dit_patchify_2x2s2", c_in=16, oc_count=16, kernel=2,
+                        stride=2, pad=0, in_hw=8, act_max=3, w_max=7)
+    # SD/SDXL UNet ResNet conv at 1280 channels -> CT=20 (also whisper-large
+    # d_model): the deepest channel-tile walk. Deterministic 1/6-sparse
+    # binary activations keep the 9x1280-product window inside the 2048
+    # integer-exactness budget while every tile carries nonzero lanes.
+    # (VAE decoder 512-ch k3s1 convs are the CT=8 shape — see wav2vec2_mid.)
+    conv2d_pytorch_test("sd_unet_ct20_3x3s1", c_in=1280, oc_count=11, kernel=3,
+                        stride=1, pad=1, in_hw=2, act_max=1, w_max=1,
+                        sparse_act_mod=6)
+    # --- wav2vec2 / HuBERT audio frontend (Conv1d feature-extractor stack) ---
+    # conv0: Conv1d(1, 512, 10, stride=5) on raw waveform: single active
+    # lane (c_in=1) and the widest 1D kernel in the suite.
+    conv2d_pytorch_test("wav2vec2_conv0_1x10s5", c_in=1, oc_count=16,
+                        kernel_h=1, kernel_w=10, stride=5, pad=0, pad_h=0,
+                        in_h=1, in_w=50, act_max=3, w_max=7)
+    # mid-stack: Conv1d(512, 512, 3, stride=2) -> CT=8 with dense random
+    # activations (also the SD-VAE decoder 512-ch channel depth).
+    conv2d_pytorch_test("wav2vec2_mid_512ch_1x3s2", c_in=512, oc_count=16,
+                        kernel_h=1, kernel_w=3, stride=2, pad=0, pad_h=0,
+                        in_h=1, in_w=33, act_max=1, w_max=1)
+    # --- Remaining class gaps from the model-suite matrix ---
+    # C08 / V04 / V08 class: 2D k3 s2 at 512 channels -> CT=8 in the 2D walk
+    # (1/3-sparse deterministic acts keep the 9x512 window in budget).
+    conv2d_pytorch_test("vae_ct8_3x3s2", c_in=512, oc_count=8, kernel=3,
+                        stride=2, pad=1, in_hw=5, act_max=1, w_max=1,
+                        sparse_act_mod=3)
+    # I01/I02: SD inpainting UNet conv_in — 9 input channels (latent + mask +
+    # masked-image latent) on partial lanes.
+    conv2d_pytorch_test("sd_inpaint_9ch_3x3s1", c_in=9, oc_count=16, kernel=3,
+                        stride=1, pad=1, in_hw=6, act_max=3, w_max=7)
+    # D01/D09: SD/SDXL UNet conv_in — 4 latent channels.
+    conv2d_pytorch_test("sd_unet_in_4ch_3x3s1", c_in=4, oc_count=16, kernel=3,
+                        stride=1, pad=1, in_hw=6, act_max=3, w_max=7)
+    # W06: whisper large-v3 front conv at 128 mel bins (exactly two full
+    # channel tiles, unlike 80-mel's partial second tile).
+    conv2d_pytorch_test("whisper_conv1_128mel_1x3s1", c_in=128, oc_count=16,
+                        kernel_h=1, kernel_w=3, stride=1, pad=1, pad_h=0,
+                        in_h=1, in_w=16, act_max=2, w_max=2)
+    # ViT-B/16 & SigLIP (k=16) and ViT-B/32 (k=32) patch embeds: kernels
+    # exceed the 4-bit geometry fields, so they deploy as im2col + matmul.
+    patch_embed_matmul_pytorch_test("vit_b16_siglip", patch=16, grid=3,
+                                    act_max=2, w_max=1)
+    patch_embed_matmul_pytorch_test("vit_b32", patch=32, grid=2,
+                                    act_max=1, w_max=1, checkerboard=True)
+    # 4x4 patch embed of a 3x384x384 image (K=C*4*4=48 -> N=64): patch <= 15,
+    # so it runs as a NATIVE Conv2d(3, 64, 4, stride=4) through run_conv2d_layer
+    # (gather mode), the conv2d twin of patching_test's gather-matmul path.
+    patch_embed_conv2d_pytorch_test("conv2d_384", patch=4, grid=96,
+                                    c_in=3, oc_count=64, act_max=2, w_max=1)
+
+    # ResNet stem pool: MaxPool2d(3, stride=2) (odd window).
+    maxpool2d_pytorch_test("resnet_3x3s2", in_hw=9, kernel=3, stride=2, pad=0)
+    # VGG / classic pool: MaxPool2d(2, stride=2) (even window).
+    maxpool2d_pytorch_test("vgg_2x2s2", in_hw=8, kernel=2, stride=2, pad=0)
+    # YOLO SPPF: MaxPool2d(5, stride=1, padding=2) chained x3 with host
+    # restaging (-inf halo re-materialised between stages).
+    maxpool2d_pytorch_test("yolo_sppf_5x5s1p2", in_hw=8, kernel=5, stride=1,
+                           pad=2, chain=3)
+    # Same SPPF chain as ONE captured program: each stage's writeback lands
+    # strided into the next stage's pre-filled -inf map, so no host in the loop.
+    maxpool2d_chain_pytorch_test("yolo_sppf_chain_x3", in_hw=8, kernel=5,
+                                 pad=2, chain=3)
+
+
+def conv_regression_tests() -> None:
+    """Run identical convolution inputs regardless of preceding legacy tests."""
+    # AXI widths and --ext take different legacy paths. Start this block from
+    # its own seed, including engine-constructor draws, then restore both
+    # caller streams on success or failure.
+    rng_state = _capture_rng_state()
+    try:
+        random.seed(0)
+        torch.manual_seed(0)
+        # Validate queue-native geometry before any hardware execution.
+        queued_conv_config_contract_test()
+        queued_conv_config_hardware_test()
+        conv_maxpool_pytorch_tests()
+        conv_layer_pytorch_tests()
+        conv_fullsize_pytorch_tests()
+        # Keep an explicit smoke for the legacy live-CSR geometry fallback.
+        maxpool2d_pytorch_test(
+            "legacy_csr_fallback", in_hw=4, kernel=2, stride=2, pad=0,
+            conv_geometry_mode=CONV_GEOMETRY_LIVE_CSR)
+    finally:
+        _restore_rng_state(rng_state)
+
 
 def matmat_mul_quantized_weights_unified_test(
     M: int, K: int, N: int, bias_enable: bool = False,
@@ -8494,6 +10786,10 @@ if __name__ == "__main__":
 
     llama32_1b_inference_test()
     llama32_1b_if8_inference_test()
+
+    # Run new coverage only after every legacy test, including model inference.
+    # The wrapper preserves both RNG streams and the legacy end fingerprint.
+    conv_regression_tests()
 
     _ALL_TESTS_PASSED_BEFORE_SUMMARY = True
     # Clean run: write the summary directly and hard-exit 0 so the atexit hook
