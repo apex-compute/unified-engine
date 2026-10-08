@@ -229,14 +229,16 @@ class Qwen25OmniLMMixin:
 
         if getattr(self, "_vision_weight_init_done", False):
             self._loud("  [LM] reclaiming the params window from vision weights")
+        self.layout.begin_weight_stage("lm")
         self.reset_params_dram_addr()
         # The first successful DMA below starts destroying every previous
         # occupant of this phase-shared window. Invalidate optimistic cache
         # flags before that can happen so a short write remains safely retryable.
         self._lm_weight_init_done = False
-        self._vision_weight_init_done = False
-        if hasattr(self, "_audio_weight_init_done"):
-            self._audio_weight_init_done = False
+        if self.layout.evicts_weights:
+            self._vision_weight_init_done = False
+            if hasattr(self, "_audio_weight_init_done"):
+                self._audio_weight_init_done = False
         start = self.get_params_dram_addr()
         quantized = self._lm_quantized_projections()
         q_desc = "/".join(t.upper() for t in
@@ -626,7 +628,7 @@ class Qwen25OmniLMMixin:
             self.LM_RESIDUAL = alloc(H, "lm.residual_decode")
         if reuse_tp_scratch and getattr(self, "multi_core", 1) > 1:
             # GATE/UP/MULT become private per-engine lanes (allocated below,
-            # once LANE and mc_arena are in scope) instead of one shared
+            # once LANE and layout are in scope) instead of one shared
             # [P, MLP] plane -- same reasoning as LM_MLP_DOWN_TP_PER_ENGINE:
             # engine e is the sole writer AND reader of lane e throughout
             # gate -> up -> mult -> down, so nothing about that chain needs
@@ -733,7 +735,7 @@ class Qwen25OmniLMMixin:
             # it is the first thing a context bump breaks. alloc_tensor would
             # report the overflow but not the number to set, which is how the
             # ceiling previously had to be found by bisection.
-            slice_bytes = self.mc_arena.tensor_bytes
+            slice_bytes = self.layout.tensor_bytes
             # GATE/UP's private lane width. Same LANE every TP matmul call
             # uses (_emit_prefill_mlp_tp derives it identically from
             # sched.num_engines), computed here too because tensor init runs
@@ -761,18 +763,18 @@ class Qwen25OmniLMMixin:
                     f"config -- but check MAX_CONTEXT_SIZE's note first: past "
                     f"4096 the shared-pool gap binds before this slice does, and "
                     f"growing the slice makes that gap smaller, not larger.")
-            self.LM_SCRATCH = self.mc_arena.alloc_tensor(
+            self.LM_SCRATCH = self.layout.alloc_tensor(
                 0, n_core0_scratch * bpe, "lm core0 attn scratch")
             # Guard above core 0's scratch. The kernel's scratch extent is
             # derived from its own arguments, so a sizing mistake is silent --
             # it lands on whatever sits next. When this buffer was in the shared
             # map that neighbour was LM_IDENTITY, twice. Here the guard plus the
             # slice's unallocated tail absorb an overrun instead.
-            self._lm_scratch_guard = self.mc_arena.alloc_tensor(
+            self._lm_scratch_guard = self.layout.alloc_tensor(
                 0, 32 * 1024 * bpe, "lm core0 scratch guard")
             self.LM_ATTN_SCRATCH_PER_ENGINE = [self.LM_SCRATCH]
             self.LM_ATTN_SCRATCH_PER_ENGINE.extend(
-                self.mc_arena.alloc_tensor(e, n_pref * bpe, "lm prefill attn scratch")
+                self.layout.alloc_tensor(e, n_pref * bpe, "lm prefill attn scratch")
                 for e in range(1, self.multi_core))
             self._lm_worker_attn_scratch_elements = n_pref
             # One FULL-WIDTH [P, H] down partial per engine, in that engine's own
@@ -781,17 +783,17 @@ class Qwen25OmniLMMixin:
             # contiguous shared plane. Decode reuses the same bases for its
             # single-row partials.
             self.LM_MLP_DOWN_TP_PER_ENGINE = [
-                self.mc_arena.alloc_tensor(e, P * H * bpe, "lm mlp down partial")
+                self.layout.alloc_tensor(e, P * H * bpe, "lm mlp down partial")
                 for e in range(self.multi_core)]
             # GATE/UP as private [P, LANE] lanes, one pair per engine. Same
             # ownership argument as the down partial above: engine e is the
             # only reader or writer of lane e from the gate/up matmul through
             # the SiLU-multiply, so nothing here needs a shared address.
             self.LM_MLP_GATE_PER_ENGINE = [
-                self.mc_arena.alloc_tensor(e, P * LANE * bpe, "lm mlp gate lane")
+                self.layout.alloc_tensor(e, P * LANE * bpe, "lm mlp gate lane")
                 for e in range(self.multi_core)]
             self.LM_MLP_UP_PER_ENGINE = [
-                self.mc_arena.alloc_tensor(e, P * LANE * bpe, "lm mlp up lane")
+                self.layout.alloc_tensor(e, P * LANE * bpe, "lm mlp up lane")
                 for e in range(self.multi_core)]
             # eltwise_core_dram supports an output aliasing input A (the old
             # shared-plane overlay relied on the same trick): once gate*up is
@@ -2508,7 +2510,7 @@ class Qwen25OmniLMMixin:
                 wb = bytearray()
                 for inst in w.capture_buffer:
                     wb.extend(inst.get_bytes())
-                self.mc_arena.check_isa_fits(idx, addr, len(wb))
+                self.layout.check_isa_fits(idx, addr, len(wb))
                 self._note_worker_isa(idx, "prefill", len(wb))
                 self._prefill_workers.append((idx, w, addr, bytes(wb)))
         self._prefill_program = (base, bytes(blob))
@@ -2653,7 +2655,7 @@ class Qwen25OmniLMMixin:
                 wb = bytearray()
                 for inst in w.capture_buffer:
                     wb.extend(inst.get_bytes())
-                self.mc_arena.check_isa_fits(idx, addr, len(wb))
+                self.layout.check_isa_fits(idx, addr, len(wb))
                 self._note_worker_isa(idx, "decode", len(wb))
                 self._decoder_workers.append((idx, w, addr, bytes(wb)))
         self._decoder_program = (base, bytes(blob))
@@ -3158,25 +3160,31 @@ class Qwen25OmniLMMixin:
             bias[:, :next_seq_len] = 0.0
             self.dma_to_accelerator_memory(self.LM_BIAS, bias)
 
-            # Per-step preamble: prime the position registers, jump to the body.
-            self.clear_inst_id()
-            self.start_capture()
-            if self._device_embedding_enabled():
-                self._emit_device_decode_embedding(token, self.LM_IO_A)
-            self.generate_instruction_add_set(self.gf_seq_len, step_pos)
-            self.generate_instruction_add_set(self.gf_aligned_seq_len, aligned)
-            self.generate_instruction_jump_abs(ue_35bit_addr_shifter(addr))
-            self.stop_capture()
-            try:
-                written = self.write_captured_instructions_to_dram(
-                    self._decoder_preamble)
-                expected = self.get_capture_instruction_size_bytes()
-                if written != expected:
-                    raise IOError(
-                        f"decoder preamble DMA wrote {written} of "
-                        f"{expected} bytes")
-            finally:
-                self.clear_capture_buffer()
+            launch = getattr(self, "_decode_launch", None)
+            if launch is not None:
+                # Precompiled: the entry for this position already sits in DRAM.
+                master_entry = launch["master"][0] + step_pos * launch["master"][1]
+            else:
+                # Per-step preamble: prime the position registers, jump to the body.
+                self.clear_inst_id()
+                self.start_capture()
+                if self._device_embedding_enabled():
+                    self._emit_device_decode_embedding(token, self.LM_IO_A)
+                self.generate_instruction_add_set(self.gf_seq_len, step_pos)
+                self.generate_instruction_add_set(self.gf_aligned_seq_len, aligned)
+                self.generate_instruction_jump_abs(ue_35bit_addr_shifter(addr))
+                self.stop_capture()
+                try:
+                    written = self.write_captured_instructions_to_dram(
+                        self._decoder_preamble)
+                    expected = self.get_capture_instruction_size_bytes()
+                    if written != expected:
+                        raise IOError(
+                            f"decoder preamble DMA wrote {written} of "
+                            f"{expected} bytes")
+                finally:
+                    self.clear_capture_buffer()
+                master_entry = self._decoder_preamble
 
             # Workers are relaunched EVERY step: each decoder program ends with
             # its workers halted, so a step that did not start them would leave
@@ -3190,6 +3198,17 @@ class Qwen25OmniLMMixin:
                     master_reserved_end=self._decoder_preamble + 64 * 8,
                     timeout_seconds=30.0,
                 )
+            elif launch is not None:
+                for (_idx, worker, wbase, wstride) in launch["workers"]:
+                    worker.start_execute_from_dram(wbase + (aligned // 64 - 1) * wstride)
+                self.start_execute_from_dram(master_entry)
+                self._wait_lm_queue(
+                    self, 30.0, "decode master", poll_interval_s=0.00025)
+                for idx, w in enumerate(
+                    dec_sched.workers if dec_sched is not None else [], start=1
+                ):
+                    self._wait_lm_queue(w, 30.0, f"decode worker {idx}")
+                step_us = self.report_latency_in_us()
             else:
                 if dec_sched is not None:
                     if (
@@ -3209,7 +3228,7 @@ class Qwen25OmniLMMixin:
                         worker_preamble_entries = self._start_decode_workers(
                             dec_sched, dec_worker_addrs, aligned)
                         worker_preamble_aligned = aligned
-                self.start_execute_from_dram(self._decoder_preamble)
+                self.start_execute_from_dram(master_entry)
                 # Native decode is only about 100 ms/token.  The generic 1-ms
                 # queue poll can therefore hide roughly half a percent of real
                 # throughput after the FPGA has already halted.  A decode-only
@@ -3430,7 +3449,8 @@ class Qwen25OmniLMMixin:
         self._base_lm_weight_init()
         # The inherited loader already clears the vision flag.  Audio occupies
         # the same transient params window and must be treated the same way.
-        self._audio_weight_init_done = False
+        if self.layout.evicts_weights:
+            self._audio_weight_init_done = False
 
     def lm_tensor_init(self) -> None:
         """Allocate LM state and exclude padded head rows from FPGA argmax."""
@@ -3580,7 +3600,7 @@ class Qwen25OmniLMMixin:
         # tensor-overlap checks this used to carry are gone with the slots.
         stripes = []
         for engine_idx, (col_offset, cols) in enumerate(splits):
-            base = self.mc_arena.alloc_weights(
+            base = self.layout.alloc_weights(
                 engine_idx, stripe_bytes, f"decode.bf16_o.core{engine_idx}")
             stripes.append(
                 {
@@ -3961,7 +3981,7 @@ class Qwen25OmniLMMixin:
             # stripe stayed inside the window it was allocated from. Per-layer
             # byte coverage is asserted in the loop above.
             for stripe in stripes:
-                region = self.mc_arena.region(int(stripe["engine"]))
+                region = self.layout.region(int(stripe["engine"]))
                 if (int(stripe["base"]) < region.weight_base
                         or int(stripe["end"]) > region.weight_limit):
                     raise AssertionError(
@@ -3999,7 +4019,7 @@ class Qwen25OmniLMMixin:
         an unrelated engine. Checking it once, after the last private
         allocation, keeps the constant honest.
         """
-        arena = self.mc_arena
+        arena = self.layout
         reserve = arena._private_reserve[0]
         used = arena.usage()
         peak = max(used)
@@ -4054,10 +4074,10 @@ class Qwen25OmniLMMixin:
         """DMA one engine's (scale, data) block into its private window."""
         s_blob = np.ascontiguousarray(scales).tobytes()
         d_blob = np.ascontiguousarray(data).tobytes()
-        s_addr = self.mc_arena.alloc_weights(engine_idx, len(s_blob), f"{what}.scale")
+        s_addr = self.layout.alloc_weights(engine_idx, len(s_blob), f"{what}.scale")
         if self.dma_write(DMA_DEVICE_H2C, s_addr, s_blob, len(s_blob)) != len(s_blob):
             raise IOError(f"{what}.scale: short private DMA")
-        d_addr = self.mc_arena.alloc_weights(engine_idx, len(d_blob), f"{what}.data")
+        d_addr = self.layout.alloc_weights(engine_idx, len(d_blob), f"{what}.data")
         if self.dma_write(DMA_DEVICE_H2C, d_addr, d_blob, len(d_blob)) != len(d_blob):
             raise IOError(f"{what}.data: short private DMA")
         return d_addr, s_addr
@@ -4079,7 +4099,7 @@ class Qwen25OmniLMMixin:
         Same role as ``_stage_shard_pair`` for IF4, but dense: no scale blob.
         """
         blob = np.ascontiguousarray(rows).tobytes()
-        addr = self.mc_arena.alloc_weights(engine_idx, len(blob), what)
+        addr = self.layout.alloc_weights(engine_idx, len(blob), what)
         if self.dma_write(DMA_DEVICE_H2C, addr, blob, len(blob)) != len(blob):
             raise IOError(f"{what}: short private DMA")
         return addr
@@ -4272,7 +4292,7 @@ class Qwen25OmniLMMixin:
         if row_start != d["VOCAB"]:
             raise AssertionError("embedding row split did not cover the vocabulary")
 
-        arena = self.mc_arena
+        arena = self.layout
         weight_cursors = list(arena._weight_cursor)
         program_cursor = self.get_program_dram_addr()
         self._fpga_embedding_loaded = False

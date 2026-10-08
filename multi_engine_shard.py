@@ -3929,6 +3929,17 @@ class MultiEngineScheduler:
 
         for engine_idx, ue in enumerate(self.engines):
             assert not ue.is_capture_on, "preclear_flags() must run outside capture"
+            fixed = getattr(ue, "_flag_clear_addr", None)
+            if fixed is not None:
+                # A model that precompiles its flag-clear program launches it by
+                # address; nothing is generated or written here.
+                ue.start_execute_from_dram(fixed)
+                ue.wait_queue(timeout_seconds)
+                if ue.is_queue_busy():
+                    raise TimeoutError(
+                        f"engine {engine_idx} flag-preclear program is still busy "
+                        f"after {timeout_seconds:.1f}s")
+                continue
             ue.start_capture()
             ue.generate_instruction_flag_clear()
             ue.generate_instruction_halt()

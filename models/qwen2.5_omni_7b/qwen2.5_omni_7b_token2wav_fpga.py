@@ -65,7 +65,8 @@ class DiTFpga:
         self.cores = cores
         self.n = cores.n
         self.dit = dit
-        self.T = frames
+        self.T = frames                    # live frames; the program is built for Tmax
+        self.Tmax = frames
         self.layers = layers
         self.verbose = verbose
         self.QC = BLOCK * query_chunk_blocks
@@ -90,6 +91,13 @@ class DiTFpga:
         addr = self.cores.put_weight(t)
         self.w[name] = addr
         return addr
+
+    def _put_or_write(self, name: str, t: torch.Tensor) -> int:
+        """Upload a constant once; later calls rewrite the same address."""
+        if name in self.w:
+            self._write(self.w[name], t)
+            return self.w[name]
+        return self._put(name, t)
 
     def _tensor(self, n_elem: int) -> int:
         return self.cores.alloc(n_elem * 2)
@@ -167,25 +175,46 @@ class DiTFpga:
             nb = (R * HID + 512 * HD) * 2
             c.zero(base, nb)
 
+    def set_length(self, frames: int) -> None:
+        """Run the already-compiled program on ``frames`` live frames.
+
+        The program is built for ``Tmax`` frames. Rows past the live length are
+        masked out of every real row's attention by the bias tiles, so the live
+        rows come out as if the program had been built for ``frames``.
+        """
+        if not 1 <= frames <= self.Tmax:
+            raise ValueError(f"{frames} frames outside 1..{self.Tmax} this program is built for")
+        if frames != self.T:
+            self.T = frames
+            self._stage_constants()
+
+    def reset_state(self) -> None:
+        """Re-zero the buffers that padding relies on (they alias other stages')."""
+        for ue, pv in zip(self.cores.engines, self.priv):
+            ue.dma_write(DMA_DEVICE_H2C, pv["scratch"],
+                         bytes(self._scratch_bytes), self._scratch_bytes)
+        for base in (self.KH, self.VH):
+            self.cores.zero(base, (self.rows * HID + 512 * HD) * 2)
+
     def _stage_constants(self) -> None:
         Tp = self.Tp
-        self.IDENT = self._put("ident", torch.eye(64))
+        self.IDENT = self._put_or_write("ident", torch.eye(64))
         pos = torch.arange(Tp, dtype=torch.float32)
         inv = 1.0 / (10000.0 ** (torch.arange(0, HD, 2, dtype=torch.float32) / HD))
         fr = torch.outer(pos, inv)
         emb = torch.cat([fr, fr], dim=-1)
-        self.ROPE_COS = self._put("rope.cos", emb.cos())
-        self.ROPE_SIN = self._put("rope.sin", emb.sin())
+        self.ROPE_COS = self._put_or_write("rope.cos", emb.cos())
+        self.ROPE_SIN = self._put_or_write("rope.sin", emb.sin())
         rot = torch.zeros(HD, HD)
         # The DiT uses the interleaved rotate_half_codec: (x0, x1) -> (-x1, x0).
         for i in range(HD // 2):
             rot[2 * i, 2 * i + 1] = -1.0
             rot[2 * i + 1, 2 * i] = 1.0
-        self.ROT = self._put("rope.rot", rot)
+        self.ROT = self._put_or_write("rope.rot", rot)
         self.bias_addr = {}
         for lb, la in {(l, a) for l, a in self.look[: self.layers]}:
             for c in range(self.Tp // self.QC):
-                self.bias_addr[(lb, la, c)] = self._put(
+                self.bias_addr[(lb, la, c)] = self._put_or_write(
                     f"bias.{lb}{la}.{c}", self._attn_bias(c * self.QC, lb, la))
 
     # --------------------------------------------------------------- attention
@@ -912,16 +941,28 @@ class BigVGANFpga:
         return self.big.process_mel_spectrogram(mel.unsqueeze(0))[0]
 
     def load_mel(self, mel: torch.Tensor) -> None:
+        """Load a [80, frames] mel; ``frames`` may be shorter than the program's T."""
+        live = int(mel.shape[1])
+        if live > self.T:
+            raise ValueError(f"{live} mel frames exceed the {self.T} this program is built for")
         x = torch.zeros(self.T, 128)
-        x[:, :MEL] = self.preprocess(mel).t()
+        x[:live, :MEL] = self.preprocess(mel).t()
         self.cores.write(self.mel_addr, x.reshape(-1))
 
     def run(self, mel: torch.Tensor) -> torch.Tensor:
-        """mel [80, T] -> waveform [L]."""
+        """mel [80, T] -> waveform [L] (trimmed to the live frames).
+
+        The program runs on its full T rows; frames past the live length are
+        zeros in, and only the live samples are returned. A short input differs
+        from a program built for that length only within the receptive field of
+        its last frame.
+        """
+        live = int(mel.shape[1])
         self.load_mel(mel)
         self.cores.run(self.sequence)
         out = self.cores.read(self.out_addr, self.lens[-1] * 64).float().reshape(-1, 64)
-        return out[:, 0].clamp(-1.0, 1.0)
+        samples = live * (self.lens[-1] // self.T)
+        return out[:samples, 0].clamp(-1.0, 1.0)
 
 
 def dit_flops(frames: int, Tp: int, QC: int, aligned: int, look, layers: int = LAYERS,
@@ -968,22 +1009,79 @@ def bigvgan_flops(big, frames: int) -> tuple[int, int]:
     return total(False), total(True)
 
 
+def _recorder(obj):
+    """Attributes ``obj`` gains or rebinds from here on (see qwen2.5_omni_7b_state)."""
+    before = dict(vars(obj))
+
+    class _R:
+        def delta(self):
+            return {k: v for k, v in vars(obj).items()
+                    if k not in before or before[k] is not v}
+    return _R()
+
+
 class Token2WavFpga:
     """Codec IDs -> waveform with the DiT and the BigVGAN both on the accelerator."""
 
-    def __init__(self, cores, t2w, *, codes: int, verbose: bool = True):
+    def __init__(self, cores, t2w, *, codes: int, verbose: bool = True,
+                 compile: bool = True, state=None):
+        """``compile=False`` builds the objects and uploads the DiT weights but
+        compiles nothing; ``state`` (from ``compile_state()``) then restores what
+        the compilers left, so ``--run_from_bin`` needs no compile pass."""
         self.cores = cores
         self.t2w = t2w
-        self.frames = codes * t2w.code2wav_dit_model.repeats
+        self.repeats = t2w.code2wav_dit_model.repeats
+        self.max_codes = codes
+        self.frames = codes * self.repeats        # live frames; the programs are built for max
         self.verbose = verbose
         self.dit = DiTFpga(cores, t2w.code2wav_dit_model, frames=self.frames, verbose=verbose)
-        self.dit.compile()
+        self.vocoder = None
+        self._compile_state = {}
+        if compile:
+            rec = _recorder(self.dit)
+            self.dit.compile()
+            self._compile_state["dit"] = rec.delta()
         # BigVGAN reuses the activation pool the DiT used once the DiT is done with it.
         self.vocoder = BigVGANFpga(cores, t2w.code2wav_bigvgan_model, frames=self.frames,
                                    verbose=verbose)
         cores.pool_rewind(self.dit.pool_mark)
-        self.vocoder.compile()
+        if compile:
+            rec = _recorder(self.vocoder)
+            self.vocoder.compile()
+            # compile() fills these containers in place, so rebinding-based
+            # recording would not see them.
+            self._compile_state["vocoder"] = {
+                **rec.delta(),
+                **{key: getattr(self.vocoder, key) for key in (
+                    "sequence", "marks", "_memo", "_zero_rows", "_mregs", "_next_reg")}}
         cores.pool_rewind(self.dit.pool_mark)
+        if not compile:
+            for name, target in (("dit", self.dit), ("vocoder", self.vocoder)):
+                for key, value in state[name].items():
+                    setattr(target, key, value)
+            if not self.dit.sequence or not self.vocoder.sequence:
+                raise RuntimeError(
+                    "restored Token2Wav has no regions to run "
+                    f"(DiT {len(self.dit.sequence)}, BigVGAN {len(self.vocoder.sequence)})")
+
+    def compile_state(self) -> dict:
+        return dict(self._compile_state)
+
+    def set_codes(self, codes: int) -> None:
+        """Run the compiled programs on ``codes`` live codec tokens (<= max_codes).
+
+        The DiT masks the extra frames out of every live row's attention; the
+        BigVGAN gets zeros for them and its waveform is cut to the live
+        duration. Measured against programs built for the exact length, the
+        mel and waveform agree to within run-to-run noise (40 and 150 codes).
+        """
+        if not 1 <= codes <= self.max_codes:
+            raise ValueError(f"{codes} codec tokens outside 1..{self.max_codes}")
+        self.frames = codes * self.repeats
+        self.dit.set_length(self.frames)
+
+    def reset_state(self) -> None:
+        self.dit.reset_state()
 
     def synthesize(self, codes: torch.Tensor, conditioning: torch.Tensor,
                    reference_mel: torch.Tensor, noise: torch.Tensor | None = None,

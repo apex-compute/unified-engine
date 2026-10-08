@@ -169,14 +169,16 @@ class Qwen25OmniVisionMixin:
         # rewinds the cursor so the LM can later be loaded over these same
         # addresses (see the module docstring); nothing else may allocate params
         # DRAM between here and the encoder run.
+        self.layout.begin_weight_stage("vision")
         self.reset_params_dram_addr()
         # Loading from this point overwrites any previous LM image. Clear both
         # phase-cache flags before the first DMA so a partial transfer cannot
         # make a retry trust corrupt shared-window contents.
         self._vision_weight_init_done = False
-        self._lm_weight_init_done = False
-        if hasattr(self, "_audio_weight_init_done"):
-            self._audio_weight_init_done = False
+        if self.layout.evicts_weights:
+            self._lm_weight_init_done = False
+            if hasattr(self, "_audio_weight_init_done"):
+                self._audio_weight_init_done = False
         start_addr = self.get_params_dram_addr()
         if start_addr != self.VISION_WEIGHT_BASE:
             raise AssertionError(
@@ -379,7 +381,7 @@ class Qwen25OmniVisionMixin:
         buffer scales as aligned_S^2, so at a large patch count it is tens of
         MiB and no longer belongs in a fixed-size per-core slice.
         """
-        return self.mc_arena.alloc_tensor(
+        return self.layout.alloc_tensor(
             engine_idx, size_bytes, "vision attn scratch")
 
     def _base_vision_tensor_init(self) -> None:
@@ -1165,7 +1167,7 @@ class Qwen25OmniVisionMixin:
                 blob = bytearray()
                 for inst in wk.capture_buffer:
                     blob.extend(inst.get_bytes())
-                self.mc_arena.check_isa_fits(idx, addr, len(blob))
+                self.layout.check_isa_fits(idx, addr, len(blob))
                 self._note_worker_isa(idx, "vision", len(blob))
                 self._vis_worker_programs.append((idx, wk, addr, bytes(blob)))
         if base_addr + len(enc) > self.DRAM_END:
@@ -1473,7 +1475,8 @@ class Qwen25OmniVisionMixin:
                 "regenerate params.bin so the FPGA patch projection has a "
                 "64-lane padded reduction axis"
             )
-        self._invalidate_decode_overlay()
+        if self.layout.evicts_weights:
+            self._invalidate_decode_overlay()
         self._base_vision_weight_init()
         try:
             with open(region["bin_path"], "rb") as file_obj:
@@ -1493,8 +1496,9 @@ class Qwen25OmniVisionMixin:
         except Exception:
             self._vision_weight_init_done = False
             raise
-        self._lm_weight_init_done = False
-        self._audio_weight_init_done = False
+        if self.layout.evicts_weights:
+            self._lm_weight_init_done = False
+            self._audio_weight_init_done = False
 
     @staticmethod
     def _position_ids(grid_thw: torch.Tensor, merge: int) -> torch.Tensor:
