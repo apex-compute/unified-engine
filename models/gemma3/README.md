@@ -107,8 +107,8 @@ of x.` First-token rates below use hardware execution time.
 | Kintex-7, 198.324 MHz | 1 → 2 | 10.60 → 19.64 tok/s | 1.85× | 95.77 → 52.16 ms/token |
 | U50, 333.332 MHz | 1 → 8 | 16.83 → 76.80 tok/s | 4.56× | 60.28 → 13.11 ms/token |
 
-See the [Kintex-7 results](../../kintex7_gemma3_controller_results.json) and
-[U50 results](../../alveo_u50_gemma3_controller_results.json) for the complete
+See the [Kintex-7 results](../../tests/kintex7_gemma3_controller_results.json) and
+[U50 results](../../tests/alveo_u50_gemma3_controller_results.json) for the complete
 hardware signatures, prompt, token IDs, placements, and timing measurements.
 These are end-to-end decode measurements, not a claim that every model operation
 sustains the raw memory benchmark's bandwidth. U55C placement is covered by

@@ -84,7 +84,7 @@ To compare exact generated tokens and hardware decode timing with one versus
 multiple engines, run:
 
 ```bash
-python3 model_controller_benchmark.py --dev xdma1 --engines 2 --models qwen \
+python3 tests/model_controller_benchmark.py --dev xdma1 --engines 2 --models qwen \
   --max-new-tokens 128 --json qwen_controller_results.json
 ```
 
@@ -106,12 +106,12 @@ identical token IDs for all 128 generated tokens:
 
 That is 2.23× for the first token and 1.91× across the capped 128-token decode.
 The prompt, exact tokens, memory windows, and image information are recorded in
-[`alveo_u50_qwen_controller_results.json`](../../alveo_u50_qwen_controller_results.json).
+[`alveo_u50_qwen_controller_results.json`](../../tests/alveo_u50_qwen_controller_results.json).
 
 The Kintex-7 two-engine run on the same date (198.324 MHz, image `0xd6c77283`)
 also matched all 128 generated token IDs. First-token hardware time improved
 from 80.28 to 54.10 ms (1.48×), and the average from 93.39 to 67.22 ms/token
-(1.39×). See [`kintex7_qwen_controller_results.json`](../../kintex7_qwen_controller_results.json).
+(1.39×). See [`kintex7_qwen_controller_results.json`](../../tests/kintex7_qwen_controller_results.json).
 
 The offline runner requires:
 

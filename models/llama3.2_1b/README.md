@@ -86,7 +86,7 @@ decode from 74.45 ms to 16.38 ms/token, approximately 4.54× faster. Reproduce
 the token comparison and save timings with:
 
 ```bash
-python model_controller_benchmark.py --dev xdma1 --engines 2 \
+python tests/model_controller_benchmark.py --dev xdma1 --engines 2 \
   --models llama --json kintex7-llama.json
 ```
 

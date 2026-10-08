@@ -76,12 +76,12 @@ IDs, including EOS, under a 128-token cap. First-token hardware time was
 (6.28×). These are decode-only hardware times for a short text request; they
 exclude preparation, prefill, and host-side argmax comparison.
 
-The [measured JSON](../../alveo_u50_qwen_vl_controller_results.json) records the
+The [measured JSON](../../tests/alveo_u50_qwen_vl_controller_results.json) records the
 tokens, board identity, and controller addresses. Repeat with:
 
 ```bash
-python model_controller_benchmark.py --dev xdma0 --engines 8 --models qwen_vl \
-  --max-new-tokens 128 --json alveo_u50_qwen_vl_controller_results.json
+python tests/model_controller_benchmark.py --dev xdma0 --engines 8 --models qwen_vl \
+  --max-new-tokens 128 --json tests/alveo_u50_qwen_vl_controller_results.json
 ```
 
 ## DRAM map

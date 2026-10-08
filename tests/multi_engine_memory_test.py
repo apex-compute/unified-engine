@@ -1,7 +1,7 @@
 """Compare engine DRAM reads/writes in private windows and a split region.
 
 Run directly to avoid the full model suite, for example:
-    python multi_engine_memory_test.py --dev xdma1 --json kintex7_memory_results.json
+    python tests/multi_engine_memory_test.py --dev xdma1 --json tests/kintex7_memory_results.json
 """
 
 import argparse
@@ -12,7 +12,12 @@ import math
 from pathlib import Path
 import socket
 import statistics
+import sys
 import time
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import torch
 

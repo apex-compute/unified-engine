@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 import torch
 import user_dma_core as core
 with patch.object(core, "configure_clock_from_hardware", side_effect=AssertionError("hardware access")):
-    import model_controller_benchmark as benchmark
+    from tests import model_controller_benchmark as benchmark
 
 
 class TokenOutputValidation(unittest.TestCase):

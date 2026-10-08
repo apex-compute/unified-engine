@@ -15,7 +15,7 @@ opt-in (`GEMMA4_E4B_ALLOW_ENCODER=1` with `--vision-enable`/`--audio-enable`).
 ```bash
 GEMMA4_LM_ONLY_BIN=1 python models/gemma4_e4b/gemma4_e4b_test.py \
   --dev xdma0 --multi-core 8 --max-new-tokens 32 --prompt "x+3=5, what is x?"
-python model_controller_benchmark.py --dev xdma0 --engines 8 --models e4b \
+python tests/model_controller_benchmark.py --dev xdma0 --engines 8 --models e4b \
   --prompt "x+3=5, what is x?" --max-new-tokens 32 \
   --json e4b-controller-results.json
 ```
@@ -23,7 +23,7 @@ python model_controller_benchmark.py --dev xdma0 --engines 8 --models e4b \
 The U50 comparison passed all 32 generated tokens exactly: average FPGA decode
 latency was **380.95 → 249.47 ms/token (1.53×)** at 333.332 MHz. These are decode
 measurements; the existing padded prefill still runs on the primary engine.
-See `../../alveo_u50_gemma4_e4b_controller_results.json` for tokens and board identity.
+See `../../tests/alveo_u50_gemma4_e4b_controller_results.json` for tokens and board identity.
 
 Q/K/V/O and MLP gate/up use controller-private weight copies. The original
 shared 0–4 GiB model image stays in place; U50 private shards occupy controller
