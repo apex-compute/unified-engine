@@ -10,7 +10,7 @@ python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma1 --multi-core 2 \
   --prefill-kernel matmatmul --max-new-tokens 32 --prompt "x+3=5, what is x?"
 python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 --multi-core 8 \
   --prefill-kernel matmatmul --max-new-tokens 32 --prompt "x+3=5, what is x?"
-python model_controller_benchmark.py --dev xdma0 --engines 8 --models e2b \
+python tests/model_controller_benchmark.py --dev xdma0 --engines 8 --models e2b \
   --prompt "x+3=5, what is x?" --max-new-tokens 32 \
   --json e2b-controller-results.json
 ```
@@ -44,8 +44,8 @@ and decoder entries now have explicit 64-byte alignment, runtime dispatch
 rejects misaligned targets, and program format version 2 rejects cached images
 with the old entry. Fresh Kintex two-engine and U50 eight-engine repeats both
 produce the same tokens.
-See `../../kintex7_gemma4_e2b_controller_results.json` and
-`../../alveo_u50_gemma4_e2b_controller_results.json` for the corrected results.
+See `../../tests/kintex7_gemma4_e2b_controller_results.json` and
+`../../tests/alveo_u50_gemma4_e2b_controller_results.json` for the corrected results.
 The older failed comparisons remain diagnostic records of that resolved bug.
 
 `--max-new-tokens` limits generation without changing the compiled context/KV

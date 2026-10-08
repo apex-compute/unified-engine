@@ -1,7 +1,7 @@
 """Verify identical tokens and compare single/multiple engine model timing.
 
 Weights must be available through the model's normal HF/params preparation.
-Example: python model_controller_benchmark.py --dev xdma1 --engines 2 --json results.json
+Example: python tests/model_controller_benchmark.py --dev xdma1 --engines 2 --json results.json
 """
 
 import argparse
@@ -18,11 +18,14 @@ import socket
 import tempfile
 import time
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import user_dma_core as core
 from andromeda_hw_info import decode_hardware_info
 from multi_engine_decode import reset_engine_queues
 
-ROOT = Path(__file__).resolve().parent
 PROMPT = "Solve 2x + 3 = 7. Reply with only the value of x."
 
 

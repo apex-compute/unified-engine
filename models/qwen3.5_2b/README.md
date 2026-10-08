@@ -88,8 +88,8 @@ and multicore run for `x+3=5, what is x?`. Average hardware latency over the
 
 | Board | Engines | Single engine | Multicore | Speedup | Result |
 |---|---:|---:|---:|---:|---|
-| Kintex7, image `0x8763d976`, 198.324 MHz | 2 | 1271.14 ms/token | 1190.33 ms/token | 1.068× | [JSON](../../kintex7_qwen35_controller_results.json) |
-| U50, image `0xe6703022`, 333.332 MHz | 8 | 776.70 ms/token | 689.38 ms/token | 1.127× | [JSON](../../alveo_u50_qwen35_controller_results.json) |
+| Kintex7, image `0x8763d976`, 198.324 MHz | 2 | 1271.14 ms/token | 1190.33 ms/token | 1.068× | [JSON](../../tests/kintex7_qwen35_controller_results.json) |
+| U50, image `0xe6703022`, 333.332 MHz | 8 | 776.70 ms/token | 689.38 ms/token | 1.127× | [JSON](../../tests/alveo_u50_qwen35_controller_results.json) |
 
 The prompt seed token is included in the token comparison and excluded from
 the timing average.

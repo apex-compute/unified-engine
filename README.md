@@ -114,7 +114,7 @@ for Kintex-7, Alveo U50, and U55C multi-engine images. To run just the memory
 comparison on the selected device:
 
 ```bash
-python3 multi_engine_memory_test.py --dev xdma1 \
+python3 tests/multi_engine_memory_test.py --dev xdma1 \
   --sizes-kib 64 256 512 --iterations 32 --samples 5 \
   --json /tmp/kintex7-memory.json
 ```
@@ -155,15 +155,15 @@ Measured on p2 with 512 KiB per engine, 32 iterations, and three samples:
 All samples passed exact read/write checks. These are aggregate device-memory
 rates, not PCIe transfer rates or model throughput. U55C placement has offline
 coverage; a U55C board was not available for measurement. The latest Kintex-7
-results use image `0x8763d976` and are in `kintex7_memory_controller_results.json`.
+results use image `0x8763d976` and are in `tests/kintex7_memory_controller_results.json`.
 
 For Qwen3 0.6B, Llama3.2 1B, and Gemma3 1B, compare single-engine and
 controller-sharded decode with identical-token validation:
 
 ```bash
-python3 model_controller_benchmark.py --dev xdma1 --engines 2 \
+python3 tests/model_controller_benchmark.py --dev xdma1 --engines 2 \
   --models qwen llama gemma --json kintex7-models.json
-python3 model_controller_benchmark.py --dev xdma0 --engines 8 \
+python3 tests/model_controller_benchmark.py --dev xdma0 --engines 8 \
   --models qwen llama gemma --json u50-models.json
 ```
 
@@ -181,7 +181,7 @@ weights loaded directly into each tile and shared tensors in the remaining
 space. This avoids keeping a duplicate full MLP weight image.
 
 ```bash
-python3 model_controller_benchmark.py --dev xdma1 --engines 2 \
+python3 tests/model_controller_benchmark.py --dev xdma1 --engines 2 \
   --models qwen_2b e2b --prompt 'x+3=5, what is x?' \
   --max-new-tokens 32 --json kintex7-2b-models.json
 ```
@@ -222,10 +222,10 @@ Its prefill previously started at a 32-byte offset that the jump emitter
 rounded forward, skipping the first input DMA and producing unstable output.
 Prefill and decoder entry points now align to 64 bytes, and cache format 2
 rejects the old programs. The verified captures are
-`kintex7_gemma4_e2b_controller_results.json` and
-`alveo_u50_gemma4_e2b_controller_results.json`; earlier failed captures remain
-in `gemma4_e2b_controller_results.json` and
-`gemma4_e2b_existing_eight_comparison.json` as diagnostic history.
+`tests/kintex7_gemma4_e2b_controller_results.json` and
+`tests/alveo_u50_gemma4_e2b_controller_results.json`; earlier failed captures remain
+in `tests/gemma4_e2b_controller_results.json` and
+`tests/gemma4_e2b_existing_eight_comparison.json` as diagnostic history.
 
 Existing eight-engine model paths also use controller placement for SmolVLM2
 decode gate/up weights, pi0.5 vision copies, ACT matrix/convolution weights,
@@ -254,7 +254,7 @@ private Q/K/V/O/gate/up decode weights above 4 GiB. On U50, 4–8 engines fit;
 MLP down projection and LM head retain their original primary kernels.
 E4B passed 32 identical generated tokens on the same algebra prompt:
 380.95 → 249.47 ms/token (1.53×) on U50. The result is saved in
-`alveo_u50_gemma4_e4b_controller_results.json`; prefill remains on the primary engine.
+`tests/alveo_u50_gemma4_e4b_controller_results.json`; prefill remains on the primary engine.
 
 ### 6. Run Gemma3 Inference (requires Hugging Face)
 

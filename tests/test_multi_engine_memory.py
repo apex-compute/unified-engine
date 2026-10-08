@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-import multi_engine_memory_test as benchmark
+from tests import multi_engine_memory_test as benchmark
 
 
 class MemoryRegions(unittest.TestCase):

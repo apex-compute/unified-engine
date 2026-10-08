@@ -8403,7 +8403,7 @@ if __name__ == "__main__":
                 snr_threshold_db=snr_floor,
             )
     if not args.single_core_only and engine_count >= 2:
-        from multi_engine_memory_test import run_memory_comparison
+        from tests.multi_engine_memory_test import run_memory_comparison
         for result in run_memory_comparison(
                 num_engines=engine_count, sizes_kib=(64, 256, 512), iterations=32, samples=3):
             record_test(
