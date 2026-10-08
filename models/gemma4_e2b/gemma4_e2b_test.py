@@ -55,6 +55,7 @@ from multi_engine_shard import (MULTICORE_WINDOW_BYTES, MultiEngineScheduler,
                                 PrivateArena, model_multicore_layout,
                                 require_multicore_dram, tiled_window_bases)
 import gemma4_e2b_model_flops as _model_flops
+from models.profile_report import measurement, write_profile_markdown
 
 # Non-tiled multicore runs reserve a contiguous 2 GiB model map and ask the
 # board allocator for controller-aware private windows. Eight-engine Alveo
@@ -1802,7 +1803,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         if seq_len is None:
             return None
         try:
-            return float(_model_flops.prefill_flops(self._cfg, int(seq_len)))
+            return float(_model_flops.prefill_flops(
+                self._cfg, int(seq_len), self._kv_shared_map))
         except Exception:
             return None
 
@@ -1813,7 +1815,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             end = int(final_seq_len)
             n = int(generated)
             contexts = range(end - n, end)
-            return float(_model_flops.decode_flops(self._cfg, contexts))
+            return float(_model_flops.decode_flops(
+                self._cfg, contexts, self._kv_shared_map))
         except Exception:
             return None
 
@@ -1833,7 +1836,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         if seq_len is None:
             return None
         try:
-            return _model_flops.prefill_flops_by_phase(self._cfg, int(seq_len))
+            return _model_flops.prefill_flops_by_phase(
+                self._cfg, int(seq_len), self._kv_shared_map)
         except Exception:
             return None
 
@@ -2224,14 +2228,16 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             model_phases=self._model_flops_prefill_by_phase())
         lines.extend(["## Decode", ""])
         first_pos = getattr(self, "_decode_first_profile_position", "n/a")
-        first_model = (_model_flops.decode_step_flops_by_phase(self._cfg, int(first_pos))
+        first_model = (_model_flops.decode_step_flops_by_phase(
+                       self._cfg, int(first_pos), self._kv_shared_map)
                        if isinstance(first_pos, int) else None)
         _append_profile_section(
             f"First decode step (position {first_pos})",
             getattr(self, "_decode_profile_results", None), level=3,
             model_phases=first_model)
         target_pos = getattr(self, "_decode_1024_profile_position", 1023)
-        target_model = (_model_flops.decode_step_flops_by_phase(self._cfg, int(target_pos))
+        target_model = (_model_flops.decode_step_flops_by_phase(
+                        self._cfg, int(target_pos), self._kv_shared_map)
                         if isinstance(target_pos, int) else None)
         _append_profile_section(
             f"1024th token (position {target_pos})",
@@ -2241,6 +2247,85 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         with open(out_path, "w") as f:
             f.write("\n".join(lines))
         return out_path
+
+    def write_unified_profile_summary(self, out_path: str, args) -> str:
+        """Write the cross-model profile schema used by all five LM entrypoints."""
+        peak = self._profile_peak_gflops()
+
+        def _rows(results, effective_by_phase):
+            rows = []
+            for raw in self._aggregate_profile_results(results or []):
+                row = measurement(
+                    label=raw["phase"], hw_ms=raw["ms"],
+                    issued_flops=raw["flops"],
+                    effective_flops=(effective_by_phase or {}).get(raw["phase"]),
+                    peak_gflops=peak)
+                row["samples"] = raw["n"]
+                rows.append(row)
+            return rows
+
+        prefill_effective = self._model_flops_prefill_by_phase()
+        first_pos = self._decode_first_profile_position
+        first_effective = _model_flops.decode_step_flops_by_phase(
+            self._cfg, first_pos, self._kv_shared_map)
+        long_pos = self._decode_1024_profile_position
+        long_effective = _model_flops.decode_step_flops_by_phase(
+            self._cfg, long_pos, self._kv_shared_map)
+        prefill_rows = _rows(self._prefill_profile_results, prefill_effective)
+        first_rows = _rows(self._decode_profile_results, first_effective)
+        long_rows = _rows(self._decode_1024_profile_results, long_effective)
+
+        def _total(rows, key):
+            values = [row.get(key) for row in rows]
+            return sum(values) if values and all(v is not None for v in values) else None
+
+        overall = [
+            measurement(
+                label="Prefill", tokens=self._prefill_seq_len,
+                hw_ms=sum(row["hw_ms"] for row in prefill_rows),
+                cpu_ms=self._prefill_profile_cpu_ms,
+                issued_flops=_total(prefill_rows, "issued_flops"),
+                effective_flops=_total(prefill_rows, "effective_flops"),
+                peak_gflops=peak),
+            measurement(
+                label="Decode first token", tokens=1, position=first_pos,
+                hw_ms=sum(row["hw_ms"] for row in first_rows),
+                cpu_ms=self._decode_profile_cpu_ms,
+                issued_flops=_total(first_rows, "issued_flops"),
+                effective_flops=_total(first_rows, "effective_flops"),
+                peak_gflops=peak),
+            measurement(
+                label="Decode large context", tokens=1, position=long_pos,
+                hw_ms=sum(row["hw_ms"] for row in long_rows),
+                cpu_ms=self._decode_1024_profile_cpu_ms,
+                issued_flops=_total(long_rows, "issued_flops"),
+                effective_flops=_total(long_rows, "effective_flops"),
+                peak_gflops=peak),
+        ]
+        hw = user_dma_core.configured_hardware_info()
+        return write_profile_markdown(
+            out_path, title="Gemma4 E2B profile summary",
+            hardware={
+                "HW info": user_dma_core.hardware_info_summary(),
+                "DMA device": args.dev,
+                "Clock": f"{hw.frequency_mhz:.2f} MHz",
+                "AXI width": f"{user_dma_core.UE_AXI_DATA_WIDTH_BITS} bit",
+                "Engines": self.multi_core,
+                "Peak throughput": f"{peak:.2f} GFLOPS",
+                "DRAM layout": self.dram_layout,
+                "Vision kernel": self.vision_kernel,
+                "Prefill kernel": self.prefill_kernel,
+                "Decode kernel": self.decode_kernel,
+            },
+            overall=overall,
+            breakdowns=[
+                ("Prefill major-step breakdown", prefill_rows),
+                ("Decode first-token breakdown", first_rows),
+                ("Decode large-context breakdown", long_rows),
+            ],
+            notes=["Issued FLOPs come from emitted accelerator cores; effective FLOPs "
+                   "come from gemma4_e2b_model_flops.py at the measured sequence/context."],
+        )
 
     def _profile_execute(self, gpr_sets: list[tuple[int, int]], target_addr: int,
                          checkpoints: list, tail_name: str, timeout: float = 120.0,
@@ -2440,9 +2525,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # self.seq_len exactly like a straight run, and returns per-phase HW
         # latencies for the whole prefill. ---
         print(f"\n--- Profiling prefill (seq_len={len(self.prefill_seq) - 1}) ---", flush=True)
+        _pf_cpu_start = time.perf_counter()
         prefill_results = self.run_prefill(
             prefill_program_addr, flops=meta["prefill_total_flops"],
             profile_checkpoints=prefill_checkpoints)
+        self._prefill_profile_cpu_ms = (time.perf_counter() - _pf_cpu_start) * 1e3
         self._prefill_profile_results = prefill_results
         # Captured HERE, before _prepare_decode_position below can overwrite
         # self.seq_len with a decode probe position -- see the long comment
@@ -2507,9 +2594,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._decode_first_profile_position = first_context_len - 1
         print(f"\n--- Profiling first decode step (pos {first_context_len - 1}) ---",
               flush=True)
+        _dec_cpu_start = time.perf_counter()
         decode_results = self._decode_profile_execute(
             decoder_program_addr, aligned_seq_len, decoder_checkpoints,
             worker_scheduler=_dec_sched, worker_addrs=_dec_worker_addrs)
+        self._decode_profile_cpu_ms = (time.perf_counter() - _dec_cpu_start) * 1e3
         self._decode_profile_results = decode_results
         self._print_phase_breakdown("DECODE (first step)", decode_results, per_token=True)
 
@@ -2520,9 +2609,12 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._decode_1024_profile_position = target_context_len - 1
         print(f"\n--- Profiling 1024th token (pos {target_context_len - 1}) ---",
               flush=True)
+        _dec_long_cpu_start = time.perf_counter()
         decode_1024_results = self._decode_profile_execute(
             decoder_program_addr, aligned_seq_len, decoder_checkpoints,
             worker_scheduler=_dec_sched, worker_addrs=_dec_worker_addrs)
+        self._decode_1024_profile_cpu_ms = (
+            time.perf_counter() - _dec_long_cpu_start) * 1e3
         self._decode_1024_profile_results = decode_1024_results
         self._print_phase_breakdown(
             "DECODE (1024th token)", decode_1024_results, per_token=True)
@@ -2968,7 +3060,7 @@ def main():
         ue.run_gemma4_profile()
         _summary_path = os.path.join(SCRIPT_DIR, _summary_name)
         try:
-            ue.write_profile_summary(_summary_path, args)
+            ue.write_unified_profile_summary(_summary_path, args)
             print(f"Wrote profile summary: {_summary_path}")
         except Exception as _e:
             print(f"[warn] failed to write profile summary: {_e}")
