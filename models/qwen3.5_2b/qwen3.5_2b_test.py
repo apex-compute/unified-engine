@@ -67,7 +67,8 @@ from user_dma_core import (                          # noqa: E402
     LALU_CLAMP_RELU_A, LALU_CLAMP_RELU_B,
     ue_35bit_addr_shifter, set_dma_device, INSTRUCTION_SIZE_BYTES,
 )
-from models.profile_report import aggregate_checkpoints, measurement, write_profile_markdown
+from models.profile_report import (aggregate_checkpoints, annotate_execution,
+                                   measurement, write_profile_markdown)
 
 BF16 = 2
 MODEL_PATH = "/srv/model_files/Qwen3.5-2B-ModelFiles/Qwen3.5-2B"
@@ -4097,6 +4098,20 @@ def run_qwen35_profile(ue: Qwen3_5_2b_UnifiedEngine, token_ids: torch.Tensor,
     large_pos = ue.max_context - 1
     large_samples, large_cpu = _step(first_token, large_pos)
     large_rows = aggregate_checkpoints(large_samples, peak_gflops=peak)
+    _sharded_steps = {"lin_qkv_proj", "full_qkv_proj"}
+    _mixed_steps = {
+        "lin_qk_norm_gates": "Z projection sharded; BF16 gates/norms primary",
+        "lin_gated_out_proj": "out_proj sharded; norm/gate/residual primary",
+        "lin_mlp_gateup_mul": "gate/up sharded; multiply primary",
+        "lin_mlp_down_residual": "down_proj sharded; residual primary",
+        "full_o_proj_residual": "o_proj sharded; sigmoid/residual primary",
+        "full_mlp_gateup_mul": "gate/up sharded; multiply primary",
+        "full_mlp_down_residual": "down_proj sharded; residual primary",
+        "output_norm_lm_head": "LM head sharded; output norm primary",
+    }
+    for _rows in (prefill_rows, first_rows, large_rows):
+        annotate_execution(
+            _rows, ue.multi_core, sharded=_sharded_steps, mixed=_mixed_steps)
 
     def _total(rows, key):
         return sum(row.get(key) or 0 for row in rows)
