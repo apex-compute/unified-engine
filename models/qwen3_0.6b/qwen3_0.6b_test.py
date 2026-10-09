@@ -2133,10 +2133,19 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
     def _profile_execute(self, entry_addr: int, checkpoints: list,
                          tail_label: str | None = None,
                          tail_flops: int | None = None,
-                         timeout: float = 120.0) -> tuple[list, float]:
-        """Single-step a checkpointed image and return raw per-layer samples."""
+                         timeout: float = 120.0,
+                         shard: bool = False) -> tuple[list, float]:
+        """Single-step a checkpointed image and return raw per-layer samples.
+
+        ``shard=True`` launches the worker engines once before the segmented
+        HALT walk and joins them after (only the decode program is sharded;
+        prefill runs single-engine). The workers rendezvous with the primary at
+        each sharded matmul, so the primary's per-checkpoint HALT/resume between
+        rendezvous points keeps the lockstep."""
         samples = []
         cpu_start = time.perf_counter()
+        if shard and self.controller_decoder is not None:
+            self.controller_decoder.start()
         self.start_execute_from_dram(entry_addr)
         for checkpoint in checkpoints:
             name, resume_hex = checkpoint[:2]
@@ -2149,9 +2158,12 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                             "effective_flops": flops})
             self.start_execute_from_dram(int(resume_hex, 16))
         self.wait_queue(timeout)
+        tail_ms = self.report_latency_in_us() / 1e3   # read before wait() clobbers the counter
+        if shard and self.controller_decoder is not None:
+            self.controller_decoder.wait(timeout)
         if tail_label is not None:
             samples.append({"name": tail_label,
-                            "hw_ms": self.report_latency_in_us() / 1e3,
+                            "hw_ms": tail_ms,
                             "issued_flops": tail_flops,
                             "effective_flops": tail_flops})
         return samples, (time.perf_counter() - cpu_start) * 1e3
@@ -2163,7 +2175,9 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         decoder_addr = _parse_offset(meta["decoder_program_start_addr"])
         pf_checkpoints = meta.get("prefill_profile_checkpoints", [])
         dec_checkpoints = meta.get("decoder_profile_checkpoints", [])
-        peak = user_dma_core.configured_hardware_info().frequency_mhz * 0.128
+        # Aggregate peak across all engines: sharded decode matmuls approach
+        # 100% while single-engine steps cap near 1/multi_core.
+        peak = user_dma_core.configured_hardware_info().frequency_mhz * 0.128 * self.multi_core
         actual = len(prefill_seq) - 1
         template = int(meta["prefill_template_seq_len"])
         q_len = actual * self.group_size
@@ -2220,7 +2234,8 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             self.stop_capture(); self.write_captured_instructions_to_dram(preamble_addr)
             self.clear_capture_buffer()
             samples, cpu_ms = self._profile_execute(
-                preamble_addr, dec_checkpoints, "output_norm_lm_head", tail_flops)
+                preamble_addr, dec_checkpoints, "output_norm_lm_head", tail_flops,
+                shard=True)
             for sample in samples:
                 if sample["name"] == "kv_attention":
                     sample["issued_flops"] = int(
@@ -2288,8 +2303,6 @@ def main():
                         help='count tokens over the last N (never penalizes punctuation/whitespace/'
                              'special tokens). Default 256.')
     args = parser.parse_args()
-    if args.profile and args.multi_core != 1:
-        parser.error("--profile currently requires --multi-core 1")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     cfg = _load_config(script_dir)
@@ -2422,8 +2435,9 @@ def main():
                         peak_gflops=peak),
         ]
         hw = user_dma_core.configured_hardware_info()
+        _mc_tag = f"_multi-core_{args.multi_core}" if args.multi_core != 1 else ""
         summary_path = os.path.join(
-            SCRIPT_DIR, f"qwen3_0.6b_profile_{args.dev}.md")
+            SCRIPT_DIR, f"qwen3_0.6b_profile_{args.dev}{_mc_tag}.md")
         write_profile_markdown(
             summary_path, title="Qwen3-0.6B profile summary",
             hardware={
