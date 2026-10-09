@@ -1431,6 +1431,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
+        assert hw_version == 0x567092b9, f"expected FPGA build 0x567092b9, got 0x{hw_version:08x}"
         if getattr(self, "conv_geometry_mode", CONV_GEOMETRY_LIVE_CSR) == CONV_GEOMETRY_QUEUE_CONFIG:
             # Convolution images have independent build stamps from the legacy
             # release. Explicit queue-CONFIG selection opts into that contract;
