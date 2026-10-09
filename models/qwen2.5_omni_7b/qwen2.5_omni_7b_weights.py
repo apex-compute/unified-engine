@@ -39,6 +39,7 @@ BLOCK = 64
 SCALE_BYTES = 2
 DATA_BYTES = 32
 WIRE_BYTES = SCALE_BYTES + DATA_BYTES
+OPTIONAL_REGIONS = ("talker", "token2wav")   # appended after decode_o on demand
 SCHEMA_VERSION = 10  # BF16 host embedding; vision attn.qk/attn.v remain compact
 # Q/K/V/O private column-shard loading (qwen2.5_omni_7b_lm.py) and V staying
 # BF16 in both phases are loader-only changes: params.bin's on-disk sections
@@ -1058,6 +1059,111 @@ def weight_bin_generate(script_dir: str | None = None, output_params: str | None
     return params_path
 
 
+def _params_paths(script_dir: str) -> tuple[str, str]:
+    cfg = _load_config(script_dir)
+    params_path = os.path.join(script_dir, cfg["paths"]["params"])
+    return params_path, params_path.rsplit(".", 1)[0] + ".json"
+
+
+def params_regions(script_dir: str) -> dict:
+    _params_path, json_path = _params_paths(script_dir)
+    with open(json_path) as f:
+        return json.load(f)["regions"]
+
+
+def append_params_region(script_dir: str, name: str, items, meta: dict | None = None,
+                         verbose: bool = True) -> dict:
+    """Append an optional region (Talker, Token2Wav) to an existing params.bin.
+
+    ``items`` yields ``(key, dtype, shape, bytes)``. The region lands after the
+    last region and before a NEW generation trailer, and the manifest is replaced
+    afterwards, so a crash in between leaves a payload whose trailer does not match
+    its manifest (ensure_params_bin refuses it) instead of a half-valid file. The
+    Thinker regions are not rewritten.
+    """
+    if name not in OPTIONAL_REGIONS:
+        raise ValueError(f"{name!r} is not an optional params region {OPTIONAL_REGIONS}")
+    params_path, json_path = _params_paths(script_dir)
+    ensure_params_bin(script_dir, verbose=False)
+    with open(json_path) as f:
+        metadata = json.load(f)
+    regions = metadata["regions"]
+    if name in regions:
+        raise ValueError(f"params region {name!r} already exists; drop it first")
+    end = int(metadata["params_size"]) - GENERATION_TAG_BYTES
+    manifest, digest = {}, hashlib.sha256()
+    # The old trailer is overwritten by the first new byte. Keep it and the old
+    # manifest so an interrupted append can be undone by hand (re-write the 32
+    # bytes at `end`, truncate there, restore the manifest) without a multi-GB
+    # re-conversion of the Thinker regions.
+    with open(params_path, "rb") as old:
+        old.seek(end)
+        old_trailer = old.read(GENERATION_TAG_BYTES)
+    with open(params_path + ".trailer.bak", "wb") as bak:
+        bak.write(old_trailer)
+    shutil.copyfile(json_path, json_path + ".bak")
+    with open(params_path, "r+b") as out:
+        out.seek(end)
+        for key, dtype, shape, raw in items:
+            if key in manifest:
+                raise KeyError(f"duplicate {name} section {key!r}")
+            manifest[key] = {"offset": out.tell() - end, "size": len(raw),
+                             "shape": [int(x) for x in shape], "dtype": dtype}
+            out.write(raw)
+            digest.update(raw)
+        size = out.tell() - end
+        tag = os.urandom(GENERATION_TAG_BYTES)
+        out.write(tag)
+        out.truncate()
+        out.flush()
+        os.fsync(out.fileno())
+        total = out.tell()
+    regions[name] = {"offset": end, "size": size, "manifest": manifest,
+                     "sha256": digest.hexdigest(), "meta": meta or {}}
+    metadata.update(regions=regions, generation_id=tag.hex(), params_size=total)
+    json_tmp = json_path + ".building"
+    with open(json_tmp, "w") as f:
+        json.dump(metadata, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(json_tmp, json_path)
+    if verbose:
+        print(f"  [params] appended {name}: {size / 2**20:.1f} MiB, "
+              f"{len(manifest)} section(s) -> {params_path}", flush=True)
+    return regions[name]
+
+
+def drop_params_regions(script_dir: str, names) -> None:
+    """Remove optional regions (they are last, so the file is simply cut)."""
+    params_path, json_path = _params_paths(script_dir)
+    with open(json_path) as f:
+        metadata = json.load(f)
+    regions = metadata["regions"]
+    drop = [n for n in OPTIONAL_REGIONS if n in names and n in regions]
+    if not drop:
+        return
+    cut = min(int(regions[n]["offset"]) for n in drop)
+    kept = {n: r for n, r in regions.items() if n not in drop}
+    for n in OPTIONAL_REGIONS:                       # a kept region must precede the cut
+        if n in kept and int(kept[n]["offset"]) >= cut:
+            raise ValueError(f"cannot drop {drop} and keep the later region {n!r}")
+    with open(params_path, "r+b") as out:
+        out.seek(cut)
+        tag = os.urandom(GENERATION_TAG_BYTES)
+        out.write(tag)
+        out.truncate()
+        out.flush()
+        os.fsync(out.fileno())
+        total = out.tell()
+    metadata.update(regions=kept, generation_id=tag.hex(), params_size=total)
+    json_tmp = json_path + ".building"
+    with open(json_tmp, "w") as f:
+        json.dump(metadata, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(json_tmp, json_path)
+
+
 def ensure_params_bin(script_dir: str, verbose: bool = True) -> str:
     cfg = _load_config(script_dir)
     _decode_bf16_projections(cfg)
@@ -1088,8 +1194,12 @@ def ensure_params_bin(script_dir: str, verbose: bool = True) -> str:
             errors.append("regions metadata is invalid")
             regions = {}
         required_region_names = {"lm", "vision", "audio", "decode_o"}
-        if set(regions) != required_region_names:
+        # The speech regions (Talker, Token2Wav) are appended on demand; they are
+        # optional, but when present they sit after decode_o in this order.
+        present_optional = [n for n in OPTIONAL_REGIONS if n in regions]
+        if set(regions) != required_region_names | set(present_optional):
             errors.append("required lm/vision/audio/decode_o regions differ")
+        region_order = ("lm", "vision", "audio", "decode_o", *present_optional)
 
         actual_size = os.path.getsize(params_path)
         if metadata.get("params_size") != actual_size:
@@ -1097,9 +1207,9 @@ def ensure_params_bin(script_dir: str, verbose: bool = True) -> str:
                 f"payload size {actual_size} != manifest "
                 f"{metadata.get('params_size')!r}"
             )
-        if set(regions) == required_region_names:
+        if required_region_names <= set(regions) <= required_region_names | set(OPTIONAL_REGIONS):
             cursor = 0
-            for name in ("lm", "vision", "audio", "decode_o"):
+            for name in region_order:
                 region = regions[name]
                 if not isinstance(region, dict):
                     errors.append(f"{name} region metadata is invalid")

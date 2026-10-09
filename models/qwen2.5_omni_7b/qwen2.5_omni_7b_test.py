@@ -76,8 +76,8 @@ def _reject_visible_torch_accelerators() -> None:
 _reject_visible_torch_accelerators()
 
 import user_dma_core
-from multi_engine_shard import (MultiEngineScheduler, PrivateArena,
-                                require_multicore_dram, tiled_window_bases)
+from multi_engine_shard import (MultiEngineScheduler, require_multicore_dram,
+                                tiled_window_bases)
 from user_dma_core import UnifiedEngine, set_dma_device
 
 
@@ -123,6 +123,16 @@ _weight_mod = _load_sibling(
 _program_mod = _load_sibling(
     "qwen2_5_omni_7b_programs", "qwen2.5_omni_7b_programs.py"
 )
+_layout_mod = _load_sibling(
+    "qwen2_5_omni_7b_layout", "qwen2.5_omni_7b_layout.py"
+)
+_state_mod = _load_sibling(
+    "qwen2_5_omni_7b_state", "qwen2.5_omni_7b_state.py"
+)
+WindowedLayout = _layout_mod.WindowedLayout
+FlatLayout = _layout_mod.FlatLayout
+OMNI_WINDOW_BYTES = _layout_mod.OMNI_WINDOW_BYTES
+FPGA_SPEECH_CONTEXT_SIZE = _layout_mod.FPGA_SPEECH_CONTEXT_SIZE
 
 Qwen25OmniLMMixin = _lm_mod.Qwen25OmniLMMixin
 Qwen25OmniVisionMixin = _vision_mod.Qwen25OmniVisionMixin
@@ -148,8 +158,8 @@ except Exception:                                    # pragma: no cover
 # the mel frames) no longer fit the shared activation pool.
 T2W_FPGA_MAX_CODES = 300
 
-REQUIRED_ENGINES = 8
-REQUIRED_DRAM_GIB = 8
+REQUIRED_ENGINES = _layout_mod.REQUIRED_ENGINES
+REQUIRED_DRAM_GIB = _layout_mod.REQUIRED_DRAM_GIB
 # CONTEXT AND PREFILL ARE ONE BUDGET. Prefill and decode read the same KV
 # cache, so MAX_CONTEXT_SIZE bounds both: a prompt (vision soft tokens + text)
 # may fill it, and generation continues inside it.
@@ -333,111 +343,8 @@ def apply_vision_resolution(cfg: dict, name: str) -> dict:
     vision.update(preset)
     return cfg
 
-# ==========================================================================
-# THE WINDOW IS ONE HBM SWITCH REGION (Alveo U50 and U55C)
-# ==========================================================================
-# A window is 1 GiB because that is the granularity the HBM fabric arbitrates
-# on, and eight of them tile the 8 GiB device so every core reads its own.
-# Which board is underneath decides only WHY 1 GiB is the right number:
-#
-#   U55C (HW_INFO cores == 12)  one memory controller owns one contiguous
-#       1 GiB, and the reordered SAXI wiring puts core i on controller i for
-#       i < 8. The window IS the controller. Measured on the PRE-reorder
-#       bitstream, where all twelve engines crowded onto MC0-MC3, decode ran at
-#       77.3 GFLOPS against 140.1 for the old 512 MiB map; with the ports
-#       reordered the same map gives 190.2.
-#   U50 (HW_INFO cores == 8)    the contended unit is the 1 GiB four-pseudo-
-#       channel switch region, not the 512 MiB controller: two engines in one
-#       region still read at the full per-engine rate, three halve it. A 1 GiB
-#       window IS one switch region, so this map puts ONE engine in each.
-#
-# The U50 is where the map looks portable but is not obviously so, because an
-# engine owns two 512 MiB segments outright -- one per 4 GiB stack, on its own
-# SAXI port -- and its 1 GiB window here is neither of them. That is deliberate.
-# Port ownership decides whether a read takes a lateral hop, and at these
-# transfer sizes the hop is free: the port-ordered bases and a flat 512 MiB
-# stride both measure 85.2 GB/s, the per-engine AXI ceiling. Crowding is what
-# costs bandwidth, and a contiguous 1 GiB window per core cannot crowd. Keeping
-# the window contiguous is also what keeps the map feasible at all -- the
-# vision encoder's ISA slice plus a full private shard set (~712 MiB, see
-# OMNI_PRIVATE_RESERVE_BYTES) needs more than a 512 MiB segment offers.
-#
-# multi_engine_shard.tiled_window_bases() owns both boards' answers and
-# validates the result (in range, disjoint, no crowded region); a board it has
-# not characterised is refused rather than guessed at.
-
-# The private window geometry this map is built for. It is deliberately NOT
-# multi_engine_shard.MULTICORE_WINDOW_BYTES: that constant is 512 MiB and three
-# other multi-core models are validated against it. Nor does it track either
-# board's constant: it is THIS MAP's geometry, and every number below --
-# OMNI_PRIVATE_RESERVE_BYTES, the ISA and tensor slices -- is tuned against
-# it. tiled_window_bases() refuses a board whose own window
-# differs (the U55C's becomes 2 GiB when its HBM is upgraded), so the map gets
-# re-tuned deliberately instead of silently running at the wrong size.
-OMNI_WINDOW_BYTES = 0x4000_0000            # 1 GiB per core, 8 GiB total
-# Medium-resolution vision has a 47.75 MiB master program, so ISA must retain
-# 64 MiB. Place it at the END of each window, with 32 MiB deliberately unused
-# immediately before it. This strip separates any overrun from the private
-# tensor slice below it; it does not make HBM writes fault or prove the ISA safe.
-OMNI_ISA_BYTES = 64 * 2**20
-OMNI_ISA_GUARD_BYTES = 32 * 2**20
-# 264 MiB, not 64: past a 4096 context, the per-engine attention scratch
-# (unified_attention_core's [aligned_seq_len, aligned_seq_len] score buffer,
-# quadratic in context -- see lm_attn_scratch's own MemoryError) plus the
-# private MLP down/gate/up lanes (see LM_MLP_*_PER_ENGINE in
-# qwen2.5_omni_7b_lm.py) no longer fit in 64 MiB. 64 MiB was exact for a 4096
-# context (~62 MiB on core 0); 8192 needs ~262 MiB, so this carries a small
-# margin over that, not the old ceiling.
-OMNI_PRIVATE_TENSOR_BYTES = 264 * 2**20
-
-# The measured IF4 projection + LM-head footprint is 447.8 MiB/core. Reserve
-# 464 MiB for private shards before lending anything to the shared pool -- the
-# measured footprint plus 16 MiB. It was 512, which left 64 MiB per core
-# reserved-but-never-used: 513 MiB across the board that the shared pool could
-# not touch. The footprint is deterministic (a fixed model at a fixed eight
-# engines; vision/audio weights are PARAMS, not private shards), and overshoot
-# fails loudly in alloc_shared rather than corrupting, so the slack buys
-# nothing. The remaining 200 MiB of the 664 MiB weight arena is shared
-# capacity; it grows only within [base+0x1D000000, base+0x29800000). (This
-# band shrank from 400 MiB when OMNI_PRIVATE_TENSOR_BYTES grew from 64 to 264
-# MiB above -- the two budgets share the same 1 GiB window and trade off
-# directly.)
-#
-# THE BAND, NOT THE TOTAL, IS WHAT BINDS. A shared object must fit one
-# contiguous per-window gap. GATE/UP used to be the objects that mattered here
-# (296 MiB each at an 8192 context) but are now private per-engine lanes (see
-# OMNI_PRIVATE_TENSOR_BYTES above), so the largest remaining shared object at
-# 8192 is the qkv/attn/mlp overlay or LM_BIAS, 128 MiB each -- comfortably
-# inside 200 MiB.
-OMNI_PRIVATE_RESERVE_BYTES = 464 * 2**20
-
-# FPGA speech keeps the Thinker's private decode shards resident while adding
-# 88.3 MiB of Talker column shards per busy worker. A 544 MiB reserve covers
-# both measured footprints (447.8 + 88.3) with 7.9 MiB left. The Talker
-# selection also narrows the Thinker context to 6144: its worst private tensor
-# requirement then falls below 184 MiB, preserving a 200 MiB shared band and
-# the 32 MiB ISA guard. Host speech and text-only runs retain the 8192 map.
-FPGA_SPEECH_CONTEXT_SIZE = 6144
-FPGA_SPEECH_PRIVATE_TENSOR_BYTES = 184 * 2**20
-FPGA_SPEECH_PRIVATE_RESERVE_BYTES = 544 * 2**20
-
-# THERE USED TO BE A SECOND UNSCATTERABLE OBJECT HERE: a 280 MiB "dedicated
-# extent" (OMNI_LM_HEAD_BYTES) holding one contiguous, unsharded copy of the
-# untied LM head, loaded via a normal device DMA. It turned out to have
-# exactly one reader: _ensure_decode_shards_impl's shard_quantized_weight
-# call, which immediately re-copied it (card -> host -> card, on top of the
-# blob's own host -> card load) into the SAME eight private per-engine column
-# shards already budgeted above as "lm_head shard 34.5 MiB". Nothing else
-# ever read the unsharded copy -- this model always runs eight engines
-# (REQUIRED_ENGINES), so decode's sharded head path is always taken and the
-# one call site that read the whole-blob fallback is unreachable. Removed:
-# lm_head is now read directly from the host file and column-sharded straight
-# into the private shards it always ended up in (shard_quantized_weight_from_
-# bytes), one host->card DMA per shard instead of three device round trips
-# for the whole weight. That freed 280 MiB from whichever ONE core alloc_
-# shared had picked to host it (always core 0, the only core that previously
-# had ZERO shared-pool slack) -- room now spent on the OMNI_ISA_BYTES growth
-# above, uniformly across every core.
+# The DRAM layout (window geometry, budgets, arena construction, phase marks)
+# lives in qwen2.5_omni_7b_layout.py; the engine only asks it for space.
 
 # The build ID read from UE_FPGA_VERSION is recorded and used to pick the flag
 # protocol, but it is not checked against an allowlist: any image that carries
@@ -471,7 +378,12 @@ _PROGRAM_CODE_FILES = (
     os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_audio.py"),
     os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_positions.py"),
     os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_programs.py"),
+    os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_layout.py"),
+    os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_state.py"),
     os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_weights.py"),
+    os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_talker_fpga.py"),
+    os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_token2wav_fpga.py"),
+    os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_t2w_cores.py"),
     os.path.join(SCRIPT_DIR, "qwen2.5_omni_7b_config.json"),
     os.path.join(PROJECT_ROOT, "andromeda_hw_info.py"),
     os.path.join(PROJECT_ROOT, "multi_engine_shard.py"),
@@ -525,7 +437,8 @@ class Qwen25OmniUnifiedEngine(
     def __init__(self, script_dir: str | None = None, multi_core: int = 8,
                  fpga_build: int | None = None,
                  vision_res: str = DEFAULT_VISION_RES,
-                 fpga_talker: bool = False):
+                 fpga_talker: bool = False, layout: str = "windowed",
+                 flat_plan=None):
         if multi_core != REQUIRED_ENGINES:
             raise ValueError(
                 f"Qwen2.5-Omni-7B requires exactly {REQUIRED_ENGINES} engines, "
@@ -537,27 +450,25 @@ class Qwen25OmniUnifiedEngine(
                 f"the board image must report at least {REQUIRED_ENGINES} engines; "
                 f"HW_INFO reports {reported_cores}"
             )
-        # At LEAST 8 GiB, not exactly: the map needs 8 GiB and a larger device
-        # simply leaves the top unused. The check lives in the library so every
-        # multi-core model states the same requirement the same way.
-        require_multicore_dram(multi_core, "Qwen2.5-Omni-7B")
-        # THE BOARD GATE, taken before a single byte is laid out: the library
-        # answers with this board's window bases or refuses the board outright.
-        expected_bases = tiled_window_bases(
-            REQUIRED_ENGINES, OMNI_WINDOW_BYTES, "Qwen2.5-Omni-7B")
-
         self.multi_core = multi_core
         self.fpga_talker = bool(fpga_talker)
-        self._private_tensor_bytes = (
-            FPGA_SPEECH_PRIVATE_TENSOR_BYTES if fpga_talker
-            else OMNI_PRIVATE_TENSOR_BYTES)
-        self._private_reserve_bytes = (
-            FPGA_SPEECH_PRIVATE_RESERVE_BYTES if fpga_talker
-            else OMNI_PRIVATE_RESERVE_BYTES)
         self.speak_as: str | None = None      # set before weight/tensor init
         self.fpga_build = None if fpga_build is None else int(fpga_build)
         self._multi_core_schedulers: dict[str, MultiEngineScheduler] = {}
         self._worker_isa_used: dict[int, dict[str, int]] = {}
+        # Resident-program state (layouts with resident_programs): one worker
+        # pool shared by every stage's scheduler, the program images already in
+        # DRAM, and what each stage's tensors looked like when it was compiled.
+        self._worker_pool: list | None = None
+        self._resident_stages: set[str] = set()
+        self._resident_images: dict[int, dict[int, set]] = {}
+        self._resident_hashes: dict = {}
+        self._stage_tensor_state: dict[str, dict] = {}
+        self._raw_stages: dict[str, dict] = {}
+        # --run_from_bin: what the compilers left in Python objects, per stage,
+        # and the stage images as read from programs.bin.
+        self._compile_state: dict[str, dict] = {}
+        self._bin_stage_state: dict[str, tuple] = {}
         self._params_regions: dict[str, dict[str, Any]] | None = None
         self._program_bundle: ProgramBundle | None = None
         self._packaged_program_stages: set[str] = set()
@@ -571,73 +482,22 @@ class Qwen25OmniUnifiedEngine(
         # the list has to exist from construction.
         self._fpga_decode_token_ids: list[int] = []
 
-        # U55 8-GiB DRAM map -- EIGHT 1-GiB PRIVATE WINDOWS THAT TILE THE DEVICE
-        #
-        #   core i -> [i GiB, (i+1) GiB), and inside each window, low to high:
-        #     private weights 512 MiB; shared weights/tensors 352 MiB;
-        #     private tensor 64 MiB; untouched guard 32 MiB; ISA 64 MiB.
-        #
-        # WHY THE WHOLE DEVICE IS PRIVATE WINDOWS. At 1 GiB per core the windows
-        # span all 8 GiB, so there is no region left ABOVE the arena to hold the
-        # weights and tensors every core reads. The empty tail of each window is
-        # the only space there is, so shared data is carved from there and the
-        # arena arbitrates between the two cursors (PrivateArena.alloc_shared).
-        #
-        # All LM projection weights are private shards shared by prefill and
-        # decode; only the small BF16 biases/norms use the shared pool. LM
-        # tensors are also carved there, between the 512 MiB private reserve
-        # and the private tensor/guard/ISA tail of each window.
-        #
-        # Vision, audio and the shared LM weights still TIME-SHARE the pool, now
-        # via shared_mark()/shared_release() instead of one contiguous window.
-        # The top of the highest window. On the 8 GiB image that is the whole
-        # device; on the 16 GiB one the windows are eight (stack, MC) regions
-        # spread over it, so this is a bound rather than "the device".
-        self.DRAM_END = max(expected_bases) + OMNI_WINDOW_BYTES
-        self.WINDOW_BYTES = OMNI_WINDOW_BYTES
-        # BUILT FROM THE BOARD'S BASES, not from base-plus-stride: on the 16 GiB
-        # image the assignment is a permutation (core 1 at 9 GiB, core 9 at
-        # 1 GiB) that no stride expresses.
-        self.mc_arena = PrivateArena(
-            REQUIRED_ENGINES,
-            windows=[(base, OMNI_WINDOW_BYTES) for base in expected_bases],
-            isa_bytes=OMNI_ISA_BYTES,
-            tensor_bytes=self._private_tensor_bytes,
-            isa_guard_bytes=OMNI_ISA_GUARD_BYTES,
-            verbose=True,
-        )
-        if self.mc_arena.stride != OMNI_WINDOW_BYTES:
-            raise AssertionError(
-                f"private windows are 0x{self.mc_arena.stride:X}, not the "
-                f"0x{OMNI_WINDOW_BYTES:X} this map is built for")
-        # The arena now takes the library's bases verbatim, so this asserts the
-        # construction rather than a coincidence -- it still fails HERE, at
-        # init, if the two ever drift apart.
-        actual_bases = [self.mc_arena.window_base(i) for i in range(REQUIRED_ENGINES)]
-        if actual_bases != expected_bases:
-            raise AssertionError(
-                "private windows do not match this board's map: "
-                f"{[hex(a) for a in actual_bases]} against "
-                f"{[hex(b) for b in expected_bases]}")
-        _device_bytes = user_dma_core.AVAILABLE_DRAM_SIZE_GB * 2**30
-        if self.DRAM_END > _device_bytes:
-            raise AssertionError(
-                f"{REQUIRED_ENGINES} x {OMNI_WINDOW_BYTES // 2**20} MiB windows "
-                f"reach 0x{self.DRAM_END:X}, past the "
-                f"{user_dma_core.AVAILABLE_DRAM_SIZE_GB} GiB HW_INFO reports")
-
-        # ISA lives INSIDE the windows now. Engine 0's slice is the master area;
-        # every worker's is arena.isa_base(i), one window stride apart. The old
-        # WORKER_ISA_BASE was only ever used as the master's upper bound, so that
-        # bound is now named for what it is.
-        self.ISA_BASE = self.mc_arena.isa_base(0)
-        self.MASTER_ISA_RESERVE = OMNI_ISA_BYTES
-        self.MASTER_ISA_LIMIT = self.mc_arena.isa_limit(0)
+        # The DRAM map (see qwen2.5_omni_7b_layout.py): the board gate, window
+        # geometry, private reserve and phase marks all live there.
+        if layout == "flat":
+            self.layout = FlatLayout(multi_core, flat_plan)
+        else:
+            self.layout = WindowedLayout(multi_core, speech=self.fpga_talker)
+        self._private_tensor_bytes = self.layout.private_tensor_bytes
+        self._private_reserve_bytes = self.layout.private_reserve_bytes
+        self.DRAM_END = self.layout.device_end
+        self.WINDOW_BYTES = self.layout.window_bytes
+        # ISA lives inside the windows. Engine 0's slice is the master area;
+        # every worker's is layout.isa_base(i).
+        self.ISA_BASE = self.layout.isa_base(0)
+        self.MASTER_ISA_RESERVE = self.layout.isa_bytes
+        self.MASTER_ISA_LIMIT = self.layout.isa_limit(0)
         self.WORKER_ISA_STRIDE = OMNI_WINDOW_BYTES
-
-        # PRIVATE SPACE IS CLAIMED BEFORE ANY SHARED BYTE IS LENT. The shard
-        # sizes are known from the manifest; the pool is whatever is left.
-        self.mc_arena.reserve_private(self._private_reserve_bytes)
 
         # TENSORS ARE CARVED PER BUFFER, NOT FROM ONE EXTENT. Only an individual
         # buffer has to be contiguous -- the KV cache, an [M, N] activation
@@ -647,13 +507,8 @@ class Qwen25OmniUnifiedEngine(
         # spreads them over the shared pool instead of requiring one impossible
         # contiguous tensor extent.
         self.TENSOR_BASE = 0
-        self.TENSOR_LIMIT = sum(self.mc_arena.shared_free())
+        self.TENSOR_LIMIT = self.layout.tensor_capacity
         self._tensor_staged = 0
-        self._tensor_phase_mark = self.mc_arena.shared_up_mark()
-        # The private per-engine slices are re-carved per phase too, so they
-        # rewind with the shared pool. Without this, vision + audio + LM scratch
-        # accumulated in a slice sized for one phase.
-        self._tensor_phase_private_mark = self.mc_arena.tensor_mark()
         # No dedicated extents left to reserve -- lm_head no longer stages an
         # unsharded device blob (see OMNI_PRIVATE_RESERVE_BYTES's comment).
         # _reserved_extent_for/reset_params_dram_addr keep working unchanged
@@ -667,10 +522,9 @@ class Qwen25OmniUnifiedEngine(
         # every caller already does ("bytes staged so far", "capacity left")
         # working against the pool instead of against a contiguous range.
         self.PARAMS_BASE = 0
-        self.PARAMS_LIMIT = sum(self.mc_arena.shared_free())
+        self.PARAMS_LIMIT = self.layout.shared_capacity
         self.VISION_WEIGHT_BASE = self.PARAMS_BASE
         self._params_staged = 0
-        self._params_phase_mark = self.mc_arena.shared_mark()
 
         super().__init__(
             BASE_ADDR=user_dma_core.UE_0_BASE_ADDR,
@@ -696,8 +550,9 @@ class Qwen25OmniUnifiedEngine(
         self.bytes_per_element = int(fi["bytes_per_element"])
         self.LAYER_SIZE = int(fi["num_layers"])
         self.EMBEDDING_ELEMENTS = int(fi["embedding_vocab"])
-        self.MAX_CONTEXT_SIZE = (FPGA_SPEECH_CONTEXT_SIZE if fpga_talker
-                                 else MAX_CONTEXT_SIZE)
+        self.MAX_CONTEXT_SIZE = getattr(
+            self.layout, "max_context",
+            FPGA_SPEECH_CONTEXT_SIZE if fpga_talker else MAX_CONTEXT_SIZE)
         self.PREFILL_MAX_SEQ_LEN = self.MAX_CONTEXT_SIZE
         model["max_context_size"] = self.MAX_CONTEXT_SIZE
         model["prefill_max_seq_len"] = self.PREFILL_MAX_SEQ_LEN
@@ -738,7 +593,7 @@ class Qwen25OmniUnifiedEngine(
         window exactly as the private slice did. It is released with the rest
         of the vision tensors.
         """
-        return self.mc_arena.alloc_shared_up(
+        return self.layout.alloc_shared_up(
             size_bytes, f"vis.attn_scratch.e{engine_idx}", engine_idx=engine_idx)
 
     def _reserved_extent_for(self, label: str | None):
@@ -768,7 +623,7 @@ class Qwen25OmniUnifiedEngine(
             return addr
         # 128 B, not the caller's 64: a shared section can land anywhere in a
         # window, and the SRAM row is the alignment every DMA base owes.
-        addr = self.mc_arena.alloc_shared(
+        addr = self.layout.alloc_shared(
             size_bytes, label or "params", align=align)
         self._params_staged += size_bytes
         if label is not None:
@@ -790,7 +645,7 @@ class Qwen25OmniUnifiedEngine(
         mark taken when the phase began. The caller must already have
         invalidated its cached addresses -- the next DMA overwrites these bytes.
         """
-        reclaimed = self.mc_arena.shared_release(self._params_phase_mark)
+        reclaimed = self.layout.release_weight_phase()
         for extent in self._reserved_extents.values():
             extent[2] = extent[0]
         self._params_staged = 0
@@ -802,7 +657,7 @@ class Qwen25OmniUnifiedEngine(
 
     def allocate_tensor_dram(self, size_bytes: int, label: str | None = None,
                              align_bytes: int = 64) -> int:
-        addr = self.mc_arena.alloc_shared_up(
+        addr = self.layout.alloc_shared_up(
             size_bytes, label or "tensor", align=max(align_bytes, 128))
         self._tensor_staged += size_bytes
         if label is not None:
@@ -824,8 +679,7 @@ class Qwen25OmniUnifiedEngine(
         outlives it. With one extent that was a cursor rewind; here it is a
         release, and the bytes genuinely return to the pool for the next phase.
         """
-        self.mc_arena.shared_up_release(self._tensor_phase_mark)
-        self.mc_arena.tensor_release(self._tensor_phase_private_mark)
+        self.layout.release_tensor_phase()
         self._tensor_staged = 0
 
     def tensor_phase_mark(self):
@@ -835,13 +689,11 @@ class Qwen25OmniUnifiedEngine(
         partially built set can hold both, so a rollback that reclaimed only the
         shared half would leak private slice space on every retry.
         """
-        return (self.mc_arena.shared_up_mark(), self._tensor_staged,
-                self.mc_arena.tensor_mark())
+        return (self.layout.tensor_phase_mark(), self._tensor_staged)
 
     def tensor_phase_restore(self, mark) -> None:
-        arena_mark, staged, private_mark = mark
-        self.mc_arena.shared_up_release(arena_mark)
-        self.mc_arena.tensor_release(private_mark)
+        layout_mark, staged = mark
+        self.layout.tensor_phase_restore(layout_mark)
         self._tensor_staged = staged
 
     def dma_to_accelerator_memory(
@@ -877,57 +729,7 @@ class Qwen25OmniUnifiedEngine(
             return json.load(file_obj)
 
     def _validate_config_and_map(self) -> None:
-        hw = self._cfg["hardware"]
-        expected = {
-            "required_engines": REQUIRED_ENGINES,
-            "required_dram_gib": REQUIRED_DRAM_GIB,
-            "private_arena_base": 0,
-            "private_arena_bytes": REQUIRED_ENGINES * OMNI_WINDOW_BYTES,
-            "private_window_bytes": OMNI_WINDOW_BYTES,
-            "private_isa_bytes": OMNI_ISA_BYTES,
-            "private_isa_guard_bytes": OMNI_ISA_GUARD_BYTES,
-            "private_tensor_bytes": OMNI_PRIVATE_TENSOR_BYTES,
-            "private_weight_reserve_bytes": OMNI_PRIVATE_RESERVE_BYTES,
-            # The DRAM this map CLAIMS, which is eight 1 GiB windows wherever
-            # the board puts them -- not self.DRAM_END. On the 8 GiB image the
-            # windows tile the device and the two are the same number; on the
-            # 16 GiB image they are eight of sixteen (stack, MC) regions and
-            # DRAM_END is the top of the highest, 16 GiB. Checking DRAM_END
-            # here would demand a config edit per board for a contract that
-            # does not change: the map needs 8 GiB of private windows.
-            "dram_limit": REQUIRED_ENGINES * OMNI_WINDOW_BYTES,
-        }
-        for name, wanted in expected.items():
-            raw = hw.get(name)
-            actual = int(raw, 0) if isinstance(raw, str) else int(raw)
-            if actual != wanted:
-                raise ValueError(
-                    f"config hardware.{name}={raw!r}, expected 0x{wanted:X}"
-                )
-        if self.mc_arena.stride != int(hw["private_window_bytes"], 0):
-            raise AssertionError("PrivateArena did not produce 1-GiB windows")
-        expected_weight_bytes = (OMNI_WINDOW_BYTES - OMNI_ISA_BYTES
-                                 - OMNI_ISA_GUARD_BYTES
-                                 - self._private_tensor_bytes)
-        if self.mc_arena.weight_bytes() != expected_weight_bytes:
-            raise AssertionError(
-                f"each engine must have {expected_weight_bytes // 2**20} MiB for its "
-                f"private shards and the shared pool, got "
-                f"{self.mc_arena.weight_bytes() // 2**20} MiB")
-        # weight_limit/tensor_base is the window minus ISA, its guard and the
-        # private tensor slice -- not a fixed literal, since
-        # OMNI_PRIVATE_TENSOR_BYTES moves it (264 MiB today, 64 MiB before
-        # the 8192-context private-lane GATE/UP/scratch growth).
-        expected_tensor_base = (OMNI_WINDOW_BYTES - OMNI_ISA_BYTES
-                                - OMNI_ISA_GUARD_BYTES - self._private_tensor_bytes)
-        for i in range(REQUIRED_ENGINES):
-            region = self.mc_arena.region(i)
-            base = region.base
-            if not (region.weight_limit == base + expected_tensor_base
-                    and region.tensor_base == base + expected_tensor_base
-                    and region.isa_base == base + 0x3C00_0000
-                    and self.mc_arena.isa_limit(i) == base + OMNI_WINDOW_BYTES):
-                raise AssertionError(f"core {i} is not in the guarded Omni map")
+        self.layout.validate_config(self._cfg["hardware"])
         if self._cfg["file_info"]["hidden_size"] != 3584:
             raise ValueError("this runtime is compiled only for the 3584-wide 7B Thinker")
         if set(self._cfg["precision"]["lm_quantized_projections"]) != {
@@ -1095,24 +897,14 @@ class Qwen25OmniUnifiedEngine(
                 "handshake": handshake,
                 "region_rendezvous": "master_worker",
                 "barrier_margin_nops": 32,
-                "dram_map": {
-                    "private_base": 0,
-                    "params_base": self.PARAMS_BASE,
-                    "params_limit": self.PARAMS_LIMIT,
-                    "tensor_base": self.TENSOR_BASE,
-                    "tensor_limit": self.TENSOR_LIMIT,
-                    "master_isa_base": self.ISA_BASE,
-                    "worker_isa_base": self.MASTER_ISA_LIMIT,
-                    # Per engine, not base + i * stride: on a board map the
-                    # windows are a permutation and no stride reaches them.
-                    "worker_isa_bases": [self.mc_arena.isa_base(i)
-                                         for i in range(REQUIRED_ENGINES)],
-                    "dram_end": self.DRAM_END,
-                },
+                "dram_map": self.layout.program_identity(
+                    self.PARAMS_BASE, self.PARAMS_LIMIT,
+                    self.TENSOR_BASE, self.TENSOR_LIMIT),
             },
         }
         self._program_bundle = ProgramBundle(
-            os.path.dirname(params_path), identity, stem="programs"
+            os.path.dirname(params_path), identity,
+            stem="programs" if self.layout.kind == "windowed" else "programs_flat"
         )
         self._packaged_program_stages.clear()
         self._loaded_program_stages.clear()
@@ -1121,7 +913,7 @@ class Qwen25OmniUnifiedEngine(
         self._runtime_processor_dir = processor_dir
         self._loud(
             f"Program artifact: {self._program_bundle.bin_path} "
-            "(fresh compile -> atomic store -> validated reload)"
+            "(compile -> atomic store -> validated reload, or loaded as stored with --run_from_bin)"
         )
 
     def _invalidate_program_stage(self, *stages: str) -> None:
@@ -1172,7 +964,30 @@ class Qwen25OmniUnifiedEngine(
         self._program_stage_profiles["decode"] = bool(profile)
         return result
 
+    def register_raw_stage(self, stage: str, master: tuple, workers: list,
+                           metadata: dict) -> None:
+        """Record a stage whose programs are already in DRAM (Talker, Token2Wav).
+
+        Those stages write their programs while compiling, so there is nothing to
+        upload; the images are read back from DRAM so the same programs.bin
+        generation holds, hashes and verifies them like the others.
+        """
+        self._raw_stages[stage] = {"master": master, "workers": workers,
+                                   "metadata": metadata}
+
+    def read_back(self, engine, addr: int, size: int) -> bytes:
+        buf = bytearray(size)
+        if engine.dma_read(engine.c2h_device, addr, buf, size) != size:
+            raise IOError(f"short program read-back at 0x{addr:X}")
+        return bytes(buf)
+
     def _program_stage_state(self, stage: str):
+        raw = self._raw_stages.get(stage)
+        if raw is not None:
+            return int(raw["master"][0]), bytes(raw["master"][1]), raw["workers"]
+        loaded = self._bin_stage_state.get(stage)
+        if loaded is not None:
+            return loaded
         if stage == "vision":
             return (
                 int(self._vis_program_addr),
@@ -1194,6 +1009,9 @@ class Qwen25OmniUnifiedEngine(
         raise ValueError(f"unknown program stage {stage!r}")
 
     def _program_stage_metadata(self, stage: str) -> dict[str, Any]:
+        raw = self._raw_stages.get(stage)
+        if raw is not None:
+            return {"kind": "resident_at_compile", **raw["metadata"]}
         common: dict[str, Any] = {
             "engines": REQUIRED_ENGINES,
             "profile": bool(self._program_stage_profiles.get(stage, False)),
@@ -1279,7 +1097,7 @@ class Qwen25OmniUnifiedEngine(
                     "columns_per_engine": columns,
                     "weight_bytes_per_layer_per_engine": columns * int(dims["H"]) // 2,
                     "scale_bytes_per_layer_per_engine": columns * int(dims["H"]) // 64 * 2,
-                    "slot_stride_bytes": int(self.mc_arena.stride),
+                    "slot_stride_bytes": int(self.layout.stride),
                 }
             else:
                 stripes = getattr(self, "_decode_o_stripes", None)
@@ -1303,7 +1121,7 @@ class Qwen25OmniUnifiedEngine(
                     "columns_per_engine": next(iter(stripe_cols)),
                     "layer_bytes_per_engine": next(iter(layer_bytes)),
                     "stripe_bytes_per_engine": next(iter(stripe_bytes)),
-                    "slot_stride_bytes": int(self.mc_arena.stride),
+                    "slot_stride_bytes": int(self.layout.stride),
                     "extent_end": f"0x{max(int(s['end']) for s in stripes):X}",
                 }
             kv_groups = int(dims["KVH"])
@@ -1438,6 +1256,15 @@ class Qwen25OmniUnifiedEngine(
             )
         master_addr, compiled_master, workers = self._program_stage_state(stage)
         master = bytes(disk_sections[0])
+        if stage in self._raw_stages:
+            for engine_index, _worker, _address, compiled_blob in workers:
+                if bytes(disk_sections[int(engine_index)]) != bytes(compiled_blob):
+                    raise RuntimeError(f"programs.bin {stage} worker {engine_index} differs "
+                                       "from the program in DRAM")
+            if master != compiled_master:
+                raise RuntimeError(f"programs.bin {stage} master differs from the program in DRAM")
+            self._loaded_program_stages.add(stage)
+            return
         if master != compiled_master:
             raise RuntimeError(
                 f"programs.bin {stage} master differs from the ISA compiled "
@@ -1534,6 +1361,8 @@ class Qwen25OmniUnifiedEngine(
         return records
 
     def _reload_program_stage(self, stage: str) -> None:
+        if stage in self._resident_stages:
+            return
         if self._program_bundle is None or stage not in self._packaged_program_stages:
             raise RuntimeError(
                 f"{stage} execution is forbidden until its master + seven "
@@ -2204,7 +2033,7 @@ class Qwen25OmniUnifiedEngine(
                     "",
                     f"- **FPGA speech context budget:** "
                     f"{self.MAX_CONTEXT_SIZE} Thinker tokens; "
-                    f"{self.mc_arena.tensor_bytes / 2**20:.0f} MiB private tensors "
+                    f"{self.layout.tensor_bytes / 2**20:.0f} MiB private tensors "
                     f"and {self._private_reserve_bytes / 2**20:.0f} MiB private "
                     "weight reserve per engine",
                     f"- **Talker setup (readback, weights, compilation):** "
@@ -2275,11 +2104,14 @@ class Qwen25OmniUnifiedEngine(
     def _ensure_stage_scheduler(self, stage: str):
         scheduler = self._multi_core_schedulers.get(stage)
         if scheduler is None:
+            pool_kw = ({"workers": self._worker_pool}
+                       if self._worker_pool is not None else {})
             scheduler = MultiEngineScheduler(
                 self,
                 num_engines=REQUIRED_ENGINES,
                 engine_base_stride=0x00010000,
-                arena=self.mc_arena,
+                arena=self.layout,
+                **pool_kw,
                 handshake=(
                     "host_segmented"
                     if self.fpga_build == LEGACY_HOST_SEGMENTED_BUILD
@@ -2291,7 +2123,342 @@ class Qwen25OmniUnifiedEngine(
                 allow_more_than_two_engines=True,
             )
             self._multi_core_schedulers[stage] = scheduler
+            if self.layout.resident_programs and self._worker_pool is None:
+                # ONE allocator per worker engine for the whole run, so each
+                # stage's programs land after the previous stage's.
+                self._worker_pool = list(scheduler.workers)
+                for worker in self._worker_pool:
+                    self._guard_resident_dma(worker)
         return scheduler
+
+    # -- resident programs ------------------------------------------------
+    def reset_program_dram_addr(self) -> None:
+        """Stage compiles start from here; resident stages keep their own range."""
+        if not self.layout.resident_programs:
+            super().reset_program_dram_addr()
+
+    def _guard_resident_dma(self, engine) -> None:
+        """Skip re-writing a program image that is already in DRAM.
+
+        The stage runners upload their program before every run. Once an image
+        has been installed (install_resident_programs) that write is redundant
+        and, for vision's 120 MiB, not free. Only the registered (address, size)
+        of a stage image is skipped; every other write -- tensors, the small
+        flag-clear programs, decode preambles -- goes through.
+        """
+        if getattr(engine, "_resident_guarded", False):
+            return
+        original = engine.dma_write
+        images = self._resident_images.setdefault(id(engine), {})
+
+        def dma_write(device, address, buffer, size, _orig=original, _images=images):
+            if int(size) in _images.get(int(address), ()):
+                return int(size)
+            return _orig(device, address, buffer, size)
+
+        engine.dma_write = dma_write
+        engine._resident_guarded = True
+
+    def snapshot_stage_tensors(self, stage: str, before: dict) -> None:
+        """Remember where a stage's tensors were carved when its program was built."""
+        labels = {k: v for k, v in self._dram_addresses.items()
+                  if before.get(k) != v}
+        self._stage_tensor_state[stage] = {
+            "labels": labels,
+            "marks": (self.layout.tensor_phase_mark(), self._tensor_staged),
+        }
+
+    def enter_stage_tensors(self, stage: str, init) -> None:
+        """Give a stage its tensors back at the addresses its program uses.
+
+        Tensors alias across stages, so a stage's contents (constants, zeroed
+        caches) have to be rewritten when it starts. Re-running its tensor
+        init does exactly that, and because the carve is deterministic it
+        yields the same addresses; any difference would mean the compiled
+        program points at the wrong buffers, so it is checked.
+        """
+        state = self._stage_tensor_state[stage]
+        entered = time.perf_counter()
+        self.reset_tensor_dram_addr()
+        init()
+        moved = {k: (v, self._dram_addresses.get(k)) for k, v in state["labels"].items()
+                 if self._dram_addresses.get(k) != v}
+        if moved:
+            k, (old, new) = next(iter(moved.items()))
+            raise RuntimeError(
+                f"{stage} tensors moved since compile ({len(moved)} buffer(s), "
+                f"e.g. {k}: 0x{old:X} -> 0x{new if new is not None else 0:X})")
+        # Whatever the compile allocated after tensor init stays allocated.
+        layout_mark, staged = state["marks"]
+        self.layout.tensor_phase_set(layout_mark)
+        self._tensor_staged = staged
+        self._loud(f"  [{stage}] tensors re-entered in "
+                   f"{time.perf_counter() - entered:.2f}s (no weights or programs loaded)")
+
+    def verify_resident_images(self, stage: str | None = None) -> list[str]:
+        """Read every resident image back and compare it with what was installed."""
+        bad = []
+        for (name, who, addr), (engine, size, digest) in self._resident_hashes.items():
+            if stage is not None and name != stage:
+                continue
+            buf = bytearray(size)
+            got = engine.dma_read(engine.c2h_device, addr, buf, size)
+            if got != size or hashlib.sha1(bytes(buf)).hexdigest() != digest:
+                bad.append(f"{name} {who} @0x{addr:X} ({size} B)")
+        return bad
+
+    @staticmethod
+    def _capture_bytes(engine, emit) -> bytes:
+        """Instruction bytes ``emit`` produces on ``engine``; nothing is written."""
+        engine.clear_inst_id()
+        engine.clear_capture_buffer()
+        engine.start_capture()
+        emit()
+        engine.stop_capture()
+        blob = b"".join(i.get_bytes() for i in engine.capture_buffer)
+        engine.clear_capture_buffer()
+        return blob
+
+    def _install_table(self, engine, blobs: list[bytes], what: str, limit=None) -> tuple:
+        """Write fixed-stride launch entries at the engine's program cursor."""
+        stride = (max(len(b) for b in blobs) + 63) // 64 * 64
+        table = b"".join(b.ljust(stride, b"\0") for b in blobs)
+        base = engine.get_program_dram_addr()
+        if limit is not None and base + len(table) > limit:
+            raise MemoryError(f"{what} ({len(table) / 2**10:.0f} KiB) exceeds the ISA slice")
+        if engine.dma_write(user_dma_core.DMA_DEVICE_H2C, base, table, len(table)) != len(table):
+            raise IOError(f"{what}: short DMA")
+        engine.allocate_program_dram(len(table))
+        return base, stride, table
+
+    def install_decode_launch_tables(self) -> None:
+        """Precompile every decode launch entry, so a step is started by address.
+
+        The master entry for position p primes the KV-row and aligned-length
+        registers and jumps into the decoder body; each worker has one entry
+        per 64-row aligned length. They replace the per-step preamble the run
+        loop used to generate and write.
+        """
+        if self._device_embedding_enabled():
+            return                      # that path emits a token-dependent lookup
+        if self._ensure_stage_scheduler("decode").host_segmented:
+            return                      # legacy rendezvous needs host-built segments
+        addr, _ = self._decoder_program
+        entries = []
+        for pos in range(self.MAX_CONTEXT_SIZE):
+            aligned = ((pos + 1 + 63) // 64) * 64
+            entries.append(self._capture_bytes(self, lambda p=pos, a=aligned: (
+                self.generate_instruction_add_set(self.gf_seq_len, p),
+                self.generate_instruction_add_set(self.gf_aligned_seq_len, a),
+                self.generate_instruction_jump_abs(
+                    user_dma_core.ue_35bit_addr_shifter(addr)))))
+        base, stride, table = self._install_table(
+            self, entries, "decode launch table", self.MASTER_ISA_LIMIT)
+        dec_sched = self._ensure_stage_scheduler("decode")
+        buckets = (self.MAX_CONTEXT_SIZE + 63) // 64
+        workers, worker_images = [], []
+        for idx, worker, waddr, _blob in self._decoder_workers:
+            blobs = []
+            for b in range(1, buckets + 1):
+                sets = self._decode_attn_worker_gpr_sets(dec_sched, 64 * b)[idx - 1]
+                blobs.append(self._capture_bytes(worker, lambda s=sets, a=waddr: (
+                    [worker.generate_instruction_add_set(r, v) for r, v in s],
+                    worker.generate_instruction_jump_abs(
+                        user_dma_core.ue_35bit_addr_shifter(a)))))
+            wbase, wstride, wtable = self._install_table(
+                worker, blobs, f"decode worker {idx} launch table",
+                self.layout.isa_limit(idx))
+            workers.append((idx, worker, wbase, wstride))
+            worker_images.append((idx, worker, wbase, wtable))
+        self._decode_launch = {"master": (base, stride), "workers": workers}
+        self.register_raw_stage(
+            "decode_launch", (base, table), worker_images,
+            {"positions": self.MAX_CONTEXT_SIZE, "aligned_buckets": buckets,
+             "master_stride": stride})
+
+    def install_flag_clear_programs(self) -> None:
+        """One precompiled flag-clear program per engine, launched by address.
+
+        The runtime used to generate this two-instruction program and write it at
+        each engine's program cursor before every launch, which put it on top of
+        whatever followed the stage that had just run.
+        """
+        engines = [(0, self)] + list(enumerate(self._worker_pool or (), start=1))
+        images = []
+        for idx, engine in engines:
+            blob = self._capture_bytes(engine, lambda e=engine: (
+                e.generate_instruction_flag_clear(), e.generate_instruction_halt()))
+            limit = self.MASTER_ISA_LIMIT if idx == 0 else self.layout.isa_limit(idx)
+            base, _stride, table = self._install_table(engine, [blob], "flag-clear", limit)
+            engine._flag_clear_addr = base
+            images.append((idx, engine, base, table))
+        self.register_raw_stage(
+            "flag_clear", (images[0][2], images[0][3]), images[1:], {"kind": "flag_clear"})
+
+    # -- --run_from_bin ---------------------------------------------------
+    # Program images come from programs.bin; these attributes are the images
+    # themselves, so they are restored from the bin and never pickled.
+    _PROGRAM_ATTRS = frozenset({
+        "_vis_program_bytes", "_vis_encoder_program_bytes", "_vis_patch_program_bytes",
+        "_vis_worker_programs", "_audio_program_bytes", "_audio_worker_programs",
+        "_prefill_program", "_prefill_workers", "_decoder_program", "_decoder_workers",
+    })
+
+    def engine_names(self, cores=None) -> dict:
+        """Name every engine object a stored value may refer to."""
+        names = {"master": self}
+        for i, worker in enumerate(self._worker_pool or (), start=1):
+            names[f"worker{i}"] = worker
+        if cores is not None:
+            for i, engine in enumerate(cores.engines):
+                names[f"core{i}"] = engine
+        return names
+
+    def keep_compile_state(self, key: str, recorder, skip=()) -> None:
+        """Remember what a compile call left behind, for --run_from_bin."""
+        self._compile_state[key] = recorder.delta(skip=self._PROGRAM_ATTRS | set(skip))
+
+    def apply_compile_state(self, key: str, target=None) -> None:
+        for name, value in self._compile_state[key].items():
+            setattr(target if target is not None else self, name, value)
+
+    @staticmethod
+    def stage_images_from_bin(manifest: dict, payload: bytes) -> dict:
+        """{stage: {engine: (dram address, bytes)}} exactly as programs.json records."""
+        stages: dict[str, dict] = {}
+        for s in manifest["sections"]:
+            start = int(s["file_offset"])
+            stages.setdefault(s["name"], {})[int(s["engine_index"])] = (
+                int(s["dram_base"], 16), payload[start:start + int(s["size"])])
+        return stages
+
+    def use_bin_stage(self, stage: str, images: dict, workers: dict, raw: bool = False,
+                      metadata: dict | None = None) -> None:
+        """Make a stage's programs the ones stored in programs.bin (no compile)."""
+        master_addr, master = images[0]
+        stage_workers = [(idx, workers[idx], addr, blob)
+                         for idx, (addr, blob) in sorted(images.items()) if idx]
+        if raw:
+            self.register_raw_stage(stage, (master_addr, master), stage_workers,
+                                    metadata or {})
+            return
+        # The same attributes a compile would have set; the stage's metadata and
+        # its runner read them.
+        if stage == "vision":
+            # run_vision_encoder keeps the encoder and the patch program as one
+            # contiguous image; the boundary was recorded when it was compiled.
+            enc = int(self._compile_state["vision_extra"]["encoder_len"])
+            self._vis_program_bytes = master
+            self._vis_encoder_program_bytes = master[:enc]
+            self._vis_patch_program_bytes = master[enc:]
+            self._vis_worker_programs = stage_workers
+        elif stage == "audio":
+            self._audio_program_bytes = master
+            self._audio_worker_programs = stage_workers
+        elif stage == "prefill":
+            self._prefill_program = (master_addr, master)
+            self._prefill_workers = stage_workers
+        elif stage == "decode":
+            self._decoder_program = (master_addr, master)
+            self._decoder_workers = stage_workers
+        self._bin_stage_state[stage] = (master_addr, master, stage_workers)
+
+    def compile_or_restore(self, key: str, compile_fn, from_bin: bool,
+                           scheduler_stage: str | None = None):
+        """Run a compile and remember what it leaves behind, or restore that."""
+        if from_bin:
+            if scheduler_stage is not None:
+                self._ensure_stage_scheduler(scheduler_stage)
+            self.apply_compile_state(key)
+            return None
+        recorder = _state_mod.Recorder(self)
+        result = compile_fn()
+        self.keep_compile_state(key, recorder)
+        return result
+
+    def reserve_isa_gap(self, *stages: str) -> None:
+        """Leave room after a stage's program for the writes made at run time.
+
+        The gap starts at the END of the stage's images, not at wherever the
+        cursor happens to be: some compilers (audio) do not advance the master
+        cursor until the program is uploaded, so a gap added to the cursor would
+        sit inside the image and the next stage would be built on top of it.
+        """
+        gap = _layout_mod.FLAT_ISA_GAP_MIB * 2**20
+        align = lambda n: (n + 63) // 64 * 64
+        for stage in stages:
+            master_addr, master, workers = self._program_stage_state(stage)
+            self._next_program_dram_addr = max(
+                self._next_program_dram_addr, align(int(master_addr) + len(master)))
+            for _idx, worker, addr, blob in workers:
+                worker._next_program_dram_addr = max(
+                    worker._next_program_dram_addr, align(int(addr) + len(blob)))
+        self.allocate_program_dram(gap)
+        for worker in self._worker_pool or ():
+            worker.allocate_program_dram(gap)
+
+    def install_resident_programs(self, stages, load_raw: bool = False) -> None:
+        """Load every stage's master and worker images into DRAM, once."""
+        started = time.perf_counter()
+        total = 0
+        # Every stage keeps its own range on every engine; two images that
+        # overlap would silently corrupt the earlier one, so refuse before any DMA.
+        spans: dict[int, list[tuple[int, int, str]]] = {}
+        for stage in stages:
+            master_addr, master, workers = self._program_stage_state(stage)
+            spans.setdefault(0, []).append(
+                (int(master_addr), int(master_addr) + len(master), stage))
+            for idx, _worker, addr, blob in workers:
+                spans.setdefault(int(idx), []).append(
+                    (int(addr), int(addr) + len(blob), stage))
+        for engine_spans in spans.values():
+            engine_spans.sort()
+            for (lo0, hi0, s0), (lo1, hi1, s1) in zip(engine_spans, engine_spans[1:]):
+                if lo1 < hi0:
+                    raise RuntimeError(
+                        f"{s0} image [0x{lo0:X}, 0x{hi0:X}) overlaps {s1} image "
+                        f"starting at 0x{lo1:X}")
+        self._guard_resident_dma(self)
+        for stage in stages:
+            if stage in self._raw_stages:
+                # Written while it compiled, or (load_raw) uploaded from the bin now.
+                master_addr, master, workers = self._program_stage_state(stage)
+                for engine, addr, blob in [(self, master_addr, master)] + [
+                        (w, int(a), bytes(b)) for _i, w, a, b in workers]:
+                    if load_raw:
+                        if engine is not self:
+                            self._guard_resident_dma(engine)
+                        if engine.dma_write(user_dma_core.DMA_DEVICE_H2C, addr, blob,
+                                            len(blob)) != len(blob):
+                            raise IOError(f"{stage}: short program DMA at 0x{addr:X}")
+                        total += len(blob)
+                    key = (stage, "master" if engine is self else f"worker@{id(engine) % 9973}", addr)
+                    self._resident_hashes[key] = (engine, len(blob),
+                                                  hashlib.sha1(blob).hexdigest())
+                self._resident_stages.add(stage)
+                continue
+            self._reload_program_stage(stage)         # disk bytes, validated
+            master_addr, master, workers = self._program_stage_state(stage)
+            engine_name = lambda e: "master" if e is self else f"worker@{id(e) % 9973}"
+            images = [(self, master_addr, bytes(master))]
+            images += [(w, int(a), bytes(b)) for _i, w, a, b in workers]
+            for engine, addr, blob in images:
+                if engine is not self:
+                    self._guard_resident_dma(engine)
+                if engine.dma_write(user_dma_core.DMA_DEVICE_H2C, addr, blob, len(blob)) != len(blob):
+                    raise IOError(f"{stage}: short program DMA at 0x{addr:X}")
+                self._resident_images[id(engine)].setdefault(addr, set()).add(len(blob))
+                if stage == "vision" and engine is self:
+                    # run_vision_encoder also uploads the encoder alone.
+                    self._resident_images[id(engine)][addr].add(
+                        len(self._vis_encoder_program_bytes))
+                self._resident_hashes[(stage, engine_name(engine), addr)] = (
+                    engine, len(blob), hashlib.sha1(blob).hexdigest())
+                total += len(blob)
+            self._resident_stages.add(stage)
+        self._loud(f"  [Program bin] installed {total / 2**20:.1f} MiB of "
+                   f"{len(self._resident_stages)} stage image(s) in "
+                   f"{time.perf_counter() - started:.1f}s; they stay resident")
 
     def _master_isa_program_ends(self) -> list[tuple[str, int]]:
         runtime_bytes = 2 * user_dma_core.INSTRUCTION_SIZE_BYTES
@@ -2356,7 +2523,7 @@ class Qwen25OmniUnifiedEngine(
         Report both payload and the intentionally untouched ISA guard strip.
         """
         MiB = float(2**20)
-        arena = self.mc_arena
+        arena = self.layout
         ne = arena.num_engines
         win = arena.stride
         out = [
@@ -2436,7 +2603,7 @@ class Qwen25OmniUnifiedEngine(
             )
             lines.append(
                 f"  core {idx} ISA peak: {peak / 2**20:.2f} / "
-                f"{self.mc_arena.isa_bytes / 2**20:.0f} MiB"
+                f"{self.layout.isa_bytes / 2**20:.0f} MiB"
                 + (f" ({details} MiB)" if details else "")
             )
         return lines
@@ -2445,7 +2612,7 @@ class Qwen25OmniUnifiedEngine(
         return "\n".join(
             [
                 "U55 8-GiB map:",
-                self.mc_arena.describe(),
+                self.layout.describe(),
                 f"  PARAMS  0x{self.PARAMS_BASE:09X}..0x{self.PARAMS_LIMIT:09X} "
                 f"{(self.PARAMS_LIMIT - self.PARAMS_BASE) / 2**20:.0f} MiB "
                 "(vision/audio/LM time-shared)",
@@ -2453,7 +2620,7 @@ class Qwen25OmniUnifiedEngine(
                 f"{(self.TENSOR_LIMIT - self.TENSOR_BASE) / 2**20:.0f} MiB",
                 f"  ISA     0x{self.ISA_BASE:09X}..0x{self.MASTER_ISA_LIMIT:09X} "
                 f"{(self.MASTER_ISA_LIMIT - self.ISA_BASE) / 2**20:.0f} MiB",
-                f"  ISA guard (per core): {self.mc_arena.isa_guard_bytes / 2**20:.0f} MiB "
+                f"  ISA guard (per core): {self.layout.isa_guard_bytes / 2**20:.0f} MiB "
                 "untouched immediately below ISA",
             ]
         )
@@ -2755,9 +2922,206 @@ def _prepare_processor_inputs(args, cfg: dict, processor_dir: str):
     return processor, processed, tokens, prompt, rendered
 
 
+def _request_signature(ue, args, context, tokens, processed) -> dict:
+    """Everything the compiled programs depend on, so a stored bin is only reused
+    for a request of the same shape (token values and pixel values do not matter)."""
+    sig = {
+        "layout": ue.layout.kind,
+        "stages": sorted(
+            ["lm"] + (["vision"] if args.image else []) + (["audio"] if args.audio else [])
+            + (["talker"] if args.speak is not None and not args.speak_host else [])
+            + (["t2w"] if args.speak is not None and not args.speak_host
+               and not args.token2wav_host else [])),
+        "vision_res": args.vision_res, "frames": int(args.frames),
+        "max_context": int(ue.MAX_CONTEXT_SIZE), "profile": bool(args.profile),
+        "prefill_tokens": len(context), "prompt_tokens": len(tokens),
+        "t2w_max_codes": int(T2W_FPGA_MAX_CODES),
+    }
+    if args.image:
+        sig["image_grid_thw"] = processed["image_grid_thw"].tolist()
+        sig["pixel_rows"] = int(processed["pixel_values"].shape[0])
+    if args.audio:
+        sig["audio_features"] = list(processed["input_features"].shape)
+        sig["audio_mask_ones"] = int(processed["feature_attention_mask"].sum())
+    return sig
+
+
+def _prepare_unified(ue: Qwen25OmniUnifiedEngine, args, processed, context,
+                     cfg: dict, tokens: list[int], signature: dict | None = None,
+                     from_bin: bool = False) -> list[str]:
+    """Everything every enabled stage needs, before any stage runs.
+
+    Weights go to their resident pools, each stage's tensors are carved (they
+    alias, so this only fixes the addresses the programs are built against),
+    every program is compiled into its own ISA range and the whole set is
+    published as one programs.bin generation and loaded into DRAM once.
+
+    ``from_bin`` (--run_from_bin) compiles nothing: the stage images are taken
+    from the existing programs.bin, the compilers' bookkeeping from its state
+    file, and the Talker's and Token2Wav's weights from the speech-weights file.
+    The weights of the Thinker, vision and audio still load from params.bin.
+    """
+    started = time.perf_counter()
+    stages: list[str] = []
+    saved = images = manifest = payload = None
+    speak_fpga = args.speak is not None and not args.speak_host
+    bin_path = str(ue._program_bundle.bin_path)
+    if from_bin:
+        # Reuse the stored programs only if they were built for this configuration
+        # (layout, context, which stages, shapes -- the prompt's text does not matter,
+        # its token count does). Anything else: build from scratch, as without the flag.
+        problem = None
+        generation = None
+        try:
+            with open(ue._program_bundle.json_path) as stream:
+                generation = json.load(stream).get("generation_id")
+        except (OSError, ValueError):
+            problem = f"{bin_path} or its manifest does not exist"
+        if problem is None:
+            # The request first: it names what differs (context, stages, prompt length).
+            problem = _state_mod.reuse_problem(bin_path, generation, signature)
+        if problem is None:
+            try:
+                manifest, payload = ue._program_bundle.load()   # code/layout identity, hashes
+            except Exception as exc:  # noqa: BLE001 - e.g. ProgramBundleError: stale identity
+                problem = f"programs.bin does not match this code or layout ({exc})"
+        if problem is not None:
+            print(f"  [run_from_bin] not reusing {os.path.basename(bin_path)}: {problem}\n"
+                  "  [run_from_bin] building the programs from scratch", flush=True)
+            from_bin = False
+            manifest = payload = None
+    print("\n--- Unified prepare: weights, tensors, programs (all stages) ---"
+          + ("   [programs from programs.bin, no compile]" if from_bin else ""))
+    if not from_bin:
+        # A build starts from nothing, so no stage of an earlier configuration lingers.
+        for stale in (bin_path, str(ue._program_bundle.json_path),
+                      _state_mod.state_path(bin_path)):
+            if os.path.exists(stale):
+                os.unlink(stale)
+    if from_bin:
+        first = "vision" if args.image else "audio" if args.audio else "prefill"
+        ue._ensure_stage_scheduler(first)           # creates the shared worker pool
+        saved = _state_mod.load(bin_path, manifest["generation_id"], signature,
+                                ue.engine_names())
+        images = ue.stage_images_from_bin(manifest, payload)
+        ue._compile_state.update(saved["compile_state"])
+        ue._stage_tensor_state.update(saved["stage_tensor_state"])
+        ue._worker_isa_used.update(saved["worker_isa_used"])
+        print(f"  [run_from_bin] {bin_path}: generation {manifest['generation_id'][:12]}, "
+              f"{len(images)} stage(s) recorded", flush=True)
+    phase = "prepare_bin" if from_bin else "prepare"
+    worker_map = lambda: {i: w for i, w in enumerate(ue._worker_pool, start=1)}
+
+    def section_metadata(stage: str) -> dict:
+        for s in manifest["sections"]:
+            if s["name"] == stage:
+                return s["metadata"]
+        raise KeyError(stage)
+
+    if args.image:
+        _run_vision(ue, processed, args.profile, phase=phase)
+        stages.append("vision")
+    if args.audio:
+        _run_audio(ue, processed, phase=phase)
+        stages.append("audio")
+    before = dict(ue._dram_addresses)
+    ue.lm_weight_init()
+    ue.lm_tensor_init()
+    layers = int(ue._lm_dims()["NL"])
+    ue.compile_or_restore(
+        "prefill", lambda: ue.compile_prefill(len(context), profile=args.profile),
+        from_bin, "prefill")
+    # The decode shards are weights (they are placed in the private windows); build
+    # them explicitly so a run that does not compile still has them.
+    ue._ensure_decode_shards(ue._ensure_stage_scheduler("decode"), layers)
+    ue.compile_or_restore("decode", lambda: ue.compile_decoder(profile=args.profile),
+                          from_bin, "decode")
+    if not from_bin:
+        ue.check_master_isa()
+        ue.snapshot_stage_tensors("lm", before)
+    stages += ["prefill", "decode"]
+    if from_bin:
+        ue._packaged_program_stages.update(stages)
+        for stage in stages:            # vision, audio, prefill, decode
+            ue.use_bin_stage(stage, images[stage], worker_map())
+        ue._decode_launch = saved["decode_launch"]
+        ue.use_bin_stage("decode_launch", images["decode_launch"], worker_map(), raw=True,
+                         metadata=section_metadata("decode_launch"))
+        stages.append("decode_launch")
+    else:
+        ue.install_decode_launch_tables()
+        if "decode_launch" in ue._raw_stages:
+            stages.append("decode_launch")
+        ue.reserve_isa_gap("prefill", "decode")
+    persist: dict = {}
+    if speak_fpga:
+        # The Talker's weights and program are request-independent, so they are
+        # staged now too, and so is Token2Wav (built for its longest output).
+        from transformers import Qwen2_5OmniConfig
+        model_dir = os.path.join(SCRIPT_DIR, cfg["paths"]["hf_model_dir"])
+        speech_cfg = Qwen2_5OmniConfig.from_pretrained(model_dir).talker_config
+        ue._talker_ctx = _stage_talker(
+            ue, args, model_dir, speech_cfg, len(tokens), saved, images,
+            section_metadata("talker") if from_bin else None)
+        persist.update(ue._talker_ctx["persist"] or {})
+        stages.append("talker")
+        print("  [Talker FPGA] weights and program resident", flush=True)
+        if not args.token2wav_host:
+            ue._t2w = _stage_token2wav(
+                ue, model_dir, saved, images,
+                section_metadata("token2wav") if from_bin else None)
+            persist.update(ue._t2w["persist"] or {})
+            stages.append("token2wav")
+            print(f"  [Token2Wav FPGA] weights and programs resident "
+                  f"({ue._t2w['prepare_s']:.1f}s)", flush=True)
+    if from_bin:
+        ue.use_bin_stage("flag_clear", images["flag_clear"], worker_map(), raw=True,
+                         metadata=section_metadata("flag_clear"))
+    else:
+        ue.install_flag_clear_programs()
+    stages.append("flag_clear")
+    if not from_bin:
+        # One programs.bin generation for every stage.
+        ue.store_program_stages(*stages)
+    # Every stage image, the Talker's and Token2Wav's included, is loaded into
+    # DRAM from the bin now; nothing is uploaded when a stage starts.
+    ue.install_resident_programs(stages, load_raw=True)
+    if from_bin:
+        for name, addr in saved["flag_clear"].items():
+            ue.engine_names()[name]._flag_clear_addr = addr
+    else:
+        _save_bin_state(ue, bin_path, signature, persist)
+    for line in ue.isa_usage_lines():
+        print(line)
+    print(f"  unified prepare done in {time.perf_counter() - started:.1f}s", flush=True)
+    return stages
+
+
+def _save_bin_state(ue, bin_path: str, signature: dict, persist: dict) -> None:
+    """Store, beside programs.bin, what --run_from_bin needs to skip the compile."""
+    manifest, _payload = ue._program_bundle.load()
+    names = ue.engine_names()
+    payload = {
+        "compile_state": ue._compile_state,
+        "stage_tensor_state": ue._stage_tensor_state,
+        "worker_isa_used": ue._worker_isa_used,
+        "decode_launch": getattr(ue, "_decode_launch", None),
+        "flag_clear": {name: engine._flag_clear_addr for name, engine in names.items()
+                       if getattr(engine, "_flag_clear_addr", None) is not None},
+        "talker": persist.get("talker"),
+        "t2w_state": persist.get("t2w_state"),
+    }
+    _state_mod.check_picklable(
+        {k: v for k, v in payload.items() if isinstance(v, dict)}, names)
+    _state_mod.save(bin_path, manifest["generation_id"], signature, payload, names)
+    size = os.path.getsize(_state_mod.state_path(bin_path)) / 2**10
+    print(f"  [Program bin] state for --run_from_bin saved ({size:.0f} KiB)", flush=True)
+
+
 def _run_vision(
-    ue: Qwen25OmniUnifiedEngine, processed, profile: bool = False
-) -> torch.Tensor:
+    ue: Qwen25OmniUnifiedEngine, processed, profile: bool = False,
+    phase: str = "all",
+) -> torch.Tensor | None:
     """Encode 1 or more camera frames and return their embeddings concatenated
     in frame order (matching the same-order image placeholder blocks
     _prepare_processor_inputs emitted, which run_prefill's slot-splicing then
@@ -2815,15 +3179,34 @@ def _run_vision(
                 f"frame {f}'s pixel patches differ from frame 0's -- --frames "
                 "only supports replaying identical frames of the same --image"
             )
-    print(f"\n--- Vision stage ({frames} frame(s)) ---")
     started = time.perf_counter()
-    ue.vision_weight_init()
-    ue.prepare_encoder_input(frame0, grid[:1])
-    ue.reset_tensor_dram_addr()
-    ue.vision_tensor_init()
-    ue.compile_vision_encoder(profile=profile)
-    ue.check_master_isa()
-    ue.store_program_stage("vision")
+    if phase == "run":
+        print(f"\n--- Vision stage ({frames} frame(s)) ---")
+        ue.enter_stage_tensors("vision", ue.vision_tensor_init)
+    else:
+        from_bin = phase == "prepare_bin"
+        if phase.startswith("prepare"):
+            print("  [Vision] weights and tensors; program "
+                  + ("from programs.bin" if from_bin else "compiled"))
+        else:
+            print(f"\n--- Vision stage ({frames} frame(s)) ---")
+        ue.vision_weight_init()
+        ue.prepare_encoder_input(frame0, grid[:1])
+        before = dict(ue._dram_addresses)
+        ue.reset_tensor_dram_addr()
+        ue.vision_tensor_init()
+        ue.compile_or_restore("vision", lambda: ue.compile_vision_encoder(profile=profile),
+                              from_bin, "vision")
+        if not from_bin:
+            ue._compile_state["vision_extra"] = {
+                "encoder_len": len(ue._vis_encoder_program_bytes)}
+            ue.check_master_isa()
+        if phase.startswith("prepare"):
+            if not from_bin:
+                ue.snapshot_stage_tensors("vision", before)
+                ue.reserve_isa_gap("vision")
+            return None
+        ue.store_program_stage("vision")
     # run_vision_encoder's own bookkeeping (_vis_latency_us/_vis_wall_s/
     # _vis_gflops/_vis_num_tokens) is PER CALL -- each call OVERWRITES it, with
     # no notion of "N frames in one run". Aggregate across the loop ourselves
@@ -2855,18 +3238,38 @@ def _run_vision(
     return embeddings
 
 
-def _run_audio(ue: Qwen25OmniUnifiedEngine, processed):
-    print("\n--- Audio stage ---")
+def _run_audio(ue: Qwen25OmniUnifiedEngine, processed, phase: str = "all"):
     started = time.perf_counter()
-    ue.audio_weight_init()
-    metadata = ue.prepare_audio_input(
-        processed["input_features"], processed["feature_attention_mask"]
-    )
-    ue.reset_tensor_dram_addr()
-    ue.audio_tensor_init()
-    ue.compile_audio_encoder()
-    ue.check_master_isa()
-    ue.store_program_stage("audio")
+    if phase == "run":
+        print("\n--- Audio stage ---")
+        metadata = ue._audio_metadata
+        ue.enter_stage_tensors("audio", ue.audio_tensor_init)
+    else:
+        from_bin = phase == "prepare_bin"
+        print(("  [Audio] weights and tensors; program "
+               + ("from programs.bin" if from_bin else "compiled"))
+              if phase.startswith("prepare") else "\n--- Audio stage ---")
+        ue.audio_weight_init()
+        metadata = ue.prepare_audio_input(
+            processed["input_features"], processed["feature_attention_mask"]
+        )
+        ue._audio_metadata = metadata
+        before = dict(ue._dram_addresses)
+        ue.reset_tensor_dram_addr()
+        ue.audio_tensor_init()
+        ue.compile_or_restore("audio", ue.compile_audio_encoder, from_bin, "audio")
+        if not from_bin:
+            ue.check_master_isa()
+        if phase.startswith("prepare"):
+            if not from_bin:
+                ue.snapshot_stage_tensors("audio", before)
+                ue.reserve_isa_gap("audio")
+            return None, metadata
+        ue.store_program_stage("audio")
+    if os.environ.get("OMNI_VERIFY_IMAGES"):
+        bad = ue.verify_resident_images()
+        print(f"  [verify] resident images before audio run: "
+              f"{'ALL MATCH' if not bad else 'MISMATCH ' + '; '.join(bad)}", flush=True)
     embeddings = ue.run_audio_encoder()
     print(
         f"  audio -> {tuple(embeddings.shape)} in "
@@ -2934,7 +3337,7 @@ def _synthesize_speech(ue, args, cfg: dict, prompt_tokens: list[int]) -> dict:
             **(hs.last_metrics or {})}
 
 
-def _token2wav_on_fpga(vocoder, codes: list[int], spk: dict):
+def _token2wav_on_fpga(vocoder, codes: list[int], spk: dict, layout=None):
     """DiT + BigVGAN on all eight engines, after the Thinker and Talker have finished.
 
     Neither stage's weights are read again, so this lays its own address map over
@@ -2949,18 +3352,280 @@ def _token2wav_on_fpga(vocoder, codes: list[int], spk: dict):
     print(f"  [Token2Wav FPGA] {len(codes)} codec tokens -> {len(codes) * 2} mel frames "
           f"on {REQUIRED_ENGINES} engines", flush=True)
     started = time.perf_counter()
-    cores = cores_mod.Cores(REQUIRED_ENGINES)
-    pipe = t2w_mod.Token2WavFpga(cores, vocoder, codes=len(codes), verbose=False)
+    memory_map = layout.t2w_memory_map() if getattr(layout, "kind", "") == "flat" else None
+    cores = cores_mod.Cores(REQUIRED_ENGINES, memory_map=memory_map)
+    pipe = t2w_mod.Token2WavFpga(
+        cores, vocoder, codes=len(codes),
+        verbose=bool(os.environ.get("OMNI_T2W_VERBOSE")))
     setup_s = time.perf_counter() - started
     wav, info = pipe.synthesize(
         _torch.tensor([codes], dtype=_torch.long), spk["cond"].float(),
         spk["ref_mel"].float())
+    for line in cores_mod.footprint_lines(cores):
+        print(line, flush=True)
     print(f"  [Token2Wav FPGA] setup {setup_s:.1f}s, DiT {info['dit_s']:.1f}s, "
           f"BigVGAN {info['bigvgan_s']:.1f}s", flush=True)
     return wav.detach(), {"token2wav_setup_s": setup_s,
                           "token2wav_dit_s": info["dit_s"],
                           "token2wav_bigvgan_s": info["bigvgan_s"],
                           **{f"t2w_{k}": v for k, v in info.items() if k != "mel"}}
+
+
+def _load_vocoder(model_dir: str):
+    from transformers import Qwen2_5OmniConfig, Qwen2_5OmniToken2WavModel
+    config = Qwen2_5OmniConfig.from_pretrained(model_dir)
+    vocoder = Qwen2_5OmniToken2WavModel(config.token2wav_config)
+    vocoder.load_state_dict(
+        _talker_mod._load_submodule_state(model_dir, "token2wav"), strict=True)
+    return vocoder.float().eval()
+
+
+_T2W_HOST_BUILDS: dict = {}
+
+
+def _host_build_token2wav(model_dir: str, plan) -> dict:
+    """Build Token2Wav's weights and programs on the CPU (no board involved).
+
+    The engines write to a HostImage, so the result is exactly the bytes that
+    belong at each address of the flat map: the weights go to params.bin, the
+    programs to programs.bin. Cached so a run that needs both builds it once.
+    """
+    cores_mod = _load_sibling("qwen2_5_omni_7b_t2w_cores", "qwen2.5_omni_7b_t2w_cores.py")
+    t2w_mod = _load_sibling("qwen2_5_omni_7b_token2wav_fpga",
+                            "qwen2.5_omni_7b_token2wav_fpga.py")
+    layout = FlatLayout(REQUIRED_ENGINES, plan)       # only for its Token2Wav map
+    memory_map = layout.t2w_memory_map()
+    key = json.dumps(memory_map, sort_keys=True, default=list)
+    if key in _T2W_HOST_BUILDS:
+        return _T2W_HOST_BUILDS[key]
+    started = time.perf_counter()
+    vocoder = _load_vocoder(model_dir)
+    cores = cores_mod.ImageCores(REQUIRED_ENGINES, memory_map=memory_map)
+    pipe = t2w_mod.Token2WavFpga(
+        cores, vocoder, codes=T2W_FPGA_MAX_CODES,
+        verbose=bool(os.environ.get("OMNI_T2W_VERBOSE")))
+    build = {"cores": cores, "pipe": pipe, "memory_map": memory_map, "vocoder": vocoder,
+             "built_s": time.perf_counter() - started}
+    _T2W_HOST_BUILDS[key] = build
+    print(f"  [Token2Wav] weights and programs built on the host in "
+          f"{build['built_s']:.1f}s", flush=True)
+    return build
+
+
+def _ensure_speech_params(script_dir: str, cfg: dict, args, plan) -> None:
+    """Make sure params.bin carries the Talker's and Token2Wav's weights.
+
+    They are appended once (the Thinker regions are not rewritten) and loaded at
+    init like every other weight. This runs before the engine exists because the
+    programs.bin identity covers the params manifest.
+    """
+    speak_fpga = args.speak is not None and not args.speak_host
+    if not speak_fpga:
+        return
+    need_t2w = not args.token2wav_host
+    model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
+    regions = _weight_mod.params_regions(script_dir)
+    if "talker" not in regions and "token2wav" in regions:
+        _weight_mod.drop_params_regions(script_dir, ["token2wav"])   # keep the order
+        regions = _weight_mod.params_regions(script_dir)
+    if "talker" not in regions:
+        print("  [params] adding the Talker's weights to params.bin (quantized once) ...",
+              flush=True)
+        weights = _talker_fpga_mod.TalkerWeights(None, model_dir, verbose=False)
+        _weight_mod.append_params_region(
+            script_dir, "talker", weights.params_items(), meta={"layers": 24})
+    if need_t2w and "token2wav" not in regions:
+        print("  [params] adding Token2Wav's weights to params.bin ...", flush=True)
+        build = _host_build_token2wav(model_dir, plan)
+        cores_mod = _load_sibling("qwen2_5_omni_7b_t2w_cores", "qwen2.5_omni_7b_t2w_cores.py")
+        cores = build["cores"]
+        items = (
+            (f"core{e}", "raw", (size,),
+             cores.image.read(cores.engines[e]._params_dram_base + off, size))
+            for e, off, size in cores_mod.weight_images(cores))
+        _weight_mod.append_params_region(
+            script_dir, "token2wav", items, meta={"max_codes": T2W_FPGA_MAX_CODES})
+
+
+def _stage_token2wav(ue, model_dir: str, saved: dict | None = None,
+                     images: dict | None = None, metadata: dict | None = None) -> dict:
+    """Make Token2Wav resident for its longest supported output, before any stage runs.
+
+    The programs are built for T2W_FPGA_MAX_CODES codec tokens; a shorter
+    output runs the same programs with the extra frames masked out (DiT) or
+    zero (BigVGAN) and trims the waveform, so nothing needs compiling when the
+    Talker finishes.
+
+    Weights come from params.bin's token2wav region and programs from
+    programs.bin, like every other stage. A run that builds the programs gets
+    them from a CPU build (no board involved); with ``saved`` (--run_from_bin)
+    they come from the stored bin and the compilers' state from the state file.
+    """
+    t2w_mod = _load_sibling("qwen2_5_omni_7b_token2wav_fpga",
+                            "qwen2.5_omni_7b_token2wav_fpga.py")
+    cores_mod = _load_sibling("qwen2_5_omni_7b_t2w_cores", "qwen2.5_omni_7b_t2w_cores.py")
+    from_bin = saved is not None
+    started = time.perf_counter()
+    persist = None
+    if from_bin:
+        vocoder = _load_vocoder(model_dir)
+        memory_map = ue.layout.t2w_memory_map()
+    else:
+        build = _host_build_token2wav(model_dir, ue.layout.plan)
+        vocoder, memory_map = build["vocoder"], build["memory_map"]
+    cores = cores_mod.Cores(REQUIRED_ENGINES, memory_map=memory_map)
+    cores.upload_weights = False        # the weights are loaded from params.bin below
+    names = ue.engine_names(cores)
+    if from_bin:
+        state = _state_mod.loads(saved["t2w_state"], names)
+    else:
+        state = {"pipe": build["pipe"].compile_state(),
+                 "cores": cores_mod.compile_state(build["cores"])}
+    pipe = t2w_mod.Token2WavFpga(
+        cores, vocoder, codes=T2W_FPGA_MAX_CODES, compile=False, state=state["pipe"],
+        verbose=bool(os.environ.get("OMNI_T2W_VERBOSE")))
+    cores_mod.restore_state(cores, state["cores"])
+    # Weights: params.bin -> DRAM (engine 0: the pool; the others: their constants).
+    region = ue._read_params_region("token2wav")
+    bases = [memory_map["weights_base"]] + [memory_map["consts"][e]
+                                             for e in range(1, REQUIRED_ENGINES)]
+    with open(region["bin_path"], "rb") as handle:
+        for key, section in region["sections"].items():
+            e = int(key.removeprefix("core"))
+            handle.seek(region["base_offset"] + int(section["offset"]))
+            data = handle.read(int(section["size"]))
+            if len(data) != int(section["size"]):
+                raise IOError(f"params.bin truncated in token2wav section {key}")
+            for done in range(0, len(data), 64 * 2**20):
+                chunk = data[done:done + 64 * 2**20]
+                if cores.engines[e].dma_write(user_dma_core.DMA_DEVICE_H2C,
+                                              bases[e] + done, chunk, len(chunk)) != len(chunk):
+                    raise IOError(f"token2wav weights: short DMA to engine {e}")
+    # Programs: the stored images (from the bin) or the ones just built.
+    if from_bin:
+        ue.use_bin_stage("token2wav", images["token2wav"],
+                         {e: cores.engines[e] for e in range(REQUIRED_ENGINES)},
+                         raw=True, metadata=metadata)
+    else:
+        built = build["cores"]
+        program_images = [
+            (e, cores.engines[e], base, built.image.read(base, size))
+            for e, base, size in cores_mod.program_ranges(built, memory_map)]
+        ue.register_raw_stage(
+            "token2wav", (program_images[0][2], program_images[0][3]), program_images[1:],
+            {"max_codes": T2W_FPGA_MAX_CODES, "regions": len(built.regions),
+             "region_sizes_engine0": [size for _addr, size in
+                                      (r[0] for r in built.regions)]})
+        persist = {"t2w_state": _state_mod.dumps(state, names)}
+    for line in cores_mod.footprint_lines(cores):
+        print(line, flush=True)
+    return {"pipe": pipe, "cores": cores, "cores_mod": cores_mod, "persist": persist,
+            "prepare_s": time.perf_counter() - started}
+
+
+def _run_token2wav(ue, codes: list[int], spk: dict):
+    import torch as _torch
+    t2w = ue._t2w
+    pipe = t2w["pipe"]
+    print(f"  [Token2Wav FPGA] {len(codes)} codec tokens -> {len(codes) * 2} mel frames "
+          f"on {REQUIRED_ENGINES} engines (programs built for {pipe.max_codes}; shorter output is masked and trimmed)",
+          flush=True)
+    pipe.set_codes(len(codes))
+    pipe.reset_state()
+    wav, info = pipe.synthesize(
+        _torch.tensor([codes], dtype=_torch.long), spk["cond"].float(),
+        spk["ref_mel"].float())
+    print(f"  [Token2Wav FPGA] setup 0.0s (prepared in {t2w['prepare_s']:.1f}s before "
+          f"any stage), DiT {info['dit_s']:.1f}s, BigVGAN {info['bigvgan_s']:.1f}s",
+          flush=True)
+    return wav.detach(), {"token2wav_setup_s": 0.0,
+                          "token2wav_prepared_s": t2w["prepare_s"],
+                          "token2wav_dit_s": info["dit_s"],
+                          "token2wav_bigvgan_s": info["bigvgan_s"],
+                          **{f"t2w_{k}": v for k, v in info.items() if k != "mel"}}
+
+
+def _stage_talker(ue, args, model_dir: str, speech_cfg, prompt_len: int,
+                  saved: dict | None = None, images: dict | None = None,
+                  metadata: dict | None = None) -> dict:
+    """Stage the Talker's weights, build its tensors and compile its step.
+
+    Everything here depends on the request only through the prompt length, so
+    the unified prepare calls it before any stage runs; the legacy flow calls
+    it when the Talker starts. With ``saved`` (--run_from_bin) the weights are
+    restored from the speech-weights file and the step from programs.bin.
+    """
+    import torch as _torch
+    from_bin = saved is not None
+    # The Thinker's scratch and (windowed map only) shared weights are released;
+    # its private projection shards stay, and the speech map reserved room for
+    # the Talker's column shards beside them.
+    ue.reset_tensor_dram_addr()
+    if ue.layout.evicts_weights:
+        ue.reset_params_dram_addr()
+    scheduler = ue._ensure_stage_scheduler("talker")
+    if not from_bin:
+        scheduler.preclear_flags()
+    weights = _talker_fpga_mod.TalkerWeights(ue, model_dir, scheduler=scheduler)
+    # The weights come from params.bin's talker region in every run: its IF4
+    # matrices are already quantized, staging only slices them into the shards.
+    weights.stage(region=ue._read_params_region("talker"))
+    before = dict(ue._dram_addresses)
+    codec_embed = weights._tensor("talker.model.embed_tokens.weight").to(
+        _torch.bfloat16)
+    prefix_len = prompt_len + 2        # prompt rows + BOS + the first reply row
+    max_codec_tokens = min(4096, ue.MAX_CONTEXT_SIZE - prefix_len)
+    if max_codec_tokens < 1:
+        raise ValueError("prompt leaves no context for FPGA Talker codec tokens")
+    if not args.token2wav_host:
+        # FPGA Token2Wav is verified up to this many codec tokens; speech is cut here
+        # rather than handed to the CPU vocoder.
+        max_codec_tokens = min(max_codec_tokens, T2W_FPGA_MAX_CODES)
+    max_ctx = ((prefix_len + max_codec_tokens + 63) // 64) * 64
+    runner = _talker_fpga_mod.TalkerRunner(
+        ue, weights, max_ctx=max_ctx, scheduler=scheduler)
+
+    def reinit() -> None:
+        runner._alloc_tensors()
+        runner.alloc_attention_scratch(aligned=max_ctx)
+        runner.zero_state()
+        runner.build_rope_table()
+
+    runner.alloc_attention_scratch(aligned=max_ctx)
+    runner.zero_state()
+    runner.build_rope_table()
+    persist = None
+    if from_bin:
+        for key, value in saved["talker"]["runner_state"].items():
+            setattr(runner, key, value)
+        ue.use_bin_stage("talker", images["talker"],
+                         {i: w for i, w in enumerate(ue._worker_pool, start=1)},
+                         raw=True, metadata=metadata)
+    else:
+        recorder = _state_mod.Recorder(runner)
+        runner.compile_reusable_step()
+        persist = {"talker": {"runner_state": recorder.delta()}}
+        if ue.layout.resident_programs:
+            ue.snapshot_stage_tensors("talker", before)
+            # The step is already in DRAM (it is written as it is compiled); read it
+            # back so the one programs.bin generation holds it too.
+            body = runner._launch_end - runner._program_addr    # body, spare slot, table
+            workers = [
+                (idx, w, int(addr),
+                 ue.read_back(w, int(addr), w.get_program_dram_addr() - int(addr)))
+                for idx, (w, addr) in enumerate(
+                    zip(scheduler.workers, runner._worker_addrs), start=1)]
+            ue.register_raw_stage(
+                "talker",
+                (runner._program_addr, ue.read_back(ue, runner._program_addr, body)),
+                workers,
+                {"layers": 24, "max_ctx": max_ctx, "prefix_len": prefix_len,
+                 "preamble_addr": f"0x{runner._preamble_addr:X}"})
+            ue.reserve_isa_gap()
+    return {"scheduler": scheduler, "weights": weights, "runner": runner,
+            "codec_embed": codec_embed, "prefix_len": prefix_len,
+            "max_codec_tokens": max_codec_tokens, "max_ctx": max_ctx,
+            "reinit": reinit, "persist": persist}
 
 
 def _synthesize_speech_fpga(ue, args, cfg: dict, prompt_tokens: list[int]) -> dict:
@@ -3008,32 +3673,23 @@ def _synthesize_speech_fpga(ue, args, cfg: dict, prompt_tokens: list[int]) -> di
     # After the Thinker finishes, its scratch and shared weights can be
     # released. Its private projection shards remain resident; the speech map
     # reserved enough additional private space for Talker's column shards.
-    ue.reset_tensor_dram_addr()
-    ue.reset_params_dram_addr()
-    scheduler = ue._ensure_stage_scheduler("talker")
-    scheduler.preclear_flags()
-    weights = _talker_fpga_mod.TalkerWeights(
-        ue, model_dir, scheduler=scheduler).stage()
-    codec_embed = weights._tensor("talker.model.embed_tokens.weight").to(
-        _torch.bfloat16)
+    ctx = getattr(ue, "_talker_ctx", None)
+    if ctx is None:
+        ctx = _stage_talker(ue, args, model_dir, speech_cfg, T)
+    else:
+        # Weights and program are already resident; only the tensors (aliased
+        # with the other stages') need their contents back.
+        ue.enter_stage_tensors("talker", ctx["reinit"])
+        ctx["scheduler"].preclear_flags()
+    scheduler, weights, runner = ctx["scheduler"], ctx["weights"], ctx["runner"]
+    codec_embed = ctx["codec_embed"]
     prefix[-2] += codec_embed[int(speech_cfg.tts_codec_pad_token_id)]
     prefix[-1] += codec_embed[int(speech_cfg.tts_codec_start_token_id)]
-
     prefix_len = len(prefix)
-    max_codec_tokens = min(4096, FPGA_SPEECH_CONTEXT_SIZE - prefix_len)
-    if max_codec_tokens < 1:
-        raise ValueError("prompt leaves no context for FPGA Talker codec tokens")
-    if not args.token2wav_host:
-        # FPGA Token2Wav is verified up to this many codec tokens; speech is cut here
-        # rather than handed to the CPU vocoder.
-        max_codec_tokens = min(max_codec_tokens, T2W_FPGA_MAX_CODES)
-    max_ctx = ((prefix_len + max_codec_tokens + 63) // 64) * 64
-    runner = _talker_fpga_mod.TalkerRunner(
-        ue, weights, max_ctx=max_ctx, scheduler=scheduler)
-    runner.alloc_attention_scratch(aligned=max_ctx)
-    runner.zero_state()
-    runner.build_rope_table()
-    runner.compile_reusable_step()
+    if prefix_len != ctx["prefix_len"]:
+        raise RuntimeError(
+            f"Talker was built for {ctx['prefix_len']} prefix rows, got {prefix_len}")
+    max_codec_tokens, max_ctx = ctx["max_codec_tokens"], ctx["max_ctx"]
 
     R = _talker_fpga_mod.TalkerRunner
     layer_mm = (2 * R.H * R.Q_SIZE + 2 * 2 * R.H * R.KV_SIZE + 2 * R.Q_SIZE * R.H
@@ -3126,15 +3782,18 @@ def _synthesize_speech_fpga(ue, args, cfg: dict, prompt_tokens: list[int]) -> di
               "end token; speech is cut here", flush=True)
 
     vocoder_started = time.perf_counter()
-    config = Qwen2_5OmniConfig.from_pretrained(model_dir)
-    vocoder = Qwen2_5OmniToken2WavModel(config.token2wav_config)
-    vocoder.load_state_dict(
-        _talker_mod._load_submodule_state(model_dir, "token2wav"), strict=True)
-    vocoder.float().eval()
+    prepared_t2w = getattr(ue, "_t2w", None)
+    if prepared_t2w is None:
+        vocoder = _load_vocoder(model_dir)
     token2wav_device = "Host CPU"
     t2w_detail: dict = {}
     if not args.token2wav_host:
-        wav, t2w_detail = _token2wav_on_fpga(vocoder, codes, spk)
+        for line in getattr(ue.layout, "peak_lines", lambda: [])():
+            print(line, flush=True)
+        if prepared_t2w is not None:
+            wav, t2w_detail = _run_token2wav(ue, codes, spk)
+        else:
+            wav, t2w_detail = _token2wav_on_fpga(vocoder, codes, spk, ue.layout)
         token2wav_device = f"FPGA ({REQUIRED_ENGINES} cores, bf16)"
     else:
         with _torch.no_grad():
@@ -3272,6 +3931,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=REQUIRED_ENGINES,
         type=int,
         help="engine count; this model requires exactly 8",
+    )
+    parser.add_argument(
+        "--layout", choices=("windowed", "flat"), default="windowed",
+        help="DRAM map: eight private 1 GiB windows (default), or one "
+             "consecutive 8 GiB range where every stage's weights stay resident",
+    )
+    parser.add_argument(
+        "--run_from_bin", "--run-from-bin", action="store_true",
+        help="with --layout flat: do not compile. Load the stage programs from the "
+             "existing programs bin (and the compilers' state and the speech weights "
+             "stored beside it), checked against this request; a bin built for a "
+             "different request is refused. Build it by running once without the flag.",
+    )
+    parser.add_argument(
+        "--max-context", type=int, default=None,
+        help="with --layout flat: build for at most this many tokens; by default "
+             "the largest context the DRAM left after every stage's weights allows",
     )
     prompt_source = parser.add_mutually_exclusive_group()
     prompt_source.add_argument("--prompt", default=None, help="user text prompt")
@@ -3486,6 +4162,12 @@ def run_summary_filename(args) -> str:
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    if os.environ.get("OMNI_WATCHDOG_S"):
+        # Debug aid for a stalled board: dump every thread's stack to stderr
+        # every N seconds, so a hang shows where the host is blocked.
+        import faulthandler
+        faulthandler.dump_traceback_later(
+            int(os.environ["OMNI_WATCHDOG_S"]), repeat=True, file=sys.stderr)
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be positive")
     if args.speak_host and args.speak is None:
@@ -3500,6 +4182,10 @@ def main() -> None:
         parser.error("--frames must be positive")
     if args.frames > 1 and not args.image:
         parser.error("--frames requires --image")
+    if args.run_from_bin and args.layout != "flat":
+        print("[run_from_bin] only applies to --layout flat; the windowed layout "
+              "always builds its programs")
+        args.run_from_bin = False
     with _exclusive_run_lock():
         _main_locked(parser, args)
 
@@ -3530,6 +4216,29 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     context_limit = (FPGA_SPEECH_CONTEXT_SIZE
                      if args.speak is not None and not args.speak_host
                      else PREFILL_INPUT_TOKEN_LIMIT)
+    flat_plan = None
+    if args.layout == "flat":
+        # Weights first: the plan sizes them, then the context that fits what
+        # is left. It needs no hardware, so it also bounds the prompt check.
+        stages = {"lm"}
+        if args.image:
+            stages.add("vision")
+        if args.audio:
+            stages.add("audio")
+        if args.speak is not None and not args.speak_host:
+            stages.add("talker")
+            if not args.token2wav_host:
+                stages.add("t2w")
+        flat_plan = _layout_mod.plan_flat(
+            stages, args.vision_res, args.max_context,
+            device_bytes=user_dma_core.AVAILABLE_DRAM_SIZE_GB * 2**30)
+        for line in flat_plan.lines():
+            print(line)
+        context_limit = flat_plan.max_context
+        # The Talker's and Token2Wav's weights live in params.bin like the rest. They
+        # are appended here, before the engine exists, because the programs.bin
+        # identity covers the params manifest.
+        _ensure_speech_params(SCRIPT_DIR, cfg, args, flat_plan)
     if len(context) > context_limit:
         raise ValueError(
             f"templated prompt needs {len(context)} prefill tokens; limit is "
@@ -3552,6 +4261,8 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         script_dir=SCRIPT_DIR, fpga_build=fpga_build,
         vision_res=args.vision_res,
         fpga_talker=args.speak is not None and not args.speak_host,
+        layout=args.layout,
+        flat_plan=flat_plan,
         **engine_kwargs
     )
     ue.speak_as = args.speak          # before lm_tensor_init sizes the buffers
@@ -3568,10 +4279,27 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     image_embeddings = None
     audio_embeddings = None
     audio_metadata = None
+    unified = ue.layout.resident_programs
+    run_phase = "run" if unified else "all"
+    if unified:
+        signature = _request_signature(ue, args, context, tokens, processed)
+        _prepare_unified(ue, args, processed, context, cfg, tokens, signature,
+                         from_bin=args.run_from_bin)
+        # From here on the host should only launch programs by address. Count any
+        # instruction the host still writes, and report it at the end of the run.
+        runtime_writes = ue._runtime_instruction_writes = [0]
+        original_write = UnifiedEngine.write_captured_instructions_to_dram
+
+        def counted_write(engine, *a, **k):
+            runtime_writes[0] += 1
+            return original_write(engine, *a, **k)
+
+        UnifiedEngine.write_captured_instructions_to_dram = counted_write
     if args.image:
-        image_embeddings = _run_vision(ue, processed, profile=args.profile)
+        image_embeddings = _run_vision(ue, processed, profile=args.profile,
+                                       phase=run_phase)
     if args.audio:
-        audio_embeddings, audio_metadata = _run_audio(ue, processed)
+        audio_embeddings, audio_metadata = _run_audio(ue, processed, phase=run_phase)
 
     image_grid = processed.get("image_grid_thw") if args.image else None
     audio_lengths = (
@@ -3606,18 +4334,21 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
 
     print("\n--- Thinker LM stage ---")
     started = time.perf_counter()
-    ue.lm_weight_init()
-    ue.lm_tensor_init()
-    ue.compile_prefill(len(context), profile=args.profile)
-    # Decoder setup installs IF4 projection shards in private windows; the
-    # BF16 embedding table stays on the host and only selected rows are DMA'd.
-    ue.compile_decoder(profile=args.profile)
-    ue.check_master_isa()
-    # These bodies are address-coupled: decoder starts immediately after this
-    # exact prefill image. Publish both in one programs.bin generation.
-    ue.store_program_stages("prefill", "decode")
-    for line in ue.isa_usage_lines():
-        print(line)
+    if unified:
+        ue.enter_stage_tensors("lm", ue.lm_tensor_init)
+    else:
+        ue.lm_weight_init()
+        ue.lm_tensor_init()
+        ue.compile_prefill(len(context), profile=args.profile)
+        # Decoder setup installs IF4 projection shards in private windows; the
+        # BF16 embedding table stays on the host and only selected rows are DMA'd.
+        ue.compile_decoder(profile=args.profile)
+        ue.check_master_isa()
+        # These bodies are address-coupled: decoder starts immediately after this
+        # exact prefill image. Publish both in one programs.bin generation.
+        ue.store_program_stages("prefill", "decode")
+        for line in ue.isa_usage_lines():
+            print(line)
     ue.run_prefill(
         context,
         image_embeddings=image_embeddings,
@@ -3740,6 +4471,15 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         ue._speech_result = speech
     lm_wall = thinker_finished - started
     print(f"\nThinker stage done in {lm_wall:.2f}s wall")
+    if os.environ.get("OMNI_VERIFY_IMAGES"):
+        bad = ue.verify_resident_images()
+        print(f"  [verify] resident images after the run: "
+              f"{'ALL MATCH' if not bad else 'MISMATCH ' + '; '.join(bad)}", flush=True)
+    for line in getattr(ue.layout, "peak_lines", lambda: [])():
+        print(line, flush=True)
+    if unified:
+        print(f"  [run] instruction writes by the host after the prepare phase: "
+              f"{ue._runtime_instruction_writes[0]}", flush=True)
 
     visible_generated = int(getattr(ue, "_decode_n", 0))
     generated = len(getattr(ue, "_decode_step_us", ()))
@@ -3759,8 +4499,10 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
             f"{sorted(ue._executed_program_stages)}"
         )
     program_manifest, program_payload = ue._program_bundle.load()
-    if program_manifest["section_count"] != REQUIRED_ENGINES * len(
-        expected_program_stages
+    # Talker and Token2Wav programs are written to DRAM as they compile and sit in
+    # the same generation as raw stages; the Thinker stages must all have run.
+    if program_manifest["section_count"] != REQUIRED_ENGINES * (
+        len(expected_program_stages) + len(ue._raw_stages)
     ):
         raise RuntimeError(
             "combined programs.bin does not contain one master + seven worker "

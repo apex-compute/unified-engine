@@ -414,7 +414,8 @@ class Qwen25OmniAudioMixin:
         if (
             already_loaded
             and hasattr(self, "_audio_weight_end")
-            and self.get_params_dram_addr() == self._audio_weight_end
+            and (not self.layout.evicts_weights
+                 or self.get_params_dram_addr() == self._audio_weight_end)
         ):
             return
         old_span = (
@@ -432,14 +433,17 @@ class Qwen25OmniAudioMixin:
             return sections[name]
 
         # Audio and LM deliberately share the transient params window.
-        self._invalidate_decode_overlay()
+        if self.layout.evicts_weights:
+            self._invalidate_decode_overlay()
+        self.layout.begin_weight_stage("audio")
         self.reset_params_dram_addr()
         self._audio_weight_init_done = False
         # Rewinding immediately destroys whichever phase owned this window.
         # Clear its optimistic idempotency flag even if a later DMA fails, so
         # no caller can silently reuse the now-partial LM/vision image.
-        self._lm_weight_init_done = False
-        self._vision_weight_init_done = False
+        if self.layout.evicts_weights:
+            self._lm_weight_init_done = False
+            self._vision_weight_init_done = False
         start = self.get_params_dram_addr()
         self._loud(
             f"  [Audio] loading {d['LAYERS']} layers "
@@ -673,7 +677,7 @@ class Qwen25OmniAudioMixin:
         if getattr(self, "multi_core", 1) > 1:
             scratch_bytes = scratch_elements * bpe
             self.AUDIO_ATTN_SCRATCH_PER_ENGINE.extend(
-                self.mc_arena.alloc_tensor(
+                self.layout.alloc_tensor(
                     engine_idx, scratch_bytes, "audio attention scratch"
                 )
                 for engine_idx in range(1, self.multi_core)
@@ -1326,7 +1330,7 @@ class Qwen25OmniAudioMixin:
             worker_blob = bytearray()
             for instruction in worker.capture_buffer:
                 worker_blob.extend(instruction.get_bytes())
-            self.mc_arena.check_isa_fits(
+            self.layout.check_isa_fits(
                 engine_idx,
                 address,
                 len(worker_blob) + FLAG_PRECLEAR_PROGRAM_BYTES,

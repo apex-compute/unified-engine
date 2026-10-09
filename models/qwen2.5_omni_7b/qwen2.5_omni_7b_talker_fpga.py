@@ -119,8 +119,8 @@ class TalkerWeights:
         self.shape[name] = (n, k)
         self._staged_bytes += len(data) + (len(scales) if scales is not None else 0)
 
-    def stage(self, layers: int = 24) -> "TalkerWeights":
-        t0 = time.perf_counter()
+    def _selected(self, layers: int):
+        """The tensors that are staged on the device, in staging order."""
         for name in sorted(self._map):
             short = name[len(TALKER_PREFIX):]
             if ".layers." in short:
@@ -132,22 +132,92 @@ class TalkerWeights:
                 # step, added to the reply row before the projection. Staging
                 # the 57.8 MiB table on the device would buy nothing.
                 continue
+            yield name, short
+
+    def params_items(self, layers: int = 24):
+        """Yield ``(key, dtype, shape, bytes)`` for params.bin's talker region.
+
+        Quantization happens here, once, when the region is built; staging then
+        only slices these bytes into the engines' shards.
+        """
+        for name, short in self._selected(layers):
             t = self._tensor(name)
-            if self.scheduler is not None and t.ndim == 2:
-                self._put_sharded(short, t, if4=short.endswith(_IF4_SUFFIXES))
-            elif short.endswith(_IF4_SUFFIXES):
-                self._put_if4(short, t)
+            if t.ndim == 2 and short.endswith(_IF4_SUFFIXES):
+                data, scales = quant_lib.quantize("if4", t.float(), block_size=BLOCK)
+                yield f"{short}.data", "if4_data", tuple(t.shape), bytes(data)
+                yield f"{short}.scale", "if4_scale", tuple(t.shape), bytes(scales)
             else:
-                self._put_bf16(short, t)
+                raw = t.to(torch.bfloat16).contiguous().view(torch.uint8).numpy().tobytes()
+                yield short, "bf16", tuple(t.shape), raw
             del t
+
+    def stage(self, layers: int = 24, region: dict | None = None) -> "TalkerWeights":
+        """Place the Talker in accelerator DRAM.
+
+        With ``region`` (params.bin's talker region) the bytes come from the file;
+        without it they are converted from the checkpoint, as before.
+        """
+        t0 = time.perf_counter()
+        handle = open(region["bin_path"], "rb") if region is not None else None
+        try:
+            def blob(key: str) -> bytes:
+                section = region["sections"][key]
+                handle.seek(region["base_offset"] + int(section["offset"]))
+                data = handle.read(int(section["size"]))
+                if len(data) != int(section["size"]):
+                    raise IOError(f"params.bin truncated in talker section {key}")
+                return data
+
+            for name, short in self._selected(layers):
+                if region is not None:
+                    sections = region["sections"]
+                    if f"{short}.data" in sections:                # IF4 matrix
+                        n, k = (int(x) for x in sections[f"{short}.data"]["shape"])
+                        self._shard(short, n, k, blob(f"{short}.data"),
+                                    blob(f"{short}.scale"), TYPE.IF4)
+                    else:
+                        shape = tuple(int(x) for x in sections[short]["shape"])
+                        raw = blob(short)
+                        if len(shape) == 2 and self.scheduler is not None:
+                            self._shard(short, shape[0], shape[1], raw, None, DENSE_BF16)
+                        else:
+                            self._put_bf16_bytes(short, shape, raw)
+                    continue
+                t = self._tensor(name)
+                if self.scheduler is not None and t.ndim == 2:
+                    self._put_sharded(short, t, if4=short.endswith(_IF4_SUFFIXES))
+                elif short.endswith(_IF4_SUFFIXES):
+                    self._put_if4(short, t)
+                else:
+                    self._put_bf16(short, t)
+                del t
+        finally:
+            if handle is not None:
+                handle.close()
         if self.verbose:
             print(f"  [Talker] staged {len(self.addr) + len(self.shards)} tensors, "
                   f"{self._staged_bytes / 2**20:.1f} MiB (IF4 matrices, bf16 norms "
                   f"and biases) in {time.perf_counter() - t0:.1f}s"
+                  + ("" if region is None else " from params.bin")
                   + (f"; private usage: " + ", ".join(
                       f"{x / 2**20:.1f} MiB" for x in self.scheduler.private_usage())
                      if self.scheduler is not None else ""))
         return self
+
+    def _shard(self, short: str, n: int, k: int, data: bytes, scales, dtype) -> None:
+        self.shards[short] = self.scheduler.shard_quantized_weight_from_bytes(
+            name=f"talker.{short}", weight_bytes=data, scale_bytes=scales,
+            K=k, N=n, layers=1, layer_stride_bytes=0, data_type=dtype, verbose=False)
+        self.shape[short] = (n, k)
+        self._staged_bytes += len(data) + (len(scales) if scales is not None else 0)
+
+    def _put_bf16_bytes(self, short: str, shape: tuple, blob: bytes) -> None:
+        a = self.ue.allocate_params_dram(len(blob), label=f"talker.{short}")
+        if self.ue.dma_write(DMA_DEVICE_H2C, a, blob, len(blob)) != len(blob):
+            raise IOError(f"talker {short}: short DMA")
+        self.addr[short] = a
+        self.shape[short] = tuple(shape)
+        self._staged_bytes += len(blob)
 
 
 class TalkerRunner:
@@ -592,6 +662,44 @@ class TalkerRunner:
             raise IOError("Talker body DMA short write")
         ue.allocate_program_dram(body_bytes + 128)
         ue.clear_capture_buffer()
+        self._build_launch_table()
+
+    def _build_launch_table(self) -> None:
+        """Precompile the per-position launch entry for every position.
+
+        An entry primes the position, KV-offset and aligned-length registers and
+        jumps into the body, so a step is started by launching one address; the
+        host writes no instructions while the Talker runs.
+        """
+        ue = self.ue
+        entries = []
+        for pos in range(self.max_ctx):
+            aligned = ((pos + 64) // 64) * 64
+            ue.clear_inst_id()
+            ue.clear_capture_buffer()
+            ue.start_capture()
+            ue.generate_instruction_add_set(
+                self._pos_reg, user_dma_core.ue_35bit_addr_shifter(
+                    pos * self._rope_row_bytes))
+            ue.generate_instruction_add_set(
+                self._kv_off_reg, user_dma_core.ue_35bit_addr_shifter(pos * self.AHD * 2))
+            ue.generate_instruction_add_set(self._aligned_reg, aligned)
+            ue.generate_instruction_jump_abs(
+                user_dma_core.ue_35bit_addr_shifter(self._program_addr))
+            ue.stop_capture()
+            entries.append(b"".join(i.get_bytes() for i in ue.capture_buffer))
+            ue.clear_capture_buffer()
+        stride = (max(len(e) for e in entries) + 63) // 64 * 64
+        blob = b"".join(e.ljust(stride, b"\0") for e in entries)
+        limit = getattr(ue, "MASTER_ISA_LIMIT", None)
+        base = ue.get_program_dram_addr()
+        if limit is not None and base + len(blob) > limit:
+            raise MemoryError("Talker launch table exceeds master ISA")
+        if ue.dma_write(user_dma_core.DMA_DEVICE_H2C, base, blob, len(blob)) != len(blob):
+            raise IOError("Talker launch table DMA short write")
+        ue.allocate_program_dram(len(blob))
+        self._launch_base, self._launch_stride = base, stride
+        self._launch_end = base + len(blob)
 
     def run_step(self, x: torch.Tensor, pos: int, *, timeout_s: float = 30.0):
         """Execute one codec position and return logits plus core-0 HW time."""
@@ -604,24 +712,8 @@ class TalkerRunner:
         self.set_causal_bias(pos + 1, aligned=aligned)
         ue.dma_to_accelerator_memory(
             self.IN_3584, x.reshape(-1).to(torch.bfloat16))
-        ue.clear_inst_id()
-        ue.clear_capture_buffer()
-        ue.start_capture()
-        ue.generate_instruction_add_set(
-            self._pos_reg, user_dma_core.ue_35bit_addr_shifter(
-                pos * self._rope_row_bytes))
-        ue.generate_instruction_add_set(
-            self._kv_off_reg, user_dma_core.ue_35bit_addr_shifter(pos * self.AHD * 2))
-        ue.generate_instruction_add_set(self._aligned_reg, aligned)
-        ue.generate_instruction_jump_abs(
-            user_dma_core.ue_35bit_addr_shifter(self._program_addr))
-        ue.stop_capture()
-        written = ue.write_captured_instructions_to_dram(self._preamble_addr)
-        if written != ue.get_capture_instruction_size_bytes():
-            raise IOError(f"Talker position {pos}: preamble DMA short write")
-        ue.clear_capture_buffer()
         sched.start_workers(self._worker_addrs)
-        ue.start_execute_from_dram(self._preamble_addr)
+        ue.start_execute_from_dram(self._launch_base + pos * self._launch_stride)
         ue.wait_queue(timeout_s)
         if ue.is_queue_busy():
             raise TimeoutError(f"Talker position {pos}: master remained busy")
