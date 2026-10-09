@@ -3997,7 +3997,10 @@ def run_qwen35_profile(ue: Qwen3_5_2b_UnifiedEngine, token_ids: torch.Tensor,
     checkpoints = list(ue._profile_checkpoints)
     if not checkpoints:
         raise RuntimeError("profile decoder has no checkpoints")
-    peak = user_dma_core.configured_hardware_info().frequency_mhz * 0.128
+    # Aggregate peak across all engines: a step is scored against the full
+    # machine, so a sharded matmul can approach 100% while a single-engine op
+    # (norm/attention) caps near 1/multi_core. Matches Gemma3's multi-core md.
+    peak = user_dma_core.configured_hardware_info().frequency_mhz * 0.128 * ue.multi_core
     issued_phase = _theoretical_flops_by_phase(ue, 1)
     # Per-major-op issued FLOPs for ONE layer of each type (keyed by the lin_*/
     # full_* step names the layer emitters record). aggregate_checkpoints sums
@@ -4031,6 +4034,13 @@ def run_qwen35_profile(ue: Qwen3_5_2b_UnifiedEngine, token_ids: torch.Tensor,
                             ue_35bit_addr_shifter(pos * ue.full_rotary_dim * BF16))
         samples = []
         cpu_start = time.perf_counter()
+        # Multi-core: launch the worker engines once before the segmented HALT
+        # walk (same pattern as _execute_decoder_program / Gemma3's profiler).
+        # The workers run flag-driven and rendezvous with the primary at each
+        # sharded matmul, so the primary's per-checkpoint HALT/resume between
+        # rendezvous points does not break the lockstep.
+        if ue._decode_sharder is not None:
+            ue._decode_sharder.start()
         ue.start_execute_from_dram(ue._decoder_prog_addr)
         for name, resume_hex in checkpoints:
             ue.wait_queue(300.0)
@@ -4062,6 +4072,10 @@ def run_qwen35_profile(ue: Qwen3_5_2b_UnifiedEngine, token_ids: torch.Tensor,
             ue.start_execute_from_dram(int(resume_hex, 16))
         ue.wait_queue(300.0)
         tail_ms = ue.report_latency_in_us() / 1e3
+        # The tail segment (final norm + sharded LM head) is where the workers
+        # do the LM-head shard; join them before recording/returning.
+        if ue._decode_sharder is not None:
+            ue._decode_sharder.wait(300.0)
         tail_flops = issued_phase["output_norm_lm_head"]
         samples.append({"name": "output_norm_lm_head", "hw_ms": tail_ms,
                         "issued_flops": tail_flops,
@@ -4099,8 +4113,11 @@ def run_qwen35_profile(ue: Qwen3_5_2b_UnifiedEngine, token_ids: torch.Tensor,
             cpu_ms=cpu_ms, issued_flops=_total(rows, "issued_flops"),
             effective_flops=_total(rows, "effective_flops"), peak_gflops=peak))
     hw = user_dma_core.configured_hardware_info()
+    # Encode the engine count so multi-core profiles don't overwrite the
+    # single-core one (matches gemma4's multi-core_N naming).
+    mc_tag = f"_multi-core_{ue.multi_core}" if ue.multi_core != 1 else ""
     out_path = _THIS.parent / (
-        f"qwen3.5_2b_profile_{args.dev}.md")
+        f"qwen3.5_2b_profile_{args.dev}{mc_tag}.md")
     write_profile_markdown(
         out_path, title="Qwen3.5-2B profile summary",
         hardware={
@@ -5036,8 +5053,6 @@ def main():
                          "of the FPGA. FPGA vision is the default with --vision-enable / "
                          "--image.")
     args = ap.parse_args()
-    if args.profile and args.multi_core != 1:
-        ap.error("--profile currently requires --multi-core 1")
     if args.profile and (args.image or args.vision_enable):
         ap.error("--profile currently benchmarks the LM path; omit --image/--vision-enable")
 

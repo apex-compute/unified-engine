@@ -1164,6 +1164,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                         ue.release_isa_reg()
                 prefill_scheduler.sharded_region(seq_len, _emit_mlp_shard)
                 total_flops += _mlp_flops[0]
+                # One checkpoint after the MLP's exit barrier (the sharded region
+                # covers pre-FFN norm + gate/up + down in one barrier-bracketed
+                # block, so it can't be split the way the single-core path is).
+                # Without this the whole sharded MLP leaks into the next layer's
+                # pre_norm segment of the profile walk.
+                if profile:
+                    _checkpoint(f"L{layer_idx}_mlp")
         self.generate_instruction_halt()
         prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
@@ -1497,8 +1504,6 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         """
         if layer_size is None:
             layer_size = self.LAYER_SIZE
-        if profile and self.multi_core > 1:
-            raise ValueError("--profile currently requires --multi-core 1; use normal multicore timing")
         decode_sharder = self._ensure_decode_sharder()
         if profile:
             instruction_bin_path = os.path.join(self.script_dir, "llama3.2_1b_bin/llama3.2_1b_profile_program.bin")
@@ -2194,7 +2199,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
         prefill_checkpoints  = meta.get("prefill_profile_checkpoints", [])
         decoder_checkpoints  = meta.get("decoder_profile_checkpoints", [])
-        peak_gflops = user_dma_core.configured_hardware_info().frequency_mhz * 0.128
+        # Aggregate peak across all engines: sharded matmul steps approach 100%
+        # while single-engine steps (norms/attention) cap near 1/multi_core.
+        peak_gflops = user_dma_core.configured_hardware_info().frequency_mhz * 0.128 * self.multi_core
         _kv_stride = self.attention_head_dim * self.bytes_per_element
         _rope_row  = self.head_dim * 2 * self.bytes_per_element
 
@@ -2244,8 +2251,18 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         _SILENT_MODE = True
         _original_print(f"\n--- Profiling: prefill (seq_len={prefill_seq_len}) ---")
         if prefill_checkpoints:
+            # Multi-core: launch the prefill workers once before the segmented
+            # HALT walk; they rendezvous with the primary at each sharded MLP
+            # region, so the primary's per-checkpoint HALT/resume keeps lockstep.
+            _pf_sched = getattr(self, "_prefill_scheduler", None) if self.multi_core > 1 else None
+            if _pf_sched is not None:
+                _pf_sched.preclear_flags()
+                _pf_sched.start_workers(self._prefill_worker_addrs)
             prefill_samples, prefill_cpu_ms = self._profile_execute(
                 preamble_addr, prefill_checkpoints)
+            if _pf_sched is not None:
+                for _w in _pf_sched.workers:
+                    _w.wait_queue(10.0)
             for sample in prefill_samples:
                 if sample["name"] == "attention" and aligned_seq_len:
                     sample["effective_flops"] = int(
@@ -2290,9 +2307,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         decoder_tail_flops = max(
             int(meta["decoder_total_flops"])
             - sum(int(cp[2]) for cp in decoder_checkpoints if len(cp) > 2), 0)
+        if self._decode_sharder is not None:
+            self._decode_sharder.start()
         decoder_samples, decoder_cpu_ms = self._profile_execute(
             preamble_addr, decoder_checkpoints, tail_label="output_norm_lm_head",
             tail_flops=decoder_tail_flops)
+        if self._decode_sharder is not None:
+            self._decode_sharder.wait()
         decoder_static_aligned = (
             (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
             * UE_VECTOR_SIZE)
@@ -2330,9 +2351,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.write_captured_instructions_to_dram(preamble_addr)
         self.clear_capture_buffer()
         _original_print(f"\n--- Profiling: decoder (large context position {large_pos}) ---")
+        if self._decode_sharder is not None:
+            self._decode_sharder.start()
         large_samples, large_cpu_ms = self._profile_execute(
             preamble_addr, decoder_checkpoints, tail_label="output_norm_lm_head",
             tail_flops=decoder_tail_flops)
+        if self._decode_sharder is not None:
+            self._decode_sharder.wait()
         for sample in large_samples:
             if sample["name"] == "attention":
                 sample["issued_flops"] = int(
@@ -2443,9 +2468,6 @@ def main():
                         help='count tokens over the last N (never penalizes punctuation/whitespace/'
                              'special tokens). Default 256.')
     args = parser.parse_args()
-
-    if args.profile and args.multi_core > 1:
-        parser.error('--profile currently requires --multi-core 1')
 
     set_dma_device(args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
