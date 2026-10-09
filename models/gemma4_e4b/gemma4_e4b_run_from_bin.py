@@ -282,6 +282,13 @@ def _ensure_hf_model(script_dir: str, cfg: dict):
 # -----------------------------------------------------------------------------
 # Gemma4 E4B unified engine
 # -----------------------------------------------------------------------------
+def _validate_single_engine_manifest(manifest):
+    if manifest.get("multi_core", 1) != 1 or manifest.get("dram_layout", "legacy") != "legacy":
+        raise ValueError(
+            "This execute-only runner cannot restore controller-private workers. "
+            "Run gemma4_e4b_test.py with --multi-core, or rebuild a single-engine image.")
+
+
 class Gemma4_UnifiedEngine(UnifiedEngine):
     """UnifiedEngine with Gemma4 E4B dims: loads config + weight bin, compile_prefill/compile_decoder, run_prefill/run_decoder. Numeric checks in gemma4_e4b_numeric.py."""
 
@@ -6877,6 +6884,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 f"Instruction bin missing: {bin_path}. Run compile_instruction_bin() first.")
         with open(meta_path, "r") as f:
             manifest = json.load(f)
+        _validate_single_engine_manifest(manifest)
         # Read only the program region (instruction_total_size bytes) via
         # chunked DMA from disk, avoiding a ~1 GB f.read() that would spike
         # host RSS (problematic on 16 GB Raspberry Pi). Read in 64 MB chunks

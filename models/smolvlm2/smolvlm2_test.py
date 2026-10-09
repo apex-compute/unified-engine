@@ -125,7 +125,7 @@ def init_hang_prevention(ue) -> None:
     halt_bytes = bytearray()
     for inst in ue.capture_buffer:
         halt_bytes.extend(inst.get_bytes())
-    ue.dma_write(DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, halt_bytes, len(halt_bytes))
+    ue._write_model_program(ue._program_dram_base, halt_bytes)
     ue.clear_capture_buffer()
     print("[Init] HALT written to instruction DRAM base")
 # =============================================================================
@@ -241,16 +241,35 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
     PF_GPR_ADDR_B       = 10   # scratch: computed B base   (eltwise only)
     PF_GPR_ADDR_OUT     = 11   # scratch: computed OUT base
     PF_ISA_SCRATCH_BASE = 12
-    def __init__(self, script_dir: str = None):
+    def __init__(self, script_dir: str = None, *, num_engines=None,
+                 decode_num_engines=None, prefill_num_engines=None):
+        if num_engines is not None:
+            self.NUM_ENGINES = int(num_engines)
+        if decode_num_engines is not None:
+            self.DECODE_NUM_ENGINES = int(decode_num_engines)
+        if prefill_num_engines is not None:
+            self.PREFILL_NUM_ENGINES = int(prefill_num_engines)
+        if not 1 <= self.DECODE_NUM_ENGINES <= self.NUM_ENGINES <= self.MAX_ENGINES:
+            raise ValueError("require 1 <= decode engines <= worker-pool engines <= MAX_ENGINES")
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self._cfg = _SMOLVLM2_CFG
         # Fixed precision scheme: bf16 vision + q4 LM → the bf16 DRAM layout (params 1 GB / tensors /
         # instructions). No other precision options.
         dl = self._cfg["dram_layout"]["bf16"]
+        self._decode_windows = None
+        original_base = int(dl["params_dram_base"], 16)
+        self._model_base = original_base
+        if int(self.DECODE_NUM_ENGINES) > 1:
+            from multi_engine_shard import model_multicore_layout
+            self._decode_windows, self._model_base = model_multicore_layout(
+                int(self.DECODE_NUM_ENGINES))
+        rebase = self._model_base - original_base
+        self._model_end = self._model_base + (2 << 30)
+        self._decode_private_weights = None
         super().__init__(
-            params_dram_base=int(dl["params_dram_base"], 16),
-            tensor_dram_base=int(dl["tensor_dram_base"], 16),
-            program_dram_base=int(dl["program_dram_base"], 16),
+            params_dram_base=self._model_base,
+            tensor_dram_base=int(dl["tensor_dram_base"], 16) + rebase,
+            program_dram_base=int(dl["program_dram_base"], 16) + rebase,
         )
         self._isa_reg_counter = 1
         self.gpr_seq_len = self.GPR_SEQ_LEN_REG      # primed to S in run_prefill
@@ -279,9 +298,12 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         # weight layout). The repetition penalty is a pure RUNTIME tensor-DRAM write (PENALTY_BIAS_DRAM,
         # always wired as the LM-head C term with zeros = greedy), so it never affects params.bin or
         # programs.bin and is deliberately NOT part of the artifact suffix/metadata.
-        if bool(getattr(self, "decode_matmat_mul_core_enable", False)):
-            return "_decode_matmat_mul_core"
-        return ""
+        suffix = ("_decode_matmat_mul_core"
+                  if bool(getattr(self, "decode_matmat_mul_core_enable", False)) else "")
+        if self._decode_windows is not None:
+            geometry = json.dumps(self._controller_layout_meta(), sort_keys=True).encode()
+            suffix += "_controllers_" + hashlib.sha256(geometry).hexdigest()[:12]
+        return suffix
 
     def _artifact_engine_suffix(self) -> str:
         """Engine configuration, as a programs-file suffix.
@@ -382,10 +404,18 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         for w, end in zip(pool, meta.get("worker_prog_end") or []):
             w._next_program_dram_addr = int(end)
 
+    def _controller_layout_meta(self):
+        return {"version": 1, "model_base": self._model_base,
+                "model_end": self._model_end,
+                "private_windows": [list(w) for w in self._decode_windows]}
+
     def _artifact_mode_meta(self) -> dict:
-        return {
+        meta = {
             "decode_matmat_mul_core_enable": bool(getattr(self, "decode_matmat_mul_core_enable", False)),
         }
+        if self._decode_windows is not None:
+            meta["controller_layout"] = self._controller_layout_meta()
+        return meta
 
     def _validate_artifact_mode(self, meta: dict, artifact_name: str) -> None:
         expected = self._artifact_mode_meta()
@@ -395,7 +425,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 f"[artifact-mode] {artifact_name} is missing metadata keys {missing}; rebuild it with "
                 "smolvlm2_test.py"
             )
-        mismatched = [f"{k}={meta.get(k)!r}" for k, v in expected.items() if bool(meta.get(k)) != bool(v)]
+        mismatched = [f"{k}={meta.get(k)!r}" for k, v in expected.items() if meta.get(k) != v]
         if mismatched:
             exp = ", ".join(f"{k}={v}" for k, v in expected.items())
             got = ", ".join(mismatched)
@@ -412,12 +442,12 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         clean (zeroed) DRAM regardless of what the previous run left behind.
         Temporary mitigation until the read-before-write gap is found and fixed.
         """
-        start = user_dma_core.DRAM_START_ADDR
-        total = 0xFFFFFFFF - start + 1
+        start = self._model_base
+        total = self._model_end - start
         zeros = b"\x00" * chunk_size_bytes
         offset = 0
         bar_width = 40
-        _original_print(f"Zeroing DRAM [{hex(start)}..0xffffffff] ({total / 1024**3:.2f} GB)")
+        _original_print(f"Zeroing DRAM [{hex(start)}..{hex(self._model_end - 1)}] ({total / 1024**3:.2f} GB)")
         while offset < total:
             n = min(chunk_size_bytes, total - offset)
             self.dma_write(DMA_DEVICE_H2C, start + offset, zeros[:n], n)
@@ -838,7 +868,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         for inst in self.capture_buffer:
             all_bytes.extend(inst.get_bytes())
         program_addr = self.get_program_dram_addr()
-        self.dma_write(DMA_DEVICE_H2C, program_addr, all_bytes, len(all_bytes))
+        self._write_model_program(program_addr, all_bytes)
         self.allocate_program_dram(len(all_bytes))
         self.clear_capture_buffer()
         if self._unified_active:
@@ -964,18 +994,23 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         """
         from multi_engine_shard import MultiEngineScheduler
         if self._lm_sched is not None:
+            self._materialize_decode_weights()
             return self._lm_sched
         # The encoder scheduler owns the pool and is always built first
         # (compile_all compiles encoder -> decoder -> prefill).
+        if self._decode_windows is None or len(self._decode_windows) != num_engines:
+            raise ValueError("set decode_num_engines at construction before allocating model DRAM")
         enc = self._vis_make_scheduler(int(self.NUM_ENGINES))
         assert num_engines <= int(self.NUM_ENGINES), (
             f'--decode-engines {num_engines} exceeds --engines {self.NUM_ENGINES}: the\n'
             f'worker engines are built by the encoder stage and shared.')
         self._lm_sched = MultiEngineScheduler(
             self, num_engines=num_engines,
-            workers=enc.workers,
+            workers=enc.workers[:num_engines - 1],
             allow_more_than_two_engines=True,
+            handshake="four_phase", region_rendezvous="master_worker",
         )
+        self._materialize_decode_weights()
         return self._lm_sched
 
     def compile_encoder_sharded(self) -> int:
@@ -1208,7 +1243,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         for inst in self.capture_buffer:
             all_bytes.extend(inst.get_bytes())
         program_addr = self.get_program_dram_addr()
-        self.dma_write(DMA_DEVICE_H2C, program_addr, all_bytes, len(all_bytes))
+        self._write_model_program(program_addr, all_bytes)
         self.allocate_program_dram(len(all_bytes))
         self.clear_capture_buffer()
         self._seg_encoder = (program_addr, bytes(all_bytes))
@@ -1722,7 +1757,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                     if seg.get("engine"):
                         continue               # worker program; written below
                     b = raw[seg["off"]:seg["off"] + seg["size"]]
-                    self.dma_write(DMA_DEVICE_H2C, seg["addr"], b, len(b))
+                    self._write_model_program(seg["addr"], b)
                 self._restore_unified_addrs(meta)
                 self._restore_worker_programs(meta, raw)
                 self._print_decoder_attn_path_banner(self._loaded_artifact_sha256)
@@ -1745,7 +1780,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         end_addr = self.get_program_dram_addr()
         # The worker arenas live in the TENSOR region and are taken from the model's
         # own allocator, so the primary's continuing program growth cannot reach them.
-        assert end_addr <= 0x100000000, f'program DRAM overflowed at 0x{end_addr:X}'
+        assert end_addr <= self._model_end, f'program DRAM overflowed at 0x{end_addr:X}'
         segments, raw = [], bytearray()
         for name, seg in (("encoder", self._seg_encoder), ("decoder", self._seg_decoder),
                           ("prefill", self._seg_prefill)):
@@ -1905,6 +1940,74 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             self._last_total_flops = None
         return self.get_arg_max_index()
 
+    def _materialize_decode_weights(self):
+        """Copy IF4 gate/up slices into distinct controller windows once per load.
+
+        ISA and scratch keep the existing shared worker pool. This arena owns
+        only the duplicated weights; it never resets the workers' allocators.
+        The complete plan is allocated before DMA, so capacity errors cannot
+        leave a partially copied set usable by the compiler.
+        """
+        if self._decode_private_weights is not None:
+            return
+        from multi_engine_shard import PrivateArena
+        ne = int(self.DECODE_NUM_ENGINES)
+        arena = PrivateArena(ne, windows=self._decode_windows)
+        splits = self._lm_sched.split_cols(self.INTERMEDIATE_SIZE)
+        plan, weights = [], {}
+        K = self.HIDDEN_SIZE
+        for la in self.lm_layer_addrs:
+            for projection in ("gate", "up"):
+                src_w, src_s = la[f"{projection}_data"], la[f"{projection}_scale"]
+                weights[src_w] = []
+                for index, (offset, cols) in enumerate(splits):
+                    wsize, ssize = cols * K // 2, cols * K // 64 * 2
+                    weight = arena.alloc_weights(index, wsize, projection + " IF4")
+                    scale = arena.alloc_weights(index, ssize, projection + " scales")
+                    weights[src_w].append((weight, scale))
+                    plan.extend(((src_w + offset * K // 2, weight, wsize),
+                                 (src_s + offset * K // 64 * 2, scale, ssize)))
+        for src, dst, size in plan:
+            if not self._params_dram_base <= src < src + size <= self._tensor_dram_base:
+                raise ValueError("decode weight source escapes the model params region")
+        for src, dst, size in plan:
+            self._lm_sched._copy_dram_bytes(src, dst, size)
+        self._decode_weight_arena = arena
+        self._decode_private_weights = weights
+
+    def _guard_model_allocation(self, cursor, size_bytes, limit, align_bytes=64,
+                                round_size=False):
+        start = self._align_up(cursor, align_bytes)
+        size = self._align_up(size_bytes, align_bytes) if round_size else size_bytes
+        if size_bytes < 0 or start + size > limit:
+            raise MemoryError(f"model allocation 0x{start:X}+0x{size:X} exceeds 0x{limit:X}")
+
+    def allocate_params_dram(self, size_bytes, label=None, align_bytes=64):
+        self._guard_model_allocation(self._next_params_dram_addr, size_bytes,
+                                     self._tensor_dram_base, align_bytes)
+        return super().allocate_params_dram(size_bytes, label, align_bytes)
+
+    def allocate_tensor_dram(self, size_bytes, label=None, align_bytes=64):
+        self._guard_model_allocation(self._tensor_dram_addr, size_bytes,
+                                     self._program_dram_base, align_bytes)
+        return super().allocate_tensor_dram(size_bytes, label, align_bytes)
+
+    def allocate_program_dram(self, size_bytes, label=None, align_bytes=64):
+        self._guard_model_allocation(self._next_program_dram_addr, size_bytes,
+                                     self._model_end, align_bytes, round_size=True)
+        return super().allocate_program_dram(size_bytes, label, align_bytes)
+
+    def _write_model_program(self, address, data):
+        if not self._program_dram_base <= address < address + len(data) <= self._model_end:
+            raise MemoryError("instruction DMA escapes the model program region")
+        return self.dma_write(DMA_DEVICE_H2C, address, data, len(data))
+
+    def write_captured_instructions_to_dram(self, start_addr=DRAM_INSTRUCTION_ADDR):
+        size = self._align_up(self.get_capture_instruction_size_bytes(), 64)
+        if not self._program_dram_base <= start_addr <= start_addr + size <= self._model_end:
+            raise MemoryError("instruction DMA escapes the model program region")
+        return super().write_captured_instructions_to_dram(start_addr)
+
     def _emit_decode_gate_up(self, la, lm_matmul, H, I, bpe):
         """gate + up + the silu*up multiply, optionally N-split over DECODE_NUM_ENGINES.
 
@@ -1916,13 +2019,10 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         blocks and split unevenly; o and down are K-fat and would need split_k plus
         host-sliced weights.
 
-        AN N-SPLIT DOES NOT REDUCE TOTAL DRAM TRAFFIC. Each engine reads half of B,
-        so the bytes moved across the pair are identical to one engine reading all
-        of it. This is only a win if the current ceiling is per-engine issue rate
-        or AXI port, not the memory controller. Measured single-engine decode is
-        ~192 MB/token at ~12 tok/s = ~2.3 GB/s against a 256-bit/198 MHz AXI
-        (~6.35 GB/s), i.e. ~36% of peak -- suggestive but not proof. That is what
-        this exists to measure.
+        Each engine's gate/up column blocks are copied once to its own board
+        controller window by _materialize_decode_weights. The full shared copy
+        remains available for prefill. Splitting columns without this copy would
+        leave every engine reading the same memory controller.
 
         WHY NO PER-ENGINE OUTPUT BUFFERS. At M=1 a column block of a [1, N] buffer
         IS a contiguous byte range, and matmat's writeback stride is the N it was
@@ -1979,6 +2079,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                      else ctx.b_addr(la[f'{proj}_data'], H, data_type=TYPE.IF4))
                 SC = (la[f'{proj}_scale'] if barrier_only
                       else ctx.scale_addr(la[f'{proj}_scale'], H))
+                if not barrier_only:
+                    B, SC = self._decode_private_weights[la[f'{proj}_data']][ctx.engine_idx]
                 if deterministic:
                     ue.matmat_mul_core(M=1, K=H, N=nc, A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                         B_DRAM_ADDR=B, OUTPUT_DRAM_ADDR=dst + off, is_B_quantized=True,
@@ -2163,7 +2265,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         bin_dir = os.path.join(self.script_dir, "smolvlm2_bin")
         # Load into program DRAM for immediate use (same session)
         self._decoder_program_addr = self.get_program_dram_addr()
-        self.dma_write(DMA_DEVICE_H2C, self._decoder_program_addr, bytes(raw), len(raw))
+        self._write_model_program(self._decoder_program_addr, bytes(raw))
         self.allocate_program_dram(len(raw))
         self._decoder_preamble_addr = self.get_program_dram_addr()
         self.allocate_program_dram(256)
@@ -2278,6 +2380,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             _original_print("  Snapshot stale (missing required model addresses) — recompiling.")
             return False
         total = meta["params_size"]
+        self._guard_model_allocation(self._params_dram_base, total, self._tensor_dram_base)
+        self._guard_model_allocation(self._tensor_dram_base, meta["tensor_size"], self._program_dram_base)
         CHUNK = 1 * 1024 * 1024
         with open(bin_path, "rb") as f:
             offset = 0
@@ -2630,12 +2734,10 @@ def main():
     )
     parser.add_argument(
         "--decode-engines", type=_engines_arg, default=1, metavar="N",
-        help="EXPERIMENT (default 1 = off). N-split the decode MLP's gate and up "
-             "projections across N engines -- half the per-layer weight bytes, and "
-             "the only decode linears whose N (2560) splits evenly. Decode is a "
-             "weight-streaming GEMV, so this reduces bytes read PER ENGINE but not "
-             "in TOTAL; it only wins if the ceiling is issue rate rather than the "
-             "DRAM controller. Must be <= --engines (workers are shared).",
+        help="N-split decode gate/up across N engines using private weight copies "
+             "on board memory controllers (default 1 = off). The original weights "
+             "serve prefill; model DRAM is relocated before loading. Must be <= "
+             "--engines (the worker pool is shared).",
     )
     parser.add_argument(
         "--engines", type=_engines_arg, default=2, metavar="N",
@@ -2667,19 +2769,18 @@ def main():
     print(user_dma_core.hardware_info_summary())
     global _SILENT_MODE
     _SILENT_MODE = True
-    ue = SmolVLM2_UnifiedEngine(script_dir=script_dir)
+    ue = SmolVLM2_UnifiedEngine(script_dir=script_dir, num_engines=args.engines,
+                               decode_num_engines=args.decode_engines,
+                               prefill_num_engines=args.prefill_engines)
     # Software-reset the engine, then clear DRAM to 0 before anything else.
     # SmolVLM2 has a read-before-write defect and depends on clean, zero-filled
     # DRAM. The harness now poisons DRAM (0xFF) before SmolVLM2 like every other
     # model, so the model must reset and zero it itself before loading weights /
     # running. Remove once the gap is fixed.
-    ue.software_reset()
+    from multi_engine_decode import reset_engine_queues
+    reset_engine_queues(int(args.engines))
     ue.zero_dram()
     ue.decode_matmat_mul_core_enable = bool(args.decode_matmat_mul_core_enable)
-    ue.NUM_ENGINES = int(args.engines)
-    ue.DECODE_NUM_ENGINES = int(args.decode_engines)
-    ue.PREFILL_NUM_ENGINES = (None if args.prefill_engines is None
-                              else int(args.prefill_engines))
     ue.penalty_enable = not bool(args.greedy_enable)
     _original_print(f"decode_linear={ 'if4_matmat_mul_core' if ue.decode_matmat_mul_core_enable else 'quantized_matmat_core' }")
     _original_print(f"generation={ 'hardware_penalty' if ue.penalty_enable else 'greedy' }")

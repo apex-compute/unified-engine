@@ -1,0 +1,156 @@
+{
+  "hostname": "p2",
+  "device": "xdma0",
+  "image": "0xe6703022",
+  "hardware_info": {
+    "raw": 2298563925,
+    "queue_mode": true,
+    "axi_data_width_bits": 256,
+    "dram_size_code": 2,
+    "dram_size_gb": 8,
+    "core_count": 8,
+    "frequency_mhz_q8": 85333,
+    "frequency_mhz": 333.33203125,
+    "frequency_hz": 333332031.25
+  },
+  "timestamp_utc": "2026-10-07T08:34:52.410942+00:00",
+  "prompt": "x+3=5, what is x?",
+  "max_new_tokens": 32,
+  "models": {
+    "e4b": {
+      "runs": [
+        {
+          "token_ids": [
+            8291,
+            236789,
+            236751,
+            1217,
+            531,
+            8974,
+            573,
+            1123,
+            236787,
+            108,
+            1018,
+            818,
+            4901,
+            563,
+            53121,
+            107,
+            9873,
+            236781,
+            900,
+            236743,
+            236800,
+            578,
+            236743,
+            236810,
+            9873,
+            108,
+            1018,
+            2021,
+            1586,
+            1123,
+            236764,
+            611
+          ],
+          "decoded_tokens": 32,
+          "decoded_text_without_special_tokens": "Here's how to solve for x:\n\n**The equation is:**\n$$x + 3 = 5$$\n\n**To find x, you",
+          "pad_token_id": 0,
+          "decoded_text": "Here's how to solve for x:\n\n**The equation is:**\n$$x + 3 = 5$$\n\n**To find x, you",
+          "decode_first_hw_ms": 380.9409120504377,
+          "decode_avg_hw_ms": 380.95093658959604,
+          "model_base": 0,
+          "dram_layout": "legacy",
+          "private_windows": null,
+          "active_engines": 1,
+          "wall_seconds": 93.08665074200007
+        },
+        {
+          "token_ids": [
+            8291,
+            236789,
+            236751,
+            1217,
+            531,
+            8974,
+            573,
+            1123,
+            236787,
+            108,
+            1018,
+            818,
+            4901,
+            563,
+            53121,
+            107,
+            9873,
+            236781,
+            900,
+            236743,
+            236800,
+            578,
+            236743,
+            236810,
+            9873,
+            108,
+            1018,
+            2021,
+            1586,
+            1123,
+            236764,
+            611
+          ],
+          "decoded_tokens": 32,
+          "decoded_text_without_special_tokens": "Here's how to solve for x:\n\n**The equation is:**\n$$x + 3 = 5$$\n\n**To find x, you",
+          "pad_token_id": 0,
+          "decoded_text": "Here's how to solve for x:\n\n**The equation is:**\n$$x + 3 = 5$$\n\n**To find x, you",
+          "decode_first_hw_ms": 249.4561584381189,
+          "decode_avg_hw_ms": 249.47026449322067,
+          "model_base": 0,
+          "dram_layout": "mc8_f46e8cd62cef",
+          "private_windows": [
+            [
+              4294967296,
+              536870912
+            ],
+            [
+              5368709120,
+              536870912
+            ],
+            [
+              6442450944,
+              536870912
+            ],
+            [
+              5905580032,
+              536870912
+            ],
+            [
+              4831838208,
+              536870912
+            ],
+            [
+              8053063680,
+              536870912
+            ],
+            [
+              7516192768,
+              536870912
+            ],
+            [
+              6979321856,
+              536870912
+            ]
+          ],
+          "active_engines": 8,
+          "wall_seconds": 90.40869256699989
+        }
+      ],
+      "exact_token_match": true,
+      "meaningful_output": true,
+      "first_token_speedup": 1.5270856187137807,
+      "average_token_speedup": 1.5270394544354537
+    }
+  }
+}

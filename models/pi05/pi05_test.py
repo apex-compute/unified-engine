@@ -2439,9 +2439,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # engines issue them. Under the row split every engine streams the FULL
     # weight matrix of every projection from the same address, so the whole
     # stage's weight traffic sits behind that one-stream ceiling.
-    # "auto" = as many extra copies as fit (params headroom first, then tensor
-    # DRAM left over after the action-expert reserve and a per-worker arena
-    # floor), capped at one set per vision engine. An int N = at most N sets
+    # "auto" uses free controller windows above the fixed low-4GiB model on
+    # Alveo. Kintex has no such free range and uses capacity-limited params /
+    # tensor headroom after the action-expert and worker reserves. This is
+    # capped at one set per vision engine. An int N = at most N sets
     # in total (1 = no copies, the A/B baseline). Engine e reads set e % n_sets.
     # Norms, biases, patch-embed and the head projection stay shared (tiny).
     # Only the M-shard path (nk == 1) uses copies; the 2D grid keeps set 0.
@@ -2876,17 +2877,88 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         nn_lib.store_quantized_weight) from the params or tensor allocator."""
         n_blocks = len(raw) // 34
         scales_size, data_size = n_blocks * 2, n_blocks * 32
-        alloc = self.allocate_params_dram if region == "params" else self.allocate_tensor_dram
+        alloc = (region if callable(region) else self.allocate_params_dram
+                 if region == "params" else self.allocate_tensor_dram)
+        write = self._dma_write_retry if callable(region) else self.dma_write
         scale_addr = alloc(scales_size)
-        self.dma_write(DMA_DEVICE_H2C, scale_addr,
+        write(DMA_DEVICE_H2C, scale_addr,
                        torch.from_numpy(np.frombuffer(raw, dtype=np.uint8, count=scales_size).copy()),
                        scales_size)
         data_addr = alloc(data_size)
-        self.dma_write(DMA_DEVICE_H2C, data_addr,
+        write(DMA_DEVICE_H2C, data_addr,
                        torch.from_numpy(np.frombuffer(raw, dtype=np.uint8, count=data_size,
                                                       offset=scales_size).copy()),
                        data_size)
         return scale_addr, data_addr
+
+    def _vis_controller_copy_windows(self, copy_bytes, num_engines):
+        """Free controller regions outside pi05's fixed [0, 4 GiB) model.
+
+        U50 offers one upper-stack 512 MiB segment per engine. U55C 16 GiB
+        chooses whole controllers around that model; its older 8 GiB image
+        has only four free controllers. Kintex has no space outside the model
+        and keeps the capacity-limited params/tensor copy path.
+        """
+        from multi_engine_shard import board_private_windows
+        cores, gib = user_dma_core.ANDROMEDA_CORE_COUNT, user_dma_core.AVAILABLE_DRAM_SIZE_GB
+        if cores is None or gib is None:
+            user_dma_core.configure_clock_from_hardware()
+            cores, gib = user_dma_core.ANDROMEDA_CORE_COUNT, user_dma_core.AVAILABLE_DRAM_SIZE_GB
+        if num_engines > cores:
+            raise ValueError(f"{num_engines} vision engines exceed HW_INFO count {cores}")
+        if gib < 8:
+            return []
+        if cores == 12 and gib == 16:
+            board = board_private_windows(num_engines, reserve=(0, 4 << 30))
+        else:
+            board = board_private_windows(8 if cores == 12 else num_engines)
+        windows = [(base, size) for window in board for base, size in window.segments
+                   if base >= (4 << 30)]
+        windows = windows[:num_engines]
+        if any(copy_bytes > size for _, size in windows):
+            raise MemoryError(f"vision weight set ({copy_bytes} bytes) exceeds a controller window")
+        return windows
+
+    def _vis_upload_controller_copies(self, blobs, copy_bytes, want_sets, ne_vis):
+        windows = self._vis_controller_copy_windows(copy_bytes, ne_vis)[:want_sets]
+        if not windows:
+            return False
+        # Allocate all sets in free HBM; original params remain the source for
+        # bin replay and shared norms/biases. Even engine 0 uses its own copy.
+        self._vis_weight_sets = []
+        self._vis_copy_record.update({
+            "controller_layout_version": 1,
+            "board": [user_dma_core.ANDROMEDA_CORE_COUNT, user_dma_core.AVAILABLE_DRAM_SIZE_GB],
+            "controller_windows": [list(w) for w in windows],
+            "copy_bytes": copy_bytes,
+            "requested_sets": want_sets,
+        })
+        for copy_index, (base, size) in enumerate(windows):
+            cursor = base
+            def allocate(nbytes):
+                nonlocal cursor
+                address = (cursor + 63) & ~63
+                if address + nbytes > base + size:
+                    raise MemoryError("vision replica escapes its controller window")
+                cursor = address + nbytes
+                return address
+            wset = []
+            for layer, packed in enumerate(blobs):
+                la = dict(self.vis_layer_addrs[layer])
+                for key in self._VIS_COPY_KEYS:
+                    la[f"{key}_scale"], la[f"{key}_data"] = self._vis_store_q4_blob(packed[key], allocate)
+                    blocks = len(packed[key]) // 34
+                    for part, nbytes in (("scale", blocks * 2), ("data", blocks * 32)):
+                        self._vis_copy_record["blobs"].append([
+                            int(la[f"{key}_{part}"]),
+                            int(self.vis_layer_addrs[layer][f"{key}_{part}"]), nbytes])
+                wset.append(la)
+            self._vis_weight_sets.append(wset)
+            _original_print(f"    [vis] controller weight set {copy_index}: "
+                            f"0x{base:X}..0x{cursor:X} ({(cursor-base)/(1<<20):.1f} MiB)")
+        _original_print(f"    [vis] {len(windows)} controller weight sets for {ne_vis} engines; "
+                        "engine e uses set e % count")
+        return True
 
     def _vis_alloc_weight_copies(self, workers):
         """Upload the private per-engine vision weight sets (see VIS_WEIGHT_COPIES).
@@ -2928,7 +3000,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             return
         # Exact bytes per set: every blob is 64-aligned by the allocator; the
         # scale/data sizes are multiples of 128 for these shapes, so no slack.
-        copy_bytes = sum(len(b[k]) for b in blobs for k in self._VIS_COPY_KEYS)
+        copy_bytes = sum(((len(b[k]) // 34 * 2 + 63) & ~63)
+                         + ((len(b[k]) // 34 * 32 + 63) & ~63)
+                         for b in blobs for k in self._VIS_COPY_KEYS)
+        try:
+            if self._vis_upload_controller_copies(blobs, copy_bytes,
+                                                  min(want_sets, ne_vis), ne_vis):
+                return
+        except Exception:
+            self._vis_weight_sets = None
+            raise
         params_free = (self._tensor_dram_base - self._next_params_dram_addr
                        - self.VIS_WEIGHT_COPY_PARAMS_MARGIN)
         # <=3 workers keep the fixed 48 MB arena layout (no resize), so hold that
@@ -8018,9 +8099,12 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
         """
         if getattr(self, "_vis_weight_sets", None) is not None:
             return
-        self._vis_weight_sets = []
         rec = self._manifest.get("vis_weight_copies")
         if rec is None:
+            if (int(user_dma_core.AVAILABLE_DRAM_SIZE_GB or 0) >= 8
+                    and self._num_engines("VIS") > 1 and self.VIS_WEIGHT_COPIES != 1
+                    and self._vis_grid(self._num_engines("VIS"))[1] == 1):
+                raise RuntimeError("vision replica bins lack a controller map; regenerate the bins")
             # Bin set dumped before the record existed. That is only a problem if the
             # compile run put weight copies in TENSOR DRAM (8 engines does; 2 engines
             # fits its one copy in params, which params.bin already holds). Replay the
@@ -8028,7 +8112,25 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
             # per-engine address shifted and refuses with a regenerate message.
             _original_print(f"    [vis] bin set {self._bin_stem} has no vis_weight_copies record "
                             f"(older dump) -- assuming no tensor-DRAM weight copies")
+            self._vis_weight_sets = []
             return
+        version = rec.get("controller_layout_version")
+        if version is not None:
+            board = [user_dma_core.ANDROMEDA_CORE_COUNT, user_dma_core.AVAILABLE_DRAM_SIZE_GB]
+            windows = self._vis_controller_copy_windows(
+                int(rec["copy_bytes"]), self._num_engines("VIS"))[:int(rec["requested_sets"])]
+            if (version != 1 or rec.get("board") != board
+                    or rec.get("controller_windows") != [list(w) for w in windows]):
+                raise RuntimeError("vision replica controller map changed; regenerate the bins")
+            for dst, src, size in rec["blobs"]:
+                if (size <= 0 or not self._params_dram_base <= src < src + size <= self._tensor_dram_base
+                        or not any(base <= dst < dst + size <= base + length
+                                   for base, length in windows)):
+                    raise RuntimeError("vision replica bin address escapes its reserved regions")
+        elif (int(user_dma_core.AVAILABLE_DRAM_SIZE_GB or 0) >= 8
+              and self._num_engines("VIS") > 1 and self.VIS_WEIGHT_COPIES != 1
+              and self._vis_grid(self._num_engines("VIS"))[1] == 1):
+            raise RuntimeError("vision replica bins predate controller placement; regenerate the bins")
         here = int(self._tensor_dram_addr)
         if here != rec["tensor_before"]:
             raise RuntimeError(
@@ -8050,6 +8152,7 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
                             f"({total / (1 << 20):.1f} MB) from params.bin in "
                             f"{time.perf_counter() - t0:.1f}s")
         self._tensor_dram_addr = int(rec["tensor_after"])
+        self._vis_weight_sets = []   # publish only after validation and all copies succeed
 
     def _resolve_worker_arena_profile(self, workers):
         """Replay the compile run's arena sizing, then insist it matches the dump.

@@ -3079,6 +3079,28 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         self._vis_per_engine_done = sched
         return sched
 
+    def _vision_controller_replicas(self):
+        from models.controller_replicas import ControllerReplicas
+        if getattr(self, "_vision_replicas", None) is None:
+            self._vision_replicas = ControllerReplicas(self, self._num_engines("VIS"))
+        return self._vision_replicas
+
+    def _materialize_vision_controller_weights(self):
+        """Replicate the six immutable bf16 vision projections per layer."""
+        if getattr(self, "_vision_private_layers", None) is not None:
+            return
+        pool = self._vision_controller_replicas()
+        H, I = (self._cfg["vision"][name] for name in ("hidden_size", "intermediate_size"))
+        layers = [[dict(layer) for layer in self.vis_layer_addrs]
+                  for _ in range(pool.num_engines)]
+        for layer_index, layer in enumerate(self.vis_layer_addrs):
+            for projection in ("q", "k", "v", "o", "fc1", "fc2"):
+                size = 2 * H * (I if projection in ("fc1", "fc2") else H)
+                addresses = pool.copy(layer[f"{projection}_weight"], size)
+                for engine, address in enumerate(addresses):
+                    layers[engine][layer_index][f"{projection}_weight"] = address
+        self._vision_private_layers = layers
+
     def compile_encoder(self):
         """One SigLIP pass over [1024,768] + the connector, compiled ONCE and executed
         once per camera slot (the program is the expensive artifact). Returns its DRAM
@@ -3133,6 +3155,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         S = V["num_patches"]
 
         ne = self._num_engines("VIS")
+        self._materialize_vision_controller_weights()
         sched = self._make_stage_scheduler("VIS", ne)
         self._vis_sched = sched
         self._vis_register_per_engine(sched)
@@ -3418,7 +3441,8 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         assert 1 <= n_vis <= len(self.vis_layer_addrs), f"VIS_LAYERS={self.VIS_LAYERS}"
         if primary and n_vis != len(self.vis_layer_addrs):
             print(f"    [bisect] compiling only {n_vis}/{len(self.vis_layer_addrs)} ViT layers")
-        for i, la in enumerate(self.vis_layer_addrs[:n_vis]):
+        layers = self._vision_private_layers[e]
+        for i, la in enumerate(layers[:n_vis]):
             h_in = self.VIS_IO_A_DRAM if i % 2 == 0 else self.VIS_IO_B_DRAM
             h_out = self.VIS_IO_B_DRAM if i % 2 == 0 else self.VIS_IO_A_DRAM
 
@@ -8946,6 +8970,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                                           for w in self._worker_engine_pool()]
 
         HEAD, V, L = self._cfg["action_head"], self._cfg["vision"], self._cfg["lm"]
+        manifest["controller_replicas"] = self._vision_controller_replicas().manifest()
         manifest["sig"] = {
             # smolvla and smolvla_qg share every shape field, so the variant name is the
             # only thing separating their bin sets if they ever meet in one directory.
@@ -9227,6 +9252,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         with open(meta_path) as f:
             self._manifest = json.load(f)
         sig = self._manifest["sig"]
+        self._vision_controller_replicas().restore(self._manifest.get("controller_replicas"))
 
         HEAD, V, L = self._cfg["action_head"], self._cfg["vision"], self._cfg["lm"]
         for name, live, want, hint in (

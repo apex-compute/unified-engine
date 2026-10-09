@@ -35,6 +35,68 @@ python3 qwen3.5_2b_run_from_bin.py --image my.jpg --prompt "What is in this imag
 `--vision-enable` uses the bundled sample image (`../../test_samples/yosemite.jpg`).
 Decode runs at ~1.1 tok/s (greedy).
 
+## Controller-private decode
+
+The builder supports two-engine text generation on a 4 GiB Kintex7 and larger
+engine counts on supported U50/U55C images:
+
+```bash
+python models/qwen3.5_2b/qwen3.5_2b_test.py --device kintex7 --dev xdma1 \
+  --multi-core 2 --max-new-tokens 128 --prompt "What is 2 + 2?"
+python models/qwen3.5_2b/qwen3.5_2b_test.py --device alveo --dev xdma0 \
+  --multi-core 8 --max-new-tokens 128 --prompt "What is 2 + 2?"
+```
+
+Each engine reads its own column slices of the IF4 projections and LM head.
+The fused full-attention KV projection stays fused; Gated DeltaNet recurrence,
+convolution state, attention, normalization, and residual operations remain on
+the primary engine. Every prompt token and generated token launches matching
+worker programs, and the LM head merges the per-engine argmax results.
+
+Kintex7 uses these nonoverlapping regions:
+
+| Data | Address range | Observed allocation at context 512 |
+|---|---|---|
+| Engine 0 private weights/ISA/scratch | 0–512 MiB, DDR0 | 476.27 MiB weights |
+| Shared parameters | 1–2 GiB | 964.00 MiB |
+| Shared recurrent state and activations | 2–2.5 GiB | 130.28 MiB persistent; transient activations reuse the remainder |
+| Primary instructions | 2.5–3 GiB | 7.64 MiB decoder |
+| Engine 1 private weights/ISA/scratch | 3–3.5 GiB, DDR1 | 476.27 MiB weights, 215 KiB worker instructions |
+
+Each private window reserves 16 MiB for instructions and 16 MiB for scratch,
+leaving a 480 MiB weight budget. The complete shard plan is checked before DMA;
+this model has only 3.73 MiB spare per engine in the two-engine layout. The host
+keeps the BF16 embedding table. The original single-engine map stays unchanged.
+U50 follows the hardware SAXI controller order, with the shared model at 6–8 GiB.
+
+Multicore currently supports text generation through the builder. It compiles
+primary and worker instructions together after every weight load; legacy
+`programs.bin` files remain single-engine artifacts. The runtime-only loader
+rejects multicore artifacts because it cannot restore the workers. Transient
+single-engine decoder caches include source, context-capacity, and memory-map
+identity. Identity-matrix addresses are scoped to each engine instance so that
+switching between single-engine and multicore layouts in one process is safe.
+
+The eleven offline tests in `tests/test_qwen35_multicore.py` cover placement,
+capacity, recurrent prefill/decode orchestration, fused projection registration,
+cache rejection, and worker startup. A full capture with the real quantized
+weights also passed without device access.
+
+Both boards generated 32 identical token IDs between the single-engine baseline
+and multicore run for `x+3=5, what is x?`. Average hardware latency over the
+31 timed decode steps was:
+
+| Board | Engines | Single engine | Multicore | Speedup | Result |
+|---|---:|---:|---:|---:|---|
+| Kintex7, image `0x8763d976`, 198.324 MHz | 2 | 1271.14 ms/token | 1190.33 ms/token | 1.068× | [JSON](../../tests/kintex7_qwen35_controller_results.json) |
+| U50, image `0xe6703022`, 333.332 MHz | 8 | 776.70 ms/token | 689.38 ms/token | 1.127× | [JSON](../../tests/alveo_u50_qwen35_controller_results.json) |
+
+The prompt seed token is included in the token comparison and excluded from
+the timing average.
+The 18 recurrent-attention layers remain on the primary engine, limiting the
+end-to-end gain even when projection weights use separate memory controllers.
+This measurement does not establish a 12 GB/s whole-model decoding rate.
+
 ## How the single bin works
 
 The file holds two program sections, **both baked for program base 0xD0000000**,
