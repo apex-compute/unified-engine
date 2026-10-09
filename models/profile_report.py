@@ -109,6 +109,34 @@ def aggregate_checkpoints(samples: Iterable[Mapping[str, Any]], *,
     return result
 
 
+def annotate_execution(rows: Iterable[dict[str, Any]], engines: int, *,
+                       sharded: Iterable[str] = (),
+                       mixed: Mapping[str, str] | None = None
+                       ) -> list[dict[str, Any]]:
+    """Label how each major step uses engines in a multi-core profile.
+
+    ``sharded`` steps run the complete checkpoint region across all engines.
+    ``mixed`` describes checkpoint regions that combine a sharded operation
+    with primary-core-only work.  Everything else is explicitly marked as a
+    primary-core-only step.  Single-core reports retain the compact legacy
+    schema and are returned unchanged.
+    """
+    rows = list(rows)
+    if int(engines) <= 1:
+        return rows
+    sharded = set(sharded)
+    mixed = dict(mixed or {})
+    for row in rows:
+        label = str(row.get("label", ""))
+        if label in mixed:
+            row["execution"] = f"Mixed: {mixed[label]}"
+        elif label in sharded:
+            row["execution"] = f"Sharded ({engines} cores)"
+        else:
+            row["execution"] = "Primary core only"
+    return rows
+
+
 def write_profile_markdown(path: str | Path, *, title: str,
                            hardware: Mapping[str, Any],
                            overall: Iterable[Mapping[str, Any]],
@@ -146,15 +174,20 @@ def write_profile_markdown(path: str | Path, *, title: str,
     for heading, rows_iter in breakdowns:
         rows = list(rows_iter)
         total_ms = sum(float(row.get("hw_ms") or 0.0) for row in rows)
+        has_execution = any(row.get("execution") for row in rows)
+        execution_header = " Execution |" if has_execution else ""
+        execution_rule = "---|" if has_execution else ""
         lines += ["", f"## {heading}", "",
-                  "| Step | Samples | HW ms | Share | Issued GFLOP | Effective GFLOP | "
+                  f"| Step |{execution_header} Samples | HW ms | Share | Issued GFLOP | Effective GFLOP | "
                   "Issued GFLOPS | Effective GFLOPS | Issued % peak | Effective % peak |",
-                  "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+                  f"|---|{execution_rule}---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
         for row in rows:
             share = (100.0 * float(row.get("hw_ms") or 0.0) / total_ms
                      if total_ms else None)
+            execution = (f" {_cell(row.get('execution'))} |"
+                         if has_execution else "")
             lines.append(
-                f"| {row['label']} | {row.get('samples', 1)} | "
+                f"| {row['label']} |{execution} {row.get('samples', 1)} | "
                 f"{_number(row.get('hw_ms'))} | {_number(share)} | "
                 f"{_gflop(row.get('issued_flops'))} | {_gflop(row.get('effective_flops'))} | "
                 f"{_number(row.get('issued_gflops'))} | "

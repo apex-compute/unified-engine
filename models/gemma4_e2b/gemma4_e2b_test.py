@@ -55,7 +55,8 @@ from multi_engine_shard import (MULTICORE_WINDOW_BYTES, MultiEngineScheduler,
                                 PrivateArena, model_multicore_layout,
                                 require_multicore_dram, tiled_window_bases)
 import gemma4_e2b_model_flops as _model_flops
-from models.profile_report import measurement, write_profile_markdown
+from models.profile_report import (annotate_execution, measurement,
+                                   write_profile_markdown)
 
 # Non-tiled multicore runs reserve a contiguous 2 GiB model map and ask the
 # board allocator for controller-aware private windows. Eight-engine Alveo
@@ -2274,6 +2275,22 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         prefill_rows = _rows(self._prefill_profile_results, prefill_effective)
         first_rows = _rows(self._decode_profile_results, first_effective)
         long_rows = _rows(self._decode_1024_profile_results, long_effective)
+        annotate_execution(
+            prefill_rows, self.multi_core,
+            mixed={
+                "qkv_vproj": "Q/K/V projection region sharded; V cache scatter primary",
+                "attention": "attention heads sharded; output permute primary",
+                "mlp": "O/MLP work sharded; reductions/control primary",
+            })
+        _decode_mixed = {
+            "qkv_vproj": "Q/K/V projections sharded; norms/cache work primary",
+            "attention": "P@V sharded; Q@K and remaining work primary",
+            "o_proj": "o_proj sharded; remaining work primary",
+            "mlp": "projections sharded; activation/multiply/residual primary",
+            "lm_head": "LM head sharded; output norm primary",
+        }
+        annotate_execution(first_rows, self.multi_core, mixed=_decode_mixed)
+        annotate_execution(long_rows, self.multi_core, mixed=_decode_mixed)
 
         def _total(rows, key):
             values = [row.get(key) for row in rows]

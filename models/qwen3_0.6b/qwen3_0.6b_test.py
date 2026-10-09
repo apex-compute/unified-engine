@@ -54,7 +54,8 @@ import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_VECTOR_SIZE, SCALE_BRAM_ELEMENTS, INSTRUCTION_SIZE_BYTES, set_dma_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 from quant_lib import quantize
-from models.profile_report import aggregate_checkpoints, measurement, write_profile_markdown
+from models.profile_report import (aggregate_checkpoints, annotate_execution,
+                                   measurement, write_profile_markdown)
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -2212,6 +2213,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             if sample["name"] == "kv_attention" and aligned:
                 sample["effective_flops"] = int(sample["issued_flops"] * q_len / aligned)
         pf_rows = aggregate_checkpoints(pf_samples, peak_gflops=peak)
+        annotate_execution(pf_rows, self.multi_core)
 
         tail_flops = max(int(meta["decoder_total_flops"])
                          - sum(int(cp[2]) for cp in dec_checkpoints if len(cp) > 2), 0)
@@ -2244,6 +2246,15 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                     sample["effective_flops"] = int(
                         sample["issued_flops"] * context_len / aligned_ctx)
             rows = aggregate_checkpoints(samples, peak_gflops=peak)
+            annotate_execution(
+                rows, self.multi_core,
+                sharded={"qkv_proj"},
+                mixed={
+                    "o_proj_residual": "o_proj sharded; residual primary",
+                    "mlp_gateup_mul": "gate/up sharded; multiply primary",
+                    "mlp_down_residual": "down_proj sharded; residual primary",
+                    "output_norm_lm_head": "LM head sharded; norm primary",
+                })
             return rows, cpu_ms, sum(row["hw_ms"] for row in rows)
 
         first_ctx = actual + 1

@@ -46,7 +46,8 @@ import time
 import user_dma_core
 from user_dma_core import DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, INSTRUCTION_SIZE_BYTES, TYPE, UE_FMAX_CONTEXT_SIZE, UE_MODE, UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS, set_dma_device, ue_35bit_addr_shifter, calculate_snr
 from user_dma_core import UnifiedEngine
-from models.profile_report import aggregate_checkpoints, measurement, write_profile_markdown
+from models.profile_report import (aggregate_checkpoints, annotate_execution,
+                                   measurement, write_profile_markdown)
 
 # Bank B follows 4096 BF16 rows; its byte base grows with the lane count.
 URAM_B_SCRATCH = 4096 * UE_VECTOR_SIZE * 2 + 0x10000
@@ -4064,6 +4065,17 @@ def main():
                 profile_result.get("decoder_long_steps", []),
                 (profile_result.get("decoder_long_pos", 0)
                  / profile_result.get("decoder_long_aligned_kv", 1)))
+            annotate_execution(_pf_rows, args.multi_core)
+            _decode_mixed = {
+                "qkv_proj_vcache": "Q/K/V projections sharded; cache work primary",
+                "attention": "P@V sharded; Q@K and remaining work primary",
+                "o_proj_post_attn_norm_residual": "o_proj sharded; norm/residual primary",
+                "mlp_gateup_gelu_mul": "gate/up sharded; GELU/multiply primary",
+                "mlp_down_post_ffn_norm_residual": "down_proj sharded; norm/residual primary",
+                "output_norm_lm_head": "LM head sharded; output norm primary",
+            }
+            annotate_execution(_first_rows, args.multi_core, mixed=_decode_mixed)
+            annotate_execution(_long_rows, args.multi_core, mixed=_decode_mixed)
             _pf_flops = sum(row.get("issued_flops") or 0 for row in _pf_rows)
             _first_flops = sum(row.get("issued_flops") or 0 for row in _first_rows)
             _long_flops = sum(row.get("issued_flops") or 0 for row in _long_rows)

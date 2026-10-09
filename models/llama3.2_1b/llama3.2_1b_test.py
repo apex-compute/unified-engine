@@ -59,7 +59,8 @@ from user_dma_core import UnifiedEngine
 URAM_B_SCRATCH = 4096 * UE_VECTOR_SIZE * 2 + 0x10000
 # Canonical, HW-aligned 4-bit codec shared across all model templates.
 from quant_lib import quantize_if4
-from models.profile_report import aggregate_checkpoints, measurement, write_profile_markdown
+from models.profile_report import (aggregate_checkpoints, annotate_execution,
+                                   measurement, write_profile_markdown)
 
 # Map the config's quantization variant string to quantize_if4's int_variant arg.
 # "int" -> pure INT4, "fp" -> pure FP4, "mix"/"mixmse" -> per-block min-MSE.
@@ -2269,6 +2270,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                         (sample["issued_flops"] or 0)
                         * prefill_seq_len / aligned_seq_len)
             prefill_rows = aggregate_checkpoints(prefill_samples, peak_gflops=peak_gflops)
+            annotate_execution(
+                prefill_rows, self.multi_core,
+                sharded={"mlp"})
             step_ms = {row["label"]: row["hw_ms"] for row in prefill_rows}
             prefill_total_ms = self._print_profile_table(
                 f"Prefill  (seq_len={prefill_seq_len})", list(step_ms), step_ms)
@@ -2325,6 +2329,15 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 sample["effective_flops"] = int(
                     sample["issued_flops"] * self.seq_len / aligned_dec)
         decoder_rows = aggregate_checkpoints(decoder_samples, peak_gflops=peak_gflops)
+        annotate_execution(
+            decoder_rows, self.multi_core,
+            sharded={"qkv_proj"},
+            mixed={
+                "o_proj_residual": "o_proj sharded; residual primary",
+                "mlp_gateup_mul": "gate/up sharded; multiply primary",
+                "mlp_down_residual": "down_proj sharded; residual primary",
+                "output_norm_lm_head": "LM head sharded; norm primary",
+            })
         step_ms = {row["label"]: row["hw_ms"] for row in decoder_rows}
         decoder_total_ms = self._print_profile_table(
             "Decoder  (first token)", list(step_ms), step_ms)
@@ -2366,6 +2379,15 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 sample["effective_flops"] = int(
                     sample["issued_flops"] * large_ctx / large_aligned)
         large_rows = aggregate_checkpoints(large_samples, peak_gflops=peak_gflops)
+        annotate_execution(
+            large_rows, self.multi_core,
+            sharded={"qkv_proj"},
+            mixed={
+                "o_proj_residual": "o_proj sharded; residual primary",
+                "mlp_gateup_mul": "gate/up sharded; multiply primary",
+                "mlp_down_residual": "down_proj sharded; residual primary",
+                "output_norm_lm_head": "LM head sharded; norm primary",
+            })
         step_ms = {row["label"]: row["hw_ms"] for row in large_rows}
         large_total_ms = self._print_profile_table(
             f"Decoder  (position {large_pos})", list(step_ms), step_ms)
