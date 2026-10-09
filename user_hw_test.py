@@ -1,4 +1,4 @@
-﻿"""
+"""
 Hardware test runner for the Unified Engine.
 
 Runs generic_tests() (memcpy, matmat, transpose, broadcast, layer norm, RMS, RoPE, etc.)
@@ -95,10 +95,12 @@ from user_dma_core import (
     UE_TRACE_SIZE,
     UE_VECTOR_SIZE,
     ue_35bit_addr_shifter,
+    ue_axi_beat_bytes,
     ue_axi_beat_bf16_elems,
     ue_axi_beat_bf16_elems_for,
     ue_round_up_to_axi_beat_bytes,
     ue_round_up_to_axi_beat_elems,
+    ISA_DRAM_ALIGN_BYTES,
 )
 
 # ---------------------------------------------------------------------------
@@ -7577,16 +7579,14 @@ def dram_stride_wb_test():
     ue = UnifiedEngine()
     chunk_elems = ue_axi_beat_bf16_elems()
     chunk_bytes = chunk_elems * 2
-    # Mirror Vitis/common/src/andromeda.c:test_dram_stride_wb().
-    # The writeback emits 16 bf16 values per chunk, takes source rows in 64-element
-    # steps, and writes chunks to DRAM with 256-byte spacing.
+    # Contiguous URAM pack (matches axi_write_fsm mid-line row ends and
+    # Vivado/sim stride_writeback): row j takes source[j*chunk ..].
     num_chunks = 5
     stride_jump_bytes = 256
     stride_jump_elems = stride_jump_bytes // 2
-    src_stride_elems = UE_VECTOR_SIZE
-    input_elements = (num_chunks - 1) * src_stride_elems + chunk_elems
-    output_elements = (num_chunks - 1) * stride_jump_elems + chunk_elems
     writeback_elements = num_chunks * chunk_elems
+    input_elements = writeback_elements
+    output_elements = (num_chunks - 1) * stride_jump_elems + chunk_elems
 
     INPUT_DRAM_ADDR = ue.allocate_tensor_dram(input_elements * 2)
     OUTPUT_DRAM_ADDR = ue.allocate_tensor_dram(output_elements * 2)
@@ -7623,7 +7623,7 @@ def dram_stride_wb_test():
     expected = torch.zeros_like(output)
     for i in range(num_chunks):
         dst = i * stride_jump_elems
-        src = i * src_stride_elems
+        src = i * chunk_elems
         expected[dst:dst + chunk_elems] = x[src:src + chunk_elems]
 
     snr_db_ref = calculate_snr(expected, output)
@@ -7639,6 +7639,1742 @@ def dram_stride_wb_test():
     )
     ue.clear_capture_buffer()
     ue.reset_tensor_dram_addr()
+
+
+def _host_window_elems(used_elems: int) -> int:
+    """Pad a bf16 element count so host XDMA length stays 64-byte aligned."""
+    rem = (used_elems * 2) % 64
+    return used_elems + ((64 - rem) // 2 if rem else 0)
+
+
+def _run_unaligned_stride_en_case(
+    ue, label, *, off, num_chunks, chunk_bytes=None, jump_bytes=None, page_align=False,
+):
+    """Stride-read from an ISA-legal start that is not beat-aligned.
+
+    Host XDMA uses the aligned allocation base. The engine gathers from
+    ``base+off`` with beat-aligned chunk/jump so every row keeps the same
+    ``start_off``.
+    """
+    beat = ue_axi_beat_bytes()
+    if chunk_bytes is None:
+        chunk_bytes = beat
+    if jump_bytes is None:
+        jump_bytes = chunk_bytes * 2
+    assert off % ISA_DRAM_ALIGN_BYTES == 0, f"{label}: off={off} is not ISA 8-byte"
+    if not page_align:
+        assert off % beat != 0, f"{label}: off={off} is beat-aligned ({beat} B)"
+    assert chunk_bytes % beat == 0 and chunk_bytes > 0, (
+        f"{label}: chunk_bytes={chunk_bytes} is not a {beat}-byte beat multiple"
+    )
+    assert jump_bytes % beat == 0 and jump_bytes >= chunk_bytes, (
+        f"{label}: jump_bytes={jump_bytes} must be a {beat}-byte multiple >= chunk"
+    )
+
+    chunk_elems = chunk_bytes // 2
+    jump_elems = jump_bytes // 2
+    pad_elems = off // 2
+    trail_elems = 8
+    used_elems = pad_elems + (num_chunks - 1) * jump_elems + chunk_elems + trail_elems
+    window_elems = _host_window_elems(used_elems)
+    output_elems = num_chunks * chunk_elems
+    out_window_elems = _host_window_elems(output_elems)
+    align = 4096 if page_align else 64
+
+    src_base = ue.allocate_tensor_dram(window_elems * 2, align_bytes=align)
+    dst_base = ue.allocate_tensor_dram(out_window_elems * 2, align_bytes=align)
+    if page_align:
+        assert (src_base & 0xFFF) == 0 and (dst_base & 0xFFF) == 0, (
+            f"{label}: expected 4KB-aligned bases, got src=0x{src_base:x} dst=0x{dst_base:x}"
+        )
+    src = src_base + off
+
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=src,
+        sram_address=0x00000,
+        element_size=output_elems,
+        stride_bytes_per_chunk=chunk_bytes,
+        stride_jump_bytes=jump_bytes,
+    )
+    ue.sram_to_accelerator_memory(
+        sram_address=0x00000,
+        accelerator_dram_address=dst_base,
+        element_size=output_elems,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    x = (torch.arange(window_elems, dtype=torch.float32) % 97).to(torch.bfloat16)
+    ue.dma_to_accelerator_memory(src_base, x)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    output = ue.dma_from_accelerator_memory(dst_base, (out_window_elems,))
+    src_view = x[pad_elems:]
+    expected = torch.cat(
+        [src_view[i * jump_elems: i * jump_elems + chunk_elems]
+         for i in range(num_chunks)],
+        dim=0,
+    )
+    got = output[:output_elems]
+    snr_db = calculate_snr(expected, got)
+    print(f"Reference SNR Analysis for {label}: {snr_db:.2f} dB "
+          f"(src=0x{src:x} chunks={num_chunks} chunk_bytes={chunk_bytes} "
+          f"jump_bytes={jump_bytes})")
+    assert snr_db >= 40 or snr_db == float("inf"), (
+        f"{label}: SNR {snr_db:.2f} dB must be at least 40 dB"
+    )
+    ue.clear_capture_buffer()
+    return snr_db
+
+
+def dram_unaligned_stride_en_test():
+    """Stride-read from ISA 8-byte starts that are not AXI-beat aligned."""
+    ue = UnifiedEngine()
+    beat = ue_axi_beat_bytes()
+    snrs = []
+    # Mid-beat starts at every ISA slot inside the first beat (8/16/24).
+    for off in (8, 16, 24):
+        snrs.append(_run_unaligned_stride_en_case(
+            ue, f"dram_unaligned_stride_en_off{off}",
+            off=off, num_chunks=8))
+    # Same offsets with a 2-beat chunk (stress page rem + multi-beat hold).
+    for off in (8, 16, 24):
+        snrs.append(_run_unaligned_stride_en_case(
+            ue, f"dram_unaligned_stride_en_off{off}_2beat",
+            off=off, num_chunks=6, chunk_bytes=beat * 2, jump_bytes=beat * 4))
+    # Multi-beat chunk (one full 128 B URAM row) with a mid-beat start.
+    snrs.append(_run_unaligned_stride_en_case(
+        ue, "dram_unaligned_stride_en_row128",
+        off=8, num_chunks=6, chunk_bytes=128, jump_bytes=256))
+    snrs.append(_run_unaligned_stride_en_case(
+        ue, "dram_unaligned_stride_en_row128_off24",
+        off=24, num_chunks=8, chunk_bytes=128, jump_bytes=256))
+    # 0xFF8 is 8 bytes before a 4 KB page end; first row must split.
+    snrs.append(_run_unaligned_stride_en_case(
+        ue, "dram_unaligned_stride_en_4k",
+        off=0xFF8, num_chunks=4, chunk_bytes=beat * 2, jump_bytes=beat * 4,
+        page_align=True))
+    # Longer gather across the page boundary (more RLAST / next2 traffic).
+    snrs.append(_run_unaligned_stride_en_case(
+        ue, "dram_unaligned_stride_en_4k_long",
+        off=0xFF8, num_chunks=12, chunk_bytes=beat, jump_bytes=beat * 2,
+        page_align=True))
+    record_test(
+        "dram_unaligned_stride_en",
+        f"off=8/16/24/0xFF8, chunk=beat/{beat * 2}/128, chunks=4..12",
+        snr_db=min(snrs),
+    )
+    ue.reset_tensor_dram_addr()
+
+
+def _run_unaligned_stride_wb_case(
+    ue, label, *, off, num_chunks, chunk_bytes=None, jump_bytes=256, page_align=False,
+):
+    """Stride-writeback to an ISA-legal start that is not beat-aligned.
+
+    Per-row leading / trailing canaries sit in the same host window so WSTRB
+    realign cannot silently overwrite neighbors. Chunk/jump stay beat-aligned.
+    """
+    beat = ue_axi_beat_bytes()
+    if chunk_bytes is None:
+        chunk_bytes = beat
+    assert off % ISA_DRAM_ALIGN_BYTES == 0, f"{label}: off={off} is not ISA 8-byte"
+    if not page_align:
+        assert off % beat != 0, f"{label}: off={off} is beat-aligned ({beat} B)"
+    assert chunk_bytes % beat == 0 and chunk_bytes > 0, (
+        f"{label}: chunk_bytes={chunk_bytes} is not a {beat}-byte beat multiple"
+    )
+    assert jump_bytes % beat == 0 and jump_bytes >= chunk_bytes, (
+        f"{label}: jump_bytes={jump_bytes} must be a {beat}-byte multiple >= chunk"
+    )
+
+    chunk_elems = chunk_bytes // 2
+    jump_elems = jump_bytes // 2
+    pad_elems = off // 2
+    trail_elems = 8
+    # Contiguous URAM pack: stride writeback streams chunk0||chunk1||... without
+    # per-row URAM-line padding (axi_write_fsm keeps mid-line slice_cnt).
+    writeback_elems = num_chunks * chunk_elems
+    input_elems = writeback_elems
+    used_dst_elems = pad_elems + (num_chunks - 1) * jump_elems + chunk_elems + trail_elems
+    dst_window_elems = _host_window_elems(used_dst_elems)
+    align = 4096 if page_align else 64
+
+    src_base = ue.allocate_tensor_dram(_host_window_elems(input_elems) * 2)
+    dst_base = ue.allocate_tensor_dram(dst_window_elems * 2, align_bytes=align)
+    if page_align:
+        assert (dst_base & 0xFFF) == 0, (
+            f"{label}: expected 4KB-aligned dst, got 0x{dst_base:x}"
+        )
+    dst = dst_base + off
+
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=src_base,
+        sram_address=0x00000,
+        element_size=input_elems,
+    )
+    ue.sram_to_accelerator_memory(
+        sram_address=0x00000,
+        accelerator_dram_address=dst,
+        element_size=writeback_elems,
+        stride_bytes_per_chunk=chunk_bytes,
+        stride_jump_bytes=jump_bytes,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    x = (torch.arange(_host_window_elems(input_elems), dtype=torch.float32) % 113).to(
+        torch.bfloat16)
+    y0 = torch.full((dst_window_elems,), 99.0, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(src_base, x)
+    ue.dma_to_accelerator_memory(dst_base, y0)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    output = ue.dma_from_accelerator_memory(dst_base, (dst_window_elems,))
+    expected = y0.clone()
+    for i in range(num_chunks):
+        dst_i = pad_elems + i * jump_elems
+        src_i = i * chunk_elems
+        expected[dst_i:dst_i + chunk_elems] = x[src_i:src_i + chunk_elems]
+
+    assert torch.equal(output[:pad_elems], y0[:pad_elems]), (
+        f"{label}: leading canary smashed at dst=0x{dst_base:x} off={off}"
+    )
+    last_end = pad_elems + (num_chunks - 1) * jump_elems + chunk_elems
+    assert torch.equal(output[last_end:], y0[last_end:]), (
+        f"{label}: trailing canary smashed at dst=0x{dst:x}"
+    )
+    for i in range(num_chunks):
+        row = pad_elems + i * jump_elems
+        gap_lo = row + chunk_elems
+        gap_hi = pad_elems + (i + 1) * jump_elems if i + 1 < num_chunks else last_end
+        if gap_hi > gap_lo:
+            assert torch.equal(output[gap_lo:gap_hi], y0[gap_lo:gap_hi]), (
+                f"{label}: inter-row canary smashed at row={i} dst=0x{dst + i * jump_bytes:x}"
+            )
+
+    snr_db = calculate_snr(expected, output)
+    print(f"Reference SNR Analysis for {label}: {snr_db:.2f} dB "
+          f"(dst=0x{dst:x} chunks={num_chunks} chunk_bytes={chunk_bytes} "
+          f"jump_bytes={jump_bytes})")
+    assert snr_db >= 40 or snr_db == float("inf"), (
+        f"{label}: SNR {snr_db:.2f} dB must be at least 40 dB"
+    )
+    ue.clear_capture_buffer()
+    return snr_db
+
+
+def dram_unaligned_stride_wb_test():
+    """Stride-writeback to ISA 8-byte starts that are not AXI-beat aligned."""
+    ue = UnifiedEngine()
+    beat = ue_axi_beat_bytes()
+    snrs = []
+    for off in (8, 16, 24):
+        snrs.append(_run_unaligned_stride_wb_case(
+            ue, f"dram_unaligned_stride_wb_off{off}",
+            off=off, num_chunks=5))
+    for off in (8, 16, 24):
+        snrs.append(_run_unaligned_stride_wb_case(
+            ue, f"dram_unaligned_stride_wb_off{off}_2beat",
+            off=off, num_chunks=6, chunk_bytes=beat * 2, jump_bytes=beat * 4))
+    snrs.append(_run_unaligned_stride_wb_case(
+        ue, "dram_unaligned_stride_wb_row128",
+        off=8, num_chunks=4, chunk_bytes=128, jump_bytes=256))
+    snrs.append(_run_unaligned_stride_wb_case(
+        ue, "dram_unaligned_stride_wb_row128_off24",
+        off=24, num_chunks=6, chunk_bytes=128, jump_bytes=256))
+    # In-page near 4 KB, then a mid-beat start that must split the first row.
+    snrs.append(_run_unaligned_stride_wb_case(
+        ue, "dram_unaligned_stride_wb_4k",
+        off=0xFD8, num_chunks=4, chunk_bytes=beat, jump_bytes=256,
+        page_align=True))
+    snrs.append(_run_unaligned_stride_wb_case(
+        ue, "dram_unaligned_stride_wb_4k_split",
+        off=0xFF8, num_chunks=4, chunk_bytes=beat * 2, jump_bytes=256,
+        page_align=True))
+    snrs.append(_run_unaligned_stride_wb_case(
+        ue, "dram_unaligned_stride_wb_4k_long",
+        off=0xFF8, num_chunks=10, chunk_bytes=beat, jump_bytes=beat * 2,
+        page_align=True))
+    record_test(
+        "dram_unaligned_stride_wb",
+        f"off=8/16/24/0xFD8/0xFF8, chunk=beat/{beat * 2}/128, chunks=4..10",
+        snr_db=min(snrs),
+    )
+    ue.reset_tensor_dram_addr()
+
+def dram_unaligned_stride_wb_page_split_test():
+    """Stride-writeback whose row chunk spills a partial beat past a 4 KB page edge.
+
+    A 128 B chunk written with a mid-beat start whose end lands 8, 16 or 24 B past
+    a 4 KB boundary (page-offset starts 3976 / 3984 / 3992) leaves a lone partial
+    beat in the next page. Before the axi_write_fsm fix, RESP ready on
+    slice_cnt==0 after draining the URAM line advanced the SRAM pointer early
+    so later rows received later-row data. Measured with chunk 128, jump 256,
+    8 rows, page-aligned destination base:
+
+        page-offset start   3968   3976  3984  3992   4000 ... 4088
+        chunk spill (B)        0      8    16    24    32  ...  120
+        result (pre-fix)    pass   FAIL  FAIL  FAIL   pass ... pass
+
+    Now gated to pass (inf SNR) on rk_256 after latching mid-row more-lines
+    at AW accept and suppressing spill-only wrap-load.
+    """
+    ue = UnifiedEngine()
+    _run_unaligned_stride_wb_case(
+        ue, "dram_unaligned_stride_wb_page_split",
+        off=3976, num_chunks=8, chunk_bytes=128, jump_bytes=256, page_align=True)
+    record_test(
+        "dram_unaligned_stride_wb_page_split",
+        "chunk=128 jump=256 rows=8 page-offset start=3976 (spill 8 B)",
+        snr_db=float("inf"),
+    )
+    ue.reset_tensor_dram_addr()
+
+
+def _run_unaligned_memcpy_case(ue, label, *, off, payload_elems, page_align=False):
+    """DRAM->URAM->DRAM memcpy at an ISA-legal start that is not beat-aligned.
+
+    Host XDMA uses the aligned allocation base. The engine copies from ``base+off``.
+    Leading / trailing canaries sit in the same host window so WSTRB realign
+    cannot silently overwrite neighbors.
+    """
+    assert off % ISA_DRAM_ALIGN_BYTES == 0, f"{label}: off={off} is not ISA 8-byte"
+    beat = ue_axi_beat_bytes()
+    if not page_align:
+        assert off % beat != 0, f"{label}: off={off} is beat-aligned ({beat} B)"
+
+    pad_elems = off // 2
+    trail_elems = 8
+    used_elems = pad_elems + payload_elems + trail_elems
+    # Host XDMA stays on the aligned base; pad the window to a 64-byte length.
+    rem = (used_elems * 2) % 64
+    window_elems = used_elems + ((64 - rem) // 2 if rem else 0)
+    align = 4096 if page_align else 64
+    src_base = ue.allocate_tensor_dram(window_elems * 2, align_bytes=align)
+    dst_base = ue.allocate_tensor_dram(window_elems * 2, align_bytes=align)
+    if page_align:
+        assert (src_base & 0xFFF) == 0 and (dst_base & 0xFFF) == 0, (
+            f"{label}: expected 4KB-aligned bases, got src=0x{src_base:x} dst=0x{dst_base:x}"
+        )
+    src = src_base + off
+    dst = dst_base + off
+
+    lead = torch.tensor([1.0, -2.0, 3.0, -4.0], dtype=torch.bfloat16)
+    if pad_elems < lead.numel():
+        lead = lead[:pad_elems]
+    elif pad_elems > lead.numel():
+        lead = lead.repeat((pad_elems + lead.numel() - 1) // lead.numel())[:pad_elems]
+    payload = (torch.arange(payload_elems, dtype=torch.float32) + 16).to(torch.bfloat16)
+    trail = (torch.arange(trail_elems, dtype=torch.float32) + 200).to(torch.bfloat16)
+
+    src_window = torch.zeros(window_elems, dtype=torch.bfloat16)
+    src_window[:pad_elems] = lead
+    src_window[pad_elems:pad_elems + payload_elems] = payload
+    src_window[pad_elems + payload_elems:pad_elems + payload_elems + trail_elems] = trail
+    dst_window = torch.full((window_elems,), 99.0, dtype=torch.bfloat16)
+    dst_window[:pad_elems] = (lead + 8).to(torch.bfloat16)
+    dst_window[pad_elems + payload_elems:pad_elems + payload_elems + trail_elems] = (
+        (trail + 8).to(torch.bfloat16)
+    )
+
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=src,
+        sram_address=0x00000,
+        element_size=payload_elems,
+    )
+    ue.sram_to_accelerator_memory(
+        sram_address=0x00000,
+        accelerator_dram_address=dst,
+        element_size=payload_elems,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    ue.dma_to_accelerator_memory(src_base, src_window)
+    ue.dma_to_accelerator_memory(dst_base, dst_window)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    out = ue.dma_from_accelerator_memory(dst_base, (window_elems,))
+    got_lead = out[:pad_elems]
+    got_payload = out[pad_elems:pad_elems + payload_elems]
+    got_trail = out[pad_elems + payload_elems:]
+    assert torch.equal(got_lead, dst_window[:pad_elems]), (
+        f"{label}: leading canary smashed at dst=0x{dst_base:x} off={off}"
+    )
+    assert torch.equal(got_trail, dst_window[pad_elems + payload_elems:]), (
+        f"{label}: trailing canary smashed at dst=0x{dst:x}"
+    )
+    snr_db = calculate_snr(payload, got_payload)
+    print(f"Reference SNR Analysis for {label}: {snr_db:.2f} dB "
+          f"(src=0x{src:x} dst=0x{dst:x} payload_elems={payload_elems})")
+    assert snr_db >= 40 or snr_db == float("inf"), (
+        f"{label}: SNR {snr_db:.2f} dB must be at least 40 dB"
+    )
+    ue.clear_capture_buffer()
+    return snr_db
+
+
+def dram_unaligned_memcpy_test():
+    """Memcpy starts at ISA 8-byte addresses that are not AXI-beat aligned."""
+    ue = UnifiedEngine()
+    beat = ue_axi_beat_bytes()
+    snrs = []
+    # Every mid-beat ISA slot in the first beat, several payload sizes.
+    for off in (8, 16, 24):
+        for elems in (16, 64, 128, 256):
+            snrs.append(_run_unaligned_memcpy_case(
+                ue, f"dram_unaligned_memcpy_off{off}_{elems}e",
+                off=off, payload_elems=elems))
+    # Cross a full URAM row from a mid-beat start.
+    snrs.append(_run_unaligned_memcpy_case(
+        ue, "dram_unaligned_memcpy_off8_row",
+        off=8, payload_elems=UE_VECTOR_SIZE))
+    # 0xFF8 is 8 bytes before a 4KB page end; first burst must shrink to the
+    # page remainder, then the rest continues in the next page.
+    snrs.append(_run_unaligned_memcpy_case(
+        ue, "dram_unaligned_memcpy_4k", off=0xFF8, payload_elems=128, page_align=True))
+    snrs.append(_run_unaligned_memcpy_case(
+        ue, "dram_unaligned_memcpy_4k_long",
+        off=0xFF8, payload_elems=512, page_align=True))
+    # 0xFF0 leaves 16 B in-page before the 4KB boundary (two ISA slots).
+    if (0xFF0 % beat) != 0:
+        snrs.append(_run_unaligned_memcpy_case(
+            ue, "dram_unaligned_memcpy_4k_ff0",
+            off=0xFF0, payload_elems=256, page_align=True))
+    record_test(
+        "dram_unaligned_memcpy",
+        "off=8/16/24/0xFF0/0xFF8 elems=16..512",
+        snr_db=min(snrs),
+    )
+    ue.reset_tensor_dram_addr()
+
+
+def dram_unaligned_write_page_split_test():
+    """Contiguous (non-strided) write that straddles a 4 KB page edge loses its tail.
+
+    KNOWN HARDWARE FAILURE (xdma1 / puzhi, AXI 256-bit, 32 B beat, page-aligned
+    destination base). A 144 B contiguous SRAM->DRAM write starting at page offset
+    4000 / 4008 / 4016 / 4024 returns wrong data in its last 16 B (payload bytes
+    128..143). Measured:
+
+        144 B write:  start 3960..3992 pass | 4000..4024 FAIL | 4032..4088 pass
+        160 B write:  start 4024 FAIL (last 32 B)            | 4032..4088 pass
+         80 B write:  start 4024..4088 pass
+
+    The failing bytes are the ones past payload byte 128 (second 128 B SRAM row).
+    The existing partial-length cases never write more than 128 B at these starts.
+    """
+    ue = UnifiedEngine()
+    _run_partial_length_memcpy_case(
+        ue, "dram_unaligned_write_page_split", off=4000, payload_bytes=144, page_align=True)
+    record_test(
+        "dram_unaligned_write_page_split",
+        "contiguous 144 B write at page offset 4000",
+        snr_db=float("inf"),
+    )
+    ue.reset_tensor_dram_addr()
+
+
+def _partial_len_geom(off, payload_bytes, beat):
+    """Describe how a contiguous transfer sits across AXI beats (for logs)."""
+    start = off % beat
+    first_rem = beat - start if start else beat
+    if payload_bytes <= first_rem:
+        return (
+            f"start={start} first_rem={first_rem} "
+            f"beats=1 second=0 end={(start + payload_bytes) % beat}"
+        )
+    after_first = payload_bytes - first_rem
+    n_full = after_first // beat
+    last = after_first % beat
+    beats = 1 + n_full + (1 if last else 0)
+    return (
+        f"start={start} first_rem={first_rem} after_first={after_first} "
+        f"full_mid={n_full} last={last} beats={beats} "
+        f"end={(start + payload_bytes) % beat}"
+    )
+
+
+def _run_partial_length_memcpy_case(ue, label, *, off, payload_bytes, page_align=False):
+    """DRAM->URAM->DRAM memcpy with a contiguous length that is not beat-aligned.
+
+    ``payload_bytes`` may be any positive byte count that is not an AXI-beat
+    multiple. ``off`` stays ISA 8-byte (0 = beat-aligned start). Leading /
+    trailing canaries prove WSTRB / pad-mask do not smash neighbors.
+    """
+    assert off % ISA_DRAM_ALIGN_BYTES == 0, f"{label}: off={off} is not ISA 8-byte"
+    assert payload_bytes > 0 and payload_bytes % 2 == 0, (
+        f"{label}: payload_bytes={payload_bytes} must be a positive even count "
+        f"(bf16 host window)"
+    )
+    beat = ue_axi_beat_bytes()
+    assert payload_bytes % beat != 0, (
+        f"{label}: payload_bytes={payload_bytes} is already a {beat}-byte beat multiple"
+    )
+
+    payload_elems = payload_bytes // 2
+    pad_elems = off // 2
+    trail_elems = 8
+    used_elems = pad_elems + payload_elems + trail_elems
+    rem = (used_elems * 2) % 64
+    window_elems = used_elems + ((64 - rem) // 2 if rem else 0)
+    align = 4096 if page_align else 64
+    src_base = ue.allocate_tensor_dram(window_elems * 2, align_bytes=align)
+    dst_base = ue.allocate_tensor_dram(window_elems * 2, align_bytes=align)
+    if page_align:
+        assert (src_base & 0xFFF) == 0 and (dst_base & 0xFFF) == 0, (
+            f"{label}: expected 4KB-aligned bases, got src=0x{src_base:x} dst=0x{dst_base:x}"
+        )
+    src = src_base + off
+    dst = dst_base + off
+    geom = _partial_len_geom(off, payload_bytes, beat)
+
+    lead = torch.tensor([1.0, -2.0, 3.0, -4.0], dtype=torch.bfloat16)
+    if pad_elems == 0:
+        lead = lead[:0]
+    elif pad_elems < lead.numel():
+        lead = lead[:pad_elems]
+    elif pad_elems > lead.numel():
+        lead = lead.repeat((pad_elems + lead.numel() - 1) // lead.numel())[:pad_elems]
+    payload = (torch.arange(payload_elems, dtype=torch.float32) + 16).to(torch.bfloat16)
+    trail = (torch.arange(trail_elems, dtype=torch.float32) + 200).to(torch.bfloat16)
+
+    src_window = torch.zeros(window_elems, dtype=torch.bfloat16)
+    if pad_elems:
+        src_window[:pad_elems] = lead
+    src_window[pad_elems:pad_elems + payload_elems] = payload
+    src_window[pad_elems + payload_elems:pad_elems + payload_elems + trail_elems] = trail
+    dst_window = torch.full((window_elems,), 99.0, dtype=torch.bfloat16)
+    if pad_elems:
+        dst_window[:pad_elems] = (lead + 8).to(torch.bfloat16)
+    dst_window[pad_elems + payload_elems:pad_elems + payload_elems + trail_elems] = (
+        (trail + 8).to(torch.bfloat16)
+    )
+
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=src,
+        sram_address=0x00000,
+        element_size=0,
+        memcpy_length_bytes=payload_bytes,
+    )
+    ue.sram_to_accelerator_memory(
+        sram_address=0x00000,
+        accelerator_dram_address=dst,
+        element_size=0,
+        memcpy_length_bytes=payload_bytes,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+
+    ue.dma_to_accelerator_memory(src_base, src_window)
+    ue.dma_to_accelerator_memory(dst_base, dst_window)
+
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+
+    out = ue.dma_from_accelerator_memory(dst_base, (window_elems,))
+    got_lead = out[:pad_elems]
+    got_payload = out[pad_elems:pad_elems + payload_elems]
+    got_trail = out[pad_elems + payload_elems:]
+    if pad_elems:
+        assert torch.equal(got_lead, dst_window[:pad_elems]), (
+            f"{label}: leading canary smashed at dst=0x{dst_base:x} off={off} ({geom})"
+        )
+    assert torch.equal(got_trail, dst_window[pad_elems + payload_elems:]), (
+        f"{label}: trailing canary smashed at dst=0x{dst:x} ({geom})"
+    )
+    snr_db = calculate_snr(payload, got_payload)
+    exp_u = payload.view(torch.uint16)
+    got_u = got_payload.view(torch.uint16)
+    eq = (exp_u == got_u)
+    n_correct = int(eq.to(torch.int8).cumprod(0).sum().item()) if payload_elems else 0
+    n_mism = int((~eq).sum().item())
+    print(
+        f"Reference SNR Analysis for {label}: {snr_db:.2f} dB "
+        f"(src=0x{src:x} dst=0x{dst:x} payload_bytes={payload_bytes} "
+        f"correct_prefix={n_correct}/{payload_elems} mism={n_mism} {geom})"
+    )
+    if not (snr_db >= 40 or snr_db == float("inf")):
+        mism_idx = (~eq).nonzero(as_tuple=False).flatten().tolist()
+        sample = ", ".join(
+            f"[{i}] exp=0x{int(exp_u[i]):04x} got=0x{int(got_u[i]):04x}"
+            for i in mism_idx[:8]
+        )
+        raise AssertionError(
+            f"{label}: SNR {snr_db:.2f} dB must be at least 40 dB "
+            f"(correct_prefix={n_correct}/{payload_elems} mism={n_mism} "
+            f"{geom}; sample: {sample})"
+        )
+    ue.clear_capture_buffer()
+    return snr_db
+
+
+def _iter_partial_length_cases(beat):
+    """Yield (label, off, payload_bytes, page_align) for the extensive matrix.
+
+    Covers every ISA mid-beat offset against every non-beat length through
+    ~3 beats, plus 4KB-boundary and multi-page spans. Lengths that land
+    exactly on a beat multiple are skipped (those belong to the aligned /
+    unaligned full-beat suites).
+    """
+    assert beat % ISA_DRAM_ALIGN_BYTES == 0 and beat >= 16
+
+    def _non_beat_lengths(lo, hi):
+        for nbytes in range(lo, hi + 1, ISA_DRAM_ALIGN_BYTES):
+            if nbytes > 0 and nbytes % beat != 0:
+                yield nbytes
+
+    # Beat-aligned start, non-beat lengths through 3 beats.
+    for nbytes in _non_beat_lengths(8, 3 * beat):
+        yield (f"dram_partial_len_off0_{nbytes}", 0, nbytes, False)
+
+    # Every mid-beat ISA offset × dense lengths through 3 beats.
+    for off in range(ISA_DRAM_ALIGN_BYTES, beat, ISA_DRAM_ALIGN_BYTES):
+        for nbytes in _non_beat_lengths(8, 3 * beat):
+            yield (f"dram_partial_len_off{off}_{nbytes}", off, nbytes, False)
+
+    # Explicit first_rem + second-beat remainders (the rk_256 failure class:
+    # mid-beat start, then a short second beat that is not a full beat).
+    for off in range(ISA_DRAM_ALIGN_BYTES, beat, ISA_DRAM_ALIGN_BYTES):
+        first_rem = beat - (off % beat)
+        for second in range(ISA_DRAM_ALIGN_BYTES, beat, ISA_DRAM_ALIGN_BYTES):
+            nbytes = first_rem + second
+            if nbytes % beat == 0:
+                continue
+            yield (
+                f"dram_partial_len_span_off{off}_fr{first_rem}_sec{second}",
+                off, nbytes, False,
+            )
+        # Cross into a third beat with a short tail.
+        for third in (8, 16, 24):
+            if third % beat == 0:
+                continue
+            nbytes = first_rem + beat + third
+            if nbytes % beat == 0:
+                continue
+            yield (
+                f"dram_partial_len_3beat_off{off}_tail{third}",
+                off, nbytes, False,
+            )
+
+    # Near 4KB page end: every ISA slot in the last beat of the page, and a
+    # few lengths that stop in-page, land on the boundary, or spill over.
+    page = 4096
+    last_beat_base = page - beat
+    for slot in range(0, beat, ISA_DRAM_ALIGN_BYTES):
+        off = last_beat_base + slot
+        in_page = page - off
+        for nbytes in _non_beat_lengths(8, 2 * beat):
+            yield (
+                f"dram_partial_len_4k_off{off:x}_{nbytes}",
+                off, nbytes, True,
+            )
+        # Force a spill of exactly in_page + {8,16,24,40} when that is not a
+        # beat multiple (page-split + partial tail).
+        for extra in (8, 16, 24, 40, 48, 56):
+            nbytes = in_page + extra
+            if nbytes % beat == 0:
+                continue
+            yield (
+                f"dram_partial_len_4k_spill_off{off:x}_{nbytes}",
+                off, nbytes, True,
+            )
+
+
+def dram_partial_length_memcpy_test():
+    """Extensive memcpy matrix: mid-beat starts × non-beat lengths ± 4KB splits.
+
+    Runs the full case list even after individual failures so one HW pass
+    reports the whole failing geometry (prefix length, beat span) instead of
+    stopping at the first assert.
+    """
+    ue = UnifiedEngine()
+    beat = ue_axi_beat_bytes()
+    snrs = []
+    failures = []
+    n_pass = 0
+    n_total = 0
+    seen = set()
+
+    print(f"dram_partial_length_memcpy: beat={beat} B, extensive matrix")
+    for label, off, nbytes, page_align in _iter_partial_length_cases(beat):
+        key = (off, nbytes, page_align)
+        if key in seen:
+            continue
+        seen.add(key)
+        n_total += 1
+        try:
+            snrs.append(_run_partial_length_memcpy_case(
+                ue, label, off=off, payload_bytes=nbytes, page_align=page_align))
+            n_pass += 1
+        except AssertionError as exc:
+            msg = str(exc)
+            failures.append(msg)
+            print(f"FAIL {label}: {msg}")
+
+    print(
+        f"dram_partial_length_memcpy summary: "
+        f"{n_pass}/{n_total} passed, {len(failures)} failed (beat={beat})"
+    )
+    if failures:
+        preview = "\n  ".join(failures[:12])
+        more = "" if len(failures) <= 12 else f"\n  ... and {len(failures) - 12} more"
+        raise AssertionError(
+            f"dram_partial_length_memcpy: {len(failures)}/{n_total} cases failed "
+            f"(beat={beat}):\n  {preview}{more}"
+        )
+    record_test(
+        "dram_partial_length_memcpy",
+        f"beat={beat} off=0..{beat - 8}/4k lens=8..{3 * beat} non-beat",
+        snr_db=min(snrs) if snrs else float("inf"),
+    )
+    ue.reset_tensor_dram_addr()
+
+
+def _run_unaligned_speed_case(ue, label, *, off, page_align=False):
+    """Same URAM-near-full transfer as dram_read_write_speed_test, unaligned start.
+
+    Host XDMA stays on the aligned allocation; the engine reads/writes ``base+off``.
+    Payload is deterministic so this does not move the suite RNG stream.
+    """
+    payload_elems = URAM_NEAR_FULL_ELEMENTS
+    assert off % ISA_DRAM_ALIGN_BYTES == 0, f"{label}: off={off} is not ISA 8-byte"
+    beat = ue_axi_beat_bytes()
+    if not page_align:
+        assert off % beat != 0, f"{label}: off={off} is beat-aligned ({beat} B)"
+
+    pad_elems = off // 2
+    trail_elems = 8
+    used_elems = pad_elems + payload_elems + trail_elems
+    rem = (used_elems * 2) % 64
+    window_elems = used_elems + ((64 - rem) // 2 if rem else 0)
+    align = 4096 if page_align else 64
+    src_base = ue.allocate_tensor_dram(window_elems * 2, align_bytes=align)
+    dst_base = ue.allocate_tensor_dram(window_elems * 2, align_bytes=align)
+    if page_align:
+        assert (src_base & 0xFFF) == 0 and (dst_base & 0xFFF) == 0, (
+            f"{label}: expected 4KB-aligned bases, got src=0x{src_base:x} dst=0x{dst_base:x}"
+        )
+    src = src_base + off
+    dst = dst_base + off
+
+    payload = (torch.arange(payload_elems, dtype=torch.float32) + 1).to(torch.bfloat16)
+    src_window = torch.zeros(window_elems, dtype=torch.bfloat16)
+    src_window[pad_elems:pad_elems + payload_elems] = payload
+    dst_window = torch.full((window_elems,), 99.0, dtype=torch.bfloat16)
+
+    ue.dma_to_accelerator_memory(src_base, src_window)
+    ue.dma_to_accelerator_memory(dst_base, dst_window)
+
+    ue.start_capture()
+    ue.accelerator_memory_to_sram(
+        accelerator_dram_address=src,
+        sram_address=0x00000,
+        element_size=payload_elems,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+    latency_us = ue.report_latency_in_us()
+    assert latency_us > 0, f"{label}: read latency_us={latency_us}"
+    read_mbps = payload_elems * 2 / latency_us
+    print(f"{label} Read Speed: {read_mbps:.2f} MB/s "
+          f"(src=0x{src:x} elements={payload_elems})")
+    record_test(
+        f"dram_unaligned_read_speed_{label}",
+        f"off={off:#x} elements={payload_elems}",
+        mb_per_s=read_mbps,
+    )
+    ue.clear_capture_buffer()
+
+    ue.start_capture()
+    ue.sram_to_accelerator_memory(
+        sram_address=0x00000,
+        accelerator_dram_address=dst,
+        element_size=payload_elems,
+    )
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(10.0)
+    ue.report_timing_and_instruction_count()
+    latency_us = ue.report_latency_in_us()
+    assert latency_us > 0, f"{label}: write latency_us={latency_us}"
+    write_mbps = payload_elems * 2 / latency_us
+    print(f"{label} Write Speed: {write_mbps:.2f} MB/s "
+          f"(dst=0x{dst:x} elements={payload_elems})")
+
+    out = ue.dma_from_accelerator_memory(dst_base, (window_elems,))
+    got_lead = out[:pad_elems]
+    got_payload = out[pad_elems:pad_elems + payload_elems]
+    got_trail = out[pad_elems + payload_elems:]
+    assert torch.equal(got_lead, dst_window[:pad_elems]), (
+        f"{label}: leading canary smashed at dst=0x{dst_base:x} off={off}"
+    )
+    assert torch.equal(got_trail, dst_window[pad_elems + payload_elems:]), (
+        f"{label}: trailing canary smashed at dst=0x{dst:x}"
+    )
+    snr_db = calculate_snr(payload, got_payload)
+    print(f"Reference SNR Analysis for {label}: {snr_db:.2f} dB")
+    assert snr_db >= 40 or snr_db == float("inf"), (
+        f"{label}: SNR {snr_db:.2f} dB must be at least 40 dB"
+    )
+    record_test(
+        f"dram_unaligned_write_speed_{label}",
+        f"off={off:#x} elements={payload_elems}",
+        snr_db=snr_db,
+        mb_per_s=write_mbps,
+    )
+    ue.clear_capture_buffer()
+
+
+def dram_unaligned_read_write_speed_test():
+    """DRAM read/write bandwidth at ISA 8-byte starts that are not AXI-beat aligned."""
+    ue = UnifiedEngine()
+    _run_unaligned_speed_case(ue, "off8", off=8)
+    _run_unaligned_speed_case(ue, "off16", off=16)
+    _run_unaligned_speed_case(ue, "off4k", off=0xFF8, page_align=True)
+    ue.reset_tensor_dram_addr()
+
+
+# ==============================================================================================
+# DRAM arbitrary / unaligned access suite (formerly pcie_utils/dram_unaligned_access_test.py)
+# ==============================================================================================
+# Scope
+#     What the engine can do now that DRAM addresses need only be 8-byte aligned and DMA lengths
+#     need not be whole AXI beats, and what is still NOT possible. Groundwork for removing the
+#     64-lane padding of pi05 (SigLIP, head_dim 72) and Qwen2.5-Omni (vision, head_dim 80).
+#
+# Groups (run order)
+#     page_split            DMA writes (strided and contiguous) that straddle a 4 KB page edge.
+#     strip_writeback       Q/K/V projection as ONE matmul over all heads; each head's real lanes
+#                           written at the start of its own aligned slot (strip_cols / strip_out_stride).
+#     unpadded_n            MLP projections at their real N (4304, 3420, 72): no zero pad rows.
+#     attention_output      attention P.V written compact + the O projection over K = NH*v_dim.
+#     strided_write_window  strided-write repro group.
+#     operand_offsets       stress: A, B, scale, bias, out each at an unaligned start address.
+#
+# Not covered on purpose: K (the contraction length) must stay a multiple of 64.
+#
+# How to run
+#     python3 user_hw_test.py --dev xdma0                                  # part of the full suite
+#     python3 user_hw_test.py --dev xdma0 --tests dram_unaligned_access     # only this suite
+#     python3 user_hw_test.py --dev xdma0 --tests dram_unaligned_access --dua-groups strip_writeback
+#     python3 user_hw_test.py --dev xdma0 --tests dram_unaligned_access --dua-groups page_split:contig_144B --dua-full
+#     python3 user_hw_test.py --dua-list                                   # list groups / labels, no board
+#
+# Behaviour
+#     * Every case is a literal tuple (M, K, N, byte offsets); a run prints each case's absolute
+#       DRAM addresses and their phase (address % beat) as "[dua]" lines.
+#     * Every case runs no matter what. The suite asserts only at the end (assert_passed).
+#     * A hang (engine queue still busy after the timeout) stops the run at once.
+#     * The whole suite is ONE entry in the user_hw_test summary.
+
+_DUA_OPTIONS = {"groups": None, "only": None, "full": False, "mask_known": True}
+
+# ==============================================================================================
+# 1. Framework: result store, aligned regions, quantizer twin, program runner, case wrapper
+# ==============================================================================================
+_CANARY = 0xA5
+_QUANTIZER_CHECKED = False
+QUEUE_TIMEOUT_S = 60.0
+RESULTS = []          # one row per tuple entry: (group, label, dims, status, detail, snr, xfail_reason)
+SUB_RESULTS = {}    # head-projection label -> per-slice rows, shown under a failing entry
+_LAST_SNR = [None]
+
+
+class _Hang(Exception):
+    """The engine queue was still busy after the timeout: stop, do not touch the board again."""
+
+
+class _Stop(Exception):
+    """Raised after a hang to abandon every remaining case."""
+
+
+_PAGE_ALIGNED_BASE = 0xFF8     # offset marker: base is 4 KB aligned, chunk starts 8 B before the page edge
+
+
+# ---- helpers ----------------------------------------------------------------------------------
+def _u8(t: torch.Tensor) -> torch.Tensor:
+    return t.contiguous().view(torch.uint8).flatten().clone()
+
+
+def _read_bytes(ue, addr: int, nbytes: int) -> torch.Tensor:
+    """Raw DRAM bytes. dma_read widens to the buffer dtype, so read as bf16 and re-view."""
+    assert nbytes % 2 == 0, f"nbytes={nbytes} must be even"
+    buf = torch.zeros(nbytes // 2, dtype=torch.bfloat16)
+    ue.dma_read(DMA_DEVICE_C2H, addr, buf, nbytes)
+    return buf.view(torch.uint8).clone()
+
+
+def _select(cases, only):
+    """Cases whose label contains ``only`` (all of them when ``only`` is None)."""
+    picked = [c for c in cases if only is None or only in c[0]]
+    assert picked, f"no case label contains {only!r}"
+    return picked
+
+
+def _phase(addr: int) -> int:
+    return addr % ue_axi_beat_bytes()
+
+
+class _Region:
+    """``payload`` placed at ``base + off`` inside a canary-filled, 64 B-multiple host window.
+
+    Host XDMA always touches the aligned ``base``; only the engine uses ``addr``.
+    ``off == 0xFF8`` means a 4 KB-aligned base (the chunk then starts 8 B before a page edge).
+    """
+
+    def __init__(self, ue, name: str, payload_u8: torch.Tensor, off: int, align: int = 64):
+        assert off % ISA_DRAM_ALIGN_BYTES == 0, f"off={off} is not ISA 8-byte"
+        self.ue, self.name, self.off = ue, name, off
+        self.n = int(payload_u8.numel())
+        self.win = ((off + self.n + 64) + 63) // 64 * 64
+        self.base = ue.allocate_tensor_dram(
+            self.win, align_bytes=4096 if off == _PAGE_ALIGNED_BASE else align)
+        self.addr = self.base + off
+        self.host = torch.full((self.win,), _CANARY, dtype=torch.uint8)
+        self.host[off:off + self.n] = payload_u8
+        ue.dma_write(DMA_DEVICE_H2C, self.base, self.host, self.win)
+
+    def describe(self) -> str:
+        return (f"{self.name:<6} addr=0x{self.addr:09x}  base=0x{self.base:09x} + {self.off:<5}"
+                f" phase={_phase(self.addr):<2} bytes={self.n}")
+
+    def payload_after_run(self, label: str) -> torch.Tensor:
+        got = _read_bytes(self.ue, self.base, self.win)
+        tail = self.off + self.n
+        assert torch.equal(got[:self.off], self.host[:self.off]), (
+            f"{label}: leading canary smashed (base=0x{self.base:x} off={self.off})")
+        assert torch.equal(got[tail:], self.host[tail:]), (
+            f"{label}: trailing canary smashed (addr=0x{self.addr:x} bytes={self.n})")
+        return got[self.off:tail].clone()
+
+
+def _print_case(label: str, dims: str, regions) -> None:
+    print(f"[dua] CASE {label}: {dims}")
+    for r in regions:
+        print(f"[dua]   {r.describe()}")
+
+
+def _quantize_if4_int(w: torch.Tensor):
+    """Vectorised twin of ``UnifiedEngine.quantize_weight`` (IF4, INT variant).
+
+    Needed because the stock helper rejects N % 64 != 0 (4304, 3420, 72) even
+    though only K blocks matter: rows are contiguous and every 64-element scale
+    block lies inside one row. Returns (packed_bytes, scale_bytes, dequantized).
+    """
+    n, k = w.shape
+    assert k % UE_VECTOR_SIZE == 0, f"K={k} must be a multiple of {UE_VECTOR_SIZE}"
+    blocks = w.reshape(-1, UE_VECTOR_SIZE)
+    max_abs = blocks.abs().amax(dim=1)
+    scale = torch.where(max_abs == 0, torch.ones_like(max_abs),
+                        max_abs / torch.tensor(7.0, dtype=torch.bfloat16))
+    q = torch.round(blocks / scale.unsqueeze(1)).clamp(-8, 7).to(torch.int8)
+    pairs = q.reshape(-1, 2).to(torch.int32)
+    packed = (((pairs[:, 1] & 0xF) << 4) | (pairs[:, 0] & 0xF)).to(torch.uint8)
+    scale_bytes = _u8(-scale)                       # negative scale == INT variant
+    eff = (q.float() * scale.float().unsqueeze(1)).to(torch.bfloat16).reshape(n, k)
+    return packed, scale_bytes, eff
+
+
+def _check_quantizer(ue) -> None:
+    """The padding-free tests rely on _quantize_if4_int == the stock quantizer."""
+    global _QUANTIZER_CHECKED
+    if _QUANTIZER_CHECKED:
+        return
+    w = (torch.randn(64, 128) * 0.3).to(torch.bfloat16)
+    packed, scale_bytes, eff = _quantize_if4_int(w)
+    d_addr, s_addr = ue.quantize_weight(w, 64, 128, TYPE.IF4, int_variant=True)
+    got_d = _read_bytes(ue, d_addr, packed.numel())
+    got_s = _read_bytes(ue, s_addr, scale_bytes.numel())
+    assert torch.equal(got_d, packed), "pad_free quantizer: packed IF4 bytes differ from stock"
+    assert torch.equal(got_s, scale_bytes), "pad_free quantizer: scale bytes differ from stock"
+    sim = ue.quantize_weight_simulate(w, TYPE.IF4, int_variant=True)
+    assert torch.equal(sim, eff), "pad_free quantizer: dequantized values differ from simulate"
+    _QUANTIZER_CHECKED = True
+
+
+def _run(ue, build):
+    """Capture ``build()``, append HALT, execute from DRAM, return (flops, inst_bytes)."""
+    ue.start_capture()
+    flops = build()
+    ue.stop_capture()
+    ue.generate_instruction_halt()
+    program_dram_addr = ue.get_program_dram_addr()
+    ue.write_captured_instructions_to_dram(program_dram_addr)
+    inst_bytes = ue.get_capture_instruction_size_bytes()
+    ue.allocate_program_dram(inst_bytes)
+    ue.start_execute_from_dram(program_dram_addr)
+    ue.wait_queue(QUEUE_TIMEOUT_S)
+    if ue.is_queue_busy():
+        raise _Hang(f"queue still busy after {QUEUE_TIMEOUT_S:.0f} s")
+    ue.report_timing_and_instruction_count()
+    ue.clear_capture_buffer()
+    ue.reset_isa_reg_counter()
+    return flops, inst_bytes
+
+
+def _assert_snr(label: str, ref: torch.Tensor, got: torch.Tensor, threshold: float = 40.0) -> float:
+    snr = calculate_snr(ref, got)
+    _LAST_SNR[0] = snr
+    print(f"Reference SNR Analysis for {label}: {snr:.2f} dB")
+    assert snr >= threshold or snr == float("inf"), (
+        f"{label}: SNR {snr:.2f} dB must be at least {threshold} dB")
+    return snr
+
+
+_MASK = [True]      # False (--no-mask): ignore the xfail marks, report known failures as plain FAIL
+_GOOD = ("PASS", "XFAIL", "XPASS")
+
+
+def _case(ue, group: str, label: str, dims: str, fn, xfail=None) -> None:
+    """Run ONE tuple entry and record PASS / FAIL / HANG / ERROR / XFAIL / XPASS. A HANG stops the suite.
+
+    ``xfail`` = reason text of a KNOWN failure (a tracked hardware bug): the entry then reports XFAIL when it fails
+    (expected, the suite still passes) or XPASS when it unexpectedly passes (the mark can be removed).
+    """
+    xfail = xfail if _MASK[0] else None
+    _LAST_SNR[0] = None
+    status, detail = "PASS", ""
+    try:
+        fn()
+    except _Hang as e:
+        status, detail = "HANG", str(e)
+    except AssertionError as e:
+        status, detail = "FAIL", str(e).split("\n")[0][:160]
+    except Exception as e:                                     # noqa: BLE001 - report, keep going
+        status, detail = "ERROR", f"{type(e).__name__}: {str(e)[:120]}"
+    finally:
+        if ue is not None and status != "HANG":
+            ue.reset_tensor_dram_addr()
+            ue.reset_isa_reg_counter()
+    if xfail and status == "FAIL":
+        status = "XFAIL"
+    elif xfail and status == "PASS":
+        status = "XPASS"
+    snr = _LAST_SNR[0]
+    snr_txt = "" if snr is None else ("inf dB" if snr == float("inf") else f"{snr:.2f} dB")
+    shown = snr_txt if status in ("PASS", "FAIL", "XPASS") and snr_txt else detail
+    RESULTS.append((group, label, dims, status, shown, snr, xfail))
+    print(f"[dua] RESULT {group} {label}: {status} {shown if status != 'PASS' or snr_txt else ''}".rstrip())
+    if status == "HANG":
+        raise _Stop(f"{group}/{label} hung the engine; no further cases are run")
+
+class SuiteResult:
+    """Outcome of one suite run. Nothing is asserted until assert_passed() is called."""
+
+    def __init__(self, rows, not_run, stopped):
+        self.rows, self.not_run, self.stopped = list(rows), list(not_run), stopped
+
+    def count(self, status: str) -> int:
+        return sum(1 for r in self.rows if r[3] == status) + (len(self.not_run) if status == "NOT RUN" else 0)
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.rows) and all(r[3] in _GOOD for r in self.rows) and not self.not_run
+
+    @property
+    def min_snr(self) -> float:
+        snrs = [r[5] for r in self.rows if r[3] == "PASS" and r[5] is not None]
+        return min(snrs) if snrs else float("inf")
+
+    def summary_text(self) -> str:
+        groups = len({r[0] for r in self.rows})
+        text = f"{len(self.rows)} entries in {groups} groups: {self.count('PASS')} pass"
+        for status, word in (("XFAIL", "xfail (known hw bug)"), ("XPASS", "xpass (remove mark)"),
+                             ("FAIL", "fail"), ("HANG", "hang"), ("ERROR", "error"), ("NOT RUN", "not run")):
+            if self.count(status):
+                text += f", {self.count(status)} {word}"
+        return text
+
+    def assert_passed(self) -> None:
+        bad = [f"{r[0]}/{r[1]} ({r[3]}: {r[4]})" for r in self.rows if r[3] not in _GOOD]
+        bad += [f"{g}/{l} (NOT RUN)" for (g, l, _d) in self.not_run]
+        assert not bad, (
+            f"dram_unaligned_access: {len(bad)} of {len(self.rows) + len(self.not_run)} entries did not pass:\n  "
+            + "\n  ".join(bad[:20]) + ("" if len(bad) <= 20 else f"\n  ... and {len(bad) - 20} more")
+            + (f"\n  {self.stopped}" if self.stopped else ""))
+
+
+def _print_results(result: "SuiteResult", full: bool = False) -> None:
+    """One block per run: a line per group, then every entry that did not pass (all of them with full=True)."""
+    rows = result.rows + [(g, l, d, "NOT RUN", "", None, None) for (g, l, d) in result.not_run]
+    print("\n" + "=" * 118)
+    print("DRAM UNALIGNED ACCESS RESULTS  " + "  ".join(
+        f"{k}={result.count(k)}" for k in
+        ("PASS", "XFAIL", "XPASS", "FAIL", "HANG", "ERROR", "NOT RUN")))
+    print("=" * 118)
+    groups = list(dict.fromkeys(r[0] for r in rows))
+    for g in groups:
+        gr = [r for r in rows if r[0] == g]
+        n_ok = sum(1 for r in gr if r[3] == "PASS")
+        extra = "".join(f", {sum(1 for r in gr if r[3] == k)} {k.lower()}" for k in
+                        ("XFAIL", "XPASS", "FAIL", "HANG", "ERROR", "NOT RUN")
+                        if any(r[3] == k for r in gr))
+        print(f"  {g:<18} {n_ok}/{len(gr)} pass{extra}")
+    shown = rows if full else [r for r in rows if r[3] != "PASS"]
+    if shown:
+        print("-" * 118)
+        print(f"{'status':<8} {'group':<18} {'label':<34} {'detail':<26} dims / offsets")
+    for (group, label, dims, status, detail, _snr, reason) in shown:
+        print(f"{status:<8} {group:<18} {label:<34} {detail[:26]:<26} {dims}")
+        if reason and status in ("XFAIL", "XPASS"):
+            print(f"           known issue: {reason}")
+        if status == "FAIL" and label in SUB_RESULTS:
+            for (i, h, n0, nn, snr, ph, ok) in SUB_RESULTS[label]:
+                if not ok:
+                    print(f"           slice {i:<3} head {h:<3} n0={n0:<5} N={nn:<3} phases={ph}  SNR {snr:.2f} dB  FAIL")
+    print("=" * 118)
+
+
+# ==============================================================================================
+# 2. page_split: DMA writes that straddle a 4 KB page edge (PR #1344)
+# ==============================================================================================
+# The destination base is 4 KB aligned; `start` is the first byte's offset inside the page, so a transfer of
+# `size` bytes ends (start + size - 4096) bytes into the NEXT page. Before the RTL fix, the entries marked
+# (was FAIL) returned wrong data: a strided chunk ending 8-24 B past the edge slipped the SRAM pointer for all
+# later rows; a contiguous 144 B write at 4000-4024 and a 160 B write at 4024 lost bytes 128 and up.
+#   kind "stride": strided SRAM->DRAM write of `rows` chunks of `size` B (one 128 B SRAM row), `jump` B apart
+#   kind "contig": ONE contiguous SRAM->DRAM write of `size` B (`jump` and `rows` unused)
+#   (label,                        kind,     start,  size, jump, rows)
+PAGE_SPLIT_CASES = (
+    ("stride_chunk128_start3968", "stride",  3968,   128,  256,    8),   # ends exactly at the edge
+    ("stride_chunk128_start3976", "stride",  3976,   128,  256,    8),   # spills 8 B   (was FAIL)
+    ("stride_chunk128_start3984", "stride",  3984,   128,  256,    8),   # spills 16 B  (was FAIL)
+    ("stride_chunk128_start3992", "stride",  3992,   128,  256,    8),   # spills 24 B  (was FAIL)
+    ("stride_chunk128_start4000", "stride",  4000,   128,  256,    8),   # spills 32 B
+    ("stride_chunk128_start4088", "stride",  4088,   128,  256,    8),   # spills 120 B
+    ("contig_144B_start3992",     "contig",  3992,   144,    0,    1),   # spills 40 B
+    ("contig_144B_start4000",     "contig",  4000,   144,    0,    1),   # spills 48 B  (was FAIL)
+    ("contig_144B_start4008",     "contig",  4008,   144,    0,    1),   # spills 56 B  (was FAIL)
+    ("contig_144B_start4016",     "contig",  4016,   144,    0,    1),   # spills 64 B  (was FAIL)
+    ("contig_144B_start4024",     "contig",  4024,   144,    0,    1),   # spills 72 B  (was FAIL)
+    ("contig_144B_start4032",     "contig",  4032,   144,    0,    1),   # spills 80 B
+    ("contig_160B_start4024",     "contig",  4024,   160,    0,    1),   # spills 88 B  (was FAIL)
+    ("contig_160B_start4032",     "contig",  4032,   160,    0,    1),   # spills 96 B
+    ("contig_80B_start4024",      "contig",  4024,    80,    0,    1),   # spills 8 B
+    ("contig_80B_start4088",      "contig",  4088,    80,    0,    1),   # spills 72 B
+)
+
+
+def _page_split_case(ue, case):
+    label, kind, start, size, jump, rows = case
+    n_rows = rows if kind == "stride" else 1
+    spill = max(0, start + size - 4096)
+    assert kind != "stride" or size == 128, f"{label}: a strided chunk here is one 128 B SRAM row"
+    n_src = n_rows * size
+    src_bytes = torch.arange(n_src // 2, dtype=torch.int32).to(torch.int16).view(torch.uint8)[:n_src].clone()
+    dst_span = (n_rows - 1) * jump + size if kind == "stride" else size
+    src = _Region(ue, "SRC", src_bytes, 0, align=4096)
+    dst = _Region(ue, "DST", torch.full((dst_span,), _CANARY, dtype=torch.uint8), start, align=4096)
+    what = (f"strided write, {rows} chunks of {size} B, jump {jump} B" if kind == "stride"
+            else f"contiguous write of {size} B")
+    _print_case(label, f"{what}, page offset {start}, ends {spill} B past the 4 KB edge", [src, dst])
+    elems = n_src // 2
+
+    def build():
+        ue.accelerator_memory_to_sram(accelerator_dram_address=src.addr, sram_address=0x00000,
+                                      element_size=elems, memcpy_length_bytes=n_src)
+        if kind == "stride":
+            ue.sram_to_accelerator_memory(sram_address=0x00000, accelerator_dram_address=dst.addr,
+                                          element_size=elems, stride_bytes_per_chunk=size,
+                                          stride_jump_bytes=jump)
+        else:
+            ue.sram_to_accelerator_memory(sram_address=0x00000, accelerator_dram_address=dst.addr,
+                                          element_size=elems, memcpy_length_bytes=size)
+        return 0
+
+    _run(ue, build)
+    got = dst.payload_after_run(label)                      # also checks the bytes around the buffer
+    expect = torch.full((dst_span,), _CANARY, dtype=torch.uint8)
+    for r in range(n_rows):
+        expect[r * jump:r * jump + size] = src_bytes[r * size:(r + 1) * size]
+    wrong = (got != expect).nonzero().flatten().tolist()
+    if wrong:
+        first = wrong[0]
+        where = f"row {first // jump} byte {first % jump}" if kind == "stride" else f"byte {first}"
+        bad_rows = sorted({w // jump for w in wrong}) if kind == "stride" else []
+        raise AssertionError(
+            f"{label}: {len(wrong)} wrong bytes, first at {where}"
+            + (f", rows {bad_rows[:8]}{'...' if len(bad_rows) > 8 else ''} affected" if bad_rows else ""))
+    _LAST_SNR[0] = float("inf")
+
+
+def run_page_split(only=None):
+    """DMA writes that straddle a 4 KB page edge, strided or contiguous."""
+    ue = UnifiedEngine()
+    for case in _select(PAGE_SPLIT_CASES, only):
+        label, kind, start, size, jump, rows = case
+        dims = (f"{rows} x {size} B chunks, jump {jump} B" if kind == "stride" else f"{size} B") \
+            + f", page offset {start}"
+        _case(ue, "page_split", label, f"{kind}: {dims}", lambda c=case: _page_split_case(ue, c))
+
+
+# ==============================================================================================
+# 3. strip_writeback: Q/K/V projection as one matmul, strided column write-back
+# ==============================================================================================
+# ---- 2b. single-shot projection: ONE matmul over all heads, strided column write-back ---------
+# matmat_mul_core(..., strip_cols=W, strip_out_stride=P): N_total/W strips of W columns each, strip s
+# is written at output columns s*P .. s*P+W-1. Weight / scale / bias are read as consecutive rows.
+#   (label,                        M,    K, N_total,  W,   P, out_cols, base_offsets(A,W,SCALE,BIAS,OUT))
+#   out_cols = (N_total / W) * P is the output row length in elements.
+STRIP_WRITEBACK_CASES = (
+    ("pi05_N72x16_into_slot128",   256, 1152,   1152, 72, 128,     2048, (0, 0, 0, 0, 0)),
+    ("pi05_N72x16_compact",        256, 1152,   1152, 72,  72,     1152, (0, 0, 0, 0, 0)),
+    ("qwen_V_N80x16_into_slot128", 192, 1280,   1280, 80, 128,     2048, (0, 0, 0, 0, 0)),
+    ("qwen_QK_N40x32_stride64",    192, 1280,   1280, 40,  64,     2048, (0, 0, 0, 0, 0)),
+)
+
+# ---- 2b. single-shot projection -----------------------------------------------------------------
+def _single_shot_case(ue, case):
+    label, m, k, n_total, w_cols, p_stride, out_cols, base_offs = case
+    assert n_total % w_cols == 0 and out_cols == (n_total // w_cols) * p_stride, (
+        f"{label}: out_cols={out_cols} must equal (N_total/W)*P = {(n_total // w_cols) * p_stride}")
+    n_strips = n_total // w_cols
+    off_a, off_w, off_s, off_c, off_o = base_offs
+    x = torch.randn(m, k).to(torch.bfloat16)
+    w = (torch.randn(n_total, k) * 0.05).to(torch.bfloat16)
+    c = (torch.randn(n_total) * 0.1).to(torch.bfloat16)
+    packed, scale_bytes, w_eff = _quantize_if4_int(w)
+    a_reg = _Region(ue, "A", _u8(x), off_a)
+    w_reg = _Region(ue, "W", packed, off_w)
+    s_reg = _Region(ue, "SCALE", scale_bytes, off_s)
+    c_reg = _Region(ue, "BIAS", _u8(c), off_c)
+    out_reg = _Region(
+        ue, "OUT", torch.full((m * out_cols * 2,), _CANARY, dtype=torch.uint8), off_o)
+    _print_case(label, f"M={m} K={k} N_total={n_total} -> {n_strips} strips of W={w_cols} "
+                          f"written at stride P={p_stride}; out_row_cols={out_cols}",
+                   [a_reg, w_reg, s_reg, c_reg, out_reg])
+    print("[dua]   strip  n0    N   W_addr         SCALE_addr     BIAS_addr      OUT_addr      "
+          "phases(W/S/BIAS/OUT)")
+    for s_i in range(n_strips):
+        n0 = s_i * w_cols
+        addrs = (w_reg.addr + n0 * (k // 2), s_reg.addr + n0 * (k // UE_VECTOR_SIZE) * 2,
+                 c_reg.addr + n0 * 2, out_reg.addr + s_i * p_stride * 2)
+        print(f"[dua]   {s_i:<6} {n0:<5} {w_cols:<3} " + " ".join(f"0x{a:010x}" for a in addrs)
+              + "  " + "/".join(str(_phase(a)) for a in addrs))
+    m_reg = ue.alloc_isa_reg()
+    stride_reg = ue.alloc_isa_reg()
+
+    def build():
+        ue.generate_instruction_add_set(m_reg, m)
+        ue.generate_instruction_add_set(stride_reg, out_cols)           # output row stride, ELEMENTS
+        return ue.matmat_mul_core(
+            M=m, K=k, N=n_total, A_DRAM_ADDR=a_reg.addr, B_DRAM_ADDR=w_reg.addr,
+            OUTPUT_DRAM_ADDR=out_reg.addr, is_B_quantized=True, data_type=TYPE.IF4,
+            SCALE_DRAM_ADDR=s_reg.addr, C_DRAM_ADDR=c_reg.addr, bias_mode="broadcast_N",
+            gpr_M_reg=m_reg, gpr_out_row_stride_reg=stride_reg,
+            strip_cols=w_cols, strip_out_stride=p_stride) or 0
+
+    _flops, inst_bytes = _run(ue, build)
+    raw = out_reg.payload_after_run(label)
+    got = raw.view(torch.bfloat16).reshape(m, out_cols)
+    ref = x.float() @ w_eff.float().T + c.float()
+    slice_rows, written = [], torch.zeros(out_cols, dtype=torch.bool)
+    got_real, ref_real = [], []
+    for s_i in range(n_strips):
+        n0, col = s_i * w_cols, s_i * p_stride
+        written[col:col + w_cols] = True
+        sl_snr = calculate_snr(ref[:, n0:n0 + w_cols].to(torch.bfloat16), got[:, col:col + w_cols])
+        phases = "/".join(str(_phase(b + o)) for b, o in (
+            (w_reg.addr, n0 * (k // 2)), (s_reg.addr, n0 * (k // UE_VECTOR_SIZE) * 2),
+            (c_reg.addr, n0 * 2), (out_reg.addr, col * 2)))
+        slice_rows.append((s_i, s_i, n0, w_cols, sl_snr, phases,
+                           sl_snr >= 40.0 or sl_snr == float("inf")))
+        got_real.append(got[:, col:col + w_cols])
+        ref_real.append(ref[:, n0:n0 + w_cols])
+    SUB_RESULTS[label] = slice_rows
+    n_bad = sum(1 for r in slice_rows if not r[6])
+    print(f"[dua]   per-strip: {n_strips - n_bad}/{n_strips} strips >= 40 dB"
+          + ("" if not n_bad else "; failing strips: "
+             + ", ".join(f"#{r[0]}({r[4]:.1f} dB)" for r in slice_rows if not r[6])))
+    snr = _assert_snr(label, torch.cat(ref_real, dim=1).to(torch.bfloat16),
+                         torch.cat(got_real, dim=1))
+    assert n_bad == 0, f"{label}: {n_bad}/{n_strips} strips below 40 dB"
+    assert bool((raw.reshape(m, out_cols * 2)[:, (~written).repeat_interleave(2)] == _CANARY).all()), (
+        f"{label}: columns between the strips were written (gap lanes not preserved)")
+    ue.reset_tensor_dram_addr()
+
+
+def run_strip_writeback(only=None):
+    """The head projection as ONE matmul over all heads with strided column write-back."""
+    ue = UnifiedEngine()
+    _check_quantizer(ue)
+    for case in _select(STRIP_WRITEBACK_CASES, only):
+        label, m, k, n_total, w_cols, p_stride, out_cols, base_offs = case
+        _case(ue, "strip_writeback", label,
+                 f"M={m} K={k} N_total={n_total} W={w_cols} P={p_stride} out_cols={out_cols} "
+                 f"base_offsets(A,W,SCALE,BIAS,OUT)={base_offs}",
+                 lambda c=case: _single_shot_case(ue, c))
+
+
+
+# ==============================================================================================
+# 4. unpadded_n: MLP projections at their real N
+# ==============================================================================================
+# ---- 3. N that is not a multiple of 64 ------------------------------------------------------
+#   (label,                          M,   K,    N,  gelu, A_off, B_off, SCALE_off, BIAS_off, OUT_off)
+UNPADDED_N_CASES = (
+    ("pi05_fc1_N4304",              256, 1152, 4304, True,     0,     8,         8,        8,       8),
+    ("qwen_vis_gate_N3420",         192, 1280, 3420, False,    0,     8,         8,        8,       8),
+    ("pi05_head_N72",               256, 1152,   72, False,    0,     8,         8,        8,       8),
+)
+
+# ---- 3. N not a multiple of 64 ------------------------------------------------------------------
+def _fused_n_case(ue, case):
+    label, m, k, n, gelu, off_a, off_b, off_s, off_c, off_o = case
+    x = torch.randn(m, k).to(torch.bfloat16)
+    w = (torch.randn(n, k) * 0.05).to(torch.bfloat16)
+    c = (torch.randn(n) * 0.1).to(torch.bfloat16)
+    packed, scale_bytes, w_eff = _quantize_if4_int(w)
+    a_reg = _Region(ue, "A", _u8(x), off_a)
+    b_reg = _Region(ue, "B", packed, off_b)
+    s_reg = _Region(ue, "SCALE", scale_bytes, off_s)
+    c_reg = _Region(ue, "BIAS", _u8(c), off_c)
+    out_reg = _Region(ue, "OUT", torch.full((m * n * 2,), _CANARY, dtype=torch.uint8), off_o)
+    _print_case(label, f"M={m} K={k} N={n} gelu={gelu} out_row_bytes={n * 2}",
+                   [a_reg, b_reg, s_reg, c_reg, out_reg])
+    m_reg = ue.alloc_isa_reg()
+
+    def build():
+        ue.generate_instruction_add_set(m_reg, m)
+        return ue.matmat_mul_core(
+            M=m, K=k, N=n, A_DRAM_ADDR=a_reg.addr, B_DRAM_ADDR=b_reg.addr,
+            OUTPUT_DRAM_ADDR=out_reg.addr, is_B_quantized=True, data_type=TYPE.IF4,
+            SCALE_DRAM_ADDR=s_reg.addr, C_DRAM_ADDR=c_reg.addr, bias_mode="broadcast_N",
+            gelu_enable=gelu, gpr_M_reg=m_reg)
+
+    _flops, inst_bytes = _run(ue, build)
+    got = out_reg.payload_after_run(label).view(torch.bfloat16).reshape(m, n)
+    ref = x.float() @ w_eff.float().T + c.float()
+    if gelu:
+        ref = ref * torch.sigmoid(1.702 * ref)
+    snr = _assert_snr(label, ref.to(torch.bfloat16), got)
+    ue.reset_tensor_dram_addr()
+
+
+def run_unpadded_n(only=None):
+    """Output widths that previously needed padding: 4304->4352, 3420->3456, 72->128."""
+    ue = UnifiedEngine()
+    _check_quantizer(ue)
+    for case in _select(UNPADDED_N_CASES, only):
+        label, m, k, n, gelu, off_a, off_b, off_s, off_c, off_o = case
+        _case(ue, "unpadded_n", label,
+                 f"M={m} K={k} N={n} gelu={gelu} | offsets A={off_a} B={off_b} SCALE={off_s} "
+                 f"BIAS={off_c} OUT={off_o}",
+                 lambda c=case: _fused_n_case(ue, c))
+
+
+
+# ==============================================================================================
+# 5. attention_output: P.V written at a row pitch (N = real head width), then the O projection
+# ==============================================================================================
+# The P.V product of NH heads (one dynamic matmul per head: M=S, K=S, N=v_dim) is written with a runtime row
+# stride (gpr_out_row_stride_reg): head h goes to column h*v_dim of a [S, pitch] buffer, so the heads sit side by
+# side with NO pad lanes between them (pitch = NH*v_dim). The O projection then contracts over K = pitch.
+# Softmax probabilities P and V^T come from the host: only the matmul + strided write-back is under test.
+# v_dim=80 (pad lanes written as zeros, pitch 1280) and v_dim=72 (real width, pitch 1152) are both run.
+#   (label,                 S,  NH,  D, v_dim, pitch, hidden)
+ATTENTION_CASES = (
+    ("attn_pv_N80_pitch1280", 256, 16, 72,    80,  1280,   1152),
+    ("attn_pv_N72_pitch1152", 256, 16, 72,    72,  1152,   1152),
+)
+
+
+def _attn_case(ue, case):
+    label, seq, nh, d, v_dim, pitch, hidden = case
+    assert pitch == nh * v_dim, f"{label}: pitch={pitch} must equal NH*v_dim={nh * v_dim}"
+    # P: row-stochastic [NH, S, S]. V^T: [NH, v_dim, S], real rows [0, D), rows [D, v_dim) zero (the B operand is N x K).
+    p = torch.softmax(torch.randn(nh, seq, seq) * 0.5, dim=-1).to(torch.bfloat16)
+    v = (torch.randn(nh, seq, d)).to(torch.bfloat16)
+    v_t = torch.zeros(nh, v_dim, seq, dtype=torch.bfloat16)
+    v_t[:, :d, :] = v.transpose(1, 2)
+    # O projection weight [hidden, pitch]: zero columns on each head's pad lanes (v_dim > D).
+    w_o = torch.zeros(hidden, nh, v_dim)
+    w_o[:, :, :d] = torch.randn(hidden, nh, d) * 0.05
+    w_o = w_o.reshape(hidden, pitch).to(torch.bfloat16)
+    bias = (torch.randn(hidden) * 0.1).to(torch.bfloat16)
+    packed, scale_bytes, w_eff = _quantize_if4_int(w_o)
+
+    p_reg = _Region(ue, "P", _u8(p), 0, align=4096)
+    vt_reg = _Region(ue, "VT", _u8(v_t), 0, align=4096)
+    attn_out = _Region(ue, "ATTN", torch.full((seq * pitch * 2,), _CANARY, dtype=torch.uint8), 0, align=4096)
+    wo_reg = _Region(ue, "W_O", packed, 0, align=4096)
+    so_reg = _Region(ue, "W_O_SC", scale_bytes, 0, align=4096)
+    bo_reg = _Region(ue, "O_BIAS", _u8(bias), 0, align=4096)
+    o_out = _Region(ue, "O_OUT", torch.full((seq * hidden * 2,), _CANARY, dtype=torch.uint8), 0, align=4096)
+    _print_case(label, f"S={seq} NH={nh} D={d} P.V M={seq} K={seq} N={v_dim} row_pitch={pitch} "
+                       f"-> O-proj K={pitch} N={hidden}",
+                [p_reg, vt_reg, attn_out, wo_reg, so_reg, bo_reg, o_out])
+    print("[dua]   head  P.V out_addr    phase  (head h written at byte h*v_dim*2 of each row)")
+    for h in range(nh):
+        a = attn_out.addr + h * v_dim * 2
+        if h < 4 or h == nh - 1:
+            print(f"[dua]   {h:<5} 0x{a:010x}   {_phase(a)}")
+        elif h == 4:
+            print("[dua]   ...")
+    m_reg = ue.alloc_isa_reg()
+    k_reg = ue.alloc_isa_reg()
+    n_reg = ue.alloc_isa_reg()
+    stride_reg = ue.alloc_isa_reg()
+    p_bytes, vt_bytes = seq * seq * 2, v_dim * seq * 2
+
+    def build():
+        flops = 0
+        ue.generate_instruction_add_set(m_reg, seq)
+        ue.generate_instruction_add_set(k_reg, seq)
+        ue.generate_instruction_add_set(n_reg, v_dim)
+        ue.generate_instruction_add_set(stride_reg, pitch)
+        for h in range(nh):
+            flops += ue.matmat_mul_core(
+                M=seq, K=seq, N=v_dim, A_DRAM_ADDR=p_reg.addr + h * p_bytes,
+                B_DRAM_ADDR=vt_reg.addr + h * vt_bytes, OUTPUT_DRAM_ADDR=attn_out.addr + h * v_dim * 2,
+                gpr_M_reg=m_reg, gpr_K_reg=k_reg, gpr_N_reg=n_reg, gpr_out_row_stride_reg=stride_reg) or 0
+        flops += ue.matmat_mul_core(
+            M=seq, K=pitch, N=hidden, A_DRAM_ADDR=attn_out.addr, B_DRAM_ADDR=wo_reg.addr,
+            OUTPUT_DRAM_ADDR=o_out.addr, is_B_quantized=True, data_type=TYPE.IF4,
+            SCALE_DRAM_ADDR=so_reg.addr, C_DRAM_ADDR=bo_reg.addr, bias_mode="broadcast_N",
+            gpr_M_reg=m_reg) or 0
+        return flops
+
+    _flops, inst_bytes = _run(ue, build)
+    got_attn = attn_out.payload_after_run(label).view(torch.bfloat16).reshape(seq, pitch).float()
+    got_o = o_out.payload_after_run(label + "/o_proj").view(torch.bfloat16).reshape(seq, hidden)
+    ref_heads = [(p[h].float() @ v[h].float()) for h in range(nh)]          # [S, D] each
+    rows, pad_ok = [], True
+    for h in range(nh):
+        col = h * v_dim
+        sn = calculate_snr(ref_heads[h].to(torch.bfloat16), got_attn[:, col:col + d])
+        if v_dim > d:
+            pad_ok = pad_ok and bool((got_attn[:, col + d:col + v_dim].abs() <= 1e-3).all())
+        rows.append((h, h, col, v_dim, sn, str(_phase(attn_out.addr + col * 2)),
+                     sn >= 40.0 or sn == float("inf")))
+    SUB_RESULTS[label] = rows
+    n_bad = sum(1 for r in rows if not r[6])
+    print(f"[dua]   per-head P.V: {nh - n_bad}/{nh} heads >= 40 dB"
+          + ("" if not n_bad else "; failing heads: "
+             + ", ".join(f"#{r[0]}({r[4]:.1f} dB)" for r in rows if not r[6])))
+    ref_in = torch.zeros(seq, nh, v_dim)
+    ref_in[:, :, :d] = torch.cat(ref_heads, dim=1).reshape(seq, nh, d)
+    ref_o = (ref_in.reshape(seq, pitch) @ w_eff.float().T + bias.float()).to(torch.bfloat16)
+    _assert_snr(label + " (O projection)", ref_o, got_o)
+    assert n_bad == 0, f"{label}: {n_bad}/{nh} heads below 40 dB"
+    assert pad_ok, f"{label}: pad lanes of the P.V output are not zero"
+    ue.reset_tensor_dram_addr()
+
+
+def run_attention_output(only=None):
+    """P.V written compact (v_dim real lanes per head), then the O projection over K = NH*v_dim."""
+    ue = UnifiedEngine()
+    _check_quantizer(ue)
+    for case in _select(ATTENTION_CASES, only):
+        label, seq, nh, d, v_dim, pitch, hidden = case
+        _case(ue, "attention_output", label,
+                 f"S={seq} NH={nh} D={d} P.V N={v_dim} pitch={pitch} -> O-proj K={pitch}",
+                 lambda c=case: _attn_case(ue, c))
+
+
+
+# ==============================================================================================
+# 6. operand_offsets: stress with unaligned operand start addresses
+# ==============================================================================================
+# ---- 1. matmul operands at unaligned start addresses ---------------------------------------
+# Stress test: ONE legacy (compile-time) matmul, M=72, K=N=1152, with A, B, scale, bias and out each
+# starting mid-beat. Every length, chunk and jump stays a multiple of the 32 B beat (e.g. A = 165,888 B,
+# bias = 384 B, out = strided write of 384 B chunks with a 2,304 B jump), so only the START addresses
+# are unaligned. The four offset rotations are 8 / 16 / 24 / 4088 (4088 = 8 B before a 4 KB page edge).
+# Models keep A and OUT aligned; their unaligned addresses come from slicing weight / scale / bias.
+# OUT's base is always 4 KB-aligned (its page offset is exactly the OUT_off column); otherwise the size of every
+# earlier operand moves OUT inside its page and unrelated offsets look like failures. Result: A, B, scale, bias,
+# and OUT (including OUT@4088) pass at every offset after the multi-line stride page-split RTL fix.
+#   (label,                 kind,          M,   K,    N,   A_off, B_off, SCALE_off, BIAS_off, OUT_off)
+#   kind: "bf16" = bf16 weights | "if4_dequant" = IF4 via matmat_mul_core | "if4_1pass" = quantized_matmat_core
+#   offsets are bytes from a 64 B-aligned base; 0xFF8 (4088) uses a 4 KB-aligned base
+OPERAND_XFAIL = {}  # OUT@4088 bad-spill XFAILs cleared after multi-line stride page-split fix
+OPERAND_CASES = (
+    ("bf16_a8_b16_c4088_o8",          "bf16",        72, 1152, 1152,      8,    16,      None,     0xFF8,       8),
+    ("bf16_a16_b24_c8_o16",           "bf16",        72, 1152, 1152,     16,    24,      None,         8,      16),
+    ("bf16_a24_b4088_c16_o24",        "bf16",        72, 1152, 1152,     24, 0xFF8,      None,        16,      24),
+    ("bf16_a4088_b8_c24_o4088",       "bf16",        72, 1152, 1152,  0xFF8,     8,      None,        24,   0xFF8),
+    ("if4dq_a8_b16_s24_c4088_o8",     "if4_dequant", 72, 1152, 1152,      8,    16,        24,     0xFF8,       8),
+    ("if4dq_a16_b24_s4088_c8_o16",    "if4_dequant", 72, 1152, 1152,     16,    24,     0xFF8,         8,      16),
+    ("if4dq_a24_b4088_s8_c16_o24",    "if4_dequant", 72, 1152, 1152,     24, 0xFF8,         8,        16,      24),
+    ("if4dq_a4088_b8_s16_c24_o4088",  "if4_dequant", 72, 1152, 1152,  0xFF8,     8,        16,        24,   0xFF8),
+    ("if4_1p_a8_b16_s24_c4088_o8",    "if4_1pass",   72, 1152, 1152,      8,    16,        24,     0xFF8,       8),
+    ("if4_1p_a16_b24_s4088_c8_o16",   "if4_1pass",   72, 1152, 1152,     16,    24,     0xFF8,         8,      16),
+    ("if4_1p_a24_b4088_s8_c16_o24",   "if4_1pass",   72, 1152, 1152,     24, 0xFF8,         8,        16,      24),
+    ("if4_1p_a4088_b8_s16_c24_o4088", "if4_1pass",   72, 1152, 1152,  0xFF8,     8,        16,        24,   0xFF8),
+)
+
+# ---- 1. matmul operands -----------------------------------------------------------------------
+def _unaligned_operands_case(ue, case):
+    label, kind, m, k, n, off_a, off_b, off_s, off_c, off_o = case
+    x = torch.randn(m, k).to(torch.bfloat16)
+    w = (torch.randn(n, k) * 0.05).to(torch.bfloat16)
+    c = torch.randn(n).to(torch.bfloat16)
+    a_reg = _Region(ue, "A", _u8(x), off_a)
+    c_reg = _Region(ue, "BIAS", _u8(c), off_c)
+    out_reg = _Region(ue, "OUT", torch.full((m * n * 2,), _CANARY, dtype=torch.uint8), off_o, align=4096)
+    if kind == "bf16":
+        w_eff = w
+        b_reg = _Region(ue, "B", _u8(w), off_b)
+        s_reg = None
+    else:
+        packed, scale_bytes, w_eff = _quantize_if4_int(w)
+        b_reg = _Region(ue, "B", packed, off_b)
+        s_reg = _Region(ue, "SCALE", scale_bytes, off_s)
+    _print_case(label, f"kind={kind} M={m} K={k} N={n}",
+                   [r for r in (a_reg, b_reg, s_reg, c_reg, out_reg) if r is not None])
+
+    def build():
+        if kind == "bf16":
+            return ue.matmat_mul_core(
+                M=m, K=k, N=n, A_DRAM_ADDR=a_reg.addr, B_DRAM_ADDR=b_reg.addr,
+                OUTPUT_DRAM_ADDR=out_reg.addr, C_DRAM_ADDR=c_reg.addr, bias_mode="broadcast_N")
+        if kind == "if4_dequant":
+            return ue.matmat_mul_core(
+                M=m, K=k, N=n, A_DRAM_ADDR=a_reg.addr, B_DRAM_ADDR=b_reg.addr,
+                OUTPUT_DRAM_ADDR=out_reg.addr, C_DRAM_ADDR=c_reg.addr, bias_mode="broadcast_N",
+                is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=s_reg.addr)
+        return ue.quantized_matmat_core(
+            M=m, K=k, N=n, A_DRAM_ADDR=a_reg.addr, B_DRAM_ADDR=b_reg.addr,
+            OUTPUT_DRAM_ADDR=out_reg.addr, SCALE_DRAM_ADDR=s_reg.addr,
+            C_DRAM_ADDR=c_reg.addr, bias_mode="broadcast_N", data_type=TYPE.IF4)
+
+    _flops, inst_bytes = _run(ue, build)
+    got = out_reg.payload_after_run(label).view(torch.bfloat16).reshape(m, n)
+    ref = (x.float() @ w_eff.float().T + c.float()).to(torch.bfloat16)
+    snr = _assert_snr(label, ref, got)
+    ue.reset_tensor_dram_addr()
+
+
+def run_operand_offsets(only=None):
+    """Every matmul operand at an 8-byte, non-beat-aligned DRAM address (incl. 4 KB crossing)."""
+    ue = UnifiedEngine()
+    _check_quantizer(ue)
+    for case in _select(OPERAND_CASES, only):
+        label, kind, m, k, n, off_a, off_b, off_s, off_c, off_o = case
+        _case(ue, "operand_offsets", label,
+                 f"{kind} M={m} K={k} N={n} | offsets A={off_a} B={off_b} SCALE={off_s} "
+                 f"BIAS={off_c} OUT={off_o}",
+                 lambda c=case: _unaligned_operands_case(ue, c), xfail=OPERAND_XFAIL.get(label))
+
+
+
+
+# ==============================================================================================
+# 6b. strided_write_window: narrowed repro of the strided-write bug (for the RTL owner)
+# ==============================================================================================
+# ONE strided SRAM->DRAM write (7 rows of `chunk` B, `jump` 2304 B apart), page-aligned destination base, no
+# matmul, no unaligned start. The first chunk starts (4096 - chunk + spill) into a page, i.e. it ends `spill` B
+# past the 4 KB edge (spill 0 never fails). Measured on hardware (bitstream 2c814c54), ALL rows are wrong when BAD:
+#   chunk  128: OK for every spill 8..120
+#   chunk  192: BAD 8..184            chunk  320: BAD 8..312            chunk  448: BAD 8..440
+#   chunk  256: OK 8..152, BAD 160..248
+#   chunk  384: OK 8..152, BAD 160..248, OK 256..280, BAD 288..376
+#   chunk  512: OK 8..152, BAD 160..248, OK 256..280, BAD 288..376, OK 384..408, BAD 416..504
+# Historical bad windows (chunk%128!=0 at every spill; 128 B multiples in
+# [128*j+32, 128*(j+1)) with j odd) are fixed; all cases expect "ok".
+#   (label,                     chunk, jump, rows, spill, expect)
+WINDOW_CASES = (
+    ("c128_spill8",     128, 2304, 7,   8, "ok"),
+    ("c128_spill120",   128, 2304, 7, 120, "ok"),
+    ("c192_spill8",     192, 2304, 7,   8, "ok"),
+    ("c192_spill96",    192, 2304, 7,  96, "ok"),
+    ("c192_spill184",   192, 2304, 7, 184, "ok"),
+    ("c256_spill8",     256, 2304, 7,   8, "ok"),
+    ("c256_spill152",   256, 2304, 7, 152, "ok"),
+    ("c256_spill160",   256, 2304, 7, 160, "ok"),
+    ("c256_spill248",   256, 2304, 7, 248, "ok"),
+    ("c320_spill8",     320, 2304, 7,   8, "ok"),
+    ("c320_spill312",   320, 2304, 7, 312, "ok"),
+    ("c384_spill152",   384, 2304, 7, 152, "ok"),
+    ("c384_spill160",   384, 2304, 7, 160, "ok"),
+    ("c384_spill256",   384, 2304, 7, 256, "ok"),
+    ("c384_spill288",   384, 2304, 7, 288, "ok"),
+    ("c384_spill376",   384, 2304, 7, 376, "ok"),
+    ("c448_spill8",     448, 2304, 7,   8, "ok"),
+    ("c448_spill440",   448, 2304, 7, 440, "ok"),
+    ("c512_spill384",   512, 2304, 7, 384, "ok"),
+    ("c512_spill416",   512, 2304, 7, 416, "ok"),
+    ("c512_spill504",   512, 2304, 7, 504, "ok"),
+)
+
+
+def _window_case(ue, case):
+    label, chunk, jump, rows, spill, _expect = case
+    start = 4096 - chunk + spill
+    n_src = rows * chunk
+    src_bytes = (torch.arange(n_src, dtype=torch.int32) % 251).to(torch.uint8)
+    dst_span = (rows - 1) * jump + chunk
+    src = _Region(ue, "SRC", src_bytes, 0, align=4096)
+    dst = _Region(ue, "DST", torch.full((dst_span,), _CANARY, dtype=torch.uint8), start, align=4096)
+    _print_case(label, f"strided write, {rows} chunks of {chunk} B, jump {jump} B, page offset {start}, "
+                       f"first chunk ends {spill} B past the 4 KB edge", [src, dst])
+    elems = n_src // 2
+
+    def build():
+        ue.accelerator_memory_to_sram(accelerator_dram_address=src.addr, sram_address=0x00000,
+                                      element_size=elems, memcpy_length_bytes=n_src)
+        ue.sram_to_accelerator_memory(sram_address=0x00000, accelerator_dram_address=dst.addr,
+                                      element_size=elems, stride_bytes_per_chunk=chunk, stride_jump_bytes=jump)
+        return 0
+
+    _run(ue, build)
+    got = dst.payload_after_run(label)
+    expect = torch.full((dst_span,), _CANARY, dtype=torch.uint8)
+    for r in range(rows):
+        expect[r * jump:r * jump + chunk] = src_bytes[r * chunk:(r + 1) * chunk]
+    wrong = (got != expect).nonzero().flatten().tolist()
+    if wrong:
+        bad_rows = sorted({w // jump for w in wrong})
+        raise AssertionError(f"{label}: {len(wrong)} wrong bytes, first at row {wrong[0] // jump} "
+                             f"byte {wrong[0] % jump}, rows {bad_rows} affected")
+    _LAST_SNR[0] = float("inf")
+
+
+def run_strided_write_window(only=None):
+    """Strided write whose first chunk spills `spill` B past a 4 KB edge; entries marked "bad" are XFAIL."""
+    ue = UnifiedEngine()
+    for case in _select(WINDOW_CASES, only):
+        label, chunk, jump, rows, spill, expect = case
+        _case(ue, "strided_write_window", label,
+              f"{rows} x {chunk} B chunks, jump {jump} B, first chunk ends {spill} B past the 4 KB edge",
+              lambda c=case: _window_case(ue, c),
+              xfail=("RTL strided-write bug: chunk crosses 4 KB edge in the bad window" if expect == "bad" else None))
+
+
+# ==============================================================================================
+# 7. Suite runner and command line
+# ==============================================================================================
+GROUPS = ("page_split", "strip_writeback", "unpadded_n", "attention_output", "strided_write_window",
+          "operand_offsets")
+_RUNNERS = {
+    "page_split": run_page_split,
+    "strip_writeback": run_strip_writeback,
+    "unpadded_n": run_unpadded_n,
+    "attention_output": run_attention_output,
+    "strided_write_window": run_strided_write_window,
+    "operand_offsets": run_operand_offsets,
+}
+_TABLES = {
+    "page_split": PAGE_SPLIT_CASES, "strip_writeback": STRIP_WRITEBACK_CASES, "unpadded_n": UNPADDED_N_CASES,
+    "attention_output": ATTENTION_CASES, "strided_write_window": WINDOW_CASES,
+    "operand_offsets": OPERAND_CASES,
+}
+
+
+def _parse_groups(groups):
+    """None -> every group; "a,b" or ["a", "b"]; an item may carry a label filter: "page_split:contig_144B"."""
+    if not groups:
+        return [(g, None) for g in GROUPS]
+    items = groups.split(",") if isinstance(groups, str) else list(groups)
+    parsed = []
+    for item in items:
+        name, _, sub = item.strip().partition(":")
+        if not name:
+            continue
+        if name not in _RUNNERS:
+            raise ValueError(f"unknown group {name!r}; choose from {GROUPS}")
+        parsed.append((name, sub or None))
+    return parsed
+
+
+def run_dram_unaligned_access_suite(groups=None, only=None, full_table=False, mask_known=True) -> SuiteResult:
+    """Run the suite. EVERY case runs (a failure never stops the run); only a hang does.
+
+    Returns a SuiteResult and asserts nothing: call result.assert_passed() once everything has run.
+    ``groups``: comma list from GROUPS (default all, in order); an item may be "group:label-substring".
+    ``only``: run just the entries whose label contains this text. The shared RNG stream is restored afterwards.
+    """
+    wanted = _parse_groups(groups)
+    RESULTS.clear()
+    SUB_RESULTS.clear()
+    _MASK[0] = mask_known
+    saved = _capture_rng_state()
+    orig_wait = UnifiedEngine.wait_queue
+
+    def _wait_and_detect_hang(self, *a, **kw):
+        orig_wait(self, *a, **kw)
+        if self.is_queue_busy():
+            raise _Hang("queue still busy after the wait_queue timeout")
+
+    UnifiedEngine.wait_queue = _wait_and_detect_hang
+    stopped = None
+    try:
+        torch.manual_seed(20260101)
+        for name, sub in wanted:
+            _RUNNERS[name](sub or only)
+    except _Stop as e:
+        stopped = str(e)
+    finally:
+        UnifiedEngine.wait_queue = orig_wait
+        _restore_rng_state(saved)
+    ran = {r[0] for r in RESULTS}
+    not_run = [(g, "(not run after hang)", "") for g, _ in wanted if g not in ran] if stopped else []
+    if stopped:
+        print(f"[dua] STOPPED: {stopped}")
+    result = SuiteResult(RESULTS, not_run, stopped)
+    _print_results(result, full=full_table)
+    return result
+
+
+def _list_cases() -> None:
+    print("groups (run order):", ", ".join(GROUPS))
+    for group in GROUPS:
+        print(f"\n[{group}]")
+        for case in _TABLES[group]:
+            print("  ", case[0])
+
+
+def dram_unaligned_access_suite_test():
+    """DRAM arbitrary / unaligned access suite (section above).
+
+    Every case runs no matter what; the summary gets ONE entry; it asserts only at the end, if any entry failed.
+    Group / label selection comes from the --dua-* command line options.
+    """
+    result = run_dram_unaligned_access_suite(
+        _DUA_OPTIONS["groups"], _DUA_OPTIONS["only"], _DUA_OPTIONS["full"],
+        mask_known=_DUA_OPTIONS["mask_known"])
+    record_test("dram_unaligned_access", result.summary_text(), snr_db=result.min_snr)
+    result.assert_passed()
+
 
 def argmax_test():
     """Argmax register sanity check via fmax pipeline."""
@@ -9861,9 +11597,12 @@ def gemma3_inference_test() -> None:
     # exceeded the prior 18,750,000 floor; matmatmul relaxed by the same
     # 16/15 ratio (37,500,000 -> 40,000,000) to keep the margins proportional.
     _MAX_CYCLES_PER_TOKEN = {
-        "streaming": int(20_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
-        "matmatmul": int(40_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
-        "legacy": int(20_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
+        "streaming": int(_GEMMA3_SINGLE_CORE_MAX_CYCLES_PER_TOKEN
+                         * GEMMA3_HARDWARE_PENALTY_FACTOR),
+        "matmatmul": int(2 * _GEMMA3_SINGLE_CORE_MAX_CYCLES_PER_TOKEN
+                         * GEMMA3_HARDWARE_PENALTY_FACTOR),
+        "legacy": int(_GEMMA3_SINGLE_CORE_MAX_CYCLES_PER_TOKEN
+                      * GEMMA3_HARDWARE_PENALTY_FACTOR),
     }
     _clock_ns = user_dma_core.CLOCK_CYCLE_TIME_NS
 
@@ -9960,9 +11699,12 @@ def gemma3_if8_inference_test() -> None:
     # quantized weight data. Keep the correctness gate identical and halve the
     # speed requirement by doubling the allowed cycles/tok.
     _MAX_CYCLES_PER_TOKEN = {
-        "streaming": int(40_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
-        "matmatmul": int(80_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
-        "legacy": int(40_000_000 * GEMMA3_HARDWARE_PENALTY_FACTOR),
+        "streaming": int(2 * _GEMMA3_SINGLE_CORE_MAX_CYCLES_PER_TOKEN
+                         * GEMMA3_HARDWARE_PENALTY_FACTOR),
+        "matmatmul": int(4 * _GEMMA3_SINGLE_CORE_MAX_CYCLES_PER_TOKEN
+                         * GEMMA3_HARDWARE_PENALTY_FACTOR),
+        "legacy": int(2 * _GEMMA3_SINGLE_CORE_MAX_CYCLES_PER_TOKEN
+                      * GEMMA3_HARDWARE_PENALTY_FACTOR),
     }
     _clock_ns = user_dma_core.CLOCK_CYCLE_TIME_NS
 
@@ -10337,7 +12079,35 @@ if __name__ == "__main__":
         '--test-name-suffix', default='',
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        '--tests',
+        type=str,
+        default=None,
+        help=(
+            'Comma-separated subset of tests to run after software_reset '
+            '(skips the rest of the suite). Names: dram_stride_en, '
+            'dram_stride_wb, dram_unaligned_stride_en, dram_unaligned_stride_wb, '
+            'dram_unaligned_memcpy, dram_partial_length_memcpy, '
+            'dram_unaligned_read_write_speed, dram_unaligned_access, or alias '
+            'dma_unaligned for the unaligned+partial+stride-unaligned set.'
+        ),
+    )
+    parser.add_argument('--dua-groups', default=None,
+                        help='dram_unaligned_access: comma list of groups; "group:substr" filters that group')
+    parser.add_argument('--dua-only', default=None,
+                        help='dram_unaligned_access: run only entries whose label contains this text')
+    parser.add_argument('--dua-full', action='store_true',
+                        help='dram_unaligned_access: print every entry in the final table, not just failures')
+    parser.add_argument('--dua-no-mask', action='store_true',
+                        help='dram_unaligned_access: report known hardware failures as FAIL (ignore xfail marks)')
+    parser.add_argument('--dua-list', action='store_true',
+                        help='dram_unaligned_access: list groups and entry labels, then exit (no board access)')
     args = parser.parse_args()
+    if args.dua_list:
+        _list_cases()
+        sys.exit(0)
+    _DUA_OPTIONS.update(groups=args.dua_groups, only=args.dua_only, full=args.dua_full,
+                        mask_known=not args.dua_no_mask)
 
     _TEST_NAME_SUFFIX = args.test_name_suffix
 
@@ -10402,6 +12172,66 @@ if __name__ == "__main__":
     # with no numeric regression behind any of them. --multi-core N still
     # resets N, exactly as it did before.
     software_reset_test(cores=args.multi_core if args.multi_core is not None else 1)
+
+    # Optional early-exit path: run only the named DMA / unaligned coverage.
+    _DMA_TEST_FUNCS = {
+        "dram_stride_en": dram_stride_en_test,
+        "dram_stride_wb": dram_stride_wb_test,
+        "dram_unaligned_stride_en": dram_unaligned_stride_en_test,
+        "dram_unaligned_stride_wb": dram_unaligned_stride_wb_test,
+        "dram_unaligned_stride_wb_page_split": dram_unaligned_stride_wb_page_split_test,
+        "dram_unaligned_write_page_split": dram_unaligned_write_page_split_test,
+        "dram_unaligned_memcpy": dram_unaligned_memcpy_test,
+        "dram_partial_length_memcpy": dram_partial_length_memcpy_test,
+        "dram_unaligned_read_write_speed": dram_unaligned_read_write_speed_test,
+        "dram_unaligned_access": dram_unaligned_access_suite_test,
+    }
+    _DMA_UNALIGNED_ALIAS = (
+        "dram_unaligned_memcpy",
+        "dram_partial_length_memcpy",
+        "dram_unaligned_stride_en",
+        "dram_unaligned_stride_wb",
+        # Remote CI failures on non-aligned-start-addr-dma before write-FSM fix.
+        "dram_unaligned_stride_wb_page_split",
+        "dram_unaligned_write_page_split",
+        "dram_stride_en",
+        "dram_stride_wb",
+    )
+    if args.tests is not None:
+        wanted = []
+        for tok in args.tests.split(","):
+            name = tok.strip()
+            if not name:
+                continue
+            if name == "dma_unaligned":
+                wanted.extend(_DMA_UNALIGNED_ALIAS)
+            elif name in _DMA_TEST_FUNCS:
+                wanted.append(name)
+            else:
+                parser.error(
+                    f"unknown --tests entry {name!r}; choose from "
+                    f"{sorted(_DMA_TEST_FUNCS)} or alias dma_unaligned"
+                )
+        # De-dupe, keep order.
+        seen = set()
+        ordered = []
+        for name in wanted:
+            if name not in seen:
+                seen.add(name)
+                ordered.append(name)
+        print(f"--tests: running {ordered}")
+        for name in ordered:
+            print(f"=== {name} ===")
+            _DMA_TEST_FUNCS[name]()
+        atexit.unregister(_atexit_write_test_summary)
+        write_test_summary(_USER_HW_TEST_SUMMARY)
+        print(f"Wrote summary to {_USER_HW_TEST_SUMMARY}")
+        # os._exit skips interpreter shutdown, so flush explicitly or the result
+        # tables are lost when stdout is a file/pipe.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
+
     dram_read_write_speed_test()
     isa_rela_loop_test()
     isa_abs_loop_test()
@@ -10752,6 +12582,13 @@ if __name__ == "__main__":
     uram_to_dram_test()
     dram_stride_en_test()
     dram_stride_wb_test()
+    dram_unaligned_stride_en_test()
+    dram_unaligned_stride_wb_test()
+    dram_unaligned_stride_wb_page_split_test()
+    dram_unaligned_memcpy_test()
+    dram_partial_length_memcpy_test()
+    dram_unaligned_write_page_split_test()
+    dram_unaligned_read_write_speed_test()
     argmax_test()
     element_wise_add_loop_test()
     interrupt_swi_and_halt_test()
@@ -10769,6 +12606,7 @@ if __name__ == "__main__":
     isa_icache_miss_conditions_test()
     matmat_mul_legacy_unroll_icache_test()
     #Adding new tests here
+    dram_unaligned_access_suite_test()
 
     gemma3_inference_test()
     gemma3_if8_inference_test()

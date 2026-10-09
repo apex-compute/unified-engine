@@ -150,9 +150,12 @@ def _apply_hardware_info(info: HardwareInfo) -> float:
 # ---------------------------------------------------------------------------
 # AXI beat width is populated exclusively from the HW_INFO register. There is
 # deliberately no board-name mapping, environment override, or software default.
-# The DMA engine requires DRAM-side transfer addresses/lengths to land on
-# beat boundaries, so every alignment/padding rule elsewhere in this file and
-# in user_hw_test.py is a direct consequence of this one doubled granularity:
+# Data DMA start addresses follow the ISA 8-byte DRAM unit; the master
+# floor-aligns AxADDR to the beat and realigns the payload. Contiguous
+# ``dma_length`` may be any positive byte count (partial final-beat WSTRB on
+# write, pad-mask on read). Stride start is the same 8-byte ISA unit; chunk
+# and jump still need a beat multiple so every row keeps the same start_off.
+# Instruction DMA stays 32-byte aligned.
 #
 #   width_bits | beat_bytes | beat_bf16_elems
 #   -----------+------------+----------------
@@ -211,6 +214,30 @@ def ue_assert_axi_beat_aligned_bytes(nbytes: int, what: str, hint: str = "") -> 
         f"{what}: {nbytes} bytes is not a multiple of the {beat}-byte AXI beat "
         f"(UE_AXI_DATA_WIDTH_BITS={UE_AXI_DATA_WIDTH_BITS})" + (f"; {hint}" if hint else "")
     )
+
+
+ISA_DRAM_ALIGN_BYTES = 8
+
+
+def ue_assert_isa_dram_aligned(addr: int, what: str, hint: str = "") -> None:
+    """Assert ``addr`` is a legal ISA DRAM address (8-byte units)."""
+    assert addr % ISA_DRAM_ALIGN_BYTES == 0, (
+        f"{what}: address 0x{addr:x} is not {ISA_DRAM_ALIGN_BYTES}-byte aligned "
+        f"(ISA DRAM unit)" + (f"; {hint}" if hint else "")
+    )
+
+
+def ue_assert_stride_dma(addr: int, chunk: int, jump: int, what: str) -> None:
+    """Stride start is ISA 8-byte; chunk and jump stay AXI-beat multiples."""
+    if chunk == 0:
+        return
+    ue_assert_isa_dram_aligned(addr, f"{what}: dram addr")
+    ue_assert_axi_beat_aligned_bytes(chunk, f"{what}: stride_bytes_per_chunk")
+    if jump:
+        ue_assert_axi_beat_aligned_bytes(
+            jump, f"{what}: stride_jump_bytes",
+            hint="jump must stay beat-aligned so each row keeps the same start_off",
+        )
 
 
 # Strided-DMA descriptor field widths (see :meth:`UnifiedEngine.ue_op_descriptor`):
@@ -1910,7 +1937,9 @@ class UnifiedEngine:
 
         Args:
             dram_src_addr: Source address in DRAM
-            memcpy_length_bytes: Number of bytes to copy
+            memcpy_length_bytes: Number of bytes to copy (contiguous: any positive
+                byte count; stride chunk and jump still need an AXI-beat multiple;
+                stride start is ISA 8-byte and may be mid-beat)
             memcpy_type: Type of memory (MEMCPY_TYPE.URAM, BRAM, BIAS_BRAM, SCALE_BRAM)
             uram_dst_addr: Destination address in URAM (only meaningful for URAM type)
             uram_type: URAM section (URAM_SECTION.URAM_A or URAM_B, only meaningful for URAM type)
@@ -1920,6 +1949,10 @@ class UnifiedEngine:
             pbi_stride_en: Enable stride for a PBI memcpy whose chunk and jump
                 values are already stored in the pointer row.
         """
+        if stride_bytes_per_chunk != 0 and inst_pointer_idx is None:
+            ue_assert_stride_dma(
+                dram_src_addr, stride_bytes_per_chunk, stride_jump_bytes,
+                "ue_memcpy_from_dram")
         if inst_pointer_idx is not None:
             inst_type = INSTRUCTION_UE_PBI
             encoded_dram_addr = dram_src_addr
@@ -1976,7 +2009,12 @@ class UnifiedEngine:
             uram_type: URAM section (URAM_SECTION.URAM_A or URAM_B)
             uram_src_addr: Source address in URAM
             dram_dst_addr: Destination address in DRAM
-            memcpy_length_bytes: Total number of bytes to copy (should be multiple of 128)
+            memcpy_length_bytes: Total bytes to copy (contiguous: any positive
+                byte count; stride mode: ``stride_bytes_per_chunk`` and
+                ``stride_jump_bytes`` must still be AXI-beat multiples. Start
+                address is ISA 8-byte and may be mid-beat. Prefer multiples of
+                128 when staging through full URAM rows, but it is not required
+                for contiguous DMA)
             stride_bytes_per_chunk: Bytes to write per stride (0 = no stride mode)
             stride_jump_bytes: Distance in bytes between start of consecutive writes in DRAM
                               (0 = contiguous, use stride_bytes_per_chunk for the jump)
@@ -1991,6 +2029,10 @@ class UnifiedEngine:
             ue.wait_queue()
             ue.clear_stride_mode()
         """
+        if stride_bytes_per_chunk != 0 and inst_pointer_idx is None:
+            ue_assert_stride_dma(
+                dram_dst_addr, stride_bytes_per_chunk, stride_jump_bytes,
+                "ue_memcpy_to_dram")
         if inst_pointer_idx is not None:
             inst_type = INSTRUCTION_UE_PBI
             encoded_dram_addr = dram_dst_addr
@@ -2266,6 +2308,10 @@ class UnifiedEngine:
         """
         uram_type, uram_start_addr = self.sram_address_to_uram_address(sram_address)
         nbytes = element_size * 2 if memcpy_length_bytes is None else memcpy_length_bytes
+        if stride_bytes_per_chunk != 0 and inst_pointer_idx is None:
+            ue_assert_stride_dma(
+                accelerator_dram_address, stride_bytes_per_chunk, stride_jump_bytes,
+                "accelerator_memory_to_sram")
         if general_reg_src is not None:
             if inst_pointer_idx is not None:
                 raise ValueError("general_reg_src and inst_pointer_idx are mutually exclusive")
@@ -2326,9 +2372,10 @@ class UnifiedEngine:
 
         """
         uram_type, uram_start_addr = self.sram_address_to_uram_address(sram_address)
-        if stride_bytes_per_chunk != 0:
-            ue_assert_axi_beat_aligned_bytes(
-                stride_bytes_per_chunk, "sram_to_accelerator_memory: stride_bytes_per_chunk")
+        if stride_bytes_per_chunk != 0 and inst_pointer_idx is None:
+            ue_assert_stride_dma(
+                accelerator_dram_address, stride_bytes_per_chunk, stride_jump_bytes,
+                "sram_to_accelerator_memory")
         nbytes = element_size * 2 if memcpy_length_bytes is None else memcpy_length_bytes
         if general_reg_src is not None:
             if inst_pointer_idx is not None:
@@ -4909,10 +4956,10 @@ class UnifiedEngine:
         })
         # The padded-split branch (N<128) places each half in its own 128-byte SRAM slot, so on
         # the SRAM side it only needs even N. Its per-half DMAs, however, start at multiples of
-        # half_bytes (= N bytes) in DRAM, and the DMA engine requires AXI-beat-aligned addresses
-        # — so N bytes must also be a beat multiple (32 B at 256-bit, 64 B at 512-bit; asserted
-        # below). The N>=128 branch slices SRAM mid-row, which requires 64-aligned halves (N a
-        # multiple of 64) and is thereby always beat-aligned.
+        # half_bytes (= N bytes) in DRAM. DMA start is 8-byte aligned; N bytes must
+        # still be a beat multiple so each half starts on a legal ISA address
+        # (32 B at 256-bit, 64 B at 512-bit; asserted below). The N>=128 branch
+        # slices SRAM mid-row, which requires 64-aligned halves (N a multiple of 64).
         if N < 128:
             assert 0 < N < 128, "padded-split RoPE expects 0 < N < 128"
         else:
@@ -5826,7 +5873,9 @@ class UnifiedEngine:
                             gpr_a_addr: Optional[int] = None, gpr_b_addr: Optional[int] = None,
                             gpr_out_addr: Optional[int] = None, gpr_c_addr: Optional[int] = None,
                             gpr_scale_addr: Optional[int] = None,
-                            gpr_out_row_stride_reg: Optional[int] = None) -> None:
+                            gpr_out_row_stride_reg: Optional[int] = None,
+                            strip_cols: Optional[int] = None,
+                            strip_out_stride: Optional[int] = None) -> None:
         """Matrix multiply entrypoint; dispatches based on which dimensions are runtime registers:
 
         - any of ``gpr_M_reg`` / ``gpr_K_reg`` / ``gpr_N_reg`` provided: :meth:`matmat_mul_core_dynamic` —
@@ -5840,8 +5889,21 @@ class UnifiedEngine:
 
         **Layout:** ``A`` is **M×K** (row-major). ``B`` is **N×K** (row-major); the accelerator uses ``B`` as above and
         applies an implicit transpose so the computed result is **A @ Bᵀ**, i.e. **M×N**, without a separate transpose pass.
+
+        **Strided column write-back (dynamic path only):** ``strip_cols`` (W) and ``strip_out_stride`` (P, elements)
+        run the matmul as N/W column strips of exactly W columns and write strip ``s`` to output columns
+        ``s*P .. s*P+W-1`` instead of ``s*W``. One matmul over all heads of a projection then lands each
+        head's real lanes at the start of its own (wider, aligned) slot: e.g. W=72, P=128 for a 72-lane head in a
+        128-lane slot. ``gpr_out_row_stride_reg`` (elements) must be the full output row, ``(N/W)*P``.
+        Weight / scale / bias are still read as consecutive N rows, so only the output addressing changes.
         """
         _addr_gprs = (gpr_a_addr, gpr_b_addr, gpr_out_addr, gpr_c_addr, gpr_scale_addr)
+        if strip_cols is not None and gpr_M_reg is None and gpr_K_reg is None and gpr_N_reg is None:
+            gpr_M_reg = self.alloc_isa_reg()                 # strip write-back needs the dynamic path
+            self.generate_instruction_add_set(gpr_M_reg, M)
+            _strip_m_alloc = True
+        else:
+            _strip_m_alloc = False
         if gpr_M_reg is not None or gpr_K_reg is not None or gpr_N_reg is not None:
             allocated = []
             if gpr_K_reg is None:
@@ -5866,10 +5928,15 @@ class UnifiedEngine:
                 gpr_a_addr=gpr_a_addr, gpr_b_addr=gpr_b_addr, gpr_out_addr=gpr_out_addr,
                 gpr_c_addr=gpr_c_addr, gpr_scale_addr=gpr_scale_addr,
                 gpr_out_row_stride_reg=gpr_out_row_stride_reg,
+                strip_cols=strip_cols, strip_out_stride=strip_out_stride,
             )
             for _ in allocated:
                 self.release_isa_reg()
+            if _strip_m_alloc:
+                self.release_isa_reg()
             return flops
+        if strip_cols is not None or strip_out_stride is not None:
+            raise ValueError("matmat_mul_core: strip_cols / strip_out_stride need the dynamic path")
         if any(r is not None for r in _addr_gprs):
             raise ValueError("matmat_mul_core: gpr_*_addr require a dimension GPR (set gpr_M_reg, gpr_K_reg, or gpr_N_reg)")
         if gpr_out_row_stride_reg is not None:
@@ -6188,7 +6255,9 @@ class UnifiedEngine:
                                 gpr_a_addr: Optional[int] = None, gpr_b_addr: Optional[int] = None,
                                 gpr_out_addr: Optional[int] = None, gpr_c_addr: Optional[int] = None,
                                 gpr_scale_addr: Optional[int] = None,
-                                gpr_out_row_stride_reg: Optional[int] = None) -> int:
+                                gpr_out_row_stride_reg: Optional[int] = None,
+                                strip_cols: Optional[int] = None,
+                                strip_out_stride: Optional[int] = None) -> int:
         """
         Fully dynamic M/K/N matmul captured as an ISA program (A @ Bᵀ -> M×N).
 
@@ -6297,16 +6366,45 @@ class UnifiedEngine:
         # a GPR at runtime (RTL stride-jump override), replacing the m_take per-row DMA loop. Requires
         # every n_take to be a multiple of 64 so the m_take output rows are contiguous in URAM (the
         # strided DMA reads URAM contiguously and writes DRAM in strided rows). That holds on the main
-        # column-strip path; the sub-64 fallback (compile-time K large enough that a 64-wide strip
-        # overflows the eff_z field) produces non-64 strips, so it keeps the per-row writeback. The
-        # path is fixed by the compile-time K regime, so this is a compile-time choice (no mid-loop
-        # branch). N must be a multiple of 64 (the runtime N must match this regime).
+        # column-strip path; the sub-64 fallback (K large enough that a 64-wide strip overflows the
+        # eff_z field) produces N_chunk=32 padded URAM lines and must keep per-row writeback.
+        # With runtime K (gpr_K_reg), compile-time K is only a template — e.g. template K=64 enables
+        # strided WB while runtime K=6912 forces N_chunk=32 — so disable strided WB whenever K is
+        # runtime-overridden (axi_write_fsm mid-line slice_cnt keep is for contiguous URAM pack).
         _kr_ct = K // UE_VECTOR_SIZE
         _main_nchunk_ct = min(
             (URAM_NEAR_FULL_ELEMENTS // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE,
             (4095 // _kr_ct) * UE_VECTOR_SIZE,
         )
-        use_strided_wb = (not write_back_disable) and (N % UE_VECTOR_SIZE == 0) and (_main_nchunk_ct >= UE_VECTOR_SIZE)
+        use_strided_wb = (
+            (not write_back_disable)
+            and (N % UE_VECTOR_SIZE == 0)
+            and (_main_nchunk_ct >= UE_VECTOR_SIZE)
+            and (gpr_K_reg is None)
+        )
+
+        # Strided column write-back: N/W strips of exactly W columns, strip s written at column s*P.
+        if (strip_cols is None) != (strip_out_stride is None):
+            raise ValueError("matmat_mul_core_dynamic: strip_cols and strip_out_stride go together")
+        if strip_cols is not None:
+            if gpr_out_row_stride_reg is None:
+                raise ValueError("matmat_mul_core_dynamic: strip write-back needs gpr_out_row_stride_reg "
+                                 "(elements per output row = (N/strip_cols)*strip_out_stride)")
+            if softmax_enable or (bias_enable and bias_mode == "full_matrix"):
+                raise ValueError("matmat_mul_core_dynamic: strip write-back supports neither softmax "
+                                 "nor a full_matrix bias")
+            if strip_cols <= 0 or strip_cols % 2 or N % strip_cols:
+                raise ValueError(f"matmat_mul_core_dynamic: N={N} must be a multiple of an even "
+                                 f"strip_cols={strip_cols}")
+            if strip_out_stride < strip_cols or strip_out_stride % 4:
+                raise ValueError(f"matmat_mul_core_dynamic: strip_out_stride={strip_out_stride} must be "
+                                 f">= strip_cols and a multiple of 4 elements (8-byte DRAM words)")
+            _strip_rows_aligned = ((strip_cols + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+            if _strip_rows_aligned * (K // UE_VECTOR_SIZE) > 4095:
+                raise ValueError(f"matmat_mul_core_dynamic: a {strip_cols}-column strip with K={K} overflows "
+                                 f"the 12-bit URAM row field")
+            if strip_cols % UE_VECTOR_SIZE:
+                use_strided_wb = False        # non-64 strips: per-row contiguous write-back (rows are padded)
 
         URAM_B_ROW0 = (0x80000 >> 7) & 0xFFF  # URAM_B base row index (== 0)
         A_BASE_W = A_DRAM_ADDR >> 3            # DRAM word addresses (byte >> 3, PBI DRAM_ADDR format)
@@ -6363,8 +6461,16 @@ class UnifiedEngine:
         n_stride_bytes_reg = _alloc() if use_strided_wb else None  # N*2 (DRAM row stride for strided wb)
         bias_full_row_reg = _alloc() if (bias_enable and bias_mode == "full_matrix") else None
         row_idx_reg = _alloc() if softmax_enable else None
+        out_col_reg = _alloc() if strip_cols is not None else None  # output column of the current strip
         N_reg = gpr_N_reg        # caller-owned read-only alias
         M_total_reg = gpr_M_reg  # caller-owned read-only alias
+
+        def _emit_out_col(dst):
+            """dst = first output column of the current strip."""
+            if strip_cols is None:                     # strips are back to back: cols_done
+                self.generate_instruction_reg_sub(dst, N_reg, N_counter_reg)
+            else:                                      # strip s lives at column s * strip_out_stride
+                self.generate_instruction_add_imm(src_reg_idx=out_col_reg, immediate_value=0, dst_reg_idx=dst)
 
         program_dram_start_addr = self.get_program_dram_addr()
 
@@ -6440,6 +6546,9 @@ class UnifiedEngine:
         self.generate_instruction_shl(N_chunk_reg, N_chunk_reg, 4)
         # cap at N (shared between main path and sub-64 fallback)
         self.generate_instruction_reg_min(N_chunk_reg, N_reg, N_chunk_reg)
+        if strip_cols is not None:
+            # Size the M tile for ONE strip: its URAM output rows are padded to 64 columns.
+            self.generate_instruction_add_set(N_chunk_reg, _strip_rows_aligned)
 
         # M_chunk = URAM_FULL // (K + N_chunk)
         self.generate_instruction_add_reg(s2, s1, N_chunk_reg)  # s2 = K + N_chunk
@@ -6456,6 +6565,9 @@ class UnifiedEngine:
         # No-chunk fast path rejoins here (its forward JZ skipped the divide block above).
         if nochunk_patch is not None:
             nochunk_patch()
+        if strip_cols is not None:
+            # Strip width is exactly one head. (After the M_chunk divide above, which used the padded width.)
+            self.generate_instruction_add_set(N_chunk_reg, strip_cols)
 
         # Seed M counter and first m_take.
         self.generate_instruction_add_imm(src_reg_idx=M_total_reg, immediate_value=0, dst_reg_idx=gpr_M_counter)
@@ -6566,6 +6678,12 @@ class UnifiedEngine:
         _seed_cursor(b_dram_reg, B_BASE_W, gpr_b_addr)
         if is_B_quantized:
             _seed_cursor(scale_dram_reg, SCALE_BASE_W, gpr_scale_addr)
+        if strip_cols is not None:
+            # NOTE: keep this BEFORE the two instructions below. The N loop's backward jump lands one
+            # instruction before n_body_start (n_loop_sz is computed without an add_dec in between), so
+            # the instruction right before the body is re-executed every strip and must be idempotent
+            # (reg_min is; resetting out_col_reg here would send every strip to column 0).
+            self.generate_instruction_add_set(out_col_reg, 0)
         self.generate_instruction_add_imm(src_reg_idx=N_reg, immediate_value=0, dst_reg_idx=N_counter_reg)
         self.generate_instruction_reg_min(n_take_reg, N_counter_reg, N_chunk_reg)
 
@@ -6684,7 +6802,7 @@ class UnifiedEngine:
             self.generate_instruction_shl(s2, n_take_reg, 1)                          # n_take*2 (chunk bytes)
             self.generate_instruction_pbi_inc(general_reg_src=s2, pbi_field_select=PBI_FIELD.OUTPUT_SIZE, inst_pointer_idx=ptr_wb)
             self.generate_instruction_mul32_reg(s1, rows_done_reg, _out_stride_reg)
-            self.generate_instruction_reg_sub(s2, N_reg, N_counter_reg)               # cols_done
+            _emit_out_col(s2)                                                         # output column of this strip
             self.generate_instruction_add_reg(s1, s1, s2)
             self.generate_instruction_shr(s1, s1, 2)                                  # (rows_done*N+cols_done) words
             _off_plus_base(s1, OUT_BASE_W, gpr_out_addr, s1)
@@ -6700,7 +6818,7 @@ class UnifiedEngine:
             self.generate_instruction_shl(s1, n_take_reg, 1)            # n_take*2 bytes (DMA length)
             self.generate_instruction_pbi_inc(general_reg_src=s1, pbi_field_select=PBI_FIELD.DMA_LENGTH, inst_pointer_idx=ptr_wb)
             self.generate_instruction_mul32_reg(s1, rows_done_reg, _out_stride_reg)
-            self.generate_instruction_reg_sub(s2, N_reg, N_counter_reg)        # cols_done
+            _emit_out_col(s2)                                                  # output column of this strip
             self.generate_instruction_add_reg(s1, s1, s2)
             self.generate_instruction_shr(s1, s1, 2)
             _off_plus_base(s1, OUT_BASE_W, gpr_out_addr, s1)
@@ -6721,6 +6839,9 @@ class UnifiedEngine:
         # ---- N-counter update / loop back ----
         self.generate_instruction_reg_sub(N_counter_reg, N_counter_reg, n_take_reg)
         self.generate_instruction_reg_min(n_take_reg, N_counter_reg, N_chunk_reg)
+        if strip_cols is not None:
+            self.generate_instruction_add_imm(src_reg_idx=out_col_reg, immediate_value=strip_out_stride,
+                                              dst_reg_idx=out_col_reg)
         n_loop_sz = self.capture_count - n_body_start + 2
         self.generate_instruction_jump_rela_jnz(n_loop_sz, N_counter_reg)
 

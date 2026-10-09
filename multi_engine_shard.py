@@ -278,11 +278,12 @@ _SCALAR_HELPER_ALLOWLIST = frozenset({
 
 # Hardware alignment contract (see reference_hardware_behaviors):
 #   * SRAM rows are 128 bytes; every DMA base and stride must respect that.
-#   * AXI beats are 32 bytes; that is the absolute floor.
+#   * ISA DRAM addresses are 8-byte units. AXI data DMA may start mid-beat.
 #   * The matvec unit consumes N in UE_VECTOR_SIZE (64) element vectors, which
 #     is also the granularity the quantization scale blob is blocked at.
 SRAM_ROW_BYTES = 128
 AXI_BEAT_BYTES = 32
+ISA_DRAM_ALIGN_BYTES = user_dma_core.ISA_DRAM_ALIGN_BYTES
 COL_ALIGN = user_dma_core.UE_VECTOR_SIZE   # 64 elements == 128 bytes at bpe=2
 
 # UnifiedEngine.init_unified_engine() dma_writes 8192 uint16 (16 KB) of random
@@ -312,8 +313,8 @@ def _shifted(base_addr: int, offset_bytes: int, what: str) -> int:
         f"{COL_ALIGN} elements; at bpe=2 that is exactly {COL_ALIGN * 2} B."
     )
     addr = base_addr + offset_bytes
-    assert addr % AXI_BEAT_BYTES == 0, (
-        f"{what}: address 0x{addr:x} is not {AXI_BEAT_BYTES} B AXI-beat aligned "
+    assert addr % ISA_DRAM_ALIGN_BYTES == 0, (
+        f"{what}: address 0x{addr:x} is not {ISA_DRAM_ALIGN_BYTES} B ISA DRAM aligned "
         f"(base 0x{base_addr:x} is misaligned to begin with)"
     )
     if base_addr % SRAM_ROW_BYTES == 0:
@@ -3110,8 +3111,8 @@ class MultiEngineScheduler:
             f"reduce_add: {len(partial_addrs)} partial(s) for "
             f"{self.num_engines} engine(s)")
         for a in partial_addrs + [out_addr]:
-            assert a % AXI_BEAT_BYTES == 0, \
-                f"reduce_add: address 0x{a:x} is not {AXI_BEAT_BYTES} B AXI-beat aligned"
+            assert a % ISA_DRAM_ALIGN_BYTES == 0, \
+                f"reduce_add: address 0x{a:x} is not {ISA_DRAM_ALIGN_BYTES} B ISA DRAM aligned"
         if self.num_engines == 1:
             # Exact passthrough: a one-engine "reduction" is the identity, and
             # emitting a copy would break byte-identity for no arithmetic.
@@ -3199,9 +3200,9 @@ class MultiEngineScheduler:
         assert len(set(addrs)) == len(addrs), (
             f"per-engine buffer {name!r} addresses must be distinct")
         for addr in addrs:
-            assert addr % AXI_BEAT_BYTES == 0, (
+            assert addr % ISA_DRAM_ALIGN_BYTES == 0, (
                 f"per-engine buffer {name!r} address 0x{addr:x} is not "
-                f"{AXI_BEAT_BYTES} B AXI-beat aligned")
+                f"{ISA_DRAM_ALIGN_BYTES} B ISA DRAM aligned")
         normalized = list(addrs)
         if name in self._per_engine:
             assert self._per_engine[name] == normalized, (
