@@ -251,6 +251,7 @@ engine today; each folder has its own README/config, and most LLMs ship a
 | Qwen3 1.7B | [`models/qwen3_1.7b`](models/qwen3_1.7b) | Text LM |
 | Qwen3 4B | [`models/qwen3_4b`](models/qwen3_4b) | Text LM |
 | Qwen3.5 2B | [`models/qwen3.5_2b`](models/qwen3.5_2b) | Text LM |
+| Qwen3.5 9B / 27B-class, multi-card | [`models/qwen3.5_tensor_parallel`](models/qwen3.5_tensor_parallel) | Tensor-parallel LM over several cards, vision, chat UI |
 | Qwen2.5-VL 3B | [`models/qwen2.5_vl_3b`](models/qwen2.5_vl_3b) | Vision-language |
 | Qwen2.5-Omni 7B | [`models/qwen2.5_omni_7b`](models/qwen2.5_omni_7b) | Multimodal Thinker (text, image, audio -> text) |
 | SmolVLM2 | [`models/smolvlm2`](models/smolvlm2) | Vision-language |
