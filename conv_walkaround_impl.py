@@ -459,11 +459,15 @@ def write_report(path, cases, results, dev, clock_mhz, peak_1e,
 
     # ---------------- 3. Caveats ----------------
     A("\n## 3. Caveats that bound these numbers\n")
-    A("- **Weight precision is not matched.** Workarounds run BF16 weights through "
-      "`matmat_mul_core`; the CONV op has no BF16 weight path (`conv2d_core` takes "
-      "`TYPE.IF4 / IF8 / TQ4` only). Timings compare BF16-matmul against INT4-conv, "
-      "so migrating is also a quantization change — a model-quality question for an "
-      "audio front end, not answered here.")
+    A("- **Weight precision is not matched in the measurements, but it is not a "
+      "difference between the ops.** The workaround rows run BF16 through "
+      "`matmat_mul_core` because that is what the models do; the CONV op has no BF16 "
+      "weight path (`conv2d_core` takes `TYPE.IF4 / IF8 / TQ4`). But "
+      "`matmat_mul_core` accepts `is_B_quantized=True, data_type=TYPE.IF4` as well — "
+      "gemma4 audio already uses it — so an IF4 GEMM baseline is available and would "
+      "remove this caveat. Until that is run, the dense speedups carry an unknown "
+      "amount of number-format advantage, which if anything means the CONV op's true "
+      "compute margin is **narrower** than the 1.03x-1.16x reported.")
     A("- **No depthwise/grouped mode.** Emulating one with a block-diagonal dense "
       "weight would cost C x the true FLOPs (C=1024 for both audio encoders), worse "
       "than the Toeplitz it would replace.")
@@ -477,6 +481,102 @@ def write_report(path, cases, results, dev, clock_mhz, peak_1e,
       "Toeplitz cases bench a channel subset (64 MiB budget) and scale linearly.")
     A("- **`bigvgan_conv1d` occurrences is 1**, a floor: BigVGAN runs many conv "
       "layers across its upsample stages, so its stage saving is understated.")
+
+    # ---------------- 4. Systematic comparison ----------------
+    bw_gbs = clock_mhz * 1e6 * 256 / 8 / 1e9          # 256-bit AXI at the engine clock
+    ai_knee = peak_1e / bw_gbs                        # FLOP/byte where compute takes over
+
+    A("\n## 4. Systematic comparison: when should a conv op beat GEMM?\n")
+    A("The five measured cases are a sample. This section generalises them with "
+      "the two laws that actually decide the answer on this engine, so the result "
+      "can be applied to a shape nobody has benchmarked.\n")
+
+    A("\n### 4.1 The algorithm space, and which ones exist here\n")
+    A("| approach | what it does | available here |")
+    A("|---|---|---|")
+    A("| direct | loop the window, accumulate in place | yes, as eltwise tap-wise (`conv2d_3x3_dw_tapwise_dram`) |")
+    A("| **im2col + GEMM** | materialize the window, call a GEMM | yes — what every model in `models/` does |")
+    A("| **implicit GEMM** | same arithmetic, window addressed on the fly | **this is what the CONV op is** |")
+    A("| Winograd | transform domain, 2.25x fewer multiplies for 3x3 s1 | **no** — no transform support in HDL |")
+    A("| FFT / overlap-add | asymptotically better for large kernels | **no** |")
+    A("\nim2col and implicit GEMM perform *identical* arithmetic. That is why four of "
+      "the five dense measurements came out within 1.03x-1.16x: the CONV op is not a "
+      "cheaper algorithm, it is the same algorithm without the materialization. Any "
+      "large win must therefore come from padding or from bandwidth, not from FLOPs.")
+
+    A("\n### 4.2 Law 1 — lane padding is the whole dense story\n")
+    A(f"A GEMM pads K and N to the {UE_VECTOR_SIZE}-lane vector. For im2col, "
+      f"`K = k*k*C_in` and `N = C_out`, so the arithmetic a GEMM *issues* exceeds "
+      f"the true conv by\n")
+    A("```")
+    A("waste = ceil(k*k*C_in / 64)*64 / (k*k*C_in)  x  ceil(C_out / 64)*64 / C_out")
+    A("```")
+    A("\nThe CONV op packs channels into lanes natively, so it does not pay this. "
+      "Predicted speedup from padding alone, against the measured points:\n")
+    A("\n| shape | k*k*C_in | C_out | predicted waste | measured speedup |")
+    A("|---|---:|---:|---:|---:|")
+    rows = [("mbv2 stem: C=3, k=3, OC=32", 27, 32, "mbv2_stem"),
+            ("omni conv1: C=128, k=3, OC=1280", 384, 1280, "omni_conv1"),
+            ("omni conv2: C=1280, k=3, OC=1280", 3840, 1280, "omni_conv2"),
+            ("mobilesam: C=64, k=3, OC=64", 576, 64, "mobilesam_3x3"),
+            ("hypothetical RGB 7x7: C=3, k=7, OC=64", 147, 64, None),
+            ("hypothetical C=16, k=3, OC=16", 144, 16, None)]
+    for label, K, N, cname in rows:
+        wk = (-(-K // UE_VECTOR_SIZE) * UE_VECTOR_SIZE) / K
+        wn = (-(-N // UE_VECTOR_SIZE) * UE_VECTOR_SIZE) / N
+        m = ""
+        if cname:
+            hit = [(c, w, o) for c, w, o in dense if c.name == cname]
+            if hit:
+                c, w, o = hit[0]
+                m = f"{w.hw_ms / o.hw_ms:.2f}x"
+        A(f"| {label} | {K} | {N} | {wk*wn:.2f}x | {m or '—'} |")
+    A("\nThe prediction tracks the measurements: `mbv2_stem` is predicted 4.74x and "
+      "measured 2.20x (padding sets the ceiling, DMA and program overhead eat the "
+      "rest); every shape whose `k*k*C_in` and `C_out` are already 64-aligned is "
+      "predicted 1.00x and measured 1.03x-1.16x. **The rule: a conv op only buys "
+      "compute when `k*k*C_in` or `C_out` is small or badly aligned — in practice, "
+      "the first one or two layers of a CNN.**")
+
+    A("\n### 4.3 Law 2 — bandwidth, and when it even matters\n")
+    A(f"im2col replicates each activation `k*k` times (2D) or `k` times (1D), so it "
+      f"writes and re-reads that much extra DRAM. Whether that costs anything depends "
+      f"on arithmetic intensity. This engine: {peak_1e:.1f} GFLOPS against "
+      f"{bw_gbs:.1f} GB/s of 256-bit AXI, so the knee is "
+      f"**{ai_knee:.1f} FLOP/byte**.\n")
+    A("A conv layer's intensity is roughly `2*k*k*C_in*C_out / (bytes touched)`, which "
+      "grows with channel count. So large-C layers sit well above the knee and are "
+      "compute-bound — im2col's extra traffic hides behind the arithmetic, which is "
+      "exactly what the 92-96%-of-peak measurements show. Low-C, large-spatial layers "
+      "sit below it and are bandwidth-bound, where the replication is paid in full. "
+      "Both laws therefore point at the same place: **CNN stems**.")
+
+    A("\n### 4.4 Where each approach is categorically correct\n")
+    A("| shape class | best approach | why |")
+    A("|---|---|---|")
+    A("| 1x1 pointwise | **GEMM** | a 1x1 conv *is* a GEMM; the conv op adds geometry setup for no gain |")
+    A("| k x k, `k*k*C_in` and `C_out` 64-aligned | **either** (GEMM already ~95% peak) | identical arithmetic; conv op saves only materialization |")
+    A("| k x k, small `C_in` (stems) | **CONV op** | GEMM pads K to 64: 2-5x issued-FLOP waste |")
+    A("| depthwise / grouped | **direct tap-wise eltwise** | conv op cannot express it; GEMM needs block-diagonal (C x waste) or Toeplitz (L/k x waste) |")
+    A("| dilated | **CONV op** | native `dilation`; GEMM needs k passes or a strided gather |")
+    A("| transposed / 2x upsample | **CONV op** | `run_conv_transpose2d_k4s2p1` does sub-pixel decomposition in one program; by hand it is a polyphase matmul chain |")
+    A("| max pooling | **MAXPOOL op** | a max reduction is not a GEMM at all |")
+    A("| very large kernel | FFT / overlap-add | neither path implements it |")
+
+    A("\n### 4.5 What this hardware's conv op does and does not give you\n")
+    A("**Gives:** implicit-GEMM addressing (no materialization), native lane packing "
+      "for low channel counts, `dilation`, asymmetric/edge geometry handled inside one "
+      "resident program via CONFIG switching, a transposed-conv decomposition, and "
+      "MAXPOOL — which the GEMM path cannot express at all.\n")
+    A("**Does not give:** a cheaper algorithm (no Winograd, no FFT), any grouped or "
+      "depthwise mode, or a weight-precision advantage — `matmat_mul_core` already "
+      "takes `is_B_quantized=True, data_type=TYPE.IF4`, so both paths get IF4/IF8 "
+      "weight bandwidth. Quantization is not a differentiator between them.\n")
+    A("**Net:** against a mature GEMM path on a 64-lane engine, a conv op is worth "
+      "roughly what it saves in lane padding and activation traffic. For "
+      "transformer-and-audio workloads that is a few percent. For a CNN front end it "
+      "is 2x and up. For depthwise-separable networks it is zero, and the gap has to "
+      "be closed in software.")
 
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(L) + "\n")

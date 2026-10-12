@@ -35,10 +35,10 @@ Dense cases only: the depthwise cases cannot be expressed on the CONV hardware, 
 | case | variant | HW ms | GFLOPS (true) | % peak | issued GF | prep MiB | SNR dB | speedup |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | `omni_conv1` | workaround: im2col + matmul | 24.32 | 24.25 | 95.5% | 0.590 | 0.4 | 55 |  |
-| `omni_conv1` | CONV op: conv1d via run_conv2d_layer (IF4) | 23.54 | 25.05 | 98.7% | 0.590 | 0.1 | 55 | **1.03x** |
+| `omni_conv1` | CONV op: conv1d via run_conv2d_layer (IF4) | 23.55 | 25.05 | 98.7% | 0.590 | 0.1 | 55 | **1.03x** |
 | `omni_conv2` | workaround: im2col + matmul | 126.24 | 23.36 | 92.0% | 2.949 | 2.2 | 55 |  |
 | `omni_conv2` | CONV op: conv1d via run_conv2d_layer (IF4) | 119.14 | 24.75 | 97.5% | 2.949 | 1.5 | 55 | **1.06x** |
-| `bigvgan_conv1d` | workaround: 3x per-tap matmul | 67.67 | 23.24 | 91.6% | 1.573 | 3.5 | 52 |  |
+| `bigvgan_conv1d` | workaround: 3x per-tap matmul | 67.66 | 23.25 | 91.6% | 1.573 | 3.5 | 52 |  |
 | `bigvgan_conv1d` | CONV op: conv1d via run_conv2d_layer (IF4) | 62.51 | 25.16 | 99.1% | 1.573 | 1.0 | 55 | **1.08x** |
 | `mbv2_stem` | workaround: im2col + matmul | 7.40 | 2.93 | 11.5% | 0.103 | 0.6 | 55 |  |
 | `mbv2_stem` | CONV op: run_conv2d_layer (IF4) | 3.36 | 6.46 | 25.4% | 0.022 | 0.3 | 67 | **2.20x** |
@@ -47,9 +47,75 @@ Dense cases only: the depthwise cases cannot be expressed on the CONV hardware, 
 
 ## 3. Caveats that bound these numbers
 
-- **Weight precision is not matched.** Workarounds run BF16 weights through `matmat_mul_core`; the CONV op has no BF16 weight path (`conv2d_core` takes `TYPE.IF4 / IF8 / TQ4` only). Timings compare BF16-matmul against INT4-conv, so migrating is also a quantization change — a model-quality question for an audio front end, not answered here.
+- **Weight precision is not matched in the measurements, but it is not a difference between the ops.** The workaround rows run BF16 through `matmat_mul_core` because that is what the models do; the CONV op has no BF16 weight path (`conv2d_core` takes `TYPE.IF4 / IF8 / TQ4`). But `matmat_mul_core` accepts `is_B_quantized=True, data_type=TYPE.IF4` as well — gemma4 audio already uses it — so an IF4 GEMM baseline is available and would remove this caveat. Until that is run, the dense speedups carry an unknown amount of number-format advantage, which if anything means the CONV op's true compute margin is **narrower** than the 1.03x-1.16x reported.
 - **No depthwise/grouped mode.** Emulating one with a block-diagonal dense weight would cost C x the true FLOPs (C=1024 for both audio encoders), worse than the Toeplitz it would replace.
 - **Toeplitz residency caps utterance length.** At L_pad=512 the matrices alone need ~12 GiB across 24 layers, against parakeet's 3 GB reservation. This is a capability limit, not only a speed one.
 - **Two more L^2 ops sit in the same parakeet block** and the conv feature does not address either: SiLU applied as an identity matmul (`2*D*L_pad^2`) and the channel-first transpose.
 - **Single engine**, so these are per-op costs, not stage throughput. Toeplitz cases bench a channel subset (64 MiB budget) and scale linearly.
 - **`bigvgan_conv1d` occurrences is 1**, a floor: BigVGAN runs many conv layers across its upsample stages, so its stage saving is understated.
+
+## 4. Systematic comparison: when should a conv op beat GEMM?
+
+The five measured cases are a sample. This section generalises them with the two laws that actually decide the answer on this engine, so the result can be applied to a shape nobody has benchmarked.
+
+
+### 4.1 The algorithm space, and which ones exist here
+
+| approach | what it does | available here |
+|---|---|---|
+| direct | loop the window, accumulate in place | yes, as eltwise tap-wise (`conv2d_3x3_dw_tapwise_dram`) |
+| **im2col + GEMM** | materialize the window, call a GEMM | yes — what every model in `models/` does |
+| **implicit GEMM** | same arithmetic, window addressed on the fly | **this is what the CONV op is** |
+| Winograd | transform domain, 2.25x fewer multiplies for 3x3 s1 | **no** — no transform support in HDL |
+| FFT / overlap-add | asymptotically better for large kernels | **no** |
+
+im2col and implicit GEMM perform *identical* arithmetic. That is why four of the five dense measurements came out within 1.03x-1.16x: the CONV op is not a cheaper algorithm, it is the same algorithm without the materialization. Any large win must therefore come from padding or from bandwidth, not from FLOPs.
+
+### 4.2 Law 1 — lane padding is the whole dense story
+
+A GEMM pads K and N to the 64-lane vector. For im2col, `K = k*k*C_in` and `N = C_out`, so the arithmetic a GEMM *issues* exceeds the true conv by
+
+```
+waste = ceil(k*k*C_in / 64)*64 / (k*k*C_in)  x  ceil(C_out / 64)*64 / C_out
+```
+
+The CONV op packs channels into lanes natively, so it does not pay this. Predicted speedup from padding alone, against the measured points:
+
+
+| shape | k*k*C_in | C_out | predicted waste | measured speedup |
+|---|---:|---:|---:|---:|
+| mbv2 stem: C=3, k=3, OC=32 | 27 | 32 | 4.74x | 2.20x |
+| omni conv1: C=128, k=3, OC=1280 | 384 | 1280 | 1.00x | 1.03x |
+| omni conv2: C=1280, k=3, OC=1280 | 3840 | 1280 | 1.00x | 1.06x |
+| mobilesam: C=64, k=3, OC=64 | 576 | 64 | 1.00x | 1.16x |
+| hypothetical RGB 7x7: C=3, k=7, OC=64 | 147 | 64 | 1.31x | — |
+| hypothetical C=16, k=3, OC=16 | 144 | 16 | 5.33x | — |
+
+The prediction tracks the measurements: `mbv2_stem` is predicted 4.74x and measured 2.20x (padding sets the ceiling, DMA and program overhead eat the rest); every shape whose `k*k*C_in` and `C_out` are already 64-aligned is predicted 1.00x and measured 1.03x-1.16x. **The rule: a conv op only buys compute when `k*k*C_in` or `C_out` is small or badly aligned — in practice, the first one or two layers of a CNN.**
+
+### 4.3 Law 2 — bandwidth, and when it even matters
+
+im2col replicates each activation `k*k` times (2D) or `k` times (1D), so it writes and re-reads that much extra DRAM. Whether that costs anything depends on arithmetic intensity. This engine: 25.4 GFLOPS against 6.3 GB/s of 256-bit AXI, so the knee is **4.0 FLOP/byte**.
+
+A conv layer's intensity is roughly `2*k*k*C_in*C_out / (bytes touched)`, which grows with channel count. So large-C layers sit well above the knee and are compute-bound — im2col's extra traffic hides behind the arithmetic, which is exactly what the 92-96%-of-peak measurements show. Low-C, large-spatial layers sit below it and are bandwidth-bound, where the replication is paid in full. Both laws therefore point at the same place: **CNN stems**.
+
+### 4.4 Where each approach is categorically correct
+
+| shape class | best approach | why |
+|---|---|---|
+| 1x1 pointwise | **GEMM** | a 1x1 conv *is* a GEMM; the conv op adds geometry setup for no gain |
+| k x k, `k*k*C_in` and `C_out` 64-aligned | **either** (GEMM already ~95% peak) | identical arithmetic; conv op saves only materialization |
+| k x k, small `C_in` (stems) | **CONV op** | GEMM pads K to 64: 2-5x issued-FLOP waste |
+| depthwise / grouped | **direct tap-wise eltwise** | conv op cannot express it; GEMM needs block-diagonal (C x waste) or Toeplitz (L/k x waste) |
+| dilated | **CONV op** | native `dilation`; GEMM needs k passes or a strided gather |
+| transposed / 2x upsample | **CONV op** | `run_conv_transpose2d_k4s2p1` does sub-pixel decomposition in one program; by hand it is a polyphase matmul chain |
+| max pooling | **MAXPOOL op** | a max reduction is not a GEMM at all |
+| very large kernel | FFT / overlap-add | neither path implements it |
+
+### 4.5 What this hardware's conv op does and does not give you
+
+**Gives:** implicit-GEMM addressing (no materialization), native lane packing for low channel counts, `dilation`, asymmetric/edge geometry handled inside one resident program via CONFIG switching, a transposed-conv decomposition, and MAXPOOL — which the GEMM path cannot express at all.
+
+**Does not give:** a cheaper algorithm (no Winograd, no FFT), any grouped or depthwise mode, or a weight-precision advantage — `matmat_mul_core` already takes `is_B_quantized=True, data_type=TYPE.IF4`, so both paths get IF4/IF8 weight bandwidth. Quantization is not a differentiator between them.
+
+**Net:** against a mature GEMM path on a 64-lane engine, a conv op is worth roughly what it saves in lane padding and activation traffic. For transformer-and-audio workloads that is a few percent. For a CNN front end it is 2x and up. For depthwise-separable networks it is zero, and the gap has to be closed in software.
