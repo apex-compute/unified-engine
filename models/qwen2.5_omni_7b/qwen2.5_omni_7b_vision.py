@@ -77,11 +77,13 @@ class Qwen25OmniVisionMixin:
         circuit pairs element i with i+VD_PAD/2=64 in hardware, unconditionally,
         so each head's real 80 dims must land in the padded buffer as two
         40-wide halves 64 apart (not one 80-wide run) -- see
-        _build_rope_tables. When self._vis_qk_compact (see vision_weight_init),
-        Q/K/V weights are stored fully COMPACT (real width, no padding baked in
-        at all) and the qkv_proj emission writes each head (V) or head-half
-        (QK) DIRECTLY to its final padded position via the matmul's own
-        gpr_out_row_stride_reg -- no scatter DMA, no intermediate buffer.
+        _build_rope_tables. Q/K/V weights are stored fully COMPACT (real
+        width, no padding baked in at all) and the qkv_proj emission writes
+        each head (V) or head-half (QK) DIRECTLY to its final padded position
+        via the matmul's own gpr_out_row_stride_reg -- no scatter DMA, no
+        intermediate buffer. These padded SLOTS are storage only: no FLOPs are
+        spent on them, and the only padding the encoder computes over is the
+        inner (reduction) K axis.
         """
         v = self._cfg["vision"]
         VD_PAD = 128
@@ -194,19 +196,17 @@ class Qwen25OmniVisionMixin:
                 raise KeyError(f"vision weight {key!r} missing from params.bin")
             return sections[key]
 
-        # attn.qk / attn.v (compact, real width, no per-head padding baked in
-        # -- the runtime scatters into padded per-head storage itself, see
-        # compile_vision_encoder_bin's qkv_proj emission) vs the older
-        # attn.qk_padded / attn.v_padded (padding baked into the quantized
-        # weight at conversion time). Detected from whichever key this
-        # params.bin actually has, so an old, not-yet-reconverted params.bin
-        # for THIS model keeps working unchanged via the padded path.
-        self._vis_qk_compact = f"visual.blocks.0.attn.qk.weight.{sfx}" in sections
-        if getattr(self, "vision_qkv_strip", False) and not self._vis_qk_compact:
-            raise ValueError("--vis-qkv-strip needs compact attn.qk/attn.v weights; "
-                             "rebuild params.bin with the current converter")
-        qk_key = "attn.qk" if self._vis_qk_compact else "attn.qk_padded"
-        v_key = "attn.v" if self._vis_qk_compact else "attn.v_padded"
+        # attn.qk / attn.v are stored compact (real width, no per-head padding
+        # baked in): the runtime writes each head or head-half straight into
+        # its padded attention slot, see compile_vision_encoder_bin's qkv_proj
+        # emission. The pre-pad-removal attn.qk_padded / attn.v_padded layout
+        # (padding baked into the quantized weight at conversion time) is no
+        # longer supported -- padding removal is not optional.
+        if f"visual.blocks.0.attn.qk.weight.{sfx}" not in sections:
+            raise ValueError(
+                "vision padding removal needs compact attn.qk/attn.v weights; "
+                "rebuild params.bin with the current converter")
+        qk_key, v_key = "attn.qk", "attn.v"
 
         with open(region["bin_path"], "rb") as f:
             base = region["base_offset"]
@@ -282,13 +282,9 @@ class Qwen25OmniVisionMixin:
             return "  (vision weights not loaded)"
         d = self._vision_dims()
         sections = self._read_vision_region()["sections"]
-        qk_suffix = (".attn.qk.weight" if getattr(self, "_vis_qk_compact", False)
-                    else ".attn.qk_padded.weight")
-        v_suffix = (".attn.v.weight" if getattr(self, "_vis_qk_compact", False)
-                   else ".attn.v_padded.weight")
         groups = {
-            "qk (fused)": qk_suffix,
-            "v":          v_suffix,
+            "qk (fused)": ".attn.qk.weight",
+            "v":          ".attn.v.weight",
             "o_proj":             ".attn.proj.weight",
             "gate_proj":          ".mlp.gate_proj.weight",
             "up_proj":            ".mlp.up_proj.weight",
@@ -412,28 +408,24 @@ class Qwen25OmniVisionMixin:
         # [VS, VN*VD_PAD]. Both are token-major and get permuted to head-major.
         # Padded per head (VD_PAD, not the real VD) because permute_qkv/RoPE/
         # attention downstream all address one head at a fixed VD_PAD stride.
-        # When self._vis_qk_compact, the qkv_proj emission writes each head's
-        # (V) or head-half's (QK, RoPE) REAL data directly into its final
-        # position here via the matmul's own gpr_out_row_stride_reg -- no
-        # intermediate compact buffer, no scatter DMA.
+        # The qkv_proj emission writes each head's (V) or head-half's (QK,
+        # RoPE) REAL data directly into its final position here via the
+        # matmul's own gpr_out_row_stride_reg -- no intermediate compact
+        # buffer, no scatter DMA.
         self.VIS_QK = alloc(VS * VN * VD_PAD * 2, "vis.qk")
         self.VIS_V = alloc(VS * VN * VD_PAD, "vis.v")
-        if getattr(self, "_vis_qk_compact", False):
-            # ZERO ONCE. Each per-head(-half) matmul only writes its REAL
-            # columns (QK: [0:40)+[64:104) of each 128-wide head slot; V:
-            # [0:80)) -- unlike the old fully-padded matmul, which wrote the
-            # WHOLE VD_PAD-wide row (zero rows baked into the weight) every
-            # single layer, nothing ever writes the remaining gap lanes (QK:
-            # [40:64)+[104:128); V: [80:128)) on any layer. Those lanes have
-            # to start zero here and then, since nothing ever touches them
-            # again, they simply stay zero -- the same self-annihilating-
-            # padding pattern pi05's vision encoder uses. Without this,
-            # VIS_QK/VIS_V start as uninitialized DRAM and every layer's
-            # attention/RoPE reads garbage in those lanes.
-            self._vis_pending_dmas.append(
-                (self.VIS_QK, torch.zeros(VS * VN * VD_PAD * 2, dtype=torch.bfloat16)))
-            self._vis_pending_dmas.append(
-                (self.VIS_V, torch.zeros(VS * VN * VD_PAD, dtype=torch.bfloat16)))
+        # ZERO ONCE. Each per-head(-half) matmul only writes its REAL columns
+        # (QK: [0:40)+[64:104) of each 128-wide head slot; V: [0:80)), so
+        # nothing ever writes the remaining gap lanes (QK: [40:64)+[104:128);
+        # V: [80:128)) on any layer. Those lanes have to start zero here and
+        # then, since nothing ever touches them again, they simply stay zero --
+        # the same self-annihilating-padding pattern pi05's vision encoder
+        # uses. Without this, VIS_QK/VIS_V start as uninitialized DRAM and
+        # every layer's attention/RoPE reads garbage in those lanes.
+        self._vis_pending_dmas.append(
+            (self.VIS_QK, torch.zeros(VS * VN * VD_PAD * 2, dtype=torch.bfloat16)))
+        self._vis_pending_dmas.append(
+            (self.VIS_V, torch.zeros(VS * VN * VD_PAD, dtype=torch.bfloat16)))
 
         # Head-major [n_groups, aligned_S, VD_PAD]. QK_HM holds Q's VN heads
         # followed by K's, so ONE permute produces both.
@@ -495,7 +487,7 @@ class Qwen25OmniVisionMixin:
         self.VIS_MLP_GATE = alloc(VS * VI_PAD, "vis.mlp_gate")
         self.VIS_MLP_UP = alloc(VS * VI_PAD, "vis.mlp_up")
         self.VIS_MLP_MULT = alloc(VS * VI_PAD, "vis.mlp_mult")
-        if getattr(self, "vision_mlp_real_n", False):
+        if True:   # vision MLP always runs at real N; pad lanes stay zero
             # gate/up write only VI real lanes into VI_PAD-wide rows. The
             # untouched tail must remain zero through all 32 layers because
             # down_proj still contracts over the 64-aligned K=VI_PAD.
@@ -674,14 +666,14 @@ class Qwen25OmniVisionMixin:
         self.clear_capture_buffer()
         self.start_capture()
         gate_m_regs = None
-        qk_compact = getattr(self, "_vis_qk_compact", False)
-        qkv_strip = bool(getattr(self, "vision_qkv_strip", False))
-        mlp_real_n = bool(getattr(self, "vision_mlp_real_n", False))
-        if qkv_strip and not qk_compact:
-            raise ValueError("vision QKV strip write-back requires compact weights")
-        if qkv_strip and (vis["VD_HALF"] % 2 or VD % 2 or VH != VN * VD):
+        # Padding removal is mandatory, not a configuration: Q/K/V project at
+        # their real widths with strip write-back into the padded attention
+        # slots, and gate/up project at real N on a padded row pitch. The only
+        # padding left in this encoder is the inner (reduction) K axis, which
+        # the 64-element quantization block and the attention core require.
+        if vis["VD_HALF"] % 2 or VD % 2 or VH != VN * VD:
             raise ValueError("vision QKV strips require even head halves and VH=VN*VD")
-        if mlp_real_n and vis["VI"] % 4:
+        if vis["VI"] % 4:
             raise ValueError("vision real MLP width must be a multiple of four")
         qk_out_stride_regs = v_out_stride_regs = None
         mlp_out_stride_regs = None
@@ -694,31 +686,28 @@ class Qwen25OmniVisionMixin:
             # after begin_program() resets its allocator.
             gate_m_regs = [self.gf_seq_len]
             gate_m_regs.extend(wk.alloc_isa_reg() for wk in sched.workers)
-            if qk_compact:
-                # gpr_out_row_stride_reg constants (see the qkv_proj emission
-                # below): fixed for the whole program, one register per engine,
-                # primed once here instead of every one of the 80 per-head(-half)
-                # matmul_slot calls per layer.
-                qk_out_stride_regs, v_out_stride_regs = [], []
-                for eng in (self, *sched.workers):
-                    r = eng.alloc_isa_reg()
-                    eng.generate_instruction_add_set(r, 2 * VN * VD_PAD)
-                    qk_out_stride_regs.append(r)
-                    r2 = eng.alloc_isa_reg()
-                    eng.generate_instruction_add_set(r2, VN * VD_PAD)
-                    v_out_stride_regs.append(r2)
-            if mlp_real_n:
-                mlp_out_stride_regs = []
-                for eng in (self, *sched.workers):
-                    r = eng.alloc_isa_reg()
-                    eng.generate_instruction_add_set(r, VI_PAD)
-                    mlp_out_stride_regs.append(r)
-        elif qk_compact:
+            # gpr_out_row_stride_reg constants (see the qkv_proj emission
+            # below): fixed for the whole program, one register per engine,
+            # primed once here instead of every one of the 80 per-head(-half)
+            # matmul_slot calls per layer.
+            qk_out_stride_regs, v_out_stride_regs = [], []
+            for eng in (self, *sched.workers):
+                r = eng.alloc_isa_reg()
+                eng.generate_instruction_add_set(r, 2 * VN * VD_PAD)
+                qk_out_stride_regs.append(r)
+                r2 = eng.alloc_isa_reg()
+                eng.generate_instruction_add_set(r2, VN * VD_PAD)
+                v_out_stride_regs.append(r2)
+            mlp_out_stride_regs = []
+            for eng in (self, *sched.workers):
+                r = eng.alloc_isa_reg()
+                eng.generate_instruction_add_set(r, VI_PAD)
+                mlp_out_stride_regs.append(r)
+        else:
             qk_out_stride_regs = [self.alloc_isa_reg()]
             self.generate_instruction_add_set(qk_out_stride_regs[0], 2 * VN * VD_PAD)
             v_out_stride_regs = [self.alloc_isa_reg()]
             self.generate_instruction_add_set(v_out_stride_regs[0], VN * VD_PAD)
-        if sched is None and mlp_real_n:
             mlp_out_stride_regs = [self.alloc_isa_reg()]
             self.generate_instruction_add_set(mlp_out_stride_regs[0], VI_PAD)
         prev_silent = self._set_silent(True)
@@ -812,11 +801,10 @@ class Qwen25OmniVisionMixin:
         # feature -- so every head's (or half's) N-slice is these many bytes,
         # regardless of which head/half it is. Shared by QK and V (both
         # contract over VH).
-        if qk_compact:
-            data_row_bytes = VH // 2
-            scale_row_bytes = (VH // 64) * 2
-            qk_row_bytes = 2 * VN * VD_PAD * bpe
-            v_row_bytes = VN * VD_PAD * bpe
+        data_row_bytes = VH // 2
+        scale_row_bytes = (VH // 64) * 2
+        qk_row_bytes = 2 * VN * VD_PAD * bpe
+        v_row_bytes = VN * VD_PAD * bpe
         for li in range(VL):
             w = self.vis_layer_addrs[li]
             IN = self.VIS_IO_A if li % 2 == 0 else self.VIS_IO_B
@@ -827,51 +815,18 @@ class Qwen25OmniVisionMixin:
                 flops += self.rms_norm_core_dram(
                     M=VS, N=VH, A_DRAM_ADDR=IN, OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT,
                     GAMMA_DRAM_ADDR=w["norm1_weight"], gpr_M_reg=self._prime_M(VS)) or 0
-                if qkv_strip:
-                    # One Q+K projection and one V projection per layer.
-                    # The strip writer maps each real RoPE half [40] into a
-                    # 64-lane slot, and each real V head [80] into a 128-lane
-                    # attention slot. The pad lanes were zeroed once above.
-                    flops += matmul(
-                        VS, VH, 2 * VH, self.VIS_NORM_OUT, w, "qk", self.VIS_QK,
-                        out_stride_reg=qk_out_stride_regs[0],
-                        strip_cols=VD_HALF, strip_out_stride=VD_PAD // 2)
-                    flops += matmul(
-                        VS, VH, VH, self.VIS_NORM_OUT, w, "v", self.VIS_V,
-                        out_stride_reg=v_out_stride_regs[0],
-                        strip_cols=VD, strip_out_stride=VD_PAD)
-                elif qk_compact:
-                    # Each head (V) / head-half (QK, RoPE) is its own REAL-
-                    # width matmul, writing straight to its final padded slot
-                    # via gpr_out_row_stride_reg -- no scatter, no compact
-                    # staging buffer. See matmul_slot's docstring and
-                    # _vision_dims for the RoPE split-half rationale. Weight
-                    # rows are addressed directly (IF4 blocks are along K,
-                    # not N, so any N-row slice is free address arithmetic).
-                    for proj in range(2):          # 0 = Q, 1 = K
-                        for h in range(VN):
-                            for half in range(2):
-                                n0 = proj * VH + h * VD + half * VD_HALF
-                                OUT_addr = (self.VIS_QK + (proj * VN + h) * VD_PAD * bpe
-                                           + half * (VD_PAD // 2) * bpe)
-                                flops += matmul_slot(
-                                    VS, VH, VD_HALF, self.VIS_NORM_OUT,
-                                    w["qk_data"] + n0 * data_row_bytes,
-                                    w["qk_scale"] + n0 * scale_row_bytes,
-                                    w["qk_bias"] + n0 * bpe,
-                                    OUT_addr, stride_reg=qk_out_stride_regs[0])
-                    for h in range(VN):
-                        n0 = h * VD
-                        OUT_addr = self.VIS_V + h * VD_PAD * bpe
-                        flops += matmul_slot(
-                            VS, VH, VD, self.VIS_NORM_OUT,
-                            w["v_data"] + n0 * data_row_bytes,
-                            w["v_scale"] + n0 * scale_row_bytes,
-                            w["v_bias"] + n0 * bpe,
-                            OUT_addr, stride_reg=v_out_stride_regs[0])
-                else:
-                    flops += matmul(VS, VH, 2 * VN * VD_PAD, self.VIS_NORM_OUT, w, "qk", self.VIS_QK)
-                    flops += matmul(VS, VH, VN * VD_PAD, self.VIS_NORM_OUT, w, "v", self.VIS_V)
+                # One Q+K projection and one V projection per layer, both at
+                # their REAL width. The strip writer maps each real RoPE half
+                # [40] into a 64-lane slot, and each real V head [80] into a
+                # 128-lane attention slot. The pad lanes were zeroed once above.
+                flops += matmul(
+                    VS, VH, 2 * VH, self.VIS_NORM_OUT, w, "qk", self.VIS_QK,
+                    out_stride_reg=qk_out_stride_regs[0],
+                    strip_cols=VD_HALF, strip_out_stride=VD_PAD // 2)
+                flops += matmul(
+                    VS, VH, VH, self.VIS_NORM_OUT, w, "v", self.VIS_V,
+                    out_stride_reg=v_out_stride_regs[0],
+                    strip_cols=VD, strip_out_stride=VD_PAD)
             else:
                 # Row-shard over tokens: norm1 and both projections are
                 # independent per token row.
@@ -885,49 +840,16 @@ class Qwen25OmniVisionMixin:
                         A_DRAM_ADDR=ctx.rows_addr(IN, h_row),
                         OUTPUT_DRAM_ADDR=ctx.rows_addr(self.VIS_NORM_OUT, h_row),
                         GAMMA_DRAM_ADDR=w["norm1_weight"], gpr_M_reg=m) or 0
-                    if qkv_strip:
-                        acc[0] += sh_matmul(
-                            ctx, m, VH, 2 * VH, self.VIS_NORM_OUT, h_row,
-                            w, "qk", self.VIS_QK, qk_row_bytes,
-                            out_stride_reg=qk_out_stride_regs[ctx.engine_idx],
-                            strip_cols=VD_HALF, strip_out_stride=VD_PAD // 2)
-                        acc[0] += sh_matmul(
-                            ctx, m, VH, VH, self.VIS_NORM_OUT, h_row,
-                            w, "v", self.VIS_V, v_row_bytes,
-                            out_stride_reg=v_out_stride_regs[ctx.engine_idx],
-                            strip_cols=VD, strip_out_stride=VD_PAD)
-                    elif qk_compact:
-                        sreg_qk = qk_out_stride_regs[ctx.engine_idx]
-                        sreg_v = v_out_stride_regs[ctx.engine_idx]
-                        for proj in range(2):
-                            for h in range(VN):
-                                for half in range(2):
-                                    n0 = proj * VH + h * VD + half * VD_HALF
-                                    OUT_addr = (self.VIS_QK + (proj * VN + h) * VD_PAD * bpe
-                                               + half * (VD_PAD // 2) * bpe)
-                                    acc[0] += sh_matmul_slot(
-                                        ctx, m, VH, VD_HALF, self.VIS_NORM_OUT, h_row,
-                                        w["qk_data"] + n0 * data_row_bytes,
-                                        w["qk_scale"] + n0 * scale_row_bytes,
-                                        w["qk_bias"] + n0 * bpe,
-                                        OUT_addr, qk_row_bytes, stride_reg=sreg_qk)
-                        for h in range(VN):
-                            n0 = h * VD
-                            OUT_addr = self.VIS_V + h * VD_PAD * bpe
-                            acc[0] += sh_matmul_slot(
-                                ctx, m, VH, VD, self.VIS_NORM_OUT, h_row,
-                                w["v_data"] + n0 * data_row_bytes,
-                                w["v_scale"] + n0 * scale_row_bytes,
-                                w["v_bias"] + n0 * bpe,
-                                OUT_addr, v_row_bytes, stride_reg=sreg_v)
-                    else:
-                        acc[0] += sh_matmul(ctx, m, VH, 2 * VN * VD_PAD,
-                                            self.VIS_NORM_OUT, h_row, w, "qk",
-                                            self.VIS_QK, 2 * VN * VD_PAD * bpe)
-                        acc[0] += sh_matmul(ctx, m, VH, VN * VD_PAD,
-                                            self.VIS_NORM_OUT, h_row, w, "v",
-                                            self.VIS_V, VN * VD_PAD * bpe)
-
+                    acc[0] += sh_matmul(
+                        ctx, m, VH, 2 * VH, self.VIS_NORM_OUT, h_row,
+                        w, "qk", self.VIS_QK, qk_row_bytes,
+                        out_stride_reg=qk_out_stride_regs[ctx.engine_idx],
+                        strip_cols=VD_HALF, strip_out_stride=VD_PAD // 2)
+                    acc[0] += sh_matmul(
+                        ctx, m, VH, VH, self.VIS_NORM_OUT, h_row,
+                        w, "v", self.VIS_V, v_row_bytes,
+                        out_stride_reg=v_out_stride_regs[ctx.engine_idx],
+                        strip_cols=VD, strip_out_stride=VD_PAD)
                 sched.sharded_region(VS, _proj)
                 flops += acc[0]
             _ckpt(f"L{li}:qkv_proj")
@@ -1096,8 +1018,8 @@ class Qwen25OmniVisionMixin:
                     M=VS, N=VH, A_DRAM_ADDR=self.VIS_RESIDUAL,
                     OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT,
                     GAMMA_DRAM_ADDR=w["norm2_weight"], gpr_M_reg=self._prime_M(VS)) or 0
-                mlp_n = vis["VI"] if mlp_real_n else VI_PAD
-                mlp_stride = mlp_out_stride_regs[0] if mlp_real_n else None
+                mlp_n = vis["VI"]
+                mlp_stride = mlp_out_stride_regs[0]
                 flops += matmul(VS, VH, mlp_n, self.VIS_NORM_OUT, w, "gate",
                                 self.VIS_MLP_GATE, silu=True,
                                 out_stride_reg=mlp_stride)
@@ -1143,9 +1065,8 @@ class Qwen25OmniVisionMixin:
                         A_DRAM_ADDR=ctx.rows_addr(self.VIS_RESIDUAL, h_row),
                         OUTPUT_DRAM_ADDR=ctx.rows_addr(self.VIS_NORM_OUT, h_row),
                         GAMMA_DRAM_ADDR=w["norm2_weight"], gpr_M_reg=m) or 0
-                    mlp_n = vis["VI"] if mlp_real_n else VI_PAD
-                    mlp_stride = (mlp_out_stride_regs[ctx.engine_idx]
-                                  if mlp_real_n else None)
+                    mlp_n = vis["VI"]
+                    mlp_stride = mlp_out_stride_regs[ctx.engine_idx]
                     acc[0] += sh_matmul(ctx, m, VH, mlp_n, self.VIS_NORM_OUT,
                                         h_row, w, "gate", self.VIS_MLP_GATE,
                                         mlp_row, silu=True,
@@ -1203,30 +1124,26 @@ class Qwen25OmniVisionMixin:
         self.generate_instruction_halt()
         worker_addrs = sched.finalize() if sched is not None else []
         if sched is not None:
-            if mlp_real_n:
-                for wk in reversed(sched.workers):
-                    wk.release_isa_reg()
-                self.release_isa_reg()
-            if qk_compact:
-                # Release in exact reverse of the per-engine alloc order
-                # (qk_out_stride_regs then v_out_stride_regs, self then
-                # workers) -- alloc_isa_reg/release_isa_reg is a LIFO counter
-                # per engine, not a general allocator.
-                for wk, qreg, vreg in reversed(
-                    list(zip(sched.workers, qk_out_stride_regs[1:], v_out_stride_regs[1:]))
-                ):
-                    wk.release_isa_reg()
-                    wk.release_isa_reg()
-                self.release_isa_reg()
-                self.release_isa_reg()
+            for wk in reversed(sched.workers):
+                wk.release_isa_reg()
+            self.release_isa_reg()
+            # Release in exact reverse of the per-engine alloc order
+            # (qk_out_stride_regs then v_out_stride_regs, self then workers)
+            # -- alloc_isa_reg/release_isa_reg is a LIFO counter per engine,
+            # not a general allocator.
+            for wk, qreg, vreg in reversed(
+                list(zip(sched.workers, qk_out_stride_regs[1:], v_out_stride_regs[1:]))
+            ):
+                wk.release_isa_reg()
+                wk.release_isa_reg()
+            self.release_isa_reg()
+            self.release_isa_reg()
             for wk in reversed(sched.workers):
                 wk.release_isa_reg()
         else:
-            if mlp_real_n:
-                self.release_isa_reg()
-            if qk_compact:
-                self.release_isa_reg()
-                self.release_isa_reg()
+            self.release_isa_reg()
+            self.release_isa_reg()
+            self.release_isa_reg()
         self._set_silent(prev_silent)
         self.stop_capture()
 

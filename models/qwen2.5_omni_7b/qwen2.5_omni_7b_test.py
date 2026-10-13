@@ -2938,8 +2938,6 @@ def _request_signature(ue, args, context, tokens, processed) -> dict:
             + (["t2w"] if args.speak is not None and not args.speak_host
                and not args.token2wav_host else [])),
         "vision_res": args.vision_res, "frames": int(args.frames),
-        "vision_qkv_strip": bool(args.vis_qkv_strip),
-        "vision_mlp_real_n": bool(args.vis_mlp_real_n),
         "max_context": int(ue.MAX_CONTEXT_SIZE), "profile": bool(args.profile),
         "prefill_tokens": len(context), "prompt_tokens": len(tokens),
         "t2w_max_codes": int(T2W_FPGA_MAX_CODES),
@@ -4027,21 +4025,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=f"optional image; bare --image uses {os.path.basename(DEFAULT_IMAGE)}",
     )
     parser.add_argument(
-        "--vis-qkv-strip", action="store_true",
-        help="experimental software-only preparation: fuse each vision Q/K "
-             "projection into one real-width matmul (40-column RoPE-half "
-             "strips) and V into one (80-column head strips), writing into "
-             "128-lane attention slots. Requires unaligned-DMA hardware; "
-             "default off and not hardware-verified",
-    )
-    parser.add_argument(
-        "--vis-mlp-real-n", action="store_true",
-        help="experimental software-only preparation: vision gate/up use "
-             "real N=3420 with row pitch 3456; down K remains 3456. "
-             "Requires unaligned-DMA hardware; default off and not "
-             "hardware-verified",
-    )
-    parser.add_argument(
         "--frames", type=int, default=1, metavar="N",
         help="with --image, encode this many camera frames in one real "
              "continuous run (a multi-camera workload) instead of one. Each "
@@ -4176,10 +4159,6 @@ def run_summary_filename(args) -> str:
             parts.append("t2whost")
     if getattr(args, "profile", False):
         parts.append("profile")
-    if getattr(args, "vis_qkv_strip", False):
-        parts.append("vis-qkv-strip")
-    if getattr(args, "vis_mlp_real_n", False):
-        parts.append("vis-mlp-real-n")
     parts.append(f"multi-core_{args.multi_core}")
     return "_".join(parts) + ".md"
 
@@ -4212,8 +4191,6 @@ def main() -> None:
         print("[run_from_bin] only applies to --layout flat; the windowed layout "
               "always builds its programs")
         args.run_from_bin = False
-    if (args.vis_qkv_strip or args.vis_mlp_real_n) and not args.image:
-        parser.error("vision pad-removal switches require --image")
     with _exclusive_run_lock():
         _main_locked(parser, args)
 
@@ -4291,8 +4268,6 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         fpga_talker=args.speak is not None and not args.speak_host,
         layout=args.layout,
         flat_plan=flat_plan,
-        vision_qkv_strip=args.vis_qkv_strip,
-        vision_mlp_real_n=args.vis_mlp_real_n,
         **engine_kwargs
     )
     ue.speak_as = args.speak          # before lm_tensor_init sizes the buffers
