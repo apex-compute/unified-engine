@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 
 UE_HW_INFO_ADDR = 0x000000A0
-MAX_FREQUENCY_MHZ_Q8 = 0x1FFFFF
+MAX_FREQUENCY_MHZ_Q8 = 0xFFFFF
 
 
 @dataclass(frozen=True)
@@ -15,6 +15,7 @@ class HardwareInfo:
     dram_size_code: int
     dram_size_gb: int
     core_count: int
+    vector_size: int
     frequency_mhz_q8: int
     frequency_mhz: float
     frequency_hz: float
@@ -28,6 +29,7 @@ def format_hardware_info(info: HardwareInfo) -> str:
         f"AXI={info.axi_data_width_bits} bits, "
         f"DRAM={info.dram_size_gb} GiB, "
         f"cores={info.core_count}, "
+        f"lanes={info.vector_size}, "
         f"clock_q8=0x{info.frequency_mhz_q8:06x}, "
         f"clock={info.frequency_mhz:.6f} MHz, "
         f"period={1000.0 / info.frequency_mhz:.9f} ns"
@@ -35,7 +37,7 @@ def format_hardware_info(info: HardwareInfo) -> str:
 
 
 def decode_hardware_info(raw_value: int) -> HardwareInfo:
-    """Decode and validate queue, AXI, DRAM, topology, and Q13.8 MHz fields."""
+    """Decode queue, AXI, DRAM, topology, lane bit 20, and Q12.8 MHz."""
     raw = raw_value & 0xFFFFFFFF
     queue_mode = bool((raw >> 31) & 0x1)
     axi_width_code = (raw >> 29) & 0x3
@@ -48,6 +50,7 @@ def decode_hardware_info(raw_value: int) -> HardwareInfo:
     core_count = (raw >> 21) & 0x1F
     if core_count == 0:
         raise RuntimeError(f"Invalid HW_INFO core count 0 in 0x{raw:08x}")
+    vector_size = 128 if raw & (1 << 20) else 64
     frequency_mhz_q8 = raw & MAX_FREQUENCY_MHZ_Q8
     frequency_mhz = frequency_mhz_q8 / 256.0
     frequency_hz = frequency_mhz * 1_000_000.0
@@ -62,6 +65,7 @@ def decode_hardware_info(raw_value: int) -> HardwareInfo:
         dram_size_code=dram_size_code,
         dram_size_gb=dram_size_gb,
         core_count=core_count,
+        vector_size=vector_size,
         frequency_mhz_q8=frequency_mhz_q8,
         frequency_mhz=frequency_mhz,
         frequency_hz=frequency_hz,
