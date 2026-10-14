@@ -151,8 +151,7 @@ def bf16_patching_core(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR
                                 + row_idx * W * bytes_per_element
                                 + patch_offset_bytes)
                     ue.ue_memcpy_from_dram(src_dram, input_bytes_per_uram_row, 0,
-                                           uram_addr, URAM_SECTION.URAM_A.value, ue._inst_id)
-                    ue._inst_id += 1
+                                           uram_addr, URAM_SECTION.URAM_A.value)
 
             # Project: for each patch in group, load weight to URAM_B, bf16 matvec
             output_sram_base = output_row_uram_addr * UE_VECTOR_SIZE * bytes_per_element
