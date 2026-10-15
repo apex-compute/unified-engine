@@ -301,6 +301,12 @@ Options:
 ./update_fpga.sh --force                     # reflash even if already up to date
 ```
 
+### Files synced from andromeda
+
+The hardware library (`user_dma_core.py`, `user_hw_test.py`, `andromeda_hw_info.py`, …), `requirements.txt` and several model directories are owned by the [andromeda](https://github.com/apex-compute/andromeda) repo and synced here by `pcie_utils/sync_unified_engine.sh` (sync PRs titled `sync pcie_only <hash>`). `.synced-from` (written by each sync) lists every synced file and the andromeda commit they came from — don't edit it by hand.
+
+You can still fix a synced file here. The overnight andromeda CI back-syncs such edits: it three-way merges them onto andromeda, validates them on hardware, and opens a `pcie_utils: back-sync unified-engine <sha>` PR in andromeda, so the next sync keeps them instead of overwriting them. If the merge conflicts or the hardware test fails, the sync PR here is left as a draft (do not merge it) and an andromeda issue `back-sync blocked: unified-engine <sha>` explains what to resolve. Deleting a synced file here is not carried back — remove it from the list in andromeda instead.
+
 ### Kintex-7 encrypted BIN + eFUSE provisioning over JTAG
 
 [`provision_kintex7.py`](provision_kintex7.py) handles the unified-engine
