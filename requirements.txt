@@ -1,15 +1,42 @@
---extra-index-url https://download.pytorch.org/whl/cpu
+# One environment for andromeda/pcie_utils and unified-engine. This file is the
+# source of truth: sync_unified_engine.sh copies it to unified-engine's
+# requirements.txt, so edit it here.
+#
+#   python3 -m pip install -r requirements.txt
+#
+--extra-index-url https://download.pytorch.org/whl/cu130
 
-torch>=2.4
-torchvision>=0.23.0
-torchaudio>=2.4
-soundfile
-numpy<2
-# >=5.5.0: models/gemma4_e2b pulls google/gemma-4-E2B-it, whose config declares
-# model_type "gemma4". That key only exists in transformers' CONFIG_MAPPING from the
-# 5.x line; on 4.x AutoConfig raises `KeyError: 'gemma4'`. 5.5.0 is the version
-# verified to register gemma4/gemma4_text/gemma4_vision/gemma4_audio.
-transformers>=5.5.0
-huggingface-hub>=0.20.0
+# torch/torchvision/torchaudio are pinned EXACTLY. The hardware tests generate
+# their inputs from fixed seeds, and torch 2.12 changed the values that
+# torch.randn (bf16/fp16, >=16 elements) and torch.rand (bf16/fp16) return for
+# the same seed, which silently changes every test's input data. Bump torch only
+# together with a new user_hw_test.py baseline. CPU and CUDA builds of the same
+# version draw identical values, so a CPU-only install may use the +cpu wheel.
+torch==2.11.0
+torchvision==0.26.0
+torchaudio==2.11.0
+numpy>=1.26,<2
+# Pinned to the version unified-engine's model_auto_test.py passes with.
+# gemma4 needs >=5.5 (its model_type is only in the 5.x CONFIG_MAPPING), and
+# 5.19 breaks qwen3.5's vision model (Qwen3_5VisionModel has no
+# fast_pos_embed_interpolate).
+transformers==5.12.1
+accelerate>=0.25.0
+huggingface_hub>=0.20.0
 pillow>=12.1.1
+soundfile>=0.12,<1
 sentencepiece
+
+# unified-engine models/kokoro: text front-end, validated with these versions.
+# misaki pip-installs spaCy's English model at runtime when it is missing, so
+# it is pinned here instead.
+kokoro==0.9.4
+misaki==0.9.4
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl#sha256=1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85
+
+# Convolution models: dpdfnet/dpdfnet8khz load and check their ONNX graphs;
+# bigcodec uses einops and librosa (yolov5s/yolov5n/unet need nothing extra).
+onnx>=1.17,<2
+onnxruntime>=1.20,<2
+einops>=0.8,<1
+librosa>=0.10,<2
