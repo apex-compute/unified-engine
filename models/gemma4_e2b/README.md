@@ -3,151 +3,128 @@
 Gemma4 E2B accelerator inference. Three modes — text only (LM), image +
 text (VLM), and audio + text — run from a single instruction bin.
 
-## Two scripts, two stages
-
-| Stage | Script | Notes |
-|---|---|---|
-| Build (once) | `gemma4_e2b_test.py` | Builds `gemma4_instruction.bin` + `weights_gemma4_e2b_hf.bin`, then sanity-runs. Needs the HF model locally. Default build includes LM + VLM + audio unless `GEMMA4_LM_ONLY_BIN=1`. |
-| Deploy (every run after) | `gemma4_e2b_run_from_bin.py` | Loads the bin files and runs. Never touches the HF model. |
-
-After the first `gemma4_e2b_test.py` run, every subsequent invocation
-(either script, any mode present in the bin) skips compilation.
-
-## Files
-
-- **gemma4_e2b_test.py** – Build + run. Builds the unified bin and the
-  combined weight bin on first invocation; otherwise just runs.
-- **gemma4_e2b_run_from_bin.py** – Execute-only. Loads bin files,
-  refuses to compile, no HF model on disk required.
-- **gemma4_e2b_config.json** – Model + layout config.
-- **gemma4_e2b_bin/** – On-disk artifacts:
-  - `gemma4_instruction.bin` + `.json` – unified ISA. Full multimodal bin
-    is 14.39 MiB on disk (15,086,688 B): LM prefill + decode + vision
-    + audio encoders + vision RoPE tables. Used size by mode: LM-only
-    5.78 MiB, VLM 7.24 MiB, audio 12.93 MiB.
-  - `weights_gemma4_e2b_hf.bin` + `.json` – combined weights (~7 GB)
-    with sections: `[LM | vision | audio | host]`.
-  - `tokenizer/` – minimal tokenizer + processor configs (~32 MB).
-
-## Prerequisites
-
-- Run from the **repo root** so `user_dma_core` is on the path.
-- Python with `torch`, `transformers >= 5.5.0`, `Pillow`,
-  and FPGA device access via xdma.
-- Build stage only: HF model `google/gemma-4-E2B-it` is downloaded
-  automatically into `gemma4_e2b_bin/gemma-4-E2B-it/` on first run.
-- Deploy stage: no HF model directory required.
-
-## Build / sanity-check — `gemma4_e2b_test.py`
+## Controller placement and current validation
 
 ```bash
-# VLM (recommended first run — builds vision encoder into the bin)
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py --vision-enable
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py --image my.jpg --prompt "?"
-
-# Audio
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py --audio-enable
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py --audio my.wav --prompt "Describe this audio."
-
-# LM only
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py --prompt "What is 2+2?"
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma1 --multi-core 2 \
+  --prefill-kernel matmatmul --max-new-tokens 32 --prompt "x+3=5, what is x?"
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 --multi-core 8 \
+  --prefill-kernel matmatmul --max-new-tokens 32 --prompt "x+3=5, what is x?"
+python tests/model_controller_benchmark.py --dev xdma0 --engines 8 --models e2b \
+  --prompt "x+3=5, what is x?" --max-new-tokens 32 \
+  --json e2b-controller-results.json
 ```
 
-The first run builds the instruction bin and combined weight bin. Subsequent
-runs just load and execute.
+The existing eight-engine tiled/shared-pool map is preserved. Smaller
+configurations now select private windows by the board's memory-controller map
+and reserve the shared model span. The two-engine, 4 GiB Kintex image instead
+uses two 2 GiB tiles at `0x00000000` and `0x80000000`, one per DDR3 controller.
+MLP shards are loaded directly from the host weight file, with no duplicate
+shared MLP image. Each tile reserves 1 GiB for private weights, 16 MiB for ISA,
+and 64 MiB for private scratch. Compact shared weights (about 540 MiB) and a
+contiguous 480 MiB tensor arena fit in the remaining tails. A conservative
+703 MiB/core private-weight budget includes both decode and prefill down
+layouts and is checked before loading weights. Other multicore configurations
+require at least 8 GiB. Program sections in `programs.bin`/`programs.json`
+record a placement hash, so equal engine counts on U50 and U55C cannot reuse
+instructions with different baked addresses.
 
-Force a clean rebuild:
+The 32-token comparison now passes with exact, meaningful outputs on both
+boards for the prompt above:
+
+| Board | Engines | Single-engine decode | Multicore decode | Speedup |
+|---|---:|---:|---:|---:|
+| Kintex7, 4 GiB | 2 | 224.09 ms/token | 125.80 ms/token | 1.78× |
+| Alveo U50, 8 GiB | 8 | 141.18 ms/token | 33.79 ms/token | 4.18× |
+
+The earlier repeatability failure came from the prefill entry: it followed a
+32-byte flag-clear instruction, but the absolute-jump encoder rounded its
+target up to a 64-byte boundary and skipped the first input DMA load. Prefill
+and decoder entries now have explicit 64-byte alignment, runtime dispatch
+rejects misaligned targets, and program format version 2 rejects cached images
+with the old entry. Fresh Kintex two-engine and U50 eight-engine repeats both
+produce the same tokens.
+See `../../tests/kintex7_gemma4_e2b_controller_results.json` and
+`../../tests/alveo_u50_gemma4_e2b_controller_results.json` for the corrected results.
+The older failed comparisons remain diagnostic records of that resolved bug.
+
+`--max-new-tokens` limits generation without changing the compiled context/KV
+layout. The comparison runner rejects empty decoded text and padding-only
+output, even when token lists match. U55C placement has offline coverage;
+U55C hardware results are not available.
+
+## Build and run
+
+Run these commands from the repository root with FPGA access through XDMA.
+The Python environment needs PyTorch, Transformers with Gemma4 support,
+Hugging Face Hub, and the dependencies for the selected image or audio mode.
+Weight generation downloads `google/gemma-4-E2B-it` when the configured local
+checkpoint is absent; access to that checkpoint must be available.
+
+`gemma4_e2b_test.py` handles weight preparation, instruction compilation, and
+execution. It generates missing `params.bin` weights, then recompiles the
+instruction image on each run by default. `--bin-reuse` reuses compatible
+cached sections; incompatible or missing sections are compiled again. Omit
+`--bin-reuse` to force a fresh instruction build without regenerating weights.
 
 ```bash
-rm gemma4_e2b_bin/gemma4_instruction.bin gemma4_e2b_bin/gemma4_instruction.json
-rm gemma4_e2b_bin/weights_gemma4_e2b_hf.bin gemma4_e2b_bin/weights_gemma4_e2b_hf.json
-python src/template/models/gemma4_e2b/gemma4_e2b_test.py --vision-enable
+# Text; --dev selects the board and defaults to xdma0.
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 \
+  --prompt "What is 2+2?" --max-new-tokens 32
+
+# Reuse a compatible compiled image.
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 \
+  --prompt "What is 2+2?" --max-new-tokens 32 --bin-reuse
+
+# Image or audio input; supply an existing local file.
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 \
+  --image my.jpg --prompt "Describe this image." --max-new-tokens 32
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 \
+  --audio my.wav --prompt "Describe this audio." --max-new-tokens 32
+
+# Per-phase hardware profiling.
+python models/gemma4_e2b/gemma4_e2b_test.py --dev xdma0 --profile
 ```
 
-## Deploy / demo — `gemma4_e2b_run_from_bin.py`
+The controller comparisons above validate text inference. Image and audio
+examples use the same entrypoint and select their respective encoder paths.
+`--image` or `--audio` without a filename selects the bundled default sample;
+the two modes are mutually exclusive. `--vision-host` with `--image` runs the
+vision encoder on the host while keeping LM prefill and decode on the FPGA.
 
-Execute-only. Refuses to compile, never imports the HF model class.
+## Files and caches
 
-```bash
-# LM
-python src/template/models/gemma4_e2b/gemma4_e2b_run_from_bin.py
-python src/template/models/gemma4_e2b/gemma4_e2b_run_from_bin.py --prompt "What is 2+2?"
+Paths below are relative to `models/gemma4_e2b/`:
 
-# VLM
-python src/template/models/gemma4_e2b/gemma4_e2b_run_from_bin.py --vision-enable
-python src/template/models/gemma4_e2b/gemma4_e2b_run_from_bin.py --image my.jpg --prompt "?"
+- `gemma4_e2b_test.py`: main CLI and shared engine configuration.
+- `gemma4_e2b_lm.py`, `gemma4_e2b_vision.py`, `gemma4_e2b_audio.py`: model stages.
+- `gemma4_e2b_config.json`: model dimensions, memory layout, and checkpoint paths.
+- `gemma4_e2b_bin/params.bin` and `params.json`: generated weights and manifest.
+- `gemma4_e2b_bin/programs.bin` and `programs.json`: captured instruction
+  sections and metadata for the selected run configuration.
+- `gemma4_e2b_bin/programs_profile.bin` and `programs_profile.json`: separate
+  instruction cache for `--profile`.
+- `gemma4_e2b_bin/gemma-4-E2B-it/`: local Hugging Face checkpoint.
+- `gemma4_e2b_bin/tokenizer/`: bundled tokenizer and processor files.
 
-# Audio
-python src/template/models/gemma4_e2b/gemma4_e2b_run_from_bin.py --audio-enable
-python src/template/models/gemma4_e2b/gemma4_e2b_run_from_bin.py --audio my.wav --prompt "Describe this audio."
-```
+Cache metadata includes placement, engine count, kernel selection, prompt
+length, and program format. Reuse does not make this an execute-only deployment
+script; the same CLI still prepares the model and compiles missing sections.
 
-### Deploy footprint
+## Engine options and context limits
 
-```
-gemma4_e2b_run_from_bin.py
-gemma4_e2b_config.json
-user_dma_core.py + quant_lib.py
-gemma4_e2b_bin/
-  gemma4_instruction.bin + .json       (14.39 MiB full multimodal)
-  weights_gemma4_e2b_hf.bin  + .json   (~7 GB; LM + vision + audio + host sections)
-  tokenizer/                           (~32 MB)
-```
+Clock frequency, AXI width, memory capacity, and available engine count come
+from the selected FPGA's `HW_INFO` register. `--multi-core N` selects the number
+of engines; bare `--multi-core` selects two. Multicore runs select the
+`matmatmul` prefill kernel. `--prefill-kernel`, `--decode-kernel`, and
+`--vision-kernel` expose the supported `streaming` or `matmatmul` choices,
+subject to hardware validation. Use `--help` for all options.
 
-## Flags
-
-- `--dev xdma0 --cycle 5.62` — DMA device and clock cycle (defaults).
-- `--local-weights` — use the local full-model weights bin.
-- `--image PATH` implies `--vision-enable`; `--vision-enable` alone
-  uses the default image at `../../test_samples/yosemite.jpg`.
-- `--audio PATH` implies `--audio-enable`; `--audio-enable` alone
-  uses the default audio at `../../test_samples/apex.wav`.
-- `GEMMA4_LM_ONLY_BIN=1` during build skips the vision/audio instruction
-  sections for a smaller LM-only artifact.
-
-## Prompt-length limits
-
-The model ships as a single prefill template plus a single dynamic
-decoder program (`prefill_max_seq_len` and bucket-dispatched decoder;
-no per-bucket ISA copies):
-
-- **`prefill_max_seq_len` (config, default `512`)** — prompts up to
-  this length are supported. Shorter prompts are extended in the host
-  buffer with the last real token for the static prefill template;
-  decode starts from the actual prompt length, so those extra KV rows
-  are not used as context.
-- **Decoder:** single captured program serves all context lengths
-  up to `max_context_size` (default `1024`) via the
-  `decoder_group_attention_core` bucket dispatcher.
-
-Both knobs live in `gemma4_e2b_config.json`. Increasing
-`prefill_max_seq_len` linearly grows the prefill ISA in
-`gemma4_instruction.bin`; the decoder bin size is fixed.
-
-## OpenAI-compatible server — `serve_openai.py`
-
-Long-running chat server over the same execute-only runtime. Loads the
-bins once, then serves `POST /v1/chat/completions` (streaming SSE and
-non-streaming), `GET /v1/models`, `GET /health`. Works with any
-OpenAI-compatible client: curl, the `openai` SDK, chat UIs.
-
-```bash
-python3 models/gemma4_e2b/serve_openai.py --port 8080
-
-curl -sN http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"What is 2+2?"}],"temperature":0,"stream":true,"max_tokens":64}'
-```
-
-Notes:
-
-- Decode is greedy by construction (the LM head ends in the hardware
-  argmax; logits never cross PCIe), so `temperature > 0` is rejected
-  with a clear error unless the server runs with `--force-greedy`.
-- Multi-turn conversations are templated with the model's chat template;
-  `system` text is folded into the first user turn. The templated prompt
-  must fit `prefill_max_seq_len`; generation caps at `max_context_size`.
-- One request at a time; concurrent requests get 503 while the engine
-  is busy. Text-only for now (vision/audio are natural follow-ups).
-- Same flags as the other scripts where relevant: `--dev`, `--cycle`,
-  `--local-weights`.
+The checked-in configuration sets `max_prefill_seq_len` and
+`prefill_max_seq_len` to 512 and `max_context_size` to 4096. Prefill processes
+all prompt tokens except the final one, which starts decoding. Its runtime
+row counts follow the actual prompt; the preparation projection uses the
+configured template maximum. A dynamic decoder serves subsequent context
+lengths. `--max-new-tokens` caps generation without resizing that compiled
+context layout. Changes to these configuration limits require recompilation
+and sufficient tensor/KV memory.

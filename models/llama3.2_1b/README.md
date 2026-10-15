@@ -46,10 +46,52 @@ python models/llama3.2_1b/llama3.2_1b_IF8.py --prompt "What is 2+2?" \
 
 # Override the board clock when needed (Kintex-7 default: 5.0422 ns / 198.33 MHz)
 python models/llama3.2_1b/llama3.2_1b_test.py --cycle 5.0422
+
+# IF4 controller-private decode: two DDR controllers on Kintex-7
+python models/llama3.2_1b/llama3.2_1b_test.py --dev xdma1 --multi-core 2
+
+# IF4 decode across the eight U50 engines
+python models/llama3.2_1b/llama3.2_1b_test.py --dev xdma0 --multi-core 8
 ```
 
 Both precision variants use a 1024-token decode context and 4096-position RoPE
 tables. The prompt/prefill limit remains 128 tokens.
+
+## Controller-private IF4 decode
+
+`--multi-core N` column-shards Q/K/V, attention output, gate/up/down, and the
+LM head into private controller windows. Each token launches paired primary
+and worker programs, joins their output slices, and selects the global argmax.
+Projections with fewer than N blocks of 64 columns stay on the primary. Decode
+uses the streaming kernel; `--profile` currently requires one engine.
+
+The original model map moves together, preserving weight and tensor offsets.
+On 4 GiB Kintex-7, the shared model occupies [1,3) GiB and the two 512 MiB
+private windows start at 0 and 3 GiB, on separate DDR controllers. U50 uses
+its physical controller windows and a shared [6,8) GiB model. U55C placement
+accounts for its 1 GiB controller regions and HBM stack bit. That board's
+layout is covered offline but has not been measured on hardware.
+
+Prefill retains row-sharding of the MLP using shared original weights. Worker
+loop registers are reserved separately from temporary kernel registers and
+released after each layer. Program cache keys include the engine count and
+actual memory placement; multi-engine runs compile both streams together.
+
+On p2's Kintex-7 image `0xd6c77283`, the prompt
+`Solve 2x + 3 = 7. Reply with only the value of x.` produced the same 36 token
+IDs (including stop) with one and two engines. Average FPGA decode latency
+fell from 118.18 ms to 64.97 ms/token, approximately 1.82× faster. U50 image
+`0xe6703022` also matched all 36 token IDs: eight engines reduced average
+decode from 74.45 ms to 16.38 ms/token, approximately 4.54× faster. Reproduce
+the token comparison and save timings with:
+
+```bash
+python tests/model_controller_benchmark.py --dev xdma1 --engines 2 \
+  --models llama --json kintex7-llama.json
+```
+
+The IF8 script has a separate implementation and does not expose this
+multi-engine decode option.
 
 ## Measured prefill performance
 

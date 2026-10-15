@@ -1,0 +1,95 @@
+{
+  "hostname": "p2",
+  "device": "xdma0",
+  "image": "0xe6703022",
+  "hardware_info": {
+    "raw": 2298563925,
+    "queue_mode": true,
+    "axi_data_width_bits": 256,
+    "dram_size_code": 2,
+    "dram_size_gb": 8,
+    "core_count": 8,
+    "frequency_mhz_q8": 85333,
+    "frequency_mhz": 333.33203125,
+    "frequency_hz": 333332031.25
+  },
+  "timestamp_utc": "2026-10-07T08:23:56.123904+00:00",
+  "prompt": "Solve 2x + 3 = 7. Reply with only the value of x.",
+  "max_new_tokens": 128,
+  "models": {
+    "qwen_vl": {
+      "runs": [
+        {
+          "token_ids": [
+            87,
+            284,
+            220,
+            17,
+            151645
+          ],
+          "decoded_text": "x = 2",
+          "decoded_tokens": 5,
+          "decode_first_hw_ms": 211.0077682490947,
+          "decode_avg_hw_ms": 210.9992050156446,
+          "model_base": 2147483648,
+          "private_windows": null,
+          "active_engines": 1,
+          "wall_seconds": 13.937727864999943
+        },
+        {
+          "token_ids": [
+            87,
+            284,
+            220,
+            17,
+            151645
+          ],
+          "decoded_text": "x = 2",
+          "decoded_tokens": 5,
+          "decode_first_hw_ms": 33.619763327200495,
+          "decode_avg_hw_ms": 33.6202625291505,
+          "model_base": 6442450944,
+          "private_windows": [
+            [
+              0,
+              536870912
+            ],
+            [
+              1073741824,
+              536870912
+            ],
+            [
+              2147483648,
+              536870912
+            ],
+            [
+              1610612736,
+              536870912
+            ],
+            [
+              536870912,
+              536870912
+            ],
+            [
+              3758096384,
+              536870912
+            ],
+            [
+              3221225472,
+              536870912
+            ],
+            [
+              2684354560,
+              536870912
+            ]
+          ],
+          "active_engines": 8,
+          "wall_seconds": 12.203864649000025
+        }
+      ],
+      "exact_token_match": true,
+      "first_token_speedup": 6.276301418171383,
+      "average_token_speedup": 6.275953521561511
+    }
+  }
+}

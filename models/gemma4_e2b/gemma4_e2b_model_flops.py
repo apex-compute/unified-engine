@@ -181,7 +181,8 @@ def _per_layer_input_phases(cfg: dict, tokens: int) -> tuple[int, int]:
     return per_layer_prepare, inject
 
 
-def _layer_breakdown(cfg: dict, tokens: int, kv_sum_by_layer) -> dict[str, int]:
+def _layer_breakdown(cfg: dict, tokens: int, kv_sum_by_layer,
+                     kv_shared_layers=()) -> dict[str, int]:
     """qkv / o / mlp / attention, each summed over every layer separately.
 
     Kept as four buckets rather than one total because prefill and decode
@@ -203,11 +204,17 @@ def _layer_breakdown(cfg: dict, tokens: int, kv_sum_by_layer) -> dict[str, int]:
     t = int(tokens)
 
     out = {"qkv": 0, "o": 0, "mlp": 0, "attention": 0}
+    shared = {int(i) for i in kv_shared_layers}
     for layer_idx in range(layers):
         head_dim, q_width, kv_width = _layer_dims(cfg, layer_idx)
         mlp = _mlp_width(cfg, layer_idx)
 
-        out["qkv"] += gemm(t, hidden, q_width) + 2 * gemm(t, hidden, kv_width)
+        # KV-shared layers have their own Q projection but reuse K/V produced
+        # by an earlier layer. Do not price nonexistent K/V projections as
+        # useful model work (the compiled program omits them too).
+        out["qkv"] += gemm(t, hidden, q_width)
+        if layer_idx not in shared:
+            out["qkv"] += 2 * gemm(t, hidden, kv_width)
         out["o"] += gemm(t, q_width, hidden)
         out["mlp"] += 2 * gemm(t, hidden, mlp) + gemm(t, mlp, hidden)
 
@@ -216,7 +223,8 @@ def _layer_breakdown(cfg: dict, tokens: int, kv_sum_by_layer) -> dict[str, int]:
     return out
 
 
-def prefill_flops_by_phase(cfg: dict, seq_len: int) -> dict[str, int]:
+def prefill_flops_by_phase(cfg: dict, seq_len: int,
+                           kv_shared_layers=()) -> dict[str, int]:
     """Same total as prefill_flops, broken out by compile_prefill's own
     checkpoint names: per_layer_prepare, qkv_vproj, rope(=0), q_permute(=0),
     attention, mlp (o_proj bundled in, see _layer_breakdown), inject.
@@ -231,7 +239,7 @@ def prefill_flops_by_phase(cfg: dict, seq_len: int) -> dict[str, int]:
     def kv_sum(_layer_idx: int, is_global: bool) -> int:
         return _causal_windowed_kv_sum(n, None if is_global else window)
 
-    layer = _layer_breakdown(cfg, n, kv_sum)
+    layer = _layer_breakdown(cfg, n, kv_sum, kv_shared_layers)
     prepare, inject = _per_layer_input_phases(cfg, n)
     return {
         "per_layer_prepare": prepare,
@@ -244,12 +252,14 @@ def prefill_flops_by_phase(cfg: dict, seq_len: int) -> dict[str, int]:
     }
 
 
-def prefill_flops(cfg: dict, seq_len: int) -> int:
+def prefill_flops(cfg: dict, seq_len: int, kv_shared_layers=()) -> int:
     """Prefill fills the KV cache and stops -- no LM head here."""
-    return sum(prefill_flops_by_phase(cfg, seq_len).values())
+    return sum(prefill_flops_by_phase(
+        cfg, seq_len, kv_shared_layers).values())
 
 
-def decode_step_flops_by_phase(cfg: dict, context_len: int) -> dict[str, int]:
+def decode_step_flops_by_phase(cfg: dict, context_len: int,
+                               kv_shared_layers=()) -> dict[str, int]:
     """Same total as decode_step_flops, broken out by compile_decoder's own
     checkpoint names: per_layer_prepare, qkv_vproj, rope(=0), attention,
     o_proj, mlp, inject, lm_head -- o_proj and mlp are SEPARATE phases here,
@@ -266,7 +276,7 @@ def decode_step_flops_by_phase(cfg: dict, context_len: int) -> dict[str, int]:
     def kv_sum(_layer_idx: int, is_global: bool) -> int:
         return c if is_global else min(c, window)
 
-    layer = _layer_breakdown(cfg, 1, kv_sum)
+    layer = _layer_breakdown(cfg, 1, kv_sum, kv_shared_layers)
     prepare, inject = _per_layer_input_phases(cfg, 1)
     return {
         "per_layer_prepare": prepare,
@@ -281,11 +291,14 @@ def decode_step_flops_by_phase(cfg: dict, context_len: int) -> dict[str, int]:
     }
 
 
-def decode_step_flops(cfg: dict, context_len: int) -> int:
+def decode_step_flops(cfg: dict, context_len: int, kv_shared_layers=()) -> int:
     """One greedy step at ``context_len`` KV rows, including the LM head."""
-    return sum(decode_step_flops_by_phase(cfg, context_len).values())
+    return sum(decode_step_flops_by_phase(
+        cfg, context_len, kv_shared_layers).values())
 
 
-def decode_flops(cfg: dict, context_lengths: Sequence[int]) -> int:
+def decode_flops(cfg: dict, context_lengths: Sequence[int],
+                 kv_shared_layers=()) -> int:
     """Every step of a decode run, priced at the KV length it actually saw."""
-    return sum(decode_step_flops(cfg, n) for n in context_lengths)
+    return sum(decode_step_flops(cfg, n, kv_shared_layers)
+               for n in context_lengths)

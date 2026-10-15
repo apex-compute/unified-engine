@@ -81,3 +81,28 @@ python models/smolvlm2/smolvlm2_test.py --decode-matmat_mul_core-enable \
 python models/smolvlm2/smolvlm2_run_from_bin.py --decode-matmat_mul_core-enable \
     --image test_samples/vette.jpg --prompt "Describe this image."
 ```
+
+## Controller-private decode weights
+
+`--decode-engines 2`, `4`, or `8` now copies each engine's IF4 gate/up column
+slices into board-selected private memory before compiling decode. These are
+actual weight copies; vision, prefill, the other decode projections, and their
+activations retain the existing algorithms. The worker objects remain shared
+between stages so one stage cannot overwrite another's programs.
+
+```bash
+python models/smolvlm2/smolvlm2_test.py --dev xdma1 --engines 2 --decode-engines 2 --lm-enable --greedy-enable
+python models/smolvlm2/smolvlm2_test.py --dev xdma0 --engines 8 --decode-engines 8 --lm-enable --greedy-enable
+```
+
+Kintex7 places the shared 2 GiB model at 1–3 GiB and private weight windows at
+0 and 3 GiB, using both DDR controllers. U50 and U55C use the shared board map
+with the model at 6–8 GiB. The complete address geometry is included in snapshot
+and program cache names and metadata; changed layouts require fresh artifacts.
+Set engine counts in the constructor before loading weights when using Python
+rather than the CLI. The separate `smolvlm2_run_from_bin.py` remains a single
+engine deployment path.
+
+Allocation, packed IF4 copy offsets, emitted addresses, and cache mismatches are
+covered by offline tests. This controller-private variant has not yet been
+measured on a model hardware run; no new token-rate claim is made.

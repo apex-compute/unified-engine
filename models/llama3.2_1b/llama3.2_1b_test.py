@@ -17,8 +17,8 @@ Architecture differences vs Gemma3:
   - LM head weight is tied to the embedding weight.
   - gamma_offset = 0.0 (LLaMA uses w directly, not 1+w).
 
-DRAM map (device DRAM is mapped AT 0x80000000; nothing usable below it — see
-__init__ for the authoritative layout + boundary guards):
+Single-engine DRAM map (multi-engine runs relocate this intact 2 GiB region
+using the board's controller-aware layout and copy decode weights per engine):
   params : 0x80000000 .. 0xB0000000   weights
   tensor : 0xB0000000 .. 0xFE000000   activations / KV
   worker : 0xFE000000 .. 0xFF600000   --multi-core prefill worker programs only
@@ -59,6 +59,8 @@ from user_dma_core import UnifiedEngine
 URAM_B_SCRATCH = 4096 * UE_VECTOR_SIZE * 2 + 0x10000
 # Canonical, HW-aligned 4-bit codec shared across all model templates.
 from quant_lib import quantize_if4
+from models.profile_report import (aggregate_checkpoints, annotate_execution,
+                                   measurement, write_profile_markdown)
 
 # Map the config's quantization variant string to quantize_if4's int_variant arg.
 # "int" -> pure INT4, "fp" -> pure FP4, "mix"/"mixmse" -> per-block min-MSE.
@@ -359,14 +361,24 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                  decoder_matmatmul: bool | None = None, stream_prefill: bool | None = None,
                  matmatmul: bool | None = None, prefill_kernel: str | None = None,
                  decode_kernel: str | None = None, multi_core: int = 1, initialize_model: bool = True):
-        # IF4 uses this low 2 GiB sub-window, independent of the total DRAM size
-        # reported by HW_INFO: 0x80000000..0xFFFFFFFF.
-        # DRAM is mapped AT 0x80000000 (user_dma_core.DRAM_START_ADDR); there is
-        # NO usable DRAM below it, so every region — including the multi-core
-        # worker ISA band — must be carved out of THIS window. (The scheduler's
-        # default worker arena is DRAM_START + 0x10000000 = 0x90000000, which
-        # lands ~256 MiB deep inside the weights below; --multi-core therefore
-        # passes an explicit base — see _ensure_prefill_scheduler.)
+        if not isinstance(multi_core, int) or multi_core < 1:
+            raise ValueError("multi_core must be a positive integer")
+        if multi_core > 1 and user_dma_core.ANDROMEDA_CORE_COUNT is None:
+            user_dma_core.configure_clock_from_hardware()
+        available_cores = user_dma_core.ANDROMEDA_CORE_COUNT
+        if available_cores is not None and multi_core > available_cores:
+            raise ValueError(f"multi_core must be 1..{available_cores}, got {multi_core}")
+        self.multi_core = multi_core
+        self._decode_sharder = None
+        self._decode_windows = None
+        model_base = 0x80000000
+        if multi_core > 1:
+            from multi_engine_shard import model_multicore_layout
+            self._decode_windows, model_base = model_multicore_layout(multi_core)
+        self._model_dram_limit = model_base + (2 << 30)
+        self._model_rebase = model_base - 0x80000000
+        # Keep all original model-relative offsets and allocate decode shards
+        # outside this contiguous model region on separate memory controllers.
         # At max_context_size=1024 the loaded params use ~642 MiB and tensors/KV
         # use ~212 MiB. Keep simple aligned boundaries; reserve the final 10 MiB
         # for the master instruction image + preamble, and a 22 MiB band just
@@ -376,9 +388,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         #   worker : 0xFE000000 .. 0xFF600000  (22 MiB, --multi-core only)
         #   program: 0xFF600000 .. 0x100000000 (10 MiB)
         super().__init__(
-            params_dram_base=0x80000000,
-            tensor_dram_base=0xB0000000,
-            program_dram_base=0xFF600000,
+            params_dram_base=model_base,
+            tensor_dram_base=0xB0000000 + self._model_rebase,
+            program_dram_base=0xFF600000 + self._model_rebase,
         )
         # Multi-core prefill worker ISA band (consumed in _ensure_prefill_scheduler).
         # Workers hold ONLY their prefill program here; every data buffer they
@@ -387,8 +399,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         # WORKER_ISA_STRIDE-sized slice and the band ends exactly at the master
         # program base, so the tensor region above and the program region below
         # both bound it. 3 MiB/worker × ≤7 workers (22 MiB) stays under 0xFF600000.
-        self.WORKER_ISA_BASE   = 0xFE000000
-        self.WORKER_ISA_STRIDE = 0x00300000   # 3 MiB / worker
+        self.WORKER_ISA_BASE = 0xFE000000 + self._model_rebase
+        self.WORKER_ISA_STRIDE = min(0x00300000,
+            (0x01600000 // max(1, multi_core - 1)) & ~0xFFFF)
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         # Unified kernel selection. The boolean inputs are legacy constructor
         # aliases retained for callers outside this script.
@@ -428,17 +441,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             )
         self.prefill_kernel = prefill_kernel
         self.decode_kernel = decode_kernel
-        # Multi-core prefill: engine 0 is this (primary); engines 1..N-1 are worker
-        # UnifiedEngines built lazily by the scheduler. N>2 is unverified on this
-        # device (the scheduler asserts unless opted in). See _ensure_prefill_scheduler.
-        available_cores = user_dma_core.ANDROMEDA_CORE_COUNT
-        assert available_cores is not None
-        if not 1 <= multi_core <= min(8, available_cores):
-            raise ValueError(
-                f"multi_core must be between 1 and min(8, HW_INFO cores={available_cores}), "
-                f"got {multi_core}"
-            )
-        self.multi_core = multi_core
+        if multi_core > 1 and self.decode_kernel != "streaming":
+            raise ValueError("multi-core decode requires --decode-kernel streaming")
         self._prefill_scheduler = None
         self._prefill_worker_addrs = []
         self._cfg = _load_config(self.script_dir)
@@ -514,6 +518,56 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 f"tensor_end=0x{self.get_tensor_dram_addr():X}, "
                 f"worker_isa_base=0x{self.WORKER_ISA_BASE:X}"
             )
+
+    def allocate_params_dram(self, size_bytes, label=None, align_bytes=64):
+        end = self._align_up(self.get_params_dram_addr(), align_bytes) + size_bytes
+        if end > self._tensor_dram_base:
+            raise MemoryError("Llama params exceed reserved model weight region")
+        return super().allocate_params_dram(size_bytes, label, align_bytes)
+
+    def allocate_tensor_dram(self, size_bytes, label=None, align_bytes=64):
+        end = self._align_up(self.get_tensor_dram_addr(), align_bytes) + size_bytes
+        if end > self.WORKER_ISA_BASE:
+            raise MemoryError("Llama tensors overlap prefill worker instructions")
+        return super().allocate_tensor_dram(size_bytes, label, align_bytes)
+
+    def allocate_program_dram(self, size_bytes, label=None, align_bytes=64):
+        end = self._align_up(self.get_program_dram_addr(), align_bytes) + size_bytes
+        if end > self._model_dram_limit:
+            raise MemoryError("Llama instructions exceed reserved model region")
+        return super().allocate_program_dram(size_bytes, label, align_bytes)
+
+    def write_captured_instructions_to_dram(self, start_addr=None):
+        address = self.get_program_dram_addr() if start_addr is None else start_addr
+        size = self._align_up(self.get_capture_instruction_size_bytes(), 64)
+        if address < self._program_dram_base or address + size > self._model_dram_limit:
+            raise MemoryError("Llama instruction write exceeds reserved model region")
+        return super().write_captured_instructions_to_dram(address)
+
+    def _ensure_decode_sharder(self):
+        if self.multi_core <= 1:
+            return None
+        if self._decode_sharder is None:
+            from multi_engine_decode import ControllerShardedDecoder
+            decoder = ControllerShardedDecoder(self, self.multi_core, self._decode_windows)
+            for name, prefix, K, N in (
+                ("q_proj", "Q_PROJ", self.vector_length, self.head_dim * self.group_size),
+                ("k_proj", "K_PROJ", self.vector_length, self.head_dim),
+                ("v_proj", "V_PROJ", self.vector_length, self.head_dim),
+                ("attn_proj", "ATTN_PROJ", self.head_dim * self.group_size, self.vector_length),
+                ("mlp_gate", "MLP_GATE", self.vector_length, self.mlp_elements),
+                ("mlp_up", "MLP_UP", self.vector_length, self.mlp_elements),
+                ("mlp_down", "MLP_DOWN", self.mlp_elements, self.vector_length),
+            ):
+                decoder.add_weight(
+                    name, getattr(self, f"DRAM_ADDR_LAYER0_{prefix}_QUANT"),
+                    getattr(self, f"DRAM_ADDR_LAYER0_{prefix}_SCALE"), K, N,
+                    self.LAYER_SIZE, self.weight_defs["LAYER_WEIGHT_SIZE"])
+            decoder.add_weight("lm_head", self.DRAM_ADDR_LM_HEAD_QUANT,
+                               self.DRAM_ADDR_LM_HEAD_SCALE, self.vector_length,
+                               self.EMBEDDING_ELEMENTS, 1, 0)
+            self._decode_sharder = decoder
+        return self._decode_sharder
 
     def get_embedding_for_tokens(self, token_ids: list[int] | tuple) -> torch.Tensor:
         """Return (len(token_ids), vector_length) bfloat16 tensor from self.embedding_weight (HF, scale applied)."""
@@ -719,6 +773,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 worker_dram_stride=self.WORKER_ISA_STRIDE,
                 worker_tensor_offset=0,
                 worker_program_offset=0,
+                handshake="four_phase",
+                region_rendezvous="master_worker",
                 allow_unaligned_rows=True,
                 allow_more_than_two_engines=self.multi_core > 2)
         return self._prefill_scheduler
@@ -744,12 +800,16 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         checkpoints: list[list] = []
+        _checkpoint_flops = 0
 
         def _checkpoint(name: str) -> None:
+            nonlocal _checkpoint_flops
             self.generate_instruction_halt()
             self.pad_capture_to_64b_boundary()
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
-            checkpoints.append([name, f"0x{resume:X}"])
+            checkpoints.append([name, f"0x{resume:X}",
+                                int(total_flops - _checkpoint_flops)])
+            _checkpoint_flops = total_flops
 
         global _SILENT_MODE
         _SILENT_MODE = True
@@ -1071,13 +1131,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             else:
                 _mlp_flops = [0]
                 def _emit_mlp_shard(ctx, layer_off=layer_off):
-                    # Per-engine row count via a GPR. gpr_q_seq_len (reg 6) is unused
-                    # in prefill after the proper-GQA rewrite, so repurpose it as the
-                    # shard row-count register on every engine (the master's dynamic
-                    # ISA pool is full; the workers set their own). Primed once per
-                    # shard, then reused by every op in the block.
+                    # The primary reserves r6 for this row count. Workers have
+                    # independent register allocators starting at r1: borrowing
+                    # r6 without reserving it lets a kernel overwrite its loop
+                    # bound. Reserve a worker register for this region, then
+                    # release it so later layers keep their M register in 1..15.
                     ue = ctx.unsafe_ue
-                    m = self.gpr_q_seq_len
+                    m = self.gpr_q_seq_len if ctx.is_primary else ue.alloc_isa_reg()
                     ue.generate_instruction_add_set(m, ctx.rows)
                     ue.rms_norm_core_dram(M=ctx.rows, N=self.vector_length,
                         A_DRAM_ADDR=ctx.rows_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, vlb),
@@ -1101,8 +1161,17 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                     ue.eltwise_core_dram(M=ctx.rows, N=self.vector_length,
                         dram_a=ctx.rows_addr(self.LAYER0_POST_ATTN_RESIDUAL_DRAM, vlb), dram_b=ctx.rows_addr(self.LAYER0_MLP_DOWN_DRAM, vlb),
                         dram_out=ctx.rows_addr(self.LAYER0_OUTPUT_DRAM, vlb), mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=m)
+                    if not ctx.is_primary:
+                        ue.release_isa_reg()
                 prefill_scheduler.sharded_region(seq_len, _emit_mlp_shard)
                 total_flops += _mlp_flops[0]
+                # One checkpoint after the MLP's exit barrier (the sharded region
+                # covers pre-FFN norm + gate/up + down in one barrier-bracketed
+                # block, so it can't be split the way the single-core path is).
+                # Without this the whole sharded MLP leaks into the next layer's
+                # pre_norm segment of the profile walk.
+                if profile:
+                    _checkpoint(f"L{layer_idx}_mlp")
         self.generate_instruction_halt()
         prefill_program_size = (self.capture_count - count_at_start) * INSTRUCTION_SIZE_BYTES
         _SILENT_MODE = False
@@ -1124,12 +1193,16 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         total_flops = 0
         decoder_aligned_seq_len = ((self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         checkpoints: list[list] = []
+        _checkpoint_flops = 0
 
         def _checkpoint(name: str) -> None:
+            nonlocal _checkpoint_flops
             self.generate_instruction_halt()
             self.pad_capture_to_64b_boundary()
             resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
-            checkpoints.append([name, f"0x{resume:X}"])
+            checkpoints.append([name, f"0x{resume:X}",
+                                int(total_flops - _checkpoint_flops)])
+            _checkpoint_flops = total_flops
 
         def decoder_projection_core(K: int, N: int, **kwargs) -> int:
             """Dispatch every decoder projection through the selected kernel.
@@ -1145,6 +1218,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             """
             if self.decode_kernel == "streaming":
                 kwargs.pop("is_B_quantized", None)
+                if self._decode_sharder is not None:
+                    sharded = self._decode_sharder.projection(M=1, K=K, N=N, **kwargs)
+                    if sharded is not None:
+                        return sharded
                 return self.quantized_matmat_core(M=1, K=K, N=N, **kwargs)
             m_reg = self.alloc_isa_reg()
             self.generate_instruction_add_set(m_reg, 1)
@@ -1374,6 +1451,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         if self.prefill_kernel != self.DEFAULT_PREFILL_KERNEL:
             tag += f"_prefill_{self.prefill_kernel}"
         tag += ("" if bool(getattr(self, "fpga_penalty", False)) else "_puregreedy")
+        if self.multi_core > 1:
+            placement = json.dumps([self._params_dram_base, self._decode_windows]).encode()
+            tag += f"_mc{self.multi_core}_{hashlib.sha256(placement).hexdigest()[:12]}"
         if tag:
             b_root, b_ext = os.path.splitext(bin_rel)
             m_root, m_ext = os.path.splitext(meta_rel)
@@ -1384,7 +1464,10 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         """Hash every local input that can change the captured instruction stream."""
         digest = hashlib.sha256()
         config_path = os.path.join(self.script_dir, "llama3.2_1b_config.json")
-        for source_path in (__file__, user_dma_core.__file__, config_path):
+        import multi_engine_shard
+        import multi_engine_decode
+        for source_path in (__file__, user_dma_core.__file__, config_path,
+                            multi_engine_shard.__file__, multi_engine_decode.__file__):
             digest.update(os.path.abspath(source_path).encode())
             with open(source_path, "rb") as source_file:
                 digest.update(source_file.read())
@@ -1396,6 +1479,8 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             f"layers={layer_size};decode_kernel={self.decode_kernel};"
             f"lanes={UE_VECTOR_SIZE};axi={user_dma_core.UE_AXI_DATA_WIDTH_BITS};"
             f"prefill_kernel={self.prefill_kernel};"
+            f"multi_core={self.multi_core};model_base={self._params_dram_base};"
+            f"windows={self._decode_windows};"
             f"penalty={getattr(self, 'fpga_penalty', False)};"
             f"prefill_len={len(_pf) - 1}".encode())
         return digest.hexdigest()
@@ -1420,6 +1505,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         """
         if layer_size is None:
             layer_size = self.LAYER_SIZE
+        decode_sharder = self._ensure_decode_sharder()
         if profile:
             instruction_bin_path = os.path.join(self.script_dir, "llama3.2_1b_bin/llama3.2_1b_profile_program.bin")
             instruction_meta_path = os.path.join(self.script_dir, "llama3.2_1b_bin/llama3.2_1b_profile_program.json")
@@ -1508,7 +1594,14 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         print("Compiling decoder...")
         t0 = time.perf_counter()
+        decoder_start_count = self.capture_count
+        if decode_sharder is not None:
+            decode_sharder.begin()
         decoder_prog = self._compile_decoder_program(layer_size=layer_size, profile=profile)
+        if decode_sharder is not None:
+            decode_sharder.finalize()
+        decoder_prog["program_size_bytes"] = (
+            self.capture_count - decoder_start_count) * INSTRUCTION_SIZE_BYTES
         print(f"  decoder compiled: {decoder_prog['program_size_bytes']} bytes, {time.perf_counter() - t0:.1f}s")
 
         self.stop_capture()
@@ -1544,6 +1637,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             "decoder_program_start_addr": f"0x{decoder_program_addr:X}",
             "decoder_program_size": decoder_prog["program_size_bytes"],
             "decoder_total_flops": decoder_prog["total_flops"],
+            "multi_core": self.multi_core,
+            "model_base": self._params_dram_base,
+            "private_windows": self._decode_windows,
         }
         if profile:
             metadata["prefill_profile_checkpoints"] = prefill_prog["checkpoints"]
@@ -1620,7 +1716,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
         preamble_addr = self.get_program_dram_addr()
-        if preamble_addr + 64 * 1024 > 0x100000000:
+        if preamble_addr + 64 * 1024 > self._model_dram_limit:
             raise MemoryError(
                 f"Instruction image exceeds 10 MiB program region: preamble=0x{preamble_addr:X}"
             )
@@ -1720,9 +1816,13 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             prefill_scheduler.preclear_flags()
             prefill_scheduler.start_workers(self._prefill_worker_addrs)
         hw_lat_prefill_us, prefill_gflops = self.program_execute(preamble_addr, flops=flops_prefill)
+        if self.is_queue_busy():
+            raise TimeoutError("Llama prefill master did not halt")
         if prefill_scheduler is not None:
             for w in prefill_scheduler.workers:
-                w.wait_queue(300.0)
+                w.wait_queue(10.0)
+                if w.is_queue_busy():
+                    raise TimeoutError("Llama prefill worker did not halt")
         latency_prefill = time.perf_counter() - timer
         print(f"Prefill done in {latency_prefill:.2f}s\n")
 
@@ -1821,12 +1921,17 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             if _fpga_penalty and (self.seq_len - prefill_seq_len) > _greedy_until:
                 self._write_penalty_bias(self._generated_tokens)
 
+            if self._decode_sharder is not None:
+                self._decode_sharder.start()
             hw_lat_dec_us, _ = self.program_execute(decoder_step_addr, flops=decoder_flops_per_token)
+            if self._decode_sharder is not None:
+                self._decode_sharder.wait()
             hw_decode_lats_us.append(hw_lat_dec_us)
             # Token selection: read the HW argmax register. In penalty mode the LM-head matmul
             # already added the bias, so the register holds the penalized token; in plain mode it's
             # pure greedy. Either way no logit readback.
-            token_id = self.get_arg_max_index(rank=1)
+            token_id = (self._decode_sharder.global_argmax("lm_head", self.LOGITS_DRAM)
+                        if self._decode_sharder is not None else self.get_arg_max_index(rank=1))
             self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
@@ -1837,6 +1942,11 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
                 break
             decoded_chars.append(token_char)
             print(token_char, end="", flush=True)
+            if (getattr(self, "max_new_tokens", 0) > 0
+                    and self.seq_len - prefill_seq_len >= self.max_new_tokens):
+                if _use_status:
+                    _status_teardown()
+                break
             if _use_status:
                 _status_update()
         else:
@@ -1875,6 +1985,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
             "prefill_tokens": prefill_seq_len,
             "decoded_text": "".join(decoded_chars),
             "decoded_tokens": tokens_decoded,
+            "generated_token_ids": self._generated_tokens[len(self.prefill_seq):],
+            "multi_core": self.multi_core,
+            "private_windows": self._decode_windows,
             # Compatibility aliases shared with Gemma3 and user_hw_test.py.
             "tokens_decoded": tokens_decoded,
             "avg_tokens_per_s": avg_tokens_per_s,
@@ -2017,27 +2130,34 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         return out_path
 
     def _profile_execute(self, preamble_addr: int, checkpoints: list,
-                         tail_label: str | None = None, timeout: float = 30.0) -> tuple[list, dict]:
+                         tail_label: str | None = None, tail_flops: int | None = None,
+                         timeout: float = 30.0) -> tuple[list, float]:
         """Walk an unrolled program through its per-layer HALT checkpoints, summing each step's HW
         latency across all layers. Checkpoint names carry an ``L<idx>_`` prefix that is stripped so
         the per-layer HALTs roll up by step type. The post-loop fall-through segment (final norm +
         LM head for decode; the terminating HALT for prefill) is always drained and recorded under
         ``tail_label`` when one is given. Returns ``(ordered_step_names, {step: summed_ms})``.
         """
-        from collections import OrderedDict
-        step_ms: "OrderedDict[str, float]" = OrderedDict()
+        samples = []
+        cpu_start = time.perf_counter()
         self.start_execute_from_dram(preamble_addr)
-        for name, resume_addr_hex in checkpoints:
+        for checkpoint in checkpoints:
+            name, resume_addr_hex = checkpoint[:2]
+            issued_flops = checkpoint[2] if len(checkpoint) > 2 else None
             self.wait_queue(timeout)
             step = name.split("_", 1)[1] if name.startswith("L") and "_" in name else name
-            step_ms[step] = step_ms.get(step, 0.0) + self.report_latency_in_us() / 1e3
+            samples.append({"name": step, "hw_ms": self.report_latency_in_us() / 1e3,
+                            "issued_flops": issued_flops,
+                            "effective_flops": issued_flops})
             self.start_execute_from_dram(int(resume_addr_hex, 16))
         # Drain the post-loop fall-through (final norm + LM head for decode; bare HALT for prefill).
         self.wait_queue(timeout)
         tail_ms = self.report_latency_in_us() / 1e3
         if tail_label is not None:
-            step_ms[tail_label] = tail_ms
-        return list(step_ms.keys()), step_ms
+            samples.append({"name": tail_label, "hw_ms": tail_ms,
+                            "issued_flops": tail_flops,
+                            "effective_flops": tail_flops})
+        return samples, (time.perf_counter() - cpu_start) * 1e3
 
     @staticmethod
     def _print_profile_table(title: str, order: list, step_ms: dict) -> float:
@@ -2058,7 +2178,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         _original_print(f"{'Total':<38} {total_ms:>9.3f}  100.0%")
         return total_ms
 
-    def run_llama_profile(self) -> None:
+    def run_llama_profile(self) -> dict:
         """Load the profile instruction image and print ONE per-step table for prefill and ONE for
         the first decoded token. Each program is walked through its per-layer HALT checkpoints and
         each step is summed across all layers (:meth:`_profile_execute`), so the tables are per-step
@@ -2071,7 +2191,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         self.load_program_instructions_from_file(os.path.join(self.script_dir, meta["instruction_bin"]))
         preamble_addr = self.get_program_dram_addr()
-        if preamble_addr + 64 * 1024 > 0x100000000:
+        if preamble_addr + 64 * 1024 > self._model_dram_limit:
             raise MemoryError(
                 f"Instruction image exceeds 10 MiB program region: preamble=0x{preamble_addr:X}"
             )
@@ -2080,6 +2200,9 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
         prefill_checkpoints  = meta.get("prefill_profile_checkpoints", [])
         decoder_checkpoints  = meta.get("decoder_profile_checkpoints", [])
+        # Aggregate peak across all engines: sharded matmul steps approach 100%
+        # while single-engine steps (norms/attention) cap near 1/multi_core.
+        peak_gflops = user_dma_core.configured_hardware_info().frequency_mhz * 0.128 * self.multi_core
         _kv_stride = self.attention_head_dim * self.bytes_per_element
         _rope_row  = self.head_dim * 2 * self.bytes_per_element
 
@@ -2129,10 +2252,34 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         _SILENT_MODE = True
         _original_print(f"\n--- Profiling: prefill (seq_len={prefill_seq_len}) ---")
         if prefill_checkpoints:
-            order, step_ms = self._profile_execute(preamble_addr, prefill_checkpoints)
-            prefill_total_ms = self._print_profile_table(f"Prefill  (seq_len={prefill_seq_len})", order, step_ms)
+            # Multi-core: launch the prefill workers once before the segmented
+            # HALT walk; they rendezvous with the primary at each sharded MLP
+            # region, so the primary's per-checkpoint HALT/resume keeps lockstep.
+            _pf_sched = getattr(self, "_prefill_scheduler", None) if self.multi_core > 1 else None
+            if _pf_sched is not None:
+                _pf_sched.preclear_flags()
+                _pf_sched.start_workers(self._prefill_worker_addrs)
+            prefill_samples, prefill_cpu_ms = self._profile_execute(
+                preamble_addr, prefill_checkpoints)
+            if _pf_sched is not None:
+                for _w in _pf_sched.workers:
+                    _w.wait_queue(10.0)
+            for sample in prefill_samples:
+                if sample["name"] == "attention" and aligned_seq_len:
+                    sample["effective_flops"] = int(
+                        (sample["issued_flops"] or 0)
+                        * prefill_seq_len / aligned_seq_len)
+            prefill_rows = aggregate_checkpoints(prefill_samples, peak_gflops=peak_gflops)
+            annotate_execution(
+                prefill_rows, self.multi_core,
+                sharded={"mlp"})
+            step_ms = {row["label"]: row["hw_ms"] for row in prefill_rows}
+            prefill_total_ms = self._print_profile_table(
+                f"Prefill  (seq_len={prefill_seq_len})", list(step_ms), step_ms)
         else:
             prefill_total_ms = 0.0
+            prefill_cpu_ms = 0.0
+            prefill_rows = []
             _original_print("  (no prefill checkpoints in meta — recompile with --profile to enable)")
 
         # --- Decoder preamble + inputs for the first decoded token (mirrors run_llama) ---
@@ -2150,6 +2297,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
 
         self.clear_inst_id()
         self.start_capture()
+        self.generate_instruction_add_set(self.gpr_seq_len, self.seq_len)
         self.generate_instruction_add_set(self.gpr_bucket_idx, bucket_idx)
         self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_dec)
         self.generate_instruction_add_set(self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(decode_pos * _kv_stride))
@@ -2160,27 +2308,124 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self.clear_capture_buffer()
 
         _original_print("\n--- Profiling: decoder (first decoded token) ---")
-        order, step_ms = self._profile_execute(
-            preamble_addr, decoder_checkpoints, tail_label="output_norm_lm_head")
-        decoder_total_ms = self._print_profile_table("Decoder  (first token)", order, step_ms)
+        decoder_tail_flops = max(
+            int(meta["decoder_total_flops"])
+            - sum(int(cp[2]) for cp in decoder_checkpoints if len(cp) > 2), 0)
+        if self._decode_sharder is not None:
+            self._decode_sharder.start()
+        decoder_samples, decoder_cpu_ms = self._profile_execute(
+            preamble_addr, decoder_checkpoints, tail_label="output_norm_lm_head",
+            tail_flops=decoder_tail_flops)
+        if self._decode_sharder is not None:
+            self._decode_sharder.wait()
+        decoder_static_aligned = (
+            (self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+            * UE_VECTOR_SIZE)
+        for sample in decoder_samples:
+            if sample["name"] == "attention":
+                sample["issued_flops"] = int(
+                    (sample["issued_flops"] or 0) * aligned_dec
+                    / decoder_static_aligned)
+                sample["effective_flops"] = int(
+                    sample["issued_flops"] * self.seq_len / aligned_dec)
+        decoder_rows = aggregate_checkpoints(decoder_samples, peak_gflops=peak_gflops)
+        annotate_execution(
+            decoder_rows, self.multi_core,
+            sharded={"qkv_proj"},
+            mixed={
+                "o_proj_residual": "o_proj sharded; residual primary",
+                "mlp_gateup_mul": "gate/up sharded; multiply primary",
+                "mlp_down_residual": "down_proj sharded; residual primary",
+                "output_norm_lm_head": "LM head sharded; norm primary",
+            })
+        step_ms = {row["label"]: row["hw_ms"] for row in decoder_rows}
+        decoder_total_ms = self._print_profile_table(
+            "Decoder  (first token)", list(step_ms), step_ms)
+
+        # Timing-only large-context probe. The program is position agnostic;
+        # stale cache values do not change its instruction or memory workload.
+        large_ctx = self.MAX_CONTEXT_SIZE
+        large_pos = large_ctx - 1
+        large_aligned = ((large_ctx + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+        self.dma_to_accelerator_memory(
+            self.LAYER0_FLASH_BIAS_DRAM,
+            torch.zeros((self.group_size, large_aligned), dtype=torch.bfloat16))
+        self.clear_inst_id()
+        self.start_capture()
+        self.generate_instruction_add_set(self.gpr_seq_len, large_ctx)
+        self.generate_instruction_add_set(self.gpr_bucket_idx, large_aligned // UE_VECTOR_SIZE)
+        self.generate_instruction_add_set(self.gpr_aligned_seq_len, large_aligned)
+        self.generate_instruction_add_set(
+            self.V_CACHE_SIZE_REG, ue_35bit_addr_shifter(large_pos * _kv_stride))
+        self.generate_instruction_add_set(
+            self.ROPE_SIZE_REG, ue_35bit_addr_shifter(large_pos * _rope_row))
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
+        self.stop_capture()
+        self.write_captured_instructions_to_dram(preamble_addr)
+        self.clear_capture_buffer()
+        _original_print(f"\n--- Profiling: decoder (large context position {large_pos}) ---")
+        if self._decode_sharder is not None:
+            self._decode_sharder.start()
+        large_samples, large_cpu_ms = self._profile_execute(
+            preamble_addr, decoder_checkpoints, tail_label="output_norm_lm_head",
+            tail_flops=decoder_tail_flops)
+        if self._decode_sharder is not None:
+            self._decode_sharder.wait()
+        for sample in large_samples:
+            if sample["name"] == "attention":
+                sample["issued_flops"] = int(
+                    (sample["issued_flops"] or 0) * large_aligned
+                    / decoder_static_aligned)
+                sample["effective_flops"] = int(
+                    sample["issued_flops"] * large_ctx / large_aligned)
+        large_rows = aggregate_checkpoints(large_samples, peak_gflops=peak_gflops)
+        annotate_execution(
+            large_rows, self.multi_core,
+            sharded={"qkv_proj"},
+            mixed={
+                "o_proj_residual": "o_proj sharded; residual primary",
+                "mlp_gateup_mul": "gate/up sharded; multiply primary",
+                "mlp_down_residual": "down_proj sharded; residual primary",
+                "output_norm_lm_head": "LM head sharded; norm primary",
+            })
+        step_ms = {row["label"]: row["hw_ms"] for row in large_rows}
+        large_total_ms = self._print_profile_table(
+            f"Decoder  (position {large_pos})", list(step_ms), step_ms)
         _SILENT_MODE = False
 
         if prefill_total_ms > 0:
             _original_print(f"\nPrefill (HW): {prefill_total_ms:.2f} ms  ({prefill_seq_len} tokens)")
         _original_print(f"Decode  (HW): {decoder_total_ms:.2f} ms/tok  ({1000/decoder_total_ms:.2f} tok/s)")
+        return {
+            "peak_gflops": peak_gflops,
+            "prefill_seq_len": prefill_seq_len,
+            "prefill_hw_ms": prefill_total_ms,
+            "prefill_cpu_ms": prefill_cpu_ms,
+            "prefill_rows": prefill_rows,
+            "first_position": decode_pos,
+            "first_hw_ms": decoder_total_ms,
+            "first_cpu_ms": decoder_cpu_ms,
+            "first_rows": decoder_rows,
+            "large_position": large_pos,
+            "large_hw_ms": large_total_ms,
+            "large_cpu_ms": large_cpu_ms,
+            "large_rows": large_rows,
+            "prefill_issued_flops": sum(row.get("issued_flops") or 0 for row in prefill_rows),
+            "decoder_issued_flops": int(meta["decoder_total_flops"]),
+        }
 
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def llama_run_summary_filename(args, prefix: str = "llama3.2_1b_test") -> str:
     """Per-run summary .md filename encoding the CLI config, e.g.
-    ``llama3.2_1b_test_xdma1_kintex7.md`` or ``..._xdma0_alveo_puregreedy.md``.
-    dev and HW_INFO are present when available; other knobs are appended only when non-default."""
+    ``llama3.2_1b_test_xdma1.md`` or ``..._xdma0_puregreedy.md``.
+    dev is always present; other knobs are appended only when non-default."""
     tokens = [args.dev]
-    if user_dma_core.HW_INFO_RAW is not None:
-        tokens.append(f"hw{user_dma_core.HW_INFO_RAW:08x}")
     if getattr(args, "multi_core", 1) and args.multi_core > 1:
         tokens.append(f"multi-core-{args.multi_core}")
+    if getattr(args, "profile", False):
+        tokens.append("profile")
     if getattr(args, "pure_greedy", False):
         tokens.append("puregreedy")
     if getattr(args, "prefill_kernel", None) == "matmatmul":
@@ -2194,6 +2439,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Llama-3.2-1B prefill + decode on accelerator.")
     parser.add_argument("--prompt", type=str, default=None, help="Text prompt")
+    parser.add_argument("--max-new-tokens", type=int, default=0,
+                        help="Stop after N generated tokens (0: stop token or context limit)")
     parser.add_argument(
         "--standard-chat-template",
         action="store_true",
@@ -2221,9 +2468,8 @@ def main():
                              'per-step HW-latency table (summed over all layers) for prefill and for '
                              'the first decoded token.')
     parser.add_argument('--multi-core', nargs='?', type=int, const=2, default=1,
-                        help='Row-shard the prefill MLP block across N engines (default 2 when the '
-                             'flag is given with no value). 1 = single-engine. >2 is unverified on '
-                             'this device.')
+                        help='Shard prefill MLP rows and decode weight columns across N engines '
+                             'using the board memory controllers (default 2; 1 = single-engine).')
     # On-FPGA repetition penalty is the DEFAULT decode path: the penalty is folded into the LM-head
     # matmul bias so the HW argmax returns the penalized token directly — no logit readback,
     # fully deterministic. --pure-greedy disables it entirely.
@@ -2279,8 +2525,8 @@ def main():
         if not os.path.exists(weights_bin_full):
             weight_bin_generate(script_dir=script_dir, output_path=weights_bin_full)
 
-    ue = UnifiedEngine()
-    ue.software_reset()
+    from multi_engine_decode import reset_engine_queues
+    reset_engine_queues(args.multi_core)
     
     ue = Llama32_1b_UnifiedEngine(
         script_dir=script_dir,
@@ -2313,6 +2559,7 @@ def main():
         prefill_seq = tuple(cfg["default_prefill_tokens"])
 
     ue.prefill_seq = prefill_seq
+    ue.max_new_tokens = max(0, args.max_new_tokens)
 
     # Decode config — deterministic, on-FPGA penalty only. Must be set BEFORE compile_llama() since
     # fpga_penalty changes the compiled LM-head matmul (bias on / writeback off).
@@ -2338,7 +2585,51 @@ def main():
         ue.compile_llama(profile=True)
         print(f"Compile done in {time.perf_counter() - timer:.2f}s")
         print("\n--- Running profile ---")
-        ue.run_llama_profile()
+        profile_result = ue.run_llama_profile()
+        peak = profile_result["peak_gflops"]
+        pf_flops = profile_result["prefill_issued_flops"]
+        dec_flops = profile_result["decoder_issued_flops"]
+        overall = [
+            measurement(label="Prefill", tokens=profile_result["prefill_seq_len"],
+                        hw_ms=profile_result["prefill_hw_ms"],
+                        cpu_ms=profile_result["prefill_cpu_ms"],
+                        issued_flops=pf_flops, effective_flops=pf_flops,
+                        peak_gflops=peak),
+            measurement(label="Decode first token", position=profile_result["first_position"],
+                        tokens=1, hw_ms=profile_result["first_hw_ms"],
+                        cpu_ms=profile_result["first_cpu_ms"],
+                        issued_flops=dec_flops, effective_flops=dec_flops,
+                        peak_gflops=peak),
+            measurement(label="Decode large context", position=profile_result["large_position"],
+                        tokens=1, hw_ms=profile_result["large_hw_ms"],
+                        cpu_ms=profile_result["large_cpu_ms"],
+                        issued_flops=dec_flops, effective_flops=dec_flops,
+                        peak_gflops=peak),
+        ]
+        hw = user_dma_core.configured_hardware_info()
+        summary_path = os.path.join(SCRIPT_DIR, llama_run_summary_filename(args))
+        write_profile_markdown(
+            summary_path, title="Llama-3.2-1B profile summary",
+            hardware={
+                "HW info": user_dma_core.hardware_info_summary(),
+                "DMA device": args.dev,
+                "Clock": f"{hw.frequency_mhz:.2f} MHz",
+                "AXI width": f"{user_dma_core.UE_AXI_DATA_WIDTH_BITS} bit",
+                "Engines": args.multi_core,
+                "Peak throughput": f"{peak:.2f} GFLOPS",
+                "Prefill kernel": prefill_kernel,
+                "Decode kernel": decode_kernel,
+            },
+            overall=overall,
+            breakdowns=[
+                ("Prefill major-step breakdown", profile_result["prefill_rows"]),
+                ("Decode first-token breakdown", profile_result["first_rows"]),
+                ("Decode large-context breakdown", profile_result["large_rows"]),
+            ],
+            notes=["Effective attention FLOPs exclude 64-lane KV padding; other "
+                   "major steps currently have identical issued and effective counts."],
+        )
+        print(f"Wrote profile summary: {summary_path}")
         print("Decoder/prefill profile done.")
         return
 
@@ -2356,7 +2647,7 @@ def main():
     # next to this script (see llama_run_summary_filename / write_run_summary).
     _summary_path = os.path.join(SCRIPT_DIR, llama_run_summary_filename(args))
     try:
-        ue.write_run_summary(_summary_path, args, run_result)
+        ue.write_run_summary(_summary_path, args, run_result, cores=args.multi_core)
         print(f"Wrote run summary: {_summary_path}")
     except Exception as _e:
         print(f"[warn] failed to write run summary: {_e}")

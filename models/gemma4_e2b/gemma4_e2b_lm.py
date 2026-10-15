@@ -536,9 +536,10 @@ class Gemma4LMMixin:
         Fixed bases are set in Gemma4_UnifiedEngine.__init__; `~` marks a
         run-time high-water (values shown are the 2-core VLM example).
 
-        ADD 4 GB TO EVERY ADDRESS BELOW ON A 12-CORE BITSTREAM. There the same
-        map is rebased to 0x180000000 .. 0x200000000 so the private windows can
-        own a flat [0, 6 GB); nothing inside the map moves relative to its base.
+        This diagram describes the single-engine layout. Non-tiled multicore
+        uses model_multicore_layout to reserve the shared span and select private
+        windows by controller. The full tiled map below instead distributes
+        compact shared blocks across its pools; see the printed runtime map.
 
           0x80000000 ┌ PARAMS  (weights, allocate_params_dram) ~1552 MiB ┐
                      │  LM weights ...................... ~1540.4 MB      │
@@ -566,20 +567,11 @@ class Gemma4LMMixin:
          0x100000000 └───────────────────────────────────────────────────┘
 
         MULTI-CORE PROGRAM DRAM (MultiEngineScheduler via _ensure_stage_scheduler):
-          Uniform at EVERY engine count (the old 2-core / >2-core split is gone).
-          The map above does not move: masters stay at VISION_ISA_BASE
-          0xFF000000 (vision) and LM_ISA_BASE 0xFF620000 (LM). EVERY worker
-          executes from the ISA slice of its own window in the LOW 2 GB,
-          allocated by multi_engine_shard.PrivateArena:
-              8 engines -> window i @ i*256 MiB, ISA slice at
-              window_top - 32 MiB, 16 MiB (images ~1.7 MB).
-          On a 12-core bitstream the arena is instead the FIXED [0, 6 GB) map of
-          twelve 512 MiB windows, allocated at every engine count: window i @
-          i*512 MiB, same 16 MiB ISA + 16 MiB tensor slices at the top, 480 MiB
-          of private weight arena below them. A run with fewer engines uses the
-          leading windows and leaves the rest untouched.
-          Vision and prefill are sequential and share ONE arena object, so
-          worker i always executes from the same slice in both stages.
+          Worker ISA and tensors use each controller-aware PrivateArena window.
+          Full tiled configurations retain their per-engine 1 GiB tiles and
+          shared pools. Smaller supported configurations use board-selected
+          windows outside the contiguous shared model span. Vision and LM
+          schedulers share ONE arena, so each stage advances the same cursors.
         Single-core (--multi-core 1) uses only core0/master; no worker ISA, no
         private arena, and keeps the original upper-2 GB addresses unchanged on
         every bitstream.
@@ -2831,6 +2823,14 @@ class Gemma4LMMixin:
         self._set_silent(False)
         return None, program_sizes, total_flops_list
 
+    def _align_dispatch_entry(self) -> int:
+        """Pad capture before recording an externally dispatched entry."""
+        address = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
+        if address % (2 * INSTRUCTION_SIZE_BYTES):
+            self.generate_instruction_nop()
+            address += INSTRUCTION_SIZE_BYTES
+        return address
+
     def _dispatch_program(self, gpr_sets: list[tuple[int, int]],
                           target_addr: int | None,
                           timeout: float = 50.0, flops: float | None = None):
@@ -2848,6 +2848,8 @@ class Gemma4LMMixin:
         clobber the prefill or decoder programs. Returns program_execute's
         (latency, flop_rate).
         """
+        if target_addr is not None and target_addr % (2 * INSTRUCTION_SIZE_BYTES):
+            raise ValueError(f"Gemma E2B dispatch entry 0x{target_addr:X} must be 64-byte aligned; recompile the program image")
         self.clear_inst_id()
         self.start_capture()
         for reg, val in gpr_sets:
@@ -2861,7 +2863,8 @@ class Gemma4LMMixin:
         self.clear_capture_buffer()
         return self.program_execute(self._preamble_addr, timeout=timeout, flops=flops)
 
-    def run_decoder(self, decoder_program_sizes: list[int], decoder_base_addr: int, token_id: int, flops_per_token: list[int] | None = None) -> dict:
+    def run_decoder(self, decoder_program_sizes: list[int], decoder_base_addr: int, token_id: int, flops_per_token: list[int] | None = None,
+                    max_new_tokens: int | None = None) -> dict:
         """Run decode loop with dynamic PBI.
 
         Single decoder program — same address every token. gpr_seq_len is
@@ -2876,7 +2879,11 @@ class Gemma4LMMixin:
             return {}
 
         max_seq_len = self.MAX_CONTEXT_SIZE
-   # benchmark cap (e.g. 128); default off
+        limit = max_new_tokens if max_new_tokens is not None else getattr(self, "max_new_tokens", None)
+        if limit is not None:
+            if not isinstance(limit, int) or limit < 1:
+                raise ValueError("max_new_tokens must be a positive integer")
+            max_seq_len = min(max_seq_len, self.seq_len + limit)
         total_latency, total_flop_rate = 0, 0
         # Single program (dynamic PBI). Ignore decoder_program_sizes length.
         prog_addr = decoder_base_addr

@@ -49,7 +49,69 @@ python3 models/qwen3_0.6b/qwen3_0.6b_test.py \
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
 python3 models/qwen3_0.6b/qwen3_0.6b_run_from_bin.py \
   --prompt "If x + 3 = 5, what is x?"
+
+# Two-engine Kintex-7 decode with weights on separate DDR controllers.
+python3 models/qwen3_0.6b/qwen3_0.6b_test.py \
+  --dev xdma1 --multi-core 2 --pure-greedy --max-new-tokens 128
+
+# Alveo U50: use all eight engines and their HBM controller regions.
+python3 models/qwen3_0.6b/qwen3_0.6b_test.py \
+  --dev xdma0 --multi-core 8 --pure-greedy --max-new-tokens 128
 ```
+
+`--multi-core N` shards the decode Q/K/V/O, gate/up/down, and LM-head
+projection output columns. Each engine gets private IF4 weights and scales;
+four-phase flag handshakes join the output slices before a dependent operation.
+SiLU and repetition bias are preserved. LM-head output is written to DRAM so
+the host can compare each engine's argmax candidate. Attention and prefill run
+on the primary engine. With `--bf16-last-layer`, layer 27 remains on the primary.
+
+The controller map comes from HW_INFO, with a separate shared model region:
+
+| Board | Private weights | Shared model region |
+|---|---|---|
+| Kintex-7, 4 GiB | 512 MiB windows at 0 and 3 GiB, one per DDR controller | 1–3 GiB |
+| U50, 8 GiB | 512 MiB per engine in the measured SAXI/controller order | 6–8 GiB |
+| U55C, 16 GiB | One 1 GiB controller region per engine, up to 12 engines | 6–8 GiB |
+| U55C, 8 GiB | Up to six private 1 GiB controllers; seven to twelve engines share controllers using disjoint 512 MiB segments | 6–8 GiB |
+
+The Kintex layout uses different DDR controllers while retaining a contiguous
+2 GiB model region. Its spacing is 3 GiB; selecting separate controllers is what
+enables the memory-bandwidth advantage. The approximately 12 GB/s memory-copy
+result does not imply the same end-to-end model throughput.
+
+To compare exact generated tokens and hardware decode timing with one versus
+multiple engines, run:
+
+```bash
+python3 tests/model_controller_benchmark.py --dev xdma1 --engines 2 --models qwen \
+  --max-new-tokens 128 --json qwen_controller_results.json
+```
+
+The JSON contains first-token and average hardware decode milliseconds, exact
+token IDs, and the controller layout. These hardware timings exclude weight
+loading, compilation, prefill, and host-side candidate selection. Multi-core
+program filenames include the engine count and layout signature; each invocation
+recompiles the primary and worker programs together. The execute-only
+`run_from_bin` runner supports single-engine images. Multi-core runs can use
+local weights/tokenizers offline through `qwen3_0.6b_test.py`.
+
+An Alveo U50 run on 2026-10-07 (333.332 MHz, image `0xe6703022`) produced
+identical token IDs for all 128 generated tokens:
+
+| Engines | First-token hardware time | Average hardware time/token |
+|---|---:|---:|
+| 1 | 50.59 ms | 58.47 ms |
+| 8, private HBM regions | 22.68 ms | 30.54 ms |
+
+That is 2.23× for the first token and 1.91× across the capped 128-token decode.
+The prompt, exact tokens, memory windows, and image information are recorded in
+[`alveo_u50_qwen_controller_results.json`](../../tests/alveo_u50_qwen_controller_results.json).
+
+The Kintex-7 two-engine run on the same date (198.324 MHz, image `0xd6c77283`)
+also matched all 128 generated token IDs. First-token hardware time improved
+from 80.28 to 54.10 ms (1.48×), and the average from 93.39 to 67.22 ms/token
+(1.39×). See [`kintex7_qwen_controller_results.json`](../../tests/kintex7_qwen_controller_results.json).
 
 The offline runner requires:
 
@@ -74,6 +136,7 @@ closed instead of being reused silently.
 | `--prompt` | Configured example | Wrapped with the Qwen chat template. |
 | `--dev` | `xdma0` | DMA device name. |
 | `--device` | `kintex7` | FPGA board profile; use `efinix` for that DMA path. |
+| `--multi-core` | `1` | Main runner only: number of decode engines, validated against HW_INFO. |
 | `--local-weights` | Off | Select `full_model_weights.bin` instead of generated `params.bin`. The file must use this config's layout. |
 | `--pure-greedy` | Off | Disable the on-FPGA repetition-penalty bias. |
 | `--max-new-tokens` | `0` | Stop after N decoded tokens; `0` uses the model stop/context limit. |
@@ -137,6 +200,9 @@ Attention-mask updates, and repetition-bias updates after their configured
 gate, still cross the host/device boundary.
 
 ## Memory layout
+
+The following addresses describe the single-engine layout. Multi-core execution
+preserves these relative offsets within the shared model region listed above.
 
 - Params DRAM starts at `0x80000000` and uses about 319 MiB in the default IF4
   mode (up to about 349 MiB with the BF16 layer-27 fallback).

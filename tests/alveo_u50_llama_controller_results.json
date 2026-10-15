@@ -1,0 +1,191 @@
+{
+  "hostname": "p2",
+  "device": "xdma0",
+  "image": "0xe6703022",
+  "hardware_info": {
+    "raw": 2298563925,
+    "queue_mode": true,
+    "axi_data_width_bits": 256,
+    "dram_size_code": 2,
+    "dram_size_gb": 8,
+    "core_count": 8,
+    "frequency_mhz_q8": 85333,
+    "frequency_mhz": 333.33203125,
+    "frequency_hz": 333332031.25
+  },
+  "timestamp_utc": "2026-10-07T08:22:51.950818+00:00",
+  "prompt": "Solve 2x + 3 = 7. Reply with only the value of x.",
+  "max_new_tokens": 128,
+  "models": {
+    "llama": {
+      "runs": [
+        {
+          "prefill_kernel": "streaming",
+          "decode_kernel": "streaming",
+          "prefill_tokens": 29,
+          "decoded_text": "2x + 3 = 7\n\n2x = 7 - 3\n2x = 4\n\nx = 4/2\nx = 2",
+          "decoded_tokens": 36,
+          "multi_core": 1,
+          "private_windows": null,
+          "tokens_decoded": 36,
+          "avg_tokens_per_s": 13.254136661244408,
+          "peak_tokens_per_s": 13.444251174736369,
+          "prefill_speed_tok_s": 19.13,
+          "decode_speed_tok_s": 13.25,
+          "decoder_gflops": 35.06,
+          "prefill_gflops": 37.44,
+          "total_tokens": 65,
+          "prefill_size_kb": 6156.1,
+          "decoder_size_kb": 1617.6,
+          "prefill_hw_ms": 1514.7309249176756,
+          "prefill_cpu_ms": 1515.7065229998352,
+          "decode_first_hw_ms": 74.38123455169746,
+          "decode_avg_hw_ms": 74.44781214509952,
+          "decode_avg_cpu_ms": 75.44814313889168,
+          "token_ids": [
+            17,
+            87,
+            489,
+            220,
+            18,
+            284,
+            220,
+            22,
+            271,
+            17,
+            87,
+            284,
+            220,
+            22,
+            482,
+            220,
+            18,
+            198,
+            17,
+            87,
+            284,
+            220,
+            19,
+            271,
+            87,
+            284,
+            220,
+            19,
+            14,
+            17,
+            198,
+            87,
+            284,
+            220,
+            17,
+            128009
+          ],
+          "model_base": 2147483648,
+          "active_engines": 1,
+          "wall_seconds": 5.932614546000195
+        },
+        {
+          "prefill_kernel": "streaming",
+          "decode_kernel": "streaming",
+          "prefill_tokens": 29,
+          "decoded_text": "2x + 3 = 7\n\n2x = 7 - 3\n2x = 4\n\nx = 4/2\nx = 2",
+          "decoded_tokens": 36,
+          "multi_core": 8,
+          "private_windows": [
+            [
+              0,
+              536870912
+            ],
+            [
+              1073741824,
+              536870912
+            ],
+            [
+              2147483648,
+              536870912
+            ],
+            [
+              1610612736,
+              536870912
+            ],
+            [
+              536870912,
+              536870912
+            ],
+            [
+              3758096384,
+              536870912
+            ],
+            [
+              3221225472,
+              536870912
+            ],
+            [
+              2684354560,
+              536870912
+            ]
+          ],
+          "tokens_decoded": 36,
+          "avg_tokens_per_s": 57.047061453483806,
+          "peak_tokens_per_s": 61.264360039184844,
+          "prefill_speed_tok_s": 20.12,
+          "decode_speed_tok_s": 57.05,
+          "decoder_gflops": 159.27,
+          "prefill_gflops": 39.59,
+          "total_tokens": 65,
+          "prefill_size_kb": 6146.1,
+          "decoder_size_kb": 1498.7,
+          "prefill_hw_ms": 1432.5966520806721,
+          "prefill_cpu_ms": 1441.3795780001237,
+          "decode_first_hw_ms": 16.322703760561563,
+          "decode_avg_hw_ms": 16.38317866345832,
+          "decode_avg_cpu_ms": 17.529386694447012,
+          "token_ids": [
+            17,
+            87,
+            489,
+            220,
+            18,
+            284,
+            220,
+            22,
+            271,
+            17,
+            87,
+            284,
+            220,
+            22,
+            482,
+            220,
+            18,
+            198,
+            17,
+            87,
+            284,
+            220,
+            19,
+            271,
+            87,
+            284,
+            220,
+            19,
+            14,
+            17,
+            198,
+            87,
+            284,
+            220,
+            17,
+            128009
+          ],
+          "model_base": 6442450944,
+          "active_engines": 8,
+          "wall_seconds": 5.270559768000112
+        }
+      ],
+      "exact_token_match": true,
+      "first_token_speedup": 4.556918733734249,
+      "average_token_speedup": 4.544161647406728
+    }
+  }
+}

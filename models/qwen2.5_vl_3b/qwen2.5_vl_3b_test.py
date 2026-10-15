@@ -44,11 +44,8 @@ builtins.print = quiet_print
 
 import user_dma_core
 from user_dma_core import UnifiedEngine, UE_VECTOR_SIZE, set_dma_device
-from multi_engine_shard import (ALVEO_BOARD_CORES, ALVEO_U55C_BOARD_CORES,
-                                MULTICORE_WINDOW_BYTES, MultiEngineScheduler,
-                                board_private_windows,
-                                PrivateArena, multicore_arena_bytes,
-                                require_multicore_dram)
+from multi_engine_shard import (MultiEngineScheduler, PrivateArena,
+                                model_multicore_layout, require_multicore_dram)
 
 # The sibling mixin file is named for the model (qwen2.5_vl_3b_vision.py), and
 # "2.5" makes that an invalid module name, so it is loaded by path rather than
@@ -96,7 +93,7 @@ MIN_CONTEXT_SIZE = 512
 MAX_ENGINES = 12
 
 # MULTI-CORE MAP (>= 8 GB device; single core keeps the historical 4 GB map):
-#   [0, N x 512 MiB) -- one fixed private window per engine
+#   private controller windows in hardware engine order (see shared board policy)
 #   [6 GiB, 8 GiB)   -- this model's own 2 GB map, rebased wholesale. Every
 #                       internal offset is unchanged, and the map sits at the
 #                       TOP at every engine count, so adding cores moves no
@@ -105,63 +102,25 @@ MULTI_CORE_MODEL_BASE = 0x180000000
 MULTI_CORE_DRAM_LIMIT = 0x200000000
 MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - 0x80000000
 
-# WHERE THE PRIVATE WINDOWS GO IS THE BOARD'S ANSWER, NOT A STRIDE.
-# ==========================================================================
-# A fixed `core * 512 MiB` map was written for one board's HBM wiring. On the
-# reordered U55C it leaves most engines reading across the lateral switch:
-# measured at 512 kB per engine, the flat stride reads 37.6 GB/s at 8 engines
-# and 56.4 at 12, where the board map reads 70.4 and 105.5. So the windows are
-# ASKED FOR, per board, keyed on the HW_INFO signature -- the same two profiles
-# gemma3 uses:
-#
-#   cores == 8,  DRAM == 8 GiB    Alveo U50
-#   cores == 12, DRAM == 16 GiB   Alveo U55C, dual stack
-#
-# Any other signature keeps the fixed map, which is what those boards ran.
-BOARD_MAP_PROFILES = {(ALVEO_BOARD_CORES, 8), (ALVEO_U55C_BOARD_CORES, 16)}
+# Preserve the complete 2 GiB model map and put private shards on the board's
+# measured controller regions. Engine order must remain the board's SAXI order;
+# sorting addresses silently assigns U50 engines to different controllers.
 MULTI_CORE_MODEL_SPAN = MULTI_CORE_DRAM_LIMIT - MULTI_CORE_MODEL_BASE
 
 
 def _board_multicore_map(num_engines: int):
-    """Per-engine ``(base, bytes)`` windows from the board map, or None.
+    """Controller windows that leave this model's fixed 6–8 GiB map clear.
 
-    Two narrowings of what board_private_windows() returns, both the same as
-    gemma3's and for the same reasons:
-
-    * only the PRIMARY segment is claimed -- a U50 window is two 512 MiB
-      segments 4 GiB apart, and claiming both covers all 8 GiB, leaving this
-      model's own 2 GiB map at 6 GiB nowhere to live;
-    * on the U50 the engines are placed in ADDRESS order rather than the SAXI
-      order, which covers the same eight regions and is what every shipped
-      8-core run used. The permutation decides which port reaches a region
-      directly, which the library documents as not moving the measured number.
-
-    On the U55C the model map is RESERVED, so the board hands out regions that
-    avoid it and every engine still gets a controller of its own.
+    Unknown boards and overlapping maps fail before allocation. In particular,
+    do not fall back to a core-index stride when the board policy rejects a map.
     """
-    cores = user_dma_core.ANDROMEDA_CORE_COUNT
-    gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
-    if (cores, gib) not in BOARD_MAP_PROFILES:
-        return None
-    reserve = ((MULTI_CORE_MODEL_BASE, MULTI_CORE_MODEL_SPAN)
-               if cores == ALVEO_U55C_BOARD_CORES else None)
-    try:
-        board = board_private_windows(num_engines, reserve=reserve)
-    except (ValueError, RuntimeError) as exc:
-        print(f"  [map] board window map unavailable, keeping the fixed "
-              f"{MULTICORE_WINDOW_BYTES // 2**20} MiB windows: {exc}")
-        return None
-    size = min(w.primary_bytes for w in board)
-    bases = sorted(w.base for w in board) if cores == ALVEO_BOARD_CORES \
-        else [w.base for w in board]
-    windows = [(base, size) for base in bases]
-    for base, nbytes in windows:
-        if base < MULTI_CORE_DRAM_LIMIT and base + nbytes > MULTI_CORE_MODEL_BASE:
-            print(f"  [map] board window 0x{base:X} overlaps the model map, "
-                  f"keeping the fixed windows")
-            return None
+    require_multicore_dram(num_engines, "Qwen2.5-VL-3B")
+    windows, model_base = model_multicore_layout(
+        num_engines, model_bytes=MULTI_CORE_MODEL_SPAN,
+        preferred_model_base=MULTI_CORE_MODEL_BASE)
+    if model_base != MULTI_CORE_MODEL_BASE:
+        raise ValueError("Qwen2.5-VL-3B requires its shared model map at 6–8 GiB")
     return windows
-
 
 
 class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine):
@@ -207,10 +166,10 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
         # explicit (reset_params_dram_addr) rather than implied by a cursor that
         # happens to be low, so the handover is visible at the call site.
         #
-        # MULTI-CORE PRIVATE SPACE, one FIXED 512 MiB window per engine from
-        # address 0 upward -- empty at 1 core, and handed to PrivateArena, which
-        # lays each window out as [ weights | tensor ]:
-        #   any engine count -> 512 MiB/window: 496 MiB weights + 16 MiB tensor
+        # MULTI-CORE PRIVATE SPACE comes from the board controller policy and
+        # is empty at one core. PrivateArena lays each window out as
+        # [ weights | tensor ]; U50 gets 512 MiB per engine, while U55C can use
+        # complete 1 GiB controllers when device capacity permits.
         #
         # THE WINDOW SIZE IS CONSTANT, NOT AN ARENA DIVIDED N WAYS. The DRAM
         # controller interleaves across these windows, so a stride that shrank
@@ -268,19 +227,9 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
             _external_isa = (self.WORKER_ISA_BASE - self.WORKER_ISA_STRIDE,
                              self.WORKER_ISA_STRIDE)
             self._board_windows = _board_multicore_map(multi_core)
-            if self._board_windows is not None:
-                self.mc_arena = PrivateArena(
-                    multi_core, windows=self._board_windows,
-                    external_isa=_external_isa, verbose=True)
-            else:
-                _arena_bytes = multicore_arena_bytes(multi_core)
-                assert _arena_bytes <= MULTI_CORE_MODEL_BASE, (
-                    f"{multi_core} x {MULTICORE_WINDOW_BYTES // 2**20} MiB private "
-                    f"windows reach 0x{_arena_bytes:X}, into the model map at "
-                    f"0x{MULTI_CORE_MODEL_BASE:X}")
-                self.mc_arena = PrivateArena(
-                    multi_core, arena_base=0x00000000, arena_bytes=_arena_bytes,
-                    external_isa=_external_isa, verbose=True)
+            self.mc_arena = PrivateArena(
+                multi_core, windows=self._board_windows,
+                external_isa=_external_isa, verbose=True)
         else:
             self._board_windows = None
             self.mc_arena = None
@@ -688,7 +637,7 @@ def resolve_engine_config(parser, args) -> dict:
     # cleans DRAM in between, and both are wasted work if the map cannot fit.
     if args.multi_core > 1:
         try:
-            require_multicore_dram(args.multi_core, "Qwen2.5-VL-3B")
+            _board_multicore_map(args.multi_core)
         except (ValueError, RuntimeError) as exc:
             parser.error(str(exc))
 
@@ -829,14 +778,14 @@ def main():
 
     engine_kwargs = resolve_engine_config(parser, args)
 
-    # Reset every engine this run will touch BEFORE anything else reaches the
-    # hardware. software_reset_test is per-core: a run that died mid-rendezvous
+    # Reset every engine this run will touch before uploading weights.
+    # A run that died mid-rendezvous
     # leaves cores spin-waiting on a FLAG_CHECK with no timeout, and the next
     # process inherits engines that never accept a program.
-    from user_hw_test import software_reset_test
+    from multi_engine_decode import reset_engine_queues
     cores = args.multi_core or 1
     print(f"\n--- Software-resetting {cores} core(s) ---")
-    software_reset_test(cores=cores)
+    reset_engine_queues(cores)
 
     # Establish known DRAM state before the model allocates or uploads anything.
     print(f"\n--- Cleaning DRAM ({user_dma_core.AVAILABLE_DRAM_SIZE_GB} GiB) ---")

@@ -51,9 +51,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import user_dma_core
-from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_VECTOR_SIZE, SCALE_BRAM_ELEMENTS, set_dma_device, ue_35bit_addr_shifter
+from user_dma_core import DMA_DEVICE_H2C, TYPE, UE_MODE, UE_VECTOR_SIZE, SCALE_BRAM_ELEMENTS, INSTRUCTION_SIZE_BYTES, set_dma_device, ue_35bit_addr_shifter
 from user_dma_core import UnifiedEngine
 from quant_lib import quantize
+from models.profile_report import (aggregate_checkpoints, annotate_execution,
+                                   measurement, write_profile_markdown)
 
 # --- BROAD PRINT SUPPRESSION FOR LIBRARIES ---
 import builtins
@@ -95,6 +97,8 @@ def _instruction_compiler_fingerprint(script_dir: str, execution_sig: str) -> st
     sources = (
         ("model_codegen", os.path.join(script_dir, "qwen3_0.6b_test.py")),
         ("engine_codegen", os.path.join(repo_root, "user_dma_core.py")),
+        ("multi_engine_codegen", os.path.join(repo_root, "multi_engine_shard.py")),
+        ("decode_sharding", os.path.join(repo_root, "multi_engine_decode.py")),
         ("model_config", os.path.join(script_dir, "qwen3_0.6b_config.json")),
     )
     digest = hashlib.sha256()
@@ -134,7 +138,7 @@ def _expected_weight_bin_size(cfg: dict) -> int:
     )
     return max(ends)
 
-def _device_bf16_embedding_layout(cfg: dict) -> tuple[int, int]:
+def _device_bf16_embedding_layout(cfg: dict, model_base: int = 0x80000000) -> tuple[int, int]:
     """Return the fixed top-down device-DRAM slot for the exact BF16 table."""
     embedding = cfg["special"]["embedding"]
     size = (int(embedding["vocab_size"]) * int(embedding["embedding_dim"])
@@ -145,18 +149,20 @@ def _device_bf16_embedding_layout(cfg: dict) -> tuple[int, int]:
             f"Embedding layout mismatch: config region is {configured_size} bytes, "
             f"but vocab/dimension require {size}."
         )
-    base = _DEVICE_DRAM_LIMIT - size
-    if base < _PROGRAM_DRAM_BASE or base % 64:
+    dram_limit = model_base + 2 * 2**30
+    base = dram_limit - size
+    if base < model_base + 0x60000000 or base % 64:
         raise ValueError(
-            f"BF16 embedding slot 0x{base:X}..0x{_DEVICE_DRAM_LIMIT:X} is invalid."
+            f"BF16 embedding slot 0x{base:X}..0x{dram_limit:X} is invalid."
         )
     return base, size
 
 def _validate_program_embedding_separation(
-        program_size: int, embedding_base: int, dispatch_size: int) -> None:
+        program_size: int, embedding_base: int, dispatch_size: int,
+        program_base: int = _PROGRAM_DRAM_BASE) -> None:
     """Keep programs, runtime preamble, and token dispatch below the embedding."""
     aligned_program_size = (int(program_size) + 63) & ~63
-    program_end = (_PROGRAM_DRAM_BASE + aligned_program_size
+    program_end = (program_base + aligned_program_size
                    + _RUNTIME_PREAMBLE_BYTES + int(dispatch_size))
     if program_end > embedding_base:
         raise ValueError(
@@ -490,16 +496,29 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
     """
 
     def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None,
-                 weights_bin: str | None = None, use_bf16_last_layer: bool = False):
+                 weights_bin: str | None = None, use_bf16_last_layer: bool = False,
+                 multi_core: int = 1):
         # Qwen3-0.6B DRAM layout in the 2 GiB accelerator window:
         #   params:       0x80000000 – 0xA0000000 (512 MB)
         #   tensors:      0xA0000000 – 0xE0000000 (KV cache + activations)
         #   programs:     0xE0000000 – 0xED740000 (bin, preamble, dispatch)
         #   embedding:    0xED740000 – 0x100000000 (exact BF16 rows)
+        self.multi_core = int(multi_core)
+        if self.multi_core < 1:
+            raise ValueError("multi_core must be at least 1")
+        self._model_base = 0x80000000
+        self._board_windows = None
+        self.shard_group = None
+        self.controller_decoder = None
+        self.sharded_weights = {}
+        if self.multi_core > 1:
+            from multi_engine_shard import model_multicore_layout
+            self._board_windows, self._model_base = model_multicore_layout(self.multi_core)
+        self._program_base = self._model_base + 0x60000000
         super().__init__(
-            params_dram_base=0x80000000,
-            tensor_dram_base=0xA0000000,
-            program_dram_base=0xE0000000,
+            params_dram_base=self._model_base,
+            tensor_dram_base=self._model_base + 0x20000000,
+            program_dram_base=self._program_base,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self.use_bf16_last_layer = bool(use_bf16_last_layer)
@@ -526,7 +545,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         self.LAYER_SIZE = fi["num_layers"]
         self.EMBEDDING_ELEMENTS = fi["embedding_vocab"]
         (self.DRAM_ADDR_TOKEN_EMBEDDING,
-         self.DEVICE_EMBEDDING_TABLE_SIZE) = _device_bf16_embedding_layout(self._cfg)
+         self.DEVICE_EMBEDDING_TABLE_SIZE) = _device_bf16_embedding_layout(self._cfg, self._model_base)
         self.EMBEDDING_ROW_BYTES = self.vector_length * self.bytes_per_element
         self.EMBEDDING_DISPATCH_STRIDE_BYTES = _EMBEDDING_DISPATCH_STRIDE_BYTES
         self.EMBEDDING_DISPATCH_TABLE_SIZE = (
@@ -564,6 +583,58 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             )
         self.weight_init()
         self.tensor_init()
+        if self.get_params_dram_addr() > self._model_base + 0x20000000:
+            raise MemoryError("Qwen params overlap its tensor region")
+        if self.get_tensor_dram_addr() > self._program_base:
+            raise MemoryError("Qwen tensors overlap its program region")
+        self.setup_multi_core()
+
+    def setup_multi_core(self) -> None:
+        """Copy output-column shards to independent DDR/HBM controllers for decode."""
+        if self.multi_core == 1 or self.shard_group is not None:
+            return
+        from multi_engine_decode import ControllerShardedDecoder
+        self.controller_decoder = ControllerShardedDecoder(
+            self, self.multi_core, self._board_windows)
+        self.shard_group = self.controller_decoder.scheduler
+        layers = self.LAYER_SIZE - int(self.use_bf16_last_layer)
+        for proj, k, n in (
+                ("q", self.vector_length, self.head_dim * self.group_size),
+                ("k", self.vector_length, self.head_dim),
+                ("v", self.vector_length, self.head_dim),
+                ("o", self.head_dim * self.group_size, self.vector_length),
+                ("gate", self.vector_length, self.mlp_elements),
+                ("up", self.vector_length, self.mlp_elements),
+                ("down", self.mlp_elements, self.vector_length)):
+            source = self._matmul_b_kwargs(0, proj)
+            self.sharded_weights[proj] = self.controller_decoder.add_weight(
+                name=proj, main_weight_addr=source["B_DRAM_ADDR"],
+                main_scale_addr=source["SCALE_DRAM_ADDR"], K=k, N=n,
+                layers=layers, main_layer_stride=self.weight_defs["LAYER_WEIGHT_SIZE"],
+                data_type=TYPE.IF4)
+        self.sharded_weights["lm_head"] = self.controller_decoder.add_weight(
+            name="lm_head", main_weight_addr=self.DRAM_ADDR_LM_HEAD_QUANT,
+            main_scale_addr=self.DRAM_ADDR_LM_HEAD_SCALE,
+            K=self.vector_length, N=self.EMBEDDING_ELEMENTS, layers=1,
+            main_layer_stride=0, data_type=TYPE.IF4)
+        self.shard_group.verify_private_space()
+
+    def _multicore_signature(self) -> str:
+        layout = {"cores": self.multi_core, "model_base": self._model_base,
+                  "windows": self._board_windows}
+        return hashlib.sha256(json.dumps(layout, sort_keys=True).encode()).hexdigest()
+
+    def instruction_paths(self, profile: bool = False) -> tuple[str, str]:
+        paths = self._cfg["paths"]
+        tag = (f"_mc{self.multi_core}_{self._multicore_signature()[:12]}"
+               if self.multi_core > 1 else "")
+        if profile:
+            tag += "_profile"
+        result = []
+        for key in ("instruction_bin", "instruction_meta"):
+            stem, ext = os.path.splitext(paths[key])
+            result.append(os.path.join(self.script_dir, stem + tag + ext))
+        return tuple(result)
 
     # XDMA drivers/bitstreams commonly cap one os.write() well below the large
     # contiguous model regions. Chunk every large H2C transfer so failures are
@@ -735,6 +806,14 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         """
         b = self._matmul_b_kwargs(layer_idx, proj)
         if b.get("is_B_quantized") and K <= SCALE_BRAM_ELEMENTS:
+            if self.controller_decoder is not None:
+                sharded_flops = self.controller_decoder.projection(
+                    M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR,
+                    B_DRAM_ADDR=b["B_DRAM_ADDR"], OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                    SCALE_DRAM_ADDR=b["SCALE_DRAM_ADDR"], data_type=b["data_type"],
+                    **extras)
+                if sharded_flops is not None:
+                    return sharded_flops
             self.quantized_matmat_core(
                 M=M, K=K, N=N,
                 A_DRAM_ADDR=A_DRAM_ADDR,
@@ -1122,7 +1201,8 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
 
         print(f"    Allocate tensor dram end at DRAM address: 0x{self.get_tensor_dram_addr():X}, usage: {self.get_tensor_dram_usage()} bytes")
 
-    def _emit_prefill_program(self, seq_len: int, layer_size: int) -> int:
+    def _emit_prefill_program(self, seq_len: int, layer_size: int,
+                              profile: bool = False) -> dict:
         """Emit ONE seq_len-agnostic prefill program (no capture-session boundary).
 
         Caller wraps this in start_capture()/stop_capture(). The emitted program
@@ -1161,6 +1241,19 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         # return-address register, no jump patching.
 
         total_flops = 0
+        checkpoints = []
+        checkpoint_flops = 0
+
+        def _checkpoint(name: str) -> None:
+            nonlocal checkpoint_flops
+            if not profile:
+                return
+            self.generate_instruction_halt()
+            self.pad_capture_to_64b_boundary()
+            resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
+            checkpoints.append([name, f"0x{resume:X}",
+                                int(total_flops - checkpoint_flops)])
+            checkpoint_flops = total_flops
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         for layer_idx in range(layer_size):
             _original_print(f"    prefill layer {layer_idx + 1}/{layer_size}", end="\r", flush=True)
@@ -1172,6 +1265,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             total_flops += (self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=layer_input_addr,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
                               gpr_M_reg=self.gpr_seq_len) or 0)
+            _checkpoint(f"L{layer_idx}_pre_norm")
 
             # Q, K, V projections — M=seq_len rows at runtime
             total_flops += (self.matmat_mul_core(M=seq_len, K=self.vector_length, N=hd * qpkv,
@@ -1183,6 +1277,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             total_flops += (self.matmat_mul_core(M=seq_len, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
                 gpr_M_reg=self.gpr_seq_len, **self._matmul_b_kwargs(layer_idx, "v")) or 0)
+            _checkpoint(f"L{layer_idx}_qkv_proj")
 
             # QK RMSNorm per head — M = seq_len * nkvh and M = seq_len * nkvh * qpkv.
             # Compute M for each into TMP_REG via reg_mul_imm(gpr_seq_len, multiplier).
@@ -1228,6 +1323,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                 scalar=1.0 / math.sqrt(ahd),
                 gpr_M_reg=self.TMP_REG,
             )
+            _checkpoint(f"L{layer_idx}_qk_norm_rope_scale")
 
             # Per-KV-head: scatter K/V to cache + flash buffers, scatter Q, then flash_attention.
             # All per-token scatters are PBI runtime loops (gpr_seq_len trips) — the bin is
@@ -1253,7 +1349,6 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                     gpr_seq_len=self.gpr_seq_len,
                     template_seq_len=seq_len,
                 )
-
                 # V scatter: V_PROJ_TEMP[t][kv_h] → V cache[kv_h][t] + FLASH_V[t*qpkv+g]
                 v_write_specs = [(v_cache_base, ahd * bpe)]
                 for g in range(qpkv):
@@ -1310,6 +1405,8 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                     template_seq_len=seq_len,
                 )
 
+            _checkpoint(f"L{layer_idx}_kv_attention")
+
             # o_proj
             total_flops += (self.matmat_mul_core(M=seq_len, K=hd * qpkv, N=self.vector_length,
                 A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
@@ -1325,11 +1422,13 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                 mode=UE_MODE.ELTWISE_ADD,
                 gpr_M_reg=self.gpr_seq_len,
             )
+            _checkpoint(f"L{layer_idx}_o_proj_residual")
 
             # Qwen3: post_attention_layernorm IS the pre-FFN norm
             total_flops += (self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
                               gpr_M_reg=self.gpr_seq_len) or 0)
+            _checkpoint(f"L{layer_idx}_pre_ffn_norm")
 
             # MLP: gate_proj with SiLU, up_proj, gate x up element-wise, down_proj
             total_flops += (self.matmat_mul_core(M=seq_len, K=self.vector_length, N=self.mlp_elements,
@@ -1349,6 +1448,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                 mode=UE_MODE.ELTWISE_MUL,
                 gpr_M_reg=self.gpr_seq_len,
             )
+            _checkpoint(f"L{layer_idx}_mlp_gateup_mul")
 
             # down_proj: K=3072 ≤ SCALE_BRAM_ELEMENTS=8192, single call
             total_flops += (self.matmat_mul_core(M=seq_len, K=self.mlp_elements, N=self.vector_length,
@@ -1365,9 +1465,10 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                 mode=UE_MODE.ELTWISE_ADD,
                 gpr_M_reg=self.gpr_seq_len,
             )
+            _checkpoint(f"L{layer_idx}_mlp_down_residual")
         # HALT ends the prefill program (attention is inline, no trailing subroutine).
         self.generate_instruction_halt()
-        return total_flops
+        return {"flops": total_flops, "checkpoints": checkpoints}
 
     def run_prefill(self, prefill_program_addr: int, preamble_addr: int,
                     prefill_seq, gflops: int = None) -> dict:
@@ -1434,7 +1535,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         # Execute from the preamble — it jumps into the cached prefill, which halts.
         self.program_execute(preamble_addr, timeout=120.0, flops=gflops)
 
-    def _emit_decoder_program(self, layer_size: int) -> int:
+    def _emit_decoder_program(self, layer_size: int, profile: bool = False) -> dict:
         """Emit ONE decode-position-agnostic decoder program.
 
         Caller wraps this in start_capture()/stop_capture(). The emitted program
@@ -1497,6 +1598,19 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             gpr_cache_row_off, self.gpr_seq_len, ue_35bit_addr_shifter(ahd * bpe))
 
         total_flops = 0
+        checkpoints = []
+        checkpoint_flops = 0
+
+        def _checkpoint(name: str) -> None:
+            nonlocal checkpoint_flops
+            if not profile:
+                return
+            self.generate_instruction_halt()
+            self.pad_capture_to_64b_boundary()
+            resume = self.get_program_dram_addr() + self.capture_count * INSTRUCTION_SIZE_BYTES
+            checkpoints.append([name, f"0x{resume:X}",
+                                int(total_flops - checkpoint_flops)])
+            checkpoint_flops = total_flops
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         for layer_idx in range(layer_size):
             layer_off = layer_idx * LAYER_WEIGHT_SIZE
@@ -1507,6 +1621,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             total_flops += (self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=layer_input_addr,
                           OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
                           gpr_M_reg=gpr_one) or 0)
+            _checkpoint(f"L{layer_idx}_pre_norm")
 
             # Q, K, V projections — fused IF4 by default; optional L27 BF16 fallback.
             total_flops += self._decode_matmul(layer_idx, "q",
@@ -1521,6 +1636,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                 M=1, K=self.vector_length, N=hd,
                 A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_V_PROJ_TEMP,
                 gpr_M_reg=gpr_one)
+            _checkpoint(f"L{layer_idx}_qkv_proj")
 
             # QK RMSNorm: M is a compile-time constant (nkvh for K, nkvh*qpkv for Q).
             # Pass static M; no gpr_M_reg needed.
@@ -1548,6 +1664,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             self.sram_to_accelerator_memory(
                 0x30000, self.LAYER0_Q_NORM_DRAM, q_all_elements)
             total_flops += q_all_elements
+            _checkpoint(f"L{layer_idx}_qk_norm_rope_scale")
 
             # Per-KV-head: store new K/V to cache at decode position, then per-Q-head attention.
             # K cache write addr = k_cache_base + gpr_seq_len * (ahd*bpe); same for V.
@@ -1594,6 +1711,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                     gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
                     q_pre_scaled=True,
                 ) or 0)
+            _checkpoint(f"L{layer_idx}_kv_attention")
 
             # o_proj
             total_flops += self._decode_matmul(layer_idx, "o",
@@ -1606,11 +1724,13 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, sram_address=0x90000, element_size=self.vector_length)
             self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, element_size=self.vector_length)
+            _checkpoint(f"L{layer_idx}_o_proj_residual")
 
             # Qwen3: post_attention_layernorm IS the pre-FFN norm
             total_flops += (self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                           OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
                           gpr_M_reg=gpr_one) or 0)
+            _checkpoint(f"L{layer_idx}_pre_ffn_norm")
 
             # MLP: SwiGLU
             total_flops += self._decode_matmul(layer_idx, "gate",
@@ -1627,6 +1747,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_UP_DRAM, sram_address=0x90000, element_size=self.mlp_elements)
             self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
+            _checkpoint(f"L{layer_idx}_mlp_gateup_mul")
 
             # down_proj: K=3072 ≤ SCALE_BRAM_ELEMENTS=8192, single call
             total_flops += self._decode_matmul(layer_idx, "down",
@@ -1639,6 +1760,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             self.accelerator_memory_to_sram(accelerator_dram_address=self.LAYER0_MLP_DOWN_DRAM, sram_address=0x90000, element_size=self.vector_length)
             self.eltwise_add_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.vector_length)
             self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_OUTPUT_DRAM, element_size=self.vector_length)
+            _checkpoint(f"L{layer_idx}_mlp_down_residual")
 
         if layer_size == self.LAYER_SIZE:
             total_flops += (self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_OUTPUT_DRAM,
@@ -1650,7 +1772,9 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             # write_back_disable=True: greedy/argmax needs no 304 KB LOGITS_DRAM writeback
             # (no host logit readback at all). The bias buffer is zero pre-gate / in
             # --pure-greedy, so the same bin serves plain greedy and penalty.
-            self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+            lm_head = (self.controller_decoder.projection if self.controller_decoder is not None
+                       else self.quantized_matmat_core)
+            lm_head(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 data_type=TYPE.IF4, SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE,
                 C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
@@ -1665,9 +1789,10 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         # End-of-program halt so the runtime preamble's JUMP_ABS returns control after
         # execute (attention is inline, no trailing subroutine).
         self.generate_instruction_halt()
-        return total_flops
+        return {"flops": total_flops, "checkpoints": checkpoints}
 
-    def compile_instructions(self, layer_size: int | None = None) -> dict:
+    def compile_instructions(self, layer_size: int | None = None,
+                             profile: bool = False) -> dict:
         """Compile a UNIFIED single-bin instruction image: ONE prefill program
         + ONE decoder program in one capture session. Writes
         ``programs.bin`` + matching ``programs.json`` meta to disk.
@@ -1695,11 +1820,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         if layer_size is None:
             layer_size = self.LAYER_SIZE
 
-        paths_cfg = self._cfg.get("paths", {})
-        bin_rel  = paths_cfg.get("instruction_bin",  "qwen3_0.6b_bin/programs.bin")
-        meta_rel = paths_cfg.get("instruction_meta", "qwen3_0.6b_bin/programs.json")
-        bin_path  = os.path.join(self.script_dir, bin_rel)
-        meta_path = os.path.join(self.script_dir, meta_rel)
+        bin_path, meta_path = self.instruction_paths(profile=profile)
 
         # The decode LM head is uniform now: write_back_disable=True + the penalty C bias
         # (PENALTY_BIAS_DRAM). Penalty vs --pure-greedy differ only in the runtime bias
@@ -1708,6 +1829,8 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         # detected and recompiled.
         last_layer_sig = "bf16_l27" if self.use_bf16_last_layer else "if4_l27"
         lm_head_sig = f"fused_lm_shared_rope_qscale_bf16_embed_dispatch_v3:{last_layer_sig}"
+        if self.multi_core > 1:
+            lm_head_sig += f":mc:{self._multicore_signature()}"
         model_layout_sig = _model_layout_signature(self._cfg)
         compiler_fingerprint = _instruction_compiler_fingerprint(self.script_dir, lm_head_sig)
 
@@ -1716,7 +1839,9 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         # fixed addresses every invocation, so loading the bin off disk is otherwise
         # sufficient. A bin from an older build (missing/different key) is recompiled.
         bin_cached = os.path.exists(bin_path) and os.path.exists(meta_path)
-        if bin_cached:
+        # Worker images are emitted and uploaded together with the primary. A
+        # cached primary alone cannot reconstruct them, so multi-core recompiles.
+        if bin_cached and self.controller_decoder is None:
             try:
                 with open(meta_path, "r") as f:
                     meta = json.load(f)
@@ -1725,12 +1850,13 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             if (meta.get("lm_head_sig") == lm_head_sig
                     and meta.get("model_layout_sig") == model_layout_sig
                     and meta.get("compiler_fingerprint") == compiler_fingerprint
-                    and meta.get("instruction_base_addr") == f"0x{_PROGRAM_DRAM_BASE:X}"
+                    and meta.get("layer_size") == layer_size
+                    and meta.get("instruction_base_addr") == f"0x{self._program_base:X}"
                     and meta.get("instruction_total_size") == os.path.getsize(bin_path)
                     and meta.get("prefill_program_start_addr")
-                        == f"0x{_PROGRAM_DRAM_BASE:X}"
+                        == f"0x{self._program_base:X}"
                     and _parse_offset(meta.get("decoder_program_start_addr", -1))
-                        == _PROGRAM_DRAM_BASE + int(meta.get("prefill_program_size", -1))
+                        == self._program_base + int(meta.get("prefill_program_size", -1))
                     and (int(meta.get("prefill_program_size", -1))
                          + int(meta.get("decoder_program_size", -1)))
                         == os.path.getsize(bin_path)
@@ -1742,10 +1868,13 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                     and meta.get("embedding_dispatch_stride")
                         == self.EMBEDDING_DISPATCH_STRIDE_BYTES
                     and meta.get("embedding_dispatch_size")
-                        == self.EMBEDDING_DISPATCH_TABLE_SIZE):
+                        == self.EMBEDDING_DISPATCH_TABLE_SIZE
+                    and (not profile or (
+                        meta.get("prefill_profile_checkpoints")
+                        and meta.get("decoder_profile_checkpoints")))):
                 _validate_program_embedding_separation(
                     os.path.getsize(bin_path), self.DRAM_ADDR_TOKEN_EMBEDDING,
-                    self.EMBEDDING_DISPATCH_TABLE_SIZE)
+                    self.EMBEDDING_DISPATCH_TABLE_SIZE, self._program_base)
                 print(f"compile_instructions: cache hit, skipping compile ({bin_path}).")
                 return meta
             print("compile_instructions: cached program signature does not match "
@@ -1767,12 +1896,27 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
 
         _original_print(f"  Compiling prefill (template seq_len={prefill_template_seq_len}, {layer_size} layers)...")
         prefill_count_at_start = self.capture_count
-        prefill_flops = self._emit_prefill_program(seq_len=prefill_template_seq_len, layer_size=layer_size)
+        prefill_result = self._emit_prefill_program(
+            seq_len=prefill_template_seq_len, layer_size=layer_size, profile=profile)
+        prefill_flops = prefill_result["flops"]
         prefill_program_size = (self.capture_count - prefill_count_at_start) * 32
 
         _original_print(f"  Compiling decoder ({layer_size} layers)...")
         decoder_count_at_start = self.capture_count
-        decoder_flops = self._emit_decoder_program(layer_size=layer_size)
+        try:
+            if self.controller_decoder is not None:
+                self.controller_decoder.begin()
+            decoder_result = self._emit_decoder_program(
+                layer_size=layer_size, profile=profile)
+            decoder_flops = decoder_result["flops"]
+            if self.controller_decoder is not None:
+                self.controller_decoder.finalize()
+        except Exception:
+            if self.shard_group is not None:
+                self.shard_group.abort_program()
+            self.stop_capture()
+            _SILENT_MODE = False
+            raise
         decoder_program_size = (self.capture_count - decoder_count_at_start) * 32
 
         self.stop_capture()
@@ -1794,14 +1938,14 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         for inst in self.capture_buffer:
             all_bytes.extend(inst.get_bytes())
 
-        if instruction_base_addr != _PROGRAM_DRAM_BASE:
+        if instruction_base_addr != self._program_base:
             raise ValueError(
                 f"Instruction image starts at 0x{instruction_base_addr:X}; expected "
-                f"0x{_PROGRAM_DRAM_BASE:X} for the fixed embedding layout."
+                f"0x{self._program_base:X} for the selected embedding layout."
             )
         _validate_program_embedding_separation(
             len(all_bytes), self.DRAM_ADDR_TOKEN_EMBEDDING,
-            self.EMBEDDING_DISPATCH_TABLE_SIZE)
+            self.EMBEDDING_DISPATCH_TABLE_SIZE, self._program_base)
 
         prefill_program_start_addr = instruction_base_addr
         decoder_program_start_addr = instruction_base_addr + prefill_program_size
@@ -1817,6 +1961,10 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             "decoder_program_size":         decoder_program_size,
             "decoder_total_flops":          decoder_flops,
             "lm_head_sig":                  lm_head_sig,
+            "multi_core":                   self.multi_core,
+            "layer_size":                   layer_size,
+            "multicore_layout_sig":         self._multicore_signature(),
+            "model_base":                   self._model_base,
             "model_layout_sig":             model_layout_sig,
             "compiler_fingerprint":          compiler_fingerprint,
             "device_embedding_base":         f"0x{self.DRAM_ADDR_TOKEN_EMBEDDING:X}",
@@ -1825,6 +1973,9 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
             "embedding_dispatch_stride":     self.EMBEDDING_DISPATCH_STRIDE_BYTES,
             "embedding_dispatch_size":       self.EMBEDDING_DISPATCH_TABLE_SIZE,
         }
+        if profile:
+            meta["prefill_profile_checkpoints"] = prefill_result["checkpoints"]
+            meta["decoder_profile_checkpoints"] = decoder_result["checkpoints"]
         with open(bin_path, "wb") as f:
             f.write(all_bytes)
         with open(meta_path, "w") as f:
@@ -1944,12 +2095,17 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                 self._write_penalty_bias(self._generated_tokens)
 
             dispatch_entry_addr = self.get_embedding_dispatch_entry_addr(token_id)
+            if self.controller_decoder is not None:
+                self.controller_decoder.start()
             step_latency_us, _ = self.program_execute(
                 dispatch_entry_addr, timeout=10.0, flops=gflops_per_token)
+            if self.controller_decoder is not None:
+                self.controller_decoder.wait()
             decoder_hw_latency_us += float(step_latency_us)
             # Read the HW argmax register — the LM-head matmul already added the penalty bias
             # on chip, so this is the penalized (or pure-greedy) token. No host logit readback.
-            token_id = self.get_arg_max_index()
+            token_id = (self.controller_decoder.global_argmax("lm_head", self.LOGITS_DRAM)
+                        if self.controller_decoder is not None else self.get_arg_max_index())
             self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
@@ -1975,6 +2131,146 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         self.last_decoder_tokens = decoded_new_tokens
         return self.seq_len
 
+    def _profile_execute(self, entry_addr: int, checkpoints: list,
+                         tail_label: str | None = None,
+                         tail_flops: int | None = None,
+                         timeout: float = 120.0,
+                         shard: bool = False) -> tuple[list, float]:
+        """Single-step a checkpointed image and return raw per-layer samples.
+
+        ``shard=True`` launches the worker engines once before the segmented
+        HALT walk and joins them after (only the decode program is sharded;
+        prefill runs single-engine). The workers rendezvous with the primary at
+        each sharded matmul, so the primary's per-checkpoint HALT/resume between
+        rendezvous points keeps the lockstep."""
+        samples = []
+        cpu_start = time.perf_counter()
+        if shard and self.controller_decoder is not None:
+            self.controller_decoder.start()
+        self.start_execute_from_dram(entry_addr)
+        for checkpoint in checkpoints:
+            name, resume_hex = checkpoint[:2]
+            flops = checkpoint[2] if len(checkpoint) > 2 else None
+            self.wait_queue(timeout)
+            step = name.split("_", 1)[1] if name.startswith("L") else name
+            samples.append({"name": step,
+                            "hw_ms": self.report_latency_in_us() / 1e3,
+                            "issued_flops": flops,
+                            "effective_flops": flops})
+            self.start_execute_from_dram(int(resume_hex, 16))
+        self.wait_queue(timeout)
+        tail_ms = self.report_latency_in_us() / 1e3   # read before wait() clobbers the counter
+        if shard and self.controller_decoder is not None:
+            self.controller_decoder.wait(timeout)
+        if tail_label is not None:
+            samples.append({"name": tail_label,
+                            "hw_ms": tail_ms,
+                            "issued_flops": tail_flops,
+                            "effective_flops": tail_flops})
+        return samples, (time.perf_counter() - cpu_start) * 1e3
+
+    def run_profile(self, meta: dict, preamble_addr: int,
+                    prefill_seq: tuple[int, ...]) -> dict:
+        """Profile prefill, first decode, and a forced maximum-context decode."""
+        prefill_addr = _parse_offset(meta["prefill_program_start_addr"])
+        decoder_addr = _parse_offset(meta["decoder_program_start_addr"])
+        pf_checkpoints = meta.get("prefill_profile_checkpoints", [])
+        dec_checkpoints = meta.get("decoder_profile_checkpoints", [])
+        # Aggregate peak across all engines: sharded decode matmuls approach
+        # 100% while single-engine steps cap near 1/multi_core.
+        peak = user_dma_core.configured_hardware_info().frequency_mhz * 0.128 * self.multi_core
+        actual = len(prefill_seq) - 1
+        template = int(meta["prefill_template_seq_len"])
+        q_len = actual * self.group_size
+        aligned = ((q_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+
+        embedding = self.get_embedding_for_tokens(prefill_seq[:-1])
+        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding)
+        bias = torch.full((aligned, aligned), float("-inf"), dtype=torch.bfloat16)
+        token_rows = torch.ones(actual, actual, dtype=torch.bool)
+        token_mask = (torch.triu(token_rows, diagonal=0) if self.causal_mask_upper
+                      else torch.tril(token_rows, diagonal=0))
+        valid = token_mask.repeat_interleave(self.group_size, 0).repeat_interleave(
+            self.group_size, 1)
+        bias[:q_len, :q_len].masked_fill_(valid, 0.0)
+        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias)
+        self.clear_inst_id(); self.start_capture()
+        self.generate_instruction_add_set(self.gpr_seq_len, actual)
+        self.generate_instruction_add_set(self.gpr_q_seq_len, q_len)
+        self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned)
+        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_addr))
+        self.stop_capture(); self.write_captured_instructions_to_dram(preamble_addr)
+        self.clear_capture_buffer()
+        pf_samples, pf_cpu = self._profile_execute(preamble_addr, pf_checkpoints)
+        tmpl_q = template * self.group_size
+        tmpl_aligned = ((tmpl_q + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+        for sample in pf_samples:
+            scale = actual / template
+            if sample["name"] == "kv_attention":
+                scale *= aligned / tmpl_aligned
+            sample["issued_flops"] = int((sample["issued_flops"] or 0) * scale)
+            sample["effective_flops"] = sample["issued_flops"]
+            if sample["name"] == "kv_attention" and aligned:
+                sample["effective_flops"] = int(sample["issued_flops"] * q_len / aligned)
+        pf_rows = aggregate_checkpoints(pf_samples, peak_gflops=peak)
+        annotate_execution(pf_rows, self.multi_core)
+
+        tail_flops = max(int(meta["decoder_total_flops"])
+                         - sum(int(cp[2]) for cp in dec_checkpoints if len(cp) > 2), 0)
+        token_id = prefill_seq[-1]
+        embed_word_addr = ue_35bit_addr_shifter(
+            self.DRAM_ADDR_TOKEN_EMBEDDING + token_id * self.EMBEDDING_ROW_BYTES)
+
+        def _decode_at(context_len: int):
+            aligned_ctx = ((context_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+            decode_bias = torch.full(
+                (self.group_size, aligned_ctx), float("-inf"), dtype=torch.bfloat16)
+            decode_bias[:, :context_len] = 0.0
+            self.dma_to_accelerator_memory(
+                self.LAYER0_FLASH_BIAS_DRAM, decode_bias)
+            self.clear_inst_id(); self.start_capture()
+            self.generate_instruction_add_set(self.TMP_REG, embed_word_addr)
+            self.generate_instruction_add_set(self.gpr_seq_len, context_len - 1)
+            self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_ctx)
+            self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_addr))
+            self.stop_capture(); self.write_captured_instructions_to_dram(preamble_addr)
+            self.clear_capture_buffer()
+            samples, cpu_ms = self._profile_execute(
+                preamble_addr, dec_checkpoints, "output_norm_lm_head", tail_flops,
+                shard=True)
+            for sample in samples:
+                if sample["name"] == "kv_attention":
+                    sample["issued_flops"] = int(
+                        (sample["issued_flops"] or 0) * aligned_ctx
+                        / self.DECODER_ALIGNED_SEQ_LEN)
+                    sample["effective_flops"] = int(
+                        sample["issued_flops"] * context_len / aligned_ctx)
+            rows = aggregate_checkpoints(samples, peak_gflops=peak)
+            annotate_execution(
+                rows, self.multi_core,
+                sharded={"qkv_proj"},
+                mixed={
+                    "o_proj_residual": "o_proj sharded; residual primary",
+                    "mlp_gateup_mul": "gate/up sharded; multiply primary",
+                    "mlp_down_residual": "down_proj sharded; residual primary",
+                    "output_norm_lm_head": "LM head sharded; norm primary",
+                })
+            return rows, cpu_ms, sum(row["hw_ms"] for row in rows)
+
+        first_ctx = actual + 1
+        first_rows, first_cpu, first_hw = _decode_at(first_ctx)
+        large_ctx = self.MAX_CONTEXT_SIZE
+        large_rows, large_cpu, large_hw = _decode_at(large_ctx)
+        return {
+            "peak_gflops": peak, "prefill_seq_len": actual,
+            "prefill_rows": pf_rows, "prefill_cpu_ms": pf_cpu,
+            "prefill_hw_ms": sum(row["hw_ms"] for row in pf_rows),
+            "first_position": first_ctx - 1, "first_rows": first_rows,
+            "first_cpu_ms": first_cpu, "first_hw_ms": first_hw,
+            "large_position": large_ctx - 1, "large_rows": large_rows,
+            "large_cpu_ms": large_cpu, "large_hw_ms": large_hw,
+        }
+
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -1985,6 +2281,8 @@ def main():
     parser.add_argument("--local-weights", action="store_true", help="Use qwen3_0.6b_bin/full_model_weights.bin instead of generated params.bin")
     parser.add_argument('--dev', type=str, default='xdma0',
                         help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
+    parser.add_argument("--multi-core", type=int, default=1, metavar="N",
+                        help="Shard decode projections and LM head across N memory controllers.")
     parser.add_argument('--device', type=str, default='kintex7',
                         help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     # Decode is deterministic, on-FPGA only: token selection is always the HW argmax of
@@ -2000,6 +2298,9 @@ def main():
                         help='Use the packaged BF16 projections for transformer layer 27. '
                              'The default fused IF4 path is faster; this flag keeps the '
                              'previous quality-first execution mode.')
+    parser.add_argument('--profile', action='store_true',
+                        help='Generate a checkpointed profile and Markdown report for prefill, '
+                             'first-token decode, and maximum-context decode.')
     pen_group = parser.add_argument_group('on-FPGA repetition penalty (active unless --pure-greedy)')
     pen_group.add_argument('--greedy-until', type=int, default=512,
                         help='Pure greedy for the first N decoded tokens (math/reasoning lands '
@@ -2059,17 +2360,15 @@ def main():
     DMA_DEVICE_USER = user_dma_core.DMA_DEVICE_USER
     user_dma_core.configure_clock_from_hardware()
 
-    # Clear stale queue/PBI state before model weights are loaded. The reset's
-    # DRAM self-test touches the params base, so it must happen before creating
-    # Qwen3_0_6b_UnifiedEngine (same boot sequence as Gemma/Llama runners).
-    boot_engine = user_dma_core.UnifiedEngine(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR)
-    boot_engine.software_reset()
-    del boot_engine
+    # Clear every participating queue before loading model or private weights.
+    from multi_engine_decode import reset_engine_queues
+    reset_engine_queues(args.multi_core)
 
     ue = Qwen3_0_6b_UnifiedEngine(
         script_dir=script_dir,
         weights_bin=weights_bin_rel,
         use_bf16_last_layer=args.bf16_last_layer,
+        multi_core=args.multi_core,
     )
     # Always tokenize via apply_chat_template — no hardcoded ids in the config.
     user_prompt = args.prompt if args.prompt is not None else cfg.get("default_prompt", "What is 3 + 5?")
@@ -2101,26 +2400,79 @@ def main():
 
     print(f"\n--- Compiling unified instruction bin (1 prefill + 1 decoder, dynamic PBI) ---")
     timer = time.perf_counter()
-    inst_meta = ue.compile_instructions()
+    inst_meta = ue.compile_instructions(profile=args.profile)
     print(f"  compile_instructions done in {time.perf_counter() - timer:.2f}s")
 
-    paths_cfg = cfg.get("paths", {})
-    inst_bin_path = os.path.join(script_dir, paths_cfg.get("instruction_bin",
-                                  "qwen3_0.6b_bin/programs.bin"))
+    inst_bin_path, _ = ue.instruction_paths(profile=args.profile)
     base_addr, program_size = ue.load_program_instructions_from_file(inst_bin_path)
-    if base_addr != _PROGRAM_DRAM_BASE:
+    if base_addr != ue._program_base:
         raise RuntimeError(
-            f"Program loaded at 0x{base_addr:X}; expected 0x{_PROGRAM_DRAM_BASE:X}."
+            f"Program loaded at 0x{base_addr:X}; expected 0x{ue._program_base:X}."
         )
     _validate_program_embedding_separation(
         program_size, ue.DRAM_ADDR_TOKEN_EMBEDDING,
-        ue.EMBEDDING_DISPATCH_TABLE_SIZE)
+        ue.EMBEDDING_DISPATCH_TABLE_SIZE, ue._program_base)
     # Reserve a slot AFTER the loaded bin for the runtime preamble. Prefill preamble
     # is 4 instructions (3 ADD_SET + JUMP_ABS) = 128 B. The decode bucket preamble
     # is 2 instructions and is reached through a prebuilt 64-byte token dispatch.
     preamble_addr = ue.get_program_dram_addr()
     ue.allocate_program_dram(_RUNTIME_PREAMBLE_BYTES)
     ue.build_embedding_dispatch_table(preamble_addr)
+
+    if args.profile:
+        result = ue.run_profile(inst_meta, preamble_addr, prefill_seq)
+        peak = result["peak_gflops"]
+
+        def _total(rows, key):
+            return sum(row.get(key) or 0 for row in rows)
+
+        overall = [
+            measurement(label="Prefill", tokens=result["prefill_seq_len"],
+                        hw_ms=result["prefill_hw_ms"], cpu_ms=result["prefill_cpu_ms"],
+                        issued_flops=_total(result["prefill_rows"], "issued_flops"),
+                        effective_flops=_total(result["prefill_rows"], "effective_flops"),
+                        peak_gflops=peak),
+            measurement(label="Decode first token", tokens=1,
+                        position=result["first_position"], hw_ms=result["first_hw_ms"],
+                        cpu_ms=result["first_cpu_ms"],
+                        issued_flops=_total(result["first_rows"], "issued_flops"),
+                        effective_flops=_total(result["first_rows"], "effective_flops"),
+                        peak_gflops=peak),
+            measurement(label="Decode maximum context", tokens=1,
+                        position=result["large_position"], hw_ms=result["large_hw_ms"],
+                        cpu_ms=result["large_cpu_ms"],
+                        issued_flops=_total(result["large_rows"], "issued_flops"),
+                        effective_flops=_total(result["large_rows"], "effective_flops"),
+                        peak_gflops=peak),
+        ]
+        hw = user_dma_core.configured_hardware_info()
+        _mc_tag = f"_multi-core_{args.multi_core}" if args.multi_core != 1 else ""
+        summary_path = os.path.join(
+            SCRIPT_DIR, f"qwen3_0.6b_profile_{args.dev}{_mc_tag}.md")
+        write_profile_markdown(
+            summary_path, title="Qwen3-0.6B profile summary",
+            hardware={
+                "HW info": user_dma_core.hardware_info_summary(),
+                "Board profile": args.device,
+                "DMA device": args.dev,
+                "Clock": f"{hw.frequency_mhz:.2f} MHz",
+                "AXI width": f"{user_dma_core.UE_AXI_DATA_WIDTH_BITS} bit",
+                "Engines": args.multi_core,
+                "Peak throughput": f"{peak:.2f} GFLOPS",
+                "Context capacity": ue.MAX_CONTEXT_SIZE,
+            },
+            overall=overall,
+            breakdowns=[
+                ("Prefill major-step breakdown", result["prefill_rows"]),
+                ("Decode first-token breakdown", result["first_rows"]),
+                ("Decode maximum-context breakdown", result["large_rows"]),
+            ],
+            notes=["The maximum-context pass is timing-only; cache values are not used for "
+                   "numeric validation.",
+                   "Effective attention FLOPs exclude 64-lane KV padding."],
+        )
+        print(f"Wrote profile summary: {summary_path}")
+        return
 
     prefill_program_addr = _parse_offset(inst_meta["prefill_program_start_addr"])
     decoder_program_addr = _parse_offset(inst_meta["decoder_program_start_addr"])

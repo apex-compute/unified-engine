@@ -107,6 +107,155 @@ pip install -r requirements.txt
 python3 user_hw_test.py
 ```
 
+#### Multi-engine memory bandwidth comparison
+
+The hardware suite includes a private-window versus split-region memory test
+for Kintex-7, Alveo U50, and U55C multi-engine images. To run just the memory
+comparison on the selected device:
+
+```bash
+python3 tests/multi_engine_memory_test.py --dev xdma1 \
+  --sizes-kib 64 256 512 --iterations 32 --samples 5 \
+  --json /tmp/kintex7-memory.json
+```
+
+For each buffer size, the standalone test measures each engine individually,
+then all selected engines concurrently with identical bytes per engine. **Private**
+uses each engine's board-assigned DRAM window; **split** gives each engine a
+nonoverlapping contiguous slice of one shared flat DRAM region. On the 4 GiB
+Kintex-7 image the default private buffers are 2 GiB apart, on different DDR3
+controllers. The runner also measures the previous 512 MiB spacing, which
+places both buffers on the same controller.
+
+Use `--private-spacing-mib 2048` to request that spacing explicitly
+(`0x08000000` and `0x88000000` on the 4 GiB Kintex-7 image). Individual engine
+baselines use the same addresses as the private comparison; ISA programs keep
+their board-assigned addresses. U50 uses its 512 MiB controller windows, and
+U55C uses its stack/controller map instead of assuming the same address stride.
+The runner rejects spacing that overlaps data or ISA storage or exceeds the
+reported DRAM capacity.
+
+Read and write results report aggregate MB/s from the master engine's hardware
+timer, including instruction and synchronization overhead and excluding PCIe
+uploads and readbacks. Each iteration reuses the same buffer; this measures
+repeated transfers rather than a sweep across all DRAM. Every sample checks
+the read/write round trip bit for bit. The JSON output preserves the results
+for comparison across runs.
+
+Measured on p2 with 512 KiB per engine, 32 iterations, and three samples:
+
+| Board / engines | Placement | Read GB/s | Write GB/s |
+| --- | --- | ---: | ---: |
+| Kintex-7 / 2 | Adjacent split | 6.87 | 6.97 |
+| Kintex-7 / 2 | Private, 512 MiB apart | 6.87 | 7.43 |
+| Kintex-7 / 2 | Private, 2 GiB apart | 12.60 | 11.99 |
+| U50 / 8 | Adjacent split | 10.66 | 10.67 |
+| U50 / 8 | Private controller windows | 81.02 | 80.57 |
+
+All samples passed exact read/write checks. These are aggregate device-memory
+rates, not PCIe transfer rates or model throughput. U55C placement has offline
+coverage; a U55C board was not available for measurement. The latest Kintex-7
+results use image `0x8763d976` and are in `tests/kintex7_memory_controller_results.json`.
+
+For Qwen3 0.6B, Llama3.2 1B, and Gemma3 1B, compare single-engine and
+controller-sharded decode with identical-token validation:
+
+```bash
+python3 tests/model_controller_benchmark.py --dev xdma1 --engines 2 \
+  --models qwen llama gemma --json kintex7-models.json
+python3 tests/model_controller_benchmark.py --dev xdma0 --engines 8 \
+  --models qwen llama gemma --json u50-models.json
+```
+
+The model map reserves a contiguous 2 GiB span for shared tensors and original
+weights. On Kintex-7, private decode shards therefore start at 0 and 3 GiB,
+still on different controllers; the standalone memory test uses exactly 2 GiB
+spacing. Model parameters must be available through each model's normal setup.
+
+The two-engine Kintex-7 path also supports Qwen3.5 2B and Gemma4 E2B within
+4 GiB. Qwen reserves 1 GiB for original parameters, 512 MiB for tensors, and
+512 MiB for instructions; its private weight copies use about 476 MiB per
+engine at 0 and 3 GiB. Recurrent state updates stay on the primary engine.
+Gemma E2B instead uses two complete 2 GiB controller tiles, with private
+weights loaded directly into each tile and shared tensors in the remaining
+space. This avoids keeping a duplicate full MLP weight image.
+
+```bash
+python3 tests/model_controller_benchmark.py --dev xdma1 --engines 2 \
+  --models qwen_2b e2b --prompt 'x+3=5, what is x?' \
+  --max-new-tokens 32 --json kintex7-2b-models.json
+```
+
+Measured average FPGA decode latency for matching token sequences:
+
+| Model | Kintex-7: 1 → 2 engines | U50: 1 → 8 engines |
+| --- | ---: | ---: |
+| Qwen3 0.6B | 93.39 → 67.22 ms (1.39×) | 58.47 → 30.54 ms (1.91×) |
+| Qwen3.5 2B, text | 1271.14 → 1190.33 ms (1.068×) | 776.70 → 689.38 ms (1.127×) |
+| Llama3.2 1B | 118.18 → 64.97 ms (1.82×) | 74.45 → 16.38 ms (4.54×) |
+| Gemma3 1B | 95.77 → 52.16 ms (1.84×) | 60.28 → 13.11 ms (4.60×) |
+| Gemma4 E2B, text | 224.09 → 125.80 ms (1.78×) | 141.18 → 33.79 ms (4.18×) |
+| Qwen2.5 VL-3B, text | Not measured | 211.00 → 33.62 ms (6.28×) |
+| Gemma4 E4B, text | Does not fit this layout | 380.95 → 249.47 ms (1.53×) |
+
+The common prompt is `Solve 2x + 3 = 7. Reply with only the value of x.`
+Qwen3 comparisons cover 128 generated tokens under a cap; Llama, Gemma3, and
+Qwen VL reach their stop token after 36, 70, and 5 steps respectively. These
+are decode timings, excluding model preparation, prefill, and host processing.
+Use `--models qwen_vl` to repeat the VL text comparison. The `*_controller_results.json`
+files at the repository root preserve token IDs, placement, and board identity.
+
+Qwen3.5 2B uses `x+3=5, what is x?` and matches 32 token IDs on each board.
+The first token comes from prefill; its timings cover the remaining 31 decode
+steps. Its recurrent attention stays on the primary engine, limiting the
+whole-model gain despite concurrent weight reads. Repeat with
+`--models qwen_2b --max-new-tokens 32`.
+
+Gemma4 E4B uses the prompt `x+3=5, what is x?` and matches all 32 generated
+tokens under its cap. Its Q/K/V/O and gate/up projections use private HBM;
+down projection and LM head retain their original primary kernels. Repeat
+with `--models e4b --max-new-tokens 32`. U50 needs at least four active
+engines to fit these copies; eight were measured.
+
+Gemma4 E2B matches 32 tokens on both boards with `x+3=5, what is x?`.
+Its prefill previously started at a 32-byte offset that the jump emitter
+rounded forward, skipping the first input DMA and producing unstable output.
+Prefill and decoder entry points now align to 64 bytes, and cache format 2
+rejects the old programs. The verified captures are
+`tests/kintex7_gemma4_e2b_controller_results.json` and
+`tests/alveo_u50_gemma4_e2b_controller_results.json`; earlier failed captures remain
+in `tests/gemma4_e2b_controller_results.json` and
+`tests/gemma4_e2b_existing_eight_comparison.json` as diagnostic history.
+
+Existing eight-engine model paths also use controller placement for SmolVLM2
+decode gate/up weights, pi0.5 vision copies, ACT matrix/convolution weights,
+VeraPulse vision projections, and Kokoro generator convolution taps. These
+changes have offline allocation, exact-copy, and cache-replay tests; their
+model throughput has not been remeasured. Fixed low-4-GiB model layouts use
+free upper HBM regions on Alveo and retain shared weights when no separate
+controller region fits on Kintex-7. Qwen Omni's existing whole-device layout
+was already suitable and remains in place.
+
+Run the offline tests without opening an FPGA device:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Gemma4 E2B preserves its existing eight-engine tiled map. Kintex-7 uses two
+2 GiB tiles; other smaller configurations use controller-aware windows.
+Cached programs record the exact map. The shared benchmark rejects matching
+padding-only or empty decoded output.
+
+Use `--models e2b` or `--models e4b` with `--max-new-tokens` for bounded Gemma4
+comparisons. E4B retains the original shared 0–4 GiB model image and places
+private Q/K/V/O/gate/up decode weights above 4 GiB. On U50, 4–8 engines fit;
+2–3 engines fail the private-capacity check before loading weights. Its large
+MLP down projection and LM head retain their original primary kernels.
+E4B passed 32 identical generated tokens on the same algebra prompt:
+380.95 → 249.47 ms/token (1.53×) on U50. The result is saved in
+`tests/alveo_u50_gemma4_e4b_controller_results.json`; prefill remains on the primary engine.
+
 ### 6. Run Gemma3 Inference (requires Hugging Face)
 
 The Gemma3 test downloads the gated [google/gemma-3-1b-it](https://huggingface.co/google/gemma-3-1b-it) model from Hugging Face. You need to:

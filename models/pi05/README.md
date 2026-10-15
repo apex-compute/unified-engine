@@ -250,3 +250,25 @@ chunk executes open-loop; the other 9 obs are discarded (they still go into the 
 MuJoCo's EGL renderer segfaults after ~6 `OffScreenRenderEnv` creations when CUDA is
 also active, so run the **torch/GPU** eval in chunks of ≤5 tasks using `--task-start`.
 The FPGA backend does no CUDA compute and is unaffected.
+
+### Controller placement for vision weight copies
+
+The existing `--vis_weight_copies auto` option now places complete IF4 vision
+projection sets in free HBM controller regions outside pi05's fixed low-4-GiB
+model. This applies to the M-sharded vision path; the optional 2D rows/K grid
+continues to use its existing weight slices.
+
+| Board image | Available private copies |
+|---|---|
+| U50, 8 GiB | Up to eight 512 MiB windows in the upper stack, in engine/SAXI order |
+| U55C, 16 GiB | Up to twelve separate 1 GiB controller regions outside the model |
+| U55C, 8 GiB | Four free controller regions; additional engines share those four sets |
+| Kintex7, 4 GiB | Existing capacity-limited params/tensor copies; no free external controller windows |
+
+`--vis_weight_copies 1` retains the shared-weight control. The default on Alveo
+also moves engine 0's vision reads to its own replica. Norms and biases remain
+shared. Program manifests record the actual board/windows and each copy's source,
+destination and size; bin replay restores those bytes and rejects an old or
+changed controller map before starting programs. Regenerate multi-engine vision
+bins after this change. These placement/copy/cache paths are tested offline;
+model throughput and action fidelity still need a hardware comparison.

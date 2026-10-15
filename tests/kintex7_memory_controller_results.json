@@ -1,0 +1,968 @@
+{
+  "timestamp_utc": "2026-10-07T17:31:46.008891+00:00",
+  "hostname": "p2",
+  "device": "xdma1",
+  "image": "0x8763d976",
+  "hardware_info": {
+    "raw": 2218837587,
+    "queue_mode": true,
+    "axi_data_width_bits": 256,
+    "dram_size_code": 1,
+    "dram_size_gb": 4,
+    "core_count": 2,
+    "frequency_mhz_q8": 50771,
+    "frequency_mhz": 198.32421875,
+    "frequency_hz": 198324218.75
+  },
+  "method": "Median hardware latency; one warmup; repeated same buffer; aggregate decimal MB/s; excludes host DMA; bit-exact roundtrip each sample",
+  "results": [
+    {
+      "layout": "private",
+      "engines": [
+        0
+      ],
+      "direction": "read",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": null,
+      "size_kib": 64,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134283264
+        }
+      ],
+      "latency_us": 345.37385515353253,
+      "latency_samples_us": [
+        345.2931791770893,
+        345.37385515353253,
+        345.535207106419
+      ],
+      "total_bytes": 2097152,
+      "mb_per_s": 6072.121466946975,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0
+      ],
+      "direction": "write",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": null,
+      "size_kib": 64,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134283264
+        }
+      ],
+      "latency_us": 358.5240393137815,
+      "latency_samples_us": [
+        358.685391266668,
+        358.5240393137815,
+        358.2820113844518
+      ],
+      "total_bytes": 2097152,
+      "mb_per_s": 5849.404140414042,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        1
+      ],
+      "direction": "read",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": null,
+      "size_kib": 64,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 1,
+          "source": 2281701376,
+          "destination": 2281766912
+        }
+      ],
+      "latency_us": 346.5839948001812,
+      "latency_samples_us": [
+        346.50331882373797,
+        346.66467077662446,
+        346.5839948001812
+      ],
+      "total_bytes": 2097152,
+      "mb_per_s": 6050.919925512105,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        1
+      ],
+      "direction": "write",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": null,
+      "size_kib": 64,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 1,
+          "source": 2281701376,
+          "destination": 2281766912
+        }
+      ],
+      "latency_us": 359.6535029839869,
+      "latency_samples_us": [
+        359.6535029839869,
+        359.4114750546572,
+        359.7341789604302
+      ],
+      "total_bytes": 2097152,
+      "mb_per_s": 5831.034544638851,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "read",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": 2147483648,
+      "size_kib": 64,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134283264
+        },
+        {
+          "engine": 1,
+          "source": 2281701376,
+          "destination": 2281766912
+        }
+      ],
+      "latency_us": 346.5839948001812,
+      "latency_samples_us": [
+        346.5839948001812,
+        346.66467077662446,
+        346.42264284729475
+      ],
+      "total_bytes": 4194304,
+      "mb_per_s": 12101.83985102421,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "write",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": 2147483648,
+      "size_kib": 64,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134283264
+        },
+        {
+          "engine": 1,
+          "source": 2281701376,
+          "destination": 2281766912
+        }
+      ],
+      "latency_us": 359.5728270075437,
+      "latency_samples_us": [
+        359.7341789604302,
+        359.4114750546572,
+        359.5728270075437
+      ],
+      "total_bytes": 4194304,
+      "mb_per_s": 11664.685663002017,
+      "verified": true
+    },
+    {
+      "layout": "split",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "read",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": 65536,
+      "size_kib": 64,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134348800
+        },
+        {
+          "engine": 1,
+          "source": 134283264,
+          "destination": 134414336
+        }
+      ],
+      "latency_us": 613.2987729215497,
+      "latency_samples_us": [
+        613.2987729215497,
+        613.2987729215497,
+        613.2987729215497
+      ],
+      "total_bytes": 4194304,
+      "mb_per_s": 6838.9244935543275,
+      "verified": true
+    },
+    {
+      "layout": "split",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "write",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": 65536,
+      "size_kib": 64,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134348800
+        },
+        {
+          "engine": 1,
+          "source": 134283264,
+          "destination": 134414336
+        }
+      ],
+      "latency_us": 604.4244155127927,
+      "latency_samples_us": [
+        604.2630635599062,
+        604.4244155127927,
+        604.4244155127927
+      ],
+      "total_bytes": 4194304,
+      "mb_per_s": 6939.335824879872,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "read",
+      "private_spacing_bytes": 536870912,
+      "source_spacing_bytes": 536870912,
+      "size_kib": 64,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134283264
+        },
+        {
+          "engine": 1,
+          "source": 671088640,
+          "destination": 671154176
+        }
+      ],
+      "latency_us": 613.2987729215497,
+      "latency_samples_us": [
+        613.2987729215497,
+        613.5408008508794,
+        613.2987729215497
+      ],
+      "total_bytes": 4194304,
+      "mb_per_s": 6838.9244935543275,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "write",
+      "private_spacing_bytes": 536870912,
+      "source_spacing_bytes": 536870912,
+      "size_kib": 64,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134283264
+        },
+        {
+          "engine": 1,
+          "source": 671088640,
+          "destination": 671154176
+        }
+      ],
+      "latency_us": 567.636170254673,
+      "latency_samples_us": [
+        567.636170254673,
+        567.636170254673,
+        567.636170254673
+      ],
+      "total_bytes": 4194304,
+      "mb_per_s": 7389.0710631040365,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0
+      ],
+      "direction": "read",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": null,
+      "size_kib": 256,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134479872
+        }
+      ],
+      "latency_us": 1336.639577711686,
+      "latency_samples_us": [
+        1336.720253688129,
+        1336.639577711686,
+        1336.639577711686
+      ],
+      "total_bytes": 8388608,
+      "mb_per_s": 6275.89377112506,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0
+      ],
+      "direction": "write",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": null,
+      "size_kib": 256,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134479872
+        }
+      ],
+      "latency_us": 1403.9233420653522,
+      "latency_samples_us": [
+        1403.9233420653522,
+        1404.0040180417957,
+        1403.9233420653522
+      ],
+      "total_bytes": 8388608,
+      "mb_per_s": 5975.118262268705,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        1
+      ],
+      "direction": "read",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": null,
+      "size_kib": 256,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 1,
+          "source": 2281701376,
+          "destination": 2281963520
+        }
+      ],
+      "latency_us": 1337.9303933347778,
+      "latency_samples_us": [
+        1337.9303933347778,
+        1337.7690413818914,
+        1338.0110693112208
+      ],
+      "total_bytes": 8388608,
+      "mb_per_s": 6269.838880849011,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        1
+      ],
+      "direction": "write",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": null,
+      "size_kib": 256,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 1,
+          "source": 2281701376,
+          "destination": 2281963520
+        }
+      ],
+      "latency_us": 1405.133481712001,
+      "latency_samples_us": [
+        1405.536861594217,
+        1405.0528057355577,
+        1405.133481712001
+      ],
+      "total_bytes": 8388608,
+      "mb_per_s": 5969.9723258885,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "read",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": 2147483648,
+      "size_kib": 256,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134479872
+        },
+        {
+          "engine": 1,
+          "source": 2281701376,
+          "destination": 2281963520
+        }
+      ],
+      "latency_us": 1337.7690413818914,
+      "latency_samples_us": [
+        1337.7690413818914,
+        1337.7690413818914,
+        1337.8497173583344
+      ],
+      "total_bytes": 16777216,
+      "mb_per_s": 12541.190206247737,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "write",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": 2147483648,
+      "size_kib": 256,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134479872
+        },
+        {
+          "engine": 1,
+          "source": 2281701376,
+          "destination": 2281963520
+        }
+      ],
+      "latency_us": 1405.6175375706605,
+      "latency_samples_us": [
+        1405.6175375706605,
+        1405.456185617774,
+        1405.8595654999901
+      ],
+      "total_bytes": 16777216,
+      "mb_per_s": 11935.832864604257,
+      "verified": true
+    },
+    {
+      "layout": "split",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "read",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": 262144,
+      "size_kib": 256,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134742016
+        },
+        {
+          "engine": 1,
+          "source": 134479872,
+          "destination": 135004160
+        }
+      ],
+      "latency_us": 2442.7072147485774,
+      "latency_samples_us": [
+        2442.7072147485774,
+        2442.6265387721337,
+        2442.7072147485774
+      ],
+      "total_bytes": 16777216,
+      "mb_per_s": 6868.2877336680085,
+      "verified": true
+    },
+    {
+      "layout": "split",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "write",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": 262144,
+      "size_kib": 256,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134742016
+        },
+        {
+          "engine": 1,
+          "source": 134479872,
+          "destination": 135004160
+        }
+      ],
+      "latency_us": 2407.5324890193224,
+      "latency_samples_us": [
+        2407.6938409722084,
+        2407.5324890193224,
+        2407.5324890193224
+      ],
+      "total_bytes": 16777216,
+      "mb_per_s": 6968.635346156423,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "read",
+      "private_spacing_bytes": 536870912,
+      "source_spacing_bytes": 536870912,
+      "size_kib": 256,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134479872
+        },
+        {
+          "engine": 1,
+          "source": 671088640,
+          "destination": 671350784
+        }
+      ],
+      "latency_us": 2442.6265387721337,
+      "latency_samples_us": [
+        2442.78789072502,
+        2442.6265387721337,
+        2442.6265387721337
+      ],
+      "total_bytes": 16777216,
+      "mb_per_s": 6868.51458202596,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "write",
+      "private_spacing_bytes": 536870912,
+      "source_spacing_bytes": 536870912,
+      "size_kib": 256,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134479872
+        },
+        {
+          "engine": 1,
+          "source": 671088640,
+          "destination": 671350784
+        }
+      ],
+      "latency_us": 2260.3795079868432,
+      "latency_samples_us": [
+        2260.621535916173,
+        2260.3795079868432,
+        2260.2181560339563
+      ],
+      "total_bytes": 16777216,
+      "mb_per_s": 7422.300521093582,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0
+      ],
+      "direction": "read",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": null,
+      "size_kib": 512,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134742016
+        }
+      ],
+      "latency_us": 2659.241535522247,
+      "latency_samples_us": [
+        2658.192747828485,
+        2659.241535522247,
+        2659.886943333793
+      ],
+      "total_bytes": 16777216,
+      "mb_per_s": 6309.022996177417,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0
+      ],
+      "direction": "write",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": null,
+      "size_kib": 512,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134742016
+        }
+      ],
+      "latency_us": 2797.8428630517424,
+      "latency_samples_us": [
+        2797.9235390281856,
+        2797.7621870752987,
+        2797.8428630517424
+      ],
+      "total_bytes": 16777216,
+      "mb_per_s": 5996.482583621683,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        1
+      ],
+      "direction": "read",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": null,
+      "size_kib": 512,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 1,
+          "source": 2281701376,
+          "destination": 2282225664
+        }
+      ],
+      "latency_us": 2662.0651946977605,
+      "latency_samples_us": [
+        2662.0651946977605,
+        2659.32221149869,
+        2662.79127848575
+      ],
+      "total_bytes": 16777216,
+      "mb_per_s": 6302.33099978786,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        1
+      ],
+      "direction": "write",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": null,
+      "size_kib": 512,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 1,
+          "source": 2281701376,
+          "destination": 2282225664
+        }
+      ],
+      "latency_us": 2799.2143546512775,
+      "latency_samples_us": [
+        2799.1336786748343,
+        2799.2143546512775,
+        2799.2950306277207
+      ],
+      "total_bytes": 16777216,
+      "mb_per_s": 5993.544571576793,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "read",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": 2147483648,
+      "size_kib": 512,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134742016
+        },
+        {
+          "engine": 1,
+          "source": 2281701376,
+          "destination": 2282225664
+        }
+      ],
+      "latency_us": 2662.79127848575,
+      "latency_samples_us": [
+        2660.613027121782,
+        2662.79127848575,
+        2662.871954462193
+      ],
+      "total_bytes": 33554432,
+      "mb_per_s": 12601.224989395867,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "write",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": 2147483648,
+      "size_kib": 512,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134742016
+        },
+        {
+          "engine": 1,
+          "source": 2281701376,
+          "destination": 2282225664
+        }
+      ],
+      "latency_us": 2799.1336786748343,
+      "latency_samples_us": [
+        2798.972326721948,
+        2799.2143546512775,
+        2799.1336786748343
+      ],
+      "total_bytes": 33554432,
+      "mb_per_s": 11987.434632234263,
+      "verified": true
+    },
+    {
+      "layout": "split",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "read",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": 524288,
+      "size_kib": 512,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 135266304
+        },
+        {
+          "engine": 1,
+          "source": 134742016,
+          "destination": 135790592
+        }
+      ],
+      "latency_us": 4881.784010557209,
+      "latency_samples_us": [
+        4881.864686533651,
+        4881.784010557209,
+        4881.784010557209
+      ],
+      "total_bytes": 33554432,
+      "mb_per_s": 6873.395448761381,
+      "verified": true
+    },
+    {
+      "layout": "split",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "write",
+      "private_spacing_bytes": null,
+      "source_spacing_bytes": 524288,
+      "size_kib": 512,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 135266304
+        },
+        {
+          "engine": 1,
+          "source": 134742016,
+          "destination": 135790592
+        }
+      ],
+      "latency_us": 4811.7572630044715,
+      "latency_samples_us": [
+        4811.595911051584,
+        4811.7572630044715,
+        4811.837938980914
+      ],
+      "total_bytes": 33554432,
+      "mb_per_s": 6973.425749878443,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "read",
+      "private_spacing_bytes": 536870912,
+      "source_spacing_bytes": 536870912,
+      "size_kib": 512,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134742016
+        },
+        {
+          "engine": 1,
+          "source": 671088640,
+          "destination": 671612928
+        }
+      ],
+      "latency_us": 4881.784010557209,
+      "latency_samples_us": [
+        4881.784010557209,
+        4881.703334580765,
+        4881.784010557209
+      ],
+      "total_bytes": 33554432,
+      "mb_per_s": 6873.395448761381,
+      "verified": true
+    },
+    {
+      "layout": "private",
+      "engines": [
+        0,
+        1
+      ],
+      "direction": "write",
+      "private_spacing_bytes": 536870912,
+      "source_spacing_bytes": 536870912,
+      "size_kib": 512,
+      "iterations": 32,
+      "samples": 3,
+      "regions": [
+        {
+          "engine": 0,
+          "source": 134217728,
+          "destination": 134742016
+        },
+        {
+          "engine": 1,
+          "source": 671088640,
+          "destination": 671612928
+        }
+      ],
+      "latency_us": 4517.3706249630695,
+      "latency_samples_us": [
+        4517.3706249630695,
+        4517.6126528924,
+        4517.3706249630695
+      ],
+      "total_bytes": 33554432,
+      "mb_per_s": 7427.867842983177,
+      "verified": true
+    }
+  ]
+}

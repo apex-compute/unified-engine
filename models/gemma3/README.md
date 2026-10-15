@@ -13,7 +13,8 @@ This folder contains the Gemma3 accelerator inference example and numeric verifi
 - **gemma3_test.py** – Prefill + decode loop on accelerator (single or multi engine, `--multi-core N`).
 - **../../multi_engine_shard.py** – the shared multi-engine library. The decoder's
   N-sharded matmuls, batch-split attention and master/worker rendezvous all come
-  from here (`MultiEngineScheduler`, `worker_map="private_low"`).
+  from here (`MultiEngineScheduler`). `model_multicore_layout()` selects disjoint
+  model storage and private weight windows for each supported board.
 - **gemma3_test_IF8.py** – **Deprecated and currently non-working** IF8 experiment.
 - **gemma3_numeric.py** – Numeric verification with torch reference (prefill + decoder).
 - **gemma3_config.json** – Model and layout config.
@@ -42,8 +43,8 @@ python models/gemma3/gemma3_test.py
 # Custom prompt
 python models/gemma3/gemma3_test.py --prompt "Your prompt here"
 
-# DMA device and clock (Kintex-7: xdma0, 1066 / 5.375 = 198.3256 MHz, 5.0422 ns)
-python models/gemma3/gemma3_test.py --dev xdma0 --cycle 5.0422
+# DMA device; clock, AXI width, memory size, and core count come from HW_INFO
+python models/gemma3/gemma3_test.py --dev xdma1
 
 # Use local full-model weights bin
 python models/gemma3/gemma3_test.py --local-weights
@@ -52,39 +53,70 @@ python models/gemma3/gemma3_test.py --local-weights
 
 ## Decoder multi-core (`--multi-core N`)
 
-The decoder's quantized matmuls are N-sharded (split by output columns) across up to 8
-engines. Each engine holds a private copy of its own column block in the low 2 GB; the
-main PARAMS/TENSOR/PROGRAM map at `0x8000_0000` is untouched. Engines rendezvous once
-per sharded round through the four-phase `FLAG_CHECK_SET` / `FLAG_CHECK_CLEAR` handshake.
+The decoder's quantized matmuls are N-sharded (split by output columns) across
+up to 12 engines, bounded by the core count reported by `HW_INFO`. Each engine
+holds its own column block in a private window selected for that board's memory
+controllers. Engines synchronize each sharded round through the four-phase
+`FLAG_CHECK_SET` / `FLAG_CHECK_CLEAR` handshake. Prefill uses the original full
+weights on engine 0.
 
 ```bash
-python models/gemma3/gemma3_test.py --multi-core 8
+# P2 Kintex-7: two engines on separate DDR controllers
+python models/gemma3/gemma3_test.py --dev xdma1 --multi-core 2
+
+# Alveo U50: eight engines using the HBM controller map
+python models/gemma3/gemma3_test.py --dev xdma0 --multi-core 8
 ```
 
-Measured on hardware (366.7 MHz, IF4, gemma3-1B):
+Device numbers depend on the host; the examples above match the tested P2
+configuration. Board selection uses the reported hardware signature even when
+only two engines of an Alveo board are active.
 
-| cores | 1st-token tok/s | speedup | of ideal | avg tok/s | avg GFLOPS | % N-core peak |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 18.63 | 1.00x | 100% | 17.82 | 37.02 | 78.9% |
-| 2 | 29.21 | 1.57x | 78% | 27.46 | 57.64 | 61.4% |
-| 4 | 40.82 | 2.19x | 55% | 37.40 | 79.97 | 42.6% |
-| 8 | 82.77 | 4.44x | 56% | 52.53 | 114.03 | 30.4% |
+| Board signature | Shared model range | Private weight windows |
+|---|---|---|
+| Kintex-7, 2 cores / 4 GiB | `[1, 3)` GiB | 512 MiB at 0 and 3 GiB, on separate DDR controllers |
+| U50, 8 cores / 8 GiB | `[6, 8)` GiB | Primary 512 MiB HBM segments in hardware engine/SAXI order |
+| U55C, 12 cores / 16 GiB | `[6, 8)` GiB | One 1 GiB controller region per engine; a reserved region moves to the same MC on the other stack when available |
+| U55C, 12 cores / 8 GiB | `[6, 8)` GiB | Up to six 1 GiB windows; 7–12 engines use disjoint 512 MiB segments and share some controllers |
 
-**Read the first-token column, not the average.** First-token speed is measured at the
-same short context in every run, so it is the one comparable number. The 8-core row was
-captured from a different run (14-token prompt, 498 tokens decoded to a 512 context,
-versus 19/76 for the others), and its *average* therefore includes long-context decode
-where attention grows and the unsharded work dominates -- it is not comparable with the
-rows above it.
+The shared model keeps its original internal offsets within a reserved 2 GiB
+span: weights at the base, tensors at `+0x30000000`, and instructions at
+`+0x50000000`. Allocations and instruction writes are checked against these
+bounds before they can overwrite a private shard. Single-engine runs retain the
+original addresses.
 
-`% N-core peak` falls as cores rise because the denominator is the aggregate peak
-(`freq x 128 x cores`) while attention, the norms, the residuals and the gate*up multiply
-all still run on engine 0 alone. That falling number is Amdahl's law made visible, not a
-regression.
+The raw Kintex memory benchmark uses windows 2 GiB apart. Model inference uses
+windows at 0 and 3 GiB so the full shared model fits between them; both choices
+place the two private shards on different DDR controllers. The U55C 8 GiB image
+cannot provide twelve independent controller regions alongside the model.
+
+Compiled multi-engine filenames include a hash of the model base and ordered
+private windows, so a binary from another placement cannot be reused accidentally.
+`--bin-reuse` remains available for single-engine runs. Multi-engine runs always
+recompile the primary image and its persistent worker programs together.
+
+### Measured validation
+
+Both comparisons used the same 28-token prefill and produced exactly the same
+70 decoded token IDs, including the stop token, and decoded text as their
+single-engine baseline. The prompt was `Solve 2x + 3 = 7. Reply with only the value
+of x.` First-token rates below use hardware execution time.
+
+| Board | Engines | First-token rate, single → multi | First-token speedup | Mean hardware decode time, single → multi |
+|---|---:|---:|---:|---:|
+| Kintex-7, 198.324 MHz | 1 → 2 | 10.60 → 19.64 tok/s | 1.85× | 95.77 → 52.16 ms/token |
+| U50, 333.332 MHz | 1 → 8 | 16.83 → 76.80 tok/s | 4.56× | 60.28 → 13.11 ms/token |
+
+See the [Kintex-7 results](../../tests/kintex7_gemma3_controller_results.json) and
+[U50 results](../../tests/alveo_u50_gemma3_controller_results.json) for the complete
+hardware signatures, prompt, token IDs, placements, and timing measurements.
+These are end-to-end decode measurements, not a claim that every model operation
+sustains the raw memory benchmark's bandwidth. U55C placement is covered by
+software tests; these results do not include a U55C hardware run.
 
 ### What is sharded
 
-Each op is behind its own flag at the bottom of `gemma3_test.py`:
+Optional shards are controlled by the flags in `gemma3_test.py`:
 
 | op | K | N | 8-way split | flag |
 |---|---:|---:|---|---|
