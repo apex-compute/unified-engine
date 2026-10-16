@@ -93,5 +93,5 @@ FLOP counts do not depend on the board or engine count; they are the same as in 
 - Per-op time is not measured; the model reports stage times only. Per-op rows are FLOP counts.
 - Counts cover matmul and attention FLOPs as the model counts them (not patch embedding, projector, norms, softmax, RoPE, AdaRMS).
 - One run, no repeats.
-- The padding-removal switches (`--vis_qkv_strip`, `--vis_unpad_lanes`, `--vis_fc1_real_n`) are in `pi05_test.py` but off by default and not verified on any hardware, because the boards' current images lack the new unaligned-DMA support. Every number in this file is the unmodified (baseline) software.
+- Every number in this file is the padded baseline software, measured on an image without non-aligned DMA. `pi05_test.py` now always runs the real-width vision layout (`VIS_LAYOUT`): Q/K/V at N=1152 with strip write-back, P·V N=72 and O-proj K=1152, fc1 N=4304. It needs the non-aligned-DMA image. The padding knobs above, and the `dma80` mode, no longer exist.
 - Raw log: `models/pi05/pi05_xdma1_baseline_runtime.log` on p2.
