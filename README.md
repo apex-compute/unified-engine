@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="update_87eabea5.bin">&#9881;&#65039; Hardware Architecture Update v1.41(update_87eabea5.bin)</a>
+  <a href="https://github.com/apex-compute/unified-engine/releases/latest">&#9881;&#65039; Latest Hardware Architecture Update (update_*.bin)</a>
 </p>
 
 <p align="center">
@@ -282,7 +282,7 @@ python3 models/gemma3/gemma3_test.py --prompt "your prompt"
 > Omni runner. It validates the already-installed supported image and never
 > reprograms the FPGA; see [`models/qwen2.5_omni_7b/README.md`](models/qwen2.5_omni_7b/README.md).
 
-The current hardware release is **v1.4** (`update_006e0d2f.bin`). At startup the software reads the FPGA version register and checks it against the expected release hash (`0x006e0d2f`); on a mismatch it stops and tells you which bin to flash.
+The hardware image this code expects is the `update_<hash>.bin` in the repo root; tagged releases and their images are on the [Releases page](https://github.com/apex-compute/unified-engine/releases). At startup the software reads the FPGA version register and checks it against that hash (the `assert hw_version == 0x<hash>` in `user_dma_core.py`, stamped by each sync from andromeda); on a mismatch it stops and tells you which bin to flash.
 
 ```
 ./update_fpga.sh
@@ -295,11 +295,17 @@ If the image currently running predates the warm-boot block, the flash is still 
 Options:
 
 ```
-./update_fpga.sh --bin update_006e0d2f.bin   # explicit image (or pass it positionally)
+./update_fpga.sh --bin update_<hash>.bin     # explicit image (or pass it positionally)
 ./update_fpga.sh --check                     # device ID + running FPGA hash vs the repo bin
 ./update_fpga.sh --boot                      # no reflash: warm boot from flash, rescan
 ./update_fpga.sh --force                     # reflash even if already up to date
 ```
+
+### Files synced from andromeda
+
+The hardware library (`user_dma_core.py`, `user_hw_test.py`, `andromeda_hw_info.py`, …), `requirements.txt` and several model directories are owned by the [andromeda](https://github.com/apex-compute/andromeda) repo and synced here by `pcie_utils/sync_unified_engine.sh` (sync PRs titled `sync pcie_only <hash>`). `.synced-from` (written by each sync) lists every synced file and the andromeda commit they came from — don't edit it by hand.
+
+You can still fix a synced file here. The overnight andromeda CI back-syncs such edits: it three-way merges them onto andromeda, validates them on hardware, and opens a `pcie_utils: back-sync unified-engine <sha>` PR in andromeda, so the next sync keeps them instead of overwriting them. If the merge conflicts or the hardware test fails, the sync PR here is left as a draft (do not merge it) and an andromeda issue `back-sync blocked: unified-engine <sha>` explains what to resolve. Deleting a synced file here is not carried back — remove it from the list in andromeda instead.
 
 ### Kintex-7 encrypted BIN + eFUSE provisioning over JTAG
 
