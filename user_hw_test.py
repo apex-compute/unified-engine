@@ -6480,6 +6480,217 @@ def conv_regression_tests() -> None:
         _restore_rng_state(rng_state)
 
 
+# --- End-to-end convolution models (models/<name>/*_run_from_bin.py) ---------
+#
+# Each model runs from its compiled bin on the board and is compared with a CPU
+# reference produced in the same run, so the check holds on any board variant:
+# clock and engine count change timing, not numerics. Thresholds carry slack
+# below the Kintex-7 values measured 2026-10-15 (in brackets). The DPDFNet and
+# BigCodec bins target AXI-256 (their runners refuse other widths), so those
+# models are recorded as skipped on other widths.
+_CONV_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+_CONV_MODEL_SAMPLE_WAV = os.path.join(_CONV_MODEL_DIR, "test_samples", "apex.wav")
+_CONV_MODEL_TIMEOUT_S = 1800
+_CONV_YOLO_MIN_CONFIDENCE = 0.40     # detections that must agree with CPU
+_CONV_YOLO_MAX_CONFIDENCE_DELTA = 0.05   # [0.008]
+_CONV_YOLO_MIN_IOU = 0.80
+_CONV_UNET_MIN_MASK_AGREEMENT = 0.99     # [0.9990]
+_CONV_UNET_MAX_LOGIT_RMSE = 0.05         # [0.0101]
+_CONV_DPDFNET_MIN_SNR_DB = 20.0          # [26.7 dB]
+_CONV_DPDFNET8K_MIN_SNR_DB = 35.0        # [44.4 dB]
+_CONV_BIGCODEC_MIN_TOKEN_MATCH = 0.70    # [0.836]
+_CONV_BIGCODEC_MIN_DECODER_SNR_DB = 25.0  # [31.2 dB]
+
+
+def _conv_model_run(args: list, label: str) -> dict:
+    """Run one model script in a child process and return its TEST_RESULT."""
+    import json
+    import re
+    import subprocess
+    cmd = [sys.executable, *[str(a) for a in args]]
+    print(f"[{label}] {' '.join(cmd)}", flush=True)
+    try:
+        proc = subprocess.run(cmd, cwd=os.path.dirname(_CONV_MODEL_DIR),
+                              capture_output=True, text=True,
+                              timeout=_CONV_MODEL_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"{label}: no result after {_CONV_MODEL_TIMEOUT_S} s; a hung board "
+            "needs a reboot, not a rerun") from exc
+    if proc.returncode != 0:
+        tail = "\n".join((proc.stdout + proc.stderr).splitlines()[-15:])
+        raise RuntimeError(f"{label}: exit {proc.returncode}\n{tail}")
+    found = re.findall(r"^TEST_RESULT[: ]\s*(\{.*\})\s*$", proc.stdout, re.M)
+    return json.loads(found[-1]) if found else {}
+
+
+def _conv_model_bin(path: str, compile_args: list, label: str) -> None:
+    """Compile a model bin once when it is missing (CI starts from a clean clone)."""
+    if os.path.exists(path):
+        return
+    start = time.time()
+    for args in compile_args:
+        _conv_model_run(args, f"{label} compile")
+    print(f"[{label}] compiled {path} in {time.time() - start:.0f} s", flush=True)
+
+
+def _conv_waveform_snr_db(actual_path: str, reference_path: str) -> float:
+    import numpy as np
+    import soundfile as sf
+    actual, _ = sf.read(actual_path, dtype="float64")
+    reference, _ = sf.read(reference_path, dtype="float64")
+    n = min(len(actual), len(reference))
+    error = float(np.sum((actual[:n] - reference[:n]) ** 2))
+    return float("inf") if error == 0 else 10 * math.log10(
+        float(np.sum(reference[:n] ** 2)) / error)
+
+
+def _conv_yolo_agreement(fpga: list, cpu: list) -> tuple:
+    """Match confident detections by class and box; return (ok, detail)."""
+    def iou(a, b):
+        ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+        iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+        inter = ix * iy
+        union = ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+        return inter / union if union > 0 else 0.0
+    unused = list(fpga)
+    worst_delta, worst_iou, problems = 0.0, 1.0, []
+    for ref in cpu:
+        if ref["confidence"] < _CONV_YOLO_MIN_CONFIDENCE:
+            continue
+        candidates = [d for d in unused if d["class_id"] == ref["class_id"]]
+        best = max(candidates, key=lambda d: iou(d["box_xyxy"], ref["box_xyxy"]), default=None)
+        if best is None or iou(best["box_xyxy"], ref["box_xyxy"]) < _CONV_YOLO_MIN_IOU:
+            problems.append(f"missing {ref['label']} {ref['confidence']:.3f}")
+            continue
+        unused.remove(best)
+        worst_delta = max(worst_delta, abs(best["confidence"] - ref["confidence"]))
+        worst_iou = min(worst_iou, iou(best["box_xyxy"], ref["box_xyxy"]))
+    problems += [f"extra {d['label']} {d['confidence']:.3f}" for d in unused
+                 if d["confidence"] >= _CONV_YOLO_MIN_CONFIDENCE]
+    if worst_delta > _CONV_YOLO_MAX_CONFIDENCE_DELTA:
+        problems.append(f"confidence delta {worst_delta:.3f}")
+    detail = (f"{len(fpga)} detections vs CPU {len(cpu)}, max dconf={worst_delta:.3f}, "
+              f"min IoU={worst_iou:.3f}")
+    return not problems, detail + ("" if not problems else "; " + ", ".join(problems))
+
+
+def conv_model_tests() -> None:
+    """Run the six convolution models end to end and check them against CPU."""
+    import tempfile
+    import numpy as np
+    import user_dma_core
+    dev = user_dma_core._current_device_name()
+    hw = ["--device", "efinix" if dev == "efinix" else "rk", "--dev", dev]
+    axi = user_dma_core.configured_hardware_info().axi_data_width_bits
+    md = "models"
+    failures = []
+    rng_state = _capture_rng_state()
+    try:
+        with tempfile.TemporaryDirectory(prefix="conv_model_tests_") as tmp:
+            def out(name):
+                return os.path.join(tmp, name)
+
+            def check(name, dims, ok, detail, snr_db=None, cycles=None):
+                # dims holds only fixed inputs: compare_hw_test_summary.py pairs
+                # rows by name + dims, so measured values go to the SNR column
+                # (audio) and the log, not into dims.
+                status = "PASS" if ok else "FAIL"
+                record_test(f"conv_model-{name}", dims, snr_db=snr_db, cycles=cycles)
+                print(f"conv_model-{name}: {status} ({detail})", flush=True)
+                if not ok:
+                    failures.append(f"{name}: {detail}")
+
+            # YOLOv5s / YOLOv5n: detections must match the CPU reference.
+            for name, image, resolution in (("yolov5s", "vette.jpg", "640x480"),
+                                            ("yolov5n", "people.jpg", "256x256")):
+                _conv_model_bin(f"{md}/{name}/{name}_bin/{name}-andromeda.bin",
+                                [[f"{md}/{name}/{name}_compile.py"]], name)
+                common = ["--image", f"{md}/test_samples/{image}", "--resolution", resolution]
+                fpga = _conv_model_run([f"{md}/{name}/{name}_run_from_bin.py", *hw, *common,
+                                        "--output", out(f"{name}.jpg")], name)
+                cpu = _conv_model_run([f"{md}/{name}/{name}_run_from_bin.py", "--cpu", *common,
+                                       "--output", out(f"{name}_cpu.jpg")], f"{name} cpu")
+                ok, detail = _conv_yolo_agreement(fpga["detections"], cpu["detections"])
+                check(name, f"{image} {resolution}", ok, detail, cycles=fpga.get("fpga_cycles"))
+
+            # U-Net: --compare runs the quantized CPU reference in the same process.
+            _conv_model_bin(f"{md}/unet/unet_bin/unet-andromeda.bin",
+                            [[f"{md}/unet/unet_compile.py", "--download", "--resolution", "256x256"]],
+                            "unet")
+            unet = _conv_model_run([f"{md}/unet/unet_run_from_bin.py", "--image",
+                                    f"{md}/test_samples/vette.jpg", "--backend", "hardware", *hw,
+                                    "--resolution", "256x256", "--compare",
+                                    "--output", out("unet_mask.png")], "unet")
+            agreement, rmse = unet["mask_agreement"], unet["logit_rmse"]
+            check("unet", "vette.jpg 256x256",
+                  agreement >= _CONV_UNET_MIN_MASK_AGREEMENT and rmse <= _CONV_UNET_MAX_LOGIT_RMSE,
+                  f"mask agreement={agreement:.4f}, logit RMSE={rmse:.4f}",
+                  cycles=unet.get("fpga_cycles_sum"))
+
+            # Audio models: their bins target AXI-256.
+            audio = ("dpdfnet", "dpdfnet8khz", "bigcodec")
+            if axi != 256:
+                for name in audio:
+                    record_test(f"conv_model-{name}", f"skipped: bin targets AXI-256, board is AXI-{axi}")
+                    print(f"conv_model-{name}: SKIP (AXI-{axi})", flush=True)
+                audio = ()
+
+            # DPDFNet 16 kHz / 8 kHz: enhanced waveform vs the CPU ONNX reference.
+            for name, bin_name, floor in (("dpdfnet", "dpdfnet2-andromeda.bin", _CONV_DPDFNET_MIN_SNR_DB),
+                                          ("dpdfnet8khz", "dpdfnet2_8khz-andromeda.bin",
+                                           _CONV_DPDFNET8K_MIN_SNR_DB)):
+                if name not in audio:
+                    continue
+                bin_path = f"{md}/{name}/{name}_bin/{bin_name}"
+                _conv_model_bin(bin_path, [[f"{md}/{name}/{name}_compile.py", "--download"]], name)
+                fpga = _conv_model_run([f"{md}/{name}/{name}_run_from_bin.py", "--bin", bin_path, *hw,
+                                        "--output", out(f"{name}.wav")], name)
+                _conv_model_run([f"{md}/{name}/{name}_run_cpu.py", "--download",
+                                 "--output", out(f"{name}_cpu.wav")], f"{name} cpu")
+                snr = _conv_waveform_snr_db(out(f"{name}.wav"), out(f"{name}_cpu.wav"))
+                check(name, "apex.wav", snr >= floor, f"waveform SNR vs CPU={snr:.2f} dB (min {floor})",
+                      snr_db=snr, cycles=fpga.get("fpga_cycles_sum"))
+
+            if "bigcodec" in audio:
+                # BigCodec: tokens vs CPU, and the decoder alone (CPU decode of the FPGA tokens).
+                _conv_model_bin(
+                    f"{md}/bigcodec/bigcodec_bin/bigcodec-andromeda.bin",
+                    [[f"{md}/bigcodec/bigcodec_fetch.py"],
+                     [f"{md}/bigcodec/bigcodec_compile.py", "--input", _CONV_MODEL_SAMPLE_WAV,
+                      "--conv-precision", "bf16", "--lstm-cell-precision", "compensated",
+                      "--lstm-tanh-precision", "compensated", "--lstm-fused-gates",
+                      "--lstm-math-scope", "decoder", "--center-quantizer-scores",
+                      "--compensated-codebook",
+                      "--output", f"{md}/bigcodec/bigcodec_bin/bigcodec-andromeda.bin"]], "bigcodec")
+                fpga = _conv_model_run([f"{md}/bigcodec/bigcodec_run_from_bin.py", *hw,
+                                        "--output", out("bigcodec.wav")], "bigcodec")
+                _conv_model_run([f"{md}/bigcodec/bigcodec_run_cpu.py", "--input", _CONV_MODEL_SAMPLE_WAV,
+                                 "--output", out("bigcodec_cpu.wav"),
+                                 "--tokens", out("bigcodec_cpu.tokens.npz"), "--threads", "1"],
+                                "bigcodec cpu")
+                _conv_model_run([f"{md}/bigcodec/bigcodec_run_cpu.py", "--mode", "decode",
+                                 "--tokens", out("bigcodec.tokens.npz"),
+                                 "--output", out("bigcodec_decode_cpu.wav"), "--threads", "1"],
+                                "bigcodec cpu decode")
+                with np.load(out("bigcodec.tokens.npz")) as a, np.load(out("bigcodec_cpu.tokens.npz")) as b:
+                    key = next(k for k in a.files if "token" in k)
+                    ta, tb = a[key].ravel(), b[key].ravel()
+                n = min(len(ta), len(tb))
+                match = float(np.mean(ta[:n] == tb[:n])) if n else 0.0
+                decoder_snr = _conv_waveform_snr_db(out("bigcodec.wav"), out("bigcodec_decode_cpu.wav"))
+                check("bigcodec", f"apex.wav, {n} tokens",
+                      match >= _CONV_BIGCODEC_MIN_TOKEN_MATCH
+                      and decoder_snr >= _CONV_BIGCODEC_MIN_DECODER_SNR_DB,
+                      f"token match vs CPU={match:.3f} (min {_CONV_BIGCODEC_MIN_TOKEN_MATCH}), "
+                      f"decoder SNR={decoder_snr:.2f} dB (min {_CONV_BIGCODEC_MIN_DECODER_SNR_DB})",
+                      snr_db=decoder_snr, cycles=fpga.get("fpga_cycles"))
+    finally:
+        _restore_rng_state(rng_state)
+    if failures:
+        raise AssertionError("conv model tests failed: " + "; ".join(failures))
+
+
 def matmat_mul_quantized_weights_unified_test(
     M: int, K: int, N: int, bias_enable: bool = False,
     bias_mode: str = "broadcast_N", data_type: TYPE = TYPE.IF4,
@@ -12594,6 +12805,9 @@ if __name__ == "__main__":
     # Run new coverage only after every legacy test, including model inference.
     # The wrapper preserves both RNG streams and the legacy end fingerprint.
     conv_regression_tests()
+    # End-to-end convolution models vs CPU references (child processes; the
+    # wrapper restores both RNG streams, so the end fingerprint is unchanged).
+    conv_model_tests()
 
     _ALL_TESTS_PASSED_BEFORE_SUMMARY = True
     # Clean run: write the summary directly and hard-exit 0 so the atexit hook
