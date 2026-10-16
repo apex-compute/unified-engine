@@ -438,7 +438,8 @@ class Qwen25OmniUnifiedEngine(
                  fpga_build: int | None = None,
                  vision_res: str = DEFAULT_VISION_RES,
                  fpga_talker: bool = False, layout: str = "windowed",
-                 flat_plan=None):
+                 flat_plan=None, vision_qkv_strip: bool = False,
+                 vision_mlp_real_n: bool = False):
         if multi_core != REQUIRED_ENGINES:
             raise ValueError(
                 f"Qwen2.5-Omni-7B requires exactly {REQUIRED_ENGINES} engines, "
@@ -453,6 +454,10 @@ class Qwen25OmniUnifiedEngine(
         self.multi_core = multi_core
         self.fpga_talker = bool(fpga_talker)
         self.speak_as: str | None = None      # set before weight/tensor init
+        # Software preparation only: these change the vision ISA, never the
+        # default path. Non-64-column writes require an unaligned-DMA image.
+        self.vision_qkv_strip = bool(vision_qkv_strip)
+        self.vision_mlp_real_n = bool(vision_mlp_real_n)
         self.fpga_build = None if fpga_build is None else int(fpga_build)
         self._multi_core_schedulers: dict[str, MultiEngineScheduler] = {}
         self._worker_isa_used: dict[int, dict[str, int]] = {}

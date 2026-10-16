@@ -145,9 +145,15 @@ def _run(argv: list[str], label: str, result_prefix: str = "TEST_RESULT: ") -> d
     return result
 
 
+def _default_summary(args, content: str, tier: str) -> str:
+    """Report path named after the device and engine count actually used."""
+    return args.summary or os.path.join(
+        SCRIPT_DIR,
+        f"qwen2.5_omni_7b_test_{args.dev}_{content}_{tier}_multi-core_{args.multi_core}.md")
+
+
 def run_low(args) -> dict | None:
-    summary = args.summary or os.path.join(
-        SCRIPT_DIR, "qwen2.5_omni_7b_test_xdma0_audio_low_multi-core_8.md")
+    summary = _default_summary(args, "audio", "low")
     argv = _argv_for(
         PRESETS["low"], dev=args.dev, multi_core=args.multi_core,
         max_new_tokens=args.max_new_tokens, summary=summary,
@@ -156,8 +162,7 @@ def run_low(args) -> dict | None:
 
 
 def run_medium(args) -> dict | None:
-    summary = args.summary or os.path.join(
-        SCRIPT_DIR, "qwen2.5_omni_7b_test_xdma0_image+audio_medium_multi-core_8.md")
+    summary = _default_summary(args, "image+audio", "medium")
     argv = _argv_for(
         PRESETS["medium"], dev=args.dev, multi_core=args.multi_core,
         max_new_tokens=args.max_new_tokens, summary=summary,
@@ -166,8 +171,7 @@ def run_medium(args) -> dict | None:
 
 
 def run_high(args) -> dict | None:
-    summary = args.summary or os.path.join(
-        SCRIPT_DIR, "qwen2.5_omni_7b_test_xdma0_image_high_multi-core_8.md")
+    summary = _default_summary(args, "image+audio", "high")
     argv = _argv_for(
         PRESETS["high"], dev=args.dev, multi_core=args.multi_core,
         max_new_tokens=args.max_new_tokens, summary=summary,

@@ -647,55 +647,40 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             la['ln1_w'] = store_weight(self, ln1_w[l])
             la['ln1_b'] = store_weight(self, ln1_b[l])
 
-            # Q/K/V projections: pad each head's OUTPUT block D->DP (72->128) with zero
-            # columns/bias, concatenated per head (col h*DP:h*DP+D real, h*DP+D:h*DP+DP
-            # zero) -- the proven qwen2.5_vl_3b "qk_padded/v_padded" pattern. This keeps
-            # every per-head DMA stride a full DP*bpe=256B (AXI-beat aligned) instead of
-            # D*bpe=144B (NOT a multiple of the 32B AXI beat), and needs no separate
-            # real-vs-padded strided copy at attention time.
-            # Per-head OUTPUT width is VIS_QKV_LANES (80 by default, 128 = the
-            # original); the gather pads each head to DP=128 for Q.K^T.
-            QL = self.VIS_QKV_LANES
-            def _pad_proj(k_l, b_l, scale=1.0):
-                k2d = k_l.reshape(H, NH, D)                    # (K, heads, D)
-                k_pad = torch.zeros(H, NH, QL, dtype=k2d.dtype)
-                k_pad[:, :, :D] = k2d * scale
-                b_pad = torch.zeros(NH, QL, dtype=b_l.dtype)
-                b_pad[:, :D] = b_l * scale
-                return k_pad.reshape(H, NH * QL).T, b_pad.reshape(NH * QL)  # (N,K), (N)
+            # Q/K/V projections at the real N = NH*D (unpadded weights and bias); the
+            # strip write-back places each head's D lanes in its DP-lane slot (see
+            # VIS_LAYOUT).
+            def _real_proj(k_l, b_l, scale=1.0):
+                return (k_l.reshape(H, NH * D) * scale).T, b_l.reshape(NH * D) * scale  # (N,K), (N)
 
-            qk, qb = _pad_proj(q_k[l], q_b[l], q_scale)
+            qk, qb = _real_proj(q_k[l], q_b[l], q_scale)
             la['q_scale'], la['q_data'] = _store_q4_keep(blobs, 'q', qk)
             la['q_bias'] = store_weight(self, qb)
 
             for short, kk_l, kb_l in (('k', k_k[l], k_b[l]), ('v', v_k[l], v_b[l])):
-                kk, kb = _pad_proj(kk_l, kb_l)
+                kk, kb = _real_proj(kk_l, kb_l)
                 la[f'{short}_scale'], la[f'{short}_data'] = _store_q4_keep(blobs, short, kk)
                 la[f'{short}_bias'] = store_weight(self, kb)
 
             # Out projection. Its K layout must match what VIS_UNPAD hands it:
             #   pad128 -> K = NH*DP, each head's 72 real rows + 56 zero rows
-            #   dma80  -> K = NH*80, each head's 72 real rows +  8 zero rows
-            #   sel    -> K = NH*D,  unpadded (row h*D+d), same blocking as the reference
+            #   sel / split80 -> K = NH*D, unpadded (row h*D+d), same blocking
+            #             as the reference
             # Zero rows meet pad lanes, so they contribute nothing to the output.
             o3d = o_k[l].reshape(NH, D, H)                      # (heads, D, out)
-            o_lanes = {"pad128": DP, "dma80": self.VIS_UNPAD_LANES,
-                       "split80": self.VIS_UNPAD_LANES, "sel": D}[self.VIS_UNPAD]
+            o_lanes = DP if self.VIS_UNPAD == "pad128" else D
             o_pad = torch.zeros(NH, o_lanes, H, dtype=o3d.dtype)
             o_pad[:, :D, :] = o3d
             ok = o_pad.reshape(NH * o_lanes, H).T.contiguous()  # (N=H, K=NH*o_lanes)
             la['o_scale'], la['o_data'] = _store_q4_keep(blobs, 'o', ok)
             la['o_bias'] = store_weight(self, o_b[l])
 
-            # fc1 (Dense_0): pad OUTPUT width I->IP with zero columns/bias so fc1's own
-            # output buffer is directly IP-wide (real values in [0:I], exact zeros in
-            # [I:IP] since both weight and bias are zero there) — no separate scatter needed.
-            d0k_pad = torch.zeros(H, IP, dtype=d0_k.dtype)
-            d0k_pad[:, :I] = d0_k[l]
-            d0b_pad = torch.zeros(IP, dtype=d0_b.dtype)
-            d0b_pad[:I] = d0_b[l]
-            la['fc1_scale'], la['fc1_data'] = _store_q4_keep(blobs, 'fc1', d0k_pad.T)   # [4352,1152] (N,K)
-            la['fc1_bias'] = store_weight(self, d0b_pad)
+            # fc1 (Dense_0) at its real N = I = 4304: no pad rows. The matmul writes each
+            # row at pitch IP, so lanes [I:IP] of the intermediate are never written and
+            # stay zero (see VIS_LAYOUT). The 2D grid's N-split reaches a lane's rows by
+            # address arithmetic; only the pad sits past I, so every n0 offset is unchanged.
+            la['fc1_scale'], la['fc1_data'] = _store_q4_keep(blobs, 'fc1', d0_k[l].T)   # [4304,1152] (N,K)
+            la['fc1_bias'] = store_weight(self, d0_b[l])
 
             # fc2 (Dense_1): pad INPUT (K) I->IP with zero rows (fc1's padded zero columns
             # contribute exactly 0 through these zero weight rows).
@@ -955,20 +940,26 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self.VIS_IO_A_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_IO_B_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_LN_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
-        # Q/K/V/attn-result are per-head-padded (D->DP=128, see _weight_init_vision's
-        # _pad_proj) so every per-head DMA stride is AXI-beat aligned.
+        # Q/K/V/attn-result hold each head in a DP=128-lane slot (the Q.K^T operand
+        # width), so every per-head DMA stride is AXI-beat aligned.
         HP = NH * DP
-        # Q/K/V are NH*VIS_QKV_LANES wide. +DP*bpe slack: the per-head gather reads
-        # a full DP-lane (256 B) chunk from head h's start, so the LAST head of the
-        # LAST row reads (DP - QL) lanes past the end of the buffer.
-        QP = NH * self.VIS_QKV_LANES
-        self.VIS_Q_DRAM = self.allocate_tensor_dram(S * QP * bpe + DP * bpe)
-        self.VIS_K_DRAM = self.allocate_tensor_dram(S * QP * bpe + DP * bpe)
-        self.VIS_V_DRAM = self.allocate_tensor_dram(S * QP * bpe + DP * bpe)
+        # Q/K/V are (S, NH*DP): the strip write-back fills only the real D lanes of each
+        # DP-lane slot, so zero the buffers ONCE and the pad lanes stay exactly 0 (they
+        # feed Q.K^T and P.V).
+        self.VIS_Q_DRAM = self.allocate_tensor_dram(S * HP * bpe)
+        self.VIS_K_DRAM = self.allocate_tensor_dram(S * HP * bpe)
+        self.VIS_V_DRAM = self.allocate_tensor_dram(S * HP * bpe)
+        _zq = torch.zeros(S * HP, dtype=torch.bfloat16)
+        for _a in (self.VIS_Q_DRAM, self.VIS_K_DRAM, self.VIS_V_DRAM):
+            self.dma_write(DMA_DEVICE_H2C, _a, _zq, S * HP * bpe)
         self.VIS_ATTN_RESULT_DRAM = self.allocate_tensor_dram(S * HP * bpe)
         self.VIS_O_PROJ_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_RESIDUAL_DRAM = self.allocate_tensor_dram(S * H * bpe)
-        self.VIS_MLP_INTER_DRAM = self.allocate_tensor_dram(S * IP * bpe)  # padded I->IP (see fc1/fc2)
+        # fc1 writes only the real I lanes of each IP-wide row: keep lanes [I:IP] exactly 0
+        # (fc2's K = IP reads them against zero weight rows).
+        self.VIS_MLP_INTER_DRAM = self.allocate_tensor_dram(S * IP * bpe)
+        self.dma_write(DMA_DEVICE_H2C, self.VIS_MLP_INTER_DRAM,
+                       torch.zeros(S * IP, dtype=torch.bfloat16), S * IP * bpe)
         self.VIS_MLP_OUT_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_POST_LN_DRAM = self.allocate_tensor_dram(S * H * bpe)
         self.VIS_HEAD_OUT_DRAM = self.allocate_tensor_dram(S * HO * bpe)
@@ -993,8 +984,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # by the per-head gather/scatter, so the padded tail columns stay zero forever once
         # zero-initialized here — K's padded lanes dot to 0 and V's padded lanes contribute
         # 0 to the weighted sum, so attention math is unaffected. The (S, NH*DP) result is
-        # then compacted per VIS_UNPAD (dma80 gather / sel matmul / pad128 none) before
-        # the O projection.
+        # then compacted per VIS_UNPAD (split80 writes it compact / sel matmul / pad128
+        # none) before the O projection.
         self.VIS_FLASH_Q_DRAM = self.allocate_tensor_dram(S * DP * bpe)
         self.VIS_FLASH_K_DRAM = self.allocate_tensor_dram(S * DP * bpe)
         self.VIS_FLASH_V_DRAM = self.allocate_tensor_dram(S * DP * bpe)
@@ -1010,13 +1001,12 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         zeros_dp = torch.zeros(S * DP, dtype=torch.bfloat16)
         for addr in (self.VIS_FLASH_Q_DRAM, self.VIS_FLASH_K_DRAM, self.VIS_FLASH_V_DRAM):
             self.dma_write(DMA_DEVICE_H2C, addr, zeros_dp, S * DP * bpe)
-        # Compacted attention output, the O projection's A (VIS_UNPAD sel/dma80;
+        # Compacted attention output, the O projection's A (VIS_UNPAD sel/split80;
         # pad128 reads VIS_ATTN_RESULT_DRAM directly). Allocated LAST so no earlier
         # vision buffer moves.
         self.VIS_ATTN_UNPAD_DRAM = None
-        if self.VIS_UNPAD in ("sel", "dma80", "split80"):
-            _w = NH * (D if self.VIS_UNPAD == "sel" else self.VIS_UNPAD_LANES)
-            self.VIS_ATTN_UNPAD_DRAM = self.allocate_tensor_dram(S * _w * bpe)
+        if self.VIS_UNPAD in ("sel", "split80"):
+            self.VIS_ATTN_UNPAD_DRAM = self.allocate_tensor_dram(S * NH * D * bpe)
         print(f"    _tensor_init_vision done; tensor DRAM at 0x{self.get_tensor_dram_addr():X}")
 
     # ---- matmul dispatch ---------------------------------------------------
@@ -2406,30 +2396,33 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     #             56 pad lanes of every head (the original layout).
     #   "sel"     explicit bf16 selection matmul 2048 -> 1152, then O at K = 1152.
     #             Exact, but a dense matmul as big as the padded O it replaces.
-    #   "dma80"   strided DMA gather of 80 lanes per head (160 B chunks = 5 whole
-    #             AXI beats: 72 real + 8 pad) into a dense (S, 1280) buffer, then O
-    #             at K = 1280 with 8 zero weight rows per head. The exact 72-lane
-    #             gather (144 B chunks, 4.5 beats) is NOT used: the hardware drops a
-    #             beat per chunk and silently scrambles the data.
     #   "split80" (DEFAULT) no unpad step at all: attention runs through
-    #             pi05_attn_kernels.attention_split_hd, whose P.V has N = 80 and
-    #             writes each head's (rows, 80) straight into its columns of the
-    #             (S, 1280) buffer via the matmul's output row stride. Q.K^T stays at
-    #             128 (its contraction dim must be 64-aligned). Measured single-engine
-    #             (pi05_attn_hd_bench.py, 16 heads x 256): 20.31 ms/layer vs 22.85 for
-    #             stock-128 + dma80 gather, output BIT-IDENTICAL. v_dim 72 would be
-    #             exact but its 144 B rows scramble on write (-32..7 dB) -- not usable.
+    #             pi05_attn_kernels.attention_split_hd, whose P.V has N = 72 and
+    #             writes each head's (rows, 72) straight into its columns of the
+    #             (S, 1152) buffer via the matmul's output row stride. Q.K^T stays at
+    #             128 (its contraction dim must be 64-aligned).
+    # split80 is named for the 80-lane width the pre-non-aligned-DMA images needed (a
+    # 72-lane, 144 B chunk scrambled there); see VIS_LAYOUT. The former "dma80" strided
+    # gather is gone: a strided-DMA chunk must still be whole 32 B beats, so it cannot
+    # gather 72 lanes (144 B) and only ever existed to keep 8 pad lanes per head.
     VIS_UNPAD = os.environ.get("PI05_VIS_UNPAD", "split80")
-    VIS_UNPAD_LANES = 80        # dma80/split80: lanes kept per head (multiple of 16 = 32 B)
-    # Q/K/V PROJECTION WIDTH PER HEAD. The 128-lane pad is only needed INSIDE the
-    # per-head Q.K^T operand (its contraction must be 64-aligned), not in the
-    # projection output. At 80 the projections write 16 x 80 = 1280 columns (72 real
-    # + 8 zero) instead of 2048, and the per-head gather pads each head to 128 while
-    # copying it into the (zeroed) FQ/FK/FV buffers. Measured single-engine
-    # (pi05_qkv80_bench.py, full slot): projections 80.3 -> 50.3 ms/layer, proj +
-    # gather + attention 100.6 -> 71.2 ms/layer, operands and output bit-identical.
-    # 128 = the original layout, for A/B. Must be a multiple of 16 (32 B) and <= 128.
-    VIS_QKV_LANES = int(os.environ.get("PI05_VIS_QKV_LANES", "80"))
+    # REAL-WIDTH VISION (padding removal; needs the non-aligned-DMA bitstream). Always on:
+    #   * split80 keeps the real D = 72 lanes per head: P.V writes 144 B rows at 144 B
+    #     head offsets and the O projection contracts over K = NH*D = 1152 (the "80" in
+    #     the mode name is historical).
+    #   * Q/K/V project at the real N = NH*D = 1152, one matmul each (weights and bias
+    #     stored unpadded), written with the matmul's strip write-back (strip_cols=D,
+    #     strip_out_stride=DP): head h's 72 lanes land at the start of its own 128-lane
+    #     slot of a (S, NH*DP) buffer, zeroed once at tensor_init. The per-head gather
+    #     then copies whole aligned 256 B slots into FQ/FK/FV.
+    #   * fc1 runs at its real N = I = 4304 (weights and bias stored unpadded), written
+    #     at row pitch VIS_I_PAD so fc2 still reads K = 4352 (a multiple of 64); the 48
+    #     pad lanes are never written and stay zero.
+    # The 80-lane Q/K/V layout this replaces is gone: its gather relied on the old
+    # bitstreams' strided write consuming a whole 256 B SRAM slot per chunk, so on the
+    # non-aligned-DMA image every row after the first shifted and the encoder fell to
+    # ~8 dB against the IF4 reference (real-width: 23 dB, the padded-128 level).
+    VIS_LAYOUT = "real-width-v1"     # bin-set signature: a padded-layout set must not replay
     # PRIVATE PER-ENGINE COPIES OF THE VISION LAYER WEIGHTS (q/k/v/o/fc1/fc2, all
     # 27 layers, ~280 MB per copy). MEASURED on this board (user_hw_test
     # matmat_mul_multi_engine_flag_check_test, 1 MB DRAM->SRAM read per engine):
@@ -3572,13 +3565,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                                 self.VIS_I_PAD)
         bpe = 2
         HP = NH * DP
-        # O-projection input width, per VIS_UNPAD: 2048 (pad128), 1152 (sel), 1280 (dma80)
-        assert self.VIS_UNPAD in ("pad128", "sel", "dma80", "split80"), f"VIS_UNPAD={self.VIS_UNPAD!r}"
-        UL = self.VIS_UNPAD_LANES
-        assert UL % 16 == 0 and D <= UL <= DP, (
-            f"VIS_UNPAD_LANES={UL}: must cover the {D} real lanes and be a multiple of 16 "
-            f"(32 B AXI beat) -- a 4.5-beat chunk (72 lanes) scrambles on hardware")
-        HR = {"pad128": HP, "sel": NH * D, "dma80": NH * UL, "split80": NH * UL}[self.VIS_UNPAD]
+        # O-projection input width, per VIS_UNPAD: 2048 (pad128), 1152 (sel, split80)
+        assert self.VIS_UNPAD in ("pad128", "sel", "split80"), f"VIS_UNPAD={self.VIS_UNPAD!r}"
+        HR = HP if self.VIS_UNPAD == "pad128" else NH * D
         HO = self.VIS_HEAD_OUT
         ne = sched.num_engines
         is_primary = engine_idx == 0
@@ -3589,10 +3578,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         RH = row_offset * H * bpe                    # [S, H]  buffers
         RP = row_offset * HP * bpe                   # [S, HP] buffers (Q/K/V/attn result)
         RU = row_offset * HR * bpe                   # [S, HR] O-projection input
-        QL = self.VIS_QKV_LANES                      # Q/K/V lanes per head (80 or 128)
-        assert QL % 16 == 0 and D <= QL <= DP, f"VIS_QKV_LANES={QL}"
-        QP = NH * QL                                 # Q/K/V projection width
-        RQ = row_offset * QP * bpe                   # [S, QP] Q/K/V buffers
         RI = row_offset * IP * bpe                   # [S, IP] MLP intermediate
         RK = row_offset * self.VIS_PATCH_K * bpe     # [S, PK] patchified pixels
         RO = row_offset * HO * bpe                   # [S, HO] head output
@@ -3633,6 +3618,20 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         ue.generate_instruction_add_set(vis_S_reg, rows)
         ue.generate_instruction_add_set(vis_N_reg, H)
         ue.generate_instruction_add_set(vis_sqrt_N_reg, ue.float_to_bf19(float(H ** 0.5)))
+
+        # fc1 at real N: this engine's output columns [fc1_n0, fc1_n0 + fc1_n) of the real
+        # I, written at row pitch fc1_pitch. nk == 1: all I columns into IP-wide rows. 2D
+        # grid: the lane's _col_split(IP) share, whose real count is short of its pitch
+        # only on the lane holding the IP - I pad columns.
+        fc1_n0, fc1_pitch = (0, IP) if nk == 1 else self._col_split(IP, nk)[kgrp]
+        fc1_n = min(fc1_pitch, self.VIS_I - fc1_n0)
+        fc1_stride_reg = None
+        if fc1_n < fc1_pitch:
+            fc1_stride_reg = ue.alloc_isa_reg()
+            ue.generate_instruction_add_set(fc1_stride_reg, fc1_pitch)
+        # Q/K/V strip write-back output row pitch (elements) = (N / D) * DP = NH * DP.
+        qkv_stride_reg = ue.alloc_isa_reg()
+        ue.generate_instruction_add_set(qkv_stride_reg, NH * DP)
 
         def vis_matmul(M, K, N, A, la, proj, OUT, bias=None, **kw):
             ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
@@ -3675,12 +3674,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     gpr_N_reg=vis_N_reg, gpr_sqrt_n_reg=vis_sqrt_N_reg,
                     ZEROS_DRAM_ADDR=zeros_addr)
                 self._debug_op(f"layer{layer_idx}_ln0", self.VIS_LN_OUT_DRAM, S * H, shape=(S, H), ue=ue)
-                # Q/K/V projections (PBI, IF4). N=NH*DP: weights are pre-padded per-head
-                # D->DP=128 (see _weight_init_vision's _pad_proj) so the buffers below are
-                # already head-block-aligned at DP=128, no separate real/padded copy needed.
+                # Q/K/V projections (PBI, IF4): ONE matmul each at the real N = NH*D,
+                # head h's D lanes written at the start of its DP-lane slot of the
+                # (S, NH*DP) buffer (strip write-back); the pad lanes stay zero.
                 for proj, dst in [('q', self.VIS_Q_DRAM), ('k', self.VIS_K_DRAM), ('v', self.VIS_V_DRAM)]:
-                    vis_matmul(rows, H, QP, self.VIS_LN_OUT_DRAM + RH, la, proj, dst + RQ,
-                               bias=la[f'{proj}_bias'])
+                    vis_matmul(rows, H, NH * D, self.VIS_LN_OUT_DRAM + RH, la, proj, dst + RP,
+                               bias=la[f'{proj}_bias'], strip_cols=D, strip_out_stride=DP,
+                               gpr_out_row_stride_reg=qkv_stride_reg)
 
                 # ---- RENDEZVOUS: the ONE point an engine reads rows it did not write.
                 # Below, K/V are gathered in FULL (both shards) while Q is this shard
@@ -3726,26 +3726,17 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     # write rows 0..127 -> finite, NaN-free, structurally plausible
                     # SCRAMBLED output (project_pi05_denoise_strided_copy_bugs).
                     assert (q_ofs + col) % 32 == 0, "strided DMA base must be AXI-beat aligned"
-                    # Q/K/V live at QL lanes/head (row pitch QP); FQ/FK/FV are DP=128
-                    # wide with lanes QL..127 zero. Read a FULL DP-lane (256 B) chunk
-                    # from the head's start (lanes QL.. are the next head's -- never
-                    # written out) so each row owns a 256 B SRAM slot, then write only
-                    # QL lanes per row. MEASURED: a strided write consumes one whole
-                    # 256 B SRAM slot per chunk, so reading just QL lanes (packed at
-                    # QL*2 B) would shift every row after the first.
-                    qcol = h * QL * bpe
-                    q_src_ofs = 0 if head_shard else RQ
-                    assert (q_src_ofs + qcol) % 32 == 0, "strided DMA base must be AXI-beat aligned"
+                    # Q/K/V hold head h in its DP-lane (256 B) slot of each (S, NH*DP)
+                    # row, lanes D..DP-1 zero: copy the slot column into the dense
+                    # (rows, DP) FQ/FK/FV operand.
+                    qcol = h * DP * bpe
+                    q_src_ofs = 0 if head_shard else RP
                     for src, dst, nrows in ((self.VIS_Q_DRAM + q_src_ofs + qcol, FQ, q_rows),
                                             (self.VIS_K_DRAM + qcol,             FK, S),
                                             (self.VIS_V_DRAM + qcol,             FV, S)):
                         ue.accelerator_memory_to_sram(src, 0x00000, nrows * DP,
-                            stride_bytes_per_chunk=DP * bpe, stride_jump_bytes=QP * bpe)
-                        if QL == DP:
-                            ue.sram_to_accelerator_memory(0x00000, dst, nrows * DP)
-                        else:
-                            ue.sram_to_accelerator_memory(0x00000, dst, nrows * QL,
-                                stride_bytes_per_chunk=QL * bpe, stride_jump_bytes=DP * bpe)
+                            stride_bytes_per_chunk=DP * bpe, stride_jump_bytes=HP * bpe)
+                        ue.sram_to_accelerator_memory(0x00000, dst, nrows * DP)
                     # INLINE full-MHA self-attention for this head: batch=THIS engine's
                     # query rows, aligned_seq_len=S (the full K/V), head_dim=DP, zero
                     # (unmasked) bias, standard 1/sqrt(DP) scale. Splitting the QUERY
@@ -3758,13 +3749,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     # PBI back-to-back corruption. Don't re-litigate this -- bisect the
                     # encoder body against pi05_torch_ref.vision_encode_checkpoints.
                     if self.VIS_UNPAD == "split80":
-                        # Q.K^T at DP=128, P.V at N=UL=80, written straight into
-                        # head h's UL columns of (S, NH*UL) at row pitch HR. The
+                        # Q.K^T at DP=128, P.V at the real N=D=72, written straight
+                        # into head h's D columns of (S, NH*D) at row pitch HR. The
                         # query-row offset uses THAT buffer's pitch, not RP's.
                         q_row0 = 0 if head_shard else row_offset
                         attention_split_hd(
-                            ue, q_rows, S, DP, UL, FQ, FK, FV, self.VIS_ZERO_BIAS_DRAM,
-                            self.VIS_ATTN_UNPAD_DRAM + (q_row0 * HR + h * UL) * bpe,
+                            ue, q_rows, S, DP, D, FQ, FK, FV, self.VIS_ZERO_BIAS_DRAM,
+                            self.VIS_ATTN_UNPAD_DRAM + (q_row0 * HR + h * D) * bpe,
                             ATTN_SCRATCH, self.identity_addr, out_row_stride=HR)
                         continue
                     ue.unified_attention_core_dynamic(
@@ -3795,18 +3786,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                         OUTPUT_DRAM_ADDR=self.VIS_ATTN_UNPAD_DRAM + RU,
                         is_B_quantized=False, gpr_M_reg=vis_S_reg)
                     o_in = self.VIS_ATTN_UNPAD_DRAM + RU
-                elif self.VIS_UNPAD == "dma80":
-                    # Strided gather: UL lanes (UL*2 B, whole AXI beats) out of every
-                    # DP-lane head block, packed densely into (rows, NH*UL). Row blocks
-                    # of 32 keep each SRAM round trip at 32*NH*UL*2 = 80 KB.
-                    for r0 in range(0, rows, 32):
-                        rb = min(32, rows - r0)
-                        ue.accelerator_memory_to_sram(
-                            self.VIS_ATTN_RESULT_DRAM + RP + r0 * HP * bpe, 0x00000, rb * HR,
-                            stride_bytes_per_chunk=UL * bpe, stride_jump_bytes=DP * bpe)
-                        ue.sram_to_accelerator_memory(
-                            0x00000, self.VIS_ATTN_UNPAD_DRAM + RU + r0 * HR * bpe, rb * HR)
-                    o_in = self.VIS_ATTN_UNPAD_DRAM + RU
                 elif self.VIS_UNPAD == "split80":
                     o_in = self.VIS_ATTN_UNPAD_DRAM + RU      # attention already wrote it
                 else:
@@ -3832,12 +3811,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # reference uses tanh-approx GELU, a small documented numeric deviation),
                 # Dense_1, residual.
                 if nk == 1:
-                    vis_matmul(rows, H, IP, self.VIS_LN_OUT_DRAM + RH, la, 'fc1',
-                               self.VIS_MLP_INTER_DRAM + RI, bias=la['fc1_bias'], gelu_enable=True)
+                    vis_matmul(rows, H, fc1_n, self.VIS_LN_OUT_DRAM + RH, la, 'fc1',
+                               self.VIS_MLP_INTER_DRAM + RI, bias=la['fc1_bias'], gelu_enable=True,
+                               gpr_out_row_stride_reg=fc1_stride_reg)
                     vis_matmul(rows, IP, H, self.VIS_MLP_INTER_DRAM + RI, la, 'fc2',
                                self.VIS_MLP_OUT_DRAM + RH, bias=la['fc2_bias'])
                 else:
-                    n0, nc = self._col_split(IP, nk)[kgrp]
+                    n0, nc = fc1_n0, fc1_pitch
                     # --- fc1: N-split. All four per-column offsets, and every one
                     # of them silently corrupts if wrong (see multi_engine_shard's
                     # "THE FOUR PER-COLUMN OFFSETS"). Verified bit-exact against a
@@ -3845,13 +3825,16 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     #   B (IF4) : + (n0*K)//2        two nibbles per byte
                     #   scale   : + ((n0*K)//64)*2   one bf16 per 64-block
                     #   bias    : + n0*2             broadcast_N is INDEXED by N
+                    # The lane holding the pad computes only its fc1_n real columns at
+                    # row pitch nc; its (zero-initialised) pad lanes meet fc2's zero rows.
                     ue.matmat_mul_core(
-                        M=rows, K=H, N=nc, A_DRAM_ADDR=self.VIS_LN_OUT_DRAM + RH,
+                        M=rows, K=H, N=fc1_n, A_DRAM_ADDR=self.VIS_LN_OUT_DRAM + RH,
                         B_DRAM_ADDR=la['fc1_data'] + (n0 * H) // 2,
                         SCALE_DRAM_ADDR=la['fc1_scale'] + ((n0 * H) // UE_VECTOR_SIZE) * bpe,
                         C_DRAM_ADDR=la['fc1_bias'] + n0 * bpe, bias_mode="broadcast_N",
                         OUTPUT_DRAM_ADDR=lane_inter, is_B_quantized=True,
-                        data_type=TYPE.IF4, gelu_enable=True, gpr_M_reg=vis_S_reg)
+                        data_type=TYPE.IF4, gelu_enable=True, gpr_M_reg=vis_S_reg,
+                        gpr_out_row_stride_reg=fc1_stride_reg)
                     # --- fc2: K-split over the SAME columns. A is this lane's dense
                     # [rows, nc] buffer, which is why the K-split is expressible at
                     # all. Bias on lane 0 ONLY -- the partials are summed, so a bias
@@ -3911,6 +3894,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         except _DebugStop:
             pass   # halt already emitted by _debug_op (on THIS engine).
 
+        ue.release_isa_reg()  # qkv_stride_reg
+        if fc1_stride_reg is not None:
+            ue.release_isa_reg()  # fc1_stride_reg
         ue.release_isa_reg()  # vis_sqrt_N_reg
         ue.release_isa_reg()  # vis_N_reg
         ue.release_isa_reg()  # vis_S_reg
@@ -7060,16 +7046,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         hw = one(self.VIS_DP, self.VIS_I_PAD)     # 128, 4352 (what silicon runs)
         # one() counts O at the padded K = NH*DP. Adjust for VIS_UNPAD:
         #   sel   -> the unpad matmul (same size as that term) + O at K = NH*D
-        #   dma80 -> O at K = NH*80 instead (the DMA gather issues no FLOPs)
-        S, H, NH_, DP = v["num_patches"], v["hidden_size"], v["num_heads"], self.VIS_DP
+        #   split80 -> O at K = NH*D instead
+        S, H, NH_, D, DP = (v["num_patches"], v["hidden_size"], v["num_heads"], self.VIS_D,
+                            self.VIS_DP)
         if self.VIS_UNPAD == "sel":
-            hw += n * 27 * 2 * S * (NH_ * self.VIS_D) * H
-        elif self.VIS_UNPAD in ("dma80", "split80"):
-            hw += n * 27 * 2 * S * (NH_ * self.VIS_UNPAD_LANES - NH_ * DP) * H
-        # Q/K/V projections at NH*VIS_QKV_LANES columns instead of NH*DP.
-        hw += n * 27 * 3 * 2 * S * H * NH_ * (self.VIS_QKV_LANES - DP)
-        if self.VIS_UNPAD == "split80":   # P.V at N = 80 instead of 128
-            hw += n * 27 * 2 * S * S * NH_ * (self.VIS_UNPAD_LANES - DP)
+            hw += n * 27 * 2 * S * (NH_ * D) * H
+        elif self.VIS_UNPAD == "split80":
+            hw += n * 27 * 2 * S * (NH_ * D - NH_ * DP) * H
+        # Q/K/V projections at the real NH*D columns instead of NH*DP (see VIS_LAYOUT).
+        hw += n * 27 * 3 * 2 * S * H * NH_ * (D - DP)
+        # fc1 at N = I instead of IP (fc2 keeps K = IP).
+        hw -= n * 27 * 2 * S * H * (self.VIS_I_PAD - self.VIS_I)
+        if self.VIS_UNPAD == "split80":   # P.V at N = D instead of 128
+            hw += n * 27 * 2 * S * S * NH_ * (D - DP)
         return eff, hw
 
     def _prefix_flops(self, M=None):
@@ -7724,6 +7713,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             "prefix_seq_len": int(self.PREFIX_SEQ_LEN),
             "denoise_steps": int(self.AE_NUM_DENOISE_STEPS),
             "keep_masked_slots": bool(self.KEEP_MASKED_SLOTS),
+            "vis_layout": self.VIS_LAYOUT,
             "program_dram_base": hex(self._program_dram_base),
             "tensor_dram_base": hex(self._tensor_dram_base),
             "params_dram_base": hex(self._params_dram_base),
@@ -8006,6 +7996,9 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
         self._sig_check("keep_masked_slots", bool(self.KEEP_MASKED_SLOTS),
                         bool(self.sig["keep_masked_slots"]),
                         "toggle --keep-masked-slots to match, or regenerate the bins")
+        self._sig_check("vis_layout", self.VIS_LAYOUT, self.sig.get("vis_layout"),
+                        "the bins predate the real-width vision layout (VIS_LAYOUT); "
+                        "regenerate them")
         for _name, _live in (("program_dram_base", self._program_dram_base),
                              ("tensor_dram_base", self._tensor_dram_base),
                              ("params_dram_base", self._params_dram_base)):
@@ -8708,12 +8701,9 @@ def main():
                           "K/V gathers happen once per head machine-wide instead of once per head "
                           "PER ENGINE. --no-vis_attn_head_shard restores the row split (every "
                           "engine loops all 16 heads on its own row slice) for the A/B.")
-    ap.add_argument("--vis_unpad", choices=("pad128", "sel", "dma80", "split80"), default=None,
+    ap.add_argument("--vis_unpad", choices=("pad128", "sel", "split80"), default=None,
                      help="How the vision attention output drops its head-dim pad lanes "
                           "before the O projection (see VIS_UNPAD). Default split80.")
-    ap.add_argument("--vis_qkv_lanes", type=int, choices=(80, 128), default=None,
-                     help="Vision Q/K/V projection lanes per head (see VIS_QKV_LANES). "
-                          "Default 80 (1280 columns); 128 = the original 2048.")
     ap.add_argument("--vis_m_shard", action=argparse.BooleanOptionalAction, default=None,
                      help="Shard the VISION encoder by ROWS ONLY (32 rows/engine at 8), "
                           "instead of the default 2D 4-row-groups x 2-K-lanes grid. The "
@@ -8820,9 +8810,6 @@ def main():
     _multi = configure_engines(args.engines, vis_4=args.vis_4, pref_8=args.pref_8,
                                vis_m_shard=args.vis_m_shard,
                                dns_8=args.dns_8, tag="main")
-    if args.vis_qkv_lanes is not None:
-        Pi05Libero_UnifiedEngine.VIS_QKV_LANES = args.vis_qkv_lanes
-    print(f"[main] vision Q/K/V lanes per head: {Pi05Libero_UnifiedEngine.VIS_QKV_LANES}")
     if args.vis_unpad is not None:
         Pi05Libero_UnifiedEngine.VIS_UNPAD = args.vis_unpad
     print(f"[main] vision attention unpad: {Pi05Libero_UnifiedEngine.VIS_UNPAD}")
@@ -8900,7 +8887,7 @@ def main():
         clean_bins(BIN_DIR)
     _bin_ok = not (args.debug or args.sanity_check or args.probe_step0
                    or args.vis_m_shard is not None or args.vis_attn_head_shard is not None
-                   or args.vis_unpad is not None or args.vis_qkv_lanes is not None
+                   or args.vis_unpad is not None
                    or args.vis_weight_copies is not None or args.ae_vt_cache is not None
                    or args.ae_trim_attn_batch is not None
                    or args.ae_primary_no_head is not None or args.ae_hoist_adarms is not None
