@@ -3294,7 +3294,7 @@ class MobileSAM_UE(UnifiedEngine):
         """DMA-read n_elements bf16 values from addr."""
         buf = bytearray(n_elements * 2)
         self.dma_read(DMA_DEVICE_C2H, addr, buf, len(buf))
-        return torch.frombuffer(buf, dtype=torch.bfloat16).clone()
+        return user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16)
 
     def _assert_no_nan(self, label: str, addr: int, n_elements: int,
                        shape: tuple | None = None) -> None:

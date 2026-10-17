@@ -973,7 +973,8 @@ def _read_tf_checkpoint(prefix: str):
             continue  # skip non-numeric (e.g. DT_STRING object-graph)
         np_dtype = _TF_DTYPE[dtype]
         count = size // np_dtype.itemsize
-        arr = np.frombuffer(data, dtype=np_dtype, count=count, offset=offset).copy()
+        # Native-order copy: torch.from_numpy rejects non-native byte order.
+        arr = np.frombuffer(data, dtype=np_dtype, count=count, offset=offset).astype(np_dtype.newbyteorder("="))
         if shape:
             arr = arr.reshape(shape)
         tensors[name] = arr

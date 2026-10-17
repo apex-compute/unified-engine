@@ -79,7 +79,7 @@ class TalkerWeights:
             return f.get_tensor(name)
 
     def _put_bf16(self, name: str, t: torch.Tensor) -> None:
-        blob = t.to(torch.bfloat16).contiguous().view(torch.uint8).numpy().tobytes()
+        blob = user_dma_core.tensor_le_bytes(t.to(torch.bfloat16))
         a = self.ue.allocate_params_dram(len(blob), label=f"talker.{name}")
         if self.ue.dma_write(DMA_DEVICE_H2C, a, blob, len(blob)) != len(blob):
             raise IOError(f"talker {name}: short DMA")
@@ -109,7 +109,7 @@ class TalkerWeights:
             data, scales = quant_lib.quantize("if4", t.float(), block_size=BLOCK)
             dtype = TYPE.IF4
         else:
-            data = t.to(torch.bfloat16).contiguous().view(torch.uint8).numpy().tobytes()
+            data = user_dma_core.tensor_le_bytes(t.to(torch.bfloat16))
             scales = None
             dtype = DENSE_BF16
         self.shards[name] = self.scheduler.shard_quantized_weight_from_bytes(
@@ -147,7 +147,7 @@ class TalkerWeights:
                 yield f"{short}.data", "if4_data", tuple(t.shape), bytes(data)
                 yield f"{short}.scale", "if4_scale", tuple(t.shape), bytes(scales)
             else:
-                raw = t.to(torch.bfloat16).contiguous().view(torch.uint8).numpy().tobytes()
+                raw = user_dma_core.tensor_le_bytes(t.to(torch.bfloat16))
                 yield short, "bf16", tuple(t.shape), raw
             del t
 
@@ -726,5 +726,5 @@ class TalkerRunner:
         read = ue.dma_read(ue.c2h_device, self.LOGITS, buf, len(buf))
         if read != len(buf):
             raise IOError(f"Talker position {pos}: logits DMA short read")
-        logits = torch.frombuffer(buf, dtype=torch.bfloat16).clone()
+        logits = user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16)
         return logits, hw_us

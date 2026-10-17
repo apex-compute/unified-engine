@@ -40,7 +40,7 @@ POLL_S = float(os.environ.get("OMNI_T2W_POLL_US", "100")) * 1e-6
 
 
 def _bf16_bytes(t: torch.Tensor) -> bytes:
-    return t.detach().to(torch.bfloat16).contiguous().view(torch.uint8).numpy().tobytes()
+    return user_dma_core.tensor_le_bytes(t.detach().to(torch.bfloat16))
 
 
 def legacy_memory_map(n: int) -> dict:
@@ -104,18 +104,13 @@ class _HostImageEngine(UnifiedEngine):
         self._image = image
 
     def dma_write(self, device, address, buffer, size):
-        if isinstance(buffer, torch.Tensor):
-            if buffer.dtype == torch.bfloat16:
-                data = buffer.view(torch.uint16).cpu().contiguous().numpy().tobytes()
-            else:
-                data = buffer.cpu().contiguous().numpy().tobytes()
-        else:
-            data = bytes(buffer)
+        # Same little-endian DRAM bytes the hardware dma_write would send.
+        data = bytes(user_dma_core.dma_payload(buffer, size))
         self._image.write(int(address), data[:size])
         return size
 
     def dma_read(self, device, address, buffer, size):
-        buffer[:size] = self._image.read(int(address), size)
+        user_dma_core.dma_copy_into(buffer, self._image.read(int(address), size), size)
         return size
 
 
@@ -253,7 +248,7 @@ class Cores:
         buf = bytearray(n_elem * 2)
         if ue.dma_read(ue.c2h_device, addr, buf, len(buf)) != len(buf):
             raise IOError("t2w cores: short DMA read")
-        return torch.frombuffer(bytes(buf), dtype=torch.bfloat16).clone()
+        return user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16)
 
     # ----------------------------------------------------------------- capture
     def region(self, name: str, emit) -> int:

@@ -657,9 +657,8 @@ _UP_CACHE: "dict" = {}
 
 
 def _tensor_key(t: torch.Tensor):
-    flat = t.detach().reshape(-1).contiguous()
-    # bfloat16 has no numpy dtype, but int16 is the same width, so the raw bytes come out intact.
-    raw = (flat.view(torch.int16) if flat.dtype == torch.bfloat16 else flat).numpy().tobytes()
+    # Little-endian bytes so digests saved in programs.json match across hosts.
+    raw = _udc.tensor_le_bytes(t.detach())
     return (str(t.dtype), tuple(t.shape), hashlib.sha1(raw).hexdigest())
 
 

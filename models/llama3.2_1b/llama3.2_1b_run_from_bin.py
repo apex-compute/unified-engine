@@ -193,7 +193,7 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
             sin_full = sin_head.repeat(1, self.num_kv_heads)
             rope_tensor = torch.cat([cos_full, cos_full, -sin_full, sin_full], dim=1)
             sz = self.weight_defs[sz_key]
-            raw = rope_tensor.contiguous().view(torch.uint8).numpy().tobytes()
+            raw = user_dma_core.tensor_le_bytes(rope_tensor)
             raw = (raw + b"\x00" * sz)[:sz]
             addr = self.allocate_params_dram(sz)
             self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
@@ -218,8 +218,8 @@ class Llama32_1b_RunFromBin(UnifiedEngine):
         embedding_dim = emb_cfg["embedding_dim"]
         emb_nbytes = vocab_size * embedding_dim * self.bytes_per_element
         raw_emb = self.weight_bin[token_embd_offset:token_embd_offset + emb_nbytes]
-        self.embedding_weight = torch.frombuffer(
-            bytearray(raw_emb), dtype=torch.bfloat16).reshape(vocab_size, embedding_dim).clone()
+        self.embedding_weight = user_dma_core.tensor_from_le_bytes(
+            raw_emb, torch.bfloat16).reshape(vocab_size, embedding_dim)
 
         LAYER_WEIGHT_SIZE = self.weight_defs["LAYER_WEIGHT_SIZE"]
         base_layer0 = self.weight_defs["BLK0_ATTN_NORM_WEIGHT"]

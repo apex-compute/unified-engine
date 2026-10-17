@@ -289,13 +289,13 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
         chunk = 1024
         for i in range(0, src.shape[0], chunk):
             scaled = (src[i:i+chunk].float() * per_layer_embed_scale).to(torch.bfloat16).contiguous()
-            f.write(scaled.view(torch.uint8).numpy().tobytes())
+            f.write(user_dma_core.tensor_le_bytes(scaled))
         del src
 
         # 2. per_layer_model_proj_weight  [8960, 1536]
         proj_off = embed_off + embed_size
         proj_bf16 = text_model.per_layer_model_projection.weight.detach().cpu().to(torch.bfloat16).contiguous()
-        proj_b = proj_bf16.view(torch.uint8).numpy().tobytes()
+        proj_b = user_dma_core.tensor_le_bytes(proj_bf16)
         f.write(proj_b)
         proj_size = len(proj_b)
         proj_shape = list(proj_bf16.shape)
@@ -304,7 +304,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
         # 3. per_layer_proj_norm_weight   [256]  (raw, no gamma_offset — host-side norm wants raw w)
         norm_off = proj_off + proj_size
         norm_bf16 = text_model.per_layer_projection_norm.weight.detach().cpu().to(torch.bfloat16).contiguous()
-        norm_b = norm_bf16.view(torch.uint8).numpy().tobytes()
+        norm_b = user_dma_core.tensor_le_bytes(norm_bf16)
         f.write(norm_b)
         norm_size = len(norm_b)
         norm_shape = list(norm_bf16.shape)
@@ -372,7 +372,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
 
         def _add_bf16(key: str, w: torch.Tensor) -> None:
             wc = w.contiguous()
-            sections.append((key, wc.view(torch.uint8).numpy().tobytes(), list(wc.shape), "bf16"))
+            sections.append((key, user_dma_core.tensor_le_bytes(wc), list(wc.shape), "bf16"))
 
         # Per-layer weights.
         for li in range(L_count):
@@ -525,7 +525,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     embed = text_model.embed_tokens.weight.detach().cpu().to(torch.bfloat16)
     embedding_scale = hidden_size ** 0.5
     emb_scaled = (embed.float() * embedding_scale).to(torch.bfloat16)
-    raw_emb = emb_scaled.contiguous().view(torch.uint8).numpy().tobytes()
+    raw_emb = user_dma_core.tensor_le_bytes(emb_scaled)
     write_at(token_embd_offset, raw_emb)
 
     # Layers
@@ -642,7 +642,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
                 i += 2
             else:
                 t = tensor.detach().cpu().to(torch.bfloat16).contiguous()
-                raw = (t.view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+                raw = (user_dma_core.tensor_le_bytes(t) + b"\x00" * sz)[:sz]
                 write_at(file_off, raw)
                 i += 1
             j += 1
@@ -678,7 +678,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     sin_local = freqs_local.sin().to(torch.bfloat16)
     rope_local = torch.cat([cos_local, cos_local, -sin_local, sin_local], dim=1)
     sz = weight_defs["ROPE_LOCAL_SIZE"]
-    raw = (rope_local.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(rope_local) + b"\x00" * sz)[:sz]
     write_at(weight_defs["ROPE_LOCAL"], raw)
 
     # GLOBAL RoPE: head_dim=512, partial_rotary_factor=0.25, rotary_dims=128, D=64
@@ -690,25 +690,25 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     sin_global = freqs_global.sin().to(torch.bfloat16)
     rope_global = torch.cat([cos_global, cos_global, -sin_global, sin_global], dim=1)
     sz = weight_defs["ROPE_GLOBAL_SIZE"]
-    raw = (rope_global.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(rope_global) + b"\x00" * sz)[:sz]
     write_at(weight_defs["ROPE_GLOBAL"], raw)
 
     # OUTPUT_NORM
     out_norm = text_model.norm.weight.detach().cpu().to(torch.bfloat16)
     sz = weight_defs["OUTPUT_NORM_WEIGHT_SIZE"]
-    raw = (out_norm.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(out_norm) + b"\x00" * sz)[:sz]
     write_at(weight_defs["OUTPUT_NORM_WEIGHT"], raw)
 
     # PER_LAYER_MODEL_PROJ_WEIGHT: [1536, 8960] from model.model.language_model.per_layer_model_projection
     per_layer_model_proj_w = text_model.per_layer_model_projection.weight.detach().cpu().to(torch.bfloat16)
     sz = weight_defs["PER_LAYER_MODEL_PROJ_WEIGHT_SIZE"]
-    raw = (per_layer_model_proj_w.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(per_layer_model_proj_w) + b"\x00" * sz)[:sz]
     write_at(weight_defs["PER_LAYER_MODEL_PROJ_WEIGHT"], raw)
 
     # PER_LAYER_PROJ_NORM_WEIGHT: [256] from model.model.language_model.per_layer_projection_norm
     per_layer_proj_norm_w = (text_model.per_layer_projection_norm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
     sz = weight_defs["PER_LAYER_PROJ_NORM_WEIGHT_SIZE"]
-    raw = (per_layer_proj_norm_w.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(per_layer_proj_norm_w) + b"\x00" * sz)[:sz]
     write_at(weight_defs["PER_LAYER_PROJ_NORM_WEIGHT"], raw)
 
     # LM_HEAD is tied with embed_tokens. Quantization is read-only, so avoid a

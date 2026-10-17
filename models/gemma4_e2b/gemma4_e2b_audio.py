@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from user_dma_core import (
     DMA_DEVICE_H2C, TYPE, UE_VECTOR_SIZE, UE_MODE,
     URAM_NEAR_FULL_SIZE, URAM_SECTION, URAM_START_ADDR,
+    tensor_from_le_bytes, tensor_le_bytes,
 )
 from audio_primitives import (
     silu_core_dram as _aud_silu,
@@ -57,7 +58,7 @@ def build_audio_weight_section(hf_model, parallel_quantize) -> tuple[bytes, dict
 
     def _add_bf16(key: str, w: torch.Tensor) -> None:
         wc = w.contiguous()
-        sections.append((key, wc.view(torch.uint8).numpy().tobytes(), list(wc.shape), "bf16"))
+        sections.append((key, tensor_le_bytes(wc), list(wc.shape), "bf16"))
 
     def _add_if4_batch(tensors: list[tuple[str, torch.Tensor]]) -> None:
         for name, w in tensors:
@@ -393,9 +394,8 @@ class Gemma4AudioMixin:
                 dw_bytes = f.read(dw_section["size"])
                 addrs["CONV_DW_W"] = self.allocate_tensor_dram(dw_section["size"])
                 self.dma_write(DMA_DEVICE_H2C, addrs["CONV_DW_W"], dw_bytes, dw_section["size"])
-                dw_w_host = torch.frombuffer(
-                    bytearray(dw_bytes), dtype=torch.bfloat16
-                ).reshape(*dw_section["shape"]).clone()
+                dw_w_host = tensor_from_le_bytes(
+                    dw_bytes, torch.bfloat16).reshape(*dw_section["shape"])
                 addrs["CONV_NORM"]       = _dma_section(f"{pre}.conv_norm")
                 addrs["FF2_PRE_NORM"]    = _dma_section(f"{pre}.ff2_pre_norm")
                 addrs["FF2_POST_NORM"]   = _dma_section(f"{pre}.ff2_post_norm")

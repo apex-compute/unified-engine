@@ -32,6 +32,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import quant_lib
+import user_dma_core
 
 
 PRECISION = "if4"
@@ -468,8 +469,7 @@ class _Checkpoint:
 
 
 def _bf16_bytes(tensor: torch.Tensor) -> bytes:
-    value = tensor.detach().cpu().to(torch.bfloat16).contiguous()
-    return value.view(torch.uint8).numpy().tobytes()
+    return user_dma_core.tensor_le_bytes(tensor.detach().cpu().to(torch.bfloat16))
 
 
 class _RegionWriter:
