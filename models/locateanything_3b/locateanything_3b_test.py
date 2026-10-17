@@ -513,7 +513,7 @@ def _write_weight_bin(bin_path, model, param_filter, mode, suffix, quant_layers,
                 raw = data.tobytes()
                 key = f'{key}.{suffix}'
             else:
-                raw = t.to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+                raw = user_dma_core.tensor_le_bytes(t.to(torch.bfloat16))
             offset = f.tell()
             f.write(raw)
             manifest[key] = {'offset': offset, 'size': len(raw)}
@@ -593,7 +593,7 @@ def generate_vision_weights(model, output_path, precision: str = "int4"):
             data, _ = qpack(qk_padded_w)
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.qk_padded.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
-            raw = qk_padded_b.contiguous().view(torch.uint16).cpu().numpy().tobytes(); offset = f.tell(); f.write(raw)
+            raw = user_dma_core.tensor_le_bytes(qk_padded_b); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.qk_padded.bias'] = {'offset': offset, 'size': len(raw)}
             # V sequential padded
             v_padded_w = torch.zeros(VN * VD_PAD, VH, dtype=torch.bfloat16)
@@ -605,13 +605,13 @@ def generate_vision_weights(model, output_path, precision: str = "int4"):
             data, _ = qpack(v_padded_w)
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.v_padded.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
-            raw = v_padded_b.contiguous().view(torch.uint16).cpu().numpy().tobytes(); offset = f.tell(); f.write(raw)
+            raw = user_dma_core.tensor_le_bytes(v_padded_b); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.v_padded.bias'] = {'offset': offset, 'size': len(raw)}
             # O proj (no padding needed)
             data, _ = qpack(block.attn.proj.weight.detach().to(torch.bfloat16))
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.proj.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
-            raw = block.attn.proj.bias.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+            raw = user_dma_core.tensor_le_bytes(block.attn.proj.bias.detach().to(torch.bfloat16))
             offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.proj.bias'] = {'offset': offset, 'size': len(raw)}
             # MLP: pad 3420→3456
@@ -623,19 +623,19 @@ def generate_vision_weights(model, output_path, precision: str = "int4"):
                 manifest[f'{prefix}.mlp.{proj_name}.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
                 b = getattr(block.mlp, proj_name).bias.detach().to(torch.bfloat16)
                 b_padded = torch.zeros(VIS_MLP_PAD, dtype=torch.bfloat16); b_padded[:b.shape[0]] = b
-                raw = b_padded.contiguous().view(torch.uint16).cpu().numpy().tobytes(); offset = f.tell(); f.write(raw)
+                raw = user_dma_core.tensor_le_bytes(b_padded); offset = f.tell(); f.write(raw)
                 manifest[f'{prefix}.mlp.{proj_name}.bias'] = {'offset': offset, 'size': len(raw)}
             down_w = block.mlp.down_proj.weight.detach().to(torch.bfloat16)
             down_padded = torch.zeros(VH, VIS_MLP_PAD, dtype=torch.bfloat16); down_padded[:, :down_w.shape[1]] = down_w
             data, _ = qpack(down_padded)
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.mlp.down_proj.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
-            raw = block.mlp.down_proj.bias.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+            raw = user_dma_core.tensor_le_bytes(block.mlp.down_proj.bias.detach().to(torch.bfloat16))
             offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.mlp.down_proj.bias'] = {'offset': offset, 'size': len(raw)}
             # Norms
             for norm_name in ['norm1', 'norm2']:
-                raw = getattr(block, norm_name).weight.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+                raw = user_dma_core.tensor_le_bytes(getattr(block, norm_name).weight.detach().to(torch.bfloat16))
                 offset = f.tell(); f.write(raw)
                 manifest[f'{prefix}.{norm_name}.weight'] = {'offset': offset, 'size': len(raw)}
             count += 1
@@ -644,14 +644,14 @@ def generate_vision_weights(model, output_path, precision: str = "int4"):
         raw = data.tobytes(); offset = f.tell(); f.write(raw)
         manifest[f'visual.patch_embed.proj.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
         # Merger
-        raw = model.visual.merger.ln_q.weight.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+        raw = user_dma_core.tensor_le_bytes(model.visual.merger.ln_q.weight.detach().to(torch.bfloat16))
         offset = f.tell(); f.write(raw)
         manifest['visual.merger.ln_q.weight'] = {'offset': offset, 'size': len(raw)}
         for mlp_idx in [0, 2]:
             data, _ = qpack(model.visual.merger.mlp[mlp_idx].weight.detach().to(torch.bfloat16))
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
             manifest[f'visual.merger.mlp.{mlp_idx}.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
-            raw = model.visual.merger.mlp[mlp_idx].bias.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+            raw = user_dma_core.tensor_le_bytes(model.visual.merger.mlp[mlp_idx].bias.detach().to(torch.bfloat16))
             offset = f.tell(); f.write(raw)
             manifest[f'visual.merger.mlp.{mlp_idx}.bias'] = {'offset': offset, 'size': len(raw)}
     with open(json_path, 'w') as f:
@@ -1200,7 +1200,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         sin_ = freqs.sin().to(torch.bfloat16)
         # rope_hf_core(N=actual_head_dim=128): [cos(64), cos(64), -sin(64), sin(64)]
         rope_tensor = torch.cat([cos_, cos_, -sin_, sin_], dim=1)  # (num_positions, 256)
-        rope_raw = rope_tensor.contiguous().view(torch.uint8).numpy().tobytes()
+        rope_raw = user_dma_core.tensor_le_bytes(rope_tensor)
         rope_sz = self.weight_defs["ROPE_SIZE"]
         rope_raw_padded = (rope_raw + b"\x00" * rope_sz)[:rope_sz]
         rope_base = self.allocate_params_dram(rope_sz)
@@ -1297,7 +1297,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         rope_tensor = torch.cat([cos_, cos_, -sin_, sin_], dim=1)  # [seq_len, 256]
 
         # Overwrite the first seq_len rows of the DRAM RoPE table
-        rope_bytes = rope_tensor.contiguous().view(torch.uint8).numpy().tobytes()
+        rope_bytes = user_dma_core.tensor_le_bytes(rope_tensor)
         self.dma_write(DMA_DEVICE_H2C, self.DRAM_ADDR_ROPE, rope_bytes, len(rope_bytes))
 
         # Compute rope_delta: decoder position = seq_len + rope_delta
@@ -1337,7 +1337,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         # Embedding (host-side only — NOT uploaded to FPGA DRAM)
         # Embedding lookup is done on host in get_embedding_for_tokens()
         embed_raw = lm_cache['language_model.embed_tokens.weight']
-        embed_bf16 = torch.from_numpy(embed_raw.copy()).view(torch.bfloat16).reshape(self.EMBEDDING_ELEMENTS, self.vector_length)
+        embed_bf16 = user_dma_core.tensor_from_le_bytes(embed_raw, torch.bfloat16).reshape(self.EMBEDDING_ELEMENTS, self.vector_length)
         self.embedding_weight = embed_bf16.clone()  # host copy for token lookup
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
@@ -1361,7 +1361,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                                   ('gate', 'mlp.gate_proj'), ('up', 'mlp.up_proj')]:
                 la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.{hf_sub}.weight.{lm_prec}'])
             # V stays BF16 (small, attention-value sensitive); O + down_proj if4-quantized.
-            la['v_weight'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.self_attn.v_proj.weight'].copy()).view(torch.bfloat16))
+            la['v_weight'] = store_weight(self, user_dma_core.tensor_from_le_bytes(lm_cache[f'{prefix}.self_attn.v_proj.weight'], torch.bfloat16))
             la['o_scale'], la['o_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.self_attn.o_proj.weight.{lm_prec}'])
             la['down_scale'], la['down_data'] = store_quantized_weight(self, lm_cache[f'{prefix}.mlp.down_proj.weight.{lm_prec}'])
             # Biases from binary
@@ -1369,19 +1369,19 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
                                   ('v', 'self_attn.v_proj')]:
                 bias_key = f'{prefix}.{hf_sub}.bias'
                 if bias_key in lm_cache:
-                    la[f'{proj}_bias'] = store_weight(self, torch.from_numpy(lm_cache[bias_key].copy()).view(torch.bfloat16))
+                    la[f'{proj}_bias'] = store_weight(self, user_dma_core.tensor_from_le_bytes(lm_cache[bias_key], torch.bfloat16))
                 else:
                     bias_size = self.vector_length if proj == 'q' else self.head_dim
                     la[f'{proj}_bias'] = store_weight(self, torch.zeros(bias_size, dtype=torch.bfloat16))
             # Norm weights from binary
-            la['ln1_gamma'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.input_layernorm.weight'].copy()).view(torch.bfloat16))
-            la['ln2_gamma'] = store_weight(self, torch.from_numpy(lm_cache[f'{prefix}.post_attention_layernorm.weight'].copy()).view(torch.bfloat16))
+            la['ln1_gamma'] = store_weight(self, user_dma_core.tensor_from_le_bytes(lm_cache[f'{prefix}.input_layernorm.weight'], torch.bfloat16))
+            la['ln2_gamma'] = store_weight(self, user_dma_core.tensor_from_le_bytes(lm_cache[f'{prefix}.post_attention_layernorm.weight'], torch.bfloat16))
             self.lm_layer_addrs.append(la)
 
         # NOTE: hf_model kept alive for vision MLP BF16 weight extraction below
 
         # Final norm
-        self.final_norm_addr = store_weight(self, torch.from_numpy(lm_cache['language_model.norm.weight'].copy()).view(torch.bfloat16))
+        self.final_norm_addr = store_weight(self, user_dma_core.tensor_from_le_bytes(lm_cache['language_model.norm.weight'], torch.bfloat16))
 
         # LM head: pre-quantized at bin-gen time (tied to embedding) and
         # loaded directly from the bin. No runtime quantization -- if the
@@ -1437,31 +1437,31 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
             prefix = f'visual.blocks.{i}'
             # Q/K (rearranged padded) + V (sequential padded) — pre-padded in binary
             la['qk_scale'], la['qk_data'] = store_quantized_weight(self, vis_cache[f'{prefix}.attn.qk_padded.weight.{vis_prec}'])
-            la['qk_bias'] = store_weight(self, torch.from_numpy(vis_cache[f'{prefix}.attn.qk_padded.bias'].copy()).view(torch.bfloat16))
+            la['qk_bias'] = store_weight(self, user_dma_core.tensor_from_le_bytes(vis_cache[f'{prefix}.attn.qk_padded.bias'], torch.bfloat16))
             la['v_scale'], la['v_data'] = store_quantized_weight(self, vis_cache[f'{prefix}.attn.v_padded.weight.{vis_prec}'])
-            la['v_bias'] = store_weight(self, torch.from_numpy(vis_cache[f'{prefix}.attn.v_padded.bias'].copy()).view(torch.bfloat16))
+            la['v_bias'] = store_weight(self, user_dma_core.tensor_from_le_bytes(vis_cache[f'{prefix}.attn.v_padded.bias'], torch.bfloat16))
             # O proj
             la['o_scale'], la['o_data'] = store_quantized_weight(self, vis_cache[f'{prefix}.attn.proj.weight.{vis_prec}'])
-            la['o_bias'] = store_weight(self, torch.from_numpy(vis_cache[f'{prefix}.attn.proj.bias'].copy()).view(torch.bfloat16))
+            la['o_bias'] = store_weight(self, user_dma_core.tensor_from_le_bytes(vis_cache[f'{prefix}.attn.proj.bias'], torch.bfloat16))
             # MLP (pre-padded 3420→3456 in binary)
             for proj, hf_sub in [('gate', 'mlp.gate_proj'), ('up', 'mlp.up_proj'), ('down', 'mlp.down_proj')]:
                 la[f'{proj}_scale'], la[f'{proj}_data'] = store_quantized_weight(self, vis_cache[f'{prefix}.{hf_sub}.weight.{vis_prec}'])
-                la[f'{proj}_bias'] = store_weight(self, torch.from_numpy(vis_cache[f'{prefix}.{hf_sub}.bias'].copy()).view(torch.bfloat16))
+                la[f'{proj}_bias'] = store_weight(self, user_dma_core.tensor_from_le_bytes(vis_cache[f'{prefix}.{hf_sub}.bias'], torch.bfloat16))
             # RMSNorm (no bias)
-            la['norm1_weight'] = store_weight(self, torch.from_numpy(vis_cache[f'{prefix}.norm1.weight'].copy()).view(torch.bfloat16))
-            la['norm2_weight'] = store_weight(self, torch.from_numpy(vis_cache[f'{prefix}.norm2.weight'].copy()).view(torch.bfloat16))
+            la['norm1_weight'] = store_weight(self, user_dma_core.tensor_from_le_bytes(vis_cache[f'{prefix}.norm1.weight'], torch.bfloat16))
+            la['norm2_weight'] = store_weight(self, user_dma_core.tensor_from_le_bytes(vis_cache[f'{prefix}.norm2.weight'], torch.bfloat16))
             self.vis_layer_addrs.append(la)
 
         # Patch embedding (Conv3D weight [1280, 3, 2, 14, 14]); precision per cfg.
         self.patch_weight_scale, self.patch_weight_data = store_quantized_weight(self, vis_cache[f'visual.patch_embed.proj.weight.{vis_prec}'])
 
         # Merger
-        self.merger_ln_q_weight = store_weight(self, torch.from_numpy(vis_cache['visual.merger.ln_q.weight'].copy()).view(torch.bfloat16))
+        self.merger_ln_q_weight = store_weight(self, user_dma_core.tensor_from_le_bytes(vis_cache['visual.merger.ln_q.weight'], torch.bfloat16))
         # Merger MLP — quantized per cfg.precision.vision.
         self.merger_mlp0_scale, self.merger_mlp0_data = store_quantized_weight(self, vis_cache[f'visual.merger.mlp.0.weight.{vis_prec}'])
-        self.merger_mlp0_bias = store_weight(self, torch.from_numpy(vis_cache['visual.merger.mlp.0.bias'].copy()).view(torch.bfloat16))
+        self.merger_mlp0_bias = store_weight(self, user_dma_core.tensor_from_le_bytes(vis_cache['visual.merger.mlp.0.bias'], torch.bfloat16))
         self.merger_mlp2_scale, self.merger_mlp2_data = store_quantized_weight(self, vis_cache[f'visual.merger.mlp.2.weight.{vis_prec}'])
-        self.merger_mlp2_bias = store_weight(self, torch.from_numpy(vis_cache['visual.merger.mlp.2.bias'].copy()).view(torch.bfloat16))
+        self.merger_mlp2_bias = store_weight(self, user_dma_core.tensor_from_le_bytes(vis_cache['visual.merger.mlp.2.bias'], torch.bfloat16))
 
         print(f"Vision weights loaded ({vis_prec} + padded MLP to {VIS_MLP_PAD}): {vis_depth} layers + merger, params DRAM usage: {self.get_params_dram_usage()} bytes")
 
@@ -3320,7 +3320,7 @@ def gen_lm_bin(precision="if4"):
         if any(key.endswith(s) for s in _LM_GEN_QUANT_SUFFIXES):
             data, _ = _qs_pack(precision, t); raw = data.tobytes(); key = f'{key}.{precision}'
         else:
-            raw = t.to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+            raw = user_dma_core.tensor_le_bytes(t.to(torch.bfloat16))
         offset = len(region_buf); region_buf.extend(raw)
         sub_manifest[key] = {'offset': offset, 'size': len(raw)}; count += 1
     embed_w = _gen_pad_vocab(sd_full['language_model.model.embed_tokens.weight'].detach().to(torch.bfloat16))
@@ -3343,7 +3343,7 @@ def gen_connector_bin():
     sub_manifest = {}
     region_buf = bytearray()
     for k in _CONN_KEYS:
-        raw = sd[k].detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+        raw = user_dma_core.tensor_le_bytes(sd[k].detach().to(torch.bfloat16))
         offset = len(region_buf); region_buf.extend(raw)
         sub_manifest[k] = {"offset": offset, "size": len(raw), "shape": list(sd[k].shape)}
     params_bin_write_region(LA_DIR, "connector", bytes(region_buf), sub_manifest)
@@ -3852,8 +3852,7 @@ def main():
 
             def _ld(key):
                 m = man[key]
-                arr = np.frombuffer(conn_cache[key], dtype=np.uint16).copy()
-                t = torch.from_numpy(arr).view(torch.bfloat16).reshape(m["shape"])
+                t = user_dma_core.tensor_from_le_bytes(conn_cache[key], torch.bfloat16).reshape(m["shape"])
                 return store_weight(self, t)
 
             self.conn_ln_g = _ld("mlp1.0.weight")   # LayerNorm gamma [4608]

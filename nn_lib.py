@@ -44,6 +44,7 @@ from user_dma_core import (
     UE_VECTOR_SIZE,
     URAM_FULL_ELEMENTS,
     URAM_NEAR_FULL_ELEMENTS,
+    tensor_le_bytes,
     ue_35bit_addr_shifter,
 )
 
@@ -1343,10 +1344,9 @@ def store_quantized_weight(ue, raw_data) -> tuple[int, int]:
     scales_size = n_blocks * 2
     data_size = n_blocks * 32
 
-    scales_np = np.frombuffer(raw_bytes[:scales_size], dtype=np.uint16).copy()
-    scale_tensor = torch.from_numpy(scales_np).view(torch.bfloat16)
+    # The GGUF scales are already little-endian bf16, as DRAM expects.
     scale_addr = ue.get_params_dram_addr()
-    ue.dma_write(DMA_DEVICE_H2C, scale_addr, scale_tensor, scales_size)
+    ue.dma_write(DMA_DEVICE_H2C, scale_addr, raw_bytes[:scales_size], scales_size)
     ue.allocate_params_dram(scales_size)
 
     data_np = np.frombuffer(raw_bytes[scales_size:scales_size + data_size], dtype=np.uint8).copy()
@@ -1421,7 +1421,7 @@ def write_weight_bin(bin_path: str,
             else:
                 if transform_fn is not None:
                     t = transform_fn(pname, t)
-                raw = t.to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+                raw = tensor_le_bytes(t.to(torch.bfloat16))
             offset = f.tell()
             f.write(raw)
             manifest[key] = {"offset": offset, "size": len(raw)}

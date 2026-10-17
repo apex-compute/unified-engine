@@ -90,7 +90,7 @@ def _quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor, block_size: int = 6
     high = w_nibbles[:, :, 1::2].reshape(N_w, -1)
     packed = (high << 4) | low
     data_bytes = packed.astype(np.uint8).tobytes()
-    scale_bytes = scale_bf16.contiguous().view(torch.uint8).numpy().tobytes()
+    scale_bytes = user_dma_core.tensor_le_bytes(scale_bf16)
     return (data_bytes, scale_bytes)
 
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
@@ -130,7 +130,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
 
     # Embedding
     embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
-    raw_emb = embed.contiguous().view(torch.uint8).numpy().tobytes()
+    raw_emb = user_dma_core.tensor_le_bytes(embed)
     write_at(token_embd_offset, raw_emb)
 
     # Layers
@@ -194,7 +194,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
                 i += 2
             else:
                 t = tensor.detach().cpu().to(torch.bfloat16).contiguous()
-                raw = (t.view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+                raw = (user_dma_core.tensor_le_bytes(t) + b"\x00" * sz)[:sz]
                 write_at(file_off, raw)
                 i += 1
             j += 1
@@ -214,13 +214,13 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
     rope_tensor = torch.cat([cos_, cos_, -sin_, sin_], dim=1)  # (num_positions, 256)
     for off_key, sz_key in [("ROPE_LOCAL", "ROPE_LOCAL_SIZE"), ("ROPE_GLOBAL", "ROPE_GLOBAL_SIZE")]:
         sz = weight_defs[sz_key]
-        raw = (rope_tensor.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+        raw = (user_dma_core.tensor_le_bytes(rope_tensor) + b"\x00" * sz)[:sz]
         write_at(weight_defs[off_key], raw)
 
     # OUTPUT_NORM
     out_norm = (model.model.norm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
     sz = weight_defs["OUTPUT_NORM_WEIGHT_SIZE"]
-    raw = (out_norm.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(out_norm) + b"\x00" * sz)[:sz]
     write_at(weight_defs["OUTPUT_NORM_WEIGHT"], raw)
 
     # LM_HEAD: Qwen3 has a separate lm_head weight (NOT tied to embedding)
@@ -433,7 +433,7 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         for name, w in weights.items():
             sz = w.numel() * 2  # bf16
             addr = self.allocate_params_dram(sz)
-            raw = w.view(torch.uint8).numpy().tobytes()
+            raw = user_dma_core.tensor_le_bytes(w)
             self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
             self._last_layer_bf16_addrs[name] = addr
             total_bytes += sz
@@ -528,7 +528,7 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         # rope_hf_core(N=actual_head_dim=128): [cos(64), cos(64), -sin(64), sin(64)]
         rope_tensor = torch.cat([cos_, cos_, -sin_, sin_], dim=1)  # (num_positions, 256)
         # Single DMA: write ROPE_LOCAL and ROPE_GLOBAL back-to-back (same table, same theta)
-        rope_raw = rope_tensor.contiguous().view(torch.uint8).numpy().tobytes()
+        rope_raw = user_dma_core.tensor_le_bytes(rope_tensor)
         local_sz  = self.weight_defs["ROPE_LOCAL_SIZE"]
         global_sz = self.weight_defs["ROPE_GLOBAL_SIZE"]
         local_raw  = (rope_raw + b"\x00" * local_sz)[:local_sz]
@@ -553,7 +553,7 @@ class Qwen3_4b_UnifiedEngine(UnifiedEngine):
         emb_dim = emb_cfg["embedding_dim"]
         emb_bytes = vocab_size * emb_dim * self.bytes_per_element
         raw_emb = bytearray(self.weight_bin[token_embd_offset : token_embd_offset + emb_bytes])
-        self.embedding_weight = torch.frombuffer(raw_emb, dtype=torch.bfloat16).reshape(vocab_size, emb_dim).clone()
+        self.embedding_weight = user_dma_core.tensor_from_le_bytes(raw_emb, torch.bfloat16).reshape(vocab_size, emb_dim)
         model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_dir, trust_remote_code=True, local_files_only=True,

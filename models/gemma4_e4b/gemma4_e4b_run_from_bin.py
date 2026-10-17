@@ -692,7 +692,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     buf = f.read(sz)
                     if len(buf) != sz:
                         raise RuntimeError(f"truncated rope pad read at offset {off}")
-                    return torch.frombuffer(bytearray(buf), dtype=torch.bfloat16).reshape(n_rows, rope_w).clone()
+                    return user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(n_rows, rope_w)
                 cos_pad_tiled     = _slice_pad(_peek["vision_rope_cos_offset"],     _peek["vision_rope_cos_size"])
                 neg_sin_pad_tiled = _slice_pad(_peek["vision_rope_neg_sin_offset"], _peek["vision_rope_neg_sin_size"])
                 sin_hi_pad_tiled  = _slice_pad(_peek["vision_rope_sin_hi_offset"],  _peek["vision_rope_sin_hi_size"])
@@ -1602,9 +1602,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             s = sections["pos_embedding_table"]
             f.seek(base_offset + s["offset"])
             bts = f.read(s["size"])
-            self._vis_pos_embed_table = torch.frombuffer(
-                bytearray(bts), dtype=torch.bfloat16
-            ).reshape(*s["shape"]).clone()
+            self._vis_pos_embed_table = user_dma_core.tensor_from_le_bytes(
+                bts, torch.bfloat16).reshape(*s["shape"])
 
             self.VIS_EMBED_NORM_HAS_SCALE = False
             self.VIS_EMBED_NORM_GAMMA = _dma_section("embed_norm_gamma")
@@ -3092,9 +3091,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 dw_bytes = f.read(dw_section["size"])
                 addrs["CONV_DW_W"] = self.allocate_tensor_dram(dw_section["size"])
                 self.dma_write(DMA_DEVICE_H2C, addrs["CONV_DW_W"], dw_bytes, dw_section["size"])
-                dw_w_host = torch.frombuffer(
-                    bytearray(dw_bytes), dtype=torch.bfloat16
-                ).reshape(*dw_section["shape"]).clone()
+                dw_w_host = user_dma_core.tensor_from_le_bytes(
+                    dw_bytes, torch.bfloat16).reshape(*dw_section["shape"])
                 addrs["CONV_NORM"]       = _dma_section(f"{pre}.conv_norm")
                 addrs["FF2_PRE_NORM"]    = _dma_section(f"{pre}.ff2_pre_norm")
                 addrs["FF2_POST_NORM"]   = _dma_section(f"{pre}.ff2_post_norm")
@@ -5497,7 +5495,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         sin_local = freqs_local.sin().to(torch.bfloat16)
         rope_local = torch.cat([cos_local, cos_local, -sin_local, sin_local], dim=1)
         sz = self.weight_defs["ROPE_LOCAL_SIZE"]
-        raw = rope_local.contiguous().view(torch.uint8).numpy().tobytes()
+        raw = user_dma_core.tensor_le_bytes(rope_local)
         raw = (raw + b"\x00" * sz)[:sz]
         addr = self.allocate_params_dram(sz)
         self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
@@ -5512,7 +5510,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         sin_global = freqs_global.sin().to(torch.bfloat16)
         rope_global = torch.cat([cos_global, cos_global, -sin_global, sin_global], dim=1)
         sz = self.weight_defs["ROPE_GLOBAL_SIZE"]
-        raw = rope_global.contiguous().view(torch.uint8).numpy().tobytes()
+        raw = user_dma_core.tensor_le_bytes(rope_global)
         raw = (raw + b"\x00" * sz)[:sz]
         addr = self.allocate_params_dram(sz)
         self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
@@ -5535,11 +5533,16 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             n_elems = 1
             for d in shape:
                 n_elems *= d
+            off = base_offset + s["offset"]
+            if not user_dma_core.HOST_IS_LITTLE_ENDIAN:
+                # The bin is little-endian; big-endian hosts need a swapped copy.
+                return user_dma_core.tensor_from_le_bytes(
+                    self.weight_bin[off:off + n_elems * 2], torch.bfloat16).reshape(shape)
             return torch.frombuffer(
                 self.weight_bin,
                 dtype=torch.bfloat16,
                 count=n_elems,
-                offset=base_offset + s["offset"],
+                offset=off,
             ).reshape(shape)
 
         self.embed_tokens_per_layer_weight = _view("embed_tokens_per_layer")
@@ -5606,6 +5609,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             count=vocab_size * emb_dim,
             offset=token_embd_offset,
         ).reshape(vocab_size, emb_dim)
+        if not user_dma_core.HOST_IS_LITTLE_ENDIAN:
+            # The bin is little-endian; big-endian hosts need a swapped copy.
+            self.embedding_weight = user_dma_core.tensor_from_le_bytes(
+                self.weight_bin[token_embd_offset:token_embd_offset + vocab_size * emb_dim * 2],
+                torch.bfloat16).reshape(vocab_size, emb_dim)
 
         host_section = self._weights_master["host_section"]
         self._load_host_weights_from_combined_bin(host_section, host_section["offset"])
@@ -7052,9 +7060,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # VLM run, since those tensor addresses are allocator-dependent.
         if rope_pads_tuple is not None:
             cos_pad, neg_sin_pad, sin_hi_pad = rope_pads_tuple
-            cos_b      = cos_pad.contiguous().view(torch.uint8).numpy().tobytes()
-            neg_sin_b  = neg_sin_pad.contiguous().view(torch.uint8).numpy().tobytes()
-            sin_hi_b   = sin_hi_pad.contiguous().view(torch.uint8).numpy().tobytes()
+            cos_b      = user_dma_core.tensor_le_bytes(cos_pad)
+            neg_sin_b  = user_dma_core.tensor_le_bytes(neg_sin_pad)
+            sin_hi_b   = user_dma_core.tensor_le_bytes(sin_hi_pad)
             rope_blob  = cos_b + neg_sin_b + sin_hi_b
         else:
             cos_b = neg_sin_b = sin_hi_b = rope_blob = b""

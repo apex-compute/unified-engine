@@ -28,6 +28,7 @@ import getpass
 import time
 from typing import Callable, Optional, Tuple
 from enum import IntEnum
+import numpy as np
 import torch
 import math
 if __package__:
@@ -289,6 +290,106 @@ def ue_assert_stride_fields_fit(stride_bytes_per_chunk: int, stride_jump_bytes: 
 DMA_DEVICE_H2C = "/dev/xdma0_h2c_0"
 DMA_DEVICE_C2H = "/dev/xdma0_c2h_0"
 DMA_DEVICE_USER = "/dev/xdma0_user"  # AXI-Lite user interface for register access
+
+# ==========================================================================
+# BYTE ORDER
+# ==========================================================================
+# The engine is little-endian: DRAM holds little-endian bf16/int words, and
+# the H2C/C2H devices copy bytes verbatim, so DMA data must be little-endian
+# on every host. The user device is different: the XDMA driver reads and
+# writes registers with ioread32/iowrite32 and copies the u32 to user space,
+# so pread/pwrite on it carry CPU-native words. Pack registers with
+# REG32_FORMAT and DMA words with '<'.
+HOST_IS_LITTLE_ENDIAN = sys.byteorder == "little"
+REG32_FORMAT = "=I"
+
+
+def tensor_le_uint8(tensor: torch.Tensor) -> torch.Tensor:
+    """Flat little-endian uint8 view of a tensor (a swapped copy on big-endian hosts)."""
+    raw = tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+    elem = tensor.element_size()
+    if HOST_IS_LITTLE_ENDIAN or elem == 1:
+        return raw
+    return raw.view(-1, elem).flip(1).reshape(-1)
+
+
+def tensor_le_bytes(tensor: torch.Tensor) -> bytes:
+    """Little-endian bytes of a tensor, for weight bins and DMA payloads."""
+    return tensor_le_uint8(tensor).numpy().tobytes()
+
+
+def tensor_from_le_bytes(raw, dtype: torch.dtype) -> torch.Tensor:
+    """Decode little-endian bytes (DRAM or a weight bin) into a new 1-D tensor."""
+    if len(raw) == 0:
+        return torch.empty(0, dtype=dtype)
+    data = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+    _swap_le_inplace(data, torch.empty((), dtype=dtype).element_size(), len(data))
+    return data.view(dtype)
+
+
+def _swap_le_inplace(raw: torch.Tensor, elem: int, nbytes: int) -> None:
+    """Convert the first nbytes of a flat uint8 tensor between LE and native order."""
+    if HOST_IS_LITTLE_ENDIAN or elem == 1:
+        return
+    whole = (nbytes // elem) * elem
+    words = raw[:whole].view(-1, elem)
+    words.copy_(words.flip(1))
+
+
+def dma_payload(buffer, size: int):
+    """Bytes that dma_write sends for a tensor, int, ndarray or bytes-like buffer."""
+    if isinstance(buffer, torch.Tensor):
+        # Present contiguous tensor storage directly to write(2). This
+        # avoids materialising a second, potentially hundreds-of-MiB
+        # Python ``bytes`` object for every activation upload.
+        # Big-endian hosts get a byte-swapped copy instead.
+        return memoryview(tensor_le_uint8(buffer).numpy()).cast('B')[:size]
+    if isinstance(buffer, int):
+        # DRAM words are little-endian whatever the host order.
+        return (buffer & ((1 << (8 * size)) - 1)).to_bytes(
+            size, byteorder='little', signed=False)
+    if isinstance(buffer, (bytes, bytearray)):
+        # Raw bytes are already in DRAM order.
+        return memoryview(buffer)[:size]
+    if isinstance(buffer, np.ndarray):
+        le = np.ascontiguousarray(buffer).astype(
+            buffer.dtype.newbyteorder('<'), copy=False)
+        return memoryview(le.reshape(-1).view(np.uint8))[:size]
+    return bytes(buffer)[:size]
+
+
+def dma_copy_into(buffer, data_bytes, size: int) -> None:
+    """Copy bytes read from DRAM into the dma_read destination buffer."""
+    if isinstance(buffer, torch.Tensor):
+        # DMA is a byte-exact transfer. Copy directly into writable
+        # contiguous CPU tensor storage rather than expanding every
+        # uint16 into a Python tuple and constructing another tensor.
+        # Large YOLO readbacks spend hundreds of milliseconds in
+        # that tuple conversion despite no numerical conversion
+        # being required.
+        if buffer.device.type == 'cpu' and buffer.is_contiguous():
+            target = buffer.detach().reshape(-1).view(torch.uint8)
+            take = min(len(data_bytes), target.numel(), size)
+            memoryview(target.numpy())[:take] = data_bytes[:take]
+            _swap_le_inplace(target, buffer.element_size(), take)
+        else:
+            # ``reshape(-1)`` may allocate for a non-contiguous
+            # destination, in which case copying into that reshape
+            # would silently leave ``buffer`` unchanged. Stage the
+            # raw bytes in a contiguous CPU tensor and copy the
+            # logical tensor back instead. Initialising from the
+            # destination also preserves bytes beyond a short read.
+            staged = buffer.detach().cpu().contiguous()
+            target = staged.reshape(-1).view(torch.uint8)
+            take = min(len(data_bytes), target.numel(), size)
+            memoryview(target.numpy())[:take] = data_bytes[:take]
+            _swap_le_inplace(target, staged.element_size(), take)
+            with torch.no_grad():
+                buffer.copy_(staged.to(buffer.device))
+    elif hasattr(buffer, '__setitem__'):
+        # For other buffer types, copy bytes directly
+        buffer[:len(data_bytes)] = data_bytes
+
 
 # ==========================================================================
 # ONE PROCESS PER BOARD
@@ -605,7 +706,7 @@ def read_hardware_info() -> HardwareInfo:
         os.close(fd)
     if len(raw) != 4:
         raise OSError(f"Short read from {DMA_DEVICE_USER} HW_INFO register: expected 4 bytes, got {len(raw)}")
-    raw_value = struct.unpack("<I", raw)[0]
+    raw_value = struct.unpack(REG32_FORMAT, raw)[0]
     override_code = _dram_size_override_code()
     if override_code is not None:
         patched = (raw_value & ~(0x7 << 26)) | (override_code << 26)
@@ -1526,7 +1627,7 @@ class UnifiedEngine:
             fd = self._get_user_fd()
             # Subtract base address to get offset within the BAR
             offset = address + self._base_addr - AXI_LITE_TRANSLATION_OFFSET
-            data_bytes = struct.pack('I', value & 0xFFFFFFFF)
+            data_bytes = struct.pack(REG32_FORMAT, value & 0xFFFFFFFF)
             # Use pwrite to write at offset (device doesn't support lseek)
             os.pwrite(fd, data_bytes, offset)
         except PermissionError as e:
@@ -1557,7 +1658,7 @@ class UnifiedEngine:
             # Use pread to read at offset (device doesn't support lseek)
             data_bytes = os.pread(fd, 4, offset)
             if len(data_bytes) == 4:
-                return struct.unpack('I', data_bytes)[0]
+                return struct.unpack(REG32_FORMAT, data_bytes)[0]
             return 0
         except PermissionError as e:
             print(f"Permission denied: {self.user_device}")
@@ -1653,27 +1754,7 @@ class UnifiedEngine:
             Number of bytes written, or -1 on error
         """
         try:
-            # Convert buffer to bytes
-            if isinstance(buffer, torch.Tensor):
-                # Present contiguous tensor storage directly to write(2). This
-                # avoids materialising a second, potentially hundreds-of-MiB
-                # Python ``bytes`` object for every activation upload.
-                tensor_bytes = buffer.detach().cpu().contiguous().reshape(-1) \
-                    .view(torch.uint8)
-                data_bytes = memoryview(tensor_bytes.numpy()).cast('B')[:size]
-            elif isinstance(buffer, int):
-                # Convert integer to bytes (for register writes)
-                if size == 4:
-                    data_bytes = struct.pack('I', buffer & 0xFFFFFFFF)
-                elif size == 2:
-                    data_bytes = struct.pack('H', buffer & 0xFFFF)
-                else:
-                    data_bytes = buffer.to_bytes(size, byteorder='little', signed=False)
-            elif isinstance(buffer, (bytes, bytearray)):
-                data_bytes = memoryview(buffer)[:size]
-            else:
-                # Try to convert to bytes
-                data_bytes = bytes(buffer)[:size]
+            data_bytes = dma_payload(buffer, size)
 
             # Open device file
             try:
@@ -1755,37 +1836,7 @@ class UnifiedEngine:
                     print(f"read failed: no data read")
                     return -1
 
-                # Copy data into buffer
-                if isinstance(buffer, torch.Tensor):
-                    # DMA is a byte-exact transfer. Copy directly into writable
-                    # contiguous CPU tensor storage rather than expanding every
-                    # uint16 into a Python tuple and constructing another tensor.
-                    # Large YOLO readbacks spend hundreds of milliseconds in
-                    # that tuple conversion despite no numerical conversion
-                    # being required.
-                    if buffer.device.type == 'cpu' and buffer.is_contiguous():
-                        target = memoryview(
-                            buffer.detach().view(torch.uint8).numpy()).cast('B')
-                        take = min(len(data_bytes), len(target), size)
-                        target[:take] = data_bytes[:take]
-                    else:
-                        # ``reshape(-1)`` may allocate for a non-contiguous
-                        # destination, in which case copying into that reshape
-                        # would silently leave ``buffer`` unchanged. Stage the
-                        # raw bytes in a contiguous CPU tensor and copy the
-                        # logical tensor back instead. Initialising from the
-                        # destination also preserves bytes beyond a short read.
-                        staged = buffer.detach().cpu().contiguous()
-                        target = memoryview(
-                            staged.view(torch.uint8).numpy()).cast('B')
-                        take = min(len(data_bytes), len(target), size)
-                        target[:take] = data_bytes[:take]
-                        with torch.no_grad():
-                            buffer.copy_(staged.to(buffer.device))
-                else:
-                    # For other buffer types, copy bytes directly
-                    if hasattr(buffer, '__setitem__'):
-                        buffer[:len(data_bytes)] = data_bytes
+                dma_copy_into(buffer, data_bytes, size)
 
                 return len(data_bytes)
             finally:

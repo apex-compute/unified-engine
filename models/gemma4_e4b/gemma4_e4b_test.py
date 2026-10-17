@@ -334,7 +334,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     embed = text_model.embed_tokens.weight.detach().cpu().to(torch.bfloat16)
     embedding_scale = hidden_size ** 0.5
     emb_scaled = (embed.float() * embedding_scale).to(torch.bfloat16)
-    raw_emb = emb_scaled.contiguous().view(torch.uint8).numpy().tobytes()
+    raw_emb = user_dma_core.tensor_le_bytes(emb_scaled)
     write_at(token_embd_offset, raw_emb)
 
     # Layers
@@ -453,7 +453,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
                 i += 2
             else:
                 t = tensor.detach().cpu().to(torch.bfloat16).contiguous()
-                raw = (t.view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+                raw = (user_dma_core.tensor_le_bytes(t) + b"\x00" * sz)[:sz]
                 write_at(file_off, raw)
                 i += 1
             j += 1
@@ -487,7 +487,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     sin_local = freqs_local.sin().to(torch.bfloat16)
     rope_local = torch.cat([cos_local, cos_local, -sin_local, sin_local], dim=1)
     sz = weight_defs["ROPE_LOCAL_SIZE"]
-    raw = (rope_local.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(rope_local) + b"\x00" * sz)[:sz]
     write_at(weight_defs["ROPE_LOCAL"], raw)
 
     # GLOBAL RoPE: head_dim=512, partial_rotary_factor=0.25, rotary_dims=128, D=64
@@ -499,25 +499,25 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     sin_global = freqs_global.sin().to(torch.bfloat16)
     rope_global = torch.cat([cos_global, cos_global, -sin_global, sin_global], dim=1)
     sz = weight_defs["ROPE_GLOBAL_SIZE"]
-    raw = (rope_global.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(rope_global) + b"\x00" * sz)[:sz]
     write_at(weight_defs["ROPE_GLOBAL"], raw)
 
     # OUTPUT_NORM
     out_norm = text_model.norm.weight.detach().cpu().to(torch.bfloat16)
     sz = weight_defs["OUTPUT_NORM_WEIGHT_SIZE"]
-    raw = (out_norm.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(out_norm) + b"\x00" * sz)[:sz]
     write_at(weight_defs["OUTPUT_NORM_WEIGHT"], raw)
 
     # PER_LAYER_MODEL_PROJ_WEIGHT: [1536, 8960] from model.model.language_model.per_layer_model_projection
     per_layer_model_proj_w = text_model.per_layer_model_projection.weight.detach().cpu().to(torch.bfloat16)
     sz = weight_defs["PER_LAYER_MODEL_PROJ_WEIGHT_SIZE"]
-    raw = (per_layer_model_proj_w.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(per_layer_model_proj_w) + b"\x00" * sz)[:sz]
     write_at(weight_defs["PER_LAYER_MODEL_PROJ_WEIGHT"], raw)
 
     # PER_LAYER_PROJ_NORM_WEIGHT: [256] from model.model.language_model.per_layer_projection_norm
     per_layer_proj_norm_w = (text_model.per_layer_projection_norm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
     sz = weight_defs["PER_LAYER_PROJ_NORM_WEIGHT_SIZE"]
-    raw = (per_layer_proj_norm_w.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(per_layer_proj_norm_w) + b"\x00" * sz)[:sz]
     write_at(weight_defs["PER_LAYER_PROJ_NORM_WEIGHT"], raw)
 
     # LM_HEAD is tied with embed_tokens. Quantization is read-only, so avoid a
@@ -632,7 +632,7 @@ def _build_vision_section_bytes(hf_model) -> tuple[bytes, dict]:
 
     def _add_bf16(key: str, w: torch.Tensor) -> None:
         wc = w.contiguous()
-        sections.append((key, wc.view(torch.uint8).numpy().tobytes(), list(wc.shape), "bf16"))
+        sections.append((key, user_dma_core.tensor_le_bytes(wc), list(wc.shape), "bf16"))
 
     # Per-layer
     for li in range(L_count):
@@ -748,7 +748,7 @@ def _build_audio_section_bytes(hf_model) -> tuple[bytes, dict]:
 
     def _add_bf16(key: str, w: torch.Tensor) -> None:
         wc = w.contiguous()
-        sections.append((key, wc.view(torch.uint8).numpy().tobytes(), list(wc.shape), "bf16"))
+        sections.append((key, user_dma_core.tensor_le_bytes(wc), list(wc.shape), "bf16"))
 
     def _add_if4_batch(tensors: list[tuple[str, torch.Tensor]]) -> None:
         for name, w in tensors:
@@ -935,12 +935,12 @@ def _write_host_section(f, text_model, cfg) -> tuple[int, dict]:
     chunk = 1024
     for i in range(0, src.shape[0], chunk):
         scaled = (src[i:i+chunk].float() * per_layer_embed_scale).to(torch.bfloat16).contiguous()
-        f.write(scaled.view(torch.uint8).numpy().tobytes())
+        f.write(user_dma_core.tensor_le_bytes(scaled))
     del src
 
     proj_off = embed_off + embed_size
     proj_bf16 = text_model.per_layer_model_projection.weight.detach().cpu().to(torch.bfloat16).contiguous()
-    proj_b = proj_bf16.view(torch.uint8).numpy().tobytes()
+    proj_b = user_dma_core.tensor_le_bytes(proj_bf16)
     f.write(proj_b)
     proj_size = len(proj_b)
     proj_shape = list(proj_bf16.shape)
@@ -948,7 +948,7 @@ def _write_host_section(f, text_model, cfg) -> tuple[int, dict]:
 
     norm_off = proj_off + proj_size
     norm_bf16 = text_model.per_layer_projection_norm.weight.detach().cpu().to(torch.bfloat16).contiguous()
-    norm_b = norm_bf16.view(torch.uint8).numpy().tobytes()
+    norm_b = user_dma_core.tensor_le_bytes(norm_bf16)
     f.write(norm_b)
     norm_size = len(norm_b)
     norm_shape = list(norm_bf16.shape)
@@ -1562,7 +1562,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 buf = f.read(sz)
                 if len(buf) != sz:
                     raise RuntimeError(f"truncated rope pad read at offset {off}")
-                return torch.frombuffer(bytearray(buf), dtype=torch.bfloat16).reshape(n_rows, rope_w).clone()
+                return user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(n_rows, rope_w)
             cos_pad_tiled     = _slice_pad(_peek["vision_rope_cos_offset"],     _peek["vision_rope_cos_size"])
             neg_sin_pad_tiled = _slice_pad(_peek["vision_rope_neg_sin_offset"], _peek["vision_rope_neg_sin_size"])
             sin_hi_pad_tiled  = _slice_pad(_peek["vision_rope_sin_hi_offset"],  _peek["vision_rope_sin_hi_size"])
@@ -2477,9 +2477,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             s = sections["pos_embedding_table"]
             f.seek(base_offset + s["offset"])
             bts = f.read(s["size"])
-            self._vis_pos_embed_table = torch.frombuffer(
-                bytearray(bts), dtype=torch.bfloat16
-            ).reshape(*s["shape"]).clone()
+            self._vis_pos_embed_table = user_dma_core.tensor_from_le_bytes(
+                bts, torch.bfloat16).reshape(*s["shape"])
 
             self.VIS_EMBED_NORM_HAS_SCALE = False
             self.VIS_EMBED_NORM_GAMMA = _dma_section("embed_norm_gamma")
@@ -4074,9 +4073,8 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 dw_bytes = f.read(dw_section["size"])
                 addrs["CONV_DW_W"] = self.allocate_tensor_dram(dw_section["size"])
                 self.dma_write(DMA_DEVICE_H2C, addrs["CONV_DW_W"], dw_bytes, dw_section["size"])
-                dw_w_host = torch.frombuffer(
-                    bytearray(dw_bytes), dtype=torch.bfloat16
-                ).reshape(*dw_section["shape"]).clone()
+                dw_w_host = user_dma_core.tensor_from_le_bytes(
+                    dw_bytes, torch.bfloat16).reshape(*dw_section["shape"])
                 addrs["CONV_NORM"]       = _dma_section(f"{pre}.conv_norm")
                 addrs["FF2_PRE_NORM"]    = _dma_section(f"{pre}.ff2_pre_norm")
                 addrs["FF2_POST_NORM"]   = _dma_section(f"{pre}.ff2_post_norm")
@@ -6643,7 +6641,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         sin_local = freqs_local.sin().to(torch.bfloat16)
         rope_local = torch.cat([cos_local, cos_local, -sin_local, sin_local], dim=1)
         sz = self.weight_defs["ROPE_LOCAL_SIZE"]
-        raw = rope_local.contiguous().view(torch.uint8).numpy().tobytes()
+        raw = user_dma_core.tensor_le_bytes(rope_local)
         raw = (raw + b"\x00" * sz)[:sz]
         addr = self.allocate_params_dram(sz)
         self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
@@ -6658,7 +6656,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         sin_global = freqs_global.sin().to(torch.bfloat16)
         rope_global = torch.cat([cos_global, cos_global, -sin_global, sin_global], dim=1)
         sz = self.weight_defs["ROPE_GLOBAL_SIZE"]
-        raw = rope_global.contiguous().view(torch.uint8).numpy().tobytes()
+        raw = user_dma_core.tensor_le_bytes(rope_global)
         raw = (raw + b"\x00" * sz)[:sz]
         addr = self.allocate_params_dram(sz)
         self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
@@ -6681,11 +6679,16 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             n_elems = 1
             for d in shape:
                 n_elems *= d
+            off = base_offset + s["offset"]
+            if not user_dma_core.HOST_IS_LITTLE_ENDIAN:
+                # The bin is little-endian; big-endian hosts need a swapped copy.
+                return user_dma_core.tensor_from_le_bytes(
+                    self.weight_bin[off:off + n_elems * 2], torch.bfloat16).reshape(shape)
             return torch.frombuffer(
                 self.weight_bin,
                 dtype=torch.bfloat16,
                 count=n_elems,
-                offset=base_offset + s["offset"],
+                offset=off,
             ).reshape(shape)
 
         self.embed_tokens_per_layer_weight = _view("embed_tokens_per_layer")
@@ -6754,6 +6757,11 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
             count=vocab_size * emb_dim,
             offset=token_embd_offset,
         ).reshape(vocab_size, emb_dim)
+        if not user_dma_core.HOST_IS_LITTLE_ENDIAN:
+            # The bin is little-endian; big-endian hosts need a swapped copy.
+            self.embedding_weight = user_dma_core.tensor_from_le_bytes(
+                self.weight_bin[token_embd_offset:token_embd_offset + vocab_size * emb_dim * 2],
+                torch.bfloat16).reshape(vocab_size, emb_dim)
 
         host_section = self._weights_master["host_section"]
         self._load_host_weights_from_combined_bin(host_section, host_section["offset"])
@@ -8321,7 +8329,7 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                         hf_model, pixel_position_ids, num_patches)
                 import hashlib
                 pos_hash = hashlib.sha256(
-                    pixel_position_ids.detach().cpu().contiguous().numpy().tobytes()
+                    user_dma_core.tensor_le_bytes(pixel_position_ids)
                 ).hexdigest()
 
         # Save the LM tensor cursor before vision_tensor_init (vision reuses
@@ -8559,9 +8567,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         program_size = len(all_bytes)
 
         if cos_pad_tiled is not None:
-            cos_b     = cos_pad_tiled.contiguous().view(torch.uint8).numpy().tobytes()
-            neg_sin_b = neg_sin_pad_tiled.contiguous().view(torch.uint8).numpy().tobytes()
-            sin_hi_b  = sin_hi_pad_tiled.contiguous().view(torch.uint8).numpy().tobytes()
+            cos_b     = user_dma_core.tensor_le_bytes(cos_pad_tiled)
+            neg_sin_b = user_dma_core.tensor_le_bytes(neg_sin_pad_tiled)
+            sin_hi_b  = user_dma_core.tensor_le_bytes(sin_hi_pad_tiled)
             rope_blob = cos_b + neg_sin_b + sin_hi_b
         else:
             cos_b = neg_sin_b = sin_hi_b = rope_blob = b""
@@ -8864,9 +8872,9 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
         # VLM run, since those tensor addresses are allocator-dependent.
         if rope_pads_tuple is not None:
             cos_pad, neg_sin_pad, sin_hi_pad = rope_pads_tuple
-            cos_b      = cos_pad.contiguous().view(torch.uint8).numpy().tobytes()
-            neg_sin_b  = neg_sin_pad.contiguous().view(torch.uint8).numpy().tobytes()
-            sin_hi_b   = sin_hi_pad.contiguous().view(torch.uint8).numpy().tobytes()
+            cos_b      = user_dma_core.tensor_le_bytes(cos_pad)
+            neg_sin_b  = user_dma_core.tensor_le_bytes(neg_sin_pad)
+            sin_hi_b   = user_dma_core.tensor_le_bytes(sin_hi_pad)
             rope_blob  = cos_b + neg_sin_b + sin_hi_b
         else:
             cos_b = neg_sin_b = sin_hi_b = rope_blob = b""

@@ -7260,7 +7260,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                     f"a zero-filled buffer that would masquerade as real data")
             mv[offset:offset + n] = piece
             offset += n
-        return torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(*shape).float()
+        return user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(*shape).float()
 
     def run_vision(self, images_hwc):
         """[2,512,512,3] -> patchify [1024,768] per slot -> encoder -> connector ->
