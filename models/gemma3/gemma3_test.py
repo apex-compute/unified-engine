@@ -175,7 +175,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
     embedding_scale = model.config.hidden_size ** 0.5
     emb_scaled = (embed.float() * embedding_scale).to(torch.bfloat16)
-    raw_emb = emb_scaled.contiguous().view(torch.uint8).numpy().tobytes()
+    raw_emb = user_dma_core.tensor_le_bytes(emb_scaled)
     write_at(token_embd_offset, raw_emb)
 
     # Layers
@@ -232,7 +232,7 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
                 i += 2
             else:
                 t = tensor.detach().cpu().to(torch.bfloat16).contiguous()
-                raw = (t.view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+                raw = (user_dma_core.tensor_le_bytes(t) + b"\x00" * sz)[:sz]
                 write_at(file_off, raw)
                 i += 1
             j += 1
@@ -254,13 +254,13 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
         sin_ = freqs.sin().to(torch.bfloat16)
         rope_tensor = torch.cat([cos_, cos_, -sin_, sin_], dim=1)
         sz = weight_defs[sz_key]
-        raw = (rope_tensor.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+        raw = (user_dma_core.tensor_le_bytes(rope_tensor) + b"\x00" * sz)[:sz]
         write_at(weight_defs[off_key], raw)
 
     # OUTPUT_NORM
     out_norm = model.model.norm.weight.detach().cpu().to(torch.bfloat16)
     sz = weight_defs["OUTPUT_NORM_WEIGHT_SIZE"]
-    raw = (out_norm.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(out_norm) + b"\x00" * sz)[:sz]
     write_at(weight_defs["OUTPUT_NORM_WEIGHT"], raw)
 
     # LM_HEAD
@@ -523,7 +523,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             sin_ = freqs.sin().to(torch.bfloat16)
             rope_tensor = torch.cat([cos_, cos_, -sin_, sin_], dim=1)
             sz = self.weight_defs[sz_key]
-            raw = rope_tensor.contiguous().view(torch.uint8).numpy().tobytes()
+            raw = user_dma_core.tensor_le_bytes(rope_tensor)
             raw = (raw + b"\x00" * sz)[:sz]
             addr = self.allocate_params_dram(sz)
             self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)

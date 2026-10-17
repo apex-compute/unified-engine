@@ -370,8 +370,7 @@ def _unpack_nibbles(data: bytes, rows: int) -> torch.Tensor:
 
 
 def _bf16_from_bytes(data: bytes) -> torch.Tensor:
-    bits = torch.frombuffer(bytearray(data), dtype=torch.uint16).clone()
-    return bits.view(torch.bfloat16)
+    return user_dma_core.tensor_from_le_bytes(data, torch.bfloat16)
 
 
 @dataclass
@@ -547,8 +546,7 @@ def dequantize_conv_if4(prepared: QuantizedConv) -> torch.Tensor:
               .view(-1, user_dma_core.UE_VECTOR_SIZE))
     packed = (blocks[:, 0::2] | (blocks[:, 1::2] << 4)).contiguous()
     data_bytes = packed.numpy().tobytes()
-    scale_bytes = (prepared.block_scales.detach().cpu().contiguous()
-                   .view(torch.uint8).numpy().tobytes())
+    scale_bytes = user_dma_core.tensor_le_bytes(prepared.block_scales)
     dequantized = quant_lib.dequantize_if4(
         data_bytes, scale_bytes, blocks.shape[0],
         user_dma_core.UE_VECTOR_SIZE,
@@ -577,8 +575,7 @@ def dequantize_conv(prepared: QuantizedConv) -> torch.Tensor:
     padded = torch.zeros(
         oc, chunks * user_dma_core.UE_VECTOR_SIZE, dtype=torch.uint8)
     padded[:, :taps] = flat
-    scale_bytes = (prepared.block_scales.detach().cpu().contiguous()
-                   .view(torch.uint8).numpy().tobytes())
+    scale_bytes = user_dma_core.tensor_le_bytes(prepared.block_scales)
     dequantized = quant_lib.dequantize_if8(
         padded.numpy().tobytes(), scale_bytes, oc,
         chunks * user_dma_core.UE_VECTOR_SIZE,

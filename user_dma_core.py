@@ -21,6 +21,7 @@ Usage:
 
 from re import U
 import struct
+import errno
 import os
 import sys
 import fcntl
@@ -28,6 +29,7 @@ import getpass
 import time
 from typing import Callable, Optional, Tuple
 from enum import IntEnum
+import numpy as np
 import torch
 import math
 if __package__:
@@ -285,10 +287,122 @@ def ue_assert_stride_fields_fit(stride_bytes_per_chunk: int, stride_jump_bytes: 
     )
 
 
+# LARGEST SINGLE os.write()/os.read() ON AN XDMA CHAR DEVICE. For one call the
+# driver pins every page of the user buffer and builds one scatter-gather table
+# for all of it. On a host that has run an hour of large transfers that
+# allocation fails with ENOMEM for a 1.8 GB weight load, while a 157 MB write
+# moments later succeeds -- it is the size of the single mapping, not the host
+# being out of memory. 64 MiB is well inside what has been seen to work and
+# costs nothing measurable: transfers are bandwidth-bound, not syscall-bound.
+# UE_DMA_MAX_CHUNK_MB overrides it.
+DMA_MAX_CHUNK_BYTES = int(os.environ.get("UE_DMA_MAX_CHUNK_MB", "64")) * 1024 * 1024
+if DMA_MAX_CHUNK_BYTES <= 0:
+    raise ValueError("UE_DMA_MAX_CHUNK_MB must be a positive number of MiB")
+
 # DMA device paths (can be overridden by command-line argument)
 DMA_DEVICE_H2C = "/dev/xdma0_h2c_0"
 DMA_DEVICE_C2H = "/dev/xdma0_c2h_0"
 DMA_DEVICE_USER = "/dev/xdma0_user"  # AXI-Lite user interface for register access
+
+# ==========================================================================
+# BYTE ORDER
+# ==========================================================================
+# The engine is little-endian: DRAM holds little-endian bf16/int words, and
+# the H2C/C2H devices copy bytes verbatim, so DMA data must be little-endian
+# on every host. The user device is different: the XDMA driver reads and
+# writes registers with ioread32/iowrite32 and copies the u32 to user space,
+# so pread/pwrite on it carry CPU-native words. Pack registers with
+# REG32_FORMAT and DMA words with '<'.
+HOST_IS_LITTLE_ENDIAN = sys.byteorder == "little"
+REG32_FORMAT = "=I"
+
+
+def tensor_le_uint8(tensor: torch.Tensor) -> torch.Tensor:
+    """Flat little-endian uint8 view of a tensor (a swapped copy on big-endian hosts)."""
+    raw = tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+    elem = tensor.element_size()
+    if HOST_IS_LITTLE_ENDIAN or elem == 1:
+        return raw
+    return raw.view(-1, elem).flip(1).reshape(-1)
+
+
+def tensor_le_bytes(tensor: torch.Tensor) -> bytes:
+    """Little-endian bytes of a tensor, for weight bins and DMA payloads."""
+    return tensor_le_uint8(tensor).numpy().tobytes()
+
+
+def tensor_from_le_bytes(raw, dtype: torch.dtype) -> torch.Tensor:
+    """Decode little-endian bytes (DRAM or a weight bin) into a new 1-D tensor."""
+    if len(raw) == 0:
+        return torch.empty(0, dtype=dtype)
+    data = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+    _swap_le_inplace(data, torch.empty((), dtype=dtype).element_size(), len(data))
+    return data.view(dtype)
+
+
+def _swap_le_inplace(raw: torch.Tensor, elem: int, nbytes: int) -> None:
+    """Convert the first nbytes of a flat uint8 tensor between LE and native order."""
+    if HOST_IS_LITTLE_ENDIAN or elem == 1:
+        return
+    whole = (nbytes // elem) * elem
+    words = raw[:whole].view(-1, elem)
+    words.copy_(words.flip(1))
+
+
+def dma_payload(buffer, size: int):
+    """Bytes that dma_write sends for a tensor, int, ndarray or bytes-like buffer."""
+    if isinstance(buffer, torch.Tensor):
+        # Present contiguous tensor storage directly to write(2). This
+        # avoids materialising a second, potentially hundreds-of-MiB
+        # Python ``bytes`` object for every activation upload.
+        # Big-endian hosts get a byte-swapped copy instead.
+        return memoryview(tensor_le_uint8(buffer).numpy()).cast('B')[:size]
+    if isinstance(buffer, int):
+        # DRAM words are little-endian whatever the host order.
+        return (buffer & ((1 << (8 * size)) - 1)).to_bytes(
+            size, byteorder='little', signed=False)
+    if isinstance(buffer, (bytes, bytearray)):
+        # Raw bytes are already in DRAM order.
+        return memoryview(buffer)[:size]
+    if isinstance(buffer, np.ndarray):
+        le = np.ascontiguousarray(buffer).astype(
+            buffer.dtype.newbyteorder('<'), copy=False)
+        return memoryview(le.reshape(-1).view(np.uint8))[:size]
+    return bytes(buffer)[:size]
+
+
+def dma_copy_into(buffer, data_bytes, size: int) -> None:
+    """Copy bytes read from DRAM into the dma_read destination buffer."""
+    if isinstance(buffer, torch.Tensor):
+        # DMA is a byte-exact transfer. Copy directly into writable
+        # contiguous CPU tensor storage rather than expanding every
+        # uint16 into a Python tuple and constructing another tensor.
+        # Large YOLO readbacks spend hundreds of milliseconds in
+        # that tuple conversion despite no numerical conversion
+        # being required.
+        if buffer.device.type == 'cpu' and buffer.is_contiguous():
+            target = buffer.detach().reshape(-1).view(torch.uint8)
+            take = min(len(data_bytes), target.numel(), size)
+            memoryview(target.numpy())[:take] = data_bytes[:take]
+            _swap_le_inplace(target, buffer.element_size(), take)
+        else:
+            # ``reshape(-1)`` may allocate for a non-contiguous
+            # destination, in which case copying into that reshape
+            # would silently leave ``buffer`` unchanged. Stage the
+            # raw bytes in a contiguous CPU tensor and copy the
+            # logical tensor back instead. Initialising from the
+            # destination also preserves bytes beyond a short read.
+            staged = buffer.detach().cpu().contiguous()
+            target = staged.reshape(-1).view(torch.uint8)
+            take = min(len(data_bytes), target.numel(), size)
+            memoryview(target.numpy())[:take] = data_bytes[:take]
+            _swap_le_inplace(target, staged.element_size(), take)
+            with torch.no_grad():
+                buffer.copy_(staged.to(buffer.device))
+    elif hasattr(buffer, '__setitem__'):
+        # For other buffer types, copy bytes directly
+        buffer[:len(data_bytes)] = data_bytes
+
 
 # ==========================================================================
 # ONE PROCESS PER BOARD
@@ -605,7 +719,7 @@ def read_hardware_info() -> HardwareInfo:
         os.close(fd)
     if len(raw) != 4:
         raise OSError(f"Short read from {DMA_DEVICE_USER} HW_INFO register: expected 4 bytes, got {len(raw)}")
-    raw_value = struct.unpack("<I", raw)[0]
+    raw_value = struct.unpack(REG32_FORMAT, raw)[0]
     override_code = _dram_size_override_code()
     if override_code is not None:
         patched = (raw_value & ~(0x7 << 26)) | (override_code << 26)
@@ -1438,7 +1552,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x160d5a5e, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x160d5a5e. Please update FPGA with update_160d5a5e.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
+        assert hw_version == 0x42029f30, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x42029f30. Please update FPGA with update_42029f30.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
         if getattr(self, "conv_geometry_mode", CONV_GEOMETRY_LIVE_CSR) == CONV_GEOMETRY_QUEUE_CONFIG:
             # Convolution images have independent build stamps from the legacy
             # release. Explicit queue-CONFIG selection opts into that contract;
@@ -1526,7 +1640,7 @@ class UnifiedEngine:
             fd = self._get_user_fd()
             # Subtract base address to get offset within the BAR
             offset = address + self._base_addr - AXI_LITE_TRANSLATION_OFFSET
-            data_bytes = struct.pack('I', value & 0xFFFFFFFF)
+            data_bytes = struct.pack(REG32_FORMAT, value & 0xFFFFFFFF)
             # Use pwrite to write at offset (device doesn't support lseek)
             os.pwrite(fd, data_bytes, offset)
         except PermissionError as e:
@@ -1557,7 +1671,7 @@ class UnifiedEngine:
             # Use pread to read at offset (device doesn't support lseek)
             data_bytes = os.pread(fd, 4, offset)
             if len(data_bytes) == 4:
-                return struct.unpack('I', data_bytes)[0]
+                return struct.unpack(REG32_FORMAT, data_bytes)[0]
             return 0
         except PermissionError as e:
             print(f"Permission denied: {self.user_device}")
@@ -1650,30 +1764,15 @@ class UnifiedEngine:
             size: Size in bytes to write
 
         Returns:
-            Number of bytes written, or -1 on error
+            Number of bytes written, or -1 if the device cannot be opened.
+
+        Raises:
+            OSError: the transfer itself failed or came up short. This is not
+                reported as -1: a caller that ignores the return value would
+                then run against DRAM that was never written.
         """
         try:
-            # Convert buffer to bytes
-            if isinstance(buffer, torch.Tensor):
-                # Present contiguous tensor storage directly to write(2). This
-                # avoids materialising a second, potentially hundreds-of-MiB
-                # Python ``bytes`` object for every activation upload.
-                tensor_bytes = buffer.detach().cpu().contiguous().reshape(-1) \
-                    .view(torch.uint8)
-                data_bytes = memoryview(tensor_bytes.numpy()).cast('B')[:size]
-            elif isinstance(buffer, int):
-                # Convert integer to bytes (for register writes)
-                if size == 4:
-                    data_bytes = struct.pack('I', buffer & 0xFFFFFFFF)
-                elif size == 2:
-                    data_bytes = struct.pack('H', buffer & 0xFFFF)
-                else:
-                    data_bytes = buffer.to_bytes(size, byteorder='little', signed=False)
-            elif isinstance(buffer, (bytes, bytearray)):
-                data_bytes = memoryview(buffer)[:size]
-            else:
-                # Try to convert to bytes
-                data_bytes = bytes(buffer)[:size]
+            data_bytes = dma_payload(buffer, size)
 
             # Open device file
             try:
@@ -1696,19 +1795,48 @@ class UnifiedEngine:
                 return -1
 
             try:
-                # Seek to address
-                os.lseek(fd, address, os.SEEK_SET)
-
-                # Write data
-                bytes_written = os.write(fd, data_bytes)
-
-                return bytes_written
+                # CHUNKED, AND A FAILED OR SHORT WRITE RAISES.
+                #
+                # This used to be one os.write() of the whole buffer. A 1.8 GB
+                # qwen3_4b weight load then failed with ENOMEM (see
+                # DMA_MAX_CHUNK_BYTES); the error was printed and returned as
+                # -1, the loader ignored it, the model ran on the random
+                # poison model_auto_test had just written to DRAM, and CI
+                # reported "did not find 'x = 2'" 48 minutes later (andromeda
+                # run 39031696086). Chunks keep each mapping small, and
+                # stopping here is better than plausible but wrong results.
+                view = memoryview(data_bytes)
+                total = len(view)
+                done = 0
+                while done < total:
+                    piece = view[done:done + DMA_MAX_CHUNK_BYTES]
+                    # SEEK BEFORE EVERY CHUNK. The XDMA char device takes the
+                    # card address from the file position and does NOT advance
+                    # it by the bytes written, so relying on the implicit
+                    # advance writes every chunk back over the first one.
+                    os.lseek(fd, address + done, os.SEEK_SET)
+                    try:
+                        n = os.write(fd, piece)
+                    except OSError as e:
+                        raise OSError(
+                            e.errno,
+                            f"dma_write to {device} failed after {done} of {total} "
+                            f"bytes, at DRAM 0x{address + done:X} (chunk {len(piece)} B): "
+                            f"{e.strerror}. DRAM is partially written") from e
+                    if n <= 0:
+                        raise OSError(
+                            errno.EIO,
+                            f"dma_write to {device} wrote 0 bytes at DRAM "
+                            f"0x{address + done:X} with {total - done} of {total} "
+                            f"bytes left")
+                    done += n
+                return done
             finally:
                 os.close(fd)
 
         except Exception as e:
             print(f"dma_write error: {e}")
-            return -1
+            raise
 
     def dma_read(self, device: str, address: int, buffer, size: int) -> int:
         """
@@ -1721,7 +1849,11 @@ class UnifiedEngine:
             size: Size in bytes to read
 
         Returns:
-            Number of bytes read, or -1 on error
+            Number of bytes read, or -1 if the device cannot be opened.
+
+        Raises:
+            OSError: the transfer itself failed or came up short, for the same
+                reason as dma_write.
         """
         try:
             # Open device file
@@ -1745,55 +1877,40 @@ class UnifiedEngine:
                 return -1
 
             try:
-                # Seek to address
-                os.lseek(fd, address, os.SEEK_SET)
+                # Chunked with a seek per chunk, like dma_write: one huge read
+                # pins one huge mapping, and the file position is not advanced.
+                data_bytes = bytearray(size)
+                view = memoryview(data_bytes)
+                done = 0
+                while done < size:
+                    want = min(DMA_MAX_CHUNK_BYTES, size - done)
+                    os.lseek(fd, address + done, os.SEEK_SET)
+                    try:
+                        chunk = os.read(fd, want)
+                    except OSError as e:
+                        raise OSError(
+                            e.errno,
+                            f"dma_read from {device} failed after {done} of {size} "
+                            f"bytes, at DRAM 0x{address + done:X} (chunk {want} B): "
+                            f"{e.strerror}") from e
+                    if not chunk:
+                        raise OSError(
+                            errno.EIO,
+                            f"dma_read from {device} read 0 bytes at DRAM "
+                            f"0x{address + done:X} with {size - done} of {size} "
+                            f"bytes left")
+                    view[done:done + len(chunk)] = chunk
+                    done += len(chunk)
 
-                # Read raw bytes from device
-                data_bytes = os.read(fd, size)
+                dma_copy_into(buffer, data_bytes, size)
 
-                if len(data_bytes) == 0:
-                    print(f"read failed: no data read")
-                    return -1
-
-                # Copy data into buffer
-                if isinstance(buffer, torch.Tensor):
-                    # DMA is a byte-exact transfer. Copy directly into writable
-                    # contiguous CPU tensor storage rather than expanding every
-                    # uint16 into a Python tuple and constructing another tensor.
-                    # Large YOLO readbacks spend hundreds of milliseconds in
-                    # that tuple conversion despite no numerical conversion
-                    # being required.
-                    if buffer.device.type == 'cpu' and buffer.is_contiguous():
-                        target = memoryview(
-                            buffer.detach().view(torch.uint8).numpy()).cast('B')
-                        take = min(len(data_bytes), len(target), size)
-                        target[:take] = data_bytes[:take]
-                    else:
-                        # ``reshape(-1)`` may allocate for a non-contiguous
-                        # destination, in which case copying into that reshape
-                        # would silently leave ``buffer`` unchanged. Stage the
-                        # raw bytes in a contiguous CPU tensor and copy the
-                        # logical tensor back instead. Initialising from the
-                        # destination also preserves bytes beyond a short read.
-                        staged = buffer.detach().cpu().contiguous()
-                        target = memoryview(
-                            staged.view(torch.uint8).numpy()).cast('B')
-                        take = min(len(data_bytes), len(target), size)
-                        target[:take] = data_bytes[:take]
-                        with torch.no_grad():
-                            buffer.copy_(staged.to(buffer.device))
-                else:
-                    # For other buffer types, copy bytes directly
-                    if hasattr(buffer, '__setitem__'):
-                        buffer[:len(data_bytes)] = data_bytes
-
-                return len(data_bytes)
+                return done
             finally:
                 os.close(fd)
 
         except Exception as e:
             print(f"dma_read error: {e}")
-            return -1
+            raise
 
     def ue_op_descriptor(
         self,
