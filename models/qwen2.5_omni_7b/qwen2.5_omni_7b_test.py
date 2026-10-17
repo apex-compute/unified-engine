@@ -752,6 +752,27 @@ class Qwen25OmniUnifiedEngine(
                 "Qwen2.5-Omni requires host BF16 token embeddings"
             )
 
+    # The latency counter is 32 bits of 16-cycle ticks, so it wraps every
+    # 2**32 * 16 cycles: 187 s at 366.7 MHz, 237 s at 290 MHz. The High tier's
+    # prefill runs longer than that. The wall time since this engine's last
+    # launch bounds the true latency from above, which is enough to add back the
+    # whole wraps the register lost; a program shorter than one wrap is unchanged.
+    def start_execute_from_dram(self, *args, **kwargs):
+        self._launch_wall_s = time.perf_counter()
+        return super().start_execute_from_dram(*args, **kwargs)
+
+    def report_latency_in_us(self):
+        us = super().report_latency_in_us()
+        launched = getattr(self, "_launch_wall_s", None)
+        if launched is None:
+            return us
+        wrap_us = (2**32 * user_dma_core.UE_PIPELINE_COUNTER_CLK_DIV
+                   * self._clock_period_ns / 1e3)
+        wall_us = (time.perf_counter() - launched) * 1e6
+        if wall_us > us + wrap_us:
+            us += wrap_us * int((wall_us - us) // wrap_us)
+        return us
+
     def _read_params_region(self, name: str) -> dict[str, Any]:
         """Return one validated disk region from the unified params artifact."""
         if self._params_regions is None:
@@ -3418,16 +3439,18 @@ def _host_build_token2wav(model_dir: str, plan) -> dict:
 
 
 def _ensure_speech_params(script_dir: str, cfg: dict, args, plan) -> None:
-    """Make sure params.bin carries the Talker's and Token2Wav's weights.
+    """Make sure params.bin carries the FPGA speech stages' weights.
 
     They are appended once (the Thinker regions are not rewritten) and loaded at
     init like every other weight. This runs before the engine exists because the
-    programs.bin identity covers the params manifest.
+    programs.bin identity covers the params manifest. Both layouts load the
+    Talker from params.bin; only the flat map (``plan``) does the same for
+    Token2Wav -- the windowed layout builds and uploads Token2Wav at run time.
     """
     speak_fpga = args.speak is not None and not args.speak_host
     if not speak_fpga:
         return
-    need_t2w = not args.token2wav_host
+    need_t2w = plan is not None and not args.token2wav_host
     model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
     regions = _weight_mod.params_regions(script_dir)
     if "talker" not in regions and "token2wav" in regions:
@@ -4206,8 +4229,11 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         args.vision_res,
     )
     # Fetch/convert before constructing a device-owning engine.  The conversion
-    # streams Thinker shards and skips Talker/token2wav-only checkpoint shards.
+    # streams Thinker shards; the Talker/Token2Wav shards and the speaker voices
+    # (spk_dict.pt) are fetched only when the run speaks.
     params_path = _weight_mod.ensure_params_bin(SCRIPT_DIR)
+    if args.speak is not None:
+        _weight_mod.ensure_speech_checkpoint(SCRIPT_DIR)
     processor_dir = _weight_mod.ensure_processor_bundle(
         SCRIPT_DIR, verbose=False
     )
@@ -4240,10 +4266,10 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         for line in flat_plan.lines():
             print(line)
         context_limit = flat_plan.max_context
-        # The Talker's and Token2Wav's weights live in params.bin like the rest. They
-        # are appended here, before the engine exists, because the programs.bin
-        # identity covers the params manifest.
-        _ensure_speech_params(SCRIPT_DIR, cfg, args, flat_plan)
+    # The Talker's (and, on the flat map, Token2Wav's) weights live in params.bin
+    # like the rest. They are appended here, before the engine exists, because the
+    # programs.bin identity covers the params manifest.
+    _ensure_speech_params(SCRIPT_DIR, cfg, args, flat_plan)
     if len(context) > context_limit:
         raise ValueError(
             f"templated prompt needs {len(context)} prefill tokens; limit is "

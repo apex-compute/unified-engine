@@ -261,9 +261,9 @@ def ensure_processor_bundle(
     """Return a validated, local-only AutoProcessor directory.
 
     Existing bundles are reused without inspecting checkpoint indexes or
-    safetensors. Missing/corrupt bundles are rebuilt from the already-local HF
-    metadata using atomic per-file replacements, with the manifest committed
-    last.
+    safetensors. Missing/corrupt bundles are rebuilt from the local HF metadata
+    (fetched at the pinned revision if it is not local) using atomic per-file
+    replacements, with the manifest committed last.
     """
     script_dir = os.path.abspath(script_dir or _THIS_DIR)
     cfg = _load_config(script_dir)
@@ -273,6 +273,9 @@ def ensure_processor_bundle(
 
     source = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
     source_errors = _validate_processor_files(source, cfg)
+    if source_errors:
+        _ensure_checkpoint(script_dir, cfg, submodels=())   # metadata only
+        source_errors = _validate_processor_files(source, cfg)
     if source_errors:
         raise RuntimeError(
             "cannot build the Qwen2.5-Omni processor bundle from local files "
@@ -346,8 +349,16 @@ def _decode_bf16_projections(cfg: dict) -> tuple[str, ...]:
     return tuple(projections)
 
 
-def _ensure_checkpoint(script_dir: str, cfg: dict) -> tuple[str, str]:
-    """Fetch metadata and only checkpoint shards containing Thinker tensors."""
+def _ensure_checkpoint(script_dir: str, cfg: dict, submodels=("thinker",),
+                       extra_files=()) -> tuple[str, str]:
+    """Fetch metadata and the checkpoint shards holding ``submodels``' tensors.
+
+    The checkpoint holds three submodels (thinker.*, talker.*, token2wav.*);
+    only the requested ones are downloaded, so a run that does not speak never
+    pulls the 2.4 GiB Talker/Token2Wav-only shard. ``extra_files`` are other
+    files of the same pinned revision (spk_dict.pt). Empty ``submodels``
+    fetches the metadata alone. Files already present are not re-downloaded.
+    """
     from huggingface_hub import hf_hub_download, snapshot_download
 
     model_dir = os.path.join(script_dir, cfg["paths"]["hf_model_dir"])
@@ -367,30 +378,50 @@ def _ensure_checkpoint(script_dir: str, cfg: dict) -> tuple[str, str]:
     with open(index_path) as f:
         index = json.load(f)
     weight_map = index.get("weight_map", {})
-    thinker_keys = [key for key in weight_map if key.startswith("thinker.")]
-    if not thinker_keys:
-        raise RuntimeError(f"{index_path} contains no thinker.* tensors")
-    shards = sorted({weight_map[key] for key in thinker_keys})
+    shards = []
+    for submodel in submodels:
+        keys = [key for key in weight_map if key.startswith(f"{submodel}.")]
+        if not keys:
+            raise RuntimeError(f"{index_path} contains no {submodel}.* tensors")
+        shards.extend(weight_map[key] for key in keys)
+    shards = sorted(set(shards))
     metadata_patterns = [
         "*.json", "*.jinja", "*.txt", "*.model", "*.tiktoken",
         "tokenizer*", "merges.txt", "vocab.json", "preprocessor_config.json",
     ]
-    missing = [name for name in shards if not os.path.exists(os.path.join(model_dir, name))]
+    wanted = shards + list(extra_files)
+    missing = [name for name in wanted if not os.path.exists(os.path.join(model_dir, name))]
     if missing:
         print(
-            f"Downloading {len(shards)} Thinker checkpoint shard(s) from {repo}; "
-            "Talker/Token2Wav-only shards are skipped ..."
+            f"Downloading {', '.join(missing)} ({'/'.join(submodels) or 'metadata'}) "
+            f"from {repo} @ {revision[:12]} ..."
         )
     snapshot_download(
         repo_id=repo,
         local_dir=model_dir,
-        allow_patterns=metadata_patterns + shards,
+        allow_patterns=metadata_patterns + wanted,
         revision=revision,
     )
-    for name in shards:
+    for name in wanted:
         if not os.path.exists(os.path.join(model_dir, name)):
-            raise FileNotFoundError(f"checkpoint shard was not downloaded: {name}")
+            raise FileNotFoundError(f"checkpoint file was not downloaded: {name}")
     return model_dir, revision
+
+
+# --speak reads the Talker (talker.*) and Token2Wav (token2wav.*) weights from the
+# checkpoint, and the speaker voices (bos token, conditioning vector, reference
+# mel per speaker) from spk_dict.pt, which is not a safetensors shard.
+SPEECH_SUBMODELS = ("talker", "token2wav")
+SPEECH_CHECKPOINT_FILES = ("spk_dict.pt",)
+
+
+def ensure_speech_checkpoint(script_dir: str | None = None) -> str:
+    """Make the checkpoint files speech needs local; returns the model directory."""
+    script_dir = os.path.abspath(script_dir or _THIS_DIR)
+    cfg = _load_config(script_dir)
+    model_dir, _revision = _ensure_checkpoint(
+        script_dir, cfg, SPEECH_SUBMODELS, SPEECH_CHECKPOINT_FILES)
+    return model_dir
 
 
 class _Checkpoint:
@@ -1078,7 +1109,7 @@ def append_params_region(script_dir: str, name: str, items, meta: dict | None = 
     ``items`` yields ``(key, dtype, shape, bytes)``. The region lands after the
     last region and before a NEW generation trailer, and the manifest is replaced
     afterwards, so a crash in between leaves a payload whose trailer does not match
-    its manifest (ensure_params_bin refuses it) instead of a half-valid file. The
+    its manifest (ensure_params_bin rebuilds it) instead of a half-valid file. The
     Thinker regions are not rewritten.
     """
     if name not in OPTIONAL_REGIONS:
@@ -1250,20 +1281,25 @@ def ensure_params_bin(script_dir: str, verbose: bool = True) -> str:
         if not errors:
             ensure_processor_bundle(script_dir, verbose=verbose)
             return params_path
-        raise RuntimeError(
-            f"cached Qwen2.5-Omni params are incompatible ({'; '.join(errors)}). "
-            f"Remove {params_path} and {json_path}, then regenerate schema "
-            f"{SCHEMA_VERSION}."
-        )
-    if os.path.exists(params_path) != os.path.exists(json_path):
-        remaining = params_path if os.path.exists(params_path) else json_path
-        raise RuntimeError(
-            "cached Qwen2.5-Omni params are incomplete; remove the remaining "
-            f"artifact ({remaining}) and regenerate"
-        )
-    if verbose:
+        # params.bin is a cache derived from the pinned checkpoint, so a stale one
+        # (older schema, other config, interrupted append) is rebuilt, not refused.
+        print(f"Qwen2.5-Omni params cache is stale ({'; '.join(errors)}); "
+              f"rebuilding schema {SCHEMA_VERSION} from the checkpoint.")
+        _remove_params_artifacts(params_path, json_path)
+    elif os.path.exists(params_path) or os.path.exists(json_path):
+        print("Qwen2.5-Omni params cache is incomplete (one of params.bin / "
+              "params.json is missing); rebuilding it from the checkpoint.")
+        _remove_params_artifacts(params_path, json_path)
+    elif verbose:
         print("Qwen2.5-Omni Thinker params are missing; generating once from safetensors.")
     return weight_bin_generate(script_dir)
+
+
+def _remove_params_artifacts(params_path: str, json_path: str) -> None:
+    # Manifest first: a payload without its manifest is never mistaken for valid.
+    for path in (json_path, params_path):
+        if os.path.exists(path):
+            os.remove(path)
 
 
 if __name__ == "__main__":
