@@ -373,6 +373,9 @@ class FlatPlan:
 def plan_flat(stages, vision_res: str = "small", max_context: int | None = None,
               device_bytes: int = REQUIRED_DRAM_GIB * 2**30) -> FlatPlan:
     """Fix the weights and instruction images, then give the rest to the context."""
+    # FlatLayout lays the plan over the first REQUIRED_DRAM_GIB of the device, so
+    # a bigger board (the 16 GiB U55C) must not grow the plan past that map.
+    device_bytes = min(device_bytes, REQUIRED_DRAM_GIB * 2**30)
     stages = frozenset(stages) | {"lm"}
     n = REQUIRED_ENGINES
     priv = FLAT_PRIVATE_RESERVE_MIB["talker" in stages] * MIB

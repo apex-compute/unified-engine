@@ -1,288 +1,253 @@
 # Qwen2.5-Omni-7B
 
-Qwen2.5-Omni-7B inference on the Apex Compute Unified Engine. This implementation
-accelerates the **Thinker path only**:
+Qwen2.5-Omni-7B on the Apex Compute Unified Engine: text, image and audio in;
+text and speech out. Every learned matrix operation runs on eight FPGA
+engines:
+- the Thinker LLM with its vision and audio encoders;
+- the Talker that turns the reply into speech codec tokens;
+- Token2Wav, the DiT and BigVGAN that turn codec tokens into a waveform.
 
-- text input -> text output
-- image + text input -> text output
-- audio + text input -> text output
-- image + audio + text input -> text output
+The host does control, DMA, tokenization, media decode and preprocessing, the
+BF16 embedding gather, and the final compare of the eight per-engine argmax
+candidates.
 
-The Talker and token2wav stages that synthesize speech are intentionally out of
-scope. Their weights and working tensors do not fit concurrently with the
-Thinker, vision, and audio stages in the current hardware layout.
+- [What it does](#what-it-does)
+- [Supported hardware](#supported-hardware)
+- [Design](#design)
+- [Setup](#setup)
+- [Running](#running)
+- [Limits](#limits)
+- [Performance with the default prompts](#performance-with-the-default-prompts)
+- [Benchmark tiers](#benchmark-tiers)
+- [Known issues](#known-issues)
+- [Reports and further reading](#reports-and-further-reading)
 
-## Hardware target
+## What it does
 
-This model uses exactly eight Unified Engine cores. Its memory policy supports
-the 8 GiB Alveo U50 and the 8 or 16 GiB U55C configurations. Hardware topology,
-DRAM capacity, AXI width, and clock are read from HW_INFO; unsupported or
-overlapping maps fail before allocation. On a 12-engine image, engines 0–7 are
-used and engines 8–11 remain idle.
+| Input | Output | Flags |
+| :--- | :--- | :--- |
+| text | text | `--prompt "..."` (or none, for the default prompt) |
+| image + text | text | `--image [PATH]` (default `test_samples/yosemite.jpg`) |
+| audio + text | text | `--audio [PATH]` (default `test_samples/apex.wav`) |
+| image + audio + text | text | `--image --audio` |
+| any of the above | text **and speech** (24 kHz WAV) | add `--speak [Chelsie\|Ethan]` |
 
-Omni retains eight private 1 GiB windows from `tiled_window_bases()`. These
-windows also contain the shared weight/tensor pool, private scratch, a 32 MiB
-unused guard, and 64 MiB of ISA storage per engine. The complete private shard
-set and scratch require this capacity, so the smaller models' 512 MiB windows
-plus a separate 2 GiB model region cannot be substituted. U50 uses the measured
-whole-device switch-region layout; U55C uses its per-engine controller mapping.
-Forced DRAM-size overrides are rejected for this layout.
+- **Multi-camera input:** `--frames N` encodes N camera frames in one run.
+- **Image resolution:** `--vision-res medium` uses 896×896 images (1024 soft tokens) instead of the default 336×336 (144).
+- **Generation:** greedy, up to `--max-new-tokens` (default 128). It stops on `<|im_end|>`.
 
-Program artifacts include hardware identity, compiler hashes, and every
-engine's ISA address in their fingerprint. Offline regression tests verify that
-changing controller order invalidates a saved program. This controller audit
-does not constitute a new Omni hardware inference measurement.
+## Supported hardware
 
-Always pass `--multi-core 8`.
+The board is identified from its HW_INFO register: core count, DRAM size, AXI
+width and clock. The model always uses engines 0–7; on a 12-engine image,
+engines 8–11 stay idle. A board it has no memory map for is refused before
+anything is allocated.
 
-The runner detects the installed image and does not reprogram the FPGA. Builds
-`0xfe984d16`, `0x0305d87d`, and `0xb3ed9175` use their native four-phase
-in-program handshake. Build `0xe7ac2caf` is also supported through
-host-separated one-shot rendezvous. Both paths use the same FPGA kernels and
-numerical policy.
+| Board | Image (verified here) | Engines used | HBM | Engine clock | 8-engine peak |
+| :--- | :--- | :--- | ---: | ---: | ---: |
+| Alveo U50 | `0x25511139` | 8 of 8 | 8 GiB | 366.7 MHz | 375.5 GFLOPS |
+| Alveo U55C | `0x25511139` | 8 of 12 | 16 GiB | 290.0 MHz | 297.0 GFLOPS |
 
-## Input limits
+Both bitstreams need non-aligned DMA support. The runner never reprograms the
+FPGA.
 
-- Images use the fixed canonical 336 x 336-pixel geometry. Inputs are converted to RGB
-  and resized before the vision encoder runs.
-- Audio is processed in bounded 200-mel-frame chunks, with at most 600 mel
-  frames and 150 audio soft tokens per request. Longer processed input is
-  rejected.
-- The complete templated prompt, including image and audio soft tokens, must fit
-  the 2500-token prefill limit; generation is bounded by the 2500-token context.
+## Design
 
-Prefill retains the logical prompt length. Current images round execution to a
-64-row multiple, giving the 31-token sanity prompt eight rows on each engine;
-the legacy host-segmented image uses a conservative 512-row tile. The logical
-input remains limited to 2500 tokens. Padding embeddings use a finite nonzero
-sentinel, padding RoPE rows are finite, and padding key columns are masked, so
-the extra rows cannot affect live-token attention.
+**Stages.** Every stage runs on all eight engines:
 
-Vision, audio, and Thinker weights are phase-shared in DRAM. Each input encoder
-runs first, its soft-token output is retained, and the Thinker weights then reuse
-the same model-weight window for prefill and decode. The transformer towers and
-Thinker prefill use all eight engines. Decode's sharded projections and LM head,
-including the IF4 O column shards, also use engines 0-7. The optimized
-one-round GQA path assigns its four complete KV groups to engines 0-3; engines
-4-7 remain required handshake participants. Remaining serial layout/merge work
-and the final global argmax run on engine 0, still on the FPGA. Engines 8-11
-remain unused.
+| Stage | What it does | Weights |
+| :--- | :--- | :--- |
+| Vision encoder | ViT over 14×14 patches, 2×2 merge to soft tokens | IF4 |
+| Audio encoder | conv front end + transformer over 128-bin log-mel, 100 frames/s | IF4 |
+| Thinker prefill | 28-layer Qwen2 decoder over the whole prompt (text + soft tokens), tensor-parallel | IF4 Q/K/O/gate/up/down, BF16 V |
+| Thinker decode | one token per step; KV cache resident in each engine's window | IF4, column-sharded per engine |
+| Talker (`--speak`) | 24-layer decoder: Thinker hidden states → codec tokens | IF4 |
+| Token2Wav (`--speak`) | flow-matching DiT (22 blocks, 36 evaluations) + BigVGAN vocoder → 24 kHz audio | BF16 |
 
-All learned inference arithmetic runs on the U55: vision patch projection,
-audio conv1/conv2 and GELU, the vision/audio transformer towers, the Thinker,
-LM head, and final global argmax. The Python host also performs BF16 token
-embedding lookup and transfers the selected feature rows to FPGA tensor DRAM,
-alongside control/DMA, tokenization, file/media decode, resize/resample/log-mel
-preparation, masking, and layout transforms.
-The entrypoint hides CUDA/HIP/ROCm before importing PyTorch and fails closed if
-PyTorch reports another accelerator backend active or visible.
+**Sharding.**
+- **Projection weights:** every projection is split into 64-aligned column shards, one per engine, staged once and shared by prefill and decode.
+- **Attention:** decode splits it across KV groups.
+- **LM head:** column-sharded. Each engine's argmax register holds its shard's winner, and the host reads back just those eight values (16 bytes) to pick the token.
+- **Embeddings:** the 152064 × 3584 table stays BF16 in host RAM, and the host gathers rows and DMAs them in.
 
-The 152064 x 3584 embedding is distinct from the untied LM head and is stored
-as BF16 in `params.bin` (1039.5 MiB). The complete table is loaded into host
-RAM, not the eight private FPGA weight windows. The host gathers prompt rows
-and one row per generated token, then DMA-writes those BF16 feature vectors to
-LM tensor DRAM. The IF4 decode O shards still use about 22.8 MiB/core. The
-embedding lookup and DMA are excluded from FPGA hardware counters but included
-in prefill/decode CPU stage timers and the CPU TTFT; logits and argmax remain on
-the FPGA.
+**DRAM layouts** (`--layout`):
+- **`windowed` (default):** eight private 1 GiB windows, one per engine. Each window holds that engine's weight shards, a pool shared over time by the stage currently running, private scratch, a guard, and its program (ISA) space. The window bases come from the board:
+  - **U50:** one 1 GiB HBM switch region per engine.
+  - **U55C:** one whole memory controller per engine. On the 16 GiB image the windows alternate between the two HBM stacks (0, 9, 2, 11, 4, 13, 6, 15 GiB).
 
-The Thinker follows Qwen2.5-VL's mixed projection policy during prefill: V is
-BF16, while Q/K/O and GATE/UP/DOWN are IF4. Decode quantizes a separate V
-copy to IF4 and copies the existing IF4 O into eight private 448-column
-shards; prefill still reads its shared BF16 V and IF4 O images.
-MLP down uses the same private eight-way K-sharded IF4 weights in prefill and
-decode; decode sums the eight full-width partial outputs before its residual
-add, so it no longer stages a separate N-sharded down-weight copy. The legacy
-decode-only BF16 O region remains in `params.bin` for artifact compatibility
-but is not uploaded. Shared LM norms and biases stay resident after prefill.
-The host embedding lookup is a gather, not matrix arithmetic, and the remaining
-learned matrix operations remain within the 8-GiB FPGA map.
-The LM head remains 64-column aligned at
-152064 rows, while its 399 rows beyond the tokenizer's 151665 valid IDs receive
-a device-side minimum-BF16 bias and therefore cannot win the FPGA global argmax.
-Greedy generation stops only on Omni's declared `<|im_end|>` EOS (151645); its
-distinct
-`<|endoftext|>` padding ID (151643) is not treated as EOS.
+  Programs are recompiled each run. Token2Wav for `--speak` is built and uploaded at run time.
+- **`flat`:** one consecutive 8 GiB range in which every stage's weights and programs stay resident. It makes `--run_from_bin` possible (no compile on repeat runs), at the cost of the engines contending for the same memory (see [Known issues](#known-issues)). On the 16 GiB U55C the flat map still uses only the first 8 GiB.
 
-## Measured decode performance
+**Cached artifacts** (in `qwen2.5_omni_7b_bin/`, all regenerated automatically):
+- **`Qwen2.5-Omni-7B/`:** the Hugging Face checkpoint, pinned to revision `ae9e1690…` in `qwen2.5_omni_7b_config.json`.
+- **`params.bin` + `params.json`:** every learned tensor in its on-device format, with a validated manifest. The Talker and Token2Wav regions are appended on first `--speak`.
+- **`programs.bin` + `programs.json`:** the compiled eight-engine programs, fingerprinted against the hardware, compiler and params.
+- **`processor/`:** the tokenizer and media-processor metadata.
 
-On U55C build `0x0305d87d` at 300 MHz, an eight-engine text run at short context
-measures 10.04 tokens/s end to end and 10.26 tokens/s for the first FPGA decode
-step. A 115-step arithmetic response measures 9.85 tokens/s as the KV history
-grows. These rates include host control, DMA, FPGA argmax readback, and
-detokenization; learned inference arithmetic remains on the FPGA.
-
-## Performance reporting
-
-Every run writes a Markdown summary next to this script, named for the CLI
-config (`qwen2.5_omni_7b_test_xdma0_image_multi-core_8.md`). It is built only
-from metrics the stages already recorded plus host bookkeeping, so writing it
-launches no FPGA program and cannot perturb what it measures. Pass
-`--summary PATH` to redirect it or `--no-summary` to skip it.
-
-The summary reports, per stage (vision, audio, prefill, decode): work in
-GFLOP, HW-counter latency, achieved GFLOPS, percent of the run's peak
-(`freq_MHz x 128 FLOP/cycle x engines`), effective speedup against one
-engine's peak, and the CPU wall time around the same stage. The gap between
-the two clocks is host overhead. TTFT covers whichever encoders the request
-ran plus prefill.
-
-`benchmark.py` drives three fixed workload tiers on top of this script: `--low`
-(voice command), `--medium` (single camera), both real, continuous FPGA runs,
-and `--high` (multi-camera: four 896x896 camera frames, a 6-second spoken
-query, 6144 aggregate input tokens) -- a shape that cannot fit as one resident
-context in the current DRAM map. Rather than faking that context with a padded,
-zero-filled KV cache, `--high` is a derivation: it profiles Medium's real,
-hardware-measured per-op rates (vision per frame, audio per second, each
-prefill/decode phase's own ms-per-model-FLOP or ms-vs-context slope) and
-evaluates `qwen2.5_omni_7b_model_flops.py`'s own phase formulas at High's dims.
-It also profiles Low for real and predicts Low from the Medium calibration,
-so the method's error is measured before it is trusted for the shape that
-cannot be measured directly. See `benchmark.py`'s module docstring and
-`benchmark.md` for the numbers this produces.
-
-A second table reports **effective throughput against model FLOPs**: the work
-the architecture owes at its own dimensions -- true prompt length, true
-attention windows, matrix products only -- rather than the padded,
-tile-aligned, mask-widened shapes the engine actually issues and bills. Those
-counts come from `qwen2.5_omni_7b_model_flops.py`, derived entirely from the
-model config so they follow it rather than drifting from it. Dividing model
-FLOPs by the same measured FPGA time gives a rate comparable across
-implementations and accelerators, and the `Useful` column is the ratio of the
-two: how much of what the engine issued the model actually needed. A stage
-marked `!` billed fewer FLOPs than the architecture requires, which is
-impossible -- padding only adds work -- and means that stage's own accounting
-is undercounting.
-
-A multi-core scaling section converts each stage's speedup into an implied
-serial fraction by solving Amdahl's law for `s`. Because this model requires
-exactly eight engines, no single-engine baseline can be measured; the speedup
-is taken against one engine's *peak*, which makes it a lower bound and folds
-every other inefficiency into the serial estimate. `--profile` is what
-separates those.
-
-`--profile` compiles the vision encoder, prefill, and decoder with per-phase
-HALT checkpoints, then runs a profiled prefill and two profiled decode steps --
-one at the prompt's own context and one at `--profile-ctx` (default 2500) --
-and reports a per-phase table for each: calls, total ms, share of stage, GFLOP,
-GFLOPS, and percent of peak. Phases marked `*` run on engine 0 alone and are
-scored against one engine's peak. The share column is the one to act on: it
-says which phase is worth sharding next. A profile run replaces generation, and
-its summary is written to a separate `..._profile_...md` so it never overwrites
-a generation run's report. The audio encoder has no checkpoints, so it appears
-at stage level only.
+## Setup
 
 ```bash
-# Generation run + summary
-python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --image
+python3 -m venv ~/venv && ~/venv/bin/pip install -r requirements.txt   # repo root
+source ~/venv/bin/activate
+```
 
-# Per-phase breakdown instead of generation
+Nothing has to be copied by hand. Everything the run needs is downloaded or
+rebuilt on first use, at the pinned checkpoint revision:
+
+| Run | Downloads (once) | Builds (once) |
+| :--- | :--- | :--- |
+| any | Thinker shards 1–4 (~20 GB) + metadata | `params.bin` Thinker/vision/audio regions, `processor/` |
+| `--speak` | shard 5 (talker/token2wav, 2.4 GB) + `spk_dict.pt` | Talker region (flat layout: also Token2Wav region) |
+
+- **Stale caches are rebuilt automatically:** a `params.bin` from an older schema, another config or an interrupted write is rebuilt, and a stale `programs.bin` is discarded and recompiled.
+- **Speech files are only fetched for `--speak`:** runs without it never download shard 5 or `spk_dict.pt`.
+- **Converting separately:** to do the one-time conversion on its own, run `python models/qwen2.5_omni_7b/qwen2.5_omni_7b_weights.py`.
+
+## Running
+
+Run from the repository root. `--multi-core 8` is required.
+
+```bash
+# Default prompts (text / image / audio / image+audio)
+python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8
+python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --image
+python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --audio
+python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --image --audio
+
+# Your own prompt and media
+python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 \
+  --image /path/to/photo.jpg --prompt "Describe this image in detail."
+
+# Speech output (FPGA Talker + FPGA Token2Wav); writes a .wav next to the summary
+python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --speak
+
+# Per-phase FPGA profile instead of generation
 python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --image --profile
 
-# Fixed-shape tiers (see benchmark.py / benchmark.md)
-python models/qwen2.5_omni_7b/benchmark.py --multi-core 8 --low
-python models/qwen2.5_omni_7b/benchmark.py --multi-core 8 --medium
-python models/qwen2.5_omni_7b/benchmark.py --multi-core 8 --high
+# Benchmark tiers (see benchmark.md)
+python models/qwen2.5_omni_7b/benchmark.py --multi-core 8 --low      # or --medium / --high
+
+# Automated hardware checks (text, image, audio, image+audio)
+python model_auto_test.py --only qwen2.5_omni_7b qwen2.5_omni_7b_vlm \
+  qwen2.5_omni_7b_audio qwen2.5_omni_7b_joint --verbose
 ```
 
-## Build and run
+The default prompts are:
 
-Run commands from the repository root after activating the PyTorch environment
-created by the root README:
+| Input | Default prompt |
+| :--- | :--- |
+| text | "Explain why the sky is blue in one sentence." |
+| image | "Describe the picture in detail." |
+| audio | "Transcribe the speech exactly." |
+| image + audio | "First transcribe the audio. Then briefly describe the image." |
 
-```bash
-source ~/my_torch_env/bin/activate
-```
+Each run writes a Markdown summary next to the script, named after the CLI
+config, unless you pass `--summary PATH` or `--no-summary`. For each stage it
+reports work (issued and model GFLOP), HW-counter latency, throughput, percent
+of peak and CPU wall time, then TTFT, decode speed, and the speech stages for
+`--speak`. HW latency is wrap-corrected: the 32-bit counter wraps every 187 s
+at 366.7 MHz and every 237 s at 290 MHz.
 
-The first test invocation downloads the checkpoint shards used by the Thinker,
-vision encoder, and audio encoder, then performs a one-time conversion into the
-cached `qwen2.5_omni_7b_bin/params.bin` bundle. `params.json` records the model
-revision, configuration fingerprint, region bounds, and tensor manifest used to
-validate that bundle before inference. The converter also creates
-`qwen2.5_omni_7b_bin/processor/`, a minimal tokenizer/processor metadata bundle.
-After conversion, a normal inference run reads all learned tensors from the
-validated `params.bin` and loads preprocessing metadata locally from that
-minimal bundle; it does not need the safetensor shards or full checkpoint
-directory. To perform the one-time conversion separately, run:
+## Limits
 
-```bash
-python models/qwen2.5_omni_7b/qwen2.5_omni_7b_weights.py
-```
+| Limit | Value |
+| :--- | :--- |
+| Context (prompt + generation) | 8192 tokens (windowed); flat: largest that fits, 7680 with speech |
+| Context with FPGA `--speak` (windowed) | 6144 tokens |
+| Image | 336×336 → 144 soft tokens (default) or 896×896 → 1024 soft tokens; any input is resized |
+| Audio | at most 600 mel frames (6 s) → up to 150 soft tokens; stereo/any rate is mixed and resampled |
+| Speech output | capped at 300 codec tokens (6.00 s); longer replies are cut |
+| Speakers | Chelsie (default), Ethan |
+| Decoding | greedy only |
 
-The test entrypoint follows the default Gemma4 E2B program-image flow. On every
-normal invocation it freshly compiles the stable ISA for the requested encoder
-and Thinker stages against the live eight-engine topology, atomically stores the
-master and seven worker sections in the combined
-`qwen2.5_omni_7b_bin/programs.bin` plus `programs.json`, reopens and validates
-those on-disk bytes, and executes the reloaded sections. It does not execute the
-compiler's in-memory copy and does not currently expose a `--bin-reuse` mode.
-The address-coupled prefill and decoder groups are published together in one
-artifact generation. An inter-process file lock also rejects concurrent Omni
-runs before they can race the artifact files or the FPGA queues.
+## Performance with the default prompts
 
-Request-specific decode-dispatch and rendezvous/flag ISA remains
-runtime-generated because it contains token-, position-, address-, or
-request-state values. Embedding lookup is instead a host BF16 gather and DMA;
-it emits no FPGA lookup/dequantization ISA. Stable stage programs still execute
-from the validated program image.
+Every run below uses the default prompt and the default (windowed) layout. On
+each board the runs used the same code. All runs produced correct output:
+- **Text:** a correct one-sentence answer about Rayleigh scattering.
+- **Image:** a detailed Yosemite sunset description.
+- **Audio:** the exact transcription "unified engine apex compute custom ml inference accelerator".
 
-The deploy-time artifacts are therefore:
+Times are HW counters, and "% peak" is the run's issued throughput.
 
-- `params.bin` + `params.json` -- all learned Thinker, vision, audio, embedding,
-  and LM-head tensors plus their validated manifest
-- `programs.bin` + `programs.json` -- the freshly compiled, atomically packaged,
-  and reloaded eight-engine stable stage ISA
-- `processor/` -- the minimal local tokenizer and multimodal processor metadata
+| Run (prompt tokens) | Stage | U50 @ 366.7 MHz | U55C @ 290 MHz | Ratio |
+| :--- | :--- | ---: | ---: | ---: |
+| text (29) | prefill | 1159 ms (87.2%) | 1464 ms (87.2%) | 1.26 |
+| | decode, 39 tokens | 19.92 tok/s (75.2%) | 15.94 tok/s (76.1%) | 0.80× speed |
+| image (170) | vision, 144 soft tokens | 2937 ms (68.8%) | 3693 ms (69.2%) | 1.26 |
+| | prefill | 6597 ms (90.1%) | 8348 ms (90.1%) | 1.27 |
+| | TTFT | 9.53 s | 12.04 s | 1.26 |
+| | decode, 128 tokens | 18.61 tok/s (70.6%) | 14.87 tok/s (71.4%) | 0.80× speed |
+| audio (154) | audio, 128 soft tokens | 1186 ms (75.8%) | 1484 ms (76.7%) | 1.25 |
+| | prefill | 6004 ms (89.7%) | 7583 ms (89.8%) | 1.26 |
+| | TTFT | 7.19 s | 9.07 s | 1.26 |
+| | decode, 9 tokens | 19.08 tok/s (72.3%) | 15.27 tok/s (73.1%) | 0.80× speed |
+| image + audio (306) | vision / audio | 2938 / 1180 ms | 3692 / 1482 ms | 1.26 / 1.26 |
+| | prefill | 11870 ms (90.5%) | 15019 ms (90.5%) | 1.27 |
+| | TTFT | 15.99 s | 20.19 s | 1.26 |
+| | decode, 98 tokens | 17.14 tok/s (65.3%) | 14.27 tok/s (68.7%) | 0.83× speed |
 
-None of this changes or reloads the FPGA image. The runner requires the existing
-U55C 8-GiB image, uses exactly engines 0-7, and leaves any additional engines
-idle. The CPU performs the BF16 embedding gather in addition to the host duties
-listed above; the GPU is not used for inference.
+Both boards produced word-for-word identical output for every prompt.
 
-```bash
-# Text sanity check
-python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 \
-  --prompt "If x + 3 = 5, what is x?"
+Every stage scales with the engine clock (366.7 / 290 = 1.26×) and runs at
+the same fraction of peak on both boards. The vision, audio and prefill stages
+are 1.25–1.27× slower on the U55C, and short-context decode runs at 0.80–0.83×
+the speed. At long context decode loses less than the clock, because more of
+each step is memory time: Medium tier decode is 0.93× (below).
 
-# Image caption; bare --image uses test_samples/yosemite.jpg
-python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 --image
+**Speech** (`--speak`, text prompt, 300 codec tokens = 6.00 s of audio, speaker
+Chelsie). On the U50 this comes from the earlier `0xbaa4c63b` reports at the
+same 366.7 MHz clock; the current U50 image hangs in Token2Wav (see
+[Known issues](#known-issues)).
 
-# Custom image
-python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 \
-  --image /path/to/image.jpg --prompt "Describe this image in detail."
+| Stage | U50 @ 366.7 MHz | U55C @ 290 MHz | Ratio |
+| :--- | ---: | ---: | ---: |
+| Talker (prefix + decode) | 8.79 s, 39.0 codec tok/s, 29.3% peak | 11.00 s, 31.0 codec tok/s, 29.4% peak | 1.25 |
+| Token2Wav DiT (36 evaluations) | 62.05 s, 69.0% peak | 78.31 s, 69.1% peak | 1.26 |
+| Token2Wav BigVGAN | 8.91 s, 33.9% peak | 10.99 s, 34.7% peak | 1.23 |
+| **Speech total** | **79.75 s (0.075× real time)** | **100.30 s (0.06× real time)** | **1.26** |
 
-# Audio transcription
-python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 \
-  --audio test_samples/apex.wav --prompt "Transcribe the speech exactly."
+Speech is not real time: 6 s of audio takes 80–100 s of device time, most of
+it in the DiT. The Talker alone decodes at 0.6–0.8× of the 50 codec-tokens/s
+real-time rate.
 
-# Joint audio and image understanding (audio is placed first; the combined
-# request fits the 2500-token prefill budget)
-python models/qwen2.5_omni_7b/qwen2.5_omni_7b_test.py --multi-core 8 \
-  --image --audio test_samples/apex.wav
-```
+## Benchmark tiers
 
-The shipped audio fixture is stereo 48 kHz PCM. The preprocessing path mixes it
-to mono and resamples it to the model's expected rate, so the default audio test
-also covers those conversions.
+`benchmark.py` runs three fixed workloads end to end. The U50 numbers come from
+[`benchmark.md`](benchmark.md); the U55C numbers were measured on aztec.
 
-## Automated hardware checks
+| Tier | Input | LM prefill rows |
+| :--- | :--- | ---: |
+| Low (voice command) | 2.55 s audio | 849 |
+| Medium (single camera) | 1 × 896×896 image + 5.10 s audio | 2047 |
+| High (multi-camera) | 4 × 896×896 images + 6.00 s audio | 6144 |
 
-The root model harness registers text, image, audio, and joint image+audio cases.
-Each case runs on eight engines after random data has been written across the
-full 8 GiB reported by HW_INFO.
+| Tier | Stage | U50 @ 366.7 MHz ([`benchmark.md`](benchmark.md)) | U55C @ 290 MHz | Ratio |
+| :--- | :--- | ---: | ---: | ---: |
+| Low | audio / prefill | 0.61 / 33.48 s | 0.77 / 42.27 s (90.8%) | 1.26 / 1.26 |
+| | TTFT | 34.09 s | 43.04 s | 1.26 |
+| | decode | 14.90 tok/s | 12.22 tok/s | 0.82× speed |
+| Medium | vision / audio / prefill | 22.27 / 1.18 / 84.51 s | 27.46 / 1.48 / 106.22 s (90.1%) | 1.23 / 1.26 / 1.26 |
+| | TTFT | 107.96 s | 135.16 s | 1.25 |
+| | decode | 9.75 tok/s | 9.02 tok/s | 0.93× speed |
+| High | vision / audio | 90.15 / 1.45 s | 109.88 / 1.76 s | 1.22 / 1.22 |
+| | prefill | 339.06 s *(extrapolated)* | **369.26 s (87.1%)** | — |
+| | TTFT | 430.65 s *(extrapolated)* | **480.90 s** | — |
+| | decode (6144-token context) | 7.05 tok/s *(extrapolated)* | **4.89 tok/s** | — |
 
-```bash
-# All four Qwen2.5-Omni cases
-python model_auto_test.py --only \
-  qwen2.5_omni_7b qwen2.5_omni_7b_vlm qwen2.5_omni_7b_audio \
-  qwen2.5_omni_7b_joint --verbose
+- **Low and Medium** scale with the clock, like the default prompts.
+- **High** has only been measured on the U55C. The U50 High row is extrapolated, because the current U50 image hangs on that load (see [Known issues](#known-issues)), so the two can't be compared yet. It ran with correct output: the transcription, after which the model ended its reply (19 tokens).
 
-# Through Make (also clears compiled program bins first)
-make model_test qwen2.5_omni_7b qwen2.5_omni_7b_vlm \
-  qwen2.5_omni_7b_audio qwen2.5_omni_7b_joint verbose
-```
+## Known issues
 
-The image check requires a coherent Yosemite description with scene keywords.
-The audio check reads structured `TEST_RESULT` output and looks for multiple
-concepts from the known `apex.wav` speech rather than requiring one exact
-transcription.
+- **U50 image `0x25511139` hangs under long, heavy loads:** Token2Wav (`--speak`), and the Medium/High tiers. It runs the engine at 366.67 MHz, where the U50 build misses timing badly (about 200k failing endpoints). A local build of the same RTL at 333.33 MHz passed the 36-evaluation Token2Wav test that this image fails. Until the U50 image is rebuilt at 333.33 MHz, run speech and the large tiers on the U55C. The U50's High tier in `benchmark.md` is extrapolated for this reason.
+- **The flat layout is slower on the U55C:** with every stage resident, the engines contend for the same memory controllers. Thinker decode drops from 75% to 43% of peak, and the Talker from 29% to 23%, against the windowed layout. Use `--layout flat` only when you need `--run_from_bin`.
+- **Thermal headroom:** on p2's U50 the die reaches 100 °C after about 5 minutes of full load, which is the limit for the High tier there. The U55C on aztec stays below 75 °C.
+
+## Reports and further reading
+
+- [`benchmark.md`](benchmark.md): the U50 tier benchmark (TTFT, stage throughput, decode, speech).
+- [`vision_pad_removal.md`](vision_pad_removal.md): the vision padding removal, which needs non-aligned DMA.
+- `benchmark.py`: the module docstring explains the tier shapes and the `--standalone` cross-check.
+- `qwen2.5_omni_7b_layout.py`: both DRAM maps, with the per-board reasoning.
+- `multi_engine_shard.py` (repo root): `tiled_window_bases()`, the board-specific HBM window maps.
