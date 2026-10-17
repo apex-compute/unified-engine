@@ -4,17 +4,15 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-import struct
 import sys
 import threading
 
-import torch
 
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from user_dma_core import UnifiedEngine
+from user_dma_core import UnifiedEngine, dma_copy_into, dma_payload
 
 
 class StreamingEngine(UnifiedEngine):
@@ -41,36 +39,12 @@ class StreamingEngine(UnifiedEngine):
     @staticmethod
     def _write_bytes(buffer, size):
         """Match the shared engine's tensor, integer and byte conversions."""
-        if isinstance(buffer, torch.Tensor):
-            tensor_bytes = buffer.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
-            return memoryview(tensor_bytes.numpy()).cast("B")[:size]
-        if isinstance(buffer, int):
-            if size == 4:
-                return struct.pack("I", buffer & 0xFFFFFFFF)
-            if size == 2:
-                return struct.pack("H", buffer & 0xFFFF)
-            return buffer.to_bytes(size, byteorder="little", signed=False)
-        if isinstance(buffer, (bytes, bytearray)):
-            return memoryview(buffer)[:size]
-        return bytes(buffer)[:size]
+        return dma_payload(buffer, size)
 
     @staticmethod
     def _copy_read_bytes(buffer, data_bytes, size):
         """Preserve byte-exact copies, short reads and noncontiguous tensors."""
-        if isinstance(buffer, torch.Tensor):
-            if buffer.device.type == "cpu" and buffer.is_contiguous():
-                target = memoryview(buffer.detach().view(torch.uint8).numpy()).cast("B")
-                take = min(len(data_bytes), len(target), size)
-                target[:take] = data_bytes[:take]
-            else:
-                staged = buffer.detach().cpu().contiguous()
-                target = memoryview(staged.view(torch.uint8).numpy()).cast("B")
-                take = min(len(data_bytes), len(target), size)
-                target[:take] = data_bytes[:take]
-                with torch.no_grad():
-                    buffer.copy_(staged.to(buffer.device))
-        elif hasattr(buffer, "__setitem__"):
-            buffer[:len(data_bytes)] = data_bytes
+        dma_copy_into(buffer, data_bytes, size)
 
     def _get_dma_fd(self, key):
         fd = self._dma_fds.get(key)

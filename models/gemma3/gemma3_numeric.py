@@ -61,9 +61,8 @@ def _dequantize_int4_from_bin(
     # Scale: (N, K/64) bf16
     scale_bytes = weight_bin[scale_off : scale_off + scale_sz]
     scale_elems = len(scale_bytes) // 2
-    scale = torch.frombuffer(
-        bytearray(scale_bytes), dtype=torch.bfloat16
-    ).clone().reshape(N, num_blocks_k)
+    scale = user_dma_core.tensor_from_le_bytes(
+        scale_bytes, torch.bfloat16).reshape(N, num_blocks_k)
 
     # Data: packed (N, K/2) bytes, low nibble = even idx, high = odd
     data_bytes = weight_bin[data_off : data_off + data_sz]
@@ -186,7 +185,7 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
             ttype = blk0[i].get("type", "")
             if ttype == "bf16":
                 raw = self.weight_bin[off : off + sz]
-                t = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16).clone()
+                t = user_dma_core.tensor_from_le_bytes(raw, torch.bfloat16)
                 weights[key] = t
                 i += 1
             elif ttype == "bf16_scale" and i + 1 < len(blk0) and "DATA" in blk0[i + 1]["key"]:
@@ -250,7 +249,7 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
             off = self.weight_defs[off_key]
             sz = self.weight_defs[sz_key]
             raw = self.weight_bin[off : off + sz]
-            rope = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16).clone().reshape(rope_shape)
+            rope = user_dma_core.tensor_from_le_bytes(raw, torch.bfloat16).reshape(rope_shape)
             # cos = [cos0, cos1], sin_block = [-sin0, sin1] (as stored)
             rope_tensors[f"cos_{name}"] = rope[:, : self.head_dim].clone()
             rope_tensors[f"sin_block_{name}"] = rope[:, self.head_dim : 2 * self.head_dim].clone()
@@ -409,7 +408,7 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
         # OUTPUT_NORM_WEIGHT: gamma (vector_length,)
         off = wd["OUTPUT_NORM_WEIGHT"]
         sz = wd["OUTPUT_NORM_WEIGHT_SIZE"]
-        gamma = torch.frombuffer(bytearray(self.weight_bin[off : off + sz]), dtype=torch.bfloat16).clone()
+        gamma = user_dma_core.tensor_from_le_bytes(self.weight_bin[off : off + sz], torch.bfloat16)
         # LM_HEAD: (EMBEDDING_ELEMENTS, vector_length), int4 dequant
         scale_off = wd["LM_HEAD_WEIGHT_SCALE"]
         scale_sz = wd["LM_HEAD_WEIGHT_SCALE_SIZE"]
@@ -448,7 +447,7 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
             off = self.weight_defs[off_key]
             sz = self.weight_defs[sz_key]
             raw = self.weight_bin[off : off + sz]
-            rope = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16).clone().reshape(rope_shape)
+            rope = user_dma_core.tensor_from_le_bytes(raw, torch.bfloat16).reshape(rope_shape)
             rope_tensors[f"cos_{name}"] = rope[:, : self.head_dim].clone()
             rope_tensors[f"sin_block_{name}"] = rope[:, self.head_dim : 2 * self.head_dim].clone()
 

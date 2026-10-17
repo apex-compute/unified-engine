@@ -226,9 +226,7 @@ def select_single_bin_profile(payload: dict, resolution=None) -> tuple[str, dict
 
 
 def _tensor_sha256(value: torch.Tensor) -> str:
-    value = value.detach().cpu().contiguous()
-    raw = (value.view(torch.uint16).numpy().tobytes()
-           if value.dtype == torch.bfloat16 else value.numpy().tobytes())
+    raw = user_dma_core.tensor_le_bytes(value)
     return hashlib.sha256(raw).hexdigest()
 
 

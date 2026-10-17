@@ -69,11 +69,7 @@ def _align_up(value: int, alignment: int) -> int:
 
 
 def _tensor_bytes(value: torch.Tensor, size: int | None = None) -> bytes:
-    value = value.detach().cpu().contiguous()
-    if value.dtype == torch.bfloat16:
-        raw = value.view(torch.uint16).numpy().tobytes()
-    else:
-        raw = value.numpy().tobytes()
+    raw = user_dma_core.tensor_le_bytes(value)
     return raw if size is None else raw[:int(size)]
 
 
