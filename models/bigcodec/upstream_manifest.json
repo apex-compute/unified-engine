@@ -1,0 +1,67 @@
+{
+  "code": {
+    "repository": "https://github.com/Aria-K-Alethia/BigCodec",
+    "revision": "09845ab1f5bc7a3d1589c16de820ef15bc2afefe",
+    "license": "MIT",
+    "source_directory": "vq",
+    "vendored_directory": "bigcodec_vq",
+    "upstream_sha256": {
+      "__init__.py": "f3008a83bbbb66ad6c5e88387397b6e7a7a3fdc92660006072385b9e8398a83c",
+      "activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+      "alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+      "alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac",
+      "alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+      "alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+      "codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+      "codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+      "factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+      "module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+      "residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656"
+    },
+    "vendored_sha256": {
+      "__init__.py": "570a82b8f78144e159a494f2e72a72d9aeb65b684b22fd9fa44d88524731ef45",
+      "activations.py": "3ba94028aebabfc994bcd746bf9cbe92ecace528434c922c480be6ada182cad6",
+      "alias_free_torch/__init__.py": "a520b10a7e52fa817b46af9cb0b8d1cf7672d3016e3632b7296cc06c11b76da0",
+      "alias_free_torch/act.py": "fb2c0ccfda50344e82227e53cab40ea6c157e9a7c33c0d8191245ba0e3807dac",
+      "alias_free_torch/filter.py": "41890f2dc9ad822e679f17db34eb7beb7c0f5f2a3b01229c2d55393cd0538991",
+      "alias_free_torch/resample.py": "f9d28fb23311ecfac2b9fc7f3e16be0e6b5e8cc33f60c2e40b435f1078edcfe0",
+      "codec_decoder.py": "0791afd99f5e8ad6c3f1801c3e4dc05f66ec7def4b2671a46647675b258406dd",
+      "codec_encoder.py": "ebc5b34e5e7dc45927246d559a05ea357f57aca19fe7fde89cb2c95f66bb4e83",
+      "factorized_vector_quantize.py": "1dee6ccbc635ccec1f94b97280c1ed27a92c4ca18ee6fc8035e6a165d2222b1d",
+      "module.py": "28012d66721f932a57f1c723b3bc51358f11d14e0cdbc3d1363804467a4557bf",
+      "residual_vq.py": "2359e5b4ad069f98b09824cd56ab4d8cfb75695dacc65c9d8ea68c0f19560656"
+    },
+    "modifications": {
+      "__init__.py": "Replace two absolute vq imports with relative imports."
+    }
+  },
+  "checkpoint": {
+    "repository": "https://huggingface.co/Alethia/BigCodec",
+    "revision": "c6548832eda95a09dcc3485d9b8ef097ce15f387",
+    "file": "bigcodec.pt",
+    "bytes": 637937326,
+    "sha256": "1fba3806e87cc01c1a65bea22fa1becefbbf46881e4219593c4d9f3cf56206b9",
+    "license": "CC-BY-SA-4.0",
+    "url": "https://huggingface.co/Alethia/BigCodec/resolve/c6548832eda95a09dcc3485d9b8ef097ce15f387/bigcodec.pt"
+  },
+  "third_party_licenses": [
+    {
+      "repository": "https://github.com/junjun3518/alias-free-torch",
+      "revision": "390ccc265a4087b78cf1ee9098d48721d848fdc5",
+      "file": "alias-free-torch-Apache-2.0.txt",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "repository": "https://github.com/EdwardDixon/snake",
+      "revision": "90343ed9458364dc3e622fc37be49d35afc26a6b",
+      "file": "Snake-MIT.txt",
+      "sha256": "9901fe7833ce27a6754368e4b2be5dc1ecc887e5ab5b3afc296e9ddb3c779188"
+    },
+    {
+      "repository": "https://github.com/adefossez/julius",
+      "revision": "2ff87901b0841a533053a5c34d0fa43486764086",
+      "file": "julius-MIT.txt",
+      "sha256": "60f83da40026e37e259b69158852384ff2ee20615d9103a3f86b6cff48784661"
+    }
+  ]
+}

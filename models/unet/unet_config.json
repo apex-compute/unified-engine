@@ -1,0 +1,11 @@
+{
+  "model": {"name": "unet_carvana", "n_channels": 3, "n_classes": 2, "bilinear": false},
+  "source": {
+    "repository_url": "https://github.com/milesial/Pytorch-UNet",
+    "weights_url": "https://github.com/milesial/Pytorch-UNet/releases/download/v3.0/unet_carvana_scale0.5_epoch2.pth",
+    "weights_sha256": "0e3683e13f41beb59f3d547a8b600baad7c5bf332f00f405a088a6f43ce1a54a"
+  },
+  "default_resolution": "256x256",
+  "execution": "whole-graph-single-bin",
+  "precision": "IF8-INT/BF16"
+}

@@ -1,0 +1,22 @@
+{
+  "model": "dpdfnet2_8khz",
+  "profile": "dpdfnet2_8khz",
+  "source_repository": "https://github.com/ceva-ip/DPDFNet",
+  "onnx_url": "https://huggingface.co/Ceva-IP/DPDFNet/resolve/main/onnx/dpdfnet2_8khz.onnx",
+  "onnx_sha256": "6218f1dbd6e4bac5768c63b7d899fe7b84b3788f2a35c4e246d4ab0946165c5d",
+  "sample_rate": 8000,
+  "n_fft": 160,
+  "window_length": 160,
+  "hop_length": 80,
+  "frequency_bins": 81,
+  "state_size": 37860,
+  "graph_operations": 492,
+  "onnx_inputs": {
+    "spec": [1, 1, 81, 2],
+    "state_in": [37860]
+  },
+  "onnx_outputs": {
+    "spec_e": [1, 1, 81, 2],
+    "state_out": [37860]
+  }
+}
