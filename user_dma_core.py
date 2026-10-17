@@ -21,7 +21,6 @@ Usage:
 
 from re import U
 import struct
-import errno
 import os
 import sys
 import fcntl
@@ -286,18 +285,6 @@ def ue_assert_stride_fields_fit(stride_bytes_per_chunk: int, stride_jump_bytes: 
         + (f"; {hint}" if hint else "")
     )
 
-
-# LARGEST SINGLE os.write()/os.read() ON AN XDMA CHAR DEVICE. For one call the
-# driver pins every page of the user buffer and builds one scatter-gather table
-# for all of it. On a host that has run an hour of large transfers that
-# allocation fails with ENOMEM for a 1.8 GB weight load, while a 157 MB write
-# moments later succeeds -- it is the size of the single mapping, not the host
-# being out of memory. 64 MiB is well inside what has been seen to work and
-# costs nothing measurable: transfers are bandwidth-bound, not syscall-bound.
-# UE_DMA_MAX_CHUNK_MB overrides it.
-DMA_MAX_CHUNK_BYTES = int(os.environ.get("UE_DMA_MAX_CHUNK_MB", "64")) * 1024 * 1024
-if DMA_MAX_CHUNK_BYTES <= 0:
-    raise ValueError("UE_DMA_MAX_CHUNK_MB must be a positive number of MiB")
 
 # DMA device paths (can be overridden by command-line argument)
 DMA_DEVICE_H2C = "/dev/xdma0_h2c_0"
@@ -1552,7 +1539,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x42029f30, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x42029f30. Please update FPGA with update_42029f30.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
+        assert hw_version == 0x0eca3ad8, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x0eca3ad8. Please update FPGA with update_0eca3ad8.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
         if getattr(self, "conv_geometry_mode", CONV_GEOMETRY_LIVE_CSR) == CONV_GEOMETRY_QUEUE_CONFIG:
             # Convolution images have independent build stamps from the legacy
             # release. Explicit queue-CONFIG selection opts into that contract;
@@ -1764,12 +1751,7 @@ class UnifiedEngine:
             size: Size in bytes to write
 
         Returns:
-            Number of bytes written, or -1 if the device cannot be opened.
-
-        Raises:
-            OSError: the transfer itself failed or came up short. This is not
-                reported as -1: a caller that ignores the return value would
-                then run against DRAM that was never written.
+            Number of bytes written, or -1 on error
         """
         try:
             data_bytes = dma_payload(buffer, size)
@@ -1795,48 +1777,19 @@ class UnifiedEngine:
                 return -1
 
             try:
-                # CHUNKED, AND A FAILED OR SHORT WRITE RAISES.
-                #
-                # This used to be one os.write() of the whole buffer. A 1.8 GB
-                # qwen3_4b weight load then failed with ENOMEM (see
-                # DMA_MAX_CHUNK_BYTES); the error was printed and returned as
-                # -1, the loader ignored it, the model ran on the random
-                # poison model_auto_test had just written to DRAM, and CI
-                # reported "did not find 'x = 2'" 48 minutes later (andromeda
-                # run 39031696086). Chunks keep each mapping small, and
-                # stopping here is better than plausible but wrong results.
-                view = memoryview(data_bytes)
-                total = len(view)
-                done = 0
-                while done < total:
-                    piece = view[done:done + DMA_MAX_CHUNK_BYTES]
-                    # SEEK BEFORE EVERY CHUNK. The XDMA char device takes the
-                    # card address from the file position and does NOT advance
-                    # it by the bytes written, so relying on the implicit
-                    # advance writes every chunk back over the first one.
-                    os.lseek(fd, address + done, os.SEEK_SET)
-                    try:
-                        n = os.write(fd, piece)
-                    except OSError as e:
-                        raise OSError(
-                            e.errno,
-                            f"dma_write to {device} failed after {done} of {total} "
-                            f"bytes, at DRAM 0x{address + done:X} (chunk {len(piece)} B): "
-                            f"{e.strerror}. DRAM is partially written") from e
-                    if n <= 0:
-                        raise OSError(
-                            errno.EIO,
-                            f"dma_write to {device} wrote 0 bytes at DRAM "
-                            f"0x{address + done:X} with {total - done} of {total} "
-                            f"bytes left")
-                    done += n
-                return done
+                # Seek to address
+                os.lseek(fd, address, os.SEEK_SET)
+
+                # Write data
+                bytes_written = os.write(fd, data_bytes)
+
+                return bytes_written
             finally:
                 os.close(fd)
 
         except Exception as e:
             print(f"dma_write error: {e}")
-            raise
+            return -1
 
     def dma_read(self, device: str, address: int, buffer, size: int) -> int:
         """
@@ -1849,11 +1802,7 @@ class UnifiedEngine:
             size: Size in bytes to read
 
         Returns:
-            Number of bytes read, or -1 if the device cannot be opened.
-
-        Raises:
-            OSError: the transfer itself failed or came up short, for the same
-                reason as dma_write.
+            Number of bytes read, or -1 on error
         """
         try:
             # Open device file
@@ -1877,40 +1826,25 @@ class UnifiedEngine:
                 return -1
 
             try:
-                # Chunked with a seek per chunk, like dma_write: one huge read
-                # pins one huge mapping, and the file position is not advanced.
-                data_bytes = bytearray(size)
-                view = memoryview(data_bytes)
-                done = 0
-                while done < size:
-                    want = min(DMA_MAX_CHUNK_BYTES, size - done)
-                    os.lseek(fd, address + done, os.SEEK_SET)
-                    try:
-                        chunk = os.read(fd, want)
-                    except OSError as e:
-                        raise OSError(
-                            e.errno,
-                            f"dma_read from {device} failed after {done} of {size} "
-                            f"bytes, at DRAM 0x{address + done:X} (chunk {want} B): "
-                            f"{e.strerror}") from e
-                    if not chunk:
-                        raise OSError(
-                            errno.EIO,
-                            f"dma_read from {device} read 0 bytes at DRAM "
-                            f"0x{address + done:X} with {size - done} of {size} "
-                            f"bytes left")
-                    view[done:done + len(chunk)] = chunk
-                    done += len(chunk)
+                # Seek to address
+                os.lseek(fd, address, os.SEEK_SET)
+
+                # Read raw bytes from device
+                data_bytes = os.read(fd, size)
+
+                if len(data_bytes) == 0:
+                    print(f"read failed: no data read")
+                    return -1
 
                 dma_copy_into(buffer, data_bytes, size)
 
-                return done
+                return len(data_bytes)
             finally:
                 os.close(fd)
 
         except Exception as e:
             print(f"dma_read error: {e}")
-            raise
+            return -1
 
     def ue_op_descriptor(
         self,
