@@ -224,7 +224,7 @@ class ACT_UnifiedEngine(UnifiedEngine):
     def _read_bf16(self, addr: int, numel: int) -> torch.Tensor:
         buf = bytearray(numel * _BPE)
         self.dma_read(DMA_DEVICE_C2H, addr, buf, numel * _BPE)
-        return torch.frombuffer(bytes(buf), dtype=torch.bfloat16).float()
+        return user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).float()
 
     def write_captured_instructions_to_dram(self, start_addr: int = DRAM_INSTRUCTION_ADDR) -> int:
         """Chunked override (large instruction streams segfault the single-shot DMA)."""

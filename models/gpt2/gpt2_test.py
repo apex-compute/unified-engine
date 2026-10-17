@@ -81,7 +81,7 @@ def _parse_offset(val) -> int:
 
 def _bf16_bytes(tensor: torch.Tensor) -> bytes:
     """Convert a tensor to bf16 raw bytes."""
-    return tensor.detach().cpu().to(torch.bfloat16).contiguous().view(torch.uint8).numpy().tobytes()
+    return user_dma_core.tensor_le_bytes(tensor.detach().cpu().to(torch.bfloat16))
 
 
 def weight_bin_generate(script_dir: str | None = None, output_path: str | None = None) -> str:
@@ -137,7 +137,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
         embed[:actual_vocab] = embed_raw
     else:
         embed = embed_raw
-    raw_emb = embed.contiguous().view(torch.uint8).numpy().tobytes()
+    raw_emb = user_dma_core.tensor_le_bytes(embed)
     write_at(token_embd_offset, raw_emb)
 
     # Layers
@@ -185,18 +185,18 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
     # Positional embeddings (replaces RoPE table generation)
     pos_embed = model.transformer.wpe.weight.detach().cpu().to(torch.bfloat16)  # (1024, 768)
     sz = weight_defs["POS_EMBED_SIZE"]
-    raw = (pos_embed.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(pos_embed) + b"\x00" * sz)[:sz]
     write_at(weight_defs["POS_EMBED"], raw)
 
     # OUTPUT LayerNorm: weight and bias
     ln_f_w = model.transformer.ln_f.weight.detach().cpu().to(torch.bfloat16)
     sz = weight_defs["OUTPUT_LN_WEIGHT_SIZE"]
-    raw = (ln_f_w.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(ln_f_w) + b"\x00" * sz)[:sz]
     write_at(weight_defs["OUTPUT_LN_WEIGHT"], raw)
 
     ln_f_b = model.transformer.ln_f.bias.detach().cpu().to(torch.bfloat16)
     sz = weight_defs["OUTPUT_LN_BIAS_SIZE"]
-    raw = (ln_f_b.contiguous().view(torch.uint8).numpy().tobytes() + b"\x00" * sz)[:sz]
+    raw = (user_dma_core.tensor_le_bytes(ln_f_b) + b"\x00" * sz)[:sz]
     write_at(weight_defs["OUTPUT_LN_BIAS"], raw)
 
     # LM_HEAD: GPT-2 ties lm_head weight to input embedding (use padded embedding).

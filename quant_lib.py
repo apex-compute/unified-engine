@@ -203,13 +203,13 @@ def _unpack_nibbles(data_bytes: bytes, N: int, K: int) -> np.ndarray:
 
 
 def _scale_bytes(scale_bf16: torch.Tensor) -> bytes:
-    return scale_bf16.contiguous().view(torch.uint8).numpy().tobytes()
+    """Little-endian bf16 scale bytes, as the engine reads them from DRAM."""
+    return scale_bf16.contiguous().view(torch.int16).numpy().astype('<i2').tobytes()
 
 
 def _read_scale(scale_bytes: bytes, N: int, num_blocks_k: int) -> torch.Tensor:
-    return torch.frombuffer(
-        bytearray(scale_bytes), dtype=torch.bfloat16
-    ).clone().reshape(N, num_blocks_k)
+    bits = np.frombuffer(scale_bytes, dtype='<i2').astype(np.int16)
+    return torch.from_numpy(bits).view(torch.bfloat16).reshape(N, num_blocks_k)
 
 
 def _expand_abs_scale(scale: torch.Tensor, block_size: int) -> torch.Tensor:
@@ -924,7 +924,7 @@ def quantize_bf16_to_int4_packed(weight_bf16: torch.Tensor,
     high = w_nibbles[:, :, 1::2].reshape(N_w, -1)
     packed = (high << 4) | low
     data_bytes = packed.astype(np.uint8).tobytes()
-    scale_bytes = scale_bf16.contiguous().view(torch.uint8).numpy().tobytes()
+    scale_bytes = _scale_bytes(scale_bf16)
     return data_bytes, scale_bytes
 
 
@@ -944,7 +944,7 @@ def quantize_q4_64(tensor: torch.Tensor) -> tuple[np.ndarray, int]:
     quantized = np.clip(np.round(blocks / scales[:, None]), -8, 7).astype(np.int8)
     pairs = (quantized.astype(np.uint8) & 0x0F).reshape(n_blocks, 32, 2)
     packed = pairs[:, :, 0] | (pairs[:, :, 1] << 4)
-    scale_bytes = torch.tensor(-scales, dtype=torch.float32).to(torch.bfloat16).view(torch.uint16).numpy()
+    scale_bytes = torch.tensor(-scales, dtype=torch.float32).to(torch.bfloat16).view(torch.int16).numpy().astype('<i2')
     return np.frombuffer(scale_bytes.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
 
 
@@ -967,7 +967,7 @@ def quantize_fp4_64(tensor: torch.Tensor,
     if len(codes_np) % 2 != 0:
         codes_np = np.pad(codes_np, (0, 1))
     packed = (codes_np[0::2] & 0x0F) | ((codes_np[1::2] & 0x0F) << 4)
-    scales_np = scales.view(torch.uint16).numpy()
+    scales_np = scales.view(torch.int16).numpy().astype('<i2')
     return np.frombuffer(scales_np.tobytes() + packed.tobytes(), dtype=np.uint8), n_blocks
 
 

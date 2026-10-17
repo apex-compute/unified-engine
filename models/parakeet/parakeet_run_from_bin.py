@@ -522,7 +522,8 @@ def main():
         def _read_extra(name):
             e = _extras[name]
             _pb.seek(e["offset"])
-            return np.frombuffer(_pb.read(e["size"]), dtype=np.dtype(e["dtype"])).reshape(e["shape"]).copy()
+            le = np.dtype(e["dtype"]).newbyteorder("<")  # bins are little-endian
+            return np.frombuffer(_pb.read(e["size"]), dtype=le).reshape(e["shape"]).astype(e["dtype"])
         fb = torch.from_numpy(_read_extra("mel_fb"))
         window = torch.from_numpy(_read_extra("mel_window"))
     stft = torch.stft(waveform.float(), pre["n_fft"], pre["hop_length"], pre["win_length"],

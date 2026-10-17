@@ -343,7 +343,7 @@ async def ws_audio(ws: WebSocket):
             n = len(data) // 4
             if n == 0:
                 continue
-            arr = np.frombuffer(data[:n * 4], dtype=np.float32).copy()
+            arr = np.frombuffer(data[:n * 4], dtype="<f4").astype(np.float32)  # browser Float32Array is LE
             with audio_lock:
                 audio_buffer.append(arr)
                 audio_total_samples += len(arr)

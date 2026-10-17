@@ -320,8 +320,8 @@ class Qwen25OmniLMMixin:
                 raw = f.read(s["size"])
                 if len(raw) != s["size"]:
                     raise RuntimeError("truncated host embedding table")
-                self.embedding_weight = torch.frombuffer(
-                    bytearray(raw), dtype=torch.bfloat16
+                self.embedding_weight = user_dma_core.tensor_from_le_bytes(
+                    raw, torch.bfloat16
                 ).reshape(d["VOCAB"], d["H"])
                 self._embedding_artifact = None
                 embedding_desc = f"{len(raw) / 2**20:.1f} MiB kept on host"

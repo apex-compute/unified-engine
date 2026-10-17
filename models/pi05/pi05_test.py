@@ -5225,7 +5225,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         H, N = self.AE_HIDDEN, self.AE_NUM_DENOISE_STEPS
         buf = bytearray(N * H * 2)
         self._dma_read_checked(self.AE_COND_TABLE_DRAM, buf, len(buf))
-        got = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(N, H).float()
+        got = user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(N, H).float()
         ref = self._ae_host_cond_table()
 
         def _snr(a, b):
@@ -5977,7 +5977,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
             buf = bytearray(S * HO * 2)
             self._dma_read_checked(self.VIS_HEAD_OUT_DRAM, buf, len(buf))
-            out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S, HO).clone()
+            out = user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(S, HO).clone()
             outs.append(out)
             print(f"  [vision] slot {i} done")
 
@@ -6123,7 +6123,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
             buf = bytearray(shape[0] * shape[1] * 2)
             self._dma_read_checked(addr, buf, len(buf))
-            out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(*shape).clone()
+            out = user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(*shape).clone()
 
             # CPU oracle at the SAME checkpoint, same IF4 weights. An all-zero image
             # is NOT a degenerate case here: the patch-embed bias makes every row
@@ -6264,7 +6264,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                                       self.prefix_v_cache_addr[layer])):
                 buf = bytearray(P * D * 2)
                 self._dma_read_checked(addr, buf, len(buf))
-                t = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(P, D).float()
+                t = user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(P, D).float()
                 hw[j, layer] = t[:valid_len]
 
         # ---- CPU oracle: pi05_torch_ref.prefix_forward, same IF4 weights ----
@@ -6460,7 +6460,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             ):
                 buf = bytearray(P * D * 2)
                 self._dma_read_checked(hw_addr, buf, len(buf))
-                hw = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(P, D).float()[:valid_len]
+                hw = user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(P, D).float()[:valid_len]
                 cpu = cpu_t.reshape(-1, D).float()[:valid_len]
                 noise = (hw - cpu).pow(2).sum().sqrt()
                 signal = cpu.pow(2).sum().sqrt()
@@ -6504,7 +6504,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             S, H = self.PREFIX_SEQ_LEN, self.HIDDEN_SIZE
             buf = bytearray(S * H * 2)
             self._dma_read_checked(addr, buf, len(buf))
-            hw_layer = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S, H).float()[:valid_len]
+            hw_layer = user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(S, H).float()[:valid_len]
 
             noise = (hw_layer - cpu_layer).pow(2).sum().sqrt()
             signal = cpu_layer.pow(2).sum().sqrt()
@@ -6537,7 +6537,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         def _hw(name, numel, shape):
             buf = bytearray(numel * 2)
             self._dma_read_checked(snap[name], buf, len(buf))
-            return torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(shape).clone().float()
+            return user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(shape).clone().float()
 
         def _snr(hw_t, cpu_t):
             hw_t, cpu_t = hw_t.float(), cpu_t.float()
@@ -6679,7 +6679,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         for i, addr in enumerate(getattr(self, "VIS_LAYER_SNAPSHOT_DRAM", [])):
             buf = bytearray(S_vis * H_vis * 2)
             self._dma_read_checked(addr, buf, len(buf))
-            out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S_vis, H_vis).float()
+            out = user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(S_vis, H_vis).float()
             n_nan, n_inf = torch.isnan(out).sum().item(), torch.isinf(out).sum().item()
             flag = " <-- FIRST BAD" if (n_nan or n_inf) and first_bad is None else ""
             if flag:
@@ -6691,7 +6691,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         for i, addr in enumerate(getattr(self, "AE_STEP_SNAPSHOT_DRAM", [])):
             buf = bytearray(S_ae * AD * 2)
             self._dma_read_checked(addr, buf, len(buf))
-            out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S_ae, AD).float()
+            out = user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(S_ae, AD).float()
             n_nan, n_inf = torch.isnan(out).sum().item(), torch.isinf(out).sum().item()
             flag = " <-- FIRST BAD" if (n_nan or n_inf) and first_bad is None else ""
             if flag:
@@ -6713,8 +6713,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         self._dma_read_checked(self.LAYER0_K_DRAM, buf_k, kv_total)
         self._dma_read_checked(self.LAYER0_V_DRAM, buf_v, kv_total)
         mcols = np.array(getattr(self, "prefix_masked_cols", []), dtype=np.int64).reshape(-1, 2)
-        np.savez(path, k=np.frombuffer(bytes(buf_k), dtype=np.uint16),
-                  v=np.frombuffer(bytes(buf_v), dtype=np.uint16),
+        np.savez(path, k=np.frombuffer(bytes(buf_k), dtype="<u2"),
+                  v=np.frombuffer(bytes(buf_v), dtype="<u2"),
                   prefix_seq_len=self.PREFIX_SEQ_LEN, prefix_valid_len=self.prefix_valid_len,
                   masked_cols=mcols)
         print(f"[dump_prefix_kv] wrote {path} ({kv_total*2/1024/1024:.1f} MB K + V, "
@@ -6736,7 +6736,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         def _read(addr, numel):
             buf = bytearray(numel * 2)
             self._dma_read_checked(addr, buf, numel * 2)
-            return torch.frombuffer(bytes(buf), dtype=torch.bfloat16).float()
+            return user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).float()
 
         fpga_in   = _read(self.AE_P0_ACTION_IN, S * H).reshape(S, H)[:AH]
         fpga_time = _read(self.AE_P0_TIME_EMB, H).reshape(1, H)
@@ -6759,8 +6759,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         npz = np.load(kv_npz_path)
         vlen = int(npz["prefix_valid_len"])
         stride = npz["k"].size // (self.NUM_LAYERS * D)
-        fk = torch.frombuffer(npz["k"].tobytes(), dtype=torch.bfloat16).float().reshape(self.NUM_LAYERS, stride, D)
-        fv = torch.frombuffer(npz["v"].tobytes(), dtype=torch.bfloat16).float().reshape(self.NUM_LAYERS, stride, D)
+        fk = user_dma_core.tensor_from_le_bytes(npz["k"].astype("<u2").tobytes(), torch.bfloat16).float().reshape(self.NUM_LAYERS, stride, D)
+        fv = user_dma_core.tensor_from_le_bytes(npz["v"].astype("<u2").tobytes(), torch.bfloat16).float().reshape(self.NUM_LAYERS, stride, D)
         W = _ref.Weights(device=device, dtype=torch.bfloat16, quant="if4")
         dt_ = W.dtype
         # (b,P,1,D) kv cache from the FPGA's cached prefix rows [0:vlen]
@@ -6920,7 +6920,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         buf = bytearray(M * N * bpe)
         self._dma_read_checked(out_addr, buf, len(buf))
-        hw_out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(M, N).clone().float()
+        hw_out = user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(M, N).clone().float()
         cpu_out = (A.float() @ B.float().T)
         return hw_out, cpu_out
 
@@ -6962,8 +6962,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         kv_total = self.NUM_LAYERS * self.KV_LAYER_STRIDE
         assert npz["k"].nbytes == kv_total, \
             f"dumped K size {npz['k'].nbytes} != current KV_LAYER_STRIDE*NUM_LAYERS {kv_total} (shape mismatch)"
-        self._dma_write_retry(DMA_DEVICE_H2C, self.LAYER0_K_DRAM, npz["k"].tobytes(), kv_total)
-        self._dma_write_retry(DMA_DEVICE_H2C, self.LAYER0_V_DRAM, npz["v"].tobytes(), kv_total)
+        self._dma_write_retry(DMA_DEVICE_H2C, self.LAYER0_K_DRAM, npz["k"].astype("<u2").tobytes(), kv_total)
+        self._dma_write_retry(DMA_DEVICE_H2C, self.LAYER0_V_DRAM, npz["v"].astype("<u2").tobytes(), kv_total)
         self.PREFIX_SEQ_LEN = int(npz["prefix_seq_len"])
         self.prefix_valid_len = int(npz["prefix_valid_len"])
         self.prefix_masked_cols = [(int(a), int(b)) for a, b in npz["masked_cols"]] if "masked_cols" in npz else []
@@ -7328,7 +7328,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 for name, addr in (("k", self.ae_k_combined[layer]), ("v", self.ae_v_combined[layer])):
                     buf_kv = bytearray(Tkv * D_chk * 2)
                     self._dma_read_checked(addr, buf_kv, len(buf_kv))
-                    full = torch.frombuffer(bytes(buf_kv), dtype=torch.bfloat16).reshape(Tkv, D_chk).float()
+                    full = user_dma_core.tensor_from_le_bytes(buf_kv, torch.bfloat16).reshape(Tkv, D_chk).float()
                     for tag, sl in (("prefix", full[:P_chk]), ("suffix", full[P_chk:])):
                         print(f"  [ae_kv_check] layer{layer:2d} {name} {tag}: "
                               f"nan={torch.isnan(sl).sum().item()} inf={torch.isinf(sl).sum().item()} "
@@ -7336,7 +7336,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
 
         buf = bytearray(S * AD * 2)
         self._dma_read_checked(self.AE_XT_DRAM, buf, len(buf))
-        out = torch.frombuffer(bytes(buf), dtype=torch.bfloat16).reshape(S, AD).float().numpy()
+        out = user_dma_core.tensor_from_le_bytes(buf, torch.bfloat16).reshape(S, AD).float().numpy()
         actions = out[:10, :7]
 
         total = t_vision + t_prefix + t_denoise
@@ -7411,8 +7411,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         # and the tail chunks sliced past the end -> a short buffer handed to
         # dma_write with a full-size length.
         if not isinstance(data, (bytes, bytearray)):
-            t = data.flatten().contiguous()
-            data = (t.view(torch.uint16) if t.dtype == torch.bfloat16 else t).numpy().tobytes()
+            data = user_dma_core.tensor_le_bytes(data)
             assert len(data) >= size, f"buffer has {len(data)} B, asked to write {size} B"
         offset = 0
         while offset < size:
@@ -9044,8 +9043,8 @@ def main():
             # not PREFIX_SEQ_LEN -- derive it from the buffer size so we don't
             # assume. total_elems = NL * stride_rows * D.
             stride_rows = npz["k"].size // (NL * D)
-            fpga_k = torch.frombuffer(npz["k"].tobytes(), dtype=torch.bfloat16).float().reshape(NL, stride_rows, D)
-            fpga_v = torch.frombuffer(npz["v"].tobytes(), dtype=torch.bfloat16).float().reshape(NL, stride_rows, D)
+            fpga_k = user_dma_core.tensor_from_le_bytes(npz["k"].astype("<u2").tobytes(), torch.bfloat16).float().reshape(NL, stride_rows, D)
+            fpga_v = user_dma_core.tensor_from_le_bytes(npz["v"].astype("<u2").tobytes(), torch.bfloat16).float().reshape(NL, stride_rows, D)
             ref_k_list, ref_v_list = ref_kv  # each: list of 18 (b,P,1,256)
             print(f"=== Prefix K/V SNR: FPGA cache vs CPU-IF4 reference (valid_len={vlen}) ===")
             def _snr(a, b):
