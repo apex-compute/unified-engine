@@ -241,8 +241,8 @@ def _bf16_region(ue, key, shape, layer_idx=None):
     count = 1
     for dim in shape:
         count *= dim
-    return torch.frombuffer(
-        ue.weight_bin, dtype=torch.bfloat16, count=count, offset=off).reshape(shape)
+    return user_dma_core.tensor_from_le_bytes(
+        ue.weight_bin[off:off + count * 2], torch.bfloat16).reshape(shape)
 
 
 def _if4_region(ue, scale_key, data_key, n, k, layer_idx=None):

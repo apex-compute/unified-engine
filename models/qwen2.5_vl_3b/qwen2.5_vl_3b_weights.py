@@ -33,6 +33,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import quant_lib
+import user_dma_core
 
 
 def _load_config(script_dir: str) -> dict:
@@ -159,7 +160,7 @@ def _write_weight_bin(bin_path, model, param_filter, mode, suffix, quant_layers,
                 raw = data.tobytes()
                 key = f'{key}.{suffix}'
             else:
-                raw = t.to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+                raw = user_dma_core.tensor_le_bytes(t.to(torch.bfloat16))
             offset = f.tell()
             f.write(raw)
             manifest[key] = {'offset': offset, 'size': len(raw)}
@@ -239,7 +240,7 @@ def generate_vision_weights(model, output_path, precision: str = "int4"):
             data, _ = qpack(qk_padded_w)
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.qk_padded.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
-            raw = qk_padded_b.contiguous().view(torch.uint16).cpu().numpy().tobytes(); offset = f.tell(); f.write(raw)
+            raw = user_dma_core.tensor_le_bytes(qk_padded_b); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.qk_padded.bias'] = {'offset': offset, 'size': len(raw)}
             # V sequential padded
             v_padded_w = torch.zeros(VN * VD_PAD, VH, dtype=torch.bfloat16)
@@ -251,13 +252,13 @@ def generate_vision_weights(model, output_path, precision: str = "int4"):
             data, _ = qpack(v_padded_w)
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.v_padded.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
-            raw = v_padded_b.contiguous().view(torch.uint16).cpu().numpy().tobytes(); offset = f.tell(); f.write(raw)
+            raw = user_dma_core.tensor_le_bytes(v_padded_b); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.v_padded.bias'] = {'offset': offset, 'size': len(raw)}
             # O proj (no padding needed)
             data, _ = qpack(block.attn.proj.weight.detach().to(torch.bfloat16))
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.proj.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
-            raw = block.attn.proj.bias.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+            raw = user_dma_core.tensor_le_bytes(block.attn.proj.bias.detach().to(torch.bfloat16))
             offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.attn.proj.bias'] = {'offset': offset, 'size': len(raw)}
             # MLP: pad 3420→3456
@@ -269,19 +270,19 @@ def generate_vision_weights(model, output_path, precision: str = "int4"):
                 manifest[f'{prefix}.mlp.{proj_name}.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
                 b = getattr(block.mlp, proj_name).bias.detach().to(torch.bfloat16)
                 b_padded = torch.zeros(VIS_MLP_PAD, dtype=torch.bfloat16); b_padded[:b.shape[0]] = b
-                raw = b_padded.contiguous().view(torch.uint16).cpu().numpy().tobytes(); offset = f.tell(); f.write(raw)
+                raw = user_dma_core.tensor_le_bytes(b_padded); offset = f.tell(); f.write(raw)
                 manifest[f'{prefix}.mlp.{proj_name}.bias'] = {'offset': offset, 'size': len(raw)}
             down_w = block.mlp.down_proj.weight.detach().to(torch.bfloat16)
             down_padded = torch.zeros(VH, VIS_MLP_PAD, dtype=torch.bfloat16); down_padded[:, :down_w.shape[1]] = down_w
             data, _ = qpack(down_padded)
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.mlp.down_proj.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
-            raw = block.mlp.down_proj.bias.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+            raw = user_dma_core.tensor_le_bytes(block.mlp.down_proj.bias.detach().to(torch.bfloat16))
             offset = f.tell(); f.write(raw)
             manifest[f'{prefix}.mlp.down_proj.bias'] = {'offset': offset, 'size': len(raw)}
             # Norms
             for norm_name in ['norm1', 'norm2']:
-                raw = getattr(block, norm_name).weight.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+                raw = user_dma_core.tensor_le_bytes(getattr(block, norm_name).weight.detach().to(torch.bfloat16))
                 offset = f.tell(); f.write(raw)
                 manifest[f'{prefix}.{norm_name}.weight'] = {'offset': offset, 'size': len(raw)}
             count += 1
@@ -290,14 +291,14 @@ def generate_vision_weights(model, output_path, precision: str = "int4"):
         raw = data.tobytes(); offset = f.tell(); f.write(raw)
         manifest[f'visual.patch_embed.proj.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
         # Merger
-        raw = model.visual.merger.ln_q.weight.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+        raw = user_dma_core.tensor_le_bytes(model.visual.merger.ln_q.weight.detach().to(torch.bfloat16))
         offset = f.tell(); f.write(raw)
         manifest['visual.merger.ln_q.weight'] = {'offset': offset, 'size': len(raw)}
         for mlp_idx in [0, 2]:
             data, _ = qpack(model.visual.merger.mlp[mlp_idx].weight.detach().to(torch.bfloat16))
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
             manifest[f'visual.merger.mlp.{mlp_idx}.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
-            raw = model.visual.merger.mlp[mlp_idx].bias.detach().to(torch.bfloat16).contiguous().view(torch.uint16).cpu().numpy().tobytes()
+            raw = user_dma_core.tensor_le_bytes(model.visual.merger.mlp[mlp_idx].bias.detach().to(torch.bfloat16))
             offset = f.tell(); f.write(raw)
             manifest[f'visual.merger.mlp.{mlp_idx}.bias'] = {'offset': offset, 'size': len(raw)}
     with open(json_path, 'w') as f:

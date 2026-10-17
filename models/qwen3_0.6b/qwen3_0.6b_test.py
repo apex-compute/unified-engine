@@ -303,7 +303,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
 
     # Embedding
     embed = model.get_input_embeddings().weight.detach().cpu().to(torch.bfloat16)
-    raw_emb = embed.contiguous().view(torch.uint8).numpy().tobytes()
+    raw_emb = user_dma_core.tensor_le_bytes(embed)
     if len(raw_emb) != token_embd_size:
         raise ValueError(f"Embedding has {len(raw_emb)} bytes; config expects {token_embd_size}")
     write_at(token_embd_offset, raw_emb)
@@ -369,7 +369,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
                 i += 2
             else:
                 t = tensor.detach().cpu().to(torch.bfloat16).contiguous()
-                raw = pad_region(t.view(torch.uint8).numpy().tobytes(), sz,
+                raw = pad_region(user_dma_core.tensor_le_bytes(t), sz,
                                  f"layer {layer_idx} {off_key}")
                 write_at(file_off, raw)
                 i += 1
@@ -390,13 +390,13 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
     rope_tensor = torch.cat([cos_, cos_, -sin_, sin_], dim=1)  # (num_positions, 256)
     for off_key, sz_key in [("ROPE_LOCAL", "ROPE_LOCAL_SIZE"), ("ROPE_GLOBAL", "ROPE_GLOBAL_SIZE")]:
         sz = weight_defs[sz_key]
-        raw = pad_region(rope_tensor.contiguous().view(torch.uint8).numpy().tobytes(), sz, off_key)
+        raw = pad_region(user_dma_core.tensor_le_bytes(rope_tensor), sz, off_key)
         write_at(weight_defs[off_key], raw)
 
     # OUTPUT_NORM
     out_norm = (model.model.norm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
     sz = weight_defs["OUTPUT_NORM_WEIGHT_SIZE"]
-    raw = pad_region(out_norm.contiguous().view(torch.uint8).numpy().tobytes(), sz,
+    raw = pad_region(user_dma_core.tensor_le_bytes(out_norm), sz,
                      "OUTPUT_NORM_WEIGHT")
     write_at(weight_defs["OUTPUT_NORM_WEIGHT"], raw)
 
@@ -425,7 +425,7 @@ def weight_bin_generate(script_dir: str | None = None, output_path: str | None =
         "LAST_LAYER_DOWN_WEIGHT_BF16": last_layer.mlp.down_proj.weight,
     }
     for key, weight in last_layer_bf16.items():
-        raw = weight.detach().cpu().to(torch.bfloat16).contiguous().view(torch.uint8).numpy().tobytes()
+        raw = user_dma_core.tensor_le_bytes(weight.detach().cpu().to(torch.bfloat16))
         expected_size = weight_defs[f"{key}_SIZE"]
         if len(raw) != expected_size:
             raise ValueError(f"{key} has {len(raw)} bytes; config expects {expected_size}")
@@ -648,12 +648,9 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
                 raise OSError(f"DMA write at 0x{address:X}: wrote {written} of {size} bytes")
             return written
 
-        if isinstance(buffer, torch.Tensor):
-            tensor = buffer.detach().cpu().contiguous()
-            if tensor.dtype == torch.bfloat16:
-                raw = tensor.view(torch.uint16).numpy().tobytes()[:size]
-            else:
-                raw = tensor.numpy().tobytes()[:size]
+        if isinstance(buffer, (torch.Tensor, np.ndarray)):
+            # Little-endian DRAM bytes on any host.
+            raw = user_dma_core.dma_payload(buffer, size)
         elif isinstance(buffer, (bytes, bytearray, memoryview)):
             raw = memoryview(buffer).cast("B")[:size]
         else:
@@ -980,7 +977,7 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
         # rope_hf_core(N=actual_head_dim=128): [cos(64), cos(64), -sin(64), sin(64)]
         rope_tensor = torch.cat([cos_, cos_, -sin_, sin_], dim=1)  # (num_positions, 256)
         # Single DMA: write ROPE_LOCAL and ROPE_GLOBAL back-to-back (same table, same theta)
-        rope_raw = rope_tensor.contiguous().view(torch.uint8).numpy().tobytes()
+        rope_raw = user_dma_core.tensor_le_bytes(rope_tensor)
         local_sz  = self.weight_defs["ROPE_LOCAL_SIZE"]
         global_sz = self.weight_defs["ROPE_GLOBAL_SIZE"]
         local_raw  = (rope_raw + b"\x00" * local_sz)[:local_sz]
@@ -1019,9 +1016,14 @@ class Qwen3_0_6b_UnifiedEngine(UnifiedEngine):
               f"{time.perf_counter() - _embedding_dma_start:.1f}s")
         # Prefill still gathers prompt rows on the host. Keep one mutable copy
         # backing the torch view, but avoid another 296.75-MiB clone at startup.
-        self._embedding_host_storage = bytearray(raw_emb)
-        self.embedding_weight = torch.frombuffer(
-            self._embedding_host_storage, dtype=torch.bfloat16).reshape(vocab_size, emb_dim)
+        if user_dma_core.HOST_IS_LITTLE_ENDIAN:
+            self._embedding_host_storage = bytearray(raw_emb)
+            self.embedding_weight = torch.frombuffer(
+                self._embedding_host_storage, dtype=torch.bfloat16).reshape(vocab_size, emb_dim)
+        else:
+            # The weight bin is little-endian; decode a native-order copy.
+            self.embedding_weight = user_dma_core.tensor_from_le_bytes(
+                raw_emb, torch.bfloat16).reshape(vocab_size, emb_dim)
         del raw_emb
         model_dir = os.path.join(self.script_dir, self._cfg["paths"]["hf_model_dir"])
         self.tokenizer = AutoTokenizer.from_pretrained(

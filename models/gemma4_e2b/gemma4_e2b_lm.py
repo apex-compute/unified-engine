@@ -465,7 +465,7 @@ class Gemma4LMMixin:
         sin_local = freqs_local.sin().to(torch.bfloat16)
         rope_local = torch.cat([cos_local, cos_local, -sin_local, sin_local], dim=1)
         sz = self.weight_defs["ROPE_LOCAL_SIZE"]
-        raw = rope_local.contiguous().view(torch.uint8).numpy().tobytes()
+        raw = user_dma_core.tensor_le_bytes(rope_local)
         raw = (raw + b"\x00" * sz)[:sz]
         addr = self.allocate_params_dram(sz)
         self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
@@ -480,7 +480,7 @@ class Gemma4LMMixin:
         sin_global = freqs_global.sin().to(torch.bfloat16)
         rope_global = torch.cat([cos_global, cos_global, -sin_global, sin_global], dim=1)
         sz = self.weight_defs["ROPE_GLOBAL_SIZE"]
-        raw = rope_global.contiguous().view(torch.uint8).numpy().tobytes()
+        raw = user_dma_core.tensor_le_bytes(rope_global)
         raw = (raw + b"\x00" * sz)[:sz]
         addr = self.allocate_params_dram(sz)
         self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
@@ -503,11 +503,16 @@ class Gemma4LMMixin:
             n_elems = 1
             for d in shape:
                 n_elems *= d
+            off = base_offset + s["offset"]
+            if not user_dma_core.HOST_IS_LITTLE_ENDIAN:
+                # The bin is little-endian; big-endian hosts need a swapped copy.
+                return user_dma_core.tensor_from_le_bytes(
+                    self.weight_bin[off:off + n_elems * 2], torch.bfloat16).reshape(shape)
             return torch.frombuffer(
                 self.weight_bin,
                 dtype=torch.bfloat16,
                 count=n_elems,
-                offset=base_offset + s["offset"],
+                offset=off,
             ).reshape(shape)
 
         self.embed_tokens_per_layer_weight = _view("embed_tokens_per_layer")
@@ -621,6 +626,11 @@ class Gemma4LMMixin:
             count=vocab_size * emb_dim,
             offset=token_embd_offset,
         ).reshape(vocab_size, emb_dim)
+        if not user_dma_core.HOST_IS_LITTLE_ENDIAN:
+            # The bin is little-endian; big-endian hosts need a swapped copy.
+            self.embedding_weight = user_dma_core.tensor_from_le_bytes(
+                self.weight_bin[token_embd_offset:token_embd_offset + vocab_size * emb_dim * 2],
+                torch.bfloat16).reshape(vocab_size, emb_dim)
 
         host_section = self._weights_master["host_section"]
         self._load_host_weights_from_combined_bin(host_section, host_section["offset"])

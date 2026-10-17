@@ -169,7 +169,7 @@ class VisionWeights:
         return self.blob[s["offset"]:s["offset"] + s["size"]]
 
     def bf16(self, key):
-        return torch.frombuffer(bytearray(self._raw(key)), dtype=torch.bfloat16)
+        return user_dma_core.tensor_from_le_bytes(self._raw(key), torch.bfloat16)
 
     def if4(self, key, n, k):
         """Split the [scales | data] section and dequantize to [n, k] BF16."""
@@ -542,7 +542,7 @@ class LMWeights:
         return self.blob[s["offset"]:s["offset"] + s["size"]]
 
     def bf16(self, key, shape=None):
-        t = torch.frombuffer(bytearray(self._raw(key)), dtype=torch.bfloat16)
+        t = user_dma_core.tensor_from_le_bytes(self._raw(key), torch.bfloat16)
         return t.reshape(shape) if shape else t
 
     def if4(self, key, n, k):

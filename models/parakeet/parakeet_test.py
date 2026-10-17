@@ -1563,7 +1563,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             extras_meta = {}
             cursor = total
             for name, arr in (extras or {}).items():
-                b = arr.tobytes()
+                b = arr.astype(arr.dtype.newbyteorder("<")).tobytes()  # bins are little-endian
                 f.write(b)
                 extras_meta[name] = {"offset": cursor, "size": len(b),
                                      "shape": list(arr.shape), "dtype": str(arr.dtype)}

@@ -162,8 +162,8 @@ class Gemma4VisionMixin:
             s = sections["pos_embedding_table"]
             f.seek(base_offset + s["offset"])
             bts = f.read(s["size"])
-            self._vis_pos_embed_table = torch.frombuffer(
-                bytearray(bts), dtype=torch.bfloat16).reshape(*s["shape"]).clone()
+            self._vis_pos_embed_table = user_dma_core.tensor_from_le_bytes(
+                bts, torch.bfloat16).reshape(*s["shape"])
 
             self.VIS_EMBED_NORM_HAS_SCALE = False
             self.VIS_EMBED_NORM_GAMMA = _dma_section("embed_norm_gamma")
