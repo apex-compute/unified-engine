@@ -2453,15 +2453,14 @@ def main():
         '--prefill-kernel',
         choices=Llama32_1b_UnifiedEngine.VALID_KERNELS,
         default=None,
-        help='Projection kernel for prefill: streaming or matmatmul. Default: streaming. '
-             'matmatmul is unsupported on 512-bit AXI devices.',
+        help='Projection kernel for prefill: streaming or matmatmul. Default: streaming.',
     )
     parser.add_argument(
         '--decode-kernel',
         choices=Llama32_1b_UnifiedEngine.VALID_KERNELS,
         default=None,
         help='Projection kernel for decode, including the LM head: streaming or matmatmul. '
-             'Default: streaming. matmatmul is unsupported on 512-bit AXI devices.',
+             'Default: streaming.',
     )
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile binary with per-step HALT checkpoints and print one '
@@ -2501,20 +2500,6 @@ def main():
 
     prefill_kernel = args.prefill_kernel or Llama32_1b_UnifiedEngine.DEFAULT_PREFILL_KERNEL
     decode_kernel = args.decode_kernel or Llama32_1b_UnifiedEngine.DEFAULT_DECODE_KERNEL
-    axi_width_bits = user_dma_core.UE_AXI_DATA_WIDTH_BITS
-    assert axi_width_bits is not None
-    if axi_width_bits == 512 and (
-        prefill_kernel == "matmatmul" or decode_kernel == "matmatmul"
-    ):
-        requested = []
-        if prefill_kernel == "matmatmul":
-            requested.append("--prefill-kernel matmatmul")
-        if decode_kernel == "matmatmul":
-            requested.append("--decode-kernel matmatmul")
-        parser.error(
-            f"{' and '.join(requested)} unsupported: matmatmul is not supported "
-            "on the 512-bit AXI data path; use streaming."
-        )
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if args.local_weights:

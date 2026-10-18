@@ -1552,7 +1552,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x42029f30, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x42029f30. Please update FPGA with update_42029f30.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
+        assert hw_version == 0xa4fba9d9, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xa4fba9d9. Please update FPGA with update_a4fba9d9.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
         if getattr(self, "conv_geometry_mode", CONV_GEOMETRY_LIVE_CSR) == CONV_GEOMETRY_QUEUE_CONFIG:
             # Convolution images have independent build stamps from the legacy
             # release. Explicit queue-CONFIG selection opts into that contract;
@@ -6232,7 +6232,11 @@ class UnifiedEngine:
         N_chunk = min(N, (URAM_NEAR_FULL_ELEMENTS // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
         N_chunk_aligned = None
         if N_chunk < UE_VECTOR_SIZE:
-            # Try 32(2 bursts) and 16(1 burst)
+            # Try 32 then 16 columns. At K >= 8192 a 32-column strip needs
+            # 4096 URAM_B rows, past the 12-bit row field (max 4095), so K in
+            # [8192, 16320] gets 16 columns: a 32-byte output row, which is half
+            # a beat on a 512-bit master and starts mid-beat for every odd strip.
+            # The master's non-aligned writes handle that (#1185).
             if (K * 32) <= URAM_NEAR_FULL_ELEMENTS:
                 N_chunk = 32
             elif (K * 16) <= URAM_NEAR_FULL_ELEMENTS:
@@ -6598,12 +6602,13 @@ class UnifiedEngine:
         # get dedicated registers so both bias modes work with softmax.
         # N and M totals are aliased onto the caller's gpr regs when provided (read-only).
         # ----------------------------------------------------------------------
-        # A strip narrower than 16 columns cannot satisfy both the 12-bit Z-row
-        # field and the 32-byte DMA alignment used by this two-pass kernel.  The
-        # old fallback aligned such a width down to zero and emitted a runtime
-        # N loop that could never make progress.  Reject that geometry while it
-        # is still a compile-time model error; large quantized projections must
-        # use quantized_matmat_core's one-pass 16-column streaming path.
+        # A strip narrower than 16 columns cannot satisfy the 12-bit Z-row field
+        # (16 columns stay legal at any AXI width: the master writes a mid-beat
+        # 32-byte row, #1185).  The old fallback aligned such a width down to
+        # zero and emitted a runtime N loop that could never make progress.
+        # Reject that geometry while it is still a compile-time model error;
+        # large quantized projections must use quantized_matmat_core's one-pass
+        # 16-column streaming path.
         if K // UE_VECTOR_SIZE > 4095 // 16:
             raise ValueError(
                 "matmat_mul_core_dynamic: K is too large for a nonzero "
@@ -6700,8 +6705,9 @@ class UnifiedEngine:
         self.generate_instruction_shl(s2, s2, 6)               # hw_max (64-aligned)
         self.generate_instruction_reg_min(N_chunk_reg, N_chunk_reg, s2)
         # If N_chunk == 0 (K too large for a 64-wide strip to fit the HW limit):
-        # sub-64 fallback: use up to 32 columns but aligned to 16 (= 32 bytes = 1 AXI beat)
-        # so the output DRAM address (cols_done >> 2 words) stays word-aligned every iteration.
+        # sub-64 fallback: use up to 32 columns but aligned to 16 (= 32 bytes) so the output
+        # DRAM address (cols_done >> 2 words) stays word-aligned every iteration. 32 bytes is
+        # a whole beat at 256-bit and half a beat at 512-bit; the master writes mid-beat (#1185).
         cur = self.capture_count
         skip_target = ue_35bit_addr_shifter(program_dram_start_addr + (cur + 7) * INSTRUCTION_SIZE_BYTES)
         # TODO(perf, needs RTL): make this a relative jump. Absolute jumps route
