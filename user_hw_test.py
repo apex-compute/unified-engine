@@ -6480,6 +6480,40 @@ def conv_regression_tests() -> None:
         _restore_rng_state(rng_state)
 
 
+def matmat_wide_k_test() -> None:
+    """matmat_mul_core at K in [8192, 16320], both kernels (#1185).
+
+    At K >= 8192 a 32-column strip needs 4096 URAM_B rows, past the 12-bit
+    Z-row field (max 4095), so both kernels fall back to 16-column strips:
+    one 32-byte output row per DMA, at byte offset j*32. That is a whole beat
+    on a 256-bit master but half a beat on a 512-bit one, and every odd strip
+    starts mid-beat. Legacy writes it with a per-row ue_memcpy_to_dram, dynamic
+    with its sub-64 per-row writeback, so the two are covered independently
+    (matmat_mul_unified_test's default paired mode). Before the master learned
+    non-aligned writes both returned SNR ~ -1.8 dB at K=8192 on 512-bit boards.
+
+      8128  : last K before the 16-column fallback (control)
+      8192  : first K that forces it
+      16320 : last K the 12-bit Z-row field allows
+
+    Its own RNG seed, restored afterwards, so the legacy suite's inputs and end
+    fingerprint do not move.
+    """
+    rng_state = _capture_rng_state()
+    try:
+        random.seed(0)
+        torch.manual_seed(0)
+        matmat_mul_unified_test(runtime_list=[(33, 8128, 512),
+                                              (33, 8192, 512),
+                                              (33, 16320, 512)])
+        for bias_mode in ("broadcast_N", "full_matrix"):
+            matmat_mul_unified_test(runtime_list=[(33, 8192, 512)], bias_enable=True,
+                                    bias_mode=bias_mode, softmax_enable=True,
+                                    debug_fmax=True)
+    finally:
+        _restore_rng_state(rng_state)
+
+
 # --- End-to-end convolution models (models/<name>/*_run_from_bin.py) ---------
 #
 # Each model runs from its compiled bin on the board and is compared with a CPU
@@ -6581,7 +6615,8 @@ def conv_model_tests() -> None:
     import numpy as np
     import user_dma_core
     dev = user_dma_core._current_device_name()
-    hw = ["--device", "efinix" if dev == "efinix" else "rk", "--dev", dev]
+    model_dev = "efinix" if dev == "pcie_dma1" else dev
+    hw = ["--device", "rk", "--dev", model_dev]
     axi = user_dma_core.configured_hardware_info().axi_data_width_bits
     md = "models"
     failures = []
@@ -12045,9 +12080,8 @@ def _llama32_1b_inference_test(module_filename: str, class_name: str, label_pref
     unlike Gemma3):
 
       * ``streaming`` : prefill=streaming, decode=streaming (class defaults).
-      * ``matmatmul`` : prefill=matmatmul, decode=streaming. matmatmul is
-                        unsupported on the 512-bit AXI path, so this run is
-                        skipped on bittware / rk (512-bit) devices.
+      * ``matmatmul`` : prefill=matmatmul, decode=streaming, on every AXI
+                        width (512-bit included since #1185).
 
     Decode is pure greedy (``fpga_penalty=False``) so the output is deterministic,
     matching how the Gemma3 regressions gate on an exact decoded string.
@@ -12120,54 +12154,57 @@ def _llama32_1b_inference_test(module_filename: str, class_name: str, label_pref
                 f"  decoded_text   = {decoded_text!r}"
             )
 
-    # (label, constructor kwargs, requires 256-bit AXI). Run 1 is the class
-    # default (streaming/streaming); run 2 switches prefill to the two-pass
-    # matmatmul kernel while decode stays streaming.
+    # (label, constructor kwargs). Run 1 is the class default
+    # (streaming/streaming); run 2 switches prefill to the two-pass matmatmul
+    # kernel while decode stays streaming.
     runs = (
-        ("streaming", {}, False),
-        ("matmatmul", {"prefill_kernel": "matmatmul"}, True),
+        ("streaming", {}),
+        ("matmatmul", {"prefill_kernel": "matmatmul"}),
     )
     axi_width_bits = user_dma_core.UE_AXI_DATA_WIDTH_BITS
     if axi_width_bits is None:
-        raise RuntimeError("HW_INFO must be read before selecting an AXI-dependent inference kernel")
-    for label, kwargs, needs_256b in runs:
-        if needs_256b and axi_width_bits != 256:
+        raise RuntimeError("HW_INFO must be read before running the Llama regression")
+    for label, kwargs in runs:
+        # Until #1185 the matmatmul run was skipped off 256-bit AXI. Engine
+        # construction draws from the global RNG, so on those boards run it
+        # with both streams restored afterwards: every later test's inputs and
+        # RNG fingerprint stay what they were when it was skipped.
+        rng_state = (_capture_rng_state()
+                     if label == "matmatmul" and axi_width_bits != 256 else None)
+        try:
+            ue = Engine(**kwargs)
+            ue.prefill_seq = tuple(ue._cfg["default_prefill_tokens"])
+            ue.fpga_penalty = False  # deterministic pure-greedy decode
+            ue._generated_tokens = list(ue.prefill_seq)
+            ue.compile_llama()
+            result = ue.run_llama()
+            _assert_result(label, result)
+
+            inst_bin = _instruction_bin_path(ue)
+            inst_bytes = os.path.getsize(inst_bin) if inst_bin and os.path.exists(inst_bin) else None
+            # HW-counter metrics for the summary: TTFT is the prefill hardware latency
+            # (time to the first token), decode_peak is the first decoded token's HW rate.
+            prefill_toks = result["prefill_tokens"]
+            decoded_toks = result["tokens_decoded"]
+            ttft_s = result["prefill_hw_ms"] / 1000.0
+            decode_peak = result["peak_tokens_per_s"]
             print(
-                f"{label_prefix} {label}: skipped — matmatmul is unsupported on the "
-                f"{axi_width_bits}-bit AXI data path."
+                f"{label_prefix} {label} inference OK: "
+                f"prefill_toks={prefill_toks}, decoded_toks={decoded_toks}, "
+                f"TTFT={ttft_s:.2f} s, decode_peak={decode_peak:.2f} tok/s, "
+                f"bin {inst_bytes if inst_bytes is not None else 'n/a'} bytes."
             )
-            continue
-
-        ue = Engine(**kwargs)
-        ue.prefill_seq = tuple(ue._cfg["default_prefill_tokens"])
-        ue.fpga_penalty = False  # deterministic pure-greedy decode
-        ue._generated_tokens = list(ue.prefill_seq)
-        ue.compile_llama()
-        result = ue.run_llama()
-        _assert_result(label, result)
-
-        inst_bin = _instruction_bin_path(ue)
-        inst_bytes = os.path.getsize(inst_bin) if inst_bin and os.path.exists(inst_bin) else None
-        # HW-counter metrics for the summary: TTFT is the prefill hardware latency
-        # (time to the first token), decode_peak is the first decoded token's HW rate.
-        prefill_toks = result["prefill_tokens"]
-        decoded_toks = result["tokens_decoded"]
-        ttft_s = result["prefill_hw_ms"] / 1000.0
-        decode_peak = result["peak_tokens_per_s"]
-        print(
-            f"{label_prefix} {label} inference OK: "
-            f"prefill_toks={prefill_toks}, decoded_toks={decoded_toks}, "
-            f"TTFT={ttft_s:.2f} s, decode_peak={decode_peak:.2f} tok/s, "
-            f"bin {inst_bytes if inst_bytes is not None else 'n/a'} bytes."
-        )
-        # Combine the dimensions / SNR / GFLOPS / MB/s columns into one info string
-        # (those numeric columns don't apply to an end-to-end inference run).
-        dims = (
-            f"prefill_toks={prefill_toks}, decoded_toks={decoded_toks}, "
-            f"TTFT={ttft_s:.2f} s, decode_peak={decode_peak:.2f} tok/s"
-        )
-        record_test(f"{label_prefix.lower().replace(' ', '_')}_inference_{label}",
-                    dims=dims, inst_bytes=inst_bytes, merge_metric_cols=True)
+            # Combine the dimensions / SNR / GFLOPS / MB/s columns into one info string
+            # (those numeric columns don't apply to an end-to-end inference run).
+            dims = (
+                f"prefill_toks={prefill_toks}, decoded_toks={decoded_toks}, "
+                f"TTFT={ttft_s:.2f} s, decode_peak={decode_peak:.2f} tok/s"
+            )
+            record_test(f"{label_prefix.lower().replace(' ', '_')}_inference_{label}",
+                        dims=dims, inst_bytes=inst_bytes, merge_metric_cols=True)
+        finally:
+            if rng_state is not None:
+                _restore_rng_state(rng_state)
 
 
 def llama32_1b_inference_test() -> None:
@@ -12259,7 +12296,8 @@ if __name__ == "__main__":
             '(skips the rest of the suite). Names: dram_stride_en, '
             'dram_stride_wb, dram_unaligned_stride_en, dram_unaligned_stride_wb, '
             'dram_unaligned_memcpy, dram_partial_length_memcpy, '
-            'dram_unaligned_read_write_speed, dram_unaligned_access, or alias '
+            'dram_unaligned_read_write_speed, dram_unaligned_access, '
+            'matmat_wide_k, or alias '
             'dma_unaligned for the unaligned+partial+stride-unaligned set.'
         ),
     )
@@ -12353,6 +12391,7 @@ if __name__ == "__main__":
         "dram_partial_length_memcpy": dram_partial_length_memcpy_test,
         "dram_unaligned_read_write_speed": dram_unaligned_read_write_speed_test,
         "dram_unaligned_access": dram_unaligned_access_suite_test,
+        "matmat_wide_k": matmat_wide_k_test,
     }
     _DMA_UNALIGNED_ALIAS = (
         "dram_unaligned_memcpy",
@@ -12634,7 +12673,8 @@ if __name__ == "__main__":
             for softmax_enable in [False, True]:
                 for bias_mode in (["broadcast_N", "full_matrix"] if bias_enable else ["broadcast_N"]):
                     matmat_mul_unified_test(runtime_list=[(8192, 512,  512)],  bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
-                    # Reminder: k=8192 breaks on 512-b dram setup
+                    # K stays 8192-64 to keep this sweep's RNG draws (and every later
+                    # test's inputs) unchanged; K >= 8192 is covered by matmat_wide_k_test.
                     matmat_mul_unified_test(runtime_list=[(512,  8192-64, 512)], bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
                     matmat_mul_unified_test(runtime_list=[(512,  512,  8192)], bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
                     matmat_mul_unified_test(runtime_list=[(4096, 4032, 4032)], bias_enable=bias_enable, softmax_enable=softmax_enable, bias_mode=bias_mode)
@@ -12662,7 +12702,9 @@ if __name__ == "__main__":
         # sources all Q/K/V/bias/out DRAM bases from GPRs). Merges the former dynamic-only,
         # matched-pair, and dynamic_addr (head_dim=128) sweeps into one.
         for head_dim in [64, 256, 512, 1024]:
-            for seq_len in [64, 256, 512, 1024, 4096, 8192-64]: # Reminder: seq_len=8192 breaks on 512-b dram setup
+            # 8192-64 keeps this sweep's RNG draws unchanged; the K >= 8192 matmat
+            # path it used to dodge is covered by matmat_wide_k_test (#1185).
+            for seq_len in [64, 256, 512, 1024, 4096, 8192-64]:
                 unified_attention_test(batch=seq_len, aligned_seq_len=seq_len, head_dim=head_dim)
         # head_dim=128 came only from the former dynamic_addr sweep (seq_len up to 1024).
         for seq_len in [64, 256, 512, 1024]:
@@ -12784,6 +12826,9 @@ if __name__ == "__main__":
     matmat_mul_legacy_unroll_icache_test()
     #Adding new tests here
     dram_unaligned_access_suite_test()
+    # matmat at K >= 8192 on both kernels (#1185). Seeds and restores its own RNG,
+    # so the gemma3/llama rows below keep their inputs and fingerprints.
+    matmat_wide_k_test()
 
     gemma3_inference_test()
     gemma3_if8_inference_test()
