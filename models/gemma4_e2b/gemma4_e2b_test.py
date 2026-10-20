@@ -38,6 +38,18 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 # This file's folder: gemma4_e2b_bin/ and *.json live here. user_dma_core is
 # two levels up (repo root).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# The model variant this process runs. gemma4_e4b/gemma4_e4b_test.py runs the
+# same code as E4B by calling set_model_variant() before main(): the config is
+# <dir>/<name>_config.json, artifacts live under <name>_bin/, and summaries are
+# named <name>_test_*.md.
+MODEL_NAME = "gemma4_e2b"
+MODEL_TITLE = "Gemma4 E2B"
+
+
+def set_model_variant(name: str, script_dir: str, title: str) -> None:
+    """Point this module at another Gemma 4 variant's directory (see MODEL_NAME)."""
+    global SCRIPT_DIR, MODEL_NAME, MODEL_TITLE
+    SCRIPT_DIR, MODEL_NAME, MODEL_TITLE = script_dir, name, title
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import torch
@@ -589,7 +601,9 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     head_dim = cfg["file_info"]["head_dim"]  # 512 (max / full attention)
     head_dim_sliding = cfg["file_info"]["head_dim_sliding"]  # 256
     hidden_size = cfg["file_info"]["hidden_size"]
-    group_size = cfg["file_info"]["group_size"]
+    num_kv_heads = int(cfg["file_info"].get("num_key_value_heads", 1))
+    num_q_heads = int(cfg["file_info"].get("num_attention_heads",
+                                           cfg["file_info"]["group_size"] * num_kv_heads))
     full_attention_layers = set(cfg["model"]["full_attention_layers"])
     mlp_elements_wide = cfg["file_info"].get("mlp_elements_wide", cfg["file_info"]["mlp_elements"])
     blk0_structure = cfg["layers"]["structure"]
@@ -621,8 +635,8 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
         attn = layer.self_attn
         is_full = layer_idx in full_attention_layers
         cur_head_dim = head_dim if is_full else head_dim_sliding
-        cur_q_size = cur_head_dim * group_size
-        cur_k_size = cur_head_dim
+        cur_q_size = cur_head_dim * num_q_heads
+        cur_k_size = cur_head_dim * num_kv_heads
 
         gamma_in = (layer.input_layernorm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
 
@@ -644,8 +658,8 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
 
         # Pad Q/K/V rows to max sizes (N dimension padding — contiguous rows, safe for sub-N matmul).
         # O weight: do NOT pad K dimension — quantize with actual K so scale/data blocks align correctly.
-        max_q_size = head_dim * group_size  # 4096
-        max_k_size = head_dim  # 512
+        max_q_size = head_dim * num_q_heads   # E2B 4096
+        max_k_size = head_dim * num_kv_heads  # E2B 512
         q_w = torch.zeros(max_q_size, hidden_size, dtype=torch.bfloat16)
         q_w[:cur_q_size, :] = q_w_actual
         k_w = torch.zeros(max_k_size, hidden_size, dtype=torch.bfloat16)
@@ -1087,6 +1101,23 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self._multi_core_schedulers[stage] = scheduler
         return scheduler
 
+    @classmethod
+    def _private_weight_upper_bound(cls, script_dir, multi_core: int) -> int:
+        """Per-engine bytes of the private projection slices, from the config.
+
+        Every projection region of every layer plus the LM head, split evenly
+        over the engines, +5%, rounded up to 32 MiB. The regions are sized for
+        the widest layer, so this over-counts the narrow ones: an upper bound,
+        which is what a reserve declared before any weight is loaded needs.
+        """
+        cfg = cls.load_config(script_dir=script_dir or SCRIPT_DIR)
+        defs, layers = cfg["_weight_defs"], cfg["file_info"]["num_layers"]
+        keys = [k for pair in Gemma4LMMixin.PROJ_REGION_KEYS.values() for k in pair]
+        total = (layers * sum(defs[k + "_SIZE"] for k in keys)
+                 + sum(defs[k + "_SIZE"] for k in Gemma4LMMixin.LM_HEAD_REGION_KEYS))
+        per_engine = int(total / max(int(multi_core), 1) * 1.05)
+        return (per_engine + (32 << 20) - 1) & ~((32 << 20) - 1)
+
     def __init__(self, script_dir: str | None = None,
                  vision_kernel: str = "matmatmul", prefill_kernel: str = "streaming",
                  decode_kernel: str = "streaming", multi_core: int = 1,
@@ -1136,13 +1167,15 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                                   and user_dma_core.ANDROMEDA_CORE_COUNT == 2
                                   and user_dma_core.AVAILABLE_DRAM_SIZE_GB == 4)
         if self._use_multicore_dram_layout and not self._kintex_tiled_map:
-            require_multicore_dram(multi_core, "Gemma4 E2B")
+            require_multicore_dram(multi_core, MODEL_TITLE)
         self._tile_window_bytes = (KINTEX_TILE_BYTES if self._kintex_tiled_map
                                    else TILED_WINDOW_BYTES)
         self._tile_tensor_bytes = (KINTEX_PRIVATE_TENSOR_BYTES if self._kintex_tiled_map
                                    else TILED_TENSOR_BYTES)
         self._tile_private_reserve_bytes = (KINTEX_PRIVATE_RESERVE_BYTES
-            if self._kintex_tiled_map else TILED_PRIVATE_RESERVE_BYTES)
+            if self._kintex_tiled_map
+            else max(TILED_PRIVATE_RESERVE_BYTES,
+                     self._private_weight_upper_bound(script_dir, multi_core)))
         # THE TILED MAP IS SELECTED BY ENGINE COUNT AND BOARD. Kintex uses
         # its two 2 GiB controller windows. At 8 engines on a characterised
         # Alveo board, the windows become 1 GiB and
@@ -1158,7 +1191,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         elif multi_core >= TILED_MAP_MIN_ENGINES:
             try:
                 self._tile_bases = tiled_window_bases(
-                    multi_core, TILED_WINDOW_BYTES, "Gemma4 E2B")
+                    multi_core, TILED_WINDOW_BYTES, MODEL_TITLE)
                 self._tiled_map = True
             except (ValueError, RuntimeError) as exc:
                 print(f"  [map] tiled 1 GiB map unavailable, using the 512 MiB "
@@ -1323,8 +1356,18 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self.group_size = fi["group_size"]
         self.mlp_elements = fi["mlp_elements"]
         self.mlp_elements_wide = fi.get("mlp_elements_wide", fi["mlp_elements"])
-        self.q_size = self.head_dim * self.group_size * self.bytes_per_element
-        self.k_size = self.head_dim * self.bytes_per_element
+        # Attention heads. group_size is query heads PER KV head (GQA ratio):
+        # E2B has 8 query heads over 1 KV head, E4B 8 over 2 (group_size 4).
+        self.num_kv_heads = int(fi.get("num_key_value_heads", 1))
+        self.num_q_heads = int(fi.get("num_attention_heads",
+                                      self.group_size * self.num_kv_heads))
+        if self.num_q_heads != self.group_size * self.num_kv_heads:
+            raise ValueError(
+                f"num_attention_heads {self.num_q_heads} != group_size "
+                f"{self.group_size} x num_key_value_heads {self.num_kv_heads}")
+        # q_size / k_size: bytes of one token's Q / K row (all heads).
+        self.q_size = self.head_dim * self.num_q_heads * self.bytes_per_element
+        self.k_size = self.head_dim * self.num_kv_heads * self.bytes_per_element
         self.MAX_CONTEXT_SIZE = MAX_CONTEXT_SIZE
         # Keep fallback config lookups (for example sliding_window) consistent
         # when the source macro is changed without editing the JSON file.
@@ -1434,7 +1477,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         """Load gemma4_e2b_config.json and build weight_defs (offset/size dict) from regions."""
         if config_path is None:
             script_dir = script_dir or SCRIPT_DIR
-            config_path = os.path.join(script_dir, "gemma4_e2b_config.json")
+            config_path = os.path.join(script_dir, f"{MODEL_NAME}_config.json")
         with open(config_path, "r") as f:
             cfg = json.load(f)
         weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
@@ -1603,7 +1646,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
               f"{n_aud} audio, {len(token_ids) - n_img - n_aud} text)")
 
     def _program_image_paths(self, profile: bool = False) -> tuple[str, str]:
-        bin_dir = os.path.join(self.script_dir, "gemma4_e2b_bin")
+        bin_dir = os.path.join(self.script_dir, f"{MODEL_NAME}_bin")
         stem = "programs_profile" if profile else "programs"
         return (os.path.join(bin_dir, stem + ".bin"),
                 os.path.join(bin_dir, stem + ".json"))
@@ -1710,7 +1753,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self.allocate_program_dram(len(sect_bytes))
         return {**meta, "_dram_base_int": base}
 
-    def compile_gemma4(self, layer_size: int = 35, profile: bool = False) -> None:
+    def compile_gemma4(self, layer_size: int | None = None, profile: bool = False) -> None:
         """Capture [prefill][decoder] into one combined image and write it to
         disk (gemma4_e2b_bin/programs.bin + programs.json). No DRAM is touched —
         run_gemma4() loads it.
@@ -1722,6 +1765,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
 
         set_prefill_seq() MUST have been called first (prefill needs the prompt).
         """
+        layer_size = self.LAYER_SIZE if layer_size is None else int(layer_size)
         assert self.prefill_seq is not None, (
             "call set_prefill_seq() before compile_gemma4()")
         prefill_template_seq_len = int(self._cfg["model"].get(
@@ -2178,7 +2222,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         enc_hw_s = sum(v for v in (vis_us, aud_us) if v) / 1e6
         enc_wall_s = sum(v for v in (_g("_vis_e2e_s"), _g("_audio_e2e_s")) if v)
         return {
-            "model": "gemma4_e2b",
+            "model": MODEL_NAME,
             "multi_core": self.multi_core,
             "clock_mhz": round(freq_mhz, 3),
             "peak_gflops": round(peak, 1),
@@ -2261,7 +2305,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         is_audio = bool(getattr(args, "audio", None))
 
         lines = []
-        lines.append(f"# gemma4_e2b_test run summary")
+        lines.append(f"# {MODEL_NAME}_test run summary")
         lines.append("")
         lines.append(f"- **HW version:** {hw_version_str}")
         lines.append(f"- **--dev:** {args.dev}")
@@ -2700,7 +2744,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         ]
         hw = user_dma_core.configured_hardware_info()
         return write_profile_markdown(
-            out_path, title="Gemma4 E2B profile summary",
+            out_path, title=f"{MODEL_TITLE} profile summary",
             hardware={
                 "HW info": user_dma_core.hardware_info_summary(),
                 "DMA device": args.dev,
@@ -2774,6 +2818,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             measured_ms = self.report_latency_in_us() / 1e3
             results.append((name, measured_ms,
                             phase_flops))   # ms, FLOPs
+            # Debug hook: the master is halted at this checkpoint (workers are
+            # parked at a flag), so intermediate buffers can be read back.
+            _hook = getattr(self, "_profile_segment_hook", None)
+            if _hook is not None:
+                _hook(name)
             self.start_execute_from_dram(int(resume_hex, 16))
         self.wait_queue(timeout)   # tail segment: everything up to the terminal HALT
         tail_ms = self.report_latency_in_us() / 1e3
@@ -2820,7 +2869,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             if match:
                 layer_idx = int(match.group(1))
                 head_dim, _, _ = self._get_layer_attention_dims(layer_idx)
-                batch = self.group_size
+                batch = self.num_q_heads
                 # The inlined multi-core chain drops the Q pre-scale (gemma's attention
                 # scale is exactly 1.0, so it was a multiply by one); single-core still
                 # emits it via unified_attention_core.
@@ -3188,7 +3237,7 @@ def build_arg_parser():
     """
     import argparse
     parser = argparse.ArgumentParser(
-        description="Gemma4 E2B LM prefill + decode on the accelerator.",
+        description=f"{MODEL_TITLE} LM prefill + decode on the accelerator.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
   python gemma4_e2b_test.py                          # default prompt
@@ -3266,7 +3315,7 @@ def run_summary_filename(args) -> str:
     if args.bin_reuse:
         tokens.append("bin-reuse")
     suffix = "_profile" if args.profile else ""
-    return "gemma4_e2b_test_" + "_".join(str(t) for t in tokens) + suffix + ".md"
+    return f"{MODEL_NAME}_test_" + "_".join(str(t) for t in tokens) + suffix + ".md"
 
 
 def poison_dram(pattern: str = "ff", dram_range: str | None = None,
@@ -3507,7 +3556,7 @@ def main():
             print(f"Wrote profile summary: {_summary_path}")
         except Exception as _e:
             print(f"[warn] failed to write profile summary: {_e}")
-        print("Gemma4 E2B decode profile ends.")
+        print(f"{MODEL_TITLE} decode profile ends.")
         return
 
     # gemma3-style workflow: compile (decoder + real-seq_len prefill) then run
@@ -3537,7 +3586,7 @@ def main():
         print(f"[warn] failed to write run summary: {_e}")
     # One machine-readable line for benchmark.py (and any other driver).
     print("TEST_RESULT: " + json.dumps(ue.run_result(), ensure_ascii=False))
-    print("Gemma4 E2B LM test ends.")
+    print(f"{MODEL_TITLE} LM test ends.")
 
 
 if __name__ == "__main__":

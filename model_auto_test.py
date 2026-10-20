@@ -630,7 +630,7 @@ TESTS = [
     # tokens, while the vision cache keys only on kernel + engine count.
     {"name": "gemma4_e2b", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vlm, "extra_args": ["--image"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True},
     {"name": "gemma4_e2b_run_from_bin", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True},
-    {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)"},
+    {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--image"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True},
     {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "qwen3_0.6b",  "script": "models/qwen3_0.6b/qwen3_0.6b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},

@@ -3,6 +3,12 @@
 Gemma4 E2B accelerator inference. Text only (LM), image + text (VLM), audio +
 text, and image(s) + audio + text run from a single instruction bin.
 
+The same code runs Gemma4 E4B: [`../gemma4_e4b/gemma4_e4b_test.py`](../gemma4_e4b/README.md)
+launches it with E4B's config and artifacts (`set_model_variant`). Head counts,
+layer count and widths all come from the config (`num_attention_heads`,
+`num_key_value_heads`, `num_layers`, ...), and the KV cache is stored per KV
+head.
+
 ## Controller placement and current validation
 
 ```bash
