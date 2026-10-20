@@ -996,7 +996,6 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 # acknowledged, so it does not degrade as engines are added. Same
                 # region API, same bodies; only the synchronisation changes.
                 region_rendezvous="master_worker",
-                barrier_margin_nops=32,
                 allow_unaligned_rows=True,
                 allow_more_than_two_engines=self.multi_core > 2)
             self._multi_core_schedulers[stage] = scheduler

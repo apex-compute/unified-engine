@@ -1187,15 +1187,16 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             h_out = self.VIS_IO_B_DRAM if layer_idx % 2 == 0 else self.VIS_IO_A_DRAM
 
             # ---- REGION A: LN1 + q/k/v ----------------------------------------
-            # Ends WITHOUT a join: begin_sharded(B) below emits the rendezvous that
-            # region B's full-K/V read needs. join=True here would emit a second,
-            # redundant one.
+            # Ends WITH a join: region B gathers the FULL K/V every engine wrote a row
+            # block of. Each region is one master/worker round, and a join=False
+            # region leaves its round open for the next region with NO rendezvous, so
+            # this close is the fence.
             for ctx in sched.begin_sharded(S):
                 sh_layer_norm(ctx, h_in, self.VIS_LN_OUT_DRAM, la['ln1_weight'], la['ln1_bias'])
                 for proj, dst in [('q', self.VIS_Q_DRAM), ('k', self.VIS_K_DRAM), ('v', self.VIS_V_DRAM)]:
                     sh_matmul(ctx, H, H, self.VIS_LN_OUT_DRAM, H * bpe, la, proj, dst, H * bpe,
                               bias=la[f'{proj}_bias'])
-            sched.end_sharded(join=False)
+            sched.end_sharded(join=True)
 
             # ---- REGION B: attention + o + residual + LN2 + fc1 + fc2 + residual ----
             # Everything after attention is row-local, so it stays in lane with no
@@ -1215,8 +1216,10 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 sh_matmul(ctx, I, H, self.VIS_MLP_INTER_DRAM, I * bpe, la, 'fc2',
                           self.VIS_MLP_OUT_DRAM, H * bpe, bias=la['fc2_bias'])
                 sh_residual(ctx, self.VIS_RESIDUAL_DRAM, self.VIS_MLP_OUT_DRAM, h_out)
-            # Last layer joins: the primary-only post-LN below reads ALL rows.
-            sched.end_sharded(join=(layer_idx == n_layers - 1))
+            # Every layer joins: this close is the WAR fence against the next
+            # layer's K/V writes (a peer may still be gathering K/V here), and on the
+            # last layer the RAW fence for the primary-only post-LN below.
+            sched.end_sharded(join=True)
 
         # Post-layernorm, pixel shuffle, connector (M=64, static). Primary only.
         final_vis = self.VIS_IO_A_DRAM if len(self.vis_layer_addrs) % 2 == 0 else self.VIS_IO_B_DRAM
