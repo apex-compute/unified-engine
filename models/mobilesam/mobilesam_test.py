@@ -233,6 +233,57 @@ def multihead_reshape_dram_pbi(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
         )
 
 
+def multihead_split_heads_pbi(ue: UnifiedEngine, PADDED_DRAM_ADDR: int,
+                              OUTPUT_DRAM_ADDR: int, seq_len: int, num_heads: int,
+                              head_dim_pad: int, gpr_pbi: int) -> None:
+    """(seq_len, num_heads*head_dim_pad) token-major -> (num_heads, seq_len, head_dim_pad).
+
+    The input is ALREADY head-padded: the Q/K/V projection's strip write-back put
+    each head's real lanes at the start of its head_dim_pad slot (pad lanes zero), so
+    this is the second half of multihead_reshape_dram_pbi with the scatter pass gone.
+    One PBI loop per head, whole 128 B slots per iteration."""
+    head_bytes = head_dim_pad * _BPE
+    row_bytes = num_heads * head_dim_pad * _BPE
+    out_head_stride = seq_len * head_dim_pad * _BPE
+    for h in range(num_heads):
+        pbi_strided_copy(
+            ue, gpr_pbi,
+            src_base=PADDED_DRAM_ADDR + h * head_bytes,
+            dst_base=OUTPUT_DRAM_ADDR + h * out_head_stride,
+            count=seq_len,
+            copy_bytes=head_bytes,
+            src_stride=row_bytes,
+            dst_stride=head_bytes,
+        )
+
+
+def multihead_unpad_dma(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                        seq_len: int, num_heads: int, head_dim: int, head_dim_pad: int) -> None:
+    """(seq_len, num_heads*head_dim_pad) -> (seq_len, num_heads*head_dim): drop each
+    head's pad lanes with a periodic strided-read DMA instead of a selection matmul.
+
+    Every head is a head_dim-wide chunk on a head_dim_pad stride and a token row is an
+    exact multiple of that stride, so ONE strided read walks across many consecutive
+    tokens; SRAM capacity sets the batch. Only the read side is strided (a multi-chunk
+    strided WRITE returns wrong data on this device); writes are contiguous. The chunk
+    (head_dim*2 B) must be whole 32 B DMA beats: 64 B for head_dim 32, 32 B for 16."""
+    chunk_bytes = head_dim * _BPE
+    if chunk_bytes % 32:
+        raise ValueError(f"multihead_unpad_dma: head_dim={head_dim} chunk ({chunk_bytes} B) "
+                         f"is not a whole number of 32 B beats")
+    out_row = num_heads * head_dim
+    in_row = num_heads * head_dim_pad
+    tokens_per_chunk = max(1, URAM_NEAR_FULL_ELEMENTS // out_row)
+    for t0 in range(0, seq_len, tokens_per_chunk):
+        take = min(tokens_per_chunk, seq_len - t0)
+        ue.accelerator_memory_to_sram(
+            INPUT_DRAM_ADDR + t0 * in_row * _BPE, 0x00000, take * out_row,
+            stride_bytes_per_chunk=chunk_bytes,
+            stride_jump_bytes=head_dim_pad * _BPE)
+        ue.sram_to_accelerator_memory(
+            0x00000, OUTPUT_DRAM_ADDR + t0 * out_row * _BPE, take * out_row)
+
+
 # ===========================================================================
 # PBI conv / window / permute helpers (hardware-loop gathers -> tiny programs).
 # Verified bit-/SNR-exact against torch in user_hw_test.py. The legacy conv/window
@@ -622,9 +673,11 @@ def multihead_reshape_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
 def multihead_merge_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
                           OUTPUT_DRAM_ADDR: int, TEMP_DRAM_ADDR: int,
                           seq_len: int, num_heads: int,
-                          head_dim: int, head_dim_pad: int,
-                          UNPAD_WEIGHT_ADDR: int = None) -> None:
-    """(num_heads, seq_len, head_dim_pad) → (seq_len, num_heads*head_dim)."""
+                          head_dim: int, head_dim_pad: int) -> None:
+    """(num_heads, seq_len, head_dim_pad) → (seq_len, num_heads*head_dim).
+
+    The pad lanes are dropped by a strided-read DMA (multihead_unpad_dma), not by
+    the old (seq, heads*64) x (heads*64, heads*hd) selection matmul."""
     ue.bf16_permute_core(dim_0=num_heads, dim_1=seq_len, dim_2=head_dim_pad,
                          INPUT_DRAM_ADDR=INPUT_DRAM_ADDR,
                          OUTPUT_DRAM_ADDR=TEMP_DRAM_ADDR)
@@ -632,12 +685,8 @@ def multihead_merge_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int,
         total = seq_len * num_heads * head_dim
         dram_copy(ue, TEMP_DRAM_ADDR, OUTPUT_DRAM_ADDR, total)
     else:
-        padded_dim = num_heads * head_dim_pad
-        dim = num_heads * head_dim
-        ue.matmat_mul_core(M=seq_len, K=padded_dim, N=dim,
-                           A_DRAM_ADDR=TEMP_DRAM_ADDR,
-                           B_DRAM_ADDR=UNPAD_WEIGHT_ADDR,
-                           OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR)
+        multihead_unpad_dma(ue, TEMP_DRAM_ADDR, OUTPUT_DRAM_ADDR,
+                            seq_len, num_heads, head_dim, head_dim_pad)
 
 
 def cross_attn_flash_single_head(ue: UnifiedEngine, head_dim: int,
@@ -1013,24 +1062,6 @@ ENC_S3_HEAD_PAD = 64
 ENC_S3_MLP_HID  = 1280
 
 
-# ---------------------------------------------------------------------------
-# Static helper: unpad selection weight
-# ---------------------------------------------------------------------------
-
-def _build_unpad_weight(num_heads: int, head_dim: int, head_dim_pad: int) -> torch.Tensor:
-    """(K=num_heads*head_dim_pad, N=num_heads*head_dim) identity-block matrix.
-
-    matmul(padded_output [seq, K], W [K, N]) → unpadded_output [seq, N].
-    Stored as W.T (N, K) for matmat_mul_core which computes A @ B^T.
-    """
-    K = num_heads * head_dim_pad
-    N = num_heads * head_dim
-    W = torch.zeros(K, N, dtype=torch.bfloat16)
-    for h in range(num_heads):
-        for d in range(head_dim):
-            W[h * head_dim_pad + d, h * head_dim + d] = 1.0
-    return W   # caller does .T.contiguous() before _alloc_param
-
 
 
 
@@ -1129,55 +1160,37 @@ class MobileSAM_UE(UnifiedEngine):
             lp = md + f"transformer.layers.{i}."
             lw = {}
 
-            # Self-attention: internal_dim=256, head_dim=32 → pad to 64
+            # Self-attention: internal_dim=256, head_dim=32. Weights stay COMPACT
+            # (256 rows); the projection matmul's strip write-back pads each head
+            # 32 -> 64 on the way out (see _dec_proj_strip).
             for proj in ("q", "k", "v"):
-                w_raw = sd[lp + f"self_attn.{proj}_proj.weight"].to(torch.bfloat16)  # (256, 256)
-                b_raw = sd[lp + f"self_attn.{proj}_proj.bias"].to(torch.bfloat16)    # (256,)
-                w_pad = torch.zeros(DEC_HEADS * DEC_HD_PAD, DEC_DIM, dtype=torch.bfloat16)
-                b_pad = torch.zeros(DEC_HEADS * DEC_HD_PAD, dtype=torch.bfloat16)
-                for h in range(DEC_HEADS):
-                    w_pad[h*DEC_HD_PAD : h*DEC_HD_PAD+DEC_SA_HD] = \
-                        w_raw[h*DEC_SA_HD : (h+1)*DEC_SA_HD]
-                    b_pad[h*DEC_HD_PAD : h*DEC_HD_PAD+DEC_SA_HD] = \
-                        b_raw[h*DEC_SA_HD : (h+1)*DEC_SA_HD]
-                lw[f'sa_{proj}_w'] = self._alloc_param(w_pad)
-                lw[f'sa_{proj}_b'] = self._alloc_param(b_pad)
+                lw[f'sa_{proj}_w'] = self._alloc_param(
+                    sd[lp + f"self_attn.{proj}_proj.weight"].to(torch.bfloat16))  # (256, 256)
+                lw[f'sa_{proj}_b'] = self._alloc_param(
+                    sd[lp + f"self_attn.{proj}_proj.bias"].to(torch.bfloat16))    # (256,)
             lw['sa_out_w'] = self._alloc_param(
                 sd[lp + "self_attn.out_proj.weight"].to(torch.bfloat16))   # (256, 256)
             lw['sa_out_b'] = self._alloc_param(
                 sd[lp + "self_attn.out_proj.bias"].to(torch.bfloat16))
 
-            # Cross-attn t2i: internal_dim=128, head_dim=16 → pad to 64
+            # Cross-attn t2i: internal_dim=128, head_dim=16. Compact (128 rows);
+            # strip write-back pads 16 -> 64 per head.
             for proj in ("q", "k", "v"):
-                w_raw = sd[lp + f"cross_attn_token_to_image.{proj}_proj.weight"].to(torch.bfloat16)
-                b_raw = sd[lp + f"cross_attn_token_to_image.{proj}_proj.bias"].to(torch.bfloat16)
-                w_pad = torch.zeros(DEC_HEADS * DEC_HD_PAD, DEC_DIM, dtype=torch.bfloat16)
-                b_pad = torch.zeros(DEC_HEADS * DEC_HD_PAD, dtype=torch.bfloat16)
-                for h in range(DEC_HEADS):
-                    w_pad[h*DEC_HD_PAD : h*DEC_HD_PAD+DEC_CA_HD] = \
-                        w_raw[h*DEC_CA_HD : (h+1)*DEC_CA_HD]
-                    b_pad[h*DEC_HD_PAD : h*DEC_HD_PAD+DEC_CA_HD] = \
-                        b_raw[h*DEC_CA_HD : (h+1)*DEC_CA_HD]
-                lw[f't2i_{proj}_w'] = self._alloc_param(w_pad)
-                lw[f't2i_{proj}_b'] = self._alloc_param(b_pad)
+                lw[f't2i_{proj}_w'] = self._alloc_param(
+                    sd[lp + f"cross_attn_token_to_image.{proj}_proj.weight"].to(torch.bfloat16))
+                lw[f't2i_{proj}_b'] = self._alloc_param(
+                    sd[lp + f"cross_attn_token_to_image.{proj}_proj.bias"].to(torch.bfloat16))
             lw['t2i_out_w'] = self._alloc_param(
                 sd[lp + "cross_attn_token_to_image.out_proj.weight"].to(torch.bfloat16))
             lw['t2i_out_b'] = self._alloc_param(
                 sd[lp + "cross_attn_token_to_image.out_proj.bias"].to(torch.bfloat16))
 
-            # Cross-attn i2t: same dims as t2i
+            # Cross-attn i2t: same dims as t2i, compact.
             for proj in ("q", "k", "v"):
-                w_raw = sd[lp + f"cross_attn_image_to_token.{proj}_proj.weight"].to(torch.bfloat16)
-                b_raw = sd[lp + f"cross_attn_image_to_token.{proj}_proj.bias"].to(torch.bfloat16)
-                w_pad = torch.zeros(DEC_HEADS * DEC_HD_PAD, DEC_DIM, dtype=torch.bfloat16)
-                b_pad = torch.zeros(DEC_HEADS * DEC_HD_PAD, dtype=torch.bfloat16)
-                for h in range(DEC_HEADS):
-                    w_pad[h*DEC_HD_PAD : h*DEC_HD_PAD+DEC_CA_HD] = \
-                        w_raw[h*DEC_CA_HD : (h+1)*DEC_CA_HD]
-                    b_pad[h*DEC_HD_PAD : h*DEC_HD_PAD+DEC_CA_HD] = \
-                        b_raw[h*DEC_CA_HD : (h+1)*DEC_CA_HD]
-                lw[f'i2t_{proj}_w'] = self._alloc_param(w_pad)
-                lw[f'i2t_{proj}_b'] = self._alloc_param(b_pad)
+                lw[f'i2t_{proj}_w'] = self._alloc_param(
+                    sd[lp + f"cross_attn_image_to_token.{proj}_proj.weight"].to(torch.bfloat16))
+                lw[f'i2t_{proj}_b'] = self._alloc_param(
+                    sd[lp + f"cross_attn_image_to_token.{proj}_proj.bias"].to(torch.bfloat16))
             lw['i2t_out_w'] = self._alloc_param(
                 sd[lp + "cross_attn_image_to_token.out_proj.weight"].to(torch.bfloat16))
             lw['i2t_out_b'] = self._alloc_param(
@@ -1226,14 +1239,6 @@ class MobileSAM_UE(UnifiedEngine):
             'w': self._alloc_param(sd[nfa + "weight"].to(torch.bfloat16)),
             'b': self._alloc_param(sd[nfa + "bias"].to(torch.bfloat16)),
         }
-
-        # ---- Unpad weights (constructed, not from checkpoint) ----
-        # SA:  (heads*HD_PAD=512, heads*HD=256) stored as (256, 512) for matmat
-        self.DEC_SA_UNPAD_W = self._alloc_param(
-            _build_unpad_weight(DEC_HEADS, DEC_SA_HD, DEC_HD_PAD).T.contiguous())
-        # CA:  (heads*HD_PAD=512, heads*HD=128) stored as (128, 512)
-        self.DEC_CA_UNPAD_W = self._alloc_param(
-            _build_unpad_weight(DEC_HEADS, DEC_CA_HD, DEC_HD_PAD).T.contiguous())
 
         # ---- Attention biases (padding masks) ----
         # Self-attn: mask padded kv positions [NT:NT_PAD] with -inf
@@ -1423,6 +1428,32 @@ class MobileSAM_UE(UnifiedEngine):
     # Internal compile helpers
     # ------------------------------------------------------------------
 
+    def _dec_proj_strip(self, M: int, src: int, w: int, b: int, dst: int, head_dim: int) -> None:
+        """One decoder Q/K/V projection at its REAL width (N = DEC_HEADS*head_dim,
+        compact weight), written head-padded: the matmul's strip write-back puts
+        strip h (head h's head_dim columns) at column h*DEC_HD_PAD of a
+        (M, DEC_HEADS*DEC_HD_PAD) row. The pad lanes of ``dst`` are never written;
+        _zero_dec_proj_pads() clears them once per program."""
+        stride_reg = self.alloc_isa_reg()
+        self.generate_instruction_add_set(stride_reg, DEC_HEADS * DEC_HD_PAD)
+        self.matmat_mul_core(
+            M=M, K=DEC_DIM, N=DEC_HEADS * head_dim,
+            A_DRAM_ADDR=src, B_DRAM_ADDR=w,
+            OUTPUT_DRAM_ADDR=dst,
+            C_DRAM_ADDR=b, bias_mode="broadcast_N",
+            gpr_out_row_stride_reg=stride_reg,
+            strip_cols=head_dim, strip_out_stride=DEC_HD_PAD,
+        )
+        self.release_isa_reg()
+
+    def _zero_dec_proj_pads(self) -> None:
+        """Zero every strip write-back destination once; the matmuls only ever
+        touch the real lanes afterwards."""
+        for addr, rows in ((self.SA_Q_PROJ, NT_PAD), (self.SA_K_PROJ, NT_PAD), (self.SA_V_PROJ, NT_PAD),
+                           (self.T2I_Q_PROJ, NT_PAD), (self.T2I_K_PROJ, GA), (self.T2I_V_PROJ, GA),
+                           (self.I2T_Q_PROJ, GA), (self.I2T_K_PROJ, NT_PAD), (self.I2T_V_PROJ, NT_PAD)):
+            dram_zero_fill(self, addr, rows * DEC_HEADS * DEC_HD_PAD)
+
     def _self_attn(self, lw: dict, skip_pe: bool) -> None:
         """Compile one self-attention block on TOKENS_DRAM.
 
@@ -1439,14 +1470,8 @@ class MobileSAM_UE(UnifiedEngine):
             ('k', q_src,              self.SA_K_PROJ),
             ('v', self.TOKENS_DRAM,   self.SA_V_PROJ),
         ]:
-            self.matmat_mul_core(
-                M=NT_PAD, K=DEC_DIM, N=DEC_HEADS * DEC_HD_PAD,
-                A_DRAM_ADDR=src_addr,
-                B_DRAM_ADDR=lw[f'sa_{proj}_w'],
-                OUTPUT_DRAM_ADDR=dst_addr,
-                C_DRAM_ADDR=lw[f'sa_{proj}_b'],
-                bias_mode="broadcast_N",
-            )
+            self._dec_proj_strip(NT_PAD, src_addr, lw[f'sa_{proj}_w'], lw[f'sa_{proj}_b'],
+                                 dst_addr, DEC_SA_HD)
 
         # Reshape (NT_PAD, heads*hd_pad) → (heads, NT_PAD, hd_pad)
         # matmul already outputs interleaved padded layout; only permute needed
@@ -1489,7 +1514,6 @@ class MobileSAM_UE(UnifiedEngine):
             TEMP_DRAM_ADDR=self.SA_MERGE_TMP,
             seq_len=NT_PAD, num_heads=DEC_HEADS,
             head_dim=DEC_SA_HD, head_dim_pad=DEC_HD_PAD,
-            UNPAD_WEIGHT_ADDR=self.DEC_SA_UNPAD_W,
         )
 
         # out_proj: (NT_PAD, 256) @ (256, 256)^T + bias → (NT_PAD, 256)
@@ -1513,27 +1537,10 @@ class MobileSAM_UE(UnifiedEngine):
         V_SRC:  (4096, 256) — image src without pe (for V)
         q_len: padded token count (NT_PAD = 64)
         """
-        # Q proj: (q_len, 256) → (q_len, 512)
-        self.matmat_mul_core(
-            M=q_len, K=DEC_DIM, N=DEC_HEADS * DEC_HD_PAD,
-            A_DRAM_ADDR=Q_SRC, B_DRAM_ADDR=q_w,
-            OUTPUT_DRAM_ADDR=self.T2I_Q_PROJ,
-            C_DRAM_ADDR=q_b, bias_mode="broadcast_N",
-        )
-        # K proj: (4096, 256) → (4096, 512)
-        self.matmat_mul_core(
-            M=GA, K=DEC_DIM, N=DEC_HEADS * DEC_HD_PAD,
-            A_DRAM_ADDR=KV_SRC, B_DRAM_ADDR=k_w,
-            OUTPUT_DRAM_ADDR=self.T2I_K_PROJ,
-            C_DRAM_ADDR=k_b, bias_mode="broadcast_N",
-        )
-        # V proj: (4096, 256) → (4096, 512)
-        self.matmat_mul_core(
-            M=GA, K=DEC_DIM, N=DEC_HEADS * DEC_HD_PAD,
-            A_DRAM_ADDR=V_SRC, B_DRAM_ADDR=v_w,
-            OUTPUT_DRAM_ADDR=self.T2I_V_PROJ,
-            C_DRAM_ADDR=v_b, bias_mode="broadcast_N",
-        )
+        # Q/K/V proj at real N=128, written head-padded (q_len|4096, 512)
+        self._dec_proj_strip(q_len, Q_SRC, q_w, q_b, self.T2I_Q_PROJ, DEC_CA_HD)
+        self._dec_proj_strip(GA, KV_SRC, k_w, k_b, self.T2I_K_PROJ, DEC_CA_HD)
+        self._dec_proj_strip(GA, V_SRC, v_w, v_b, self.T2I_V_PROJ, DEC_CA_HD)
 
         # Reshape → multi-head layout (permute only; matmul output already interleaved padded)
         self.bf16_permute_core(
@@ -1584,7 +1591,6 @@ class MobileSAM_UE(UnifiedEngine):
             TEMP_DRAM_ADDR=self.T2I_MERGE_TMP,
             seq_len=q_len, num_heads=DEC_HEADS,
             head_dim=DEC_CA_HD, head_dim_pad=DEC_HD_PAD,
-            UNPAD_WEIGHT_ADDR=self.DEC_CA_UNPAD_W,
         )
 
         # out_proj: (q_len, 128) @ (256, 128)^T + bias → (q_len, 256)
@@ -1606,27 +1612,10 @@ class MobileSAM_UE(UnifiedEngine):
         KV_SRC: (NT_PAD, 256) — tokens + query_pe  (for K)
         V_SRC:  (NT_PAD, 256) — tokens without pe  (for V)
         """
-        # Q proj: (4096, 256) → (4096, 512)
-        self.matmat_mul_core(
-            M=GA, K=DEC_DIM, N=DEC_HEADS * DEC_HD_PAD,
-            A_DRAM_ADDR=Q_SRC, B_DRAM_ADDR=q_w,
-            OUTPUT_DRAM_ADDR=self.I2T_Q_PROJ,
-            C_DRAM_ADDR=q_b, bias_mode="broadcast_N",
-        )
-        # K proj: (NT_PAD, 256) → (NT_PAD, 512)
-        self.matmat_mul_core(
-            M=NT_PAD, K=DEC_DIM, N=DEC_HEADS * DEC_HD_PAD,
-            A_DRAM_ADDR=KV_SRC, B_DRAM_ADDR=k_w,
-            OUTPUT_DRAM_ADDR=self.I2T_K_PROJ,
-            C_DRAM_ADDR=k_b, bias_mode="broadcast_N",
-        )
-        # V proj: (NT_PAD, 256) → (NT_PAD, 512)
-        self.matmat_mul_core(
-            M=NT_PAD, K=DEC_DIM, N=DEC_HEADS * DEC_HD_PAD,
-            A_DRAM_ADDR=V_SRC, B_DRAM_ADDR=v_w,
-            OUTPUT_DRAM_ADDR=self.I2T_V_PROJ,
-            C_DRAM_ADDR=v_b, bias_mode="broadcast_N",
-        )
+        # Q/K/V proj at real N=128, written head-padded (4096|NT_PAD, 512)
+        self._dec_proj_strip(GA, Q_SRC, q_w, q_b, self.I2T_Q_PROJ, DEC_CA_HD)
+        self._dec_proj_strip(NT_PAD, KV_SRC, k_w, k_b, self.I2T_K_PROJ, DEC_CA_HD)
+        self._dec_proj_strip(NT_PAD, V_SRC, v_w, v_b, self.I2T_V_PROJ, DEC_CA_HD)
 
         # Reshape → multi-head (permute only; matmul output already interleaved padded)
         self.bf16_permute_core(
@@ -1681,7 +1670,6 @@ class MobileSAM_UE(UnifiedEngine):
             TEMP_DRAM_ADDR=self.I2T_MERGE_TMP,
             seq_len=GA, num_heads=DEC_HEADS,
             head_dim=DEC_CA_HD, head_dim_pad=DEC_HD_PAD,
-            UNPAD_WEIGHT_ADDR=self.DEC_CA_UNPAD_W,
         )
 
         # out_proj: (4096, 128) @ (256, 128)^T + bias → (4096, 256)
@@ -1704,6 +1692,7 @@ class MobileSAM_UE(UnifiedEngine):
         Returns the program DRAM address.
         """
         self.start_capture()
+        self._zero_dec_proj_pads()
 
         # === Step 0: src = image_emb + dense (written to SRC_DRAM before execute) ===
         # NOTE: image_emb + dense is computed CPU-side and DMAed into SRC_DRAM directly.
@@ -2342,8 +2331,6 @@ class MobileSAM_UE(UnifiedEngine):
             # proj
             proj_w = sd[f"{pfx}.attn.proj.weight"].to(torch.bfloat16)   # (128, 128)
             proj_b = sd[f"{pfx}.attn.proj.bias"].to(torch.bfloat16)     # (128,)
-            # unpad weight: (4*64, 4*32) = (256, 128)
-            unpad_w = _build_unpad_weight(ENC_S1_HEADS, ENC_S1_HEAD_DIM, ENC_S1_HEAD_PAD)
             # local_conv: depthwise 3×3, BN-fold, block-diagonal
             lc_w = sd[f"{pfx}.local_conv.c.weight"].float()  # (128, 1, 3, 3)
             lc_wf, lc_bf = _bn_fold(
@@ -2378,7 +2365,6 @@ class MobileSAM_UE(UnifiedEngine):
             d["bias"]   = _ap(bias_pad, f"s1b{bi}_bias")
             d["proj_w"] = _ap(proj_w, f"s1b{bi}_projw")
             d["proj_b"] = _ap(proj_b, f"s1b{bi}_projb")
-            d["unpad"]  = _ap(unpad_w.T.contiguous(), f"s1b{bi}_unpad")
             d["lc_w"]   = _ap(W_lc, f"s1b{bi}_lcw")
             d["lc_b"]   = _ap(lc_bf.to(torch.bfloat16), f"s1b{bi}_lcb")
             d["lc_zero"]= _ap(torch.zeros(ENC_S1_C, dtype=torch.bfloat16), f"s1b{bi}_lczero")
@@ -2396,10 +2382,13 @@ class MobileSAM_UE(UnifiedEngine):
         _NTOK = ENC_S1_NWIN * ENC_S1_WIN_PAD   # 361*64 = 23104
         _HW1  = ENC_S1_H * ENC_S1_W            # 16384
         self.S1_WIN_DRAM    = self.allocate_tensor_dram(_NTOK * ENC_S1_C * _BPE,           "s1_win")
-        self.S1_Q_DRAM      = self.allocate_tensor_dram(_NTOK * ENC_S1_C * _BPE,           "s1_q")
-        self.S1_K_DRAM      = self.allocate_tensor_dram(_NTOK * ENC_S1_C * _BPE,           "s1_k")
-        self.S1_V_DRAM      = self.allocate_tensor_dram(_NTOK * ENC_S1_C * _BPE,           "s1_v")
-        # after multihead_reshape: (heads, NTOK, HEAD_PAD)
+        # Q/K/V projections land HEAD-PADDED, (NTOK, heads*HEAD_PAD): the matmul's strip
+        # write-back puts each head's 32 real lanes at the start of its 64-lane slot.
+        _QKV_BUF = _NTOK * ENC_S1_HEADS * ENC_S1_HEAD_PAD
+        self.S1_Q_DRAM      = self.allocate_tensor_dram(_QKV_BUF * _BPE,                   "s1_q")
+        self.S1_K_DRAM      = self.allocate_tensor_dram(_QKV_BUF * _BPE,                   "s1_k")
+        self.S1_V_DRAM      = self.allocate_tensor_dram(_QKV_BUF * _BPE,                   "s1_v")
+        # after multihead split: (heads, NTOK, HEAD_PAD)
         _HEAD_BUF = ENC_S1_HEADS * _NTOK * ENC_S1_HEAD_PAD
         self.S1_Q_HEAD_DRAM = self.allocate_tensor_dram(_HEAD_BUF * _BPE,                  "s1_q_head")
         self.S1_K_HEAD_DRAM = self.allocate_tensor_dram(_HEAD_BUF * _BPE,                  "s1_k_head")
@@ -2543,10 +2532,6 @@ class MobileSAM_UE(UnifiedEngine):
             # proj: (160,160) → (192,192)
             proj_w = _pad_s2_w(sd[f"{pfx}.attn.proj.weight"].float().reshape(_C2, _C2))
             proj_b = _pad_b2(sd[f"{pfx}.attn.proj.bias"].float())
-            # unpad weight: (5*64=320, 160) → pad output to 192, store .T
-            unpad_w_real = _build_unpad_weight(_H2, _HD2, _HP2)  # (320, 160)
-            unpad_w = torch.zeros(_H2 * _HP2, _CP2, dtype=torch.bfloat16)
-            unpad_w[:, :_C2] = unpad_w_real.to(torch.bfloat16)
             # local_conv: (160,1,3,3) → 3 blocks of 64 (last block all-zero)
             lc_w = sd[f"{pfx}.local_conv.c.weight"].float()
             lc_wf, lc_bf = _bn_fold(
@@ -2588,7 +2573,6 @@ class MobileSAM_UE(UnifiedEngine):
             d["bias"]    = _ap(bias_pad, f"s2b{bi}_bias")
             d["proj_w"]  = _ap(proj_w,  f"s2b{bi}_projw")
             d["proj_b"]  = _ap(proj_b,  f"s2b{bi}_projb")
-            d["unpad"]   = _ap(unpad_w.T.contiguous(), f"s2b{bi}_unpad")
             d["lc_w"]    = _ap(W_lc,  f"s2b{bi}_lcw")
             d["lc_b"]    = _ap(lc_bf.to(torch.bfloat16), f"s2b{bi}_lcb")
             d["lc_zero"] = _ap(torch.zeros(_CP2, dtype=torch.bfloat16), f"s2b{bi}_lczero")
@@ -2607,9 +2591,11 @@ class MobileSAM_UE(UnifiedEngine):
         _HW2   = ENC_S2_H * ENC_S2_W             # 4096
         _HEAD_BUF2 = ENC_S2_HEADS * _NTOK2 * ENC_S2_HEAD_PAD  # 5*6400*64
         self.S2_WIN_DRAM     = self.allocate_tensor_dram(_NTOK2 * _CP2 * _BPE,   "s2_win")
-        self.S2_Q_DRAM       = self.allocate_tensor_dram(_NTOK2 * _CP2 * _BPE,   "s2_q")
-        self.S2_K_DRAM       = self.allocate_tensor_dram(_NTOK2 * _CP2 * _BPE,   "s2_k")
-        self.S2_V_DRAM       = self.allocate_tensor_dram(_NTOK2 * _CP2 * _BPE,   "s2_v")
+        # Q/K/V projections land head-padded (NTOK, 5*64=320) via the strip write-back.
+        _QKV_BUF2 = _NTOK2 * ENC_S2_HEADS * ENC_S2_HEAD_PAD
+        self.S2_Q_DRAM       = self.allocate_tensor_dram(_QKV_BUF2 * _BPE,       "s2_q")
+        self.S2_K_DRAM       = self.allocate_tensor_dram(_QKV_BUF2 * _BPE,       "s2_k")
+        self.S2_V_DRAM       = self.allocate_tensor_dram(_QKV_BUF2 * _BPE,       "s2_v")
         self.S2_Q_HEAD_DRAM  = self.allocate_tensor_dram(_HEAD_BUF2 * _BPE,      "s2_q_head")
         self.S2_K_HEAD_DRAM  = self.allocate_tensor_dram(_HEAD_BUF2 * _BPE,      "s2_k_head")
         self.S2_V_HEAD_DRAM  = self.allocate_tensor_dram(_HEAD_BUF2 * _BPE,      "s2_v_head")
@@ -2617,6 +2603,7 @@ class MobileSAM_UE(UnifiedEngine):
         _SCRATCH2 = ENC_S2_NWIN * (ENC_S2_HEAD_PAD * ENC_S2_WIN_PAD + ENC_S2_WIN_PAD ** 2)
         self.S2_FLASH_SCRATCH = self.allocate_tensor_dram(_SCRATCH2 * _BPE,      "s2_fscr")
         self.S2_MH_TEMP      = self.allocate_tensor_dram(_NTOK2 * ENC_S2_HEADS * ENC_S2_HEAD_PAD * _BPE, "s2_mh_tmp")
+        self.S2_UNPAD_TMP    = self.allocate_tensor_dram(_NTOK2 * ENC_S2_C * _BPE, "s2_unpad_tmp")  # (NTOK, 160) compact
         self.S2_MERGED_DRAM  = self.allocate_tensor_dram(_NTOK2 * _CP2 * _BPE,   "s2_merged")
         self.S2_PROJ_DRAM    = self.allocate_tensor_dram(_NTOK2 * _CP2 * _BPE,   "s2_proj")
         self.S2_REV_DRAM     = self.allocate_tensor_dram(_HW2   * _CP2 * _BPE,   "s2_rev")
@@ -2724,7 +2711,6 @@ class MobileSAM_UE(UnifiedEngine):
             bias_pad = bias_pad.to(torch.bfloat16)
             proj_w = sd[f"{pfx}.attn.proj.weight"].to(torch.bfloat16)   # (320, 320)
             proj_b = sd[f"{pfx}.attn.proj.bias"].to(torch.bfloat16)
-            unpad_w = _build_unpad_weight(ENC_S3_HEADS, ENC_S3_HEAD_DIM, ENC_S3_HEAD_PAD)
             lc_w = sd[f"{pfx}.local_conv.c.weight"].float()  # (320, 1, 3, 3)
             lc_wf, lc_bf = _bn_fold(
                 lc_w, sd[f"{pfx}.local_conv.bn.weight"].float(),
@@ -2756,7 +2742,6 @@ class MobileSAM_UE(UnifiedEngine):
             d["bias"]    = _ap(bias_pad, f"s3b{bi}_bias")
             d["proj_w"]  = _ap(proj_w, f"s3b{bi}_projw")
             d["proj_b"]  = _ap(proj_b, f"s3b{bi}_projb")
-            d["unpad"]   = _ap(unpad_w.T.contiguous(), f"s3b{bi}_unpad")
             d["lc_w"]    = _ap(W_lc,  f"s3b{bi}_lcw")
             d["lc_b"]    = _ap(lc_bf.to(torch.bfloat16), f"s3b{bi}_lcb")
             d["lc_zero"] = _ap(torch.zeros(_C3, dtype=torch.bfloat16), f"s3b{bi}_lczero")
@@ -2775,9 +2760,11 @@ class MobileSAM_UE(UnifiedEngine):
         _HW3   = ENC_S3_H * ENC_S3_W             # 4096
         _HEAD_BUF3 = ENC_S3_HEADS * _NTOK3 * ENC_S3_HEAD_PAD  # 10*6400*64
         self.S3_WIN_DRAM     = self.allocate_tensor_dram(_NTOK3 * _C3 * _BPE,    "s3_win")
-        self.S3_Q_DRAM       = self.allocate_tensor_dram(_NTOK3 * _C3 * _BPE,    "s3_q")
-        self.S3_K_DRAM       = self.allocate_tensor_dram(_NTOK3 * _C3 * _BPE,    "s3_k")
-        self.S3_V_DRAM       = self.allocate_tensor_dram(_NTOK3 * _C3 * _BPE,    "s3_v")
+        # Q/K/V projections land head-padded (NTOK, 10*64) via the strip write-back.
+        _QKV_BUF3 = _NTOK3 * ENC_S3_HEADS * ENC_S3_HEAD_PAD
+        self.S3_Q_DRAM       = self.allocate_tensor_dram(_QKV_BUF3 * _BPE,       "s3_q")
+        self.S3_K_DRAM       = self.allocate_tensor_dram(_QKV_BUF3 * _BPE,       "s3_k")
+        self.S3_V_DRAM       = self.allocate_tensor_dram(_QKV_BUF3 * _BPE,       "s3_v")
         self.S3_Q_HEAD_DRAM  = self.allocate_tensor_dram(_HEAD_BUF3 * _BPE,      "s3_q_head")
         self.S3_K_HEAD_DRAM  = self.allocate_tensor_dram(_HEAD_BUF3 * _BPE,      "s3_k_head")
         self.S3_V_HEAD_DRAM  = self.allocate_tensor_dram(_HEAD_BUF3 * _BPE,      "s3_v_head")
@@ -2867,35 +2854,41 @@ class MobileSAM_UE(UnifiedEngine):
         # attn norm
         _ln_hw(INPUT_DRAM, self.S1_LN_DRAM, w["an_g"], w["an_b"])
 
+        def _qkv_strip(src, K_in, W, b, dst):
+            """Q/K/V projection at the REAL width N=ENC_S1_C (= ENC_S1_HEADS x ENC_S1_HEAD_DIM; for the
+            channel-padded weights only the first N rows/bias lanes are read), written
+            head-padded (NTOK, ENC_S1_HEADS*_HP) by the matmul's strip write-back: strip h
+            (head h's ENC_S1_HEAD_DIM columns) lands at column h*_HP. Replaces the old padded-N
+            matmul + multihead_reshape scatter pass. ``dst`` pad lanes are zeroed below."""
+            _set_ntok()
+            stride_reg = self.alloc_isa_reg()
+            self.generate_instruction_add_set(stride_reg, ENC_S1_HEADS * _HP)
+            self.matmat_mul_core(M=_NTOK, K=K_in, N=ENC_S1_C,
+                                 A_DRAM_ADDR=src, B_DRAM_ADDR=W,
+                                 OUTPUT_DRAM_ADDR=dst,
+                                 C_DRAM_ADDR=b, bias_mode="broadcast_N",
+                                 gpr_M_reg=gpr_ntok,
+                                 gpr_out_row_stride_reg=stride_reg,
+                                 strip_cols=ENC_S1_HEAD_DIM, strip_out_stride=_HP)
+            self.release_isa_reg()
+
+        for _dst in (self.S1_Q_DRAM, self.S1_K_DRAM, self.S1_V_DRAM):
+            dram_zero_fill(self, _dst, _NTOK * ENC_S1_HEADS * _HP)
+
         window_partition_dram(self, self.S1_LN_DRAM, self.S1_WIN_DRAM,
                               ENC_S1_H, ENC_S1_W, ENC_S1_C, ENC_S1_WS)
 
         # Q, K, V projections
-        _set_ntok()
-        self.matmat_mul_core(M=_NTOK, K=ENC_S1_C, N=ENC_S1_C,
-                             A_DRAM_ADDR=self.S1_WIN_DRAM, B_DRAM_ADDR=w["W_q"],
-                             OUTPUT_DRAM_ADDR=self.S1_Q_DRAM,
-                             C_DRAM_ADDR=w["b_q"], bias_mode="broadcast_N",
-                             gpr_M_reg=gpr_ntok)
-        _set_ntok()
-        self.matmat_mul_core(M=_NTOK, K=ENC_S1_C, N=ENC_S1_C,
-                             A_DRAM_ADDR=self.S1_WIN_DRAM, B_DRAM_ADDR=w["W_k"],
-                             OUTPUT_DRAM_ADDR=self.S1_K_DRAM,
-                             C_DRAM_ADDR=w["b_k"], bias_mode="broadcast_N",
-                             gpr_M_reg=gpr_ntok)
-        _set_ntok()
-        self.matmat_mul_core(M=_NTOK, K=ENC_S1_C, N=ENC_S1_C,
-                             A_DRAM_ADDR=self.S1_WIN_DRAM, B_DRAM_ADDR=w["W_v"],
-                             OUTPUT_DRAM_ADDR=self.S1_V_DRAM,
-                             C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N",
-                             gpr_M_reg=gpr_ntok)
+        _qkv_strip(self.S1_WIN_DRAM, ENC_S1_C, w["W_q"], w["b_q"], self.S1_Q_DRAM)
+        _qkv_strip(self.S1_WIN_DRAM, ENC_S1_C, w["W_k"], w["b_k"], self.S1_K_DRAM)
+        _qkv_strip(self.S1_WIN_DRAM, ENC_S1_C, w["W_v"], w["b_v"], self.S1_V_DRAM)
 
-        multihead_reshape_dram_pbi(self, self.S1_Q_DRAM, self.S1_Q_HEAD_DRAM, self.S1_MH_TEMP,
-                                   _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP, gpr_pbi)
-        multihead_reshape_dram_pbi(self, self.S1_K_DRAM, self.S1_K_HEAD_DRAM, self.S1_MH_TEMP,
-                                   _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP, gpr_pbi)
-        multihead_reshape_dram_pbi(self, self.S1_V_DRAM, self.S1_V_HEAD_DRAM, self.S1_MH_TEMP,
-                                   _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP, gpr_pbi)
+        multihead_split_heads_pbi(self, self.S1_Q_DRAM, self.S1_Q_HEAD_DRAM,
+                                  _NTOK, ENC_S1_HEADS, _HP, gpr_pbi)
+        multihead_split_heads_pbi(self, self.S1_K_DRAM, self.S1_K_HEAD_DRAM,
+                                  _NTOK, ENC_S1_HEADS, _HP, gpr_pbi)
+        multihead_split_heads_pbi(self, self.S1_V_DRAM, self.S1_V_HEAD_DRAM,
+                                  _NTOK, ENC_S1_HEADS, _HP, gpr_pbi)
         broadcast_mul_dram(self, self.S1_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
                            ENC_S1_HEADS * _NTOK * _HP)
 
@@ -2914,8 +2907,7 @@ class MobileSAM_UE(UnifiedEngine):
                 bias_shared=True, _silent=True)
 
         multihead_merge_dram(self, self.S1_ATTN_DRAM, self.S1_MERGED_DRAM, self.S1_MH_TEMP,
-                             _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP,
-                             UNPAD_WEIGHT_ADDR=w["unpad"])
+                             _NTOK, ENC_S1_HEADS, ENC_S1_HEAD_DIM, _HP)
 
         # proj
         _set_ntok()
@@ -2987,37 +2979,40 @@ class MobileSAM_UE(UnifiedEngine):
 
         _ln_hw(INPUT_DRAM, self.S2_LN_DRAM, w["an_g"], w["an_b"])
 
+        def _qkv_strip(src, K_in, W, b, dst):
+            """Q/K/V projection at the REAL width N=ENC_S2_C (= ENC_S2_HEADS x ENC_S2_HEAD_DIM; for the
+            channel-padded weights only the first N rows/bias lanes are read), written
+            head-padded (NTOK, ENC_S2_HEADS*_HP) by the matmul's strip write-back: strip h
+            (head h's ENC_S2_HEAD_DIM columns) lands at column h*_HP. Replaces the old padded-N
+            matmul + multihead_reshape scatter pass. ``dst`` pad lanes are zeroed below."""
+            _set_ntok()
+            stride_reg = self.alloc_isa_reg()
+            self.generate_instruction_add_set(stride_reg, ENC_S2_HEADS * _HP)
+            self.matmat_mul_core(M=_NTOK, K=K_in, N=ENC_S2_C,
+                                 A_DRAM_ADDR=src, B_DRAM_ADDR=W,
+                                 OUTPUT_DRAM_ADDR=dst,
+                                 C_DRAM_ADDR=b, bias_mode="broadcast_N",
+                                 gpr_M_reg=gpr_ntok,
+                                 gpr_out_row_stride_reg=stride_reg,
+                                 strip_cols=ENC_S2_HEAD_DIM, strip_out_stride=_HP)
+            self.release_isa_reg()
+
+        for _dst in (self.S2_Q_DRAM, self.S2_K_DRAM, self.S2_V_DRAM):
+            dram_zero_fill(self, _dst, _NTOK * ENC_S2_HEADS * _HP)
+
         window_partition_dram(self, self.S2_LN_DRAM, self.S2_WIN_DRAM,
                               ENC_S2_H, ENC_S2_W, _CP, ENC_S2_WS)
 
-        _set_ntok()
-        self.matmat_mul_core(M=_NTOK, K=_CP, N=_CP,
-                             A_DRAM_ADDR=self.S2_WIN_DRAM, B_DRAM_ADDR=w["W_q"],
-                             OUTPUT_DRAM_ADDR=self.S2_Q_DRAM,
-                             C_DRAM_ADDR=w["b_q"], bias_mode="broadcast_N",
-                             gpr_M_reg=gpr_ntok)
-        _set_ntok()
-        self.matmat_mul_core(M=_NTOK, K=_CP, N=_CP,
-                             A_DRAM_ADDR=self.S2_WIN_DRAM, B_DRAM_ADDR=w["W_k"],
-                             OUTPUT_DRAM_ADDR=self.S2_K_DRAM,
-                             C_DRAM_ADDR=w["b_k"], bias_mode="broadcast_N",
-                             gpr_M_reg=gpr_ntok)
-        _set_ntok()
-        self.matmat_mul_core(M=_NTOK, K=_CP, N=_CP,
-                             A_DRAM_ADDR=self.S2_WIN_DRAM, B_DRAM_ADDR=w["W_v"],
-                             OUTPUT_DRAM_ADDR=self.S2_V_DRAM,
-                             C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N",
-                             gpr_M_reg=gpr_ntok)
+        _qkv_strip(self.S2_WIN_DRAM, _CP, w["W_q"], w["b_q"], self.S2_Q_DRAM)
+        _qkv_strip(self.S2_WIN_DRAM, _CP, w["W_k"], w["b_k"], self.S2_K_DRAM)
+        _qkv_strip(self.S2_WIN_DRAM, _CP, w["W_v"], w["b_v"], self.S2_V_DRAM)
 
-        multihead_reshape_dram_pbi(self, self.S2_Q_DRAM, self.S2_Q_HEAD_DRAM, self.S2_MH_TEMP,
-                                   _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, gpr_pbi,
-                                   input_row_stride=_CP)
-        multihead_reshape_dram_pbi(self, self.S2_K_DRAM, self.S2_K_HEAD_DRAM, self.S2_MH_TEMP,
-                                   _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, gpr_pbi,
-                                   input_row_stride=_CP)
-        multihead_reshape_dram_pbi(self, self.S2_V_DRAM, self.S2_V_HEAD_DRAM, self.S2_MH_TEMP,
-                                   _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP, gpr_pbi,
-                                   input_row_stride=_CP)
+        multihead_split_heads_pbi(self, self.S2_Q_DRAM, self.S2_Q_HEAD_DRAM,
+                                  _NTOK, ENC_S2_HEADS, _HP, gpr_pbi)
+        multihead_split_heads_pbi(self, self.S2_K_DRAM, self.S2_K_HEAD_DRAM,
+                                  _NTOK, ENC_S2_HEADS, _HP, gpr_pbi)
+        multihead_split_heads_pbi(self, self.S2_V_DRAM, self.S2_V_HEAD_DRAM,
+                                  _NTOK, ENC_S2_HEADS, _HP, gpr_pbi)
         broadcast_mul_dram(self, self.S2_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
                            ENC_S2_HEADS * _NTOK * _HP)
 
@@ -3038,12 +3033,17 @@ class MobileSAM_UE(UnifiedEngine):
         self.bf16_permute_core(dim_0=ENC_S2_HEADS, dim_1=_NTOK, dim_2=_HP,
                                INPUT_DRAM_ADDR=self.S2_ATTN_DRAM,
                                OUTPUT_DRAM_ADDR=self.S2_MH_TEMP)
-        _set_ntok()
-        self.matmat_mul_core(M=_NTOK, K=ENC_S2_HEADS * _HP, N=_CP,
-                             A_DRAM_ADDR=self.S2_MH_TEMP,
-                             B_DRAM_ADDR=w["unpad"],
-                             OUTPUT_DRAM_ADDR=self.S2_MERGED_DRAM,
-                             gpr_M_reg=gpr_ntok)
+        # Drop the head pad lanes by DMA: (NTOK, 5*64) -> compact (NTOK, 160), then
+        # re-pitch to the channel-padded (NTOK, 192) rows proj_w contracts over
+        # (K=_CP). The 32 pad columns must be ZERO (not stale), so MERGED is cleared
+        # first; the PBI row copy writes only the 160 real lanes.
+        multihead_unpad_dma(self, self.S2_MH_TEMP, self.S2_UNPAD_TMP,
+                            _NTOK, ENC_S2_HEADS, ENC_S2_HEAD_DIM, _HP)
+        dram_zero_fill(self, self.S2_MERGED_DRAM, _NTOK * _CP)
+        pbi_strided_copy(self, gpr_pbi,
+                         src_base=self.S2_UNPAD_TMP, dst_base=self.S2_MERGED_DRAM,
+                         count=_NTOK, copy_bytes=ENC_S2_C * _BPE,
+                         src_stride=ENC_S2_C * _BPE, dst_stride=_CP * _BPE)
 
         _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=_CP, N=_CP,
@@ -3118,34 +3118,40 @@ class MobileSAM_UE(UnifiedEngine):
 
         _ln_hw(INPUT_DRAM, self.S3_LN_DRAM, w["an_g"], w["an_b"])
 
+        def _qkv_strip(src, K_in, W, b, dst):
+            """Q/K/V projection at the REAL width N=ENC_S3_C (= ENC_S3_HEADS x ENC_S3_HEAD_DIM; for the
+            channel-padded weights only the first N rows/bias lanes are read), written
+            head-padded (NTOK, ENC_S3_HEADS*_HP) by the matmul's strip write-back: strip h
+            (head h's ENC_S3_HEAD_DIM columns) lands at column h*_HP. Replaces the old padded-N
+            matmul + multihead_reshape scatter pass. ``dst`` pad lanes are zeroed below."""
+            _set_ntok()
+            stride_reg = self.alloc_isa_reg()
+            self.generate_instruction_add_set(stride_reg, ENC_S3_HEADS * _HP)
+            self.matmat_mul_core(M=_NTOK, K=K_in, N=ENC_S3_C,
+                                 A_DRAM_ADDR=src, B_DRAM_ADDR=W,
+                                 OUTPUT_DRAM_ADDR=dst,
+                                 C_DRAM_ADDR=b, bias_mode="broadcast_N",
+                                 gpr_M_reg=gpr_ntok,
+                                 gpr_out_row_stride_reg=stride_reg,
+                                 strip_cols=ENC_S3_HEAD_DIM, strip_out_stride=_HP)
+            self.release_isa_reg()
+
+        for _dst in (self.S3_Q_DRAM, self.S3_K_DRAM, self.S3_V_DRAM):
+            dram_zero_fill(self, _dst, _NTOK * ENC_S3_HEADS * _HP)
+
         window_partition_dram(self, self.S3_LN_DRAM, self.S3_WIN_DRAM,
                               ENC_S3_H, ENC_S3_W, _C, ENC_S3_WS)
 
-        _set_ntok()
-        self.matmat_mul_core(M=_NTOK, K=_C, N=_C,
-                             A_DRAM_ADDR=self.S3_WIN_DRAM, B_DRAM_ADDR=w["W_q"],
-                             OUTPUT_DRAM_ADDR=self.S3_Q_DRAM,
-                             C_DRAM_ADDR=w["b_q"], bias_mode="broadcast_N",
-                             gpr_M_reg=gpr_ntok)
-        _set_ntok()
-        self.matmat_mul_core(M=_NTOK, K=_C, N=_C,
-                             A_DRAM_ADDR=self.S3_WIN_DRAM, B_DRAM_ADDR=w["W_k"],
-                             OUTPUT_DRAM_ADDR=self.S3_K_DRAM,
-                             C_DRAM_ADDR=w["b_k"], bias_mode="broadcast_N",
-                             gpr_M_reg=gpr_ntok)
-        _set_ntok()
-        self.matmat_mul_core(M=_NTOK, K=_C, N=_C,
-                             A_DRAM_ADDR=self.S3_WIN_DRAM, B_DRAM_ADDR=w["W_v"],
-                             OUTPUT_DRAM_ADDR=self.S3_V_DRAM,
-                             C_DRAM_ADDR=w["b_v"], bias_mode="broadcast_N",
-                             gpr_M_reg=gpr_ntok)
+        _qkv_strip(self.S3_WIN_DRAM, _C, w["W_q"], w["b_q"], self.S3_Q_DRAM)
+        _qkv_strip(self.S3_WIN_DRAM, _C, w["W_k"], w["b_k"], self.S3_K_DRAM)
+        _qkv_strip(self.S3_WIN_DRAM, _C, w["W_v"], w["b_v"], self.S3_V_DRAM)
 
-        multihead_reshape_dram_pbi(self, self.S3_Q_DRAM, self.S3_Q_HEAD_DRAM, self.S3_MH_TEMP,
-                                   _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP, gpr_pbi)
-        multihead_reshape_dram_pbi(self, self.S3_K_DRAM, self.S3_K_HEAD_DRAM, self.S3_MH_TEMP,
-                                   _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP, gpr_pbi)
-        multihead_reshape_dram_pbi(self, self.S3_V_DRAM, self.S3_V_HEAD_DRAM, self.S3_MH_TEMP,
-                                   _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP, gpr_pbi)
+        multihead_split_heads_pbi(self, self.S3_Q_DRAM, self.S3_Q_HEAD_DRAM,
+                                  _NTOK, ENC_S3_HEADS, _HP, gpr_pbi)
+        multihead_split_heads_pbi(self, self.S3_K_DRAM, self.S3_K_HEAD_DRAM,
+                                  _NTOK, ENC_S3_HEADS, _HP, gpr_pbi)
+        multihead_split_heads_pbi(self, self.S3_V_DRAM, self.S3_V_HEAD_DRAM,
+                                  _NTOK, ENC_S3_HEADS, _HP, gpr_pbi)
         broadcast_mul_dram(self, self.S3_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
                            ENC_S3_HEADS * _NTOK * _HP)
 
@@ -3164,8 +3170,7 @@ class MobileSAM_UE(UnifiedEngine):
                 bias_shared=True, _silent=True)
 
         multihead_merge_dram(self, self.S3_ATTN_DRAM, self.S3_MERGED_DRAM, self.S3_MH_TEMP,
-                             _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP,
-                             UNPAD_WEIGHT_ADDR=w["unpad"])
+                             _NTOK, ENC_S3_HEADS, ENC_S3_HEAD_DIM, _HP)
 
         _set_ntok()
         self.matmat_mul_core(M=_NTOK, K=_C, N=_C,
@@ -3522,24 +3527,30 @@ class MobileSAM_UE(UnifiedEngine):
             self, self.S2_LN_DRAM, self.S2_WIN_DRAM, ENC_S2_H, ENC_S2_W, _CP, ENC_S2_WS))
         self._assert_no_nan("S2B0 win_part", self.S2_WIN_DRAM, _NTOK2 * _CP)
 
+        _QKV2 = _NTOK2 * ENC_S2_HEADS * _HP2
         def _s2b0_qkv():
             for proj, dst in [("W_q","S2_Q_DRAM"),("W_k","S2_K_DRAM"),("W_v","S2_V_DRAM")]:
-                self.matmat_mul_core(M=_NTOK2, K=_CP, N=_CP,
+                dram_zero_fill(self, getattr(self, dst), _QKV2)
+                stride_reg = self.alloc_isa_reg()
+                self.generate_instruction_add_set(stride_reg, ENC_S2_HEADS * _HP2)
+                self.matmat_mul_core(M=_NTOK2, K=_CP, N=ENC_S2_C,
                     A_DRAM_ADDR=self.S2_WIN_DRAM, B_DRAM_ADDR=_w2[proj],
                     OUTPUT_DRAM_ADDR=getattr(self, dst),
-                    C_DRAM_ADDR=_w2[proj.replace("W_","b_")], bias_mode="broadcast_N")
+                    C_DRAM_ADDR=_w2[proj.replace("W_","b_")], bias_mode="broadcast_N",
+                    gpr_out_row_stride_reg=stride_reg,
+                    strip_cols=_HD2, strip_out_stride=_HP2)
+                self.release_isa_reg()
         self._compile_run(_s2b0_qkv)
-        self._assert_no_nan("S2B0 Q", self.S2_Q_DRAM, _NTOK2 * _CP)
-        self._assert_no_nan("S2B0 K", self.S2_K_DRAM, _NTOK2 * _CP)
-        self._assert_no_nan("S2B0 V", self.S2_V_DRAM, _NTOK2 * _CP)
+        self._assert_no_nan("S2B0 Q", self.S2_Q_DRAM, _QKV2)
+        self._assert_no_nan("S2B0 K", self.S2_K_DRAM, _QKV2)
+        self._assert_no_nan("S2B0 V", self.S2_V_DRAM, _QKV2)
 
         def _s2b0_flash():
             _gpr_pbi = self.alloc_isa_reg()
             for src, dst in [(self.S2_Q_DRAM, self.S2_Q_HEAD_DRAM),
                               (self.S2_K_DRAM, self.S2_K_HEAD_DRAM),
                               (self.S2_V_DRAM, self.S2_V_HEAD_DRAM)]:
-                multihead_reshape_dram_pbi(self, src, dst, self.S2_MH_TEMP,
-                    _NTOK2, ENC_S2_HEADS, _HD2, _HP2, _gpr_pbi, input_row_stride=_CP)
+                multihead_split_heads_pbi(self, src, dst, _NTOK2, ENC_S2_HEADS, _HP2, _gpr_pbi)
             broadcast_mul_dram(self, self.S2_Q_HEAD_DRAM, SA_SCALE_CORRECTION,
                                ENC_S2_HEADS * _NTOK2 * _HP2)
             _hs = ENC_S2_NWIN * ENC_S2_WIN_PAD * _HP2 * _BPE
@@ -3743,6 +3754,7 @@ class MobileSAM_UE(UnifiedEngine):
         _NTD = NT_PAD * DEC_DIM
         _GAD = GA * DEC_DIM
         _HHD = DEC_HEADS * DEC_HD_PAD
+        self._compile_run(self._zero_dec_proj_pads)
 
         for layer_i in range(DEC_LAYERS):
             lw = self.dec_layer_weights[layer_i]
@@ -4500,17 +4512,6 @@ def window_reverse_dram(ue: UnifiedEngine, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADD
                 dst_dram = OUTPUT_DRAM_ADDR + (src_h * W + src_w) * C * _BPE
                 ue.accelerator_memory_to_sram(src_dram, 0x00000, n_elem)
                 ue.sram_to_accelerator_memory(0x00000, dst_dram, n_elem)
-
-
-def _build_unpad_weight(num_heads: int, head_dim: int, head_dim_pad: int) -> torch.Tensor:
-    """Selection matrix (num_heads*head_dim_pad, num_heads*head_dim) for stripping head_dim padding."""
-    K = num_heads * head_dim_pad
-    N = num_heads * head_dim
-    W = torch.zeros(K, N, dtype=torch.bfloat16)
-    for h in range(num_heads):
-        for d in range(head_dim):
-            W[h * head_dim_pad + d, h * head_dim + d] = 1.0
-    return W
 
 
 def _bn_fold(w_conv, bn_w, bn_b, bn_mean, bn_var, eps=1e-5):
