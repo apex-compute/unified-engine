@@ -15,6 +15,7 @@ _SD = os.path.dirname(os.path.abspath(__file__))
 if os.path.dirname(os.path.dirname(_SD)) not in sys.path:
     sys.path.insert(0, os.path.dirname(os.path.dirname(_SD)))
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from user_dma_core import (
@@ -2279,9 +2280,13 @@ class Gemma4AudioMixin:
         straight-line program in the dedicated audio ISA region."""
         meta, _ = self._get_program_section("audio")
         tensor_base = self.AUD_IO_A
+        # The program bakes the clip's frame counts, so reuse it only for a clip
+        # of the same shape: a 4.5 s program run on a 2.55 s clip encodes garbage.
         if (meta is not None
                 and int(meta.get("tensor_base", "0"), 16) == tensor_base
-                and meta.get("program_version") == AUDIO_PROGRAM_VERSION):
+                and meta.get("program_version") == AUDIO_PROGRAM_VERSION
+                and meta.get("num_frames") == self._aud_num_frames
+                and meta.get("padded_frames") == self._aud_L_pad):
             print("  [Audio] reusing existing audio instruction section")
             return
 
@@ -2354,37 +2359,60 @@ class Gemma4AudioMixin:
         self.allocate_program_dram(len(program))
         self.start_execute_from_dram(program_addr)
         self.wait_queue(600.0)
+        self._audio_hw_latency_us = self.report_latency_in_us()
         return self.dma_from_accelerator_memory(
             self.AUD_FEATURES_FINAL,
             (self._aud_L_pad, self.AUD_OUT_DIM)).cpu()[:self._aud_num_frames]
 
-    def _run_audio_encoder_fpga(self, audio_path: str, prompt: str):
-        """LM-facing audio interface: preprocess, compile/run FPGA, and return
-        ``(soft_tokens, token_ids, mm_token_types)``."""
-        from transformers import AutoProcessor
+    @staticmethod
+    def _load_audio_samples(audio_path: str, target_rate: int,
+                            target_seconds: float | None = None):
+        """Mono float32 samples at ``target_rate``; ``target_seconds`` trims the
+        clip, or repeats it until it is that long."""
         try:
             import soundfile as sf
         except ImportError as exc:
             raise RuntimeError("soundfile is required for audio input") from exc
-
-        self._ensure_model_loaded()
-        processor = AutoProcessor.from_pretrained(self.hf_model_dir)
         samples, sample_rate = sf.read(audio_path, dtype="float32", always_2d=False)
         if samples.ndim > 1:
             samples = samples.mean(axis=-1)
-        target_rate = processor.feature_extractor.sampling_rate
         if sample_rate != target_rate:
             wave = torch.from_numpy(samples).float()[None, None]
             samples = F.interpolate(
                 wave, size=int(samples.shape[0] * target_rate / sample_rate),
                 mode="linear", align_corners=False).squeeze().numpy()
+        if target_seconds is not None:
+            want = int(round(float(target_seconds) * target_rate))
+            reps = -(-want // max(len(samples), 1))
+            samples = np.tile(samples, max(reps, 1))[:want]
+        return samples
 
-        conversation = [{"role": "user", "content": [
-            {"type": "audio"}, {"type": "text", "text": prompt}]}]
+    def _run_audio_encoder_fpga(self, audio_path: str, prompt: str,
+                                target_seconds: float | None = None,
+                                conversation_content: list | None = None,
+                                processor_kwargs: dict | None = None):
+        """LM-facing audio interface: preprocess, compile/run FPGA, and return
+        ``(soft_tokens, token_ids, mm_token_types)``.
+
+        ``target_seconds`` trims the clip to that length, or repeats it until
+        it is that long, so a workload's audio shape does not depend on the
+        file. ``conversation_content`` / ``processor_kwargs`` replace the
+        audio-then-text user turn (a joint image + audio prompt passes its
+        images through them); the clip is always the one audio item."""
+        from transformers import AutoProcessor
+
+        self._ensure_model_loaded()
+        processor = AutoProcessor.from_pretrained(self.hf_model_dir)
+        target_rate = processor.feature_extractor.sampling_rate
+        samples = self._load_audio_samples(audio_path, target_rate, target_seconds)
+        self._audio_seconds = len(samples) / float(target_rate)
+
+        content = conversation_content or [{"type": "audio"}, {"type": "text", "text": prompt}]
+        conversation = [{"role": "user", "content": content}]
         text = processor.apply_chat_template(
             conversation, add_generation_prompt=True, tokenize=False)
         inputs = processor(text=[text], audio=[samples], sampling_rate=target_rate,
-                           return_tensors="pt")
+                           return_tensors="pt", **(processor_kwargs or {}))
         input_features = inputs["input_features"]
         input_mask = inputs.get("input_features_mask")
         token_ids = inputs["input_ids"][0].tolist()
@@ -2399,7 +2427,10 @@ class Gemma4AudioMixin:
         soft_frames = (h0 + 1) // 2
         self.audio_tensor_init(soft_frames)
         self.compile_audio_fpga(input_features, input_mask)
+        _run_t0 = time.perf_counter()
         features = self.run_audio_fpga(input_features, input_mask)
+        # Run time = upload + FPGA execute + soft-token readback; compile excluded.
+        self._audio_e2e_s = time.perf_counter() - _run_t0
         if not torch.isfinite(features).all():
             raise RuntimeError("FPGA audio encoder produced non-finite features")
 

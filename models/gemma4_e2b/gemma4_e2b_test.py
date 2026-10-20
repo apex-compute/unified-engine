@@ -178,6 +178,94 @@ def _parse_offset(val) -> int:
         return int(val, 0)
     return int(val)
 
+# ==========================================================================
+# PREFILL-LENGTH FITTING
+# ==========================================================================
+# --target-prefill-tokens GROWS THE TEXT PROMPT until the assembled prefill
+# reaches a token count, because the media (if any) contribute a fixed token
+# count and only the text is free. Fixed workload shapes are the caller's
+# business (benchmark.py); this script only knows how to hit a number. The
+# filler is real instruction text, the same as qwen2.5_omni_7b's, because a
+# prompt of repeated nonsense changes what attention does with it.
+DEFAULT_PROMPT_BASE = "Respond to the request in detail."
+_FIT_FILLER_SENTENCES = (
+    "Address every part of the request before you stop, and do not end the "
+    "answer while any part of it remains uncovered.",
+    "Make the structure of the answer explicit, so the boundary between its "
+    "parts is easy to locate at a glance.",
+    "Keep each observation to a single sentence, so the shape of the response "
+    "stays easy to follow from start to finish.",
+    "Prefer concrete detail over general impression, and name what is actually "
+    "present rather than what would usually be present.",
+    "Stay grounded in the material you were given rather than in background "
+    "knowledge about material of this kind.",
+    "Use plain language throughout, and choose a concrete noun wherever an "
+    "evaluative adjective would otherwise go.",
+    "Do not repeat a point you have already made, and do not pad the answer "
+    "once its subject has been covered.",
+    "Say so briefly if something is genuinely unclear, instead of guessing at "
+    "content that is not actually there.",
+    "Work through the material methodically rather than compressing it into a "
+    "single summarising line.",
+    "Finish only once every part of the request has been addressed, and not "
+    "before that point.",
+)
+
+
+def _filler_words(count: int) -> str:
+    """``count`` words, cycling the filler sentences in order."""
+    words: list[str] = []
+    i = 0
+    while len(words) < count:
+        words.extend(_FIT_FILLER_SENTENCES[i % len(_FIT_FILLER_SENTENCES)].split())
+        i += 1
+    return " ".join(words[:count])
+
+
+def fit_prompt_to_prefill(tokenizer, render_len, target: int, base: str) -> str:
+    """Build a prompt whose rendered prompt length is ``target`` tokens.
+
+    ``render_len(prompt)`` returns the length of the FULL assembled sequence --
+    chat scaffolding plus expanded media placeholders plus the prompt. The
+    media contribution is fixed, so the length is monotone in the filler word
+    count: binary-search the words on the prompt alone, then correct against a
+    real render, walking down so the target is never exceeded.
+    """
+    base_total = render_len(base)
+    if base_total >= target:
+        return base
+    fixed = base_total - len(tokenizer(base).input_ids)   # media + scaffolding
+    want = target - fixed                                  # prompt tokens needed
+
+    def prompt_for(words: int) -> str:
+        return f"{base} {_filler_words(words)}"
+
+    lo, hi = 0, 16
+    while len(tokenizer(prompt_for(hi)).input_ids) < want:
+        hi *= 2
+        if hi > 65536:
+            raise RuntimeError(f"cannot reach {target} prompt tokens")
+    while lo < hi:                                         # smallest words >= want
+        mid = (lo + hi) // 2
+        if len(tokenizer(prompt_for(mid)).input_ids) < want:
+            lo = mid + 1
+        else:
+            hi = mid
+    words = lo
+    for _ in range(64):
+        total = render_len(prompt_for(words))
+        if total == target or (total < target and words == 0):
+            break
+        if total > target:
+            words -= 1
+        else:
+            words += 1
+            if render_len(prompt_for(words)) > target:
+                words -= 1
+                break
+    return prompt_for(max(words, 0))
+
+
 def weight_bin_generate(output_path: str | None = None, config_path: str | None = None) -> str:
     """Generate params.bin from Hugging Face model per gemma4_e2b_config.json layout.
     Returns the path to the written file."""
@@ -1418,6 +1506,103 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         print(f"Audio prefill: {len(token_ids)} tokens, "
               f"{sum(kind == 3 for kind in mm_types)} audio tokens")
 
+    def set_prefill_seq_media(self, image_path: str | None = None, frames: int = 1,
+                              audio_path: str | None = None,
+                              audio_seconds: float | None = None,
+                              prompt: str | None = None,
+                              target_prefill_tokens: int | None = None,
+                              prompt_base: str | None = None) -> None:
+        """One user turn of [audio] + ``frames`` x [image] + text, encoders on FPGA.
+
+        Each frame is its own image block and its own real vision-encoder run,
+        in prompt order; the audio clip (trimmed or repeated to
+        ``audio_seconds``) runs through the FPGA audio encoder. With
+        ``target_prefill_tokens`` the text is grown with instruction filler
+        until the whole prompt is that many tokens (fit_prompt_to_prefill).
+        """
+        from PIL import Image
+        from transformers import AutoProcessor
+
+        frames = max(int(frames or 1), 1) if image_path else 0
+        self._ensure_model_loaded()
+        processor = AutoProcessor.from_pretrained(self.hf_model_dir)
+        images = None
+        if image_path:
+            image = Image.open(image_path).convert("RGB").resize(
+                VISION_CANONICAL_SIZE, Image.BICUBIC)
+            images = [image.copy() for _ in range(frames)]
+        samples = None
+        if audio_path:
+            rate = processor.feature_extractor.sampling_rate
+            samples = self._load_audio_samples(audio_path, rate, audio_seconds)
+
+        # Audio first, then the frames: the order the answer is asked for.
+        media = ([{"type": "audio"}] if audio_path else []) + [{"type": "image"}] * frames
+
+        def _content(text: str) -> list:
+            return media + [{"type": "text", "text": text}]
+
+        def _render(text: str):
+            rendered = processor.apply_chat_template(
+                [{"role": "user", "content": _content(text)}],
+                add_generation_prompt=True, tokenize=False)
+            kwargs = {"text": [rendered], "return_tensors": "pt"}
+            if images is not None:
+                kwargs["images"] = [images]
+            if samples is not None:
+                kwargs["audio"] = [samples]
+                kwargs["sampling_rate"] = processor.feature_extractor.sampling_rate
+            return processor(**kwargs)
+
+        if prompt is None:
+            prompt = prompt_base or DEFAULT_PROMPT_BASE
+            if target_prefill_tokens:
+                prompt = fit_prompt_to_prefill(
+                    processor.tokenizer,
+                    lambda text: int(_render(text)["input_ids"].shape[1]),
+                    int(target_prefill_tokens), prompt)
+        self._fitted_prompt = prompt
+
+        # Vision: one real encoder run per frame, features concatenated in order.
+        image_features = None
+        vis_hw_us, vis_e2e_s = 0.0, 0.0
+        for f in range(frames):
+            feats, _, _ = self._run_vision_encoder_fpga(image_path, "Describe this image.")
+            image_features = feats if image_features is None else torch.cat((image_features, feats), 0)
+            vis_hw_us += float(getattr(self, "_vis_last_latency_us", 0.0) or 0.0)
+            vis_e2e_s += float(getattr(self, "_vis_e2e_s", 0.0) or 0.0)
+            print(f"[media] vision frame {f + 1}/{frames}: {feats.shape[0]} soft tokens")
+        if frames:
+            # The summary reports the whole vision stage, every frame.
+            self._vis_last_latency_us = vis_hw_us
+            self._vis_e2e_s = vis_e2e_s
+            self._vis_frames = frames
+
+        if audio_path:
+            proc_kwargs = {"images": [images]} if images is not None else None
+            audio_features, token_ids, mm_types = self._run_audio_encoder_fpga(
+                audio_path, prompt, target_seconds=audio_seconds,
+                conversation_content=_content(prompt), processor_kwargs=proc_kwargs)
+            self._audio_features = audio_features
+        else:
+            inputs = _render(prompt)
+            token_ids = inputs["input_ids"][0].tolist()
+            mm_types = inputs["mm_token_type_ids"][0].tolist()
+        n_img = sum(t == 1 for t in mm_types)
+        n_aud = sum(t == 3 for t in mm_types)
+        if image_features is not None and image_features.shape[0] != n_img:
+            raise RuntimeError(
+                f"{frames} frame(s) produced {image_features.shape[0]} image features "
+                f"for {n_img} image-token positions")
+        self.prefill_seq = tuple(token_ids)
+        self._image_features = image_features
+        self._mm_types = mm_types
+        self._media_counts = {"image_frames": frames, "image_tokens": n_img,
+                              "audio_tokens": n_aud,
+                              "audio_seconds": getattr(self, "_audio_seconds", None) if audio_path else None}
+        print(f"Media prefill: {len(token_ids)} tokens ({n_img} image over {frames} frame(s), "
+              f"{n_aud} audio, {len(token_ids) - n_img - n_aud} text)")
+
     def _program_image_paths(self, profile: bool = False) -> tuple[str, str]:
         bin_dir = os.path.join(self.script_dir, "gemma4_e2b_bin")
         stem = "programs_profile" if profile else "programs"
@@ -1444,7 +1629,13 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         return sections, data
 
     def _get_program_section(self, name: str, profile: bool = False):
-        """Return (section_meta, section_bytes) for `name`, or (None, None)."""
+        """Return (section_meta, section_bytes) for `name`, or (None, None).
+
+        Served from the in-memory snapshot (_section_cache) when one is set, so
+        a timed run never reads programs.bin from disk; see prepare_prefill_chunks."""
+        cache = getattr(self, "_section_cache", None)
+        if cache is not None and not profile and name in cache:
+            return cache[name]
         sections, data = self._read_program_sections(profile)
         s = sections.get(name)
         if s is None:
@@ -1724,6 +1915,60 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
               f"prefill @ 0x{prefill_program_addr:X} ({prefill_size_bytes/1024:.1f} KB), "
               f"decoder @ 0x{decoder_program_addr:X} ({decoder_size_bytes/1024:.1f} KB)")
 
+    def _snapshot_program_sections(self) -> dict:
+        """{name: (meta, bytes)} of every valid section in programs.bin, read once."""
+        sections, _ = self._read_program_sections()
+        snap = {}
+        for name in sections:
+            meta, data = self._get_program_section(name)
+            if meta is not None:
+                snap[name] = (meta, bytes(data))
+        return snap
+
+    def prepare_prefill_chunks(self) -> None:
+        """Compile every prefill chunk's program image up front (one-time cost).
+
+        Call after compile_gemma4(), which built the first chunk. Each later
+        chunk has its position offset baked in, so it is its own compile; all
+        of them target the same ISA base, so they cannot be resident together.
+        The compiled sections are kept in host memory (_chunk_sections) and the
+        rest of programs.bin is snapshotted too (_section_cache), so run_gemma4
+        only DMAs a chunk's image in before running it -- no compile and no
+        disk read inside the timed run.
+        """
+        self._section_cache = None
+        chunks = self.prefill_chunks(len(self.prefill_seq) - 1)
+        # The LM image carries the decoder too, and the decode workers' images
+        # (and their register assignment) belong to the same compile, so they
+        # travel with each chunk's LM image.
+        names = (["lm"] + [f"prefill_worker{i}" for i in range(1, self.multi_core)]
+                 + [f"decode_worker{i}" for i in range(1, self.multi_core)])
+        first = self._snapshot_program_sections()
+        self._chunk_sections = [{n: first[n] for n in names if n in first}]
+        # Every chunk's worker programs go where the first chunk's start: only
+        # one chunk's set is resident at a time, and without the rewind each
+        # compile would place its set after the previous one and walk the
+        # worker's 16 MiB ISA slice off its end (12 chunks at 6144 tokens).
+        sched = self._ensure_prefill_scheduler()
+        worker_bases = {}
+        if sched is not None:
+            for i, w in enumerate(sched.workers, start=1):
+                meta = first.get(f"prefill_worker{i}", (None,))[0]
+                if meta is not None:
+                    worker_bases[i] = (w, int(meta["dram_base"], 16))
+        for pos_offset, chunk_len in chunks[1:]:
+            for w, base in worker_bases.values():
+                w._next_program_dram_addr = base
+            self._prefill_chunk = (pos_offset, chunk_len)
+            self.compile_gemma4()
+            snap = self._snapshot_program_sections()
+            self._chunk_sections.append({n: snap[n] for n in names if n in snap})
+        self._prefill_chunk = None
+        # Everything else (vision, audio, decode workers) is chunk-independent.
+        self._section_cache = {**first, **self._chunk_sections[0]}
+        if len(chunks) > 1:
+            print(f"[compile] {len(chunks)} prefill chunks compiled; images held in host memory")
+
     def prefill_chunks(self, prompt_len: int) -> list[tuple[int, int]]:
         """Split a prompt into (pos_offset, length) prefill chunks.
 
@@ -1784,16 +2029,17 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
 
         timer = time.perf_counter()
         chunks = self.prefill_chunks(len(self.prefill_seq) - 1)
-        latency_hw_prefill, prefill_total_flops, compile_s = 0.0, 0, 0.0
+        latency_hw_prefill, prefill_total_flops, program_dma_s = 0.0, 0, 0.0
+        if len(chunks) > 1 and len(getattr(self, "_chunk_sections", [])) != len(chunks):
+            raise RuntimeError("chunked prefill: call prepare_prefill_chunks() after compile_gemma4()")
         for i, (pos_offset, chunk_len) in enumerate(chunks):
             if i > 0:
-                # Chunks past the first need their own program image: the
-                # offset is baked in. compile_gemma4 rebuilds and stores it, and
-                # the LM section is reloaded at the same base.
+                # Chunks past the first run their own image (the offset is baked
+                # in), compiled up front by prepare_prefill_chunks: swap its
+                # sections in and DMA the LM image to the same base. The worker
+                # images are DMA'd by run_prefill, as for the first chunk.
                 _c0 = time.perf_counter()
-                self._prefill_chunk = (pos_offset, chunk_len)
-                self._next_program_dram_addr = base_addr   # capture at the same base
-                self.compile_gemma4()
+                self._section_cache.update(self._chunk_sections[i])
                 meta = self._load_program_section("lm")
                 prefill_program_addr = int(meta["prefill_program_start_addr"], 16)
                 decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
@@ -1801,7 +2047,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                     {k: int(vv) for k, vv in r.items()}
                     for r in meta.get("decoder_attn_worker_regs", [])]
                 self._preamble_addr = self.get_program_dram_addr()
-                compile_s += time.perf_counter() - _c0
+                program_dma_s += time.perf_counter() - _c0
             if len(chunks) > 1:
                 print(f"[Prefill] chunk {i + 1}/{len(chunks)}: positions "
                       f"[{pos_offset}, {pos_offset + chunk_len})", flush=True)
@@ -1821,11 +2067,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._prefill_total_flops = prefill_total_flops
         self._prefill_e2e_s = latency_prefill
         self._prefill_chunk_count = len(chunks)
-        self._prefill_chunk_compile_s = compile_s
+        self._prefill_program_dma_s = program_dma_s
         if len(chunks) > 1:
             print(f"[Prefill] {len(chunks)} chunks: HW {latency_hw_prefill / 1e6:.2f} s, "
-                  f"wall {latency_prefill:.2f} s (of which {compile_s:.2f} s compiling "
-                  f"and loading the later chunks' images)", flush=True)
+                  f"wall {latency_prefill:.2f} s (of which {program_dma_s:.2f} s DMA-ing "
+                  f"the later chunks' LM images)", flush=True)
         print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n", flush=True)
 
         timer = time.perf_counter()
@@ -1903,6 +2149,69 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 self._cfg, int(seq_len), self._kv_shared_map)
         except Exception:
             return None
+
+    def run_result(self) -> dict:
+        """The run's headline numbers as one flat dict (the TEST_RESULT line).
+
+        Every value comes from metrics already stashed by the encoders,
+        run_gemma4 and run_decoder; missing ones are None. TTFT (HW) is the
+        encoders' HW counters plus prefill's; TTFT (wall) is their run times
+        plus prefill's wall time (which includes DMA-ing the later prefill
+        chunks' LM images, reported separately as prefill_program_dma_s).
+        Compiles are one-time setup and are in neither."""
+        def _g(name):
+            return getattr(self, name, None)
+        clock_ns = self._clock_period_ns
+        freq_mhz = 1000.0 / clock_ns if clock_ns else 0.0
+        peak = freq_mhz * 0.128 * self.multi_core
+        media = _g("_media_counts") or {}
+        n_img = media.get("image_tokens")
+        if n_img is None and _g("_vis_num_soft_tokens") is not None and _g("_vis_last_latency_us"):
+            n_img = int(self._vis_num_soft_tokens)
+        vis_us = _g("_vis_last_latency_us")
+        aud_us = _g("_audio_hw_latency_us")
+        pf_us = _g("_prefill_latency_hw_us")
+        pf_seq = _g("_prefill_seq_len")
+        pf_model = self._model_flops_prefill()
+        gen_n = _g("_decode_generated_n")
+        dec_us = _g("_decode_hw_latency_us")
+        dec_model = (self._model_flops_decode(gen_n, self.seq_len) if gen_n else None)
+        enc_hw_s = sum(v for v in (vis_us, aud_us) if v) / 1e6
+        enc_wall_s = sum(v for v in (_g("_vis_e2e_s"), _g("_audio_e2e_s")) if v)
+        return {
+            "model": "gemma4_e2b",
+            "multi_core": self.multi_core,
+            "clock_mhz": round(freq_mhz, 3),
+            "peak_gflops": round(peak, 1),
+            "max_context_size": self.MAX_CONTEXT_SIZE,
+            "prompt_tokens": len(self.prefill_seq),
+            "image_frames": media.get("image_frames", 1 if vis_us else 0),
+            "image_tokens": n_img or 0,
+            "audio_tokens": media.get("audio_tokens"),
+            "audio_seconds": media.get("audio_seconds", _g("_audio_seconds")),
+            "vision_hw_s": vis_us / 1e6 if vis_us else None,
+            "vision_wall_s": _g("_vis_e2e_s"),
+            "audio_hw_s": aud_us / 1e6 if aud_us else None,
+            "audio_wall_s": _g("_audio_e2e_s"),
+            "prefill_tokens": pf_seq,
+            "prefill_chunks": _g("_prefill_chunk_count"),
+            "prefill_hw_s": pf_us / 1e6 if pf_us else None,
+            "prefill_wall_s": _g("_prefill_e2e_s"),
+            "prefill_program_dma_s": _g("_prefill_program_dma_s"),
+            "prefill_hw_tok_s": pf_seq / (pf_us * 1e-6) if pf_us and pf_seq else None,
+            "prefill_gflops_issued": _g("_prefill_flop_rate_gflops"),
+            "prefill_gflops_model": pf_model / (pf_us * 1e3) if pf_model and pf_us else None,
+            "ttft_hw_s": enc_hw_s + pf_us / 1e6 if pf_us else None,
+            "ttft_wall_s": (enc_wall_s + _g("_prefill_e2e_s")
+                            if _g("_prefill_e2e_s") is not None else None),
+            "decode_tokens": gen_n,
+            "decode_first_token_tok_s": _g("_decode_peak_toks"),
+            "decode_avg_tok_s": _g("_decode_avg_toks"),
+            "decode_hw_tok_s": gen_n / (dec_us * 1e-6) if gen_n and dec_us else None,
+            "decode_gflops_model": dec_model / (dec_us * 1e3) if dec_model and dec_us else None,
+            "final_seq_len": self.seq_len,
+            "decoded_text": _g("_decoded_text"),
+        }
 
     def write_run_summary(self, out_path: str, args) -> str:
         """Write a per-run Markdown summary (weights/program sizes, per-stage HW
@@ -2896,6 +3205,20 @@ default prompt: "x+3=5, what is x?"
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile bin with per-phase HALT checkpoints and run one '
                              'profiled decode step; print a per-phase HW-latency breakdown.')
+    parser.add_argument("--frames", type=int, default=1, metavar="N",
+                        help="With --image, N camera frames: N image blocks in the prompt, "
+                             "each its own FPGA vision-encoder run.")
+    parser.add_argument("--audio-seconds", type=float, default=None, metavar="S",
+                        help="With --audio, trim the clip to S seconds (or repeat it until it "
+                             "is that long), so the audio shape does not depend on the file.")
+    parser.add_argument("--target-prefill-tokens", type=int, default=None, metavar="N",
+                        help="Grow the text prompt with instruction filler until the whole "
+                             "prompt (media included) is N tokens. Ignored with --prompt.")
+    parser.add_argument("--prompt-base", type=str, default=None, metavar="TEXT",
+                        help="Instruction text --target-prefill-tokens pads with filler "
+                             f"(default {DEFAULT_PROMPT_BASE!r}).")
+    parser.add_argument("--summary", type=str, default=None, metavar="PATH",
+                        help="Write the run summary to PATH instead of the CLI-derived name.")
     parser.add_argument('--profile-context', type=int, default=1024, metavar='N',
                         help='With --profile, the context length of the large-context decode '
                              'probe (default 1024; up to max_context_size).')
@@ -2913,7 +3236,9 @@ def run_summary_filename(args) -> str:
     args.prefill_kernel for multi-core — otherwise an auto-forced kernel would
     leak into the name.
     """
-    if args.audio:
+    if args.audio and args.image:
+        mode = "image+audio"
+    elif args.audio:
         mode = "audio"
     elif args.image:
         mode = "image"
@@ -3024,8 +3349,12 @@ def main():
     # shared kernel validation + HW_INFO wiring lives in resolve_engine_config().
     if args.vision_host and not args.image:
         parser.error("--vision-host requires --image")
-    if args.image and args.audio:
-        parser.error("--image and --audio are mutually exclusive")
+    if args.vision_host and args.audio:
+        parser.error("--vision-host cannot be combined with --audio")
+    if args.frames < 1 or (args.frames > 1 and not args.image):
+        parser.error("--frames N needs --image and N >= 1")
+    if args.audio_seconds is not None and not args.audio:
+        parser.error("--audio-seconds requires --audio")
     # Capture the summary filename now, before resolve_engine_config() mutates
     # args.prefill_kernel (multi-core forces matmatmul) — keeps auto-forced
     # kernels out of the name.
@@ -3112,6 +3441,24 @@ def main():
                 args.audio = candidate
         if not os.path.isfile(args.audio):
             raise SystemExit(f"--audio: file not found: {args.audio!r}")
+    if args.image and not os.path.isfile(args.image):
+        _cand = os.path.join(os.path.dirname(DEFAULT_IMAGE), os.path.basename(args.image))
+        if os.path.isfile(_cand):
+            args.image = _cand
+    _media_mode = ((args.image and args.audio) or args.frames > 1
+                   or args.audio_seconds is not None
+                   or args.target_prefill_tokens is not None or args.prompt_base is not None)
+    if _media_mode and not args.vision_host:
+        if args.image and not os.path.isfile(args.image):
+            raise SystemExit(f"--image: file not found: {args.image!r}")
+        print(f"[Mode] media (FPGA encoders) -- image: {args.image!r} x {args.frames if args.image else 0}, "
+              f"audio: {args.audio!r} ({args.audio_seconds} s), "
+              f"target prompt tokens: {args.target_prefill_tokens}")
+        ue.set_prefill_seq_media(
+            image_path=args.image, frames=args.frames, audio_path=args.audio,
+            audio_seconds=args.audio_seconds, prompt=args.prompt,
+            target_prefill_tokens=args.target_prefill_tokens, prompt_base=args.prompt_base)
+    elif args.audio:
         print(f"[Mode] audio (FPGA) -- file: {args.audio!r}")
         ue.set_prefill_seq_audio(args.audio, args.prompt)
     elif args.image:
@@ -3160,6 +3507,7 @@ def main():
     print(f"\n--- Compiling ---")
     timer = time.perf_counter()
     ue.compile_gemma4()
+    ue.prepare_prefill_chunks()
     print(f"Compile done in {time.perf_counter() - timer:.2f} seconds")
 
     (token_cnt_decoded, latency_hw_prefill, latency_hw_decoder,
@@ -3173,12 +3521,14 @@ def main():
 
     # Per-run Markdown summary, named for the full CLI config (see
     # run_summary_filename), written next to this script.
-    _summary_path = os.path.join(SCRIPT_DIR, _summary_name)
+    _summary_path = args.summary or os.path.join(SCRIPT_DIR, _summary_name)
     try:
         ue.write_run_summary(_summary_path, args)
         print(f"Wrote run summary: {_summary_path}")
     except Exception as _e:
         print(f"[warn] failed to write run summary: {_e}")
+    # One machine-readable line for benchmark.py (and any other driver).
+    print("TEST_RESULT: " + json.dumps(ue.run_result(), ensure_ascii=False))
     print("Gemma4 E2B LM test ends.")
 
 

@@ -1,7 +1,7 @@
 # Gemma4 E2B example
 
-Gemma4 E2B accelerator inference. Three modes — text only (LM), image +
-text (VLM), and audio + text — run from a single instruction bin.
+Gemma4 E2B accelerator inference. Text only (LM), image + text (VLM), audio +
+text, and image(s) + audio + text run from a single instruction bin.
 
 ## Controller placement and current validation
 
@@ -121,10 +121,24 @@ of engines; bare `--multi-core` selects two. Multicore runs select the
 subject to hardware validation. Use `--help` for all options.
 
 The checked-in configuration sets `max_prefill_seq_len` and
-`prefill_max_seq_len` to 512 and `max_context_size` to 4096. Prefill processes
+`prefill_max_seq_len` to 512 and `max_context_size` to 8192. Prefill processes
 all prompt tokens except the final one, which starts decoding. Its runtime
 row counts follow the actual prompt; the preparation projection uses the
-configured template maximum. A dynamic decoder serves subsequent context
-lengths. `--max-new-tokens` caps generation without resizing that compiled
-context layout. Changes to these configuration limits require recompilation
-and sufficient tensor/KV memory.
+configured template maximum. A prompt longer than 512 tokens is prefilled in
+chunks of up to 512: each chunk's program is compiled with its position offset
+and attends the K/V cache the earlier chunks wrote. Every chunk's image is
+compiled up front with the rest of the programs and held in host memory; the
+run only DMAs each chunk's image in before running it. A dynamic
+decoder serves subsequent context lengths. `--max-new-tokens` caps generation
+without resizing that compiled context layout. Changes to these configuration
+limits require recompilation and sufficient tensor/KV memory.
+
+## Benchmark tiers
+
+`benchmark.py --low | --medium | --high | --all` runs the fixed workload shapes
+shared with qwen2.5_omni_7b (0 / 1 / 4 camera frames, 2.55 / 4.5 / 6 s of
+audio, 850 / 2048 / 6144-token prompts, 32 / 64 / 128 decoded tokens), one
+real FPGA run per tier. The building blocks are generic `gemma4_e2b_test.py`
+options: `--frames N`, `--audio-seconds S`, `--target-prefill-tokens N`,
+`--prompt-base TEXT`, `--summary PATH`, and a `TEST_RESULT:` JSON line. Results
+are in [benchmark.md](benchmark.md).
