@@ -33,6 +33,9 @@ import signal
 import subprocess
 import sys
 
+# The model this benchmark drives; gemma4_e4b/benchmark.py repoints these
+# three at the E4B launcher and directory and reuses everything else.
+MODEL_NAME = "gemma4_e2b"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MAIN_SCRIPT = os.path.join(SCRIPT_DIR, "gemma4_e2b_test.py")
 
@@ -181,14 +184,14 @@ def result_table(results: dict[str, dict]) -> list[str]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="gemma4_e2b fixed-shape benchmark: --low / --medium / --high / --all")
+        description=f"{MODEL_NAME} fixed-shape benchmark: --low / --medium / --high / --all")
     parser.add_argument("--dev", default="xdma0")
     parser.add_argument("--multi-core", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=None,
                         help="override every tier's decode budget (low 32, medium 64, high 128)")
     parser.add_argument("--summary", default=None, metavar="PATH",
                         help="per-run summary path (single tier only); default "
-                             "gemma4_e2b_test_<dev>_<content>_<tier>_multi-core_<N>.md")
+                             f"{MODEL_NAME}_test_<dev>_<content>_<tier>_multi-core_<N>.md")
     parser.add_argument("--report", default=None, metavar="PATH",
                         help="also write the tier metric table (and results JSON) to PATH")
     tier = parser.add_mutually_exclusive_group(required=True)
@@ -216,13 +219,13 @@ def main() -> None:
         spec = PRESETS[t]
         content = "image+audio" if spec["frames"] else "audio"
         summary = args.summary or os.path.join(
-            SCRIPT_DIR, f"gemma4_e2b_test_{args.dev}_{content}_{t}_multi-core_{args.multi_core}.md")
+            SCRIPT_DIR, f"{MODEL_NAME}_test_{args.dev}_{content}_{t}_multi-core_{args.multi_core}.md")
         results[t] = _run(_argv_for(spec, args, summary), spec["label"])
     table = result_table({t: r for t, r in results.items() if r})
     print("\n" + "\n".join(table))
     if args.report:
         with open(args.report, "w", encoding="utf-8") as handle:
-            handle.write("# gemma4_e2b benchmark\n\n" + "\n".join(table) + "\n\n```json\n"
+            handle.write(f"# {MODEL_NAME} benchmark\n\n" + "\n".join(table) + "\n\n```json\n"
                          + json.dumps(results, indent=2, ensure_ascii=False) + "\n```\n")
         print(f"\nWrote benchmark report: {args.report}")
 
