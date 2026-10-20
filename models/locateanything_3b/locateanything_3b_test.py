@@ -4189,53 +4189,26 @@ def _vis_dims(cfg):
 # Host-side weight preparation (padding + evens-odds reorder + q score-scale)
 # =====================================================================================
 
-def _qk_pad_reorder(W, b, VN, VD, scale):
-    """[VN*VD, VH] q or k weight -> [VN*VD_PAD, VH] in the pad-128 rotate_half layout.
+def _qk_reorder(W, b, VN, VD, scale):
+    """[VN*VD, VH] q or k weight -> [VN*VD, VH] COMPACT, rows per head = [even lanes (36) |
+    odd lanes (36)], i.e. the rotate_half layout WITHOUT the zero padding.
 
     rotate_half pairs lane i with lane i+64 (half of VD_PAD=128). The rope cos/sin table
-    has the real angles at lanes [0:36] (lo) and [64:100] (hi). So the EVEN head_dim
-    indices (the real part of each interleaved pair) go to lanes 0..35 and the ODD
-    indices (imag part) go to lanes 64..99 — NOT contiguous 0..71. Pad lanes (36..63,
-    100..127) stay zero. `scale` folds the sqrt(128/72) flash-scale correction into q."""
+    has the real angles at lanes [0:36] (lo) and [64:100] (hi). The projection matmul's
+    strip write-back (strip_cols=36, strip_out_stride=64) lands row h*72 + 0..35 (the
+    EVEN head_dim indices, real part) at slot lanes h*128 + 0..35 and row h*72 + 36..71
+    (ODD, imag part) at h*128 + 64..99; pad lanes 36..63 / 100..127 are never written
+    and stay zero. `scale` folds the sqrt(128/72) flash-scale correction into q."""
     VH = W.shape[1]
-    half = VD // 2                       # 36
-    hp = VD_PAD // 2                     # 64
     W = W.reshape(VN, VD, VH)
     b = b.reshape(VN, VD)
     W_even = W[:, 0:VD:2, :] * scale      # [VN, 36, VH] -> lo half lanes 0..35
     W_odd = W[:, 1:VD:2, :] * scale       # [VN, 36, VH] -> hi half lanes 64..99
     b_even = b[:, 0:VD:2] * scale
     b_odd = b[:, 1:VD:2] * scale
-    Wp = torch.zeros(VN, VD_PAD, VH, dtype=torch.bfloat16)
-    bp = torch.zeros(VN, VD_PAD, dtype=torch.bfloat16)
-    Wp[:, :half, :] = W_even.to(torch.bfloat16)
-    Wp[:, hp:hp + half, :] = W_odd.to(torch.bfloat16)
-    bp[:, :half] = b_even.to(torch.bfloat16)
-    bp[:, hp:hp + half] = b_odd.to(torch.bfloat16)
-    return Wp.reshape(VN * VD_PAD, VH).contiguous(), bp.reshape(-1).contiguous()
-
-
-def _o_pad(Wo, VN, VD):
-    """o-proj weight [VH, VN*VD] -> [VH, VN*VD_PAD]: each head's VD input cols placed in
-    the first VD of its 128-block, pad cols zero. Lets o-proj consume the 128-padded
-    attention output directly (so no separate 72-trim / unaligned permute is needed)."""
-    VH = Wo.shape[0]
-    Wo = Wo.reshape(VH, VN, VD)
-    Wp = torch.zeros(VH, VN, VD_PAD, dtype=torch.bfloat16)
-    Wp[:, :, :VD] = Wo.to(torch.bfloat16)
-    return Wp.reshape(VH, VN * VD_PAD).contiguous()
-
-
-def _v_pad(W, b, VN, VD):
-    """[VN*VD, VH] v weight -> [VN*VD_PAD, VH] natural order, zero-padded 72->128."""
-    VH = W.shape[1]
-    W = W.reshape(VN, VD, VH)
-    b = b.reshape(VN, VD)
-    Wp = torch.zeros(VN, VD_PAD, VH, dtype=torch.bfloat16)
-    bp = torch.zeros(VN, VD_PAD, dtype=torch.bfloat16)
-    Wp[:, :VD, :] = W.to(torch.bfloat16)
-    bp[:, :VD] = b.to(torch.bfloat16)
-    return Wp.reshape(VN * VD_PAD, VH).contiguous(), bp.reshape(-1).contiguous()
+    Wc = torch.cat([W_even, W_odd], dim=1).to(torch.bfloat16)   # [VN, 72, VH]
+    bc = torch.cat([b_even, b_odd], dim=1).to(torch.bfloat16)   # [VN, 72]
+    return Wc.reshape(VN * VD, VH).contiguous(), bc.reshape(-1).contiguous()
 
 
 def _row_pad(W, b, target_rows):
@@ -4282,9 +4255,12 @@ def _prepare_moonvit_weights(model, cfg, precision):
         Wqkv = blk.wqkv.weight.data.float(); bqkv = blk.wqkv.bias.data.float()
         qW, kW, vW = Wqkv[:VH], Wqkv[VH:2 * VH], Wqkv[2 * VH:]
         qb, kb, vb = bqkv[:VH], bqkv[VH:2 * VH], bqkv[2 * VH:]
-        qWp, qbp = _qk_pad_reorder(qW, qb, VN, VD, scale=q_scale)
-        kWp, kbp = _qk_pad_reorder(kW, kb, VN, VD, scale=1.0)
-        vWp, vbp = _v_pad(vW, vb, VN, VD)
+        # q/k: compact rotate_half row order (see _qk_reorder); v: natural, compact.
+        # The 72 -> 128 head padding is inserted by the projection matmul's strip
+        # write-back at runtime, not baked into the weights.
+        qWp, qbp = _qk_reorder(qW, qb, VN, VD, scale=q_scale)
+        kWp, kbp = _qk_reorder(kW, kb, VN, VD, scale=1.0)
+        vWp, vbp = vW.to(torch.bfloat16).contiguous(), vb.to(torch.bfloat16).contiguous()
         fc0W, fc0b = _row_pad(blk.mlp.fc0.weight.data.float(), blk.mlp.fc0.bias.data.float(), VIS_MLP_PAD)
         fc1W = _col_pad(blk.mlp.fc1.weight.data.float(), VIS_MLP_PAD)
         bf = lambda t: t.to(torch.bfloat16).contiguous()
@@ -4292,7 +4268,7 @@ def _prepare_moonvit_weights(model, cfg, precision):
             (li, 'q', *_mat(qWp)),   (li, 'q_bias', 'bf16', bf(qbp)),
             (li, 'k', *_mat(kWp)),   (li, 'k_bias', 'bf16', bf(kbp)),
             (li, 'v', *_mat(vWp)),   (li, 'v_bias', 'bf16', bf(vbp)),
-            (li, 'o', *_mat(_o_pad(blk.wo.weight.data.float(), VN, VD))),
+            (li, 'o', *_mat(blk.wo.weight.data.float().to(torch.bfloat16).contiguous())),  # K = VN*VD, unpadded
             (li, 'o_bias', 'bf16', bf(blk.wo.bias.data)),
             (li, 'norm0_w', 'bf16', bf(blk.norm0.weight.data)),
             (li, 'norm0_b', 'bf16', bf(blk.norm0.bias.data)),
@@ -4333,7 +4309,7 @@ def moonvit_load_weights(ue, model, cfg, precision="if4"):
     need `model` for weights). Big matmuls are if4 by default; biases/norms stay bf16."""
     ue.mv_precision = precision
     os.makedirs(_BIN_DIR, exist_ok=True)
-    cache = os.path.join(_BIN_DIR, f"moonvit_weights_{precision}.pt")
+    cache = os.path.join(_BIN_DIR, f"moonvit_weights_{precision}_compact.pt")
     if os.path.exists(cache):
         prepared = torch.load(cache, weights_only=False)
         print(f"  MoonViT weights: loaded prepared cache {os.path.basename(cache)}")
@@ -4382,6 +4358,12 @@ def moonvit_setup_dram(ue, N, cfg):
     ue.MV_Q = ue.allocate_tensor_dram(N * VN * VD_PAD * bpe)
     ue.MV_K = ue.allocate_tensor_dram(N * VN * VD_PAD * bpe)
     ue.MV_V = ue.allocate_tensor_dram(N * VN * VD_PAD * bpe)
+    # The q/k/v projections write ONLY each head's 72 real lanes (strip write-back)
+    # into these 128-lane slots, so the pad lanes are zeroed once here and never again.
+    zeros_qkv = torch.zeros(N * VN * VD_PAD, dtype=torch.bfloat16)
+    ue.dma_to_accelerator_memory(ue.MV_Q, zeros_qkv)
+    ue.dma_to_accelerator_memory(ue.MV_K, zeros_qkv)
+    ue.dma_to_accelerator_memory(ue.MV_V, zeros_qkv)
     ue.MV_Q_PAD = ue.allocate_tensor_dram(VN * N * VD_PAD * bpe)
     ue.MV_K_PAD = ue.allocate_tensor_dram(VN * N * VD_PAD * bpe)
     ue.MV_V_PAD = ue.allocate_tensor_dram(VN * N * VD_PAD * bpe)
@@ -4389,16 +4371,17 @@ def moonvit_setup_dram(ue, N, cfg):
     ue.dma_to_accelerator_memory(ue.MV_Q_PAD, zeros_pad)
     ue.dma_to_accelerator_memory(ue.MV_K_PAD, zeros_pad)
     ue.dma_to_accelerator_memory(ue.MV_V_PAD, zeros_pad)
-    ue.MV_ATTN_OUT = ue.allocate_tensor_dram(VN * N * VD_PAD * bpe)
-    # zero so a NaN read here means flash COMPUTED NaN, not that it failed to write
-    ue.dma_to_accelerator_memory(ue.MV_ATTN_OUT, torch.zeros(VN * N * VD_PAD, dtype=torch.bfloat16))
     # debug tap: softmax(QK^T) dump [N, N] (flash debug_mode), zeroed for clean read
     ue.MV_SM_DEBUG = ue.allocate_tensor_dram(N * N * bpe)
     ue.dma_to_accelerator_memory(ue.MV_SM_DEBUG, torch.zeros(N * N, dtype=torch.bfloat16))
     ue.MV_ATTN_SCRATCH = ue.allocate_tensor_dram(
         ((VD_PAD + N) * N + N * VD_PAD) * bpe)
-    # attention result kept in padded head layout [N, VN*VD_PAD]; o-proj weight zero-pads
-    ue.MV_ATTN_RESULT = ue.allocate_tensor_dram(N * VN * VD_PAD * bpe)
+    # attention result, token-major at the REAL head width [N, VN*VD]: P.V writes each
+    # head's (N, 72) block straight into its columns (row pitch VN*VD), so there is no
+    # inverse permute and no pad-lane trim; o-proj contracts over K = VN*VD = 1152.
+    # Zeroed so a NaN read here means attention COMPUTED NaN, not that it failed to write.
+    ue.MV_ATTN_RESULT = ue.allocate_tensor_dram(N * VN * VD * bpe)
+    ue.dma_to_accelerator_memory(ue.MV_ATTN_RESULT, torch.zeros(N * VN * VD, dtype=torch.bfloat16))
     ue.MV_O_PROJ = ue.allocate_tensor_dram(N * VH * bpe)
     ue.MV_RESIDUAL = ue.allocate_tensor_dram(N * VH * bpe)
     ue.MV_MLP_INTER = ue.allocate_tensor_dram(N * VIS_MLP_PAD * bpe)
@@ -4410,11 +4393,6 @@ def moonvit_setup_dram(ue, N, cfg):
     ue.MV_ROPE_COS = ue.MV_ROPE
     ue.MV_ROPE_SIN = ue.MV_ROPE + VD_PAD * bpe
     ue.MV_PERM_TEMP = ue.allocate_tensor_dram(VN * N * VD_PAD * bpe * 2)
-    # MoonViT attention fixed operand buffers, one head at a time.
-    ue.MV_FLASH_Q   = ue.allocate_tensor_dram(N * VD_PAD * bpe)
-    ue.MV_FLASH_K   = ue.allocate_tensor_dram(N * VD_PAD * bpe)
-    ue.MV_FLASH_V   = ue.allocate_tensor_dram(N * VD_PAD * bpe)
-    ue.MV_FLASH_OUT = ue.allocate_tensor_dram(N * VD_PAD * bpe)
     # Flash BIAS [N, N] row-major (added to QK^T before softmax): mask padded KEY
     # columns (>= N_real) with a large negative so real queries ignore them. Same mask
     # for every head/layer (depends only on key index).
@@ -4495,6 +4473,78 @@ def moonvit_prepare_input(ue, model, pixel_values, grid_hw, cfg, device="cpu"):
 # Compile the encoder program (single capture stream)
 # =====================================================================================
 
+def moonvit_attention_split_hd(ue, batch, aligned_seq_len, qk_dim, v_dim,
+                               Q_DRAM_ADDR, K_DRAM_ADDR, V_DRAM_ADDR, BIAS_DRAM_ADDR,
+                               OUTPUT_DRAM_ADDR, SCRATCH_DRAM_ADDR, IDENTITY_DRAM_ADDR,
+                               out_row_stride):
+    """unified_attention_core_dynamic with the head_dim split in two (pi05's
+    attention_split_hd, see models/pi05/utility/pi05_attn_kernels.py):
+
+      qk_dim   contraction dim of Q @ K^T, must be a multiple of 64 -> MoonViT's 72
+               stays padded to 128 here (Q/K slots, zero pad lanes, q pre-scaled by
+               sqrt(128/72) in the weights so the 1/sqrt(128) scale below is right).
+      v_dim    OUTPUT width of P @ V. P @ V contracts over the keys, so head_dim is
+               its N and N has no 64-rule -> the REAL 72.
+      out_row_stride  row pitch (elements) of the destination: P @ V writes this
+               head's (batch, 72) block straight into its columns of the token-major
+               (N, VN*72) result. That is what removes the inverse permute + trim.
+
+    Steps: V^T over the full qk_dim width (only rows [0, v_dim) are consumed), scale Q,
+    P = softmax(Q K^T + bias), OUT = P @ V^T[:v_dim]^T. All matmuls run on the PBI
+    runtime-dim path (gpr regs) so the program stays small. Scratch layout is the
+    stock one: V^T (qk_dim*S) | P (S*S) | scaled Q (batch*qk_dim)."""
+    bpe = 2
+    S = aligned_seq_len
+    if S % UE_VECTOR_SIZE or qk_dim % UE_VECTOR_SIZE:
+        raise ValueError(f"moonvit_attention_split_hd: aligned_seq_len={S} and qk_dim={qk_dim} "
+                         f"must be multiples of {UE_VECTOR_SIZE}")
+    if not 0 < v_dim <= qk_dim:
+        raise ValueError(f"moonvit_attention_split_hd: v_dim={v_dim} must be in (0, qk_dim={qk_dim}]")
+    if OUTPUT_DRAM_ADDR % 8:
+        raise ValueError("moonvit_attention_split_hd: OUTPUT_DRAM_ADDR must be 8-byte aligned")
+    regs = []
+
+    def _reg(val):
+        r = ue.alloc_isa_reg()
+        regs.append(r)
+        ue.generate_instruction_add_set(r, val)
+        return r
+
+    batch_reg = _reg(batch)
+    seq_reg = _reg(S)
+    qk_reg = _reg(qk_dim)
+    v_reg = _reg(v_dim)
+    stride_reg = _reg(out_row_stride)
+
+    v_t = SCRATCH_DRAM_ADDR
+    score = v_t + qk_dim * S * bpe
+    scaled_q = score + S * S * bpe
+
+    # 1. V^T over the padded width; only rows [0, v_dim) are consumed below.
+    ue.bf16_transpose_core(M=S, N=qk_dim, INPUT_DRAM_ADDR=V_DRAM_ADDR,
+                           OUTPUT_DRAM_ADDR=v_t, IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+                           gpr_M_reg=seq_reg)
+    # 2. scale Q (1/sqrt(qk_dim); the sqrt(128/72) correction is folded into the q weights)
+    ue.eltwise_core_dram(
+        M=batch, N=qk_dim, dram_a=Q_DRAM_ADDR, dram_b=None, dram_out=scaled_q,
+        mode=UE_MODE.MUL_BROADCAST, scalar=1.0 / math.sqrt(qk_dim),
+        gpr_M_reg=batch_reg)
+    # 3. scores + softmax (contraction over qk_dim)
+    ue.matmat_mul_core(
+        M=batch, K=qk_dim, N=S, A_DRAM_ADDR=scaled_q, B_DRAM_ADDR=K_DRAM_ADDR,
+        OUTPUT_DRAM_ADDR=score, softmax_enable=True,
+        C_DRAM_ADDR=BIAS_DRAM_ADDR, bias_mode="full_matrix",
+        gpr_M_reg=batch_reg, gpr_K_reg=qk_reg, gpr_N_reg=seq_reg)
+    # 4. context: N = v_dim, written at the caller's row pitch
+    ue.matmat_mul_core(
+        M=batch, K=S, N=v_dim, A_DRAM_ADDR=score, B_DRAM_ADDR=v_t,
+        OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+        gpr_M_reg=batch_reg, gpr_K_reg=seq_reg, gpr_N_reg=v_reg,
+        gpr_out_row_stride_reg=stride_reg)
+    for _ in regs:
+        ue.release_isa_reg()
+
+
 def moonvit_compile_encoder(ue, cfg, grid_hw):
     """Capture the full MoonViT transformer stack + final norm + 2x2 merge into one
     instruction stream. Returns the program DRAM address. Static M=N (recompiled per
@@ -4515,7 +4565,7 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     # weight/tensor addresses + absolute jumps, so reload is valid only when load_weights/
     # setup_dram ran first and the program lands at the same addr (deterministic alloc order). ---
     os.makedirs(_BIN_DIR, exist_ok=True)
-    moonvit_key = f"moonvit_encoder_N{N}_{prec}_unified_attention"
+    moonvit_key = f"moonvit_encoder_N{N}_{prec}_split_hd"
     _cached = programs_bin_load(os.path.dirname(_BIN_DIR), moonvit_key)
     if _cached is not None:
         prog, _ = _cached
@@ -4526,8 +4576,14 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
               f"({len(prog)} bytes = {len(prog)//32} instructions)")
         return program_addr
 
-    def _mm(M, K, Nn, A, name, la, OUT, bias=None, gelu=False):
+    def _mm(M, K, Nn, A, name, la, OUT, bias=None, gelu=False,
+            strip_cols=None, strip_out_stride=None, out_stride_reg=None):
         """Precision-aware matmul: if4 (quantized B + scale) or bf16.
+
+        strip_cols / strip_out_stride / out_stride_reg: the matmul's strip write-back
+        (dynamic path). Used by the q/k/v projections to run at the REAL N = VN*VD
+        with compact weights and still land each head (v: 72 lanes) or rotate_half
+        head-half (q/k: 36 lanes) at the start of its 128- / 64-lane slot.
 
         PBI runtime-M: passes gpr_M_reg=vis_M_reg (primed with N) so matmat_mul_core
         routes to matmat_mul_core_pbi -> ONE templated M-iteration + hardware loop
@@ -4535,16 +4591,18 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
         size win (6 big matmuls/layer x 27 layers). Mirrors the LM prefill matmuls
         (locateanything_3b_test.py: q/k/v/o/gate/up all pass gpr_M_reg=gf_seq_len).
         Flash/permute/norm stay static (flash can't be PBI - back-to-back bug)."""
+        strip = dict(strip_cols=strip_cols, strip_out_stride=strip_out_stride,
+                     gpr_out_row_stride_reg=out_stride_reg)
         if prec == "if4":
             ue.matmat_mul_core(M=M, K=K, N=Nn, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{name}_data'],
                                OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N",
                                is_B_quantized=True, data_type=TYPE.IF4,
                                SCALE_DRAM_ADDR=la[f'{name}_scale'], gelu_enable=gelu,
-                               gpr_M_reg=vis_M_reg)
+                               gpr_M_reg=vis_M_reg, **strip)
         else:
             ue.matmat_mul_core(M=M, K=K, N=Nn, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{name}_weight'],
                                OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N",
-                               gelu_enable=gelu, gpr_M_reg=vis_M_reg)
+                               gelu_enable=gelu, gpr_M_reg=vis_M_reg, **strip)
 
     global _SILENT_MODE
     _SILENT_MODE = True
@@ -4553,26 +4611,11 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     ue.reset_isa_reg_counter()
     vis_M_reg = ue.alloc_isa_reg()
     ue.generate_instruction_add_set(vis_M_reg, N)
-
-    def _mv_flash_call(q_src, k_src, v_src, out_dst):
-        """Marshal one head's Q/K/V into fixed buffers and run unified attention."""
-        elems = N * VD_PAD
-        for src, dst in ((q_src, ue.MV_FLASH_Q), (k_src, ue.MV_FLASH_K), (v_src, ue.MV_FLASH_V)):
-            ue.accelerator_memory_to_sram(src, 0x00000, elems)
-            ue.sram_to_accelerator_memory(0x00000, dst, elems)
-        ue.unified_attention_core(
-            batch=N,
-            aligned_seq_len=N,
-            head_dim=VD_PAD,
-            Q_DRAM_ADDR=ue.MV_FLASH_Q,
-            K_DRAM_ADDR=ue.MV_FLASH_K,
-            V_DRAM_ADDR=ue.MV_FLASH_V,
-            BIAS_DRAM_ADDR=ue.MV_ATTN_BIAS,
-            OUTPUT_DRAM_ADDR=ue.MV_FLASH_OUT,
-            SCRATCH_DRAM_ADDR=ue.MV_ATTN_SCRATCH,
-            IDENTITY_DRAM_ADDR=ue.IDENTITY_DRAM_ADDR)
-        ue.accelerator_memory_to_sram(ue.MV_FLASH_OUT, 0x00000, elems)
-        ue.sram_to_accelerator_memory(0x00000, out_dst, elems)
+    # Row pitch (elements) of the head-padded q/k/v projection outputs, for the strip
+    # write-back. Constant for the whole program.
+    qkv_stride_reg = ue.alloc_isa_reg()
+    ue.generate_instruction_add_set(qkv_stride_reg, VN_VD_PAD)
+    VN_VD = VN * VD
 
     for li in range(depth):
         la = ue.mv_layer_addrs[li]
@@ -4583,9 +4626,15 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
         ue.layer_norm_core_dram(M=N, N=VH, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=ue.MV_NORM_OUT,
                                 GAMMA_DRAM_ADDR=la['norm0_w'], BETA_DRAM_ADDR=la['norm0_b'])
 
-        # --- q/k/v projections into per-head-128-padded layout [N, VN*128] ---
-        for proj, dst in [('q', ue.MV_Q), ('k', ue.MV_K), ('v', ue.MV_V)]:
-            _mm(N, VH, VN_VD_PAD, ue.MV_NORM_OUT, proj, la, dst, bias=la[f'{proj}_bias'])
+        # --- q/k/v projections at the REAL N = VN*VD = 1152 (compact weights), written
+        # head-padded [N, VN*128] by the strip write-back: q/k strips are the 36-lane
+        # rotate_half halves (slot pitch 64), v strips the 72-lane heads (pitch 128).
+        # Pad lanes were zeroed once in moonvit_setup_dram. ---
+        for proj, dst in [('q', ue.MV_Q), ('k', ue.MV_K)]:
+            _mm(N, VH, VN_VD, ue.MV_NORM_OUT, proj, la, dst, bias=la[f'{proj}_bias'],
+                strip_cols=VD // 2, strip_out_stride=VD_PAD // 2, out_stride_reg=qkv_stride_reg)
+        _mm(N, VH, VN_VD, ue.MV_NORM_OUT, 'v', la, ue.MV_V, bias=la['v_bias'],
+            strip_cols=VD, strip_out_stride=VD_PAD, out_stride_reg=qkv_stride_reg)
 
         # --- permute [N, VN, 128] -> [VN, N, 128] for q/k/v via strided DMA ---
         # Each SRAM load: d0*last = N*VD_PAD = 1408*128 = 180224 elems = 352KB < 512KB SRAM.
@@ -4603,19 +4652,22 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
                                  gpr_M_reg=vis_M_reg)
         ue.generate_instruction_add_set(vis_M_reg, N)
 
-        # --- per-head attention ---
+        # --- per-head attention: Q.K^T at the padded 128, P.V at the REAL 72, each
+        # head's (N, 72) written straight into its columns of the token-major
+        # [N, VN*72] result. No inverse permute, no pad-lane trim. ---
         for h in range(VN):
-            _mv_flash_call(ue.MV_Q_PAD + h * head_stride_pad,
-                           ue.MV_K_PAD + h * head_stride_pad,
-                           ue.MV_V_PAD + h * head_stride_pad,
-                           ue.MV_ATTN_OUT + h * head_stride_pad)
+            moonvit_attention_split_hd(
+                ue, N, N, VD_PAD, VD,
+                ue.MV_Q_PAD + h * head_stride_pad,
+                ue.MV_K_PAD + h * head_stride_pad,
+                ue.MV_V_PAD + h * head_stride_pad,
+                ue.MV_ATTN_BIAS,
+                ue.MV_ATTN_RESULT + h * VD * bpe,
+                ue.MV_ATTN_SCRATCH, ue.IDENTITY_DRAM_ADDR,
+                out_row_stride=VN_VD)
 
-        # --- inverse permute [VN, N, 128] -> [N, VN*128] via strided DMA ---
-        # Each SRAM load: d0*last = VN*VD_PAD = 16*128 = 2048 elems = 4KB — trivial.
-        ue._vis_transpose_10(ue.MV_ATTN_OUT, ue.MV_ATTN_RESULT, d0=VN, d1=N, last=VD_PAD)
-
-        # --- o proj (K=VN*128, pad cols zeroed in weight) + residual + norm1 fused ---
-        _mm(N, VN_VD_PAD, VH, ue.MV_ATTN_RESULT, 'o', la, ue.MV_O_PROJ, bias=la['o_bias'])
+        # --- o proj (K = VN*72, unpadded weight) + residual + norm1 fused ---
+        _mm(N, VN_VD, VH, ue.MV_ATTN_RESULT, 'o', la, ue.MV_O_PROJ, bias=la['o_bias'])
         layer_norm_core_dram_post_add(ue, M=N, N=VH,
                                       A_DRAM_ADDR=h_in, B_DRAM_ADDR=ue.MV_O_PROJ,
                                       ADDOUTPUT_DRAM_ADDR=ue.MV_RESIDUAL,
@@ -4726,17 +4778,27 @@ def moonvit_run_staged(ue, cfg, grid_hw, stop_after=None, check=True, timeout_s=
     from user_dma_core import TYPE
     prec = getattr(ue, "mv_precision", "if4")
 
-    def _mm_emit(M, K, Nn, A, name, la, OUT, bias=None, gelu=False):
+    VN_VD = VN * VD
+
+    def _mm_emit(M, K, Nn, A, name, la, OUT, bias=None, gelu=False,
+                 strip_cols=None, strip_out_stride=None):
         def f():
+            strip = {}
+            if strip_cols is not None:
+                ue.reset_isa_reg_counter()
+                r = ue.alloc_isa_reg()
+                ue.generate_instruction_add_set(r, VN_VD_PAD)
+                strip = dict(strip_cols=strip_cols, strip_out_stride=strip_out_stride,
+                             gpr_out_row_stride_reg=r)
             if prec == "if4":
                 ue.matmat_mul_core(M=M, K=K, N=Nn, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{name}_data'],
                                    OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N",
                                    is_B_quantized=True, data_type=TYPE.IF4,
-                                   SCALE_DRAM_ADDR=la[f'{name}_scale'], gelu_enable=gelu)
+                                   SCALE_DRAM_ADDR=la[f'{name}_scale'], gelu_enable=gelu, **strip)
             else:
                 ue.matmat_mul_core(M=M, K=K, N=Nn, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{name}_weight'],
                                    OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N",
-                                   gelu_enable=gelu)
+                                   gelu_enable=gelu, **strip)
         return f
 
     def step(label, emit, addr=None, shape=None):
@@ -4757,9 +4819,14 @@ def moonvit_run_staged(ue, cfg, grid_hw, stop_after=None, check=True, timeout_s=
                  GAMMA_DRAM_ADDR=la['norm0_w'], BETA_DRAM_ADDR=la['norm0_b']),
              ue.MV_NORM_OUT, (N, VH))
 
-        for proj, dst in [('q', ue.MV_Q), ('k', ue.MV_K), ('v', ue.MV_V)]:
+        # q/k/v at the real N = VN*VD, head-padded by the strip write-back (see
+        # moonvit_compile_encoder); pad lanes zeroed once in moonvit_setup_dram.
+        for proj, dst, sc, so in [('q', ue.MV_Q, VD // 2, VD_PAD // 2),
+                                  ('k', ue.MV_K, VD // 2, VD_PAD // 2),
+                                  ('v', ue.MV_V, VD, VD_PAD)]:
             step(f"{L}.{proj}proj",
-                 _mm_emit(N, VH, VN_VD_PAD, ue.MV_NORM_OUT, proj, la, dst, bias=la[f'{proj}_bias']),
+                 _mm_emit(N, VH, VN_VD, ue.MV_NORM_OUT, proj, la, dst, bias=la[f'{proj}_bias'],
+                          strip_cols=sc, strip_out_stride=so),
                  dst, (N, VN_VD_PAD))
 
         for proj, src, dst in [('q', ue.MV_Q, ue.MV_Q_PAD), ('k', ue.MV_K, ue.MV_K_PAD),
@@ -4783,33 +4850,29 @@ def moonvit_run_staged(ue, cfg, grid_hw, stop_after=None, check=True, timeout_s=
                                          gpr_M_reg=r)
         step(f"{L}.rope", rope_emit, ue.MV_Q_PAD, (VN * N, VD_PAD))
 
-        # Attention per head. Staged debug no longer has the legacy softmax dump tap.
+        # Attention per head (Q.K^T at 128, P.V at the real 72 straight into the
+        # token-major [N, VN*72] result). Staged debug no longer has the legacy
+        # softmax dump tap. The whole (N, VN*VD) result is NaN-checked after the last head.
         bias_addr = ue.MV_ATTN_BIAS if mask_pad else ue.MV_SM_DEBUG
         for h in range(VN):
-            def flash_emit(h=h):
-                ue.unified_attention_core(
-                    batch=N,
-                    aligned_seq_len=N,
-                    head_dim=VD_PAD,
-                    Q_DRAM_ADDR=ue.MV_Q_PAD + h * head_stride_pad,
-                    K_DRAM_ADDR=ue.MV_K_PAD + h * head_stride_pad,
-                    V_DRAM_ADDR=ue.MV_V_PAD + h * head_stride_pad,
-                    BIAS_DRAM_ADDR=bias_addr,
-                    OUTPUT_DRAM_ADDR=ue.MV_ATTN_OUT + h * head_stride_pad,
-                    SCRATCH_DRAM_ADDR=ue.MV_ATTN_SCRATCH,
-                    IDENTITY_DRAM_ADDR=ue.IDENTITY_DRAM_ADDR)
+            def attn_emit(h=h):
+                ue.reset_isa_reg_counter()
+                moonvit_attention_split_hd(
+                    ue, N, N, VD_PAD, VD,
+                    ue.MV_Q_PAD + h * head_stride_pad,
+                    ue.MV_K_PAD + h * head_stride_pad,
+                    ue.MV_V_PAD + h * head_stride_pad,
+                    bias_addr,
+                    ue.MV_ATTN_RESULT + h * VD * bpe,
+                    ue.MV_ATTN_SCRATCH, ue.IDENTITY_DRAM_ADDR,
+                    out_row_stride=VN_VD)
 
-            step(f"{L}.flash_h{h}", flash_emit, ue.MV_ATTN_OUT + h * head_stride_pad, (N, VD_PAD))
-
-        step(f"{L}.inv_perm",
-             lambda: smart_bf16_permute_core(
-                 ue, dims=[VN, N, VD_PAD], permute_indices=[1, 0, 2],
-                 input_dram_addr=ue.MV_ATTN_OUT, output_dram_addr=ue.MV_ATTN_RESULT,
-                 params_dram_addr=ue.VIS_PERMUTE_PARAMS_DRAM, temp_dram_start=ue.MV_PERM_TEMP),
-             ue.MV_ATTN_RESULT, (N, VN_VD_PAD))
+            step(f"{L}.attn_h{h}", attn_emit,
+                 ue.MV_ATTN_RESULT if h == VN - 1 else None,
+                 (N, VN_VD) if h == VN - 1 else None)
 
         step(f"{L}.oproj",
-             _mm_emit(N, VN_VD_PAD, VH, ue.MV_ATTN_RESULT, 'o', la, ue.MV_O_PROJ, bias=la['o_bias']),
+             _mm_emit(N, VN_VD, VH, ue.MV_ATTN_RESULT, 'o', la, ue.MV_O_PROJ, bias=la['o_bias']),
              ue.MV_O_PROJ, (N, VH))
 
         step(f"{L}.norm1_postadd",
