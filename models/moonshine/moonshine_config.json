@@ -1,0 +1,143 @@
+{
+  "$comment": "Moonshine-base ASR (moonshine-ai/moonshine-base). Encoder-decoder transformer on raw 16kHz PCM; no mel frontend. Padded dims are the accelerator-side obligations from hw_notes; the CPU reference runs the unpadded HF shapes.",
+  "fixed_isa_regs": {
+    "V_CACHE_SIZE_REG": 1,
+    "ROPE_SIZE_REG": 2,
+    "TMP_REG": 3,
+    "GPR_SEQ_LEN_REG": 4,
+    "GPR_Q_SEQ_LEN_REG": 5,
+    "GPR_BUCKET_IDX_REG": 6,
+    "GPR_ALIGNED_SEQ_LEN_REG": 7
+  },
+  "model": {
+    "name": "moonshine-base",
+    "task": "asr",
+    "params_m": 61.5,
+    "sample_rate": 16000,
+    "frontend": "conv_stem",
+    "conv_stem": {
+      "conv1": {
+        "in": 1,
+        "out": 416,
+        "kernel": 127,
+        "stride": 64,
+        "bias": false,
+        "act": "tanh"
+      },
+      "groupnorm": {
+        "groups": 1,
+        "channels": 416,
+        "eps": 1e-05
+      },
+      "conv2": {
+        "in": 416,
+        "out": 832,
+        "kernel": 7,
+        "stride": 3,
+        "bias": true,
+        "act": "gelu"
+      },
+      "conv3": {
+        "in": 832,
+        "out": 416,
+        "kernel": 3,
+        "stride": 2,
+        "bias": true,
+        "act": "gelu"
+      },
+      "total_downsample": 384
+    }
+  },
+  "encoder": {
+    "hidden_size": 416,
+    "hidden_size_padded": 448,
+    "num_layers": 8,
+    "num_heads": 8,
+    "num_kv_heads": 8,
+    "head_dim": 52,
+    "head_dim_hf_padded": 56,
+    "head_dim_padded": 64,
+    "intermediate_size": 1664,
+    "intermediate_size_padded": 1664,
+    "norm": "layer_norm",
+    "norm_bias": false,
+    "norm_eps": 1e-05,
+    "mlp": "gelu",
+    "mlp_bias": true,
+    "attention_bias": false,
+    "causal": false,
+    "rope_theta": 10000.0,
+    "rotary_dim": 32,
+    "rope_style": "interleaved",
+    "max_position_embeddings": 194
+  },
+  "decoder": {
+    "hidden_size": 416,
+    "hidden_size_padded": 448,
+    "num_layers": 8,
+    "num_heads": 8,
+    "num_kv_heads": 8,
+    "head_dim": 52,
+    "head_dim_hf_padded": 56,
+    "head_dim_padded": 64,
+    "intermediate_size": 1664,
+    "intermediate_size_padded": 1664,
+    "norm": "layer_norm",
+    "norm_bias": false,
+    "norm_eps": 1e-05,
+    "mlp": "gated_silu",
+    "mlp_bias": true,
+    "attention_bias": false,
+    "causal": true,
+    "cross_attention": true,
+    "rope_theta": 10000.0,
+    "rotary_dim": 32,
+    "rope_style": "interleaved",
+    "vocab_size": 32768,
+    "tie_word_embeddings": true,
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "pad_token_id": 2,
+    "decoder_start_token_id": 1,
+    "max_length": 194
+  },
+  "ops": {
+    "norm": "layer_norm",
+    "rope": "hf_core",
+    "attn": "flash",
+    "encoder_mlp": "gelu",
+    "decoder_mlp": "gated_silu",
+    "lm_quant": "bf16",
+    "weight_dtype": "bf16"
+  },
+  "hw_notes": [
+    "64-ALU floor: hidden 416 -> pad to 448 (zero lanes 416..447 on every matmul N/K); intermediate 1664 is already 26*64.",
+    "head_dim 52 (HF pads to 56 for SDPA) -> pad to 64 on the accelerator; scaling stays 52**-0.5 (HF uses the unpadded head_dim).",
+    "RoPE: partial rotary, rotary_dim = int(52*0.62) = 32 on the first 32 lanes, interleaved (GPT-J) pairs, remaining 20 lanes pass through. Needs a custom cos/sin table for the padded 64-lane head; d64_pbi assumes full-head half-split so use hf_core or a bespoke table.",
+    "Decoder gated MLP: fc1 emits 2*1664 with x = first half, gate = second half; out = silu(gate) * x (note order: gate is the SECOND chunk).",
+    "Conv stem on raw PCM: conv1 k=127 s=64 no bias -> tanh -> GroupNorm(1 group) -> conv2 k=7 s=3 -> gelu -> conv3 k=3 s=2 -> gelu. Frames = ((N-127)//64+1 - 7)//3+1 ... ; map as im2col matmuls (ACT pattern).",
+    "Compile-then-execute: audio length and decode length are runtime-dependent -> fix max_audio_seconds (encoder frames = ~T*16000/384) and max_length 194 decode steps; run all steps and mask after EOS.",
+    "Cross-attention K/V computed once from encoder output; cache them in DRAM (not per-step recompute).",
+    "Decoder self-attn K/V cache grows to 194 rows max; over-allocate at compile time."
+  ],
+  "dram_layout": {
+    "selected": "bf16",
+    "params_dram_base": "0x80000000",
+    "tensor_dram_base": "0xC0000000",
+    "program_dram_base": "0xCE000000",
+    "$comment": "61.5M params bf16 = 123MB + tied proj_out; comfortably under tensor_base. Sizing to be re-done by scripts/new_model.py on a box with user_dma_core."
+  },
+  "paths": {
+    "hf_model_repo": "moonshine-ai/moonshine-base",
+    "weights_dir": "moonshine_bin",
+    "weights_file": "moonshine_bin/model.safetensors",
+    "tokenizer_file": "moonshine_bin/tokenizer.json"
+  },
+  "defaults": {
+    "dev": "xdma0",
+    "cycle_ns": 5.63,
+    "max_audio_seconds": 30,
+    "max_new_tokens": 194,
+    "default_audio": "../test_samples/apex.wav"
+  }
+}

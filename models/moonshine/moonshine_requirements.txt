@@ -1,0 +1,9 @@
+# Moonshine ASR host-side deps. Weights are NOT here: moonshine_test.py downloads
+# moonshine-ai/moonshine-base into moonshine_bin/ on first run.
+torch
+safetensors
+tokenizers
+huggingface_hub
+soundfile
+scipy             # resampling fallback when torchaudio is absent
+transformers>=4.48 # only for --validate (HF MoonshineForConditionalGeneration)
