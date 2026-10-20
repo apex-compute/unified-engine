@@ -200,13 +200,15 @@ def generate_lm_weights(model, output_path, precision: str = "if4"):
     print(f"LM head ({precision}) appended: {len(combined_bytes)/1048576:.1f} MB at offset 0x{offset:X}")
 
 def generate_vision_weights(model, output_path, precision: str = "int4"):
-    """Generate vision weight bin with pre-padded QKV (80→128) and MLP
+    """Generate vision weight bin with COMPACT QKV and a pre-padded MLP
     (3420→3456). The given quant_lib precision ('int4' / 'fp4' / 'if4')
     drives both the codec and the manifest suffix.
 
-    The binary stores padded weights so the runtime doesn't need the HF model.
-    QKV is stored as separate qk_padded (rearranged 128-dim) and v_padded
-    (sequential 128-dim).
+    Q/K/V are stored at their real width: ``attn.qk`` is [2*VH, VH] (Q's
+    1280 rows then K's, natural head/lane order) and ``attn.v`` is [VH, VH].
+    The runtime inserts the 80→128 per-head (and 40→64 per RoPE half)
+    padding itself through the projection matmul's strip write-back, so no
+    padding is baked into the quantized weight (see qwen2.5_vl_3b_vision.py).
     """
     if precision not in _VALID_PRECISIONS:
         raise ValueError(f"precision={precision!r} not in {_VALID_PRECISIONS}")
@@ -222,38 +224,25 @@ def generate_vision_weights(model, output_path, precision: str = "int4"):
     with open(output_path, 'wb') as f:
         for i, block in enumerate(model.visual.blocks):
             prefix = f'visual.blocks.{i}'
-            # QKV: pad and split into qk_padded (rearranged) + v_padded (sequential)
+            # QKV: split into compact qk ([2*VH, VH], Q rows then K rows) + v ([VH, VH]).
+            # Natural (head, lane) row order: the strip write-back maps row
+            # (proj*VN + h)*VD + half*half_d + j to slot (proj*VN + h)*VD_PAD + half*64 + j.
             qkv_w = block.attn.qkv.weight.detach().to(torch.bfloat16)
             qkv_b = block.attn.qkv.bias.detach().to(torch.bfloat16)
-            qkv_w_3d = qkv_w.view(3, VN, VD, VH)
-            qkv_b_3d = qkv_b.view(3, VN, VD)
-            # Q/K rearranged padded
-            qk_padded_w = torch.zeros(2 * VN * VD_PAD, VH, dtype=torch.bfloat16)
-            qk_padded_b = torch.zeros(2 * VN * VD_PAD, dtype=torch.bfloat16)
-            for proj in range(2):
-                for h in range(VN):
-                    hs = (proj * VN + h) * VD_PAD
-                    qk_padded_w[hs:hs+half_d, :] = qkv_w_3d[proj, h, :half_d, :]
-                    qk_padded_w[hs+64:hs+64+half_d, :] = qkv_w_3d[proj, h, half_d:, :]
-                    qk_padded_b[hs:hs+half_d] = qkv_b_3d[proj, h, :half_d]
-                    qk_padded_b[hs+64:hs+64+half_d] = qkv_b_3d[proj, h, half_d:]
-            data, _ = qpack(qk_padded_w)
+            qk_w = qkv_w[:2 * VH].contiguous()
+            qk_b = qkv_b[:2 * VH].contiguous()
+            data, _ = qpack(qk_w)
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
-            manifest[f'{prefix}.attn.qk_padded.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
-            raw = user_dma_core.tensor_le_bytes(qk_padded_b); offset = f.tell(); f.write(raw)
-            manifest[f'{prefix}.attn.qk_padded.bias'] = {'offset': offset, 'size': len(raw)}
-            # V sequential padded
-            v_padded_w = torch.zeros(VN * VD_PAD, VH, dtype=torch.bfloat16)
-            v_padded_b = torch.zeros(VN * VD_PAD, dtype=torch.bfloat16)
-            for h in range(VN):
-                hs = h * VD_PAD
-                v_padded_w[hs:hs+VD, :] = qkv_w_3d[2, h, :, :]
-                v_padded_b[hs:hs+VD] = qkv_b_3d[2, h, :]
-            data, _ = qpack(v_padded_w)
+            manifest[f'{prefix}.attn.qk.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
+            raw = user_dma_core.tensor_le_bytes(qk_b); offset = f.tell(); f.write(raw)
+            manifest[f'{prefix}.attn.qk.bias'] = {'offset': offset, 'size': len(raw)}
+            v_w = qkv_w[2 * VH:].contiguous()
+            v_b = qkv_b[2 * VH:].contiguous()
+            data, _ = qpack(v_w)
             raw = data.tobytes(); offset = f.tell(); f.write(raw)
-            manifest[f'{prefix}.attn.v_padded.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
-            raw = user_dma_core.tensor_le_bytes(v_padded_b); offset = f.tell(); f.write(raw)
-            manifest[f'{prefix}.attn.v_padded.bias'] = {'offset': offset, 'size': len(raw)}
+            manifest[f'{prefix}.attn.v.weight.{sfx}'] = {'offset': offset, 'size': len(raw)}
+            raw = user_dma_core.tensor_le_bytes(v_b); offset = f.tell(); f.write(raw)
+            manifest[f'{prefix}.attn.v.bias'] = {'offset': offset, 'size': len(raw)}
             # O proj (no padding needed)
             data, _ = qpack(block.attn.proj.weight.detach().to(torch.bfloat16))
             raw = data.tobytes(); offset = f.tell(); f.write(raw)

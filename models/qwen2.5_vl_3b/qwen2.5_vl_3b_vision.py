@@ -70,10 +70,13 @@ class Qwen25VLVisionMixin:
         """Vision geometry from the config, with the on-chip padding applied.
 
         head_dim 80 is not a multiple of the 64-element quantization block, and
-        the attention core needs a 64-aligned head stride, so weights are stored
-        pre-padded to 128. Likewise the FFN 3420 -> 3456. The padding is baked
-        into params.bin by the weight generator; these numbers only have to
-        agree with it.
+        the attention core needs a 64-aligned head stride, so Q/K/V LAND in
+        128-lane slots on chip. The weights themselves are stored COMPACT
+        (real 80-lane heads): the projection matmul's strip write-back
+        (strip_cols / strip_out_stride) places each real head (V) or RoPE
+        head-half (Q/K) at the start of its padded slot, same as pi05 and
+        qwen2.5_omni_7b. Only the FFN 3420 -> 3456 is still baked into
+        params.bin.
         """
         v = self._cfg["vision"]
         VD_PAD = 128
@@ -81,7 +84,7 @@ class Qwen25VLVisionMixin:
                   // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
         return dict(
             VS=v["num_patches"], VH=v["hidden_size"], VN=v["num_heads"],
-            VD=v["head_dim"], VD_PAD=VD_PAD,
+            VD=v["head_dim"], VD_PAD=VD_PAD, VD_HALF=v["head_dim"] // 2,
             VI=v["intermediate_size"], VI_PAD=VI_PAD,
             VL=v["depth"], VMERGE=v["spatial_merge_size"],
             VH_OUT=v["out_hidden_size"],
@@ -206,14 +209,24 @@ class Qwen25VLVisionMixin:
                 raise KeyError(f"vision weight {key!r} missing from params.bin")
             return sections[key]
 
+        # attn.qk / attn.v are stored compact (real width, no per-head padding
+        # baked in): the projection matmul's strip write-back puts each head
+        # (V) or RoPE head-half (Q/K) straight into its padded slot. The old
+        # attn.qk_padded / attn.v_padded layout is no longer supported.
+        if f"visual.blocks.0.attn.qk.weight.{sfx}" not in sections:
+            raise ValueError(
+                "vision padding removal needs compact attn.qk/attn.v weights; "
+                "regenerate the vision params.bin with the current "
+                "generate_vision_weights")
+
         with open(region["bin_path"], "rb") as f:
             base = region["base_offset"]
             layer_addrs = []
             for li in range(d["VL"]):
                 pre = f"visual.blocks.{li}"
                 la = {}
-                # Fused QK (pre-padded 80 -> 128 per head) and V, then o_proj.
-                for tag, key in (("qk", "attn.qk_padded"), ("v", "attn.v_padded"),
+                # Fused QK (compact, Q's 1280 rows then K's) and V, then o_proj.
+                for tag, key in (("qk", "attn.qk"), ("v", "attn.v"),
                                  ("o", "attn.proj")):
                     la[f"{tag}_scale"], la[f"{tag}_data"] = self._dma_if4(
                         f, need(f"{pre}.{key}.weight.{sfx}"), base, f"{pre}.{key}")
@@ -282,8 +295,8 @@ class Qwen25VLVisionMixin:
         d = self._vision_dims()
         sections = self._read_vision_region()["sections"]
         groups = {
-            "qk (fused, padded)": ".attn.qk_padded.weight",
-            "v (padded)":         ".attn.v_padded.weight",
+            "qk (fused, compact)": ".attn.qk.weight",
+            "v (compact)":         ".attn.v.weight",
             "o_proj":             ".attn.proj.weight",
             "gate_proj":          ".mlp.gate_proj.weight",
             "up_proj":            ".mlp.up_proj.weight",
@@ -480,6 +493,13 @@ class Qwen25VLVisionMixin:
         # [VS, VN*VD_PAD]. Both are token-major and get permuted to head-major.
         self.VIS_QK = alloc(VS * VN * VD_PAD * 2, "vis.qk")
         self.VIS_V = alloc(VS * VN * VD_PAD, "vis.v")
+        # The strip write-back only ever touches the real lanes of each
+        # 64/128-lane slot, so the pad lanes are zeroed ONCE here and stay
+        # zero for the life of the model.
+        self._vis_pending_dmas.append(
+            (self.VIS_QK, torch.zeros(VS * VN * VD_PAD * 2, dtype=torch.bfloat16)))
+        self._vis_pending_dmas.append(
+            (self.VIS_V, torch.zeros(VS * VN * VD_PAD, dtype=torch.bfloat16)))
 
         # Head-major [n_groups, aligned_S, VD_PAD]. QK_HM holds Q's VN heads
         # followed by K's, so ONE permute produces both.
@@ -688,6 +708,22 @@ class Qwen25VLVisionMixin:
             # after begin_program() resets its allocator.
             gate_m_regs = [self.gf_seq_len]
             gate_m_regs.extend(wk.alloc_isa_reg() for wk in sched.workers)
+            # Output row pitch of the strip write-back (elements), one
+            # register per engine, primed once for the whole program.
+            qk_out_stride_regs, v_out_stride_regs = [], []
+            for eng in (self, *sched.workers):
+                r = eng.alloc_isa_reg()
+                eng.generate_instruction_add_set(r, 2 * VN * VD_PAD)
+                qk_out_stride_regs.append(r)
+                r2 = eng.alloc_isa_reg()
+                eng.generate_instruction_add_set(r2, VN * VD_PAD)
+                v_out_stride_regs.append(r2)
+        else:
+            qk_out_stride_regs = [self.alloc_isa_reg()]
+            self.generate_instruction_add_set(qk_out_stride_regs[0], 2 * VN * VD_PAD)
+            v_out_stride_regs = [self.alloc_isa_reg()]
+            self.generate_instruction_add_set(v_out_stride_regs[0], VN * VD_PAD)
+        VD_HALF = vis["VD_HALF"]
         prev_silent = self._set_silent(True)
         flops = 0
         self._vis_checkpoints = []
@@ -704,7 +740,8 @@ class Qwen25VLVisionMixin:
                 [name, resume, int(flops - _ckpt_flops[0])])
             _ckpt_flops[0] = int(flops)
 
-        def matmul(M, K, N, A, w, tag, OUT, *, silu=False, gelu=False, bias=True):
+        def matmul(M, K, N, A, w, tag, OUT, *, silu=False, gelu=False, bias=True,
+                   out_stride_reg=None, strip_cols=None, strip_out_stride=None):
             return self.matmat_mul_core(
                 M=M, K=K, N=N, A_DRAM_ADDR=A,
                 B_DRAM_ADDR=w[f"{tag}_data"], OUTPUT_DRAM_ADDR=OUT,
@@ -713,10 +750,14 @@ class Qwen25VLVisionMixin:
                 C_DRAM_ADDR=w[f"{tag}_bias"] if bias else None,
                 bias_mode="broadcast_N" if bias else None,
                 silu_enable=silu, gelu_enable=gelu,
-                gpr_M_reg=self._prime_M(M)) or 0
+                gpr_M_reg=self._prime_M(M),
+                gpr_out_row_stride_reg=out_stride_reg,
+                strip_cols=strip_cols,
+                strip_out_stride=strip_out_stride) or 0
 
         def sh_matmul(ctx, m_reg, K, N, A, A_row, w, tag, OUT, OUT_row,
-                      *, silu=False, gelu=False):
+                      *, silu=False, gelu=False, out_stride_reg=None,
+                      strip_cols=None, strip_out_stride=None):
             """One engine's row-block of a projection. Bias is per-COLUMN
             (broadcast_N), so it is shared, not sliced."""
             ctx.ue.generate_instruction_add_set(m_reg, ctx.rows)
@@ -728,7 +769,10 @@ class Qwen25VLVisionMixin:
                 is_B_quantized=True, data_type=TYPE.IF4,
                 SCALE_DRAM_ADDR=w[f"{tag}_scale"],
                 C_DRAM_ADDR=w[f"{tag}_bias"], bias_mode="broadcast_N",
-                silu_enable=silu, gelu_enable=gelu, gpr_M_reg=m_reg) or 0
+                silu_enable=silu, gelu_enable=gelu, gpr_M_reg=m_reg,
+                gpr_out_row_stride_reg=out_stride_reg,
+                strip_cols=strip_cols,
+                strip_out_stride=strip_out_stride) or 0
 
         h_row = VH * bpe
         for li in range(VL):
@@ -741,8 +785,16 @@ class Qwen25VLVisionMixin:
                 flops += self.rms_norm_core_dram(
                     M=VS, N=VH, A_DRAM_ADDR=IN, OUTPUT_DRAM_ADDR=self.VIS_NORM_OUT,
                     GAMMA_DRAM_ADDR=w["norm1_weight"], gpr_M_reg=self._prime_M(VS)) or 0
-                flops += matmul(VS, VH, 2 * VN * VD_PAD, self.VIS_NORM_OUT, w, "qk", self.VIS_QK)
-                flops += matmul(VS, VH, VN * VD_PAD, self.VIS_NORM_OUT, w, "v", self.VIS_V)
+                # Q+K and V projections at their REAL width (N = 2*VH / VH,
+                # compact weights). The strip writer maps each real RoPE half
+                # [40] into a 64-lane slot and each real V head [80] into a
+                # 128-lane slot; the pad lanes were zeroed once at alloc.
+                flops += matmul(VS, VH, 2 * VH, self.VIS_NORM_OUT, w, "qk", self.VIS_QK,
+                                out_stride_reg=qk_out_stride_regs[0],
+                                strip_cols=VD_HALF, strip_out_stride=VD_PAD // 2)
+                flops += matmul(VS, VH, VH, self.VIS_NORM_OUT, w, "v", self.VIS_V,
+                                out_stride_reg=v_out_stride_regs[0],
+                                strip_cols=VD, strip_out_stride=VD_PAD)
             else:
                 # Row-shard over tokens: norm1 and both projections are
                 # independent per token row.
@@ -756,12 +808,16 @@ class Qwen25VLVisionMixin:
                         A_DRAM_ADDR=ctx.rows_addr(IN, h_row),
                         OUTPUT_DRAM_ADDR=ctx.rows_addr(self.VIS_NORM_OUT, h_row),
                         GAMMA_DRAM_ADDR=w["norm1_weight"], gpr_M_reg=m) or 0
-                    acc[0] += sh_matmul(ctx, m, VH, 2 * VN * VD_PAD,
+                    acc[0] += sh_matmul(ctx, m, VH, 2 * VH,
                                         self.VIS_NORM_OUT, h_row, w, "qk",
-                                        self.VIS_QK, 2 * VN * VD_PAD * bpe)
-                    acc[0] += sh_matmul(ctx, m, VH, VN * VD_PAD,
+                                        self.VIS_QK, 2 * VN * VD_PAD * bpe,
+                                        out_stride_reg=qk_out_stride_regs[ctx.engine_idx],
+                                        strip_cols=VD_HALF, strip_out_stride=VD_PAD // 2)
+                    acc[0] += sh_matmul(ctx, m, VH, VH,
                                         self.VIS_NORM_OUT, h_row, w, "v",
-                                        self.VIS_V, VN * VD_PAD * bpe)
+                                        self.VIS_V, VN * VD_PAD * bpe,
+                                        out_stride_reg=v_out_stride_regs[ctx.engine_idx],
+                                        strip_cols=VD, strip_out_stride=VD_PAD)
 
                 sched.sharded_region(VS, _proj)
                 flops += acc[0]
