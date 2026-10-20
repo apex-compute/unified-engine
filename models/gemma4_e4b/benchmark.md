@@ -47,22 +47,27 @@ Weights: 2482 MB of DRAM (171 MB shared + 2311 MB of per-engine slices).
 
 | Metric | Low | Medium | High |
 | :--- | ---: | ---: | ---: |
-| Vision encoder, HW (s) | — | 4.81 | not run |
-| Audio encoder, HW (s) | 2.81 | 5.44 | not run |
-| Prefill, HW (s) | 24.31 | 59.73 | not run |
-| Prefill speed, HW (tok/s) | 34.9 | 34.3 | not run |
-| Prefill model GFLOPS (% peak) | 282.8 (75.3%) | 280.7 (74.8%) | not run |
-| **TTFT, HW counters (s)** | **27.12** | **69.98** | not run |
-| TTFT, wall clock (s) | 27.71 | 71.37 | not run |
-| Decode first token, HW (tok/s) | 13.3 | 10.0 | not run |
-| Decode average, wall clock (tok/s) | 11.4 | 8.4 | not run |
-| Decode model GFLOPS (% peak) | 126.8 (33.8%) | 95.3 (25.4%) | not run |
-| Die temperature, start → peak | 72.3 → 79.2 °C | 70.3 → 84.2 °C | — |
+| Vision encoder, HW (s) | — | 4.81 | 19.23 (4 frames) |
+| Audio encoder, HW (s) | 2.81 | 5.44 | 8.03 |
+| Prefill, HW (s) | 24.31 | 59.73 | 197.31 |
+| Prefill speed, HW (tok/s) | 34.9 | 34.3 | 31.1 |
+| Prefill model GFLOPS (% peak) | 282.8 (75.3%) | 280.7 (74.8%) | 262.7 (70.0%) |
+| **TTFT, HW counters (s)** | **27.12** | **69.98** | **224.57** |
+| TTFT, wall clock (s) | 27.71 | 71.37 | —¹ |
+| Decode first token, HW (tok/s) | 13.3 | 10.0 | 5.4 |
+| Decode average, wall clock (tok/s) | 11.4 | 8.4 | 4.8 |
+| Decode model GFLOPS (% peak) | 126.8 (33.8%) | 95.3 (25.4%) | 54.3 (14.5%) |
+| Die temperature, start → peak | 72.3 → 79.2 °C | 70.3 → 84.2 °C | 60.8 → 72.3 °C¹ |
 
-High was not run on this U50: its E2B High already loses the device off PCIe
-at 93.7–95.2 °C after ~110 s of prefill, and E4B's High prefill is about twice
-as long. The U55C runs it at 68 °C. The U50 is 1.26× faster per tier (its
-clock ratio), e.g. Medium TTFT 69.98 s against 88.10 s.
+¹ Run continuously, a High prefill takes this U50 past 94 °C and the device
+drops off PCIe (see [gemma4_e2b](../gemma4_e2b/benchmark.md#high-and-the-boards-temperature)),
+so High is measured with cooling pauses: the 12 prefill chunks run in four
+groups of three, and the run waits for the die to cool to 60 °C before each
+group (598, 548 and 592 s). The HW times exclude the pauses; the wall-clock
+TTFT includes them (1966 s) and is not meaningful. The pauses are a debug-only
+measurement aid, not in the repository. The U55C runs High continuously at
+68 °C. The U50 is 1.26× faster per tier (its clock ratio), e.g. Medium TTFT
+69.98 s against 88.10 s and High 224.57 s against 282.55 s.
 
 ## Outputs
 
@@ -94,8 +99,8 @@ weights lose the audio under a long joint prompt; E2B's do not.
 
 | TTFT, HW (s) | Low | Medium | High |
 | :--- | ---: | ---: | ---: |
-| E2B, U50 | 15.12 | 41.12 | 135.86 |
-| E4B, U50 | 27.12 | 69.98 | — |
+| E2B, U50 | 15.12 | 41.12 | 133.23 |
+| E4B, U50 | 27.12 | 69.98 | 224.57 |
 | E2B, U55C | 19.04 | 51.79 | 170.86 |
 | E4B, U55C | 34.18 | 88.10 | 282.55 |
 

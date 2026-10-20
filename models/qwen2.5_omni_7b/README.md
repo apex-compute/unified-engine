@@ -230,19 +230,20 @@ real-time rate.
 | Medium | vision / audio / prefill | 22.27 / 1.18 / 84.51 s | 27.46 / 1.48 / 106.22 s (90.1%) | 1.23 / 1.26 / 1.26 |
 | | TTFT | 107.96 s | 135.16 s | 1.25 |
 | | decode | 9.75 tok/s | 9.02 tok/s | 0.93× speed |
-| High | vision / audio | 90.15 / 1.45 s | 109.88 / 1.76 s | 1.22 / 1.22 |
-| | prefill | 339.06 s *(extrapolated)* | **369.26 s (87.1%)** | — |
-| | TTFT | 430.65 s *(extrapolated)* | **480.90 s** | — |
-| | decode (6144-token context) | 7.05 tok/s *(extrapolated)* | **4.89 tok/s** | — |
+| High | vision / audio | 87.40 / 1.42 s | 109.88 / 1.76 s | 1.26 / 1.24 |
+| | prefill | 292.69 s (86.9%)¹ | 369.26 s (87.1%) | 1.26 |
+| | TTFT | 381.50 s¹ | 480.90 s | 1.26 |
+| | decode (6144-token context) | 6.26 tok/s | 4.89 tok/s | 0.78× speed |
 
 - **Low and Medium** scale with the clock, like the default prompts.
-- **High** has only been measured on the U55C. The U50 High row is extrapolated, because the current U50 image hangs on that load (see [Known issues](#known-issues)), so the two can't be compared yet. It ran with correct output: the transcription, after which the model ended its reply (19 tokens).
+- **High** scales with the clock too. On both boards it ran with correct output: the transcription, after which the model ended its reply (19 tokens).
+- ¹ The U50 High run used cooling pauses: run continuously, its prefill takes the die past 95 °C and the device drops off PCIe (see [Known issues](#known-issues)). The 28 LM layers ran as four 7-layer programs, waiting for the die to cool to 60 °C before each; the HW times exclude the pauses. The split is a debug-only measurement aid, not in the repository.
 
 ## Known issues
 
-- **U50 image `0x25511139` hangs under long, heavy loads:** Token2Wav (`--speak`), and the Medium/High tiers. It runs the engine at 366.67 MHz, where the U50 build misses timing badly (about 200k failing endpoints). A local build of the same RTL at 333.33 MHz passed the 36-evaluation Token2Wav test that this image fails. Until the U50 image is rebuilt at 333.33 MHz, run speech and the large tiers on the U55C. The U50's High tier in `benchmark.md` is extrapolated for this reason.
+- **U50 image `0x25511139` hangs under long, heavy loads:** Token2Wav (`--speak`), and the Medium/High tiers. It runs the engine at 366.67 MHz, where the U50 build misses timing badly (about 200k failing endpoints). A local build of the same RTL at 333.33 MHz passed the 36-evaluation Token2Wav test that this image fails. Until the U50 image is rebuilt at 333.33 MHz, run speech and the large tiers on the U55C. The U50's High tier in `benchmark.md` was measured with cooling pauses for this reason.
 - **The flat layout is slower on the U55C:** with every stage resident, the engines contend for the same memory controllers. Thinker decode drops from 75% to 43% of peak, and the Talker from 29% to 23%, against the windowed layout. Use `--layout flat` only when you need `--run_from_bin`.
-- **Thermal headroom:** on p2's U50 the die reaches 100 °C after about 5 minutes of full load, which is the limit for the High tier there. The U55C on aztec stays below 75 °C.
+- **Thermal headroom:** on p2's U50 the die reaches 95–97 °C about 4–6 minutes into a continuous High run, at which point the device drops off PCIe (seen twice, from 76 °C and from 60 °C starts). The U55C on aztec stays below 75 °C.
 
 ## Reports and further reading
 

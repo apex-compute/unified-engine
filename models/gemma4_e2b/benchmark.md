@@ -46,21 +46,27 @@ cache prefix that the earlier chunks wrote.
 
 | Metric | Low | Medium | High |
 | :--- | ---: | ---: | ---: |
-| Vision encoder, HW / wall (s) | — | 4.72 / 4.77 | 18.90 / 19.12 (4 frames) |
-| Audio encoder, HW / wall (s) | 2.80 / 2.95 | 5.43 / 5.71 | 8.01 / 8.36 |
+| Vision encoder, HW / wall (s) | — | 4.72 / 4.77 | 19.19 / 19.42 (4 frames) |
+| Audio encoder, HW / wall (s) | 2.80 / 2.95 | 5.43 / 5.71 | 8.01 / 8.45 |
 | Prefill chunks | 2 | 4 | 12 |
-| Prefill, HW / wall (s) | 12.32 / 12.59 | 30.97 / 31.47 | 108.94 / 110.28 |
-| Prefill speed, HW (tok/s) | 68.9 | 66.1 | 56.4 |
-| Prefill model GFLOPS (% peak) | 267.7 (71.3%) | 262.6 (69.9%) | 237.9 (63.3%) |
-| **TTFT, HW counters (s)** | **15.12** | **41.12** | **135.86** |
-| TTFT, wall clock (s) | 15.54 | 41.95 | 137.76 |
+| Prefill, HW / wall (s) | 12.32 / 12.59 | 30.97 / 31.47 | 106.02 / —¹ |
+| Prefill speed, HW (tok/s) | 68.9 | 66.1 | 57.9 |
+| Prefill model GFLOPS (% peak) | 267.7 (71.3%) | 262.6 (69.9%) | 244.4 (65.1%) |
+| **TTFT, HW counters (s)** | **15.12** | **41.12** | **133.23** |
+| TTFT, wall clock (s) | 15.54 | 41.95 | —¹ |
 | Decoded tokens (budget) | 32 (32) | 64 (64) | 128 (128) |
-| Decode first token, HW (tok/s) | 26.5 | 20.1 | 10.6 |
-| Decode average, HW (tok/s) | 26.3 | 19.5 | 10.5 |
-| Decode average, wall clock (tok/s) | 20.1 | 16.0 | 8.0 |
-| Decode model GFLOPS (% peak) | 125.6 (33.4%) | 96.1 (25.6%) | 56.4 (15.0%) |
+| Decode first token, HW (tok/s) | 26.5 | 20.1 | 11.3 |
+| Decode average, HW (tok/s) | 26.3 | 19.5 | 11.2 |
+| Decode average, wall clock (tok/s) | 20.1 | 16.0 | 7.5 |
+| Decode model GFLOPS (% peak) | 125.6 (33.4%) | 96.1 (25.6%) | 60.3 (16.0%) |
 | Final context (tokens) | 881 | 2111 | 6271 |
-| Die temperature, start → peak | 84.2 → 86.7 °C | 80.7 → 86.7 °C | 70.8 → 92.7 °C |
+| Die temperature, start → peak | 84.2 → 86.7 °C | 80.7 → 86.7 °C | 59.8 → 68.3 °C¹ |
+
+¹ High is measured with cooling pauses (see [High and the board's
+temperature](#high-and-the-boards-temperature)): its 12 prefill chunks run in
+four groups of three, and the run waits for the die to cool to 60 °C before
+each group. The HW times exclude the pauses; the wall-clock prefill and TTFT
+include them (1610 s and 1638 s) and are not meaningful.
 
 Outputs (greedy, cut at the decode budget):
 
@@ -96,19 +102,25 @@ host work only:
 
 ### High and the board's temperature
 
-High is the first tier long enough to heat this card, and on it High passes
-only from a cool start:
+High is the first tier long enough to heat this card. Run continuously, it
+passes only from a cool start; with cooling pauses between prefill chunk
+groups it passes and peaks at 68 °C:
 
 | Run | Die at start | Peak | Result |
 | :--- | ---: | ---: | :--- |
-| High, after an hour idle | 70.8 °C | 92.7 °C | passed (the numbers above) |
+| High, cooling to 60 °C before chunks 4, 7 and 10 | 59.8 °C | 68.3 °C | passed (the numbers above); pauses 382, 528 and 592 s |
+| High, continuous, after an hour idle | 70.8 °C | 92.7 °C | passed: prefill 108.94 s HW, TTFT 135.86 s HW, same 128 tokens |
 | High, 15 min after that run | 78.2 °C | 94.7 °C | device lost off PCIe in prefill chunk 12 of 12 |
 | High, earlier, back-to-back | 86.7 °C | 95.2 °C | device lost off PCIe in prefill chunk 6 |
 | 4000-token text prompt, back-to-back | 90.7 °C | 93.7 °C | device lost off PCIe in the first chunk |
 
-Every failure came at 93.7–95.2 °C, and the one pass peaked at 92.7 °C. This U50 idles at 80–84 °C and the 366.7 MHz image does
-not meet timing, so High on this card depends on its starting temperature; the
-same program on an Alveo U55C (290 MHz) peaks at 63 °C.
+Every failure came at 93.7–95.2 °C, and the continuous pass peaked at 92.7 °C.
+This U50 idles at 80–84 °C and the 366.7 MHz image does not meet timing, so a
+continuous High on this card depends on its starting temperature; the same
+program on an Alveo U55C (290 MHz) peaks at 63 °C. The cooling pauses are a
+debug-only measurement aid and are not in the repository. The paused run
+decodes the same 128 tokens as the continuous one, and its prefill is 2.7%
+faster on the HW counters (106.02 s against 108.94 s).
 
 ## Notes
 
