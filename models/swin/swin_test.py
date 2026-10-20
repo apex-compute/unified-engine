@@ -1123,8 +1123,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
 
         gpr_mm = self.alloc_isa_reg()   # matmul M (= spatial^2 per stage)
         gpr_ln = self.alloc_isa_reg()   # LayerNorm runtime row count
-        gpr_pbi = self.alloc_isa_reg()  # PBI strided-copy trip count (permute loops)
-        gpr_qkv_stride = self.alloc_isa_reg()  # Q/K/V strip write-back row pitch (elements)
+        # Q/K/V strip write-back row pitch (elements). MUST be allocated BEFORE gpr_pbi:
+        # pbi_strided_copy resets _isa_reg_counter to gpr_pbi+1, so any register above
+        # gpr_pbi is reused as a temporary by the next matmul and silently clobbered.
+        gpr_qkv_stride = self.alloc_isa_reg()
+        gpr_pbi = self.alloc_isa_reg()  # PBI strided-copy trip count (permute loops) -- keep LAST
 
         # ================================================================
         # PRE-ENCODER: patch extraction + bias + LayerNorm
