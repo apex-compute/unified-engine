@@ -1176,6 +1176,68 @@ class Gemma4LMMixin:
         if own_tmp:
             ue.release_isa_reg()   # tmp
 
+    def _stage_prefill_private_state(self, prefill_scheduler, layer_size: int):
+        """Stage every per-engine buffer the LM programs bake addresses of.
+
+        The private weight slices (both phases), the K-sliced down, the MLP
+        lanes and the per-engine prefill attention scratch. All of it is
+        allocated deterministically and cached, so a run that REUSES a stored
+        program image (--bin-reuse) must still call this -- in the same order
+        as a compile -- to put the weights where that image expects them.
+        Returns (mlp_shards, down_k_shards, mlp_lanes), Nones single-engine.
+        """
+        mlp_shards = down_k_shards = mlp_lanes = None
+        if prefill_scheduler is not None and self._tiled_map:
+            mlp_shards = self._ensure_decode_qkv_shards(prefill_scheduler, layer_size)
+            down_k_shards = self._ensure_prefill_down_k_shards(
+                prefill_scheduler, layer_size)
+            mlp_lanes = self._ensure_prefill_mlp_lane_buffers()
+
+        # Multi-core attention shards the group heads across engines; each engine
+        # needs PRIVATE flash scratch. Carve one slot per engine out of the big
+        # LAYER0_FLASH_SCRATCH_DRAM arena (sized for per_head_rows=max, head_dim
+        # max). register_per_engine_addrs is idempotent across recompiles.
+        if prefill_scheduler is not None:
+            # unified_attention_core needs THREE scratch buffers (V^T + score +
+            # scaled_q), NOT the two the flash kernel's attn_scratch_bytes sizes.
+            # Match the core's own layout (see _attention_buffer_sizes, which
+            # also covers a chunk's [P, S] score plane). Undersizing overlaps
+            # adjacent engines' scaled_q onto the next engine's V^T and corrupts
+            # the worker heads.
+            _attn_scr_stride = (self._attention_buffer_sizes()["engine_scratch"]
+                                * self.bytes_per_element)
+            _n_eng = prefill_scheduler.num_engines
+            # Workers take their scratch from their PRIVATE TENSOR window in
+            # self.mc_arena (low 2 GB); core 0 keeps its LAYER0_FLASH_SCRATCH_DRAM
+            # buffer in the tensor arena. Previously every engine strided into
+            # that one buffer, so N engines walked straight through the tensors
+            # that follow it -- guarded only by an assert. The arena's cursor is
+            # shared with the vision scratch allocated earlier in the run, so
+            # the two stages cannot be handed the same address.
+            # Allocated once: chunked prefill compiles once per chunk, and a
+            # fresh allocation per compile would walk the private cursor
+            # through the window.
+            _scr_addrs = getattr(self, "_prefill_attn_scr_addrs", None)
+            if _scr_addrs is None or len(_scr_addrs) != _n_eng:
+                _scr_addrs = [self.LAYER0_FLASH_SCRATCH_DRAM] + [
+                    self.mc_arena.alloc_tensor(e, _attn_scr_stride, "prefill attn scratch")
+                    for e in range(1, _n_eng)]
+                self._prefill_attn_scr_addrs = _scr_addrs
+            print(f"[prefill attn scratch] core0=0x{self.LAYER0_FLASH_SCRATCH_DRAM:X} "
+                  f"(tensor arena) workers="
+                  f"{', '.join(f'0x{a:X}' for a in _scr_addrs[1:])} "
+                  f"used=0x{_attn_scr_stride:X} engines={_n_eng}")
+            # Core 0's own buffer must still hold one engine's worth.
+            assert (self.LAYER0_FLASH_SCRATCH_DRAM + _attn_scr_stride
+                    <= self.LAYER0_ATTN_PROJ_OUTPUT_DRAM), (
+                f"prefill core0 attn scratch overruns FLASH_SCRATCH: "
+                f"0x{_attn_scr_stride:X} from 0x{self.LAYER0_FLASH_SCRATCH_DRAM:X} > "
+                f"next tensor 0x{self.LAYER0_ATTN_PROJ_OUTPUT_DRAM:X}")
+            prefill_scheduler.register_per_engine_addrs(
+                "prefill_attn_scratch", _scr_addrs)
+
+        return mlp_shards, down_k_shards, mlp_lanes
+
     def compile_prefill(self, seq_len: int, layer_size: int | None = None, profile: bool = False,
                         pos_offset: int = 0) -> tuple[None, int]:
         """Emit one runtime-length prefill program into the capture buffer.
@@ -1244,55 +1306,8 @@ class Gemma4LMMixin:
         # stages -- each engine computes all rows of its own column block --
         # so no weight has a second layout. _ensure_decode_qkv_shards is cached:
         # calling it here moves the staging earlier and compile_decoder reuses it.
-        mlp_shards = down_k_shards = mlp_lanes = None
-        if prefill_scheduler is not None and self._tiled_map:
-            mlp_shards = self._ensure_decode_qkv_shards(prefill_scheduler, layer_size)
-            down_k_shards = self._ensure_prefill_down_k_shards(
-                prefill_scheduler, layer_size)
-            mlp_lanes = self._ensure_prefill_mlp_lane_buffers()
-
-        # Multi-core attention shards the group heads across engines; each engine
-        # needs PRIVATE flash scratch. Carve one slot per engine out of the big
-        # LAYER0_FLASH_SCRATCH_DRAM arena (sized for per_head_rows=max, head_dim
-        # max). register_per_engine_addrs is idempotent across recompiles.
-        if prefill_scheduler is not None:
-            # unified_attention_core needs THREE scratch buffers (V^T + score +
-            # scaled_q), NOT the two the flash kernel's attn_scratch_bytes sizes.
-            # Match the core's own layout (see _attention_buffer_sizes, which
-            # also covers a chunk's [P, S] score plane). Undersizing overlaps
-            # adjacent engines' scaled_q onto the next engine's V^T and corrupts
-            # the worker heads.
-            _attn_scr_stride = (self._attention_buffer_sizes()["engine_scratch"]
-                                * self.bytes_per_element)
-            _n_eng = prefill_scheduler.num_engines
-            # Workers take their scratch from their PRIVATE TENSOR window in
-            # self.mc_arena (low 2 GB); core 0 keeps its LAYER0_FLASH_SCRATCH_DRAM
-            # buffer in the tensor arena. Previously every engine strided into
-            # that one buffer, so N engines walked straight through the tensors
-            # that follow it -- guarded only by an assert. The arena's cursor is
-            # shared with the vision scratch allocated earlier in the run, so
-            # the two stages cannot be handed the same address.
-            # Allocated once: chunked prefill compiles once per chunk, and a
-            # fresh allocation per compile would walk the private cursor
-            # through the window.
-            _scr_addrs = getattr(self, "_prefill_attn_scr_addrs", None)
-            if _scr_addrs is None or len(_scr_addrs) != _n_eng:
-                _scr_addrs = [self.LAYER0_FLASH_SCRATCH_DRAM] + [
-                    self.mc_arena.alloc_tensor(e, _attn_scr_stride, "prefill attn scratch")
-                    for e in range(1, _n_eng)]
-                self._prefill_attn_scr_addrs = _scr_addrs
-            print(f"[prefill attn scratch] core0=0x{self.LAYER0_FLASH_SCRATCH_DRAM:X} "
-                  f"(tensor arena) workers="
-                  f"{', '.join(f'0x{a:X}' for a in _scr_addrs[1:])} "
-                  f"used=0x{_attn_scr_stride:X} engines={_n_eng}")
-            # Core 0's own buffer must still hold one engine's worth.
-            assert (self.LAYER0_FLASH_SCRATCH_DRAM + _attn_scr_stride
-                    <= self.LAYER0_ATTN_PROJ_OUTPUT_DRAM), (
-                f"prefill core0 attn scratch overruns FLASH_SCRATCH: "
-                f"0x{_attn_scr_stride:X} from 0x{self.LAYER0_FLASH_SCRATCH_DRAM:X} > "
-                f"next tensor 0x{self.LAYER0_ATTN_PROJ_OUTPUT_DRAM:X}")
-            prefill_scheduler.register_per_engine_addrs(
-                "prefill_attn_scratch", _scr_addrs)
+        mlp_shards, down_k_shards, mlp_lanes = self._stage_prefill_private_state(
+            prefill_scheduler, layer_size)
 
         def _shard_projection_core(ctx, **kwargs) -> int:
             """Emit one fixed row shard through the two-pass matmatmul core."""

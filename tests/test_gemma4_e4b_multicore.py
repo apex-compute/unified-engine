@@ -80,7 +80,7 @@ class Gemma4E4BVariant(unittest.TestCase):
         self.assertEqual(engine.mc_arena.tensor_bytes, 64 << 20)
         self.assertEqual(engine.TENSOR_LIMIT - engine._tensor_dram_base, 480 << 20)
         # E4B's private slices need ~337 MiB/engine, more than E2B's 256 MiB floor.
-        bound = gemma.Gemma4_UnifiedEngine._private_weight_upper_bound(None, 8)
+        bound = gemma.Gemma4_UnifiedEngine._private_weight_bytes(None, 8)
         self.assertGreater(bound, 256 << 20)
         self.assertEqual(engine.mc_arena._private_reserve, [bound] * 8)
 

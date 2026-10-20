@@ -934,6 +934,28 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     bin, compiles prefill/decoder into one bin, runs prefill + decode. Numeric
     checks live in gemma4_e2b_numeric.py."""
 
+    def _kv_cache_bytes_estimate(self) -> int:
+        """Bytes of one of the K / V caches at MAX_CONTEXT_SIZE (tensor_init's
+        layout), for layers that own KV state. The KV-shared layers come from
+        the weight manifest when it is on disk; otherwise every layer counts."""
+        shared = set()
+        manifest = os.path.join(self.script_dir,
+                                os.path.dirname(self._cfg["paths"]["weights_bin"]), "params.json")
+        try:
+            with open(manifest) as f:
+                shared = set(int(k) for k in json.load(f)["host_section"]["manifest"]
+                             .get("kv_shared_map", {}))
+        except (OSError, KeyError, ValueError):
+            pass
+        total = 0
+        for layer in range(self.LAYER_SIZE):
+            if layer in shared:
+                continue
+            hd = (self.head_dim if layer in self._full_attention_layers
+                  else self.head_dim_sliding)
+            total += self.num_kv_heads * self.MAX_CONTEXT_SIZE * hd * self.bytes_per_element
+        return total
+
     def _plan_kintex_capacity(self):
         """Check the full private and shared allocation before loading weights.
 
@@ -984,6 +1006,13 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             arena.alloc_shared(self.weight_defs[key + "_SIZE"], key)
         arena.alloc_shared(UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element,
                            "vision identity")
+        # The KV cache and the audio program also come from the shared pool
+        # under a tiled map (tensor_init, compile_audio_fpga).
+        kv_bytes = self._kv_cache_bytes_estimate()
+        arena.alloc_shared(kv_bytes, "kv cache V")
+        arena.alloc_shared(kv_bytes, "kv cache K")
+        from gemma4_e2b_audio import AUDIO_ISA_BYTES
+        arena.alloc_shared(AUDIO_ISA_BYTES, "audio ISA")
 
         rows = max(self.max_prefill_seq_len, 1)
         mlp_lane = max(self.mlp_elements, self.mlp_elements_wide) // self.multi_core
@@ -1001,7 +1030,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 arena.alloc_tensor(engine, 16 << 20, "vision attention upper bound")
         return {"private_weights_upper_bound": private_bytes,
                 "shared_weight_bytes": sum(item["size"] for item in arena._shared_allocs
-                                            if item["what"] != "TENSOR.window"),
+                                            if item["what"] not in (
+                                                "TENSOR.window", "kv cache V",
+                                                "kv cache K", "audio ISA")),
+                "kv_cache_bytes": 2 * kv_bytes,
                 "shared_free_bytes": arena.shared_free(),
                 "tensor_bytes_per_engine": self._tile_tensor_bytes}
 
@@ -1102,19 +1134,34 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         return scheduler
 
     @classmethod
-    def _private_weight_upper_bound(cls, script_dir, multi_core: int) -> int:
-        """Per-engine bytes of the private projection slices, from the config.
+    def _private_weight_bytes(cls, script_dir, multi_core: int) -> int:
+        """Per-engine bytes of the private IF4 projection slices, from the config.
 
-        Every projection region of every layer plus the LM head, split evenly
-        over the engines, +5%, rounded up to 32 MiB. The regions are sized for
-        the widest layer, so this over-counts the narrow ones: an upper bound,
-        which is what a reserve declared before any weight is loaded needs.
+        Every projection at its layer's real shape -- Q/O over all query heads,
+        K/V over the KV heads (counted on every layer, though KV-shared layers
+        stage none), gate/up/down at the layer's MLP width -- plus the LM head,
+        split evenly over the engines, +5%, rounded up to 32 MiB. An upper
+        bound, which is what a reserve declared before any weight is loaded
+        needs, without the widest-layer padding of the file regions.
         """
         cfg = cls.load_config(script_dir=script_dir or SCRIPT_DIR)
-        defs, layers = cfg["_weight_defs"], cfg["file_info"]["num_layers"]
-        keys = [k for pair in Gemma4LMMixin.PROJ_REGION_KEYS.values() for k in pair]
-        total = (layers * sum(defs[k + "_SIZE"] for k in keys)
-                 + sum(defs[k + "_SIZE"] for k in Gemma4LMMixin.LM_HEAD_REGION_KEYS))
+        fi, model = cfg["file_info"], cfg["model"]
+        hidden = int(fi["hidden_size"])
+        num_kv = int(fi.get("num_key_value_heads", 1))
+        num_q = int(fi.get("num_attention_heads", int(fi["group_size"]) * num_kv))
+        full = set(int(i) for i in model["full_attention_layers"])
+        wide_from = int(model.get("double_wide_mlp_first_layer", fi["num_layers"]))
+
+        def if4(n, k):   # packed nibbles + one bf16 scale per 64-element block
+            return n * k // 2 + n * (k // 64) * 2
+
+        total = if4(int(fi["embedding_vocab"]), hidden)          # LM head
+        for layer in range(int(fi["num_layers"])):
+            hd = int(fi["head_dim"]) if layer in full else int(fi["head_dim_sliding"])
+            mlp = int(fi["mlp_elements_wide"] if layer >= wide_from else fi["mlp_elements"])
+            total += (2 * if4(hd * num_q, hidden)                # q, o
+                      + 2 * if4(hd * num_kv, hidden)             # k, v
+                      + 3 * if4(mlp, hidden))                    # gate, up, down
         per_engine = int(total / max(int(multi_core), 1) * 1.05)
         return (per_engine + (32 << 20) - 1) & ~((32 << 20) - 1)
 
@@ -1172,10 +1219,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                                    else TILED_WINDOW_BYTES)
         self._tile_tensor_bytes = (KINTEX_PRIVATE_TENSOR_BYTES if self._kintex_tiled_map
                                    else TILED_TENSOR_BYTES)
-        self._tile_private_reserve_bytes = (KINTEX_PRIVATE_RESERVE_BYTES
-            if self._kintex_tiled_map
-            else max(TILED_PRIVATE_RESERVE_BYTES,
-                     self._private_weight_upper_bound(script_dir, multi_core)))
+        # The floor per map, raised to what this model's slices need (E4B).
+        self._tile_private_reserve_bytes = max(
+            KINTEX_PRIVATE_RESERVE_BYTES if self._kintex_tiled_map
+            else TILED_PRIVATE_RESERVE_BYTES,
+            self._private_weight_bytes(script_dir, multi_core))
         # THE TILED MAP IS SELECTED BY ENGINE COUNT AND BOARD. Kintex uses
         # its two 2 GiB controller windows. At 8 engines on a characterised
         # Alveo board, the windows become 1 GiB and
@@ -1799,6 +1847,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                         and meta.get("prefill_kernel") == self.prefill_kernel
                         for meta in _prefill_worker_metas)):
             bin_path, _ = self._program_image_paths(profile)
+            # The image bakes the per-engine weight slices' and scratch
+            # addresses; stage them exactly as a compile would.
+            if prefill_scheduler is not None:
+                self._stage_prefill_private_state(prefill_scheduler, layer_size)
             print(f"[compile] reusing existing instruction image at {bin_path}")
             print(f"  delete {bin_path} (or make clean) to force recompile.")
             self._lm_compile_reused = True

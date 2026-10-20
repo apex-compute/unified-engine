@@ -86,13 +86,17 @@ class Gemma4MulticoreLayout(unittest.TestCase):
             used = engine.mc_arena._tensor_cursor[index] - engine.mc_arena.regions[index].tensor_base
             self.assertEqual(used, (19 << 20) + (512 << 10))
 
-    def test_kintex_insufficient_reservation_fails_before_weight_loading(self):
+    def test_kintex_private_slices_past_the_tile_fail_before_weight_loading(self):
+        # The reserve grows to what the model's slices need; a model whose slices
+        # cannot fit the 2 GiB tile at all must still stop before any weight is
+        # loaded.
         with patch.multiple(core, ANDROMEDA_CORE_COUNT=2,
                             AVAILABLE_DRAM_SIZE_GB=4, CLOCK_CYCLE_TIME_NS=4.0), \
-                patch.object(gemma, "KINTEX_PRIVATE_RESERVE_BYTES", 512 << 20), \
+                patch.object(gemma.Gemma4_UnifiedEngine, "_private_weight_bytes",
+                             return_value=3 << 30), \
                 patch.object(gemma.Gemma4_UnifiedEngine, "weight_init") as load, \
                 patch("builtins.print"):
-            with self.assertRaisesRegex(MemoryError, "Kintex E2B private projections need"):
+            with self.assertRaises((ValueError, MemoryError)):
                 gemma.Gemma4_UnifiedEngine(multi_core=2)
             load.assert_not_called()
 
