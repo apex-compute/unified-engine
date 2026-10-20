@@ -203,27 +203,15 @@ class HFVisionWeightsBF16:
         with torch.no_grad():
             for i, blk in enumerate(visual.blocks):
                 pre = f"visual.blocks.{i}"
-                qkv_w = blk.attn.qkv.weight.detach().to(torch.bfloat16).view(3, VN, VD, VH)
-                qkv_b = blk.attn.qkv.bias.detach().to(torch.bfloat16).view(3, VN, VD)
-                qk_w = torch.zeros(2 * VN * VD_PAD, VH, dtype=torch.bfloat16)
-                qk_b = torch.zeros(2 * VN * VD_PAD, dtype=torch.bfloat16)
-                for proj in range(2):
-                    for h in range(VN):
-                        hs = (proj * VN + h) * VD_PAD
-                        qk_w[hs:hs + half] = qkv_w[proj, h, :half]
-                        qk_w[hs + 64:hs + 64 + half] = qkv_w[proj, h, half:]
-                        qk_b[hs:hs + half] = qkv_b[proj, h, :half]
-                        qk_b[hs + 64:hs + 64 + half] = qkv_b[proj, h, half:]
-                w[f"{pre}.attn.qk_padded.weight.if4"] = qk_w
-                w[f"{pre}.attn.qk_padded.bias"] = qk_b
-                v_w = torch.zeros(VN * VD_PAD, VH, dtype=torch.bfloat16)
-                v_b = torch.zeros(VN * VD_PAD, dtype=torch.bfloat16)
-                for h in range(VN):
-                    hs = h * VD_PAD
-                    v_w[hs:hs + VD] = qkv_w[2, h]
-                    v_b[hs:hs + VD] = qkv_b[2, h]
-                w[f"{pre}.attn.v_padded.weight.if4"] = v_w
-                w[f"{pre}.attn.v_padded.bias"] = v_b
+                # Compact Q/K/V, exactly as params.bin stores them; the
+                # 80->128 / 40->64 slot padding is applied AFTER the matmul
+                # (see _strip_place below), mirroring the strip write-back.
+                qkv_w = blk.attn.qkv.weight.detach().to(torch.bfloat16)
+                qkv_b = blk.attn.qkv.bias.detach().to(torch.bfloat16)
+                w[f"{pre}.attn.qk.weight.if4"] = qkv_w[:2 * VH].contiguous()
+                w[f"{pre}.attn.qk.bias"] = qkv_b[:2 * VH].contiguous()
+                w[f"{pre}.attn.v.weight.if4"] = qkv_w[2 * VH:].contiguous()
+                w[f"{pre}.attn.v.bias"] = qkv_b[2 * VH:].contiguous()
                 w[f"{pre}.attn.proj.weight.if4"] = blk.attn.proj.weight.detach().to(torch.bfloat16)
                 w[f"{pre}.attn.proj.bias"] = blk.attn.proj.bias.detach().to(torch.bfloat16)
                 for name in ("gate_proj", "up_proj"):
@@ -256,6 +244,18 @@ class HFVisionWeightsBF16:
         return t
 
 
+def _strip_place(y: torch.Tensor, strip_cols: int, strip_out_stride: int) -> torch.Tensor:
+    """Host model of matmat_mul_core's strip write-back: column strip s of
+    ``y`` [M, N] is written at columns s*P .. s*P+W-1 of a [M, (N/W)*P]
+    buffer whose other lanes are zero."""
+    M, N = y.shape
+    assert N % strip_cols == 0, (N, strip_cols)
+    strips = N // strip_cols
+    out = torch.zeros(M, strips, strip_out_stride, dtype=y.dtype)
+    out[:, :, :strip_cols] = y.reshape(M, strips, strip_cols)
+    return out.reshape(M, strips * strip_out_stride)
+
+
 def build_hostsim_reference(ue, patch_embeds, rope_table, bias_full, bias_window,
                             num_layers=None, weights=None, tag="hostsim"):
     """Recompute the encoder on the host exactly as the FPGA program does.
@@ -282,11 +282,17 @@ def build_hostsim_reference(ue, patch_embeds, rope_table, bias_full, bias_window
         pre = f"visual.blocks.{li}"
         h = _hw_rms(x, W.bf16(f"{pre}.norm1.weight"))
 
-        qk = _hw_linear(h, W.if4(f"{pre}.attn.qk_padded.weight.if4",
-                                 2 * VN * VD_PAD, VH),
-                        W.bf16(f"{pre}.attn.qk_padded.bias"))
-        v = _hw_linear(h, W.if4(f"{pre}.attn.v_padded.weight.if4", VN * VD_PAD, VH),
-                       W.bf16(f"{pre}.attn.v_padded.bias"))
+        # Real-width projections, then the strip write-back's slot placement:
+        # each 40-lane RoPE half of Q/K lands at the start of a 64-lane slot,
+        # each 80-lane V head at the start of a 128-lane slot, pad lanes zero.
+        qk = _strip_place(
+            _hw_linear(h, W.if4(f"{pre}.attn.qk.weight.if4", 2 * VH, VH),
+                       W.bf16(f"{pre}.attn.qk.bias")),
+            VD // 2, VD_PAD // 2)
+        v = _strip_place(
+            _hw_linear(h, W.if4(f"{pre}.attn.v.weight.if4", VH, VH),
+                       W.bf16(f"{pre}.attn.v.bias")),
+            VD, VD_PAD)
 
         # [VS, 2*VN, VD_PAD] -> head-major; groups 0..VN-1 are Q, VN.. are K.
         qk = qk.reshape(VS, 2 * VN, VD_PAD).permute(1, 0, 2)
