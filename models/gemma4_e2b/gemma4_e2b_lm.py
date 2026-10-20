@@ -455,6 +455,10 @@ class Gemma4LMMixin:
         local_base = rope_local_base if rope_local_base is not None else rope_cfg["local_base"]
         num_rope_positions = rope_cfg["num_positions"]
         partial_rotary_factor = rope_cfg["partial_rotary_factor_global"]
+        if num_rope_positions < self.MAX_CONTEXT_SIZE:
+            raise ValueError(
+                f"special.rope.num_positions ({num_rope_positions}) < max_context_size "
+                f"({self.MAX_CONTEXT_SIZE}): decode would read RoPE rows past the table")
 
         # LOCAL RoPE: head_dim_sliding=256, full rotation, D=128
         D_local = self.head_dim_sliding // 2  # 128
@@ -466,6 +470,9 @@ class Gemma4LMMixin:
         rope_local = torch.cat([cos_local, cos_local, -sin_local, sin_local], dim=1)
         sz = self.weight_defs["ROPE_LOCAL_SIZE"]
         raw = user_dma_core.tensor_le_bytes(rope_local)
+        if len(raw) > sz:
+            raise ValueError(f"ROPE_LOCAL table is {len(raw)} bytes but its region is {sz}; "
+                             f"grow non_layer_regions.ROPE_LOCAL.size with num_positions")
         raw = (raw + b"\x00" * sz)[:sz]
         addr = self.allocate_params_dram(sz)
         self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
@@ -481,6 +488,9 @@ class Gemma4LMMixin:
         rope_global = torch.cat([cos_global, cos_global, -sin_global, sin_global], dim=1)
         sz = self.weight_defs["ROPE_GLOBAL_SIZE"]
         raw = user_dma_core.tensor_le_bytes(rope_global)
+        if len(raw) > sz:
+            raise ValueError(f"ROPE_GLOBAL table is {len(raw)} bytes but its region is {sz}; "
+                             f"grow non_layer_regions.ROPE_GLOBAL.size with num_positions")
         raw = (raw + b"\x00" * sz)[:sz]
         addr = self.allocate_params_dram(sz)
         self.dma_write(DMA_DEVICE_H2C, addr, raw, sz)
@@ -819,14 +829,12 @@ class Gemma4LMMixin:
         # need the largest prefill request; decode reuses them for one token.
         activation_seq_len = max(self.max_prefill_seq_len, 1)
         activation_q_seq_len = activation_seq_len * self.group_size
-        # Unified attention scratch/bias buffers are largest during prefill,
-        # but decode can still require MAX_CONTEXT_SIZE KV rows. Size the
-        # shared attention buffers for the larger aligned dimension.
-        prefill_seq_len = min(self.max_prefill_seq_len, self.MAX_CONTEXT_SIZE)
-        prefill_q_seq_len = prefill_seq_len * self.group_size
-        prefill_aligned_seq_len = ((prefill_q_seq_len + 63) // 64) * 64
-        decode_aligned_seq_len = ((self.MAX_CONTEXT_SIZE + 63) // 64) * 64
-        attention_aligned_seq_len = max(prefill_aligned_seq_len, decode_aligned_seq_len)
+        # Attention buffers are sized per role rather than as one square of the
+        # larger of prefill*group_size and MAX_CONTEXT_SIZE, which at an 8192
+        # context would need 2 x 128 MiB of bias planes plus a 128 MiB score
+        # plane -- more than the whole 480 MiB tensor arena.
+        self._attn_sizes = self._attention_buffer_sizes()
+        attention_rows_aligned = self._attn_sizes["rows"]
 
         # Build compact KV slot map: only layers that own KV state get a slot.
         # KV-shared layers point at their reference layer's slot, so L15-34 do not
@@ -882,8 +890,8 @@ class Gemma4LMMixin:
         # full-attention layers attend to the whole causal window, sliding
         # layers to `sliding_window`. compile_* pick the right address per layer;
         # run_prefill / run_decoder upload both.
-        self.LAYER0_FLASH_BIAS_FULL_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * attention_aligned_seq_len * self.bytes_per_element)
-        self.LAYER0_FLASH_BIAS_SLIDING_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * attention_aligned_seq_len * self.bytes_per_element)
+        self.LAYER0_FLASH_BIAS_FULL_DRAM = self.allocate_tensor_dram(self._attn_sizes["bias"] * self.bytes_per_element)
+        self.LAYER0_FLASH_BIAS_SLIDING_DRAM = self.allocate_tensor_dram(self._attn_sizes["bias"] * self.bytes_per_element)
         # Backwards-compat alias (older callers use the singular name).
         self.LAYER0_FLASH_BIAS_DRAM = self.LAYER0_FLASH_BIAS_FULL_DRAM
         # Reserved streaming LM-head penalty bias.
@@ -901,12 +909,12 @@ class Gemma4LMMixin:
 
         # ================= SCRATCH tensors =================
         # Transient per-op / per-stage buffers. Sized for the larger of prefill
-        # (seq_len*group_size rows) and decode (MAX_CONTEXT_SIZE KV rows).
-        self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
-        self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
+        # (seq_len*group_size rows) and decode (group_size rows).
+        self.LAYER0_FLASH_Q_DRAM = self.allocate_tensor_dram(attention_rows_aligned * self.head_dim * self.bytes_per_element)
+        self.LAYER0_FLASH_K_DRAM = self.allocate_tensor_dram(attention_rows_aligned * self.head_dim * self.bytes_per_element)
         self.LAYER0_FLASH_V_DRAM = self.allocate_tensor_dram(activation_seq_len * self.head_dim * self.bytes_per_element)
         attention_zero_pad = torch.zeros(
-            attention_aligned_seq_len * self.head_dim * self.bytes_per_element,
+            attention_rows_aligned * self.head_dim,
             dtype=torch.bfloat16)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, attention_zero_pad)
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, attention_zero_pad)
@@ -921,13 +929,10 @@ class Gemma4LMMixin:
         self.LAYER0_K_DRAM = self.allocate_tensor_dram(activation_seq_len * self.k_size)
         self.LAYER0_K_NORM_DRAM = self.allocate_tensor_dram(activation_seq_len * self.k_size)
         self.LAYER0_Q_NORM_DRAM = self.allocate_tensor_dram(activation_q_seq_len * self.head_dim * self.bytes_per_element)
-        self.LAYER0_FLASH_OUTPUT_DRAM = self.allocate_tensor_dram(attention_aligned_seq_len * self.head_dim * self.bytes_per_element)
-        # unified_attention_core scratch layout:
-        #   V.T [HD, S] + scores [S, S] + scaled_q [batch, HD].
-        # Worst case batch <= S, so allocate S*S + 2*HD*S elements.
+        self.LAYER0_FLASH_OUTPUT_DRAM = self.allocate_tensor_dram(attention_rows_aligned * self.head_dim * self.bytes_per_element)
+        # Core 0's attention scratch; see _attention_buffer_sizes for the layout.
         self.LAYER0_FLASH_SCRATCH_DRAM = self.allocate_tensor_dram(
-            (attention_aligned_seq_len * attention_aligned_seq_len
-             + 2 * self.head_dim * attention_aligned_seq_len) * self.bytes_per_element)
+            self._attn_sizes["scratch"] * self.bytes_per_element)
         self.LAYER0_ATTN_PROJ_OUTPUT_DRAM = self.allocate_tensor_dram(activation_seq_len * self.vector_length * 2)
         self.LAYER0_POST_ATTN_NORM_DRAM = self.allocate_tensor_dram(activation_seq_len * self.vector_length * 2)
         self.LAYER0_POST_ATTN_RESIDUAL_DRAM = self.allocate_tensor_dram(activation_seq_len * self.vector_length * 2)
@@ -958,6 +963,47 @@ class Gemma4LMMixin:
         print(f"    Tensor DRAM: persistent {_persistent_bytes/(1024*1024):.1f} MB @ "
               f"0x{self._tensor_dram_base:X}, scratch base 0x{self._scratch_dram_base:X}, "
               f"total high-water {self.get_tensor_dram_usage()/(1024*1024):.1f} MB")
+
+    def _attention_buffer_sizes(self) -> dict:
+        """Element counts of the shared attention buffers, per role.
+
+        ``rows``: rows of head_dim in FLASH_Q / FLASH_K / FLASH_OUTPUT. Prefill
+        keeps every group head's Q there, token-major and then head-major
+        (seq * group_size rows); decode needs group_size rows.
+
+        ``bias``: each of the two bias planes. The core reads the bias at the
+        LIVE row stride: prefill uploads [P, P] (P = align64(prefill length)),
+        a later prefill chunk [P, S] and decode [group_size, S]
+        (S = align64(context)).
+
+        ``scratch``: core 0's unified_attention_core scratch, V^T [HD, A] +
+        scores [A, A] + scaled_q [batch, HD] at the static aligned length A the
+        core is emitted with. Prefill emits it per head with A = P; a later
+        chunk with A = S and no scaled_q, so V^T [HD, S] + scores [P, S].
+        Single-core decode emits it with A = S, so it needs the square score
+        plane; multi-core decode inlines the core and uses V^T [HD, S] + scores
+        [group_size, S] only.
+
+        ``engine_scratch``: what each prefill engine needs of that (the worker
+        engines' private copies).
+        """
+        hd = self.head_dim
+        p_al = ((max(self.max_prefill_seq_len, 1) + 63) // 64) * 64
+        s_al = ((self.MAX_CONTEXT_SIZE + 63) // 64) * 64
+        rows = ((min(self.max_prefill_seq_len, self.MAX_CONTEXT_SIZE)
+                 * self.group_size + 63) // 64) * 64
+        chunked = self.MAX_CONTEXT_SIZE > self.max_prefill_seq_len
+        bias = max(p_al * p_al, self.group_size * s_al,
+                   p_al * s_al if chunked else 0)
+        prefill_scratch = max(hd * p_al + p_al * p_al + p_al * hd,
+                              hd * s_al + p_al * s_al if chunked else 0)
+        if self.multi_core > 1:
+            decode_scratch = hd * s_al + self.group_size * s_al
+        else:
+            decode_scratch = hd * s_al + s_al * s_al + self.group_size * hd
+        return {"rows": max(rows, self.group_size), "bias": bias,
+                "scratch": max(prefill_scratch, decode_scratch),
+                "engine_scratch": prefill_scratch}
 
     # Per-layer dim resolution for Gemma4's heterogeneous stack. Two independent
     # axes → 4 layer buckets. Values below are for the current config (35 layers,
@@ -1075,7 +1121,8 @@ class Gemma4LMMixin:
         self.loop_end()
         self.release_isa_reg()       # i_reg
 
-    def compile_prefill(self, seq_len: int, layer_size: int = 35, profile: bool = False) -> tuple[None, int]:
+    def compile_prefill(self, seq_len: int, layer_size: int = 35, profile: bool = False,
+                        pos_offset: int = 0) -> tuple[None, int]:
         """Emit one runtime-length prefill program into the capture buffer.
 
         ``seq_len`` is the current prompt length used for dynamic-core defaults
@@ -1092,8 +1139,19 @@ class Gemma4LMMixin:
         per phase. Stored in self._prefill_checkpoints (empty when not profiling).
         A profile-compiled prefill can only be run segment-by-segment (each HALT
         stops the FPGA), never in one shot.
+
+        ``pos_offset``: chunked prefill. The program processes prompt positions
+        [pos_offset, pos_offset + seq_len): RoPE rows and the K/V cache writes
+        start at row pos_offset, and attention reads the whole cache prefix
+        [0, pos_offset + seq_len) that earlier chunks wrote. The offset is
+        baked in, so each chunk is its own compile (run_prefill_chunked).
         """
         seq_len = int(seq_len)
+        pos_offset = int(pos_offset)
+        if pos_offset < 0 or pos_offset + seq_len > self.MAX_CONTEXT_SIZE:
+            raise ValueError(
+                f"prefill chunk [{pos_offset}, {pos_offset + seq_len}) is outside "
+                f"max_context_size {self.MAX_CONTEXT_SIZE}")
         template_seq_len = int(self._cfg["model"].get(
             "prefill_max_seq_len", self.max_prefill_seq_len))
         self.seq_len = seq_len
@@ -1143,15 +1201,14 @@ class Gemma4LMMixin:
         # LAYER0_FLASH_SCRATCH_DRAM arena (sized for per_head_rows=max, head_dim
         # max). register_per_engine_addrs is idempotent across recompiles.
         if prefill_scheduler is not None:
-            _ph_rows = ((self.max_prefill_seq_len + 63) // 64) * 64
             # unified_attention_core needs THREE scratch buffers (V^T + score +
             # scaled_q), NOT the two the flash kernel's attn_scratch_bytes sizes.
-            # Match the core's own layout (user_dma_core: v_t=head_dim*aligned,
-            # score=aligned*aligned, scaled_q=batch*head_dim; aligned=batch=
-            # per_head_rows, head_dim=max). Undersizing overlaps adjacent engines'
-            # scaled_q onto the next engine's V^T and corrupts the worker heads.
-            _attn_scr_stride = (self.head_dim * _ph_rows + _ph_rows * _ph_rows
-                                + _ph_rows * self.head_dim) * self.bytes_per_element
+            # Match the core's own layout (see _attention_buffer_sizes, which
+            # also covers a chunk's [P, S] score plane). Undersizing overlaps
+            # adjacent engines' scaled_q onto the next engine's V^T and corrupts
+            # the worker heads.
+            _attn_scr_stride = (self._attention_buffer_sizes()["engine_scratch"]
+                                * self.bytes_per_element)
             _n_eng = prefill_scheduler.num_engines
             # Workers take their scratch from their PRIVATE TENSOR window in
             # self.mc_arena (low 2 GB); core 0 keeps its LAYER0_FLASH_SCRATCH_DRAM
@@ -1160,9 +1217,15 @@ class Gemma4LMMixin:
             # that follow it -- guarded only by an assert. The arena's cursor is
             # shared with the vision scratch allocated earlier in the run, so
             # the two stages cannot be handed the same address.
-            _scr_addrs = [self.LAYER0_FLASH_SCRATCH_DRAM] + [
-                self.mc_arena.alloc_tensor(e, _attn_scr_stride, "prefill attn scratch")
-                for e in range(1, _n_eng)]
+            # Allocated once: chunked prefill compiles once per chunk, and a
+            # fresh allocation per compile would walk the private cursor
+            # through the window.
+            _scr_addrs = getattr(self, "_prefill_attn_scr_addrs", None)
+            if _scr_addrs is None or len(_scr_addrs) != _n_eng:
+                _scr_addrs = [self.LAYER0_FLASH_SCRATCH_DRAM] + [
+                    self.mc_arena.alloc_tensor(e, _attn_scr_stride, "prefill attn scratch")
+                    for e in range(1, _n_eng)]
+                self._prefill_attn_scr_addrs = _scr_addrs
             print(f"[prefill attn scratch] core0=0x{self.LAYER0_FLASH_SCRATCH_DRAM:X} "
                   f"(tensor arena) workers="
                   f"{', '.join(f'0x{a:X}' for a in _scr_addrs[1:])} "
@@ -1280,7 +1343,8 @@ class Gemma4LMMixin:
                 # write (KV cache, k_size stride) addrs are register-computed, so
                 # the body is emitted once and hardware-looped over gpr_seq_len.
                 kv_row_bytes = self._kv_row_bytes_for_layer[layer_idx]
-                v_cache_base = self.LAYER0_V_DRAM + self._kv_offset_for_layer[layer_idx]
+                v_cache_base = (self.LAYER0_V_DRAM + self._kv_offset_for_layer[layer_idx]
+                                + pos_offset * kv_row_bytes)   # this chunk's first row
                 _vi = self.alloc_isa_reg()
                 self.generate_instruction_add_set(_vi, 0)
                 self.loop_start(loop_cnt=seq_len, gpr_loop_cnt=self.gpr_seq_len)
@@ -1310,11 +1374,15 @@ class Gemma4LMMixin:
             bpe = self.bytes_per_element
             head_bytes = cur_head_dim * bpe
             rope_bytes = rope_n * bpe
+            # One table row (cos | sin halves) per position: start at the chunk's.
+            ROPE_WEIGHT_ADDR += pos_offset * 2 * rope_n * bpe
             sin_addr = ROPE_WEIGHT_ADDR + rope_n * bpe
             q_rows = seq_len * self.group_size
             kv_slot_off = self._kv_offset_for_layer[layer_idx]
             k_cache_base = self.LAYER0_K_ROPE_DRAM + kv_slot_off
             v_cache_base = self.LAYER0_V_DRAM + kv_slot_off
+            # RoPE'd K lands at this chunk's rows; attention reads from row 0.
+            k_cache_write = k_cache_base + pos_offset * self._kv_row_bytes_for_layer[layer_idx]
             tmp_in = self.LAYER0_MLP_GATE_DRAM    # gather/rope scratch (dead during attn,
             tmp_out = self.LAYER0_MLP_UP_DRAM     #  overwritten by the real MLP later)
             if non_shared:
@@ -1326,7 +1394,7 @@ class Gemma4LMMixin:
                 # Full rotary: single PBI rope call (input/output contiguous).
                 if non_shared:
                     total_flops += self.rope_hf_core_dram(M=seq_len, N=rope_n,
-                        input_dram_addr=self.LAYER0_K_NORM_DRAM, output_dram_addr=k_cache_base,
+                        input_dram_addr=self.LAYER0_K_NORM_DRAM, output_dram_addr=k_cache_write,
                         cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
                 total_flops += self.rope_hf_core_dram_gqa(M=seq_len, group_size=self.group_size, N=rope_n,
                     input_dram_addr=self.LAYER0_Q_NORM_DRAM, output_dram_addr=self.LAYER0_FLASH_Q_DRAM,
@@ -1337,8 +1405,8 @@ class Gemma4LMMixin:
                 if non_shared:
                     self._emit_strided_copy_pbi(self.LAYER0_K_NORM_DRAM, tmp_in, rope_n, head_bytes, rope_bytes, seq_len, self.gpr_seq_len)
                     total_flops += self.rope_hf_core_dram(M=seq_len, N=rope_n, input_dram_addr=tmp_in, output_dram_addr=tmp_out, cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
-                    self._emit_strided_copy_pbi(tmp_out, k_cache_base, rope_n, rope_bytes, head_bytes, seq_len, self.gpr_seq_len)
-                    self._emit_strided_copy_pbi(self.LAYER0_K_NORM_DRAM + rope_bytes, k_cache_base + rope_bytes, non_rot, head_bytes, head_bytes, seq_len, self.gpr_seq_len)
+                    self._emit_strided_copy_pbi(tmp_out, k_cache_write, rope_n, rope_bytes, head_bytes, seq_len, self.gpr_seq_len)
+                    self._emit_strided_copy_pbi(self.LAYER0_K_NORM_DRAM + rope_bytes, k_cache_write + rope_bytes, non_rot, head_bytes, head_bytes, seq_len, self.gpr_seq_len)
                 self._emit_strided_copy_pbi(self.LAYER0_Q_NORM_DRAM, tmp_in, rope_n, head_bytes, rope_bytes, q_rows, self.gpr_q_seq_len)
                 total_flops += self.rope_hf_core_dram_gqa(M=seq_len, group_size=self.group_size, N=rope_n, input_dram_addr=tmp_in, output_dram_addr=tmp_out, cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
                 self._emit_strided_copy_pbi(tmp_out, self.LAYER0_FLASH_Q_DRAM, rope_n, rope_bytes, head_bytes, q_rows, self.gpr_q_seq_len)
@@ -1373,7 +1441,16 @@ class Gemma4LMMixin:
             # The core receives maximum-capacity static dimensions so its
             # internal scratch partition is safe for any reusable prompt. Live
             # execution dimensions still come exclusively from the GPRs.
-            attn_aligned_live = ((seq_len + 63) // 64) * 64
+            # Live KV length: the cache prefix earlier chunks wrote plus this one.
+            attn_aligned_live = ((pos_offset + seq_len + 63) // 64) * 64
+            # A chunk past the first attends more KV rows than it has queries, so
+            # the core's static aligned length becomes the live KV length (the
+            # scratch is sized for MAX_CONTEXT_SIZE, see _attention_buffer_sizes).
+            # Gemma's scale is 1.0, so the Q pre-scale is skipped there: its
+            # scaled_q buffer would sit past a square [aligned, aligned] score
+            # plane that a chunk does not otherwise need.
+            core_aligned = per_head_rows if pos_offset == 0 else attn_aligned_live
+            core_q_pre_scaled = pos_offset > 0
             for g in range(self.group_size):
                 self._emit_strided_copy_pbi(
                     self.LAYER0_FLASH_Q_DRAM + g * head_bytes,       # token-major head g
@@ -1401,16 +1478,17 @@ class Gemma4LMMixin:
                 # prompt dimensions outside the core.
                 ue.unified_attention_core(
                     batch=self.max_prefill_seq_len,
-                    aligned_seq_len=per_head_rows,
+                    aligned_seq_len=core_aligned,
                     head_dim=cur_head_dim,
                     Q_DRAM_ADDR=head_slot, K_DRAM_ADDR=k_cache_base,
                     V_DRAM_ADDR=v_cache_base, BIAS_DRAM_ADDR=bias_addr_layer,
                     OUTPUT_DRAM_ADDR=head_slot, SCRATCH_DRAM_ADDR=scratch_addr,
                     IDENTITY_DRAM_ADDR=self.IDENTITY_DRAM_ADDR,
                     gpr_batch_reg=batch_reg, gpr_aligned_seq_len_reg=aligned_reg,
-                    q_scale=1.0)
+                    q_scale=1.0, q_pre_scaled=core_q_pre_scaled)
                 return self._dynamic_attention_flops(
-                    seq_len, attn_aligned_live, cur_head_dim)
+                    seq_len, attn_aligned_live, cur_head_dim,
+                    q_pre_scaled=core_q_pre_scaled)
 
             if prefill_scheduler is None:
                 # Single core: loop all group heads on the master, reusing the
@@ -1693,18 +1771,24 @@ class Gemma4LMMixin:
         self._set_silent(False)
         return None, total_flops
 
-    def _lookup_per_layer_embeddings(self, token_ids) -> torch.Tensor:
-        """Return lightweight token-indexed rows as [token, layer, dim]."""
+    def _lookup_per_layer_embeddings(self, token_ids, mm_types=None) -> torch.Tensor:
+        """Return lightweight token-indexed rows as [token, layer, dim].
+
+        ``mm_types``: the multimodal types of exactly these tokens (a prefill
+        chunk passes its slice); default is the prompt's, from position 0."""
         tid_t = torch.tensor(token_ids, dtype=torch.long)
-        if hasattr(self, '_mm_types') and self._mm_types is not None:
-            mm_mask = torch.tensor(self._mm_types[:len(token_ids)])
+        if mm_types is None and getattr(self, '_mm_types', None) is not None:
+            mm_types = self._mm_types[:len(token_ids)]
+        if mm_types is not None:
+            mm_mask = torch.tensor(mm_types)
             tid_t = tid_t.clone()
             tid_t[(mm_mask == 1) | (mm_mask == 3)] = 0
         return self.embed_tokens_per_layer_weight[tid_t].reshape(
             len(token_ids), self.LAYER_SIZE, self.per_layer_input_dim).contiguous()
 
     def run_prefill(self, prefill_program_addr: int, prefill_seq=None, flops: int = None,
-                    profile_checkpoints: list | None = None):
+                    profile_checkpoints: list | None = None,
+                    pos_offset: int = 0, chunk_len: int | None = None):
         """
         Run prefill for the actual prompt — single entry, no bucket/padding.
 
@@ -1723,6 +1807,10 @@ class Gemma4LMMixin:
                 return the per-segment [(name, ms)] HW latencies INSTEAD of a
                 one-shot execute. The KV cache is still fully populated. Used by
                 run_gemma4_profile.
+            pos_offset, chunk_len: run one chunk of a chunked prefill, prompt
+                positions [pos_offset, pos_offset + chunk_len), with a program
+                compiled for that chunk (compile_prefill's pos_offset). Only the
+                first chunk resets the KV cache; later ones append to it.
 
         Returns:
             (latency, flop_rate) from the accelerator, or — when
@@ -1736,6 +1824,19 @@ class Gemma4LMMixin:
             raise ValueError("Prefill sequence must have at least 2 tokens.")
         # Prefill processes all but the last token.
         prefill_seq = tuple(prefill_seq[:-1])
+        prompt_len = len(prefill_seq)
+        pos_offset = int(pos_offset)
+        if chunk_len is None:
+            chunk_len = prompt_len - pos_offset
+        if not (0 <= pos_offset and 0 < chunk_len and pos_offset + chunk_len <= prompt_len):
+            raise ValueError(f"prefill chunk [{pos_offset}, {pos_offset + chunk_len}) "
+                             f"is outside the {prompt_len}-token prompt")
+        final_chunk = pos_offset + chunk_len == prompt_len
+        mm_all = getattr(self, '_mm_types', None)
+        mm_chunk = (list(mm_all[:prompt_len])[pos_offset:pos_offset + chunk_len]
+                    if mm_all is not None else None)
+        mm_before = (list(mm_all[:pos_offset]) if mm_all is not None else [])
+        prefill_seq = prefill_seq[pos_offset:pos_offset + chunk_len]
         seq_len = len(prefill_seq)
         assert seq_len <= self.max_prefill_seq_len, (
             f"Prefill length {seq_len} exceeds max_prefill_seq_len {self.max_prefill_seq_len}. "
@@ -1744,14 +1845,16 @@ class Gemma4LMMixin:
         )
         # Runtime GPRs select the real row counts; run_decoder resumes from this
         # prompt position after prefill.
-        self.seq_len = seq_len
+        self.seq_len = pos_offset + seq_len
         q_seq_len = seq_len * self.group_size
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
         # Per-head aligned KV length: with GQA run as an outer loop over query
         # heads reusing one K/V, attention is per-token (not per q-position), so
         # the live aligned length is align64(seq_len), primed into
         # gpr_aligned_seq_len below (replaces the old align64(q_seq_len)).
-        attn_aligned = ((seq_len + 63) // 64) * 64
+        # A later chunk attends the whole cache prefix, so its aligned KV length
+        # counts the earlier chunks' rows too.
+        attn_aligned = ((pos_offset + seq_len + 63) // 64) * 64
         prefill_scheduler = self._ensure_prefill_scheduler()
         worker_program_addrs = []
         if prefill_scheduler is not None:
@@ -1787,56 +1890,49 @@ class Gemma4LMMixin:
         # -inf + NaN is NaN, so one stale pad element takes out a whole softmax
         # row. Each size below mirrors its allocate_tensor_dram() in tensor_init,
         # in ELEMENTS (dma_to_accelerator_memory writes numel()*2 bytes).
-        from user_dma_core import UE_VECTOR_SIZE as _UE_VS
-        num_slots = getattr(self, "_num_kv_slots", self.LAYER_SIZE)
-        kv_cache_bytes = getattr(
-            self, "_kv_cache_bytes",
-            num_slots * self.MAX_CONTEXT_SIZE * self.head_dim * self.bytes_per_element)
-        kv_zero_pad = torch.zeros(
-            kv_cache_bytes // self.bytes_per_element, dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, kv_zero_pad)
-        self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, kv_zero_pad)
-        # Same expression tensor_init sized the attention buffers with: prefill
-        # rows are seq*group_size, decode needs MAX_CONTEXT_SIZE KV rows, and
-        # the buffers take the larger. Deriving a prefill-only alignment here
-        # (the old _pre_align) matches only while max_prefill_seq_len*group_size
-        # >= MAX_CONTEXT_SIZE -- true today at 512*8 == 4096, and silently short
-        # the moment either constant moves.
-        _prefill_aligned = ((min(self.max_prefill_seq_len, self.MAX_CONTEXT_SIZE)
-                             * self.group_size + 63) // 64) * 64
-        _decode_aligned = ((self.MAX_CONTEXT_SIZE + 63) // 64) * 64
-        _attn_aligned = max(_prefill_aligned, _decode_aligned)
-        # Q / K / OUTPUT: [aligned, head_dim].  V: [activation_seq_len, head_dim].
-        _flash_zero = torch.zeros(_attn_aligned * self.head_dim, dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, _flash_zero)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, _flash_zero)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_OUTPUT_DRAM, _flash_zero)
-        self.dma_to_accelerator_memory(
-            self.LAYER0_FLASH_V_DRAM,
-            torch.zeros(max(self.max_prefill_seq_len, 1) * self.head_dim,
-                        dtype=torch.bfloat16))
-        # Attention scratch: V.T [head_dim, aligned] + scores [aligned, aligned]
-        # + scaled_q [batch, head_dim]. The scores plane is the one that must be
-        # finite everywhere -- softmax reads the full aligned row.
-        self.dma_to_accelerator_memory(
-            self.LAYER0_FLASH_SCRATCH_DRAM,
-            torch.zeros(_attn_aligned * _attn_aligned
-                        + 2 * self.head_dim * _attn_aligned,
-                        dtype=torch.bfloat16))
-        # Both bias planes, full [aligned, aligned]. run_prefill overwrites the
-        # live square below and run_decoder rewrites its rows per token, but the
-        # region past the live length is only ever written here -- and it is
-        # exactly the region the kernel reads as padding.
-        _bias_zero = torch.full((_attn_aligned * _attn_aligned,), float("-inf"),
-                                dtype=torch.bfloat16)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_FULL_DRAM, _bias_zero)
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, _bias_zero)
-        self.dma_to_accelerator_memory(self.IDENTITY_DRAM_ADDR,
-                                       torch.eye(_UE_VS, dtype=torch.bfloat16))
-        print(f"[Prefill] flash-attention state initialised "
-              f"({num_slots} KV slots, Q/K/V/OUTPUT + scratch + both bias planes "
-              f"zeroed over the full {_attn_aligned}-row alignment, "
-              f"IDENTITY re-uploaded)")
+        # Only the first chunk resets: a later chunk of a chunked prefill
+        # appends to the K/V cache the earlier ones wrote.
+        if pos_offset == 0:
+            from user_dma_core import UE_VECTOR_SIZE as _UE_VS
+            num_slots = getattr(self, "_num_kv_slots", self.LAYER_SIZE)
+            kv_cache_bytes = getattr(
+                self, "_kv_cache_bytes",
+                num_slots * self.MAX_CONTEXT_SIZE * self.head_dim * self.bytes_per_element)
+            kv_zero_pad = torch.zeros(
+                kv_cache_bytes // self.bytes_per_element, dtype=torch.bfloat16)
+            self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, kv_zero_pad)
+            self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, kv_zero_pad)
+            # The same per-role sizes tensor_init allocated (_attention_buffer_sizes).
+            _sizes = self._attention_buffer_sizes()
+            _attn_rows = _sizes["rows"]
+            # Q / K / OUTPUT: [rows, head_dim].  V: [activation_seq_len, head_dim].
+            _flash_zero = torch.zeros(_attn_rows * self.head_dim, dtype=torch.bfloat16)
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_Q_DRAM, _flash_zero)
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_K_DRAM, _flash_zero)
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_OUTPUT_DRAM, _flash_zero)
+            self.dma_to_accelerator_memory(
+                self.LAYER0_FLASH_V_DRAM,
+                torch.zeros(max(self.max_prefill_seq_len, 1) * self.head_dim,
+                            dtype=torch.bfloat16))
+            # Attention scratch: V.T + scores + scaled_q. The scores plane is the
+            # one that must be finite everywhere -- softmax reads the full aligned row.
+            self.dma_to_accelerator_memory(
+                self.LAYER0_FLASH_SCRATCH_DRAM,
+                torch.zeros(_sizes["scratch"], dtype=torch.bfloat16))
+            # Both bias planes, whole. run_prefill overwrites the live square below
+            # and run_decoder rewrites its rows per token, but the region past the
+            # live length is only ever written here -- and it is exactly the region
+            # the kernel reads as padding.
+            _bias_zero = torch.full((_sizes["bias"],), float("-inf"),
+                                    dtype=torch.bfloat16)
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_FULL_DRAM, _bias_zero)
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, _bias_zero)
+            self.dma_to_accelerator_memory(self.IDENTITY_DRAM_ADDR,
+                                           torch.eye(_UE_VS, dtype=torch.bfloat16))
+            print(f"[Prefill] flash-attention state initialised "
+                  f"({num_slots} KV slots, Q/K/V/OUTPUT + scratch + both bias planes "
+                  f"zeroed ({_attn_rows} Q rows, {_sizes['bias']} bias elements), "
+                  f"IDENTITY re-uploaded)")
 
         # Time host-side prep (embedding lookup, per-layer inputs, bias build,
         # DMAs) — reported only in the segmented-profile path's status line.
@@ -1849,15 +1945,18 @@ class Gemma4LMMixin:
         # encoder-produced soft-token features. Uses mm_token_type_ids where
         # 1=image, 3=audio (HF convention, see transformers/processing_utils.py
         # create_mm_token_type_ids).
-        if hasattr(self, '_mm_types') and self._mm_types is not None:
-            mm_types = torch.tensor(self._mm_types[:len(prefill_seq)])
+        # A chunk takes the features after those the earlier chunks consumed.
+        if mm_chunk is not None:
+            mm_types = torch.tensor(mm_chunk)
             if hasattr(self, '_image_features') and self._image_features is not None:
                 image_mask = (mm_types == 1)
-                embedding_tensor[image_mask] = self._image_features[:image_mask.sum()].to(embedding_tensor.dtype)
+                _i0 = mm_before.count(1)
+                embedding_tensor[image_mask] = self._image_features[_i0:_i0 + image_mask.sum()].to(embedding_tensor.dtype)
                 print(f"[Prefill] merged {image_mask.sum().item()} image features into embeddings")
             if hasattr(self, '_audio_features') and self._audio_features is not None:
                 audio_mask = (mm_types == 3)
-                embedding_tensor[audio_mask] = self._audio_features[:audio_mask.sum()].to(embedding_tensor.dtype)
+                _a0 = mm_before.count(3)
+                embedding_tensor[audio_mask] = self._audio_features[_a0:_a0 + audio_mask.sum()].to(embedding_tensor.dtype)
                 print(f"[Prefill] merged {audio_mask.sum().item()} audio features into embeddings")
 
         print(f"[Prefill] uploading embeddings to FPGA DRAM...", flush=True)
@@ -1866,7 +1965,7 @@ class Gemma4LMMixin:
         # Host performs only the runtime token-indexed lookup. Projection,
         # normalization, add and scaling run on FPGA.
         print(f"[Prefill] [host] looking up per-layer embedding rows...", flush=True)
-        per_layer_embed = self._lookup_per_layer_embeddings(prefill_seq)
+        per_layer_embed = self._lookup_per_layer_embeddings(prefill_seq, mm_types=mm_chunk)
         print(f"[Prefill] uploading per-layer embedding rows to FPGA DRAM...", flush=True)
         self.dma_to_accelerator_memory(
             self.PER_LAYER_EMBED_DRAM,
@@ -1876,10 +1975,11 @@ class Gemma4LMMixin:
         # _lookup_per_layer_embeddings with one token; retaining _mm_types would
         # incorrectly treat that token as multimodal and replace its ID with 0,
         # producing garbage per-layer injection and all-pad output. Mirror the
-        # compare script's pattern: clear right after use.
-        self._mm_types = None
-        self._image_features = None
-        self._audio_features = None
+        # compare script's pattern: clear right after use (after the last chunk).
+        if final_chunk:
+            self._mm_types = None
+            self._image_features = None
+            self._audio_features = None
 
         # Build BOTH prefill bias matrices: full (causal) for full-attention
         # layers, and sliding (causal AND within `sliding_window` tokens) for
@@ -1892,23 +1992,26 @@ class Gemma4LMMixin:
         # q_seq×q_seq "same head AND token-causal" mask is gone). Columns past
         # seq_len are the alignment padding and stay masked to -inf, which is
         # what zeroes the stale K/V padding rows after softmax.
-        _i = torch.arange(attn_aligned).unsqueeze(1)
+        # A later chunk's plane is [chunk rows, attn_aligned]: query row i is
+        # prompt position pos_offset + i and attends KV rows up to it.
+        _rows = attn_aligned if pos_offset == 0 else seq_len
+        _i = torch.arange(_rows).unsqueeze(1) + pos_offset
         _j = torch.arange(attn_aligned).unsqueeze(0)
         _tok_causal = (_j <= _i) if not self.causal_mask_upper else (_j >= _i)
-        full_bias = torch.full((attn_aligned, attn_aligned), float("-inf"), dtype=torch.bfloat16)
+        full_bias = torch.full((_rows, attn_aligned), float("-inf"), dtype=torch.bfloat16)
         full_bias.masked_fill_(_tok_causal, 0.0)
-        full_bias[:, seq_len:] = float("-inf")
+        full_bias[:, pos_offset + seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_FULL_DRAM, full_bias)
 
         # Sliding bias is identical to full when seq_len ≤ sliding_window;
         # otherwise it additionally masks tokens older than the window.
-        if seq_len <= self.sliding_window:
+        if pos_offset + seq_len <= self.sliding_window:
             sliding_bias = full_bias
         else:
             in_window = (_i - _j) < self.sliding_window
-            sliding_bias = torch.full((attn_aligned, attn_aligned), float("-inf"), dtype=torch.bfloat16)
+            sliding_bias = torch.full((_rows, attn_aligned), float("-inf"), dtype=torch.bfloat16)
             sliding_bias.masked_fill_(_tok_causal & in_window, 0.0)
-            sliding_bias[:, seq_len:] = float("-inf")
+            sliding_bias[:, pos_offset + seq_len:] = float("-inf")
         self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_SLIDING_DRAM, sliding_bias)
 
         host_prepare_s = time.perf_counter() - _host_prepare_w0

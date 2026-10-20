@@ -89,10 +89,11 @@ MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
 # the shared one (bumping down) so neither can land on the other.
 #
 # WHAT EACH CORE'S 1 GiB HOLDS
-#   weights   992 MiB   private decode shards bump UP from the base;
+#   weights   944 MiB   private decode shards bump UP from the base;
 #                       the shared pool bumps DOWN from the top
 #   ISA        16 MiB   master (core 0: vision + LM) or worker
-#   tensor     16 MiB   per-engine scratch: vision attn 13.12 + prefill 1.50
+#   tensor     64 MiB   per-engine scratch: vision attn 13.12 + prefill MLP
+#                       lanes 6 + prefill attention 16 (see TILED_TENSOR_BYTES)
 #
 # WHAT IS SHARED, AND WHY IT FITS. Private decode shards are ~193 MiB/core (the
 # whole 1544 MiB weight set, N-sharded eight ways), leaving ~799 MiB of tail per
@@ -114,12 +115,14 @@ MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
 TILED_MAP_MIN_ENGINES = 8
 TILED_WINDOW_BYTES = 0x4000_0000           # 1 GiB per core, one memory controller
 TILED_ISA_BYTES = 16 * 2**20               # per-core ISA slice, inside the window
-# 32 MiB, not 16: vision attention scratch is 13.12 MiB and prefill attention
-# 1.50, which fitted 16 with nothing to spare -- and the tensor-parallel prefill
+# 64 MiB: vision attention scratch is 13.12 MiB, the tensor-parallel prefill
 # MLP adds four per-engine lane buffers (gate, up, product, down partial) at
-# 1.5 MiB each. The 16 MiB comes out of a 992 MiB weight arena that has 549 MiB
-# of contiguous tail free, so this is the cheapest space on the board.
-TILED_TENSOR_BYTES = 32 * 2**20            # per-core private scratch, inside the window
+# 1.5 MiB each, and prefill attention needs V^T [512, S] + scores [512, S] =
+# 16 MiB at an 8192 context, because a later chunk of a chunked prefill attends
+# the whole cache prefix (1.50 MiB when everything fitted one 512-row pass).
+# The space comes out of a 992 MiB weight arena that has 549 MiB of contiguous
+# tail free, so this is the cheapest space on the board.
+TILED_TENSOR_BYTES = 64 * 2**20            # per-core private scratch, inside the window
 # Core 0 carries BOTH master programs, resident at disjoint addresses: the
 # vision encoder and the LM (prefill + decoder) images. Measured 1.6 MiB and
 # 4.7 MiB; the split below is the old model map's, kept so the two cannot grow
@@ -161,16 +164,12 @@ builtins.print = quiet_print
 DEFAULT_IMAGE = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samples", "yosemite.jpg"))
 DEFAULT_AUDIO = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samples", "apex.wav"))
 
-# Static context-capacity switch. Change this single constant to 1024, 2048,
-# 3072, or 4096 when building a program image; tensor allocation and decoder
-# bounds follow it consistently. The JSON value is checked against this choice.
-MAX_CONTEXT_SIZE = 4096
-
-# Context is a static capacity setting in gemma4_e2b_config.json. Keep the
-# supported range explicit because tensor sizing and address arithmetic assume
-# 64-token alignment and the fixed 32-bit DRAM layouts below.
+# Static context capacity in tokens: a 64-aligned value in
+# [MIN_CONTEXT_SIZE, MAX_CONTEXT_SIZE], used when building a program image.
+# Tensor allocation, the RoPE tables and the decoder bounds follow it; the JSON
+# value (model.max_context_size) is checked against this choice.
 MIN_CONTEXT_SIZE = 1024
-MAX_CONTEXT_SIZE = 4096
+MAX_CONTEXT_SIZE = 8192
 
 
 def _parse_offset(val) -> int:
@@ -1537,7 +1536,12 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "call set_prefill_seq() before compile_gemma4()")
         prefill_template_seq_len = int(self._cfg["model"].get(
             "prefill_max_seq_len", self.max_prefill_seq_len))
-        prefill_flops_seq_len = len(self.prefill_seq) - 1
+        # A prompt longer than max_prefill_seq_len is prefilled in chunks, each
+        # its own compile (run_gemma4 sets _prefill_chunk per chunk); compiling
+        # without one builds the first chunk.
+        prefill_pos_offset, prefill_flops_seq_len = (
+            getattr(self, "_prefill_chunk", None)
+            or self.prefill_chunks(len(self.prefill_seq) - 1)[0])
         if self.multi_core > 1 and prefill_flops_seq_len < self.multi_core:
             raise ValueError(
                 f"{self.multi_core}-engine fixed prefill requires at least "
@@ -1551,6 +1555,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         if (self.bin_reuse
                 and _lm_meta is not None
                 and _lm_meta.get("prefill_flops_seq_len") == prefill_flops_seq_len
+                and _lm_meta.get("prefill_pos_offset", 0) == prefill_pos_offset
                 and _lm_meta.get("prefill_kernel") == self.prefill_kernel
                 and _lm_meta.get("decode_kernel") == self.decode_kernel
                 and _lm_meta.get("multi_core", 1) == self.multi_core
@@ -1590,6 +1595,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                     worker.alloc_isa_reg() for worker in prefill_scheduler.workers)
                 self._active_prefill_scheduler = prefill_scheduler
             _, prefill_total_flops = self.compile_prefill(seq_len=prefill_flops_seq_len,
+                                                          pos_offset=prefill_pos_offset,
                                                           layer_size=layer_size,
                                                           profile=profile)
             prefill_program_addr = instruction_base_addr + prefill_count_at_start * INSTRUCTION_SIZE_BYTES
@@ -1648,6 +1654,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "instruction_base_addr": f"0x{instruction_base_addr:X}",
             "prefill_template_seq_len": prefill_template_seq_len,
             "prefill_flops_seq_len": prefill_flops_seq_len,
+            "prefill_pos_offset": prefill_pos_offset,
             "prefill_program_start_addr": f"0x{prefill_program_addr:X}",
             "prefill_program_size": prefill_size_bytes,
             "prefill_total_flops": prefill_total_flops,
@@ -1717,6 +1724,28 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
               f"prefill @ 0x{prefill_program_addr:X} ({prefill_size_bytes/1024:.1f} KB), "
               f"decoder @ 0x{decoder_program_addr:X} ({decoder_size_bytes/1024:.1f} KB)")
 
+    def prefill_chunks(self, prompt_len: int) -> list[tuple[int, int]]:
+        """Split a prompt into (pos_offset, length) prefill chunks.
+
+        One chunk when it fits max_prefill_seq_len. Otherwise the fewest chunks
+        that do, of near-equal length -- so the last one is never a sliver
+        (multi-core prefill needs at least one row per engine).
+        """
+        prompt_len = int(prompt_len)
+        if prompt_len > self.MAX_CONTEXT_SIZE - 1:
+            raise ValueError(
+                f"prompt of {prompt_len + 1} tokens leaves no room to decode in a "
+                f"{self.MAX_CONTEXT_SIZE}-token context")
+        cap = max(int(self.max_prefill_seq_len), 1)
+        n = max(1, -(-prompt_len // cap))
+        base, rem = divmod(prompt_len, n)
+        chunks, off = [], 0
+        for i in range(n):
+            length = base + (1 if i < rem else 0)
+            chunks.append((off, length))
+            off += length
+        return chunks
+
     def run_gemma4(self) -> tuple[int, float, float, float, float, float]:
         """Load the combined image from disk into program DRAM, then run one
         prefill pass and decode to the stop token / context limit — the gemma4
@@ -1754,15 +1783,49 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         print(f"--- Prompt end ---")
 
         timer = time.perf_counter()
-        latency_hw_prefill, _flop_rate_hw_prefill = self.run_prefill(
-            prefill_program_addr, flops=meta["prefill_total_flops"])
+        chunks = self.prefill_chunks(len(self.prefill_seq) - 1)
+        latency_hw_prefill, prefill_total_flops, compile_s = 0.0, 0, 0.0
+        for i, (pos_offset, chunk_len) in enumerate(chunks):
+            if i > 0:
+                # Chunks past the first need their own program image: the
+                # offset is baked in. compile_gemma4 rebuilds and stores it, and
+                # the LM section is reloaded at the same base.
+                _c0 = time.perf_counter()
+                self._prefill_chunk = (pos_offset, chunk_len)
+                self._next_program_dram_addr = base_addr   # capture at the same base
+                self.compile_gemma4()
+                meta = self._load_program_section("lm")
+                prefill_program_addr = int(meta["prefill_program_start_addr"], 16)
+                decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
+                self._decode_attn_worker_regs = [
+                    {k: int(vv) for k, vv in r.items()}
+                    for r in meta.get("decoder_attn_worker_regs", [])]
+                self._preamble_addr = self.get_program_dram_addr()
+                compile_s += time.perf_counter() - _c0
+            if len(chunks) > 1:
+                print(f"[Prefill] chunk {i + 1}/{len(chunks)}: positions "
+                      f"[{pos_offset}, {pos_offset + chunk_len})", flush=True)
+            _lat, _rate = self.run_prefill(
+                prefill_program_addr, flops=meta["prefill_total_flops"],
+                pos_offset=pos_offset, chunk_len=chunk_len)
+            latency_hw_prefill += _lat
+            prefill_total_flops += meta["prefill_total_flops"]
+        self._prefill_chunk = None
         latency_prefill = time.perf_counter() - timer
+        _flop_rate_hw_prefill = (prefill_total_flops / (latency_hw_prefill * 1e3)
+                                 if latency_hw_prefill else 0.0)
         # Stash prefill metrics for the run-summary writer (write_run_summary).
         self._prefill_seq_len = self.seq_len
         self._prefill_latency_hw_us = latency_hw_prefill
         self._prefill_flop_rate_gflops = _flop_rate_hw_prefill
-        self._prefill_total_flops = meta["prefill_total_flops"]
+        self._prefill_total_flops = prefill_total_flops
         self._prefill_e2e_s = latency_prefill
+        self._prefill_chunk_count = len(chunks)
+        self._prefill_chunk_compile_s = compile_s
+        if len(chunks) > 1:
+            print(f"[Prefill] {len(chunks)} chunks: HW {latency_hw_prefill / 1e6:.2f} s, "
+                  f"wall {latency_prefill:.2f} s (of which {compile_s:.2f} s compiling "
+                  f"and loading the later chunks' images)", flush=True)
         print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n", flush=True)
 
         timer = time.perf_counter()
@@ -2240,7 +2303,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                         self._cfg, int(target_pos), self._kv_shared_map)
                         if isinstance(target_pos, int) else None)
         _append_profile_section(
-            f"1024th token (position {target_pos})",
+            f"Token {target_pos + 1} (position {target_pos})",
             getattr(self, "_decode_1024_profile_results", None), level=3,
             model_phases=target_model)
 
@@ -2618,12 +2681,17 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._decode_profile_results = decode_results
         self._print_phase_breakdown("DECODE (first step)", decode_results, per_token=True)
 
-        # Performance-only 1024th-token profile. Intermediate KV rows are left
-        # as initialized/prefill data; values do not affect the execution path.
-        target_context_len = 1024
+        # Performance-only large-context profile (1024 tokens unless
+        # --profile-context says otherwise). Intermediate KV rows are left as
+        # initialized/prefill data; values do not affect the execution path.
+        target_context_len = int(getattr(self, "profile_context_len", 1024))
+        if not 1 <= target_context_len <= self.MAX_CONTEXT_SIZE:
+            raise ValueError(
+                f"--profile-context {target_context_len} is outside "
+                f"[1, max_context_size={self.MAX_CONTEXT_SIZE}]")
         aligned_seq_len = _prepare_decode_position(target_context_len)
         self._decode_1024_profile_position = target_context_len - 1
-        print(f"\n--- Profiling 1024th token (pos {target_context_len - 1}) ---",
+        print(f"\n--- Profiling token {target_context_len} (pos {target_context_len - 1}) ---",
               flush=True)
         _dec_long_cpu_start = time.perf_counter()
         decode_1024_results = self._decode_profile_execute(
@@ -2633,7 +2701,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             time.perf_counter() - _dec_long_cpu_start) * 1e3
         self._decode_1024_profile_results = decode_1024_results
         self._print_phase_breakdown(
-            "DECODE (1024th token)", decode_1024_results, per_token=True)
+            f"DECODE (token {target_context_len})", decode_1024_results, per_token=True)
 
     @staticmethod
     def _parse_offset(val) -> int:
@@ -2828,6 +2896,9 @@ default prompt: "x+3=5, what is x?"
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile bin with per-phase HALT checkpoints and run one '
                              'profiled decode step; print a per-phase HW-latency breakdown.')
+    parser.add_argument('--profile-context', type=int, default=1024, metavar='N',
+                        help='With --profile, the context length of the large-context decode '
+                             'probe (default 1024; up to max_context_size).')
     return parser
 
 
@@ -3069,6 +3140,7 @@ def main():
     # --profile: build the instrumented bin and print a per-phase decode
     # breakdown instead of the normal generation run.
     if args.profile:
+        ue.profile_context_len = args.profile_context
         print(f"\n--- Compiling profile bin (per-phase checkpoints) ---")
         timer = time.perf_counter()
         ue.compile_gemma4(profile=True)
