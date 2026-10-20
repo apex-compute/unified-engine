@@ -1123,11 +1123,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
 
         gpr_mm = self.alloc_isa_reg()   # matmul M (= spatial^2 per stage)
         gpr_ln = self.alloc_isa_reg()   # LayerNorm runtime row count
-        # Q/K/V strip write-back row pitch (elements). MUST be allocated BEFORE gpr_pbi:
-        # pbi_strided_copy resets _isa_reg_counter to gpr_pbi+1, so any register above
-        # gpr_pbi is reused as a temporary by the next matmul and silently clobbered.
-        gpr_qkv_stride = self.alloc_isa_reg()
-        gpr_pbi = self.alloc_isa_reg()  # PBI strided-copy trip count (permute loops) -- keep LAST
+        gpr_pbi = self.alloc_isa_reg()  # PBI strided-copy trip count (permute loops)
+        gpr_qkv_stride = self.alloc_isa_reg()  # Q/K/V strip write-back row pitch; re-primed per use
 
         # ================================================================
         # PRE-ENCODER: patch extraction + bias + LayerNorm
@@ -1223,7 +1220,6 @@ class Swin_UnifiedEngine(UnifiedEngine):
             # lanes (never written by the matmul) are zero for every layer.
             for proj_addr in (st['q_proj'], st['k_proj'], st['v_proj']):
                 dram_zero_fill(self, proj_addr, num_windows * wa * num_heads * hd_pad)
-            self._pbi_set(gpr_qkv_stride, num_heads * hd_pad)
 
             for l in range(self.DEPTHS[s]):
                 lw = self.encoder_weights[s][l]
@@ -1268,7 +1264,15 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 M_win = num_windows * wa
                 head_dim = self.HEAD_DIM
                 for name, out_addr in [('q', st['q_proj']), ('k', st['k_proj']), ('v', st['v_proj'])]:
+                    # Register convention in this file: _pbi_set / pbi_strided_copy drop
+                    # _isa_reg_counter to gpr+1 and every GPR is re-primed right before use,
+                    # since matmul temporaries (auto K/N regs etc.) are allocated from the
+                    # counter and overwrite whatever sits above it. So: prime M, then leave
+                    # the counter ABOVE the stride register and prime it too.
                     self._pbi_set(gpr_mm, M_win)
+                    self._isa_reg_counter = max(self._isa_reg_counter, gpr_qkv_stride + 1)
+                    self.generate_instruction_add_set(dst_reg_idx=gpr_qkv_stride,
+                                                      immediate_value=num_heads * hd_pad)
                     self.matmat_mul_core(
                         M=M_win, K=dim, N=dim,
                         A_DRAM_ADDR=st['windowed'],
