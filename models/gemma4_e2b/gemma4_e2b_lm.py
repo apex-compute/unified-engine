@@ -77,19 +77,24 @@ class Gemma4LMMixin:
     # The MLP weights are sliced from params.bin straight into the private
     # windows, so they never enter the shared pool at all. tag -> (scale, data)
     # region keys; N is the row axis of the stored [N, K] image.
-    MLP_SHARED_REGION_KEYS = (
-        "BLK0_FFN_GATE_WEIGHT_SCALE", "BLK0_FFN_GATE_WEIGHT_DATA",
-        "BLK0_FFN_UP_WEIGHT_SCALE", "BLK0_FFN_UP_WEIGHT_DATA",
-        "BLK0_FFN_DOWN_WEIGHT_SCALE", "BLK0_FFN_DOWN_WEIGHT_DATA",
-    )
-
-    MLP_REGION_KEYS = {
+    # Every IF4 projection decode slices per engine. Under the tiled map they
+    # are staged host-side from params.bin straight into the private windows
+    # (_stage_private_n_shard), BOTH phases read those slices, and the shared
+    # copies are never loaded.
+    PROJ_REGION_KEYS = {
+        "q": ("BLK0_ATTN_Q_WEIGHT_SCALE", "BLK0_ATTN_Q_WEIGHT_DATA"),
+        "k": ("BLK0_ATTN_K_WEIGHT_SCALE", "BLK0_ATTN_K_WEIGHT_DATA"),
+        "v": ("BLK0_ATTN_V_WEIGHT_SCALE", "BLK0_ATTN_V_WEIGHT_DATA"),
+        "o": ("BLK0_ATTN_OUTPUT_WEIGHT_SCALE", "BLK0_ATTN_OUTPUT_WEIGHT_DATA"),
         "gate": ("BLK0_FFN_GATE_WEIGHT_SCALE", "BLK0_FFN_GATE_WEIGHT_DATA"),
         "up": ("BLK0_FFN_UP_WEIGHT_SCALE", "BLK0_FFN_UP_WEIGHT_DATA"),
         "down": ("BLK0_FFN_DOWN_WEIGHT_SCALE", "BLK0_FFN_DOWN_WEIGHT_DATA"),
     }
+    PROJ_SHARED_REGION_KEYS = tuple(k for pair in PROJ_REGION_KEYS.values() for k in pair)
+    LM_HEAD_REGION_KEYS = ("LM_HEAD_WEIGHT_SCALE", "LM_HEAD_WEIGHT_DATA")
 
-    def _stage_private_n_shard(self, tag: str, layer_idx: int, N: int, K: int):
+    def _stage_private_n_shard(self, tag: str, layer_idx: int, N: int, K: int,
+                               keys: tuple[str, str] | None = None):
         """Slice an IF4 [N, K] weight into per-engine ROW blocks, host-side.
 
         An N-shard is a contiguous row block of both the nibble image and the
@@ -97,16 +102,26 @@ class Gemma4LMMixin:
         re-quantized. Going host-side (rather than shard_quantized_weight's
         card -> host -> card copy out of a loaded image) is what lets the shared
         copy never be loaded in the first place.
+
+        Sliced over as many engines as N can feed in whole 64-row blocks
+        (mes.max_shards), like shard_quantized_weight's max_engines: K/V on a
+        sliding layer (N=256) take 4 engines and the rest emit nothing.
+        ``keys`` = (scale, data) region keys of a non-layer weight (the LM
+        head); the default is the layer projection named by ``tag``.
         """
         import numpy as np
-        ne = int(self.multi_core)
+        ne = min(int(self.multi_core), mes.max_shards(N))
         rows = N // ne
         if N % ne or rows % mes.COL_ALIGN:
             raise ValueError(
                 f"{tag} L{layer_idx}: N={N} does not give {ne} row blocks of "
                 f"whole {mes.COL_ALIGN}-element scale blocks")
-        s_key, d_key = self.MLP_REGION_KEYS[tag]
-        bin_off = layer_idx * self.weight_defs["LAYER_WEIGHT_SIZE"]
+        if keys is None:
+            s_key, d_key = self.PROJ_REGION_KEYS[tag]
+            bin_off = layer_idx * self.weight_defs["LAYER_WEIGHT_SIZE"]
+        else:
+            s_key, d_key = keys
+            bin_off = 0
         data = np.frombuffer(self.weight_bin, dtype=np.uint8, count=N * (K // 2),
                              offset=self.weight_defs[d_key] + bin_off).reshape(N, K // 2)
         scales = np.frombuffer(self.weight_bin, dtype=np.uint8,
@@ -127,7 +142,8 @@ class Gemma4LMMixin:
                 engine_idx=e, col_offset=e * rows, cols=rows,
                 weight_addr=d_addr, scale_addr=s_addr,
                 layer_stride=0, scale_layer_stride=0))
-        return mes.ShardedWeight(name=f"{tag}_proj_L{layer_idx}", K=K, N=N,
+        name = f"{tag}_proj_L{layer_idx}" if keys is None else tag
+        return mes.ShardedWeight(name=name, K=K, N=N,
                                  layers=1, data_type=TYPE.IF4, shards=shards)
 
     def _ensure_prefill_mlp_lane_buffers(self) -> dict:
@@ -325,7 +341,13 @@ class Gemma4LMMixin:
                 # MLP: sliced host-side from params.bin into the private
                 # windows, so the shared copy is never loaded. Everything else
                 # still copies out of the shared image it was loaded into.
-                if op in self.MLP_REGION_KEYS and self._tiled_map:
+                if op == "down" and self._tiled_map:
+                    # down has ONE layout under the tiled map, the K-slices
+                    # (_ensure_prefill_down_k_shards): prefill contracts each
+                    # engine's own MLP lane, and decode does the same over its
+                    # slice of the product, summing the partials on the master.
+                    continue
+                if op in self.PROJ_REGION_KEYS and self._tiled_map:
                     shards[(op, layer_idx)] = self._stage_private_n_shard(
                         op, layer_idx, N, K)
                     continue
@@ -345,7 +367,13 @@ class Gemma4LMMixin:
         # at any engine count (32768 columns each at 8).
         self._decode_lm_shard = None
         _lm_cap = mes.max_shards(self.EMBEDDING_ELEMENTS)
-        if _lm_cap >= 2:
+        if _lm_cap >= 2 and self._tiled_map:
+            # Staged from params.bin like the projections: the shared copy is
+            # not loaded under the tiled map.
+            self._decode_lm_shard = self._stage_private_n_shard(
+                "lm_head", 0, self.EMBEDDING_ELEMENTS, self.vector_length,
+                keys=self.LM_HEAD_REGION_KEYS)
+        elif _lm_cap >= 2:
             self._decode_lm_shard = sched.shard_quantized_weight(
                 name="lm_head",
                 main_weight_addr=self.DRAM_ADDR_LM_HEAD_QUANT,
@@ -672,12 +700,12 @@ class Gemma4LMMixin:
             f"Layer 0 size overflow: computed {layer0_end} > LAYER_WEIGHT_SIZE {LAYER_WEIGHT_SIZE}"
         )
 
-        # THE MLP IS NOT LOADED UNDER THE TILED MAP. gate/up/down are sliced
-        # host-side from params.bin straight into the private windows
-        # (_stage_private_n_shard / _ensure_prefill_down_k_shards), and BOTH
-        # phases read those shards, so a shared copy would be written once and
-        # never read.
-        _skip_shared_regions = (set(self.MLP_SHARED_REGION_KEYS)
+        # NO PROJECTION IS LOADED SHARED UNDER THE TILED MAP. Q/K/V/O and the
+        # MLP (and the LM head, below) are sliced host-side from params.bin
+        # straight into the private windows (_stage_private_n_shard), and
+        # prefill and decode both read those slices, so a shared copy would be
+        # written once and never read.
+        _skip_shared_regions = (set(self.PROJ_SHARED_REGION_KEYS)
                                 if self._tiled_map else set())
 
         # COMPACT THE LAYER BLOCK AROUND THE HOLE. The MLP sits in the MIDDLE of
@@ -704,7 +732,7 @@ class Gemma4LMMixin:
         print(f"\n--- Loading weights to DRAM ---")
         if _skip_shared_regions:
             print(f"    layer block compacted {LAYER_WEIGHT_SIZE / 2**20:.2f} -> "
-                  f"{LAYER_BLOCK_BYTES / 2**20:.2f} MiB (MLP staged privately); "
+                  f"{LAYER_BLOCK_BYTES / 2**20:.2f} MiB (projections staged privately); "
                   f"{(LAYER_WEIGHT_SIZE - LAYER_BLOCK_BYTES) * self.LAYER_SIZE / 2**20:.0f} "
                   f"MiB of shared pool reclaimed")
         layers_total = self.LAYER_SIZE * LAYER_BLOCK_BYTES
@@ -761,6 +789,9 @@ class Gemma4LMMixin:
         print(f"  Loaded {self.LAYER_SIZE} layers ({layers_total/(1024*1024):.1f} MB)")
 
         for off_key, sz_key, attr in non_layer:
+            if self._tiled_map and off_key in self.LM_HEAD_REGION_KEYS:
+                setattr(self, attr, None)      # staged privately; see above
+                continue
             off = self.weight_defs[off_key]
             sz = self.weight_defs[sz_key]
             raw = self.weight_bin[off : off + sz]
@@ -1094,32 +1125,40 @@ class Gemma4LMMixin:
     def _emit_strided_copy_pbi(self, src_base: int, dst_base: int, copy_elems: int,
                                src_row_bytes: int, dst_row_bytes: int,
                                n_template: int, gpr_loop: int,
-                               sram_addr: int = 0x10000) -> None:
+                               sram_addr: int = 0x10000, ue=None) -> None:
         """§4.4 PBI hardware loop: for n_template rows (runtime trip count =
         gpr_loop) copy copy_elems bf16 from src to dst, advancing the source DRAM
         addr by src_row_bytes and the dest by dst_row_bytes each iteration (both
         register-computed → arbitrary strides). Used for the partial-rotary
-        gather/scatter and the non-rotated-dim pass-through."""
-        i_reg = self.alloc_isa_reg()
-        self.generate_instruction_add_set(i_reg, 0)
-        self.loop_start(loop_cnt=n_template, gpr_loop_cnt=gpr_loop)
-        self.generate_instruction_reg_mul_imm(
-            self.TMP_REG, i_reg, ue_35bit_addr_shifter(src_row_bytes))
-        self.generate_instruction_add_imm(
-            self.TMP_REG, ue_35bit_addr_shifter(src_base), self.TMP_REG)
-        self.accelerator_memory_to_sram(
+        gather/scatter and the non-rotated-dim pass-through.
+
+        ``ue``: the engine to emit on (default the master). A worker engine has
+        no model-level TMP_REG, so it gets one of its own for the loop."""
+        ue = self if ue is None else ue
+        own_tmp = ue is not self
+        tmp = ue.alloc_isa_reg() if own_tmp else self.TMP_REG
+        i_reg = ue.alloc_isa_reg()
+        ue.generate_instruction_add_set(i_reg, 0)
+        ue.loop_start(loop_cnt=n_template, gpr_loop_cnt=gpr_loop)
+        ue.generate_instruction_reg_mul_imm(
+            tmp, i_reg, ue_35bit_addr_shifter(src_row_bytes))
+        ue.generate_instruction_add_imm(
+            tmp, ue_35bit_addr_shifter(src_base), tmp)
+        ue.accelerator_memory_to_sram(
             accelerator_dram_address=0, sram_address=sram_addr,
-            element_size=copy_elems, general_reg_src=self.TMP_REG)
-        self.generate_instruction_reg_mul_imm(
-            self.TMP_REG, i_reg, ue_35bit_addr_shifter(dst_row_bytes))
-        self.generate_instruction_add_imm(
-            self.TMP_REG, ue_35bit_addr_shifter(dst_base), self.TMP_REG)
-        self.sram_to_accelerator_memory(
+            element_size=copy_elems, general_reg_src=tmp)
+        ue.generate_instruction_reg_mul_imm(
+            tmp, i_reg, ue_35bit_addr_shifter(dst_row_bytes))
+        ue.generate_instruction_add_imm(
+            tmp, ue_35bit_addr_shifter(dst_base), tmp)
+        ue.sram_to_accelerator_memory(
             sram_address=sram_addr, accelerator_dram_address=0,
-            element_size=copy_elems, general_reg_src=self.TMP_REG)
-        self.generate_instruction_add_inc(i_reg)
-        self.loop_end()
-        self.release_isa_reg()       # i_reg
+            element_size=copy_elems, general_reg_src=tmp)
+        ue.generate_instruction_add_inc(i_reg)
+        ue.loop_end()
+        ue.release_isa_reg()       # i_reg
+        if own_tmp:
+            ue.release_isa_reg()   # tmp
 
     def compile_prefill(self, seq_len: int, layer_size: int = 35, profile: bool = False,
                         pos_offset: int = 0) -> tuple[None, int]:
@@ -1183,12 +1222,11 @@ class Gemma4LMMixin:
         prefill_scheduler = getattr(self, "_active_prefill_scheduler", None)
         shard_m_regs = getattr(self, "_prefill_shard_m_regs", None)
 
-        # ONE WEIGHT SETUP FOR BOTH PHASES. The gate/up N-shards prefill's lane
-        # reads are the ones decode stages -- _ensure_decode_qkv_shards is
-        # cached, so calling it here simply moves the staging earlier and
-        # compile_decoder reuses the result. `down` is the weight that cannot
-        # agree with itself (decode splits its output dim, prefill its
-        # contraction dim), so it gets the second, K-sliced layout.
+        # ONE WEIGHT SETUP FOR BOTH PHASES. Under the tiled map every prefill
+        # projection (Q/K/V, O, gate/up, down) reads the private N-slices decode
+        # stages -- each engine computes all rows of its own column block --
+        # so no weight has a second layout. _ensure_decode_qkv_shards is cached:
+        # calling it here moves the staging earlier and compile_decoder reuses it.
         mlp_shards = down_k_shards = mlp_lanes = None
         if prefill_scheduler is not None and self._tiled_map:
             mlp_shards = self._ensure_decode_qkv_shards(prefill_scheduler, layer_size)
@@ -1246,6 +1284,41 @@ class Gemma4LMMixin:
             kwargs["gpr_M_reg"] = m_reg
             kwargs.setdefault("is_B_quantized", True)
             return ctx.ue.matmat_mul_core(**kwargs)
+
+        def _col_projection(ctx, sw, a_addr: int, out_addr: int, n_full: int,
+                            gelu: bool = False, dense: bool = False) -> int:
+            """Emit engine ctx's column block of one projection over ALL rows.
+
+            The weight is the engine's PRIVATE decode slice (sw), so prefill
+            reads the same bytes decode does: no second copy, and each engine
+            streams only 1/N of the weight. The block lands in the full-width
+            output at its column offset, rows n_full elements apart. Engines
+            past the slice's cap (narrow K/V) emit nothing and only run the
+            round. ``dense``: write the block as its own [rows, cols] matrix at
+            out_addr instead (no row stride, so the fast tiled writeback).
+            """
+            sh = sw.shard_or_none(ctx.engine_idx)
+            if sh is None:
+                return 0
+            ue = ctx.ue
+            m_reg = shard_m_regs[ctx.engine_idx]
+            ue.generate_instruction_add_set(m_reg, seq_len)
+            if dense:
+                return ue.matmat_mul_core(
+                    M=seq_len, K=sw.K, N=sh.cols, A_DRAM_ADDR=a_addr,
+                    B_DRAM_ADDR=sh.weight_addr, OUTPUT_DRAM_ADDR=out_addr,
+                    is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=sh.scale_addr,
+                    gelu_enable=gelu, gpr_M_reg=m_reg) or 0
+            stride_reg = ue.alloc_isa_reg()
+            ue.generate_instruction_add_set(stride_reg, n_full)
+            flops = ue.matmat_mul_core(
+                M=seq_len, K=sw.K, N=sh.cols, A_DRAM_ADDR=a_addr,
+                B_DRAM_ADDR=sh.weight_addr,
+                OUTPUT_DRAM_ADDR=out_addr + sh.col_offset * self.bytes_per_element,
+                is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=sh.scale_addr,
+                gelu_enable=gelu, gpr_M_reg=m_reg, gpr_out_row_stride_reg=stride_reg) or 0
+            ue.release_isa_reg()
+            return flops
         prefill_t0 = time.perf_counter()
 
         # Per-layer input preparation (prefill): project each token to all 35 layer slices, then normalize, add its per-layer embedding, and scale. The projection uses template M; the row-wise stages use live seq_len.
@@ -1300,6 +1373,7 @@ class Gemma4LMMixin:
             # AFTER it is consumed here and as the attention-residual source.
             layer_input_addr = self.LAYER0_INPUT_DRAM if layer_idx == 0 else self.LAYER0_OUTPUT_DRAM
             non_shared = layer_idx not in self._kv_shared_map
+            q_fused = False   # set by the tiled projection path (one Q head per engine)
             if prefill_scheduler is None:
                 total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=layer_input_addr,
                                     OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
@@ -1320,6 +1394,93 @@ class Gemma4LMMixin:
                 total_flops += self.rms_norm_core_dram(M=seq_len * self.group_size, N=cur_head_dim, A_DRAM_ADDR=self.LAYER0_Q_DRAM,
                                 OUTPUT_DRAM_ADDR=self.LAYER0_Q_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA + layer_off,
                                                 gpr_M_reg=self.gpr_q_seq_len)
+            elif self._tiled_map:
+                # COLUMNS over decode's private slices. The pre-norm and the Q
+                # norm are row-independent, so they stay row-sharded around it.
+                shard_flops = [0]
+                h_pitch = self.vector_length * self.bytes_per_element
+                def _emit_pre_norm(ctx):
+                    m_reg = shard_m_regs[ctx.engine_idx]
+                    ctx.ue.generate_instruction_add_set(m_reg, ctx.rows)
+                    shard_flops[0] += ctx.ue.rms_norm_core_dram(M=ctx.rows, N=self.vector_length, A_DRAM_ADDR=ctx.rows_addr(layer_input_addr, h_pitch), OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LAYER0_PRE_NORM_DRAM, h_pitch), GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off, gpr_M_reg=m_reg)
+                prefill_scheduler.sharded_region(seq_len, _emit_pre_norm)
+                # ONE Q HEAD PER ENGINE. With as many engines as query heads,
+                # an engine's Q slice is exactly one head, so it writes that
+                # head DENSE into its head-major attention slot and normalizes
+                # and RoPEs it in place of the master: no strided Q, no master
+                # Q RoPE over all heads, and no token-to-head-major permute.
+                _q_sw = mlp_shards[("q", layer_idx)]
+                q_fused = (int(self.multi_core) == self.group_size
+                           and all(_q_sw.shard_or_none(e) is not None
+                                   and _q_sw.shard_or_none(e).cols == cur_head_dim
+                                   for e in range(self.group_size)))
+                bpe_q = self.bytes_per_element
+                q_slot_bytes = (((self.max_prefill_seq_len + 63) // 64) * 64
+                                * cur_head_dim * bpe_q)
+                q_rope_base = ((self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers
+                                else self.DRAM_ADDR_ROPE_LOCAL)
+                               + pos_offset * 2 * rope_n * bpe_q)
+                q_rope_sin = q_rope_base + rope_n * bpe_q
+                def _emit_q_head(ctx):
+                    # unsafe_ue: RoPE and the strided copies are refused inside a
+                    # sharded region by default, but here every engine touches
+                    # only its own head's slot and scratch -- nothing another
+                    # engine reads or writes in this region.
+                    e, ue = ctx.engine_idx, ctx.unsafe_ue
+                    m_reg = shard_m_regs[e]
+                    slot = self.LAYER0_FLASH_K_DRAM + e * q_slot_bytes
+                    # Per-head scratch in the MLP buffers, dead until the MLP.
+                    raw = self.LAYER0_MLP_GATE_DRAM + e * q_slot_bytes
+                    normed = self.LAYER0_MLP_UP_DRAM + e * q_slot_bytes
+                    rot = self.LAYER0_MLP_MULT_DRAM + e * q_slot_bytes
+                    shard_flops[0] += _col_projection(
+                        ctx, _q_sw, self.LAYER0_PRE_NORM_DRAM, raw, cur_head_dim, dense=True)
+                    ue.generate_instruction_add_set(m_reg, seq_len)
+                    shard_flops[0] += ue.rms_norm_core_dram(
+                        M=seq_len, N=cur_head_dim, A_DRAM_ADDR=raw, OUTPUT_DRAM_ADDR=normed,
+                        GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA + layer_off,
+                        gpr_M_reg=m_reg)
+                    head_b, rope_b = cur_head_dim * bpe_q, rope_n * bpe_q
+                    ue.generate_instruction_add_set(m_reg, seq_len)
+                    if rope_n == cur_head_dim:
+                        shard_flops[0] += ue.rope_hf_core_dram(
+                            M=seq_len, N=rope_n, input_dram_addr=normed, output_dram_addr=slot,
+                            cos_dram_addr=q_rope_base, sin_dram_addr=q_rope_sin, gpr_M_reg=m_reg)
+                    else:
+                        # Partial rotary: rotate the first rope_n dims, pass the rest.
+                        self._emit_strided_copy_pbi(normed, raw, rope_n, head_b, rope_b,
+                                                    seq_len, m_reg, ue=ue)
+                        ue.generate_instruction_add_set(m_reg, seq_len)
+                        shard_flops[0] += ue.rope_hf_core_dram(
+                            M=seq_len, N=rope_n, input_dram_addr=raw, output_dram_addr=rot,
+                            cos_dram_addr=q_rope_base, sin_dram_addr=q_rope_sin, gpr_M_reg=m_reg)
+                        ue.generate_instruction_add_set(m_reg, seq_len)
+                        self._emit_strided_copy_pbi(rot, slot, rope_n, rope_b, head_b,
+                                                    seq_len, m_reg, ue=ue)
+                        ue.generate_instruction_add_set(m_reg, seq_len)
+                        self._emit_strided_copy_pbi(normed + rope_b, slot + rope_b,
+                                                    cur_head_dim - rope_n, head_b, head_b,
+                                                    seq_len, m_reg, ue=ue)
+                qkv_ops = [] if q_fused else [("q", self.LAYER0_Q_DRAM, cur_q_size)]
+                if non_shared:
+                    qkv_ops += [("k", self.LAYER0_K_DRAM, cur_k_size),
+                                ("v", self.LAYER0_FLASH_V_DRAM, cur_k_size)]
+                def _emit_qkv(ctx):
+                    if q_fused:
+                        _emit_q_head(ctx)
+                    for op, out_addr, n_full in qkv_ops:
+                        shard_flops[0] += _col_projection(
+                            ctx, mlp_shards[(op, layer_idx)], self.LAYER0_PRE_NORM_DRAM,
+                            out_addr, n_full)
+                prefill_scheduler.col_sharded_region(cur_q_size, _emit_qkv)
+                def _emit_q_norm(ctx):
+                    m_reg = shard_m_regs[ctx.engine_idx]
+                    q_rows = ctx.rows * self.group_size
+                    ctx.ue.generate_instruction_add_set(m_reg, q_rows)
+                    shard_flops[0] += ctx.ue.rms_norm_core_dram(M=q_rows, N=cur_head_dim, A_DRAM_ADDR=ctx.rows_addr(self.LAYER0_Q_DRAM, cur_q_size * self.bytes_per_element), OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LAYER0_Q_NORM_DRAM, cur_q_size * self.bytes_per_element), GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA + layer_off, gpr_M_reg=m_reg)
+                if not q_fused:
+                    prefill_scheduler.sharded_region(seq_len, _emit_q_norm)
+                total_flops += shard_flops[0]
             else:
                 shard_flops = [0]
                 def _emit_prefill_projection_shard(ctx):
@@ -1396,9 +1557,10 @@ class Gemma4LMMixin:
                     total_flops += self.rope_hf_core_dram(M=seq_len, N=rope_n,
                         input_dram_addr=self.LAYER0_K_NORM_DRAM, output_dram_addr=k_cache_write,
                         cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
-                total_flops += self.rope_hf_core_dram_gqa(M=seq_len, group_size=self.group_size, N=rope_n,
-                    input_dram_addr=self.LAYER0_Q_NORM_DRAM, output_dram_addr=self.LAYER0_FLASH_Q_DRAM,
-                    cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
+                if not q_fused:
+                    total_flops += self.rope_hf_core_dram_gqa(M=seq_len, group_size=self.group_size, N=rope_n,
+                        input_dram_addr=self.LAYER0_Q_NORM_DRAM, output_dram_addr=self.LAYER0_FLASH_Q_DRAM,
+                        cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
             else:
                 # Partial rotary: rotate first rope_n dims, copy the rest through.
                 non_rot = cur_head_dim - rope_n
@@ -1407,10 +1569,11 @@ class Gemma4LMMixin:
                     total_flops += self.rope_hf_core_dram(M=seq_len, N=rope_n, input_dram_addr=tmp_in, output_dram_addr=tmp_out, cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
                     self._emit_strided_copy_pbi(tmp_out, k_cache_write, rope_n, rope_bytes, head_bytes, seq_len, self.gpr_seq_len)
                     self._emit_strided_copy_pbi(self.LAYER0_K_NORM_DRAM + rope_bytes, k_cache_write + rope_bytes, non_rot, head_bytes, head_bytes, seq_len, self.gpr_seq_len)
-                self._emit_strided_copy_pbi(self.LAYER0_Q_NORM_DRAM, tmp_in, rope_n, head_bytes, rope_bytes, q_rows, self.gpr_q_seq_len)
-                total_flops += self.rope_hf_core_dram_gqa(M=seq_len, group_size=self.group_size, N=rope_n, input_dram_addr=tmp_in, output_dram_addr=tmp_out, cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
-                self._emit_strided_copy_pbi(tmp_out, self.LAYER0_FLASH_Q_DRAM, rope_n, rope_bytes, head_bytes, q_rows, self.gpr_q_seq_len)
-                self._emit_strided_copy_pbi(self.LAYER0_Q_NORM_DRAM + rope_bytes, self.LAYER0_FLASH_Q_DRAM + rope_bytes, non_rot, head_bytes, head_bytes, q_rows, self.gpr_q_seq_len)
+                if not q_fused:
+                    self._emit_strided_copy_pbi(self.LAYER0_Q_NORM_DRAM, tmp_in, rope_n, head_bytes, rope_bytes, q_rows, self.gpr_q_seq_len)
+                    total_flops += self.rope_hf_core_dram_gqa(M=seq_len, group_size=self.group_size, N=rope_n, input_dram_addr=tmp_in, output_dram_addr=tmp_out, cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
+                    self._emit_strided_copy_pbi(tmp_out, self.LAYER0_FLASH_Q_DRAM, rope_n, rope_bytes, head_bytes, q_rows, self.gpr_q_seq_len)
+                    self._emit_strided_copy_pbi(self.LAYER0_Q_NORM_DRAM + rope_bytes, self.LAYER0_FLASH_Q_DRAM + rope_bytes, non_rot, head_bytes, head_bytes, q_rows, self.gpr_q_seq_len)
             _checkpoint(f"L{layer_idx}_rope")
 
             # ---- GQA = an outer loop over the group's query heads ----
@@ -1451,7 +1614,7 @@ class Gemma4LMMixin:
             # plane that a chunk does not otherwise need.
             core_aligned = per_head_rows if pos_offset == 0 else attn_aligned_live
             core_q_pre_scaled = pos_offset > 0
-            for g in range(self.group_size):
+            for g in range(0 if q_fused else self.group_size):   # fused: already head-major
                 self._emit_strided_copy_pbi(
                     self.LAYER0_FLASH_Q_DRAM + g * head_bytes,       # token-major head g
                     self.LAYER0_FLASH_K_DRAM + g * qhm_head_bytes,   # head-major head g
@@ -1557,40 +1720,30 @@ class Gemma4LMMixin:
                 total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM, OUTPUT_DRAM_ADDR=self.LAYER0_POST_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off, gpr_M_reg=self.gpr_seq_len)
                 self.eltwise_core_dram(M=seq_len, N=self.vector_length, dram_a=self.LAYER0_POST_ATTN_RESIDUAL_DRAM, dram_b=self.LAYER0_POST_MLP_NORM_DRAM, dram_out=self.LAYER0_OUTPUT_DRAM, mode=UE_MODE.ELTWISE_ADD, gpr_M_reg=self.gpr_seq_len)
             else:
-                # TENSOR-PARALLEL MLP, TILED MAP ONLY. The lane buffers are
-                # 6 MiB of per-engine scratch and the gate/up shards are the
-                # private N-shards decode stages; neither exists under the
-                # 512 MB map, whose 16 MiB scratch slice is already 13.12 MiB
-                # of vision attention. Other engine counts keep the M-shard.
+                # COLUMN-PARALLEL O AND MLP, TILED MAP ONLY: the private
+                # N-slices exist only there. Other engine counts keep the
+                # M-shard over the shared weights.
                 if self._tiled_map:
                     shard_flops = [0]
                     h_pitch = self.vector_length * self.bytes_per_element
-                    q_pitch = cur_q_size * self.bytes_per_element
                     mlp_pitch = cur_mlp * self.bytes_per_element
 
-                    # ROWS. o_proj, the two norms and the residual are row-
-                    # independent, so they stay M-sharded and this region JOINS
-                    # -- the MLP lane below needs the whole PRE_MLP_NORM.
-                    #
-                    # o_proj IS NOT K-SHARDED, though it looks like it should be:
-                    # it contracts over q_size, attention has already split that
-                    # axis head-per-engine, and the head-major buffer hands each
-                    # engine a dense [M, head_dim] block that is exactly the A
-                    # operand for K-columns [e*head_dim, (e+1)*head_dim). That
-                    # version was built and measured, and it is WRONG on
-                    # hardware: coherent for ~100 tokens, then a repetition loop,
-                    # with prefill 1.2% SLOWER because o's matmul is small enough
-                    # (M x 512 x 1536) that the extra region and reduce_add cost
-                    # more than the better tile buys. Addressing was verified
-                    # against the head slot _emit_prefill_head writes, the
-                    # head-to-engine map, both lane widths and the IF4 slice
-                    # arithmetic -- all consistent -- so the defect is elsewhere
-                    # and it is not worth a negative-value optimisation. If it is
-                    # revisited, _stage_private_k_shard already produces the
-                    # lanes and the IF4 oracle is the tool to bisect it with.
+                    # COLUMNS: o_proj over decode's private slices. Every engine
+                    # reads the whole attention output and writes its block of
+                    # the 1536 output columns, so nothing is summed (a K-split
+                    # o_proj -- partials over each engine's heads -- was built
+                    # once and measured wrong on hardware; this is not that).
+                    o_sw = mlp_shards[("o", layer_idx)]
+                    def _emit_o_proj(ctx):
+                        shard_flops[0] += _col_projection(
+                            ctx, o_sw, self.LAYER0_FLASH_OUTPUT_DRAM,
+                            self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, self.vector_length)
+                    prefill_scheduler.col_sharded_region(self.vector_length, _emit_o_proj)
+
+                    # ROWS. The norms and the residual are row-independent; this
+                    # region JOINS because the MLP below reads the whole PRE_MLP_NORM.
                     def _emit_pre_mlp(ctx):
                         m_reg = shard_m_regs[ctx.engine_idx]
-                        shard_flops[0] += _shard_projection_core(ctx, M=ctx.rows, K=cur_q_size, N=self.vector_length, A_DRAM_ADDR=ctx.rows_addr(self.LAYER0_FLASH_OUTPUT_DRAM, q_pitch), B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, h_pitch), is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off)
                         ctx.ue.generate_instruction_add_set(m_reg, ctx.rows)
                         shard_flops[0] += ctx.ue.rms_norm_core_dram(M=ctx.rows, N=self.vector_length, A_DRAM_ADDR=ctx.rows_addr(self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, h_pitch), OUTPUT_DRAM_ADDR=ctx.rows_addr(self.LAYER0_POST_ATTN_NORM_DRAM, h_pitch), GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA + layer_off, gpr_M_reg=m_reg)
                         ctx.ue.generate_instruction_add_set(m_reg, ctx.rows)
@@ -2810,7 +2963,32 @@ class Gemma4LMMixin:
                 # which only exists after the master's multiply above, so it cannot
                 # ride in the gate/up round.
                 _down_sw = _shards.get(("down", layer_idx))
-                if _down_sw is None:
+                _down_k = (self._ensure_prefill_down_k_shards(_dec_sched, layer_size)
+                           if _dec_sched is not None and self._tiled_map else None)
+                _down_partials = None
+                if _down_k is not None:
+                    # K-SPLIT: engine e contracts its lane of the product (one
+                    # row, so a contiguous slice of MLP_MULT) with its K-slice of
+                    # down into a private [1, vector_length] partial; the master
+                    # sums the partials straight into the post-MLP norm below.
+                    _lane = cur_mlp // _dec_sched.num_engines
+                    _down_partials = self._ensure_prefill_mlp_lane_buffers()["down"]
+                    _dec_sched.release()
+                    for _e in range(_dec_sched.num_engines):
+                        if _e:
+                            _dec_sched.begin_worker_round(_e)
+                        _ue = _dec_sched.engines[_e]
+                        _d_addr, _s_addr = _down_k[layer_idx][_e]
+                        _ue.quantized_matmat_core(
+                            M=1, K=_lane, N=self.vector_length,
+                            A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM + _e * _lane * self.bytes_per_element,
+                            B_DRAM_ADDR=_d_addr, OUTPUT_DRAM_ADDR=_down_partials[_e],
+                            SCALE_DRAM_ADDR=_s_addr, data_type=TYPE.IF4)
+                        if _e:
+                            _dec_sched.end_worker_round(_e)
+                    _dec_sched.join()
+                    total_flops += 2 * cur_mlp * self.vector_length
+                elif _down_sw is None:
                     total_flops += _projection_core(M=1, K=cur_mlp, N=self.vector_length,
                         A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
                         B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
@@ -2830,8 +3008,18 @@ class Gemma4LMMixin:
                 # Decode-only fused MLP post-normalization + residual. Keep the
                 # normalized MLP-down vector in SRAM through the residual add,
                 # removing the post-MLP-norm DRAM write/read pair.
-                self.accelerator_memory_to_sram(
-                    self.LAYER0_MLP_DOWN_DRAM, _vec_a, self.vector_length)
+                if _down_partials is not None:
+                    # Sum the K-split partials into _vec_a (engine order, as
+                    # prefill's reduce_add does).
+                    self.accelerator_memory_to_sram(
+                        _down_partials[0], _vec_a, self.vector_length)
+                    for _part in _down_partials[1:]:
+                        self.accelerator_memory_to_sram(_part, _vec_b, self.vector_length)
+                        self.eltwise_add_core(_vec_a, _vec_b, _vec_a, self.vector_length)
+                    total_flops += (len(_down_partials) - 1) * self.vector_length
+                else:
+                    self.accelerator_memory_to_sram(
+                        self.LAYER0_MLP_DOWN_DRAM, _vec_a, self.vector_length)
                 self.accelerator_memory_to_sram(
                     self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off,
                     _vec_b, self.vector_length)

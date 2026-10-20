@@ -924,8 +924,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         """Check the full private and shared allocation before loading weights.
 
         Count K/V on every layer as a conservative upper bound; the real loader
-        can omit borrowed K/V layers after reading the host manifest. Include
-        both layouts of MLP down (decode N-shards and prefill K-shards).
+        can omit borrowed K/V layers after reading the host manifest. Every
+        projection and the LM head have ONE private layout read by both prefill
+        and decode -- N-slices, except down's K-slices (same size) -- and none
+        is loaded shared.
         """
         import copy
         arena = copy.deepcopy(self.mc_arena)
@@ -944,10 +946,6 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                     raise ValueError("Kintex E2B projections require whole 64-column shards")
                 private_bytes += ((columns * K // 2 + 63) & ~63)
                 private_bytes += ((columns * K // UE_VECTOR_SIZE * 2 + 63) & ~63)
-            # A second packed copy, K-sharded for prefill's partial reductions.
-            lane = mlp // self.multi_core
-            private_bytes += ((self.vector_length * lane // 2 + 63) & ~63)
-            private_bytes += ((self.vector_length * lane // UE_VECTOR_SIZE * 2 + 63) & ~63)
         columns = self.EMBEDDING_ELEMENTS // self.multi_core
         private_bytes += columns * self.vector_length // 2
         private_bytes += columns * self.vector_length // UE_VECTOR_SIZE * 2
@@ -962,11 +960,12 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # matters: each compact layer and non-layer region must fit one tail.
         layer_bytes = sum((self.weight_defs[item["key"] + "_SIZE"] + 127) & ~127
                           for item in self._cfg["layers"]["structure"]
-                          if item["key"] not in self.MLP_SHARED_REGION_KEYS)
+                          if item["key"] not in self.PROJ_SHARED_REGION_KEYS)
         for layer in range(self.LAYER_SIZE):
             arena.alloc_shared(layer_bytes, f"lm.layer{layer}")
         non_layer = [item["key"] for item in self._cfg["layers"]["non_layer"]
-                     if item["key"] not in ("ROPE_LOCAL", "ROPE_GLOBAL")]
+                     if item["key"] not in ("ROPE_LOCAL", "ROPE_GLOBAL")
+                     and item["key"] not in self.LM_HEAD_REGION_KEYS]
         for key in [*non_layer, "ROPE_LOCAL", "ROPE_GLOBAL"]:
             arena.alloc_shared(self.weight_defs[key + "_SIZE"], key)
         arena.alloc_shared(UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element,
@@ -976,8 +975,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         mlp_lane = max(self.mlp_elements, self.mlp_elements_wide) // self.multi_core
         lane_bytes = rows * mlp_lane * self.bytes_per_element
         partial_bytes = rows * self.vector_length * self.bytes_per_element
-        aligned_rows = ((rows + 63) // 64) * 64
-        attention_bytes = (2 * self.head_dim * aligned_rows + aligned_rows**2) * self.bytes_per_element
+        attention_bytes = (self._attention_buffer_sizes()["engine_scratch"]
+                           * self.bytes_per_element)
         for engine in range(self.multi_core):
             for name, size in (("gate", lane_bytes), ("up", lane_bytes),
                                ("product", lane_bytes), ("down partial", partial_bytes)):
@@ -2297,6 +2296,15 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         lines.append("")
         lines.append(f"- **Weight bin:** `{os.path.basename(weight_bin_path)}` — {_mb(weight_bin_size)}")
         lines.append(f"- **Total weight DRAM (quantized, on FPGA):** {total_weight_dram_mb:.1f} MB")
+        if getattr(self, "mc_arena", None) is not None:
+            # Per-engine private shards (decode and prefill layouts) live in the
+            # engine windows, outside the shared params figure above.
+            _priv = self.mc_arena.usage()
+            lines.append(f"- **Private weight DRAM (per-engine shards):** "
+                         f"{sum(_priv) / 2**20:.1f} MB ({max(_priv) / 2**20:.1f} MB "
+                         f"on the fullest engine)")
+            lines.append(f"- **All weight DRAM (shared + private):** "
+                         f"{total_weight_dram_mb + sum(_priv) / 2**20:.1f} MB")
         lines.append("")
 
         # --- Program image ---------------------------------------------------

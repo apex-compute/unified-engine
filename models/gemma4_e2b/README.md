@@ -19,12 +19,18 @@ The existing eight-engine tiled/shared-pool map is preserved. Smaller
 configurations now select private windows by the board's memory-controller map
 and reserve the shared model span. The two-engine, 4 GiB Kintex image instead
 uses two 2 GiB tiles at `0x00000000` and `0x80000000`, one per DDR3 controller.
-MLP shards are loaded directly from the host weight file, with no duplicate
-shared MLP image. Each tile reserves 1 GiB for private weights, 16 MiB for ISA,
-and 64 MiB for private scratch. Compact shared weights (about 540 MiB) and a
-contiguous 480 MiB tensor arena fit in the remaining tails. A conservative
-703 MiB/core private-weight budget includes both decode and prefill down
-layouts and is checked before loading weights. Other multicore configurations
+Under these tiled maps every projection (Q/K/V/O, gate/up/down) and the LM
+head is sliced per engine straight from the host weight file, and prefill and
+decode read the same slices: N-slices, except down's K-slices (each engine
+contracts its own MLP lane; decode sums the partials on the master). No
+projection is loaded shared and none has a second layout. On the 8-engine U50
+the weights take 1225 MB in all (91 MB shared, 1134 MB private) instead of
+1943 MB. With as many engines as query heads, each engine also produces,
+normalizes and RoPEs its own Q head directly in the head-major attention
+layout. Each tile reserves 1 GiB for private weights, 16 MiB for ISA, and 64 MiB
+for private scratch; the shared weights and a contiguous 480 MiB tensor arena
+fit in the remaining tails. The private-weight upper bound is checked before
+loading weights. Other multicore configurations
 require at least 8 GiB. Program sections in `programs.bin`/`programs.json`
 record a placement hash, so equal engine counts on U50 and U55C cannot reuse
 instructions with different baked addresses.
