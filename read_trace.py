@@ -150,7 +150,12 @@ def _queue_loading_reason(ev: dict, pc_rows: list[dict] | None) -> str:
 
 
 def _jump_triggers_icache_refill(row: dict) -> bool:
-    """True when RTL JUMP goes to STATE_RAM_DMA_START (full i-cache line DMA)."""
+    """True when the JUMP may enter STATE_RAM_DMA_START (full i-cache line DMA).
+
+    Before #1326 every taken absolute jump refilled. Now only a miss does, so
+    this is used to name a fill that the hardware actually tagged, or to infer
+    fills on untagged (older) images, where it is still exact.
+    """
     mode = str(row.get("jump_mode", "")).upper()
     taken = str(row.get("taken", "")).lower() == "taken"
     if mode in ("ABSOLUTE", "REG_ABS"):
@@ -170,8 +175,9 @@ def _isa_jump_perfetto_name(jump_mode: str, taken: str, nest: str = "") -> str:
     if taken_s in ("taken", "fall") and mode in ("JNZ", "JZ", "RELA_JNZ", "RELA_JZ"):
         parts.append(taken_s)
     core = " ".join(parts)
-    if _jump_triggers_icache_refill({"jump_mode": mode, "taken": taken_s}):
-        return f"ISA_JUMP ({core}, icache refill)"
+    # No refill claim here: since #1326 a taken absolute jump whose target is in
+    # the resident line is a hit (pointer move). A real refill always shows as
+    # the UE_QUEUE_LOADING slice that follows the jump.
     return f"ISA_JUMP ({core})"
 
 
