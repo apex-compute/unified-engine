@@ -308,11 +308,15 @@ _VARIANTS = {
     # NATIVE_QUICK_GELU -- the FPGA's quick_gelu substitutes for the trained
     # gelu_pytorch_tanh here rather than matching it.
     "smolvla_lid": "verapulse_smolvla_lid_config.json",
+    # Lid-pickup finetune on the quick_gelu backbone (NATIVE_QUICK_GELU), hardware-aware:
+    # trained for 10 Hz control with a 27-tick (2.7 s) stamp offset -- the policy server
+    # must run with --delay-ticks 27 (hwaware.json carries the contract).
+    "smolvla_lid_qg": "verapulse_smolvla_lid_qg_config.json",
 }
 
 # Variants whose weights were TRAINED in the accelerator's activation, so quick_gelu is
 # the published model rather than a substitution to cancel out.
-NATIVE_QUICK_GELU = {"smolvla_qg"}
+NATIVE_QUICK_GELU = {"smolvla_qg", "smolvla_lid_qg"}
 
 
 def _select_variant():
@@ -3040,22 +3044,44 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         """
         if getattr(self, "_vis_per_engine_done", None) is sched:
             return sched
-        V = self._cfg["vision"]
-        S, H, D, bpe = V["num_patches"], V["hidden_size"], V["head_dim"], 2
-        sched.register_per_engine("vis_zeros", self.vis_zeros_addr, H * bpe,
-                                  init_tensor=torch.zeros(H, dtype=torch.bfloat16))
-        zeros_d = torch.zeros(S * D, dtype=torch.bfloat16)
-        for name, addr in (("flash_q", self.VIS_FLASH_Q_DRAM),
-                           ("flash_k", self.VIS_FLASH_K_DRAM),
-                           ("flash_v", self.VIS_FLASH_V_DRAM),
-                           ("flash_out", self.VIS_FLASH_OUT_DRAM)):
-            sched.register_per_engine(name, addr, S * D * bpe, init_tensor=zeros_d)
-        scratch_n = (D + S) * S + S * D
-        sched.register_per_engine(
-            "attn_scratch", self.VIS_ATTN_SCRATCH_DRAM, scratch_n * bpe,
-            init_tensor=torch.zeros(scratch_n, dtype=torch.bfloat16))
+        for name, addr, init in self._vis_per_engine_specs():
+            sched.register_per_engine(name, addr, init.numel() * 2, init_tensor=init)
         self._vis_per_engine_done = sched
         return sched
+
+    def _vis_per_engine_specs(self):
+        """(name, primary_addr, init_tensor) for every vision per-engine buffer.
+
+        ONE table, TWO consumers (ported from 737526d on verapulse_porting). The compile
+        path feeds it to register_per_engine, which allocates each worker's copy AND
+        uploads the zeros. The bin path cannot: load_programs replays compile-time
+        addresses through register_per_engine_addrs, which only RECORDS them -- it has
+        no init_tensor argument and uploads nothing. vis_zeros is READ as a zeros
+        OPERAND at ne>1, so without a re-upload every worker reads whatever DRAM residue
+        sits at its arena address: invisible in a compiling run, intermittent in a
+        bin-backed one. Keep both paths reading this one table."""
+        V = self._cfg["vision"]
+        S, H, D = V["num_patches"], V["hidden_size"], V["head_dim"]
+        zeros_d = torch.zeros(S * D, dtype=torch.bfloat16)
+        scratch_n = (D + S) * S + S * D
+        return [("vis_zeros", self.vis_zeros_addr,
+                 torch.zeros(H, dtype=torch.bfloat16)),
+                ("flash_q", self.VIS_FLASH_Q_DRAM, zeros_d),
+                ("flash_k", self.VIS_FLASH_K_DRAM, zeros_d),
+                ("flash_v", self.VIS_FLASH_V_DRAM, zeros_d),
+                ("flash_out", self.VIS_FLASH_OUT_DRAM, zeros_d),
+                ("attn_scratch", self.VIS_ATTN_SCRATCH_DRAM,
+                 torch.zeros(scratch_n, dtype=torch.bfloat16))]
+
+    def _vis_stage_per_engine_init(self, sched):
+        """Upload the zeros register_per_engine would have uploaded, to the WORKER
+        copies only (the primary's live at model addresses the checkpoint staging
+        already covers). Bin path only -- see _vis_per_engine_specs."""
+        if sched is None or sched.num_engines <= 1:
+            return
+        for name, _addr, init in self._vis_per_engine_specs():
+            for e, w in enumerate(sched.workers, start=1):
+                w.dma_to_accelerator_memory(sched.per_engine_addr(name, e), init)
 
     def _vision_controller_replicas(self):
         from models.controller_replicas import ControllerReplicas
@@ -5552,11 +5578,9 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                             la["down_weight_k"][i],
                             sched.per_engine_addr("ae_mlp_down_partial", i), m_reg=mreg)
 
-        # join=False TWICE. col_sharded_region's exit barrier is redundant because
-        # reduce_add opens with its own rendezvous and the partials are meaningless until
-        # it runs; reduce_add's exit barrier is redundant because the only thing a worker
-        # can do afterwards is block on the NEXT region's opening rendezvous. Over 32
-        # layers x 10 Euler steps that is 320 barriers saved instead of 960.
+        # join=False here is fine: reduce_add opens with its own rendezvous and the
+        # partials are meaningless until it runs. The fence the ROW-SPLIT residual add
+        # below depends on comes from reduce_add's parallel path (see its note).
         sched.col_sharded_region(I, _body, join=False)
         # partial[0] IS AE_MLP_DOWN_DRAM (register_per_engine keeps the primary on its
         # existing model address), so the add chain accumulates IN PLACE: dram_a ==
@@ -9356,6 +9380,12 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                     # alloc_col_output both allocates and records, so there is no public
                     # re-register hook; the registry is a plain {name: [addr]} map.
                     sc._col_outputs[nm] = [int(a) for a in addrs]
+                # register_per_engine_addrs RECORDS addresses and uploads nothing, so
+                # the zeros compile time DMA'd into every worker copy are missing here.
+                # vis_zeros is read as a zeros OPERAND at ne>1: without this the workers
+                # read DRAM residue and the run is intermittently wrong.
+                if stage == "vision":
+                    self._vis_stage_per_engine_init(sc)
 
         wt = self._manifest.get("worker_tensor_addr")
         if wt is not None:

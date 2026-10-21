@@ -71,6 +71,13 @@ import threading
 # Every dim on VeraPulse_UnifiedEngine (V_SLOTS, E_HIDDEN, NUM_LAYERS, ...) is a CLASS
 # attribute read from the config when the class STATEMENT executes, so setting this after
 # the import would change nothing while appearing to work.
+# --variant on the command line wins over the env default. verapulse_test's own argv scan
+# would be shadowed by the env var set below, so resolve it here first.
+for _i, _a in enumerate(sys.argv[1:], 1):
+    if _a.startswith("--variant="):
+        os.environ["VERAPULSE_VARIANT"] = _a.split("=", 1)[1]
+    elif _a == "--variant" and _i + 1 < len(sys.argv):
+        os.environ["VERAPULSE_VARIANT"] = sys.argv[_i + 1]
 os.environ.setdefault("VERAPULSE_VARIANT", "smolvla")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -79,12 +86,17 @@ for _p in (_REPO, _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import json  # noqa: E402
+import pathlib  # noqa: E402
+import pickle  # noqa: E402  (same framing the stock server uses)
+
 import torch  # noqa: E402
 
 import verapulse_test as vp  # noqa: E402
 
 from lerobot.async_inference.configs import PolicyServerConfig  # noqa: E402
 from lerobot.async_inference.policy_server import PolicyServer  # noqa: E402
+from lerobot.async_inference.helpers import TimedAction  # noqa: E402
 
 
 # ======================================================================================
@@ -226,9 +238,38 @@ class FPGABackend:
 class FPGAPolicyServer(PolicyServer):
     """Stock PolicyServer with the model's forward pass rebound to the accelerator."""
 
-    def __init__(self, config, backend):
+    def __init__(self, config, backend, delay_ticks=0):
         super().__init__(config)
         self.backend = backend      # None => --cuda: stock torch, no FPGA
+        # HARDWARE-AWARE TIMESTAMPING. A checkpoint trained by hwaware_train.py predicts
+        # chunk index i for control tick t_obs + delay + i; the stock server stamps it
+        # t_obs + i, so the client would run every action `delay` ticks early and drop
+        # the ones it deems stale. The checkpoint's hwaware.json is the contract and is
+        # checked against this value when the client announces the checkpoint.
+        self.delay_ticks = int(delay_ticks)
+
+    def _time_action_chunk(self, t_0, action_chunk, i_0):
+        d = self.delay_ticks
+        if d == 0:
+            return super()._time_action_chunk(t_0, action_chunk, i_0)
+        dt = self.config.environment_dt
+        return [TimedAction(timestamp=t_0 + (d + i) * dt, timestep=i_0 + d + i, action=a)
+                for i, a in enumerate(action_chunk)]
+
+    def _check_hwaware(self, request):
+        specs = pickle.loads(request.data)  # nosec - same mechanism as upstream
+        side = pathlib.Path(str(getattr(specs, "pretrained_name_or_path", ""))) / "hwaware.json"
+        if side.exists():
+            want = int(json.loads(side.read_text())["delay_ticks"])
+            if want != self.delay_ticks:
+                raise RuntimeError(
+                    f"checkpoint {side.parent} was trained for delay_ticks={want}, server "
+                    f"started with --delay-ticks {self.delay_ticks}")
+            self.logger.info(f"hardware-aware checkpoint: delay_ticks={want} ok ({side})")
+        elif self.delay_ticks:
+            raise RuntimeError(
+                f"server started with --delay-ticks {self.delay_ticks} but {side.parent} "
+                f"has no hwaware.json (stock checkpoint?)")
 
     def SendPolicyInstructions(self, request, context):  # noqa: N802
         """Let upstream load the policy + processors, then rebind the forward pass.
@@ -238,6 +279,7 @@ class FPGAPolicyServer(PolicyServer):
         normalization buffers, the baked-in rename map and the tokenizer. We only take
         over afterwards.
         """
+        self._check_hwaware(request)
         out = super().SendPolicyInstructions(request, context)
 
         policy = getattr(self, "policy", None)
@@ -313,6 +355,13 @@ def main():
                          "path. Pair with --policy_device=cuda on the robot_client, since "
                          "the client's device is what the pre/post processors are built "
                          "against.")
+    ap.add_argument("--variant", default=os.environ["VERAPULSE_VARIANT"],
+                    help="verapulse_test variant (smolvla | smolvla_qg | smolvla_lid | "
+                         "smolvla_lid_qg); resolved before import, listed here for --help")
+    ap.add_argument("--delay-ticks", type=int, default=0,
+                    help="hardware-aware stamp offset: chunk index i -> timestep "
+                         "t_obs + delay + i. Must equal the checkpoint's hwaware.json "
+                         "delay_ticks (27 for smolvla_lid_qg).")
     ap.add_argument("--engines", default="8", metavar="N|max")
     ap.add_argument("--vis-engines", type=int, default=None)
     ap.add_argument("--prefix-engines", type=int, default=None)
@@ -339,7 +388,9 @@ def main():
     import grpc
     from lerobot.transport import services_pb2_grpc
 
-    server_impl = FPGAPolicyServer(cfg, backend)
+    server_impl = FPGAPolicyServer(cfg, backend, delay_ticks=args.delay_ticks)
+    if args.delay_ticks:
+        print(f"[server] hardware-aware: chunk index i -> timestep t_obs + {args.delay_ticks} + i")
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
     services_pb2_grpc.add_AsyncInferenceServicer_to_server(server_impl, server)
     server.add_insecure_port(f"{cfg.host}:{cfg.port}")
