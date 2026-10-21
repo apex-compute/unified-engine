@@ -135,40 +135,12 @@ That is a real cross-engine reduction and it is deliberately NOT hidden --
   it costs nothing at runtime, but it does cost DRAM: the down-projection
   weight is stored sliced instead of whole.
 
-BARRIER = SYMMETRIC RENDEZVOUS
-------------------------------
-The ISA's only cross-engine primitive is a 1-bit per-engine flag with
-SET / CLEAR / CHECK, where CHECK spin-waits for ``== 1`` (no wait-for-zero, no
-DRAM-load + conditional branch, so a monotone phase-counter barrier is not
-expressible). The shape that provably RE-ARMS inside one instruction stream is
-the symmetric rendezvous validated by ``flag_rendezvous_repeat_test`` in
-user_hw_test.py (27 rounds, exact payloads)::
-
-    per engine:  FLAG_SET ; FLAG_CHECK(every other engine) ; <margin> ; FLAG_CLEAR
-
-Every engine both signals and waits, so an asymmetric "primary sets go /
-workers wait" scheme -- which cannot re-arm without a stale-1 window -- is not
-used here. CLEAR placement is the delicate part and cuts both ways:
-
-  * CLEAR too early -> the partner misses our SET -> hang.
-  * CLEAR too late  -> the partner's NEXT rendezvous sees our stale SET ->
-                       it races ahead and reads data we have not written.
-
-The proven test buys margin by putting CLEAR one DMA after the CHECK. This
-module emits ``barrier_margin_nops`` NOPs (default 32) between CHECK and CLEAR
-for the same purpose; the window on the other side is a whole region body or a
-whole single-engine region, i.e. orders of magnitude larger. Multi-region
-programs are therefore supported directly -- see
-``sharded_scheduler_multi_region_test``.
-
-FULL-DUPLEX (FOUR-PHASE) RENDEZVOUS -- RECOMMENDED FOR NEW CODE
----------------------------------------------------------------
-The paragraph above describes the ISA AS IT WAS. It has since grown
-``FLAG_MODE_CHECK_CLEAR`` (spin-wait for ``== 0``), so "wait-for-zero is not
-expressible" is no longer true, and the NOP margin it forced is no longer the
-only option. :meth:`MultiEngineScheduler.release` / :meth:`~.join` implement
-the shape that replaces it -- an ASYMMETRIC master/worker handshake in which
-every flag EDGE is acknowledged before the next edge in that direction::
+RENDEZVOUS = THE FOUR-PHASE MASTER/WORKER ROUND (the only one)
+----------------------------------------------------------------
+The ISA's only cross-engine primitive is a 1-bit per-engine flag with SET /
+CLEAR / CHECK_SET (spin until ``== 1``) / CHECK_CLEAR (spin until ``== 0``).
+Every rendezvous this module emits is one ROUND of an asymmetric handshake in
+which every flag EDGE is acknowledged before the next edge in that direction::
 
     master:  SET | work | CHECK_SET(all W) | CLEAR | CHECK_CLEAR(all W)
     worker:  CHECK_SET(0) | work | SET     | CHECK_CLEAR(0) | CLEAR
@@ -181,41 +153,44 @@ every flag EDGE is acknowledged before the next edge in that direction::
 The master cannot reach the next round's SET without having seen every worker
 CLEAR (4), so a stale worker flag can never satisfy its CHECK_SET; a worker
 cannot reach its next CHECK_SET without having seen the master CLEAR (3), so a
-stale master flag can never release it twice. That is a CORRECTNESS ARGUMENT,
-not a timing margin: it needs no delay, and it does not care how uneven the
-shards are or how little work the master has between rounds.
+stale master flag can never release it twice; and no level is dropped before
+the side waiting on it has seen it. That is a CORRECTNESS ARGUMENT, not a
+timing margin: it holds however uneven the shards are, however little work
+sits between rounds, and wherever an i-cache refill stalls an engine.
 
-WHY THIS MATTERS AS THE ENGINE COUNT GROWS. The margin-based barrier couples
-two bounds that squeeze from opposite directions::
+How the API maps onto rounds:
 
-    worker completion skew  <  margin  <  the master's next-round work
+  * :meth:`~.release` / :meth:`~.join` (master) and
+    :meth:`~.begin_worker_round` / :meth:`~.end_worker_round` (worker) emit the
+    two halves directly; :meth:`~.emit_worker_program` builds persistent worker
+    programs from them.
+  * A REGION (:meth:`~.sharded_region` and friends) is one round wrapped around
+    the body: OPEN at entry, CLOSE at exit (``join=True``). CLOSE is a full
+    fence. OPEN only orders the master's earlier work before the workers' body,
+    so if any worker emitted a data-moving instruction outside a round since the
+    last full fence, the entry first emits a standalone round (see
+    ``_region_enter``). ``join=False`` leaves the round open and the next region
+    runs inside it with NO rendezvous ("stay in this lane"): use it only when the
+    next region reads nothing another engine wrote.
+  * :meth:`~.barrier` is a full fence on every engine: it closes an open round,
+    or emits a standalone round (no work in it). :meth:`~.reduce_add` opens with
+    one. :meth:`~.barrier_slice` is one engine's share of a standalone round, for
+    models that emit each engine's stream separately.
 
-The right-hand side SHRINKS as cores are added, because the master's own shard
-gets smaller. Measured on gemma3-1B decode: the margin scheme passed at 2
-engines and failed at 4 and 8 -- silently, as finite-but-wrong logits, because
-a fast worker re-read its own round's still-asserted release and ran the next
-round against activations the master had not produced yet. The four-phase
-handshake decouples them entirely and was verified on hardware at 8 engines.
-
-Both shapes are available and both are supported. Choose by TOPOLOGY, not by
-preference:
-
-  * :meth:`~.release` / :meth:`~.join` -- master/worker. The master emits into
-    the model's own stream and the workers run their own persistent program
-    (see :meth:`~.emit_worker_program`). O(N) checks on the master, exactly one
-    on each worker. This is the recommended shape for anything new.
-  * :meth:`~.barrier` -- symmetric, all engines emitted in lockstep by one
-    region body. Still the right primitive for :meth:`~.sharded_region` and
-    friends, and still the default for existing callers. Pass
-    ``handshake="four_phase"`` to the constructor to get the margin-free
-    mechanism under the SAME symmetric contract; ``"nops"`` (the default)
-    keeps the exact instruction stream the current models are validated
-    against.
-
-THE TWO SHAPES DO NOT INTEROPERATE INSIDE ONE PROGRAM. A master sitting in
-``join()`` while a worker sits in a symmetric ``barrier()`` deadlocks, and
-FLAG_CHECK has no timeout. The scheduler therefore LATCHES its rendezvous mode
-on first use and refuses a mix (see ``_latch_rendezvous``).
+THE SYMMETRIC BARRIER WAS REMOVED. It was ``SET ; CHECK(every other engine) ;
+<NOP margin> ; CLEAR`` on every engine (and a ``"four_phase"`` variant that
+replaced the margin with ``CLEAR ; CHECK_CLEAR(others)``). Both rest on timing.
+The margin couples two bounds -- completion skew < margin < the partner's work
+before its next barrier -- and an engine with no work between two barriers
+reuses a partner's stale SET as soon as the partner stalls inside its margin.
+That stopped being hypothetical with andromeda #1414, which made in-line jumps
+i-cache hits: 16 KiB line refills moved into barrier margins, and the 2-engine
+pi05 and verapulse denoise programs hung on the 10-20 kintex7 nightly (the
+worker ran one barrier ahead and halted; the primary waited in CHECK_SET for
+ever). The symmetric four-phase variant still lets a partner CLEAR before an
+engine stalled between its SET and CHECK_SET has looked. The margin scheme had
+already failed gemma3-1B decode at 4 and 8 engines. ``handshake="nops"`` and
+``region_rendezvous="symmetric"`` are now errors.
 """
 
 from __future__ import annotations
@@ -231,6 +206,11 @@ from typing import Callable, Optional
 
 import user_dma_core
 from user_dma_core import UnifiedEngine
+
+# Identifies the rendezvous shape baked into compiled multi-engine programs.
+# Models that cache program bins record it and recompile a set that lacks it, so
+# no program built with the removed symmetric barrier is ever replayed.
+RENDEZVOUS_SIG = "master_worker-round-v1"
 
 
 class TensorRole(Enum):
@@ -2541,14 +2521,13 @@ class MultiEngineScheduler:
                  col_align: int = COL_ALIGN,
                  split_mode: str = "even",
                  allow_unaligned_rows: bool = False,
-                 barrier_margin_nops: int = 32,
                  allow_more_than_two_engines: bool = False,
                  workers: Optional[list] = None,
                  worker_map: str = "legacy",
                  worker_arena: Optional[tuple] = None,
                  arena: Optional[PrivateArena] = None,
-                 handshake: str = "nops",
-                 region_rendezvous: str = "symmetric",
+                 handshake: str = "four_phase",
+                 region_rendezvous: str = "master_worker",
                  verbose: bool = False):
         assert num_engines >= 1, f"num_engines must be >= 1, got {num_engines}"
         # ENGINE-COUNT GATE. This used to be an unconditional opt-in ("the device
@@ -2580,53 +2559,39 @@ class MultiEngineScheduler:
         self.col_align = col_align
         self.split_mode = split_mode
         self.allow_unaligned_rows = allow_unaligned_rows
-        self.barrier_margin_nops = barrier_margin_nops
 
-        # RENDEZVOUS MECHANISM for the symmetric barrier():
-        #   "nops"       -- SET / CHECK(others) / N NOPs / CLEAR. The original, and
-        #                   still the default so existing programs keep the exact
-        #                   instruction stream they are validated against.
-        #   "four_phase" -- SET / CHECK_SET(others) / CLEAR / CHECK_CLEAR(others).
-        #                   Same symmetric contract, no timing margin. Strictly more
-        #                   robust; ``barrier_margin_nops`` is ignored in this mode.
-        #   "host_segmented" -- legacy-build compatibility for master/worker
-        #                   programs. Each round ends in HALT after SET/CHECK_SET;
-        #                   the host clears all flags and relaunches the next segment.
-        #                   This never emits CHECK_CLEAR, which older FPGA images do
-        #                   not implement. It is valid only with master_worker regions.
-        assert handshake in ("nops", "four_phase", "host_segmented"), \
-            ("handshake must be 'nops', 'four_phase', or 'host_segmented', "
-             f"got {handshake!r}")
-        self.handshake = handshake
-
-        # HOW A REGION SYNCHRONISES. The region API (sharded_region,
-        # col_sharded_region, k_sharded_region, head_sharded_region) is unchanged
-        # in shape either way -- one body replayed per engine -- but the
-        # rendezvous around it has two implementations:
-        #
-        #   "symmetric"    (default, and what every existing caller gets): an
-        #       all-to-all barrier at region entry and again at exit. Each engine
-        #       waits on all N-1 others, twice per region: O(N^2) checks, and the
-        #       re-arm rests on a NOP margin unless handshake="four_phase".
-        #
-        #   "master_worker": ONE four-phase round WRAPPED AROUND the body --
-        #       master SET at entry, join at exit; workers wait at entry, signal at
-        #       exit. O(N) checks on the master and exactly one on each worker,
-        #       half as many rendezvous, and every flag edge is acknowledged, so it
-        #       needs no timing margin at any engine count.
-        #
-        # The default is "symmetric" ON PURPOSE: it emits the identical
-        # instruction stream those models are validated against, so opting in is
-        # a per-model decision, not a library-wide change.
-        assert region_rendezvous in ("symmetric", "master_worker"), (
-            f"region_rendezvous must be 'symmetric' or 'master_worker', "
-            f"got {region_rendezvous!r}")
-        self.region_rendezvous = region_rendezvous
-        if handshake == "host_segmented" and region_rendezvous != "master_worker":
+        # EVERY RENDEZVOUS IS THE FOUR-PHASE MASTER/WORKER ROUND (module docstring,
+        # "RENDEZVOUS"). ``handshake`` only chooses how a round re-arms:
+        #   "four_phase"     -- CLEAR / CHECK_CLEAR inside the program (default).
+        #   "host_segmented" -- legacy-build compatibility (qwen2.5_omni_7b on the
+        #                       E7-era U55 image): each round ends in HALT after
+        #                       SET/CHECK_SET and the host clears the flags and
+        #                       relaunches the next segment. Those images have no
+        #                       CHECK_CLEAR.
+        # The symmetric barriers ("nops": SET / CHECK / NOP margin / CLEAR, and the
+        # symmetric "four_phase" variant) are gone: both rest on a timing window.
+        if handshake == "nops":
             raise ValueError(
-                "handshake='host_segmented' requires "
-                "region_rendezvous='master_worker'")
+                "handshake='nops' (the symmetric NOP-margin barrier) was removed: it "
+                "breaks when an i-cache refill lands inside the margin. Every "
+                "rendezvous is now the four-phase master/worker round; drop the "
+                "argument.")
+        if handshake not in ("four_phase", "host_segmented"):
+            raise ValueError(
+                f"handshake must be 'four_phase' or 'host_segmented', got {handshake!r}")
+        self.handshake = handshake
+        # Kept as an argument only so existing callers that spell out the
+        # master/worker choice keep working; there is no other shape any more.
+        if region_rendezvous != "master_worker":
+            raise ValueError(
+                f"region_rendezvous={region_rendezvous!r}: the symmetric region "
+                "rendezvous was removed. Regions are always wrapped in one "
+                "master/worker round; drop the argument.")
+        self.region_rendezvous = "master_worker"
         self._mw_round_open = False
+        # Worker data-moving instructions emitted since the last full fence (see
+        # _region_enter): [scanned capture length, dirty] per worker.
+        self._fence_scan: list[list] = []
         # Latched by the first rendezvous emitted; see _latch_rendezvous().
         self._rendezvous_mode: Optional[str] = None
         self.verbose = verbose
@@ -3383,13 +3348,13 @@ class MultiEngineScheduler:
         else:
             self._host_segment_starts = []
             self._host_clear_program_addrs = None
-        # THE RENDEZVOUS LATCH IS PER PROGRAM. What must agree on a topology is
-        # the pair of streams that RUN TOGETHER; two programs compiled on one
-        # scheduler and launched separately never rendezvous with each other. A
-        # model that row-shards its prefill through sharded_region (symmetric) and
-        # then master/worker-shards its decode on the same engines is doing
-        # nothing wrong, so each begin_program() starts the choice afresh.
+        # Per-program state: the latch (see _latch_rendezvous), the open-round flag
+        # and the fence bookkeeping all describe streams that RUN TOGETHER, so each
+        # begin_program() starts them afresh. Flags are cleared by preclear_flags()
+        # before the first launch, which is the program's initial full fence.
         self._rendezvous_mode = None
+        self._mw_round_open = False
+        self._fence_scan = [[0, False] for _ in self.workers]
         self._program_open = True
 
     def abort_program(self) -> None:
@@ -3408,6 +3373,7 @@ class MultiEngineScheduler:
         self._program_open = False
         self._in_region = False
         self._mw_round_open = False
+        self._fence_scan = []
         self._rendezvous_mode = None
         self._worker_prog_addrs = []
         self._host_segment_starts = []
@@ -3433,10 +3399,9 @@ class MultiEngineScheduler:
         prepared: list[tuple[UnifiedEngine, int, bytes]] = []
         try:
             if self._mw_round_open:
-                # The last region closed with join=False. In the symmetric shape that
-                # is harmless (no trailing barrier); here it would leave the master's
-                # release standing with no join, and every worker waiting on a close
-                # that never comes. Shut the round before the HALT.
+                # The last region closed with join=False: the master's release is
+                # still standing with no join, and every worker would wait on a
+                # close that never comes. Shut the round before the HALT.
                 self._region_exit(join=True)
 
             # Serialize and bounds-check EVERY worker before the first DMA. An
@@ -3641,18 +3606,25 @@ class MultiEngineScheduler:
                 for i, ue in enumerate(self.engines)]
 
     def end_sharded(self, join: bool = True) -> None:
-        """Close the region; ``join`` emits the exit rendezvous so the primary
-        (and every worker) sees all rows before anything downstream reads them.
-        Pass ``join=False`` only if you emit :meth:`barrier` yourself later."""
+        """Close the region. ``join=True`` closes its round, which is a full fence:
+        every engine has finished the body before any engine goes on. ``join=False``
+        leaves the round open ("stay in this lane"): the next region runs inside the
+        SAME round with no rendezvous, so it may only read what its own engine wrote.
+        :meth:`barrier` and :meth:`reduce_add` close an open round."""
         assert self._in_region, "end_sharded() without begin_sharded()"
         self._in_region = False
         self._region_exit(join)
 
     def _region_enter(self) -> None:
-        """Rendezvous at region ENTRY, in whichever shape this scheduler uses."""
-        if self.region_rendezvous == "symmetric":
-            self.barrier()
-            return
+        """Open the region's round (or stay in the round a join=False region left open).
+
+        A round's OPEN orders only the MASTER's earlier work before the workers' body
+        (workers wait for its SET). It does not make the master, or another worker,
+        wait for a worker's earlier work. Work a worker did OUTSIDE any round since the
+        last full fence -- a per-engine loop emitted between regions, the parallel adds
+        of a reduce -- is therefore fenced first with a standalone round, so a region
+        body may read whatever any engine wrote before the region, as it always could.
+        """
         if self.num_engines == 1:
             return
         if self._mw_round_open:
@@ -3660,102 +3632,117 @@ class MultiEngineScheduler:
             # lane": the round it opened is still the current one, and opening a
             # second SET inside it would be a protocol error, not a barrier.
             return
+        if self._workers_dirty():
+            self._standalone_round()
         self.release()
         for idx in self.worker_indices():
             self.begin_worker_round(idx)
         self._mw_round_open = True
 
     def _region_exit(self, join: bool) -> None:
-        """Rendezvous at region EXIT, or defer it when the caller passed join=False."""
-        if self.region_rendezvous == "symmetric":
-            if join:
-                self.barrier()
-            return
+        """Close the region's round, or leave it open when the caller passed join=False."""
         if self.num_engines == 1 or not join:
             return
+        self._close_round()
+
+    def _close_round(self) -> None:
+        """Close the open round: every worker signals done and waits for the master's
+        CLEAR; the master waits for every worker, CLEARs, and waits for every worker
+        to re-arm. A full fence."""
+        assert self._mw_round_open, "no open round to close"
         for idx in self.worker_indices():
             self.end_worker_round(idx)
         self.join()
         self._mw_round_open = False
+        self._mark_fenced()
+
+    def _standalone_round(self) -> None:
+        """A round with no work in it: a full fence between everything before it and
+        everything after it, on every engine."""
+        self.release()
+        for idx in self.worker_indices():
+            self.begin_worker_round(idx)
+            self.end_worker_round(idx)
+        self.join()
+        self._mark_fenced()
+
+    # Instruction types that move data (DMA / engine ops). Register, flag, jump and
+    # PBI-pointer updates never touch DRAM, so they cannot create a cross-engine
+    # hazard and do not need a fence.
+    _DATA_INST_TYPES = (user_dma_core.INSTRUCTION_UE_OP, user_dma_core.INSTRUCTION_UE_PBI)
+
+    def _workers_dirty(self) -> bool:
+        """True if any worker emitted a data-moving instruction since the last full
+        fence. Scans each worker's capture incrementally (amortised O(program))."""
+        if len(self._fence_scan) != len(self.workers):
+            self._fence_scan = [[0, True] for _ in self.workers]
+        dirty = False
+        for st, w in zip(self._fence_scan, self.workers):
+            buf = w.capture_buffer or []
+            if len(buf) < st[0]:
+                # The capture was drained or restarted under us: be conservative.
+                st[0], st[1] = 0, True
+            if not st[1]:
+                for inst in buf[st[0]:]:
+                    if ((inst.words[0] >> 8) & 0xF) in self._DATA_INST_TYPES:
+                        st[1] = True
+                        break
+            st[0] = len(buf)
+            dirty = dirty or st[1]
+        return dirty
+
+    def _mark_fenced(self) -> None:
+        self._fence_scan = [[len(w.capture_buffer or []), False] for w in self.workers]
 
     def _latch_rendezvous(self, kind: str) -> None:
-        """Pin this scheduler to ONE rendezvous topology and refuse a mix.
-
-        ``barrier()`` is symmetric -- every engine's stream is emitted in lockstep by
-        one region body -- while ``release()``/``join()`` are asymmetric, with the
-        workers running their own persistent program. Their instruction sequences are
-        not compatible: a master waiting in ``join()`` for a worker that is sitting in
-        a symmetric ``barrier()`` waits forever, and FLAG_CHECK has NO TIMEOUT, so the
-        failure is an unkillable hang rather than an error. Catching it at emit time is
-        the only place it can be caught cheaply.
+        """Refuse to emit a round on a host-segmented program where the HALT bookkeeping
+        cannot follow it. Kept as the single choke point every rendezvous emitter calls
+        (there is only one topology now, so it no longer has a second kind to refuse).
 
         Scope: ONE PROGRAM. :meth:`begin_program` clears the latch -- see there.
         """
-        if self._rendezvous_mode is None:
-            self._rendezvous_mode = kind
-            return
-        assert self._rendezvous_mode == kind, (
-            f"this scheduler already emitted a {self._rendezvous_mode!r} rendezvous and "
-            f"cannot also emit {kind!r}. The symmetric barrier() and the asymmetric "
-            f"release()/join() pair do not interoperate inside one program -- mixing "
-            f"them deadlocks with no timeout. Use one topology per scheduler.")
+        assert kind == "master_worker", f"unknown rendezvous kind {kind!r}"
+        self._rendezvous_mode = kind
 
     def barrier(self) -> None:
-        """Symmetric all-engine rendezvous (see module docstring).
+        """All-engine rendezvous: a full fence on every engine.
 
-        Every engine raises its own flag and spin-waits on every other engine's. How it
-        then RE-ARMS depends on ``handshake``, chosen at construction:
+        With a round open (the previous region ended ``join=False``) it CLOSES that
+        round, which is the fence; otherwise it emits a standalone round::
 
-          ``"nops"`` (default) -- wait out ``barrier_margin_nops`` NOPs, then CLEAR.
-              The original shape, proven to re-arm by ``flag_rendezvous_repeat_test``.
-              The margin is a TIMING argument: it must exceed the completion skew
-              between engines and stay under the next round's work.
+            master:  SET | CHECK_SET(every worker) | CLEAR | CHECK_CLEAR(every worker)
+            worker:  CHECK_SET(0) | SET | CHECK_CLEAR(0) | CLEAR
 
-          ``"four_phase"`` -- CLEAR, then CHECK_CLEAR every other engine. No margin,
-              because the re-arm is OBSERVED rather than waited out: no engine can
-              leave the barrier until every other engine's flag has been seen to fall,
-              so no engine can carry a stale 1 into the next round. Same symmetric
-              contract, same call, strictly weaker assumptions -- and it does not
-              degrade as engines are added, which the margin does.
-
-        Prefer ``release()``/``join()`` for new master/worker code; this stays the
-        right primitive for region bodies that emit every engine in lockstep.
+        Every flag level is held until the other side has observed it, so the round is
+        correct whatever the skew between engines, however little work sits between two
+        barriers, and wherever i-cache refills land -- there is no timing margin.
         """
         assert not self._in_region, "barrier() inside an open sharded region"
         if self.num_engines == 1:
             return   # exact passthrough: not one extra instruction
-        if self.region_rendezvous == "master_worker":
-            # A standalone barrier is one complete round with no work inside it:
-            # the master opens and closes, every worker waits and acknowledges.
-            # Same meeting point, asymmetric implementation -- so a model can opt
-            # in without touching its explicit barrier() call sites.
-            assert not self._mw_round_open, (
-                "barrier() inside an open master/worker round: the region before "
-                "it closed with join=False, so the round is still current")
-            self.release()
-            for idx in self.worker_indices():
-                self.begin_worker_round(idx)
-                self.end_worker_round(idx)
-            self.join()
+        if self._mw_round_open:
+            self._close_round()
             return
-        self._latch_rendezvous("symmetric")
-        for i, ue in enumerate(self.engines):
-            ue.generate_instruction_flag_set()
-            for j in range(self.num_engines):
-                if j != i:
-                    ue.generate_instruction_flag_check_set(target_engine_idx=j)
-            if self.handshake == "four_phase":
-                ue.generate_instruction_flag_clear()
-                for j in range(self.num_engines):
-                    if j != i:
-                        ue.generate_instruction_flag_check_clear(target_engine_idx=j)
-            else:
-                for _ in range(self.barrier_margin_nops):
-                    ue.generate_instruction_nop()
-                ue.generate_instruction_flag_clear()
+        self._standalone_round()
+
+    def barrier_slice(self, engine_idx: int) -> None:
+        """ONE engine's share of a standalone :meth:`barrier` round, for models that
+        emit each engine's program as a separate stream (pi05 / verapulse encoder and
+        prefix bodies) instead of replaying a body across engines. Every engine's stream
+        must emit the same number of slices in the same order -- exactly as with
+        :meth:`barrier`, which is this for all engines at once."""
+        if self.num_engines == 1:
+            return
+        assert not self._mw_round_open, "barrier_slice() inside an open round"
+        if engine_idx == 0:
+            self.release()
+            self.join()
+        else:
+            self.begin_worker_round(engine_idx)
+            self.end_worker_round(engine_idx)
 
     # ======================================================================
-    # NEW: asymmetric master/worker rendezvous -- RECOMMENDED (see docstring)
+    # Master/worker round halves -- every rendezvous above is built from these
     # ======================================================================
     def release(self) -> None:
         """MASTER, phase 1 of a round: raise the release flag and let the workers run.

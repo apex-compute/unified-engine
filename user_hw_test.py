@@ -1554,7 +1554,11 @@ def unified_attention_test(batch: int = 256, aligned_seq_len: int = 256, head_di
             f"dynamic_addr={dynamic_addr}"
         )
 
-        q_scaled = q * (1.0 / math.sqrt(head_dim))
+        # Match the BF16 coefficient programmed by the core's default scaling
+        # and the runtime scale register. Reinterpret its bits for the reference.
+        reference_scale_bits = ue.float_to_bf16(1.0 / math.sqrt(head_dim))
+        reference_scale = torch.tensor(reference_scale_bits, dtype=torch.uint16).view(torch.bfloat16)
+        q_scaled = q * reference_scale
         scores = q_scaled @ k.t()
         scores = scores + bias
         probs = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
@@ -11341,48 +11345,61 @@ def isa_icache_multiline_test() -> None:
 
 
 def isa_icache_miss_conditions_test() -> None:
-    """One static TRACE that hits both i-cache ``RAM_DMA`` paths.
+    """One static TRACE that covers both i-cache ``RAM_DMA`` paths and a jump hit.
 
-    1. **icache empty** — start of program, then ``FETCH`` ``inst_ram_empty`` after
-       exactly ``INST_LINE_WORDS`` NOPs (sequential next-line DMA).
-    2. **absolute jump** — ``JUMP_MODE_ABSOLUTE`` after that line, which always
-       enters ``STATE_RAM_DMA_START`` even when the target is on the same line.
+    1. **icache empty**: start of program, then ``FETCH`` ``inst_ram_empty``
+       after exactly ``INST_LINE_WORDS`` NOPs (sequential next-line DMA). The
+       second line then starts at the first jump.
+    2. **jump hit**: ``JUMP_MODE_ABSOLUTE`` to a target on that resident line.
+       Since #1326 the read pointer moves and there is no refill.
+    3. **absolute jump** (miss): ``JUMP_MODE_ABSOLUTE`` to a HALT placed beyond
+       the resident line, which refills from the target.
 
-    Relative jumps are not used. ``pc_reg`` is the executed count (the 64 B
-    align NOP between the jump and HALT is skipped).
+    Relative jumps are not used. ``pc_reg`` is the executed count; the 64 B
+    alignment NOPs and the filler that pushes the HALT off the line are skipped.
     """
     align = 2 * INSTRUCTION_SIZE_BYTES
     ue = UnifiedEngine()
     program_dram_addr = ue.get_program_dram_addr()
 
+    def _pad_to_align() -> None:
+        while (
+            program_dram_addr + ue.capture_count * INSTRUCTION_SIZE_BYTES
+        ) % align != 0:
+            ue.generate_instruction_nop()
+
     ue.start_capture()
     for _ in range(INST_LINE_WORDS):
         ue.generate_instruction_nop()
-    jump_idx = ue.capture_count
+    hit_jump_idx = ue.capture_count  # first instruction of the second line
     ue.generate_instruction_jump_abs(0)
-    while (
-        program_dram_addr + ue.capture_count * INSTRUCTION_SIZE_BYTES
-    ) % align != 0:
+    _pad_to_align()
+    miss_jump_idx = ue.capture_count  # on the same line: the hit target
+    ue.generate_instruction_jump_abs(0)
+    # Never executed: pushes the HALT past the line that starts at hit_jump_idx.
+    while ue.capture_count < hit_jump_idx + INST_LINE_WORDS:
         ue.generate_instruction_nop()
+    _pad_to_align()
     halt_idx = ue.capture_count
     ue.generate_instruction_halt()
     ue.stop_capture()
 
-    halt_word_addr = ue_35bit_addr_shifter(
-        program_dram_addr + halt_idx * INSTRUCTION_SIZE_BYTES
-    )
-    ue._patch_jump_immediate(jump_idx, halt_word_addr)
+    def _word_addr(idx: int) -> int:
+        return ue_35bit_addr_shifter(program_dram_addr + idx * INSTRUCTION_SIZE_BYTES)
+
+    ue._patch_jump_immediate(hit_jump_idx, _word_addr(miss_jump_idx))
+    ue._patch_jump_immediate(miss_jump_idx, _word_addr(halt_idx))
 
     ue.write_captured_instructions_to_dram(program_dram_addr)
     ue.allocate_program_dram(ue.get_capture_instruction_size_bytes())
     ue.start_execute_from_dram(program_dram_addr)
     ue.wait_queue(30.0)
 
-    expected_pc = INST_LINE_WORDS + 2  # NOPs + JUMP_ABS + HALT (align NOP skipped)
+    expected_pc = INST_LINE_WORDS + 3  # NOPs + hit JUMP_ABS + miss JUMP_ABS + HALT
     _, pc_reg = ue.report_timing_and_instruction_count()
     assert pc_reg == expected_pc, (
         f"isa_icache_miss_conditions_test: pc_reg={pc_reg} != {expected_pc} "
-        f"(jump_idx={jump_idx}, halt_idx={halt_idx})"
+        f"(hit_jump_idx={hit_jump_idx}, miss_jump_idx={miss_jump_idx}, halt_idx={halt_idx})"
     )
 
     ticks = _read_ue_trace_ticks(ue, pc_reg, "isa_icache_miss_conditions")
@@ -11391,24 +11408,31 @@ def isa_icache_miss_conditions_test() -> None:
     for i in range(trace_count):
         ue.write_reg32(UE_TRACE_BRAM_ADDR, i)
         raw.append(int(ue.read_reg32(UE_TRACE_BRAM_DATA)))
+    miss_fill_at = INST_LINE_WORDS + 2  # retires before the miss refill: NOPs + both jumps
     fills = _assert_icache_fill_sites(
         ticks,
         raw,
-        [0, INST_LINE_WORDS, INST_LINE_WORDS + 1],
+        [0, INST_LINE_WORDS, miss_fill_at],
         "isa_icache_miss_conditions_test",
     )
     retires_before_each_fill = [int(ev.get("retires_before", -1)) for ev in fills]
     reasons: list[str]
     if fills:
+        # The hit jump must not refill: exactly start, sequential and miss fills.
+        assert retires_before_each_fill == [0, INST_LINE_WORDS, miss_fill_at], (
+            f"isa_icache_miss_conditions_test: fills at retires_before="
+            f"{retires_before_each_fill}, expected [0, {INST_LINE_WORDS}, {miss_fill_at}] "
+            f"(a fill at {INST_LINE_WORDS + 1} means the in-line jump refilled)"
+        )
         pc_rows = (
             [{"jump_mode": "", "taken": ""}] * INST_LINE_WORDS
-            + [{"jump_mode": "ABSOLUTE", "taken": "taken"}]
+            + [{"jump_mode": "ABSOLUTE", "taken": "taken"}] * 2
             + [{"jump_mode": "", "taken": ""}]
         )
-        reasons = [_queue_loading_reason(ev, pc_rows) for ev in fills[:3]]
+        reasons = [_queue_loading_reason(ev, pc_rows) for ev in fills]
         assert reasons == ["icache empty", "icache empty", "absolute jump"], (
             f"isa_icache_miss_conditions_test: fill reasons {reasons} "
-            f"(retires_before={retires_before_each_fill[:3]})"
+            f"(retires_before={retires_before_each_fill})"
         )
     else:
         reasons = ["icache empty", "icache empty", "absolute jump"]
@@ -11421,7 +11445,8 @@ def isa_icache_miss_conditions_test() -> None:
     )
     record_test(
         "isa_icache_miss_conditions",
-        f"fills={len(fills)}, empty={INST_LINE_WORDS}, abs={INST_LINE_WORDS + 1}",
+        f"fills={len(fills)}, empty={INST_LINE_WORDS}, hit={INST_LINE_WORDS + 1}, "
+        f"abs_miss={miss_fill_at}",
     )
     ue.clear_capture_buffer()
     ue.reset_inst_ptr_counter()
