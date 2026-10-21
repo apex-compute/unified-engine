@@ -5977,9 +5977,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                                     OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off,
                                                     gpr_M_reg=self.gpr_seq_len)
             if not self.engine_slave:
-                # Master: set -> clear -> workload -> check | set -> clear -> workload -> check |
-                self.generate_instruction_flag_set()
-                self.generate_instruction_flag_clear()
+                # Master: one master/worker round per region (SET | work | CHECK_SET | CLEAR | CHECK_CLEAR)
+                if self.dual_engine:
+                    # master/worker round OPEN: the slave waits in CHECK_SET(0).
+                    self.generate_instruction_flag_set()
+                else:
+                    self.generate_instruction_flag_set()
+                    self.generate_instruction_flag_clear()
                 # Q projection: N = cur_q_size (actual per-layer Q output dim)
                 total_flops += self.matmat_mul_core(M=seq_len_engine0, K=self.vector_length, N=cur_q_size,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
@@ -6021,11 +6025,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                         self.rms_norm_core(0x10000, 0x10000, cur_k_size)  # no gamma
                         self.sram_to_accelerator_memory(0x10000, v_cache_base + t * self.k_size, cur_k_size)
                 if self.dual_engine:
-                    self.generate_instruction_flag_check(target_engine_idx=1)
+                    # round CLOSE: slave done -> CLEAR -> slave re-armed.
+                    self.generate_instruction_flag_check_set(target_engine_idx=1)
+                    self.generate_instruction_flag_clear()
+                    self.generate_instruction_flag_check_clear(target_engine_idx=1)
             else:
-                # Slave(run first): check -> clear -> workload -> set | check -> clear -> workload -> set |
-                self.generate_instruction_flag_check(target_engine_idx=0)
-                self.generate_instruction_flag_clear()
+                # Slave(run first): CHECK_SET(0) | work | SET | CHECK_CLEAR(0) | CLEAR per region
+                self.generate_instruction_flag_check_set(target_engine_idx=0)
                 total_flops += self.matmat_mul_core(M=seq_len_engine1, K=self.vector_length, N=cur_q_size,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM + seq_len_engine0 * self.vector_length * self.bytes_per_element,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off,
@@ -6053,7 +6059,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off,
                     gpr_M_reg=self.gpr_seq_len,
                     )
+                # round: done -> wait for the master's CLEAR -> re-arm.
                 self.generate_instruction_flag_set()
+                self.generate_instruction_flag_check_clear(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
             if not self.engine_slave:
                 # Q norm always needed (Q is always computed fresh)
                 total_flops += self.rms_norm_core_dram(M=seq_len * self.group_size, N=cur_head_dim, A_DRAM_ADDR=self.LAYER0_Q_DRAM,
@@ -6156,9 +6165,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                 )
                 total_flops += int(sum(_fa_result)) if isinstance(_fa_result, (list, tuple)) else int(_fa_result)
             if not self.engine_slave:
-                # Master: set -> clear -> workload -> check | set -> clear -> workload -> check |
-                self.generate_instruction_flag_set()
-                self.generate_instruction_flag_clear()
+                # Master: one master/worker round per region (SET | work | CHECK_SET | CLEAR | CHECK_CLEAR)
+                if self.dual_engine:
+                    # master/worker round OPEN: the slave waits in CHECK_SET(0).
+                    self.generate_instruction_flag_set()
+                else:
+                    self.generate_instruction_flag_set()
+                    self.generate_instruction_flag_clear()
                 # O projection: INT4, K=cur_q_size
                 total_flops += self.matmat_mul_core(M=seq_len_engine0, K=cur_q_size, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
@@ -6170,11 +6183,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     gpr_M_reg=self.gpr_seq_len,
                     )
                 if self.dual_engine:
-                    self.generate_instruction_flag_check(target_engine_idx=1)
+                    # round CLOSE: slave done -> CLEAR -> slave re-armed.
+                    self.generate_instruction_flag_check_set(target_engine_idx=1)
+                    self.generate_instruction_flag_clear()
+                    self.generate_instruction_flag_check_clear(target_engine_idx=1)
             else:
-                # Slave(run first): check -> clear -> workload -> set | check -> clear -> workload -> set |
-                self.generate_instruction_flag_check(target_engine_idx=0)
-                self.generate_instruction_flag_clear()
+                # Slave(run first): CHECK_SET(0) | work | SET | CHECK_CLEAR(0) | CLEAR per region
+                self.generate_instruction_flag_check_set(target_engine_idx=0)
                 total_flops += self.matmat_mul_core(M=seq_len_engine1, K=cur_q_size, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM + seq_len_engine0 * cur_q_size * self.bytes_per_element,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off,
@@ -6184,7 +6199,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off,
                     gpr_M_reg=self.gpr_seq_len,
                     )
+                # round: done -> wait for the master's CLEAR -> re-arm.
                 self.generate_instruction_flag_set()
+                self.generate_instruction_flag_check_clear(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
             if not self.engine_slave:
                 total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                                 OUTPUT_DRAM_ADDR=self.LAYER0_POST_ATTN_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA + layer_off,
@@ -6197,9 +6215,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                                 OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off,
                                                 gpr_M_reg=self.gpr_seq_len)
             if not self.engine_slave:
-                # Master: set -> clear -> workload -> check | set -> clear -> workload -> check |
-                self.generate_instruction_flag_set()
-                self.generate_instruction_flag_clear()
+                # Master: one master/worker round per region (SET | work | CHECK_SET | CLEAR | CHECK_CLEAR)
+                if self.dual_engine:
+                    # master/worker round OPEN: the slave waits in CHECK_SET(0).
+                    self.generate_instruction_flag_set()
+                else:
+                    self.generate_instruction_flag_set()
+                    self.generate_instruction_flag_clear()
                 total_flops += self.matmat_mul_core(M=seq_len_engine0, K=self.vector_length, N=cur_mlp,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
@@ -6220,11 +6242,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     gpr_M_reg=self.gpr_seq_len,
                     )
                 if self.dual_engine:
-                    self.generate_instruction_flag_check(target_engine_idx=1)
+                    # round CLOSE: slave done -> CLEAR -> slave re-armed.
+                    self.generate_instruction_flag_check_set(target_engine_idx=1)
+                    self.generate_instruction_flag_clear()
+                    self.generate_instruction_flag_check_clear(target_engine_idx=1)
             else:
                 # Slave: check -> clear -> workload -> set | check -> clear -> workload -> set |
-                self.generate_instruction_flag_check(target_engine_idx=0)
-                self.generate_instruction_flag_clear()
+                self.generate_instruction_flag_check_set(target_engine_idx=0)
                 total_flops += self.matmat_mul_core(M=seq_len_engine1, K=self.vector_length, N=cur_mlp,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM + seq_len_engine0 * self.vector_length * self.bytes_per_element,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off,
@@ -6244,16 +6268,23 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off,
                     gpr_M_reg=self.gpr_seq_len,
                     )
+                # round: done -> wait for the master's CLEAR -> re-arm.
                 self.generate_instruction_flag_set()
+                self.generate_instruction_flag_check_clear(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
             if not self.engine_slave:
                 self._emit_sram_eltwise_chunked(
                     "mul", self.LAYER0_MLP_GATE_DRAM, self.LAYER0_MLP_UP_DRAM,
                     self.LAYER0_MLP_MULT_DRAM,
                     seq_len * cur_mlp)
             if not self.engine_slave:
-                # Master: set -> clear -> workload -> check | set -> clear -> workload -> check |
-                self.generate_instruction_flag_set()
-                self.generate_instruction_flag_clear()
+                # Master: one master/worker round per region (SET | work | CHECK_SET | CLEAR | CHECK_CLEAR)
+                if self.dual_engine:
+                    # master/worker round OPEN: the slave waits in CHECK_SET(0).
+                    self.generate_instruction_flag_set()
+                else:
+                    self.generate_instruction_flag_set()
+                    self.generate_instruction_flag_clear()
                 total_flops += self.matmat_mul_core(M=seq_len_engine0, K=cur_mlp, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
@@ -6264,11 +6295,13 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     gpr_M_reg=self.gpr_seq_len,
                     )
                 if self.dual_engine:
-                    self.generate_instruction_flag_check(target_engine_idx=1)
+                    # round CLOSE: slave done -> CLEAR -> slave re-armed.
+                    self.generate_instruction_flag_check_set(target_engine_idx=1)
+                    self.generate_instruction_flag_clear()
+                    self.generate_instruction_flag_check_clear(target_engine_idx=1)
             else:
                 # Slave: check -> clear -> workload -> set | check -> clear -> workload -> set |
-                self.generate_instruction_flag_check(target_engine_idx=0)
-                self.generate_instruction_flag_clear()
+                self.generate_instruction_flag_check_set(target_engine_idx=0)
                 total_flops += self.matmat_mul_core(M=seq_len_engine1, K=cur_mlp, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM + seq_len_engine0 * cur_mlp * self.bytes_per_element,
                     B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off,
@@ -6278,7 +6311,10 @@ class Gemma4_UnifiedEngine(UnifiedEngine):
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off,
                     gpr_M_reg=self.gpr_seq_len,
                     )
+                # round: done -> wait for the master's CLEAR -> re-arm.
                 self.generate_instruction_flag_set()
+                self.generate_instruction_flag_check_clear(target_engine_idx=0)
+                self.generate_instruction_flag_clear()
             if not self.engine_slave:
                 total_flops += self.rms_norm_core_dram(M=seq_len, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                                 OUTPUT_DRAM_ADDR=self.LAYER0_POST_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA + layer_off,

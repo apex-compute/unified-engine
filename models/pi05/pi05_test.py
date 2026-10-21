@@ -1690,7 +1690,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
         [row_offset, row_offset+rows) of the S prefix tokens.
 
         With ne == 1 this is (row_offset, rows) == (0, S), every byte offset is 0,
-        every M is S and _vis_barrier emits nothing -- i.e. byte-for-byte the
+        every M is S and no rendezvous is emitted -- i.e. byte-for-byte the
         historical single-engine stream.
 
         ADDRESSING CONTRACT
@@ -1883,7 +1883,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # (Not needed under shard_primary: nothing reads a peer's rows
                 # before rendezvous #A.)
                 if not shard_primary:
-                    self._vis_barrier(ue, engine_idx, ne)
+                    if ne > 1:
+                        self._prefix_sched.barrier_slice(engine_idx)
 
                 # ---- SINGLE-ENGINE REGION (primary, full S) ------------------
                 # RoPE, the Q permute and the KV-cache staging. Attention itself
@@ -1946,7 +1947,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # PREFIX_ROPE_SHARD the permute and the RoPE are the same engine,
                 # back-to-back, and this barrier is not emitted at all.
                 if rope_shard:
-                    self._vis_barrier(ue, engine_idx, ne)
+                    if ne > 1:
+                        self._prefix_sched.barrier_slice(engine_idx)
 
                 # ---- RoPE + KV staging  [SHARDED over PREFIX_ROPE_SHARD] --------
                 # Every address is pre-offset to THIS engine's row range; _rope_matmul
@@ -2021,7 +2023,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # sharded and already fenced by #1, but the workers must wait here
                 # regardless -- without #A a worker would run layer i's attention
                 # against layer i-1's Q permute.
-                self._vis_barrier(ue, engine_idx, ne)
+                if ne > 1:
+                    self._prefix_sched.barrier_slice(engine_idx)
 
                 # 5. MQA self-attention  [HEAD-SHARDED]
                 self._emit_prefix_attention(ue, engine_idx, ne, layer_idx, S,
@@ -2030,7 +2033,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # ---- RENDEZVOUS #B: the attention permute below reads ALL NH
                 # heads of LAYER0_ATTN_OUT_DRAM, which every engine just wrote a
                 # disjoint slice of (RAW).
-                self._vis_barrier(ue, engine_idx, ne)
+                if ne > 1:
+                    self._prefix_sched.barrier_slice(engine_idx)
 
                 if shard_out_permute:
                     # 6. [ROW-SHARDED] permute attn output (heads, seq, head_dim) ->
@@ -2056,7 +2060,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # wrote itself, and the MLP's #C/#D rendezvous (column-split path)
                 # already fence layer i+1's projections against layer i's readers.
                 if not (shard_out_permute and mlp_col_split):
-                    self._vis_barrier(ue, engine_idx, ne)
+                    if ne > 1:
+                        self._prefix_sched.barrier_slice(engine_idx)
 
                 # 7. output projection + residual  [SHARDED]
                 # (non-aliased: OUT distinct from both inputs -- in-place eltwise is a
@@ -2096,7 +2101,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 if mlp_col_split:
                     # RENDEZVOUS #C: the lanes read ALL S rows of LAYER0_PRE_NORM_DRAM,
                     # which was just written ROW-SHARDED by every engine (RAW).
-                    self._vis_barrier(ue, engine_idx, ne)
+                    if ne > 1:
+                        self._prefix_sched.barrier_slice(engine_idx)
                     lane_ids, lane_M, lane_row, lane_Mreg = [engine_idx], S, 0, prefix_S_reg
                 else:
                     lane_ids, lane_M, lane_row, lane_Mreg = range(lanes), rows, RH, prefix_R_reg
@@ -2130,7 +2136,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                     # written by a different engine (RAW). It is also the WAR fence for
                     # LAYER0_PRE_NORM_DRAM -- without it an engine could race into
                     # layer i+1's ln2 and overwrite rows a peer is still reading here.
-                    self._vis_barrier(ue, engine_idx, ne)
+                    if ne > 1:
+                        self._prefix_sched.barrier_slice(engine_idx)
 
                 # Reduce the lane partials over THIS engine's row shard. Ping-pong
                 # accumulators, last add straight into LAYER0_MLP_DOWN_DRAM: OUT never
@@ -2169,7 +2176,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # loop -- the program ends right after the final HALT. The final
             # rendezvous makes the primary's halt (the only thing the HOST waits on)
             # unreachable until every worker has written its last rows.
-            self._vis_barrier(ue, engine_idx, ne)
+            if ne > 1:
+                self._prefix_sched.barrier_slice(engine_idx)
             if is_primary:
                 self.generate_instruction_halt()
         except _DebugStop:
@@ -2619,28 +2627,6 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # A rendezvous is ~35 instructions against ~1e5 per layer, so the insurance
     # is free. Set False to A/B the single-barrier variant.
     VIS_BARRIER_AFTER_ATTN = True
-
-    @staticmethod
-    def _vis_barrier(ue, engine_idx, num_engines, margin_nops=32):
-        """Emit ONE engine's slice of the symmetric all-engine rendezvous.
-
-        MultiEngineScheduler.barrier() emits into every engine at once, which is
-        wrong here: the encoder body is emitted one COMPLETE engine stream at a
-        time (each engine's program is independent; only the per-stream order
-        matters), so the barrier has to be emitted per stream at the right point
-        in that stream. The shape is exactly scheduler.barrier()'s per-engine
-        slice -- SET / CHECK(every peer) / margin NOPs / CLEAR -- the form proven
-        to RE-ARM by user_hw_test.flag_rendezvous_repeat_test.
-        """
-        if num_engines == 1:
-            return   # exact passthrough: not one extra instruction
-        ue.generate_instruction_flag_set()
-        for j in range(num_engines):
-            if j != engine_idx:
-                ue.generate_instruction_flag_check(target_engine_idx=j)
-        for _ in range(margin_nops):
-            ue.generate_instruction_nop()
-        ue.generate_instruction_flag_clear()
 
     # Per-worker DRAM arena carved out of the PRIMARY's own tensor allocator.
     # Carving it from the model's allocator is the only placement that cannot
@@ -3371,7 +3357,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # HEAD SHARDING CAPS AT NH. Past one head per engine there is nothing
             # left to split (split_heads asserts H >= n), so engines NH..ne-1 own
             # ZERO heads: they emit no attention work, but they still emit EVERY
-            # rendezvous, because the _vis_barrier calls in _emit_prefix_body are
+            # rendezvous, because the barrier_slice calls in _emit_prefix_body are
             # unconditional on the head count. Skipping one on a zero-head engine
             # would deadlock every peer waiting on its flag.
             # Only ATTENTION is capped here. The row split and the RoPE/KV-staging
@@ -3419,8 +3405,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             sched.start_workers(self._denoise_worker_prog_addrs)
         self._execute(self._denoise_prog_addr, label="denoise_loop", timeout=timeout)
         if multi:
-            # The primary retires its halt as soon as the last rendezvous clears; a
-            # worker may still be draining its (write-free) margin NOPs.
+            # The primary retires its halt as soon as the last round closes; a
+            # worker may still be retiring its final CLEAR / HALT.
             for w in sched.workers:
                 w.wait_queue(60.0)
 
@@ -3437,9 +3423,9 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             sched.start_workers(self._prefix_worker_prog_addrs)
         self._execute(self._prefix_prog_addr, label="prefix", timeout=timeout)
         if multi:
-            # The primary retires its halt as soon as the exit rendezvous clears;
-            # a worker may still be draining its (write-free) margin NOPs. Wait
-            # rather than assert-not-busy, which would be flaky.
+            # The primary retires its halt as soon as the exit round closes; a
+            # worker may still be retiring its final CLEAR / HALT. Wait rather
+            # than assert-not-busy, which would be flaky.
             for w in sched.workers:
                 w.wait_queue(60.0)
 
@@ -3685,7 +3671,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # ---- RENDEZVOUS: the ONE point an engine reads rows it did not write.
                 # Below, K/V are gathered in FULL (both shards) while Q is this shard
                 # only, so every engine's K/V projection must have landed first.
-                self._vis_barrier(ue, engine_idx, ne)
+                sched.barrier_slice(engine_idx)
 
                 # Per-head bidirectional flash attention (no mask, no RoPE). Each head's
                 # block is a full DP=128-wide (256B) column slice -> every DMA stride
@@ -3773,7 +3759,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                 # layer i+1's K/V projection and overwriting VIS_K/VIS_V rows the peer is
                 # still gathering above. See VIS_BARRIER_AFTER_ATTN.
                 if self.VIS_BARRIER_AFTER_ATTN:
-                    self._vis_barrier(ue, engine_idx, ne)
+                    sched.barrier_slice(engine_idx)
 
                 # Drop the head-dim pad lanes (VIS_UNPAD), own rows only -- fenced by
                 # the WAR rendezvous above, which is what makes every head's columns
@@ -3848,7 +3834,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                         OUTPUT_DRAM_ADDR=lane_partial, is_B_quantized=True,
                         data_type=TYPE.IF4, gpr_M_reg=vis_S_reg)
                     # --- reduce: every lane's partial must have landed first.
-                    self._vis_barrier(ue, engine_idx, ne)
+                    sched.barrier_slice(engine_idx)
                     if kgrp == 0:
                         acc = lane_partial
                         for j in range(1, nk):
@@ -3860,7 +3846,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
                             acc = self.VIS_MLP_OUT_DRAM + RH
                     # --- lane 0's sum must be visible before the residual below,
                     # which every lane recomputes redundantly.
-                    self._vis_barrier(ue, engine_idx, ne)
+                    sched.barrier_slice(engine_idx)
                 self._debug_op(f"layer{layer_idx}_mlp_out", self.VIS_MLP_OUT_DRAM, S * H, shape=(S, H), ue=ue)
                 eltwise_add_core_dram(ue, size=rows * H,
                     A_DRAM_ADDR=self.VIS_RESIDUAL_DRAM + RH, B_DRAM_ADDR=self.VIS_MLP_OUT_DRAM + RH,
@@ -3888,7 +3874,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             # engine0's queue alone (run_vision's _wait_with_heartbeat + the full
             # (S, HO) DMA readback are unchanged) -- and engine0 cannot report done
             # until every worker has reached this point and written its rows.
-            self._vis_barrier(ue, engine_idx, ne)
+            sched.barrier_slice(engine_idx)
             if is_primary:
                 ue.generate_instruction_halt()   # encoder ends.
         except _DebugStop:
@@ -3963,7 +3949,8 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # suspects: the reduce's first add reading AE_O_PROJ_ZERO_DRAM instead of
     # accumulating in place (PI05_AE_NOZERO=1 isolates it), and the primary sitting
     # idle across six back-to-back rendezvous (flag clear immediately followed by
-    # the next flag set) -- the barrier's documented re-arm race. Expected gain was
+    # the next flag set) -- the (since removed) NOP-margin barrier's re-arm race,
+    # which the master/worker round no longer has; not re-tested. Expected gain was
     # only ~0.13 s, so it is parked rather than chased. --ae_primary_no_head re-enables.
     AE_PRIMARY_NO_HEAD = False
     # AE_HOIST_ADARMS_DENSE: the AdaRMSNorm conditioning dense (cond(1,H) @ W
@@ -3990,8 +3977,7 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     # (~177.6 MHz) was the config default for a different board; see
     # gemma4_e2b_test.py::_clock_ns_default_for_device, which maps alveo_u55c to
     # 3.3333333 and rk/rk_256 (HW 0x3d04c689, the previous device) to 3.0.
-    # This is REPORTING ONLY -- CLOCK_CYCLE_TIME_NS drives no timeout or spin count,
-    # and barrier_margin_nops is an instruction count, so it scales with the clock.
+    # This is REPORTING ONLY -- CLOCK_CYCLE_TIME_NS drives no timeout or spin count.
     CYCLE_NS = 1000.0 / 366.67   # HW clock period, 366.67 MHz
     MACS_PER_CYCLE = 64      # ASSUMPTION: 64-ALU vector unit = 64 MACs/cycle. If the
                              # matmul core is a 64xN systolic array this is higher --
@@ -7713,6 +7699,10 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             "denoise_steps": int(self.AE_NUM_DENOISE_STEPS),
             "keep_masked_slots": bool(self.KEEP_MASKED_SLOTS),
             "vis_layout": self.VIS_LAYOUT,
+            # Rendezvous shape baked into the multi-engine programs (see
+            # multi_engine_shard.RENDEZVOUS_SIG): a set without it carries the removed
+            # symmetric NOP-margin barrier and is recompiled, never replayed.
+            "rendezvous": _mes_rendezvous_sig(),
             "program_dram_base": hex(self._program_dram_base),
             "tensor_dram_base": hex(self._tensor_dram_base),
             "params_dram_base": hex(self._params_dram_base),
@@ -7995,6 +7985,8 @@ class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
         self._sig_check("keep_masked_slots", bool(self.KEEP_MASKED_SLOTS),
                         bool(self.sig["keep_masked_slots"]),
                         "toggle --keep-masked-slots to match, or regenerate the bins")
+        self._sig_check("rendezvous", _mes_rendezvous_sig(), self.sig.get("rendezvous"),
+                        "the bins carry the removed symmetric barrier; regenerate them")
         self._sig_check("vis_layout", self.VIS_LAYOUT, self.sig.get("vis_layout"),
                         "the bins predate the real-width vision layout (VIS_LAYOUT); "
                         "regenerate them")
@@ -8563,6 +8555,21 @@ def configure_engines(engines=1, vis_4=False, pref_8=False, dns_8=False, vis_m_s
     return multi or vis_4 or pref_8 or dns_8
 
 
+def _mes_rendezvous_sig():
+    """multi_engine_shard.RENDEZVOUS_SIG: the rendezvous shape compiled programs carry."""
+    import multi_engine_shard
+    return multi_engine_shard.RENDEZVOUS_SIG
+
+
+def _bins_rendezvous(meta_path):
+    """The rendezvous a dumped programs json was compiled with (None if absent)."""
+    try:
+        with open(meta_path) as f:
+            return json.load(f).get("sig", {}).get("rendezvous")
+    except (OSError, ValueError):
+        return None
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -8896,6 +8903,10 @@ def main():
     bins_exist = _bin_ok and os.path.exists(os.path.join(BIN_DIR, "params.bin")) \
                           and os.path.exists(os.path.join(BIN_DIR, _stem + ".bin")) \
                           and os.path.exists(os.path.join(BIN_DIR, _stem + ".json"))
+    if bins_exist and _bins_rendezvous(os.path.join(BIN_DIR, _stem + ".json")) \
+            != _mes_rendezvous_sig():
+        print(f"[main] {_stem} predates the master/worker rendezvous; recompiling")
+        bins_exist = False
 
     if bins_exist:
         print(f"[main] loading pre-compiled bins from {BIN_DIR} (no weight unpack, no compile)")

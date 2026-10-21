@@ -349,7 +349,6 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
                 # O(N^2), and every flag edge is acknowledged so it does not
                 # need NOP timing margin.
                 region_rendezvous="master_worker",
-                barrier_margin_nops=32,
                 allow_unaligned_rows=True,
                 allow_more_than_two_engines=self.multi_core > 2)
             self._multi_core_schedulers[stage] = sched

@@ -2144,7 +2144,6 @@ class Qwen25OmniUnifiedEngine(
                     else "four_phase"
                 ),
                 region_rendezvous="master_worker",
-                barrier_margin_nops=32,
                 allow_unaligned_rows=True,
                 allow_more_than_two_engines=True,
             )

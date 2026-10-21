@@ -1611,7 +1611,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
     # MULTI-ENGINE SHARDING KNOBS  (shared scaffolding -- vision/prefix/denoise)
     # ==================================================================================
     # NUM_ENGINES is the run-wide default; each stage may override it. A stage at 1 is
-    # BYTE-IDENTICAL to the historical single-engine program: _vp_barrier returns before
+    # BYTE-IDENTICAL to the historical single-engine program: the barrier_slice returns before
     # emitting anything, split_rows returns [(0, M)], and no worker engine is built.
     NUM_ENGINES = 1
 
@@ -2670,28 +2670,6 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         return max([int(self.NUM_ENGINES)]
                    + [self._num_engines(s) for s in ("VIS", "PREFIX", "DENOISE")])
 
-    def _vp_barrier(self, ue, engine_idx, ne, margin_nops=32):
-        """Emit ONE engine's slice of a symmetric all-engine rendezvous.
-
-        SET / CHECK(every peer) / margin NOPs / CLEAR -- the shape proven to RE-ARM by
-        user_hw_test.flag_rendezvous_repeat_test. It is emitted per STREAM, not through
-        MultiEngineScheduler.barrier(), because a stage body is emitted one complete
-        engine stream at a time (each engine's program is independent; only the
-        per-stream order matters).
-
-        AT ne == 1 THIS EMITS NOTHING AT ALL. That is the contract that makes the
-        single-engine program byte-identical to the historical one; do not "simplify" it
-        into an unconditional emit guarded downstream."""
-        if ne == 1:
-            return
-        ue.generate_instruction_flag_set()
-        for j in range(ne):
-            if j != engine_idx:
-                ue.generate_instruction_flag_check(target_engine_idx=j)
-        for _ in range(margin_nops):
-            ue.generate_instruction_nop()
-        ue.generate_instruction_flag_clear()
-
     @contextlib.contextmanager
     def _vp_dram_selftest_guard(self, ne):
         """Protect the 16 KB at DRAM_START_ADDR from UnifiedEngine.__init__.
@@ -3145,7 +3123,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         PRIMARY ONLY: post_ln and the whole connector (M=64, and its permute is a
         host-index-table DMA gather with no per-engine form).
 
-        The two are stitched together by _vp_barrier: a rendezvous CLOSES each sharded
+        The two are stitched together by bar() (sched.barrier_slice): a rendezvous CLOSES each sharded
         region (so the primary sees every worker's rows before it reads them) and OPENS
         the next one (so no worker reads a primary-written buffer early). At ne == 1
         every barrier and every row offset is zero and the emitted stream is
@@ -3350,7 +3328,9 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             ue.generate_instruction_add_set(s_reg, S)
 
         def bar():
-            self._vp_barrier(ue, e, ne)
+            # One engine's share of a standalone master/worker round; every stream
+            # emits the same sequence of bar() calls.
+            sched.barrier_slice(e)
 
         def shard_mm(K, N, A, a_pitch, B, OUT, o_pitch, bias=None, **kw):
             """One row-sharded matmul: M = this engine's row count, A and OUT advanced by
@@ -3621,7 +3601,7 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         `bar` is compile_encoder's per-engine rendezvous slice. Two are needed and both
         are real: VIS_SHUFFLED_DRAM is written by the primary and read in FULL by every
         engine, and VIS_CONNECTOR_DRAM is written by all of them and read back by the
-        host. At ne == 1 _vp_barrier emits nothing, the split is [(0, 960)], and the
+        host. At ne == 1 bar() emits nothing, the split is [(0, 960)], and the
         original single matmul into VIS_CONNECTOR_DRAM is reproduced exactly."""
         V, C = self._cfg["vision"], self._cfg["connector"]
         H, s = V["hidden_size"], C["pixel_shuffle_scale_factor"]
@@ -4599,10 +4579,11 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
                             ctx.col_out("lm_o"), split=True)
                 scatter_lane(x, ctx.col_out("lm_o"), self.LM_O_PROJ_DRAM,
                              ctx.col_offset, ctx.cols, H)
-            # join=False: region 4 opens with its own barrier and that is the fence the
-            # full-width LM_O_PROJ_DRAM read needs. Two back-to-back rendezvous would
-            # cost 32 extra round trips over the layer stack for nothing.
-            sched.col_sharded_region(H, o_body, join=False)
+            # join=True: region 4 reads the full-width LM_O_PROJ_DRAM, which every
+            # engine scattered a band of. With master/worker rounds a join=False region
+            # leaves its round open and the next region runs inside it with NO
+            # rendezvous, so the fence has to be this region's close.
+            sched.col_sharded_region(H, o_body, join=True)
 
             # ---- region 4: residual + ln2 (redundant) + gate/up/mul (N-split lane) ----
             def mlp_body(ctx, la=la, h_in=h_in):
@@ -5590,9 +5571,15 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
         # layer and MEASURED +50 ms, because it raised the matmul floor 412 -> 430 ms and
         # this stage tracks its floor at a flat 2.6x. Reverted. Do not re-derive it from
         # op counts.
+        # parallel=True, and it is load-bearing: the layer's residual add right after
+        # this is ROW-SPLIT, so every engine reads its rows of AE_MLP_DOWN_DRAM. The
+        # serial path with join=False left the workers reading rows the primary was
+        # still summing (no rendezvous between the adds and those reads). The parallel
+        # path splits the adds by the same row blocks and FORCES its closing
+        # rendezvous; the sums are bit-identical to the serial chain.
         sched.reduce_add([sched.per_engine_addr("ae_mlp_down_partial", i)
                           for i in range(ne)],
-                         self.AE_MLP_DOWN_DRAM, M, HP, join=False)
+                         self.AE_MLP_DOWN_DRAM, M, HP, join=False, parallel=True)
 
     def _ae_group_map(self, ne):
         """kv_b -> engine index. THE ONE SOURCE for every per-kv-head split in a self
@@ -8988,6 +8975,9 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             "program_dram_base": hex(self._program_dram_base),
             "worker_arena_base": hex(self.VIS_WORKER_ARENA_BASE),
             "worker_arena_bytes": int(self.VIS_WORKER_ARENA_BYTES),
+            # Rendezvous shape baked into the multi-engine programs. A set without it
+            # carries the removed symmetric NOP-margin barrier (see bins_available).
+            "rendezvous": mes.RENDEZVOUS_SIG,
         }
         with open(bin_path, "wb") as f:
             f.write(blob)
@@ -9139,6 +9129,16 @@ class VeraPulse_UnifiedEngine(UnifiedEngine):
             return False
         if pm.get("weight_tensor_attrs") and not os.path.exists(
                 os.path.join(bin_dir, "weight_tensors.pt")):
+            return False
+        # Programs compiled with the removed symmetric NOP-margin barrier (no
+        # "rendezvous" field) must be recompiled, not replayed. clean_program_bins.sh
+        # keeps this model's programs, so this is the only thing that retires them.
+        try:
+            with open(os.path.join(bin_dir, stem + ".json")) as f:
+                prog_sig = json.load(f).get("sig", {})
+        except (OSError, ValueError):
+            return False
+        if prog_sig.get("rendezvous") != mes.RENDEZVOUS_SIG:
             return False
         # Provenance is part of "matching": loading a dummy-weight dump into a real-weight
         # run would score a model nobody asked for. Report NOT available (so the caller
