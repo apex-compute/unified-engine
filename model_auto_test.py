@@ -375,6 +375,20 @@ def _check_mbv2_224(text):
         else f"unexpected label: {text!r}"
     )
 
+def _check_yolov5s(text):
+    # vette.jpg: the yolov5s_test.py wrapper re-emits the runner's TEST_RESULT whose
+    # n_detections / decoded_text (comma-joined COCO labels) carry the result. Expect
+    # at least one detection and a car-class label.
+    n = _test_result_field(text, "n_detections")
+    labels = _test_result_field(text, "decoded_text") or ""
+    if n is None:
+        return False, "missing n_detections in TEST_RESULT"
+    if n < 1:
+        return False, "no detections on vette.jpg"
+    if not re.search(r"\b(car|truck)\b", labels, re.IGNORECASE):
+        return False, f"{n} detection(s) but no car/truck label: {labels!r}"
+    return True, f"{n} detection(s), labels: {labels!r}"
+
 def _check_mbv2_ssd(text):
     # vette.jpg should produce >=1 detection. The model emits a TEST_RESULT line whose
     # n_detections/decoded_text carry the real result; key on that instead of the raw
@@ -597,6 +611,15 @@ TESTS = [
     # kokoro_bin/ (frozen instruction image), reused on the next pass.
     {"name": "kokoro",  "script": "models/kokoro/kokoro_test.py",   "pass_check": _check_kokoro, "extra_args": ["--fpga"]},
 
+    # --- Andromeda conv/audio ports (synced from pcie_utils) ---------------------
+    # These run a precompiled single-bin image through native CONV2D/MAXPOOL opcodes
+    # and need the queue-CONFIG convolution bitstream, which HW_INFO does not
+    # advertise. requires_conv_image gates them on UE_CI_CONV_IMAGE=1 in the runner's
+    # environment; on a board with the standard image they SKIP instead of timing out
+    # waiting for a HALT that never comes. Each <model>_test.py wrapper compiles the
+    # bin on pass 1 and reuses it on pass 2.
+    {"name": "yolov5s", "script": "models/yolov5s/yolov5s_test.py", "pass_check": _check_yolov5s, "image": "test_samples/vette.jpg", "requires_conv_image": True},
+
 ]
 
 
@@ -800,6 +823,14 @@ def run_test(test: dict, verbose: bool = False,
             result = _parse_output(test, "", 0, 0.0)
             result.update(passed=True, skipped=True, pass_reason=reason)
             return result
+
+    if test.get("requires_conv_image") and os.environ.get("UE_CI_CONV_IMAGE") != "1":
+        reason = ("needs the CONV2D/MAXPOOL queue-CONFIG bitstream; set UE_CI_CONV_IMAGE=1 "
+                  "on a runner whose board carries it")
+        print(f"SKIP         : {reason}\n", flush=True)
+        result = _parse_output(test, "", 0, 0.0)
+        result.update(passed=True, skipped=True, pass_reason=reason)
+        return result
 
     # Check immediately before poisoning. Model worktrees are sometimes updated
     # while a long suite is running; do not spend time writing all device DRAM when the
