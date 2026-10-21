@@ -74,6 +74,13 @@ class MobileSAM_UE_Run(UnifiedEngine):
         self.dma_write(DMA_DEVICE_H2C, self._program_dram_base, halt_bytes, len(halt_bytes))
         self.clear_capture_buffer()
 
+    def software_reset(self, run_dram_self_test: bool = True):
+        """Reset pulse only (same as MobileSAM_UE): the base class re-runs
+        init_unified_engine() here, which no other model does."""
+        self.write_reg32(user_dma_core.UE_QUEUE_CTRL_ADDR, 0x80008000)
+        self.wait_queue(1.0)
+        self._inst_id = 0
+
     # ------------------------------------------------------------------
     # Load from bin
     # ------------------------------------------------------------------
