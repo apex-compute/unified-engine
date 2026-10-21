@@ -401,6 +401,18 @@ def _check_yolov5n(text):
         return False, f"{n} detection(s) but no person label: {labels!r}"
     return True, f"{n} detection(s), labels: {labels!r}"
 
+def _check_unet(text):
+    # unet_test.py runs the bin with --compare, so TEST_RESULT carries mask_agreement
+    # (fraction of pixels whose argmax class matches the quantized CPU reference) and
+    # logit_rmse. The runner already raises on non-finite logits.
+    agreement = _test_result_field(text, "mask_agreement")
+    rmse = _test_result_field(text, "logit_rmse")
+    if agreement is None:
+        return False, "missing mask_agreement in TEST_RESULT (runner not run with --compare?)"
+    ok = agreement >= 0.90
+    return ok, (f"mask agreement {agreement:.4f} vs CPU reference (logit rmse {rmse})"
+                + ("" if ok else " below 0.90"))
+
 def _check_mbv2_ssd(text):
     # vette.jpg should produce >=1 detection. The model emits a TEST_RESULT line whose
     # n_detections/decoded_text carry the real result; key on that instead of the raw
@@ -632,6 +644,7 @@ TESTS = [
     # bin on pass 1 and reuses it on pass 2.
     {"name": "yolov5s", "script": "models/yolov5s/yolov5s_test.py", "pass_check": _check_yolov5s, "image": "test_samples/vette.jpg", "requires_conv_image": True},
     {"name": "yolov5n", "script": "models/yolov5n/yolov5n_test.py", "pass_check": _check_yolov5n, "image": "test_samples/people.jpg", "requires_conv_image": True},
+    {"name": "unet",    "script": "models/unet/unet_test.py",       "pass_check": _check_unet,    "image": "test_samples/vette.jpg",  "requires_conv_image": True},
 
 ]
 
