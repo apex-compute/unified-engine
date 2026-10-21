@@ -1095,7 +1095,9 @@ class MobileSAM_UE(UnifiedEngine):
         # reached halt, and run_decoder timed out at 120 s with IOU=0. Push programs above the
         # true tensor end. Programs (~33 MB) then end ~0xDA035000, well within 4 GB.
         super().__init__(program_dram_base=0xD8000000)
-        self.init_unified_engine()
+        # No explicit init_unified_engine(): like every other model, construction
+        # alone is enough (it skips the register dump, the destructive 16 KB DRAM
+        # self-test and the hard-coded HW-version assert).
         sd = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         self.weight_init(sd)
         self._enc_init(sd)
