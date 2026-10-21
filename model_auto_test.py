@@ -389,6 +389,18 @@ def _check_yolov5s(text):
         return False, f"{n} detection(s) but no car/truck label: {labels!r}"
     return True, f"{n} detection(s), labels: {labels!r}"
 
+def _check_yolov5n(text):
+    # people.jpg via the yolov5n_test.py wrapper: expect >=1 detection and a person label.
+    n = _test_result_field(text, "n_detections")
+    labels = _test_result_field(text, "decoded_text") or ""
+    if n is None:
+        return False, "missing n_detections in TEST_RESULT"
+    if n < 1:
+        return False, "no detections on people.jpg"
+    if not re.search(r"\bperson\b", labels, re.IGNORECASE):
+        return False, f"{n} detection(s) but no person label: {labels!r}"
+    return True, f"{n} detection(s), labels: {labels!r}"
+
 def _check_mbv2_ssd(text):
     # vette.jpg should produce >=1 detection. The model emits a TEST_RESULT line whose
     # n_detections/decoded_text carry the real result; key on that instead of the raw
@@ -619,6 +631,7 @@ TESTS = [
     # waiting for a HALT that never comes. Each <model>_test.py wrapper compiles the
     # bin on pass 1 and reuses it on pass 2.
     {"name": "yolov5s", "script": "models/yolov5s/yolov5s_test.py", "pass_check": _check_yolov5s, "image": "test_samples/vette.jpg", "requires_conv_image": True},
+    {"name": "yolov5n", "script": "models/yolov5n/yolov5n_test.py", "pass_check": _check_yolov5n, "image": "test_samples/people.jpg", "requires_conv_image": True},
 
 ]
 
