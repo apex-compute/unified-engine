@@ -671,6 +671,7 @@ TESTS = [
     {"name": "yolov5n", "script": "models/yolov5n/yolov5n_test.py", "pass_check": _check_yolov5n, "image": "test_samples/people.jpg", "requires_conv_image": True},
     {"name": "unet",    "script": "models/unet/unet_test.py",       "pass_check": _check_unet,    "image": "test_samples/vette.jpg",  "requires_conv_image": True},
     {"name": "dpdfnet", "script": "models/dpdfnet/dpdfnet_test.py", "pass_check": _check_dpdfnet, "audio": "test_samples/apex.wav",   "requires_conv_image": True},
+    {"name": "dpdfnet8khz", "script": "models/dpdfnet8khz/dpdfnet8khz_test.py", "pass_check": _check_dpdfnet8khz, "audio": "test_samples/apex.wav", "requires_conv_image": True},
 
 ]
 
