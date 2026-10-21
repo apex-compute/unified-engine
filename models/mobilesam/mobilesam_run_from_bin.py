@@ -58,11 +58,11 @@ class MobileSAM_UE_Run(UnifiedEngine):
     """MobileSAM engine that loads pre-compiled bins (no weight unpacking, no compilation)."""
 
     def __init__(self, clock_period_ns=None):
-        # MUST match MobileSAM_UE's program base (0xD8000000): the decoder bakes ABSOLUTE
+        # MUST match MobileSAM_UE's program base (0xE0000000): the decoder bakes ABSOLUTE
         # jump addresses (flash subroutines) at compile time, and the tensor region runs to
         # ~0xD7602780, so the program must load+execute above it. A mismatched base sends every
         # jump to the wrong address -> hang/garbage.
-        super().__init__(program_dram_base=0xD8000000, clock_period_ns=clock_period_ns)
+        super().__init__(program_dram_base=0xE0000000, clock_period_ns=clock_period_ns)
         self.script_dir = SCRIPT_DIR
         # Hang prevention
         self.start_capture()

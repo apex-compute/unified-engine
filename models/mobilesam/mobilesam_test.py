@@ -1089,12 +1089,14 @@ class MobileSAM_UE(UnifiedEngine):
     """
 
     def __init__(self, checkpoint_path: str):
-        # Tensor region is actually ~660 MB (base 0xB0000000, end ~0xD7602780) — the old
-        # 0xD3000000 program base put 73 MB of tensors ON TOP of the program stream, which
-        # corrupted instructions at execute time -> the decoder PC jumped into garbage, never
-        # reached halt, and run_decoder timed out at 120 s with IOU=0. Push programs above the
-        # true tensor end. Programs (~33 MB) then end ~0xDA035000, well within 4 GB.
-        super().__init__(program_dram_base=0xD8000000)
+        # Tensor region is ~700 MB (base 0xB0000000; the head-padded Q/K/V projection
+        # buffers added ~42 MB on top of the old ~0xD7602780 end). Programs MUST sit above
+        # the true tensor end: an earlier 0xD3000000 base put tensors ON TOP of the program
+        # stream, which corrupted instructions at execute time (decoder PC into garbage,
+        # IOU=0), and 0xD8000000 did the same once the buffers grew (S1B1 drift, S2B0 NaN).
+        # compile_encoder asserts the two regions do not overlap. Programs (~55 MB) end
+        # ~0xE3800000, well within 4 GB. MobileSAM_UE_Run MUST use the same base.
+        super().__init__(program_dram_base=0xE0000000)
         # No explicit init_unified_engine(): like every other model, construction
         # alone is enough (it skips the register dump, the destructive 16 KB DRAM
         # self-test and the hard-coded HW-version assert).
@@ -3210,6 +3212,10 @@ class MobileSAM_UE(UnifiedEngine):
 
     def compile_encoder(self) -> int:
         """Compile all encoder instructions into a single DRAM program. Returns prog addr."""
+        assert self._tensor_dram_addr <= self._program_dram_base, (
+            f"tensor region end 0x{self._tensor_dram_addr:X} overlaps the program base "
+            f"0x{self._program_dram_base:X}: raise program_dram_base in MobileSAM_UE "
+            f"(and MobileSAM_UE_Run)")
         self.start_capture()
         # GPR 1: Stage-0 M=ENC_S0_H*ENC_S0_W=65536 (1x1 convs + identity matmuls)
         # GPR 2: Stage 1-3 NTOK (window tokens)
