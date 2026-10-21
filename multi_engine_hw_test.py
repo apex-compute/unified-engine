@@ -197,26 +197,25 @@ def flag_rendezvous_repeat_test(rounds: int = 27, chunk_elems: int = 1024,
     Data flow (DRAM is one flat shared space; the per-engine BASE_ADDR only selects
     AXI-Lite control registers, so engine1 can read an address engine0 wrote):
 
-      round r, engine e (partner p):
+      round r, engine e (partner p; engine 0 is the master):
         [filler matmul, only when r % 2 == e]   <- makes the partner genuinely WAIT
         src_e[r]      -> SRAM -> shared_e[r]    <- produce
-        FLAG_SET; FLAG_CHECK(p)                 <- the rendezvous under test
+        master: SET ; CHECK_SET(1)              <- the rendezvous under test: one
+        worker: CHECK_SET(0) ; SET                 four-phase master/worker round
         shared_p[r]   -> SRAM                   <- consume the OTHER engine's region
-        FLAG_CLEAR                              <- re-arm for round r+1
+        master: CLEAR ; CHECK_CLEAR(1)          <- close the round / re-arm
+        worker: CHECK_CLEAR(0) ; CLEAR
         SRAM          -> dst_e[r]
 
     Verification is exact (pure bf16 copies): dst_e[r] must bit-match src_p[r] for
     every round. All shared/dst regions are pre-filled with a poison pattern, so a
     read that races ahead of the partner's write lands on poison and fails loudly.
 
-    Clear placement matters. FLAG_CHECK only spin-waits on level-1, and an engine can
-    only touch its OWN flag, so a two-engine repeating barrier has two races:
-      * CLEAR too early -> partner misses our SET -> hang.
-      * CLEAR too late  -> partner's NEXT round sees our stale SET -> reads poison.
-    Putting CLEAR between the consume-read and the consume-write buys ~1 DMA of
-    margin against the first (partner only has to retire one already-satisfied CHECK)
-    and >=3 DMAs of margin against the second (partner cannot reach its next SET
-    without a produce pair), so neither window is a few-cycle coin flip.
+    This used to exercise the symmetric SET / CHECK / margin / CLEAR rendezvous,
+    whose CLEAR placement was a timing argument (too early -> partner misses our SET
+    -> hang; too late -> partner's next round sees our stale SET -> poison). That
+    shape was removed from multi_engine_shard; the round above holds every level
+    until the other side has observed it, so neither window exists.
     """
     import user_dma_core
 
@@ -297,14 +296,28 @@ def flag_rendezvous_repeat_test(rounds: int = 27, chunk_elems: int = 1024,
                 sram_address=sram_addr,
                 accelerator_dram_address=shared_addrs[e] + r * chunk_bytes,
                 element_size=chunk_elems)
+            # One four-phase master/worker round per exchange (engine 0 = master):
+            #   master: SET | CHECK_SET(1) | consume | CLEAR | CHECK_CLEAR(1)
+            #   worker: CHECK_SET(0) | SET | consume | CHECK_CLEAR(0) | CLEAR
+            # Each side raises its flag only after its produce, and every level is
+            # held until the other side has observed it.
             if barrier:
-                ue.generate_instruction_flag_set()
-                ue.generate_instruction_flag_check(target_engine_idx=p)
+                if e == 0:
+                    ue.generate_instruction_flag_set()
+                    ue.generate_instruction_flag_check_set(target_engine_idx=1)
+                else:
+                    ue.generate_instruction_flag_check_set(target_engine_idx=0)
+                    ue.generate_instruction_flag_set()
             ue.accelerator_memory_to_sram(
                 accelerator_dram_address=shared_addrs[p] + r * chunk_bytes,
                 sram_address=sram_addr, element_size=chunk_elems)
             if barrier:
-                ue.generate_instruction_flag_clear()
+                if e == 0:
+                    ue.generate_instruction_flag_clear()
+                    ue.generate_instruction_flag_check_clear(target_engine_idx=1)
+                else:
+                    ue.generate_instruction_flag_check_clear(target_engine_idx=0)
+                    ue.generate_instruction_flag_clear()
             ue.sram_to_accelerator_memory(
                 sram_address=sram_addr,
                 accelerator_dram_address=dst_addrs[e] + r * chunk_bytes,
