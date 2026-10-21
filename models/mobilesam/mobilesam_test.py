@@ -3230,6 +3230,15 @@ class MobileSAM_UE(UnifiedEngine):
         self.clear_capture_buffer()
         return prog
 
+    def software_reset(self, run_dram_self_test: bool = True):
+        """Reset pulse only. The base-class version re-runs init_unified_engine()
+        (register dump, destructive 16 KB DRAM self-test, hard-coded HW-version
+        assert); no other model does that, and MobileSAM only needs the reset to
+        clear stale PBI/loop/queue state between programs."""
+        self.write_reg32(user_dma_core.UE_QUEUE_CTRL_ADDR, 0x80008000)
+        self.wait_queue(1.0)
+        self._inst_id = 0
+
     def execute_encoder(self, prog: int, image_t: torch.Tensor):
         """Execute pre-compiled encoder program. Result lands in self.NECK_OUT_DRAM."""
         # Clear stale device state (PBI pointers, loop/queue regs) left by a prior
