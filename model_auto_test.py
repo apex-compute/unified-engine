@@ -413,6 +413,31 @@ def _check_unet(text):
     return ok, (f"mask agreement {agreement:.4f} vs CPU reference (logit rmse {rmse})"
                 + ("" if ok else " below 0.90"))
 
+def _check_dpdfnet_like(text, label):
+    # dpdfnet_test.py / dpdfnet8khz_test.py enhance apex.wav on the FPGA and with the
+    # onnxruntime CPU reference, then report snr_db_vs_cpu on the output waveforms.
+    # 12 dB == relative L2 of 0.25, the default bound of dpdfnet8khz_compare.py.
+    if _test_result_field(text, "frames") is None:
+        return False, "missing TEST_RESULT from the FPGA runner"
+    if _test_result_field(text, "finite_output") is False:
+        return False, f"{label}: non-finite enhanced audio"
+    err = _test_result_field(text, "ref_compare_error")
+    if err:
+        return False, f"{label}: {err}"
+    if _test_result_field(text, "exact_match"):
+        return True, f"{label}: FPGA output identical to CPU reference"
+    snr = _test_result_field(text, "snr_db_vs_cpu")
+    if snr is None:
+        return False, f"{label}: no snr_db_vs_cpu in TEST_RESULT (run without --no-ref)"
+    ok = snr >= 12.0
+    return ok, f"{label}: {snr:.2f} dB vs CPU reference" + ("" if ok else " (below 12 dB)")
+
+def _check_dpdfnet(text):
+    return _check_dpdfnet_like(text, "dpdfnet 16 kHz")
+
+def _check_dpdfnet8khz(text):
+    return _check_dpdfnet_like(text, "dpdfnet 8 kHz")
+
 def _check_mbv2_ssd(text):
     # vette.jpg should produce >=1 detection. The model emits a TEST_RESULT line whose
     # n_detections/decoded_text carry the real result; key on that instead of the raw
@@ -645,6 +670,7 @@ TESTS = [
     {"name": "yolov5s", "script": "models/yolov5s/yolov5s_test.py", "pass_check": _check_yolov5s, "image": "test_samples/vette.jpg", "requires_conv_image": True},
     {"name": "yolov5n", "script": "models/yolov5n/yolov5n_test.py", "pass_check": _check_yolov5n, "image": "test_samples/people.jpg", "requires_conv_image": True},
     {"name": "unet",    "script": "models/unet/unet_test.py",       "pass_check": _check_unet,    "image": "test_samples/vette.jpg",  "requires_conv_image": True},
+    {"name": "dpdfnet", "script": "models/dpdfnet/dpdfnet_test.py", "pass_check": _check_dpdfnet, "audio": "test_samples/apex.wav",   "requires_conv_image": True},
 
 ]
 
