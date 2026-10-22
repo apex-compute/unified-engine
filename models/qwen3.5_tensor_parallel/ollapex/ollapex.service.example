@@ -1,0 +1,23 @@
+# Copy to /etc/systemd/system/ollapex.service, replace USER and /path/to, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ollapex
+[Unit]
+Description=OllApeX - chat interface for the model running on the FPGA cards (port 3000)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=USER
+WorkingDirectory=/path/to/unified-engine/models/qwen3.5_tensor_parallel/ollapex
+Environment=APEX_TP_WORK=/path/to/apex_tp
+Environment=OLLAPEX_PORT=3000
+ExecStartPre=/bin/sleep 5
+ExecStart=/path/to/venv/bin/python -u ollapex_server.py
+KillSignal=SIGINT
+TimeoutStopSec=40
+Restart=on-failure
+RestartSec=15
+StandardOutput=append:/path/to/unified-engine/models/qwen3.5_tensor_parallel/ollapex/logs/server.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target
