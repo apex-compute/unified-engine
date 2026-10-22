@@ -429,6 +429,29 @@ def _check_verapulse(text):
     return True, f"finite action chunk ({chunk}x{dof}, absmax={hi})"
 
 
+def _check_moonshine(text):
+    # moonshine_test.py prints ">>> <transcript>" and, with the default per-stage SNR
+    # on, "[tokens] match=<bool>  hw=N ref=M" vs the in-process CPU reference. Exact
+    # token match is the pass criterion (HW-proven 2026-10-20); the transcript
+    # keywords are the fallback when the match line is absent (--no-snr).
+    m = re.search(r"\[tokens\] match=(True|False)\s+hw=(\d+)\s+ref=(\d+)", text)
+    if m:
+        if m.group(1) == "True":
+            return True, f"HW tokens match CPU reference ({m.group(2)} tokens)"
+        return False, f"HW tokens differ from CPU reference (hw={m.group(2)} ref={m.group(3)})"
+    transcript = None
+    for line in text.splitlines():
+        if line.startswith(">>> "):
+            transcript = line[4:].strip()
+    if not transcript:
+        return False, "no '>>> <transcript>' line in output"
+    keywords = ("unified engine", "apex computes", "custom ml inference accelerator")
+    matched = [k for k in keywords if k in transcript.lower()]
+    if not matched:
+        return False, f"no expected transcription keywords in {transcript!r}"
+    return True, f"matched {len(matched)}/{len(keywords)} transcription keywords (no match line): {transcript!r}"
+
+
 def _check_act(text):
     # ACT (LeRobot, 34M) prints a TEST_RESULT: JSON line with actions_snr_db vs the CPU
     # reference. HW-proven at ~38 dB; gate at 35 so a NaN (-inf / nan) or a scrambled
@@ -550,6 +573,12 @@ TESTS = [
     # Encoder models take no --prompt and emit non-LM output (ASR transcription /
     # segmentation).
     {"name": "parakeet",  "script": "models/parakeet/parakeet_test.py",        "pass_check": _check_parakeet},
+    # moonshine (ASR, 61M enc-dec on raw PCM): transcribes test_samples/apex.wav and
+    # compares HW tokens against its CPU reference. Pass 1 compiles (~85 s) and freezes
+    # moonshine_bin/{params,programs}.bin; pass 2 replays the image automatically when
+    # the signature matches. --engines is pinned to 1: only the single-engine path is
+    # HW-proven (2026-10-20); drop the pin once the sharded stem/encoder is validated.
+    {"name": "moonshine", "script": "models/moonshine/moonshine_test.py",      "pass_check": _check_moonshine, "extra_args": ["--engines", "1"]},
     {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",      "pass_check": _check_nonempty},
     {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_swin},
 
