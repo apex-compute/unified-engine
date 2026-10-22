@@ -375,6 +375,100 @@ def _check_mbv2_224(text):
         else f"unexpected label: {text!r}"
     )
 
+def _check_yolov5s(text):
+    # vette.jpg: the yolov5s_test.py wrapper re-emits the runner's TEST_RESULT whose
+    # n_detections / decoded_text (comma-joined COCO labels) carry the result. Expect
+    # at least one detection and a car-class label.
+    n = _test_result_field(text, "n_detections")
+    labels = _test_result_field(text, "decoded_text") or ""
+    if n is None:
+        return False, "missing n_detections in TEST_RESULT"
+    if n < 1:
+        return False, "no detections on vette.jpg"
+    if not re.search(r"\b(car|truck)\b", labels, re.IGNORECASE):
+        return False, f"{n} detection(s) but no car/truck label: {labels!r}"
+    return True, f"{n} detection(s), labels: {labels!r}"
+
+def _check_yolov5n(text):
+    # people.jpg via the yolov5n_test.py wrapper: expect >=1 detection and a person label.
+    n = _test_result_field(text, "n_detections")
+    labels = _test_result_field(text, "decoded_text") or ""
+    if n is None:
+        return False, "missing n_detections in TEST_RESULT"
+    if n < 1:
+        return False, "no detections on people.jpg"
+    if not re.search(r"\bperson\b", labels, re.IGNORECASE):
+        return False, f"{n} detection(s) but no person label: {labels!r}"
+    return True, f"{n} detection(s), labels: {labels!r}"
+
+def _check_unet(text):
+    # unet_test.py runs the bin with --compare, so TEST_RESULT carries mask_agreement
+    # (fraction of pixels whose argmax class matches the quantized CPU reference) and
+    # logit_rmse. The runner already raises on non-finite logits.
+    agreement = _test_result_field(text, "mask_agreement")
+    rmse = _test_result_field(text, "logit_rmse")
+    if agreement is None:
+        return False, "missing mask_agreement in TEST_RESULT (runner not run with --compare?)"
+    ok = agreement >= 0.90
+    return ok, (f"mask agreement {agreement:.4f} vs CPU reference (logit rmse {rmse})"
+                + ("" if ok else " below 0.90"))
+
+def _check_dpdfnet_like(text, label):
+    # dpdfnet_test.py / dpdfnet8khz_test.py enhance apex.wav on the FPGA and with the
+    # onnxruntime CPU reference, then report snr_db_vs_cpu on the output waveforms.
+    # 12 dB == relative L2 of 0.25, the default bound of dpdfnet8khz_compare.py.
+    if _test_result_field(text, "frames") is None:
+        return False, "missing TEST_RESULT from the FPGA runner"
+    if _test_result_field(text, "finite_output") is False:
+        return False, f"{label}: non-finite enhanced audio"
+    err = _test_result_field(text, "ref_compare_error")
+    if err:
+        return False, f"{label}: {err}"
+    if _test_result_field(text, "exact_match"):
+        return True, f"{label}: FPGA output identical to CPU reference"
+    snr = _test_result_field(text, "snr_db_vs_cpu")
+    if snr is None:
+        return False, f"{label}: no snr_db_vs_cpu in TEST_RESULT (run without --no-ref)"
+    ok = snr >= 12.0
+    return ok, f"{label}: {snr:.2f} dB vs CPU reference" + ("" if ok else " (below 12 dB)")
+
+def _check_dpdfnet(text):
+    return _check_dpdfnet_like(text, "dpdfnet 16 kHz")
+
+def _check_dpdfnet8khz(text):
+    return _check_dpdfnet_like(text, "dpdfnet 8 kHz")
+
+def _check_bigcodec(text):
+    # bigcodec_test.py round-trips apex.wav on the FPGA and the CPU (fp32). End-to-end
+    # waveform SNR is dominated by codebook flips (8192-entry nearest-neighbour
+    # quantizer), so it is NOT the gate: measured 2026-10-22 e2e 11.3 dB while the
+    # decoder alone (CPU-decoded FPGA tokens) was 31.2 dB, PESQ-WB 4.08, STOI 0.994.
+    # Gate on the three things that track the hardware: decoder-only SNR, token
+    # agreement with the CPU encoder, and whole-signal cosine similarity.
+    if _test_result_field(text, "tokens") is None:
+        return False, "missing TEST_RESULT from the FPGA runner"
+    err = _test_result_field(text, "ref_compare_error")
+    if err:
+        return False, f"bigcodec: {err}"
+    if _test_result_field(text, "finite_output") is False:
+        return False, "bigcodec: non-finite reconstructed audio"
+    dec = _test_result_field(text, "decoder_snr_db_vs_cpu")
+    tokens = _test_result_field(text, "token_match_fraction")
+    cos = _test_result_field(text, "cosine_similarity_vs_cpu")
+    e2e = _test_result_field(text, "snr_db_vs_cpu")
+    if dec is None or tokens is None or cos is None:
+        return False, "bigcodec: missing decoder_snr/token_match/cosine in TEST_RESULT (run without --no-ref)"
+    bad = []
+    if dec < 25.0:
+        bad.append(f"decoder SNR {dec:.2f} dB < 25")
+    if tokens < 0.75:
+        bad.append(f"token match {tokens:.3f} < 0.75")
+    if cos < 0.95:
+        bad.append(f"cosine {cos:.4f} < 0.95")
+    summary = (f"bigcodec: decoder-only {dec:.2f} dB, tokens match {tokens:.3f}, "
+               f"cosine {cos:.4f} (e2e {e2e:.2f} dB) vs CPU")
+    return (not bad), summary + ("" if not bad else " -- " + "; ".join(bad))
+
 def _check_mbv2_ssd(text):
     # vette.jpg should produce >=1 detection. The model emits a TEST_RESULT line whose
     # n_detections/decoded_text carry the real result; key on that instead of the raw
@@ -597,6 +691,20 @@ TESTS = [
     # kokoro_bin/ (frozen instruction image), reused on the next pass.
     {"name": "kokoro",  "script": "models/kokoro/kokoro_test.py",   "pass_check": _check_kokoro, "extra_args": ["--fpga"]},
 
+    # --- Andromeda conv/audio ports (synced from pcie_utils) ---------------------
+    # These run a precompiled single-bin image through native CONV2D/MAXPOOL opcodes
+    # and need the queue-CONFIG convolution bitstream, which HW_INFO does not
+    # advertise. requires_conv_image gates them on UE_CI_CONV_IMAGE=1 in the runner's
+    # environment; on a board with the standard image they SKIP instead of timing out
+    # waiting for a HALT that never comes. Each <model>_test.py wrapper compiles the
+    # bin on pass 1 and reuses it on pass 2.
+    {"name": "yolov5s", "script": "models/yolov5s/yolov5s_test.py", "pass_check": _check_yolov5s, "image": "test_samples/vette.jpg", "requires_conv_image": True},
+    {"name": "yolov5n", "script": "models/yolov5n/yolov5n_test.py", "pass_check": _check_yolov5n, "image": "test_samples/people.jpg", "requires_conv_image": True},
+    {"name": "unet",    "script": "models/unet/unet_test.py",       "pass_check": _check_unet,    "image": "test_samples/vette.jpg",  "requires_conv_image": True},
+    {"name": "dpdfnet", "script": "models/dpdfnet/dpdfnet_test.py", "pass_check": _check_dpdfnet, "audio": "test_samples/apex.wav",   "requires_conv_image": True},
+    {"name": "dpdfnet8khz", "script": "models/dpdfnet8khz/dpdfnet8khz_test.py", "pass_check": _check_dpdfnet8khz, "audio": "test_samples/apex.wav", "requires_conv_image": True},
+    {"name": "bigcodec", "script": "models/bigcodec/bigcodec_test.py", "pass_check": _check_bigcodec, "audio": "test_samples/apex.wav", "requires_conv_image": True},
+
 ]
 
 
@@ -800,6 +908,14 @@ def run_test(test: dict, verbose: bool = False,
             result = _parse_output(test, "", 0, 0.0)
             result.update(passed=True, skipped=True, pass_reason=reason)
             return result
+
+    if test.get("requires_conv_image") and os.environ.get("UE_CI_CONV_IMAGE") != "1":
+        reason = ("needs the CONV2D/MAXPOOL queue-CONFIG bitstream; set UE_CI_CONV_IMAGE=1 "
+                  "on a runner whose board carries it")
+        print(f"SKIP         : {reason}\n", flush=True)
+        result = _parse_output(test, "", 0, 0.0)
+        result.update(passed=True, skipped=True, pass_reason=reason)
+        return result
 
     # Check immediately before poisoning. Model worktrees are sometimes updated
     # while a long suite is running; do not spend time writing all device DRAM when the

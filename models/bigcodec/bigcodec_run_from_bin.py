@@ -73,7 +73,8 @@ def main():
     parser.add_argument('--report', type=Path)
     parser.add_argument('--device', choices=['rk'], default='rk')
     parser.add_argument('--dev', default='xdma0')
-    parser.add_argument('--cpu-core', type=int, default=6)
+    parser.add_argument('--cpu-core', type=int,
+                        help='pin the host thread to this CPU core for stable timing (default: no pin)')
     parser.add_argument('--timeout', type=float, default=300)
     parser.add_argument('--expected-version', type=lambda value: int(value, 0),
                         help='Require this FPGA build before reset/upload (for controlled comparisons)')
@@ -88,14 +89,15 @@ def main():
         validate_output_paths(args.input, args.bin, args.output, args.tokens, args.report)
     except ValueError as error:
         parser.error(str(error))
-    if args.cpu_core not in os.sched_getaffinity(0):
+    if args.cpu_core is not None and args.cpu_core not in os.sched_getaffinity(0):
         parser.error('--cpu-core is not available')
     if not np.isfinite(args.timeout) or args.timeout <= 0:
         parser.error('--timeout must be positive and finite')
     if args.expected_version is not None and not 0 <= args.expected_version <= 0xFFFFFFFF:
         parser.error('--expected-version must be a 32-bit unsigned build value')
     torch.set_num_threads(1)
-    os.sched_setaffinity(0, {args.cpu_core})
+    if args.cpu_core is not None:
+        os.sched_setaffinity(0, {args.cpu_core})
     began = time.perf_counter()
     bin_sha256 = sha256_file(args.bin)
     payload = load_artifact(args.bin)
