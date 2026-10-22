@@ -11,8 +11,9 @@ one-script contract:
      bin is missing or --force (README's compensated-decoder flag set);
   2. run the round trip on the board;
   3. unless --no-ref, run the CPU round trip (bigcodec_run_cpu.py) and compare
-     waveforms + tokens with bigcodec_compare.py: snr_db, relative_l2,
-     cosine_similarity, token match_fraction;
+     waveforms + tokens with bigcodec_compare.py (snr_db, cosine_similarity,
+     token match_fraction), then decode the FPGA's tokens on the CPU for a
+     decoder-only SNR that is not polluted by codebook flips;
   4. re-emit the runner's TEST_RESULT with those metrics and timings added.
 
 Hardware needs the RK AXI-256 CONV/MAXPOOL queue-CONFIG image.
@@ -192,6 +193,28 @@ def main(argv=None) -> int:
                 snr = result["snr_db_vs_cpu"]
                 print(f"[bigcodec_test] FPGA vs CPU: SNR {'n/a' if snr is None else f'{snr:.2f} dB'}, "
                       f"tokens match {result['token_match_fraction']}", flush=True)
+            # Decoder-only error: decode the FPGA's own tokens on the CPU and compare
+            # waveforms. End-to-end SNR is dominated by codebook flips near a boundary
+            # (measured 11 dB e2e vs 31 dB decoder-only, PESQ 4.08), so this is the
+            # number that actually tracks the hardware.
+            same_tokens_wav = BIN_DIR / f"ci_{clip.stem}_fpga_tokens_cpu.wav"
+            dec_report = BIN_DIR / f"ci_{clip.stem}_decoder_only.json"
+            rc, _, _ = _stream([py, "-u", str(CPU_REF), "--mode", "decode", "--tokens", str(fpga_tokens),
+                                "--output", str(same_tokens_wav), "--checkpoint", str(CHECKPOINT)],
+                               "bigcodec_test/cpu-decode")
+            if rc == 0 and same_tokens_wav.is_file():
+                rc, _, _ = _stream([py, "-u", str(COMPARE), "--reference", str(same_tokens_wav),
+                                    "--actual", str(fpga_wav), "--report", str(dec_report)],
+                                   "bigcodec_test/compare-decoder")
+            if rc == 0 and dec_report.is_file():
+                dec = json.loads(dec_report.read_text())
+                result["decoder_snr_db_vs_cpu"] = dec.get("snr_db")
+                result["decoder_cosine_similarity_vs_cpu"] = dec.get("cosine_similarity")
+                d = result["decoder_snr_db_vs_cpu"]
+                print(f"[bigcodec_test] decoder-only (same tokens): SNR "
+                      f"{'n/a' if d is None else f'{d:.2f} dB'}", flush=True)
+            else:
+                result["ref_compare_error"] = f"decoder-only comparison failed (rc={rc})"
 
     result.update(timings)
     result["ci_entry"] = "bigcodec_test.py"
