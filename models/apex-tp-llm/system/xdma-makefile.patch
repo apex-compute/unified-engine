@@ -1,0 +1,16 @@
+--- Makefile.orig	2026-10-20 18:02:17.529011708 -0700
++++ Makefile	2026-10-20 18:02:36.481727762 -0700
+@@ -16,7 +16,7 @@
+ 
+ $(warning XVC_FLAGS: $(XVC_FLAGS).)
+ 
+-topdir := $(shell cd $(src)/.. && pwd)
++topdir := /home/USER/dma_ip_drivers/XDMA/linux-kernel
+ 
+ TARGET_MODULE:=xdma
+ 
+@@ -58,3 +58,4 @@
+ 
+ 
+ endif
++ccflags-y += $(EXTRA_CFLAGS)
