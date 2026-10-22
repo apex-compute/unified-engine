@@ -73,6 +73,39 @@ def _stream(cmd: list[str], tag: str = "bigcodec_test") -> tuple[int, dict | Non
     return proc.wait(), result, "".join(captured)
 
 
+def _sha256(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _discard_corrupt(path: Path, *, zip_archive: bool = False, sha256: str | None = None, tag: str) -> None:
+    """Delete a cached artifact that a box reboot mid-write left truncated.
+
+    The compile scripts treat an existing file as authoritative (and refuse to
+    overwrite a checkpoint with a bad hash), so a half-written file would be
+    reused forever. torch.save bins and .pt/.pth checkpoints are zip archives;
+    ONNX / other files are checked by SHA256 when one is pinned.
+    """
+    if not path.is_file():
+        return
+    ok = True
+    if zip_archive:
+        import zipfile
+        try:
+            ok = zipfile.ZipFile(path).testzip() is None
+        except Exception:
+            ok = False
+    if ok and sha256 is not None:
+        ok = _sha256(path) == sha256
+    if not ok:
+        print(f"[{tag}] cached {path.name} is truncated/corrupt; deleting so it is rebuilt", flush=True)
+        path.unlink()
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="BigCodec on the UnifiedEngine FPGA (CI entry)")
     ap.add_argument("--dev", default="xdma0", help="XDMA device name")
@@ -89,6 +122,10 @@ def main(argv=None) -> int:
     py = sys.executable
     clip = args.input.resolve()
     timings = {}
+    manifest = json.loads((SCRIPT_DIR / "upstream_manifest.json").read_text())
+    _discard_corrupt(BIN, zip_archive=True, tag="bigcodec_test")
+    _discard_corrupt(CHECKPOINT, zip_archive=True, sha256=manifest["checkpoint"]["sha256"],
+                     tag="bigcodec_test")
 
     if args.force or not BIN.is_file():
         t0 = time.perf_counter()
