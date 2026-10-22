@@ -3723,10 +3723,16 @@ class MobileSAM_UE(UnifiedEngine):
 
         _rows = []
 
+        _dump_dir = os.environ.get("MOBILESAM_DUMP")
+        if _dump_dir:
+            os.makedirs(_dump_dir, exist_ok=True)
+
         def _step(label, fn, checks):
             self._compile_run(fn)
             for nm, addr, n, *rest in checks:
                 t = self._read_tensor(addr, n)
+                if _dump_dir:
+                    np.save(os.path.join(_dump_dir, f"{label}__{nm}.npy"), t.float().numpy())
                 nn = torch.isnan(t).sum().item()
                 ni = torch.isinf(t).sum().item()
                 fin = t[torch.isfinite(t)]

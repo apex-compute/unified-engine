@@ -467,76 +467,45 @@ def pbi_strided_copy(ue: UnifiedEngine, gpr: int,
     ue.release_inst_ptr(ptr_src)
 
 
-def multihead_pad_and_permute(ue: UnifiedEngine,
-                              INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
-                              TEMP_DRAM_ADDR: int,
-                              num_windows: int, wa: int, num_heads: int,
-                              head_dim: int, head_dim_pad: int, wa_pad: int,
-                              gpr_pbi: int) -> None:
-    """Reshape Q/K/V from projection layout to multi-head attention layout.
+def multihead_permute(ue: UnifiedEngine,
+                      INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
+                      num_windows: int, wa: int, num_heads: int,
+                      head_dim_pad: int, wa_pad: int,
+                      gpr_pbi: int) -> None:
+    """Reshape Q/K/V from the (already head-padded) projection layout to the
+    multi-head attention layout.
 
-    Input:  (num_windows * wa, num_heads * head_dim) in INPUT_DRAM_ADDR
-            i.e. (num_windows, wa, num_heads, head_dim) row-major
+    Input:  (num_windows * wa, num_heads * head_dim_pad) in INPUT_DRAM_ADDR
+            i.e. (num_windows, wa, num_heads, head_dim_pad) row-major. The
+            projection matmul's strip write-back put each head's head_dim real
+            lanes at the start of its head_dim_pad slot (pad lanes zero), so the
+            old scatter step (head_dim -> head_dim_pad) is gone.
     Output: (num_windows * num_heads, wa_pad, head_dim_pad) in OUTPUT_DRAM_ADDR
             i.e. per-head, per-window attention blocks with padding
 
-    Steps per window:
-      1. Zero-fill output region (already done before calling this)
-      2. Strided copy: (wa, num_heads * head_dim) -> (wa, num_heads, head_dim_pad)
-         in TEMP buffer — scatter head_dim real elements into head_dim_pad slots
-      3. bf16_permute_core: (wa, num_heads, head_dim_pad) -> (num_heads, wa, head_dim_pad)
-      4. Copy permuted data into output with wa_pad stride
-
-    TEMP_DRAM_ADDR must hold at least (wa * num_heads * head_dim_pad) elements.
-    OUTPUT_DRAM_ADDR must be pre-zeroed (call dram_zero_fill first).
+    Per window: transpose (wa, num_heads, head_dim_pad) -> per-head padded blocks
+    (num_heads, wa_pad, head_dim_pad) directly, with NO bf16_permute_core. For a
+    fixed output head h, source rows sit at a uniform stride of
+    num_heads*head_dim_pad, so the gather collapses to one small PBI loop per
+    head. Rows wa..wa_pad-1 stay zero (OUTPUT pre-zeroed by the caller).
     """
     bytes_per_element = 2
-    dim = num_heads * head_dim
-    input_window_stride = wa * dim * bytes_per_element
-    temp_row_width = num_heads * head_dim_pad  # elements per row in padded layout
+    row_width = num_heads * head_dim_pad          # elements per padded input row
+    input_window_stride = wa * row_width * bytes_per_element
     output_head_stride = wa_pad * head_dim_pad * bytes_per_element  # per (window, head) block
-
-    # Zero TEMP once for the whole call: every window's scatter overwrites only the
-    # head_dim low half of the same head_dim_pad slots, so the padded tails stay zero
-    # across all windows — no need to re-zero per window.
-    dram_zero_fill(ue, TEMP_DRAM_ADDR, wa * temp_row_width)
+    head_bytes = head_dim_pad * bytes_per_element
 
     for w in range(num_windows):
         input_base = INPUT_DRAM_ADDR + w * input_window_stride
-
-        # Step 2: scatter real data into the (pre-zeroed) padded TEMP layout.
-        # Iterating heads innermost (i = row*num_heads + h) makes BOTH the source and
-        # destination perfectly contiguous within the window:
-        #   src offset = (row*dim + h*head_dim)        = i*head_dim     (dim = num_heads*head_dim)
-        #   dst offset = (row*temp_row_width + h*head_dim_pad) = i*head_dim_pad
-        # so the whole scatter collapses to one uniform-stride PBI loop. The PBI copy
-        # writes only the head_dim real elements; padded tails remain zero.
-        pbi_strided_copy(
-            ue, gpr_pbi,
-            src_base=input_base,
-            dst_base=TEMP_DRAM_ADDR,
-            count=wa * num_heads,
-            copy_bytes=head_dim * bytes_per_element,
-            src_stride=head_dim * bytes_per_element,
-            dst_stride=head_dim_pad * bytes_per_element,
-        )
-
-        # Steps 3+4 fused: transpose (wa, num_heads, head_dim_pad) -> per-head padded
-        # blocks (num_heads, wa_pad, head_dim_pad) directly, with NO bf16_permute_core
-        # (which unrolls into wa*num_heads gather instructions per window). For a fixed
-        # output head h, source rows sit at a uniform stride of num_heads*head_dim_pad
-        # in TEMP, so the gather+pad collapses to one small PBI loop per head. Rows
-        # wa..wa_pad-1 stay zero (OUTPUT pre-zeroed by the caller).
         out_window_base = OUTPUT_DRAM_ADDR + w * num_heads * output_head_stride
-        head_bytes = head_dim_pad * bytes_per_element
         for h in range(num_heads):
             pbi_strided_copy(
                 ue, gpr_pbi,
-                src_base=TEMP_DRAM_ADDR + h * head_bytes,
+                src_base=input_base + h * head_bytes,
                 dst_base=out_window_base + h * output_head_stride,
                 count=wa,
                 copy_bytes=head_bytes,
-                src_stride=temp_row_width * bytes_per_element,
+                src_stride=row_width * bytes_per_element,
                 dst_stride=head_bytes,
             )
 
@@ -580,7 +549,6 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     # - patch merging (3x): norm gamma+beta, reduction weight
     # - final layernorm gamma+beta
     # - classifier weight+bias
-    # - unpad weights (constructed, not from HF): one per stage
 
     raise NotImplementedError("weight_bin_generate")
 
@@ -870,13 +838,6 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 stage_weights.append(lw)
             self.encoder_weights.append(stage_weights)
 
-        # ---- Encoder: unpad weights (constructed, one per stage) ----
-        self.unpad_weight_addrs = []
-        for s in range(self.NUM_STAGES):
-            w = self.build_unpad_weight(self.NUM_HEADS[s], self.HEAD_DIM, pad(self.HEAD_DIM))
-            # matmat_mul_core expects B as (N, K) since it computes A @ B^T
-            self.unpad_weight_addrs.append(self._alloc_param(w.T.contiguous()))
-
         # ---- Encoder: patch merging weights (stages 0, 1, 2 only — no merge after stage 3) ----
         self.patch_merge_weights = []
         for s in range(self.NUM_STAGES - 1):
@@ -963,10 +924,13 @@ class Swin_UnifiedEngine(UnifiedEngine):
             st['shifted'] = self._alloc_tensor(M * dim)      # forward cyclic shift output (step 2)
             st['win_reverse'] = self._alloc_tensor(M * dim)  # window reverse output (step 10)
 
-            # Q/K/V after projection (windowed flat)
-            st['q_proj'] = self._alloc_tensor(num_windows * wa * dim)
-            st['k_proj'] = self._alloc_tensor(num_windows * wa * dim)
-            st['v_proj'] = self._alloc_tensor(num_windows * wa * dim)
+            # Q/K/V after projection (windowed flat), HEAD-PADDED: the projection's
+            # strip write-back lands each head's HEAD_DIM lanes at the start of its
+            # hd_pad slot, so rows are num_heads*hd_pad wide. Pad lanes are zeroed
+            # once per stage in compile and never written again.
+            st['q_proj'] = self._alloc_tensor(num_windows * wa * num_heads * hd_pad)
+            st['k_proj'] = self._alloc_tensor(num_windows * wa * num_heads * hd_pad)
+            st['v_proj'] = self._alloc_tensor(num_windows * wa * num_heads * hd_pad)
 
             # Q/K/V after permute to multi-head: (total_batches, wa_pad, hd_pad)
             st['q_heads'] = self._alloc_tensor(total_batches * wa_pad * hd_pad)
@@ -991,13 +955,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
             # Per-window relative-position bias slice (rel_pos_bias is tiled per batch).
             st['flash_stage_bias'] = self._alloc_tensor(wa_pad * wa_pad)
 
-            # After inverse permute: (num_windows * wa, num_heads * hd_pad)
-            st['attn_permuted'] = self._alloc_tensor(num_windows * wa * num_heads * hd_pad)
-
-            # Temp buffer for multihead_pad_and_permute: needs 2 * (wa * num_heads * hd_pad) for pad + permute
-            st['permute_temp'] = self._alloc_tensor(2 * wa * num_heads * hd_pad)
-
-            # After unpad: (num_windows * wa, dim)
+            # After inverse permute, pad lanes dropped in the same copy: (num_windows * wa, dim)
             st['attn_unpadded'] = self._alloc_tensor(num_windows * wa * dim)
 
             # Output projection result
@@ -1042,29 +1000,6 @@ class Swin_UnifiedEngine(UnifiedEngine):
             self.ZEROS_DRAM,
             torch.zeros(URAM_NEAR_FULL_ELEMENTS, dtype=torch.bfloat16),
         )
-
-    # ------------------------------------------------------------------
-    # Unpad weight construction
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def build_unpad_weight(num_heads: int, head_dim: int = 32, head_dim_pad: int = 64) -> torch.Tensor:
-        """Build the unpad selection matrix for a given stage.
-
-        After attention, output is (M, num_heads * head_dim_pad). We need
-        (M, num_heads * head_dim). This weight W has shape
-        (num_heads * head_dim_pad, num_heads * head_dim) with identity blocks
-        at the real-data positions and zeros at padding positions.
-
-        matmul(padded_output, W) -> unpadded_output
-        """
-        K = num_heads * head_dim_pad   # input  dim (padded)
-        N = num_heads * head_dim       # output dim (real)
-        W = torch.zeros(K, N, dtype=torch.bfloat16)
-        for h in range(num_heads):
-            for d in range(head_dim):
-                W[h * head_dim_pad + d, h * head_dim + d] = 1.0
-        return W
 
     # ------------------------------------------------------------------
     # Program compilation
@@ -1189,6 +1124,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
         gpr_mm = self.alloc_isa_reg()   # matmul M (= spatial^2 per stage)
         gpr_ln = self.alloc_isa_reg()   # LayerNorm runtime row count
         gpr_pbi = self.alloc_isa_reg()  # PBI strided-copy trip count (permute loops)
+        gpr_qkv_stride = self.alloc_isa_reg()  # Q/K/V strip write-back row pitch; re-primed per use
 
         # ================================================================
         # PRE-ENCODER: patch extraction + bias + LayerNorm
@@ -1280,6 +1216,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
             total_batches = num_windows * num_heads
             st = self.stage_tensors[s]
 
+            # Strip write-back destinations: zero once per stage so the head pad
+            # lanes (never written by the matmul) are zero for every layer.
+            for proj_addr in (st['q_proj'], st['k_proj'], st['v_proj']):
+                dram_zero_fill(self, proj_addr, num_windows * wa * num_heads * hd_pad)
+
             for l in range(self.DEPTHS[s]):
                 lw = self.encoder_weights[s][l]
                 shift_size = 0 if l % 2 == 0 else self.WINDOW_SIZE // 2
@@ -1316,10 +1257,22 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     H=spatial, W=spatial, C=dim,
                     window_size=self.WINDOW_SIZE)
 
-                # --- 4. Q/K/V projections ---
+                # --- 4. Q/K/V projections (real N = dim, head-padded write-back) ---
+                # strip write-back: N/HEAD_DIM strips of HEAD_DIM columns, strip h
+                # written at column h*hd_pad, row pitch num_heads*hd_pad. Each head's
+                # real lanes land at the start of its 64-lane slot with no copy.
                 M_win = num_windows * wa
+                head_dim = self.HEAD_DIM
                 for name, out_addr in [('q', st['q_proj']), ('k', st['k_proj']), ('v', st['v_proj'])]:
+                    # Register convention in this file: _pbi_set / pbi_strided_copy drop
+                    # _isa_reg_counter to gpr+1 and every GPR is re-primed right before use,
+                    # since matmul temporaries (auto K/N regs etc.) are allocated from the
+                    # counter and overwrite whatever sits above it. So: prime M, then leave
+                    # the counter ABOVE the stride register and prime it too.
                     self._pbi_set(gpr_mm, M_win)
+                    self._isa_reg_counter = max(self._isa_reg_counter, gpr_qkv_stride + 1)
+                    self.generate_instruction_add_set(dst_reg_idx=gpr_qkv_stride,
+                                                      immediate_value=num_heads * hd_pad)
                     self.matmat_mul_core(
                         M=M_win, K=dim, N=dim,
                         A_DRAM_ADDR=st['windowed'],
@@ -1328,22 +1281,22 @@ class Swin_UnifiedEngine(UnifiedEngine):
                         C_DRAM_ADDR=lw[f'{name}_bias'],
                         bias_mode="broadcast_N",
                         gpr_M_reg=gpr_mm,
+                        gpr_out_row_stride_reg=gpr_qkv_stride,
+                        strip_cols=head_dim, strip_out_stride=hd_pad,
                     )
 
-                # --- 5. Zero-fill + pad + permute Q/K/V to multi-head ---
-                head_dim = self.HEAD_DIM
+                # --- 5. Zero-fill + permute Q/K/V to multi-head ---
                 for proj_addr, heads_addr in [
                     (st['q_proj'], st['q_heads']),
                     (st['k_proj'], st['k_heads']),
                     (st['v_proj'], st['v_heads']),
                 ]:
                     dram_zero_fill(self, heads_addr, total_batches * wa_pad * hd_pad)
-                    multihead_pad_and_permute(self,
+                    multihead_permute(self,
                         INPUT_DRAM_ADDR=proj_addr,
                         OUTPUT_DRAM_ADDR=heads_addr,
-                        TEMP_DRAM_ADDR=st['permute_temp'],
                         num_windows=num_windows, wa=wa, num_heads=num_heads,
-                        head_dim=head_dim, head_dim_pad=hd_pad, wa_pad=wa_pad,
+                        head_dim_pad=hd_pad, wa_pad=wa_pad,
                         gpr_pbi=gpr_pbi)
 
                 # --- 5b. Pre-scale Q ---
@@ -1392,38 +1345,31 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     gpr_M_reg=gpr_mm,
                 )
 
-                # --- 7. Inverse permute (fused) ---
+                # --- 7+8. Inverse permute AND unpad (fused) ---
                 # Transpose per-head attention blocks (num_heads, wa_pad, hd_pad) back to
-                # token-major (wa, num_heads, hd_pad), dropping the wa_pad padding — all in
-                # one PBI loop per head, with NO bf16_permute_core and no intermediate
-                # buffer. For a fixed head h, source rows are contiguous (stride hd_pad)
-                # and destination rows step by num_heads*hd_pad (uniform), so the gather +
-                # transpose collapses to one small PBI loop per head.
-                head_bytes = hd_pad * 2
-                row_stride = num_heads * hd_pad * 2
+                # token-major (wa, num_heads, head_dim), dropping BOTH the wa_pad row
+                # padding and the hd_pad lane padding in the same copy: each iteration
+                # moves only the head's HEAD_DIM real lanes (64 B, whole DMA beats) from
+                # a hd_pad-pitched source row into a dim-pitched destination row. One
+                # PBI loop per head, no intermediate buffer, and no selection matmul
+                # (the old step 8 burned a (M, num_heads*64) x (64*num_heads, dim)
+                # matmul per layer just to drop zero lanes).
+                src_row_bytes = hd_pad * 2
+                real_bytes = head_dim * 2
+                dst_row_bytes = dim * 2
                 for w in range(num_windows):
                     src_window = st['attn_output'] + w * num_heads * wa_pad * hd_pad * 2
-                    dst_window = st['attn_permuted'] + w * wa * num_heads * hd_pad * 2
+                    dst_window = st['attn_unpadded'] + w * wa * dim * 2
                     for h in range(num_heads):
                         pbi_strided_copy(
                             self, gpr_pbi,
                             src_base=src_window + h * wa_pad * hd_pad * 2,
-                            dst_base=dst_window + h * head_bytes,
+                            dst_base=dst_window + h * real_bytes,
                             count=wa,
-                            copy_bytes=head_bytes,
-                            src_stride=head_bytes,
-                            dst_stride=row_stride,
+                            copy_bytes=real_bytes,
+                            src_stride=src_row_bytes,
+                            dst_stride=dst_row_bytes,
                         )
-
-                # --- 8. Unpad matmul ---
-                self._pbi_set(gpr_mm, M_win)
-                self.matmat_mul_core(
-                    M=M_win, K=num_heads * hd_pad, N=dim,
-                    A_DRAM_ADDR=st['attn_permuted'],
-                    B_DRAM_ADDR=self.unpad_weight_addrs[s],
-                    OUTPUT_DRAM_ADDR=st['attn_unpadded'],
-                    gpr_M_reg=gpr_mm,
-                )
 
                 # --- 9. Output projection ---
                 self._pbi_set(gpr_mm, M_win)

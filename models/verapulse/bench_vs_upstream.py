@@ -53,6 +53,9 @@ def cos_sim(hw, ref):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engines", default="8")
+    ap.add_argument("--vis-engines", type=int, default=None)
+    ap.add_argument("--prefix-engines", type=int, default=None)
+    ap.add_argument("--denoise-engines", type=int, default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--hw-gelu", action="store_true",
                     help="patch UPSTREAM's vision MLP to quick_gelu so the hardware's "
@@ -87,7 +90,8 @@ def main():
 
     # ---- 1. FPGA ---------------------------------------------------------------------
     ue = vp.VeraPulse_UnifiedEngine()
-    vp.configure_engines(ue, args.engines, tag="bench")
+    vp.configure_engines(ue, args.engines, vis=args.vis_engines, prefix=args.prefix_engines,
+                         denoise=args.denoise_engines, tag="bench")
     ue.weight_init()
     ue.tensor_init()
     ue.precompile_all(stages=("vision", "prefix", "denoise"))
