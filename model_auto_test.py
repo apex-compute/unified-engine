@@ -439,8 +439,12 @@ def _check_dpdfnet8khz(text):
     return _check_dpdfnet_like(text, "dpdfnet 8 kHz")
 
 def _check_bigcodec(text):
-    # bigcodec_test.py round-trips apex.wav on the FPGA and on the CPU and compares the
-    # waveforms (bigcodec_compare.py): snr_db_vs_cpu plus token_match_fraction.
+    # bigcodec_test.py round-trips apex.wav on the FPGA and the CPU (fp32). End-to-end
+    # waveform SNR is dominated by codebook flips (8192-entry nearest-neighbour
+    # quantizer), so it is NOT the gate: measured 2026-10-22 e2e 11.3 dB while the
+    # decoder alone (CPU-decoded FPGA tokens) was 31.2 dB, PESQ-WB 4.08, STOI 0.994.
+    # Gate on the three things that track the hardware: decoder-only SNR, token
+    # agreement with the CPU encoder, and whole-signal cosine similarity.
     if _test_result_field(text, "tokens") is None:
         return False, "missing TEST_RESULT from the FPGA runner"
     err = _test_result_field(text, "ref_compare_error")
@@ -448,13 +452,22 @@ def _check_bigcodec(text):
         return False, f"bigcodec: {err}"
     if _test_result_field(text, "finite_output") is False:
         return False, "bigcodec: non-finite reconstructed audio"
-    snr = _test_result_field(text, "snr_db_vs_cpu")
+    dec = _test_result_field(text, "decoder_snr_db_vs_cpu")
     tokens = _test_result_field(text, "token_match_fraction")
-    if snr is None:
-        return False, "bigcodec: no snr_db_vs_cpu in TEST_RESULT (run without --no-ref)"
-    ok = snr >= 10.0
-    return ok, (f"bigcodec: {snr:.2f} dB vs CPU round trip, token match {tokens}"
-                + ("" if ok else " (below 10 dB)"))
+    cos = _test_result_field(text, "cosine_similarity_vs_cpu")
+    e2e = _test_result_field(text, "snr_db_vs_cpu")
+    if dec is None or tokens is None or cos is None:
+        return False, "bigcodec: missing decoder_snr/token_match/cosine in TEST_RESULT (run without --no-ref)"
+    bad = []
+    if dec < 25.0:
+        bad.append(f"decoder SNR {dec:.2f} dB < 25")
+    if tokens < 0.75:
+        bad.append(f"token match {tokens:.3f} < 0.75")
+    if cos < 0.95:
+        bad.append(f"cosine {cos:.4f} < 0.95")
+    summary = (f"bigcodec: decoder-only {dec:.2f} dB, tokens match {tokens:.3f}, "
+               f"cosine {cos:.4f} (e2e {e2e:.2f} dB) vs CPU")
+    return (not bad), summary + ("" if not bad else " -- " + "; ".join(bad))
 
 def _check_mbv2_ssd(text):
     # vette.jpg should produce >=1 detection. The model emits a TEST_RESULT line whose
