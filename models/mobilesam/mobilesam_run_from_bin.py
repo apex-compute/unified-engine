@@ -58,11 +58,11 @@ class MobileSAM_UE_Run(UnifiedEngine):
     """MobileSAM engine that loads pre-compiled bins (no weight unpacking, no compilation)."""
 
     def __init__(self, clock_period_ns=None):
-        # MUST match MobileSAM_UE's program base (0xD8000000): the decoder bakes ABSOLUTE
+        # MUST match MobileSAM_UE's program base (0xE0000000): the decoder bakes ABSOLUTE
         # jump addresses (flash subroutines) at compile time, and the tensor region runs to
         # ~0xD7602780, so the program must load+execute above it. A mismatched base sends every
         # jump to the wrong address -> hang/garbage.
-        super().__init__(program_dram_base=0xD8000000, clock_period_ns=clock_period_ns)
+        super().__init__(program_dram_base=0xE0000000, clock_period_ns=clock_period_ns)
         self.script_dir = SCRIPT_DIR
         # Hang prevention
         self.start_capture()
@@ -73,6 +73,13 @@ class MobileSAM_UE_Run(UnifiedEngine):
             halt_bytes.extend(inst.get_bytes())
         self.dma_write(DMA_DEVICE_H2C, self._program_dram_base, halt_bytes, len(halt_bytes))
         self.clear_capture_buffer()
+
+    def software_reset(self, run_dram_self_test: bool = True):
+        """Reset pulse only (same as MobileSAM_UE): the base class re-runs
+        init_unified_engine() here, which no other model does."""
+        self.write_reg32(user_dma_core.UE_QUEUE_CTRL_ADDR, 0x80008000)
+        self.wait_queue(1.0)
+        self._inst_id = 0
 
     # ------------------------------------------------------------------
     # Load from bin
