@@ -94,7 +94,7 @@ PRESETS = {
 
 def _argv_for(spec: dict, args, summary: str) -> list[str]:
     argv = [
-        sys.executable, MAIN_SCRIPT,
+        sys.executable, "-u", MAIN_SCRIPT,
         "--dev", args.dev, "--multi-core", str(args.multi_core),
         "--target-prefill-tokens", str(spec["target_prefill_tokens"]),
         "--prompt-base", spec["prompt_base"],

@@ -111,7 +111,7 @@ def _argv_for(spec: dict, *, dev: str, multi_core: int, max_new_tokens: int,
               heartbeat_interval: float = 1.0,
               heartbeat_precheck: bool = False) -> list[str]:
     argv = [
-        sys.executable, MAIN_SCRIPT,
+        sys.executable, "-u", MAIN_SCRIPT,
         "--dev", dev, "--multi-core", str(multi_core),
         "--target-prefill-tokens", str(spec["target_prefill_tokens"]),
         "--prompt-base", spec["prompt_base"],
