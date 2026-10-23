@@ -75,7 +75,32 @@ def _reject_visible_torch_accelerators() -> None:
 
 _reject_visible_torch_accelerators()
 
+
+def _silence_talker_token_id_warnings() -> None:
+    """Drop transformers' false "token id outside the vocabulary" warnings.
+
+    Its config validation checks every ``*_token_id`` against the decoder's own
+    ``vocab_size``. The Talker's ``tts_text_*`` ids, and the Thinker's
+    ``audio_*`` ids, are Thinker text-vocabulary ids (~151.6k-151.9k) checked
+    against the Talker's 8448-entry codec vocabulary, so they always warn. Only
+    those messages are dropped; every other config warning still prints.
+    """
+    import logging
+
+    class _Filter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            return not (msg.startswith("Model config: ")
+                        and "must be `None` or an integer within the vocabulary "
+                            "(between 0 and 8447)" in msg)
+
+    logging.getLogger("transformers.configuration_utils").addFilter(_Filter())
+
+
+_silence_talker_token_id_warnings()
+
 import user_dma_core
+from program_heartbeat import board_precheck
 from multi_engine_shard import (MultiEngineScheduler, require_multicore_dram,
                                 tiled_window_bases)
 from user_dma_core import UnifiedEngine, set_dma_device
