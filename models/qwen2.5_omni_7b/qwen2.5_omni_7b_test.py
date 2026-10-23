@@ -3940,6 +3940,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 """,
     )
     parser.add_argument("--dev", default="xdma0", help="DMA device (default xdma0)")
+    parser.add_argument("--heartbeat", type=str, nargs="?", default=None, metavar="LOG",
+                        const="",
+                        help="Sample each engine's busy/flag and retired-instruction count "
+                             "while every LM prefill program runs, one block per program. "
+                             "Optional LOG path; default "
+                             "qwen2.5_omni_7b_heartbeat_<dev>_<timestamp>.log beside this script.")
+    parser.add_argument("--heartbeat-interval", type=float, default=1.0, metavar="S",
+                        help="Seconds between --heartbeat samples. Default: 1")
+    parser.add_argument("--heartbeat-precheck", action="store_true",
+                        help="With --heartbeat: before every sampled FPGA program, run "
+                             "andromeda's hw_check.py (must be alive, same version) and "
+                             "temp_check.tcl (die temperatures, recorded only).")
     parser.add_argument(
         "--vision-res",
         choices=sorted(VISION_RESOLUTIONS),
@@ -4296,6 +4308,14 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         **engine_kwargs
     )
     ue.speak_as = args.speak          # before lm_tensor_init sizes the buffers
+    if args.heartbeat is not None:
+        ue.heartbeat_log = args.heartbeat or os.path.join(
+            SCRIPT_DIR, f"qwen2.5_omni_7b_heartbeat_{args.dev}_"
+                        f"{time.strftime('%Y%m%d_%H%M%S')}.log")
+        ue.heartbeat_interval = args.heartbeat_interval
+        ue.heartbeat_precheck = args.heartbeat_precheck
+        print(f"[heartbeat] LM prefill programs sampled every {args.heartbeat_interval:g} s "
+              f"-> {ue.heartbeat_log}")
     if args.speak is not None and _talker_mod is None:
         raise SystemExit("--speak needs qwen2.5_omni_7b_talker.py, which failed to import")
     if args.speak is not None and not args.speak_host and _talker_fpga_mod is None:
@@ -4432,6 +4452,9 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         return
 
     print("\n--- Decode run ---")
+    # --heartbeat-precheck: one board check before decode (and its program
+    # reload), not before each of its per-token programs.
+    board_precheck(ue, "decode start")
     speech = None
     if args.speak is None:
         _, decoded_text = ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)

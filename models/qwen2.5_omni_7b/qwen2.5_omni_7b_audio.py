@@ -36,6 +36,7 @@ if _PROJECT_ROOT not in sys.path:
 
 import torch
 
+from program_heartbeat import program_heartbeat
 from user_dma_core import (
     DMA_DEVICE_C2H,
     DMA_DEVICE_H2C,
@@ -1415,28 +1416,32 @@ class Qwen25OmniAudioMixin:
         started = time.perf_counter()
         # Workers park on their first rendezvous until core 0 releases the
         # first layer's head-sharded attention region.
-        if scheduler.host_segmented:
-            latency_us = scheduler.run_host_segmented(
-                address, worker_addresses, timeout_seconds=timeout_s)
-        else:
-            scheduler.start_workers(worker_addresses)
-            self.start_execute_from_dram(address)
-            self.wait_queue(float(timeout_s))
-            # wait_queue logs and returns on timeout; it deliberately does not
-            # raise. Never read partially-written embeddings as though they were
-            # a successful encoder result.
-            if self.is_queue_busy():
-                raise TimeoutError(
-                    f"audio FPGA queue is still busy after {timeout_s:.1f}s"
-                )
-            for engine_idx, worker in enumerate(scheduler.workers, start=1):
-                worker.wait_queue(float(timeout_s))
-                if worker.is_queue_busy():
+        # --heartbeat: sample every engine of this audio run, launch to HALT.
+        hb_engines = [self] + list(scheduler.workers)
+        with program_heartbeat(self, f"audio encoder, {len(hb_engines)} engine(s)",
+                               hb_engines):
+            if scheduler.host_segmented:
+                latency_us = scheduler.run_host_segmented(
+                    address, worker_addresses, timeout_seconds=timeout_s)
+            else:
+                scheduler.start_workers(worker_addresses)
+                self.start_execute_from_dram(address)
+                self.wait_queue(float(timeout_s))
+                # wait_queue logs and returns on timeout; it deliberately does not
+                # raise. Never read partially-written embeddings as though they were
+                # a successful encoder result.
+                if self.is_queue_busy():
                     raise TimeoutError(
-                        f"audio FPGA worker {engine_idx} is still busy after "
-                        f"{timeout_s:.1f}s"
+                        f"audio FPGA queue is still busy after {timeout_s:.1f}s"
                     )
-            latency_us = float(self.report_latency_in_us())
+                for engine_idx, worker in enumerate(scheduler.workers, start=1):
+                    worker.wait_queue(float(timeout_s))
+                    if worker.is_queue_busy():
+                        raise TimeoutError(
+                            f"audio FPGA worker {engine_idx} is still busy after "
+                            f"{timeout_s:.1f}s"
+                        )
+                latency_us = float(self.report_latency_in_us())
         wall_s = time.perf_counter() - started
 
         d = self._audio_dims()

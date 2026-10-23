@@ -3190,6 +3190,18 @@ def add_engine_args(parser) -> None:
                              "0xC0000000:0x100000000. Use it to find which region a run "
                              "reads without initialising: poison one arena at a time, then "
                              "halve whichever range reproduces the failure.")
+    parser.add_argument("--heartbeat", type=str, nargs="?", default=None, metavar="LOG",
+                        const="",
+                        help="Sample each engine's busy/flag and retired-instruction count "
+                             "while every prefill program runs, one block per program. "
+                             "Optional LOG path; default "
+                             "gemma4_e2b_heartbeat_<dev>_<timestamp>.log beside this script.")
+    parser.add_argument("--heartbeat-interval", type=float, default=1.0, metavar="S",
+                        help="Seconds between --heartbeat samples. Default: 1")
+    parser.add_argument("--heartbeat-precheck", action="store_true",
+                        help="With --heartbeat: before every sampled FPGA program, run "
+                             "andromeda's hw_check.py (must be alive, same version) and "
+                             "temp_check.tcl (die temperatures, recorded only).")
     parser.add_argument("--bin-reuse", action="store_true",
                         help="Reuse a matching cached program image (programs.bin) if it "
                              "exists instead of recompiling. Default: OFF (fresh compile "
@@ -3526,6 +3538,14 @@ def main():
 
     ue = Gemma4_UnifiedEngine(**engine_kwargs)
     ue.max_new_tokens = args.max_new_tokens
+    if args.heartbeat is not None:
+        ue.heartbeat_log = args.heartbeat or os.path.join(
+            SCRIPT_DIR, f"{MODEL_NAME}_heartbeat_{args.dev}_"
+                        f"{time.strftime('%Y%m%d_%H%M%S')}.log")
+        ue.heartbeat_interval = args.heartbeat_interval
+        ue.heartbeat_precheck = args.heartbeat_precheck
+        print(f"[heartbeat] prefill programs sampled every {args.heartbeat_interval:g} s "
+              f"-> {ue.heartbeat_log}")
 
     # ISA-only second pass. After construction so ue.VISION_ISA_BASE is known
     # (it depends on the engine count), and before compile/program load, which

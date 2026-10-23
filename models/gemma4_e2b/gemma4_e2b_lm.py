@@ -24,6 +24,7 @@ import torch
 import torch.nn.functional as F
 import multi_engine_shard as mes
 import user_dma_core
+from program_heartbeat import program_heartbeat
 from user_dma_core import (
     DMA_DEVICE_H2C, DRAM_INSTRUCTION_ADDR, TYPE, UE_FMAX_CONTEXT_SIZE,
     UE_VECTOR_SIZE, UE_ARGMAX_INDEX, URAM_NEAR_FULL_ELEMENTS, URAM_FULL_ELEMENTS,
@@ -2271,21 +2272,27 @@ class Gemma4LMMixin:
                 print(f"[Prefill] [exec]   ... still running on FPGA ({time.perf_counter()-_pf_t0:.0f}s elapsed)", flush=True)
         _pf_th = threading.Thread(target=_pf_hb, daemon=True)
         _pf_th.start()
+        # --heartbeat: sample every engine of this prefill run, launch to HALT.
+        _hb_engines = [self] + (list(prefill_scheduler.workers)
+                                if prefill_scheduler is not None else [])
+        _hb_label = (f"prefill positions [{pos_offset}, {pos_offset + seq_len}) "
+                     f"of {prompt_len}, {len(_hb_engines)} engine(s)")
         try:
-            # Dynamic-PBI dispatch: a single preamble primes seq_len / Q rows /
-            # aligned attention length, then jumps into the cached prefill
-            # program (gemma3 pattern). Building this at the fixed _preamble_addr
-            # (past every program) is what keeps the gpr priming from clobbering
-            # the prefill body.
-            if prefill_scheduler is not None:
-                prefill_scheduler.start_workers(worker_program_addrs)
-            latency, flop_rate_program = self._dispatch_program(
-                [(self.gpr_seq_len,         seq_len),
-                 (self.gpr_q_seq_len,       q_seq_len),
-                 (self.gpr_aligned_seq_len, attn_aligned)],
-                prefill_program_addr, timeout=300.0, flops=flops)
-            for worker in prefill_scheduler.workers if prefill_scheduler is not None else []:
-                worker.wait_queue(300.0)
+            with program_heartbeat(self, _hb_label, _hb_engines):
+                # Dynamic-PBI dispatch: a single preamble primes seq_len / Q rows /
+                # aligned attention length, then jumps into the cached prefill
+                # program (gemma3 pattern). Building this at the fixed _preamble_addr
+                # (past every program) is what keeps the gpr priming from clobbering
+                # the prefill body.
+                if prefill_scheduler is not None:
+                    prefill_scheduler.start_workers(worker_program_addrs)
+                latency, flop_rate_program = self._dispatch_program(
+                    [(self.gpr_seq_len,         seq_len),
+                     (self.gpr_q_seq_len,       q_seq_len),
+                     (self.gpr_aligned_seq_len, attn_aligned)],
+                    prefill_program_addr, timeout=300.0, flops=flops)
+                for worker in prefill_scheduler.workers if prefill_scheduler is not None else []:
+                    worker.wait_queue(300.0)
         finally:
             _pf_stop.set()
             _pf_th.join(timeout=1.0)

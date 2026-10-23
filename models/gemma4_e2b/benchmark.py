@@ -104,6 +104,11 @@ def _argv_for(spec: dict, args, summary: str) -> list[str]:
     ]
     if spec["frames"]:
         argv += ["--image", "--frames", str(spec["frames"])]
+    if args.heartbeat is not None:
+        argv += ["--heartbeat"] + ([args.heartbeat] if args.heartbeat else [])
+        argv += ["--heartbeat-interval", str(args.heartbeat_interval)]
+        if args.heartbeat_precheck:
+            argv += ["--heartbeat-precheck"]
     return argv
 
 
@@ -192,6 +197,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--summary", default=None, metavar="PATH",
                         help="per-run summary path (single tier only); default "
                              f"{MODEL_NAME}_test_<dev>_<content>_<tier>_multi-core_<N>.md")
+    parser.add_argument("--heartbeat", nargs="?", default=None, const="", metavar="LOG",
+                        help="forwarded to the main script: sample the engines during "
+                             "every prefill program (optional log path)")
+    parser.add_argument("--heartbeat-interval", type=float, default=1.0, metavar="S",
+                        help="seconds between --heartbeat samples. Default: 1")
+    parser.add_argument("--heartbeat-precheck", action="store_true",
+                        help="forwarded: hw_check.py + temp_check.tcl before every "
+                             "sampled FPGA program")
     parser.add_argument("--report", default=None, metavar="PATH",
                         help="also write the tier metric table (and results JSON) to PATH")
     tier = parser.add_mutually_exclusive_group(required=True)

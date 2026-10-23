@@ -37,6 +37,7 @@ import numpy as np
 import torch
 
 import user_dma_core
+from program_heartbeat import program_heartbeat
 from user_dma_core import (
     DMA_DEVICE_H2C, INSTRUCTION_SIZE_BYTES, TYPE, UE_MODE, UE_VECTOR_SIZE,
     ue_35bit_addr_shifter)
@@ -2882,23 +2883,28 @@ class Qwen25OmniLMMixin:
                                     f"prefill worker {idx}")
             us = sum(r[1] for r in self._prefill_profile) * 1e3
         else:
-            # Workers first: each parks on its first rendezvous until the master
-            # enters the region.
-            if sched is not None and sched.host_segmented:
-                us = sched.run_host_segmented(
-                    addr, worker_addrs, timeout_seconds=30.0)
-            elif sched is not None:
-                sched.start_workers(worker_addrs)
-            if sched is None or not sched.host_segmented:
-                self.start_execute_from_dram(addr)
-                self._wait_lm_queue(self, self._prefill_timeout_s(),
-                                    "prefill master")
-                for idx, w in enumerate(
-                    sched.workers if sched is not None else [], start=1
-                ):
-                    self._wait_lm_queue(w, self._prefill_timeout_s(),
-                                    f"prefill worker {idx}")
-                us = self.report_latency_in_us()
+            # --heartbeat: sample every engine of this prefill run, launch to HALT.
+            hb_engines = [self] + (list(sched.workers) if sched is not None else [])
+            with program_heartbeat(
+                    self, f"prefill {seq_len} tokens, {len(hb_engines)} engine(s)",
+                    hb_engines):
+                # Workers first: each parks on its first rendezvous until the master
+                # enters the region.
+                if sched is not None and sched.host_segmented:
+                    us = sched.run_host_segmented(
+                        addr, worker_addrs, timeout_seconds=30.0)
+                elif sched is not None:
+                    sched.start_workers(worker_addrs)
+                if sched is None or not sched.host_segmented:
+                    self.start_execute_from_dram(addr)
+                    self._wait_lm_queue(self, self._prefill_timeout_s(),
+                                        "prefill master")
+                    for idx, w in enumerate(
+                        sched.workers if sched is not None else [], start=1
+                    ):
+                        self._wait_lm_queue(w, self._prefill_timeout_s(),
+                                        f"prefill worker {idx}")
+                    us = self.report_latency_in_us()
         # Expose the prompt length only after every engine has completed the
         # cache population. Failed uploads or launches leave host state at the
         # last known-complete sequence.

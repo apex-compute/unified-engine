@@ -107,7 +107,9 @@ PRESETS = {
 # ==========================================================================
 
 def _argv_for(spec: dict, *, dev: str, multi_core: int, max_new_tokens: int,
-              summary: str) -> list[str]:
+              summary: str, heartbeat: str | None = None,
+              heartbeat_interval: float = 1.0,
+              heartbeat_precheck: bool = False) -> list[str]:
     argv = [
         sys.executable, MAIN_SCRIPT,
         "--dev", dev, "--multi-core", str(multi_core),
@@ -121,6 +123,11 @@ def _argv_for(spec: dict, *, dev: str, multi_core: int, max_new_tokens: int,
         argv += ["--image", "--vision-res", spec["vision_res"]]
         if spec.get("frames", 1) != 1:
             argv += ["--frames", str(spec["frames"])]
+    if heartbeat is not None:
+        argv += ["--heartbeat"] + ([heartbeat] if heartbeat else [])
+        argv += ["--heartbeat-interval", str(heartbeat_interval)]
+        if heartbeat_precheck:
+            argv += ["--heartbeat-precheck"]
     return argv
 
 
@@ -157,6 +164,8 @@ def run_low(args) -> dict | None:
     argv = _argv_for(
         PRESETS["low"], dev=args.dev, multi_core=args.multi_core,
         max_new_tokens=args.max_new_tokens, summary=summary,
+        heartbeat=args.heartbeat, heartbeat_interval=args.heartbeat_interval,
+        heartbeat_precheck=args.heartbeat_precheck,
     )
     return _run(argv, "LOW -- voice command")
 
@@ -166,6 +175,8 @@ def run_medium(args) -> dict | None:
     argv = _argv_for(
         PRESETS["medium"], dev=args.dev, multi_core=args.multi_core,
         max_new_tokens=args.max_new_tokens, summary=summary,
+        heartbeat=args.heartbeat, heartbeat_interval=args.heartbeat_interval,
+        heartbeat_precheck=args.heartbeat_precheck,
     )
     return _run(argv, "MEDIUM -- single camera")
 
@@ -175,6 +186,8 @@ def run_high(args) -> dict | None:
     argv = _argv_for(
         PRESETS["high"], dev=args.dev, multi_core=args.multi_core,
         max_new_tokens=args.max_new_tokens, summary=summary,
+        heartbeat=args.heartbeat, heartbeat_interval=args.heartbeat_interval,
+        heartbeat_precheck=args.heartbeat_precheck,
     )
     return _run(argv, "HIGH -- multi-camera")
 
@@ -844,6 +857,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--multi-core", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--summary", default=None, metavar="PATH")
+    parser.add_argument("--heartbeat", nargs="?", default=None, const="", metavar="LOG",
+                        help="forwarded to the main script: sample the engines during "
+                             "every LM prefill program (optional log path)")
+    parser.add_argument("--heartbeat-interval", type=float, default=1.0, metavar="S",
+                        help="seconds between --heartbeat samples. Default: 1")
+    parser.add_argument("--heartbeat-precheck", action="store_true",
+                        help="forwarded: hw_check.py + temp_check.tcl before every "
+                             "sampled FPGA program")
     parser.add_argument(
         "--standalone", action="store_true",
         help="run the op-by-op method (see the module docstring) at the "
