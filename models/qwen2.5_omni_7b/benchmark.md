@@ -11,6 +11,7 @@ projection weight (Q, K, V, O, gate, up, down), shared by prefill and decode.
 | Board | Device | Engines | Clock | Eight-engine peak | HW version | Model weight bin |
 | :--- | :--- | ---: | ---: | ---: | :--- | ---: |
 | Alveo U50, 8 GiB HBM | `xdma0` | 8 of 8 | 366.7 MHz | 375.5 GFLOPS | `0xfc46ae6f` | 5989.5 MiB |
+| Alveo U50, 8 GiB HBM | `xdma0` | 8 of 8 | 333.3 MHz | 341.3 GFLOPS | `0x6798f78b` ([333.3 MHz results](#alveo-u50-at-3333-mhz)) | 5989.5 MiB |
 
 | Tier | Command | Vision | Audio | LM prefill rows |
 | :--- | :--- | :--- | :--- | ---: |
@@ -63,6 +64,35 @@ BF16 embedding gather -- see each tier's own source report).
 High's model stopped after 19 tokens: it transcribed the speech correctly
 ("unified engine apex computes custom ml inference accelerator unified
 engine.") and ended without describing the frames.
+
+## Alveo U50 at 333.3 MHz
+
+`0x6798f78b`: the split35 floorplan with the engine clock lowered to
+333.33 MHz (andromeda `alveo/u50-split35-floorplan-333mhz`, CI run
+40031819605; routed WNS −0.540 ns). Low, Medium and High ran back to back
+with **no cooling pauses**, in one series with Gemma4 E2B and E4B
+Low/Medium/High (2026-10-24, p2). Outputs match the 366.7 MHz runs; High again
+stops after 19 tokens with the transcription.
+
+| Tier | Vision HW (s) | Audio HW (s) | Prefill HW (s) | Prefill (tok/s) | Prefill model GFLOPS (% peak) | TTFT, HW (s) | Decode first / avg HW / avg CPU (tok/s) |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Low | — | 0.64 | 36.57 | 23.2 | 306.9 (89.9%) | **37.21** | 14.25 / 14.25 / 12.10 |
+| Medium | 22.85 | 1.24 | 91.83 | 22.3 | 300.1 (87.9%) | **115.92** | 10.69 / 10.56 / 9.13 |
+| High | 91.42 | 1.48 | 319.59 | 19.2 | 274.6 (80.5%) | **412.49** | 5.82 / 5.78 / 4.92 |
+
+High's prefill (319.6 s) is longer than one wrap of the 32-bit latency counter
+(2**32 × 16 cycles = 206.2 s at 333.3 MHz); `UnifiedEngine.read_latency_cycles()`
+adds the wrap back from the host launch-to-halt time.
+
+At 366.7 MHz the U50 image misses timing by 0.74–0.78 ns, and that is the
+image the failures above were measured on. On 2026-10-23/24 two 366.7 MHz
+builds failed the same continuous High: `0x821ebde1` lost the board off PCIe
+partway through the Qwen-Omni High prefill (3 of 3 runs, two U50s), and the
+split35 floorplan `0xe0942acd` (WNS −0.742 ns) returned NaN/Inf from the audio
+encoder (2 of 2) and one NaN in `user_hw_test.py`'s 8-engine matmul. The same
+floorplan at 333.3 MHz (`0x6798f78b`, WNS −0.540 ns) and two 200 MHz
+timing-clean images (`0xc8a797b8`, `0x0b8030a6`) ran every tier back to back
+with no pauses and no failures.
 
 ## Speech output (Talker + Token2Wav)
 

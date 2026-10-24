@@ -11,6 +11,7 @@ can be compared tier by tier.
 | Board | Device | Engines | Clock | Eight-engine peak | HW version | Model weight bin |
 | :--- | :--- | ---: | ---: | ---: | :--- | ---: |
 | Alveo U50, 8 GiB HBM | `xdma0` | 8 of 8 | 366.7 MHz | 375.5 GFLOPS | `0x25511139` (flash image) | 7078.6 MB |
+| Alveo U50, 8 GiB HBM | `xdma0` | 8 of 8 | 333.3 MHz | 341.3 GFLOPS | `0x6798f78b` ([333.3 MHz results](#results-alveo-u50-at-3333-mhz)) | 7078.6 MB |
 
 ## Workloads
 
@@ -121,6 +122,40 @@ program on an Alveo U55C (290 MHz) peaks at 63 °C. The cooling pauses are a
 debug-only measurement aid and are not in the repository. The paused run
 decodes the same 128 tokens as the continuous one, and its prefill is 2.7%
 faster on the HW counters (106.02 s against 108.94 s).
+
+## Results: Alveo U50 at 333.3 MHz
+
+`0x6798f78b` is the split35 floorplan with the engine clock lowered to
+333.33 MHz (andromeda branch `alveo/u50-split35-floorplan-333mhz`, CI run
+40031819605; routed WNS −0.540 ns). Low, Medium and High ran back to back with
+no cooling pauses, in one series with E4B and Qwen-Omni Low/Medium/High
+(2026-10-24, p2). Outputs match the 366.7 MHz runs.
+
+| Metric | Low | Medium | High |
+| :--- | ---: | ---: | ---: |
+| Vision encoder, HW (s) | — | 5.04 | 20.14 (4 frames) |
+| Audio encoder, HW (s) | 3.03 | 5.88 | 8.69 |
+| Prefill chunks | 2 | 4 | 12 |
+| Prefill, HW (s) | 13.17 | 33.06 | 116.14 |
+| Prefill speed, HW (tok/s) | 64.5 | 61.9 | 52.9 |
+| Prefill model GFLOPS (% peak) | 250.4 (73.4%) | 246.0 (72.1%) | 223.1 (65.4%) |
+| **TTFT, HW counters (s)** | **16.20** | **43.98** | **144.96** |
+| TTFT, wall clock (s) | 16.72 | 44.77 | 146.75 |
+| Decoded tokens (budget) | 32 (32) | 64 (64) | 128 (128) |
+| Decode first token, HW (tok/s) | 25.4 | 19.3 | 10.4 |
+| Decode average, HW (tok/s) | 25.4 | 19.0 | 10.3 |
+| Decode average, wall clock (tok/s) | 19.6 | 15.6 | 8.0 |
+| Final context (tokens) | 881 | 2111 | 6271 |
+
+At 366.7 MHz the U50 image misses timing by 0.74–0.78 ns, and that is the
+image the failures above were measured on. On 2026-10-23/24 two 366.7 MHz
+builds failed the same continuous High: `0x821ebde1` lost the board off PCIe
+partway through the Qwen-Omni High prefill (3 of 3 runs, two U50s), and the
+split35 floorplan `0xe0942acd` (WNS −0.742 ns) returned NaN/Inf from the audio
+encoder (2 of 2) and one NaN in `user_hw_test.py`'s 8-engine matmul. The same
+floorplan at 333.3 MHz (`0x6798f78b`, WNS −0.540 ns) and two 200 MHz
+timing-clean images (`0xc8a797b8`, `0x0b8030a6`) ran every tier back to back
+with no pauses and no failures.
 
 ## Notes
 
