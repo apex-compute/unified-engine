@@ -1,0 +1,27 @@
+[Unit]
+Description=OllApeX - chat interface for the model running on the FPGA cards (port 3000)
+After=network-online.target xdma.service
+Wants=network-online.target xdma.service
+
+[Service]
+User=USER
+WorkingDirectory=/home/USER/unified-engine/models/apex-tp-llm/ollapex
+Environment=APEX_TP_WORK=/home/USER/apex_tp
+Environment=OLLAPEX_PORT=3000
+Environment=OLLAPEX_MODEL=qwen3.8:27b
+Environment=OLLAPEX_TP_Q35_9B=10fp4
+Environment=OLLAPEX_TP_Q38_27B=10fp4
+Environment=OLLAPEX_CTX=8192
+Environment=OLLAPEX_ENGINES=2
+Environment=APEX_TP_CPUS=8,9,10,11,12,13
+ExecStartPre=/bin/sleep 5
+ExecStart=/home/USER/my_torch_env/bin/python -u ollapex_server.py
+KillSignal=SIGINT
+TimeoutStopSec=40
+Restart=on-failure
+RestartSec=15
+StandardOutput=append:/home/USER/unified-engine/models/apex-tp-llm/ollapex/logs/server.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target
