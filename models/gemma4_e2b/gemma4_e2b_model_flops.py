@@ -140,12 +140,13 @@ def _layer_dims(cfg: dict, layer_idx: int) -> tuple[int, int, int]:
     _get_layer_attention_dims in gemma4_e2b_lm.py exactly."""
     f = cfg["file_info"]
     m = cfg["model"]
-    group_size = int(f["group_size"])
+    num_kv = int(f.get("num_key_value_heads", 1))
+    num_q = int(f.get("num_attention_heads", int(f["group_size"]) * num_kv))
     if layer_idx in set(int(i) for i in m["full_attention_layers"]):
         head_dim = int(f["head_dim"])
     else:
         head_dim = int(f["head_dim_sliding"])
-    return head_dim, head_dim * group_size, head_dim
+    return head_dim, head_dim * num_q, head_dim * num_kv
 
 
 def _mlp_width(cfg: dict, layer_idx: int) -> int:

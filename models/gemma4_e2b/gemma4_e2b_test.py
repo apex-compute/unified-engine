@@ -38,6 +38,18 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 # This file's folder: gemma4_e2b_bin/ and *.json live here. user_dma_core is
 # two levels up (repo root).
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# The model variant this process runs. gemma4_e4b/gemma4_e4b_test.py runs the
+# same code as E4B by calling set_model_variant() before main(): the config is
+# <dir>/<name>_config.json, artifacts live under <name>_bin/, and summaries are
+# named <name>_test_*.md.
+MODEL_NAME = "gemma4_e2b"
+MODEL_TITLE = "Gemma4 E2B"
+
+
+def set_model_variant(name: str, script_dir: str, title: str) -> None:
+    """Point this module at another Gemma 4 variant's directory (see MODEL_NAME)."""
+    global SCRIPT_DIR, MODEL_NAME, MODEL_TITLE
+    SCRIPT_DIR, MODEL_NAME, MODEL_TITLE = script_dir, name, title
 sys.path.insert(0, os.path.dirname(os.path.dirname(SCRIPT_DIR)))
 
 import torch
@@ -89,10 +101,11 @@ MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
 # the shared one (bumping down) so neither can land on the other.
 #
 # WHAT EACH CORE'S 1 GiB HOLDS
-#   weights   992 MiB   private decode shards bump UP from the base;
+#   weights   944 MiB   private decode shards bump UP from the base;
 #                       the shared pool bumps DOWN from the top
 #   ISA        16 MiB   master (core 0: vision + LM) or worker
-#   tensor     16 MiB   per-engine scratch: vision attn 13.12 + prefill 1.50
+#   tensor     64 MiB   per-engine scratch: vision attn 13.12 + prefill MLP
+#                       lanes 6 + prefill attention 16 (see TILED_TENSOR_BYTES)
 #
 # WHAT IS SHARED, AND WHY IT FITS. Private decode shards are ~193 MiB/core (the
 # whole 1544 MiB weight set, N-sharded eight ways), leaving ~799 MiB of tail per
@@ -114,12 +127,14 @@ MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
 TILED_MAP_MIN_ENGINES = 8
 TILED_WINDOW_BYTES = 0x4000_0000           # 1 GiB per core, one memory controller
 TILED_ISA_BYTES = 16 * 2**20               # per-core ISA slice, inside the window
-# 32 MiB, not 16: vision attention scratch is 13.12 MiB and prefill attention
-# 1.50, which fitted 16 with nothing to spare -- and the tensor-parallel prefill
+# 64 MiB: vision attention scratch is 13.12 MiB, the tensor-parallel prefill
 # MLP adds four per-engine lane buffers (gate, up, product, down partial) at
-# 1.5 MiB each. The 16 MiB comes out of a 992 MiB weight arena that has 549 MiB
-# of contiguous tail free, so this is the cheapest space on the board.
-TILED_TENSOR_BYTES = 32 * 2**20            # per-core private scratch, inside the window
+# 1.5 MiB each, and prefill attention needs V^T [512, S] + scores [512, S] =
+# 16 MiB at an 8192 context, because a later chunk of a chunked prefill attends
+# the whole cache prefix (1.50 MiB when everything fitted one 512-row pass).
+# The space comes out of a 992 MiB weight arena that has 549 MiB of contiguous
+# tail free, so this is the cheapest space on the board.
+TILED_TENSOR_BYTES = 64 * 2**20            # per-core private scratch, inside the window
 # Core 0 carries BOTH master programs, resident at disjoint addresses: the
 # vision encoder and the LM (prefill + decoder) images. Measured 1.6 MiB and
 # 4.7 MiB; the split below is the old model map's, kept so the two cannot grow
@@ -161,16 +176,12 @@ builtins.print = quiet_print
 DEFAULT_IMAGE = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samples", "yosemite.jpg"))
 DEFAULT_AUDIO = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samples", "apex.wav"))
 
-# Static context-capacity switch. Change this single constant to 1024, 2048,
-# 3072, or 4096 when building a program image; tensor allocation and decoder
-# bounds follow it consistently. The JSON value is checked against this choice.
-MAX_CONTEXT_SIZE = 4096
-
-# Context is a static capacity setting in gemma4_e2b_config.json. Keep the
-# supported range explicit because tensor sizing and address arithmetic assume
-# 64-token alignment and the fixed 32-bit DRAM layouts below.
+# Static context capacity in tokens: a 64-aligned value in
+# [MIN_CONTEXT_SIZE, MAX_CONTEXT_SIZE], used when building a program image.
+# Tensor allocation, the RoPE tables and the decoder bounds follow it; the JSON
+# value (model.max_context_size) is checked against this choice.
 MIN_CONTEXT_SIZE = 1024
-MAX_CONTEXT_SIZE = 4096
+MAX_CONTEXT_SIZE = 8192
 
 
 def _parse_offset(val) -> int:
@@ -178,6 +189,94 @@ def _parse_offset(val) -> int:
     if isinstance(val, str):
         return int(val, 0)
     return int(val)
+
+# ==========================================================================
+# PREFILL-LENGTH FITTING
+# ==========================================================================
+# --target-prefill-tokens GROWS THE TEXT PROMPT until the assembled prefill
+# reaches a token count, because the media (if any) contribute a fixed token
+# count and only the text is free. Fixed workload shapes are the caller's
+# business (benchmark.py); this script only knows how to hit a number. The
+# filler is real instruction text, the same as qwen2.5_omni_7b's, because a
+# prompt of repeated nonsense changes what attention does with it.
+DEFAULT_PROMPT_BASE = "Respond to the request in detail."
+_FIT_FILLER_SENTENCES = (
+    "Address every part of the request before you stop, and do not end the "
+    "answer while any part of it remains uncovered.",
+    "Make the structure of the answer explicit, so the boundary between its "
+    "parts is easy to locate at a glance.",
+    "Keep each observation to a single sentence, so the shape of the response "
+    "stays easy to follow from start to finish.",
+    "Prefer concrete detail over general impression, and name what is actually "
+    "present rather than what would usually be present.",
+    "Stay grounded in the material you were given rather than in background "
+    "knowledge about material of this kind.",
+    "Use plain language throughout, and choose a concrete noun wherever an "
+    "evaluative adjective would otherwise go.",
+    "Do not repeat a point you have already made, and do not pad the answer "
+    "once its subject has been covered.",
+    "Say so briefly if something is genuinely unclear, instead of guessing at "
+    "content that is not actually there.",
+    "Work through the material methodically rather than compressing it into a "
+    "single summarising line.",
+    "Finish only once every part of the request has been addressed, and not "
+    "before that point.",
+)
+
+
+def _filler_words(count: int) -> str:
+    """``count`` words, cycling the filler sentences in order."""
+    words: list[str] = []
+    i = 0
+    while len(words) < count:
+        words.extend(_FIT_FILLER_SENTENCES[i % len(_FIT_FILLER_SENTENCES)].split())
+        i += 1
+    return " ".join(words[:count])
+
+
+def fit_prompt_to_prefill(tokenizer, render_len, target: int, base: str) -> str:
+    """Build a prompt whose rendered prompt length is ``target`` tokens.
+
+    ``render_len(prompt)`` returns the length of the FULL assembled sequence --
+    chat scaffolding plus expanded media placeholders plus the prompt. The
+    media contribution is fixed, so the length is monotone in the filler word
+    count: binary-search the words on the prompt alone, then correct against a
+    real render, walking down so the target is never exceeded.
+    """
+    base_total = render_len(base)
+    if base_total >= target:
+        return base
+    fixed = base_total - len(tokenizer(base).input_ids)   # media + scaffolding
+    want = target - fixed                                  # prompt tokens needed
+
+    def prompt_for(words: int) -> str:
+        return f"{base} {_filler_words(words)}"
+
+    lo, hi = 0, 16
+    while len(tokenizer(prompt_for(hi)).input_ids) < want:
+        hi *= 2
+        if hi > 65536:
+            raise RuntimeError(f"cannot reach {target} prompt tokens")
+    while lo < hi:                                         # smallest words >= want
+        mid = (lo + hi) // 2
+        if len(tokenizer(prompt_for(mid)).input_ids) < want:
+            lo = mid + 1
+        else:
+            hi = mid
+    words = lo
+    for _ in range(64):
+        total = render_len(prompt_for(words))
+        if total == target or (total < target and words == 0):
+            break
+        if total > target:
+            words -= 1
+        else:
+            words += 1
+            if render_len(prompt_for(words)) > target:
+                words -= 1
+                break
+    return prompt_for(max(words, 0))
+
 
 def weight_bin_generate(output_path: str | None = None, config_path: str | None = None) -> str:
     """Generate params.bin from Hugging Face model per gemma4_e2b_config.json layout.
@@ -502,7 +601,9 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
     head_dim = cfg["file_info"]["head_dim"]  # 512 (max / full attention)
     head_dim_sliding = cfg["file_info"]["head_dim_sliding"]  # 256
     hidden_size = cfg["file_info"]["hidden_size"]
-    group_size = cfg["file_info"]["group_size"]
+    num_kv_heads = int(cfg["file_info"].get("num_key_value_heads", 1))
+    num_q_heads = int(cfg["file_info"].get("num_attention_heads",
+                                           cfg["file_info"]["group_size"] * num_kv_heads))
     full_attention_layers = set(cfg["model"]["full_attention_layers"])
     mlp_elements_wide = cfg["file_info"].get("mlp_elements_wide", cfg["file_info"]["mlp_elements"])
     blk0_structure = cfg["layers"]["structure"]
@@ -534,8 +635,8 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
         attn = layer.self_attn
         is_full = layer_idx in full_attention_layers
         cur_head_dim = head_dim if is_full else head_dim_sliding
-        cur_q_size = cur_head_dim * group_size
-        cur_k_size = cur_head_dim
+        cur_q_size = cur_head_dim * num_q_heads
+        cur_k_size = cur_head_dim * num_kv_heads
 
         gamma_in = (layer.input_layernorm.weight.detach().cpu().to(torch.bfloat16).float() + gamma_offset).to(torch.bfloat16)
 
@@ -557,8 +658,8 @@ def weight_bin_generate(output_path: str | None = None, config_path: str | None 
 
         # Pad Q/K/V rows to max sizes (N dimension padding — contiguous rows, safe for sub-N matmul).
         # O weight: do NOT pad K dimension — quantize with actual K so scale/data blocks align correctly.
-        max_q_size = head_dim * group_size  # 4096
-        max_k_size = head_dim  # 512
+        max_q_size = head_dim * num_q_heads   # E2B 4096
+        max_k_size = head_dim * num_kv_heads  # E2B 512
         q_w = torch.zeros(max_q_size, hidden_size, dtype=torch.bfloat16)
         q_w[:cur_q_size, :] = q_w_actual
         k_w = torch.zeros(max_k_size, hidden_size, dtype=torch.bfloat16)
@@ -833,12 +934,36 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     bin, compiles prefill/decoder into one bin, runs prefill + decode. Numeric
     checks live in gemma4_e2b_numeric.py."""
 
+    def _kv_cache_bytes_estimate(self) -> int:
+        """Bytes of one of the K / V caches at MAX_CONTEXT_SIZE (tensor_init's
+        layout), for layers that own KV state. The KV-shared layers come from
+        the weight manifest when it is on disk; otherwise every layer counts."""
+        shared = set()
+        manifest = os.path.join(self.script_dir,
+                                os.path.dirname(self._cfg["paths"]["weights_bin"]), "params.json")
+        try:
+            with open(manifest) as f:
+                shared = set(int(k) for k in json.load(f)["host_section"]["manifest"]
+                             .get("kv_shared_map", {}))
+        except (OSError, KeyError, ValueError):
+            pass
+        total = 0
+        for layer in range(self.LAYER_SIZE):
+            if layer in shared:
+                continue
+            hd = (self.head_dim if layer in self._full_attention_layers
+                  else self.head_dim_sliding)
+            total += self.num_kv_heads * self.MAX_CONTEXT_SIZE * hd * self.bytes_per_element
+        return total
+
     def _plan_kintex_capacity(self):
         """Check the full private and shared allocation before loading weights.
 
         Count K/V on every layer as a conservative upper bound; the real loader
-        can omit borrowed K/V layers after reading the host manifest. Include
-        both layouts of MLP down (decode N-shards and prefill K-shards).
+        can omit borrowed K/V layers after reading the host manifest. Every
+        projection and the LM head have ONE private layout read by both prefill
+        and decode -- N-slices, except down's K-slices (same size) -- and none
+        is loaded shared.
         """
         import copy
         arena = copy.deepcopy(self.mc_arena)
@@ -857,10 +982,6 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                     raise ValueError("Kintex E2B projections require whole 64-column shards")
                 private_bytes += ((columns * K // 2 + 63) & ~63)
                 private_bytes += ((columns * K // UE_VECTOR_SIZE * 2 + 63) & ~63)
-            # A second packed copy, K-sharded for prefill's partial reductions.
-            lane = mlp // self.multi_core
-            private_bytes += ((self.vector_length * lane // 2 + 63) & ~63)
-            private_bytes += ((self.vector_length * lane // UE_VECTOR_SIZE * 2 + 63) & ~63)
         columns = self.EMBEDDING_ELEMENTS // self.multi_core
         private_bytes += columns * self.vector_length // 2
         private_bytes += columns * self.vector_length // UE_VECTOR_SIZE * 2
@@ -875,22 +996,30 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # matters: each compact layer and non-layer region must fit one tail.
         layer_bytes = sum((self.weight_defs[item["key"] + "_SIZE"] + 127) & ~127
                           for item in self._cfg["layers"]["structure"]
-                          if item["key"] not in self.MLP_SHARED_REGION_KEYS)
+                          if item["key"] not in self.PROJ_SHARED_REGION_KEYS)
         for layer in range(self.LAYER_SIZE):
             arena.alloc_shared(layer_bytes, f"lm.layer{layer}")
         non_layer = [item["key"] for item in self._cfg["layers"]["non_layer"]
-                     if item["key"] not in ("ROPE_LOCAL", "ROPE_GLOBAL")]
+                     if item["key"] not in ("ROPE_LOCAL", "ROPE_GLOBAL")
+                     and item["key"] not in self.LM_HEAD_REGION_KEYS]
         for key in [*non_layer, "ROPE_LOCAL", "ROPE_GLOBAL"]:
             arena.alloc_shared(self.weight_defs[key + "_SIZE"], key)
         arena.alloc_shared(UE_VECTOR_SIZE * UE_VECTOR_SIZE * self.bytes_per_element,
                            "vision identity")
+        # The KV cache and the audio program also come from the shared pool
+        # under a tiled map (tensor_init, compile_audio_fpga).
+        kv_bytes = self._kv_cache_bytes_estimate()
+        arena.alloc_shared(kv_bytes, "kv cache V")
+        arena.alloc_shared(kv_bytes, "kv cache K")
+        from gemma4_e2b_audio import AUDIO_ISA_BYTES
+        arena.alloc_shared(AUDIO_ISA_BYTES, "audio ISA")
 
         rows = max(self.max_prefill_seq_len, 1)
         mlp_lane = max(self.mlp_elements, self.mlp_elements_wide) // self.multi_core
         lane_bytes = rows * mlp_lane * self.bytes_per_element
         partial_bytes = rows * self.vector_length * self.bytes_per_element
-        aligned_rows = ((rows + 63) // 64) * 64
-        attention_bytes = (2 * self.head_dim * aligned_rows + aligned_rows**2) * self.bytes_per_element
+        attention_bytes = (self._attention_buffer_sizes()["engine_scratch"]
+                           * self.bytes_per_element)
         for engine in range(self.multi_core):
             for name, size in (("gate", lane_bytes), ("up", lane_bytes),
                                ("product", lane_bytes), ("down partial", partial_bytes)):
@@ -901,7 +1030,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 arena.alloc_tensor(engine, 16 << 20, "vision attention upper bound")
         return {"private_weights_upper_bound": private_bytes,
                 "shared_weight_bytes": sum(item["size"] for item in arena._shared_allocs
-                                            if item["what"] != "TENSOR.window"),
+                                            if item["what"] not in (
+                                                "TENSOR.window", "kv cache V",
+                                                "kv cache K", "audio ISA")),
+                "kv_cache_bytes": 2 * kv_bytes,
                 "shared_free_bytes": arena.shared_free(),
                 "tensor_bytes_per_engine": self._tile_tensor_bytes}
 
@@ -1001,6 +1133,38 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self._multi_core_schedulers[stage] = scheduler
         return scheduler
 
+    @classmethod
+    def _private_weight_bytes(cls, script_dir, multi_core: int) -> int:
+        """Per-engine bytes of the private IF4 projection slices, from the config.
+
+        Every projection at its layer's real shape -- Q/O over all query heads,
+        K/V over the KV heads (counted on every layer, though KV-shared layers
+        stage none), gate/up/down at the layer's MLP width -- plus the LM head,
+        split evenly over the engines, +5%, rounded up to 32 MiB. An upper
+        bound, which is what a reserve declared before any weight is loaded
+        needs, without the widest-layer padding of the file regions.
+        """
+        cfg = cls.load_config(script_dir=script_dir or SCRIPT_DIR)
+        fi, model = cfg["file_info"], cfg["model"]
+        hidden = int(fi["hidden_size"])
+        num_kv = int(fi.get("num_key_value_heads", 1))
+        num_q = int(fi.get("num_attention_heads", int(fi["group_size"]) * num_kv))
+        full = set(int(i) for i in model["full_attention_layers"])
+        wide_from = int(model.get("double_wide_mlp_first_layer", fi["num_layers"]))
+
+        def if4(n, k):   # packed nibbles + one bf16 scale per 64-element block
+            return n * k // 2 + n * (k // 64) * 2
+
+        total = if4(int(fi["embedding_vocab"]), hidden)          # LM head
+        for layer in range(int(fi["num_layers"])):
+            hd = int(fi["head_dim"]) if layer in full else int(fi["head_dim_sliding"])
+            mlp = int(fi["mlp_elements_wide"] if layer >= wide_from else fi["mlp_elements"])
+            total += (2 * if4(hd * num_q, hidden)                # q, o
+                      + 2 * if4(hd * num_kv, hidden)             # k, v
+                      + 3 * if4(mlp, hidden))                    # gate, up, down
+        per_engine = int(total / max(int(multi_core), 1) * 1.05)
+        return (per_engine + (32 << 20) - 1) & ~((32 << 20) - 1)
+
     def __init__(self, script_dir: str | None = None,
                  vision_kernel: str = "matmatmul", prefill_kernel: str = "streaming",
                  decode_kernel: str = "streaming", multi_core: int = 1,
@@ -1050,13 +1214,16 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                                   and user_dma_core.ANDROMEDA_CORE_COUNT == 2
                                   and user_dma_core.AVAILABLE_DRAM_SIZE_GB == 4)
         if self._use_multicore_dram_layout and not self._kintex_tiled_map:
-            require_multicore_dram(multi_core, "Gemma4 E2B")
+            require_multicore_dram(multi_core, MODEL_TITLE)
         self._tile_window_bytes = (KINTEX_TILE_BYTES if self._kintex_tiled_map
                                    else TILED_WINDOW_BYTES)
         self._tile_tensor_bytes = (KINTEX_PRIVATE_TENSOR_BYTES if self._kintex_tiled_map
                                    else TILED_TENSOR_BYTES)
-        self._tile_private_reserve_bytes = (KINTEX_PRIVATE_RESERVE_BYTES
-            if self._kintex_tiled_map else TILED_PRIVATE_RESERVE_BYTES)
+        # The floor per map, raised to what this model's slices need (E4B).
+        self._tile_private_reserve_bytes = max(
+            KINTEX_PRIVATE_RESERVE_BYTES if self._kintex_tiled_map
+            else TILED_PRIVATE_RESERVE_BYTES,
+            self._private_weight_bytes(script_dir, multi_core))
         # THE TILED MAP IS SELECTED BY ENGINE COUNT AND BOARD. Kintex uses
         # its two 2 GiB controller windows. At 8 engines on a characterised
         # Alveo board, the windows become 1 GiB and
@@ -1072,7 +1239,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         elif multi_core >= TILED_MAP_MIN_ENGINES:
             try:
                 self._tile_bases = tiled_window_bases(
-                    multi_core, TILED_WINDOW_BYTES, "Gemma4 E2B")
+                    multi_core, TILED_WINDOW_BYTES, MODEL_TITLE)
                 self._tiled_map = True
             except (ValueError, RuntimeError) as exc:
                 print(f"  [map] tiled 1 GiB map unavailable, using the 512 MiB "
@@ -1237,8 +1404,18 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self.group_size = fi["group_size"]
         self.mlp_elements = fi["mlp_elements"]
         self.mlp_elements_wide = fi.get("mlp_elements_wide", fi["mlp_elements"])
-        self.q_size = self.head_dim * self.group_size * self.bytes_per_element
-        self.k_size = self.head_dim * self.bytes_per_element
+        # Attention heads. group_size is query heads PER KV head (GQA ratio):
+        # E2B has 8 query heads over 1 KV head, E4B 8 over 2 (group_size 4).
+        self.num_kv_heads = int(fi.get("num_key_value_heads", 1))
+        self.num_q_heads = int(fi.get("num_attention_heads",
+                                      self.group_size * self.num_kv_heads))
+        if self.num_q_heads != self.group_size * self.num_kv_heads:
+            raise ValueError(
+                f"num_attention_heads {self.num_q_heads} != group_size "
+                f"{self.group_size} x num_key_value_heads {self.num_kv_heads}")
+        # q_size / k_size: bytes of one token's Q / K row (all heads).
+        self.q_size = self.head_dim * self.num_q_heads * self.bytes_per_element
+        self.k_size = self.head_dim * self.num_kv_heads * self.bytes_per_element
         self.MAX_CONTEXT_SIZE = MAX_CONTEXT_SIZE
         # Keep fallback config lookups (for example sliding_window) consistent
         # when the source macro is changed without editing the JSON file.
@@ -1348,7 +1525,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         """Load gemma4_e2b_config.json and build weight_defs (offset/size dict) from regions."""
         if config_path is None:
             script_dir = script_dir or SCRIPT_DIR
-            config_path = os.path.join(script_dir, "gemma4_e2b_config.json")
+            config_path = os.path.join(script_dir, f"{MODEL_NAME}_config.json")
         with open(config_path, "r") as f:
             cfg = json.load(f)
         weight_defs = {"LAYER_WEIGHT_SIZE": cfg["file_info"]["layer_size"]}
@@ -1419,8 +1596,105 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         print(f"Audio prefill: {len(token_ids)} tokens, "
               f"{sum(kind == 3 for kind in mm_types)} audio tokens")
 
+    def set_prefill_seq_media(self, image_path: str | None = None, frames: int = 1,
+                              audio_path: str | None = None,
+                              audio_seconds: float | None = None,
+                              prompt: str | None = None,
+                              target_prefill_tokens: int | None = None,
+                              prompt_base: str | None = None) -> None:
+        """One user turn of [audio] + ``frames`` x [image] + text, encoders on FPGA.
+
+        Each frame is its own image block and its own real vision-encoder run,
+        in prompt order; the audio clip (trimmed or repeated to
+        ``audio_seconds``) runs through the FPGA audio encoder. With
+        ``target_prefill_tokens`` the text is grown with instruction filler
+        until the whole prompt is that many tokens (fit_prompt_to_prefill).
+        """
+        from PIL import Image
+        from transformers import AutoProcessor
+
+        frames = max(int(frames or 1), 1) if image_path else 0
+        self._ensure_model_loaded()
+        processor = AutoProcessor.from_pretrained(self.hf_model_dir)
+        images = None
+        if image_path:
+            image = Image.open(image_path).convert("RGB").resize(
+                VISION_CANONICAL_SIZE, Image.BICUBIC)
+            images = [image.copy() for _ in range(frames)]
+        samples = None
+        if audio_path:
+            rate = processor.feature_extractor.sampling_rate
+            samples = self._load_audio_samples(audio_path, rate, audio_seconds)
+
+        # Audio first, then the frames: the order the answer is asked for.
+        media = ([{"type": "audio"}] if audio_path else []) + [{"type": "image"}] * frames
+
+        def _content(text: str) -> list:
+            return media + [{"type": "text", "text": text}]
+
+        def _render(text: str):
+            rendered = processor.apply_chat_template(
+                [{"role": "user", "content": _content(text)}],
+                add_generation_prompt=True, tokenize=False)
+            kwargs = {"text": [rendered], "return_tensors": "pt"}
+            if images is not None:
+                kwargs["images"] = [images]
+            if samples is not None:
+                kwargs["audio"] = [samples]
+                kwargs["sampling_rate"] = processor.feature_extractor.sampling_rate
+            return processor(**kwargs)
+
+        if prompt is None:
+            prompt = prompt_base or DEFAULT_PROMPT_BASE
+            if target_prefill_tokens:
+                prompt = fit_prompt_to_prefill(
+                    processor.tokenizer,
+                    lambda text: int(_render(text)["input_ids"].shape[1]),
+                    int(target_prefill_tokens), prompt)
+        self._fitted_prompt = prompt
+
+        # Vision: one real encoder run per frame, features concatenated in order.
+        image_features = None
+        vis_hw_us, vis_e2e_s = 0.0, 0.0
+        for f in range(frames):
+            feats, _, _ = self._run_vision_encoder_fpga(image_path, "Describe this image.")
+            image_features = feats if image_features is None else torch.cat((image_features, feats), 0)
+            vis_hw_us += float(getattr(self, "_vis_last_latency_us", 0.0) or 0.0)
+            vis_e2e_s += float(getattr(self, "_vis_e2e_s", 0.0) or 0.0)
+            print(f"[media] vision frame {f + 1}/{frames}: {feats.shape[0]} soft tokens")
+        if frames:
+            # The summary reports the whole vision stage, every frame.
+            self._vis_last_latency_us = vis_hw_us
+            self._vis_e2e_s = vis_e2e_s
+            self._vis_frames = frames
+
+        if audio_path:
+            proc_kwargs = {"images": [images]} if images is not None else None
+            audio_features, token_ids, mm_types = self._run_audio_encoder_fpga(
+                audio_path, prompt, target_seconds=audio_seconds,
+                conversation_content=_content(prompt), processor_kwargs=proc_kwargs)
+            self._audio_features = audio_features
+        else:
+            inputs = _render(prompt)
+            token_ids = inputs["input_ids"][0].tolist()
+            mm_types = inputs["mm_token_type_ids"][0].tolist()
+        n_img = sum(t == 1 for t in mm_types)
+        n_aud = sum(t == 3 for t in mm_types)
+        if image_features is not None and image_features.shape[0] != n_img:
+            raise RuntimeError(
+                f"{frames} frame(s) produced {image_features.shape[0]} image features "
+                f"for {n_img} image-token positions")
+        self.prefill_seq = tuple(token_ids)
+        self._image_features = image_features
+        self._mm_types = mm_types
+        self._media_counts = {"image_frames": frames, "image_tokens": n_img,
+                              "audio_tokens": n_aud,
+                              "audio_seconds": getattr(self, "_audio_seconds", None) if audio_path else None}
+        print(f"Media prefill: {len(token_ids)} tokens ({n_img} image over {frames} frame(s), "
+              f"{n_aud} audio, {len(token_ids) - n_img - n_aud} text)")
+
     def _program_image_paths(self, profile: bool = False) -> tuple[str, str]:
-        bin_dir = os.path.join(self.script_dir, "gemma4_e2b_bin")
+        bin_dir = os.path.join(self.script_dir, f"{MODEL_NAME}_bin")
         stem = "programs_profile" if profile else "programs"
         return (os.path.join(bin_dir, stem + ".bin"),
                 os.path.join(bin_dir, stem + ".json"))
@@ -1445,7 +1719,13 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         return sections, data
 
     def _get_program_section(self, name: str, profile: bool = False):
-        """Return (section_meta, section_bytes) for `name`, or (None, None)."""
+        """Return (section_meta, section_bytes) for `name`, or (None, None).
+
+        Served from the in-memory snapshot (_section_cache) when one is set, so
+        a timed run never reads programs.bin from disk; see prepare_prefill_chunks."""
+        cache = getattr(self, "_section_cache", None)
+        if cache is not None and not profile and name in cache:
+            return cache[name]
         sections, data = self._read_program_sections(profile)
         s = sections.get(name)
         if s is None:
@@ -1521,7 +1801,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self.allocate_program_dram(len(sect_bytes))
         return {**meta, "_dram_base_int": base}
 
-    def compile_gemma4(self, layer_size: int = 35, profile: bool = False) -> None:
+    def compile_gemma4(self, layer_size: int | None = None, profile: bool = False) -> None:
         """Capture [prefill][decoder] into one combined image and write it to
         disk (gemma4_e2b_bin/programs.bin + programs.json). No DRAM is touched —
         run_gemma4() loads it.
@@ -1533,11 +1813,17 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
 
         set_prefill_seq() MUST have been called first (prefill needs the prompt).
         """
+        layer_size = self.LAYER_SIZE if layer_size is None else int(layer_size)
         assert self.prefill_seq is not None, (
             "call set_prefill_seq() before compile_gemma4()")
         prefill_template_seq_len = int(self._cfg["model"].get(
             "prefill_max_seq_len", self.max_prefill_seq_len))
-        prefill_flops_seq_len = len(self.prefill_seq) - 1
+        # A prompt longer than max_prefill_seq_len is prefilled in chunks, each
+        # its own compile (run_gemma4 sets _prefill_chunk per chunk); compiling
+        # without one builds the first chunk.
+        prefill_pos_offset, prefill_flops_seq_len = (
+            getattr(self, "_prefill_chunk", None)
+            or self.prefill_chunks(len(self.prefill_seq) - 1)[0])
         if self.multi_core > 1 and prefill_flops_seq_len < self.multi_core:
             raise ValueError(
                 f"{self.multi_core}-engine fixed prefill requires at least "
@@ -1551,6 +1837,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         if (self.bin_reuse
                 and _lm_meta is not None
                 and _lm_meta.get("prefill_flops_seq_len") == prefill_flops_seq_len
+                and _lm_meta.get("prefill_pos_offset", 0) == prefill_pos_offset
                 and _lm_meta.get("prefill_kernel") == self.prefill_kernel
                 and _lm_meta.get("decode_kernel") == self.decode_kernel
                 and _lm_meta.get("multi_core", 1) == self.multi_core
@@ -1560,6 +1847,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                         and meta.get("prefill_kernel") == self.prefill_kernel
                         for meta in _prefill_worker_metas)):
             bin_path, _ = self._program_image_paths(profile)
+            # The image bakes the per-engine weight slices' and scratch
+            # addresses; stage them exactly as a compile would.
+            if prefill_scheduler is not None:
+                self._stage_prefill_private_state(prefill_scheduler, layer_size)
             print(f"[compile] reusing existing instruction image at {bin_path}")
             print(f"  delete {bin_path} (or make clean) to force recompile.")
             self._lm_compile_reused = True
@@ -1590,6 +1881,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                     worker.alloc_isa_reg() for worker in prefill_scheduler.workers)
                 self._active_prefill_scheduler = prefill_scheduler
             _, prefill_total_flops = self.compile_prefill(seq_len=prefill_flops_seq_len,
+                                                          pos_offset=prefill_pos_offset,
                                                           layer_size=layer_size,
                                                           profile=profile)
             prefill_program_addr = instruction_base_addr + prefill_count_at_start * INSTRUCTION_SIZE_BYTES
@@ -1648,6 +1940,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "instruction_base_addr": f"0x{instruction_base_addr:X}",
             "prefill_template_seq_len": prefill_template_seq_len,
             "prefill_flops_seq_len": prefill_flops_seq_len,
+            "prefill_pos_offset": prefill_pos_offset,
             "prefill_program_start_addr": f"0x{prefill_program_addr:X}",
             "prefill_program_size": prefill_size_bytes,
             "prefill_total_flops": prefill_total_flops,
@@ -1717,6 +2010,82 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
               f"prefill @ 0x{prefill_program_addr:X} ({prefill_size_bytes/1024:.1f} KB), "
               f"decoder @ 0x{decoder_program_addr:X} ({decoder_size_bytes/1024:.1f} KB)")
 
+    def _snapshot_program_sections(self) -> dict:
+        """{name: (meta, bytes)} of every valid section in programs.bin, read once."""
+        sections, _ = self._read_program_sections()
+        snap = {}
+        for name in sections:
+            meta, data = self._get_program_section(name)
+            if meta is not None:
+                snap[name] = (meta, bytes(data))
+        return snap
+
+    def prepare_prefill_chunks(self) -> None:
+        """Compile every prefill chunk's program image up front (one-time cost).
+
+        Call after compile_gemma4(), which built the first chunk. Each later
+        chunk has its position offset baked in, so it is its own compile; all
+        of them target the same ISA base, so they cannot be resident together.
+        The compiled sections are kept in host memory (_chunk_sections) and the
+        rest of programs.bin is snapshotted too (_section_cache), so run_gemma4
+        only DMAs a chunk's image in before running it -- no compile and no
+        disk read inside the timed run.
+        """
+        self._section_cache = None
+        chunks = self.prefill_chunks(len(self.prefill_seq) - 1)
+        # The LM image carries the decoder too, and the decode workers' images
+        # (and their register assignment) belong to the same compile, so they
+        # travel with each chunk's LM image.
+        names = (["lm"] + [f"prefill_worker{i}" for i in range(1, self.multi_core)]
+                 + [f"decode_worker{i}" for i in range(1, self.multi_core)])
+        first = self._snapshot_program_sections()
+        self._chunk_sections = [{n: first[n] for n in names if n in first}]
+        # Every chunk's worker programs go where the first chunk's start: only
+        # one chunk's set is resident at a time, and without the rewind each
+        # compile would place its set after the previous one and walk the
+        # worker's 16 MiB ISA slice off its end (12 chunks at 6144 tokens).
+        sched = self._ensure_prefill_scheduler()
+        worker_bases = {}
+        if sched is not None:
+            for i, w in enumerate(sched.workers, start=1):
+                meta = first.get(f"prefill_worker{i}", (None,))[0]
+                if meta is not None:
+                    worker_bases[i] = (w, int(meta["dram_base"], 16))
+        for pos_offset, chunk_len in chunks[1:]:
+            for w, base in worker_bases.values():
+                w._next_program_dram_addr = base
+            self._prefill_chunk = (pos_offset, chunk_len)
+            self.compile_gemma4()
+            snap = self._snapshot_program_sections()
+            self._chunk_sections.append({n: snap[n] for n in names if n in snap})
+        self._prefill_chunk = None
+        # Everything else (vision, audio, decode workers) is chunk-independent.
+        self._section_cache = {**first, **self._chunk_sections[0]}
+        if len(chunks) > 1:
+            print(f"[compile] {len(chunks)} prefill chunks compiled; images held in host memory")
+
+    def prefill_chunks(self, prompt_len: int) -> list[tuple[int, int]]:
+        """Split a prompt into (pos_offset, length) prefill chunks.
+
+        One chunk when it fits max_prefill_seq_len. Otherwise the fewest chunks
+        that do, of near-equal length -- so the last one is never a sliver
+        (multi-core prefill needs at least one row per engine).
+        """
+        prompt_len = int(prompt_len)
+        if prompt_len > self.MAX_CONTEXT_SIZE - 1:
+            raise ValueError(
+                f"prompt of {prompt_len + 1} tokens leaves no room to decode in a "
+                f"{self.MAX_CONTEXT_SIZE}-token context")
+        cap = max(int(self.max_prefill_seq_len), 1)
+        n = max(1, -(-prompt_len // cap))
+        base, rem = divmod(prompt_len, n)
+        chunks, off = [], 0
+        for i in range(n):
+            length = base + (1 if i < rem else 0)
+            chunks.append((off, length))
+            off += length
+        return chunks
+
     def run_gemma4(self) -> tuple[int, float, float, float, float, float]:
         """Load the combined image from disk into program DRAM, then run one
         prefill pass and decode to the stop token / context limit — the gemma4
@@ -1754,15 +2123,50 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         print(f"--- Prompt end ---")
 
         timer = time.perf_counter()
-        latency_hw_prefill, _flop_rate_hw_prefill = self.run_prefill(
-            prefill_program_addr, flops=meta["prefill_total_flops"])
+        chunks = self.prefill_chunks(len(self.prefill_seq) - 1)
+        latency_hw_prefill, prefill_total_flops, program_dma_s = 0.0, 0, 0.0
+        if len(chunks) > 1 and len(getattr(self, "_chunk_sections", [])) != len(chunks):
+            raise RuntimeError("chunked prefill: call prepare_prefill_chunks() after compile_gemma4()")
+        for i, (pos_offset, chunk_len) in enumerate(chunks):
+            if i > 0:
+                # Chunks past the first run their own image (the offset is baked
+                # in), compiled up front by prepare_prefill_chunks: swap its
+                # sections in and DMA the LM image to the same base. The worker
+                # images are DMA'd by run_prefill, as for the first chunk.
+                _c0 = time.perf_counter()
+                self._section_cache.update(self._chunk_sections[i])
+                meta = self._load_program_section("lm")
+                prefill_program_addr = int(meta["prefill_program_start_addr"], 16)
+                decoder_program_addr = int(meta["decoder_program_start_addr"], 16)
+                self._decode_attn_worker_regs = [
+                    {k: int(vv) for k, vv in r.items()}
+                    for r in meta.get("decoder_attn_worker_regs", [])]
+                self._preamble_addr = self.get_program_dram_addr()
+                program_dma_s += time.perf_counter() - _c0
+            if len(chunks) > 1:
+                print(f"[Prefill] chunk {i + 1}/{len(chunks)}: positions "
+                      f"[{pos_offset}, {pos_offset + chunk_len})", flush=True)
+            _lat, _rate = self.run_prefill(
+                prefill_program_addr, flops=meta["prefill_total_flops"],
+                pos_offset=pos_offset, chunk_len=chunk_len)
+            latency_hw_prefill += _lat
+            prefill_total_flops += meta["prefill_total_flops"]
+        self._prefill_chunk = None
         latency_prefill = time.perf_counter() - timer
+        _flop_rate_hw_prefill = (prefill_total_flops / (latency_hw_prefill * 1e3)
+                                 if latency_hw_prefill else 0.0)
         # Stash prefill metrics for the run-summary writer (write_run_summary).
         self._prefill_seq_len = self.seq_len
         self._prefill_latency_hw_us = latency_hw_prefill
         self._prefill_flop_rate_gflops = _flop_rate_hw_prefill
-        self._prefill_total_flops = meta["prefill_total_flops"]
+        self._prefill_total_flops = prefill_total_flops
         self._prefill_e2e_s = latency_prefill
+        self._prefill_chunk_count = len(chunks)
+        self._prefill_program_dma_s = program_dma_s
+        if len(chunks) > 1:
+            print(f"[Prefill] {len(chunks)} chunks: HW {latency_hw_prefill / 1e6:.2f} s, "
+                  f"wall {latency_prefill:.2f} s (of which {program_dma_s:.2f} s DMA-ing "
+                  f"the later chunks' LM images)", flush=True)
         print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n", flush=True)
 
         timer = time.perf_counter()
@@ -1841,6 +2245,69 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         except Exception:
             return None
 
+    def run_result(self) -> dict:
+        """The run's headline numbers as one flat dict (the TEST_RESULT line).
+
+        Every value comes from metrics already stashed by the encoders,
+        run_gemma4 and run_decoder; missing ones are None. TTFT (HW) is the
+        encoders' HW counters plus prefill's; TTFT (wall) is their run times
+        plus prefill's wall time (which includes DMA-ing the later prefill
+        chunks' LM images, reported separately as prefill_program_dma_s).
+        Compiles are one-time setup and are in neither."""
+        def _g(name):
+            return getattr(self, name, None)
+        clock_ns = self._clock_period_ns
+        freq_mhz = 1000.0 / clock_ns if clock_ns else 0.0
+        peak = freq_mhz * 0.128 * self.multi_core
+        media = _g("_media_counts") or {}
+        n_img = media.get("image_tokens")
+        if n_img is None and _g("_vis_num_soft_tokens") is not None and _g("_vis_last_latency_us"):
+            n_img = int(self._vis_num_soft_tokens)
+        vis_us = _g("_vis_last_latency_us")
+        aud_us = _g("_audio_hw_latency_us")
+        pf_us = _g("_prefill_latency_hw_us")
+        pf_seq = _g("_prefill_seq_len")
+        pf_model = self._model_flops_prefill()
+        gen_n = _g("_decode_generated_n")
+        dec_us = _g("_decode_hw_latency_us")
+        dec_model = (self._model_flops_decode(gen_n, self.seq_len) if gen_n else None)
+        enc_hw_s = sum(v for v in (vis_us, aud_us) if v) / 1e6
+        enc_wall_s = sum(v for v in (_g("_vis_e2e_s"), _g("_audio_e2e_s")) if v)
+        return {
+            "model": MODEL_NAME,
+            "multi_core": self.multi_core,
+            "clock_mhz": round(freq_mhz, 3),
+            "peak_gflops": round(peak, 1),
+            "max_context_size": self.MAX_CONTEXT_SIZE,
+            "prompt_tokens": len(self.prefill_seq),
+            "image_frames": media.get("image_frames", 1 if vis_us else 0),
+            "image_tokens": n_img or 0,
+            "audio_tokens": media.get("audio_tokens"),
+            "audio_seconds": media.get("audio_seconds", _g("_audio_seconds")),
+            "vision_hw_s": vis_us / 1e6 if vis_us else None,
+            "vision_wall_s": _g("_vis_e2e_s"),
+            "audio_hw_s": aud_us / 1e6 if aud_us else None,
+            "audio_wall_s": _g("_audio_e2e_s"),
+            "prefill_tokens": pf_seq,
+            "prefill_chunks": _g("_prefill_chunk_count"),
+            "prefill_hw_s": pf_us / 1e6 if pf_us else None,
+            "prefill_wall_s": _g("_prefill_e2e_s"),
+            "prefill_program_dma_s": _g("_prefill_program_dma_s"),
+            "prefill_hw_tok_s": pf_seq / (pf_us * 1e-6) if pf_us and pf_seq else None,
+            "prefill_gflops_issued": _g("_prefill_flop_rate_gflops"),
+            "prefill_gflops_model": pf_model / (pf_us * 1e3) if pf_model and pf_us else None,
+            "ttft_hw_s": enc_hw_s + pf_us / 1e6 if pf_us else None,
+            "ttft_wall_s": (enc_wall_s + _g("_prefill_e2e_s")
+                            if _g("_prefill_e2e_s") is not None else None),
+            "decode_tokens": gen_n,
+            "decode_first_token_tok_s": _g("_decode_peak_toks"),
+            "decode_avg_tok_s": _g("_decode_avg_toks"),
+            "decode_hw_tok_s": gen_n / (dec_us * 1e-6) if gen_n and dec_us else None,
+            "decode_gflops_model": dec_model / (dec_us * 1e3) if dec_model and dec_us else None,
+            "final_seq_len": self.seq_len,
+            "decoded_text": _g("_decoded_text"),
+        }
+
     def write_run_summary(self, out_path: str, args) -> str:
         """Write a per-run Markdown summary (weights/program sizes, per-stage HW
         latency + FLOPS, decode throughput, and the prompt/decoded text) built
@@ -1890,7 +2357,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         is_audio = bool(getattr(args, "audio", None))
 
         lines = []
-        lines.append(f"# gemma4_e2b_test run summary")
+        lines.append(f"# {MODEL_NAME}_test run summary")
         lines.append("")
         lines.append(f"- **HW version:** {hw_version_str}")
         lines.append(f"- **--dev:** {args.dev}")
@@ -1925,6 +2392,15 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         lines.append("")
         lines.append(f"- **Weight bin:** `{os.path.basename(weight_bin_path)}` — {_mb(weight_bin_size)}")
         lines.append(f"- **Total weight DRAM (quantized, on FPGA):** {total_weight_dram_mb:.1f} MB")
+        if getattr(self, "mc_arena", None) is not None:
+            # Per-engine private shards (decode and prefill layouts) live in the
+            # engine windows, outside the shared params figure above.
+            _priv = self.mc_arena.usage()
+            lines.append(f"- **Private weight DRAM (per-engine shards):** "
+                         f"{sum(_priv) / 2**20:.1f} MB ({max(_priv) / 2**20:.1f} MB "
+                         f"on the fullest engine)")
+            lines.append(f"- **All weight DRAM (shared + private):** "
+                         f"{total_weight_dram_mb + sum(_priv) / 2**20:.1f} MB")
         lines.append("")
 
         # --- Program image ---------------------------------------------------
@@ -2240,7 +2716,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                         self._cfg, int(target_pos), self._kv_shared_map)
                         if isinstance(target_pos, int) else None)
         _append_profile_section(
-            f"1024th token (position {target_pos})",
+            f"Token {target_pos + 1} (position {target_pos})",
             getattr(self, "_decode_1024_profile_results", None), level=3,
             model_phases=target_model)
 
@@ -2320,7 +2796,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         ]
         hw = user_dma_core.configured_hardware_info()
         return write_profile_markdown(
-            out_path, title="Gemma4 E2B profile summary",
+            out_path, title=f"{MODEL_TITLE} profile summary",
             hardware={
                 "HW info": user_dma_core.hardware_info_summary(),
                 "DMA device": args.dev,
@@ -2394,6 +2870,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             measured_ms = self.report_latency_in_us() / 1e3
             results.append((name, measured_ms,
                             phase_flops))   # ms, FLOPs
+            # Debug hook: the master is halted at this checkpoint (workers are
+            # parked at a flag), so intermediate buffers can be read back.
+            _hook = getattr(self, "_profile_segment_hook", None)
+            if _hook is not None:
+                _hook(name)
             self.start_execute_from_dram(int(resume_hex, 16))
         self.wait_queue(timeout)   # tail segment: everything up to the terminal HALT
         tail_ms = self.report_latency_in_us() / 1e3
@@ -2440,7 +2921,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             if match:
                 layer_idx = int(match.group(1))
                 head_dim, _, _ = self._get_layer_attention_dims(layer_idx)
-                batch = self.group_size
+                batch = self.num_q_heads
                 # The inlined multi-core chain drops the Q pre-scale (gemma's attention
                 # scale is exactly 1.0, so it was a multiply by one); single-core still
                 # emits it via unified_attention_core.
@@ -2618,12 +3099,17 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self._decode_profile_results = decode_results
         self._print_phase_breakdown("DECODE (first step)", decode_results, per_token=True)
 
-        # Performance-only 1024th-token profile. Intermediate KV rows are left
-        # as initialized/prefill data; values do not affect the execution path.
-        target_context_len = 1024
+        # Performance-only large-context profile (1024 tokens unless
+        # --profile-context says otherwise). Intermediate KV rows are left as
+        # initialized/prefill data; values do not affect the execution path.
+        target_context_len = int(getattr(self, "profile_context_len", 1024))
+        if not 1 <= target_context_len <= self.MAX_CONTEXT_SIZE:
+            raise ValueError(
+                f"--profile-context {target_context_len} is outside "
+                f"[1, max_context_size={self.MAX_CONTEXT_SIZE}]")
         aligned_seq_len = _prepare_decode_position(target_context_len)
         self._decode_1024_profile_position = target_context_len - 1
-        print(f"\n--- Profiling 1024th token (pos {target_context_len - 1}) ---",
+        print(f"\n--- Profiling token {target_context_len} (pos {target_context_len - 1}) ---",
               flush=True)
         _dec_long_cpu_start = time.perf_counter()
         decode_1024_results = self._decode_profile_execute(
@@ -2633,7 +3119,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             time.perf_counter() - _dec_long_cpu_start) * 1e3
         self._decode_1024_profile_results = decode_1024_results
         self._print_phase_breakdown(
-            "DECODE (1024th token)", decode_1024_results, per_token=True)
+            f"DECODE (token {target_context_len})", decode_1024_results, per_token=True)
 
     @staticmethod
     def _parse_offset(val) -> int:
@@ -2704,6 +3190,18 @@ def add_engine_args(parser) -> None:
                              "0xC0000000:0x100000000. Use it to find which region a run "
                              "reads without initialising: poison one arena at a time, then "
                              "halve whichever range reproduces the failure.")
+    parser.add_argument("--heartbeat", type=str, nargs="?", default=None, metavar="LOG",
+                        const="",
+                        help="Sample each engine's busy/flag and retired-instruction count "
+                             "while every prefill program runs, one block per program. "
+                             "Optional LOG path; default "
+                             "gemma4_e2b_heartbeat_<dev>_<timestamp>.log beside this script.")
+    parser.add_argument("--heartbeat-interval", type=float, default=1.0, metavar="S",
+                        help="Seconds between --heartbeat samples. Default: 1")
+    parser.add_argument("--heartbeat-precheck", action="store_true",
+                        help="With --heartbeat: before every sampled FPGA program, run "
+                             "andromeda's hw_check.py (must be alive, same version) and "
+                             "temp_check.tcl (die temperatures, recorded only).")
     parser.add_argument("--bin-reuse", action="store_true",
                         help="Reuse a matching cached program image (programs.bin) if it "
                              "exists instead of recompiling. Default: OFF (fresh compile "
@@ -2803,7 +3301,7 @@ def build_arg_parser():
     """
     import argparse
     parser = argparse.ArgumentParser(
-        description="Gemma4 E2B LM prefill + decode on the accelerator.",
+        description=f"{MODEL_TITLE} LM prefill + decode on the accelerator.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
   python gemma4_e2b_test.py                          # default prompt
@@ -2828,6 +3326,23 @@ default prompt: "x+3=5, what is x?"
     parser.add_argument('--profile', action='store_true',
                         help='Compile a profile bin with per-phase HALT checkpoints and run one '
                              'profiled decode step; print a per-phase HW-latency breakdown.')
+    parser.add_argument("--frames", type=int, default=1, metavar="N",
+                        help="With --image, N camera frames: N image blocks in the prompt, "
+                             "each its own FPGA vision-encoder run.")
+    parser.add_argument("--audio-seconds", type=float, default=None, metavar="S",
+                        help="With --audio, trim the clip to S seconds (or repeat it until it "
+                             "is that long), so the audio shape does not depend on the file.")
+    parser.add_argument("--target-prefill-tokens", type=int, default=None, metavar="N",
+                        help="Grow the text prompt with instruction filler until the whole "
+                             "prompt (media included) is N tokens. Ignored with --prompt.")
+    parser.add_argument("--prompt-base", type=str, default=None, metavar="TEXT",
+                        help="Instruction text --target-prefill-tokens pads with filler "
+                             f"(default {DEFAULT_PROMPT_BASE!r}).")
+    parser.add_argument("--summary", type=str, default=None, metavar="PATH",
+                        help="Write the run summary to PATH instead of the CLI-derived name.")
+    parser.add_argument('--profile-context', type=int, default=1024, metavar='N',
+                        help='With --profile, the context length of the large-context decode '
+                             'probe (default 1024; up to max_context_size).')
     return parser
 
 
@@ -2842,7 +3357,9 @@ def run_summary_filename(args) -> str:
     args.prefill_kernel for multi-core — otherwise an auto-forced kernel would
     leak into the name.
     """
-    if args.audio:
+    if args.audio and args.image:
+        mode = "image+audio"
+    elif args.audio:
         mode = "audio"
     elif args.image:
         mode = "image"
@@ -2862,7 +3379,7 @@ def run_summary_filename(args) -> str:
     if args.bin_reuse:
         tokens.append("bin-reuse")
     suffix = "_profile" if args.profile else ""
-    return "gemma4_e2b_test_" + "_".join(str(t) for t in tokens) + suffix + ".md"
+    return f"{MODEL_NAME}_test_" + "_".join(str(t) for t in tokens) + suffix + ".md"
 
 
 def poison_dram(pattern: str = "ff", dram_range: str | None = None,
@@ -2953,8 +3470,12 @@ def main():
     # shared kernel validation + HW_INFO wiring lives in resolve_engine_config().
     if args.vision_host and not args.image:
         parser.error("--vision-host requires --image")
-    if args.image and args.audio:
-        parser.error("--image and --audio are mutually exclusive")
+    if args.vision_host and args.audio:
+        parser.error("--vision-host cannot be combined with --audio")
+    if args.frames < 1 or (args.frames > 1 and not args.image):
+        parser.error("--frames N needs --image and N >= 1")
+    if args.audio_seconds is not None and not args.audio:
+        parser.error("--audio-seconds requires --audio")
     # Capture the summary filename now, before resolve_engine_config() mutates
     # args.prefill_kernel (multi-core forces matmatmul) — keeps auto-forced
     # kernels out of the name.
@@ -3017,6 +3538,14 @@ def main():
 
     ue = Gemma4_UnifiedEngine(**engine_kwargs)
     ue.max_new_tokens = args.max_new_tokens
+    if args.heartbeat is not None:
+        ue.heartbeat_log = args.heartbeat or os.path.join(
+            SCRIPT_DIR, f"{MODEL_NAME}_heartbeat_{args.dev}_"
+                        f"{time.strftime('%Y%m%d_%H%M%S')}.log")
+        ue.heartbeat_interval = args.heartbeat_interval
+        ue.heartbeat_precheck = args.heartbeat_precheck
+        print(f"[heartbeat] prefill programs sampled every {args.heartbeat_interval:g} s "
+              f"-> {ue.heartbeat_log}")
 
     # ISA-only second pass. After construction so ue.VISION_ISA_BASE is known
     # (it depends on the engine count), and before compile/program load, which
@@ -3041,6 +3570,24 @@ def main():
                 args.audio = candidate
         if not os.path.isfile(args.audio):
             raise SystemExit(f"--audio: file not found: {args.audio!r}")
+    if args.image and not os.path.isfile(args.image):
+        _cand = os.path.join(os.path.dirname(DEFAULT_IMAGE), os.path.basename(args.image))
+        if os.path.isfile(_cand):
+            args.image = _cand
+    _media_mode = ((args.image and args.audio) or args.frames > 1
+                   or args.audio_seconds is not None
+                   or args.target_prefill_tokens is not None or args.prompt_base is not None)
+    if _media_mode and not args.vision_host:
+        if args.image and not os.path.isfile(args.image):
+            raise SystemExit(f"--image: file not found: {args.image!r}")
+        print(f"[Mode] media (FPGA encoders) -- image: {args.image!r} x {args.frames if args.image else 0}, "
+              f"audio: {args.audio!r} ({args.audio_seconds} s), "
+              f"target prompt tokens: {args.target_prefill_tokens}")
+        ue.set_prefill_seq_media(
+            image_path=args.image, frames=args.frames, audio_path=args.audio,
+            audio_seconds=args.audio_seconds, prompt=args.prompt,
+            target_prefill_tokens=args.target_prefill_tokens, prompt_base=args.prompt_base)
+    elif args.audio:
         print(f"[Mode] audio (FPGA) -- file: {args.audio!r}")
         ue.set_prefill_seq_audio(args.audio, args.prompt)
     elif args.image:
@@ -3069,6 +3616,7 @@ def main():
     # --profile: build the instrumented bin and print a per-phase decode
     # breakdown instead of the normal generation run.
     if args.profile:
+        ue.profile_context_len = args.profile_context
         print(f"\n--- Compiling profile bin (per-phase checkpoints) ---")
         timer = time.perf_counter()
         ue.compile_gemma4(profile=True)
@@ -3080,7 +3628,7 @@ def main():
             print(f"Wrote profile summary: {_summary_path}")
         except Exception as _e:
             print(f"[warn] failed to write profile summary: {_e}")
-        print("Gemma4 E2B decode profile ends.")
+        print(f"{MODEL_TITLE} decode profile ends.")
         return
 
     # gemma3-style workflow: compile (decoder + real-seq_len prefill) then run
@@ -3088,6 +3636,7 @@ def main():
     print(f"\n--- Compiling ---")
     timer = time.perf_counter()
     ue.compile_gemma4()
+    ue.prepare_prefill_chunks()
     print(f"Compile done in {time.perf_counter() - timer:.2f} seconds")
 
     (token_cnt_decoded, latency_hw_prefill, latency_hw_decoder,
@@ -3101,13 +3650,15 @@ def main():
 
     # Per-run Markdown summary, named for the full CLI config (see
     # run_summary_filename), written next to this script.
-    _summary_path = os.path.join(SCRIPT_DIR, _summary_name)
+    _summary_path = args.summary or os.path.join(SCRIPT_DIR, _summary_name)
     try:
         ue.write_run_summary(_summary_path, args)
         print(f"Wrote run summary: {_summary_path}")
     except Exception as _e:
         print(f"[warn] failed to write run summary: {_e}")
-    print("Gemma4 E2B LM test ends.")
+    # One machine-readable line for benchmark.py (and any other driver).
+    print("TEST_RESULT: " + json.dumps(ue.run_result(), ensure_ascii=False))
+    print(f"{MODEL_TITLE} LM test ends.")
 
 
 if __name__ == "__main__":

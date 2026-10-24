@@ -452,10 +452,17 @@ class Gemma4VisionMixin:
         # Window 0 belongs to core 0, which keeps its dedicated tensor-arena
         # buffer above, so its window allocation is skipped and engine index
         # still maps straight to window index.
+        # Allocated once per size: a multi-frame prompt runs the encoder (and
+        # this init) once per frame, and fresh windows each time would walk the
+        # private cursor and re-register the scratch at new addresses.
         if self.multi_core > 1:
-            self.VIS_FLASH_SCRATCH_PER_ENGINE.extend(
-                self.mc_arena.alloc_tensor(e, attn_scratch_bytes, "vision attn scratch")
-                for e in range(1, self.multi_core))
+            _cached = getattr(self, "_vis_worker_scratch", None)
+            if _cached is None or _cached[0] != attn_scratch_bytes:
+                _cached = (attn_scratch_bytes, [
+                    self.mc_arena.alloc_tensor(e, attn_scratch_bytes, "vision attn scratch")
+                    for e in range(1, self.multi_core)])
+                self._vis_worker_scratch = _cached
+            self.VIS_FLASH_SCRATCH_PER_ENGINE.extend(_cached[1])
         self.VIS_FLASH_SCRATCH_WORKER = (
             self.VIS_FLASH_SCRATCH_PER_ENGINE[1]
             if self.multi_core > 1 else None)

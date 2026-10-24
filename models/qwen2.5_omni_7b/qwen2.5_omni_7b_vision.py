@@ -36,6 +36,7 @@ import torch
 import torch.nn.functional as F
 
 import user_dma_core
+from program_heartbeat import program_heartbeat
 from user_dma_core import (
     DMA_DEVICE_C2H, DMA_DEVICE_H2C, INSTRUCTION_SIZE_BYTES, TYPE, UE_MODE, UE_VECTOR_SIZE,
     URAM_NEAR_FULL_ELEMENTS)
@@ -1386,28 +1387,32 @@ class Qwen25OmniVisionMixin:
             latency_us = sum(r[1] for r in results) * 1e3
             self._vis_profile = results
         else:
-            # Workers first: they park on their first rendezvous and wait for
-            # the master to enter the region.
-            if sched is not None and sched.host_segmented:
-                latency_us = sched.run_host_segmented(
-                    addr, worker_addrs, timeout_seconds=timeout_s)
-            elif sched is not None:
-                sched.start_workers(worker_addrs)
-            if sched is None or not sched.host_segmented:
-                self.start_execute_from_dram(addr)
-                self.wait_queue(timeout_s)
-                if self.is_queue_busy():
-                    raise TimeoutError(
-                        f"vision master is still busy after {timeout_s:.1f}s")
-                for idx, wk in enumerate(
-                    sched.workers if sched is not None else [], start=1
-                ):
-                    wk.wait_queue(timeout_s)
-                    if wk.is_queue_busy():
+            # --heartbeat: sample every engine of this vision run, launch to HALT.
+            hb_engines = [self] + (list(sched.workers) if sched is not None else [])
+            with program_heartbeat(self, f"vision encoder, {len(hb_engines)} engine(s)",
+                                   hb_engines):
+                # Workers first: they park on their first rendezvous and wait for
+                # the master to enter the region.
+                if sched is not None and sched.host_segmented:
+                    latency_us = sched.run_host_segmented(
+                        addr, worker_addrs, timeout_seconds=timeout_s)
+                elif sched is not None:
+                    sched.start_workers(worker_addrs)
+                if sched is None or not sched.host_segmented:
+                    self.start_execute_from_dram(addr)
+                    self.wait_queue(timeout_s)
+                    if self.is_queue_busy():
                         raise TimeoutError(
-                            f"vision worker {idx} is still busy after "
-                            f"{timeout_s:.1f}s")
-                latency_us = self.report_latency_in_us()
+                            f"vision master is still busy after {timeout_s:.1f}s")
+                    for idx, wk in enumerate(
+                        sched.workers if sched is not None else [], start=1
+                    ):
+                        wk.wait_queue(timeout_s)
+                        if wk.is_queue_busy():
+                            raise TimeoutError(
+                                f"vision worker {idx} is still busy after "
+                                f"{timeout_s:.1f}s")
+                    latency_us = self.report_latency_in_us()
         wall = time.perf_counter() - t0
         gflops = (self._vis_encoder_flops / (latency_us * 1e-6) / 1e9
                   if latency_us > 0 else 0.0)

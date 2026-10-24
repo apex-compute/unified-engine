@@ -1719,6 +1719,7 @@ class UnifiedEngine:
             if elapsed >= timeout_seconds:
                 # The queue can finish during the final polling interval.
                 if not self.is_queue_busy():
+                    self._halt_seen_wall_s = time.perf_counter()
                     return
                 # Raise rather than print and return: model decoders suppress prints
                 # and would otherwise consume stale results after an unfinished run.
@@ -1752,6 +1753,7 @@ class UnifiedEngine:
                     f"wait_queue() timed out after {elapsed:.3f} seconds "
                     f"({iteration} polls); " + ", ".join(details)
                 )
+        self._halt_seen_wall_s = time.perf_counter()
 
     def dma_write(self, device: str, address: int, buffer, size: int) -> int:
         """
@@ -12675,6 +12677,9 @@ class UnifiedEngine:
                             (default: DRAM_INSTRUCTION_ADDR)
         """
         self._last_execute_addr = int(instruction_addr)
+        # Host launch time: read_latency_cycles() uses it to undo PIPELINE_COUNTER wraps.
+        self._launch_wall_s = time.perf_counter()
+        self._halt_seen_wall_s = None
         self.write_reg32(UE_INSTRUCTION_ADDR, ue_35bit_addr_shifter(instruction_addr))
 
     def program_execute(self, program_start_addr: int = DRAM_INSTRUCTION_ADDR, timeout: float = 50.0, flops: float = None) -> None:
@@ -12726,8 +12731,26 @@ class UnifiedEngine:
 
 
     def read_latency_cycles(self) -> int:
-        """Read the last program latency in FPGA ``aclk`` cycles."""
-        return self.read_latency_counter_ticks() * UE_PIPELINE_COUNTER_CLK_DIV
+        """Read the last program latency in FPGA ``aclk`` cycles.
+
+        PIPELINE_COUNTER is 32 bits of UE_PIPELINE_COUNTER_CLK_DIV-cycle ticks, so it
+        wraps every 2**32 * CLK_DIV cycles: 187 s at 366.67 MHz, 206 s at 333.33 MHz,
+        344 s at 200 MHz. The host time from start_execute_from_dram() to the halt
+        wait_queue() observed (or to now, if the caller polled the queue itself) is
+        the same latency on another clock. It differs from the true value only by
+        host overhead and clock skew, either sign but far below half a wrap, so
+        rounding the difference recovers the wraps the register lost. A program
+        shorter than half a wrap is returned unchanged.
+        """
+        cycles = self.read_latency_counter_ticks() * UE_PIPELINE_COUNTER_CLK_DIV
+        launched = getattr(self, "_launch_wall_s", None)
+        period_ns = getattr(self, "_clock_period_ns", None)
+        if launched is None or not period_ns:
+            return cycles
+        ended = getattr(self, "_halt_seen_wall_s", None) or time.perf_counter()
+        host_cycles = (ended - launched) * 1e9 / period_ns
+        wrap = (1 << 32) * UE_PIPELINE_COUNTER_CLK_DIV
+        return cycles + max(0, round((host_cycles - cycles) / wrap)) * wrap
 
 
     def report_timing_and_instruction_count(self):

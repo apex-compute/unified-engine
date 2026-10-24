@@ -75,7 +75,32 @@ def _reject_visible_torch_accelerators() -> None:
 
 _reject_visible_torch_accelerators()
 
+
+def _silence_talker_token_id_warnings() -> None:
+    """Drop transformers' false "token id outside the vocabulary" warnings.
+
+    Its config validation checks every ``*_token_id`` against the decoder's own
+    ``vocab_size``. The Talker's ``tts_text_*`` ids, and the Thinker's
+    ``audio_*`` ids, are Thinker text-vocabulary ids (~151.6k-151.9k) checked
+    against the Talker's 8448-entry codec vocabulary, so they always warn. Only
+    those messages are dropped; every other config warning still prints.
+    """
+    import logging
+
+    class _Filter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            return not (msg.startswith("Model config: ")
+                        and "must be `None` or an integer within the vocabulary "
+                            "(between 0 and 8447)" in msg)
+
+    logging.getLogger("transformers.configuration_utils").addFilter(_Filter())
+
+
+_silence_talker_token_id_warnings()
+
 import user_dma_core
+from program_heartbeat import board_precheck
 from multi_engine_shard import (MultiEngineScheduler, require_multicore_dram,
                                 tiled_window_bases)
 from user_dma_core import UnifiedEngine, set_dma_device
@@ -751,27 +776,6 @@ class Qwen25OmniUnifiedEngine(
             raise ValueError(
                 "Qwen2.5-Omni requires host BF16 token embeddings"
             )
-
-    # The latency counter is 32 bits of 16-cycle ticks, so it wraps every
-    # 2**32 * 16 cycles: 187 s at 366.7 MHz, 237 s at 290 MHz. The High tier's
-    # prefill runs longer than that. The wall time since this engine's last
-    # launch bounds the true latency from above, which is enough to add back the
-    # whole wraps the register lost; a program shorter than one wrap is unchanged.
-    def start_execute_from_dram(self, *args, **kwargs):
-        self._launch_wall_s = time.perf_counter()
-        return super().start_execute_from_dram(*args, **kwargs)
-
-    def report_latency_in_us(self):
-        us = super().report_latency_in_us()
-        launched = getattr(self, "_launch_wall_s", None)
-        if launched is None:
-            return us
-        wrap_us = (2**32 * user_dma_core.UE_PIPELINE_COUNTER_CLK_DIV
-                   * self._clock_period_ns / 1e3)
-        wall_us = (time.perf_counter() - launched) * 1e6
-        if wall_us > us + wrap_us:
-            us += wrap_us * int((wall_us - us) // wrap_us)
-        return us
 
     def _read_params_region(self, name: str) -> dict[str, Any]:
         """Return one validated disk region from the unified params artifact."""
@@ -3940,6 +3944,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 """,
     )
     parser.add_argument("--dev", default="xdma0", help="DMA device (default xdma0)")
+    parser.add_argument("--heartbeat", type=str, nargs="?", default=None, metavar="LOG",
+                        const="",
+                        help="Sample each engine's busy/flag and retired-instruction count "
+                             "while every LM prefill program runs, one block per program. "
+                             "Optional LOG path; default "
+                             "qwen2.5_omni_7b_heartbeat_<dev>_<timestamp>.log beside this script.")
+    parser.add_argument("--heartbeat-interval", type=float, default=1.0, metavar="S",
+                        help="Seconds between --heartbeat samples. Default: 1")
+    parser.add_argument("--heartbeat-precheck", action="store_true",
+                        help="With --heartbeat: before every sampled FPGA program, run "
+                             "andromeda's hw_check.py (must be alive, same version) and "
+                             "temp_check.tcl (die temperatures, recorded only).")
     parser.add_argument(
         "--vision-res",
         choices=sorted(VISION_RESOLUTIONS),
@@ -4296,6 +4312,14 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         **engine_kwargs
     )
     ue.speak_as = args.speak          # before lm_tensor_init sizes the buffers
+    if args.heartbeat is not None:
+        ue.heartbeat_log = args.heartbeat or os.path.join(
+            SCRIPT_DIR, f"qwen2.5_omni_7b_heartbeat_{args.dev}_"
+                        f"{time.strftime('%Y%m%d_%H%M%S')}.log")
+        ue.heartbeat_interval = args.heartbeat_interval
+        ue.heartbeat_precheck = args.heartbeat_precheck
+        print(f"[heartbeat] LM prefill programs sampled every {args.heartbeat_interval:g} s "
+              f"-> {ue.heartbeat_log}")
     if args.speak is not None and _talker_mod is None:
         raise SystemExit("--speak needs qwen2.5_omni_7b_talker.py, which failed to import")
     if args.speak is not None and not args.speak_host and _talker_fpga_mod is None:
@@ -4432,6 +4456,9 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         return
 
     print("\n--- Decode run ---")
+    # --heartbeat-precheck: one board check before decode (and its program
+    # reload), not before each of its per-token programs.
+    board_precheck(ue, "decode start")
     speech = None
     if args.speak is None:
         _, decoded_text = ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)

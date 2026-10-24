@@ -69,11 +69,14 @@ class Gemma4MulticoreLayout(unittest.TestCase):
     def test_kintex_budget_covers_private_down_copies_shared_layers_and_scratch(self):
         engine = self.engine(2, 4, 2)
         plan = engine._kintex_capacity_plan
-        # Conservative K/V on every layer plus two different down layouts.
-        self.assertGreater(plan["private_weights_upper_bound"], 700 << 20)
-        self.assertLess(plan["private_weights_upper_bound"], 1 << 30)
-        self.assertGreater(plan["shared_weight_bytes"], 530 << 20)
-        self.assertLess(plan["shared_weight_bytes"], 550 << 20)
+        # Conservative K/V on every layer; ONE private layout of every
+        # projection and of the LM head (prefill reads decode's slices).
+        self.assertGreater(plan["private_weights_upper_bound"], 550 << 20)
+        self.assertLess(plan["private_weights_upper_bound"], 600 << 20)
+        # No projection and no LM head is loaded shared: norms, per-layer
+        # weights, embeddings-side tables and RoPE only.
+        self.assertGreater(plan["shared_weight_bytes"], 85 << 20)
+        self.assertLess(plan["shared_weight_bytes"], 100 << 20)
         self.assertGreater(sum(plan["shared_free_bytes"]), 800 << 20)
         # A dry-run capacity check must not consume the live private cursors.
         self.assertEqual(engine.mc_arena.usage(), [0, 0])
@@ -83,13 +86,17 @@ class Gemma4MulticoreLayout(unittest.TestCase):
             used = engine.mc_arena._tensor_cursor[index] - engine.mc_arena.regions[index].tensor_base
             self.assertEqual(used, (19 << 20) + (512 << 10))
 
-    def test_kintex_insufficient_reservation_fails_before_weight_loading(self):
+    def test_kintex_private_slices_past_the_tile_fail_before_weight_loading(self):
+        # The reserve grows to what the model's slices need; a model whose slices
+        # cannot fit the 2 GiB tile at all must still stop before any weight is
+        # loaded.
         with patch.multiple(core, ANDROMEDA_CORE_COUNT=2,
                             AVAILABLE_DRAM_SIZE_GB=4, CLOCK_CYCLE_TIME_NS=4.0), \
-                patch.object(gemma, "KINTEX_PRIVATE_RESERVE_BYTES", 512 << 20), \
+                patch.object(gemma.Gemma4_UnifiedEngine, "_private_weight_bytes",
+                             return_value=3 << 30), \
                 patch.object(gemma.Gemma4_UnifiedEngine, "weight_init") as load, \
                 patch("builtins.print"):
-            with self.assertRaisesRegex(MemoryError, "Kintex E2B private projections need"):
+            with self.assertRaises((ValueError, MemoryError)):
                 gemma.Gemma4_UnifiedEngine(multi_core=2)
             load.assert_not_called()
 
@@ -109,9 +116,14 @@ class Gemma4MulticoreLayout(unittest.TestCase):
         engine._stage_private_n_shard = Mock()
         with patch("builtins.print"):
             engine._ensure_decode_qkv_shards(scheduler, engine.LAYER_SIZE)
-        self.assertEqual(engine._stage_private_n_shard.call_count, 3 * engine.LAYER_SIZE)
+        # Every projection but down (whose one layout is the K-slices) is
+        # N-sliced host-side, K/V only for layers that own their KV, plus the
+        # LM head.
+        own_kv = engine.LAYER_SIZE - len(engine._kv_shared_map)
+        self.assertEqual(engine._stage_private_n_shard.call_count,
+                         4 * engine.LAYER_SIZE + 2 * own_kv + 1)
         self.assertEqual({call.args[0] for call in engine._stage_private_n_shard.call_args_list},
-                         {"gate", "up", "down"})
+                         {"q", "k", "v", "o", "gate", "up", "lm_head"})
         # Poisoned shared MLP pointers must never reach the device-copy path.
         for call in scheduler.shard_quantized_weight.call_args_list:
             self.assertIsNotNone(call.kwargs["main_weight_addr"])
@@ -123,7 +135,7 @@ class Gemma4MulticoreLayout(unittest.TestCase):
         self.assertTrue(engine._tiled_map)
         self.assertEqual(engine._tile_bases, [i << 30 for i in range(8)])
         self.assertEqual(engine.mc_arena.stride, 1 << 30)
-        self.assertEqual(engine.mc_arena.tensor_bytes, 32 << 20)
+        self.assertEqual(engine.mc_arena.tensor_bytes, 64 << 20)
         self.assertEqual(engine.TENSOR_LIMIT - engine._tensor_dram_base, 480 << 20)
         self.assertEqual(engine.VISION_ISA_BASE, engine.mc_arena.isa_base(0))
         self.assertLess(engine.LM_ISA_BASE, engine.MASTER_ISA_LIMIT)

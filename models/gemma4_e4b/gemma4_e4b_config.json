@@ -23,9 +23,9 @@
     "per_layer_input_dim": 256
   },
   "model": {
-    "max_context_size": 1024,
-    "max_prefill_seq_len": 320,
-    "prefill_max_seq_len": 320,
+    "max_context_size": 8192,
+    "max_prefill_seq_len": 512,
+    "prefill_max_seq_len": 512,
     "sliding_window": 512,
     "end_of_turn_token_id": 106,
     "rope_global_layers": [
@@ -150,8 +150,8 @@
     "PER_LAYER_PROJ_NORM_WEIGHT":  {"offset": "0xE55DF600", "size": 512},
     "LM_HEAD_WEIGHT_SCALE": {"offset": "0xE55DF800", "size": 20971520},
     "LM_HEAD_WEIGHT_DATA":  {"offset": "0xE69DF800", "size": 335544320},
-    "ROPE_LOCAL":           {"offset": "0xFA9DF800", "size": 1048576},
-    "ROPE_GLOBAL":          {"offset": "0xFAADF800", "size": 1048576}
+    "ROPE_LOCAL":           {"offset": "0xFABDF800", "size": 8388608},
+    "ROPE_GLOBAL":          {"offset": "0xFB3DF800", "size": 4194304}
   },
   "special": {
     "embedding": {
@@ -159,7 +159,7 @@
       "token_embd_size": "0x50000000"
     },
     "rope": {
-      "num_positions": 1024,
+      "num_positions": 8192,
       "theta": 1000000.0,
       "local_base": 10000.0,
       "partial_rotary_factor_global": 0.25

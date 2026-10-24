@@ -628,9 +628,17 @@ TESTS = [
     # silently recompiles -- which is what this entry used to do. The image is
     # free to differ: it is data, not program, and always yields 256 soft
     # tokens, while the vision cache keys only on kernel + engine count.
-    {"name": "gemma4_e2b", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vlm, "extra_args": ["--image"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True},
-    {"name": "gemma4_e2b_run_from_bin", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True},
-    {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--vision-enable"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)"},
+    # All three gemma4 entries run on every engine the board has, up to 8 (the
+    # tiled map's count): --multi-core min(cores, 8) via "multi_core_max", e.g.
+    # 2 on the Kintex7 CI board, 8 on an Alveo. E4B needs at least 2: its
+    # weights do not fit the single-engine model map. Decode is capped at 128
+    # tokens: the checks only need a coherent opening with the scene words, and
+    # an 8192-token context would otherwise let a description run for ~20 min
+    # on Kintex.
+    {"name": "gemma4_e2b", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vlm, "extra_args": ["--image", "--max-new-tokens", "128"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
+    {"name": "gemma4_e2b_run_from_bin", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "128"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
+    {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--image", "--max-new-tokens", "128"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8, "minimum_engines": 2},
+    {"name": "gemma4_e4b_run_from_bin", "script": "models/gemma4_e4b/gemma4_e4b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "128"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8, "minimum_engines": 2},
     {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "qwen3_0.6b",  "script": "models/qwen3_0.6b/qwen3_0.6b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
@@ -842,6 +850,17 @@ def run_test(test: dict, verbose: bool = False,
         _ne = _device_max_engines()
         if _ne and _ne > 1:
             cmd += ["--engines", str(_ne)]
+    # --multi-core at the board's engine count, capped by the entry's
+    # "multi_core_max" (gemma4: 8, its tiled map's engine count), for entries
+    # that opt in and do not pin --multi-core themselves. UE_CI_ENGINES still
+    # overrides the board count.
+    _mc_cap = test.get("multi_core_max")
+    if _mc_cap and "--multi-core" not in cmd:
+        _override = os.environ.get("UE_CI_ENGINES")
+        _cores = (int(_override) if _override and _override.isdigit()
+                  else _device_capacity(dev or DMA_DEV)[0])
+        if _cores and _cores > 1:
+            cmd += ["--multi-core", str(min(int(_cores), int(_mc_cap)))]
     unsupported = []
     for flag, value in (("--dev", dev), ("--device", device)):
         if value is None:

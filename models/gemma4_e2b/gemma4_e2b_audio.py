@@ -15,6 +15,7 @@ _SD = os.path.dirname(os.path.abspath(__file__))
 if os.path.dirname(os.path.dirname(_SD)) not in sys.path:
     sys.path.insert(0, os.path.dirname(os.path.dirname(_SD)))
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from user_dma_core import (
@@ -33,7 +34,10 @@ from audio_primitives import (
 
 AUDIO_QUANT_PRECISION = "if4"
 AUDIO_FIXED_SOFT_TOKENS = 128
-AUDIO_ISA_BASE = 0x98000000
+AUDIO_ISA_BASE = 0x98000000        # legacy model map only; see _audio_isa_base()
+# Under the tiled map the audio program gets its own shared-pool allocation of
+# this size (the legacy map's audio ISA region was 96 MiB).
+AUDIO_ISA_BYTES = 96 << 20
 AUDIO_PROGRAM_VERSION = 7
 
 
@@ -252,7 +256,11 @@ class Gemma4AudioMixin:
         self.AUD_SOFT_CAP = ac["attention_logit_cap"]       # 50
         self.AUD_RESIDUAL_W = ac["residual_weight"]         # 0.5
         self.AUD_RMS_EPS = ac["rms_norm_eps"]
-        self.AUD_OUT_DIM = ac["output_proj_dims"]           # 1536 (LM hidden size)
+        # Two widths, equal on E2B: the encoder's output projection
+        # (output_proj_dims, 1536 on both E2B and E4B) and the multimodal
+        # embedder's projection into the LM hidden size (1536 E2B, 2560 E4B).
+        self.AUD_PROJ_DIM = ac["output_proj_dims"]
+        self.AUD_OUT_DIM = self.vector_length
         self.AUD_SUB_CHANS = ac["subsampling_conv_channels"]  # [128, 32]
         self.AUD_USE_CLIP = ac["use_clipped_linears"]
         self.AUD_INVALID_LOGIT = ac["attention_invalid_logits_value"]
@@ -722,16 +730,17 @@ class Gemma4AudioMixin:
             torch.zeros(ctx_pad * HD, dtype=torch.bfloat16).contiguous())
 
         # Phase B: FPGA output_proj + multimodal embedder.
-        OUT_DIM = self.AUD_OUT_DIM  # 1536
-        # Output of output_proj: (L_pad, OUT_DIM). First T_sub rows valid.
-        self.AUD_FEATURES_MID = self.allocate_tensor_dram(L_pad * OUT_DIM * bpe)
-        # Output of multimodal embedder: same shape; the final audio_features.
+        PROJ_DIM, OUT_DIM = self.AUD_PROJ_DIM, self.AUD_OUT_DIM
+        # Output of output_proj: (L_pad, PROJ_DIM). First T_sub rows valid.
+        self.AUD_FEATURES_MID = self.allocate_tensor_dram(L_pad * PROJ_DIM * bpe)
+        # Output of multimodal embedder: (L_pad, OUT_DIM = LM hidden); the final
+        # audio_features.
         self.AUD_FEATURES_FINAL = self.allocate_tensor_dram(L_pad * OUT_DIM * bpe)
         # All-ones gamma for the embedder's RMSNorm (with_scale=False in HF).
         # rms_norm_core_dram expects a gamma tile; passing ones gives plain RMSNorm.
-        self.AUD_EMB_ONES_GAMMA = self.allocate_tensor_dram(OUT_DIM * bpe)
+        self.AUD_EMB_ONES_GAMMA = self.allocate_tensor_dram(PROJ_DIM * bpe)
         self.dma_to_accelerator_memory(self.AUD_EMB_ONES_GAMMA,
-            torch.ones(OUT_DIM, dtype=torch.bfloat16).contiguous())
+            torch.ones(PROJ_DIM, dtype=torch.bfloat16).contiguous())
 
         # Phase 2B.c step 3: per-r shift matrices M_r for rel-shift via matmul.
         # M_r in (N=ctx_pad, K=num_pos_pad) layout has M_r[c, p]=1 if c == p+r
@@ -1168,14 +1177,14 @@ class Gemma4AudioMixin:
         Reads from AUD_IO_A (encoder output), writes to AUD_FEATURES_FINAL.
         """
         H = self.AUD_H
-        OUT_DIM = self.AUD_OUT_DIM
+        PROJ_DIM, OUT_DIM = self.AUD_PROJ_DIM, self.AUD_OUT_DIM
         L_pad = self._aud_L_pad
 
         # Step 1: encoder_out @ W_op.T + b_op  ->  AUD_FEATURES_MID
         op = self._aud_output_proj_addrs
         self._compile_and_run_single("aud_embed_output_proj",
             lambda: self.matmat_mul_core(
-                M=L_pad, K=H, N=OUT_DIM,
+                M=L_pad, K=H, N=PROJ_DIM,
                 A_DRAM_ADDR=self.AUD_IO_A,
                 B_DRAM_ADDR=op["data"],
                 OUTPUT_DRAM_ADDR=self.AUD_FEATURES_MID,
@@ -1195,7 +1204,7 @@ class Gemma4AudioMixin:
         # scale errors than e4b). Mirrors gemma4_e4b which never had PBI here.
         self._compile_and_run_single("aud_embed_rmsnorm",
             lambda: self.rms_norm_core_dram(
-                M=L_pad, N=OUT_DIM,
+                M=L_pad, N=PROJ_DIM,
                 A_DRAM_ADDR=self.AUD_FEATURES_MID,
                 OUTPUT_DRAM_ADDR=self.AUD_FEATURES_MID,
                 GAMMA_DRAM_ADDR=self.AUD_EMB_ONES_GAMMA))
@@ -1204,7 +1213,7 @@ class Gemma4AudioMixin:
         em = self._aud_embedder_proj_addrs
         self._compile_and_run_single("aud_embed_emb_proj",
             lambda: self.matmat_mul_core(
-                M=L_pad, K=OUT_DIM, N=OUT_DIM,
+                M=L_pad, K=PROJ_DIM, N=OUT_DIM,
                 A_DRAM_ADDR=self.AUD_FEATURES_MID,
                 B_DRAM_ADDR=em["data"],
                 OUTPUT_DRAM_ADDR=self.AUD_FEATURES_FINAL,
@@ -2273,22 +2282,46 @@ class Gemma4AudioMixin:
             gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
             cache=cache, cache_key=f"aud_L{layer_idx}_norm_out")
 
+    def _audio_isa_base(self) -> int:
+        """Where the audio program lives.
+
+        The legacy model map reserves a fixed region at AUDIO_ISA_BASE. The
+        tiled map has no such region -- 0x98000000 is inside an engine window
+        whose shared pool also hands out the KV cache and vision weights -- so
+        the program gets its own shared-pool allocation, made once.
+        """
+        if not getattr(self, "_tiled_map", False):
+            return AUDIO_ISA_BASE
+        base = getattr(self, "_audio_isa_alloc", None)
+        if base is None:
+            base = self.mc_arena.alloc_shared(AUDIO_ISA_BYTES, "audio ISA")
+            self._audio_isa_alloc = base
+        return base
+
     def compile_audio_fpga(self, input_features: torch.Tensor,
                            input_features_mask: torch.Tensor | None = None) -> None:
         """Capture subsampling, 12 Conformer layers, and projection as one
         straight-line program in the dedicated audio ISA region."""
         meta, _ = self._get_program_section("audio")
         tensor_base = self.AUD_IO_A
+        # The program bakes the clip's frame counts, so reuse it only for a clip
+        # of the same shape: a 4.5 s program run on a 2.55 s clip encodes garbage.
+        isa_base = self._audio_isa_base()
         if (meta is not None
                 and int(meta.get("tensor_base", "0"), 16) == tensor_base
-                and meta.get("program_version") == AUDIO_PROGRAM_VERSION):
+                and int(meta.get("dram_base", "0"), 16) == isa_base
+                and meta.get("program_version") == AUDIO_PROGRAM_VERSION
+                and meta.get("num_frames") == self._aud_num_frames
+                and meta.get("padded_frames") == self._aud_L_pad
+                and meta.get("proj_dim") == self.AUD_PROJ_DIM
+                and meta.get("out_dim") == self.AUD_OUT_DIM):
             print("  [Audio] reusing existing audio instruction section")
             return
 
         saved_base = self._program_dram_base
         saved_next = self._next_program_dram_addr
-        self._program_dram_base = AUDIO_ISA_BASE
-        self._next_program_dram_addr = AUDIO_ISA_BASE
+        self._program_dram_base = isa_base
+        self._next_program_dram_addr = isa_base
         self.reset_program_dram_addr()
         base_addr = self.get_program_dram_addr()
         self.clear_capture_buffer()
@@ -2315,10 +2348,16 @@ class Gemma4AudioMixin:
             self._program_dram_base = saved_base
             self._next_program_dram_addr = saved_next
 
+        if getattr(self, "_tiled_map", False) and len(program) > AUDIO_ISA_BYTES:
+            raise MemoryError(
+                f"audio program is {len(program) / 2**20:.1f} MiB, past its "
+                f"{AUDIO_ISA_BYTES >> 20} MiB allocation at 0x{base_addr:X}")
         self._store_program_section("audio", base_addr, program, {
             "num_layers": self.AUD_LAYERS,
             "num_frames": self._aud_num_frames,
             "padded_frames": self._aud_L_pad,
+            "proj_dim": self.AUD_PROJ_DIM,
+            "out_dim": self.AUD_OUT_DIM,
             "tensor_base": f"0x{tensor_base:X}",
             "program_version": AUDIO_PROGRAM_VERSION,
             "includes_subsample": True,
@@ -2354,37 +2393,60 @@ class Gemma4AudioMixin:
         self.allocate_program_dram(len(program))
         self.start_execute_from_dram(program_addr)
         self.wait_queue(600.0)
+        self._audio_hw_latency_us = self.report_latency_in_us()
         return self.dma_from_accelerator_memory(
             self.AUD_FEATURES_FINAL,
             (self._aud_L_pad, self.AUD_OUT_DIM)).cpu()[:self._aud_num_frames]
 
-    def _run_audio_encoder_fpga(self, audio_path: str, prompt: str):
-        """LM-facing audio interface: preprocess, compile/run FPGA, and return
-        ``(soft_tokens, token_ids, mm_token_types)``."""
-        from transformers import AutoProcessor
+    @staticmethod
+    def _load_audio_samples(audio_path: str, target_rate: int,
+                            target_seconds: float | None = None):
+        """Mono float32 samples at ``target_rate``; ``target_seconds`` trims the
+        clip, or repeats it until it is that long."""
         try:
             import soundfile as sf
         except ImportError as exc:
             raise RuntimeError("soundfile is required for audio input") from exc
-
-        self._ensure_model_loaded()
-        processor = AutoProcessor.from_pretrained(self.hf_model_dir)
         samples, sample_rate = sf.read(audio_path, dtype="float32", always_2d=False)
         if samples.ndim > 1:
             samples = samples.mean(axis=-1)
-        target_rate = processor.feature_extractor.sampling_rate
         if sample_rate != target_rate:
             wave = torch.from_numpy(samples).float()[None, None]
             samples = F.interpolate(
                 wave, size=int(samples.shape[0] * target_rate / sample_rate),
                 mode="linear", align_corners=False).squeeze().numpy()
+        if target_seconds is not None:
+            want = int(round(float(target_seconds) * target_rate))
+            reps = -(-want // max(len(samples), 1))
+            samples = np.tile(samples, max(reps, 1))[:want]
+        return samples
 
-        conversation = [{"role": "user", "content": [
-            {"type": "audio"}, {"type": "text", "text": prompt}]}]
+    def _run_audio_encoder_fpga(self, audio_path: str, prompt: str,
+                                target_seconds: float | None = None,
+                                conversation_content: list | None = None,
+                                processor_kwargs: dict | None = None):
+        """LM-facing audio interface: preprocess, compile/run FPGA, and return
+        ``(soft_tokens, token_ids, mm_token_types)``.
+
+        ``target_seconds`` trims the clip to that length, or repeats it until
+        it is that long, so a workload's audio shape does not depend on the
+        file. ``conversation_content`` / ``processor_kwargs`` replace the
+        audio-then-text user turn (a joint image + audio prompt passes its
+        images through them); the clip is always the one audio item."""
+        from transformers import AutoProcessor
+
+        self._ensure_model_loaded()
+        processor = AutoProcessor.from_pretrained(self.hf_model_dir)
+        target_rate = processor.feature_extractor.sampling_rate
+        samples = self._load_audio_samples(audio_path, target_rate, target_seconds)
+        self._audio_seconds = len(samples) / float(target_rate)
+
+        content = conversation_content or [{"type": "audio"}, {"type": "text", "text": prompt}]
+        conversation = [{"role": "user", "content": content}]
         text = processor.apply_chat_template(
             conversation, add_generation_prompt=True, tokenize=False)
         inputs = processor(text=[text], audio=[samples], sampling_rate=target_rate,
-                           return_tensors="pt")
+                           return_tensors="pt", **(processor_kwargs or {}))
         input_features = inputs["input_features"]
         input_mask = inputs.get("input_features_mask")
         token_ids = inputs["input_ids"][0].tolist()
@@ -2399,7 +2461,10 @@ class Gemma4AudioMixin:
         soft_frames = (h0 + 1) // 2
         self.audio_tensor_init(soft_frames)
         self.compile_audio_fpga(input_features, input_mask)
+        _run_t0 = time.perf_counter()
         features = self.run_audio_fpga(input_features, input_mask)
+        # Run time = upload + FPGA execute + soft-token readback; compile excluded.
+        self._audio_e2e_s = time.perf_counter() - _run_t0
         if not torch.isfinite(features).all():
             raise RuntimeError("FPGA audio encoder produced non-finite features")
 

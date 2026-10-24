@@ -1,155 +1,63 @@
 # Gemma4 E4B example
 
-Gemma4 E4B accelerator inference from a single instruction bin. Text-only
-(LM) is the default mode; image+text (VLM) and audio+text encoders are
-opt-in (`GEMMA4_E4B_ALLOW_ENCODER=1` with `--vision-enable`/`--audio-enable`).
+Gemma4 E4B accelerator inference: text only (LM), image + text (VLM), audio +
+text, and image(s) + audio + text, from a single instruction bin.
 
-> **Note on E4B decode quality:** the LM and audio paths decode cleanly.
-> The VLM path is image-dependent and can fall into repetition early or in
-> the long tail (a documented IF4/depth-sensitivity issue in the LM, not a
-> vision/ISA bug). Run encoder modes with `GEMMA4_PENALTY=1` to improve
-> loop resistance, but do not treat E4B VLM quality as final.
-
-## Controller-private decode
+E4B is the same Gemma 4 architecture as E2B with larger dimensions, so it runs
+on the E2B implementation in [`../gemma4_e2b`](../gemma4_e2b/README.md).
+`gemma4_e4b_test.py` is a launcher: it points that code at this directory's
+config and artifacts and calls its `main()`. Every `gemma4_e2b_test.py`
+option applies (`--multi-core`, `--image`, `--audio`, `--frames`,
+`--audio-seconds`, `--target-prefill-tokens`, `--profile`, `--summary`, ...).
 
 ```bash
-GEMMA4_LM_ONLY_BIN=1 python models/gemma4_e4b/gemma4_e4b_test.py \
-  --dev xdma0 --multi-core 8 --max-new-tokens 32 --prompt "x+3=5, what is x?"
-python tests/model_controller_benchmark.py --dev xdma0 --engines 8 --models e4b \
-  --prompt "x+3=5, what is x?" --max-new-tokens 32 \
-  --json e4b-controller-results.json
+python models/gemma4_e4b/gemma4_e4b_test.py --dev xdma0 --multi-core 8 --prompt "x+3=5, what is x?"
+python models/gemma4_e4b/gemma4_e4b_test.py --dev xdma0 --multi-core 8 --image
+python models/gemma4_e4b/gemma4_e4b_test.py --dev xdma0 --multi-core 8 --audio \
+  --prompt "Transcribe the speech exactly."
 ```
 
-The U50 comparison passed all 32 generated tokens exactly: average FPGA decode
-latency was **380.95 → 249.47 ms/token (1.53×)** at 333.332 MHz. These are decode
-measurements; the existing padded prefill still runs on the primary engine.
-See `../../tests/alveo_u50_gemma4_e4b_controller_results.json` for tokens and board identity.
+## What differs from E2B
 
-Q/K/V/O and MLP gate/up use controller-private weight copies. The original
-shared 0–4 GiB model image stays in place; U50 private shards occupy controller
-windows in 4–8 GiB. Four through eight engines fit. Two or three engines exceed
-the per-engine weight capacity and fail before weight loading. The larger-K
-MLP down projection and LM head retain their original primary kernels. U55C
-maps have offline coverage; no U55C hardware measurement is available.
+| | E2B | E4B |
+| :--- | ---: | ---: |
+| Hidden size | 1536 | 2560 |
+| Layers (full attention) | 35 (7) | 42 (7) |
+| Query heads / KV heads | 8 / 1 | 8 / 2 (4 query heads per KV head) |
+| MLP width | 6144, 12288 from layer 15 | 10240 |
+| Layers owning a KV cache | 15 | 24 |
+| KV cache at 8192 context | 144 MB | 448 MB |
+| Weight DRAM (8-engine tiled map) | 1225 MB | 2482 MB |
 
-Multicore runs compile and restore worker programs each time. Program metadata
-records engine count and memory placement, and stale layouts are rejected
-before ISA upload. The standalone execute-only runner supports single-engine
-images and rejects multicore images because it cannot restore their workers.
-
-## Two scripts, two stages
-
-| Stage | Script | Notes |
-|---|---|---|
-| Build (once) | `gemma4_e4b_test.py` | Builds `gemma4_instruction.bin` + `weights_gemma4_e4b_hf.bin`, then sanity-runs. Needs the HF model locally. Default build is LM-only; set `GEMMA4_LM_ONLY_BIN=0` and `GEMMA4_E4B_ALLOW_ENCODER=1` to build/test encoder modes. |
-| Deploy (every run after) | `gemma4_e4b_run_from_bin.py` | Loads the bin files and runs. Never touches the HF model. |
-
-Single-engine runs reuse matching cached instructions. Multicore runs rebuild
-their workers, and changing layouts rebuilds the primary image.
+The shared code handles the differences by configuration: `num_q_heads` /
+`num_kv_heads` from `file_info`, the KV cache stored per KV head (query head
+*h* reads KV head *h* / 4), one decode attention call per KV head, the
+private-weight reserve per engine derived from the weight sizes (352 MiB for
+E4B), and the KV cache placed in the windows' shared pool rather than the
+480 MiB tensor arena. The vision and audio encoders are identical; their
+outputs project into the 2560-wide LM.
 
 ## Files
 
-- **gemma4_e4b_test.py** – Build + run. Builds the unified bin and the
-  combined weight bin on first invocation; otherwise just runs.
-- **gemma4_e4b_run_from_bin.py** – Execute-only. Loads bin files,
-  refuses to compile, no HF model on disk required.
-- **gemma4_e4b_config.json** – Model + layout config.
-- **gemma4_e4b_bin/** – On-disk artifacts:
-  - `gemma4_instruction.bin` + `.json` – instruction ISA. Full multimodal
-    bin is 15.02 MiB on disk (15,746,912 B): LM prefill + decode + vision
-    + audio encoders + vision RoPE tables. Used size by mode: LM-only
-    6.38 MiB, VLM 7.84 MiB, audio 13.56 MiB.
-  - `weights_gemma4_e4b_hf.bin` + `.json` – combined weights (~10 GB)
-    with sections: `[LM | vision | audio | host]`.
-  - `tokenizer/` – minimal tokenizer + processor configs (~32 MB).
+- **gemma4_e4b_test.py** -- the launcher.
+- **gemma4_e4b_config.json** -- model and layout config (context 8192,
+  512-row prefill program, longer prompts prefilled in chunks).
+- **gemma4_e4b_bin/** -- `params.bin` + `params.json` (combined weights
+  `[LM | vision | audio | host]`, ~10 GB, generated from the HF model if
+  missing), `programs.bin` + `programs.json` (instruction image),
+  `tokenizer/`, and the HF model `gemma-4-E4B-it/` (downloaded on first use).
 
-## Prerequisites
+## Measured (Alveo U50, 366.7 MHz, 8 engines)
 
-- Run from the **repo root** so `user_dma_core` is on the path.
-- Python with `torch`, `transformers >= 5.5.0`, and FPGA device access via xdma.
-- Build stage only: HF model `google/gemma-4-E4B-it` is downloaded
-  automatically into `gemma4_e4b_bin/gemma-4-E4B-it/` on first run.
-- Deploy stage: no HF model directory required.
+`--image` (yosemite, 272-token prompt), against E2B on the same code:
 
-## Build / sanity-check — `gemma4_e4b_test.py`
+| | E2B | E4B |
+| :--- | ---: | ---: |
+| Vision encoder, HW | 4.72 s | 4.81 s |
+| Prefill, HW | 3.88 s | 7.92 s (274.8 model GFLOPS, 73% of peak) |
+| TTFT, HW | 8.67 s | 12.73 s |
+| Decode, first token | 31.0 tok/s | 15.5 tok/s |
 
-```bash
-python src/template/models/gemma4_e4b/gemma4_e4b_test.py
-python src/template/models/gemma4_e4b/gemma4_e4b_test.py --prompt "What is 2+2?"
-
-# Build/test encoder modes into the unified bin
-GEMMA4_LM_ONLY_BIN=0 GEMMA4_E4B_ALLOW_ENCODER=1 \
-  python src/template/models/gemma4_e4b/gemma4_e4b_test.py --vision-enable
-GEMMA4_LM_ONLY_BIN=0 GEMMA4_E4B_ALLOW_ENCODER=1 \
-  python src/template/models/gemma4_e4b/gemma4_e4b_test.py --audio-enable
-```
-
-First run builds the instruction bin and combined weight bin. Subsequent
-runs just load and execute.
-
-Force a clean rebuild:
-
-```bash
-rm gemma4_e4b_bin/gemma4_instruction.bin gemma4_e4b_bin/gemma4_instruction.json
-rm gemma4_e4b_bin/weights_gemma4_e4b_hf.bin gemma4_e4b_bin/weights_gemma4_e4b_hf.json
-python src/template/models/gemma4_e4b/gemma4_e4b_test.py
-```
-
-## Deploy / demo — `gemma4_e4b_run_from_bin.py`
-
-Execute-only. Refuses to compile, never imports the HF model class.
-
-```bash
-python src/template/models/gemma4_e4b/gemma4_e4b_run_from_bin.py
-python src/template/models/gemma4_e4b/gemma4_e4b_run_from_bin.py --prompt "What is 2+2?"
-
-# Encoder modes require an encoder-containing bin and the runtime gate.
-GEMMA4_E4B_ALLOW_ENCODER=1 GEMMA4_PENALTY=1 \
-  python src/template/models/gemma4_e4b/gemma4_e4b_run_from_bin.py --vision-enable
-GEMMA4_E4B_ALLOW_ENCODER=1 GEMMA4_PENALTY=1 \
-  python src/template/models/gemma4_e4b/gemma4_e4b_run_from_bin.py --audio-enable
-```
-
-### Deploy footprint
-
-```
-gemma4_e4b_run_from_bin.py
-gemma4_e4b_config.json
-user_dma_core.py + quant_lib.py
-gemma4_e4b_bin/
-  gemma4_instruction.bin + .json       (15.02 MiB full multimodal)
-  weights_gemma4_e4b_hf.bin  + .json   (~10 GB; LM + vision + audio + host sections)
-  tokenizer/                           (~32 MB)
-```
-
-## Flags
-
-- `--dev xdma0 --cycle 5.62` — DMA device and clock cycle (defaults).
-- `--local-weights` — use the local full-model weights bin.
-- `--image PATH` implies `--vision-enable`; `--vision-enable` alone
-  uses the default image at `../../test_samples/yosemite.jpg`.
-- `--audio PATH` implies `--audio-enable`; `--audio-enable` alone
-  uses the default audio at `../../test_samples/apex.wav`.
-- `GEMMA4_E4B_ALLOW_ENCODER=1` gates VLM/audio runs.
-- `GEMMA4_LM_ONLY_BIN=0` during build includes vision/audio instruction
-  sections; the default `GEMMA4_LM_ONLY_BIN=1` builds LM-only.
-- `GEMMA4_PENALTY=1` enables the on-FPGA repetition penalty used for
-  encoder-mode demos.
-
-## Prompt-length limits
-
-The model ships as a single prefill template plus a single dynamic
-decoder program (`prefill_max_seq_len` and bucket-dispatched decoder;
-no per-bucket ISA copies):
-
-- **`prefill_max_seq_len` (config, default `320`)** — prompts up to
-  this length are supported. Shorter prompts are extended in the host
-  buffer with the last real token for the static prefill template;
-  decode starts from the actual prompt length, so those extra KV rows
-  are not used as context.
-- **Decoder:** single captured program serves all context lengths up
-  to `max_context_size` (default `1024`) via the bucket dispatcher in
-  `decoder_group_attention_core` (one body per `UE_VECTOR_SIZE`
-  multiple of K context length).
-
-Both knobs live in `gemma4_e4b_config.json`.
+The text-only run decodes the same answer as the earlier standalone E4B
+implementation, with prefill 1.16 s instead of 66.8 s (18-token prompt; the
+old prefill ran padded on one engine) and decode 16.1 tok/s instead of 3.9.
