@@ -73,8 +73,7 @@ measurement aid, not in the repository. The U55C runs High continuously at
 ## Results: Alveo U50 (333.3 MHz)
 
 `0x6798f78b`: the split35 floorplan with the engine clock lowered to
-333.33 MHz (andromeda `alveo/u50-split35-floorplan-333mhz`, CI run
-40031819605; routed WNS −0.540 ns). Low, Medium and High ran back to back with
+333.33 MHz (andromeda CI run 40031819605; routed WNS −0.540 ns). Low, Medium and High ran back to back with
 no cooling pauses, in one series with E2B and Qwen-Omni Low/Medium/High
 (2026-10-24, p2). Outputs match the ones below.
 
