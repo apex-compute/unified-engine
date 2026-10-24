@@ -149,7 +149,7 @@ details.raw pre { font: 11px/1.4 var(--mono); background: var(--soft); padding: 
           <label>Thinking mode<select id="think"><option value="0">Off</option><option value="1">On</option></select></label>
           <label>Image detail<select id="detail"></select></label>
           <label class="wide">System prompt<textarea id="system" rows="2" placeholder="Optional. E.g. Answer briefly."></textarea></label>
-          <div class="hint wide">At temperature 0 the token is chosen on the cards. Above 0, each card reports its four best candidates and sampling happens among them, so top_k is at most 4.</div>
+          <div class="hint wide">At temperature 0 the token is chosen on the cards. Above 0, each core reports its four best candidates and sampling happens among them, so top_k is at most 4.</div>
         </div>
       </div>
     </div>
@@ -289,7 +289,7 @@ function renderStatus() {
   if (s.state === "loading") {
     const p = s.progress || {};
     st.textContent = "Loading onto cards" + (p.cards ? " · " + p.ready + "/" + p.cards + " cards" : "") + " · " + Math.round(p.elapsed_s || 0) + " s";
-  } else if (s.state === "ready") st.textContent = "Ready · " + (s.info?.cards?.length || 0) + " cards";
+  } else if (s.state === "ready") st.textContent = "Ready · " + hwCount(s.info).label;
   else if (s.state === "busy") st.textContent = "Generating" + (s.waiting ? " · " + s.waiting + " queued" : "");
   else st.textContent = s.error ? "Error: " + s.error.split("\n")[0].slice(0, 80) : "No model loaded";
   const ms = $("model");
@@ -307,15 +307,19 @@ function renderStatus() {
   renderCards(); renderSys(); renderPower(); renderExchange();
 }
 
+function hwCount(i) {
+  const cores = i?.cards?.length || 0, cards = new Set((i?.cards || []).map(c => c.bdf || c.dev.split("/")[0])).size;
+  return { cards, cores, label: cards + " cards" + (cores > cards ? " · " + cores + " cores" : "") };
+}
 function renderCards() {
   const info = status?.info, st = lastStats;
   if (!info) { $("cards-sub").textContent = ""; return; }
-  $("cards-sub").textContent = "· " + info.cards.length + " cards · " + fmt(info.weights_mb / 1000, 1) + " GB weights";
+  $("cards-sub").textContent = "· " + hwCount(info).label + " · " + fmt(info.weights_mb / 1000, 1) + " GB weights";
   const comp = {}; (st?.cards || []).forEach(c => comp[c.index] = c);
   const max = Math.max(1, ...Object.values(comp).map(c => c.compute_ms_per_token));
   const pd = powerModel(), act = generating(), tsum = Object.values(comp).reduce((a, c) => a + c.compute_ms_per_token, 0);
   // a card's share of the power that inference adds follows its share of the compute time
-  const watts = c => !pd ? null : !act ? pd.fpgaIdle / pd.n : pd.fpgaIdle / pd.n + (pd.fpgaActive - pd.fpgaIdle) * (tsum && comp[c.index] ? comp[c.index].compute_ms_per_token / tsum : 1 / pd.n);
+  const watts = c => !pd ? null : !act ? pd.fpgaIdle / pd.cores : pd.fpgaIdle / pd.cores + (pd.fpgaActive - pd.fpgaIdle) * (tsum && comp[c.index] ? comp[c.index].compute_ms_per_token / tsum : 1 / pd.cores);
   $("cards").innerHTML = info.cards.map(c => {
     const t = comp[c.index];
     return '<div class="cardrow"><div class="n">' + c.dev + '<small>' + c.link + '</small></div>' +
@@ -323,7 +327,7 @@ function renderCards() {
       '<small style="color:var(--mute);font-size:10.5px">' + c.bdf.replace("0000:", "") + " · " + Math.round(c.params_mb) + " MB · " +
       (c.plan?.vh ? "value heads " + c.plan.vh[0] + "–" + (c.plan.vh[1] - 1) : "") + '</small></div>' +
       '<div class="m">' + (pd ? "<b>" + fmt(watts(c), 1) + " W</b>" : "") + (t ? (pd ? "<small>" : "") + fmt(t.compute_ms_per_token, 0) + " ms" + (pd ? "</small>" : "") : (pd ? "" : "–")) + '</div></div>';
-  }).join("") + '<div class="hint">' + (st?.cards ? "Bar and ms: compute time per token, measured by each card&#39;s own hardware counter. " : "") + (pd ? "Watts: per card, " + (act ? "generating" : "idle with the model loaded") + "." : "") + "</div>";
+  }).join("") + '<div class="hint">' + (st?.cards ? "Bar and ms: compute time per token, measured by each core&#39;s own hardware counter. " : "") + (pd ? "Watts: per " + (pd.cores > pd.n ? "core" : "card") + ", " + (act ? "generating" : "idle with the model loaded") + "." : "") + "</div>";
 }
 
 function renderSys() {
@@ -334,6 +338,8 @@ function renderSys() {
     add("Model", i.model + " · " + (i.details?.parameter_size || ""));
     add("Quantization", "FP4, 4-bit · one scale per 64-value block");
     add("Layers / hidden size", i.layers + " / " + i.hidden);
+    const c0 = i.cards[0] || {};
+    add("Cards", hwCount(i).label + (c0.clock_mhz ? " · " + fmt(c0.clock_mhz, 0) + " MHz" : "") + (c0.firmware ? " · firmware " + c0.firmware : ""));
     add("Sync points per token", i.segments_per_token);
     add("Card program", fmt(i.cards[0].instructions / 1000, 0) + "k instructions");
     add("Load time", fmt(i.load_s, 0) + " s");
@@ -377,9 +383,9 @@ let power = null;
 fetch("/static/power.json").then(r => r.json()).then(p => { power = p; renderStatus(); if (lastStats) renderPower(lastStats); }).catch(() => {});
 const generating = () => busy || status?.state === "busy";
 function powerModel() {
-  const p = power, n = status?.info?.cards?.length;
+  const p = power, hc = hwCount(status?.info), n = hc.cards;
   if (!p || !n) return null;
-  const base = { n, wallIdle: p.wall_idle_w, wallActive: p.wall_active_w, cpuIdle: p.cpu_dram_idle_w, cpuActive: p.cpu_dram_active_w };
+  const base = { n, cores: hc.cores, wallIdle: p.wall_idle_w, wallActive: p.wall_active_w, cpuIdle: p.cpu_dram_idle_w, cpuActive: p.cpu_dram_active_w };
   const perCard = p.fpga_active_w_total ? p.fpga_active_w_total / n : p.fpga_active_w_per_card;
   if (perCard) {
     // per-card power while generating is given; what inference adds at the wall, minus the CPU's part, is the cards' idle-to-active step
@@ -432,8 +438,8 @@ function renderExchange(st, live) {
   if (st) { xStats = st; xLive = !!live; }
   const i = status?.info, s = xStats || lastStats;
   if (!i) { $("x-tok").textContent = $("x-ans").textContent = "–"; $("x-kv").innerHTML = $("x-cards").innerHTML = ""; $("x-note").textContent = "Shown once the model is loaded."; return; }
-  const n = i.cards.length, S = i.segments_per_token, vec = i.hidden * 2;          // one bf16 vector of the hidden size
-  const down = n * S * vec, up = n * (S - 1) * vec;                                // per token; the last segment returns only its best tokens
+  const n = hwCount(i).cards, S = i.segments_per_token, vec = i.hidden * 2;        // one bf16 vector of the hidden size
+  const down = n * S * n * vec, up = n * (S - 1) * vec;                            // each write carries all cards' shares                                // per token; the last segment returns only its best tokens
   $("x-tok").textContent = fmtBytes(down + up);
   const nt = !s ? 0 : xLive ? Math.max(0, (s.context_used || 0) - (s.reused_tokens || 0)) : (s.prefill_tokens || 0) + (s.eval_tokens || 0);
   $("x-ans-box").className = "stat" + (xLive && generating() ? " live" : "");
@@ -444,14 +450,14 @@ function renderExchange(st, live) {
     row("CPU → cards", fmtBytes(down) + " · " + num(n * S) + " writes") +
     row("Cards → CPU", fmtBytes(up) + " · " + num(n * (S - 1)) + " reads") +
     row("Card ↔ card", "through the CPU · " + (S - 1) + " exchanges") +
-    row("One transfer", fmtBytes(vec) + " (" + i.hidden + " values)");
+    row("One share", fmtBytes(vec) + " (" + i.hidden + " values); a write carries " + n + " shares");
   const f = xLive ? lastStats : s;                                                    // timing exists once an answer has finished
   if (f?.eval_tok_s) kv += row("Data rate while generating", fmt((down + up) / 1e6 * f.eval_tok_s, 0) + " MB/s");
   if (f?.cards && f.host_ms_per_token !== undefined) {
     const link = f.cards.map(c => c.roundtrip_ms_per_token - c.compute_ms_per_token);
     kv += row("CPU ↔ card link time, average", fmt(link.reduce((a, b) => a + b, 0) / link.length, 0) + " ms / token") +
       row("Card ↔ card combine on the CPU", fmt(Math.max(0, f.ms_per_token - f.host_ms_per_token), 0) + " ms / token");
-    $("x-cards").innerHTML = '<table class="t"><tr><th>Card</th><th>Compute</th><th>CPU ↔ card</th><th>Round trip</th></tr>' +
+    $("x-cards").innerHTML = '<table class="t"><tr><th>Core</th><th>Compute</th><th>CPU ↔ card</th><th>Round trip</th></tr>' +
       f.cards.map(c => "<tr><td>" + c.dev + "</td><td>" + fmt(c.compute_ms_per_token, 0) + "</td><td>" + fmt(c.roundtrip_ms_per_token - c.compute_ms_per_token, 0) + "</td><td>" + fmt(c.roundtrip_ms_per_token, 0) + " ms</td></tr>").join("") + "</table>";
   } else $("x-cards").innerHTML = "";
   $("x-kv").innerHTML = kv;

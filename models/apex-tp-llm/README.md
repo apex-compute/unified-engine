@@ -6,11 +6,11 @@ All model compute runs on the cards. The host CPU only coordinates. It does the 
 
 | Model | Cards | Context | Generation | Prompt reading |
 |---|---|---|---|---|
-| **GPT‑OSS‑20B** (MoE) | 5 cards × 2 engines | 8192 | **15.3 tokens/s** | 15–17 tokens/s |
-| **Qwen3.5‑9B** | 5 cards × 2 engines | 16384 | **6.97 tokens/s** | 6.9 tokens/s |
-| **Qwen3.8‑27B** | 5 cards × 2 engines | 8192 | **2.39 tokens/s** | 2.4 tokens/s |
+| **GPT‑OSS‑20B** (MoE) | 5 cards × 2 engines | 8192 | **19.45 tokens/s** | 19.7 tokens/s |
+| **Qwen3.5‑9B** | 5 cards × 2 engines | 16384 | **7.04 tokens/s** | 7.1 tokens/s |
+| **Qwen3.8‑27B** | 5 cards × 2 engines | 8192 | **2.59 tokens/s** | 2.6 tokens/s |
 
-<sub>HP Z420, 5 × Apex Kintex‑7 (198 MHz), 4‑bit FP4 weights, greedy decoding. Details in [Results](#results).</sub>
+<sub>HP Z420, 5 × Apex Kintex‑7, firmware `c7de4c55` (230 MHz), 4‑bit FP4 weights, greedy decoding. Details in [Results](#results) and [Firmware update: 198 → 230 MHz](#firmware-update-198--230-mhz).</sub>
 
 ---
 
@@ -40,7 +40,7 @@ All model compute runs on the cards. The host CPU only coordinates. It does the 
 | **Software** | Fresh Ubuntu 24.04.5, kernel 7.0; no driver, no runtime, no Python environment |
 | **Goal** | Run large models with all 5 cards working on the same token, as fast as possible |
 
-The first working setup ran Qwen3.5‑9B on the 5 cards with one engine per card at **3.2 tokens/s** (context 4096). The rest of this README describes how the system got from there to where it is now.
+The first working setup ran Qwen3.5‑9B on the 5 cards with one engine per card at **3.2 tokens/s** (context 4096). The rest of this README describes how the system got from there to where it is now. All optimization work was done at 198 MHz. Afterwards the cards were updated to the vendor's firmware `c7de4c55` (230 MHz) with no code change ([Firmware update](#firmware-update-198--230-mhz)).
 
 ### PCIe layout of the cards
 
@@ -58,9 +58,11 @@ The first working setup ran Qwen3.5‑9B on the 5 cards with one engine per card
 
 ### Speed
 
+Measured at 198 MHz (firmware `a4fba9d9`), at the end of the optimization work. For the 230 MHz numbers see [Firmware update](#firmware-update-198--230-mhz).
+
 ```mermaid
 xychart-beta
-    title "Generation speed (tokens/s): starting point and now"
+    title "Generation speed at 198 MHz (tokens/s): starting point and after the optimizations"
     x-axis ["Qwen3.5-9B start", "Qwen3.5-9B", "Qwen3.8-27B", "GPT-OSS-20B first", "GPT-OSS-20B"]
     y-axis "tokens/s" 0 --> 16
     bar [3.2, 6.97, 2.39, 11.3, 15.3]
@@ -76,11 +78,54 @@ xychart-beta
 - For GPT‑OSS‑20B the context size (2048 or 8192) does not change the speed. The cards only compute over the part of the context that is filled.
 - Qwen3.5‑9B at 16K context passes long-context retrieval tests: a fact placed at the start of a 1066-token and a 3021-token prompt is found.
 
+### Firmware update: 198 → 230 MHz
+
+The vendor's firmware `c7de4c55` runs the engines at 230 MHz instead of 198 MHz. Below, the same code, prompts and settings are run on both firmware versions, one after the other. The only software change is the firmware version check in `user_dma_core.py`.
+
+**Generation speed**
+
+| Model | 198 MHz (`a4fba9d9`) | 230 MHz (`c7de4c55`) | Gain |
+|---|---|---|---|
+| GPT‑OSS‑20B (MoE), 116-token reply | 53.7 ms/token · 18.61 tok/s | 51.4 ms/token · **19.45 tok/s** | **+4.5 %** |
+| Qwen3.5‑9B, 16K context | 158.2 ms/token · 6.32 tok/s | 142.0 ms/token · **7.04 tok/s** | **+11.4 %** |
+| Qwen3.8‑27B, 8K context | 416.6 ms/token · 2.40 tok/s | 385.5 ms/token · **2.59 tok/s** | **+8.1 %** |
+
+**Prompt reading**
+
+| Model | 198 MHz | 230 MHz | Gain |
+|---|---|---|---|
+| GPT‑OSS‑20B | 18.53 tok/s | 19.73 tok/s | +6.5 % |
+| Qwen3.5‑9B | 6.37 tok/s | 7.08 tok/s | +11.1 % |
+| Qwen3.8‑27B | 2.40 tok/s | 2.56 tok/s | +6.7 % |
+
+**On-card compute per token (slowest engine)**
+
+| Model | 198 MHz | 230 MHz | Change |
+|---|---|---|---|
+| Qwen3.5‑9B | 137.9 ms | 118.1 ms | −14.4 % |
+| Qwen3.8‑27B | 377.4 ms | 323.6 ms | −14.3 % |
+
+```mermaid
+xychart-beta
+    title "Generation speed (tokens/s): 198 MHz vs 230 MHz"
+    x-axis ["GPT-OSS-20B 198", "GPT-OSS-20B 230", "Qwen3.5-9B 198", "Qwen3.5-9B 230", "Qwen3.8-27B 198", "Qwen3.8-27B 230"]
+    y-axis "tokens/s" 0 --> 20
+    bar [18.61, 19.45, 6.32, 7.04, 2.40, 2.59]
+```
+
+- The cards' compute scales with the clock: 198 / 230 = 0.86, and compute time per token dropped by 14 %.
+- The gain per token is smaller than 14 % because part of every token is host-side synchronization over PCIe, and that part does not depend on the card clock. GPT‑OSS‑20B has 73 sync points per token, so it gains the least.
+- Output is bit-identical on all three models: the same greedy text, and for Qwen the same token IDs. GPT‑OSS expert picks agree on every layer across all cards.
+- The comparison runs use fixed short prompts. That is why GPT‑OSS‑20B at 198 MHz shows 53.7 ms/token here and 65.5 ms/token in the table above.
+- How to update the cards: [Card firmware](#card-firmware).
+
 ### GPT‑OSS‑20B: where the time of one token goes
+
+Measured at 198 MHz.
 
 ```mermaid
 pie showData
-    title GPT-OSS-20B, 65.5 ms per token
+    title GPT-OSS-20B at 198 MHz, 65.5 ms per token
     "Router + experts (24 layers)" : 39.9
     "Attention (24 layers)" : 18.6
     "LM head (201088 words)" : 6.0
@@ -348,13 +393,13 @@ Patch for [aptop](https://github.com/celikomer/aptop), an nvtop-like monitor for
 
 - Ubuntu 24.04, `build-essential`, kernel headers.
 - A Python 3.12 virtual environment with `torch` (CPU), `transformers` ≥ 5.20, `numpy` 1.26, `safetensors`.
-- The vendor runtime [apex-compute/unified-engine](https://github.com/apex-compute/unified-engine), at a version that matches firmware `a4fba9d9`.
+- The vendor runtime [apex-compute/unified-engine](https://github.com/apex-compute/unified-engine), at a version that matches the card firmware (`c7de4c55`, 230 MHz).
 
 > On this Xeon, PyTorch's multi-threaded paths can use a CPU instruction the processor lacks. All scripts run with `torch.set_num_threads(1)`.
 
 ### 1. Get the code
 
-The branch `5-Apex-fpga` is the vendor runtime (matching firmware `a4fba9d9`) with this project in `models/apex-tp-llm/`:
+The branch `5-Apex-fpga` is the vendor runtime (matching firmware `c7de4c55`) with this project in `models/apex-tp-llm/`:
 
 ```bash
 git clone -b 5-Apex-fpga https://github.com/dogankumova/unified-engine.git ~/unified-engine
@@ -372,6 +417,28 @@ sudo cp ~/unified-engine/models/apex-tp-llm/system/{xdma,apex-tune}.service /etc
 sudo systemctl daemon-reload && sudo systemctl enable --now apex-tune xdma
 ls /dev/xdma*_h2c_0          # one line per card
 ```
+
+#### Card firmware
+
+The runtime checks the firmware version of every card when it starts. Check the cards first:
+
+```bash
+cd ~/unified-engine
+for d in /dev/xdma*_user; do python3 update_flash.py --dev $(basename $d _user) --is-current update_c7de4c55.bin; done
+```
+
+To update a card, write the flash without the warm boot, one card after the other. Then switch the machine off and on again:
+
+```bash
+cd ~/unified-engine
+python3 -u update_flash.py update_c7de4c55.bin --dev xdma0 --no-boot     # repeat for xdma1 … xdma4
+sudo poweroff                                                            # then power on again
+```
+
+- Each card takes about 1.5 minutes: erase, program (~32 s), and a byte-by-byte verify (~22 s).
+- Stop OllApeX and every other program that uses the cards before you start.
+- A power cycle is needed because the cards load their image from flash only at power-on. A software reboot is not enough.
+- On the HP Z420, the vendor's one-step `update_fpga.sh` (warm boot plus a PCIe rescan of all cards) froze the host. `--no-boot` plus a power cycle avoids both steps.
 
 ### 3. Patched model port
 

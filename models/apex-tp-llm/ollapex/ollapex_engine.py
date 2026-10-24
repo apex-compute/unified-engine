@@ -261,7 +261,8 @@ def worker(c, E, P, dev, paths, n_layers, max_ctx, cpu, nap, shm_names, conn, vi
                                   * ue.full_head_dim * BF16 / 1e6,
                          "tensor_mb": (lm_tensor_end - g["tensor0"]) / 1e6,
                          "instructions": sizes[0] // INST, "tensor_free_mb": (tensor_limit - lm_tensor_end) / 1048576.0,
-                         "clock_mhz": 1000.0 / float(getattr(T_e.user_dma_core, "CLOCK_PERIOD_NS", 0) or 5.042)})
+                         "clock_mhz": 1000.0 / float(getattr(ue, "_clock_period_ns", 0) or 5.042),
+                         "firmware": "%08x" % ue.get_hardware_version()})
         n_seg = len(eng[0]["starts"])
         ue0 = eng[0]["ue"]
         T_al = ue0.max_context_aligned

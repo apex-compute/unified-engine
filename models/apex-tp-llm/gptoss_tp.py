@@ -137,7 +137,9 @@ def worker(c, E, P, dev, tdir, max_ctx, cpu, shm_names, conn):
         info = [{"dev": "%s/e%d" % (dev, e), "params_mb": (s.ue._next_params_dram_addr - s.ue._params_dram_base) / 1e6,
                  "prog_mb": (s.ue.get_program_dram_addr() - p0) / 1e6, "tensor_mb": tensor_mb(s),
                  "kv_mb": s.L * s.T_ext * (G.KQ + 2 * s.HD) * BF16 / 1e6,
-                 "setup_s": time.time() - t0, "segs": n_seg} for e, (s, p0) in enumerate(zip(shards, prog0))]
+                 "setup_s": time.time() - t0, "segs": n_seg,
+                 "clock_mhz": 1000.0 / float(getattr(s.ue, "_clock_period_ns", 0) or 5.042),
+                 "firmware": "%08x" % s.ue.get_hardware_version()} for e, (s, p0) in enumerate(zip(shards, prog0))]
         sh = Shared(P, H, shm_names)
         # the card's DMA channels opened ONCE: the vendor dma_write/dma_read open and close the device on
         # every call, which costs more than the small transfer itself (~170 transfers per token)

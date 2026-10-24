@@ -6,9 +6,11 @@ This document continues the [README](../README.md). It covers how the card progr
 
 ## 1. Hardware measurements
 
+The values below were measured with firmware `a4fba9d9` (198 MHz). With firmware `c7de4c55` (230 MHz), the engines' compute time per token is 14 % shorter (198 / 230). Host-side and DMA times do not change ([README](../README.md#firmware-update-198--230-mhz)).
+
 | Measurement | Value |
 |---|---|
-| Engine compute | 64 MAC / cycle × 198 MHz ≈ 12.7 GMAC/s |
+| Engine compute | 64 MAC / cycle × 198 MHz ≈ 12.7 GMAC/s (230 MHz: ≈ 14.8 GMAC/s) |
 | FP4 weight read, one engine | ~5.7 GB/s |
 | Two engines, separate DDR channels | 11.38 GB/s total |
 | Two engines, same DDR channel | 6.43 GB/s total |
@@ -19,7 +21,7 @@ This document continues the [README](../README.md). It covers how the card progr
 | All 5 cards at once, 256 B write/read | 11–16 µs |
 | Engine start + idle poll | ~4 µs |
 
-Single-token decoding is bound by the weight read rate. Matmul time grows linearly with the number of rows, so batched prompt reading brings no extra speed; the extra compute comes from the second engine.
+Single-token decoding is bound by the engine's weight read rate. That rate follows the engine clock, not the DDR limit: at 230 MHz the on-card time per token drops by the full clock ratio. Matmul time grows linearly with the number of rows, so batched prompt reading brings no extra speed; the extra compute comes from the second engine.
 
 ### Engine addressing
 
