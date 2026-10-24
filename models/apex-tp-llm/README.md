@@ -6,9 +6,9 @@ All model compute runs on the cards. The host CPU only coordinates. It does the 
 
 | Model | Cards | Context | Generation | Prompt reading |
 |---|---|---|---|---|
-| **GPT‑OSS‑20B** (MoE) | 5 cards × 2 engines | 8192 | **19.45 tokens/s** | 19.7 tokens/s |
-| **Qwen3.5‑9B** | 5 cards × 2 engines | 16384 | **7.04 tokens/s** | 7.1 tokens/s |
-| **Qwen3.8‑27B** | 5 cards × 2 engines | 8192 | **2.59 tokens/s** | 2.6 tokens/s |
+| **GPT‑OSS‑20B** (MoE) | 5 cards × 2 engines | 8192 | **21.1 tokens/s** | 21.4 tokens/s |
+| **Qwen3.5‑9B** | 5 cards × 2 engines | 16384 | **7.35 tokens/s** | 7.4 tokens/s |
+| **Qwen3.8‑27B** | 5 cards × 2 engines | 8192 | **2.76 tokens/s** | 2.8 tokens/s |
 
 <sub>HP Z420, 5 × Apex Kintex‑7, firmware `c7de4c55` (230 MHz), 4‑bit FP4 weights, greedy decoding. Details in [Results](#results) and [Firmware update: 198 → 230 MHz](#firmware-update-198--230-mhz).</sub>
 
@@ -117,6 +117,7 @@ xychart-beta
 - The gain per token is smaller than 14 % because part of every token is host-side synchronization over PCIe, and that part does not depend on the card clock. GPT‑OSS‑20B has 73 sync points per token, so it gains the least.
 - Output is bit-identical on all three models: the same greedy text, and for Qwen the same token IDs. GPT‑OSS expert picks agree on every layer across all cards.
 - The comparison runs use fixed short prompts. That is why GPT‑OSS‑20B at 198 MHz shows 53.7 ms/token here and 65.5 ms/token in the table above.
+- The headline numbers at the top come from a later run of the same benchmark on a less busy host: GPT‑OSS‑20B 47.4 ms/token, Qwen3.5‑9B 136.0 ms/token, Qwen3.8‑27B 362.3 ms/token. On-card compute in that run was the same as in the comparison above (118.1 / 323.6 ms); only host-side time was lower.
 - How to update the cards: [Card firmware](#card-firmware).
 
 ### GPT‑OSS‑20B: where the time of one token goes
