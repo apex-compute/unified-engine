@@ -777,27 +777,6 @@ class Qwen25OmniUnifiedEngine(
                 "Qwen2.5-Omni requires host BF16 token embeddings"
             )
 
-    # The latency counter is 32 bits of 16-cycle ticks, so it wraps every
-    # 2**32 * 16 cycles: 187 s at 366.7 MHz, 237 s at 290 MHz. The High tier's
-    # prefill runs longer than that. The wall time since this engine's last
-    # launch bounds the true latency from above, which is enough to add back the
-    # whole wraps the register lost; a program shorter than one wrap is unchanged.
-    def start_execute_from_dram(self, *args, **kwargs):
-        self._launch_wall_s = time.perf_counter()
-        return super().start_execute_from_dram(*args, **kwargs)
-
-    def report_latency_in_us(self):
-        us = super().report_latency_in_us()
-        launched = getattr(self, "_launch_wall_s", None)
-        if launched is None:
-            return us
-        wrap_us = (2**32 * user_dma_core.UE_PIPELINE_COUNTER_CLK_DIV
-                   * self._clock_period_ns / 1e3)
-        wall_us = (time.perf_counter() - launched) * 1e6
-        if wall_us > us + wrap_us:
-            us += wrap_us * int((wall_us - us) // wrap_us)
-        return us
-
     def _read_params_region(self, name: str) -> dict[str, Any]:
         """Return one validated disk region from the unified params artifact."""
         if self._params_regions is None:
