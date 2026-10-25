@@ -195,15 +195,22 @@ flowchart TB
         G["generate(): prompt reading, token loop, sampling, statistics"]
         L1["Loaded (Qwen)"]
         L2["LoadedGptOss (ollapex_gptoss.py)"]
+        L3["LoadedGemma4 (ollapex_gemma4.py)<br/>vision() · forward_block()"]
         AP["AptopState → aptop-workload/v1"]
     end
     H --> T --> G
     G --> L1
     G --> L2
+    G --> L3
     G --> DT
     G --> AP
 ```
 
 - **Stop tokens:** Qwen uses `<|im_end|>`; GPT‑OSS uses `<|return|>` / `<|call|>`. In GPT-OSS, `<|end|>` closes the analysis message and the final answer follows it.
+- **Images:** `/api/file` keeps an uploaded image in `/dev/shm/ollapex_uploads` (id = md5) and reports its size and token cost at each detail level. A chat message carries `images: [id]`, and the image is encoded under the engine lock before the prompt is built.
+  - Qwen: the encoder runs on one card, and the image tokens get (t, h, w) rotary positions.
+  - Gemma 4: `LoadedGemma4.vision()` runs the encoder on the first `GEMMA4_VISION_SHARDS` shards (default 8) at 70 / 140 / 280 soft tokens. The server expands each `<|image|>` of the chat template to `<|image>` + one `<|image|>` per soft token + `<image|>`, and `generate()` reads each image as one block (`forward_block()`, `req["image_blocks"]`).
+  - Encoded images are cached per detail level, so follow-up turns do not encode again.
+- **Follow-ups:** when a request is the previous exchange plus one user message, the token ids are built as the exact continuation of what the cards hold, so only the new turn is read.
 - **Candidates:** Every engine reports its best 4 tokens through the hardware argmax. Greedy mode takes the largest logit; sampling picks among the overall top‑k candidates with temperature / top‑p.
 - **aptop state file:** `$XDG_RUNTIME_DIR/aptop-workload.json` and `/tmp/aptop-$UID/workload.json`. It holds the model, the phase, and the per-card memory split (weights / KV / program).

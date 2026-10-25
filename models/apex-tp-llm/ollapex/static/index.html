@@ -202,7 +202,7 @@ details.raw pre { font: 11px/1.4 var(--mono); background: var(--soft); padding: 
     <div id="vis-box" hidden>
     <h3>Image encoder</h3>
     <dl class="kv" id="vis-kv"></dl>
-    <div class="hint" style="margin-top:6px">The image encoder (27 transformer blocks) runs on one FPGA card; its output goes to all cards as prompt tokens.</div>
+    <div class="hint" id="vis-note" style="margin-top:6px">The image encoder (27 transformer blocks) runs on one FPGA card; its output goes to all cards as prompt tokens.</div>
     </div>
 
     <h3>Time per token</h3>
@@ -300,7 +300,17 @@ function renderStatus() {
   if (document.activeElement !== cs && s.num_ctx) cs.value = s.num_ctx;
   $("npred").max = s.limits.max_ctx;
   const ds = $("detail");
-  if (!ds.options.length && s.image_detail) { ds.innerHTML = Object.entries(s.image_detail.choices).map(([k, px]) => '<option value="' + k + '">' + k[0].toUpperCase() + k.slice(1) + " · up to " + px + " px, " + Math.pow(px / 32, 2) + " tokens</option>").join(""); ds.value = s.image_detail.default; }
+  const dsig = s.image_detail ? JSON.stringify(s.image_detail.choices) + s.image_detail.unit : "";
+  if (s.image_detail && ds.dataset.sig !== dsig) {
+    const keep = ds.value;
+    ds.innerHTML = Object.entries(s.image_detail.choices).map(([k, v]) => '<option value="' + k + '">' + k[0].toUpperCase() + k.slice(1) + " · " +
+      (s.image_detail.unit === "tokens" ? "up to " + v + " tokens" : "up to " + v + " px, " + Math.pow(v / 32, 2) + " tokens") + "</option>").join("");
+    ds.value = keep && s.image_detail.choices[keep] ? keep : s.image_detail.default; ds.dataset.sig = dsig;
+    if (attached) setAttached(attached);
+  }
+  const vi = s.info || {};
+  $("vis-note").textContent = vi.vision_shards ? "The image encoder (27 transformer blocks) runs tensor-parallel on " + vi.vision_shards + " FPGA engines; its output goes to all cards as one block of prompt tokens."
+    : "The image encoder (27 transformer blocks) runs on one FPGA card; its output goes to all cards as prompt tokens.";
   ds.disabled = !s.vision;
 
   $("send").disabled = !busy && s.state === "loading";
@@ -477,13 +487,14 @@ function renderVision(st) {
   if (!im.length) return;
   const row = (k, v) => "<dt>" + k + "</dt><dd>" + v + "</dd>";
   $("vis-kv").innerHTML = im.map(i =>
-    row("Image", esc(i.name)) + row("Card", i.card) +
+    row("Image", esc(i.name)) + row(i.segments ? "Encoder on" : "Card", i.card) +
     row("Size", i.source[0] + "×" + i.source[1] + " → " + i.encoded[0] + "×" + i.encoded[1] + " px (" + i.detail + ")") +
     row("Patches → tokens", i.patches + " → " + i.tokens) +
-    row("Encoding time on the card", fmt(i.card_s, 1) + " s") +
+    row(i.segments ? "Encoding time on the cards" : "Encoding time on the card", fmt(i.card_s, 1) + " s") +
+    (i.segments ? row("Card commands", i.segments + " (2 per block + pooling)") : "") +
     (i.compile_s > 0.5 ? row("Program build, first use of this size", fmt(i.compile_s, 0) + " s") : "") +
     (i.weights_upload_s > 0.5 ? row("Encoder weights upload, first use", fmt(i.weights_upload_s, 0) + " s") : "") +
-    row("Card program", fmt(i.instructions / 1000, 0) + "k instructions")).join("");
+    row(i.segments ? "Program per engine" : "Card program", fmt(i.instructions / 1000, 0) + "k instructions")).join("");
 }
 
 function options() {
@@ -536,7 +547,7 @@ async function send() {
           const a = o;
           if (a.event === "start") { live = { prompt_tokens: a.prompt_tokens, reused_tokens: a.reused_tokens, num_ctx: a.num_ctx, context_used: a.reused_tokens };
             $("s-phase").textContent = "Reading prompt: " + (a.prompt_tokens - a.reused_tokens) + " tokens" + (a.reused_tokens ? " (" + a.reused_tokens + " tokens already on the cards)" : ""); renderStats(live, true); }
-          else if (a.event === "vision") { $("s-phase").textContent = "Encoding the image on an FPGA card: " + a.name + " (" + a.width + "×" + a.height + " px, " + a.tokens + " tokens)…"; }
+          else if (a.event === "vision") { $("s-phase").textContent = (a.cards ? "Encoding the image on the FPGA cards: " : "Encoding the image on an FPGA card: ") + a.name + " (" + a.width + "×" + a.height + " px, " + a.tokens + " tokens)…"; }
           else if (a.event === "prefill") { $("s-phase").textContent = "Reading prompt: " + a.done + " / " + a.total + " tokens"; live.context_used = (live.reused_tokens || 0) + a.done; renderStats(live, true); }
         }
         if (o.type === "thinking") { thinking += o.text; paint(); }

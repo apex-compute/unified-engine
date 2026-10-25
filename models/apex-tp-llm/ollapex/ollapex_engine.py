@@ -889,16 +889,27 @@ def generate(m, req, emit, abort):
     def vec_at(i, token):
         return np.frombuffer(vecs[i], dtype=np.int16) if i in vecs else m.embed[token]
 
+    # image blocks the model reads as one unit (Gemma 4: bidirectional attention inside an image)
+    blocks = {s: n for s, n in (req.get("image_blocks") or []) if s >= reuse} if hasattr(m, "forward_block") else {}
     t0 = time.perf_counter()
     cands = None
-    for i in range(reuse, len(ids)):
+    i = reuse
+    while i < len(ids):
         if abort.is_set():
             break
+        if i in blocks:
+            n = blocks[i]
+            m.forward_block(np.stack([np.frombuffer(vecs[j], dtype=np.int16) for j in range(i, i + n)]), i)
+            m.fed.extend(keys[i:i + n])
+            i += n
+            emit(("prefill", {"done": i - reuse, "total": len(ids) - reuse}))
+            continue
         lastp = i == len(ids) - 1
         cands = m.forward(vec_at(i, ids[i]), i, want if lastp else 0, None)
         m.fed.append(keys[i])
         if (i - reuse) % 8 == 7 and not lastp:
             emit(("prefill", {"done": i + 1 - reuse, "total": len(ids) - reuse}))
+        i += 1
     t_prefill = time.perf_counter() - t0
     n_prefill = len(m.fed) - reuse
 
@@ -994,7 +1005,7 @@ def driver_main(conn, abort):
             elif msg[0] == "vision":
                 if m is None:
                     raise RuntimeError("no model loaded")
-                toks, meta = m.vision(msg[1], msg[2], msg[3])
+                toks, meta = m.vision(*msg[1:])
                 emit(("vision_done", toks.tobytes(), list(toks.shape), meta))
             elif msg[0] == "unload":
                 if m is not None:

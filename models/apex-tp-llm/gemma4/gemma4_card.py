@@ -60,7 +60,8 @@ R_LEN_S, R_BLK_VT_S, R_MASK_NEW_G, R_REBUILD_S = 42, 39, 38, 37
 R_RET = 50
 R_EXP = (51, 52, 53, 54, 55, 56, 63, 49)
 R_W = 36                                         # address of the one-hot that picks the current expert weight
-REG_FIXED_MIN = 36                               # every register >= this is ours
+R_XT = 35                                        # block program: byte offset of the current token's row in XS
+REG_FIXED_MIN = 35                               # every register >= this is ours
 # fused expert path: the weight scales the 64-128 hidden values inside the expert and the down projection
 # accumulates through its bias input straight into the MoE share (no per-expert H-sized copies / adds);
 # the FFN finish sums the dense and MoE shares in one 2H pass
@@ -147,9 +148,11 @@ class Gemma4Shard:
     (constructing an engine self-tests the first 16 KB of DRAM)."""
 
     def __init__(self, T, qwen_cfg, dev, engine, cdir, wdir, plan, max_ctx, window=None, layers=None,
-                 router_part=(0, 1)):
+                 router_part=(0, 1), max_block=0):
         """router_part = (i, n): this engine computes router rows [i*128/n, (i+1)*128/n) (the engines of a
-        card split the router; the other engine's logits land in engine 0's LOGITS, see compile())."""
+        card split the router; the other engine's logits land in engine 0's LOGITS, see compile()).
+        max_block: the longest image block (bidirectional in the sliding layers, see compile_block()); the
+        sliding rings grow by it so a block's first token still finds its whole window."""
         self.router_part = router_part
         self.T, self.U = T, T.user_dma_core
         self.fast_h2c = None
@@ -179,7 +182,9 @@ class Gemma4Shard:
         self.eps = cfg["rms_norm_eps"]
         self.window_len = cfg["sliding_window"]
         self.T_ext = (max_ctx + PV_CH - 1) // PV_CH * PV_CH
-        self.RING = min(self.window_len + RING_EXTRA, self.T_ext)     # rows of a sliding layer's K / V / V^T
+        self.max_block = (max_block + VEC - 1) // VEC * VEC
+        # rows of a sliding layer's K / V / V^T: the window, one block, and room for the longest image block
+        self.RING = min(self.window_len + RING_EXTRA + self.max_block, self.T_ext)
         self.max_ctx = max_ctx
 
     # ---------------------------------------------------------------- uploads
@@ -407,14 +412,18 @@ class Gemma4Shard:
             ue.sram_to_accelerator_memory(SA_PASS, dst + 2 * half * BF16, rest)
 
     # ---------------------------------------------------------------- per-token setup (start of A0)
-    def _emit_token_setup(self, tpl_new, tpl_old):
+    def _emit_rope_rows(self):
+        """This position's RoPE rows (R_ROPE) into fixed slots."""
         ue, sh = self.ue, self.T.ue_35bit_addr_shifter
-        # this position's RoPE rows into fixed slots
         for kind in ("s", "g"):
             for name in ("cos", "nsin", "sin"):
                 ue.generate_instruction_add_imm(R_ROPE, sh(self.tabs[kind][name]), ue._ISA_TMP_REG)
                 ue.accelerator_memory_to_sram(self.tabs[kind][name], 0x40000, 128, general_reg_src=ue._ISA_TMP_REG)
                 ue.sram_to_accelerator_memory(0x40000, self.ROPE_ROW[kind][name], 128)
+
+    def _emit_token_setup(self, tpl_new, tpl_old):
+        ue, sh = self.ue, self.T.ue_35bit_addr_shifter
+        self._emit_rope_rows()
         # mask rows: the block holding this position, and (sliding layers) the block leaving the window
         SA_NEW, SA_OLD = 0x40400, 0x40480
         ue.accelerator_memory_to_sram(tpl_new, SA_NEW, VEC)
@@ -430,9 +439,13 @@ class Gemma4Shard:
                 ue.sram_to_accelerator_memory(SA_OLD, row, VEC, general_reg_src=ue._ISA_TMP_REG)
 
     # ---------------------------------------------------------------- segments
-    def _emit_attention(self, d):
+    def _emit_attention(self, d, part="all", mask=None):
+        """part "all": the token's attention (the normal program). The block program splits it: "kv" writes
+        this token's K / V (and V^T) only, "q" computes q and attends with the mask row `mask`."""
         T, ue, H = self.T, self.ue, self.H
         nq, hd, sh = d["nq"], d["hd"], T.ue_35bit_addr_shifter
+        do_q, do_kv = part in ("all", "q"), part in ("all", "kv")
+        mask = d["MASK"] if mask is None else mask
         kind = "s" if d["sliding"] else "g"
         half = self.rope[kind][0]
         # sliding layers: slot-based registers into the ring; global layers: position-based
@@ -442,46 +455,55 @@ class Gemma4Shard:
             r_pos_k, r_blk_v, r_blk_vt, r_len, r_rebuild = R_POS_K2, R_BLK_V2, R_BLK_VT, R_LEN, R_REBUILD
         TL = d["T"]
         self._rms(self.X, d["ln_in"], self.XN)
-        self._gemv(self.XN, d["q"], nq * hd, H, self.Q)
-        self._gemv(self.XN, d["k"], hd, H, self.Kt)
-        if d["v"] is not None:
-            self._gemv(self.XN, d["v"], hd, H, self.Kt + hd * BF16)       # raw V right after raw K
-            self._rms(self.Kt + hd * BF16, self.ones512, self.VN, N=hd)
-        else:
-            self._rms(self.Kt, self.ones512, self.VN, N=hd)               # K = V: v_norm(raw k), no RoPE
-        self._rms(self.Q, d["q_norm"], self.QN, M=nq, N=hd)
-        self._rms(self.Kt, d["k_norm"], self.KN, N=hd)
+        if do_q:
+            self._gemv(self.XN, d["q"], nq * hd, H, self.Q)
+        if do_kv:
+            self._gemv(self.XN, d["k"], hd, H, self.Kt)
+            if d["v"] is not None:
+                self._gemv(self.XN, d["v"], hd, H, self.Kt + hd * BF16)       # raw V right after raw K
+                self._rms(self.Kt + hd * BF16, self.ones512, self.VN, N=hd)
+            else:
+                self._rms(self.Kt, self.ones512, self.VN, N=hd)               # K = V: v_norm(raw k), no RoPE
+        if do_q:
+            self._rms(self.Q, d["q_norm"], self.QN, M=nq, N=hd)
+        if do_kv:
+            self._rms(self.Kt, d["k_norm"], self.KN, N=hd)
         self._rope_load(kind)
-        for h in range(nq):
-            self._rope(self.QN + h * hd * BF16, self.QR + h * hd * BF16, hd, half)
-        self._rope(self.KN, self.KR, hd, half)
-        # KV write at row pos
-        for src, cache in ((self.KR, d["K"]), (self.VN, d["V"])):
-            ue.accelerator_memory_to_sram(src, 0x40000, hd)
-            ue.generate_instruction_add_imm(r_pos_k, sh(cache), ue._ISA_TMP_REG)
-            ue.sram_to_accelerator_memory(0x40000, cache, hd, general_reg_src=ue._ISA_TMP_REG)
+        if do_q:
+            for h in range(nq):
+                self._rope(self.QN + h * hd * BF16, self.QR + h * hd * BF16, hd, half)
+        if do_kv:
+            self._rope(self.KN, self.KR, hd, half)
+            # KV write at row pos
+            for src, cache in ((self.KR, d["K"]), (self.VN, d["V"])):
+                ue.accelerator_memory_to_sram(src, 0x40000, hd)
+                ue.generate_instruction_add_imm(r_pos_k, sh(cache), ue._ISA_TMP_REG)
+                ue.sram_to_accelerator_memory(0x40000, cache, hd, general_reg_src=ue._ISA_TMP_REG)
         rc = ue._isa_reg_counter
         ue._isa_reg_counter = max(rc, 6)
-        # V^T packed [hd, R_LEN]: transpose this position's 64-row block into it (row stride R_LEN*2) ...
-        ue.generate_instruction_shl(R_VT_STRIDE, r_len, 1)
-        ue.generate_instruction_add_imm(r_blk_v, sh(d["V"]), R_VT_IN)
-        ue.generate_instruction_add_imm(r_blk_vt, sh(d["VT"]), R_VT_OUT)
-        ue.bf16_transpose_core(M=VEC, N=hd, INPUT_DRAM_ADDR=d["V"], OUTPUT_DRAM_ADDR=d["VT"],
-                               IDENTITY_DRAM_ADDR=ue._identity_dram_addr, gpr_input_addr=R_VT_IN,
-                               gpr_out_addr=R_VT_OUT, gpr_out_row_stride_reg=R_VT_STRIDE)
-        # ... and when R_LEN has just grown, rebuild all of it with the new row stride
-        patch = ue._emit_forward_skip_jz(r_rebuild, self._cap_base)
-        ue.bf16_transpose_core(M=TL, N=hd, INPUT_DRAM_ADDR=d["V"], OUTPUT_DRAM_ADDR=d["VT"],
-                               IDENTITY_DRAM_ADDR=ue._identity_dram_addr, gpr_M_reg=r_len)
-        patch()
-        # both heads in ONE matmul (scale 1.0: the norms carry it), shared mask row, then ONE P.V matmul
-        ue.matmat_mul_core(M=nq, K=hd, N=TL, A_DRAM_ADDR=self.QR, B_DRAM_ADDR=d["K"],
-                           OUTPUT_DRAM_ADDR=d["SC"], softmax_enable=True, C_DRAM_ADDR=d["MASK"],
-                           bias_mode="broadcast_N", gpr_N_reg=r_len)
-        ue.matmat_mul_core(M=nq, K=TL, N=hd, A_DRAM_ADDR=d["SC"], B_DRAM_ADDR=d["VT"],
-                           OUTPUT_DRAM_ADDR=self.ATT, gpr_K_reg=r_len)
+        if do_kv:
+            # V^T packed [hd, R_LEN]: transpose this position's 64-row block into it (row stride R_LEN*2) ...
+            ue.generate_instruction_shl(R_VT_STRIDE, r_len, 1)
+            ue.generate_instruction_add_imm(r_blk_v, sh(d["V"]), R_VT_IN)
+            ue.generate_instruction_add_imm(r_blk_vt, sh(d["VT"]), R_VT_OUT)
+            ue.bf16_transpose_core(M=VEC, N=hd, INPUT_DRAM_ADDR=d["V"], OUTPUT_DRAM_ADDR=d["VT"],
+                                   IDENTITY_DRAM_ADDR=ue._identity_dram_addr, gpr_input_addr=R_VT_IN,
+                                   gpr_out_addr=R_VT_OUT, gpr_out_row_stride_reg=R_VT_STRIDE)
+            # ... and when R_LEN has just grown, rebuild all of it with the new row stride
+            patch = ue._emit_forward_skip_jz(r_rebuild, self._cap_base)
+            ue.bf16_transpose_core(M=TL, N=hd, INPUT_DRAM_ADDR=d["V"], OUTPUT_DRAM_ADDR=d["VT"],
+                                   IDENTITY_DRAM_ADDR=ue._identity_dram_addr, gpr_M_reg=r_len)
+            patch()
+        if do_q:
+            # both heads in ONE matmul (scale 1.0: the norms carry it), shared mask row, then ONE P.V matmul
+            ue.matmat_mul_core(M=nq, K=hd, N=TL, A_DRAM_ADDR=self.QR, B_DRAM_ADDR=d["K"],
+                               OUTPUT_DRAM_ADDR=d["SC"], softmax_enable=True, C_DRAM_ADDR=mask,
+                               bias_mode="broadcast_N", gpr_N_reg=r_len)
+            ue.matmat_mul_core(M=nq, K=TL, N=hd, A_DRAM_ADDR=d["SC"], B_DRAM_ADDR=d["VT"],
+                               OUTPUT_DRAM_ADDR=self.ATT, gpr_K_reg=r_len)
         ue._isa_reg_counter = rc
-        self._gemv(self.ATT, d["o"], H, nq * hd, self.SHARE_A)
+        if do_q:
+            self._gemv(self.ATT, d["o"], H, nq * hd, self.SHARE_A)
 
     def _emit_router(self, d):
         self._finish_attn(d)
@@ -650,6 +672,163 @@ class Gemma4Shard:
                            for a in row] for row in self.sub_addr]
         return len(self.seg_start)
 
+    # ---------------------------------------------------------------- image blocks
+    def _emit_x_load(self):
+        """XB := XS[token] (R_XT)."""
+        ue, sh = self.ue, self.T.ue_35bit_addr_shifter
+        ue.generate_instruction_add_imm(R_XT, sh(self.XS), ue._ISA_TMP_REG)
+        ue.accelerator_memory_to_sram(self.XS, 0x00000, self.H, general_reg_src=ue._ISA_TMP_REG)
+        self._a_to(self.XB, self.H)
+
+    def _emit_x_store(self):
+        """XS[token] (R_XT) := XB."""
+        ue, sh = self.ue, self.T.ue_35bit_addr_shifter
+        self._to_a(self.XB, self.H)
+        ue.generate_instruction_add_imm(R_XT, sh(self.XS), ue._ISA_TMP_REG)
+        ue.sram_to_accelerator_memory(0x00000, self.XS, self.H, general_reg_src=ue._ISA_TMP_REG)
+
+    def compile_block(self):
+        """The block program: the prompt's image tokens, layer by layer, so that in the sliding layers every
+        token of the block also attends to the block's later tokens (transformers: AND(window, OR(causal,
+        same block))); the global layers stay causal. Each token's residual lives in XS (on the card).
+            K        : per token, layer 0's K / V
+            per layer: B  token entry (registers, RoPE rows, X from XS), q + attention (host-written mask row)
+                       R, D, E as in the normal program
+                       F  finish the FFN, the NEXT layer's K / V, X back to XS
+        so a layer's K / V of the whole block exist before any of its tokens attends. Call after compile()."""
+        ue, H, INST = self.ue, self.H, self.INST
+        assert self.max_block, "the shard was built without max_block"
+        self.XS = self._t(self.max_block * H)
+        self.XB = self._t(H)
+        self.MS, self.MG = self._t(self.RING), self._t(self.T_ext)
+        self.blk_regs = self.pos_regs + [R_XT]
+        saved_x = self.X
+        self.X = self.XB
+        segs, self.blk_lg8 = [], []
+
+        def data_slots(n):
+            for _ in range(n):
+                ue.generate_instruction_add_set(R_DATA, 0)
+
+        def entry():                                  # the host overwrites these slots for each token
+            for r in self.blk_regs:
+                ue.generate_instruction_add_set(r, 0)
+            self._emit_rope_rows()
+            self._emit_x_load()
+
+        def body(base):
+            segs.append(("K", -1, ue.capture_count))
+            entry()
+            if self.layers[0]["nq"]:
+                self._emit_attention(self.layers[0], "kv")
+            ue.generate_instruction_halt()
+            for i, d in enumerate(self.layers):
+                segs.append(("B", i, ue.capture_count))
+                entry()
+                if d["nq"]:
+                    self._emit_attention(d, "q", mask=self.MS if d["sliding"] else self.MG)
+                ue.generate_instruction_halt()
+                segs.append(("R", i, ue.capture_count))
+                self._emit_router(d)
+                ue.generate_instruction_halt()
+                segs.append(("D", i, ue.capture_count))
+                self._emit_dense(d)
+                ue.generate_instruction_halt()
+                ue.pad_capture_to_64b_boundary()
+                lg8 = base + ue.capture_count * INST
+                data_slots(VEC * BF16 // INST)
+                self.blk_lg8.append(lg8)
+                segs.append(("E", i, ue.capture_count))
+                self._emit_experts(d, base, lg8)
+                ue.generate_instruction_halt()
+                segs.append(("F", i, ue.capture_count))
+                self._finish_ffn(d)
+                if i + 1 < self.L and self.layers[i + 1]["nq"]:
+                    self._emit_attention(self.layers[i + 1], "kv")
+                self._emit_x_store()
+                ue.generate_instruction_halt()
+
+        base = self._place(body)
+        self.X = saved_x
+        self.bseg_kind = [k for k, _, _ in segs]
+        self.bseg_layer = [i for _, i, _ in segs]
+        self.bseg_start = [base + idx * INST for _, _, idx in segs]
+        self._mask_cache = {}
+        return len(self.bseg_start)
+
+    def block_begin(self, p0, n, xs_bytes):
+        """A block of n image tokens at positions p0..p0+n-1, their embeddings (n rows, bf16 bits) into XS."""
+        assert 0 < n <= self.max_block and p0 + n <= self.max_ctx
+        self.blk = (p0, n)
+        self._mask_cache = {}
+        self._write(self.XS, xs_bytes)
+
+    def block_slots(self, seg, t):
+        """Token t's registers into the entry slots of block segment seg (K or B), ONE DMA: the same values as
+        set_position, except that the lengths already cover the whole block (all of its K / V exist before
+        anyone attends) and token 0 rebuilds V^T with that length."""
+        sh, R = self.T.ue_35bit_addr_shifter, self.RING
+        p0, n = self.blk
+        pos = p0 + t
+        Lb = (p0 + n - 1 + VEC) // VEC * VEC
+        blk = pos // VEC * VEC
+        slot = pos % R
+        blk_s = slot // VEC * VEC
+        rb = 1 if t == 0 else 0
+        vals = [sh(slot * 256 * BF16), sh(pos * 512 * BF16), sh(pos * 128 * BF16), min(Lb, self.T_ext),
+                sh(blk_s * 256 * BF16), sh(blk * 512 * BF16), sh(blk * BF16), sh(blk_s * BF16), sh(blk_s * BF16),
+                rb, min(Lb, R), sh(blk_s * BF16), sh(blk * BF16), rb, sh(t * self.H * BF16)]
+        self._write(self.bseg_start[seg], b"".join(self._enc(r, v) for r, v in zip(self.blk_regs, vals)))
+
+    def _held(self, last):
+        """Position each ring slot holds once positions 0..last are written (-1: none)."""
+        s = np.arange(self.RING)
+        return last - ((last - s) % self.RING)
+
+    def _mask_row(self, sliding, pos, last, block):
+        """bf16 bits of a mask row: what query `pos` may see once positions 0..last are written. block =
+        (first, last) of the image block pos belongs to, or None."""
+        if sliding:
+            kv = self._held(last)
+            vis = (kv >= 0) & (kv > pos - self.window_len) & (kv <= pos)
+            if block is not None:
+                vis |= (kv >= block[0]) & (kv <= block[1]) & (kv > pos - self.window_len)
+            n = self.RING
+        else:
+            n = (last + VEC) // VEC * VEC
+            kv = np.arange(n)
+            vis = kv <= pos
+        row = np.full(n, NEG_BF, dtype=np.int16)
+        row[vis] = 0
+        return row
+
+    def block_mask(self, seg, t):
+        """Token t's mask row for block segment seg (B) of a layer with heads, ONE DMA."""
+        d = self.layers[self.bseg_layer[seg]]
+        if not d["nq"]:
+            return
+        p0, n = self.blk
+        key = (d["sliding"], t)
+        row = self._mask_cache.get(key)
+        if row is None:
+            row = self._mask_cache[key] = self._mask_row(d["sliding"], p0 + t, p0 + n - 1,
+                                                         (p0, p0 + n - 1)).tobytes()
+        self._write(self.MS if d["sliding"] else self.MG, row)
+
+    def block_end(self):
+        """Back to the normal program: every layer's mask row as the next text token expects it (what the
+        block's last token sees causally; the block is ordinary history from now on)."""
+        p0, n = self.blk
+        last = p0 + n - 1
+        rows = {s: self._mask_row(s, last, last, None) for s in (True, False)}
+        for d in self.layers:
+            if d["nq"]:
+                r = rows[d["sliding"]]
+                full = np.full(d["T"], NEG_BF, dtype=np.int16)
+                full[:min(len(r), d["T"])] = r[:d["T"]]
+                self._write(d["MASK"], full.tobytes())
+        self.blk = None
+
     def _addset_encoder(self):
         """Learn where ADD_SET keeps its 32-bit immediate, so the host can produce instruction bytes directly."""
         ue, T = self.ue, self.T
@@ -666,7 +845,7 @@ class Gemma4Shard:
             return w
 
         self._addset = {}
-        for r in set(self.pos_regs) | set(R_EXP):
+        for r in set(self.pos_regs) | set(R_EXP) | {R_XT}:
             base = capture(r, 0)
             bitmap = []
             for k in range(32):
@@ -722,14 +901,16 @@ class Gemma4Shard:
         else:
             self.ue.dma_write(self.T.DMA_DEVICE_H2C, addr, torch.frombuffer(bytearray(buf), dtype=torch.uint8), len(buf))
 
-    def set_experts_bf(self, li_idx, idx, lg_bf):
+    def set_experts_bf(self, li_idx, idx, lg_bf, block=False):
         """The host's pick for layer slot li_idx, ONE DMA: the 8 logits (bf16 bit patterns, as read from the
-        card) padded to 64 with -inf, and the 8 register slots pointing at the experts' subroutines."""
+        card) padded to 64 with -inf, and the 8 register slots pointing at the experts' subroutines.
+        block: into the block program's E segment."""
         pad = self.__dict__.get("_lg_pad")
         if pad is None:
             pad = self._lg_pad = np.full(VEC - TOPK, NEG_BF, dtype=np.int16).tobytes()
         sb = self.sel_bytes[li_idx]
-        self._write(self.lg8_addr[li_idx], _PACK8H(*lg_bf) + pad + b"".join(sb[e][i] for i, e in enumerate(idx)))
+        self._write((self.blk_lg8 if block else self.lg8_addr)[li_idx],
+                    _PACK8H(*lg_bf) + pad + b"".join(sb[e][i] for i, e in enumerate(idx)))
 
     def run(self, addr, limit_s=30.0):
         ue = self.ue

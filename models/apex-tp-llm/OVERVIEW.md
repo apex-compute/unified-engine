@@ -15,6 +15,8 @@ It is the vendor's [unified-engine](https://github.com/apex-compute/unified-engi
 
 <sub>HP Z420 (Xeon E5‑2689, 32 GB), 5 × Apex Kintex‑7, firmware `c7de4c55` (230 MHz), 4‑bit FP4 weights, greedy decoding. The optimization history below was measured at 198 MHz; see [Firmware update](#firmware-update-198--230-mhz).</sub>
 
+**Images:** Gemma 4's vision encoder runs on the cards too, tensor-parallel on 8 engines: 5.3 / 11.4 / 26.5 s for a 70 / 140 / 280-token image. The image enters the language model as one block with the model's exact attention rule ([docs/FINDINGS.md §9](docs/FINDINGS.md#9-gemma-4-images-the-encoder-and-the-image-block-on-the-cards)).
+
 ---
 
 ## Contents
@@ -321,9 +323,10 @@ flowchart LR
 | **Qwen runtime** | Slicing every layer over 10 slices, sums on the cards, two engines on separate DDR channels, on-card pre-sum, dynamic attention length, 16K context, FP4 | 9B: 3.2 → 6.97 tokens/s; 27B: 2.39 tokens/s |
 | **GPT‑OSS‑20B port** | New card program: MXFP4 → FP4, attention sinks, sliding window, YaRN, clamped SwiGLU, experts as precompiled subroutines picked through registers, card-local top‑4 pick, batched attention | 11.3 → 15.3 tokens/s |
 | **Gemma 4 26B‑A4B port** | New card program: 128 experts with top‑8 plus a parallel dense FFN, sliding and global attention (K = V, partial RoPE by head-dim permutation), 1088-row KV ring for the sliding layers, router split over both engines, expert pick hidden behind the dense FFN | 15.7 → 17.1 tokens/s, context 8192 |
+| **Gemma 4 images** | Vision encoder (27 layers, IF8) tensor-parallel on 8 engines, axial 2D RoPE by padding heads 72 → 128 with permuted dims, position / RoPE tables on the card, one program per detail level; exact image block in the language model (K / V of the whole image before its attention, per-token mask rows) | 70-token image in 5.3 s, 280 in 26.5 s; text speed unchanged |
 | **Embedding on the cards** | Every model's table on the cards, one vocabulary block per shard (Qwen3.8‑27B as IF8, dequantized on the card); one row per token is copied from the card that holds it | Host RAM holds no model data; no measurable cost |
 | **Firmware** | Vendor firmware `c7de4c55` (230 MHz) on all 5 cards, updated without a warm boot plus one power cycle; no code change | +4.5 % to +11.4 % tokens/s, identical output |
-| **OllApeX** | Web chat UI, model and context choice, files, images (Qwen), sampling, harmony format for GPT‑OSS (thinking / answer), math typesetting (KaTeX), live technical panel, systemd service | Use from any browser on port 3000 |
+| **OllApeX** | Web chat UI, model and context choice, files, images (Qwen, Gemma 4), sampling, harmony format for GPT‑OSS (thinking / answer), math typesetting (KaTeX), live technical panel, systemd service | Use from any browser on port 3000 |
 | **aptop** | Multi-card grid, live OllApeX state (model, phase, memory per card) | Monitor all cards in a terminal |
 | **Tools** | Reference tests, step profilers, PCIe/DMA and memory benchmarks, quantization comparison | Every number in this README is reproducible |
 
@@ -413,6 +416,7 @@ APEX_Q4=fp4 Q_MODEL=q38_27b TP_HEAD=1 TP_LAYERS=0:0 python extract_tp.py 10 fp4
 python tools/download_models.py gemma-4-26b
 for r in 0:8 8:16 16:23 23:30; do GEMMA4_LAYERS=$r python gemma4/extract_gemma4.py & done; wait
 GEMMA4_HEAD=1 GEMMA4_LAYERS=0:0 python gemma4/extract_gemma4.py      # LM head, embedding, final norm
+python gemma4/extract_gemma4_vision.py                               # image encoder (IF8) -> vision/vision.pt, ~1 min
 
 # every model: its embedding table goes onto the cards (one vocabulary block per shard, never in host RAM)
 EMB_WORK=$APEX_TP_WORK/models/gemma4_26b TPDIR=tp10    python tools/slice_embed.py
@@ -439,7 +443,7 @@ Open `http://<host>:3000`.
 
 ### Web interface
 
-Pick **gpt-oss:20b**, **gemma4:26b**, **qwen3.5:9b** or **qwen3.8:27b** from the model menu. The first time a model is chosen it is loaded onto the cards: ~40 s for GPT‑OSS and Gemma 4, ~1.5–2 min for 27B.
+Pick **gpt-oss:20b**, **gemma4:26b**, **qwen3.5:9b** or **qwen3.8:27b** from the model menu. The first time a model is chosen it is loaded onto the cards: ~40 s for GPT‑OSS, ~2.5 min for Gemma 4 with its image encoder, ~1.5–2 min for 27B. Attach an image and pick the **Image detail** to ask about it (Gemma 4: up to 70 / 140 / 280 tokens).
 
 ### API
 
@@ -460,6 +464,8 @@ curl -N -X POST localhost:3000/api/chat -d '{
 python gptoss_tp.py --engines 2 --max-context 8192 --max-new-tokens 200 --prompt "..."
 GPTOSS_PROF=1 python gptoss_tp.py ...                     # per-card, per-step time breakdown
 Q_MODEL=q35_9b python run_tp.py --tp 10fp4 --engines 2 --max-context 16384 --prompt "..."
+GEMMA4_VISION_SHARDS=8 GEMMA4_MAX_BLOCK=288 python gemma4/gemma4_tp.py --max-context 8192 \
+    --image ../test_samples/people.jpg --soft 70 --prompt "Describe this image."   # Gemma 4 with an image
 ```
 
 ---
@@ -474,7 +480,7 @@ unified-engine/  (branch 5-Apex-fpga)
 └── models/apex-tp-llm/
     ├── port_build.py · extract_tp.py · run_tp.py · vision_prep.py     Qwen tensor-parallel runtime
     ├── gptoss_card.py · gptoss_tp.py · extract_gptoss.py              GPT-OSS-20B runtime
-    ├── gemma4/         Gemma 4 26B-A4B runtime (card program, runner, slicing)
+    ├── gemma4/         Gemma 4 26B-A4B runtime (card program, runner, slicing, image encoder)
     ├── ollapex/        chat interface (server, engine, GPT-OSS and Gemma 4 backends, web page)
     ├── system/         systemd services, xdma Makefile patch
     ├── aptop/          aptop multi-card patch

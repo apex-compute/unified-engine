@@ -14,9 +14,10 @@ In every result below, and in OllApeX, **the host CPU does no model arithmetic a
 | Embedding table | Card DRAM (bf16; IF8 for Qwen3.8-27B). The host copies the one row a token needs from the card that holds it, then writes it to all cards. |
 | KV cache, attention, FFN, experts, norms, RoPE, softmax, residual sums | Card engines |
 | Sum of the shards' partial results | On the cards: each card adds the shares the host copies in. The host only moves the bytes. |
+| Image encoder (Gemma 4) | Card DRAM and engines: its weights, the position and RoPE tables, all 27 layers, pooling and the projection into the language model ([§9](#9-gemma-4-images-the-encoder-and-the-image-block-on-the-cards)). |
 
 The host only coordinates:
-- the tokenizer;
+- the tokenizer, and for images the model's image processor (resize, cut into patches) plus one-hot selectors and a padding mask built from the patch coordinates;
 - issuing segment commands and writing position registers;
 - moving shares and embedding rows between cards;
 - choosing indices from values the cards computed: the top-k experts among the router logits, and the next token among the cards' 4 best candidates per shard.
@@ -225,6 +226,127 @@ flowchart LR
 
 **Per token:** 30 layers + LM head + syncs = **~58 ms, about 17 tok/s**.
 
+## 9. Gemma 4 images: the encoder and the image block on the cards
+
+Gemma 4 reads images with its own vision encoder. Both parts run on the cards: the **encoder** (27 transformer layers) tensor-parallel over the 8 engines of the four x4 cards, and the **image block** in the language model with the model's exact attention rule. The host resizes the image and cuts it into patches (the model's own image processor), turns the patch coordinates into one-hot selectors and a padding mask (indices only, no model data), and moves shares between the cards, as for text.
+
+### What the model does (from the checkpoint and `transformers`)
+
+| Part | Detail |
+|---|---|
+| Patches | 16 × 16 px, 3 × 16 × 16 = 768 values each. Both sides are multiples of 48 (patch × pool 3). At most 9 × S patches for S soft tokens; S = 70, 140 or 280. |
+| Patch embedding | `input_proj(2 · (p − 0.5))` plus learned x and y position tables (2 × 10240 × 1152). |
+| Encoder | 27 layers, hidden 1152, 16 heads × 72, MLP 4304 (tanh GELU), q / k / v norms, scaling 1.0. **Axial 2D RoPE**: each head is two 36-wide parts (x, then y), each rotated as pairs (i, i + 18). Attention is bidirectional over all patches. |
+| Output | 3 × 3 average pool, × √1152, standardize (`std_bias`, `std_scale`), then RMSNorm without weight and a linear 1152 → 2816 into the language model. |
+| In the prompt | `<|image>`, one `<|image|>` per soft token, `<image|>`. The soft tokens replace those embeddings directly (no √2816 scaling). Positions stay plain 1D. |
+| Language-model mask | Global layers: causal. Sliding layers: `kv > q − 1024` **and** (`kv ≤ q` **or** both tokens in the same image). Inside an image, every token sees the whole image. |
+
+### Precision: IF8, not FP4
+
+Measured on one image (60 soft tokens) against the bf16 encoder:
+
+| Encoder weights | Soft-token error, mean / max | Cosine, min |
+|---|---|---|
+| IF8 (one scale per 64 values) | **2.1 % / 8.7 %** | 0.996 |
+| FP4 | 27 % / 88 % | 0.60 |
+
+FP4, which is fine for the language model, breaks the encoder. Its 27 layers use IF8 (~0.6 GB), and the tables and both projections stay bf16 (`gemma4/extract_gemma4_vision.py` → `vision/vision.pt`, 699 MB, once).
+
+### Encoder layout on the card
+
+- **Head 72 → 128 with permuted dimensions.** Inside a head, x dims 0–17 go to 0–17, x 18–35 to 64–81, y 0–17 to 18–35, and y 18–35 to 82–99, with the rest zero. The card's rotate-half RoPE pairs (j, j + 64), which is then exactly the model's axial RoPE. The q / k / v norm gammas are multiplied by √(72 / 128), so an RMS over 128 padded dims equals the model's RMS over 72. MLP 4304 → 4352 (a multiple of 64).
+- **Every table on the card.** The x and y position embeddings and the cos / sin rows of the RoPE live on the card as matrices. The host writes a one-hot selector per patch (its x and y index), and one matmul on the card picks each patch's rows.
+- **2p − 1 on the card.** The patch projection is stored doubled, and its bias is minus its row sum, so the card applies `2 · (p − 0.5)` inside the projection.
+- **Pooling as contiguous adds.** The host orders the patches by their offset inside the 3 × 3 pool block, so the 9 patches of a soft token are 9 equal-length stripes and the pool is 8 adds. Standardize and the √1152 are one diagonal matmul plus a bias.
+- **Padding.** A level has a fixed number of rows (`ceil64(9 · S)`). Unused rows are copies of patch 0, because the card's dynamic RMS has no epsilon and a zero row would give NaN. An additive mask removes them from attention.
+
+### Tensor-parallel encoder (8 engines)
+
+- Every shard keeps the full X (rows × 1152). It owns some of the 16 heads and some 64-neuron blocks of the MLP, balanced so that attention and MLP time per shard are close.
+- **Two segments per layer, each ending in a halt:** A (attention share) and M (MLP share), then one P segment for pool and projection. Engine 0 adds engine 1's share on the card, the host copies each card's share to every card (bytes only), and every card sums them itself, the same scheme as the language model.
+- **One program per level.** The row layout of a level is fixed (row j · S + m for pool offset j and soft token m), so the programs for 70, 140 and 280 are compiled once at load: 7 / 13 / 39 MB per engine.
+- The inputs (patches, one-hot selectors, mask) and the share buffers sit in the weight region, because some engines have only ~100 MB of tensor region left after the language model.
+
+### The image block in the language model (exact)
+
+A token-by-token prompt read cannot do the image rule: an early image token must see later image tokens that are not read yet. The block mode reads the image **layer by layer** instead:
+
+1. **block_begin:** the soft tokens go into a per-token X buffer on the card (XS), one write per card.
+2. **K**, for every image token: layer 0's K / V into the cache.
+3. For each of the 30 layers, for every image token:
+   - **B:** q and attention, with a mask row the host writes for that token: the sliding window plus the whole image, or causal in the global layers.
+   - **R / D / E:** router, dense FFN, experts, as in the normal program.
+   - **F:** finish the FFN, write the **next** layer's K / V, and store the token's X back into XS.
+
+   So all K / V of a layer exist before any image token attends in that layer.
+4. **block_end** rewrites the normal mask rows, and text continues with the normal program.
+
+- It is a separate block program per shard; the normal per-token program and its instruction order are unchanged.
+- The sliding ring grows from window + 64 to **window + 64 + 288 = 1376 rows**, so a full image fits next to the window.
+- **Unit test** (`tools/test_gemma4_block.py`: window shrunk to 128; 250 text, 90 image, 4 text tokens): block attention error ≤ 3.9 %, the same as text tokens. The first image token sees 217 keys and the last one 128, which is the model's rule. The text after the image is correct.
+
+### Image pipeline
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant H as Host (coordination only)
+    participant C as 8 engines (x4 cards)
+    participant L as 5 cards × 2 engines (LM)
+    Note over H: resize + cut into 16-px patches (image processor)<br/>one-hot x / y selectors, padding mask
+    H->>C: patches + selectors + mask, 1 write per card
+    loop 27 encoder layers
+        H->>C: start A (attention share)
+        C-->>H: share per card
+        H->>C: every card's share into every card (bytes only)
+        H->>C: start M (MLP share)
+        C-->>H: share per card
+        H->>C: every card's share into every card
+    end
+    H->>C: start P (pool, standardize, projection 1152 → 2816)
+    C-->>H: soft tokens
+    H->>L: soft tokens into XS (block_begin), then K per token
+    loop 30 layers, every image token
+        H->>L: mask row + registers, start B (q, attention)
+        H->>L: start R (D, E follow), then F (next layer's K / V)
+    end
+    Note over L: mask: window + whole image (sliding), causal (global)
+```
+
+### Results (230 MHz, people.jpg 612 × 408)
+
+**Accuracy:**
+
+| Check | Result |
+|---|---|
+| Encoder, each layer alone vs a torch emulation of the same IF8 weights | 0.2–0.6 % (tensor-parallel: 0.57 % after one layer) |
+| Soft tokens, tensor-parallel card vs the emulation | mean 6.0 %, max 27.7 %, the same as on one engine |
+| Soft tokens, card vs the bf16 model in fp32 | mean 6.4 %, max 36 %, cosine ≥ 0.934. For scale: the model's own bf16 path vs fp32 gives 3.1 % / 15 % / 0.988. |
+| End to end (OllApeX, greedy) | A correct description at every level: group photo in a park, rows sitting and standing, clothes and hair of the front row. Count of people: 14 / 16 / 17 at 70 / 140 / 280 tokens; the photo shows about 15. |
+
+**Speed** (the encoder alone):
+
+| Level (soft tokens) | Patches (rows) | 10 engines | **8 engines (x4 cards)** |
+|---|---|---|---|
+| 70 | 540 (640) | 5.97 s | **5.29 s** |
+| 140 | 1134 (1280) | 12.9 s | **11.4 s** |
+| 280 | 2340 (2560) | 29.3 s | **26.5 s** |
+
+- Reading the image block costs about the same per token as reading text (~60 ms per image token, the block is processed token by token in each layer): 60 tokens in ~3.7 s.
+- Generation speed after an image is unchanged: 16.6–17.1 tok/s.
+- Loading Gemma 4 with image support takes ~160 s instead of ~47 s (encoder weights plus the three level programs).
+
+### What we learned
+
+| Finding | Evidence |
+|---|---|
+| **The encoder is compute-bound, not link-bound.** Leaving out the x1 card makes it faster. | 8 engines beat 10 at every level by ~10 %. The 16 heads split evenly over 8, and the x1 link drops out of every sync. ~12 GMAC/s per engine; the head pad 72 → 128 wastes part of it. |
+| **FP4 is not enough for a vision encoder.** | 27 % mean token error with FP4 against 2.1 % with IF8. |
+| **An exact bidirectional block fits the per-token machinery.** It only needs the K / V of all block tokens before their attention, and a per-token mask row. | Block error ≤ 3.9 %, the same as text; the visible-key counts match the model's rule. |
+| **Pad and permute instead of new kernels.** Axial 2D RoPE, 72-wide heads and the patch normalization all map onto existing card operations by moving dimensions at slicing time. | Each encoder layer 0.2–0.6 % against the emulation. |
+| **Chat templates can break prefix reuse.** Gemma's template opens each model turn with an empty thinking block but drops it when the turn is in the history, so a re-rendered chat never matches what the cards hold. OllApeX builds a follow-up as the exact continuation instead. | A follow-up question about an image: 278 of 301 tokens reused, 1.8 s instead of 16.8 s. |
+| **Memory is the limit for higher detail.** | After the language model, the encoder and its three programs: 46 MB of tensor region left on the tightest engine, and 4 MB of program region on engine 1 of each card. |
+
 ---
 
 ## Final numbers (230 MHz, text mode, greedy)
@@ -235,6 +357,8 @@ flowchart LR
 | Gemma 4 26B-A4B | 3.8B / 25B (MoE) | 8192 | **17.1–17.3 tok/s** | on the cards, bf16 |
 | Qwen3.5-9B | 9B (dense) | 16384 | **7.35 tok/s** | on the cards, bf16 |
 | Qwen3.8-27B | 27B (dense) | 8192 | **2.76 tok/s** | on the cards, IF8 |
+
+Images (Gemma 4, encoder on 8 engines): **5.3 / 11.4 / 26.5 s** at 70 / 140 / 280 soft tokens, then ~60 ms per image token to read the block; generation speed unchanged ([§9](#9-gemma-4-images-the-encoder-and-the-image-block-on-the-cards)).
 
 ## What would move the numbers further (vendor side)
 

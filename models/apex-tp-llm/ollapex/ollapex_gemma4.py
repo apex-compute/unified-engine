@@ -4,7 +4,11 @@ the host picks the next token from the cards' candidates and each card process p
 experts from its own card's router logits.
 
 Per token: A0, then per layer R(+D, E, run inside the R command) / A, then the LM head (H). Prompt tokens
-whose prediction nobody reads skip H."""
+whose prediction nobody reads skip H.
+
+Images: the encoder runs tensor-parallel on the first GEMMA4_VISION_SHARDS shards (default 8: the x4 cards),
+at one of three detail levels (70 / 140 / 280 soft tokens). The soft tokens then go through the LM as one
+block (exact bidirectional attention inside the image, see gemma4_card.compile_block)."""
 import json
 import multiprocessing as mp
 import os
@@ -13,8 +17,13 @@ import time
 
 import numpy as np
 
+# image support (read by gemma4_tp at import; the card processes inherit it)
+os.environ.setdefault("GEMMA4_VISION_SHARDS", "8")
+os.environ.setdefault("GEMMA4_MAX_BLOCK", "288")
 sys.path.insert(0, os.environ.get("GEMMA4_CODE", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gemma4")))
 import gemma4_tp as GT  # noqa: E402
+
+DETAIL = {"low": 70, "medium": 140, "high": 280}      # soft tokens per image, at most
 
 SEG_QUIT, SEG_RESET, SEG_PARK = GT.SEG_QUIT, GT.SEG_RESET, GT.SEG_PARK
 FAILED = GT.FAILED
@@ -51,6 +60,7 @@ class LoadedGemma4:
         devs = devs[:n_cards]
         self.cards = [(None, devs[k // self.E], None) for k in range(self.P)]
         self.vision_k, self.rope_from = -1, None
+        self.has_vision = bool(GT.VIS_P and GT.MAX_BLOCK and os.path.exists(GT.VIS_PATH))
         self.sh = GT.Shared(self.P, self.H, n_cards)
         ctx = mp.get_context("spawn")
         cpus = GT.cpu_plan(n_cards)[1]
@@ -82,6 +92,8 @@ class LoadedGemma4:
                 elif not self.procs[c].is_alive():
                     raise RuntimeError("the process of card %d ended unexpectedly (log: %s/card_%02d.log)" % (c, GT.LOGDIR, c))
         self.n_seg = self.card_info[0]["segs"]
+        self.vinfo = self.card_info[0].get("vision")
+        self.has_vision = self.has_vision and bool(self.vinfo)
         self.load_s = time.time() - t0
         # the embedding table is on the cards: embed[token] copies that one row from the card that holds it
         self.embed = GT.CardEmbed(plan, devs, self.E, [i["emb_addr"] for i in self.card_info], self.H)
@@ -92,14 +104,71 @@ class LoadedGemma4:
 
     def info(self):
         return {"model": self.name, "num_ctx": self.num_ctx, "cards": self.card_info, "segments_per_token": self.n_seg,
-                "vision": False, "vision_card": -1, "layers": self.L, "hidden": self.H, "load_s": self.load_s,
+                "vision": self.has_vision, "vision_card": -1,
+                "vision_shards": GT.VIS_P if self.has_vision else 0, "vision_levels": DETAIL if self.has_vision else {},
+                "vision_load_s": (self.vinfo or {}).get("load_s", 0.0), "max_image_tokens": GT.MAX_BLOCK, "layers": self.L, "hidden": self.H, "load_s": self.load_s,
                 "weights_mb": sum(c["params_mb"] for c in self.card_info), "details": self.details}
 
     def set_rope(self, i0, pos3):
-        raise ValueError("this model has no image support yet")
+        raise ValueError("this model gives its image tokens plain 1D positions")
 
-    def vision(self, image, W, H):
-        raise ValueError("this model has no image support on the cards yet")
+    def vision(self, image, W, H, level=None):
+        """One image through the encoder on the cards. The host only resizes it and cuts it into patches (the
+        model's image processor) and writes those inputs; the 27 layers run as 2 segments each over the cards.
+        Returns the soft tokens (int16 view of bf16, [n, H]) and a report."""
+        if not self.has_vision:
+            raise ValueError("The loaded model cannot read images.")
+        import torch
+        import gemma4_vision_tp as GV
+        from transformers.models.gemma4.image_processing_gemma4 import Gemma4ImageProcessor
+        from PIL import Image
+        S = int(level or DETAIL["low"])
+        if S not in GT.VIS_LEVELS:
+            raise ValueError("image detail level %d is not one of %s" % (S, GT.VIS_LEVELS))
+        sh = self.sh
+        t0 = time.time()
+        inp = Gemma4ImageProcessor(max_soft_tokens=S)(images=[Image.open(image).convert("RGB")], return_tensors="pt")
+        pix, oh, bias, n_soft = GV.level_inputs(inp["pixel_values"], inp["image_position_ids"], S, GT.VIS_POS)
+        NP = pix.shape[0]
+        sh.vin_pix[:NP] = pix.view(torch.int16).numpy()
+        sh.vin_oh[:NP] = oh.view(torch.int16).numpy()
+        sh.vin_bias[:NP, :NP] = bias.view(torch.int16).numpy()
+        t1 = time.time()
+        self.command(GT.SEG_VIS_BEGIN, S)
+        n = 2 * 27 + 1                                    # A and M per layer, then P (pool + projection)
+        for i in range(n):
+            self.command(GT.VIS + i, -1, limit_s=300.0)
+        t2 = time.time()
+        toks = sh.vout[:n_soft].copy()
+        pp = inp["image_position_ids"][0]
+        pp = pp[(pp >= 0).all(-1)]
+        g0, g1 = int(pp[:, 0].max()) + 1, int(pp[:, 1].max()) + 1     # patch grid
+        progs = (self.vinfo or {}).get("programs", {})
+        prog = progs.get(S) or progs.get(str(S)) or []
+        meta = {"patches": int(len(pp)), "tokens": int(n_soft), "level": S, "grid": [g0, g1],
+                "encoded": [16 * g0, 16 * g1], "card": "%d engines on %d cards" % (GT.VIS_P, GT.VIS_P // self.E),
+                "card_s": t2 - t1, "prep_s": t1 - t0, "compile_s": 0.0, "weights_upload_s": 0.0,
+                "instructions": int(sum(p[0] for p in prog) / len(prog)) if prog else 0, "segments": n}
+        return toks, meta
+
+    def forward_block(self, rows, p0):
+        """An image block (its soft tokens [n, H], int16 view of bf16) at positions p0 .. p0+n-1, layer by layer
+        through the block program: K for every token, then per layer B / R (D and E run inside it) / F per token."""
+        sh = self.sh
+        n = rows.shape[0]
+        if n > GT.MAX_BLOCK:
+            raise ValueError("an image of %d tokens is longer than the longest block (%d)" % (n, GT.MAX_BLOCK))
+        sh.xb[:n] = rows
+        sh.blk[0], sh.blk[1] = p0, n
+        self.command(GT.SEG_BLOCK_BEGIN, -1)
+        for t in range(n):                                # block segment 0: K; layer i: B R D E F = 1 + 5 i + 0..4
+            self.command(GT.BLK, t)
+        for i in range(self.L):
+            for t in range(n):
+                self.command(GT.BLK + 1 + 5 * i, t)
+                self.command(GT.BLK + 2 + 5 * i, t)
+                self.command(GT.BLK + 5 + 5 * i, t)
+        self.command(GT.SEG_BLOCK_END, -1)
 
     def command(self, s, pos, want=1, limit_s=120.0):
         sh = self.sh

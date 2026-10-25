@@ -119,9 +119,9 @@ class Engine:
             elif ev[0] == "error":
                 raise self._fail((ev[0], ev[1], True))
 
-    def encode_image(self, path, W, H):
-        """Caller holds the lock and the model is loaded. Runs the image encoder on its card."""
-        self.conn.send(("vision", path, W, H))
+    def encode_image(self, path, W, H, level=None):
+        """Caller holds the lock and the model is loaded. Runs the image encoder on the cards."""
+        self.conn.send(("vision", path, W, H) + ((level,) if level else ()))
         while True:
             ev = self._recv()
             if ev[0] == "vision_done":
@@ -204,12 +204,47 @@ def build_prompt(model, msgs, think, encoded):
     turn has to be read (the cards cannot rewind; they can only continue)."""
     tok = ENGINE.tokenizer(model)
     if eng.is_gemma4(model):
-        # Gemma 4 chat template (it starts with <bos>); "think" turns its thinking channel on
-        if any(m["images"] for m in msgs):
-            raise ValueError("gemma4 cannot read images on the cards yet.")
-        text = tok.apply_chat_template([{"role": m["role"], "content": m["content"]} for m in msgs], tokenize=False,
-                                       add_generation_prompt=True, enable_thinking=bool(think))
-        return [int(v) for v in tok.encode(text, add_special_tokens=False)], {}, [], None
+        # Gemma 4 chat template (it starts with <bos>); "think" turns its thinking channel on. The template
+        # leaves one <|image|> per image: it becomes <|image> + one <|image|> per soft token + <image|>, and
+        # those positions are fed the encoder's soft tokens instead of a token embedding.
+        def expand_g(text, ms):
+            imgs = [encoded[i]["tokens"] for m in ms for i in m["images"]]
+            parts = text.split("<|image|>")
+            if len(parts) != len(imgs) + 1:
+                raise ValueError("the chat template placed %d image slots for %d images" % (len(parts) - 1, len(imgs)))
+            text = parts[0] + "".join("<|image>" + "<|image|>" * len(t) + "<image|>" + p for t, p in zip(imgs, parts[1:]))
+            ids = [int(v) for v in tok.encode(text, add_special_tokens=False)]
+            img_id = tok.convert_tokens_to_ids("<|image|>")
+            rows = [r for t in imgs for r in t]
+            at = [i for i, v in enumerate(ids) if v == img_id]
+            if len(at) != len(rows):
+                raise ValueError("image tokens in the prompt: %d, soft tokens: %d" % (len(at), len(rows)))
+            return ids, {i: r.tobytes() for i, r in zip(at, rows)}
+
+        def render(ms):
+            return tok.apply_chat_template([for_template(m) for m in ms], tokenize=False, add_generation_prompt=True,
+                                           enable_thinking=bool(think))
+
+        # The template renders past model turns without the (empty) thinking block it opens each new turn with,
+        # so a re-rendered chat never continues what the cards hold. A follow-up (the previous exchange plus one
+        # user message) is therefore built as the exact continuation, as for Qwen above.
+        lt = ENGINE.last_turn
+        eot = tok.convert_tokens_to_ids("<turn|>")
+        if (lt and lt["model"] == model and lt["think"] == think and len(msgs) == len(lt["messages"]) + 2
+                and msgs[:-2] == lt["messages"] and msgs[-2]["role"] == "assistant" and msgs[-1]["role"] == "user"
+                and msgs[-2]["content"].strip() == lt["reply"].strip()):
+            tail = render([msgs[-1]])
+            tail = tail[len("<bos>"):] if tail.startswith("<bos>") else tail
+            out = list(lt["out"])
+            if not out or out[-1] != eot:
+                out.append(eot)
+            base = lt["ids"] + out
+            tids, tvecs = expand_g("\n" + tail, [msgs[-1]])
+            vecs = dict(lt["vecs"])
+            vecs.update({len(base) + i: v for i, v in tvecs.items()})
+            return base + tids, vecs, [], eot
+        ids, vecs = expand_g(render(msgs), msgs)
+        return ids, vecs, [], eot
     if eng.is_gptoss(model):
         # harmony chat template; "think" picks the reasoning effort (the model always writes an analysis
         # first). No continuation shortcut: the engine still reuses whatever prefix the cards already hold.
@@ -388,6 +423,23 @@ def run_chat(model, messages, options, think, send):
             im = IMAGES.get(iid)
             if im is None:
                 raise ValueError("An attached image is no longer available on the server; attach it again.")
+            if gemma:
+                gkey = "gemma:" + detail                  # the Qwen encoder's output is cached under the bare level
+                if gkey in im["enc"]:
+                    encoded[iid] = im["enc"][gkey]
+                    continue
+                S = detail_levels()[detail]
+                plan = image_plans(im)[detail]
+                yield ("vision", {"name": im["name"], "width": plan["width"], "height": plan["height"],
+                                  "tokens": plan["tokens"], "cards": True})
+                toks, meta = ENGINE.encode_image(im["path"], plan["width"], plan["height"], S)
+                im["enc"][gkey] = encoded[iid] = {"tokens": toks}
+                image_report.append({"name": im["name"], "source": [im["width"], im["height"]],
+                                     "encoded": [plan["width"], plan["height"]], "detail": detail,
+                                     "patches": meta["patches"], "tokens": meta["tokens"], "card": meta["card"],
+                                     "card_s": meta["card_s"], "compile_s": 0.0, "weights_upload_s": 0.0,
+                                     "instructions": meta["instructions"], "segments": meta["segments"]})
+                continue
             if detail not in im["enc"]:
                 W, H = vis.plan_size(im["width"], im["height"], detail)
                 yield ("vision", {"name": im["name"], "width": W, "height": H, "tokens": vis.tokens_for(W, H)})
@@ -400,6 +452,14 @@ def run_chat(model, messages, options, think, send):
             encoded[iid] = im["enc"][detail]
         ids, vecs, blocks, _ = build_prompt(model, msgs, think, encoded)
         built.update(ids=ids, vecs=vecs, blocks=blocks)
+        if gemma:                                     # 1D positions; each image is one block of soft tokens
+            runs = []
+            for i in sorted(vecs):
+                if runs and runs[-1][0] + runs[-1][1] == i:
+                    runs[-1][1] += 1
+                else:
+                    runs.append([i, 1])
+            return {"ids": ids, "vecs": vecs, "opts": opts, "stop_ids": stop_ids, "image_blocks": runs}
         return {"ids": ids, "vecs": vecs, "opts": opts, "stop_ids": stop_ids, "rope": vis.rope_positions(len(ids), blocks)}
 
     gen = ENGINE.run(model, num_ctx, prepare)
@@ -458,12 +518,39 @@ def add_image(name, data):
         img.save(path)
         IMAGES[iid] = {"name": name, "path": path, "width": img.size[0], "height": img.size[1], "enc": {}}
     im = IMAGES[iid]
-    plans = {}
-    for d in vis.DETAIL:
-        W, H = vis.plan_size(im["width"], im["height"], d)
-        plans[d] = {"width": W, "height": H, "tokens": vis.tokens_for(W, H), "ready": d in im["enc"]}
+    plans = image_plans(im)
     return {"name": name, "kind": "image", "image_id": iid, "width": im["width"], "height": im["height"], "plans": plans,
             "text": "", "tokens": plans[DEFAULT_DETAIL]["tokens"], "num_ctx": ENGINE.status["num_ctx"] or clamp_ctx(DEFAULT_CTX)}
+
+
+def detail_levels():
+    """Detail level -> soft tokens per image when the loaded model sets them (Gemma 4), else None (Qwen: pixels)."""
+    return (ENGINE.status.get("info") or {}).get("vision_levels") or None
+
+
+def image_plans(im):
+    """What the image becomes at each detail level: encoded size and prompt tokens."""
+    levels = detail_levels()
+    if not levels:
+        plans = {}
+        for d in vis.DETAIL:
+            W, H = vis.plan_size(im["width"], im["height"], d)
+            plans[d] = {"width": W, "height": H, "tokens": vis.tokens_for(W, H), "ready": d in im["enc"]}
+        return plans
+    key = tuple(sorted(levels.items()))
+    if im.get("gplans_key") != key:
+        # the model's own image processor (resize + patches only): the side lengths and the soft tokens
+        from transformers.models.gemma4.image_processing_gemma4 import Gemma4ImageProcessor
+        from PIL import Image
+        img = Image.open(im["path"]).convert("RGB")
+        im["gplans"] = {}
+        for d, S in levels.items():
+            pp = Gemma4ImageProcessor(max_soft_tokens=S)(images=[img], return_tensors="np")["image_position_ids"][0]
+            pp = pp[(pp >= 0).all(-1)]
+            g0, g1 = int(pp[:, 0].max()) + 1, int(pp[:, 1].max()) + 1
+            im["gplans"][d] = {"width": 16 * g0, "height": 16 * g1, "tokens": len(pp) // 9 + 2}
+        im["gplans_key"] = key
+    return {d: dict(p, ready="gemma:" + d in im["enc"]) for d, p in im["gplans"].items()}
 
 
 def extract_file(name, data):
@@ -532,7 +619,8 @@ class Handler(BaseHTTPRequestHandler):
                            "limits": {"ctx_choices": CTX_CHOICES, "max_ctx": eng.MAX_CTX, "max_top_k": eng.MAX_RANK,
                                       "default_num_predict": DEFAULT_PREDICT, "max_upload_mb": MAX_UPLOAD // 1048576},
                            "vision": bool((st.get("info") or {}).get("vision")), "default_model": DEFAULT_MODEL,
-                           "image_detail": {"choices": vis.DETAIL, "default": DEFAULT_DETAIL}})
+                           "image_detail": {"choices": detail_levels() or vis.DETAIL, "default": DEFAULT_DETAIL,
+                                            "unit": "tokens" if detail_levels() else "px"}})
                 return self.send_json(st)
             self.send_json({"error": "not found"}, 404)
         except Exception as e:
