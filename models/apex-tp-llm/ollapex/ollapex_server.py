@@ -203,6 +203,13 @@ def build_prompt(model, msgs, think, encoded):
     the ids are built as an exact continuation of what the cards already hold, so only the new
     turn has to be read (the cards cannot rewind; they can only continue)."""
     tok = ENGINE.tokenizer(model)
+    if eng.is_gemma4(model):
+        # Gemma 4 chat template (it starts with <bos>); "think" turns its thinking channel on
+        if any(m["images"] for m in msgs):
+            raise ValueError("gemma4 cannot read images on the cards yet.")
+        text = tok.apply_chat_template([{"role": m["role"], "content": m["content"]} for m in msgs], tokenize=False,
+                                       add_generation_prompt=True, enable_thinking=bool(think))
+        return [int(v) for v in tok.encode(text, add_special_tokens=False)], {}, [], None
     if eng.is_gptoss(model):
         # harmony chat template; "think" picks the reasoning effort (the model always writes an analysis
         # first). No continuation shortcut: the engine still reuses whatever prefix the cards already hold.
@@ -269,6 +276,40 @@ class Detok:
         return th
 
 
+class GemmaDetok:
+    """Gemma 4 output: an optional <|channel>thought\n ... <channel|> block (the thinking), then the answer.
+    Same push/flush interface as Detok."""
+
+    def __init__(self, tok, skip):
+        self.tok, self.skip = tok, set(skip)
+        self.OPEN, self.CLOSE = tok.convert_tokens_to_ids("<|channel>"), tok.convert_tokens_to_ids("<channel|>")
+        self.thinking, self.ids, self.sent, self.head = False, [], 0, False
+
+    def push(self, token):
+        if token in self.skip:
+            return "", ""
+        if token == self.OPEN:
+            self.thinking, self.ids, self.sent, self.head = True, [], 0, True
+            return "", ""
+        if token == self.CLOSE:
+            self.thinking, self.ids, self.sent, self.head = False, [], 0, False
+            return "", ""
+        self.ids.append(token)
+        text = self.tok.decode(self.ids, skip_special_tokens=True)
+        if text.endswith("\ufffd"):
+            return "", ""
+        if self.head:                                  # the channel name ("thought") and its newline
+            if "\n" not in text:
+                return "", ""
+            self.head = False
+            self.sent = text.index("\n") + 1
+        piece, self.sent = text[self.sent:], len(text)
+        return ("", piece) if self.thinking else (piece, "")
+
+    def flush(self):
+        return ""
+
+
 class HarmonyDetok:
     """GPT-OSS (harmony format) output: <|channel|>NAME<|message|>TEXT<|end|><|start|>assistant<|channel|>...
     Text of the analysis channel is the thinking, the final (and commentary) channel is the answer.
@@ -319,7 +360,11 @@ def run_chat(model, messages, options, think, send):
     msgs = normalize(messages)
     tok = ENGINE.tokenizer(model)
     harmony = eng.is_gptoss(model)
-    if harmony:
+    gemma = eng.is_gemma4(model)
+    if gemma:
+        # <turn|> ends the model turn; <eos> too
+        stop_ids = [tok.convert_tokens_to_ids("<turn|>"), tok.convert_tokens_to_ids("<eos>")]
+    elif harmony:
         # <|end|> closes the analysis message and the final answer follows; the turn ends at <|return|>
         stop_ids = [tok.convert_tokens_to_ids(t) for t in ("<|return|>", "<|call|>")]
     else:
@@ -327,7 +372,8 @@ def run_chat(model, messages, options, think, send):
         stop_ids = [eot] + [t for t in (tok.convert_tokens_to_ids("<|endoftext|>"),) if isinstance(t, int) and t >= 0]
     opts = {"num_predict": options.get("num_predict", DEFAULT_PREDICT), "temperature": options.get("temperature", 0.0),
             "top_k": options.get("top_k", eng.MAX_RANK), "top_p": options.get("top_p", 1.0), "seed": options.get("seed")}
-    det = HarmonyDetok(tok, stop_ids) if harmony else Detok(tok, think, stop_ids)
+    det = (GemmaDetok(tok, stop_ids) if gemma else HarmonyDetok(tok, stop_ids) if harmony
+           else Detok(tok, think, stop_ids))
     content, out_ids, stats = [], [], None
     built = {}
     image_report = []

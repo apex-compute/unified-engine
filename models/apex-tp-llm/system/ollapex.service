@@ -13,6 +13,8 @@ Environment=OLLAPEX_TP_Q35_9B=10fp4
 Environment=OLLAPEX_TP_Q38_27B=10fp4
 Environment=OLLAPEX_CTX=8192
 Environment=OLLAPEX_ENGINES=2
+Environment=OLLAPEX_PARAM_FACTOR=1.0
+Environment=OLLAPEX_PARAM_SLACK_MB=64
 Environment=APEX_TP_CPUS=8,9,10,11,12,13
 ExecStartPre=/bin/sleep 5
 ExecStart=/home/USER/my_torch_env/bin/python -u ollapex_server.py

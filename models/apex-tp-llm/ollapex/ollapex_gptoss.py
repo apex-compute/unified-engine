@@ -86,8 +86,8 @@ class LoadedGptOss:
                     raise RuntimeError("the process of card %d ended unexpectedly (log: %s/card_%02d.log)" % (c, GT.LOGDIR, c))
         self.n_seg = self.card_info[0]["segs"]
         self.load_s = time.time() - t0
-        shape = json.load(open(os.path.join(paths["wdir"], "embed.json")))["shape"]
-        self.embed = np.fromfile(os.path.join(paths["wdir"], "embed.bin"), dtype=np.int16).reshape(tuple(shape))
+        # the embedding table is on the cards: embed[token] copies that one row from the card that holds it
+        self.embed = GT.CardEmbed(plan, devs, self.E, [i["emb_addr"] for i in self.card_info], self.H)
         self.seq = 0
         self.fed = []
         self.command(SEG_RESET, -1)
@@ -155,6 +155,10 @@ class LoadedGptOss:
                 "host_ms_per_token": float(sw.sum())}
 
     def close(self):
+        try:
+            self.embed.close()
+        except Exception:
+            pass
         try:
             self.sh.cmd[1] = SEG_QUIT
             self.sh.cmd[0] = self.seq + 1

@@ -164,16 +164,6 @@ details.raw pre { font: 11px/1.4 var(--mono); background: var(--soft); padding: 
     </div>
     <div class="hint" id="s-phase" style="margin-top:8px"></div>
 
-    <h3>Power and energy</h3>
-    <div class="big">
-      <div class="stat" id="p-wall-box"><div class="v" id="p-wall">–</div><div class="l" id="p-wall-l">system power</div></div>
-      <div class="stat" id="p-card-box"><div class="v" id="p-card">–</div><div class="l" id="p-card-l">per FPGA card</div></div>
-      <div class="stat"><div class="v" id="p-jtok">–</div><div class="l" id="p-jtok-l">energy per token</div></div>
-      <div class="stat"><div class="v" id="p-wh">–</div><div class="l" id="p-wh-l">energy, last answer</div></div>
-    </div>
-    <dl class="kv" id="p-kv" style="margin-top:8px"></dl>
-    <div class="hint" id="p-note" style="margin-top:6px"></div>
-
     <h3>Context</h3>
     <div class="bar"><i id="ctxbar" style="width:0"></i></div>
     <dl class="kv" style="margin-top:7px">
@@ -184,15 +174,6 @@ details.raw pre { font: 11px/1.4 var(--mono); background: var(--soft); padding: 
       <dt>Prompt reading</dt><dd id="c-prefill">–</dd>
     </dl>
 
-    <div id="vis-box" hidden>
-    <h3>Image encoder</h3>
-    <dl class="kv" id="vis-kv"></dl>
-    <div class="hint" style="margin-top:6px">The image encoder (27 transformer blocks) runs on one FPGA card; its output goes to all cards as prompt tokens.</div>
-    </div>
-
-    <h3>Cards <span id="cards-sub" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h3>
-    <div id="cards"><div class="hint">Shown once the model is loaded.</div></div>
-
     <h3>Data exchange</h3>
     <div class="big">
       <div class="stat"><div class="v" id="x-tok">–</div><div class="l">per token · CPU ↔ cards</div></div>
@@ -202,11 +183,30 @@ details.raw pre { font: 11px/1.4 var(--mono); background: var(--soft); padding: 
     <div id="x-cards" style="margin-top:8px"></div>
     <div class="hint" id="x-note" style="margin-top:6px"></div>
 
-    <h3>Time per token</h3>
-    <div id="segs"><div class="hint">Shown after the first answer.</div></div>
+    <h3>Cards <span id="cards-sub" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h3>
+    <div id="cards"><div class="hint">Shown once the model is loaded.</div></div>
 
     <h3>Model and system</h3>
     <dl class="kv" id="sys"></dl>
+
+    <h3>Power and energy</h3>
+    <div class="big">
+      <div class="stat" id="p-wall-box"><div class="v" id="p-wall">–</div><div class="l" id="p-wall-l">system power</div></div>
+      <div class="stat" id="p-card-box"><div class="v" id="p-card">–</div><div class="l" id="p-card-l">per FPGA card</div></div>
+      <div class="stat"><div class="v" id="p-jtok">–</div><div class="l" id="p-jtok-l">energy per token</div></div>
+      <div class="stat"><div class="v" id="p-wh">–</div><div class="l" id="p-wh-l">energy, last answer</div></div>
+    </div>
+    <dl class="kv" id="p-kv" style="margin-top:8px"></dl>
+    <div class="hint" id="p-note" style="margin-top:6px"></div>
+
+    <div id="vis-box" hidden>
+    <h3>Image encoder</h3>
+    <dl class="kv" id="vis-kv"></dl>
+    <div class="hint" style="margin-top:6px">The image encoder (27 transformer blocks) runs on one FPGA card; its output goes to all cards as prompt tokens.</div>
+    </div>
+
+    <h3>Time per token</h3>
+    <div id="segs"><div class="hint">Shown after the first answer.</div></div>
 
     <details class="raw"><summary>Raw technical data (JSON)</summary><pre id="raw">–</pre></details>
   </aside>
@@ -215,7 +215,7 @@ details.raw pre { font: 11px/1.4 var(--mono); background: var(--soft); padding: 
 <script>
 const $ = id => document.getElementById(id);
 const fmt = (v, d = 1) => (v === null || v === undefined || isNaN(v)) ? "–" : Number(v).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
-const SEG = { linear_attention: "Linear attention", linear_mlp: "Linear-layer MLP", full_attention: "Full attention", full_mlp: "Full-attention-layer MLP", lm_head: "Output head" };
+const SEG = { attention: "Attention", router_and_experts: "Router + experts", router_and_ffn: "Router + FFN (dense + experts)", linear_attention: "Linear attention", linear_mlp: "Linear-layer MLP", full_attention: "Full attention", full_mlp: "Full-attention-layer MLP", lm_head: "Output head" };
 let status = null, messages = [], busy = false, ctrl = null, lastStats = null;
 
 function esc(s) { return s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }

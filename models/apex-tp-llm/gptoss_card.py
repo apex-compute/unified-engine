@@ -170,6 +170,9 @@ class GptOssShard:
             d["experts"] = ex
             self.layers.append(d)
         self.lm_head = T._upload_fp4_pair(ue, torch.load(os.path.join(self.cdir, "lm_head.pt"), weights_only=False))
+        # this shard's rows of the bf16 embedding table: the host copies a token's row from here
+        ep = os.path.join(self.cdir, "embed.pt")
+        self.EMB = self._up(torch.load(ep, weights_only=False)) if os.path.exists(ep) else None
         self.vocab = self.plan["cards"][0]["vocab"]                   # replaced by the caller per shard
         self.final_norm = self._up(torch.load(os.path.join(self.wdir, "final_norm.pt"), weights_only=False))
         # constants

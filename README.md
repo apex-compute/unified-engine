@@ -406,7 +406,7 @@ engine today; each folder has its own README/config, and most LLMs ship a
 | Qwen3 1.7B | [`models/qwen3_1.7b`](models/qwen3_1.7b) | Text LM |
 | Qwen3 4B | [`models/qwen3_4b`](models/qwen3_4b) | Text LM |
 | Qwen3.5 2B | [`models/qwen3.5_2b`](models/qwen3.5_2b) | Text LM |
-| GPT-OSS 20B, Qwen3.5 9B / Qwen3.8 27B, multi-card | [`models/apex-tp-llm`](models/apex-tp-llm) | Tensor-parallel LM over 5 cards (both engines), OllApeX chat UI |
+| GPT-OSS 20B, Gemma 4 26B-A4B, Qwen3.5 9B / Qwen3.8 27B, multi-card | [`models/apex-tp-llm`](models/apex-tp-llm) | Tensor-parallel LM over 5 cards (both engines), OllApeX chat UI |
 | Qwen2.5-VL 3B | [`models/qwen2.5_vl_3b`](models/qwen2.5_vl_3b) | Vision-language |
 | Qwen2.5-Omni 7B | [`models/qwen2.5_omni_7b`](models/qwen2.5_omni_7b) | Multimodal Thinker (text, image, audio -> text) |
 | SmolVLM2 | [`models/smolvlm2`](models/smolvlm2) | Vision-language |

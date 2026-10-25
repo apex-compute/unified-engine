@@ -29,6 +29,7 @@ LOGDIR = os.environ.get("OLLAPEX_LOGDIR") or os.path.join(os.path.dirname(os.pat
 BF16 = 2
 INST = 32
 SEG_QUIT, SEG_RESET, SEG_PARK, SEG_VISION, SEG_ROPE = -1, -2, -3, -4, -5
+SEG_EMB = -6                    # pos = token: the card holding its IF8 embedding row dequantizes it into x
 VIS_REQ, VIS_OUT, VIS_META = "/dev/shm/ollapex_vis_req.json", "/dev/shm/ollapex_vis_out.npy", "/dev/shm/ollapex_vis_meta.json"
 ROPE_FILE = "/dev/shm/ollapex_rope.npz"
 FAILED = -1
@@ -36,13 +37,15 @@ MAX_RANK = 4                      # the card tracks its four best logits
 MAX_CTX = 16384                   # ctx16k patch: one KV copy per KV head, persistent V^T, one mask row
 
 # name -> (directory under $APEX_TP_WORK/models, sliced weight set, display details)
-MODEL_MAX_CTX = {"qwen3.8:27b": 8192, "gpt-oss:20b": 8192}   # per-model cap below MAX_CTX (card memory per engine)
+MODEL_MAX_CTX = {"qwen3.8:27b": 8192, "gpt-oss:20b": 8192, "gemma4:26b": 8192}   # per-model cap below MAX_CTX (card memory per engine)
 
 MODELS = {
     "qwen3.8:27b": ("q38_27b", "10fp4", {"family": "qwen3.8", "parameter_size": "27B"}),
     "qwen3.5:9b": ("q35_9b", "10fp4", {"family": "qwen3.5", "parameter_size": "9B"}),
     "gpt-oss:20b": ("gptoss20b", "10", {"family": "gpt-oss", "parameter_size": "20B (MoE, 3.6B active)",
                                         "quantization_level": "FP4"}),
+    "gemma4:26b": ("gemma4_26b", "10", {"family": "gemma4", "parameter_size": "26B (MoE, 3.8B active)",
+                                       "quantization_level": "FP4"}),
 }
 GPTOSS_HF = os.path.expanduser(os.environ.get("GPTOSS_MODEL", "~/apex_exp/models/gpt_oss_20b/hf/gpt-oss-20b"))
 
@@ -51,10 +54,20 @@ def is_gptoss(name):
     return MODELS[name][0] == "gptoss20b"
 
 
+GEMMA4_HF = os.path.expanduser(os.environ.get("GEMMA4_MODEL", "~/apex_exp/models/gemma4_26b/hf/gemma-4-26b-a4b-it"))
+
+
+def is_gemma4(name):
+    return MODELS[name][0] == "gemma4_26b"
+
+
 def model_paths(name):
     d, tp, _ = MODELS[name]
     tp = os.environ.get("OLLAPEX_TP_" + d.upper(), tp)   # e.g. OLLAPEX_TP_Q35_9B=5v2 on a 5-card host
     base = os.path.join(EXP, d)
+    if is_gemma4(name):                               # its own card runtime (gemma4_card / gemma4_tp)
+        return {"base": base, "tdir": os.path.join(base, "tp" + tp), "wdir": os.path.join(base, "weights"),
+                "hf": GEMMA4_HF}
     if is_gptoss(name):                               # its own card runtime (gptoss_card / gptoss_tp)
         return {"base": base, "tdir": os.path.join(base, "tp" + tp), "wdir": os.path.join(base, "weights"),
                 "hf": GPTOSS_HF}
@@ -167,8 +180,12 @@ def engine_window(e, E, cdir):
         return {}                                  # single engine: the port's membase layout
     w = e * CHANNEL_BYTES
     on_disk = sum(os.path.getsize(f) for f in glob.glob(os.path.join(cdir, "*.pt")))
-    params = (int(on_disk * 1.03) + (96 << 20) + (16 << 20) - 1) // (16 << 20) * (16 << 20)
-    assert params < CHANNEL_BYTES - PROGRAM_BYTES - (256 << 20), "the slice does not fit one DDR channel"
+    # margins (defaults unchanged; the env overrides are for fit tests)
+    factor = float(os.environ.get("OLLAPEX_PARAM_FACTOR", "1.03"))
+    slack = int(os.environ.get("OLLAPEX_PARAM_SLACK_MB", "96")) << 20
+    tmin = int(os.environ.get("OLLAPEX_TENSOR_MIN_MB", "256")) << 20
+    params = (int(on_disk * factor) + slack + (16 << 20) - 1) // (16 << 20) * (16 << 20)
+    assert params < CHANNEL_BYTES - PROGRAM_BYTES - tmin, "the slice does not fit one DDR channel"
     return {"params_dram_base": w, "tensor_dram_base": w + params,
             "program_dram_base": w + CHANNEL_BYTES - PROGRAM_BYTES}
 
@@ -227,6 +244,45 @@ def worker(c, E, P, dev, paths, n_layers, max_ctx, cpu, nap, shm_names, conn, vi
             ue._preallocate_identity_matrix()
             ue.prepare_inference(weights, max_context=max_ctx)
             del weights
+            # this shard's rows of the bf16 embedding table: the driver copies a token's row from here
+            ep = os.path.join(cdir, "embed.pt")
+            g["emb"] = None
+            if os.path.exists(ep):
+                et = torch.load(ep, weights_only=False).to(torch.bfloat16).contiguous()
+                g["emb"] = ue.allocate_params_dram(et.numel() * BF16)
+                ue.dma_write(g["T"].DMA_DEVICE_H2C, g["emb"], g["T"]._bf(et), et.numel() * BF16)
+                del et
+            # or the IF8 table (model too large for the bf16 one): rows dequantized on the card, one per token
+            e8p = os.path.join(cdir, "embed8.pt")
+            g["emb8"] = None
+            if g["emb"] is None and os.path.exists(e8p):
+                z = torch.load(e8p, weights_only=False)
+                T_e, U_e = g["T"], g["T"].user_dma_core
+                Hh = int(z["H"])
+                nd, ns = z["data"].numel(), z["scales"].numel() * BF16
+                da = ue.allocate_params_dram(nd)
+                ue.dma_write(T_e.DMA_DEVICE_H2C, da, z["data"].contiguous(), nd)
+                sa = ue.allocate_params_dram(ns)
+                ue.dma_write(T_e.DMA_DEVICE_H2C, sa, T_e._bf(z["scales"].contiguous()), ns)
+                st_d = ue.allocate_tensor_dram(Hh)
+                st_s = ue.allocate_tensor_dram(max(256, Hh // 64 * BF16))
+                out = ue.allocate_tensor_dram(Hh * BF16)
+                ue.clear_capture_buffer()
+                T_e.UnifiedEngine.start_capture(ue)
+                ue.start_queue_for_bf16_dequantize_operation(st_d, st_s, U_e.TYPE.IF8, 0x00000, Hh)
+                ue.sram_to_accelerator_memory(0x00000, out, Hh)
+                ue.generate_instruction_halt()
+                T_e.UnifiedEngine.stop_capture(ue)
+                prog = ue.get_program_dram_addr()
+                ue.write_captured_instructions_to_dram(prog)
+                ue.allocate_program_dram(ue.get_capture_instruction_size_bytes() + 64)
+                ue.clear_capture_buffer()
+                plan_k = json.load(open(os.path.join(paths["tdir"], "plan.json")))["cards"][g["k"]]
+                g["emb8"] = {"data": da, "scales": sa, "st_d": st_d, "st_s": st_s, "out": out, "prog": prog,
+                             "rows": int(z["rows"]), "H": Hh, "v0": plan_k["vocab"][0],
+                             "bd": torch.empty(Hh, dtype=torch.uint8),
+                             "bs": torch.empty(Hh // 64, dtype=torch.bfloat16)}
+                del z
         for g in eng[1:]:                             # one copy of the shards' partial outputs per card
             g["ue"]._tp_parts_dram = eng[0]["ue"]._tp_parts_dram
         info = []
@@ -262,7 +318,8 @@ def worker(c, E, P, dev, paths, n_layers, max_ctx, cpu, nap, shm_names, conn, vi
                          "tensor_mb": (lm_tensor_end - g["tensor0"]) / 1e6,
                          "instructions": sizes[0] // INST, "tensor_free_mb": (tensor_limit - lm_tensor_end) / 1048576.0,
                          "clock_mhz": 1000.0 / float(getattr(ue, "_clock_period_ns", 0) or 5.042),
-                         "firmware": "%08x" % ue.get_hardware_version()})
+                         "firmware": "%08x" % ue.get_hardware_version(), "emb_addr": g["emb"],
+                         "emb8": g.get("emb8") is not None})
         n_seg = len(eng[0]["starts"])
         ue0 = eng[0]["ue"]
         T_al = ue0.max_context_aligned
@@ -374,6 +431,25 @@ def worker(c, E, P, dev, paths, n_layers, max_ctx, cpu, nap, shm_names, conn, vi
                     for k in ks:
                         done[k] = last
                     continue
+                if s == SEG_EMB:
+                    tok = pos
+                    for g in eng:
+                        e8 = g.get("emb8")
+                        if e8 is not None and e8["v0"] <= tok < e8["v0"] + e8["rows"]:
+                            T_e, ue, Hh, r = g["T"], g["ue"], e8["H"], tok - e8["v0"]
+                            nsc = Hh // 64 * BF16
+                            # bytes only: the row and its scales into the staging slots, then the card dequantizes
+                            ue.dma_read(T_e.DMA_DEVICE_C2H, e8["data"] + r * Hh, e8["bd"], Hh)
+                            ue.dma_read(T_e.DMA_DEVICE_C2H, e8["scales"] + r * nsc, e8["bs"], nsc)
+                            ue.dma_write(T_e.DMA_DEVICE_H2C, e8["st_d"], e8["bd"], Hh)
+                            ue.dma_write(T_e.DMA_DEVICE_H2C, e8["st_s"], e8["bs"], nsc)
+                            ue.start_execute_from_dram(e8["prog"])
+                            while ue.is_queue_busy():
+                                pass
+                            ue.dma_read(T_e.DMA_DEVICE_C2H, e8["out"], x_t, Hh * BF16)
+                    for k in ks:
+                        done[k] = last
+                    continue
                 if s == SEG_ROPE:
                     # position rows of the attention layers' rotary tables, rewritten for image positions
                     z = np.load(ROPE_FILE)
@@ -434,6 +510,41 @@ def worker(c, E, P, dev, paths, n_layers, max_ctx, cpu, nap, shm_names, conn, vi
             conn.send(("error", traceback.format_exc()[-1500:]))
         except Exception:
             pass
+
+
+class CardEmbed8:
+    """embed[token] for an IF8 table on the cards: the card holding the row dequantizes it (SEG_EMB)."""
+
+    def __init__(self, m):
+        self.m = m
+
+    def __getitem__(self, t):
+        self.m.command(SEG_EMB, int(t))
+        return self.m.sh.x.copy()
+
+
+class CardEmbed:
+    """embed[token] -> the token's embedding row (int16 bf16 bits), read from the card that holds it.
+    The table lives on the cards (each shard its vocabulary block, see slice_embed.py); the driver only
+    copies one row per token, over each card's second c2h channel (the card processes use the first)."""
+
+    def __init__(self, voff, devs, E, emb_addr, H):
+        if any(a is None for a in emb_addr):
+            raise RuntimeError("the embedding table is not on the cards (run slice_embed.py)")
+        self.voff, self.addr, self.E, self.nb = voff, emb_addr, E, H * BF16
+        self.fds = [os.open("/dev/%s_c2h_1" % d, os.O_RDWR) for d in devs]
+
+    def __getitem__(self, t):
+        import bisect
+        k = bisect.bisect_right(self.voff, int(t)) - 1
+        data = os.pread(self.fds[k // self.E], self.nb, self.addr[k] + (int(t) - self.voff[k]) * self.nb)
+        if len(data) != self.nb:
+            raise OSError("short embedding read")
+        return np.frombuffer(data, dtype=np.int16)
+
+    def close(self):
+        for fd in self.fds:
+            os.close(fd)
 
 
 class Loaded:
@@ -499,9 +610,17 @@ class Loaded:
                     raise RuntimeError("the process of card %d ended unexpectedly (log: %s/card_%02d.log)" % (c, LOGDIR, c))
         self.n_seg = self.card_info[0]["segs"]
         self.load_s = time.time() - t0
-        shape = json.load(open(os.path.join(self.paths["wdir"], "embed.json")))["shape"]
-        # the whole table in RAM: a memmap row costs a random disk read (~28 ms on this SSD) once the page cache drops it
-        self.embed = np.fromfile(os.path.join(self.paths["wdir"], "embed.bin"), dtype=np.int16).reshape(tuple(shape))
+        # the embedding table is on the cards: embed[token] copies that one row from the card that holds it.
+        # A model whose slices carry no embed.pt (Qwen3.8-27B: its 254 MB per engine does not fit next to the
+        # weights) still reads the table from host RAM, as before.
+        if all(i.get("emb_addr") is not None for i in self.card_info):
+            self.embed = CardEmbed(self.voff, [d for _, d, _ in self.phys], self.E,
+                                   [i["emb_addr"] for i in self.card_info], self.H)
+        elif all(i.get("emb8") for i in self.card_info):
+            self.embed = CardEmbed8(self)
+        else:                                 # never from host RAM
+            raise RuntimeError("the embedding table of %s is not on the cards: run slice_embed.py (bf16) "
+                               "or slice_embed8.py (IF8)" % name)
         self.seq = 0
         self.fed = []                 # what the cards' state already contains: one key per position
         self.f32 = np.empty(self.H, dtype=np.float32)
@@ -590,6 +709,8 @@ class Loaded:
         return cands
 
     def close(self):
+        if isinstance(self.embed, CardEmbed):
+            self.embed.close()
         try:
             self.sh.cmd[1] = SEG_QUIT
             self.sh.cmd[0] = self.seq + 1
@@ -852,7 +973,11 @@ def driver_main(conn, abort):
                     m.close()
                     m = None
                 aptop.loading(name)
-                if is_gptoss(name):
+                if is_gemma4(name):
+                    import ollapex_gemma4
+                    m = ollapex_gemma4.LoadedGemma4(name, num_ctx, emit, model_paths(name), MODELS[name][2],
+                                                    MODEL_MAX_CTX.get(name, MAX_CTX))
+                elif is_gptoss(name):
                     import ollapex_gptoss
                     m = ollapex_gptoss.LoadedGptOss(name, num_ctx, emit, model_paths(name), MODELS[name][2],
                                                     MODEL_MAX_CTX.get(name, MAX_CTX))

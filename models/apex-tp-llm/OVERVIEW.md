@@ -1,12 +1,15 @@
 # Large language models on 5 Apex FPGA cards — overview and results
 
-This work runs **GPT‑OSS‑20B, Qwen3.5‑9B and Qwen3.8‑27B tensor-parallel on five Apex Kintex‑7 cards**, with a web chat interface (OllApeX). All model compute runs on the cards; the host CPU only coordinates.
+This work runs **GPT‑OSS‑20B, Gemma 4 26B‑A4B, Qwen3.5‑9B and Qwen3.8‑27B tensor-parallel on five Apex Kintex‑7 cards**, with a web chat interface (OllApeX).
+
+**The host CPU and RAM are not used for inference.** Weights, the embedding table, the KV cache and every computation (attention, FFN, experts, norms, sums of the shards' results) live on the cards. The host only coordinates: tokenizer, commands, moving bytes between the cards (shares and the one embedding row a token needs, copied from the card that holds it), and choosing indices from values the cards computed (the top-k experts, the next token).
 
 It is the vendor's [unified-engine](https://github.com/apex-compute/unified-engine) runtime (matching card firmware `c7de4c55`, 230 MHz) plus this project in [`models/apex-tp-llm/`](./). The vendor's original guide (XDMA driver, hardware tests, single-card models) is in [README.unified-engine.md](../../README.md).
 
 | Model | Cards | Context | Generation | Prompt reading |
 |---|---|---|---|---|
 | **GPT‑OSS‑20B** (MoE, 21B / 3.6B active) | 5 cards × 2 engines | 8192 | **21.1 tokens/s** | 21.4 tokens/s |
+| **Gemma 4 26B‑A4B** (MoE, 25B / 3.8B active) | 5 cards × 2 engines | 8192 | **17.1 tokens/s** | 17.3 tokens/s |
 | **Qwen3.5‑9B** | 5 cards × 2 engines | 16384 | **7.35 tokens/s** | 7.4 tokens/s |
 | **Qwen3.8‑27B** | 5 cards × 2 engines | 8192 | **2.76 tokens/s** | 2.8 tokens/s |
 
@@ -317,6 +320,8 @@ flowchart LR
 | **Host** | xdma driver for kernel 7.0, poll mode, `apex-tune` (performance governor, no deep C-states), CPU placement, systemd boot order | All 5 cards up at boot; ~10 µs per small DMA |
 | **Qwen runtime** | Slicing every layer over 10 slices, sums on the cards, two engines on separate DDR channels, on-card pre-sum, dynamic attention length, 16K context, FP4 | 9B: 3.2 → 6.97 tokens/s; 27B: 2.39 tokens/s |
 | **GPT‑OSS‑20B port** | New card program: MXFP4 → FP4, attention sinks, sliding window, YaRN, clamped SwiGLU, experts as precompiled subroutines picked through registers, card-local top‑4 pick, batched attention | 11.3 → 15.3 tokens/s |
+| **Gemma 4 26B‑A4B port** | New card program: 128 experts with top‑8 plus a parallel dense FFN, sliding and global attention (K = V, partial RoPE by head-dim permutation), 1088-row KV ring for the sliding layers, router split over both engines, expert pick hidden behind the dense FFN | 15.7 → 17.1 tokens/s, context 8192 |
+| **Embedding on the cards** | Every model's table on the cards, one vocabulary block per shard (Qwen3.8‑27B as IF8, dequantized on the card); one row per token is copied from the card that holds it | Host RAM holds no model data; no measurable cost |
 | **Firmware** | Vendor firmware `c7de4c55` (230 MHz) on all 5 cards, updated without a warm boot plus one power cycle; no code change | +4.5 % to +11.4 % tokens/s, identical output |
 | **OllApeX** | Web chat UI, model and context choice, files, images (Qwen), sampling, harmony format for GPT‑OSS (thinking / answer), math typesetting (KaTeX), live technical panel, systemd service | Use from any browser on port 3000 |
 | **aptop** | Multi-card grid, live OllApeX state (model, phase, memory per card) | Monitor all cards in a terminal |
@@ -403,6 +408,19 @@ for r in 0:16 16:32 32:48 48:64; do APEX_Q4=fp4 Q_MODEL=q38_27b TP_LAYERS=$r pyt
 APEX_Q4=fp4 Q_MODEL=q38_27b TP_HEAD=1 TP_LAYERS=0:0 python extract_tp.py 10 fp4
 ```
 
+```bash
+# Gemma 4 26B-A4B
+python tools/download_models.py gemma-4-26b
+for r in 0:8 8:16 16:23 23:30; do GEMMA4_LAYERS=$r python gemma4/extract_gemma4.py & done; wait
+GEMMA4_HEAD=1 GEMMA4_LAYERS=0:0 python gemma4/extract_gemma4.py      # LM head, embedding, final norm
+
+# every model: its embedding table goes onto the cards (one vocabulary block per shard, never in host RAM)
+EMB_WORK=$APEX_TP_WORK/models/gemma4_26b TPDIR=tp10    python tools/slice_embed.py
+EMB_WORK=$APEX_TP_WORK/models/gptoss20b  TPDIR=tp10    python tools/slice_embed.py
+EMB_WORK=$APEX_TP_WORK/models/q35_9b     TPDIR=tp10fp4 python tools/slice_embed.py
+EMB_WORK=$APEX_TP_WORK/models/q38_27b    TPDIR=tp10fp4 python tools/slice_embed8.py   # IF8: bf16 does not fit next to the 27B weights
+```
+
 The slices land in `$APEX_TP_WORK/models/<model>/tp10…`. OllApeX lists a model as soon as its slices are there.
 
 ### 6. OllApeX service
@@ -421,7 +439,7 @@ Open `http://<host>:3000`.
 
 ### Web interface
 
-Pick **gpt-oss:20b**, **qwen3.5:9b** or **qwen3.8:27b** from the model menu. The first time a model is chosen it is loaded onto the cards: ~40 s for GPT‑OSS, ~1.5 min for 27B.
+Pick **gpt-oss:20b**, **gemma4:26b**, **qwen3.5:9b** or **qwen3.8:27b** from the model menu. The first time a model is chosen it is loaded onto the cards: ~40 s for GPT‑OSS and Gemma 4, ~1.5–2 min for 27B.
 
 ### API
 
@@ -456,10 +474,11 @@ unified-engine/  (branch 5-Apex-fpga)
 └── models/apex-tp-llm/
     ├── port_build.py · extract_tp.py · run_tp.py · vision_prep.py     Qwen tensor-parallel runtime
     ├── gptoss_card.py · gptoss_tp.py · extract_gptoss.py              GPT-OSS-20B runtime
-    ├── ollapex/        chat interface (server, engine, GPT-OSS backend, web page)
+    ├── gemma4/         Gemma 4 26B-A4B runtime (card program, runner, slicing)
+    ├── ollapex/        chat interface (server, engine, GPT-OSS and Gemma 4 backends, web page)
     ├── system/         systemd services, xdma Makefile patch
     ├── aptop/          aptop multi-card patch
     ├── tools/          download_models.py, tests, benchmarks, profilers
-    ├── docs/TECHNICAL.md
+    ├── docs/TECHNICAL.md · docs/FINDINGS.md
     └── README.md       project README
 ```

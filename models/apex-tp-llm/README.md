@@ -2,11 +2,12 @@
 
 **Run large language models tensor-parallel across several Apex FPGA cards, with the OllApeX chat interface on top.**
 
-All model compute runs on the cards. The host CPU only coordinates. It does the tokenizer and the embedding-row copy, moves data between the cards, picks the next token (sampling), and, for MoE models, picks the indices of the top-4 experts.
+**The host CPU and RAM are not used for inference.** Weights, the embedding table, the KV cache and every computation (attention, FFN, experts, norms, sums of the shards' results) live on the cards. The host only coordinates: tokenizer, commands, moving bytes between the cards (shares and the one embedding row a token needs, copied from the card that holds it), and choosing indices from values the cards computed (the top-k experts, the next token).
 
 | Model | Cards | Context | Generation | Prompt reading |
 |---|---|---|---|---|
 | **GPT‑OSS‑20B** (MoE) | 5 cards × 2 engines | 8192 | **21.1 tokens/s** | 21.4 tokens/s |
+| **Gemma 4 26B‑A4B** (MoE) | 5 cards × 2 engines | 8192 | **17.1 tokens/s** | 17.3 tokens/s |
 | **Qwen3.5‑9B** | 5 cards × 2 engines | 16384 | **7.35 tokens/s** | 7.4 tokens/s |
 | **Qwen3.8‑27B** | 5 cards × 2 engines | 8192 | **2.76 tokens/s** | 2.8 tokens/s |
 
@@ -15,7 +16,8 @@ All model compute runs on the cards. The host CPU only coordinates. It does the 
 ---
 
 > **Overview, optimization history and measurement charts:** [OVERVIEW.md](OVERVIEW.md).  
-> **Card program internals:** [docs/TECHNICAL.md](docs/TECHNICAL.md).
+> **Card program internals:** [docs/TECHNICAL.md](docs/TECHNICAL.md).  
+> **Findings, and how Gemma 4 is sliced, compiled and pipelined:** [docs/FINDINGS.md](docs/FINDINGS.md).
 
 ## Contents
 
@@ -27,6 +29,7 @@ All model compute runs on the cards. The host CPU only coordinates. It does the 
 6. [Usage](#usage)
 7. [Repository layout](#repository-layout)
 8. [Technical details](docs/TECHNICAL.md)
+9. [Findings: what the measurements taught us](docs/FINDINGS.md) (incl. how Gemma 4 is sliced, compiled and pipelined)
 
 ---
 
@@ -362,18 +365,41 @@ On an 8-head slice the card time of attention went from 691 µs to 435 µs per l
 - **Sampling:** greedy or temperature / top‑k / top‑p. Every engine reports its best 4 tokens through the hardware argmax, and the host picks among the overall best candidates.
 - Replies are limited to 1024 tokens by default.
 - For the Qwen models, the part of the previous conversation already held on the cards is reused; only the new message is read.
+- **gemma4:26b:** Gemma 4 chat template; with "think" on, its thinking channel is shown as "thinking".
 - The LM head is skipped while the prompt is read, so GPT‑OSS reads prompts at ~17 tokens/s.
 - Between requests the card processes park and use no CPU.
 - Runs as a systemd service: `ollapex.sh start | stop | restart | status | log`.
 
-### 5. aptop: multi-card monitoring
+### 5. Gemma 4 26B‑A4B (MoE) port
+
+New card program (`gemma4/`): 30 layers, 128 experts with top‑8 plus a parallel dense FFN, sliding (1024) and global attention (K = V, partial RoPE). How it is sliced, compiled and pipelined: [docs/FINDINGS.md §8](docs/FINDINGS.md).
+
+| Step | Effect |
+|---|---|
+| First version (card-local top‑8 pick) | 63.7 ms/token, 15.7 tokens/s |
+| Router split over the card's two engines | 61.7 ms/token (−2.0) |
+| Dense FFN started before the expert pick; the pick runs while it computes | 58.8 ms/token (−2.9) |
+| Sliding layers in a 1088-row KV ring | context 4096 → **8192** fits; sliding-attention time stays flat |
+| Fused expert accumulation | 58.5 ms/token (−0.6) |
+
+The output is bit-identical across all these steps.
+
+### 6. Embedding tables on the cards
+
+Every model keeps its embedding table on the cards, one vocabulary block per shard (`tools/slice_embed.py`). For each token the driver copies the one row it needs from the card that holds it; the table is never in host RAM.
+
+- Qwen3.8‑27B: the bf16 table (254 MB per engine) does not fit next to its weights, so it is stored as IF8 (`tools/slice_embed8.py`, 131 MB per engine) and the card dequantizes the row. Row error is 0.65–1.05 %, and the first ~30 generated tokens are identical to the bf16 version.
+- Cost: none measurable (GPT‑OSS 47.4 → 47.3 ms/token).
+- 27B needs a tighter weight-region margin: `OLLAPEX_PARAM_FACTOR=1.0 OLLAPEX_PARAM_SLACK_MB=64`, already in `system/ollapex.service`. The measured need is the on-disk size + ~31 MB.
+
+### 7. aptop: multi-card monitoring
 
 Patch for [aptop](https://github.com/celikomer/aptop), an nvtop-like monitor for Apex cards ([aptop/aptop-multicard.patch](aptop/aptop-multicard.patch)):
 
 - Detects how many cards are installed and lays them out in a grid of up to 6 columns.
 - OllApeX writes the state file aptop reads (`aptop-workload/v1`): the loaded model, the phase (loading / idle / prompt reading / generating), and per-card memory use (weights, KV, program).
 
-### 6. Measurement and test tools
+### 8. Measurement and test tools
 
 | Tool | What it measures |
 |---|---|
@@ -465,6 +491,17 @@ APEX_Q4=fp4 Q_MODEL=q38_27b python extract_tp.py 10 fp4      # -> $APEX_TP_WORK/
 
 # GPT-OSS-20B: 10 slices; can run as parallel copies over layer ranges (GPTOSS_LAYERS=0:6 ...)
 GPTOSS_MODEL=<gpt-oss-20b dir> python extract_gptoss.py 10   # -> $APEX_TP_WORK/models/gptoss20b/tp10
+
+# Gemma 4 26B-A4B
+python tools/download_models.py gemma-4-26b
+for r in 0:8 8:16 16:23 23:30; do GEMMA4_LAYERS=$r python gemma4/extract_gemma4.py & done; wait
+GEMMA4_HEAD=1 GEMMA4_LAYERS=0:0 python gemma4/extract_gemma4.py      # LM head, embedding, final norm
+
+# every model: its embedding table goes onto the cards (one vocabulary block per shard, never in host RAM)
+EMB_WORK=$APEX_TP_WORK/models/gemma4_26b TPDIR=tp10    python tools/slice_embed.py
+EMB_WORK=$APEX_TP_WORK/models/gptoss20b  TPDIR=tp10    python tools/slice_embed.py
+EMB_WORK=$APEX_TP_WORK/models/q35_9b     TPDIR=tp10fp4 python tools/slice_embed.py
+EMB_WORK=$APEX_TP_WORK/models/q38_27b    TPDIR=tp10fp4 python tools/slice_embed8.py   # IF8: bf16 does not fit next to the 27B weights
 ```
 
 ### 5. OllApeX service
@@ -483,7 +520,7 @@ The interface is at `http://<host>:3000`.
 
 ### Web interface
 
-Pick **gpt-oss:20b**, **qwen3.5:9b** or **qwen3.8:27b** from the model menu. A model is loaded onto the cards the first time it is chosen: about 40 s for GPT‑OSS and about 1.5 minutes for the 27B model.
+Pick **gpt-oss:20b**, **gemma4:26b**, **qwen3.5:9b** or **qwen3.8:27b** from the model menu. A model is loaded onto the cards the first time it is chosen: about 40 s for GPT‑OSS and Gemma 4, about 1.5–2 minutes for the 27B model.
 
 ### API
 
@@ -507,7 +544,11 @@ curl -N -X POST localhost:3000/api/chat -d '{
 python gptoss_tp.py --engines 2 --max-context 8192 --max-new-tokens 200 --prompt "..."
 GPTOSS_PROF=1 python gptoss_tp.py ...        # step-by-step time breakdown per card
 
-# Qwen
+# Gemma 4 26B-A4B
+python gemma4/gemma4_tp.py --max-context 8192 --max-new-tokens 200 --prompt "..."
+GEMMA4_PROF=1 python gemma4/gemma4_tp.py ...    # step-by-step time breakdown per card
+
+# Qwen (27B: export OLLAPEX_PARAM_FACTOR=1.0 OLLAPEX_PARAM_SLACK_MB=64 first)
 Q_MODEL=q35_9b python run_tp.py --tp 10fp4 --engines 2 --max-context 16384 --prompt "..."
 Q_MODEL=q35_9b python run_tp.py --tp 10fp4 --engines 2 --eval-file text.txt --eval-tokens 1000
 ```
@@ -525,9 +566,11 @@ models/apex-tp-llm/           (in unified-engine, branch 5-Apex-fpga)
 ├── gptoss_card.py            GPT-OSS card program (one engine = one slice)
 ├── gptoss_tp.py              GPT-OSS runner and card processes
 ├── extract_gptoss.py         GPT-OSS slicing (MXFP4 → FP4)
-├── ollapex/                  chat interface: server, engine, GPT-OSS backend, web page
+├── gemma4/                   Gemma 4 26B-A4B: card program, runner, slicing (gemma4_card / gemma4_tp / extract_gemma4)
+├── ollapex/                  chat interface: server, engine, GPT-OSS and Gemma 4 backends, web page
 ├── system/                   systemd services and the xdma Makefile patch
 ├── aptop/                    aptop multi-card patch
-├── tools/                    tests, benchmarks and profilers
-└── docs/TECHNICAL.md         card program, register map, measurements
+├── tools/                    tests, benchmarks, profilers, slice_embed.py / slice_embed8.py
+├── docs/TECHNICAL.md         card program, register map, measurements
+└── docs/FINDINGS.md          what the measurements taught us; Gemma 4 slicing, compile and pipeline
 ```

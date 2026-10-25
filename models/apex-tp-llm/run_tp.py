@@ -36,6 +36,7 @@ MODEL = os.path.dirname(sorted(glob.glob(os.path.join(BASE, "*_bin", "*", "confi
 BF16 = 2
 INST = 32
 SEG_QUIT, SEG_RESET = -1, -2
+SEG_EMB = -6                      # pos = token: dequantize its IF8 embedding row on its card
 FAILED = -1
 
 
@@ -122,9 +123,13 @@ def engine_window(e, E, cdir):
         return {}                                  # single engine: the port's membase layout
     w = e * CHANNEL_BYTES
     on_disk = sum(os.path.getsize(f) for f in glob.glob(os.path.join(cdir, "*.pt")))
-    params = (int(on_disk * 1.03) + (96 << 20) + (16 << 20) - 1) // (16 << 20) * (16 << 20)
+    # margins: the same env overrides as OllApeX (measured need: on-disk size + ~31 MB)
+    factor = float(os.environ.get("OLLAPEX_PARAM_FACTOR", "1.03"))
+    slack = int(os.environ.get("OLLAPEX_PARAM_SLACK_MB", "96")) << 20
+    tmin = int(os.environ.get("OLLAPEX_TENSOR_MIN_MB", "256")) << 20
+    params = (int(on_disk * factor) + slack + (16 << 20) - 1) // (16 << 20) * (16 << 20)
     prog = w + CHANNEL_BYTES - PROGRAM_BYTES
-    assert params < CHANNEL_BYTES - PROGRAM_BYTES - (256 << 20), "the slice does not fit one DDR channel"
+    assert params < CHANNEL_BYTES - PROGRAM_BYTES - tmin, "the slice does not fit one DDR channel"
     return {"params_dram_base": w, "tensor_dram_base": w + params, "program_dram_base": prog}
 
 
@@ -163,6 +168,7 @@ def worker(c, E, P, dev, tdir, n_layers, max_ctx, cpu, nap, shm_names, conn, car
         cfg = json.load(open(os.path.join(cdirs[0], "config.json")))
         H = cfg["file_info"]["hidden_size"]
         info, eng = [], []
+        emb_of = {}                                  # k -> where this shard keeps its embedding rows
         for T_e, ue, cdir, k in zip(mods, ues, cdirs, ks):
             vocab = json.load(open(os.path.join(cdir, "config.json")))["file_info"]["embedding_vocab"]
             weights = {
@@ -180,6 +186,40 @@ def worker(c, E, P, dev, tdir, n_layers, max_ctx, cpu, nap, shm_names, conn, car
             ue._preallocate_identity_matrix()
             ue.prepare_inference(weights, max_context=max_ctx)
             del weights
+            # this shard's rows of the embedding table on the card: bf16 (embed.pt) or, for a model whose bf16
+            # table does not fit next to its weights, IF8 (embed8.pt) that the card dequantizes per token
+            ep, e8p = os.path.join(cdir, "embed.pt"), os.path.join(cdir, "embed8.pt")
+            if os.path.exists(ep):
+                et = torch.load(ep, weights_only=False).to(torch.bfloat16).contiguous()
+                a_e = ue.allocate_params_dram(et.numel() * BF16)
+                ue.dma_write(T_e.DMA_DEVICE_H2C, a_e, T_e._bf(et), et.numel() * BF16)
+                emb_of[k] = {"addr": a_e}
+                del et
+            elif os.path.exists(e8p):
+                z = torch.load(e8p, weights_only=False)
+                U_e, Hh = T_e.user_dma_core, int(z["H"])
+                nd, ns = z["data"].numel(), z["scales"].numel() * BF16
+                da = ue.allocate_params_dram(nd)
+                ue.dma_write(T_e.DMA_DEVICE_H2C, da, z["data"].contiguous(), nd)
+                sa = ue.allocate_params_dram(ns)
+                ue.dma_write(T_e.DMA_DEVICE_H2C, sa, T_e._bf(z["scales"].contiguous()), ns)
+                st_d, st_s = ue.allocate_tensor_dram(Hh), ue.allocate_tensor_dram(max(256, Hh // 64 * BF16))
+                out = ue.allocate_tensor_dram(Hh * BF16)
+                ue.clear_capture_buffer()
+                T_e.UnifiedEngine.start_capture(ue)
+                ue.start_queue_for_bf16_dequantize_operation(st_d, st_s, U_e.TYPE.IF8, 0x00000, Hh)
+                ue.sram_to_accelerator_memory(0x00000, out, Hh)
+                ue.generate_instruction_halt()
+                T_e.UnifiedEngine.stop_capture(ue)
+                prog = ue.get_program_dram_addr()
+                ue.write_captured_instructions_to_dram(prog)
+                ue.allocate_program_dram(ue.get_capture_instruction_size_bytes() + 64)
+                ue.clear_capture_buffer()
+                v0 = json.load(open(os.path.join(tdir, "plan.json")))["cards"][k]["vocab"][0]
+                emb_of[k] = {"prog": prog, "data": da, "scales": sa, "st_d": st_d, "st_s": st_s, "out": out,
+                             "rows": int(z["rows"]), "H": Hh, "v0": v0, "T": T_e, "ue": ue,
+                             "bd": torch.empty(Hh, dtype=torch.uint8), "bs": torch.empty(Hh // 64, dtype=torch.bfloat16)}
+                del z
         if card_sum and E > 1:
             # one copy of the shards' partial outputs per card: every engine's program reads engine 0's
             # buffer (one flat address space), so the host writes it once per card instead of per engine
@@ -204,7 +244,8 @@ def worker(c, E, P, dev, tdir, n_layers, max_ctx, cpu, nap, shm_names, conn, car
             eng.append(g)
             info.append({"dev": "%s/e%d" % (dev, k - c * E),
                          "params_mb": (ue._next_params_dram_addr - ue._params_dram_base) / 1e6,
-                         "prog_mb": sizes[0] / 1e6, "setup_s": time.time() - t0, "segs": len(g["starts"])})
+                         "prog_mb": sizes[0] / 1e6, "setup_s": time.time() - t0, "segs": len(g["starts"]),
+                         "emb_addr": emb_of.get(k, {}).get("addr"), "emb8": "prog" in emb_of.get(k, {})})
         n_seg = len(eng[0]["starts"])
         T_al = ues[0].max_context_aligned
         row_byt = ues[0].full_head_dim * BF16
@@ -291,6 +332,22 @@ def worker(c, E, P, dev, tdir, n_layers, max_ctx, cpu, nap, shm_names, conn, car
                     for k in ks:
                         done[k] = last
                     continue
+                if s == SEG_EMB:                      # pos = token: the card holding its IF8 row dequantizes it into x
+                    for e8 in emb_of.values():
+                        if "prog" in e8 and e8["v0"] <= pos < e8["v0"] + e8["rows"]:
+                            T_e, ue, Hh, r = e8["T"], e8["ue"], e8["H"], pos - e8["v0"]
+                            nsc = Hh // 64 * BF16
+                            ue.dma_read(T_e.DMA_DEVICE_C2H, e8["data"] + r * Hh, e8["bd"], Hh)      # bytes only
+                            ue.dma_read(T_e.DMA_DEVICE_C2H, e8["scales"] + r * nsc, e8["bs"], nsc)
+                            ue.dma_write(T_e.DMA_DEVICE_H2C, e8["st_d"], e8["bd"], Hh)
+                            ue.dma_write(T_e.DMA_DEVICE_H2C, e8["st_s"], e8["bs"], nsc)
+                            ue.start_execute_from_dram(e8["prog"])
+                            while ue.is_queue_busy():
+                                pass
+                            ue.dma_read(T_e.DMA_DEVICE_C2H, e8["out"], x_t, Hh * BF16)
+                    for k in ks:
+                        done[k] = last
+                    continue
                 t1 = time.perf_counter()
                 if pos >= 0:                          # first segment of a token
                     bias.fill_(float("-inf"))
@@ -338,6 +395,34 @@ def worker(c, E, P, dev, tdir, n_layers, max_ctx, cpu, nap, shm_names, conn, car
             conn.send(("error", traceback.format_exc()[-1500:]))
         except Exception:
             pass
+
+
+class CardEmbed:
+    """embed[token] -> the token's embedding row (int16 bf16 bits), read from the card that holds it, over each
+    card's second c2h channel (the card processes use the first). The table is never in host RAM."""
+
+    def __init__(self, voff, devs, E, emb_addr, H):
+        self.voff, self.addr, self.E, self.nb = voff, emb_addr, E, H * BF16
+        self.fds = [os.open("/dev/%s_c2h_1" % d, os.O_RDWR) for d in devs]
+
+    def __getitem__(self, t):
+        import bisect
+        k = bisect.bisect_right(self.voff, int(t)) - 1
+        data = os.pread(self.fds[k // self.E], self.nb, self.addr[k] + (int(t) - self.voff[k]) * self.nb)
+        if len(data) != self.nb:
+            raise OSError("short embedding read")
+        return np.frombuffer(data, dtype=np.int16)
+
+
+class CardEmbed8:
+    """embed[token] for an IF8 table on the cards: the card holding the row dequantizes it (SEG_EMB)."""
+
+    def __init__(self, command, x):
+        self.command, self.x = command, x
+
+    def __getitem__(self, t):
+        self.command(SEG_EMB, int(t))
+        return self.x.copy()
 
 
 def cpu_plan(P):
@@ -399,6 +484,7 @@ def main():
         pipes.append(pa); procs.append(p)
     n_seg = None
     shard_dev = [None] * P
+    emb_addr, emb8 = [None] * P, [False] * P
     for c, pc in enumerate(pipes):
         m = pc.recv()
         if m[0] != "ready":
@@ -408,6 +494,7 @@ def main():
             k = c * E + e
             n_seg = i["segs"]
             shard_dev[k] = i["dev"]
+            emb_addr[k], emb8[k] = i.get("emb_addr"), i.get("emb8")
             print("CARD|%d|%s|weights %.0f MB|program %.1f MB|setup %.0f s" % (
                 k, i["dev"], i["params_mb"], i["prog_mb"], i["setup_s"]), flush=True)
     print("READY|%d cards x %d engines|%d segments/token|%.0f s" % (n_cards, E, n_seg, time.time() - t0), flush=True)
@@ -448,6 +535,14 @@ def main():
         if s >= 0:
             back_us[s] = (time.perf_counter() - t) * 1e6
 
+    # the embedding table is on the cards (bf16 rows copied, or IF8 rows dequantized on the card); never in host RAM
+    if all(v is not None for v in emb_addr):
+        embed = CardEmbed(voff, [devs[k // E] for k in range(0, P, E)], E, emb_addr, H)
+    elif all(emb8):
+        embed = CardEmbed8(command, sh.x)
+    else:
+        print("ERROR|the embedding table is not on the cards: run slice_embed.py (bf16) or slice_embed8.py (IF8)")
+        return 1
     command(SEG_RESET, -1)
     hw = np.zeros((P, n_seg)); wall = np.zeros((P, n_seg)); seg_wall = np.zeros(n_seg); n_meas = [0]
     f32 = np.empty(H, dtype=np.float32)

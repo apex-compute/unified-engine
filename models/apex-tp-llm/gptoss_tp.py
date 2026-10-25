@@ -60,6 +60,31 @@ def engine_window(e, E, cdir):
     return {"params_dram_base": w, "tensor_dram_base": w + params, "program_dram_base": w + CHANNEL_BYTES - PROGRAM_BYTES}
 
 
+class CardEmbed:
+    """embed[token] -> the token's embedding row (int16 bf16 bits), read from the card that holds it.
+    The table lives on the cards (each shard its vocabulary block, see slice_embed.py); the host only copies
+    one row per token, over each card's second c2h channel (the card processes use the first)."""
+
+    def __init__(self, plan, devs, E, emb_addr, H):
+        if any(a is None for a in emb_addr):
+            raise RuntimeError("the embedding table is not on the cards (run slice_embed.py)")
+        self.voff = [c["vocab"][0] for c in plan["cards"]]
+        self.addr, self.E, self.nb = emb_addr, E, H * BF16
+        self.fds = [os.open("/dev/%s_c2h_1" % d, os.O_RDWR) for d in devs]
+
+    def __getitem__(self, t):
+        import bisect
+        k = bisect.bisect_right(self.voff, int(t)) - 1
+        data = os.pread(self.fds[k // self.E], self.nb, self.addr[k] + (int(t) - self.voff[k]) * self.nb)
+        if len(data) != self.nb:
+            raise OSError("short embedding read")
+        return np.frombuffer(data, dtype=np.int16)
+
+    def close(self):
+        for fd in self.fds:
+            os.close(fd)
+
+
 class Shared:
     def __init__(self, P, H, names=None):
         spec = (("cmd", np.int64, (4,)), ("x", np.int16, (H,)), ("done", np.int64, (P,)),
@@ -139,7 +164,8 @@ def worker(c, E, P, dev, tdir, max_ctx, cpu, shm_names, conn):
                  "kv_mb": s.L * s.T_ext * (G.KQ + 2 * s.HD) * BF16 / 1e6,
                  "setup_s": time.time() - t0, "segs": n_seg,
                  "clock_mhz": 1000.0 / float(getattr(s.ue, "_clock_period_ns", 0) or 5.042),
-                 "firmware": "%08x" % s.ue.get_hardware_version()} for e, (s, p0) in enumerate(zip(shards, prog0))]
+                 "firmware": "%08x" % s.ue.get_hardware_version(),
+                 "emb_addr": s.EMB} for e, (s, p0) in enumerate(zip(shards, prog0))]
         sh = Shared(P, H, shm_names)
         # the card's DMA channels opened ONCE: the vendor dma_write/dma_read open and close the device on
         # every call, which costs more than the small transfer itself (~170 transfers per token)
@@ -333,12 +359,14 @@ def main():
         p = ctx.Process(target=worker, args=(c, E, P, dev, tdir, a.max_context, card_cpus[c], sh.names, pb), daemon=True)
         p.start(); pipes.append(pa); procs.append(p)
     n_seg = None
+    emb_addr = [None] * P
     for c, pc in enumerate(pipes):
         m = pc.recv()
         if m[0] != "ready":
             print("ERROR|card %d|%s" % (c, m[1])); return 1
-        for i in m[1]:
+        for e, i in enumerate(m[1]):
             n_seg = i["segs"]
+            emb_addr[c * E + e] = i["emb_addr"]
             print("CARD|%s|weights %.0f MB|setup %.0f s" % (i["dev"], i["params_mb"], i["setup_s"]), flush=True)
     print("READY|%d cards x %d engines|%d segments/token|%.0f s" % (n_cards, E, n_seg, time.time() - t0), flush=True)
 
@@ -349,8 +377,7 @@ def main():
     ids = tok.encode(text, add_special_tokens=False)
     # harmony: the analysis message ends with <|end|> and the final answer follows; stop at the turn's end
     stops = {tok.convert_tokens_to_ids(t) for t in ("<|return|>", "<|call|>")}
-    shape = json.load(open(os.path.join(WDIR, "embed.json")))["shape"]
-    embed = np.fromfile(os.path.join(WDIR, "embed.bin"), dtype=np.int16).reshape(tuple(shape))
+    embed = CardEmbed(plan, devs, E, emb_addr, H)    # the table is on the cards; one row per token comes over
     seq = [0]
 
     def command(s, pos):
