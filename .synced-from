@@ -1,8 +1,8 @@
 # Written by andromeda pcie_utils/sync_unified_engine.sh --push. Do not edit.
 # The files below are owned by andromeda; edits made here are carried back
 # by --backsync, using the commit that last changed this file as the base.
-andromeda_commit=42c1f0a33a85202b616a9a8d5867645a3c4f3539
-hw_hash=c7de4c55
+andromeda_commit=1dc975db598da8adb3218ac537541522d9973eb2
+hw_hash=720476db
 files:
   andromeda_hw_info.py
   user_dma_core.py
