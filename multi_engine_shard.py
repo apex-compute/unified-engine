@@ -443,8 +443,9 @@ def require_multicore_dram(num_engines: int, what: str) -> None:
 # It does not describe Kintex-7, U55C, or any other target/core-count layout.
 # Each engine owns one 512 MiB memory-controller region on EACH 4 GiB stack,
 # for 1 GiB of private DRAM total.  HBM1 is the matching HBM0 range + 4 GiB.
-# The engine-to-controller order follows build_alveo.tcl's dedicated SAXI-port
-# wiring, so it is deliberately not a simple ``core * stride`` permutation:
+# The engine-to-controller order follows the engine-to-AXI-port wiring in
+# Vivado/hdl/board/u50_hbm_stack.sv, so it is deliberately not a simple
+# ``core * stride`` permutation:
 #
 #   core  SAXI/MC  HBM0 private range              HBM1 private range
 #     0    00 / 0  0x000000000 - 0x01FFFFFFF      0x100000000 - 0x11FFFFFFF
@@ -511,8 +512,8 @@ def require_multicore_dram(num_engines: int, what: str) -> None:
 #
 # Alveo U55C dual-stack HBM ownership for u55c/hbm_16GB (12 cores, 16 GiB).
 # Select this map only for HW_INFO core_count == 12 AND dram_size_gb == 16.
-# build_alveo_u55c.tcl wires each core to the same SAXI number on both stacks
-# (SAXI_xx_8HI on hbm_0, SAXI_xx_RT_8HI on hbm_1). Each stack has eight MCs,
+# Vivado/hdl/board/u55c_hbm_stack.sv wires each core to the same AXI port
+# number on both stacks (u55c_hbm_l and u55c_hbm_r). Each stack has eight MCs,
 # each owning two adjacent 512 MiB segments. Use native HBM addressing:
 #
 #   address [33] = stack, [32:30] = MC (no external address swap)
@@ -554,7 +555,7 @@ ALVEO_U55C_BOARD_CORES = 12                 # HW_INFO signature of the U55C imag
 
 ALVEO_MC_STRIDE = 0x2000_0000               # U50: 512 MiB per controller, per stack
 ALVEO_STACK_STRIDE = 0x1_0000_0000          # U50: HBM1 is HBM0 + 4 GiB
-# build_alveo.tcl's SAXI wiring, core -> controller. NOT core * stride.
+# u50_hbm_stack.sv's AXI-port wiring, core -> controller. NOT core * stride.
 ALVEO_CORE_MC_ORDER = (0, 2, 4, 3, 1, 7, 6, 5)
 
 ALVEO_U55C_MC_STRIDE = 0x4000_0000          # U55C: one controller, two segments
@@ -570,8 +571,8 @@ ALVEO_U55C_CORE_BASES = tuple(
     for core in range(ALVEO_U55C_BOARD_CORES)
 )
 
-# Dual-stack U55C (16 GiB): build_alveo_u55c.tcl connects each engine to the
-# same SAXI port on both stacks. Native address bit 33 selects the stack and
+# Dual-stack U55C (16 GiB): u55c_hbm_stack.sv connects each engine to the
+# same AXI port on both stacks. Native address bit 33 selects the stack and
 # bits [32:30] select the MC. No software or hardware address permutation.
 # Give each engine one whole 1 GiB (stack, MC) region. Alternate stacks for
 # cores 0..7; cores 8..11 use the opposite stack from their MC partner 0..3.
@@ -660,8 +661,8 @@ def is_alveo_u55c() -> bool:
 #
 # A U50 engine's 1 GiB is NOT ONE CONTIGUOUS RANGE, and that is the point of
 # EngineWindow. The board has two 4 GiB stacks and each engine has its own
-# dedicated SAXI port on BOTH (``SAXI_xx`` on hbm_0, ``SAXI_xx_RT`` on hbm_1,
-# see build_alveo.tcl:908-938). The 512 MB region an engine owns outright on
+# dedicated AXI port on BOTH (``AXI_xx`` on u50_hbm_l and u50_hbm_r, see
+# Vivado/hdl/board/u50_hbm_stack.sv). The 512 MB region an engine owns outright on
 # each stack is therefore the SAME controller offset 4 GiB apart, so its
 # private DRAM is two segments: ``B`` and ``B + 0x1_0000_0000``. Splicing them
 # into one 1 GiB range is impossible -- the addresses in between belong to
@@ -1114,7 +1115,7 @@ def tiled_window_bases(num_engines: int, window_bytes: int, what: str) -> list[i
     # bitstream does not actually map does not fault -- the upper windows alias
     # the lower ones and four cores silently scribble over the other four's
     # weights. The U50 shipped exactly that combination for a while: HW_INFO
-    # said 4 GiB and build_alveo.tcl mapped a single stack.
+    # said 4 GiB and the bitstream mapped a single stack.
     if os.environ.get("UE_FORCE_DRAM_SIZE_GB"):
         raise ValueError(
             f"{what}: windows that tile the whole device must be backed by DRAM "
