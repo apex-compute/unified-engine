@@ -284,15 +284,32 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
       - Per-KV-head flash attention (8 KV heads x 128 dim); group_size=2.
     """
 
-    def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None, is_efinix: bool = False):
+    def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None, is_efinix: bool = False,
+                 engines: int = 1):
         # Qwen3 DRAM layout starting from 0x00000000 (4 GB DRAM):
         #   params: 0x00000000 – 0x58000000 (~1.4 GB, covers layers + LM_HEAD + ROPE)
         #   tensors: 0x58000000 – 0x98000000 (~1 GB, intermediates + KV cache)
         #   instructions: 0x98000000 – 0xA0000000 (128 MB)
+        # With --engines N > 1 the whole map is rebased by model_base (the
+        # private per-engine shard windows occupy the low addresses); for
+        # engines == 1, model_base is 0 and the literals above are unchanged.
+        self.engines = int(engines)
+        if self.engines < 1:
+            raise ValueError("engines must be at least 1")
+        self._model_base = 0
+        self._board_windows = None
+        self.shard_group = None
+        self.controller_decoder = None
+        self.sharded_weights = {}
+        if self.engines > 1:
+            from multi_engine_shard import model_multicore_layout
+            self._board_windows, self._model_base = model_multicore_layout(
+                self.engines, model_bytes=4 << 30, preferred_model_base=4 << 30)
+        self._program_base = self._model_base + 0xE0000000
         super().__init__(
-            params_dram_base=0x00000000,
-            tensor_dram_base=0x58000000,
-            program_dram_base=0xE0000000,
+            params_dram_base=self._model_base + 0x00000000,
+            tensor_dram_base=self._model_base + 0x58000000,
+            program_dram_base=self._program_base,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self._cfg = _load_config(self.script_dir)
@@ -349,6 +366,55 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             self.weight_bin = f.read()
         self.weight_init()
         self.tensor_init()
+        self.setup_multi_core()
+
+    def setup_multi_core(self) -> None:
+        """Copy output-column shards of the decode projections to the private
+        per-engine windows (controller-sharded M=1 decode). No-op for engines == 1."""
+        if self.engines == 1 or self.shard_group is not None:
+            return
+        from multi_engine_decode import ControllerShardedDecoder
+        self.controller_decoder = ControllerShardedDecoder(
+            self, self.engines, self._board_windows)
+        self.shard_group = self.controller_decoder.scheduler
+        # The bf16 last layer (QWEN3_L27_BF16) goes through matmat_mul_core and is
+        # never sharded; only the IF4 layers are registered. Registered sources are
+        # exactly _matmul_b_kwargs(layer, proj) for layer < layers (LAYER_WEIGHT_SIZE stride).
+        layers = self.LAYER_SIZE - int(bool(self._last_layer_bf16_addrs))
+        for proj, k, n in (
+                ("q", self.vector_length, self.head_dim * self.group_size),
+                ("k", self.vector_length, self.head_dim),
+                ("v", self.vector_length, self.head_dim),
+                ("o", self.head_dim * self.group_size, self.vector_length),
+                ("gate", self.vector_length, self.mlp_elements),
+                ("up", self.vector_length, self.mlp_elements),
+                ("down", self.mlp_elements, self.vector_length)):
+            source = self._matmul_b_kwargs(0, proj)
+            self.sharded_weights[proj] = self.controller_decoder.add_weight(
+                name=proj, main_weight_addr=source["B_DRAM_ADDR"],
+                main_scale_addr=source["SCALE_DRAM_ADDR"], K=k, N=n,
+                layers=layers, main_layer_stride=self.weight_defs["LAYER_WEIGHT_SIZE"],
+                data_type=TYPE.IF4)
+        self.sharded_weights["lm_head"] = self.controller_decoder.add_weight(
+            name="lm_head", main_weight_addr=self.DRAM_ADDR_LM_HEAD_QUANT,
+            main_scale_addr=self.DRAM_ADDR_LM_HEAD_SCALE,
+            K=self.vector_length, N=self.EMBEDDING_ELEMENTS, layers=1,
+            main_layer_stride=0, data_type=TYPE.IF4)
+        self.shard_group.verify_private_space()
+
+    def instruction_paths(self) -> tuple[str, str]:
+        """(programs.bin, programs.json) paths. Multi-engine compiles use a
+        ``_mc{N}`` tagged pair so the shared single-engine cache is never
+        read or overwritten by a sharded build."""
+        paths_cfg = self._cfg.get("paths", {})
+        bin_rel  = paths_cfg.get("instruction_bin",  "qwen3_1.7b_bin/programs.bin")
+        meta_rel = paths_cfg.get("instruction_meta", "qwen3_1.7b_bin/programs.json")
+        tag = f"_mc{self.engines}" if self.engines > 1 else ""
+        result = []
+        for rel in (bin_rel, meta_rel):
+            stem, ext = os.path.splitext(rel)
+            result.append(os.path.join(self.script_dir, stem + tag + ext))
+        return tuple(result)
 
     # ---- On-FPGA repetition penalty (the sole decode path; no host sampling) ----
     # The penalty is folded into the LM-head matmul as its per-vocab additive C bias
@@ -502,6 +568,15 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         """
         b = self._matmul_b_kwargs(layer_idx, proj)
         if b.get("is_B_quantized") and K <= SCALE_BRAM_ELEMENTS:
+            if self.controller_decoder is not None:
+                # Column-sharded across engines (returns None for an unregistered weight).
+                sharded_flops = self.controller_decoder.projection(
+                    M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR,
+                    B_DRAM_ADDR=b["B_DRAM_ADDR"], OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+                    SCALE_DRAM_ADDR=b["SCALE_DRAM_ADDR"], data_type=b["data_type"],
+                    **extras)
+                if sharded_flops is not None:
+                    return sharded_flops
             # Fused: kernel streams IF4 + scales through the dot-product pipeline.
             # M is static (M=1 in decode); quantized_matmat_core has no PBI variant.
             self.quantized_matmat_core(
@@ -1302,12 +1377,23 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             # write_back_disable=True: greedy/argmax needs no 304 KB LOGITS_DRAM writeback
             # (no host logit readback at all). The bias buffer is zero pre-gate / in
             # --pure-greedy, so the same bin serves plain greedy and penalty.
-            total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
-                A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, gpr_M_reg=gpr_one,
-                C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
-                write_back_disable=True) or 0)
+            if self.controller_decoder is not None:
+                # Column-sharded LM head: projection() forces writeback ON so
+                # global_argmax can read each engine's candidate from LOGITS_DRAM.
+                total_flops += (self.controller_decoder.projection(
+                    M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT,
+                    OUTPUT_DRAM_ADDR=self.LOGITS_DRAM, data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE,
+                    C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
+                    write_back_disable=True) or 0)
+            else:
+                total_flops += (self.matmat_mul_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+                    A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
+                    is_B_quantized=True, data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, gpr_M_reg=gpr_one,
+                    C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N",
+                    write_back_disable=True) or 0)
 
         # Advance gpr_seq_len for next decode step (matches gemma3 convention).
         # Host preamble primes only gpr_aligned_seq_len between steps; gpr_seq_len carries
@@ -1347,11 +1433,7 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         if layer_size is None:
             layer_size = self.LAYER_SIZE
 
-        paths_cfg = self._cfg.get("paths", {})
-        bin_rel  = paths_cfg.get("instruction_bin",  "qwen3_1.7b_bin/programs.bin")
-        meta_rel = paths_cfg.get("instruction_meta", "qwen3_1.7b_bin/programs.json")
-        bin_path  = os.path.join(self.script_dir, bin_rel)
-        meta_path = os.path.join(self.script_dir, meta_rel)
+        bin_path, meta_path = self.instruction_paths()
 
         # The decode LM head is uniform now: write_back_disable=True + the penalty C bias
         # (PENALTY_BIAS_DRAM). Penalty vs --pure-greedy differ only in the runtime bias
@@ -1365,7 +1447,9 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         # fixed addresses every invocation, so loading the bin off disk is otherwise
         # sufficient. A bin from an older build (missing/different key) is recompiled.
         bin_cached = os.path.exists(bin_path) and os.path.exists(meta_path)
-        if bin_cached:
+        # Worker images are emitted and uploaded together with the primary. A
+        # cached primary alone cannot reconstruct them, so multi-engine recompiles.
+        if bin_cached and self.controller_decoder is None:
             with open(meta_path, "r") as f:
                 meta = json.load(f)
             if meta.get("lm_head_sig") == lm_head_sig:
@@ -1395,7 +1479,18 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
 
         _original_print(f"  Compiling decoder ({layer_size} layers)...")
         decoder_count_at_start = self.capture_count
-        decoder_flops = self._emit_decoder_program(layer_size=layer_size)
+        try:
+            if self.controller_decoder is not None:
+                self.controller_decoder.begin()
+            decoder_flops = self._emit_decoder_program(layer_size=layer_size)
+            if self.controller_decoder is not None:
+                self.controller_decoder.finalize()
+        except Exception:
+            if self.shard_group is not None:
+                self.shard_group.abort_program()
+            self.stop_capture()
+            _SILENT_MODE = False
+            raise
         decoder_program_size = (self.capture_count - decoder_count_at_start) * 32
 
         self.stop_capture()
@@ -1517,6 +1612,9 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
         if _use_status:
             _status_setup()
 
+        # --max-new-tokens: 0/None = decode until a stop token or the context limit.
+        max_new_tokens = int(getattr(self, "max_new_tokens", None) or 0)
+        decoded_new_tokens = 0
         while self.seq_len < max_seq_len:
             _SILENT_MODE = True
             # self.seq_len at entry is the count of K/V already in cache; the
@@ -1551,21 +1649,32 @@ class Qwen3_1_7b_UnifiedEngine(UnifiedEngine):
             if _fpga_penalty and (len(self._generated_tokens) - _prompt_len) > _greedy_until:
                 self._write_penalty_bias(self._generated_tokens)
 
+            if self.controller_decoder is not None:
+                self.controller_decoder.start()
             self.program_execute(preamble_addr, timeout=10.0, flops=gflops_per_token)
+            if self.controller_decoder is not None:
+                self.controller_decoder.wait()
             # Token selection: read the HW argmax register. The LM-head matmul already added
             # the penalty bias on chip, so the register holds the penalized token id (or pure
             # greedy when the bias is zero). No host logit readback.
-            token_id = self.get_arg_max_index()
+            token_id = (self.controller_decoder.global_argmax("lm_head", self.LOGITS_DRAM)
+                        if self.controller_decoder is not None else self.get_arg_max_index())
             self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
             self.seq_len += 1
+            decoded_new_tokens += 1
             if token_id in _qwen3_stop_tokens:
                 if _use_status:
                     _status_teardown()
                 print(f"\nStop token {token_id} reached.")
                 break
             print(token_char, end="", flush=True)
+            if max_new_tokens > 0 and decoded_new_tokens >= max_new_tokens:
+                if _use_status:
+                    _status_teardown()
+                print(f"\nMaximum new-token limit ({max_new_tokens}) reached.")
+                break
             if _use_status:
                 _status_update()
         else:
@@ -1604,7 +1713,17 @@ def main():
     pen_group.add_argument('--rep-window', type=int, default=256,
                         help='count tokens over the last N (never penalizes punctuation/whitespace/'
                              'special tokens). Default 256.')
+    parser.add_argument('--engines', type=int, default=1,
+                        help='Number of engines (1..8) for column-sharded decode. Prefill stays '
+                             'single-engine. Default 1 (unchanged single-engine path).')
+    parser.add_argument('--max-new-tokens', type=int, default=None,
+                        help='Stop after N decoded tokens. Default: decode until a stop token '
+                             'or the context limit.')
     args = parser.parse_args()
+    if args.engines < 1:
+        raise SystemExit("--engines must be >= 1")
+    if args.device == "efinix" and args.engines > 1:
+        raise SystemExit("--engines > 1 is not supported on the efinix device profile")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if args.local_weights:
@@ -1627,7 +1746,18 @@ def main():
     print(f"  USER: {DMA_DEVICE_USER}")
     print(f"Setting CLOCK_CYCLE_TIME_NS = {user_dma_core.CLOCK_CYCLE_TIME_NS}, UE_PEAK_GFLOPS = {user_dma_core.UE_PEAK_GFLOPS:.4f}")
 
-    ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel, is_efinix=(args.device == "efinix"))
+    if args.engines > 1:
+        # Clear every participating queue before loading model or private weights.
+        from multi_engine_decode import reset_engine_queues
+        available = user_dma_core.ANDROMEDA_CORE_COUNT
+        if not isinstance(available, int) or args.engines > available:
+            raise SystemExit(f"--engines {args.engines} requested but HW_INFO reports "
+                             f"{available} core(s)")
+        reset_engine_queues(args.engines)
+
+    ue = Qwen3_1_7b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel, is_efinix=(args.device == "efinix"),
+                                  engines=args.engines)
+    ue.max_new_tokens = args.max_new_tokens
     cfg = _load_config(script_dir)
     # Always tokenize via apply_chat_template — no hardcoded ids in the config.
     user_prompt = args.prompt if args.prompt is not None else cfg.get("default_prompt", "What is 3 + 5?")
@@ -1661,9 +1791,7 @@ def main():
     inst_meta = ue.compile_instructions()
     print(f"  compile_instructions done in {time.perf_counter() - timer:.2f}s")
 
-    paths_cfg = cfg.get("paths", {})
-    inst_bin_path = os.path.join(script_dir, paths_cfg.get("instruction_bin",
-                                  "qwen3_1.7b_bin/programs.bin"))
+    inst_bin_path, _ = ue.instruction_paths()
     base_addr, _ = ue.load_program_instructions_from_file(inst_bin_path)
     # Reserve a slot AFTER the loaded bin for the runtime preamble. Prefill preamble
     # is 4 instructions (3 ADD_SET + JUMP_ABS) = 128 B; decode preamble is 2 instructions
@@ -1700,6 +1828,7 @@ def main():
     decoded_tokens = max(token_cnt_decoded - len(prefill_seq) + 1, 1)
     print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, "
           f"speed: {decoded_tokens / latency_decoder:.2f} tokens/s, total {token_cnt_decoded} tokens.")
+    print(f"Engines: {args.engines}")
     print("Qwen3-1.7B test ends.")
 
 if __name__ == "__main__":
