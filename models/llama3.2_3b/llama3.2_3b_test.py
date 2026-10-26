@@ -26,6 +26,7 @@ Usage:
   python llama3.2_3b_test.py --prompt "your prompt"
   python llama3.2_3b_test.py --dev xdma0 [--cycle 5.15]
   python llama3.2_3b_test.py --local-weights
+  python llama3.2_3b_test.py --engines 8          # column-sharded decode on 8 engines
 """
 
 import json
@@ -291,18 +292,34 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
       - LM head weight tied to input embedding.
     """
 
-    def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None):
+    def __init__(self, script_dir: str | None = None, hf_model_dir: str | None = None, weights_bin: str | None = None,
+                 engines: int = 1):
         # Full 4 GB DRAM layout (mirrors qwen3_1.7b): the default split reserves only
         # 512 MB for the tensor region, which overflows at max_context_size=4096
         # (attention + activation buffers in tensor_init scale with context). The
-        # tensor region here is 0x58000000..0xE0000000 = 2.25 GB.
-        #   params : 0x00000000 .. 0x58000000  (1.375 GB)  weights + host RoPE
-        #   tensor : 0x58000000 .. 0xE0000000  (2.25 GB)   activations + KV cache
+        # tensor region here is 0x70000000..0xE0000000 = 1.75 GB.
+        #   params : 0x00000000 .. 0x70000000  (1.75 GB)   weights + host RoPE
+        #   tensor : 0x70000000 .. 0xE0000000  (1.75 GB)   activations + KV cache
         #   program: 0xE0000000 .. 0x100000000 (512 MB)    unified instruction bin
+        # With --engines N > 1 the whole map is rebased by model_base (the private
+        # per-engine shard windows occupy the low addresses); for engines == 1,
+        # model_base is 0 and the literals above are unchanged.
+        self.engines = int(engines)
+        if self.engines < 1:
+            raise ValueError("engines must be at least 1")
+        self._model_base = 0
+        self._board_windows = None
+        self.shard_group = None
+        self.controller_decoder = None
+        self.sharded_weights = {}
+        if self.engines > 1:
+            from multi_engine_shard import model_multicore_layout
+            self._board_windows, self._model_base = model_multicore_layout(
+                self.engines, model_bytes=4 << 30, preferred_model_base=4 << 30)
         super().__init__(
-            params_dram_base=0x00000000,
-            tensor_dram_base=0x70000000,
-            program_dram_base=0xE0000000,
+            params_dram_base=self._model_base + 0x00000000,
+            tensor_dram_base=self._model_base + 0x70000000,
+            program_dram_base=self._model_base + 0xE0000000,
         )
         self.script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
         self._cfg = _load_config(self.script_dir)
@@ -358,6 +375,67 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
             self.weight_bin = f.read()
         self.weight_init()
         self.tensor_init()
+        self.setup_multi_core()
+
+    def setup_multi_core(self) -> None:
+        """Copy output-column shards of the decode projections to the private
+        per-engine windows (controller-sharded M=1 decode). No-op for engines == 1."""
+        if self.engines == 1 or self.shard_group is not None:
+            return
+        from multi_engine_decode import ControllerShardedDecoder
+        self.controller_decoder = ControllerShardedDecoder(
+            self, self.engines, self._board_windows)
+        self.shard_group = self.controller_decoder.scheduler
+        # Registered sources are exactly DRAM_ADDR_LAYER0_<proj>_QUANT + layer_idx *
+        # LAYER_WEIGHT_SIZE, the B_DRAM_ADDR values _compile_decoder_program passes.
+        # Scales live inside the same per-layer block, so they share that stride.
+        stride = self.weight_defs["LAYER_WEIGHT_SIZE"]
+        for name, prefix, k, n in (
+                ("q_proj", "Q_PROJ", self.vector_length, self.head_dim * self.group_size),
+                ("k_proj", "K_PROJ", self.vector_length, self.head_dim),
+                ("v_proj", "V_PROJ", self.vector_length, self.head_dim),
+                ("attn_proj", "ATTN_PROJ", self.head_dim * self.group_size, self.vector_length),
+                ("mlp_gate", "MLP_GATE", self.vector_length, self.mlp_elements),
+                ("mlp_up", "MLP_UP", self.vector_length, self.mlp_elements),
+                ("mlp_down", "MLP_DOWN", self.mlp_elements, self.vector_length)):
+            self.sharded_weights[name] = self.controller_decoder.add_weight(
+                name=name,
+                main_weight_addr=getattr(self, f"DRAM_ADDR_LAYER0_{prefix}_QUANT"),
+                main_scale_addr=getattr(self, f"DRAM_ADDR_LAYER0_{prefix}_SCALE"),
+                K=k, N=n, layers=self.LAYER_SIZE, main_layer_stride=stride,
+                data_type=TYPE.IF4)
+        self.sharded_weights["lm_head"] = self.controller_decoder.add_weight(
+            name="lm_head", main_weight_addr=self.DRAM_ADDR_LM_HEAD_QUANT,
+            main_scale_addr=self.DRAM_ADDR_LM_HEAD_SCALE,
+            K=self.vector_length, N=self.EMBEDDING_ELEMENTS, layers=1,
+            main_layer_stride=0, data_type=TYPE.IF4)
+        self.shard_group.verify_private_space()
+
+    def instruction_paths(self) -> tuple[str, str]:
+        """(programs.bin, programs.json) paths. The on-FPGA penalty bin carries the
+        ``_fpgapenalty`` tag (bias on / writeback off); multi-engine compiles add a
+        ``_mc{N}`` tag so the shared single-engine cache is never read or overwritten."""
+        paths_cfg = self._cfg.get("paths", {})
+        bin_rel = paths_cfg.get("instruction_bin", "llama3.2_3b_bin/programs.bin")
+        meta_rel = paths_cfg.get("instruction_meta", "llama3.2_3b_bin/programs.json")
+        tag = "_fpgapenalty" if bool(getattr(self, "fpga_penalty", False)) else ""
+        if self.engines > 1:
+            tag += f"_mc{self.engines}"
+        result = []
+        for rel in (bin_rel, meta_rel):
+            stem, ext = os.path.splitext(rel)
+            result.append(os.path.join(self.script_dir, stem + tag + ext))
+        return tuple(result)
+
+    def decoder_projection_core(self, **kwargs) -> int:
+        """Decode-only M=1 IF4 projection. With --engines N > 1 a registered weight
+        is column-sharded across the engines by ControllerShardedDecoder; otherwise
+        (or for an unregistered weight) it is the plain quantized_matmat_core call."""
+        if self.controller_decoder is not None:
+            sharded = self.controller_decoder.projection(**kwargs)
+            if sharded is not None:
+                return sharded
+        return self.quantized_matmat_core(**kwargs)
 
     def get_embedding_for_tokens(self, token_ids: list[int] | tuple) -> torch.Tensor:
         """Return (len(token_ids), vector_length) bfloat16 tensor from self.embedding_weight (HF, scale applied)."""
@@ -785,13 +863,13 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
                     self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_INPUT_DRAM, element_size=self.vector_length)
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_INPUT_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_PRE_NORM_GAMMA + layer_off)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim * self.group_size,
+                total_flops += self.decoder_projection_core(M=1, K=self.vector_length, N=self.head_dim * self.group_size,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim,
+                total_flops += self.decoder_projection_core(M=1, K=self.vector_length, N=self.head_dim,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.head_dim,
+                total_flops += self.decoder_projection_core(M=1, K=self.vector_length, N=self.head_dim,
                     A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_FLASH_V_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
 
@@ -906,7 +984,7 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
                         self.LAYER0_FLASH_OUT_HEAD_DRAM, 0x40000, qpkv * ahd)
                     self.sram_to_accelerator_memory(
                         0x40000, self.LAYER0_FLASH_OUTPUT_DRAM + kv_h * qpkv * ahd * bpe, qpkv * ahd)
-                total_flops += self.quantized_matmat_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
+                total_flops += self.decoder_projection_core(M=1, K=self.head_dim * self.group_size, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE + layer_off, data_type=TYPE.IF4)
 
@@ -920,10 +998,10 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
                 total_flops += self.rms_norm_core_dram(M=1, N=self.vector_length, A_DRAM_ADDR=self.LAYER0_POST_ATTN_RESIDUAL_DRAM,
                               OUTPUT_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_FFN_NORM_GAMMA + layer_off)
 
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
+                total_flops += self.decoder_projection_core(M=1, K=self.vector_length, N=self.mlp_elements,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE + layer_off, data_type=TYPE.IF4, silu_enable=True)
-                total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.mlp_elements,
+                total_flops += self.decoder_projection_core(M=1, K=self.vector_length, N=self.mlp_elements,
                     A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE + layer_off, data_type=TYPE.IF4)
 
@@ -932,7 +1010,7 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
                 self.eltwise_mul_core(vector_A_sram_start_addr=0x10000, vector_B_sram_start_addr=0x90000, vector_C_sram_wb_addr=0x10000, element_size=self.mlp_elements)
                 self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=self.LAYER0_MLP_MULT_DRAM, element_size=self.mlp_elements)
 
-                total_flops += self.quantized_matmat_core(M=1, K=self.mlp_elements, N=self.vector_length,
+                total_flops += self.decoder_projection_core(M=1, K=self.mlp_elements, N=self.vector_length,
                     A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT + layer_off, OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
                     SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE + layer_off, data_type=TYPE.IF4)
 
@@ -947,7 +1025,7 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
                 OUTPUT_DRAM_ADDR=self.OUTPUT_NORM_DRAM, GAMMA_DRAM_ADDR=self.DRAM_ADDR_OUTPUT_NORM_GAMMA)
             penalty_kwargs = dict(C_DRAM_ADDR=self.PENALTY_BIAS_DRAM, bias_mode="broadcast_N") \
                 if bool(getattr(self, "fpga_penalty", False)) else {}
-            total_flops += self.quantized_matmat_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
+            total_flops += self.decoder_projection_core(M=1, K=self.vector_length, N=self.EMBEDDING_ELEMENTS,
                 A_DRAM_ADDR=self.OUTPUT_NORM_DRAM, B_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_QUANT, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
                 SCALE_DRAM_ADDR=self.DRAM_ADDR_LM_HEAD_SCALE, data_type=TYPE.IF4,
                 write_back_disable=True, **penalty_kwargs)
@@ -972,17 +1050,17 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         """
         if layer_size is None:
             layer_size = self.LAYER_SIZE
-        paths_cfg = self._cfg.get("paths", {})
-        instruction_bin_path = os.path.join(self.script_dir, paths_cfg.get("instruction_bin", "llama3.2_3b_bin/programs.bin"))
-        instruction_meta_path = os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_3b_bin/programs.json"))
+        # On-FPGA penalty changes the LM-head matmul (bias on / writeback off) → a different bin.
+        # instruction_paths() keeps it in a separate _fpgapenalty cache file so it never clobbers
+        # the host-path bin (run_from_bin loads the same), plus an _mc{N} tag when sharded.
+        instruction_bin_path, instruction_meta_path = self.instruction_paths()
         if bool(getattr(self, "fpga_penalty", False)):
-            # On-FPGA penalty changes the LM-head matmul (bias on / writeback off) → a different bin.
-            # Separate cache file so it never clobbers the host-path bin. run_from_bin loads the same.
-            instruction_bin_path = instruction_bin_path.replace(".bin", "_fpgapenalty.bin")
-            instruction_meta_path = instruction_meta_path.replace(".json", "_fpgapenalty.json")
             self._instruction_bin_path = instruction_bin_path
             self._instruction_meta_path = instruction_meta_path
-        if os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path):
+        # Worker images are emitted and uploaded together with the primary. A cached
+        # primary alone cannot reconstruct them, so multi-engine always recompiles.
+        if (os.path.exists(instruction_bin_path) and os.path.exists(instruction_meta_path)
+                and self.controller_decoder is None):
             print(f"Reusing existing instruction image at {instruction_bin_path}")
             print(f"  delete {instruction_bin_path} to force recompile.")
             return
@@ -1003,7 +1081,19 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
 
         print("Compiling decoder...")
         t0 = time.perf_counter()
-        decoder_prog = self._compile_decoder_program(layer_size=layer_size)
+        global _SILENT_MODE
+        try:
+            if self.controller_decoder is not None:
+                self.controller_decoder.begin()
+            decoder_prog = self._compile_decoder_program(layer_size=layer_size)
+            if self.controller_decoder is not None:
+                self.controller_decoder.finalize()
+        except Exception:
+            if self.shard_group is not None:
+                self.shard_group.abort_program()
+            self.stop_capture()
+            _SILENT_MODE = False
+            raise
         print(f"  decoder compiled: {decoder_prog['program_size_bytes']} bytes, {time.perf_counter() - t0:.1f}s")
 
         self.stop_capture()
@@ -1092,11 +1182,9 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         Primes GPRs via a small captured preamble that jumps into the cached
         prefill or decoder program at runtime.
         """
-        paths_cfg = self._cfg.get("paths", {})
-        # When fpga_penalty, compile_llama set _instruction_meta_path to the _fpgapenalty meta — use
-        # it so we load the bias bin (whose meta's instruction_bin points to the _fpgapenalty bin).
-        meta_path = getattr(self, "_instruction_meta_path", None) or \
-            os.path.join(self.script_dir, paths_cfg.get("instruction_meta", "llama3.2_3b_bin/programs.json"))
+        # instruction_paths() selects the _fpgapenalty meta when fpga_penalty (its instruction_bin
+        # points to the bias bin) and the _mc{N} pair when sharded.
+        _, meta_path = self.instruction_paths()
         with open(meta_path, "r") as f:
             meta = json.load(f)
 
@@ -1208,6 +1296,8 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         if _use_status:
             _status_setup()
 
+        # --max-new-tokens: 0/None = decode until a stop token or the context limit.
+        max_new_tokens = int(getattr(self, "max_new_tokens", None) or 0)
         while self.seq_len < self.MAX_CONTEXT_SIZE:
             _SILENT_MODE = True
             self.seq_len += 1
@@ -1243,12 +1333,18 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
             if _fpga_penalty and (self.seq_len - prefill_seq_len) > _greedy_until:
                 self._write_penalty_bias(self._generated_tokens)
 
+            if self.controller_decoder is not None:
+                self.controller_decoder.start()
             self.program_execute(preamble_addr, flops=decoder_flops_per_token)
+            if self.controller_decoder is not None:
+                self.controller_decoder.wait()
             # Token selection: read the HW argmax register. In penalty mode the LM-head matmul
             # already added the bias, so the register holds the penalized token; in plain mode it's
             # pure greedy. No logit readback. (The compare/calibration tool overrides
             # get_arg_max_index to apply a host-side penalty against the writeback-on plain bin.)
-            token_id = self.get_arg_max_index(rank=1)
+            # Sharded: each engine wrote its LM-head column slice to LOGITS_DRAM; reduce their argmaxes.
+            token_id = (self.controller_decoder.global_argmax("lm_head", self.LOGITS_DRAM)
+                        if self.controller_decoder is not None else self.get_arg_max_index(rank=1))
             self._generated_tokens.append(token_id)
             token_char = self.tokenizer.decode([token_id])
             _SILENT_MODE = False
@@ -1258,6 +1354,11 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
                 print(f"\nStop token {token_id} reached.")
                 break
             print(token_char, end="", flush=True)
+            if max_new_tokens > 0 and (self.seq_len - prefill_seq_len) >= max_new_tokens:
+                if _use_status:
+                    _status_teardown()
+                print(f"\nMaximum new-token limit ({max_new_tokens}) reached.")
+                break
             if _use_status:
                 _status_update()
         else:
@@ -1269,6 +1370,7 @@ class Llama32_3b_UnifiedEngine(UnifiedEngine):
         print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, "
               f"speed: {tokens_decoded / latency_decoder:.2f} tokens/s, "
               f"total {self.seq_len} tokens.")
+        print(f"Engines: {self.engines}")
 
 # -----------------------------------------------------------------------------
 # Main
@@ -1302,7 +1404,17 @@ def main():
     pen_group.add_argument('--rep-window', type=int, default=256,
                         help='count tokens over the last N (never penalizes punctuation/whitespace/'
                              'special tokens). Default 256. Validated 3B params: see notes_repetition_penalty_fpga_bias.md.')
+    parser.add_argument('--engines', type=int, default=1,
+                        help='Number of engines (1..8) for column-sharded decode. Prefill stays '
+                             'single-engine. Default 1 (unchanged single-engine path).')
+    parser.add_argument('--max-new-tokens', type=int, default=None,
+                        help='Stop after N decoded tokens. Default: decode until a stop token '
+                             'or the context limit.')
     args = parser.parse_args()
+    if args.engines < 1:
+        raise SystemExit("--engines must be >= 1")
+    if args.device == "efinix" and args.engines > 1:
+        raise SystemExit("--engines > 1 is not supported on the efinix device profile")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if args.local_weights:
@@ -1323,7 +1435,17 @@ def main():
     print(f"FPGA profile: device={args.device}")
     print(user_dma_core.hardware_info_summary())
 
-    ue = Llama32_3b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel)
+    if args.engines > 1:
+        # Clear every participating queue before loading model or private weights.
+        from multi_engine_decode import reset_engine_queues
+        available = user_dma_core.ANDROMEDA_CORE_COUNT
+        if not isinstance(available, int) or args.engines > available:
+            raise SystemExit(f"--engines {args.engines} requested but HW_INFO reports "
+                             f"{available} core(s)")
+        reset_engine_queues(args.engines)
+
+    ue = Llama32_3b_UnifiedEngine(script_dir=script_dir, weights_bin=weights_bin_rel, engines=args.engines)
+    ue.max_new_tokens = args.max_new_tokens
     cfg = _load_config(script_dir)
 
     if args.prompt is not None:
