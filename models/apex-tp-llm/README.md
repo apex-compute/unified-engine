@@ -31,7 +31,7 @@
 6. [Usage](#usage)
 7. [Repository layout](#repository-layout)
 8. [Technical details](docs/TECHNICAL.md)
-9. [Findings: what the measurements taught us](docs/FINDINGS.md) (incl. how Gemma 4 is sliced, compiled and pipelined)
+9. [Findings: what the measurements taught us](docs/FINDINGS.md) (incl. how Gemma 4 is sliced, compiled and pipelined, and object detection next to it)
 
 ---
 
@@ -438,8 +438,28 @@ Patch for [aptop](https://github.com/celikomer/aptop), an nvtop-like monitor for
 | `tools/test_gemma4_vision.py` | Gemma 4 image encoder on one engine against a torch emulation of the same IF8 weights |
 | `tools/test_gemma4_block.py` | Gemma 4 image block: every segment against a reference with the model's masks (sliding: window + whole image) |
 | `tools/vision_tp_check.py` | Tensor-parallel encoder output (saved by `gemma4_tp.py --image`) against the emulation |
+| `yolo26/test_yolo26.py` | YOLO26s-OBB on one engine, standalone: boxes on an image and the card time |
+| `yolo26/debug_yolo26.py` | YOLO26s-OBB operation by operation against the float graph (chain and local SNR) |
+| `tools/test_yolo26_load.py`, `tools/test_yolo26_chat.py` | Detection frames through the OllApeX API while Gemma generates; the chat about a detection result |
 | `tools/download_models.py` | Downloads the Hugging Face checkpoints into the places the slicing scripts read |
 | `run_tp.py --eval-file` | Teacher-forced top‑1 accuracy on the cards |
+
+### 9. Object detection: YOLO26s-OBB next to Gemma 4
+
+YOLO26s-OBB (oriented boxes, the 15 DOTA classes: plane, ship, storage tank, harbor, bridge, large / small vehicle, helicopter, …) runs on all 10 engines while Gemma 4 26B-A4B is loaded, each engine with its own copy in the memory the language model leaves free. Method and measurements: [docs/FINDINGS.md §10](docs/FINDINGS.md#10-object-detection-next-to-gemma-4-yolo26s-obb-on-the-same-cards).
+
+- **Compiler** (`yolo26/yolo26_card.py`): lowers the pretrained network onto the vendor's CONV2D / MAXPOOL opcodes and YOLOv5 emitters (`models/yolov5s`), with the attention block as matmuls and a fused softmax, a 2 × 2 space-to-depth input, IF8 weights, and relocatable addresses. The program is cut into ~4 ms halt-terminated units.
+- **Build per engine** (`yolo26/yolo26_build.py`): at Gemma 4 load, for the free weight and tensor ranges of each engine; cached in `yolo26/cache/`, so only the first load compiles.
+- **Frame bus** (`yolo26/yolo26_bus.py`): 16 shared-memory frame slots between the web server, the driver and the card processes, plus the host's letterbox, packing, box decoding and a video tracker.
+- **Runtime:** `gemma4/gemma4_tp.py` command `SEG_YOLO` runs units on both engines of a card. `ollapex/ollapex_gemma4.py` gives camera frames 20 ms after every Gemma token; uploaded images and videos run before the next chat command.
+- **Detection page** (`ollapex/ollapex_yolo.py`, `ollapex/static/yolo.html`, at `/yolo`): image, video and webcam, with a chat that asks Gemma 4 about the result.
+
+| | Result |
+|---|---|
+| One 640-px frame, one engine | 3.15 s |
+| 10 engines, Gemma idle | 2.56 frames/s |
+| While Gemma generates | 2.19 frames/s, Gemma 12.1 tok/s, identical greedy answer |
+| Memory per engine | 52.2 MB weights + program, 35.5 MB tensors |
 
 ---
 
@@ -534,6 +554,17 @@ EMB_WORK=$APEX_TP_WORK/models/q35_9b     TPDIR=tp10fp4 python tools/slice_embed.
 EMB_WORK=$APEX_TP_WORK/models/q38_27b    TPDIR=tp10fp4 python tools/slice_embed8.py   # IF8: bf16 does not fit next to the 27B weights
 ```
 
+Object detection next to Gemma 4 (optional): a separate environment for the build step (torch and ultralytics are used at load time to read the checkpoint and compile it, never to run it), and the pretrained weights.
+
+```bash
+python3 -m venv yolo26/env
+yolo26/env/bin/python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+yolo26/env/bin/python -m pip install ultralytics imageio-ffmpeg
+wget -P yolo26 https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26s-obb.pt
+```
+
+OllApeX turns it on by itself when `yolo26/env` and the weights exist: loading Gemma 4 then builds one detector per engine (~240 s the first time, ~168 s after that). Without them Gemma 4 loads as before, without the detector.
+
 ### 5. OllApeX service
 
 ```bash
@@ -553,6 +584,16 @@ The interface is at `http://<host>:3000`.
 Pick **gpt-oss:20b**, **gemma4:26b**, **qwen3.5:9b** or **qwen3.8:27b** from the model menu. A model is loaded onto the cards the first time it is chosen: about 40 s for GPT‑OSS, about 2.5 minutes for Gemma 4 with its image encoder, about 1.5–2 minutes for the 27B model.
 
 To ask about an image, attach it with **Attach file** and pick the **Image detail** (Gemma 4: low / medium / high = up to 70 / 140 / 280 tokens). The image is encoded once per detail level; follow-up questions reuse it.
+
+### Object detection
+
+With Gemma 4 loaded, open `http://<host>:3000/yolo` (or **YOLO** in the chat page header):
+- **Image:** upload an image; oriented boxes, counts per class and a region grid.
+- **Video:** upload a video and pick the sample rate; frames are tracked, with unique and peak counts per class.
+- **Camera:** the browser's webcam; frames run on the cards while Gemma generates (the browser needs HTTPS or localhost for the camera).
+- **Ask Gemma about these results:** the first question sends a compact summary of the detections, and optionally the picture; follow-ups reuse what the cards already read.
+
+API: `POST /api/yolo/detect` (raw image body), `POST /api/yolo/video` (raw video body, `X-Fps`), `GET /api/yolo/job?id=`, `GET /api/yolo/status`.
 
 ### API
 
@@ -613,10 +654,11 @@ models/apex-tp-llm/           (in unified-engine, branch 5-Apex-fpga)
 ├── extract_gptoss.py         GPT-OSS slicing (MXFP4 → FP4)
 ├── gemma4/                   Gemma 4 26B-A4B: card program, runner, slicing (gemma4_card / gemma4_tp / extract_gemma4),
 │                             image encoder (gemma4_vision / gemma4_vision_tp / extract_gemma4_vision)
-├── ollapex/                  chat interface: server, engine, GPT-OSS and Gemma 4 backends, web page
+├── ollapex/                  chat interface: server, engine, GPT-OSS and Gemma 4 backends, web page, detection page
+├── yolo26/                   YOLO26s-OBB next to Gemma 4: card compiler, per-engine build, frame bus, tests
 ├── system/                   systemd services and the xdma Makefile patch
 ├── aptop/                    aptop multi-card patch
 ├── tools/                    tests, benchmarks, profilers, slice_embed.py / slice_embed8.py
 ├── docs/TECHNICAL.md         card program, register map, measurements
-└── docs/FINDINGS.md          what the measurements taught us; Gemma 4 slicing, compile, pipeline and images
+└── docs/FINDINGS.md          what the measurements taught us; Gemma 4 slicing, compile, pipeline, images, object detection
 ```

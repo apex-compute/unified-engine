@@ -1,0 +1,452 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OllApeX YOLO</title>
+<link rel="icon" href="/static/ollapex-mark.svg">
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #141a22; --mute: #5d6878; --line: #e2e6ec; --soft: #eef1f5;
+  --acc: #0f5fa8; --acc-ink: #ffffff; --good: #1d7a46; --warn: #a15c00; --bad: #b3261e;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --bg: #0e1116; --panel: #161b22; --ink: #e7ebf0; --mute: #94a0b0; --line: #262d38;
+    --soft: #1c232d; --acc: #5aa9f0; --acc-ink: #06121f; --good: #56c487; --warn: #e0a54a; --bad: #f2776f; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header img { width: 26px; height: 26px; }
+header b { font-size: 16px; }
+header a { color: var(--acc); text-decoration: none; margin-left: auto; }
+.pill { font-size: 12px; padding: 2px 8px; border-radius: 99px; background: var(--soft); color: var(--mute); }
+.pill.ok { color: var(--good); } .pill.bad { color: var(--bad); }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; padding: 16px; max-width: 1500px; margin: 0 auto; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+.tabs { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; align-items: center; }
+.tabs button, .btn { border: 1px solid var(--line); background: var(--soft); color: var(--ink); padding: 6px 12px; border-radius: 8px; cursor: pointer; font: inherit; }
+.tabs button.on, .btn.primary { background: var(--acc); color: var(--acc-ink); border-color: var(--acc); }
+.btn:disabled { opacity: .5; cursor: default; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.stage { position: relative; background: #0b0d10; border-radius: 8px; min-height: 360px; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+.stage canvas, .stage video { max-width: 100%; max-height: 72vh; display: block; }
+.stage .over { position: absolute; pointer-events: none; }
+.hint { color: #9aa4b2; padding: 40px; text-align: center; }
+h3 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--mute); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+td { padding: 3px 4px; border-bottom: 1px solid var(--line); }
+td.n { text-align: right; font-family: var(--mono); }
+.sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+.stats div { display: flex; justify-content: space-between; font-size: 13px; padding: 2px 0; }
+.stats span:last-child { font-family: var(--mono); }
+.bar { height: 6px; background: var(--soft); border-radius: 3px; overflow: hidden; flex: 1; min-width: 120px; }
+.bar i { display: block; height: 100%; background: var(--acc); width: 0; }
+.side { display: flex; flex-direction: column; gap: 12px; }
+.err { color: var(--bad); font-size: 13px; }
+.mute { color: var(--mute); font-size: 12px; }
+label.inl { display: flex; align-items: center; gap: 6px; color: var(--mute); }
+.chat { margin-top: 16px; }
+.chat .head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.chat .head h3 { margin: 0; }
+.chat .ctxnote { color: var(--mute); font-size: 12px; margin-left: auto; }
+.msgs { max-height: 46vh; overflow: auto; display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+.msg { padding: 8px 10px; border-radius: 8px; white-space: normal; word-wrap: break-word; }
+.msg.user { background: var(--soft); align-self: flex-end; max-width: 85%; }
+.msg.bot { border: 1px solid var(--line); max-width: 100%; }
+.msg .meta { color: var(--mute); font-size: 12px; margin-top: 4px; }
+.compose { display: flex; gap: 8px; align-items: flex-end; }
+.compose textarea { flex: 1; resize: vertical; min-height: 40px; max-height: 160px; padding: 8px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink); font: inherit; }
+</style>
+</head>
+<body>
+<header>
+  <img src="/static/ollapex-mark.svg" alt="">
+  <b>OllApeX YOLO</b>
+  <span class="pill" id="pill">checking...</span>
+  <a href="/">Chat</a>
+</header>
+<main>
+  <section class="card">
+    <div class="tabs">
+      <button data-tab="image" class="on">Image</button>
+      <button data-tab="video">Video</button>
+      <button data-tab="camera">Camera</button>
+      <label class="inl" style="margin-left:auto">Confidence <input type="range" id="conf" min="0.05" max="0.9" step="0.05" value="0.25"> <span id="confv">0.25</span></label>
+    </div>
+    <div class="row" data-for="image">
+      <input type="file" id="imgfile" accept="image/*">
+      <span class="mute">Satellite or aerial photos work best (DOTA classes).</span>
+    </div>
+    <div class="row" data-for="video" hidden>
+      <input type="file" id="vidfile" accept="video/*">
+      <label class="inl">Frames per second <select id="vfps"><option>0.5</option><option selected>1</option><option>2</option><option>5</option></select></label>
+      <button class="btn primary" id="vgo" disabled>Analyze</button>
+      <div class="bar"><i id="vbar"></i></div><span class="mute" id="vprog"></span>
+    </div>
+    <div class="row" data-for="camera" hidden>
+      <button class="btn primary" id="camgo">Start camera</button>
+      <span class="mute" id="camnote">Frames go to the cards as fast as they come back.</span>
+    </div>
+    <div class="stage" id="stage"><div class="hint" id="hint">Choose an image to detect objects on the FPGA cards.</div></div>
+    <div class="err" id="err"></div>
+    <div class="chat">
+      <div class="head">
+        <h3>Ask Gemma about these results</h3>
+        <button class="btn" id="cnew">New chat</button>
+        <span class="ctxnote" id="ctxnote">Run a detection first.</span>
+      </div>
+      <div class="msgs" id="cmsgs"></div>
+      <div class="compose">
+        <textarea id="cin" placeholder="e.g. How many ships are in the harbor? Which ones moved?  (Enter sends, Shift+Enter for a new line)"></textarea>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <label class="inl"><input type="checkbox" id="cpic" checked> Attach the picture</label>
+          <button class="btn primary" id="csend">Send</button>
+        </div>
+      </div>
+    </div>
+  </section>
+  <aside class="side">
+    <div class="card"><h3>Objects</h3><table id="counts"><tr><td class="mute">No detections yet.</td></tr></table></div>
+    <div class="card stats" id="stats"><h3>Run</h3></div>
+    <div class="card"><h3>Detections</h3><div style="max-height:320px;overflow:auto"><table id="dets"></table></div></div>
+  </aside>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let tab = "image", info = null, CLS = [];
+const colors = ["#ff5252","#ffd740","#40c4ff","#69f0ae","#e040fb","#ff6e40","#b2ff59","#18ffff","#ffab40","#7c4dff","#eeff41","#f06292","#64ffda","#ff8a80","#82b1ff"];
+const color = (c) => colors[Math.max(0, CLS.indexOf(c)) % colors.length];
+const conf = () => parseFloat($("conf").value);
+$("conf").oninput = () => { $("confv").textContent = conf().toFixed(2); };
+
+async function status() {
+  try {
+    const r = await fetch("/api/yolo/status"); info = await r.json(); CLS = info.classes || CLS;
+    const p = $("pill");
+    if (info.available) { p.className = "pill ok"; p.textContent = `${info.engines} engines ready · ${info.model}`; }
+    else { p.className = "pill bad"; p.textContent = info.state === "loading" ? "cards are loading..." : "load Gemma 4 26B on the chat page"; }
+  } catch (e) { $("pill").textContent = "offline"; }
+}
+status(); setInterval(status, 3000);
+
+document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
+  if (camOn) stopCam();
+  tab = b.dataset.tab;
+  setSource(null);
+  document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll("[data-for]").forEach(x => x.hidden = x.dataset.for !== tab);
+  clearStage({ image: "Choose an image to detect objects on the FPGA cards.",
+               video: "Choose a video, pick a frame rate and press Analyze.",
+               camera: "Start the camera; every frame is detected on the cards." }[tab]);
+});
+
+function clearStage(text) {
+  $("stage").innerHTML = `<div class="hint">${text}</div>`; $("err").textContent = "";
+}
+
+function drawDets(ctx, dets, sx, sy, minConf) {
+  ctx.lineWidth = Math.max(1.5, 2 * Math.min(sx, sy) * 1.5);
+  ctx.font = `${Math.max(10, Math.round(12 * Math.min(sx, sy) * 1.4))}px system-ui, sans-serif`;
+  for (const d of dets) {
+    if (d.score < minConf) continue;
+    ctx.strokeStyle = color(d.cls); ctx.beginPath();
+    d.poly.forEach(([x, y], i) => i ? ctx.lineTo(x * sx, y * sy) : ctx.moveTo(x * sx, y * sy));
+    ctx.closePath(); ctx.stroke();
+  }
+}
+
+function showCounts(cs, title) {
+  const rows = Object.entries(cs);
+  $("counts").innerHTML = rows.length ? rows.map(([c, n]) =>
+    `<tr><td><span class="sw" style="background:${color(c)}"></span>${c}</td><td class="n">${n}</td></tr>`).join("")
+    + (title ? `<tr><td class="mute" colspan="2">${title}</td></tr>` : "")
+    : `<tr><td class="mute">Nothing found above ${conf().toFixed(2)}.</td></tr>`;
+}
+function countOf(dets) { const c = {}; for (const d of dets) if (d.score >= conf()) c[d.cls] = (c[d.cls] || 0) + 1;
+  return Object.fromEntries(Object.entries(c).sort((a, b) => b[1] - a[1])); }
+function showDets(dets) {
+  const ds = dets.filter(d => d.score >= conf()).slice(0, 300);
+  $("dets").innerHTML = ds.map(d => `<tr><td><span class="sw" style="background:${color(d.cls)}"></span>${d.cls}${d.track ? " #" + d.track : ""}</td>`
+    + `<td class="n">${d.score.toFixed(2)}</td><td class="n">${Math.round(d.cx)},${Math.round(d.cy)}</td></tr>`).join("");
+}
+function showStats(items) {
+  $("stats").innerHTML = "<h3>Run</h3>" + items.map(([k, v]) => `<div><span>${k}</span><span>${v}</span></div>`).join("");
+}
+function timingRows(res) {
+  const t = res.timing || {};
+  return [["Engine", res.engine >= 0 ? `#${res.engine}` : "-"], ["Card run", `${t.card_ms} ms`],
+          ["Queue wait", `${t.queue_ms} ms`], ["Pack + decode (host)", `${(t.pack_ms + t.decode_ms).toFixed(1)} ms`],
+          ["Round trip", `${t.total_ms} ms`]];
+}
+
+async function detect(blob, mode) {
+  const r = await fetch("/api/yolo/detect", { method: "POST", body: blob,
+    headers: { "X-Mode": mode, "X-Conf": "0.05", "Content-Type": "application/octet-stream" } });
+  const j = await r.json();
+  if (!r.ok || j.error) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+function render(bitmap, res) {
+  const c = document.createElement("canvas"); c.width = bitmap.width; c.height = bitmap.height;
+  const ctx = c.getContext("2d"); ctx.drawImage(bitmap, 0, 0);
+  drawDets(ctx, res.detections, 1, 1, conf());
+  $("stage").innerHTML = ""; $("stage").appendChild(c);
+}
+
+// ---------------------------------------------------------------- image
+let lastImg = null;
+$("imgfile").onchange = async () => {
+  const f = $("imgfile").files[0]; if (!f) return;
+  clearStage("Detecting on the cards...");
+  try {
+    const bmp = await createImageBitmap(f);
+    const res = await detect(f, "image");
+    lastImg = { bmp, res };
+    redrawImage();
+    setSource({ kind: "image", label: f.name, res, file: f });
+  } catch (e) { $("err").textContent = e.message; }
+};
+function redrawImage() {
+  if (!lastImg) return;
+  render(lastImg.bmp, lastImg.res);
+  showCounts(countOf(lastImg.res.detections)); showDets(lastImg.res.detections);
+  showStats(timingRows(lastImg.res).concat([["Image", `${lastImg.res.width} x ${lastImg.res.height}`]]));
+}
+$("conf").addEventListener("change", () => { if (tab === "image") redrawImage(); if (tab === "video") drawVideo(); });
+
+// ---------------------------------------------------------------- video
+let vjob = null, vurl = null, vel = null, vover = null;
+$("vidfile").onchange = () => {
+  const f = $("vidfile").files[0]; if (!f) return;
+  if (vurl) URL.revokeObjectURL(vurl);
+  vurl = URL.createObjectURL(f); vjob = null;
+  $("stage").innerHTML = ""; vel = document.createElement("video"); vel.src = vurl; vel.controls = true; vel.muted = true;
+  vover = document.createElement("canvas"); vover.className = "over";
+  $("stage").appendChild(vel); $("stage").appendChild(vover);
+  vel.addEventListener("timeupdate", drawVideo); vel.addEventListener("seeked", drawVideo);
+  vel.addEventListener("loadedmetadata", drawVideo); window.addEventListener("resize", drawVideo);
+  $("vgo").disabled = false; $("vprog").textContent = ""; $("vbar").style.width = "0";
+};
+$("vgo").onclick = async () => {
+  const f = $("vidfile").files[0]; if (!f) return;
+  $("vgo").disabled = true; $("err").textContent = ""; $("vprog").textContent = "uploading...";
+  try {
+    const r = await fetch("/api/yolo/video", { method: "POST", body: f, headers: {
+      "X-Filename": encodeURIComponent(f.name), "X-Fps": $("vfps").value, "X-Conf": "0.05",
+      "Content-Type": "application/octet-stream" } });
+    const j = await r.json(); if (!r.ok || j.error) throw new Error(j.error || r.statusText);
+    pollJob(j.job);
+  } catch (e) { $("err").textContent = e.message; $("vgo").disabled = false; }
+};
+async function pollJob(id) {
+  const r = await fetch("/api/yolo/job?id=" + id); const j = await r.json();
+  const pct = j.total ? 100 * j.done / j.total : 0;
+  $("vbar").style.width = pct + "%";
+  $("vprog").textContent = j.state === "running" ? `${j.done} / ${j.total} frames` : j.state;
+  if (j.state === "done") {
+    vjob = j; $("vgo").disabled = false; drawVideo();
+    setSource({ kind: "video", label: j.name, job: j });
+    const uniq = Object.fromEntries(Object.entries(j.unique || {}).filter(([c]) => true));
+    showCounts(uniq, "distinct objects tracked over the video");
+    showStats([["Frames analyzed", j.total], ["Sample rate", `${j.fps} fps`], ["Card run per frame", `${j.card_ms} ms`],
+               ["Whole job", `${j.wall_s} s`], ["Throughput", `${(j.total / j.wall_s).toFixed(2)} frames/s`]]);
+    return;
+  }
+  if (j.state === "error") { $("err").textContent = j.error; $("vgo").disabled = false; return; }
+  setTimeout(() => pollJob(id), 800);
+}
+function drawVideo() {
+  if (!vel || !vover) return;
+  const r = vel.getBoundingClientRect(), s = $("stage").getBoundingClientRect();
+  vover.style.left = (r.left - s.left) + "px"; vover.style.top = (r.top - s.top) + "px";
+  vover.width = r.width; vover.height = Math.max(0, r.height - 40);
+  const ctx = vover.getContext("2d"); ctx.clearRect(0, 0, vover.width, vover.height);
+  if (!vjob || !vjob.frames || !vel.videoWidth) return;
+  const i = Math.min(vjob.frames.length - 1, Math.max(0, Math.floor(vel.currentTime * vjob.fps + 1e-6)));
+  const fr = vjob.frames[i]; const sx = r.width / fr.width, sy = (r.width * vel.videoHeight / vel.videoWidth) / fr.height;
+  drawDets(ctx, fr.detections, sx, sy, conf());
+  showDets(fr.detections);
+}
+
+// ---------------------------------------------------------------- camera
+let camOn = false, stream = null, camVid = null, inflight = 0, done = [], lastSeq = 0, seq = 0;
+$("camgo").onclick = () => camOn ? stopCam() : startCam();
+async function startCam() {
+  $("err").textContent = "";
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  } catch (e) { $("err").textContent = "Camera not available: " + e.message; return; }
+  camVid = document.createElement("video"); camVid.srcObject = stream; camVid.muted = true; camVid.playsInline = true;
+  await camVid.play();
+  camOn = true; $("camgo").textContent = "Stop camera"; done = []; lastSeq = 0;
+  clearStage("Waiting for the first frame from the cards...");
+  pump();
+}
+function stopCam() {
+  camOn = false; $("camgo").textContent = "Start camera";
+  if (stream) stream.getTracks().forEach(t => t.stop()); stream = null;
+}
+function maxInflight() { return Math.max(1, (info && info.engines) || 1); }
+
+// ---------------------------------------------------------------- chat with Gemma about the results
+// The first question carries the detection results as text (and, if ticked, the picture); follow-ups only
+// add the new question, so the cards reuse what they already read.
+let source = null, chatMsgs = [], chatBusy = false;
+function setSource(s) { source = s; resetChat(); }
+function resetChat() {
+  chatMsgs = []; $("cmsgs").innerHTML = "";
+  $("ctxnote").textContent = source ? `About: ${source.label}` : "Run a detection first.";
+}
+$("cnew").onclick = resetChat;
+const deg = (a) => Math.round(a * 180 / Math.PI);
+function countText(c) { const e = Object.entries(c); return e.length ? e.map(([k, n]) => `${k} ${n}`).join(", ") : "none"; }
+// Gemma reads a prompt one token at a time (~60 ms each), so the results go in compact: counts, a 3 x 3 grid
+// of where things are, and only the most confident detections / longest tracks.
+const MAX_DETS = 15, MAX_TRACKS = 20, MAX_TIMES = 12;
+function detLines(dets, max) {
+  return dets.filter(d => d.score >= conf()).slice(0, max).map((d, i) =>
+    `${d.track ? "#" + d.track : i + 1} ${d.cls} ${d.score.toFixed(2)} (${Math.round(d.cx)},${Math.round(d.cy)}) `
+    + `${Math.round(Math.max(d.w, d.h))}x${Math.round(Math.min(d.w, d.h))} ${deg(d.angle)}°`);
+}
+function gridText(dets, W, H) {
+  const rows = ["top", "middle", "bottom"], cols = ["left", "center", "right"], cells = {};
+  for (const d of dets) {
+    if (d.score < conf()) continue;
+    const k = rows[Math.min(2, Math.floor(3 * d.cy / H))] + "-" + cols[Math.min(2, Math.floor(3 * d.cx / W))];
+    (cells[k] = cells[k] || {})[d.cls] = (cells[k][d.cls] || 0) + 1;
+  }
+  // every cell, most objects first (an empty cell says 0), so "where most / fewest" is a lookup
+  const all = rows.flatMap(r => cols.map(c => r + "-" + c));
+  const tot = (k) => Object.values(cells[k] || {}).reduce((a, b) => a + b, 0);
+  return all.sort((a, b) => tot(b) - tot(a))
+    .map(k => `${k} ${tot(k)}` + (Object.keys(cells[k] || {}).length > 1 ? ` (${countText(cells[k])})` : "")).join(", ");
+}
+function contextText() {
+  const head = "Object detection results from YOLO26s-OBB (oriented boxes, DOTA aerial classes) run on the FPGA cards. "
+    + "Pixel coordinates, x right, y down. Answer from these results and the attached picture, if any; say when they "
+    + "cannot answer.";
+  if (source.kind !== "video") {
+    const r = source.res, all = r.detections.filter(d => d.score >= conf()), dl = detLines(r.detections, MAX_DETS);
+    return `${head}\n${source.kind === "image" ? "Image" : "Camera frame"} "${source.label}", ${r.width}x${r.height} px, `
+      + `confidence >= ${conf().toFixed(2)}.\nCounts: ${countText(countOf(r.detections))}.\n`
+      + `Objects per region of a 3x3 grid, most first: ${gridText(r.detections, r.width, r.height)}.\n`
+      + `Most confident detections (id class confidence (center) length x width angle)`
+      + `${dl.length < all.length ? ", " + dl.length + " of " + all.length : ""}:\n${dl.join("\n")}`;
+  }
+  const j = source.job, fr = j.frames;
+  const step = Math.max(1, Math.ceil(fr.length / MAX_TIMES)), timeline = [];
+  for (let i = 0; i < fr.length; i += step) timeline.push(`t=${fr[i].t.toFixed(1)}s: ${countText(countOf(fr[i].detections))}`);
+  const tr = {};
+  fr.forEach(f => f.detections.forEach(d => {
+    if (d.score < conf() || !d.track) return;
+    const t = tr[d.track] || (tr[d.track] = { cls: d.cls, n: 0, t0: f.t, x0: d.cx, y0: d.cy });
+    t.n++; t.t1 = f.t; t.x1 = d.cx; t.y1 = d.cy;
+  }));
+  const uniq = {}; Object.values(tr).forEach(t => uniq[t.cls] = (uniq[t.cls] || 0) + 1);
+  const tl = Object.entries(tr).filter(([, t]) => t.n >= 2).sort((a, b) => b[1].n - a[1].n).slice(0, MAX_TRACKS)
+    .map(([id, t]) => `#${id} ${t.cls} ${t.t0.toFixed(0)}-${t.t1.toFixed(0)}s (${Math.round(t.x0)},${Math.round(t.y0)})`
+      + `->(${Math.round(t.x1)},${Math.round(t.y1)}) moved ${Math.round(Math.hypot(t.x1 - t.x0, t.y1 - t.y0))}px`);
+  const moving = Object.values(tr).filter(t => t.n >= 2 && Math.hypot(t.x1 - t.x0, t.y1 - t.y0) > 0.02 * fr[0].width).length;
+  const shown = vel ? ` Attached: the frame at t=${vel.currentTime.toFixed(1)}s.` : "";
+  return `${head}\nVideo "${source.label}": ${fr.length} frames at ${j.fps} fps (${(fr.length / j.fps).toFixed(0)} s), `
+    + `${fr[0].width}x${fr[0].height} px, confidence >= ${conf().toFixed(2)}; # = track id, kept from frame to frame.${shown}\n`
+    + `Distinct objects tracked: ${countText(uniq)}; ${moving} of them moved more than 2% of the width.\n`
+    + `Counts over time: ${timeline.join("; ")}\nLongest tracks:\n${tl.join("\n") || "none"}`;
+}
+async function pictureBlob() {
+  if (source.kind === "image") return source.file;
+  let c = source.canvas;
+  if (source.kind === "video") {
+    c = document.createElement("canvas"); c.width = vel.videoWidth; c.height = vel.videoHeight;
+    c.getContext("2d").drawImage(vel, 0, 0);
+  }
+  return await new Promise(r => c.toBlob(r, "image/jpeg", 0.9));
+}
+function md(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/\n/g, "<br>");
+}
+function addMsg(cls, html) {
+  const d = document.createElement("div"); d.className = "msg " + cls; d.innerHTML = html;
+  $("cmsgs").appendChild(d); $("cmsgs").scrollTop = 1e9; return d;
+}
+async function sendChat() {
+  const q = $("cin").value.trim(); if (!q || chatBusy) return;
+  if (!source) { $("err").textContent = "Run a detection first; Gemma answers about its results."; return; }
+  if (!info || !info.available) { $("err").textContent = "Gemma 4 26B is not ready on the cards."; return; }
+  chatBusy = true; $("csend").disabled = true; $("cin").value = ""; $("err").textContent = "";
+  $("ctxnote").textContent = `About: ${source.label}`;
+  addMsg("user", md(q));
+  const bot = addMsg("bot", "<span class='mute'>…</span>");
+  try {
+    const m = { role: "user", content: q, images: [] };
+    if (!chatMsgs.length) {
+      m.content = contextText() + "\n\nQuestion: " + q;
+      if ($("cpic").checked) {
+        bot.innerHTML = "<span class='mute'>sending the picture…</span>";
+        const r = await fetch("/api/file", { method: "POST", body: await pictureBlob(), headers: { "X-Filename": "frame.jpg" } });
+        const f = await r.json(); if (!r.ok || f.error) throw new Error(f.error || r.statusText);
+        m.images = [f.image_id];
+      }
+    }
+    const msgs = chatMsgs.concat([m]);
+    const r = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: info.model, messages: msgs, think: false, options: { temperature: 0, num_predict: 1024 } }) });
+    if (!r.ok) { let e = r.statusText; try { e = (await r.json()).error || e; } catch (x) {} throw new Error(e); }
+    const rd = r.body.getReader(), dec = new TextDecoder();
+    let buf = "", text = "", stats = null;
+    for (;;) {
+      const { value, done } = await rd.read(); if (done) break;
+      buf += dec.decode(value, { stream: true }); let k;
+      while ((k = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, k); buf = buf.slice(k + 1); if (!line.trim()) continue;
+        const ev = JSON.parse(line);
+        if (ev.type === "content") { text += ev.text; bot.innerHTML = md(text); $("cmsgs").scrollTop = 1e9; }
+        else if (ev.type === "status" && !text) bot.innerHTML = "<span class='mute'>" + (ev.event === "vision"
+          ? "reading the picture on the cards…" : ev.event === "prefill" ? `reading the results… ${ev.done}/${ev.total}` : "…") + "</span>";
+        else if (ev.type === "error") throw new Error(ev.message);
+        else if (ev.type === "done") stats = ev.stats;
+      }
+    }
+    if (stats) bot.insertAdjacentHTML("beforeend", `<div class="meta">${stats.eval_tokens} tokens · `
+      + `${(stats.eval_tok_s || 0).toFixed(1)} tok/s · prompt ${stats.prompt_tokens} tokens (${stats.reused_tokens} reused)</div>`);
+    chatMsgs = msgs.concat([{ role: "assistant", content: text }]);
+  } catch (e) { bot.innerHTML = `<span class="err">${md(e.message)}</span>`; }
+  chatBusy = false; $("csend").disabled = false;
+}
+$("csend").onclick = sendChat;
+$("cin").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); } });
+function pump() {
+  while (camOn && inflight < maxInflight()) {
+    inflight++; const my = ++seq;
+    const w = camVid.videoWidth, h = camVid.videoHeight;
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    c.getContext("2d").drawImage(camVid, 0, 0, w, h);
+    const t0 = performance.now();
+    c.toBlob(async (blob) => {
+      try {
+        const res = await detect(blob, "camera");
+        if (camOn && my > lastSeq) {
+          lastSeq = my; const bmp = await createImageBitmap(c);
+          render(bmp, res);
+          if (!chatMsgs.length) {                 // the chat follows the newest frame until a question is asked
+            source = { kind: "camera", label: "camera frame " + new Date().toLocaleTimeString(), res, canvas: c };
+            $("ctxnote").textContent = "About: the newest camera frame";
+          }
+          const now = performance.now(); done.push(now); done = done.filter(t => now - t < 5000);
+          showCounts(countOf(res.detections)); showDets(res.detections);
+          showStats([["Frames per second", (done.length / Math.min(5, Math.max(0.001, (now - done[0]) / 1000 || 1))).toFixed(2)],
+                     ["Latency", `${Math.round(now - t0)} ms`], ["Frames in flight", `${inflight}/${maxInflight()}`]].concat(timingRows(res)));
+        }
+      } catch (e) { $("err").textContent = e.message; }
+      inflight--; if (camOn) setTimeout(pump, 0);
+    }, "image/jpeg", 0.85);
+  }
+}
+</script>
+</body>
+</html>

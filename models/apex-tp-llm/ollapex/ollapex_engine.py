@@ -972,9 +972,32 @@ def driver_main(conn, abort):
     def emit(ev):
         conn.send(ev)
 
+    def next_msg():
+        """The next command; meanwhile YOLO frames on the bus run on the cards. Uploaded frames (video /
+        image) finish before the next command is read; camera frames give way to it."""
+        nonlocal m
+        ran = False
+        while True:
+            if m is not None and getattr(m, "yolo_pending", None) and m.yolo_pending():
+                YB = m.YB
+                try:
+                    uploads = m.yolo_pending((YB.UPLOAD,))
+                    m.yolo_tick(float(os.environ.get("YOLO_IDLE_MS", "200")) / 1e3)
+                    ran = True
+                except Exception:
+                    traceback.print_exc()
+                    m.ybus = None                     # YOLO off; the LM itself is untouched
+                if uploads or not conn.poll(0):
+                    continue
+            elif ran and m is not None:
+                m.command(SEG_PARK, -1)               # back to the cards' low-CPU idle poll
+                ran = False
+            if conn.poll(0.005 if ran else 0.05):
+                return conn.recv()
+
     while True:
         try:
-            msg = conn.recv()
+            msg = next_msg()
         except EOFError:
             break
         try:

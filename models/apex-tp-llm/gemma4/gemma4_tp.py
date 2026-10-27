@@ -44,6 +44,11 @@ VIS_PATH = os.path.join(WORK, "vision", "vision.pt")
 VIS_HID, VIS_POS, VIS_OUT = 1152, 1024, 2816
 SEG_VIS_BEGIN = -6                               # inputs of one image (level cmd[2]) from Shared.vin_* to the cards
 VIS = 2 << 20                                    # command VIS + i: encoder segment i
+# YOLO26-OBB next to the LM in each engine's free DRAM (../yolo26, frames over yolo26_bus): command SEG_YOLO runs
+# program units of the frames the driver assigned to this card's engines, for cmd[2] microseconds at most
+SEG_YOLO = -7
+YOLO = os.environ.get("GEMMA4_YOLO", "0") == "1" and bool(os.environ.get("YOLO_BUS"))
+YOLO_CODE = os.path.expanduser(os.environ.get("YOLO_CODE", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "yolo26")))
 FAILED = -1
 CHANNEL_BYTES = 0x8000_0000
 PROGRAM_BYTES = 64 << 20
@@ -230,6 +235,41 @@ def worker(c, E, P, dev, tdir, max_ctx, cpu, shm_names, conn):
                 ue0.clear_capture_buffer()
                 add_prog[kind] = addr
 
+        # YOLO in what the LM left free: parameters + program in the params gap, tensors in the tensor gap
+        yolo_eng, yinfo = [None] * E, [None] * E
+        if YOLO:
+            if YOLO_CODE not in sys.path:
+                sys.path.insert(0, YOLO_CODE)
+            import yolo26_bus as YB
+            ybus = YB.Bus.from_env()
+            yh2c = os.open(shards[0].T.DMA_DEVICE_H2C, os.O_RDWR)
+            for e, (s, k) in enumerate(zip(shards, ks)):
+                u = s.ue
+                try:
+                    mb = 1 << 20
+                    pb = (u._next_params_dram_addr + mb - 1) // mb * mb
+                    pl = getattr(u, "_params_limit", u._tensor_dram_base)
+                    tb = (u._tensor_dram_addr + mb - 1) // mb * mb
+                    tl = u._program_dram_base
+                    img, man = YB.build(pb, pl, tb, tl)
+                    ty = time.time()
+                    for o in range(0, len(img), 8 << 20):
+                        part = img[o:o + (8 << 20)]
+                        if os.pwrite(yh2c, part, man["image_base"] + o) != len(part):
+                            raise OSError("short YOLO image write")
+                    u._next_params_dram_addr = pb + len(img)          # the ranges are taken now
+                    u._tensor_dram_addr = tb + man["tensor_peak"]
+                    go_y = [struct.pack("=I", U_.ue_35bit_addr_shifter(man["program_address"] + off) & 0xFFFFFFFF)
+                            for U_ in [s.U] for off in man["unit_offsets"]]
+                    yolo_eng[e] = {"man": man, "go": go_y}
+                    yinfo[e] = {"image_mb": len(img) / 1e6, "tensor_mb": man["tensor_peak"] / 1e6,
+                                "units": len(go_y), "build_s": man["build_s"], "cached": man["cached"],
+                                "upload_s": time.time() - ty, "precision": man.get("precision"), "size": man["H"]}
+                    ybus.eng_ready[k] = 1
+                except Exception as ex:                               # the LM keeps working without YOLO
+                    yinfo[e] = {"error": str(ex)[-400:]}
+                    print("YOLO setup failed on engine %d: %s" % (k, ex), flush=True)
+
         def tensor_mb(s):
             a, b = getattr(s.ue, "_next_tensor_dram_addr", None), getattr(s.ue, "_tensor_dram_base", None)
             return (a - b) / 1e6 if a is not None and b is not None else 0.0
@@ -239,7 +279,7 @@ def worker(c, E, P, dev, tdir, max_ctx, cpu, shm_names, conn):
                  "setup_s": time.time() - t0, "segs": n_seg,
                  "clock_mhz": 1000.0 / float(getattr(s.ue, "_clock_period_ns", 0) or 5.042),
                  "firmware": "%08x" % s.ue.get_hardware_version(),
-                 "free_lm_mb": free_lm[e], "free_mb": free_mb(s), "vision": vinfo,
+                 "free_lm_mb": free_lm[e], "free_mb": free_mb(s), "vision": vinfo, "yolo": yinfo[e],
                  "emb_addr": s.EMB} for e, (s, p0) in enumerate(zip(shards, prog0))]
         sh = Shared(P, H, n_cards, shm_names)
         h2c = os.open(shards[0].T.DMA_DEVICE_H2C, os.O_RDWR)
@@ -344,6 +384,11 @@ def worker(c, E, P, dev, tdir, max_ctx, cpu, shm_names, conn):
                     continue
                 if s in (SEG_BLOCK_BEGIN, SEG_BLOCK_END) or s >= BLK:
                     run_block_cmd(s, pos, last)
+                    for k in ks:
+                        done[k] = last
+                    continue
+                if s == SEG_YOLO:
+                    run_yolo(pos)
                     for k in ks:
                         done[k] = last
                     continue
@@ -526,6 +571,56 @@ def worker(c, E, P, dev, tdir, max_ctx, cpu, shm_names, conn):
                 for x, k, us in zip(shards, ks, hw):
                     meta[k, 0] = us / 1e3
                     meta[k, 1] = (time.perf_counter() - t1) * 1e3
+
+        ycur = [None] * E                                  # per engine: slot, next unit, start time
+        yout = [None] * E
+
+        def run_yolo(budget_us):
+            """Load newly assigned frames, then run program units on both engines side by side until the
+            budget is used; a finished frame's head maps go back to its bus slot."""
+            if not YOLO:
+                return
+            t_end = time.perf_counter() + max(int(budget_us), 0) / 1e6
+            act = []
+            for e, k in enumerate(ks):
+                y = yolo_eng[e]
+                sl = int(ybus.eng_slot[k]) if y else -1
+                if sl < 0:
+                    ycur[e] = None
+                    continue
+                if ycur[e] is None or ycur[e][0] != sl:
+                    m = y["man"]
+                    mv = memoryview(ybus.inp[sl]).cast("B")[:m["input_bytes"]]
+                    if pwrite(h2c, mv, m["input_address"]) != len(mv):
+                        raise OSError("short YOLO input write")
+                    ycur[e] = [sl, 0, time.perf_counter(), 0.0]
+                    yout[e] = memoryview(ybus.out[sl]).cast("B")[:m["head_bytes"]]
+                act.append(e)
+            while act and time.perf_counter() < t_end:
+                for e in act:
+                    fd, ia, q = ctl[e]
+                    pwrite(fd, yolo_eng[e]["go"][ycur[e][1]], ia)
+                for e in act:
+                    fd, ia, q = ctl[e]
+                    wait_idle(fd, q)
+                nxt = []
+                for e in act:
+                    cur = ycur[e]
+                    cur[1] += 1
+                    if cur[1] < len(yolo_eng[e]["go"]):
+                        nxt.append(e)
+                        continue
+                    sl, m, k = cur[0], yolo_eng[e]["man"], ks[e]
+                    rd(m["head_address"], yout[e])
+                    ms = (time.perf_counter() - cur[2]) * 1e3
+                    ybus.slot_t[sl, 2] = time.time()
+                    ybus.slot_t[sl, 3] = ms
+                    ybus.eng_frames[k] += 1
+                    ybus.eng_ms[k] = ms
+                    ybus.slot_state[sl] = 3
+                    ybus.eng_slot[k] = -1
+                    ycur[e] = None
+                act = nxt
 
         with T._quiet():
             loop()

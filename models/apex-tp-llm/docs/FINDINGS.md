@@ -350,7 +350,7 @@ sequenceDiagram
 
 ## 10. Object detection next to Gemma 4: YOLO26s-OBB on the same cards
 
-A second network shares the cards with the language model: **YOLO26s-OBB** (oriented boxes, the 15 DOTA classes: plane, ship, storage tank, harbor, bridge, large / small vehicle, helicopter, …), unmodified pretrained weights, 640 × 640 input. Every engine holds its own full copy in the memory the language model leaves free, so **10 engines detect in parallel while Gemma 4 26B-A4B stays loaded**, and Gemma can then talk about what was found. The detector code is not part of this pull request; this section records the method and the measurements.
+A second network shares the cards with the language model: **YOLO26s-OBB** (oriented boxes, the 15 DOTA classes: plane, ship, storage tank, harbor, bridge, large / small vehicle, helicopter, …), unmodified pretrained weights, 640 × 640 input. Every engine holds its own full copy in the memory the language model leaves free, so **10 engines detect in parallel while Gemma 4 26B-A4B stays loaded**, and Gemma can then talk about what was found. Code: `yolo26/` (compiler, per-engine build, frame bus), `SEG_YOLO` in `gemma4/gemma4_tp.py`, and the detection page `ollapex/ollapex_yolo.py` + `ollapex/static/yolo.html`.
 
 ### Method
 

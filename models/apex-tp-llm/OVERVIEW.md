@@ -484,7 +484,8 @@ unified-engine/  (branch 5-Apex-fpga)
     ├── port_build.py · extract_tp.py · run_tp.py · vision_prep.py     Qwen tensor-parallel runtime
     ├── gptoss_card.py · gptoss_tp.py · extract_gptoss.py              GPT-OSS-20B runtime
     ├── gemma4/         Gemma 4 26B-A4B runtime (card program, runner, slicing, image encoder)
-    ├── ollapex/        chat interface (server, engine, GPT-OSS and Gemma 4 backends, web page)
+    ├── ollapex/        chat interface (server, engine, GPT-OSS and Gemma 4 backends, web page, detection page)
+    ├── yolo26/         YOLO26s-OBB next to Gemma 4 (card compiler, per-engine build, frame bus)
     ├── system/         systemd services, xdma Makefile patch
     ├── aptop/          aptop multi-card patch
     ├── tools/          download_models.py, tests, benchmarks, profilers

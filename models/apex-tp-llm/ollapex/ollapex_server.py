@@ -29,6 +29,7 @@ import numpy as np
 
 import ollapex_engine as eng
 import ollapex_vision as vis
+import ollapex_yolo as yolo
 
 VERSION = "0.2.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -609,6 +610,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path in ("/", "/index.html"):
                 return self.static("index.html")
+            if path in ("/yolo", "/yolo/"):
+                return self.static("yolo.html")
+            if path.startswith("/api/yolo/"):
+                return yolo.handle_get(self, path)
             if path.startswith("/static/"):
                 return self.static(path[len("/static/"):])
             if path == "/api/status":
@@ -646,6 +651,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/file":
                 name = urllib.parse.unquote(self.headers.get("X-Filename") or "file.txt")
                 return self.send_json(extract_file(os.path.basename(name), self.raw_body()))
+            if path.startswith("/api/yolo/"):
+                return yolo.handle_post(self, path)
             req = json.loads(self.raw_body() or b"{}")
             if path == "/api/chat":
                 model = resolve_model(req.get("model"))
@@ -686,6 +693,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global ENGINE, HOST
     HOST = host_info()
+    yolo.init(lambda: ENGINE)                     # the frame bus first: the driver inherits its name
     ENGINE = Engine()
     if os.environ.get("OLLAPEX_AUTOLOAD", "1") != "0":
         ENGINE.load_async(DEFAULT_MODEL, clamp_ctx(DEFAULT_CTX))
