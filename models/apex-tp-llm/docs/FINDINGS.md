@@ -15,6 +15,7 @@ In every result below, and in OllApeX, **the host CPU does no model arithmetic a
 | KV cache, attention, FFN, experts, norms, RoPE, softmax, residual sums | Card engines |
 | Sum of the shards' partial results | On the cards: each card adds the shares the host copies in. The host only moves the bytes. |
 | Image encoder (Gemma 4) | Card DRAM and engines: its weights, the position and RoPE tables, all 27 layers, pooling and the projection into the language model ([§9](#9-gemma-4-images-the-encoder-and-the-image-block-on-the-cards)). |
+| Object detector (YOLO26s-OBB) | Card DRAM and engines: its weights, every convolution, the attention block and the detection heads, on every engine next to Gemma 4 ([§10](#10-object-detection-next-to-gemma-4-yolo26s-obb-on-the-same-cards)). The host resizes and packs the frame and turns the head values into boxes. |
 
 The host only coordinates:
 - the tokenizer, and for images the model's image processor (resize, cut into patches) plus one-hot selectors and a padding mask built from the patch coordinates;
@@ -347,6 +348,58 @@ sequenceDiagram
 | **Chat templates can break prefix reuse.** Gemma's template opens each model turn with an empty thinking block but drops it when the turn is in the history, so a re-rendered chat never matches what the cards hold. OllApeX builds a follow-up as the exact continuation instead. | A follow-up question about an image: 278 of 301 tokens reused, 1.8 s instead of 16.8 s. |
 | **Memory is the limit for higher detail.** | After the language model, the encoder and its three programs: 46 MB of tensor region left on the tightest engine, and 4 MB of program region on engine 1 of each card. |
 
+## 10. Object detection next to Gemma 4: YOLO26s-OBB on the same cards
+
+A second network shares the cards with the language model: **YOLO26s-OBB** (oriented boxes, the 15 DOTA classes: plane, ship, storage tank, harbor, bridge, large / small vehicle, helicopter, …), unmodified pretrained weights, 640 × 640 input. Every engine holds its own full copy in the memory the language model leaves free, so **10 engines detect in parallel while Gemma 4 26B-A4B stays loaded**, and Gemma can then talk about what was found. The detector code is not part of this pull request; this section records the method and the measurements.
+
+### Method
+
+| Part | How |
+|---|---|
+| Card operations | The vendor's native CONV2D and MAXPOOL opcodes (queue-CONFIG geometry) and its YOLOv5 emitters (conv, maxpool, nearest upsample, add, concat). The attention block (C2PSA) is a transpose plus two matmuls with the softmax fused into the first, as in the language model. |
+| Graph lowering | 195 operations, 136 convolutions. Splits and chunks become convolutions over channel ranges, depthwise convolutions become dense convolutions with a diagonal weight, and the three last convolutions of each head level are merged into one (4 box + 15 class + 1 angle channels). The head uses the model's NMS-free one-to-one branch. |
+| Input | 2 × 2 space-to-depth: the 640 × 640 image becomes 320 × 320 with 12 channels and the stem convolution is rewritten to match, so the input is 13 MB instead of 52 MB. |
+| Precision | IF8 weights with one scale per output channel. |
+| Placement | The program is relocatable: weights and program go into the free part of each engine's weight region, tensors into its free tensor region, with buffer reuse. Per engine: **52.2 MB** weights + program and **35.5 MB** tensors. |
+| Time slicing | The program is cut into **1096 units of ~4 ms** (longest measured 6.1 ms), each ending in a halt. It uses only operation, configuration, halt and no-op instructions, no registers or jumps, so a frame can stop between any two units and the language model's program runs in between. |
+| Scheduling | A shared-memory frame bus (16 slots) between the web server, the driver and the card processes. Camera frames: after every Gemma token, 20 ms of detector units on every engine, so both run at the same time. Uploaded images and videos: queued, the cards run the detector frames before the next chat command. |
+| Host part | Letterbox resize and the space-to-depth packing before the cards; after them, turning the head values into boxes (position + distances × stride, class threshold, best 300) and a greedy IoU tracker across video frames. The network itself runs entirely on the cards. |
+
+### Results (230 MHz, Gemma 4 26B-A4B 8K loaded)
+
+| Measurement | Result |
+|---|---|
+| Accuracy vs the float model, op by op | Each operation alone: 32–47 dB SNR. The three head outputs after the whole chain: 25–30 dB. |
+| Aerial photo of a marina (boats.jpg) | **166 detections** (165 ship, 1 harbor), rotated boxes on the boats |
+| One frame on one engine | **3.15 s** card time (weight-stream bound); 3.25 s end to end through the web API |
+| Throughput, Gemma idle | **2.56 frames/s** on 10 engines |
+| Throughput while Gemma generates (camera mode) | **2.19 frames/s**, Gemma 12.1 tok/s (17.25 without frames). The greedy answer is **identical** to the one without the detector. |
+| Video upload | Frames sampled at a chosen rate, each frame through the cards, tracks across frames; unique and peak counts per class |
+| Loading Gemma 4 with the detector | ~240 s the first time (includes compiling the detector for each engine's addresses), ~168 s after that (compiled images cached) |
+
+### Talking about the results
+
+The OllApeX detection page (image, video, webcam) has a chat with Gemma 4 about the current result. The first question carries a compact summary instead of every box:
+- **Image:** counts per class, a 3 × 3 region grid sorted from most to fewest objects, and the 15 most confident detections (position, size, angle).
+- **Video:** counts over time, unique tracked objects, how many moved, and where the 20 longest tracks went.
+- **Optional:** the picture itself, through the Gemma 4 image path (§9).
+
+Follow-up questions are exact continuations, so the cards reuse what they already read:
+
+| | Prompt tokens | Reading time | Answer |
+|---|---|---|---|
+| First question (summary + picture) | 746 | 41 s | "165 boats, most in the top-center region, a marina" (correct) |
+| Follow-up "Where are the fewest boats?" | 860 reused | 1.4 s | "top right, 8 boats" (correct) |
+
+### What we learned
+
+| Finding | Evidence |
+|---|---|
+| **A CNN and an LLM can share the cards without changing each other's results.** Halt-terminated units plus separate memory regions are enough. | Greedy Gemma output identical with and without camera frames; the detector runs on all 10 engines. |
+| **Short units let the detector run between tokens.** | 20 ms of units after each token: 2.19 frames/s while Gemma still generates at 12.1 tok/s. |
+| **Space-to-depth makes the input fit.** | Input 52 → 13 MB per engine, which is what lets the detector fit next to the language model on every engine. |
+| **The prompt summary sets the chat speed.** Prompt reading is ~55–60 ms per token, so the summary is kept to what the questions need, sorted so the model reads the answer directly. | 746 tokens → 41 s for the first answer; follow-ups in seconds. |
+
 ---
 
 ## Final numbers (230 MHz, text mode, greedy)
@@ -359,6 +412,8 @@ sequenceDiagram
 | Qwen3.8-27B | 27B (dense) | 8192 | **2.76 tok/s** | on the cards, IF8 |
 
 Images (Gemma 4, encoder on 8 engines): **5.3 / 11.4 / 26.5 s** at 70 / 140 / 280 soft tokens, then ~60 ms per image token to read the block; generation speed unchanged ([§9](#9-gemma-4-images-the-encoder-and-the-image-block-on-the-cards)).
+
+Object detection (YOLO26s-OBB, 640 px, next to Gemma 4 on all 10 engines): **3.15 s** per frame per engine, **2.56 frames/s** in total, 2.19 frames/s while Gemma generates at 12.1 tok/s with an unchanged answer ([§10](#10-object-detection-next-to-gemma-4-yolo26s-obb-on-the-same-cards)).
 
 ## What would move the numbers further (vendor side)
 

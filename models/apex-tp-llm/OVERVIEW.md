@@ -17,6 +17,8 @@ It is the vendor's [unified-engine](https://github.com/apex-compute/unified-engi
 
 **Images:** Gemma 4's vision encoder runs on the cards too, tensor-parallel on 8 engines: 5.3 / 11.4 / 26.5 s for a 70 / 140 / 280-token image. The image enters the language model as one block with the model's exact attention rule ([docs/FINDINGS.md §9](docs/FINDINGS.md#9-gemma-4-images-the-encoder-and-the-image-block-on-the-cards)).
 
+**Object detection:** YOLO26s-OBB (oriented boxes, DOTA classes such as ship, plane, harbor) runs on all 10 engines next to Gemma 4: 3.15 s per frame per engine, 2.56 frames/s in total, and 2.19 frames/s while Gemma generates with an unchanged answer. Gemma can then be asked about the detections ([docs/FINDINGS.md §10](docs/FINDINGS.md#10-object-detection-next-to-gemma-4-yolo26s-obb-on-the-same-cards)).
+
 ---
 
 ## Contents
@@ -324,6 +326,7 @@ flowchart LR
 | **GPT‑OSS‑20B port** | New card program: MXFP4 → FP4, attention sinks, sliding window, YaRN, clamped SwiGLU, experts as precompiled subroutines picked through registers, card-local top‑4 pick, batched attention | 11.3 → 15.3 tokens/s |
 | **Gemma 4 26B‑A4B port** | New card program: 128 experts with top‑8 plus a parallel dense FFN, sliding and global attention (K = V, partial RoPE by head-dim permutation), 1088-row KV ring for the sliding layers, router split over both engines, expert pick hidden behind the dense FFN | 15.7 → 17.1 tokens/s, context 8192 |
 | **Gemma 4 images** | Vision encoder (27 layers, IF8) tensor-parallel on 8 engines, axial 2D RoPE by padding heads 72 → 128 with permuted dims, position / RoPE tables on the card, one program per detail level; exact image block in the language model (K / V of the whole image before its attention, per-token mask rows) | 70-token image in 5.3 s, 280 in 26.5 s; text speed unchanged |
+| **Object detection** | YOLO26s-OBB lowered onto the vendor CONV2D / MAXPOOL opcodes (attention as matmuls, 2 × 2 space-to-depth input, IF8), one relocatable copy per engine in the memory Gemma 4 leaves free, cut into ~4 ms halt-terminated units that run between Gemma tokens; detection page with image, video and webcam plus a chat with Gemma about the result | 2.56 frames/s on 10 engines; Gemma output unchanged |
 | **Embedding on the cards** | Every model's table on the cards, one vocabulary block per shard (Qwen3.8‑27B as IF8, dequantized on the card); one row per token is copied from the card that holds it | Host RAM holds no model data; no measurable cost |
 | **Firmware** | Vendor firmware `c7de4c55` (230 MHz) on all 5 cards, updated without a warm boot plus one power cycle; no code change | +4.5 % to +11.4 % tokens/s, identical output |
 | **OllApeX** | Web chat UI, model and context choice, files, images (Qwen, Gemma 4), sampling, harmony format for GPT‑OSS (thinking / answer), math typesetting (KaTeX), live technical panel, systemd service | Use from any browser on port 3000 |
