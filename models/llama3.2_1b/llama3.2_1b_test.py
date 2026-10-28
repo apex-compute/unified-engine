@@ -378,7 +378,7 @@ class Llama32_1b_UnifiedEngine(UnifiedEngine):
         self._model_dram_limit = model_base + (2 << 30)
         self._model_rebase = model_base - 0x80000000
         # Keep all original model-relative offsets and allocate decode shards
-        # outside this contiguous model region on separate memory controllers.
+        # outside this contiguous model region (model_multicore_layout).
         # At max_context_size=1024 the loaded params use ~642 MiB and tensors/KV
         # use ~212 MiB. Keep simple aligned boundaries; reserve the final 10 MiB
         # for the master instruction image + preamble, and a 22 MiB band just

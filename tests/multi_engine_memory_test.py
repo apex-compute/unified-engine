@@ -262,9 +262,10 @@ def run_memory_comparison(num_engines=None, sizes_kib=(64, 256, 512), iterations
             if count > 1:
                 cases += [(layout, list(range(count)), private_spacing_bytes) for layout in ("private", "split")]
             if (private_spacing_bytes is None and count == 2
-                    and core.ANDROMEDA_CORE_COUNT == 2 and core.AVAILABLE_DRAM_SIZE_GB == 4):
-                # Keep the former single-controller layout as an explicit
-                # comparison alongside the corrected dual-controller default.
+                    and core.ANDROMEDA_CORE_COUNT == 2 and core.AVAILABLE_DRAM_SIZE_GB == 4
+                    and not shard.dram_interleaved()):
+                # kintex7_systolic: keep the single-controller layout as an
+                # explicit comparison alongside the dual-controller default.
                 cases.append(("private", list(range(count)), 512 << 20))
             for layout, engine_ids, spacing in cases:
                 print(f"Memory {layout}: engines={engine_ids}, {size} KiB/engine, "

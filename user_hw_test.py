@@ -155,10 +155,9 @@ GEMMA3_EXPECTED_TOKENS = 76
 # so it is clock-independent. Multi-core limits are measured separately below.
 _GEMMA3_SINGLE_CORE_MAX_CYCLES_PER_TOKEN = 20_000_000
 # Multi-core decode floors, MEASURED per core count rather than derived from the
-# single-core floor. Scaling is set by DRAM bandwidth, not by core count, and the
-# private weight placement must actually select different controllers. Kintex-7
-# now places decode shards at 0 and 3 GiB around the shared [1,3) GiB model;
-# the earlier low-2GiB placement sent both engines to one DDR controller.
+# single-core floor. Scaling is set by DRAM bandwidth, not by core count. The
+# U50 and kintex7 interleave DRAM over all controllers, so their decode shards
+# simply follow one another (multi_engine_shard.model_multicore_layout).
 #
 # Values carry deliberate slack over the measurements below, because DRAM speed is
 # the least stable thing being measured here -- it moves with refresh, temperature
@@ -178,19 +177,15 @@ KINTEX7_SYSTOLIC_CSR_BASE_ADDR = 0x02020000
 
 
 # The per-engine DRAM map is board policy and lives in multi_engine_shard
-# (board_private_windows / EngineWindow), next to the HBM controller maps it is
-# derived from -- not here. This module only consumes it.
+# (board_private_windows / EngineWindow) -- not here. This module only
+# consumes it.
 
 
 def _make_multi_engine_ues(num_engines: int):
     """Build ``num_engines`` engines on their board-assigned private windows.
 
-    Returns the engines and their PRIMARY segment bases. An engine's window may
-    be several non-contiguous segments (a U50 owns one 512 MB controller region
-    on each of the two HBM stacks); the allocator cursors below all live in the
-    primary segment, so callers that only need ENGINE_FOOTPRINT_BYTES are fine
-    with the bases alone. Anything wanting the whole window must ask
-    multi_engine_shard.board_private_windows() for the segments.
+    Returns the engines and their window bases; the allocator cursors below all
+    live in the window's first segment.
     """
     import user_dma_core
     import multi_engine_shard
@@ -638,9 +633,9 @@ def multi_core_dram_speed_test(data_size_kB: int = 512, num_engines: int = 4):
     every worker. The measured latency therefore covers the whole concurrent
     read.
 
-    HBM hardware only: the layout is based at 0x0 and uses the shared
-    multi_engine_shard.board_private_windows() policy, which is controller-
-    aligned so the engines do not contend. Engines are NOT software-reset here.
+    4 GB or larger hardware only: the layout is based at 0x0 and uses the
+    shared multi_engine_shard.board_private_windows() policy. Engines are NOT
+    software-reset here.
     """
     import user_dma_core
 
@@ -12359,8 +12354,8 @@ if __name__ == "__main__":
     # --multi-core N runs on the FIRST N engines of the board HW_INFO reports,
     # so the 12-core U55C build can be exercised 8 engines at a time. Only the
     # count used by the tests moves: ANDROMEDA_CORE_COUNT stays the board
-    # signature that board_private_windows() keys its HBM map on, so the
-    # engines that do run keep their controller-aligned bases.
+    # signature that board_private_windows() keys its map on, so the engines
+    # that do run keep the board's bases.
     if args.multi_core is not None:
         if not 1 <= args.multi_core <= engine_count:
             parser.error(
