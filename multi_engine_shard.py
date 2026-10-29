@@ -400,20 +400,34 @@ def multicore_arena_bytes(num_engines: int) -> int:
     return num_engines * MULTICORE_WINDOW_BYTES
 
 
-def require_multicore_dram(num_engines: int, what: str) -> None:
+def require_multicore_dram(num_engines: int, what: str,
+                           need_bytes: Optional[int] = None) -> None:
     """Fail before any allocation if the device is too small for the map.
 
-    Multi-core needs the >= 8 GB map whatever the engine count: the model's own
-    window sits above a private arena that starts at 0 and the two together do
-    not fit a 4 GB device. Raised as a hard error rather than a silent fallback
-    to a divided arena -- a run that quietly halves its window would look fine
-    and simply lose the bandwidth.
+    On interleaved DRAM (dram_interleaved) the map is consecutive, so it fits
+    when its bytes do: ``need_bytes`` when the caller knows its map, otherwise
+    ``num_engines`` 512 MB windows plus the 2 GB model map. A two-engine kintex7
+    (4 GB) holds that at 3 GB.
+
+    The other boards place windows by memory controller and keep the >= 8 GB
+    rule: the model's own window sits above a private arena that starts at 0
+    and the two together do not fit a 4 GB device. Raised as a hard error
+    rather than a silent fallback to a divided arena -- a run that quietly
+    halves its window would look fine and simply lose the bandwidth.
     """
     gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
     if gib is None:
         raise RuntimeError(
             f"{what}: HW_INFO has not been read, so DRAM size is unknown; call "
             f"user_dma_core.configure_clock_from_hardware() first")
+    if dram_interleaved():
+        need = (need_bytes if need_bytes is not None
+                else num_engines * MULTICORE_WINDOW_BYTES + (2 << 30))
+        if need > gib << 30:
+            raise ValueError(
+                f"{what}: the {num_engines}-engine map needs "
+                f"{need / 2**30:.2f} GiB but HW_INFO reports {gib} GiB")
+        return
     if gib < MULTICORE_MIN_DRAM_GIB:
         raise ValueError(
             f"{what}: multi-core ({num_engines} engines) needs the "
@@ -1237,7 +1251,8 @@ class PrivateArena:
                  external_isa: Optional[tuple] = None,
                  verbose: bool = False,
                  windows: Optional[list[tuple[int, int]]] = None,
-                 isa_guard_bytes: int = 0):
+                 isa_guard_bytes: int = 0,
+                 shared_region: Optional[tuple[int, int]] = None):
         """``external_isa=(base, stride)`` moves the per-engine ISA slices OUT of
         the private windows and into a region the model owns elsewhere.
 
@@ -1258,6 +1273,15 @@ class PrivateArena:
         layout [weights/shared | tensor | unused guard | ISA]. The zero default
         retains the original [weights/shared | ISA | tensor] layout. The guard
         is excluded from all allocators; it is not hardware access protection.
+
+        ``shared_region=(base, bytes)`` gives the shared pool ONE contiguous
+        region of its own instead of the window tails. Both shared cursors
+        (alloc_shared down from the top, alloc_shared_up up from the base) then
+        work inside it, so a shared object is bounded by the region rather than
+        by the largest per-window gap, and the windows only have to hold what
+        is private. On interleaved DRAM (dram_interleaved) a consecutive map --
+        compact windows back to back, then the shared region -- reads at the
+        same rate as any other placement.
         """
         if isa_guard_bytes < 0 or isa_guard_bytes % PRIVATE_ALIGN:
             raise ValueError("isa_guard_bytes must be a nonnegative multiple of 16 MiB")
@@ -1363,6 +1387,28 @@ class PrivateArena:
         # private reserve. Each is LIFO within itself and they are independent.
         self._shared_up_cursor = [r.weight_base for r in self.regions]
         self._shared_up_allocs: list[dict] = []
+        # With a shared region the window tails are never lent: the two shared
+        # cursors move inside the region instead, and every shared method below
+        # reports ONE pool where the tail pool reports one entry per window.
+        self.shared_region = None
+        if shared_region is not None:
+            s_base, s_bytes = shared_region
+            if s_bytes <= 0 or s_base % SRAM_ROW_BYTES or s_bytes % SRAM_ROW_BYTES:
+                raise ValueError(
+                    f"shared region 0x{s_base:X} + 0x{s_bytes:X} must be positive and "
+                    f"{SRAM_ROW_BYTES} B aligned")
+            spans = ([(b, b + n) for b, n in windows] if windows is not None
+                     else [(arena_base, arena_base + arena_bytes)])
+            if external_isa is not None:
+                spans += [(r.isa_base, r.isa_base + self.isa_bytes) for r in self.regions]
+            for lo, hi in spans:
+                if s_base < hi and lo < s_base + s_bytes:
+                    raise ValueError(
+                        f"shared region 0x{s_base:X}..0x{s_base + s_bytes:X} overlaps "
+                        f"the private windows at 0x{lo:X}..0x{hi:X}")
+            self.shared_region = (s_base, s_bytes)
+            self._region_down = s_base + s_bytes
+            self._region_up = s_base
         if verbose:
             print(self.describe())
 
@@ -1409,6 +1455,10 @@ class PrivateArena:
                 lines.append(
                     f"    {self.isa_guard_bytes / 2**20:.0f} MB unused guard "
                     "between each tensor slice and ISA slice")
+            if self.shared_region is not None:
+                base, size = self.shared_region
+                lines.append(f"    shared region 0x{base:09X} .. 0x{base + size:09X} "
+                             f"({size / 2**20:.0f} MB)")
             return "\n".join(lines)
         if self.external_isa is None:
             return describe_private_map(self.num_engines, self.arena_base,
@@ -1513,6 +1563,10 @@ class PrivateArena:
             raise ValueError(
                 f"private reserve {bytes_per_engine / 2**20:.1f} MiB exceeds the "
                 f"{capacity / 2**20:.1f} MiB weight arena per core")
+        if self.shared_region is not None:
+            # Nothing is lent from the windows; the reserve is only checked.
+            self._private_reserve = [bytes_per_engine] * self.num_engines
+            return
         for i in range(self.num_engines):
             lent = self.regions[i].weight_limit - self._shared_cursor[i]
             if lent and self._shared_cursor[i] < self.regions[i].weight_base + bytes_per_engine:
@@ -1526,7 +1580,12 @@ class PrivateArena:
                 self._shared_up_cursor[i] = floor
 
     def shared_free(self) -> list[int]:
-        """Free bytes per window the shared pool may still take."""
+        """Free bytes per window the shared pool may still take.
+
+        One entry, the region's free bytes, when the pool has its own region.
+        """
+        if self.shared_region is not None:
+            return [self._region_down - self._region_up]
         return [max(0, self._shared_cursor[i]
                     - max(self._weight_cursor[i], self._shared_up_cursor[i],
                           self.regions[i].weight_base + self._private_reserve[i]))
@@ -1547,6 +1606,18 @@ class PrivateArena:
             raise ValueError(f"{what}: shared allocation must be positive, got {size_bytes}")
         if align <= 0 or align & (align - 1):
             raise ValueError(f"{what}: align must be a power of two, got {align}")
+        if self.shared_region is not None:
+            # engine_idx only picks a window tail; the region has one pool.
+            addr = (self._region_down - size_bytes) & ~(align - 1)
+            if addr < self._region_up:
+                raise MemoryError(
+                    f"{what}: {size_bytes / 2**20:.2f} MB does not fit the shared "
+                    f"region ({self.shared_region[1] / 2**20:.1f} MB, "
+                    f"{(self._region_down - self._region_up) / 2**20:.2f} MB free)")
+            self._region_down = addr
+            self._shared_allocs.append(
+                {"engine": None, "base": addr, "size": size_bytes, "what": what})
+            return addr
         if engine_idx is None:
             free = self.shared_free()
             engine_idx = max(range(self.num_engines), key=lambda i: free[i])
@@ -1582,6 +1653,8 @@ class PrivateArena:
         released in strict reverse order (everything after the mark goes), which
         is exactly the phase structure and nothing more.
         """
+        if self.shared_region is not None:
+            return ((self._region_down,), len(self._shared_allocs))
         return (tuple(self._shared_cursor), len(self._shared_allocs))
 
     def shared_release(self, mark: tuple) -> int:
@@ -1593,6 +1666,20 @@ class PrivateArena:
         not a fault. Release only at a phase boundary.
         """
         cursors, alloc_count = mark
+        if self.shared_region is not None:
+            if len(cursors) != 1:
+                raise ValueError("shared_release: mark is from a different arena")
+            want = cursors[0]
+            if want < self._region_down:
+                raise ValueError(
+                    f"shared_release: region cursor 0x{self._region_down:X} is already "
+                    f"below the mark 0x{want:X}; marks release in reverse order only")
+            if want > sum(self.shared_region):
+                raise ValueError("shared_release: mark is outside the shared region")
+            reclaimed = want - self._region_down
+            self._region_down = want
+            del self._shared_allocs[alloc_count:]
+            return reclaimed
         if len(cursors) != self.num_engines:
             raise ValueError("shared_release: mark is from a different arena")
         reclaimed = 0
@@ -1622,6 +1709,17 @@ class PrivateArena:
             raise ValueError(f"{what}: allocation must be positive, got {size_bytes}")
         if align <= 0 or align & (align - 1):
             raise ValueError(f"{what}: align must be a power of two, got {align}")
+        if self.shared_region is not None:
+            addr = (self._region_up + align - 1) & ~(align - 1)
+            if addr + size_bytes > self._region_down:
+                raise MemoryError(
+                    f"{what}: {size_bytes / 2**20:.2f} MB does not fit the shared "
+                    f"region ({self.shared_region[1] / 2**20:.1f} MB, "
+                    f"{(self._region_down - self._region_up) / 2**20:.2f} MB free)")
+            self._region_up = addr + size_bytes
+            self._shared_up_allocs.append(
+                {"engine": None, "base": addr, "size": size_bytes, "what": what})
+            return addr
         if engine_idx is None:
             free = self.shared_free()
             engine_idx = max(range(self.num_engines), key=lambda i: free[i])
@@ -1670,10 +1768,24 @@ class PrivateArena:
         return reclaimed
 
     def shared_up_mark(self) -> tuple:
+        if self.shared_region is not None:
+            return ((self._region_up,), len(self._shared_up_allocs))
         return (tuple(self._shared_up_cursor), len(self._shared_up_allocs))
 
     def shared_up_release(self, mark: tuple) -> int:
         cursors, alloc_count = mark
+        if self.shared_region is not None:
+            if len(cursors) != 1:
+                raise ValueError("shared_up_release: mark is from a different arena")
+            want = cursors[0]
+            if want > self._region_up:
+                raise ValueError(
+                    f"shared_up_release: region cursor 0x{self._region_up:X} is already "
+                    f"below the mark 0x{want:X}; marks release in reverse order only")
+            reclaimed = self._region_up - want
+            self._region_up = want
+            del self._shared_up_allocs[alloc_count:]
+            return reclaimed
         if len(cursors) != self.num_engines:
             raise ValueError("shared_up_release: mark is from a different arena")
         reclaimed = 0
@@ -1689,13 +1801,17 @@ class PrivateArena:
         return reclaimed
 
     def shared_up_usage(self) -> list[int]:
+        if self.shared_region is not None:
+            return [self._region_up - self.shared_region[0]]
         return [self._shared_up_cursor[i]
                 - max(self.regions[i].weight_base + self._private_reserve[i],
                       self._weight_cursor[i])
                 for i in range(self.num_engines)]
 
     def shared_usage(self) -> list[int]:
-        """Bytes lent to the shared pool per window."""
+        """Bytes lent to the shared pool per window (one entry for a region)."""
+        if self.shared_region is not None:
+            return [sum(self.shared_region) - self._region_down]
         return [self.regions[i].weight_limit - self._shared_cursor[i]
                 for i in range(self.num_engines)]
 
@@ -1705,6 +1821,12 @@ class PrivateArena:
 
     def describe_shared(self) -> str:
         used, free = self.shared_usage(), self.shared_free()
+        if self.shared_region is not None:
+            base, size = self.shared_region
+            return (f"  Shared region 0x{base:09X} .. 0x{base + size:09X} "
+                    f"({size / 2**20:.1f} MB): {used[0] / 2**20:.1f} MB weights from the "
+                    f"top, {self.shared_up_usage()[0] / 2**20:.1f} MB tensors from the "
+                    f"base, {free[0] / 2**20:.1f} MB free")
         lines = [f"  Shared pool inside the private windows "
                  f"({sum(used) / 2**20:.1f} MB placed, "
                  f"{sum(free) / 2**20:.1f} MB still free):"]
