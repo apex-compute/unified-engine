@@ -41,30 +41,57 @@ class Gemma4MulticoreLayout(unittest.TestCase):
         self.stack.enter_context(patch.object(core, "configure_clock_from_hardware",
             side_effect=AssertionError("unexpected hardware access")))
 
-    def engine(self, cores=8, gib=8, active=8):
+    # Engine clock per board: it is what tells the interleaved kintex7 (213 MHz
+    # release image) from kintex7_systolic (150 MHz), see dram_interleaved.
+    CLOCK_HZ = {2: 213.2e6, 8: 333.3e6, 12: 290e6}
+
+    def engine(self, cores=8, gib=8, active=8, clock_hz=None):
         with patch.multiple(core, ANDROMEDA_CORE_COUNT=cores,
-                            AVAILABLE_DRAM_SIZE_GB=gib, CLOCK_CYCLE_TIME_NS=4.0), \
+                            AVAILABLE_DRAM_SIZE_GB=gib, CLOCK_CYCLE_TIME_NS=4.0,
+                            CORE_CLOCK_FREQ_HZ=clock_hz or self.CLOCK_HZ[cores]), \
                 patch.object(gemma.Gemma4_UnifiedEngine, "weight_init"), \
                 patch.object(gemma.Gemma4_UnifiedEngine, "tensor_init"), \
                 patch.object(core.UnifiedEngine, "dma_to_accelerator_memory"), \
                 patch("builtins.print"):
             return gemma.Gemma4_UnifiedEngine(multi_core=active)
 
-    def test_kintex_two_engine_tiles_follow_separate_ddr_controllers(self):
-        engine = self.engine(2, 4, 2)
-        self.assertTrue(engine._kintex_tiled_map)
+    def assert_packed(self, engine, cores, gib, window):
+        """Windows back to back from 0, one shared region to the end of DRAM."""
         self.assertTrue(engine._tiled_map)
-        self.assertEqual(engine._tile_bases, [0, 2 << 30])
-        self.assertEqual(engine.mc_arena.windows, [(0, 2 << 30), (2 << 30, 2 << 30)])
+        self.assertTrue(engine.dram_layout.startswith(f"pack{cores}_"))
+        self.assertEqual(engine._tile_bases, [i * window for i in range(cores)])
+        self.assertEqual(engine.mc_arena.windows, [(i * window, window) for i in range(cores)])
+        self.assertEqual(engine._shared_region, (cores * window, (gib << 30) - cores * window))
+        self.assertEqual(engine.mc_arena.shared_region, engine._shared_region)
+        self.assertEqual(engine.DRAM_END, gib << 30)
         self.assertEqual(engine.mc_arena.tensor_bytes, 64 << 20)
-        self.assertEqual(engine.mc_arena._private_reserve, [1 << 30, 1 << 30])
-        self.assertEqual(engine.DRAM_END, 4 << 30)
+        # The tensor extent and every shared section live in the shared region.
         self.assertEqual(engine.TENSOR_LIMIT - engine._tensor_dram_base, 480 << 20)
-        self.assertLessEqual(engine.TENSOR_LIMIT, engine.VISION_ISA_BASE)
-        self.assertEqual(engine.mc_arena.isa_base(1), 0xFB000000)
+        self.assertGreaterEqual(engine._tensor_dram_base, cores * window)
+        self.assertEqual(engine.VISION_ISA_BASE, engine.mc_arena.isa_base(0))
         self.assertLess(engine.LM_ISA_BASE, engine.MASTER_ISA_LIMIT)
         self.assertEqual(engine.MASTER_ISA_LIMIT, engine.mc_arena.regions[0].tensor_base)
+        for i in range(cores):
+            region = engine.mc_arena.regions[i]
+            self.assertEqual(region.tensor_base + (64 << 20), (i + 1) * window)
+
+    def test_kintex_two_engines_pack_private_windows_below_one_shared_region(self):
+        engine = self.engine(2, 4, 2)
+        self.assertTrue(engine._kintex_tiled_map)
+        # 1 GiB private reserve + 16 MiB ISA + 64 MiB tensor per engine.
+        self.assert_packed(engine, 2, 4, (1 << 30) + (80 << 20))
+        self.assertEqual(engine.mc_arena._private_reserve, [1 << 30, 1 << 30])
         self.assertNotEqual(engine.dram_layout, self.engine(active=2).dram_layout)
+
+    def test_kintex7_systolic_keeps_one_tile_per_ddr_channel(self):
+        engine = self.engine(2, 4, 2, clock_hz=150e6)
+        self.assertTrue(engine._tiled_map)
+        self.assertIsNone(engine._shared_region)
+        self.assertEqual(engine._tile_bases, [0, 2 << 30])
+        self.assertEqual(engine.mc_arena.windows, [(0, 2 << 30), (2 << 30, 2 << 30)])
+        self.assertEqual(engine.DRAM_END, 4 << 30)
+        self.assertLessEqual(engine.TENSOR_LIMIT, engine.VISION_ISA_BASE)
+        self.assertEqual(engine.mc_arena.isa_base(1), 0xFB000000)
 
     def test_kintex_budget_covers_private_down_copies_shared_layers_and_scratch(self):
         engine = self.engine(2, 4, 2)
@@ -130,16 +157,13 @@ class Gemma4MulticoreLayout(unittest.TestCase):
             self.assertIsNotNone(call.kwargs["main_scale_addr"])
             self.assertFalse(call.kwargs["name"].startswith(("gate", "up", "down")))
 
-    def test_u50_full_eight_engine_shared_pool_map_is_preserved(self):
+    def test_u50_eight_engines_pack_private_windows_below_one_shared_region(self):
         engine = self.engine()
-        self.assertTrue(engine._tiled_map)
-        self.assertEqual(engine._tile_bases, [i << 30 for i in range(8)])
-        self.assertEqual(engine.mc_arena.stride, 1 << 30)
-        self.assertEqual(engine.mc_arena.tensor_bytes, 64 << 20)
-        self.assertEqual(engine.TENSOR_LIMIT - engine._tensor_dram_base, 480 << 20)
-        self.assertEqual(engine.VISION_ISA_BASE, engine.mc_arena.isa_base(0))
-        self.assertLess(engine.LM_ISA_BASE, engine.MASTER_ISA_LIMIT)
+        # 256 MiB private reserve + 16 MiB ISA + 64 MiB tensor per engine.
+        self.assert_packed(engine, 8, 8, 336 << 20)
         self.assertLessEqual(engine.mc_arena.usage()[0], 256 << 20)
+        # The shared region is ONE pool: 8 GiB minus the windows.
+        self.assertEqual(len(engine.mc_arena.shared_free()), 1)
 
     def test_u55c_tiled_windows_follow_native_stack_controller_map(self):
         engine = self.engine(12, 16, 12)
@@ -159,15 +183,18 @@ class Gemma4MulticoreLayout(unittest.TestCase):
                 self.assertEqual(engine.DRAM_END, model_base + (2 << 30))
                 for base, size in expected:
                     self.assertTrue(base + size <= model_base or base >= engine.DRAM_END)
-        self.assertEqual(self.engine(active=4)._board_windows,
-                         [(base, 512 << 20) for base in shard.alveo_core_bases(4)])
+        # Interleaved U50: sequential 512 MiB windows, the model map right after.
+        u50 = self.engine(active=4)
+        self.assertEqual(u50._board_windows, [(i << 29, 512 << 20) for i in range(4)])
+        self.assertEqual(u50._params_dram_base, 2 << 30)
 
     def test_layout_identity_distinguishes_same_count_on_different_boards(self):
         u50 = self.engine()
         u55 = self.engine(12, 16, 8)
         self.assertNotEqual(u50.dram_layout, u55.dram_layout)
         self.assertEqual(u50.dram_layout, self.engine().dram_layout)
-        self.assertTrue(u50.dram_layout.startswith("tile8_"))
+        self.assertTrue(u50.dram_layout.startswith("pack8_"))
+        self.assertTrue(u55.dram_layout.startswith("tile8_"))
         self.assertNotEqual(self.engine(active=2).dram_layout,
                             self.engine(active=4).dram_layout)
         self.assertEqual(self.engine(active=1).dram_layout, "legacy")

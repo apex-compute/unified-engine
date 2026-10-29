@@ -47,7 +47,8 @@ class Gemma4E4BVariant(unittest.TestCase):
 
     def engine(self, cores=8, gib=8, active=8):
         with patch.multiple(core, ANDROMEDA_CORE_COUNT=cores,
-                            AVAILABLE_DRAM_SIZE_GB=gib, CLOCK_CYCLE_TIME_NS=4.0), \
+                            AVAILABLE_DRAM_SIZE_GB=gib, CLOCK_CYCLE_TIME_NS=4.0,
+                            CORE_CLOCK_FREQ_HZ=333.3e6), \
                 patch.object(gemma.Gemma4_UnifiedEngine, "weight_init"), \
                 patch.object(gemma.Gemma4_UnifiedEngine, "tensor_init"), \
                 patch.object(core.UnifiedEngine, "dma_to_accelerator_memory"), \
@@ -73,16 +74,19 @@ class Gemma4E4BVariant(unittest.TestCase):
         self.assertEqual(engine._get_layer_attention_dims(5), (512, 4096, 1024))
         self.assertEqual(engine.k_size, 512 * 2 * 2)   # widest KV row, bytes
 
-    def test_u50_tiled_map_and_private_reserve(self):
+    def test_u50_packed_map_and_private_reserve(self):
         engine = self.engine()
         self.assertTrue(engine._tiled_map)
-        self.assertEqual(engine._tile_bases, [i << 30 for i in range(8)])
-        self.assertEqual(engine.mc_arena.tensor_bytes, 64 << 20)
-        self.assertEqual(engine.TENSOR_LIMIT - engine._tensor_dram_base, 480 << 20)
-        # E4B's private slices need ~337 MiB/engine, more than E2B's 256 MiB floor.
+        # E4B's private slices need ~337 MiB/engine, more than E2B's 256 MiB floor,
+        # and the packed window is sized from them: reserve + 16 MiB ISA + 64 MiB tensor.
         bound = gemma.Gemma4_UnifiedEngine._private_weight_bytes(None, 8)
         self.assertGreater(bound, 256 << 20)
         self.assertEqual(engine.mc_arena._private_reserve, [bound] * 8)
+        window = bound + (80 << 20)
+        self.assertEqual(engine._tile_bases, [i * window for i in range(8)])
+        self.assertEqual(engine._shared_region, (8 * window, (8 << 30) - 8 * window))
+        self.assertEqual(engine.mc_arena.tensor_bytes, 64 << 20)
+        self.assertEqual(engine.TENSOR_LIMIT - engine._tensor_dram_base, 480 << 20)
 
 
 if __name__ == "__main__":
