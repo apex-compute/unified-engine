@@ -302,8 +302,8 @@ class MoonshineEngine(UnifiedEngine):
                  _parse_addr(lay["program_dram_base"]), self.PRIMARY_PROGRAM_LIMIT]
         self.windows = None
         if engines > 1:
-            # Controller-aware map: private 512 MiB windows per engine on HBM0 (board SAXI order),
-            # the model's own 2 GiB map on the second stack, disjoint from every window.
+            # Board map: private 512 MiB windows per engine (consecutive from 0 on interleaved
+            # DRAM), and the model's own 2 GiB map placed disjoint from every window.
             if dev:
                 user_dma_core.set_dma_device(dev)
             windows, model_base = model_multicore_layout(engines, model_bytes=2 << 30)

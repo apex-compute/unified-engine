@@ -7,7 +7,7 @@ engine emits its own projection addresses, preserving the existing row split,
 camera batching, arithmetic and worker-program allocation.
 
 Copies occupy free Alveo controller windows above the fixed low-4-GiB model.
-U50 supports eight 512 MiB windows; 16 GiB U55C supports twelve separate 1 GiB
+U50 packs eight 512 MiB windows consecutively from 4 GiB; 16 GiB U55C supports twelve separate 1 GiB
 regions. The 8 GiB U55C image has four free controllers, shared cyclically by
 additional engines. Kintex keeps shared weights because this fixed layout has
 no free external reserve.

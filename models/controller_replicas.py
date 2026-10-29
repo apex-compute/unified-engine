@@ -6,11 +6,18 @@ activations, or caches, and cannot free a second controller on a full Kintex map
 from __future__ import annotations
 
 import user_dma_core as core
-from multi_engine_shard import board_private_windows
+from multi_engine_shard import board_private_windows, dram_interleaved
+
+REPLICA_SLOT_BYTES = 512 << 20
 
 
 def free_controller_windows(num_engines: int) -> list[tuple[int, int]]:
-    """Free HBM controller segments outside the model's reserved [0, 4 GiB)."""
+    """Free HBM regions outside the model's reserved [0, 4 GiB).
+
+    On interleaved HBM (the U50) any placement reads at the same rate, so the
+    replicas are packed consecutively above the model, 512 MiB per engine. The
+    U55C picks whole memory controllers around the model.
+    """
     if num_engines < 1:
         raise ValueError('engine count must be positive')
     if num_engines == 1:
@@ -22,6 +29,10 @@ def free_controller_windows(num_engines: int) -> list[tuple[int, int]]:
         raise ValueError(f'{num_engines} engines exceed HW_INFO count {cores}')
     if gib < 8:
         return []
+    if dram_interleaved():
+        slots = ((gib - 4) << 30) // REPLICA_SLOT_BYTES
+        return [((4 << 30) + i * REPLICA_SLOT_BYTES, REPLICA_SLOT_BYTES)
+                for i in range(min(num_engines, slots))]
     if (cores, gib) == (12, 16):
         board = board_private_windows(num_engines, reserve=(0, 4 << 30))
     else:

@@ -70,15 +70,17 @@ The controller map comes from HW_INFO, with a separate shared model region:
 
 | Board | Private weights | Shared model region |
 |---|---|---|
-| Kintex-7, 4 GiB | 512 MiB windows at 0 and 3 GiB, one per DDR controller | 1–3 GiB |
-| U50, 8 GiB | 512 MiB per engine in the measured SAXI/controller order | 6–8 GiB |
+| Kintex-7, 4 GiB (interleaved DDR3) | 512 MiB per engine from 0 | 1–3 GiB |
+| Kintex-7 systolic, 4 GiB | 512 MiB windows at 0 and 3 GiB, one per DDR controller | 1–3 GiB |
+| U50, 8 GiB (interleaved HBM) | 512 MiB per engine from 0 | directly above the windows (8 engines: 4–6 GiB) |
 | U55C, 16 GiB | One 1 GiB controller region per engine, up to 12 engines | 6–8 GiB |
 | U55C, 8 GiB | Up to six private 1 GiB controllers; seven to twelve engines share controllers using disjoint 512 MiB segments | 6–8 GiB |
 
-The Kintex layout uses different DDR controllers while retaining a contiguous
-2 GiB model region. Its spacing is 3 GiB; selecting separate controllers is what
-enables the memory-bandwidth advantage. The approximately 12 GB/s memory-copy
-result does not imply the same end-to-end model throughput.
+On the interleaved boards every address spreads over all memory controllers, so
+the windows are simply consecutive. The systolic Kintex image is not interleaved:
+its layout uses different DDR controllers while retaining a contiguous 2 GiB
+model region. The approximately 12 GB/s memory-copy result does not imply the
+same end-to-end model throughput.
 
 To compare exact generated tokens and hardware decode timing with one versus
 multiple engines, run:
