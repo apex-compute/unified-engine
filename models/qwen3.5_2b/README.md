@@ -53,21 +53,25 @@ convolution state, attention, normalization, and residual operations remain on
 the primary engine. Every prompt token and generated token launches matching
 worker programs, and the LM head merges the per-engine argmax results.
 
-Kintex7 uses these nonoverlapping regions:
+Kintex7 (interleaved DDR3) uses these nonoverlapping regions:
 
 | Data | Address range | Observed allocation at context 512 |
 |---|---|---|
-| Engine 0 private weights/ISA/scratch | 0–512 MiB, DDR0 | 476.27 MiB weights |
+| Engine 0 private weights/ISA/scratch | 0–512 MiB | 476.27 MiB weights |
+| Engine 1 private weights/ISA/scratch | 512 MiB–1 GiB | 476.27 MiB weights, 215 KiB worker instructions |
 | Shared parameters | 1–2 GiB | 964.00 MiB |
 | Shared recurrent state and activations | 2–2.5 GiB | 130.28 MiB persistent; transient activations reuse the remainder |
 | Primary instructions | 2.5–3 GiB | 7.64 MiB decoder |
-| Engine 1 private weights/ISA/scratch | 3–3.5 GiB, DDR1 | 476.27 MiB weights, 215 KiB worker instructions |
+
+The systolic Kintex7 image, whose DDR3 is not interleaved, puts engine 1's
+window at 3–3.5 GiB on the second DDR channel instead.
 
 Each private window reserves 16 MiB for instructions and 16 MiB for scratch,
 leaving a 480 MiB weight budget. The complete shard plan is checked before DMA;
 this model has only 3.73 MiB spare per engine in the two-engine layout. The host
 keeps the BF16 embedding table. The original single-engine map stays unchanged.
-U50 follows the hardware SAXI controller order, with the shared model at 6–8 GiB.
+The U50 (interleaved HBM) puts the windows at 512 MiB per engine from 0 and the
+shared model directly above them (8 engines: 4–6 GiB).
 
 Multicore currently supports text generation through the builder. It compiles
 primary and worker instructions together after every weight load; legacy

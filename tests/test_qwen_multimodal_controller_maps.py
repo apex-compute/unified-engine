@@ -45,25 +45,40 @@ class MultimodalControllerMaps(unittest.TestCase):
             guard.start()
             self.addCleanup(guard.stop)
 
-    def engine(self, module, cores=8, gib=8, active=8):
+    # Engine clock per board: it is what tells the interleaved kintex7 (213 MHz
+    # release image) from kintex7_systolic (150 MHz), see dram_interleaved.
+    CLOCK_HZ = {2: 213.2e6, 4: 300e6, 8: 333.3e6, 12: 290e6}
+
+    def engine(self, module, cores=8, gib=8, active=8, clock_hz=None, **kwargs):
         cls = module.Qwen25VL_UnifiedEngine if module is VL else module.Qwen25OmniUnifiedEngine
         with patch.multiple(core, ANDROMEDA_CORE_COUNT=cores, AVAILABLE_DRAM_SIZE_GB=gib,
-                            CLOCK_CYCLE_TIME_NS=3.0), contextlib.redirect_stdout(io.StringIO()):
-            return cls(multi_core=active)
+                            CLOCK_CYCLE_TIME_NS=3.0,
+                            CORE_CLOCK_FREQ_HZ=clock_hz or self.CLOCK_HZ[cores]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return cls(multi_core=active, **kwargs)
 
-    def test_vl_u50_keeps_engine_saxi_order_for_all_active_counts(self):
+    def assert_vl_consecutive(self, engine, active):
+        """Sequential 512 MiB windows, the 2 GiB model map directly above them."""
+        self.assertEqual(engine._board_windows,
+                         [(i << 29, 512 << 20) for i in range(active)])
+        self.assertEqual(engine.PARAMS_BASE, active << 29)
+        self.assertEqual(engine.DRAM_END, engine.PARAMS_BASE + (2 << 30))
+        self.assertEqual(engine.mc_arena.windows, engine._board_windows)
+        self.assertEqual(engine.mc_arena.weight_bytes(), 496 << 20)
+        for index in range(1, active):
+            self.assertGreaterEqual(engine.mc_arena.isa_base(index), engine.WORKER_ISA_BASE)
+            self.assertLessEqual(engine.mc_arena.isa_limit(index), engine.DRAM_END)
+
+    def test_vl_u50_model_map_follows_the_sequential_windows(self):
         for active in (2, 4, 8):
             with self.subTest(active=active):
-                engine = self.engine(VL, active=active)
-                self.assertEqual(engine._board_windows,
-                                 [(base, 512 << 20) for base in shard.alveo_core_bases(active)])
-                self.assertEqual(engine.PARAMS_BASE, 6 << 30)
-                self.assertEqual(engine.DRAM_END, 8 << 30)
-                self.assertEqual(engine.mc_arena.windows, engine._board_windows)
-                self.assertEqual(engine.mc_arena.weight_bytes(), 496 << 20)
-                for index in range(1, active):
-                    self.assertGreaterEqual(engine.mc_arena.isa_base(index), engine.WORKER_ISA_BASE)
-                    self.assertLessEqual(engine.mc_arena.isa_limit(index), engine.DRAM_END)
+                self.assert_vl_consecutive(self.engine(VL, active=active), active)
+
+    def test_vl_kintex7_two_engines_fit_4_gib(self):
+        # 2 x 512 MiB windows + the 2 GiB model map = 3 GiB of the 4 GiB DDR3.
+        engine = self.engine(VL, cores=2, gib=4, active=2)
+        self.assert_vl_consecutive(engine, 2)
+        self.assertEqual(engine.DRAM_END, 3 << 30)
 
     def test_vl_u55c_windows_avoid_shared_model_for_8_and_16_gib_images(self):
         for gib in (8, 16):
@@ -72,7 +87,8 @@ class MultimodalControllerMaps(unittest.TestCase):
                     engine = self.engine(VL, cores=12, gib=gib, active=active)
                     self.assertEqual(len(engine._board_windows), active)
                     for base, size in engine._board_windows:
-                        self.assertTrue(base + size <= 6 << 30 or base >= 8 << 30)
+                        self.assertTrue(base + size <= engine.PARAMS_BASE
+                                        or base >= engine.DRAM_END)
                         self.assertLessEqual(base + size, gib << 30)
                     size = (512 << 20) if gib == 8 and active > 6 else (1 << 30)
                     self.assertEqual({span for _, span in engine._board_windows}, {size})
@@ -83,8 +99,9 @@ class MultimodalControllerMaps(unittest.TestCase):
         with patch.object(VL, "model_multicore_layout", side_effect=ValueError("bad controller map")), \
                 self.assertRaisesRegex(ValueError, "bad controller map"):
             self.engine(VL)
+        # kintex7_systolic places windows per DDR3 channel and keeps the 8 GB rule.
         with self.assertRaisesRegex(ValueError, "needs the 8 GB DRAM map"):
-            self.engine(VL, cores=2, gib=4, active=2)
+            self.engine(VL, cores=2, gib=4, active=2, clock_hz=150e6)
 
     def test_vl_single_core_retains_original_map_without_private_arena(self):
         engine = self.engine(VL, active=1)
@@ -92,31 +109,47 @@ class MultimodalControllerMaps(unittest.TestCase):
         self.assertEqual(engine.DRAM_END, 4 << 30)
         self.assertIsNone(engine.mc_arena)
 
-    def test_omni_preserves_whole_device_capacity_and_guarded_windows(self):
+    def test_omni_windowed_preserves_whole_device_capacity_and_guarded_windows(self):
         for cores, gib in ((8, 8), (12, 8), (12, 16)):
             with self.subTest(cores=cores, gib=gib), \
                     patch.dict(os.environ, {}, clear=True):
-                engine = self.engine(OMNI, cores=cores, gib=gib)
+                engine = self.engine(OMNI, cores=cores, gib=gib, layout="windowed")
                 with patch.multiple(core, ANDROMEDA_CORE_COUNT=cores,
                                     AVAILABLE_DRAM_SIZE_GB=gib):
                     expected = shard.tiled_window_bases(8, 1 << 30, "Qwen Omni test")
-                self.assertEqual(engine.mc_arena.windows, [(base, 1 << 30) for base in expected])
-                self.assertEqual(engine.mc_arena.arena_bytes, 8 << 30)
-                self.assertGreater(engine.mc_arena.weight_bytes(), 512 << 20)
+                arena = engine.layout
+                self.assertEqual(arena.kind, "windowed")
+                self.assertEqual(arena.windows, [(base, 1 << 30) for base in expected])
+                self.assertEqual(arena.arena_bytes, 8 << 30)
+                self.assertGreater(arena.weight_bytes(), 512 << 20)
                 for index, base in enumerate(expected):
-                    region = engine.mc_arena.regions[index]
-                    self.assertEqual(engine.mc_arena.isa_limit(index), base + (1 << 30))
-                    self.assertEqual(region.isa_base - region.tensor_base - engine.mc_arena.tensor_bytes,
-                                     OMNI.OMNI_ISA_GUARD_BYTES)
+                    region = arena.regions[index]
+                    self.assertEqual(arena.isa_limit(index), base + (1 << 30))
+                    self.assertEqual(region.isa_base - region.tensor_base - arena.tensor_bytes,
+                                     OMNI._layout_mod.OMNI_ISA_GUARD_BYTES)
+
+    def test_omni_flat_is_one_consecutive_map_inside_the_device(self):
+        # The U50 map (flat on interleaved DRAM): private weights,
+        # shared pools, tensor zones and ISA back to back from 0.
+        with patch.dict(os.environ, {}, clear=True):
+            plan = OMNI._layout_mod.plan_flat({"lm", "vision", "audio"})
+            engine = self.engine(OMNI, layout="flat", flat_plan=plan)
+        arena = engine.layout
+        self.assertEqual(arena.kind, "flat")
+        self.assertEqual(arena.regions[0].weight_base, 0)
+        bases = [r.weight_base for r in arena.regions]
+        self.assertEqual(bases, [i * arena.weight_bytes() for i in range(8)])
+        self.assertLessEqual(arena.map_end, 8 << 30)
+        self.assertGreaterEqual(arena.max_context, 4096)
 
     def test_omni_rejects_forced_capacity_before_any_allocation(self):
         with patch.dict(os.environ, {"UE_FORCE_DRAM_SIZE_GB": "8"}), \
                 self.assertRaisesRegex(ValueError, "must be backed by DRAM"):
-            self.engine(OMNI)
+            self.engine(OMNI, layout="windowed")
 
     def test_omni_program_cache_rejects_changed_controller_order(self):
         with patch.dict(os.environ, {}, clear=True):
-            engine = self.engine(OMNI)
+            engine = self.engine(OMNI, layout="windowed")
         manifest = dict(schema_version=1, config_sha256="config", generation_id="generation",
                         params_size=64, model_revision="revision", generation_trailer_bytes=0,
                         regions={})
@@ -134,7 +167,8 @@ class MultimodalControllerMaps(unittest.TestCase):
                 first_bundle.store_stage("decode", [dict(engine_index=0,
                     dram_base=engine.ISA_BASE, bytes=bytes(64))])
                 first_bases = first_bundle.identity["hardware"]["dram_map"]["worker_isa_bases"]
-                with patch.object(engine.mc_arena, "isa_base", side_effect=reversed(first_bases)):
+                reordered = first_bases[::-1]
+                with patch.object(engine.layout, "isa_base", side_effect=lambda i: reordered[i]):
                     engine.configure_runtime_artifacts(str(params), tmp)
                 self.assertNotEqual(first_bundle.identity, engine._program_bundle.identity)
                 with self.assertRaisesRegex(OMNI._program_mod.ProgramBundleError, "identity"):

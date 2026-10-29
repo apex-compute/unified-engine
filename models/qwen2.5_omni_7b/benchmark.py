@@ -224,10 +224,10 @@ def _make_multi_engine_ues(dev: str, num_engines: int, *, attention_only: bool =
     """``num_engines`` engines on their board-assigned private windows.
 
     Use the board's private windows. Attention-only calls have no weights:
-    on U50 their tensors live in the second private 512 MiB segment while ISA
-    stays in the first; on a contiguous window, tensors run from the normal
-    tensor offset to a 16 MiB ISA reservation at the far end. Never join U50's
-    non-contiguous segments. Matmul calls keep the usual layout.
+    on a contiguous window, tensors run from the normal tensor offset to a
+    16 MiB ISA reservation at the far end; a window of several segments keeps
+    its tensors in the second segment and its ISA in the first, and the
+    segments are never joined. Matmul calls keep the usual layout.
     """
     import user_dma_core as udc
     import multi_engine_shard as mes

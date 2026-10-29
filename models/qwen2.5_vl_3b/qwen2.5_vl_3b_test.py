@@ -92,35 +92,27 @@ MIN_CONTEXT_SIZE = 512
 # computed per engine count -- so the ceiling was the map's, not the model's.
 MAX_ENGINES = 12
 
-# MULTI-CORE MAP (>= 8 GB device; single core keeps the historical 4 GB map):
-#   private controller windows in hardware engine order (see shared board policy)
-#   [6 GiB, 8 GiB)   -- this model's own 2 GB map, rebased wholesale. Every
-#                       internal offset is unchanged, and the map sits at the
-#                       TOP at every engine count, so adding cores moves no
-#                       model address. Same arrangement as gemma3/gemma4_e2b.
-MULTI_CORE_MODEL_BASE = 0x180000000
-MULTI_CORE_DRAM_LIMIT = 0x200000000
-MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - 0x80000000
-
-# Preserve the complete 2 GiB model map and put private shards on the board's
-# measured controller regions. Engine order must remain the board's SAXI order;
-# sorting addresses silently assigns U50 engines to different controllers.
-MULTI_CORE_MODEL_SPAN = MULTI_CORE_DRAM_LIMIT - MULTI_CORE_MODEL_BASE
+# MULTI-CORE MAP (single core keeps the historical 4 GB map):
+#   private windows from the board policy (multi_engine_shard.model_multicore_layout)
+#   then this model's own 2 GB map, rebased wholesale. Every internal offset is
+#   unchanged; only the map base moves. On interleaved DRAM (U50, kintex7) the
+#   windows are 512 MiB each from 0 and the map follows them directly -- 8 cores:
+#   [4 GiB, 6 GiB), 2 cores: [1 GiB, 3 GiB) -- so nothing above the map is
+#   reserved. Boards that place windows by controller (U55C) prefer 6 GiB.
+MULTI_CORE_PREFERRED_MODEL_BASE = 0x180000000
+MULTI_CORE_MODEL_SPAN = 2 << 30
 
 
 def _board_multicore_map(num_engines: int):
-    """Controller windows that leave this model's fixed 6–8 GiB map clear.
+    """Private windows and the base of this model's 2 GB map, from the board.
 
     Unknown boards and overlapping maps fail before allocation. In particular,
     do not fall back to a core-index stride when the board policy rejects a map.
     """
     require_multicore_dram(num_engines, "Qwen2.5-VL-3B")
-    windows, model_base = model_multicore_layout(
+    return model_multicore_layout(
         num_engines, model_bytes=MULTI_CORE_MODEL_SPAN,
-        preferred_model_base=MULTI_CORE_MODEL_BASE)
-    if model_base != MULTI_CORE_MODEL_BASE:
-        raise ValueError("Qwen2.5-VL-3B requires its shared model map at 6–8 GiB")
-    return windows
+        preferred_model_base=MULTI_CORE_PREFERRED_MODEL_BASE)
 
 
 class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine):
@@ -171,12 +163,9 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
         # [ weights | tensor ]; U50 gets 512 MiB per engine, while U55C can use
         # complete 1 GiB controllers when device capacity permits.
         #
-        # THE WINDOW SIZE IS CONSTANT, NOT AN ARENA DIVIDED N WAYS. The DRAM
-        # controller interleaves across these windows, so a stride that shrank
-        # with the engine count would give up the concurrent bandwidth the extra
-        # engines were added for. The arena grows instead -- 4 GiB at 8 cores --
-        # which is why multi-core rebases this map to [6 GiB, 8 GiB) and needs a
-        # device of at least 8 GB.
+        # THE WINDOW SIZE IS CONSTANT, NOT AN ARENA DIVIDED N WAYS: 512 MiB per
+        # engine whatever the count. The arena grows instead -- 4 GiB at 8
+        # cores -- and the model map is rebased to sit directly above it.
         #
         # WORKER ISA LIVES IN THE MODEL MAP, NOT THE PRIVATE WINDOWS. A worker
         # program is a few MB, so a 16 MiB private slice per core bought little
@@ -192,9 +181,11 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
         # Whole-map rebase for multi-core. Every address below keeps its offset
         # from the map base, so nothing in the model, the mixins or a compiled
         # program needs to know which map it is running on.
+        _rebase = 0
+        self._board_windows = None
         if multi_core > 1:
-            require_multicore_dram(multi_core, "Qwen2.5-VL-3B")
-        _rebase = MULTI_CORE_MODEL_REBASE if multi_core > 1 else 0
+            self._board_windows, _model_base = _board_multicore_map(multi_core)
+            _rebase = _model_base - 0x80000000
         self.DRAM_END = 0x100000000 + _rebase
         self.PARAMS_BASE = 0x80000000 + _rebase
         self.PARAMS_LIMIT = 0xF1000000 + _rebase   # 1808 MiB, > the 1801.7 MiB LM needs
@@ -218,20 +209,19 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
         # Engine 0's slice is never used (the master allocates from ISA_BASE
         # through the normal program cursor), so index the stride from engine 1.
         if multi_core > 1:
-            assert self.DRAM_END == MULTI_CORE_DRAM_LIMIT, (
-                f"multi-core model map ends at 0x{self.DRAM_END:X}, not at the "
-                f"8 GB device limit 0x{MULTI_CORE_DRAM_LIMIT:X}")
+            _dram_end = user_dma_core.AVAILABLE_DRAM_SIZE_GB << 30
+            assert self.DRAM_END <= _dram_end, (
+                f"multi-core model map ends at 0x{self.DRAM_END:X}, past the "
+                f"0x{_dram_end:X} bytes HW_INFO reports")
             # The ISA slices live in the MODEL map either way, so a board
             # window holds only weights and tensors and external_isa is
             # unchanged by where the windows land.
             _external_isa = (self.WORKER_ISA_BASE - self.WORKER_ISA_STRIDE,
                              self.WORKER_ISA_STRIDE)
-            self._board_windows = _board_multicore_map(multi_core)
             self.mc_arena = PrivateArena(
                 multi_core, windows=self._board_windows,
                 external_isa=_external_isa, verbose=True)
         else:
-            self._board_windows = None
             self.mc_arena = None
         # Exact per-core worker image sizes, filled in as each stage compiles.
         self._worker_isa_used = {}

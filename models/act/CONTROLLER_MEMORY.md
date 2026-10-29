@@ -6,7 +6,7 @@ matrix-multiply wrapper and the SRAM convolution kernel's weight-strip loads.
 Activation/attention operands remain at their shared addresses, and the existing
 row/column splits and four-phase synchronization stay in place.
 
-U50 offers eight 512 MiB private windows in the upper stack. A 16 GiB U55C can
+U50 (interleaved HBM) packs eight 512 MiB windows consecutively from 4 GiB. A 16 GiB U55C can
 assign one free 1 GiB region per engine. An 8 GiB U55C has four free controller
 regions after reserving the original low-4-GiB model; more engines share those
 four copies. Kintex retains shared source addresses because its fixed layout

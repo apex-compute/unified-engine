@@ -54,9 +54,14 @@ class LlamaMulticoreLayout(unittest.TestCase):
         self.weights.write_bytes(b"")
         self.addCleanup(setattr, llama, "_SILENT_MODE", False)
 
+    # Engine clock per board: it is what tells the interleaved kintex7 (213 MHz
+    # release image) from kintex7_systolic (150 MHz), see dram_interleaved.
+    CLOCK_HZ = {2: 213.2e6, 8: 333.3e6, 12: 290e6}
+
     def engine(self, cores=2, gib=4, active=2, **kwargs):
         with patch.multiple(core, ANDROMEDA_CORE_COUNT=cores,
-                            AVAILABLE_DRAM_SIZE_GB=gib), \
+                            AVAILABLE_DRAM_SIZE_GB=gib,
+                            CORE_CLOCK_FREQ_HZ=self.CLOCK_HZ[cores]), \
                 patch.object(llama.Llama32_1b_UnifiedEngine, "weight_init"), \
                 patch.object(llama.Llama32_1b_UnifiedEngine, "tensor_init"):
             engine = llama.Llama32_1b_UnifiedEngine(
@@ -79,8 +84,10 @@ class LlamaMulticoreLayout(unittest.TestCase):
             engine.tensor_init()
 
     def test_whole_model_rebases_without_changing_internal_offsets(self):
-        for cores, gib, active, base in ((2, 4, 2, 1 << 30), (8, 8, 2, 6 << 30),
-                                         (8, 8, 8, 6 << 30), (12, 16, 12, 6 << 30)):
+        # Interleaved DRAM (kintex7, U50): the map follows the 512 MiB windows
+        # directly. The U55C keeps its controller-aware 6 GiB base.
+        for cores, gib, active, base in ((2, 4, 2, 1 << 30), (8, 8, 2, 1 << 30),
+                                         (8, 8, 8, 4 << 30), (12, 16, 12, 6 << 30)):
             with self.subTest(cores=cores, gib=gib, active=active):
                 engine = self.engine(cores, gib, active)
                 self.assertEqual(engine._params_dram_base, base)
@@ -149,7 +156,9 @@ class LlamaMulticoreLayout(unittest.TestCase):
         engine = self.engine()
         engine._decode_windows = list(reversed(engine._decode_windows))
         self.assertNotEqual(original, engine._instruction_paths())
-        self.assertNotEqual(original, self.engine(8, 8, 2)._instruction_paths())
+        # Interleaved kintex7 and U50 give two engines the same addresses, so
+        # the same image serves both; a different placement does not.
+        self.assertEqual(original, self.engine(8, 8, 2)._instruction_paths())
         self.assertNotEqual(self.engine(8, 8, 2)._instruction_paths(),
                             self.engine(8, 8, 4)._instruction_paths())
         self.assertNotIn("_mc", self.engine(active=1)._instruction_paths()[0])
@@ -169,8 +178,8 @@ class LlamaMulticoreLayout(unittest.TestCase):
                               "mlp_gate", "mlp_up", "mlp_down", "lm_head"])
             for call in calls:
                 _, weight_addr, scale_addr, K, N, layers, stride = call.args
-                self.assertGreaterEqual(weight_addr, 6 << 30)
-                self.assertGreaterEqual(scale_addr, 6 << 30)
+                self.assertGreaterEqual(weight_addr, engine._params_dram_base)
+                self.assertGreaterEqual(scale_addr, engine._params_dram_base)
                 self.assertGreater(K, 0)
                 self.assertGreater(N, 0)
                 if layers > 1:
