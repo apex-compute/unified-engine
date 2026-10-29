@@ -70,13 +70,12 @@ FPGA.
 - **LM head:** column-sharded. Each engine's argmax register holds its shard's winner, and the host reads back just those eight values (16 bytes) to pick the token.
 - **Embeddings:** the 152064 × 3584 table stays BF16 in host RAM, and the host gathers rows and DMAs them in.
 
-**DRAM layouts** (`--layout`):
-- **`windowed` (default):** eight private 1 GiB windows, one per engine. Each window holds that engine's weight shards, a pool shared over time by the stage currently running, private scratch, a guard, and its program (ISA) space. The window bases come from the board:
-  - **U50:** one 1 GiB HBM switch region per engine.
+**DRAM layouts** (chosen by the board, no option): `flat` where the DRAM is interleaved over all memory controllers (the U50, see `multi_engine_shard.dram_interleaved`), `windowed` on the U55C.
+- **`flat`:** one consecutive 8 GiB range in which every stage's weights and programs stay resident. It makes `--run_from_bin` possible (no compile on repeat runs). On the interleaved U50 every address already spreads over all controllers, so the consecutive map reads at the same rate as the windows; on the U55C the engines contend for the same memory (see [Known issues](#known-issues)). On the 16 GiB U55C the flat map still uses only the first 8 GiB.
+- **`windowed`:** eight private 1 GiB windows, one per engine. Each window holds that engine's weight shards, a pool shared over time by the stage currently running, private scratch, a guard, and its program (ISA) space. The window bases come from the board:
   - **U55C:** one whole memory controller per engine. On the 16 GiB image the windows alternate between the two HBM stacks (0, 9, 2, 11, 4, 13, 6, 15 GiB).
 
   Programs are recompiled each run. Token2Wav for `--speak` is built and uploaded at run time.
-- **`flat`:** one consecutive 8 GiB range in which every stage's weights and programs stay resident. It makes `--run_from_bin` possible (no compile on repeat runs), at the cost of the engines contending for the same memory (see [Known issues](#known-issues)). On the 16 GiB U55C the flat map still uses only the first 8 GiB.
 
 **Cached artifacts** (in `qwen2.5_omni_7b_bin/`, all regenerated automatically):
 - **`Qwen2.5-Omni-7B/`:** the Hugging Face checkpoint, pinned to revision `ae9e1690…` in `qwen2.5_omni_7b_config.json`.
@@ -162,7 +161,7 @@ at 366.7 MHz and every 237 s at 290 MHz.
 
 ## Performance with the default prompts
 
-Every run below uses the default prompt and the default (windowed) layout. On
+Every run below uses the default prompt and the windowed layout (measured before the U50 moved to the flat layout). On
 each board the runs used the same code. All runs produced correct output:
 - **Text:** a correct one-sentence answer about Rayleigh scattering.
 - **Image:** a detailed Yosemite sunset description.
@@ -242,7 +241,7 @@ real-time rate.
 ## Known issues
 
 - **U50 image `0x25511139` hangs under long, heavy loads:** Token2Wav (`--speak`), and the Medium/High tiers. It runs the engine at 366.67 MHz, where the U50 build misses timing badly (about 200k failing endpoints). A local build of the same RTL at 333.33 MHz passed the 36-evaluation Token2Wav test that this image fails. Until the U50 image is rebuilt at 333.33 MHz, run speech and the large tiers on the U55C. The U50's High tier in `benchmark.md` was measured with cooling pauses for this reason.
-- **The flat layout is slower on the U55C:** with every stage resident, the engines contend for the same memory controllers. Thinker decode drops from 75% to 43% of peak, and the Talker from 29% to 23%, against the windowed layout. Use `--layout flat` only when you need `--run_from_bin`.
+- **The flat layout is slower on the U55C:** its DRAM is not interleaved, so with every stage resident the engines contend for the same memory controllers. Thinker decode drops from 75% to 43% of peak, and the Talker from 29% to 23%, against the windowed layout. The U55C therefore always runs the windowed layout, so `--run_from_bin` is not available there.
 - **Thermal headroom:** on p2's U50 the die reaches 95–97 °C about 4–6 minutes into a continuous High run, at which point the device drops off PCIe (seen twice, from 76 °C and from 60 °C starts). The U55C on aztec stays below 75 °C.
 
 ## Reports and further reading
