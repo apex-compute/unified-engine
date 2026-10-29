@@ -57,10 +57,9 @@ from multi_engine_shard import (ALVEO_BOARD_CORES, ALVEO_U55C_BOARD_CORES,
                                 require_multicore_dram)
 
 # The board-aware layout keeps the original two-GiB model offsets together
-# and places the private weight shards beside them. On the interleaved U50
-# and kintex7 the shards follow one another from 0 and the model follows
-# them; the U55C and kintex7_systolic keep controller-aware windows
-# (multi_engine_shard.model_multicore_layout). Unknown boards retain the
+# and places the private weight shards beside them: on the interleaved U50,
+# U55C and Kintex-7 the shards follow one another from 0 and the model follows
+# them (multi_engine_shard.model_multicore_layout). Unknown boards retain the
 # historical layout policy below.
 MULTI_CORE_MAX_ENGINES = 12
 MULTI_CORE_FIXED_MAP_MIN_ENGINES = 8
@@ -70,7 +69,7 @@ MULTI_CORE_DRAM_LIMIT = 0x200000000
 MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
 MULTI_CORE_MODEL_SPAN = MULTI_CORE_DRAM_LIMIT - MULTI_CORE_MODEL_BASE
 BOARD_MAP_PROFILES = {(KINTEX7_BOARD_CORES, 4), (ALVEO_BOARD_CORES, 8),
-                      (ALVEO_U55C_BOARD_CORES, 8), (ALVEO_U55C_BOARD_CORES, 16)}
+                      (ALVEO_U55C_BOARD_CORES, 16)}
 
 
 def _board_multicore_map(num_engines: int):
