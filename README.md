@@ -41,15 +41,17 @@ This guide covers installation and usage of the Xilinx XDMA driver for PCIe-base
 
 ## Installation
 
-### 1. Install XDMA Driver from Xilinx Repository
+### 1. Install the XDMA Driver
 
-Clone the official Xilinx DMA driver repository:
+Clone the Apex Compute fork of the Xilinx DMA driver repository:
 ```bash
-git clone https://github.com/Xilinx/dma_ip_drivers.git
+git clone https://github.com/apex-compute/dma_ip_drivers.git
 cd dma_ip_drivers/XDMA/linux-kernel/xdma
 sudo make install
 ```
 > **Tip:** If `sudo make install` fails, you may need to disable Secure Boot in your BIOS settings.
+
+The fork adds big-endian host support (for example ppc64 on IBM POWER). On a big-endian host the upstream Xilinx driver programs a byte-swapped descriptor address, so every DMA transfer times out. If an XDMA driver is already loaded, run `sudo rmmod xdma` before step 2.
 
 ### 2. Load the Driver
 
