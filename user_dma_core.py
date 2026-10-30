@@ -652,6 +652,11 @@ def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
         DMA_DEVICE_C2H = "/dev/pcie_dma1_cth_0"
         DMA_DEVICE_USER = "/dev/pcie_dma1_user"
         UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
+    elif device_name == "efinix_m2":
+        DMA_DEVICE_H2C = "/dev/pcie_dma0_htc_0"
+        DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
+        DMA_DEVICE_USER = "/dev/pcie_dma0_user"
+        UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
     else:
         DMA_DEVICE_H2C = f"/dev/{device_name}_h2c_0"
         DMA_DEVICE_C2H = f"/dev/{device_name}_c2h_0"
@@ -1552,7 +1557,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x6e302bdc, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x6e302bdc. Please update FPGA with update_6e302bdc.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
+        assert hw_version == 0x42a3138b, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x42a3138b. Please update FPGA with update_42a3138b.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
         if getattr(self, "conv_geometry_mode", CONV_GEOMETRY_LIVE_CSR) == CONV_GEOMETRY_QUEUE_CONFIG:
             # Convolution images have independent build stamps from the legacy
             # release. Explicit queue-CONFIG selection opts into that contract;

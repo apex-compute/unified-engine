@@ -12277,7 +12277,7 @@ if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='User DMA Operations for Unified Engine')
     parser.add_argument('--dev', type=str, default='xdma0',
-                        help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
+                        help='DMA device name or alias (e.g., xdma0, efinix_m2). Default: xdma0')
     parser.add_argument('--base-addr', type=lambda x: int(x, 0), default=None,
                         help='AXI-Lite register base address (default: device-specific).')
     parser.add_argument(
