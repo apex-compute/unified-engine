@@ -27,12 +27,6 @@ from andromeda_hw_info import decode_hardware_info, format_hardware_info
 
 
 def benchmark_windows(num_engines):
-    """Use every physical engine, including the older U55C's shared MC ports."""
-    if (core.ANDROMEDA_CORE_COUNT == shard.ALVEO_U55C_BOARD_CORES
-            and core.AVAILABLE_DRAM_SIZE_GB == 8
-            and num_engines > shard.ALVEO_U55C_MC_COUNT):
-        return [shard.EngineWindow(i, ((base, shard.ALVEO_U55C_SEGMENT_STRIDE),))
-                for i, base in enumerate(shard.alveo_u55c_core_bases(num_engines, dram_size_gb=8))]
     return shard.board_private_windows(num_engines)
 
 
@@ -261,12 +255,6 @@ def run_memory_comparison(num_engines=None, sizes_kib=(64, 256, 512), iterations
             cases = [("private", [engine], private_spacing_bytes) for engine in range(count)]
             if count > 1:
                 cases += [(layout, list(range(count)), private_spacing_bytes) for layout in ("private", "split")]
-            if (private_spacing_bytes is None and count == 2
-                    and core.ANDROMEDA_CORE_COUNT == 2 and core.AVAILABLE_DRAM_SIZE_GB == 4
-                    and not shard.dram_interleaved()):
-                # kintex7_systolic: keep the single-controller layout as an
-                # explicit comparison alongside the dual-controller default.
-                cases.append(("private", list(range(count)), 512 << 20))
             for layout, engine_ids, spacing in cases:
                 print(f"Memory {layout}: engines={engine_ids}, {size} KiB/engine, "
                       f"{iterations} transfers, {samples} samples, "

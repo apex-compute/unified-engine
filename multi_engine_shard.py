@@ -372,12 +372,10 @@ def private_total() -> int:
 # THE MULTI-CORE WINDOW IS A FIXED 512 MB, NOT A DIVIDED ARENA
 # ==========================================================================
 # This is the contiguous model arena, and on the interleaved boards (U50,
-# kintex7; see dram_interleaved) it is also the board map. The non-interleaved
-# boards select controllers differently (kintex7_systolic by address bit 31,
-# U55C in 1 GiB regions). New model integrations should use
-# model_multicore_layout(), which reserves the shared model map and chooses
-# private windows for the board. The arena remains available to callers with
-# an explicit layout:
+# U55C, Kintex-7; see dram_interleaved) it is also the board map. New model
+# integrations should use model_multicore_layout(), which reserves the shared
+# model map and chooses private windows for the board. The arena remains
+# available to callers with an explicit layout:
 #
 #     arena = [0, num_engines * 512 MB)      engine i -> [i*512MB, (i+1)*512MB)
 #
@@ -440,138 +438,35 @@ def require_multicore_dram(num_engines: int, what: str,
 
 
 # ==========================================================================
-# WHICH CONTROLLER EACH ENGINE OWNS (non-interleaved boards only)
+# WHERE EACH ENGINE'S WINDOW SITS
 # ==========================================================================
-# On the U50 and kintex7 the hardware interleaves every address over all
-# memory controllers (#1441, dram_interleaved), so there is nothing to own:
-# their windows are sequential and any placement gets the same bandwidth.
-#
-# On the U55C the window SIZE above is only half of the contract: the
-# concurrent bandwidth an engine gets depends on WHICH controller region its
-# window lands in, because an engine reaches its own controller at full rate
-# and anything further away shares the lateral switch. Measured on the U55C
-# (bitstream 0xc3ee417c, 512 kB per engine): 12 engines on the bases below read
-# at 108.1 GB/s -- 12 x 9.0, the per-port limit, and the same latency one engine
-# alone takes -- against 56.4 GB/s for a flat 512 MiB-per-core stride, which
-# leaves most cores reading across that switch. The contended unit is a 512 MiB
-# segment, not a 1 GiB controller: two engines in one segment take 2x the time,
-# while the two halves of one controller run at the full 18.1 GB/s.
-#
-# Alveo U55C HBM ownership for the u55c/hbm-port-reorder Tcl design.
-# ALVEO_U55C TARGET ONLY: use this map only when HW_INFO reports core_count == 12.
-# The single 8 GiB HBM address space has eight memory controllers (MCs).  Each
-# MC owns two adjacent 512 MiB HBM_MEM segments, hence one contiguous 1 GiB
-# range; SAXI ports 2k and 2k+1 share MC k.  The reordered engine wiring is:
-#
-#   core  SAXI / MC  controller-aligned range          bandwidth ownership
-#     0     00 / 0   0x000000000 - 0x03FFFFFFF        shared with core 8
-#     1     02 / 1   0x040000000 - 0x07FFFFFFF        shared with core 9
-#     2     04 / 2   0x080000000 - 0x0BFFFFFFF        shared with core 10
-#     3     06 / 3   0x0C0000000 - 0x0FFFFFFFF        shared with core 11
-#     4     08 / 4   0x100000000 - 0x13FFFFFFF        shared with XDMA (SAXI 09)
-#     5     10 / 5   0x140000000 - 0x17FFFFFFF        exclusive for core 5
-#     6     12 / 6   0x180000000 - 0x1BFFFFFFF        exclusive for core 6
-#     7     14 / 7   0x1C0000000 - 0x1FFFFFFFF        exclusive for core 7
-#     8     01 / 0   0x000000000 - 0x03FFFFFFF        shared with core 0
-#     9     03 / 1   0x040000000 - 0x07FFFFFFF        shared with core 1
-#    10     05 / 2   0x080000000 - 0x0BFFFFFFF        shared with core 2
-#    11     07 / 3   0x0C0000000 - 0x0FFFFFFFF        shared with core 3
-#
-# Alveo U55C dual-stack HBM ownership for u55c/hbm_16GB (12 cores, 16 GiB).
-# Select this map only for HW_INFO core_count == 12 AND dram_size_gb == 16.
-# Vivado/hdl/board/u55c_hbm_stack.sv wires each core to the same AXI port
-# number on both stacks (u55c_hbm_l and u55c_hbm_r). Each stack has eight MCs,
-# each owning two adjacent 512 MiB segments. Use native HBM addressing:
-#
-#   address [33] = stack, [32:30] = MC (no external address swap)
-#   base = stack * 8 GiB + MC * 1 GiB
-# This map requires the native-map bitstream, not the older swapped image.
-#
-# The test allocator claims ONE 1 GiB controller region per core, not the
-# entire 2 GiB two-stack pair. Cores sharing an MC number use opposite stacks.
-# Ranges below are inclusive native addresses, identical for engines and XDMA.
-#
-#   core  SAXI / MC  stack   private 1 GiB range
-#     0     00 / 0     0     0x000000000 - 0x03FFFFFFF
-#     1     02 / 1     1     0x240000000 - 0x27FFFFFFF
-#     2     04 / 2     0     0x080000000 - 0x0BFFFFFFF
-#     3     06 / 3     1     0x2C0000000 - 0x2FFFFFFFF
-#     4     08 / 4     0     0x100000000 - 0x13FFFFFFF
-#     5     10 / 5     1     0x340000000 - 0x37FFFFFFF
-#     6     12 / 6     0     0x180000000 - 0x1BFFFFFFF
-#     7     14 / 7     1     0x3C0000000 - 0x3FFFFFFFF
-#     8     01 / 0     1     0x200000000 - 0x23FFFFFFF
-#     9     03 / 1     0     0x040000000 - 0x07FFFFFFF
-#    10     05 / 2     1     0x280000000 - 0x2BFFFFFFF
-#    11     07 / 3     0     0x0C0000000 - 0x0FFFFFFFF
-#
-# Six cores per stack; 12 distinct (stack, MC) regions, 12 GiB total claimed.
-# Unclaimed: stack 1/MC4 [0x300000000, 0x33FFFFFFF],
-#            stack 0/MC5 [0x140000000, 0x17FFFFFFF],
-#            stack 1/MC6 [0x380000000, 0x3BFFFFFFF],
-#            stack 0/MC7 [0x1C0000000, 0x1FFFFFFFF].
-# XDMA uses SAXI_09 (MC4) on both stacks and can access the full address space;
-# unique engine controllers do not imply zero contention with host DMA.
-# Per-core cursors: params = base, tensors = base + 0x08000000 (128 MiB),
-#                  program = base + 0x0F000000 (240 MiB).
+# The U50, the U55C and the Kintex-7 interleave every address over all memory
+# controllers in hardware (#1441, dram_interleaved), so no engine owns a
+# controller: the windows are sequential and any placement gets the same
+# bandwidth.
 
-KINTEX7_BOARD_CORES = 2                     # HW_INFO signature of the kintex7 image
-KINTEX7_CHANNEL_BYTES = 0x8000_0000          # two 2 GiB DDR3 channels, address bit 31
-# kintex7_systolic reports the same core count as kintex7 but runs its engines
-# at 150 MHz (kintex7: 213 MHz), and it is the one Kintex-7 image whose DDR3 is
-# not interleaved.
-KINTEX7_SYSTOLIC_MAX_CLOCK_HZ = 200e6
+KINTEX7_BOARD_CORES = 2                     # HW_INFO signature of the kintex7 images
 ALVEO_BOARD_CORES = 8                       # HW_INFO signature of the U50 image
 ALVEO_U55C_BOARD_CORES = 12                 # HW_INFO signature of the U55C image
-
-ALVEO_U55C_MC_STRIDE = 0x4000_0000          # U55C: one controller, two segments
-ALVEO_U55C_SEGMENT_STRIDE = 0x2000_0000     # U55C: one HBM_MEM segment, 512 MiB
-ALVEO_U55C_MC_COUNT = 8
-# Core k < 8 takes the FIRST segment of its own controller, core 8+k the SECOND
-# segment of controller k, so the two cores that share a controller never share
-# a segment. A model that uses only the first eight engines therefore gets one
-# whole controller each, which is what the 1 GiB-per-core model maps do.
-ALVEO_U55C_CORE_BASES = tuple(
-    (core % ALVEO_U55C_MC_COUNT) * ALVEO_U55C_MC_STRIDE
-    + (core // ALVEO_U55C_MC_COUNT) * ALVEO_U55C_SEGMENT_STRIDE
-    for core in range(ALVEO_U55C_BOARD_CORES)
-)
-
-# Dual-stack U55C (16 GiB): u55c_hbm_stack.sv connects each engine to the
-# same AXI port on both stacks. Native address bit 33 selects the stack and
-# bits [32:30] select the MC. No software or hardware address permutation.
-# Give each engine one whole 1 GiB (stack, MC) region. Alternate stacks for
-# cores 0..7; cores 8..11 use the opposite stack from their MC partner 0..3.
-# This gives six engines per stack and twelve distinct physical controllers.
-# The four unused controller regions remain unclaimed; this is a bandwidth-
-# oriented test map, not a policy that packs every byte of model storage.
-ALVEO_U55C_16GB_CORE_BASES = tuple(
-    ((core % ALVEO_U55C_MC_COUNT)
-     + ((core % 2) ^ (core // ALVEO_U55C_MC_COUNT)) * ALVEO_U55C_MC_COUNT)
-    * ALVEO_U55C_MC_STRIDE
-    for core in range(ALVEO_U55C_BOARD_CORES)
-)
 
 
 def dram_interleaved() -> bool:
     """True when the board interleaves DRAM over all its memory controllers.
 
-    The U50 and the kintex7 / kintex7_encryption images interleave every
-    address over all controllers in hardware (#1441), so any contiguous range
-    of a few granules already uses all of them and where an engine's data
-    sits does not change its bandwidth. Their multi-core maps are therefore
-    plain sequential windows. The U55C and kintex7_systolic are not
-    interleaved and keep their controller-aligned maps.
+    The U50, U55C and Kintex-7 (4 GiB) images interleave every address over
+    all controllers in hardware (#1441), so any contiguous range of a few
+    granules already uses all of them and where an engine's data sits does not
+    change its bandwidth. Their multi-core maps are therefore plain sequential
+    windows. Only older Kintex-7 images reporting less than 4 GiB are not.
     """
     if (user_dma_core.ANDROMEDA_CORE_COUNT is None
             or user_dma_core.AVAILABLE_DRAM_SIZE_GB is None):
         user_dma_core.configure_clock_from_hardware()
     cores = user_dma_core.ANDROMEDA_CORE_COUNT
-    if cores == ALVEO_BOARD_CORES:
+    if cores in (ALVEO_BOARD_CORES, ALVEO_U55C_BOARD_CORES):
         return True
     if cores == KINTEX7_BOARD_CORES:
-        return (user_dma_core.AVAILABLE_DRAM_SIZE_GB >= 4
-                and (user_dma_core.CORE_CLOCK_FREQ_HZ or 0) > KINTEX7_SYSTOLIC_MAX_CLOCK_HZ)
+        return user_dma_core.AVAILABLE_DRAM_SIZE_GB >= 4
     return False
 
 
@@ -581,47 +476,6 @@ def sequential_windows(num_engines: int,
     return [(i * window_bytes, window_bytes) for i in range(num_engines)]
 
 
-def alveo_u55c_core_bases(num_engines: int, dram_size_gb: int = 8) -> list[int]:
-    """U55C private bases for the explicitly selected 8 or 16 GiB image.
-
-    8 GiB preserves the legacy 512 MiB segment map. Cores 0..3 and 8..11
-    have disjoint segments but still share memory controllers.
-    16 GiB gives each core a private 1 GiB controller on one stack, with
-    MC-sharing port pairs assigned opposite stacks. Bases are stable across
-    engine counts. The default remains 8 for existing explicit-map callers;
-    board_private_windows passes the capacity reported by HW_INFO.
-    """
-    if not 1 <= num_engines <= len(ALVEO_U55C_CORE_BASES):
-        raise ValueError(
-            f"num_engines must be 1..{len(ALVEO_U55C_CORE_BASES)} for the U55C "
-            f"HBM map, got {num_engines}")
-    if dram_size_gb == 8:
-        bases = ALVEO_U55C_CORE_BASES
-    elif dram_size_gb == 16:
-        bases = ALVEO_U55C_16GB_CORE_BASES
-    else:
-        raise ValueError(f"U55C HBM map requires 8 or 16 GiB, got {dram_size_gb}")
-    return list(bases[:num_engines])
-
-
-def alveo_u55c_16gb_pool() -> list[int]:
-    """Every 1 GiB (stack, MC) region of the 16 GiB U55C, in assignment order.
-
-    The twelve preferred regions first -- ALVEO_U55C_16GB_CORE_BASES, which
-    alternates stacks so MC-sharing port pairs land on opposite stacks -- then
-    the four the map leaves spare. A caller that reserves part of the device
-    draws replacements from the tail rather than losing an engine's controller.
-    """
-    preferred = list(ALVEO_U55C_16GB_CORE_BASES)
-    every = [region * ALVEO_U55C_MC_STRIDE for region in range(2 * ALVEO_U55C_MC_COUNT)]
-    return preferred + [base for base in every if base not in preferred]
-
-
-def is_alveo_u55c() -> bool:
-    """True when HW_INFO's core count is the U55C image's signature."""
-    return user_dma_core.ANDROMEDA_CORE_COUNT == ALVEO_U55C_BOARD_CORES
-
-
 # ==========================================================================
 # WHOLE-BOARD PRIVATE WINDOWS (the hardware test suite's map)
 # ==========================================================================
@@ -629,12 +483,10 @@ def is_alveo_u55c() -> bool:
 # below derives a model arena from these board maps while reserving the
 # model's shared weights, activations and programs.
 #
-#   model runs   private windows must clear the model's own contiguous map.
-#                Interleaved boards put the model after the windows;
-#                kintex7_systolic can move a window within its DDR channel;
-#                U55C can select a free controller on the other stack.
+#   model runs   private windows must clear the model's own contiguous map;
+#                the model goes right after the windows.
 #   test runs    user_hw_test.py owns the whole device; nothing else is
-#                resident. The U55C gives each core a whole 1 GiB controller.
+#                resident.
 #
 # EngineWindow allows a window of several non-contiguous segments; every map
 # here currently uses one segment per engine.
@@ -692,30 +544,20 @@ def board_private_windows(num_engines: int,
 
     Nothing else in the tree decides where a multi-core engine's private DRAM
     lives -- callers ask here. The board is identified by its HW_INFO CORE
-    COUNT, which is the image signature (see is_alveo_u55c):
+    COUNT, which is the image signature:
 
       2 cores   kintex7      interleaved DDR3 (see dram_interleaved): 512 MiB
-                             per core, one after another from 0.
-                             kintex7_systolic: 512 MiB at 0 and 2 GiB, one
-                             window per DDR3 channel. Older < 4 GiB images
-                             retain 256 MiB from DRAM_START_ADDR.
+                             per core, one after another from 0. Older < 4 GiB
+                             images retain 256 MiB from DRAM_START_ADDR.
       8 cores   alveo U50    interleaved HBM: 512 MiB per core, one after
-                             another from 0.
-      12 cores  alveo U55C   16 GiB image: one 1 GiB (stack, MC) per core,
-                             supporting all twelve engines without sharing MCs.
-                             8 GiB image: legacy 1 GiB per core, at most eight.
+      12 cores  alveo U55C   another from 0.
 
     Any other core count raises: a window map guessed for hardware nobody has
     measured is worse than no map at all.
 
-    ``reserve=(base, bytes)`` keeps a region of the device OUT of the windows,
-    for a caller that also needs a contiguous map of its own there (gemma3's
-    model map is 2 GiB at 6 GiB). It is honoured by CHOOSING which regions the
-    engines get, not by shrinking them: the 16 GiB U55C has sixteen 1 GiB
-    (stack, MC) regions and at most twelve engines, so a 2 GiB reserve still
-    leaves every engine a controller of its own. On a board whose windows are
-    fixed rather than chosen, the reserve is CHECKED against them and a clash
-    raises -- there is nothing to trade.
+    ``reserve=(base, bytes)`` names a region of the device a caller needs for a
+    contiguous map of its own. The windows are fixed, so the reserve is CHECKED
+    against them and a clash raises.
 
     Models that also need a contiguous shared region should use
     model_multicore_layout(), rather than claiming every segment here.
@@ -737,70 +579,22 @@ def board_private_windows(num_engines: int,
 
     if cores == ALVEO_BOARD_CORES and gib != 8:
         raise ValueError(f"U50 HBM map requires 8 GiB, got {gib}")
+    if cores == ALVEO_U55C_BOARD_CORES and gib != 16:
+        raise ValueError(f"U55C HBM map requires 16 GiB, got {gib}")
     if dram_interleaved():
         windows = [EngineWindow(i, (window,))
                    for i, window in enumerate(sequential_windows(num_engines))]
-    elif cores == ALVEO_U55C_BOARD_CORES:
-        if gib == 16:
-            if reserve is None:
-                bases = alveo_u55c_core_bases(num_engines, dram_size_gb=gib)
-            else:
-                usable = [base for base in alveo_u55c_16gb_pool()
-                          if not _overlaps(base, ALVEO_U55C_MC_STRIDE, reserve)]
-                if len(usable) < num_engines:
-                    raise ValueError(
-                        f"{num_engines} engines need {num_engines} x 1 GiB "
-                        f"controller regions, but reserving 0x{reserve[0]:X}.."
-                        f"0x{reserve[0] + reserve[1]:X} leaves only {len(usable)}")
-                # Keep every unaffected core on its own MC. Filtering the
-                # pool and taking its first N entries shifts all subsequent
-                # cores when one preferred region is reserved. A displaced
-                # core first tries the same MC on the opposite stack.
-                preferred = alveo_u55c_core_bases(num_engines, dram_size_gb=gib)
-                bases = [base if base in usable else None for base in preferred]
-                available = [base for base in usable if base not in bases]
-                for i, base in enumerate(bases):
-                    if base is None:
-                        partner = preferred[i] ^ (8 << 30)
-                        replacement = partner if partner in available else available[0]
-                        bases[i] = replacement
-                        available.remove(replacement)
-            windows = [EngineWindow(i, ((base, ALVEO_U55C_MC_STRIDE),))
-                       for i, base in enumerate(bases)]
-            _validate_windows(windows, gib, is_hbm=True)
-            return windows
-        if gib != 8:
-            raise ValueError(f"U55C HBM map requires 8 or 16 GiB, got {gib}")
-        # U55C. One MC owns two adjacent 512 MB segments, so a core's 1 GiB is
-        # consecutive. Only EIGHT fit: 8 GiB / 1 GiB. Past that the board's own
-        # 512 MB-per-core map (ALVEO_U55C_CORE_BASES) is the only option, and
-        # the caller has to ask for it deliberately rather than be silently
-        # given half of what this function promises.
-        if num_engines > ALVEO_U55C_MC_COUNT:
-            raise ValueError(
-                f"num_engines={num_engines} x 1 GiB does not fit the U55C's "
-                f"{gib} GiB; at most {ALVEO_U55C_MC_COUNT} cores get a "
-                f"consecutive 1 GiB. For all {cores} engines use the 512 MB "
-                f"segment map, alveo_u55c_core_bases().")
-        windows = [EngineWindow(i, ((i * ALVEO_U55C_MC_STRIDE, ALVEO_U55C_MC_STRIDE),))
-                   for i in range(num_engines)]
     elif cores == KINTEX7_BOARD_CORES:
-        if gib >= 4:
-            # kintex7_systolic: one window per DDR3 channel.
-            windows = [EngineWindow(i, ((i * KINTEX7_CHANNEL_BYTES,
-                                        MULTICORE_WINDOW_BYTES),))
-                       for i in range(num_engines)]
-        else:
-            base, size = user_dma_core.DRAM_START_ADDR, DDR_WINDOW_BYTES
-            windows = [EngineWindow(i, ((base + i * size, size),))
-                       for i in range(num_engines)]
+        # Older images reporting less than 4 GiB.
+        base, size = user_dma_core.DRAM_START_ADDR, DDR_WINDOW_BYTES
+        windows = [EngineWindow(i, ((base + i * size, size),))
+                   for i in range(num_engines)]
     else:
         raise ValueError(
             f"no multi-core DRAM map for a {cores}-core board (HW_INFO reports "
-            f"{gib} GB). The maps here are measured per board: "
+            f"{gib} GB). The maps here are per board: "
             f"{KINTEX7_BOARD_CORES} cores = kintex7, {ALVEO_BOARD_CORES} = "
-            f"Alveo U50, {ALVEO_U55C_BOARD_CORES} = Alveo U55C. Measure the "
-            f"new board's HBM ownership and add it above.")
+            f"Alveo U50, {ALVEO_U55C_BOARD_CORES} = Alveo U55C.")
 
     _validate_windows(windows, gib, is_hbm=gib >= 4)
     _require_reserve_clear(windows, reserve, f"{cores}-core board")
@@ -869,20 +663,10 @@ def model_multicore_layout(num_engines: int, model_bytes: int = 2 << 30,
     rebase all model allocations to ``model_base``. A window's size includes
     the arena's ISA and tensor tails, not only weight storage.
 
-    On interleaved DRAM (U50, kintex7; see dram_interleaved) the layout is
-    sequential: 512 MiB windows one after another from 0, and the model
-    directly after the last window. ``preferred_model_base`` is not used.
-
-    The other boards keep each window inside one memory-controller region.
-    kintex7_systolic puts 512 MiB private windows at 0 and 3 GiB, and the
-    2 GiB model at 1 GiB, so the private windows use different DDR channels
-    while preserving room for the shared model. Exactly 2 GiB between private
-    windows would leave only a 1.5 GiB hole. U55C uses whole 1 GiB
-    controllers, preferring each engine's own MC on either stack. A 2 GiB
-    model fits alongside all twelve engines on its 16 GiB image. The older
-    8 GiB image supports six whole-controller windows; seven to twelve
-    engines use 512 MiB segments and share some of the six remaining MCs.
-    Those segments are disjoint, but cannot promise twelve independent MCs.
+    The layout is sequential (all supported boards interleave their DRAM; see
+    dram_interleaved): 512 MiB windows one after another from 0, and the model
+    directly after the last window. ``preferred_model_base`` is kept for
+    callers and not used.
 
     Unsupported boards and layouts that cannot fit raise ValueError. This
     function does not change PrivateArena's legacy low-address defaults.
@@ -897,85 +681,22 @@ def model_multicore_layout(num_engines: int, model_bytes: int = 2 << 30,
     cores = user_dma_core.ANDROMEDA_CORE_COUNT
     gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
     if (cores, gib) not in {(KINTEX7_BOARD_CORES, 4), (ALVEO_BOARD_CORES, 8),
-                            (ALVEO_U55C_BOARD_CORES, 8),
                             (ALVEO_U55C_BOARD_CORES, 16)}:
-        raise ValueError(f"no controller-aware model map for {cores} cores / {gib} GiB")
+        raise ValueError(f"no multi-core model map for {cores} cores / {gib} GiB")
     if not 1 <= num_engines <= cores:
         raise ValueError(f"num_engines must be 1..{cores}, got {num_engines}")
     dram_bytes = gib << 30
     if model_bytes > dram_bytes:
         raise ValueError("shared model map exceeds the device's DRAM capacity")
 
-    if dram_interleaved():
-        windows = sequential_windows(num_engines)
-        model_base = num_engines * MULTICORE_WINDOW_BYTES
-        if model_base + model_bytes > dram_bytes:
-            raise ValueError(
-                f"{num_engines} x {MULTICORE_WINDOW_BYTES // 2**20} MiB private "
-                f"windows and a {model_bytes // 2**20} MiB model map do not fit "
-                f"the {gib} GiB board")
-        return windows, model_base
-
-    segmented_u55c = (cores == ALVEO_U55C_BOARD_CORES and gib == 8
-                     and num_engines > (dram_bytes - model_bytes) // ALVEO_U55C_MC_STRIDE)
-    if not segmented_u55c:
-        board_private_windows(num_engines)   # validates the engine count for the board
-    # These boundaries cover every relevant contiguous gap on the supported
-    # board maps. Try the caller's existing address first to preserve binaries
-    # where possible; the Kintex preference leaves one GiB on each side.
-    if cores == KINTEX7_BOARD_CORES:
-        alternatives = [1 << 30, MULTICORE_WINDOW_BYTES, 0]
-    else:
-        alternatives = [i << 30 for i in range(gib)]
-    candidates = dict.fromkeys([preferred_model_base, *alternatives])
-    for model_base in candidates:
-        if model_base + model_bytes > dram_bytes:
-            continue
-        reserve = (model_base, model_bytes)
-        if cores == KINTEX7_BOARD_CORES:
-            windows = []
-            for i in range(num_engines):
-                channel_base = i * KINTEX7_CHANNEL_BYTES
-                base = channel_base
-                if _overlaps(base, MULTICORE_WINDOW_BYTES, reserve):
-                    base = model_base + model_bytes
-                if base + MULTICORE_WINDOW_BYTES > channel_base + KINTEX7_CHANNEL_BYTES:
-                    break
-                windows.append((base, MULTICORE_WINDOW_BYTES))
-            if len(windows) != num_engines:
-                continue
-        elif segmented_u55c:
-            size = ALVEO_U55C_SEGMENT_STRIDE
-            usable = [base for base in range(0, dram_bytes, size)
-                      if not _overlaps(base, size, reserve)]
-            if len(usable) < num_engines:
-                continue
-            preferred = alveo_u55c_core_bases(num_engines, dram_size_gb=8)
-            bases = [base if base in usable else None for base in preferred]
-            available = [base for base in usable if base not in bases]
-            for i, base in enumerate(bases):
-                if base is not None:
-                    continue
-                occupied_mcs = {b // ALVEO_U55C_MC_STRIDE for b in bases if b is not None}
-                # An unused MC is preferable to a second segment of an MC
-                # another engine already reads. Retain unaffected affinities.
-                replacement = next((b for b in available
-                                    if b // ALVEO_U55C_MC_STRIDE not in occupied_mcs),
-                                   available[0])
-                bases[i] = replacement
-                available.remove(replacement)
-            windows = [(base, size) for base in bases]
-        else:
-            try:
-                selected = board_private_windows(num_engines, reserve=reserve)
-            except ValueError:
-                continue
-            windows = [(w.base, w.primary_bytes) for w in selected]
-        return windows, model_base
-    raise ValueError(
-        f"{num_engines} board-aware private windows and a "
-        f"{model_bytes // 2**20} MiB contiguous model map do not fit on "
-        f"the {cores}-core / {gib} GiB board")
+    windows = sequential_windows(num_engines)
+    model_base = num_engines * MULTICORE_WINDOW_BYTES
+    if model_base + model_bytes > dram_bytes:
+        raise ValueError(
+            f"{num_engines} x {MULTICORE_WINDOW_BYTES // 2**20} MiB private "
+            f"windows and a {model_bytes // 2**20} MiB model map do not fit "
+            f"the {gib} GiB board")
+    return windows, model_base
 
 
 # ==========================================================================
@@ -987,31 +708,15 @@ def model_multicore_layout(num_engines: int, model_bytes: int = 2 << 30,
 # shared pool carved from their tails. That map asks the board for exactly one
 # guarantee: CONCURRENT READS FROM THE EIGHT WINDOWS MUST NOT CONTEND.
 #
-# Both Alveo boards give it, and both end up at the SAME bases -- core i at
-# i GiB:
-#
-#   U55C (12 cores)  a memory controller owns one contiguous 1 GiB, and the
-#                    reordered SAXI wiring puts core i on controller i for
-#                    i < 8. The window IS the controller. ALVEO_U55C_CORE_BASES'
-#                    first eight entries are exactly i * 1 GiB.
-#   U50  (8 cores)   the HBM is interleaved over all controllers (#1441), so
-#                    any window reads at full rate wherever it sits; the
-#                    windows are simply sequential.
-SWITCH_REGION_BYTES = 0x4000_0000        # 1 GiB: the unit tiled windows are checked in
-MAX_ENGINES_PER_SWITCH_REGION = 2        # U55C: a third engine on one region halves the rate
+# Both Alveo boards give it: their HBM is interleaved over all controllers
+# (#1441), so any window reads at full rate wherever it sits, and the windows
+# are simply sequential -- core i at i GiB.
+TILED_WINDOW_ALIGN = 0x4000_0000         # tiled windows are whole GiB
 
-# THE WINDOW SIZE IS PER BOARD, NOT SHARED. Today both boards land on 1 GiB,
-# for different reasons -- a U55C window is one MEMORY CONTROLLER, a U50 window
-# is what the model needs -- and the U55C moves to 2 GiB per core when its HBM
-# is upgraded. Keep the two constants apart so that upgrade is one edit in the
-# U55C branch and does not redefine the U50's window.
-ALVEO_WINDOW_BYTES = SWITCH_REGION_BYTES        # U50: 1 GiB, sequential.
-ALVEO_U55C_WINDOW_BYTES = ALVEO_U55C_MC_STRIDE  # U55C: one controller. -> 2 GiB on upgrade.
-# THE U55C UPGRADE, when it lands, is ALVEO_U55C_MC_STRIDE and
-# ALVEO_U55C_SEGMENT_STRIDE together: the window follows the controller, and the
-# second-segment offset that cores 8+ take (ALVEO_U55C_CORE_BASES) is half of
-# it. Everything else here -- the bases, the window size, the validator -- is
-# derived.
+# The window size is per board; today both Alveo boards use 1 GiB.
+ALVEO_WINDOW_BYTES = 0x4000_0000         # U50
+ALVEO_U55C_WINDOW_BYTES = 0x4000_0000    # U55C
+
 
 def board_window_bytes(what: str) -> int:
     """The per-core private window this board hands a tiling map."""
@@ -1022,20 +727,17 @@ def board_window_bytes(what: str) -> int:
         return ALVEO_WINDOW_BYTES
     raise ValueError(
         f"{what}: no tiling window map for a {reported}-core board. The maps "
-        f"here are measured per board: {ALVEO_BOARD_CORES} cores = Alveo U50, "
-        f"{ALVEO_U55C_BOARD_CORES} = Alveo U55C. Measure the new board's HBM "
-        f"behaviour and add it above rather than inheriting a map built around "
-        f"different wiring.")
+        f"here are per board: {ALVEO_BOARD_CORES} cores = Alveo U50, "
+        f"{ALVEO_U55C_BOARD_CORES} = Alveo U55C.")
 
 
 def tiled_window_bases(num_engines: int, window_bytes: int, what: str) -> list[int]:
     """Private window bases for a model whose windows tile the whole device.
 
     The board is identified by HW_INFO's core count, which is the image
-    signature (see :func:`is_alveo_u55c`), and the result is validated against
-    the board rather than assumed: in range, non-overlapping, and with no
-    1 GiB switch region carrying more engines than it can serve at full rate.
-    A board nobody has characterised is refused rather than guessed at.
+    signature, and the result is validated against the board rather than
+    assumed: in range and non-overlapping. A board without a tiling map is
+    refused rather than guessed at.
     """
     reported = user_dma_core.ANDROMEDA_CORE_COUNT
     if reported is None or user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
@@ -1044,7 +746,6 @@ def tiled_window_bases(num_engines: int, window_bytes: int, what: str) -> list[i
             f"user_dma_core.configure_clock_from_hardware() first")
     if num_engines < 1:
         raise ValueError(f"{what}: num_engines must be >= 1, got {num_engines}")
-    gib = user_dma_core.AVAILABLE_DRAM_SIZE_GB
     board_window = board_window_bytes(what)
     if window_bytes != board_window:
         raise ValueError(
@@ -1073,25 +774,8 @@ def tiled_window_bases(num_engines: int, window_bytes: int, what: str) -> list[i
             f"ones and half the cores overwrite the other half. Run an image "
             f"whose HW_INFO reports the full size instead.")
 
-    if reported == ALVEO_U55C_BOARD_CORES:
-        # HOW MANY CORES GET A CONTROLLER IS A PROPERTY OF THE IMAGE, not of
-        # the map: the 8 GiB image has eight 1 GiB controller regions and the
-        # 16 GiB image sixteen (stack, MC) regions, enough for all twelve
-        # engines. Both come from alveo_u55c_core_bases(), so a tiling model
-        # and board_private_windows() agree on where a core's window is
-        # instead of each carrying its own answer.
-        if gib == 8 and num_engines > ALVEO_U55C_MC_COUNT:
-            raise ValueError(
-                f"{what}: only {ALVEO_U55C_MC_COUNT} of the U55C's {reported} "
-                f"cores get a controller to themselves on the {gib} GiB image; "
-                f"cores 8+ share one with cores 0-3 and would halve their "
-                f"bandwidth. The 16 GiB image has a region for every core.")
-        bases = alveo_u55c_core_bases(num_engines, dram_size_gb=gib)
-    elif reported == ALVEO_BOARD_CORES:
-        # Interleaved HBM: sequential windows.
-        bases = [base for base, _ in sequential_windows(num_engines, window_bytes)]
-    else:  # unreachable: board_window_bytes() already refused the board
-        raise ValueError(f"{what}: no tiling window map for {reported} cores")
+    # Interleaved HBM on both Alveo boards: sequential windows.
+    bases = [base for base, _ in sequential_windows(num_engines, window_bytes)]
 
     require_uncontended_windows(bases, window_bytes, what)
     return bases
@@ -1099,17 +783,16 @@ def tiled_window_bases(num_engines: int, window_bytes: int, what: str) -> list[i
 
 def require_uncontended_windows(bases: list[int], window_bytes: int,
                                 what: str) -> None:
-    """Fail unless the windows are in range, disjoint, and free of crowding."""
-    if window_bytes <= 0 or window_bytes % SWITCH_REGION_BYTES:
+    """Fail unless the windows are whole GiB, in range and disjoint."""
+    if window_bytes <= 0 or window_bytes % TILED_WINDOW_ALIGN:
         raise ValueError(
-            f"{what}: a window must be whole switch regions "
-            f"({SWITCH_REGION_BYTES // 2**20} MiB each), got 0x{window_bytes:X}")
+            f"{what}: a window must be whole GiB, got 0x{window_bytes:X}")
     dram_end = user_dma_core.AVAILABLE_DRAM_SIZE_GB * 2**30
     for i, base in enumerate(bases):
-        if base % SWITCH_REGION_BYTES:
+        if base % TILED_WINDOW_ALIGN:
             raise ValueError(
                 f"{what}: core {i}'s window at 0x{base:X} does not start on a "
-                f"{SWITCH_REGION_BYTES // 2**20} MiB switch-region boundary")
+                f"GiB boundary")
         if base + window_bytes > dram_end:
             raise ValueError(
                 f"{what}: core {i}'s window 0x{base:X}..0x{base + window_bytes:X} "
@@ -1120,20 +803,6 @@ def require_uncontended_windows(bases: list[int], window_bytes: int,
             raise ValueError(
                 f"{what}: cores {i0} and {i1} overlap at 0x{b1:X} "
                 f"(core {i0} owns 0x{b0:X}..0x{b0 + window_bytes:X})")
-    occupancy: dict[int, list[int]] = {}
-    for i, base in enumerate(bases):
-        for region in range(base // SWITCH_REGION_BYTES,
-                            (base + window_bytes) // SWITCH_REGION_BYTES):
-            occupancy.setdefault(region, []).append(i)
-    crowded = {r: e for r, e in occupancy.items()
-               if len(e) > MAX_ENGINES_PER_SWITCH_REGION}
-    if crowded:
-        detail = "; ".join(
-            f"region {r} (0x{r * SWITCH_REGION_BYTES:X}) holds cores {e}"
-            for r, e in sorted(crowded.items()))
-        raise ValueError(
-            f"{what}: more than {MAX_ENGINES_PER_SWITCH_REGION} engines share an "
-            f"HBM switch region, which halves their read bandwidth -- {detail}")
 
 
 def private_stride(num_engines: int, arena_bytes: Optional[int] = None,
@@ -1263,10 +932,9 @@ class PrivateArena:
         goes to weights.
 
         ``windows=[(base, bytes), ...]`` places the engines on EXPLICIT windows
-        instead of tiling ``arena_base`` by a stride. A board map is a
-        permutation, not an arithmetic progression -- the 16 GiB U55C puts core
-        1 at 9 GiB and core 9 at 1 GiB (board_private_windows) -- and base plus
-        stride cannot express that. The windows must all be the same size, since
+        instead of tiling ``arena_base`` by a stride, e.g. the board map from
+        board_private_windows() or model_multicore_layout(). The windows must all
+        be the same size, since
         every shard budget here is per core; they are checked for overlap.
 
         With explicit windows, ``isa_guard_bytes`` selects the protected-tail
@@ -1417,12 +1085,7 @@ class PrivateArena:
         return self.regions[engine_idx]
 
     def window_base(self, engine_idx: int) -> int:
-        """Where one engine's private window starts.
-
-        On HBM this is the address a board map is checked against: which
-        controller a window lands in is what the concurrent bandwidth depends
-        on (see alveo_u55c_core_bases).
-        """
+        """Where one engine's private window starts."""
         return self.regions[engine_idx].base
 
     def isa_base(self, engine_idx: int) -> int:
@@ -1446,8 +1109,8 @@ class PrivateArena:
 
     def describe(self) -> str:
         if self.windows is not None:
-            # Built from self.regions: the windows are a board permutation, so
-            # there is no stride for describe_private_map to walk.
+            # Built from self.regions: explicit windows need not be a single
+            # stride for describe_private_map to walk.
             lines = [f"  Private map: {self.num_engines} explicit board window(s), "
                      f"{self.stride / 2**20:.0f} MB/core:"]
             lines += ["    " + r.describe() for r in self.regions]
