@@ -34,6 +34,12 @@ sequential) -- NOT times the engine count, since the engines within one op
 already ran concurrently inside the measurement itself. Comparing
 --standalone's derived numbers against a plain (real) run at the same tier is
 the validation that this method is trustworthy at all.
+
+--standalone --chained (any tier) is a stress test rather than a timing
+derivation: it compiles the real prefill program for layer 0 alone at the
+tier's prefill length, loads random IF4 weights into layer 0, and launches it
+back to back --iters times, comparing every output against an fp32 host
+reference and against the first iteration (see run_chained_layer0).
 """
 
 from __future__ import annotations
@@ -849,6 +855,258 @@ def run_standalone(args, tier: str) -> None:
     )
 
 
+# ==========================================================================
+# --standalone --chained: the real layer-0 prefill, random weights, looped
+# ==========================================================================
+# --standalone's op-by-op rows are isolated programs: zero weights, no data
+# flowing between ops, host compile gaps between them. That times each op
+# well but never loads the board the way a real prefill does. --chained runs
+# the REAL compiled prefill program (Qwen25OmniLMMixin._emit_layer via
+# compile_prefill(seq, layer_size=1)): norm1 -> q/k/v -> RoPE/KV store ->
+# head-sharded attention -> o_proj -> residual -> norm2 -> gate/up/SiLU ->
+# down -> reduce -> residual, on all eight engines with the real
+# rendezvous, at the tier's prefill length. Layer 0's weights are random IF4
+# (uniform nibble codes, random positive block scales) so every multiplier
+# toggles like real data, and the layer is launched back to back --iters
+# times. Every output is checked against an fp32 host reference of the same
+# layer (SNR) and against the first iteration (must be bit-identical).
+
+# FP4 E2M1 value of each IF4 nibble code (bit 3 = sign), as the hardware
+# decodes it under a positive block scale -- quantize_weight's FP variant.
+_FP4_CODE_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def _random_if4(rng, N: int, K: int, weight_std: float):
+    """Random [N, K] IF4 weight. Returns (blob, dequantized fp32 matrix).
+
+    The blob has params.bin's IF4 layout -- every bf16 block scale, then the
+    packed codes, low nibble first -- so the model's own loader stages it.
+    The matrix is what the hardware dequantizes: code value times the
+    block's bf16 scale, rounded to bf16 (quantize_weight_simulate's model).
+    """
+    import numpy as np
+    import torch
+
+    blocks = N * K // 64
+    table = np.array(_FP4_CODE_VALUES, dtype=np.float32)
+    # Uniform codes have E[v^2] = 8.5625, so this scale gives weight_std.
+    mean_scale = weight_std / math.sqrt(float(np.mean(table ** 2)))
+    scales = torch.from_numpy(
+        rng.uniform(0.5, 1.5, blocks).astype(np.float32) * mean_scale
+    ).to(torch.bfloat16)
+    codes = rng.integers(0, 256, N * K // 2, dtype=np.uint8)
+    blob = scales.view(torch.int16).numpy().tobytes() + codes.tobytes()
+    nibbles = np.stack([codes & 0xF, codes >> 4], axis=-1).reshape(N, K // 64, 64)
+    w = table[nibbles] * scales.float().numpy().reshape(N, K // 64, 1)
+    return blob, torch.from_numpy(w.reshape(N, K)).to(torch.bfloat16).float()
+
+
+def _stage_random_layer0(ue, rng, weight_std: float) -> dict:
+    """Load random layer-0 weights through the model's own staging path.
+
+    Projections go through _stage_private_lm_projection (the per-engine
+    N-shards, and down's K-shards) exactly as params.bin's would; biases and
+    norm gammas through _dma_bf16. Returns the fp32 host copies.
+    """
+    import io
+    import numpy as np
+    import torch
+
+    d = ue._lm_dims()
+    H, AHD, KVH, QH, MLP = d["H"], d["AHD"], d["KVH"], d["QH"], d["MLP"]
+    ue.layout.begin_weight_stage("lm")
+    ue.reset_params_dram_addr()
+    la, ref = {}, {}
+    for tag in ("q", "k", "v", "o", "gate", "up", "down"):
+        if not ue._lm_projection_is_quantized(tag):
+            raise RuntimeError(f"--chained expects IF4 {tag}_proj (see config precision)")
+        N, K = (H, MLP) if tag == "down" else ue._lm_private_projection_dims(tag)
+        blob, ref[tag] = _random_if4(rng, N, K, weight_std)
+        ue._stage_private_lm_projection(
+            io.BytesIO(blob), {"offset": 0, "size": len(blob)}, 0, la, tag, 0,
+            f"random.L0.{tag}")
+
+    def bf16_vector(key, values):
+        t = torch.from_numpy(values.astype(np.float32)).to(torch.bfloat16)
+        blob = t.view(torch.int16).numpy().tobytes()
+        la[key] = ue._dma_bf16(io.BytesIO(blob), {"offset": 0, "size": len(blob)},
+                               0, f"random.L0.{key}")
+        ref[key] = t.float()
+
+    for key, n in (("q_bias", QH * AHD), ("k_bias", KVH * AHD), ("v_bias", KVH * AHD)):
+        bf16_vector(key, 0.1 * rng.standard_normal(n))
+    for key in ("ln1", "ln2"):
+        bf16_vector(key, 1.0 + 0.1 * rng.standard_normal(H))
+    ue.lm_layer_addrs = [la]
+    ue._lm_weight_init_done = True
+    return ref
+
+
+def _layer0_reference(ue, ref: dict, x, rope_table, eps: float = 1e-6):
+    """fp32 host reference of one Qwen2 decoder layer, as _emit_layer runs it."""
+    import torch
+
+    d = ue._lm_dims()
+    AHD, KVH, QH, G = d["AHD"], d["KVH"], d["QH"], d["G"]
+    S = x.shape[0]
+    half = AHD // 2
+
+    def rms(t, gamma):
+        return t * torch.rsqrt(t.pow(2).mean(-1, keepdim=True) + eps) * gamma
+
+    # rope_table rows are [cos | cos | -sin | sin]: out = x*cos + swap(x)*sin.
+    cos = rope_table[:, :AHD].float()[:, None, :]
+    sin = rope_table[:, AHD:].float()[:, None, :]
+
+    def rope(t):
+        return t * cos + torch.cat([t[..., half:], t[..., :half]], -1) * sin
+
+    h = x.float()
+    n1 = rms(h, ref["ln1"])
+    q = rope((n1 @ ref["q"].T + ref["q_bias"]).view(S, QH, AHD))
+    k = rope((n1 @ ref["k"].T + ref["k_bias"]).view(S, KVH, AHD))
+    v = (n1 @ ref["v"].T + ref["v_bias"]).view(S, KVH, AHD)
+    mask = torch.full((S, S), float("-inf")).triu(1)
+    attn = torch.empty(S, QH, AHD)
+    for qh in range(QH):
+        kv = qh // G
+        scores = q[:, qh] @ k[:, kv].T / math.sqrt(AHD) + mask
+        attn[:, qh] = torch.softmax(scores, -1) @ v[:, kv]
+    h = h + attn.reshape(S, QH * AHD) @ ref["o"].T
+    n2 = rms(h, ref["ln2"])
+    mlp = torch.nn.functional.silu(n2 @ ref["gate"].T) * (n2 @ ref["up"].T)
+    return h + mlp @ ref["down"].T
+
+
+def run_chained_layer0(args, tier: str) -> dict:
+    """--standalone --chained: loop the real layer-0 prefill on random weights."""
+    import importlib.util
+    import numpy as np
+    import time
+    import torch
+
+    spec = importlib.util.spec_from_file_location("qwen2_5_omni_7b_test", MAIN_SCRIPT)
+    tm = importlib.util.module_from_spec(spec)
+    sys.modules["qwen2_5_omni_7b_test"] = tm
+    spec.loader.exec_module(tm)
+
+    seq = int(PRESETS[tier]["target_prefill_tokens"])
+    rng = np.random.default_rng(args.seed)
+    rows, failure = [], None
+    with tm._exclusive_run_lock():
+        engine_kwargs = tm.resolve_engine_config(
+            argparse.ArgumentParser(),
+            argparse.Namespace(dev=args.dev, multi_core=8))
+        fpga_build = tm.reset_selected_engines()
+        ue = tm.Qwen25OmniUnifiedEngine(
+            script_dir=SCRIPT_DIR, fpga_build=fpga_build, **engine_kwargs)
+        d = ue._lm_dims()
+        H = d["H"]
+
+        class _VocabOnly:
+            # lm_tensor_init only asks the tokenizer for its size.
+            def __len__(self):
+                return int(d["VOCAB"])
+
+        ue.tokenizer = _VocabOnly()
+        t0 = time.perf_counter()
+        ref_w = _stage_random_layer0(ue, rng, args.weight_std)
+        print(f"[chained] random layer-0 IF4 weights staged "
+              f"({time.perf_counter() - t0:.1f}s, weight std {args.weight_std})", flush=True)
+        # --layers N: one program of N layers that all read layer 0's weights,
+        # each with its own KV cache, ping-ponging LM_IO_A/B like the real one.
+        ue.lm_layer_addrs = ue.lm_layer_addrs[:1] * args.layers
+        ue.lm_tensor_init()
+        ue.compile_prefill(seq, layer_size=args.layers)
+
+        # The prompt's embeddings ARE the random input: row i of the host
+        # table is token i, so run_prefill's own host gather uploads x as-is.
+        x = torch.from_numpy(rng.standard_normal((seq, H)).astype(np.float32)).to(torch.bfloat16)
+        ue.embedding_weight = x
+        tokens = list(range(seq))
+
+        t0 = time.perf_counter()
+        rope_table = ue._build_rope_table(torch.arange(seq))
+        expected = x.float()
+        for li in range(args.layers):
+            # Each FPGA layer writes bf16 to the ping-pong buffer, so the
+            # reference hands the next layer the same rounding.
+            expected = _layer0_reference(ue, ref_w, expected.to(torch.bfloat16), rope_table)
+            if args.layers > 1:
+                print(f"[chained] host reference layer {li + 1}/{args.layers} "
+                      f"({time.perf_counter() - t0:.0f}s)", flush=True)
+        signal = float(expected.pow(2).sum())
+        print(f"[chained] fp32 host reference: {time.perf_counter() - t0:.1f}s", flush=True)
+
+        # The engine class's run_prefill only executes stage images published
+        # to programs.bin. This one-layer, random-weight program must not
+        # overwrite the real model's programs.bin, so call the LM mixin's
+        # run_prefill below that gate; it uploads the in-memory program itself.
+        run_prefill = super(tm.Qwen25OmniUnifiedEngine, ue).run_prefill
+        first = None
+        for it in range(1, args.iters + 1):
+            t0 = time.perf_counter()
+            try:
+                run_prefill(tokens)
+            except Exception as exc:  # noqa: BLE001 - a hang is the result
+                failure = f"iteration {it}: {type(exc).__name__}: {exc}"
+                print(f"[chained] FAILED {failure}", flush=True)
+                break
+            out = ue.dma_from_accelerator_memory(ue.LM_PREFILL_OUT, torch.Size([seq, H]))
+            wall = time.perf_counter() - t0
+            err = out.float() - expected
+            noise = float(err.pow(2).sum())
+            snr = 10 * math.log10(signal / noise) if noise else float("inf")
+            bits = out.view(torch.int16)
+            if first is None:
+                first = bits.clone()
+            mismatched = int((bits != first).sum())
+            nonfinite = int((~torch.isfinite(out.float())).sum())
+            row = dict(iter=it, hw_ms=ue._latency_prefill_us / 1e3, wall_s=wall,
+                       snr_db=snr, max_abs_err=float(err.abs().max()),
+                       mismatched=mismatched, nonfinite=nonfinite)
+            rows.append(row)
+            print(f"[chained] iter {it:3d}/{args.iters}: {row['hw_ms']:9.1f} ms HW, "
+                  f"{wall:6.2f}s wall, SNR {snr:6.2f} dB, max|err| {row['max_abs_err']:.4g}, "
+                  f"{mismatched} element(s) differ from iter 1, {nonfinite} non-finite",
+                  flush=True)
+
+    ok = (failure is None and len(rows) == args.iters
+          and all(r["mismatched"] == 0 and r["nonfinite"] == 0 for r in rows))
+    hw_total = sum(r["hw_ms"] for r in rows) / 1e3
+    out_path = args.summary or os.path.join(
+        SCRIPT_DIR, f"qwen2.5_omni_7b_benchmark_{tier}_chained_layer0.md")
+    lines = [
+        f"# qwen2.5_omni_7b {tier.upper()} --standalone --chained -- layer-0 prefill stress",
+        "",
+        f"- **Result:** {'PASS' if ok else 'FAIL'}"
+        + (f" -- {failure}" if failure else ""),
+        f"- **Program:** the real compiled prefill, {args.layers} layer(s) all on "
+        f"layer 0's weights (`compile_prefill({seq}, layer_size={args.layers})`), "
+        f"8 engines, {seq} rows",
+        f"- **Weights:** random IF4 (uniform codes, positive block scales), "
+        f"std {args.weight_std}, seed {args.seed}; random q/k/v biases and norm gammas",
+        f"- **Input:** random N(0, 1) bf16 hidden rows; positions 0..{seq - 1}",
+        f"- **Iterations:** {len(rows)} of {args.iters} completed, "
+        f"{hw_total:.1f} s engine time in total",
+        f"- **Reference:** fp32 host layer on the dequantized weights; SNR = "
+        f"10 log10(sum ref^2 / sum (hw - ref)^2)",
+        "",
+        "| Iter | HW ms | Wall s | SNR dB | max abs err | Elements != iter 1 | Non-finite |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        *(f"| {r['iter']} | {r['hw_ms']:.1f} | {r['wall_s']:.2f} | {r['snr_db']:.2f} | "
+          f"{r['max_abs_err']:.4g} | {r['mismatched']} | {r['nonfinite']} |" for r in rows),
+        "",
+    ]
+    with open(out_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines))
+    print(f"\n[chained] {'PASS' if ok else 'FAIL'}; wrote {out_path}", flush=True)
+    if not ok:
+        raise SystemExit(1)
+    return {"rows": rows, "ok": ok}
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="qwen2.5_omni_7b fixed-shape benchmark: --low / --medium / --high",
@@ -873,6 +1131,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "plain (real) run -- the cross-check that this method is "
              "trustworthy at all.",
     )
+    parser.add_argument(
+        "--chained", action="store_true",
+        help="with --standalone: instead of isolated ops, loop the REAL compiled "
+             "layer-0 prefill at the tier's prefill length on random IF4 "
+             "weights, checking every output against an fp32 host reference "
+             "(SNR) and against the first iteration (bit-exact). A stress test.",
+    )
+    parser.add_argument("--layers", type=int, default=1,
+                        help="--chained: layers in the one compiled prefill program, "
+                             "all on layer 0's random weights (28 = the real model's shape)")
+    parser.add_argument("--iters", type=int, default=None,
+                        help="--chained: back-to-back program launches (default "
+                             "28 // --layers, i.e. one full prefill's engine time)")
+    parser.add_argument("--seed", type=int, default=0, help="--chained: RNG seed")
+    parser.add_argument("--weight-std", type=float, default=0.02,
+                        help="--chained: random weight standard deviation")
     tier = parser.add_mutually_exclusive_group(required=True)
     tier.add_argument("--low", action="store_true", help="voice command: real FPGA run")
     tier.add_argument("--medium", action="store_true", help="single camera: real FPGA run")
@@ -885,6 +1159,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.chained:
+        if not args.standalone:
+            parser.error("--chained requires --standalone")
+        if not 1 <= args.layers <= 28:
+            parser.error("--layers must be 1..28")
+        if args.iters is None:
+            args.iters = max(1, 28 // args.layers)
+        if args.iters < 1:
+            parser.error("--iters must be positive")
+        tier = "low" if args.low else "medium" if args.medium else "high"
+        run_chained_layer0(args, tier)
+        return
     if args.standalone:
         _reset_engines_at_start(args.dev)
     if args.low:
