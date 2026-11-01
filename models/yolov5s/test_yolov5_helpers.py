@@ -523,7 +523,7 @@ class PlannerTests(unittest.TestCase):
                 self.assertTrue(torch.equal(
                     result.view(torch.uint8), source.view(torch.uint8)))
 
-    def test_dma_read_updates_noncontiguous_tensor_and_preserves_short_tail(self):
+    def test_dma_read_updates_noncontiguous_tensor_and_rejects_short_read(self):
         engine = object.__new__(user_dma_core.UnifiedEngine)
         source = torch.tensor(
             [0x3F80, 0xBF00, 0x0001, 0x7F7F], dtype=torch.uint16) \
@@ -546,10 +546,10 @@ class PlannerTests(unittest.TestCase):
         with tempfile.NamedTemporaryFile() as device:
             self.assertEqual(
                 engine.dma_write(device.name, 0, prefix, 4), 4)
-            self.assertEqual(
-                engine.dma_read(device.name, 0, result, 8), 4)
+            with self.assertRaisesRegex(OSError, "with 4 of 8 bytes left"):
+                engine.dma_read(device.name, 0, result, 8)
         self.assertEqual(
-            result.tolist(), [0x1111, 0x2222, 0xCCCC, 0xDDDD])
+            result.tolist(), [0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD])
 
     def test_latency_counter_units_are_hidden_by_engine_wrapper(self):
         engine = object.__new__(user_dma_core.UnifiedEngine)
