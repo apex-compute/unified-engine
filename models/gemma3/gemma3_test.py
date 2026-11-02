@@ -3372,7 +3372,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             else:
                 from gemma3_numeric import Gemma3_NumericEngine
                 _original_print("[Numeric] Running host prefill and first-decode references...")
-                _num_ue = Gemma3_NumericEngine(script_dir=self.script_dir, local_weights=self.local_weights)
+                # Host-only reference: initialize_model=False skips weight_init()/tensor_init(),
+                # which would re-upload the weights and re-allocate DRAM on the board mid-run.
+                _num_ue = Gemma3_NumericEngine(script_dir=self.script_dir, local_weights=self.local_weights,
+                                               initialize_model=False)
+                _num_ue.embedding_weight = self.embedding_weight
                 _, _ref_kv = _num_ue._compute_torch_prefill(tuple(prefill_seq), self.LAYER_SIZE)
                 _, _dec_new_kv = _num_ue._compute_torch_decoder(self.prefill_seq[-1], _ref_kv, self.LAYER_SIZE)
                 self._numeric_ref_cache = (_ref_cache_key, (_ref_kv, _dec_new_kv))

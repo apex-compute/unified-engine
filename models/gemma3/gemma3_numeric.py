@@ -34,6 +34,7 @@ from user_dma_core import DMA_DEVICE_C2H, TYPE, set_dma_device, calculate_snr
 from read_trace import generate_trace
 
 import gemma3_test
+from quant_lib import dequant
 from gemma3_test import (
     Gemma3_UnifiedEngine,
     _parse_offset,
@@ -51,35 +52,14 @@ def _dequantize_int4_from_bin(
     block_size: int = 64,
 ) -> torch.Tensor:
     """
-    Dequantize INT4 packed weight from bin. Scale per block of 64 along K.
-    Same format as _quantize_bf16_to_int4_packed in gemma3_test.
+    Dequantize a 4-bit packed weight from bin with the codec weight_bin_generate used
+    (gemma3_test.QUANT_PRECISION, "if4": per-block INT4 or FP4 E2M1 chosen by scale sign).
+    Decoding every block as plain INT4 is wrong for the FP4 blocks.
     Returns (N, K) bfloat16 tensor.
     """
-    assert K % block_size == 0
-    num_blocks_k = K // block_size
-
-    # Scale: (N, K/64) bf16
     scale_bytes = weight_bin[scale_off : scale_off + scale_sz]
-    scale_elems = len(scale_bytes) // 2
-    scale = user_dma_core.tensor_from_le_bytes(
-        scale_bytes, torch.bfloat16).reshape(N, num_blocks_k)
-
-    # Data: packed (N, K/2) bytes, low nibble = even idx, high = odd
     data_bytes = weight_bin[data_off : data_off + data_sz]
-    packed = np.frombuffer(data_bytes, dtype=np.uint8)
-    packed = packed[: N * (K // 2)].reshape(N, K // 2)
-
-    # Unpack: each byte -> two int4 values (signed: 0-7 -> 0-7, 8-15 -> -8 to -1)
-    low = (packed & 0x0F).astype(np.int16)
-    high = ((packed >> 4) & 0x0F).astype(np.int16)
-    low = np.where(low >= 8, low - 16, low)
-    high = np.where(high >= 8, high - 16, high)
-    w_int8 = np.stack([low, high], axis=-1).reshape(N, K)
-
-    # Dequantize: w_int8 * scale (scale broadcast per block)
-    scale_expanded = scale.float().repeat_interleave(block_size, dim=1).to(torch.bfloat16)
-    w_bf16 = torch.from_numpy(w_int8.astype(np.float32)).to(torch.bfloat16) * scale_expanded
-    return w_bf16
+    return dequant(gemma3_test.QUANT_PRECISION, data_bytes, scale_bytes, N, K, block_size=block_size)
 
 
 def _rms_norm_torch(x: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
@@ -167,6 +147,16 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
     """
     Gemma3_UnifiedEngine with torch reference computation for numeric verification.
     """
+
+    @property
+    def weight_bin(self) -> bytes:
+        """Packed weight bin, read on first use: weight_init() keeps it local so the 1.1 GB
+        buffer is freed after the DRAM upload, and a reference built with
+        initialize_model=False never runs weight_init() at all."""
+        if getattr(self, "_weight_bin", None) is None:
+            with open(os.path.join(self.script_dir, self._weights_bin_rel), "rb") as f:
+                self._weight_bin = f.read()
+        return self._weight_bin
 
     def _load_layer_weights_torch(self, layer_idx: int) -> dict:
         """Load layer weights from weight_bin for torch ref (bf16, int4 dequantized)."""
@@ -425,11 +415,13 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
         last_token_id: int,
         kv_cache: dict,
         layer_size: int,
-    ) -> dict:
+    ) -> tuple[dict, dict]:
         """
         One decoder step: input = last token embedding, use kv_cache in flash attention,
-        then through all layers and last LM norm + LM head. Returns ref dict for 1-token
-        last-layer intermediates (same keys as prefill) plus OUTPUT_NORM_DRAM, LOGITS_DRAM.
+        then through all layers and last LM norm + LM head. Returns (ref, new_kv): ref holds
+        the 1-token last-layer intermediates (same keys as prefill) plus OUTPUT_NORM_DRAM,
+        LOGITS_DRAM; new_kv maps layer_idx -> {"k_rope": (1, head_dim), "v": (1, head_dim)}
+        for the new token.
         """
         seq_len = kv_cache[0]["k_rope"].shape[0]
         scale_attn = 1.0 / math.sqrt(self.head_dim)
@@ -453,6 +445,7 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
 
         x = self.get_embedding_for_tokens([last_token_id]).clone()  # (1, vector_length)
         ref = {}
+        new_kv = {}
 
         for layer_idx in range(layer_size):
             w = self._load_layer_weights_torch(layer_idx)
@@ -484,6 +477,7 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
             cache_v = kv_cache[layer_idx]["v"]
             K_full = torch.cat([cache_k, k_rope_new], dim=0)
             V_full = torch.cat([cache_v, v_proj], dim=0)
+            new_kv[layer_idx] = {"k_rope": k_rope_new.clone(), "v": v_proj.clone()}
             # Match compile_decoder: one decoder_attention_core per head group g; same K,V (seq_len, head_dim), Q_g (1, head_dim)
             bias_decoder = torch.zeros(1, seq_len + 1, dtype=torch.bfloat16)
             flash_out_list = []
@@ -536,7 +530,7 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
         ref["OUTPUT_NORM_DRAM"] = out_norm
         ref["LOGITS_DRAM"] = logits
 
-        return ref
+        return ref, new_kv
 
     def torch_ref_check_prefill(self, layer_size: int) -> dict:
         """
@@ -613,7 +607,7 @@ class Gemma3_NumericEngine(Gemma3_UnifiedEngine):
         assert self.prefill_seq is not None, "prefill_seq is not set"
         prefill_seq = self.prefill_seq
         last_token_id = prefill_seq[-1]
-        ref = self._compute_torch_decoder(last_token_id, kv_cache, layer_size)
+        ref, _ = self._compute_torch_decoder(last_token_id, kv_cache, layer_size)
 
         # HW decoder writes 1 token to base of each buffer; same names as prefill, 1-token shapes
         tensor_specs = [
