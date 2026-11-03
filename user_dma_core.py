@@ -124,6 +124,10 @@ UE_PIPELINE_COUNTER_CLK_DIV = 16
 UE_PEAK_GFLOPS: Optional[float] = None
 UE_TRACE_SIZE = 8192
 UE_AXI_DATA_WIDTH_BITS: Optional[int] = None
+# wait_queue() timeouts are given for an engine clock of at least this; on a
+# slower image they stretch by WAIT_QUEUE_REFERENCE_CLOCK_HZ / CORE_CLOCK_FREQ_HZ
+# (kintex7_closed_timing at 100.3 MHz: 2.5x), so the same programs fit.
+WAIT_QUEUE_REFERENCE_CLOCK_HZ = 250_000_000.0
 
 
 def _clock_period_ns_from_frequency_hz(frequency_hz: float) -> float:
@@ -1652,7 +1656,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xfa9a499e, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xfa9a499e. Please update FPGA with update_fa9a499e.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
+        assert hw_version == 0x39221277, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x39221277. Please update FPGA with update_39221277.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
         if getattr(self, "conv_geometry_mode", CONV_GEOMETRY_LIVE_CSR) == CONV_GEOMETRY_QUEUE_CONFIG:
             # Convolution images have independent build stamps from the legacy
             # release. Explicit queue-CONFIG selection opts into that contract;
@@ -1800,13 +1804,16 @@ class UnifiedEngine:
         Wait for queue to finish
 
         Args:
-            timeout_seconds: Maximum time to wait in seconds.
+            timeout_seconds: Maximum time to wait in seconds at an engine clock of
+                WAIT_QUEUE_REFERENCE_CLOCK_HZ or more; scaled up on slower clocks.
             poll_interval_seconds: Delay between status reads. The 1 ms default avoids
                 adding up to 10 ms of completion-detection latency to every decoded token.
 
         Raises:
             TimeoutError: The queue remains busy, with a best-effort register snapshot.
         """
+        if CORE_CLOCK_FREQ_HZ:
+            timeout_seconds *= max(1.0, WAIT_QUEUE_REFERENCE_CLOCK_HZ / CORE_CLOCK_FREQ_HZ)
         start_time = time.monotonic()
         iteration = 0
 
