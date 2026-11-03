@@ -11,11 +11,14 @@ MIB = 1 << 20
 
 
 class BoardMemoryMaps(unittest.TestCase):
-    def board(self, cores, gib):
+    def board(self, cores, gib, clock_hz=150e6):
+        # The default clock is kintex7_systolic's (150 MHz): its windows are per
+        # DDR3 channel. The 213 MHz kintex7 release image is interleaved.
         return patch.multiple(shard.user_dma_core,
                               ANDROMEDA_CORE_COUNT=cores,
                               AVAILABLE_DRAM_SIZE_GB=gib,
-                              DRAM_START_ADDR=2 * GIB)
+                              DRAM_START_ADDR=2 * GIB,
+                              CORE_CLOCK_FREQ_HZ=clock_hz)
 
     def assert_disjoint(self, windows, model_base=None, model_bytes=2 * GIB):
         spans = [(base, base + size) for base, size in windows]
@@ -66,20 +69,25 @@ class BoardMemoryMaps(unittest.TestCase):
         self.assertEqual(base, GIB)
         self.assert_disjoint(windows, base)
 
-    def test_u50_ports_keep_primary_and_secondary_stack_ownership(self):
-        # build_alveo.tcl: engine SAXI ports 00,04,08,06,02,14,12,10.
-        ports = [0, 4, 8, 6, 2, 14, 12, 10]
-        with self.board(8, 8):
+    def test_kintex7_interleaved_windows_are_sequential(self):
+        with self.board(2, 4, clock_hz=213.2e6):
+            self.assertEqual([w.segments for w in shard.board_private_windows(2)],
+                             [((0, 512 * MIB),), ((512 * MIB, 512 * MIB),)])
+            windows, model_base = shard.model_multicore_layout(2)
+            shard.require_multicore_dram(2, "test")
+        self.assertEqual(windows, [(0, 512 * MIB), (512 * MIB, 512 * MIB)])
+        self.assertEqual(model_base, GIB)
+
+    def test_u50_windows_are_sequential_and_the_model_follows_them(self):
+        # Interleaved HBM (#1441): any placement reads at the same rate.
+        with self.board(8, 8, clock_hz=333.3e6):
             for count in range(1, 9):
                 board = shard.board_private_windows(count)
                 windows, model_base = shard.model_multicore_layout(count)
-                self.assertEqual(model_base, 6 * GIB)
-                for i, window in enumerate(board):
-                    expected = ports[i] // 2 * 512 * MIB
-                    self.assertEqual(window.segments,
-                                     ((expected, 512 * MIB),
-                                      (expected + 4 * GIB, 512 * MIB)))
-                    self.assertEqual(windows[i], (expected, 512 * MIB))
+                expected = [(i * 512 * MIB, 512 * MIB) for i in range(count)]
+                self.assertEqual([w.segments for w in board], [(e,) for e in expected])
+                self.assertEqual(windows, expected)
+                self.assertEqual(model_base, count * 512 * MIB)
                 self.assert_disjoint(windows, model_base)
 
     def test_u55c_native_stack_and_controller_match_each_engine_port(self):

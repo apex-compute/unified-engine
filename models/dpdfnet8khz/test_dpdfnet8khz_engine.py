@@ -55,6 +55,18 @@ class StreamingEngineIOTest(unittest.TestCase):
         self.assertEqual(contents[:16], bytes(range(16)))
         self.assertEqual(contents[22:48], bytes(range(22, 48)))
 
+    def test_preserves_alternating_bf16_and_fp16_dma_bytes(self):
+        for index, dtype in enumerate((torch.bfloat16, torch.float16, torch.bfloat16)):
+            # Check raw encodings independently of readback interpretation.
+            source = torch.tensor([1.0, -2.0], dtype=dtype)
+            target = torch.zeros_like(source)
+            offset = 16 + index * 8
+            self.assertEqual(self.engine.dma_write(self.path, offset, source, 4), 4)
+            self.assertEqual(self.engine.dma_read(self.path, offset, target, 4), 4)
+            self.assertTrue(torch.equal(source, target))
+            expected = b"\x80\x3f\x00\xc0" if dtype == torch.bfloat16 else b"\x00\x3c\x00\xc0"
+            self.assertEqual(Path(self.path).read_bytes()[offset:offset + 4], expected)
+
     def test_scalar_read_copies_into_offset_tensor_and_write_shares_storage(self):
         storage = torch.full((10,), 0x5A, dtype=torch.uint8)
         target = storage[2:8].view(torch.bfloat16)

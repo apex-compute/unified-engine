@@ -33,6 +33,9 @@ import numpy as np
 import torch
 import math
 if __package__:
+    from .storage_format import (
+        StorageFormat, TensorFormats, UE_TENSOR_FORMATS_ADDR, as_storage_format,
+    )
     from .andromeda_hw_info import (
         HardwareInfo,
         MAX_FREQUENCY_MHZ_Q8,
@@ -41,6 +44,9 @@ if __package__:
         format_hardware_info,
     )
 else:  # Direct execution from pcie_utils/.
+    from storage_format import (
+        StorageFormat, TensorFormats, UE_TENSOR_FORMATS_ADDR, as_storage_format,
+    )
     from andromeda_hw_info import (
         HardwareInfo,
         MAX_FREQUENCY_MHZ_Q8,
@@ -65,7 +71,7 @@ UE_URAM_LENGTH_ADDR = 0x00000020
 UE_URAM_WRITEBACK_ADDR = 0x00000024
 UE_LATENCY_COUNT_ADDR = 0x00000030
 UE_DRAM_URAM_CTRL_ADDR = 0x00000034
-UE_LALU_HYPERPARAMETERS_ADDR = 0x00000038  # bf16_lalu_a [15:0], bf16_lalu_b [31:16] (axi_reg_map_pkg.sv)
+UE_LALU_HYPERPARAMETERS_ADDR = 0x00000038  # lalu_a [15:0], lalu_b [31:16], encoded in formats.params
 UE_URAM_ROW_SIZE_ADDR = 0x00000040
 UE_LALU_INST_ADDR = 0x00000048
 UE_SCALAR_ADDR = 0x00000050
@@ -108,6 +114,7 @@ INT_CAUSE_HALT = 2
 CLOCK_CYCLE_TIME_NS: Optional[float] = None
 CORE_CLOCK_FREQ_HZ: Optional[float] = None
 HW_INFO_RAW: Optional[int] = None
+_DEFAULT_TENSOR_FORMATS = TensorFormats()
 QUEUE_MODE_ENABLED: Optional[bool] = None
 ANDROMEDA_CORE_COUNT: Optional[int] = None
 AVAILABLE_DRAM_SIZE_GB: Optional[int] = None
@@ -646,11 +653,18 @@ def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
     """
     import sys as _sys
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER, UE_0_BASE_ADDR
+    global CLOCK_CYCLE_TIME_NS
+    old_identity = (DMA_DEVICE_USER, UE_0_BASE_ADDR)
     old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
     if device_name == "efinix":
         DMA_DEVICE_H2C = "/dev/pcie_dma1_htc_0"
         DMA_DEVICE_C2H = "/dev/pcie_dma1_cth_0"
         DMA_DEVICE_USER = "/dev/pcie_dma1_user"
+        UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
+    elif device_name == "efinix_m2":
+        DMA_DEVICE_H2C = "/dev/pcie_dma0_htc_0"
+        DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
+        DMA_DEVICE_USER = "/dev/pcie_dma0_user"
         UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
     else:
         DMA_DEVICE_H2C = f"/dev/{device_name}_h2c_0"
@@ -658,6 +672,8 @@ def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
         DMA_DEVICE_USER = f"/dev/{device_name}_user"
         if base_addr is not None:
             UE_0_BASE_ADDR = int(base_addr)
+    if old_identity != (DMA_DEVICE_USER, UE_0_BASE_ADDR):
+        CLOCK_CYCLE_TIME_NS = None
     # Claim the board before anything touches it (see ONE PROCESS PER BOARD).
     claim_dma_device()
     for _mod in list(_sys.modules.values()):
@@ -758,6 +774,8 @@ UE_VECTOR_SIZE = 64
 INSTRUCTION_SIZE_BYTES = 32
 UE_FMAX_CONTEXT_SIZE = 64
 SCALE_BRAM_ELEMENTS = 8192
+# Quantizer output scales use a separate narrow-write QBRAM (10-bit address).
+QBRAM_ELEMENTS = 1024
 # GroupNorm live-accumulator budget in URAM lines (see plan_group_norm): the
 # stats pass keeps 2 slot-blocks in URAM_A and 3 in URAM_B, so 1024 lines per
 # block clears both 4096-line banks with room to spare.
@@ -816,14 +834,14 @@ class UE_MODE(IntEnum):
 
 class TYPE(IntEnum):
     # Adaptive block-scale formats. For IF4/IF8 the INT vs FP variant is
-    # encoded in the sign bit of each block's bf16 scale: negative scale ->
+    # encoded in the sign bit of each block's 16-bit scale: negative scale ->
     # INT path, positive scale -> FP path. The hardware always uses |scale|
     # as the effective multiplier.
     IF8 = 1   # 8-bit: sign=1 -> INT8, sign=0 -> FP8 E4M3
-    # TQ4 (TurboQuant 4-bit): 4-bit index into a 16-entry programmable bf16
+    # TQ4 (TurboQuant 4-bit): 4-bit index into a 16-entry programmable 16-bit
     # codebook latched from URAM-B[0] at dma_start.
     #
-    # Hardware constraint: per-block bf16 scales must be POSITIVE. Unlike
+    # Hardware constraint: per-block scales must be POSITIVE. Unlike
     # IF4/IF8 where the scale sign bit selects the FP-vs-INT variant, for
     # TQ4 the same sign bit (``quant_datatype``) gates which data path the
     # 4-bit nibble takes inside compute_unit.vhdl. Only the
@@ -1115,14 +1133,22 @@ class DeviceTensor:
     For outputs: Lazy C2H DMA - only fetch when to_cpu() called or data accessed.
     """
 
-    def __init__(self, shape: torch.Size, ue: 'UnifiedEngine', dram_addr: Optional[int] = None, data: Optional[torch.Tensor] = None):
+    def __init__(self, shape: torch.Size, ue: 'UnifiedEngine', dram_addr: Optional[int] = None, data: Optional[torch.Tensor] = None, *, dtype=None):
         self._ue = ue
+        self.storage_format = as_storage_format(
+            dtype if dtype is not None else data.dtype if data is not None else torch.bfloat16)
+        if data is not None:
+            ue._validate_storage_tensor(data, storage_format=self.storage_format)
         self._data = data
         self._shape = shape
         self.dram_addr = dram_addr
         self.on_fpga_dram = dram_addr is not None
         self.on_host_dram = data is not None
         self.synced = False
+
+    @property
+    def dtype(self):
+        return self.storage_format.dtype
 
     @property
     def data(self) -> torch.Tensor:
@@ -1134,10 +1160,12 @@ class DeviceTensor:
             if self.on_fpga_dram:
                 if self.dram_addr is not None:
                     print(f"Data is on FPGA DRAM at {hex(self.dram_addr)} and size is {self.size_bytes()} bytes")
-                    self._data = torch.zeros(self.get_num_elements(), dtype=torch.bfloat16)
-                    self._ue.dma_read(DMA_DEVICE_C2H, self.dram_addr, self._data, self.size_bytes())
+                    self._data = torch.zeros(self.get_num_elements(), dtype=self.dtype)
+                    self._ue.dma_read(self._ue.c2h_device, self.dram_addr, self._data, self.size_bytes())
+                    self._data = self._data.reshape(self._shape)
+                    self.on_host_dram = True
                     self.synced = True
-                    return self._data.reshape(self._shape)
+                    return self._data
                 else:
                     print(f"Data is on FPGA DRAM but no DRAM address set")
                     raise ValueError("Data is on FPGA DRAM but no DRAM address set")
@@ -1147,6 +1175,7 @@ class DeviceTensor:
 
     @data.setter
     def data(self, value: torch.Tensor):
+        self._ue._validate_storage_tensor(value, storage_format=self.storage_format)
         self._data = value
         self.on_host_dram = True
         self.on_fpga_dram = False
@@ -1157,8 +1186,9 @@ class DeviceTensor:
         if dram_addr is not None:
             if self._data is None:
                 self.data # fetch data from FPGA DRAM
+            self._ue._validate_storage_tensor(self._data, storage_format=self.storage_format)
             self.dram_addr = dram_addr # new address
-            self._ue.dma_write(DMA_DEVICE_H2C, dram_addr, self._data, self.size_bytes())
+            self._ue.dma_write(self._ue.h2c_device, dram_addr, self._data, self.size_bytes())
         else:
             print(f"Data is on host DRAM")
             self.on_fpga_dram = False
@@ -1173,7 +1203,7 @@ class DeviceTensor:
 
     def needs_dma(self, dram_addr: int) -> bool:
         """Check if H2C DMA is needed to reach the given address."""
-        return (self.dram_addr != dram_addr)
+        return self.dram_addr != dram_addr or (self.on_host_dram and not self.synced)
 
     def get_num_elements(self) -> int:
         """Get number of elements in a tensor."""
@@ -1187,7 +1217,7 @@ class DeviceTensor:
             raise ValueError(f"Invalid shape: {self._shape}")
 
     def size_bytes(self) -> int:
-        """Get size in bytes (assumes bf16 = 2 bytes per element)."""
+        """Get storage size: both supported tensor formats use two bytes."""
         if len(self._shape) == 1:
             return self._shape[0] * 2
         elif len(self._shape) == 2:
@@ -1214,7 +1244,16 @@ class DeviceTensor:
 
 class UnifiedEngine:
     """
-    PyTorch-based Unified Engine that simulates hardware operations
+    Compile operations for the BF19 compute engine.
+
+    Tensors default to BF16. Pass ``formats=TensorFormats(...)``
+    to select each input/output boundary without changing engine state. A/B
+    identify the logical inputs of core APIs (physical URAM operands in low-level
+    descriptors). Transpose uses A for input and B for its identity. Norms use B
+    for gamma/beta/inv-N/mask vectors; RoPE uses B for cos/sin and swap identity.
+    Intermediate tensor writes use ``formats.output`` and subsequent reads carry
+    that type explicitly. Attention accepts additional V/scratch/identity types.
+    BF19 FMAX, reciprocal, accumulators, and 21-bit scalars never change format.
     """
     def __init__(self,
                  BASE_ADDR: Optional[int] = None,
@@ -1319,6 +1358,65 @@ class UnifiedEngine:
             return value
         return ((value + align_bytes - 1) // align_bytes) * align_bytes
 
+    def _resolve_tensor_formats(self, formats=None) -> TensorFormats:
+        if formats is None:
+            return _DEFAULT_TENSOR_FORMATS
+        if not isinstance(formats, TensorFormats):
+            raise TypeError("formats must be a TensorFormats instance")
+        return formats
+
+    def _resolve_attention_formats(self, formats, v_format, scratch_format, identity_format,
+                                   q_pre_scaled=False):
+        formats = self._resolve_tensor_formats(formats)
+        v_format = formats.a if v_format is None else as_storage_format(v_format)
+        scratch_format = StorageFormat.FP16 if scratch_format is None else as_storage_format(scratch_format)
+        identity_format = formats.a if identity_format is None else as_storage_format(identity_format)
+        scaled_q_format = (formats.a if q_pre_scaled or scratch_format == StorageFormat.BF16
+                           else StorageFormat.FP16)
+        return formats, v_format, scratch_format, identity_format, scaled_q_format
+
+    def _validate_storage_tensor(self, buffer, *, storage_format=None) -> None:
+        """Validate typed tensor storage without converting or reinterpreting data."""
+        if not isinstance(buffer, torch.Tensor):
+            raise TypeError("Expected a BF16 or FP16 torch tensor")
+        actual = as_storage_format(buffer.dtype)
+        if storage_format is not None and actual != as_storage_format(storage_format):
+            raise TypeError(f"Expected {as_storage_format(storage_format).dtype}, got {buffer.dtype}")
+
+    def configure_tensor_formats(self, formats: TensorFormats) -> None:
+        """Set formats in the full manual CSR map; queued ops carry their own flags."""
+        formats = self._resolve_tensor_formats(formats)
+        self.user_write_reg32(UE_TENSOR_FORMATS_ADDR, formats.bits)
+
+    def float_to_storage(self, value: float, storage_format=None) -> int:
+        """Encode a 16-bit scalar; raw 21-bit scalars remain BF19."""
+        storage = StorageFormat.BF16 if storage_format is None else as_storage_format(storage_format)
+        return storage.encode_scalar(value)
+
+    def _storage_constant(self, bf16_bits: int, value: float, storage_format=None) -> int:
+        # Preserve hand-encoded BF16 constants and their historical truncation.
+        storage = StorageFormat.BF16 if storage_format is None else as_storage_format(storage_format)
+        return bf16_bits if storage == StorageFormat.BF16 else storage.encode_scalar(value)
+
+    def _matmul_activation(self, gelu, silu, sigmoid, clamp, log, lower, upper,
+                           *, formats: Optional[TensorFormats] = None):
+        """One storage-format boundary for all static/dynamic DOT epilogues."""
+        formats = self._resolve_tensor_formats(formats)
+        if gelu:
+            return LALU_MODE.ACT, 0, self._storage_constant(LALU_ACT_GELU_B, -1.702, storage_format=formats.params)
+        if silu:
+            return LALU_MODE.ACT, 0, self._storage_constant(LALU_ACT_SILU_B, -1.0, storage_format=formats.params)
+        if sigmoid:
+            return (LALU_MODE.ACT_NO_X, self.float_to_storage(1.0, storage_format=formats.params),
+                    self._storage_constant(LALU_ACT_SIGMOID_B, -1.0, storage_format=formats.params))
+        if clamp:
+            return LALU_MODE.CLAMP, self.float_to_storage(lower, storage_format=formats.params), self.float_to_storage(upper, storage_format=formats.params)
+        if log:
+            floor = (self.float_to_storage(lower, storage_format=formats.params) if lower > 0
+                     else self._storage_constant(LALU_LOG_A, 0.001, storage_format=formats.params))
+            return LALU_MODE.LOG, floor, self.float_to_storage(float("inf"), storage_format=formats.params)
+        return LALU_MODE.BYPASS, 0, 0
+
     def define_dram_address(self, key: str, address: int):
         """Define or override a named DRAM address."""
         self._dram_addresses[key] = address
@@ -1396,8 +1494,10 @@ class UnifiedEngine:
         with open(bin_path, "rb") as f:
             data = f.read()
         size_bytes = len(data)
+        if size_bytes % INSTRUCTION_SIZE_BYTES:
+            raise ValueError("Instruction file length must be a multiple of 32 bytes")
         start_addr = self.allocate_program_dram(size_bytes)
-        written = self.dma_write(DMA_DEVICE_H2C, start_addr, data, size_bytes)
+        written = self.dma_write(self.h2c_device, start_addr, data, size_bytes)
         if written != size_bytes:
             raise RuntimeError(
                 f"load_program_instructions_from_file({bin_path!r}): DMA wrote {written} of "
@@ -1552,7 +1652,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0x4d680477, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x4d680477. Please update FPGA with update_4d680477.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
+        assert hw_version == 0xfa9a499e, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xfa9a499e. Please update FPGA with update_fa9a499e.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
         if getattr(self, "conv_geometry_mode", CONV_GEOMETRY_LIVE_CSR) == CONV_GEOMETRY_QUEUE_CONFIG:
             # Convolution images have independent build stamps from the legacy
             # release. Explicit queue-CONFIG selection opts into that contract;
@@ -1948,6 +2048,7 @@ class UnifiedEngine:
         general_reg_src: Optional[int] = None,
         fmax_context_addr: int = 0,
         pbi_stride_en: bool = False,
+        *, formats: Optional[TensorFormats] = None,
     ) -> None:
         """
         Shared 256b instruction descriptor compiler (queue replay / capture).
@@ -1974,6 +2075,7 @@ class UnifiedEngine:
         ``general_reg_src`` is valid only for a ``PBI_MODE_REG`` pointer-field update.
         """
 
+        formats = self._resolve_tensor_formats(formats)
         uram_start = int((mode != UE_MODE.DOT_PRODUCT) and
                         (mode != UE_MODE.URAM_DRAM_WRITEBACK) and
                         (mode != UE_MODE.DEQUANTIZE) and
@@ -2079,6 +2181,10 @@ class UnifiedEngine:
             # legacy [246:0] layout. It is consumed as a stride chunk MSB;
             # compute operations continue to use output_size[15:0].
             w[7] |= ((output_size >> 16) & 0x1) << 23
+            # One format bit per storage boundary; DMA and PBI pointer updates
+            # copy bytes/addresses and never reinterpret tensor contents.
+            if not is_memcpy_mode:
+                w[7] |= formats.bits << 24
 
             self.capture_buffer.append(inst)
             self.capture_count += 1
@@ -2163,13 +2269,22 @@ class UnifiedEngine:
                          pbi_stride_en: bool = False,
                          ):
         """
-        Memory copy from URAM to DRAM. Emits the UE descriptor via :meth:`ue_op_descriptor` only.
+        Copy URAM or quantizer output scales to DRAM via :meth:`ue_op_descriptor`.
+
+        ``SCALE_BRAM`` reads QBRAM from entry zero. Its hardware length comes
+        from the descriptor's count of 16-bit scales, rounded to whole AXI beats.
+        This helper requires a whole-beat length and aligned destination so
+        the transfer cannot exceed the caller's requested allocation. Pad the
+        destination allocation/read length when fewer scales are needed.
+        QBRAM holds 1,024 scales and wraps on longer quantization operations.
+        To retain every scale, tile at no more than 65,536 input elements and
+        read the scales before launching the next tile.
 
         Supports stride mode: When stride parameters are provided, the DMA will write
         data in strides to non-contiguous DRAM locations.
 
         Args:
-            memcpy_type: Type of memory (MEMCPY_TYPE.URAM, BRAM, etc.)
+            memcpy_type: MEMCPY_TYPE.URAM or MEMCPY_TYPE.SCALE_BRAM for QBRAM
             uram_type: URAM section (URAM_SECTION.URAM_A or URAM_B)
             uram_src_addr: Source address in URAM
             dram_dst_addr: Destination address in DRAM
@@ -2194,6 +2309,20 @@ class UnifiedEngine:
             ue.wait_queue()
             ue.clear_stride_mode()
         """
+        scale_count = 0
+        if int(memcpy_type) == int(MEMCPY_TYPE.SCALE_BRAM):
+            if uram_src_addr != 0 or uram_type != 0:
+                raise ValueError("QBRAM readback starts at source zero")
+            if (stride_bytes_per_chunk or stride_jump_bytes or pbi_stride_en
+                    or inst_pointer_idx is not None):
+                raise ValueError("QBRAM readback requires a literal contiguous transfer")
+            beat_bytes = ue_axi_beat_bytes()
+            if (memcpy_length_bytes <= 0 or memcpy_length_bytes % beat_bytes
+                    or dram_dst_addr % beat_bytes):
+                raise ValueError("QBRAM readback length and destination must be AXI-beat aligned")
+            scale_count = memcpy_length_bytes // 2
+            if scale_count > QBRAM_ELEMENTS:
+                raise ValueError(f"QBRAM readback exceeds {QBRAM_ELEMENTS} scale elements")
         if stride_bytes_per_chunk != 0 and inst_pointer_idx is None:
             ue_assert_stride_dma(
                 dram_dst_addr, stride_bytes_per_chunk, stride_jump_bytes,
@@ -2224,7 +2353,7 @@ class UnifiedEngine:
             data_type=0,
             uram_a_start_addr=uram_src_addr,
             uram_b_start_addr=uram_src_addr,
-            uram_length=0,
+            uram_length=scale_count,
             dma_start_addr=encoded_dram_addr,
             dma_length=memcpy_length_bytes,
             output_size=0,
@@ -2319,7 +2448,9 @@ class UnifiedEngine:
                 print(f"Please consider using DeviceTensor for DMA cache optimization")
 
             # Validate input
-            assert matrix_data.dtype == torch.bfloat16, "Input matrix must be in bf16 format"
+            if not skip_dma and not isinstance(matrix, DeviceTensor):
+                self._validate_storage_tensor(matrix_data)
+            copied_dtype = matrix.dtype if isinstance(matrix, DeviceTensor) else matrix_data.dtype
 
             # Write input matrix to DRAM (skip if DeviceTensor already synced)
             if skip_dma:
@@ -2328,7 +2459,7 @@ class UnifiedEngine:
                 if isinstance(matrix, DeviceTensor):
                     matrix.sync(input_dram_addr) # sync the data to the FPGA DRAM
                 else:
-                    self.dma_write(DMA_DEVICE_H2C, input_dram_addr, matrix_data.flatten(), total_size)
+                    self.dma_write(self.h2c_device, input_dram_addr, matrix_data.flatten(), total_size)
 
             # Start executing from DRAM and wait for completion
             self.start_execute_from_dram(program_dram_addr)
@@ -2339,9 +2470,9 @@ class UnifiedEngine:
             print(f"flops: {_gflops:.3f} GFLOPS")
 
             if isinstance(matrix, DeviceTensor):
-                return DeviceTensor((memcpy_length_bytes // stride_bytes_per_chunk, stride_bytes_per_chunk // bytes_per_element), ue=self, dram_addr=output_dram_addr)
+                return DeviceTensor((memcpy_length_bytes // stride_bytes_per_chunk, stride_bytes_per_chunk // bytes_per_element), ue=self, dram_addr=output_dram_addr, dtype=copied_dtype)
             else:
-                return DeviceTensor((memcpy_length_bytes // stride_bytes_per_chunk, stride_bytes_per_chunk // bytes_per_element), ue=self, dram_addr=output_dram_addr).data
+                return DeviceTensor((memcpy_length_bytes // stride_bytes_per_chunk, stride_bytes_per_chunk // bytes_per_element), ue=self, dram_addr=output_dram_addr, dtype=copied_dtype).data
 
         return handler
 
@@ -2357,6 +2488,7 @@ class UnifiedEngine:
                    wb_padding_select: int = WB_PADDING_ZERO,
                    fmax_context_addr: int = 0,
                    inst_pointer_idx: Optional[int] = None,
+                   *, formats: Optional[TensorFormats] = None,
                    ) -> Optional[torch.Tensor]:
         """
         Emit a non-memcpy UE operation as a 256-bit descriptor via :meth:`ue_op_descriptor`.
@@ -2367,6 +2499,7 @@ class UnifiedEngine:
         Returns:
             None (legacy API; no tensor result)
         """
+        formats = self._resolve_tensor_formats(formats)
         if mode == UE_MODE.URAM_DRAM_WRITEBACK or mode == UE_MODE.MEMCPY_FROM_DRAM:
             raise ValueError(
                 "ue_arithmetic_op does not handle memcpy modes; use ue_memcpy_from_dram() or ue_memcpy_to_dram()"
@@ -2401,18 +2534,19 @@ class UnifiedEngine:
             stride_jump_bytes=stride_jump_bytes,
             wb_padding_select=wb_padding_select,
             fmax_context_addr=fmax_context_addr,
+            formats=formats,
         )
         return None
 
     def dma_to_accelerator_memory(self, dma_address: int, data: torch.Tensor) -> None:
         """DMA data from host memory to accelerator memory"""
-        assert data.dtype == torch.bfloat16, "Data must be in bf16 format"
-        self.dma_write(DMA_DEVICE_H2C, dma_address, data, data.numel() * 2) # 2 bytes per element
+        self._validate_storage_tensor(data)
+        self.dma_write(self.h2c_device, dma_address, data, data.numel() * 2) # 2 bytes per element
 
-    def dma_from_accelerator_memory(self, dma_address: int, shape: torch.Size) -> torch.Tensor:
+    def dma_from_accelerator_memory(self, dma_address: int, shape: torch.Size, *, dtype=None) -> torch.Tensor:
         """DMA data from accelerator memory to host memory"""
-        data = torch.zeros(shape, dtype=torch.bfloat16).flatten()
-        self.dma_read(DMA_DEVICE_C2H, dma_address, data, data.numel() * 2) # 2 bytes per element
+        data = torch.zeros(shape, dtype=torch.bfloat16 if dtype is None else as_storage_format(dtype).dtype).flatten()
+        self.dma_read(self.c2h_device, dma_address, data, data.numel() * 2) # 2 bytes per element
         return data.reshape(shape)
 
     # Describe URAM A and URAM B as follows:
@@ -2631,6 +2765,7 @@ class UnifiedEngine:
         uram_section: int,
         row_size: int,
         inst_pointer_idx: Optional[int] = None,
+        *, formats: Optional[TensorFormats] = None,
     ) -> Optional[torch.Tensor]:
         """
         Start queue for element-wise op: ELTWISE_ADD, ELTWISE_MUL, or ELTWISE_SUB.
@@ -2639,6 +2774,7 @@ class UnifiedEngine:
         ``inst_pointer_idx`` is forwarded when provided (PBI / UE_OP_REG path); default ``None`` keeps
         prior behavior.
         """
+        formats = self._resolve_tensor_formats(formats)
         if mode not in (UE_MODE.ELTWISE_ADD, UE_MODE.ELTWISE_MUL, UE_MODE.ELTWISE_SUB):
             raise ValueError(f"Invalid eltwise mode: {mode}. Use ELTWISE_ADD, ELTWISE_MUL, or ELTWISE_SUB.")
         self.ue_arithmetic_op(
@@ -2662,11 +2798,14 @@ class UnifiedEngine:
             0,  # dma_length
             0,  # output_size
             inst_pointer_idx=inst_pointer_idx,
+            formats=formats,
         )
 
     def eltwise_add_core(self, vector_A_sram_start_addr: int, vector_B_sram_start_addr: int, vector_C_sram_wb_addr: int,
-                                element_size: int) -> Optional[torch.Tensor]:
+                                element_size: int,
+                                *, formats: Optional[TensorFormats] = None) -> Optional[torch.Tensor]:
         """Start queue for element-wise add. Wraps ue_arithmetic_op with UE_MODE.ELTWISE_ADD."""
+        formats = self._resolve_tensor_formats(formats)
         row_size = (element_size + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
         vector_A_uram_type, vector_A_uram_start_addr = self.sram_address_to_uram_address(vector_A_sram_start_addr)
         vector_B_uram_type, vector_B_uram_start_addr = self.sram_address_to_uram_address(vector_B_sram_start_addr)
@@ -2675,18 +2814,22 @@ class UnifiedEngine:
             uram_a_start_addr = vector_A_uram_start_addr
             uram_b_start_addr = vector_B_uram_start_addr
         else:
+            formats = formats.with_formats(a=formats.b, b=formats.a)
             uram_a_start_addr = vector_B_uram_start_addr
             uram_b_start_addr = vector_A_uram_start_addr
         uram_wb_type, uram_wb_addr = self.sram_address_to_uram_address(vector_C_sram_wb_addr)
         self.start_queue_eltwise(
             UE_MODE.ELTWISE_ADD,
             uram_a_start_addr, uram_b_start_addr,
-            uram_wb_addr, uram_wb_type.value, row_size
+            uram_wb_addr, uram_wb_type.value, row_size,
+            formats=formats,
         )
 
     def eltwise_mul_core(self, vector_A_sram_start_addr: int, vector_B_sram_start_addr: int, vector_C_sram_wb_addr: int,
-                                element_size: int) -> Optional[torch.Tensor]:
+                                element_size: int,
+                                *, formats: Optional[TensorFormats] = None) -> Optional[torch.Tensor]:
         """Start queue for element-wise multiply. Wraps ue_arithmetic_op with UE_MODE.ELTWISE_MUL."""
+        formats = self._resolve_tensor_formats(formats)
         row_size = (element_size + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
         vector_A_uram_type, vector_A_uram_start_addr = self.sram_address_to_uram_address(vector_A_sram_start_addr)
         vector_B_uram_type, vector_B_uram_start_addr = self.sram_address_to_uram_address(vector_B_sram_start_addr)
@@ -2695,21 +2838,25 @@ class UnifiedEngine:
             uram_a_start_addr = vector_A_uram_start_addr
             uram_b_start_addr = vector_B_uram_start_addr
         else:
+            formats = formats.with_formats(a=formats.b, b=formats.a)
             uram_a_start_addr = vector_B_uram_start_addr
             uram_b_start_addr = vector_A_uram_start_addr
         uram_wb_type, uram_wb_addr = self.sram_address_to_uram_address(vector_C_sram_wb_addr)
         self.start_queue_eltwise(
             UE_MODE.ELTWISE_MUL,
             uram_a_start_addr, uram_b_start_addr,
-            uram_wb_addr, uram_wb_type.value, row_size
+            uram_wb_addr, uram_wb_type.value, row_size,
+            formats=formats,
         )
 
     def eltwise_sub_core(self, vector_A_sram_start_addr: int, vector_B_sram_start_addr: int, vector_C_sram_wb_addr: int,
-                                element_size: int) -> Optional[torch.Tensor]:
+                                element_size: int,
+                                *, formats: Optional[TensorFormats] = None) -> Optional[torch.Tensor]:
         """Start queue for element-wise subtract (A - B). Wraps ue_arithmetic_op with UE_MODE.ELTWISE_SUB.
 
         A must live in URAM_A and B in URAM_B (order matters: SUB is non-commutative).
         """
+        formats = self._resolve_tensor_formats(formats)
         row_size = (element_size + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
         vector_A_uram_type, vector_A_uram_start_addr = self.sram_address_to_uram_address(vector_A_sram_start_addr)
         vector_B_uram_type, vector_B_uram_start_addr = self.sram_address_to_uram_address(vector_B_sram_start_addr)
@@ -2721,7 +2868,8 @@ class UnifiedEngine:
         self.start_queue_eltwise(
             UE_MODE.ELTWISE_SUB,
             vector_A_uram_start_addr, vector_B_uram_start_addr,
-            uram_wb_addr, uram_wb_type.value, row_size
+            uram_wb_addr, uram_wb_type.value, row_size,
+            formats=formats,
         )
 
     def _validate_addr_gprs(self, fn: str, gpr_M_reg: Optional[int], addr_gprs: dict) -> None:
@@ -2783,6 +2931,7 @@ class UnifiedEngine:
         gpr_out_addr: Optional[int] = None,
         gpr_N_reg: Optional[int] = None,
         gpr_scalar_reg: Optional[int] = None,
+        *, formats: Optional[TensorFormats] = None,
     ) -> int:
         """Dispatches to the dynamic core when any runtime register is supplied.
 
@@ -2800,8 +2949,9 @@ class UnifiedEngine:
         placement. They require ``gpr_M_reg`` to be set. ``gpr_scalar_reg`` (MUL_BROADCAST only)
         writes shared PBI field 11, interpreted as ``lalu_scalar`` by arithmetic UE_PBI.
 
-        Returns ``M * N`` (one flop per output BF16 element).
+        Returns ``M * N`` (one flop per output element).
         """
+        formats = self._resolve_tensor_formats(formats)
         if any(r is not None for r in (gpr_M_reg, gpr_N_reg, gpr_a_addr, gpr_b_addr,
                                        gpr_out_addr, gpr_scalar_reg)):
             seeded_regs = []
@@ -2820,6 +2970,7 @@ class UnifiedEngine:
                 gpr_b_addr=gpr_b_addr,
                 gpr_out_addr=gpr_out_addr,
                 gpr_scalar_reg=gpr_scalar_reg,
+                formats=formats,
             )
             for _ in seeded_regs:
                 self.release_isa_reg()
@@ -2828,6 +2979,7 @@ class UnifiedEngine:
             M=M, N=N,
             dram_a=dram_a, dram_b=dram_b, dram_out=dram_out,
             mode=mode, scalar=scalar,
+            formats=formats,
         )
 
 
@@ -2840,9 +2992,10 @@ class UnifiedEngine:
         dram_out: int,
         mode: UE_MODE,
         scalar: float = None,
+        *, formats: Optional[TensorFormats] = None,
     ) -> int:
         """
-        Legacy BF16 element-wise op on ``[M, N]`` tensors in DRAM with compile-time vertical tiling.
+        Element-wise op on ``[M, N]`` tensors in DRAM with compile-time vertical tiling.
 
         Vector modes (ELTWISE_ADD/MUL/SUB): ``dram_b`` required. Tiles are Python-unrolled
         (no ISA loop, no jumps).
@@ -2851,6 +3004,7 @@ class UnifiedEngine:
 
         **Staging (fixed):** A at ``0x00000`` (URAM_A), B at ``0x80000`` (URAM_B) for vector modes.
         """
+        formats = self._resolve_tensor_formats(formats)
         _VECTOR_MODES = (UE_MODE.ELTWISE_ADD, UE_MODE.ELTWISE_MUL, UE_MODE.ELTWISE_SUB)
         _BROADCAST_MODES = (UE_MODE.MUL_BROADCAST, UE_MODE.ADD_BROADCAST)
         fn = "eltwise_core_dram_legacy"
@@ -2876,15 +3030,17 @@ class UnifiedEngine:
 
         def _emit_tile(elements: int) -> None:
             if mode == UE_MODE.ELTWISE_ADD:
-                self.eltwise_add_core(0x00000, 0x80000, 0x00000, elements)
+                self.eltwise_add_core(0x00000, 0x80000, 0x00000, elements, formats=formats)
             elif mode == UE_MODE.ELTWISE_MUL:
-                self.eltwise_mul_core(0x00000, 0x80000, 0x00000, elements)
+                self.eltwise_mul_core(0x00000, 0x80000, 0x00000, elements, formats=formats)
             elif mode == UE_MODE.ELTWISE_SUB:
-                self.eltwise_sub_core(0x00000, 0x80000, 0x00000, elements)
+                self.eltwise_sub_core(0x00000, 0x80000, 0x00000, elements, formats=formats)
             elif mode == UE_MODE.MUL_BROADCAST:
-                self.broadcast_mul(scalar=scalar, sram_start_addr=0x00000, sram_wb_addr=0x00000, element_size=elements)
+                self.broadcast_mul(scalar=scalar, sram_start_addr=0x00000,
+                                   sram_wb_addr=0x00000, element_size=elements,
+                                   formats=formats)
             else:  # ADD_BROADCAST
-                self.broadcast_add(scalar=scalar, sram_start_addr=0x00000, sram_wb_addr=0x00000, element_size=elements)
+                self.broadcast_add(scalar=scalar, sram_start_addr=0x00000, sram_wb_addr=0x00000, element_size=elements, formats=formats)
 
         m_chunk = URAM_NEAR_FULL_ELEMENTS // N
         if m_chunk < 1:
@@ -3188,8 +3344,9 @@ class UnifiedEngine:
         gpr_b_addr: Optional[int] = None,
         gpr_out_addr: Optional[int] = None,
         gpr_scalar_reg: Optional[int] = None,
+        *, formats: Optional[TensorFormats] = None,
     ) -> int:
-        """BF16 element-wise op on ``[M, N]`` with **both M and N runtime**, chunk-tiled for speed.
+        """Element-wise op on ``[M, N]`` with **both M and N runtime**, chunk-tiled for speed.
 
         Because the tensors are contiguous row-major and element-wise ops have no row structure,
         the ``[M, N]`` problem is executed as a flat ``M*N``-element stream: ``total = M*N`` full
@@ -3217,6 +3374,7 @@ class UnifiedEngine:
         inside the loop body (the compute pointer is only dispatched in the loop for the
         runtime-scalar broadcast variant).
         """
+        formats = self._resolve_tensor_formats(formats)
         fn = "eltwise_core_dram_dynamic"
         _VECTOR_MODES = (UE_MODE.ELTWISE_ADD, UE_MODE.ELTWISE_MUL, UE_MODE.ELTWISE_SUB)
         _BROADCAST_MODES = (UE_MODE.MUL_BROADCAST, UE_MODE.ADD_BROADCAST)
@@ -3321,7 +3479,7 @@ class UnifiedEngine:
         # tail compute (runtime row size) and by vector full chunks; broadcast full chunks avoid it.
         self.generate_instruction_pbi_init(
             inst_pointer_idx=ptr_comp,
-            lalu_scalar=(self.float_to_bf16(scalar) if is_broadcast else 0),
+            lalu_scalar=(self.float_to_storage(scalar, storage_format=formats.scalar) if is_broadcast else 0),
         )
         _set(ptr_comp, PBI_FIELD.URAM_START_ADDR_Y, 0)   # reg 0 = hardwired zero (A row 0)
         if zb_reg is not None:
@@ -3341,28 +3499,30 @@ class UnifiedEngine:
             if not is_broadcast:
                 if pbi_tail:
                     self.start_queue_eltwise(mode, a_uram_row, b_uram_row, a_uram_row,
-                                             URAM_SECTION.URAM_A.value, rows, inst_pointer_idx=ptr_comp)
+                                             URAM_SECTION.URAM_A.value, rows, inst_pointer_idx=ptr_comp, formats=formats)
                 else:
                     self.start_queue_eltwise(mode, a_uram_row, b_uram_row, a_uram_row,
-                                             URAM_SECTION.URAM_A.value, rows)
+                                             URAM_SECTION.URAM_A.value, rows, formats=formats)
             elif mode == UE_MODE.MUL_BROADCAST:
                 if gpr_scalar_reg is not None:
                     # ptr_comp supplies row size, Y/WB addresses, stride and runtime scalar. The
                     # descriptor contributes zero increments so the pointer remains set-once.
                     self.broadcast_mul(scalar=0.0, sram_start_addr=SRAM_A, sram_wb_addr=SRAM_A,
-                                       element_size=0, inst_pointer_idx=ptr_comp)
+                                       element_size=0, inst_pointer_idx=ptr_comp,
+                                       formats=formats)
                 elif pbi_tail:
                     # Baked scale, runtime tail size: UE_PBI via ptr_comp (stride_z=1 via field-10).
                     self.broadcast_mul(scalar=0.0, sram_start_addr=SRAM_A, sram_wb_addr=SRAM_A,
-                                       element_size=0, inst_pointer_idx=ptr_comp)
+                                       element_size=0, inst_pointer_idx=ptr_comp,
+                                       formats=formats)
                 else:
                     # Full chunk, baked scale: plain baked broadcast (fast path).
                     self.broadcast_mul(scalar=scalar, sram_start_addr=SRAM_A, sram_wb_addr=SRAM_A,
-                                       element_size=elems)
+                                       element_size=elems, formats=formats)
             else:  # ADD_BROADCAST
                 self.broadcast_add(scalar=scalar, sram_start_addr=SRAM_A, sram_wb_addr=SRAM_A,
                                    element_size=elems,
-                                   inst_pointer_idx=ptr_comp if pbi_tail else None)
+                                   inst_pointer_idx=ptr_comp if pbi_tail else None, formats=formats)
 
         program_dram_start_addr = self.get_program_dram_addr()
 
@@ -3413,16 +3573,18 @@ class UnifiedEngine:
     def start_queue_broadcast(self, mode: UE_MODE, broadcast_mode: BROADCAST_MODE,
                               uram_src_start_addr: int, uram_wb_start_addr: int,
                               element_size: int, scalar: float = None,
-                              inst_pointer_idx: Optional[int] = None) -> Optional[torch.Tensor]:
+                              inst_pointer_idx: Optional[int] = None,
+                              *, formats: Optional[TensorFormats] = None) -> Optional[torch.Tensor]:
         """
         Start queue for broadcast op: MUL_BROADCAST or ADD_BROADCAST.
-        scalar: encoded scalar (e.g. bf16 from float_to_bf16 for MUL/ADD broadcast).
+        scalar: 16-bit scalar encoded in ``formats.scalar`` (use ``float_to_storage``).
         Wraps ue_arithmetic_op with BROADCAST_MODE.SCALAR_IN_REG.
 
         ``inst_pointer_idx`` emits a normal UE_PBI operation. The pointer row supplies the complete
         compute state, including field 11 interpreted as ``lalu_scalar``; descriptor values are PBI
         increments, so callers normally pass zero-valued fields for a set-once compute pointer.
         """
+        formats = self._resolve_tensor_formats(formats)
         if mode not in (UE_MODE.MUL_BROADCAST, UE_MODE.ADD_BROADCAST):
             raise ValueError(f"Invalid broadcast mode: {mode}. Use MUL_BROADCAST or ADD_BROADCAST.")
 
@@ -3443,13 +3605,13 @@ class UnifiedEngine:
             0,  # lalu_a
             0,  # lalu_b
             LALU_MODE.BYPASS.value,  # lalu_mode
-            self.float_to_bf16(scalar) if scalar is not None else self.float_to_bf19(1.0),
+            self.float_to_storage(scalar, storage_format=formats.scalar) if scalar is not None else self.float_to_bf19(1.0),
             uram_wb_type.value,
             0,  # uram_dst_addr
             uram_wb_addr,
             URAM_WRITE_SRC.URAM_WRITE_BACK.value,  # uram_write_src
             mode,
-            0,  # data_type
+            0,  # data_type (unused by vector broadcasts)
             uram_src_start_addr,
             0,  # uram_b_start_addr (not used for broadcast)
             row_size,
@@ -3457,32 +3619,41 @@ class UnifiedEngine:
             0,  # dma_length
             0,  # output_size
             inst_pointer_idx=inst_pointer_idx,
+            formats=formats,
         )
 
     def broadcast_mul(self, scalar: float,
                             sram_start_addr: int, sram_wb_addr: int,
-                            element_size: int, inst_pointer_idx: Optional[int] = None) -> Optional[torch.Tensor]:
+                            element_size: int, inst_pointer_idx: Optional[int] = None,
+                            *, formats: Optional[TensorFormats] = None) -> Optional[torch.Tensor]:
         """Start queue for broadcast multiply. Wraps ue_arithmetic_op with UE_MODE.MUL_BROADCAST.
-        ``inst_pointer_idx`` emits UE_PBI; pointer field 11 is interpreted as ``lalu_scalar``."""
+        ``inst_pointer_idx`` emits UE_PBI; pointer field 11 is interpreted as ``lalu_scalar``.
+        The BF19 product is converted to the selected output storage format."""
+        formats = self._resolve_tensor_formats(formats)
         self.start_queue_broadcast(
             UE_MODE.MUL_BROADCAST, BROADCAST_MODE.SCALAR_IN_REG,
             sram_start_addr, sram_wb_addr, element_size, scalar, inst_pointer_idx=inst_pointer_idx,
+            formats=formats,
         )
 
     def broadcast_add(self, scalar: float,
                             sram_start_addr: int, sram_wb_addr: int,
-                            element_size: int, inst_pointer_idx: Optional[int] = None) -> Optional[torch.Tensor]:
+                            element_size: int, inst_pointer_idx: Optional[int] = None,
+                            *, formats: Optional[TensorFormats] = None) -> Optional[torch.Tensor]:
         """Start queue for broadcast add. Wraps ue_arithmetic_op with UE_MODE.ADD_BROADCAST.
         ``inst_pointer_idx``: emit UE_PBI via that pointer (runtime URAM dims; scalar stays the
         baked descriptor immediate)."""
+        formats = self._resolve_tensor_formats(formats)
         self.start_queue_broadcast(
             UE_MODE.ADD_BROADCAST, BROADCAST_MODE.SCALAR_IN_REG,
-            sram_start_addr, sram_wb_addr, element_size, scalar, inst_pointer_idx=inst_pointer_idx
+            sram_start_addr, sram_wb_addr, element_size, scalar, inst_pointer_idx=inst_pointer_idx,
+            formats=formats,
         )
 
     def exp_core(self, vector_sram_start_addr: int, output_sram_wb_addr: int,
-                 element_size: int) -> None:
-        """Apply ``exp`` independently to every BF16 lane in an URAM_A tensor.
+                 element_size: int,
+                 *, formats: Optional[TensorFormats] = None) -> None:
+        """Apply ``exp`` independently to every lane in an URAM_A tensor.
 
         ``EXP`` is often driven through :meth:`start_queue_for_bf16_softmax_operation`,
         where its scalar leg also reduces the row and feeds reciprocal into the
@@ -3490,6 +3661,7 @@ class UnifiedEngine:
         64-lane ``alu_out`` value, though, so element-wise users only need EXP
         with a zero addend and LALU bypass.
         """
+        formats = self._resolve_tensor_formats(formats)
         vector_uram_type, vector_uram_start_addr = \
             self.sram_address_to_uram_address(vector_sram_start_addr)
         assert vector_uram_type == URAM_SECTION.URAM_A, \
@@ -3504,7 +3676,7 @@ class UnifiedEngine:
             0,  # lalu_a
             0,  # lalu_b
             LALU_MODE.BYPASS.value,
-            self.float_to_bf16(0.0),  # exp(x + 0)
+            self.float_to_storage(0.0, storage_format=formats.scalar),  # exp(x + 0)
             output_uram_type.value,
             0,  # uram_dst_addr
             output_uram_start_addr,
@@ -3517,12 +3689,14 @@ class UnifiedEngine:
             0,  # dma_start_addr
             0,  # dma_length
             0,  # output_size
+            formats=formats,
         )
 
     def start_queue_for_dot_product_operation(self, max_clear_en: int, fmax_context_addr: int, vector_sram_start_addr: int, output_sram_wb_addr: int,
                                             K: int, N: int, dma_start_addr: int,
                                             data_type: TYPE = TYPE.IF4, bias_enable: bool = False, lalu_mode: LALU_MODE = LALU_MODE.BYPASS,
-                                            lalu_a: int = 0, lalu_b: int = 0) -> None:
+                                            lalu_a: int = 0, lalu_b: int = 0,
+                                            *, formats: Optional[TensorFormats] = None) -> None:
         """Start queue for dot product operation. Matrix data streams from DRAM via DMA.
         Args:
             max_clear_en: clear max accumulator (1 on first chunk, 0 on subsequent)
@@ -3535,6 +3709,7 @@ class UnifiedEngine:
             lalu_mode: LALU mode value (e.g. LALU_MODE.ACT)
             lalu_scalar: scalar for LALU operation
         """
+        formats = self._resolve_tensor_formats(formats)
         vector_uram_type, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_start_addr)
         assert vector_uram_type == URAM_SECTION.URAM_A, f"vector_sram_start_addr must be in URAM_A hex(vector_uram_start_addr)={hex(vector_uram_start_addr)}"
         output_uram_type, output_uram_start_addr = self.sram_address_to_uram_address(output_sram_wb_addr)
@@ -3569,7 +3744,8 @@ class UnifiedEngine:
             dma_length,  # dma_length
             N,  # output_size
             bias_adder_en=bias_enable,
-            fmax_context_addr=fmax_context_addr
+            fmax_context_addr=fmax_context_addr,
+            formats=formats,
         )
 
 
@@ -3590,8 +3766,9 @@ class UnifiedEngine:
         lalu_b: int = 0,
         lalu_scalar: int = 0,
         inst_pointer_idx: Optional[int] = None,
+        *, formats: Optional[TensorFormats] = None,
     ) -> None:
-        """Start queue for bf16 matvec operation. Wraps ue_arithmetic_op with UE_MODE.BF16_DOT_PRODUCT.
+        """Start a matvec operation with independently selected input and output formats.
         Args:
             max_clear_en: max_clear_en
             fmax_context_addr: fmax_context_addr
@@ -3602,6 +3779,7 @@ class UnifiedEngine:
             N: N
             inst_pointer_idx: when nonzero, emit PBI-style UE op (pointer-backed registers are incremented by the immediate value specified in the instruction).
         """
+        formats = self._resolve_tensor_formats(formats)
         vector_uram_type, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_start_addr)
         matrix_uram_type, matrix_uram_start_addr = self.sram_address_to_uram_address(matrix_sram_start_addr)
         assert vector_uram_type ==  URAM_SECTION.URAM_A, f"vector_sram_start_addr must be in URAM_A hex(vector_uram_start_addr)={hex(vector_uram_start_addr)}"
@@ -3627,7 +3805,7 @@ class UnifiedEngine:
             output_uram_start_addr,
             URAM_WRITE_SRC.URAM_WRITE_BACK.value,  # uram_write_src
             UE_MODE.BF16_DOT_PRODUCT,
-            0,  # data_type
+            0,
             vector_uram_start_addr,
             matrix_uram_start_addr,  # uram_b_start_addr (not used for compute)
             K // UE_VECTOR_SIZE,
@@ -3637,10 +3815,12 @@ class UnifiedEngine:
             bias_adder_en=bias_enable,
             fmax_context_addr=fmax_context_addr,
             inst_pointer_idx=inst_pointer_idx,
+            formats=formats,
         )
 
     # Compute engine operations --------------------------------------------------
-    def start_queue_for_bf16_softmax_operation(self, fmax_context_addr: int, vector_sram_start_addr: int, output_sram_wb_addr: int, N: int) -> None:
+    def start_queue_for_bf16_softmax_operation(self, fmax_context_addr: int, vector_sram_start_addr: int, output_sram_wb_addr: int, N: int,
+                                               *, formats: Optional[TensorFormats] = None) -> None:
         """Start queue for compute engine. Wraps ue_arithmetic_op with UE_MODE.
         Args:
             fmax_context_addr: fmax_context_addr
@@ -3648,6 +3828,7 @@ class UnifiedEngine:
             output_sram_wb_addr: output_sram_wb_addr
             N: N
         """
+        formats = self._resolve_tensor_formats(formats)
         vector_uram_type, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_start_addr)
         assert vector_uram_type ==  URAM_SECTION.URAM_A, f"vector_sram_start_addr must be in URAM_A hex(vector_uram_start_addr)={hex(vector_sram_start_addr)}"
 
@@ -3656,7 +3837,7 @@ class UnifiedEngine:
 
         row_size = (N + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE # round up to the nearest multiple of UE_VECTOR_SIZE
 
-        #$ this writes back exp(x - max(x)) to URAM_A at the same time
+        # Store FP16 exponentials in-place while reducing their BF19 values.
         self.ue_arithmetic_op(
             BROADCAST_MODE.FMAX_NEGATE.value,  # broadcast_mode
             0,  # max_clear_en
@@ -3668,28 +3849,42 @@ class UnifiedEngine:
             vector_uram_type.value,
             0,  # uram_dst_addr
             vector_uram_start_addr,
-            URAM_WRITE_SRC.URAM_WRITE_BACK.value,  # uram_write_src
+            URAM_WRITE_SRC.URAM_WRITE_BACK.value,  # FP16 exponentials replace logits
             UE_MODE.EXP,
-            0,  # data_type
+            0,  # data_type (unused by ordinary EXP)
             vector_uram_start_addr,
             0,  # uram_b_start_addr (not used for this compute)
             row_size,
             0,  # dma_start_addr
             0,  # dma_length
             0,  # output_size
-            fmax_context_addr=fmax_context_addr
+            fmax_context_addr=fmax_context_addr,
+            formats=formats.with_formats(output=StorageFormat.FP16),
         )
 
-        self.start_queue_broadcast(UE_MODE.MUL_BROADCAST, BROADCAST_MODE.LALU_RESULT, # use 1/sum result from LALU
-                            vector_sram_start_addr, output_sram_wb_addr, N)
+        output_uram_type, output_uram_addr = self.sram_address_to_uram_address(output_sram_wb_addr)
+        self.ue_arithmetic_op(
+            broadcast_mode=BROADCAST_MODE.LALU_RESULT.value,
+            max_clear_en=0, stride_z=1, lalu_a=0, lalu_b=0,
+            lalu_mode=LALU_MODE.BYPASS.value, scalar=0,
+            uram_section=output_uram_type.value, uram_dst_addr=0,
+            uram_wb_addr=output_uram_addr,
+            uram_write_src=URAM_WRITE_SRC.URAM_WRITE_BACK.value,
+            mode=UE_MODE.MUL_BROADCAST, data_type=0,
+            uram_a_start_addr=vector_uram_start_addr, uram_b_start_addr=0,
+            uram_length=row_size, dma_start_addr=0, dma_length=0, output_size=0,
+            formats=formats.with_formats(a=StorageFormat.FP16),
+        )
 
-    def start_queue_for_bf16_rms_mean(self, vector_sram_start_addr: int, N: int) -> None:
+    def start_queue_for_bf16_rms_mean(self, vector_sram_start_addr: int, N: int,
+                                      *, formats: Optional[TensorFormats] = None) -> None:
         """
         Start queue for RMS mean operation. Wraps ue_arithmetic_op with UE_MODE.
         Args:
             vector_uram_start_addr: vector_uram_start_addr
             N: number of elements in the vector
         """
+        formats = self._resolve_tensor_formats(formats)
         row_size = (N + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
 
         vector_uram_type, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_start_addr)
@@ -3715,9 +3910,11 @@ class UnifiedEngine:
             0,  # dma_start_addr
             0,  # dma_length
             0,  # output_size
+            formats=formats,
         )
 
-    def start_queue_for_bf16_layer_norm_mean(self, vector_sram_start_addr: int, zeros_sram_start_addr: int, N: int) -> None:
+    def start_queue_for_bf16_layer_norm_mean(self, vector_sram_start_addr: int, zeros_sram_start_addr: int, N: int,
+                                             *, formats: Optional[TensorFormats] = None) -> None:
         """
         Start queue for layer norm mean operation. Wraps ue_arithmetic_op with UE_MODE.
         Args:
@@ -3725,6 +3922,7 @@ class UnifiedEngine:
             zeros_sram_start_addr: zeros_sram_start_addr
             N: number of elements in the vector
         """
+        formats = self._resolve_tensor_formats(formats)
         row_size = (N + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
 
         vector_uram_type, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_start_addr)
@@ -3752,10 +3950,12 @@ class UnifiedEngine:
             0,  # dma_start_addr
             0,  # dma_length
             0,  # output_size
+            formats=formats,
         )
 
     # SRAM only version of rms norm core
-    def rms_norm_core(self, vector_sram_start_addr: int, output_sram_wb_addr: int, N: int, gamma_sram_start_addr: int = None) -> None:
+    def rms_norm_core(self, vector_sram_start_addr: int, output_sram_wb_addr: int, N: int, gamma_sram_start_addr: int = None,
+                      *, formats: Optional[TensorFormats] = None) -> None:
         """ Core RMS norm: normalizes vector x -> x / rms(x).
         Args:
             vector_sram_start_addr: SRAM address of input vector (must be URAM_A: 0x00000-0x7FFFF)
@@ -3765,10 +3965,11 @@ class UnifiedEngine:
             N: number of elements
         """
 
-        self.start_queue_for_bf16_rms_mean(vector_sram_start_addr, N)
-        self.start_queue_broadcast(UE_MODE.MUL_BROADCAST, BROADCAST_MODE.LALU_RESULT, vector_sram_start_addr, output_sram_wb_addr, N) # use 1/rms(x) result from LALU
+        formats = self._resolve_tensor_formats(formats)
+        self.start_queue_for_bf16_rms_mean(vector_sram_start_addr, N, formats=formats)
+        self.start_queue_broadcast(UE_MODE.MUL_BROADCAST, BROADCAST_MODE.LALU_RESULT, vector_sram_start_addr, output_sram_wb_addr, N, formats=formats) # use 1/rms(x) result from LALU
         if gamma_sram_start_addr is not None:
-            self.eltwise_mul_core(output_sram_wb_addr, gamma_sram_start_addr, output_sram_wb_addr, N)
+            self.eltwise_mul_core(output_sram_wb_addr, gamma_sram_start_addr, output_sram_wb_addr, N, formats=formats.with_formats(a=formats.output))
 
 
     def rms_norm_core_dram_pbi(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int, gpr_M_reg: int,
@@ -3912,7 +4113,8 @@ class UnifiedEngine:
     def rms_norm_core_dram_dynamic(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int,
                                    gpr_M_reg: int, gpr_N_reg: int, gpr_sqrt_n_reg: int, gpr_rms_scale_reg: Optional[int] = None,
                                    gpr_a_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
-                                   gpr_gamma_addr: Optional[int] = None) -> int:
+                                   gpr_gamma_addr: Optional[int] = None,
+                                   *, formats: Optional[TensorFormats] = None) -> int:
         """RMS norm — runtime M (batch) and runtime ``sqrt(N)`` scalar, N baked at capture (chunk-tiled).
 
         Batches up to ``U = min(URAM_A capacity, 16)`` rows per DMA transfer and runs the per-row
@@ -3954,6 +4156,7 @@ class UnifiedEngine:
         variance — so it keeps the ``inv_n`` mask-vector path.) See ``rms_norm_core_dram_dynamic_test``
         in user_hw_test.py.
         """
+        formats = self._resolve_tensor_formats(formats)
         fn = "rms_norm_core_dram_dynamic"
         assert M >= 1 and N >= 1, f"{fn}: require M>=1 and N>=1"
         if N % UE_VECTOR_SIZE != 0:
@@ -4055,6 +4258,8 @@ class UnifiedEngine:
             else:
                 self.generate_instruction_mul32_reg(dma_len_reg, rows_take_reg, rowb_reg)
 
+        output_a_formats = formats.with_formats(a=formats.output)
+
         def _rms_row(sram, row_idx):
             # RMS-mean is UE_PBI so its complete pointer row supplies the runtime scalar and URAM
             # state. The descriptor's Y field is the post-op pointer increment; the final row wraps
@@ -4067,9 +4272,9 @@ class UnifiedEngine:
                 0, 0, 0, 0, 0, LALU_MODE.MODE_RSQRT.value, 0,
                 URAM_SECTION.URAM_A.value, 0, 0, URAM_WRITE_SRC.URAM_WB_DISABLE.value,
                 UE_MODE.RMS, 0, y_delta, 0, 0, 0, 0, 0,
-                inst_pointer_idx=rms_ptr)
-            self.start_queue_broadcast(UE_MODE.MUL_BROADCAST, BROADCAST_MODE.LALU_RESULT, sram, sram, N)
-            self.eltwise_mul_core(sram, gamma_sram_addr, sram, N)
+                inst_pointer_idx=rms_ptr, formats=formats)
+            self.start_queue_broadcast(UE_MODE.MUL_BROADCAST, BROADCAST_MODE.LALU_RESULT, sram, sram, N, formats=formats)
+            self.eltwise_mul_core(sram, gamma_sram_addr, sram, N, formats=output_a_formats)
 
         # ===== outer chunk loop (2 live PBI pointers: row_load_ptr, row_store_ptr) =====
         program_dram_start_addr = self.get_program_dram_addr()
@@ -4116,10 +4321,12 @@ class UnifiedEngine:
 
         return 3 * M * N + M * N  # RMS + gamma mul
 
-    def rms_norm_core_dram_legacy(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int) -> None:
+    def rms_norm_core_dram_legacy(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, GAMMA_DRAM_ADDR: int,
+                                  *, formats: Optional[TensorFormats] = None) -> None:
         """
         Legacy RMS-norm DRAM path that emits one software-unrolled row op sequence per row.
         """
+        formats = self._resolve_tensor_formats(formats)
         vector_sram_addr = 0x00000
         gamma_sram_addr = 0x80000
 
@@ -4136,7 +4343,7 @@ class UnifiedEngine:
                                             sram_address=vector_sram_addr,
                                             element_size=m_take * N)
             for j in range(m_take):
-                self.rms_norm_core(vector_sram_addr + j * N * 2, vector_sram_addr + j * N * 2, N, gamma_sram_addr)
+                self.rms_norm_core(vector_sram_addr + j * N * 2, vector_sram_addr + j * N * 2, N, gamma_sram_addr, formats=formats)
 
             self.sram_to_accelerator_memory(sram_address=vector_sram_addr,
                                             accelerator_dram_address=OUTPUT_DRAM_ADDR + i * N * 2,
@@ -4152,7 +4359,8 @@ class UnifiedEngine:
                            gpr_rms_scale_reg: Optional[int] = None,
                            gpr_a_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
                            gpr_gamma_addr: Optional[int] = None,
-                           gpr_sqrt_n_reg: Optional[int] = None) -> int:
+                           gpr_sqrt_n_reg: Optional[int] = None,
+                           *, formats: Optional[TensorFormats] = None) -> int:
         """RMS norm DRAM entrypoint; dispatches on whether any runtime register is supplied:
 
         - **Any** of ``gpr_M_reg`` / ``gpr_N_reg`` / ``gpr_sqrt_n_reg`` (or a GPR DRAM base):
@@ -4167,6 +4375,7 @@ class UnifiedEngine:
         ``gpr_a_addr`` / ``gpr_out_addr`` / ``gpr_gamma_addr`` (dynamic path) optionally source the
         input / output / gamma DRAM bases from GPRs (word addr).
         """
+        formats = self._resolve_tensor_formats(formats)
         if any(r is not None for r in (gpr_M_reg, gpr_N_reg, gpr_sqrt_n_reg,
                                        gpr_a_addr, gpr_out_addr, gpr_gamma_addr)):
             # Any runtime register -> the dynamic core (it subsumes the retired PBI path). The missing
@@ -4187,6 +4396,7 @@ class UnifiedEngine:
                 gpr_M_reg=gpr_M_reg, gpr_N_reg=gpr_N_reg, gpr_sqrt_n_reg=gpr_sqrt_n_reg,
                 gpr_rms_scale_reg=gpr_rms_scale_reg,
                 gpr_a_addr=gpr_a_addr, gpr_out_addr=gpr_out_addr, gpr_gamma_addr=gpr_gamma_addr,
+                formats=formats,
             )
             for _ in _seeded:
                 self.release_isa_reg()
@@ -4198,10 +4408,12 @@ class UnifiedEngine:
             A_DRAM_ADDR=A_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
             GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR,
+            formats=formats,
         )
 
     # we need a layer norm core that takes in a vector and outputs a vector
-    def layer_norm_core(self, vector_sram_start_addr: int, output_sram_wb_addr: int, N: int, zeros_sram_start_addr: int = None, input_gamma_sram_start_addr: int = None, input_beta_sram_start_addr: int = None) -> None:
+    def layer_norm_core(self, vector_sram_start_addr: int, output_sram_wb_addr: int, N: int, zeros_sram_start_addr: int = None, input_gamma_sram_start_addr: int = None, input_beta_sram_start_addr: int = None,
+                        *, formats: Optional[TensorFormats] = None) -> None:
         """
         Core layer norm: normalizes vector x -> x / rms(x).
         Args:
@@ -4214,14 +4426,15 @@ class UnifiedEngine:
             input_beta_sram_start_addr: input_beta_sram_start_addr
         """
 
-        self.start_queue_for_bf16_layer_norm_mean(vector_sram_start_addr, zeros_sram_start_addr, N)
-        self.start_queue_broadcast(UE_MODE.ADD_BROADCAST, BROADCAST_MODE.LALU_RESULT_NEGATE, vector_sram_start_addr, output_sram_wb_addr, N) # use 1/rms(x) result from LALU
-        self.start_queue_for_bf16_rms_mean(output_sram_wb_addr, N)
-        self.start_queue_broadcast(UE_MODE.MUL_BROADCAST, BROADCAST_MODE.LALU_RESULT, output_sram_wb_addr, output_sram_wb_addr, N) # use 1/rms(x) result from LALU
+        formats = self._resolve_tensor_formats(formats)
+        self.start_queue_for_bf16_layer_norm_mean(vector_sram_start_addr, zeros_sram_start_addr, N, formats=formats)
+        self.start_queue_broadcast(UE_MODE.ADD_BROADCAST, BROADCAST_MODE.LALU_RESULT_NEGATE, vector_sram_start_addr, output_sram_wb_addr, N, formats=formats) # use 1/rms(x) result from LALU
+        self.start_queue_for_bf16_rms_mean(output_sram_wb_addr, N, formats=formats.with_formats(a=formats.output))
+        self.start_queue_broadcast(UE_MODE.MUL_BROADCAST, BROADCAST_MODE.LALU_RESULT, output_sram_wb_addr, output_sram_wb_addr, N, formats=formats.with_formats(a=formats.output)) # use 1/rms(x) result from LALU
         if input_gamma_sram_start_addr is not None:
-            self.eltwise_mul_core(output_sram_wb_addr, input_gamma_sram_start_addr, output_sram_wb_addr, N)
+            self.eltwise_mul_core(output_sram_wb_addr, input_gamma_sram_start_addr, output_sram_wb_addr, N, formats=formats.with_formats(a=formats.output))
         if input_beta_sram_start_addr is not None:
-            self.eltwise_add_core(output_sram_wb_addr, input_beta_sram_start_addr, output_sram_wb_addr, N)
+            self.eltwise_add_core(output_sram_wb_addr, input_beta_sram_start_addr, output_sram_wb_addr, N, formats=formats.with_formats(a=formats.output))
 
 
     def layer_norm_core_dram_pbi(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
@@ -4415,7 +4628,8 @@ class UnifiedEngine:
                                      INV_N_DRAM_ADDR: int = None, MASK_DRAM_ADDR: Optional[int] = None,
                                      gpr_a_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
                                      gpr_gamma_addr: Optional[int] = None, gpr_beta_addr: Optional[int] = None,
-                                     gpr_invn_addr: Optional[int] = None, gpr_mask_addr: Optional[int] = None) -> int:
+                                     gpr_invn_addr: Optional[int] = None, gpr_mask_addr: Optional[int] = None,
+                                     *, formats: Optional[TensorFormats] = None) -> int:
         """Layer norm with runtime M, runtime ``sqrt(N)`` scalar, N baked at capture.
 
         Chunk-tiled, like :meth:`rms_norm_core_dram_dynamic`: batches up to
@@ -4483,6 +4697,7 @@ class UnifiedEngine:
         64-aligned callers. Gamma/beta pad lanes don't need special handling: after masking they're
         exactly 0 through the gamma multiply, and the caller slices ``[:N]`` off the output anyway.
         """
+        formats = self._resolve_tensor_formats(formats)
         fn = "layer_norm_core_dram_dynamic"
         assert M >= 1 and N >= 1, f"{fn}: require M>=1 and N>=1"
         if N % UE_VECTOR_SIZE != 0:
@@ -4596,7 +4811,7 @@ class UnifiedEngine:
         else:
             zeros_dram_addr = self.get_params_dram_addr()
             self.allocate_params_dram(N * 2)
-            self.dma_write(DMA_DEVICE_H2C, zeros_dram_addr, torch.zeros(N, dtype=torch.bfloat16), N * 2)
+            self.dma_write(self.h2c_device, zeros_dram_addr, torch.zeros(N, dtype=formats.b.dtype), N * 2)
 
         # Plain (non-PBI) DMA preloads — see [[pbi-hazards-add-reduce-and-preload-race]] (chained
         # pbi_init reconfigures can race ahead of a still-draining DMA).
@@ -4637,6 +4852,8 @@ class UnifiedEngine:
         # Arithmetic UE_PBI interprets shared field 11 as lalu_scalar.
         _set(rms_ptr, PBI_FIELD.LALU_SCALAR, gpr_sqrt_n_reg)
 
+        output_a_formats = formats.with_formats(a=formats.output)
+
         def _ln_row(sram, scratch_row, row_idx):
             # Full per-row LayerNorm as PLAIN ops at a compile-time SRAM offset. mean via inv_n
             # prescale into this row's SCRATCH (x survives at `sram`) + ADD_REDUCE(scratch) +
@@ -4646,14 +4863,14 @@ class UnifiedEngine:
             self.ue_arithmetic_op(
                 0, 0, 1, 0, 0, LALU_MODE.BYPASS.value, 0, URAM_SECTION.URAM_A.value,
                 0, scratch_row, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
-                UE_MODE.ELTWISE_MUL, 0, urow, Z_INV_N, MAX_ROWS, 0, 0, 0)
+                UE_MODE.ELTWISE_MUL, 0, urow, Z_INV_N, MAX_ROWS, 0, 0, 0, formats=formats)
             self.ue_arithmetic_op(
                 0, 0, 1, 0, 0, LALU_MODE.MODE_RECIP.value, self.float_to_bf19(1.0), URAM_SECTION.URAM_A.value,
                 0, 0, URAM_WRITE_SRC.URAM_WB_DISABLE.value,
-                UE_MODE.ADD_REDUCE, 0, scratch_row, Z_ZEROS, MAX_ROWS, 0, 0, 0)
-            self.start_queue_broadcast(UE_MODE.ADD_BROADCAST, BROADCAST_MODE.LALU_RESULT_NEGATE, sram, sram, N)
+                UE_MODE.ADD_REDUCE, 0, scratch_row, Z_ZEROS, MAX_ROWS, 0, 0, 0, formats=output_a_formats)
+            self.start_queue_broadcast(UE_MODE.ADD_BROADCAST, BROADCAST_MODE.LALU_RESULT_NEGATE, sram, sram, N, formats=formats)
             if MASK_DRAM_ADDR is not None:
-                self.eltwise_mul_core(sram, mask_sram_addr, sram, N)
+                self.eltwise_mul_core(sram, mask_sram_addr, sram, N, formats=output_a_formats)
             # RSQRT is a normal UE_PBI arithmetic operation. Its pointer supplies the complete RMS
             # state and runtime scalar; the descriptor advances Y, wrapping after the final row.
             y_delta = MAX_ROWS if row_idx < U - 1 else -((U - 1) * MAX_ROWS)
@@ -4662,12 +4879,12 @@ class UnifiedEngine:
                 URAM_SECTION.URAM_A.value,
                 0, 0, URAM_WRITE_SRC.URAM_WB_DISABLE.value,
                 UE_MODE.RMS, 0, y_delta, 0, 0, 0, 0, 0,
-                inst_pointer_idx=rms_ptr)
-            self.start_queue_broadcast(UE_MODE.MUL_BROADCAST, BROADCAST_MODE.LALU_RESULT, sram, sram, N)
+                inst_pointer_idx=rms_ptr, formats=output_a_formats)
+            self.start_queue_broadcast(UE_MODE.MUL_BROADCAST, BROADCAST_MODE.LALU_RESULT, sram, sram, N, formats=output_a_formats)
             if GAMMA_DRAM_ADDR is not None:
-                self.eltwise_mul_core(sram, gamma_sram_addr, sram, N)
+                self.eltwise_mul_core(sram, gamma_sram_addr, sram, N, formats=output_a_formats)
             if BETA_DRAM_ADDR is not None:
-                self.eltwise_add_core(sram, beta_sram_addr, sram, N)
+                self.eltwise_add_core(sram, beta_sram_addr, sram, N, formats=output_a_formats)
 
         # ===== outer chunk loop (2 live PBI pointers: load_ptr, store_ptr) =====
         program_dram_start_addr = self.get_program_dram_addr()
@@ -4720,10 +4937,12 @@ class UnifiedEngine:
 
     def layer_norm_core_dram_legacy(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                                      GAMMA_DRAM_ADDR: int = None, BETA_DRAM_ADDR: int = None,
-                                     ZEROS_DRAM_ADDR: int = None) -> int:
+                                     ZEROS_DRAM_ADDR: int = None,
+                                     *, formats: Optional[TensorFormats] = None) -> int:
         """
         Legacy layer norm DRAM path: compile-time chunk-tiled, M-unrolled.
         """
+        formats = self._resolve_tensor_formats(formats)
         zeros_sram_addr = 0x80000
 
         if ZEROS_DRAM_ADDR is not None:
@@ -4731,7 +4950,7 @@ class UnifiedEngine:
         else:
             zeros_dram_addr = self.get_params_dram_addr()
             self.allocate_params_dram(N * 2)
-            self.dma_write(DMA_DEVICE_H2C, zeros_dram_addr, torch.zeros(N, dtype=torch.bfloat16), N * 2)
+            self.dma_write(self.h2c_device, zeros_dram_addr, torch.zeros(N, dtype=formats.b.dtype), N * 2)
 
         # These are small enough to fit in URAM_B, the layout zeros + gamma + beta
         self.accelerator_memory_to_sram(accelerator_dram_address=zeros_dram_addr,
@@ -4768,7 +4987,7 @@ class UnifiedEngine:
                                         element_size=m_take * N)
 
             for j in range(m_take):
-                self.layer_norm_core(vector_sram_addr + j * N * 2, vector_sram_addr + j * N * 2, N, zeros_sram_addr, gamma_sram_addr, beta_sram_addr)
+                self.layer_norm_core(vector_sram_addr + j * N * 2, vector_sram_addr + j * N * 2, N, zeros_sram_addr, gamma_sram_addr, beta_sram_addr, formats=formats)
 
             self.sram_to_accelerator_memory(sram_address=vector_sram_addr,
                                             accelerator_dram_address=OUTPUT_DRAM_ADDR + i * N * 2,
@@ -4791,7 +5010,8 @@ class UnifiedEngine:
                               gpr_a_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
                               gpr_gamma_addr: Optional[int] = None, gpr_beta_addr: Optional[int] = None,
                               gpr_invn_addr: Optional[int] = None, gpr_mask_addr: Optional[int] = None,
-                              gpr_sqrt_n_reg: Optional[int] = None) -> int:
+                              gpr_sqrt_n_reg: Optional[int] = None,
+                              *, formats: Optional[TensorFormats] = None) -> int:
         """Layer norm DRAM entrypoint; dispatches to dynamic for any runtime argument.
 
         - Any runtime dimension/address GPR, ``INV_N_DRAM_ADDR``, or ``MASK_DRAM_ADDR``:
@@ -4806,6 +5026,7 @@ class UnifiedEngine:
         optionally source the input/output/gamma/beta DRAM bases from GPRs (word addr). The constant
         zeros buffer stays a literal because it does not vary per layer.
         """
+        formats = self._resolve_tensor_formats(formats)
         runtime_args = (gpr_M_reg, gpr_N_reg, gpr_sqrt_n_reg, gpr_a_addr, gpr_out_addr,
                         gpr_gamma_addr, gpr_beta_addr, gpr_invn_addr, gpr_mask_addr)
         if any(r is not None for r in runtime_args) or INV_N_DRAM_ADDR is not None or MASK_DRAM_ADDR is not None:
@@ -4827,15 +5048,15 @@ class UnifiedEngine:
                     raise ValueError("layer_norm_core_dram: gpr_gamma_addr requires GAMMA_DRAM_ADDR")
                 GAMMA_DRAM_ADDR = self.get_params_dram_addr()
                 self.allocate_params_dram(N * 2)
-                self.dma_write(DMA_DEVICE_H2C, GAMMA_DRAM_ADDR,
-                               torch.ones(N, dtype=torch.bfloat16), N * 2)
+                self.dma_write(self.h2c_device, GAMMA_DRAM_ADDR,
+                               torch.ones(N, dtype=formats.b.dtype), N * 2)
             if INV_N_DRAM_ADDR is None:
                 if gpr_invn_addr is not None:
                     raise ValueError("layer_norm_core_dram: gpr_invn_addr requires INV_N_DRAM_ADDR")
                 INV_N_DRAM_ADDR = self.get_params_dram_addr()
                 self.allocate_params_dram(N * 2)
-                self.dma_write(DMA_DEVICE_H2C, INV_N_DRAM_ADDR,
-                               torch.full((N,), 1.0 / N, dtype=torch.bfloat16), N * 2)
+                self.dma_write(self.h2c_device, INV_N_DRAM_ADDR,
+                               torch.full((N,), 1.0 / N, dtype=formats.b.dtype), N * 2)
             # gpr_n_scale_reg / gpr_rms_scale_reg are accepted for backward compat but ignored (1/N via
             # INV_N_DRAM_ADDR vector; sqrt(N) via gpr_sqrt_n_reg).
             result = self.layer_norm_core_dram_dynamic(
@@ -4846,6 +5067,7 @@ class UnifiedEngine:
                 gpr_a_addr=gpr_a_addr, gpr_out_addr=gpr_out_addr,
                 gpr_gamma_addr=gpr_gamma_addr, gpr_beta_addr=gpr_beta_addr, gpr_invn_addr=gpr_invn_addr,
                 gpr_mask_addr=gpr_mask_addr,
+                formats=formats,
             )
             for _ in seeded_regs:
                 self.release_isa_reg()
@@ -4855,14 +5077,16 @@ class UnifiedEngine:
             A_DRAM_ADDR=A_DRAM_ADDR, OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
             GAMMA_DRAM_ADDR=GAMMA_DRAM_ADDR, BETA_DRAM_ADDR=BETA_DRAM_ADDR,
             ZEROS_DRAM_ADDR=ZEROS_DRAM_ADDR,
+            formats=formats,
         )
 
 
     def rope_hf_core_decode(self, N: int, input_dram_addr: int, output_dram_addr: int,
                      cos_dram_addr: int = 0, sin_dram_addr: int = 0,
                      rope_size_reg: int = None, gr_weight_dram: int = 0,
-                     output_addr_inc_reg: int = None, tmp_reg: int = None) -> int:
-        """HuggingFace-style RoPE on N bf16 elements. Caller must bracket with start/stop_capture.
+                     output_addr_inc_reg: int = None, tmp_reg: int = None,
+                     *, formats: Optional[TensorFormats] = None) -> int:
+        """HuggingFace-style RoPE on N elements. Caller must bracket with start/stop_capture.
 
         Compute flow (single token, head_dim=N, half=N//2):
           1. Load x[N]          → sram_x
@@ -4885,6 +5109,7 @@ class UnifiedEngine:
         output_addr_inc_reg: ISA register holding a per-position byte offset applied to output_dram_addr.
         Returns: approximate FLOPs (4*N).
         """
+        formats = self._resolve_tensor_formats(formats)
         assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
         assert N % 2 == 0, "N must be even for RoPE half layout"
         assert N >= 128, "N must be >= 128 so half-vector SRAM offsets are 128-byte aligned"
@@ -4910,10 +5135,10 @@ class UnifiedEngine:
         else:
             self.accelerator_memory_to_sram(accelerator_dram_address=cos_dram_addr, sram_address=sram_cos, element_size=N)
             self.accelerator_memory_to_sram(accelerator_dram_address=sin_dram_addr, sram_address=sram_sin, element_size=N)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos, vector_C_sram_wb_addr=sram_a, element_size=N)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin, vector_C_sram_wb_addr=sram_bc, element_size=half)
-        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half)
-        self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_d, element_size=N)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos, vector_C_sram_wb_addr=sram_a, element_size=N, formats=formats)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin, vector_C_sram_wb_addr=sram_bc, element_size=half, formats=formats)
+        self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half, formats=formats)
+        self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_d, element_size=N, formats=formats.with_formats(a=formats.output, b=formats.output))
         if output_addr_inc_reg is not None:
             self.generate_instruction_add_imm(output_addr_inc_reg, ue_35bit_addr_shifter(output_dram_addr), tmp_reg)
             self.sram_to_accelerator_memory(sram_address=sram_d, accelerator_dram_address=output_dram_addr, element_size=N, general_reg_src=tmp_reg)
@@ -4925,7 +5150,8 @@ class UnifiedEngine:
 
     def rope_hf_core_decode_d64(self, N: int, input_dram_addr: int, output_dram_addr: int,
                                 packed_table_addr: int, pos_reg: int, tmp_reg: int,
-                                output_pos_strided: bool = False) -> int:
+                                output_pos_strided: bool = False,
+                                *, formats: Optional[TensorFormats] = None) -> int:
         """Single-token decode HF RoPE for head_dim ``N < 128`` (the decode analog of
         :meth:`rope_hf_core_dram_d64_pbi`). :meth:`rope_hf_core_decode` asserts ``N >= 128``;
         this is the N<128 path. Caller must bracket with start_capture()/stop_capture().
@@ -4943,6 +5169,7 @@ class UnifiedEngine:
         output_pos_strided : True  -> write to ``output_dram_addr + pos*N*bpe`` (KV-cache slot, K).
                              False -> write to ``output_dram_addr`` (fixed slot, e.g. Q_PERM).
         """
+        formats = self._resolve_tensor_formats(formats)
         assert 0 < N < 128 and N % 2 == 0, "rope_hf_core_decode_d64 is the N<128 even path"
         bpe = 2
         half = N // 2
@@ -4985,12 +5212,12 @@ class UnifiedEngine:
         _read_pos(sin_base + half_bytes, uram_sin_hi)   # sin[half:N]
 
         # result = x*cos + rotate_half(x)*sin  (sin_lo pre-negated, so b_lo = x_hi*(-sin))
-        self.eltwise_mul_core(uram_x_lo, uram_cos_lo, uram_a_lo, half)
-        self.eltwise_mul_core(uram_x_hi, uram_cos_hi, uram_a_hi, half)
-        self.eltwise_mul_core(uram_x_hi, uram_sin_lo, uram_b_lo, half)
-        self.eltwise_mul_core(uram_x_lo, uram_sin_hi, uram_b_hi, half)
-        self.eltwise_add_core(uram_a_lo, uram_b_lo, uram_result_lo, half)
-        self.eltwise_add_core(uram_a_hi, uram_b_hi, uram_result_hi, half)
+        self.eltwise_mul_core(uram_x_lo, uram_cos_lo, uram_a_lo, half, formats=formats)
+        self.eltwise_mul_core(uram_x_hi, uram_cos_hi, uram_a_hi, half, formats=formats)
+        self.eltwise_mul_core(uram_x_hi, uram_sin_lo, uram_b_lo, half, formats=formats)
+        self.eltwise_mul_core(uram_x_lo, uram_sin_hi, uram_b_hi, half, formats=formats)
+        self.eltwise_add_core(uram_a_lo, uram_b_lo, uram_result_lo, half, formats=formats.with_formats(a=formats.output, b=formats.output))
+        self.eltwise_add_core(uram_a_hi, uram_b_hi, uram_result_hi, half, formats=formats.with_formats(a=formats.output, b=formats.output))
 
         if output_pos_strided:
             def _write_pos(base, sram_addr):
@@ -5009,7 +5236,8 @@ class UnifiedEngine:
 
     def rope_hf_core_dram(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None, rope_size_reg: int = None, output_addr_inc_reg: int = None, tmp_reg: int = None,
                           gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None,
-                          gpr_N_reg: Optional[int] = None) -> int:
+                          gpr_N_reg: Optional[int] = None,
+                          *, formats: Optional[TensorFormats] = None) -> int:
         """HF RoPE DRAM entrypoint; dispatches based on ``N``, ``gpr_M_reg`` and ``gpr_N_reg``:
 
         - Any runtime dimension/address GPR: :meth:`rope_hf_core_dram_dynamic`. Missing M/N registers
@@ -5017,6 +5245,7 @@ class UnifiedEngine:
           padded-split branch needed when ``N < 128``.
         - No runtime GPRs (default): :meth:`rope_hf_core_dram_legacy` — Python-unrolled rows.
         """
+        formats = self._resolve_tensor_formats(formats)
         if any(r is not None for r in (gpr_M_reg, gpr_N_reg, gpr_input_addr, gpr_out_addr, gpr_cos_addr)):
             seeded_regs = []
             if gpr_M_reg is None:
@@ -5028,19 +5257,21 @@ class UnifiedEngine:
             result = self.rope_hf_core_dram_dynamic(
                 M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr,
                 gpr_M_reg=gpr_M_reg, gpr_N_reg=gpr_N_reg,
-                gpr_input_addr=gpr_input_addr, gpr_out_addr=gpr_out_addr, gpr_cos_addr=gpr_cos_addr)
+                gpr_input_addr=gpr_input_addr, gpr_out_addr=gpr_out_addr, gpr_cos_addr=gpr_cos_addr, formats=formats)
             for _ in seeded_regs:
                 self.release_isa_reg()
             return result
-        return self.rope_hf_core_dram_legacy(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr)
+        return self.rope_hf_core_dram_legacy(M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, formats=formats)
 
-    def rope_hf_core_dram_legacy(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int) -> int:
+    def rope_hf_core_dram_legacy(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int,
+                                 *, formats: Optional[TensorFormats] = None) -> int:
         """Statically compiled, chunk-batched HuggingFace RoPE.
 
         Uses the same batch geometry and SRAM reuse as the dynamic core, but all chunk sizes,
         addresses and row offsets are capture-time constants. This keeps legacy as an independent
         static baseline while making DMA granularity comparable to dynamic.
         """
+        formats = self._resolve_tensor_formats(formats)
         assert M >= 1, "M must be at least 1"
         assert N % UE_VECTOR_SIZE == 0 and N >= 128, (
             f"N must be a multiple of {UE_VECTOR_SIZE} and >= 128")
@@ -5079,10 +5310,10 @@ class UnifiedEngine:
                 sin = cos + row_bytes
                 b = sram_b_base + j * row_bytes
 
-                self.eltwise_mul_core(x, cos, a, N)
-                self.eltwise_mul_core(x + half * 2, sin, b, half)
-                self.eltwise_mul_core(x, sin + half * 2, b + half * 2, half)
-                self.eltwise_add_core(a, b, x, N)
+                self.eltwise_mul_core(x, cos, a, N, formats=formats)
+                self.eltwise_mul_core(x + half * 2, sin, b, half, formats=formats)
+                self.eltwise_mul_core(x, sin + half * 2, b + half * 2, half, formats=formats)
+                self.eltwise_add_core(a, b, x, N, formats=formats.with_formats(a=formats.output, b=formats.output))
 
             self.sram_to_accelerator_memory(
                 sram_address=sram_x_base,
@@ -5092,7 +5323,8 @@ class UnifiedEngine:
         return 4 * M * N
 
     def _rope_hf_core_dram_dynamic_small_n(self, M: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: int = None,
-                              gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None) -> int:
+                              gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None,
+                              *, formats: Optional[TensorFormats] = None) -> int:
         """PBI-backed HF RoPE over M rows. Caller must have start_capture() before and stop_capture() after.
 
         **Batch dimension / M (dynamic, required):**
@@ -5114,6 +5346,7 @@ class UnifiedEngine:
         slot. Eight PBI pointers are used (2×x, 4×rope, 2×output), each transferring half_bytes
         per iteration with row-stride advances.
         """
+        formats = self._resolve_tensor_formats(formats)
         assert M >= 1, "M must be at least 1"
         assert N % 2 == 0, "N must be even for RoPE half layout"
         self._validate_addr_gprs("rope_hf_core_dram_pbi", gpr_M_reg, {
@@ -5209,12 +5442,12 @@ class UnifiedEngine:
             self.generate_instruction_add_imm(cos_reg, ue_35bit_addr_shifter(N * bytes_per_elem + half_bytes),   tmp_r)
             self.accelerator_memory_to_sram(accelerator_dram_address=N * bytes_per_elem + half_bytes, sram_address=sram_sin_hi, element_size=half, general_reg_src=tmp_r)
 
-            self.eltwise_mul_core(sram_x_lo, sram_cos_lo, sram_a_lo,  half)
-            self.eltwise_mul_core(sram_x_hi, sram_cos_hi, sram_a_hi,  half)
-            self.eltwise_mul_core(sram_x_hi, sram_sin_lo, sram_bc_lo, half)
-            self.eltwise_mul_core(sram_x_lo, sram_sin_hi, sram_bc_hi, half)
-            self.eltwise_add_core(sram_a_lo, sram_bc_lo, sram_result_lo, half)
-            self.eltwise_add_core(sram_a_hi, sram_bc_hi, sram_result_hi, half)
+            self.eltwise_mul_core(sram_x_lo, sram_cos_lo, sram_a_lo,  half, formats=formats)
+            self.eltwise_mul_core(sram_x_hi, sram_cos_hi, sram_a_hi,  half, formats=formats)
+            self.eltwise_mul_core(sram_x_hi, sram_sin_lo, sram_bc_lo, half, formats=formats)
+            self.eltwise_mul_core(sram_x_lo, sram_sin_hi, sram_bc_hi, half, formats=formats)
+            self.eltwise_add_core(sram_a_lo, sram_bc_lo, sram_result_lo, half, formats=formats.with_formats(a=formats.output, b=formats.output))
+            self.eltwise_add_core(sram_a_hi, sram_bc_hi, sram_result_hi, half, formats=formats.with_formats(a=formats.output, b=formats.output))
 
             # result_lo to [out_reg], result_hi to [out_reg + half_bytes]
             self.sram_to_accelerator_memory(sram_address=sram_result_lo, accelerator_dram_address=0, element_size=half, general_reg_src=out_reg)
@@ -5316,10 +5549,10 @@ class UnifiedEngine:
                 element_size=0,
                 inst_pointer_idx=rope_ptr,
             )
-            self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos,              vector_C_sram_wb_addr=sram_a,                   element_size=N)
-            self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin,              vector_C_sram_wb_addr=sram_bc,                  element_size=half)
-            self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half*bytes_per_elem,   vector_C_sram_wb_addr=sram_bc + half*bytes_per_elem,       element_size=half)
-            self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc,               vector_C_sram_wb_addr=sram_d,                   element_size=N)
+            self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos,              vector_C_sram_wb_addr=sram_a,                   element_size=N, formats=formats)
+            self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin,              vector_C_sram_wb_addr=sram_bc,                  element_size=half, formats=formats)
+            self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half*bytes_per_elem,   vector_C_sram_wb_addr=sram_bc + half*bytes_per_elem,       element_size=half, formats=formats)
+            self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc,               vector_C_sram_wb_addr=sram_d,                   element_size=N, formats=formats.with_formats(a=formats.output, b=formats.output))
             self.sram_to_accelerator_memory(
                 sram_address=0,
                 accelerator_dram_address=row_bytes,
@@ -5337,7 +5570,8 @@ class UnifiedEngine:
                                          cos_dram_addr: int, sin_dram_addr: int,
                                          gpr_M_reg: int = None, gpr_N_reg: int = None,
                                          gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
-                                         gpr_cos_addr: Optional[int] = None) -> int:
+                                         gpr_cos_addr: Optional[int] = None,
+                                         *, formats: Optional[TensorFormats] = None) -> int:
         """Fast batched, 4-PBI-pointer HF RoPE with runtime M and N (head_dim>=128).
 
         Follows the shape of the HW-confirmed :meth:`rms_norm_core_dram_dynamic` and
@@ -5386,12 +5620,13 @@ class UnifiedEngine:
 
         **Status: offline-validated only (HW-UNVALIDATED).**
         """
+        formats = self._resolve_tensor_formats(formats)
         fn = "rope_hf_core_dram_dynamic"
         if N < 128:
             return self._rope_hf_core_dram_dynamic_small_n(
                 M, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr,
                 gpr_M_reg=gpr_M_reg, gpr_input_addr=gpr_input_addr,
-                gpr_out_addr=gpr_out_addr, gpr_cos_addr=gpr_cos_addr)
+                gpr_out_addr=gpr_out_addr, gpr_cos_addr=gpr_cos_addr, formats=formats)
         assert M >= 1, f"{fn}: M must be at least 1"
         if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
             raise ValueError(f"{fn}: gpr_M_reg must be a GPR index 1..15, got {gpr_M_reg}")
@@ -5533,7 +5768,7 @@ class UnifiedEngine:
         _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, xr_reg)      # A = x
         _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, cosr_reg)    # B = cos
         _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, ar_reg)       # -> a
-        self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_A.value, 0, inst_pointer_idx=ptr_compute)
+        self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_A.value, 0, inst_pointer_idx=ptr_compute, formats=formats)
 
         # op2: b[:half] = x[half:] * sin[:half]  (half row -> URAM_B b-region).  sin row = cos + n_rows.
         _set(ptr_compute, PBI_FIELD.URAM_ROW_SIZE, half_rows_reg)
@@ -5542,7 +5777,7 @@ class UnifiedEngine:
         self.generate_instruction_add_reg(s2, cosr_reg, n_rows_reg)    # sin row = cos + n_rows
         _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, s2)
         _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, br_reg)          # -> b[:half]
-        self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_B.value, 0, inst_pointer_idx=ptr_compute)
+        self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_B.value, 0, inst_pointer_idx=ptr_compute, formats=formats)
 
         # op3: b[half:] = x[:half] * sin[half:]  (half row -> URAM_B b-region).  row_size still half.
         _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, xr_reg)         # A = x1 = x
@@ -5550,14 +5785,14 @@ class UnifiedEngine:
         _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, s1)
         self.generate_instruction_add_reg(s2, br_reg, half_rows_reg)   # b[half:] row = b + half_rows
         _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, s2)
-        self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_B.value, 0, inst_pointer_idx=ptr_compute)
+        self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_B.value, 0, inst_pointer_idx=ptr_compute, formats=formats)
 
         # op4: out = a + b  (full row -> URAM_A, in place over x).  A = a (URAM_A), B = b (URAM_B).
         _set(ptr_compute, PBI_FIELD.URAM_ROW_SIZE, n_rows_reg)
         _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, ar_reg)         # A = a
         _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, br_reg)         # B = b
         _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, xr_reg)          # -> out (over x)
-        self.start_queue_eltwise(UE_MODE.ELTWISE_ADD, 0, 0, 0, URAM_SECTION.URAM_A.value, 0, inst_pointer_idx=ptr_compute)
+        self.start_queue_eltwise(UE_MODE.ELTWISE_ADD, 0, 0, 0, URAM_SECTION.URAM_A.value, 0, inst_pointer_idx=ptr_compute, formats=formats.with_formats(a=formats.output, b=formats.output))
 
         # advance per-row URAM cursors
         self.generate_instruction_add_reg(xr_reg, xr_reg, n_rows_reg)
@@ -5597,7 +5832,8 @@ class UnifiedEngine:
 
     def rope_hf_core_dram_gqa(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int, gpr_M_reg: Optional[int] = None,
                               gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_cos_addr: Optional[int] = None,
-                              gpr_N_reg: Optional[int] = None, gpr_group_reg: Optional[int] = None) -> int:
+                              gpr_N_reg: Optional[int] = None, gpr_group_reg: Optional[int] = None,
+                              *, formats: Optional[TensorFormats] = None) -> int:
         """HF GQA RoPE DRAM entrypoint; dispatches based on ``gpr_N_reg`` / ``gpr_M_reg``:
 
         - Any runtime dimension/address GPR: :meth:`rope_hf_core_dram_gqa_dynamic`. Missing M/N
@@ -5608,6 +5844,7 @@ class UnifiedEngine:
         ``gpr_input_addr`` / ``gpr_out_addr`` / ``gpr_cos_addr`` (dynamic path only) optionally source
         the Q/output/cos-table bases from GPRs (word addr).
         """
+        formats = self._resolve_tensor_formats(formats)
         if any(r is not None for r in (gpr_M_reg, gpr_N_reg, gpr_group_reg,
                                        gpr_input_addr, gpr_out_addr, gpr_cos_addr)):
             seeded_regs = []
@@ -5620,14 +5857,16 @@ class UnifiedEngine:
             result = self.rope_hf_core_dram_gqa_dynamic(
                 M, group_size, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr,
                 gpr_M_reg=gpr_M_reg, gpr_N_reg=gpr_N_reg, gpr_group_reg=gpr_group_reg,
-                gpr_input_addr=gpr_input_addr, gpr_out_addr=gpr_out_addr, gpr_cos_addr=gpr_cos_addr)
+                gpr_input_addr=gpr_input_addr, gpr_out_addr=gpr_out_addr, gpr_cos_addr=gpr_cos_addr, formats=formats)
             for _ in seeded_regs:
                 self.release_isa_reg()
             return result
-        return self.rope_hf_core_dram_gqa_legacy(M, group_size, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr)
+        return self.rope_hf_core_dram_gqa_legacy(M, group_size, N, input_dram_addr, output_dram_addr, cos_dram_addr, sin_dram_addr, formats=formats)
 
-    def rope_hf_core_dram_gqa_legacy(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int) -> int:
+    def rope_hf_core_dram_gqa_legacy(self, M: int, group_size: int, N: int, input_dram_addr: int, output_dram_addr: int, cos_dram_addr: int, sin_dram_addr: int,
+                                     *, formats: Optional[TensorFormats] = None) -> int:
         """Static grouped-query RoPE with dynamic-equivalent table reuse and DMA granularity."""
+        formats = self._resolve_tensor_formats(formats)
         assert M >= 1, "M must be at least 1"
         assert group_size >= 1, "group_size must be at least 1"
         assert N % UE_VECTOR_SIZE == 0 and N >= 64, f"N must be a multiple of {UE_VECTOR_SIZE} and >= 64"
@@ -5649,10 +5888,10 @@ class UnifiedEngine:
             for group_idx in range(group_size):
                 q_row_idx = row_idx * group_size + group_idx
                 self.accelerator_memory_to_sram(accelerator_dram_address=input_dram_addr + q_row_idx * row_bytes, sram_address=sram_x, element_size=N)
-                self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos, vector_C_sram_wb_addr=sram_a, element_size=N)
-                self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin, vector_C_sram_wb_addr=sram_bc, element_size=half)
-                self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half)
-                self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_x, element_size=N)
+                self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_cos, vector_C_sram_wb_addr=sram_a, element_size=N, formats=formats)
+                self.eltwise_mul_core(vector_A_sram_start_addr=sram_x + half * bytes_per_elem, vector_B_sram_start_addr=sram_sin, vector_C_sram_wb_addr=sram_bc, element_size=half, formats=formats)
+                self.eltwise_mul_core(vector_A_sram_start_addr=sram_x, vector_B_sram_start_addr=sram_sin + half * bytes_per_elem, vector_C_sram_wb_addr=sram_bc + half * bytes_per_elem, element_size=half, formats=formats)
+                self.eltwise_add_core(vector_A_sram_start_addr=sram_a, vector_B_sram_start_addr=sram_bc, vector_C_sram_wb_addr=sram_x, element_size=N, formats=formats.with_formats(a=formats.output, b=formats.output))
                 self.sram_to_accelerator_memory(sram_address=sram_x, accelerator_dram_address=output_dram_addr + q_row_idx * row_bytes, element_size=N)
         return 4 * M * group_size * N
 
@@ -5660,7 +5899,8 @@ class UnifiedEngine:
                                              cos_dram_addr: int, sin_dram_addr: int,
                                              gpr_M_reg: int = None, gpr_N_reg: int = None, gpr_group_reg: Optional[int] = None,
                                              gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
-                                             gpr_cos_addr: Optional[int] = None) -> int:
+                                             gpr_cos_addr: Optional[int] = None,
+                                             *, formats: Optional[TensorFormats] = None) -> int:
         """Fast 4-PBI-pointer grouped-query HF RoPE with runtime M / group_size / N (head_dim>=128).
 
         The GQA analog of :meth:`rope_hf_core_dram_dynamic`. Q rows are
@@ -5688,6 +5928,7 @@ class UnifiedEngine:
 
         **Status: offline-validated only (HW-UNVALIDATED)**.
         """
+        formats = self._resolve_tensor_formats(formats)
         fn = "rope_hf_core_dram_gqa_dynamic"
         assert M >= 1 and group_size >= 1, f"{fn}: M and group_size must be at least 1"
         if gpr_M_reg is None or not (1 <= gpr_M_reg <= 15):
@@ -5786,24 +6027,24 @@ class UnifiedEngine:
             _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, za_reg)         # A = x @ 0
             _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, za_reg)         # B = cos @ 0
             _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, n_rows_reg)      # -> a @ n_rows
-            self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_A.value, 0, inst_pointer_idx=ptr_compute)
+            self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_A.value, 0, inst_pointer_idx=ptr_compute, formats=formats)
             # op2: b[:half] = x[half:] * sin[:half] (half -> URAM_B b-region). sin @ n_rows, b @ 2*n_rows.
             _set(ptr_compute, PBI_FIELD.URAM_ROW_SIZE, half_rows_reg)
             _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, half_rows_reg)  # A = x2 @ half_rows
             _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, n_rows_reg)     # B = sin_lo @ n_rows
             _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, rope_rows_reg)   # -> b_lo @ 2*n_rows
-            self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_B.value, 0, inst_pointer_idx=ptr_compute)
+            self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_B.value, 0, inst_pointer_idx=ptr_compute, formats=formats)
             # op3: b[half:] = x[:half] * sin[half:] (half -> URAM_B). row_size stays half.
             _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, za_reg)         # A = x1 @ 0
             _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, sin_hi_row_reg) # B = sin_hi @ n_rows+half
             _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, b_hi_row_reg)    # -> b_hi @ 2*n_rows+half
-            self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_B.value, 0, inst_pointer_idx=ptr_compute)
+            self.start_queue_eltwise(UE_MODE.ELTWISE_MUL, 0, 0, 0, URAM_SECTION.URAM_B.value, 0, inst_pointer_idx=ptr_compute, formats=formats)
             # op4: out = a + b (full -> URAM_A in place over x). A = a @ n_rows, B = b @ 2*n_rows.
             _set(ptr_compute, PBI_FIELD.URAM_ROW_SIZE, n_rows_reg)
             _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Y, n_rows_reg)     # A = a
             _set(ptr_compute, PBI_FIELD.URAM_START_ADDR_Z, rope_rows_reg)  # B = b
             _set(ptr_compute, PBI_FIELD.URAM_WRITEB_ADDR, za_reg)          # -> out @ 0
-            self.start_queue_eltwise(UE_MODE.ELTWISE_ADD, 0, 0, 0, URAM_SECTION.URAM_A.value, 0, inst_pointer_idx=ptr_compute)
+            self.start_queue_eltwise(UE_MODE.ELTWISE_ADD, 0, 0, 0, URAM_SECTION.URAM_A.value, 0, inst_pointer_idx=ptr_compute, formats=formats.with_formats(a=formats.output, b=formats.output))
 
         # ===== Phase 4: outer M loop / inner group loop (4 live PBI pointers) =====
         program_dram_start_addr = self.get_program_dram_addr()
@@ -5855,7 +6096,8 @@ class UnifiedEngine:
                             identity_swap_dram_addr: int, scratch_dram_addr: int,
                             gpr_M_reg: int = None,
                             gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
-                            gpr_cos_addr: Optional[int] = None, gpr_sin_addr: Optional[int] = None) -> int:
+                            gpr_cos_addr: Optional[int] = None, gpr_sin_addr: Optional[int] = None,
+                            *, formats: Optional[TensorFormats] = None) -> int:
         """HF RoPE via a swap-matmul rotate-half, for **small head_dim (N=64)** where each ``N/2``-wide
         rotate-half is a *sub-URAM-row* slice (< 64 elements) and so cannot be addressed in URAM the way
         :meth:`rope_hf_core_dram_dynamic` does for N>=128. Rotate-half is a batched matmul against a
@@ -5873,6 +6115,7 @@ class UnifiedEngine:
         compile-time, optional ``gpr_*_addr`` source the DRAM bases from GPRs (word addr = ``byte >>
         3``). In-place safe (``output_dram_addr == input_dram_addr``). Returns ``4 * M * N`` FLOPs.
         """
+        formats = self._resolve_tensor_formats(formats)
         fn = "rope_hf_matmul_core"
         assert self.is_capture_on, f"{fn}() requires active capture"
         assert N % UE_VECTOR_SIZE == 0, f"{fn}: N must be a multiple of {UE_VECTOR_SIZE}, got N={N}"
@@ -5889,26 +6132,28 @@ class UnifiedEngine:
         # rot = X @ P_swap  (rotate_half without the sign; P symmetric so A@P == A@Pᵀ)
         flops += self.matmat_mul_core(M=M, K=N, N=N, A_DRAM_ADDR=input_dram_addr,
                                       B_DRAM_ADDR=identity_swap_dram_addr, OUTPUT_DRAM_ADDR=scratch_dram_addr,
-                                      is_B_quantized=False, gpr_M_reg=_pm(), gpr_a_addr=gpr_input_addr) or 0
+                                      is_B_quantized=False, gpr_M_reg=_pm(), gpr_a_addr=gpr_input_addr, formats=formats) or 0
         # rot = rot (.) sin
         flops += self.eltwise_core_dram(M=M, N=N, dram_a=scratch_dram_addr, dram_b=sin_dram_addr,
                                         dram_out=scratch_dram_addr, mode=UE_MODE.ELTWISE_MUL,
-                                        gpr_M_reg=_pm(), gpr_b_addr=gpr_sin_addr)
+                                        gpr_M_reg=_pm(), gpr_b_addr=gpr_sin_addr, formats=formats.with_formats(a=formats.output))
         # out = X (.) cos  (reads input, writes output; in-place safe when output == input)
         flops += self.eltwise_core_dram(M=M, N=N, dram_a=input_dram_addr, dram_b=cos_dram_addr,
                                         dram_out=output_dram_addr, mode=UE_MODE.ELTWISE_MUL,
                                         gpr_M_reg=_pm(), gpr_a_addr=gpr_input_addr,
-                                        gpr_b_addr=gpr_cos_addr, gpr_out_addr=gpr_out_addr)
+                                        gpr_b_addr=gpr_cos_addr, gpr_out_addr=gpr_out_addr, formats=formats)
         # out = out + rot
         flops += self.eltwise_core_dram(M=M, N=N, dram_a=output_dram_addr, dram_b=scratch_dram_addr,
                                         dram_out=output_dram_addr, mode=UE_MODE.ELTWISE_ADD,
-                                        gpr_M_reg=_pm(), gpr_a_addr=gpr_out_addr, gpr_out_addr=gpr_out_addr)
+                                        gpr_M_reg=_pm(), gpr_a_addr=gpr_out_addr, gpr_out_addr=gpr_out_addr, formats=formats.with_formats(a=formats.output, b=formats.output))
         return flops
 
     def start_queue_for_bf16_dequantize_operation(self, VECTOR_INPUT_DRAM_ADDR: int, SCALE_INPUT_DRAM_ADDR: int, data_type: TYPE,
-                                                  output_sram_wb_addr: int, element_size: int) -> None:
+                                                  output_sram_wb_addr: int, element_size: int,
+                                                  *, formats: Optional[TensorFormats] = None) -> None:
         """
-        Start queue for bf16 dequantize operation.
+        Dequantize weights using ``formats.scale`` and write ``formats.output``.
+        TQ4 additionally reads its lookup table in ``formats.codebook``.
         Args:
             VECTOR_INPUT_DRAM_ADDR: DRAM address of input matrix
             data_type: data_type
@@ -5916,6 +6161,7 @@ class UnifiedEngine:
             element_size: number of elements in the matrix
         """
 
+        formats = self._resolve_tensor_formats(formats)
         output_uram_type, output_uram_start_addr = self.sram_address_to_uram_address(output_sram_wb_addr)
         row_size = (element_size + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE # round up to the nearest multiple of UE_VECTOR_SIZE - K is inner dimension of the matrix
 
@@ -5948,22 +6194,32 @@ class UnifiedEngine:
             VECTOR_INPUT_DRAM_ADDR,  # dma_start_addr
             dma_length,  # dma_length
             row_size,  # output_size
+            formats=formats,
         )
 
         return element_size # total flops is element_size
 
     def start_queue_for_quantize_operation(self, input_sram_addr: int, output_sram_addr: int,
-                                               data_type: TYPE, element_size: int) -> int:
+                                               data_type: TYPE, element_size: int,
+                                               *, formats: Optional[TensorFormats] = None) -> int:
         """
-        Start queue for bf16 quantize operation. Input data must already be in SRAM.
+        Quantize stored-format input already in SRAM to packed FP4 values.
+
+        One scale per 64 elements is written to the 1,024-entry output QBRAM.
+        Larger operations wrap that scale buffer while still producing packed
+        output. When retaining scales, tile at 65,536 elements or fewer and
+        copy each tile's scales with ``ue_memcpy_to_dram(SCALE_BRAM, ...)``
+        before launching another tile. Initialize unused lanes in a partial
+        64-element input row to zero before quantization.
 
         Args:
-            input_sram_addr: SRAM address of input bf16 vector
+            input_sram_addr: SRAM address of input stored-format vector
             output_sram_addr: SRAM address for quantized output
             data_type: quantization type. The on-chip quantize core only
                 produces the FP4 variant of TYPE.IF4.
             element_size: number of elements to quantize
         """
+        formats = self._resolve_tensor_formats(formats)
         input_uram_type, input_uram_start_addr = self.sram_address_to_uram_address(input_sram_addr)
         assert input_uram_type == URAM_SECTION.URAM_A, f"input_sram_addr must be in URAM_A hex(input_uram_start_addr)={hex(input_uram_start_addr)}"
         output_uram_type, output_uram_start_addr = self.sram_address_to_uram_address(output_sram_addr)
@@ -5992,24 +6248,28 @@ class UnifiedEngine:
             0,  # dma_start_addr (N/A)
             0,  # dma_length (N/A)
             0,  # output_size (N/A)
+            formats=formats,
         )
 
         return 2 * element_size # 2 FLOPS per element
 
-    def prepare_tq4_codebook_dram(self, codebook_bf16: torch.Tensor) -> int:
+    def prepare_tq4_codebook_dram(self, codebook_bf16: torch.Tensor,
+                                  *, formats: Optional[TensorFormats] = None) -> int:
         """Stage a 16-entry TQ4 codebook in params DRAM.
 
         The hardware auto-loads the lowest 256 bits of URAM-B[0] into the TQ4
         codebook register on the rising edge of every DEQUANTIZE / DOT_PRODUCT
-        dma_start. Pad the 16 bf16 entries (32 bytes) up to a full 128-byte
-        URAM row so a single 64-element bf16 transfer copies them into place.
+        dma_start. Entries use ``formats.codebook``. Pad the 16 entries (32 bytes)
+        up to a full 128-byte URAM row so one 64-element transfer copies them into place.
         """
-        assert codebook_bf16.dtype == torch.bfloat16, "codebook must be bf16"
+        formats = self._resolve_tensor_formats(formats)
+        if codebook_bf16.dtype != formats.codebook.dtype:
+            raise TypeError(f"Codebook must use {formats.codebook.dtype}")
         assert codebook_bf16.numel() == 16, "TQ4 codebook must contain exactly 16 entries"
-        padded = torch.zeros(UE_VECTOR_SIZE, dtype=torch.bfloat16)
+        padded = torch.zeros(UE_VECTOR_SIZE, dtype=formats.codebook.dtype)
         padded[:16] = codebook_bf16.flatten()
         codebook_dram_addr = self.get_params_dram_addr()
-        self.dma_write(DMA_DEVICE_H2C, codebook_dram_addr,
+        self.dma_write(self.h2c_device, codebook_dram_addr,
                        padded.view(torch.uint16), UE_VECTOR_SIZE * 2)
         self.allocate_params_dram(UE_VECTOR_SIZE * 2)
         return codebook_dram_addr
@@ -6040,7 +6300,8 @@ class UnifiedEngine:
                             gpr_scale_addr: Optional[int] = None,
                             gpr_out_row_stride_reg: Optional[int] = None,
                             strip_cols: Optional[int] = None,
-                            strip_out_stride: Optional[int] = None) -> None:
+                            strip_out_stride: Optional[int] = None,
+                            *, formats: Optional[TensorFormats] = None) -> None:
         """Matrix multiply entrypoint; dispatches based on which dimensions are runtime registers:
 
         - any of ``gpr_M_reg`` / ``gpr_K_reg`` / ``gpr_N_reg`` provided: :meth:`matmat_mul_core_dynamic` —
@@ -6057,6 +6318,10 @@ class UnifiedEngine:
         **Layout:** ``A`` is **M×K** (row-major). ``B`` is **N×K** (row-major); the accelerator uses ``B`` as above and
         applies an implicit transpose so the computed result is **A @ Bᵀ**, i.e. **M×N**, without a separate transpose pass.
 
+        With softmax enabled, logits use ``formats.output`` by default (BF16).
+        Inputs, bias and final output retain ``formats``. Softmax stores EXP
+        output in FP16, then multiplies by the BF19 reciprocal of the BF19 sum.
+
         **Strided column write-back (dynamic path only):** ``strip_cols`` (W) and ``strip_out_stride`` (P, elements)
         run the matmul as N/W column strips of exactly W columns and write strip ``s`` to output columns
         ``s*P .. s*P+W-1`` instead of ``s*W``. One matmul over all heads of a projection then lands each
@@ -6064,6 +6329,7 @@ class UnifiedEngine:
         128-lane slot. ``gpr_out_row_stride_reg`` (elements) must be the full output row, ``(N/W)*P``.
         Weight / scale / bias are still read as consecutive N rows, so only the output addressing changes.
         """
+        formats = self._resolve_tensor_formats(formats)
         _addr_gprs = (gpr_a_addr, gpr_b_addr, gpr_out_addr, gpr_c_addr, gpr_scale_addr)
         if strip_cols is not None and gpr_M_reg is None and gpr_K_reg is None and gpr_N_reg is None:
             gpr_M_reg = self.alloc_isa_reg()                 # strip write-back needs the dynamic path
@@ -6097,6 +6363,7 @@ class UnifiedEngine:
                 gpr_out_row_stride_reg=gpr_out_row_stride_reg,
                 strip_cols=strip_cols, strip_out_stride=strip_out_stride,
                 _static_k_n=('K' in allocated and 'N' in allocated),
+                formats=formats,
             )
             for _ in allocated:
                 self.release_isa_reg()
@@ -6116,6 +6383,7 @@ class UnifiedEngine:
             clamp_min=clamp_min, clamp_max=clamp_max,
             debug_fmax=debug_fmax, ZERO_DRAM_ADDR=ZERO_DRAM_ADDR, FMAX_DRAM_ADDR=FMAX_DRAM_ADDR,
             write_back_disable=write_back_disable,
+            formats=formats,
         )
 
     # Activation name -> the matmat_mul_core epilogue flag it maps to. These are
@@ -6132,8 +6400,9 @@ class UnifiedEngine:
     def activation_core(self, M: int, N: int, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                         IDENTITY_DRAM_ADDR: int, activation: str,
                         clamp_min: float = 0.0, clamp_max: float = float("inf"),
-                        gpr_M_reg: int = None) -> None:
-        """Standalone activation over a bf16 buffer via the identity-matmul trick.
+                        gpr_M_reg: int = None,
+                        *, formats: Optional[TensorFormats] = None) -> None:
+        """Standalone activation over a typed buffer via the identity-matmul trick.
 
         The accelerator exposes its LALU activations (``gelu`` / ``silu`` /
         ``sigmoid`` / ``clamp`` / ``log`` / ``softmax``) only as fused epilogues on
@@ -6156,7 +6425,7 @@ class UnifiedEngine:
         real runtime row count sourced from ``gpr_M_reg`` when supplied; ``N`` is
         the tile/vector width and **must equal the identity matrix's dimension**
         (typically ``UE_VECTOR_SIZE``), so ``IDENTITY_DRAM_ADDR`` must point at an
-        N×N bf16 identity in DRAM. In-place is fine (``OUTPUT_DRAM_ADDR`` may equal
+        N×N identity in ``formats.b`` in DRAM. In-place is fine (``OUTPUT_DRAM_ADDR`` may equal
         ``A_DRAM_ADDR``). Returns the matmul FLOP count.
 
         Note on tiling: the pointwise activations (``clamp`` / ``gelu`` / ``silu`` /
@@ -6165,6 +6434,7 @@ class UnifiedEngine:
         N dimension — so it is only correct when ``N`` spans a full logical row, not
         a sub-row vector tile.
         """
+        formats = self._resolve_tensor_formats(formats)
         try:
             flag = self._ACTIVATION_FLAGS[activation]
         except KeyError:
@@ -6176,19 +6446,21 @@ class UnifiedEngine:
             A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=IDENTITY_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, is_B_quantized=False,
             clamp_min=clamp_min, clamp_max=clamp_max, gpr_M_reg=gpr_M_reg,
-            **{flag: True})
+            **{flag: True}, formats=formats)
 
     def matmat_mul_core_legacy(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, softmax_enable: bool = False, C_DRAM_ADDR: int = None, bias_mode: str = "broadcast_N",
                              is_B_quantized: bool = False, data_type: TYPE = None, SCALE_DRAM_ADDR: int = None, gelu_enable: bool = False, silu_enable: bool = False, sigmoid_enable: bool = False,
                              clamp_enable: bool = False, log_enable: bool = False,
                              clamp_min: float = 0.0, clamp_max: float = float("inf"),
                              debug_fmax: bool = False, ZERO_DRAM_ADDR: int = None, FMAX_DRAM_ADDR: int = None,
-                             write_back_disable: bool = False) -> None:
+                             write_back_disable: bool = False,
+                             *, formats: Optional[TensorFormats] = None) -> None:
         # Requirements: Based on these conditions M_chunk x K + M_chunk x N_chunk should fit in URAM_A and N_chunk x K should fit in URAM_B
         # 1. M_chunk can be any value between 1 and M
         # 2. N_chunk needs to be a multiple of UE_VECTOR_SIZE
         # 3. M_chunk * K + N_chunk * M_chunk must be less than or equal to URAM_FULL_ELEMENTS
 
+        formats = self._resolve_tensor_formats(formats)
         bytes_per_element = 2
         bias_enable = C_DRAM_ADDR is not None
 
@@ -6205,30 +6477,9 @@ class UnifiedEngine:
                 assert ZERO_DRAM_ADDR is not None, "ZERO_DRAM_ADDR must be provided when debug_fmax=True"
                 assert FMAX_DRAM_ADDR is not None, "FMAX_DRAM_ADDR must be provided when debug_fmax=True"
 
-        lalu_mode = LALU_MODE.BYPASS
-        lalu_a = 0
-        lalu_b = 0
-        if gelu_enable:
-            lalu_mode = LALU_MODE.ACT
-            lalu_a = LALU_ACT_GELU_A
-            lalu_b = LALU_ACT_GELU_B
-        elif silu_enable:
-            lalu_mode = LALU_MODE.ACT
-            lalu_a = LALU_ACT_SILU_A
-            lalu_b = LALU_ACT_SILU_B
-        elif sigmoid_enable:
-            lalu_mode = LALU_MODE.ACT_NO_X
-            lalu_a = LALU_ACT_SIGMOID_A
-            lalu_b = LALU_ACT_SIGMOID_B
-        elif clamp_enable:
-            lalu_mode = LALU_MODE.CLAMP
-            lalu_a = self.float_to_bf16(clamp_min)
-            lalu_b = self.float_to_bf16(clamp_max)
-        elif log_enable:
-            lalu_mode = LALU_MODE.LOG
-            lalu_a = (self.float_to_bf16(clamp_min)
-                      if clamp_min > 0 else LALU_LOG_A)
-            lalu_b = LALU_LOG_B
+        lalu_mode, lalu_a, lalu_b = self._matmul_activation(
+            gelu_enable, silu_enable, sigmoid_enable, clamp_enable, log_enable,
+            clamp_min, clamp_max, formats=formats)
 
         # Calculate N_chunk
         N_chunk = min(N, (URAM_NEAR_FULL_ELEMENTS // K) // UE_VECTOR_SIZE * UE_VECTOR_SIZE)
@@ -6292,7 +6543,7 @@ class UnifiedEngine:
                                                                   SCALE_INPUT_DRAM_ADDR=SCALE_DRAM_ADDR + ((j * K) // UE_VECTOR_SIZE) * bytes_per_element,
                                                                   data_type=data_type,
                                                                   output_sram_wb_addr=0x80000,
-                                                                  element_size=n_take * K)
+                                                                  element_size=n_take * K, formats=formats.with_formats(output=formats.b))
                 else:
                     self.accelerator_memory_to_sram(accelerator_dram_address=B_DRAM_ADDR + j * K * bytes_per_element,
                                                 sram_address=0x80000,
@@ -6323,7 +6574,8 @@ class UnifiedEngine:
                                                             bias_enable=bias_enable,
                                                             lalu_mode=lalu_mode,
                                                             lalu_a=lalu_a,
-                                                            lalu_b=lalu_b)
+                                                            lalu_b=lalu_b,
+                                                            formats=formats)
                     clear_en = 0
 
                 # generated matrix is m_take x n_take
@@ -6376,7 +6628,7 @@ class UnifiedEngine:
                             self.fmax_core(vector_sram_start_addr=zero_sram_addr,
                                         output_sram_wb_addr=zero_sram_addr,
                                         N=UE_VECTOR_SIZE,
-                                        fmax_context_addr=row_idx + m_take_chunk_idx)
+                                        fmax_context_addr=row_idx + m_take_chunk_idx, formats=formats.with_formats(a=formats.output))
                             self.sram_to_accelerator_memory(sram_address=zero_sram_addr,
                                                             accelerator_dram_address=FMAX_DRAM_ADDR + (i + row_idx + m_take_chunk_idx) * UE_VECTOR_SIZE * bytes_per_element,
                                                             element_size=UE_VECTOR_SIZE)
@@ -6384,7 +6636,7 @@ class UnifiedEngine:
                         self.start_queue_for_bf16_softmax_operation(fmax_context_addr=row_idx + m_take_chunk_idx,
                                                                 vector_sram_start_addr=input_sram_start_addr + row_idx * N * bytes_per_element,
                                                                 output_sram_wb_addr=output_sram_wb_addr + row_idx * N * bytes_per_element,
-                                                                N=N)
+                                                                N=N, formats=formats.with_formats(a=formats.output))
 
                     self.sram_to_accelerator_memory(sram_address=output_sram_wb_addr,
                                                 accelerator_dram_address=start_dram_address_of_partial_row_complete_matrix,
@@ -6430,7 +6682,8 @@ class UnifiedEngine:
                                 gpr_out_row_stride_reg: Optional[int] = None,
                                 strip_cols: Optional[int] = None,
                                 strip_out_stride: Optional[int] = None, *,
-                                _static_k_n: bool = False) -> int:
+                                _static_k_n: bool = False,
+                                formats: Optional[TensorFormats] = None) -> int:
         """
         Fully dynamic M/K/N matmul captured as an ISA program (A @ Bᵀ -> M×N).
 
@@ -6463,6 +6716,7 @@ class UnifiedEngine:
         lines. Runtime K/N, runtime output row strides, and padded output rows retain the
         per-row DMA loop.
         """
+        formats = self._resolve_tensor_formats(formats)
         bytes_per_element = 2
         bias_enable = C_DRAM_ADDR is not None
 
@@ -6478,22 +6732,9 @@ class UnifiedEngine:
         if softmax_enable:
             assert N % UE_VECTOR_SIZE == 0, f"softmax requires N % {UE_VECTOR_SIZE} == 0, got N={N}"
 
-        lalu_mode = LALU_MODE.BYPASS
-        lalu_a = 0
-        lalu_b = 0
-        if gelu_enable:
-            lalu_mode, lalu_a, lalu_b = LALU_MODE.ACT, LALU_ACT_GELU_A, LALU_ACT_GELU_B
-        elif silu_enable:
-            lalu_mode, lalu_a, lalu_b = LALU_MODE.ACT, LALU_ACT_SILU_A, LALU_ACT_SILU_B
-        elif sigmoid_enable:
-            lalu_mode, lalu_a, lalu_b = LALU_MODE.ACT_NO_X, LALU_ACT_SIGMOID_A, LALU_ACT_SIGMOID_B
-        elif clamp_enable:
-            lalu_mode, lalu_a, lalu_b = LALU_MODE.CLAMP, self.float_to_bf16(clamp_min), self.float_to_bf16(clamp_max)
-        elif log_enable:
-            lalu_mode, lalu_a, lalu_b = (
-                LALU_MODE.LOG,
-                self.float_to_bf16(clamp_min) if clamp_min > 0 else LALU_LOG_A,
-                LALU_LOG_B)
+        lalu_mode, lalu_a, lalu_b = self._matmul_activation(
+            gelu_enable, silu_enable, sigmoid_enable, clamp_enable, log_enable,
+            clamp_min, clamp_max, formats=formats)
 
         assert (gpr_M_reg is not None and gpr_K_reg is not None and gpr_N_reg is not None), "Dynamic requires gpr inputs of m n k dims!"
 
@@ -6818,7 +7059,7 @@ class UnifiedEngine:
                 inst_pointer_idx=ptr_sm_exp)
             self.generate_instruction_pbi_init(
                 dram_shared_addr=0, uram_wb_addr=URAM_B_ROW0,
-                lalu_scalar=self.float_to_bf19(1.0), inst_pointer_idx=ptr_sm_mul)
+                inst_pointer_idx=ptr_sm_mul)
             self.generate_instruction_pbi_init(dram_shared_addr=OUTPUT_DRAM_ADDR, inst_pointer_idx=ptr_sm_wb)
 
         # ===== Phase 3: M while-loop body ===================================
@@ -6856,7 +7097,7 @@ class UnifiedEngine:
         self.generate_instruction_add_reg(a_dram_reg, a_dram_reg, s1)
 
         # clear all fmax contexts for this M tile, set dot uram_length = K_rows
-        self.generate_instruction_clear_fmax()
+        self.generate_instruction_clear_fmax( formats=formats)
         self.generate_instruction_pbi_inc(general_reg_src=K_rows_reg, pbi_field_select=PBI_FIELD.URAM_ROW_SIZE, inst_pointer_idx=ptr_dot)
 
         # ---- N while-loop init (reset each M tile) ----
@@ -6897,7 +7138,7 @@ class UnifiedEngine:
                 uram_write_src=URAM_WRITE_SRC.URAM_WRITE_BACK.value,
                 mode=UE_MODE.DEQUANTIZE, data_type=data_type.value,
                 uram_a_start_addr=0, uram_b_start_addr=0, uram_length=0, dma_start_addr=0,
-                dma_length=0, output_size=0, inst_pointer_idx=ptr_B_quant)
+                dma_length=0, output_size=0, inst_pointer_idx=ptr_B_quant, formats=formats.with_formats(output=formats.b))
             # Advance scale cursor: n_take * K_rows * 2 bytes / 8 = n_take * K_rows / 4 words
             self.generate_instruction_mul32_shr_reg(s1, n_take_reg, K_rows_reg, 2)
             self.generate_instruction_add_reg(scale_dram_reg, scale_dram_reg, s1)
@@ -6961,9 +7202,10 @@ class UnifiedEngine:
         self.ue_arithmetic_op(
             broadcast_mode=0, max_clear_en=0, stride_z=1, lalu_a=lalu_a, lalu_b=lalu_b, lalu_mode=lalu_mode.value,
             scalar=0, uram_section=URAM_SECTION.URAM_A.value, uram_dst_addr=0, uram_wb_addr=0,
-            uram_write_src=URAM_WRITE_SRC.URAM_WRITE_BACK.value, mode=UE_MODE.BF16_DOT_PRODUCT, data_type=0,
+            uram_write_src=URAM_WRITE_SRC.URAM_WRITE_BACK.value, mode=UE_MODE.BF16_DOT_PRODUCT,
+            data_type=0,
             uram_a_start_addr=0, uram_b_start_addr=0, uram_length=0, dma_start_addr=0, dma_length=0,
-            output_size=0, bias_adder_en=(1 if bias_enable else 0), fmax_context_addr=0, inst_pointer_idx=ptr_dot)
+            output_size=0, bias_adder_en=(1 if bias_enable else 0), fmax_context_addr=0, inst_pointer_idx=ptr_dot, formats=formats)
         self.generate_instruction_add_reg(s2, s2, K_rows_reg)   # uram_a_cur += K_rows
         self.generate_instruction_add_reg(s3, s3, s4)           # uram_wb_cur += n_take_rows
         if bias_enable and bias_mode == "full_matrix":
@@ -7048,7 +7290,8 @@ class UnifiedEngine:
             self.generate_instruction_pbi_inc(general_reg_src=s4, pbi_field_select=PBI_FIELD.URAM_ROW_SIZE, inst_pointer_idx=ptr_sm_exp)
             self.generate_instruction_pbi_inc(general_reg_src=s4, pbi_field_select=PBI_FIELD.URAM_ROW_SIZE, inst_pointer_idx=ptr_sm_mul)
 
-            # 2. per-row EXP+RECIP (BCAST_FMAX_NEGATE) -> URAM_A, then MUL_BROADCAST (BCAST_LALU_RESULT) -> URAM_B
+            # 2. Store EXP as FP16 in URAM_A and retain the BF19 sum reciprocal;
+            # normalize with MUL_BROADCAST into the requested URAM_B format.
             self.generate_instruction_add_set(row_idx_reg, 0)        # row_idx (fmax context)
             self.generate_instruction_add_set(s2, 0)        # URAM row cursor
             sm_body = self.capture_count
@@ -7061,7 +7304,8 @@ class UnifiedEngine:
                 uram_section=URAM_SECTION.URAM_A.value, uram_dst_addr=0, uram_wb_addr=0,
                 uram_write_src=URAM_WRITE_SRC.URAM_WRITE_BACK.value, mode=UE_MODE.EXP, data_type=0,
                 uram_a_start_addr=0, uram_b_start_addr=0, uram_length=0, dma_start_addr=0, dma_length=0,
-                output_size=0, fmax_context_addr=0, inst_pointer_idx=ptr_sm_exp)
+                output_size=0, fmax_context_addr=0, inst_pointer_idx=ptr_sm_exp,
+                formats=formats.with_formats(a=formats.output, output=StorageFormat.FP16))
             self.generate_instruction_pbi_inc(general_reg_src=s2, pbi_field_select=PBI_FIELD.URAM_START_ADDR_Y, inst_pointer_idx=ptr_sm_mul)
             self.generate_instruction_pbi_inc(general_reg_src=s2, pbi_field_select=PBI_FIELD.URAM_WRITEB_ADDR, inst_pointer_idx=ptr_sm_mul)
             self.ue_arithmetic_op(
@@ -7070,7 +7314,8 @@ class UnifiedEngine:
                 uram_section=URAM_SECTION.URAM_B.value, uram_dst_addr=0, uram_wb_addr=0,
                 uram_write_src=URAM_WRITE_SRC.URAM_WRITE_BACK.value, mode=UE_MODE.MUL_BROADCAST, data_type=0,
                 uram_a_start_addr=0, uram_b_start_addr=0, uram_length=0, dma_start_addr=0, dma_length=0,
-                output_size=0, fmax_context_addr=0, inst_pointer_idx=ptr_sm_mul)
+                output_size=0, inst_pointer_idx=ptr_sm_mul,
+                formats=formats.with_formats(a=StorageFormat.FP16))
             self.generate_instruction_add_reg(s2, s2, s4)   # cursor += N_chunks
             self.generate_instruction_add_inc(row_idx_reg)           # row_idx++
             sm_loop_sz = self.capture_count - sm_body + 2
@@ -7078,7 +7323,7 @@ class UnifiedEngine:
             self.generate_instruction_jump_rela_jnz(sm_loop_sz, m_take_reg)
             self.generate_instruction_add_imm(src_reg_idx=m_tile_rows_reg, immediate_value=0, dst_reg_idx=m_take_reg)
 
-            # 3. writeback URAM_B -> DRAM as ONE contiguous DMA. The softmax MUL_BROADCAST laid the
+            # 3. writeback URAM_B -> DRAM as ONE contiguous DMA. Normalization laid the
             # m_take output rows out contiguously in URAM_B (cursor += N_chunks per row from row 0),
             # and they map to the contiguous DRAM block [OUT_BASE_W + rows_done*N/4 .. +m_take*N/4).
             # ptr_sm_wb was pbi_init'd with URAM_START_ADDR_Y/Z = 0 and is touched nowhere else, so the
@@ -7157,12 +7402,14 @@ class UnifiedEngine:
                              log_enable: bool = False,
                              m_engine0: int = None,
                              wait_timeout_seconds: float = 10.0,
-                             dynamic: bool = False) -> int:
+                             dynamic: bool = False,
+                             *, formats: Optional[TensorFormats] = None) -> int:
         """
         Run one matmul on two engines in parallel by sharding rows of A along M.
 
         ue0 computes top rows, ue1 computes bottom rows. Both engines use the
         same B matrix. Output is written contiguously to OUTPUT_DRAM_ADDR.
+        ``formats`` applies to the shared inputs and output of both shards.
 
         Returns:
             Total theoretical FLOPs of the combined two-engine workload.
@@ -7224,6 +7471,7 @@ class UnifiedEngine:
             gpr_M_reg=m_reg0,
             gpr_K_reg=k_reg0,
             gpr_N_reg=n_reg0,
+            formats=formats,
         )
         ue0.generate_instruction_flag_set()
         ue0.generate_instruction_halt()
@@ -7264,6 +7512,7 @@ class UnifiedEngine:
             gpr_M_reg=m_reg1,
             gpr_K_reg=k_reg1,
             gpr_N_reg=n_reg1,
+            formats=formats,
         )
         ue1.generate_instruction_flag_check(target_engine_idx=0)
         ue1.generate_instruction_halt()
@@ -7307,7 +7556,8 @@ class UnifiedEngine:
                                log_enable: bool = False,
                                m_shards=None,
                                wait_timeout_seconds: float = 10.0,
-                               dynamic: bool = False) -> int:
+                               dynamic: bool = False,
+                               *, formats: Optional[TensorFormats] = None) -> int:
         """
         Run one matmul on len(ues) engines in parallel by sharding rows of A
         along M. Generalization of matmat_mul_two_cores to any engine count.
@@ -7318,6 +7568,7 @@ class UnifiedEngine:
         OUTPUT_DRAM_ADDR. Engines 0..n-2 flag_set when done; the last engine
         flag_checks every other engine after its own matmul, so waiting on the
         last engine's queue guarantees all shards have completed.
+        ``formats`` applies to the shared inputs and output of every shard.
 
         Returns:
             Total theoretical FLOPs of the combined multi-engine workload.
@@ -7383,6 +7634,7 @@ class UnifiedEngine:
                 gpr_M_reg=m_reg,
                 gpr_K_reg=k_reg,
                 gpr_N_reg=n_reg,
+                formats=formats,
             )
             if not is_last:
                 ue.generate_instruction_flag_set()
@@ -7410,7 +7662,8 @@ class UnifiedEngine:
         print(f"Total Theoretical FLOPS ({num_engines} cores): {total_flops / 1e9:.6f} G")
         return total_flops
 
-    def fmax_core(self, vector_sram_start_addr: int, output_sram_wb_addr: int, N: int, fmax_context_addr: int = 0) -> None:
+    def fmax_core(self, vector_sram_start_addr: int, output_sram_wb_addr: int, N: int, fmax_context_addr: int = 0,
+                  *, formats: Optional[TensorFormats] = None) -> None:
         """get's the fmax from the fmax_context_addr and stores it in the output_sram_wb_addr.
 
         Uses ADD_BROADCAST with FMAX_NEGATE broadcast mode to subtract the tracked
@@ -7423,6 +7676,7 @@ class UnifiedEngine:
             N: number of elements
             fmax_context_addr: fmax context slot (0-63) populated by a prior dot product (default: 0)
         """
+        formats = self._resolve_tensor_formats(formats)
         vector_uram_type, vector_uram_start_addr = self.sram_address_to_uram_address(vector_sram_start_addr)
         assert vector_uram_type == URAM_SECTION.URAM_A, f"vector_sram_start_addr must be in URAM_A, got {hex(vector_sram_start_addr)}"
 
@@ -7450,17 +7704,20 @@ class UnifiedEngine:
             0,  # dma_start_addr
             0,  # dma_length
             0,  # output_size
-            fmax_context_addr=fmax_context_addr
+            fmax_context_addr=fmax_context_addr,
+            formats=formats,
         )
 
     def bf16_transpose_core(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None, gpr_M_reg: int = None, gpr_N_reg: int = None,
                             gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None, gpr_identity_addr: Optional[int] = None,
-                            gpr_out_row_stride_reg: Optional[int] = None) -> None:
+                            gpr_out_row_stride_reg: Optional[int] = None,
+                            *, formats: Optional[TensorFormats] = None) -> None:
         """Transpose ``M×N`` → ``N×M``. Dispatches to :meth:`bf16_transpose_core_dynamic` when any ``gpr_*`` is set, else :meth:`bf16_transpose_core_legacy`.
 
         ``gpr_input_addr`` / ``gpr_out_addr`` / ``gpr_identity_addr`` (dynamic path only) optionally
         source the X / Y / identity-matrix DRAM bases from GPRs (word addr). See
         :meth:`bf16_transpose_core_dynamic`."""
+        formats = self._resolve_tensor_formats(formats)
         if any(r is not None for r in (gpr_M_reg, gpr_N_reg, gpr_input_addr,
                                        gpr_out_addr, gpr_identity_addr)):
             seeded_regs = []
@@ -7471,13 +7728,14 @@ class UnifiedEngine:
                 M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR,
                 gpr_M_reg, gpr_N_reg, gpr_input_addr=gpr_input_addr,
                 gpr_out_addr=gpr_out_addr, gpr_identity_addr=gpr_identity_addr,
-                gpr_out_row_stride_reg=gpr_out_row_stride_reg)
+                gpr_out_row_stride_reg=gpr_out_row_stride_reg, formats=formats)
             for _ in seeded_regs:
                 self.release_isa_reg()
             return result
-        return self.bf16_transpose_core_legacy(M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR)
+        return self.bf16_transpose_core_legacy(M, N, INPUT_DRAM_ADDR, OUTPUT_DRAM_ADDR, IDENTITY_DRAM_ADDR, formats=formats)
 
-    def bf16_transpose_core_legacy(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None) -> None:
+    def bf16_transpose_core_legacy(self, M: int, N: int, INPUT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, IDENTITY_DRAM_ADDR: int = None,
+                                   *, formats: Optional[TensorFormats] = None) -> None:
         """
         Transposes a (M x N) input matrix X to produce an (N x M) output matrix Y = X^T.
 
@@ -7485,6 +7743,7 @@ class UnifiedEngine:
         Y[j, :] = e_j^T @ X = X[:, j] via bf16 matvec with a one-hot vector.
         Processes N in column blocks of UE_VECTOR_SIZE width.
         """
+        formats = self._resolve_tensor_formats(formats)
         bytes_per_element = 2
         # Allocate identity matrix of size UE_VECTOR_SIZE x UE_VECTOR_SIZE in URAM_A start
         identity_matrix_sram_start_addr = 0x00000
@@ -7493,9 +7752,9 @@ class UnifiedEngine:
         else:
             identity_matrix_dram_addr = self.get_params_dram_addr()
             self.allocate_params_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
-            self.dma_write(DMA_DEVICE_H2C, identity_matrix_dram_addr, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16), UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
+            self.dma_write(self.h2c_device, identity_matrix_dram_addr, torch.eye(UE_VECTOR_SIZE, dtype=formats.b.dtype), UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
 
-        identity_tensor = torch.eye(N, dtype=torch.bfloat16)
+        identity_tensor = torch.eye(N, dtype=formats.b.dtype)
 
         # transfer identity matrix to URAM_A start
         self.accelerator_memory_to_sram(accelerator_dram_address=identity_matrix_dram_addr,
@@ -7550,7 +7809,7 @@ class UnifiedEngine:
                                                                 output_sram_wb_addr=output_sram_wb_addr + out_sram_offset,
                                                                 K=UE_VECTOR_SIZE,
                                                                 N=m_take,
-                                                                stride_z=N)
+                                                                stride_z=N, formats=formats.with_formats(a=formats.b, b=formats.a))
 
                 start_dram_address_of_partial_matrix = OUTPUT_DRAM_ADDR + i * M * bytes_per_element + j * bytes_per_element
 
@@ -7574,7 +7833,8 @@ class UnifiedEngine:
                                     gpr_M_reg: int = None, gpr_N_reg: int = None,
                                     gpr_input_addr: Optional[int] = None, gpr_out_addr: Optional[int] = None,
                                     gpr_identity_addr: Optional[int] = None,
-                                    gpr_out_row_stride_reg: Optional[int] = None) -> None:
+                                    gpr_out_row_stride_reg: Optional[int] = None,
+                                    *, formats: Optional[TensorFormats] = None) -> None:
         """
         Transpose an (M x N) input matrix X into an (N x M) output Y = X^T, captured as a
         single replayable ISA program with **runtime (dynamic) M and N**.
@@ -7613,6 +7873,7 @@ class UnifiedEngine:
         identity vector in URAM_A) and ``URAM_START_ADDR_Z`` backs ``uram_b_start_addr``
         (the data in URAM_B) — there is no ``_X`` field.
         """
+        formats = self._resolve_tensor_formats(formats)
         bytes_per_element = 2
 
         assert gpr_M_reg is not None, "bf16_transpose_core_dynamic requires gpr_M_reg (dynamic M)."
@@ -7676,7 +7937,7 @@ class UnifiedEngine:
         else:
             identity_matrix_dram_addr = self.get_params_dram_addr()
             self.allocate_params_dram(UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
-            self.dma_write(DMA_DEVICE_H2C, identity_matrix_dram_addr, torch.eye(UE_VECTOR_SIZE, dtype=torch.bfloat16), UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
+            self.dma_write(self.h2c_device, identity_matrix_dram_addr, torch.eye(UE_VECTOR_SIZE, dtype=formats.b.dtype), UE_VECTOR_SIZE * UE_VECTOR_SIZE * bytes_per_element)
 
         # gpr_identity_addr (optional): source the identity-matrix DRAM base from a runtime GPR
         # (word addr) via the REG_REWRITE path instead of the literal, so a single captured program
@@ -7834,7 +8095,7 @@ class UnifiedEngine:
             uram_dst_addr=0, uram_wb_addr=0, uram_write_src=URAM_WRITE_SRC.URAM_WRITE_BACK.value,
             mode=UE_MODE.BF16_DOT_PRODUCT, data_type=0, uram_a_start_addr=0, uram_b_start_addr=0,
             uram_length=0, dma_start_addr=0, dma_length=0, output_size=0, bias_adder_en=0,
-            fmax_context_addr=0, inst_pointer_idx=ptr_dot)
+            fmax_context_addr=0, inst_pointer_idx=ptr_dot, formats=formats.with_formats(a=formats.b, b=formats.a))
         # advance identity row (+1) and buffer write cursor (+m_rows)
         self.generate_instruction_pbi_inc(uram_a_start_addr=1, inst_pointer_idx=ptr_dot)
         self.generate_instruction_add_reg(wb_cursor_reg, wb_cursor_reg, m_rows_reg)
@@ -7990,7 +8251,8 @@ class UnifiedEngine:
                       C: int = 3, H: int = 384, W: int = 384,
                       patch_h: int = 4, patch_w: int = 4,
                       K: int = 1024, N: int = 64,
-                      data_type: 'TYPE' = None) -> int:
+                      data_type: 'TYPE' = None,
+                      *, formats: Optional[TensorFormats] = None) -> int:
         """
         Patching core: extracts (patch_h x patch_w x C) patches from a (C, H, W) image
         and projects each patch through quantized weight matrices.
@@ -8008,8 +8270,8 @@ class UnifiedEngine:
           URAM_A[HALFWAY..]:       output rows for one patch group
 
         Args:
-            INPUT_DRAM_ADDR: DRAM address of input image (C x H x W, bf16, CHW layout)
-            OUTPUT_DRAM_ADDR: DRAM address for output (n_patches_h * n_patches_w, N, bf16)
+            INPUT_DRAM_ADDR: DRAM address of input image (C x H x W, formats.a, CHW layout)
+            OUTPUT_DRAM_ADDR: DRAM address for output (n_patches_h * n_patches_w, N, formats.output)
             matrix_dram_addrs: list of DRAM addresses for quantized weight matrices
             scale_dram_addrs: list of DRAM addresses for weight scales
             C, H, W: image dimensions
@@ -8017,11 +8279,12 @@ class UnifiedEngine:
             K: weight inner dimension (= C * patch_h * UE_VECTOR_SIZE)
             N: output dimension per patch
             data_type: quantization type (TYPE.IF4 or TYPE.IF8). The INT vs FP
-                variant is selected per-block by the sign of the bf16 scale.
+                variant is selected per-block by the sign of the formats.scale value.
 
         Returns:
             total_flops
         """
+        formats = self._resolve_tensor_formats(formats)
         if data_type is None:
             data_type = TYPE.IF4
 
@@ -8099,7 +8362,8 @@ class UnifiedEngine:
                             dram_addr,
                             chunk_dma_bytes,
                             N_chunk,
-                            0  # no bias
+                            0,  # no bias
+                            formats=formats,
                         )
 
                         scale_addr += chunk_scale_bytes
@@ -8144,8 +8408,16 @@ class UnifiedEngine:
         q_scale: float = None,
         q_pre_scaled: bool = False,
         pv_head_dim: int = None,
+        *, formats: Optional[TensorFormats] = None, v_format=None, scratch_format=None, identity_format=None,
     ) -> int:
         """Scaled dot-product attention with explicit batch and aligned KV length.
+
+        ``scratch_format`` defaults to FP16 for stored logits and probabilities,
+        independently of the input and final output formats (BF16 by default).
+        V transpose retains its input format. Emitted Q scaling also stores FP16
+        when scratch is FP16; BF16 scratch retains Q's input storage format.
+        Pass ``scratch_format=StorageFormat.BF16`` for BF16 logits/probabilities.
+        Softmax exponentials are stored in FP16 for either scratch format.
 
         ``pv_head_dim`` (dynamic path only; see unified_attention_core_dynamic's
         docstring): unpadded output width for the final P @ V matmul alone.
@@ -8159,12 +8431,13 @@ class UnifiedEngine:
         passes ``q_scale=1.0`` for no additional rescale). A runtime
         ``gpr_scale_reg`` still overrides this baked scalar on the dynamic path.
         ``q_pre_scaled=True`` skips the Q multiply entirely when the caller has
-        already applied the same scalar after RoPE.
+        already applied the same scalar after RoPE. Q is then read directly
+        in ``formats.a``.
 
         Runtime-``head_dim`` extension (all optional, dynamic path only):
           * ``gpr_head_dim_reg`` — head_dim as a runtime register (drives the score/PV matmul K/N and,
             with ``gpr_scratch_addr``, the scratch sub-offsets).
-          * ``gpr_scale_reg``    — bf16 bit-pattern of the Q pre-scale (``1/sqrt(head_dim)``), primed
+          * ``gpr_scale_reg``    — ``formats.scalar`` bit-pattern of the Q pre-scale (``1/sqrt(head_dim)``), primed
             by the host at runtime (the ISA has no on-device rsqrt); fed to the scaled-Q broadcast via
             the field-11 ``lalu_scalar`` override. ``None`` → baked ``1/sqrt(head_dim)`` scalar.
           * ``gpr_scratch_addr`` / ``gpr_identity_addr`` — runtime SCRATCH / IDENTITY base overrides
@@ -8207,6 +8480,8 @@ class UnifiedEngine:
                 IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
                 q_scale=q_scale,
                 q_pre_scaled=q_pre_scaled,
+                formats=formats,
+                v_format=v_format, scratch_format=scratch_format, identity_format=identity_format,
             )
         if any(g is not None for g in _addr_gprs) and (gpr_batch_reg is None or gpr_aligned_seq_len_reg is None):
             raise ValueError("unified_attention_core: gpr_*_addr require both gpr_batch_reg and gpr_aligned_seq_len_reg")
@@ -8235,6 +8510,8 @@ class UnifiedEngine:
             q_scale=q_scale,
             q_pre_scaled=q_pre_scaled,
             pv_head_dim=pv_head_dim,
+            formats=formats,
+            v_format=v_format, scratch_format=scratch_format, identity_format=identity_format,
         )
 
     def unified_attention_core_legacy(
@@ -8251,7 +8528,15 @@ class UnifiedEngine:
         IDENTITY_DRAM_ADDR: int = None,
         q_scale: float = None,
         q_pre_scaled: bool = False,
+        *, formats: Optional[TensorFormats] = None, v_format=None, scratch_format=None, identity_format=None,
     ) -> int:
+        """Compile static attention with FP16 logits/probabilities by default.
+
+        ``scratch_format=StorageFormat.BF16`` selects BF16 logits/probabilities; input
+        and output ownership follows :meth:`unified_attention_core`.
+        """
+        formats, v_format, scratch_format, identity_format, scaled_q_format = self._resolve_attention_formats(
+            formats, v_format, scratch_format, identity_format, q_pre_scaled)
         bytes_per_element = 2
         if batch <= 0 or aligned_seq_len <= 0 or head_dim <= 0:
             raise ValueError(f"unified_attention_core_legacy: invalid dims batch={batch}, aligned_seq_len={aligned_seq_len}, head_dim={head_dim}")
@@ -8270,6 +8555,7 @@ class UnifiedEngine:
             INPUT_DRAM_ADDR=V_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=v_t_dram_addr,
             IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
+            formats=formats.with_formats(a=v_format, b=identity_format, output=v_format),
         )
         if q_pre_scaled:
             total_flops = 0
@@ -8282,6 +8568,7 @@ class UnifiedEngine:
                 dram_out=scaled_q_dram_addr,
                 mode=UE_MODE.MUL_BROADCAST,
                 scalar=(q_scale if q_scale is not None else 1.0 / math.sqrt(head_dim)),
+                formats=formats.with_formats(output=scaled_q_format),
             )
         score_q_dram_addr = Q_DRAM_ADDR if q_pre_scaled else scaled_q_dram_addr
         total_flops += self.matmat_mul_core(
@@ -8294,6 +8581,7 @@ class UnifiedEngine:
             softmax_enable=True,
             C_DRAM_ADDR=BIAS_DRAM_ADDR,
             bias_mode="full_matrix",
+            formats=formats.with_formats(a=scaled_q_format, output=scratch_format),
         )
         total_flops += self.matmat_mul_core(
             M=batch,
@@ -8302,6 +8590,7 @@ class UnifiedEngine:
             A_DRAM_ADDR=score_dram_addr,
             B_DRAM_ADDR=v_t_dram_addr,
             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
+            formats=formats.with_formats(a=scratch_format, b=v_format),
         )
         print(f"unified_attention_core_legacy: batch={batch}, aligned_seq_len={aligned_seq_len}, head_dim={head_dim}, FLOPS={total_flops / 1e9:.6f} G")
         return total_flops
@@ -8333,8 +8622,14 @@ class UnifiedEngine:
         q_pre_scaled: bool = False,
         V_T_DRAM_ADDR: int = None,
         pv_head_dim: int = None,
+        *, formats: Optional[TensorFormats] = None, v_format=None, scratch_format=None, identity_format=None,
     ) -> int:
-        """``V_T_DRAM_ADDR`` (optional, static-address path only): DRAM address of an
+        """Compile runtime attention with FP16 logits/probabilities by default.
+
+        ``scratch_format=StorageFormat.BF16`` selects BF16 logits/probabilities; input
+        and output ownership follows :meth:`unified_attention_core`.
+
+        ``V_T_DRAM_ADDR`` (optional, static-address path only): DRAM address of an
         ALREADY-TRANSPOSED V, laid out ``[head_dim, aligned_seq_len]`` row-major --
         exactly what this core's own ``bf16_transpose_core`` step writes into the
         head of ``SCRATCH_DRAM_ADDR``. When given, that transpose is SKIPPED and the
@@ -8362,6 +8657,8 @@ class UnifiedEngine:
         the same one-time zero-init this session already added for VIS_QK/
         VIS_V's own pad lanes).
         """
+        formats, v_format, scratch_format, identity_format, scaled_q_format = self._resolve_attention_formats(
+            formats, v_format, scratch_format, identity_format, q_pre_scaled)
         pv_n = head_dim if pv_head_dim is None else pv_head_dim
         if pv_n > head_dim:
             raise ValueError(
@@ -8431,6 +8728,7 @@ class UnifiedEngine:
                 gpr_input_addr=gpr_v_addr,
                 gpr_out_addr=v_t_reg,
                 gpr_identity_addr=gpr_identity_addr,
+                formats=formats.with_formats(a=v_format, b=identity_format, output=v_format),
             )
         if q_pre_scaled:
             total_flops = 0
@@ -8448,6 +8746,7 @@ class UnifiedEngine:
                 gpr_a_addr=gpr_q_addr,
                 gpr_out_addr=scaled_q_reg,
                 gpr_scalar_reg=gpr_scale_reg,   # runtime scale override (host-primed); None -> baked scalar
+                formats=formats.with_formats(output=scaled_q_format),
             )
         score_q_dram_addr = Q_DRAM_ADDR if q_pre_scaled else scaled_q_dram_addr
         score_q_reg = gpr_q_addr if q_pre_scaled else scaled_q_reg
@@ -8468,6 +8767,7 @@ class UnifiedEngine:
             gpr_b_addr=gpr_k_addr,
             gpr_out_addr=score_reg,
             gpr_c_addr=gpr_bias_addr,
+            formats=formats.with_formats(a=scaled_q_format, output=scratch_format),
         )
         total_flops += self.matmat_mul_core(
             M=batch,
@@ -8497,6 +8797,7 @@ class UnifiedEngine:
             gpr_a_addr=score_reg,
             gpr_b_addr=v_t_reg,
             gpr_out_addr=gpr_out_addr,
+            formats=formats.with_formats(a=scratch_format, b=v_format),
         )
         for _ in allocated_regs:
             self.release_isa_reg()
@@ -8509,7 +8810,8 @@ class UnifiedEngine:
                               gpr_out_addr: Optional[int] = None, gpr_scale_addr: Optional[int] = None,
                               gpr_c_addr: Optional[int] = None, *,
                               clamp_min: float = 0.0,
-                              clamp_max: float = float("inf")) -> None:
+                              clamp_max: float = float("inf"),
+                              formats: Optional[TensorFormats] = None) -> None:
         """Quantized matrix-matrix multiplication core (1-pass streaming quantized dot).
 
         Dispatches on whether runtime-dimension GPRs are supplied:
@@ -8552,6 +8854,7 @@ class UnifiedEngine:
                 :meth:`quantized_matmat_core_dynamic`. ``gpr_c_addr`` requires a bias
                 (``C_DRAM_ADDR``) and a dimension GPR.
         """
+        formats = self._resolve_tensor_formats(formats)
         _addr_gprs = (gpr_a_addr, gpr_b_addr, gpr_out_addr, gpr_scale_addr, gpr_c_addr)
         if gpr_M_reg is not None or gpr_K_reg is not None or gpr_N_reg is not None:
             allocated = []
@@ -8571,6 +8874,7 @@ class UnifiedEngine:
                 data_type=data_type, gelu_enable=gelu_enable, silu_enable=silu_enable, sigmoid_enable=sigmoid_enable,
                 clamp_enable=clamp_enable, log_enable=log_enable, write_back_disable=write_back_disable,
                 clamp_min=clamp_min, clamp_max=clamp_max,
+                formats=formats,
             )
             for _ in allocated:
                 self.release_isa_reg()
@@ -8584,6 +8888,7 @@ class UnifiedEngine:
             gelu_enable=gelu_enable, silu_enable=silu_enable, sigmoid_enable=sigmoid_enable,
             clamp_enable=clamp_enable, log_enable=log_enable, write_back_disable=write_back_disable,
             clamp_min=clamp_min, clamp_max=clamp_max,
+            formats=formats,
         )
 
     def quantized_matmat_core_legacy(self, M: int, K: int, N: int, A_DRAM_ADDR: int, B_DRAM_ADDR: int,
@@ -8593,7 +8898,8 @@ class UnifiedEngine:
                                      sigmoid_enable: bool = False, clamp_enable: bool = False,
                                      log_enable: bool = False, write_back_disable: bool = False, *,
                                      clamp_min: float = 0.0,
-                                     clamp_max: float = float("inf")) -> int:
+                                     clamp_max: float = float("inf"),
+                                     formats: Optional[TensorFormats] = None) -> int:
         """Compile-time-tiled static quantized matmul (A @ Bᵀ), 1-pass streaming quantized dot.
 
         The default (no runtime-dimension GPRs) path of :meth:`quantized_matmat_core`.
@@ -8607,6 +8913,7 @@ class UnifiedEngine:
         :meth:`quantized_matmat_core_dynamic`; defaults preserve ReLU and the
         historical 1e-3 log floor.
         """
+        formats = self._resolve_tensor_formats(formats)
         bytes_per_element = 2
 
         bias_enable = False
@@ -8621,30 +8928,9 @@ class UnifiedEngine:
 
         assert sum([gelu_enable, silu_enable, sigmoid_enable, clamp_enable, log_enable]) <= 1, "only one activation can be True"
 
-        lalu_mode = LALU_MODE.BYPASS
-        lalu_a = 0
-        lalu_b = 0
-        if gelu_enable:
-            lalu_mode = LALU_MODE.ACT
-            lalu_a = LALU_ACT_GELU_A
-            lalu_b = LALU_ACT_GELU_B
-        elif silu_enable:
-            lalu_mode = LALU_MODE.ACT
-            lalu_a = LALU_ACT_SILU_A
-            lalu_b = LALU_ACT_SILU_B
-        elif sigmoid_enable:
-            lalu_mode = LALU_MODE.ACT_NO_X
-            lalu_a = LALU_ACT_SIGMOID_A
-            lalu_b = LALU_ACT_SIGMOID_B
-        elif clamp_enable:
-            lalu_mode = LALU_MODE.CLAMP
-            lalu_a = self.float_to_bf16(clamp_min)
-            lalu_b = self.float_to_bf16(clamp_max)
-        elif log_enable:
-            lalu_mode = LALU_MODE.LOG
-            lalu_a = (self.float_to_bf16(clamp_min)
-                      if clamp_min > 0 else LALU_LOG_A)
-            lalu_b = LALU_LOG_B
+        lalu_mode, lalu_a, lalu_b = self._matmul_activation(
+            gelu_enable, silu_enable, sigmoid_enable, clamp_enable, log_enable,
+            clamp_min, clamp_max, formats=formats)
 
         # We put entire input matrix into URAM_A, and entire output matrix into URAM_B
 
@@ -8728,7 +9014,7 @@ class UnifiedEngine:
                                                                 bias_enable=bias_enable,
                                                                 lalu_mode=lalu_mode,
                                                                 lalu_a=lalu_a,
-                                                                lalu_b=lalu_b)
+                                                                lalu_b=lalu_b, formats=formats)
                     max_clear_en = 0
 
                 if not write_back_disable and N_chunk_aligned is None:
@@ -8773,7 +9059,8 @@ class UnifiedEngine:
                                       data_type: TYPE = None, gelu_enable: bool = False, silu_enable: bool = False,
                                       sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False,
                                       clamp_min: float = 0.0, clamp_max: float = float("inf"),
-                                      write_back_disable: bool = False) -> int:
+                                      write_back_disable: bool = False,
+                                      *, formats: Optional[TensorFormats] = None) -> int:
         """1-pass streaming quantized matmul (A @ Bᵀ), IF4/IF8/TQ4 weights straight through DOT_PRODUCT.
 
         Runtime-dynamic vs baked-at-capture:
@@ -8800,6 +9087,7 @@ class UnifiedEngine:
         per-strip/per-row writeback of the valid ``strip_w`` elements. Regime is fixed by compile-time
         K (runtime K must match it), so one capture is valid within one K regime only.
         """
+        formats = self._resolve_tensor_formats(formats)
         fn = "quantized_matmat_core_dynamic"
         assert self.is_capture_on, f"{fn}() requires active capture"
         if data_type not in (TYPE.IF4, TYPE.IF8, TYPE.TQ4):
@@ -8851,20 +9139,9 @@ class UnifiedEngine:
                 f"{fn}: K={K} too large — no 16/32/64-wide column strip's scales fit the scale BRAM")
 
         # Activation -> LALU (baked into the dot descriptor; identical mapping to quantized_matmat_core).
-        lalu_mode, lalu_a, lalu_b = LALU_MODE.BYPASS, 0, 0
-        if gelu_enable:
-            lalu_mode, lalu_a, lalu_b = LALU_MODE.ACT, LALU_ACT_GELU_A, LALU_ACT_GELU_B
-        elif silu_enable:
-            lalu_mode, lalu_a, lalu_b = LALU_MODE.ACT, LALU_ACT_SILU_A, LALU_ACT_SILU_B
-        elif sigmoid_enable:
-            lalu_mode, lalu_a, lalu_b = LALU_MODE.ACT_NO_X, LALU_ACT_SIGMOID_A, LALU_ACT_SIGMOID_B
-        elif clamp_enable:
-            lalu_mode, lalu_a, lalu_b = LALU_MODE.CLAMP, self.float_to_bf16(clamp_min), self.float_to_bf16(clamp_max)
-        elif log_enable:
-            lalu_mode, lalu_a, lalu_b = (
-                LALU_MODE.LOG,
-                self.float_to_bf16(clamp_min) if clamp_min > 0 else LALU_LOG_A,
-                LALU_LOG_B)
+        lalu_mode, lalu_a, lalu_b = self._matmul_activation(
+            gelu_enable, silu_enable, sigmoid_enable, clamp_enable, log_enable,
+            clamp_min, clamp_max, formats=formats)
 
         SRAM_A = 0x00000
         SRAM_B = 0x80000
@@ -8987,7 +9264,7 @@ class UnifiedEngine:
                         0, 1, 1, lalu_a, lalu_b, lalu_mode.value, 0,
                         out_type.value, 0, out_urow, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
                         UE_MODE.DOT_PRODUCT, data_type.value,
-                        a_urow, 0, 0, 0, 0, 0, bias_adder_en=bias_adder, inst_pointer_idx=ptr_dot)
+                        a_urow, 0, 0, 0, 0, 0, bias_adder_en=bias_adder, inst_pointer_idx=ptr_dot, formats=formats)
                     if advance:
                         # B += nt*K/2 words ; scale += nt*K_rows*2>>3 words ; bias += nt*2>>3 words ; out-row += nt/64 rows
                         self.generate_instruction_mul32_shl_reg(s1, nt_reg, K_rows_reg, b_word_shift)
@@ -9141,7 +9418,7 @@ class UnifiedEngine:
                     0, 1, 1, lalu_a, lalu_b, lalu_mode.value, 0,
                     out_type.value, 0, out_urow, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
                     UE_MODE.DOT_PRODUCT, data_type.value,
-                    a_urow, 0, 0, 0, 0, 0, bias_adder_en=bias_adder, inst_pointer_idx=ptr_dot)
+                    a_urow, 0, 0, 0, 0, 0, bias_adder_en=bias_adder, inst_pointer_idx=ptr_dot, formats=formats)
                 # (3) per-strip writeback: strip_w valid elements URAM_B row 0 -> OUTPUT DRAM cursor
                 if not write_back_disable:
                     _set(ptr_wb, PBI_FIELD.DRAM_ADDR, out_dram_reg)
@@ -9355,7 +9632,7 @@ class UnifiedEngine:
                 0, 1, 1, lalu_a, lalu_b, lalu_mode.value, 0,
                 out_type.value, 0, out_urow, URAM_WRITE_SRC.URAM_WRITE_BACK.value,
                 UE_MODE.DOT_PRODUCT, data_type.value,
-                a_urow, 0, 0, 0, 0, 0, bias_adder_en=bias_adder, inst_pointer_idx=ptr_dot)
+                a_urow, 0, 0, 0, 0, 0, bias_adder_en=bias_adder, inst_pointer_idx=ptr_dot, formats=formats)
             self.generate_instruction_add_reg(a_row_reg, a_row_reg, K_rows_reg)
             self.generate_instruction_add_reg(out_row_reg, out_row_reg, n_take_rows_reg)
             if full_bias:
@@ -9533,7 +9810,8 @@ class UnifiedEngine:
                                          lalu_mode: LALU_MODE = LALU_MODE.BYPASS,
                                          lalu_a: int = 0, lalu_b: int = 0,
                                          dilation: int = 1,
-                                         gather: bool = False, c_in: Optional[int] = None) -> None:
+                                         gather: bool = False, c_in: Optional[int] = None,
+                                         *, formats: Optional[TensorFormats] = None) -> None:
         """Emit one CONV2D (mode 0xE) descriptor + program its geometry registers.
 
         Python twin of ``ue_conv2d()`` in andromeda.c. The pre-padded activation
@@ -9569,6 +9847,7 @@ class UnifiedEngine:
                 free (col_stride = dil*CT, row_stride = dil*W_pad*CT); the
                 pixel-step registers keep the plain stride.
         """
+        formats = self._resolve_tensor_formats(formats)
         act_uram_type, act_uram_start_addr = self.sram_address_to_uram_address(act_sram_start_addr)
         assert act_uram_type == URAM_SECTION.URAM_A, \
             "conv activations must live in URAM_A (bank Y); bank Z is reserved for the TQ4 codebook"
@@ -9639,22 +9918,25 @@ class UnifiedEngine:
             blocks * bytes_per_blk,  # dma_length
             results,  # output_size
             bias_adder_en=int(bias_enable),
+            formats=formats,
         )
 
     def start_queue_for_maxpool2d_operation(self, act_sram_start_addr: int, output_sram_wb_addr: int,
                                             kernel_w: int, kernel_h: int,
                                             out_w: int, out_h: int, w_pad: int,
-                                            stride_s: int) -> None:
+                                            stride_s: int,
+                                            *, formats: Optional[TensorFormats] = None) -> None:
         """Emit one MAXPOOL (mode 0x3) descriptor + program its geometry registers.
 
         Python twin of ``ue_maxpool2d()`` in andromeda.c. Per-channel running max
-        over the window: one full 64-lane line out per pooled pixel, bit-exact
-        BF16 (compare-select only, no arithmetic). Pooling never folds across
+        over the window: read ``formats.a`` and write one 64-lane line in
+        ``formats.output`` per pooled pixel. Pooling never folds across
         channel tiles — for C_in > 64 issue one op per 64-channel tile.
 
-        The padded map (halo pre-filled with -inf = 0xFF80 when pad > 0) must be
+        The padded map (halo pre-filled with -inf in ``formats.a`` when pad > 0) must be
         in URAM_A at ``act_sram_start_addr``.
         """
+        formats = self._resolve_tensor_formats(formats)
         act_uram_type, act_uram_start_addr = self.sram_address_to_uram_address(act_sram_start_addr)
         assert act_uram_type == URAM_SECTION.URAM_A, "maxpool activations must live in URAM_A (bank Y)"
         output_uram_type, output_uram_start_addr = self.sram_address_to_uram_address(output_sram_wb_addr)
@@ -9691,6 +9973,7 @@ class UnifiedEngine:
             0,  # dma_start_addr (URAM-only op)
             0,  # dma_length
             out_h * out_w,  # output_size: pooled lines
+            formats=formats,
         )
 
     def conv2d_core(self, ACT_DRAM_ADDR: int, WEIGHTS_DRAM_ADDR: int, SCALE_DRAM_ADDR: int,
@@ -9704,7 +9987,8 @@ class UnifiedEngine:
                     gelu_enable: bool = False,
                     dilation: int = 1,
                     pad_h: Optional[int] = None,
-                    act_uram_addr: int = 0x000, wb_uram_addr: int = 0x300) -> int:
+                    act_uram_addr: int = 0x000, wb_uram_addr: int = 0x300,
+                    formats: Optional[TensorFormats] = None) -> int:
         """DRAM-to-DRAM 2D convolution (single launch, one geometry).
 
         Emits: padded map -> URAM_A, scales -> scale BRAM, optional bias ->
@@ -9723,6 +10007,7 @@ class UnifiedEngine:
         conv geometry. ``pad_h`` overrides the H-axis padding (defaults to
         ``pad``; Conv1d uses pad_h=0). Returns the FLOP count of the launch.
         """
+        formats = self._resolve_tensor_formats(formats)
         ct = (c_in + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
         if pad_h is None:
             pad_h = pad
@@ -9756,7 +10041,8 @@ class UnifiedEngine:
                 accelerator_dram_address=BIAS_DRAM_ADDR,
                 element_size=oc_count)
 
-        lalu_mode, lalu_a, lalu_b = _conv_fused_lalu(relu_enable, silu_enable, gelu_enable)
+        lalu_mode, lalu_a, lalu_b = self._matmul_activation(
+            gelu_enable, silu_enable, False, relu_enable, False, 0.0, float("inf"), formats=formats)
 
         self.start_queue_for_conv2d_operation(
             act_sram_start_addr=act_uram_addr << 7,
@@ -9766,7 +10052,7 @@ class UnifiedEngine:
             out_w=out_w, out_h=out_h, w_pad=w_pad, stride_s=stride_s,
             data_type=data_type, bias_enable=bias_enable,
             lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b,
-            dilation=dilation)
+            dilation=dilation, formats=formats)
 
         self.sram_to_accelerator_memory(
             sram_address=wb_uram_addr << 7,
@@ -9791,7 +10077,8 @@ class UnifiedEngine:
                     silu_enable: bool = False,
                     gelu_enable: bool = False,
                     dilation: int = 1,
-                    act_uram_addr: int = 0x000, wb_uram_addr: int = 0x300) -> int:
+                    act_uram_addr: int = 0x000, wb_uram_addr: int = 0x300,
+                    formats: Optional[TensorFormats] = None) -> int:
         """DRAM-to-DRAM 1D convolution (Whisper-style audio conv stem).
 
         A Conv1d over (C, T) is CONV2D with H = 1 / Kh = 1: channels in the
@@ -9802,6 +10089,7 @@ class UnifiedEngine:
         Conv1d(n_mels->d, 3, stride=1, padding=1) and
         Conv1d(d->d, 3, stride=2, padding=1) + GELU.
         """
+        formats = self._resolve_tensor_formats(formats)
         return self.conv2d_core(
             ACT_DRAM_ADDR, WEIGHTS_DRAM_ADDR, SCALE_DRAM_ADDR, OUTPUT_DRAM_ADDR,
             c_in=c_in, in_h=1, in_w=length,
@@ -9811,7 +10099,7 @@ class UnifiedEngine:
             BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
             relu_enable=relu_enable, silu_enable=silu_enable, gelu_enable=gelu_enable,
             dilation=dilation,
-            act_uram_addr=act_uram_addr, wb_uram_addr=wb_uram_addr)
+            act_uram_addr=act_uram_addr, wb_uram_addr=wb_uram_addr, formats=formats)
 
     # -------------------------------------------------------------------------
     # Layer-level drivers: full-tensor conv / pool via multiple launches.
@@ -9838,7 +10126,8 @@ class UnifiedEngine:
                                   lalu_mode: LALU_MODE, lalu_a: int, lalu_b: int,
                                   gather: bool = False, c_in: Optional[int] = None,
                                   act_uram_addr: int = 0x000,
-                                  wb_uram_addr: int = 0x300) -> None:
+                                  wb_uram_addr: int = 0x300,
+                                  formats: Optional[TensorFormats] = None) -> None:
         """Capture ONE resident PBI tile loop covering ``n_tiles`` same-shape
         conv tiles — the single code piece the engine executes end-to-end
         with no host involvement.
@@ -9860,6 +10149,7 @@ class UnifiedEngine:
         (slot i at ``act_base + i*act_bytes``); results land contiguously at
         ``out_base``. PBI pointers post-increment: iteration 0 uses the base.
         """
+        formats = self._resolve_tensor_formats(formats)
         self.accelerator_memory_to_scale_sram(scale_dram_addr, scale_count)
         if bias_dram_addr is not None:
             # CONV rewinds bias after each pixel's OC vector. The packed
@@ -9903,7 +10193,7 @@ class UnifiedEngine:
             out_w=out_w, out_h=out_h, w_pad=w_pad, stride_s=stride_s,
             data_type=data_type, bias_enable=bias_dram_addr is not None,
             lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b,
-            dilation=dilation, gather=gather, c_in=c_in)
+            dilation=dilation, gather=gather, c_in=c_in, formats=formats)
         self.sram_to_accelerator_memory(
             sram_address=wb_uram_addr << 7,
             accelerator_dram_address=0,
@@ -10120,15 +10410,18 @@ class UnifiedEngine:
 
     def run_maxpool2d_layer(self, x: torch.Tensor, *, kernel: int, stride_s: int,
                             pad: int, wb_uram_addr: int = 0x300,
-                            timeout_s: float = 300.0) -> torch.Tensor:
+                            timeout_s: float = 300.0,
+                            formats: Optional[TensorFormats] = None) -> torch.Tensor:
         """Full-tensor MaxPool2d layer for any channel count.
 
         Tiles over 64-channel groups (pooling never folds across lanes) and
         over output rows so the launch's total tap count fits the 12-bit
         uram_row_size field (k*k*tile_pixels <= 4095 — e.g. k=5 caps at 163
         output pixels per launch) and the padded window fits the URAM tile.
-        The -inf halo is host-materialised once. Returns (C, out_h, out_w).
+        The -inf halo is host-materialised once in ``formats.a``.
+        Returns (C, out_h, out_w) in ``formats.output``.
         """
+        formats = self._resolve_tensor_formats(formats)
         import torch.nn.functional as F
         C, H, W = x.shape
         h_pad, w_pad = H + 2 * pad, W + 2 * pad
@@ -10148,9 +10441,9 @@ class UnifiedEngine:
         assert fits(rows_per), (
             f"one output row does not fit a launch (out_w={out_w}, k={kernel})")
 
-        x_padded = F.pad(x.to(torch.bfloat16), (pad, pad, pad, pad),
+        x_padded = F.pad(x.to(formats.a.dtype), (pad, pad, pad, pad),
                          value=float('-inf'))
-        out = torch.zeros(C, out_h, out_w, dtype=torch.bfloat16)
+        out = torch.zeros(C, out_h, out_w, dtype=formats.output.dtype)
 
         # Overlap-clamped row chunks: every chunk is exactly rows_per rows
         # (the last one shifted up to overlap), so all (channel tile, row
@@ -10171,14 +10464,14 @@ class UnifiedEngine:
             for oy0 in oy0s:
                 slots.append((c0, n_ch, oy0))
         staged = torch.empty(len(slots) * win_lines, UE_VECTOR_SIZE,
-                             dtype=torch.bfloat16)
+                             dtype=formats.a.dtype)
         for i, (c0, n_ch, oy0) in enumerate(slots):
             y0 = oy0 * stride_s
             staged[i * win_lines:(i + 1) * win_lines] = conv2d_pack_activation_map(
                 x_padded[c0:c0 + n_ch, y0:y0 + win_h, :], 0,
                 pad_value=float('-inf'))
         ACT_BASE = self.allocate_params_dram(len(slots) * act_bytes)
-        self.dma_write(DMA_DEVICE_H2C, ACT_BASE, staged, staged.numel() * 2)
+        self.dma_write(self.h2c_device, ACT_BASE, staged, staged.numel() * 2)
         OUT_BASE = self.allocate_tensor_dram(len(slots) * out_bytes)
 
         # ONE capture for the whole layer: PBI pointers + loop over every
@@ -10205,7 +10498,7 @@ class UnifiedEngine:
             act_sram_start_addr=0x00000,
             output_sram_wb_addr=wb_uram_addr << 7,
             kernel_w=kernel, kernel_h=kernel,
-            out_w=out_w, out_h=rh, w_pad=w_pad, stride_s=stride_s)
+            out_w=out_w, out_h=rh, w_pad=w_pad, stride_s=stride_s, formats=formats)
         self.sram_to_accelerator_memory(
             sram_address=wb_uram_addr << 7,
             accelerator_dram_address=0,
@@ -10232,7 +10525,7 @@ class UnifiedEngine:
         self.clear_capture_buffer()
 
         big = self.dma_from_accelerator_memory(
-            OUT_BASE, (len(slots) * rh * out_w * UE_VECTOR_SIZE,))
+            OUT_BASE, (len(slots) * rh * out_w * UE_VECTOR_SIZE,), dtype=formats.output.dtype)
         big = big.view(len(slots), rh * out_w * UE_VECTOR_SIZE)
         for i, (c0, n_ch, oy0) in enumerate(slots):
             out[c0:c0 + n_ch, oy0:oy0 + rh, :] = \
@@ -11376,16 +11669,18 @@ class UnifiedEngine:
     def maxpool2d_core(self, ACT_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, *,
                        in_h: int, in_w: int,
                        kernel_h: int, kernel_w: int, stride_s: int, pad: int,
-                       act_uram_addr: int = 0x000, wb_uram_addr: int = 0x300) -> int:
+                       act_uram_addr: int = 0x000, wb_uram_addr: int = 0x300,
+                       formats: Optional[TensorFormats] = None) -> int:
         """DRAM-to-DRAM 2D max-pool over one 64-channel tile (single launch).
 
         ACT_DRAM_ADDR holds the padded channels-in-lanes map packed by
-        :func:`conv2d_pack_activation_map` with ``pad_value=-inf`` (halo =
-        0xFF80, so padding never wins the max — same contract as
-        torch.nn.functional.max_pool2d). Output: one 64-lane bf16 line per
-        pooled pixel, pixel-major (:func:`maxpool2d_unpack_result`).
+        :func:`conv2d_pack_activation_map` in ``formats.a`` with ``pad_value=-inf``,
+        so padding never wins the max (same contract as
+        torch.nn.functional.max_pool2d). Output: one 64-lane line in
+        ``formats.output`` per pooled pixel, pixel-major (:func:`maxpool2d_unpack_result`).
         Returns the compare-op count of the launch.
         """
+        formats = self._resolve_tensor_formats(formats)
         h_pad = in_h + 2 * pad
         w_pad = in_w + 2 * pad
         assert h_pad >= kernel_h and w_pad >= kernel_w, "window larger than padded map"
@@ -11407,7 +11702,7 @@ class UnifiedEngine:
             act_sram_start_addr=act_uram_addr << 7,
             output_sram_wb_addr=wb_uram_addr << 7,
             kernel_w=kernel_w, kernel_h=kernel_h,
-            out_w=out_w, out_h=out_h, w_pad=w_pad, stride_s=stride_s)
+            out_w=out_w, out_h=out_h, w_pad=w_pad, stride_s=stride_s, formats=formats)
 
         self.sram_to_accelerator_memory(
             sram_address=wb_uram_addr << 7,
@@ -11522,7 +11817,7 @@ class UnifiedEngine:
               f"HW_INFO reports {AVAILABLE_DRAM_SIZE_GB} GiB total)")
         while offset < dram_total_bytes:
             write_size = min(chunk_size_bytes, dram_total_bytes - offset)
-            self.dma_write(DMA_DEVICE_H2C, DRAM_START_ADDR + offset, fill[:write_size], write_size)
+            self.dma_write(self.h2c_device, DRAM_START_ADDR + offset, fill[:write_size], write_size)
             offset += write_size
             pct = offset / dram_total_bytes
             filled = int(bar_width * pct)
@@ -12579,10 +12874,12 @@ class UnifiedEngine:
             fmax_context_addr=fmax_context_addr,
         )
 
-    def generate_instruction_clear_fmax(self) -> None:
+    def generate_instruction_clear_fmax(self,
+                                        *, formats: Optional[TensorFormats] = None) -> None:
         """
         Generate an dummy pbi instruction using reserved register 0 to clear the fmax context
         """
+        formats = self._resolve_tensor_formats(formats)
         if self.capture_buffer is None:
             print("ERROR: generate_instruction_pbi_init() called but capture_buffer is not initialized!")
             return
@@ -12612,6 +12909,7 @@ class UnifiedEngine:
             0,  # output_size
             bias_adder_en=0,
             fmax_context_addr=0,
+            formats=formats,
         )
 
     def write_captured_instructions_to_dram(self, start_addr: int = DRAM_INSTRUCTION_ADDR) -> int:
@@ -12639,17 +12937,13 @@ class UnifiedEngine:
         # Each instruction is 32 bytes (256 bits)
         total_bytes = self.capture_count * 32
 
-        # Combine all instructions into a single byte array
-        all_instructions_bytes = bytearray()
+        instructions_bytes = bytearray()
         for inst in self.capture_buffer:
-            all_instructions_bytes.extend(inst.get_bytes())
-
-        # Convert to bytes
-        instructions_bytes = bytes(all_instructions_bytes)
+            instructions_bytes.extend(inst.get_bytes())
 
         # Write to DRAM
         print(f"Writing {self.capture_count} captured instructions ({total_bytes} bytes) to DRAM at 0x{start_addr:x}...")
-        bytes_written = self.dma_write(DMA_DEVICE_H2C, start_addr, instructions_bytes, total_bytes)
+        bytes_written = self.dma_write(self.h2c_device, start_addr, instructions_bytes, total_bytes)
 
         if bytes_written == total_bytes:
             print(f"Successfully wrote {bytes_written} bytes ({self.capture_count} instructions) to DRAM")
@@ -12873,17 +13167,19 @@ class UnifiedEngine:
                         N: int,
                         K: int,
                         data_type: TYPE,
-                        int_variant: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+                        int_variant: bool = False, *, formats: Optional[TensorFormats] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Quantize a bf16 weight matrix (N, K) with absmax quantization.
+        Quantize a weight matrix (N, K) in ``formats.a`` with absmax quantization.
+        Store each block scale in ``formats.scale``.
 
         Width is selected by ``data_type`` (TYPE.IF4 -> 4-bit packed nibbles,
         TYPE.IF8 -> 8-bit raw bytes). Within each width, the INT vs FP variant
         is selected by ``int_variant`` and is communicated to the hardware via
-        the sign bit of the per-block bf16 scale: negative -> INT (two's
+        the sign bit of the per-block scale: negative -> INT (two's
         complement codes), positive -> FP (E2M1 / E4M3 codes). The hardware
         always uses ``|scale|`` as the effective multiplier.
         """
+        formats = self._resolve_tensor_formats(formats)
         assert data_type in (TYPE.IF4, TYPE.IF8), \
             f"data_type={data_type} must be one of TYPE.IF4, TYPE.IF8"
         if N % UE_VECTOR_SIZE != 0:
@@ -12891,7 +13187,7 @@ class UnifiedEngine:
         if K % UE_VECTOR_SIZE != 0:
             raise ValueError(f"K={K} must be a multiple of {UE_VECTOR_SIZE}")
         assert weight.dim() == 2, "Weight must be 2D"
-        assert weight.dtype == torch.bfloat16, "Weight must be bfloat16"
+        assert weight.dtype == formats.a.dtype, f"Weight must use {formats.a.dtype}"
         assert weight.shape[0] == N and weight.shape[1] == K, f"Weight shape {weight.shape} must match ({N}, {K})"
 
         matrix = weight.contiguous()  # (N, K)
@@ -12899,53 +13195,53 @@ class UnifiedEngine:
         num_elements = matrix_flat.numel()
         num_blocks = (num_elements + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
 
-        fp4_values = torch.tensor([-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-                                    dtype=torch.bfloat16, device=matrix.device)
-        # FP8 E4M3FN code-to-value table (excludes NaN). Built once outside the
-        # per-block loop and only consulted on the IF8-FP path below.
-        fp8_values_t, fp8_codes_t = self._fp8_e4m3fn_value_code_table(matrix.device)
+        fp4_values = fp4_codes = None
+        fp8_values_t = fp8_codes_t = None
         if data_type == TYPE.IF4:
             if int_variant:
-                max_val_bf16 = torch.tensor(7.0, dtype=torch.bfloat16, device=matrix.device)
+                max_val_bf16 = torch.tensor(7.0, dtype=formats.a.dtype, device=matrix.device)
                 clamp_min, clamp_max = -8, 7
             else:
-                max_val_bf16 = torch.tensor(6.0, dtype=torch.bfloat16, device=matrix.device)
+                max_val_bf16 = torch.tensor(6.0, dtype=formats.a.dtype, device=matrix.device)
+                fp4_values = torch.tensor(
+                    [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0,
+                     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+                    dtype=formats.a.dtype, device=matrix.device)
+                fp4_codes = torch.tensor([
+                    0b1111, 0b1110, 0b1101, 0b1100, 0b1011, 0b1010, 0b1001, 0b1000,
+                    0b0000, 0b0001, 0b0010, 0b0011, 0b0100, 0b0101, 0b0110, 0b0111,
+                ], dtype=torch.int8, device=matrix.device)
         else:  # TYPE.IF8
             if int_variant:
-                max_val_bf16 = torch.tensor(127.0, dtype=torch.bfloat16, device=matrix.device)
+                max_val_bf16 = torch.tensor(127.0, dtype=formats.a.dtype, device=matrix.device)
                 clamp_min, clamp_max = -128, 127
             else:
                 # FP8 E4M3 finite max (excluding NaN at 0x7F/0xFF).
-                max_val_bf16 = torch.tensor(448.0, dtype=torch.bfloat16, device=matrix.device)
+                max_val_bf16 = torch.tensor(448.0, dtype=formats.a.dtype, device=matrix.device)
+                fp8_values_t, fp8_codes_t = self._fp8_e4m3fn_value_code_table(matrix.device)
 
-        quantized_int8 = torch.zeros(num_elements, dtype=torch.int8, device=matrix.device)
-        scales_bf16 = torch.zeros(num_blocks, dtype=torch.bfloat16, device=matrix.device)
+        quantized_int8 = torch.empty(num_elements, dtype=torch.int8, device=matrix.device)
+        scales_bf16 = torch.empty(num_blocks, dtype=formats.scale.dtype, device=matrix.device)
+        one_scale = torch.tensor(1.0, dtype=formats.scale.dtype, device=matrix.device)
         for i in range(num_blocks):
             start = i * UE_VECTOR_SIZE
             end = min(start + UE_VECTOR_SIZE, num_elements)
             block = matrix_flat[start:end]
-            block_bf16 = block.to(torch.bfloat16)
-            abs_block = block_bf16.abs()
-            max_abs = abs_block.max()
-            if float(max_abs.item()) == 0.0:
-                scale_bf16 = torch.tensor(1.0, dtype=torch.bfloat16, device=matrix.device)
+            max_abs = block.abs().max()
+            is_zero = max_abs.item() == 0.0
+            if is_zero:
+                scale_bf16 = one_scale
             else:
-                scale_bf16 = max_abs / max_val_bf16
+                scale_bf16 = (max_abs / max_val_bf16).to(formats.scale.dtype)
             scales_bf16[i] = scale_bf16
-            if float(max_abs.item()) == 0.0:
+            if is_zero:
                 q_block = torch.zeros(end - start, dtype=torch.int8, device=matrix.device)
             else:
-                scaled = block_bf16 / scale_bf16
+                scaled = block / scale_bf16
                 if data_type == TYPE.IF4 and not int_variant:
                     # FP4 E2M1: snap to the 16-entry value table.
-                    scaled_expanded = scaled.unsqueeze(-1)
-                    fp4_values_expanded = fp4_values.unsqueeze(0)
-                    distances = torch.abs(scaled_expanded - fp4_values_expanded)
+                    distances = torch.abs(scaled.unsqueeze(-1) - fp4_values)
                     closest_indices = torch.argmin(distances, dim=1)
-                    fp4_codes = torch.tensor([
-                        0b1111, 0b1110, 0b1101, 0b1100, 0b1011, 0b1010, 0b1001, 0b1000,
-                        0b0000, 0b0001, 0b0010, 0b0011, 0b0100, 0b0101, 0b0110, 0b0111,
-                    ], dtype=torch.int8, device=matrix.device)
                     q_block = fp4_codes[closest_indices]
                 elif data_type == TYPE.IF4 and int_variant:
                     rounded = torch.round(scaled)
@@ -12961,13 +13257,12 @@ class UnifiedEngine:
                     # fp8_to_bf19 module (Vivado/hdl/fp8_to_bf19.sv) decodes
                     # the same byte to bf19 1:1, so the SW reference and HW
                     # output match exactly for non-NaN codes.
-                    distances = torch.abs(scaled.to(torch.float32).unsqueeze(-1)
-                                          - fp8_values_t.unsqueeze(0))
+                    distances = torch.abs(scaled.to(torch.float32).unsqueeze(-1) - fp8_values_t)
                     closest_indices = torch.argmin(distances, dim=-1)
                     # uint8 byte code reinterpreted into the int8 storage
                     # buffer (bit pattern is preserved; quantized_int8 is
                     # later viewed as uint8 for the DMA write).
-                    q_block = fp8_codes_t[closest_indices].contiguous().view(torch.int8)
+                    q_block = fp8_codes_t[closest_indices].view(torch.int8)
             quantized_int8[start:end] = q_block
 
         # Sign-bit encodes the INT vs FP variant for the hardware: negative
@@ -12981,28 +13276,21 @@ class UnifiedEngine:
             num_bytes = num_elements
             quantized_matrix_dram_addr = self.get_params_dram_addr()
             scale_dram_addr = quantized_matrix_dram_addr + num_bytes
-            self.dma_write(DMA_DEVICE_H2C, quantized_matrix_dram_addr, quantized_bytes, num_bytes)
-            self.dma_write(DMA_DEVICE_H2C, scale_dram_addr, scales_bf16.view(torch.uint16), num_blocks * 2)
+            self.dma_write(self.h2c_device, quantized_matrix_dram_addr, quantized_bytes, num_bytes)
+            self.dma_write(self.h2c_device, scale_dram_addr, scales_bf16.view(torch.uint16), num_blocks * 2)
             variant_str = "INT8" if int_variant else "FP8"
             print(f"IF8 ({variant_str}): wrote {num_bytes} raw bytes + {num_blocks*2} scale bytes")
             self.allocate_params_dram(num_bytes + num_blocks * 2)
         else:
             # IF4: pack two 4-bit codes per byte (low nibble first).
-            num_packed_bytes = (num_elements + 1) // 2
-            packed_int4 = torch.zeros(num_packed_bytes, dtype=torch.uint8, device=matrix.device)
-            for i in range(0, num_elements, 2):
-                byte_idx = i // 2
-                if i + 1 < num_elements:
-                    val1 = quantized_int8[i].item()
-                    val2 = quantized_int8[i + 1].item()
-                    packed_int4[byte_idx] = ((val2 & 0xF) << 4) | (val1 & 0xF)
-                else:
-                    val1 = quantized_int8[i].item()
-                    packed_int4[byte_idx] = val1 & 0xF
+            # The validated 64-element dimensions guarantee an even code count.
+            num_packed_bytes = num_elements // 2
+            codes = quantized_int8.view(torch.uint8)
+            packed_int4 = (codes[0::2] & 0xF) | ((codes[1::2] & 0xF) << 4)
             quantized_matrix_dram_addr = self.get_params_dram_addr()
             scale_dram_addr = quantized_matrix_dram_addr + num_packed_bytes
-            self.dma_write(DMA_DEVICE_H2C, quantized_matrix_dram_addr, packed_int4, num_packed_bytes)
-            self.dma_write(DMA_DEVICE_H2C, scale_dram_addr, scales_bf16.view(torch.uint16), num_blocks * 2)
+            self.dma_write(self.h2c_device, quantized_matrix_dram_addr, packed_int4, num_packed_bytes)
+            self.dma_write(self.h2c_device, scale_dram_addr, scales_bf16.view(torch.uint16), num_blocks * 2)
             variant_str = "INT4" if int_variant else "FP4"
             print(f"IF4 ({variant_str}): wrote {num_packed_bytes} packed bytes + {num_blocks*2} scale bytes")
             self.allocate_params_dram(num_packed_bytes + num_blocks * 2)
@@ -13013,26 +13301,28 @@ class UnifiedEngine:
     def quantize_weight_simulate(self,
                                  weight: torch.Tensor,
                                  data_type: TYPE,
-                                 int_variant: bool = False) -> torch.Tensor:
+                                 int_variant: bool = False, *, formats: Optional[TensorFormats] = None) -> torch.Tensor:
         """
         Software model of ``quantize_weight`` followed by the on-chip
-        IF4 / IF8 dequantize path. Returns the bf16 matrix the hardware
+        IF4 / IF8 dequantize path. Returns the matrix in ``formats.output`` the hardware
         would emit -- ``code_table[byte] * |scale|`` per element -- using
         the same per-block absmax + snap-to-grid quantization rules.
 
-        This is the comparison reference for IF4 / IF8 correctness tests:
-        no DRAM round-trip is needed, and the result is bit-exact with
-        the HW dequantize output for non-NaN codes (FP4 / FP8 lookup
-        values fit losslessly in bf16; INT codes are integers).
+        This is the software comparison reference for IF4 / IF8 correctness tests;
+        no DRAM round-trip is needed. FP4 / FP8 lookup values and INT codes fit
+        losslessly in either supported storage format. Input weights use
+        ``formats.a`` and block scales use ``formats.scale``; multiplication
+        rounds to ``formats.output``.
 
         ``data_type``: TYPE.IF4 or TYPE.IF8.
         ``int_variant``: True selects the INT path (round-and-clamp);
         False selects the FP path (snap to NVFP4 / FP8 E4M3FN grid).
         """
+        formats = self._resolve_tensor_formats(formats)
         assert data_type in (TYPE.IF4, TYPE.IF8), \
             f"data_type={data_type} must be one of TYPE.IF4, TYPE.IF8"
         assert weight.dim() == 2, "Weight must be 2D"
-        assert weight.dtype == torch.bfloat16, "Weight must be bfloat16"
+        assert weight.dtype == formats.a.dtype, f"Weight must use {formats.a.dtype}"
 
         matrix = weight.contiguous()
         matrix_flat = matrix.flatten()
@@ -13041,18 +13331,18 @@ class UnifiedEngine:
 
         if data_type == TYPE.IF4:
             max_val = torch.tensor(7.0 if int_variant else 6.0,
-                                   dtype=torch.bfloat16, device=matrix.device)
+                                   dtype=formats.a.dtype, device=matrix.device)
             fp_values = torch.tensor(
                 [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0,
                   0.0,  0.5,  1.0,  1.5,  2.0,  3.0,  4.0,  6.0],
-                dtype=torch.bfloat16, device=matrix.device)
+                dtype=formats.a.dtype, device=matrix.device)
         else:  # TYPE.IF8
             max_val = torch.tensor(127.0 if int_variant else 448.0,
-                                   dtype=torch.bfloat16, device=matrix.device)
+                                   dtype=formats.a.dtype, device=matrix.device)
             if not int_variant:
                 fp8_values_t, _ = self._fp8_e4m3fn_value_code_table(matrix.device)
 
-        out_flat = torch.zeros(num_elements, dtype=torch.bfloat16, device=matrix.device)
+        out_flat = torch.zeros(num_elements, dtype=formats.output.dtype, device=matrix.device)
         for i in range(num_blocks):
             start = i * UE_VECTOR_SIZE
             end = min(start + UE_VECTOR_SIZE, num_elements)
@@ -13060,21 +13350,21 @@ class UnifiedEngine:
             max_abs = block.abs().max()
             if float(max_abs.item()) == 0.0:
                 continue
-            scale_bf16 = (max_abs / max_val).to(torch.bfloat16)
+            scale_bf16 = (max_abs / max_val).to(formats.scale.dtype)
             scaled = block / scale_bf16
             if data_type == TYPE.IF4 and not int_variant:
                 distances = torch.abs(scaled.unsqueeze(-1) - fp_values.unsqueeze(0))
                 dequant = fp_values[torch.argmin(distances, dim=-1)]
             elif data_type == TYPE.IF4 and int_variant:
-                dequant = scaled.round().clamp(-8, 7).to(torch.bfloat16)
+                dequant = scaled.round().clamp(-8, 7).to(formats.a.dtype)
             elif data_type == TYPE.IF8 and int_variant:
-                dequant = scaled.round().clamp(-128, 127).to(torch.bfloat16)
+                dequant = scaled.round().clamp(-128, 127).to(formats.a.dtype)
             else:  # IF8 + FP
                 distances = torch.abs(scaled.to(torch.float32).unsqueeze(-1)
                                       - fp8_values_t.unsqueeze(0))
-                dequant = fp8_values_t[torch.argmin(distances, dim=-1)].to(torch.bfloat16)
+                dequant = fp8_values_t[torch.argmin(distances, dim=-1)].to(formats.a.dtype)
             out_flat[start:end] = (dequant.to(torch.float32)
-                                   * float(scale_bf16.item())).to(torch.bfloat16)
+                                   * float(scale_bf16.item())).to(formats.output.dtype)
         return out_flat.reshape(matrix.shape)
 
     @staticmethod
@@ -13277,13 +13567,14 @@ def conv2d_pack_activation_map(x: torch.Tensor, pad: int, pad_value: float = 0.0
     ``pad_h=0``).
     """
     assert x.dim() == 3, f"expected (C, H, W), got shape {tuple(x.shape)}"
+    dtype = torch.float16 if x.dtype == torch.float16 else torch.bfloat16
     C, H, W = x.shape
     if pad_h is None:
         pad_h = pad
     ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
     h_pad, w_pad = H + 2 * pad_h, W + 2 * pad
-    m = torch.full((h_pad, w_pad, ct * UE_VECTOR_SIZE), pad_value, dtype=torch.bfloat16)
-    m[pad_h:pad_h + H, pad:pad + W, :C] = x.permute(1, 2, 0).to(torch.bfloat16)
+    m = torch.full((h_pad, w_pad, ct * UE_VECTOR_SIZE), pad_value, dtype=dtype)
+    m[pad_h:pad_h + H, pad:pad + W, :C] = x.permute(1, 2, 0).to(dtype)
     return m.reshape(h_pad * w_pad * ct, UE_VECTOR_SIZE).contiguous()
 
 
@@ -13436,7 +13727,8 @@ def conv2d_pack_weight_stream(w_codes: torch.Tensor, out_h: int, out_w: int,
     return per_pixel.repeat(out_h * out_w).contiguous()
 
 
-def conv2d_pack_scale_stream(scale, oc_count: int, taps: int, out_h: int, out_w: int) -> torch.Tensor:
+def conv2d_pack_scale_stream(scale, oc_count: int, taps: int, out_h: int, out_w: int,
+                             *, dtype=torch.bfloat16) -> torch.Tensor:
     """One reusable ``[oc][tap]`` BF16 scale pattern for channels-mode CONV.
 
     ``scale`` is a float (uniform) or an (OC, taps)-shaped tensor. Hardware
@@ -13447,12 +13739,12 @@ def conv2d_pack_scale_stream(scale, oc_count: int, taps: int, out_h: int, out_w:
     must stay positive.
     """
     if isinstance(scale, torch.Tensor):
-        per_pixel = scale.to(torch.bfloat16).reshape(-1)
+        per_pixel = scale.to(dtype).reshape(-1)
         assert per_pixel.numel() == oc_count * taps, (
             f"scale tensor has {per_pixel.numel()} entries, expected oc_count*taps = {oc_count * taps}"
         )
     else:
-        per_pixel = torch.full((oc_count * taps,), float(scale), dtype=torch.bfloat16)
+        per_pixel = torch.full((oc_count * taps,), float(scale), dtype=dtype)
     assert out_h > 0 and out_w > 0
     return per_pixel.contiguous()
 
@@ -13496,7 +13788,8 @@ def conv2d_pack_weight_stream_gather(w_codes: torch.Tensor, out_h: int, out_w: i
     return per_pixel.repeat(out_h * out_w).contiguous()
 
 
-def conv2d_pack_scale_stream_gather(scale, oc_count: int, chunks: int) -> torch.Tensor:
+def conv2d_pack_scale_stream_gather(scale, oc_count: int, chunks: int,
+                                    *, dtype=torch.bfloat16) -> torch.Tensor:
     """Gather-mode per-block bf16 scale: ONE pixel's ``oc_count*chunks`` blocks.
 
     Like channels mode, the gather scale is NOT replicated per output pixel;
@@ -13507,14 +13800,15 @@ def conv2d_pack_scale_stream_gather(scale, oc_count: int, chunks: int) -> torch.
     """
     bpp = oc_count * chunks
     if isinstance(scale, torch.Tensor):
-        blocks = scale.to(torch.bfloat16).reshape(-1)
+        blocks = scale.to(dtype).reshape(-1)
         assert blocks.numel() == bpp, f"scale has {blocks.numel()} entries, expected {bpp}"
     else:
-        blocks = torch.full((bpp,), float(scale), dtype=torch.bfloat16)
+        blocks = torch.full((bpp,), float(scale), dtype=dtype)
     return blocks.contiguous()
 
 
-def conv2d_pack_bias_stream(bias: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
+def conv2d_pack_bias_stream(bias: torch.Tensor, out_h: int, out_w: int,
+                            *, dtype=torch.bfloat16) -> torch.Tensor:
     """Pack one reusable per-output-channel BF16 bias vector.
 
     CONV RTL wraps the bias address after ``oc_count`` scalar results, so the
@@ -13523,7 +13817,7 @@ def conv2d_pack_bias_stream(bias: torch.Tensor, out_h: int, out_w: int) -> torch
     """
     assert bias.dim() == 1, f"expected (OC,), got shape {tuple(bias.shape)}"
     assert out_h > 0 and out_w > 0
-    return bias.to(torch.bfloat16).contiguous()
+    return bias.to(dtype).contiguous()
 
 
 def conv2d_unpack_result(flat: torch.Tensor, out_h: int, out_w: int, oc_count: int) -> torch.Tensor:

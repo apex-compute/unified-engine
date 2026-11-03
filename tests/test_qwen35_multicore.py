@@ -31,9 +31,14 @@ class Qwen35MulticoreTests(unittest.TestCase):
         stack.enter_context(patch.object(core, "configure_clock_from_hardware",
                                         side_effect=AssertionError("unexpected hardware probe")))
 
+    # Engine clock per board: it is what tells the interleaved kintex7 (213 MHz
+    # release image) from kintex7_systolic (150 MHz), see dram_interleaved.
+    CLOCK_HZ = {2: 213.2e6, 8: 333.3e6}
+
     def engine(self, active=2, cores=2, gib=4):
         with patch.multiple(core, ANDROMEDA_CORE_COUNT=cores, AVAILABLE_DRAM_SIZE_GB=gib,
-                            CLOCK_CYCLE_TIME_NS=5.0), redirect_stdout(io.StringIO()):
+                            CLOCK_CYCLE_TIME_NS=5.0, CORE_CLOCK_FREQ_HZ=self.CLOCK_HZ[cores]), \
+                redirect_stdout(io.StringIO()):
             return qwen.Qwen3_5_2b_UnifiedEngine(multi_core=active, device="cpu")
 
     def test_import_preserves_measured_clock(self):
@@ -41,7 +46,7 @@ class Qwen35MulticoreTests(unittest.TestCase):
 
     def test_kintex_complete_shared_model_and_private_shards_fit(self):
         engine = self.engine()
-        self.assertEqual(engine._decode_windows, [(0, 512 << 20), (3 << 30, 512 << 20)])
+        self.assertEqual(engine._decode_windows, [(0, 512 << 20), (512 << 20, 512 << 20)])
         self.assertEqual((engine._params_dram_base, engine._params_limit,
                           engine._program_dram_base, engine._model_end),
                          (1 << 30, 2 << 30, 2560 << 20, 3 << 30))
@@ -50,9 +55,9 @@ class Qwen35MulticoreTests(unittest.TestCase):
 
     def test_u50_eight_engine_layout_and_legacy_layout_remain_disjoint(self):
         engine = self.engine(8, 8, 8)
-        self.assertEqual(engine._params_dram_base, 6 << 30)
-        self.assertEqual(len(engine._decode_windows), 8)
-        self.assertTrue(all(base + size <= 6 << 30 for base, size in engine._decode_windows))
+        # Eight 512 MiB windows from 0, the model map directly above them.
+        self.assertEqual(engine._params_dram_base, 4 << 30)
+        self.assertEqual(engine._decode_windows, [(i << 29, 512 << 20) for i in range(8)])
         legacy = self.engine(active=1)
         self.assertEqual((legacy._params_dram_base, legacy._tensor_dram_base,
                           legacy._program_dram_base), (0, 0xB0000000, 0xD0000000))

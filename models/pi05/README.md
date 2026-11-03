@@ -260,7 +260,7 @@ continues to use its existing weight slices.
 
 | Board image | Available private copies |
 |---|---|
-| U50, 8 GiB | Up to eight 512 MiB windows in the upper stack, in engine/SAXI order |
+| U50, 8 GiB | Up to eight 512 MiB windows packed consecutively from 4 GiB (interleaved HBM) |
 | U55C, 16 GiB | Up to twelve separate 1 GiB controller regions outside the model |
 | U55C, 8 GiB | Four free controller regions; additional engines share those four sets |
 | Kintex7, 4 GiB | Existing capacity-limited params/tensor copies; no free external controller windows |

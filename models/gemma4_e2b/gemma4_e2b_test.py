@@ -63,8 +63,9 @@ from user_dma_core import UnifiedEngine
 from user_dma_core import ue_35bit_addr_shifter
 from user_dma_core import INSTRUCTION_SIZE_BYTES
 from user_dma_core import UE_MODE
-from multi_engine_shard import (MULTICORE_WINDOW_BYTES, MultiEngineScheduler,
-                                PrivateArena, model_multicore_layout,
+from multi_engine_shard import (MULTICORE_WINDOW_BYTES, PRIVATE_ALIGN,
+                                MultiEngineScheduler, PrivateArena,
+                                dram_interleaved, model_multicore_layout,
                                 require_multicore_dram, tiled_window_bases)
 import gemma4_e2b_model_flops as _model_flops
 from models.profile_report import (annotate_execution, measurement,
@@ -148,6 +149,19 @@ TILED_TENSOR_EXTENT_BYTES = 480 * 2**20
 # allocation still needs, and the failure lands on an unrelated engine much
 # later. 1544 MiB of weights over 8 engines is 193 MiB; 256 is ~1.3x that.
 TILED_PRIVATE_RESERVE_BYTES = 256 * 2**20
+# THE PACKED MAP replaces the tiles above on interleaved DRAM (the U50 and the
+# kintex7, see multi_engine_shard.dram_interleaved): every window shrinks to
+# its private reserve + ISA + tensor slice, the windows sit back to back from 0,
+# and the shared pool is ONE contiguous region from their end to the end of the
+# device instead of N window tails. Same bytes for the shared pool, but no
+# shared object is limited by the largest single tail any more.
+# Cost on the U50: its map spreads eight engines reading the same offset over
+# all eight 1 GiB switch regions only when they are 1 GiB apart. Packed windows
+# reach 5-6 regions on average, and 8-core decode measured ~1% slower than on
+# the 1 GiB tiles (E4B 12.46 -> 12.32 tok/s); prefill is unchanged. A 512 MiB
+# stride is worse (4 regions, 12.22 tok/s).
+# The tiles stay for boards that place windows by memory controller (U55C,
+# kintex7_systolic).
 # Kintex's two controllers each own 2 GiB. Reuse the compact shared-pool
 # loader so MLP weights are only stored in their private shard layouts.
 KINTEX_TILE_BYTES = 2 << 30
@@ -1232,8 +1246,32 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # because the difference is 2 GiB of arena and the decode shard budget.
         self._tiled_map = False
         self._tile_bases = None
+        self._shared_region = None
         self._params_staged = 0        # bytes placed into the pool (tiled map only)
-        if self._kintex_tiled_map:
+        # THE PACKED MAP (interleaved DRAM: the U50 and the kintex7). Every
+        # address already spreads over all memory controllers, so a window no
+        # longer has to be a whole controller or switch region. Each core's
+        # window holds only what is private -- the shard reserve, its ISA and
+        # tensor slices -- the windows sit back to back from 0, and everything
+        # shared (weights, the tensor extent, KV cache) goes to ONE contiguous
+        # region above them that runs to the end of the device.
+        _packed = (dram_interleaved()
+                   and (self._kintex_tiled_map or multi_core >= TILED_MAP_MIN_ENGINES))
+        if _packed:
+            _window = (self._tile_private_reserve_bytes + TILED_ISA_BYTES
+                       + self._tile_tensor_bytes)
+            self._tile_window_bytes = -(-_window // PRIVATE_ALIGN) * PRIVATE_ALIGN
+            self._tile_bases = [i * self._tile_window_bytes for i in range(multi_core)]
+            _packed_end = multi_core * self._tile_window_bytes
+            _dram_bytes = user_dma_core.AVAILABLE_DRAM_SIZE_GB << 30
+            if _packed_end >= _dram_bytes:
+                raise MemoryError(
+                    f"{MODEL_TITLE}: {multi_core} private windows of "
+                    f"{self._tile_window_bytes / 2**20:.0f} MiB leave no shared region "
+                    f"in {_dram_bytes / 2**30:.0f} GiB")
+            self._shared_region = (_packed_end, _dram_bytes - _packed_end)
+            self._tiled_map = True
+        elif self._kintex_tiled_map:
             self._tile_bases = [0, KINTEX_TILE_BYTES]
             self._tiled_map = True
         elif multi_core >= TILED_MAP_MIN_ENGINES:
@@ -1255,7 +1293,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # against the map below, so a cached section is only reusable by a run
         # with the SAME layout. The program bin/meta path -- run and profile,
         # compiler and loader -- must agree on this tag.
-        self.dram_layout = (f"tile{multi_core}" if self._tiled_map
+        self.dram_layout = (f"pack{multi_core}" if self._shared_region is not None
+                            else f"tile{multi_core}" if self._tiled_map
                             else f"mcmap{multi_core}" if self._use_multicore_dram_layout
                             else "legacy")
         # Gemma4 DRAM layout. ONE model map, used at EVERY engine count: the
@@ -1328,16 +1367,18 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 multi_core,
                 windows=[(base, self._tile_window_bytes) for base in self._tile_bases],
                 isa_bytes=TILED_ISA_BYTES, tensor_bytes=self._tile_tensor_bytes,
-                verbose=True)
+                shared_region=self._shared_region, verbose=True)
             _actual = [self.mc_arena.window_base(i) for i in range(multi_core)]
             if _actual != self._tile_bases:
                 raise AssertionError(
                     "private windows do not match this board's map: "
                     f"{[hex(a) for a in _actual]} against "
                     f"{[hex(b) for b in self._tile_bases]}")
-            # The top of the highest window: the windows no longer start at 0
-            # and run up, so this is a bound, not an arena size.
-            self.DRAM_END = max(self._tile_bases) + self._tile_window_bytes
+            # The top of the map: the end of the shared region in the packed
+            # map; otherwise the top of the highest window (the windows no
+            # longer start at 0 and run up, so this is a bound, not a size).
+            self.DRAM_END = (sum(self._shared_region) if self._shared_region is not None
+                             else max(self._tile_bases) + self._tile_window_bytes)
             # Private space is claimed before a single shared byte is lent.
             self.mc_arena.reserve_private(self._tile_private_reserve_bytes)
             # Core 0 holds both master images at disjoint addresses, exactly as
@@ -1382,6 +1423,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                          self.VISION_ISA_BASE, self.LM_ISA_BASE,
                          [(r.base, r.weight_limit, r.isa_base, r.tensor_base)
                           for r in self.mc_arena.regions]]
+            if self._shared_region is not None:
+                placement.append(list(self._shared_region))
             signature = hashlib.sha256(json.dumps(placement).encode()).hexdigest()[:12]
             self.dram_layout += f"_{signature}"
         super().__init__(BASE_ADDR=engine_base,
@@ -2363,7 +2406,16 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         lines.append(f"- **--dev:** {args.dev}")
         lines.append(f"- **Clock / frequency:** {clock_ns:.1f} ns ({freq_mhz:.1f} MHz)")
         lines.append(f"- **Cores (--multi-core):** {cores}")
-        if self._tiled_map:
+        if self._shared_region is not None:
+            s_base, s_bytes = self._shared_region
+            lines.append(
+                f"- **DRAM layout:** {self.dram_layout} ({cores} x "
+                f"{self._tile_window_bytes // 2**20} MB private windows at "
+                f"[0x0, 0x{s_base:X}), then one shared region "
+                f"[0x{s_base:X}, 0x{s_base + s_bytes:X}) of {s_bytes // 2**20} MB for the "
+                f"shared weights, the {TILED_TENSOR_EXTENT_BYTES // 2**20} MB tensor "
+                f"arena and the KV cache)")
+        elif self._tiled_map:
             # No model map to report: the windows cover the device and the
             # shared weights live in their tails.
             lines.append(

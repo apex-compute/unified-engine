@@ -96,11 +96,13 @@ TENSOR  0xF100_0000 - 0xFB00_0000    160 MiB   activations + KV cache (122.8 use
 ISA     0xFB00_0000 - 0x1_0000_0000   80 MiB   master 24 MiB, then one slice per worker
 ```
 
-Multi-core execution preserves those relative offsets in the 6–8 GiB region
-and requires at least 8 GiB of memory. Private `[ weights | tensor ]` windows
-come from the shared `model_multicore_layout()` controller policy:
+Multi-core execution preserves those relative offsets in a 2 GiB model region
+placed by the shared `model_multicore_layout()` policy, which also gives the
+private `[ weights | tensor ]` windows:
 
-- U50: 512 MiB per engine in hardware SAXI order, leaving 496 MiB for weights.
+- U50 and kintex7 (interleaved DRAM): 512 MiB per engine from address 0, leaving
+  496 MiB for weights, and the model region directly above the windows -- 8 engines
+  `[4, 6)` GiB, 2 engines on the 4 GiB kintex7 `[1, 3)` GiB.
 - U55C, 16 GiB: one private 1 GiB controller region per engine; all twelve engines
   fit alongside the shared model region.
 - U55C, 8 GiB: up to six 1 GiB controller windows; seven to twelve engines use

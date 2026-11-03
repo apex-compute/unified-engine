@@ -25,16 +25,22 @@ class GemmaMulticoreLayout(unittest.TestCase):
             guard.start()
             self.addCleanup(guard.stop)
 
-    def engine(self, cores=2, gib=4, active=2):
+    # Engine clock per board: it is what tells the interleaved kintex7 (213 MHz
+    # release image) from kintex7_systolic (150 MHz), see dram_interleaved.
+    CLOCK_HZ = {2: 213.2e6, 8: 333.3e6, 12: 290e6}
+
+    def engine(self, cores=2, gib=4, active=2, clock_hz=None):
         with patch.multiple(core, ANDROMEDA_CORE_COUNT=cores,
-                            AVAILABLE_DRAM_SIZE_GB=gib, CLOCK_CYCLE_TIME_NS=4.0), \
+                            AVAILABLE_DRAM_SIZE_GB=gib, CLOCK_CYCLE_TIME_NS=4.0,
+                            CORE_CLOCK_FREQ_HZ=clock_hz or self.CLOCK_HZ[cores]), \
                 patch.object(gemma.Gemma3_UnifiedEngine, "weight_init"), \
                 patch.object(gemma.Gemma3_UnifiedEngine, "tensor_init"):
             return gemma.Gemma3_UnifiedEngine(multi_core=active)
 
-    def test_kintex_shards_use_both_ddr_controllers_and_clear_model(self):
+    def test_kintex_shards_sit_below_the_model_map(self):
+        # Interleaved DDR3: sequential 512 MiB windows, the 2 GiB model at 1 GiB.
         engine = self.engine()
-        self.assertEqual(engine._board_windows, [(0, 512 << 20), (3 << 30, 512 << 20)])
+        self.assertEqual(engine._board_windows, [(0, 512 << 20), (512 << 20, 512 << 20)])
         self.assertEqual(engine._params_dram_base, 1 << 30)
         self.assertEqual(engine._tensor_dram_base, 0x70000000)
         self.assertEqual(engine._program_dram_base, 0x90000000)
@@ -42,6 +48,11 @@ class GemmaMulticoreLayout(unittest.TestCase):
         self.assertEqual(model_end, 3 << 30)
         for base, size in engine._board_windows:
             self.assertTrue(base + size <= engine._model_base or base >= model_end)
+
+    def test_kintex7_systolic_shards_use_both_ddr_controllers(self):
+        engine = self.engine(clock_hz=150e6)
+        self.assertEqual(engine._board_windows, [(0, 512 << 20), (3 << 30, 512 << 20)])
+        self.assertEqual(engine._params_dram_base, 1 << 30)
         self.assertEqual({base // (2 << 30) for base, _ in engine._board_windows}, {0, 1})
 
     def test_alveo_uses_board_map_even_with_fewer_than_eight_active_engines(self):
@@ -52,13 +63,15 @@ class GemmaMulticoreLayout(unittest.TestCase):
                     engine = self.engine(cores, gib, active)
                     self.assertTrue(engine._use_multicore_dram_layout)
                     self.assertEqual(len(engine._board_windows), active)
-                    self.assertEqual(engine._model_base, 6 << 30)
+                    # Interleaved U50: the model follows the windows; the U55C
+                    # keeps its controller-aware 6 GiB base.
+                    self.assertEqual(engine._model_base,
+                                     active << 29 if cores == 8 else 6 << 30)
                     # The scheduler takes explicit hardware-order windows.
                     arena = shard.PrivateArena(active, windows=engine._board_windows)
                     self.assertIsNotNone(arena)
         u50 = self.engine(8, 8, 4)
-        self.assertEqual([base for base, _ in u50._board_windows],
-                         shard.alveo_core_bases(4))
+        self.assertEqual(u50._board_windows, [(i << 29, 512 << 20) for i in range(4)])
 
     def test_single_engine_retains_original_addresses_and_cache_name(self):
         engine = self.engine(active=1)
@@ -88,7 +101,10 @@ class GemmaMulticoreLayout(unittest.TestCase):
         self.assertNotEqual(engine._mc_tag(), original)
         engine._board_windows = [(0, 512 << 20), (2 << 30, 512 << 20)]
         self.assertNotEqual(engine._mc_tag(), original)
-        self.assertNotEqual(self.engine(8, 8, 2)._mc_tag(), original)
+        # Interleaved kintex7 and U50 give two engines the same addresses, so
+        # the same image serves both; a different placement does not.
+        self.assertEqual(self.engine(8, 8, 2)._mc_tag(), original)
+        self.assertNotEqual(self.engine(8, 8, 4)._mc_tag(), original)
 
     def test_allocators_fail_before_crossing_region_or_advancing_cursor(self):
         engine = self.engine()

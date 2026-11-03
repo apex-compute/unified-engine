@@ -2873,12 +2873,13 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
     def _vis_controller_copy_windows(self, copy_bytes, num_engines):
         """Free controller regions outside pi05's fixed [0, 4 GiB) model.
 
-        U50 offers one upper-stack 512 MiB segment per engine. U55C 16 GiB
-        chooses whole controllers around that model; its older 8 GiB image
+        The interleaved U50 packs one 512 MiB copy per engine consecutively
+        above the model (any placement reads at the same rate there). U55C 16
+        GiB chooses whole controllers around that model; its older 8 GiB image
         has only four free controllers. Kintex has no space outside the model
         and keeps the capacity-limited params/tensor copy path.
         """
-        from multi_engine_shard import board_private_windows
+        from multi_engine_shard import board_private_windows, dram_interleaved
         cores, gib = user_dma_core.ANDROMEDA_CORE_COUNT, user_dma_core.AVAILABLE_DRAM_SIZE_GB
         if cores is None or gib is None:
             user_dma_core.configure_clock_from_hardware()
@@ -2887,13 +2888,19 @@ class Pi05Libero_UnifiedEngine(UnifiedEngine):
             raise ValueError(f"{num_engines} vision engines exceed HW_INFO count {cores}")
         if gib < 8:
             return []
-        if cores == 12 and gib == 16:
+        if dram_interleaved():
+            slots = ((gib - 4) << 30) // (512 << 20)
+            board = None
+            windows = [((4 << 30) + i * (512 << 20), 512 << 20)
+                       for i in range(min(num_engines, slots))]
+        elif cores == 12 and gib == 16:
             board = board_private_windows(num_engines, reserve=(0, 4 << 30))
         else:
             board = board_private_windows(8 if cores == 12 else num_engines)
-        windows = [(base, size) for window in board for base, size in window.segments
-                   if base >= (4 << 30)]
-        windows = windows[:num_engines]
+        if board is not None:
+            windows = [(base, size) for window in board for base, size in window.segments
+                       if base >= (4 << 30)]
+            windows = windows[:num_engines]
         if any(copy_bytes > size for _, size in windows):
             raise MemoryError(f"vision weight set ({copy_bytes} bytes) exceeds a controller window")
         return windows

@@ -101,8 +101,8 @@ _silence_talker_token_id_warnings()
 
 import user_dma_core
 from program_heartbeat import board_precheck
-from multi_engine_shard import (MultiEngineScheduler, require_multicore_dram,
-                                tiled_window_bases)
+from multi_engine_shard import (MultiEngineScheduler, dram_interleaved,
+                                require_multicore_dram, tiled_window_bases)
 from user_dma_core import UnifiedEngine, set_dma_device
 
 
@@ -3976,20 +3976,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="engine count; this model requires exactly 8",
     )
     parser.add_argument(
-        "--layout", choices=("windowed", "flat"), default="windowed",
-        help="DRAM map: eight private 1 GiB windows (default), or one "
-             "consecutive 8 GiB range where every stage's weights stay resident",
-    )
-    parser.add_argument(
         "--run_from_bin", "--run-from-bin", action="store_true",
-        help="with --layout flat: do not compile. Load the stage programs from the "
+        help="flat layout (the U50): do not compile. Load the stage programs from the "
              "existing programs bin (and the compilers' state and the speech weights "
              "stored beside it), checked against this request; a bin built for a "
              "different request is refused. Build it by running once without the flag.",
     )
     parser.add_argument(
         "--max-context", type=int, default=None,
-        help="with --layout flat: build for at most this many tokens; by default "
+        help="flat layout (the U50): build for at most this many tokens; by default "
              "the largest context the DRAM left after every stage's weights allows",
     )
     prompt_source = parser.add_mutually_exclusive_group()
@@ -4225,10 +4220,6 @@ def main() -> None:
         parser.error("--frames must be positive")
     if args.frames > 1 and not args.image:
         parser.error("--frames requires --image")
-    if args.run_from_bin and args.layout != "flat":
-        print("[run_from_bin] only applies to --layout flat; the windowed layout "
-              "always builds its programs")
-        args.run_from_bin = False
     with _exclusive_run_lock():
         _main_locked(parser, args)
 
@@ -4238,6 +4229,16 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
     args.image = _resolve_sample(args.image, DEFAULT_IMAGE, "--image")
     args.audio = _resolve_sample(args.audio, DEFAULT_AUDIO, "--audio")
     engine_kwargs = resolve_engine_config(parser, args)
+    # HW_INFO has been read, so the board picks the DRAM map: the consecutive
+    # flat map wherever DRAM is interleaved over all memory controllers (the
+    # U50), and the per-controller windows only on the U55C, whose windows are
+    # its memory controllers.
+    layout = "flat" if dram_interleaved() else "windowed"
+    print(f"[layout] {layout}")
+    if args.run_from_bin and layout != "flat":
+        print("[run_from_bin] only applies to the flat layout; the windowed layout "
+              "always builds its programs")
+        args.run_from_bin = False
 
     cfg = apply_vision_resolution(
         Qwen25OmniUnifiedEngine.load_config(script_dir=SCRIPT_DIR),
@@ -4263,7 +4264,7 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
                      if args.speak is not None and not args.speak_host
                      else PREFILL_INPUT_TOKEN_LIMIT)
     flat_plan = None
-    if args.layout == "flat":
+    if layout == "flat":
         # Weights first: the plan sizes them, then the context that fits what
         # is left. It needs no hardware, so it also bounds the prompt check.
         stages = {"lm"}
@@ -4307,7 +4308,7 @@ def _main_locked(parser: argparse.ArgumentParser, args) -> None:
         script_dir=SCRIPT_DIR, fpga_build=fpga_build,
         vision_res=args.vision_res,
         fpga_talker=args.speak is not None and not args.speak_host,
-        layout=args.layout,
+        layout=layout,
         flat_plan=flat_plan,
         **engine_kwargs
     )

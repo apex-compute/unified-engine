@@ -57,10 +57,10 @@ from multi_engine_shard import (ALVEO_BOARD_CORES, ALVEO_U55C_BOARD_CORES,
                                 require_multicore_dram)
 
 # The board-aware layout keeps the original two-GiB model offsets together
-# while placing private weight shards in controller-aware windows.
-# Kintex-7 uses model [1, 3) GiB and private windows at 0 and 3 GiB; Alveo
-# uses its HBM controller map and reserves [6, 8) GiB for the model.
-# Unknown boards retain the historical layout policy below.
+# and places the private weight shards beside them: on the interleaved U50,
+# U55C and Kintex-7 the shards follow one another from 0 and the model follows
+# them (multi_engine_shard.model_multicore_layout). Unknown boards retain the
+# historical layout policy below.
 MULTI_CORE_MAX_ENGINES = 12
 MULTI_CORE_FIXED_MAP_MIN_ENGINES = 8
 MULTI_CORE_ENGINE_WINDOW_BYTES = MULTICORE_WINDOW_BYTES
@@ -69,7 +69,7 @@ MULTI_CORE_DRAM_LIMIT = 0x200000000
 MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
 MULTI_CORE_MODEL_SPAN = MULTI_CORE_DRAM_LIMIT - MULTI_CORE_MODEL_BASE
 BOARD_MAP_PROFILES = {(KINTEX7_BOARD_CORES, 4), (ALVEO_BOARD_CORES, 8),
-                      (ALVEO_U55C_BOARD_CORES, 8), (ALVEO_U55C_BOARD_CORES, 16)}
+                      (ALVEO_U55C_BOARD_CORES, 16)}
 
 
 def _board_multicore_map(num_engines: int):
@@ -311,8 +311,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self._board_windows = None
         self._model_base = user_dma_core.DRAM_START_ADDR
         # Select by the hardware signature even when only two engines of an
-        # Alveo board are active. A divided low arena can place both shards
-        # behind the same controller on Kintex-7.
+        # Alveo board are active.
         if self.multi_core > 1:
             if user_dma_core.AVAILABLE_DRAM_SIZE_GB is None:
                 user_dma_core.configure_clock_from_hardware()
@@ -3373,7 +3372,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             else:
                 from gemma3_numeric import Gemma3_NumericEngine
                 _original_print("[Numeric] Running host prefill and first-decode references...")
-                _num_ue = Gemma3_NumericEngine(script_dir=self.script_dir, local_weights=self.local_weights)
+                # Host-only reference: initialize_model=False skips weight_init()/tensor_init(),
+                # which would re-upload the weights and re-allocate DRAM on the board mid-run.
+                _num_ue = Gemma3_NumericEngine(script_dir=self.script_dir, local_weights=self.local_weights,
+                                               initialize_model=False)
+                _num_ue.embedding_weight = self.embedding_weight
                 _, _ref_kv = _num_ue._compute_torch_prefill(tuple(prefill_seq), self.LAYER_SIZE)
                 _, _dec_new_kv = _num_ue._compute_torch_decoder(self.prefill_seq[-1], _ref_kv, self.LAYER_SIZE)
                 self._numeric_ref_cache = (_ref_cache_key, (_ref_kv, _dec_new_kv))

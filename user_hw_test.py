@@ -29,6 +29,11 @@ from read_trace import (
 )
 import torch
 
+from attention_reference import (
+    fp32_attention_reference,
+    snr_db as attention_snr_db,
+)
+
 from user_dma_core import (
     ALU_MODE_SET,
     DMA_DEVICE_C2H,
@@ -155,10 +160,9 @@ GEMMA3_EXPECTED_TOKENS = 76
 # so it is clock-independent. Multi-core limits are measured separately below.
 _GEMMA3_SINGLE_CORE_MAX_CYCLES_PER_TOKEN = 20_000_000
 # Multi-core decode floors, MEASURED per core count rather than derived from the
-# single-core floor. Scaling is set by DRAM bandwidth, not by core count, and the
-# private weight placement must actually select different controllers. Kintex-7
-# now places decode shards at 0 and 3 GiB around the shared [1,3) GiB model;
-# the earlier low-2GiB placement sent both engines to one DDR controller.
+# single-core floor. Scaling is set by DRAM bandwidth, not by core count. The
+# U50 and kintex7 interleave DRAM over all controllers, so their decode shards
+# simply follow one another (multi_engine_shard.model_multicore_layout).
 #
 # Values carry deliberate slack over the measurements below, because DRAM speed is
 # the least stable thing being measured here -- it moves with refresh, temperature
@@ -178,19 +182,15 @@ KINTEX7_SYSTOLIC_CSR_BASE_ADDR = 0x02020000
 
 
 # The per-engine DRAM map is board policy and lives in multi_engine_shard
-# (board_private_windows / EngineWindow), next to the HBM controller maps it is
-# derived from -- not here. This module only consumes it.
+# (board_private_windows / EngineWindow) -- not here. This module only
+# consumes it.
 
 
 def _make_multi_engine_ues(num_engines: int):
     """Build ``num_engines`` engines on their board-assigned private windows.
 
-    Returns the engines and their PRIMARY segment bases. An engine's window may
-    be several non-contiguous segments (a U50 owns one 512 MB controller region
-    on each of the two HBM stacks); the allocator cursors below all live in the
-    primary segment, so callers that only need ENGINE_FOOTPRINT_BYTES are fine
-    with the bases alone. Anything wanting the whole window must ask
-    multi_engine_shard.board_private_windows() for the segments.
+    Returns the engines and their window bases; the allocator cursors below all
+    live in the window's first segment.
     """
     import user_dma_core
     import multi_engine_shard
@@ -421,6 +421,11 @@ def write_test_summary(path: str = "user_hw_test_summary.md") -> None:
         # Never synthesize values when a run aborts before the register read.
         hw_info_line = f"unavailable: {error}"
     hw_summary = f"\n**Hardware Info (hardware register only):**\n{hw_info_line}\n"
+    hw_summary += "Tensor formats: per instruction (0=BF16, 1=FP16); arithmetic: BF19\n"
+    hw_summary += (
+        "Unified attention reference: FP32 math from stored inputs, independent of hardware "
+        "scratch/output format.\n"
+    )
 
     with open(path, "w") as f:
         f.write(text)
@@ -638,9 +643,9 @@ def multi_core_dram_speed_test(data_size_kB: int = 512, num_engines: int = 4):
     every worker. The measured latency therefore covers the whole concurrent
     read.
 
-    HBM hardware only: the layout is based at 0x0 and uses the shared
-    multi_engine_shard.board_private_windows() policy, which is controller-
-    aligned so the engines do not contend. Engines are NOT software-reset here.
+    4 GB or larger hardware only: the layout is based at 0x0 and uses the
+    shared multi_engine_shard.board_private_windows() policy. Engines are NOT
+    software-reset here.
     """
     import user_dma_core
 
@@ -1445,8 +1450,11 @@ def unified_attention_test(batch: int = 256, aligned_seq_len: int = 256, head_di
 
     The inner ``_run_case`` also supports any partial dynamic subset (dynamic-only, dynamic+addr,
     dynamic+scale, ...); those combos are core-supported but intentionally not exercised here — only
-    the two endpoints (fully static, fully dynamic) are tested.
+    the two endpoints (fully static, fully dynamic) are tested. Attention uses
+    BF16 inputs/output and the compiler's default FP16 intermediates. The FP32
+    PyTorch reference has no intermediate or final storage casts.
     """
+
     def _run_case(dynamic=False, dynamic_addr=False, dynamic_scale=False, dynamic_headdim=False):
         ue = UnifiedEngine()
         if aligned_seq_len % UE_VECTOR_SIZE != 0:
@@ -1557,21 +1565,20 @@ def unified_attention_test(batch: int = 256, aligned_seq_len: int = 256, head_di
         # Match the BF16 coefficient programmed by the core's default scaling
         # and the runtime scale register. Reinterpret its bits for the reference.
         reference_scale_bits = ue.float_to_bf16(1.0 / math.sqrt(head_dim))
-        reference_scale = torch.tensor(reference_scale_bits, dtype=torch.uint16).view(torch.bfloat16)
-        q_scaled = q * reference_scale
-        scores = q_scaled @ k.t()
-        scores = scores + bias
-        probs = torch.softmax(scores.float(), dim=-1).to(torch.bfloat16)
-        ref = probs @ v
-
-        snr_db_ref = calculate_snr(ref, output)
+        ref = fp32_attention_reference(
+            q, k, v, bias, scale_bits=reference_scale_bits,
+        )
+        snr_db_ref = attention_snr_db(ref, output)
         print(f"Reference SNR Analysis for Unified Attention: {snr_db_ref:.2f} dB")
-        assert snr_db_ref >= 32 or snr_db_ref == float("inf"), f"SNR {snr_db_ref:.2f} dB must be at least 32 dB"
+
+        assert snr_db_ref >= 32 or snr_db_ref == float("inf"), (
+            f"FP32 reference SNR {snr_db_ref:.2f} dB must be at least 32 dB"
+        )
 
         tag = ("+dynamic" if dynamic else "") + ("+dynaddr" if dynamic_addr else "") \
             + ("+dynscale" if (dynamic_scale and not dynamic_headdim) else "") + ("+dynheaddim" if dynamic_headdim else "")
         record_test(
-            f"unified_attention{tag}",
+            f"unified_attention+ref_fp32_v1+scratch_fp16{tag}",
             f"batch={batch}, aligned_seq_len={aligned_seq_len}, head_dim={head_dim}",
             snr_db=snr_db_ref,
             gflops=report_flop_rate_gflops,
@@ -12282,7 +12289,7 @@ if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='User DMA Operations for Unified Engine')
     parser.add_argument('--dev', type=str, default='xdma0',
-                        help='DMA device name (e.g., xdma0, xdma1). Default: xdma0')
+                        help='DMA device name or alias (e.g., xdma0, efinix_m2). Default: xdma0')
     parser.add_argument('--base-addr', type=lambda x: int(x, 0), default=None,
                         help='AXI-Lite register base address (default: device-specific).')
     parser.add_argument(
@@ -12359,8 +12366,8 @@ if __name__ == "__main__":
     # --multi-core N runs on the FIRST N engines of the board HW_INFO reports,
     # so the 12-core U55C build can be exercised 8 engines at a time. Only the
     # count used by the tests moves: ANDROMEDA_CORE_COUNT stays the board
-    # signature that board_private_windows() keys its HBM map on, so the
-    # engines that do run keep their controller-aligned bases.
+    # signature that board_private_windows() keys its map on, so the engines
+    # that do run keep the board's bases.
     if args.multi_core is not None:
         if not 1 <= args.multi_core <= engine_count:
             parser.error(
@@ -12878,6 +12885,15 @@ if __name__ == "__main__":
     # End-to-end convolution models vs CPU references (child processes; the
     # wrapper restores both RNG streams, so the end fingerprint is unchanged).
     conv_model_tests()
+
+    # Mixed-format coverage runs after every legacy case and preserves both
+    # RNG streams, so BF16 inputs, thresholds and the end fingerprint remain
+    # directly comparable to earlier images.
+    if engine_count == 1:
+        from mixed_storage_hw_test import run_mixed_suite
+        run_mixed_suite(extended=args.ext, record=record_test)
+    else:
+        print("Mixed tensor operator suite: core-0 single-engine coverage only")
 
     _ALL_TESTS_PASSED_BEFORE_SUMMARY = True
     # Clean run: write the summary directly and hard-exit 0 so the atexit hook

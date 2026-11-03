@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import user_dma_core as core
-from multi_engine_shard import alveo_core_bases
 
 _original_print = builtins.print
 try:
@@ -28,17 +27,22 @@ class ControllerModelTests(unittest.TestCase):
         guard.start()
         self.addCleanup(guard.stop)
 
+    # Engine clock per board: it is what tells the interleaved kintex7 (213 MHz
+    # release image) from kintex7_systolic (150 MHz), see dram_interleaved.
+    CLOCK_HZ = {2: 213.2e6, 8: 333.3e6, 12: 290e6}
+
     def smol_engine(self, cores=2, gib=4, active=2):
         with patch.multiple(core, ANDROMEDA_CORE_COUNT=cores,
-                            AVAILABLE_DRAM_SIZE_GB=gib, CLOCK_CYCLE_TIME_NS=4), \
+                            AVAILABLE_DRAM_SIZE_GB=gib, CLOCK_CYCLE_TIME_NS=4,
+                            CORE_CLOCK_FREQ_HZ=self.CLOCK_HZ[cores]), \
                 patch.object(smol.SmolVLM2_UnifiedEngine, 'DECODE_NUM_ENGINES', active):
             engine = smol.SmolVLM2_UnifiedEngine(num_engines=max(2, active))
             engine.DECODE_NUM_ENGINES = active
             return engine
 
-    def test_smol_kintex_separates_weight_controllers_and_model(self):
+    def test_smol_kintex_windows_sit_below_the_model(self):
         engine = self.smol_engine()
-        self.assertEqual(engine._decode_windows, [(0, 512 << 20), (3 << 30, 512 << 20)])
+        self.assertEqual(engine._decode_windows, [(0, 512 << 20), (512 << 20, 512 << 20)])
         self.assertEqual(engine._params_dram_base, 1 << 30)
         self.assertEqual(engine._tensor_dram_base, 2 << 30)
         self.assertEqual(engine._model_end, 3 << 30)
@@ -46,11 +50,12 @@ class ControllerModelTests(unittest.TestCase):
     def test_smol_u50_and_u55_preserve_private_windows_outside_model(self):
         for cores, gib, active in ((8, 8, 8), (12, 16, 8), (12, 8, 8)):
             engine = self.smol_engine(cores, gib, active)
-            self.assertEqual(engine._model_base, 6 << 30)
+            # Interleaved U50: the model follows the windows; U55C keeps 6 GiB.
+            self.assertEqual(engine._model_base, 4 << 30 if cores == 8 else 6 << 30)
             for base, size in engine._decode_windows:
                 self.assertTrue(base + size <= engine._model_base or base >= engine._model_end)
-        self.assertEqual([b for b, _ in self.smol_engine(8, 8, 8)._decode_windows],
-                         alveo_core_bases(8))
+        self.assertEqual(self.smol_engine(8, 8, 8)._decode_windows,
+                         [(i << 29, 512 << 20) for i in range(8)])
 
     def test_smol_single_engine_retains_original_snapshot_names(self):
         engine = self.smol_engine(active=1)
@@ -135,11 +140,11 @@ class ControllerModelTests(unittest.TestCase):
     def pi_engine(self):
         return object.__new__(pi05.Pi05Libero_UnifiedEngine)
 
-    def test_pi05_u50_replica_for_each_engine_uses_upper_owned_segment(self):
+    def test_pi05_u50_replicas_pack_consecutively_above_the_model(self):
         with patch.multiple(core, ANDROMEDA_CORE_COUNT=8, AVAILABLE_DRAM_SIZE_GB=8):
             windows = self.pi_engine()._vis_controller_copy_windows(280 << 20, 8)
-            self.assertEqual([base for base, _ in windows], alveo_core_bases(8, stack=1))
-            self.assertEqual(len({base // (512 << 20) for base, _ in windows}), 8)
+            self.assertEqual(windows, [((4 << 30) + i * (512 << 20), 512 << 20)
+                                       for i in range(8)])
             with self.assertRaises(MemoryError):
                 self.pi_engine()._vis_controller_copy_windows(513 << 20, 8)
 

@@ -95,9 +95,11 @@ python models/smolvlm2/smolvlm2_test.py --dev xdma1 --engines 2 --decode-engines
 python models/smolvlm2/smolvlm2_test.py --dev xdma0 --engines 8 --decode-engines 8 --lm-enable --greedy-enable
 ```
 
-Kintex7 places the shared 2 GiB model at 1–3 GiB and private weight windows at
-0 and 3 GiB, using both DDR controllers. U50 and U55C use the shared board map
-with the model at 6–8 GiB. The complete address geometry is included in snapshot
+On interleaved DRAM (kintex7, U50) the private weight windows are 512 MiB per
+engine from 0 and the shared 2 GiB model sits directly above them: kintex7 at
+1–3 GiB, U50 with 8 decode engines at 4–6 GiB. The systolic kintex7 image puts
+its windows at 0 and 3 GiB, one per DDR controller, and the U55C uses its
+controller map with the model at 6–8 GiB. The complete address geometry is included in snapshot
 and program cache names and metadata; changed layouts require fresh artifacts.
 Set engine counts in the constructor before loading weights when using Python
 rather than the CLI. The separate `smolvlm2_run_from_bin.py` remains a single

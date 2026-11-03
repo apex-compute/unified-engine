@@ -1,4 +1,4 @@
-"""Controller-private weight shards for models with unrolled M=1 decoders.
+"""Private weight shards for models with unrolled M=1 decoders.
 
 The scheduler owns allocation, weight copying, and four-phase rendezvous. This
 adapter only matches a model's original projection addresses to those shards
