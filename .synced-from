@@ -2,7 +2,7 @@
 # The files below are owned by andromeda; edits made here are carried back
 # by --backsync, using the commit that last changed this file as the base.
 andromeda_commit=f55c378be2f35422812619b3d5bb548b7145604d
-hw_hash=39221277
+hw_hash=221538b4
 files:
   andromeda_hw_info.py
   user_dma_core.py
