@@ -16,13 +16,22 @@ contiguously ("tiled") for the host to unpack.
 
   1x1 conv    with C and OC multiples of 64 the map IS a row-major [pixels, C]
               matrix: one quantized-B matmul (A @ W^T + bias) per image row.
-  conv        the layer driver's exact tile grid; per tile one strided DRAM->URAM
-              read of the window straight from the padded map, CONV2D, and strided
-              URAM->DRAM writes of the tile rows into the output map. Tile ranges
-              of every (OC chunk, geometry group) are split over the engines. The
-              walker re-reads its weight stream per tile pixel, so each conv is
-              preceded by an on-engine expansion of its unrepeated weight blocks
-              (loaded once per run in the constant image).
+  3x3 conv    (C and OC multiples of 64, padded output) nine accumulated row-block
+              matmuls: for tap (ky, kx) the A operand of output rows y0..y0+R-1 is
+              the R*Wp consecutive input pixels starting at padded pixel (y0+ky, kx),
+              so there is no im2col and the matmul keeps its B tile across 64 A rows
+              (the CONV2D walker re-streams the whole IF8 weight block per output
+              pixel, one byte per MAC, which the 32 B/cycle AXI caps at half rate).
+              The partial sums accumulate in place through the full-matrix C operand;
+              the border pixels of the rows get junk and are re-zeroed afterwards.
+  conv        (the rest: conv_in with C = 32, the tiled conv_out) the layer driver's
+              exact tile grid; per tile one strided DRAM->URAM read of the window
+              straight from the padded map, CONV2D, and strided URAM->DRAM writes of
+              the tile rows into the output map. Tile ranges of every (OC chunk,
+              geometry group) are split over the engines. The walker re-reads its
+              weight stream per tile pixel, so each conv is preceded by an on-engine
+              expansion of its unrepeated weight blocks (loaded once per run in the
+              constant image).
   GroupNorm   pass 1 lane-wise pixel sums into slotted accumulators (flushed every
               32 chunks); the flush blocks are transposed with an identity matmul
               and summed by a ones matmul on the bf20 ladder; a group-average
@@ -65,6 +74,7 @@ NEWTON_ITERS = 40                  # rsqrt from y0 = 2^-10 up to 1e3
 MAP_ALIGN = 256 * 1024             # map buffers are padded so round-based ops may overrun
 K_PIECE = 8192                     # ladder reduction piece (rows) per matmul
 GN_FLUSH = udc.GROUP_NORM_MAX_ACC_DEPTH
+MM9_MAX_M = 2048                   # pixels per row-block matmul of a 3x3 conv (R = MM9_MAX_M // Wp rows)
 
 
 def emitter_hash() -> str:
@@ -377,6 +387,9 @@ class Flux2VaeOneShot:
         assert wc_c == C, f"{key}: weight C_in {wc_c} != activation C {C}"
         if kh == kw == 1 and C % UE_VECTOR_SIZE == 0 and OC % UE_VECTOR_SIZE == 0 and out_layout != "tiled":
             return self.conv1x1(x, key, out_layout)
+        if (kh, kw, pad) == (3, 3, 1) and C % UE_VECTOR_SIZE == 0 and OC % UE_VECTOR_SIZE == 0 \
+                and x.layout == "padded" and out_layout == "padded":
+            return self.conv3x3_mm(x, key)
         OC_eff = OC if (OC % UE_VECTOR_SIZE == 0 or out_layout == "tiled") else _align(OC, UE_VECTOR_SIZE)
         g = self._conv_geometry(C, H, Wd, OC_eff, kh, kw, pad)
         n_oc, nck = g["oc_chunk"], g["n_chunks"]
@@ -413,6 +426,30 @@ class Flux2VaeOneShot:
                         WEXP=WEXP, WBLK=WBLK, SA=SA, BA=BA, block_bytes=block_bytes, work=per_engine,
                         out_layout=out_layout))
         return out if out_buf is None else out_buf
+
+    def conv3x3_mm(self, x: Buf, key: str):
+        """3x3 conv as nine accumulated row-block matmuls (see the module notes).
+        Per engine: a contiguous range of output rows, cut into groups of R rows; per tap
+        and group one quantized-B matmul with M = R * Wp pixels (the two border pixels of
+        every row are computed too and zeroed at the end)."""
+        OC, C, kh, kw, pad = self.shapes[key]
+        _, H, Wd = x.shape()
+        ct = C // UE_VECTOR_SIZE
+        Wp = x.Wp
+        codes = self._calloc(9 * OC * C)
+        scales = self._calloc(9 * OC * ct * 2)
+        bias = self._calloc(OC * 2)
+        self.conv_chunks[key] = dict(mm9=True, codes=codes, scales=scales, bias=bias, OC=OC, C=C)
+        out = self._new_buf("padded", OC, H, Wd)
+        # tap (2, 2) of the last group reads two pixels past the padded map: inside the aligned buffer
+        assert ((H + 2) * Wp + 2) * ct * LINE <= x.size, key
+        R = max(1, min(H, MM9_MAX_M // Wp))
+        groups = [[(y0, min(R, r1 - y0)) for y0 in range(r0, r1, R)] for r0, r1 in _split(H, self.ne)]
+        macs = H * Wd * OC * kh * kw * C
+        self.macs += macs
+        self._step("conv3x3mm", key, out, dict(x=x, out=out, C=C, OC=OC, Wp=Wp, codes=codes, scales=scales,
+                                               bias=bias, groups=groups, macs=macs))
+        return out
 
     def conv1x1(self, x: Buf, key: str, out_layout: str):
         """[pixels, C] @ W[OC, C]^T + bias, one matmul per image row (M = W)."""
@@ -637,6 +674,39 @@ class Flux2VaeOneShot:
             self._zero_borders(out)
         if e == 0:
             self.ue._flops_acc += 2 * st["macs"]
+        self._B()
+
+    def _emit_conv3x3mm(self, st):
+        eng, e = self.eng, self.e
+        x, out, C, OC, Wp = st["x"], st["out"], st["C"], st["OC"], st["Wp"]
+        ct = C // UE_VECTOR_SIZE
+        px_in, px_out = C * 2, OC * 2
+        groups = st["groups"][e]
+        if groups:
+            reg = eng.alloc_isa_reg()
+            for t in range(9):
+                ky, kx = divmod(t, 3)
+                Bm = st["codes"] + t * OC * C
+                Sc = st["scales"] + t * OC * ct * 2
+                for y0, R in groups:
+                    M = R * Wp
+                    a = x.addr + ((y0 + ky) * Wp + kx) * px_in
+                    o = out.addr + ((y0 + 1) * Wp + 1) * px_out
+                    eng.generate_instruction_add_set(reg, M)
+                    if t == 0:                                  # first tap carries the bias
+                        eng.matmat_mul_core(M=M, K=C, N=OC, A_DRAM_ADDR=a, B_DRAM_ADDR=Bm, OUTPUT_DRAM_ADDR=o,
+                                            is_B_quantized=True, data_type=TYPE.IF8, SCALE_DRAM_ADDR=Sc,
+                                            C_DRAM_ADDR=st["bias"], bias_mode="broadcast_N", gpr_M_reg=reg)
+                    else:                                       # accumulate in place
+                        eng.matmat_mul_core(M=M, K=C, N=OC, A_DRAM_ADDR=a, B_DRAM_ADDR=Bm, OUTPUT_DRAM_ADDR=o,
+                                            is_B_quantized=True, data_type=TYPE.IF8, SCALE_DRAM_ADDR=Sc,
+                                            C_DRAM_ADDR=o, bias_mode="full_matrix", gpr_M_reg=reg)
+            eng.release_isa_reg()
+        if e == 0:
+            self.ue._flops_acc += 2 * st["macs"]
+        self._B()                                               # every engine's rows (and spills) are in
+        if e == 0:
+            self._zero_borders(out)
         self._B()
 
     def _emit_conv1x1(self, st):
@@ -922,6 +992,18 @@ class Flux2VaeOneShot:
             c = weights["convs"][key]
             codes, bs, bias = c["codes"], c["block_scales"].to(torch.bfloat16), c["bias"]
             OC, C, kh, kw = codes.shape
+            if cc.get("mm9"):
+                ct = C // UE_VECTOR_SIZE
+                assert (kh, kw) == (3, 3) and tuple(bs.shape) == (OC, 9 * ct), key
+                cb, sb = bytearray(), bytearray()
+                for t in range(9):                      # block_scales are [oc, ky, kx, ct]: tap-major
+                    ky, kx = divmod(t, 3)
+                    cb += (codes[:, :, ky, kx].reshape(OC, C).to(torch.int16) & 0xFF).to(torch.uint8).numpy().tobytes()
+                    sb += _i16bytes(bs[:, t * ct:(t + 1) * ct].contiguous())
+                put(cc["codes"], bytes(cb))
+                put(cc["scales"], bytes(sb))
+                put(cc["bias"], _i16bytes(bias.to(torch.bfloat16)))
+                continue
             if cc.get("mm"):
                 # quantized-B matmul operands: codes [OC, C] int8 row-major, scales [OC, C/64] bf16, bias [OC]
                 assert (kh, kw) == (1, 1) and tuple(bs.shape) == (OC, C // UE_VECTOR_SIZE), key

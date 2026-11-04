@@ -48,8 +48,11 @@ every op. With one engine the stream is byte-for-byte the single-engine one.
 
 DRAM: the TE and DiT weight images time-share the params arena (both are
 DMA'd in at their phase), tensors persist across phases (prompt embedding and
-latents never leave DRAM), per-engine program slots follow the tensor arena,
-all addresses stay below the 4 GiB DMA limit.
+latents never leave DRAM), the 778 MB BF16 token embedding table sits at the
+top of the tensor region (resident; the TE program gathers the prompt's rows
+from it with one DMA pair per token whose addresses the host patches per
+prompt), per-engine program slots follow, all addresses stay below the 4 GiB
+DMA limit.
 
 Usage (repo root):
     python models/flux2_klein_4b/flux2_klein_4b_test.py --prompt "..." [--height 512 --width 512 --max-seq-len 512] [--engines max]
@@ -215,6 +218,7 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
         )
         self.cfg = cfg
         self.geo = geo
+        self.embed_base = int(lay["embed_dram_base"], 16)      # resident token embedding table
         self.bytes_per_element = BPE
         d, te = cfg["dit"], cfg["text_encoder"]
         self.D, self.Dm, self.NH, self.HD = d["hidden"], d["mlp_hidden"], d["heads"], d["head_dim"]
@@ -363,8 +367,8 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
         self.V_PRED, self.V_SCALED, self.X_DENORM = A(NI * self.CIN), A(NI * self.CIN), A(NI * self.CIN)
         self.VAE_TENSOR_BASE = self._align_up(self.get_tensor_dram_addr(), 4096)
         used = self.get_tensor_dram_usage()
-        limit = self._program_dram_base - self._tensor_dram_base
-        assert used <= limit, f"tensor arena overflow: {used / 1e6:.0f} MB > {limit / 1e6:.0f} MB"
+        limit = min(self._program_dram_base, self.embed_base) - self._tensor_dram_base
+        assert used <= limit, f"tensor arena overflow: {used / 1e6:.0f} MB > {limit / 1e6:.0f} MB (below the embedding table)"
         self.tensor_usage = used
 
     def load_constants(self, vae_weights: dict | None = None) -> None:
@@ -621,6 +625,9 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
     def emit_text_encoder_stream(self) -> None:
         L, H, hd, nh, nkv, I = self.L, self.TE_H, self.TE_HD, self.TE_NH, self.TE_NKV, self.TE_I
         self._prime_regs("te")
+        if self.e == 0:
+            self.te_embed_gather = self._emit_embed_gather([0] * L)      # row addresses patched per prompt
+        self.B()
         cur, nxt = 0, 1
         for li in range(self.TE_L):
             if self.e == 0 and li % 9 == 0:
@@ -650,6 +657,45 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
                 k = self.TE_TAPS.index(li + 1)
                 self._scatter_rows(XO, H * BPE, self.TXT_EMB_IN + k * H * BPE, self.J * BPE, L, H, "TE")
             cur, nxt = nxt, cur
+
+    def _emit_embed_gather(self, ids: list[int]) -> dict:
+        """Engine 0: copy the embedding row of every token from the resident table into
+        TE_X[0], one DRAM->URAM->DRAM pair per token. The row addresses are immediates,
+        so the host re-encodes this block per prompt (embed_gather_block) and DMAs it
+        over the program; the instruction ids are kept so the block is byte-compatible."""
+        row = self.TE_H * BPE
+        eng = self.cur
+        off = eng.get_program_dram_addr() + eng.get_capture_instruction_size_bytes() - self._phase_base
+        inst_id = eng._inst_id
+        for t, tok in enumerate(ids):
+            eng.accelerator_memory_to_sram(accelerator_dram_address=self.embed_base + int(tok) * row, sram_address=0,
+                                           element_size=0, memcpy_length_bytes=row)
+            eng.sram_to_accelerator_memory(sram_address=0, accelerator_dram_address=self.TE_X[0] + t * row,
+                                           element_size=0, memcpy_length_bytes=row)
+        return {"offset": off, "inst_id": inst_id, "tokens": len(ids), "row_bytes": row,
+                "bytes": 2 * len(ids) * user_dma_core.INSTRUCTION_SIZE_BYTES, "dst": self.TE_X[0]}
+
+    def embed_gather_block(self, meta: dict, ids: list[int]) -> bytes:
+        """The gather block of ``ids`` (host side, capture only): the bytes to DMA to
+        te_program_start_addr + te_embed_gather.offset before the TE phase."""
+        g = meta["te_embed_gather"]
+        assert len(ids) == g["tokens"], (len(ids), g["tokens"])
+        saved = (self.is_capture_on, self.capture_buffer, self.capture_count, self._inst_id,
+                 getattr(self, "_phase_base", 0), self.cur, self.e)
+        self.is_capture_on, self.capture_buffer, self.capture_count, self._inst_id = True, [], 0, g["inst_id"]
+        self._phase_base, self.cur, self.e = 0, self, 0
+        try:
+            self._emit_embed_gather(ids)
+            blob = b"".join(inst.get_bytes() for inst in self.capture_buffer)
+        finally:
+            (self.is_capture_on, self.capture_buffer, self.capture_count, self._inst_id,
+             self._phase_base, self.cur, self.e) = saved
+        assert len(blob) == g["bytes"], (len(blob), g["bytes"])
+        return blob
+
+    def load_embed_table(self, path: str) -> None:
+        """DMA the BF16 token embedding table to its resident address (above every tensor)."""
+        self._dma_blob(path, self.embed_base, "token embedding")
 
     # ============================================================
     # Program 2: DiT, steps unrolled (one engine's stream)
@@ -783,6 +829,7 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
         segment of its capture; the workers' programs are finalized by the
         scheduler. Returns (primary start, primary size, flops, worker addrs, worker blobs)."""
         base = self.get_program_dram_addr() + self.get_capture_instruction_size_bytes()
+        self._phase_base = base
         self._flops_acc = 0
         if self.sched is not None:
             self.sched.begin_program()
@@ -864,6 +911,7 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
             "dit_program_start_addr": dit[0], "dit_program_size": dit[1], "dit_flops": dit[2], "dit_worker_prog_addrs": dit[3],
             "vae_program_start_addr": vae[0], "vae_program_size": vae[1], "vae_flops": vae[2], "vae_worker_prog_addrs": vae[3],
             "tensor_dram_usage": self.tensor_usage, "params_image_size": self.params_image_size,
+            "embed_dram_base": self.embed_base, "te_embed_gather": self.te_embed_gather,
             "vae": vae_plan,
             "flag_clear_addrs": flag_clear,
             "compile_seconds": round(time.time() - t0, 1),
@@ -958,18 +1006,26 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
                 self.sched.preclear_flags()
                 self._flags_precleared = True
             self.sched.start_workers(meta[f"{name}_worker_prog_addrs"])
-        self.program_execute(meta[f"{name}_program_start_addr"], timeout=timeout, flops=meta[f"{name}_flops"])
+        latency_us, gflops = self.program_execute(meta[f"{name}_program_start_addr"], timeout=timeout,
+                                                  flops=meta[f"{name}_flops"])
+        # on-device figures of the phase (the wall time around it also holds the host side)
+        self.timings[f"{name}_device_s"] = float(latency_us) / 1e6
+        self.timings[f"{name}_gflops"] = float(gflops)
+        self.timings[f"{name}_flops"] = int(meta[f"{name}_flops"])
         if self.sched is not None:
             for w in self.workers:
                 w.wait_queue(120.0)
 
     def run_text_encoder(self, meta: dict, input_ids: torch.Tensor, attention_mask: torch.Tensor,
-                         embed_tokens: torch.Tensor, params_te_bin: str) -> torch.Tensor:
+                         params_te_bin: str) -> torch.Tensor:
+        """The token embedding table must be on the board (load_embed_table)."""
         L = self.L
         assert input_ids.shape[-1] == L
         self._dma_blob(params_te_bin, self.params_base, "TE weights")
-        emb = embed_tokens[input_ids.reshape(-1)].to(torch.bfloat16)
-        self.dma_to_accelerator_memory(self.TE_X[0], emb)
+        blk = self.embed_gather_block(meta, input_ids.reshape(-1).tolist())
+        addr = meta["te_program_start_addr"] + meta["te_embed_gather"]["offset"]
+        n = self.dma_write(self.h2c_device, addr, blk, len(blk))
+        assert n == len(blk), "embedding gather block: short DMA"
         valid = int(attention_mask.sum())
         bias = torch.full((L, L), float("-inf"), dtype=torch.bfloat16)
         bias.masked_fill_(torch.tril(torch.ones(L, L, dtype=torch.bool)), 0.0)
@@ -1164,8 +1220,8 @@ def main(argv=None) -> int:
         del te
         fpga_embeds = host_embeds
     else:
-        embed_tokens = load_embed_tokens(cfg, paths)
-        fpga_embeds = ue.run_text_encoder(meta, input_ids, attention_mask, embed_tokens, paths["params_te_bin"])
+        ue.load_embed_table(paths["embed_tokens_bin"])
+        fpga_embeds = ue.run_text_encoder(meta, input_ids, attention_mask, paths["params_te_bin"])
         _log(f"  TE phase {ue.timings['te_s']:.1f}s; embeds finite={bool(torch.isfinite(fpga_embeds.float()).all())}")
 
     # ---------------- phase 2: DiT ----------------

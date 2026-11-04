@@ -10,8 +10,9 @@ three phases and writes the PNG.
 | File | Purpose |
 |---|---|
 | `flux2_klein_4b_test.py` | Build + run. Exports weights on first use, compiles the two programs, runs TE -> DiT -> VAE, scores against the host IF4 reference, prints `TEST_RESULT`. `--compile-only` needs no board. |
-| `flux2_klein_4b_run_from_bin.py` | Run-only: one configuration per call from the prebuilt weight files and that configuration's compiled programs (never quantizes or compiles; no host reference unless `--reference`). |
-| `flux2_klein_4b_vae.py` | Phase 3: planner + emitter of the VAE decoder as one sharded program (convs straight from the padded maps, 1x1 convs as matmuls, on-device GroupNorm statistics, SiLU, residual add, upsample, mid-block attention), plus its IF8 host oracle with per-op intermediates. |
+| `flux2_klein_4b_run_from_bin.py` | Run-only from the prebuilt weight files and compiled programs (never quantizes or compiles; no host reference unless `--reference`). One image per call, or `--serve`: one JSON job per stdin line in a process that keeps the device, tokenizer, VAE weights and the last program set (the token embedding table is sent once and stays resident); the TE / DiT weight images are re-sent every run because the TE image, the DiT image and the VAE arena time-share the params arena below the 4 GiB DMA window. |
+| `flux2_klein_4b_server.py` | Minimal web UI (standard library only): prompt box, resolution picker over the compiled program sets, seed; runs `flux2_klein_4b_run_from_bin.py` one job at a time and shows the PNG. Selecting a configuration shows its weight images, program sizes and FLOPs per phase; a finished run shows every phase's on-device GFLOPS and share of the raw peak (128 FLOP/cycle/engine at the HW_INFO clock). "Keep the board loaded" (checkbox; `--no-reload` ticks it by default) drives one resident `--serve` runner that keeps the device, the host state and the program set between runs. |
+| `flux2_klein_4b_vae.py` | Phase 3: planner + emitter of the VAE decoder as one sharded program (3x3 convs as nine accumulated row-block matmuls over the padded maps, 1x1 convs as matmuls, on-device GroupNorm statistics, SiLU, residual add, upsample, mid-block attention), plus its IF8 host oracle with per-op intermediates. |
 | `flux2_klein_4b_vae_probe.py` | On-board bring-up of the VAE phase: compiles any prefix of the decoder graph and scores the last op against the host intermediate. |
 | `flux2_klein_4b_weights.py` | Checkpoint -> `params_te.bin` (IF4 Qwen3), `params_dit.bin` (IF4 DiT), `vae_weights.pt` (IF8 convs); shape-only layout planner the compiler addresses from. |
 | `flux2_klein_4b_ref.py` | Plain-torch reference of the whole pipeline (bit-identical to diffusers in fp32); IF4 / IF8 fake-quant helpers. |
@@ -40,6 +41,9 @@ python models/flux2_klein_4b/flux2_klein_4b_test.py --compile-only --height 512 
 # run one configuration from the prebuilt files (no quantization, no compile): ~38 s for 256x256, ~2 min 10 s for 512x512 on 8 engines
 python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --height 256 --width 256 --max-seq-len 64 --engines 8 --prompt "A photo of a red sports car on a mountain road at sunset" --out car_256.png
 python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --height 512 --width 512 --max-seq-len 64 --engines 8 --prompt "A photo of a red sports car on a mountain road at sunset" --out car_512.png
+
+# web UI on http://127.0.0.1:8080/ (pick a compiled resolution, type a prompt, see the image); --cpus pins the runs
+python models/flux2_klein_4b/flux2_klein_4b_server.py --port 8080 --cpus 0,2-23 --no-reload
 
 # host checks
 python -m unittest discover -s models/flux2_klein_4b -p 'test_*.py'
@@ -103,8 +107,12 @@ query head; the bias is causal plus a right-padding key mask built per prompt),
 permute back, o_proj, residual, RMSNorm, SwiGLU (SiLU fused on the gate
 matmul), down, residual. The raw residual after layers 9/18/27 is scattered
 into the DiT's 7680-wide text buffer with a per-token PBI loop, so the prompt
-embedding never leaves DRAM. The 778 MB token embedding stays on the host
-(rows gathered per prompt), as in `qwen3_4b`.
+embedding never leaves DRAM. The 778 MB BF16 token embedding table is resident
+on the board (top of the tensor region, below the program slots); the TE
+program starts with one DMA pair per token that copies its row into the input
+buffer. The row addresses are instruction immediates (the ISA has no
+memory-to-register load), so the host re-encodes that 4 KB block per prompt
+and DMAs it over the program, like the attention mask.
 
 **Phase 2, diffusion transformer.** One program, the 4 Euler steps unrolled
 (the loop-free pattern pi05 settled on). Up front, the timestep sinusoids of
@@ -137,11 +145,16 @@ matmul operands of the 1x1 convs, GroupNorm affine rows, identity / ones /
 group-average matrices) in before the phase and reads the image out after it;
 nothing moves between host and board while it runs. Every map lives in DRAM
 channels-in-lanes with a one-pixel zero border kept by its producer. 3x3 convs
-keep the layer driver's exact tile grid, each tile one strided DRAM->URAM read
-of its window straight from the padded map, CONV2D, and strided writes of the
-tile rows into the output map (tile ranges split over the engines; the walker's
-per-pixel weight stream is expanded on-engine right before the conv). 1x1
-convs with C, OC multiples of 64 are one quantized-B matmul per image row
+with C, OC multiples of 64 are nine accumulated quantized-B matmuls: for tap
+(ky, kx) the A operand of output rows y0..y0+R-1 is the R*Wp consecutive input
+pixels starting at padded pixel (y0+ky, kx), so there is no im2col and the
+matmul keeps its B tile across 64 A rows; the partials accumulate in place
+through the full-matrix C operand and the rows' border pixels are re-zeroed at
+the end (row ranges split over the engines). The CONV2D walker is kept only
+for conv_in (C = 32) and the tiled conv_out: it re-streams the whole IF8 weight
+block per output pixel, one byte per MAC, which the 32 B/cycle AXI caps at half
+rate (measured 40-47% of peak; the matmul form runs the big convs at 70-80%).
+1x1 convs with C, OC multiples of 64 are one quantized-B matmul per image row
 (the map is already a row-major [pixels, C] matrix). GroupNorm accumulates
 lane-wise pixel sums into slotted accumulators, transposes the flush blocks
 with an identity matmul and sums them with a ones matmul on the bf20 ladder,
