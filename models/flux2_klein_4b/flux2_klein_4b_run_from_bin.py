@@ -49,7 +49,8 @@ def main(argv=None) -> int:
                     help="host: decode on the CPU from the IF8 VAE weights (standard FPGA image)")
     ap.add_argument("--phase-timeout", type=float, default=4 * 3600.0)
     ap.add_argument("--reference", action="store_true",
-                    help="also score against the host IF4 reference (needs the HF checkpoint)")
+                    help="also score on the host: the decoder vs the IF8 oracle and the whole pipeline vs "
+                         "the IF4 reference (needs the HF checkpoint); off by default, nothing runs on the CPU")
     ap.add_argument("--ref-device", default="cpu")
     args = ap.parse_args(argv)
 
@@ -111,7 +112,7 @@ def main(argv=None) -> int:
               "seed": args.seed, "engines": ne, "image": out, "vae": args.vae, "config": key,
               "finite": bool(torch.isfinite(lat.float()).all()) and bool(torch.isfinite(img.float()).all()),
               "te_s": ue.timings["te_s"], "dit_s": ue.timings["dit_s"], "vae_s": ue.timings["vae_s"], "total_s": total}
-    if args.vae == "fpga":
+    if args.vae == "fpga" and args.reference:
         from flux2_klein_4b_vae import reference_decode
         oracle = reference_decode(vae_w, cfg, latent[0])[None]
         result["vae_psnr_db"] = T.psnr_u8(ref.to_uint8_image(oracle), image)

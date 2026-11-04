@@ -1188,8 +1188,8 @@ def main(argv=None) -> int:
     ref.save_image(image, out)
     _log(f"  VAE phase ({args.vae}) {ue.timings['vae_s']:.1f}s -> {out}")
     vae_psnr = None
-    if args.vae == "fpga":
-        # the decoder alone: same latent, same IF8 weights, host arithmetic (cheap, CPU)
+    if args.vae == "fpga" and not args.no_reference:
+        # the decoder alone: same latent, same IF8 weights, host arithmetic (CPU)
         t0 = time.time()
         oracle = flux2_klein_4b_vae.reference_decode(vae_w, cfg, latent[0])[None]
         vae_psnr = psnr_u8(ref.to_uint8_image(oracle), image)
