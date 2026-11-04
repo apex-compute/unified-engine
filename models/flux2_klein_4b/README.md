@@ -187,6 +187,8 @@ Measured on the U50, 4 steps, all phases on the FPGA, from the packed bins:
 |---|---|---:|---:|---:|---:|
 | 367 MHz (andromeda run 41729405935) | 256x256, 64 tokens, 8 engines | 1.1 s | 23.4 s (341 GFLOPS) | 8.9 s | **35.8 s** |
 | 367 MHz | 512x512, 64 tokens, 8 engines | 1.1 s | 82.5 s (342 GFLOPS) | 31.7 s | **117.7 s** |
+| 333 MHz (andromeda run 41691268697, flashed) | 256x256, 64 tokens, 8 engines | 1.2 s | 25.7 s (310 GFLOPS) | 9.2 s | 38.5 s |
+| 333 MHz (flashed) | 512x512, 64 tokens, 8 engines | 1.2 s | 90.7 s (311 GFLOPS) | 33.1 s | 127.4 s |
 
 Earlier measurements on the 300 MHz image (same accuracy):
 
