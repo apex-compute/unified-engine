@@ -11,7 +11,8 @@ three phases and writes the PNG.
 |---|---|
 | `flux2_klein_4b_test.py` | Build + run. Exports weights on first use, compiles the two programs, runs TE -> DiT -> VAE, scores against the host IF4 reference, prints `TEST_RESULT`. `--compile-only` needs no board. |
 | `flux2_klein_4b_run_from_bin.py` | Run-only: one configuration per call from the prebuilt weight files and that configuration's compiled programs (never quantizes or compiles). |
-| `flux2_klein_4b_vae.py` | Phase 3: compiler + runtime of the VAE decoder as prebuilt per-engine programs (conv tile loops with on-engine weight-stream expansion, GroupNorm, SiLU, residual add, upsample, mid-block attention), plus its IF8 host oracle. |
+| `flux2_klein_4b_vae.py` | Phase 3: planner + emitter of the VAE decoder as one sharded program (convs straight from the padded maps, 1x1 convs as matmuls, on-device GroupNorm statistics, SiLU, residual add, upsample, mid-block attention), plus its IF8 host oracle with per-op intermediates. |
+| `flux2_klein_4b_vae_probe.py` | On-board bring-up of the VAE phase: compiles any prefix of the decoder graph and scores the last op against the host intermediate. |
 | `flux2_klein_4b_weights.py` | Checkpoint -> `params_te.bin` (IF4 Qwen3), `params_dit.bin` (IF4 DiT), `vae_weights.pt` (IF8 convs); shape-only layout planner the compiler addresses from. |
 | `flux2_klein_4b_ref.py` | Plain-torch reference of the whole pipeline (bit-identical to diffusers in fp32); IF4 / IF8 fake-quant helpers. |
 | `flux2_klein_4b_compare_diffusers.py` | Reference vs the official diffusers pipeline (needs a GPU). |
@@ -129,22 +130,26 @@ an ADD_BROADCAST. Each step then:
 **Phase 3, VAE decoder.** `AutoencoderKLFlux2` (32-ch latent, 2x2 patchify,
 `post_quant_conv`, conv_in, mid resnet / single-head attention / resnet, four
 levels of three resnets with nearest-2x upsample convs, GroupNorm/SiLU/conv_out)
-as 118 prebuilt steps in the same program set as the other two phases
-(`--compile-only` plans them from shapes alone). Every conv (IF8, per-(oc,
-tap, 64-ch) scales, bias) is the layer driver's exact tile grid with the tile
-ranges of every (OC chunk, geometry group) split across the engines, one
-tile-loop program per engine; GroupNorm (stats + apply), SiLU and the residual
-adds are split over pixel chunks / rounds, the mid-block attention over query
-rows, the nearest-2x upsample copies stay on engine 0. The conv walker
-re-reads its weight stream once per output pixel of a tile, so the resident
-streams total 3.5 GB: only the unrepeated per-chunk blocks (52 MB, each
-under one URAM bank) are loaded once per run as the VAE constant image, and a
-prebuilt program on each engine expands its chunks into the staging region
-(DRAM -> URAM once, URAM -> DRAM `tile_pixels` times) right before the conv.
-Between layers the host packs / unpacks one activation map (the conv models'
-pattern); GroupNorm folds the per-channel statistics on the host between its
-two programs. Arenas reset per layer; every address is baked and checked
-against the run-time layout.
+as ONE program: 119 ops emitted into every engine's stream as the third phase
+of the program set, with the scheduler's flag barriers between them. The host
+DMAs the latent map and the constant image (unrepeated IF8 weight blocks,
+matmul operands of the 1x1 convs, GroupNorm affine rows, identity / ones /
+group-average matrices) in before the phase and reads the image out after it;
+nothing moves between host and board while it runs. Every map lives in DRAM
+channels-in-lanes with a one-pixel zero border kept by its producer. 3x3 convs
+keep the layer driver's exact tile grid, each tile one strided DRAM->URAM read
+of its window straight from the padded map, CONV2D, and strided writes of the
+tile rows into the output map (tile ranges split over the engines; the walker's
+per-pixel weight stream is expanded on-engine right before the conv). 1x1
+convs with C, OC multiples of 64 are one quantized-B matmul per image row
+(the map is already a row-major [pixels, C] matrix). GroupNorm accumulates
+lane-wise pixel sums into slotted accumulators, transposes the flush blocks
+with an identity matmul and sums them with a ones matmul on the bf20 ladder,
+pools per group with a group-average matmul, does the same for the centred
+squares, takes rsqrt by Newton iteration and applies `x*A_c + B_c`. SiLU is
+the driver's max/exp/polynomial form on a device-built `[x, 0]` pair map; the
+upsample is one read and four strided writes per input row; the attention runs
+on compact (seq, C) maps the surrounding 1x1 matmuls write and read directly.
 
 **RoPE.** FLUX rotates interleaved pairs `(2j, 2j+1)` on four 32-dim axes
 (T, H, W, L; theta 2000). The engine core is HF rotate-half, so the exporter
@@ -192,15 +197,18 @@ Measured on the U50, 4 steps, all phases on the FPGA, from the prebuilt files:
 |---|---|---:|---:|---:|---:|
 | 367 MHz (andromeda run 41729405935) | 256x256, 64 tokens, 8 engines | 1.1 s | 23.4 s (341 GFLOPS) | 8.9 s | **35.8 s** |
 | 367 MHz | 512x512, 64 tokens, 8 engines | 1.1 s | 82.5 s (342 GFLOPS) | 31.7 s | **117.7 s** |
-| 333 MHz (andromeda run 41691268697, flashed), precompiled VAE | 256x256, 64 tokens, 8 engines | 1.2 s | 25.7 s (310 GFLOPS) | 7.3 s | **38.4 s** |
-| 333 MHz (flashed), precompiled VAE | 512x512, 64 tokens, 8 engines | 1.2 s | 90.7 s (311 GFLOPS) | 27.8 s | **122.2 s** |
+| 333 MHz (andromeda run 41691268697, flashed), one-shot VAE | 256x256, 64 tokens, 8 engines | 1.2 s | 25.7 s (310 GFLOPS) | 5.0 s | **35.3 s** |
+| 333 MHz (flashed), one-shot VAE | 512x512, 64 tokens, 8 engines | 1.2 s | 90.7 s (311 GFLOPS) | 17.0 s | **116.4 s** |
+| 333 MHz (flashed), per-layer VAE programs | 256x256, 64 tokens, 8 engines | 1.2 s | 25.7 s | 7.3 s | 38.4 s |
+| 333 MHz (flashed), per-layer VAE programs | 512x512, 64 tokens, 8 engines | 1.2 s | 90.7 s | 27.8 s | 122.2 s |
 | 333 MHz (flashed), host-orchestrated VAE | 256x256, 64 tokens, 8 engines | 1.2 s | 25.7 s | 9.2 s | 38.5 s |
 | 333 MHz (flashed), host-orchestrated VAE | 512x512, 64 tokens, 8 engines | 1.2 s | 90.7 s | 33.1 s | 127.4 s |
 
-The precompiled VAE decoder scores 55.9 dB (256x256) / 55.4 dB (512x512)
-image PSNR against the IF8 host oracle on the same latents (`vae_psnr_db`);
-a run captures no instructions at all (the 367 MHz rows above were taken
-with the host-orchestrated VAE). Host-side, torch's intra-op pool defaults
+The one-shot VAE decoder scores 52.2 dB (256x256) / 55.5 dB (512x512)
+image PSNR against the IF8 host oracle on the same latents (`vae_psnr_db`),
+runs at 131 / 150 GFLOPS, and a run captures no instructions and moves
+nothing between host and board during any phase (the 367 MHz rows above were
+taken with the host-orchestrated VAE). Host-side, torch's intra-op pool defaults
 to one thread per CPU for the per-layer packing; cap it with
 `OMP_NUM_THREADS` if the host should stay quieter.
 
@@ -219,15 +227,14 @@ at 300 MHz, 341 of 375 GFLOPS at 367 MHz), so the 4-step DiT's floor at
 512x512 is 75 s with 64 text tokens on the 367 MHz image; accuracy is
 unchanged by sharding.
 `--max-seq-len auto` pads the prompt only to the next multiple of 64 instead
-of 512, the single biggest lever left at 512x512. The VAE decoder runs from
-prebuilt per-engine programs (convs, GroupNorm, SiLU, residual adds and the
-mid-block attention all sharded over the engines); what remains on the host
-is one activation pack / DMA / readback per layer.
+of 512, the single biggest lever left at 512x512. The VAE decoder is one
+program with no host traffic while it runs.
 
 ## Known limitations / follow-ups
 
 * Bring-up order that worked: `--steps 1 --text-encoder host --vae host` (one DiT forward, scored as `velocity0_snr_db`), then the text encoder, then `--vae fpga`. `flux2_klein_4b_probe.py` checks every primitive in isolation on the model's own buffers.
 * The VAE phase needs the conv bitstream; `--vae host` is the fallback on the standard image.
-* The VAE's programs are prebuilt, but the host still moves one activation map per layer (the conv tile staging is a host re-pack) and folds the GroupNorm statistics between its two programs. Folding the decoder into a whole-graph program needs an on-device tile re-pack.
+* The DiT -> VAE hop (unpack / unpatchify of the latents) is still a host step between the two phases; an on-device scatter would make the three phases one launch.
+* `flux2_klein_4b_vae_probe.py --sweep ...` scores any prefix of the decoder graph on the board against the host intermediates; SNRs fall along the chain as bf16 arithmetic (GroupNorm re-scales the input's error by |mean|/sigma, SiLU lowers signal power), the end-to-end check is the image PSNR against the IF8 oracle.
 * Weights are re-DMA'd every run (phased layout) rather than resident on an 8 GiB board.
 * GELU is not used by this model (SwiGLU everywhere), so the engine's sigmoid-approximation GELU is not a factor.

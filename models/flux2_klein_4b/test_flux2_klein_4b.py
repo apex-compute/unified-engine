@@ -197,20 +197,12 @@ class TestCompile(unittest.TestCase):
             self.assertGreaterEqual(im["addr"], slot)
             self.assertLessEqual(im["addr"] + im["size"], slot + ue.PROGRAM_SLOT)
         self.assertEqual(os.path.getsize(os.path.join(tmp, "programs.bin")), sum(im["size"] for im in meta["images"]))
-        # VAE: the big convs are sharded (tile loops on all 8 engines; at this tiny geometry some
-        # layers have fewer tiles than engines), the 16x16 mid-block attention is too small to
-        # split and stays on engine 0
-        vm = meta["vae"]
-        conv = [st for st in vm["steps"] if st["kind"] == "conv"]
-        self.assertEqual(max(len(st["progs"]["conv"]) for st in conv), 8)
-        self.assertTrue(all(1 <= len(st["progs"]["expand"]) <= 8 for st in conv))
-        att = [st for st in vm["steps"] if st["kind"] == "attention"][0]
-        self.assertEqual([p["engine"] for p in att["progs"]["attn"]], [0])
+        self.assertEqual(len(meta["vae_worker_prog_addrs"]), 7)
+        self.assertEqual(len([im for im in meta["images"] if im["phase"] == "vae"]), 7)
 
     def test_vae_phase_layout(self):
-        """The VAE step list covers the decoder, every address is inside its arena, and the
-        baked addresses are reproduced by a run-mode walk (offline engine: DMA / execute are
-        no-ops, so this replays the whole decoder on zeros)."""
+        """The VAE phase covers the decoder, every buffer is inside the params arena, the
+        plan is reproducible, and the constant image builder fills exactly the planned bytes."""
         import flux2_klein_4b_test as T
         import flux2_klein_4b_vae as V
         cfg = T.load_config()
@@ -221,30 +213,26 @@ class TestCompile(unittest.TestCase):
         meta = ue.compile_programs(os.path.join(tmp, "programs.bin"), os.path.join(tmp, "programs.json"))
         vm = meta["vae"]
         self.assertEqual(vm["latent"], [32, 16, 16])
-        self.assertEqual(vm["out"], [3, 128, 128])
+        self.assertEqual(vm["out_shape"], [3, 128, 128])
         kinds = {}
         for st in vm["steps"]:
             kinds[st["kind"]] = kinds.get(st["kind"], 0) + 1
-        self.assertEqual(kinds, {"conv": 40, "gn": 30, "silu": 29, "add": 15, "attention": 1, "upsample": 3})
-        self.assertLessEqual(vm["const_base"] + vm["const_size"], vm["staging_base"])
-        self.assertLessEqual(vm["staging_end"], ue._tensor_dram_base)
-        self.assertLessEqual(vm["tensor_end"], ue._program_dram_base)
-        self.assertGreater(vm["program_bytes"], 0)
-        n_vae = len([im for im in meta["images"] if im["phase"] == "vae"])
-        self.assertEqual(n_vae, sum(len(p) for st in vm["steps"] for p in st["progs"].values()))
-        # the conv blocks of every OC chunk fit one URAM bank and the 3.5 GB expanded
-        # streams never exist on the host
-        for st in vm["steps"]:
-            if st["kind"] == "conv":
-                self.assertLessEqual(st["addrs"]["block_bytes"], 524288)
+        self.assertEqual(kinds, {"zero_pairs": 1, "conv": 34, "conv1x1": 6, "gn": 30, "silu": 29, "add": 15,
+                                 "attention": 1, "upsample": 3})
+        self.assertLessEqual(vm["const_base"] + vm["const_size"], vm["arena_end"])
+        self.assertLessEqual(vm["arena_end"], ue._tensor_dram_base)
+        self.assertGreater(meta["vae_program_size"], 0)
+        self.assertEqual(len(meta["vae_worker_prog_addrs"]), 1)
+        # the plan is deterministic (the run-time side re-derives every address from it)
+        again = V.Flux2VaeOneShot(ue, cfg).plan(geo.latent_h, geo.latent_w)
+        self.assertEqual(again, vm)
         if not os.path.exists(os.path.join(BIN, "vae_weights.pt")):
-            self.skipTest("vae weights not exported (run-mode replay needs them)")
+            self.skipTest("vae weights not exported (constant image needs them)")
         w = torch.load(os.path.join(BIN, "vae_weights.pt"), map_location="cpu")
-        ue.load_programs(os.path.join(tmp, "programs.bin"), os.path.join(tmp, "programs.json"))
-        vae = V.Flux2VaeFPGA(ue, w, cfg, meta=meta, progress=False)
-        out = vae.decode(torch.zeros(32, 16, 16, dtype=torch.bfloat16))
-        self.assertEqual(tuple(out.shape), (3, 128, 128))
-        self.assertEqual(len(vae.layer_times), 1 + len(vm["steps"]))
+        img = ue.vae.const_image(w)
+        self.assertEqual(len(img), vm["const_size"])
+        lat = ue.vae.pack_latent(torch.zeros(32, 16, 16, dtype=torch.bfloat16))
+        self.assertEqual(lat.numel() * 2, vm["input_bytes"])
 
 
 @unittest.skipUnless(_snap(), "checkpoint not downloaded")

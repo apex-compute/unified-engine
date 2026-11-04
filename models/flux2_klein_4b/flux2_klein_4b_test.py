@@ -29,13 +29,14 @@ Three phases, N engines:
        timestep / modulation vectors for the 4 steps are computed on-device
        up front from a host sin/cos table (M = 4 matmuls).
 
-  VAE  AutoencoderKLFlux2 decoder as prebuilt per-layer programs
-       (flux2_klein_4b_vae.py): conv tile loops, GroupNorm, SiLU, residual
-       adds and the mid-block attention sharded over the engines, nearest
-       upsample on engine 0; the IF8 weight blocks are loaded once per run
-       and expanded into the walker's per-pixel stream on the engines. The
-       host moves one activation map per layer; needs the CONV2D queue-config
-       image. ``--vae host`` decodes on the host instead (reported as such).
+  VAE  AutoencoderKLFlux2 decoder as ONE program, the third phase of the
+       set (flux2_klein_4b_vae.py): 3x3 convs straight from the padded
+       channels-in-lanes maps, 1x1 convs as quantized-B matmuls, GroupNorm
+       statistics reduced on the ladder and folded on device, SiLU,
+       residual adds, upsample and the mid-block attention, all sharded
+       over the engines with flag barriers between ops. One DMA in (latent
+       map + constant image), one DMA out (the image). Needs the CONV2D
+       queue-config image; ``--vae host`` decodes on the host instead.
 
 Multi-engine (``--engines N``): every op is emitted into each engine's own
 program with that engine's share -- matmuls are split over output columns
@@ -813,26 +814,25 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
             te = self._emit_phase("te", self.emit_text_encoder_stream)
             _log(f"  compiling DiT program ({self.ne} engine(s))...")
             dit = self._emit_phase("dit", self.emit_dit_stream)
-            self.stop_capture()
-            assert self.capture_count <= user_dma_core.MAX_DECODER_INSTRUCTIONS
-            primary = b"".join(inst.get_bytes() for inst in self.capture_buffer)
-            images = [{"engine": 0, "phase": "primary", "addr": self._program_dram_base, "size": len(primary)}]
-            blob = bytearray(primary)
-            for name, ph in (("te", te), ("dit", dit)):
-                for wi, (addr, wb) in enumerate(zip(ph[3], ph[4]), start=1):
-                    images.append({"engine": wi, "phase": name, "addr": addr, "size": len(wb), "offset": len(blob)})
-                    blob.extend(wb)
-            images[0]["offset"] = 0
-            self.clear_capture_buffer()
-            # VAE: standalone per-layer programs after every engine's TE / DiT images (the
-            # same cursors load_program_images leaves behind)
+            _log(f"  compiling VAE program ({self.ne} engine(s))...")
+            vae_plan = self.vae_planner().plan(self.geo.latent_h, self.geo.latent_w)
+            vae = self._emit_phase("vae", self.vae.emit)
+        finally:
+            _SILENT = False
+        self.stop_capture()
+        assert self.capture_count <= user_dma_core.MAX_DECODER_INSTRUCTIONS
+        primary = b"".join(inst.get_bytes() for inst in self.capture_buffer)
+        images = [{"engine": 0, "phase": "primary", "addr": self._program_dram_base, "size": len(primary)}]
+        blob = bytearray(primary)
+        for name, ph in (("te", te), ("dit", dit), ("vae", vae)):
+            for wi, (addr, wb) in enumerate(zip(ph[3], ph[4]), start=1):
+                images.append({"engine": wi, "phase": name, "addr": addr, "size": len(wb), "offset": len(blob)})
+                blob.extend(wb)
+        images[0]["offset"] = 0
+        self.clear_capture_buffer()
+        _SILENT = True
+        try:
             self._set_program_cursors(images)
-            _log(f"  compiling VAE programs ({self.ne} engine(s))...")
-            vae = flux2_klein_4b_vae.Flux2VaeFPGA(self, None, self.cfg)
-            vae_meta = vae.compile(self.geo.latent_h, self.geo.latent_w)
-            for e, addr, data in vae.images:
-                images.append({"engine": e, "phase": "vae", "addr": addr, "size": len(data), "offset": len(blob)})
-                blob.extend(data)
             # the scheduler's per-engine flag-clear program (run once before the first phase),
             # prebuilt so nothing is captured at run time
             flag_clear = []
@@ -862,8 +862,9 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
             "images": images,
             "te_program_start_addr": te[0], "te_program_size": te[1], "te_flops": te[2], "te_worker_prog_addrs": te[3],
             "dit_program_start_addr": dit[0], "dit_program_size": dit[1], "dit_flops": dit[2], "dit_worker_prog_addrs": dit[3],
+            "vae_program_start_addr": vae[0], "vae_program_size": vae[1], "vae_flops": vae[2], "vae_worker_prog_addrs": vae[3],
             "tensor_dram_usage": self.tensor_usage, "params_image_size": self.params_image_size,
-            "vae": vae_meta,
+            "vae": vae_plan,
             "flag_clear_addrs": flag_clear,
             "compile_seconds": round(time.time() - t0, 1),
         }
@@ -872,10 +873,36 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
         per_engine = (max((im["size"] for im in images[1:] if im["phase"] in ("te", "dit")), default=0)) / 1e6
         _log(f"  programs: TE {te[1] / 1e6:.1f} MB ({te[2] / 1e12:.2f} TFLOP), DiT {dit[1] / 1e6:.1f} MB "
              f"({dit[2] / 1e12:.2f} TFLOP), worker programs up to {per_engine:.1f} MB, "
-             f"VAE {len(vae_meta['steps'])} steps / {vae_meta['program_bytes'] / 1e6:.1f} MB "
-             f"(const image {vae_meta['const_size'] / 1e6:.0f} MB), "
+             f"VAE {vae[1] / 1e6:.1f} MB ({vae[2] / 1e12:.2f} TFLOP, {len(vae_plan['steps'])} steps, "
+             f"const image {vae_plan['const_size'] / 1e6:.0f} MB, arena {(vae_plan['arena_end'] - vae_plan['const_base']) / 1e6:.0f} MB), "
              f"bin {len(blob) / 1e6:.1f} MB, compiled in {meta['compile_seconds']}s")
         return meta
+
+    def vae_planner(self):
+        """The VAE phase planner for this geometry (deterministic: compile and run agree)."""
+        self.vae = flux2_klein_4b_vae.Flux2VaeOneShot(self, self.cfg)
+        return self.vae
+
+    def run_vae(self, meta: dict, latent: torch.Tensor, vae_weights: dict) -> torch.Tensor:
+        """(32, h, w) latent -> (3, 8h, 8w) image: one DMA in (constant image + latent map),
+        the VAE program, one DMA out."""
+        vm = meta["vae"]
+        plan = self.vae_planner().plan(self.geo.latent_h, self.geo.latent_w)
+        for k in ("const_base", "const_size", "input", "output", "output_bytes", "arena_end"):
+            assert plan[k] == vm[k], f"VAE plan {k} differs from the compiled programs (recompile)"
+        t0 = time.time()
+        img = self.vae.const_image(vae_weights)
+        n = self.dma_write(self.h2c_device, vm["const_base"], img, len(img))
+        assert n == len(img)
+        lat = self.vae.pack_latent(latent)
+        assert lat.numel() * 2 == vm["input_bytes"]
+        self.dma_to_accelerator_memory(vm["input"], lat)
+        self.timings["vae_load_s"] = time.time() - t0
+        t0 = time.time()
+        self._execute_phase(meta, "vae", getattr(self, "phase_timeout", 4 * 3600.0))
+        self.timings["vae_s"] = time.time() - t0
+        flat = self.dma_from_accelerator_memory(vm["output"], (vm["output_bytes"] // 2,))
+        return self.vae.unpack_output(flat)
 
     def _set_program_cursors(self, images: list[dict]) -> None:
         """Every engine's next program address = just past its last image."""
@@ -1080,7 +1107,6 @@ def main(argv=None) -> int:
     ap.add_argument("--no-compile", action="store_true", help="run-from-bin: never compile")
     ap.add_argument("--force-compile", action="store_true")
     ap.add_argument("--vae", choices=["fpga", "host"], default="fpga")
-    ap.add_argument("--vae-timeout", type=float, default=900.0, help="per-program wait timeout (s) for the FPGA VAE")
     ap.add_argument("--phase-timeout", type=float, default=4 * 3600.0, help="wait timeout (s) for the TE / DiT programs")
     ap.add_argument("--text-encoder", choices=["fpga", "host"], default="fpga",
                     help="host: compute the prompt embedding with transformers and skip the TE phase")
@@ -1150,24 +1176,25 @@ def main(argv=None) -> int:
     # ---------------- phase 3: VAE ----------------
     vae_cfg = ref.load_json(os.path.join(snap, "vae", "config.json"))
     latent = ref.unpatchify_latents(ref.unpack_latents(lat_denorm, geo.token_h, geo.token_w))  # (1, 32, h, w)
-    t0 = time.time()
     if args.vae == "fpga":
-        vae = flux2_klein_4b_vae.Flux2VaeFPGA(ue, vae_w, cfg, meta=meta, timeout_s=args.vae_timeout)
-        img = vae.decode(latent[0].to(torch.bfloat16))[None]
+        img = ue.run_vae(meta, latent[0].to(torch.bfloat16), vae_w)[None]
     else:
+        t0 = time.time()
         vae = ref.Flux2VaeDecoder(ref.load_safetensors_dir(os.path.join(snap, "vae")), vae_cfg, device=args.ref_device)
         img = vae.decode(latent)
-    ue.timings["vae_s"] = time.time() - t0
+        ue.timings["vae_s"] = time.time() - t0
     image = ref.to_uint8_image(img)
     out = args.out or os.path.join(HERE, cfg["paths"]["bin_dir"], f"flux2_{args.seed}.png")
     ref.save_image(image, out)
     _log(f"  VAE phase ({args.vae}) {ue.timings['vae_s']:.1f}s -> {out}")
     vae_psnr = None
-    if args.vae == "fpga" and not args.no_reference:
-        # the decoder alone: same latent, same IF8 weights, host arithmetic
-        oracle = flux2_klein_4b_vae.reference_decode(vae_w, cfg, latent[0], device=args.ref_device)[None]
+    if args.vae == "fpga":
+        # the decoder alone: same latent, same IF8 weights, host arithmetic (cheap, CPU)
+        t0 = time.time()
+        oracle = flux2_klein_4b_vae.reference_decode(vae_w, cfg, latent[0])[None]
         vae_psnr = psnr_u8(ref.to_uint8_image(oracle), image)
-        _log(f"  FPGA decoder vs IF8 host oracle: image PSNR {vae_psnr:.1f} dB")
+        _log(f"  FPGA decoder vs IF8 host oracle: image PSNR {vae_psnr:.1f} dB, "
+             f"latent SNR {snr_db(oracle, img):.1f} dB (oracle {time.time() - t0:.1f}s on the host)")
 
     # ---------------- scoring ----------------
     result = {"height": geo.height, "width": geo.width, "max_sequence_length": geo.n_txt, "steps": geo.num_inference_steps,

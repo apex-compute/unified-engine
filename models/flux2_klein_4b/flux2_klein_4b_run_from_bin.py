@@ -47,7 +47,6 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=None, help="output PNG (default flux2_klein_4b_bin/flux2_<config>_<seed>.png)")
     ap.add_argument("--vae", choices=["fpga", "host"], default="fpga",
                     help="host: decode on the CPU from the IF8 VAE weights (standard FPGA image)")
-    ap.add_argument("--vae-timeout", type=float, default=900.0)
     ap.add_argument("--phase-timeout", type=float, default=4 * 3600.0)
     ap.add_argument("--reference", action="store_true",
                     help="also score against the host IF4 reference (needs the HF checkpoint)")
@@ -94,15 +93,13 @@ def main(argv=None) -> int:
 
     # phase 3: VAE
     latent = ref.unpatchify_latents(ref.unpack_latents(lat, geo.token_h, geo.token_w))
-    t0 = time.time()
     if args.vae == "fpga":
-        from flux2_klein_4b_vae import Flux2VaeFPGA
-        vae = Flux2VaeFPGA(ue, vae_w, cfg, meta=meta, timeout_s=args.vae_timeout)
-        img = vae.decode(latent[0].to(torch.bfloat16))[None]
+        img = ue.run_vae(meta, latent[0].to(torch.bfloat16), vae_w)[None]
     else:
         from flux2_klein_4b_vae import reference_decode
+        t0 = time.time()
         img = reference_decode(vae_w, cfg, latent[0])[None]
-    ue.timings["vae_s"] = time.time() - t0
+        ue.timings["vae_s"] = time.time() - t0
     image = ref.to_uint8_image(img)
     out = args.out or os.path.join(HERE, cfg["paths"]["bin_dir"], f"flux2_{key}_{args.seed}.png")
     ref.save_image(image, out)
@@ -114,6 +111,11 @@ def main(argv=None) -> int:
               "seed": args.seed, "engines": ne, "image": out, "vae": args.vae, "config": key,
               "finite": bool(torch.isfinite(lat.float()).all()) and bool(torch.isfinite(img.float()).all()),
               "te_s": ue.timings["te_s"], "dit_s": ue.timings["dit_s"], "vae_s": ue.timings["vae_s"], "total_s": total}
+    if args.vae == "fpga":
+        from flux2_klein_4b_vae import reference_decode
+        oracle = reference_decode(vae_w, cfg, latent[0])[None]
+        result["vae_psnr_db"] = T.psnr_u8(ref.to_uint8_image(oracle), image)
+        _log(f"  FPGA decoder vs IF8 host oracle: image PSNR {result['vae_psnr_db']:.1f} dB")
     if args.reference:
         rr = T.quantized_reference(cfg, geo, snap, args.prompt, args.seed, args.ref_device)
         result["embeds_snr_db"] = T.snr_db(rr.prompt_embeds, embeds)
