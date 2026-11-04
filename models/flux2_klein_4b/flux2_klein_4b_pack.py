@@ -5,13 +5,13 @@
       magic "FLX2KLN1" | u64 header length | JSON header | 4 KiB-aligned sections
 
 Sections: the Qwen3 token embedding, the IF4 text-encoder and DiT weight
-images, the IF8 VAE weights, the tokenizer files, and the compiled programs
-(every engine's images) for ONE geometry / engine count recorded in the
-header together with the model config and the layout manifests.
-``flux2_klein_4b_run_from_bin.py`` runs from this file alone: no network, no
-HF checkpoint, no per-model JSON.
+images, the IF8 VAE weights, the tokenizer files, and one compiled program
+set (every engine's images) per packed configuration -- the weights are
+shared, each configuration (resolution x text length x steps x engines)
+adds only its ~90 MB of programs. ``flux2_klein_4b_run_from_bin.py`` runs
+from this file alone: no network, no HF checkpoint, no per-model JSON.
 
-    python models/flux2_klein_4b/flux2_klein_4b_pack.py [--height 512 --width 512 --max-seq-len 512 --steps 4 --engines 8] [--out flux2_klein_4b.bin]
+    python models/flux2_klein_4b/flux2_klein_4b_pack.py --config 256x256x64x4 --config 512x512x64x4 --engines 8 [--out flux2_klein_4b.bin]
 """
 from __future__ import annotations
 
@@ -52,26 +52,41 @@ def read_header(path: str) -> tuple[dict, int]:
     return header, 16 + hlen
 
 
-def pack(cfg: dict, geo: ref.Flux2Geometry, engines: int, out_path: str, *, dev: str | None = None,
-         offline: bool = False) -> dict:
+def config_key(geo: ref.Flux2Geometry) -> str:
+    return f"{geo.height}x{geo.width}x{geo.max_sequence_length}x{geo.num_inference_steps}"
+
+
+def parse_config(spec: str) -> ref.Flux2Geometry:
+    h, w, L, steps = (int(v) for v in spec.lower().split("x"))
+    return ref.Flux2Geometry(h, w, L, steps)
+
+
+def pack(cfg: dict, geos: list, engines: int, out_path: str) -> dict:
     paths = T._paths(cfg)
     for k in ("params_te_bin", "params_dit_bin", "vae_weights", "embed_tokens_bin"):
         if not os.path.exists(paths[k]):
             print("  exporting weights (one-time)...", flush=True)
             W.build_all(cfg)
             break
-    # programs for exactly this geometry / engine count (compile if the cached ones differ)
-    ue = T.Flux2KleinEngine(cfg, geo, num_engines=engines, offline=True)
-    meta = None
-    if os.path.exists(paths["instruction_meta"]) and os.path.exists(paths["instruction_bin"]):
-        with open(paths["instruction_meta"]) as f:
-            m = json.load(f)
-        if m.get("signature") == ue.program_signature():
-            meta = m
-    if meta is None:
-        print(f"  compiling programs for {geo.height}x{geo.width}, {geo.n_txt} tokens, {geo.num_inference_steps} steps, "
-              f"{engines} engine(s)...", flush=True)
-        meta = ue.compile_programs(paths["instruction_bin"], paths["instruction_meta"])
+    # one program set per configuration (compiled offline into its own files)
+    prog_dir = os.path.join(HERE, cfg["paths"]["bin_dir"], "programs")
+    os.makedirs(prog_dir, exist_ok=True)
+    programs = {}
+    ue = None
+    for geo in geos:
+        key = config_key(geo)
+        ue = T.Flux2KleinEngine(cfg, geo, num_engines=engines, offline=True)
+        bin_p, meta_p = os.path.join(prog_dir, f"{key}_e{engines}.bin"), os.path.join(prog_dir, f"{key}_e{engines}.json")
+        meta = None
+        if os.path.exists(meta_p) and os.path.exists(bin_p):
+            with open(meta_p) as f:
+                m = json.load(f)
+            if m.get("signature") == ue.program_signature():
+                meta = m
+        if meta is None:
+            print(f"  compiling programs for {key}, {engines} engine(s)...", flush=True)
+            meta = ue.compile_programs(bin_p, meta_p)
+        programs[key] = (bin_p, meta)
     with open(paths["params_te_meta"]) as f:
         te_meta = json.load(f)
     with open(paths["params_dit_meta"]) as f:
@@ -91,17 +106,19 @@ def pack(cfg: dict, geo: ref.Flux2Geometry, engines: int, out_path: str, *, dev:
     buf = io.BytesIO()
     torch.save(torch.load(paths["vae_weights"], map_location="cpu"), buf)
     sections.append(("vae_weights", buf.getvalue()))
-    sections.append(("programs", paths["instruction_bin"]))
+    for key, (bin_p, _meta) in programs.items():
+        sections.append((f"programs/{key}", bin_p))
 
     sizes = {n: (os.path.getsize(src) if isinstance(src, str) else len(src)) for n, src in sections}
     header = {
         "format": "flux2_klein_4b_single_bin", "version": 1,
         "model": cfg["paths"]["hf_model_repo"],
-        "geometry": {"height": geo.height, "width": geo.width, "max_sequence_length": geo.max_sequence_length,
-                     "num_inference_steps": geo.num_inference_steps},
+        "configs": {config_key(g): {"height": g.height, "width": g.width, "max_sequence_length": g.max_sequence_length,
+                                    "num_inference_steps": g.num_inference_steps} for g in geos},
+        "default_config": config_key(geos[0]),
         "engines": engines,
         "config": cfg,
-        "programs_meta": meta,
+        "programs_meta": {key: meta for key, (_bin, meta) in programs.items()},
         "te_meta": {k: v for k, v in te_meta.items() if k != "embed_tokens"},
         "dit_meta": dit_meta,
         "tokenizer_files": [n.split("/", 1)[1] for n, _ in sections if n.startswith("tokenizer/")],
@@ -150,15 +167,13 @@ def main(argv=None) -> int:
     cfg = T.load_config()
     m = cfg["model"]
     ap = argparse.ArgumentParser(description="Pack FLUX.2 klein 4B into one deployable bin")
-    ap.add_argument("--height", type=int, default=m["height"])
-    ap.add_argument("--width", type=int, default=m["width"])
-    ap.add_argument("--max-seq-len", type=int, default=m["max_sequence_length"])
-    ap.add_argument("--steps", type=int, default=m["num_inference_steps"])
+    ap.add_argument("--config", action="append", default=None,
+                    help="HxWxTOKENSxSTEPS, repeatable (default: 256x256x64x4 and 512x512x64x4)")
     ap.add_argument("--engines", type=int, default=8)
     ap.add_argument("--out", default=os.path.join(HERE, cfg["paths"]["bin_dir"], "flux2_klein_4b.bin"))
     args = ap.parse_args(argv)
-    geo = ref.Flux2Geometry(args.height, args.width, args.max_seq_len, args.steps)
-    pack(cfg, geo, args.engines, args.out)
+    specs = args.config or ["256x256x64x4", "512x512x64x4"]
+    pack(cfg, [parse_config(c) for c in specs], args.engines, args.out)
     return 0
 
 

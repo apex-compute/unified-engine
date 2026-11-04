@@ -33,11 +33,12 @@ python models/flux2_klein_4b/flux2_klein_4b_test.py --prompt "A photo of a red s
 # quicker CI geometry (256x256, 128 text tokens) and host-decoded VAE (standard FPGA image)
 python models/flux2_klein_4b/flux2_klein_4b_test.py --height 256 --width 256 --max-seq-len 128 --vae host
 
-# one deployable file (~4.7 GB: weights + tokenizer + programs for 512x512 / 512 tokens / 4 steps / 8 engines)
+# ONE deployable file (~4.8 GB): weights + tokenizer + a program set per configuration (default 256x256 and 512x512, 64 text tokens, 4 steps, 8 engines)
 python models/flux2_klein_4b/flux2_klein_4b_pack.py --engines 8
 
-# run from that file alone (no network, no HF checkpoint)
-python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin models/flux2_klein_4b/flux2_klein_4b_bin/flux2_klein_4b.bin --prompt "A photo of a red sports car on a mountain road at sunset" --out car.png
+# run from that file alone (no network, no HF checkpoint): ~40 s for 256x256, ~2 min 20 s for 512x512 on 8 engines
+python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin models/flux2_klein_4b/flux2_klein_4b_bin/flux2_klein_4b.bin --config 256x256x64x4 --prompt "A photo of a red sports car on a mountain road at sunset" --out car.png
+python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin models/flux2_klein_4b/flux2_klein_4b_bin/flux2_klein_4b.bin --config 512x512x64x4 --prompt "A photo of a red sports car on a mountain road at sunset" --out car_512.png
 
 # compile without a board (writes flux2_klein_4b_bin/programs.{bin,json})
 python models/flux2_klein_4b/flux2_klein_4b_test.py --compile-only
@@ -51,7 +52,7 @@ python models/flux2_klein_4b/flux2_klein_4b_quant_report.py --height 512 --width
 | Flag | Default | Notes |
 |---|---|---|
 | `--height/--width` | 512 | multiples of 16; image tokens = (H/16)*(W/16) must be a multiple of 64 |
-| `--max-seq-len` | 512 | text tokens (padded, like the pipeline); multiple of 64 |
+| `--max-seq-len` | 512 | text tokens (padded, like the pipeline); multiple of 64. `auto` = the prompt's own length rounded up to 64 (a 25-token prompt -> 64), which removes a third of the DiT work at 512x512 |
 | `--steps` | 4 | distilled schedule; the dt of every step is baked into the program |
 | `--seed` | 0 | same CPU generator semantics as diffusers |
 | `--vae fpga\|host` | fpga | `fpga` needs the CONV2D queue-config image |
@@ -66,12 +67,13 @@ count or code change recompiles (seconds). Weight bins are geometry-independent.
 ## Single deployable bin
 
 `flux2_klein_4b_pack.py` writes `flux2_klein_4b.bin`: a header (JSON: model
-config, geometry, engine count, layout manifests, program metadata) followed
-by 4 KiB-aligned sections -- the tokenizer files, the Qwen3 token embedding,
-the IF4 text-encoder and DiT weight images, the IF8 VAE weights and the
-compiled programs of every engine. `flux2_klein_4b_run_from_bin.py --bin`
-memory-maps it and DMAs each section to its baked address; the geometry and
-engine count are those the programs were compiled for (re-pack for another).
+config, the packed configurations, engine count, layout manifests, program
+metadata) followed by 4 KiB-aligned sections -- the tokenizer files, the Qwen3
+token embedding, the IF4 text-encoder and DiT weight images, the IF8 VAE
+weights, and one compiled program set (every engine's images, ~90 MB) per
+configuration (`--config HxWxTOKENSxSTEPS`, repeatable; the weights are
+shared). `flux2_klein_4b_run_from_bin.py --bin ... --config KEY` DMAs each
+section to its baked address; `--list` shows the packed configurations.
 On the board the run is still three host-sequenced phases: the text-encoder
 program, the DiT program, then the VAE decoder's per-layer programs.
 
@@ -178,39 +180,30 @@ is finite and lands on the same image, not bit-level agreement.
 
 ## Cost and expectations
 
-Measured on the 300 MHz U50 image, 256x256 with 128 text tokens, 4 steps:
+Measured on the 300 MHz U50 image, 4 steps, all phases on the FPGA:
 
-| Phase | 1 engine | 8 engines |
-|---|---:|---:|
-| Text encoder (0.71 TFLOP) | 20.1 s, 35.1 GFLOPS | 2.6 s, 275 GFLOPS |
-| DiT (9.62 TFLOP) | 269.8 s, 35.6 GFLOPS | 34.4 s, 280 GFLOPS (91% of the 8-engine peak) |
-| VAE decoder (host-orchestrated layer drivers, engine 0) | 38 s | 38 s |
-| Weight DMA (1.45 GB + 2.35 GB) | ~4 s | ~4 s |
+| Configuration | Text encoder | DiT | VAE | Total on board | vs IF4 oracle |
+|---|---:|---:|---:|---:|---|
+| 256x256, 64 tokens, 8 engines, sharded VAE | 1.3 s | 28.6 s | 9.7 s | **~40 s** | step-0 latents 45.7 dB, image PSNR 28 dB |
+| 512x512, 64 tokens, 8 engines, sharded VAE | 1.3 s | 100.8 s | 34.8 s | ~2 min 20 s | step-0 latents 46.9 dB, image PSNR 21 dB |
+| 512x512, 512 tokens, 8 engines | 10.5 s | 145 s | 151 s (engine 0 only) | ~5 min | step-0 latents 46.5 dB, image PSNR 26 dB |
+| 256x256, 128 tokens, 8 engines | 2.6 s | 34.4 s | 38 s (engine 0 only) | ~1.3 min | step-0 latents 41.5 dB, image PSNR 21.5 dB |
+| 256x256, 128 tokens, 1 engine | 20.1 s | 270 s | 38 s | ~5.5 min | step-0 latents 42.9 dB, image PSNR 21 dB |
 
-Accuracy is unchanged by sharding (per-step latent SNR vs the IF4 host
-reference [41.5, 29.8, 20.2, 9.8] dB on 8 engines vs [42.9, 30.3, 19.9, 9.4]
-on one). 512x512 with 512 tokens, 4 steps, all phases on the FPGA, 8 engines:
-
-| Phase | Time |
-|---|---:|
-| Text encoder (2.9 TFLOP) | 10.5 s, 276 GFLOPS |
-| DiT, 4 steps (40.7 TFLOP) | 145 s, 280 GFLOPS |
-| VAE decoder (118 layer launches on engine 0) | 151 s |
-| Weight DMA | ~2.3 s |
-
-Accuracy vs the IF4 host reference at 512x512 on 8 engines: prompt embeds
-33 dB, per-step latents [46.5, 34.7, 25.2, 13.2] dB, image PSNR 26 dB. The
-VAE decoder (~1.2 TMAC through the per-layer conv drivers with a host round
-trip per layer) is now the largest phase. Multi-engine sharding
-(`multi_engine_shard.py`) and a hardware step loop are the obvious next
-speed-ups; 1024x1024 (4096 image tokens) compiles with the same code and fits
-the tensor arena but the mid-block VAE attention (16384 tokens) needs the
-tiled attention path.
+The transformer phases sustain 275-280 GFLOPS on 8 engines (91% of the
+307 GFLOPS peak), so the 4-step DiT has a hard floor of 132 s at 512x512
+with 512 text tokens and 92 s with 64; accuracy is unchanged by sharding.
+`--max-seq-len auto` pads the prompt only to the next multiple of 64 instead
+of 512, the single biggest lever left at 512x512. The VAE decoder's
+convolutions are spread over all engines (`conv2d_layer_sharded`: every
+output-channel chunk and tile range split evenly, one program per engine per
+layer); GroupNorm, SiLU, the upsample copies and the residual adds still run
+on engine 0 and are now most of the VAE time.
 
 ## Known limitations / follow-ups
 
 * Bring-up order that worked: `--steps 1 --text-encoder host --vae host` (one DiT forward, scored as `velocity0_snr_db`), then the text encoder, then `--vae fpga`. `flux2_klein_4b_probe.py` checks every primitive in isolation on the model's own buffers.
 * VAE phase is host-orchestrated (one program per layer) and needs the conv bitstream; `--vae host` is the fallback on the standard image.
-* The VAE phase is still single-engine and host-orchestrated (one program per layer); sharding its convs or folding it into a whole-graph program is the next speed-up now that it dominates.
+* The VAE is still host-orchestrated (one program per engine per layer); its non-conv ops run on engine 0 only. Folding it into a whole-graph program would remove the host round trips.
 * Weights are re-DMA'd every run (phased layout) rather than resident on an 8 GiB board.
 * GELU is not used by this model (SwiGLU everywhere), so the engine's sigmoid-approximation GELU is not a factor.

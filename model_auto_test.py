@@ -733,10 +733,10 @@ TESTS = [
 
     # FLUX.2 [klein] 4B text-to-image: Qwen3-4B text encoder + 25-block DiT (4 Euler
     # steps, one statically unrolled program per engine) on the standard image, VAE
-    # decoder through the conv drivers. The harness adds --engines <cores>: on the 8-engine
-    # U50 the CI geometry (256x256, 128 text tokens) is 2.6 s TE + 34 s DiT + 38 s VAE
-    # (270 s DiT on one engine); the default 512x512 / 512-token image is ~41 TFLOP of
-    # DiT. Bins (params_te/params_dit/vae_weights/programs) are cached in
+    # decoder through the conv drivers (convs sharded across engines). The harness adds
+    # --engines <cores>: on the 8-engine U50 the CI geometry (256x256, 128 text tokens) is
+    # 2.6 s TE + 34 s DiT + ~10 s VAE (270 s DiT on one engine); --max-seq-len auto pads
+    # the prompt only to the next multiple of 64 (256x256 then takes ~40 s in total). Bins (params_te/params_dit/vae_weights/programs) are cached in
     # flux2_klein_4b_bin/ and reused on pass 2 (the program signature covers geometry,
     # engine count and the compiler source). The first entry decodes the VAE on the host
     # (standard image); the second runs all three phases on the FPGA and needs the CONV2D

@@ -4,10 +4,11 @@
 Everything comes from ONE file (see flux2_klein_4b_pack.py): config, tokenizer,
 weights, compiled programs. No network, no HF checkpoint, no other file.
 
-    python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin flux2_klein_4b.bin --prompt "..." --out image.png
+    python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin flux2_klein_4b.bin --prompt "..." --out image.png [--config 512x512x64x4]
 
-The geometry (resolution, text length, steps) and the engine count are baked
-into the bin; the board must report at least that many engines.
+The bin carries one program set per packed configuration (resolution x text
+tokens x steps); ``--config`` picks one (default: the first packed, listed by
+``--list``). The engine count is baked in; the board must report at least that many.
 """
 from __future__ import annotations
 
@@ -76,16 +77,25 @@ def main(argv=None) -> int:
     ap.add_argument("--reference", action="store_true",
                     help="also score against the host IF4 reference (needs the HF checkpoint)")
     ap.add_argument("--ref-device", default="cpu")
+    ap.add_argument("--config", default=None, help="which packed configuration to run (HxWxTOKENSxSTEPS)")
+    ap.add_argument("--list", action="store_true", help="list the packed configurations and exit")
     args = ap.parse_args(argv)
 
     sb = SingleBin(args.bin)
     h = sb.header
     cfg = h["config"]
-    g = h["geometry"]
+    if args.list:
+        for k, g in h["configs"].items():
+            print(f"  {k}: {g['height']}x{g['width']}, {g['max_sequence_length']} text tokens, {g['num_inference_steps']} steps, {h['engines']} engines")
+        return 0
+    key = args.config or h["default_config"]
+    if key not in h["configs"]:
+        raise SystemExit(f"configuration {key} is not in this bin; packed: {list(h['configs'])}")
+    g = h["configs"][key]
     geo = ref.Flux2Geometry(g["height"], g["width"], g["max_sequence_length"], g["num_inference_steps"])
     engines = int(h["engines"])
     prompt = args.prompt or cfg["defaults"]["prompt"]
-    _log(f"FLUX.2 klein 4B from {os.path.basename(args.bin)} | {geo.height}x{geo.width} | text {geo.n_txt} + image "
+    _log(f"FLUX.2 klein 4B from {os.path.basename(args.bin)} [{key}] | {geo.height}x{geo.width} | text {geo.n_txt} + image "
          f"{geo.n_img} tokens | {geo.num_inference_steps} steps | {engines} engine(s) | built {h.get('built')}")
 
     user_dma_core.set_dma_device(args.dev)
@@ -96,12 +106,17 @@ def main(argv=None) -> int:
     ue = T.Flux2KleinEngine(cfg, geo, num_engines=engines)
     ue.phase_timeout = args.phase_timeout
     ue.timings = {}
-    meta = ue.load_program_images(sb.section("programs"), h["programs_meta"], check_signature=False)
+    meta = ue.load_program_images(sb.section(f"programs/{key}"), h["programs_meta"][key], check_signature=False)
     vae_w = torch.load(io.BytesIO(sb.section_bytes("vae_weights")), map_location="cpu")
     ue.load_constants(vae_w)
 
     # phase 1: text encoder
     tok = sb.tokenizer()
+    n_real = int(tok(tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False,
+                                             add_generation_prompt=True, enable_thinking=False),
+                     return_tensors="pt")["input_ids"].shape[-1])
+    if n_real > geo.n_txt:
+        _log(f"  WARNING: prompt is {n_real} tokens but this configuration keeps {geo.n_txt}; it will be truncated")
     text = tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False,
                                    add_generation_prompt=True, enable_thinking=False)
     enc = tok(text, return_tensors="pt", padding="max_length", truncation=True, max_length=geo.n_txt)
@@ -135,7 +150,7 @@ def main(argv=None) -> int:
     _log(f"  total {total:.1f}s on the board for {geo.height}x{geo.width}, {geo.num_inference_steps} steps, {engines} engine(s)")
 
     result = {"height": geo.height, "width": geo.width, "max_sequence_length": geo.n_txt, "steps": geo.num_inference_steps,
-              "seed": args.seed, "engines": engines, "image": out, "vae": args.vae, "bin": args.bin,
+              "seed": args.seed, "engines": engines, "image": out, "vae": args.vae, "bin": args.bin, "config": key,
               "finite": bool(torch.isfinite(lat.float()).all()) and bool(torch.isfinite(img.float()).all()),
               "te_s": ue.timings["te_s"], "dit_s": ue.timings["dit_s"], "vae_s": ue.timings["vae_s"], "total_s": total}
     if args.reference:

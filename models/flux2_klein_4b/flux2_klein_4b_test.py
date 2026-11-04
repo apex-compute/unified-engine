@@ -177,7 +177,8 @@ class _WorkerEngine(_OfflineMixin, UnifiedEngine):
         self.offline = offline
         super().__init__(BASE_ADDR=user_dma_core.UE_0_BASE_ADDR + e * 0x10000,
                          params_dram_base=params_base, tensor_dram_base=tensor_base,
-                         program_dram_base=program_base, clock_period_ns=clock_period_ns)
+                         program_dram_base=program_base, clock_period_ns=clock_period_ns,
+                         conv_geometry_mode=CONV_GEOMETRY_QUEUE_CONFIG)
         self.bytes_per_element = BPE
         self.TMP_REG = 1
 
@@ -1005,7 +1006,8 @@ def main(argv=None) -> int:
     ap.add_argument("--seed", type=int, default=dfl["seed"])
     ap.add_argument("--height", type=int, default=m["height"])
     ap.add_argument("--width", type=int, default=m["width"])
-    ap.add_argument("--max-seq-len", type=int, default=m["max_sequence_length"])
+    ap.add_argument("--max-seq-len", default=str(m["max_sequence_length"]),
+                    help="text tokens (padded like the pipeline), or 'auto' = the prompt's length rounded up to 64")
     ap.add_argument("--steps", type=int, default=m["num_inference_steps"])
     ap.add_argument("--dev", default=dfl["dev"])
     ap.add_argument("--engines", default="max", help="engine count or 'max' (HW_INFO core count)")
@@ -1022,7 +1024,14 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=None, help="output PNG (default flux2_klein_4b_bin/flux2_<seed>.png)")
     args = ap.parse_args(argv)
 
-    geo = ref.Flux2Geometry(args.height, args.width, args.max_seq_len, args.steps)
+    if args.max_seq_len == "auto":
+        snap0 = ref.snapshot_dir(cfg["paths"]["hf_model_repo"])
+        n_real = int(tokenize(snap0, args.prompt, 4096)[1].sum())
+        max_seq_len = max(64, -(-n_real // 64) * 64)
+        _log(f"  prompt is {n_real} tokens -> max_sequence_length {max_seq_len}")
+    else:
+        max_seq_len = int(args.max_seq_len)
+    geo = ref.Flux2Geometry(args.height, args.width, max_seq_len, args.steps)
     paths = _paths(cfg)
     os.makedirs(os.path.join(HERE, cfg["paths"]["bin_dir"]), exist_ok=True)
 

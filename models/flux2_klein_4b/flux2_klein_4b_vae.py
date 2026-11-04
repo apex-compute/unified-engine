@@ -35,8 +35,122 @@ for p in (ROOT, HERE):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+import user_dma_core as udc  # noqa: E402
 from user_dma_core import TYPE, UE_VECTOR_SIZE  # noqa: E402
 import flux2_klein_4b_weights as W  # noqa: E402
+
+
+def conv2d_layer_sharded(engines, x: torch.Tensor, w_codes: torch.Tensor, *, pad: int,
+                         block_scales: torch.Tensor, bias: torch.Tensor, data_type=TYPE.IF8,
+                         timeout_s: float = 300.0) -> torch.Tensor:
+    """``UnifiedEngine.run_conv2d_layer`` spread over several engines.
+
+    The layer driver already splits a conv into output-channel chunks and
+    same-geometry tile groups; every (chunk, group) tile range is divided
+    evenly across the engines, each engine captures its own tile-loop program
+    over its share (same staged activation, same per-chunk weight streams,
+    disjoint output tiles), all programs are launched together and the host
+    waits for every engine. One staging DMA and one readback, as before."""
+    ue0 = engines[0]
+    ne = len(engines)
+    assert data_type in (TYPE.IF4, TYPE.IF8)
+    C, H, W_ = x.shape
+    OC, wc_c, kh, kw = w_codes.shape
+    assert wc_c == C
+    stride_s, dilation, pad_h = 1, 1, pad
+    ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    taps = kh * kw * ct
+    lalu_mode, lalu_a, lalu_b = udc._conv_fused_lalu(False, False, False)
+    patch_taps = kh * kw * C
+    chunks = (patch_taps + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    can_gather = C <= 255 and patch_taps <= 256
+    gather_cycles = max(kh * kw * ((C + 3) // 4), OC * chunks)
+    use_gather = can_gather and gather_cycles < OC * taps
+    block_scales = block_scales.detach().to(device="cpu", dtype=torch.bfloat16)
+    assert tuple(block_scales.shape) == (OC, chunks if use_gather else taps)
+    out_h, out_w, oc_chunk, tiles = udc.plan_conv2d_layer_tiles(
+        c_in=C, oc_count=OC, in_h=H, in_w=W_, kernel_h=kh, kernel_w=kw, stride_s=stride_s,
+        pad=pad, pad_h=pad_h, dilation=dilation, gather=use_gather, bias_enabled=bias is not None)
+    n_chunks = OC // oc_chunk
+    groups, activation_bytes, chunk_output_bytes = udc.conv2d_tiled_dram_layout(tiles, ct, oc_chunk)
+    staged = udc.conv2d_pack_activation_tiles(x, tiles, pad=pad, pad_h=pad_h)
+    ACT_BASE = ue0.allocate_params_dram(activation_bytes)
+    ue0.dma_write(ue0.h2c_device, ACT_BASE, staged, staged.numel() * 2)
+    OUT_BASE = ue0.allocate_tensor_dram(n_chunks * chunk_output_bytes)
+    stream_group = max(groups, key=lambda g: g[2] * g[3])
+    sth, stw = stream_group[2], stream_group[3]
+    streams = []
+    for ci, oc0 in enumerate(range(0, OC, oc_chunk)):
+        wc = w_codes[oc0:oc0 + oc_chunk]
+        chunk_scale = udc._conv2d_chunk_scale(block_scales, 1.0, oc0=oc0, n_oc=oc_chunk)
+        if use_gather:
+            w_stream = udc.conv2d_pack_weight_stream_gather(wc, sth, stw, data_type)
+            scale_stream = udc.conv2d_pack_scale_stream_gather(chunk_scale, oc_chunk, chunks)
+        else:
+            w_stream = udc.conv2d_pack_weight_stream(wc, sth, stw, data_type)
+            scale_stream = udc.conv2d_pack_scale_stream(chunk_scale, oc_chunk, taps, sth, stw)
+        WA = ue0.allocate_params_dram(w_stream.numel())
+        ue0.dma_write(ue0.h2c_device, WA, w_stream, w_stream.numel())
+        SA = ue0.allocate_params_dram(scale_stream.numel() * 2)
+        ue0.dma_write(ue0.h2c_device, SA, scale_stream, scale_stream.numel() * 2)
+        BA = None
+        if bias is not None:
+            bias_stream = udc.conv2d_pack_bias_stream(bias[oc0:oc0 + oc_chunk], sth, stw)
+            BA = ue0.allocate_params_dram(bias_stream.numel() * 2)
+            ue0.dma_write(ue0.h2c_device, BA, bias_stream, bias_stream.numel() * 2)
+        streams.append((WA, SA, BA))
+    # work units: every (chunk, geometry group) tile range split evenly across engines
+    per_engine = [[] for _ in engines]
+    for ci in range(n_chunks):
+        for gi, g in enumerate(groups):
+            start, stop = g[0], g[1]
+            n = stop - start
+            base, rem = divmod(n, ne)
+            t = start
+            for e in range(ne):
+                cnt = base + (1 if e < rem else 0)
+                if cnt:
+                    per_engine[e].append((ci, gi, t, t + cnt))
+                    t += cnt
+    progs = []
+    for e, eng in enumerate(engines):
+        if not per_engine[e]:
+            progs.append(None)
+            continue
+        eng.clear_inst_id()
+        eng.reset_isa_reg_counter()
+        eng.reset_inst_ptr_counter()
+        eng.start_capture()
+        for ci, gi, t0, t1 in per_engine[e]:
+            (start, stop, th, tw, _wh, win_w, act_offset, act_bytes, out_offset, out_bytes, _rl) = groups[gi]
+            rel = t0 - start
+            WA, SA, BA = streams[ci]
+            eng._capture_conv2d_tile_loop(
+                n_tiles=t1 - t0,
+                act_base=ACT_BASE + act_offset + rel * act_bytes, act_bytes=act_bytes,
+                weights_dram_addr=WA,
+                out_base=OUT_BASE + ci * chunk_output_bytes + out_offset + rel * out_bytes, out_bytes=out_bytes,
+                kernel_w=kw, kernel_h=kh, ct=ct, oc_count=oc_chunk, out_w=tw, out_h=th,
+                w_pad=win_w, stride_s=stride_s, dilation=dilation, data_type=data_type,
+                scale_dram_addr=SA, scale_count=(oc_chunk * chunks if use_gather else oc_chunk * taps),
+                bias_dram_addr=BA, results=th * tw * oc_chunk,
+                lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b,
+                gather=use_gather, c_in=C)
+        eng.stop_capture()
+        eng.generate_instruction_halt()
+        prog = eng.get_program_dram_addr()
+        eng.write_captured_instructions_to_dram(prog)
+        eng.allocate_program_dram(eng.get_capture_instruction_size_bytes())
+        eng.clear_capture_buffer()
+        progs.append(prog)
+    for eng, prog in zip(engines, progs):
+        if prog is not None:
+            eng.start_execute_from_dram(prog)
+    for eng, prog in zip(engines, progs):
+        if prog is not None:
+            eng.wait_queue(timeout_s)
+    big = ue0.dma_from_accelerator_memory(OUT_BASE, (n_chunks * chunk_output_bytes // 2,))
+    return udc.conv2d_unpack_tiled_result(big, tiles, out_h, out_w, OC, oc_chunk)
 
 
 class Flux2VaeFPGA:
@@ -51,13 +165,18 @@ class Flux2VaeFPGA:
         self.progress = progress
         self.timeout_s = timeout_s
         self.layer_times: list[tuple[str, float]] = []
+        # the engines that run the convolutions (all of them) and where each
+        # one's per-layer programs go (its cursor after the DiT phase)
+        self.engines = list(getattr(ue, "E", [ue]))
+        self.prog_bases = [eng.get_program_dram_addr() for eng in self.engines]
 
     # ---- arena discipline: every layer starts from the same marks ----
     def _reset(self) -> None:
         ue = self.ue
         ue.reset_params_dram_addr()
         ue._tensor_dram_addr = getattr(ue, "VAE_TENSOR_BASE", ue._tensor_dram_base)
-        ue._next_program_dram_addr = getattr(ue, "VAE_PROGRAM_BASE", ue._program_dram_base)
+        for eng, base in zip(self.engines, self.prog_bases):
+            eng._next_program_dram_addr = base
 
     def _timed(self, name, fn):
         t0 = time.time()
@@ -72,6 +191,10 @@ class Flux2VaeFPGA:
     def conv(self, x: torch.Tensor, key: str) -> torch.Tensor:
         c = self.w["convs"][key]
         self._reset()
+        if len(self.engines) > 1:
+            return self._timed(key, lambda: conv2d_layer_sharded(
+                self.engines, x, c["codes"], pad=c["pad"], block_scales=c["block_scales"], bias=c["bias"],
+                data_type=TYPE.IF8, timeout_s=self.timeout_s))
         return self._timed(key, lambda: self.ue.run_conv2d_layer(
             x, c["codes"], stride_s=1, pad=c["pad"], block_scales=c["block_scales"], bias=c["bias"],
             data_type=TYPE.IF8, timeout_s=self.timeout_s))
