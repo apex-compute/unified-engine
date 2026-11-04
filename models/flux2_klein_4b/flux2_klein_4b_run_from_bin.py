@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
-"""Run FLUX.2 [klein] 4B from the single deployable bin.
+"""Run FLUX.2 [klein] 4B on the board from the prebuilt files, one configuration per call.
 
-Everything comes from ONE file (see flux2_klein_4b_pack.py): config, tokenizer,
-weights, compiled programs. No network, no HF checkpoint, no other file.
+Reads, from ``flux2_klein_4b_bin/``:
+  params_te.bin / params_dit.bin / embed_tokens.bin / vae_weights.pt   (flux2_klein_4b_weights.py)
+  programs/<HxWxTOKENSxSTEPS>_e<engines>.{bin,json}                     (flux2_klein_4b_test.py --compile-only)
+and the tokenizer from the local HF cache. Never quantizes or compiles.
 
-    python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin flux2_klein_4b_256x256x64x4_e8.bin --prompt "..." --out image.png
-
-The configuration (resolution, text tokens, steps) and the engine count are
-baked into the bin (``--list`` shows them); the board must report at least
-that many engines.
+    python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --height 256 --width 256 --max-seq-len 64 --engines 8 --prompt "..." --out car_256.png
+    python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --height 512 --width 512 --max-seq-len 64 --engines 8 --prompt "..." --out car_512.png
 """
 from __future__ import annotations
 
 import argparse
-import io
 import json
-import mmap
 import os
 import sys
-import tempfile
 import time
 
-import numpy as np
 import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -33,103 +28,68 @@ for p in (ROOT, HERE):
 import user_dma_core  # noqa: E402
 import flux2_klein_4b_ref as ref  # noqa: E402
 import flux2_klein_4b_test as T  # noqa: E402
-from flux2_klein_4b_pack import read_header  # noqa: E402
 
 _log = T._log
 
 
-class SingleBin:
-    def __init__(self, path: str):
-        self.path = path
-        self.header, _ = read_header(path)
-        self.f = open(path, "rb")
-        self.mm = mmap.mmap(self.f.fileno(), 0, access=mmap.ACCESS_READ)
-
-    def section(self, name: str) -> bytes:
-        """A section as in-memory bytes. (The XDMA driver rejects writes straight
-        from a file-backed mmap view with EFAULT, so DMA sources are plain bytes.)"""
-        s = self.header["sections"][name]
-        self.f.seek(s["offset"])
-        return self.f.read(s["size"])
-
-    section_bytes = section
-
-    def tokenizer(self):
-        from transformers import AutoTokenizer
-        tmp = tempfile.mkdtemp(prefix="flux2_tok_")
-        for fn in self.header["tokenizer_files"]:
-            with open(os.path.join(tmp, fn), "wb") as f:
-                f.write(self.section_bytes(f"tokenizer/{fn}"))
-        return AutoTokenizer.from_pretrained(tmp)
-
-
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="FLUX.2 klein 4B from one bin")
-    ap.add_argument("--bin", required=True, help="the packed flux2_klein_4b_*.bin")
-    ap.add_argument("--prompt", default=None)
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--dev", default="xdma0")
-    ap.add_argument("--out", default=None, help="output PNG (default: <bin dir>/flux2_<seed>.png)")
+    cfg = T.load_config()
+    m, dfl = cfg["model"], cfg["defaults"]
+    ap = argparse.ArgumentParser(description="FLUX.2 klein 4B, run-only from the prebuilt files")
+    ap.add_argument("--prompt", default=dfl["prompt"])
+    ap.add_argument("--seed", type=int, default=dfl["seed"])
+    ap.add_argument("--height", type=int, default=m["height"])
+    ap.add_argument("--width", type=int, default=m["width"])
+    ap.add_argument("--max-seq-len", type=int, default=64, help="text tokens the programs were compiled for")
+    ap.add_argument("--steps", type=int, default=m["num_inference_steps"])
+    ap.add_argument("--engines", default="max", help="engine count or 'max' (HW_INFO core count)")
+    ap.add_argument("--dev", default=dfl["dev"])
+    ap.add_argument("--out", default=None, help="output PNG (default flux2_klein_4b_bin/flux2_<config>_<seed>.png)")
     ap.add_argument("--vae", choices=["fpga", "host"], default="fpga",
-                    help="host: decode on the CPU from the bin's IF8 VAE weights (standard FPGA image)")
+                    help="host: decode on the CPU from the IF8 VAE weights (standard FPGA image)")
     ap.add_argument("--vae-timeout", type=float, default=900.0)
     ap.add_argument("--phase-timeout", type=float, default=4 * 3600.0)
     ap.add_argument("--reference", action="store_true",
                     help="also score against the host IF4 reference (needs the HF checkpoint)")
     ap.add_argument("--ref-device", default="cpu")
-    ap.add_argument("--config", default=None, help="which packed configuration to run (HxWxTOKENSxSTEPS)")
-    ap.add_argument("--list", action="store_true", help="list the packed configurations and exit")
     args = ap.parse_args(argv)
 
-    sb = SingleBin(args.bin)
-    h = sb.header
-    cfg = h["config"]
-    if args.list:
-        for k, g in h["configs"].items():
-            print(f"  {k}: {g['height']}x{g['width']}, {g['max_sequence_length']} text tokens, {g['num_inference_steps']} steps, {h['engines']} engines")
-        return 0
-    key = args.config or h["default_config"]
-    if key not in h["configs"]:
-        raise SystemExit(f"configuration {key} is not in this bin; packed: {list(h['configs'])}")
-    g = h["configs"][key]
-    geo = ref.Flux2Geometry(g["height"], g["width"], g["max_sequence_length"], g["num_inference_steps"])
-    engines = int(h["engines"])
-    prompt = args.prompt or cfg["defaults"]["prompt"]
-    _log(f"FLUX.2 klein 4B from {os.path.basename(args.bin)} [{key}] | {geo.height}x{geo.width} | text {geo.n_txt} + image "
-         f"{geo.n_img} tokens | {geo.num_inference_steps} steps | {engines} engine(s) | built {h.get('built')}")
-
+    geo = ref.Flux2Geometry(args.height, args.width, args.max_seq_len, args.steps)
+    paths = T._paths(cfg)
+    for k in ("params_te_bin", "params_dit_bin", "vae_weights", "embed_tokens_bin"):
+        if not os.path.exists(paths[k]):
+            raise FileNotFoundError(f"{paths[k]} missing: run flux2_klein_4b_weights.py first")
     user_dma_core.set_dma_device(args.dev)
     user_dma_core.configure_clock_from_hardware()
-    cores = user_dma_core.ANDROMEDA_CORE_COUNT or 1
-    if cores < engines:
-        raise RuntimeError(f"bin was built for {engines} engines but HW_INFO reports {cores}")
-    ue = T.Flux2KleinEngine(cfg, geo, num_engines=engines)
+    ne = T.resolve_engines(args.engines, False)
+    key = T.config_key(geo)
+    _log(f"FLUX.2 klein 4B [{key}] | {geo.height}x{geo.width} | text {geo.n_txt} + image {geo.n_img} tokens | "
+         f"{geo.num_inference_steps} steps | {ne} engine(s)")
+
+    ue = T.Flux2KleinEngine(cfg, geo, num_engines=ne)
     ue.phase_timeout = args.phase_timeout
     ue.timings = {}
-    meta = ue.load_program_images(sb.section(f"programs/{key}"), h["programs_meta"][key], check_signature=False)
-    vae_w = torch.load(io.BytesIO(sb.section_bytes("vae_weights")), map_location="cpu")
+    meta = T.ensure_programs(ue, cfg, allow_compile=False)
+    bin_p, meta_p = T.program_paths(cfg, geo, ne)
+    ue.load_programs(bin_p, meta_p)
+    vae_w = torch.load(paths["vae_weights"], map_location="cpu")
     ue.load_constants(vae_w)
 
     # phase 1: text encoder
-    tok = sb.tokenizer()
-    n_real = int(tok(tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False,
-                                             add_generation_prompt=True, enable_thinking=False),
-                     return_tensors="pt")["input_ids"].shape[-1])
+    snap = ref.snapshot_dir(cfg["paths"]["hf_model_repo"])
+    input_ids, attention_mask = T.tokenize(snap, args.prompt, geo.n_txt)
+    n_real = int(T.tokenize(snap, args.prompt, 4096)[1].sum())
     if n_real > geo.n_txt:
-        _log(f"  WARNING: prompt is {n_real} tokens but this configuration keeps {geo.n_txt}; it will be truncated")
-    text = tok.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False,
-                                   add_generation_prompt=True, enable_thinking=False)
-    enc = tok(text, return_tensors="pt", padding="max_length", truncation=True, max_length=geo.n_txt)
-    te = cfg["text_encoder"]
-    embed = torch.frombuffer(bytearray(sb.section_bytes("embed_tokens")), dtype=torch.bfloat16).reshape(te["vocab"], te["hidden"])
+        _log(f"  WARNING: prompt is {n_real} tokens but this configuration keeps {geo.n_txt}; it is truncated")
+    embed_tokens = T.load_embed_tokens(cfg, paths)
     t_all = time.time()
-    embeds = ue.run_text_encoder(meta, enc["input_ids"], enc["attention_mask"], embed, sb.section("params_te"))
+    embeds = ue.run_text_encoder(meta, input_ids, attention_mask, embed_tokens, paths["params_te_bin"])
     _log(f"  TE phase {ue.timings['te_s']:.1f}s")
-    del embed
+    del embed_tokens
 
     # phase 2: DiT
     noise = ref.initial_noise(geo, args.seed)
-    lat = ue.run_dit(meta, noise, sb.section("params_dit"))
+    lat = ue.run_dit(meta, noise, paths["params_dit_bin"])
     _log(f"  DiT phase {ue.timings['dit_s']:.1f}s")
 
     # phase 3: VAE
@@ -143,19 +103,18 @@ def main(argv=None) -> int:
         img = reference_decode(vae_w, cfg, latent[0])[None]
     ue.timings["vae_s"] = time.time() - t0
     image = ref.to_uint8_image(img)
-    out = args.out or os.path.join(os.path.dirname(os.path.abspath(args.bin)), f"flux2_{args.seed}.png")
+    out = args.out or os.path.join(HERE, cfg["paths"]["bin_dir"], f"flux2_{key}_{args.seed}.png")
     ref.save_image(image, out)
     total = time.time() - t_all
     _log(f"  VAE phase ({args.vae}) {ue.timings['vae_s']:.1f}s -> {out}")
-    _log(f"  total {total:.1f}s on the board for {geo.height}x{geo.width}, {geo.num_inference_steps} steps, {engines} engine(s)")
+    _log(f"  total {total:.1f}s on the board for {geo.height}x{geo.width}, {geo.num_inference_steps} steps, {ne} engine(s)")
 
     result = {"height": geo.height, "width": geo.width, "max_sequence_length": geo.n_txt, "steps": geo.num_inference_steps,
-              "seed": args.seed, "engines": engines, "image": out, "vae": args.vae, "bin": args.bin, "config": key,
+              "seed": args.seed, "engines": ne, "image": out, "vae": args.vae, "config": key,
               "finite": bool(torch.isfinite(lat.float()).all()) and bool(torch.isfinite(img.float()).all()),
               "te_s": ue.timings["te_s"], "dit_s": ue.timings["dit_s"], "vae_s": ue.timings["vae_s"], "total_s": total}
     if args.reference:
-        snap = ref.snapshot_dir(cfg["paths"]["hf_model_repo"])
-        rr = T.quantized_reference(cfg, geo, snap, prompt, args.seed, args.ref_device)
+        rr = T.quantized_reference(cfg, geo, snap, args.prompt, args.seed, args.ref_device)
         result["embeds_snr_db"] = T.snr_db(rr.prompt_embeds, embeds)
         result["step_latents_snr_db"] = [T.snr_db(x, ue.step_latents[s + 1]) for s, (i, sg, v, x) in enumerate(rr.steps)]
         result["latents_snr_db"] = T.snr_db(rr.latents, ue.latents_raw)

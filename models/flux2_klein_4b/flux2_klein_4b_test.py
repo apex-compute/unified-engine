@@ -853,12 +853,10 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
 
     def load_program_images(self, blob, meta: dict, check_signature: bool = True) -> dict:
         """DMA every program image of ``meta`` (the primary's and the workers')
-        from ``blob`` (bytes-like / ndarray) to its baked address. A packed single
-        bin carries programs that match its own header, so it loads with
-        ``check_signature=False``."""
+        from ``blob`` (bytes-like / ndarray) to its baked address."""
         if check_signature and meta.get("signature") != self.program_signature():
             raise RuntimeError("program signature does not match this geometry/config/engine count/compiler; "
-                               "recompile (flux2_klein_4b_test.py --force-compile) and re-pack")
+                               "recompile (flux2_klein_4b_test.py --compile-only ... --force-compile)")
         ends = {}
         for im in meta["images"]:
             ue = self.E[im["engine"]]
@@ -991,6 +989,34 @@ def quantized_reference(cfg: dict, geo: ref.Flux2Geometry, snap: str, prompt: st
                              vae_state=vae_state, prompt_embeds=prompt_embeds, keep_steps=keep_steps)
 
 
+def config_key(geo: ref.Flux2Geometry) -> str:
+    return f"{geo.height}x{geo.width}x{geo.max_sequence_length}x{geo.num_inference_steps}"
+
+
+def program_paths(cfg: dict, geo: ref.Flux2Geometry, engines: int) -> tuple[str, str]:
+    """Where one configuration's compiled programs live:
+    flux2_klein_4b_bin/programs/<HxWxTOKENSxSTEPS>_e<engines>.{bin,json}."""
+    d = os.path.join(HERE, cfg["paths"]["bin_dir"], "programs")
+    os.makedirs(d, exist_ok=True)
+    stem = os.path.join(d, f"{config_key(geo)}_e{engines}")
+    return stem + ".bin", stem + ".json"
+
+
+def ensure_programs(ue: "Flux2KleinEngine", cfg: dict, *, allow_compile: bool = True, force: bool = False) -> dict:
+    """Return the program metadata for ``ue``'s configuration, compiling (offline-capable)
+    when the files are missing or their signature is stale."""
+    bin_p, meta_p = program_paths(cfg, ue.geo, ue.ne)
+    if not force and os.path.exists(bin_p) and os.path.exists(meta_p):
+        with open(meta_p) as f:
+            meta = json.load(f)
+        if meta.get("signature") == ue.program_signature():
+            return meta
+    if not allow_compile:
+        raise RuntimeError(f"programs for {config_key(ue.geo)} / {ue.ne} engine(s) are missing or stale: "
+                           f"compile them with flux2_klein_4b_test.py --compile-only")
+    return ue.compile_programs(bin_p, meta_p)
+
+
 def resolve_engines(spec: str, offline: bool) -> int:
     if spec == "max":
         cores = getattr(user_dma_core, "ANDROMEDA_CORE_COUNT", None)
@@ -1053,19 +1079,11 @@ def main(argv=None) -> int:
     ue.phase_timeout = args.phase_timeout
     _log(f"  tensor arena {ue.tensor_usage / 1e6:.0f} MB, params image {ue.params_image_size / 1e9:.2f} GB")
 
-    need_compile = args.force_compile or not (os.path.exists(paths["instruction_bin"]) and os.path.exists(paths["instruction_meta"]))
-    if not need_compile:
-        with open(paths["instruction_meta"]) as f:
-            if json.load(f).get("signature") != ue.program_signature():
-                need_compile = True
-    if need_compile and args.no_compile:
-        raise RuntimeError("programs.bin missing or stale and --no-compile given")
-    if need_compile:
-        meta = ue.compile_programs(paths["instruction_bin"], paths["instruction_meta"])
+    meta = ensure_programs(ue, cfg, allow_compile=not args.no_compile, force=args.force_compile)
     if args.compile_only:
-        _log("compile-only done")
+        _log(f"compile-only done: {program_paths(cfg, geo, ne)[0]}")
         return 0
-    meta = ue.load_programs(paths["instruction_bin"], paths["instruction_meta"])
+    meta = ue.load_programs(*program_paths(cfg, geo, ne))
     ue.timings = {}
 
     snap = ref.snapshot_dir(cfg["paths"]["hf_model_repo"])

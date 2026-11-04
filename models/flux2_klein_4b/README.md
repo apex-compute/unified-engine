@@ -10,8 +10,7 @@ three phases and writes the PNG.
 | File | Purpose |
 |---|---|
 | `flux2_klein_4b_test.py` | Build + run. Exports weights on first use, compiles the two programs, runs TE -> DiT -> VAE, scores against the host IF4 reference, prints `TEST_RESULT`. `--compile-only` needs no board. |
-| `flux2_klein_4b_pack.py` | Packs weights, tokenizer, VAE and the compiled programs of one configuration into one deployable `flux2_klein_4b_<config>_e<engines>.bin`. |
-| `flux2_klein_4b_run_from_bin.py` | Runs from that single bin: no network, no HF checkpoint, no other file. |
+| `flux2_klein_4b_run_from_bin.py` | Run-only: one configuration per call from the prebuilt weight files and that configuration's compiled programs (never quantizes or compiles). |
 | `flux2_klein_4b_vae.py` | Phase 3: the VAE decoder through the conv / GroupNorm / SiLU / upsample layer drivers, plus its IF8 host oracle. |
 | `flux2_klein_4b_weights.py` | Checkpoint -> `params_te.bin` (IF4 Qwen3), `params_dit.bin` (IF4 DiT), `vae_weights.pt` (IF8 convs); shape-only layout planner the compiler addresses from. |
 | `flux2_klein_4b_ref.py` | Plain-torch reference of the whole pipeline (bit-identical to diffusers in fp32); IF4 / IF8 fake-quant helpers. |
@@ -33,16 +32,13 @@ python models/flux2_klein_4b/flux2_klein_4b_test.py --prompt "A photo of a red s
 # quicker CI geometry (256x256, 128 text tokens) and host-decoded VAE (standard FPGA image)
 python models/flux2_klein_4b/flux2_klein_4b_test.py --height 256 --width 256 --max-seq-len 128 --vae host
 
-# one deployable file per configuration (~4.7 GB each: weights + tokenizer + that configuration's programs for 8 engines)
-python models/flux2_klein_4b/flux2_klein_4b_pack.py --config 256x256x64x4 --engines 8
-python models/flux2_klein_4b/flux2_klein_4b_pack.py --config 512x512x64x4 --engines 8
+# compile the programs of a configuration (no board needed, ~15 s each; cached under flux2_klein_4b_bin/programs/)
+python models/flux2_klein_4b/flux2_klein_4b_test.py --compile-only --height 256 --width 256 --max-seq-len 64 --engines 8
+python models/flux2_klein_4b/flux2_klein_4b_test.py --compile-only --height 512 --width 512 --max-seq-len 64 --engines 8
 
-# run from a file alone (no network, no HF checkpoint): ~42 s for 256x256, ~2 min 20 s for 512x512 on 8 engines
-python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin models/flux2_klein_4b/flux2_klein_4b_bin/flux2_klein_4b_256x256x64x4_e8.bin --prompt "A photo of a red sports car on a mountain road at sunset" --out car_256.png
-python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin models/flux2_klein_4b/flux2_klein_4b_bin/flux2_klein_4b_512x512x64x4_e8.bin --prompt "A photo of a red sports car on a mountain road at sunset" --out car_512.png
-
-# compile without a board (writes flux2_klein_4b_bin/programs.{bin,json})
-python models/flux2_klein_4b/flux2_klein_4b_test.py --compile-only
+# run one configuration from the prebuilt files (no quantization, no compile): ~38 s for 256x256, ~2 min 10 s for 512x512 on 8 engines
+python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --height 256 --width 256 --max-seq-len 64 --engines 8 --prompt "A photo of a red sports car on a mountain road at sunset" --out car_256.png
+python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --height 512 --width 512 --max-seq-len 64 --engines 8 --prompt "A photo of a red sports car on a mountain road at sunset" --out car_512.png
 
 # host checks
 python -m unittest discover -s models/flux2_klein_4b -p 'test_*.py'
@@ -63,20 +59,18 @@ python models/flux2_klein_4b/flux2_klein_4b_quant_report.py --height 512 --width
 
 Programs are keyed by a signature over geometry, engine count and the
 compiler source; a different resolution, text length, step count, engine
-count or code change recompiles (seconds). Weight bins are geometry-independent.
+count or code change recompiles (seconds). Weight files are geometry-independent.
 
-## Single deployable bin
+## Prebuilt files
 
-`flux2_klein_4b_pack.py` writes `flux2_klein_4b_<config>_e<engines>.bin`: a header (JSON: model
-config, the packed configurations, engine count, layout manifests, program
-metadata) followed by 4 KiB-aligned sections -- the tokenizer files, the Qwen3
-token embedding, the IF4 text-encoder and DiT weight images, the IF8 VAE
-weights, and the compiled programs (every engine's images, ~90 MB) of one
-configuration (`--config HxWxTOKENSxSTEPS`); one bin per configuration.
-`flux2_klein_4b_run_from_bin.py --bin FILE` DMAs each section to its baked
-address and runs; `--list` shows what a bin was built for.
-On the board the run is still three host-sequenced phases: the text-encoder
-program, the DiT program, then the VAE decoder's per-layer programs.
+`flux2_klein_4b_weights.py` writes the geometry-independent weight files once
+(`params_te.bin`, `params_dit.bin`, `embed_tokens.bin`, `vae_weights.pt`);
+`flux2_klein_4b_test.py --compile-only` writes one program set per
+configuration and engine count under `flux2_klein_4b_bin/programs/`
+(`<HxWxTOKENSxSTEPS>_e<engines>.bin` plus its JSON: every engine's image and
+its baked DRAM address). `flux2_klein_4b_run_from_bin.py` loads exactly those
+files for the configuration given on its command line and DMAs them to the
+board; it refuses a stale or missing program set instead of compiling.
 
 ## Multi-engine (`--engines N`, default `max` = HW_INFO core count)
 
@@ -181,7 +175,7 @@ is finite and lands on the same image, not bit-level agreement.
 
 ## Cost and expectations
 
-Measured on the U50, 4 steps, all phases on the FPGA, from the packed bins:
+Measured on the U50, 4 steps, all phases on the FPGA, from the prebuilt files:
 
 | Image clock | Configuration | Text encoder | DiT | VAE | Total on board |
 |---|---|---:|---:|---:|---:|

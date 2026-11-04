@@ -93,9 +93,8 @@
     "params_dit_bin": "flux2_klein_4b_bin/params_dit.bin",
     "params_dit_meta": "flux2_klein_4b_bin/params_dit.json",
     "vae_weights": "flux2_klein_4b_bin/vae_weights.pt",
-    "instruction_bin": "flux2_klein_4b_bin/programs.bin",
-    "instruction_meta": "flux2_klein_4b_bin/programs.json",
-    "tokenizer_dir": "tokenizer"
+    "tokenizer_dir": "tokenizer",
+    "programs_dir": "flux2_klein_4b_bin/programs"
   },
   "defaults": {
     "prompt": "A photo of a red sports car on a mountain road at sunset",
