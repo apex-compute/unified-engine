@@ -81,8 +81,19 @@ def scan_configs() -> list[dict]:
             with open(meta_p) as f:
                 meta = json.load(f)
             g = meta["geometry"]
-            phases = {n: {"program_bytes": int(meta[f"{n}_program_size"]), "flops": int(meta[f"{n}_flops"])}
-                      for n in PHASES if f"{n}_flops" in meta}
+            images = meta.get("images", [])
+            phases = {}
+            for n in PHASES:
+                if f"{n}_flops" not in meta:
+                    continue
+                primary = int(meta[f"{n}_program_size"])             # engine 0's segment of this phase
+                workers = sum(int(im["size"]) for im in images if im.get("phase") == n)
+                phases[n] = {"program_bytes": primary, "worker_bytes": workers,
+                             "all_engines_bytes": primary + workers, "flops": int(meta[f"{n}_flops"])}
+            # anything else in the bin (the per-engine barrier flag-clear stubs), engine 0 / the others
+            other = [im for im in images if im.get("phase") not in PHASES + ("primary",)]
+            other_primary = sum(int(im["size"]) for im in other if int(im.get("engine", 0)) == 0)
+            other_workers = sum(int(im["size"]) for im in other) - other_primary
             out.append({
                 "id": os.path.basename(meta_p)[:-5],
                 "height": int(g["height"]), "width": int(g["width"]),
@@ -90,8 +101,10 @@ def scan_configs() -> list[dict]:
                 "engines": int(meta["engines"]),
                 "image_tokens": (int(g["height"]) // 16) * (int(g["width"]) // 16),
                 "program_bin_bytes": _size(bin_p),
-                "program_images_bytes": sum(int(im["size"]) for im in meta.get("images", [])),
+                "program_images_bytes": sum(int(im["size"]) for im in images),
                 "phases": phases,
+                "other_images": {"program_bytes": other_primary, "worker_bytes": other_workers,
+                                 "all_engines_bytes": other_primary + other_workers, "count": len(other)},
                 "total_flops": sum(p["flops"] for p in phases.values()),
                 "params_image_bytes": int(meta.get("params_image_size", 0)),
                 "tensor_dram_bytes": int(meta.get("tensor_dram_usage", 0)),
@@ -433,12 +446,15 @@ function showStatic() {
   const body = [];
   for (const n of ['te', 'dit', 'vae']) {
     const p = c.phases[n]; if (!p) continue;
-    body.push({ cells: [NAMES[n], gb(p.program_bytes), tf(p.flops), peak ? (p.flops / peak / 1e9).toFixed(1) + ' s' : '—'] });
+    body.push({ cells: [NAMES[n], gb(p.program_bytes), gb(p.worker_bytes), gb(p.all_engines_bytes), tf(p.flops), peak ? (p.flops / peak / 1e9).toFixed(1) + ' s' : '—'] });
   }
-  body.push({ cells: ['Total (program bin)', gb(c.program_bin_bytes), tf(c.total_flops), peak ? (c.total_flops / peak / 1e9).toFixed(1) + ' s' : '—'], total: true });
-  $('programs').innerHTML = rows(['Phase', 'Program', 'Work', 'At peak'], body);
+  const o = c.other_images || { program_bytes: 0, worker_bytes: 0, all_engines_bytes: 0, count: 0 };
+  if (o.count) body.push({ cells: [`Barrier flag-clear stubs (${o.count} \u00d7 ${o.all_engines_bytes / o.count} B)`, gb(o.program_bytes), gb(o.worker_bytes), gb(o.all_engines_bytes), '', ''] });
+  const sum = k => Object.values(c.phases).reduce((a, p) => a + p[k], 0) + o[k];
+  body.push({ cells: ['Total (program bin)', gb(sum('program_bytes')), gb(sum('worker_bytes')), gb(c.program_bin_bytes), tf(c.total_flops), peak ? (c.total_flops / peak / 1e9).toFixed(1) + ' s' : '—'], total: true });
+  $('programs').innerHTML = rows(['Phase', 'Engine 0', `Engines 1–${c.engines - 1}`, 'All engines', 'Work', 'At peak'], body);
   $('staticnote').textContent =
-    `${c.image_tokens} image + ${c.max_seq_len} text tokens. The program bin holds the instruction images of all ${c.engines} engines; ` +
+    `${c.image_tokens} image + ${c.max_seq_len} text tokens. Engine 0 runs the primary program of each phase and every other engine its own worker program; the bin is all of them. ` +
     `a ${gb(c.vae_const_bytes)} VAE constant image is built from the weights per run; tensor DRAM ${gb(c.tensor_dram_bytes)}. ` +
     (peak ? `Raw peak ${peak.toFixed(0)} GFLOPS = ${c.engines} engines × 128 FLOP/cycle at ${board.clock_mhz.toFixed(0)} MHz.`
           : 'The raw peak of the board is known after the first run.');
