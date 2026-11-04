@@ -5,7 +5,9 @@ Standard library only. Serves one page (prompt box, resolution picker, seed,
 Generate) and runs ``flux2_klein_4b_run_from_bin.py`` as a subprocess for each
 request, one at a time (the board is a single resource). The picker lists the
 program sets found under ``flux2_klein_4b_bin/programs/``; compile more with
-``flux2_klein_4b_test.py --compile-only``.
+``flux2_klein_4b_test.py --compile-only``. Selecting one shows its static
+figures (weight images, program sizes, FLOPs per phase); a finished run shows
+every phase's on-device FLOP rate against the raw peak of the engines.
 
     python models/flux2_klein_4b/flux2_klein_4b_server.py --port 8080
     python models/flux2_klein_4b/flux2_klein_4b_server.py --port 8080 --cpus 0,2-23   # pin the runs
@@ -31,13 +33,36 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 RUNNER = os.path.join(HERE, "flux2_klein_4b_run_from_bin.py")
-PROGRAMS_DIR = os.path.join(HERE, "flux2_klein_4b_bin", "programs")
-OUT_DIR = os.path.join(HERE, "flux2_klein_4b_bin", "server")
+CONFIG = os.path.join(HERE, "flux2_klein_4b_config.json")
+BIN_DIR = os.path.join(HERE, "flux2_klein_4b_bin")
+PROGRAMS_DIR = os.path.join(BIN_DIR, "programs")
+OUT_DIR = os.path.join(BIN_DIR, "server")
+BOARD_CACHE = os.path.join(OUT_DIR, "board.json")   # clock / peak seen on the last run
 MAX_PROMPT_CHARS = 2000
+PHASES = ("te", "dit", "vae")
+
+
+def _size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def weight_files() -> dict:
+    """Sizes of the geometry-independent weight images (flux2_klein_4b_weights.py)."""
+    with open(CONFIG) as f:
+        paths = json.load(f)["paths"]
+    return {
+        "te": _size(os.path.join(HERE, paths["params_te_bin"])),
+        "dit": _size(os.path.join(HERE, paths["params_dit_bin"])),
+        "vae": _size(os.path.join(HERE, paths["vae_weights"])),
+        "embed_tokens": _size(os.path.join(HERE, paths["embed_tokens_bin"])),
+    }
 
 
 def scan_configs() -> list[dict]:
-    """One entry per compiled program set: <HxWxTOKENSxSTEPS>_e<N>.json."""
+    """One entry per compiled program set: <HxWxTOKENSxSTEPS>_e<N>.json, with its static figures."""
     out = []
     for meta_p in sorted(glob.glob(os.path.join(PROGRAMS_DIR, "*_e*.json"))):
         bin_p = meta_p[:-5] + ".bin"
@@ -47,16 +72,48 @@ def scan_configs() -> list[dict]:
             with open(meta_p) as f:
                 meta = json.load(f)
             g = meta["geometry"]
+            phases = {n: {"program_bytes": int(meta[f"{n}_program_size"]), "flops": int(meta[f"{n}_flops"])}
+                      for n in PHASES if f"{n}_flops" in meta}
             out.append({
                 "id": os.path.basename(meta_p)[:-5],
                 "height": int(g["height"]), "width": int(g["width"]),
                 "max_seq_len": int(g["max_sequence_length"]), "steps": int(g["steps"]),
                 "engines": int(meta["engines"]),
+                "image_tokens": (int(g["height"]) // 16) * (int(g["width"]) // 16),
+                "program_bin_bytes": _size(bin_p),
+                "program_images_bytes": sum(int(im["size"]) for im in meta.get("images", [])),
+                "phases": phases,
+                "total_flops": sum(p["flops"] for p in phases.values()),
+                "params_image_bytes": int(meta.get("params_image_size", 0)),
+                "tensor_dram_bytes": int(meta.get("tensor_dram_usage", 0)),
+                "vae_const_bytes": int(meta.get("vae", {}).get("const_size", 0)),
+                "compile_seconds": meta.get("compile_seconds"),
             })
         except (OSError, KeyError, ValueError, TypeError):
             continue
     out.sort(key=lambda c: (c["height"] * c["width"], c["max_seq_len"], c["engines"]))
     return out
+
+
+def load_board() -> dict:
+    try:
+        with open(BOARD_CACHE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_board(result: dict) -> None:
+    if not result.get("peak_gflops"):
+        return
+    board = {"clock_mhz": result["clock_mhz"], "peak_gflops_per_engine": result["peak_gflops_per_engine"],
+             "seen": time.time()}
+    try:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        with open(BOARD_CACHE, "w") as f:
+            json.dump(board, f)
+    except OSError:
+        pass
 
 
 class Job:
@@ -141,6 +198,8 @@ class Runner(threading.Thread):
                     raise RuntimeError(f"runner exited with code {rc}: {last}")
                 if not os.path.exists(job.image):
                     raise RuntimeError("runner finished but wrote no image")
+                if job.result:
+                    save_board(job.result)
                 job.state = "done"
             except Exception as e:  # noqa: BLE001 - report anything to the page
                 job.state, job.error = "error", str(e)
@@ -155,14 +214,15 @@ PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FLUX.2 klein on the Unified Engine</title>
 <style>
-  :root { --bg:#f6f7f9; --fg:#1c1e21; --muted:#6b7280; --card:#fff; --line:#d9dde3; --accent:#2563eb; --err:#b91c1c; }
+  :root { --bg:#f6f7f9; --fg:#1c1e21; --muted:#6b7280; --card:#fff; --line:#d9dde3; --accent:#2563eb; --err:#b91c1c; --bar:#dbe4ff; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#111317; --fg:#e6e8eb; --muted:#9aa3ad; --card:#1a1d23; --line:#2d323b; --accent:#5b8cff; --err:#f87171; }
+    :root { --bg:#111317; --fg:#e6e8eb; --muted:#9aa3ad; --card:#1a1d23; --line:#2d323b; --accent:#5b8cff; --err:#f87171; --bar:#26324f; }
   }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
   main { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
   h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 14px; color: var(--muted); font-weight: 600; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .03em; }
   .sub { color: var(--muted); margin: 0 0 20px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
   label { display:block; font-size:13px; color:var(--muted); margin-bottom:4px; }
@@ -180,6 +240,16 @@ PAGE = """<!doctype html>
   .hist { display:flex; gap:8px; flex-wrap:wrap; }
   .hist img { width:96px; height:96px; object-fit:cover; border-radius:6px; border:1px solid var(--line); cursor:pointer; }
   details summary { cursor:pointer; color:var(--muted); font-size:13px; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 500; }
+  tr.total td { font-weight: 600; border-bottom: 0; }
+  td.util { position: relative; }
+  td.util span { position: relative; z-index: 1; }
+  td.util i { position:absolute; left:0; top:3px; bottom:3px; background:var(--bar); border-radius:3px; z-index:0; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -199,9 +269,20 @@ PAGE = """<!doctype html>
     <details><summary>Run log</summary><pre id="log"></pre></details>
   </div>
 
+  <div class="card" id="static" hidden>
+    <div class="grid">
+      <div><h2>Weights on the board</h2><table id="weights"></table></div>
+      <div><h2>Programs of this configuration</h2><table id="programs"></table></div>
+    </div>
+    <div class="note" id="staticnote"></div>
+  </div>
+
   <div class="card" id="result" hidden>
     <img id="img" alt="generated image">
     <div class="meta" id="meta"></div>
+    <h2 style="margin-top:14px">Run on the board</h2>
+    <table id="stats"></table>
+    <div class="note" id="statsnote"></div>
   </div>
 
   <div class="card" id="history" hidden>
@@ -211,24 +292,82 @@ PAGE = """<!doctype html>
 </main>
 <script>
 const $ = id => document.getElementById(id);
-let configs = [], current = null, timer = null;
+let configs = [], board = {}, current = null, timer = null;
+const NAMES = { te: 'Text encoder (Qwen3-4B, 27 layers)', dit: 'Diffusion transformer (4 steps)', vae: 'VAE decoder' };
 
+const gb = b => b >= 1e9 ? (b / 1e9).toFixed(2) + ' GB' : (b / 1e6).toFixed(1) + ' MB';
+const tf = f => (f / 1e12).toFixed(2) + ' TFLOP';
+const pct = x => (100 * x).toFixed(0) + '%';
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 function fmt(c) {
   return `${c.width}×${c.height} — ${c.max_seq_len} text tokens, ${c.steps} steps, ${c.engines} engines`;
 }
+function rows(head, body) {
+  return '<tr>' + head.map(h => `<th>${h}</th>`).join('') + '</tr>' +
+    body.map(r => `<tr${r.total ? ' class="total"' : ''}>` + r.cells.map(c => typeof c === 'object'
+      ? `<td class="util"><i style="width:${Math.min(100, 100 * c.util).toFixed(1)}%"></i><span>${pct(c.util)}</span></td>`
+      : `<td>${c}</td>`).join('') + '</tr>').join('');
+}
+function peakOf(c) { return board.peak_gflops_per_engine ? board.peak_gflops_per_engine * c.engines : 0; }
+
+function showStatic() {
+  const c = configs.find(x => x.id === $('config').value);
+  if (!c) { $('static').hidden = true; return; }
+  const w = board.weights || {};
+  const wtotal = (w.te || 0) + (w.dit || 0) + (w.vae || 0);
+  $('weights').innerHTML = rows(['Image', 'Format', 'Size'], [
+    { cells: ['Text encoder', 'IF4', gb(w.te || 0)] },
+    { cells: ['Diffusion transformer', 'IF4 + BF16 heads', gb(w.dit || 0)] },
+    { cells: ['VAE decoder', 'IF8', gb(w.vae || 0)] },
+    { cells: ['Token embedding (host)', 'BF16', gb(w.embed_tokens || 0)] },
+    { cells: ['Total on the board', '', gb(wtotal)], total: true },
+  ]);
+  const peak = peakOf(c);
+  const body = [];
+  for (const n of ['te', 'dit', 'vae']) {
+    const p = c.phases[n]; if (!p) continue;
+    body.push({ cells: [NAMES[n], gb(p.program_bytes), tf(p.flops), peak ? (p.flops / peak / 1e9).toFixed(1) + ' s' : '—'] });
+  }
+  body.push({ cells: ['Total', gb(c.program_bin_bytes), tf(c.total_flops), peak ? (c.total_flops / peak / 1e9).toFixed(1) + ' s' : '—'], total: true });
+  $('programs').innerHTML = rows(['Phase', 'Program', 'Work', 'At peak'], body);
+  $('staticnote').textContent =
+    `${c.image_tokens} image + ${c.max_seq_len} text tokens; program bin ${gb(c.program_bin_bytes)} ` +
+    `of instructions across ${c.engines} engines, plus a ${gb(c.vae_const_bytes)} VAE constant image built from the weights per run; ` +
+    `tensor DRAM ${gb(c.tensor_dram_bytes)}; ` +
+    (peak ? `raw peak ${peak.toFixed(0)} GFLOPS = ${c.engines} engines × 128 FLOP/cycle at ${board.clock_mhz.toFixed(0)} MHz.`
+          : 'the raw peak of the board is known after the first run.');
+  $('static').hidden = false;
+}
 async function loadConfigs() {
-  configs = await (await fetch('/api/configs')).json();
-  const sel = $('config'); sel.innerHTML = '';
+  const d = await (await fetch('/api/configs')).json();
+  configs = d.configs; board = d.board;
+  const sel = $('config'), keep = sel.value; sel.innerHTML = '';
   for (const c of configs) { const o = document.createElement('option'); o.value = c.id; o.textContent = fmt(c); sel.appendChild(o); }
   if (!configs.length) { $('status').textContent = 'No compiled program sets found under flux2_klein_4b_bin/programs/.'; $('go').disabled = true; }
-  else { sel.value = (configs.find(c => c.width === 256 && c.max_seq_len === 64) || configs[0]).id; }
+  else { sel.value = configs.some(c => c.id === keep) ? keep : (configs.find(c => c.width === 256 && c.max_seq_len === 64) || configs[0]).id; }
+  showStatic();
 }
 function showJob(j) {
   if (!j || j.state !== 'done') return;
   $('img').src = j.image + '?t=' + (j.result && j.result.total_s || 0);
   const r = j.result || {};
-  $('meta').textContent = `"${j.prompt}" — ${j.config.width}×${j.config.height}, seed ${j.seed}` +
-    (r.total_s ? ` — ${r.total_s.toFixed(1)} s on the board (TE ${r.te_s.toFixed(1)} s, DiT ${r.dit_s.toFixed(1)} s, VAE ${r.vae_s.toFixed(1)} s)` : '');
+  $('meta').innerHTML = `“${esc(j.prompt)}” — ${j.config.width}×${j.config.height}, seed ${j.seed}` +
+    (r.total_s ? ` — ${r.total_s.toFixed(1)} s on the board` : '');
+  const body = [];
+  if (r.phases) {
+    for (const n of ['te', 'dit', 'vae']) {
+      const p = r.phases[n]; if (!p) continue;
+      body.push({ cells: [NAMES[n], tf(p.flops), p.device_s.toFixed(1) + ' s', p.wall_s.toFixed(1) + ' s', p.gflops.toFixed(0), { util: p.utilization }] });
+    }
+    body.push({ cells: ['Total', tf(r.total_flops), r.device_s.toFixed(1) + ' s', r.total_s.toFixed(1) + ' s', r.total_gflops.toFixed(0), { util: r.utilization }], total: true });
+    $('stats').innerHTML = rows(['Phase', 'Work', 'On device', 'Phase wall', 'GFLOPS', 'Of raw peak'], body);
+    $('statsnote').textContent =
+      `Raw peak ${r.peak_gflops.toFixed(0)} GFLOPS (${r.engines} engines × 128 FLOP/cycle at ${r.clock_mhz.toFixed(0)} MHz). ` +
+      `Overall ${pct(r.utilization)} of peak over the whole run including weight DMA, ${pct(r.device_utilization)} while programs execute. ` +
+      `"Phase wall" adds the host side of each phase (weight upload, DMA in/out) to the device time; total also holds tokenizing and the PNG.`;
+  } else {
+    $('stats').innerHTML = ''; $('statsnote').textContent = r.total_s ? `TE ${r.te_s.toFixed(1)} s, DiT ${r.dit_s.toFixed(1)} s, VAE ${r.vae_s.toFixed(1)} s.` : '';
+  }
   $('result').hidden = false;
 }
 async function loadHistory() {
@@ -251,8 +390,10 @@ async function poll() {
     $('status').className = 'status' + (j.state === 'error' ? ' err' : '');
     $('status').textContent = j.state === 'error' ? 'Failed: ' + j.error : `Done in ${j.elapsed.toFixed(1)} s.`;
     showJob(j); loadHistory();
+    if (j.state === 'done') loadConfigs();      // the board's clock / peak are known now
   }
 }
+$('config').onchange = showStatic;
 $('go').onclick = async () => {
   const body = { prompt: $('prompt').value, config: $('config').value, seed: parseInt($('seed').value || '0', 10) };
   $('go').disabled = true; $('status').className = 'status'; $('status').textContent = 'Submitting…'; $('log').textContent = '';
@@ -290,7 +431,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
         if path == "/api/configs":
-            return self._json(scan_configs())
+            board = load_board()
+            board["weights"] = weight_files()
+            return self._json({"configs": scan_configs(), "board": board})
         if path == "/api/jobs":
             with self.runner.lock:
                 jobs = [self.runner.jobs[i] for i in self.runner.order]
@@ -348,7 +491,8 @@ def main(argv=None) -> int:
               file=sys.stderr)
     for c in cfgs:
         print(f"  {c['id']}: {c['width']}x{c['height']}, {c['max_seq_len']} text tokens, {c['steps']} steps, "
-              f"{c['engines']} engines", file=sys.stderr)
+              f"{c['engines']} engines, {c['total_flops'] / 1e12:.2f} TFLOP, bin {c['program_bin_bytes'] / 1e6:.1f} MB",
+              file=sys.stderr)
     runner = Runner(args.python, args.cpus, args.dev)
     runner.start()
     Handler.runner = runner

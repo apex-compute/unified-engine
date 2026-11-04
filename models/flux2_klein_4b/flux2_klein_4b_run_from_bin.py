@@ -32,6 +32,32 @@ import flux2_klein_4b_test as T  # noqa: E402
 _log = T._log
 
 
+FLOPS_PER_CYCLE = 128          # raw peak of one engine (user_dma_core.report_flop_rate_gflops uses the same 128)
+
+
+def phase_stats(timings: dict, engines: int, total_s: float) -> dict:
+    """Per-phase and overall FLOP rates against the raw peak of ``engines`` engines
+    (FLOPS_PER_CYCLE each at the clock HW_INFO reported)."""
+    clock_hz = float(user_dma_core.CORE_CLOCK_FREQ_HZ or 0.0)
+    peak_engine = FLOPS_PER_CYCLE * clock_hz / 1e9                  # GFLOPS of one engine
+    peak = peak_engine * engines
+    phases = {}
+    for name in ("te", "dit", "vae"):
+        if f"{name}_gflops" not in timings:
+            continue                                        # phase ran on the host
+        g = timings[f"{name}_gflops"]
+        phases[name] = {"flops": timings[f"{name}_flops"], "device_s": timings[f"{name}_device_s"],
+                        "wall_s": timings[f"{name}_s"], "gflops": g, "utilization": g / peak if peak else 0.0}
+    total_flops = sum(p["flops"] for p in phases.values())
+    device_s = sum(p["device_s"] for p in phases.values())
+    total_gflops = total_flops / total_s / 1e9 if total_s else 0.0
+    device_gflops = total_flops / device_s / 1e9 if device_s else 0.0
+    return {"clock_mhz": clock_hz / 1e6, "peak_gflops": peak, "peak_gflops_per_engine": peak_engine, "phases": phases,
+            "total_flops": total_flops, "device_s": device_s, "total_gflops": total_gflops,
+            "utilization": total_gflops / peak if peak else 0.0,
+            "device_utilization": device_gflops / peak if peak else 0.0}
+
+
 def main(argv=None) -> int:
     cfg = T.load_config()
     m, dfl = cfg["model"], cfg["defaults"]
@@ -112,6 +138,13 @@ def main(argv=None) -> int:
               "seed": args.seed, "engines": ne, "image": out, "vae": args.vae, "config": key,
               "finite": bool(torch.isfinite(lat.float()).all()) and bool(torch.isfinite(img.float()).all()),
               "te_s": ue.timings["te_s"], "dit_s": ue.timings["dit_s"], "vae_s": ue.timings["vae_s"], "total_s": total}
+    result.update(phase_stats(ue.timings, ne, total))
+    for name, ph in result["phases"].items():
+        _log(f"  {name.upper()}: {ph['flops'] / 1e12:.2f} TFLOP in {ph['device_s']:.1f}s on the device = "
+             f"{ph['gflops']:.0f} GFLOPS, {100 * ph['utilization']:.0f}% of the {result['peak_gflops']:.0f} GFLOPS peak")
+    _log(f"  overall: {result['total_flops'] / 1e12:.2f} TFLOP / {total:.1f}s = {result['total_gflops']:.0f} GFLOPS, "
+         f"{100 * result['utilization']:.0f}% of peak ({100 * result['device_utilization']:.0f}% on the device, "
+         f"{ne} engine(s) at {result['clock_mhz']:.0f} MHz)")
     if args.vae == "fpga" and args.reference:
         from flux2_klein_4b_vae import reference_decode
         oracle = reference_decode(vae_w, cfg, latent[0])[None]

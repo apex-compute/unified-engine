@@ -958,7 +958,12 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
                 self.sched.preclear_flags()
                 self._flags_precleared = True
             self.sched.start_workers(meta[f"{name}_worker_prog_addrs"])
-        self.program_execute(meta[f"{name}_program_start_addr"], timeout=timeout, flops=meta[f"{name}_flops"])
+        latency_us, gflops = self.program_execute(meta[f"{name}_program_start_addr"], timeout=timeout,
+                                                  flops=meta[f"{name}_flops"])
+        # on-device figures of the phase (the wall time around it also holds the host side)
+        self.timings[f"{name}_device_s"] = float(latency_us) / 1e6
+        self.timings[f"{name}_gflops"] = float(gflops)
+        self.timings[f"{name}_flops"] = int(meta[f"{name}_flops"])
         if self.sched is not None:
             for w in self.workers:
                 w.wait_queue(120.0)
