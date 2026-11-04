@@ -546,6 +546,38 @@ def _check_moonshine(text):
     return True, f"matched {len(matched)}/{len(keywords)} transcription keywords (no match line): {transcript!r}"
 
 
+def _check_flux2(text):
+    # flux2_klein_4b_test.py prints TEST_RESULT: {finite, embeds_snr_db, velocity0_snr_db,
+    # latents_snr_db, image_psnr_db, ...} against the host reference run with the SAME
+    # IF4/IF8 weights (flux2_klein_4b_test.quantized_reference). The gate is the STEP-0
+    # LATENT SNR (x1 = x0 + dt*v0: one full 25-block DiT forward on identical inputs) plus
+    # the text embedding SNR and a loose image PSNR. End-to-end latent SNR is NOT gated:
+    # the 4-step schedule amplifies per-step bf16/bf19 noise (bf16 host vs diffusers
+    # already drifts to 24 dB), so it only confirms the run lands on the same image.
+    # (velocity0_snr_db is reported too but is dominated by bf16 storage rounding of
+    # x1 - x0 when dt0 is small, so it is not a gate.) Board baseline 2026-11-03 (U50,
+    # 256x256/128 tokens, all phases on FPGA): 1 engine embeds 40.8 dB, step-0 latents
+    # 42.9 dB, per-step [42.9, 30.3, 19.9, 9.4] dB, image PSNR 21 dB; 8 engines embeds
+    # 42.6 dB, per-step [41.5, 29.8, 20.2, 9.8] dB, image PSNR 21.5 dB.
+    if _test_result_field(text, "finite") is None:
+        return False, "no TEST_RESULT line (run did not reach the VAE output)"
+    if not _test_result_field(text, "finite"):
+        return False, "non-finite latents or image"
+    steps = _test_result_field(text, "step_latents_snr_db")
+    emb = _test_result_field(text, "embeds_snr_db")
+    img = _test_result_field(text, "image_psnr_db")
+    lat = _test_result_field(text, "latents_snr_db")
+    if not steps or img is None:
+        return False, "no reference comparison in TEST_RESULT (run with the host reference enabled)"
+    s0 = float(steps[0])
+    emb_ok = (emb is None) or emb >= 25.0 or emb == float("inf")
+    ok = s0 >= 30.0 and img >= 15.0 and emb_ok
+    return ok, (f"vs IF4 host reference: embeds {emb} dB, step-0 latents {s0:.1f} dB, per-step {steps} dB, "
+                f"final latents {lat:.1f} dB, image PSNR {img:.1f} dB (TE {_test_result_field(text, 'te_s')}s, "
+                f"DiT {_test_result_field(text, 'dit_s')}s, VAE[{_test_result_field(text, 'vae')}] {_test_result_field(text, 'vae_s')}s)"
+                + ("" if ok else " -- below the gates (step-0 latents >= 30 dB, image PSNR >= 15 dB, embeds >= 25 dB)"))
+
+
 def _check_act(text):
     # ACT (LeRobot, 34M) prints a TEST_RESULT: JSON line with actions_snr_db vs the CPU
     # reference. HW-proven at ~38 dB; gate at 35 so a NaN (-inf / nan) or a scrambled
@@ -698,6 +730,24 @@ TESTS = [
     # bisects vs the CPU reference (on by default) and writes a wav. Bins cached in
     # kokoro_bin/ (frozen instruction image), reused on the next pass.
     {"name": "kokoro",  "script": "models/kokoro/kokoro_test.py",   "pass_check": _check_kokoro, "extra_args": ["--fpga"]},
+
+    # FLUX.2 [klein] 4B text-to-image: Qwen3-4B text encoder + 25-block DiT (4 Euler
+    # steps, one statically unrolled program per engine) on the standard image, VAE
+    # decoder through the conv drivers. The harness adds --engines <cores>: on the 8-engine
+    # U50 the CI geometry (256x256, 128 text tokens) is 2.6 s TE + 34 s DiT + 38 s VAE
+    # (270 s DiT on one engine); the default 512x512 / 512-token image is ~41 TFLOP of
+    # DiT. Bins (params_te/params_dit/vae_weights/programs) are cached in
+    # flux2_klein_4b_bin/ and reused on pass 2 (the program signature covers geometry,
+    # engine count and the compiler source). The first entry decodes the VAE on the host
+    # (standard image); the second runs all three phases on the FPGA and needs the CONV2D
+    # queue-config image like the conv models below.
+    {"name": "flux2_klein_4b", "script": "models/flux2_klein_4b/flux2_klein_4b_test.py", "pass_check": _check_flux2,
+     "extra_args": ["--height", "256", "--width", "256", "--max-seq-len", "128", "--vae", "host"],
+     "mode": "T2I (TE+DiT on FPGA, VAE host)", "prompt_desc": "A photo of a red sports car on a mountain road at sunset (default)"},
+    {"name": "flux2_klein_4b_vae", "script": "models/flux2_klein_4b/flux2_klein_4b_test.py", "pass_check": _check_flux2,
+     "extra_args": ["--height", "256", "--width", "256", "--max-seq-len", "128", "--vae", "fpga"],
+     "mode": "T2I (all phases on FPGA)", "prompt_desc": "A photo of a red sports car on a mountain road at sunset (default)",
+     "requires_conv_image": True},
 
     # --- Andromeda conv/audio ports (synced from pcie_utils) ---------------------
     # These run a precompiled single-bin image through native CONV2D/MAXPOOL opcodes

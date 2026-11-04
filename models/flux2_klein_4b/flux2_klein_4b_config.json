@@ -1,0 +1,105 @@
+{
+  "_template_note": "FLUX.2 [klein] 4B text-to-image on the Unified Engine. Three phases: (TE) Qwen3-4B text encoder, 27 of 36 layers, hidden-state taps at layers 9/18/27 -> 7680-wide prompt embedding; (DiT) 5 double-stream + 20 single-stream blocks, 4 Euler flow-matching steps statically unrolled into one program; (VAE) AutoencoderKLFlux2 decoder run layer-by-layer through the conv/GroupNorm drivers (needs the CONV2D queue-config image). The TE and DiT weight images time-share the params arena (phased layout, everything below the 4 GiB DMA address limit); tensors persist across phases so the prompt embedding and latents never leave DRAM.",
+  "fixed_isa_regs": {
+    "TMP_REG": 1,
+    "_note": "The rest of the fixed GPR map is built per program by Flux2KleinEngine._prime_regs: per-engine row counts (names ending in _e) and full counts, all <= 14 so every bulk op runs the dynamic (PBI) core; dynamic allocation starts at 15."
+  },
+  "model": {
+    "height": 512,
+    "width": 512,
+    "max_sequence_length": 512,
+    "num_inference_steps": 4,
+    "guidance_scale": 1.0,
+    "vae_scale_factor": 8
+  },
+  "dit": {
+    "hidden": 3072,
+    "heads": 24,
+    "head_dim": 128,
+    "num_double_blocks": 5,
+    "num_single_blocks": 20,
+    "mlp_hidden": 9216,
+    "joint_dim": 7680,
+    "in_channels": 128,
+    "time_channels": 256,
+    "rope_theta": 2000.0,
+    "axes_dims_rope": [
+      32,
+      32,
+      32,
+      32
+    ],
+    "eps": 1e-06
+  },
+  "text_encoder": {
+    "hidden": 2560,
+    "num_layers_used": 27,
+    "tap_layers": [
+      9,
+      18,
+      27
+    ],
+    "heads": 32,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "intermediate": 9728,
+    "rope_theta": 1000000.0,
+    "vocab": 151936,
+    "rms_eps": 1e-06,
+    "pad_token_id": 151643
+  },
+  "vae": {
+    "latent_channels": 32,
+    "block_out_channels": [
+      128,
+      256,
+      512,
+      512
+    ],
+    "layers_per_block": 2,
+    "norm_num_groups": 32,
+    "batch_norm_eps": 0.0001,
+    "gn_eps": 1e-06
+  },
+  "quantization": {
+    "precision": "if4",
+    "block_size": 64,
+    "bf16_keys": [
+      "x_embedder.weight",
+      "context_embedder.weight",
+      "time_guidance_embed.timestep_embedder.linear_1.weight",
+      "time_guidance_embed.timestep_embedder.linear_2.weight",
+      "double_stream_modulation_img.linear.weight",
+      "double_stream_modulation_txt.linear.weight",
+      "single_stream_modulation.linear.weight",
+      "norm_out.linear.weight",
+      "proj_out.weight"
+    ],
+    "vae_precision": "if8",
+    "_note": "IF4 = per-64-block min-MSE INT4/FP4 (scale sign selects the codebook, quant_lib.quantize). bf16_keys stay BF16 B-operands: embedders, the timestep MLP, the shared modulation projections and the output head (small, and their outputs scale every token). VAE convs are IF8 per (oc, tap, 64-ch block)."
+  },
+  "dram_layout": {
+    "params_dram_base": "0x00000000",
+    "tensor_dram_base": "0xA0000000",
+    "program_dram_base": "0xE0000000",
+    "_note": "params arena 2.5 GiB (DiT image 2.34 GB; TE image 1.45 GB time-shares it), tensors 1 GiB at 0xA0000000 (~100 MB at 256x256, ~430 MB at 512x512 with 8 per-engine attention scratches), then 8 per-engine program slots of 64 MiB (engine e at 0xE0000000 + e*0x04000000; TE+DiT programs are 43 MB on one engine, <10 MB per engine on eight). Everything below 0x100000000 (32-bit DMA address)."
+  },
+  "paths": {
+    "bin_dir": "flux2_klein_4b_bin",
+    "hf_model_repo": "black-forest-labs/FLUX.2-klein-4B",
+    "params_te_bin": "flux2_klein_4b_bin/params_te.bin",
+    "params_te_meta": "flux2_klein_4b_bin/params_te.json",
+    "embed_tokens_bin": "flux2_klein_4b_bin/embed_tokens.bin",
+    "params_dit_bin": "flux2_klein_4b_bin/params_dit.bin",
+    "params_dit_meta": "flux2_klein_4b_bin/params_dit.json",
+    "vae_weights": "flux2_klein_4b_bin/vae_weights.pt",
+    "instruction_bin": "flux2_klein_4b_bin/programs.bin",
+    "instruction_meta": "flux2_klein_4b_bin/programs.json",
+    "tokenizer_dir": "tokenizer"
+  },
+  "defaults": {
+    "prompt": "A photo of a red sports car on a mountain road at sunset",
+    "seed": 0,
+    "dev": "xdma0"
+  }
+}
