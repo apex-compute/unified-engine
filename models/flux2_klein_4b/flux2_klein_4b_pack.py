@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Pack everything a FLUX.2 [klein] 4B run needs into ONE deployable file.
 
-    flux2_klein_4b.bin
+    flux2_klein_4b_<config>_e<engines>.bin
       magic "FLX2KLN1" | u64 header length | JSON header | 4 KiB-aligned sections
 
 Sections: the Qwen3 token embedding, the IF4 text-encoder and DiT weight
-images, the IF8 VAE weights, the tokenizer files, and one compiled program
-set (every engine's images) per packed configuration -- the weights are
-shared, each configuration (resolution x text length x steps x engines)
-adds only its ~90 MB of programs. ``flux2_klein_4b_run_from_bin.py`` runs
-from this file alone: no network, no HF checkpoint, no per-model JSON.
+images, the IF8 VAE weights, the tokenizer files, and the compiled programs
+(every engine's images) of ONE configuration (resolution x text length x
+steps, for one engine count). One bin per configuration:
 
-    python models/flux2_klein_4b/flux2_klein_4b_pack.py --config 256x256x64x4 --config 512x512x64x4 --engines 8 [--out flux2_klein_4b.bin]
+    python models/flux2_klein_4b/flux2_klein_4b_pack.py --config 256x256x64x4 --engines 8   # -> flux2_klein_4b_256x256x64x4_e8.bin
+    python models/flux2_klein_4b/flux2_klein_4b_pack.py --config 512x512x64x4 --engines 8   # -> flux2_klein_4b_512x512x64x4_e8.bin
+
+``flux2_klein_4b_run_from_bin.py --bin <file>`` runs from that file alone:
+no network, no HF checkpoint, no per-model JSON.
 """
 from __future__ import annotations
 
@@ -167,13 +169,12 @@ def main(argv=None) -> int:
     cfg = T.load_config()
     m = cfg["model"]
     ap = argparse.ArgumentParser(description="Pack FLUX.2 klein 4B into one deployable bin")
-    ap.add_argument("--config", action="append", default=None,
-                    help="HxWxTOKENSxSTEPS, repeatable (default: 256x256x64x4 and 512x512x64x4)")
+    ap.add_argument("--config", default="512x512x64x4", help="HxWxTOKENSxSTEPS of the one configuration to pack")
     ap.add_argument("--engines", type=int, default=8)
-    ap.add_argument("--out", default=os.path.join(HERE, cfg["paths"]["bin_dir"], "flux2_klein_4b.bin"))
+    ap.add_argument("--out", default=None, help="default: flux2_klein_4b_bin/flux2_klein_4b_<config>_e<engines>.bin")
     args = ap.parse_args(argv)
-    specs = args.config or ["256x256x64x4", "512x512x64x4"]
-    pack(cfg, [parse_config(c) for c in specs], args.engines, args.out)
+    out = args.out or os.path.join(HERE, cfg["paths"]["bin_dir"], f"flux2_klein_4b_{args.config}_e{args.engines}.bin")
+    pack(cfg, [parse_config(args.config)], args.engines, out)
     return 0
 
 

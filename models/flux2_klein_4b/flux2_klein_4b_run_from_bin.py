@@ -4,11 +4,11 @@
 Everything comes from ONE file (see flux2_klein_4b_pack.py): config, tokenizer,
 weights, compiled programs. No network, no HF checkpoint, no other file.
 
-    python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin flux2_klein_4b.bin --prompt "..." --out image.png [--config 512x512x64x4]
+    python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin flux2_klein_4b_256x256x64x4_e8.bin --prompt "..." --out image.png
 
-The bin carries one program set per packed configuration (resolution x text
-tokens x steps); ``--config`` picks one (default: the first packed, listed by
-``--list``). The engine count is baked in; the board must report at least that many.
+The configuration (resolution, text tokens, steps) and the engine count are
+baked into the bin (``--list`` shows them); the board must report at least
+that many engines.
 """
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ class SingleBin:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="FLUX.2 klein 4B from one bin")
-    ap.add_argument("--bin", default=os.path.join(HERE, "flux2_klein_4b_bin", "flux2_klein_4b.bin"))
+    ap.add_argument("--bin", required=True, help="the packed flux2_klein_4b_*.bin")
     ap.add_argument("--prompt", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--dev", default="xdma0")

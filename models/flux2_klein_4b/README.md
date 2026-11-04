@@ -10,7 +10,7 @@ three phases and writes the PNG.
 | File | Purpose |
 |---|---|
 | `flux2_klein_4b_test.py` | Build + run. Exports weights on first use, compiles the two programs, runs TE -> DiT -> VAE, scores against the host IF4 reference, prints `TEST_RESULT`. `--compile-only` needs no board. |
-| `flux2_klein_4b_pack.py` | Packs weights, tokenizer, VAE and the compiled programs for one geometry / engine count into ONE deployable `flux2_klein_4b.bin`. |
+| `flux2_klein_4b_pack.py` | Packs weights, tokenizer, VAE and the compiled programs of one configuration into one deployable `flux2_klein_4b_<config>_e<engines>.bin`. |
 | `flux2_klein_4b_run_from_bin.py` | Runs from that single bin: no network, no HF checkpoint, no other file. |
 | `flux2_klein_4b_vae.py` | Phase 3: the VAE decoder through the conv / GroupNorm / SiLU / upsample layer drivers, plus its IF8 host oracle. |
 | `flux2_klein_4b_weights.py` | Checkpoint -> `params_te.bin` (IF4 Qwen3), `params_dit.bin` (IF4 DiT), `vae_weights.pt` (IF8 convs); shape-only layout planner the compiler addresses from. |
@@ -33,12 +33,13 @@ python models/flux2_klein_4b/flux2_klein_4b_test.py --prompt "A photo of a red s
 # quicker CI geometry (256x256, 128 text tokens) and host-decoded VAE (standard FPGA image)
 python models/flux2_klein_4b/flux2_klein_4b_test.py --height 256 --width 256 --max-seq-len 128 --vae host
 
-# ONE deployable file (~4.8 GB): weights + tokenizer + a program set per configuration (default 256x256 and 512x512, 64 text tokens, 4 steps, 8 engines)
-python models/flux2_klein_4b/flux2_klein_4b_pack.py --engines 8
+# one deployable file per configuration (~4.7 GB each: weights + tokenizer + that configuration's programs for 8 engines)
+python models/flux2_klein_4b/flux2_klein_4b_pack.py --config 256x256x64x4 --engines 8
+python models/flux2_klein_4b/flux2_klein_4b_pack.py --config 512x512x64x4 --engines 8
 
-# run from that file alone (no network, no HF checkpoint): ~40 s for 256x256, ~2 min 20 s for 512x512 on 8 engines
-python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin models/flux2_klein_4b/flux2_klein_4b_bin/flux2_klein_4b.bin --config 256x256x64x4 --prompt "A photo of a red sports car on a mountain road at sunset" --out car.png
-python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin models/flux2_klein_4b/flux2_klein_4b_bin/flux2_klein_4b.bin --config 512x512x64x4 --prompt "A photo of a red sports car on a mountain road at sunset" --out car_512.png
+# run from a file alone (no network, no HF checkpoint): ~42 s for 256x256, ~2 min 20 s for 512x512 on 8 engines
+python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin models/flux2_klein_4b/flux2_klein_4b_bin/flux2_klein_4b_256x256x64x4_e8.bin --prompt "A photo of a red sports car on a mountain road at sunset" --out car_256.png
+python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --bin models/flux2_klein_4b/flux2_klein_4b_bin/flux2_klein_4b_512x512x64x4_e8.bin --prompt "A photo of a red sports car on a mountain road at sunset" --out car_512.png
 
 # compile without a board (writes flux2_klein_4b_bin/programs.{bin,json})
 python models/flux2_klein_4b/flux2_klein_4b_test.py --compile-only
@@ -66,14 +67,14 @@ count or code change recompiles (seconds). Weight bins are geometry-independent.
 
 ## Single deployable bin
 
-`flux2_klein_4b_pack.py` writes `flux2_klein_4b.bin`: a header (JSON: model
+`flux2_klein_4b_pack.py` writes `flux2_klein_4b_<config>_e<engines>.bin`: a header (JSON: model
 config, the packed configurations, engine count, layout manifests, program
 metadata) followed by 4 KiB-aligned sections -- the tokenizer files, the Qwen3
 token embedding, the IF4 text-encoder and DiT weight images, the IF8 VAE
-weights, and one compiled program set (every engine's images, ~90 MB) per
-configuration (`--config HxWxTOKENSxSTEPS`, repeatable; the weights are
-shared). `flux2_klein_4b_run_from_bin.py --bin ... --config KEY` DMAs each
-section to its baked address; `--list` shows the packed configurations.
+weights, and the compiled programs (every engine's images, ~90 MB) of one
+configuration (`--config HxWxTOKENSxSTEPS`); one bin per configuration.
+`flux2_klein_4b_run_from_bin.py --bin FILE` DMAs each section to its baked
+address and runs; `--list` shows what a bin was built for.
 On the board the run is still three host-sequenced phases: the text-encoder
 program, the DiT program, then the VAE decoder's per-layer programs.
 
