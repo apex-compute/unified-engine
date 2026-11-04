@@ -11,6 +11,7 @@ three phases and writes the PNG.
 |---|---|
 | `flux2_klein_4b_test.py` | Build + run. Exports weights on first use, compiles the two programs, runs TE -> DiT -> VAE, scores against the host IF4 reference, prints `TEST_RESULT`. `--compile-only` needs no board. |
 | `flux2_klein_4b_run_from_bin.py` | Run-only: one configuration per call from the prebuilt weight files and that configuration's compiled programs (never quantizes or compiles; no host reference unless `--reference`). |
+| `flux2_klein_4b_server.py` | Minimal web UI (standard library only): prompt box, resolution picker over the compiled program sets, seed; runs `flux2_klein_4b_run_from_bin.py` one job at a time and shows the PNG. |
 | `flux2_klein_4b_vae.py` | Phase 3: planner + emitter of the VAE decoder as one sharded program (convs straight from the padded maps, 1x1 convs as matmuls, on-device GroupNorm statistics, SiLU, residual add, upsample, mid-block attention), plus its IF8 host oracle with per-op intermediates. |
 | `flux2_klein_4b_vae_probe.py` | On-board bring-up of the VAE phase: compiles any prefix of the decoder graph and scores the last op against the host intermediate. |
 | `flux2_klein_4b_weights.py` | Checkpoint -> `params_te.bin` (IF4 Qwen3), `params_dit.bin` (IF4 DiT), `vae_weights.pt` (IF8 convs); shape-only layout planner the compiler addresses from. |
@@ -40,6 +41,9 @@ python models/flux2_klein_4b/flux2_klein_4b_test.py --compile-only --height 512 
 # run one configuration from the prebuilt files (no quantization, no compile): ~38 s for 256x256, ~2 min 10 s for 512x512 on 8 engines
 python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --height 256 --width 256 --max-seq-len 64 --engines 8 --prompt "A photo of a red sports car on a mountain road at sunset" --out car_256.png
 python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --height 512 --width 512 --max-seq-len 64 --engines 8 --prompt "A photo of a red sports car on a mountain road at sunset" --out car_512.png
+
+# web UI on http://127.0.0.1:8080/ (pick a compiled resolution, type a prompt, see the image); --cpus pins the runs
+python models/flux2_klein_4b/flux2_klein_4b_server.py --port 8080 --cpus 0,2-23
 
 # host checks
 python -m unittest discover -s models/flux2_klein_4b -p 'test_*.py'
