@@ -846,11 +846,18 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
     def load_programs(self, bin_path: str, meta_path: str) -> dict:
         with open(meta_path) as f:
             meta = json.load(f)
-        if meta.get("signature") != self.program_signature():
-            raise RuntimeError("programs.json signature does not match this geometry/config/engine count; "
-                               "recompile (delete flux2_klein_4b_bin/programs.bin)")
         with open(bin_path, "rb") as f:
             blob = f.read()
+        return self.load_program_images(blob, meta)
+
+    def load_program_images(self, blob, meta: dict, check_signature: bool = True) -> dict:
+        """DMA every program image of ``meta`` (the primary's and the workers')
+        from ``blob`` (bytes-like / ndarray) to its baked address. A packed single
+        bin carries programs that match its own header, so it loads with
+        ``check_signature=False``."""
+        if check_signature and meta.get("signature") != self.program_signature():
+            raise RuntimeError("program signature does not match this geometry/config/engine count/compiler; "
+                               "recompile (flux2_klein_4b_test.py --force-compile) and re-pack")
         ends = {}
         for im in meta["images"]:
             ue = self.E[im["engine"]]
@@ -861,20 +868,24 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
             ends[im["engine"]] = max(ends.get(im["engine"], 0), im["addr"] + im["size"])
         for e, end in ends.items():
             self.E[e]._next_program_dram_addr = self._align_up(end, 64)
-        _log(f"    loaded {len(meta['images'])} program image(s), {len(blob) / 1e6:.1f} MB")
+        _log(f"    loaded {len(meta['images'])} program image(s), {sum(im['size'] for im in meta['images']) / 1e6:.1f} MB")
         self.VAE_PROGRAM_BASE = self.get_program_dram_addr()
         return meta
 
     # ============================================================
     # Run
     # ============================================================
-    def _dma_file(self, path: str, addr: int, label: str) -> None:
+    def _dma_blob(self, data, addr: int, label: str) -> None:
+        """DMA a weight image given as a path, bytes-like or uint8 ndarray."""
         t0 = time.time()
-        with open(path, "rb") as f:
-            data = f.read()
+        if isinstance(data, str):
+            with open(data, "rb") as f:
+                data = f.read()
         n = self.dma_write(self.h2c_device, addr, data, len(data))
         assert n == len(data), f"{label}: DMA wrote {n} of {len(data)} bytes"
         _log(f"  [{label}] {len(data) / 1e9:.2f} GB -> 0x{addr:X} in {time.time() - t0:.1f}s")
+
+    _dma_file = _dma_blob
 
     def _execute_phase(self, meta: dict, name: str, timeout: float) -> None:
         if self.sched is not None:
@@ -891,7 +902,7 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
                          embed_tokens: torch.Tensor, params_te_bin: str) -> torch.Tensor:
         L = self.L
         assert input_ids.shape[-1] == L
-        self._dma_file(params_te_bin, self.params_base, "TE weights")
+        self._dma_blob(params_te_bin, self.params_base, "TE weights")
         emb = embed_tokens[input_ids.reshape(-1)].to(torch.bfloat16)
         self.dma_to_accelerator_memory(self.TE_X[0], emb)
         valid = int(attention_mask.sum())
@@ -907,7 +918,7 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
 
     def run_dit(self, meta: dict, noise: torch.Tensor, params_dit_bin: str,
                 prompt_embeds: torch.Tensor | None = None) -> torch.Tensor:
-        self._dma_file(params_dit_bin, self.params_base, "DiT weights")
+        self._dma_blob(params_dit_bin, self.params_base, "DiT weights")
         if prompt_embeds is not None:                       # bypass the TE phase (cached / host embeds)
             self.dma_to_accelerator_memory(self.TXT_EMB_IN, prompt_embeds.reshape(self.L, self.J).to(torch.bfloat16))
         self.dma_to_accelerator_memory(self.X_LAT[0], noise.reshape(self.NI, self.CIN).to(torch.bfloat16))
