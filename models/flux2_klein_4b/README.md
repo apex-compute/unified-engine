@@ -181,7 +181,14 @@ is finite and lands on the same image, not bit-level agreement.
 
 ## Cost and expectations
 
-Measured on the 300 MHz U50 image, 4 steps, all phases on the FPGA:
+Measured on the U50, 4 steps, all phases on the FPGA, from the packed bins:
+
+| Image clock | Configuration | Text encoder | DiT | VAE | Total on board |
+|---|---|---:|---:|---:|---:|
+| 367 MHz (andromeda run 41729405935) | 256x256, 64 tokens, 8 engines | 1.1 s | 23.4 s (341 GFLOPS) | 8.9 s | **35.8 s** |
+| 367 MHz | 512x512, 64 tokens, 8 engines | 1.1 s | 82.5 s (342 GFLOPS) | 31.7 s | **117.7 s** |
+
+Earlier measurements on the 300 MHz image (same accuracy):
 
 | Configuration | Text encoder | DiT | VAE | Total on board | vs IF4 oracle |
 |---|---:|---:|---:|---:|---|
@@ -191,9 +198,10 @@ Measured on the 300 MHz U50 image, 4 steps, all phases on the FPGA:
 | 256x256, 128 tokens, 8 engines | 2.6 s | 34.4 s | 38 s (engine 0 only) | ~1.3 min | step-0 latents 41.5 dB, image PSNR 21.5 dB |
 | 256x256, 128 tokens, 1 engine | 20.1 s | 270 s | 38 s | ~5.5 min | step-0 latents 42.9 dB, image PSNR 21 dB |
 
-The transformer phases sustain 275-280 GFLOPS on 8 engines (91% of the
-307 GFLOPS peak), so the 4-step DiT has a hard floor of 132 s at 512x512
-with 512 text tokens and 92 s with 64; accuracy is unchanged by sharding.
+The transformer phases sustain 91% of the 8-engine peak (280 of 307 GFLOPS
+at 300 MHz, 341 of 375 GFLOPS at 367 MHz), so the 4-step DiT's floor at
+512x512 is 75 s with 64 text tokens on the 367 MHz image; accuracy is
+unchanged by sharding.
 `--max-seq-len auto` pads the prompt only to the next multiple of 64 instead
 of 512, the single biggest lever left at 512x512. The VAE decoder's
 convolutions are spread over all engines (`conv2d_layer_sharded`: every
