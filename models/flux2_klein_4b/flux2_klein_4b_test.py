@@ -29,10 +29,13 @@ Three phases, N engines:
        timestep / modulation vectors for the 4 steps are computed on-device
        up front from a host sin/cos table (M = 4 matmuls).
 
-  VAE  AutoencoderKLFlux2 decoder through the conv / GroupNorm / SiLU /
-       upsample layer drivers (flux2_klein_4b_vae.py). Host-orchestrated,
-       all arithmetic on the FPGA; needs the CONV2D queue-config image.
-       ``--vae host`` decodes on the host instead (reported as such).
+  VAE  AutoencoderKLFlux2 decoder as prebuilt per-layer programs
+       (flux2_klein_4b_vae.py): conv tile loops, GroupNorm, SiLU, residual
+       adds and the mid-block attention sharded over the engines, nearest
+       upsample on engine 0; the IF8 weight blocks are loaded once per run
+       and expanded into the walker's per-pixel stream on the engines. The
+       host moves one activation map per layer; needs the CONV2D queue-config
+       image. ``--vae host`` decodes on the host instead (reported as such).
 
 Multi-engine (``--engines N``): every op is emitted into each engine's own
 program with that engine's share -- matmuls are split over output columns
@@ -77,6 +80,7 @@ from user_dma_core import (  # noqa: E402
 )
 import flux2_klein_4b_ref as ref  # noqa: E402
 import flux2_klein_4b_weights as W  # noqa: E402
+import flux2_klein_4b_vae  # noqa: E402
 
 BPE = 2  # bf16
 
@@ -768,7 +772,8 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
         g = self.geo
         key = json.dumps({"h": g.height, "w": g.width, "L": g.max_sequence_length, "steps": g.num_inference_steps,
                           "sigmas": [round(float(x), 7) for x in self.sigmas], "layout": self.cfg["dram_layout"],
-                          "q": self.cfg["quantization"], "engines": self.ne, "emitter": self._emitter_hash(), "v": 3},
+                          "q": self.cfg["quantization"], "engines": self.ne, "emitter": self._emitter_hash(),
+                          "vae_emitter": flux2_klein_4b_vae.emitter_hash(), "v": 4},
                          sort_keys=True)
         return hashlib.sha1(key.encode()).hexdigest()[:12]
 
@@ -808,18 +813,43 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
             te = self._emit_phase("te", self.emit_text_encoder_stream)
             _log(f"  compiling DiT program ({self.ne} engine(s))...")
             dit = self._emit_phase("dit", self.emit_dit_stream)
+            self.stop_capture()
+            assert self.capture_count <= user_dma_core.MAX_DECODER_INSTRUCTIONS
+            primary = b"".join(inst.get_bytes() for inst in self.capture_buffer)
+            images = [{"engine": 0, "phase": "primary", "addr": self._program_dram_base, "size": len(primary)}]
+            blob = bytearray(primary)
+            for name, ph in (("te", te), ("dit", dit)):
+                for wi, (addr, wb) in enumerate(zip(ph[3], ph[4]), start=1):
+                    images.append({"engine": wi, "phase": name, "addr": addr, "size": len(wb), "offset": len(blob)})
+                    blob.extend(wb)
+            images[0]["offset"] = 0
+            self.clear_capture_buffer()
+            # VAE: standalone per-layer programs after every engine's TE / DiT images (the
+            # same cursors load_program_images leaves behind)
+            self._set_program_cursors(images)
+            _log(f"  compiling VAE programs ({self.ne} engine(s))...")
+            vae = flux2_klein_4b_vae.Flux2VaeFPGA(self, None, self.cfg)
+            vae_meta = vae.compile(self.geo.latent_h, self.geo.latent_w)
+            for e, addr, data in vae.images:
+                images.append({"engine": e, "phase": "vae", "addr": addr, "size": len(data), "offset": len(blob)})
+                blob.extend(data)
+            # the scheduler's per-engine flag-clear program (run once before the first phase),
+            # prebuilt so nothing is captured at run time
+            flag_clear = []
+            for e, eng in enumerate(self.E):
+                eng.start_capture()
+                eng.generate_instruction_flag_clear()
+                eng.generate_instruction_halt()
+                eng.stop_capture()
+                addr = eng.get_program_dram_addr()
+                data = b"".join(inst.get_bytes() for inst in eng.capture_buffer)
+                eng.allocate_program_dram(len(data))
+                eng.clear_capture_buffer()
+                images.append({"engine": e, "phase": "flag_clear", "addr": addr, "size": len(data), "offset": len(blob)})
+                blob.extend(data)
+                flag_clear.append(addr)
         finally:
             _SILENT = False
-        self.stop_capture()
-        assert self.capture_count <= user_dma_core.MAX_DECODER_INSTRUCTIONS
-        primary = b"".join(inst.get_bytes() for inst in self.capture_buffer)
-        images = [{"engine": 0, "phase": "primary", "addr": self._program_dram_base, "size": len(primary)}]
-        blob = bytearray(primary)
-        for name, ph in (("te", te), ("dit", dit)):
-            for wi, (addr, wb) in enumerate(zip(ph[3], ph[4]), start=1):
-                images.append({"engine": wi, "phase": name, "addr": addr, "size": len(wb), "offset": len(blob)})
-                blob.extend(wb)
-        images[0]["offset"] = 0
         os.makedirs(os.path.dirname(bin_path), exist_ok=True)
         with open(bin_path, "wb") as f:
             f.write(blob)
@@ -833,16 +863,27 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
             "te_program_start_addr": te[0], "te_program_size": te[1], "te_flops": te[2], "te_worker_prog_addrs": te[3],
             "dit_program_start_addr": dit[0], "dit_program_size": dit[1], "dit_flops": dit[2], "dit_worker_prog_addrs": dit[3],
             "tensor_dram_usage": self.tensor_usage, "params_image_size": self.params_image_size,
+            "vae": vae_meta,
+            "flag_clear_addrs": flag_clear,
             "compile_seconds": round(time.time() - t0, 1),
         }
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=1)
-        self.clear_capture_buffer()
-        per_engine = (max((im["size"] for im in images[1:]), default=0)) / 1e6
+        per_engine = (max((im["size"] for im in images[1:] if im["phase"] in ("te", "dit")), default=0)) / 1e6
         _log(f"  programs: TE {te[1] / 1e6:.1f} MB ({te[2] / 1e12:.2f} TFLOP), DiT {dit[1] / 1e6:.1f} MB "
              f"({dit[2] / 1e12:.2f} TFLOP), worker programs up to {per_engine:.1f} MB, "
+             f"VAE {len(vae_meta['steps'])} steps / {vae_meta['program_bytes'] / 1e6:.1f} MB "
+             f"(const image {vae_meta['const_size'] / 1e6:.0f} MB), "
              f"bin {len(blob) / 1e6:.1f} MB, compiled in {meta['compile_seconds']}s")
         return meta
+
+    def _set_program_cursors(self, images: list[dict]) -> None:
+        """Every engine's next program address = just past its last image."""
+        ends = {}
+        for im in images:
+            ends[im["engine"]] = max(ends.get(im["engine"], 0), im["addr"] + im["size"])
+        for e, end in ends.items():
+            self.E[e]._next_program_dram_addr = self._align_up(end, 64)
 
     def load_programs(self, bin_path: str, meta_path: str) -> dict:
         with open(meta_path) as f:
@@ -857,18 +898,16 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
         if check_signature and meta.get("signature") != self.program_signature():
             raise RuntimeError("program signature does not match this geometry/config/engine count/compiler; "
                                "recompile (flux2_klein_4b_test.py --compile-only ... --force-compile)")
-        ends = {}
         for im in meta["images"]:
             ue = self.E[im["engine"]]
             data = blob[im["offset"]:im["offset"] + im["size"]]
             assert len(data) == im["size"]
             n = ue.dma_write(ue.h2c_device, im["addr"], data, len(data))
             assert n == len(data), f"program image for engine {im['engine']}: DMA wrote {n} of {len(data)} bytes"
-            ends[im["engine"]] = max(ends.get(im["engine"], 0), im["addr"] + im["size"])
-        for e, end in ends.items():
-            self.E[e]._next_program_dram_addr = self._align_up(end, 64)
+        self._set_program_cursors(meta["images"])
+        for e, addr in enumerate(meta.get("flag_clear_addrs", [])):
+            self.E[e]._flag_clear_addr = addr            # MultiEngineScheduler.preclear_flags launches it by address
         _log(f"    loaded {len(meta['images'])} program image(s), {sum(im['size'] for im in meta['images']) / 1e6:.1f} MB")
-        self.VAE_PROGRAM_BASE = self.get_program_dram_addr()
         return meta
 
     # ============================================================
@@ -1041,7 +1080,7 @@ def main(argv=None) -> int:
     ap.add_argument("--no-compile", action="store_true", help="run-from-bin: never compile")
     ap.add_argument("--force-compile", action="store_true")
     ap.add_argument("--vae", choices=["fpga", "host"], default="fpga")
-    ap.add_argument("--vae-timeout", type=float, default=900.0, help="per-layer wait timeout (s) for the FPGA VAE")
+    ap.add_argument("--vae-timeout", type=float, default=900.0, help="per-program wait timeout (s) for the FPGA VAE")
     ap.add_argument("--phase-timeout", type=float, default=4 * 3600.0, help="wait timeout (s) for the TE / DiT programs")
     ap.add_argument("--text-encoder", choices=["fpga", "host"], default="fpga",
                     help="host: compute the prompt embedding with transformers and skip the TE phase")
@@ -1113,8 +1152,7 @@ def main(argv=None) -> int:
     latent = ref.unpatchify_latents(ref.unpack_latents(lat_denorm, geo.token_h, geo.token_w))  # (1, 32, h, w)
     t0 = time.time()
     if args.vae == "fpga":
-        from flux2_klein_4b_vae import Flux2VaeFPGA
-        vae = Flux2VaeFPGA(ue, vae_w, cfg, timeout_s=args.vae_timeout)
+        vae = flux2_klein_4b_vae.Flux2VaeFPGA(ue, vae_w, cfg, meta=meta, timeout_s=args.vae_timeout)
         img = vae.decode(latent[0].to(torch.bfloat16))[None]
     else:
         vae = ref.Flux2VaeDecoder(ref.load_safetensors_dir(os.path.join(snap, "vae")), vae_cfg, device=args.ref_device)
@@ -1124,12 +1162,19 @@ def main(argv=None) -> int:
     out = args.out or os.path.join(HERE, cfg["paths"]["bin_dir"], f"flux2_{args.seed}.png")
     ref.save_image(image, out)
     _log(f"  VAE phase ({args.vae}) {ue.timings['vae_s']:.1f}s -> {out}")
+    vae_psnr = None
+    if args.vae == "fpga" and not args.no_reference:
+        # the decoder alone: same latent, same IF8 weights, host arithmetic
+        oracle = flux2_klein_4b_vae.reference_decode(vae_w, cfg, latent[0], device=args.ref_device)[None]
+        vae_psnr = psnr_u8(ref.to_uint8_image(oracle), image)
+        _log(f"  FPGA decoder vs IF8 host oracle: image PSNR {vae_psnr:.1f} dB")
 
     # ---------------- scoring ----------------
     result = {"height": geo.height, "width": geo.width, "max_sequence_length": geo.n_txt, "steps": geo.num_inference_steps,
               "seed": args.seed, "engines": ne, "image": out, "vae": args.vae, "text_encoder": args.text_encoder,
               "finite": bool(torch.isfinite(lat_denorm.float()).all()) and bool(torch.isfinite(img.float()).all()),
-              "te_s": ue.timings.get("te_s"), "dit_s": ue.timings.get("dit_s"), "vae_s": ue.timings.get("vae_s")}
+              "te_s": ue.timings.get("te_s"), "dit_s": ue.timings.get("dit_s"), "vae_s": ue.timings.get("vae_s"),
+              "vae_psnr_db": vae_psnr}
     if not args.no_reference:
         _log("  host IF4 reference...")
         rr = quantized_reference(cfg, geo, snap, args.prompt, args.seed, args.ref_device,

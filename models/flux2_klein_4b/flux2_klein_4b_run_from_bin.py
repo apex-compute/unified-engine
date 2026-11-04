@@ -97,7 +97,8 @@ def main(argv=None) -> int:
     t0 = time.time()
     if args.vae == "fpga":
         from flux2_klein_4b_vae import Flux2VaeFPGA
-        img = Flux2VaeFPGA(ue, vae_w, cfg, timeout_s=args.vae_timeout).decode(latent[0].to(torch.bfloat16))[None]
+        vae = Flux2VaeFPGA(ue, vae_w, cfg, meta=meta, timeout_s=args.vae_timeout)
+        img = vae.decode(latent[0].to(torch.bfloat16))[None]
     else:
         from flux2_klein_4b_vae import reference_decode
         img = reference_decode(vae_w, cfg, latent[0])[None]
