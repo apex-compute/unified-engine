@@ -2,18 +2,27 @@
 """Minimal web UI for FLUX.2 [klein] 4B on the board.
 
 Standard library only. Serves one page (prompt box, resolution picker, seed,
-Generate) and runs ``flux2_klein_4b_run_from_bin.py`` as a subprocess for each
-request, one at a time (the board is a single resource). The picker lists the
-program sets found under ``flux2_klein_4b_bin/programs/``; compile more with
+Generate) and runs ``flux2_klein_4b_run_from_bin.py`` for each request, one at
+a time (the board is a single resource). The picker lists the program sets
+found under ``flux2_klein_4b_bin/programs/``; compile more with
 ``flux2_klein_4b_test.py --compile-only``. Selecting one shows its static
 figures (weight images, program sizes, FLOPs per phase); a finished run shows
 every phase's on-device FLOP rate against the raw peak of the engines.
 
-    python models/flux2_klein_4b/flux2_klein_4b_server.py --port 8080
-    python models/flux2_klein_4b/flux2_klein_4b_server.py --port 8080 --cpus 0,2-23   # pin the runs
+"Keep the board loaded" (the page's checkbox; ``--no-reload`` makes it the
+default) runs the jobs through one long-lived ``--serve`` runner that keeps the
+device, the tokenizer, the token embedding, the VAE weights and the program set
+of the last configuration, so a run skips process start-up, the host file
+reads and the program DMA. The weight images are still sent on every run (the
+TE image, the DiT image and the VAE arena time-share the params arena below
+the 4 GiB DMA window). While that runner lives it holds the device, so other
+board users wait; "release the board" on the page (or an unchecked run) stops it.
 
-API: GET /api/configs, POST /api/generate {prompt, config, seed}, GET /api/jobs/<id>,
-GET /api/jobs/<id>/image.png, GET /api/jobs (history).
+    python models/flux2_klein_4b/flux2_klein_4b_server.py --port 8080
+    python models/flux2_klein_4b/flux2_klein_4b_server.py --port 8080 --cpus 0,2-23 --no-reload
+
+API: GET /api/configs, POST /api/generate {prompt, config, seed, no_reload}, GET /api/jobs/<id>,
+GET /api/jobs/<id>/image.png, GET /api/jobs (history), POST /api/release (stop the resident runner).
 """
 from __future__ import annotations
 
@@ -117,11 +126,12 @@ def save_board(result: dict) -> None:
 
 
 class Job:
-    def __init__(self, prompt: str, config: dict, seed: int):
+    def __init__(self, prompt: str, config: dict, seed: int, no_reload: bool):
         self.id = uuid.uuid4().hex[:12]
         self.prompt = prompt
         self.config = config
         self.seed = seed
+        self.no_reload = no_reload
         self.state = "queued"       # queued | running | done | error
         self.log: list[str] = []
         self.result: dict | None = None
@@ -135,15 +145,38 @@ class Job:
         now = time.time()
         return {
             "id": self.id, "prompt": self.prompt, "config": self.config, "seed": self.seed,
-            "state": self.state, "error": self.error, "result": self.result,
+            "no_reload": self.no_reload, "state": self.state, "error": self.error, "result": self.result,
             "log": "".join(self.log[-200:]),
             "elapsed": round((self.finished or now) - (self.started or now), 1) if self.started else 0.0,
             "image": f"/api/jobs/{self.id}/image.png" if self.state == "done" else None,
         }
 
 
+class Worker:
+    """A ``--serve`` runner process: holds the device and the host state between jobs."""
+
+    def __init__(self, cmd: list[str], engines: int):
+        self.engines = engines
+        self.loaded: str | None = None
+        self.started = time.time()
+        self.proc = subprocess.Popen(cmd, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def stop(self) -> None:
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.close()               # EOF ends the job loop
+            self.proc.wait(timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            self.proc.kill()
+            self.proc.wait()
+
+
 class Runner(threading.Thread):
-    """Runs queued jobs sequentially through the run-from-bin script."""
+    """Runs queued jobs sequentially: a one-shot runner process per job, or the resident worker."""
 
     def __init__(self, python: str, cpus: str | None, dev: str):
         super().__init__(daemon=True)
@@ -152,6 +185,8 @@ class Runner(threading.Thread):
         self.jobs: dict[str, Job] = {}
         self.order: list[str] = []
         self.lock = threading.Lock()
+        self.worker: Worker | None = None
+        self.release_requested = False
 
     def submit(self, job: Job) -> None:
         with self.lock:
@@ -164,38 +199,100 @@ class Runner(threading.Thread):
             ahead = [j for j in self.jobs.values() if j.state == "queued" and j.created < job.created]
         return len(ahead)
 
+    def worker_state(self) -> dict | None:
+        w = self.worker
+        if w is None or not w.alive():
+            return None
+        return {"engines": w.engines, "loaded": w.loaded, "since": w.started}
+
+    def _prefix(self) -> list[str]:
+        return ["taskset", "-c", self.cpus] if self.cpus else []
+
     def command(self, job: Job) -> list[str]:
         c = job.config
-        cmd = []
-        if self.cpus:
-            cmd += ["taskset", "-c", self.cpus]
-        cmd += [self.python, RUNNER,
-                "--height", str(c["height"]), "--width", str(c["width"]),
-                "--max-seq-len", str(c["max_seq_len"]), "--steps", str(c["steps"]),
-                "--engines", str(c["engines"]), "--seed", str(job.seed), "--dev", self.dev,
-                f"--prompt={job.prompt}", "--out", job.image]
-        return cmd
+        return self._prefix() + [self.python, RUNNER,
+                                 "--height", str(c["height"]), "--width", str(c["width"]),
+                                 "--max-seq-len", str(c["max_seq_len"]), "--steps", str(c["steps"]),
+                                 "--engines", str(c["engines"]), "--seed", str(job.seed), "--dev", self.dev,
+                                 f"--prompt={job.prompt}", "--out", job.image]
+
+    def stop_worker(self) -> None:
+        w, self.worker = self.worker, None
+        if w is not None:
+            w.stop()
+
+    def _ensure_worker(self, job: Job) -> Worker:
+        w = self.worker
+        if w is not None and (not w.alive() or w.engines != job.config["engines"]):
+            self.stop_worker()
+            w = None
+        if w is None:
+            cmd = self._prefix() + [self.python, RUNNER, "--serve", "--engines", str(job.config["engines"]),
+                                    "--dev", self.dev]
+            w = Worker(cmd, job.config["engines"])
+            job.log.append("starting the resident runner (device, tokenizer, token embedding, VAE weights)...\n")
+            assert w.proc.stdout is not None
+            for line in w.proc.stdout:              # start-up output until the runner is ready
+                job.log.append(line)
+                if line.startswith("SERVE_READY"):
+                    break
+            if not w.alive():
+                raise RuntimeError("the resident runner exited during start-up")
+            self.worker = w
+        return w
+
+    def _run_resident(self, job: Job) -> None:
+        w = self._ensure_worker(job)
+        c = job.config
+        spec = {"prompt": job.prompt, "seed": job.seed, "height": c["height"], "width": c["width"],
+                "max_seq_len": c["max_seq_len"], "steps": c["steps"], "out": job.image, "reload": False}
+        assert w.proc.stdin is not None and w.proc.stdout is not None
+        w.proc.stdin.write(json.dumps(spec) + "\n")
+        w.proc.stdin.flush()
+        for line in w.proc.stdout:
+            job.log.append(line)
+            if line.startswith("TEST_RESULT: "):
+                job.result = json.loads(line[len("TEST_RESULT: "):])
+                w.loaded = job.result.get("config")
+                return
+            if line.startswith("JOB_ERROR: "):
+                raise RuntimeError(json.loads(line[len("JOB_ERROR: "):]).get("error", "job failed"))
+        self.stop_worker()
+        raise RuntimeError("the resident runner exited during the job")
+
+    def _run_oneshot(self, job: Job) -> None:
+        self.stop_worker()                          # the resident runner holds the device
+        proc = subprocess.Popen(self.command(job), cwd=ROOT, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            job.log.append(line)
+            if line.startswith("TEST_RESULT: "):
+                try:
+                    job.result = json.loads(line[len("TEST_RESULT: "):])
+                except json.JSONDecodeError:
+                    pass
+        rc = proc.wait()
+        if rc != 0:
+            last = next((l.strip() for l in reversed(job.log) if l.strip()), "")
+            raise RuntimeError(f"runner exited with code {rc}: {last}")
 
     def run(self) -> None:
         while True:
-            job = self.q.get()
+            try:
+                job = self.q.get(timeout=1.0)
+            except queue.Empty:
+                if self.release_requested:
+                    self.release_requested = False
+                    self.stop_worker()
+                continue
             job.state, job.started = "running", time.time()
             try:
                 os.makedirs(OUT_DIR, exist_ok=True)
-                proc = subprocess.Popen(self.command(job), cwd=ROOT, stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT, text=True, bufsize=1)
-                assert proc.stdout is not None
-                for line in proc.stdout:
-                    job.log.append(line)
-                    if line.startswith("TEST_RESULT: "):
-                        try:
-                            job.result = json.loads(line[len("TEST_RESULT: "):])
-                        except json.JSONDecodeError:
-                            pass
-                rc = proc.wait()
-                if rc != 0:
-                    last = next((l.strip() for l in reversed(job.log) if l.strip()), "")
-                    raise RuntimeError(f"runner exited with code {rc}: {last}")
+                if job.no_reload:
+                    self._run_resident(job)
+                else:
+                    self._run_oneshot(job)
                 if not os.path.exists(job.image):
                     raise RuntimeError("runner finished but wrote no image")
                 if job.result:
@@ -220,16 +317,19 @@ PAGE = """<!doctype html>
   }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
-  main { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+  main { max-width: 1240px; margin: 0 auto; padding: 24px 20px; }
   h1 { font-size: 20px; margin: 0 0 4px; }
-  h2 { font-size: 14px; color: var(--muted); font-weight: 600; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .03em; }
+  h2 { font-size: 13px; color: var(--muted); font-weight: 600; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .03em; }
   .sub { color: var(--muted); margin: 0 0 20px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin-bottom:16px; }
   label { display:block; font-size:13px; color:var(--muted); margin-bottom:4px; }
-  textarea, select, input { width:100%; font:inherit; color:inherit; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:8px; }
+  textarea, select, input[type=number] { width:100%; font:inherit; color:inherit; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:8px; }
   textarea { min-height: 72px; resize: vertical; }
   .row { display:flex; gap:12px; flex-wrap:wrap; margin-top:12px; align-items:flex-end; }
-  .row > div { flex: 1 1 180px; }
+  .row > div { flex: 1 1 220px; }
+  .check { display:flex; align-items:center; gap:8px; margin-top:12px; font-size:14px; color:var(--fg); }
+  .check input { width:auto; margin:0; }
+  .check a { color: var(--accent); font-size: 13px; margin-left: 8px; }
   button { font:inherit; padding:9px 18px; border:0; border-radius:6px; background:var(--accent); color:#fff; cursor:pointer; }
   button:disabled { opacity:.5; cursor:default; }
   .status { margin-top:12px; color:var(--muted); min-height: 1.4em; }
@@ -240,16 +340,18 @@ PAGE = """<!doctype html>
   .hist { display:flex; gap:8px; flex-wrap:wrap; }
   .hist img { width:96px; height:96px; object-fit:cover; border-radius:6px; border:1px solid var(--line); cursor:pointer; }
   details summary { cursor:pointer; color:var(--muted); font-size:13px; }
-  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 24px; }
+  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  .tw { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
-  th, td { text-align: right; padding: 4px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-  th:first-child, td:first-child { text-align: left; }
+  th, td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; white-space: normal; min-width: 160px; }
   th { color: var(--muted); font-weight: 500; }
   tr.total td { font-weight: 600; border-bottom: 0; }
-  td.util { position: relative; }
+  td.util { position: relative; min-width: 90px; }
   td.util span { position: relative; z-index: 1; }
   td.util i { position:absolute; left:0; top:3px; bottom:3px; background:var(--bar); border-radius:3px; z-index:0; }
-  .note { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; line-height: 1.5; }
 </style>
 </head>
 <body>
@@ -265,14 +367,19 @@ PAGE = """<!doctype html>
       <div style="flex:0 1 120px"><label for="seed">Seed</label><input id="seed" type="number" value="0" min="0"></div>
       <div style="flex:0 0 auto"><button id="go">Generate</button></div>
     </div>
+    <div class="check">
+      <input type="checkbox" id="noreload" __NO_RELOAD__>
+      <label for="noreload" style="margin:0;color:inherit;font-size:14px">Keep the board loaded between runs (no reload)</label>
+      <a href="#" id="release" hidden>release the board</a>
+    </div>
     <div id="status" class="status"></div>
     <details><summary>Run log</summary><pre id="log"></pre></details>
   </div>
 
   <div class="card" id="static" hidden>
     <div class="grid">
-      <div><h2>Weights on the board</h2><table id="weights"></table></div>
-      <div><h2>Programs of this configuration</h2><table id="programs"></table></div>
+      <div><h2>Weights on the board</h2><div class="tw"><table id="weights"></table></div></div>
+      <div><h2>Programs of this configuration</h2><div class="tw"><table id="programs"></table></div></div>
     </div>
     <div class="note" id="staticnote"></div>
   </div>
@@ -280,8 +387,8 @@ PAGE = """<!doctype html>
   <div class="card" id="result" hidden>
     <img id="img" alt="generated image">
     <div class="meta" id="meta"></div>
-    <h2 style="margin-top:14px">Run on the board</h2>
-    <table id="stats"></table>
+    <h2 style="margin-top:16px">Run on the board</h2>
+    <div class="tw"><table id="stats"></table></div>
     <div class="note" id="statsnote"></div>
   </div>
 
@@ -293,7 +400,7 @@ PAGE = """<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 let configs = [], board = {}, current = null, timer = null;
-const NAMES = { te: 'Text encoder (Qwen3-4B, 27 layers)', dit: 'Diffusion transformer (4 steps)', vae: 'VAE decoder' };
+const NAMES = { te: 'Text encoder (Qwen3-4B)', dit: 'Diffusion transformer', vae: 'VAE decoder' };
 
 const gb = b => b >= 1e9 ? (b / 1e9).toFixed(2) + ' GB' : (b / 1e6).toFixed(1) + ' MB';
 const tf = f => (f / 1e12).toFixed(2) + ' TFLOP';
@@ -319,8 +426,8 @@ function showStatic() {
     { cells: ['Text encoder', 'IF4', gb(w.te || 0)] },
     { cells: ['Diffusion transformer', 'IF4 + BF16 heads', gb(w.dit || 0)] },
     { cells: ['VAE decoder', 'IF8', gb(w.vae || 0)] },
-    { cells: ['Token embedding (host)', 'BF16', gb(w.embed_tokens || 0)] },
-    { cells: ['Total on the board', '', gb(wtotal)], total: true },
+    { cells: ['Token embedding (stays on the host)', 'BF16', gb(w.embed_tokens || 0)] },
+    { cells: ['Sent to the board per run', '', gb(wtotal)], total: true },
   ]);
   const peak = peakOf(c);
   const body = [];
@@ -328,15 +435,19 @@ function showStatic() {
     const p = c.phases[n]; if (!p) continue;
     body.push({ cells: [NAMES[n], gb(p.program_bytes), tf(p.flops), peak ? (p.flops / peak / 1e9).toFixed(1) + ' s' : '—'] });
   }
-  body.push({ cells: ['Total', gb(c.program_bin_bytes), tf(c.total_flops), peak ? (c.total_flops / peak / 1e9).toFixed(1) + ' s' : '—'], total: true });
+  body.push({ cells: ['Total (program bin)', gb(c.program_bin_bytes), tf(c.total_flops), peak ? (c.total_flops / peak / 1e9).toFixed(1) + ' s' : '—'], total: true });
   $('programs').innerHTML = rows(['Phase', 'Program', 'Work', 'At peak'], body);
   $('staticnote').textContent =
-    `${c.image_tokens} image + ${c.max_seq_len} text tokens; program bin ${gb(c.program_bin_bytes)} ` +
-    `of instructions across ${c.engines} engines, plus a ${gb(c.vae_const_bytes)} VAE constant image built from the weights per run; ` +
-    `tensor DRAM ${gb(c.tensor_dram_bytes)}; ` +
-    (peak ? `raw peak ${peak.toFixed(0)} GFLOPS = ${c.engines} engines × 128 FLOP/cycle at ${board.clock_mhz.toFixed(0)} MHz.`
-          : 'the raw peak of the board is known after the first run.');
+    `${c.image_tokens} image + ${c.max_seq_len} text tokens. The program bin holds the instruction images of all ${c.engines} engines; ` +
+    `a ${gb(c.vae_const_bytes)} VAE constant image is built from the weights per run; tensor DRAM ${gb(c.tensor_dram_bytes)}. ` +
+    (peak ? `Raw peak ${peak.toFixed(0)} GFLOPS = ${c.engines} engines × 128 FLOP/cycle at ${board.clock_mhz.toFixed(0)} MHz.`
+          : 'The raw peak of the board is known after the first run.');
   $('static').hidden = false;
+}
+function showWorker() {
+  const w = board.worker;
+  $('release').hidden = !w;
+  if (w) $('release').title = `resident runner on ${w.engines} engines` + (w.loaded ? `, ${w.loaded} loaded` : '');
 }
 async function loadConfigs() {
   const d = await (await fetch('/api/configs')).json();
@@ -345,14 +456,16 @@ async function loadConfigs() {
   for (const c of configs) { const o = document.createElement('option'); o.value = c.id; o.textContent = fmt(c); sel.appendChild(o); }
   if (!configs.length) { $('status').textContent = 'No compiled program sets found under flux2_klein_4b_bin/programs/.'; $('go').disabled = true; }
   else { sel.value = configs.some(c => c.id === keep) ? keep : (configs.find(c => c.width === 256 && c.max_seq_len === 64) || configs[0]).id; }
-  showStatic();
+  showStatic(); showWorker();
 }
 function showJob(j) {
   if (!j || j.state !== 'done') return;
   $('img').src = j.image + '?t=' + (j.result && j.result.total_s || 0);
   const r = j.result || {};
   $('meta').innerHTML = `“${esc(j.prompt)}” — ${j.config.width}×${j.config.height}, seed ${j.seed}` +
-    (r.total_s ? ` — ${r.total_s.toFixed(1)} s on the board` : '');
+    (r.total_s ? ` — ${r.total_s.toFixed(1)} s on the board` : '') +
+    (r.reload ? ` — setup ${r.setup_s.toFixed(1)} s: programs ${r.reload.programs ? 'reloaded' : 'kept on the board'}, ` +
+                `weight images (${gb(r.reload.weight_bytes)}) re-sent` : '');
   const body = [];
   if (r.phases) {
     for (const n of ['te', 'dit', 'vae']) {
@@ -363,8 +476,9 @@ function showJob(j) {
     $('stats').innerHTML = rows(['Phase', 'Work', 'On device', 'Phase wall', 'GFLOPS', 'Of raw peak'], body);
     $('statsnote').textContent =
       `Raw peak ${r.peak_gflops.toFixed(0)} GFLOPS (${r.engines} engines × 128 FLOP/cycle at ${r.clock_mhz.toFixed(0)} MHz). ` +
-      `Overall ${pct(r.utilization)} of peak over the whole run including weight DMA, ${pct(r.device_utilization)} while programs execute. ` +
-      `"Phase wall" adds the host side of each phase (weight upload, DMA in/out) to the device time; total also holds tokenizing and the PNG.`;
+      `Overall ${pct(r.utilization)} of peak over the whole run including the weight DMA, ${pct(r.device_utilization)} while programs execute. ` +
+      `"Phase wall" adds the host side of each phase (weight upload, DMA in/out) to the device time. ` +
+      `The weight images cannot stay resident: the TE image, the DiT image and the VAE arena time-share the params arena below the 4 GiB DMA window.`;
   } else {
     $('stats').innerHTML = ''; $('statsnote').textContent = r.total_s ? `TE ${r.te_s.toFixed(1)} s, DiT ${r.dit_s.toFixed(1)} s, VAE ${r.vae_s.toFixed(1)} s.` : '';
   }
@@ -390,12 +504,19 @@ async function poll() {
     $('status').className = 'status' + (j.state === 'error' ? ' err' : '');
     $('status').textContent = j.state === 'error' ? 'Failed: ' + j.error : `Done in ${j.elapsed.toFixed(1)} s.`;
     showJob(j); loadHistory();
-    if (j.state === 'done') loadConfigs();      // the board's clock / peak are known now
+    loadConfigs();                              // the board's clock / peak and the runner state
   }
 }
 $('config').onchange = showStatic;
+$('release').onclick = async e => {
+  e.preventDefault();
+  await fetch('/api/release', { method: 'POST' });
+  $('status').className = 'status'; $('status').textContent = 'Resident runner stopped; the board is free.';
+  setTimeout(loadConfigs, 1500);
+};
 $('go').onclick = async () => {
-  const body = { prompt: $('prompt').value, config: $('config').value, seed: parseInt($('seed').value || '0', 10) };
+  const body = { prompt: $('prompt').value, config: $('config').value, seed: parseInt($('seed').value || '0', 10),
+                 no_reload: $('noreload').checked };
   $('go').disabled = true; $('status').className = 'status'; $('status').textContent = 'Submitting…'; $('log').textContent = '';
   const r = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const j = await r.json();
@@ -410,7 +531,8 @@ loadConfigs(); loadHistory();
 
 
 class Handler(BaseHTTPRequestHandler):
-    runner: Runner  # set by serve()
+    runner: Runner          # set by main()
+    page: bytes = b""
 
     def log_message(self, fmt, *args):  # quieter than the default
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -429,10 +551,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
         if path == "/":
-            return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+            return self._send(200, self.page, "text/html; charset=utf-8")
         if path == "/api/configs":
             board = load_board()
             board["weights"] = weight_files()
+            board["worker"] = self.runner.worker_state()
             return self._json({"configs": scan_configs(), "board": board})
         if path == "/api/jobs":
             with self.runner.lock:
@@ -453,6 +576,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
+        if self.path == "/api/release":
+            self.runner.release_requested = True       # the runner thread stops it between jobs
+            return self._json({"ok": True}, HTTPStatus.ACCEPTED)
         if self.path != "/api/generate":
             return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
         try:
@@ -460,6 +586,7 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n) or b"{}")
             prompt = str(body.get("prompt", "")).strip()
             seed = int(body.get("seed", 0))
+            no_reload = bool(body.get("no_reload", False))
             cfg = next((c for c in scan_configs() if c["id"] == body.get("config")), None)
         except (ValueError, TypeError, json.JSONDecodeError) as e:
             return self._json({"error": f"bad request: {e}"}, HTTPStatus.BAD_REQUEST)
@@ -471,7 +598,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "unknown configuration"}, HTTPStatus.BAD_REQUEST)
         if seed < 0:
             return self._json({"error": "seed must be >= 0"}, HTTPStatus.BAD_REQUEST)
-        job = Job(prompt, cfg, seed)
+        job = Job(prompt, cfg, seed, no_reload)
         self.runner.submit(job)
         self._json({"id": job.id, "position": self.runner.position(job)}, HTTPStatus.ACCEPTED)
 
@@ -483,6 +610,8 @@ def main(argv=None) -> int:
     ap.add_argument("--python", default=sys.executable, help="interpreter for the run script")
     ap.add_argument("--cpus", default=None, help="pin each run with taskset -c <list>, e.g. 0,2-23")
     ap.add_argument("--dev", default="xdma0")
+    ap.add_argument("--no-reload", action="store_true",
+                    help="tick 'keep the board loaded between runs' by default (a resident runner holds the device)")
     args = ap.parse_args(argv)
 
     cfgs = scan_configs()
@@ -496,13 +625,17 @@ def main(argv=None) -> int:
     runner = Runner(args.python, args.cpus, args.dev)
     runner.start()
     Handler.runner = runner
+    Handler.page = PAGE.replace("__NO_RELOAD__", "checked" if args.no_reload else "").encode()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"FLUX.2 klein server on http://{args.host}:{args.port}/  (runner: {args.python}"
-          f"{', taskset -c ' + args.cpus if args.cpus else ''})", file=sys.stderr)
+          f"{', taskset -c ' + args.cpus if args.cpus else ''}{', no-reload by default' if args.no_reload else ''})",
+          file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        runner.stop_worker()                        # free the device
     return 0
 
 
