@@ -82,7 +82,8 @@
     "params_dram_base": "0x00000000",
     "tensor_dram_base": "0xA0000000",
     "program_dram_base": "0xE0000000",
-    "_note": "params arena 2.5 GiB (DiT image 2.34 GB; TE image 1.45 GB time-shares it), tensors 1 GiB at 0xA0000000 (~100 MB at 256x256, ~430 MB at 512x512 with 8 per-engine attention scratches), then 8 per-engine program slots of 64 MiB (engine e at 0xE0000000 + e*0x04000000; TE+DiT programs are 43 MB on one engine, <10 MB per engine on eight). Everything below 0x100000000 (32-bit DMA address)."
+    "embed_dram_base": "0xB1A00000",
+    "_note": "params arena 2.5 GiB (DiT image 2.34 GB; TE image 1.45 GB and the VAE arena time-share it), tensors at 0xA0000000 (~75 MB at 256x256, ~270 MB at 512x512 with 8 per-engine attention scratches) up to the 778 MB BF16 token embedding table at 0xB1A00000 (resident, ends just below the program slots; the TE program gathers the prompt's rows from it), then 8 per-engine program slots of 64 MiB (engine e at 0xE0000000 + e*0x04000000; TE+DiT programs are 43 MB on one engine, <10 MB per engine on eight). Everything below 0x100000000 (32-bit DMA address)."
   },
   "paths": {
     "bin_dir": "flux2_klein_4b_bin",

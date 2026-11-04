@@ -10,7 +10,7 @@ three phases and writes the PNG.
 | File | Purpose |
 |---|---|
 | `flux2_klein_4b_test.py` | Build + run. Exports weights on first use, compiles the two programs, runs TE -> DiT -> VAE, scores against the host IF4 reference, prints `TEST_RESULT`. `--compile-only` needs no board. |
-| `flux2_klein_4b_run_from_bin.py` | Run-only from the prebuilt weight files and compiled programs (never quantizes or compiles; no host reference unless `--reference`). One image per call, or `--serve`: one JSON job per stdin line in a process that keeps the device, tokenizer, token embedding, VAE weights and the last program set; the weight images are re-sent every run because the TE image, the DiT image and the VAE arena time-share the params arena below the 4 GiB DMA window. |
+| `flux2_klein_4b_run_from_bin.py` | Run-only from the prebuilt weight files and compiled programs (never quantizes or compiles; no host reference unless `--reference`). One image per call, or `--serve`: one JSON job per stdin line in a process that keeps the device, tokenizer, VAE weights and the last program set (the token embedding table is sent once and stays resident); the TE / DiT weight images are re-sent every run because the TE image, the DiT image and the VAE arena time-share the params arena below the 4 GiB DMA window. |
 | `flux2_klein_4b_server.py` | Minimal web UI (standard library only): prompt box, resolution picker over the compiled program sets, seed; runs `flux2_klein_4b_run_from_bin.py` one job at a time and shows the PNG. Selecting a configuration shows its weight images, program sizes and FLOPs per phase; a finished run shows every phase's on-device GFLOPS and share of the raw peak (128 FLOP/cycle/engine at the HW_INFO clock). "Keep the board loaded" (checkbox; `--no-reload` ticks it by default) drives one resident `--serve` runner that keeps the device, the host state and the program set between runs. |
 | `flux2_klein_4b_vae.py` | Phase 3: planner + emitter of the VAE decoder as one sharded program (3x3 convs as nine accumulated row-block matmuls over the padded maps, 1x1 convs as matmuls, on-device GroupNorm statistics, SiLU, residual add, upsample, mid-block attention), plus its IF8 host oracle with per-op intermediates. |
 | `flux2_klein_4b_vae_probe.py` | On-board bring-up of the VAE phase: compiles any prefix of the decoder graph and scores the last op against the host intermediate. |
@@ -107,8 +107,12 @@ query head; the bias is causal plus a right-padding key mask built per prompt),
 permute back, o_proj, residual, RMSNorm, SwiGLU (SiLU fused on the gate
 matmul), down, residual. The raw residual after layers 9/18/27 is scattered
 into the DiT's 7680-wide text buffer with a per-token PBI loop, so the prompt
-embedding never leaves DRAM. The 778 MB token embedding stays on the host
-(rows gathered per prompt), as in `qwen3_4b`.
+embedding never leaves DRAM. The 778 MB BF16 token embedding table is resident
+on the board (top of the tensor region, below the program slots); the TE
+program starts with one DMA pair per token that copies its row into the input
+buffer. The row addresses are instruction immediates (the ISA has no
+memory-to-register load), so the host re-encodes that 4 KB block per prompt
+and DMAs it over the program, like the attention mask.
 
 **Phase 2, diffusion transformer.** One program, the 4 Euler steps unrolled
 (the loop-free pattern pi05 settled on). Up front, the timestep sinusoids of

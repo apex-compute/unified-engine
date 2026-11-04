@@ -11,11 +11,13 @@ One image per call:
 
 Many images per process (``--serve``, what the web UI's "keep the board loaded" mode drives):
 one JSON job per stdin line, ``TEST_RESULT: {...}`` or ``JOB_ERROR: {...}`` per job on stdout.
-The process keeps the device, the tokenizer, the 778 MB token embedding, the VAE weights and
-the program set of the last configuration; a job of the same configuration skips the program
-DMA. The weight images are re-sent on every run regardless: the TE image, the DiT image and the
-VAE arena time-share the params arena (everything sits below the 4 GiB DMA window), so a run
-always overwrites what the previous one left there.
+The process keeps the device, the tokenizer, the VAE weights and the program set of the last
+configuration; a job of the same configuration skips the program DMA. The 778 MB BF16 token
+embedding table lives on the board (top of the tensor region, nothing overwrites it) and is sent
+once per process; the TE program gathers the prompt's rows from it. The TE / DiT weight images
+are re-sent on every run regardless: they and the VAE arena time-share the params arena
+(everything sits below the 4 GiB DMA window), so a run always overwrites what the previous one
+left there.
 """
 from __future__ import annotations
 
@@ -44,7 +46,8 @@ FLOPS_PER_CYCLE = 128          # raw peak of one engine (user_dma_core.report_fl
 
 def phase_stats(timings: dict, engines: int, total_s: float) -> dict:
     """Per-phase and overall FLOP rates against the raw peak of ``engines`` engines
-    (FLOPS_PER_CYCLE each at the clock HW_INFO reported)."""
+    (FLOPS_PER_CYCLE each at the clock HW_INFO reported), from the engines' own execution
+    time only; the host side of a phase (weight DMA, tokenizing) is not in the rates."""
     clock_hz = float(user_dma_core.CORE_CLOCK_FREQ_HZ or 0.0)
     peak_engine = FLOPS_PER_CYCLE * clock_hz / 1e9                  # GFLOPS of one engine
     peak = peak_engine * engines
@@ -56,13 +59,11 @@ def phase_stats(timings: dict, engines: int, total_s: float) -> dict:
         phases[name] = {"flops": timings[f"{name}_flops"], "device_s": timings[f"{name}_device_s"],
                         "wall_s": timings[f"{name}_s"], "gflops": g, "utilization": g / peak if peak else 0.0}
     total_flops = sum(p["flops"] for p in phases.values())
-    device_s = sum(p["device_s"] for p in phases.values())
-    total_gflops = total_flops / total_s / 1e9 if total_s else 0.0
-    device_gflops = total_flops / device_s / 1e9 if device_s else 0.0
+    device_s = sum(p["device_s"] for p in phases.values())        # engine time only: no host side
+    total_gflops = total_flops / device_s / 1e9 if device_s else 0.0
     return {"clock_mhz": clock_hz / 1e6, "peak_gflops": peak, "peak_gflops_per_engine": peak_engine, "phases": phases,
             "total_flops": total_flops, "device_s": device_s, "total_gflops": total_gflops,
-            "utilization": total_gflops / peak if peak else 0.0,
-            "device_utilization": device_gflops / peak if peak else 0.0}
+            "utilization": total_gflops / peak if peak else 0.0, "wall_s": total_s}
 
 
 class Session:
@@ -82,12 +83,12 @@ class Session:
         self.snap = ref.snapshot_dir(cfg["paths"]["hf_model_repo"])
         from transformers import AutoTokenizer
         self.tok = AutoTokenizer.from_pretrained(os.path.join(self.snap, "tokenizer"))
-        self.embed_tokens = T.load_embed_tokens(cfg, self.paths)
         self.vae_w = torch.load(self.paths["vae_weights"], map_location="cpu")
         self.host_load_s = time.time() - t0
         self.engines: dict[str, tuple] = {}        # config key -> (engine, program meta)
         self.loaded: str | None = None             # config key whose programs + constants are on the board
-        _log(f"  host state loaded in {self.host_load_s:.1f}s (tokenizer, token embedding, VAE weights); "
+        self.embed_resident = False                # the token embedding table has been sent to the board
+        _log(f"  host state loaded in {self.host_load_s:.1f}s (tokenizer, VAE weights); "
              f"{self.ne} engine(s) at {float(user_dma_core.CORE_CLOCK_FREQ_HZ or 0) / 1e6:.0f} MHz")
 
     def tokenize(self, prompt: str, L: int):
@@ -121,6 +122,12 @@ class Session:
             self.loaded = key
         else:
             _log(f"    programs and constants of [{key}] already on the board (no reload)")
+        embed_sent = not self.embed_resident
+        if embed_sent:                              # the table sits above every tensor: once per process
+            ue.load_embed_table(self.paths["embed_tokens_bin"])
+            self.embed_resident = True
+        else:
+            _log("    token embedding table already on the board")
         input_ids, attention_mask = self.tokenize(prompt, geo.n_txt)
         n_real = int(self.tokenize(prompt, 4096)[1].sum())
         if n_real > geo.n_txt:
@@ -128,7 +135,7 @@ class Session:
         setup_s = time.time() - t_setup
 
         t_all = time.time()
-        embeds = ue.run_text_encoder(meta, input_ids, attention_mask, self.embed_tokens, self.paths["params_te_bin"])
+        embeds = ue.run_text_encoder(meta, input_ids, attention_mask, self.paths["params_te_bin"])
         _log(f"  TE phase {ue.timings['te_s']:.1f}s")
         noise = ref.initial_noise(geo, seed)
         lat = ue.run_dit(meta, noise, self.paths["params_dit_bin"])
@@ -149,20 +156,22 @@ class Session:
              f"{self.ne} engine(s); setup {setup_s:.1f}s ({'programs reloaded' if programs_loaded else 'programs kept'})")
 
         weight_bytes = os.path.getsize(self.paths["params_te_bin"]) + os.path.getsize(self.paths["params_dit_bin"])
+        embed_bytes = os.path.getsize(self.paths["embed_tokens_bin"])
         result = {"height": geo.height, "width": geo.width, "max_sequence_length": geo.n_txt,
                   "steps": geo.num_inference_steps, "seed": seed, "engines": self.ne, "image": out, "vae": vae,
                   "config": key, "prompt_tokens": n_real,
                   "finite": bool(torch.isfinite(lat.float()).all()) and bool(torch.isfinite(img.float()).all()),
                   "te_s": ue.timings["te_s"], "dit_s": ue.timings["dit_s"], "vae_s": ue.timings["vae_s"],
                   "total_s": total, "setup_s": setup_s,
-                  "reload": {"programs": programs_loaded, "weights": True, "weight_bytes": weight_bytes}}
+                  "reload": {"programs": programs_loaded, "weights": True, "weight_bytes": weight_bytes,
+                             "embed": embed_sent, "embed_bytes": embed_bytes}}
         result.update(phase_stats(ue.timings, self.ne, total))
         for name, ph in result["phases"].items():
             _log(f"  {name.upper()}: {ph['flops'] / 1e12:.2f} TFLOP in {ph['device_s']:.1f}s on the device = "
                  f"{ph['gflops']:.0f} GFLOPS, {100 * ph['utilization']:.0f}% of the {result['peak_gflops']:.0f} GFLOPS peak")
-        _log(f"  overall: {result['total_flops'] / 1e12:.2f} TFLOP / {total:.1f}s = {result['total_gflops']:.0f} GFLOPS, "
-             f"{100 * result['utilization']:.0f}% of peak ({100 * result['device_utilization']:.0f}% on the device, "
-             f"{self.ne} engine(s) at {result['clock_mhz']:.0f} MHz)")
+        _log(f"  overall: {result['total_flops'] / 1e12:.2f} TFLOP / {result['device_s']:.1f}s of engine time = "
+             f"{result['total_gflops']:.0f} GFLOPS, {100 * result['utilization']:.0f}% of peak "
+             f"({self.ne} engine(s) at {result['clock_mhz']:.0f} MHz; {total:.1f}s wall with the host side)")
         aux = {"embeds": embeds, "latent": latent, "image": image, "ue": ue}
         return result, aux
 

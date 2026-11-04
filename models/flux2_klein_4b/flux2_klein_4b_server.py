@@ -11,12 +11,13 @@ every phase's on-device FLOP rate against the raw peak of the engines.
 
 "Keep the board loaded" (the page's checkbox; ``--no-reload`` makes it the
 default) runs the jobs through one long-lived ``--serve`` runner that keeps the
-device, the tokenizer, the token embedding, the VAE weights and the program set
-of the last configuration, so a run skips process start-up, the host file
-reads and the program DMA. The weight images are still sent on every run (the
-TE image, the DiT image and the VAE arena time-share the params arena below
-the 4 GiB DMA window). While that runner lives it holds the device, so other
-board users wait; "release the board" on the page (or an unchecked run) stops it.
+device, the tokenizer, the VAE weights and the program set of the last
+configuration, so a run skips process start-up, the host file reads and the
+program DMA; the token embedding table is sent to the board once per runner and
+stays resident. The TE / DiT weight images are still sent on every run (they
+and the VAE arena time-share the params arena below the 4 GiB DMA window).
+While that runner lives it holds the device, so other board users wait;
+"release the board" on the page (or an unchecked run) stops it.
 
     python models/flux2_klein_4b/flux2_klein_4b_server.py --port 8080
     python models/flux2_klein_4b/flux2_klein_4b_server.py --port 8080 --cpus 0,2-23 --no-reload
@@ -353,8 +354,8 @@ PAGE = """<!doctype html>
   .hist { display:flex; gap:8px; flex-wrap:wrap; }
   .hist img { width:96px; height:96px; object-fit:cover; border-radius:6px; border:1px solid var(--line); cursor:pointer; }
   details summary { cursor:pointer; color:var(--muted); font-size:13px; }
-  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 24px; }
-  @media (max-width: 560px) { .grid { grid-template-columns: 1fr; } }
+  .block + .block { margin-top: 18px; }
+  .narrow { max-width: 620px; }
   .tw { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
   th, td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
@@ -390,10 +391,8 @@ PAGE = """<!doctype html>
   </div>
 
   <div class="card" id="static" hidden>
-    <div class="grid">
-      <div><h2>Weights on the board</h2><div class="tw"><table id="weights"></table></div></div>
-      <div><h2>Programs of this configuration</h2><div class="tw"><table id="programs"></table></div></div>
-    </div>
+    <div class="block narrow"><h2>Weights on the board</h2><div class="tw"><table id="weights"></table></div></div>
+    <div class="block"><h2>Programs of this configuration</h2><div class="tw"><table id="programs"></table></div></div>
     <div class="note" id="staticnote"></div>
   </div>
 
@@ -434,13 +433,13 @@ function showStatic() {
   const c = configs.find(x => x.id === $('config').value);
   if (!c) { $('static').hidden = true; return; }
   const w = board.weights || {};
-  const wtotal = (w.te || 0) + (w.dit || 0) + (w.vae || 0);
-  $('weights').innerHTML = rows(['Image', 'Format', 'Size'], [
-    { cells: ['Text encoder', 'IF4', gb(w.te || 0)] },
-    { cells: ['Diffusion transformer', 'IF4 + BF16 heads', gb(w.dit || 0)] },
-    { cells: ['VAE decoder', 'IF8', gb(w.vae || 0)] },
-    { cells: ['Token embedding (stays on the host)', 'BF16', gb(w.embed_tokens || 0)] },
-    { cells: ['Sent to the board per run', '', gb(wtotal)], total: true },
+  const wtotal = (w.te || 0) + (w.dit || 0) + (w.vae || 0) + (w.embed_tokens || 0);
+  $('weights').innerHTML = rows(['Image', 'Format', 'Where', 'Size'], [
+    { cells: ['Text encoder', 'IF4', 'params arena, sent per run', gb(w.te || 0)] },
+    { cells: ['Diffusion transformer', 'IF4 + BF16 heads', 'params arena, sent per run', gb(w.dit || 0)] },
+    { cells: ['VAE decoder', 'IF8', 'params arena, sent per run', gb(w.vae || 0)] },
+    { cells: ['Token embedding table', 'BF16', 'tensor region, resident', gb(w.embed_tokens || 0)] },
+    { cells: ['Total on the board', '', '', gb(wtotal)], total: true },
   ]);
   const peak = peakOf(c);
   const body = [];
@@ -479,22 +478,23 @@ function showJob(j) {
   $('img').src = j.image + '?t=' + (j.result && j.result.total_s || 0);
   const r = j.result || {};
   $('meta').innerHTML = `“${esc(j.prompt)}” — ${j.config.width}×${j.config.height}, seed ${j.seed}` +
-    (r.total_s ? ` — ${r.total_s.toFixed(1)} s on the board` : '') +
+    (r.device_s ? ` — ${r.device_s.toFixed(1)} s of engine time` : (r.total_s ? ` — ${r.total_s.toFixed(1)} s` : '')) +
     (r.reload ? ` — setup ${r.setup_s.toFixed(1)} s: programs ${r.reload.programs ? 'reloaded' : 'kept on the board'}, ` +
-                `weight images (${gb(r.reload.weight_bytes)}) re-sent` : '');
+                `TE + DiT weight images (${gb(r.reload.weight_bytes)}) re-sent` +
+                (r.reload.embed === undefined ? '' : `, token embedding table ${r.reload.embed ? 'sent' : 'already resident'}`) : '');
   const body = [];
   if (r.phases) {
     for (const n of ['te', 'dit', 'vae']) {
       const p = r.phases[n]; if (!p) continue;
-      body.push({ cells: [NAMES[n], tf(p.flops), p.device_s.toFixed(1) + ' s', p.wall_s.toFixed(1) + ' s', p.gflops.toFixed(0), { util: p.utilization }] });
+      body.push({ cells: [NAMES[n], tf(p.flops), p.device_s.toFixed(2) + ' s', p.gflops.toFixed(0), { util: p.utilization }] });
     }
-    body.push({ cells: ['Total', tf(r.total_flops), r.device_s.toFixed(1) + ' s', r.total_s.toFixed(1) + ' s', r.total_gflops.toFixed(0), { util: r.utilization }], total: true });
-    $('stats').innerHTML = rows(['Phase', 'Work', 'On device', 'Phase wall', 'GFLOPS', 'Of raw peak'], body);
+    body.push({ cells: ['Total', tf(r.total_flops), r.device_s.toFixed(2) + ' s', r.total_gflops.toFixed(0), { util: r.utilization }], total: true });
+    $('stats').innerHTML = rows(['Phase', 'Work', 'Engine time', 'GFLOPS', 'Of raw peak'], body);
     $('statsnote').textContent =
       `Raw peak ${r.peak_gflops.toFixed(0)} GFLOPS (${r.engines} engines × 128 FLOP/cycle at ${r.clock_mhz.toFixed(0)} MHz). ` +
-      `Overall ${pct(r.utilization)} of peak over the whole run including the weight DMA, ${pct(r.device_utilization)} while programs execute. ` +
-      `"Phase wall" adds the host side of each phase (weight upload, DMA in/out) to the device time. ` +
-      `The weight images cannot stay resident: the TE image, the DiT image and the VAE arena time-share the params arena below the 4 GiB DMA window.`;
+      `Every rate uses the engines' own execution time (the on-device latency counter of each phase); the total is the sum of the three. ` +
+      `The host side (weight DMA, tokenizing, the PNG) is outside these numbers: ${(r.wall_s || r.total_s).toFixed(1)} s wall for the whole run. ` +
+      `The TE and DiT weight images cannot stay resident: they and the VAE arena time-share the params arena below the 4 GiB DMA window.`;
   } else {
     $('stats').innerHTML = ''; $('statsnote').textContent = r.total_s ? `TE ${r.te_s.toFixed(1)} s, DiT ${r.dit_s.toFixed(1)} s, VAE ${r.vae_s.toFixed(1)} s.` : '';
   }
