@@ -217,8 +217,10 @@ class TestCompile(unittest.TestCase):
         kinds = {}
         for st in vm["steps"]:
             kinds[st["kind"]] = kinds.get(st["kind"], 0) + 1
-        self.assertEqual(kinds, {"zero_pairs": 1, "conv": 34, "conv1x1": 6, "gn": 30, "silu": 29, "add": 15,
-                                 "attention": 1, "upsample": 3})
+        # 3x3 convs with 64-multiple channels run as nine accumulated matmuls; the CONV2D walker
+        # keeps post_quant_conv (C = 32, 1x1), conv_in (C = 32) and the tiled conv_out
+        self.assertEqual(kinds, {"zero_pairs": 1, "conv": 3, "conv3x3mm": 31, "conv1x1": 6, "gn": 30, "silu": 29,
+                                 "add": 15, "attention": 1, "upsample": 3})
         self.assertLessEqual(vm["const_base"] + vm["const_size"], vm["arena_end"])
         self.assertLessEqual(vm["arena_end"], ue._tensor_dram_base)
         self.assertGreater(meta["vae_program_size"], 0)

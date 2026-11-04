@@ -129,7 +129,7 @@ def main(argv=None) -> int:
         ok &= finite and s > 25
         _log(f"[{n:3d}] {st['kind']:9s} {st['name']:52s} {tuple(got.shape)} {dt:6.2f}s  SNR {s:6.1f} dB"
              f"{'' if finite else '  NOT FINITE'}")
-        if st["kind"] == "conv" and st.get("out_layout") != "tiled":
+        if st["kind"] in ("conv", "conv3x3mm") and st.get("out_layout") != "tiled":
             # border check: the producer must leave the halo zero
             b = st["out"]
             full = user_dma_core.packed_map_to_chw(

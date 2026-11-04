@@ -12,7 +12,7 @@ three phases and writes the PNG.
 | `flux2_klein_4b_test.py` | Build + run. Exports weights on first use, compiles the two programs, runs TE -> DiT -> VAE, scores against the host IF4 reference, prints `TEST_RESULT`. `--compile-only` needs no board. |
 | `flux2_klein_4b_run_from_bin.py` | Run-only from the prebuilt weight files and compiled programs (never quantizes or compiles; no host reference unless `--reference`). One image per call, or `--serve`: one JSON job per stdin line in a process that keeps the device, tokenizer, token embedding, VAE weights and the last program set; the weight images are re-sent every run because the TE image, the DiT image and the VAE arena time-share the params arena below the 4 GiB DMA window. |
 | `flux2_klein_4b_server.py` | Minimal web UI (standard library only): prompt box, resolution picker over the compiled program sets, seed; runs `flux2_klein_4b_run_from_bin.py` one job at a time and shows the PNG. Selecting a configuration shows its weight images, program sizes and FLOPs per phase; a finished run shows every phase's on-device GFLOPS and share of the raw peak (128 FLOP/cycle/engine at the HW_INFO clock). "Keep the board loaded" (checkbox; `--no-reload` ticks it by default) drives one resident `--serve` runner that keeps the device, the host state and the program set between runs. |
-| `flux2_klein_4b_vae.py` | Phase 3: planner + emitter of the VAE decoder as one sharded program (convs straight from the padded maps, 1x1 convs as matmuls, on-device GroupNorm statistics, SiLU, residual add, upsample, mid-block attention), plus its IF8 host oracle with per-op intermediates. |
+| `flux2_klein_4b_vae.py` | Phase 3: planner + emitter of the VAE decoder as one sharded program (3x3 convs as nine accumulated row-block matmuls over the padded maps, 1x1 convs as matmuls, on-device GroupNorm statistics, SiLU, residual add, upsample, mid-block attention), plus its IF8 host oracle with per-op intermediates. |
 | `flux2_klein_4b_vae_probe.py` | On-board bring-up of the VAE phase: compiles any prefix of the decoder graph and scores the last op against the host intermediate. |
 | `flux2_klein_4b_weights.py` | Checkpoint -> `params_te.bin` (IF4 Qwen3), `params_dit.bin` (IF4 DiT), `vae_weights.pt` (IF8 convs); shape-only layout planner the compiler addresses from. |
 | `flux2_klein_4b_ref.py` | Plain-torch reference of the whole pipeline (bit-identical to diffusers in fp32); IF4 / IF8 fake-quant helpers. |
@@ -141,11 +141,16 @@ matmul operands of the 1x1 convs, GroupNorm affine rows, identity / ones /
 group-average matrices) in before the phase and reads the image out after it;
 nothing moves between host and board while it runs. Every map lives in DRAM
 channels-in-lanes with a one-pixel zero border kept by its producer. 3x3 convs
-keep the layer driver's exact tile grid, each tile one strided DRAM->URAM read
-of its window straight from the padded map, CONV2D, and strided writes of the
-tile rows into the output map (tile ranges split over the engines; the walker's
-per-pixel weight stream is expanded on-engine right before the conv). 1x1
-convs with C, OC multiples of 64 are one quantized-B matmul per image row
+with C, OC multiples of 64 are nine accumulated quantized-B matmuls: for tap
+(ky, kx) the A operand of output rows y0..y0+R-1 is the R*Wp consecutive input
+pixels starting at padded pixel (y0+ky, kx), so there is no im2col and the
+matmul keeps its B tile across 64 A rows; the partials accumulate in place
+through the full-matrix C operand and the rows' border pixels are re-zeroed at
+the end (row ranges split over the engines). The CONV2D walker is kept only
+for conv_in (C = 32) and the tiled conv_out: it re-streams the whole IF8 weight
+block per output pixel, one byte per MAC, which the 32 B/cycle AXI caps at half
+rate (measured 40-47% of peak; the matmul form runs the big convs at 70-80%).
+1x1 convs with C, OC multiples of 64 are one quantized-B matmul per image row
 (the map is already a row-major [pixels, C] matrix). GroupNorm accumulates
 lane-wise pixel sums into slotted accumulators, transposes the flush blocks
 with an identity matmul and sums them with a ones matmul on the bf20 ladder,
