@@ -12329,7 +12329,7 @@ if __name__ == "__main__":
             'dram_stride_wb, dram_unaligned_stride_en, dram_unaligned_stride_wb, '
             'dram_unaligned_memcpy, dram_partial_length_memcpy, '
             'dram_unaligned_read_write_speed, dram_unaligned_access, '
-            'matmat_wide_k, or alias '
+            'matmat_wide_k, fp16 (PyTorch FP16 and mixed BF16/FP16), or alias '
             'dma_unaligned for the unaligned+partial+stride-unaligned set.'
         ),
     )
@@ -12411,7 +12411,8 @@ if __name__ == "__main__":
     # resets N, exactly as it did before.
     software_reset_test(cores=args.multi_core if args.multi_core is not None else 1)
 
-    # Optional early-exit path: run only the named DMA / unaligned coverage.
+    # Optional early-exit path: run only the named coverage.
+    from torch_storage_hw_test import run_torch_storage_suite
     _DMA_TEST_FUNCS = {
         "dram_stride_en": dram_stride_en_test,
         "dram_stride_wb": dram_stride_wb_test,
@@ -12424,6 +12425,7 @@ if __name__ == "__main__":
         "dram_unaligned_read_write_speed": dram_unaligned_read_write_speed_test,
         "dram_unaligned_access": dram_unaligned_access_suite_test,
         "matmat_wide_k": matmat_wide_k_test,
+        "fp16": lambda: run_torch_storage_suite(extended=args.ext, record=record_test),
     }
     _DMA_UNALIGNED_ALIAS = (
         "dram_unaligned_memcpy",
@@ -12462,6 +12464,7 @@ if __name__ == "__main__":
         for name in ordered:
             print(f"=== {name} ===")
             _DMA_TEST_FUNCS[name]()
+        _ALL_TESTS_PASSED_BEFORE_SUMMARY = True
         atexit.unregister(_atexit_write_test_summary)
         write_test_summary(_USER_HW_TEST_SUMMARY)
         print(f"Wrote summary to {_USER_HW_TEST_SUMMARY}")
@@ -12892,6 +12895,8 @@ if __name__ == "__main__":
     if engine_count == 1:
         from mixed_storage_hw_test import run_mixed_suite
         run_mixed_suite(extended=args.ext, record=record_test)
+        # Append native PyTorch and mixed-format comparisons after all existing cases.
+        run_torch_storage_suite(extended=args.ext, record=record_test)
     else:
         print("Mixed tensor operator suite: core-0 single-engine coverage only")
 
