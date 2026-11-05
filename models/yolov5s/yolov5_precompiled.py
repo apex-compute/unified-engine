@@ -28,11 +28,6 @@ GEOMETRY_ABI = "conv-config-inst-v1"
 PRECOMPILED_AXI_DATA_WIDTH_BITS = 256
 SUPPORTED_RUNTIME_AXI_DATA_WIDTH_BITS = (256, 512)
 
-# The CONV X stream repeats a layer's weights for every pixel of its largest
-# tile.  Keep that resident-data trade-off bounded while still allowing much
-# larger launches than the former spatial scale/bias-BRAM limits.
-_CONV_WEIGHT_STREAM_BUDGET_BYTES = 4 << 20
-
 # In strided-write mode the checked-in RTL stores the per-stride AXI beat
 # count in eight bits.  A zero value represents the legal 256-beat maximum;
 # larger chunks wrap and no longer agree with the byte count.  Non-strided
@@ -400,8 +395,7 @@ def _expanded_channel_weights(
 
 def _prepare_conv_plan(operation: dict, weight: dict, source: _PackedMap,
                        destination: _PackedMap, image: _ImageBuilder, *,
-                       allow_half_vector_output: bool = False,
-                       weight_stream_budget_bytes: int = _CONV_WEIGHT_STREAM_BUDGET_BYTES) -> dict:
+                       allow_half_vector_output: bool = False) -> dict:
     precision = weight["precision"]
     data_type = user_dma_core.TYPE[precision.upper()]
     codes = _unpack_codes(
@@ -453,9 +447,6 @@ def _prepare_conv_plan(operation: dict, weight: dict, source: _PackedMap,
         stride_s=int(operation["stride"]), pad=int(operation["pad"]),
         dilation=int(operation["dilation"]), gather=use_gather,
         bias_enabled=padded_bias is not None,
-        weight_bytes_per_block=(
-            64 if data_type == user_dma_core.TYPE.IF8 else 32),
-        weight_stream_budget_bytes=weight_stream_budget_bytes,
         wb_uram_addr=_ACT_URAM_LINES)
     if (out_h, out_w) != destination.logical_shape[1:]:
         raise RuntimeError(f"{operation['name']}: convolution planner shape differs")
@@ -465,8 +456,6 @@ def _prepare_conv_plan(operation: dict, weight: dict, source: _PackedMap,
             f"{operation['name']}: OC chunk {oc_chunk} cannot be scattered "
             "into the persistent packed map without host repacking")
     groups = user_dma_core.conv2d_tile_geometry_groups(tiles)
-    stream_group = max(groups, key=lambda group: group[2] * group[3])
-    stream_h, stream_w = stream_group[2], stream_group[3]
 
     chunks_manifest = []
     for oc0 in range(0, physical_oc, oc_chunk):
@@ -474,21 +463,21 @@ def _prepare_conv_plan(operation: dict, weight: dict, source: _PackedMap,
         chunk_scales = padded_scales[oc0:oc0 + oc_chunk]
         if use_gather:
             weight_stream = user_dma_core.conv2d_pack_weight_stream_gather(
-                chunk_codes, stream_h, stream_w, data_type)
+                chunk_codes, 1, 1, data_type)
             scale_stream = user_dma_core.conv2d_pack_scale_stream_gather(
                 chunk_scales, oc_chunk, chunks)
         else:
             taps = kh * kw * (convolution_c // user_dma_core.UE_VECTOR_SIZE)
             weight_stream = user_dma_core.conv2d_pack_weight_stream(
-                chunk_codes, stream_h, stream_w, data_type)
+                chunk_codes, 1, 1, data_type)
             scale_stream = user_dma_core.conv2d_pack_scale_stream(
-                chunk_scales, oc_chunk, taps, stream_h, stream_w)
+                chunk_scales, oc_chunk, taps, 1, 1)
         weight_address = image.allocate(weight_stream, alignment=64)
         scale_address = image.allocate(scale_stream, alignment=64)
         bias_address = None
         if padded_bias is not None:
             bias_stream = user_dma_core.conv2d_pack_bias_stream(
-                padded_bias[oc0:oc0 + oc_chunk], stream_h, stream_w)
+                padded_bias[oc0:oc0 + oc_chunk], 1, 1)
             bias_address = image.allocate(bias_stream, alignment=64)
         chunks_manifest.append({
             "oc0": oc0,
@@ -653,7 +642,8 @@ def _emit_conv(engine: _WholeGraphEngine, plan: dict,
                     bias_enable=plan["bias_enabled"],
                     lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b,
                     dilation=dilation, gather=plan["use_gather"],
-                    c_in=plan["convolution_c"])
+                    c_in=plan["convolution_c"],
+                    weight_reuse=True)
                 _scatter_conv_tile(
                     engine, destination, tile, oc0, plan["oc_chunk"])
 

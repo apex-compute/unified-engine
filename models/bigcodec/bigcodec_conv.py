@@ -208,9 +208,7 @@ def _map(shape, address):
 
 
 def _prepare_subplans(name, weight, bias, *, source, output_length,
-                       output_address, image, stride, dilation,
-                       weight_reuse_pixels):
-    reuse = _positive(weight_reuse_pixels, "weight_reuse_pixels")
+                       output_address, image, stride, dilation):
     plans = []
     # BigCodec C768/K7 otherwise selects OC96, which cannot be scattered from
     # half SRAM lines. An aligned <=64-output plan also bounds scale BRAM use.
@@ -218,14 +216,12 @@ def _prepare_subplans(name, weight, bias, *, source, output_length,
         take = min(64, weight.shape[0] - start)
         encoded = quantize_conv1d_if8(weight[start:start + take],
                                      None if bias is None else bias[start:start + take])
-        blocks = encoded["block_scales"].shape[1]
         target = _map((output_length, take), output_address)
         operation = {"name": f"{name}/oc{start}", "stride": stride,
                      "pad": 0, "dilation": dilation, "activate": False}
         plan = shared._prepare_conv_plan(
             operation, encoded, source, target, image,
-            allow_half_vector_output=True,
-            weight_stream_budget_bytes=64 * blocks * 64 * reuse)
+            allow_half_vector_output=True)
         plan["channel_offset"] = start
         plans.append(plan)
     return plans
@@ -254,7 +250,7 @@ def _shorten_subplans(subplans, output_length):
 
 def prepare_conv1d(name, weight, bias=None, *, input_shape, input_address,
                    output_address, padded_input_address, image, stride=1,
-                   padding=0, dilation=1, weight_reuse_pixels=1):
+                   padding=0, dilation=1):
     weight = torch.as_tensor(weight)
     input_shape = _shape(input_shape)
     output_shape = conv1d_output_shape(input_shape, weight.shape, stride=stride,
@@ -285,8 +281,7 @@ def prepare_conv1d(name, weight, bias=None, *, input_shape, input_address,
         plans = _prepare_subplans(
             name, weight, bias, source=_map(stage_shape, staging),
             output_length=output_shape[0], output_address=output_address,
-            image=image, stride=stride, dilation=dilation,
-            weight_reuse_pixels=weight_reuse_pixels)
+            image=image, stride=stride, dilation=dilation)
     else:
         # The 2-D descriptor still encodes dilation*window_width*channel_tiles
         # as a 12-bit row stride when height==1. C768/K7/d9 needs5940, although
@@ -303,8 +298,7 @@ def prepare_conv1d(name, weight, bias=None, *, input_shape, input_address,
         plans = _prepare_subplans(
             name, weight, bias, source=_map((phase_input, input_shape[1]), staging),
             output_length=longest, output_address=output_address, image=image,
-            stride=inner_stride, dilation=1,
-            weight_reuse_pixels=weight_reuse_pixels)
+            stride=inner_stride, dilation=1)
         result["output_step"] = output_step
         result["dilation_phases"] = []
         for phase in range(min(output_step, output_shape[0])):
@@ -322,8 +316,7 @@ def prepare_conv1d(name, weight, bias=None, *, input_shape, input_address,
 
 def prepare_conv_transpose1d(name, weight, bias=None, *, input_shape,
                              input_address, output_address, padded_input_address,
-                             image, stride, padding=0, output_padding=0,
-                             weight_reuse_pixels=1):
+                             image, stride, padding=0, output_padding=0):
     weight = torch.as_tensor(weight)
     input_shape = _shape(input_shape)
     output_shape = conv_transpose1d_output_shape(
@@ -346,8 +339,7 @@ def prepare_conv_transpose1d(name, weight, bias=None, *, input_shape,
             f"{name}/phase{phase['phase']}", phase.pop("weight"), bias,
             source=_map((phase["input_length"], input_shape[1]), staging),
             output_length=phase["output_length"], output_address=output_address,
-            image=image, stride=1, dilation=1,
-            weight_reuse_pixels=weight_reuse_pixels)
+            image=image, stride=1, dilation=1)
         phases.append(phase)
     return {"name": name, "kind": "conv_transpose1d", "input_shape": input_shape,
             "output_shape": output_shape, "input_address": source_address,
@@ -414,7 +406,8 @@ def _emit_subplans(engine, plans, *, output_shape, output_address, phase,
                         w_pad=win_w, stride_s=operation["stride"], data_type=udc.TYPE.IF8,
                         bias_enable=plan["bias_enabled"], lalu_mode=udc.LALU_MODE.BYPASS,
                         lalu_a=0, lalu_b=0, dilation=operation["dilation"],
-                        gather=plan["use_gather"], c_in=plan["convolution_c"])
+                        gather=plan["use_gather"], c_in=plan["convolution_c"],
+                        weight_reuse=True)
                     destination = output_address + (output_step * tile[1] + phase) * pixel_bytes + oc * 2
                     if plan["oc_chunk"] == 32:
                         # SRAM addresses are128-byte aligned. Spill a packed

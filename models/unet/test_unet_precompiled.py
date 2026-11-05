@@ -35,6 +35,40 @@ class MemoryEngine:
 
 
 class WholeGraphTests(unittest.TestCase):
+    def test_if4_if8_plans_store_one_pattern_and_emit_reuse_for_each_tile(self):
+        for precision, block_bytes in (('if4', 32), ('if8', 64)):
+            for gather, cin in ((False, 64), (True, 3)):
+                with self.subTest(gather=gather, precision=precision):
+                    source = up.shared._layout_for_conv((cin, 8, 8))
+                    destination = up.shared._layout_for_conv((64, 8, 8))
+                    blocks = 1 if gather else 9
+                    codes = torch.ones((64, cin, 3, 3), dtype=torch.uint8)
+                    packed = (codes.flatten() if precision == 'if8' else
+                              codes.flatten()[::2] | (codes.flatten()[1::2] << 4))
+                    weight = dict(precision=precision, codes_packed=packed,
+                                  codes_shape=list(codes.shape),
+                                  layout='gather' if gather else 'channel',
+                                  block_scales=torch.full((64, blocks), -1., dtype=torch.bfloat16),
+                                  bias=torch.zeros(64, dtype=torch.bfloat16))
+                    image = up.shared._ImageBuilder(up.shared.MODEL_BASE, up.shared.MODEL_LIMIT)
+                    op = dict(name='conv', stride=1, pad=1, dilation=1, activate=False)
+                    plan = up.shared._prepare_conv_plan(op, weight, source, destination, image)
+                    self.assertGreater(max(t[2]*t[3] for t in plan['tiles']), 1)
+                    self.assertEqual(len(plan['chunks']), 1)
+                    # Image span 0 is the packed weight allocation: spatial extent
+                    # must not multiply it. Scale/bias follow as separate spans.
+                    self.assertEqual(image.spans[0][1] - image.spans[0][0], 64*blocks*block_bytes)
+                    engine = mock.Mock()
+                    if precision == 'if8':
+                        up.emit_conv(engine, plan, 0, 0, False)
+                    else:
+                        up.shared._emit_conv(engine, plan, 0)
+                    self.assertEqual(engine.start_queue_for_conv2d_operation.call_count,
+                                     len(plan['tiles']))
+                    for call in engine.start_queue_for_conv2d_operation.call_args_list:
+                        self.assertTrue(call.kwargs['weight_reuse'])
+                        self.assertEqual(call.kwargs['data_type'], plan['data_type'])
+
     def test_merge_only_copies_skip_half(self):
         engine = MemoryEngine()
         shapes = [(64,4,6)]+[(64,2,3)]*4
@@ -106,8 +140,6 @@ class WholeGraphTests(unittest.TestCase):
     def test_resolution_rejected_before_compilation(self):
         with self.assertRaises(ValueError):
             up.graph({},33,32)
-        with self.assertRaises(ValueError):
-            up.compile_hardware({},16,16,weight_reuse_pixels=0)
 
     def test_runtime_one_upload_kick_read(self):
         engine = mock.Mock()

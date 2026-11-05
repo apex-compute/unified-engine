@@ -14,6 +14,12 @@ background noise; use [DPDFNet](../dpdfnet/README.md) for speech enhancement.
 
 ## Compile and run
 
+The IF8 compiler stores one weight pattern per output-channel chunk and enables
+the hardware's bank-Z replay for normal and transposed convolutions. Recompile
+IF8 images for firmware supporting `UE_CONV_CTRL[30]`; spatial weight replication
+settings have been removed. The default BF16 model below retains its specialized
+matmul lowering.
+
 ```bash
 python3 -m pip install -r requirements.txt
 python3 models/bigcodec/bigcodec_fetch.py

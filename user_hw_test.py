@@ -12897,6 +12897,8 @@ if __name__ == "__main__":
         run_mixed_suite(extended=args.ext, record=record_test)
         # Append native PyTorch and mixed-format comparisons after all existing cases.
         run_torch_storage_suite(extended=args.ext, record=record_test)
+        from conv_weight_reuse_benchmark import run_hardware_suite as run_conv_reuse_suite
+        run_conv_reuse_suite(record_test)
     else:
         print("Mixed tensor operator suite: core-0 single-engine coverage only")
 

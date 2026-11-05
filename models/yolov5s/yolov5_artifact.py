@@ -44,7 +44,8 @@ from yolov5_common import (
 )
 
 
-ARTIFACT_VERSION = 6
+# v7 stores one weight pattern per convolution chunk and enables on-chip reuse.
+ARTIFACT_VERSION = 7
 
 # Public resolution strings use the conventional WIDTHxHEIGHT spelling while
 # tensor shapes remain CHW. Every profile is compiled offline into the bin;
@@ -83,15 +84,15 @@ CANONICAL_ARTIFACTS = {
         weights_sha256=(
             "273634fad085fa82ed76b5c5f03d80abebf3c8edcf4c8dbda95697c8c8b7d4d3"),
         model_sha256=(
-            "169dec4503e9e04f6f968f47d539d5a1b42338a547b5d6d312fd25317dc8a277"),
+            "0530aa967bb3e55ac2a06c7ff2e1acb70596fe5f24711879ac1706811aed369f"),
         program_sha256=(
-            "dfb22c24ee749c66a3e8448d94bf4b0e05a2918012af0bf43b6c5dd82dc2a027"),
+            "3e43b8cb553808d10853b6e531e7167b6c2e9003f8dca321f0535792d28733cb"),
         manifest_sha256=(
-            "c66c0d3ece1d36fcb7290aef58f3c1d5538d201cb8859311e4f35ff2d6671abe"),
+            "53dae1ca24cca02071416b0389f780145bcc2ba0eed62d01533c2d364d454e13"),
         bundle_sha256=(
-            "2ec6e653082fae35f12067513b1d3bd516986d87534d8960fa238c2c331814f6"),
-        model_bytes=191_365_248,
-        program_bytes=145_024,
+            "517df4eb78a6cddcec825477a1a07cbdef5cf04af7870233c627662a0fc23431"),
+        model_bytes=4_202_112,
+        program_bytes=113_792,
     ),
     "n": CanonicalArtifact(
         variant="n",
@@ -101,15 +102,15 @@ CANONICAL_ARTIFACTS = {
         weights_sha256=(
             "b8ca688e49a44c87b657de6b5c4c9d7b0193718c40ccc8f860733cd89865f666"),
         model_sha256=(
-            "d13b4daaf3998b8da7d682137729d1f65a3b4526b24aa86f7e9bdbd6da908e0b"),
+            "ac9fb3e9605f3db6d9136a135178844e1f7142e06bbb7f90a610eeca24e38f81"),
         program_sha256=(
-            "fa0e228a4f43038d0260c86702602d162d9cf8c6308853fa82c51fc514835004"),
+            "ea04c37a9d4e44742fb9dd36610172fb1f266712d1978d2ec3e1d3bd6499c811"),
         manifest_sha256=(
-            "a496a6081257aa25f595f120741b7a405ad46e5dd98d1a50f9f00eaf9ea86f16"),
+            "d3a64f90334b28f58632a3532534e2ee5a150cbc5fd66f0022af6b0e789508d4"),
         bundle_sha256=(
-            "91e214d9e1babd3f8d432c43dfa9c6220fabf6977b6856b0bdc1884b04313ea2"),
-        model_bytes=128_758_464,
-        program_bytes=109_120,
+            "e9176ba3d14f37e9e336ea83cdf9648b68ee5ed91e2e290ad1ebe6c5f4ba8b18"),
+        model_bytes=1_406_208,
+        program_bytes=99_456,
     ),
 }
 
@@ -626,7 +627,8 @@ def validate_single_bin(payload: dict) -> None:
     artifact_spec = get_canonical_artifact(variant)
     if payload.get("artifact_version") != ARTIFACT_VERSION:
         raise RuntimeError(
-            f"unsupported YOLO artifact version {payload.get('artifact_version')!r}")
+            f"unsupported YOLO artifact version {payload.get('artifact_version')!r}; "
+            "rebuild with the matching compiler and --force")
     expected_keys = {
         "format", "artifact_version", "checkpoint_sha256", "graph_sha256",
         "model", "operations", "head_outputs", "weights", "runtime",

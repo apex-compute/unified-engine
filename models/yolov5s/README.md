@@ -25,8 +25,10 @@ a compiler destination and `--force` to rebuild. The runner accepts `--bin` and
 `--list-resolutions`; it loads only the artifact, without downloading weights
 or compiling the graph.
 
-The v6 bin contains all profiles, quantized CPU tensors, and one fixed-address
+The v7 bin contains all profiles, quantized CPU tensors, and one fixed-address
 parameter/program image per profile. The selected image is uploaded once.
+Convolutions store one weight pattern per output-channel chunk and reuse it
+on-chip across each spatial tile. Rebuild older bins with `--force`.
 Each inference then performs one input upload, one START/HALT sequence and one
 bundled output read. Convolution, SiLU, SPPF, upsampling, residuals and
 concatenation remain on the FPGA. Letterboxing, detection decoding, NMS and
@@ -40,7 +42,8 @@ floating codebooks per block, with signed BF16 scales. Default confidence and
 IoU thresholds are 0.25 and 0.45.
 
 Hardware requires native CONV2D/MAXPOOL, ordered queue-CONFIG geometry, corrected
-gather-IF8 scale rewind and `HW_INFO`. Program a compatible image separately;
+gather-IF8 scale rewind, bank-Z convolution weight reuse and `HW_INFO`.
+Program a compatible image separately;
 `--device` does not select or flash a bitstream. The runtime does not enforce
 a build-hash allow-list. Accelerator timing covers the single START-to-HALT
 interval; host timing also includes boundary transfers and image processing.
@@ -49,6 +52,11 @@ interval; host timing also includes boundary transfers and image processing.
 
 ```bash
 python3 -m unittest discover -s models/yolov5s -p 'test_*.py'
+
+# Also rebuild both variants and verify all six profiles against their pinned
+# deployment hashes, using locally cached official v7.0 checkpoints.
+ANDROMEDA_YOLO_CHECKPOINT_DIR=/path/to/checkpoints \
+  python3 -m unittest discover -s models/yolov5s -p 'test_yolov5_canonical_compile.py'
 ```
 
 The native adapter pins Ultralytics source commit
