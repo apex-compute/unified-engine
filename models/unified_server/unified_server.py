@@ -20,7 +20,7 @@ counter, the host wall time, tokens/s, GFLOPS and the share of the raw peak
 (128 FLOP/cycle/engine at the HW_INFO clock).
 
     python models/unified_server/unified_server.py --port 8080
-    python models/unified_server/unified_server.py --host 0.0.0.0 --port 8080 --engines 8 --cpus 0,2-23
+    python models/unified_server/unified_server.py --host 0.0.0.0 --port 8080 --engines 8
 
 API: GET /api/models, POST /api/chat {model, messages, image?, audio?, max_new_tokens},
 POST /api/generate (FLUX, as flux2_klein_4b_server.py), GET /api/jobs/<id>,
@@ -211,7 +211,23 @@ class ChatJob:
         self.started: float | None = None
         self.finished: float | None = None
         self.first_token: float | None = None
+        self.n_tokens = 0
+        self.status_since = time.time()
         self.stop_requested = False
+
+    def set_status(self, text: str) -> None:
+        if text != self.status:
+            self.status, self.status_since = text, time.time()
+
+    def live(self) -> dict:
+        """What the token stream sends besides the text: progress, no log."""
+        now = time.time()
+        return {"state": self.state, "status": self.status,
+                "status_s": round(now - self.status_since, 1) if self.status else 0.0,
+                "tokens": self.n_tokens,
+                "decode_s": round(now - self.first_token, 3) if self.first_token else None,
+                "elapsed": round((self.finished or now) - (self.started or now), 1) if self.started else 0.0,
+                "ttft_s": round(self.first_token - self.started, 2) if (self.first_token and self.started) else None}
 
     def public(self) -> dict:
         now = time.time()
@@ -227,14 +243,14 @@ class ChatJob:
 class Board(threading.Thread):
     """The single scheduler: FLUX jobs and chat jobs, one at a time, one resident process at most."""
 
-    def __init__(self, python: str, cpus: str | None, dev: str, engines: int):
+    def __init__(self, python: str, dev: str, engines: int):
         super().__init__(daemon=True)
-        self.python, self.cpus, self.dev, self.engines = python, cpus, dev, engines
+        self.python, self.dev, self.engines = python, dev, engines
         self.q: "queue.Queue" = queue.Queue()
         self.jobs: dict[str, object] = {}
         self.order: list[str] = []
         self.lock = threading.Lock()
-        self.flux = flux.Runner(python, cpus, dev)   # used for its job methods; its thread never starts
+        self.flux = flux.Runner(python, None, dev)   # used for its job methods; its thread never starts
         self.llm: LLMWorker | None = None
         self.release_requested = False
         self.loading: dict | None = None             # model being brought up
@@ -260,9 +276,6 @@ class Board(threading.Thread):
                     "loaded": fw["loaded"]}
         return None
 
-    def _prefix(self) -> list[str]:
-        return ["taskset", "-c", self.cpus] if self.cpus else []
-
     def stop_llm(self) -> None:
         w, self.llm = self.llm, None
         if w is not None:
@@ -281,11 +294,11 @@ class Board(threading.Thread):
         if w is None:
             self.flux.stop_worker()                # the device is one resource
             title = CHAT_MODELS[job.model]["title"]
-            job.status = f"loading {title} onto the board"
+            job.set_status(f"loading {title} onto the board")
             job.log.append(f"starting the resident {title} runner on {job.engines} engines "
                            f"(device, weights, program image)...\n")
             self.loading = {"model": job.model, "since": time.time()}
-            cmd = self._prefix() + [self.python, WORKER, "--model", job.model, "--engines", str(job.engines),
+            cmd = [self.python, WORKER, "--model", job.model, "--engines", str(job.engines),
                                     "--dev", self.dev]
             w = LLMWorker(cmd, job.model, job.engines, job.log.append)
             try:
@@ -310,7 +323,7 @@ class Board(threading.Thread):
         w = self._ensure_llm(job)
         if job.stop_requested:
             raise RuntimeError("stopped")
-        job.status = "running"
+        job.set_status("starting")
         w.send({"id": job.id, "messages": job.messages, "image": job.image, "audio": job.audio,
                 "max_new_tokens": job.max_new_tokens})
         for ev in w.events():
@@ -320,10 +333,11 @@ class Board(threading.Thread):
             if e == "token":
                 if job.first_token is None:
                     job.first_token = time.time()
-                job.status = "decode"
+                job.n_tokens += 1
+                job.set_status("decode")
                 job.text += ev.get("text", "")
             elif e == "status":
-                job.status = ev.get("text", "")
+                job.set_status(ev.get("text", ""))
             elif e == "result":
                 job.metrics = ev.get("metrics") or {}
                 job.metrics["resident"] = w.info
@@ -442,6 +456,38 @@ def save_upload(obj, kind: str, job_tag: str) -> tuple[str, str]:
 
 PAGE_PATH = os.path.join(HERE, "page.html")
 
+# The page's Markdown / math libraries, fetched once from the CDN and served from here,
+# so the browser needs no internet access (the page falls back to plain text without them).
+VENDOR_CDN = "https://cdn.jsdelivr.net/npm/"
+VENDOR_ALLOWED = ("marked@12.0.2/marked.min.js", "dompurify@3.1.6/dist/purify.min.js", "katex@0.16.11/dist/")
+VENDOR_DIR = os.path.join(OUT_DIR, "vendor")
+VENDOR_TYPES = {".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+                ".woff2": "font/woff2", ".woff": "font/woff", ".ttf": "font/ttf"}
+_vendor_lock = threading.Lock()
+
+
+def vendor_file(rel: str) -> tuple[bytes, str] | None:
+    """(bytes, content type) of an allow-listed CDN file, cached under server_out/vendor/."""
+    ext = os.path.splitext(rel)[1]
+    if (".." in rel.split("/") or ext not in VENDOR_TYPES
+            or not any(rel == a or (a.endswith("/") and rel.startswith(a)) for a in VENDOR_ALLOWED)):
+        return None
+    path = os.path.join(VENDOR_DIR, *rel.split("/"))
+    with _vendor_lock:
+        if not os.path.exists(path):
+            import urllib.request
+            try:
+                with urllib.request.urlopen(VENDOR_CDN + rel, timeout=15) as r:
+                    data = r.read()
+            except OSError:
+                return None
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path + ".part", "wb") as f:
+                f.write(data)
+            os.replace(path + ".part", path)
+        with open(path, "rb") as f:
+            return f.read(), VENDOR_TYPES[ext]
+
 
 class Handler(BaseHTTPRequestHandler):
     board: Board            # set by main()
@@ -472,6 +518,17 @@ class Handler(BaseHTTPRequestHandler):
         b = self.board
         if path == "/":
             return self._send(200, self.page, "text/html; charset=utf-8")
+        if path.startswith("/vendor/"):
+            got = vendor_file(path[len("/vendor/"):])
+            if got is None:
+                return self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            self.send_response(200)
+            self.send_header("Content-Type", got[1])
+            self.send_header("Content-Length", str(len(got[0])))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(got[0])
+            return
         if path == "/api/models":
             fboard = flux.load_board()
             fboard["weights"] = flux.weight_files()
@@ -492,6 +549,11 @@ class Handler(BaseHTTPRequestHandler):
                 d.pop("log", None)
                 out.append(d)
             return self._json(out)
+        if path.startswith("/api/jobs/") and path.endswith("/stream"):
+            job = b.jobs.get(path[len("/api/jobs/"):-len("/stream")])
+            if job is None or getattr(job, "kind", "image") != "chat":
+                return self._json({"error": "no such chat job"}, HTTPStatus.NOT_FOUND)
+            return self._stream(job)
         if path.startswith("/api/jobs/"):
             parts = path[len("/api/jobs/"):].split("/")
             job = b.jobs.get(parts[0])
@@ -507,6 +569,40 @@ class Handler(BaseHTTPRequestHandler):
                 with open(job.image, "rb") as f:
                     return self._send(200, f.read(), "image/png")
         self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+
+    def _stream(self, job: "ChatJob") -> None:
+        """Server-sent events: 'delta' {text, ...progress} as tokens arrive, 'done' with the whole job."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        def send(event: str, data: dict) -> None:
+            self.wfile.write(f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode())
+            self.wfile.flush()
+
+        prev, last_beat = "", 0.0
+        try:
+            while True:
+                finished = job.state in ("done", "error", "cancelled")
+                text = job.text
+                now = time.time()
+                if text != prev or now - last_beat > 0.5:
+                    d = job.live()
+                    if text.startswith(prev):
+                        d["text"] = text[len(prev):]
+                    else:                            # the final text replaced the streamed one
+                        d["text"], d["reset"] = text, True
+                    d["position"] = self.board.position(job) if job.state == "queued" else 0
+                    send("delta", d)
+                    prev, last_beat = text, now
+                if finished:
+                    send("done", job.public())
+                    return
+                time.sleep(0.02)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def do_POST(self) -> None:
         b = self.board
@@ -604,14 +700,13 @@ def main(argv=None) -> int:
     ap.add_argument("--host", default="127.0.0.1", help="bind address (0.0.0.0 to reach it from other machines)")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--python", default=sys.executable, help="interpreter for the model runners")
-    ap.add_argument("--cpus", default=None, help="pin each runner with taskset -c <list>, e.g. 0,2-23")
     ap.add_argument("--dev", default="xdma0")
     ap.add_argument("--engines", type=int, default=8, help="engines for the chat models (FLUX uses its configs')")
     ap.add_argument("--no-reload", action="store_true",
                     help="FLUX: tick 'keep the board loaded between runs' by default")
     args = ap.parse_args(argv)
 
-    board = Board(args.python, args.cpus, args.dev, args.engines)
+    board = Board(args.python, args.dev, args.engines)
     board.start()
     Handler.board = board
     with open(PAGE_PATH, encoding="utf-8") as f:
@@ -624,7 +719,7 @@ def main(argv=None) -> int:
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     print(f"Unified Engine model server on http://{args.host}:{args.port}/  (runners: {args.python}, "
-          f"{args.engines} engines for chat{', taskset -c ' + args.cpus if args.cpus else ''})", file=sys.stderr)
+          f"{args.engines} engines for chat)", file=sys.stderr)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

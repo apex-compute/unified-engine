@@ -339,7 +339,8 @@ class Gemma4Backend:
             secs = r.get("audio_seconds")
             phases.append(_phase("Audio encoder" + (f" ({secs:.1f} s clip)" if secs else ""),
                                  tokens=r.get("audio_tokens") or n_aud, hw_s=r["audio_hw_s"], wall_s=r.get("audio_wall_s"),
-                                 engines=1, clock_mhz=c, note="engine 0; soft tokens out"))
+                                 flops=ue._model_flops_audio(), engines=e, clock_mhz=c,
+                                 note="frames split across the engines; soft tokens out"))
         pf_model = ue._model_flops_prefill()
         chunks = r.get("prefill_chunks") or 1
         phases.append(_phase("Prefill" + (f" ({chunks} chunks)" if chunks > 1 else ""),

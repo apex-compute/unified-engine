@@ -4,10 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Unified Engine models</title>
+<link rel="stylesheet" href="/vendor/katex@0.16.11/dist/katex.min.css">
+<script defer src="/vendor/marked@12.0.2/marked.min.js"></script>
+<script defer src="/vendor/dompurify@3.1.6/dist/purify.min.js"></script>
+<script defer src="/vendor/katex@0.16.11/dist/katex.min.js"></script>
 <style>
-  :root { --bg:#f6f7f9; --fg:#1c1e21; --muted:#6b7280; --card:#fff; --line:#d9dde3; --accent:#2563eb; --err:#b91c1c; --bar:#dbe4ff; --me:#e8efff; --chip:#eef0f3; }
+  :root { --bg:#f6f7f9; --fg:#1c1e21; --muted:#6b7280; --card:#fff; --line:#d9dde3; --accent:#2563eb; --err:#b91c1c; --bar:#dbe4ff; --me:#e8efff; --chip:#eef0f3; --code:#f1f3f6; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#111317; --fg:#e6e8eb; --muted:#9aa3ad; --card:#1a1d23; --line:#2d323b; --accent:#5b8cff; --err:#f87171; --bar:#26324f; --me:#1f2a44; --chip:#252a33; }
+    :root { --bg:#111317; --fg:#e6e8eb; --muted:#9aa3ad; --card:#1a1d23; --line:#2d323b; --accent:#5b8cff; --err:#f87171; --bar:#26324f; --me:#1f2a44; --chip:#252a33; --code:#0d0f13; }
   }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
@@ -51,24 +55,63 @@
   .kv div { font-size: 13px; color: var(--muted); }
   .kv b { display:block; font-size: 18px; color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
   /* chat */
-  #conv { display:flex; flex-direction:column; gap:10px; max-height: 56vh; overflow-y:auto; padding-right: 4px; }
-  .msg { max-width: 88%; padding: 10px 14px; border-radius: 10px; white-space: pre-wrap; word-wrap: break-word; border:1px solid var(--line); }
-  .msg.user { align-self:flex-end; background: var(--me); border-color: transparent; }
-  .msg.assistant { align-self:flex-start; background: var(--bg); cursor: pointer; }
-  .msg.assistant.sel { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .msg .att { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:6px; }
-  .msg .att img { max-height: 120px; border-radius: 6px; }
-  .msg .att span { font-size:12px; background:var(--chip); padding:2px 8px; border-radius: 10px; }
-  .msg .foot { font-size: 12px; color: var(--muted); margin-top: 6px; white-space: normal; }
-  .msg.err { color: var(--err); }
-  .empty { color: var(--muted); font-size: 14px; }
-  .tools { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top: 10px; }
-  .chip { display:inline-flex; align-items:center; gap:6px; font-size:13px; background:var(--chip); padding:4px 10px; border-radius: 14px; }
-  .chip img { height: 28px; border-radius: 4px; }
+  .chat { padding: 0; overflow: hidden; }
+  #conv { height: min(64vh, 720px); overflow-y: auto; padding: 22px 24px 8px; scroll-behavior: auto; }
+  .empty { color: var(--muted); font-size: 14px; text-align: center; margin-top: 18vh; }
+  .turn { display: flex; margin: 0 0 18px; }
+  .turn.user { justify-content: flex-end; }
+  .msg { max-width: 82%; word-wrap: break-word; overflow-wrap: anywhere; }
+  .turn.user .msg { background: var(--me); padding: 10px 14px; border-radius: 16px 16px 4px 16px; white-space: pre-wrap; }
+  .turn.assistant .msg { max-width: 100%; width: 100%; padding: 2px 2px; border-radius: 8px; }
+  .turn.assistant.sel .msg { box-shadow: -3px 0 0 var(--accent); padding-left: 12px; }
+  .msg .att { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; }
+  .msg .att img { max-height: 140px; border-radius: 10px; display: block; }
+  .msg .att span { font-size:12px; background:var(--card); padding:3px 10px; border-radius: 10px; }
+  .msg.err .md { color: var(--err); }
+  .foot { font-size: 12px; color: var(--muted); margin-top: 8px; display: flex; gap: 6px 14px; flex-wrap: wrap; align-items: center; font-variant-numeric: tabular-nums; }
+  .foot b { color: var(--fg); font-weight: 600; }
+  .foot a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .phase { display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; padding: 6px 0; }
+  .dots { display: inline-flex; gap: 4px; }
+  .dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: bounce 1.2s infinite ease-in-out; }
+  .dots i:nth-child(2) { animation-delay: .15s; } .dots i:nth-child(3) { animation-delay: .3s; }
+  @keyframes bounce { 0%, 80%, 100% { opacity: .25; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-3px); } }
+  .caret { display: inline-block; width: .5em; height: 1.05em; margin-left: 2px; vertical-align: text-bottom; background: var(--accent); border-radius: 1px; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  /* markdown */
+  .md { line-height: 1.6; }
+  .md > :first-child { margin-top: 0; } .md > :last-child { margin-bottom: 0; }
+  .md p, .md ul, .md ol, .md pre, .md blockquote, .md table { margin: 0 0 .75em; }
+  .md h1, .md h2, .md h3, .md h4 { margin: 1.1em 0 .45em; line-height: 1.3; text-transform: none; letter-spacing: 0; color: var(--fg); }
+  .md h1 { font-size: 1.35em; } .md h2 { font-size: 1.2em; font-weight: 650; } .md h3 { font-size: 1.07em; } .md h4 { font-size: 1em; }
+  .md ul, .md ol { padding-left: 1.4em; } .md li { margin: .2em 0; } .md li > p { margin: 0; }
+  .md code { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code); padding: .1em .35em; border-radius: 4px; }
+  .md pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; max-height: none; white-space: pre; font-size: 13px; }
+  .md pre code { background: none; padding: 0; }
+  .md blockquote { border-left: 3px solid var(--line); margin-left: 0; padding: 0 0 0 12px; color: var(--muted); }
+  .md table { width: auto; font-size: 14px; } .md th, .md td { text-align: left; border: 1px solid var(--line); padding: 5px 10px; white-space: normal; }
+  .md hr { border: 0; border-top: 1px solid var(--line); margin: 1em 0; }
+  .md a { color: var(--accent); }
+  .md .katex-display { margin: .6em 0; overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
+  /* composer */
+  .composer { border-top: 1px solid var(--line); padding: 12px 16px 14px; background: var(--card); }
+  .box { border: 1px solid var(--line); border-radius: 14px; background: var(--bg); padding: 8px 10px 8px 14px; transition: border-color .15s; }
+  .box:focus-within { border-color: var(--accent); }
+  .box textarea { border: 0; background: transparent; padding: 6px 0; min-height: 24px; max-height: 220px; resize: none; outline: none; line-height: 1.5; display: block; }
+  .tools { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-top: 6px; }
+  .tools button.ghost { padding: 5px 10px; font-size: 13px; border-radius: 8px; }
+  .tools label { margin: 0; font-size: 12px; }
+  .tools input[type=number] { width: 72px; padding: 4px 6px; font-size: 13px; }
+  #send, #stop { border-radius: 10px; padding: 7px 16px; }
+  #stop { background: var(--fg); color: var(--bg); }
+  .chip { display:inline-flex; align-items:center; gap:6px; font-size:12px; background:var(--chip); padding:3px 8px; border-radius: 10px; }
+  .chip img { height: 26px; border-radius: 4px; }
   .chip a { color: var(--muted); text-decoration:none; cursor:pointer; }
   .rec { color: var(--err); font-weight: 600; }
-  .cursor::after { content: "\258b"; animation: blink 1s steps(1) infinite; color: var(--muted); }
-  @keyframes blink { 50% { opacity: 0; } }
+  .under { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .under .status { margin: 0; min-height: 0; font-size: 12px; }
+  .under details summary { font-size: 12px; }
+  #clog { max-height: 260px; margin-top: 8px; }
   /* flux */
   #fresult img { max-width:100%; height:auto; border-radius:8px; border:1px solid var(--line); display:block; }
   .meta { color:var(--muted); font-size:13px; margin-top:8px; }
@@ -87,29 +130,33 @@
 
   <!-- ===================== chat models ===================== -->
   <section id="chatview" hidden>
-    <div class="card">
-      <div id="conv"><div class="empty" id="empty">Ask something. Answers stream from the board token by token.</div></div>
-      <div class="row">
-        <div style="flex:1 1 100%"><textarea id="input" placeholder="Message (Enter to send, Shift+Enter for a new line)"></textarea></div>
+    <div class="card chat">
+      <div id="conv"><div class="empty" id="empty">Ask something — answers stream from the board token by token.</div></div>
+      <div class="composer">
+        <div class="box">
+          <div id="chips"></div>
+          <textarea id="input" rows="1" placeholder="Message (Enter to send, Shift+Enter for a new line)"></textarea>
+          <div class="tools">
+            <span id="mediatools">
+              <button class="ghost" id="addimg" title="Attach an image">＋ Image</button>
+              <button class="ghost" id="addaud" title="Attach an audio clip (WAV / FLAC / OGG; others need ffmpeg)">＋ Audio</button>
+              <button class="ghost" id="recbtn" title="Record from the microphone">● Record</button>
+            </span>
+            <span style="flex:1"></span>
+            <label for="maxnew">Max tokens</label>
+            <input id="maxnew" type="number" value="256" min="1" max="8192">
+            <button class="ghost" id="clear" title="Start a new conversation">New chat</button>
+            <button id="stop" hidden>■ Stop</button>
+            <button id="send">Send</button>
+          </div>
+        </div>
+        <div class="under">
+          <div id="cstatus" class="status"></div>
+          <details><summary>Run log</summary><pre id="clog"></pre></details>
+        </div>
+        <input type="file" id="imgfile" accept="image/*" hidden>
+        <input type="file" id="audfile" accept="audio/*" hidden>
       </div>
-      <div class="tools">
-        <span id="mediatools">
-          <button class="ghost" id="addimg" title="Attach an image">Image…</button>
-          <button class="ghost" id="addaud" title="Attach an audio clip (WAV / FLAC / OGG; others need ffmpeg)">Audio…</button>
-          <button class="ghost" id="recbtn" title="Record from the microphone">Record</button>
-        </span>
-        <span id="chips"></span>
-        <span style="flex:1"></span>
-        <label for="maxnew" style="margin:0">Max new tokens</label>
-        <input id="maxnew" type="number" value="256" min="1" max="8192" style="width:90px">
-        <button class="ghost" id="clear">New chat</button>
-        <button class="ghost" id="stop" hidden>Stop</button>
-        <button id="send">Send</button>
-      </div>
-      <input type="file" id="imgfile" accept="image/*" hidden>
-      <input type="file" id="audfile" accept="audio/*" hidden>
-      <div id="cstatus" class="status"></div>
-      <details><summary>Run log</summary><pre id="clog"></pre></details>
     </div>
 
     <div class="card" id="cmetrics" hidden>
@@ -231,7 +278,7 @@ $('model').onchange = () => showModel(true);
 // --------------------------------------------------------------- chat
 let conv = [];          // {role, content, attachments, metrics, el}
 let att = { image: null, audio: null };
-let chatTimer = null, chatJob = null, recorder = null;
+let chatJob = null, recorder = null;
 
 function showChatStatic() {
   const m = model(), s = m.static, r = state.resident;
@@ -309,33 +356,103 @@ $('recbtn').onclick = async () => {
   recorder.start();
 };
 function setStatus(t, err) { $('cstatus').className = 'status' + (err ? ' err' : ''); $('cstatus').textContent = t; }
+
+// Markdown + math. marked/DOMPurify/KaTeX come from the CDN; without them the text shows as plain text.
+const PH = (k, i) => `${k}${i}`;
+function renderMath(tex, display) {
+  try { return katex.renderToString(tex, { displayMode: display, throwOnError: false, output: 'html' }); }
+  catch (e) { return esc(tex); }
+}
+function md(text) {
+  if (!(window.marked && window.DOMPurify)) return '<p style="white-space:pre-wrap">' + esc(text) + '</p>';
+  const math = [], code = [];
+  let src = text;
+  if (window.katex) {
+    // Keep code literal, then lift $$..$$, \[..\], \(..\) and $..$ out before Markdown sees them.
+    src = src.replace(/```[\s\S]*?(?:```|$)|`[^`\n]*`/g, m => { code.push(m); return PH('C', code.length - 1); });
+    src = src.replace(/\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]/g, (m, a, b) => { math.push(renderMath(a ?? b, true)); return PH('M', math.length - 1); });
+    src = src.replace(/\\\(([\s\S]+?)\\\)|(^|[^\\$\w])\$([^\s$](?:[^$\n]*?[^\s$])?)\$(?!\w)/g,
+      (m, a, pre, b) => { math.push(renderMath(a ?? b, false)); return (a != null ? '' : pre) + PH('M', math.length - 1); });
+    src = src.replace(/C(\d+)/g, (m, i) => code[i]);
+  }
+  let html = DOMPurify.sanitize(marked.parse(src, { gfm: true, breaks: true }));
+  return html.replace(/M(\d+)/g, (m, i) => math[i]);
+}
+function lastTextHost(el) {          // where the caret goes: the deepest last block
+  let n = el;
+  while (n.lastElementChild && !n.lastElementChild.classList.contains('katex') &&
+         !n.lastElementChild.classList.contains('katex-display') && !['BR', 'IMG', 'HR'].includes(n.lastElementChild.tagName))
+    n = n.lastElementChild;
+  return n;
+}
+
+// Reveals streamed text frame by frame (catching up faster when tokens arrive in bursts)
+// and re-renders the Markdown at most once per frame.
+class Streamer {
+  constructor(el) { this.el = el; this.target = ''; this.shown = 0; this.rendered = -1; this.raf = 0; this.live = true; this.last = 0; }
+  push(t) { this.target += t; this.kick(); }
+  reset(t) { this.target = t; this.shown = Math.min(this.shown, t.length); this.kick(); }
+  finish(t) { if (t != null) this.reset(t); this.live = false; this.kick(); }
+  kick() { if (!this.raf) this.raf = requestAnimationFrame(ts => this.frame(ts)); }
+  frame(ts) {
+    this.raf = 0;
+    const back = this.target.length - this.shown;
+    if (back > 0) {
+      this.shown += Math.max(1, Math.ceil(back / 5));
+      const c = this.target.charCodeAt(this.shown - 1);
+      if (c >= 0xD800 && c <= 0xDBFF && this.shown < this.target.length) this.shown++;   // never split an emoji
+    }
+    const busy = this.shown > 4000 ? 70 : 0;                        // long answers: ~14 renders/s
+    if ((this.shown !== this.rendered || !this.live) && ts - this.last >= busy) { this.render(); this.last = ts; }
+    if (this.shown < this.target.length || this.shown !== this.rendered) this.kick();
+  }
+  render() {
+    const c = $('conv'), stick = c.scrollHeight - c.scrollTop - c.clientHeight < 60;
+    this.el.innerHTML = md(this.target.slice(0, this.shown));
+    if (this.live || this.shown < this.target.length) {
+      const k = document.createElement('span'); k.className = 'caret'; lastTextHost(this.el).appendChild(k);
+    }
+    this.rendered = this.shown;
+    if (stick) c.scrollTop = c.scrollHeight;
+  }
+}
+
+const PHASE = s => !s ? 'Waiting for the board' : s.startsWith('loading') ? s[0].toUpperCase() + s.slice(1)
+  : ({ starting: 'Starting', 'program image': 'Preparing the program image', prefill: 'Prefill',
+       'vision encoder': 'Vision encoder', 'audio encoder': 'Audio encoder',
+       'vision + audio encoders': 'Vision + audio encoders', decode: 'Decoding' }[s] || s);
+
 function newChat() {
-  if (chatTimer) return;
-  conv = []; $('conv').innerHTML = '<div class="empty" id="empty">Ask something. Answers stream from the board token by token.</div>';
+  if (chatJob) return;
+  conv = []; $('conv').innerHTML = '<div class="empty" id="empty">Ask something — answers stream from the board token by token.</div>';
   $('cmetrics').hidden = true; setStatus('');
 }
 $('clear').onclick = newChat;
-function addBubble(m) {
+function addTurn(m) {
   const e = $('empty'); if (e) e.remove();
-  const el = document.createElement('div'); el.className = 'msg ' + m.role;
-  let h = '';
+  const t = document.createElement('div'); t.className = 'turn ' + m.role;
+  const el = document.createElement('div'); el.className = 'msg'; t.appendChild(el);
   if (m.attachments && (m.attachments.image || m.attachments.audio)) {
-    h += '<div class="att">' + (m.attachments.image ? `<img src="${m.attachments.image.url}" alt="">` : '') +
-      (m.attachments.audio ? `<span>♪ ${esc(m.attachments.audio.name)}</span>` : '') + '</div>';
+    el.insertAdjacentHTML('beforeend', '<div class="att">' + (m.attachments.image ? `<img src="${m.attachments.image.url}" alt="">` : '') +
+      (m.attachments.audio ? `<span>♪ ${esc(m.attachments.audio.name)}</span>` : '') + '</div>');
   }
-  el.innerHTML = h + '<div class="body"></div><div class="foot"></div>';
-  el.querySelector('.body').textContent = m.content;
-  if (m.role === 'assistant') el.onclick = () => { if (m.metrics) showMetrics(m); };
-  $('conv').appendChild(el); m.el = el; scrollConv();
-  return el;
+  if (m.role === 'user') el.appendChild(document.createTextNode(m.content));
+  else {
+    el.insertAdjacentHTML('beforeend', '<div class="phase"><span class="dots"><i></i><i></i><i></i></span><span class="ptext">Sending…</span></div><div class="md"></div><div class="foot"></div>');
+    t.onclick = ev => { if (m.metrics && !window.getSelection().toString()) showMetrics(m); };
+  }
+  $('conv').appendChild(t); m.turn = t; m.el = el;
+  $('conv').scrollTop = $('conv').scrollHeight;
 }
-function scrollConv() { const c = $('conv'); c.scrollTop = c.scrollHeight; }
+function autosize() { const t = $('input'); t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 220) + 'px'; }
+$('input').addEventListener('input', autosize);
+
 async function send() {
-  const m = model(); if (!m || m.kind !== 'chat' || chatTimer) return;
+  const m = model(); if (!m || m.kind !== 'chat' || chatJob) return;
   const text = $('input').value.trim();
   if (!text && !att.image && !att.audio) return;
   const user = { role: 'user', content: text, attachments: { image: att.image, audio: att.audio } };
-  conv.push(user); addBubble(user);
+  conv.push(user); addTurn(user);
   const media = !!(att.image || att.audio);
   const history = media ? [{ role: 'user', content: text }] :
     conv.filter(x => !x.failed && !(x.attachments && (x.attachments.image || x.attachments.audio)))
@@ -343,51 +460,93 @@ async function send() {
   const body = { model: m.id, messages: history, max_new_tokens: parseInt($('maxnew').value || '256', 10) };
   if (att.image) body.image = { name: att.image.name, data: att.image.data };
   if (att.audio) body.audio = { name: att.audio.name, data: att.audio.data };
-  $('input').value = ''; att = { image: null, audio: null }; refreshTools();
-  const bot = { role: 'assistant', content: '', model: m.id }; conv.push(bot); addBubble(bot);
-  bot.el.querySelector('.body').classList.add('cursor');
-  $('send').disabled = true; $('stop').hidden = false; setStatus('Submitting…'); $('clog').textContent = '';
-  const r = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  const j = await r.json();
+  $('input').value = ''; autosize(); att = { image: null, audio: null }; refreshTools();
+  const bot = { role: 'assistant', content: '', model: m.id }; conv.push(bot); addTurn(bot);
+  bot.stream = new Streamer(bot.el.querySelector('.md'));
+  $('send').hidden = true; $('stop').hidden = false; setStatus(''); $('clog').textContent = '';
+  chatJob = 'pending';
+  let r, j;
+  try {
+    r = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    j = await r.json();
+  } catch (e) { j = { error: e.message }; r = { ok: false }; }
   if (!r.ok) { finishBot(bot, null, j.error || 'request rejected'); return; }
-  chatJob = j.id; bot.job = j.id; pollChat(bot); chatTimer = setInterval(() => pollChat(bot), 250);
+  chatJob = j.id; bot.job = j.id; follow(bot);
+}
+
+// Live state of the running answer: phase label with its own timer, then the token counter.
+function showLive(bot) {
+  const L = bot.livestate; if (!L) return;
+  const ph = bot.el.querySelector('.phase'), foot = bot.el.querySelector('.foot');
+  const since = (performance.now() - L.at) / 1000;
+  if (L.state === 'queued') { ph.hidden = false; ph.querySelector('.ptext').textContent = `Queued — ${L.position} ahead`; return; }
+  if (!L.tokens) {
+    ph.hidden = false;
+    ph.querySelector('.ptext').textContent = `${PHASE(L.status)} · ${(L.status_s + since).toFixed(1)} s`;
+    return;
+  }
+  ph.hidden = true;
+  const dt = L.decode_s ? L.decode_s + since : 0;
+  foot.innerHTML = `<span><b>${L.tokens}</b> tokens</span>` + (dt > 0.2 ? `<span><b>${(L.tokens / dt).toFixed(1)}</b> tok/s</span>` : '') +
+    (L.ttft_s != null ? `<span>first token after <b>${L.ttft_s.toFixed(2)} s</b></span>` : '');
+}
+function follow(bot) {
+  let es, done = false;
+  const tick = setInterval(() => showLive(bot), 100);
+  const onDelta = d => {
+    if (d.reset) bot.stream.reset(d.text); else if (d.text) bot.stream.push(d.text);
+    bot.livestate = { ...d, at: performance.now() }; showLive(bot);
+  };
+  const onDone = j => {
+    if (done) return; done = true; clearInterval(tick); if (es) es.close();
+    $('clog').textContent = j.log || '';
+    if (j.state === 'done') {
+      bot.metrics = j.metrics; bot.content = j.text;
+      bot.stream.finish(j.text || '');
+      finishBot(bot, j, null);
+    } else finishBot(bot, j, j.state === 'cancelled' ? 'cancelled' : (j.error || 'failed'));
+  };
+  const poll = async () => {                        // fallback when the event stream drops
+    while (!done) {
+      try {
+        const j = await (await fetch('/api/jobs/' + bot.job)).json();
+        const prev = bot.stream.target;
+        onDelta({ ...j, text: j.text.startsWith(prev) ? j.text.slice(prev.length) : j.text, reset: !j.text.startsWith(prev), tokens: bot.livestate ? bot.livestate.tokens : 0, status_s: 0 });
+        if (['done', 'error', 'cancelled'].includes(j.state)) { onDone(j); return; }
+      } catch (e) { /* retry */ }
+      await new Promise(r => setTimeout(r, 400));
+    }
+  };
+  if (window.EventSource) {
+    es = new EventSource(`/api/jobs/${bot.job}/stream`);
+    es.addEventListener('delta', e => onDelta(JSON.parse(e.data)));
+    es.addEventListener('done', e => onDone(JSON.parse(e.data)));
+    es.onerror = () => { if (!done) { es.close(); poll(); } };
+  } else poll();
 }
 function finishBot(bot, j, err) {
-  clearInterval(chatTimer); chatTimer = null; chatJob = null;
-  $('send').disabled = false; $('stop').hidden = true;
-  const b = bot.el.querySelector('.body'); b.classList.remove('cursor');
+  chatJob = null; $('send').hidden = false; $('stop').hidden = true;
+  bot.el.querySelector('.phase').hidden = true;
+  const foot = bot.el.querySelector('.foot');
   if (err) {
     bot.failed = true; conv[conv.indexOf(bot) - 1].failed = true;
-    bot.el.classList.add('err'); b.textContent = (bot.content ? bot.content + '\n\n' : '') + 'Error: ' + err; setStatus('Failed: ' + err, true);
+    bot.el.classList.add('err'); bot.stream.finish((bot.stream.target ? bot.stream.target + '\n\n' : '') + '**Error:** ' + err);
+    foot.textContent = ''; setStatus('Failed: ' + err, true);
+  } else {
+    const mm = j.metrics || {};
+    const dec = mm.phases ? mm.phases.find(p => p.name === 'Decode') : null;
+    foot.innerHTML = `<span><b>${mm.generated_tokens}</b> tokens</span>` +
+      `<span>TTFT <b>${sec(mm.ttft_hw_s)}</b> on the engines</span>` +
+      `<span><b>${num(mm.decode_hw_tok_s)}</b> tok/s decode</span>` +
+      (dec && dec.gflops ? `<span><b>${dec.gflops.toFixed(0)}</b> GFLOPS</span>` : '') +
+      (mm.stopped ? '<span>stopped</span>' : '') + '<a>details ↓</a>';
+    setStatus(mm.history_dropped ? `${mm.history_dropped} earlier turn(s) dropped to fit the prompt window.` : '');
+    showMetrics(bot);
   }
   loadModels();
 }
-async function pollChat(bot) {
-  let j;
-  try { j = await (await fetch('/api/jobs/' + bot.job)).json(); } catch (e) { return; }
-  $('clog').textContent = j.log || '';
-  if (j.text !== bot.content) { bot.content = j.text; bot.el.querySelector('.body').textContent = j.text; scrollConv(); }
-  if (j.state === 'queued') setStatus(`Queued (${j.position} ahead)…`);
-  else if (j.state === 'running') {
-    setStatus(`${j.status ? j.status[0].toUpperCase() + j.status.slice(1) : 'Running'}… ${j.elapsed.toFixed(0)} s` +
-      (j.ttft_s != null ? ` · first token after ${j.ttft_s.toFixed(1)} s` : ''));
-    if (j.status && j.status.startsWith('loading')) showBoard();
-  } else if (j.state === 'done') {
-    bot.metrics = j.metrics; bot.content = j.text;
-    bot.el.querySelector('.body').textContent = j.text || '(empty answer)';
-    finishBot(bot, j, null);
-    const mm = j.metrics || {};
-    const dec = mm.phases ? mm.phases.find(p => p.name === 'Decode') : null;
-    bot.el.querySelector('.foot').textContent =
-      `${mm.generated_tokens} tokens · TTFT ${sec(mm.ttft_hw_s)} on the engines · ` +
-      `${num(mm.decode_hw_tok_s)} tok/s decode` + (dec && dec.gflops ? ` · ${dec.gflops.toFixed(0)} GFLOPS` : '') +
-      (mm.stopped ? ' · stopped' : '') + ' — click for details';
-    setStatus(`Done in ${j.elapsed.toFixed(1)} s.` + (mm.history_dropped ? ` ${mm.history_dropped} earlier turn(s) dropped to fit the prompt window.` : ''));
-    showMetrics(bot);
-  } else finishBot(bot, j, j.state === 'cancelled' ? 'cancelled' : (j.error || 'failed'));
-}
 function showMetrics(bot) {
-  for (const x of conv) if (x.el) x.el.classList.toggle('sel', x === bot);
+  for (const x of conv) if (x.turn) x.turn.classList.toggle('sel', x === bot);
   const mm = bot.metrics; if (!mm) return;
   const info = mm.resident || {}, title = (models.find(m => m.id === bot.model) || {}).title || bot.model;
   $('cmtitle').textContent = `Run on the board — ${title}, ${info.engines || '?'} engines`;
@@ -422,7 +581,7 @@ function showMetrics(bot) {
   $('cmetrics').hidden = false;
 }
 $('send').onclick = send;
-$('stop').onclick = () => { if (chatJob) fetch(`/api/jobs/${chatJob}/stop`, { method: 'POST' }); };
+$('stop').onclick = () => { if (chatJob && chatJob !== 'pending') fetch(`/api/jobs/${chatJob}/stop`, { method: 'POST' }); };
 $('input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
 
 // --------------------------------------------------------------- FLUX.2 klein (as flux2_klein_4b_server.py)
@@ -524,7 +683,7 @@ $('go').onclick = async () => {
 };
 
 loadModels();
-setInterval(() => { if (!chatTimer && !ftimer) loadModels(); }, 10000);
+setInterval(() => { if (!chatJob && !ftimer) loadModels(); }, 10000);
 </script>
 </body>
 </html>

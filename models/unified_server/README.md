@@ -12,14 +12,13 @@ One web page for the models that run on the board, picked from a dropdown:
 ```bash
 # from the repo root
 ~/flux_env/bin/python models/unified_server/unified_server.py --port 8080
-~/flux_env/bin/python models/unified_server/unified_server.py --host 0.0.0.0 --port 8080 --engines 8 --cpus 0,2-23
+~/flux_env/bin/python models/unified_server/unified_server.py --host 0.0.0.0 --port 8080 --engines 8
 ```
 
 | Flag | Default | Notes |
 |---|---|---|
 | `--engines` | 8 | engines for the chat models (FLUX uses each compiled config's own count) |
 | `--dev` | xdma0 | DMA device |
-| `--cpus` | — | pin every runner with `taskset -c` |
 | `--python` | this interpreter | interpreter for the runners |
 | `--no-reload` | off | FLUX: tick "keep the board loaded" by default |
 
@@ -34,8 +33,12 @@ order, and at most one process holds the device:
   once. Picking another model, a FLUX image, or "release the board" stops it.
   The worker speaks JSON lines on a private stdout (`ready`, `token`, `status`,
   `result`, `error`); everything the model code prints goes to stderr, which
-  the page shows as the run log. Tokens stream to the page as they decode, and
-  Stop ends the generation after the current token.
+  the page shows as the run log. Tokens are pushed to the page as server-sent
+  events (`/api/jobs/<id>/stream`, polling as a fallback), revealed frame by
+  frame and rendered as Markdown with math (marked, DOMPurify and KaTeX,
+  fetched once from the CDN and served from `/vendor/`, so the browser needs
+  no internet access; without them answers show as plain text). Stop ends the
+  generation after the current token.
 - **FLUX.2 klein** runs exactly as in `flux2_klein_4b_server.py` (its module is
   imported): one `flux2_klein_4b_run_from_bin.py` process per image, or its
   resident `--serve` runner with "keep the board loaded".
@@ -80,6 +83,7 @@ as its own server.
 | POST | `/api/chat` | `{model, messages:[{role, content}], image?:{name, data(base64)}, audio?:{...}, max_new_tokens}` → `{id}` |
 | POST | `/api/generate` | FLUX: `{prompt, config, seed, no_reload}` → `{id}` |
 | GET | `/api/jobs/<id>` | state, streamed `text`, `metrics` (chat) or `result` (FLUX), log |
+| GET | `/api/jobs/<id>/stream` | chat: server-sent `delta` events (new text, phase, token count), then `done` with the job |
 | POST | `/api/jobs/<id>/stop` | stop a chat generation |
 | GET | `/api/jobs/<id>/image.png` | FLUX image |
 | POST | `/api/release` | stop the resident process, free the board |
