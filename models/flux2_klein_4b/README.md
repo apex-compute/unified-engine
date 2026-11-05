@@ -14,7 +14,7 @@ three phases and writes the PNG.
 | `flux2_klein_4b_server.py` | Minimal web UI (standard library only): prompt box, resolution picker over the compiled program sets, seed; runs `flux2_klein_4b_run_from_bin.py` one job at a time and shows the PNG. Selecting a configuration shows its weight images, program sizes and FLOPs per phase; a finished run shows every phase's on-device GFLOPS and share of the raw peak (128 FLOP/cycle/engine at the HW_INFO clock). "Keep the board loaded" (checkbox; `--no-reload` ticks it by default) drives one resident `--serve` runner that keeps the device, the host state and the program set between runs. |
 | `flux2_klein_4b_vae.py` | Phase 3: planner + emitter of the VAE decoder as one sharded program (convs straight from the padded maps with the walker's weight reuse, or 3x3 convs as nine accumulated row-block matmuls on older images, 1x1 convs as matmuls, on-device GroupNorm statistics, SiLU, residual add, upsample, mid-block attention), plus its IF8 host oracle with per-op intermediates. |
 | `flux2_klein_4b_vae_probe.py` | On-board bring-up of the VAE phase: compiles any prefix of the decoder graph and scores the last op against the host intermediate. |
-| `flux2_klein_4b_weights.py` | Checkpoint -> `params_te.bin` (IF4 Qwen3), `params_dit.bin` (IF4 DiT), `vae_weights.pt` (IF8 convs); shape-only layout planner the compiler addresses from. |
+| `flux2_klein_4b_weights.py` | Checkpoint -> `params_te.bin` (IF4 Qwen3), `params_dit.bin` (IF4 DiT), `vae_weights.pt` (every conv as IF8 codes AND the checkpoint's BF16 weights); shape-only layout planner the compiler addresses from. |
 | `flux2_klein_4b_ref.py` | Plain-torch reference of the whole pipeline (bit-identical to diffusers in fp32); IF4 / IF8 fake-quant helpers. |
 | `flux2_klein_4b_compare_diffusers.py` | Reference vs the official diffusers pipeline (needs a GPU). |
 | `flux2_klein_4b_quant_report.py` | BF16 vs IF4 quality (prompt-embedding SNR, latent SNR, image PSNR). |
@@ -140,11 +140,19 @@ an ADD_BROADCAST. Each step then:
 levels of three resnets with nearest-2x upsample convs, GroupNorm/SiLU/conv_out)
 as ONE program: 89 ops emitted into every engine's stream as the third phase
 of the program set, with the scheduler's flag barriers between them. The host
-DMAs the latent map and the constant image (unrepeated IF8 weight blocks,
-matmul operands of the 1x1 convs, GroupNorm affine rows, identity / ones /
-group-average matrices) in before the phase and reads the image out after it;
+DMAs the latent map and the constant image (one weight pattern per conv and OC
+chunk, matmul operands of the 1x1 convs, GroupNorm affine rows, identity / ones
+/ group-average matrices) in before the phase and reads the image out after it;
 nothing moves between host and board while it runs. Every map lives in DRAM
-channels-in-lanes with a one-pixel zero border kept by its producer. Convs
+channels-in-lanes with a one-pixel zero border kept by its producer. The conv
+weights are the checkpoint's own BF16 values (`quantization.vae_precision =
+"bf16"`): native 16-bit patterns on the walker (FLOAT16 launches, no scales,
+128 B per block, a 4096-block pattern limit that halves the OC chunk of the
+512- and 256-channel convs) and unquantized B operands on the 1x1 matmuls, so
+the host oracle equals the fp32 decoder (116 dB) where the IF8 one sat at
+40 dB SNR / 55.8 dB image PSNR, at the same decode time (2.28 s vs 2.27 s at
+256x256). `"if8"` keeps the per-(oc, tap, 64-block) codes for images without
+weight reuse; `vae_weights.pt` carries both forms. Convs
 keep the layer driver's tile grid, planned with the largest URAM_A window
 region that still leaves every engine a tile (2.4x fewer launches than the
 default split); each tile is one strided DRAM->URAM read of its window

@@ -367,7 +367,7 @@ def vae_conv_names(cfg: dict) -> list[tuple[str, str, int]]:
 
 def build_vae_weights(snap: str, cfg: dict, out_path: str) -> dict:
     state = ref.load_safetensors_dir(os.path.join(snap, "vae"))
-    out = {"convs": {}, "norms": {}, "bn": {}, "precision": "if8"}
+    out = {"convs": {}, "norms": {}, "bn": {}, "precision": "if8+bf16"}      # both forms; the config picks
     worst = ("", 0.0)
     for key, kind, pad in vae_conv_names(cfg):
         w = state[key + ".weight"]
@@ -375,6 +375,7 @@ def build_vae_weights(snap: str, cfg: dict, out_path: str) -> dict:
             w = w[:, :, None, None]
         codes, scales, rel = quantize_conv_if8(w)
         out["convs"][key] = {"codes": codes, "block_scales": scales,
+                             "weight": w.to(torch.bfloat16).contiguous(),        # exact: the checkpoint is BF16
                              "bias": state[key + ".bias"].to(torch.bfloat16).contiguous(),
                              "pad": pad, "kind": kind, "rel_err": rel}
         if rel > worst[1]:
@@ -389,7 +390,7 @@ def build_vae_weights(snap: str, cfg: dict, out_path: str) -> dict:
                  "running_var": state["bn.running_var"].to(torch.bfloat16).contiguous()}
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     torch.save(out, out_path)
-    print(f"[weights] VAE decoder: {len(out['convs'])} convs (IF8), {len(out['norms'])} GroupNorms -> {out_path}; "
+    print(f"[weights] VAE decoder: {len(out['convs'])} convs (IF8 codes + BF16 weights), {len(out['norms'])} GroupNorms -> {out_path}; "
           f"worst conv rel err {worst[1]:.4f} ({worst[0]})")
     return out
 

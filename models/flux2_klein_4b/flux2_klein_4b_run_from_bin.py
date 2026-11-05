@@ -236,7 +236,8 @@ def main(argv=None) -> int:
         from flux2_klein_4b_vae import reference_decode
         oracle = reference_decode(session.vae_w, cfg, aux["latent"][0])[None]
         result["vae_psnr_db"] = T.psnr_u8(ref.to_uint8_image(oracle), aux["image"])
-        _log(f"  FPGA decoder vs IF8 host oracle: image PSNR {result['vae_psnr_db']:.1f} dB")
+        _log(f"  FPGA decoder vs the host oracle ({cfg['quantization'].get('vae_precision', 'if8')} weights): "
+             f"image PSNR {result['vae_psnr_db']:.1f} dB")
     if args.reference:
         ue = aux["ue"]
         rr = T.quantized_reference(cfg, geo, session.snap, args.prompt, args.seed, args.ref_device)
