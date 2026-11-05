@@ -54,7 +54,10 @@ UPLOAD_DIR = os.path.join(OUT_DIR, "uploads")
 MAX_PROMPT_CHARS = 8000
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 AUDIO_NATIVE = (".wav", ".flac", ".ogg")               # what soundfile reads; others go through ffmpeg
-IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif")
+# Upload extensions: the saved file's suffix comes from these tables, never
+# from the client's string (the name only selects an entry).
+IMAGE_EXT = {e: e for e in (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif")}
+AUDIO_EXT = {e: e for e in AUDIO_NATIVE + (".mp3", ".m4a", ".webm", ".aac", ".opus", ".mp4")}
 
 sys.path.insert(0, os.path.join(MODELS_DIR, "flux2_klein_4b"))
 import flux2_klein_4b_server as flux  # noqa: E402  (FLUX.2 configs, runner and job)
@@ -427,12 +430,10 @@ def save_upload(obj, kind: str, job_tag: str) -> tuple[str, str]:
         raise ValueError(f"empty {kind}")
     if len(raw) > MAX_UPLOAD_BYTES:
         raise ValueError(f"{kind} larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
-    ext = os.path.splitext(name)[1].lower()
-    if kind == "image":
-        if ext not in IMAGE_EXT:
-            ext = ".png"
-    elif ext not in AUDIO_NATIVE + (".mp3", ".m4a", ".webm", ".aac", ".opus", ".mp4"):
-        ext = ".wav"
+    asked = os.path.splitext(name)[1].lower()
+    ext = IMAGE_EXT.get(asked, ".png") if kind == "image" else AUDIO_EXT.get(asked, ".wav")
+    if kind not in ("image", "audio") or not job_tag.isalnum():
+        raise ValueError("bad upload")
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     path = os.path.join(UPLOAD_DIR, f"{job_tag}_{kind}{ext}")
     with open(path, "wb") as f:
@@ -472,7 +473,10 @@ def vendor_file(rel: str) -> tuple[bytes, str] | None:
     if (".." in rel.split("/") or ext not in VENDOR_TYPES
             or not any(rel == a or (a.endswith("/") and rel.startswith(a)) for a in VENDOR_ALLOWED)):
         return None
-    path = os.path.join(VENDOR_DIR, *rel.split("/"))
+    root = os.path.realpath(VENDOR_DIR)
+    path = os.path.realpath(os.path.join(root, *rel.split("/")))
+    if not path.startswith(root + os.sep):
+        return None
     with _vendor_lock:
         if not os.path.exists(path):
             import urllib.request
