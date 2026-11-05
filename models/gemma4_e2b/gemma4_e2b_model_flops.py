@@ -135,6 +135,47 @@ def vision_flops(num_patches: int, soft_tokens: int, text_hidden: int = 1536) ->
     return sum(vision_flops_by_phase(num_patches, soft_tokens, text_hidden).values())
 
 
+def audio_flops_by_phase(audio_cfg: dict, mel_frames: int, out_dim: int,
+                         n_mels: int = 128) -> dict[str, int]:
+    """One clip through the audio encoder, by phase (HF Gemma4AudioModel).
+
+    ``audio_cfg`` is the checkpoint's ``audio_config``; ``mel_frames`` the
+    log-mel frames in; ``out_dim`` the LM hidden the embedder projects to.
+    Subsampling is two stride-2 3x3 convs (1 -> c0 -> c1 channels) and a
+    Linear over the flattened (c1 x freq) features; the 12 Conformer layers
+    run at T = the subsampled frame count with block-local attention (each
+    chunk of queries sees ``chunk + left - 1 + right`` keys) plus the
+    relative-position term against ``left + right`` positions. The depthwise
+    conv1d is elementwise work and excluded, as are norms and activations.
+    """
+    H = int(audio_cfg["hidden_size"])
+    NH = int(audio_cfg["num_attention_heads"])
+    HD = H // NH
+    FF = 4 * H
+    layers = int(audio_cfg["num_hidden_layers"])
+    c0, c1 = (int(c) for c in audio_cfg["subsampling_conv_channels"])
+    chunk = int(audio_cfg["attention_chunk_size"])
+    left, right = int(audio_cfg["attention_context_left"]), int(audio_cfg["attention_context_right"])
+    ctx, positions = chunk + left - 1 + right, left + right
+    proj = int(audio_cfg["output_proj_dims"])
+
+    def _out(n: int) -> int:                  # stride 2, kernel 3, padding 1
+        return (n + 2 - 3) // 2 + 1
+    h0, w0 = _out(mel_frames), _out(n_mels)
+    T, w1 = _out(h0), _out(w0)
+    subsample = gemm(h0 * w0, 9, c0) + gemm(T * w1, 9 * c0, c1) + gemm(T, c1 * w1, H)
+    ffn = 2 * (gemm(T, H, FF) + gemm(T, FF, H))                  # the two macaron halves
+    attn = (4 * gemm(T, H, H) + gemm(positions, H, H)            # q/k/v/o, rel-pos keys
+            + NH * (gemm(T, HD, ctx) + gemm(T, HD, positions) + gemm(T, ctx, HD)))
+    conv = gemm(T, H, 2 * H) + gemm(T, H, H)                     # linear_start (GLU), linear_end
+    return {"subsample": subsample, "ffn": layers * ffn, "attention": layers * attn,
+            "conv": layers * conv, "embed": gemm(T, H, proj) + gemm(T, proj, out_dim)}
+
+
+def audio_flops(audio_cfg: dict, mel_frames: int, out_dim: int, n_mels: int = 128) -> int:
+    return sum(audio_flops_by_phase(audio_cfg, mel_frames, out_dim, n_mels).values())
+
+
 def _layer_dims(cfg: dict, layer_idx: int) -> tuple[int, int, int]:
     """(head_dim, query_width, kv_width) for one layer -- mirrors
     _get_layer_attention_dims in gemma4_e2b_lm.py exactly."""

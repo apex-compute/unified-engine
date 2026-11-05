@@ -38,7 +38,7 @@ AUDIO_ISA_BASE = 0x98000000        # legacy model map only; see _audio_isa_base(
 # Under the tiled map the audio program gets its own shared-pool allocation of
 # this size (the legacy map's audio ISA region was 96 MiB).
 AUDIO_ISA_BYTES = 96 << 20
-AUDIO_PROGRAM_VERSION = 7
+AUDIO_PROGRAM_VERSION = 10
 
 
 def build_audio_weight_section(hf_model, parallel_quantize) -> tuple[bytes, dict]:
@@ -196,8 +196,183 @@ def build_audio_weight_section(hf_model, parallel_quantize) -> tuple[bytes, dict
     print(f"  Audio section: {cur/1024**2:.1f} MiB, {len(section_meta)} tensors")
     return bytes(out), manifest
 
+class _AudShard:
+    """One engine's row block of the audio encoder's per-frame (row-wise) ops.
+
+    Every op here reads and writes only rows ``[row0, row0 + rows)`` of its
+    [L_pad, N] buffers, so the encoder's frames can be split across engines
+    with no data exchanged between them. ``ue`` is engine 0 (the model) or a
+    worker; ``m_reg`` is that engine's row-count GPR. With one engine the
+    shard is all L_pad rows on the model itself.
+    """
+
+    def __init__(self, model, ue, row0: int, rows: int, m_reg: int):
+        self.m, self.ue, self.row0, self.rows, self.m_reg = model, ue, row0, rows, m_reg
+
+    def r(self, base: int, n: int) -> int:
+        """This shard's first row of a [L_pad, n] bf16 buffer."""
+        return base + self.row0 * n * 2
+
+    def _op(self, emit) -> None:
+        # Fresh PBI pointer allocator per op (15 slots), as _emit_audio_core
+        # does on engine 0; engine 0 also resets its scratch ISA registers.
+        if self.ue is self.m:
+            self.m._isa_reg_counter = self.m._isa_reg_base
+        self.ue.reset_inst_ptr_counter()
+        emit()
+
+    def _m(self, M: int) -> int:
+        self.ue.generate_instruction_add_set(self.m_reg, M)
+        return self.m_reg
+
+    def copy(self, src: int, dst: int, n: int) -> None:
+        self._op(lambda: _aud_copy_chunked(self.ue, self.r(src, n), self.r(dst, n),
+                                           self.rows * n, row_n=n))
+
+    def norm(self, src: int, dst: int, gamma: int, n: int) -> None:
+        self._op(lambda: self.ue.rms_norm_core_dram(
+            M=self.rows, N=n, A_DRAM_ADDR=self.r(src, n), OUTPUT_DRAM_ADDR=self.r(dst, n),
+            GAMMA_DRAM_ADDR=gamma, gpr_M_reg=self._m(self.rows)))
+
+    def clip(self, buf: int, n: int, lo: float, hi: float) -> None:
+        M = self.rows * n // UE_VECTOR_SIZE
+        self._op(lambda: self.ue.matmat_mul_core(
+            M=M, K=UE_VECTOR_SIZE, N=UE_VECTOR_SIZE,
+            A_DRAM_ADDR=self.r(buf, n), B_DRAM_ADDR=self.m.AUD_IDENTITY_64,
+            OUTPUT_DRAM_ADDR=self.r(buf, n), is_B_quantized=False,
+            clamp_enable=True, clamp_min=lo, clamp_max=hi, gpr_M_reg=self._m(M)))
+
+    def linear(self, src: int, k: int, dst: int, n: int, w: dict) -> None:
+        """IF4 Linear [rows, k] -> [rows, n]."""
+        self._op(lambda: self.ue.matmat_mul_core(
+            M=self.rows, K=k, N=n, A_DRAM_ADDR=self.r(src, k), B_DRAM_ADDR=w["data"],
+            OUTPUT_DRAM_ADDR=self.r(dst, n), is_B_quantized=True, data_type=TYPE.IF4,
+            SCALE_DRAM_ADDR=w["scale"], gpr_M_reg=self._m(self.rows)))
+
+    def clipped_linear(self, src: int, k: int, dst: int, n: int, w: dict, cr: dict) -> None:
+        self.clip(src, k, cr["in_min"], cr["in_max"])
+        self.linear(src, k, dst, n, w)
+        self.clip(dst, n, cr["out_min"], cr["out_max"])
+
+    def silu(self, src: int, dst: int, n: int) -> None:
+        self._op(lambda: _aud_silu(self.ue, self.rows, n, self.r(src, n), self.r(dst, n),
+                                   self.m.AUD_IDENTITY_64))
+
+    def glu(self, gate: int, value: int, out: int, n: int) -> None:
+        self._op(lambda: _aud_glu(self.ue, self.rows, n, self.r(gate, n), self.r(value, n),
+                                  self.r(out, n), self.m.AUD_IDENTITY_64))
+
+    def half_step(self, residual: int, ff: int, out: int, n: int) -> None:
+        self._op(lambda: _aud_half_step(self.ue, self.rows, n, self.r(residual, n),
+                                        self.r(ff, n), self.r(out, n)))
+
+    def add(self, a: int, b: int, out: int, n: int) -> None:
+        self._op(lambda: _aud_eltwise_add(self.ue, self.rows, n, self.r(a, n), self.r(b, n),
+                                          self.r(out, n)))
+
+    def split_halves(self, src_2n: int, dst_a: int, dst_b: int, n: int) -> None:
+        """[rows, 2n] -> [rows, n] first half and [rows, n] second half."""
+        def emit():
+            for half, dst in ((0, dst_a), (1, dst_b)):
+                self.ue.accelerator_memory_to_sram(
+                    accelerator_dram_address=self.r(src_2n, 2 * n) + half * n * 2,
+                    sram_address=0x00000, element_size=self.rows * n,
+                    stride_bytes_per_chunk=n * 2, stride_jump_bytes=2 * n * 2)
+                self.ue.sram_to_accelerator_memory(0x00000, self.r(dst, n), self.rows * n)
+        self._op(emit)
+
+    def scale_rows(self, buf: int, tile: int | None, scalar: float | None, n: int) -> None:
+        """buf *= tile (a [L_pad, n] buffer) or buf *= scalar, in URAM-sized row chunks."""
+        from audio_primitives import URAM_A_BASE, URAM_B_BASE, _row_chunk
+
+        def emit():
+            chunk = _row_chunk(self.rows, n, divisor=2 if tile is not None else 1)
+            for m0 in range(0, self.rows, chunk):
+                take = min(chunk, self.rows - m0)
+                e, off = take * n, m0 * n * 2
+                self.ue.accelerator_memory_to_sram(self.r(buf, n) + off, URAM_A_BASE, e)
+                if tile is not None:
+                    self.ue.accelerator_memory_to_sram(self.r(tile, n) + off, URAM_B_BASE, e)
+                    self.ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE,
+                                             vector_B_sram_start_addr=URAM_B_BASE,
+                                             vector_C_sram_wb_addr=URAM_A_BASE, element_size=e)
+                else:
+                    self.ue.broadcast_mul(scalar=scalar, sram_start_addr=URAM_A_BASE,
+                                          sram_wb_addr=URAM_A_BASE, element_size=e)
+                self.ue.sram_to_accelerator_memory(URAM_A_BASE, self.r(buf, n) + off, e)
+        self._op(emit)
+
+
 class Gemma4AudioMixin:
     """Production-only audio methods for ``Gemma4_UnifiedEngine``."""
+
+    # ------------------------------------------------------------------
+    # Multi-engine encoder. The conformer's per-frame ops (norms, clips, every
+    # Linear, SiLU/GLU, residuals, Q/K scaling) are queued as row-wise steps
+    # and emitted as one region over the engines' row blocks; only the two
+    # steps that mix frames -- the chunked rel-pos attention and the depthwise
+    # conv -- run on engine 0 between regions. Consecutive row-wise steps share
+    # a region (no engine reads another's rows), so a layer costs three joins.
+    # ------------------------------------------------------------------
+    def _aud_row_step(self, body) -> None:
+        """Queue ``body(shard)``: a per-frame step (see _AudShard)."""
+        if not hasattr(self, "_aud_pending"):
+            self._aud_pending = []
+        self._aud_pending.append(body)
+
+    def _aud_serial(self, emit) -> None:
+        """Run ``emit()`` on engine 0 alone, after every queued row-wise step."""
+        self._aud_flush()
+        self._emit_audio_core(emit)
+
+    def _aud_flush(self) -> None:
+        steps, self._aud_pending = getattr(self, "_aud_pending", []), []
+        if not steps:
+            return
+        sched = getattr(self, "_aud_sched", None)
+        if sched is None:
+            shard = _AudShard(self, self, 0, self._aud_L_pad, self.gpr_seq_len)
+            for step in steps:
+                step(shard)
+            return
+
+        def region(ctx):
+            shard = _AudShard(self, ctx.unsafe_ue, ctx.row_offset, ctx.rows,
+                              self._aud_m_regs[ctx.engine_idx])
+            for step in steps:
+                step(shard)
+        sched.sharded_region(self._aud_L_pad, region)
+
+    def _aud_mreg(self, engine_idx: int) -> int:
+        """Engine ``engine_idx``'s row-count GPR in the open audio capture."""
+        return (self._aud_m_regs[engine_idx] if getattr(self, "_aud_sched", None) is not None
+                else self.gpr_seq_len)
+
+    def _aud_op(self, ue, emit) -> None:
+        """One op on ``ue`` with fresh per-op PBI allocators (see _AudShard._op)."""
+        if ue is self:
+            self._isa_reg_counter = self._isa_reg_base
+        ue.reset_inst_ptr_counter()
+        emit()
+
+    def _aud_split(self, M: int, body) -> None:
+        """Run ``body(ue, first, count, engine_idx)`` over ``M`` units (heads,
+        blocks) split across the engines, after the queued row-wise steps."""
+        self._aud_flush()
+        sched = getattr(self, "_aud_sched", None)
+        if sched is None:
+            self._emit_audio_core(lambda: body(self, 0, M, 0))
+            return
+
+        def region(ctx):
+            if ctx.rows <= 0:
+                return
+            ue = ctx.unsafe_ue
+            if ue is self:
+                self._isa_reg_counter = self._isa_reg_base
+            ue.reset_inst_ptr_counter()
+            body(ue, ctx.row_offset, ctx.rows, ctx.engine_idx)
+        sched.sharded_region(M, region)
 
     def _emit_audio_core(self, emit) -> None:
         """Reset per-core PBI allocators, then emit into the open capture."""
@@ -493,26 +668,12 @@ class Gemma4AudioMixin:
         # as AUD_FFN_MID (L_pad × FF).
         self.AUD_SILU_OUT = self.allocate_tensor_dram(L_pad * FF * bpe)
 
-        # Identity matrices for SiLU/GLU sigmoid-via-matmul. We need TWO
-        # because matmat reads B with row stride = N (the matmul output dim).
-        # If we passed an FFxFF identity to a 1024x1024 matmul, the row stride
-        # mismatch would corrupt the result. Allocate one per N value used:
-        #   AUD_IDENTITY_FF: 4096x4096 — used by FFN1/FFN2 SiLU
-        #   AUD_IDENTITY_H : 1024x1024 — used by conv module SiLU and GLU
-        self.AUD_IDENTITY_FF = self.allocate_tensor_dram(FF * FF * bpe)
-        self.dma_to_accelerator_memory(self.AUD_IDENTITY_FF,
-            torch.eye(FF, dtype=torch.bfloat16).contiguous())
-        self.AUD_IDENTITY_H = self.allocate_tensor_dram(H * H * bpe)
-        self.dma_to_accelerator_memory(self.AUD_IDENTITY_H,
-            torch.eye(H, dtype=torch.bfloat16).contiguous())
-        # 64×64 identity for FPGA standalone clamp via matmul-w/-identity
-        # trick (see _emit_clamp_dram_to_dram). Required to replace
-        # _host_clip_dram with a pure-FPGA op (Phase 1).
+        # 64×64 identity for the element-wise ops that ride the matmul
+        # writeback: clamp (clip), and sigmoid for SiLU / GLU over the (n/64, 64)
+        # view of a tensor (audio_primitives._sigmoid_inplace).
         self.AUD_IDENTITY_64 = self.allocate_tensor_dram(VS * VS * bpe)
         self.dma_to_accelerator_memory(self.AUD_IDENTITY_64,
             torch.eye(VS, dtype=torch.bfloat16).contiguous())
-        # Alias used by the compare script's audio FFN1 verification path.
-        self.AUD_IDENTITY = self.AUD_IDENTITY_FF
 
         # Attention scratch buffers (small)
         HD = self.AUD_HEAD_DIM
@@ -764,6 +925,27 @@ class Gemma4AudioMixin:
         self.dma_to_accelerator_memory(self.AUD_ZEROS_CHUNK_HD,
             torch.zeros(chunk_pad * HD, dtype=torch.bfloat16).contiguous())
 
+        # Depthwise conv1d: its input copy, shifted copy and product, each
+        # (L_pad, H). Dedicated so that, split over engines, no step fused into
+        # the same region (FFN2's FF-wide FFN_MID / SILU_OUT) aliases them.
+        self.AUD_DW_X = self.allocate_tensor_dram(L_pad * H * bpe)
+        self.AUD_DW_SHIFT = self.allocate_tensor_dram(L_pad * H * bpe)
+        self.AUD_DW_SCRATCH = self.allocate_tensor_dram(L_pad * H * bpe)
+
+        # The attention chain's single-(block, head) scratch tiles, one per
+        # engine (index 0 is the original buffer): the head- and block-split
+        # regions run one head / block range per engine concurrently.
+        engines = max(int(getattr(self, "multi_core", 1)), 1)
+        self._aud_scratch = {"q_block": [self.AUD_Q_HEAD_BLOCK], "v_block": [self.AUD_V_BLOCK_HEAD],
+                             "q_full": [self.AUD_Q_HEAD_FULL], "out_bh": [self.AUD_ATTN_OUT_BH]}
+        sizes = {"q_block": chunk_pad * HD, "v_block": ctx_pad * HD,
+                 "q_full": T_pad_padded * HD, "out_bh": chunk_pad * HD}
+        for _ in range(1, engines):
+            for name, n in sizes.items():
+                addr = self.allocate_tensor_dram(n * bpe)
+                self.dma_to_accelerator_memory(addr, torch.zeros(n, dtype=torch.bfloat16))
+                self._aud_scratch[name].append(addr)
+
         print(f"[Audio] tensor DRAM usage: {self.get_tensor_dram_usage()/(1024*1024):.1f} MB")
 
     def audio_subsample_fpga(self,
@@ -872,6 +1054,19 @@ class Gemma4AudioMixin:
         # for the N0_pad-N0 padding positions consumed by conv0.
         self.dma_to_accelerator_memory(self.AUD_SUB_R_COMBINED,
             torch.zeros(H0_pad * K_g_s0, dtype=torch.bfloat16))
+
+        if getattr(self, "_oneshot_mode", False):
+            # The encoder program: the same ops, split over the engines by
+            # output time row (see _emit_aud_subsample_split). Stage 1's
+            # im2col skips out-of-bounds taps, so its patches start zeroed.
+            self.dma_to_accelerator_memory(self.AUD_SUB_PATCHES1,
+                torch.zeros(N1_pad * 1152, dtype=torch.bfloat16))
+            if self.capture_buffer is not None:
+                # run_audio_fpga calls this with no capture just for the uploads
+                # above; emitting the ops there would only be discarded (and the
+                # row-by-row LayerNorm alone costs ~0.6 s of host time).
+                self._emit_aud_subsample_split(T_raw, H0, W0, H1, W1, N1_pad)
+            return None, (mask[:, ::4] if mask is not None else None)
 
         # Emit the im2col segment (3 strided DMA gathers + 1 matmul).
         self._compile_and_run_single("aud_sub_im2col_s0",
@@ -1014,7 +1209,82 @@ class Gemma4AudioMixin:
             self.AUD_SUB_OUT0, (H1_pad, 1024)).cpu()[:H1].to(torch.bfloat16).unsqueeze(0)
         return hidden, mask_s2
 
-    def _emit_aud_sub_im2col_s0(self, T_raw: int, H0: int, H0_pad: int) -> None:
+    def _emit_aud_subsample_split(self, T_raw: int, H0: int, W0: int, H1: int, W1: int,
+                                  N1_pad: int) -> None:
+        """Gemma4AudioSubSampleConvProjection in the encoder program, split by
+        output time row (the ops and shapes of audio_subsample_fpga's path):
+
+          engine 0   stage-0 im2col gather (three strided DMAs) into R_combined
+          rows of H0 R @ G_s0 -> patches0, conv0, LayerNorm, GELU -> ACT0
+          rows of H1 stage-1 im2col (reads the ACT0 rows around them), conv1,
+                     LayerNorm, GELU -> ACT1, input projection -> AUD_IO_A
+
+        Each engine computes the rows the single-engine program would, the
+        padding rows included, so the result is identical.
+        """
+        bpe, H = self.bytes_per_element, self.AUD_H
+        K_g, N_g = self._aud_sub_K_g_s0, self._aud_sub_N_g_s0
+        c0, c1, proj = self._aud_sub_conv0_addrs, self._aud_sub_conv1_addrs, self._aud_sub_proj_addrs
+        H1_pad = ((H1 + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+        self._aud_serial(lambda: self._emit_aud_sub_im2col_s0(T_raw, H0, 0, gather_only=True))
+
+        def stage0(ue, o0: int, n: int, e: int) -> None:
+            m_reg, r0, rows = self._aud_mreg(e), o0 * W0, n * W0
+            self._aud_op(ue, lambda: ue.matmat_mul_core(
+                M=n, K=K_g, N=N_g, A_DRAM_ADDR=self.AUD_SUB_R_COMBINED + o0 * K_g * bpe,
+                B_DRAM_ADDR=self._aud_sub_G_s0_addr, OUTPUT_DRAM_ADDR=self.AUD_SUB_PATCHES0 + o0 * N_g * bpe))
+
+            def conv0():
+                ue.generate_instruction_add_set(m_reg, rows)
+                ue.matmat_mul_core(M=rows, K=64, N=128, A_DRAM_ADDR=self.AUD_SUB_PATCHES0 + r0 * 64 * bpe,
+                                   B_DRAM_ADDR=c0["data"], OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT0 + r0 * 128 * bpe,
+                                   is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=c0["scale"],
+                                   gpr_M_reg=m_reg)
+            self._aud_op(ue, conv0)
+            self._aud_op(ue, lambda: ue.layer_norm_core_dram(
+                M=rows, N=128, A_DRAM_ADDR=self.AUD_SUB_OUT0 + r0 * 128 * bpe,
+                OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT0 + r0 * 128 * bpe,
+                GAMMA_DRAM_ADDR=self._aud_sub_ln0_gamma_addr, ZEROS_DRAM_ADDR=self._aud_ln_zeros_addr))
+            self._aud_op(ue, lambda: ue.matmat_mul_core(
+                M=rows, K=128, N=128, A_DRAM_ADDR=self.AUD_SUB_OUT0 + r0 * 128 * bpe,
+                B_DRAM_ADDR=self.AUD_SUB_ID_128, OUTPUT_DRAM_ADDR=self.AUD_SUB_ACT0 + r0 * 128 * bpe,
+                gelu_enable=True, gpr_M_reg=None))
+        self._aud_split(H0, stage0)
+
+        def stage1(ue, p0: int, n: int, e: int) -> None:
+            m_reg = self._aud_mreg(e)
+            if min(p0 + n, H1) > p0:
+                self._aud_op(ue, lambda: self._emit_aud_sub_im2col_s1(H0, W0, H1, W1, ue=ue,
+                                                                      oh1_range=(p0, min(p0 + n, H1))))
+            r0, r1 = p0 * W1, min((p0 + n) * W1, N1_pad)
+            if r1 > r0:
+                def conv1():
+                    ue.generate_instruction_add_set(m_reg, r1 - r0)
+                    ue.matmat_mul_core(M=r1 - r0, K=1152, N=64, A_DRAM_ADDR=self.AUD_SUB_PATCHES1 + r0 * 1152 * bpe,
+                                       B_DRAM_ADDR=c1["data"], OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT1 + r0 * 64 * bpe,
+                                       is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=c1["scale"],
+                                       gpr_M_reg=m_reg)
+                self._aud_op(ue, conv1)
+                self._aud_op(ue, lambda: ue.layer_norm_core_dram(
+                    M=r1 - r0, N=64, A_DRAM_ADDR=self.AUD_SUB_OUT1 + r0 * 64 * bpe,
+                    OUTPUT_DRAM_ADDR=self.AUD_SUB_OUT1 + r0 * 64 * bpe,
+                    GAMMA_DRAM_ADDR=self._aud_sub_ln1_gamma_addr, ZEROS_DRAM_ADDR=self._aud_ln_zeros_addr))
+                self._aud_op(ue, lambda: ue.matmat_mul_core(
+                    M=r1 - r0, K=64, N=64, A_DRAM_ADDR=self.AUD_SUB_OUT1 + r0 * 64 * bpe,
+                    B_DRAM_ADDR=self._aud_sub_id_64_addr, OUTPUT_DRAM_ADDR=self.AUD_SUB_ACT1 + r0 * 64 * bpe,
+                    gelu_enable=True, gpr_M_reg=None))
+
+            def project():       # ACT1 viewed as (H1_pad, W1 * 64 = 2048): one row per time step
+                ue.generate_instruction_add_set(m_reg, n)
+                ue.matmat_mul_core(M=n, K=2 * 1024, N=1024, A_DRAM_ADDR=self.AUD_SUB_ACT1 + p0 * 2048 * bpe,
+                                   B_DRAM_ADDR=proj["data"], OUTPUT_DRAM_ADDR=self.AUD_IO_A + p0 * H * bpe,
+                                   is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=proj["scale"],
+                                   gpr_M_reg=m_reg)
+            self._aud_op(ue, project)
+        self._aud_split(H1_pad, stage1)
+
+    def _emit_aud_sub_im2col_s0(self, T_raw: int, H0: int, H0_pad: int, *,
+                                gather_only: bool = False) -> None:
         """FPGA emitter for stage-0 im2col (parakeet pattern).
 
         Builds R_combined(H0_pad, K_g=384) in AUD_SUB_R_COMBINED via 3 strided
@@ -1078,6 +1348,8 @@ class Gemma4AudioMixin:
                     stride_bytes_per_chunk=row_bytes,
                     stride_jump_bytes=K_g_s0 * bpe_local)
                 offset += chunk
+        if gather_only:
+            return
 
         # Matmul: R_combined(H0_pad, K_g) @ G_s0(N_g, K_g)^T → (H0_pad, N_g).
         # Byte layout is identical to (N0_pad, 64) patches0 view since
@@ -1089,7 +1361,8 @@ class Gemma4AudioMixin:
             B_DRAM_ADDR=self._aud_sub_G_s0_addr,
             OUTPUT_DRAM_ADDR=self.AUD_SUB_PATCHES0)
 
-    def _emit_aud_sub_im2col_s1(self, H0: int, W0: int, H1: int, W1: int) -> None:
+    def _emit_aud_sub_im2col_s1(self, H0: int, W0: int, H1: int, W1: int, *,
+                                ue=None, oh1_range: tuple[int, int] | None = None) -> None:
         """FPGA emitter for stage-1 im2col (multi-channel).
 
         Unlike stage-0 (single-channel, parakeet G-matrix), stage-1 has 128
@@ -1110,6 +1383,8 @@ class Gemma4AudioMixin:
             in row-major (oh, ow, c) layout.
           - AUD_SUB_PATCHES1 was pre-zeroed.
         """
+        ue = self if ue is None else ue
+        lo, hi = oh1_range if oh1_range is not None else (0, H1)
         bpe_local = self.bytes_per_element
         chunk_bytes = 128 * bpe_local       # 256 — one 128-channel pixel
         src_stride = 2 * chunk_bytes        # 512 — ow1-step in source
@@ -1125,19 +1400,19 @@ class Gemma4AudioMixin:
                     continue
                 slot = kh * 3 + kw
                 chunk_total_bytes = n_ow1 * chunk_bytes
-                for oh1 in range(oh1_start, oh1_end):
+                for oh1 in range(max(oh1_start, lo), min(oh1_end, hi)):
                     in_row = oh1 * 2 - 1 + kh           # 0 <= in_row < H0
                     in_col_start = ow1_start * 2 - 1 + kw
                     src = (self.AUD_SUB_ACT0
                            + (in_row * W0 + in_col_start) * chunk_bytes)
-                    self.ue_memcpy_from_dram(
+                    ue.ue_memcpy_from_dram(
                         src, chunk_total_bytes, 0, URAM_START_ADDR,
                         URAM_SECTION.URAM_A.value,
                         stride_bytes_per_chunk=chunk_bytes,
                         stride_jump_bytes=src_stride)
                     dst = (self.AUD_SUB_PATCHES1
                            + ((oh1 * W1 + ow1_start) * 1152 + slot * 128) * bpe_local)
-                    self.ue_memcpy_to_dram(
+                    ue.ue_memcpy_to_dram(
                         0, URAM_SECTION.URAM_A.value, URAM_START_ADDR,
                         dst, chunk_total_bytes,
                         stride_bytes_per_chunk=chunk_bytes,
@@ -1169,56 +1444,31 @@ class Gemma4AudioMixin:
         return pe.to(torch.bfloat16)
 
     def _emit_aud_embed_project_chain(self) -> None:
-        """Phase B embed+projector ISA emitter (no DMA-back, no host work).
-
-        Designed to be folded into the encoder one-shot capture: when called
-        with ``self._oneshot_mode=True``, the three sub-ops emit inline into
-        the caller's open capture instead of issuing separate per-op triggers.
-        Reads from AUD_IO_A (encoder output), writes to AUD_FEATURES_FINAL.
+        """Output projection + multimodal embedder, AUD_IO_A -> AUD_FEATURES_FINAL,
+        as a row-wise step (split over the engines' row blocks):
+            x @ W_op^T + b_op -> RMSNorm (ones gamma) -> @ W_em^T.
+        The norm and the embedder projection stay static-M (no gpr_M_reg): with
+        PBI these once-run ops diverged in the one-shot bin and corrupted the
+        features ("I don't hear any audio" on E2B); the output projection's
+        bias path is likewise left on the static kernel.
         """
-        H = self.AUD_H
-        PROJ_DIM, OUT_DIM = self.AUD_PROJ_DIM, self.AUD_OUT_DIM
-        L_pad = self._aud_L_pad
+        H, PROJ_DIM, OUT_DIM = self.AUD_H, self.AUD_PROJ_DIM, self.AUD_OUT_DIM
+        op, em = self._aud_output_proj_addrs, self._aud_embedder_proj_addrs
 
-        # Step 1: encoder_out @ W_op.T + b_op  ->  AUD_FEATURES_MID
-        op = self._aud_output_proj_addrs
-        self._compile_and_run_single("aud_embed_output_proj",
-            lambda: self.matmat_mul_core(
-                M=L_pad, K=H, N=PROJ_DIM,
-                A_DRAM_ADDR=self.AUD_IO_A,
-                B_DRAM_ADDR=op["data"],
-                OUTPUT_DRAM_ADDR=self.AUD_FEATURES_MID,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=op["scale"],
-                C_DRAM_ADDR=self._aud_output_proj_b_addr,
-                bias_mode="broadcast_N"))
-                # bias-matmul PBI left legacy: C_DRAM bias path not covered by the
-                # vision all-saves validation; runs once, produces audio_features.
-
-        # Step 2: RMSNorm with all-ones gamma (HF Gemma4MultimodalEmbedder uses
-        # embedding_pre_projection_norm with with_scale=False, so ones-gamma is
-        # mathematically equivalent). LEGACY (no gpr_M_reg) — PBI on this once-run
-        # op silently diverges in the one-shot bin (passes per-sub-op compare but
-        # corrupts audio features end-to-end → e2b "I don't hear any audio"
-        # degenerate decode, since the smaller LM is more sensitive to feature
-        # scale errors than e4b). Mirrors gemma4_e4b which never had PBI here.
-        self._compile_and_run_single("aud_embed_rmsnorm",
-            lambda: self.rms_norm_core_dram(
-                M=L_pad, N=PROJ_DIM,
-                A_DRAM_ADDR=self.AUD_FEATURES_MID,
-                OUTPUT_DRAM_ADDR=self.AUD_FEATURES_MID,
-                GAMMA_DRAM_ADDR=self.AUD_EMB_ONES_GAMMA))
-
-        # Step 3: x @ W_em.T  ->  AUD_FEATURES_FINAL. LEGACY — see Step 2 rationale.
-        em = self._aud_embedder_proj_addrs
-        self._compile_and_run_single("aud_embed_emb_proj",
-            lambda: self.matmat_mul_core(
-                M=L_pad, K=PROJ_DIM, N=OUT_DIM,
-                A_DRAM_ADDR=self.AUD_FEATURES_MID,
-                B_DRAM_ADDR=em["data"],
-                OUTPUT_DRAM_ADDR=self.AUD_FEATURES_FINAL,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=em["scale"]))
+        def step(e: _AudShard) -> None:
+            mid = e.r(self.AUD_FEATURES_MID, PROJ_DIM)
+            e._op(lambda: e.ue.matmat_mul_core(
+                M=e.rows, K=H, N=PROJ_DIM, A_DRAM_ADDR=e.r(self.AUD_IO_A, H), B_DRAM_ADDR=op["data"],
+                OUTPUT_DRAM_ADDR=mid, is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=op["scale"],
+                C_DRAM_ADDR=self._aud_output_proj_b_addr, bias_mode="broadcast_N"))
+            e._op(lambda: e.ue.rms_norm_core_dram(M=e.rows, N=PROJ_DIM, A_DRAM_ADDR=mid, OUTPUT_DRAM_ADDR=mid,
+                                                  GAMMA_DRAM_ADDR=self.AUD_EMB_ONES_GAMMA))
+            e._op(lambda: e.ue.matmat_mul_core(
+                M=e.rows, K=PROJ_DIM, N=OUT_DIM, A_DRAM_ADDR=mid, B_DRAM_ADDR=em["data"],
+                OUTPUT_DRAM_ADDR=e.r(self.AUD_FEATURES_FINAL, OUT_DIM), is_B_quantized=True,
+                data_type=TYPE.IF4, SCALE_DRAM_ADDR=em["scale"]))
+        self._aud_row_step(step)
+        self._aud_flush()
 
     def _aud_ffn_mm(self, kind: str, w_entry: dict, *, cache=None, cache_key: str = None) -> None:
         """One conformer-FFN matmul. kind='w1' (H→FF) or 'w2' (FF→H). Per-layer
@@ -1241,202 +1491,57 @@ class Gemma4AudioMixin:
     def _aud_ffn_silu(self, **_unused) -> None:
         self._emit_audio_core(lambda: _aud_silu(
             self, self._aud_L_pad, self.AUD_FFN,
-            self.AUD_FFN_MID, self.AUD_SILU_OUT, self.AUD_IDENTITY_FF))
+            self.AUD_FFN_MID, self.AUD_SILU_OUT, self.AUD_IDENTITY_64))
 
     def compile_audio_layer_ffn1(self, layer_idx: int) -> None:
-        """Compile + run FFN1 macaron half for one Conformer layer.
-
-        Reads from AUD_IO_A (or B depending on layer parity), writes back to
-        the same buffer. The half-step residual is applied in place.
-
-        Sequence (mirrors Gemma4AudioFeedForward.forward):
-            residual = x
-            x = clamp(x)                                  ← skipped, BF16 won't overflow
-            x = pre_layer_norm(x)                         ← RMSNorm
-            x = ffw_layer_1(x)                            ← Linear 1024→4096 (Clippable)
-            x = SiLU(x)                                   ← x * sigmoid(x)
-            x = ffw_layer_2(x)                            ← Linear 4096→1024 (Clippable)
-            x = clamp(x)                                  ← skipped
-            x = post_layer_norm(x)                        ← RMSNorm
-            x = x * residual_weight  +  residual          ← *0.5 + residual
-        """
-        self.audio_config_init()
-        H = self.AUD_H
-        FF = self.AUD_FFN
-        L_pad = self._aud_L_pad
-        S = self._aud_num_frames  # only the first S rows are valid; rest are padding
-        w = self._aud_weight_addrs[layer_idx]
-        cr = self._aud_clip_ranges[layer_idx]
-        cache = getattr(self, "_aud_program_cache", None)
-
-        def _ck(label: str) -> str:
-            return f"aud_L{layer_idx}_{label}"
-
-        IN_BUF = self.AUD_IO_A  # all audio layers operate in place on IO_A
-
-        # Save residual (for half-step add at the end)
-        self._aud_copy_buf("ffn1_save_residual", IN_BUF, self.AUD_RESIDUAL, L_pad * H, row_n=H)
-
-        # 1. pre_layer_norm
-        self._compile_and_run_single("aud_ff1_pre_norm", lambda: self.rms_norm_core_dram(
-            M=L_pad, N=H,
-            A_DRAM_ADDR=IN_BUF,
-            OUTPUT_DRAM_ADDR=self.AUD_NORM_OUT,
-            GAMMA_DRAM_ADDR=w["FF1_PRE_NORM"],
-            gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
-            cache=cache, cache_key=_ck("ff1_pre_norm"))
-
-        # 2. ffw_layer_1 (clippable, IF4 (block=64)). Apply input clip on host,
-        #    run matmul, apply output clip on host.
-        self._aud_clip_dram(self.AUD_NORM_OUT, (L_pad, H),
-                              cr["FF1_W1"]["in_min"], cr["FF1_W1"]["in_max"])
-        self._aud_ffn_mm("w1", w["FF1_W1"], cache=cache, cache_key=_ck("ff1_w1"))
-        self._aud_clip_dram(self.AUD_FFN_MID, (L_pad, FF),
-                              cr["FF1_W1"]["out_min"], cr["FF1_W1"]["out_max"])
-
-        # 3. SiLU on (L_pad, FF) — §7-FFN shares ONE silu body across all layers.
-        self._aud_ffn_silu(cache=cache, cache_key=_ck("ff1_silu"))
-
-        # 4. ffw_layer_2 (clippable, IF4 (block=64)). Reads from SiLU output.
-        self._aud_clip_dram(self.AUD_SILU_OUT, (L_pad, FF),
-                              cr["FF1_W2"]["in_min"], cr["FF1_W2"]["in_max"])
-        self._aud_ffn_mm("w2", w["FF1_W2"], cache=cache, cache_key=_ck("ff1_w2"))
-        self._aud_clip_dram(self.AUD_FFN_OUT, (L_pad, H),
-                              cr["FF1_W2"]["out_min"], cr["FF1_W2"]["out_max"])
-
-        # 5. post_layer_norm
-        self._compile_and_run_single("aud_ff1_post_norm", lambda: self.rms_norm_core_dram(
-            M=L_pad, N=H,
-            A_DRAM_ADDR=self.AUD_FFN_OUT,
-            OUTPUT_DRAM_ADDR=self.AUD_FFN_OUT,
-            GAMMA_DRAM_ADDR=w["FF1_POST_NORM"],
-            gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
-            cache=cache, cache_key=_ck("ff1_post_norm"))
-
-        # 6. Half-step residual: out = residual + 0.5 * ffn_out → IN_BUF
-        self._compile_and_run_single("aud_ff1_half_residual", lambda: _aud_half_step(
-            self, L_pad, H,
-            self.AUD_RESIDUAL, self.AUD_FFN_OUT, IN_BUF),
-            cache=cache, cache_key=_ck("ff1_half_residual"))
+        """FFN1 macaron half of one Conformer layer (Gemma4AudioFeedForward):
+        residual = x; x = post_norm(W2(SiLU(W1(pre_norm(x))))) * 0.5 + residual,
+        with the clippable linears' input/output clamps. In place on AUD_IO_A."""
+        self._compile_audio_ffn_macaron(layer_idx, prefix="FF1")
 
     def compile_audio_layer_attn(self, layer_idx: int) -> None:
-        """Run the self-attention block of one Conformer layer.
+        """Self-attention block of one Conformer layer (Gemma4AudioAttention).
 
-        Sequence (mirrors Gemma4AudioLayer.forward + Gemma4AudioAttention.forward):
+            residual = x; x = norm_pre_attn(x)
+            q, k, v = clipped q/k/v projections          (row-wise, all engines)
+            q *= q_scale * softplus(per_dim_scale); k *= k_scale
+            chunked local rel-pos attention              (engine 0: mixes frames)
+            x = norm_post_attn(o_proj(attn)) + residual  (row-wise, all engines)
 
-            residual = x          # (the layer's running hidden, IN_BUF)
-            x = norm_pre_attn(x)  # RMSNorm  ← FPGA
-            q = q_proj(x); k = k_proj(x); v = v_proj(x)  ← FPGA (FP4)
-            q = q * q_scale * softplus(per_dim_scale)
-            k = k * k_scale
-            ▼ chunked local attention (rel-pos, soft-cap, mask, softmax) ← HOST for now
-            attn_out = post(attn_out)   ← FPGA (FP4)
-            x = norm_post_attn(attn_out)  ← FPGA
-            x = x + residual               ← FPGA eltwise
-
-        IN_BUF parity: layer 0 reads from AUD_IO_A, layer 1 from AUD_IO_B,
-        etc. We write the post-attn-residual result back to the SAME buffer
-        the layer started in (so the conv module reads from there).
+        In place on AUD_IO_A, so the conv module reads from there.
         """
         self.audio_config_init()
         H = self.AUD_H
-        HD = self.AUD_HEAD_DIM
-        NH = self.AUD_HEADS
-        L_pad = self._aud_L_pad
-        T = self._aud_num_frames
         w = self._aud_weight_addrs[layer_idx]
         cr = self._aud_clip_ranges[layer_idx]
-        cache = getattr(self, "_aud_program_cache", None)
+        IN = self.AUD_IO_A
+        past_bytes = (self.AUD_CTX_LEFT - 1) * H * self.bytes_per_element
 
-        def _ck(label: str) -> str:
-            return f"aud_L{layer_idx}_{label}"
+        def front(e: _AudShard) -> None:
+            e.copy(IN, self.AUD_RESIDUAL, H)
+            e.norm(IN, self.AUD_NORM_OUT, w["ATTN_PRE_NORM"], H)
+            for key, dst in (("Q_PROJ", self.AUD_Q), ("K_PROJ", self.AUD_K), ("V_PROJ", self.AUD_V)):
+                e.clipped_linear(self.AUD_NORM_OUT, H, dst, H, w[key], cr[key])
+            e.scale_rows(self.AUD_Q, w["Q_SCALE_TILE"], None, H)
+            e.scale_rows(self.AUD_K, None, float(self.AUD_K_SCALE), H)
+            # K / V after max_past leading zero rows (the chunks' left context).
+            e.copy(self.AUD_K, self.AUD_K_PADDED + past_bytes, H)
+            e.copy(self.AUD_V, self.AUD_V_PADDED + past_bytes, H)
+            if e.ue is self:        # input-independent, so it rides engine 0's share
+                e._op(lambda: self._emit_aud_attn_rel_k_proj(layer_idx))
+        self._aud_row_step(front)
 
-        IN_BUF = self.AUD_IO_A  # all audio layers operate in place on IO_A
+        # Chunked local rel-pos attention -> AUD_ATTN_OUT (pre o_proj): the
+        # position term per head, then everything else per block of frames.
+        self._aud_split(self.AUD_HEADS, lambda ue, h0, n, e: self._emit_aud_attn_heads(ue, h0, n, e))
+        self._aud_split(self._aud_num_blocks,
+                        lambda ue, b0, n, e: self._emit_aud_attn_blocks(layer_idx, ue, b0, n, e))
 
-        # Save residual: copy current IN_BUF state into AUD_RESIDUAL.
-        # Note: AUD_RESIDUAL is reused by every sub-block (FFN1, attn, conv,
-        # FFN2) within this layer. Each sub-block must save its own residual
-        # before any FPGA writes happen.
-        self._aud_copy_buf("attn_save_residual", IN_BUF, self.AUD_RESIDUAL,
-                            L_pad * H, row_n=H)
-
-        # 1. norm_pre_attn (RMSNorm with learned scale)
-        self._compile_and_run_single("aud_attn_pre_norm", lambda: self.rms_norm_core_dram(
-            M=L_pad, N=H,
-            A_DRAM_ADDR=IN_BUF,
-            OUTPUT_DRAM_ADDR=self.AUD_NORM_OUT,
-            GAMMA_DRAM_ADDR=w["ATTN_PRE_NORM"],
-            gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
-            cache=cache, cache_key=_ck("attn_pre_norm"))
-
-        # 2. Q / K / V projections (IF4 (block=64), ClippableLinear).
-        # Writes go directly into AUD_Q / AUD_K / AUD_V which are sized
-        # (L_pad, NH*HD) = (L_pad, H) bf16.
-        for proj_name, addr_key, dst in [
-            ("Q_PROJ", "Q_PROJ", self.AUD_Q),
-            ("K_PROJ", "K_PROJ", self.AUD_K),
-            ("V_PROJ", "V_PROJ", self.AUD_V),
-        ]:
-            self._aud_clip_dram(self.AUD_NORM_OUT, (L_pad, H),
-                                  cr[addr_key]["in_min"], cr[addr_key]["in_max"])
-            wq = w[addr_key]
-            label = f"aud_attn_{proj_name.lower()}"
-            self._compile_and_run_single(label, lambda d=dst, ww=wq: self.matmat_mul_core(
-                M=L_pad, K=H, N=H,
-                A_DRAM_ADDR=self.AUD_NORM_OUT,
-                B_DRAM_ADDR=ww["data"],
-                OUTPUT_DRAM_ADDR=d,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=ww["scale"],
-                gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
-                cache=cache, cache_key=_ck(f"attn_{proj_name.lower()}"))
-            self._aud_clip_dram(dst, (L_pad, H),
-                                  cr[addr_key]["out_min"], cr[addr_key]["out_max"])
-
-        # Phase 2B.b: Q / K scaling on FPGA.
-        # Q *= q_scale * softplus(per_dim_scale[d])  — eltwise_mul by Q_SCALE_TILE
-        # K *= k_scale                                — broadcast_mul by AUD_K_SCALE
-        self._compile_and_run_single("aud_attn_q_scale",
-            lambda: self._emit_aud_q_scale_fpga(layer_idx),
-            cache=cache, cache_key=_ck("attn_q_scale"))
-        self._compile_and_run_single("aud_attn_k_scale",
-            lambda: self._emit_aud_k_scale_fpga(),
-            cache=cache, cache_key=_ck("attn_k_scale"))
-
-        # Phase 2B.c: chunked attention chain (Q@K^T, rel-shift, softcap-tanh,
-        # mask, softmax, attn@V) writes pre-o_proj output to AUD_ATTN_OUT.
-        self._compile_and_run_single(
-            "aud_attn_fpga_chain",
-            lambda: self._emit_aud_attn_fpga_chain(layer_idx))
-        self._aud_clip_dram(self.AUD_ATTN_OUT, (L_pad, H),
-                              cr["O_PROJ"]["in_min"], cr["O_PROJ"]["in_max"])
-        op = w["O_PROJ"]
-        self._compile_and_run_single("aud_attn_o_proj",
-            lambda: self.matmat_mul_core(
-                M=L_pad, K=H, N=H,
-                A_DRAM_ADDR=self.AUD_ATTN_OUT,
-                B_DRAM_ADDR=op["data"],
-                OUTPUT_DRAM_ADDR=self.AUD_ATTN_OUT,
-                is_B_quantized=True, data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=op["scale"],
-                gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
-            cache=cache, cache_key=_ck("attn_o_proj"))
-        self._aud_clip_dram(self.AUD_ATTN_OUT, (L_pad, H),
-                              cr["O_PROJ"]["out_min"], cr["O_PROJ"]["out_max"])
-
-        # 4. norm_post_attn (RMSNorm)
-        self._compile_and_run_single("aud_attn_post_norm", lambda: self.rms_norm_core_dram(
-            M=L_pad, N=H,
-            A_DRAM_ADDR=self.AUD_ATTN_OUT,
-            OUTPUT_DRAM_ADDR=self.AUD_ATTN_OUT,
-            GAMMA_DRAM_ADDR=w["ATTN_POST_NORM"],
-            gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
-            cache=cache, cache_key=_ck("attn_post_norm"))
-
-        # 5. Residual add: out = norm_post_attn(attn) + saved residual → IN_BUF
-        self._compile_and_run_single("aud_attn_residual", lambda: _aud_eltwise_add(
-            self, L_pad, H, self.AUD_RESIDUAL, self.AUD_ATTN_OUT, IN_BUF),
-            cache=cache, cache_key=_ck("attn_residual"))
+        def back(e: _AudShard) -> None:
+            e.clipped_linear(self.AUD_ATTN_OUT, H, self.AUD_ATTN_OUT, H, w["O_PROJ"], cr["O_PROJ"])
+            e.norm(self.AUD_ATTN_OUT, self.AUD_ATTN_OUT, w["ATTN_POST_NORM"], H)
+            e.add(self.AUD_RESIDUAL, self.AUD_ATTN_OUT, IN, H)
+        self._aud_row_step(back)
 
     def _aud_make_blocked_mask(self, T: int, num_blocks: int, chunk_size: int,
                                 max_past: int, max_future: int) -> torch.Tensor:
@@ -1472,123 +1577,38 @@ class Gemma4AudioMixin:
         return self._aud_hf_layers[layer_idx]["o_w"]
 
     def compile_audio_layer_conv(self, layer_idx: int) -> None:
-        """Run the lconv1d (light Conv1d) module of one Conformer layer.
+        """Light Conv1d module of one Conformer layer (Gemma4AudioLightConv1d).
 
-        Sequence (mirrors Gemma4AudioLightConv1d.forward):
-            residual = x
-            x = pre_layer_norm(x)             ← FPGA RMSNorm
-            x = linear_start(x)               ← FPGA matmul (1024 → 2048)
-            x = GLU(x)                        ← FPGA helper (split halves + sigmoid + mul)
-            x = depthwise_conv1d(x)           ← HOST (kernel size 5)
-            x = conv_norm(x)                  ← FPGA RMSNorm
-            x = SiLU(x)                       ← FPGA helper
-            x = linear_end(x)                 ← FPGA matmul (1024 → 1024)
-            x = x + residual                  ← FPGA eltwise
+            residual = x; x = GLU(linear_start(pre_norm(x)))   (row-wise, all engines)
+            x = depthwise_conv1d(x)                             (engine 0: mixes frames)
+            x = linear_end(SiLU(conv_norm(x))) + residual       (row-wise, all engines)
         """
         self.audio_config_init()
         H = self.AUD_H
-        L_pad = self._aud_L_pad
-        T = self._aud_num_frames
         w = self._aud_weight_addrs[layer_idx]
         cr = self._aud_clip_ranges[layer_idx]
-        cache = getattr(self, "_aud_program_cache", None)
+        IN = self.AUD_IO_A
 
-        def _ck(label: str) -> str:
-            return f"aud_L{layer_idx}_{label}"
+        def front(e: _AudShard) -> None:
+            e.copy(IN, self.AUD_RESIDUAL, H)
+            e.norm(IN, self.AUD_NORM_OUT, w["CONV_PRE_NORM"], H)
+            e.clipped_linear(self.AUD_NORM_OUT, H, self.AUD_FFN_MID, 2 * H,
+                             w["CONV_LIN_START"], cr["CONV_LIN_START"])
+            # GLU: a = first half (gate), b = second half (sigmoid'd) -> a * sigmoid(b)
+            e.split_halves(self.AUD_FFN_MID, self.AUD_NORM_OUT, self.AUD_FFN_OUT, H)
+            e.glu(self.AUD_NORM_OUT, self.AUD_FFN_OUT, self.AUD_NORM_OUT, H)
+            e.copy(self.AUD_NORM_OUT, self.AUD_DW_X, H)       # the conv's input, read with a halo
+        self._aud_row_step(front)
+        self._aud_flush()       # every engine's rows of AUD_DW_X are written before any tap reads them
 
-        IN_BUF = self.AUD_IO_A  # all audio layers operate in place on IO_A
-
-        self._aud_copy_buf("conv_save_residual", IN_BUF, self.AUD_RESIDUAL, L_pad * H, row_n=H)
-
-        # 1. pre_layer_norm
-        self._compile_and_run_single("aud_conv_pre_norm", lambda: self.rms_norm_core_dram(
-            M=L_pad, N=H,
-            A_DRAM_ADDR=IN_BUF,
-            OUTPUT_DRAM_ADDR=self.AUD_NORM_OUT,
-            GAMMA_DRAM_ADDR=w["CONV_PRE_NORM"],
-            gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
-            cache=cache, cache_key=_ck("conv_pre_norm"))
-
-        # 2. linear_start (1024 → 2048). Output goes to AUD_FFN_MID temporarily
-        # (which is L_pad × FF=4096 = enough for L_pad × 2H=2048).
-        self._aud_clip_dram(self.AUD_NORM_OUT, (L_pad, H),
-                              cr["CONV_LIN_START"]["in_min"], cr["CONV_LIN_START"]["in_max"])
-        cls = w["CONV_LIN_START"]
-        self._compile_and_run_single("aud_conv_lin_start", lambda: self.matmat_mul_core(
-            M=L_pad, K=H, N=2 * H,
-            A_DRAM_ADDR=self.AUD_NORM_OUT,
-            B_DRAM_ADDR=cls["data"],
-            OUTPUT_DRAM_ADDR=self.AUD_FFN_MID,
-            is_B_quantized=True, data_type=TYPE.IF4,
-            SCALE_DRAM_ADDR=cls["scale"],
-            gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
-            cache=cache, cache_key=_ck("conv_lin_start"))
-        self._aud_clip_dram(self.AUD_FFN_MID, (L_pad, 2 * H),
-                              cr["CONV_LIN_START"]["out_min"], cr["CONV_LIN_START"]["out_max"])
-
-        # 3. GLU: split (L_pad, 2H) into gate=(L_pad, H) and value=(L_pad, H),
-        # then output = gate * sigmoid(value).
-        # The linear output is laid out as [L_pad, 2H] row-major. Row r:
-        #   gate[r]  = AUD_FFN_MID[r, 0:H]
-        #   value[r] = AUD_FFN_MID[r, H:2H]
-        # We can pass these as DRAM bases to glu_core_dram, but the helper
-        # assumes both halves are in CONTIGUOUS L_pad×H buffers, not a single
-        # interleaved buffer. Easiest fix: copy each half to its own buffer.
-        # AUD_CONV_GATE/VALUE were dropped in tensor_init's Phase-3 cleanup;
-        # reuse AUD_NORM_OUT (L_pad×H, free at this point) as the gate buffer
-        # and AUD_RESIDUAL would clobber the residual we need later — so use
-        # AUD_FFN_OUT (L_pad×H) as the value buffer instead.
-        # Then the helper writes the GLU output back over AUD_NORM_OUT.
-        # row_bytes_2H = 2*H*bpe; gate at offset 0, value at offset H*bpe per row.
-        self._aud_split_2h_to_halves("conv_glu_split",
-            self.AUD_FFN_MID, self.AUD_NORM_OUT, self.AUD_FFN_OUT, L_pad, H)
-        self._compile_and_run_single("aud_conv_glu", lambda: _aud_glu(
-            self, L_pad, H,
-            self.AUD_NORM_OUT,  # GATE (a)
-            self.AUD_FFN_OUT,   # VALUE (b, will be sigmoided in place)
-            self.AUD_NORM_OUT,  # OUTPUT
-            self.AUD_IDENTITY_H),  # H×H identity for K=N=H matmul
-            cache=cache, cache_key=_ck("conv_glu"))
-
-        # 4. depthwise_conv1d (FPGA 4-tap shifted-eltwise).
-        self._aud_dw_conv1d_dispatch(
-            layer_idx, in_addr=self.AUD_NORM_OUT, out_addr=self.AUD_NORM_OUT,
-            cache=cache, cache_key=_ck("conv_dw"))
-
-        # 5. conv_norm (RMSNorm with learned scale)
-        self._compile_and_run_single("aud_conv_norm", lambda: self.rms_norm_core_dram(
-            M=L_pad, N=H,
-            A_DRAM_ADDR=self.AUD_NORM_OUT,
-            OUTPUT_DRAM_ADDR=self.AUD_NORM_OUT,
-            GAMMA_DRAM_ADDR=w["CONV_NORM"],
-            gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
-            cache=cache, cache_key=_ck("conv_norm"))
-
-        # 6. SiLU
-        self._compile_and_run_single("aud_conv_silu", lambda: _aud_silu(
-            self, L_pad, H, self.AUD_NORM_OUT, self.AUD_FFN_OUT, self.AUD_IDENTITY_H),
-            cache=cache, cache_key=_ck("conv_silu"))
-
-        # 7. linear_end (1024 → 1024)
-        self._aud_clip_dram(self.AUD_FFN_OUT, (L_pad, H),
-                              cr["CONV_LIN_END"]["in_min"], cr["CONV_LIN_END"]["in_max"])
-        cle = w["CONV_LIN_END"]
-        self._compile_and_run_single("aud_conv_lin_end", lambda: self.matmat_mul_core(
-            M=L_pad, K=H, N=H,
-            A_DRAM_ADDR=self.AUD_FFN_OUT,
-            B_DRAM_ADDR=cle["data"],
-            OUTPUT_DRAM_ADDR=self.AUD_FFN_OUT,
-            is_B_quantized=True, data_type=TYPE.IF4,
-            SCALE_DRAM_ADDR=cle["scale"],
-            gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
-            cache=cache, cache_key=_ck("conv_lin_end"))
-        self._aud_clip_dram(self.AUD_FFN_OUT, (L_pad, H),
-                              cr["CONV_LIN_END"]["out_min"], cr["CONV_LIN_END"]["out_max"])
-
-        # 8. Residual: out = AUD_FFN_OUT + AUD_RESIDUAL → IN_BUF
-        self._compile_and_run_single("aud_conv_residual", lambda: _aud_eltwise_add(
-            self, L_pad, H, self.AUD_RESIDUAL, self.AUD_FFN_OUT, IN_BUF),
-            cache=cache, cache_key=_ck("conv_residual"))
+        def back(e: _AudShard) -> None:
+            e._op(lambda: self._emit_aud_dw_conv1d_rows(layer_idx, e.ue, e.row0, e.rows))
+            e.norm(self.AUD_NORM_OUT, self.AUD_NORM_OUT, w["CONV_NORM"], H)
+            e.silu(self.AUD_NORM_OUT, self.AUD_FFN_OUT, H)
+            e.clipped_linear(self.AUD_FFN_OUT, H, self.AUD_FFN_OUT, H,
+                             w["CONV_LIN_END"], cr["CONV_LIN_END"])
+            e.add(self.AUD_RESIDUAL, self.AUD_FFN_OUT, IN, H)
+        self._aud_row_step(back)
 
     def _aud_split_2h_to_halves(self, label: str,
                                  src_2h: int, dst_a: int, dst_b: int,
@@ -2109,6 +2129,175 @@ class Gemma4AudioMixin:
                     stride_bytes_per_chunk=HD * bpe,
                     stride_jump_bytes=H * bpe)
 
+    def _emit_aud_attn_heads(self, ue, h0: int, n: int, e: int) -> None:
+        """Heads [h0, h0+n) on engine ``ue``: the rel-pos term Q_h @ rel_K_h^T over
+        all frames (AUD_MATRIX_BD_UNSHIFTED), as _emit_aud_attn_matrix_bd_unshifted.
+        Needs AUD_REL_K_OUT (the layer's rel_k projection) and AUD_Q."""
+        from audio_primitives import URAM_A_BASE
+        H, HD, bpe = self.AUD_H, self.AUD_HEAD_DIM, self.bytes_per_element
+        L_pad, T_pp, num_pos_pad = self._aud_L_pad, self._aud_T_pad_padded, self._aud_num_pos_pad
+        chunk_pad, bd_N = self._aud_chunk_pad, self._aud_bd_unshifted_N
+        q_full = self._aud_scratch["q_full"][e]
+        for h in range(h0, h0 + n):
+            ue.accelerator_memory_to_sram(
+                accelerator_dram_address=self.AUD_REL_K_OUT + h * HD * bpe, sram_address=URAM_A_BASE,
+                element_size=num_pos_pad * HD, stride_bytes_per_chunk=HD * bpe, stride_jump_bytes=H * bpe)
+            ue.sram_to_accelerator_memory(URAM_A_BASE, self.AUD_REL_K_T + (h * bd_N + chunk_pad) * HD * bpe,
+                                          num_pos_pad * HD)
+            ue.accelerator_memory_to_sram(
+                accelerator_dram_address=self.AUD_Q + h * HD * bpe, sram_address=URAM_A_BASE,
+                element_size=L_pad * HD, stride_bytes_per_chunk=HD * bpe, stride_jump_bytes=H * bpe)
+            ue.sram_to_accelerator_memory(URAM_A_BASE, q_full, L_pad * HD)
+            ue.matmat_mul_core(M=T_pp, K=HD, N=bd_N, A_DRAM_ADDR=q_full,
+                               B_DRAM_ADDR=self.AUD_REL_K_T + h * bd_N * HD * bpe,
+                               OUTPUT_DRAM_ADDR=self.AUD_MATRIX_BD_UNSHIFTED + h * T_pp * bd_N * bpe)
+
+    def _emit_aud_attn_blocks(self, layer_idx: int, ue, b0: int, n: int, e: int) -> None:
+        """Blocks [b0, b0+n) of frames on engine ``ue``, every head: the chunk
+        contexts, Q@K^T, the rel-shifted position term, soft-cap + mask + softmax
+        and @V scattered into AUD_ATTN_OUT -- _emit_aud_attn_build_kctx_t,
+        _matrix_ac, _rel_shift, _build_vctx_t, _logits_softcap_mask_softmax and
+        _value_and_scatter restricted to these blocks (their tiles are
+        block-major, so a block range is contiguous). Needs AUD_K/V_PADDED,
+        AUD_Q and every head's AUD_MATRIX_BD_UNSHIFTED."""
+        from audio_primitives import (URAM_A_BASE, _row_chunk, copy_dram_to_dram_chunked,
+                                      eltwise_add_core_dram)
+        H, HD, NH, bpe = self.AUD_H, self.AUD_HEAD_DIM, self.AUD_HEADS, self.bytes_per_element
+        L_pad, chunk, ctx_size = self._aud_L_pad, self.AUD_CHUNK, self.AUD_CTX
+        ctx_pad, chunk_pad = self._aud_ctx_pad, self._aud_chunk_pad
+        T_pp, num_pos_pad, bd_N = self._aud_T_pad_padded, self._aud_num_pos_pad, self._aud_bd_unshifted_N
+        q_block, v_block = self._aud_scratch["q_block"][e], self._aud_scratch["v_block"][e]
+        out_bh = self._aud_scratch["out_bh"][e]
+        blocks = range(b0, b0 + n)
+
+        def strided_rows(src: int, rows: int, dst: int) -> None:
+            """One head's [rows, HD] column slice of an [*, H] buffer -> contiguous."""
+            ue.accelerator_memory_to_sram(accelerator_dram_address=src, sram_address=URAM_A_BASE,
+                                          element_size=rows * HD, stride_bytes_per_chunk=HD * bpe,
+                                          stride_jump_bytes=H * bpe)
+            ue.sram_to_accelerator_memory(URAM_A_BASE, dst, rows * HD)
+
+        for b in blocks:            # each block's K / V context window (rows past ctx_size stay zero)
+            for padded, ctx in ((self.AUD_K_PADDED, self.AUD_K_CTX_BLOCKS),
+                                (self.AUD_V_PADDED, self.AUD_V_CTX_BLOCKS)):
+                copy_dram_to_dram_chunked(ue, padded + b * chunk * H * bpe, ctx + b * ctx_pad * H * bpe,
+                                          ctx_size * H, row_n=H)
+        for b in blocks:
+            valid_rows = min(chunk, L_pad - b * chunk)
+            for h in range(NH):
+                bh = b * NH + h
+                # K_ctx (ctx_pad, HD): the B operand of Q @ K^T as stored.
+                strided_rows(self.AUD_K_CTX_BLOCKS + (b * ctx_pad * H + h * HD) * bpe, ctx_pad,
+                             self.AUD_K_CTX_T_BLOCKS + bh * ctx_pad * HD * bpe)
+                # Q block (chunk_pad, HD): valid rows, zeros below.
+                if valid_rows < chunk_pad:
+                    fill = (chunk_pad - valid_rows) * HD
+                    ue.accelerator_memory_to_sram(accelerator_dram_address=self.AUD_ZEROS_CHUNK_HD,
+                                                  sram_address=URAM_A_BASE, element_size=fill)
+                    ue.sram_to_accelerator_memory(URAM_A_BASE, q_block + valid_rows * HD * bpe, fill)
+                if valid_rows > 0:
+                    strided_rows(self.AUD_Q + (b * chunk * H + h * HD) * bpe, valid_rows, q_block)
+                ue.matmat_mul_core(M=chunk_pad, K=HD, N=ctx_pad, A_DRAM_ADDR=q_block,
+                                   B_DRAM_ADDR=self.AUD_K_CTX_T_BLOCKS + bh * ctx_pad * HD * bpe,
+                                   OUTPUT_DRAM_ADDR=self.AUD_MATRIX_AC + bh * chunk_pad * ctx_pad * bpe)
+                # Rel-shift row r of the position term by r (one tiny matmul per row).
+                for r in range(chunk):
+                    ue.matmat_mul_core(
+                        M=1, K=num_pos_pad, N=ctx_pad,
+                        A_DRAM_ADDR=(self.AUD_MATRIX_BD_UNSHIFTED
+                                     + ((h * T_pp + b * chunk + r) * bd_N + chunk_pad) * bpe),
+                        B_DRAM_ADDR=self.AUD_REL_SHIFT_M + r * ctx_pad * num_pos_pad * bpe,
+                        OUTPUT_DRAM_ADDR=self.AUD_MATRIX_BD_SHIFTED + (bh * chunk_pad + r) * ctx_pad * bpe)
+                # V_ctx^T (HD, ctx_pad) via identity matmul (a strided DMA cannot transpose).
+                strided_rows(self.AUD_V_CTX_BLOCKS + (b * ctx_pad * H + h * HD) * bpe, ctx_pad, v_block)
+                ue.matmat_mul_core(M=HD, K=HD, N=ctx_pad, A_DRAM_ADDR=self.AUD_IDENTITY_HD,
+                                   B_DRAM_ADDR=v_block,
+                                   OUTPUT_DRAM_ADDR=self.AUD_V_CTX_T_BLOCKS + bh * HD * ctx_pad * bpe)
+
+        # logits = softcap(AC + BD_shifted) + mask; softmax over the context.
+        rows0, M = b0 * NH * chunk_pad, n * NH * chunk_pad
+        ac = self.AUD_MATRIX_AC + rows0 * ctx_pad * bpe
+        eltwise_add_core_dram(ue, M=M, N=ctx_pad, A_DRAM_ADDR=ac,
+                              B_DRAM_ADDR=self.AUD_MATRIX_BD_SHIFTED + rows0 * ctx_pad * bpe,
+                              OUTPUT_DRAM_ADDR=ac)
+        cap = float(self.AUD_SOFT_CAP)           # cap * tanh(x / cap) = 2cap * sigmoid(2x / cap) - cap
+        step = _row_chunk(M, ctx_pad, divisor=2)
+        for scale, add in ((2.0 / cap, None), (2.0 * cap, -cap)):
+            if add is not None:
+                ue.matmat_mul_core(M=M, K=ctx_pad, N=ctx_pad, A_DRAM_ADDR=ac,
+                                   B_DRAM_ADDR=self.AUD_IDENTITY_CTX, OUTPUT_DRAM_ADDR=ac,
+                                   sigmoid_enable=True)
+            for m0 in range(0, M, step):
+                take = min(step, M - m0)
+                c, k = ac + m0 * ctx_pad * bpe, take * ctx_pad
+                ue.accelerator_memory_to_sram(c, URAM_A_BASE, k)
+                ue.broadcast_mul(scalar=scale, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE,
+                                 element_size=k)
+                if add is not None:
+                    ue.broadcast_add(scalar=add, sram_start_addr=URAM_A_BASE, sram_wb_addr=URAM_A_BASE,
+                                     element_size=k)
+                ue.sram_to_accelerator_memory(URAM_A_BASE, c, k)
+        eltwise_add_core_dram(ue, M=M, N=ctx_pad, A_DRAM_ADDR=ac,
+                              B_DRAM_ADDR=self.AUD_MASK_ADDEND + rows0 * ctx_pad * bpe, OUTPUT_DRAM_ADDR=ac)
+        ue.matmat_mul_core(M=M, K=ctx_pad, N=ctx_pad, A_DRAM_ADDR=ac, B_DRAM_ADDR=self.AUD_IDENTITY_CTX,
+                           OUTPUT_DRAM_ADDR=ac, softmax_enable=True)
+
+        # attn @ V_ctx per (block, head), scattered into AUD_ATTN_OUT[block rows, head cols].
+        for b in blocks:
+            valid_rows = min(chunk, L_pad - b * chunk)
+            for h in range(NH):
+                bh = b * NH + h
+                ue.matmat_mul_core(M=chunk_pad, K=ctx_pad, N=HD,
+                                   A_DRAM_ADDR=self.AUD_MATRIX_AC + bh * chunk_pad * ctx_pad * bpe,
+                                   B_DRAM_ADDR=self.AUD_V_CTX_T_BLOCKS + bh * HD * ctx_pad * bpe,
+                                   OUTPUT_DRAM_ADDR=out_bh)
+                if valid_rows <= 0:
+                    continue
+                ue.accelerator_memory_to_sram(accelerator_dram_address=out_bh, sram_address=URAM_A_BASE,
+                                              element_size=valid_rows * HD)
+                ue.sram_to_accelerator_memory(
+                    sram_address=URAM_A_BASE,
+                    accelerator_dram_address=self.AUD_ATTN_OUT + (b * chunk * H + h * HD) * bpe,
+                    element_size=valid_rows * HD, stride_bytes_per_chunk=HD * bpe, stride_jump_bytes=H * bpe)
+
+    def _emit_aud_dw_conv1d_rows(self, layer_idx: int, ue, r0: int, rows: int) -> None:
+        """Rows [r0, r0+rows) of the causal depthwise conv1d on engine ``ue``:
+        y[r] = sum_t tap_t * x[r - (K-1-t)], x = AUD_DW_X (zero before row 0),
+        into AUD_NORM_OUT. The same taps, products and summation order as
+        _emit_aud_dw_conv1d_fpga; reads up to K-1 rows above its block, so
+        AUD_DW_X must be complete on every engine first."""
+        from audio_primitives import (URAM_A_BASE, URAM_B_BASE, _row_chunk, copy_dram_to_dram_chunked,
+                                      eltwise_add_core_dram)
+        H, K, bpe = self.AUD_H, self.AUD_CONV_K, self.bytes_per_element
+        rb = H * bpe
+        taps = self._aud_weight_addrs[layer_idx]["CONV_DW_TAP_TILES"]
+        shift = self.AUD_DW_SHIFT + r0 * rb
+        scratch = self.AUD_DW_SCRATCH + r0 * rb
+        accum = self.AUD_NORM_OUT + r0 * rb
+        for t in range(K):
+            s = (K - 1) - t                       # this tap reads x[r - s]
+            lo = max(r0, s)                       # first row with a real source row
+            if lo > r0:
+                copy_dram_to_dram_chunked(ue, self.AUD_DW_ZERO_KM1, shift, (min(lo, r0 + rows) - r0) * H,
+                                          row_n=H)
+            if r0 + rows > lo:
+                copy_dram_to_dram_chunked(ue, self.AUD_DW_X + (lo - s) * rb, self.AUD_DW_SHIFT + lo * rb,
+                                          (r0 + rows - lo) * H, row_n=H)
+            step = _row_chunk(rows, H, divisor=2)
+            for m0 in range(0, rows, step):
+                take = min(step, rows - m0)
+                k = take * H
+                ue.accelerator_memory_to_sram(shift + m0 * rb, URAM_A_BASE, k)
+                ue.accelerator_memory_to_sram(taps[t] + (r0 + m0) * rb, URAM_B_BASE, k)
+                ue.eltwise_mul_core(vector_A_sram_start_addr=URAM_A_BASE, vector_B_sram_start_addr=URAM_B_BASE,
+                                    vector_C_sram_wb_addr=URAM_A_BASE, element_size=k)
+                ue.sram_to_accelerator_memory(URAM_A_BASE, scratch + m0 * rb, k)
+            if t == 0:
+                copy_dram_to_dram_chunked(ue, scratch, accum, rows * H, row_n=H)
+            else:
+                eltwise_add_core_dram(ue, M=rows, N=H, A_DRAM_ADDR=accum, B_DRAM_ADDR=scratch,
+                                      OUTPUT_DRAM_ADDR=accum)
+
     def _emit_aud_dw_conv1d_fpga(self, layer_idx: int, *,
                                    in_addr: int, out_addr: int) -> None:
         """4-tap shifted-eltwise depthwise causal conv1d on FPGA.
@@ -2214,73 +2403,30 @@ class Gemma4AudioMixin:
         self._compile_audio_ffn_macaron(layer_idx, prefix="FF2")
 
     def _compile_audio_ffn_macaron(self, layer_idx: int, *, prefix: str) -> None:
-        """Generic Gemma4AudioFeedForward macaron half: works for FFN1 and
-        FFN2. ``prefix`` selects the weight keys: 'FF1' or 'FF2'."""
-        H = self.AUD_H
-        FF = self.AUD_FFN
-        L_pad = self._aud_L_pad
+        """Gemma4AudioFeedForward macaron half (FFN1 / FFN2 by ``prefix``): one
+        row-wise step, so it runs split over the engines' row blocks."""
+        self.audio_config_init()
+        H, FF = self.AUD_H, self.AUD_FFN
         w = self._aud_weight_addrs[layer_idx]
         cr = self._aud_clip_ranges[layer_idx]
-        cache = getattr(self, "_aud_program_cache", None)
-        plow = prefix.lower()
+        IN = self.AUD_IO_A    # all audio layers operate in place on IO_A
 
-        def _ck(label: str) -> str:
-            return f"aud_L{layer_idx}_{label}"
-
-        IN_BUF = self.AUD_IO_A  # all audio layers operate in place on IO_A
-
-        self._aud_copy_buf(f"{plow}_save_residual",
-                            IN_BUF, self.AUD_RESIDUAL, L_pad * H, row_n=H)
-
-        self._compile_and_run_single(f"aud_{plow}_pre_norm", lambda: self.rms_norm_core_dram(
-            M=L_pad, N=H,
-            A_DRAM_ADDR=IN_BUF,
-            OUTPUT_DRAM_ADDR=self.AUD_NORM_OUT,
-            GAMMA_DRAM_ADDR=w[f"{prefix}_PRE_NORM"],
-            gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
-            cache=cache, cache_key=_ck(f"{plow}_pre_norm"))
-
-        self._aud_clip_dram(self.AUD_NORM_OUT, (L_pad, H),
-                              cr[f"{prefix}_W1"]["in_min"], cr[f"{prefix}_W1"]["in_max"])
-        self._aud_ffn_mm("w1", w[f"{prefix}_W1"], cache=cache, cache_key=_ck(f"{plow}_w1"))
-        self._aud_clip_dram(self.AUD_FFN_MID, (L_pad, FF),
-                              cr[f"{prefix}_W1"]["out_min"], cr[f"{prefix}_W1"]["out_max"])
-
-        self._aud_ffn_silu(cache=cache, cache_key=_ck(f"{plow}_silu"))
-
-        self._aud_clip_dram(self.AUD_SILU_OUT, (L_pad, FF),
-                              cr[f"{prefix}_W2"]["in_min"], cr[f"{prefix}_W2"]["in_max"])
-        self._aud_ffn_mm("w2", w[f"{prefix}_W2"], cache=cache, cache_key=_ck(f"{plow}_w2"))
-        self._aud_clip_dram(self.AUD_FFN_OUT, (L_pad, H),
-                              cr[f"{prefix}_W2"]["out_min"], cr[f"{prefix}_W2"]["out_max"])
-
-        self._compile_and_run_single(f"aud_{plow}_post_norm", lambda: self.rms_norm_core_dram(
-            M=L_pad, N=H,
-            A_DRAM_ADDR=self.AUD_FFN_OUT,
-            OUTPUT_DRAM_ADDR=self.AUD_FFN_OUT,
-            GAMMA_DRAM_ADDR=w[f"{prefix}_POST_NORM"],
-            gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
-            cache=cache, cache_key=_ck(f"{plow}_post_norm"))
-
-        self._compile_and_run_single(f"aud_{plow}_half_residual",
-            lambda: _aud_half_step(self, L_pad, H,
-                self.AUD_RESIDUAL, self.AUD_FFN_OUT, IN_BUF),
-            cache=cache, cache_key=_ck(f"{plow}_half_residual"))
+        def step(e: _AudShard) -> None:
+            e.copy(IN, self.AUD_RESIDUAL, H)
+            e.norm(IN, self.AUD_NORM_OUT, w[f"{prefix}_PRE_NORM"], H)
+            e.clipped_linear(self.AUD_NORM_OUT, H, self.AUD_FFN_MID, FF,
+                             w[f"{prefix}_W1"], cr[f"{prefix}_W1"])
+            e.silu(self.AUD_FFN_MID, self.AUD_SILU_OUT, FF)
+            e.clipped_linear(self.AUD_SILU_OUT, FF, self.AUD_FFN_OUT, H,
+                             w[f"{prefix}_W2"], cr[f"{prefix}_W2"])
+            e.norm(self.AUD_FFN_OUT, self.AUD_FFN_OUT, w[f"{prefix}_POST_NORM"], H)
+            e.half_step(self.AUD_RESIDUAL, self.AUD_FFN_OUT, IN, H)
+        self._aud_row_step(step)
 
     def compile_audio_layer_norm_out(self, layer_idx: int) -> None:
-        """Final per-layer RMSNorm. Writes back into IN_BUF in place."""
-        H = self.AUD_H
-        L_pad = self._aud_L_pad
-        w = self._aud_weight_addrs[layer_idx]
-        cache = getattr(self, "_aud_program_cache", None)
-        IN_BUF = self.AUD_IO_A  # all audio layers operate in place on IO_A
-        self._compile_and_run_single("aud_norm_out", lambda: self.rms_norm_core_dram(
-            M=L_pad, N=H,
-            A_DRAM_ADDR=IN_BUF,
-            OUTPUT_DRAM_ADDR=IN_BUF,
-            GAMMA_DRAM_ADDR=w["NORM_OUT"],
-            gpr_M_reg=self._aud_mm_gpr(M=L_pad)),
-            cache=cache, cache_key=f"aud_L{layer_idx}_norm_out")
+        """Final per-layer RMSNorm, in place on AUD_IO_A (row-wise step)."""
+        H, gamma, IN = self.AUD_H, self._aud_weight_addrs[layer_idx]["NORM_OUT"], self.AUD_IO_A
+        self._aud_row_step(lambda e: e.norm(IN, IN, gamma, H))
 
     def _audio_isa_base(self) -> int:
         """Where the audio program lives.
@@ -2304,17 +2450,27 @@ class Gemma4AudioMixin:
         straight-line program in the dedicated audio ISA region."""
         meta, _ = self._get_program_section("audio")
         tensor_base = self.AUD_IO_A
+        # Every scratch address is baked in, so the whole tensor layout keys
+        # the cached program, not just its first buffer.
+        tensor_top = self.get_tensor_dram_addr()
+        sched = self._ensure_stage_scheduler("audio") if self.multi_core > 1 else None
+        worker_metas = [self._get_program_section(f"audio_worker{i}")[0]
+                        for i in range(1, self.multi_core)] if sched is not None else []
         # The program bakes the clip's frame counts, so reuse it only for a clip
         # of the same shape: a 4.5 s program run on a 2.55 s clip encodes garbage.
         isa_base = self._audio_isa_base()
         if (meta is not None
                 and int(meta.get("tensor_base", "0"), 16) == tensor_base
+                and int(meta.get("tensor_top", "0"), 16) == tensor_top
                 and int(meta.get("dram_base", "0"), 16) == isa_base
                 and meta.get("program_version") == AUDIO_PROGRAM_VERSION
                 and meta.get("num_frames") == self._aud_num_frames
                 and meta.get("padded_frames") == self._aud_L_pad
                 and meta.get("proj_dim") == self.AUD_PROJ_DIM
-                and meta.get("out_dim") == self.AUD_OUT_DIM):
+                and meta.get("out_dim") == self.AUD_OUT_DIM
+                and meta.get("multi_core", 1) == self.multi_core
+                and all(m is not None and m.get("program_version") == AUDIO_PROGRAM_VERSION
+                        and m.get("num_frames") == self._aud_num_frames for m in worker_metas)):
             print("  [Audio] reusing existing audio instruction section")
             return
 
@@ -2329,6 +2485,17 @@ class Gemma4AudioMixin:
         self._oneshot_mode = True
         previous_silent = self._set_silent(True)
         started = time.perf_counter()
+        worker_addrs: list[int] = []
+        self._aud_pending = []
+        self._aud_sched = sched
+        if sched is not None:
+            # Each stage reloads its worker images before it runs, so the audio
+            # programs start at each worker's ISA slice base on every compile
+            # (a new clip length recompiles; the cursors must not creep).
+            for w in sched.workers:
+                w.reset_program_dram_addr()
+            sched.begin_program()
+            self._aud_m_regs = [self.gpr_seq_len] + [w.alloc_isa_reg() for w in sched.workers]
         try:
             self.audio_subsample_fpga(input_features, input_features_mask)
             for layer_idx in range(self.AUD_LAYERS):
@@ -2337,12 +2504,23 @@ class Gemma4AudioMixin:
                 self.compile_audio_layer_conv(layer_idx)
                 self.compile_audio_layer_ffn2(layer_idx)
                 self.compile_audio_layer_norm_out(layer_idx)
+            self._aud_flush()
             self._emit_aud_embed_project_chain()
             self.generate_instruction_halt()
+            if sched is not None:
+                worker_addrs = sched.finalize()
+                for w in reversed(sched.workers):
+                    w.release_isa_reg()
             self.stop_capture()
             program = b"".join(inst.get_bytes() for inst in self.capture_buffer)
             self.clear_capture_buffer()
+        except BaseException:
+            if sched is not None and sched._program_open:
+                sched.abort_program()
+            raise
         finally:
+            self._aud_sched = None
+            self._aud_pending = []
             self._oneshot_mode = False
             self._set_silent(previous_silent)
             self._program_dram_base = saved_base
@@ -2359,9 +2537,19 @@ class Gemma4AudioMixin:
             "proj_dim": self.AUD_PROJ_DIM,
             "out_dim": self.AUD_OUT_DIM,
             "tensor_base": f"0x{tensor_base:X}",
+            "tensor_top": f"0x{tensor_top:X}",
             "program_version": AUDIO_PROGRAM_VERSION,
             "includes_subsample": True,
+            "multi_core": self.multi_core,
         })
+        if sched is not None:
+            for engine_idx, (w, addr) in enumerate(zip(sched.workers, worker_addrs), start=1):
+                blob = b"".join(inst.get_bytes() for inst in w.capture_buffer)
+                self.mc_arena.check_isa_fits(engine_idx, addr, len(blob))
+                self._store_program_section(f"audio_worker{engine_idx}", addr, blob, {
+                    "parent": "audio", "engine_idx": engine_idx, "multi_core": self.multi_core,
+                    "num_frames": self._aud_num_frames, "program_version": AUDIO_PROGRAM_VERSION})
+                w.clear_capture_buffer()
         print(f"  [Audio] stored {len(program)/1024/1024:.1f} MB FPGA section "
               f"at 0x{base_addr:X} in {time.perf_counter()-started:.1f}s")
 
@@ -2391,8 +2579,26 @@ class Gemma4AudioMixin:
         self._next_program_dram_addr = program_addr
         self.dma_write(DMA_DEVICE_H2C, program_addr, program, len(program))
         self.allocate_program_dram(len(program))
+        # Worker row-block programs (multi-engine): re-uploaded every run, since
+        # the other stages' workers share the same ISA slices.
+        sched = self._ensure_stage_scheduler("audio") if self.multi_core > 1 else None
+        worker_addrs = []
+        if sched is not None:
+            for engine_idx, w in enumerate(sched.workers, start=1):
+                wmeta, wbytes = self._get_program_section(f"audio_worker{engine_idx}")
+                if wmeta is None:
+                    raise FileNotFoundError(f"audio_worker{engine_idx} section is not compiled")
+                addr = int(wmeta["dram_base"], 16)
+                w._next_program_dram_addr = addr
+                w.dma_write(DMA_DEVICE_H2C, addr, wbytes, len(wbytes))
+                w.allocate_program_dram(len(wbytes))
+                worker_addrs.append(addr)
+            sched.preclear_flags()
+            sched.start_workers(worker_addrs)
         self.start_execute_from_dram(program_addr)
         self.wait_queue(600.0)
+        for w in sched.workers if sched is not None else []:
+            w.wait_queue(600.0)
         self._audio_hw_latency_us = self.report_latency_in_us()
         return self.dma_from_accelerator_memory(
             self.AUD_FEATURES_FINAL,
@@ -2457,6 +2663,7 @@ class Gemma4AudioMixin:
         program_base = self._program_dram_base
         self.audio_weight_init()
         raw_frames = int(input_features.shape[1])
+        self._aud_mel_frames = raw_frames
         h0 = (raw_frames + 1) // 2
         soft_frames = (h0 + 1) // 2
         self.audio_tensor_init(soft_frames)

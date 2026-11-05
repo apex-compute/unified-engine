@@ -65,6 +65,30 @@ layout. The comparison runner rejects empty decoded text and padding-only
 output, even when token lists match. U55C placement has offline coverage;
 U55C hardware results are not available.
 
+## Audio encoder on N engines
+
+The audio encoder (subsampling convs, 12 Conformer layers, embedder) runs on
+every engine of `--multi-core N`, split by audio frame. Per-frame work (norms,
+clips, every Linear, SiLU/GLU, residuals) runs as one region over the engines'
+row blocks; the steps that mix frames split on another axis: the rel-pos
+attention term by head, the chunked attention by block of frames, and the
+causal depthwise conv by rows with a 4-row halo. Worker programs are stored as
+`audio_worker<i>` sections. SiLU and GLU take their sigmoid through a 64x64
+identity over the (n/64, 64) view instead of an (n, n) one (4096x4096 for the
+FFN), exact in bf16 and 64x less matmul work.
+
+Output is bit-identical to the single-engine program. 5.1 s clip
+(`test_samples/apex.wav`, 128 frames), Alveo U50 at 333 MHz:
+
+| | Audio encoder, HW | Model GFLOPS (76.2 GFLOP) |
+|---|---:|---:|
+| Before (engine 0, N x N identity sigmoid) | 5.90 s | 12.9 |
+| 1 engine | 2.98 s | 25.6 |
+| 8 engines | 0.45 s | 169 (49% of peak) |
+
+E2B audio TTFT (HW) drops from 8.2 s to 2.8 s. The single-engine (`--multi-core
+1`) audio path decodes only `<pad>` on the U50, with or without this change.
+
 ## Build and run
 
 Run these commands from the repository root with FPGA access through XDMA.

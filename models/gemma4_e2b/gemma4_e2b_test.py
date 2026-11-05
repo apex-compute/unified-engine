@@ -2234,6 +2234,13 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         except Exception:
             return None
 
+    def _model_flops_audio(self) -> float | None:
+        try:
+            return float(_model_flops.audio_flops(
+                self._audio_cfg, int(self._aud_mel_frames), int(self.AUD_OUT_DIM)))
+        except Exception:
+            return None
+
     def _model_flops_prefill(self) -> float | None:
         # self.seq_len is NOT a safe fallback here: it is live, mutable state
         # that run_gemma4_profile's decode-position probing (_prepare_decode_
@@ -2331,6 +2338,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "vision_wall_s": _g("_vis_e2e_s"),
             "audio_hw_s": aud_us / 1e6 if aud_us else None,
             "audio_wall_s": _g("_audio_e2e_s"),
+            "audio_gflops_model": (self._model_flops_audio() / (aud_us * 1e3)
+                                   if aud_us and self._model_flops_audio() else None),
             "prefill_tokens": pf_seq,
             "prefill_chunks": _g("_prefill_chunk_count"),
             "prefill_hw_s": pf_us / 1e6 if pf_us else None,
