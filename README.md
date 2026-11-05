@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  Contributors: Hasan Unlu, Siqin Liu, Tin Nguyen, Rohit Rao, Dave Wei, Hiruna Vishwamith, Yinuo Zhao
+  Contributors: Hasan Unlu, Siqin Liu, Tin Nguyen, Rohit Rao, Selim Sandal, Hiruna Vishwamith, Yinuo Zhao
 </p>
 
 <p align="center">
@@ -12,7 +12,7 @@
   <a href="mailto:siqin.liu@apexcompute.com">siqin.liu@apexcompute.com</a>,
   <a href="mailto:tin.nguyen@apexcompute.com">tin.nguyen@apexcompute.com</a>,
   <a href="mailto:rohit@apexcompute.com">rohit@apexcompute.com</a>,
-  <a href="mailto:dave.wei@apexcompute.com">dave.wei@apexcompute.com</a>,
+  <a href="mailto:selim@apexcompute.com">selim@apexcompute.com</a>,
   <a href="mailto:hiruna@apexcompute.com">hiruna@apexcompute.com</a>,
   <a href="mailto:yinuo.zhao@apexcompute.com">yinuo.zhao@apexcompute.com</a>
 </p>
@@ -23,12 +23,12 @@
 
 <p align="center">
   <a href="#"><img src="board_pic.jpg" alt="FPGA Board" width="500"></a><br>
-  <a href="https://buy.stripe.com/6oUaEQf6365bgAt0QHds401">&#128722; Purchase FPGA Board with Unified Engine IP Block for $49.99</a><br>
+  <a href="https://buy.stripe.com/14AeV66zxdxD1Fz6b1ds402">&#128722; Purchase FPGA Board with Unified Engine IP Block for $79</a><br>
   Includes ongoing hardware design updates so you always have the latest architecture.
 </p>
 
 <p align="center">
-  <a href="http://discord.gg/hr9BwTUx"><img src="https://img.shields.io/badge/Discord-Join%20Us-7289da?logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://discord.gg/SqprdvQXnC"><img src="https://img.shields.io/badge/Discord-Join%20Us-7289da?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
 # XDMA Driver Setup and Usage Guide
