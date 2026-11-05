@@ -80,6 +80,18 @@ jobs:
           git reset --hard HEAD
           git clean -ffdx -e models
           ./clean_program_bins.sh
+          # Convolution models (user_hw_test.py conv_model_tests): delete the
+          # compiled bins so they are recompiled every run (~1 min) from the
+          # checkpoints kept next to them, as andromeda's CI does from its fresh
+          # clone. user_hw_test.py compiles a conv bin only when it is missing,
+          # so a cached one outlived the format change synced in #271
+          # ("unsupported YOLO artifact version 6").
+          rm -fv models/yolov5s/yolov5s_bin/yolov5s-andromeda.bin \
+                 models/yolov5n/yolov5n_bin/yolov5n-andromeda.bin \
+                 models/unet/unet_bin/unet-andromeda.bin \
+                 models/dpdfnet/dpdfnet_bin/dpdfnet2-andromeda.bin \
+                 models/dpdfnet8khz/dpdfnet8khz_bin/dpdfnet2_8khz-andromeda.bin \
+                 models/bigcodec/bigcodec_bin/bigcodec-andromeda.bin
 
       - name: Run CI suite
         id: ci
