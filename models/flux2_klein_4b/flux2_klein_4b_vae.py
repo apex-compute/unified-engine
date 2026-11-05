@@ -16,13 +16,16 @@ contiguously ("tiled") for the host to unpack.
 
   1x1 conv    with C and OC multiples of 64 the map IS a row-major [pixels, C]
               matrix: one quantized-B matmul (A @ W^T + bias) per image row.
-  conv        the layer driver's exact tile grid; per tile one strided DRAM->URAM
-              read of the window straight from the padded map, CONV2D with
-              weight_reuse (the hardware loads the conv's one [oc][tap] IF8 pattern
-              from the constant image into URAM_B per launch and replays it for every
-              tile pixel; RTL with UE_CONV_CTRL[30], andromeda 927fd8d+), and strided
-              URAM->DRAM writes of the tile rows into the output map. Tile ranges of
-              every (OC chunk, geometry group) are split over the engines.
+  conv        the layer driver's tile grid, planned with the largest URAM_A window
+              region (CONV_WB_CANDIDATES) that still leaves every engine a tile, so
+              the small maps are not cut into many tiny launches; per tile one
+              strided DRAM->URAM read of the window straight from the padded map,
+              then one CONV2D per OC chunk with weight_reuse (the hardware loads the
+              chunk's [oc][tap] IF8 pattern from the constant image into URAM_B per
+              launch and replays it for every tile pixel; RTL with UE_CONV_CTRL[30],
+              andromeda 927fd8d+), and strided URAM->DRAM writes of the tile rows
+              into the output map. Tiles are split over the engines; each engine runs
+              all OC chunks of its tiles off one window load.
   3x3 conv    alternative (config vae.conv3x3_mode = "matmul", for images without
               weight reuse, whose walker re-streams the whole weight block per output
               pixel, one byte per MAC, capped at half rate by the 32 B/cycle AXI):
@@ -33,12 +36,16 @@ contiguously ("tiled") for the host to unpack.
               The partial sums accumulate in place through the full-matrix C operand;
               the border pixels of the rows get junk and are re-zeroed afterwards.
   GroupNorm   pass 1 lane-wise pixel sums into slotted accumulators (flushed every
-              32 chunks); the flush blocks are transposed with an identity matmul
-              and summed by a ones matmul on the bf20 ladder; a group-average
-              matmul pools per group; pass 2 does the same for the centred squares;
-              rsqrt by Newton iteration; pass 3 applies x*A_c + B_c.
-  SiLU        the layer driver's max(x,0)/exp/polynomial form; the [x, 0] pair
-              map it needs is built on device with a strided write.
+              32 chunks); each engine transposes ITS flush blocks with an identity
+              matmul and sums them by a ones matmul on the bf20 ladder, the engines'
+              partial rows are added after a barrier, and a group-average matmul
+              pools per group; pass 2 does the same for the centred squares;
+              rsqrt by Newton iteration; pass 3 applies x*A_c + B_c and, for the
+              norms a SiLU follows (every one but the attention's), the SiLU right
+              there in URAM: max(y, 0) by the MAXPOOL walker over a two-row map
+              (the chunk half and a zero block), then the layer driver's
+              exp(-|y|) / polynomial form on the free regions of both banks, so the
+              activation never takes a second trip through DRAM.
   add         rounds of ELTWISE_ADD.
   upsample    per input row: one read, four strided writes (2 rows x 2 parities).
   attention   unified_attention_core over query-row shards.
@@ -69,13 +76,13 @@ import flux2_klein_4b_weights as W  # noqa: E402
 
 LINE = UE_VECTOR_SIZE * 2          # one 64-lane bf16 URAM line (bytes)
 URAM_B = 0x80000                   # URAM bank B byte offset
-WB = 0x300 << 7                    # conv writeback region in URAM_A (bytes)
 NEWTON_ITERS = 40                  # rsqrt from y0 = 2^-10 up to 1e3
 MAP_ALIGN = 256 * 1024             # map buffers are padded so round-based ops may overrun
 K_PIECE = 8192                     # ladder reduction piece (rows) per matmul
 GN_FLUSH = udc.GROUP_NORM_MAX_ACC_DEPTH
 MM9_MAX_M = 2048                   # pixels per row-block matmul of a 3x3 conv (R = MM9_MAX_M // Wp rows)
 WEIGHT_REUSE_BANK = 512 * 1024     # URAM_B: the one [oc][tap] weight pattern a weight_reuse launch holds
+CONV_WB_CANDIDATES = (0x300, 0x600, 0x900, 0xC00)   # URAM_A lines below the conv writeback: the window region
 
 
 def emitter_hash() -> str:
@@ -230,7 +237,7 @@ class Flux2VaeOneShot:
         return s
 
     @staticmethod
-    def _conv_geometry(C, H, Wd, OC, kh, kw, pad):
+    def _conv_geometry(C, H, Wd, OC, kh, kw, pad, wb_lines=0x300):
         ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
         taps = kh * kw * ct
         patch = kh * kw * C
@@ -239,13 +246,25 @@ class Flux2VaeOneShot:
         use_gather = can_gather and max(kh * kw * ((C + 3) // 4), OC * chunks) < OC * taps
         out_h, out_w, oc_chunk, tiles = udc.plan_conv2d_layer_tiles(
             c_in=C, oc_count=OC, in_h=H, in_w=Wd, kernel_h=kh, kernel_w=kw, stride_s=1,
-            pad=pad, pad_h=pad, dilation=1, gather=use_gather, bias_enabled=True)
+            pad=pad, pad_h=pad, dilation=1, gather=use_gather, bias_enabled=True, wb_uram_addr=wb_lines)
         groups, act_bytes, chunk_out = udc.conv2d_tiled_dram_layout(tiles, ct, oc_chunk)
         sg = max(groups, key=lambda g: g[2] * g[3])
         return dict(ct=ct, taps=taps, chunks=chunks, use_gather=use_gather, out_h=out_h, out_w=out_w,
                     oc_chunk=oc_chunk, n_chunks=OC // oc_chunk, tiles=tiles, groups=groups,
                     act_bytes=act_bytes, chunk_out=chunk_out, npix=sg[2] * sg[3],
-                    blocks_per_oc=chunks if use_gather else taps)
+                    blocks_per_oc=chunks if use_gather else taps, wb=wb_lines)
+
+    def _best_conv_geometry(self, C, H, Wd, OC, kh, kw, pad):
+        """The URAM split with the fewest tiles that still gives every engine one
+        (the weight pattern is re-DMA'd per launch, so fewer, larger tiles amortise it)."""
+        best = None
+        for wb in CONV_WB_CANDIDATES:
+            g = self._conv_geometry(C, H, Wd, OC, kh, kw, pad, wb)
+            n = len(g["tiles"])
+            key = (n >= self.ne, -n if n >= self.ne else n)      # enough tiles first, then the fewest
+            if best is None or key > best[0]:
+                best = (key, g)
+        return best[1]
 
     # ------------------------------------------------------------------ plan
     def plan(self, lat_h: int, lat_w: int) -> dict:
@@ -294,17 +313,12 @@ class Flux2VaeOneShot:
         return {"latent": [self.lat, lat_h, lat_w], "const_base": self.const_base, "const_size": self.const_size,
                 "arena_end": self.arena_end, "input": self.in_buf.addr, "input_bytes": self.in_buf.lines * LINE,
                 "output": self.out_buf["addr"], "output_bytes": self.out_buf["bytes"],
-                "out_shape": self.out_buf["shape"], "pairs": [self.pairs_addr, self.pairs_bytes],
-                "macs": self.macs,
+                "out_shape": self.out_buf["shape"], "macs": self.macs,
                 "steps": [{"kind": s["kind"], "name": s["name"], "out": s["out_shape"]} for s in self.steps]}
 
     # graph ------------------------------------------------------------
     def _walk(self, lat_h, lat_w):
         self.in_buf = self._new_buf("padded", self.lat, lat_h, lat_w)
-        # the [x, 0] pair map SiLU needs: sized by the largest map, odd lines stay zero
-        self.pairs_bytes = 2 * max(Buf.bytes_of("padded", c, h, w) for c, h, w in self._map_sizes(lat_h, lat_w))
-        self.pairs_addr = self._alloc(self.pairs_bytes)
-        self._step("zero_pairs", "pairs", None, {})
         x0 = self.conv(self.in_buf, "post_quant_conv", "padded")
         x = self.conv(x0, "decoder.conv_in", "padded")
         self._release(x0)
@@ -322,33 +336,17 @@ class Flux2VaeOneShot:
                 self._release(x)
                 x = self.conv(u, f"decoder.up_blocks.{i}.upsamplers.0.conv", "padded")
                 self._release(u)
-        g = self.gn(x, "decoder.conv_norm_out")
+        h = self.gn(x, "decoder.conv_norm_out", silu=True)
         self._release(x)
-        h = self.silu(g, "decoder.conv_norm_out")
-        self._release(g)
         out = self.conv(h, "decoder.conv_out", "tiled")
         self._release(h)
         return out
 
-    def _map_sizes(self, lat_h, lat_w):
-        c = self.block_out[-1]
-        h, w = lat_h, lat_w
-        yield (c, h, w)
-        for i, cout in enumerate(reversed(self.block_out)):
-            yield (cout, h, w)
-            if i < len(self.block_out) - 1:
-                h, w = 2 * h, 2 * w
-                yield (cout, h, w)
-
     def resnet(self, x, p, cin, cout):
-        g1 = self.gn(x, p + ".norm1")
-        s1 = self.silu(g1, p + ".norm1")
-        self._release(g1)
+        s1 = self.gn(x, p + ".norm1", silu=True)
         h = self.conv(s1, p + ".conv1", "padded")
         self._release(s1)
-        g2 = self.gn(h, p + ".norm2")
-        s2 = self.silu(g2, p + ".norm2")
-        self._release(g2)
+        s2 = self.gn(h, p + ".norm2", silu=True)
         h2 = self.conv(s2, p + ".conv2", "padded")
         self._release(s2)
         self._release(h)
@@ -394,7 +392,7 @@ class Flux2VaeOneShot:
                 and x.layout == "padded" and out_layout == "padded" and self.conv3x3_mode == "matmul":
             return self.conv3x3_mm(x, key)
         OC_eff = OC if (OC % UE_VECTOR_SIZE == 0 or out_layout == "tiled") else _align(OC, UE_VECTOR_SIZE)
-        g = self._conv_geometry(C, H, Wd, OC_eff, kh, kw, pad)
+        g = self._best_conv_geometry(C, H, Wd, OC_eff, kh, kw, pad)
         n_oc, nck = g["oc_chunk"], g["n_chunks"]
         block_bytes = n_oc * g["blocks_per_oc"] * UE_VECTOR_SIZE
         assert block_bytes <= WEIGHT_REUSE_BANK, f"{key}: weight pattern {block_bytes} B exceeds URAM_B"
@@ -413,13 +411,15 @@ class Flux2VaeOneShot:
         else:
             out_buf = self._new_buf(out_layout, OC, g["out_h"], g["out_w"])      # ct(OC) == ct(OC_eff)
             out = out_buf
-        # work split: every (chunk, group) tile range split evenly across engines
+        # work split: the whole tile grid (the groups are contiguous tile ranges) split evenly across
+        # engines, each engine's share cut at group boundaries; an engine runs all OC chunks of a
+        # tile off one window load
         per_engine = [[] for _ in range(self.ne)]
-        for ci in range(nck):
+        for e, (a, b) in enumerate(_split(len(g["tiles"]), self.ne)):
             for gi, grp in enumerate(g["groups"]):
-                for e, (a, b) in enumerate(_split(grp[1] - grp[0], self.ne)):
-                    if b > a:
-                        per_engine[e].append((ci, gi, grp[0] + a, grp[0] + b))
+                lo, hi = max(a, grp[0]), min(b, grp[1])
+                if hi > lo:
+                    per_engine[e].append((gi, lo, hi))
         macs = g["out_h"] * g["out_w"] * OC * kh * kw * C
         self.macs += macs
         self._step("conv", key, out_buf if out_buf is not None else out["shape"],
@@ -466,7 +466,8 @@ class Flux2VaeOneShot:
                                              ranges=_split(H, self.ne), macs=H * Wd * OC * C))
         return out
 
-    def gn(self, x: Buf, key: str):
+    def gn(self, x: Buf, key: str, silu: bool = False):
+        """GroupNorm, with the SiLU that follows it fused into the apply pass when ``silu``."""
         C, H, Wd = x.shape()
         ct = x.ct
         assert x.layout == "padded"
@@ -478,37 +479,29 @@ class Flux2VaeOneShot:
         n_fl = [-(-(b - a) // flush_every) if b > a else 0 for a, b in ranges]
         F = sum(n_fl)
         bpp = max(1, K_PIECE // slots)                             # flush blocks per reduction piece
-        pieces = [(f0, min(F, f0 + bpp)) for f0 in range(0, F, bpp)]
+        # every engine reduces its own flush blocks (global indices [b0, b1)) in pieces; the partial
+        # sums meet in a shared row per engine after a barrier
+        starts = [sum(n_fl[:e]) for e in range(self.ne)]
+        pieces = [[(f0, min(b0 + n, f0 + bpp)) for f0 in range(b0, b0 + n, bpp)] for b0, n in zip(starts, n_fl)]
         gamma = self._calloc(ct * LINE)
         beta = self._calloc(ct * LINE)
         self.gn_params[key] = (gamma, beta)
         SUM = self._scratch("gn_SUM", F * chunk_bytes)             # all engines' flush blocks, contiguous
         SQ = self._scratch("gn_SQ", F * chunk_bytes)
-        sum_off = [sum(n_fl[:e]) * chunk_bytes for e in range(self.ne)]
+        sum_off = [b0 * chunk_bytes for b0 in starts]
+        SH = [self._scratch(f"gn_SH{j}", self.ne * ct * LINE) for j in range(2)]   # partial sums, per pass
         # per-engine scratch for the redundant reduction / fold
         per = [dict(T=self._scratch(f"gn_T{e}", C * bpp * slots * 2), S=self._scratch(f"gn_S{e}", 64 * C * 2),
                     P=self._scratch(f"gn_P{e}", 64 * C * 2), ROW=self._scratch(f"gn_ROW{e}", 8 * ct * LINE),
                     REP=self._scratch(f"gn_REP{e}", 3 * chunk_bytes)) for e in range(self.ne)]
         out = self._new_buf("padded", C, H, Wd)
-        self._step("gn", key, out, dict(x=x, out=out, C=C, ct=ct, slots=slots, slot_lines=slot_lines, n_full=n_full,
-                                        tail=tail, flush_every=flush_every, ranges=ranges, n_fl=n_fl, F=F,
-                                        pieces=pieces, SUM=SUM, SQ=SQ, sum_off=sum_off, per=per, gamma=gamma,
-                                        beta=beta, chunk_bytes=chunk_bytes, n_pix=H * Wd))
-        return out
-
-    def silu(self, x: Buf, key: str):
-        C, H, Wd = x.shape()
-        total_lines = x.lines
-        round_lines = min(total_lines, 0xFFF // 4, (udc.URAM_NEAR_FULL_SIZE // LINE) // 2)
-        n_rounds = -(-total_lines // round_lines)
-        chunk_bytes = round_lines * LINE
-        assert n_rounds * chunk_bytes * 2 <= self.pairs_bytes
-        out = self._new_buf("padded", C, H, Wd)
-        ranges = _split(n_rounds, self.ne)
-        SCR = [[self._scratch(f"silu_{e}_{j}", chunk_bytes) for j in range(3)] if b > a else None
-               for e, (a, b) in enumerate(ranges)]
-        self._step("silu", key + ".silu", out, dict(x=x, out=out, total_lines=total_lines, round_lines=round_lines,
-                                          n_rounds=n_rounds, chunk_bytes=chunk_bytes, ranges=ranges, SCR=SCR))
+        if silu:
+            assert slot_lines % 2 == 0 and 3 * slot_lines <= 4096 and slot_lines + slot_lines // 2 <= 0xFFF
+        self._step("gn", key + ".silu" if silu else key, out,
+                   dict(x=x, out=out, C=C, ct=ct, slots=slots, slot_lines=slot_lines, n_full=n_full,
+                        tail=tail, flush_every=flush_every, ranges=ranges, n_fl=n_fl, F=F,
+                        pieces=pieces, SUM=SUM, SQ=SQ, SH=SH, sum_off=sum_off, per=per, gamma=gamma,
+                        beta=beta, chunk_bytes=chunk_bytes, n_pix=H * Wd, silu=silu))
         return out
 
     def add(self, x: Buf, y: Buf, key: str):
@@ -608,25 +601,13 @@ class Flux2VaeOneShot:
         if self.e == 0:
             self.ue._flops_acc += 2 * M * K * N
 
-    # zero the pair map once --------------------------------------------
-    def _emit_zero_pairs(self, st):
-        if self.e == 0:
-            n = udc.URAM_NEAR_FULL_SIZE
-            self._load(self.consts["ZERO"], 0, n)
-            full, rem = divmod(self.pairs_bytes, n)
-            if full:
-                self._loop_store(0, self.pairs_addr, n, full)
-            if rem:
-                self._store(0, self.pairs_addr + full * n, rem)
-        self._B()
-
     # conv -------------------------------------------------------------
     def _emit_conv(self, st):
         eng, e = self.eng, self.e
         g, x, out = st["g"], st["x"], st["out"]
         nck, n_oc, C = st["nck"], st["n_oc"], st["C"]
         kh, kw, pad = st["kh"], st["kw"], st["pad"]
-        # tiles; the hardware loads the chunk's [oc][tap] pattern into URAM_B per launch
+        wb = g["wb"] * LINE                         # conv writeback region (URAM_A, above the window)
         lalu_mode, lalu_a, lalu_b = udc._conv_fused_lalu(False, False, False)
         ct_in = x.ct
         bsrc = x.border - pad                       # window coords are in the conv's own padding
@@ -637,33 +618,31 @@ class Flux2VaeOneShot:
             dst_px = ct_out * LINE
             dst_row = out.Wp * dst_px
             OC = st["OC"]
-        last_ci = None
-        for ci, gi, t0, t1 in st["work"][e]:
+        for gi, t0, t1 in st["work"][e]:
             (start, stop, th, tw, win_h, win_w, _ao, _ab, out_off, out_b, _rl) = g["groups"][gi]
-            if ci != last_ci:
-                eng.accelerator_memory_to_scale_sram(st["SA"][ci], n_oc * g["blocks_per_oc"])
-                eng.accelerator_memory_to_bias_sram(st["BA"][ci], n_oc)
-                last_ci = ci
+            chunk = win_w * ct_in * LINE
             for t in range(t0, t1):
                 oy0, ox0, _th, _tw, y0, x0, _wh, _ww = g["tiles"][t]
-                chunk = win_w * ct_in * LINE
                 self._load(x.addr + ((y0 + bsrc) * x.Wp + x0 + bsrc) * ct_in * LINE, 0, win_h * chunk,
                            chunk=chunk, jump=src_row)
-                eng.start_queue_for_conv2d_operation(
-                    act_sram_start_addr=0, output_sram_wb_addr=WB, weights_dram_addr=st["WBLK"][ci],
-                    kernel_w=kw, kernel_h=kh, ct=ct_in, oc_count=n_oc, out_w=tw, out_h=th, w_pad=win_w,
-                    stride_s=1, data_type=TYPE.IF8, bias_enable=True, lalu_mode=lalu_mode, lalu_a=lalu_a,
-                    lalu_b=lalu_b, dilation=1, gather=g["use_gather"], c_in=C, weight_reuse=True)
-                if tiled:
-                    self._store(WB, out["addr"] + ci * g["chunk_out"] + out_off + (t - start) * out_b, out_b)
-                elif n_oc == OC:
-                    self._store(WB, out.addr + ((oy0 + out.border) * out.Wp + ox0 + out.border) * dst_px,
-                                th * tw * dst_px, chunk=tw * dst_px, jump=dst_row)
-                else:
-                    for py in range(th):
-                        self._store(WB + py * tw * n_oc * 2,
-                                    out.addr + ((oy0 + py + out.border) * out.Wp + ox0 + out.border) * dst_px + ci * n_oc * 2,
-                                    tw * n_oc * 2, chunk=n_oc * 2, jump=dst_px)
+                for ci in range(nck):               # the hardware loads chunk ci's pattern into URAM_B per launch
+                    eng.accelerator_memory_to_scale_sram(st["SA"][ci], n_oc * g["blocks_per_oc"])
+                    eng.accelerator_memory_to_bias_sram(st["BA"][ci], n_oc)
+                    eng.start_queue_for_conv2d_operation(
+                        act_sram_start_addr=0, output_sram_wb_addr=wb, weights_dram_addr=st["WBLK"][ci],
+                        kernel_w=kw, kernel_h=kh, ct=ct_in, oc_count=n_oc, out_w=tw, out_h=th, w_pad=win_w,
+                        stride_s=1, data_type=TYPE.IF8, bias_enable=True, lalu_mode=lalu_mode, lalu_a=lalu_a,
+                        lalu_b=lalu_b, dilation=1, gather=g["use_gather"], c_in=C, weight_reuse=True)
+                    if tiled:
+                        self._store(wb, out["addr"] + ci * g["chunk_out"] + out_off + (t - start) * out_b, out_b)
+                    elif n_oc == OC:
+                        self._store(wb, out.addr + ((oy0 + out.border) * out.Wp + ox0 + out.border) * dst_px,
+                                    th * tw * dst_px, chunk=tw * dst_px, jump=dst_row)
+                    else:
+                        for py in range(th):
+                            self._store(wb + py * tw * n_oc * 2,
+                                        out.addr + ((oy0 + py + out.border) * out.Wp + ox0 + out.border) * dst_px
+                                        + ci * n_oc * 2, tw * n_oc * 2, chunk=n_oc * 2, jump=dst_px)
         if not tiled and e == 0:
             self._zero_borders(out)
         if e == 0:
@@ -764,12 +743,13 @@ class Flux2VaeOneShot:
                     if i != c1 - 1:
                         self._load(ZERO, b_ln(B_ACC), cb)
 
-        def reduce_(region, scale):
-            """Column sums of all flush blocks (ladder, in pieces of <= K_PIECE rows) -> group-averaged
-            row (scaled) in URAM_A line 0."""
-            # the running sum lives in DRAM between pieces: the matmul core stages through URAM
+        def reduce_(region, scale, shared):
+            """This engine column-sums ITS flush blocks on the ladder (pieces of <= K_PIECE rows) into a
+            shared row; after a barrier every engine adds the engines' partials, pools per group and
+            scales -> row in URAM_A line 0. (One engine transposing every block was ~13 ms per pass.)"""
             acc = per["ROW"] + 4 * ct * LINE
-            for pi, (f0, f1) in enumerate(st["pieces"]):
+            mine = st["pieces"][e]
+            for pi, (f0, f1) in enumerate(mine):
                 K = (f1 - f0) * slots
                 self._mm(C, C, K, self.consts[f"IDENT{C}"], region + f0 * cb, per["T"])    # T = blocks^T [C, K]
                 self._mm(64, K, C, self.consts["ONES"], per["T"], per["S"])                # S[0] = column sums
@@ -778,6 +758,19 @@ class Flux2VaeOneShot:
                     self._load(acc, b_ln(0), ct * LINE)
                     eng.eltwise_add_core(a_ln(0), b_ln(0), a_ln(0), n_elem)
                 self._store(a_ln(0), acc, ct * LINE)
+            if mine:
+                self._store(a_ln(0), shared + e * ct * LINE, ct * LINE)                    # my partial
+            self._B()
+            first = True
+            for k in range(self.ne):
+                if not st["pieces"][k]:
+                    continue
+                if first:
+                    self._load(shared + k * ct * LINE, a_ln(0), ct * LINE)
+                    first = False
+                else:
+                    self._load(shared + k * ct * LINE, b_ln(0), ct * LINE)
+                    eng.eltwise_add_core(a_ln(0), b_ln(0), a_ln(0), n_elem)
             self._store(a_ln(0), per["S"], ct * LINE)                                      # S[0] = total sums
             self._mm(64, C, C, per["S"], self.consts[f"GAVG{C}"], per["P"])                # P[0] = group averages
             self._load(per["P"], a_ln(0), ct * LINE)
@@ -787,20 +780,16 @@ class Flux2VaeOneShot:
             """Repeat the ct-line row at URAM_A ``src_line`` ``slots`` times into DRAM ``dst``."""
             self._loop_store(a_ln(src_line), dst, ct * LINE, slots)
 
-        # ---- pass 1: sums
+        # ---- pass 1: sums (an engine without chunks still joins every barrier and the fold)
         pass_(st["SUM"], centred=False)
         self._B()
-        if c1 <= c0:                       # nothing to normalise on this engine
-            self._B()
-            self._B()
-            return
-        reduce_(st["SUM"], 1.0 / st["n_pix"])                                       # A0 = mean_c
+        reduce_(st["SUM"], 1.0 / st["n_pix"], st["SH"][0])                          # A0 = mean_c
         self._store(a_ln(0), per["ROW"], ct * LINE)                                 # ROW[0] = mean
         rep_(0, per["REP"])
         # ---- pass 2: centred squares
         pass_(st["SQ"], centred=True)
         self._B()
-        reduce_(st["SQ"], 1.0 / st["n_pix"])                                        # A0 = var_g
+        reduce_(st["SQ"], 1.0 / st["n_pix"], st["SH"][1])                           # A0 = var_g
         eng.broadcast_add(self.gn_eps, a_ln(0), a_ln(0), n_elem)                    # A0 = v = var + eps
         # Newton rsqrt: y <- y * (1.5 - 0.5 * v * y^2), from y0 = 2^-10
         self._load(ZERO, b_ln(0), ct * LINE)                                         # B0 = zeros
@@ -824,82 +813,51 @@ class Flux2VaeOneShot:
         eng.eltwise_sub_core(a_ln(5 * ct), b_ln(4 * ct), a_ln(5 * ct), n_elem)       # A5 = B_c
         rep_(3 * ct, per["REP"])                                                     # REP = A repeated
         rep_(5 * ct, per["REP"] + cb)                                                # REP + cb = B repeated
-        # ---- pass 3: apply
+        # ---- pass 3: apply (and the SiLU that follows, in URAM)
         self._load(per["REP"], b_ln(0), 2 * cb)
+        fused = bool(st.get("silu"))
+        if fused:
+            HALF = slot_lines // 2
+            # URAM_A: chunk [0, SL), zeros [SL, SL+H), XN [SL+H, 2SL), T [2SL, 2SL+H); URAM_B: REP A/B [0, 2SL),
+            # XP [2SL, 2SL+H), T [2SL+H, 3SL), zeros [3SL, 3SL+H)
+            A_ZERO, A_XN, A_T = slot_lines, slot_lines + HALF, 2 * slot_lines
+            B_XP, B_T, B_ZERO = 2 * slot_lines, 2 * slot_lines + HALF, 3 * slot_lines
+            self._load(ZERO, a_ln(A_ZERO), HALF * LINE)
+            self._load(ZERO, b_ln(B_ZERO), HALF * LINE)
+            coeffs = udc.SILU_RECIP_POLY
         for i in range(c0, c1):
             tl = take_lines(i)
             tb = tl * LINE
             self._load(x.addr + i * cb, a_ln(A_CHUNK), tb)
             eng.eltwise_mul_core(a_ln(A_CHUNK), b_ln(0), a_ln(A_CHUNK), tl * UE_VECTOR_SIZE)
             eng.eltwise_add_core(a_ln(A_CHUNK), b_ln(slot_lines), a_ln(A_CHUNK), tl * UE_VECTOR_SIZE)
-            self._store(a_ln(A_CHUNK), out.addr + i * cb, tb)
+            if not fused:
+                self._store(a_ln(A_CHUNK), out.addr + i * cb, tb)
+                continue
+            for h0 in range(0, tl, HALF):
+                n = min(HALF, tl - h0)
+                ne_ = n * UE_VECTOR_SIZE
+                y = A_CHUNK + h0
+                # XP = max(y, 0): MAXPOOL 2x1 over a two-row map, row 0 = y, row 1 = zeros (row pitch A_ZERO - y)
+                eng.start_queue_for_maxpool2d_operation(act_sram_start_addr=a_ln(y), output_sram_wb_addr=b_ln(B_XP),
+                                                        kernel_w=1, kernel_h=2, out_w=n, out_h=1,
+                                                        w_pad=A_ZERO - y, stride_s=1)
+                eng.eltwise_sub_core(a_ln(y), b_ln(B_XP), a_ln(A_XN), ne_)           # XN = y - XP = min(y, 0)
+                eng.eltwise_sub_core(a_ln(A_XN), b_ln(B_XP), a_ln(A_T), ne_)         # -|y|
+                eng.exp_core(a_ln(A_T), a_ln(A_T), ne_)                               # t = exp(-|y|) in (0, 1]
+                eng.eltwise_add_core(a_ln(A_T), b_ln(B_ZERO), b_ln(B_T), ne_)         # B_T = t
+                eng.broadcast_mul(float(coeffs[-1]), a_ln(A_T), a_ln(A_T), ne_)       # p(t) ~ 1 / (1 + t), Horner
+                eng.broadcast_add(float(coeffs[-2]), a_ln(A_T), a_ln(A_T), ne_)
+                for coeff in reversed(coeffs[:-2]):
+                    eng.eltwise_mul_core(a_ln(A_T), b_ln(B_T), a_ln(A_T), ne_)
+                    eng.broadcast_add(float(coeff), a_ln(A_T), a_ln(A_T), ne_)
+                eng.eltwise_mul_core(a_ln(A_T), b_ln(B_XP), b_ln(B_XP), ne_)          # XP * p
+                eng.eltwise_mul_core(a_ln(A_T), b_ln(B_T), b_ln(B_T), ne_)            # t * p
+                eng.eltwise_mul_core(a_ln(A_XN), b_ln(B_T), a_ln(A_XN), ne_)          # XN * t * p
+                eng.eltwise_add_core(a_ln(A_XN), b_ln(B_XP), a_ln(A_XN), ne_)         # silu(y) = XP p + XN t p
+                self._store(a_ln(A_XN), out.addr + i * cb + h0 * LINE, n * LINE)
         if e == 0:
             self._zero_borders(out)
-        self._B()
-
-    # SiLU -------------------------------------------------------------
-    def _emit_silu(self, st):
-        eng, e = self.eng, self.e
-        x, out = st["x"], st["out"]
-        rl, cb, n_rounds = st["round_lines"], st["chunk_bytes"], st["n_rounds"]
-        r0, r1 = st["ranges"][e]
-        if r1 > r0:
-            # 1. build [x, 0] pairs for this engine's rounds (odd lines of the pair map are zero)
-            for r in range(r0, r1):
-                take = min(rl, st["total_lines"] - r * rl)
-                self._load(x.addr + r * cb, 0, take * LINE)
-                self._store(0, self.pairs_addr + r * 2 * cb, take * LINE, chunk=LINE, jump=2 * LINE)
-            # 2. the layer driver's SiLU loop over the pair rounds
-            XP, XN, WQ = st["SCR"][e]
-            coeffs = udc.SILU_RECIP_POLY
-            pair_bytes = 2 * cb
-            elements = rl * UE_VECTOR_SIZE
-            pair_reg = eng.alloc_isa_reg()
-            out_reg = eng.alloc_isa_reg()
-            eng.generate_instruction_add_set(pair_reg, (self.pairs_addr + r0 * pair_bytes) >> 3)
-            eng.generate_instruction_add_set(out_reg, (out.addr + r0 * cb) >> 3)
-            start = eng.get_program_dram_addr()
-            eng.generate_instruction_jump_abs(udc.ue_35bit_addr_shifter(
-                start + (eng.capture_count + 1) * INSTRUCTION_SIZE_BYTES))
-            eng.loop_start(loop_cnt=r1 - r0)
-            eng.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=0, element_size=0,
-                                           memcpy_length_bytes=pair_bytes, general_reg_src=pair_reg)
-            eng.start_queue_for_maxpool2d_operation(act_sram_start_addr=0, output_sram_wb_addr=URAM_B,
-                                                    kernel_w=2, kernel_h=1, out_w=rl, out_h=1,
-                                                    w_pad=2 * rl, stride_s=2)
-            self._store(URAM_B, XP, cb)
-            eng.accelerator_memory_to_sram(accelerator_dram_address=0, sram_address=0, element_size=0,
-                                           memcpy_length_bytes=cb, stride_bytes_per_chunk=LINE,
-                                           stride_jump_bytes=2 * LINE, general_reg_src=pair_reg)
-            eng.eltwise_sub_core(0, URAM_B, 0, elements)
-            self._store(0, XN, cb)
-            eng.eltwise_sub_core(0, URAM_B, 0, elements)
-            eng.exp_core(0, 0, elements)
-            self._store(0, WQ, cb)
-            self._load(WQ, URAM_B, cb)
-            eng.broadcast_mul(float(coeffs[-1]), 0, 0, elements)
-            eng.broadcast_add(float(coeffs[-2]), 0, 0, elements)
-            for coeff in reversed(coeffs[:-2]):
-                eng.eltwise_mul_core(0, URAM_B, 0, elements)
-                eng.broadcast_add(float(coeff), 0, 0, elements)
-            eng.eltwise_mul_core(0, URAM_B, URAM_B, elements)
-            self._store(URAM_B, WQ, cb)
-            self._load(XP, URAM_B, cb)
-            eng.eltwise_mul_core(0, URAM_B, 0, elements)
-            self._store(0, XP, cb)
-            self._load(XN, 0, cb)
-            self._load(WQ, URAM_B, cb)
-            eng.eltwise_mul_core(0, URAM_B, 0, elements)
-            self._load(XP, URAM_B, cb)
-            eng.eltwise_add_core(0, URAM_B, 0, elements)
-            eng.sram_to_accelerator_memory(sram_address=0, accelerator_dram_address=0, element_size=0,
-                                           memcpy_length_bytes=cb, general_reg_src=out_reg)
-            eng.generate_instruction_add_imm(src_reg_idx=pair_reg, immediate_value=pair_bytes >> 3)
-            eng.generate_instruction_add_imm(src_reg_idx=out_reg, immediate_value=cb >> 3)
-            body = eng.loop_end()
-            assert body <= 256
-            eng.release_isa_reg()
-            eng.release_isa_reg()
         self._B()
 
     # residual add ------------------------------------------------------

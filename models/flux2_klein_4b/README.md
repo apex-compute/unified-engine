@@ -138,20 +138,23 @@ an ADD_BROADCAST. Each step then:
 **Phase 3, VAE decoder.** `AutoencoderKLFlux2` (32-ch latent, 2x2 patchify,
 `post_quant_conv`, conv_in, mid resnet / single-head attention / resnet, four
 levels of three resnets with nearest-2x upsample convs, GroupNorm/SiLU/conv_out)
-as ONE program: 119 ops emitted into every engine's stream as the third phase
+as ONE program: 89 ops emitted into every engine's stream as the third phase
 of the program set, with the scheduler's flag barriers between them. The host
 DMAs the latent map and the constant image (unrepeated IF8 weight blocks,
 matmul operands of the 1x1 convs, GroupNorm affine rows, identity / ones /
 group-average matrices) in before the phase and reads the image out after it;
 nothing moves between host and board while it runs. Every map lives in DRAM
 channels-in-lanes with a one-pixel zero border kept by its producer. Convs
-keep the layer driver's exact tile grid, each tile one strided DRAM->URAM read
-of its window straight from the padded map, CONV2D with weight reuse (the
-hardware loads the conv's one [oc][tap] IF8 pattern from the constant image
+keep the layer driver's tile grid, planned with the largest URAM_A window
+region that still leaves every engine a tile (2.4x fewer launches than the
+default split); each tile is one strided DRAM->URAM read of its window
+straight from the padded map, then one CONV2D per OC chunk with weight reuse
+(the hardware loads the chunk's [oc][tap] IF8 pattern from the constant image
 into URAM_B per launch and replays it for every tile pixel; needs the RTL with
 UE_CONV_CTRL[30], andromeda 927fd8d or later), and strided writes of the tile
-rows into the output map (tile ranges split over the engines). On that image
-the big convs run at ~94% of peak and the 256x256 decode takes 2.9 s. For
+rows into the output map (the tile grid split evenly over the engines). On
+that image the big convs run at ~94% of peak and the 256x256 decode takes
+2.3 s. For
 images without weight reuse, whose walker re-streams the whole weight block per
 output pixel (one byte per MAC, capped at half rate by the 32 B/cycle AXI:
 40-47% of peak, 5.0 s), `vae.conv3x3_mode = "matmul"` in the config runs the
@@ -160,16 +163,22 @@ instead: for tap (ky, kx) the A operand of output rows y0..y0+R-1 is the R*Wp
 consecutive input pixels starting at padded pixel (y0+ky, kx), so there is no
 im2col and the matmul keeps its B tile across 64 A rows; the partials
 accumulate in place through the full-matrix C operand and the rows' border
-pixels are re-zeroed at the end (70-80% of peak, 3.2 s). The switch is part of
-the program signature.
+pixels are re-zeroed at the end (70-80% of peak). The switch is part of the
+program signature.
 1x1 convs with C, OC multiples of 64 are one quantized-B matmul per image row
 (the map is already a row-major [pixels, C] matrix). GroupNorm accumulates
-lane-wise pixel sums into slotted accumulators, transposes the flush blocks
-with an identity matmul and sums them with a ones matmul on the bf20 ladder,
-pools per group with a group-average matmul, does the same for the centred
-squares, takes rsqrt by Newton iteration and applies `x*A_c + B_c`. SiLU is
-the driver's max/exp/polynomial form on a device-built `[x, 0]` pair map; the
-upsample is one read and four strided writes per input row; the attention runs
+lane-wise pixel sums into slotted accumulators; each engine transposes its own
+flush blocks with an identity matmul and sums them with a ones matmul on the
+bf20 ladder, the engines' partial rows are added after a barrier (one engine
+transposing every block cost ~13 ms per pass, 30-40 ms per norm, a third of the
+decode at the small resolutions; sharded it is ~10 ms), a group-average matmul
+pools per group, the same for the centred squares, rsqrt by Newton iteration,
+and the apply pass does `x*A_c + B_c` and, for the 29 norms a SiLU follows, the
+SiLU right there in URAM (max(y, 0) by the MAXPOOL walker over a two-row map of
+the chunk half and a zero block, then the driver's exp(-|y|) / polynomial form
+on the free regions of both banks), so the activation never makes a second trip
+through DRAM and there is no pair map. The upsample is one read and four
+strided writes per input row; the attention runs
 on compact (seq, C) maps the surrounding 1x1 matmuls write and read directly.
 
 **RoPE.** FLUX rotates interleaved pairs `(2j, 2j+1)` on four 32-dim axes
