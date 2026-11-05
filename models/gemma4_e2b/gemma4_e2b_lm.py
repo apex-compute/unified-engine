@@ -3456,6 +3456,13 @@ class Gemma4LMMixin:
             print(token_char, end="", flush=True)
             if _use_status:
                 _status_update()
+            # Optional per-token hook (the web server streams through it):
+            # on_token(token_id, text) -> True stops generation here.
+            _on_token = getattr(self, "on_token", None)
+            if _on_token is not None and _on_token(token_id, token_char):
+                if _use_status:
+                    _status_teardown()
+                break
         else:
             if _use_status:
                 _status_teardown()

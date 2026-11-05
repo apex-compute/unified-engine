@@ -3458,6 +3458,12 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         token_id = self.prefill_seq[-1]
         global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
+        # Optional cap on generated tokens (a driver such as the web server sets it).
+        _limit = getattr(self, "max_new_tokens", None)
+        if _limit:
+            max_seq_len = min(max_seq_len, self.seq_len + int(_limit))
+        # Optional per-token hook: on_token(token_id, text) -> True stops generation.
+        _on_token = getattr(self, "on_token", None)
         total_latency, total_flop_rate = 0, 0
         decoder_token_cnt = 0
         hw_decode_lats_us: list[float] = []
@@ -3572,6 +3578,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             print(token_char, end="", flush=True)
             if _use_status:
                 _status_update()
+            if _on_token is not None and _on_token(token_id, token_char):
+                if _use_status:
+                    _status_teardown()
+                break
         else:
             if _use_status:
                 _status_teardown()
