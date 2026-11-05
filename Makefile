@@ -9,15 +9,27 @@ user_dma_core: user_dma_core.c
 clean:
 	./clean_program_bins.sh
 
+# Every board's lock (pcie_lock.py): who holds each one, or that it is free.
+lock_status:
+	python3 pcie_lock.py status
+
+# Programming, flashing, loading the driver and rescanning take boards off the
+# bus, so each runs holding every board's lock: it waits for every run on the
+# host to finish, and none starts until it is done. The rescan inside reuses
+# the hold. rescan_xilinx.sh runs as you, not under sudo (it asks for sudo
+# itself): sudo would drop the environment that marks the hold.
+LOCK_ALL := python3 pcie_lock.py all --
+
+# Loading the driver creates every board's nodes, so it holds every board.
 load_drivers:
-	sudo insmod /lib/modules/$$(uname -r)/xdma/xdma.ko interrupt_mode=0 config_bar_num=0
+	$(LOCK_ALL) sudo insmod /lib/modules/$$(uname -r)/xdma/xdma.ko interrupt_mode=0 config_bar_num=0
 	sudo chmod 666 /dev/xdma*
 
 run: user_dma_core
 	sudo ./user_dma_core
 
 rescan:
-	sudo ./rescan_xilinx.sh
+	./rescan_xilinx.sh
 
 # Program FPGA with bit file
 # Usage: make program FPGA_TARGET=<target> [BITFILE=<path_to_bit_file>]
@@ -30,18 +42,17 @@ program:
 		echo "Error: Bit file not found: $(BITFILE)"; \
 		exit 1; \
 	fi
-	@bash -c 'set -o pipefail; vivado -mode batch -nolog -nojournal -source program_fpga.tcl -tclargs $(BITFILE) $(TARGET) 2>&1 | grep -v "^#"'
-	sudo ./rescan_xilinx.sh
+	@$(LOCK_ALL) bash -c 'set -o pipefail; vivado -mode batch -nolog -nojournal -source program_fpga.tcl -tclargs $(BITFILE) $(TARGET) 2>&1 | grep -v "^#" && ./rescan_xilinx.sh'
 
 # Optional BITFILE= for program_flash: custom bitstream path (default from Vivado build)
 program_flash:
-	@bash -c 'set -o pipefail; vivado -mode batch -source program_flash.tcl -tclargs $(TARGET) $(if $(BITFILE),BITFILE=$(BITFILE),) 2>&1 | grep -v "^#"'
+	@$(LOCK_ALL) bash -c 'set -o pipefail; vivado -mode batch -source program_flash.tcl -tclargs $(TARGET) $(if $(BITFILE),BITFILE=$(BITFILE),) 2>&1 | grep -v "^#"'
 
 # Read-only by default. PROGRAM=1 permanently burns the AES key and flashes BIN.
 # Extra selectors/options: PROVISION_ARGS='--target <serial> --dna <hex> --boot'
 .PHONY: kintex7_efuse_flash
 kintex7_efuse_flash:
-	@python3 ./provision_kintex7.py "$(BINFILE)" $(if $(NKY_FILE),--key "$(NKY_FILE)",) $(if $(filter 1,$(PROGRAM)),--program,--check) $(PROVISION_ARGS)
+	@$(LOCK_ALL) python3 ./provision_kintex7.py "$(BINFILE)" $(if $(NKY_FILE),--key "$(NKY_FILE)",) $(if $(filter 1,$(PROGRAM)),--program,--check) $(PROVISION_ARGS)
 
 # Download artifact from GH Actions, extract bitstream from XSA, program FPGA
 # Usage: make program_with_artifact GITHUB_RUN_ID=123456789 [TARGET=alveo]

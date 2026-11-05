@@ -2,9 +2,20 @@
 #
 # rescan_xilinx.sh
 # Hot-remove and re-add all Xilinx PCIe devices found by lspci.
-# Requires root privileges.
+# Writes through sudo; run it as yourself, not under sudo, so a caller that
+# already holds the board locks is recognized.
+#
+# Removing the devices takes every board on the host off the bus, so the
+# whole rescan runs holding every board's lock (pcie_lock.py all): it waits
+# for every run on any board to finish, and no run starts until it is done.
+# Under a caller that already holds them (make program, update_fpga.sh) it
+# does not take them again.
 
 set -euo pipefail
+
+if ! { [[ -n "${PCIE_LOCK_ALL_HOLDER:-}" ]] && kill -0 "$PCIE_LOCK_ALL_HOLDER" 2>/dev/null; }; then
+    exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pcie_lock.py" all -- "$0" "$@"
+fi
 
 # Find all Xilinx devices' BDFs (e.g. 0000:82:00.0)
 BDFS=$(lspci -D | grep -i xilinx | awk '{print $1}')
