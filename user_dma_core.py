@@ -10053,6 +10053,35 @@ class UnifiedEngine:
             total_flops += 4 * results
         return total_flops
 
+    def conv2d_auto(self, *, winograd=None, im2col=None, matmul=None,
+                    path: Optional[str] = None, allow_winograd: bool = True,
+                    **conv2d_core_kwargs) -> int:
+        """Thin conv dispatcher: pick the lowering for one conv and emit it.
+
+        The decision is :func:`select_conv_path` on the conv's shape and weight
+        type; ``path`` overrides it (e.g. a layer that cannot afford Winograd's
+        bf16 rounding). ``"walker"`` is emitted here through :meth:`conv2d_core`
+        with ``weight_reuse=True``. The other lowerings live in the model
+        (their operands differ: Winograd wants the raw bf16 kernel as 16 U
+        planes and an HWC map, im2col wants a [9*Cin x Cout] matrix), so the
+        caller passes them as callables taking no arguments; the one chosen is
+        called. Returns the FLOPs the chosen emitter reports (0 for callables
+        that return None).
+        """
+        kw = conv2d_core_kwargs
+        if path is None:
+            path = select_conv_path(
+                kernel_h=kw["kernel_h"], kernel_w=kw["kernel_w"], stride_s=kw["stride_s"],
+                dilation=kw.get("dilation", 1), c_in=kw["c_in"], oc_count=kw["oc_count"],
+                data_type=kw["data_type"], allow_winograd=allow_winograd)
+        if path == "walker":
+            kw = dict(kw)
+            kw.setdefault("weight_reuse", True)
+            return self.conv2d_core(**kw)
+        fn = {"winograd": winograd, "im2col": im2col, "matmul": matmul}[path]
+        assert fn is not None, f"conv2d_auto chose {path!r} but the caller gave no {path} emitter"
+        return fn() or 0
+
     def conv1d_core(self, ACT_DRAM_ADDR: int, WEIGHTS_DRAM_ADDR: int, SCALE_DRAM_ADDR: int,
                     OUTPUT_DRAM_ADDR: int, *,
                     c_in: int, length: int, kernel_size: int, stride_s: int, pad: int,
@@ -13547,6 +13576,54 @@ def check_isa_jumps(
 # stream, per-block scale stream, per-OC bias stream, and the
 # pixel-major/oc-innermost result order of the dot-style writeback.
 # ---------------------------------------------------------------------------
+
+# Conv path selection (the thin wrapper behind UnifiedEngine.conv2d_auto).
+# CONV3X3_BF16_FALLBACK is the bf16 lowering used when Winograd does not apply:
+# "walker" = CONV2D opcode, FLOAT16 weights held in URAM_B (weight_reuse, 927fd8d RTL);
+# "im2col" = strided-DMA im2col + bf16 matmul. Set from conv3x3_paths_probe.
+CONV3X3_WINOGRAD_MIN_CIN = 96
+CONV3X3_BF16_FALLBACK = "walker"
+CONV_WALKER_NATIVE_BLOCK_LIMIT = 4096            # 16-bit weight blocks per reuse pattern (doc: 4096 native)
+
+
+def conv_walker_pattern_fits(*, c_in: int, oc_count: int, kernel_h: int, kernel_w: int,
+                             data_type: TYPE) -> bool:
+    """True when at least one whole-divisor oc chunk of this conv fits a weight_reuse launch:
+    the [oc][tap] pattern within the 512 KiB URAM_B bank and the per-format block limit."""
+    ct = (c_in + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
+    taps = kernel_h * kernel_w * ct
+    bpb = 128 if data_type == TYPE.FLOAT16 else (64 if data_type == TYPE.IF8 else 32)
+    limit = CONV_WALKER_NATIVE_BLOCK_LIMIT if data_type == TYPE.FLOAT16 else SCALE_BRAM_ELEMENTS
+    return taps <= 0xFFF and taps <= limit and taps * bpb <= 512 * 1024
+
+
+def select_conv_path(*, kernel_h: int, kernel_w: int, stride_s: int, dilation: int,
+                     c_in: int, oc_count: int, data_type: TYPE,
+                     allow_winograd: bool = True) -> str:
+    """Pick the lowering for one conv. Top-down, first match wins:
+
+    1. 1x1                                      -> "matmul"   (nothing to reuse between neighbours)
+    2. quantized weights (IF8 / IF4 / TQ4)      -> "walker"   (CONV2D has no other home for them; with
+                                                                weight_reuse it is already near peak)
+    3. 3x3 / stride 1 / dil 1 / bf16 / Cin >= CONV3X3_WINOGRAD_MIN_CIN
+                                                -> "winograd" (F(2x2,3x3): 16 K=Cin matmuls for 36 taps;
+                                                                costs ~0-0.3 dB per conv, so allow_winograd
+                                                                is the caller's accuracy veto)
+    4. bf16, anything else                      -> CONV3X3_BF16_FALLBACK ("walker" when its pattern fits
+                                                                URAM_B, else "im2col")
+    """
+    if kernel_h == 1 and kernel_w == 1 and stride_s == 1 and dilation == 1:
+        return "matmul"
+    if data_type != TYPE.FLOAT16:
+        return "walker"
+    if (allow_winograd and kernel_h == 3 and kernel_w == 3 and stride_s == 1 and dilation == 1
+            and c_in >= CONV3X3_WINOGRAD_MIN_CIN):
+        return "winograd"
+    if CONV3X3_BF16_FALLBACK == "walker" and conv_walker_pattern_fits(
+            c_in=c_in, oc_count=oc_count, kernel_h=kernel_h, kernel_w=kernel_w, data_type=data_type):
+        return "walker"
+    return "im2col"
+
 
 def conv2d_pack_activation_map(x: torch.Tensor, pad: int, pad_value: float = 0.0,
                                pad_h: Optional[int] = None) -> torch.Tensor:
