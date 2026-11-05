@@ -820,7 +820,8 @@ class Flux2KleinEngine(_OfflineMixin, UnifiedEngine):
         key = json.dumps({"h": g.height, "w": g.width, "L": g.max_sequence_length, "steps": g.num_inference_steps,
                           "sigmas": [round(float(x), 7) for x in self.sigmas], "layout": self.cfg["dram_layout"],
                           "q": self.cfg["quantization"], "engines": self.ne, "emitter": self._emitter_hash(),
-                          "vae_emitter": flux2_klein_4b_vae.emitter_hash(), "v": 4},
+                          "vae_emitter": flux2_klein_4b_vae.emitter_hash(),
+                          "vae_conv3x3": self.cfg["vae"].get("conv3x3_mode", "walker"), "v": 4},
                          sort_keys=True)
         return hashlib.sha1(key.encode()).hexdigest()[:12]
 
