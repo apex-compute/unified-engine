@@ -7,6 +7,7 @@ One web page for the models that run on the board, picked from a dropdown:
 | Gemma 3 1B | text | prefill (engine 0) + decode (N-sharded) |
 | Gemma 4 E2B | text, image, audio | vision encoder, audio encoder, prefill, decode |
 | Gemma 4 E4B | text, image, audio | same code as E2B with E4B's geometry |
+| Qwen2.5-Omni 7B | text, image, audio | vision encoder, audio encoder, Thinker prefill + decode (all eight engines) |
 | FLUX.2 [klein] 4B | text → image | text encoder, diffusion transformer, VAE decoder |
 
 ```bash
@@ -39,6 +40,12 @@ order, and at most one process holds the device:
   fetched once from the CDN and served from `/vendor/`, so the browser needs
   no internet access; without them answers show as plain text). Stop ends the
   generation after the current token.
+- **Qwen2.5-Omni 7B** runs one `qwen_runner.py` process per message: that
+  is `qwen2.5_omni_7b_test.py`'s own `main()` with `--run_from_bin`, plus the
+  token stream, Stop and its per-stage metrics on the server's channel. Its
+  programs depend on the prompt's shape (token count, media), so it is set up
+  per message (a repeated shape reuses `programs_flat.bin`) and messages carry
+  no history. Speech output (`--speak`) is not offered.
 - **FLUX.2 klein** runs exactly as in `flux2_klein_4b_server.py` (its module is
   imported): one `flux2_klein_4b_run_from_bin.py` process per image, or its
   resident `--serve` runner with "keep the board loaded".

@@ -3280,6 +3280,13 @@ class Qwen25OmniLMMixin:
             self._set_silent(True)
             if use_status:
                 _status_update()
+            # Optional per-token hook (the unified web server streams through
+            # it): on_token(token_id, text) -> True stops generation here.
+            on_token = getattr(self, "on_token", None)
+            if on_token is not None and on_token(token, piece):
+                if use_status:
+                    _status_teardown()
+                break
         else:
             # Loop ran to the token cap or the context end rather than breaking.
             if use_status:

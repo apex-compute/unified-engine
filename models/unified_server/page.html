@@ -420,7 +420,7 @@ class Streamer {
 const PHASE = s => !s ? 'Waiting for the board' : s.startsWith('loading') ? s[0].toUpperCase() + s.slice(1)
   : ({ starting: 'Starting', 'program image': 'Preparing the program image', prefill: 'Prefill',
        'vision encoder': 'Vision encoder', 'audio encoder': 'Audio encoder',
-       'vision + audio encoders': 'Vision + audio encoders', decode: 'Decoding' }[s] || s);
+       'vision + audio encoders': 'Vision + audio encoders', decode: 'Decoding' }[s] || s[0].toUpperCase() + s.slice(1));
 
 function newChat() {
   if (chatJob) return;
