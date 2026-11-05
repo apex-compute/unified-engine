@@ -8,7 +8,7 @@
 #                                                    already runs that image
 #   1. python3 update_flash.py <bin> --no-rescan     program + verify flash,
 #                                                    then ICAPE2 IPROG warm boot
-#   2. sleep $BOOT_WAIT; sudo ./rescan_xilinx.sh     PCIe hot remove + rescan
+#   2. sleep $BOOT_WAIT; ./rescan_xilinx.sh          PCIe hot remove + rescan (sudo inside)
 #   3. python3 update_flash.py --verify-image <bin>  confirm the FPGA now runs
 #                                                    the flashed image
 #
@@ -50,6 +50,7 @@ EOF
 MODE="update"
 FORCE=0
 BIN=""
+ARGS=("$@")
 while [ $# -gt 0 ]; do
     case "$1" in
         --bin)       BIN="${2:-}"; [ -n "$BIN" ] || { echo "ERROR: --bin needs a path" >&2; exit 1; }; shift ;;
@@ -63,6 +64,14 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# Flashing, the warm boot and the rescan take boards off the bus, so every mode
+# but --check runs holding every board's lock (pcie_lock.py): it waits for every
+# run on the host to finish, and none starts until the rescan is done.
+if [ "$MODE" != "check" ] &&
+   ! { [ -n "${PCIE_LOCK_ALL_HOLDER:-}" ] && kill -0 "$PCIE_LOCK_ALL_HOLDER" 2>/dev/null; }; then
+    exec python3 pcie_lock.py all -- "$SCRIPT_DIR/$(basename "$0")" ${ARGS[@]+"${ARGS[@]}"}
+fi
+
 # --- warm reboot trigger only -------------------------------------------------
 if [ "$MODE" = "boot" ]; then
     rc=0
@@ -74,7 +83,7 @@ if [ "$MODE" = "boot" ]; then
     fi
     echo ">> waiting ${BOOT_WAIT}s for the FPGA to reconfigure from flash..."
     sleep "$BOOT_WAIT"
-    sudo ./rescan_xilinx.sh
+    ./rescan_xilinx.sh
     exit 0
 fi
 
@@ -117,6 +126,6 @@ fi
 
 echo ">> waiting ${BOOT_WAIT}s for the FPGA to reconfigure from flash..."
 sleep "$BOOT_WAIT"
-sudo ./rescan_xilinx.sh
+./rescan_xilinx.sh
 
 python3 update_flash.py --verify-image "$BIN" --dev "$DEV"

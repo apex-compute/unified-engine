@@ -454,7 +454,7 @@ def rescan_after_warm_boot():
         return True
     except Exception as e:
         print(f"PCIe rescan failed ({e}).")
-        print("Rescan manually: sudo ./rescan_xilinx.sh")
+        print("Rescan manually: ./rescan_xilinx.sh")
         return False
 
 

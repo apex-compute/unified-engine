@@ -288,7 +288,7 @@ The hardware image this code expects is the `update_<hash>.bin` in the repo root
 ./update_fpga.sh
 ```
 
-One command does the whole update, no PC reboot or power cycle. With no arguments it picks up the `update_*.bin` in the repo root, checks the running version first and exits immediately if the FPGA is already up to date; otherwise it programs and verifies the flash, warm-boots the FPGA from the new image (ICAPE2 IPROG) via `update_flash.py`, hot-rescans the PCIe bus (`sudo ./rescan_xilinx.sh` — the one step that needs root), then reads the FPGA version back and prints `UPDATE SUCCESSFUL` when it matches the bin.
+One command does the whole update, no PC reboot or power cycle. With no arguments it picks up the `update_*.bin` in the repo root, checks the running version first and exits immediately if the FPGA is already up to date; otherwise it programs and verifies the flash, warm-boots the FPGA from the new image (ICAPE2 IPROG) via `update_flash.py`, hot-rescans the PCIe bus (`./rescan_xilinx.sh`, which asks for sudo — the one step that needs root), then reads the FPGA version back and prints `UPDATE SUCCESSFUL` when it matches the bin.
 
 If the image currently running predates the warm-boot block, the flash is still written but there is nothing to warm boot into: the script says so, tells you to cold reboot once, and stops before the PCIe rescan (exit code 3). After that one cold boot every update is reboot-free.
 

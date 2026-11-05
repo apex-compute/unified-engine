@@ -25,13 +25,14 @@ import errno
 import os
 import sys
 import fcntl
-import getpass
 import time
 from typing import Callable, Optional, Tuple
 from enum import IntEnum
 import numpy as np
 import torch
 import math
+
+import pcie_lock
 if __package__:
     from .storage_format import (
         StorageFormat, TensorFormats, UE_TENSOR_FORMATS_ADDR, as_storage_format,
@@ -447,8 +448,6 @@ DEVICE_LOCK_DISABLE_ENV = "UE_ALLOW_SHARED_DEVICE"
 DEVICE_LOCK_INHERIT_ENV_PREFIX = "UE_DEVICE_LOCK_HELD_"
 DEVICE_LOCK_WAIT_ENV = "UE_DEVICE_LOCK_WAIT"
 DEVICE_LOCK_WAIT_SECONDS = 600.0      # 10 minutes
-DEVICE_LOCK_POLL_SECONDS = 2.0
-DEVICE_LOCK_REPORT_SECONDS = 60.0     # how often to say who we are waiting on
 
 _DEVICE_LOCK_FD: Optional[int] = None
 _DEVICE_LOCK_NAME: Optional[str] = None
@@ -561,83 +560,22 @@ def claim_dma_device(device_name: Optional[str] = None,
         return
 
     path = _device_lock_path(device_name)
-    # O_CREAT LAST, not first. /tmp is sticky and world-writable, and these lab
-    # hosts run fs.protected_regular=2, under which O_CREAT on a file owned by
-    # ANOTHER user is refused with EACCES even at mode 0666. The lock file
-    # outlives whoever created it, so the second user through here is normally
-    # not the owner -- opening plain O_RDWR (no O_CREAT) is allowed and is what
-    # keeps the holder annotation writable across users. Getting this wrong does
-    # not break the lock (a read-only fd still flocks), it breaks the annotation,
-    # so a blocked run names whoever held it last instead of who holds it now.
-    fd = None
-    for flags in (os.O_RDWR, os.O_CREAT | os.O_RDWR, os.O_RDONLY):
-        try:
-            fd = os.open(path, flags, 0o666)
-            break
-        except OSError:
-            continue
-    if fd is None:
-        raise RuntimeError(f"cannot open the {device_name} lock at {path}")
-    try:
-        os.fchmod(fd, 0o666)   # no-op unless we own it; umask must not shut others out
-    except OSError:
-        pass
 
-    if wait_seconds is None:
-        try:
-            wait_seconds = float(os.environ.get(DEVICE_LOCK_WAIT_ENV,
-                                                DEVICE_LOCK_WAIT_SECONDS))
-        except ValueError:
-            wait_seconds = DEVICE_LOCK_WAIT_SECONDS
+    def _refusal(board: str, waited: float, holder: str, lock: str) -> str:
+        return (f"{board} is still in use after waiting {waited:.0f}s"
+                + (f" -- {holder}" if holder else "")
+                + f".\n  Two processes on one board corrupt each other's "
+                f"DMA, so this run stops rather than sharing it.\n"
+                f"  Wait for that run to finish, or pick the other board "
+                f"with --dev.\n"
+                f"  Lock: {lock}  ({DEVICE_LOCK_WAIT_ENV}=<seconds> to "
+                f"change the wait, 0 to fail on contact; "
+                f"{DEVICE_LOCK_DISABLE_ENV}=1 only if you truly want them "
+                f"to share)")
 
-    def _holder() -> str:
-        try:
-            return os.pread(fd, 400, 0).decode("utf-8", "replace").strip()
-        except OSError:
-            return ""
-
-    deadline = time.monotonic() + max(0.0, wait_seconds)
-    next_report = 0.0        # report the first wait immediately
-    waited = 0.0
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except OSError:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                holder = _holder()
-                os.close(fd)
-                raise RuntimeError(
-                    f"{device_name} is still in use after waiting "
-                    f"{waited:.0f}s" + (f" -- {holder}" if holder else "")
-                    + f".\n  Two processes on one board corrupt each other's "
-                    f"DMA, so this run stops rather than sharing it.\n"
-                    f"  Wait for that run to finish, or pick the other board "
-                    f"with --dev.\n"
-                    f"  Lock: {path}  ({DEVICE_LOCK_WAIT_ENV}=<seconds> to "
-                    f"change the {wait_seconds:.0f}s wait, 0 to fail on "
-                    f"contact; {DEVICE_LOCK_DISABLE_ENV}=1 only if you truly "
-                    f"want them to share)"
-                ) from None
-            if waited >= next_report:
-                print(f"[device-lock] {device_name} is busy"
-                      + (f" ({_holder()})" if _holder() else "")
-                      + f"; waiting up to {remaining:.0f}s more...", flush=True)
-                next_report = waited + DEVICE_LOCK_REPORT_SECONDS
-            time.sleep(min(DEVICE_LOCK_POLL_SECONDS, max(0.05, remaining)))
-            waited = wait_seconds - max(0.0, deadline - time.monotonic())
-    if waited > 0:
-        print(f"[device-lock] acquired {device_name} after {waited:.0f}s",
-              flush=True)
-
-    try:
-        os.ftruncate(fd, 0)
-        os.write(fd, (f"pid={os.getpid()} user={getpass.getuser()} "
-                      f"host={os.uname().nodename} "
-                      f"cmd={' '.join(sys.argv)}\n").encode())
-    except OSError:
-        pass   # lock-only fd; holding it matters, the annotation does not
+    # The lock every process on the host takes for this board, rescans
+    # included (pcie_lock.py): same file, protocol and holder annotation.
+    fd = pcie_lock.acquire(device_name, wait_seconds, _refusal, path)
     _DEVICE_LOCK_FD = fd
     _DEVICE_LOCK_NAME = device_name
     # Children inherit os.environ through subprocess, so this is what lets a
