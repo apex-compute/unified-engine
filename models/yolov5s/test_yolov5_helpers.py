@@ -26,6 +26,7 @@ import user_dma_core
 import yolov5s_run_from_bin
 import yolov5_precompiled
 from yolov5_artifact import (
+    ARTIFACT_VERSION,
     _pack_codes,
     _unpack_codes,
     SUPPORTED_INPUT_RESOLUTIONS,
@@ -34,6 +35,7 @@ from yolov5_artifact import (
     get_canonical_artifact,
     parse_input_resolution,
     select_single_bin_profile,
+    validate_single_bin,
 )
 from yolov5_precompiled import (
     _scan_queue_configs,
@@ -103,15 +105,25 @@ class VariantTests(unittest.TestCase):
         self.assertEqual(
             artifact.weights_sha256,
             "b8ca688e49a44c87b657de6b5c4c9d7b0193718c40ccc8f860733cd89865f666")
-        self.assertEqual(artifact.model_bytes, 128_758_464)
-        self.assertEqual(artifact.program_bytes, 109_120)
+        self.assertEqual(artifact.model_bytes, 1_406_208)
+        self.assertEqual(artifact.program_bytes, 99_456)
         self.assertEqual(
             artifact.model_sha256,
-            "d13b4daaf3998b8da7d682137729d1f65a3b4526b24aa86f7e9bdbd6da908e0b")
+            "ac9fb3e9605f3db6d9136a135178844e1f7142e06bbb7f90a610eeca24e38f81")
         self.assertEqual(
             artifact.program_sha256,
-            "fa0e228a4f43038d0260c86702602d162d9cf8c6308853fa82c51fc514835004")
+            "ea04c37a9d4e44742fb9dd36610172fb1f266712d1978d2ec3e1d3bd6499c811")
         self.assertEqual(artifact_variant({"format": artifact.format}), "n")
+
+    def test_expanded_weight_artifacts_require_recompilation(self):
+        for variant in ("s", "n"):
+            with self.subTest(variant=variant):
+                with self.assertRaisesRegex(
+                        RuntimeError, "unsupported YOLO artifact version 6; rebuild.*--force"):
+                    validate_single_bin({
+                        "format": get_canonical_artifact(variant).format,
+                        "artifact_version": 6,
+                    })
 
     def test_variant_configs_match_pinned_profiles(self):
         paths = {
@@ -152,7 +164,7 @@ class DirectBinRunnerTests(unittest.TestCase):
             torch.zeros(255, 1, 1, dtype=torch.bfloat16),
         ]
         payload = {
-            "artifact_version": 6,
+            "artifact_version": ARTIFACT_VERSION,
             "runtime": {
                 "postprocessing": {
                     "confidence_threshold": 0.25,
@@ -668,16 +680,16 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(
             sum(tile[2] * tile[3] for tile in tiles), out_h * out_w)
 
-    def test_resident_weight_budget_bounds_precompiled_tile(self):
+    def test_pattern_capacity_is_independent_of_spatial_area(self):
         _, _, oc_chunk, tiles = user_dma_core.plan_conv2d_layer_tiles(
             c_in=256, oc_count=256, in_h=32, in_w=32,
-            kernel_h=3, kernel_w=3, stride_s=1, pad=1,
-            weight_bytes_per_block=32,
-            weight_stream_budget_bytes=4 << 20)
+            kernel_h=3, kernel_w=3, stride_s=1, pad=1)
         tile_h, tile_w = tiles[0][2:4]
         blocks_per_oc = 3 * 3 * (256 // user_dma_core.UE_VECTOR_SIZE)
         self.assertLessEqual(
-            tile_h * tile_w * 256 * blocks_per_oc * 32, 4 << 20)
+            oc_chunk * blocks_per_oc, user_dma_core.SCALE_BRAM_ELEMENTS)
+        self.assertGreater(tile_h * tile_w * 256 * blocks_per_oc * 32, 4 << 20)
+        self.assertEqual(sum(tile[2] * tile[3] for tile in tiles), 32 * 32)
 
     def test_conv_bias_stream_stores_one_channel_vector(self):
         bias = torch.arange(64, dtype=torch.float32)
@@ -1260,7 +1272,7 @@ class PrecompiledBinTests(unittest.TestCase):
             out_w=4, out_h=4, ct=1, kernel_w=1, kernel_h=1,
             # Persistent maps are physically padded to one 64-lane vector.
             oc_count=64, row_stride=4, col_stride=1,
-            pix_col_step=1, pix_row_step=4)
+            pix_col_step=1, pix_row_step=4, weight_reuse=True)
         self.assertEqual(configs[0], expected)
 
 

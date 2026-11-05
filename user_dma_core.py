@@ -833,10 +833,11 @@ class UE_MODE(IntEnum):
     ADD_REDUCE = 11
     DEQUANTIZE = 12
     ELTWISE_SUB = 13
-    CONV2D = 14   # 4'hE — streams IF4/IF8/TQ4 weights DOT-style, walker replays window per oc
+    CONV2D = 14   # 4'hE — native FLOAT16 or quantized weights, sliding-window walker
     MEMCPY_FROM_DRAM = 15
 
 class TYPE(IntEnum):
+    FLOAT16 = 0  # CONV native 16-bit weights: BF16/FP16 selected by formats.b
     # Adaptive block-scale formats. For IF4/IF8 the INT vs FP variant is
     # encoded in the sign bit of each block's 16-bit scale: negative scale ->
     # INT path, positive scale -> FP path. The hardware always uses |scale|
@@ -1056,7 +1057,7 @@ def validate_conv2d_geometry_words(
     if not all((out_w, out_h, geom_hi, kernel_w, kernel_h, count,
                 row_stride, col_stride, pix_col_step, pix_row_step)):
         raise ValueError("CONV geometry dimensions, counts, and steps must be non-zero")
-    if ctrl & 0x7F000000:
+    if ctrl & 0x3F000000:
         raise ValueError(f"CONV CTRL reserved bits are non-zero: {ctrl:#010x}")
     if stride & 0xFF000000:
         raise ValueError(f"CONV STRIDE reserved bits are non-zero: {stride:#010x}")
@@ -1085,7 +1086,8 @@ def pack_conv2d_geometry_words(*, out_w: int, out_h: int, ct: int,
                                pix_col_step: int, pix_row_step: int,
                                gather: bool = False, c_in: Optional[int] = None,
                                blocks_per_pixel: Optional[int] = None,
-                               chunks: Optional[int] = None) -> tuple[int, int, int, int]:
+                               chunks: Optional[int] = None,
+                               weight_reuse: bool = False) -> tuple[int, int, int, int]:
     """Pack logical CONV/MAXPOOL geometry into the four hardware words."""
     if not 1 <= kernel_w <= 15 or not 1 <= kernel_h <= 15:
         raise ValueError(f"kernel {kernel_h}x{kernel_w} exceeds the 4-bit fields")
@@ -1124,7 +1126,7 @@ def pack_conv2d_geometry_words(*, out_w: int, out_h: int, ct: int,
         geom_hi, count, ctrl31, chunks_field = ct, oc_count, 0, 0
     return validate_conv2d_geometry_words((
         (geom_hi << 24) | (out_h << 12) | out_w,
-        ctrl31 | (count << 8) | (kernel_h << 4) | kernel_w,
+        ctrl31 | (int(weight_reuse) << 30) | (count << 8) | (kernel_h << 4) | kernel_w,
         (col_stride << 12) | row_stride,
         chunks_field | (pix_row_step << 12) | pix_col_step,
     ))
@@ -1656,7 +1658,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xa0fbc521, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xa0fbc521. Please update FPGA with update_a0fbc521.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
+        assert hw_version == 0x927fd8d9, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x927fd8d9. Please update FPGA with update_927fd8d9.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
         if getattr(self, "conv_geometry_mode", CONV_GEOMETRY_LIVE_CSR) == CONV_GEOMETRY_QUEUE_CONFIG:
             # Convolution images have independent build stamps from the legacy
             # release. Explicit queue-CONFIG selection opts into that contract;
@@ -9766,7 +9768,8 @@ class UnifiedEngine:
                                         pix_col_step: int, pix_row_step: int,
                                         gather: bool = False, c_in: Optional[int] = None,
                                         blocks_per_pixel: Optional[int] = None,
-                                        chunks: Optional[int] = None) -> None:
+                                        chunks: Optional[int] = None,
+                                        weight_reuse: bool = False) -> None:
         """Program or queue the four UE_CONV_* geometry words.
 
         Immediate operations and ``live-csr-v1`` captures retain the legacy
@@ -9784,7 +9787,8 @@ class UnifiedEngine:
             kernel_w=kernel_w, kernel_h=kernel_h, oc_count=oc_count,
             row_stride=row_stride, col_stride=col_stride,
             pix_col_step=pix_col_step, pix_row_step=pix_row_step,
-            gather=gather, c_in=c_in, blocks_per_pixel=blocks_per_pixel, chunks=chunks)
+            gather=gather, c_in=c_in, blocks_per_pixel=blocks_per_pixel, chunks=chunks,
+            weight_reuse=weight_reuse)
         if self.is_capture_on:
             if self.conv_geometry_mode == CONV_GEOMETRY_QUEUE_CONFIG:
                 # Always emit at the operation site. Linear capture-time
@@ -9818,15 +9822,26 @@ class UnifiedEngine:
                                          lalu_a: int = 0, lalu_b: int = 0,
                                          dilation: int = 1,
                                          gather: bool = False, c_in: Optional[int] = None,
-                                         *, formats: Optional[TensorFormats] = None) -> None:
+                                         *, weight_reuse: bool = False,
+                                         formats: Optional[TensorFormats] = None) -> None:
         """Emit one CONV2D (mode 0xE) descriptor + program its geometry registers.
 
         Python twin of ``ue_conv2d()`` in andromeda.c. The pre-padded activation
         map must already be in URAM_A at ``act_sram_start_addr`` and the packed
         weight stream (:func:`conv2d_pack_weight_stream`) at
-        ``weights_dram_addr``; one reusable ``[oc][tap]`` scale pattern
+        ``weights_dram_addr``; quantized weights also need one reusable
+        ``[oc][tap]`` scale pattern
         (:func:`conv2d_pack_scale_stream`) must be loaded into scale BRAM
         before this op runs. Hardware rewinds that pattern at every pixel.
+
+        ``weight_reuse=True`` (new RTL, UE_CONV_CTRL[30]) loads only one
+        ``[oc][tap]`` FLOAT16/IF4/IF8 pattern into URAM_B and replays it for all tile pixels.
+        This clobbers URAM_B and requires output in URAM_A. Pack weights with
+        out_h=out_w=1; DMA length is oc_count*uram_length*block_bytes, where
+        block_bytes is 32 for IF4, 64 for IF8, or 128 for FLOAT16.
+        Limits: 8192 quantized blocks, 4096 native blocks. FLOAT16 requires
+        reuse and bypasses scales; formats.b selects BF16/FP16 weight storage.
+        The default preserves the legacy repeated-stream interface.
 
         ``gather=True`` selects the small-C GATHER path (UE_CONV_CTRL[31], doc
         §9.4): the whole Kh*Kw*C im2col patch computes as a plain dot summed over
@@ -9847,7 +9862,7 @@ class UnifiedEngine:
             out_w, out_h: output tile extent
             w_pad: padded map width W_in + 2*pad (host pre-fills the halo)
             stride_s: convolution stride (dilation folds into the stride regs)
-            data_type: TYPE.IF4 / TYPE.IF8 / TYPE.TQ4 (X-stream weight format)
+            data_type: TYPE.FLOAT16 / TYPE.IF4 / TYPE.IF8 / TYPE.TQ4
             bias_enable: one reusable per-oc vector in bias BRAM
             lalu_mode/lalu_a/lalu_b: fused activation (e.g. CLAMP-as-ReLU)
             dilation: kernel-tap dilation. Rides the kernel-step registers for
@@ -9857,15 +9872,23 @@ class UnifiedEngine:
         formats = self._resolve_tensor_formats(formats)
         act_uram_type, act_uram_start_addr = self.sram_address_to_uram_address(act_sram_start_addr)
         assert act_uram_type == URAM_SECTION.URAM_A, \
-            "conv activations must live in URAM_A (bank Y); bank Z is reserved for the TQ4 codebook"
+            "conv activations must live in URAM_A (bank Y); bank Z is reserved for weights or the TQ4 codebook"
         output_uram_type, output_uram_start_addr = self.sram_address_to_uram_address(output_sram_wb_addr)
+
+        if data_type == TYPE.FLOAT16 and not weight_reuse:
+            raise ValueError("FLOAT16 convolution requires weight_reuse=True")
+        if weight_reuse:
+            if data_type not in (TYPE.FLOAT16, TYPE.IF4, TYPE.IF8):
+                raise ValueError("weight_reuse requires FLOAT16, IF4 or IF8 weights")
+            if output_uram_type != URAM_SECTION.URAM_A:
+                raise ValueError("weight_reuse reserves all of URAM_B; output must use URAM_A")
 
         row_stride = dilation * w_pad * ct
         col_stride = dilation * ct
         pix_col_step = stride_s * ct
         pix_row_step = stride_s * w_pad * ct
         results = out_h * out_w * oc_count
-        bytes_per_blk = 64 if data_type == TYPE.IF8 else 32
+        bytes_per_blk = 128 if data_type == TYPE.FLOAT16 else (64 if data_type == TYPE.IF8 else 32)
         assert results <= 0xFFFF, f"output_size={results} exceeds the 16-bit descriptor field"
         if bias_enable:
             assert oc_count <= BIAS_BRAM_ELEMENTS, (
@@ -9881,12 +9904,15 @@ class UnifiedEngine:
             assert bpp <= SCALE_BRAM_ELEMENTS, (
                 f"gather scale needs {bpp} blocks (one pixel) > scale BRAM {SCALE_BRAM_ELEMENTS}"
             )
+            if weight_reuse and bpp * bytes_per_blk > 512 * 1024:
+                raise ValueError("weight_reuse pattern exceeds the 512 KiB URAM_B bank")
             self.write_conv2d_geometry_registers(
                 out_w=out_w, out_h=out_h, ct=ct,
                 kernel_w=kernel_w, kernel_h=kernel_h, oc_count=oc_count,
                 row_stride=row_stride, col_stride=col_stride,
                 pix_col_step=pix_col_step, pix_row_step=pix_row_step,
-                gather=True, c_in=c_in, blocks_per_pixel=bpp, chunks=chunks)
+                gather=True, c_in=c_in, blocks_per_pixel=bpp, chunks=chunks,
+                weight_reuse=weight_reuse)
             uram_length = chunks                          # itr_add = chunks
         else:
             taps = kernel_h * kernel_w * ct
@@ -9897,12 +9923,18 @@ class UnifiedEngine:
                 f"channel CONV scale pattern has {scale_blocks} blocks > scale BRAM "
                 f"capacity {SCALE_BRAM_ELEMENTS}; chunk output channels"
             )
+            if weight_reuse and scale_blocks * bytes_per_blk > 512 * 1024:
+                raise ValueError("weight_reuse pattern exceeds the 512 KiB URAM_B bank")
             self.write_conv2d_geometry_registers(
                 out_w=out_w, out_h=out_h, ct=ct,
                 kernel_w=kernel_w, kernel_h=kernel_h, oc_count=oc_count,
                 row_stride=row_stride, col_stride=col_stride,
-                pix_col_step=pix_col_step, pix_row_step=pix_row_step)
+                pix_col_step=pix_col_step, pix_row_step=pix_row_step,
+                weight_reuse=weight_reuse)
             uram_length = taps                            # itr_add = Kh*Kw*CT
+
+        if weight_reuse:
+            blocks = oc_count * uram_length
 
         self.ue_arithmetic_op(
             0,  # broadcast_mode
@@ -9919,7 +9951,7 @@ class UnifiedEngine:
             UE_MODE.CONV2D,
             data_type,
             act_uram_start_addr,  # uram_a_start_addr = pix_base0
-            0,  # uram_b_start_addr (bank Z reserved for TQ4 codebook)
+            0,  # uram_b_start_addr (bank Z holds weights or TQ4 codebook)
             uram_length,  # uram_length -> URAM_ROW_SIZE -> add_itr
             weights_dram_addr,
             blocks * bytes_per_blk,  # dma_length
@@ -9995,7 +10027,8 @@ class UnifiedEngine:
                     dilation: int = 1,
                     pad_h: Optional[int] = None,
                     act_uram_addr: int = 0x000, wb_uram_addr: int = 0x300,
-                    formats: Optional[TensorFormats] = None) -> int:
+                    formats: Optional[TensorFormats] = None,
+                    weight_reuse: Optional[bool] = None) -> int:
         """DRAM-to-DRAM 2D convolution (single launch, one geometry).
 
         Emits: padded map -> URAM_A, scales -> scale BRAM, optional bias ->
@@ -10004,17 +10037,23 @@ class UnifiedEngine:
           - ACT_DRAM_ADDR:     :func:`conv2d_pack_activation_map` bytes
           - WEIGHTS_DRAM_ADDR: :func:`conv2d_pack_weight_stream` bytes
           - SCALE_DRAM_ADDR:   :func:`conv2d_pack_scale_stream` bytes
+                              (ignored for TYPE.FLOAT16)
           - BIAS_DRAM_ADDR:    :func:`conv2d_pack_bias_stream` bytes (optional)
-        Output: out_h*out_w*oc_count bf16 scalars, pixel-major with oc
+        Output: out_h*out_w*oc_count scalars in formats.output, pixel-major with oc
         innermost, padded to a whole 128-byte line
         (:func:`conv2d_unpack_result` reorders to (OC, out_h, out_w)).
 
         Geometry registers are per-launch (see
         :meth:`write_conv2d_geometry_registers`) — capture one program per
-        conv geometry. ``pad_h`` overrides the H-axis padding (defaults to
+        conv geometry. Native FLOAT16 weights default to weight reuse; pack
+        one pattern with out_h=out_w=1. Quantized callers retain their legacy
+        stream by default and may request weight_reuse=True explicitly.
+        ``pad_h`` overrides the H-axis padding (defaults to
         ``pad``; Conv1d uses pad_h=0). Returns the FLOP count of the launch.
         """
         formats = self._resolve_tensor_formats(formats)
+        if weight_reuse is None:
+            weight_reuse = data_type == TYPE.FLOAT16
         ct = (c_in + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
         if pad_h is None:
             pad_h = pad
@@ -10039,9 +10078,10 @@ class UnifiedEngine:
             accelerator_dram_address=ACT_DRAM_ADDR,
             sram_address=act_uram_addr << 7,
             element_size=map_lines * UE_VECTOR_SIZE)
-        self.accelerator_memory_to_scale_sram(
-            accelerator_dram_address=SCALE_DRAM_ADDR,
-            element_size=oc_count * taps)
+        if data_type != TYPE.FLOAT16:
+            self.accelerator_memory_to_scale_sram(
+                accelerator_dram_address=SCALE_DRAM_ADDR,
+                element_size=oc_count * taps)
         bias_enable = BIAS_DRAM_ADDR is not None
         if bias_enable:
             self.accelerator_memory_to_bias_sram(
@@ -10059,7 +10099,7 @@ class UnifiedEngine:
             out_w=out_w, out_h=out_h, w_pad=w_pad, stride_s=stride_s,
             data_type=data_type, bias_enable=bias_enable,
             lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b,
-            dilation=dilation, formats=formats)
+            dilation=dilation, formats=formats, weight_reuse=weight_reuse)
 
         self.sram_to_accelerator_memory(
             sram_address=wb_uram_addr << 7,
@@ -10085,7 +10125,8 @@ class UnifiedEngine:
                     gelu_enable: bool = False,
                     dilation: int = 1,
                     act_uram_addr: int = 0x000, wb_uram_addr: int = 0x300,
-                    formats: Optional[TensorFormats] = None) -> int:
+                    formats: Optional[TensorFormats] = None,
+                    weight_reuse: Optional[bool] = None) -> int:
         """DRAM-to-DRAM 1D convolution (Whisper-style audio conv stem).
 
         A Conv1d over (C, T) is CONV2D with H = 1 / Kh = 1: channels in the
@@ -10106,7 +10147,8 @@ class UnifiedEngine:
             BIAS_DRAM_ADDR=BIAS_DRAM_ADDR,
             relu_enable=relu_enable, silu_enable=silu_enable, gelu_enable=gelu_enable,
             dilation=dilation,
-            act_uram_addr=act_uram_addr, wb_uram_addr=wb_uram_addr, formats=formats)
+            act_uram_addr=act_uram_addr, wb_uram_addr=wb_uram_addr, formats=formats,
+            weight_reuse=weight_reuse)
 
     # -------------------------------------------------------------------------
     # Layer-level drivers: full-tensor conv / pool via multiple launches.
@@ -10114,10 +10156,9 @@ class UnifiedEngine:
     # A single launch is capped by the 8192-entry scale BRAM (X blocks), the
     # URAM bank (padded map below the writeback base), the 16-bit output_size
     # and the 12-bit uram_row_size. Real model layers (224x224 stems, 64x64
-    # latents, T=3000 audio) exceed those, so these host-orchestrated drivers
-    # tile the output (and oc), run one captured program per tile — geometry
-    # registers are per-launch — and assemble the result on the host. Slow
-    # path (PCIe roundtrip per tile) but bit-exact and shape-complete.
+    # latents, T=3000 audio) exceed those, so these drivers tile the output
+    # and output channels inside one resident program, then assemble the
+    # tiled result after a single bulk readback.
     # -------------------------------------------------------------------------
 
     def _capture_conv2d_tile_loop(self, *, n_tiles: int,
@@ -10134,7 +10175,8 @@ class UnifiedEngine:
                                   gather: bool = False, c_in: Optional[int] = None,
                                   act_uram_addr: int = 0x000,
                                   wb_uram_addr: int = 0x300,
-                                  formats: Optional[TensorFormats] = None) -> None:
+                                  formats: Optional[TensorFormats] = None,
+                                  weight_reuse: bool = False) -> None:
         """Capture ONE resident PBI tile loop covering ``n_tiles`` same-shape
         conv tiles — the single code piece the engine executes end-to-end
         with no host involvement.
@@ -10142,22 +10184,23 @@ class UnifiedEngine:
         Emitted stream (the proven eltwise_core_dram_pbi shape):
           scale BRAM load (once — contents persist; the per-op read address
           restarts at op start), optional bias BRAM load (once per oc chunk),
-          pbi_init(act ptr: base=act_base, len=act_bytes),
-          pbi_init(out ptr: base=out_base, len=out_bytes),
+          initialize activation/output address registers,
           abs-jump i-cache anchor,
           loop_start(n_tiles):
-            PBI memcpy DRAM->URAM_A   (pointer advances act_bytes/iteration)
+            PBI memcpy DRAM->URAM_A,
             CONFIG + CONV2D           (constant descriptor for this group;
                                        ordered queued geometry precedes it)
-            PBI writeback URAM->DRAM  (pointer advances out_bytes/iteration)
+            PBI writeback URAM->DRAM,
+            advance the address registers by act_bytes/out_bytes,
           loop_end.
 
         Activation windows must be pre-staged contiguously at ``act_base``
         (slot i at ``act_base + i*act_bytes``); results land contiguously at
-        ``out_base``. PBI pointers post-increment: iteration 0 uses the base.
+        ``out_base``. Iteration 0 uses the base addresses.
         """
         formats = self._resolve_tensor_formats(formats)
-        self.accelerator_memory_to_scale_sram(scale_dram_addr, scale_count)
+        if data_type != TYPE.FLOAT16:
+            self.accelerator_memory_to_scale_sram(scale_dram_addr, scale_count)
         if bias_dram_addr is not None:
             # CONV rewinds bias after each pixel's OC vector. The packed
             # allocation contains only oc_count entries, even for large tiles.
@@ -10200,7 +10243,8 @@ class UnifiedEngine:
             out_w=out_w, out_h=out_h, w_pad=w_pad, stride_s=stride_s,
             data_type=data_type, bias_enable=bias_dram_addr is not None,
             lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b,
-            dilation=dilation, gather=gather, c_in=c_in, formats=formats)
+            dilation=dilation, gather=gather, c_in=c_in, formats=formats,
+            weight_reuse=weight_reuse)
         self.sram_to_accelerator_memory(
             sram_address=wb_uram_addr << 7,
             accelerator_dram_address=0,
@@ -10227,11 +10271,14 @@ class UnifiedEngine:
                          data_type: TYPE = TYPE.IF4,
                          wb_uram_addr: int = 0x300,
                          gather: Optional[bool] = None,
-                         timeout_s: float = 300.0) -> torch.Tensor:
+                         timeout_s: float = 300.0,
+                         formats: Optional[TensorFormats] = None) -> torch.Tensor:
         """Full-tensor Conv2d layer as one resident multi-geometry program.
 
-        x: (C, H, W) tensor (cast to bf16); w_codes: (OC, C, kh, kw) integer
-        hardware codes. ``scale_mag`` is the positive, uniform IF4-INT scale.
+        x: (C, H, W), stored in formats.a; w_codes: (OC, C, kh, kw).
+        TYPE.FLOAT16 stores floating weights in formats.b (BF16 or FP16),
+        bypasses block scales, and keeps one pattern in bank Z. Quantized
+        types accept integer hardware codes. ``scale_mag`` is the positive, uniform IF4-INT scale.
         For block-quantized weights, ``block_scales`` carries the signed BF16
         hardware scales instead: negative selects INT4 and positive selects
         FP4. In channels mode its shape is
@@ -10249,8 +10296,9 @@ class UnifiedEngine:
         exactly one capture + one program + one execute without recomputing
         overlap-clamped edge pixels.
         """
-        assert data_type in (TYPE.IF4, TYPE.IF8), \
-            f"layer driver supports IF4/IF8 weights, got {data_type}"
+        formats = self._resolve_tensor_formats(formats)
+        assert data_type in (TYPE.FLOAT16, TYPE.IF4, TYPE.IF8), \
+            f"layer driver supports FLOAT16/IF4/IF8 weights, got {data_type}"
         C, H, W = x.shape
         OC, wc_c, kernel_h, kernel_w = w_codes.shape
         assert wc_c == C, f"weight C_in {wc_c} != activation C {C}"
@@ -10258,7 +10306,8 @@ class UnifiedEngine:
             pad_h = pad
         ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
         taps = kernel_h * kernel_w * ct
-        lalu_mode, lalu_a, lalu_b = _conv_fused_lalu(relu_enable, silu_enable, gelu_enable)
+        lalu_mode, lalu_a, lalu_b = _conv_fused_lalu(relu_enable, silu_enable, gelu_enable,
+                                                     params_format=formats.params)
 
         # Gather mode (small-C, UE_CONV_CTRL[31]): computes the whole im2col
         # patch as a plain dot -> ~9x utilization on C_in=3/4 stems. The gather
@@ -10279,9 +10328,13 @@ class UnifiedEngine:
             raise ValueError(
                 f"gather=True unsupported here: need C<=255 (got {C}) and "
                 f"Kh*Kw*C<=256 (got {patch_taps})")
+        native_weights = data_type == TYPE.FLOAT16
         scales_per_oc = chunks if use_gather else taps
+        if native_weights and (block_scales is not None or
+                               isinstance(scale_mag, torch.Tensor) or scale_mag != 1.0):
+            raise ValueError("FLOAT16 weights are used directly without block scales")
         if block_scales is not None:
-            block_scales = block_scales.detach().to(device="cpu", dtype=torch.bfloat16)
+            block_scales = block_scales.detach().to(device="cpu", dtype=formats.scale.dtype)
             expected = (OC, scales_per_oc)
             if tuple(block_scales.shape) != expected:
                 raise ValueError(
@@ -10304,7 +10357,8 @@ class UnifiedEngine:
             kernel_h=kernel_h, kernel_w=kernel_w, stride_s=stride_s,
             pad=pad, pad_h=pad_h, dilation=dilation,
             gather=use_gather, bias_enabled=bias is not None,
-            wb_uram_addr=wb_uram_addr)
+            wb_uram_addr=wb_uram_addr,
+            weight_block_limit=4096 if native_weights else SCALE_BRAM_ELEMENTS)
         n_chunks = -(-OC // oc_chunk)
         assert OC % oc_chunk == 0, (
             "planner must choose a divisor of OC so every descriptor and "
@@ -10319,7 +10373,7 @@ class UnifiedEngine:
 
         # Stage every exact tile window in geometry-group order; ONE bulk DMA.
         staged = conv2d_pack_activation_tiles(
-            x, tiles, pad=pad, pad_h=pad_h)
+            x, tiles, pad=pad, pad_h=pad_h, dtype=formats.a.dtype)
         assert staged.numel() * staged.element_size() == activation_bytes
         ACT_BASE = self.allocate_params_dram(activation_bytes)
         self.dma_write(DMA_DEVICE_H2C, ACT_BASE, staged, staged.numel() * 2)
@@ -10334,37 +10388,32 @@ class UnifiedEngine:
             # A scalar is the backwards-compatible forced-INT path. Signed
             # block scales pass through unchanged so IF4 MixMSE can select
             # INT4/FP4 independently for every 64-value block.
-            chunk_scale = _conv2d_chunk_scale(
+            chunk_scale = None if native_weights else _conv2d_chunk_scale(
                 block_scales, scale_mag, oc0=oc0, n_oc=n_oc)
-            # Weights still repeat per output pixel; channel scales and bias
-            # are one geometry-independent pattern that hardware rewinds.
-            # Pack weights for the largest geometry once: every tail geometry
-            # consumes an exact prefix from the same address.
-            stream_group = max(groups, key=lambda group: group[2] * group[3])
-            stream_th, stream_tw = stream_group[2], stream_group[3]
+            # Keep one weight pattern in bank Z for the complete tile.
             if use_gather:
                 w_stream = conv2d_pack_weight_stream_gather(
-                    wc, stream_th, stream_tw, data_type)
-                scale_stream = conv2d_pack_scale_stream_gather(
-                    chunk_scale, n_oc, chunks)
+                    wc, 1, 1, data_type, weight_format=formats.b)
+                scale_stream = None if native_weights else conv2d_pack_scale_stream_gather(
+                    chunk_scale, n_oc, chunks, dtype=formats.scale.dtype)
             else:
                 w_stream = conv2d_pack_weight_stream(
-                    wc, stream_th, stream_tw, data_type)
-                scale_stream = conv2d_pack_scale_stream(
-                    chunk_scale, n_oc, taps, stream_th, stream_tw)
+                    wc, 1, 1, data_type, weight_format=formats.b)
+                scale_stream = None if native_weights else conv2d_pack_scale_stream(
+                    chunk_scale, n_oc, taps, 1, 1, dtype=formats.scale.dtype)
             WEIGHTS_DRAM_ADDR = self.allocate_params_dram(w_stream.numel())
             self.dma_write(
                 DMA_DEVICE_H2C, WEIGHTS_DRAM_ADDR,
                 w_stream, w_stream.numel())
-            SCALE_DRAM_ADDR = self.allocate_params_dram(
-                scale_stream.numel() * 2)
-            self.dma_write(
-                DMA_DEVICE_H2C, SCALE_DRAM_ADDR,
-                scale_stream, scale_stream.numel() * 2)
+            SCALE_DRAM_ADDR = 0
+            if scale_stream is not None:
+                SCALE_DRAM_ADDR = self.allocate_params_dram(scale_stream.numel() * 2)
+                self.dma_write(DMA_DEVICE_H2C, SCALE_DRAM_ADDR,
+                               scale_stream, scale_stream.numel() * 2)
             BIAS_DRAM_ADDR = None
             if bias is not None:
                 bias_stream = conv2d_pack_bias_stream(
-                    bias[oc0:oc0 + n_oc], stream_th, stream_tw)
+                    bias[oc0:oc0 + n_oc], 1, 1, dtype=formats.bias.dtype)
                 BIAS_DRAM_ADDR = self.allocate_params_dram(
                     bias_stream.numel() * 2)
                 self.dma_write(
@@ -10391,8 +10440,8 @@ class UnifiedEngine:
                     scale_count=scale_count,
                     bias_dram_addr=BIAS_DRAM_ADDR, results=th * tw * n_oc,
                     lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b,
-                    gather=use_gather, c_in=C,
-                    wb_uram_addr=wb_uram_addr)
+                    gather=use_gather, c_in=C, weight_reuse=True,
+                    wb_uram_addr=wb_uram_addr, formats=formats)
         self.stop_capture()
         self.generate_instruction_halt()
         program_dram_addr = self.get_program_dram_addr()
@@ -10411,7 +10460,7 @@ class UnifiedEngine:
 
         # ONE bulk readback for the whole layer; scatter exact grouped tiles.
         big = self.dma_from_accelerator_memory(
-            OUT_BASE, (n_chunks * chunk_output_bytes // 2,))
+            OUT_BASE, (n_chunks * chunk_output_bytes // 2,), dtype=formats.output.dtype)
         return conv2d_unpack_tiled_result(
             big, tiles, out_h, out_w, OC, oc_chunk)
 
@@ -13655,7 +13704,7 @@ def conv2d_tiled_dram_layout(tiles, ct: int, oc_chunk: int):
 
 def conv2d_pack_activation_tiles(x: torch.Tensor, tiles, pad: int,
                                  pad_h: Optional[int] = None,
-                                 pad_value: float = 0.0) -> torch.Tensor:
+                                 pad_value: float = 0.0, *, dtype=torch.bfloat16) -> torch.Tensor:
     """Pack exact planner tiles with at most one gather per geometry group.
 
     ``tiles`` uses :func:`plan_conv2d_layer_tiles` tuples, ordered in contiguous
@@ -13673,7 +13722,7 @@ def conv2d_pack_activation_tiles(x: torch.Tensor, tiles, pad: int,
         pad_h = pad
     assert pad >= 0 and pad_h >= 0, "padding must be non-negative"
     x_padded = torch.nn.functional.pad(
-        x.to(torch.bfloat16), (pad, pad, pad_h, pad_h), value=float(pad_value))
+        x.to(dtype), (pad, pad, pad_h, pad_h), value=float(pad_value))
     device = x_padded.device
     ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
     packed_groups = []
@@ -13694,7 +13743,7 @@ def conv2d_pack_activation_tiles(x: torch.Tensor, tiles, pad: int,
         else:
             staged = torch.full(
                 (stop - start, win_h, win_w, ct * UE_VECTOR_SIZE),
-                float(pad_value), dtype=torch.bfloat16, device=device)
+                float(pad_value), dtype=dtype, device=device)
             staged[..., :C] = windows
             packed = staged.reshape(-1, UE_VECTOR_SIZE)
         packed_groups.append(packed)
@@ -13702,18 +13751,20 @@ def conv2d_pack_activation_tiles(x: torch.Tensor, tiles, pad: int,
 
 
 def conv2d_pack_weight_stream(w_codes: torch.Tensor, out_h: int, out_w: int,
-                              data_type: TYPE) -> torch.Tensor:
-    """Pack (OC, C, KH, KW) integer weight codes into the conv X-stream bytes.
+                              data_type: TYPE, *, weight_format=StorageFormat.BF16) -> torch.Tensor:
+    """Pack (OC, C, KH, KW) native weights or codes into convolution bytes.
 
     Block order matches the walker (ct inner -> kx -> ky -> oc, replayed once
     per output pixel): for every pixel, for every oc, taps in (ky, kx, ct)
     order, each block = 64 lanes (channels ct*64..ct*64+63; lanes past C are
     zero codes). IF4/TQ4: 32 bytes/block, lane 2j in the LOW nibble of byte j;
-    IF8: 64 bytes/block. Codes are raw hardware codes (e.g. two's-complement
+    IF8: 64 bytes/block. FLOAT16: 128 bytes/block in weight_format storage,
+    without quantization or scales. Codes are raw hardware codes (e.g. two's-complement
     INT4/INT8 when the block scale is negative, FP4/FP8/TQ4 indices otherwise).
 
     Returns a flat uint8 tensor of out_h*out_w * OC * taps * bytes_per_block.
-    Note the footprint: weights live only in the X-stream, so the walker
+    For weight_reuse=True launches, pass out_h=out_w=1; bank Z holds this
+    pattern for every tile pixel. In legacy streaming mode the walker
     re-fetches the window per output pixel and this buffer scales with
     out_h*out_w (doc §5.4 risk R6) — pack per-tile, not per-layer.
     """
@@ -13721,13 +13772,16 @@ def conv2d_pack_weight_stream(w_codes: torch.Tensor, out_h: int, out_w: int,
     OC, C, KH, KW = w_codes.shape
     ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
     mask = 0xFF if data_type == TYPE.IF8 else 0xF
-    codes = w_codes.to(torch.int16) & mask
+    codes = (w_codes.to(as_storage_format(weight_format).dtype).contiguous().view(torch.int16)
+             if data_type == TYPE.FLOAT16 else w_codes.to(torch.int16) & mask)
     padded = torch.zeros(OC, ct * UE_VECTOR_SIZE, KH, KW, dtype=torch.int16)
     padded[:, :C] = codes
     # (OC, ct, 64, KH, KW) -> (OC, KH, KW, ct, 64): blocks in [oc][ky][kx][ct] order
     blocks = padded.view(OC, ct, UE_VECTOR_SIZE, KH, KW).permute(0, 3, 4, 1, 2) \
                    .reshape(-1, UE_VECTOR_SIZE)
-    if data_type == TYPE.IF8:
+    if data_type == TYPE.FLOAT16:
+        per_pixel = blocks.contiguous().view(torch.uint8).reshape(-1)
+    elif data_type == TYPE.IF8:
         per_pixel = blocks.to(torch.uint8).reshape(-1)
     else:  # IF4 / TQ4: two 4-bit codes per byte, even lane in the low nibble
         per_pixel = (blocks[:, 0::2] | (blocks[:, 1::2] << 4)).to(torch.uint8).reshape(-1)
@@ -13765,7 +13819,7 @@ def _conv2d_chunk_scale(block_scales: Optional[torch.Tensor], scale_mag: float,
 
 
 def conv2d_pack_weight_stream_gather(w_codes: torch.Tensor, out_h: int, out_w: int,
-                                     data_type: TYPE) -> torch.Tensor:
+                                     data_type: TYPE, *, weight_format=StorageFormat.BF16) -> torch.Tensor:
     """Pack (OC, C, KH, KW) codes into the GATHER-mode X-stream (UE_CONV_CTRL[31]).
 
     Gather mode computes conv as a plain dot: each output pixel's whole im2col
@@ -13774,7 +13828,8 @@ def conv2d_pack_weight_stream_gather(w_codes: torch.Tensor, out_h: int, out_w: i
     ``[pixel][oc][chunk]`` (repeated per output pixel, tail-zero-padded); within
     a chunk the 64 taps run in walker order ``[ky][kx][ch]`` (ch innermost),
     tap t = ky*(KW*C)+kx*C+ch. IF4/TQ4: 32 bytes/block (tap 2j low nibble of
-    byte j); IF8: 64 bytes/block. Contrast :func:`conv2d_pack_weight_stream`
+    byte j); IF8: 64 bytes/block; FLOAT16: 128 bytes/block in weight_format
+    storage, without quantization or scales. Contrast :func:`conv2d_pack_weight_stream`
     (channels mode: block = 64 channels of one (ky,kx), Kh*Kw*CT blocks/oc).
     """
     assert w_codes.dim() == 4, f"expected (OC, C, KH, KW), got shape {tuple(w_codes.shape)}"
@@ -13782,13 +13837,16 @@ def conv2d_pack_weight_stream_gather(w_codes: torch.Tensor, out_h: int, out_w: i
     taps = KH * KW * C
     chunks = (taps + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
     mask = 0xFF if data_type == TYPE.IF8 else 0xF
-    codes = w_codes.to(torch.int16) & mask
+    codes = (w_codes.to(as_storage_format(weight_format).dtype).contiguous().view(torch.int16)
+             if data_type == TYPE.FLOAT16 else w_codes.to(torch.int16) & mask)
     # (OC, C, KH, KW) -> (OC, KH, KW, C) -> (OC, taps) in [ky][kx][ch] order.
     taps_arr = codes.permute(0, 2, 3, 1).reshape(OC, taps)
     padded = torch.zeros(OC, chunks * UE_VECTOR_SIZE, dtype=torch.int16)
     padded[:, :taps] = taps_arr
     blocks = padded.reshape(OC * chunks, UE_VECTOR_SIZE)  # [oc][chunk], 64 codes each
-    if data_type == TYPE.IF8:
+    if data_type == TYPE.FLOAT16:
+        per_pixel = blocks.contiguous().view(torch.uint8).reshape(-1)
+    elif data_type == TYPE.IF8:
         per_pixel = blocks.to(torch.uint8).reshape(-1)
     else:
         per_pixel = (blocks[:, 0::2] | (blocks[:, 1::2] << 4)).to(torch.uint8).reshape(-1)
@@ -13921,15 +13979,18 @@ def maxpool2d_unpack_result(flat: torch.Tensor, out_h: int, out_w: int,
     return lines.view(out_h, out_w, c).permute(2, 0, 1).contiguous()
 
 
-def _conv_fused_lalu(relu_enable: bool, silu_enable: bool, gelu_enable: bool):
+def _conv_fused_lalu(relu_enable: bool, silu_enable: bool, gelu_enable: bool,
+                     *, params_format=StorageFormat.BF16):
     """(lalu_mode, lalu_a, lalu_b) for the conv fused-activation epilogue."""
     assert sum([relu_enable, silu_enable, gelu_enable]) <= 1, "pick one fused activation"
+    fmt = as_storage_format(params_format)
     if relu_enable:
-        return LALU_MODE.CLAMP, LALU_CLAMP_RELU_A, LALU_CLAMP_RELU_B
+        return LALU_MODE.CLAMP, fmt.encode_scalar(0.0), fmt.encode_scalar(float("inf"))
     if silu_enable:  # YOLO Conv: x * sigmoid(x) (BN folded into scales/bias)
-        return LALU_MODE.ACT, LALU_ACT_SILU_A, LALU_ACT_SILU_B
+        # ACT divides (a + x) by 1 + exp(b*x), so b must be negative.
+        return LALU_MODE.ACT, fmt.encode_scalar(0.0), fmt.encode_scalar(-1.0)
     if gelu_enable:  # Whisper conv stem: x * sigmoid(1.702x)
-        return LALU_MODE.ACT, LALU_ACT_GELU_A, LALU_ACT_GELU_B
+        return LALU_MODE.ACT, fmt.encode_scalar(0.0), fmt.encode_scalar(-1.702)
     return LALU_MODE.BYPASS, 0, 0
 
 
@@ -13939,8 +14000,7 @@ def plan_conv2d_layer_tiles(*, c_in: int, oc_count: int, in_h: int, in_w: int,
                             dilation: int = 1,
                             gather: bool = False,
                             bias_enabled: bool = False,
-                            weight_bytes_per_block: Optional[int] = None,
-                            weight_stream_budget_bytes: Optional[int] = None,
+                            weight_block_limit: int = SCALE_BRAM_ELEMENTS,
                             act_uram_addr: int = 0x000,
                             wb_uram_addr: int = 0x300):
     """Tile a full conv layer into single-launch chunks.
@@ -13949,16 +14009,16 @@ def plan_conv2d_layer_tiles(*, c_in: int, oc_count: int, in_h: int, in_w: int,
     ``(oy0, ox0, th, tw, y0, x0, win_h, win_w)`` — the launch computes output
     block [oy0:oy0+th, ox0:ox0+tw] for one oc chunk from the PADDED-input
     window [y0:y0+win_h, x0:x0+win_w]. Per-launch constraints honoured:
-    In channels mode, X blocks per launch must fit SCALE_BRAM_ELEMENTS. In
+    The reusable pattern must fit weight_block_limit (8192 by default,
+    4096 for native 16-bit weights). In
     gather mode the hardware rewinds its scale address at each pixel, so only
     ``oc_chunk*ceil(Kh*Kw*C/64)`` scales must fit; tile pixels do not multiply
     that requirement. Both modes also keep the padded window below the
     writeback base, writeback inside the 4096-line bank, output_size within 16
     bits, and taps/stride products within their geometry fields. oc is chunked
     first, then all legal spatial tile shapes are costed by staged input,
-    padded output and fixed launch overhead.  Precompiled callers may also
-    bound the resident spatially-repeated weight stream; this limits artifact
-    growth without restoring the scale/bias BRAM spatial limit.  The grid is
+    padded output and fixed launch overhead. The weight pattern size is
+    independent of tile area. The grid is
     an exact, non-overlapping partition ordered as contiguous
     interior/right/bottom/corner geometry
     groups.  A queue-config resident program can therefore switch geometry at
@@ -13967,17 +14027,13 @@ def plan_conv2d_layer_tiles(*, c_in: int, oc_count: int, in_h: int, in_w: int,
     ``oc_count``; a prime OC above the per-launch cap can therefore fall back
     to chunk 1.  Callers with such shapes may pad OC when throughput matters.
     """
+    assert 1 <= weight_block_limit <= SCALE_BRAM_ELEMENTS
     assert c_in > 0 and oc_count > 0, "channel counts must be positive"
     assert in_h > 0 and in_w > 0, "input dimensions must be positive"
     assert 1 <= kernel_h <= 15 and 1 <= kernel_w <= 15, \
         f"kernel {kernel_h}x{kernel_w} exceeds the 4-bit geometry fields"
     assert stride_s > 0 and dilation > 0, "stride and dilation must be positive"
     assert pad >= 0 and (pad_h is None or pad_h >= 0), "padding must be non-negative"
-    assert ((weight_bytes_per_block is None)
-            == (weight_stream_budget_bytes is None)), \
-        "weight stream byte size and budget must be provided together"
-    if weight_stream_budget_bytes is not None:
-        assert weight_bytes_per_block > 0 and weight_stream_budget_bytes > 0
     assert 0 <= act_uram_addr < wb_uram_addr < 4096, \
         f"invalid URAM split act={act_uram_addr:#x}, wb={wb_uram_addr:#x}"
     if pad_h is None:
@@ -14007,29 +14063,22 @@ def plan_conv2d_layer_tiles(*, c_in: int, oc_count: int, in_h: int, in_w: int,
         col_stride = dilation * ct
         pix_col_step = stride_s * ct
         pix_row_step = stride_s * win_w * ct
-        weight_blocks_per_oc = gather_chunks if gather else taps
-        resident_weight_bytes = (
-            th * tw * oc_count * weight_blocks_per_oc
-            * (weight_bytes_per_block or 0))
         return (th <= 0xFFF and tw <= 0xFFF
                 and max(row_stride, col_stride,
                         pix_col_step, pix_row_step) <= 0xFFF
-                and ((n_oc * gather_chunks <= SCALE_BRAM_ELEMENTS)
-                     if gather else (n_oc * taps <= SCALE_BRAM_ELEMENTS))
+                and ((n_oc * gather_chunks <= weight_block_limit)
+                     if gather else (n_oc * taps <= weight_block_limit))
                 and (not bias_enabled or n_oc <= BIAS_BRAM_ELEMENTS)
                 and win_h * win_w * ct <= wb_uram_addr - act_uram_addr
                 and wb_uram_addr + result_lines <= 4096
-                and results <= 0xFFFF
-                and (weight_stream_budget_bytes is None
-                     or resident_weight_bytes <= weight_stream_budget_bytes
-                     or th * tw == 1))
+                and results <= 0xFFFF)
 
     # Keep one ``oc_count`` and result-slot layout across every OC block in the
     # resident program. Pick the largest fitting divisor instead of leaving a
     # short tail block (e.g. 512 -> 113+...+60).
     scale_blocks_per_oc = gather_chunks if gather else taps
     oc_cap = min(
-        oc_count, max(1, SCALE_BRAM_ELEMENTS // scale_blocks_per_oc))
+        oc_count, max(1, weight_block_limit // scale_blocks_per_oc))
     oc_chunk = next(
         (n for n in range(oc_cap, 0, -1)
          if oc_count % n == 0 and fits(1, 1, n)),

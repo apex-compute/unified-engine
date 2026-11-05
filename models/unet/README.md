@@ -48,8 +48,11 @@ the quantized CPU backend is not a bit-exact BF19/BF20 simulator.
 
 `model_upload_s` is one-time initialization. `fpga_execution_s_sum` measures the
 single device execution; `execution_elapsed_s` includes boundary transfers.
-The compiler's `--weight-reuse-pixels 1..16` trades deployment size for latency.
-Larger resolutions must fit the fixed DRAM arenas.
+IF8 convolutions now keep each tile's weight pattern in URAM bank Z and
+reuse it across all output pixels. Recompile the model and use firmware with
+`UE_CONV_CTRL[30]` support. The obsolete `--weight-reuse-pixels` option has been
+removed; tile size is selected automatically. Larger resolutions must fit the
+fixed DRAM arenas.
 
 For a trace, add `--trace-tail /tmp/unet_trace` to the hardware command. The trace
 contains only the final 8,192 decode events, with layer labels. Inferred windows

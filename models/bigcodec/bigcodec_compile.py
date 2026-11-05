@@ -32,8 +32,6 @@ from bigcodec_layout import MemoryLayout, LEGACY_LAYOUT, EXTENDED_LAYOUT, LARGE_
 FORMAT = "andromeda.bigcodec.whole-utterance-v1"
 DEFAULT_OUTPUT = Path(__file__).resolve().parent / "bigcodec_bin" / "bigcodec-andromeda.bin"
 CONV_SCATTER_BYTES = 512 * 1024
-CONV_STREAM_BUDGET_PER_64_OUTPUTS = 256 * 1024
-CONV_MAX_REUSE_PIXELS = 32
 WAVEFORM_ROW_LANES = 64  # SRAM DMA advances in complete 128-byte rows.
 WAVEFORM_ROW_BYTES = WAVEFORM_ROW_LANES * 2
 WAVEFORM_TILE_ROWS = TANH_CHUNK_ELEMENTS // WAVEFORM_ROW_LANES
@@ -62,7 +60,6 @@ class Operation:
     plan: object = field(default=None, repr=False)
     scratch_bytes: int = 0
     scatter_address: int = 0
-    weight_reuse_pixels: int = 1
 
 
 @dataclass
@@ -97,21 +94,6 @@ def compiled_sample_count(samples: int) -> int:
     if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
         raise ValueError("samples must be a positive native 16 kHz sample count")
     return samples + HOP_LENGTH - samples % HOP_LENGTH
-
-
-def convolution_reuse_pixels(module) -> int:
-    """Spend bounded weight replication on the early, longest convolutions."""
-    inputs = int(module.in_channels)
-    kernel = int(module.kernel_size[0])
-    if isinstance(module, torch.nn.ConvTranspose1d):
-        # The helper emits ordinary convolutions for temporal polyphases.
-        kernel = (kernel + module.stride[0] - 1) // module.stride[0]
-    padded_blocks = (inputs + 63) // 64
-    gather_blocks = (kernel * inputs + 63) // 64
-    gather = inputs <= 255 and gather_blocks <= 4 and gather_blocks < kernel * padded_blocks
-    blocks = gather_blocks if gather else kernel * padded_blocks
-    bytes_per_pixel = 64 * blocks * 64  # 64 OC × IF8 blocks × 64 one-byte codes.
-    return max(1, min(CONV_MAX_REUSE_PIXELS, CONV_STREAM_BUDGET_PER_64_OUTPUTS // bytes_per_pixel))
 
 
 def build_graph(encoder, decoder, compiled_samples: int, *, conv_precision="if8", lstm_precision="bf16",
@@ -372,7 +354,6 @@ def _plan_memory(graph: Graph, layout: MemoryLayout) -> Graph:
                 operation.scratch_bytes = _bf16_convolutions().conv_scratch_bytes(shape, module.weight.shape,
                     padding=module.padding[0], stride=module.stride[0], dilation=module.dilation[0])
             else:
-                operation.weight_reuse_pixels = convolution_reuse_pixels(module)
                 operation.scratch_bytes = aligned(conv1d_padding_bytes(shape, padding=module.padding[0])) + CONV_SCATTER_BYTES
         elif operation.op == "conv_transpose1d":
             if graph.conv_precision == "bf16":
@@ -380,7 +361,6 @@ def _plan_memory(graph: Graph, layout: MemoryLayout) -> Graph:
                     padding=module.padding[0], stride=module.stride[0], transpose=True,
                     output_padding=module.output_padding[0])
             else:
-                operation.weight_reuse_pixels = convolution_reuse_pixels(module)
                 operation.scratch_bytes = aligned(conv_transpose1d_padding_bytes(shape, module.weight.shape,
                     stride=module.stride[0], padding=module.padding[0], output_padding=module.output_padding[0])) + CONV_SCATTER_BYTES
         scratch = max(scratch, operation.scratch_bytes)
@@ -411,12 +391,12 @@ def _prepare_operation(graph, image, identity_address, zero_address, operation):
         operation.plan = prepare_conv1d(operation.name, module.weight, module.bias,
             input_shape=source.shape, input_address=source.address, output_address=output.address,
             padded_input_address=graph.scratch_address, image=image, stride=module.stride[0],
-            padding=module.padding[0], dilation=module.dilation[0], weight_reuse_pixels=operation.weight_reuse_pixels)
+            padding=module.padding[0], dilation=module.dilation[0])
     elif operation.op == "conv_transpose1d":
         operation.plan = prepare_conv_transpose1d(operation.name, module.weight, module.bias,
             input_shape=source.shape, input_address=source.address, output_address=output.address,
             padded_input_address=graph.scratch_address, image=image, stride=module.stride[0],
-            padding=module.padding[0], output_padding=module.output_padding[0], weight_reuse_pixels=operation.weight_reuse_pixels)
+            padding=module.padding[0], output_padding=module.output_padding[0])
     elif operation.op == "activation":
         operation.plan = prepare_activation(module, image, input_shape=source.shape,
             input_address=source.address, output_address=output.address,
@@ -571,7 +551,7 @@ def _compile_models(encoder, decoder, *, samples: int, conv_precision="if8",
                 raise RuntimeError(f"{operation.name}: no instructions were emitted")
             operations.append({"name": operation.name, "op": operation.op,
                 "start": start, "stop": stop, "inputs": list(operation.inputs),
-                "output": operation.output, "weight_reuse_pixels": operation.weight_reuse_pixels})
+                "output": operation.output})
             if program_address + aligned((stop + 1) * udc.INSTRUCTION_SIZE_BYTES, 64) > layout.model_limit:
                 counts = Counter()
                 for entry in operations:

@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from bigcodec_common import DEFAULT_CHECKPOINT, load_models
-from bigcodec_compile import Arena, build_graph, compiled_sample_count, plan_memory, convolution_reuse_pixels, _prepare_operation, emit_operation, _lstm_numerics, shared
+from bigcodec_compile import Arena, build_graph, compiled_sample_count, plan_memory, _prepare_operation, emit_operation, _lstm_numerics, shared
 from bigcodec_layout import LEGACY_LAYOUT, EXTENDED_LAYOUT, LARGE_PROGRAM_LAYOUT, layout_for_hardware
 from bigcodec_vq.activations import SnakeBeta
 from bigcodec_vq.alias_free_torch import Activation1d
@@ -146,14 +146,6 @@ class BigCodecGraphTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             arena.allocate(0x1000)
 
-    def test_adaptive_reuse_bounds_large_weights_and_uses_small_gather(self):
-        for inputs, kernel, expected in ((1, 7, 32), (48, 7, 9), (96, 7, 4), (192, 7, 3), (768, 7, 1)):
-            module = torch.nn.Conv1d(inputs, 64, kernel)
-            self.assertEqual(convolution_reuse_pixels(module), expected)
-        module = torch.nn.ConvTranspose1d(96, 48, kernel_size=4, stride=2)
-        # Two-tap phases pack 96 channels into three profitable gather blocks.
-        self.assertEqual(convolution_reuse_pixels(module), 21)
-
     def test_bf16_dispatch_has_own_workspace_and_same_audio_contract(self):
         backend = SimpleNamespace(conv_scratch_bytes=Mock(return_value=128 * 1024),
             prepare_conv1d=Mock(return_value="bf16-conv"),
@@ -167,7 +159,6 @@ class BigCodecGraphTest(unittest.TestCase):
                 if operation.op not in ("conv1d", "conv_transpose1d"):
                     continue
                 self.assertEqual(operation.scratch_bytes, 128 * 1024)
-                self.assertEqual(operation.weight_reuse_pixels, 1)
                 _prepare_operation(graph, object(), 0x90000000, 0x90002000, operation)
                 with patch("bigcodec_compile.zero"):
                     emit_operation(object(), graph, operation, 0x90000000, 0x90002000)

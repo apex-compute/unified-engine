@@ -176,7 +176,8 @@ def emit_conv(engine, plan, zero, scratch, relu, phase_target=None):
                     kernel_h=plan['kernel_h'],ct=ct,oc_count=plan['oc_chunk'],
                     out_w=tw,out_h=th,w_pad=win_w,stride_s=1,data_type=udc.TYPE.IF8,
                     bias_enable=True,lalu_mode=mode,lalu_a=a,lalu_b=b,
-                    dilation=1,gather=plan['use_gather'],c_in=plan['convolution_c'])
+                    dilation=1,gather=plan['use_gather'],c_in=plan['convolution_c'],
+                    weight_reuse=True)
                 if phase_target is not None:
                     destination,phase,channel_offset = phase_target
                     _scatter_phase_tile(engine,destination,tile,chunk['oc0'],
@@ -210,18 +211,16 @@ def emit_merge(engine, sources, dst):
             destination=dst.address+start*out_pixel,total=n*pixel,chunk=pixel,jump=out_pixel)
 
 
-def compile_hardware(layers, height, width, *, weight_reuse_pixels=12):
-    if not 1 <= int(weight_reuse_pixels) <= 16:
-        raise ValueError('weight_reuse_pixels must be in [1,16]')
+def compile_hardware(layers, height, width):
     previous = udc.UE_AXI_DATA_WIDTH_BITS
     udc.UE_AXI_DATA_WIDTH_BITS = 256
     try:
-        return _compile(layers,height,width,int(weight_reuse_pixels))
+        return _compile(layers,height,width)
     finally:
         udc.UE_AXI_DATA_WIDTH_BITS = previous
 
 
-def _compile(layers,height,width,weight_reuse_pixels=12):
+def _compile(layers,height,width):
     shapes,ops = graph(layers,height,width)
     layouts,scratch = memory_plan(shapes,ops)
     image = shared._ImageBuilder(shared.MODEL_BASE,shared.MODEL_LIMIT)
@@ -247,13 +246,9 @@ def _compile(layers,height,width,weight_reuse_pixels=12):
         weight = dict(precision='if8',codes_packed=codes.contiguous().view(torch.uint8).flatten(),
                       codes_shape=list(codes.shape),layout='gather' if gather else 'channel',
                       block_scales=-layer['scales'][:,None].expand(oc,blocks).contiguous(),bias=layer['bias'])
-        # A deep kernel alone can exceed YOLO's 4 MiB floor. Permit a bounded
-        # number of spatial weight copies so the planner can amortize tile
-        # setup/halo DMA; the compiler exposes this memory/latency tradeoff.
-        budget = max(4 << 20, oc*blocks*64*weight_reuse_pixels)
+        # IF8 stores one [oc][tap] pattern; hardware replays it from bank Z.
         plans[op['name']] = shared._prepare_conv_plan(op,weight,layouts[op['inputs'][0]],
-            layouts[op['output']],image,allow_half_vector_output=True,
-            weight_stream_budget_bytes=budget)
+            layouts[op['output']],image,allow_half_vector_output=True)
     base = image.align(64)
     engine = shared._WholeGraphEngine(base)
     engine.start_capture()
@@ -279,7 +274,6 @@ def _compile(layers,height,width,weight_reuse_pixels=12):
         program_offset=base-shared.MODEL_BASE,program_size=len(program),
         model_sha256=hashlib.sha256(image.data).hexdigest(),
         program_sha256=hashlib.sha256(program).hexdigest(),
-        weight_reuse_pixels=weight_reuse_pixels,
         tensors={name:layout.manifest() for name,layout in layouts.items()},
         scratch=scratch,operations=entries)
     validate(layers,hardware)
@@ -287,8 +281,6 @@ def _compile(layers,height,width,weight_reuse_pixels=12):
 
 
 def validate(layers, hardware):
-    if not 1 <= int(hardware.get('weight_reuse_pixels',4)) <= 16:
-        raise RuntimeError('invalid U-Net weight reuse setting')
     width,height = hardware['resolution']
     shapes,ops = graph(layers,height,width)
     layouts,scratch = memory_plan(shapes,ops)

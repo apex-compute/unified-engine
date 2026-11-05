@@ -17,8 +17,6 @@ def main():
     parser.add_argument('--output', type=Path, default=HERE/'unet_bin/unet-andromeda.bin')
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--resolution', default='256x256')
-    parser.add_argument('--weight-reuse-pixels', type=int, default=12,
-                        help='per-layer spatial weight-copy budget, 1..16 (default: 12)')
     args = parser.parse_args()
     try:
         width,height = map(int,args.resolution.lower().split('x'))
@@ -43,8 +41,7 @@ def main():
         raise ValueError(f'official checkpoint SHA256 mismatch: {digest}')
     state = torch.load(checkpoint, map_location='cpu', weights_only=True)
     layers = build_layers(state)
-    hardware = compile_hardware(layers,height,width,
-                                weight_reuse_pixels=args.weight_reuse_pixels)
+    hardware = compile_hardware(layers,height,width)
     payload = dict(format=FORMAT, precision='IF8-INT/BF16', checkpoint_sha256=digest,
                    layers=layers, mask_values=state.get('mask_values',[0,1]),
                    hardware=hardware, full_graph=True)

@@ -84,8 +84,9 @@ class MemoryEngine:
         count, channels, kernel = kw["oc_count"], kw["c_in"], kw["kernel_w"]
         cpad = kw["ct"] * 64
         blocks = (kernel * channels + 63) // 64 if kw["gather"] else kernel * kw["ct"]
-        code_bytes = kw["out_w"] * count * blocks * 64
-        weights = self.view(kw["weights_dram_addr"], code_bytes).view(np.int8).reshape(kw["out_w"], count, blocks * 64)
+        assert kw['weight_reuse']
+        code_bytes = count * blocks * 64
+        weights = self.view(kw["weights_dram_addr"], code_bytes).view(np.int8).reshape(count, blocks * 64)
         scales = np.repeat(np.abs(self.scales.reshape(count, blocks)), 64, axis=1)
         assert np.all(self.scales < 0)
         inputs = self.floats(kw["act_sram_start_addr"], kw["w_pad"] * cpad, sram=True).reshape(kw["w_pad"], cpad)
@@ -95,7 +96,7 @@ class MemoryEngine:
             values = np.zeros(blocks * 64, dtype=np.float32)
             flattened = patch[:, :channels].reshape(-1) if kw["gather"] else patch.reshape(-1)
             values[:flattened.size] = flattened
-            result = (weights[t].astype(np.float32) * scales) @ values
+            result = (weights.astype(np.float32) * scales) @ values
             if kw["bias_enable"]:
                 result += self.bias
             outputs.append(result)
@@ -184,14 +185,16 @@ class ConvTests(unittest.TestCase):
                 expected = F.conv1d(values.T[None], self.dequantize(weight), bias.bfloat16().float(), stride=stride, dilation=dilation, padding=padding)[0].T.bfloat16().float()
                 torch.testing.assert_close(actual, expected, rtol=.008, atol=1e-5)
                 self.assertTrue(engine.launches)
-                self.assertTrue(all(p["groups"][0][3] == 1 for p in plan["subplans"]))
+                for subplan in plan['subplans']:
+                    self.assertEqual(sum(tile[3] for tile in subplan['tiles']),
+                                     plan['output_shape'][0])
 
     def test_emitted_transpose_phases_bias_padding_and_scatter(self):
         for stride in (2, 5):
             values = torch.randn(7, 96).bfloat16().float()
             weight, bias = torch.randn(96, 48, 2 * stride) * .025, torch.randn(48) * .01
             padding, extra = (stride + 1) // 2, stride % 2
-            plan = conv.prepare_conv_transpose1d("transpose", weight, bias, **self.args(values.shape), stride=stride, padding=padding, output_padding=extra, weight_reuse_pixels=3)
+            plan = conv.prepare_conv_transpose1d("transpose", weight, bias, **self.args(values.shape), stride=stride, padding=padding, output_padding=extra)
             actual, engine = self.execute(plan, values)
             decoded = torch.empty_like(weight)
             for phase in conv.transpose_polyphase(weight, input_length=7, stride=stride, padding=padding, output_padding=extra):
@@ -208,21 +211,21 @@ class ConvTests(unittest.TestCase):
         self.assertEqual(len(plan["subplans"]), 12)
         for subplan in plan["subplans"]:
             self.assertEqual(subplan["oc_chunk"], 64)
-            self.assertTrue(all(tile[2:4] == (1, 1) for tile in subplan["tiles"]))
+            self.assertEqual(sum(tile[2] * tile[3] for tile in subplan['tiles']), 3)
+            self.assertGreater(subplan['tiles'][0][3], 1)
         # One int8 copy of each weight plus scale bytes/alignment, never the
         # activation length times those weights.
         self.assertLess(len(self.image.data), conv.ZERO_BYTES + weight.numel() * 1.04)
 
     def test_official_c768_dilation9_uses_exact_phases_and_shared_weights(self):
-        for length, outputs, stride, reuse in ((10, 768, 1, 1), (30, 64, 6, 3)):
-            with self.subTest(length=length, stride=stride, reuse=reuse):
+        for length, outputs, stride in ((10, 768, 1), (30, 64, 6)):
+            with self.subTest(length=length, stride=stride):
                 values = torch.randn(length, 768).bfloat16().float()
                 weight, bias = torch.randn(outputs, 768, 7) * .01, torch.randn(outputs) * .01
                 before = len(self.image.data)
                 plan = conv.prepare_conv1d("official_d9", weight, bias,
                                            **self.args(values.shape), padding=27,
-                                           dilation=9, stride=stride,
-                                           weight_reuse_pixels=reuse)
+                                           dilation=9, stride=stride)
                 actual, engine = self.execute(plan, values)
                 expected = F.conv1d(values.T[None], self.dequantize(weight),
                                     bias.bfloat16().float(), stride=stride,
@@ -235,7 +238,7 @@ class ConvTests(unittest.TestCase):
                 addresses = [{chunk["weight_address"] for subplan in phase["subplans"]
                               for chunk in subplan["chunks"]} for phase in plan["dilation_phases"]]
                 self.assertTrue(all(item == addresses[0] for item in addresses))
-                self.assertLess(len(self.image.data) - before, weight.numel() * reuse * 1.04 + 8192)
+                self.assertLess(len(self.image.data) - before, weight.numel() * 1.04 + 8192)
 
                 old = conv.udc.UE_AXI_DATA_WIDTH_BITS
                 conv.udc.UE_AXI_DATA_WIDTH_BITS = 256
