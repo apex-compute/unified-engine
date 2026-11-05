@@ -16,22 +16,22 @@ contiguously ("tiled") for the host to unpack.
 
   1x1 conv    with C and OC multiples of 64 the map IS a row-major [pixels, C]
               matrix: one quantized-B matmul (A @ W^T + bias) per image row.
-  3x3 conv    (C and OC multiples of 64, padded output) nine accumulated row-block
-              matmuls: for tap (ky, kx) the A operand of output rows y0..y0+R-1 is
+  conv        the layer driver's exact tile grid; per tile one strided DRAM->URAM
+              read of the window straight from the padded map, CONV2D with
+              weight_reuse (the hardware loads the conv's one [oc][tap] IF8 pattern
+              from the constant image into URAM_B per launch and replays it for every
+              tile pixel; RTL with UE_CONV_CTRL[30], andromeda 927fd8d+), and strided
+              URAM->DRAM writes of the tile rows into the output map. Tile ranges of
+              every (OC chunk, geometry group) are split over the engines.
+  3x3 conv    alternative (config vae.conv3x3_mode = "matmul", for images without
+              weight reuse, whose walker re-streams the whole weight block per output
+              pixel, one byte per MAC, capped at half rate by the 32 B/cycle AXI):
+              nine accumulated row-block matmuls (C and OC multiples of 64, padded
+              output): for tap (ky, kx) the A operand of output rows y0..y0+R-1 is
               the R*Wp consecutive input pixels starting at padded pixel (y0+ky, kx),
-              so there is no im2col and the matmul keeps its B tile across 64 A rows
-              (the CONV2D walker re-streams the whole IF8 weight block per output
-              pixel, one byte per MAC, which the 32 B/cycle AXI caps at half rate).
+              so there is no im2col and the matmul keeps its B tile across 64 A rows.
               The partial sums accumulate in place through the full-matrix C operand;
               the border pixels of the rows get junk and are re-zeroed afterwards.
-  conv        (the rest: conv_in with C = 32, the tiled conv_out) the layer driver's
-              exact tile grid; per tile one strided DRAM->URAM read of the window
-              straight from the padded map, CONV2D, and strided URAM->DRAM writes of
-              the tile rows into the output map. Tile ranges of every (OC chunk,
-              geometry group) are split over the engines. The walker re-reads its
-              weight stream per tile pixel, so each conv is preceded by an on-engine
-              expansion of its unrepeated weight blocks (loaded once per run in the
-              constant image).
   GroupNorm   pass 1 lane-wise pixel sums into slotted accumulators (flushed every
               32 chunks); the flush blocks are transposed with an identity matmul
               and summed by a ones matmul on the bf20 ladder; a group-average
@@ -75,6 +75,7 @@ MAP_ALIGN = 256 * 1024             # map buffers are padded so round-based ops m
 K_PIECE = 8192                     # ladder reduction piece (rows) per matmul
 GN_FLUSH = udc.GROUP_NORM_MAX_ACC_DEPTH
 MM9_MAX_M = 2048                   # pixels per row-block matmul of a 3x3 conv (R = MM9_MAX_M // Wp rows)
+WEIGHT_REUSE_BANK = 512 * 1024     # URAM_B: the one [oc][tap] weight pattern a weight_reuse launch holds
 
 
 def emitter_hash() -> str:
@@ -160,6 +161,8 @@ class Flux2VaeOneShot:
         self.block_out = list(self.cfg["block_out_channels"])
         self.n_res = self.cfg["layers_per_block"] + 1
         self.lat = self.cfg["latent_channels"]
+        self.conv3x3_mode = self.cfg.get("conv3x3_mode", "walker")
+        assert self.conv3x3_mode in ("walker", "matmul"), self.conv3x3_mode
         self.steps: list[dict] = []
         self.consts: dict[str, int] = {}
         self.gn_params: dict[str, int] = {}
@@ -388,13 +391,13 @@ class Flux2VaeOneShot:
         if kh == kw == 1 and C % UE_VECTOR_SIZE == 0 and OC % UE_VECTOR_SIZE == 0 and out_layout != "tiled":
             return self.conv1x1(x, key, out_layout)
         if (kh, kw, pad) == (3, 3, 1) and C % UE_VECTOR_SIZE == 0 and OC % UE_VECTOR_SIZE == 0 \
-                and x.layout == "padded" and out_layout == "padded":
+                and x.layout == "padded" and out_layout == "padded" and self.conv3x3_mode == "matmul":
             return self.conv3x3_mm(x, key)
         OC_eff = OC if (OC % UE_VECTOR_SIZE == 0 or out_layout == "tiled") else _align(OC, UE_VECTOR_SIZE)
         g = self._conv_geometry(C, H, Wd, OC_eff, kh, kw, pad)
         n_oc, nck = g["oc_chunk"], g["n_chunks"]
         block_bytes = n_oc * g["blocks_per_oc"] * UE_VECTOR_SIZE
-        assert block_bytes <= udc.URAM_NEAR_FULL_SIZE
+        assert block_bytes <= WEIGHT_REUSE_BANK, f"{key}: weight pattern {block_bytes} B exceeds URAM_B"
         if not self._dry and key in self.conv_chunks:
             raise RuntimeError(key)
         WBLK = [self._calloc(block_bytes) for _ in range(nck)]
@@ -402,8 +405,6 @@ class Flux2VaeOneShot:
         BA = [self._calloc(n_oc * 2) for _ in range(nck)]
         self.conv_chunks[key] = dict(WBLK=WBLK, SA=SA, BA=BA, block_bytes=block_bytes, oc_chunk=n_oc,
                                      gather=g["use_gather"], OC_eff=OC_eff, OC=OC)
-        wexp = self._scratch("wexp", nck * _align(block_bytes * g["npix"], 4096))
-        WEXP = [wexp + ci * _align(block_bytes * g["npix"], 4096) for ci in range(nck)]
         if out_layout == "tiled":
             out_bytes = nck * g["chunk_out"]
             out = {"addr": self._alloc(out_bytes), "bytes": out_bytes, "shape": [OC, g["out_h"], g["out_w"]],
@@ -423,7 +424,7 @@ class Flux2VaeOneShot:
         self.macs += macs
         self._step("conv", key, out_buf if out_buf is not None else out["shape"],
                    dict(x=x, out=out, g=g, key=key, macs=macs, kh=kh, kw=kw, pad=pad, C=C, OC=OC_eff, n_oc=n_oc, nck=nck,
-                        WEXP=WEXP, WBLK=WBLK, SA=SA, BA=BA, block_bytes=block_bytes, work=per_engine,
+                        WBLK=WBLK, SA=SA, BA=BA, block_bytes=block_bytes, work=per_engine,
                         out_layout=out_layout))
         return out if out_buf is None else out_buf
 
@@ -625,14 +626,7 @@ class Flux2VaeOneShot:
         g, x, out = st["g"], st["x"], st["out"]
         nck, n_oc, C = st["nck"], st["n_oc"], st["C"]
         kh, kw, pad = st["kh"], st["kw"], st["pad"]
-        bb = st["block_bytes"]
-        # 1. expand this engine's weight chunks (block -> npix copies)
-        for ci in range(nck):
-            if ci % self.ne == e:
-                self._load(st["WBLK"][ci], 0, bb)
-                self._loop_store(0, st["WEXP"][ci], bb, g["npix"])
-        self._B()
-        # 2. tiles
+        # tiles; the hardware loads the chunk's [oc][tap] pattern into URAM_B per launch
         lalu_mode, lalu_a, lalu_b = udc._conv_fused_lalu(False, False, False)
         ct_in = x.ct
         bsrc = x.border - pad                       # window coords are in the conv's own padding
@@ -656,10 +650,10 @@ class Flux2VaeOneShot:
                 self._load(x.addr + ((y0 + bsrc) * x.Wp + x0 + bsrc) * ct_in * LINE, 0, win_h * chunk,
                            chunk=chunk, jump=src_row)
                 eng.start_queue_for_conv2d_operation(
-                    act_sram_start_addr=0, output_sram_wb_addr=WB, weights_dram_addr=st["WEXP"][ci],
+                    act_sram_start_addr=0, output_sram_wb_addr=WB, weights_dram_addr=st["WBLK"][ci],
                     kernel_w=kw, kernel_h=kh, ct=ct_in, oc_count=n_oc, out_w=tw, out_h=th, w_pad=win_w,
                     stride_s=1, data_type=TYPE.IF8, bias_enable=True, lalu_mode=lalu_mode, lalu_a=lalu_a,
-                    lalu_b=lalu_b, dilation=1, gather=g["use_gather"], c_in=C)
+                    lalu_b=lalu_b, dilation=1, gather=g["use_gather"], c_in=C, weight_reuse=True)
                 if tiled:
                     self._store(WB, out["addr"] + ci * g["chunk_out"] + out_off + (t - start) * out_b, out_b)
                 elif n_oc == OC:

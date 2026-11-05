@@ -217,10 +217,12 @@ class TestCompile(unittest.TestCase):
         kinds = {}
         for st in vm["steps"]:
             kinds[st["kind"]] = kinds.get(st["kind"], 0) + 1
-        # 3x3 convs with 64-multiple channels run as nine accumulated matmuls; the CONV2D walker
-        # keeps post_quant_conv (C = 32, 1x1), conv_in (C = 32) and the tiled conv_out
-        self.assertEqual(kinds, {"zero_pairs": 1, "conv": 3, "conv3x3mm": 31, "conv1x1": 6, "gn": 30, "silu": 29,
-                                 "add": 15, "attention": 1, "upsample": 3})
+        # vae.conv3x3_mode: "walker" runs every conv on CONV2D with weight reuse; "matmul" runs the
+        # 31 3x3 convs with 64-multiple channels as nine accumulated matmuls (post_quant_conv with
+        # C = 32, conv_in with C = 32 and the tiled conv_out stay on the walker either way)
+        mm = cfg["vae"].get("conv3x3_mode", "walker") == "matmul"
+        self.assertEqual(kinds, {"zero_pairs": 1, "conv": 3 if mm else 34, **({"conv3x3mm": 31} if mm else {}),
+                                 "conv1x1": 6, "gn": 30, "silu": 29, "add": 15, "attention": 1, "upsample": 3})
         self.assertLessEqual(vm["const_base"] + vm["const_size"], vm["arena_end"])
         self.assertLessEqual(vm["arena_end"], ue._tensor_dram_base)
         self.assertGreater(meta["vae_program_size"], 0)
