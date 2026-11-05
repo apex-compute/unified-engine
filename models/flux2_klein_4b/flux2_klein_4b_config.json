@@ -77,8 +77,8 @@
       "norm_out.linear.weight",
       "proj_out.weight"
     ],
-    "vae_precision": "if8",
-    "_note": "IF4 = per-64-block min-MSE INT4/FP4 (scale sign selects the codebook, quant_lib.quantize). bf16_keys stay BF16 B-operands: embedders, the timestep MLP, the shared modulation projections and the output head (small, and their outputs scale every token). VAE convs are IF8 per (oc, tap, 64-ch block)."
+    "vae_precision": "bf16",
+    "_note": "IF4 = per-64-block min-MSE INT4/FP4 (scale sign selects the codebook, quant_lib.quantize). bf16_keys stay BF16 B-operands: embedders, the timestep MLP, the shared modulation projections and the output head (small, and their outputs scale every token). VAE convs: vae_precision bf16 = the checkpoint's own BF16 weights, exact, as native 16-bit conv patterns (walker with weight reuse, 4096-block limit) and unquantized matmul B operands (needs the conv-weight-reuse RTL); if8 = per (oc, tap, 64-ch block) codes (any image). vae_weights.pt carries both."
   },
   "dram_layout": {
     "params_dram_base": "0x00000000",

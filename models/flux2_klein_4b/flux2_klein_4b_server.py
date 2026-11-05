@@ -62,12 +62,14 @@ def _size(path: str) -> int:
 def weight_files() -> dict:
     """Sizes of the geometry-independent weight images (flux2_klein_4b_weights.py)."""
     with open(CONFIG) as f:
-        paths = json.load(f)["paths"]
+        cfg = json.load(f)
+    paths = cfg["paths"]
     return {
         "te": _size(os.path.join(HERE, paths["params_te_bin"])),
         "dit": _size(os.path.join(HERE, paths["params_dit_bin"])),
         "vae": _size(os.path.join(HERE, paths["vae_weights"])),
         "embed_tokens": _size(os.path.join(HERE, paths["embed_tokens_bin"])),
+        "vae_precision": cfg.get("quantization", {}).get("vae_precision", "if8"),
     }
 
 
@@ -437,7 +439,7 @@ function showStatic() {
   $('weights').innerHTML = rows(['Image', 'Format', 'Where', 'Size'], [
     { cells: ['Text encoder', 'IF4', 'params arena, sent per run', gb(w.te || 0)] },
     { cells: ['Diffusion transformer', 'IF4 + BF16 heads', 'params arena, sent per run', gb(w.dit || 0)] },
-    { cells: ['VAE decoder', 'IF8', 'params arena, sent per run', gb(w.vae || 0)] },
+    { cells: ['VAE decoder', (w.vae_precision || 'if8').toUpperCase() + (w.vae_precision === 'bf16' ? ' (exact checkpoint weights)' : ''), 'params arena, sent per run', gb(w.vae || 0)] },
     { cells: ['Token embedding table', 'BF16', 'tensor region, resident', gb(w.embed_tokens || 0)] },
     { cells: ['Total on the board', '', '', gb(wtotal)], total: true },
   ]);

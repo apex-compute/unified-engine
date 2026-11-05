@@ -16,6 +16,12 @@ contiguously ("tiled") for the host to unpack.
 
   1x1 conv    with C and OC multiples of 64 the map IS a row-major [pixels, C]
               matrix: one quantized-B matmul (A @ W^T + bias) per image row.
+  weights     quantization.vae_precision: "bf16" (default) = the checkpoint's own BF16
+              weights, exact: native 16-bit patterns on the walker (FLOAT16 launches,
+              no scales, 128 B/block, 4096-block pattern limit so the 512- and 256-ch
+              convs take twice the OC chunks) and unquantized B operands on the 1x1
+              matmuls; "if8" = per (oc, tap, 64-ch block) codes with scales (any
+              image; the nine-matmul form keeps IF8 codes). vae_weights.pt holds both.
   conv        the layer driver's tile grid, planned with the largest URAM_A window
               region (CONV_WB_CANDIDATES) that still leaves every engine a tile, so
               the small maps are not cut into many tiny launches; per tile one
@@ -71,7 +77,7 @@ for p in (ROOT, HERE):
         sys.path.insert(0, p)
 
 import user_dma_core as udc  # noqa: E402
-from user_dma_core import TYPE, UE_VECTOR_SIZE, INSTRUCTION_SIZE_BYTES  # noqa: E402
+from user_dma_core import TYPE, UE_VECTOR_SIZE, INSTRUCTION_SIZE_BYTES, TensorFormats, StorageFormat  # noqa: E402
 import flux2_klein_4b_weights as W  # noqa: E402
 
 LINE = UE_VECTOR_SIZE * 2          # one 64-lane bf16 URAM line (bytes)
@@ -170,6 +176,15 @@ class Flux2VaeOneShot:
         self.lat = self.cfg["latent_channels"]
         self.conv3x3_mode = self.cfg.get("conv3x3_mode", "walker")
         assert self.conv3x3_mode in ("walker", "matmul"), self.conv3x3_mode
+        # weight precision: "if8" codes + scales, or native 16-bit weights ("bf16": the checkpoint's own
+        # values, exact; "fp16"), which the walker takes as FLOAT16 patterns (no scales, 128 B/block,
+        # 4096-block pattern limit) and the 1x1 matmuls as unquantized B operands
+        self.wprec = cfg["quantization"].get("vae_precision", "if8")
+        assert self.wprec in ("if8", "bf16", "fp16"), self.wprec
+        self.native = self.wprec != "if8"
+        self.wformat = StorageFormat.FP16 if self.wprec == "fp16" else StorageFormat.BF16
+        self.formats = TensorFormats(a=StorageFormat.BF16, b=self.wformat, output=StorageFormat.BF16,
+                                     bias=StorageFormat.BF16)
         self.steps: list[dict] = []
         self.consts: dict[str, int] = {}
         self.gn_params: dict[str, int] = {}
@@ -236,8 +251,7 @@ class Flux2VaeOneShot:
         s["decoder.conv_out"] = (self.cfg.get("out_channels", 3), c, 3, 3, 1)
         return s
 
-    @staticmethod
-    def _conv_geometry(C, H, Wd, OC, kh, kw, pad, wb_lines=0x300):
+    def _conv_geometry(self, C, H, Wd, OC, kh, kw, pad, wb_lines=0x300):
         ct = (C + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
         taps = kh * kw * ct
         patch = kh * kw * C
@@ -246,7 +260,8 @@ class Flux2VaeOneShot:
         use_gather = can_gather and max(kh * kw * ((C + 3) // 4), OC * chunks) < OC * taps
         out_h, out_w, oc_chunk, tiles = udc.plan_conv2d_layer_tiles(
             c_in=C, oc_count=OC, in_h=H, in_w=Wd, kernel_h=kh, kernel_w=kw, stride_s=1,
-            pad=pad, pad_h=pad, dilation=1, gather=use_gather, bias_enabled=True, wb_uram_addr=wb_lines)
+            pad=pad, pad_h=pad, dilation=1, gather=use_gather, bias_enabled=True, wb_uram_addr=wb_lines,
+            weight_block_limit=4096 if self.native else udc.SCALE_BRAM_ELEMENTS)
         groups, act_bytes, chunk_out = udc.conv2d_tiled_dram_layout(tiles, ct, oc_chunk)
         sg = max(groups, key=lambda g: g[2] * g[3])
         return dict(ct=ct, taps=taps, chunks=chunks, use_gather=use_gather, out_h=out_h, out_w=out_w,
@@ -394,15 +409,15 @@ class Flux2VaeOneShot:
         OC_eff = OC if (OC % UE_VECTOR_SIZE == 0 or out_layout == "tiled") else _align(OC, UE_VECTOR_SIZE)
         g = self._best_conv_geometry(C, H, Wd, OC_eff, kh, kw, pad)
         n_oc, nck = g["oc_chunk"], g["n_chunks"]
-        block_bytes = n_oc * g["blocks_per_oc"] * UE_VECTOR_SIZE
+        block_bytes = n_oc * g["blocks_per_oc"] * (2 * UE_VECTOR_SIZE if self.native else UE_VECTOR_SIZE)
         assert block_bytes <= WEIGHT_REUSE_BANK, f"{key}: weight pattern {block_bytes} B exceeds URAM_B"
         if not self._dry and key in self.conv_chunks:
             raise RuntimeError(key)
         WBLK = [self._calloc(block_bytes) for _ in range(nck)]
-        SA = [self._calloc(n_oc * g["blocks_per_oc"] * 2) for _ in range(nck)]
+        SA = [] if self.native else [self._calloc(n_oc * g["blocks_per_oc"] * 2) for _ in range(nck)]
         BA = [self._calloc(n_oc * 2) for _ in range(nck)]
         self.conv_chunks[key] = dict(WBLK=WBLK, SA=SA, BA=BA, block_bytes=block_bytes, oc_chunk=n_oc,
-                                     gather=g["use_gather"], OC_eff=OC_eff, OC=OC)
+                                     gather=g["use_gather"], OC_eff=OC_eff, OC=OC, native=self.native)
         if out_layout == "tiled":
             out_bytes = nck * g["chunk_out"]
             out = {"addr": self._alloc(out_bytes), "bytes": out_bytes, "shape": [OC, g["out_h"], g["out_w"]],
@@ -420,11 +435,13 @@ class Flux2VaeOneShot:
                 lo, hi = max(a, grp[0]), min(b, grp[1])
                 if hi > lo:
                     per_engine[e].append((gi, lo, hi))
+        tile_lines = max(-(-grp[9] // LINE) for grp in g["groups"])            # largest tile output
+        TILE = [self._scratch(f"conv_tile{e}", tile_lines * LINE) for e in range(self.ne)]
         macs = g["out_h"] * g["out_w"] * OC * kh * kw * C
         self.macs += macs
         self._step("conv", key, out_buf if out_buf is not None else out["shape"],
                    dict(x=x, out=out, g=g, key=key, macs=macs, kh=kh, kw=kw, pad=pad, C=C, OC=OC_eff, n_oc=n_oc, nck=nck,
-                        WBLK=WBLK, SA=SA, BA=BA, block_bytes=block_bytes, work=per_engine,
+                        WBLK=WBLK, SA=SA, BA=BA, block_bytes=block_bytes, work=per_engine, TILE=TILE,
                         out_layout=out_layout))
         return out if out_buf is None else out_buf
 
@@ -456,10 +473,10 @@ class Flux2VaeOneShot:
         """[pixels, C] @ W[OC, C]^T + bias, one matmul per image row (M = W)."""
         OC, C, _, _, _ = self.shapes[key]
         _, H, Wd = x.shape()
-        codes = self._calloc(OC * C)
-        scales = self._calloc(OC * (C // UE_VECTOR_SIZE) * 2)
+        codes = self._calloc(OC * C * 2 if self.native else OC * C)          # native: bf16 [OC, C] B operand
+        scales = None if self.native else self._calloc(OC * (C // UE_VECTOR_SIZE) * 2)
         bias = self._calloc(OC * 2)
-        self.conv_chunks[key] = dict(mm=True, codes=codes, scales=scales, bias=bias, OC=OC, C=C)
+        self.conv_chunks[key] = dict(mm=True, codes=codes, scales=scales, bias=bias, OC=OC, C=C, native=self.native)
         out = self._new_buf(out_layout, OC, H, Wd)
         self.macs += H * Wd * OC * C
         self._step("conv1x1", key, out, dict(x=x, out=out, C=C, OC=OC, W=Wd, codes=codes, scales=scales, bias=bias,
@@ -626,23 +643,38 @@ class Flux2VaeOneShot:
                 self._load(x.addr + ((y0 + bsrc) * x.Wp + x0 + bsrc) * ct_in * LINE, 0, win_h * chunk,
                            chunk=chunk, jump=src_row)
                 for ci in range(nck):               # the hardware loads chunk ci's pattern into URAM_B per launch
-                    eng.accelerator_memory_to_scale_sram(st["SA"][ci], n_oc * g["blocks_per_oc"])
+                    if not self.native:
+                        eng.accelerator_memory_to_scale_sram(st["SA"][ci], n_oc * g["blocks_per_oc"])
                     eng.accelerator_memory_to_bias_sram(st["BA"][ci], n_oc)
                     eng.start_queue_for_conv2d_operation(
                         act_sram_start_addr=0, output_sram_wb_addr=wb, weights_dram_addr=st["WBLK"][ci],
                         kernel_w=kw, kernel_h=kh, ct=ct_in, oc_count=n_oc, out_w=tw, out_h=th, w_pad=win_w,
-                        stride_s=1, data_type=TYPE.IF8, bias_enable=True, lalu_mode=lalu_mode, lalu_a=lalu_a,
-                        lalu_b=lalu_b, dilation=1, gather=g["use_gather"], c_in=C, weight_reuse=True)
+                        stride_s=1, data_type=TYPE.FLOAT16 if self.native else TYPE.IF8, bias_enable=True,
+                        lalu_mode=lalu_mode, lalu_a=lalu_a, lalu_b=lalu_b, dilation=1, gather=g["use_gather"],
+                        c_in=C, weight_reuse=True, formats=self.formats)
                     if tiled:
                         self._store(wb, out["addr"] + ci * g["chunk_out"] + out_off + (t - start) * out_b, out_b)
                     elif n_oc == OC:
                         self._store(wb, out.addr + ((oy0 + out.border) * out.Wp + ox0 + out.border) * dst_px,
                                     th * tw * dst_px, chunk=tw * dst_px, jump=dst_row)
                     else:
-                        for py in range(th):
-                            self._store(wb + py * tw * n_oc * 2,
-                                        out.addr + ((oy0 + py + out.border) * out.Wp + ox0 + out.border) * dst_px
-                                        + ci * n_oc * 2, tw * n_oc * 2, chunk=n_oc * 2, jump=dst_px)
+                        row_b = tw * n_oc * 2
+                        if row_b % LINE == 0:
+                            for py in range(th):
+                                self._store(wb + py * row_b,
+                                            out.addr + ((oy0 + py + out.border) * out.Wp + ox0 + out.border) * dst_px
+                                            + ci * n_oc * 2, row_b, chunk=n_oc * 2, jump=dst_px)
+                        else:
+                            # a tile row starts mid-line in URAM (n_oc * 2 * tw is not a multiple of 128 B, the
+                            # native 32-channel chunks): park the tile in DRAM and re-send every row from URAM_B,
+                            # which is free between launches (the pattern is reloaded per launch)
+                            tile = st["TILE"][e]
+                            self._store(wb, tile, -(-th * row_b // LINE) * LINE)
+                            for py in range(th):
+                                self._load(tile + py * row_b, URAM_B, -(-row_b // LINE) * LINE)
+                                self._store(URAM_B,
+                                            out.addr + ((oy0 + py + out.border) * out.Wp + ox0 + out.border) * dst_px
+                                            + ci * n_oc * 2, row_b, chunk=n_oc * 2, jump=dst_px)
         if not tiled and e == 0:
             self._zero_borders(out)
         if e == 0:
@@ -692,9 +724,14 @@ class Flux2VaeOneShot:
             for r in range(r0, r1):
                 a = x.addr + ((r + x.border) * x.Wp + x.border) * C * 2
                 o = out.addr + ((r + out.border) * out.Wp + out.border) * OC * 2
-                eng.matmat_mul_core(M=Wd, K=C, N=OC, A_DRAM_ADDR=a, B_DRAM_ADDR=st["codes"], OUTPUT_DRAM_ADDR=o,
-                                    is_B_quantized=True, data_type=TYPE.IF8, SCALE_DRAM_ADDR=st["scales"],
-                                    C_DRAM_ADDR=st["bias"], bias_mode="broadcast_N", gpr_M_reg=reg)
+                if self.native:
+                    eng.matmat_mul_core(M=Wd, K=C, N=OC, A_DRAM_ADDR=a, B_DRAM_ADDR=st["codes"], OUTPUT_DRAM_ADDR=o,
+                                        C_DRAM_ADDR=st["bias"], bias_mode="broadcast_N", gpr_M_reg=reg,
+                                        formats=self.formats)
+                else:
+                    eng.matmat_mul_core(M=Wd, K=C, N=OC, A_DRAM_ADDR=a, B_DRAM_ADDR=st["codes"], OUTPUT_DRAM_ADDR=o,
+                                        is_B_quantized=True, data_type=TYPE.IF8, SCALE_DRAM_ADDR=st["scales"],
+                                        C_DRAM_ADDR=st["bias"], bias_mode="broadcast_N", gpr_M_reg=reg)
             eng.release_isa_reg()
         if e == 0:
             self._zero_borders(out)
@@ -944,6 +981,25 @@ class Flux2VaeOneShot:
             c = weights["convs"][key]
             codes, bs, bias = c["codes"], c["block_scales"].to(torch.bfloat16), c["bias"]
             OC, C, kh, kw = codes.shape
+            if cc.get("native"):
+                assert "weight" in c, f"{key}: vae_weights.pt has no native weights (re-export)"
+                w = c["weight"].to(self.wformat.dtype)
+                if cc.get("mm"):                    # unquantized B [OC, C] + bias
+                    put(cc["codes"], w.reshape(OC, C).contiguous().view(torch.int16).numpy().tobytes())
+                    put(cc["bias"], _i16bytes(bias.to(torch.bfloat16)))
+                    continue
+                if cc["OC_eff"] != OC:
+                    w = torch.cat([w, torch.zeros(cc["OC_eff"] - OC, C, kh, kw, dtype=w.dtype)], 0)
+                    bias = torch.cat([bias, torch.zeros(cc["OC_eff"] - OC, dtype=bias.dtype)], 0)
+                n_oc = cc["oc_chunk"]
+                for ci, oc0 in enumerate(range(0, cc["OC_eff"], n_oc)):
+                    wc = w[oc0:oc0 + n_oc]
+                    pack = udc.conv2d_pack_weight_stream_gather if cc["gather"] else udc.conv2d_pack_weight_stream
+                    blk = pack(wc, 1, 1, TYPE.FLOAT16, weight_format=self.wformat)
+                    assert blk.numel() == cc["block_bytes"], (key, blk.numel(), cc["block_bytes"])
+                    put(cc["WBLK"][ci], blk.numpy().tobytes())
+                    put(cc["BA"][ci], _i16bytes(udc.conv2d_pack_bias_stream(bias[oc0:oc0 + n_oc], 1, 1)))
+                continue
             if cc.get("mm9"):
                 ct = C // UE_VECTOR_SIZE
                 assert (kh, kw) == (3, 3) and tuple(bs.shape) == (OC, 9 * ct), key
@@ -1008,11 +1064,15 @@ class Flux2VaeOneShot:
 
 def reference_decode(weights: dict, cfg: dict, latent: torch.Tensor, dtype=torch.float32,
                      device: str = "cpu", intermediates: dict | None = None) -> torch.Tensor:
-    """Same graph on the host from the dequantized IF8 codes (bias in bf16).
-    ``intermediates`` (a dict) receives every op's output keyed like the on-device steps."""
+    """Same graph on the host with the weights the board uses: the dequantized IF8 codes, or
+    (``quantization.vae_precision`` bf16 / fp16) the native weights rounded to that storage
+    (bias in bf16). ``intermediates`` (a dict) receives every op's output keyed like the
+    on-device steps."""
     v = cfg["vae"]
     groups, eps = v["norm_num_groups"], v.get("gn_eps", 1e-6)
     convs, norms = weights["convs"], weights["norms"]
+    wprec = cfg["quantization"].get("vae_precision", "if8")
+    wdtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(wprec)
     x = latent[None].to(device=device, dtype=dtype)
 
     def rec(key, t):
@@ -1022,7 +1082,10 @@ def reference_decode(weights: dict, cfg: dict, latent: torch.Tensor, dtype=torch
 
     def conv(x, key):
         c = convs[key]
-        w = W.dequantize_conv_if8(c["codes"], c["block_scales"]).to(device=device, dtype=dtype)
+        if wdtype is not None:
+            w = c["weight"].to(wdtype).to(device=device, dtype=dtype)
+        else:
+            w = W.dequantize_conv_if8(c["codes"], c["block_scales"]).to(device=device, dtype=dtype)
         return rec(key, F.conv2d(x, w, c["bias"].to(device=device, dtype=dtype), padding=c["pad"]))
 
     def gn(x, key):
