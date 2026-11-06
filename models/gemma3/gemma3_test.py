@@ -950,7 +950,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             # its no-chunk fast path.
             # ------------------------------------------------------------------
             gpr_layer_off = self.alloc_isa_reg()
-            gpr_kv_off = self.alloc_isa_reg()
+            gpr_kv_off = self.alloc_isa_reg()      # K/V WRITE cursor: this layer's cache, row P
+            gpr_kv_rd = self.alloc_isa_reg()       # K/V READ cursor: this layer's cache, row 0
+            # Prompt position of the first row (P), primed by the run preamble: a chunk
+            # of a long prompt, or the next turn of a conversation whose earlier turns
+            # are already in the K/V cache, writes its K/V at rows [P, P+n), takes its
+            # RoPE rows from P, and attends over [0, P+n).
+            gpr_pos = self.alloc_isa_reg()
+            self._pf_gpr_pos = gpr_pos
             gpr_rope_cycle = self.alloc_isa_reg()
             gpr_rope_saved = self.alloc_isa_reg()
             gpr_rope_base = self.alloc_isa_reg()
@@ -981,7 +988,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             _pf_rounds = self._prefill_rows_rounds() if self._prefill_sharded() else None
             gpr_pf_layer = self.alloc_isa_reg() if _pf_rounds is not None else None
             self.generate_instruction_add_set(gpr_layer_off, 0)
-            self.generate_instruction_add_set(gpr_kv_off, 0)
+            self.generate_instruction_reg_mul_imm(gpr_kv_off, gpr_pos, ue_35bit_addr_shifter(self.k_size))
+            self.generate_instruction_add_set(gpr_kv_rd, 0)
             if gpr_pf_layer is not None:
                 self.generate_instruction_add_set(gpr_pf_layer, 0)
             self.generate_instruction_add_set(gpr_rope_cycle, 6)
@@ -1056,6 +1064,15 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 )
                 return scratch_reg
 
+            def kv_read_addr(base_literal: int, scratch_reg: int) -> int:
+                """This layer's cache from row 0 (attention reads every cached position)."""
+                self.generate_instruction_add_imm(
+                    src_reg_idx=gpr_kv_rd,
+                    immediate_value=ue_35bit_addr_shifter(base_literal),
+                    dst_reg_idx=scratch_reg,
+                )
+                return scratch_reg
+
             def const_addr(base_literal: int, scratch_reg: int) -> int:
                 """Source a *layer-invariant* DRAM base (the LAYER0_* / LAYER0_FLASH_* scratch
                 buffers, which are the same physical DRAM every layer) from a GPR, so the looped
@@ -1094,6 +1111,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             _rope_patch = self._emit_forward_skip_jz(gpr_rope_saved, program_start)
             self.generate_instruction_add_set(gpr_rope_base, ue_35bit_addr_shifter(self.DRAM_ADDR_ROPE_LOCAL))
             _rope_patch()
+            # ... from position P: one table row is cos+sin, 2*k_size bytes.
+            self.generate_instruction_reg_mul_imm(self.TMP_REG, gpr_pos, ue_35bit_addr_shifter(self.k_size * 2))
+            self.generate_instruction_add_reg(gpr_rope_base, gpr_rope_base, self.TMP_REG)
 
             # cycle = 6 if it just hit 0 (wraparound), else keep the decremented value
             self.generate_instruction_add_set(gpr_rope_cycle, 6)
@@ -1230,7 +1250,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             # attention cost from O((seq_len*group_size)^2) into
             # group_size * O(seq_len^2) — a group_size-fold reduction.
             head_bytes = self.head_dim * self.bytes_per_element
-            per_head_rows = ((self.PREFILL_MAX_SEQ_LEN + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+            # A chunk at position P attends P+n cached rows, up to the whole context, so the
+            # attention core's scratch carve (and the head-major Q slots) are sized for it.
+            per_head_rows = ((self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
             qhm_head_bytes = per_head_rows * head_bytes
             # Q token-major -> head-major (into freed FLASH_K per-head slots).
             for g in range(self.group_size):
@@ -1274,8 +1296,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     gpr_batch_reg=self.gpr_seq_len,
                     gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
                     gpr_q_addr=const_addr(head_slot, gpr_scratch_a),
-                    gpr_k_addr=kv_addr(self.LAYER0_K_ROPE_DRAM, gpr_scratch_b),
-                    gpr_v_addr=kv_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
+                    gpr_k_addr=kv_read_addr(self.LAYER0_K_ROPE_DRAM, gpr_scratch_b),
+                    gpr_v_addr=kv_read_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
                     gpr_bias_addr=const_addr(self.LAYER0_FLASH_BIAS_DRAM, gpr_scratch_d),
                     gpr_out_addr=const_addr(head_slot, gpr_scratch_e),
                     gpr_scale_reg=gpr_attn_scale,
@@ -1461,6 +1483,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.generate_instruction_add_imm(
                 src_reg_idx=gpr_kv_off, immediate_value=ue_35bit_addr_shifter(KV_CACHE_LAYER_STRIDE), dst_reg_idx=gpr_kv_off
             )
+            self.generate_instruction_add_imm(
+                src_reg_idx=gpr_kv_rd, immediate_value=ue_35bit_addr_shifter(KV_CACHE_LAYER_STRIDE), dst_reg_idx=gpr_kv_rd
+            )
             if gpr_pf_layer is not None:
                 self.generate_instruction_add_inc(gpr_pf_layer)
             self.generate_instruction_add_dec(reg_idx=gpr_layer_cnt)
@@ -1475,6 +1500,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                  self._prefill_worker_m_regs) = self.shard_group.emit_rows_worker_programs(
                     [_pf_rounds[k] for k in ("qkv", "o_proj", "gate_up", "down")],
                     layers=layer_size, kv_layer_stride=KV_CACHE_LAYER_STRIDE)
+                self._prefill_worker_kv_regs = list(self.shard_group.rows_kv_regs)
             self.release_isa_reg()  # gpr_attn_scale
             self.release_isa_reg()  # gpr_sqrt_head_dim
             self.release_isa_reg()  # gpr_sqrt_vector_length
@@ -1490,6 +1516,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.release_isa_reg()  # gpr_rope_base
             self.release_isa_reg()  # gpr_rope_saved
             self.release_isa_reg()  # gpr_rope_cycle
+            self.release_isa_reg()  # gpr_pos
+            self.release_isa_reg()  # gpr_kv_rd
             self.release_isa_reg()  # gpr_kv_off
             self.release_isa_reg()  # gpr_layer_off
             total_flops *= layer_size
@@ -3035,6 +3063,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "prefill_program_size": prefill_prog["size_bytes"],
             "prefill_template_flops": prefill_prog["flops"],
             "prefill_attn_aligned_seq_len": prefill_prog["attn_aligned_seq_len"],
+            # Register the run preamble primes with the first row's prompt position.
+            "prefill_pos_reg": getattr(self, "_pf_gpr_pos", None),
             "decoder_program_start_addr": f"0x{decoder_program_addr:X}",
             "decoder_program_size": decoder_program["program_size_bytes"],
             "decoder_total_flops": decoder_program["total_flops"],
@@ -3242,6 +3272,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_add_set(self.gpr_seq_len, prefill_seq_len)
         self.generate_instruction_add_set(self.gpr_q_seq_len, q_seq_len)
         self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
+        self._emit_prefill_pos(meta, 0)
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
         self.stop_capture()
         self.write_captured_instructions_to_dram(preamble_addr)
@@ -3420,7 +3451,16 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             return {}
         return {name: self.multi_core for name in self.PREFILL_SHARDED_STEPS}
 
-    def _start_prefill_workers(self, seq_len: int) -> None:
+    def _emit_prefill_pos(self, meta: dict, pos: int) -> None:
+        """Preamble: prime the folded prefill's position register with the first row's position."""
+        reg = meta.get("prefill_pos_reg")
+        if reg is None:
+            if pos:
+                raise RuntimeError("this gemma3 program has no prefill position register; recompile it")
+            return
+        self.generate_instruction_add_set(int(reg), int(pos))
+
+    def _start_prefill_workers(self, seq_len: int, pos: int = 0) -> None:
         """Launch the sharded-prefill workers, priming each one's runtime row count.
 
         Call right before the primary's prefill program on EVERY run: the workers park on
@@ -3432,8 +3472,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         if not addrs:
             raise RuntimeError("sharded prefill: no worker programs -- compile_gemma3() first "
                                "(multi-core images are always rebuilt with their workers)")
+        kv_regs = getattr(self, "_prefill_worker_kv_regs", None) or [None] * len(self._prefill_worker_m_regs)
+        kv_words = ue_35bit_addr_shifter(int(pos) * self.k_size)    # V write cursor: row P of layer 0
         self.shard_group.start_workers(
-            addrs, gpr_sets_by_worker=[[(r, seq_len)] for r in self._prefill_worker_m_regs])
+            addrs, gpr_sets_by_worker=[[(r, seq_len)] + ([(kv, kv_words)] if kv is not None else [])
+                                       for r, kv in zip(self._prefill_worker_m_regs, kv_regs)])
 
     def _wait_prefill_workers(self, timeout: float = 30.0) -> None:
         """Wait for every prefill worker to HALT (they finish with the primary's last join)."""
@@ -3489,58 +3532,85 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # Prefill program processes all but the last token (the last one feeds the decoder).
         prefill_seq = prefill_seq[:-1]
         prefill_seq_len = len(prefill_seq)
-        self.seq_len = prefill_seq_len
+        # A continued conversation (_prefill_start = P) prefills only rows [P, end): the
+        # K/V cache already holds the earlier turns. A span longer than the program's
+        # PREFILL_MAX_SEQ_LEN rows runs as several chunks, each at its own position.
+        start = int(getattr(self, "_prefill_start", 0) or 0)
+        if not 0 <= start < prefill_seq_len:
+            raise ValueError(f"prefill start {start} is outside the {prefill_seq_len}-row prompt")
+        if prefill_seq_len > self.MAX_CONTEXT_SIZE - 1:
+            raise ValueError(f"a {prefill_seq_len + 1}-token prompt leaves no room in the "
+                             f"{self.MAX_CONTEXT_SIZE}-token context")
+        cap = max(1, int(self.PREFILL_MAX_SEQ_LEN))
+        n_chunks = -(-(prefill_seq_len - start) // cap)
+        base, rem = divmod(prefill_seq_len - start, n_chunks)
+        chunks, off = [], start
+        for i in range(n_chunks):
+            ln = base + (1 if i < rem else 0)
+            chunks.append((off, ln))
+            off += ln
 
-        # Rough FLOPs rescale (linear in seq_len for the bulk of the work; a couple of softmax /
-        # quadratic terms in the compiled template don't scale cleanly, but this is fine for
-        # back-of-envelope GFLOPS reporting).
-        flops_prefill = flops_prefill_template * prefill_seq_len // max(template_prefill_seq_len, 1)
+        print(f"\n--- Starting prefill (rows [{start}, {prefill_seq_len}) in {len(chunks)} chunk(s)) ---")
+        print(f"Prompt ({len(self.prefill_seq)}) tokens: {self.prefill_seq[start:]}")
 
-        print(f"\n--- Starting prefill (seq_len={prefill_seq_len}) ---")
-        print(f"Prompt ({len(self.prefill_seq)}) tokens: {self.prefill_seq}")
-
-        seq_len = prefill_seq_len
-        q_seq_len = seq_len * self.group_size
-        aligned_seq_len_q = ((q_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
-        # Proper GQA: gpr_aligned_seq_len holds the compact KV length align_lanes(seq_len).
-        aligned_seq_len = ((seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
-
-        # ----- Runtime preamble: prime three GPRs, then jump into the cached prefill -----
-        self.clear_inst_id()
-        self.start_capture()
-        self.generate_instruction_add_set(self.gpr_seq_len, prefill_seq_len)
-        self.generate_instruction_add_set(self.gpr_q_seq_len, q_seq_len)
-        self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
-        # Unconditional absolute jump into the cached prefill program.
-        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
-        self.stop_capture()
-        _preamble_issues = user_dma_core.check_isa_jumps(
-            self.capture_buffer, preamble_addr, name="prefill_preamble"
-        )
-        if _preamble_issues:
-            raise RuntimeError(
-                f"Prefill preamble jump violations: {_preamble_issues}"
-            )
-        self.write_captured_instructions_to_dram(preamble_addr)
-        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        self.clear_capture_buffer()
-
-        embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
-        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
-        # Proper-GQA per-head causal bias (both folded and legacy paths): one
-        # [aligned_seq, aligned_seq] plane over the compact seq_len-long KV, shared
-        # by every query head (num_kv=1).
-        bias_one_group = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
-        valid_mask = torch.tril(torch.ones(aligned_seq_len, aligned_seq_len, dtype=torch.bool), diagonal=0) if not self.causal_mask_upper else torch.triu(torch.ones(aligned_seq_len, aligned_seq_len, dtype=torch.bool), diagonal=0)
-        bias_one_group.masked_fill_(valid_mask, 0.0)
-        bias_one_group[:, seq_len:] = float("-inf")
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
-        # Execute from the preamble; preamble jumps into cached prefill, which HALTs on completion.
+        latency_hw_prefill, flops_prefill_total, flop_rate_hw_prefill = 0.0, 0, None
         timer = time.perf_counter()
-        self._start_prefill_workers(prefill_seq_len)
-        latency_hw_prefill, flop_rate_hw_prefill = self.program_execute(preamble_addr, flops=flops_prefill)
-        self._wait_prefill_workers()
+        for pos, seq_len in chunks:
+            # Rough FLOPs rescale (linear in seq_len for the bulk of the work).
+            flops_prefill = flops_prefill_template * seq_len // max(template_prefill_seq_len, 1)
+            q_seq_len = seq_len * self.group_size
+            # Proper GQA: gpr_aligned_seq_len holds the compact KV length this chunk attends:
+            # every cached row before it plus its own.
+            kv_len = pos + seq_len
+            aligned_seq_len = ((kv_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+
+            # ----- Runtime preamble: prime the GPRs, then jump into the cached prefill -----
+            self.clear_inst_id()
+            self.start_capture()
+            self.generate_instruction_add_set(self.gpr_seq_len, seq_len)
+            self.generate_instruction_add_set(self.gpr_q_seq_len, q_seq_len)
+            self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
+            self._emit_prefill_pos(meta, pos)
+            # Unconditional absolute jump into the cached prefill program.
+            self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
+            self.stop_capture()
+            _preamble_issues = user_dma_core.check_isa_jumps(
+                self.capture_buffer, preamble_addr, name="prefill_preamble"
+            )
+            if _preamble_issues:
+                raise RuntimeError(
+                    f"Prefill preamble jump violations: {_preamble_issues}"
+                )
+            self.write_captured_instructions_to_dram(preamble_addr)
+            self.clear_capture_buffer()
+
+            embedding_tensor = self.get_embedding_for_tokens(prefill_seq[pos:pos + seq_len])
+            self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
+            # Proper-GQA per-head causal bias, shared by every query head (num_kv=1): query
+            # row i is position pos+i and attends cached rows [0, pos+i]. Row pitch is the
+            # runtime aligned KV length. A chunk at 0 writes the whole aligned square (as
+            # before); a later one its own rows.
+            rows = aligned_seq_len if pos == 0 else seq_len
+            _i = torch.arange(rows).unsqueeze(1) + pos
+            _j = torch.arange(aligned_seq_len).unsqueeze(0)
+            valid_mask = (_j <= _i) if not self.causal_mask_upper else (_j >= _i)
+            bias_one_group = torch.full((rows, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
+            bias_one_group.masked_fill_(valid_mask, 0.0)
+            bias_one_group[:, kv_len:] = float("-inf")
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
+            # Execute from the preamble; preamble jumps into cached prefill, which HALTs on completion.
+            self._start_prefill_workers(seq_len, pos)
+            _lat, _rate = self.program_execute(preamble_addr, flops=flops_prefill)
+            self._wait_prefill_workers()
+            latency_hw_prefill += _lat
+            flops_prefill_total += flops_prefill
+        self.allocate_program_dram(INSTRUCTION_SIZE_BYTES * 8)      # the preamble's slot
         latency_prefill = time.perf_counter() - timer
+        if latency_hw_prefill:
+            flop_rate_hw_prefill = flops_prefill_total / (latency_hw_prefill * 1e3)
+        self.seq_len = prefill_seq_len
+        self._prefill_rows = prefill_seq_len - start
+        self._prefill_chunks = len(chunks)
         print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n")
 
         _ref_kv = None
@@ -3707,6 +3777,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
             self.clear_inst_id()
             self.start_capture()
+            # This token's position: decode appends its K/V there and advances the
+            # register itself, but priming it every step keeps a decode correct after
+            # any prefill (a chunk, a continued conversation) or an earlier decode pass.
+            self.generate_instruction_add_set(self.gpr_seq_len, self.seq_len - 1)
             self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len_q)
             self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
             self.stop_capture()
@@ -3770,6 +3844,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         latency_decoder = time.perf_counter() - timer
         tokens_decoded = decoder_token_cnt
+        # The last sampled token was never fed back: its K/V is not cached (a continued
+        # conversation feeds it first; self.seq_len is the number of cached positions).
+        self._decode_last_token_id = int(token_id)
         print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, "
               f"speed: {tokens_decoded / latency_decoder:.2f} tokens/s, "
               f"total {self.seq_len} tokens.")

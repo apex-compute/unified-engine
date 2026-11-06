@@ -191,7 +191,7 @@
       <details><summary>Run log</summary><pre id="flog"></pre></details>
     </div>
     <div class="card" id="fstatic" hidden>
-      <div class="block narrow"><h2>Weights on the board</h2><div class="tw"><table id="weights"></table></div></div>
+      <div class="block"><h2>Weights on the board</h2><div class="tw"><table id="weights"></table></div></div>
       <div class="block"><h2>Programs of this configuration</h2><div class="tw"><table id="programs"></table></div></div>
       <div class="note" id="staticnote"></div>
     </div>
@@ -422,9 +422,11 @@ const PHASE = s => !s ? 'Waiting for the board' : s.startsWith('loading') ? s[0]
        'vision encoder': 'Vision encoder', 'audio encoder': 'Audio encoder',
        'vision + audio encoders': 'Vision + audio encoders', decode: 'Decoding' }[s] || s[0].toUpperCase() + s.slice(1));
 
+const newId = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+let convId = newId();
 function newChat() {
   if (chatJob) return;
-  conv = []; $('conv').innerHTML = '<div class="empty" id="empty">Ask something — answers stream from the board token by token.</div>';
+  conv = []; convId = newId(); $('conv').innerHTML = '<div class="empty" id="empty">Ask something — answers stream from the board token by token.</div>';
   $('cmetrics').hidden = true; setStatus('');
 }
 $('clear').onclick = newChat;
@@ -453,11 +455,11 @@ async function send() {
   if (!text && !att.image && !att.audio) return;
   const user = { role: 'user', content: text, attachments: { image: att.image, audio: att.audio } };
   conv.push(user); addTurn(user);
-  const media = !!(att.image || att.audio);
-  const history = media ? [{ role: 'user', content: text }] :
-    conv.filter(x => !x.failed && !(x.attachments && (x.attachments.image || x.attachments.audio)))
-        .map(x => ({ role: x.role, content: x.content }));
-  const body = { model: m.id, messages: history, max_new_tokens: parseInt($('maxnew').value || '256', 10) };
+  // The whole conversation goes along, but the board keeps it in its K/V cache:
+  // a message that continues the same chat (same id) prefills only itself.
+  const history = conv.filter(x => !x.failed).map(x => ({ role: x.role, content: x.content }));
+  const body = { model: m.id, messages: history, conversation: convId,
+                 max_new_tokens: parseInt($('maxnew').value || '256', 10) };
   if (att.image) body.image = { name: att.image.name, data: att.image.data };
   if (att.audio) body.audio = { name: att.audio.name, data: att.audio.data };
   $('input').value = ''; autosize(); att = { image: null, audio: null }; refreshTools();
@@ -491,9 +493,16 @@ function showLive(bot) {
     (L.ttft_s != null ? `<span>first token after <b>${L.ttft_s.toFixed(2)} s</b></span>` : '');
 }
 function follow(bot) {
-  let es, done = false;
-  const tick = setInterval(() => showLive(bot), 100);
+  let es, done = false, polling = false, lastEvent = performance.now();
+  const tick = setInterval(() => {
+    showLive(bot);
+    // The server beats every 0.5 s; a silent stream (a proxy or port forward
+    // buffering it) falls back to polling so the answer still arrives and the
+    // "working" dots stop when the board does.
+    if (es && !polling && performance.now() - lastEvent > 3000) { es.close(); es = null; startPoll(); }
+  }, 100);
   const onDelta = d => {
+    lastEvent = performance.now();
     if (d.reset) bot.stream.reset(d.text); else if (d.text) bot.stream.push(d.text);
     bot.livestate = { ...d, at: performance.now() }; showLive(bot);
   };
@@ -506,12 +515,13 @@ function follow(bot) {
       finishBot(bot, j, null);
     } else finishBot(bot, j, j.state === 'cancelled' ? 'cancelled' : (j.error || 'failed'));
   };
+  const startPoll = () => { if (!polling) { polling = true; poll(); } };
   const poll = async () => {                        // fallback when the event stream drops
     while (!done) {
       try {
         const j = await (await fetch('/api/jobs/' + bot.job)).json();
         const prev = bot.stream.target;
-        onDelta({ ...j, text: j.text.startsWith(prev) ? j.text.slice(prev.length) : j.text, reset: !j.text.startsWith(prev), tokens: bot.livestate ? bot.livestate.tokens : 0, status_s: 0 });
+        onDelta({ ...j, text: j.text.startsWith(prev) ? j.text.slice(prev.length) : j.text, reset: !j.text.startsWith(prev) });
         if (['done', 'error', 'cancelled'].includes(j.state)) { onDone(j); return; }
       } catch (e) { /* retry */ }
       await new Promise(r => setTimeout(r, 400));
@@ -521,8 +531,8 @@ function follow(bot) {
     es = new EventSource(`/api/jobs/${bot.job}/stream`);
     es.addEventListener('delta', e => onDelta(JSON.parse(e.data)));
     es.addEventListener('done', e => onDone(JSON.parse(e.data)));
-    es.onerror = () => { if (!done) { es.close(); poll(); } };
-  } else poll();
+    es.onerror = () => { if (!done && es) { es.close(); es = null; startPoll(); } };
+  } else startPoll();
 }
 function finishBot(bot, j, err) {
   chatJob = null; $('send').hidden = false; $('stop').hidden = true;
@@ -551,7 +561,8 @@ function showMetrics(bot) {
   const info = mm.resident || {}, title = (models.find(m => m.id === bot.model) || {}).title || bot.model;
   $('cmtitle').textContent = `Run on the board — ${title}, ${info.engines || '?'} engines`;
   const kv = [
-    ['Prompt tokens', mm.prompt_tokens + (mm.image_tokens ? ` (${mm.image_tokens} image)` : '') + (mm.audio_tokens ? ` (${mm.audio_tokens} audio)` : '')],
+    ['Prompt tokens' + (mm.cached_tokens ? ' (new)' : ''), mm.prompt_tokens + (mm.image_tokens ? ` (${mm.image_tokens} image)` : '') + (mm.audio_tokens ? ` (${mm.audio_tokens} audio)` : '')],
+    ...(mm.context_tokens ? [['Context in K/V cache', `${mm.context_tokens} / ${mm.max_context}` + (mm.cached_tokens ? ` (${mm.cached_tokens} reused)` : '')]] : []),
     ['Generated tokens', mm.generated_tokens],
     ['TTFT, engines', sec(mm.ttft_hw_s)],
     ['TTFT, wall', sec(mm.ttft_wall_s)],

@@ -2119,10 +2119,15 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             raise ValueError(
                 f"prompt of {prompt_len + 1} tokens leaves no room to decode in a "
                 f"{self.MAX_CONTEXT_SIZE}-token context")
+        # A continued conversation (_prefill_start = P) prefills only positions
+        # [P, prompt_len): the K/V cache already holds the earlier turns.
+        start = int(getattr(self, "_prefill_start", 0) or 0)
+        if not 0 <= start < prompt_len:
+            raise ValueError(f"prefill start {start} is outside the {prompt_len}-row prompt")
         cap = max(int(self.max_prefill_seq_len), 1)
-        n = max(1, -(-prompt_len // cap))
-        base, rem = divmod(prompt_len, n)
-        chunks, off = [], 0
+        n = max(1, -(-(prompt_len - start) // cap))
+        base, rem = divmod(prompt_len - start, n)
+        chunks, off = [], start
         for i in range(n):
             length = base + (1 if i < rem else 0)
             chunks.append((off, length))

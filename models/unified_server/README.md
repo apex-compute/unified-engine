@@ -4,7 +4,7 @@ One web page for the models that run on the board, picked from a dropdown:
 
 | Model | Input | Runs on the FPGA |
 |---|---|---|
-| Gemma 3 1B | text | prefill + decode (both N-sharded) |
+| Gemma 3 1B | text | prefill + decode (both N-sharded), 512-token context |
 | Gemma 4 E2B | text, image, audio | vision encoder, audio encoder, prefill, decode |
 | Gemma 4 E4B | text, image, audio | same code as E2B with E4B's geometry |
 | Qwen2.5-Omni 7B | text, image, audio | vision encoder, audio encoder, Thinker prefill + decode (all eight engines) |
@@ -21,7 +21,7 @@ One web page for the models that run on the board, picked from a dropdown:
 | `--engines` | 8 | engines for the chat models (FLUX uses each compiled config's own count) |
 | `--dev` | xdma0 | DMA device |
 | `--python` | this interpreter | interpreter for the runners |
-| `--no-reload` | off | FLUX: tick "keep the board loaded" by default |
+| `--reload-per-image` | off | FLUX: untick "keep the board loaded" by default (weights reloaded per image) |
 
 ## How it works
 
@@ -50,22 +50,33 @@ order, and at most one process holds the device:
   imported): one `flux2_klein_4b_run_from_bin.py` process per image, or its
   resident `--serve` runner with "keep the board loaded".
 
-Prompt handling:
+Conversations:
 
-- Text turns carry the conversation (each model's chat template). Gemma 3's
-  prefill program takes at most 193 prompt tokens and its context is 512, so
-  the oldest turns are dropped to fit (the page says so). Gemma 4 has an
-  8192-token context and prefills longer prompts in 512-row chunks.
-- An image and/or audio turn is sent on its own: the encoders build a single
-  user turn of `[audio] [image] text`. Audio may be uploaded (WAV / FLAC / OGG,
-  anything else through `ffmpeg` if installed) or recorded in the browser
-  (sent as 16 kHz mono WAV; the browser allows the microphone on localhost or
-  https only).
-- Gemma 4's multi-engine prefill shards the prompt rows, so a prompt shorter
-  than the engine count ("hi") gets a one-line system preamble.
-- Gemma 4's prefill program is rebuilt in-process when the prompt length
-  changes (a few seconds, weights stay on the board); the metrics report it
-  separately and keep it out of the TTFT.
+- The conversation stays in the model's K/V cache until **New chat**. Each
+  page chat has an id; a message that continues it prefills only its own
+  tokens (the previous answer's unfed last token, the end-of-turn marker, the
+  new user turn) at the next position, on top of the cached turns, then
+  decodes. Image and audio turns join the same conversation: their soft tokens
+  go into the cache like text, so a later question can refer to them.
+- Context: Gemma 3 512 tokens (prefill runs in chunks of up to 192 rows, each
+  at its position), Gemma 4 8192. When a message would not fit, the
+  conversation starts over from the latest turns (the page says how many were
+  dropped). Selecting another model or FLUX unloads the chat model; coming
+  back rebuilds the context from the page's text history (earlier images and
+  audio are not re-encoded).
+- Qwen2.5-Omni runs each message on its own (no history yet).
+- Audio may be uploaded (WAV / FLAC / OGG, anything else through `ffmpeg` if
+  installed) or recorded in the browser (sent as 16 kHz mono WAV; the browser
+  allows the microphone on localhost or https only).
+- Gemma 4's multi-engine prefill shards the prompt rows, so a first message
+  shorter than the engine count ("hi") gets a one-line system preamble.
+- Gemma 4's prefill program is rebuilt in-process for each message's length
+  and position (a few seconds, weights stay on the board); the metrics report
+  it separately and keep it out of the TTFT.
+- FLUX keeps its weights on the board between images by default
+  (`--reload-per-image` or unticking the box reloads per image).
+- The page falls back to polling when the token stream goes silent (a proxy
+  or port forward that buffers server-sent events), so answers still arrive.
 
 ## Metrics
 

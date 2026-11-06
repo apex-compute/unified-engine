@@ -1682,7 +1682,9 @@ class Gemma4LMMixin:
             # Gemma's scale is 1.0, so the Q pre-scale is skipped there: its
             # scaled_q buffer would sit past a square [aligned, aligned] score
             # plane that a chunk does not otherwise need.
-            core_aligned = per_head_rows if pos_offset == 0 else attn_aligned_live
+            # (never below the static batch: a continued conversation's first chunk
+            # can start at a small P with a KV prefix shorter than max_prefill_seq_len)
+            core_aligned = per_head_rows if pos_offset == 0 else max(per_head_rows, attn_aligned_live)
             core_q_pre_scaled = pos_offset > 0
             for g in range(0 if q_fused else self.num_q_heads):   # fused: already head-major
                 self._emit_strided_copy_pbi(
@@ -2116,17 +2118,22 @@ class Gemma4LMMixin:
         # row. Each size below mirrors its allocate_tensor_dram() in tensor_init,
         # in ELEMENTS (dma_to_accelerator_memory writes numel()*2 bytes).
         # Only the first chunk resets: a later chunk of a chunked prefill
-        # appends to the K/V cache the earlier ones wrote.
-        if pos_offset == 0:
+        # appends to the K/V cache the earlier ones wrote. A continued
+        # conversation (_prefill_start = P > 0: the cache already holds
+        # positions [0, P) from earlier turns) starts its first chunk at P and
+        # keeps the cache; it re-initialises only the attention scratch, which
+        # an encoder run in between may have reused.
+        if pos_offset == int(getattr(self, "_prefill_start", 0) or 0):
             from user_dma_core import UE_VECTOR_SIZE as _UE_VS
             num_slots = getattr(self, "_num_kv_slots", self.LAYER_SIZE)
-            kv_cache_bytes = getattr(
-                self, "_kv_cache_bytes",
-                num_slots * self.MAX_CONTEXT_SIZE * self.head_dim * self.bytes_per_element)
-            kv_zero_pad = torch.zeros(
-                kv_cache_bytes // self.bytes_per_element, dtype=torch.bfloat16)
-            self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, kv_zero_pad)
-            self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, kv_zero_pad)
+            if pos_offset == 0:
+                kv_cache_bytes = getattr(
+                    self, "_kv_cache_bytes",
+                    num_slots * self.MAX_CONTEXT_SIZE * self.head_dim * self.bytes_per_element)
+                kv_zero_pad = torch.zeros(
+                    kv_cache_bytes // self.bytes_per_element, dtype=torch.bfloat16)
+                self.dma_to_accelerator_memory(self.LAYER0_V_DRAM, kv_zero_pad)
+                self.dma_to_accelerator_memory(self.LAYER0_K_ROPE_DRAM, kv_zero_pad)
             # The same per-role sizes tensor_init allocated (_attention_buffer_sizes).
             _sizes = self._attention_buffer_sizes()
             _attn_rows = _sizes["rows"]
@@ -3484,6 +3491,10 @@ class Gemma4LMMixin:
         self._decode_total_flop_rate = total_flop_rate
         self._decode_hw_latency_us = total_latency
         self._decoded_token_ids = list(_decoded_ids)
+        # The last sampled token was never fed back, so its K/V is not in the
+        # cache: a continued conversation feeds it first (self.seq_len is the
+        # number of cached positions).
+        self._decode_last_token_id = int(token_id)
         try:
             self._decoded_text = self.tokenizer.decode(_decoded_ids, skip_special_tokens=False)
         except Exception:

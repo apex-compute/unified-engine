@@ -139,8 +139,10 @@ def chat_static(model: str) -> dict:
                                 "flops": meta.get("decoder_total_flops"),
                                 "flops_note": f"at {meta.get('decoder_attn_aligned_seq_len')}-token KV"}]
         out["ready"] = out["weights_file"]["bytes"] > 0
-        out["notes"].append(f"Prompts up to {(out['prefill_max'] or 0) + 1} tokens (one prefill program); "
-                            f"older turns are dropped to fit.")
+        out["notes"].append(f"Context {out.get('max_context') or 512} tokens. The conversation stays in the "
+                            f"K/V cache until New chat: each message prefills only itself, in chunks of up to "
+                            f"{out['prefill_max'] or 192} rows at its position. When the context is full the "
+                            f"conversation restarts from the latest turns.")
     else:
         wb = os.path.join(d, paths.get("weights_bin", f"{model}_bin/params.bin"))
         out["weights_file"] = {"name": os.path.relpath(wb, d), "bytes": _size(wb)}
@@ -160,8 +162,9 @@ def chat_static(model: str) -> dict:
         if not out["ready"]:
             out["notes"].append("params.bin is not generated yet: the first load converts the checkpoint "
                                 "(downloading it if needed), which takes several minutes.")
-        out["notes"].append("Image / audio turns are sent on their own (the encoders build their own prompt); "
-                            "text turns carry the conversation.")
+        out["notes"].append("Context 8192 tokens. The conversation (text, image and audio turns) stays in the "
+                            "K/V cache until New chat: each message prefills only itself, at its position, "
+                            "on top of the cache.")
     return out
 
 
@@ -222,8 +225,9 @@ class ChatJob:
     kind = "chat"
 
     def __init__(self, model: str, engines: int, messages: list[dict], image: str | None, audio: str | None,
-                 max_new_tokens: int, attachments: dict):
+                 max_new_tokens: int, attachments: dict, conversation: str = ""):
         self.id = uuid.uuid4().hex[:12]
+        self.conversation = conversation            # the page's chat id: same id = continue its KV cache
         self.model, self.engines = model, engines
         self.messages, self.image, self.audio = messages, image, audio
         self.max_new_tokens = max_new_tokens
@@ -258,7 +262,7 @@ class ChatJob:
 
     def public(self) -> dict:
         now = time.time()
-        return {"id": self.id, "kind": self.kind, "model": self.model, "engines": self.engines,
+        return {**self.live(), "id": self.id, "kind": self.kind, "model": self.model, "engines": self.engines,
                 "state": self.state, "status": self.status, "text": self.text, "metrics": self.metrics,
                 "error": self.error, "attachments": self.attachments,
                 "prompt": self.messages[-1]["content"] if self.messages else "",
@@ -354,7 +358,7 @@ class Board(threading.Thread):
             raise RuntimeError("stopped")
         job.set_status("starting")
         w.send({"id": job.id, "messages": job.messages, "image": job.image, "audio": job.audio,
-                "max_new_tokens": job.max_new_tokens})
+                "max_new_tokens": job.max_new_tokens, "conversation": job.conversation})
         for ev in w.events():
             e = ev.get("event")
             if ev.get("id") not in (None, job.id):
@@ -802,9 +806,10 @@ class Handler(BaseHTTPRequestHandler):
                 "Transcribe the speech exactly." if audio and not image else "Describe what you see and hear.")
         if not msgs[-1]["content"].strip():
             return self._json({"error": "empty message"}, HTTPStatus.BAD_REQUEST)
-        if image or audio or CHAT_MODELS[model].get("runner") == "oneshot":
-            msgs = msgs[-1:]                        # a single-turn prompt (encoders / per-message setup)
-        job = ChatJob(model, self.board.engines, msgs, image, audio, max_new, att)
+        if CHAT_MODELS[model].get("runner") == "oneshot":
+            msgs = msgs[-1:]                        # a single-turn prompt (per-message setup)
+        conversation = str(body.get("conversation") or "")[:64]
+        job = ChatJob(model, self.board.engines, msgs, image, audio, max_new, att, conversation)
         self.board.submit(job)
         self._json({"id": job.id, "position": self.board.position(job)}, HTTPStatus.ACCEPTED)
 
@@ -812,7 +817,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             prompt = str(body.get("prompt", "")).strip()
             seed = int(body.get("seed", 0))
-            no_reload = bool(body.get("no_reload", False))
+            no_reload = bool(body.get("no_reload", True))
             cfg = next((c for c in flux.scan_configs() if c["id"] == body.get("config")), None)
         except (ValueError, TypeError) as e:
             return self._json({"error": f"bad request: {e}"}, HTTPStatus.BAD_REQUEST)
@@ -838,15 +843,15 @@ def main(argv=None) -> int:
     ap.add_argument("--python", default=sys.executable, help="interpreter for the model runners")
     ap.add_argument("--dev", default="xdma0")
     ap.add_argument("--engines", type=int, default=8, help="engines for the chat models (FLUX uses its configs')")
-    ap.add_argument("--no-reload", action="store_true",
-                    help="FLUX: tick 'keep the board loaded between runs' by default")
+    ap.add_argument("--reload-per-image", action="store_true",
+                    help="FLUX: untick 'keep the board loaded' by default (reload the weights for every image)")
     args = ap.parse_args(argv)
 
     board = Board(args.python, args.dev, args.engines)
     board.start()
     Handler.board = board
     with open(PAGE_PATH, encoding="utf-8") as f:
-        Handler.page = f.read().replace("__NO_RELOAD__", "checked" if args.no_reload else "").encode()
+        Handler.page = f.read().replace("__NO_RELOAD__", "" if args.reload_per_image else "checked").encode()
     for k in CHAT_MODELS:
         s = chat_static(k)
         print(f"  {k}: weights {s['weights_file']['bytes'] / 1e9:.2f} GB"

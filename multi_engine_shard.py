@@ -4772,7 +4772,8 @@ class MultiEngineScheduler:
         :meth:`release` / :meth:`join` -- for :class:`RowsColumnOp` rounds whose row
         count is a RUNTIME value. Unlike :meth:`emit_worker_program` it leaves the
         persistent (decode) program state alone, so both stay resident: launch these with
-        ``start_workers(addrs, gpr_sets_by_worker=[[(m_reg, rows)] for m_reg in m_regs])``.
+        ``start_workers(addrs, gpr_sets_by_worker=[[(m_reg, rows), (kv_reg, row0_words)] ...])``
+        (``self.rows_kv_regs[i]`` is the KV cursor register, None when no op writes the KV cache).
 
         Returns ``(program addresses, row-count register)`` per worker, in worker order.
         """
@@ -4781,6 +4782,10 @@ class MultiEngineScheduler:
         sh = user_dma_core.ue_35bit_addr_shifter
         need_kv = any(op.out_kv_relative for rnd in rounds for op in rnd)
         addrs, m_regs = [], []
+        # The KV cursor (when an op writes into the KV cache) is primed by the same
+        # per-run preamble as the row count: the cache row the first row writes to
+        # (a prompt chunk or a continued conversation starts past row 0).
+        self.rows_kv_regs = []
         for idx in self.worker_indices():
             ue = self.engines[idx]
             ue.clear_inst_id()
@@ -4797,8 +4802,6 @@ class MultiEngineScheduler:
             gpr_a, gpr_out = ue.alloc_isa_reg(), ue.alloc_isa_reg()
             ue.generate_instruction_add_set(gpr_cnt, layers)
             ue.generate_instruction_add_set(gpr_layer, 0)
-            if gpr_kv is not None:
-                ue.generate_instruction_add_set(gpr_kv, 0)
             # One register per distinct K and per distinct output pitch, shared by ops.
             dim_regs = {}
             def _dim(kind, v):
@@ -4856,6 +4859,7 @@ class MultiEngineScheduler:
             ue.allocate_program_dram(size)
             addrs.append(addr)
             m_regs.append(gpr_M)
+            self.rows_kv_regs.append(gpr_kv)
         return addrs, m_regs
 
     def reset_workers(self) -> None:
