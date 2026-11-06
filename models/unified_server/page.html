@@ -279,7 +279,7 @@ function showModel(reset) {
     }
     showChatStatic(); refreshTools();
   }
-  else { loadFluxConfigs(); loadFluxHistory(); }
+  else { loadFluxConfigs(); loadFluxHistory(); if (reset || !fbuildTimer) prepareFlux(); }
 }
 let maxFor = null;
 $('model').onchange = () => showModel(true);
@@ -637,13 +637,44 @@ function showFluxStatic() {
     (peak ? `Raw peak ${peak.toFixed(0)} GFLOPS = ${c.engines} engines × 128 FLOP/cycle at ${board.clock_mhz.toFixed(0)} MHz.` : 'The raw peak of the board is known after the first run.');
   $('fstatic').hidden = false;
 }
+// The 256x256 and 512x512 (64 text tokens) program sets are built when FLUX is
+// opened (on the host, no board needed); show how that goes.
+let fbuildTimer = null;
+const buildKey = c => `${c.height}x${c.width}x${c.max_seq_len}`;
+function buildBusy(c) { const b = (state.flux.builds || {})[buildKey(c)]; return !!b && (b.state === 'queued' || b.state === 'building'); }
+function showBuilds() {
+  const b = state.flux.builds || {}, keys = Object.keys(b);
+  if (!keys.length || ftimer) return;
+  const name = k => { if (k === 'weights') return 'FLUX weights (one-time export)'; const [h, w, t] = k.split('x'); return `${w}×${h} (${t} text tokens)`; };
+  const busy = keys.filter(k => b[k].state === 'queued' || b[k].state === 'building');
+  const err = keys.filter(k => b[k].state === 'error');
+  $('fstatus').className = 'status' + (err.length ? ' err' : '');
+  $('fstatus').textContent =
+    busy.length ? 'Building programs: ' + busy.map(k => `${name(k)} ${b[k].state === 'building' ? b[k].seconds.toFixed(0) + ' s' : 'queued'}`).join(', ') + '…'
+    : err.length ? 'Program build failed: ' + err.map(k => `${name(k)}: ${b[k].error || 'error'}`).join('; ')
+    : 'Programs ready: ' + keys.map(name).join(', ') + '.';
+  const c = configs.find(x => x.id === $('config').value);
+  $('go').disabled = !!(c && buildBusy(c));
+}
+async function prepareFlux() {
+  try {
+    const r = await (await fetch('/api/flux/prepare', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).json();
+    state.flux.builds = r.builds; state.flux.configs = r.configs; loadFluxConfigs();
+  } catch (e) { return; }
+  if (fbuildTimer) return;
+  fbuildTimer = setInterval(async () => {
+    try { await loadModels(); } catch (e) { return; }
+    const b = state.flux.builds || {};
+    if (!Object.values(b).some(x => x.state === 'queued' || x.state === 'building')) { clearInterval(fbuildTimer); fbuildTimer = null; }
+  }, 2000);
+}
 function loadFluxConfigs() {
   configs = state.flux.configs; board = state.flux.board;
   const sel = $('config'), keep = sel.value; sel.innerHTML = '';
-  for (const c of configs) { const o = document.createElement('option'); o.value = c.id; o.textContent = fmt(c); sel.appendChild(o); }
-  if (!configs.length) { $('fstatus').textContent = 'No compiled program sets found under flux2_klein_4b_bin/programs/.'; $('go').disabled = true; }
+  for (const c of configs) { const o = document.createElement('option'); o.value = c.id; o.textContent = fmt(c) + (buildBusy(c) ? ' — building…' : ''); sel.appendChild(o); }
+  if (!configs.length) { $('fstatus').textContent = 'No compiled program sets yet (building them…).'; $('go').disabled = true; }
   else sel.value = configs.some(c => c.id === keep) ? keep : (configs.find(c => c.width === 256 && c.max_seq_len === 64) || configs[0]).id;
-  showFluxStatic();
+  showFluxStatic(); showBuilds();
 }
 function showFluxJob(j) {
   if (!j || j.state !== 'done') return;
@@ -692,7 +723,7 @@ async function pollFlux() {
     showFluxJob(j); loadFluxHistory(); await loadModels();
   }
 }
-$('config').onchange = showFluxStatic;
+$('config').onchange = () => { showFluxStatic(); showBuilds(); };
 $('go').onclick = async () => {
   const body = { prompt: $('prompt').value, config: $('config').value, seed: parseInt($('seed').value || '0', 10), no_reload: $('noreload').checked };
   $('go').disabled = true; $('fstatus').className = 'status'; $('fstatus').textContent = 'Submitting…'; $('flog').textContent = '';

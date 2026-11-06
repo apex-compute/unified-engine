@@ -223,6 +223,93 @@ class LLMWorker:
             self.proc.wait()
 
 
+# FLUX program sets that are always there: opening the FLUX view builds the
+# missing or stale ones (flux2_klein_4b_test.py --compile-only: CPU only, no
+# board), one after another in the background.
+FLUX_REQUIRED = ((256, 256, 64), (512, 512, 64))        # height, width, text tokens
+FLUX_DIR = os.path.join(MODELS_DIR, "flux2_klein_4b")
+FLUX_TEST = os.path.join(FLUX_DIR, "flux2_klein_4b_test.py")
+FLUX_WEIGHTS = os.path.join(FLUX_DIR, "flux2_klein_4b_weights.py")
+
+
+def flux_weights_missing() -> list[str]:
+    """FLUX weight files not exported yet (a fresh machine: the first build makes them)."""
+    with open(os.path.join(FLUX_DIR, "flux2_klein_4b_config.json")) as f:
+        paths = json.load(f)["paths"]
+    return [v for k, v in paths.items() if k.endswith(("_bin", "vae_weights"))
+            and not os.path.exists(os.path.join(FLUX_DIR, v))]
+
+
+class FluxBuilds:
+    """Background builds of the FLUX_REQUIRED program sets."""
+
+    def __init__(self, python: str, engines: int):
+        self.python, self.engines = python, engines
+        self.lock = threading.Lock()
+        self.thread: threading.Thread | None = None
+        self.state: dict[str, dict] = {}            # "HxW" -> {state, since, seconds, error, log}
+
+    @staticmethod
+    def key(h: int, w: int, toks: int) -> str:
+        return f"{h}x{w}x{toks}"
+
+    def busy(self, cfg: dict) -> bool:
+        st = self.state.get(self.key(cfg["height"], cfg["width"], cfg["max_seq_len"]))
+        return bool(st and st["state"] in ("queued", "building"))
+
+    def ensure(self) -> dict:
+        """Start the builds (checks are cheap when a set is up to date); idempotent."""
+        with self.lock:
+            if self.thread is None or not self.thread.is_alive():
+                for h, w, t in FLUX_REQUIRED:
+                    st = self.state.get(self.key(h, w, t))
+                    if st is None or st["state"] == "error":
+                        self.state[self.key(h, w, t)] = {"state": "queued", "since": time.time()}
+                todo = [r for r in FLUX_REQUIRED if self.state[self.key(*r)]["state"] == "queued"]
+                if todo:
+                    self.thread = threading.Thread(target=self._run, args=(todo,), daemon=True)
+                    self.thread.start()
+            return self.public()
+
+    def public(self) -> dict:
+        now = time.time()
+        return {k: {**{x: v[x] for x in ("state", "error") if x in v},
+                    "seconds": round(v.get("seconds") or (now - v["since"]), 1)}
+                for k, v in self.state.items()}
+
+    def _run(self, todo) -> None:
+        if flux_weights_missing():
+            # One-time weight export (downloads the checkpoint if needed, quantizes ~3 min).
+            st = self.state["weights"] = {"state": "building", "since": time.time()}
+            try:
+                r = subprocess.run([self.python, FLUX_WEIGHTS], cwd=ROOT, capture_output=True, text=True,
+                                   timeout=4 * 3600)
+                ok = r.returncode == 0 and not flux_weights_missing()
+                tail = [l for l in (r.stdout + r.stderr).splitlines() if l.strip()][-3:]
+                st.update(state="ready" if ok else "error", seconds=time.time() - st["since"],
+                          error=None if ok else " | ".join(tail)[-400:])
+            except Exception as e:  # noqa: BLE001 - reported on the page
+                st.update(state="error", seconds=time.time() - st["since"], error=f"{type(e).__name__}: {e}")
+            if st["state"] == "error":
+                for h, w, t in todo:
+                    self.state[self.key(h, w, t)].update(state="error", seconds=0.0,
+                                                         error="the FLUX weight export failed")
+                return
+        for h, w, t in todo:
+            st = self.state[self.key(h, w, t)]
+            st.update(state="building", since=time.time())
+            cmd = [self.python, FLUX_TEST, "--compile-only", "--height", str(h), "--width", str(w),
+                   "--max-seq-len", str(t), "--engines", str(self.engines)]
+            try:
+                r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=3600)
+                ok = r.returncode == 0
+                tail = [l for l in (r.stdout + r.stderr).splitlines() if l.strip()][-3:]
+                st.update(state="ready" if ok else "error", seconds=time.time() - st["since"],
+                          error=None if ok else " | ".join(tail)[-400:])
+            except Exception as e:  # noqa: BLE001 - reported on the page
+                st.update(state="error", seconds=time.time() - st["since"], error=f"{type(e).__name__}: {e}")
+
+
 class ChatJob:
     kind = "chat"
 
@@ -576,7 +663,8 @@ class Handler(BaseHTTPRequestHandler):
                            "modalities": ["text→image"],
                            "blurb": "Text-to-image. Text encoder, diffusion transformer and VAE decoder all on the FPGA."})
             return self._json({"models": models, "engines": b.engines, "resident": b.resident(),
-                               "loading": b.loading, "flux": {"configs": flux.scan_configs(), "board": fboard}})
+                               "loading": b.loading, "flux": {"configs": flux.scan_configs(), "board": fboard,
+                                                              "builds": self.flux_builds.public()}})
         if path == "/api/jobs":
             with b.lock:
                 jobs = [b.jobs[i] for i in b.order]
@@ -658,6 +746,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": f"bad request: {e}"}, HTTPStatus.BAD_REQUEST)
         if path == "/api/chat":
             return self._chat(body)
+        if path == "/api/flux/prepare":
+            return self._json({"builds": self.flux_builds.ensure(), "configs": flux.scan_configs()})
         if path == "/api/generate":
             return self._flux(body)
         self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
@@ -723,6 +813,9 @@ class Handler(BaseHTTPRequestHandler):
                               HTTPStatus.BAD_REQUEST)
         if cfg is None:
             return self._json({"error": "unknown configuration"}, HTTPStatus.BAD_REQUEST)
+        if self.flux_builds.busy(cfg):
+            return self._json({"error": "this configuration's programs are being built; try again shortly"},
+                              HTTPStatus.CONFLICT)
         if seed < 0:
             return self._json({"error": "seed must be >= 0"}, HTTPStatus.BAD_REQUEST)
         job = flux.Job(prompt, cfg, seed, no_reload)
@@ -746,6 +839,7 @@ def main(argv=None) -> int:
     board.start()
     Handler.board = board
     Handler.no_reload_default = "" if args.reload_per_image else "checked"
+    Handler.flux_builds = FluxBuilds(args.python, args.engines)
     for k in CHAT_MODELS:
         s = chat_static(k)
         print(f"  {k}: weights {s['weights_file']['bytes'] / 1e9:.2f} GB"
