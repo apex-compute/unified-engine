@@ -1864,14 +1864,30 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # A prompt longer than max_prefill_seq_len is prefilled in chunks, each
         # its own compile (run_gemma4 sets _prefill_chunk per chunk); compiling
         # without one builds the first chunk.
-        prefill_pos_offset, prefill_flops_seq_len = (
+        _chunk_pos, _chunk_len = (
             getattr(self, "_prefill_chunk", None)
             or self.prefill_chunks(len(self.prefill_seq) - 1)[0])
+        # The position is a runtime register (compile_prefill), so the image
+        # depends only on its row count: the chunk rounded up to a 64-row
+        # bucket. One image then serves every chunk and conversation turn of
+        # that size, and is kept in host memory once built.
+        prefill_pos_offset = 0
+        prefill_flops_seq_len = self.prefill_program_rows(_chunk_len, _chunk_pos)
         if self.multi_core > 1 and prefill_flops_seq_len < self.multi_core:
             raise ValueError(
                 f"{self.multi_core}-engine fixed prefill requires at least "
                 f"{self.multi_core} prefill rows")
         prefill_scheduler = self._ensure_prefill_scheduler()
+        _mem_key = (prefill_flops_seq_len, self.prefill_kernel, self.decode_kernel,
+                    self.multi_core, self.dram_layout)
+        _mem = self.__dict__.setdefault("_lm_image_cache", {})
+        if not profile and _mem_key in _mem:
+            if prefill_scheduler is not None:
+                self._stage_prefill_private_state(prefill_scheduler, layer_size)
+            self._section_cache = {**(getattr(self, "_section_cache", None) or {}), **_mem[_mem_key]}
+            print(f"[compile] reusing the {prefill_flops_seq_len}-row prefill image from host memory")
+            self._lm_compile_reused = True
+            return
         _lm_meta, _ = self._get_program_section("lm", profile)
         _prefill_worker_metas = [
             self._get_program_section(f"prefill_worker{i}", profile)[0]
@@ -1881,6 +1897,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 and _lm_meta is not None
                 and _lm_meta.get("prefill_flops_seq_len") == prefill_flops_seq_len
                 and _lm_meta.get("prefill_pos_offset", 0) == prefill_pos_offset
+                and _lm_meta.get("prefill_pos_regs") is not None
                 and _lm_meta.get("prefill_kernel") == self.prefill_kernel
                 and _lm_meta.get("decode_kernel") == self.decode_kernel
                 and _lm_meta.get("multi_core", 1) == self.multi_core
@@ -1897,8 +1914,19 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             print(f"[compile] reusing existing instruction image at {bin_path}")
             print(f"  delete {bin_path} (or make clean) to force recompile.")
             self._lm_compile_reused = True
+            if not profile:
+                self._remember_lm_image(_mem_key)
             return
         self._lm_compile_reused = False
+        # Every LM build starts at the same program cursors (the first build's):
+        # the images are swapped in by DMA, never resident side by side.
+        _cursor_engines = [self] + (list(prefill_scheduler.workers) if prefill_scheduler is not None else [])
+        _bases = getattr(self, "_lm_cursor_bases", None)
+        if _bases is None:
+            self._lm_cursor_bases = [(e, int(e._next_program_dram_addr)) for e in _cursor_engines]
+        else:
+            for e, addr in _bases:
+                e._next_program_dram_addr = addr
 
         print(f"[compile] building combined [prefill-template@{prefill_template_seq_len}, "
               f"kernel={self.prefill_kernel}][decoder, kernel={self.decode_kernel}] image...")
@@ -1922,7 +1950,16 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 self._prefill_shard_m_regs = [self.alloc_isa_reg()]
                 self._prefill_shard_m_regs.extend(
                     worker.alloc_isa_reg() for worker in prefill_scheduler.workers)
+                # Runtime position (every engine) and live attention length (the
+                # workers; engine 0 has gpr_aligned_seq_len), primed per run.
+                self._prefill_pos_regs = [self.alloc_isa_reg()] + [
+                    worker.alloc_isa_reg() for worker in prefill_scheduler.workers]
+                self._prefill_aligned_regs = [None] + [
+                    worker.alloc_isa_reg() for worker in prefill_scheduler.workers]
                 self._active_prefill_scheduler = prefill_scheduler
+            else:
+                self._prefill_pos_regs = [self.alloc_isa_reg()]
+                self._prefill_aligned_regs = None
             _, prefill_total_flops = self.compile_prefill(seq_len=prefill_flops_seq_len,
                                                           pos_offset=prefill_pos_offset,
                                                           layer_size=layer_size,
@@ -1939,11 +1976,20 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                 b"".join(inst.get_bytes() for inst in w.capture_buffer)
                 for w in prefill_scheduler.workers] if prefill_scheduler is not None else []
             self._active_prefill_scheduler = None
+            _prefill_pos_regs = list(self._prefill_pos_regs)
+            _prefill_aligned_regs = (list(self._prefill_aligned_regs)
+                                     if self._prefill_aligned_regs is not None else None)
+            self._prefill_pos_regs = self._prefill_aligned_regs = None
             if prefill_scheduler is not None:
                 for worker in reversed(prefill_scheduler.workers):
-                    worker.release_isa_reg()
-                self.release_isa_reg()
+                    worker.release_isa_reg()     # aligned
+                    worker.release_isa_reg()     # position
+                    worker.release_isa_reg()     # rows
+                self.release_isa_reg()           # position
+                self.release_isa_reg()           # rows
                 self._prefill_shard_m_regs = None
+            else:
+                self.release_isa_reg()           # position
 
             self._align_dispatch_entry()
             decoder_count_at_start = self.capture_count
@@ -1984,6 +2030,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             "prefill_template_seq_len": prefill_template_seq_len,
             "prefill_flops_seq_len": prefill_flops_seq_len,
             "prefill_pos_offset": prefill_pos_offset,
+            # Registers the run primes with the first row's position (per engine)
+            # and the live attention length (per worker): the position is runtime.
+            "prefill_pos_regs": _prefill_pos_regs,
+            "prefill_aligned_regs": _prefill_aligned_regs,
             "prefill_program_start_addr": f"0x{prefill_program_addr:X}",
             "prefill_program_size": prefill_size_bytes,
             "prefill_total_flops": prefill_total_flops,
@@ -2052,6 +2102,38 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         print(f"[compile] stored LM section ({len(image_bytes)/1024:.1f} KB @ 0x{instruction_base_addr:X}); "
               f"prefill @ 0x{prefill_program_addr:X} ({prefill_size_bytes/1024:.1f} KB), "
               f"decoder @ 0x{decoder_program_addr:X} ({decoder_size_bytes/1024:.1f} KB)")
+        if not profile:
+            self._remember_lm_image(_mem_key)
+
+    def _lm_section_names(self) -> list[str]:
+        """The sections one LM compile produces (the decoder travels with the prefill)."""
+        return (["lm"] + [f"prefill_worker{i}" for i in range(1, self.multi_core)]
+                + [f"decode_worker{i}" for i in range(1, self.multi_core)])
+
+    def _remember_lm_image(self, key) -> None:
+        """Keep the LM sections just built (or found on disk) in host memory under ``key``."""
+        saved, self._section_cache = getattr(self, "_section_cache", None), None
+        try:
+            snap = {n: self._get_program_section(n) for n in self._lm_section_names()}
+        finally:
+            self._section_cache = saved
+        if all(meta is not None for meta, _ in snap.values()):
+            sections = {n: (meta, bytes(data)) for n, (meta, data) in snap.items()}
+            self.__dict__.setdefault("_lm_image_cache", {})[key] = sections
+            if self._section_cache is not None:
+                self._section_cache.update(sections)
+
+    def prefill_program_rows(self, chunk_len: int, pos_offset: int = 0) -> int:
+        """Rows the prefill image for a ``chunk_len``-row chunk runs: rounded up to
+        16 rows up to 128 (a chat turn is short and prefill time grows with the
+        rows) and to 32 above, at least one row per engine, at most
+        max_prefill_seq_len -- so a handful of images cover every length. Never
+        past the context."""
+        rows = max(int(chunk_len), int(self.multi_core))
+        step = 16 if rows <= 128 else 32
+        rows = min(-(-rows // step) * step, int(self.max_prefill_seq_len))
+        rows = min(rows, int(self.MAX_CONTEXT_SIZE) - int(pos_offset))
+        return max(rows, int(chunk_len))
 
     def _snapshot_program_sections(self) -> dict:
         """{name: (meta, bytes)} of every valid section in programs.bin, read once."""
@@ -2064,48 +2146,28 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         return snap
 
     def prepare_prefill_chunks(self) -> None:
-        """Compile every prefill chunk's program image up front (one-time cost).
+        """Get every prefill chunk's program image ready (built once per row count).
 
-        Call after compile_gemma4(), which built the first chunk. Each later
-        chunk has its position offset baked in, so it is its own compile; all
-        of them target the same ISA base, so they cannot be resident together.
-        The compiled sections are kept in host memory (_chunk_sections) and the
-        rest of programs.bin is snapshotted too (_section_cache), so run_gemma4
-        only DMAs a chunk's image in before running it -- no compile and no
-        disk read inside the timed run.
+        Call after compile_gemma4(). The position is a runtime register, so a
+        chunk's image depends only on its row count (prefill_program_rows); the
+        images are kept in host memory (_lm_image_cache) and run_gemma4 DMAs each
+        chunk's in before running it -- no compile and no disk read in the run.
         """
         self._section_cache = None
         chunks = self.prefill_chunks(len(self.prefill_seq) - 1)
-        # The LM image carries the decoder too, and the decode workers' images
-        # (and their register assignment) belong to the same compile, so they
-        # travel with each chunk's LM image.
-        names = (["lm"] + [f"prefill_worker{i}" for i in range(1, self.multi_core)]
-                 + [f"decode_worker{i}" for i in range(1, self.multi_core)])
-        first = self._snapshot_program_sections()
-        self._chunk_sections = [{n: first[n] for n in names if n in first}]
-        # Every chunk's worker programs go where the first chunk's start: only
-        # one chunk's set is resident at a time, and without the rewind each
-        # compile would place its set after the previous one and walk the
-        # worker's 16 MiB ISA slice off its end (12 chunks at 6144 tokens).
-        sched = self._ensure_prefill_scheduler()
-        worker_bases = {}
-        if sched is not None:
-            for i, w in enumerate(sched.workers, start=1):
-                meta = first.get(f"prefill_worker{i}", (None,))[0]
-                if meta is not None:
-                    worker_bases[i] = (w, int(meta["dram_base"], 16))
-        for pos_offset, chunk_len in chunks[1:]:
-            for w, base in worker_bases.values():
-                w._next_program_dram_addr = base
+        base = self._snapshot_program_sections()       # vision, audio, ...
+        self._chunk_sections = []
+        for pos_offset, chunk_len in chunks:
             self._prefill_chunk = (pos_offset, chunk_len)
-            self.compile_gemma4()
-            snap = self._snapshot_program_sections()
-            self._chunk_sections.append({n: snap[n] for n in names if n in snap})
+            self._section_cache = dict(base)
+            self.compile_gemma4()                       # memory hit, or build + remember
+            rows = self.prefill_program_rows(chunk_len, pos_offset)
+            key = (rows, self.prefill_kernel, self.decode_kernel, self.multi_core, self.dram_layout)
+            self._chunk_sections.append(self._lm_image_cache[key])
         self._prefill_chunk = None
-        # Everything else (vision, audio, decode workers) is chunk-independent.
-        self._section_cache = {**first, **self._chunk_sections[0]}
+        self._section_cache = {**base, **self._chunk_sections[0]}
         if len(chunks) > 1:
-            print(f"[compile] {len(chunks)} prefill chunks compiled; images held in host memory")
+            print(f"[compile] {len(chunks)} prefill chunks ready; images held in host memory")
 
     def prefill_chunks(self, prompt_len: int) -> list[tuple[int, int]]:
         """Split a prompt into (pos_offset, length) prefill chunks.

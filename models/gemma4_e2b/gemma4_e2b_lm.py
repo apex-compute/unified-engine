@@ -1142,7 +1142,8 @@ class Gemma4LMMixin:
     def _emit_strided_copy_pbi(self, src_base: int, dst_base: int, copy_elems: int,
                                src_row_bytes: int, dst_row_bytes: int,
                                n_template: int, gpr_loop: int,
-                               sram_addr: int = 0x10000, ue=None) -> None:
+                               sram_addr: int = 0x10000, ue=None,
+                               dst_off_reg: int | None = None) -> None:
         """§4.4 PBI hardware loop: for n_template rows (runtime trip count =
         gpr_loop) copy copy_elems bf16 from src to dst, advancing the source DRAM
         addr by src_row_bytes and the dest by dst_row_bytes each iteration (both
@@ -1168,6 +1169,8 @@ class Gemma4LMMixin:
             tmp, i_reg, ue_35bit_addr_shifter(dst_row_bytes))
         ue.generate_instruction_add_imm(
             tmp, ue_35bit_addr_shifter(dst_base), tmp)
+        if dst_off_reg is not None:     # runtime destination offset (words), e.g. a cache row
+            ue.generate_instruction_add_reg(tmp, tmp, dst_off_reg)
         ue.sram_to_accelerator_memory(
             sram_address=sram_addr, accelerator_dram_address=0,
             element_size=copy_elems, general_reg_src=tmp)
@@ -1261,8 +1264,15 @@ class Gemma4LMMixin:
         ``pos_offset``: chunked prefill. The program processes prompt positions
         [pos_offset, pos_offset + seq_len): RoPE rows and the K/V cache writes
         start at row pos_offset, and attention reads the whole cache prefix
-        [0, pos_offset + seq_len) that earlier chunks wrote. The offset is
-        baked in, so each chunk is its own compile (run_prefill_chunked).
+        [0, pos_offset + seq_len) that earlier chunks wrote.
+
+        RUNTIME POSITION: when compile_gemma4 provides _prefill_pos_regs (one
+        register per engine) the position is not baked: every RoPE row and K/V
+        cache write is computed from that register, and the live attention
+        length comes from gpr_aligned_seq_len / _prefill_aligned_regs, all
+        primed per run (run_prefill). One program then serves every position
+        -- every chunk and every turn of a conversation -- for its row count
+        (``seq_len``, rows past the real prompt are padding).
         """
         layer_size = self.LAYER_SIZE if layer_size is None else int(layer_size)
         seq_len = int(seq_len)
@@ -1273,6 +1283,22 @@ class Gemma4LMMixin:
                 f"max_context_size {self.MAX_CONTEXT_SIZE}")
         template_seq_len = int(self._cfg["model"].get(
             "prefill_max_seq_len", self.max_prefill_seq_len))
+        pos_regs = getattr(self, "_prefill_pos_regs", None)       # [engine 0, worker 1, ...]
+        aligned_regs = getattr(self, "_prefill_aligned_regs", None)
+        rt_pos = pos_regs is not None
+        P_lit = 0 if rt_pos else pos_offset       # what is still baked into addresses
+        sh = ue_35bit_addr_shifter
+
+        def _pos_times(ue, pos_reg, row_bytes: int, base: int = 0) -> int:
+            """A fresh register = base + P * row_bytes (words); the caller releases it."""
+            r = ue.alloc_isa_reg()
+            if pos_reg is None:
+                ue.generate_instruction_add_set(r, sh(base + P_lit * row_bytes))
+            else:
+                ue.generate_instruction_reg_mul_imm(r, pos_reg, sh(row_bytes))
+                if base:
+                    ue.generate_instruction_add_imm(r, sh(base), r)
+            return r
         self.seq_len = seq_len
         q_seq_len = seq_len * self.num_q_heads
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
@@ -1450,9 +1476,9 @@ class Gemma4LMMixin:
                 bpe_q = self.bytes_per_element
                 q_slot_bytes = (((self.max_prefill_seq_len + 63) // 64) * 64
                                 * cur_head_dim * bpe_q)
-                q_rope_base = ((self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers
+                q_rope_table = (self.DRAM_ADDR_ROPE_GLOBAL if layer_idx in self._rope_global_layers
                                 else self.DRAM_ADDR_ROPE_LOCAL)
-                               + pos_offset * 2 * rope_n * bpe_q)
+                q_rope_base = q_rope_table + P_lit * 2 * rope_n * bpe_q
                 q_rope_sin = q_rope_base + rope_n * bpe_q
                 def _emit_q_head(ctx):
                     # unsafe_ue: RoPE and the strided copies are refused inside a
@@ -1474,11 +1500,15 @@ class Gemma4LMMixin:
                         GAMMA_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_NORM_GAMMA + layer_off,
                         gpr_M_reg=m_reg)
                     head_b, rope_b = cur_head_dim * bpe_q, rope_n * bpe_q
+                    # This engine's table row for position P (its own copy of P).
+                    q_cos = _pos_times(ue, pos_regs[e] if rt_pos else None,
+                                       2 * rope_n * bpe_q, q_rope_table)
                     ue.generate_instruction_add_set(m_reg, seq_len)
                     if rope_n == cur_head_dim:
                         shard_flops[0] += ue.rope_hf_core_dram(
                             M=seq_len, N=rope_n, input_dram_addr=normed, output_dram_addr=slot,
-                            cos_dram_addr=q_rope_base, sin_dram_addr=q_rope_sin, gpr_M_reg=m_reg)
+                            cos_dram_addr=q_rope_base, sin_dram_addr=q_rope_sin, gpr_M_reg=m_reg,
+                            gpr_cos_addr=q_cos)
                     else:
                         # Partial rotary: rotate the first rope_n dims, pass the rest.
                         self._emit_strided_copy_pbi(normed, raw, rope_n, head_b, rope_b,
@@ -1486,7 +1516,8 @@ class Gemma4LMMixin:
                         ue.generate_instruction_add_set(m_reg, seq_len)
                         shard_flops[0] += ue.rope_hf_core_dram(
                             M=seq_len, N=rope_n, input_dram_addr=raw, output_dram_addr=rot,
-                            cos_dram_addr=q_rope_base, sin_dram_addr=q_rope_sin, gpr_M_reg=m_reg)
+                            cos_dram_addr=q_rope_base, sin_dram_addr=q_rope_sin, gpr_M_reg=m_reg,
+                            gpr_cos_addr=q_cos)
                         ue.generate_instruction_add_set(m_reg, seq_len)
                         self._emit_strided_copy_pbi(rot, slot, rope_n, rope_b, head_b,
                                                     seq_len, m_reg, ue=ue)
@@ -1494,6 +1525,7 @@ class Gemma4LMMixin:
                         self._emit_strided_copy_pbi(normed + rope_b, slot + rope_b,
                                                     cur_head_dim - rope_n, head_b, head_b,
                                                     seq_len, m_reg, ue=ue)
+                    ue.release_isa_reg()   # q_cos
                 qkv_ops = [] if q_fused else [("q", self.LAYER0_Q_DRAM, cur_q_size)]
                 if non_shared:
                     qkv_ops += [("k", self.LAYER0_K_DRAM, cur_k_size),
@@ -1538,7 +1570,9 @@ class Gemma4LMMixin:
                 # the body is emitted once and hardware-looped over gpr_seq_len.
                 kv_row_bytes = self._kv_row_bytes_for_layer[layer_idx]
                 v_cache_base = (self.LAYER0_V_DRAM + self._kv_offset_for_layer[layer_idx]
-                                + pos_offset * kv_row_bytes)   # this chunk's first row
+                                + P_lit * kv_row_bytes)   # this chunk's first row
+                # Runtime position: + P rows, in words (released after the loop).
+                v_pos = _pos_times(self, pos_regs[0], kv_row_bytes) if rt_pos else None
                 _vi = self.alloc_isa_reg()
                 self.generate_instruction_add_set(_vi, 0)
                 self.loop_start(loop_cnt=seq_len, gpr_loop_cnt=self.gpr_seq_len)
@@ -1551,10 +1585,14 @@ class Gemma4LMMixin:
                     self.rms_norm_core(0x10000, 0x10000, cur_head_dim)  # no gamma
                     self.generate_instruction_reg_mul_imm(self.TMP_REG, _vi, ue_35bit_addr_shifter(kv_row_bytes))
                     self.generate_instruction_add_imm(self.TMP_REG, ue_35bit_addr_shifter(v_cache_base + _kvh * self._kv_head_stride_for_layer[layer_idx]), self.TMP_REG)
+                    if v_pos is not None:
+                        self.generate_instruction_add_reg(self.TMP_REG, self.TMP_REG, v_pos)
                     self.sram_to_accelerator_memory(sram_address=0x10000, accelerator_dram_address=0, element_size=cur_head_dim, general_reg_src=self.TMP_REG)
                 self.generate_instruction_add_inc(_vi)
                 self.loop_end()
                 self.release_isa_reg()  # _vi
+                if v_pos is not None:
+                    self.release_isa_reg()  # v_pos
 
             _checkpoint(f"L{layer_idx}_qkv_vproj")
 
@@ -1572,14 +1610,20 @@ class Gemma4LMMixin:
             head_bytes = cur_head_dim * bpe
             rope_bytes = rope_n * bpe
             # One table row (cos | sin halves) per position: start at the chunk's.
-            ROPE_WEIGHT_ADDR += pos_offset * 2 * rope_n * bpe
+            rope_table = ROPE_WEIGHT_ADDR
+            ROPE_WEIGHT_ADDR += P_lit * 2 * rope_n * bpe
             sin_addr = ROPE_WEIGHT_ADDR + rope_n * bpe
+            # Runtime position (released at the end of the RoPE step): the table
+            # row of P, and P cache rows in words for the K writes.
+            l_cos = _pos_times(self, pos_regs[0], 2 * rope_n * bpe, rope_table) if rt_pos else None
+            l_kv = (_pos_times(self, pos_regs[0], self._kv_row_bytes_for_layer[layer_idx])
+                    if rt_pos and non_shared else None)
             q_rows = seq_len * self.num_q_heads
             kv_slot_off = self._kv_offset_for_layer[layer_idx]
             k_cache_base = self.LAYER0_K_ROPE_DRAM + kv_slot_off
             v_cache_base = self.LAYER0_V_DRAM + kv_slot_off
             # RoPE'd K lands at this chunk's rows; attention reads from row 0.
-            k_cache_write = k_cache_base + pos_offset * self._kv_row_bytes_for_layer[layer_idx]
+            k_cache_write = k_cache_base + P_lit * self._kv_row_bytes_for_layer[layer_idx]
             tmp_in = self.LAYER0_MLP_GATE_DRAM    # gather/rope scratch (dead during attn,
             tmp_out = self.LAYER0_MLP_UP_DRAM     #  overwritten by the real MLP later)
             if non_shared and self.num_kv_heads > 1:
@@ -1597,23 +1641,23 @@ class Gemma4LMMixin:
                 if rope_n == cur_head_dim:
                     total_flops += self.rope_hf_core_dram_gqa(M=seq_len, group_size=nkv, N=rope_n,
                         input_dram_addr=self.LAYER0_K_NORM_DRAM, output_dram_addr=tmp_out,
-                        cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
+                        cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len, gpr_cos_addr=l_cos)
                     for kvh in range(nkv):
                         self._emit_strided_copy_pbi(tmp_out + kvh * head_bytes, k_cache_write + kvh * k_head_stride,
-                                                    cur_head_dim, nkv * head_bytes, head_bytes, seq_len, self.gpr_seq_len)
+                                                    cur_head_dim, nkv * head_bytes, head_bytes, seq_len, self.gpr_seq_len, dst_off_reg=l_kv)
                 else:
                     non_rot = cur_head_dim - rope_n
                     self._emit_strided_copy_pbi(self.LAYER0_K_NORM_DRAM, tmp_in, rope_n, head_bytes, rope_bytes,
                                                 seq_len * nkv, kv_rows)
                     total_flops += self.rope_hf_core_dram_gqa(M=seq_len, group_size=nkv, N=rope_n,
                         input_dram_addr=tmp_in, output_dram_addr=tmp_out,
-                        cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
+                        cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len, gpr_cos_addr=l_cos)
                     for kvh in range(nkv):
                         self._emit_strided_copy_pbi(tmp_out + kvh * rope_bytes, k_cache_write + kvh * k_head_stride,
-                                                    rope_n, nkv * rope_bytes, head_bytes, seq_len, self.gpr_seq_len)
+                                                    rope_n, nkv * rope_bytes, head_bytes, seq_len, self.gpr_seq_len, dst_off_reg=l_kv)
                         self._emit_strided_copy_pbi(self.LAYER0_K_NORM_DRAM + kvh * head_bytes + rope_bytes,
                                                     k_cache_write + kvh * k_head_stride + rope_bytes,
-                                                    non_rot, nkv * head_bytes, head_bytes, seq_len, self.gpr_seq_len)
+                                                    non_rot, nkv * head_bytes, head_bytes, seq_len, self.gpr_seq_len, dst_off_reg=l_kv)
                 self.release_isa_reg()   # kv_rows
             elif non_shared:
                 # K norm (non-shared layers own their KV slot).
@@ -1624,26 +1668,37 @@ class Gemma4LMMixin:
             if rope_n == cur_head_dim:
                 # Full rotary: single PBI rope call (input/output contiguous).
                 if k_single:
+                    k_out = None
+                    if l_kv is not None:
+                        k_out = self.alloc_isa_reg()
+                        self.generate_instruction_add_imm(l_kv, sh(k_cache_write), k_out)
                     total_flops += self.rope_hf_core_dram(M=seq_len, N=rope_n,
                         input_dram_addr=self.LAYER0_K_NORM_DRAM, output_dram_addr=k_cache_write,
-                        cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
+                        cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len, gpr_cos_addr=l_cos,
+                        gpr_out_addr=k_out)
+                    if k_out is not None:
+                        self.release_isa_reg()   # k_out
                 if not q_fused:
                     total_flops += self.rope_hf_core_dram_gqa(M=seq_len, group_size=self.num_q_heads, N=rope_n,
                         input_dram_addr=self.LAYER0_Q_NORM_DRAM, output_dram_addr=self.LAYER0_FLASH_Q_DRAM,
-                        cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
+                        cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len, gpr_cos_addr=l_cos)
             else:
                 # Partial rotary: rotate first rope_n dims, copy the rest through.
                 non_rot = cur_head_dim - rope_n
                 if k_single:
                     self._emit_strided_copy_pbi(self.LAYER0_K_NORM_DRAM, tmp_in, rope_n, head_bytes, rope_bytes, seq_len, self.gpr_seq_len)
-                    total_flops += self.rope_hf_core_dram(M=seq_len, N=rope_n, input_dram_addr=tmp_in, output_dram_addr=tmp_out, cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
-                    self._emit_strided_copy_pbi(tmp_out, k_cache_write, rope_n, rope_bytes, head_bytes, seq_len, self.gpr_seq_len)
-                    self._emit_strided_copy_pbi(self.LAYER0_K_NORM_DRAM + rope_bytes, k_cache_write + rope_bytes, non_rot, head_bytes, head_bytes, seq_len, self.gpr_seq_len)
+                    total_flops += self.rope_hf_core_dram(M=seq_len, N=rope_n, input_dram_addr=tmp_in, output_dram_addr=tmp_out, cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len, gpr_cos_addr=l_cos)
+                    self._emit_strided_copy_pbi(tmp_out, k_cache_write, rope_n, rope_bytes, head_bytes, seq_len, self.gpr_seq_len, dst_off_reg=l_kv)
+                    self._emit_strided_copy_pbi(self.LAYER0_K_NORM_DRAM + rope_bytes, k_cache_write + rope_bytes, non_rot, head_bytes, head_bytes, seq_len, self.gpr_seq_len, dst_off_reg=l_kv)
                 if not q_fused:
                     self._emit_strided_copy_pbi(self.LAYER0_Q_NORM_DRAM, tmp_in, rope_n, head_bytes, rope_bytes, q_rows, self.gpr_q_seq_len)
-                    total_flops += self.rope_hf_core_dram_gqa(M=seq_len, group_size=self.num_q_heads, N=rope_n, input_dram_addr=tmp_in, output_dram_addr=tmp_out, cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len)
+                    total_flops += self.rope_hf_core_dram_gqa(M=seq_len, group_size=self.num_q_heads, N=rope_n, input_dram_addr=tmp_in, output_dram_addr=tmp_out, cos_dram_addr=ROPE_WEIGHT_ADDR, sin_dram_addr=sin_addr, gpr_M_reg=self.gpr_seq_len, gpr_cos_addr=l_cos)
                     self._emit_strided_copy_pbi(tmp_out, self.LAYER0_FLASH_Q_DRAM, rope_n, rope_bytes, head_bytes, q_rows, self.gpr_q_seq_len)
                     self._emit_strided_copy_pbi(self.LAYER0_Q_NORM_DRAM + rope_bytes, self.LAYER0_FLASH_Q_DRAM + rope_bytes, non_rot, head_bytes, head_bytes, q_rows, self.gpr_q_seq_len)
+            if l_kv is not None:
+                self.release_isa_reg()   # l_kv
+            if l_cos is not None:
+                self.release_isa_reg()   # l_cos
             _checkpoint(f"L{layer_idx}_rope")
 
             # ---- GQA = an outer loop over the group's query heads ----
@@ -1675,7 +1730,7 @@ class Gemma4LMMixin:
             # internal scratch partition is safe for any reusable prompt. Live
             # execution dimensions still come exclusively from the GPRs.
             # Live KV length: the cache prefix earlier chunks wrote plus this one.
-            attn_aligned_live = ((pos_offset + seq_len + 63) // 64) * 64
+            attn_aligned_live = ((P_lit + seq_len + 63) // 64) * 64
             # A chunk past the first attends more KV rows than it has queries, so
             # the core's static aligned length becomes the live KV length (the
             # scratch is sized for MAX_CONTEXT_SIZE, see _attention_buffer_sizes).
@@ -1686,6 +1741,11 @@ class Gemma4LMMixin:
             # can start at a small P with a KV prefix shorter than max_prefill_seq_len)
             core_aligned = per_head_rows if pos_offset == 0 else max(per_head_rows, attn_aligned_live)
             core_q_pre_scaled = pos_offset > 0
+            if rt_pos:
+                # The live KV length is P + rows for a runtime P: reserve the whole
+                # context (the scratch is sized for it, _attention_buffer_sizes).
+                core_aligned = ((self.MAX_CONTEXT_SIZE + 63) // 64) * 64
+                core_q_pre_scaled = True
             for g in range(0 if q_fused else self.num_q_heads):   # fused: already head-major
                 self._emit_strided_copy_pbi(
                     self.LAYER0_FLASH_Q_DRAM + g * head_bytes,       # token-major head g
@@ -1750,12 +1810,17 @@ class Gemma4LMMixin:
                         return            # capped out by max_engines; barrier only
                     b_reg = ctx.ue.alloc_isa_reg()
                     ctx.ue.generate_instruction_add_set(b_reg, seq_len)
-                    a_reg = ctx.ue.alloc_isa_reg()
-                    ctx.ue.generate_instruction_add_set(a_reg, attn_aligned_live)
+                    if rt_pos:      # primed per run: engine 0's dispatch, the workers' launch
+                        a_reg = (self.gpr_aligned_seq_len if ctx.engine_idx == 0
+                                 else aligned_regs[ctx.engine_idx])
+                    else:
+                        a_reg = ctx.ue.alloc_isa_reg()
+                        ctx.ue.generate_instruction_add_set(a_reg, attn_aligned_live)
                     scr = ctx.scratch("prefill_attn_scratch")
                     for h in range(ctx.head_off, ctx.head_off + ctx.heads):
                         _attn_flops[0] += _emit_prefill_head(ctx.ue, h, scr, b_reg, a_reg)
-                    ctx.ue.release_isa_reg()
+                    if not rt_pos:
+                        ctx.ue.release_isa_reg()
                     ctx.ue.release_isa_reg()
                 # max_engines: Gemma4 E2B has eight LM query/KV groups, so on a
                 # 9-12 engine board there are fewer heads than engines. The cap
@@ -2065,6 +2130,16 @@ class Gemma4LMMixin:
         mm_before = (list(mm_all[:pos_offset]) if mm_all is not None else [])
         prefill_seq = prefill_seq[pos_offset:pos_offset + chunk_len]
         seq_len = len(prefill_seq)
+        # The program's own row count and position registers (runtime-position
+        # images): it runs `n_run` rows, the real ones then padding, at the
+        # position primed below. Older images bake the position and the rows.
+        _lm_meta = self._get_program_section("lm", profile_checkpoints is not None)[0] or {}
+        pos_regs = _lm_meta.get("prefill_pos_regs")
+        aligned_regs = _lm_meta.get("prefill_aligned_regs")
+        n_run = int(_lm_meta.get("prefill_flops_seq_len", seq_len)) if pos_regs else seq_len
+        if n_run < seq_len or pos_offset + n_run > self.MAX_CONTEXT_SIZE:
+            raise RuntimeError(f"the prefill image runs {n_run} rows; this chunk needs {seq_len} "
+                               f"at position {pos_offset}; recompile the program image")
         assert seq_len <= self.max_prefill_seq_len, (
             f"Prefill length {seq_len} exceeds max_prefill_seq_len {self.max_prefill_seq_len}. "
             f"Bump 'max_prefill_seq_len' in gemma4_e2b_config.json (and raise _tensor_estimate "
@@ -2073,7 +2148,7 @@ class Gemma4LMMixin:
         # Runtime GPRs select the real row counts; run_decoder resumes from this
         # prompt position after prefill.
         self.seq_len = pos_offset + seq_len
-        q_seq_len = seq_len * self.num_q_heads
+        q_seq_len = n_run * self.num_q_heads
         aligned_seq_len = ((q_seq_len + 63) // 64) * 64
         # Per-head aligned KV length: with GQA run as an outer loop over query
         # heads reusing one K/V, attention is per-token (not per q-position), so
@@ -2081,7 +2156,7 @@ class Gemma4LMMixin:
         # gpr_aligned_seq_len below (replaces the old align64(q_seq_len)).
         # A later chunk attends the whole cache prefix, so its aligned KV length
         # counts the earlier chunks' rows too.
-        attn_aligned = ((pos_offset + seq_len + 63) // 64) * 64
+        attn_aligned = ((pos_offset + n_run + 63) // 64) * 64
         prefill_scheduler = self._ensure_prefill_scheduler()
         worker_program_addrs = []
         if prefill_scheduler is not None:
@@ -2091,11 +2166,11 @@ class Gemma4LMMixin:
                 if worker_meta is None:
                     raise FileNotFoundError(
                         f"prefill_worker{engine_idx} section not found in combined programs bin")
-                if worker_meta.get("prefill_seq_len") != seq_len:
+                if worker_meta.get("prefill_seq_len") != n_run:
                     raise RuntimeError(
                         f"fixed prefill worker {engine_idx} was compiled for "
                         f"M={worker_meta.get('prefill_seq_len')}, but this prompt "
-                        f"requires M={seq_len}; recompile the program image")
+                        f"requires M={n_run}; recompile the program image")
                 worker_addr = int(worker_meta["dram_base"], 16)
                 worker._next_program_dram_addr = worker_addr
                 worker.dma_write(DMA_DEVICE_H2C, worker_addr, worker_bytes, len(worker_bytes))
@@ -2191,13 +2266,22 @@ class Gemma4LMMixin:
                 embedding_tensor[audio_mask] = self._audio_features[_a0:_a0 + audio_mask.sum()].to(embedding_tensor.dtype)
                 print(f"[Prefill] merged {audio_mask.sum().item()} audio features into embeddings")
 
+        pad = n_run - seq_len
+        if pad:
+            # Padding rows (pad token): they run, write K/V past the prompt (decode
+            # and later prefills overwrite those rows before anything attends them)
+            # and are masked out of every real row's attention.
+            embedding_tensor = torch.cat(
+                [embedding_tensor, self.get_embedding_for_tokens((0,) * pad).to(embedding_tensor.dtype)], 0)
         print(f"[Prefill] uploading embeddings to FPGA DRAM...", flush=True)
         self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
 
         # Host performs only the runtime token-indexed lookup. Projection,
         # normalization, add and scaling run on FPGA.
         print(f"[Prefill] [host] looking up per-layer embedding rows...", flush=True)
-        per_layer_embed = self._lookup_per_layer_embeddings(prefill_seq, mm_types=mm_chunk)
+        per_layer_embed = self._lookup_per_layer_embeddings(
+            tuple(prefill_seq) + (0,) * pad,
+            mm_types=(list(mm_chunk) + [0] * pad) if mm_chunk is not None else None)
         print(f"[Prefill] uploading per-layer embedding rows to FPGA DRAM...", flush=True)
         self.dma_to_accelerator_memory(
             self.PER_LAYER_EMBED_DRAM,
@@ -2226,7 +2310,7 @@ class Gemma4LMMixin:
         # what zeroes the stale K/V padding rows after softmax.
         # A later chunk's plane is [chunk rows, attn_aligned]: query row i is
         # prompt position pos_offset + i and attends KV rows up to it.
-        _rows = attn_aligned if pos_offset == 0 else seq_len
+        _rows = attn_aligned if pos_offset == 0 else n_run
         _i = torch.arange(_rows).unsqueeze(1) + pos_offset
         _j = torch.arange(attn_aligned).unsqueeze(0)
         _tok_causal = (_j <= _i) if not self.causal_mask_upper else (_j >= _i)
@@ -2248,6 +2332,27 @@ class Gemma4LMMixin:
 
         host_prepare_s = time.perf_counter() - _host_prepare_w0
 
+        # Runtime position: engine 0's register through the dispatch preamble,
+        # each worker's position and live attention length through its launch.
+        _pos_gprs = [(int(pos_regs[0]), pos_offset)] if pos_regs else []
+
+        def _launch_workers():
+            # start_workers parks a register preamble right after a worker's image
+            # and remembers the slot by image address. Every prefill image of
+            # every row count starts at the same address, so a slot reserved
+            # after a smaller image would sit inside a larger one: forget them,
+            # so it lands after the image loaded now (its cursor, set above).
+            slots = getattr(prefill_scheduler, "_runtime_worker_preambles", None)
+            if slots:
+                ours = {int(a) for a in worker_program_addrs}
+                for k in [k for k in slots if k[1] in ours]:
+                    del slots[k]
+            sets = None
+            if pos_regs:
+                sets = [[(int(pos_regs[i]), pos_offset), (int(aligned_regs[i]), attn_aligned)]
+                        for i in range(1, len(pos_regs))]
+            prefill_scheduler.start_workers(worker_program_addrs, gpr_sets_by_worker=sets)
+
         # Profiling path: run the prefill through its per-phase HALT checkpoints
         # and return per-segment HW latencies. Populates the KV cache exactly
         # like a straight run (segments tile the whole program). The dynamic-PBI
@@ -2260,12 +2365,13 @@ class Gemma4LMMixin:
             # region's segment measures its fork-to-join wall-time; the worker runs
             # its continuous shard stream and parks at region entry flags between.
             return self._profile_execute(
-                [(self.gpr_seq_len,         seq_len),
+                [(self.gpr_seq_len,         n_run),
                  (self.gpr_q_seq_len,       q_seq_len),
-                 (self.gpr_aligned_seq_len, attn_aligned)],
+                 (self.gpr_aligned_seq_len, attn_aligned)] + _pos_gprs,
                 prefill_program_addr, profile_checkpoints, tail_name="tail_halt",
                 worker_scheduler=prefill_scheduler,
-                worker_addrs=worker_program_addrs)
+                worker_addrs=worker_program_addrs,
+                worker_launch=(_launch_workers if prefill_scheduler is not None else None))
 
         print(f"[Prefill] [exec] launching prefill program on FPGA ({seq_len} tokens, {self.LAYER_SIZE} layers)...", flush=True)
         # Heartbeat thread: program_execute blocks until the FPGA halts, with no
@@ -2292,11 +2398,11 @@ class Gemma4LMMixin:
                 # (past every program) is what keeps the gpr priming from clobbering
                 # the prefill body.
                 if prefill_scheduler is not None:
-                    prefill_scheduler.start_workers(worker_program_addrs)
+                    _launch_workers()
                 latency, flop_rate_program = self._dispatch_program(
-                    [(self.gpr_seq_len,         seq_len),
+                    [(self.gpr_seq_len,         n_run),
                      (self.gpr_q_seq_len,       q_seq_len),
-                     (self.gpr_aligned_seq_len, attn_aligned)],
+                     (self.gpr_aligned_seq_len, attn_aligned)] + _pos_gprs,
                     prefill_program_addr, timeout=300.0, flops=flops)
                 for worker in prefill_scheduler.workers if prefill_scheduler is not None else []:
                     worker.wait_queue(300.0)
