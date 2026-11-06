@@ -186,7 +186,7 @@ class Gemma3Backend(_Conversation):
         while True:
             text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
             ids = list(tok.encode(text, add_special_tokens=True))
-            if len(ids) <= limit or len(msgs) <= 1:
+            if len(msgs) <= 1 or len(ids) <= (limit if not dropped else _HISTORY_SHARE * limit):
                 break
             msgs = msgs[2:] if len(msgs) > 2 else msgs[1:]
             dropped += 1
@@ -272,6 +272,11 @@ _G4_PER_REQUEST = ("_media_counts", "_vis_last_latency_us", "_vis_e2e_s", "_vis_
 
 SHORT_PROMPT_SYSTEM = "You are a helpful assistant."
 
+# When a conversation no longer fits and has to drop its oldest turns, keep at
+# most this share of the context for what remains, so the next turns have room
+# to continue on the cache instead of overflowing (and re-prefilling) every time.
+_HISTORY_SHARE = 0.5
+
 
 class Gemma4Backend(_Conversation):
     modalities = ("text", "image", "audio")
@@ -349,7 +354,7 @@ class Gemma4Backend(_Conversation):
         msgs, dropped = list(messages), 0
         while True:
             ids = self._template(msgs)
-            if len(ids) <= limit or len(msgs) <= 1:
+            if len(msgs) <= 1 or len(ids) <= (limit if not dropped else _HISTORY_SHARE * limit):
                 break
             msgs = msgs[2:] if len(msgs) > 2 else msgs[1:]
             dropped += 1
