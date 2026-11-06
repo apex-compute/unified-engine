@@ -26,6 +26,7 @@ Requests:
 from __future__ import annotations
 
 import argparse
+import collections
 import copy
 import json
 import os
@@ -582,6 +583,15 @@ class QwenBackend:
         self._fresh = {k: copy.deepcopy(getattr(ue, k)) for k in self._BUILD_STATE if hasattr(ue, k)}
         self.clock_mhz = 1000.0 / float(ue._clock_period_ns)
         self.compile_s = 0.0
+        # Programs kept between messages (_prepare): the vision encoder (one
+        # input shape, always the first stage, so always at the same address)
+        # and the decode program + launch tables + flag-clear, keyed by where
+        # they land (decode follows prefill, whose size rarely changes).
+        self._vision_cache: dict | None = None
+        self._decode_cache: dict = {}
+        # Prefill programs by (prompt length, address): a repeated length (the
+        # same question again, a new chat) skips its ~3 s compile. Bounded.
+        self._prefill_cache: "collections.OrderedDict" = collections.OrderedDict()
 
     # Per-build bookkeeping the program builders accumulate (restored per message).
     _BUILD_STATE = ("_compile_state", "_raw_stages", "_packaged_program_stages", "_resident_stages",
@@ -602,6 +612,160 @@ class QwenBackend:
         for k in _QWEN_PER_REQUEST:
             if hasattr(ue, k):
                 setattr(ue, k, None)
+        # Stage images restored from memory shadow the compiled ones; and the
+        # resident-image registry makes the DMA guard skip a write whose
+        # (address, size) it has seen -- a new program of the same size at the
+        # same address would then never reach the board. Both start empty.
+        ue._bin_stage_state.clear()
+        for regs in ue._resident_images.values():
+            regs.clear()
+
+    # -- per-message programs ------------------------------------------------
+    def _engines(self):
+        return [self.ue] + list(self.ue._worker_pool or [])
+
+    def _cursor_state(self) -> tuple:
+        return tuple(int(e._next_program_dram_addr) for e in self._engines())
+
+    def _set_cursors(self, cursors: tuple) -> None:
+        for e, addr in zip(self._engines(), cursors):
+            e._next_program_dram_addr = addr
+
+    def _stage_images(self, stage: str) -> dict:
+        """{engine index: (address, bytes)} of a stage, as use_bin_stage takes them."""
+        addr, master, workers = self.ue._program_stage_state(stage)
+        images = {0: (int(addr), bytes(master))}
+        for idx, _w, waddr, blob in workers:
+            images[int(idx)] = (int(waddr), bytes(blob))
+        return images
+
+    def _prepare(self, args, processed, context) -> None:
+        """The test script's _prepare_unified for this message, minus the work
+        that does not change between messages.
+
+        Stage order and placement are the script's (vision, audio, prefill,
+        decode, decode launch tables, flag-clear, each after the previous one's
+        ISA gap). The vision encoder is compiled once and restored afterwards,
+        the way --run_from_bin restores it (compile state, tensor layout,
+        images); decode and its launch tables are restored whenever they land
+        at the addresses they were built for. Prefill (built for this prompt's
+        length) and audio (this clip's length) are compiled. Nothing is stored
+        to programs_flat.bin: every image goes to the board from host memory.
+        """
+        mod, ue = self.mod, self.ue
+        started = time.perf_counter()
+        worker_map = {i: w for i, w in enumerate(ue._worker_pool or [], start=1)}
+        stages: list[str] = []
+        vision_restored = False
+        if args.image:
+            vc = self._vision_cache
+            vision_restored = vc is not None
+            if vc is None:
+                mod._run_vision(ue, processed, False, phase="prepare")
+                self._vision_cache = {
+                    "images": self._stage_images("vision"),
+                    "compile_state": {k: ue._compile_state[k] for k in ("vision", "vision_extra")},
+                    "tensor_state": copy.deepcopy(ue._stage_tensor_state["vision"]),
+                    "isa_used": copy.deepcopy(ue._worker_isa_used),
+                    "cursors": self._cursor_state(),
+                }
+            else:
+                ue._compile_state.update(vc["compile_state"])
+                mod._run_vision(ue, processed, False, phase="prepare_bin")   # inputs + tensors, no compile
+                ue._stage_tensor_state["vision"] = copy.deepcopy(vc["tensor_state"])
+                ue._worker_isa_used = copy.deepcopy(vc["isa_used"])
+                ue.use_bin_stage("vision", vc["images"], worker_map)
+                self._set_cursors(vc["cursors"])
+            stages.append("vision")
+        if args.audio:
+            mod._run_audio(ue, processed, phase="prepare")
+            stages.append("audio")
+        before = dict(ue._dram_addresses)
+        ue.lm_weight_init()
+        ue.lm_tensor_init()
+        layers = int(ue._lm_dims()["NL"])
+        prefill_base = self._cursor_state()
+        pkey = (len(context), prefill_base)
+        pc = self._prefill_cache.get(pkey)
+        if pc is None:
+            ue.compile_or_restore("prefill", lambda: ue.compile_prefill(len(context)), False, "prefill")
+            self._prefill_cache[pkey] = {"images": self._stage_images("prefill"),
+                                         "compile_state": ue._compile_state["prefill"],
+                                         "cursors": self._cursor_state()}
+            while len(self._prefill_cache) > 24:
+                self._prefill_cache.popitem(last=False)
+        else:
+            self._prefill_cache.move_to_end(pkey)
+            ue._compile_state["prefill"] = pc["compile_state"]
+            ue.compile_or_restore("prefill", None, True, "prefill")    # what the compile left behind
+            ue.use_bin_stage("prefill", pc["images"], worker_map)
+            self._set_cursors(pc["cursors"])
+        ue._ensure_decode_shards(ue._ensure_stage_scheduler("decode"), layers)
+        # Prefill's image size moves a little with the prompt length; give it a
+        # fixed slot on every engine so decode (built right after it) always
+        # lands at the same addresses and is built once, not per message.
+        used = [c - b for c, b in zip(self._cursor_state(), prefill_base)]
+        slot = getattr(self, "_prefill_slot", None)
+        if slot is None or any(u > s_ for u, s_ in zip(used, slot)):
+            mib = 2 ** 20
+            self._prefill_slot = slot = tuple(-(-(u + u // 4 + mib) // mib) * mib for u in used)
+        self._set_cursors(tuple(b + s_ for b, s_ in zip(prefill_base, slot)))
+        key = self._cursor_state()
+        dc = self._decode_cache.get(key)
+        if dc is None:
+            ue.compile_or_restore("decode", lambda: ue.compile_decoder(), False, "decode")
+            ue.check_master_isa()
+            ue.snapshot_stage_tensors("lm", before)
+            ue.install_decode_launch_tables()
+            ue.reserve_isa_gap("prefill", "decode")
+            self._decode_cache[key] = {
+                "images": self._stage_images("decode"),
+                "compile_state": ue._compile_state["decode"],
+                "lm_tensor_state": copy.deepcopy(ue._stage_tensor_state["lm"]),
+                "launch": dict(ue._decode_launch) if getattr(ue, "_decode_launch", None) else None,
+                "launch_raw": dict(ue._raw_stages["decode_launch"]) if "decode_launch" in ue._raw_stages else None,
+                "cursors": self._cursor_state(),
+            }
+        else:
+            ue._compile_state["decode"] = dc["compile_state"]
+            ue.compile_or_restore("decode", None, True, "decode")     # what the compile left behind
+            ue.use_bin_stage("decode", dc["images"], worker_map)
+            ue._stage_tensor_state["lm"] = copy.deepcopy(dc["lm_tensor_state"])
+            if dc["launch"] is not None:
+                ue._decode_launch = dict(dc["launch"])
+                ue._raw_stages["decode_launch"] = dict(dc["launch_raw"])
+            self._set_cursors(dc["cursors"])
+        stages += ["prefill", "decode"]
+        if "decode_launch" in ue._raw_stages:
+            stages.append("decode_launch")
+        ue.install_flag_clear_programs()
+        stages.append("flag_clear")
+        self._install(stages)
+        log(f"  [prepare] {', '.join(stages)} in {time.perf_counter() - started:.2f}s "
+            f"(vision {('cached' if vision_restored else 'built') if args.image else '-'}, "
+            f"prefill {'cached' if pc is not None else 'built'}, "
+            f"decode {'cached' if dc is not None else 'built'})")
+
+    def _install(self, stages: list[str]) -> None:
+        """install_resident_programs from host memory: every stage image to the
+        board, registered as resident (so the runners neither re-upload nor read
+        programs_flat.bin)."""
+        import hashlib
+        ue = self.ue
+        h2c = self.mod.user_dma_core.DMA_DEVICE_H2C
+        for stage in stages:
+            addr, master, workers = ue._program_stage_state(stage)
+            items = [(ue, int(addr), bytes(master))] + [(w, int(a), bytes(b)) for _i, w, a, b in workers]
+            for engine, a, blob in items:
+                if engine.dma_write(h2c, a, blob, len(blob)) != len(blob):
+                    raise IOError(f"{stage}: short program DMA at 0x{a:X}")
+                ue._resident_images.setdefault(id(engine), {}).setdefault(a, set()).add(len(blob))
+                who = "master" if engine is ue else f"worker@{id(engine) % 9973}"
+                ue._resident_hashes[(stage, who, a)] = (engine, len(blob), hashlib.sha1(blob).hexdigest())
+            if stage == "vision":
+                ue._resident_images[id(ue)][int(addr)].add(len(ue._vis_encoder_program_bytes))
+            ue._resident_stages.add(stage)
+            ue._packaged_program_stages.add(stage)
 
     def info(self) -> dict:
         ue = self.ue
@@ -663,8 +827,7 @@ class QwenBackend:
         t_req = time.perf_counter()
         emit("status", id=rid, text="program image")
         self._rewind()
-        signature = mod._request_signature(ue, args, context, tokens, processed)
-        mod._prepare_unified(ue, args, processed, context, self.cfg, tokens, signature, from_bin=False)
+        self._prepare(args, processed, context)
         compile_s = time.perf_counter() - t_req
         image_emb = audio_emb = audio_meta = None
         if image:
