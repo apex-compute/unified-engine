@@ -10,7 +10,7 @@ This folder contains the Gemma3 accelerator inference example and numeric verifi
 
 ## Layout
 
-- **gemma3_test.py** – Prefill + decode loop on accelerator (single or multi engine, `--multi-core N`).
+- **gemma3_test.py** – Prefill + decode loop on accelerator (single or multi engine, `--multi-core N`; both phases shard).
 - **../../multi_engine_shard.py** – the shared multi-engine library. The decoder's
   N-sharded matmuls, batch-split attention and master/worker rendezvous all come
   from here (`MultiEngineScheduler`). `model_multicore_layout()` selects disjoint
@@ -51,14 +51,15 @@ python models/gemma3/gemma3_test.py --local-weights
 
 ```
 
-## Decoder multi-core (`--multi-core N`)
+## Multi-core (`--multi-core N`)
 
-The decoder's quantized matmuls are N-sharded (split by output columns) across
-up to 12 engines, bounded by the core count reported by `HW_INFO`. Each engine
-holds its own column block in a private window selected for that board's memory
-controllers. Engines synchronize each sharded round through the four-phase
-`FLAG_CHECK_SET` / `FLAG_CHECK_CLEAR` handshake. Prefill uses the original full
-weights on engine 0.
+The quantized matmuls of both prefill and decode are N-sharded (split by output
+columns) across up to 12 engines, bounded by the core count reported by `HW_INFO`.
+Each engine holds its own column block in a private window selected for that
+board's memory controllers. Engines synchronize each sharded round through the
+four-phase `FLAG_CHECK_SET` / `FLAG_CHECK_CLEAR` handshake. Prefill reads the same
+private column blocks as decode, so neither phase adds a second copy of a weight;
+see [Prefill](#prefill) below.
 
 ```bash
 # P2 Kintex-7: two engines on separate DDR controllers
@@ -132,3 +133,52 @@ A column shard must be a whole multiple of `UE_VECTOR_SIZE` (64), so remainders 
 handed to the trailing engines and engine 0 -- which also runs everything unsharded --
 takes the smallest block. Ops that share an input and write disjoint outputs ride in one
 round: Q/K/V together, and gate+up together.
+
+### Prefill
+
+Prefill stays one seq_len-agnostic program: a single layer body, hardware-looped 26
+times, whose row count is a runtime register. Splitting rows across engines would bake
+the prompt length into each engine's slice, and a 16-token prompt would leave each
+engine two rows padded to a 64-row tile. Prefill therefore splits COLUMNS, like decode:
+every engine computes all rows of its own column block and writes it in place into the
+shared full-width output (a strided write-back, `gpr_out_row_stride_reg` on
+`quantized_matmat_core`). Each engine runs its own looped worker program
+(`MultiEngineScheduler.emit_rows_worker_programs`), meeting engine 0 four times per layer:
+
+| Round | Ops | Weights |
+|---|---|---|
+| QKV | Q, K, V projections (V straight into the KV cache) | Q: decode's private shards. K/V: their eight 64-column blocks dealt out from the shared image, so at 8 engines engines 0-3 take a K block and 4-7 a V block (192 columns per engine) |
+| O | attention output projection | decode's private shards |
+| gate/up | gate (GELU) + up | decode's private shards |
+| down | MLP down | decode's private shards |
+
+The RMS norms, RoPE, attention and the gate*up multiply between the rounds stay on
+engine 0. `--legacy` and `--two-pass-prefill` keep prefill on engine 0.
+
+Measured on the U50 at 333.332 MHz with `--multi-core 8` (8-engine decode in both
+columns; the "before" column is prefill on engine 0). Every prompt decoded exactly the
+same text as the single-engine-prefill run. One engine's peak is 42.7 GFLOPS, eight
+engines' is 341.3.
+
+| Prompt | Prefill tokens | Prefill HW time, before → after | Prefill GFLOPS, before → after | Speedup |
+|---|---:|---:|---:|---:|
+| `What is the capital of France?` | 16 | 574.8 → 108.4 ms | 39.5 → 209.1 | 5.30× |
+| `Solve 2x + 3 = 7. Reply with only the value of x.` | 28 | 995.0 → 180.2 ms | 39.9 → 220.2 | 5.52× |
+| sky-is-blue paragraph request | 72 | 2555.2 → 462.7 ms | 40.0 → 220.5 | 5.52× |
+| ten "Fact i" sentences + question | 169 | 6005.5 → 1095.3 ms | 39.9 → 218.7 | 5.48× |
+
+Profile of the 16-token prompt (`--profile`, summed over the 26 layers): the four sharded
+steps reach 54-84% of the 8-engine peak (gate/up 286 GFLOPS, 84%). Attention, still on
+engine 0, is now the largest single-engine step at 18.0 of 108.5 ms.
+
+| Step | ms | GFLOPS | Engines |
+|---|---:|---:|---:|
+| pre_norm | 0.50 | 3.9 | 1 |
+| qkv_proj_vcache | 5.70 | 258.5 | 8 |
+| qk_norm_rope | 2.86 | 1.5 | 1 |
+| attention | 17.95 | 6.1 | 1 |
+| o_proj_post_attn_norm_residual | 5.37 | 183.4 | 8 (norm/residual on 1) |
+| pre_ffn_norm | 0.44 | 4.3 | 1 |
+| mlp_gateup_gelu_mul | 46.26 | 286.5 | 8 (multiply on 1) |
+| mlp_down_post_ffn_norm_residual | 29.41 | 225.4 | 8 (norm/residual on 1) |
+| **Total** | **108.48** | **207.0** | |

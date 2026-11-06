@@ -84,7 +84,7 @@ def _json(path: str) -> dict:
 
 CHAT_MODELS = {
     "gemma3": {"title": "Gemma 3 1B", "dir": "gemma3", "modalities": ["text"],
-               "blurb": "Text chat. IF4 weights; decode N-sharded over the engines, prefill on engine 0."},
+               "blurb": "Text chat. IF4 weights; prefill and decode N-sharded over the engines."},
     "gemma4_e2b": {"title": "Gemma 4 E2B", "dir": "gemma4_e2b", "modalities": ["text", "image", "audio"],
                    "blurb": "Text, image and audio in. Vision encoder, audio encoder, prefill and decode all on the FPGA."},
     "gemma4_e4b": {"title": "Gemma 4 E4B", "dir": "gemma4_e4b", "modalities": ["text", "image", "audio"],

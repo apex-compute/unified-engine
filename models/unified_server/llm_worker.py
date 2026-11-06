@@ -163,8 +163,10 @@ class Gemma3Backend:
         c = self.clock_mhz
         phases = [
             _phase("Prefill", tokens=r["prefill_tokens"], hw_s=r["prefill_hw_ms"] / 1e3,
-                   wall_s=r["prefill_cpu_ms"] / 1e3, gflops=r.get("prefill_gflops"), engines=1, clock_mhz=c,
-                   note="engine 0 runs prefill"),
+                   wall_s=r["prefill_cpu_ms"] / 1e3, gflops=r.get("prefill_gflops"),
+                   engines=self.engines if ue._prefill_sharded() else 1, clock_mhz=c,
+                   note=(f"projections N-sharded over {self.engines} engines; attention on engine 0"
+                         if ue._prefill_sharded() else "engine 0 runs prefill")),
             _phase("Decode", tokens=n, hw_s=dec_hw, wall_s=dec_wall, gflops=r.get("decoder_gflops") or None,
                    engines=self.engines, clock_mhz=c, note=f"N-sharded over {self.engines} engines"),
         ]
