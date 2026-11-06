@@ -14,6 +14,7 @@
     :root { --bg:#111317; --fg:#e6e8eb; --muted:#9aa3ad; --card:#1a1d23; --line:#2d323b; --accent:#5b8cff; --err:#f87171; --bar:#26324f; --me:#1f2a44; --chip:#252a33; --code:#0d0f13; }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }   /* else a display rule (.phase: inline-flex) keeps it on screen */
   body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
   main { max-width: 1240px; margin: 0 auto; padding: 24px 20px; }
   h1 { font-size: 20px; margin: 0; }

@@ -120,9 +120,12 @@ class _Conversation:
         return [self.unfed, eot, nl]
 
     def _strip_bos(self, ids: list[int], mm: list[int] | None):
-        if ids and ids[0] == self.ue.tokenizer.bos_token_id:
-            return ids[1:], (mm[1:] if mm is not None else None)
-        return ids, mm
+        # Every leading <bos>: Gemma 3's template already starts with one and the
+        # encode adds another, which must not land in the middle of a conversation.
+        bos, n = self.ue.tokenizer.bos_token_id, 0
+        while n < len(ids) and ids[n] == bos:
+            n += 1
+        return ids[n:], (mm[n:] if mm is not None else None)
 
 
 class Gemma3Backend(_Conversation):
