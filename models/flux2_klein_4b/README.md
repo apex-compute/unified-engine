@@ -28,17 +28,17 @@ three phases and writes the PNG.
 # one-time: environment with the pinned stack + diffusers (reference / comparisons)
 python3 -m pip install -r requirements.txt diffusers accelerate safetensors
 
-# build everything and generate an image (first run downloads ~10 GB, quantizes ~3 min, compiles ~5 s)
+# build everything and generate an image (first run downloads ~10 GB, quantizes weights and compiles programs)
 python models/flux2_klein_4b/flux2_klein_4b_test.py --prompt "A photo of a red sports car on a mountain road at sunset"
 
 # quicker CI geometry (256x256, 128 text tokens) and host-decoded VAE (standard FPGA image)
 python models/flux2_klein_4b/flux2_klein_4b_test.py --height 256 --width 256 --max-seq-len 128 --vae host
 
-# compile the programs of a configuration (no board needed, ~15 s each; cached under flux2_klein_4b_bin/programs/)
+# compile the programs of a configuration (no board needed; cached under flux2_klein_4b_bin/programs/)
 python models/flux2_klein_4b/flux2_klein_4b_test.py --compile-only --height 256 --width 256 --max-seq-len 64 --engines 8
 python models/flux2_klein_4b/flux2_klein_4b_test.py --compile-only --height 512 --width 512 --max-seq-len 64 --engines 8
 
-# run one configuration from the prebuilt files (no quantization, no compile): ~38 s for 256x256, ~2 min 10 s for 512x512 on 8 engines
+# run one configuration from the prebuilt files (no quantization, no compile)
 python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --height 256 --width 256 --max-seq-len 64 --engines 8 --prompt "A photo of a red sports car on a mountain road at sunset" --out car_256.png
 python models/flux2_klein_4b/flux2_klein_4b_run_from_bin.py --height 512 --width 512 --max-seq-len 64 --engines 8 --prompt "A photo of a red sports car on a mountain road at sunset" --out car_512.png
 
@@ -54,7 +54,7 @@ python models/flux2_klein_4b/flux2_klein_4b_quant_report.py --height 512 --width
 | Flag | Default | Notes |
 |---|---|---|
 | `--height/--width` | 512 | multiples of 16; image tokens = (H/16)*(W/16) must be a multiple of 64 |
-| `--max-seq-len` | 512 | text tokens (padded, like the pipeline); multiple of 64. `auto` = the prompt's own length rounded up to 64 (a 25-token prompt -> 64), which removes a third of the DiT work at 512x512 |
+| `--max-seq-len` | 512 | text tokens (padded, like the pipeline); multiple of 64. `auto` = the prompt's own length rounded up to 64 (a 25-token prompt -> 64), reducing padding and DiT work |
 | `--steps` | 4 | distilled schedule; the dt of every step is baked into the program |
 | `--seed` | 0 | same CPU generator semantics as diffusers |
 | `--vae fpga\|host` | fpga | `fpga` needs the CONV2D queue-config image |
@@ -64,7 +64,7 @@ python models/flux2_klein_4b/flux2_klein_4b_quant_report.py --height 512 --width
 
 Programs are keyed by a signature over geometry, engine count and the
 compiler source; a different resolution, text length, step count, engine
-count or code change recompiles (seconds). Weight files are geometry-independent.
+count or code change recompiles. Weight files are geometry-independent.
 
 ## Prebuilt files
 
@@ -150,37 +150,31 @@ weights are the checkpoint's own BF16 values (`quantization.vae_precision =
 128 B per block, a 4096-block pattern limit that halves the OC chunk of the
 512- and 256-channel convs) and unquantized B operands on the 1x1 matmuls, so
 the host oracle equals the fp32 decoder (116 dB) where the IF8 one sat at
-40 dB SNR / 55.8 dB image PSNR, at the same decode time (2.28 s vs 2.27 s at
-256x256). `"if8"` keeps the per-(oc, tap, 64-block) codes for images without
-weight reuse; `vae_weights.pt` carries both forms. Convs
+40 dB SNR / 55.8 dB image PSNR. `"if8"` keeps the per-(oc, tap, 64-block)
+codes for images without weight reuse; `vae_weights.pt` carries both forms. Convs
 keep the layer driver's tile grid, planned with the largest URAM_A window
-region that still leaves every engine a tile (2.4x fewer launches than the
-default split); each tile is one strided DRAM->URAM read of its window
-straight from the padded map, then one CONV2D per OC chunk with weight reuse
+region that still leaves every engine a tile; each tile is one strided
+DRAM->URAM read of its window straight from the padded map, then one CONV2D
+per OC chunk with weight reuse
 (the hardware loads the chunk's [oc][tap] IF8 pattern from the constant image
 into URAM_B per launch and replays it for every tile pixel; needs the RTL with
 UE_CONV_CTRL[30], andromeda 927fd8d or later), and strided writes of the tile
-rows into the output map (the tile grid split evenly over the engines). On
-that image the big convs run at ~94% of peak and the 256x256 decode takes
-2.3 s. For
+rows into the output map (the tile grid split evenly over the engines). For
 images without weight reuse, whose walker re-streams the whole weight block per
-output pixel (one byte per MAC, capped at half rate by the 32 B/cycle AXI:
-40-47% of peak, 5.0 s), `vae.conv3x3_mode = "matmul"` in the config runs the
-3x3 convs with C, OC multiples of 64 as nine accumulated quantized-B matmuls
+output pixel (one byte per MAC, capped at half rate by the 32 B/cycle AXI),
+`vae.conv3x3_mode = "matmul"` in the config runs the 3x3 convs with C, OC
+multiples of 64 as nine accumulated quantized-B matmuls
 instead: for tap (ky, kx) the A operand of output rows y0..y0+R-1 is the R*Wp
 consecutive input pixels starting at padded pixel (y0+ky, kx), so there is no
 im2col and the matmul keeps its B tile across 64 A rows; the partials
 accumulate in place through the full-matrix C operand and the rows' border
-pixels are re-zeroed at the end (70-80% of peak). The switch is part of the
-program signature.
+pixels are re-zeroed at the end. The switch is part of the program signature.
 1x1 convs with C, OC multiples of 64 are one quantized-B matmul per image row
 (the map is already a row-major [pixels, C] matrix). GroupNorm accumulates
 lane-wise pixel sums into slotted accumulators; each engine transposes its own
 flush blocks with an identity matmul and sums them with a ones matmul on the
-bf20 ladder, the engines' partial rows are added after a barrier (one engine
-transposing every block cost ~13 ms per pass, 30-40 ms per norm, a third of the
-decode at the small resolutions; sharded it is ~10 ms), a group-average matmul
-pools per group, the same for the centred squares, rsqrt by Newton iteration,
+bf20 ladder, the engines' partial rows are added after a barrier, a group-average
+matmul pools per group, the same for the centred squares, rsqrt by Newton iteration,
 and the apply pass does `x*A_c + B_c` and, for the 29 norms a SiLU follows, the
 SiLU right there in URAM (max(y, 0) by the MAXPOOL walker over a two-row map of
 the chunk half and a zero block, then the driver's exp(-|y|) / polynomial form
@@ -202,7 +196,7 @@ IF8 for the VAE convolutions; BF16 activations throughout (BF19 internally).
 
 **DRAM (U50, everything below the 4 GiB DMA limit).** Params arena 2.5 GiB at
 0x0 holds the DiT image (2.35 GB) or the TE image (1.45 GB) — the two
-time-share it and are DMA'd in at their phase (~2 s per run). Tensors from
+time-share it and are DMA'd in at their phase. Tensors from
 0xA0000000 (~280 MB at 512x512, ~800 MB at 1024x1024), programs from
 0xE8000000 (TE 10.7 MB + DiT 32.6 MB, geometry-independent thanks to the
 dynamic-M cores).
@@ -214,9 +208,9 @@ dynamic-M cores).
 | Reference vs diffusers, fp32 single forward (DiT, VAE) | bit-identical (`max|diff| = 0`) |
 | Reference vs diffusers, bf16 pipeline 256x256 | prompt embeds exact; step-0 latents 55 dB; final latents 24 dB (bf16 kernel-order noise amplified by the front-loaded schedule); image PSNR 35 dB |
 | Exported bins vs shape-only layout plan | match (asserted at load) |
-| Offline compile 256x256/128 and 512x512/512 | TE 10.7 MB (0.7 / 2.9 TFLOP), DiT 32 MB (9.6 / 40.7 TFLOP) |
+| Offline compile 256x256/128 and 512x512/512 | TE 10.7 MB, DiT 32 MB |
 | BF16 vs IF4 host reference, 512x512/512 tokens, seed 0 | Qwen3 IF4 prompt embeds 19 dB; DiT step-0 velocity 37 dB; final latents 2 dB / image PSNR 16 dB (18 dB with BF16 text) — the images are visually equivalent (same scene, car, lighting); the pixel-level divergence is the 4-step schedule amplifying small per-step differences, exactly as BF16-vs-diffusers already drifts to 24 dB. Per-step numbers in `flux2_klein_4b_bin/quant_report_*.json` (`flux2_klein_4b_quant_report.py`) |
-| On the board (Alveo U50 image: queue mode, 256-bit AXI, 8 GiB, 8 engines, 300 MHz; one engine used), 256x256 / 128 text tokens, seed 0 | **text encoder on FPGA**: 20 s, 35.1 GFLOPS, prompt embeds 40.8 dB vs the IF4 host oracle. **DiT on FPGA**: 1 step 68 s / 4 steps 270 s at 35.6 GFLOPS (93% of the 38.4 GFLOPS peak); step-0 velocity (one full 25-block forward) 31.7-33.1 dB, end-to-end latents 9.4 dB after 4 steps (schedule amplification, see below), image PSNR 21 dB and visually the same sample. **VAE decoder on FPGA**: 38 s, image PSNR 41.6 dB vs the IF8 host oracle on the 1-step latents. Primitive probes (`flux2_klein_4b_probe.py`): LN-mod 48 dB, RMSNorm 50 dB, RoPE 54-57 dB, SiLU 56 dB, eltwise 55 dB, copies/scatters exact. |
+| On the board (Alveo U50 image: queue mode, 256-bit AXI, 8 GiB, 8 engines, 300 MHz; one engine used), 256x256 / 128 text tokens, seed 0 | **text encoder on FPGA**: prompt embeds 40.8 dB vs the IF4 host oracle. **DiT on FPGA**: step-0 velocity (one full 25-block forward) 31.7-33.1 dB, end-to-end latents 9.4 dB after 4 steps (schedule amplification, see below), image PSNR 21 dB and visually the same sample. **VAE decoder on FPGA**: image PSNR 41.6 dB vs the IF8 host oracle on the 1-step latents. Primitive probes (`flux2_klein_4b_probe.py`): LN-mod 48 dB, RMSNorm 50 dB, RoPE 54-57 dB, SiLU 56 dB, eltwise 55 dB, copies/scatters exact. |
 
 The FPGA output is scored against the host reference run with the *same*
 quantized weights (`quantized_reference`), so the score isolates engine
@@ -226,53 +220,3 @@ meaningful accuracy number for bring-up is the **step-0 latent SNR** (`step_late
 (a single DiT forward on identical inputs; the IF4 weights alone score about
 37 dB there); end-to-end latent SNR and image PSNR mainly confirm the run
 is finite and lands on the same image, not bit-level agreement.
-
-## Cost and expectations
-
-Measured on the U50, 4 steps, all phases on the FPGA, from the prebuilt files:
-
-| Image clock | Configuration | Text encoder | DiT | VAE | Total on board |
-|---|---|---:|---:|---:|---:|
-| 367 MHz (andromeda run 41729405935) | 256x256, 64 tokens, 8 engines | 1.1 s | 23.4 s (341 GFLOPS) | 8.9 s | **35.8 s** |
-| 367 MHz | 512x512, 64 tokens, 8 engines | 1.1 s | 82.5 s (342 GFLOPS) | 31.7 s | **117.7 s** |
-| 333 MHz (andromeda run 41691268697, flashed), one-shot VAE | 256x256, 64 tokens, 8 engines | 1.2 s | 25.7 s (310 GFLOPS) | 5.0 s | **35.3 s** |
-| 333 MHz (flashed), one-shot VAE | 512x512, 64 tokens, 8 engines | 1.2 s | 90.7 s (311 GFLOPS) | 17.0 s | **116.4 s** |
-| 333 MHz (flashed), per-layer VAE programs | 256x256, 64 tokens, 8 engines | 1.2 s | 25.7 s | 7.3 s | 38.4 s |
-| 333 MHz (flashed), per-layer VAE programs | 512x512, 64 tokens, 8 engines | 1.2 s | 90.7 s | 27.8 s | 122.2 s |
-| 333 MHz (flashed), host-orchestrated VAE | 256x256, 64 tokens, 8 engines | 1.2 s | 25.7 s | 9.2 s | 38.5 s |
-| 333 MHz (flashed), host-orchestrated VAE | 512x512, 64 tokens, 8 engines | 1.2 s | 90.7 s | 33.1 s | 127.4 s |
-
-The one-shot VAE decoder scores 52.2 dB (256x256) / 55.5 dB (512x512)
-image PSNR against the IF8 host oracle on the same latents (`vae_psnr_db`),
-runs at 131 / 150 GFLOPS, and a run captures no instructions and moves
-nothing between host and board during any phase (the 367 MHz rows above were
-taken with the host-orchestrated VAE). Host-side, torch's intra-op pool defaults
-to one thread per CPU for the per-layer packing; cap it with
-`OMP_NUM_THREADS` if the host should stay quieter.
-
-Earlier measurements on the 300 MHz image (same accuracy):
-
-| Configuration | Text encoder | DiT | VAE | Total on board | vs IF4 oracle |
-|---|---:|---:|---:|---:|---|
-| 256x256, 64 tokens, 8 engines, sharded VAE | 1.3 s | 28.6 s | 9.7 s | **~40 s** | step-0 latents 45.7 dB, image PSNR 28 dB |
-| 512x512, 64 tokens, 8 engines, sharded VAE | 1.3 s | 100.8 s | 34.8 s | ~2 min 20 s | step-0 latents 46.9 dB, image PSNR 21 dB |
-| 512x512, 512 tokens, 8 engines | 10.5 s | 145 s | 151 s (engine 0 only) | ~5 min | step-0 latents 46.5 dB, image PSNR 26 dB |
-| 256x256, 128 tokens, 8 engines | 2.6 s | 34.4 s | 38 s (engine 0 only) | ~1.3 min | step-0 latents 41.5 dB, image PSNR 21.5 dB |
-| 256x256, 128 tokens, 1 engine | 20.1 s | 270 s | 38 s | ~5.5 min | step-0 latents 42.9 dB, image PSNR 21 dB |
-
-The transformer phases sustain 91% of the 8-engine peak (280 of 307 GFLOPS
-at 300 MHz, 341 of 375 GFLOPS at 367 MHz), so the 4-step DiT's floor at
-512x512 is 75 s with 64 text tokens on the 367 MHz image; accuracy is
-unchanged by sharding.
-`--max-seq-len auto` pads the prompt only to the next multiple of 64 instead
-of 512, the single biggest lever left at 512x512. The VAE decoder is one
-program with no host traffic while it runs.
-
-## Known limitations / follow-ups
-
-* Bring-up order that worked: `--steps 1 --text-encoder host --vae host` (one DiT forward, scored as `velocity0_snr_db`), then the text encoder, then `--vae fpga`. `flux2_klein_4b_probe.py` checks every primitive in isolation on the model's own buffers.
-* The VAE phase needs the conv bitstream; `--vae host` is the fallback on the standard image.
-* The DiT -> VAE hop (unpack / unpatchify of the latents) is still a host step between the two phases; an on-device scatter would make the three phases one launch.
-* `flux2_klein_4b_vae_probe.py --sweep ...` scores any prefix of the decoder graph on the board against the host intermediates; SNRs fall along the chain as bf16 arithmetic (GroupNorm re-scales the input's error by |mean|/sigma, SiLU lowers signal power), the end-to-end check is the image PSNR against the IF8 oracle.
-* Weights are re-DMA'd every run (phased layout) rather than resident on an 8 GiB board.
-* GELU is not used by this model (SwiGLU everywhere), so the engine's sigmoid-approximation GELU is not a factor.
