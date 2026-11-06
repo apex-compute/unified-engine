@@ -4,7 +4,7 @@ One web page for the models that run on the board, picked from a dropdown:
 
 | Model | Input | Runs on the FPGA |
 |---|---|---|
-| Gemma 3 1B | text | prefill (engine 0) + decode (N-sharded) |
+| Gemma 3 1B | text | prefill + decode (both N-sharded) |
 | Gemma 4 E2B | text, image, audio | vision encoder, audio encoder, prefill, decode |
 | Gemma 4 E4B | text, image, audio | same code as E2B with E4B's geometry |
 | Qwen2.5-Omni 7B | text, image, audio | vision encoder, audio encoder, Thinker prefill + decode (all eight engines) |

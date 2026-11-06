@@ -46,7 +46,9 @@ python models/gemma3/gemma3_test.py --dev xdma0 --multi-core 8 --profile
 | Weight DRAM (quantized, on FPGA) (MB) | 507.8 | same | |
 | Correctness | coherent (solves x = 2) | coherent (solves x = 2) | |
 
-† **Prefill is not sharded.** `--multi-core 8` shards the decoder only, so prefill
+† **Measured before prefill was sharded.** Prefill now also shards across the engines
+(5.3-5.5× at 8 engines on the U50; see the README's multi-core Prefill section). At the
+time of these runs `--multi-core 8` sharded the decoder only, so prefill
 runs on core 0 in both configurations and the two times are within 0.02% of each
 other. Its 8-core `% peak` of 11.2% is that same single-engine work scored against
 the eight-engine peak — it is not a regression, and the honest figure is the 89.9%
