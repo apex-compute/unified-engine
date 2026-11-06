@@ -348,9 +348,15 @@ class Gemma4Backend(_Conversation):
                 "weights_dram_bytes": int(ue.get_params_dram_usage()),
                 "load_s": self.load_s, "compile_s": self.compile_s, "modalities": list(self.modalities)}
 
+    # Context kept free for the answer when the history is fitted. The answer
+    # itself runs up to max_new_tokens or the end of the context, whichever is
+    # first: reserving the whole max_new_tokens (8192 by default) would leave
+    # no room for any history.
+    MIN_ROOM = 64
+
     def _encode_text(self, messages: list[dict], max_new: int) -> tuple[list[int], int]:
         tok, ue = self.ue.tokenizer, self.ue
-        limit = int(ue.MAX_CONTEXT_SIZE) - max_new
+        limit = int(ue.MAX_CONTEXT_SIZE) - self.MIN_ROOM
         msgs, dropped = list(messages), 0
         while True:
             ids = self._template(msgs)
@@ -397,7 +403,7 @@ class Gemma4Backend(_Conversation):
         if cont:
             turn, mm_turn = self._strip_bos(list(ue.prefill_seq), getattr(ue, "_mm_types", None))
             delta = self._joiner() + turn
-            if self.cached + len(delta) + max_new <= int(ue.MAX_CONTEXT_SIZE):
+            if self.cached + len(delta) + self.MIN_ROOM <= int(ue.MAX_CONTEXT_SIZE):
                 start = self.cached
                 ue.prefill_seq = tuple([0] * start + delta)   # history rows are not re-read
                 if mm_turn is not None:
