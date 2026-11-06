@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resident chat runner for the unified web server: one Gemma model on the board.
+"""Resident chat runner for the unified web server: one chat model on the board.
 
 Loads one model once (device, weights to DRAM, program image), then answers
 chat requests read as JSON lines on stdin until EOF. Everything the model code
@@ -15,15 +15,18 @@ protocol goes to the original stdout as JSON lines:
 Requests:
 
     {"id": "...", "messages": [{"role": "user"|"assistant", "content": "..."}, ...],
-     "image": "/path.jpg" | null, "audio": "/path.wav" | null, "max_new_tokens": 256}
+     "image": "/path.jpg" | null, "audio": "/path.wav" | null, "max_new_tokens": 256,
+     "conversation": "<page chat id>"}
     {"cmd": "stop"}      stops the generation in flight after the current token
 
     python models/unified_server/llm_worker.py --model gemma3 --engines 8 --dev xdma0
     python models/unified_server/llm_worker.py --model gemma4_e2b --engines 8
+    python models/unified_server/llm_worker.py --model qwen2.5_omni_7b --engines 8
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import queue
@@ -482,10 +485,245 @@ class Gemma4Backend(_Conversation):
 
 
 # ---------------------------------------------------------------------------
+# Qwen2.5-Omni 7B (text, image, audio)
+# ---------------------------------------------------------------------------
+
+_QWEN_PER_REQUEST = ("_vis_latency_us", "_vis_wall_s", "_vis_total_flops", "_vis_gflops", "_vis_num_tokens",
+                     "_audio_latency_us", "_audio_wall_s", "_audio_total_flops", "_audio_gflops",
+                     "_audio_num_tokens", "_latency_prefill_us", "_prefill_wall_s", "_prefill_flops",
+                     "_decode_step_us", "_decode_total_us", "_decode_wall_s", "_decode_n")
+
+
+class QwenBackend:
+    """Qwen2.5-Omni 7B Thinker, resident: weights go to the board once.
+
+    The test script's own setup (flat DRAM plan, engine, artifacts) runs once
+    with every stage the server can use ({lm, vision, audio}), so the plan --
+    and with it every weight pool -- never changes, and the three weight sets
+    load once. Each message then builds its programs for its own prompt shape
+    (_prepare_unified, compile only; the weight inits are no-ops), after the
+    engines' program cursors are rewound to where the first build started, and
+    runs the encoders, prefill and decode as the script's main() does.
+
+    History: every message re-prefills the whole conversation (the chat
+    template over the text turns, the current turn's image / audio encoded);
+    Qwen's prefill has no offset and its K/V cache is re-carved per message.
+    """
+    title = "Qwen2.5-Omni 7B"
+    modalities = ("text", "image", "audio")
+    MIN_ROOM = 64
+
+    def __init__(self, engines: int, dev: str):
+        import importlib.util
+        path = os.path.join(MODELS, "qwen2.5_omni_7b", "qwen2.5_omni_7b_test.py")
+        spec = importlib.util.spec_from_file_location("qwen25_omni_test", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["qwen25_omni_test"] = mod
+        spec.loader.exec_module(mod)
+        self.mod, self.engines = mod, engines
+        parser = mod.build_arg_parser()
+        self.base_args = parser.parse_args(["--multi-core", str(engines), "--dev", dev, "--no-summary"])
+        # One process owns the board (and params.bin / programs.bin) for its lifetime.
+        self._lock = mod._exclusive_run_lock()
+        self._lock.__enter__()
+        t0 = time.perf_counter()
+        kw = mod.resolve_engine_config(parser, self.base_args)
+        if not mod.dram_interleaved():
+            raise RuntimeError("the resident Qwen runner needs the flat DRAM layout (U50)")
+        a = self.base_args
+        self.cfg = cfg = mod.apply_vision_resolution(
+            mod.Qwen25OmniUnifiedEngine.load_config(script_dir=mod.SCRIPT_DIR), a.vision_res)
+        params_path = mod._weight_mod.ensure_params_bin(mod.SCRIPT_DIR)
+        self.params_bytes = _size(str(params_path))
+        self.processor_dir = mod._weight_mod.ensure_processor_bundle(mod.SCRIPT_DIR, verbose=False)
+        from transformers import AutoProcessor
+        self.processor = AutoProcessor.from_pretrained(self.processor_dir, trust_remote_code=True,
+                                                       local_files_only=True)
+        self.plan = mod._layout_mod.plan_flat(
+            {"lm", "vision", "audio"}, a.vision_res, a.max_context,
+            device_bytes=mod.user_dma_core.AVAILABLE_DRAM_SIZE_GB * 2**30)
+        for line in self.plan.lines():
+            log(line)
+        fpga_build = mod.reset_selected_engines()
+        ue = mod.Qwen25OmniUnifiedEngine(script_dir=mod.SCRIPT_DIR, fpga_build=fpga_build,
+                                         vision_res=a.vision_res, fpga_talker=False,
+                                         layout="flat", flat_plan=self.plan, **kw)
+        ue.speak_as = None
+        ue.configure_runtime_artifacts(params_path, self.processor_dir)
+        ue.tokenizer = self.processor.tokenizer
+        ue.processor = self.processor
+        log(ue.describe_dram_map())
+        # Weights, once: the flat plan gives every stage its own pool.
+        ue.vision_weight_init()
+        ue.audio_weight_init()
+        ue.lm_weight_init()
+        layers = int(ue._lm_dims()["NL"])
+        ue._ensure_decode_shards(ue._ensure_stage_scheduler("decode"), layers)
+        self.load_s = time.perf_counter() - t0
+        self.ue = ue
+        # Program cursors of every engine before any program is built: each
+        # message's build starts here again (programs are rebuilt per prompt
+        # shape, weights stay where they are).
+        self._cursors = [(e, int(e._next_program_dram_addr)) for e in [ue] + list(ue._worker_pool or [])]
+        self._fresh = {k: copy.deepcopy(getattr(ue, k)) for k in self._BUILD_STATE if hasattr(ue, k)}
+        self.clock_mhz = 1000.0 / float(ue._clock_period_ns)
+        self.compile_s = 0.0
+
+    # Per-build bookkeeping the program builders accumulate (restored per message).
+    _BUILD_STATE = ("_compile_state", "_raw_stages", "_packaged_program_stages", "_resident_stages",
+                    "_resident_hashes", "_executed_program_stages", "_stage_tensor_state",
+                    "_worker_isa_used")
+
+    def _rewind(self) -> None:
+        ue = self.ue
+        for e, addr in self._cursors:
+            e._next_program_dram_addr = addr
+        for k, v in self._fresh.items():
+            setattr(ue, k, copy.deepcopy(v))
+        # The program bundle merges a process's later stores into the generation it
+        # started; each message's build is a new generation of its own.
+        bundle_mod = sys.modules.get(type(ue._program_bundle).__module__)
+        if bundle_mod is not None:
+            bundle_mod._STARTED_BUNDLES.pop(ue._program_bundle._run_key, None)
+        for k in _QWEN_PER_REQUEST:
+            if hasattr(ue, k):
+                setattr(ue, k, None)
+
+    def info(self) -> dict:
+        ue = self.ue
+        return {"model": "qwen2.5_omni_7b", "title": self.title, "engines": self.engines,
+                "clock_mhz": self.clock_mhz, "peak_gflops": _peak(self.clock_mhz, self.engines),
+                "hw_info": self.mod.user_dma_core.hardware_info_summary(),
+                "max_context": int(self.plan.max_context), "max_prompt_tokens": int(self.plan.max_context) - self.MIN_ROOM,
+                "weights_dram_bytes": int(self.params_bytes),
+                "load_s": self.load_s, "compile_s": self.compile_s, "modalities": list(self.modalities)}
+
+    def _inputs(self, messages: list[dict], image: str | None, audio: str | None):
+        """The processor over the conversation: earlier turns as text, the last
+        user turn with its media ([audio] [image] text, as the test script)."""
+        from PIL import Image
+        mod, cfg, proc = self.mod, self.cfg, self.processor
+        images = audio_in = None
+        last = []
+        if audio:
+            audio_in = [mod._load_audio(audio, int(cfg["audio"]["sample_rate"]))]
+            last.append({"type": "audio", "audio": audio})
+        if image:
+            size = int(cfg["vision"]["image_size"])
+            with Image.open(image) as src:
+                images = [src.convert("RGB").resize((size, size), Image.Resampling.BILINEAR)]
+            last.append({"type": "image", "image": image})
+        last.append({"type": "text", "text": messages[-1]["content"]})
+        history = [{"role": m["role"], "content": [{"type": "text", "text": m["content"]}]}
+                   for m in messages[:-1]]
+        limit = int(self.plan.max_context) - self.MIN_ROOM
+        dropped = 0
+        while True:
+            msgs = history + [{"role": "user", "content": last}]
+            text = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            kw = {"text": text, "padding": True, "return_tensors": "pt"}
+            if images is not None:
+                kw["images"] = images
+            if audio_in is not None:
+                kw["audio"] = audio_in
+            processed = proc(**kw)
+            tokens = [int(v) for v in processed["input_ids"][0].tolist()]
+            if len(tokens) <= limit or not history:
+                break
+            history = history[2:]
+            dropped += 1
+        if len(tokens) > limit:
+            raise ValueError(f"the prompt is {len(tokens)} tokens; the context holds {self.plan.max_context}")
+        return processed, tokens, dropped
+
+    def generate(self, req: dict, on_token) -> dict:
+        mod, ue, rid = self.mod, self.ue, req["id"]
+        image, audio = req.get("image"), req.get("audio")
+        processed, tokens, dropped = self._inputs(req["messages"], image, audio)
+        context, seed = tokens[:-1], tokens[-1]
+        room = int(self.plan.max_context) - len(tokens)
+        args = copy.copy(self.base_args)
+        args.image, args.audio = image, audio
+        args.prompt = req["messages"][-1]["content"]
+        args.max_new_tokens = max(1, min(int(req.get("max_new_tokens") or 256), room))
+        t_req = time.perf_counter()
+        emit("status", id=rid, text="program image")
+        self._rewind()
+        signature = mod._request_signature(ue, args, context, tokens, processed)
+        mod._prepare_unified(ue, args, processed, context, self.cfg, tokens, signature, from_bin=False)
+        compile_s = time.perf_counter() - t_req
+        image_emb = audio_emb = audio_meta = None
+        if image:
+            emit("status", id=rid, text="vision encoder")
+            image_emb = mod._run_vision(ue, processed, phase="run")
+        if audio:
+            emit("status", id=rid, text="audio encoder")
+            audio_emb, audio_meta = mod._run_audio(ue, processed, phase="run")
+        positions, rope_delta = mod.build_multimodal_positions(
+            tokens,
+            image_grid_thw=processed.get("image_grid_thw") if image else None,
+            audio_token_lengths=audio_meta["output_lengths"] if audio_meta is not None else None,
+            image_token_id=int(self.cfg["tokens"]["image_token_id"]),
+            audio_token_id=int(self.cfg["tokens"]["audio_token_id"]),
+            video_token_id=int(self.cfg["tokens"]["video_token_id"]),
+            spatial_merge_size=int(self.cfg["vision"]["spatial_merge_size"]),
+            position_ids_per_second=int(self.cfg["vision"]["tokens_per_second"]))
+        ue._rope_offset = int(rope_delta)
+        emit("status", id=rid, text="prefill")
+        ue.enter_stage_tensors("lm", ue.lm_tensor_init)
+        ue.run_prefill(context, image_embeddings=image_emb, audio_embeddings=audio_emb,
+                       positions=positions[: len(context)])
+        ue.activate_decode_shared_weights()
+        emit("status", id=rid, text="decode")
+        ue.on_token = on_token
+        try:
+            _, text = ue.run_decoder(seed, max_new_tokens=args.max_new_tokens)
+        finally:
+            ue.on_token = None
+        wall = time.perf_counter() - t_req
+        rows = ue.stage_metrics(args)
+        e, c = self.engines, self.clock_mhz
+        phases, by = [], {}
+        steps = list(getattr(ue, "_decode_step_us", ()) or ())
+        for row in rows:
+            hw = (row.get("us") or 0.0) / 1e6
+            detail = str(row.get("detail", ""))
+            if row["stage"] == "Prefill":
+                tokens_n = len(context)
+            elif row["stage"] == "Decode":
+                tokens_n = len(steps)
+            else:
+                digits = [int(t) for t in detail.replace("->", " ").split() if t.isdigit()]
+                tokens_n = digits[-1] if digits else None
+            p = _phase(row["stage"], tokens=tokens_n, hw_s=hw or None, wall_s=row.get("wall"),
+                       flops=row.get("model_flops"), gflops=row.get("model_gflops"), engines=e, clock_mhz=c,
+                       note=(f"{detail}; issued work at {row.get('speedup', 0):.1f}x one engine's peak"
+                             if row.get("speedup") else detail))
+            phases.append(p)
+            by[row["stage"]] = p
+        ttft = [by[s] for s in ("Vision encoder", "Audio encoder", "Prefill") if s in by]
+        dec = by.get("Decode")
+        dec_wall = float(getattr(ue, "_decode_wall_s", 0.0) or 0.0)
+        return {
+            "prompt_tokens": len(tokens), "generated_tokens": int(getattr(ue, "_decode_n", len(steps)) or 0),
+            "history_dropped": dropped, "context_tokens": len(tokens) + len(steps),
+            "max_context": int(self.plan.max_context),
+            "phases": phases,
+            "ttft_hw_s": sum(p["hw_s"] or 0 for p in ttft) or None,
+            "ttft_wall_s": sum(p["wall_s"] or 0 for p in ttft) or None,
+            "decode_first_tok_s": (1e6 / steps[0]) if steps else None,
+            "decode_hw_tok_s": dec["tok_s"] if dec else None,
+            "decode_wall_tok_s": (len(steps) / dec_wall) if dec_wall else None,
+            "compile_s": compile_s, "compile_reused": False, "wall_s": wall,
+            "text": text or "",
+        }
+
+
+# ---------------------------------------------------------------------------
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--model", required=True, choices=("gemma3", "gemma4_e2b", "gemma4_e4b"))
+    ap.add_argument("--model", required=True, choices=("gemma3", "gemma4_e2b", "gemma4_e4b", "qwen2.5_omni_7b"))
     ap.add_argument("--engines", type=int, default=8)
     ap.add_argument("--dev", default="xdma0")
     args = ap.parse_args(argv)
@@ -494,6 +732,8 @@ def main(argv=None) -> int:
     try:
         if args.model == "gemma3":
             backend = Gemma3Backend(args.engines, args.dev)
+        elif args.model == "qwen2.5_omni_7b":
+            backend = QwenBackend(args.engines, args.dev)
         else:
             backend = Gemma4Backend(args.model, args.engines, args.dev)
     except BaseException as e:  # noqa: BLE001 - report start-up failures to the server

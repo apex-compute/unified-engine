@@ -40,12 +40,13 @@ order, and at most one process holds the device:
   fetched once from the CDN and served from `/vendor/`, so the browser needs
   no internet access; without them answers show as plain text). Stop ends the
   generation after the current token.
-- **Qwen2.5-Omni 7B** runs one `qwen_runner.py` process per message: that
-  is `qwen2.5_omni_7b_test.py`'s own `main()` with `--run_from_bin`, plus the
-  token stream, Stop and its per-stage metrics on the server's channel. Its
-  programs depend on the prompt's shape (token count, media), so it is set up
-  per message (a repeated shape reuses `programs_flat.bin`) and messages carry
-  no history. Speech output (`--speak`) is not offered.
+- **Qwen2.5-Omni 7B** runs in the same resident `llm_worker.py`: the test
+  script's setup (flat DRAM plan for {LM, vision, audio}, engine, params.bin)
+  runs once and its weights stay on the board. Its programs depend on the
+  prompt's shape (token count, media), so each message rebuilds them on the
+  host (`_prepare_unified`, compile only, ~5 s for text, ~8 s with audio,
+  ~14 s with an image; reported separately from the TTFT) at the same program
+  addresses. Speech output (`--speak`) is not offered.
 - **FLUX.2 klein** runs exactly as in `flux2_klein_4b_server.py` (its module is
   imported): one `flux2_klein_4b_run_from_bin.py` process per image, or its
   resident `--serve` runner with "keep the board loaded".
@@ -64,7 +65,10 @@ Conversations:
   dropped). Selecting another model or FLUX unloads the chat model; coming
   back rebuilds the context from the page's text history (earlier images and
   audio are not re-encoded).
-- Qwen2.5-Omni runs each message on its own (no history yet).
+- Qwen2.5-Omni keeps the conversation by re-prefilling it each message (the
+  text of the earlier turns plus this turn's image / audio, oldest turns
+  dropped past the 8192-token context): its prefill has no position offset
+  and the encoders share the K/V cache's DRAM, so the cache is not reused.
 - Audio may be uploaded (WAV / FLAC / OGG, anything else through `ffmpeg` if
   installed) or recorded in the browser (sent as 16 kHz mono WAV; the browser
   allows the microphone on localhost or https only).

@@ -5,6 +5,7 @@ One page, one model dropdown:
 
 * Gemma 3 1B            -- text chat
 * Gemma 4 E2B / E4B     -- chat with text, an image and/or an audio clip
+* Qwen2.5-Omni 7B       -- chat with text, an image and/or an audio clip
 * FLUX.2 [klein] 4B     -- text-to-image (the flux2_klein_4b_server.py flow)
 
 Standard library only. The board is one resource, so every request goes
@@ -22,7 +23,7 @@ counter, the host wall time, tokens/s, GFLOPS and the share of the raw peak
     python models/unified_server/unified_server.py --port 8080
     python models/unified_server/unified_server.py --host 0.0.0.0 --port 8080 --engines 8
 
-API: GET /api/models, POST /api/chat {model, messages, image?, audio?, max_new_tokens},
+API: GET /api/models, POST /api/chat {model, messages, conversation?, image?, audio?, max_new_tokens},
 POST /api/generate (FLUX, as flux2_klein_4b_server.py), GET /api/jobs/<id>,
 POST /api/jobs/<id>/stop, GET /api/jobs/<id>/image.png, GET /api/jobs, POST /api/release.
 """
@@ -49,7 +50,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.dirname(HERE)
 ROOT = os.path.dirname(MODELS_DIR)
 WORKER = os.path.join(HERE, "llm_worker.py")
-QWEN_RUNNER = os.path.join(HERE, "qwen_runner.py")
 OUT_DIR = os.path.join(HERE, "server_out")             # uploads, FLUX images (git-ignored)
 UPLOAD_DIR = os.path.join(OUT_DIR, "uploads")
 MAX_PROMPT_CHARS = 8000
@@ -91,9 +91,9 @@ CHAT_MODELS = {
     "gemma4_e4b": {"title": "Gemma 4 E4B", "dir": "gemma4_e4b", "modalities": ["text", "image", "audio"],
                    "blurb": "Gemma 4 E2B's code with E4B's geometry (2560 wide, 42 layers, 2 KV heads)."},
     "qwen2.5_omni_7b": {"title": "Qwen2.5-Omni 7B", "dir": "qwen2.5_omni_7b",
-                        "modalities": ["text", "image", "audio"], "runner": "oneshot",
+                        "modalities": ["text", "image", "audio"],
                         "blurb": "Text, image and audio in. Vision encoder, audio encoder and the 7B Thinker "
-                                 "(prefill + decode) on all eight engines. Set up per message."},
+                                 "(prefill + decode) on all eight engines."},
 }
 
 
@@ -121,9 +121,11 @@ def chat_static(model: str) -> dict:
         if not out["ready"]:
             out["notes"].append("params.bin is not generated yet: the first message converts the checkpoint "
                                 "(downloading ~20 GB if needed).")
-        out["notes"].append("Each message runs on its own (no conversation history): the programs depend on "
-                            "the prompt's shape, so the model is set up per message and a repeated shape "
-                            "reuses programs.bin. Context up to 8192 tokens on the flat layout.")
+        out["notes"].append("Weights load once and stay on the board until another model is picked. The "
+                            "programs depend on the prompt's shape, so each message rebuilds them on the host "
+                            "(a few seconds, reported separately from the TTFT). The conversation is re-prefilled "
+                            "each message (the text of earlier turns plus this turn's image / audio); context "
+                            "8192 tokens on the flat layout.")
         return out
     if model == "gemma3":
         out["layers"] = out["layers"] or len(cfg.get("layers", []) or []) or 26
@@ -351,8 +353,6 @@ class Board(threading.Thread):
         return w
 
     def _run_chat(self, job: ChatJob) -> None:
-        if CHAT_MODELS[job.model].get("runner") == "oneshot":
-            return self._run_qwen(job)
         w = self._ensure_llm(job)
         if job.stop_requested:
             raise RuntimeError("stopped")
@@ -388,14 +388,6 @@ class Board(threading.Thread):
         job.stop_requested = True
         if job.state == "queued":
             return True
-        proc = getattr(job, "proc", None)
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.stdin.write("stop\n")
-                proc.stdin.flush()
-            except (OSError, ValueError):
-                pass
-            return True
         w = self.llm
         if job.state == "running" and w is not None and w.alive():
             try:
@@ -403,59 +395,6 @@ class Board(threading.Thread):
             except OSError:
                 pass
         return True
-
-    # -- Qwen2.5-Omni: one qwen_runner.py process per message ---------------
-    QWEN_PHASES = (("--- Unified prepare", "preparing weights and programs"), ("[Vision", "vision encoder"),
-                   ("[Audio", "audio encoder"), ("--- Thinker LM stage", "prefill"), ("--- Decode run", "decode"))
-
-    def _run_qwen(self, job: ChatJob) -> None:
-        self.stop_llm()
-        self.flux.stop_worker()                    # the device is one resource
-        cmd = [self.python, QWEN_RUNNER, "--multi-core", str(job.engines), "--dev", self.dev, "--run_from_bin",
-               "--max-new-tokens", str(job.max_new_tokens), "--no-summary", f"--prompt={job.messages[-1]['content']}"]
-        if job.image:
-            cmd.append(f"--image={job.image}")
-        if job.audio:
-            cmd.append(f"--audio={job.audio}")
-        job.set_status("starting Qwen2.5-Omni (weights, programs)")
-        proc = subprocess.Popen(cmd, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, bufsize=1, encoding="utf-8", errors="replace")
-        job.proc = proc
-
-        def pump() -> None:
-            for line in proc.stderr:
-                job.log.append(line)
-                for marker, phase in self.QWEN_PHASES:
-                    if line.lstrip().startswith(marker) and job.status != "decode":
-                        job.set_status(phase)
-        pumper = threading.Thread(target=pump, daemon=True)
-        pumper.start()
-        result = error = None
-        for line in proc.stdout:
-            try:
-                ev = json.loads(line)
-            except ValueError:
-                continue
-            if ev.get("event") == "token":
-                if job.first_token is None:
-                    job.first_token = time.time()
-                job.n_tokens += 1
-                job.set_status("decode")
-                job.text += ev.get("text", "")
-            elif ev.get("event") == "result":
-                result = ev.get("metrics") or {}
-            elif ev.get("event") == "error":
-                error = ev.get("error")
-        proc.wait()
-        pumper.join(timeout=5)
-        job.proc = None
-        if error or result is None:
-            last = next((l.strip() for l in reversed(job.log) if l.strip()), "")
-            raise RuntimeError(error or f"the Qwen run exited with code {proc.returncode}: {last}")
-        job.metrics = qwen_metrics(result, time.time() - job.started)
-        tr = result.get("test_result") or {}
-        if tr.get("decoded_text") is not None:
-            job.text = tr["decoded_text"]
 
     # -- FLUX (flux2_klein_4b_server.Runner's job body) ----------------------
     def _run_flux(self, job) -> None:
@@ -495,51 +434,6 @@ class Board(threading.Thread):
                 job.finished = time.time()
                 if getattr(job, "kind", "") == "chat":
                     job.status = ""
-
-
-def qwen_metrics(r: dict, wall_s: float) -> dict:
-    """qwen_runner's stage rows + TEST_RESULT -> the page's metrics (as llm_worker's)."""
-    tr = r.get("test_result") or {}
-    engines, peak = int(r.get("engines") or 8), float(r.get("peak_gflops") or 0.0)
-    core = float(r.get("core_peak_gflops") or (peak / engines if engines else 0.0))
-    names = {"Vision encoder": "Vision encoder", "Audio encoder": "Audio encoder", "Prefill": "Prefill",
-             "Decode": "Decode"}
-    phases, by = [], {}
-    for row in r.get("rows") or []:
-        hw = (row.get("us") or 0.0) / 1e6
-        detail = str(row.get("detail", ""))
-        tokens = None
-        if row["stage"] == "Prefill":
-            tokens = tr.get("prefill_tokens")
-        elif row["stage"] == "Decode":
-            tokens = tr.get("decode_steps") or r.get("decode_steps")
-        else:
-            digits = [int(t) for t in detail.replace("->", " ").split() if t.isdigit()]
-            tokens = digits[-1] if digits else None
-        gflops = row.get("model_gflops")
-        p = {"name": names.get(row["stage"], row["stage"]), "tokens": tokens, "hw_s": hw or None,
-             "wall_s": row.get("wall"), "tok_s": (tokens / hw) if (tokens and hw) else None,
-             "flops": row.get("model_flops"), "gflops": gflops, "engines": engines, "peak_gflops": peak,
-             "utilization": (gflops / peak) if (gflops and peak) else None,
-             "note": (f"{detail}; issued work at {row.get('speedup', 0):.1f}x one engine's peak"
-                      if row.get("speedup") else detail)}
-        phases.append(p)
-        by[row["stage"]] = p
-    ttft_rows = [by[s] for s in ("Vision encoder", "Audio encoder", "Prefill") if s in by]
-    dec = by.get("Decode")
-    first_us = r.get("decode_first_us")
-    return {
-        "prompt_tokens": tr.get("prompt_tokens"), "generated_tokens": tr.get("tokens_generated"),
-        "history_dropped": 0, "phases": phases,
-        "ttft_hw_s": sum(p["hw_s"] or 0 for p in ttft_rows) or None,
-        "ttft_wall_s": sum(p["wall_s"] or 0 for p in ttft_rows) or None,
-        "decode_first_tok_s": (1e6 / first_us) if first_us else None,
-        "decode_hw_tok_s": dec["tok_s"] if dec else None, "decode_wall_tok_s": tr.get("decode_tok_s"),
-        "compile_s": 0.0, "wall_s": wall_s, "stopped": bool(r.get("stopped")),
-        "resident": {"engines": engines, "clock_mhz": float(r.get("clock_mhz") or 0.0), "peak_gflops": peak,
-                     "core_peak_gflops": core},
-        "text": tr.get("decoded_text") or "",
-    }
 
 
 def flux_public(job, board: Board) -> dict:
@@ -806,8 +700,6 @@ class Handler(BaseHTTPRequestHandler):
                 "Transcribe the speech exactly." if audio and not image else "Describe what you see and hear.")
         if not msgs[-1]["content"].strip():
             return self._json({"error": "empty message"}, HTTPStatus.BAD_REQUEST)
-        if CHAT_MODELS[model].get("runner") == "oneshot":
-            msgs = msgs[-1:]                        # a single-turn prompt (per-message setup)
         conversation = str(body.get("conversation") or "")[:64]
         job = ChatJob(model, self.board.engines, msgs, image, audio, max_new, att, conversation)
         self.board.submit(job)
