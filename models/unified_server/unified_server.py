@@ -525,7 +525,7 @@ def vendor_file(rel: str) -> tuple[bytes, str] | None:
 
 class Handler(BaseHTTPRequestHandler):
     board: Board            # set by main()
-    page: bytes = b""
+    no_reload_default = "checked"     # FLUX "keep the board loaded" box
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -551,7 +551,10 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         b = self.board
         if path == "/":
-            return self._send(200, self.page, "text/html; charset=utf-8")
+            # Read per request: a page fix shows on reload, without restarting the server.
+            with open(PAGE_PATH, encoding="utf-8") as f:
+                page = f.read().replace("__NO_RELOAD__", self.no_reload_default).encode()
+            return self._send(200, page, "text/html; charset=utf-8")
         if path.startswith("/vendor/"):
             got = vendor_file(path[len("/vendor/"):])
             if got is None:
@@ -742,8 +745,7 @@ def main(argv=None) -> int:
     board = Board(args.python, args.dev, args.engines)
     board.start()
     Handler.board = board
-    with open(PAGE_PATH, encoding="utf-8") as f:
-        Handler.page = f.read().replace("__NO_RELOAD__", "" if args.reload_per_image else "checked").encode()
+    Handler.no_reload_default = "" if args.reload_per_image else "checked"
     for k in CHAT_MODELS:
         s = chat_static(k)
         print(f"  {k}: weights {s['weights_file']['bytes'] / 1e9:.2f} GB"
