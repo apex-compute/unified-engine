@@ -2155,7 +2155,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         """
         self._section_cache = None
         chunks = self.prefill_chunks(len(self.prefill_seq) - 1)
-        base = self._snapshot_program_sections()       # vision, audio, ...
+        # Only the LM sections are needed from here on (vision / audio already
+        # ran); anything else still reads programs.bin on demand. Snapshotting
+        # the whole file cost ~0.65 s per message.
+        base = {}
         self._chunk_sections = []
         for pos_offset, chunk_len in chunks:
             self._prefill_chunk = (pos_offset, chunk_len)
