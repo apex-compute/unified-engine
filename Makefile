@@ -49,9 +49,11 @@ program_flash:
 	@$(LOCK_ALL) bash -c 'set -o pipefail; vivado -mode batch -source program_flash.tcl -tclargs $(TARGET) $(if $(BITFILE),BITFILE=$(BITFILE),) 2>&1 | grep -v "^#"'
 
 # Reboot the FPGA from its configuration flash over JTAG (boot_from_flash.tcl
-# picks the device by TARGET's part), then rescan PCIe.
+# picks the device by TARGET's part), then rescan PCIe. Sources Vivado's
+# settings64.sh first when vivado is not on PATH (override VIVADO_SETTINGS=).
+VIVADO_SETTINGS ?= /opt/tools/Xilinx/Vivado/2024.2/settings64.sh
 reboot_from_flash:
-	@$(LOCK_ALL) bash -c 'set -o pipefail; vivado -mode batch -nolog -nojournal -source boot_from_flash.tcl -tclargs $(TARGET) 2>&1 | grep -v "^#" && ./rescan_xilinx.sh'
+	@$(LOCK_ALL) bash -c 'set -o pipefail; if ! command -v vivado >/dev/null; then [ -r "$(VIVADO_SETTINGS)" ] || { echo "Error: vivado not on PATH and $(VIVADO_SETTINGS) not found; pass VIVADO_SETTINGS=<path to settings64.sh>"; exit 1; }; source "$(VIVADO_SETTINGS)"; fi; vivado -mode batch -nolog -nojournal -source boot_from_flash.tcl -tclargs $(TARGET) 2>&1 | grep -v "^#" && ./rescan_xilinx.sh'
 
 # Read-only by default. PROGRAM=1 permanently burns the AES key and flashes BIN.
 # Extra selectors/options: PROVISION_ARGS='--target <serial> --dna <hex> --boot'
