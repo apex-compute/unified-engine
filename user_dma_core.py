@@ -10053,8 +10053,8 @@ class UnifiedEngine:
             total_flops += 4 * results
         return total_flops
 
-    def conv2d_auto(self, *, winograd=None, im2col=None, matmul=None,
-                    path: Optional[str] = None, allow_winograd: bool = True,
+    def conv2d_auto(self, *, winograd=None, im2col=None, matmul=None, grouped=None, walker=None,
+                    path: Optional[str] = None, allow_winograd: bool = True, groups: int = 1,
                     **conv2d_core_kwargs) -> int:
         """Thin conv dispatcher: pick the lowering for one conv and emit it.
 
@@ -10065,20 +10065,25 @@ class UnifiedEngine:
         (their operands differ: Winograd wants the raw bf16 kernel as 16 U
         planes and an HWC map, im2col wants a [9*Cin x Cout] matrix), so the
         caller passes them as callables taking no arguments; the one chosen is
-        called. Returns the FLOPs the chosen emitter reports (0 for callables
-        that return None).
+        called. ``walker`` replaces the single-launch :meth:`conv2d_core` with
+        the caller's own (tiled) walker emitter; with it, only the routing keys
+        (kernel_h, kernel_w, stride_s, dilation, c_in, oc_count, data_type) are
+        needed in the kwargs. Returns the FLOPs the chosen emitter reports (0
+        for callables that return None).
         """
         kw = conv2d_core_kwargs
         if path is None:
             path = select_conv_path(
                 kernel_h=kw["kernel_h"], kernel_w=kw["kernel_w"], stride_s=kw["stride_s"],
                 dilation=kw.get("dilation", 1), c_in=kw["c_in"], oc_count=kw["oc_count"],
-                data_type=kw["data_type"], allow_winograd=allow_winograd)
+                data_type=kw["data_type"], allow_winograd=allow_winograd, groups=groups)
         if path == "walker":
+            if walker is not None:
+                return walker() or 0
             kw = dict(kw)
             kw.setdefault("weight_reuse", True)
             return self.conv2d_core(**kw)
-        fn = {"winograd": winograd, "im2col": im2col, "matmul": matmul}[path]
+        fn = {"winograd": winograd, "im2col": im2col, "matmul": matmul, "grouped": grouped}[path]
         assert fn is not None, f"conv2d_auto chose {path!r} but the caller gave no {path} emitter"
         return fn() or 0
 
@@ -13588,31 +13593,46 @@ CONV_WALKER_NATIVE_BLOCK_LIMIT = 4096            # 16-bit weight blocks per reus
 
 def conv_walker_pattern_fits(*, c_in: int, oc_count: int, kernel_h: int, kernel_w: int,
                              data_type: TYPE) -> bool:
-    """True when at least one whole-divisor oc chunk of this conv fits a weight_reuse launch:
-    the [oc][tap] pattern within the 512 KiB URAM_B bank and the per-format block limit."""
+    """True when this conv's oc chunk (the largest divisor of oc_count whose [oc][tap] pattern fits,
+    as plan_conv2d_layer_tiles picks it) fits a weight_reuse launch -- the per-format block limit and
+    the 512 KiB URAM_B bank -- and its bf16 writeback can be scattered into an HWC map: either the
+    chunk is every oc, or its per-pixel slice is whole 32-byte AXI beats. 7x7 / 512->512 FLOAT16 fails
+    the last test (8 oc per launch = 16 B per pixel; conv3x3_paths_probe sweep, 927fd8d)."""
     ct = (c_in + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE
     taps = kernel_h * kernel_w * ct
     bpb = 128 if data_type == TYPE.FLOAT16 else (64 if data_type == TYPE.IF8 else 32)
     limit = CONV_WALKER_NATIVE_BLOCK_LIMIT if data_type == TYPE.FLOAT16 else SCALE_BRAM_ELEMENTS
-    return taps <= 0xFFF and taps <= limit and taps * bpb <= 512 * 1024
+    if taps > 0xFFF or taps > limit or taps * bpb > 512 * 1024:
+        return False
+    cap = min(oc_count, limit // taps, (512 * 1024) // (taps * bpb))
+    oc_chunk = next(n for n in range(cap, 0, -1) if oc_count % n == 0)
+    beat = ue_axi_beat_bytes_for(UE_AXI_DATA_WIDTH_BITS or 512)   # before HW_INFO: assume the wider beat
+    return oc_chunk == oc_count or (oc_chunk * 2) % beat == 0
 
 
 def select_conv_path(*, kernel_h: int, kernel_w: int, stride_s: int, dilation: int,
                      c_in: int, oc_count: int, data_type: TYPE,
-                     allow_winograd: bool = True) -> str:
+                     allow_winograd: bool = True, groups: int = 1) -> str:
     """Pick the lowering for one conv. Top-down, first match wins:
 
-    1. 1x1                                      -> "matmul"   (nothing to reuse between neighbours)
+    0. groups != 1 (depthwise / grouped)        -> "grouped"  (no lowering here; the caller's own, e.g.
+                                                                the tap-wise depthwise paths)
+    1. 1x1, or kernel == stride (patch embed)   -> "matmul"   (nothing to reuse between neighbours;
+                                                                a patchify is a plain matmul)
     2. quantized weights (IF8 / IF4 / TQ4)      -> "walker"   (CONV2D has no other home for them; with
                                                                 weight_reuse it is already near peak)
     3. 3x3 / stride 1 / dil 1 / bf16 / Cin >= CONV3X3_WINOGRAD_MIN_CIN
-                                                -> "winograd" (F(2x2,3x3): 16 K=Cin matmuls for 36 taps;
-                                                                costs ~0-0.3 dB per conv, so allow_winograd
-                                                                is the caller's accuracy veto)
+                                                -> "winograd" (F(2x2,3x3): 16 K=Cin matmuls for 36 taps.
+                                                                Its bf16 intermediates cost ~10 dB per conv
+                                                                (44.5 vs 55 dB on the probe), so
+                                                                allow_winograd is the caller's accuracy veto)
     4. bf16, anything else                      -> CONV3X3_BF16_FALLBACK ("walker" when its pattern fits
                                                                 URAM_B, else "im2col")
     """
-    if kernel_h == 1 and kernel_w == 1 and stride_s == 1 and dilation == 1:
+    if groups != 1:
+        return "grouped"
+    if (kernel_h == kernel_w == stride_s and dilation == 1) or (kernel_h == 1 and kernel_w == 1
+                                                               and stride_s == 1 and dilation == 1):
         return "matmul"
     if data_type != TYPE.FLOAT16:
         return "walker"
