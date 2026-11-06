@@ -678,7 +678,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": f"conversation longer than {MAX_PROMPT_CHARS} characters"},
                               HTTPStatus.BAD_REQUEST)
         try:
-            max_new = int(body.get("max_new_tokens") or 256)
+            max_new = int(body.get("max_new_tokens") or 8192)       # each model caps it at its context
         except (TypeError, ValueError):
             return self._json({"error": "max_new_tokens must be an integer"}, HTTPStatus.BAD_REQUEST)
         if not 1 <= max_new <= 8192:

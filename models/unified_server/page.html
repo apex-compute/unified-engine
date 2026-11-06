@@ -145,7 +145,7 @@
             </span>
             <span style="flex:1"></span>
             <label for="maxnew">Max tokens</label>
-            <input id="maxnew" type="number" value="256" min="1" max="8192">
+            <input id="maxnew" type="number" value="8192" min="1" max="8192">
             <button class="ghost" id="clear" title="Start a new conversation">New chat</button>
             <button id="stop" hidden>■ Stop</button>
             <button id="send">Send</button>
@@ -271,9 +271,17 @@ function showModel(reset) {
   $('blurb').textContent = m.blurb;
   $('chatview').hidden = m.kind !== 'chat';
   $('fluxview').hidden = m.kind !== 'image';
-  if (m.kind === 'chat') { if (reset) newChat(); showChatStatic(); refreshTools(); }
+  if (m.kind === 'chat') {
+    if (reset) newChat();
+    if (maxFor !== m.id) {            // default: the model's whole context (Gemma 3 512, the others 8192)
+      const cap = (m.static && m.static.max_context) || 8192;
+      $('maxnew').max = cap; $('maxnew').value = cap; maxFor = m.id;
+    }
+    showChatStatic(); refreshTools();
+  }
   else { loadFluxConfigs(); loadFluxHistory(); }
 }
+let maxFor = null;
 $('model').onchange = () => showModel(true);
 
 // --------------------------------------------------------------- chat
@@ -287,7 +295,7 @@ function showChatStatic() {
   const body = [
     { cells: ['Layers × hidden', s.layers && s.hidden ? `${s.layers} × ${s.hidden}` : '—'] },
     { cells: ['Context (tokens)', s.max_context ?? '—'] },
-    { cells: ['Prefill program rows', s.prefill_max ? s.prefill_max + (m.id === 'gemma3' ? '' : ' per chunk (longer prompts chunked)') : '—'] },
+    { cells: ['Prefill program rows', s.prefill_max ? s.prefill_max + ' per chunk (longer prompts chunked)' : '—'] },
     { cells: [`Weight file (${esc(s.weights_file.name)})`, s.weights_file.bytes ? gb(s.weights_file.bytes) : 'not generated'] },
     { cells: ['Weights in board DRAM (quantized)', live ? gb(live.weights_dram_bytes) : 'known once loaded'] },
     { cells: ['Engines', live ? live.engines : state.engines] },
@@ -460,7 +468,7 @@ async function send() {
   // a message that continues the same chat (same id) prefills only itself.
   const history = conv.filter(x => !x.failed).map(x => ({ role: x.role, content: x.content }));
   const body = { model: m.id, messages: history, conversation: convId,
-                 max_new_tokens: parseInt($('maxnew').value || '256', 10) };
+                 max_new_tokens: parseInt($('maxnew').value || '8192', 10) };
   if (att.image) body.image = { name: att.image.name, data: att.image.data };
   if (att.audio) body.audio = { name: att.audio.name, data: att.audio.data };
   $('input').value = ''; autosize(); att = { image: null, audio: null }; refreshTools();

@@ -368,7 +368,7 @@ class Gemma4Backend(_Conversation):
         ue, rid = self.ue, req["id"]
         for name in _G4_PER_REQUEST:
             setattr(ue, name, None)
-        max_new = max(1, int(req.get("max_new_tokens") or 256))
+        max_new = max(1, int(req.get("max_new_tokens") or int(self.ue.MAX_CONTEXT_SIZE)))
         image, audio = req.get("image"), req.get("audio")
         prompt = req["messages"][-1]["content"] if req["messages"] else ""
         dropped = 0
@@ -648,7 +648,7 @@ class QwenBackend:
         args = copy.copy(self.base_args)
         args.image, args.audio = image, audio
         args.prompt = req["messages"][-1]["content"]
-        args.max_new_tokens = max(1, min(int(req.get("max_new_tokens") or 256), room))
+        args.max_new_tokens = max(1, min(int(req.get("max_new_tokens") or room), room))
         t_req = time.perf_counter()
         emit("status", id=rid, text="program image")
         self._rewind()
