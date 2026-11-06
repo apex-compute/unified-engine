@@ -17,6 +17,14 @@ if ! { [[ -n "${PCIE_LOCK_ALL_HOLDER:-}" ]] && kill -0 "$PCIE_LOCK_ALL_HOLDER" 2
     exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pcie_lock.py" all -- "$0" "$@"
 fi
 
+# Setuid helper installed on the lab hosts (andromeda's rescan_xilinx.sh uses
+# it too): does the same remove + rescan for users without sudo.
+SETUID_HELPER=/usr/local/sbin/pcie_rescan_xilinx
+if [[ -x "$SETUID_HELPER" ]]; then
+    echo "Using setuid helper: $SETUID_HELPER"
+    exec "$SETUID_HELPER"
+fi
+
 # Find all Xilinx devices' BDFs (e.g. 0000:82:00.0)
 BDFS=$(lspci -D | grep -i xilinx | awk '{print $1}')
 
