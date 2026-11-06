@@ -151,7 +151,7 @@ def chat_static(model: str) -> dict:
             groups.setdefault(key, []).append(int(s.get("size", 0)))
         label = {"lm": "LM: prefill + decoder (engine 0)", "vision": "Vision encoder (engine 0)",
                  "audio": "Audio encoder", "prefill_worker": "Prefill workers", "decode_worker": "Decode workers",
-                 "vision_worker": "Vision workers"}
+                 "vision_worker": "Vision workers", "audio_worker": "Audio workers"}
         for key in sorted(groups, key=lambda k: (k not in label, list(label).index(k) if k in label else 0, k)):
             sizes = groups[key]
             name = label.get(key, key) + (f" ({len(sizes)} engines)" if "worker" in key else "")
