@@ -1,0 +1,740 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unified Engine models</title>
+<link rel="stylesheet" href="/vendor/katex@0.16.11/dist/katex.min.css">
+<script defer src="/vendor/marked@12.0.2/marked.min.js"></script>
+<script defer src="/vendor/dompurify@3.1.6/dist/purify.min.js"></script>
+<script defer src="/vendor/katex@0.16.11/dist/katex.min.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --fg:#1c1e21; --muted:#6b7280; --card:#fff; --line:#d9dde3; --accent:#2563eb; --err:#b91c1c; --bar:#dbe4ff; --me:#e8efff; --chip:#eef0f3; --code:#f1f3f6; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111317; --fg:#e6e8eb; --muted:#9aa3ad; --card:#1a1d23; --line:#2d323b; --accent:#5b8cff; --err:#f87171; --bar:#26324f; --me:#1f2a44; --chip:#252a33; --code:#0d0f13; }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }   /* else a display rule (.phase: inline-flex) keeps it on screen */
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, sans-serif; }
+  main { max-width: 1240px; margin: 0 auto; padding: 24px 20px; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 13px; color: var(--muted); font-weight: 600; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .03em; }
+  .top { display:flex; gap:16px; align-items:center; flex-wrap:wrap; margin-bottom: 6px; }
+  .top select { width:auto; min-width: 260px; font-weight: 600; }
+  .sub { color: var(--muted); margin: 4px 0 16px; }
+  .boardline { font-size: 13px; color: var(--muted); margin: 0 0 16px; }
+  .boardline a { color: var(--accent); margin-left: 8px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin-bottom:16px; }
+  label { display:block; font-size:13px; color:var(--muted); margin-bottom:4px; }
+  textarea, select, input[type=number] { width:100%; font:inherit; color:inherit; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:8px; }
+  textarea { min-height: 72px; resize: vertical; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; margin-top:12px; align-items:flex-end; }
+  .row > div { flex: 1 1 220px; }
+  .check { display:flex; align-items:center; gap:8px; margin-top:12px; font-size:14px; color:var(--fg); }
+  .check input { width:auto; margin:0; }
+  .check label { margin:0; color:inherit; font-size:14px; }
+  button { font:inherit; padding:9px 18px; border:0; border-radius:6px; background:var(--accent); color:#fff; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--fg); border:1px solid var(--line); padding:8px 12px; }
+  button:disabled { opacity:.5; cursor:default; }
+  .status { margin-top:12px; color:var(--muted); min-height: 1.4em; }
+  .status.err { color: var(--err); }
+  pre { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:10px; max-height:240px; overflow:auto; font-size:12px; white-space:pre-wrap; }
+  details summary { cursor:pointer; color:var(--muted); font-size:13px; }
+  .block + .block { margin-top: 18px; }
+  .narrow { max-width: 620px; }
+  .tw { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; white-space: normal; min-width: 160px; }
+  th { color: var(--muted); font-weight: 500; }
+  tr.total td { font-weight: 600; border-bottom: 0; }
+  td.util { position: relative; min-width: 90px; }
+  td.util span { position: relative; z-index: 1; }
+  td.util i { position:absolute; left:0; top:3px; bottom:3px; background:var(--bar); border-radius:3px; z-index:0; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; line-height: 1.5; }
+  .kv { display:grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px 16px; margin-bottom: 12px; }
+  .kv div { font-size: 13px; color: var(--muted); }
+  .kv b { display:block; font-size: 18px; color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+  /* chat */
+  .chat { padding: 0; overflow: hidden; }
+  #conv { height: min(64vh, 720px); overflow-y: auto; padding: 22px 24px 8px; scroll-behavior: auto; }
+  .empty { color: var(--muted); font-size: 14px; text-align: center; margin-top: 18vh; }
+  .turn { display: flex; margin: 0 0 18px; }
+  .turn.user { justify-content: flex-end; }
+  .msg { max-width: 82%; word-wrap: break-word; overflow-wrap: anywhere; }
+  .turn.user .msg { background: var(--me); padding: 10px 14px; border-radius: 16px 16px 4px 16px; white-space: pre-wrap; }
+  .turn.assistant .msg { max-width: 100%; width: 100%; padding: 2px 2px; border-radius: 8px; }
+  .turn.assistant.sel .msg { box-shadow: -3px 0 0 var(--accent); padding-left: 12px; }
+  .msg .att { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; }
+  .msg .att img { max-height: 140px; border-radius: 10px; display: block; }
+  .msg .att span { font-size:12px; background:var(--card); padding:3px 10px; border-radius: 10px; }
+  .msg.err .md { color: var(--err); }
+  .foot { font-size: 12px; color: var(--muted); margin-top: 8px; display: flex; gap: 6px 14px; flex-wrap: wrap; align-items: center; font-variant-numeric: tabular-nums; }
+  .foot b { color: var(--fg); font-weight: 600; }
+  .foot a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .phase { display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; padding: 6px 0; }
+  .dots { display: inline-flex; gap: 4px; }
+  .dots i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: bounce 1.2s infinite ease-in-out; }
+  .dots i:nth-child(2) { animation-delay: .15s; } .dots i:nth-child(3) { animation-delay: .3s; }
+  @keyframes bounce { 0%, 80%, 100% { opacity: .25; transform: translateY(0); } 40% { opacity: 1; transform: translateY(-3px); } }
+  .caret { display: inline-block; width: .5em; height: 1.05em; margin-left: 2px; vertical-align: text-bottom; background: var(--accent); border-radius: 1px; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  /* markdown */
+  .md { line-height: 1.6; }
+  .md > :first-child { margin-top: 0; } .md > :last-child { margin-bottom: 0; }
+  .md p, .md ul, .md ol, .md pre, .md blockquote, .md table { margin: 0 0 .75em; }
+  .md h1, .md h2, .md h3, .md h4 { margin: 1.1em 0 .45em; line-height: 1.3; text-transform: none; letter-spacing: 0; color: var(--fg); }
+  .md h1 { font-size: 1.35em; } .md h2 { font-size: 1.2em; font-weight: 650; } .md h3 { font-size: 1.07em; } .md h4 { font-size: 1em; }
+  .md ul, .md ol { padding-left: 1.4em; } .md li { margin: .2em 0; } .md li > p { margin: 0; }
+  .md code { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code); padding: .1em .35em; border-radius: 4px; }
+  .md pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; overflow-x: auto; max-height: none; white-space: pre; font-size: 13px; }
+  .md pre code { background: none; padding: 0; }
+  .md blockquote { border-left: 3px solid var(--line); margin-left: 0; padding: 0 0 0 12px; color: var(--muted); }
+  .md table { width: auto; font-size: 14px; } .md th, .md td { text-align: left; border: 1px solid var(--line); padding: 5px 10px; white-space: normal; }
+  .md hr { border: 0; border-top: 1px solid var(--line); margin: 1em 0; }
+  .md a { color: var(--accent); }
+  .md .katex-display { margin: .6em 0; overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
+  /* composer */
+  .composer { border-top: 1px solid var(--line); padding: 12px 16px 14px; background: var(--card); }
+  .box { border: 1px solid var(--line); border-radius: 14px; background: var(--bg); padding: 8px 10px 8px 14px; transition: border-color .15s; }
+  .box:focus-within { border-color: var(--accent); }
+  .box textarea { border: 0; background: transparent; padding: 6px 0; min-height: 24px; max-height: 220px; resize: none; outline: none; line-height: 1.5; display: block; }
+  .tools { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-top: 6px; }
+  .tools button.ghost { padding: 5px 10px; font-size: 13px; border-radius: 8px; }
+  .tools label { margin: 0; font-size: 12px; }
+  .tools input[type=number] { width: 72px; padding: 4px 6px; font-size: 13px; }
+  #send, #stop { border-radius: 10px; padding: 7px 16px; }
+  #stop { background: var(--fg); color: var(--bg); }
+  .chip { display:inline-flex; align-items:center; gap:6px; font-size:12px; background:var(--chip); padding:3px 8px; border-radius: 10px; }
+  .chip img { height: 26px; border-radius: 4px; }
+  .chip a { color: var(--muted); text-decoration:none; cursor:pointer; }
+  .rec { color: var(--err); font-weight: 600; }
+  .under { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .under .status { margin: 0; min-height: 0; font-size: 12px; }
+  .under details summary { font-size: 12px; }
+  #clog { max-height: 260px; margin-top: 8px; }
+  /* flux */
+  #fresult img { max-width:100%; height:auto; border-radius:8px; border:1px solid var(--line); display:block; }
+  .meta { color:var(--muted); font-size:13px; margin-top:8px; }
+  .hist { display:flex; gap:8px; flex-wrap:wrap; }
+  .hist img { width:96px; height:96px; object-fit:cover; border-radius:6px; border:1px solid var(--line); cursor:pointer; }
+</style>
+</head>
+<body>
+<main>
+  <div class="top">
+    <h1>Unified Engine</h1>
+    <select id="model" aria-label="Model"></select>
+  </div>
+  <p class="sub" id="blurb"></p>
+  <p class="boardline" id="boardline"></p>
+
+  <!-- ===================== chat models ===================== -->
+  <section id="chatview" hidden>
+    <div class="card chat">
+      <div id="conv"><div class="empty" id="empty">Ask something — answers stream from the board token by token.</div></div>
+      <div class="composer">
+        <div class="box">
+          <div id="chips"></div>
+          <textarea id="input" rows="1" placeholder="Message (Enter to send, Shift+Enter for a new line)"></textarea>
+          <div class="tools">
+            <span id="mediatools">
+              <button class="ghost" id="addimg" title="Attach an image">＋ Image</button>
+              <button class="ghost" id="addaud" title="Attach an audio clip (WAV / FLAC / OGG; others need ffmpeg)">＋ Audio</button>
+              <button class="ghost" id="recbtn" title="Record from the microphone">● Record</button>
+            </span>
+            <span style="flex:1"></span>
+            <label for="maxnew">Max tokens</label>
+            <input id="maxnew" type="number" value="8192" min="1" max="8192">
+            <button class="ghost" id="clear" title="Start a new conversation">New chat</button>
+            <button id="stop" hidden>■ Stop</button>
+            <button id="send">Send</button>
+          </div>
+        </div>
+        <div class="under">
+          <div id="cstatus" class="status"></div>
+          <details><summary>Run log</summary><pre id="clog"></pre></details>
+        </div>
+        <input type="file" id="imgfile" accept="image/*" hidden>
+        <input type="file" id="audfile" accept="audio/*" hidden>
+      </div>
+    </div>
+
+    <div class="card" id="cmetrics" hidden>
+      <h2 id="cmtitle">Run on the board</h2>
+      <div class="kv" id="ckv"></div>
+      <div class="tw"><table id="ctable"></table></div>
+      <div class="note" id="cnote"></div>
+    </div>
+
+    <div class="card" id="cstatic">
+      <div class="block"><h2>Model on the board</h2><div class="tw"><table id="cstatictable"></table></div></div>
+      <div class="block" id="cprogblock"><h2>Program image</h2><div class="tw"><table id="cprogtable"></table></div></div>
+      <div class="note" id="cstaticnote"></div>
+    </div>
+  </section>
+
+  <!-- ===================== FLUX.2 klein ===================== -->
+  <section id="fluxview" hidden>
+    <div class="card">
+      <label for="prompt">Prompt</label>
+      <textarea id="prompt">A photo of a red sports car on a mountain road at sunset</textarea>
+      <div class="row">
+        <div><label for="config">Resolution</label><select id="config"></select></div>
+        <div style="flex:0 1 120px"><label for="seed">Seed</label><input id="seed" type="number" value="0" min="0"></div>
+        <div style="flex:0 0 auto"><button id="go">Generate</button></div>
+      </div>
+      <div class="check">
+        <input type="checkbox" id="noreload" __NO_RELOAD__>
+        <label for="noreload">Keep the board loaded between runs (no reload)</label>
+      </div>
+      <div id="fstatus" class="status"></div>
+      <details><summary>Run log</summary><pre id="flog"></pre></details>
+    </div>
+    <div class="card" id="fstatic" hidden>
+      <div class="block"><h2>Weights on the board</h2><div class="tw"><table id="weights"></table></div></div>
+      <div class="block"><h2>Programs of this configuration</h2><div class="tw"><table id="programs"></table></div></div>
+      <div class="note" id="staticnote"></div>
+    </div>
+    <div class="card" id="fresult" hidden>
+      <img id="img" alt="generated image">
+      <div class="meta" id="fmeta"></div>
+      <h2 style="margin-top:16px">Run on the board</h2>
+      <div class="tw"><table id="stats"></table></div>
+      <div class="note" id="statsnote"></div>
+    </div>
+    <div class="card" id="fhistory" hidden>
+      <label>Earlier images (this server session)</label>
+      <div class="hist" id="hist"></div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let models = [], state = {}, current = null;
+const gb = b => b >= 1e9 ? (b / 1e9).toFixed(2) + ' GB' : b >= 1e6 ? (b / 1e6).toFixed(1) + ' MB' : (b / 1e3).toFixed(1) + ' KB';
+const tf = f => (f / 1e12).toFixed(2) + ' TFLOP';
+const gf = f => f >= 1e12 ? tf(f) : (f / 1e9).toFixed(1) + ' GFLOP';
+const pct = x => (100 * x).toFixed(0) + '%';
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const sec = s => s == null ? '—' : s < 1 ? (s * 1000).toFixed(0) + ' ms' : s.toFixed(2) + ' s';
+const num = (x, d = 1) => x == null ? '—' : x.toFixed(d);
+function rows(head, body) {
+  return '<tr>' + head.map(h => `<th>${h}</th>`).join('') + '</tr>' +
+    body.map(r => `<tr${r.total ? ' class="total"' : ''}>` + r.cells.map(c => (c && typeof c === 'object')
+      ? (c.util == null ? '<td>—</td>' : `<td class="util"><i style="width:${Math.min(100, 100 * c.util).toFixed(1)}%"></i><span>${pct(c.util)}</span></td>`)
+      : `<td>${c ?? '—'}</td>`).join('') + '</tr>').join('');
+}
+const model = () => models.find(m => m.id === $('model').value);
+
+// --------------------------------------------------------------- model list / board state
+async function loadModels() {
+  const d = await (await fetch('/api/models')).json();
+  models = d.models; state = d;
+  const sel = $('model');
+  if (!sel.options.length) {
+    const groups = { chat: 'Chat (LLM / VLM)', image: 'Image generation' };
+    for (const k of ['chat', 'image']) {
+      const g = document.createElement('optgroup'); g.label = groups[k];
+      for (const m of models.filter(m => m.kind === k)) {
+        const o = document.createElement('option'); o.value = m.id;
+        o.textContent = `${m.title} — ${m.modalities.join(' + ')}`; g.appendChild(o);
+      }
+      sel.appendChild(g);
+    }
+    const saved = localGet('model');
+    sel.value = models.some(m => m.id === saved) ? saved : (d.resident && models.some(m => m.id === d.resident.model) ? d.resident.model : 'gemma3');
+  }
+  showBoard(); showModel(false);
+}
+function localGet(k) { try { return localStorage.getItem('ue.' + k); } catch (e) { return null; } }
+function localSet(k, v) { try { localStorage.setItem('ue.' + k, v); } catch (e) {} }
+function showBoard() {
+  const r = state.resident, l = state.loading;
+  const title = id => (models.find(m => m.id === id) || { title: id }).title;
+  let s;
+  if (l) s = `Board: loading ${title(l.model)}…`;
+  else if (r) s = `Board: ${title(r.model)} resident on ${r.engines} engines` +
+    (r.info ? ` (${r.info.clock_mhz.toFixed(0)} MHz, peak ${r.info.peak_gflops.toFixed(0)} GFLOPS; loaded in ${(r.info.load_s + r.info.compile_s).toFixed(0)} s)` : '') +
+    ` <a href="#" id="release">release the board</a>`;
+  else s = 'Board: free. The first message to a model loads it (weights + program image), later ones reuse it.';
+  $('boardline').innerHTML = s;
+  const rel = $('release');
+  if (rel) rel.onclick = async e => {
+    e.preventDefault(); await fetch('/api/release', { method: 'POST' });
+    $('boardline').textContent = 'Board: releasing…'; setTimeout(loadModels, 2000);
+  };
+}
+function showModel(reset) {
+  const m = model(); if (!m) return;
+  localSet('model', m.id);
+  $('blurb').textContent = m.blurb;
+  $('chatview').hidden = m.kind !== 'chat';
+  $('fluxview').hidden = m.kind !== 'image';
+  if (m.kind === 'chat') {
+    if (reset) newChat();
+    if (maxFor !== m.id) {            // default: the model's whole context (Gemma 3 512, the others 8192)
+      const cap = (m.static && m.static.max_context) || 8192;
+      $('maxnew').max = cap; $('maxnew').value = cap; maxFor = m.id;
+    }
+    showChatStatic(); refreshTools();
+  }
+  else { loadFluxConfigs(); loadFluxHistory(); if (reset || !fbuildTimer) prepareFlux(); }
+}
+let maxFor = null;
+$('model').onchange = () => showModel(true);
+
+// --------------------------------------------------------------- chat
+let conv = [];          // {role, content, attachments, metrics, el}
+let att = { image: null, audio: null };
+let chatJob = null, recorder = null;
+
+function showChatStatic() {
+  const m = model(), s = m.static, r = state.resident;
+  const live = r && r.model === m.id ? r.info : null;
+  const body = [
+    { cells: ['Layers × hidden', s.layers && s.hidden ? `${s.layers} × ${s.hidden}` : '—'] },
+    { cells: ['Context (tokens)', s.max_context ?? '—'] },
+    { cells: ['Prefill program rows', s.prefill_max ? s.prefill_max + ' per chunk (longer prompts chunked)' : '—'] },
+    { cells: [`Weight file (${esc(s.weights_file.name)})`, s.weights_file.bytes ? gb(s.weights_file.bytes) : 'not generated'] },
+    { cells: ['Weights in board DRAM (quantized)', live ? gb(live.weights_dram_bytes) : 'known once loaded'] },
+    { cells: ['Engines', live ? live.engines : state.engines] },
+  ];
+  if (live) body.push({ cells: ['Load (weights → DRAM) + program image', `${live.load_s.toFixed(1)} s + ${live.compile_s.toFixed(1)} s`] });
+  $('cstatictable').innerHTML = rows(['', ''], body);
+  const progs = s.programs || [];
+  $('cprogblock').hidden = !progs.length;
+  $('cprogtable').innerHTML = rows(['Program', 'Size', 'Work'], progs.map(p => ({ cells: [esc(p.name), gb(p.bytes), p.flops ? `${gf(p.flops)} ${p.flops_note ? '(' + esc(p.flops_note) + ')' : ''}` : ''] })));
+  $('cstaticnote').textContent = (s.notes || []).join(' ') + (live ? ` ${live.hw_info}` : '');
+}
+function refreshTools() {
+  const m = model(), media = m.modalities.includes('image');
+  $('mediatools').hidden = !media;
+  if (!media) att = { image: null, audio: null };
+  const c = [];
+  if (att.image) c.push(`<span class="chip"><img src="${att.image.url}" alt="">${esc(att.image.name)} <a data-k="image" title="remove">✕</a></span>`);
+  if (att.audio) c.push(`<span class="chip">♪ ${esc(att.audio.name)} <a data-k="audio" title="remove">✕</a></span>`);
+  $('chips').innerHTML = c.join(' ');
+  for (const a of $('chips').querySelectorAll('a')) a.onclick = () => { att[a.dataset.k] = null; refreshTools(); };
+}
+function readFile(file) {
+  return new Promise((ok, bad) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = bad; r.readAsDataURL(file); });
+}
+$('addimg').onclick = () => $('imgfile').click();
+$('addaud').onclick = () => $('audfile').click();
+$('imgfile').onchange = async () => {
+  const f = $('imgfile').files[0]; if (!f) return;
+  att.image = { name: f.name, data: await readFile(f), url: URL.createObjectURL(f) }; $('imgfile').value = ''; refreshTools();
+};
+$('audfile').onchange = async () => {
+  const f = $('audfile').files[0]; if (!f) return;
+  att.audio = { name: f.name, data: await readFile(f), url: URL.createObjectURL(f) }; $('audfile').value = ''; refreshTools();
+};
+// Microphone: record, decode in the browser, send 16 kHz mono WAV (what the audio encoder reads).
+function wav16k(buf) {
+  const rate = 16000, src = buf.getChannelData(0), ratio = buf.sampleRate / rate, n = Math.floor(src.length / ratio);
+  const out = new DataView(new ArrayBuffer(44 + n * 2));
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) out.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); out.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); out.setUint32(16, 16, true);
+  out.setUint16(20, 1, true); out.setUint16(22, 1, true); out.setUint32(24, rate, true); out.setUint32(28, rate * 2, true);
+  out.setUint16(32, 2, true); out.setUint16(34, 16, true); w(36, 'data'); out.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    let acc = 0, a = Math.floor(i * ratio), b = Math.max(a + 1, Math.floor((i + 1) * ratio));
+    for (let j = a; j < b && j < src.length; j++) acc += src[j];
+    const v = Math.max(-1, Math.min(1, acc / (b - a)));
+    out.setInt16(44 + i * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+  }
+  return new Blob([out.buffer], { type: 'audio/wav' });
+}
+$('recbtn').onclick = async () => {
+  if (recorder) { recorder.stop(); return; }
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) { setStatus('Microphone unavailable: ' + e.message + ' (browsers allow it on localhost or https only).', true); return; }
+  const chunks = []; recorder = new MediaRecorder(stream); const t0 = Date.now();
+  recorder.ondataavailable = e => chunks.push(e.data);
+  const tick = setInterval(() => { $('recbtn').innerHTML = `<span class="rec">● ${((Date.now() - t0) / 1000).toFixed(0)} s</span> stop`; }, 250);
+  recorder.onstop = async () => {
+    clearInterval(tick); stream.getTracks().forEach(t => t.stop()); recorder = null; $('recbtn').textContent = 'Record';
+    const ab = await new Blob(chunks).arrayBuffer();
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const blob = wav16k(await ctx.decodeAudioData(ab)); ctx.close();
+    att.audio = { name: `recording-${new Date().toLocaleTimeString()}.wav`, data: await readFile(blob), url: URL.createObjectURL(blob) };
+    refreshTools();
+  };
+  recorder.start();
+};
+function setStatus(t, err) { $('cstatus').className = 'status' + (err ? ' err' : ''); $('cstatus').textContent = t; }
+
+// Markdown + math. marked/DOMPurify/KaTeX come from the CDN; without them the text shows as plain text.
+const PH = (k, i) => `${k}${i}`;
+function renderMath(tex, display) {
+  try { return katex.renderToString(tex, { displayMode: display, throwOnError: false, output: 'html' }); }
+  catch (e) { return esc(tex); }
+}
+function md(text) {
+  if (!(window.marked && window.DOMPurify)) return '<p style="white-space:pre-wrap">' + esc(text) + '</p>';
+  const math = [], code = [];
+  let src = text;
+  if (window.katex) {
+    // Keep code literal, then lift $$..$$, \[..\], \(..\) and $..$ out before Markdown sees them.
+    src = src.replace(/```[\s\S]*?(?:```|$)|`[^`\n]*`/g, m => { code.push(m); return PH('C', code.length - 1); });
+    src = src.replace(/\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]/g, (m, a, b) => { math.push(renderMath(a ?? b, true)); return PH('M', math.length - 1); });
+    src = src.replace(/\\\(([\s\S]+?)\\\)|(^|[^\\$\w])\$([^\s$](?:[^$\n]*?[^\s$])?)\$(?!\w)/g,
+      (m, a, pre, b) => { math.push(renderMath(a ?? b, false)); return (a != null ? '' : pre) + PH('M', math.length - 1); });
+    src = src.replace(/C(\d+)/g, (m, i) => code[i]);
+  }
+  let html = DOMPurify.sanitize(marked.parse(src, { gfm: true, breaks: true }));
+  return html.replace(/M(\d+)/g, (m, i) => math[i]);
+}
+function lastTextHost(el) {          // where the caret goes: the deepest last block
+  let n = el;
+  while (n.lastElementChild && !n.lastElementChild.classList.contains('katex') &&
+         !n.lastElementChild.classList.contains('katex-display') && !['BR', 'IMG', 'HR'].includes(n.lastElementChild.tagName))
+    n = n.lastElementChild;
+  return n;
+}
+
+// Reveals streamed text frame by frame (catching up faster when tokens arrive in bursts)
+// and re-renders the Markdown at most once per frame.
+class Streamer {
+  constructor(el) { this.el = el; this.target = ''; this.shown = 0; this.rendered = -1; this.raf = 0; this.live = true; this.last = 0; }
+  push(t) { this.target += t; this.kick(); }
+  reset(t) { this.target = t; this.shown = Math.min(this.shown, t.length); this.kick(); }
+  finish(t) { if (t != null) this.reset(t); this.live = false; this.kick(); }
+  kick() { if (!this.raf) this.raf = requestAnimationFrame(ts => this.frame(ts)); }
+  frame(ts) {
+    this.raf = 0;
+    const back = this.target.length - this.shown;
+    if (back > 0) {
+      this.shown += Math.max(1, Math.ceil(back / 5));
+      const c = this.target.charCodeAt(this.shown - 1);
+      if (c >= 0xD800 && c <= 0xDBFF && this.shown < this.target.length) this.shown++;   // never split an emoji
+    }
+    const busy = this.shown > 4000 ? 70 : 0;                        // long answers: ~14 renders/s
+    if ((this.shown !== this.rendered || !this.live) && ts - this.last >= busy) { this.render(); this.last = ts; }
+    if (this.shown < this.target.length || this.shown !== this.rendered) this.kick();
+  }
+  render() {
+    const c = $('conv'), stick = c.scrollHeight - c.scrollTop - c.clientHeight < 60;
+    this.el.innerHTML = md(this.target.slice(0, this.shown));
+    if (this.live || this.shown < this.target.length) {
+      const k = document.createElement('span'); k.className = 'caret'; lastTextHost(this.el).appendChild(k);
+    }
+    this.rendered = this.shown;
+    if (stick) c.scrollTop = c.scrollHeight;
+  }
+}
+
+const PHASE = s => !s ? 'Waiting for the board' : s.startsWith('loading') ? s[0].toUpperCase() + s.slice(1)
+  : ({ starting: 'Starting', 'program image': 'Preparing the program image', prefill: 'Prefill',
+       'vision encoder': 'Vision encoder', 'audio encoder': 'Audio encoder',
+       'vision + audio encoders': 'Vision + audio encoders', decode: 'Decoding' }[s] || s[0].toUpperCase() + s.slice(1));
+
+const newId = () => Math.random().toString(36).slice(2) + Date.now().toString(36);
+let convId = newId();
+function newChat() {
+  if (chatJob) return;
+  conv = []; convId = newId(); $('conv').innerHTML = '<div class="empty" id="empty">Ask something — answers stream from the board token by token.</div>';
+  $('cmetrics').hidden = true; setStatus('');
+}
+$('clear').onclick = newChat;
+function addTurn(m) {
+  const e = $('empty'); if (e) e.remove();
+  const t = document.createElement('div'); t.className = 'turn ' + m.role;
+  const el = document.createElement('div'); el.className = 'msg'; t.appendChild(el);
+  if (m.attachments && (m.attachments.image || m.attachments.audio)) {
+    el.insertAdjacentHTML('beforeend', '<div class="att">' + (m.attachments.image ? `<img src="${m.attachments.image.url}" alt="">` : '') +
+      (m.attachments.audio ? `<span>♪ ${esc(m.attachments.audio.name)}</span>` : '') + '</div>');
+  }
+  if (m.role === 'user') el.appendChild(document.createTextNode(m.content));
+  else {
+    el.insertAdjacentHTML('beforeend', '<div class="phase"><span class="dots"><i></i><i></i><i></i></span><span class="ptext">Sending…</span></div><div class="md"></div><div class="foot"></div>');
+    t.onclick = ev => { if (m.metrics && !window.getSelection().toString()) showMetrics(m); };
+  }
+  $('conv').appendChild(t); m.turn = t; m.el = el;
+  $('conv').scrollTop = $('conv').scrollHeight;
+}
+function autosize() { const t = $('input'); t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 220) + 'px'; }
+$('input').addEventListener('input', autosize);
+
+async function send() {
+  const m = model(); if (!m || m.kind !== 'chat' || chatJob) return;
+  const text = $('input').value.trim();
+  if (!text && !att.image && !att.audio) return;
+  const user = { role: 'user', content: text, attachments: { image: att.image, audio: att.audio } };
+  conv.push(user); addTurn(user);
+  // The whole conversation goes along, but the board keeps it in its K/V cache:
+  // a message that continues the same chat (same id) prefills only itself.
+  const history = conv.filter(x => !x.failed).map(x => ({ role: x.role, content: x.content }));
+  const body = { model: m.id, messages: history, conversation: convId,
+                 max_new_tokens: parseInt($('maxnew').value || '8192', 10) };
+  if (att.image) body.image = { name: att.image.name, data: att.image.data };
+  if (att.audio) body.audio = { name: att.audio.name, data: att.audio.data };
+  $('input').value = ''; autosize(); att = { image: null, audio: null }; refreshTools();
+  const bot = { role: 'assistant', content: '', model: m.id }; conv.push(bot); addTurn(bot);
+  bot.stream = new Streamer(bot.el.querySelector('.md'));
+  $('send').hidden = true; $('stop').hidden = false; setStatus(''); $('clog').textContent = '';
+  chatJob = 'pending';
+  let r, j;
+  try {
+    r = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    j = await r.json();
+  } catch (e) { j = { error: e.message }; r = { ok: false }; }
+  if (!r.ok) { finishBot(bot, null, j.error || 'request rejected'); return; }
+  chatJob = j.id; bot.job = j.id; follow(bot);
+}
+
+// Live state of the running answer: phase label with its own timer, then the token counter.
+function showLive(bot) {
+  const L = bot.livestate; if (!L) return;
+  const ph = bot.el.querySelector('.phase'), foot = bot.el.querySelector('.foot');
+  const since = (performance.now() - L.at) / 1000;
+  if (L.state === 'queued') { ph.hidden = false; ph.querySelector('.ptext').textContent = `Queued — ${L.position} ahead`; return; }
+  if (!L.tokens) {
+    ph.hidden = false;
+    ph.querySelector('.ptext').textContent = `${PHASE(L.status)} · ${(L.status_s + since).toFixed(1)} s`;
+    return;
+  }
+  ph.hidden = true;
+  const dt = L.decode_s ? L.decode_s + since : 0;
+  foot.innerHTML = `<span><b>${L.tokens}</b> tokens</span>` + (dt > 0.2 ? `<span><b>${(L.tokens / dt).toFixed(1)}</b> tok/s</span>` : '') +
+    (L.ttft_s != null ? `<span>first token after <b>${L.ttft_s.toFixed(2)} s</b></span>` : '');
+}
+function follow(bot) {
+  let es, done = false, polling = false, lastEvent = performance.now();
+  const tick = setInterval(() => {
+    showLive(bot);
+    // The server beats every 0.5 s; a silent stream (a proxy or port forward
+    // buffering it) falls back to polling so the answer still arrives and the
+    // "working" dots stop when the board does.
+    if (es && !polling && performance.now() - lastEvent > 3000) { es.close(); es = null; startPoll(); }
+  }, 100);
+  const onDelta = d => {
+    lastEvent = performance.now();
+    if (d.reset) bot.stream.reset(d.text); else if (d.text) bot.stream.push(d.text);
+    bot.livestate = { ...d, at: performance.now() }; showLive(bot);
+  };
+  const onDone = j => {
+    if (done) return; done = true; clearInterval(tick); if (es) es.close();
+    $('clog').textContent = j.log || '';
+    if (j.state === 'done') {
+      bot.metrics = j.metrics; bot.content = j.text;
+      bot.stream.finish(j.text || '');
+      finishBot(bot, j, null);
+    } else finishBot(bot, j, j.state === 'cancelled' ? 'cancelled' : (j.error || 'failed'));
+  };
+  const startPoll = () => { if (!polling) { polling = true; poll(); } };
+  const poll = async () => {                        // fallback when the event stream drops
+    while (!done) {
+      try {
+        const j = await (await fetch('/api/jobs/' + bot.job)).json();
+        const prev = bot.stream.target;
+        onDelta({ ...j, text: j.text.startsWith(prev) ? j.text.slice(prev.length) : j.text, reset: !j.text.startsWith(prev) });
+        if (['done', 'error', 'cancelled'].includes(j.state)) { onDone(j); return; }
+      } catch (e) { /* retry */ }
+      await new Promise(r => setTimeout(r, 400));
+    }
+  };
+  if (window.EventSource) {
+    es = new EventSource(`/api/jobs/${bot.job}/stream`);
+    es.addEventListener('delta', e => onDelta(JSON.parse(e.data)));
+    es.addEventListener('done', e => onDone(JSON.parse(e.data)));
+    es.onerror = () => { if (!done && es) { es.close(); es = null; startPoll(); } };
+  } else startPoll();
+}
+function finishBot(bot, j, err) {
+  chatJob = null; $('send').hidden = false; $('stop').hidden = true;
+  bot.el.querySelector('.phase').hidden = true;
+  const foot = bot.el.querySelector('.foot');
+  if (err) {
+    bot.failed = true; conv[conv.indexOf(bot) - 1].failed = true;
+    bot.el.classList.add('err'); bot.stream.finish((bot.stream.target ? bot.stream.target + '\n\n' : '') + '**Error:** ' + err);
+    foot.textContent = ''; setStatus('Failed: ' + err, true);
+  } else {
+    const mm = j.metrics || {};
+    const dec = mm.phases ? mm.phases.find(p => p.name === 'Decode') : null;
+    foot.innerHTML = `<span><b>${mm.generated_tokens}</b> tokens</span>` +
+      `<span>TTFT <b>${sec(mm.ttft_hw_s)}</b> on the engines</span>` +
+      `<span><b>${num(mm.decode_hw_tok_s)}</b> tok/s decode</span>` +
+      (dec && dec.gflops ? `<span><b>${dec.gflops.toFixed(0)}</b> GFLOPS</span>` : '') +
+      (mm.stopped ? '<span>stopped</span>' : '') + '<a>details ↓</a>';
+    setStatus(mm.history_dropped ? `${mm.history_dropped} earlier turn(s) dropped to fit the prompt window.` : '');
+    showMetrics(bot);
+  }
+  loadModels();
+}
+function showMetrics(bot) {
+  for (const x of conv) if (x.turn) x.turn.classList.toggle('sel', x === bot);
+  const mm = bot.metrics; if (!mm) return;
+  const info = mm.resident || {}, title = (models.find(m => m.id === bot.model) || {}).title || bot.model;
+  $('cmtitle').textContent = `Run on the board — ${title}, ${info.engines || '?'} engines`;
+  const kv = [
+    ['Prompt tokens' + (mm.cached_tokens ? ' (new)' : ''), mm.prompt_tokens + (mm.image_tokens ? ` (${mm.image_tokens} image)` : '') + (mm.audio_tokens ? ` (${mm.audio_tokens} audio)` : '')],
+    ...(mm.context_tokens ? [['Context in K/V cache', `${mm.context_tokens} / ${mm.max_context}` + (mm.cached_tokens ? ` (${mm.cached_tokens} reused)` : '')]] : []),
+    ['Generated tokens', mm.generated_tokens],
+    ['TTFT, engines', sec(mm.ttft_hw_s)],
+    ['TTFT, wall', sec(mm.ttft_wall_s)],
+    ['Decode, first token', mm.decode_first_tok_s ? mm.decode_first_tok_s.toFixed(1) + ' tok/s' : '—'],
+    ['Decode, engines', mm.decode_hw_tok_s ? mm.decode_hw_tok_s.toFixed(1) + ' tok/s' : '—'],
+    ['Decode, wall', mm.decode_wall_tok_s ? mm.decode_wall_tok_s.toFixed(1) + ' tok/s' : '—'],
+    ['Request wall time', sec(mm.wall_s)],
+  ];
+  $('ckv').innerHTML = kv.map(([k, v]) => `<div>${k}<b>${v}</b></div>`).join('');
+  const body = (mm.phases || []).map(p => ({ cells: [
+    esc(p.name) + (p.note ? `<div class="note" style="margin:0">${esc(p.note)}</div>` : ''),
+    p.tokens ?? '—', sec(p.hw_s), sec(p.wall_s), p.tok_s ? p.tok_s.toFixed(1) : '—',
+    p.flops ? gf(p.flops) : '—', p.gflops ? p.gflops.toFixed(1) : '—', p.engines,
+    { util: p.utilization }] }));
+  const hw = (mm.phases || []).reduce((a, p) => a + (p.hw_s || 0), 0);
+  const fl = (mm.phases || []).reduce((a, p) => a + (p.flops || 0), 0);
+  const peak = info.peak_gflops || 0;
+  body.push({ total: true, cells: ['Total', '', sec(hw), '', '', fl ? gf(fl) : '', fl && hw ? (fl / hw / 1e9).toFixed(1) : '', info.engines || '',
+    { util: fl && hw && peak ? fl / hw / 1e9 / peak : null }] });
+  $('ctable').innerHTML = rows(['Phase', 'Tokens', 'Engine time', 'Wall', 'tok/s', 'Work', 'GFLOPS', 'Engines', 'Of raw peak'], body);
+  $('cnote').textContent =
+    (peak ? `Raw peak ${peak.toFixed(0)} GFLOPS = ${info.engines} engines × 128 FLOP/cycle at ${info.clock_mhz.toFixed(0)} MHz; each phase is scored against the peak of the engines it runs on. ` : '') +
+    'Engine time is the on-device latency counter; wall adds the host side (DMA, embedding lookups, argmax readback, tokenizer). ' +
+    'Decode tok/s on the engines sums every token\'s counter; the first-token rate is the single fastest point. ' +
+    (mm.compile_s > 0.05 ? `This prompt length needed a program-image ${mm.compile_reused ? 'reload' : 'recompile'} on the host (${mm.compile_s.toFixed(1)} s, outside the figures above). ` : '') +
+    (mm.history_dropped ? `${mm.history_dropped} earlier turn(s) were dropped to fit the prompt window. ` : '');
+  $('cmetrics').hidden = false;
+}
+$('send').onclick = send;
+$('stop').onclick = () => { if (chatJob && chatJob !== 'pending') fetch(`/api/jobs/${chatJob}/stop`, { method: 'POST' }); };
+$('input').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+
+// --------------------------------------------------------------- FLUX.2 klein (as flux2_klein_4b_server.py)
+let configs = [], board = {}, fcurrent = null, ftimer = null;
+const NAMES = { te: 'Text encoder (Qwen3-4B)', dit: 'Diffusion transformer', vae: 'VAE decoder' };
+function fmt(c) { return `${c.width}×${c.height} — ${c.max_seq_len} text tokens, ${c.steps} steps, ${c.engines} engines`; }
+function peakOf(c) { return board.peak_gflops_per_engine ? board.peak_gflops_per_engine * c.engines : 0; }
+function showFluxStatic() {
+  const c = configs.find(x => x.id === $('config').value);
+  if (!c) { $('fstatic').hidden = true; return; }
+  const w = board.weights || {};
+  const wtotal = (w.te || 0) + (w.dit || 0) + (w.vae || 0) + (w.embed_tokens || 0);
+  $('weights').innerHTML = rows(['Image', 'Format', 'Where', 'Size'], [
+    { cells: ['Text encoder', 'IF4', 'params arena, sent per run', gb(w.te || 0)] },
+    { cells: ['Diffusion transformer', 'IF4 + BF16 heads', 'params arena, sent per run', gb(w.dit || 0)] },
+    { cells: ['VAE decoder', (w.vae_precision || 'if8').toUpperCase() + (w.vae_precision === 'bf16' ? ' (exact checkpoint weights)' : ''), 'params arena, sent per run', gb(w.vae || 0)] },
+    { cells: ['Token embedding table', 'BF16', 'tensor region, resident', gb(w.embed_tokens || 0)] },
+    { cells: ['Total on the board', '', '', gb(wtotal)], total: true },
+  ]);
+  const peak = peakOf(c), body = [];
+  for (const n of ['te', 'dit', 'vae']) {
+    const p = c.phases[n]; if (!p) continue;
+    body.push({ cells: [NAMES[n], gb(p.program_bytes), gb(p.worker_bytes), gb(p.all_engines_bytes), tf(p.flops), peak ? (p.flops / peak / 1e9).toFixed(1) + ' s' : '—'] });
+  }
+  const o = c.other_images || { program_bytes: 0, worker_bytes: 0, all_engines_bytes: 0, count: 0 };
+  if (o.count) body.push({ cells: [`Barrier flag-clear stubs (${o.count} × ${o.all_engines_bytes / o.count} B)`, gb(o.program_bytes), gb(o.worker_bytes), gb(o.all_engines_bytes), '', ''] });
+  const sum = k => Object.values(c.phases).reduce((a, p) => a + p[k], 0) + o[k];
+  body.push({ cells: ['Total (program bin)', gb(sum('program_bytes')), gb(sum('worker_bytes')), gb(c.program_bin_bytes), tf(c.total_flops), peak ? (c.total_flops / peak / 1e9).toFixed(1) + ' s' : '—'], total: true });
+  $('programs').innerHTML = rows(['Phase', 'Engine 0', `Engines 1–${c.engines - 1}`, 'All engines', 'Work', 'At peak'], body);
+  $('staticnote').textContent =
+    `${c.image_tokens} image + ${c.max_seq_len} text tokens. Engine 0 runs the primary program of each phase and every other engine its own worker program; the bin is all of them. ` +
+    `A ${gb(c.vae_const_bytes)} VAE constant image is built from the weights per run; tensor DRAM ${gb(c.tensor_dram_bytes)}. ` +
+    (peak ? `Raw peak ${peak.toFixed(0)} GFLOPS = ${c.engines} engines × 128 FLOP/cycle at ${board.clock_mhz.toFixed(0)} MHz.` : 'The raw peak of the board is known after the first run.');
+  $('fstatic').hidden = false;
+}
+// The 256x256 and 512x512 (64 text tokens) program sets are built when FLUX is
+// opened (on the host, no board needed); show how that goes.
+let fbuildTimer = null;
+const buildKey = c => `${c.height}x${c.width}x${c.max_seq_len}`;
+function buildBusy(c) { const b = (state.flux.builds || {})[buildKey(c)]; return !!b && (b.state === 'queued' || b.state === 'building'); }
+function showBuilds() {
+  const b = state.flux.builds || {}, keys = Object.keys(b);
+  if (!keys.length || ftimer) return;
+  const name = k => { if (k === 'weights') return 'FLUX weights (one-time export)'; const [h, w, t] = k.split('x'); return `${w}×${h} (${t} text tokens)`; };
+  const busy = keys.filter(k => b[k].state === 'queued' || b[k].state === 'building');
+  const err = keys.filter(k => b[k].state === 'error');
+  $('fstatus').className = 'status' + (err.length ? ' err' : '');
+  $('fstatus').textContent =
+    busy.length ? 'Building programs: ' + busy.map(k => `${name(k)} ${b[k].state === 'building' ? b[k].seconds.toFixed(0) + ' s' : 'queued'}`).join(', ') + '…'
+    : err.length ? 'Program build failed: ' + err.map(k => `${name(k)}: ${b[k].error || 'error'}`).join('; ')
+    : 'Programs ready: ' + keys.map(name).join(', ') + '.';
+  const c = configs.find(x => x.id === $('config').value);
+  $('go').disabled = !!(c && buildBusy(c));
+}
+async function prepareFlux() {
+  try {
+    const r = await (await fetch('/api/flux/prepare', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).json();
+    state.flux.builds = r.builds; state.flux.configs = r.configs; loadFluxConfigs();
+  } catch (e) { return; }
+  if (fbuildTimer) return;
+  fbuildTimer = setInterval(async () => {
+    try { await loadModels(); } catch (e) { return; }
+    const b = state.flux.builds || {};
+    if (!Object.values(b).some(x => x.state === 'queued' || x.state === 'building')) { clearInterval(fbuildTimer); fbuildTimer = null; }
+  }, 2000);
+}
+function loadFluxConfigs() {
+  configs = state.flux.configs; board = state.flux.board;
+  const sel = $('config'), keep = sel.value; sel.innerHTML = '';
+  for (const c of configs) { const o = document.createElement('option'); o.value = c.id; o.textContent = fmt(c) + (buildBusy(c) ? ' — building…' : ''); sel.appendChild(o); }
+  if (!configs.length) { $('fstatus').textContent = 'No compiled program sets yet (building them…).'; $('go').disabled = true; }
+  else sel.value = configs.some(c => c.id === keep) ? keep : (configs.find(c => c.width === 256 && c.max_seq_len === 64) || configs[0]).id;
+  showFluxStatic(); showBuilds();
+}
+function showFluxJob(j) {
+  if (!j || j.state !== 'done') return;
+  $('img').src = j.image + '?t=' + (j.result && j.result.total_s || 0);
+  const r = j.result || {};
+  $('fmeta').innerHTML = `“${esc(j.prompt)}” — ${j.config.width}×${j.config.height}, seed ${j.seed}` +
+    (r.device_s ? ` — ${r.device_s.toFixed(1)} s of engine time` : (r.total_s ? ` — ${r.total_s.toFixed(1)} s` : '')) +
+    (r.reload ? ` — setup ${r.setup_s.toFixed(1)} s: programs ${r.reload.programs ? 'reloaded' : 'kept on the board'}, ` +
+                `TE + DiT weight images (${gb(r.reload.weight_bytes)}) re-sent` +
+                (r.reload.embed === undefined ? '' : `, token embedding table ${r.reload.embed ? 'sent' : 'already resident'}`) : '');
+  const body = [];
+  if (r.phases) {
+    for (const n of ['te', 'dit', 'vae']) {
+      const p = r.phases[n]; if (!p) continue;
+      body.push({ cells: [NAMES[n], tf(p.flops), p.device_s.toFixed(2) + ' s', p.gflops.toFixed(0), { util: p.utilization }] });
+    }
+    body.push({ cells: ['Total', tf(r.total_flops), r.device_s.toFixed(2) + ' s', r.total_gflops.toFixed(0), { util: r.utilization }], total: true });
+    $('stats').innerHTML = rows(['Phase', 'Work', 'Engine time', 'GFLOPS', 'Of raw peak'], body);
+    $('statsnote').textContent =
+      `Raw peak ${r.peak_gflops.toFixed(0)} GFLOPS (${r.engines} engines × 128 FLOP/cycle at ${r.clock_mhz.toFixed(0)} MHz). ` +
+      `Every rate uses the engines' own execution time (the on-device latency counter of each phase); the total is the sum of the three. ` +
+      `The host side (weight DMA, tokenizing, the PNG) is outside these numbers: ${(r.wall_s || r.total_s).toFixed(1)} s wall for the whole run.`;
+  } else {
+    $('stats').innerHTML = ''; $('statsnote').textContent = r.total_s ? `TE ${r.te_s.toFixed(1)} s, DiT ${r.dit_s.toFixed(1)} s, VAE ${r.vae_s.toFixed(1)} s.` : '';
+  }
+  $('fresult').hidden = false;
+}
+async function loadFluxHistory() {
+  const jobs = (await (await fetch('/api/jobs')).json()).filter(j => j.kind === 'image' && j.state === 'done');
+  if (jobs.length && fcurrent === null) showFluxJob(jobs[jobs.length - 1]);
+  $('fhistory').hidden = jobs.length < 2; $('hist').innerHTML = '';
+  for (const j of jobs.slice().reverse()) {
+    const im = document.createElement('img'); im.src = j.image; im.title = j.prompt;
+    im.onclick = () => showFluxJob(j); $('hist').appendChild(im);
+  }
+}
+async function pollFlux() {
+  const j = await (await fetch('/api/jobs/' + fcurrent)).json();
+  $('flog').textContent = j.log;
+  if (j.state === 'queued') $('fstatus').textContent = `Queued (${j.position} ahead)…`;
+  else if (j.state === 'running') $('fstatus').textContent = `Running on the board… ${j.elapsed.toFixed(0)} s`;
+  else {
+    clearInterval(ftimer); ftimer = null; $('go').disabled = false;
+    $('fstatus').className = 'status' + (j.state === 'error' ? ' err' : '');
+    $('fstatus').textContent = j.state === 'error' ? 'Failed: ' + j.error : `Done in ${j.elapsed.toFixed(1)} s.`;
+    showFluxJob(j); loadFluxHistory(); await loadModels();
+  }
+}
+$('config').onchange = () => { showFluxStatic(); showBuilds(); };
+$('go').onclick = async () => {
+  const body = { prompt: $('prompt').value, config: $('config').value, seed: parseInt($('seed').value || '0', 10), no_reload: $('noreload').checked };
+  $('go').disabled = true; $('fstatus').className = 'status'; $('fstatus').textContent = 'Submitting…'; $('flog').textContent = '';
+  const r = await fetch('/api/generate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const j = await r.json();
+  if (!r.ok) { $('fstatus').className = 'status err'; $('fstatus').textContent = j.error || 'request rejected'; $('go').disabled = false; return; }
+  fcurrent = j.id; pollFlux(); ftimer = setInterval(pollFlux, 1000);
+};
+
+loadModels();
+setInterval(() => { if (!chatJob && !ftimer) loadModels(); }, 10000);
+</script>
+</body>
+</html>

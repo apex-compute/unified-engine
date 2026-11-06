@@ -1785,6 +1785,58 @@ class ColumnMatmatOp:
 
 
 @dataclass
+class RowsColumnOp:
+    """A quantized projection over ALL rows of a RUNTIME-length input, split by columns.
+
+    The prefill counterpart of a ``(ShardedWeight, a, out, gelu)`` decode op. Decode has
+    one row, so its column block is one contiguous run; prefill has a runtime row count
+    (one captured body serves every prompt length), so engine i computes ALL rows of its
+    column block and writes them IN PLACE into the shared ``[rows, N]`` output at its
+    column offset, ``N`` elements apart (``gpr_out_row_stride_reg``). Splitting rows
+    instead would bake the length into each engine's slice, and pad a 16-token prompt's
+    two rows per engine out to a 64-row tile anyway.
+
+    ``slices`` maps engine -> list of :class:`WeightShard` (layer 0 addresses plus
+    per-layer strides). One engine may hold several slices of one op (or none: it still
+    runs the round's handshake). Slices come either from a materialized
+    :class:`ShardedWeight` (:meth:`from_sharded`, the decode copies -- each engine reads
+    its own private window) or from zero-copy row blocks of the shared image
+    (:meth:`MultiEngineScheduler.zero_copy_column_slices`, for weights too narrow to
+    have decode shards on every engine).
+
+    ``out_kv_relative``: ``out_addr`` is layer 0 of a KV cache and the engine's per-layer
+    KV cursor is added on top (a V projection writing straight into the cache).
+    """
+
+    name: str
+    K: int
+    N: int                 # FULL output width = output row pitch (elements)
+    a_addr: int
+    out_addr: int
+    slices: dict
+    gelu: bool = False
+    out_kv_relative: bool = False
+    data_type: object = None
+    bytes_per_element: int = 2
+
+    @classmethod
+    def from_sharded(cls, sw: "ShardedWeight", a_addr: int, out_addr: int,
+                     gelu: bool = False, out_kv_relative: bool = False) -> "RowsColumnOp":
+        return cls(name=sw.name, K=sw.K, N=sw.N, a_addr=a_addr, out_addr=out_addr,
+                   slices={s.engine_idx: [s] for s in sw.shards}, gelu=gelu,
+                   out_kv_relative=out_kv_relative, data_type=sw.data_type)
+
+    def engine_slices(self, engine_idx: int) -> list:
+        return list(self.slices.get(engine_idx, ()))
+
+    def flops(self, rows: int, engine_idx: Optional[int] = None) -> int:
+        """2*rows*K*cols over one engine's slices, or over every engine's."""
+        engines = self.slices if engine_idx is None else (engine_idx,)
+        return sum(2 * rows * self.K * sh.cols
+                   for e in engines for sh in self.slices.get(e, ()))
+
+
+@dataclass
 class ShardedAttention:
     """A unified_attention_core distributed over its batch (query-row) dimension."""
 
@@ -4618,6 +4670,197 @@ class MultiEngineScheduler:
             self._check_isa_fits(
                 idx, self._persistent_preamble[idx], preamble_bytes)
             ue.allocate_program_dram(preamble_bytes)
+
+    # -- runtime-row column-sharded programs (prefill) ----------------------
+    def zero_copy_column_slices(self, weights, data_type=None) -> dict:
+        """Split several narrow weights' columns over the engines WITHOUT copying them.
+
+        ``weights`` is a list of ``(name, main_weight_addr, main_scale_addr, K, N,
+        main_layer_stride)``. Their 64-column blocks are concatenated in order and dealt
+        out as contiguous runs, remainder to the leading engines, so the WORK balances
+        even when no single weight is wide enough to reach every engine (gemma3's K and V
+        are four blocks each: at 8 engines, engines 0-3 take K and 4-7 take V). Returns
+        ``{name: {engine_idx: [WeightShard, ...]}}`` with addresses into the SHARED image
+        and its own per-layer stride -- for an op that :class:`RowsColumnOp` steps by a
+        layer index, a column block of a layer-strided blob needs no packing.
+        """
+        if data_type is None:
+            data_type = user_dma_core.TYPE.IF4
+        bpe_w = _weight_elem_bytes(data_type)
+        blocks = []                            # (weight index, column offset)
+        for wi, (_n, _w, _s, K, N, _ls) in enumerate(weights):
+            if N % COL_ALIGN or K % user_dma_core.UE_VECTOR_SIZE:
+                raise ValueError(f"zero_copy_column_slices: {_n} N={N} K={K} not block-aligned")
+            blocks.extend((wi, c) for c in range(0, N, COL_ALIGN))
+        n = min(self.num_engines, len(blocks))
+        base, rem = divmod(len(blocks), n)
+        counts = [base + (1 if i < rem else 0) for i in range(n)]
+        out = {w[0]: {} for w in weights}
+        pos = 0
+        for e, cnt in enumerate(counts):
+            run = blocks[pos:pos + cnt]
+            pos += cnt
+            # Merge consecutive blocks of the same weight into one slice.
+            i = 0
+            while i < len(run):
+                wi, c0 = run[i]
+                j = i
+                while j + 1 < len(run) and run[j + 1][0] == wi:
+                    j += 1
+                cols = (j - i + 1) * COL_ALIGN
+                name, w_addr, s_addr, K, _N, ls = weights[wi]
+                out[name].setdefault(e, []).append(WeightShard(
+                    engine_idx=e, col_offset=c0, cols=cols,
+                    weight_addr=w_addr + int(c0 * K * bpe_w),
+                    scale_addr=s_addr + (c0 * K // user_dma_core.UE_VECTOR_SIZE) * 2,
+                    layer_stride=ls, scale_layer_stride=ls))
+                i = j + 1
+        return out
+
+    def emit_rows_slice(self, ue, op: RowsColumnOp, shard: WeightShard, *,
+                        gpr_M: int, gpr_K: int, gpr_stride: int, gpr_layer: int,
+                        gpr_w: int, gpr_s: int, gpr_a: int, gpr_out: int,
+                        gpr_kv: Optional[int] = None, M_template: int = 64) -> int:
+        """Emit ONE slice of a :class:`RowsColumnOp` into ``ue``'s capture.
+
+        Shared by the primary (inside its own folded layer body) and the workers (inside
+        :meth:`emit_rows_worker_programs`), so the two cannot disagree on addressing.
+        The slice's layer-L weight/scale bases are ``base + L*stride``, computed from the
+        ONE layer-index register ``gpr_layer`` into the scratch ``gpr_w`` / ``gpr_s`` (with
+        ``gpr_out`` as the stride operand before it takes the output base) --
+        a cursor pair per slice would cost the primary a dozen registers it does not
+        have. ``gpr_M`` is the RUNTIME row count; ``gpr_stride`` holds ``op.N``.
+        Returns this slice's FLOPs at ``M_template`` rows.
+        """
+        sh = user_dma_core.ue_35bit_addr_shifter
+        # base + layer * stride, in words. The stride goes through a REGISTER (gpr_out, not
+        # yet live): MUL32_IMM keeps only the low 16 bits of its immediate on hardware, and a
+        # shared-image layer stride (~43 MB) or a wide private shard is far past that.
+        for gpr_dst, stride, base, what in ((gpr_w, shard.layer_stride, shard.weight_addr, "weight"),
+                                            (gpr_s, shard.scale_layer_stride, shard.scale_addr, "scale")):
+            if stride % 8:
+                raise ValueError(f"{op.name}: {what} layer stride {stride} is not word-aligned")
+            ue.generate_instruction_add_set(gpr_out, stride >> 3)
+            ue.generate_instruction_mul32_reg(gpr_dst, gpr_layer, gpr_out)
+            ue.generate_instruction_add_imm(src_reg_idx=gpr_dst, immediate_value=sh(base),
+                                            dst_reg_idx=gpr_dst)
+        out_lit = _shifted(op.out_addr, shard.col_offset * op.bytes_per_element,
+                           f"{op.name} out")
+        ue.generate_instruction_add_set(gpr_a, sh(op.a_addr))
+        if op.out_kv_relative:
+            if gpr_kv is None:
+                raise ValueError(f"{op.name}: KV-relative output needs a KV cursor register")
+            ue.generate_instruction_add_imm(src_reg_idx=gpr_kv, immediate_value=sh(out_lit),
+                                            dst_reg_idx=gpr_out)
+        else:
+            ue.generate_instruction_add_set(gpr_out, sh(out_lit))
+        return ue.quantized_matmat_core(
+            M=M_template, K=op.K, N=shard.cols,
+            A_DRAM_ADDR=op.a_addr, B_DRAM_ADDR=shard.weight_addr,
+            OUTPUT_DRAM_ADDR=out_lit, SCALE_DRAM_ADDR=shard.scale_addr,
+            data_type=op.data_type or user_dma_core.TYPE.IF4, gelu_enable=op.gelu,
+            gpr_M_reg=gpr_M, gpr_K_reg=gpr_K,
+            gpr_a_addr=gpr_a, gpr_b_addr=gpr_w, gpr_out_addr=gpr_out, gpr_scale_addr=gpr_s,
+            gpr_out_row_stride_reg=gpr_stride) or 0
+
+    def emit_rows_worker_programs(self, rounds, layers: int,
+                                  kv_layer_stride: int = 0) -> tuple[list[int], list[int]]:
+        """Compile and upload each worker's WHOLE runtime-row program (prefill).
+
+        The :meth:`emit_worker_program` structure -- ONE body, hardware-looped ``layers``
+        times, one four-phase rendezvous per round against the master's
+        :meth:`release` / :meth:`join` -- for :class:`RowsColumnOp` rounds whose row
+        count is a RUNTIME value. Unlike :meth:`emit_worker_program` it leaves the
+        persistent (decode) program state alone, so both stay resident: launch these with
+        ``start_workers(addrs, gpr_sets_by_worker=[[(m_reg, rows), (kv_reg, row0_words)] ...])``
+        (``self.rows_kv_regs[i]`` is the KV cursor register, None when no op writes the KV cache).
+
+        Returns ``(program addresses, row-count register)`` per worker, in worker order.
+        """
+        self._require_private_map("emit_rows_worker_programs")
+        self._latch_rendezvous("master_worker")
+        sh = user_dma_core.ue_35bit_addr_shifter
+        need_kv = any(op.out_kv_relative for rnd in rounds for op in rnd)
+        addrs, m_regs = [], []
+        # The KV cursor (when an op writes into the KV cache) is primed by the same
+        # per-run preamble as the row count: the cache row the first row writes to
+        # (a prompt chunk or a continued conversation starts past row 0).
+        self.rows_kv_regs = []
+        for idx in self.worker_indices():
+            ue = self.engines[idx]
+            ue.clear_inst_id()
+            ue.reset_isa_reg_counter()
+            ue.start_capture()
+            ue.generate_instruction_flag_clear()
+            # Row count FIRST: gpr_M_reg rides a narrow field (low register window). It is
+            # written by the per-run preamble start_workers builds, never by this program.
+            gpr_M = ue.alloc_isa_reg()
+            gpr_cnt = ue.alloc_isa_reg()
+            gpr_layer = ue.alloc_isa_reg()
+            gpr_kv = ue.alloc_isa_reg() if need_kv else None
+            gpr_w, gpr_s = ue.alloc_isa_reg(), ue.alloc_isa_reg()
+            gpr_a, gpr_out = ue.alloc_isa_reg(), ue.alloc_isa_reg()
+            ue.generate_instruction_add_set(gpr_cnt, layers)
+            ue.generate_instruction_add_set(gpr_layer, 0)
+            # One register per distinct K and per distinct output pitch, shared by ops.
+            dim_regs = {}
+            def _dim(kind, v):
+                key = (kind, v)
+                if key not in dim_regs:
+                    dim_regs[key] = ue.alloc_isa_reg()
+                    ue.generate_instruction_add_set(dim_regs[key], v)
+                return dim_regs[key]
+            for rnd in rounds:
+                for op in rnd:
+                    if op.engine_slices(idx):
+                        _dim("K", op.K)
+                        _dim("N", op.N)
+
+            ue.pad_capture_to_64b_boundary()
+            body_word_addr = sh(ue.get_program_dram_addr()
+                                + ue.capture_count * user_dma_core.INSTRUCTION_SIZE_BYTES)
+            for rnd in rounds:
+                ue.generate_instruction_flag_check_set(target_engine_idx=0)    # 1: go
+                for op in rnd:
+                    for shard in op.engine_slices(idx):
+                        self.emit_rows_slice(
+                            ue, op, shard, gpr_M=gpr_M, gpr_K=_dim("K", op.K),
+                            gpr_stride=_dim("N", op.N), gpr_layer=gpr_layer,
+                            gpr_w=gpr_w, gpr_s=gpr_s, gpr_a=gpr_a, gpr_out=gpr_out,
+                            gpr_kv=gpr_kv)
+                ue.generate_instruction_flag_set()                             # 2: done
+                ue.generate_instruction_flag_check_clear(target_engine_idx=0)  # 3: closed
+                ue.generate_instruction_flag_clear()                           # 4: re-armed
+            ue.generate_instruction_add_inc(gpr_layer)
+            if gpr_kv is not None:
+                ue.generate_instruction_add_imm(src_reg_idx=gpr_kv,
+                                                immediate_value=sh(kv_layer_stride),
+                                                dst_reg_idx=gpr_kv)
+            ue.generate_instruction_add_dec(reg_idx=gpr_cnt)
+            ue.generate_instruction_jump_abs_jnz(body_word_addr, gpr_cnt)
+            ue.generate_instruction_halt()
+            ue.stop_capture()
+
+            issues = user_dma_core.check_isa_jumps(
+                ue.capture_buffer, ue.get_program_dram_addr(), name=f"rows_worker{idx}")
+            if issues:
+                ue.clear_capture_buffer()
+                raise RuntimeError(f"engine {idx} rows program jump violations: {issues}")
+            addr = ue.get_program_dram_addr()
+            size = ue.get_capture_instruction_size_bytes()
+            self._check_isa_fits(idx, addr, size)
+            try:
+                written = ue.write_captured_instructions_to_dram(addr)
+                if written != size:
+                    raise IOError(f"engine {idx} rows program upload wrote "
+                                  f"{written} of {size} bytes")
+            finally:
+                ue.clear_capture_buffer()
+            ue.allocate_program_dram(size)
+            addrs.append(addr)
+            m_regs.append(gpr_M)
+            self.rows_kv_regs.append(gpr_kv)
+        return addrs, m_regs
 
     def reset_workers(self) -> None:
         """Clear stale flags left set by an aborted run, so the next rendezvous is clean.

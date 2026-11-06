@@ -1162,6 +1162,14 @@ class Qwen25OmniLMMixin:
         uses exactly V.T ``[AHD,A]``, score/P ``[G,A]``, and scaled-Q
         ``[G,AHD]``.  It returns ``(all_flops, kv_length_scaled_flops)`` so the
         decode reporter can keep the fixed Q scaling out of its context term.
+
+        Storage formats follow ``unified_attention_core``'s default (FP16
+        scaled-Q, logits and probabilities; V in its own format).  The
+        softmax stores ``exp(x - fmax)`` in FP16, with ``fmax`` retained at
+        BF19, so a stored logit rounded ABOVE that max overflows it.  Omni's
+        layer-27 KV group 1 has logits near -1e4, where a BF16 store rounds
+        by up to 32 (exp(32) >> 65504) but FP16 by at most 4: BF16 logits
+        decoded "The blue color" and then turned the whole hidden state NaN.
         """
         d = self._lm_dims()
         AHD, G = int(d["AHD"]), int(d["G"])
@@ -1174,6 +1182,8 @@ class Qwen25OmniLMMixin:
         if aligned_kv_reg is None:
             raise ValueError("one-round decode attention needs runtime aligned KV")
 
+        formats, v_format, scratch_format, _identity_format, scaled_q_format = (
+            ue._resolve_attention_formats(None, None, None, None))
         v_t = scratch
         score = v_t + AHD * aligned_kv * bpe
         scaled_q = score + G * aligned_kv * bpe
@@ -1196,6 +1206,7 @@ class Qwen25OmniLMMixin:
                 mode=UE_MODE.MUL_BROADCAST,
                 scalar=1.0 / math.sqrt(AHD),
                 gpr_M_reg=batch_reg,
+                formats=formats.with_formats(output=scaled_q_format),
             ) or 0
             score_flops = ue.matmat_mul_core(
                 M=G, K=AHD, N=aligned_kv,
@@ -1208,6 +1219,8 @@ class Qwen25OmniLMMixin:
                 gpr_M_reg=batch_reg,
                 gpr_K_reg=head_dim_reg,
                 gpr_N_reg=aligned_kv_reg,
+                formats=formats.with_formats(
+                    a=scaled_q_format, output=scratch_format),
             ) or 0
             pv_flops = ue.matmat_mul_core(
                 M=G, K=aligned_kv, N=AHD,
@@ -1217,6 +1230,7 @@ class Qwen25OmniLMMixin:
                 gpr_M_reg=batch_reg,
                 gpr_K_reg=aligned_kv_reg,
                 gpr_N_reg=head_dim_reg,
+                formats=formats.with_formats(a=scratch_format, b=v_format),
             ) or 0
         finally:
             ue.release_isa_reg()  # head_dim_reg
@@ -3280,6 +3294,13 @@ class Qwen25OmniLMMixin:
             self._set_silent(True)
             if use_status:
                 _status_update()
+            # Optional per-token hook (the unified web server streams through
+            # it): on_token(token_id, text) -> True stops generation here.
+            on_token = getattr(self, "on_token", None)
+            if on_token is not None and on_token(token, piece):
+                if use_status:
+                    _status_teardown()
+                break
         else:
             # Loop ran to the token cap or the context end rather than breaking.
             if use_status:

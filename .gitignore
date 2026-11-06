@@ -4,3 +4,4 @@ models/*/*_bin/
 models/kokoro/kokoro_out.wav
 *.nky
 *.nkz
+models/unified_server/server_out/

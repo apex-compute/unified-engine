@@ -39,16 +39,30 @@ def _row_chunk(M: int, N: int, divisor: int = 2) -> int:
     return min(M, m)
 
 
+def _sigmoid_inplace(ue, addr: int, elems: int, identity64: int) -> None:
+    """sigmoid(x) in place over ``elems`` contiguous bf16 values.
+
+    The sigmoid rides the matmul writeback, applied element by element, so the
+    tensor is viewed as (elems/64, 64) and multiplied by a 64x64 identity: exact
+    in bf16 (x * 1 + 0s), 2*elems*64 FLOPs. An (N, N) identity over the (M, N)
+    view gives the same values for N/64 times the work (64x at N = 4096).
+    """
+    ue.matmat_mul_core(M=elems // UE_VECTOR_SIZE, K=UE_VECTOR_SIZE, N=UE_VECTOR_SIZE,
+                       A_DRAM_ADDR=addr, B_DRAM_ADDR=identity64,
+                       OUTPUT_DRAM_ADDR=addr, sigmoid_enable=True)
+
+
 def silu_core_dram(ue, M: int, N: int,
                    A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int,
                    IDENTITY_DRAM_ADDR: int) -> None:
     """Standalone SiLU on a (M, N) bf16 tensor: output = x * sigmoid(x).
 
+    ``IDENTITY_DRAM_ADDR`` is a 64x64 bf16 identity (see _sigmoid_inplace).
     Chunks rows so each sub-batch's bulk SRAM ops fit in URAM_A/B.
 
     Per chunk:
       1. Copy x_chunk → OUTPUT_chunk.
-      2. matmat(M_chunk, N, N) @ I(N, N) sigmoid_enable=True → sigmoid(x) at OUTPUT_chunk.
+      2. sigmoid in place at OUTPUT_chunk (64-wide identity matmul).
       3. eltwise_mul x_chunk * sigmoid(x_chunk) → OUTPUT_chunk.
     """
     assert N % UE_VECTOR_SIZE == 0, f"N={N} must be a multiple of {UE_VECTOR_SIZE}"
@@ -63,13 +77,8 @@ def silu_core_dram(ue, M: int, N: int,
         # Step 1: copy chunk to OUTPUT (so we can sigmoid in place there).
         ue.accelerator_memory_to_sram(chunk_in, URAM_A_BASE, chunk_elems)
         ue.sram_to_accelerator_memory(URAM_A_BASE, chunk_out, chunk_elems)
-        # Step 2: identity matmul with sigmoid → sigmoid(x) at OUTPUT.
-        # matmat_mul_core handles its own internal URAM chunking.
-        ue.matmat_mul_core(M=m_take, K=N, N=N,
-                           A_DRAM_ADDR=chunk_out,
-                           B_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-                           OUTPUT_DRAM_ADDR=chunk_out,
-                           sigmoid_enable=True)
+        # Step 2: sigmoid(x) in place at OUTPUT.
+        _sigmoid_inplace(ue, chunk_out, chunk_elems, IDENTITY_DRAM_ADDR)
         # Step 3: bulk x * sigmoid(x) into OUTPUT.
         ue.accelerator_memory_to_sram(chunk_in, URAM_A_BASE, chunk_elems)
         ue.accelerator_memory_to_sram(chunk_out, URAM_B_BASE, chunk_elems)
@@ -91,17 +100,14 @@ def glu_core_dram(ue, M: int, C: int,
         a, b = x.chunk(2, dim=-1); out = a * sigmoid(b)
 
     So GATE = a (first half), VALUE = b (second half, sigmoid'd).
+    ``IDENTITY_DRAM_ADDR`` is a 64x64 bf16 identity (see _sigmoid_inplace).
 
     Chunked over rows so eltwise_mul fits in URAM A+B.
     """
     assert C % UE_VECTOR_SIZE == 0, f"C={C} must be a multiple of {UE_VECTOR_SIZE}"
     bpe = 2
-    # Step 1: in-place sigmoid(VALUE) — matmat handles its own URAM chunking
-    ue.matmat_mul_core(M=M, K=C, N=C,
-                       A_DRAM_ADDR=VALUE_DRAM_ADDR,
-                       B_DRAM_ADDR=IDENTITY_DRAM_ADDR,
-                       OUTPUT_DRAM_ADDR=VALUE_DRAM_ADDR,
-                       sigmoid_enable=True)
+    # Step 1: in-place sigmoid(VALUE)
+    _sigmoid_inplace(ue, VALUE_DRAM_ADDR, M * C, IDENTITY_DRAM_ADDR)
     # Step 2: eltwise_mul GATE * sigmoid(VALUE), chunked over rows
     M_chunk = _row_chunk(M, C, divisor=2)
     row_bytes = C * bpe

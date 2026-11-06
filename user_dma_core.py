@@ -8758,6 +8758,7 @@ class UnifiedEngine:
                               gpr_c_addr: Optional[int] = None, *,
                               clamp_min: float = 0.0,
                               clamp_max: float = float("inf"),
+                              gpr_out_row_stride_reg: Optional[int] = None,
                               formats: Optional[TensorFormats] = None) -> None:
         """Quantized matrix-matrix multiplication core (1-pass streaming quantized dot).
 
@@ -8800,6 +8801,10 @@ class UnifiedEngine:
             gpr_*_reg / gpr_*_addr: runtime dims / DRAM bases (dynamic path); see
                 :meth:`quantized_matmat_core_dynamic`. ``gpr_c_addr`` requires a bias
                 (``C_DRAM_ADDR``) and a dimension GPR.
+            gpr_out_row_stride_reg: dynamic path only -- GPR holding the OUTPUT row pitch in
+                elements, when the result is a column block of a wider ``[M, N_full]`` buffer
+                (``OUTPUT_DRAM_ADDR`` then points at the block's first column). Omit for a
+                dense ``[M, N]`` result.
         """
         formats = self._resolve_tensor_formats(formats)
         _addr_gprs = (gpr_a_addr, gpr_b_addr, gpr_out_addr, gpr_scale_addr, gpr_c_addr)
@@ -8821,6 +8826,7 @@ class UnifiedEngine:
                 data_type=data_type, gelu_enable=gelu_enable, silu_enable=silu_enable, sigmoid_enable=sigmoid_enable,
                 clamp_enable=clamp_enable, log_enable=log_enable, write_back_disable=write_back_disable,
                 clamp_min=clamp_min, clamp_max=clamp_max,
+                gpr_out_row_stride_reg=gpr_out_row_stride_reg,
                 formats=formats,
             )
             for _ in allocated:
@@ -8828,6 +8834,8 @@ class UnifiedEngine:
             return flops
         if any(r is not None for r in _addr_gprs):
             raise ValueError("quantized_matmat_core: gpr_*_addr require a dimension GPR (set gpr_M_reg/gpr_K_reg/gpr_N_reg)")
+        if gpr_out_row_stride_reg is not None:
+            raise ValueError("quantized_matmat_core: gpr_out_row_stride_reg requires a dimension GPR (dynamic path only)")
         return self.quantized_matmat_core_legacy(
             M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=B_DRAM_ADDR,
             OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, SCALE_DRAM_ADDR=SCALE_DRAM_ADDR,
@@ -9007,7 +9015,8 @@ class UnifiedEngine:
                                       sigmoid_enable: bool = False, clamp_enable: bool = False, log_enable: bool = False,
                                       clamp_min: float = 0.0, clamp_max: float = float("inf"),
                                       write_back_disable: bool = False,
-                                      *, formats: Optional[TensorFormats] = None) -> int:
+                                      *, gpr_out_row_stride_reg: Optional[int] = None,
+                                      formats: Optional[TensorFormats] = None) -> int:
         """1-pass streaming quantized matmul (A @ Bᵀ), IF4/IF8/TQ4 weights straight through DOT_PRODUCT.
 
         Runtime-dynamic vs baked-at-capture:
@@ -9064,6 +9073,15 @@ class UnifiedEngine:
                 raise ValueError(f"{fn}: {_nm}={_rg} collides with gpr_K_reg/gpr_N_reg")
         if sum([gelu_enable, silu_enable, sigmoid_enable, clamp_enable, log_enable]) > 1:
             raise ValueError(f"{fn}: at most one activation may be enabled")
+        if gpr_out_row_stride_reg is not None:
+            # Output row pitch (elements) for a column block of a wider [M, N_full] buffer.
+            # M==1 writes a single row, so the pitch never matters there.
+            if not (1 <= gpr_out_row_stride_reg <= 63):
+                raise ValueError(f"{fn}: gpr_out_row_stride_reg must be a GPR index 1..63, "
+                                 f"got {gpr_out_row_stride_reg}")
+            if gpr_out_row_stride_reg in (gpr_M_reg, gpr_K_reg, gpr_N_reg):
+                raise ValueError(f"{fn}: gpr_out_row_stride_reg={gpr_out_row_stride_reg} "
+                                 f"collides with a dimension GPR")
         # Template feasibility + column-strip width. One column strip's per-block scales
         # (strip_w * K_rows blocks) must fit the scale BRAM. Prefer a 64-wide strip; when compile-time
         # K is large enough that a 64-wide strip overflows the scale BRAM (K > 8192), fall back to a
@@ -9407,6 +9425,11 @@ class UnifiedEngine:
             # (see class docstring for the M==1 path, which remains the HW-validated production path).
             # ================================================================================
             sub64 = strip_w is not None
+            if sub64 and gpr_out_row_stride_reg is not None:
+                raise NotImplementedError(
+                    f"{fn}: gpr_out_row_stride_reg is not supported on the sub-64 large-K path")
+            # Output DRAM row pitch: the full buffer width for a column block, else N itself.
+            out_stride_reg = gpr_N_reg if gpr_out_row_stride_reg is None else gpr_out_row_stride_reg
             bcast_bias = bias_enable and bias_mode == "broadcast_N"
             full_bias  = bias_enable and bias_mode == "full_matrix"
 
@@ -9483,7 +9506,7 @@ class UnifiedEngine:
             self.generate_instruction_shl(k_row_word_stride_reg, K_rows_reg, 4)        # K_rows*16 words/A-row
             self.generate_instruction_shr(n_row_words_reg, gpr_N_reg, 2)               # N/4 words/output row
             if not sub64:
-                self.generate_instruction_shl(n_stride_bytes_reg, gpr_N_reg, 1)        # N*2 bytes
+                self.generate_instruction_shl(n_stride_bytes_reg, out_stride_reg, 1)   # pitch*2 bytes
 
             _seed_cursor(a_dram_reg, A_BASE_W, gpr_a_addr)
 
@@ -9603,7 +9626,7 @@ class UnifiedEngine:
                 _set(ptr_wb, PBI_FIELD.DMA_LENGTH, s1)
                 self.generate_instruction_shl(s2, n_take_reg, 1)                               # n_take*2 (chunk)
                 _set(ptr_wb, PBI_FIELD.OUTPUT_SIZE, s2)
-                self.generate_instruction_mul32_reg(s1, rows_done_reg, gpr_N_reg)
+                self.generate_instruction_mul32_reg(s1, rows_done_reg, out_stride_reg)         # rows_done*pitch
                 self.generate_instruction_reg_sub(s2, gpr_N_reg, N_counter_reg)                # cols_done
                 self.generate_instruction_add_reg(s1, s1, s2)
                 self.generate_instruction_shr(s1, s1, 2)                                       # -> words

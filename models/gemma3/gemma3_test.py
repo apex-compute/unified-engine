@@ -950,7 +950,14 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             # its no-chunk fast path.
             # ------------------------------------------------------------------
             gpr_layer_off = self.alloc_isa_reg()
-            gpr_kv_off = self.alloc_isa_reg()
+            gpr_kv_off = self.alloc_isa_reg()      # K/V WRITE cursor: this layer's cache, row P
+            gpr_kv_rd = self.alloc_isa_reg()       # K/V READ cursor: this layer's cache, row 0
+            # Prompt position of the first row (P), primed by the run preamble: a chunk
+            # of a long prompt, or the next turn of a conversation whose earlier turns
+            # are already in the K/V cache, writes its K/V at rows [P, P+n), takes its
+            # RoPE rows from P, and attends over [0, P+n).
+            gpr_pos = self.alloc_isa_reg()
+            self._pf_gpr_pos = gpr_pos
             gpr_rope_cycle = self.alloc_isa_reg()
             gpr_rope_saved = self.alloc_isa_reg()
             gpr_rope_base = self.alloc_isa_reg()
@@ -975,8 +982,16 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             gpr_sqrt_vector_length = self.alloc_isa_reg()
             gpr_sqrt_head_dim = self.alloc_isa_reg()
             gpr_attn_scale = self.alloc_isa_reg()  # bf16 of 1/sqrt(head_dim) for the runtime attention scale
+            # Multi-core: every projection is column-sharded over the engines (see
+            # _prefill_rows_rounds). One layer-index register drives every slice's per-layer
+            # weight/scale base, instead of a cursor pair per slice.
+            _pf_rounds = self._prefill_rows_rounds() if self._prefill_sharded() else None
+            gpr_pf_layer = self.alloc_isa_reg() if _pf_rounds is not None else None
             self.generate_instruction_add_set(gpr_layer_off, 0)
-            self.generate_instruction_add_set(gpr_kv_off, 0)
+            self.generate_instruction_reg_mul_imm(gpr_kv_off, gpr_pos, ue_35bit_addr_shifter(self.k_size))
+            self.generate_instruction_add_set(gpr_kv_rd, 0)
+            if gpr_pf_layer is not None:
+                self.generate_instruction_add_set(gpr_pf_layer, 0)
             self.generate_instruction_add_set(gpr_rope_cycle, 6)
             self.generate_instruction_add_set(gpr_dim_vector_length, self.vector_length)
             self.generate_instruction_add_set(gpr_dim_head_dim, self.head_dim)
@@ -1012,9 +1027,47 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                 )
                 return scratch_reg
 
+            # Full-width dimension -> the persistent register already holding it. A sharded
+            # slice takes its K and its output row pitch (the FULL N) from here.
+            _pf_dim_reg = {self.vector_length: gpr_dim_vector_length,
+                           self.head_dim: gpr_dim_head_dim,
+                           self.head_dim * self.group_size: gpr_dim_head_dim_group,
+                           self.mlp_elements: gpr_dim_mlp_elements}
+
+            def rows_round(ops) -> int:
+                """Engine 0's share of one column-sharded round, between release and join.
+
+                Every engine computes ALL runtime rows (gpr_seq_len) of its column block and
+                writes it in place into the shared full-width output, so the round is as
+                seq_len-agnostic as the rest of the body. The workers run the same ops from
+                their own programs (emit_rows_worker_programs). Returns the WHOLE round's
+                FLOPs at the template seq_len.
+                """
+                sg = self.shard_group
+                sg.release()
+                for op in ops:
+                    for shard in op.engine_slices(0):
+                        sg.emit_rows_slice(
+                            self, op, shard, gpr_M=self.gpr_seq_len,
+                            gpr_K=_pf_dim_reg[op.K], gpr_stride=_pf_dim_reg[op.N],
+                            gpr_layer=gpr_pf_layer, gpr_w=gpr_scratch_b, gpr_s=gpr_scratch_d,
+                            gpr_a=gpr_scratch_a, gpr_out=gpr_scratch_c, gpr_kv=gpr_kv_off,
+                            M_template=seq_len)
+                sg.join()
+                return sum(op.flops(seq_len) for op in ops)
+
             def kv_addr(base_literal: int, scratch_reg: int) -> int:
                 self.generate_instruction_add_imm(
                     src_reg_idx=gpr_kv_off,
+                    immediate_value=ue_35bit_addr_shifter(base_literal),
+                    dst_reg_idx=scratch_reg,
+                )
+                return scratch_reg
+
+            def kv_read_addr(base_literal: int, scratch_reg: int) -> int:
+                """This layer's cache from row 0 (attention reads every cached position)."""
+                self.generate_instruction_add_imm(
+                    src_reg_idx=gpr_kv_rd,
                     immediate_value=ue_35bit_addr_shifter(base_literal),
                     dst_reg_idx=scratch_reg,
                 )
@@ -1058,6 +1111,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             _rope_patch = self._emit_forward_skip_jz(gpr_rope_saved, program_start)
             self.generate_instruction_add_set(gpr_rope_base, ue_35bit_addr_shifter(self.DRAM_ADDR_ROPE_LOCAL))
             _rope_patch()
+            # ... from position P: one table row is cos+sin, 2*k_size bytes.
+            self.generate_instruction_reg_mul_imm(self.TMP_REG, gpr_pos, ue_35bit_addr_shifter(self.k_size * 2))
+            self.generate_instruction_add_reg(gpr_rope_base, gpr_rope_base, self.TMP_REG)
 
             # cycle = 6 if it just hit 0 (wraparound), else keep the decremented value
             self.generate_instruction_add_set(gpr_rope_cycle, 6)
@@ -1075,60 +1131,63 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             )
             if profile:
                 _checkpoint("pre_norm")
-            total_flops += prefill_projection_core(
-                M=seq_len,
-                K=self.vector_length,
-                N=self.head_dim * self.group_size,
-                gpr_M_reg=self.gpr_seq_len,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
-                B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
-                OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
-                is_B_quantized=True,
-                data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE,
-                gpr_K_reg=gpr_dim_vector_length,
-                gpr_N_reg=gpr_dim_head_dim_group,
-                gpr_a_addr=const_addr(self.LAYER0_PRE_NORM_DRAM, gpr_scratch_a),
-                gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT, gpr_scratch_b),
-                gpr_out_addr=const_addr(self.LAYER0_Q_DRAM, gpr_scratch_c),
-                gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE, gpr_scratch_d),
-            )
-            total_flops += prefill_projection_core(
-                M=seq_len,
-                K=self.vector_length,
-                N=self.head_dim,
-                gpr_M_reg=self.gpr_seq_len,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
-                B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT,
-                OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
-                is_B_quantized=True,
-                data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE,
-                gpr_K_reg=gpr_dim_vector_length,
-                gpr_N_reg=gpr_dim_head_dim,
-                gpr_a_addr=const_addr(self.LAYER0_PRE_NORM_DRAM, gpr_scratch_a),
-                gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_K_PROJ_QUANT, gpr_scratch_b),
-                gpr_out_addr=const_addr(self.LAYER0_K_DRAM, gpr_scratch_c),
-                gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_K_PROJ_SCALE, gpr_scratch_d),
-            )
-            total_flops += prefill_projection_core(
-                M=seq_len,
-                K=self.vector_length,
-                N=self.head_dim,
-                gpr_M_reg=self.gpr_seq_len,
-                A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
-                B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT,
-                OUTPUT_DRAM_ADDR=self.LAYER0_V_DRAM,
-                is_B_quantized=True,
-                data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE,
-                gpr_K_reg=gpr_dim_vector_length,
-                gpr_N_reg=gpr_dim_head_dim,
-                gpr_a_addr=const_addr(self.LAYER0_PRE_NORM_DRAM, gpr_scratch_a),
-                gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_V_PROJ_QUANT, gpr_scratch_b),
-                gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_V_PROJ_SCALE, gpr_scratch_d),
-                gpr_out_addr=kv_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
-            )
+            if _pf_rounds is not None:
+                total_flops += rows_round(_pf_rounds["qkv"])
+            else:
+                total_flops += prefill_projection_core(
+                    M=seq_len,
+                    K=self.vector_length,
+                    N=self.head_dim * self.group_size,
+                    gpr_M_reg=self.gpr_seq_len,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_Q_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE,
+                    gpr_K_reg=gpr_dim_vector_length,
+                    gpr_N_reg=gpr_dim_head_dim_group,
+                    gpr_a_addr=const_addr(self.LAYER0_PRE_NORM_DRAM, gpr_scratch_a),
+                    gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT, gpr_scratch_b),
+                    gpr_out_addr=const_addr(self.LAYER0_Q_DRAM, gpr_scratch_c),
+                    gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE, gpr_scratch_d),
+                )
+                total_flops += prefill_projection_core(
+                    M=seq_len,
+                    K=self.vector_length,
+                    N=self.head_dim,
+                    gpr_M_reg=self.gpr_seq_len,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_QUANT,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_K_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_K_PROJ_SCALE,
+                    gpr_K_reg=gpr_dim_vector_length,
+                    gpr_N_reg=gpr_dim_head_dim,
+                    gpr_a_addr=const_addr(self.LAYER0_PRE_NORM_DRAM, gpr_scratch_a),
+                    gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_K_PROJ_QUANT, gpr_scratch_b),
+                    gpr_out_addr=const_addr(self.LAYER0_K_DRAM, gpr_scratch_c),
+                    gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_K_PROJ_SCALE, gpr_scratch_d),
+                )
+                total_flops += prefill_projection_core(
+                    M=seq_len,
+                    K=self.vector_length,
+                    N=self.head_dim,
+                    gpr_M_reg=self.gpr_seq_len,
+                    A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_QUANT,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_V_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_V_PROJ_SCALE,
+                    gpr_K_reg=gpr_dim_vector_length,
+                    gpr_N_reg=gpr_dim_head_dim,
+                    gpr_a_addr=const_addr(self.LAYER0_PRE_NORM_DRAM, gpr_scratch_a),
+                    gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_V_PROJ_QUANT, gpr_scratch_b),
+                    gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_V_PROJ_SCALE, gpr_scratch_d),
+                    gpr_out_addr=kv_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
+                )
             if profile:
                 _checkpoint("qkv_proj_vcache")
             total_flops += fold_rms(
@@ -1191,7 +1250,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             # attention cost from O((seq_len*group_size)^2) into
             # group_size * O(seq_len^2) — a group_size-fold reduction.
             head_bytes = self.head_dim * self.bytes_per_element
-            per_head_rows = ((self.PREFILL_MAX_SEQ_LEN + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+            # A chunk at position P attends P+n cached rows, up to the whole context, so the
+            # attention core's scratch carve (and the head-major Q slots) are sized for it.
+            per_head_rows = ((self.MAX_CONTEXT_SIZE + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
             qhm_head_bytes = per_head_rows * head_bytes
             # Q token-major -> head-major (into freed FLASH_K per-head slots).
             for g in range(self.group_size):
@@ -1235,8 +1296,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     gpr_batch_reg=self.gpr_seq_len,
                     gpr_aligned_seq_len_reg=self.gpr_aligned_seq_len,
                     gpr_q_addr=const_addr(head_slot, gpr_scratch_a),
-                    gpr_k_addr=kv_addr(self.LAYER0_K_ROPE_DRAM, gpr_scratch_b),
-                    gpr_v_addr=kv_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
+                    gpr_k_addr=kv_read_addr(self.LAYER0_K_ROPE_DRAM, gpr_scratch_b),
+                    gpr_v_addr=kv_read_addr(self.LAYER0_V_DRAM, gpr_scratch_c),
                     gpr_bias_addr=const_addr(self.LAYER0_FLASH_BIAS_DRAM, gpr_scratch_d),
                     gpr_out_addr=const_addr(head_slot, gpr_scratch_e),
                     gpr_scale_reg=gpr_attn_scale,
@@ -1254,24 +1315,27 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                     seq_len, self.gpr_seq_len)
             if profile:
                 _checkpoint("attention")
-            total_flops += prefill_projection_core(
-                M=seq_len,
-                K=self.head_dim * self.group_size,
-                N=self.vector_length,
-                gpr_M_reg=self.gpr_seq_len,
-                A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
-                B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT,
-                OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
-                is_B_quantized=True,
-                data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE,
-                gpr_K_reg=gpr_dim_head_dim_group,
-                gpr_N_reg=gpr_dim_vector_length,
-                gpr_a_addr=const_addr(self.LAYER0_FLASH_OUTPUT_DRAM, gpr_scratch_a),
-                gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT, gpr_scratch_b),
-                gpr_out_addr=const_addr(self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, gpr_scratch_c),
-                gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE, gpr_scratch_d),
-            )
+            if _pf_rounds is not None:
+                total_flops += rows_round(_pf_rounds["o_proj"])
+            else:
+                total_flops += prefill_projection_core(
+                    M=seq_len,
+                    K=self.head_dim * self.group_size,
+                    N=self.vector_length,
+                    gpr_M_reg=self.gpr_seq_len,
+                    A_DRAM_ADDR=self.LAYER0_FLASH_OUTPUT_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_ATTN_PROJ_OUTPUT_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE,
+                    gpr_K_reg=gpr_dim_head_dim_group,
+                    gpr_N_reg=gpr_dim_vector_length,
+                    gpr_a_addr=const_addr(self.LAYER0_FLASH_OUTPUT_DRAM, gpr_scratch_a),
+                    gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT, gpr_scratch_b),
+                    gpr_out_addr=const_addr(self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, gpr_scratch_c),
+                    gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE, gpr_scratch_d),
+                )
             total_flops += fold_rms(
                 seq_len, self.vector_length,
                 self.LAYER0_ATTN_PROJ_OUTPUT_DRAM, self.LAYER0_POST_ATTN_NORM_DRAM, self.DRAM_ADDR_LAYER0_POST_NORM_GAMMA,
@@ -1305,43 +1369,46 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             )
             if profile:
                 _checkpoint("pre_ffn_norm")
-            total_flops += prefill_projection_core(
-                M=seq_len,
-                K=self.vector_length,
-                N=self.mlp_elements,
-                gpr_M_reg=self.gpr_seq_len,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
-                B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT,
-                OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
-                is_B_quantized=True,
-                data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE,
-                gelu_enable=True,
-                gpr_K_reg=gpr_dim_vector_length,
-                gpr_N_reg=gpr_dim_mlp_elements,
-                gpr_a_addr=const_addr(self.LAYER0_PRE_MLP_NORM_DRAM, gpr_scratch_a),
-                gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT, gpr_scratch_b),
-                gpr_out_addr=const_addr(self.LAYER0_MLP_GATE_DRAM, gpr_scratch_c),
-                gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE, gpr_scratch_d),
-            )
-            total_flops += prefill_projection_core(
-                M=seq_len,
-                K=self.vector_length,
-                N=self.mlp_elements,
-                gpr_M_reg=self.gpr_seq_len,
-                A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
-                B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT,
-                OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
-                is_B_quantized=True,
-                data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE,
-                gpr_K_reg=gpr_dim_vector_length,
-                gpr_N_reg=gpr_dim_mlp_elements,
-                gpr_a_addr=const_addr(self.LAYER0_PRE_MLP_NORM_DRAM, gpr_scratch_a),
-                gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_UP_QUANT, gpr_scratch_b),
-                gpr_out_addr=const_addr(self.LAYER0_MLP_UP_DRAM, gpr_scratch_c),
-                gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_UP_SCALE, gpr_scratch_d),
-            )
+            if _pf_rounds is not None:
+                total_flops += rows_round(_pf_rounds["gate_up"])
+            else:
+                total_flops += prefill_projection_core(
+                    M=seq_len,
+                    K=self.vector_length,
+                    N=self.mlp_elements,
+                    gpr_M_reg=self.gpr_seq_len,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_GATE_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE,
+                    gelu_enable=True,
+                    gpr_K_reg=gpr_dim_vector_length,
+                    gpr_N_reg=gpr_dim_mlp_elements,
+                    gpr_a_addr=const_addr(self.LAYER0_PRE_MLP_NORM_DRAM, gpr_scratch_a),
+                    gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT, gpr_scratch_b),
+                    gpr_out_addr=const_addr(self.LAYER0_MLP_GATE_DRAM, gpr_scratch_c),
+                    gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE, gpr_scratch_d),
+                )
+                total_flops += prefill_projection_core(
+                    M=seq_len,
+                    K=self.vector_length,
+                    N=self.mlp_elements,
+                    gpr_M_reg=self.gpr_seq_len,
+                    A_DRAM_ADDR=self.LAYER0_PRE_MLP_NORM_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_QUANT,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_UP_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_UP_SCALE,
+                    gpr_K_reg=gpr_dim_vector_length,
+                    gpr_N_reg=gpr_dim_mlp_elements,
+                    gpr_a_addr=const_addr(self.LAYER0_PRE_MLP_NORM_DRAM, gpr_scratch_a),
+                    gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_UP_QUANT, gpr_scratch_b),
+                    gpr_out_addr=const_addr(self.LAYER0_MLP_UP_DRAM, gpr_scratch_c),
+                    gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_UP_SCALE, gpr_scratch_d),
+                )
             # BF16 multiply of [seq_len, mlp_elements] tensors in DRAM; tiles inside
             # eltwise_core_dram so large prefill (up through model.prefill_max_seq_len, 64-aligned
             # with flash attn) is not limited by staging full tensors in flat URAM.
@@ -1360,24 +1427,27 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             )
             if profile:
                 _checkpoint("mlp_gateup_gelu_mul")
-            total_flops += prefill_projection_core(
-                M=seq_len,
-                K=self.mlp_elements,
-                N=self.vector_length,
-                gpr_M_reg=self.gpr_seq_len,
-                A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
-                B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT,
-                OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
-                is_B_quantized=True,
-                data_type=TYPE.IF4,
-                SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE,
-                gpr_K_reg=gpr_dim_mlp_elements,
-                gpr_N_reg=gpr_dim_vector_length,
-                gpr_a_addr=const_addr(self.LAYER0_MLP_MULT_DRAM, gpr_scratch_a),
-                gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT, gpr_scratch_b),
-                gpr_out_addr=const_addr(self.LAYER0_MLP_DOWN_DRAM, gpr_scratch_c),
-                gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE, gpr_scratch_d),
-            )
+            if _pf_rounds is not None:
+                total_flops += rows_round(_pf_rounds["down"])
+            else:
+                total_flops += prefill_projection_core(
+                    M=seq_len,
+                    K=self.mlp_elements,
+                    N=self.vector_length,
+                    gpr_M_reg=self.gpr_seq_len,
+                    A_DRAM_ADDR=self.LAYER0_MLP_MULT_DRAM,
+                    B_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT,
+                    OUTPUT_DRAM_ADDR=self.LAYER0_MLP_DOWN_DRAM,
+                    is_B_quantized=True,
+                    data_type=TYPE.IF4,
+                    SCALE_DRAM_ADDR=self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE,
+                    gpr_K_reg=gpr_dim_mlp_elements,
+                    gpr_N_reg=gpr_dim_vector_length,
+                    gpr_a_addr=const_addr(self.LAYER0_MLP_MULT_DRAM, gpr_scratch_a),
+                    gpr_b_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT, gpr_scratch_b),
+                    gpr_out_addr=const_addr(self.LAYER0_MLP_DOWN_DRAM, gpr_scratch_c),
+                    gpr_scale_addr=layer_addr(self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE, gpr_scratch_d),
+                )
             total_flops += fold_rms(
                 seq_len, self.vector_length,
                 self.LAYER0_MLP_DOWN_DRAM, self.LAYER0_POST_MLP_NORM_DRAM, self.DRAM_ADDR_LAYER0_POST_FFW_NORM_GAMMA,
@@ -1413,9 +1483,24 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.generate_instruction_add_imm(
                 src_reg_idx=gpr_kv_off, immediate_value=ue_35bit_addr_shifter(KV_CACHE_LAYER_STRIDE), dst_reg_idx=gpr_kv_off
             )
+            self.generate_instruction_add_imm(
+                src_reg_idx=gpr_kv_rd, immediate_value=ue_35bit_addr_shifter(KV_CACHE_LAYER_STRIDE), dst_reg_idx=gpr_kv_rd
+            )
+            if gpr_pf_layer is not None:
+                self.generate_instruction_add_inc(gpr_pf_layer)
             self.generate_instruction_add_dec(reg_idx=gpr_layer_cnt)
             self.generate_instruction_jump_abs_jnz(layer_body_start_word_addr, gpr_layer_cnt)
             self.release_isa_reg()  # gpr_layer_cnt
+            if gpr_pf_layer is not None:
+                self.release_isa_reg()  # gpr_pf_layer
+                # The workers mirror the folded body: one program each, hardware-looped
+                # layer_size x, meeting the primary once per round. They stay resident next
+                # to the decode workers; run_gemma3_prefill launches them per prompt.
+                (self._prefill_worker_addrs,
+                 self._prefill_worker_m_regs) = self.shard_group.emit_rows_worker_programs(
+                    [_pf_rounds[k] for k in ("qkv", "o_proj", "gate_up", "down")],
+                    layers=layer_size, kv_layer_stride=KV_CACHE_LAYER_STRIDE)
+                self._prefill_worker_kv_regs = list(self.shard_group.rows_kv_regs)
             self.release_isa_reg()  # gpr_attn_scale
             self.release_isa_reg()  # gpr_sqrt_head_dim
             self.release_isa_reg()  # gpr_sqrt_vector_length
@@ -1431,6 +1516,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             self.release_isa_reg()  # gpr_rope_base
             self.release_isa_reg()  # gpr_rope_saved
             self.release_isa_reg()  # gpr_rope_cycle
+            self.release_isa_reg()  # gpr_pos
+            self.release_isa_reg()  # gpr_kv_rd
             self.release_isa_reg()  # gpr_kv_off
             self.release_isa_reg()  # gpr_layer_off
             total_flops *= layer_size
@@ -1821,6 +1908,88 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             data_type=TYPE.IF4,
         )
         self.shard_group.verify_private_space()
+
+    def _prefill_sharded(self) -> bool:
+        """Whether the prefill projections run on every engine.
+
+        Needs the folded (PBI) body and the one-pass streaming kernel: the column shards are
+        quantized_matmat_core slices with a strided output row. The legacy unrolled path and
+        --prefill-twopass stay single-engine.
+        """
+        return (self.shard_group is not None and self.multi_core > 1
+                and not self.legacy and not self.two_pass_prefill)
+
+    def _prefill_rows_rounds(self) -> dict:
+        """The four column-sharded prefill rounds of one layer, as RowsColumnOps.
+
+        Each engine computes every (runtime) row of its own column block, so the folded,
+        seq_len-agnostic body survives sharding unchanged. The weights are the SAME private
+        column copies decode reads (setup_multi_core) wherever decode sharded a weight over
+        every engine -- no second layout. K and V (N=256, four 64-column blocks each) are too
+        narrow for that above four engines; their blocks are dealt out together from the
+        shared image instead, so at 8 engines engines 0-3 each take a K block and 4-7 a V
+        block, and every engine's QKV share is 192 columns.
+
+          qkv      Q / K / V           read PRE_NORM; V lands straight in the KV cache
+          o_proj   attention output    reads FLASH_OUTPUT (primary-only attention before it)
+          gate_up  gate(gelu) + up     read PRE_MLP_NORM, disjoint outputs: one round
+          down     MLP down            reads the gate*up product the primary multiplies
+        """
+        from multi_engine_shard import RowsColumnOp
+        sg = self.shard_group
+        n = self.multi_core
+        lws = self.weight_defs["LAYER_WEIGHT_SIZE"]
+        vl, hd, qn, mlp = (self.vector_length, self.head_dim,
+                           self.head_dim * self.group_size, self.mlp_elements)
+
+        def full(sw):
+            return sw is not None and len(sw.shards) == n
+
+        def op(sw, name, w, s, K, N, a, out, gelu=False, kv=False, slices=None):
+            if slices is None and full(sw):
+                return RowsColumnOp.from_sharded(sw, a, out, gelu=gelu, out_kv_relative=kv)
+            if slices is None:
+                slices = sg.zero_copy_column_slices([(name, w, s, K, N, lws)])[name]
+            return RowsColumnOp(name=name, K=K, N=N, a_addr=a, out_addr=out, slices=slices,
+                                gelu=gelu, out_kv_relative=kv, data_type=TYPE.IF4)
+
+        k_args = ("k_proj", self.DRAM_ADDR_LAYER0_K_PROJ_QUANT, self.DRAM_ADDR_LAYER0_K_PROJ_SCALE, vl, hd)
+        v_args = ("v_proj", self.DRAM_ADDR_LAYER0_V_PROJ_QUANT, self.DRAM_ADDR_LAYER0_V_PROJ_SCALE, vl, hd)
+        kv_slices = ({} if full(self.sharded_k_proj) and full(self.sharded_v_proj) else
+                     sg.zero_copy_column_slices([k_args + (lws,), v_args + (lws,)]))
+        qkv = [
+            op(self.sharded_q_proj, "q_proj", self.DRAM_ADDR_LAYER0_Q_PROJ_QUANT,
+               self.DRAM_ADDR_LAYER0_Q_PROJ_SCALE, vl, qn,
+               self.LAYER0_PRE_NORM_DRAM, self.LAYER0_Q_DRAM),
+            op(self.sharded_k_proj, *k_args, self.LAYER0_PRE_NORM_DRAM, self.LAYER0_K_DRAM,
+               slices=kv_slices.get("k_proj")),
+            op(self.sharded_v_proj, *v_args, self.LAYER0_PRE_NORM_DRAM, self.LAYER0_V_DRAM,
+               kv=True, slices=kv_slices.get("v_proj")),
+        ]
+        rounds = {
+            "qkv": qkv,
+            "o_proj": [op(self.sharded_attn_oproj, "attn_oproj",
+                          self.DRAM_ADDR_LAYER0_ATTN_PROJ_QUANT, self.DRAM_ADDR_LAYER0_ATTN_PROJ_SCALE,
+                          qn, vl, self.LAYER0_FLASH_OUTPUT_DRAM, self.LAYER0_ATTN_PROJ_OUTPUT_DRAM)],
+            "gate_up": [op(self.sharded_mlp_gate, "mlp_gate",
+                           self.DRAM_ADDR_LAYER0_MLP_GATE_QUANT, self.DRAM_ADDR_LAYER0_MLP_GATE_SCALE,
+                           vl, mlp, self.LAYER0_PRE_MLP_NORM_DRAM, self.LAYER0_MLP_GATE_DRAM, gelu=True),
+                        op(self.sharded_mlp_up, "mlp_up",
+                           self.DRAM_ADDR_LAYER0_MLP_UP_QUANT, self.DRAM_ADDR_LAYER0_MLP_UP_SCALE,
+                           vl, mlp, self.LAYER0_PRE_MLP_NORM_DRAM, self.LAYER0_MLP_UP_DRAM)],
+            "down": [op(self.sharded_mlp_down, "mlp_down",
+                        self.DRAM_ADDR_LAYER0_MLP_DOWN_QUANT, self.DRAM_ADDR_LAYER0_MLP_DOWN_SCALE,
+                        mlp, vl, self.LAYER0_MLP_MULT_DRAM, self.LAYER0_MLP_DOWN_DRAM)],
+        }
+        for ops in rounds.values():
+            for o in ops:
+                cols = sorted((sh.col_offset, sh.cols) for e in o.slices for sh in o.slices[e])
+                covered = 0
+                for off, c in cols:
+                    assert off == covered, f"{o.name}: column slices leave a gap/overlap at {off}"
+                    covered += c
+                assert covered == o.N, f"{o.name}: column slices cover {covered} of {o.N}"
+        return rounds
 
     def _compile_decoder_programs(self, layer_size: int = 26, use_pbi: bool = False, profile: bool = False) -> dict:
         """Compile a single decoder program; KV length is selected at runtime via ``gpr_aligned_seq_len``.
@@ -2894,6 +3063,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "prefill_program_size": prefill_prog["size_bytes"],
             "prefill_template_flops": prefill_prog["flops"],
             "prefill_attn_aligned_seq_len": prefill_prog["attn_aligned_seq_len"],
+            # Register the run preamble primes with the first row's prompt position.
+            "prefill_pos_reg": getattr(self, "_pf_gpr_pos", None),
             "decoder_program_start_addr": f"0x{decoder_program_addr:X}",
             "decoder_program_size": decoder_program["program_size_bytes"],
             "decoder_total_flops": decoder_program["total_flops"],
@@ -2983,7 +3154,8 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             util = gf / peak * 100 if peak else 0.0
             gf_s = f"{gf:9.2f}" if gf else f"{'n/a':>9}"
             ut_s = f"{util:5.1f}%" if gf and peak else f"{'n/a':>6}"
-            print(f"{name:<38} {ms:>9.3f}  {pct:>5.1f}%  {gf_s}  {ut_s}  {engines:>2}c")
+            eng_s = f"{engines:>2}" if float(engines).is_integer() else f"{engines:.1f}"
+            print(f"{name:<38} {ms:>9.3f}  {pct:>5.1f}%  {gf_s}  {ut_s}  {eng_s}c")
 
         for name in order:
             _row(name, step_ms[name], (step_flops or {}).get(name, 0.0),
@@ -3100,6 +3272,7 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         self.generate_instruction_add_set(self.gpr_seq_len, prefill_seq_len)
         self.generate_instruction_add_set(self.gpr_q_seq_len, q_seq_len)
         self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
+        self._emit_prefill_pos(meta, 0)
         self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
         self.stop_capture()
         self.write_captured_instructions_to_dram(preamble_addr)
@@ -3120,7 +3293,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         print(f"\n--- Profiling: prefill (seq_len={prefill_seq_len}) ---")
         if prefill_checkpoints:
             _pf_cpu_start = time.perf_counter()
+            self._start_prefill_workers(prefill_seq_len)
             pf_order, pf_step_ms = self._profile_execute_folded(preamble_addr, prefill_checkpoints, folded_layers)
+            self._wait_prefill_workers()
             prefill_cpu_ms = (time.perf_counter() - _pf_cpu_start) * 1e3
             # The prefill program is compiled once at a template seq_len and replayed at the
             # run's seq_len via gpr_seq_len, so its compiled FLOPs describe the template, not
@@ -3139,9 +3314,12 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
                            if _pf_attn_aligned else _seq_scale)
             pf_step_flops = _step_flops(prefill_checkpoints, folded_layers,
                                         seq_scale=_seq_scale, attn_scale=_attn_scale)
-            # Prefill is not sharded -- only the decoder is -- so every prefill step is 1-core.
+            # Multi-core: the four projection steps run on every engine (column-sharded),
+            # the norms, RoPE and attention between them on engine 0.
             prefill_total_ms = self._print_profile_table(f"Prefill  (seq_len={prefill_seq_len})",
-                                                         pf_order, pf_step_ms, pf_step_flops, peak_gflops)
+                                                         pf_order, pf_step_ms, pf_step_flops, peak_gflops,
+                                                         sharded_steps=self._prefill_sharded_steps(),
+                                                         peak_1core=peak_gflops)
         else:
             pf_order, pf_step_ms, pf_step_flops = [], {}, {}
             prefill_total_ms = 0.0
@@ -3254,13 +3432,58 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             "decoder_steps": [[n, step_ms[n], dec_step_flops.get(n, 0.0)] for n in order],
             "decoder_aligned_kv": aligned_dec,
             # Steps that ran on every engine at once; the summary scores only these against
-            # the aggregate peak. Prefill is never sharded.
-            # {step: engines} -- how many engines each step really ran on.
+            # the aggregate peak. {step: engines} -- how many engines each step really ran on.
+            # Decode and prefill share step names but not their sharding, hence two maps.
             "sharded_steps": dict(sharded_steps),
+            "prefill_sharded_steps": self._prefill_sharded_steps(),
         }
         if long_result:
             result.update(long_result)
         return result
+
+    # Prefill profile steps holding a column-sharded projection round (the rest is engine 0).
+    PREFILL_SHARDED_STEPS = ("qkv_proj_vcache", "o_proj_post_attn_norm_residual",
+                             "mlp_gateup_gelu_mul", "mlp_down_post_ffn_norm_residual")
+
+    def _prefill_sharded_steps(self) -> dict:
+        """{step: engines} for the prefill profile; empty when prefill is single-engine."""
+        if not self._prefill_sharded():
+            return {}
+        return {name: self.multi_core for name in self.PREFILL_SHARDED_STEPS}
+
+    def _emit_prefill_pos(self, meta: dict, pos: int) -> None:
+        """Preamble: prime the folded prefill's position register with the first row's position."""
+        reg = meta.get("prefill_pos_reg")
+        if reg is None:
+            if pos:
+                raise RuntimeError("this gemma3 program has no prefill position register; recompile it")
+            return
+        self.generate_instruction_add_set(int(reg), int(pos))
+
+    def _start_prefill_workers(self, seq_len: int, pos: int = 0) -> None:
+        """Launch the sharded-prefill workers, priming each one's runtime row count.
+
+        Call right before the primary's prefill program on EVERY run: the workers park on
+        the primary's first release, and each run ends with them halted.
+        """
+        if not self._prefill_sharded():
+            return
+        addrs = getattr(self, "_prefill_worker_addrs", None)
+        if not addrs:
+            raise RuntimeError("sharded prefill: no worker programs -- compile_gemma3() first "
+                               "(multi-core images are always rebuilt with their workers)")
+        kv_regs = getattr(self, "_prefill_worker_kv_regs", None) or [None] * len(self._prefill_worker_m_regs)
+        kv_words = ue_35bit_addr_shifter(int(pos) * self.k_size)    # V write cursor: row P of layer 0
+        self.shard_group.start_workers(
+            addrs, gpr_sets_by_worker=[[(r, seq_len)] + ([(kv, kv_words)] if kv is not None else [])
+                                       for r, kv in zip(self._prefill_worker_m_regs, kv_regs)])
+
+    def _wait_prefill_workers(self, timeout: float = 30.0) -> None:
+        """Wait for every prefill worker to HALT (they finish with the primary's last join)."""
+        if not self._prefill_sharded():
+            return
+        for w in self.shard_group.workers:
+            w.wait_queue(timeout)
 
     def run_gemma3_prefill(self, numeric: bool = False) -> dict:
         """Load the unified instruction image once and run prefill only.
@@ -3309,56 +3532,85 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         # Prefill program processes all but the last token (the last one feeds the decoder).
         prefill_seq = prefill_seq[:-1]
         prefill_seq_len = len(prefill_seq)
-        self.seq_len = prefill_seq_len
+        # A continued conversation (_prefill_start = P) prefills only rows [P, end): the
+        # K/V cache already holds the earlier turns. A span longer than the program's
+        # PREFILL_MAX_SEQ_LEN rows runs as several chunks, each at its own position.
+        start = int(getattr(self, "_prefill_start", 0) or 0)
+        if not 0 <= start < prefill_seq_len:
+            raise ValueError(f"prefill start {start} is outside the {prefill_seq_len}-row prompt")
+        if prefill_seq_len > self.MAX_CONTEXT_SIZE - 1:
+            raise ValueError(f"a {prefill_seq_len + 1}-token prompt leaves no room in the "
+                             f"{self.MAX_CONTEXT_SIZE}-token context")
+        cap = max(1, int(self.PREFILL_MAX_SEQ_LEN))
+        n_chunks = -(-(prefill_seq_len - start) // cap)
+        base, rem = divmod(prefill_seq_len - start, n_chunks)
+        chunks, off = [], start
+        for i in range(n_chunks):
+            ln = base + (1 if i < rem else 0)
+            chunks.append((off, ln))
+            off += ln
 
-        # Rough FLOPs rescale (linear in seq_len for the bulk of the work; a couple of softmax /
-        # quadratic terms in the compiled template don't scale cleanly, but this is fine for
-        # back-of-envelope GFLOPS reporting).
-        flops_prefill = flops_prefill_template * prefill_seq_len // max(template_prefill_seq_len, 1)
+        print(f"\n--- Starting prefill (rows [{start}, {prefill_seq_len}) in {len(chunks)} chunk(s)) ---")
+        print(f"Prompt ({len(self.prefill_seq)}) tokens: {self.prefill_seq[start:]}")
 
-        print(f"\n--- Starting prefill (seq_len={prefill_seq_len}) ---")
-        print(f"Prompt ({len(self.prefill_seq)}) tokens: {self.prefill_seq}")
-
-        seq_len = prefill_seq_len
-        q_seq_len = seq_len * self.group_size
-        aligned_seq_len_q = ((q_seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
-        # Proper GQA: gpr_aligned_seq_len holds the compact KV length align_lanes(seq_len).
-        aligned_seq_len = ((seq_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
-
-        # ----- Runtime preamble: prime three GPRs, then jump into the cached prefill -----
-        self.clear_inst_id()
-        self.start_capture()
-        self.generate_instruction_add_set(self.gpr_seq_len, prefill_seq_len)
-        self.generate_instruction_add_set(self.gpr_q_seq_len, q_seq_len)
-        self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
-        # Unconditional absolute jump into the cached prefill program.
-        self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
-        self.stop_capture()
-        _preamble_issues = user_dma_core.check_isa_jumps(
-            self.capture_buffer, preamble_addr, name="prefill_preamble"
-        )
-        if _preamble_issues:
-            raise RuntimeError(
-                f"Prefill preamble jump violations: {_preamble_issues}"
-            )
-        self.write_captured_instructions_to_dram(preamble_addr)
-        self.allocate_program_dram(self.get_capture_instruction_size_bytes())
-        self.clear_capture_buffer()
-
-        embedding_tensor = self.get_embedding_for_tokens(prefill_seq)
-        self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
-        # Proper-GQA per-head causal bias (both folded and legacy paths): one
-        # [aligned_seq, aligned_seq] plane over the compact seq_len-long KV, shared
-        # by every query head (num_kv=1).
-        bias_one_group = torch.full((aligned_seq_len, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
-        valid_mask = torch.tril(torch.ones(aligned_seq_len, aligned_seq_len, dtype=torch.bool), diagonal=0) if not self.causal_mask_upper else torch.triu(torch.ones(aligned_seq_len, aligned_seq_len, dtype=torch.bool), diagonal=0)
-        bias_one_group.masked_fill_(valid_mask, 0.0)
-        bias_one_group[:, seq_len:] = float("-inf")
-        self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
-        # Execute from the preamble; preamble jumps into cached prefill, which HALTs on completion.
+        latency_hw_prefill, flops_prefill_total, flop_rate_hw_prefill = 0.0, 0, None
         timer = time.perf_counter()
-        latency_hw_prefill, flop_rate_hw_prefill = self.program_execute(preamble_addr, flops=flops_prefill)
+        for pos, seq_len in chunks:
+            # Rough FLOPs rescale (linear in seq_len for the bulk of the work).
+            flops_prefill = flops_prefill_template * seq_len // max(template_prefill_seq_len, 1)
+            q_seq_len = seq_len * self.group_size
+            # Proper GQA: gpr_aligned_seq_len holds the compact KV length this chunk attends:
+            # every cached row before it plus its own.
+            kv_len = pos + seq_len
+            aligned_seq_len = ((kv_len + UE_VECTOR_SIZE - 1) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+
+            # ----- Runtime preamble: prime the GPRs, then jump into the cached prefill -----
+            self.clear_inst_id()
+            self.start_capture()
+            self.generate_instruction_add_set(self.gpr_seq_len, seq_len)
+            self.generate_instruction_add_set(self.gpr_q_seq_len, q_seq_len)
+            self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len)
+            self._emit_prefill_pos(meta, pos)
+            # Unconditional absolute jump into the cached prefill program.
+            self.generate_instruction_jump_abs(ue_35bit_addr_shifter(prefill_program_addr))
+            self.stop_capture()
+            _preamble_issues = user_dma_core.check_isa_jumps(
+                self.capture_buffer, preamble_addr, name="prefill_preamble"
+            )
+            if _preamble_issues:
+                raise RuntimeError(
+                    f"Prefill preamble jump violations: {_preamble_issues}"
+                )
+            self.write_captured_instructions_to_dram(preamble_addr)
+            self.clear_capture_buffer()
+
+            embedding_tensor = self.get_embedding_for_tokens(prefill_seq[pos:pos + seq_len])
+            self.dma_to_accelerator_memory(self.LAYER0_INPUT_DRAM, embedding_tensor)
+            # Proper-GQA per-head causal bias, shared by every query head (num_kv=1): query
+            # row i is position pos+i and attends cached rows [0, pos+i]. Row pitch is the
+            # runtime aligned KV length. A chunk at 0 writes the whole aligned square (as
+            # before); a later one its own rows.
+            rows = aligned_seq_len if pos == 0 else seq_len
+            _i = torch.arange(rows).unsqueeze(1) + pos
+            _j = torch.arange(aligned_seq_len).unsqueeze(0)
+            valid_mask = (_j <= _i) if not self.causal_mask_upper else (_j >= _i)
+            bias_one_group = torch.full((rows, aligned_seq_len), float("-inf"), dtype=torch.bfloat16)
+            bias_one_group.masked_fill_(valid_mask, 0.0)
+            bias_one_group[:, kv_len:] = float("-inf")
+            self.dma_to_accelerator_memory(self.LAYER0_FLASH_BIAS_DRAM, bias_one_group)
+            # Execute from the preamble; preamble jumps into cached prefill, which HALTs on completion.
+            self._start_prefill_workers(seq_len, pos)
+            _lat, _rate = self.program_execute(preamble_addr, flops=flops_prefill)
+            self._wait_prefill_workers()
+            latency_hw_prefill += _lat
+            flops_prefill_total += flops_prefill
+        self.allocate_program_dram(INSTRUCTION_SIZE_BYTES * 8)      # the preamble's slot
         latency_prefill = time.perf_counter() - timer
+        if latency_hw_prefill:
+            flop_rate_hw_prefill = flops_prefill_total / (latency_hw_prefill * 1e3)
+        self.seq_len = prefill_seq_len
+        self._prefill_rows = prefill_seq_len - start
+        self._prefill_chunks = len(chunks)
         print(f"Prefill execute done in {latency_prefill:.2f} seconds, start decoding...\n")
 
         _ref_kv = None
@@ -3458,6 +3710,12 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
         token_id = self.prefill_seq[-1]
         global _SILENT_MODE
         max_seq_len = self.MAX_CONTEXT_SIZE
+        # Optional cap on generated tokens (a driver such as the web server sets it).
+        _limit = getattr(self, "max_new_tokens", None)
+        if _limit:
+            max_seq_len = min(max_seq_len, self.seq_len + int(_limit))
+        # Optional per-token hook: on_token(token_id, text) -> True stops generation.
+        _on_token = getattr(self, "on_token", None)
         total_latency, total_flop_rate = 0, 0
         decoder_token_cnt = 0
         hw_decode_lats_us: list[float] = []
@@ -3519,6 +3777,10 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
             self.clear_inst_id()
             self.start_capture()
+            # This token's position: decode appends its K/V there and advances the
+            # register itself, but priming it every step keeps a decode correct after
+            # any prefill (a chunk, a continued conversation) or an earlier decode pass.
+            self.generate_instruction_add_set(self.gpr_seq_len, self.seq_len - 1)
             self.generate_instruction_add_set(self.gpr_aligned_seq_len, aligned_seq_len_q)
             self.generate_instruction_jump_abs(ue_35bit_addr_shifter(decoder_program_addr))
             self.stop_capture()
@@ -3572,12 +3834,19 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             print(token_char, end="", flush=True)
             if _use_status:
                 _status_update()
+            if _on_token is not None and _on_token(token_id, token_char):
+                if _use_status:
+                    _status_teardown()
+                break
         else:
             if _use_status:
                 _status_teardown()
 
         latency_decoder = time.perf_counter() - timer
         tokens_decoded = decoder_token_cnt
+        # The last sampled token was never fed back: its K/V is not cached (a continued
+        # conversation feeds it first; self.seq_len is the number of cached positions).
+        self._decode_last_token_id = int(token_id)
         print(f"\nDecoder done in {latency_prefill + latency_decoder:.2f}s, "
               f"speed: {tokens_decoded / latency_decoder:.2f} tokens/s, "
               f"total {self.seq_len} tokens.")
@@ -3715,10 +3984,9 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
             profile_result.get("decoder_size_kb"), title)
         # Only the sharded step spreads across engines; everything else is single-engine, so
         # each row is scored against the peak that its own step could actually reach.
-        # DECODE-only: prefill is never sharded, and its checkpoints happen to carry the
-        # same names (qkv_proj_vcache, mlp_gateup_gelu_mul, ...), so this set must be
-        # applied per table rather than globally or the prefill rows claim shards that the
-        # prefill program does not have.
+        # Per table: prefill and decode checkpoints carry the same names
+        # (qkv_proj_vcache, mlp_gateup_gelu_mul, ...) but are sharded differently, so each
+        # table gets its own {step: engines} map.
         _ds = profile_result.get("sharded_steps") or {}
         # {step: engines}. Older metadata stored a plain list of names; fall back to
         # "all cores" for those so an old profile still renders.
@@ -3777,10 +4045,11 @@ class Gemma3_UnifiedEngine(UnifiedEngine):
 
         # Both programs are folded (one body hardware-looped layer_size×), so each table is a
         # per-step total across ALL layers, not a per-layer breakdown.
-        # Prefill runs entirely on engine 0 -> every row is scored against one core.
+        # Multi-core prefill shards its projection steps; the rest scores against one core.
         _table(f"Prefill profile (seq_len={pf_tokens if pf_tokens is not None else 'n/a'}, "
                f"HW latency summed over all layers)",
-               profile_result.get("prefill_steps", []), pf_ms)
+               profile_result.get("prefill_steps", []), pf_ms,
+               sharded=profile_result.get("prefill_sharded_steps") or {})
         _kv = profile_result.get("decoder_aligned_kv")
         _table("Decode profile (first token"
                + (f", aligned KV={_kv}" if _kv else "")
@@ -4068,7 +4337,13 @@ def main():
                 profile_result.get("decoder_long_steps", []),
                 (profile_result.get("decoder_long_pos", 0)
                  / profile_result.get("decoder_long_aligned_kv", 1)))
-            annotate_execution(_pf_rows, args.multi_core)
+            annotate_execution(_pf_rows, args.multi_core, sharded=(
+                ("qkv_proj_vcache",) if profile_result.get("prefill_sharded_steps") else ()),
+                mixed=({
+                    "o_proj_post_attn_norm_residual": "o_proj sharded; norm/residual primary",
+                    "mlp_gateup_gelu_mul": "gate/up sharded; GELU*up multiply primary",
+                    "mlp_down_post_ffn_norm_residual": "down_proj sharded; norm/residual primary",
+                } if profile_result.get("prefill_sharded_steps") else None))
             _decode_mixed = {
                 "qkv_proj_vcache": "Q/K/V projections sharded; cache work primary",
                 "attention": "P@V sharded; Q@K and remaining work primary",
