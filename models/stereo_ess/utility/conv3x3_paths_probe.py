@@ -65,7 +65,10 @@ IM2COL_BUDGET = 64 << 20               # bytes of im2col per matmul; bigger band
 WINO_BUDGET = 128 << 20                # bytes of Winograd D + M planes per engine; bigger bands go in row groups
 # label: (kernel, stride, dilation)
 CONV_TYPES = (("1x1", 1, 1, 1), ("3x3", 3, 1, 1), ("3x3 s2", 3, 2, 1), ("3x3 d2", 3, 1, 2),
-              ("5x5", 5, 1, 1), ("7x7 s2", 7, 2, 1))
+              ("5x5", 5, 1, 1), ("7x7", 7, 1, 1), ("7x7 s2", 7, 2, 1))
+WINO_NOTE = {"plain": "Winograd F(2x2,3x3) directly",
+             "subgrid": "Winograd via 4 parity sub-grids (each a 3x3 conv on a quarter map)",
+             "split": "Winograd via {n} 3x3 kernel pieces summed in the M planes"}
 PATH_ORDER = ("winograd", "native16", "direct", "native8")
 # --auto: conv2d_auto on the board, 1 engine, 12x20 maps (small enough for its single-launch walker path).
 # (name, k, stride, dilation, Cin, Cout, dtype, allow_winograd, expected route) -- expectations from the
@@ -134,14 +137,32 @@ class Spec:
         self.pad = d * (k - 1) // 2
         self.halo = max(halo, self.pad, 1)
         self.Hout, self.Wout = (H - 1) // s + 1, (W - 1) // s + 1
+        if self.winograd_mode == "split":               # the padded 3x3 pieces read past the conv's own padding
+            n3 = -(-k // 3)
+            self.halo = max(self.halo, 3 * (n3 - 1) - self.pad + 2)
 
     @property
     def kind(self):
         return f"{self.k}x{self.k}" + (f" s{self.s}" if self.s > 1 else "") + (f" d{self.d}" if self.d > 1 else "")
 
     @property
+    def winograd_mode(self):
+        """How F(2x2,3x3) reaches this conv: "plain" (3x3), "subgrid" (3x3 dilation 2 = four 3x3 convs on the
+        parity sub-grids), "split" (5x5 / 7x7 = n*n 3x3 kernel pieces accumulated in the M planes), or None
+        (stride 2: its polyphase pieces are 2x2 / 2x1 / 1x1 kernels, no F(2x2,3x3) in them)."""
+        if self.s != 1:
+            return None
+        if self.k == 3 and self.d == 1 and self.H % 2 == 0 and self.W % 2 == 0:
+            return "plain"
+        if self.k == 3 and self.d == 2 and self.H % 4 == 0 and self.W % 4 == 0:
+            return "subgrid"
+        if self.k in (5, 7) and self.d == 1 and self.H % 2 == 0 and self.W % 2 == 0:
+            return "split"
+        return None
+
+    @property
     def winograd_applies(self):
-        return self.k == 3 and self.s == 1 and self.d == 1 and self.H % 2 == 0 and self.W % 2 == 0
+        return self.winograd_mode is not None
 
     def describe(self):
         return f"{self.name} {self.kind} {self.H}x{self.W} {self.Cin}->{self.Cout}"
@@ -406,31 +427,47 @@ class Probe:
                                              stride_jump_bytes=jump)
             return 1
 
-        # ---- winograd F(2x2,3x3)
+        # ---- winograd F(2x2,3x3); dilation 2 through parity sub-grids, 5x5 / 7x7 through 3x3 kernel pieces
         G = torch.tensor([[1., 0, 0], [.5, .5, .5], [.5, -.5, .5], [0, 0, 1]])
-        TW = W // 2
+        mode = sp.winograd_mode
+        gs = 2 if mode == "subgrid" else 1                  # sub-grid stride (dilation 2: four parity grids)
+        subgrids = [(a, b) for a in range(gs) for b in range(gs)]
+        Hs, Ws = Hout // gs, Wout // gs                     # one sub-grid's output map
+        TW = Ws // 2
+        if mode == "split":                                 # kernel padded to n*3 x n*3, n*n 3x3 pieces
+            n3 = -(-k // 3)
+            pieces = [(3 * a - pad + 1, 3 * b - pad + 1, a, b) for a in range(n3) for b in range(n3)]
+        else:
+            pieces = [(0, 0, 0, 0)]
 
         def setup_winograd():
-            assert sp.winograd_applies
-            twc = wino_chunk(W, Cin, Cout)
+            assert mode is not None
+            twc = wino_chunk(Ws, Cin, Cout)
             assert twc is not None, "one tile column does not fit the SRAM staging"
-            U = torch.einsum("ik,ockl,jl->ocij", G, gq, G)     # U_xi = (G g G^T)[:, :, r, c]
+            gk = gq
+            if mode == "split":
+                gk = torch.zeros(Cout, Cin, 3 * n3, 3 * n3)
+                gk[:, :, :k, :k] = gq
             sgn = lambda r, c: (-1.0 if r == 2 else 1.0) * (-1.0 if c == 2 else 1.0)
             P = []
             for i in range(NE):
-                ta, tb = split(Hout // 2, i, NE)
+                ta, tb = split(Hs // 2, i, NE)
                 tg = max(1, min(tb - ta, WINO_BUDGET // (16 * TW * (Cin + Cout) * 2)))   # tile rows per group
                 nt = tg * TW
-                st = {"tiles": (ta, tb), "tg": tg, "twc": twc, "bd": self.pwt(i, bq, "bias"),
-                      "us": [self.pwt(i, (sgn(r, c) * U[:, :, r, c]).contiguous(), f"us{r}{c}")
-                             for r in range(4) for c in range(4)]}
+                us = []
+                for sy, sx, a, b in pieces:
+                    U = torch.einsum("ik,ockl,jl->ocij", G, gk[:, :, 3 * a:3 * a + 3, 3 * b:3 * b + 3], G)
+                    us.append([self.pwt(i, (sgn(r, c) * U[:, :, r, c]).contiguous(), f"us{a}{b}_{r}{c}")
+                               for r in range(4) for c in range(4)])
+                st = {"tiles": (ta, tb), "tg": tg, "twc": twc, "bd": self.pwt(i, bq, "bias"), "us": us}
                 st["D"] = [self.pal(i, nt * Cin * 2, f"D{p}") for p in range(16)]
                 st["M"] = [self.pal(i, nt * Cout * 2, f"M{p}") for p in range(16)]
                 P.append(st)
             return P
 
         def winograd(e, i, P):
-            """winograd_probe 'weo': even/odd input stage, transforms in SRAM, 16 matmuls, output transform in SRAM."""
+            """winograd_probe 'weo': even/odd input stage, transforms in SRAM, 16 matmuls, output transform in SRAM.
+            Per sub-grid and tile-row group; kernel pieces accumulate into the same 16 M planes."""
             st = P[i]
             ta, tb = st["tiles"]
             if tb <= ta:
@@ -446,73 +483,81 @@ class Probe:
             DS = lambda r, par: (A0 + (r * 2 + par) * sz) if r < 2 else (B0 + ((r - 2) * 2 + par) * sz)
             TA = lambda k_, par: A0 + (4 + k_ * 2 + par) * sz
             TB = lambda k_, par: B0 + (4 + k_ * 2 + par) * sz
+            Pout = up128(twc * Cout * 2)
+            Msr = lambda r, c: A0 + c * Pout if r == 1 else B0 + ({0: 0, 2: 1, 3: 2}[r] * 4 + c) * Pout
+            Ssr = lambda i_, c: A0 + (4 + i_) * Pout if c == 1 else B0 + (12 + i_ * 3 + {0: 0, 2: 1, 3: 2}[c]) * Pout
+            T0, T1 = A0 + 6 * Pout, A0 + 7 * Pout
+            Ysr = lambda k_: A0 + (8 + k_) * Pout
             chunks = [(c0, min(twc, TW - c0)) for c0 in range(0, TW, twc)]
-            for g0 in range(ta, tb, st["tg"]):                 # tile-row groups bound the D / M planes
-                g1 = min(g0 + st["tg"], tb)
-                nt = (g1 - g0) * TW
-                for ty in range(g0, g1):
-                    for c0, n in chunks:
-                        off = (ty - g0) * TW + c0
-                        ne, nel = (n + 1) * Cin, n * Cin
-                        for r in range(4):                           # each source row once: even / odd pixels
-                            for par in (0, 1):
-                                e.accelerator_memory_to_sram(X.pix(2 * ty - 1 + r, 2 * c0 - 1 + par), DS(r, par), ne,
-                                                             stride_bytes_per_chunk=X.pb, stride_jump_bytes=2 * X.pb)
-                        for T in (TA, TB):                           # rows: T0=D0-D2, T1=D1+D2, -T2=D1-D2, T3=D1-D3
-                            for par in (0, 1):
-                                sub(DS(0, par), DS(2, par), T(0, par), ne)
-                                add(DS(1, par), DS(2, par), T(1, par), ne)
-                                sub(DS(1, par), DS(2, par), T(2, par), ne)
-                                sub(DS(1, par), DS(3, par), T(3, par), ne)
-                        for k_ in range(4):                          # cols on tile windows (contiguous slices)
-                            Vs = [A0 + q * sz for q in range(4)]
-                            sub(TA(k_, 0), TB(k_, 0) + X.pb, Vs[0], nel)
-                            add(TA(k_, 1), TB(k_, 0) + X.pb, Vs[1], nel)
-                            sub(TA(k_, 1), TB(k_, 0) + X.pb, Vs[2], nel)
-                            sub(TA(k_, 1), TB(k_, 1) + X.pb, Vs[3], nel)
-                            for q in range(4):
-                                e.sram_to_accelerator_memory(Vs[q], D[k_ * 4 + q] + off * Cin * 2, nel)
-                for xi in range(16):                                 # 16 matmuls on the (signed) V planes
-                    e.generate_instruction_add_set(gM, nt)
-                    kw = dict(C_DRAM_ADDR=st["bd"], bias_mode="broadcast_N") if xi == 5 else {}
-                    e.matmat_mul_core(M=nt, K=Cin, N=Cout, A_DRAM_ADDR=D[xi], B_DRAM_ADDR=st["us"][xi],
-                                      OUTPUT_DRAM_ADDR=Mx[xi], gpr_M_reg=gM, **kw)
-                Pout = up128(twc * Cout * 2)
-                Msr = lambda r, c: A0 + c * Pout if r == 1 else B0 + ({0: 0, 2: 1, 3: 2}[r] * 4 + c) * Pout
-                Ssr = lambda i_, c: A0 + (4 + i_) * Pout if c == 1 else B0 + (12 + i_ * 3 + {0: 0, 2: 1, 3: 2}[c]) * Pout
-                T0, T1 = A0 + 6 * Pout, A0 + 7 * Pout
-                Ysr = lambda k_: A0 + (8 + k_) * Pout
-                Y = Mx[:4]
-                for ty in range(g0, g1):
-                    for c0, n in chunks:
-                        off = (ty - g0) * TW + c0
-                        nel = n * Cout
-                        for r in range(4):
-                            for c in range(4):
-                                e.accelerator_memory_to_sram(Mx[r * 4 + c] + off * Cout * 2, Msr(r, c), nel)
-                        for c in range(4):                           # S0 = (M1 + M2) + M0, S1 = (M1 - M2) - M3
-                            add(Msr(1, c), Msr(2, c), T0, nel)
-                            add(T0, Msr(0, c), Ssr(0, c), nel)
-                            sub(Msr(1, c), Msr(2, c), T1, nel)
-                            sub(T1, Msr(3, c), Ssr(1, c), nel)
-                        for i_ in range(2):                          # y0 = (S1 + S2) + S0, y1 = (S1 - S2) - S3
-                            add(Ssr(i_, 1), Ssr(i_, 2), T0, nel)
-                            add(T0, Ssr(i_, 0), Ysr(2 * i_), nel)
-                            sub(Ssr(i_, 1), Ssr(i_, 2), T1, nel)
-                            sub(T1, Ssr(i_, 3), Ysr(2 * i_ + 1), nel)
-                        for k_ in range(4):
-                            e.sram_to_accelerator_memory(Ysr(k_), Y[k_] + off * Cout * 2, nel)
-                ro = nt * Cout // 64
-                for yp in Y:                                         # ReLU (identity-matmul clamp)
-                    e.generate_instruction_add_set(gM, ro)
-                    e.activation_core(M=ro, N=64, A_DRAM_ADDR=yp, OUTPUT_DRAM_ADDR=yp, IDENTITY_DRAM_ADDR=self.I64,
-                                      activation="clamp", gpr_M_reg=gM)
-                for i_ in range(2):
-                    for j in range(2):
+            for ga, gb in subgrids:
+                xin = lambda yy, xx: X.pix(gs * yy + ga, gs * xx + gb)       # sub-grid coords -> map pixel
+                for g0 in range(ta, tb, st["tg"]):                          # tile-row groups bound the D / M planes
+                    g1 = min(g0 + st["tg"], tb)
+                    nt = (g1 - g0) * TW
+                    for pi, (sy, sx, _a, _b) in enumerate(pieces):
                         for ty in range(g0, g1):
-                            scopy(e, Y[2 * i_ + j] + (ty - g0) * TW * Cout * 2, Yw.pix(2 * ty + i_, j), TW, Cout * 2,
-                                  dst_jump=2 * Yw.pb)
-            return 16
+                            for c0, n in chunks:
+                                off = (ty - g0) * TW + c0
+                                ne, nel = (n + 1) * Cin, n * Cin
+                                for r in range(4):                          # each source row once: even / odd pixels
+                                    for par in (0, 1):
+                                        e.accelerator_memory_to_sram(xin(2 * ty - 1 + r + sy, 2 * c0 - 1 + par + sx),
+                                                                     DS(r, par), ne, stride_bytes_per_chunk=X.pb,
+                                                                     stride_jump_bytes=2 * gs * X.pb)
+                                for T in (TA, TB):                          # rows: T0=D0-D2, T1=D1+D2, -T2=D1-D2, T3=D1-D3
+                                    for par in (0, 1):
+                                        sub(DS(0, par), DS(2, par), T(0, par), ne)
+                                        add(DS(1, par), DS(2, par), T(1, par), ne)
+                                        sub(DS(1, par), DS(2, par), T(2, par), ne)
+                                        sub(DS(1, par), DS(3, par), T(3, par), ne)
+                                for k_ in range(4):                         # cols on tile windows (contiguous slices)
+                                    Vs = [A0 + q * sz for q in range(4)]
+                                    sub(TA(k_, 0), TB(k_, 0) + X.pb, Vs[0], nel)
+                                    add(TA(k_, 1), TB(k_, 0) + X.pb, Vs[1], nel)
+                                    sub(TA(k_, 1), TB(k_, 0) + X.pb, Vs[2], nel)
+                                    sub(TA(k_, 1), TB(k_, 1) + X.pb, Vs[3], nel)
+                                    for q in range(4):
+                                        e.sram_to_accelerator_memory(Vs[q], D[k_ * 4 + q] + off * Cin * 2, nel)
+                        for xi in range(16):                                # 16 matmuls; pieces after the first accumulate
+                            e.generate_instruction_add_set(gM, nt)
+                            if pi == 0:
+                                kw = dict(C_DRAM_ADDR=st["bd"], bias_mode="broadcast_N") if xi == 5 else {}
+                            else:
+                                kw = dict(C_DRAM_ADDR=Mx[xi], bias_mode="full_matrix")
+                            e.matmat_mul_core(M=nt, K=Cin, N=Cout, A_DRAM_ADDR=D[xi], B_DRAM_ADDR=st["us"][pi][xi],
+                                              OUTPUT_DRAM_ADDR=Mx[xi], gpr_M_reg=gM, **kw)
+                    Y = Mx[:4]
+                    for ty in range(g0, g1):
+                        for c0, n in chunks:
+                            off = (ty - g0) * TW + c0
+                            nel = n * Cout
+                            for r in range(4):
+                                for c in range(4):
+                                    e.accelerator_memory_to_sram(Mx[r * 4 + c] + off * Cout * 2, Msr(r, c), nel)
+                            for c in range(4):                              # S0 = (M1 + M2) + M0, S1 = (M1 - M2) - M3
+                                add(Msr(1, c), Msr(2, c), T0, nel)
+                                add(T0, Msr(0, c), Ssr(0, c), nel)
+                                sub(Msr(1, c), Msr(2, c), T1, nel)
+                                sub(T1, Msr(3, c), Ssr(1, c), nel)
+                            for i_ in range(2):                             # y0 = (S1 + S2) + S0, y1 = (S1 - S2) - S3
+                                add(Ssr(i_, 1), Ssr(i_, 2), T0, nel)
+                                add(T0, Ssr(i_, 0), Ysr(2 * i_), nel)
+                                sub(Ssr(i_, 1), Ssr(i_, 2), T1, nel)
+                                sub(T1, Ssr(i_, 3), Ysr(2 * i_ + 1), nel)
+                            for k_ in range(4):
+                                e.sram_to_accelerator_memory(Ysr(k_), Y[k_] + off * Cout * 2, nel)
+                    ro = nt * Cout // 64
+                    for yp in Y:                                            # ReLU (identity-matmul clamp)
+                        e.generate_instruction_add_set(gM, ro)
+                        e.activation_core(M=ro, N=64, A_DRAM_ADDR=yp, OUTPUT_DRAM_ADDR=yp,
+                                          IDENTITY_DRAM_ADDR=self.I64, activation="clamp", gpr_M_reg=gM)
+                    for i_ in range(2):
+                        for j in range(2):
+                            for ty in range(g0, g1):
+                                scopy(e, Y[2 * i_ + j] + (ty - g0) * TW * Cout * 2,
+                                      Yw.pix(gs * (2 * ty + i_) + ga, gs * j + gb), TW, Cout * 2,
+                                      dst_jump=2 * gs * Yw.pb)
+            return 16 * len(pieces) * len(subgrids)
 
         # ---- native CONV2D walker (FLOAT16 or IF8 weights, weight_reuse)
         quant = {}
@@ -627,7 +672,8 @@ class Probe:
                   "native8": lambda e, i, P: native(e, i, P, "native8")}
 
         def record(meth, status, **kw):
-            rec = {"case": sp.name, "group": sp.group, "kind": sp.kind, "H": H, "W": W, "Cin": Cin, "Cout": Cout,
+            rec = {"case": sp.name, "group": sp.group, "kind": sp.kind, "wmode": sp.winograd_mode,
+                   "H": H, "W": W, "Cin": Cin, "Cout": Cout,
                    "k": k, "s": s, "d": d, "engines": NE, "path": meth, "status": status, "pick": pick}
             rec.update(kw)
             results.append(rec)
@@ -715,7 +761,7 @@ class Probe:
         for meth in paths:
             if meth == "winograd" and not sp.winograd_applies:
                 record(meth, "n/a")
-                print(f"  {sp.name:22s} {meth:9s} n/a (Winograd F(2x2,3x3) needs 3x3 / stride 1 / dilation 1)")
+                print(f"  {sp.name:22s} {meth:9s} n/a (stride {s}: no F(2x2,3x3) piece in its polyphase split)")
                 continue
             self.restore_arena()
             try:
@@ -852,7 +898,7 @@ def print_summary(results, peak=None):
 
 INK, INK2, MUTED, SURFACE, GRID_LINE = "#0b0b0b", "#52514e", "#8a8984", "#fcfcfb", "#e4e3df"
 SERIES = {"winograd": "#2a78d6", "native16": "#eb6834", "direct": "#1baf7a", "native8": "#eda100"}
-LABEL = {"winograd": "Winograd F(2x2,3x3)", "native16": "native CONV2D, bf16 (baseline = 1.0)",
+LABEL = {"winograd": "Winograd F(2x2,3x3) (direct / sub-grid / kernel split)", "native16": "native CONV2D, bf16 (baseline = 1.0)",
          "direct": "im2col + matmul", "native8": "native CONV2D, IF8"}
 
 
@@ -990,9 +1036,103 @@ def plot_snr(results, png, title):
     print(f"graph: {png}")
 
 
+def _type_rows(cases, kd):
+    return sorted((c for c in cases.values() if next(iter(c.values()))["kind"] == kd),
+                  key=lambda c: (next(iter(c.values()))["H"] * next(iter(c.values()))["W"],
+                                 next(iter(c.values()))["Cin"]))
+
+
+def _wino_note(rows_, thr):
+    modes = {r.get("wmode") for c in rows_ for r in c.values()} - {None}
+    if not modes and not any(c.get("winograd", {}).get("status") not in (None, "n/a") for c in rows_):
+        r0 = next(iter(rows_[0].values()))
+        if r0["k"] == 1:
+            return "Winograd n/a: a 1x1 conv shares no inputs between outputs (it is a plain matmul)"
+        if r0["s"] > 1:
+            return f"Winograd n/a: stride {r0['s']} (no F(2x2,3x3) piece in its polyphase split)"
+        return "Winograd not run in this sweep"
+    mode = modes.pop() if modes else "plain"
+    r0 = next(iter(rows_[0].values()))
+    note = WINO_NOTE.get(mode, "Winograd").format(n=(-(-r0["k"] // 3)) ** 2)
+    return note + (f"; select_conv_path uses it from Cin ≥ {thr}" if mode == "plain" else "")
+
+
+def plot_split(results, prefix, title):
+    """One readable PNG per conv type: <prefix>_<type>.png, rows = map size · channels, one bar per path."""
+    plt = _mpl()
+    from matplotlib.patches import Patch
+    from user_dma_core import CONV3X3_WINOGRAD_MIN_CIN as thr
+    plt.rcParams.update({"font.size": 10, "axes.titlesize": 12})
+    cases = by_case(results)
+    kinds = []
+    for c in cases.values():
+        kd = next(iter(c.values()))["kind"]
+        if kd not in kinds:
+            kinds.append(kd)
+    order = [lbl for lbl, *_ in CONV_TYPES]
+    kinds.sort(key=lambda kd: order.index(kd) if kd in order else len(order))
+    out = []
+    for kd in kinds:
+        rows_ = _type_rows(cases, kd)
+        paths = [p for p in PATH_ORDER if any(_measured(c.get(p)) for c in rows_)]
+        if not paths:
+            continue
+        xmax = max([1.0] + [c["native16"]["ms"] / r["ms"] for c in rows_ if _measured(c.get("native16"))
+                            for r in c.values() if _measured(r)])
+        bar_h = 0.82 / len(paths)
+        fig, ax = plt.subplots(figsize=(9.5, 1.9 + 0.17 * len(paths) * len(rows_) + 0.12 * len(rows_)))
+        prev_hw = None
+        for yi, c in enumerate(rows_):
+            r0 = next(iter(c.values()))
+            if prev_hw is not None and (r0["H"], r0["W"]) != prev_hw:
+                ax.axhline(yi - 0.5, color=GRID_LINE, lw=1.2)
+            prev_hw = (r0["H"], r0["W"])
+            base = c.get("native16")
+            for pi, p in enumerate(paths):
+                y = yi - 0.41 + bar_h * (pi + 0.5)
+                r = c.get(p)
+                if _measured(r) and _measured(base):
+                    v = base["ms"] / r["ms"]
+                    ax.barh(y, v, height=bar_h * 0.8, color=SERIES[p], lw=0)
+                    if p != "native16":
+                        ax.text(v + xmax * 0.012, y, f"{v:.2f}x", va="center", fontsize=7.5, color=INK2)
+                elif _measured(r):                                   # ran, but native16 could not: no ratio
+                    ax.text(xmax * 0.012, y, f"{p}: {r['ms']:.2f} ms (native16 can't run this shape)", va="center",
+                            fontsize=7.5, color=MUTED, style="italic")
+                elif r is not None and r["status"] != "n/a":
+                    ax.text(xmax * 0.012, y, f"{p}: {r['status']}", va="center", fontsize=7.5, color=MUTED,
+                            style="italic")
+        ax.axvline(1.0, color=INK2, lw=1)
+        ax.set_yticks(range(len(rows_)), [_shape_label(next(iter(c.values()))) for c in rows_])
+        ax.set_ylim(len(rows_) - 0.5, -0.5)
+        ax.set_xlim(0, xmax * 1.14)
+        ax.tick_params(axis="y", length=0)
+        ax.grid(axis="x", color=GRID_LINE, lw=0.8)
+        ax.set_axisbelow(True)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        ax.set_xlabel("speedup vs native CONV2D bf16 (higher is faster)")
+        ax.set_title(f"{kd} conv\n{_wino_note(rows_, thr)}", fontsize=12)
+        ax.title.set_linespacing(1.45)
+        fh = fig.get_figheight()
+        fig.suptitle(title, x=0.01, ha="left", fontsize=10, color=INK2)
+        fig.legend(handles=[Patch(color=SERIES[p], label=LABEL[p]) for p in paths], loc="upper left",
+                   bbox_to_anchor=(0.005, 1 - 0.40 / fh), ncol=2, frameon=False, fontsize=9)
+        fig.text(0.01, 0.005, "rows: input map H x W · input channels → output channels"
+                 + ("; stride 2 halves the output map" if "s2" in kd else ""), fontsize=8, color=INK2)
+        fig.tight_layout(rect=(0, 0.02, 1, 1 - (0.58 + 0.2 * ((len(paths) - 1) // 2)) / fh))
+        png = f"{prefix}_{kd.replace(' ', '_')}.png"
+        fig.savefig(png, dpi=150)
+        plt.close(fig)
+        out.append(png)
+        print(f"graph: {png}")
+    return out
+
+
 def plot_all(results, prefix, title):
     plot(results, prefix + ".png", title)
     plot_snr(results, prefix + "_snr.png", title)
+    plot_split(results, prefix, title)
 
 
 # ----------------------------------------------------------------------------------------------- main
@@ -1072,7 +1212,7 @@ def main():
         plot_all(saved["results"], os.path.splitext(args.plot_only)[0], saved["title"])
         return
 
-    paths = (args.paths or ("winograd,native16,direct" if args.sweep else "direct,winograd,native16,native8")).split(",")
+    paths = (args.paths or ("winograd,native16,direct,native8" if args.sweep else "direct,winograd,native16,native8")).split(",")
     specs = build_specs(args)
     probe = Probe(args)
     out = args.out or os.path.join(ROOT, "scratchpad", "conv_paths_sweep" if args.sweep else "conv_paths_cases")
