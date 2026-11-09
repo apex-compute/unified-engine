@@ -8,19 +8,13 @@ python3 -m pip install -r requirements.txt
 ```
 
 The model compilers download and verify pinned checkpoints, then generate local
-single-bin deployments. Generated bins, cached checkpoints and output media
-are not committed; benchmark reports live alongside their models. Compile a bin before using its direct runner; add
+single-bin deployments. Generated bins, cached checkpoints, reports and output
+media are not committed. Compile a bin before using its direct runner; add
 `--force` to rebuild it after compiler or driver changes.
-
-The [four-model YOLO benchmark](benchmarks/README.md) reports native and optimized
-latency, FPS, deployment memory and numerical comparisons for YOLOv5n, YOLOv5s,
-YOLO26n and YOLO26s. Their compilers, direct runners and CI wrappers use the
-optimized path by default; `--native` selects the original baseline.
 
 | Model | Task | Guide |
 | --- | --- | --- |
 | YOLOv5s / YOLOv5n | Object detection | [YOLOv5s](yolov5s/README.md), [YOLOv5n](yolov5n/README.md) |
-| YOLO26n / YOLO26s | NMS-free object detection | [YOLO26n](yolo26n/README.md), [YOLO26s](yolo26s/README.md) |
 | U-Net | Car foreground segmentation | [U-Net](unet/README.md) |
 | DPDFNet2 | Speech enhancement at 16 kHz or native 8 kHz | [16 kHz](dpdfnet/README.md), [8 kHz](dpdfnet8khz/README.md) |
 | BigCodec | Speech compression and reconstruction | [BigCodec](bigcodec/README.md) |
@@ -49,7 +43,7 @@ Run model host tests without FPGA access:
 
 ```bash
 (
-  for suite in yolov5s yolov5n yolo26n unet dpdfnet dpdfnet8khz bigcodec; do
+  for suite in yolov5s yolov5n unet dpdfnet dpdfnet8khz bigcodec; do
     python3 -m unittest discover -s "models/$suite" -p 'test_*.py' || exit 1
   done
 )

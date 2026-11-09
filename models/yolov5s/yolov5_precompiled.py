@@ -21,9 +21,6 @@ from typing import Sequence
 import torch
 
 import user_dma_core
-import yolov5_winograd
-import yolo_attention
-import yolo_channel_ops
 
 
 PRECOMPILED_ABI = "andromeda-yolov5-whole-graph-v1"
@@ -262,7 +259,7 @@ def _layout_for_conv(shape: Sequence[int]) -> _PackedMap:
     return _PackedMap(logical, physical, tuple(range(logical[0])))
 
 
-def _build_memory_plan(payload: dict, winograd_layers=()):
+def _build_memory_plan(payload: dict):
     input_shape = tuple(int(value) for value in payload["model"]["input_shape"])
     layouts: dict[str, _PackedMap] = {
         "input": _layout_for_conv(input_shape),
@@ -275,7 +272,7 @@ def _build_memory_plan(payload: dict, winograd_layers=()):
         sources = [layouts[name] for name in operation["inputs"]]
         shape = tuple(int(value) for value in operation["output_shape"])
         kind = operation["op"]
-        if kind in ("conv", "attention", "select", "depthwise"):
+        if kind == "conv":
             result = _layout_for_conv(shape)
         elif kind in ("maxpool", "upsample2x"):
             source = sources[0]
@@ -348,17 +345,6 @@ def _build_memory_plan(payload: dict, winograd_layers=()):
         scratch_bytes = max(
             scratch_bytes,
             2 * source.height * source.width * source.channel_tiles * _LINE_BYTES)
-    for operation in payload["operations"]:
-        if operation["op"] == "depthwise":
-            source = layouts[operation["inputs"][0]]
-            scratch_bytes = max(scratch_bytes, source.height * source.width * _LINE_BYTES)
-        if operation["op"] == "attention":
-            source = layouts[operation["inputs"][0]]
-            scratch_bytes = max(scratch_bytes, yolo_attention.scratch_bytes(source))
-        if operation["name"] in winograd_layers:
-            source = layouts[operation["inputs"][0]]
-            scratch_bytes = max(scratch_bytes, yolov5_winograd.SCRATCH_BYTES
-                                + yolov5_winograd.padded_bytes(source))
     scratch_address = _align_up(cursor, _LINE_BYTES)
     cursor = scratch_address + scratch_bytes
     if cursor > TENSOR_LIMIT:
@@ -809,27 +795,19 @@ def _emit_concat(engine: _WholeGraphEngine, sources: Sequence[_PackedMap],
         destination_tile_offset += source.channel_tiles
 
 
-def compile_precompiled_hardware(payload: dict, *, winograd: bool = False) -> dict:
+def compile_precompiled_hardware(payload: dict) -> dict:
     """Compile one fixed-address, HALT-terminated program without an FPGA."""
     previous_axi_width = user_dma_core.UE_AXI_DATA_WIDTH_BITS
     user_dma_core.UE_AXI_DATA_WIDTH_BITS = PRECOMPILED_AXI_DATA_WIDTH_BITS
     try:
-        return _compile_precompiled_hardware(payload, winograd=winograd)
+        return _compile_precompiled_hardware(payload)
     finally:
         user_dma_core.UE_AXI_DATA_WIDTH_BITS = previous_axi_width
 
 
-def _compile_precompiled_hardware(payload: dict, *, winograd: bool = False) -> dict:
+def _compile_precompiled_hardware(payload: dict) -> dict:
     (layouts, heads, head_bundle_address, head_bundle_bytes,
      scratch_address, scratch_bytes) = _build_memory_plan(payload)
-    winograd_layers = []
-    if winograd:
-        winograd_layers = [op["name"] for op in payload["operations"]
-                           if op["op"] == "conv" and yolov5_winograd.eligible(
-                               op, payload["weights"][op["name"]],
-                               layouts[op["inputs"][0]], layouts[op["output"]])]
-        (layouts, heads, head_bundle_address, head_bundle_bytes,
-         scratch_address, scratch_bytes) = _build_memory_plan(payload, winograd_layers)
     image = _ImageBuilder(MODEL_BASE, MODEL_LIMIT)
     zero_address = image.allocate(
         torch.zeros(_ACT_TEMPLATE_BYTES // 2, dtype=torch.bfloat16),
@@ -839,26 +817,12 @@ def _compile_precompiled_hardware(payload: dict, *, winograd: bool = False) -> d
                    dtype=torch.bfloat16), alignment=64)
 
     conv_plans = {}
-    attention_plans = {}
-    depthwise_plans = {}
     for operation in payload["operations"]:
-        if operation['op'] == 'depthwise':
-            depthwise_plans[operation['name']] = yolo_channel_ops.prepare_depthwise(
-                operation, payload['weights'][operation['name']], layouts[operation['inputs'][0]],
-                layouts[operation['output']], image, scratch_address,
-                unpack_codes=_unpack_codes, prepare_conv=_prepare_conv_plan)
-        if operation["op"] == "attention":
-            attention_plans[operation["name"]] = yolo_attention.prepare(
-                operation, [layouts[name] for name in operation["inputs"]],
-                layouts[operation["output"]], image)
         if operation["op"] == "conv":
-            prepare = (yolov5_winograd.prepare if operation["name"] in winograd_layers
-                       else _prepare_conv_plan)
-            options = {"unpack_codes": _unpack_codes} if operation["name"] in winograd_layers else {}
-            conv_plans[operation["name"]] = prepare(
+            conv_plans[operation["name"]] = _prepare_conv_plan(
                 operation, payload["weights"][operation["name"]],
                 layouts[operation["inputs"][0]], layouts[operation["output"]],
-                image, **options)
+                image)
 
     program_address = image.align(64)
     engine = _WholeGraphEngine(program_address)
@@ -869,20 +833,7 @@ def _compile_precompiled_hardware(payload: dict, *, winograd: bool = False) -> d
         sources = [layouts[name] for name in operation["inputs"]]
         destination = layouts[operation["output"]]
         if operation["op"] == "conv":
-            if operation["name"] in winograd_layers:
-                yolov5_winograd.emit(engine, conv_plans[operation["name"]],
-                                     scratch_address, zero_address, _ACT_TEMPLATE_BYTES)
-            else:
-                _emit_conv(engine, conv_plans[operation["name"]], zero_address)
-        elif operation["op"] == "attention":
-            yolo_attention.emit(engine, attention_plans[operation["name"]],
-                                scratch_address, zero_address, _ACT_TEMPLATE_BYTES)
-        elif operation['op'] == 'select':
-            yolo_channel_ops.emit_select(engine, operation, sources[0], destination,
-                                         zero_address, _ACT_TEMPLATE_BYTES)
-        elif operation['op'] == 'depthwise':
-            yolo_channel_ops.emit_depthwise(engine, depthwise_plans[operation['name']],
-                zero_address, _ACT_TEMPLATE_BYTES, emit_conv=_emit_conv)
+            _emit_conv(engine, conv_plans[operation["name"]], zero_address)
         elif operation["op"] == "maxpool":
             _emit_maxpool(
                 engine, operation, sources[0], destination, neg_inf_address)
@@ -941,8 +892,6 @@ def _compile_precompiled_hardware(payload: dict, *, winograd: bool = False) -> d
         "scratch_bytes": scratch_bytes,
         "operations": entries,
     }
-    if winograd:
-        hardware["winograd_layers"] = winograd_layers
     validate_precompiled_hardware(payload, hardware)
     return hardware
 
@@ -991,8 +940,6 @@ def validate_precompiled_hardware(payload: dict,
         "program_sha256", "tensors", "heads", "head_bundle_address",
         "head_bundle_bytes", "scratch_address", "scratch_bytes", "operations",
     }
-    if "winograd_layers" in hardware:
-        expected_keys.add("winograd_layers")
     if set(hardware) != expected_keys:
         raise RuntimeError("YOLO whole-graph hardware schema has unknown/missing fields")
     expected_scalars = {
@@ -1044,18 +991,8 @@ def validate_precompiled_hardware(payload: dict,
         raise RuntimeError(
             "invalid whole-graph program jumps:\n" + "\n".join(jump_issues))
 
-    winograd_layers = hardware.get("winograd_layers", [])
-    if not isinstance(winograd_layers, list) or any(not isinstance(n, str) for n in winograd_layers):
-        raise RuntimeError("YOLO Winograd layer manifest is invalid")
     (layouts, heads, head_bundle_address, head_bundle_bytes,
-     scratch_address, scratch_bytes) = _build_memory_plan(payload, winograd_layers)
-    if "winograd_layers" in hardware:
-        expected_layers = [op["name"] for op in payload["operations"]
-                           if op["op"] == "conv" and yolov5_winograd.eligible(
-                               op, payload["weights"][op["name"]],
-                               layouts[op["inputs"][0]], layouts[op["output"]])]
-        if winograd_layers != expected_layers:
-            raise RuntimeError("YOLO Winograd layer manifest differs from eligible layers")
+     scratch_address, scratch_bytes) = _build_memory_plan(payload)
     expected_tensors = {
         name: layout.manifest() for name, layout in layouts.items()}
     if hardware["tensors"] != expected_tensors:

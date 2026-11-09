@@ -62,13 +62,7 @@ def main(argv=None, *, pinned_variant: str = "s",
     parser = argparse.ArgumentParser(
         description=f"Run {model_name} from one compiled Andromeda bin")
     parser.set_defaults(variant=pinned_variant)
-    strategy = parser.add_mutually_exclusive_group()
-    strategy.add_argument("--bin", type=Path, default=None,
-                          help="Run this exact artifact instead of selecting the default")
-    strategy.add_argument("--winograd", "--optimize", dest="winograd", action="store_true",
-                          default=True, help="Select the optimized artifact (default)")
-    strategy.add_argument("--native", dest="winograd", action="store_false",
-                          help="Select the native convolution baseline artifact")
+    parser.add_argument("--bin", type=Path, default=None)
     parser.add_argument("--image", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument(
@@ -106,8 +100,6 @@ def main(argv=None, *, pinned_variant: str = "s",
         args.variant, config_path)
     if args.bin is None:
         args.bin = resource_dir / config["paths"]["artifact"]
-        if args.winograd:
-            args.bin = args.bin.with_name(args.bin.stem + "_winograd" + args.bin.suffix)
     if args.image is None:
         args.image = (resource_dir / config["paths"]["default_image"]).resolve()
 
@@ -138,9 +130,6 @@ def main(argv=None, *, pinned_variant: str = "s",
           f"resolution={resolution} image={args.image}")
     print(f"Single bin: {args.bin.resolve()}")
     print(f"  sha256={sha256_file(args.bin.resolve())} load={load_elapsed:.3f}s")
-    if "winograd_layers" in selected_payload["hardware"]:
-        print(f"  Winograd: {len(selected_payload['hardware']['winograd_layers'])} layers "
-              "(remaining convolutions use native IF4/IF8)")
     original, image_tensor, letterbox = letterbox_image(
         args.image, tuple(selected_payload["model"]["input_shape"][1:]))
 
