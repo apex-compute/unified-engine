@@ -6571,11 +6571,13 @@ def _conv_model_run(args: list, label: str) -> dict:
 
 def _conv_model_bin(path: str, compile_args: list, label: str) -> None:
     """Compile a model bin once when it is missing (CI starts from a clean clone)."""
-    if os.path.exists(path):
+    if os.path.isfile(path):
         return
     start = time.time()
     for args in compile_args:
         _conv_model_run(args, f"{label} compile")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"{label}: compiler did not produce the requested bin: {path}")
     print(f"[{label}] compiled {path} in {time.time() - start:.0f} s", flush=True)
 
 
@@ -6650,9 +6652,14 @@ def conv_model_tests() -> None:
             # YOLOv5s / YOLOv5n: detections must match the CPU reference.
             for name, image, resolution in (("yolov5s", "vette.jpg", "640x480"),
                                             ("yolov5n", "people.jpg", "256x256")):
-                _conv_model_bin(f"{md}/{name}/{name}_bin/{name}-andromeda.bin",
-                                [[f"{md}/{name}/{name}_compile.py"]], name)
-                common = ["--image", f"{md}/test_samples/{image}", "--resolution", resolution]
+                # Check the same optimized artifact that both runners consume.
+                # A cached native bin must not suppress its initial compilation.
+                bin_path = f"{md}/{name}/{name}_bin/{name}-andromeda_winograd.bin"
+                _conv_model_bin(bin_path,
+                                [[f"{md}/{name}/{name}_compile.py", "--optimize",
+                                  "--output", bin_path]], name)
+                common = ["--bin", bin_path, "--image", f"{md}/test_samples/{image}",
+                          "--resolution", resolution]
                 fpga = _conv_model_run([f"{md}/{name}/{name}_run_from_bin.py", *hw, *common,
                                         "--output", out(f"{name}.jpg")], name)
                 cpu = _conv_model_run([f"{md}/{name}/{name}_run_from_bin.py", "--cpu", *common,
