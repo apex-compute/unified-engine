@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """FLUX.2 VAE decoder on the Unified Engine (phase 3) as ONE program.
 
+With bf16 / fp16 weights the 3x3 convs run through
+UnifiedEngine.conv2d_auto(strategy="wino") (every 3x3 at >= 128 channels, conv_in only from a 64x64
+latent, never conv_out); the router's weights (U planes, bias) live in the constant image. The router
+writes a dense map, so the residual stream (conv outputs, adds) is "compact"; GroupNorm reads it and
+writes the padded map the next conv reads, upsample reads it and writes padded. Every other conv keeps
+the walker / matmul emitters.
+
 ``AutoencoderKLFlux2`` decode path emitted into every engine's stream as the
 third phase of the program set (after the text encoder and the DiT), with the
 scheduler's flag barriers between ops. The host DMAs the latent map and the
@@ -89,6 +96,27 @@ GN_FLUSH = udc.GROUP_NORM_MAX_ACC_DEPTH
 MM9_MAX_M = 2048                   # pixels per row-block matmul of a 3x3 conv (R = MM9_MAX_M // Wp rows)
 WEIGHT_REUSE_BANK = 512 * 1024     # URAM_B: the one [oc][tap] weight pattern a weight_reuse launch holds
 CONV_WB_CANDIDATES = (0x300, 0x600, 0x900, 0xC00)   # URAM_A lines below the conv writeback: the window region
+WINO_BUDGET = 32 << 20             # conv2d_auto Winograd scratch (D + M planes) per engine (bytes)
+
+
+class _ConstUpload:
+    """conv2d_auto's params_ue: the router's weight uploads land in the constant image. The plan allocates
+    (weights unused); const_image replays the same allocations with the real weights into ``put``."""
+
+    def __init__(self, vae):
+        self.vae, self.addrs, self.put, self.i = vae, [], None, 0
+
+    def allocate_params_dram(self, n, label=None, align_bytes=64):
+        if self.put is None:
+            self.addrs.append(self.vae._calloc(n, align_bytes))
+            return self.addrs[-1]
+        self.i += 1
+        return self.addrs[self.i - 1]
+
+    def dma_write(self, _dev, addr, data, n):
+        if self.put is not None:
+            self.put(addr, bytes(data[:n]))
+        return n
 
 
 def emitter_hash() -> str:
@@ -335,7 +363,7 @@ class Flux2VaeOneShot:
     def _walk(self, lat_h, lat_w):
         self.in_buf = self._new_buf("padded", self.lat, lat_h, lat_w)
         x0 = self.conv(self.in_buf, "post_quant_conv", "padded")
-        x = self.conv(x0, "decoder.conv_in", "padded")
+        x = self.conv(x0, "decoder.conv_in", "compact")
         self._release(x0)
         c = self.block_out[-1]
         x = self.resnet(x, "decoder.mid_block.resnets.0", c, c)
@@ -349,7 +377,7 @@ class Flux2VaeOneShot:
             if i < len(rev) - 1:
                 u = self.upsample(x, f"decoder.up_blocks.{i}.upsamplers.0")
                 self._release(x)
-                x = self.conv(u, f"decoder.up_blocks.{i}.upsamplers.0.conv", "padded")
+                x = self.conv(u, f"decoder.up_blocks.{i}.upsamplers.0.conv", "compact")
                 self._release(u)
         h = self.gn(x, "decoder.conv_norm_out", silu=True)
         self._release(x)
@@ -359,14 +387,14 @@ class Flux2VaeOneShot:
 
     def resnet(self, x, p, cin, cout):
         s1 = self.gn(x, p + ".norm1", silu=True)
-        h = self.conv(s1, p + ".conv1", "padded")
+        h = self.conv(s1, p + ".conv1", "compact")
         self._release(s1)
         s2 = self.gn(h, p + ".norm2", silu=True)
-        h2 = self.conv(s2, p + ".conv2", "padded")
+        h2 = self.conv(s2, p + ".conv2", "compact")
         self._release(s2)
         self._release(h)
         if cin != cout:
-            xs = self.conv(x, p + ".conv_shortcut", "padded")
+            xs = self.conv(x, p + ".conv_shortcut", "compact")
             self._release(x)
             x = xs
         out = self.add(x, h2, p)
@@ -383,7 +411,7 @@ class Flux2VaeOneShot:
         o = self.attention_core(q, k, v, p)
         for b in (q, k, v):
             self._release(b)
-        o2 = self.conv(o, p + ".to_out.0", "padded")
+        o2 = self.conv(o, p + ".to_out.0", "compact")
         self._release(o)
         out = self.add(x, o2, p)
         self._release(x)
@@ -406,6 +434,10 @@ class Flux2VaeOneShot:
         if (kh, kw, pad) == (3, 3, 1) and C % UE_VECTOR_SIZE == 0 and OC % UE_VECTOR_SIZE == 0 \
                 and x.layout == "padded" and out_layout == "padded" and self.conv3x3_mode == "matmul":
             return self.conv3x3_mm(x, key)
+        # port plan: Winograd for 3x3 at >= 128 channels (conv_in from a 64x64 latent on), conv_out stays native
+        if (self.native and (kh, kw, pad) == (3, 3, 1) and x.layout == "padded" and out_layout == "compact"
+                and H % 2 == 0 and key != "decoder.conv_out" and (C >= 128 or H * Wd >= 64 * 64)):
+            return self.conv_wino(x, key)
         OC_eff = OC if (OC % UE_VECTOR_SIZE == 0 or out_layout == "tiled") else _align(OC, UE_VECTOR_SIZE)
         g = self._best_conv_geometry(C, H, Wd, OC_eff, kh, kw, pad)
         n_oc, nck = g["oc_chunk"], g["n_chunks"]
@@ -469,6 +501,24 @@ class Flux2VaeOneShot:
                                                bias=bias, groups=groups, macs=macs))
         return out
 
+    def conv_wino(self, x: Buf, key: str):
+        """3x3 conv through conv2d_auto(strategy="wino"): padded map in, compact map out; each engine an
+        even band of output rows. The weights are prepared here (shape only) into the constant image."""
+        OC, C, kh, kw, pad = self.shapes[key]
+        _, H, Wd = x.shape()
+        geom = dict(c_in=C, in_h=H, in_w=Wd, kernel_h=kh, kernel_w=kw, stride_s=1, pad=pad, oc_count=OC)
+        w, b, cache, up = torch.zeros(OC, C, kh, kw), torch.zeros(OC), {}, _ConstUpload(self)
+        self.ue.conv2d_auto(strategy="wino", weight=w, bias=b, ACT_DRAM_ADDR=0, OUTPUT_DRAM_ADDR=0, band=(0, 0, 0, 0),
+                            params_ue=up, cache=cache, **geom)
+        self.conv_chunks[key] = dict(wino=True, up=up, geom=geom)
+        out = self._new_buf("compact", OC, H, Wd)
+        S = [self._scratch(f"wino{e}", WINO_BUDGET) for e in range(self.ne)]
+        macs = H * Wd * OC * kh * kw * C
+        self.macs += macs
+        self._step("wino", key, out, dict(x=x, out=out, geom=geom, w=w, b=b, cache=cache, up=up, S=S,
+                                          bands=_split(H, self.ne, unit=2), macs=macs))
+        return out
+
     def conv1x1(self, x: Buf, key: str, out_layout: str):
         """[pixels, C] @ W[OC, C]^T + bias, one matmul per image row (M = W)."""
         OC, C, _, _, _ = self.shapes[key]
@@ -487,7 +537,6 @@ class Flux2VaeOneShot:
         """GroupNorm, with the SiLU that follows it fused into the apply pass when ``silu``."""
         C, H, Wd = x.shape()
         ct = x.ct
-        assert x.layout == "padded"
         (_, slots, slot_lines, n_full, tail, flush_every, _nf) = udc.plan_group_norm(C, x.Hp, x.Wp, self.groups)
         n_chunks = n_full + (1 if tail else 0)
         chunk_bytes = slot_lines * LINE
@@ -522,11 +571,11 @@ class Flux2VaeOneShot:
         return out
 
     def add(self, x: Buf, y: Buf, key: str):
-        assert x.shape() == y.shape() and x.layout == y.layout == "padded"
+        assert x.shape() == y.shape() and x.layout == y.layout
         total_lines = x.lines
         round_lines = min(udc.URAM_NEAR_FULL_SIZE // LINE, 4096)
         n_rounds = -(-total_lines // round_lines)
-        out = self._new_buf("padded", *x.shape())
+        out = self._new_buf(x.layout, *x.shape())
         self._step("add", key, out, dict(x=x, y=y, out=out, total_lines=total_lines, round_lines=round_lines,
                                          ranges=_split(n_rounds, self.ne)))
         return out
@@ -581,6 +630,17 @@ class Flux2VaeOneShot:
             self.eng.sram_to_accelerator_memory(sram_address=sram, accelerator_dram_address=dram, element_size=0,
                                                 memcpy_length_bytes=nbytes)
 
+    def _store_map(self, sram, x: Buf, out: Buf, l0, n):
+        """Store lines [l0, l0+n) of map x's layout into ``out``; a compact source goes to a padded map row by row."""
+        if x.layout == out.layout:
+            return self._store(sram, out.addr + l0 * LINE, n * LINE)
+        rl = x.W * x.ct
+        while n > 0:
+            y, j = divmod(l0, rl)
+            k = min(n, rl - j)
+            self._store(sram, out.addr + ((y + 1) * out.Wp + 1) * out.ct * LINE + j * LINE, k * LINE)
+            sram, l0, n = sram + k * LINE, l0 + k, n - k
+
     def _zero_borders(self, b: Buf):
         """Zero the one-pixel border of a padded map (zeros staged in URAM_B)."""
         if b.layout != "padded":
@@ -620,6 +680,20 @@ class Flux2VaeOneShot:
 
     # conv -------------------------------------------------------------
     def _emit_conv(self, st):
+        self._emit_conv_walker(st)
+
+    def _emit_wino(self, st):
+        e = self.e
+        r0, r1 = st["bands"][e]
+        self.eng.conv2d_auto(strategy="wino", weight=st["w"], bias=st["b"], ACT_DRAM_ADDR=st["x"].addr,
+                             OUTPUT_DRAM_ADDR=st["out"].addr, band=(r0, r1, 0, st["geom"]["in_w"]), params_ue=st["up"],
+                             cache=st["cache"], scratch_addr=st["S"][e], scratch_bytes=WINO_BUDGET, **st["geom"])
+        assert len(st["cache"]) == 1, st["name"]          # the plan's weights: nothing uploaded at emit
+        if e == 0:
+            self.ue._flops_acc += 2 * st["macs"]
+        self._B()
+
+    def _emit_conv_walker(self, st):
         eng, e = self.eng, self.e
         g, x, out = st["g"], st["x"], st["out"]
         nck, n_oc, C = st["nck"], st["n_oc"], st["C"]
@@ -869,7 +943,7 @@ class Flux2VaeOneShot:
             eng.eltwise_mul_core(a_ln(A_CHUNK), b_ln(0), a_ln(A_CHUNK), tl * UE_VECTOR_SIZE)
             eng.eltwise_add_core(a_ln(A_CHUNK), b_ln(slot_lines), a_ln(A_CHUNK), tl * UE_VECTOR_SIZE)
             if not fused:
-                self._store(a_ln(A_CHUNK), out.addr + i * cb, tb)
+                self._store_map(a_ln(A_CHUNK), x, out, i * slot_lines, tl)
                 continue
             for h0 in range(0, tl, HALF):
                 n = min(HALF, tl - h0)
@@ -892,7 +966,7 @@ class Flux2VaeOneShot:
                 eng.eltwise_mul_core(a_ln(A_T), b_ln(B_T), b_ln(B_T), ne_)            # t * p
                 eng.eltwise_mul_core(a_ln(A_XN), b_ln(B_T), a_ln(A_XN), ne_)          # XN * t * p
                 eng.eltwise_add_core(a_ln(A_XN), b_ln(B_XP), a_ln(A_XN), ne_)         # silu(y) = XP p + XN t p
-                self._store(a_ln(A_XN), out.addr + i * cb + h0 * LINE, n * LINE)
+                self._store_map(a_ln(A_XN), x, out, i * slot_lines + h0, n)
         if e == 0:
             self._zero_borders(out)
         self._B()
@@ -922,7 +996,7 @@ class Flux2VaeOneShot:
         y0, y1 = st["ranges"][e]
         assert x.W * px <= udc.URAM_NEAR_FULL_SIZE
         for y in range(y0, y1):
-            self._load(x.addr + ((y + 1) * x.Wp + 1) * px, 0, x.W * px)
+            self._load(x.addr + ((y + x.border) * x.Wp + x.border) * px, 0, x.W * px)
             for a in (0, 1):
                 for b in (0, 1):
                     self._store(0, out.addr + ((2 * y + a + 1) * out.Wp + 1 + b) * px, x.W * px,
@@ -979,6 +1053,16 @@ class Flux2VaeOneShot:
                 put(addr, _i16bytes(line))
         for key, cc in self.conv_chunks.items():
             c = weights["convs"][key]
+            if cc.get("wino"):                          # replay the plan's router uploads with the real weights
+                assert "weight" in c, f"{key}: Winograd needs the native weights"
+                up = cc["up"]
+                up.put, up.i = put, 0
+                self.ue.conv2d_auto(strategy="wino", weight=c["weight"].to(self.wformat.dtype).float(),
+                                    bias=c["bias"].float(), ACT_DRAM_ADDR=0, OUTPUT_DRAM_ADDR=0, band=(0, 0, 0, 0),
+                                    params_ue=up, cache=None, **cc["geom"])
+                up.put = None
+                assert up.i == len(up.addrs), key
+                continue
             codes, bs, bias = c["codes"], c["block_scales"].to(torch.bfloat16), c["bias"]
             OC, C, kh, kw = codes.shape
             if cc.get("native"):

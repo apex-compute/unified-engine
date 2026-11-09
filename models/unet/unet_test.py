@@ -14,7 +14,7 @@ Hardware needs the CONV2D/MAXPOOL queue-CONFIG image (AXI-256 or AXI-512).
 
 Usage:
   python models/unet/unet_test.py --dev xdma0 [--image test_samples/vette.jpg]
-                                  [--resolution 256x256] [--force] [--cpu]
+                                  [--resolution 256x256] [--force] [--cpu] [--conv-router]
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ COMPILE = SCRIPT_DIR / "unet_compile.py"
 RUNNER = SCRIPT_DIR / "unet_run_from_bin.py"
 BIN_DIR = SCRIPT_DIR / "unet_bin"
 BIN = BIN_DIR / "unet-andromeda.bin"
+ROUTER_BIN = BIN_DIR / "unet-andromeda-router.bin"
 DEFAULT_IMAGE = MODELS_DIR / "test_samples" / "vette.jpg"
 
 
@@ -100,35 +101,39 @@ def main(argv=None) -> int:
     ap.add_argument("--force", action="store_true", help="rebuild the bin even if present")
     ap.add_argument("--cpu", action="store_true",
                     help="run the quantized CPU backend instead of the FPGA (host smoke test)")
+    ap.add_argument("--conv-router", action="store_true",
+                    help="3x3 convs from 128 channels via conv2d_auto(strategy='wino'); separate bin")
     args = ap.parse_args(argv)
+    bin_path = ROUTER_BIN if args.conv_router else BIN
+    router = ["--conv-router"] if args.conv_router else []
 
     py = sys.executable
     timings = {}
     cfg = json.loads((SCRIPT_DIR / "unet_config.json").read_text())
-    _discard_corrupt(BIN, zip_archive=True, tag="unet_test")
+    _discard_corrupt(bin_path, zip_archive=True, tag="unet_test")
     _discard_corrupt(BIN_DIR / "unet_carvana_scale0.5_epoch2.pth", zip_archive=True,
                      sha256=cfg["source"]["weights_sha256"], tag="unet_test")
 
-    if args.force or not BIN.is_file():
+    if args.force or not bin_path.is_file():
         t0 = time.perf_counter()
         cmd = [py, "-u", str(COMPILE), "--download", "--resolution", args.resolution,
-               "--output", str(BIN)]
+               "--output", str(bin_path)] + router
         if args.force:
             cmd.append("--force")
         rc, _ = _stream(cmd)
         timings["compile_s"] = round(time.perf_counter() - t0, 3)
-        if rc != 0 or not BIN.is_file():
-            print(f"[unet_test] compile failed (rc={rc}); bin missing: {BIN}")
+        if rc != 0 or not bin_path.is_file():
+            print(f"[unet_test] compile failed (rc={rc}); bin missing: {bin_path}")
             return rc or 1
     else:
-        print(f"[unet_test] reusing bin {BIN}")
+        print(f"[unet_test] reusing bin {bin_path}")
         timings["compile_s"] = 0.0
 
     transport = "efinix" if args.device == "efinix" else "rk"
-    output = BIN_DIR / f"ci_{args.image.stem}_{args.resolution}_mask.png"
-    cmd = [py, "-u", str(RUNNER), "--bin", str(BIN),
+    output = BIN_DIR / f"ci_{args.image.stem}_{args.resolution}{'_router' if args.conv_router else ''}_mask.png"
+    cmd = [py, "-u", str(RUNNER), "--bin", str(bin_path),
            "--image", str(args.image.resolve()), "--resolution", args.resolution,
-           "--output", str(output), "--timeout", str(args.timeout), "--compare"]
+           "--output", str(output), "--timeout", str(args.timeout), "--compare"] + router
     if args.cpu:
         cmd += ["--backend", "cpu-quantized"]
     else:
@@ -146,7 +151,7 @@ def main(argv=None) -> int:
 
     result.update(timings)
     result["ci_entry"] = "unet_test.py"
-    result["bin"] = str(BIN)
+    result["bin"] = str(bin_path)
     print("TEST_RESULT:" + json.dumps(result, separators=(",", ":")), flush=True)
     return 0
 

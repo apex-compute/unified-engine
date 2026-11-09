@@ -14,7 +14,9 @@ HERE = Path(__file__).resolve().parent
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bin', type=Path, default=HERE/'unet_bin/unet-andromeda.bin')
+    parser.add_argument('--bin', type=Path)
+    parser.add_argument('--conv-router', action='store_true',
+                        help='expect a unet_compile.py --conv-router bin (default unet-andromeda-router.bin)')
     parser.add_argument('--image', type=Path, required=True)
     parser.add_argument('--output', type=Path, default=HERE/'unet_bin/mask.png')
     parser.add_argument('--resolution', default='256x256')
@@ -36,7 +38,11 @@ def main():
     except ValueError:
         parser.error('resolution must be WIDTHxHEIGHT, each >=16')
     torch.set_num_threads(min(4,torch.get_num_threads()))
+    args.bin = args.bin or HERE/('unet_bin/unet-andromeda-router.bin' if args.conv_router
+                                 else 'unet_bin/unet-andromeda.bin')
     payload, layers = load_artifact(args.bin)
+    if args.conv_router != any(layer.get('wino') for layer in layers.values()):
+        parser.error('--conv-router must match how the bin was compiled')
     if args.backend == 'hardware':
         if not payload.get('full_graph'):
             parser.error('legacy layer bin: rebuild with unet_compile.py --force')

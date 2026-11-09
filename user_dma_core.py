@@ -10053,6 +10053,39 @@ class UnifiedEngine:
             total_flops += 4 * results
         return total_flops
 
+    def conv2d_auto(self, *, weight: torch.Tensor, strategy: Optional[str] = None, bias: Optional[torch.Tensor] = None,
+                    band=None, scratch_addr: Optional[int] = None, scratch_bytes: int = 32 << 20, params_ue=None,
+                    cache: Optional[dict] = None, **conv2d_core_kwargs) -> int:
+        """Conv router: ``strategy`` = "native" (CONV2D walker), "naive" (im2col + matmul) or "wino" (Winograd);
+        None uses the default rule in :func:`conv_strategy`. ``weight`` is float; data_type=TYPE.IF8 / IF4
+        quantizes it here (native and naive; wino needs bf16). Takes conv2d_core's geometry and
+        ACT_DRAM_ADDR (conv2d_pack_activation_map layout), writes OUTPUT_DRAM_ADDR as [out_h][out_w][oc rounded
+        up to 64] bf16. ``band`` = (row0, row1, col0, col1) of output pixels for this engine; ``params_ue`` uploads
+        the weights (the primary engine when emitting on a worker); pass the same ``cache`` dict to every engine's
+        call to upload them once. Raises ValueError if the strategy cannot run the conv. Returns the conv's FLOPs.
+        """
+        kw = conv2d_core_kwargs
+        act = next((k[:-7] for k in ("relu_enable", "silu_enable", "gelu_enable") if kw.pop(k, False)), None)
+        ACT, OUT, dt = kw.pop("ACT_DRAM_ADDR"), kw.pop("OUTPUT_DRAM_ADDR"), kw.pop("data_type", None)
+        g = ConvGeom(**kw)
+        s = conv_strategy(g, dt, strategy)
+        key = (id(weight), id(bias), s, dt, str(g), g.ph, g.pw)
+        P = cache.get(key) if cache is not None else None
+        if P is None:
+            P = _conv_prepare(params_ue or self, g, s, weight, bias, dt)
+            if cache is not None:
+                cache[key] = P
+        ra, rb, ca, cb = band or (0, g.Hout, 0, g.Wout)
+        if rb > ra and cb > ca:
+            X = _ConvMap(g.H, g.W, g.Ci, g.ph, g.pw, ACT)
+            Y = _ConvMap(g.Hout, g.Wout, g.Co, 0, 0, OUT)
+            scratch = self.allocate_tensor_dram(scratch_bytes) if scratch_addr is None else scratch_addr
+            gM = self.alloc_isa_reg()
+            {"native": _conv_emit_native, "naive": _conv_emit_naive, "wino": _conv_emit_wino}[s](
+                self, P, g, X, Y, (ra, rb, ca, cb), act, scratch, scratch_bytes, gM)
+            self.release_isa_reg()
+        return 2 * g.Hout * g.Wout * g.kh * g.kw * g.c_in * g.oc
+
     def conv1d_core(self, ACT_DRAM_ADDR: int, WEIGHTS_DRAM_ADDR: int, SCALE_DRAM_ADDR: int,
                     OUTPUT_DRAM_ADDR: int, *,
                     c_in: int, length: int, kernel_size: int, stride_s: int, pad: int,
@@ -13547,6 +13580,414 @@ def check_isa_jumps(
 # stream, per-block scale stream, per-OC bias stream, and the
 # pixel-major/oc-innermost result order of the dot-style writeback.
 # ---------------------------------------------------------------------------
+
+# Output: [out_h][out_w][oc rounded up to 64] bf16. Thresholds in conv_strategy are from conv_strategy_bench.
+CONV_STRATEGIES = ("native", "naive", "wino")
+_CONV_SRAM_BANK, _CONV_STAGE, _CONV_WB_LINES = 0x80000, 4000 * 128, 0x300
+
+
+def _up(n, m):
+    return (n + m - 1) // m * m
+
+
+class _ConvMap:
+    def __init__(self, H, W, C, hh, hw, addr):
+        self.C, self.hh, self.hw, self.addr, self.pb, self.Wp = C, hh, hw, addr, C * 2, W + 2 * hw
+        self.pitch = self.Wp * self.pb
+
+    def pix(self, y, x):
+        return self.addr + ((y + self.hh) * self.Wp + x + self.hw) * self.pb
+
+
+class ConvGeom:
+    def __init__(self, *, c_in, in_h, in_w, kernel_h, kernel_w, stride_s, pad, oc_count, pad_h=None, dilation=1,
+                 **_):
+        self.c_in, self.H, self.W, self.kh, self.kw, self.s, self.d, self.oc = (
+            c_in, in_h, in_w, kernel_h, kernel_w, stride_s, dilation, oc_count)
+        self.pw, self.ph = pad, pad if pad_h is None else pad_h
+        self.Ci, self.Co = _up(c_in, 64), _up(oc_count, 64)
+        self.Hout = (in_h + 2 * self.ph - dilation * (kernel_h - 1) - 1) // stride_s + 1
+        self.Wout = (in_w + 2 * self.pw - dilation * (kernel_w - 1) - 1) // stride_s + 1
+        self.wino, self.wino_why = None, None
+        n = -(-kernel_w // 3)
+        if kernel_h == kernel_w == 1:
+            self.wino_why = "1x1"
+        elif stride_s != 1:
+            self.wino_why = f"stride {stride_s}"
+        elif kernel_h == 1:
+            self.wino = dict(dim=1, gs=dilation, nph=1, npw=n) if 2 * n < kernel_w and not self.ph else None
+            self.wino_why = None if self.wino else f"1x{kernel_w} gains nothing from F(2,3)"
+        elif kernel_w == 1:
+            self.wino_why = f"{kernel_h}x1 kernel"
+        else:
+            m = -(-kernel_h // 3)
+            self.wino = dict(dim=2, gs=dilation, nph=m, npw=n) if 4 * m * n < kernel_h * kernel_w else None
+            self.wino_why = None if self.wino else f"{kernel_h}x{kernel_w} gains nothing from F(2x2,3x3)"
+
+    def __str__(self):
+        return f"{self.kh}x{self.kw} s{self.s} d{self.d} {self.H}x{self.W} {self.c_in}->{self.oc}"
+
+
+def _conv_wino_chunk(tw, ci, co):
+    return next((t for t in range(tw, 0, -1) if 18 * _up(t * co * 2, 128) <= _CONV_SRAM_BANK
+                 and 12 * _up((t + 1) * ci * 2, 128) <= _CONV_SRAM_BANK), None)
+
+
+def _conv_native_mode(g, dt=None):
+    """(gather, ct, occ) for the walker, or why it cannot run g."""
+    if g.kh > 15 or g.kw > 15:
+        return f"kernel {g.kh}x{g.kw} > 15"
+    q = dt in (TYPE.IF8, TYPE.IF4)
+    limit, bpb = (SCALE_BRAM_ELEMENTS, 64 if dt == TYPE.IF8 else 32) if q else (4096, 128)
+    ct, chunks = g.Ci // 64, -(-g.kh * g.kw * g.c_in // 64)
+    gather = (not q and g.c_in <= 255 and g.kh * g.kw * g.c_in <= 256
+              and max(g.kh * g.kw * ((g.c_in + 3) // 4), g.Co * chunks) < g.Co * g.kh * g.kw * ct)
+    if g.d * ((g.kw - 1) * g.d + 1) * ct > 0xFFF:
+        return "row-stride register > 4095"
+    blocks = chunks if gather else g.kh * g.kw * ct
+    # oc chunk: whole 64-lane groups or 32 / 16; other widths scattered into HWC came back wrong on the board
+    for n in range(min(g.Co, limit // blocks), 0, -1):
+        if g.Co % n or not (n % 64 == 0 or n in (32, 16)) or n * blocks * bpb > 512 * 1024:
+            continue
+        try:
+            occ = plan_conv2d_layer_tiles(
+                c_in=g.c_in if gather else g.Ci, oc_count=n, in_h=g.d * (g.kh - 1) + 1, in_w=g.d * (g.kw - 1) + 1,
+                kernel_h=g.kh, kernel_w=g.kw, stride_s=g.s, pad=0, pad_h=0, dilation=g.d, gather=gather,
+                bias_enabled=True, weight_block_limit=limit, wb_uram_addr=_CONV_WB_LINES)[2]
+        except AssertionError:
+            continue
+        if occ == n:
+            return gather, ct, n
+    return "no walker oc chunk fits"
+
+
+def _conv_naive_c(g):
+    """im2col pixel channels: 32 when Cin <= 32 and the kernel has an even tap count (no padded K tail), else Cin
+    padded to 64 -- a 3-channel 16x16 patch embed is K = 8192 instead of 16384."""
+    return 32 if g.c_in <= 32 and g.kh * g.kw % 2 == 0 else g.Ci
+
+
+def _conv_why(g, strategy, data_type):
+    q = data_type not in (None, TYPE.FLOAT16)
+    if q and data_type not in (TYPE.IF8, TYPE.IF4):
+        return f"weight type {data_type} (router takes FLOAT16, IF8, IF4)"
+    if strategy == "native":
+        m = _conv_native_mode(g, data_type)
+        return m if isinstance(m, str) else None
+    if strategy == "naive":
+        kmax = SCALE_BRAM_ELEMENTS if q else 16320
+        return f"K > {kmax}" if g.kh * g.kw * _conv_naive_c(g) > kmax else None
+    if strategy == "wino":
+        if q:
+            return "Winograd needs bf16 weights (it multiplies by transformed kernel planes, not the quantized weights)"
+        if g.wino is None:
+            return g.wino_why
+        return None if _conv_wino_chunk(1, g.Ci, g.Co) else "one tile column does not fit SRAM"
+    return f"unknown strategy {strategy!r}, choose from {CONV_STRATEGIES}"
+
+
+def conv_strategy(g, data_type=None, strategy=None):
+    """The strategy conv2d_auto runs for ConvGeom g. Given: checked, ValueError with the reason if it cannot run.
+    None: the default rule (within 5% of the best lowering on 344 of 367 measured convs), falling back to the
+    next strategy that can run g."""
+    if strategy is not None:
+        why = _conv_why(g, strategy, data_type)
+        if why:
+            raise ValueError(f"conv strategy {strategy!r} cannot run {g}: {why}")
+        return strategy
+    if data_type not in (None, TYPE.FLOAT16):
+        pick = "native"
+    elif g.kh == g.kw == g.s > 1 and g.ph == g.pw == 0:
+        pick = "naive" if g.kh * g.kw * g.c_in >= 512 else "native"
+    elif g.wino and min(g.c_in, g.oc) >= (256 if g.H == 1 and g.kh == 1 else 128):
+        pick = "wino"
+    else:
+        pick = "native"
+    for s in (pick, "native", "naive", "wino"):
+        if _conv_why(g, s, data_type) is None:
+            return s
+    raise ValueError(f"no conv strategy can run {g}")
+
+
+def _conv_upload(ue, data):
+    if isinstance(data, torch.Tensor):
+        data = tensor_le_bytes(data.to(torch.bfloat16).contiguous())
+    addr = ue.allocate_params_dram(_up(len(data), 128), align_bytes=128)
+    for off in range(0, len(data), 1 << 20):
+        n = min(1 << 20, len(data) - off)
+        ue.dma_write(DMA_DEVICE_H2C, addr + off, data[off:off + n], n)
+    return addr
+
+
+def _conv_quantize(w2d, dt):
+    """[rows, 64*k] float -> (codes bytes, scales bytes) with quant_lib's MixMSE IF8 / IF4."""
+    import quant_lib
+    return (quant_lib.quantize_if8 if dt == TYPE.IF8 else quant_lib.quantize_if4)(w2d, block_size=64, int_variant=None)
+
+
+def _conv_prepare(ue, g, strategy, weight, bias, dt=None):
+    w = weight.detach().float().cpu()
+    b = torch.zeros(g.Co)
+    if bias is not None:
+        b[:g.oc] = bias.detach().float().cpu()
+    q = dt in (TYPE.IF8, TYPE.IF4)
+    P = {"s": strategy, "dt": dt if q else TYPE.FLOAT16}
+    if strategy == "native":
+        gather, ct, occ = _conv_native_mode(g, dt)
+        src = torch.zeros(g.Co, g.c_in if gather else g.Ci, g.kh, g.kw)
+        src[:g.oc, :g.c_in] = w
+        scales = None
+        if q:                                                      # one 64-lane block per [oc][ky][kx][ct]
+            rows = src.view(g.Co, ct, 64, g.kh, g.kw).permute(0, 3, 4, 1, 2).reshape(-1, 64)
+            data, sc = _conv_quantize(rows, dt)
+            codes = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+            if dt == TYPE.IF4:                                     # low nibble first
+                codes = torch.stack((codes & 0xF, codes >> 4), -1)
+            src = (codes.reshape(g.Co, g.kh, g.kw, ct, 64).permute(0, 3, 4, 1, 2).reshape(g.Co, g.Ci, g.kh, g.kw))
+            scales = tensor_from_le_bytes(sc, torch.bfloat16).view(g.Co, g.kh * g.kw * ct)
+        pack = conv2d_pack_weight_stream_gather if gather else conv2d_pack_weight_stream
+        P.update(gather=gather, ct=ct, occ=occ, chunks=[
+            (o, _conv_upload(ue, pack(src[o:o + occ], 1, 1, P["dt"]).numpy().tobytes()),
+             _conv_upload(ue, tensor_le_bytes(conv2d_pack_bias_stream(b[o:o + occ].to(torch.bfloat16), 1, 1))),
+             None if scales is None else _conv_upload(ue, tensor_le_bytes(conv2d_pack_scale_stream(
+                 scales[o:o + occ], occ, g.kh * g.kw * ct, 1, 1).contiguous())))
+            for o in range(0, g.Co, occ)])
+    elif strategy == "naive":
+        cd = _conv_naive_c(g)
+        wd = torch.zeros(g.Co, g.kh, g.kw, cd)
+        wd[:g.oc, :, :, :g.c_in] = w.permute(0, 2, 3, 1)
+        wd = wd.reshape(g.Co, -1)
+        if q:
+            data, sc = _conv_quantize(wd, dt)
+            P.update(scales=_conv_upload(ue, sc))
+        P.update(K=g.kh * g.kw * cd, cd=cd, w=_conv_upload(ue, data if q else wd), b=_conv_upload(ue, b))
+    else:
+        wp, G = g.wino, torch.tensor([[1., 0, 0], [.5, .5, .5], [.5, -.5, .5], [0, 0, 1]])
+        gk = torch.zeros(g.Co, g.Ci, 3 * wp["nph"], 3 * wp["npw"])
+        gk[:g.oc, :g.c_in, :g.kh, :g.kw] = w
+        sg = lambda i: -1.0 if i == 2 else 1.0                       # plane 2 is stored negated (D2 = d1 - d2)
+        us = []
+        for a in range(wp["nph"]):
+            for c in range(wp["npw"]):
+                piece = gk[:, :, 3 * a:3 * a + 3, 3 * c:3 * c + 3]
+                if wp["dim"] == 2:
+                    U = torch.einsum("ik,ockl,jl->ocij", G, piece, G)
+                    us.append([_conv_upload(ue, sg(r) * sg(q) * U[:, :, r, q]) for r in range(4) for q in range(4)])
+                else:
+                    U = torch.einsum("ik,ock->oci", G, piece[:, :, 0])
+                    us.append([_conv_upload(ue, sg(q) * U[:, :, q]) for q in range(4)])
+        P.update(us=us, b=_conv_upload(ue, b), i64=_conv_upload(ue, torch.eye(64)))
+    return P
+
+
+def _conv_scopy(e, src, dst, count, chunk, src_jump=0, dst_jump=0):
+    src_jump, dst_jump = (0 if src_jump == chunk else src_jump), (0 if dst_jump == chunk else dst_jump)
+    for i0 in range(0, count, max(1, _CONV_STAGE // chunk)):
+        n = min(max(1, _CONV_STAGE // chunk), count - i0)
+        e.accelerator_memory_to_sram(src + i0 * (src_jump or chunk), 0, n * chunk // 2,
+                                     stride_bytes_per_chunk=chunk if src_jump else 0, stride_jump_bytes=src_jump)
+        e.sram_to_accelerator_memory(0, dst + i0 * (dst_jump or chunk), n * chunk // 2,
+                                     stride_bytes_per_chunk=chunk if dst_jump else 0, stride_jump_bytes=dst_jump)
+
+
+def _conv_emit_native(e, P, g, X, Y, band, act, scratch, scratch_bytes, gM):
+    ra, rb, ca, cb = band
+    gather, ct, occ, s, d = P["gather"], P["ct"], P["occ"], g.s, g.d
+    _, _, _, tiles = plan_conv2d_layer_tiles(
+        c_in=g.c_in if gather else g.Ci, oc_count=occ, in_h=(rb - ra - 1) * s + (g.kh - 1) * d + 1,
+        in_w=(cb - ca - 1) * s + (g.kw - 1) * d + 1, kernel_h=g.kh, kernel_w=g.kw, stride_s=s, pad=0, pad_h=0,
+        dilation=d, gather=gather, bias_enabled=True,
+        weight_block_limit=4096 if P["dt"] == TYPE.FLOAT16 else SCALE_BRAM_ELEMENTS, wb_uram_addr=_CONV_WB_LINES)
+    mode, la, lb = _conv_fused_lalu(act == "relu", act == "silu", act == "gelu")
+    wb, ob = _CONV_WB_LINES << 7, occ * 2
+    for oc0, w_addr, b_addr, s_addr in P["chunks"]:
+        for start, stop, *_ in conv2d_tile_geometry_groups(tiles):
+            if s_addr is not None:
+                e.accelerator_memory_to_scale_sram(s_addr, occ * g.kh * g.kw * ct)
+            e.accelerator_memory_to_bias_sram(b_addr, occ)
+            for tile in tiles[start:stop]:
+                oy, ox, th, tw, y0, x0, wh, ww = (int(v) for v in tile)
+                a, row = X.pix(ra * s - g.ph + y0, ca * s - g.pw + x0), ww * X.pb
+                if row == X.pitch or wh == 1:
+                    e.accelerator_memory_to_sram(a, 0, wh * row // 2)
+                else:
+                    e.accelerator_memory_to_sram(a, 0, wh * row // 2, stride_bytes_per_chunk=row,
+                                                 stride_jump_bytes=X.pitch)
+                e.start_queue_for_conv2d_operation(
+                    act_sram_start_addr=0, output_sram_wb_addr=wb, weights_dram_addr=w_addr, kernel_w=g.kw,
+                    kernel_h=g.kh, ct=ct, oc_count=occ, out_w=tw, out_h=th, w_pad=ww, stride_s=s,
+                    data_type=P["dt"], bias_enable=True, lalu_mode=mode, lalu_a=la, lalu_b=lb, dilation=d,
+                    gather=gather, c_in=g.c_in if gather else g.Ci, weight_reuse=True)
+                dst = lambda r: Y.pix(ra + oy + r, ca + ox) + oc0 * 2
+                if ob == Y.pb and (th == 1 or tw * Y.pb == Y.pitch):
+                    e.sram_to_accelerator_memory(wb, dst(0), th * tw * ob // 2)
+                elif ob == Y.pb:
+                    e.sram_to_accelerator_memory(wb, dst(0), th * tw * ob // 2, stride_bytes_per_chunk=tw * ob,
+                                                 stride_jump_bytes=Y.pitch)
+                else:
+                    if th > 1 and (tw * ob) % 128:                     # rows off SRAM lines: bounce via DRAM
+                        e.sram_to_accelerator_memory(wb, scratch, _up(th * tw * ob, 128) // 2)
+                    for r in range(th):
+                        src = wb + r * tw * ob
+                        if th > 1 and (tw * ob) % 128:
+                            e.accelerator_memory_to_sram(scratch + r * tw * ob, 0, tw * ob // 2)
+                            src = 0
+                        e.sram_to_accelerator_memory(src, dst(r), tw * ob // 2, stride_bytes_per_chunk=ob,
+                                                     stride_jump_bytes=Y.pb)
+
+
+def _conv_emit_naive(e, P, g, X, Y, band, act, scratch, scratch_bytes, gM):
+    ra, rb, ca, cb = band
+    nc, K, s, d, cd = cb - ca, P["K"], g.s, g.d, P["cd"]
+    pointwise = g.kh == g.kw == 1 and s == 1
+    if cd != g.Ci:                                                    # band rows -> 32-channel pixels in scratch
+        y0, y1 = ra * s - g.ph, (rb - 1) * s + (g.kh - 1) * d - g.ph + 1
+        npx = (y1 - y0) * X.Wp
+        _conv_scopy(e, X.pix(y0, -g.pw), scratch, npx, cd * 2, src_jump=X.pb)
+        X = _ConvMap(0, g.W, cd, 0, g.pw, scratch - y0 * X.Wp * cd * 2)
+        used = _up(npx * cd * 2, 128)
+        scratch, scratch_bytes = scratch + used, scratch_bytes - used
+    xc = min(nc, max(1, scratch_bytes // (K * 2)))                    # columns per im2col row that fit scratch
+    multi = xc == nc and ca == 0 and cb == g.Wout and (not pointwise or g.ph == g.pw == 0)
+    rc = max(1, min(rb - ra, scratch_bytes // (nc * K * 2))) if multi else 1
+    for c0 in range(ra, rb, rc):
+        n = min(rc, rb - c0)
+        for x0 in range(ca, cb, xc):
+            m = min(xc, cb - x0)
+            for r in range(0 if pointwise else n):
+                for ky in range(g.kh):
+                    iy = (c0 + r) * s + ky * d - g.ph
+                    for kx in ([0] if d == 1 else range(g.kw)):
+                        _conv_scopy(e, X.pix(iy, x0 * s + kx * d - g.pw), scratch + (r * m * K + (ky * g.kw + kx)
+                                    * X.C) * 2, m, (g.kw if d == 1 else 1) * X.pb, src_jump=s * X.pb, dst_jump=K * 2)
+            mm = dict(M=n * m, K=K, N=g.Co, A_DRAM_ADDR=X.pix(c0 - g.ph, x0 - g.pw) if pointwise else scratch,
+                      B_DRAM_ADDR=P["w"], OUTPUT_DRAM_ADDR=Y.pix(c0, x0), C_DRAM_ADDR=P["b"], bias_mode="broadcast_N",
+                      clamp_enable=act == "relu", clamp_min=0.0, clamp_max=float("inf"), silu_enable=act == "silu",
+                      gelu_enable=act == "gelu")
+            if "scales" in P:
+                e.quantized_matmat_core(SCALE_DRAM_ADDR=P["scales"], data_type=P["dt"], **mm)
+            else:
+                e.generate_instruction_add_set(gM, n * m)
+                e.matmat_mul_core(gpr_M_reg=gM, **mm)
+
+
+def _conv_emit_wino(e, P, g, X, Y, band, act, scratch, scratch_bytes, gM):
+    """F(2x2,3x3) / F(2,3): transforms as SRAM add/subs (A-bank op B-bank), matmuls with K = Cin."""
+    gs, dim, nph, npw = (g.wino[k] for k in ("gs", "dim", "nph", "npw"))
+    Ci, Co, step = g.Ci, g.Co, 2 * g.wino["gs"]
+    ra, rb, ca, cb = band
+    assert ca % step == 0 and (dim == 1 or ra % step == 0), f"Winograd band must start on a multiple of {step}"
+    ta, tb = (ra // step, -(-rb // step)) if dim == 2 else (ra, rb)
+    xa, xb = ca // step, -(-cb // step)
+    twe, npl, nout = xb - xa, (16 if dim == 2 else 4), (4 if dim == 2 else 2)
+    per_tile = npl * (Ci + Co) * 2
+    if twe * per_tile > scratch_bytes:                                # D + M planes too wide: column groups
+        tw_g = max(1, scratch_bytes // per_tile)
+        for x in range(xa, xb, tw_g):
+            _conv_emit_wino(e, P, g, X, Y, (ra, rb, x * step, min((x + tw_g) * step, cb)), act, scratch,
+                            scratch_bytes, gM)
+        return
+    twc = _conv_wino_chunk(twe, Ci, Co)
+    tg = max(1, min(tb - ta, scratch_bytes // (npl * twe * (Ci + Co) * 2)))
+    D = [scratch + p * tg * twe * Ci * 2 for p in range(npl)]
+    Mx = [scratch + npl * tg * twe * Ci * 2 + p * tg * twe * Co * 2 for p in range(npl)]
+    A0, B0 = 0, _CONV_SRAM_BANK
+    add, sub = e.eltwise_add_core, e.eltwise_sub_core
+    sz, Po = _up((twc + 1) * X.pb, 128), _up(twc * Co * 2, 128)
+    chunks = [(c0, min(twc, xb - c0)) for c0 in range(xa, xb, twc)]
+    col0 = lambda c0, par, b, gb: gs * (2 * c0 + par + 3 * b) + gb - g.pw
+    load = lambda iy, c0, par, b, gb, dst, ne: e.accelerator_memory_to_sram(
+        X.pix(iy, col0(c0, par, b, gb)), dst, ne, stride_bytes_per_chunk=X.pb, stride_jump_bytes=2 * gs * X.pb)
+    for ga in (range(gs) if dim == 2 else (0,)):
+        for gb in range(gs):
+            for g0 in range(ta, tb, tg):
+                g1 = min(g0 + tg, tb)
+                nt = (g1 - g0) * twe
+                for pi, (a, b) in enumerate((a, b) for a in range(nph) for b in range(npw)):
+                    for ty in range(g0, g1):
+                        for c0, n in chunks:
+                            off, ne, nel = (ty - g0) * twe + c0 - xa, (n + 1) * Ci, n * Ci
+                            if dim == 2:                                # rows: D0-D2, D1+D2, D1-D2, D1-D3
+                                DS = lambda r, p: (A0 if r < 2 else B0) + ((r % 2) * 2 + p) * sz
+                                TA = lambda k, p: A0 + (4 + k * 2 + p) * sz
+                                TB = lambda k, p: B0 + (4 + k * 2 + p) * sz
+                                for r in range(4):
+                                    for p in (0, 1):
+                                        load(gs * (2 * ty + r + 3 * a) + ga - g.ph, c0, p, b, gb, DS(r, p), ne)
+                                for T in (TA, TB):
+                                    for p in (0, 1):
+                                        sub(DS(0, p), DS(2, p), T(0, p), ne)
+                                        add(DS(1, p), DS(2, p), T(1, p), ne)
+                                        sub(DS(1, p), DS(2, p), T(2, p), ne)
+                                        sub(DS(1, p), DS(3, p), T(3, p), ne)
+                                rows, Vs = [(TA(k, 0), TA(k, 1), TB(k, 0), TB(k, 1), 4 * k) for k in range(4)], \
+                                    [A0 + q * sz for q in range(4)]
+                            else:
+                                for dst, p in ((A0, 0), (A0 + sz, 1), (B0, 0), (B0 + sz, 1)):
+                                    load(ty - g.ph, c0, p, b, gb, dst, ne)
+                                rows, Vs = [(A0, A0 + sz, B0, B0 + sz, 0)], [A0 + (2 + q) * sz for q in range(4)]
+                            for ae, ao, be, bo, p0 in rows:             # cols: d0-d2, d1+d2, d1-d2, d1-d3
+                                sub(ae, be + X.pb, Vs[0], nel)
+                                add(ao, be + X.pb, Vs[1], nel)
+                                sub(ao, be + X.pb, Vs[2], nel)
+                                sub(ao, bo + X.pb, Vs[3], nel)
+                                for q in range(4):
+                                    e.sram_to_accelerator_memory(Vs[q], D[p0 + q] + off * Ci * 2, nel)
+                    for xi in range(npl):                               # pieces after the first accumulate
+                        e.generate_instruction_add_set(gM, nt)
+                        kw_ = (dict(C_DRAM_ADDR=Mx[xi], bias_mode="full_matrix") if pi else
+                               dict(C_DRAM_ADDR=P["b"], bias_mode="broadcast_N") if xi == (5 if dim == 2 else 1)
+                               else {})
+                        e.matmat_mul_core(M=nt, K=Ci, N=Co, A_DRAM_ADDR=D[xi], B_DRAM_ADDR=P["us"][pi][xi],
+                                          OUTPUT_DRAM_ADDR=Mx[xi], gpr_M_reg=gM, **kw_)
+                for ty in range(g0, g1):                                # outputs: y0 = M0+M1+M2, y1 = M1-M2-M3
+                    for c0, n in chunks:
+                        off, nel = (ty - g0) * twe + c0 - xa, n * Co
+                        if dim == 2:
+                            idx = {0: 0, 2: 1, 3: 2}
+                            Ms = lambda r, c: A0 + c * Po if r == 1 else B0 + (idx[r] * 4 + c) * Po
+                            Ss = lambda i, c: A0 + (4 + i) * Po if c == 1 else B0 + (12 + i * 3 + idx[c]) * Po
+                            T0, T1, Ys = A0 + 6 * Po, A0 + 7 * Po, (lambda k: A0 + (8 + k) * Po)
+                            for r in range(4):
+                                for c in range(4):
+                                    e.accelerator_memory_to_sram(Mx[r * 4 + c] + off * Co * 2, Ms(r, c), nel)
+                            for c in range(4):
+                                add(Ms(1, c), Ms(2, c), T0, nel)
+                                add(T0, Ms(0, c), Ss(0, c), nel)
+                                sub(Ms(1, c), Ms(2, c), T1, nel)
+                                sub(T1, Ms(3, c), Ss(1, c), nel)
+                            for i in range(2):
+                                add(Ss(i, 1), Ss(i, 2), T0, nel)
+                                add(T0, Ss(i, 0), Ys(2 * i), nel)
+                                sub(Ss(i, 1), Ss(i, 2), T1, nel)
+                                sub(T1, Ss(i, 3), Ys(2 * i + 1), nel)
+                        else:
+                            M1, M0, M2, M3, T0, T1 = A0, B0, B0 + Po, B0 + 2 * Po, A0 + Po, A0 + 2 * Po
+                            Ys = lambda k: A0 + (3 + k) * Po
+                            for p, dst in ((1, M1), (0, M0), (2, M2), (3, M3)):
+                                e.accelerator_memory_to_sram(Mx[p] + off * Co * 2, dst, nel)
+                            add(M1, M2, T0, nel)
+                            add(T0, M0, Ys(0), nel)
+                            sub(M1, M2, T1, nel)
+                            sub(T1, M3, Ys(1), nel)
+                        for k in range(nout):
+                            e.sram_to_accelerator_memory(Ys(k), Mx[k] + off * Co * 2, nel)
+                if act:
+                    for yp in Mx[:nout]:
+                        e.generate_instruction_add_set(gM, nt * Co // 64)
+                        e.activation_core(M=nt * Co // 64, N=64, A_DRAM_ADDR=yp, OUTPUT_DRAM_ADDR=yp,
+                                          IDENTITY_DRAM_ADDR=P["i64"], activation="clamp" if act == "relu" else act,
+                                          gpr_M_reg=gM)
+                for k in range(nout):                                   # scatter valid outputs only
+                    i, j = (k // 2, k % 2) if dim == 2 else (0, k)
+                    x0 = gs * (2 * xa + j) + gb
+                    cnt = min(twe, max(0, -(-(g.Wout - x0) // step)))
+                    for ty in range(g0, g1):
+                        oy = gs * (2 * ty + i) + ga if dim == 2 else ty
+                        if cnt and oy < g.Hout:
+                            _conv_scopy(e, Mx[k] + (ty - g0) * twe * Co * 2, Y.pix(oy, x0), cnt, Co * 2,
+                                        dst_jump=step * Y.pb)
+
 
 def conv2d_pack_activation_map(x: torch.Tensor, pad: int, pad_value: float = 0.0,
                                pad_h: Optional[int] = None) -> torch.Tensor:
