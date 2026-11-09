@@ -26,11 +26,16 @@ from yolov5_common import (
 
 def build_artifact(*, variant: str = "s", checkpoint: Path | None = None,
                    config_path: Path | None = None, output: Path | None = None,
-                   force: bool = False) -> Path:
+                   force: bool = False, winograd: bool = True) -> Path:
     profile, config, resource_dir = load_yolov5_config(variant, config_path)
+    if output is None and winograd:
+        native = resource_dir / config["paths"]["artifact"]
+        output = native.with_name(native.stem + "_winograd" + native.suffix)
     output = (output or resource_dir / config["paths"]["artifact"]).resolve()
     if output.is_file() and not force:
         payload = load_single_bin(output)
+        if ("winograd_layers" in payload["hardware"]) != winograd:
+            raise RuntimeError("existing artifact uses a different convolution strategy; pass --force")
         expected = config["source"]["weights_sha256"]
         if payload.get("checkpoint_sha256") != expected:
             raise RuntimeError(
@@ -52,7 +57,7 @@ def build_artifact(*, variant: str = "s", checkpoint: Path | None = None,
         image_size=int(config["model"]["input_size"]),
         input_resolutions=tuple(config["model"]["input_resolutions"]),
         checkpoint_sha256=config["source"]["weights_sha256"],
-        variant=profile.key)
+        variant=profile.key, winograd=winograd)
     print(f"Single bin written: {report['path']}")
     print(f"  size={report['size'] / 2**20:.2f} MiB sha256={report['sha256']}")
     print(f"  operations={report['operations']} convs={report['convolutions']}")
@@ -73,10 +78,15 @@ def main(argv=None, *, pinned_variant: str = "s",
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--force", action="store_true")
+    strategy = parser.add_mutually_exclusive_group()
+    strategy.add_argument("--winograd", "--optimize", dest="winograd", action="store_true",
+                          default=True, help="Use BF16 Winograd for eligible 3x3 layers (default)")
+    strategy.add_argument("--native", dest="winograd", action="store_false",
+                          help="Compile the native convolution baseline instead")
     args = parser.parse_args(argv)
     build_artifact(
         variant=args.variant, config_path=config_path, checkpoint=args.checkpoint,
-        output=args.output, force=args.force)
+        output=args.output, force=args.force, winograd=args.winograd)
 
 
 if __name__ == "__main__":
