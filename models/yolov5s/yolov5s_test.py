@@ -106,12 +106,19 @@ def main(argv=None) -> int:
     ap.add_argument("--resolution", default="640x480", metavar="WIDTHxHEIGHT")
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--force", action="store_true", help="rebuild the bin even if present")
+    strategy = ap.add_mutually_exclusive_group()
+    strategy.add_argument("--winograd", "--optimize", dest="winograd", action="store_true",
+                          default=True, help="Use the optimized artifact (default)")
+    strategy.add_argument("--native", dest="winograd", action="store_false",
+                          help="Use the native convolution baseline")
     ap.add_argument("--cpu", action="store_true",
                     help="run the quantized CPU backend instead of the FPGA (host smoke test)")
     args = ap.parse_args(argv)
 
     py = sys.executable
     bin_path = _bin_path()
+    if args.winograd:
+        bin_path = bin_path.with_name(bin_path.stem + '_winograd.bin')
     timings = {}
     cfg = _config()
     _discard_corrupt(bin_path, zip_archive=True, tag="yolov5s_test")
@@ -120,7 +127,8 @@ def main(argv=None) -> int:
 
     if args.force or not bin_path.is_file():
         t0 = time.perf_counter()
-        rc, _ = _stream([py, "-u", str(COMPILE)] + (["--force"] if args.force else []))
+        rc, _ = _stream([py, "-u", str(COMPILE)] + (["--force"] if args.force else [])
+                        + (["--winograd"] if args.winograd else ["--native"]))
         timings["compile_s"] = round(time.perf_counter() - t0, 3)
         if rc != 0 or not bin_path.is_file():
             print(f"[yolov5s_test] compile failed (rc={rc}); bin missing: {bin_path}")

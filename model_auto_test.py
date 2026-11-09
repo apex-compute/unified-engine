@@ -401,6 +401,22 @@ def _check_yolov5n(text):
         return False, f"{n} detection(s) but no person label: {labels!r}"
     return True, f"{n} detection(s), labels: {labels!r}"
 
+def _check_yolo26n(text):
+    return _check_yolo26(text, 'yolo26n')
+
+
+def _check_yolo26s(text):
+    return _check_yolo26(text, 'yolo26s')
+
+
+def _check_yolo26(text, model):
+    if (_test_result_field(text, "model") != model
+            or _test_result_field(text, "head") != "one2one"
+            or _test_result_field(text, "nms") is not False):
+        return False, f"missing {model} NMS-free head metadata"
+    return _check_yolov5n(text)  # Same people.jpg detection smoke check.
+
+
 def _check_unet(text):
     # unet_test.py runs the bin with --compare, so TEST_RESULT carries mask_agreement
     # (fraction of pixels whose argmax class matches the quantized CPU reference) and
@@ -758,6 +774,8 @@ TESTS = [
     # bin on pass 1 and reuses it on pass 2.
     {"name": "yolov5s", "script": "models/yolov5s/yolov5s_test.py", "pass_check": _check_yolov5s, "image": "test_samples/vette.jpg", "requires_conv_image": True},
     {"name": "yolov5n", "script": "models/yolov5n/yolov5n_test.py", "pass_check": _check_yolov5n, "image": "test_samples/people.jpg", "requires_conv_image": True},
+    {"name": "yolo26n", "script": "models/yolo26n/yolo26n_test.py", "pass_check": _check_yolo26n, "image": "test_samples/people.jpg", "requires_conv_image": True},
+    {"name": "yolo26s", "script": "models/yolo26s/yolo26s_test.py", "pass_check": _check_yolo26s, "image": "test_samples/people.jpg", "requires_conv_image": True},
     {"name": "unet",    "script": "models/unet/unet_test.py",       "pass_check": _check_unet,    "image": "test_samples/vette.jpg",  "requires_conv_image": True},
     {"name": "dpdfnet", "script": "models/dpdfnet/dpdfnet_test.py", "pass_check": _check_dpdfnet, "audio": "test_samples/apex.wav",   "requires_conv_image": True},
     {"name": "dpdfnet8khz", "script": "models/dpdfnet8khz/dpdfnet8khz_test.py", "pass_check": _check_dpdfnet8khz, "audio": "test_samples/apex.wav", "requires_conv_image": True},

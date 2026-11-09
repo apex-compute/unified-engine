@@ -412,6 +412,7 @@ engine today; each folder has its own README/config, and most LLMs ship a
 | GPT-2 | [`models/gpt2`](models/gpt2) | Text LM |
 | LocateAnything 3B | [`models/locateanything_3b`](models/locateanything_3b) | Open-vocabulary localization |
 | MobileNetV2 (224 + SSD-FPNLite 640) | [`models/mobilenetv2`](models/mobilenetv2) | Classification / detection |
+| YOLO26n / YOLO26s | [`models/yolo26n`](models/yolo26n/README.md), [`models/yolo26s`](models/yolo26s/README.md) | NMS-free object detection |
 | Parakeet | [`models/parakeet`](models/parakeet) | Speech recognition (incl. streaming) |
 | MobileSAM | [`models/mobilesam`](models/mobilesam) | Segmentation |
 | Swin | [`models/swin`](models/swin) | Image classification |

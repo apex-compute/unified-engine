@@ -535,6 +535,11 @@ def quantize_conv_for_andromeda(
 
 def dequantize_conv_if4(prepared: QuantizedConv) -> torch.Tensor:
     """Dequantize a stored native-layout convolution without float weights."""
+    return _dequantize_channel_conv(prepared)
+
+
+def _dequantize_channel_conv(prepared: QuantizedConv) -> torch.Tensor:
+    """Decode channel-layout IF4/IF8 blocks with the same tap/channel order."""
     codes = prepared.codes.detach().cpu().to(torch.uint8)
     oc, channels, kh, kw = codes.shape
     ct = (channels + user_dma_core.UE_VECTOR_SIZE - 1) // user_dma_core.UE_VECTOR_SIZE
@@ -544,10 +549,15 @@ def dequantize_conv_if4(prepared: QuantizedConv) -> torch.Tensor:
     blocks = (padded.view(oc, ct, user_dma_core.UE_VECTOR_SIZE, kh, kw)
               .permute(0, 3, 4, 1, 2).contiguous()
               .view(-1, user_dma_core.UE_VECTOR_SIZE))
-    packed = (blocks[:, 0::2] | (blocks[:, 1::2] << 4)).contiguous()
+    if prepared.data_type == user_dma_core.TYPE.IF8:
+        packed = blocks
+        dequantize = quant_lib.dequantize_if8
+    else:
+        packed = (blocks[:, 0::2] | (blocks[:, 1::2] << 4)).contiguous()
+        dequantize = quant_lib.dequantize_if4
     data_bytes = packed.numpy().tobytes()
     scale_bytes = user_dma_core.tensor_le_bytes(prepared.block_scales)
-    dequantized = quant_lib.dequantize_if4(
+    dequantized = dequantize(
         data_bytes, scale_bytes, blocks.shape[0],
         user_dma_core.UE_VECTOR_SIZE,
         block_size=user_dma_core.UE_VECTOR_SIZE)
@@ -559,9 +569,9 @@ def dequantize_conv_if4(prepared: QuantizedConv) -> torch.Tensor:
 
 
 def dequantize_conv(prepared: QuantizedConv) -> torch.Tensor:
-    """Dequantize either native channels-IF4 or gather-IF8 layout."""
-    if not prepared.gather and prepared.data_type == user_dma_core.TYPE.IF4:
-        return dequantize_conv_if4(prepared)
+    """Dequantize native channel IF4/IF8 or gather IF8 weights."""
+    if not prepared.gather and prepared.data_type in (user_dma_core.TYPE.IF4, user_dma_core.TYPE.IF8):
+        return _dequantize_channel_conv(prepared)
     if not prepared.gather or prepared.data_type != user_dma_core.TYPE.IF8:
         raise ValueError(
             f"unsupported convolution layout/data type: gather={prepared.gather}, "

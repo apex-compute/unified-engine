@@ -1,0 +1,1001 @@
+{
+  "model": "yolo26n",
+  "timestamp_utc": "2026-11-09T02:30:43.079077+00:00",
+  "hardware_version": "0xf1e5582c",
+  "clock_ns": 3.000750187546887,
+  "axi_width_bits": 512,
+  "available_cores": 1,
+  "used_cores": 1,
+  "runtime_driver_sha256": "2e4088eb3bc609c39787d931ead57f9b0040cb935efcf48b919d601a06c5238d",
+  "torch_version": "2.12.0.dev20260405+cu128",
+  "source_commit": "6bc84f1eda65fc8b0aa2a2c71b2eb60908b00711",
+  "checkpoint_sha256": "9b09cc8bf347f0fc8a5f7657480587f25db09b34bf33b0652110fb03a8ad4fef",
+  "precision": "IF8 weights, BF16 activations, FP16 attention scratch",
+  "native_bundle_sha256": "5ba75812944678340d7994fbfe2b24de4c4a2132f7db5577bf53deeedb424483",
+  "winograd_bundle_sha256": "947fe3415cf791b4281b6553bfb50041e3bb941300a5680bd7c785a35baff97b",
+  "warmup": 2,
+  "repeats": 7,
+  "confidence_threshold": 0.25,
+  "results": [
+    {
+      "resolution": "256x256",
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            73.48880420105027,
+            73.49269317329332,
+            73.49259714928733,
+            73.48818004501125,
+            73.49254913728433,
+            73.49211702925732,
+            73.49355738934734
+          ],
+          "host_execution_ms": [
+            79.9041609861888,
+            79.77497001411393,
+            79.72428400535136,
+            79.32738200179301,
+            79.67505601118319,
+            79.83108999906108,
+            79.6791780157946
+          ],
+          "median_accelerator_ms": 73.49254913728433,
+          "median_host_execution_ms": 79.72428400535136,
+          "model_image_bytes": 5812544,
+          "program_bytes": 168128,
+          "scratch_bytes": 131072,
+          "winograd_layers": [],
+          "model_upload_writes": 1,
+          "input_upload_writes": 10,
+          "program_kicks": 10,
+          "output_reads": 10,
+          "intermediate_upload_writes": 0,
+          "intermediate_output_reads": 0
+        },
+        "winograd": {
+          "accelerator_ms": [
+            72.75791747936985,
+            72.7606061515379,
+            72.76612753188297,
+            72.75738934733684,
+            72.75916579144786,
+            72.7618544636159,
+            72.76487921980495
+          ],
+          "host_execution_ms": [
+            78.91012998879887,
+            79.19497301918454,
+            79.2891760065686,
+            78.72765298816375,
+            78.91866500722244,
+            78.69376198505051,
+            78.72707600472495
+          ],
+          "median_accelerator_ms": 72.7606061515379,
+          "median_host_execution_ms": 78.91012998879887,
+          "model_image_bytes": 7874880,
+          "program_bytes": 352960,
+          "scratch_bytes": 33637376,
+          "winograd_layers": [
+            "model.23.one2one_cv3.1.0.0",
+            "model.23.one2one_cv3.2.0.0"
+          ],
+          "model_upload_writes": 1,
+          "input_upload_writes": 10,
+          "program_kicks": 10,
+          "output_reads": 10,
+          "intermediate_upload_writes": 0,
+          "intermediate_output_reads": 0
+        }
+      },
+      "quality": [
+        {
+          "image": "people.jpg",
+          "float_to_cpu": {
+            "snr_db": 32.23746402464693,
+            "max_abs_error": 8.938285827636719,
+            "relative_l2": 0.02444144052931977,
+            "reference_count": 9,
+            "actual_count": 8,
+            "matched_iou50": 8,
+            "min_matched_iou": 0.9815652370452881,
+            "max_confidence_delta": 0.045093148946762085
+          },
+          "cpu_to_native": {
+            "snr_db": 39.80256606497595,
+            "max_abs_error": 4.65625,
+            "relative_l2": 0.010229907263551063,
+            "reference_count": 8,
+            "actual_count": 8,
+            "matched_iou50": 8,
+            "min_matched_iou": 0.9917028546333313,
+            "max_confidence_delta": 0.0072470903396606445
+          },
+          "float_to_native": {
+            "snr_db": 31.673210962478237,
+            "max_abs_error": 11.938285827636719,
+            "relative_l2": 0.026081913597637355,
+            "reference_count": 9,
+            "actual_count": 8,
+            "matched_iou50": 8,
+            "min_matched_iou": 0.9815652370452881,
+            "max_confidence_delta": 0.05234023928642273
+          },
+          "native_to_winograd": {
+            "snr_db": 47.73657163288724,
+            "max_abs_error": 2.0,
+            "relative_l2": 0.004103660446983217,
+            "reference_count": 8,
+            "actual_count": 8,
+            "matched_iou50": 8,
+            "min_matched_iou": 1.0,
+            "max_confidence_delta": 0.0038661956787109375
+          }
+        },
+        {
+          "image": "vette.jpg",
+          "float_to_cpu": {
+            "snr_db": 36.37877800702722,
+            "max_abs_error": 4.764198303222656,
+            "relative_l2": 0.015172638119510825,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.98356693983078,
+            "max_confidence_delta": 0.01667320728302002
+          },
+          "cpu_to_native": {
+            "snr_db": 43.11846886124872,
+            "max_abs_error": 2.5,
+            "relative_l2": 0.006983554985407685,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 1.0,
+            "max_confidence_delta": 0.0
+          },
+          "float_to_native": {
+            "snr_db": 37.546861013647835,
+            "max_abs_error": 3.6391983032226562,
+            "relative_l2": 0.013263463583542603,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.98356693983078,
+            "max_confidence_delta": 0.01667320728302002
+          },
+          "native_to_winograd": {
+            "snr_db": 49.07244708038536,
+            "max_abs_error": 1.125,
+            "relative_l2": 0.0035186627708272836,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 1.0,
+            "max_confidence_delta": 0.0
+          }
+        }
+      ],
+      "speedup": 1.0100596053889659,
+      "latency_reduction_percent": 0.9959417578224938
+    },
+    {
+      "resolution": "320x320",
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            114.77759039759941,
+            114.77927081770444,
+            114.78099924981245,
+            114.78243960990248,
+            114.77600600150038,
+            114.7835438859715,
+            114.78128732183046
+          ],
+          "host_execution_ms": [
+            124.38960198778659,
+            124.29535799310543,
+            123.9802349882666,
+            123.50027498905547,
+            124.14553499547765,
+            124.06603901763447,
+            123.51016400498338
+          ],
+          "median_accelerator_ms": 114.78099924981245,
+          "median_host_execution_ms": 124.06603901763447,
+          "model_image_bytes": 5920128,
+          "program_bytes": 206080,
+          "scratch_bytes": 204800,
+          "winograd_layers": [],
+          "model_upload_writes": 1,
+          "input_upload_writes": 10,
+          "program_kicks": 10,
+          "output_reads": 10,
+          "intermediate_upload_writes": 0,
+          "intermediate_output_reads": 0
+        },
+        "winograd": {
+          "accelerator_ms": [
+            113.18618454613654,
+            113.18719279819956,
+            113.18863315828958,
+            113.18171942985748,
+            113.19473068267068,
+            113.19199399849963,
+            113.18647261815454
+          ],
+          "host_execution_ms": [
+            121.9321399985347,
+            122.02993998653255,
+            122.18710899469443,
+            121.82011301047169,
+            121.87196800368838,
+            122.1489520103205,
+            122.59417099994607
+          ],
+          "median_accelerator_ms": 113.18719279819956,
+          "median_host_execution_ms": 122.02993998653255,
+          "model_image_bytes": 8903488,
+          "program_bytes": 551104,
+          "scratch_bytes": 33678336,
+          "winograd_layers": [
+            "model.10.m.0.attn.pe",
+            "model.22.m.0.1.attn.pe",
+            "model.23.one2one_cv3.1.0.0",
+            "model.23.one2one_cv3.2.0.0"
+          ],
+          "model_upload_writes": 1,
+          "input_upload_writes": 10,
+          "program_kicks": 10,
+          "output_reads": 10,
+          "intermediate_upload_writes": 0,
+          "intermediate_output_reads": 0
+        }
+      },
+      "quality": [
+        {
+          "image": "people.jpg",
+          "float_to_cpu": {
+            "snr_db": 31.81145051896584,
+            "max_abs_error": 12.591450691223145,
+            "relative_l2": 0.025670094889963548,
+            "reference_count": 10,
+            "actual_count": 10,
+            "matched_iou50": 10,
+            "min_matched_iou": 0.9473981261253357,
+            "max_confidence_delta": 0.038183391094207764
+          },
+          "cpu_to_native": {
+            "snr_db": 40.11776562207828,
+            "max_abs_error": 4.625,
+            "relative_l2": 0.00986533231035376,
+            "reference_count": 10,
+            "actual_count": 10,
+            "matched_iou50": 10,
+            "min_matched_iou": 0.9903011322021484,
+            "max_confidence_delta": 0.015223503112792969
+          },
+          "float_to_native": {
+            "snr_db": 31.47621254352645,
+            "max_abs_error": 11.528950691223145,
+            "relative_l2": 0.026680217939215604,
+            "reference_count": 10,
+            "actual_count": 10,
+            "matched_iou50": 10,
+            "min_matched_iou": 0.9492931962013245,
+            "max_confidence_delta": 0.039068907499313354
+          },
+          "native_to_winograd": {
+            "snr_db": 43.88164264538402,
+            "max_abs_error": 3.0,
+            "relative_l2": 0.006396138624842239,
+            "reference_count": 10,
+            "actual_count": 10,
+            "matched_iou50": 10,
+            "min_matched_iou": 0.9940652847290039,
+            "max_confidence_delta": 0.017670542001724243
+          }
+        },
+        {
+          "image": "vette.jpg",
+          "float_to_cpu": {
+            "snr_db": 35.52253860844695,
+            "max_abs_error": 5.908857345581055,
+            "relative_l2": 0.01674453415187603,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9868217706680298,
+            "max_confidence_delta": 0.05957448482513428
+          },
+          "cpu_to_native": {
+            "snr_db": 44.039188251175304,
+            "max_abs_error": 2.875,
+            "relative_l2": 0.006281170574014574,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9966216087341309,
+            "max_confidence_delta": 0.0026343464851379395
+          },
+          "float_to_native": {
+            "snr_db": 36.752976838337304,
+            "max_abs_error": 5.5091705322265625,
+            "relative_l2": 0.014532862282784442,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.988617479801178,
+            "max_confidence_delta": 0.05694013833999634
+          },
+          "native_to_winograd": {
+            "snr_db": 46.07526344252118,
+            "max_abs_error": 1.625,
+            "relative_l2": 0.004968631952028678,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 1.0,
+            "max_confidence_delta": 0.0013083815574645996
+          }
+        }
+      ],
+      "speedup": 1.0140811554046973,
+      "latency_reduction_percent": 1.3885629695069013
+    },
+    {
+      "resolution": "416x416",
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            194.05534583645914,
+            194.06955738934735,
+            194.06283570892725,
+            194.05472168042013,
+            194.06533233308326,
+            194.0513608402101,
+            194.0594748687172
+          ],
+          "host_execution_ms": [
+            207.87409599870443,
+            207.7477629936766,
+            207.94772199587896,
+            207.82356298877858,
+            208.21690998855047,
+            207.7121780021116,
+            208.14562399755232
+          ],
+          "median_accelerator_ms": 194.0594748687172,
+          "median_host_execution_ms": 207.87409599870443,
+          "model_image_bytes": 6169024,
+          "program_bytes": 297792,
+          "scratch_bytes": 346112,
+          "winograd_layers": [],
+          "model_upload_writes": 1,
+          "input_upload_writes": 10,
+          "program_kicks": 10,
+          "output_reads": 10,
+          "intermediate_upload_writes": 0,
+          "intermediate_output_reads": 0
+        },
+        "winograd": {
+          "accelerator_ms": [
+            191.92778994748687,
+            191.92529332333086,
+            191.92399699924982,
+            191.91977194298576,
+            191.92634958739686,
+            191.92538934733685,
+            191.9276459114779
+          ],
+          "host_execution_ms": [
+            205.60515898978338,
+            205.9381479921285,
+            205.8397060027346,
+            205.41608100757003,
+            205.78579700668342,
+            207.30325899785385,
+            206.81283000158146
+          ],
+          "median_accelerator_ms": 191.92538934733685,
+          "median_host_execution_ms": 205.8397060027346,
+          "model_image_bytes": 8258176,
+          "program_bytes": 509440,
+          "scratch_bytes": 33755136,
+          "winograd_layers": [
+            "model.23.one2one_cv3.1.0.0",
+            "model.23.one2one_cv3.2.0.0"
+          ],
+          "model_upload_writes": 1,
+          "input_upload_writes": 10,
+          "program_kicks": 10,
+          "output_reads": 10,
+          "intermediate_upload_writes": 0,
+          "intermediate_output_reads": 0
+        }
+      },
+      "quality": [
+        {
+          "image": "people.jpg",
+          "float_to_cpu": {
+            "snr_db": 31.84818594865407,
+            "max_abs_error": 16.681472778320312,
+            "relative_l2": 0.02556175703585156,
+            "reference_count": 14,
+            "actual_count": 13,
+            "matched_iou50": 12,
+            "min_matched_iou": 0.9688099026679993,
+            "max_confidence_delta": 0.13277888298034668
+          },
+          "cpu_to_native": {
+            "snr_db": 38.27239663713159,
+            "max_abs_error": 4.0078125,
+            "relative_l2": 0.012200571324153852,
+            "reference_count": 13,
+            "actual_count": 15,
+            "matched_iou50": 13,
+            "min_matched_iou": 0.9893560409545898,
+            "max_confidence_delta": 0.062038153409957886
+          },
+          "float_to_native": {
+            "snr_db": 31.545839566035042,
+            "max_abs_error": 14.556472778320312,
+            "relative_l2": 0.02646720137444133,
+            "reference_count": 14,
+            "actual_count": 15,
+            "matched_iou50": 14,
+            "min_matched_iou": 0.9787631034851074,
+            "max_confidence_delta": 0.12310826778411865
+          },
+          "native_to_winograd": {
+            "snr_db": 47.60622054403389,
+            "max_abs_error": 2.0,
+            "relative_l2": 0.004165709424216189,
+            "reference_count": 15,
+            "actual_count": 14,
+            "matched_iou50": 14,
+            "min_matched_iou": 1.0,
+            "max_confidence_delta": 0.01850414276123047
+          }
+        },
+        {
+          "image": "vette.jpg",
+          "float_to_cpu": {
+            "snr_db": 34.347887422108,
+            "max_abs_error": 5.661838531494141,
+            "relative_l2": 0.019169272401609396,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9896036386489868,
+            "max_confidence_delta": 0.005839526653289795
+          },
+          "cpu_to_native": {
+            "snr_db": 44.31340828044418,
+            "max_abs_error": 1.875,
+            "relative_l2": 0.006085966899503763,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9964664578437805,
+            "max_confidence_delta": 0.001147150993347168
+          },
+          "float_to_native": {
+            "snr_db": 35.006032523634374,
+            "max_abs_error": 5.786838531494141,
+            "relative_l2": 0.017770447882968842,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9861246943473816,
+            "max_confidence_delta": 0.006986677646636963
+          },
+          "native_to_winograd": {
+            "snr_db": 48.22337586786073,
+            "max_abs_error": 1.25,
+            "relative_l2": 0.0038799953633550815,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 1.0,
+            "max_confidence_delta": 0.0
+          }
+        }
+      ],
+      "speedup": 1.0111193497047866,
+      "latency_reduction_percent": 1.0997069443911767
+    },
+    {
+      "resolution": "512x512",
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            293.19374643660916,
+            293.1941305326332,
+            293.1864486121531,
+            293.1888012003001,
+            293.1895213803451,
+            293.18385596399105,
+            293.1899534883721
+          ],
+          "host_execution_ms": [
+            316.26816699281335,
+            316.7815080087166,
+            316.607565007871,
+            315.8635059953667,
+            318.4127930144314,
+            315.774838993093,
+            318.80964699666947
+          ],
+          "median_accelerator_ms": 293.1895213803451,
+          "median_host_execution_ms": 316.607565007871,
+          "model_image_bytes": 6513728,
+          "program_bytes": 377792,
+          "scratch_bytes": 524288,
+          "winograd_layers": [],
+          "model_upload_writes": 1,
+          "input_upload_writes": 10,
+          "program_kicks": 10,
+          "output_reads": 10,
+          "intermediate_upload_writes": 0,
+          "intermediate_output_reads": 0
+        },
+        "winograd": {
+          "accelerator_ms": [
+            288.1717389347337,
+            288.1834538634659,
+            288.1854223555889,
+            288.16986646661667,
+            288.17557989497374,
+            288.1818694673669,
+            288.1805251312829
+          ],
+          "host_execution_ms": [
+            312.15682899346575,
+            311.7584169958718,
+            311.8765520048328,
+            312.19006699393503,
+            311.86534999869764,
+            310.79329099156894,
+            311.2275059975218
+          ],
+          "median_accelerator_ms": 288.1805251312829,
+          "median_host_execution_ms": 311.86534999869764,
+          "model_image_bytes": 9547648,
+          "program_bytes": 773376,
+          "scratch_bytes": 33850368,
+          "winograd_layers": [
+            "model.10.m.0.attn.pe",
+            "model.22.m.0.1.attn.pe",
+            "model.23.one2one_cv3.1.0.0",
+            "model.23.one2one_cv3.2.0.0"
+          ],
+          "model_upload_writes": 1,
+          "input_upload_writes": 10,
+          "program_kicks": 10,
+          "output_reads": 10,
+          "intermediate_upload_writes": 0,
+          "intermediate_output_reads": 0
+        }
+      },
+      "quality": [
+        {
+          "image": "people.jpg",
+          "float_to_cpu": {
+            "snr_db": 31.810971354533883,
+            "max_abs_error": 20.928571701049805,
+            "relative_l2": 0.025671511041472535,
+            "reference_count": 15,
+            "actual_count": 15,
+            "matched_iou50": 15,
+            "min_matched_iou": 0.9796159267425537,
+            "max_confidence_delta": 0.029240906238555908
+          },
+          "cpu_to_native": {
+            "snr_db": 37.65405177584174,
+            "max_abs_error": 5.25,
+            "relative_l2": 0.013100787769667405,
+            "reference_count": 15,
+            "actual_count": 15,
+            "matched_iou50": 15,
+            "min_matched_iou": 0.9927694201469421,
+            "max_confidence_delta": 0.020364344120025635
+          },
+          "float_to_native": {
+            "snr_db": 31.459081248847536,
+            "max_abs_error": 22.428571701049805,
+            "relative_l2": 0.02673289161231923,
+            "reference_count": 15,
+            "actual_count": 15,
+            "matched_iou50": 15,
+            "min_matched_iou": 0.9809374213218689,
+            "max_confidence_delta": 0.03256732225418091
+          },
+          "native_to_winograd": {
+            "snr_db": 45.21079153275533,
+            "max_abs_error": 3.75,
+            "relative_l2": 0.005488585366310484,
+            "reference_count": 15,
+            "actual_count": 15,
+            "matched_iou50": 15,
+            "min_matched_iou": 0.993607759475708,
+            "max_confidence_delta": 0.013036191463470459
+          }
+        },
+        {
+          "image": "vette.jpg",
+          "float_to_cpu": {
+            "snr_db": 34.0058709197274,
+            "max_abs_error": 7.483407974243164,
+            "relative_l2": 0.019939141436904336,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9834396243095398,
+            "max_confidence_delta": 0.009872913360595703
+          },
+          "cpu_to_native": {
+            "snr_db": 44.29825302294573,
+            "max_abs_error": 2.875,
+            "relative_l2": 0.006096595046079954,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9957805871963501,
+            "max_confidence_delta": 0.0
+          },
+          "float_to_native": {
+            "snr_db": 34.42393497501999,
+            "max_abs_error": 7.5085296630859375,
+            "relative_l2": 0.019002172280774304,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.987565279006958,
+            "max_confidence_delta": 0.009872913360595703
+          },
+          "native_to_winograd": {
+            "snr_db": 46.62312485008083,
+            "max_abs_error": 1.75,
+            "relative_l2": 0.004664915243565264,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9957716464996338,
+            "max_confidence_delta": 0.0012565255165100098
+          }
+        }
+      ],
+      "speedup": 1.0173814529860419,
+      "latency_reduction_percent": 1.7084499560147126
+    },
+    {
+      "resolution": "640x480",
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            344.51785746436616,
+            344.5161290322581,
+            344.50830307576894,
+            344.52021005251316,
+            344.50777494373597,
+            344.508063015754,
+            344.5168012003001
+          ],
+          "host_execution_ms": [
+            371.21648201718926,
+            370.1441729790531,
+            370.91654201503843,
+            372.36353699699976,
+            370.93788202037103,
+            373.7028960022144,
+            371.486880001612
+          ],
+          "median_accelerator_ms": 344.5161290322581,
+          "median_host_execution_ms": 371.21648201718926,
+          "model_image_bytes": 6841728,
+          "program_bytes": 462080,
+          "scratch_bytes": 614400,
+          "winograd_layers": [],
+          "model_upload_writes": 1,
+          "input_upload_writes": 10,
+          "program_kicks": 10,
+          "output_reads": 10,
+          "intermediate_upload_writes": 0,
+          "intermediate_output_reads": 0
+        },
+        "winograd": {
+          "accelerator_ms": [
+            338.93295723930987,
+            338.9254193548387,
+            338.9327171792948,
+            338.9294043510878,
+            338.92825206301575,
+            338.944816204051,
+            338.941839459865
+          ],
+          "host_execution_ms": [
+            365.722946007736,
+            364.1964919806924,
+            364.6369999914896,
+            365.15132000204176,
+            365.2313069906086,
+            365.37349500576966,
+            364.74422898027115
+          ],
+          "median_accelerator_ms": 338.9327171792948,
+          "median_host_execution_ms": 365.15132000204176,
+          "model_image_bytes": 9868160,
+          "program_bytes": 850176,
+          "scratch_bytes": 33898496,
+          "winograd_layers": [
+            "model.10.m.0.attn.pe",
+            "model.22.m.0.1.attn.pe",
+            "model.23.one2one_cv3.1.0.0",
+            "model.23.one2one_cv3.2.0.0"
+          ],
+          "model_upload_writes": 1,
+          "input_upload_writes": 10,
+          "program_kicks": 10,
+          "output_reads": 10,
+          "intermediate_upload_writes": 0,
+          "intermediate_output_reads": 0
+        }
+      },
+      "quality": [
+        {
+          "image": "people.jpg",
+          "float_to_cpu": {
+            "snr_db": 26.133755525501577,
+            "max_abs_error": 62.41387176513672,
+            "relative_l2": 0.04935284847804419,
+            "reference_count": 14,
+            "actual_count": 15,
+            "matched_iou50": 14,
+            "min_matched_iou": 0.9807530641555786,
+            "max_confidence_delta": 0.050297677516937256
+          },
+          "cpu_to_native": {
+            "snr_db": 41.145113530201726,
+            "max_abs_error": 5.5,
+            "relative_l2": 0.008764846678697036,
+            "reference_count": 15,
+            "actual_count": 15,
+            "matched_iou50": 15,
+            "min_matched_iou": 0.9936012625694275,
+            "max_confidence_delta": 0.010418355464935303
+          },
+          "float_to_native": {
+            "snr_db": 25.967309579166546,
+            "max_abs_error": 62.35137176513672,
+            "relative_l2": 0.05030770679022036,
+            "reference_count": 14,
+            "actual_count": 15,
+            "matched_iou50": 14,
+            "min_matched_iou": 0.981389582157135,
+            "max_confidence_delta": 0.06071603298187256
+          },
+          "native_to_winograd": {
+            "snr_db": 44.07326265860944,
+            "max_abs_error": 3.5,
+            "relative_l2": 0.006256578055285202,
+            "reference_count": 15,
+            "actual_count": 15,
+            "matched_iou50": 15,
+            "min_matched_iou": 0.9967213273048401,
+            "max_confidence_delta": 0.007028162479400635
+          }
+        },
+        {
+          "image": "vette.jpg",
+          "float_to_cpu": {
+            "snr_db": 31.786192147202343,
+            "max_abs_error": 21.502723693847656,
+            "relative_l2": 0.025744851591429106,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9882180690765381,
+            "max_confidence_delta": 0.013916254043579102
+          },
+          "cpu_to_native": {
+            "snr_db": 35.24016736844401,
+            "max_abs_error": 11.75,
+            "relative_l2": 0.01729783027697526,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9924468398094177,
+            "max_confidence_delta": 0.0012243986129760742
+          },
+          "float_to_native": {
+            "snr_db": 31.26402862547831,
+            "max_abs_error": 20.252723693847656,
+            "relative_l2": 0.02734000368237179,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.985405683517456,
+            "max_confidence_delta": 0.015140652656555176
+          },
+          "native_to_winograd": {
+            "snr_db": 47.601358702940324,
+            "max_abs_error": 1.5,
+            "relative_l2": 0.004168041791696986,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 1.0,
+            "max_confidence_delta": 0.0012243986129760742
+          }
+        }
+      ],
+      "speedup": 1.016473511024342,
+      "latency_reduction_percent": 1.6206532532009654
+    },
+    {
+      "resolution": "640x640",
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            460.3052363090773,
+            460.32127231807954,
+            460.3239129782446,
+            460.3191117779445,
+            460.3029317329333,
+            460.32151237809455,
+            460.3197839459865
+          ],
+          "host_execution_ms": [
+            499.9770809954498,
+            493.2106759806629,
+            497.10598698584363,
+            493.8865260046441,
+            494.97384901042096,
+            497.29952702182345,
+            493.6949149996508
+          ],
+          "median_accelerator_ms": 460.3197839459865,
+          "median_host_execution_ms": 494.97384901042096,
+          "model_image_bytes": 7570624,
+          "program_bytes": 525376,
+          "scratch_bytes": 819200,
+          "winograd_layers": [],
+          "model_upload_writes": 1,
+          "input_upload_writes": 10,
+          "program_kicks": 10,
+          "output_reads": 10,
+          "intermediate_upload_writes": 0,
+          "intermediate_output_reads": 0
+        },
+        "winograd": {
+          "accelerator_ms": [
+            451.96723180795203,
+            451.98422805701426,
+            451.9824036009002,
+            451.9762100525132,
+            451.966751687922,
+            451.9728972243061,
+            451.9810592648162
+          ],
+          "host_execution_ms": [
+            484.93358597625047,
+            486.46618000930175,
+            485.8916760131251,
+            486.62542100646533,
+            486.06929898960516,
+            484.9450800102204,
+            485.74916398501955
+          ],
+          "median_accelerator_ms": 451.9762100525132,
+          "median_host_execution_ms": 485.8916760131251,
+          "model_image_bytes": 10635328,
+          "program_bytes": 951744,
+          "scratch_bytes": 34006016,
+          "winograd_layers": [
+            "model.10.m.0.attn.pe",
+            "model.22.m.0.1.attn.pe",
+            "model.23.one2one_cv3.1.0.0",
+            "model.23.one2one_cv3.2.0.0"
+          ],
+          "model_upload_writes": 1,
+          "input_upload_writes": 10,
+          "program_kicks": 10,
+          "output_reads": 10,
+          "intermediate_upload_writes": 0,
+          "intermediate_output_reads": 0
+        }
+      },
+      "quality": [
+        {
+          "image": "people.jpg",
+          "float_to_cpu": {
+            "snr_db": 29.077741793216543,
+            "max_abs_error": 39.29270553588867,
+            "relative_l2": 0.035165185308526546,
+            "reference_count": 16,
+            "actual_count": 16,
+            "matched_iou50": 16,
+            "min_matched_iou": 0.9641323089599609,
+            "max_confidence_delta": 0.04686605930328369
+          },
+          "cpu_to_native": {
+            "snr_db": 34.89953936431207,
+            "max_abs_error": 7.6875,
+            "relative_l2": 0.01798966316538254,
+            "reference_count": 16,
+            "actual_count": 16,
+            "matched_iou50": 16,
+            "min_matched_iou": 0.9915235638618469,
+            "max_confidence_delta": 0.05565369129180908
+          },
+          "float_to_native": {
+            "snr_db": 29.986668882279844,
+            "max_abs_error": 32.79270553588867,
+            "relative_l2": 0.03167134855591038,
+            "reference_count": 16,
+            "actual_count": 16,
+            "matched_iou50": 16,
+            "min_matched_iou": 0.961763858795166,
+            "max_confidence_delta": 0.08411157131195068
+          },
+          "native_to_winograd": {
+            "snr_db": 45.34803877484072,
+            "max_abs_error": 4.0,
+            "relative_l2": 0.0054025408733627675,
+            "reference_count": 16,
+            "actual_count": 16,
+            "matched_iou50": 16,
+            "min_matched_iou": 0.9935064911842346,
+            "max_confidence_delta": 0.03703013062477112
+          }
+        },
+        {
+          "image": "vette.jpg",
+          "float_to_cpu": {
+            "snr_db": 32.05950169804551,
+            "max_abs_error": 18.560760498046875,
+            "relative_l2": 0.02494737843783861,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9875526428222656,
+            "max_confidence_delta": 0.011008143424987793
+          },
+          "cpu_to_native": {
+            "snr_db": 42.815397106432364,
+            "max_abs_error": 4.75,
+            "relative_l2": 0.007231529208491798,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9966443181037903,
+            "max_confidence_delta": 0.0
+          },
+          "float_to_native": {
+            "snr_db": 32.51113507589943,
+            "max_abs_error": 13.810760498046875,
+            "relative_l2": 0.023683356164149752,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.984238862991333,
+            "max_confidence_delta": 0.011008143424987793
+          },
+          "native_to_winograd": {
+            "snr_db": 45.85567502978341,
+            "max_abs_error": 1.875,
+            "relative_l2": 0.0050958454563303,
+            "reference_count": 1,
+            "actual_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9966443181037903,
+            "max_confidence_delta": 0.002661764621734619
+          }
+        }
+      ],
+      "speedup": 1.01846020588673,
+      "latency_reduction_percent": 1.8125603514039579
+    }
+  ]
+}
