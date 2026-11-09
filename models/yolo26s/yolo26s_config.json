@@ -1,0 +1,23 @@
+{
+  "model": "yolo26s",
+  "bundle_sha256": {
+    "native": "6ba800c399f123bde459f3a227e53d08a9443d051056608b77d81d657626c35b",
+    "winograd": "b55453343e210e459a3ee57b55c157959feb71089c3c7a1d1d44e20876fbc395",
+    "optimized": "98a88955ff40a2478b8cc48c368b52bccefcb4efe237163ec066eeae5d9db9b1"
+  },
+  "task": "detect",
+  "head": "one2one",
+  "source_commit": "6bc84f1eda65fc8b0aa2a2c71b2eb60908b00711",
+  "checkpoint_url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26s.pt",
+  "checkpoint_sha256": "646f8bc3fe0a656803d95c294f7852321748cb29d13466a1af8862e2db384a1b",
+  "resolutions": [
+    "256x256",
+    "320x320",
+    "416x416",
+    "512x512",
+    "640x480",
+    "640x640"
+  ],
+  "default_resolution": "640x640",
+  "precision": "IF8 weights, BF16 activations, FP16 attention scratch"
+}

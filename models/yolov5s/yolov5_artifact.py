@@ -46,6 +46,9 @@ from yolov5_common import (
 
 # v7 stores one weight pattern per convolution chunk and enables on-chip reuse.
 ARTIFACT_VERSION = 7
+WINOGRAD_ARTIFACT_VERSION = 8
+NATIVE_PRECISION = "CHANNEL-IF4/GATHER-IF8-MIXED-BLOCK64"
+WINOGRAD_PRECISION = NATIVE_PRECISION + "/WINOGRAD-BF16"
 
 # Public resolution strings use the conventional WIDTHxHEIGHT spelling while
 # tensor shapes remain CHW. Every profile is compiled offline into the bin;
@@ -131,8 +134,11 @@ CANONICAL_DISPATCH_SHA256 = CANONICAL_MANIFEST_SHA256
 CANONICAL_PARAMS_BYTES = CANONICAL_MODEL_BYTES
 
 
-def get_canonical_artifact(variant: str = "s") -> CanonicalArtifact:
+def get_canonical_artifact(variant: str = "s", *, winograd: bool = False) -> CanonicalArtifact:
     profile = get_yolov5_variant(variant)
+    if winograd:
+        from yolov5_winograd_artifacts import CANONICAL_WINOGRAD_ARTIFACTS
+        return CanonicalArtifact(**CANONICAL_WINOGRAD_ARTIFACTS[profile.key])
     return CANONICAL_ARTIFACTS[profile.key]
 
 
@@ -517,10 +523,10 @@ def compile_single_bin(model: torch.nn.Module, output_path: Path, *,
                        image_size: int = 256,
                        input_resolutions: Sequence[str] | None = None,
                        checkpoint_sha256: str,
-                       variant: str = "s") -> dict:
+                       variant: str = "s", winograd: bool = False) -> dict:
     """Compile canonical weights and several fixed shapes into one bin."""
     profile = get_yolov5_variant(variant)
-    artifact_spec = get_canonical_artifact(profile.key)
+    artifact_spec = get_canonical_artifact(profile.key, winograd=winograd)
     resolutions = tuple(input_resolutions or SUPPORTED_INPUT_RESOLUTIONS)
     if image_size != 256 or resolutions != SUPPORTED_INPUT_RESOLUTIONS:
         raise ValueError(
@@ -536,7 +542,7 @@ def compile_single_bin(model: torch.nn.Module, output_path: Path, *,
     detect = model.model[-1]
     payload = {
         "format": artifact_spec.format,
-        "artifact_version": ARTIFACT_VERSION,
+        "artifact_version": WINOGRAD_ARTIFACT_VERSION if winograd else ARTIFACT_VERSION,
         "checkpoint_sha256": str(checkpoint_sha256),
         "model": {
             "name": profile.model_name,
@@ -552,7 +558,7 @@ def compile_single_bin(model: torch.nn.Module, output_path: Path, *,
         "runtime": {
             "engine_abi": PRECOMPILED_ABI,
             "geometry_abi": GEOMETRY_ABI,
-            "precision": "CHANNEL-IF4/GATHER-IF8-MIXED-BLOCK64",
+            "precision": WINOGRAD_PRECISION if winograd else NATIVE_PRECISION,
             "preprocessing": {
                 "letterbox": True,
                 "pad_value": 114,
@@ -569,7 +575,7 @@ def compile_single_bin(model: torch.nn.Module, output_path: Path, *,
         "profiles": {},
     }
     payload["graph_sha256"] = _graph_sha256(payload)
-    payload["hardware"] = compile_precompiled_hardware(payload)
+    payload["hardware"] = compile_precompiled_hardware(payload, winograd=winograd)
     for resolution in resolutions[1:]:
         height, width = parse_input_resolution(resolution)
         input_shape = [3, height, width]
@@ -582,7 +588,7 @@ def compile_single_bin(model: torch.nn.Module, output_path: Path, *,
             "weights": payload["weights"],
         }
         selected["graph_sha256"] = _graph_sha256(selected)
-        hardware = compile_precompiled_hardware(selected)
+        hardware = compile_precompiled_hardware(selected, winograd=winograd)
         payload["profiles"][resolution] = {
             "input_shape": input_shape,
             "graph_sha256": selected["graph_sha256"],
@@ -624,8 +630,9 @@ def validate_single_bin(payload: dict) -> None:
         raise RuntimeError("YOLO single-bin payload is not a dictionary")
     variant = artifact_variant(payload)
     profile = get_yolov5_variant(variant)
-    artifact_spec = get_canonical_artifact(variant)
-    if payload.get("artifact_version") != ARTIFACT_VERSION:
+    winograd = payload.get("artifact_version") == WINOGRAD_ARTIFACT_VERSION
+    artifact_spec = get_canonical_artifact(variant, winograd=winograd)
+    if payload.get("artifact_version") not in (ARTIFACT_VERSION, WINOGRAD_ARTIFACT_VERSION):
         raise RuntimeError(
             f"unsupported YOLO artifact version {payload.get('artifact_version')!r}; "
             "rebuild with the matching compiler and --force")
@@ -651,7 +658,7 @@ def validate_single_bin(payload: dict) -> None:
     expected_runtime = {
         "engine_abi": PRECOMPILED_ABI,
         "geometry_abi": GEOMETRY_ABI,
-        "precision": "CHANNEL-IF4/GATHER-IF8-MIXED-BLOCK64",
+        "precision": WINOGRAD_PRECISION if winograd else NATIVE_PRECISION,
         "preprocessing": {
             "letterbox": True, "pad_value": 114, "scale": "0_to_1"},
         "postprocessing": {
@@ -803,6 +810,8 @@ def validate_single_bin(payload: dict) -> None:
         raise RuntimeError("YOLO artifact detection head shapes are not canonical")
     validate_precompiled_hardware(payload)
     hardware = payload["hardware"]
+    if ("winograd_layers" in hardware) != winograd:
+        raise RuntimeError("YOLO convolution strategy differs from artifact version")
     if (artifact_spec.model_bytes
             and (hardware["model_image"].numel() != artifact_spec.model_bytes
                  or hardware["model_sha256"] != artifact_spec.model_sha256)):
@@ -855,6 +864,8 @@ def validate_single_bin(payload: dict) -> None:
         if [selected_shapes[name] for name in heads] != expected_heads:
             raise RuntimeError(f"YOLO profile {key} detection heads are invalid")
         validate_precompiled_hardware(selected)
+        if ("winograd_layers" in selected["hardware"]) != winograd:
+            raise RuntimeError("YOLO profile convolution strategy differs from artifact version")
 
     computed_bundle = _bundle_sha256(payload)
     if payload.get("bundle_sha256") != computed_bundle:

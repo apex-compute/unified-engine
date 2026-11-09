@@ -1,0 +1,1143 @@
+{
+  "board_version": "0xf1e5582c",
+  "timestamp_utc": "2026-11-08T22:59:13.063190+00:00",
+  "runtime_driver_sha256": "2e4088eb3bc609c39787d931ead57f9b0040cb935efcf48b919d601a06c5238d",
+  "winograd_source_commit": "7c7ff3289d9b2c4bf1dbca25233cad6af569ad57",
+  "clock_ns": 3.000750187546887,
+  "axi_width_bits": 512,
+  "available_cores": 1,
+  "used_cores": 1,
+  "torch_version": "2.12.0.dev20260405+cu128",
+  "warmup": 2,
+  "repeats": 7,
+  "results": [
+    {
+      "variant": "s",
+      "resolution": "256x256",
+      "winograd_layers": [
+        "model.6.m.0.cv2",
+        "model.6.m.1.cv2",
+        "model.6.m.2.cv2",
+        "model.8.m.0.cv2",
+        "model.13.m.0.cv2",
+        "model.20.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            84.08582145536384,
+            84.0891822955739,
+            84.09201500375094,
+            84.08985446361591,
+            84.08385296324082,
+            84.08567741935484,
+            84.09191897974495
+          ],
+          "execution_ms": [
+            90.48341098241508,
+            93.55739198508672,
+            90.94427098170854,
+            91.30288500455208,
+            90.74165698257275,
+            91.32909498293884,
+            90.56862202123739
+          ],
+          "median_accelerator_ms": 84.0891822955739,
+          "median_execution_ms": 90.94427098170854,
+          "model_image_bytes": 4202112,
+          "program_bytes": 113792,
+          "model_sha256": "0530aa967bb3e55ac2a06c7ff2e1acb70596fe5f24711879ac1706811aed369f",
+          "program_sha256": "3e43b8cb553808d10853b6e531e7167b6c2e9003f8dca321f0535792d28733cb"
+        },
+        "winograd": {
+          "accelerator_ms": [
+            82.05558589647413,
+            82.05621005251314,
+            82.06115528882222,
+            82.0603390847712,
+            82.05649812453113,
+            82.06533233308328,
+            82.05885071267818
+          ],
+          "execution_ms": [
+            88.6483550129924,
+            88.9833550027106,
+            88.7665000045672,
+            89.2787859775126,
+            88.97670099395327,
+            88.71333801653236,
+            88.36249701562338
+          ],
+          "median_accelerator_ms": 82.05885071267818,
+          "median_execution_ms": 88.7665000045672,
+          "model_image_bytes": 10726208,
+          "program_bytes": 783168,
+          "model_sha256": "4b4a52f2f1d2b6507435215e7dae0f83946266da502df66c40380222d239ee75",
+          "program_sha256": "43bbdfb4df11eae81641d96559fa2410f9c54227579a66b5a3b208c136a58e29"
+        }
+      },
+      "quality": [
+        {
+          "image": "models/test_samples/people.jpg",
+          "snr_db": 51.436732905801435,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.0026801762517037384,
+          "detections": {
+            "native_count": 10,
+            "winograd_count": 10,
+            "matched_iou50": 10,
+            "min_matched_iou": 0.9261060357093811,
+            "max_confidence_delta": 0.006603211164474487
+          }
+        },
+        {
+          "image": "models/test_samples/vette.jpg",
+          "snr_db": 51.92421338721715,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.0025338991780501415,
+          "detections": {
+            "native_count": 1,
+            "winograd_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9988357424736023,
+            "max_confidence_delta": 0.006739258766174316
+          }
+        }
+      ],
+      "speedup": 1.0247423838533245,
+      "latency_reduction_percent": 2.414497950234673
+    },
+    {
+      "variant": "s",
+      "resolution": "320x320",
+      "winograd_layers": [
+        "model.6.m.0.cv2",
+        "model.6.m.1.cv2",
+        "model.6.m.2.cv2",
+        "model.8.m.0.cv2",
+        "model.13.m.0.cv2",
+        "model.20.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            131.29179894973745,
+            131.27965191297824,
+            131.28997449362342,
+            131.28603750937737,
+            131.28723780945236,
+            131.2898304576144,
+            131.2893983495874
+          ],
+          "execution_ms": [
+            140.12086897855625,
+            140.30478900531307,
+            140.60209397575818,
+            140.69682999979705,
+            140.63980200444348,
+            140.69230100722052,
+            140.37796700722538
+          ],
+          "median_accelerator_ms": 131.2893983495874,
+          "median_execution_ms": 140.60209397575818,
+          "model_image_bytes": 4241472,
+          "program_bytes": 153152,
+          "model_sha256": "02ba0b9ccf81c9bb455cb61f66eaecd1be24e7ac508180c398db5e59194b145e",
+          "program_sha256": "cc205b13e785f5f42c0aa8dc688d4de7b1f3e9de0a9c0ea64db7b8006a33bfa3"
+        },
+        "winograd": {
+          "accelerator_ms": [
+            127.41996699174794,
+            127.41871867966994,
+            127.41727831957989,
+            127.41799849962491,
+            127.41924681170293,
+            127.41939084771194,
+            127.42275168792199
+          ],
+          "execution_ms": [
+            136.6483730089385,
+            136.30444699083455,
+            137.0880489994306,
+            136.49677799548954,
+            136.8509200110566,
+            137.73823698284104,
+            137.61663998593576
+          ],
+          "median_accelerator_ms": 127.41924681170293,
+          "median_execution_ms": 136.8509200110566,
+          "model_image_bytes": 10806464,
+          "program_bytes": 863424,
+          "model_sha256": "6867e20568ba4c55cef59659ce031ee21656cc517969f02ff21f1c855c35845c",
+          "program_sha256": "2345b318794be3e82517fb0c78a2ee66a7e8dc320ca7e7248b49d20024dfec92"
+        }
+      },
+      "quality": [
+        {
+          "image": "models/test_samples/people.jpg",
+          "snr_db": 50.75548600864909,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.0028988497066425164,
+          "detections": {
+            "native_count": 9,
+            "winograd_count": 9,
+            "matched_iou50": 9,
+            "min_matched_iou": 0.995128333568573,
+            "max_confidence_delta": 0.0075525641441345215
+          }
+        },
+        {
+          "image": "models/test_samples/vette.jpg",
+          "snr_db": 52.12975560395219,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.002474641089664212,
+          "detections": {
+            "native_count": 1,
+            "winograd_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9984248280525208,
+            "max_confidence_delta": 0.0075491368770599365
+          }
+        }
+      ],
+      "speedup": 1.0303733669341468,
+      "latency_reduction_percent": 2.947802020982171
+    },
+    {
+      "variant": "s",
+      "resolution": "416x416",
+      "winograd_layers": [
+        "model.6.m.0.cv2",
+        "model.6.m.1.cv2",
+        "model.6.m.2.cv2",
+        "model.8.m.0.cv2",
+        "model.13.m.0.cv2",
+        "model.20.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            221.7518859714929,
+            221.75030157539385,
+            221.74818904726183,
+            221.74967741935487,
+            221.74357989497375,
+            221.75130982745688,
+            221.7522220555139
+          ],
+          "execution_ms": [
+            236.3891830027569,
+            236.39648102107458,
+            236.3708159828093,
+            236.43553900183178,
+            235.78138300217688,
+            236.30971999955364,
+            236.06331399059854
+          ],
+          "median_accelerator_ms": 221.75030157539385,
+          "median_execution_ms": 236.3708159828093,
+          "model_image_bytes": 4328064,
+          "program_bytes": 239744,
+          "model_sha256": "facca0f8afc784cef42039d592197d535286b96666292acc6cfe841f2e9506de",
+          "program_sha256": "bd2c21c0897d2afcaed5bde782c2fb28a03033b41aad7a44bf0f6cae58ca2507"
+        },
+        "winograd": {
+          "accelerator_ms": [
+            215.20372093023258,
+            215.19738334583647,
+            215.19181395348838,
+            215.18590847711928,
+            215.20348087021756,
+            215.1905656414104,
+            215.1927261815454
+          ],
+          "execution_ms": [
+            233.26357998303138,
+            229.41932201501913,
+            232.32249700231478,
+            229.90575700532645,
+            229.78976799640805,
+            230.3107869811356,
+            230.5177070084028
+          ],
+          "median_accelerator_ms": 215.1927261815454,
+          "median_execution_ms": 230.3107869811356,
+          "model_image_bytes": 10957632,
+          "program_bytes": 1014592,
+          "model_sha256": "d16d2ed95713b6e72f8529b6394dbaa515744e29c55f00ff07565b342a03a721",
+          "program_sha256": "f984f3b48fee382ac1f6f49b7619ba8d61f836fcbe1058cc25faad3ab43f0a7c"
+        }
+      },
+      "quality": [
+        {
+          "image": "models/test_samples/people.jpg",
+          "snr_db": 51.32839478749745,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.0027138151376245243,
+          "detections": {
+            "native_count": 15,
+            "winograd_count": 15,
+            "matched_iou50": 15,
+            "min_matched_iou": 0.9941627979278564,
+            "max_confidence_delta": 0.007796347141265869
+          }
+        },
+        {
+          "image": "models/test_samples/vette.jpg",
+          "snr_db": 52.3000368406305,
+          "max_abs_error": 0.25,
+          "relative_l2": 0.0024265998027968804,
+          "detections": {
+            "native_count": 1,
+            "winograd_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9985986948013306,
+            "max_confidence_delta": 0.0022208094596862793
+          }
+        }
+      ],
+      "speedup": 1.0304730346151023,
+      "latency_reduction_percent": 2.9571889405611063
+    },
+    {
+      "variant": "s",
+      "resolution": "512x512",
+      "winograd_layers": [
+        "model.6.m.0.cv2",
+        "model.6.m.1.cv2",
+        "model.6.m.2.cv2",
+        "model.8.m.0.cv2",
+        "model.13.m.0.cv2",
+        "model.20.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            334.59992198049514,
+            334.60510727681924,
+            334.5994898724681,
+            334.5994898724681,
+            334.59920180045015,
+            334.59977794448616,
+            334.60097824456113
+          ],
+          "execution_ms": [
+            359.5417230098974,
+            359.9246800004039,
+            358.47687799832784,
+            362.44983598589897,
+            358.65483499947004,
+            359.8848870024085,
+            358.12219401123
+          ],
+          "median_accelerator_ms": 334.59977794448616,
+          "median_execution_ms": 359.5417230098974,
+          "model_image_bytes": 4403584,
+          "program_bytes": 315264,
+          "model_sha256": "ac6f66283654f4dc5898d9c5eb5eebdd0f31fbe127a4eec9074d4cec7119d01f",
+          "program_sha256": "9c514aba590cf03f591f5e28256c1e0e7a1e12d1f49dd3ba3eec3a63e006fc1d"
+        },
+        "winograd": {
+          "accelerator_ms": [
+            322.6819984996249,
+            322.6603450862716,
+            322.67633308327083,
+            322.65203900975246,
+            322.65501575393847,
+            322.67033158289576,
+            322.6594808702176
+          ],
+          "execution_ms": [
+            349.09796400461346,
+            347.3918529925868,
+            348.2640599831939,
+            347.81936201034114,
+            347.5284859887324,
+            347.4491680099163,
+            347.7268769929651
+          ],
+          "median_accelerator_ms": 322.6603450862716,
+          "median_execution_ms": 347.7268769929651,
+          "model_image_bytes": 11086912,
+          "program_bytes": 1143872,
+          "model_sha256": "59fecb14060b94662c17cefc691d1b5cd503b61cbdc4231974f6a629ba509414",
+          "program_sha256": "41243d781c01124b2539cb8243b93898e7539ada09319366947d82387948ede5"
+        }
+      },
+      "quality": [
+        {
+          "image": "models/test_samples/people.jpg",
+          "snr_db": 50.617420587656106,
+          "max_abs_error": 0.25,
+          "relative_l2": 0.0029452961562306053,
+          "detections": {
+            "native_count": 15,
+            "winograd_count": 15,
+            "matched_iou50": 15,
+            "min_matched_iou": 0.9937573671340942,
+            "max_confidence_delta": 0.006998807191848755
+          }
+        },
+        {
+          "image": "models/test_samples/vette.jpg",
+          "snr_db": 52.41995792157485,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.002393327350750475,
+          "detections": {
+            "native_count": 1,
+            "winograd_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9989672303199768,
+            "max_confidence_delta": 0.0007877945899963379
+          }
+        }
+      ],
+      "speedup": 1.0370030995132737,
+      "latency_reduction_percent": 3.5682727978963102
+    },
+    {
+      "variant": "s",
+      "resolution": "640x480",
+      "winograd_layers": [
+        "model.6.m.0.cv2",
+        "model.6.m.1.cv2",
+        "model.6.m.2.cv2",
+        "model.8.m.0.cv2",
+        "model.13.m.0.cv2",
+        "model.20.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            392.44339084771195,
+            392.43292423105777,
+            392.4295153788447,
+            392.4295153788447,
+            392.4334043510878,
+            392.4372453113279,
+            392.43590097524384
+          ],
+          "execution_ms": [
+            420.41892401175573,
+            417.1558629896026,
+            420.49902500002645,
+            420.8591770147905,
+            419.8003789933864,
+            420.00018199905753,
+            420.08127900771797
+          ],
+          "median_accelerator_ms": 392.4334043510878,
+          "median_execution_ms": 420.08127900771797,
+          "model_image_bytes": 4472256,
+          "program_bytes": 383936,
+          "model_sha256": "9a47aecd93bfb0935c59712d4980a18d2d93857966000d2cb06ec12df0401df3",
+          "program_sha256": "aa1611158c22f873c7e37a8df5e21870de0c1feec2f58b341173574b151ef7cb"
+        },
+        "winograd": {
+          "accelerator_ms": [
+            378.67791747936985,
+            378.6705236309078,
+            378.6679309827457,
+            378.685023255814,
+            378.6786856714179,
+            378.685551387847,
+            378.6781575393849
+          ],
+          "execution_ms": [
+            406.25115198781714,
+            407.09396798047237,
+            406.4323950151447,
+            409.3427899933886,
+            406.9600189977791,
+            406.66373702697456,
+            406.40167900710367
+          ],
+          "median_accelerator_ms": 378.6781575393849,
+          "median_execution_ms": 406.66373702697456,
+          "model_image_bytes": 11131136,
+          "program_bytes": 1188096,
+          "model_sha256": "e2a76d0795ab80f45b61375035395b1392beb90abbba1bcb57d33610866454eb",
+          "program_sha256": "048c869060c5c36aaaab6435be9f1d9c574f284ffe23514d598b152035998dc6"
+        }
+      },
+      "quality": [
+        {
+          "image": "models/test_samples/people.jpg",
+          "snr_db": 51.33477098129258,
+          "max_abs_error": 0.140625,
+          "relative_l2": 0.0027118236937690686,
+          "detections": {
+            "native_count": 14,
+            "winograd_count": 14,
+            "matched_iou50": 14,
+            "min_matched_iou": 0.9847718477249146,
+            "max_confidence_delta": 0.005825340747833252
+          }
+        },
+        {
+          "image": "models/test_samples/vette.jpg",
+          "snr_db": 51.99739450912337,
+          "max_abs_error": 0.25,
+          "relative_l2": 0.002512640030640117,
+          "detections": {
+            "native_count": 1,
+            "winograd_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9962568283081055,
+            "max_confidence_delta": 0.002323448657989502
+          }
+        }
+      ],
+      "speedup": 1.0363243734496945,
+      "latency_reduction_percent": 3.505116195306568
+    },
+    {
+      "variant": "s",
+      "resolution": "640x640",
+      "winograd_layers": [
+        "model.6.m.0.cv2",
+        "model.6.m.1.cv2",
+        "model.6.m.2.cv2",
+        "model.8.m.0.cv2",
+        "model.13.m.0.cv2",
+        "model.20.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            522.4843330832708,
+            522.4790997749437,
+            522.4809242310578,
+            522.4743465866467,
+            522.4706976744186,
+            522.4856774193548,
+            522.4658004501126
+          ],
+          "execution_ms": [
+            558.465748996241,
+            558.3343190082815,
+            558.6354499973822,
+            559.1957719880156,
+            556.5075860067736,
+            557.4852279969491,
+            559.3217459972948
+          ],
+          "median_accelerator_ms": 522.4790997749437,
+          "median_execution_ms": 558.465748996241,
+          "model_image_bytes": 4550016,
+          "program_bytes": 461696,
+          "model_sha256": "c06f327b082560e58c55870c0feaa72c253e2e5ce2b86a24bf17116cb4f15434",
+          "program_sha256": "6c0eed22576de9be2d5c067feb7fa799c9d10ebb0cb26872d0c671e7b63960e1"
+        },
+        "winograd": {
+          "accelerator_ms": [
+            502.87195798949745,
+            502.8855453863466,
+            502.8843450862716,
+            502.8656684171043,
+            502.8755108777195,
+            502.8716219054764,
+            502.86446811702933
+          ],
+          "execution_ms": [
+            537.9659550089855,
+            538.0700280074961,
+            538.1287680065725,
+            537.9119340213947,
+            538.4182750131004,
+            539.0854760189541,
+            537.3306259862147
+          ],
+          "median_accelerator_ms": 502.87195798949745,
+          "median_execution_ms": 538.0700280074961,
+          "model_image_bytes": 11307776,
+          "program_bytes": 1364736,
+          "model_sha256": "bad1163a5176a9e20e3934794a2903496021227b460a20e13268003b89cbfb76",
+          "program_sha256": "d073678b9714202554891b63d89d9ae588e496a993408dda43dfb1d4fa7c2b1f"
+        }
+      },
+      "quality": [
+        {
+          "image": "models/test_samples/people.jpg",
+          "snr_db": 51.059836447259094,
+          "max_abs_error": 0.25,
+          "relative_l2": 0.002799034024123554,
+          "detections": {
+            "native_count": 14,
+            "winograd_count": 14,
+            "matched_iou50": 14,
+            "min_matched_iou": 0.9940518736839294,
+            "max_confidence_delta": 0.0036201775074005127
+          }
+        },
+        {
+          "image": "models/test_samples/vette.jpg",
+          "snr_db": 52.85211354171538,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.0022771640710049085,
+          "detections": {
+            "native_count": 1,
+            "winograd_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.997541606426239,
+            "max_confidence_delta": 0.0007852911949157715
+          }
+        }
+      ],
+      "speedup": 1.0389903264119886,
+      "latency_reduction_percent": 3.7527131312797057
+    },
+    {
+      "variant": "n",
+      "resolution": "256x256",
+      "winograd_layers": [],
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            41.07359639909978,
+            41.06687471867967,
+            41.07052363090773,
+            41.06658664666167,
+            41.07330832708177,
+            41.06927531882971,
+            41.073980495123784
+          ],
+          "execution_ms": [
+            47.53413298749365,
+            47.13571898173541,
+            47.351003013318405,
+            47.395786008564755,
+            47.60876201908104,
+            47.25532099837437,
+            47.35803900985047
+          ],
+          "median_accelerator_ms": 41.07052363090773,
+          "median_execution_ms": 47.35803900985047,
+          "model_image_bytes": 1406208,
+          "program_bytes": 99456,
+          "model_sha256": "ac9fb3e9605f3db6d9136a135178844e1f7142e06bbb7f90a610eeca24e38f81",
+          "program_sha256": "ea04c37a9d4e44742fb9dd36610172fb1f266712d1978d2ec3e1d3bd6499c811"
+        },
+        "winograd": {
+          "accelerator_ms": [
+            41.070955738934735,
+            41.068603150787695,
+            41.07191597899475,
+            41.070571642910735,
+            41.07129182295574,
+            41.069707426856716,
+            41.07206001500376
+          ],
+          "execution_ms": [
+            47.36237699398771,
+            47.25562801468186,
+            47.47553600464016,
+            47.48367299907841,
+            47.69369401037693,
+            47.14238698943518,
+            47.484916023677215
+          ],
+          "median_accelerator_ms": 41.070955738934735,
+          "median_execution_ms": 47.47553600464016,
+          "model_image_bytes": 1406208,
+          "program_bytes": 99456,
+          "model_sha256": "ac9fb3e9605f3db6d9136a135178844e1f7142e06bbb7f90a610eeca24e38f81",
+          "program_sha256": "ea04c37a9d4e44742fb9dd36610172fb1f266712d1978d2ec3e1d3bd6499c811"
+        }
+      },
+      "quality": [
+        {
+          "image": "models/test_samples/people.jpg",
+          "snr_db": null,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "detections": {
+            "native_count": 7,
+            "winograd_count": 7,
+            "matched_iou50": 7,
+            "min_matched_iou": 1.0,
+            "max_confidence_delta": 0.0
+          }
+        },
+        {
+          "image": "models/test_samples/vette.jpg",
+          "snr_db": null,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "detections": {
+            "native_count": 2,
+            "winograd_count": 2,
+            "matched_iou50": 2,
+            "min_matched_iou": 1.0,
+            "max_confidence_delta": 0.0
+          }
+        }
+      ],
+      "speedup": 0.9999894789877851,
+      "latency_reduction_percent": -0.0010521122907780622
+    },
+    {
+      "variant": "n",
+      "resolution": "320x320",
+      "winograd_layers": [
+        "model.8.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            64.06044711177795,
+            64.0573263315829,
+            64.0567501875469,
+            64.06025506376594,
+            64.06102325581395,
+            64.05852663165793,
+            64.05852663165793
+          ],
+          "execution_ms": [
+            73.33462600945495,
+            73.05285500478931,
+            73.19997099693865,
+            73.3770839869976,
+            73.12859399826266,
+            73.49263099604286,
+            72.92903299094178
+          ],
+          "median_accelerator_ms": 64.05852663165793,
+          "median_execution_ms": 73.19997099693865,
+          "model_image_bytes": 1439168,
+          "program_bytes": 132416,
+          "model_sha256": "c736875d3f0ab3c1d473c5e35bb426d53a4a6cc89afd5f693d8f50f1306d7a1b",
+          "program_sha256": "9ca00d906c032849f907d7c4c3e1cb53ba374de1776525658cbe7ed8a8b3b26d"
+        },
+        "winograd": {
+          "accelerator_ms": [
+            64.02851912978245,
+            64.0259264816204,
+            64.02741485371342,
+            64.02871117779446,
+            64.02616654163542,
+            64.02683870967742,
+            64.0252063015754
+          ],
+          "execution_ms": [
+            73.13487201463431,
+            73.03495801170357,
+            73.57148401206359,
+            72.8774449962657,
+            73.25158300227486,
+            72.71232601488009,
+            72.60080700507388
+          ],
+          "median_accelerator_ms": 64.02683870967742,
+          "median_execution_ms": 73.03495801170357,
+          "model_image_bytes": 2526144,
+          "program_bytes": 311104,
+          "model_sha256": "407cba6520e9c4897a78e4b6052fd6ba0b842eadf89730beb1327751cfd8d8ff",
+          "program_sha256": "b5374138440e1054ff0a0a9fe5e764bd35720da24e9c50f8dc81a4792cdace25"
+        }
+      },
+      "quality": [
+        {
+          "image": "models/test_samples/people.jpg",
+          "snr_db": 50.151982060824636,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.0031074267282246125,
+          "detections": {
+            "native_count": 6,
+            "winograd_count": 6,
+            "matched_iou50": 6,
+            "min_matched_iou": 0.9949462413787842,
+            "max_confidence_delta": 0.004365503787994385
+          }
+        },
+        {
+          "image": "models/test_samples/vette.jpg",
+          "snr_db": 51.328728050669284,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.0027137110150385825,
+          "detections": {
+            "native_count": 1,
+            "winograd_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.997907280921936,
+            "max_confidence_delta": 0.0037713348865509033
+          }
+        }
+      ],
+      "speedup": 1.0004949162354273,
+      "latency_reduction_percent": 0.04946714145130926
+    },
+    {
+      "variant": "n",
+      "resolution": "416x416",
+      "winograd_layers": [],
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            108.0760750187547,
+            108.07559489872469,
+            108.07967591897975,
+            108.08102025506378,
+            108.07871567891974,
+            108.07780345086272,
+            108.07482670667667
+          ],
+          "execution_ms": [
+            123.21040200185962,
+            122.79304201365449,
+            123.05604197899811,
+            123.04533499991521,
+            123.14288699417375,
+            122.4793339788448,
+            122.79857401154004
+          ],
+          "median_accelerator_ms": 108.07780345086272,
+          "median_execution_ms": 123.04533499991521,
+          "model_image_bytes": 1509056,
+          "program_bytes": 202304,
+          "model_sha256": "2345bd483940346089229d9255c2e44773a220d096f4cc0169f91f9d4361c6ab",
+          "program_sha256": "2867700000ccf72eb17632411d2fe830724fead62327591a807860d2adfcc59e"
+        },
+        "winograd": {
+          "accelerator_ms": [
+            108.08226856714178,
+            108.07410652663167,
+            108.07535483870969,
+            108.08010802700676,
+            108.07977194298576,
+            108.07828357089274,
+            108.07948387096775
+          ],
+          "execution_ms": [
+            123.01860598381609,
+            123.1616529985331,
+            122.91462798020802,
+            122.06446297932416,
+            122.25121699157171,
+            122.31645901920274,
+            122.32760598999448
+          ],
+          "median_accelerator_ms": 108.07948387096775,
+          "median_execution_ms": 122.32760598999448,
+          "model_image_bytes": 1509056,
+          "program_bytes": 202304,
+          "model_sha256": "2345bd483940346089229d9255c2e44773a220d096f4cc0169f91f9d4361c6ab",
+          "program_sha256": "2867700000ccf72eb17632411d2fe830724fead62327591a807860d2adfcc59e"
+        }
+      },
+      "quality": [
+        {
+          "image": "models/test_samples/people.jpg",
+          "snr_db": null,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "detections": {
+            "native_count": 6,
+            "winograd_count": 6,
+            "matched_iou50": 6,
+            "min_matched_iou": 1.0,
+            "max_confidence_delta": 0.0
+          }
+        },
+        {
+          "image": "models/test_samples/vette.jpg",
+          "snr_db": null,
+          "max_abs_error": 0.0,
+          "relative_l2": 0.0,
+          "detections": {
+            "native_count": 1,
+            "winograd_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 1.0,
+            "max_confidence_delta": 0.0
+          }
+        }
+      ],
+      "speedup": 0.9999844519973186,
+      "latency_reduction_percent": -0.0015548244425511726
+    },
+    {
+      "variant": "n",
+      "resolution": "512x512",
+      "winograd_layers": [
+        "model.8.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            162.84154238559643,
+            162.8391897974494,
+            162.83798949737437,
+            162.84451912978247,
+            162.8406301575394,
+            162.83174793698427,
+            162.83669317329333
+          ],
+          "execution_ms": [
+            186.79176599835046,
+            188.16793500445783,
+            187.86106401239522,
+            187.58544299635105,
+            187.247155001387,
+            187.3221400019247,
+            187.2581350035034
+          ],
+          "median_accelerator_ms": 162.8391897974494,
+          "median_execution_ms": 187.3221400019247,
+          "model_image_bytes": 1574976,
+          "program_bytes": 268224,
+          "model_sha256": "2041811cc1b3c5ad83ffc47a0137b2e41997050b81fca8c3b822ae96083eb391",
+          "program_sha256": "45c1e12051bc08835aadc37e5f603b27f997717641643e6fe7db2236d38c99ea"
+        },
+        "winograd": {
+          "accelerator_ms": [
+            162.40266466616654,
+            162.4037209302326,
+            162.40693773443363,
+            162.39642310577645,
+            162.39416654163543,
+            162.40151237809454,
+            162.40429707426858
+          ],
+          "execution_ms": [
+            188.19398901541717,
+            187.4057640088722,
+            187.21088199527003,
+            188.51466898922808,
+            186.66430801386014,
+            187.03644699417055,
+            187.3127500002738
+          ],
+          "median_accelerator_ms": 162.40266466616654,
+          "median_execution_ms": 187.3127500002738,
+          "model_image_bytes": 2683008,
+          "program_bytes": 467968,
+          "model_sha256": "1f22f53104d114c535cfa129ce6c33b5c0495a48c66ebe1d67dbe5d8e256bda2",
+          "program_sha256": "cf188039af9f90ed2d186aeaca2ac00dcd8bdf63789222b40dd59608951271bc"
+        }
+      },
+      "quality": [
+        {
+          "image": "models/test_samples/people.jpg",
+          "snr_db": 50.24374549385668,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.0030747706387896315,
+          "detections": {
+            "native_count": 4,
+            "winograd_count": 4,
+            "matched_iou50": 4,
+            "min_matched_iou": 0.9933565258979797,
+            "max_confidence_delta": 0.005876064300537109
+          }
+        },
+        {
+          "image": "models/test_samples/vette.jpg",
+          "snr_db": 51.61406160696017,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.002626013289821511,
+          "detections": {
+            "native_count": 1,
+            "winograd_count": 1,
+            "matched_iou50": 1,
+            "min_matched_iou": 0.9966399669647217,
+            "max_confidence_delta": 0.0015856623649597168
+          }
+        }
+      ],
+      "speedup": 1.0026879185275694,
+      "latency_reduction_percent": 0.2680712989458045
+    },
+    {
+      "variant": "n",
+      "resolution": "640x480",
+      "winograd_layers": [
+        "model.8.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            191.1731852963241,
+            191.15791747936984,
+            191.16420705176296,
+            191.16449512378097,
+            191.16430307576894,
+            191.16070217554392,
+            191.16795198799701
+          ],
+          "execution_ms": [
+            219.9798899819143,
+            218.49402197403833,
+            219.2983420100063,
+            219.42528799991123,
+            217.70757899503224,
+            218.9627249899786,
+            219.45609597605653
+          ],
+          "median_accelerator_ms": 191.16430307576894,
+          "median_execution_ms": 219.2983420100063,
+          "model_image_bytes": 1624768,
+          "program_bytes": 318016,
+          "model_sha256": "aab4fb29d29bec7dc55facf534962ed8d40ba33af3c88f492236bd5600552092",
+          "program_sha256": "4e9846ef35a65d53c26559f908e4a416bc5978dc0f1d64b4603bb4a03ccb468a"
+        },
+        "winograd": {
+          "accelerator_ms": [
+            190.8210652663166,
+            190.8215453863466,
+            190.81295123780947,
+            190.81026256564144,
+            190.8157839459865,
+            190.82000900225057,
+            190.8161200300075
+          ],
+          "execution_ms": [
+            219.42862099967897,
+            218.3832460141275,
+            218.80728300311603,
+            218.5495309822727,
+            218.64353699493222,
+            217.86142600467429,
+            217.49958099098876
+          ],
+          "median_accelerator_ms": 190.8161200300075,
+          "median_execution_ms": 218.5495309822727,
+          "model_image_bytes": 2732672,
+          "program_bytes": 517632,
+          "model_sha256": "7bdf8b2f0eba02b00ca56d89f68fc88d6d64741e5740c62cbeb5474a1ca57a7d",
+          "program_sha256": "f9c63a6ef5ddfe4abc15f9b33cf5c19e673d07464561bb13ae5db2c9b9314a95"
+        }
+      },
+      "quality": [
+        {
+          "image": "models/test_samples/people.jpg",
+          "snr_db": 50.43040362357162,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.0030093993222051014,
+          "detections": {
+            "native_count": 5,
+            "winograd_count": 5,
+            "matched_iou50": 5,
+            "min_matched_iou": 0.9963917136192322,
+            "max_confidence_delta": 0.005567997694015503
+          }
+        },
+        {
+          "image": "models/test_samples/vette.jpg",
+          "snr_db": 52.10782356452347,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.0024808975017625184,
+          "detections": {
+            "native_count": 0,
+            "winograd_count": 0,
+            "matched_iou50": 0,
+            "min_matched_iou": null,
+            "max_confidence_delta": null
+          }
+        }
+      ],
+      "speedup": 1.0018247045674478,
+      "latency_reduction_percent": 0.1821381085062912
+    },
+    {
+      "variant": "n",
+      "resolution": "640x640",
+      "winograd_layers": [
+        "model.8.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "timing": {
+        "native": {
+          "accelerator_ms": [
+            254.38343585896476,
+            254.37388147036762,
+            254.37469767441863,
+            254.38079519879972,
+            254.38069917479373,
+            254.37743435858968,
+            254.36941635408854
+          ],
+          "execution_ms": [
+            287.839875993086,
+            290.6408080016263,
+            291.7216939968057,
+            289.88113600644283,
+            290.1455490209628,
+            291.22186498716474,
+            289.6692710055504
+          ],
+          "median_accelerator_ms": 254.37743435858968,
+          "median_execution_ms": 290.1455490209628,
+          "model_image_bytes": 1680448,
+          "program_bytes": 373696,
+          "model_sha256": "e18af3209c51d518464701716e347adfb8efc90c493f1dd145ca01765185d64f",
+          "program_sha256": "5dce5c10f0b7c183823286e92530839dd80b6079a15f86bf91fa1d6f93fe76e2"
+        },
+        "winograd": {
+          "accelerator_ms": [
+            253.53708027006755,
+            253.53866466616657,
+            253.5240210052513,
+            253.54649062265568,
+            253.55105176294077,
+            253.53832858214554,
+            253.54365791447864
+          ],
+          "execution_ms": [
+            290.4274000029545,
+            290.08306999458,
+            290.2982380182948,
+            290.8029419777449,
+            289.1620759910438,
+            288.4584970015567,
+            288.30935500445776
+          ],
+          "median_accelerator_ms": 253.53866466616657,
+          "median_execution_ms": 290.08306999458,
+          "model_image_bytes": 2802176,
+          "program_bytes": 587136,
+          "model_sha256": "c771a1eebe0b93ca5cf2cc15a0ed6c52b832b7495de847e67d3762241f8ee2fc",
+          "program_sha256": "fa8c6b3f70d022dfb8181de040cbe794640249a9d4b08b082e997e4c0a541655"
+        }
+      },
+      "quality": [
+        {
+          "image": "models/test_samples/people.jpg",
+          "snr_db": 50.61155227358202,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.0029472867137390535,
+          "detections": {
+            "native_count": 6,
+            "winograd_count": 6,
+            "matched_iou50": 6,
+            "min_matched_iou": 0.9938405752182007,
+            "max_confidence_delta": 0.005424052476882935
+          }
+        },
+        {
+          "image": "models/test_samples/vette.jpg",
+          "snr_db": 51.804876069612,
+          "max_abs_error": 0.125,
+          "relative_l2": 0.002568953223405312,
+          "detections": {
+            "native_count": 0,
+            "winograd_count": 0,
+            "matched_iou50": 0,
+            "min_matched_iou": null,
+            "max_confidence_delta": null
+          }
+        }
+      ],
+      "speedup": 1.0033082515975522,
+      "latency_reduction_percent": 0.3297343156786203
+    }
+  ]
+}

@@ -1,6 +1,13 @@
 # YOLOv5n
 
-Run commands from `pcie_utils/` with the [model dependencies](../README.md).
+The compiler, direct runner and CI wrapper use the optimized path by default.
+`--optimize` (an alias for `--winograd`) selects it explicitly; `--native`
+selects the original baseline.
+The [four-model benchmark](../benchmarks/README.md) reports fresh FPGA metrics
+for YOLOv5n/s and YOLO26n/s; YOLOv5n's measured 640×640 latency reduction is
+0.33%, and its 256×256/416×416 profiles retain the native fallback.
+
+Run commands from the repository root with the [model dependencies](../README.md).
 YOLOv5n uses the [YOLOv5s implementation](../yolov5s/README.md) for graph
 compilation, mixed IF4/IF8 quantization and single-bin hardware execution.
 Its configuration and checkpoint are separate.
@@ -38,3 +45,14 @@ These entrypoints always select YOLOv5n. Source pinning, timing definitions and
 the source compatibility audit are described in the YOLOv5s guide. The official
 checkpoint and derived artifacts are subject to upstream YOLOv5 v7.0 GPL-3.0
 terms.
+
+## Default Winograd
+
+By default, `yolov5n_compile.py` writes
+`yolov5n_bin/yolov5n-andromeda_winograd.bin`, which the direct runner selects automatically.
+The shared compiler uses BF16 Winograd for profitable 3×3 layers and retains
+native IF4/IF8 elsewhere. The 256×256 and 416×416 profiles use native convolution
+throughout. On the measured board, overall latency improves by at most 0.33%;
+the improvement is larger for YOLOv5s. See the
+[shared performance report](../yolov5s/README.md#default-winograd-compilation-and-measured-performance)
+for all profiles, output comparisons, memory costs and reproduction commands.

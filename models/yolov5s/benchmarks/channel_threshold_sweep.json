@@ -1,0 +1,72 @@
+{
+  "firmware": "0xf1e5582c",
+  "clock_ns": 3.000750187546887,
+  "axi_width_bits": 512,
+  "resolution": "640x640",
+  "warmup": 1,
+  "repeats": 4,
+  "description": "Same Winograd eligibility predicate with min_channels 128 versus 64; full resident graph timing.",
+  "results": [
+    {
+      "variant": "n",
+      "threshold": 128,
+      "layers": [
+        "model.8.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "median_ms": 253.53914478619657
+    },
+    {
+      "variant": "n",
+      "threshold": 64,
+      "layers": [
+        "model.6.m.0.cv2",
+        "model.6.m.1.cv2",
+        "model.6.m.2.cv2",
+        "model.8.m.0.cv2",
+        "model.13.m.0.cv2",
+        "model.20.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "median_ms": 258.87339834958743,
+      "snr_db": 49.43332608183709,
+      "max_abs_error": 0.15625,
+      "relative_l2": 0.0033754656741235025
+    },
+    {
+      "variant": "s",
+      "threshold": 128,
+      "layers": [
+        "model.6.m.0.cv2",
+        "model.6.m.1.cv2",
+        "model.6.m.2.cv2",
+        "model.8.m.0.cv2",
+        "model.13.m.0.cv2",
+        "model.20.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "median_ms": 502.8690532633159
+    },
+    {
+      "variant": "s",
+      "threshold": 64,
+      "layers": [
+        "model.4.m.0.cv2",
+        "model.4.m.1.cv2",
+        "model.6.m.0.cv2",
+        "model.6.m.1.cv2",
+        "model.6.m.2.cv2",
+        "model.8.m.0.cv2",
+        "model.13.m.0.cv2",
+        "model.17.m.0.cv2",
+        "model.20.m.0.cv2",
+        "model.23.m.0.cv2"
+      ],
+      "median_ms": 513.8813503375844,
+      "snr_db": 49.485546370451765,
+      "max_abs_error": 0.25,
+      "relative_l2": 0.0033552329759172763
+    }
+  ],
+  "image": "models/test_samples/people.jpg"
+}
