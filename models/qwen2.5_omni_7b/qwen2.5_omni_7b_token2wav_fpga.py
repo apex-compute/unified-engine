@@ -31,7 +31,7 @@ import time
 
 import torch
 
-from user_dma_core import DMA_DEVICE_H2C, UE_MODE
+from user_dma_core import CONV_GEOMETRY_QUEUE_CONFIG, DMA_DEVICE_H2C, UE_MODE
 
 BLOCK = 24
 HEADS = 16
@@ -548,10 +548,16 @@ class BigVGANFpga:
 
     SLICE_ALIGN = 128
 
-    def __init__(self, cores, big, *, frames: int, verbose: bool = True):
+    def __init__(self, cores, big, *, frames: int, verbose: bool = True, conv_router: bool = False):
         self.cores = cores
         self.n = cores.n
         self.big = big
+        self.conv_router = conv_router
+        self._router_w: dict = {}
+        self._router_cache: dict = {}
+        if conv_router:                          # native convs need per-op queued geometry
+            for ue in cores.engines:
+                ue.conv_geometry_mode = CONV_GEOMETRY_QUEUE_CONFIG
         self.T = frames
         self.verbose = verbose
         self.kk = _kokoro()
@@ -668,6 +674,18 @@ class BigVGANFpga:
             self._mm(ue, m, Cin_p, Cout_p, x + (s0 + kk * dil - pad) * Cin_p * 2,
                      self._tap(conv, kk, Cin_p, Cout_p), dst,
                      bias if kk == 0 else prev, "broadcast_N" if kk == 0 else "full_matrix")
+
+    def conv_routed(self, ue, x, rows, s0, s1, conv, Cin_p, out, dil, pad):
+        """conv1d via conv2d_auto, in place on the [T, C] buffers (time = W); returns the rows written.
+        Bands start on a multiple of 2*dil, as a Winograd band must."""
+        step = 2 * dil
+        s0, s1 = s0 - s0 % step, (rows if s1 == rows else s1 - s1 % step)
+        w = self._router_w.setdefault(id(conv), conv.weight.detach().unsqueeze(2))
+        ue.conv2d_auto(weight=w, bias=conv.bias, ACT_DRAM_ADDR=x - pad * Cin_p * 2, OUTPUT_DRAM_ADDR=out,
+                       c_in=conv.in_channels, in_h=1, in_w=rows, kernel_h=1, kernel_w=conv.weight.shape[2],
+                       stride_s=1, pad=pad, pad_h=0, dilation=dil, oc_count=conv.out_channels,
+                       band=(0, 1, s0, s1), params_ue=self.cores.weights, cache=self._router_cache)
+        return s0, s1
 
     def conv_transpose(self, ue, x, T_in, s0, s1, conv, Cin_p, Cout_p, stride, out):
         """This engine's INPUT rows [s0, s1) of a polyphase ConvTranspose1d."""
@@ -835,8 +853,13 @@ class BigVGANFpga:
             s0, s1 = self._slice(rows, e)
             if s1 <= s0:
                 return
-            self._zero_halo(ue, x, rows, Cin_p, pad, s0, s1)
-            self.conv1d(ue, x, rows, s0, s1, conv, Cin_p, Cout_p, out, dil)
+            if self.conv_router:                 # Winograd reads up to 3*ceil(k/3) taps
+                k = conv.weight.shape[2]
+                self._zero_halo(ue, x, rows, Cin_p, dil * 3 * -(-k // 3), s0, s1)
+                s0, s1 = self.conv_routed(ue, x, rows, s0, s1, conv, Cin_p, out, dil, pad)
+            else:
+                self._zero_halo(ue, x, rows, Cin_p, pad, s0, s1)
+                self.conv1d(ue, x, rows, s0, s1, conv, Cin_p, Cout_p, out, dil)
             if post is not None:
                 post(ue, s0, s1)
         self._region(name, emit)
@@ -931,6 +954,8 @@ class BigVGANFpga:
             self.marks[i] = (len(self.sequence), x, i + 1)
         self.out_addr = self.build_post(x)
         self.marks["post"] = (len(self.sequence), self.out_addr, None)
+        if c.weights_limit is not None and c.weights._next_params_dram_addr > c.weights_limit:
+            raise MemoryError("t2w cores: BigVGAN conv-router weights run past the weight pool")
         if self.verbose:
             print(f"  [T2W] BigVGAN: {len(self.sequence)} regions x {self.n} engines, "
                   f"{c.program_bytes() / 2**20:.1f} MiB of programs in total, compiled in "
@@ -1024,7 +1049,7 @@ class Token2WavFpga:
     """Codec IDs -> waveform with the DiT and the BigVGAN both on the accelerator."""
 
     def __init__(self, cores, t2w, *, codes: int, verbose: bool = True,
-                 compile: bool = True, state=None):
+                 compile: bool = True, state=None, conv_router: bool = False):
         """``compile=False`` builds the objects and uploads the DiT weights but
         compiles nothing; ``state`` (from ``compile_state()``) then restores what
         the compilers left, so ``--run_from_bin`` needs no compile pass."""
@@ -1043,7 +1068,7 @@ class Token2WavFpga:
             self._compile_state["dit"] = rec.delta()
         # BigVGAN reuses the activation pool the DiT used once the DiT is done with it.
         self.vocoder = BigVGANFpga(cores, t2w.code2wav_bigvgan_model, frames=self.frames,
-                                   verbose=verbose)
+                                   verbose=verbose, conv_router=conv_router)
         cores.pool_rewind(self.dit.pool_mark)
         if compile:
             rec = _recorder(self.vocoder)
