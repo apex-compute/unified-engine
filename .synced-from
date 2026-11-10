@@ -1,8 +1,8 @@
 # Written by andromeda pcie_utils/sync_unified_engine.sh --push. Do not edit.
 # The files below are owned by andromeda; edits made here are carried back
 # by --backsync, using the commit that last changed this file as the base.
-andromeda_commit=46c84103767ed3f678cda36bd989133464d80022
-hw_hash=16bac9d4
+andromeda_commit=1e241c1ef2633aa61bff925ef98b0105acc180a7
+hw_hash=5fa236ad
 files:
   andromeda_hw_info.py
   user_dma_core.py
@@ -165,9 +165,13 @@ files:
   models/yolov5s/README.md
   models/yolov5s/test_yolov5_helpers.py
   models/yolov5s/test_yolov5_trace.py
+  models/yolov5s/yolo_attention.py
+  models/yolov5s/yolo_channel_ops.py
   models/yolov5s/yolov5_artifact.py
   models/yolov5s/yolov5_common.py
   models/yolov5s/yolov5_precompiled.py
+  models/yolov5s/yolov5_winograd.py
+  models/yolov5s/yolov5_winograd_artifacts.py
   models/yolov5s/yolov5s_compile.py
   models/yolov5s/yolov5s_config.json
   models/yolov5s/yolov5s_run_from_bin.py
