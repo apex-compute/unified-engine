@@ -42,6 +42,7 @@ MEL = 80
 MEL_PAD = 128
 LAYERS = 22
 GATE_TILE_ROWS = 8               # rows per SRAM tile of the gated-residual chain
+ROUTER_SCRATCH_BYTES = 32 << 20  # conv2d_auto Winograd D/M-plane scratch per engine (--conv-router)
 
 
 def _align(x: int, a: int) -> int:
@@ -555,9 +556,17 @@ class BigVGANFpga:
         self.conv_router = conv_router
         self._router_w: dict = {}
         self._router_cache: dict = {}
+        self._router_scratch: dict = {}
         if conv_router:                          # native convs need per-op queued geometry
             for ue in cores.engines:
                 ue.conv_geometry_mode = CONV_GEOMETRY_QUEUE_CONFIG
+                # One Winograd D/M-plane scratch per engine, reused by every routed conv. Without it
+                # conv2d_auto bump-allocates 32 MiB per call from the engine's private tensor region
+                # (~70 calls -> 2+ GiB past a region of a few hundred MiB, into the other engines' maps).
+                a = ue.allocate_tensor_dram(ROUTER_SCRATCH_BYTES)
+                assert a + ROUTER_SCRATCH_BYTES <= ue._tensor_dram_base + 96 * 2**20, (
+                    "router scratch would reach the per-engine consts (t2w_memory_map const_off)")
+                self._router_scratch[id(ue)] = a
         self.T = frames
         self.verbose = verbose
         self.kk = _kokoro()
@@ -684,7 +693,8 @@ class BigVGANFpga:
         ue.conv2d_auto(weight=w, bias=conv.bias, ACT_DRAM_ADDR=x - pad * Cin_p * 2, OUTPUT_DRAM_ADDR=out,
                        c_in=conv.in_channels, in_h=1, in_w=rows, kernel_h=1, kernel_w=conv.weight.shape[2],
                        stride_s=1, pad=pad, pad_h=0, dilation=dil, oc_count=conv.out_channels,
-                       band=(0, 1, s0, s1), params_ue=self.cores.weights, cache=self._router_cache)
+                       band=(0, 1, s0, s1), params_ue=self.cores.weights, cache=self._router_cache,
+                       scratch_addr=self._router_scratch[id(ue)], scratch_bytes=ROUTER_SCRATCH_BYTES)
         return s0, s1
 
     def conv_transpose(self, ue, x, T_in, s0, s1, conv, Cin_p, Cout_p, stride, out):
