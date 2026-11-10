@@ -17,6 +17,12 @@ sys.path.insert(0, str(ROOT/'models/yolov5s'))
 import yolov5_precompiled as shared
 
 FORMAT = 'andromeda.unet.whole-graph-v2'
+ROUTER_SCRATCH = 32 << 20
+
+
+def router_wino(layer):
+    """--conv-router: 3x3 convs from 128 input channels up run conv2d_auto(strategy='wino')."""
+    return layer['codes'].shape[1] >= 128 and layer['codes'].shape[2:] == (3, 3)
 
 
 def graph(layers, height, width):
@@ -26,9 +32,17 @@ def graph(layers, height, width):
     ops = []
     def conv(name, source):
         shape = (layers[name]['codes'].shape[0], *shapes[source][1:])
+        wino = layers[name].get('wino', False)
+        # Router input needs a zero halo: walker convs and merges write it
+        # directly; maxpool / Winograd outputs get one row-copy 'pad' op.
+        if wino and ops and ops[-1]['output'] == source and (
+                ops[-1]['op'] == 'maxpool' or ops[-1].get('wino')):
+            ops.append(dict(name=source+'.pad', op='pad', inputs=[source], output=source+'.pad'))
+            shapes[source+'.pad'] = shapes[source]
+            source += '.pad'
         shapes[name] = tuple(shape)
         ops.append(dict(name=name, op='conv', inputs=[source], output=name,
-                        stride=1, pad=layers[name]['pad'], dilation=1))
+                        stride=1, pad=layers[name]['pad'], dilation=1, wino=wino))
         return name
     def double(prefix, source):
         return conv(prefix+'.3', conv(prefix+'.0', source))
@@ -55,7 +69,24 @@ def graph(layers, height, width):
     return shapes, ops
 
 
+def padded_tensors(ops):
+    return {op['inputs'][0] for op in ops if op.get('wino')}
+
+
+def _layout(shapes, padded, name):
+    c,h,w = shapes[name]
+    return shared._layout_for_conv((c,h+2,w+2) if name in padded else (c,h,w))
+
+
+def _interior(m):
+    """Halo map as a _PackedMap view whose width is the padded row pitch."""
+    pixel = m.physical_channels*2
+    return shared._PackedMap((m.channels,m.height-2,m.width),m.physical_channels,
+                             m.channel_map,m.address+(m.width+1)*pixel)
+
+
 def memory_plan(shapes, ops):
+    padded = padded_tensors(ops)
     layouts = {'input': shared._layout_for_conv(shapes['input'])}
     layouts['input'].address = shared.INPUT_BASE
     last = {name: i for i,op in enumerate(ops) for name in op['inputs']}
@@ -71,11 +102,11 @@ def memory_plan(shapes, ops):
     virtual = set(phase_merge)
     for i,op in enumerate(ops):
         name = op['output']
-        layout = shared._layout_for_conv(shapes[name])
+        layout = _layout(shapes,padded,name)
         if name in virtual:
             merge_name = phase_merge[name]
             if merge_name not in layouts:
-                merge = shared._layout_for_conv(shapes[merge_name])
+                merge = _layout(shapes,padded,merge_name)
                 merge.address = cursor
                 cursor += shared._align_up(merge.size_bytes, 128)
                 layouts[merge_name] = merge
@@ -111,7 +142,7 @@ def memory_plan(shapes, ops):
                 merged.append((address,length))
         free = merged
     scratch = shared._align_up(cursor,128)
-    if scratch + (512 << 10) > shared.TENSOR_LIMIT:
+    if scratch + (ROUTER_SCRATCH if padded else 512 << 10) > shared.TENSOR_LIMIT:
         raise RuntimeError('U-Net live tensor arena exceeds 512 MiB')
     if layouts['input'].size_bytes > shared.INPUT_LIMIT-shared.INPUT_BASE:
         raise RuntimeError('U-Net input exceeds input arena')
@@ -203,6 +234,17 @@ def emit_merge(engine, sources, dst):
     pixel = skip.physical_channels*2
     out_pixel = dst.physical_channels*2
     # Skip channels occupy the first half; transpose phases the second half.
+    if dst.width != skip.width:
+        row = skip.width*pixel
+        rows = max(1,udc.URAM_NEAR_FULL_SIZE//row)
+        for y0 in range(0,skip.height,rows):
+            n = min(rows,skip.height-y0)
+            engine.accelerator_memory_to_sram(skip.address+y0*row,0,0,memcpy_length_bytes=n*row)
+            for r in range(n):
+                shared._copy_contiguous_or_strided_write(engine,sram=r*row,
+                    destination=dst.address+(y0+r)*dst.width*out_pixel,
+                    total=row,chunk=pixel,jump=out_pixel)
+        return
     take_pixels = max(1,udc.URAM_NEAR_FULL_SIZE//pixel)
     for start in range(0,skip.height*skip.width,take_pixels):
         n = min(take_pixels,skip.height*skip.width-start)
@@ -211,7 +253,63 @@ def emit_merge(engine, sources, dst):
             destination=dst.address+start*out_pixel,total=n*pixel,chunk=pixel,jump=out_pixel)
 
 
-def compile_hardware(layers, height, width):
+def _zero_halo(engine, m, zero):
+    pixel = m.physical_channels*2
+    pitch = m.width*pixel
+    block = shared._ACT_TEMPLATE_BYTES
+    engine.accelerator_memory_to_sram(zero,0,0,memcpy_length_bytes=block)
+    edge = pitch+pixel          # top row + left of row 1; right of row h + bottom row
+    for address in (m.address, m.address+(m.height-1)*pitch-pixel):
+        for off in range(0,edge,block):
+            engine.sram_to_accelerator_memory(0,address+off,0,memcpy_length_bytes=min(block,edge-off))
+    per = block//(2*pixel)      # right of row r + left of row r+1 are adjacent
+    for r in range(1,m.height-2,per):
+        n = min(per,m.height-2-r)
+        shared._copy_contiguous_or_strided_write(engine,sram=0,
+            destination=m.address+(r+1)*pitch-pixel,total=n*2*pixel,chunk=2*pixel,jump=pitch)
+
+
+def emit_pad(engine, src, dst):
+    """Dense map -> interior of a halo map (row copies; halo zeroed separately)."""
+    row = src.width*src.physical_channels*2
+    rows = max(1,udc.URAM_NEAR_FULL_SIZE//row)
+    for y0 in range(0,src.height,rows):
+        n = min(rows,src.height-y0)
+        engine.accelerator_memory_to_sram(src.address+y0*row,0,0,memcpy_length_bytes=n*row)
+        shared._copy_contiguous_or_strided_write(engine,sram=0,
+            destination=dst.address+y0*dst.width*dst.physical_channels*2,
+            total=n*row,chunk=row,jump=dst.width*dst.physical_channels*2)
+
+
+class _ImageParams:
+    """params_ue for conv2d_auto: router weight uploads land in the deployment image."""
+    def __init__(self, image):
+        self.image = image
+
+    def allocate_params_dram(self, size, label=None, align_bytes=64):
+        address = self.image.align(align_bytes)
+        self.image.data.extend(bytes(size))
+        return address
+
+    def dma_write(self, _device, address, data, size):
+        self.image.write(address, bytes(data[:size]))
+        return size
+
+
+def _router_kwargs(layer, shapes, op, layouts, scratch, params, cache):
+    c,h,w = shapes[op['inputs'][0]]
+    return dict(strategy='wino',weight=layer['weight'],bias=layer['bias'],
+        ACT_DRAM_ADDR=layouts[op['inputs'][0]].address,OUTPUT_DRAM_ADDR=layouts[op['output']].address,
+        c_in=c,in_h=h,in_w=w,kernel_h=3,kernel_w=3,stride_s=1,pad=1,
+        oc_count=layer['weight'].shape[0],relu_enable=layer['relu'],
+        scratch_addr=scratch,scratch_bytes=ROUTER_SCRATCH,params_ue=params,cache=cache)
+
+
+def compile_hardware(layers, height, width, router=False):
+    if router:
+        for layer in layers.values():
+            if router_wino(layer):
+                layer['wino'] = True
     previous = udc.UE_AXI_DATA_WIDTH_BITS
     udc.UE_AXI_DATA_WIDTH_BITS = 256
     try:
@@ -228,16 +326,26 @@ def _compile(layers,height,width):
     neg = image.allocate(torch.full((shared._ACT_TEMPLATE_BYTES//2,),float('-inf'),dtype=torch.bfloat16))
     plans = {}
     phase_targets = {}
+    padded = padded_tensors(ops)
+    view = lambda name: _interior(layouts[name]) if name in padded else layouts[name]
+    storage = {}
     for op in ops:
         if op['op'] == 'merge':
             skip = layouts[op['inputs'][0]]
             for phase,source in enumerate(op['inputs'][1:]):
-                phase_targets[source] = (layouts[op['output']],phase,
+                storage[source] = op['output']
+                phase_targets[source] = (view(op['output']),phase,
                                          skip.physical_channels*2)
+    params,cache = _ImageParams(image),{}
     for op in ops:
         if op['op'] != 'conv':
             continue
         layer = layers[op['name']]
+        if op['wino']:
+            # Upload only (empty band); the emit pass below hits the cache.
+            shared._WholeGraphEngine(0).conv2d_auto(band=(0,0,0,0),
+                **_router_kwargs(layer,shapes,op,layouts,scratch,params,cache))
+            continue
         codes = layer['codes']
         oc,c,kh,kw = codes.shape
         chunks = (kh*kw*c+63)//64
@@ -248,22 +356,34 @@ def _compile(layers,height,width):
                       block_scales=-layer['scales'][:,None].expand(oc,blocks).contiguous(),bias=layer['bias'])
         # IF8 stores one [oc][tap] pattern; hardware replays it from bank Z.
         plans[op['name']] = shared._prepare_conv_plan(op,weight,layouts[op['inputs'][0]],
-            layouts[op['output']],image,allow_half_vector_output=True)
+            shared._layout_for_conv(shapes[op['output']]) if op['output'] in padded else layouts[op['output']],
+            image,allow_half_vector_output=True)
+        if op['output'] in padded:
+            plans[op['name']]['destination'] = view(op['output'])
     base = image.align(64)
     engine = shared._WholeGraphEngine(base)
     engine.start_capture()
     entries = []
+    zeroed = set()
     for op in ops:
         start = engine.capture_count
         sources = [layouts[name] for name in op['inputs']]
         dst = layouts[op['output']]
-        if op['op'] == 'conv':
+        target = storage.get(op['output'],op['output'])
+        if target in padded and target not in zeroed:
+            _zero_halo(engine,layouts[target],zero)
+            zeroed.add(target)
+        if op['op'] == 'conv' and op['wino']:
+            engine.conv2d_auto(**_router_kwargs(layers[op['name']],shapes,op,layouts,scratch,params,cache))
+        elif op['op'] == 'conv':
             emit_conv(engine,plans[op['name']],zero,scratch,
                       layers[op['name']]['relu'],phase_targets.get(op['name']))
         elif op['op'] == 'maxpool':
             shared._emit_maxpool(engine,op,sources[0],dst,neg)
+        elif op['op'] == 'pad':
+            emit_pad(engine,sources[0],view(op['output']))
         else:
-            emit_merge(engine,sources,dst)
+            emit_merge(engine,sources,view(op['output']))
         entries.append(dict(name=op['name'],start=start,stop=engine.capture_count))
     engine.generate_instruction_halt()
     engine.stop_capture()

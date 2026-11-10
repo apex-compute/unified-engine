@@ -162,11 +162,12 @@ class ACT_UnifiedEngine(UnifiedEngine):
     WORKER_TENSOR_OFF = 0x01000000
     WORKER_PROGRAM_OFF = 0x04000000
 
-    def __init__(self, script_dir: str = SCRIPT_DIR, num_engines: int = 1):
+    def __init__(self, script_dir: str = SCRIPT_DIR, num_engines: int = 1, conv_router: bool = False):
         super().__init__(params_dram_base=ACT_PARAMS_BASE,
                          tensor_dram_base=ACT_TENSOR_BASE,
                          program_dram_base=ACT_PROGRAM_BASE)
         self.NE = num_engines
+        self.conv_router = conv_router  # layer2-4 3x3/s1 convs via conv2d_auto(strategy="wino")
         self.SNE = num_engines          # engines in the current shard group (backbone: NE/2 per camera)
         self.EOFF = 0                   # global index of the group's first engine (per-engine scratch)
         self.sched = None
@@ -341,6 +342,10 @@ class ACT_UnifiedEngine(UnifiedEngine):
                 w1, b1 = self._fold_bn(sd, p + ".conv1", p + ".bn1")
                 w2, b2 = self._fold_bn(sd, p + ".conv2", p + ".bn2")
                 blk = {"conv1": self._alloc_conv3x3(w1, b1), "conv2": self._alloc_conv3x3(w2, b2)}
+                if self.conv_router and stride == 2:     # layer2-4: float weights for the router
+                    if i:
+                        blk["conv1_f"] = (w1, b1)
+                    blk["conv2_f"] = (w2, b2)
                 if i == 0 and stride == 2:
                     wd, bd = self._fold_bn(sd, p + ".downsample.0", p + ".downsample.1")
                     blk["down"] = self._alloc_param(wd[:, :, 0, 0])
@@ -378,6 +383,7 @@ class ACT_UnifiedEngine(UnifiedEngine):
             })
         self.DEC_NORM = self._alloc_ln(sd, "decoder.norm")
         self.ACTION_HEAD = self._alloc_linear(sd, "action_head", N_pad=64)
+        self._wino_cache = {}
 
     # ------------------------------------------------------------------
     # Activations
@@ -433,6 +439,8 @@ class ACT_UnifiedEngine(UnifiedEngine):
         self.D3 = self._alloc_tensor(CHP * D)                 # last decoder layer out (pre final norm)
         self.DEC_OUT = self._alloc_tensor(CHP * D)
         self.ACT_OUT = self._alloc_tensor(CHP * 64)
+        if self.conv_router:
+            self.WINO_ARENA = [self._alloc_tensor(self.WINO_ARENA_BYTES // _BPE) for _ in range(self.NE)]
 
     # ------------------------------------------------------------------
     # Bin cache
@@ -454,7 +462,7 @@ class ACT_UnifiedEngine(UnifiedEngine):
         return f"{st.st_size}:{int(st.st_mtime)}:{code}"
 
     def _prog_dir(self) -> str:
-        return os.path.join(self.bin_dir, f"programs_e{self.NE}")
+        return os.path.join(self.bin_dir, f"programs_e{self.NE}" + ("_wino" if self.conv_router else ""))
 
     def _dma_dump(self, addr: int, size: int, path: str) -> None:
         with open(path, "wb") as f:
@@ -835,6 +843,41 @@ class ACT_UnifiedEngine(UnifiedEngine):
                                                   out_buf + (go.idx(c0 + r, 0) * Cout + si * N_s) * _BPE, W * N_s,
                                                   stride_bytes_per_chunk=N_s * _BPE, stride_jump_bytes=Cout * _BPE)
 
+    WINO_ARENA_BYTES = 8 << 20      # --conv-router: per-engine dense output band + Winograd scratch
+
+    def conv3x3_wino(self, ue, ei, in_buf, out_buf, g: Grid, wb, residual: int | None = None) -> None:
+        """--conv-router: 3x3/s1 conv + ReLU (after the residual) via conv2d_auto(strategy="wino"). The padded
+        grid is the router's input map as is; the dense output band lands in this engine's arena, then one
+        contiguous read + one strided write per SRAM chunk moves it into out_buf's interior (+ residual)."""
+        t0, t1 = self._split((g.H + 1) // 2, ei)            # Winograd bands start on even rows
+        h0, h1 = 2 * t0, min(2 * t1, g.H)
+        if h1 <= h0:
+            return
+        C, W, row = g.C, g.W, g.W * g.C
+        arena = self.WINO_ARENA[self.EOFF + ei]
+        dense = ((h1 - h0) * row * _BPE + 127) // 128 * 128
+        self._flops += ue.conv2d_auto(
+            strategy="wino", weight=wb[0], bias=wb[1], ACT_DRAM_ADDR=in_buf, OUTPUT_DRAM_ADDR=arena - h0 * row * _BPE,
+            c_in=C, in_h=g.H, in_w=W, kernel_h=3, kernel_w=3, stride_s=1, pad=1, oc_count=C,
+            relu_enable=residual is None, band=(h0, h1, 0, W), params_ue=self, cache=self._wino_cache,
+            scratch_addr=arena + dense, scratch_bytes=self.WINO_ARENA_BYTES - dense) * (h1 - h0) // g.H
+        strided = dict(stride_bytes_per_chunk=row * _BPE, stride_jump_bytes=g.Wp * C * _BPE)
+        step = URAM_NEAR_FULL_ELEMENTS // row
+        for r0 in range(h0, h1, step):
+            n = min(step, h1 - r0) * row
+            src, dst = arena + (r0 - h0) * row * _BPE, out_buf + g.idx(r0, 0) * C * _BPE
+            if residual is None:
+                ue.accelerator_memory_to_sram(src, 0x00000, n)
+                ue.sram_to_accelerator_memory(0x00000, dst, n, **strided)
+            else:
+                ue.accelerator_memory_to_sram(residual + g.idx(r0, 0) * C * _BPE, 0x00000, n, **strided)
+                ue.accelerator_memory_to_sram(src, 0x80000, n)
+                ue.eltwise_add_core(0x00000, 0x80000, 0x80000, n)
+                ue.sram_to_accelerator_memory(0x80000, dst, n, **strided)
+        if residual is not None:                            # band span incl. its inner (zero) border cells
+            a = out_buf + g.idx(h0, 0) * C * _BPE
+            self.relu(ue, ((h1 - h0 - 1) * g.Wp + W) * C, a, a)
+
     def conv1x1_s2_rows(self, ue, ei, in_buf, out_buf, g: Grid, go: Grid, w, bias) -> None:
         """Downsample 1x1/s2 for this engine's output rows: strided gather -> dense scratch -> matmul."""
         h0, h1 = self._split(go.H, ei)
@@ -898,7 +941,9 @@ class ACT_UnifiedEngine(UnifiedEngine):
 
     def _block_stages(self, x_in, bufs, g_in: Grid, g_out: Grid, w, stride):
         """ResNet BasicBlock as two stages (callables of (ue, ei)): conv1 (+downsample) | conv2+res."""
-        if stride == 1:
+        if "conv1_f" in w:
+            s1 = lambda ue, ei: self.conv3x3_wino(ue, ei, x_in, bufs["T"], g_out, w["conv1_f"])
+        elif stride == 1:
             s1 = lambda ue, ei: self.conv3x3_rows(ue, ei, x_in, bufs["T"], g_in, g_out, w["conv1"], True)
         else:
             def s1(ue, ei):
@@ -906,6 +951,8 @@ class ACT_UnifiedEngine(UnifiedEngine):
                 self.conv1x1_s2_rows(ue, ei, x_in, bufs["R"], g_in, g_out, w["down"], w["bd"])
         res = x_in if stride == 1 else bufs["R"]
         s2 = lambda ue, ei: self.conv3x3_rows(ue, ei, bufs["T"], bufs["out"], g_out, g_out, w["conv2"], True, residual=res)
+        if "conv2_f" in w:
+            s2 = lambda ue, ei: self.conv3x3_wino(ue, ei, bufs["T"], bufs["out"], g_out, w["conv2_f"], residual=res)
         return [s1, s2], bufs["out"]
 
     def backbone_stages(self, cam: int) -> list:
@@ -1257,6 +1304,8 @@ def main():
     ap.add_argument("--engines", type=int, default=2, help="number of engines to shard across (pass 8 for the full box)")
     ap.add_argument("--profile", action="store_true", help="time stem / backbone / encoder prefixes")
     ap.add_argument("--debug", action="store_true", help="per-stage SNRs vs the CPU reference + NaN localizer")
+    ap.add_argument("--conv-router", action="store_true",
+                    help="layer2-4 3x3/s1 convs via conv2d_auto(strategy='wino') (own programs_e<N>_wino/ cache)")
     args = ap.parse_args()
 
     bin_dir = os.path.join(SCRIPT_DIR, ACT_UnifiedEngine.BIN_SUBDIR)
@@ -1295,7 +1344,7 @@ def main():
     _original_print(user_dma_core.hardware_info_summary())
 
     t0 = time.perf_counter()
-    ue = ACT_UnifiedEngine(num_engines=args.engines)
+    ue = ACT_UnifiedEngine(num_engines=args.engines, conv_router=args.conv_router)
     ue.software_reset()
     if ue.sched is not None:
         ue.sched.preclear_flags()

@@ -14,10 +14,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', type=Path)
     parser.add_argument('--download', action='store_true')
-    parser.add_argument('--output', type=Path, default=HERE/'unet_bin/unet-andromeda.bin')
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--conv-router', action='store_true',
+                        help="run 3x3 convs with >=128 input channels through conv2d_auto(strategy='wino') "
+                             '(bf16 weights); default bin unet-andromeda-router.bin')
     parser.add_argument('--force', action='store_true')
     parser.add_argument('--resolution', default='256x256')
     args = parser.parse_args()
+    args.output = args.output or HERE/('unet_bin/unet-andromeda-router.bin' if args.conv_router
+                                       else 'unet_bin/unet-andromeda.bin')
     try:
         width,height = map(int,args.resolution.lower().split('x'))
         if min(width,height) < 16 or width%16 or height%16:
@@ -41,7 +46,7 @@ def main():
         raise ValueError(f'official checkpoint SHA256 mismatch: {digest}')
     state = torch.load(checkpoint, map_location='cpu', weights_only=True)
     layers = build_layers(state)
-    hardware = compile_hardware(layers,height,width)
+    hardware = compile_hardware(layers,height,width,router=args.conv_router)
     payload = dict(format=FORMAT, precision='IF8-INT/BF16', checkpoint_sha256=digest,
                    layers=layers, mask_values=state.get('mask_values',[0,1]),
                    hardware=hardware, full_graph=True)

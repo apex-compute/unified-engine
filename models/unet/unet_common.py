@@ -121,6 +121,8 @@ class Backend:
         else:
             x = x.to(torch.bfloat16)
             weight = layer['codes'].float() * layer['scales'].float()[:,None,None,None]
+            if layer.get('wino'):   # --conv-router layers run the folded float weights in bf16
+                weight = layer['weight'].to(torch.bfloat16).float()
             bias = layer['bias'].to(torch.bfloat16).float()
         if self.kind == 'hardware':
             ue = self.engine
