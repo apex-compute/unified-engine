@@ -249,7 +249,7 @@ class Alpamayo2EdgeRef:
         h = F.relu(F.linear(h, w[p + "mlp.fc1.weight"])).square()
         return x + F.linear(h, w[p + "mlp.fc2.weight"]), k, v
 
-    def lm_forward(self, embeds, pos3, cache, stages=None):
+    def lm_forward(self, embeds, pos3, cache, stages=None, layer_outs=None):
         """Causal pass over new tokens (L, 2048) at pos3 (3, L); appends their KV. Returns final-norm hidden."""
         cos, sin = self.rope_cos_sin(pos3)
         L, P = embeds.shape[0], cache.n
@@ -260,6 +260,8 @@ class Alpamayo2EdgeRef:
             cache.put(layer, k, v)
             if stages is not None and layer in (0, self.n_lm - 1):
                 stages[f"prefill_layer{layer}"] = x
+            if layer_outs is not None:
+                layer_outs.append(x)
         cache.n += L
         return rms_norm(x, self.w[LM + "norm.weight"], self.rms_eps)
 

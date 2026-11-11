@@ -131,16 +131,16 @@
     "convention": "offsets from DRAM_START_ADDR 0x80000000; usable 0x0..0x100000000",
     "selected": "a2e_provisional",
     "params_dram_base": "0x00000000",
-    "tensor_dram_base": "0x98000000",
+    "tensor_dram_base": "0x92000000",
     "program_dram_base": "0xD0000000",
     "budget_mb": {
-      "lm_q4": 793,
-      "lm_head_q4": 156,
       "vision_bf16": 822,
       "projector_bf16": 153,
+      "lm_if4": 750,
+      "lm_head_if4": 147,
       "expert_bf16": 396,
-      "params_total": 2320,
-      "tensor_region": 896,
+      "params_total": 2270,
+      "tensor_region": 992,
       "program_region": 768
     }
   },
@@ -166,5 +166,16 @@
     "expert attends non-causally to [LM KV cache ; 64 self]; kv_len 3274+64 padded to 64-multiple with mask",
     "expert Fourier features need sin/cos of the current noisy action each Euler step: no sin core -> host round trip per step (64x2 values) or CORDIC",
     "bf16 everything = 4.7GB: LM must be q4/IF4; embedding table stays on host"
-  ]
+  ],
+  "action_expert": {
+    "hidden_size": 512,
+    "num_layers": 28,
+    "q_dim": 2048,
+    "kv_dim": 1024,
+    "intermediate_size": 3840,
+    "num_action_tokens": 64,
+    "action_dim": 2,
+    "flow_steps": 10,
+    "fourier_feats": 60
+  }
 }
