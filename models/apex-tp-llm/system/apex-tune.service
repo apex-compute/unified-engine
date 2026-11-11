@@ -1,0 +1,11 @@
+[Unit]
+Description=APEX host tuning for card latency: performance governor, no deep C-states (C3/C6/C7)
+Before=xdma.service ollapex.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for c in /sys/devices/system/cpu/cpu[0-9]*; do echo performance > $c/cpufreq/scaling_governor; for s in $c/cpuidle/state[3-9]; do [ -e $s/disable ] && echo 1 > $s/disable; done; done'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

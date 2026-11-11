@@ -1,0 +1,52 @@
+diff --git a/src/aptop/aptop.tcss b/src/aptop/aptop.tcss
+index 54c37fb..c45dfef 100644
+--- a/src/aptop/aptop.tcss
++++ b/src/aptop/aptop.tcss
+@@ -140,6 +140,15 @@ Sparkline {
+     grid-columns: 1fr 1fr;
+ }
+ 
++/* 3+ cards: columns/rows are set from the card count in AptopApp.on_mount */
++#cards-grid.multi-card {
++    grid-gutter: 0 1;
++}
++
++#dashboard {
++    overflow-y: auto;
++}
++
+ .apex-card {
+     min-height: 17;
+ }
+diff --git a/src/aptop/tui.py b/src/aptop/tui.py
+index 7dfa4e1..1cc3eb3 100644
+--- a/src/aptop/tui.py
++++ b/src/aptop/tui.py
+@@ -406,7 +406,8 @@ class AptopApp(App[None]):
+         yield TopBar(id="topbar")
+         with Grid(id="dashboard"):
+             yield HostPanel(id="host-panel", classes="panel")
+-            card_class = "one-card" if len(self.devices) == 1 else "two-card"
++            n = len(self.devices)
++            card_class = "one-card" if n == 1 else "two-card" if n == 2 else "multi-card"
+             with Grid(id="cards-grid", classes=card_class):
+                 if self.devices:
+                     for index, device in enumerate(self.devices):
+@@ -417,6 +418,17 @@ class AptopApp(App[None]):
+         yield Footer(compact=True)
+ 
+     def on_mount(self) -> None:
++        n = len(self.devices)
++        if n > 2:
++            # any number of cards: up to 6 per row, extra rows scroll with the dashboard
++            cols = min(n, 6)
++            rows = -(-n // cols)
++            grid = self.query_one("#cards-grid", Grid)
++            grid.styles.grid_size_columns = cols
++            grid.styles.grid_size_rows = rows
++            if rows > 1:
++                grid.styles.grid_rows = "23"
++                grid.styles.height = rows * 23
+         self._render_snapshot()
+         self.poll_timer = self.set_interval(self.interval, self.refresh_snapshot)
+ 
