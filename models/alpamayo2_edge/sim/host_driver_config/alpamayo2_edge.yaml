@@ -1,0 +1,38 @@
+# Standalone driver process on the host (the route the accelerator backend needs):
+#   A2E_BACKEND=host uv run --project src/driver python -m alpasim_driver.main \
+#       --config-path=/home/rohit/unified-engine/models/alpamayo2_edge/sim/host_driver_config --config-name=alpamayo2_edge
+# Key layout copied from AlpaSim's src/driver/configs/manual.yaml (main @ affc2eab).  # UNVERIFIED: not run
+
+log_level: INFO
+
+model:
+  model_type: alpamayo2_edge
+  checkpoint_path: "nvidia/Alpamayo2-Edge"   # not a directory -> HF cache
+  device: "cuda"
+  image_decode_device: cpu
+  num_trajectory_samples: 1
+
+host: "0.0.0.0"
+port: 6789
+
+inference:
+  use_cameras:
+    - camera_cross_left_120fov
+    - camera_front_wide_120fov
+    - camera_cross_right_120fov
+    - camera_rear_left_70fov
+    - camera_rear_right_70fov
+    - camera_front_tele_30fov
+  max_batch_size: 1
+  subsample_factor: 1
+  context_length: 21
+
+route:
+  use_waypoint_commands: false
+
+output_dir: "."
+
+trajectory_optimizer:
+  enabled: false
+
+plot_debug_images: false

@@ -131,7 +131,7 @@
     "convention": "offsets from DRAM_START_ADDR 0x80000000; usable 0x0..0x100000000",
     "selected": "a2e_provisional",
     "params_dram_base": "0x00000000",
-    "tensor_dram_base": "0x92000000",
+    "tensor_dram_base": "0x8A000000",
     "program_dram_base": "0xD0000000",
     "budget_mb": {
       "vision_bf16": 822,

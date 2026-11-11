@@ -164,6 +164,7 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         # matmul FLOPs (2*M*K*N, attention's two matmuls included) each program EXECUTES, all engines
         self._flops_acc, self.flops, self.done_flops = 0, {}, {}
         self._attn_parts = ("store", "vt", "attn")      # --profile narrows this to time one part
+        self._vattn_parts = ("vt", "attn")              # same, vision attention (--profile-vision)
 
     # ---------------------------------------------------------------- plumbing
 
@@ -428,16 +429,18 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         self._flops_acc += 2 * n * VDP * N + 2 * n * N * VD
         score = v_t + VDP * N * BPE
         scaled_q = score + N * N * BPE
-        ue.bf16_transpose_core(M=N, N=VDP, INPUT_DRAM_ADDR=v, OUTPUT_DRAM_ADDR=v_t,
-                               IDENTITY_DRAM_ADDR=self.buf["IDENTITY"], gpr_M_reg=seq_reg)
-        ue.eltwise_core_dram(M=n, N=VDP, dram_a=q, dram_b=None, dram_out=scaled_q,
-                             mode=UE_MODE.MUL_BROADCAST, scalar=1.0 / math.sqrt(VDP), gpr_M_reg=batch_reg)
-        ue.matmat_mul_core(M=n, K=VDP, N=N, A_DRAM_ADDR=scaled_q, B_DRAM_ADDR=k, OUTPUT_DRAM_ADDR=score,
-                           softmax_enable=True, C_DRAM_ADDR=bias, bias_mode="full_matrix",
-                           gpr_M_reg=batch_reg, gpr_K_reg=qk_reg, gpr_N_reg=seq_reg)
-        ue.matmat_mul_core(M=n, K=N, N=VD, A_DRAM_ADDR=score, B_DRAM_ADDR=v_t, OUTPUT_DRAM_ADDR=out,
-                           gpr_M_reg=batch_reg, gpr_K_reg=seq_reg, gpr_N_reg=v_reg,
-                           gpr_out_row_stride_reg=stride_reg)
+        if "vt" in self._vattn_parts:
+            ue.bf16_transpose_core(M=N, N=VDP, INPUT_DRAM_ADDR=v, OUTPUT_DRAM_ADDR=v_t,
+                                   IDENTITY_DRAM_ADDR=self.buf["IDENTITY"], gpr_M_reg=seq_reg)
+        if "attn" in self._vattn_parts:
+            ue.eltwise_core_dram(M=n, N=VDP, dram_a=q, dram_b=None, dram_out=scaled_q,
+                                 mode=UE_MODE.MUL_BROADCAST, scalar=1.0 / math.sqrt(VDP), gpr_M_reg=batch_reg)
+            ue.matmat_mul_core(M=n, K=VDP, N=N, A_DRAM_ADDR=scaled_q, B_DRAM_ADDR=k, OUTPUT_DRAM_ADDR=score,
+                               softmax_enable=True, C_DRAM_ADDR=bias, bias_mode="full_matrix",
+                               gpr_M_reg=batch_reg, gpr_K_reg=qk_reg, gpr_N_reg=seq_reg)
+            ue.matmat_mul_core(M=n, K=N, N=VD, A_DRAM_ADDR=score, B_DRAM_ADDR=v_t, OUTPUT_DRAM_ADDR=out,
+                               gpr_M_reg=batch_reg, gpr_K_reg=seq_reg, gpr_N_reg=v_reg,
+                               gpr_out_row_stride_reg=stride_reg)
         for _ in regs:
             ue.release_isa_reg()
 
@@ -511,12 +514,48 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
             E.ue.sram_to_accelerator_memory(sram_address=0x00000,
                                             accelerator_dram_address=dst + r0 * VH * BPE, element_size=take * VH)
 
-    def _emit_image(self, E, i):
+    @staticmethod
+    def _vkind(label):
+        tail = label.split(".")[-1]
+        if "norm" in tail:
+            return "norm"
+        if tail.startswith("perm"):
+            return "perm"
+        if tail.startswith("attn"):
+            return "attn"
+        return "elt" if tail == "out" else "mm"
+
+    def _emit_image(self, E, i, only=None):
+        """only (profiling): emit just the ops of one kind -- "io" | "norm" | "mm" | "perm" | "attn" | "elt"."""
         im = self.images[i]
-        self._emit_pre(E, im)
-        for _, op, _, _ in self._encoder_steps(E, im["key"], im["n"], im["N"]):
-            op()
-        self._emit_post(E, im)
+        if only in (None, "io"):
+            self._emit_pre(E, im)
+        else:
+            self._prime(E, im["n"])
+        for label, op, _, _ in self._encoder_steps(E, im["key"], im["n"], im["N"]):
+            if only is None or self._vkind(label) == only:
+                op()
+        if only in (None, "io"):
+            self._emit_post(E, im)
+
+    def profile_vision(self):
+        """Where the vision stage spends its time: re-run it with only one kind of op emitted (same
+        images per engine). Timing only -- it leaves garbage behind, so call it after the real run."""
+        full = self.hw_us["vision"]
+        variants = [("patch embed + copy out", "io", None), ("layer norms (norm2 adds the residual)", "norm", None),
+                    ("matmuls (q/k/v/o/fc1/fc2)", "mm", None), ("q/k/v head permutes", "perm", None),
+                    ("attn: V^T transposes", "attn", ("vt",)), ("attn: scale + scores + P.V", "attn", ("attn",)),
+                    ("final residual add", "elt", None)]
+        print(f"\nprofile: vision = {full / 1e6:.1f} s on {self.NE} engine{'s' if self.NE > 1 else ''} "
+              f"(each line re-runs the stage with one kind of op)")
+        for label, only, parts in variants:
+            self._vattn_parts = parts or ("vt", "attn")
+            name = f"prof_vision_{label}"
+            self._compile(name, lambda only=only: self._round(
+                lambda E: [self._emit_image(E, i, only) for i in self.assign[E.e]]), parallel=True)
+            us = self._exec(name, timeout=3600.0)
+            print(f"  {label:38s} {us / 1e6:6.2f} s  ({100 * us / (full or 1):4.0f}% of the stage)")
+        self._vattn_parts = ("vt", "attn")
 
     # ---------------------------------------------------------------- vision: compile / run
 
@@ -718,6 +757,11 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         # Zeroed: slots no stage ever writes are masked, but still flow through V^T and P.V.
         kv = LML * KVH * CAP * HD
         b["KC"], b["VC"] = self._alloc(kv, zero=True), self._alloc(kv, zero=True)
+        # Persistent V^T [layer][kv_head][128][KV_CAP] for decode / expert: built once after prefill,
+        # then only the 64-slot block a step wrote is refreshed (a full re-transpose was 62% of a token).
+        b["VT"] = self._alloc(kv)
+        b["EYE"] = self._alloc(HD * HD)
+        self.dma_to_accelerator_memory(b["EYE"], torch.eye(HD, dtype=torch.bfloat16).flatten())
         mask = torch.full((S, S), MASK_VALUE).triu(1).to(torch.bfloat16)      # causal
         self.dma_to_accelerator_memory(b["MASK_PRE"], mask.flatten())
         line = f"LM tensors: S={S} KV_CAP={CAP}, shared tensor arena {(self.get_tensor_dram_addr() - self.tensor_base) / 2**20:.0f} MB"
@@ -727,6 +771,22 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
 
     def _kv(self, name, layer, kvh, slot=0):
         return self.buf[name] + ((layer * KVH + kvh) * self.KV_CAP + slot) * HD * BPE
+
+    def _vt(self, layer, kvh):
+        return self.buf["VT"] + (layer * KVH + kvh) * HD * self.KV_CAP * BPE
+
+    def _vt_refresh(self, E, layer, kvh, slot):
+        """V^T columns of the 64-slot block holding `slot` <- that block of V: I(128) . V_blk^T
+        written as 128 rows of 64 at the V^T row pitch (the output-stride path column shards use)."""
+        ue, blk = E.ue, slot // UE_VECTOR_SIZE * UE_VECTOR_SIZE
+        regs = [ue.alloc_isa_reg() for _ in range(4)]
+        for r, val in zip(regs, (HD, HD, UE_VECTOR_SIZE, self.KV_CAP)):
+            ue.generate_instruction_add_set(r, val)
+        ue.matmat_mul_core(M=HD, K=HD, N=UE_VECTOR_SIZE, A_DRAM_ADDR=self.buf["EYE"],
+                           B_DRAM_ADDR=self._kv("VC", layer, kvh, blk), OUTPUT_DRAM_ADDR=self._vt(layer, kvh) + blk * BPE,
+                           gpr_M_reg=regs[0], gpr_K_reg=regs[1], gpr_N_reg=regs[2], gpr_out_row_stride_reg=regs[3])
+        for _ in regs:
+            ue.release_isa_reg()
 
     def lm_write_rope(self, name, cos, sin):
         """cos / sin (rows, 128) from the reference -> engine rows [cos(128) | -sin(64) | sin(64)]."""
@@ -795,9 +855,9 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
             ue.sram_to_accelerator_memory(sram_address=0x00000, accelerator_dram_address=dst + r0 * row_bytes,
                                           element_size=take * HD)
 
-    def _lm_attention(self, E, M, kv_len, q, k, v, mask, out, transpose, parts=("vt", "attn")):
+    def _lm_attention(self, E, M, kv_len, q, k, v_t, mask, out, parts=("attn",)):
         """One query head: softmax(Q K^T / sqrt(128) + mask) V over kv_len slots, written into its
-        128 columns of the token-major [M, 2048] result. `transpose`: (re)build V^T for this KV head."""
+        128 columns of the token-major [M, 2048] result. v_t: this KV head's V^T [128, kv_len]."""
         ue, p, regs = E.ue, self.pbuf[E.e], []
 
         def reg(val):
@@ -809,16 +869,13 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         batch_reg, seq_reg, hd_reg, stride_reg = reg(M), reg(kv_len), reg(HD), reg(LQW)
         if "attn" in parts:
             self._flops_acc += 4 * M * HD * kv_len
-        if transpose and "vt" in parts:
-            ue.bf16_transpose_core(M=kv_len, N=HD, INPUT_DRAM_ADDR=v, OUTPUT_DRAM_ADDR=p["V_T"],
-                                   IDENTITY_DRAM_ADDR=self.buf["IDENTITY"], gpr_M_reg=seq_reg)
         if "attn" in parts:
             ue.eltwise_core_dram(M=M, N=HD, dram_a=q, dram_b=None, dram_out=p["SQ"], mode=UE_MODE.MUL_BROADCAST,
                                  scalar=1.0 / math.sqrt(HD), gpr_M_reg=batch_reg)
             ue.matmat_mul_core(M=M, K=HD, N=kv_len, A_DRAM_ADDR=p["SQ"], B_DRAM_ADDR=k, OUTPUT_DRAM_ADDR=p["SCORE"],
                                softmax_enable=True, C_DRAM_ADDR=mask, bias_mode="full_matrix",
                                gpr_M_reg=batch_reg, gpr_K_reg=hd_reg, gpr_N_reg=seq_reg)
-            ue.matmat_mul_core(M=M, K=kv_len, N=HD, A_DRAM_ADDR=p["SCORE"], B_DRAM_ADDR=p["V_T"], OUTPUT_DRAM_ADDR=out,
+            ue.matmat_mul_core(M=M, K=kv_len, N=HD, A_DRAM_ADDR=p["SCORE"], B_DRAM_ADDR=v_t, OUTPUT_DRAM_ADDR=out,
                                gpr_M_reg=batch_reg, gpr_K_reg=seq_reg, gpr_N_reg=hd_reg,
                                gpr_out_row_stride_reg=stride_reg)
         for _ in regs:
@@ -873,13 +930,23 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
                 if "store" in parts:
                     self._gather(ue, b["LK"], kvh, KVH, M, self._kv("KC", layer, kvh, slot0))
                     self._gather(ue, b["LV"], kvh, KVH, M, self._kv("VC", layer, kvh, slot0))
+                persistent = kv_len == self.KV_CAP          # decode / expert; prefill transposes its S slots
+                v_t = self._vt(layer, kvh) if persistent else self.pbuf[E.e]["V_T"]
+                if "vt" in parts and persistent:
+                    self._vt_refresh(E, layer, kvh, slot0)
+                elif "vt" in parts:
+                    r = ue.alloc_isa_reg()
+                    ue.generate_instruction_add_set(r, kv_len)
+                    ue.bf16_transpose_core(M=kv_len, N=HD, INPUT_DRAM_ADDR=self._kv("VC", layer, kvh), OUTPUT_DRAM_ADDR=v_t,
+                                           IDENTITY_DRAM_ADDR=b["IDENTITY"], gpr_M_reg=r)
+                    ue.release_isa_reg()
                 for g in range(group):
                     h = kvh * group + g
                     q = b["Q_HM"] + h * M * HD * BPE
                     if "store" in parts:
                         self._gather(ue, b["LQ"], h, QH, M, q)
-                    self._lm_attention(E, M, kv_len, q, self._kv("KC", layer, kvh), self._kv("VC", layer, kvh),
-                                       mask, b["ATT"] + h * HD * BPE, transpose=g == 0, parts=parts)
+                    self._lm_attention(E, M, kv_len, q, self._kv("KC", layer, kvh), v_t,
+                                       mask, b["ATT"] + h * HD * BPE, parts=parts)
 
         norm("norm1", x_in, b["LNORM"], wl["ln1"])
         mm("q", H, LQW, b["LNORM"], wl["q"], b["LQ"])
@@ -915,8 +982,9 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         """Schedule an op table onto the engines.
         mode "rows": every run of row / mm ops is ONE row-sharded round (an engine's rows never
                      leave its lane, so a layer's tail and the next layer's head share a round).
-        mode "cols": row ops run on the primary alone between rounds; every run of mm ops is one
-                     column-sharded round.
+        mode "cols": every run of mm ops is one column-sharded round; row ops between them are
+                     row-sharded (M / engines rows each) when M divides, else run on the primary.
+                     "solo" ops (whole-buffer emitters) always run on the primary.
         Attention is always its own round, split by KV head.
         only (profiling): emit the full round structure but only the ops of that kind --
         "row" | "mm" | "heads" | "none" (rendezvous alone)."""
@@ -934,7 +1002,7 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
             elif mode == "rows":
                 while j < len(ops) and ops[j][1][0] != "heads":
                     j += 1
-                shards = self._split(M)
+                shards = self._split(M, 1)      # balanced; a row count need not be a 64-multiple
 
                 def body(E, run=ops[i:j], shards=shards):
                     r0, n = shards[E.e]
@@ -945,8 +1013,18 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
                         if keep(k[0]):
                             fn(E, r0, n, 0, k[1] if k[0] == "mm" else None)
                 self._round(body)
-            elif kind == "row":
-                while j < len(ops) and ops[j][1][0] == "row":
+            elif kind == "row" and self.NE > 1 and M > 1 and M % self.NE == 0:
+                while j < len(ops) and ops[j][1][0] == "row":       # expert: M / NE rows per engine
+                    j += 1
+
+                def body(E, run=ops[i:j], n=M // self.NE):
+                    self._prime_rows(E, n)
+                    for _, _, fn, _, _ in run:
+                        if keep("row"):
+                            fn(E, E.e * n, n, None, None)
+                self._round(body)
+            elif kind in ("row", "solo"):                           # primary alone, every row
+                while j < len(ops) and ops[j][1][0] == kind:
                     j += 1
                 E0 = self.eng[0]
                 self._prime_rows(E0, M)
@@ -990,8 +1068,25 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
                                                     element_size=take * LH)
         self._compile("scatter_img", scatter)
 
-        ops, self.prefill_out = self._stack_ops("P", S, LH, self.lw["layers"], b["ROPE_PRE"], 0, S, b["MASK_PRE"])
-        self._compile("prefill", lambda ops=ops: self._emit_ops(ops, S, "rows"), parallel=True)
+        # Real prompt rows only: the pad rows [P, S) stay in the KV length as masked keys (slots the
+        # decode tokens later fill), but nothing is computed for them.
+        P = self.P
+        ops, self.prefill_out = self._stack_ops("P", P, LH, self.lw["layers"], b["ROPE_PRE"], 0, S, b["MASK_PRE"])
+        self._compile("prefill", lambda ops=ops: self._emit_ops(ops, P, "rows"), parallel=True)
+
+        def build_vt():       # every KV head's whole V -> the persistent V^T, once per inference
+            def body(E):
+                self._prime_rows(E, 1)
+                r = E.ue.alloc_isa_reg()
+                E.ue.generate_instruction_add_set(r, CAP)
+                for layer in range(LML):
+                    for kvh in range(KVH):
+                        if kvh % self.NE == E.e:
+                            E.ue.bf16_transpose_core(M=CAP, N=HD, INPUT_DRAM_ADDR=self._kv("VC", layer, kvh),
+                                                     OUTPUT_DRAM_ADDR=self._vt(layer, kvh),
+                                                     IDENTITY_DRAM_ADDR=b["IDENTITY"], gpr_M_reg=r)
+            self._round(body)
+        self._compile("build_vt", build_vt, parallel=True)
 
         ops, x = self._stack_ops("D", 1, LH, self.lw["layers"], b["ROPE_CUR"], self.CUR, CAP, b["MASK_DEC"])
         ops.append(("D.norm", ("row",), lambda E, r0, n, c0, cn, x=x: E.ue.rms_norm_core_dram(
@@ -1002,21 +1097,27 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         self._compile("decode", lambda ops=ops: self._emit_ops(ops, 1, "cols"), parallel=True)
         self.stage_ops = {"decode": (ops, 1)}
 
-        for slot in range(self.P, self.P + 1 + max_new):      # CUR slot -> the token's real slot (primary)
+        for slot in range(self.P, self.P + 1 + max_new):      # CUR slot -> the token's real slot, by KV head
             def append(slot=slot):
-                for layer in range(LML):
-                    for kvh in range(KVH):
-                        for name in ("KC", "VC"):
-                            self.accelerator_memory_to_sram(accelerator_dram_address=self._kv(name, layer, kvh, self.CUR),
-                                                            sram_address=0x00000, element_size=HD)
-                            self.sram_to_accelerator_memory(sram_address=0x00000,
-                                                            accelerator_dram_address=self._kv(name, layer, kvh, slot),
-                                                            element_size=HD)
-            self._compile(f"append_{slot}", append)
+                def body(E):
+                    self._prime_rows(E, 1)
+                    for layer in range(LML):
+                        for kvh in range(KVH):
+                            if kvh % self.NE != E.e:
+                                continue
+                            for name in ("KC", "VC"):
+                                E.ue.accelerator_memory_to_sram(accelerator_dram_address=self._kv(name, layer, kvh, self.CUR),
+                                                                sram_address=0x00000, element_size=HD)
+                                E.ue.sram_to_accelerator_memory(sram_address=0x00000,
+                                                                accelerator_dram_address=self._kv(name, layer, kvh, slot),
+                                                                element_size=HD)
+                            self._vt_refresh(E, layer, kvh, slot)
+                self._round(body)
+            self._compile(f"append_{slot}", append, parallel=True)
 
         # action expert: action_in_proj trunk (primary) -> 28 expert layers -> norm -> velocity head
         e, n = self.ew, NWAY
-        solo = lambda label, fn, addr, shape: (label, ("row",), lambda E, r0, nn, c0, cn: fn(E), addr, shape)
+        solo = lambda label, fn, addr, shape: (label, ("solo",), lambda E, r0, nn, c0, cn: fn(E), addr, shape)
         rms = lambda E, src, dst, gamma: E.ue.rms_norm_core_dram(M=n, N=EH, A_DRAM_ADDR=src, OUTPUT_DRAM_ADDR=dst,
                                                                 GAMMA_DRAM_ADDR=gamma, gpr_M_reg=E.r_M)
         V64 = UE_VECTOR_SIZE
@@ -1044,8 +1145,8 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         with only one kind of op emitted (same rounds, same shards). Timing only -- the data
         these partial programs leave behind is meaningless, so call this after the real run."""
         ops, M = self.stage_ops[stage]
-        variants = [("rendezvous only", "none", None), ("row ops on the primary", "row", None), ("matmuls", "mm", None),
-                    ("attn: K/V/Q store + gather", "heads", ("store",)), ("attn: V^T transposes", "heads", ("vt",)),
+        variants = [("rendezvous only", "none", None), ("row ops", "row", None), ("matmuls", "mm", None),
+                    ("attn: K/V/Q store + gather", "heads", ("store",)), ("attn: V^T block update", "heads", ("vt",)),
                     ("attn: scale + scores + P.V", "heads", ("attn",))]
         full = self._exec(stage)
         print(f"\nprofile: one {stage} step = {full / 1e3:.1f} ms on {self.NE} engine{'s' if self.NE > 1 else ''} "
@@ -1160,6 +1261,8 @@ def main():
                          "compares like for like with the golden (leaves only the 4-bit / GELU effects)")
     ap.add_argument("--no-profile", dest="profile", action="store_false",
                     help="skip the per-op-kind timing of one decode step and one denoise step that follows the run")
+    ap.add_argument("--profile-vision", action="store_true",
+                    help="after the run, time the vision stage by op kind (recompiles it 7 times; adds a few minutes)")
     ap.add_argument("--max-new", type=int, default=CFG["model"]["max_new_tokens"])
     ap.add_argument("--steps", type=int, default=CFG["action_expert"]["flow_steps"])
     ap.add_argument("--seed", type=int, default=0)
@@ -1314,13 +1417,13 @@ def main():
     report("prompt embeddings", embeds[:P].float().cpu(), emb_dev)
 
     if args.staged == "prefill":
-        ops, _ = ue._stack_ops("P", S, LH, ue.lw["layers"], ue.buf["ROPE_PRE"], 0, S, ue.buf["MASK_PRE"])
+        ops, _ = ue._stack_ops("P", P, LH, ue.lw["layers"], ue.buf["ROPE_PRE"], 0, S, ue.buf["MASK_PRE"])
         ref_for = lambda label: ref_layers[int(label[1:].split(".")[0])].float().cpu() if label.endswith(".out") else None
-        if ue._staged(ue._ops_as_steps(ops, S), lambda: ue._prime_rows(ue.eng[0], S), P, S, ref_for, args.stop_after, timeout=600.0):
+        if ue._staged(ue._ops_as_steps(ops, P), lambda: ue._prime_rows(ue.eng[0], P), P, S, ref_for, args.stop_after, timeout=600.0):
             print("staged prefill complete")
         return
 
-    hw_ms["prefill"] = ue._exec("prefill", timeout=3600.0) / 1e3
+    hw_ms["prefill"] = (ue._exec("prefill", timeout=3600.0) + ue._exec("build_vt")) / 1e3
     x_dev = ue.dma_from_accelerator_memory(ue.prefill_out, (S, LH)).float()[:P]
     s, c = report("prefill last layer", ref_layers[-1].float().cpu(), x_dev, f"hw {hw_ms['prefill'] / 1e3:.1f} s")
     ok &= not bool(torch.isnan(x_dev).any())
@@ -1440,6 +1543,8 @@ def main():
     if args.profile:
         ue.profile("decode")
         ue.profile("expert")
+    if args.profile_vision and "vision" in ue.hw_us:
+        ue.profile_vision()
     print("PASS" if ok else f"FAIL (gates: vision/projector snr >= {args.min_snr} dB, no NaN, trajectory max err <= {args.max_traj_err} m)")
     sys.exit(0 if ok else 1)
 
