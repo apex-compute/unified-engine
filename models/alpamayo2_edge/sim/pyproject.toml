@@ -1,0 +1,29 @@
+# Registers Alpamayo 2 Edge with AlpaSim (docs/PLUGIN_SYSTEM.md, main @ affc2eab):
+#   alpasim.models  -> model_type: alpamayo2_edge
+#   alpasim.configs -> wizard finds driver=alpamayo2_edge in alpasim_edge_configs/driver/
+# Install editable (edge_policy.py imports ../alpamayo2_edge_cpu_reference.py by path):
+#   uv pip install -e /home/rohit/unified-engine/models/alpamayo2_edge/sim
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpasim-alpamayo2-edge"
+version = "0.0.1"
+description = "AlpaSim driver plugin for Alpamayo 2 Edge"
+requires-python = ">=3.11"
+# torch / numpy come from the AlpaSim driver environment; the rest is listed in requirements-alpasim.txt
+dependencies = ["numpy", "torch", "transformers", "safetensors", "pillow", "huggingface_hub"]
+
+[project.entry-points."alpasim.models"]
+alpamayo2_edge = "alpasim_edge_driver:Alpamayo2EdgeModel"
+
+[project.entry-points."alpasim.configs"]
+alpamayo2_edge = "alpasim_edge_configs"
+
+[tool.setuptools]
+py-modules = ["alpasim_edge_driver", "edge_policy", "edge_inputs"]
+packages = ["alpasim_edge_configs", "alpasim_edge_configs.driver"]
+
+[tool.setuptools.package-data]
+"alpasim_edge_configs.driver" = ["*.yaml"]

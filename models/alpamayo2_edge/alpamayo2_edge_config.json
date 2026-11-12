@@ -1,0 +1,181 @@
+{
+  "fixed_isa_regs": {
+    "V_CACHE_SIZE_REG": 1,
+    "ROPE_SIZE_REG": 2,
+    "TMP_REG": 3,
+    "GPR_SEQ_LEN_REG": 4,
+    "GPR_Q_SEQ_LEN_REG": 5,
+    "GPR_BUCKET_IDX_REG": 6
+  },
+  "lm": {
+    "hidden_size": 2048,
+    "num_layers": 28,
+    "num_heads": 16,
+    "num_kv_heads": 8,
+    "group_size": 2,
+    "head_dim": 128,
+    "intermediate_size": 9216,
+    "vocab_size": 135168,
+    "rope_theta": 100000000.0,
+    "mrope_section": [
+      24,
+      20,
+      20
+    ],
+    "mrope_interleaved": true,
+    "rms_norm_eps": 1e-05,
+    "max_position_embeddings": 4096
+  },
+  "vision": {
+    "hidden_size": 1152,
+    "num_layers": 27,
+    "num_heads": 16,
+    "head_dim": 72,
+    "head_dim_padded": 128,
+    "intermediate_size": 4304,
+    "intermediate_size_padded": 4352,
+    "patch_size": 16,
+    "patch_dim": 768,
+    "pos_embed_grid": 16,
+    "layer_norm_eps": 1e-06,
+    "image_groups": [
+      {
+        "count": 10,
+        "patches_hw": [
+          20,
+          36
+        ],
+        "num_patches": 720,
+        "num_patches_padded": 768,
+        "tokens": 180
+      },
+      {
+        "count": 12,
+        "patches_hw": [
+          14,
+          26
+        ],
+        "num_patches": 364,
+        "num_patches_padded": 384,
+        "tokens": 91
+      }
+    ],
+    "num_patches_total": 11568
+  },
+  "connector": {
+    "pixel_shuffle_scale_factor": 2,
+    "input_size": 4608,
+    "hidden_size": 11520,
+    "output_size": 2048,
+    "num_tokens": 2892,
+    "pre_norm": "layer_norm"
+  },
+  "model": {
+    "max_context_size": 3392,
+    "prefill_max_seq_len": 3328,
+    "max_new_tokens": 64,
+    "stop_token_ids": [
+      135084
+    ],
+    "traj_token_range": [
+      131072,
+      135071
+    ],
+    "eos_token_id": 11
+  },
+  "ops": {
+    "norm": "rms",
+    "rope": "hf_core",
+    "mlp": "relu2",
+    "attn": "prefill_flash",
+    "causal": true,
+    "mlp_bias": false,
+    "lm_quant": "q4_64",
+    "vision_quant": "bf16",
+    "expert_quant": "bf16"
+  },
+  "quantization": {
+    "q4_64": {
+      "block_size": 64,
+      "bits": 4,
+      "scale_divisor": 7.0,
+      "range": [
+        -8,
+        7
+      ]
+    },
+    "fp4_e2m1": {
+      "block_size": 64,
+      "max_value": 6.0,
+      "table": [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0
+      ]
+    }
+  },
+  "dram_layout": {
+    "convention": "offsets from DRAM_START_ADDR 0x80000000; usable 0x0..0x100000000",
+    "selected": "a2e_provisional",
+    "params_dram_base": "0x00000000",
+    "tensor_dram_base": "0x8A000000",
+    "program_dram_base": "0xD0000000",
+    "budget_mb": {
+      "vision_bf16": 822,
+      "projector_bf16": 153,
+      "lm_if4": 750,
+      "lm_head_if4": 147,
+      "expert_bf16": 396,
+      "params_total": 2270,
+      "tensor_region": 992,
+      "program_region": 768
+    }
+  },
+  "paths": {
+    "hf_model_repo": "nvidia/Alpamayo2-Edge"
+  },
+  "defaults": {
+    "golden": "~/a2e_golden/synthetic_float32",
+    "dev": "xdma0",
+    "cycle_ns": 5.63,
+    "max_seq": 3392
+  },
+  "hw_notes": [
+    "lm dims all %64; head_dim 128 -> rope halves are one full SRAM row each",
+    "lm mlp = relu^2: fc1 with clamp(0,inf) epilogue, then eltwise_mul(x,x), then fc2 (no fused relu^2)",
+    "lm fc2 K=9216 > SCALE_BRAM_ELEMENTS 8192: quantized_matmat_core cannot take it; split K or run fc2 unfused via matmat_mul_core",
+    "M-RoPE: cos/sin tables built on host from (t,h,w) positions; token after last image = index + rope_delta (data-dependent, rewrite tables per prompt)",
+    "vision head_dim 72 -> pad to 128 for flash attention, unpad after (strided DMA, chunk 160B rule)",
+    "vision mlp 4304 -> pad to 4352 (zero rows in fc1/bias, zero cols in fc2)",
+    "vision seq 720 -> 768 and 364 -> 384 with -inf softmax mask on pad columns; attention is per image (22 runs, 2 shapes)",
+    "vision GELU is tanh-approx; hardware GELU is x*sigmoid(1.702x) -> known SNR ceiling, same deviation as pi05/smolvlm2",
+    "pos-emb bilinear resize + patchify on host (2 static shapes); patch embed 768->1152 on device",
+    "expert attends non-causally to [LM KV cache ; 64 self]; kv_len 3274+64 padded to 64-multiple with mask",
+    "expert Fourier features need sin/cos of the current noisy action each Euler step: no sin core -> host round trip per step (64x2 values) or CORDIC",
+    "bf16 everything = 4.7GB: LM must be q4/IF4; embedding table stays on host"
+  ],
+  "action_expert": {
+    "hidden_size": 512,
+    "num_layers": 28,
+    "q_dim": 2048,
+    "kv_dim": 1024,
+    "intermediate_size": 3840,
+    "num_action_tokens": 64,
+    "action_dim": 2,
+    "flow_steps": 10,
+    "fourier_feats": 60
+  }
+}
