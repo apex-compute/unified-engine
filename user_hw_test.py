@@ -6631,7 +6631,9 @@ def conv_model_tests() -> None:
     model_dev = "efinix" if dev == "pcie_dma1" else dev
     hw = ["--device", "rk", "--dev", model_dev]
     axi = user_dma_core.configured_hardware_info().axi_data_width_bits
-    md = "models"
+    # Absolute: the model scripts run with cwd=pcie_utils (_conv_model_run), but
+    # _conv_model_bin checks the bin from this process, whose cwd is the caller's.
+    md = _CONV_MODEL_DIR
     failures = []
     rng_state = _capture_rng_state()
     try:
