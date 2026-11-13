@@ -451,6 +451,7 @@ DEVICE_LOCK_WAIT_SECONDS = 600.0      # 10 minutes
 
 _DEVICE_LOCK_FD: Optional[int] = None
 _DEVICE_LOCK_NAME: Optional[str] = None
+_DMA_DEVICE_NAME: Optional[str] = None
 
 
 def _device_lock_path(device_name: str) -> str:
@@ -458,7 +459,9 @@ def _device_lock_path(device_name: str) -> str:
 
 
 def _current_device_name() -> str:
-    """Board name behind the configured char devices, e.g. ``xdma1``."""
+    """Return the logical device name used to configure the DMA paths."""
+    if _DMA_DEVICE_NAME is not None:
+        return _DMA_DEVICE_NAME
     base = os.path.basename(DMA_DEVICE_USER)
     return base[:-len("_user")] if base.endswith("_user") else base
 
@@ -595,6 +598,7 @@ def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
     """
     import sys as _sys
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER, UE_0_BASE_ADDR
+    global _DMA_DEVICE_NAME
     global CLOCK_CYCLE_TIME_NS
     old_identity = (DMA_DEVICE_USER, UE_0_BASE_ADDR)
     old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
@@ -616,6 +620,7 @@ def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
             UE_0_BASE_ADDR = int(base_addr)
     if old_identity != (DMA_DEVICE_USER, UE_0_BASE_ADDR):
         CLOCK_CYCLE_TIME_NS = None
+    _DMA_DEVICE_NAME = device_name
     # Claim the board before anything touches it (see ONE PROCESS PER BOARD).
     claim_dma_device()
     for _mod in list(_sys.modules.values()):
@@ -1596,7 +1601,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xf9d05d62, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xf9d05d62. Please update FPGA with update_f9d05d62.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
+        assert hw_version == 0xc746c746, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xc746c746. Please update FPGA with update_c746c746.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
         if getattr(self, "conv_geometry_mode", CONV_GEOMETRY_LIVE_CSR) == CONV_GEOMETRY_QUEUE_CONFIG:
             # Convolution images have independent build stamps from the legacy
             # release. Explicit queue-CONFIG selection opts into that contract;
