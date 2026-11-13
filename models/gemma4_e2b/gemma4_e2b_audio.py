@@ -34,7 +34,11 @@ from audio_primitives import (
 
 AUDIO_QUANT_PRECISION = "if4"
 AUDIO_FIXED_SOFT_TOKENS = 128
-AUDIO_ISA_BASE = 0x98000000        # legacy model map only; see _audio_isa_base()
+# Legacy model map only (see _audio_isa_base()): directly above the audio weight
+# region (0x6C000000-0x78000000), below the model map's params at 0x80000000.
+# It was 0x98000000, inside the params (LM weights, 0x80000000-0xE1000000): the
+# audio program overwrote LM weights and every single-core audio run decoded <pad>.
+AUDIO_ISA_BASE = 0x78000000
 # Under the tiled map the audio program gets its own shared-pool allocation of
 # this size (the legacy map's audio ISA region was 96 MiB).
 AUDIO_ISA_BYTES = 96 << 20
@@ -2431,12 +2435,17 @@ class Gemma4AudioMixin:
     def _audio_isa_base(self) -> int:
         """Where the audio program lives.
 
-        The legacy model map reserves a fixed region at AUDIO_ISA_BASE. The
+        The legacy model map reserves a fixed region at AUDIO_ISA_BASE, in the
+        low space the single-core map leaves empty. The
         tiled map has no such region -- 0x98000000 is inside an engine window
         whose shared pool also hands out the KV cache and vision weights -- so
         the program gets its own shared-pool allocation, made once.
         """
         if not getattr(self, "_tiled_map", False):
+            weights_base, weights_end = self._audio_weight_region()
+            assert weights_end <= AUDIO_ISA_BASE and AUDIO_ISA_BASE + AUDIO_ISA_BYTES <= 0x80000000, (
+                f"audio ISA [0x{AUDIO_ISA_BASE:X}, +{AUDIO_ISA_BYTES >> 20} MiB) must sit between "
+                f"the audio weights (end 0x{weights_end:X}) and the model map's params (0x80000000)")
             return AUDIO_ISA_BASE
         base = getattr(self, "_audio_isa_alloc", None)
         if base is None:
