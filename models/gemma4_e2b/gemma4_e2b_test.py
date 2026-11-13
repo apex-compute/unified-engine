@@ -128,6 +128,10 @@ MULTI_CORE_MODEL_REBASE = MULTI_CORE_MODEL_BASE - user_dma_core.DRAM_START_ADDR
 TILED_MAP_MIN_ENGINES = 8
 TILED_WINDOW_BYTES = 0x4000_0000           # 1 GiB per core, one memory controller
 TILED_ISA_BYTES = 16 * 2**20               # per-core ISA slice, inside the window
+# Kintex 2-core: each worker carries half a stage, and the audio encoder's
+# engine-1 program is 16.1 MiB -- over the 16 MiB slice (ISA overflow). 32 MiB
+# costs 32 MiB of the 4 GiB shared region.
+KINTEX_ISA_BYTES = 32 * 2**20
 # 64 MiB: vision attention scratch is 13.12 MiB, the tensor-parallel prefill
 # MLP adds four per-engine lane buffers (gate, up, product, down partial) at
 # 1.5 MiB each, and prefill attention needs V^T [512, S] + scores [512, S] =
@@ -1233,6 +1237,8 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                                    else TILED_WINDOW_BYTES)
         self._tile_tensor_bytes = (KINTEX_PRIVATE_TENSOR_BYTES if self._kintex_tiled_map
                                    else TILED_TENSOR_BYTES)
+        self._tile_isa_bytes = (KINTEX_ISA_BYTES if self._kintex_tiled_map
+                                else TILED_ISA_BYTES)
         # The floor per map, raised to what this model's slices need (E4B).
         self._tile_private_reserve_bytes = max(
             KINTEX_PRIVATE_RESERVE_BYTES if self._kintex_tiled_map
@@ -1258,7 +1264,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         _packed = (dram_interleaved()
                    and (self._kintex_tiled_map or multi_core >= TILED_MAP_MIN_ENGINES))
         if _packed:
-            _window = (self._tile_private_reserve_bytes + TILED_ISA_BYTES
+            _window = (self._tile_private_reserve_bytes + self._tile_isa_bytes
                        + self._tile_tensor_bytes)
             self._tile_window_bytes = -(-_window // PRIVATE_ALIGN) * PRIVATE_ALIGN
             self._tile_bases = [i * self._tile_window_bytes for i in range(multi_core)]
@@ -1366,7 +1372,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self.mc_arena = PrivateArena(
                 multi_core,
                 windows=[(base, self._tile_window_bytes) for base in self._tile_bases],
-                isa_bytes=TILED_ISA_BYTES, tensor_bytes=self._tile_tensor_bytes,
+                isa_bytes=self._tile_isa_bytes, tensor_bytes=self._tile_tensor_bytes,
                 shared_region=self._shared_region, verbose=True)
             _actual = [self.mc_arena.window_base(i) for i in range(multi_core)]
             if _actual != self._tile_bases:
@@ -1388,7 +1394,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             self.MASTER_ISA_LIMIT = self.mc_arena.isa_limit(0)
             if self.LM_ISA_BASE >= self.MASTER_ISA_LIMIT:
                 raise AssertionError(
-                    f"master ISA slice ({TILED_ISA_BYTES // 2**20} MiB) cannot "
+                    f"master ISA slice ({self._tile_isa_bytes // 2**20} MiB) cannot "
                     f"hold the vision image plus the LM image")
             self.VISION_WORKER_ISA_BASE = self.LM_ISA_BASE
             # ONE CONTIGUOUS TENSOR ARENA, carved first, while the largest run is
