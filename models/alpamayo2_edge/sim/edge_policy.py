@@ -63,14 +63,81 @@ class HostReferenceBackend:
         return xyz, rot, tokens
 
 
-class DeviceBackend:
-    """STUB -- the accelerator backend. Same interface as HostReferenceBackend.run."""
+RESUME_FILE = Path.home() / "a2e_resume"
 
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError("DeviceBackend: the accelerator hook is added later by the maintainer")
+
+def _device_worker(conn, model_dir, device):
+    """Child process that owns the board: one DeviceRunner, one reply per request, exits on any error."""
+    try:
+        from edge_device import DeviceRunner
+
+        sample = EdgeInputBuilder(model_dir).pack(**synthetic_raw(nav_text="Continue straight"))
+        runner = DeviceRunner(model_dir, sample, ref_device=device)
+        conn.send(("ok", None))
+        while True:
+            packed, seed = conn.recv()
+            xyz, rot, tokens = runner.run(packed, seed)
+            conn.send(("ok", (xyz.float().cpu(), rot.float().cpu(), list(tokens))))
+    except EOFError:
+        pass
+    except BaseException as e:  # noqa: BLE001 -- a dead board shows up as TimeoutError / OSError
+        conn.send(("error", f"{type(e).__name__}: {e}"))
+
+
+class DeviceBackend:
+    """The accelerator: same interface as HostReferenceBackend.run. Weights and programs are put on
+    the board at construction (a few minutes), sized from a synthetic sample of the driving input.
+
+    The board lives in a child process. When an inference fails (the board dies under sustained
+    load), run() waits for the board to be reset -- `touch ~/a2e_resume` -- then starts a fresh
+    child and repeats the same inference, so the caller only sees a slow plan."""
+
+    def __init__(self, model_dir=None, device="cuda"):
+        self.args = (model_dir or default_model_dir(), device)
+        self.proc = None
+        while not self._start():
+            self._wait_for_reset(f"start-up failed: {self.err}")
+
+    def _start(self):
+        import multiprocessing as mp
+
+        if self.proc is not None:
+            self.proc.kill()
+            self.proc.join()
+        ctx = mp.get_context("spawn")
+        self.conn, child = ctx.Pipe()
+        self.proc = ctx.Process(target=_device_worker, args=(child, *self.args), daemon=True)
+        self.proc.start()
+        child.close()
+        kind, self.err = self._reply()
+        return kind == "ok"
+
+    def _reply(self):
+        try:
+            return self.conn.recv()
+        except (EOFError, OSError) as e:
+            return "error", f"device process died ({type(e).__name__})"
+
+    def _wait_for_reset(self, why):
+        RESUME_FILE.unlink(missing_ok=True)       # a stale file must not resume a dead board
+        print(f"[device] {why}\n[device] reset the board, then run:  touch {RESUME_FILE}", flush=True)
+        while not RESUME_FILE.exists():
+            time.sleep(1.0)
+        RESUME_FILE.unlink()
+        print("[device] resuming: reloading the board", flush=True)
 
     def run(self, packed, seed):
-        raise NotImplementedError("DeviceBackend: the accelerator hook is added later by the maintainer")
+        while True:
+            try:
+                self.conn.send((packed, seed))
+                kind, val = self._reply()
+            except OSError as e:
+                kind, val = "error", f"device process died ({type(e).__name__})"
+            if kind == "ok":
+                return val
+            self._wait_for_reset(f"inference failed: {val}")
+            while not self._start():
+                self._wait_for_reset(f"start-up failed: {self.err}")
 
 
 class EdgePolicy:

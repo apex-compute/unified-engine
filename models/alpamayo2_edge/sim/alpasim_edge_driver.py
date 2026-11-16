@@ -218,7 +218,7 @@ def _make_policy(model_dir, device):
     if kind == "host":
         return EdgePolicy(HostReferenceBackend(model_dir, device), model_dir)
     if kind == "device":
-        return EdgePolicy(DeviceBackend(), model_dir)
+        return EdgePolicy(DeviceBackend(model_dir, device), model_dir)
     raise ValueError(f"A2E_BACKEND must be host or device, got {kind!r}")
 
 
@@ -269,7 +269,8 @@ class Alpamayo2EdgeModel(BaseTrajectoryModel):
         t0_us = int(ts[-1])
         frames, cameras, stamps = select_frames(prediction_input.camera_images, t0_us)
         hist_xyz, hist_rot, pose_t0 = build_history(ts, xyz, quat, t0_us)
-        nav_text = nav_text_from_route(prediction_input.route, ts, xyz, quat, pose_t0)
+        # A2E_NAV_TEXT forces one command for the whole run (e.g. "Turn left in 20m") instead of the route's
+        nav_text = os.environ.get("A2E_NAV_TEXT") or nav_text_from_route(prediction_input.route, ts, xyz, quat, pose_t0)
         way_xyz, way_rot, text = self._policy.predict(
             frames, cameras, stamps, hist_xyz, hist_rot, nav_text, seed=int(prediction_input.inference_seed))
         return ModelPrediction(

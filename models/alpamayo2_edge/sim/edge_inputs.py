@@ -170,12 +170,26 @@ def default_model_dir():
     return resolve_model_dir(None)
 
 
+class _Tokenizer:
+    """The checkpoint's tokenizer.json through the `tokenizers` library alone. The checkpoint names
+    a tokenizer class only transformers 5 has, and AlpaSim's environment ships transformers 4."""
+
+    def __init__(self, path):
+        from tokenizers import Tokenizer
+
+        self.tk = Tokenizer.from_file(str(path))
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": self.tk.encode(text, add_special_tokens=add_special_tokens).ids}
+
+    def decode(self, ids, skip_special_tokens=False):
+        return self.tk.decode([int(i) for i in ids], skip_special_tokens=skip_special_tokens)
+
+
 class EdgeInputBuilder:
     """Holds the tokenizer and the checkpoint's processor constants; `pack` does one sample."""
 
     def __init__(self, model_dir=None):
-        from transformers import AutoTokenizer
-
         self.dir = Path(model_dir).expanduser() if model_dir else default_model_dir()
         cfg = json.loads((self.dir / "config.json").read_text())
         ip = json.loads((self.dir / "processor_config.json").read_text())["image_processor"]
@@ -188,7 +202,7 @@ class EdgeInputBuilder:
         self.std = torch.tensor(ip["image_std"], dtype=torch.float32) * scale
         self.image_token = cfg["vlm_config"]["image_token_id"]
         self.history_pad, self.history_id0 = cfg["traj_ids"]["history_pad"], cfg["traj_ids"]["history_id0"]
-        self.tokenizer = AutoTokenizer.from_pretrained(str(self.dir))
+        self.tokenizer = _Tokenizer(self.dir / "tokenizer.json")
 
     def pixels(self, frame, camera):
         lo, hi = CAMERA_PIXEL_BOUNDS[camera]

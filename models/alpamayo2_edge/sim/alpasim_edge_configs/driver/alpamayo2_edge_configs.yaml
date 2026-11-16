@@ -5,9 +5,22 @@
 defaults:
   - _self_
 
+# The driver runs as a host process (it has to reach the accelerator), as AlpaSim's manual driver
+# does: use with driver_source=external_static. Override the address on the command line if needed.
+wizard:
+  external_services:
+    driver:
+      - "localhost:6789"
+  debug_flags:
+    use_localhost: true     # containers on the host network, so the runtime can reach the host driver
+
 runtime:
   simulation_config:
     skip_driver_during_force_gt: true
+    # One plan per 0.5 s (the policy is slow); cameras stay at 100 ms. The logged-driving lead-in
+    # must be a whole number of control steps, and Edge needs 2.0 s of frames before its first plan.
+    control_timestep_us: 500_000
+    force_gt_duration_us: 2_000_000
 
     cameras:
     - logical_id: camera_cross_left_120fov
