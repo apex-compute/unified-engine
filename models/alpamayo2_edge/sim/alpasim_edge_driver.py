@@ -271,8 +271,14 @@ class Alpamayo2EdgeModel(BaseTrajectoryModel):
         hist_xyz, hist_rot, pose_t0 = build_history(ts, xyz, quat, t0_us)
         # A2E_NAV_TEXT forces one command for the whole run (e.g. "Turn left in 20m") instead of the route's
         nav_text = os.environ.get("A2E_NAV_TEXT") or nav_text_from_route(prediction_input.route, ts, xyz, quat, pose_t0)
+        seed = int(prediction_input.inference_seed)
+        if os.environ.get("A2E_SEED"):      # the simulator draws a new seed per drive; this makes drives comparable
+            last = getattr(self, "_last_sim_seed", None)        # sim seeds count up by one within a drive
+            self._plan_index = getattr(self, "_plan_index", -1) + 1 if last is not None and seed == last + 1 else 0
+            self._last_sim_seed = seed
+            seed = int(os.environ["A2E_SEED"]) + self._plan_index
         way_xyz, way_rot, text = self._policy.predict(
-            frames, cameras, stamps, hist_xyz, hist_rot, nav_text, seed=int(prediction_input.inference_seed))
+            frames, cameras, stamps, hist_xyz, hist_rot, nav_text, seed=seed)
         return ModelPrediction(
             candidate_positions=np.asarray(way_xyz, dtype=np.float64)[None],
             candidate_rotations=np.asarray(way_rot, dtype=np.float64)[None],

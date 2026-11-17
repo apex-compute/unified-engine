@@ -13,6 +13,7 @@ only draws the flow-matching noise.
 """
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -38,6 +39,39 @@ class HostReferenceBackend:
             dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
         self.steps, self.max_new = steps, max_new
         self.m = Alpamayo2EdgeRef(model_dir or default_model_dir(), device, dtype)
+        # A2E_HOST_EQUIV=1: the accelerator's model on the host -- its 4-bit LM weights (dequantized
+        # from the cached packs), its GELU, its 64-token reasoning cap. Separates "the device model
+        # drives differently" from "the device computes it wrong".
+        self.equiv = os.environ.get("A2E_HOST_EQUIV") == "1"
+        if self.equiv:
+            self.max_new = 64
+            self._install_if4()
+
+    def _install_if4(self):
+        sys.path.insert(0, str(HERE.parent.parent.parent))      # repo root, for quant_lib
+        import quant_lib
+        from alpamayo2_edge_cpu_reference import LM
+
+        w = self.m.w
+        packs = torch.load(HERE.parent / "alpamayo2_edge_bin" / "lm_if4.pt", weights_only=False)
+        for key, (data, scale, n, k) in packs.items():
+            deq = quant_lib.dequant("if4", data, scale, n, k)
+            part = key.split(".")
+            if key == "head":
+                name, sl = "vlm.lm_head.weight", None
+            elif len(part) == 2:
+                name, sl = f"{LM}layers.{part[0]}.self_attn.{part[1]}_proj.weight", None
+            else:
+                name, i = f"{LM}layers.{part[0]}.mlp.{part[1]}.weight", int(part[2])
+                half = w[name].shape[0 if part[1] == "fc1" else 1] // 2
+                rows = slice(i * half, (i + 1) * half)
+                sl = (rows, slice(None)) if part[1] == "fc1" else (slice(None), rows)
+            deq = deq.to(w[name].device, w[name].dtype)
+            if sl is None:
+                w[name] = deq
+            else:
+                w[name][sl] = deq
+        print(f"[host] device-equivalent model: {len(packs)} IF4 tensors installed, hw GELU, max {self.max_new} tokens", flush=True)
 
     @torch.no_grad()
     def run(self, packed, seed):
@@ -49,7 +83,7 @@ class HostReferenceBackend:
         types = packed["tokenized_data.mm_token_type_ids"][0]
         grid = packed["tokenized_data.image_grid_thw"]
         L = ids.shape[0]
-        image_embeds = m.project(m.vision_encode(packed["tokenized_data.pixel_values"], grid))
+        image_embeds = m.project(m.vision_encode(packed["tokenized_data.pixel_values"], grid, hw_gelu=self.equiv), hw_gelu=self.equiv)
         pos, delta = m.mrope_positions(types, grid)
         embeds = m.embed_prompt(ids, image_embeds)
         cache = KVCache(m.n_lm, m.kv_heads, L + self.max_new + 1, m.hd, m.dev, m.dt)
@@ -153,6 +187,12 @@ class EdgePolicy:
         xyz, rot, tokens = self.backend.run(packed, seed)
         xyz = np.asarray(torch.as_tensor(xyz).float().cpu(), dtype=np.float32)
         rot = np.asarray(torch.as_tensor(rot).float().cpu(), dtype=np.float32)
+        dump = os.environ.get("A2E_DUMP_DIR")       # every plan's input and output, for edge_device.py replay
+        if dump:
+            Path(dump).mkdir(parents=True, exist_ok=True)
+            self.n_dumped = getattr(self, "n_dumped", 0) + 1
+            torch.save({"packed": packed, "seed": int(seed), "xyz": torch.from_numpy(xyz), "tokens": list(tokens),
+                        "nav_text": nav_text}, Path(dump) / f"plan_{self.n_dumped - 1:03d}.pt")
         if xyz.shape != (N_WAYPOINTS, 3) or rot.shape != (N_WAYPOINTS, 3, 3) or not (np.isfinite(xyz).all() and np.isfinite(rot).all()):
             raise RuntimeError(f"backend returned a bad trajectory: {xyz.shape} {rot.shape}")
         text = self.inputs.tokenizer.decode(list(tokens)[:-1], skip_special_tokens=False).strip()  # drop the anchor

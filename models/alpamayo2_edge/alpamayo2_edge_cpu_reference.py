@@ -57,6 +57,8 @@ def rms_norm(x, w, eps):
 
 def attention(q, k, v, scale, mask=None):
     """q (H, Lq, D), k / v (H, Lk, D) -> (H, Lq, D). Softmax in float32."""
+    if q.shape[0] * q.shape[1] * k.shape[1] > 1 << 24 and q.shape[0] > 1:     # big score matrix: one head at a time (memory)
+        return torch.cat([attention(q[i : i + 1], k[i : i + 1], v[i : i + 1], scale, mask) for i in range(q.shape[0])])
     a = (torch.matmul(q, k.transpose(-1, -2)) * scale).float()
     if mask is not None:
         a = a + mask

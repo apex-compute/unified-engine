@@ -101,8 +101,10 @@ class DeviceRunner:
         """packed dict -> (xyz (64, 3), rot (64, 3, 3), generated token ids, anchor last)."""
         ue, T, ref = self.ue, self.T, self.ref
         b, LH, BPE = ue.buf, T.LH, T.BPE
-        if self.idle_from is not None and self.cooldown:
-            time.sleep(max(0.0, self.idle_from + self.cooldown - time.time()))
+        f = Path.home() / "a2e_cooldown"            # a number of seconds in this file overrides A2E_COOLDOWN, live
+        cooldown = float(f.read_text()) if f.exists() else self.cooldown
+        if self.idle_from is not None and cooldown:
+            time.sleep(max(0.0, self.idle_from + cooldown - time.time()))
         t_wall, ms = time.time(), {}
         grid = packed["tokenized_data.image_grid_thw"].long()
         assert [(int(h), int(w)) for _, h, w in grid.tolist()] == self.grids, "image sizes changed since start-up"
@@ -178,6 +180,18 @@ if __name__ == "__main__":      # repeat test without the simulator: N inference
     sys.path.insert(0, str(HERE))
     from edge_inputs import EdgeInputBuilder, default_model_dir, synthetic_raw
 
+    if len(sys.argv) > 2 and sys.argv[1] == "replay":        # replay <dump dir> [plan indices]: device vs the dumped plans
+        files = sorted(Path(sys.argv[2]).glob("plan_*.pt"))
+        files = [files[int(i)] for i in sys.argv[3:]] or files
+        runner = DeviceRunner(default_model_dir(), torch.load(files[0], weights_only=False)["packed"])
+        for f in files:
+            d = torch.load(f, weights_only=False)
+            xyz, _, out = runner.run(d["packed"], d["seed"])
+            xyz, ref = xyz.float().cpu(), d["xyz"].float()
+            print(f"[replay] {f.stem}: tokens {'same' if list(out) == list(d['tokens']) else 'DIFFER'} ({len(out)} vs {len(d['tokens'])}), "
+                  f"max |xyz err| {float((xyz - ref).abs().max()):.3f} m, end point device ({float(xyz[-1, 0]):.2f}, {float(xyz[-1, 1]):+.2f}) "
+                  f"vs host ({float(ref[-1, 0]):.2f}, {float(ref[-1, 1]):+.2f}), nav {d['nav_text']!r}", flush=True)
+        sys.exit(0)
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 3
     sample = EdgeInputBuilder(default_model_dir()).pack(**synthetic_raw(nav_text="Continue straight"))
     runner = DeviceRunner(default_model_dir(), sample)
