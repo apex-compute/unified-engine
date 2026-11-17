@@ -353,7 +353,7 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
             config_path = os.path.join(script_dir or SCRIPT_DIR,
                                        "qwen2.5_vl_3b_config.json")
         with open(config_path) as f:
-            return json.load(f)
+            return apply_image_size(json.load(f), IMAGE_SIZE)
 
     def _loud(self, *args, **kwargs) -> None:
         """Progress print that bypasses suppression (the saved original print)."""
@@ -656,6 +656,11 @@ qwen2.5_vl_3b_numeric.py.""")
     parser.add_argument("--image", type=str, nargs="?", const=DEFAULT_IMAGE, default=None,
                         help=f"VLM mode: run the vision encoder and merge image tokens into "
                              f"the prompt. Bare --image uses {os.path.basename(DEFAULT_IMAGE)}.")
+    parser.add_argument("--image-size", type=int, default=None,
+                        help="With --image: the square (px) the encoder is compiled for and the image is "
+                             "resized to, a multiple of the 112-px vision window (default: the config's "
+                             "image_size, 336 -> 144 image tokens; 224 -> 64). The summary is named "
+                             "..._image_size_N.md.")
     parser.add_argument("--max-new-tokens", type=int, default=256,
                         help="Cap on generated tokens (default 256). A low cap is the "
                              "guard against a bad argmax decoding until the context "
@@ -733,11 +738,36 @@ def summary_filename(args, cores: int) -> str:
     tags = [args.dev]
     if args.image:
         tags.append("image")
+        if args.image_size:
+            tags.append(f"size_{args.image_size}")
     if cores > 1:
         tags.append(f"multi-core_{cores}")
     if args.profile:
         tags.append("profile")
     return "qwen2.5_vl_3b_test_" + "_".join(tags) + ".md"
+
+
+# --image-size: the square the encoder is compiled for and every image is resized to (None: the config's
+# image_size, 336). The patch and merged-token counts follow from it.
+IMAGE_SIZE: int | None = None
+
+
+def apply_image_size(cfg: dict, size: int | None) -> dict:
+    """The config with its vision geometry for a SIZE x SIZE image (unchanged for None).
+
+    SIZE must be a multiple of the vision window (112 px): the window attention partitions the patch grid into
+    whole windows. num_patches = (SIZE / patch_size)^2, num_merged_tokens = num_patches / spatial_merge_size^2.
+    """
+    if size is None:
+        return cfg
+    v = cfg["vision"]
+    if size <= 0 or size % v["window_size"]:
+        raise SystemExit(f"--image-size {size}: a positive multiple of the vision window "
+                         f"({v['window_size']} px), e.g. 224 or 336")
+    v["image_size"] = size
+    v["num_patches"] = (size // v["patch_size"]) ** 2
+    v["num_merged_tokens"] = v["num_patches"] // v["spatial_merge_size"] ** 2
+    return cfg
 
 
 def process_image(image_path: str, size: int = 336) -> torch.Tensor:
@@ -764,6 +794,8 @@ def process_image(image_path: str, size: int = 336) -> torch.Tensor:
 def main():
     parser = build_arg_parser()
     args = parser.parse_args()
+    global IMAGE_SIZE
+    IMAGE_SIZE = args.image_size
 
     engine_kwargs = resolve_engine_config(parser, args)
 
@@ -933,7 +965,7 @@ def main():
     # block-diagonal window mask are built from this image's grid.
     print(f"\n--- Vision host preprocessing ({os.path.basename(args.image)}) ---")
     timer = time.perf_counter()
-    ue.prepare_encoder_input(process_image(args.image))
+    ue.prepare_encoder_input(process_image(args.image, ue._cfg["vision"]["image_size"]))
     print(f"  done in {time.perf_counter() - timer:.2f}s")
 
     print(f"\n--- Vision tensor init ---")
