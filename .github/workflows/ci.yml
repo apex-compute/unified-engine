@@ -6,6 +6,10 @@ name: Model HW CI
 # includes pi05 (robot policy / VLA). The nightly (night-run.yml) dispatches this
 # workflow with full_run: 'true', so pi05 is covered every night.
 #
+# alpamayo2_edge note: registered in TESTS, so the nightly full run covers it. It needs
+# the 8-engine / 8 GiB board and the nvidia/Alpamayo2-Edge checkpoint in the runner's
+# Hugging Face cache (downloaded on first run); each pass is a full compile + ~80 s.
+#
 # pi05 note: its first run on a clean runner downloads the upstream checkpoint and
 # exports ~13 GB into models/pi05/pi05_bin/weights_export/. That needs the jax /
 # orbax / flax pins from models/pi05/pi05_requirements.txt to be present in the
@@ -107,6 +111,12 @@ jobs:
             # regress from changes confined to models/verapulse.
             echo "[ci] branch $BRANCH -> verapulse only"
             ARGS+=(--only verapulse)
+          elif [[ "$BRANCH" == "alpamayo2-edge" ]]; then
+            # Alpamayo 2 Edge bring-up branch: run ONLY alpamayo2_edge (8 engines, 8 GiB;
+            # the harness skips it on a smaller board). Changes there are confined to
+            # models/alpamayo2_edge, so the default subset would add board time for nothing.
+            echo "[ci] branch $BRANCH -> alpamayo2_edge only"
+            ARGS+=(--only alpamayo2_edge)
           elif [[ "$BRANCH" == "model/pi05_libero" ]]; then
             # pi05 bring-up branch: run ONLY pi05. The Gemma4 cases add ~15 min of
             # shared-board time and cannot regress from pi05-only changes.
