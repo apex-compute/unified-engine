@@ -117,6 +117,9 @@ ST_ALL_OPS = ("v.o", "v.fc2", "lm.q", "lm.k", "lm.v", "lm.o", "lm.fc2")
 ST_LAYOUT = {"tensor_dram_base": 0xB8000000, "program_dram_base": 0xF8000000}
 
 
+FRONT = ("vision", "projector", "scatter_img", "prefill", "build_vt")     # the default front half: one stream, this order
+
+
 def st_level(K, N):
     """Deepest level <= ST_LEVEL the shape allows."""
     return strassen_levels(K, N, ST_LEVEL)
@@ -205,6 +208,7 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         self.buf = {}                                   # shared buffers (model tensor arena)
         self.pbuf = [dict() for _ in range(engines)]    # written scratch, one copy per engine
         self.prog, self.wprog, self.hw_us = {}, {}, {}
+        self.emit, self.defer = {}, set()               # emitters kept; streams in defer are not compiled alone
         # matmul FLOPs (2*M*K*N, attention's two matmuls included) each program EXECUTES, all engines
         self._flops_acc, self.flops, self.done_flops = 0, {}, {}
         self._attn_parts = ("store", "vt", "attn")      # --profile narrows this to time one part
@@ -269,6 +273,9 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
     def _compile(self, name, emit, parallel=False):
         """capture -> HALT -> next program slot. parallel: the workers get a program of their own."""
         global _SILENT_MODE
+        self.emit[name] = emit
+        if name in self.defer:                          # becomes part of the merged "front" stream
+            return None
         t0 = time.time()
         par = parallel and self.NE > 1
         flops0 = self._flops_acc
@@ -295,6 +302,13 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         if size > (1 << 20):
             print(f"[compile {name}] primary {size // 32} instr ({size / 2**20:.1f} MB) @0x{addr:X}, {time.time() - t0:.1f}s")
         return addr
+
+    def front_compile(self):
+        """vision -> projector -> image scatter -> prefill -> V^T build as ONE stream: one launch,
+        no host step in between (everything the host writes for them is in DRAM before the launch)."""
+        t0 = time.time()
+        self._compile("front", lambda: [self.emit[n]() for n in FRONT], parallel=True)
+        self._report_programs("front (merged)", t0)
 
     def _run_transient(self, emit, timeout):
         """Capture one op group into the (unallocated) top of the program arena and run it now."""
@@ -650,15 +664,19 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
 
     # ---------------------------------------------------------------- vision: compile / run
 
-    def vision_compile(self, image_ids):
+    def assign_images(self, image_ids):
         """Whole images per engine, longest first onto the least-loaded engine. Cost ~ N^1.1
-        (measured single-engine: 20.0 s at 768 rows, 9.3 s at 384)."""
-        t0 = time.time()
-        load, self.assign = [0.0] * self.NE, [[] for _ in range(self.NE)]
+        (measured single-engine: 20.0 s at 768 rows, 9.3 s at 384). -> image ids per engine."""
+        load, assign = [0.0] * self.NE, [[] for _ in range(self.NE)]
         for i in sorted(image_ids, key=lambda i: -self.images[i]["N"]):
             e = min(range(self.NE), key=lambda e: load[e])
-            self.assign[e].append(i)
+            assign[e].append(i)
             load[e] += self.images[i]["N"] ** 1.1
+        return assign
+
+    def vision_compile(self, image_ids):
+        t0 = time.time()
+        self.assign = self.assign_images(image_ids)
         self._compile("vision", lambda: self._round(lambda E: [self._emit_image(E, i) for i in self.assign[E.e]]),
                       parallel=True)
         if self.NE > 1:
@@ -686,30 +704,33 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         """rows: leading patch rows of VIS_OUT to project (a multiple of 4). The 2x2 merge is the
         reinterpretation of (rows, 1152) as (rows / 4, 4608): block-major patch order. Tokens are
         split evenly across engines (every op here is row-wise)."""
-        b, pw, tokens = self.buf, self.pw, rows // MERGE2
+        tokens = rows // MERGE2
         base, rem = divmod(tokens, self.NE)
         counts = [base + (i < rem) for i in range(self.NE)]
         shards = [(sum(counts[:i]), counts[i]) for i in range(self.NE)]
 
         def body(E):
             t0, n = shards[E.e]
-            if n == 0:
-                return
-            ue = E.ue
-            self._flops_acc += 2 * n * PJ_IN * PJ_HID + 2 * n * PJ_HID * PJ_OUT
-            ue.reset_isa_reg_counter()
-            r_tok = ue.alloc_isa_reg()
-            ue.generate_instruction_add_set(r_tok, n)
-            ue.layer_norm_core_dram(M=n * MERGE2, N=VH, A_DRAM_ADDR=b["OUT"] + t0 * PJ_IN * BPE,
-                                    OUTPUT_DRAM_ADDR=b["PJ_LN"] + t0 * PJ_IN * BPE,
-                                    GAMMA_DRAM_ADDR=pw["ln_w"], BETA_DRAM_ADDR=pw["ln_b"])
-            ue.matmat_mul_core(M=n, K=PJ_IN, N=PJ_HID, A_DRAM_ADDR=b["PJ_LN"] + t0 * PJ_IN * BPE, B_DRAM_ADDR=pw["fc1"],
-                               OUTPUT_DRAM_ADDR=b["PJ_HID"] + t0 * PJ_HID * BPE, C_DRAM_ADDR=pw["fc1_b"],
-                               bias_mode="broadcast_N", gelu_enable=True, gpr_M_reg=r_tok)
-            ue.matmat_mul_core(M=n, K=PJ_HID, N=PJ_OUT, A_DRAM_ADDR=b["PJ_HID"] + t0 * PJ_HID * BPE, B_DRAM_ADDR=pw["fc2"],
-                               OUTPUT_DRAM_ADDR=b["IMG"] + t0 * PJ_OUT * BPE, C_DRAM_ADDR=pw["fc2_b"],
-                               bias_mode="broadcast_N", gpr_M_reg=r_tok)
+            if n:
+                self.emit_projector(E, t0, n)
         self._compile("projector", lambda: self._round(body), parallel=True)
+
+    def emit_projector(self, E, t0, n):
+        """The projector on tokens [t0, t0 + n) on engine E: their 4 n patch rows of VIS_OUT -> IMG."""
+        b, pw, ue = self.buf, self.pw, E.ue
+        self._flops_acc += 2 * n * PJ_IN * PJ_HID + 2 * n * PJ_HID * PJ_OUT
+        ue.reset_isa_reg_counter()
+        r_tok = ue.alloc_isa_reg()
+        ue.generate_instruction_add_set(r_tok, n)
+        ue.layer_norm_core_dram(M=n * MERGE2, N=VH, A_DRAM_ADDR=b["OUT"] + t0 * PJ_IN * BPE,
+                                OUTPUT_DRAM_ADDR=b["PJ_LN"] + t0 * PJ_IN * BPE,
+                                GAMMA_DRAM_ADDR=pw["ln_w"], BETA_DRAM_ADDR=pw["ln_b"])
+        ue.matmat_mul_core(M=n, K=PJ_IN, N=PJ_HID, A_DRAM_ADDR=b["PJ_LN"] + t0 * PJ_IN * BPE, B_DRAM_ADDR=pw["fc1"],
+                           OUTPUT_DRAM_ADDR=b["PJ_HID"] + t0 * PJ_HID * BPE, C_DRAM_ADDR=pw["fc1_b"],
+                           bias_mode="broadcast_N", gelu_enable=True, gpr_M_reg=r_tok)
+        ue.matmat_mul_core(M=n, K=PJ_HID, N=PJ_OUT, A_DRAM_ADDR=b["PJ_HID"] + t0 * PJ_HID * BPE, B_DRAM_ADDR=pw["fc2"],
+                           OUTPUT_DRAM_ADDR=b["IMG"] + t0 * PJ_OUT * BPE, C_DRAM_ADDR=pw["fc2_b"],
+                           bias_mode="broadcast_N", gpr_M_reg=r_tok)
 
     def projector_read(self, rows):
         return self.dma_from_accelerator_memory(self.buf["IMG"], (rows // MERGE2, PJ_OUT)).float()
@@ -1385,6 +1406,9 @@ def main():
                     help="skip the per-op-kind timing of one decode step and one denoise step that follows the run")
     ap.add_argument("--profile-vision", action="store_true",
                     help="after the run, time the vision stage by op kind (recompiles it 7 times; adds a few minutes)")
+    ap.add_argument("--split-front", action="store_true",
+                    help="launch vision, projector, image scatter, prefill and the V^T build one by one (per-stage times "
+                         "and the prompt-embedding check). Default: one merged instruction stream, one launch")
     ap.add_argument("--strassen-level", type=int, default=0, choices=(0, 1, 2, 3),
                     help="Strassen depth for the layers in --strassen-ops (0 = off); a layer whose widths "
                          "cannot split that deep uses the deepest level they allow")
@@ -1442,6 +1466,10 @@ def main():
     ue = Alpamayo2Edge_UnifiedEngine(dev=args.dev, engines=engines)
     mhz = 1e3 / ue._clock_period_ns
     print(f"clock {mhz:.1f} MHz -> raw peak {engines * 128 * mhz / 1e3:.1f} GFLOPS ({engines} x 128 FLOP/cycle)")
+    # One stream for the front half unless a mode needs its stages one at a time.
+    args.merge_front = not (args.split_front or args.host_vision or args.staged or vision_only or args.profile_vision)
+    if args.merge_front:
+        ue.defer = set(FRONT)
     ue.vision_weight_init(ref, sorted(set(grids)))
     ue.vision_tensor_init(grids)
     ue.vision_upload_pixels(pixels)
@@ -1453,6 +1481,7 @@ def main():
         return
 
     ok, hw_ms = True, {}
+    hw_s = lambda k: f"hw {hw_ms[k] / 1e3:.1f} s" if k in hw_ms else "hw time in 'front'"
     rows = sum(sizes[i] for i in image_ids)
     ue.projector_init(ref)
 
@@ -1466,36 +1495,43 @@ def main():
     else:
         ue.vision_compile(image_ids)
         ue.projector_compile(rows)
-        hw_ms["vision"] = ue._exec("vision", timeout=3600.0) / 1e3
-        hw_ms["projector"] = ue._exec("projector") / 1e3
-        utilization(ue, "vision", ["vision"], hw_ms["vision"] * 1e3)
-        utilization(ue, "projector", ["projector"], hw_ms["projector"] * 1e3)
-        print(f"\n{'image':>5} {'grid':>6} | vs hw-gelu ref: {'snr dB':>7} {'cos':>8} | vs published: {'snr dB':>7} {'cos':>8}")
-        hw, pub, got = [], [], []
-        with torch.no_grad():
-            for i in image_ids:
-                dev_out = ue.vision_read(i)
-                r_hw, r_pub = reference(i, True)[2].float().cpu(), reference(i, False)[2].float().cpu()
-                hw.append(r_hw); pub.append(r_pub); got.append(dev_out)
-                s, c = snr_db(r_hw, dev_out), cos_sim(r_hw, dev_out)
-                bad = bool(torch.isnan(dev_out).any()) or s < args.min_snr or c < args.min_cos
-                ok &= not bad
-                print(f"{i:5d} {grids[i][0]:>3}x{grids[i][1]:<2} | {s:23.1f} {c:8.5f} | "
-                      f"{snr_db(r_pub, dev_out):21.1f} {cos_sim(r_pub, dev_out):8.5f}{'  FAIL' if bad else ''}")
-            hw, pub, got = torch.cat(hw), torch.cat(pub), torch.cat(got)
-            print(f"\nall {len(image_ids)} images: vs hw-gelu ref {snr_db(hw, got):.1f} dB cos {cos_sim(hw, got):.5f} | "
-                  f"vs published {snr_db(pub, got):.1f} dB cos {cos_sim(pub, got):.5f} | hw {hw_ms['vision'] / 1e3:.1f} s")
-            # Projector: isolated (reference projector fed the DEVICE vision output) and end to end.
-            img = ue.projector_read(rows)
-            on = lambda t: t.to(ref.dev, ref.dt)
-            iso, e2e_hw, e2e_pub = (ref.project(on(got), hw_gelu=True).float().cpu(),
-                                    ref.project(on(hw), hw_gelu=True).float().cpu(), ref.project(on(pub)).float().cpu())
-        s, c = snr_db(iso, img), cos_sim(iso, img)
-        proj_bad = bool(torch.isnan(img).any()) or s < args.min_snr or c < args.min_cos
-        ok &= not proj_bad
-        print(f"projector {tuple(img.shape)} hw {hw_ms['projector'] / 1e3:.1f} s: isolated {s:.1f} dB cos {c:.5f}{'  FAIL' if proj_bad else ''} | "
-              f"end to end vs hw-gelu ref {snr_db(e2e_hw, img):.1f} dB cos {cos_sim(e2e_hw, img):.5f} | "
-              f"vs published {snr_db(e2e_pub, img):.1f} dB cos {cos_sim(e2e_pub, img):.5f}")
+        if not args.merge_front:
+            hw_ms["vision"] = ue._exec("vision", timeout=3600.0) / 1e3
+            hw_ms["projector"] = ue._exec("projector") / 1e3
+            utilization(ue, "vision", ["vision"], hw_ms["vision"] * 1e3)
+            utilization(ue, "projector", ["projector"], hw_ms["projector"] * 1e3)
+
+        def check_vision():         # read the vision / projector outputs back and gate them; -> image embeddings
+            nonlocal ok
+            print(f"\n{'image':>5} {'grid':>6} | vs hw-gelu ref: {'snr dB':>7} {'cos':>8} | vs published: {'snr dB':>7} {'cos':>8}")
+            hw, pub, got = [], [], []
+            with torch.no_grad():
+                for i in image_ids:
+                    dev_out = ue.vision_read(i)
+                    r_hw, r_pub = reference(i, True)[2].float().cpu(), reference(i, False)[2].float().cpu()
+                    hw.append(r_hw); pub.append(r_pub); got.append(dev_out)
+                    s, c = snr_db(r_hw, dev_out), cos_sim(r_hw, dev_out)
+                    bad = bool(torch.isnan(dev_out).any()) or s < args.min_snr or c < args.min_cos
+                    ok &= not bad
+                    print(f"{i:5d} {grids[i][0]:>3}x{grids[i][1]:<2} | {s:23.1f} {c:8.5f} | "
+                          f"{snr_db(r_pub, dev_out):21.1f} {cos_sim(r_pub, dev_out):8.5f}{'  FAIL' if bad else ''}")
+                hw, pub, got = torch.cat(hw), torch.cat(pub), torch.cat(got)
+                print(f"\nall {len(image_ids)} images: vs hw-gelu ref {snr_db(hw, got):.1f} dB cos {cos_sim(hw, got):.5f} | "
+                      f"vs published {snr_db(pub, got):.1f} dB cos {cos_sim(pub, got):.5f} | {hw_s('vision')}")
+                # Projector: isolated (reference projector fed the DEVICE vision output) and end to end.
+                img = ue.projector_read(rows)
+                on = lambda t: t.to(ref.dev, ref.dt)
+                iso, e2e_hw, e2e_pub = (ref.project(on(got), hw_gelu=True).float().cpu(),
+                                        ref.project(on(hw), hw_gelu=True).float().cpu(), ref.project(on(pub)).float().cpu())
+            s, c = snr_db(iso, img), cos_sim(iso, img)
+            proj_bad = bool(torch.isnan(img).any()) or s < args.min_snr or c < args.min_cos
+            ok &= not proj_bad
+            print(f"projector {tuple(img.shape)} {hw_s('projector')}: isolated {s:.1f} dB cos {c:.5f}{'  FAIL' if proj_bad else ''} | "
+                  f"end to end vs hw-gelu ref {snr_db(e2e_hw, img):.1f} dB cos {cos_sim(e2e_hw, img):.5f} | "
+                  f"vs published {snr_db(e2e_pub, img):.1f} dB cos {cos_sim(e2e_pub, img):.5f}")
+            return img
+        if not args.merge_front:
+            img = check_vision()
     if vision_only:
         print(f"hw ms: {hw_ms}")
         print("PASS" if ok else "FAIL")
@@ -1534,10 +1570,15 @@ def main():
             src, i = src + j - i, j
         else:
             i += 1
-    assert src == img.shape[0], f"{src} image placeholders vs {img.shape[0]} image embeddings"
+    assert src == rows // MERGE2, f"{src} image placeholders vs {rows // MERGE2} image embeddings"
     slot_pos = torch.cat([pos[:, :P], (torch.arange(P, S) + delta).expand(3, -1)], 1)
     ue.lm_write_rope("ROPE_PRE", *ref.rope_cos_sin(slot_pos))
     ue.lm_compile(runs, args.max_new)
+    if args.merge_front:        # one launch: vision -> projector -> image scatter -> prefill -> V^T build
+        ue.front_compile()
+        hw_ms["front"] = ue._exec("front", timeout=3600.0) / 1e3
+        utilization(ue, "front", ["front"], hw_ms["front"] * 1e3)
+        img = check_vision()
 
     # ------------------------------------------------------------ prefill
     with torch.no_grad():
@@ -1545,10 +1586,11 @@ def main():
         cache = KVCache(ref.n_lm, ref.kv_heads, L + args.max_new + 1, ref.hd, ref.dev, ref.dt)
         ref_layers = []
         ref.lm_forward(embeds[:P], pos[:, :P], cache, layer_outs=ref_layers)
-    ue._exec("scatter_img")
-    emb_dev = ue.dma_from_accelerator_memory(ue.buf["X_A"], (S, LH)).float()[:P]
     print("\nLM (reference = IF4 weights, fed the device's image embeddings)")
-    report("prompt embeddings", embeds[:P].float().cpu(), emb_dev)
+    if not args.merge_front:    # merged: the layers have already overwritten X_A
+        ue._exec("scatter_img")
+        emb_dev = ue.dma_from_accelerator_memory(ue.buf["X_A"], (S, LH)).float()[:P]
+        report("prompt embeddings", embeds[:P].float().cpu(), emb_dev)
 
     if args.staged == "prefill":
         ops, _ = ue._stack_ops("P", P, LH, ue.lw["layers"], ue.buf["ROPE_PRE"], 0, S, ue.buf["MASK_PRE"])
@@ -1557,11 +1599,13 @@ def main():
             print("staged prefill complete")
         return
 
-    hw_ms["prefill"] = (ue._exec("prefill", timeout=3600.0) + ue._exec("build_vt")) / 1e3
+    if not args.merge_front:
+        hw_ms["prefill"] = (ue._exec("prefill", timeout=3600.0) + ue._exec("build_vt")) / 1e3
     x_dev = ue.dma_from_accelerator_memory(ue.prefill_out, (S, LH)).float()[:P]
-    s, c = report("prefill last layer", ref_layers[-1].float().cpu(), x_dev, f"hw {hw_ms['prefill'] / 1e3:.1f} s")
+    s, c = report("prefill last layer", ref_layers[-1].float().cpu(), x_dev, hw_s("prefill"))
     ok &= not bool(torch.isnan(x_dev).any())
-    utilization(ue, "prefill", ["prefill"], hw_ms["prefill"] * 1e3)
+    if not args.merge_front:
+        utilization(ue, "prefill", ["prefill"], hw_ms["prefill"] * 1e3)
     for layer in (0, LML - 1):
         for name, store in (("KC", cache.K), ("VC", cache.V)):
             report(f"{name[0].lower()} cache layer {layer}", store[layer, :, :P].float().cpu(), ue.lm_read_kv(name, layer, P))
