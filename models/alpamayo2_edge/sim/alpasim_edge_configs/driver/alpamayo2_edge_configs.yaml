@@ -1,0 +1,62 @@
+# @package _global_
+# Runtime settings for Alpamayo 2 Edge: six cameras at 10 Hz.
+# The four front entries are AlpaSim's src/wizard/configs/driver/alpamayo_configs.yaml (main @ affc2eab).
+
+defaults:
+  - _self_
+
+# The driver runs as a host process (it has to reach the accelerator), as AlpaSim's manual driver
+# does: use with driver_source=external_static. Override the address on the command line if needed.
+wizard:
+  external_services:
+    driver:
+      - "localhost:6789"
+  debug_flags:
+    use_localhost: true     # containers on the host network, so the runtime can reach the host driver
+
+runtime:
+  simulation_config:
+    skip_driver_during_force_gt: true
+    # One plan per 0.5 s (the policy is slow); cameras stay at 100 ms. The logged-driving lead-in
+    # must be a whole number of control steps, and Edge needs 2.0 s of frames before its first plan.
+    control_timestep_us: 500_000
+    force_gt_duration_us: 2_000_000
+
+    cameras:
+    - logical_id: camera_cross_left_120fov
+      height: 1080
+      width: 1900  # NRE resizes to 1916
+      frame_interval_us: 100_000  # 10 Hz
+      shutter_duration_us: 30_000
+
+    - logical_id: camera_front_wide_120fov
+      height: 1080
+      width: 1900
+      frame_interval_us: 100_000
+      shutter_duration_us: 30_000
+
+    - logical_id: camera_cross_right_120fov
+      height: 1080
+      width: 1900
+      frame_interval_us: 100_000
+      shutter_duration_us: 30_000
+
+    # UNVERIFIED: no shipped AlpaSim config renders the two rear cameras; whether the
+    # NuRec 26.01 scenes provide them, and at this size, was not checked.
+    - logical_id: camera_rear_left_70fov
+      height: 1080
+      width: 1900
+      frame_interval_us: 100_000
+      shutter_duration_us: 30_000
+
+    - logical_id: camera_rear_right_70fov  # UNVERIFIED, as above
+      height: 1080
+      width: 1900
+      frame_interval_us: 100_000
+      shutter_duration_us: 30_000
+
+    - logical_id: camera_front_tele_30fov
+      height: 1080
+      width: 1900
+      frame_interval_us: 100_000
+      shutter_duration_us: 30_000

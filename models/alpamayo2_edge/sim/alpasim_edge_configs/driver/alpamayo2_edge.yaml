@@ -1,0 +1,44 @@
+# Wizard driver config: `driver=alpamayo2_edge`.
+# Key layout copied from AlpaSim's src/wizard/configs/driver/alpamayo2.yaml (main @ affc2eab);
+# the values that differ are commented. Not run against a wizard.                 # UNVERIFIED as a whole
+
+defaults:
+  - alpamayo2_edge_configs   # six-camera runtime settings
+  - _self_
+
+log_level: ${wizard.log_level}
+
+model:
+  model_type: alpamayo2_edge            # entry point in sim/pyproject.toml
+  # A local snapshot directory, or any non-directory string to use the HF cache
+  # (nvidia/Alpamayo2-Edge at the revision pinned in alpamayo2_edge_cpu_reference.py).
+  checkpoint_path: "nvidia/Alpamayo2-Edge"
+  device: "cuda"
+  force_determinism: false              # ignored: reasoning is greedy, noise is seeded per inference
+  image_decode_device: cpu
+  num_trajectory_samples: 1             # the driver rejects anything else
+
+host: "0.0.0.0"
+port: ???
+
+inference:
+  use_cameras:
+    - camera_cross_left_120fov
+    - camera_front_wide_120fov
+    - camera_cross_right_120fov
+    - camera_rear_left_70fov
+    - camera_rear_right_70fov
+    - camera_front_tele_30fov
+  max_batch_size: 1
+  subsample_factor: 1
+  context_length: 21                    # 21 frames x 100 ms: Edge looks back 2.0 s
+
+route:
+  use_waypoint_commands: false          # navigation is text derived from the route
+
+output_dir: "/mnt/output/driver"
+
+trajectory_optimizer:
+  enabled: false
+
+plot_debug_images: false

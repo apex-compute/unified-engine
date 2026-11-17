@@ -594,6 +594,25 @@ def _check_flux2(text):
                 + ("" if ok else " -- below the gates (step-0 latents >= 30 dB, image PSNR >= 15 dB, embeds >= 25 dB)"))
 
 
+def _check_alpamayo2_edge(text):
+    # Alpamayo 2 Edge (driving VLA) prints TEST_RESULT: {"passed", "traj_max_err_m", "tokens",
+    # "engines", "hw_s"}. "passed" is the script's own gates (vision / projector SNR, no NaN,
+    # trajectory within 0.5 m of the device-equivalent reference). HW-proven at ~0.2 m.
+    m = re.search(r"TEST_RESULT:(\{.*\})", text)
+    if not m:
+        return False, "no TEST_RESULT line (run did not reach the action expert)"
+    try:
+        r = json.loads(m.group(1))
+    except ValueError:
+        return False, "unparseable TEST_RESULT"
+    err = float(r.get("traj_max_err_m", float("nan")))
+    if not (err == err):
+        return False, "trajectory has non-finite values"
+    if not r.get("passed", False):
+        return False, f"script gates failed (trajectory max err {err:.3f} m)"
+    return True, f"trajectory max err {err:.3f} m, {r.get('tokens')} tokens, {r.get('hw_s')} s on {r.get('engines')} engines"
+
+
 def _check_act(text):
     # ACT (LeRobot, 34M) prints a TEST_RESULT: JSON line with actions_snr_db vs the CPU
     # reference. HW-proven at ~38 dB; gate at 35 so a NaN (-inf / nan) or a scrambled
@@ -742,6 +761,12 @@ TESTS = [
     # act (LeRobot ACT): 2 cams + 7-dof -> [chunk, 14] actions, SNR vs CPU reference.
     # --engines is added by the harness generically. Caches params/programs in act_bin/.
     {"name": "act",     "script": "models/act/act_test.py",         "pass_check": _check_act},
+    # alpamayo2_edge (NVIDIA Alpamayo 2 Edge, driving VLA): 22 camera frames -> SigLIP2 vision
+    # -> 4-bit LM prefill + decode -> flow-matching action expert -> 6.4 s trajectory, checked
+    # against the device-equivalent host reference. Needs the 8-engine / 8 GiB layout; about
+    # 80 s on the board per pass and no program bin yet, so every pass compiles.
+    {"name": "alpamayo2_edge", "script": "models/alpamayo2_edge/alpamayo2_edge_test.py", "pass_check": _check_alpamayo2_edge,
+     "mode": "VLA (8 engines)", "no_device": True, "minimum_engines": 8, "required_dram_gib": 8},
     # kokoro (TTS): --fpga runs the ported sections on hardware with per-section SNR
     # bisects vs the CPU reference (on by default) and writes a wav. Bins cached in
     # kokoro_bin/ (frozen instruction image), reused on the next pass.
