@@ -76,7 +76,8 @@ from safetensors.torch import load_file
 import user_dma_core
 from user_dma_core import DRAM_INSTRUCTION_ADDR, TYPE, UE_MODE, UE_VECTOR_SIZE, UnifiedEngine
 from multi_engine_shard import MultiEngineScheduler, PrivateArena, model_multicore_layout
-from nn_lib import eltwise_add_core_dram, layer_norm_core_dram_post_add
+from nn_lib import (eltwise_add_core_dram, layer_norm_core_dram_post_add, strassen_levels, strassen_matmul_core_dram,
+                    strassen_weight_tree)
 
 from alpamayo2_edge_cpu_reference import (  # host oracle + weight loading; no hardware in there
     AIP, EXP, LM, PROJ, STAT_KEYS, VIS, Alpamayo2EdgeRef, KVCache, cos_sim, resolve_model_dir, snr_db, synthetic_inputs,
@@ -105,7 +106,7 @@ PRIVATE_TENSOR_BYTES = 128 << 20   # per engine: vision scratch (~43 MB) + atten
 PRIVATE_ISA_BYTES = 256 << 20      # per engine: its share of the unrolled vision program dominates
 ZERO_CHUNK = 1 << 26               # elements per zero-fill DMA
 
-# Strassen matmuls (--strassen-level N, off at 0; --strassen-ops picks the layers). See _strassen.
+# Strassen matmuls (--strassen-level N, off at 0; --strassen-ops picks the layers). The routine is nn_lib §10.
 ST_LEVEL, ST_OPS, ST_MIN_ROWS = 0, (), 64
 ST_ALL_OPS = ("v.o", "v.fc2", "lm.q", "lm.k", "lm.v", "lm.o", "lm.fc2")
 # The extra weight copies need room: the programs use ~40 MB of their 768 MB, so with Strassen on
@@ -114,21 +115,8 @@ ST_LAYOUT = {"tensor_dram_base": 0xB8000000, "program_dram_base": 0xF8000000}
 
 
 def st_level(K, N):
-    """Deepest level <= ST_LEVEL at which every K and N half is still whole 64-lane blocks."""
-    L = ST_LEVEL
-    while L and (K % (64 << L) or N % (64 << L)):
-        L -= 1
-    return L
-
-
-def st_combos(W, b):
-    """The 7 (weight, bias) pairs one Strassen level needs, W [N, K] -> [N/2, K/2] each.
-    Yij = block (i, j) of W^T. Products: P1 P2 P3 P4 P5 P6 P7 in this order; the layer bias is
-    folded into P1 (b_L + b_R), P2 (b_L) and P5 (b_R) so every output quarter ends with its own half."""
-    n, k = W.shape[0] // 2, W.shape[1] // 2
-    Y11, Y12, Y21, Y22 = W[:n, :k], W[n:, :k], W[:n, k:], W[n:, k:]
-    bl, br, bs = (None, None, None) if b is None else (b[:n], b[n:], b[:n] + b[n:])
-    return [(Y11 + Y22, bs), (Y11, bl), (Y12 - Y22, None), (Y21 - Y11, None), (Y22, br), (Y11 + Y12, None), (Y21 + Y22, None)]
+    """Deepest level <= ST_LEVEL the shape allows."""
+    return strassen_levels(K, N, ST_LEVEL)
 
 
 _FP4_VALUES = [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
@@ -349,32 +337,14 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         print(line)
 
     # ---------------------------------------------------------------- Strassen matmul
-    # A drop-in for one matmul: ordinary row-major [m, k] in, ordinary row-major [m, n] out, bias
-    # included, any depth. One level = 4 strided gathers of the input quarters, 5 sums, 7 half-size
-    # products (each one again a _strassen call, so levels nest), 4 sums and 4 strided writes:
-    #     P1' = (X11+X22)(Y11+Y22)        P2' = (X21+X22) Y11        P5' = (X11+X12) Y22
-    #     C12 = X11 (Y12-Y22) + P5'       C21 = X22 (Y21-Y11) + P2'
-    #     U   = P1' - P2' - P5'
-    #     C22 = (X21-X11)(Y11+Y12) + (U + C12)        C11 = (X12-X22)(Y21+Y22) + (U + C21)
-    # The last product of an output quarter takes the rest of the quarter as a full-matrix bias,
-    # so a quarter costs no extra add; the four quarters are then written into the row-major
-    # result by strided writes of whole 128-byte lines (the kernel refuses a full-matrix bias
-    # together with a strided matmul output, and strided writes are only safe line-aligned).
-    # The weight side is a tree built on the host (_st_tree): 7 children per level, leaves hold a
-    # bf16 address or an IF4 pack. A fused activation is NOT supported.
-
-    def _st_tree(self, W, b, L, store):
-        if L == 0:
-            return {"w": store(W), "b": None if b is None else self._store(b)}
-        return {"c": [self._st_tree(w, bb, L - 1, store) for w, bb in st_combos(W, b)]}
+    # nn_lib.strassen_matmul_core_dram (see nn_lib §10 for how it works and its limits). Here:
+    # the weight tree per layer, the private scratch, and the rows a level cannot take.
 
     def _st_node(self, W, b, L, scr, store=None):
-        """Top node of one layer's Strassen weights; None when the shape allows no level."""
+        """One layer's Strassen weights; None when the shape allows no level."""
         if L == 0:
             return None
-        node = self._st_tree(W.float().cpu(), None if b is None else b.float().cpu(), L, store or self._store)
-        node.update(L=L, scr=scr)
-        return node
+        return {"tree": strassen_weight_tree(W, b, L, store or self._store, self._store), "L": L, "scr": scr}
 
     def _st_scratch(self, scr, uses):
         """Private scratch for every depth. uses: [(rows, K, N, L)] of the layers sharing it."""
@@ -383,108 +353,21 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
             self._palloc(f"{scr}_X{d}", 9 * max((m >> (d + 1)) * (K >> (d + 1)) for m, K, N, L in live))
             self._palloc(f"{scr}_P{d}", 14 * max((m >> (d + 1)) * (N >> (d + 1)) for m, K, N, L in live))
 
-    @staticmethod
-    def _st_reg(E, val):
-        """A register holding `val` (row count or row pitch), shared within one _st_rows call."""
-        if val not in E.st_regs:
-            E.st_regs[val] = E.ue.alloc_isa_reg()
-            E.ue.generate_instruction_add_set(E.st_regs[val], val)
-        return E.st_regs[val]
-
-    @staticmethod
-    def _st_gather(ue, src, pitch, cols, rows, dst, hop=131072):
-        """`cols` lanes of each of `rows` rows at row pitch `pitch` -> contiguous [rows, cols]."""
-        step = max(1, hop // cols)
-        for r0 in range(0, rows, step):
-            take = min(step, rows - r0)
-            stride = dict(stride_bytes_per_chunk=cols * BPE, stride_jump_bytes=pitch * BPE) if take > 1 else {}
-            ue.accelerator_memory_to_sram(accelerator_dram_address=src + r0 * pitch * BPE, sram_address=0x00000,
-                                          element_size=take * cols, **stride)
-            ue.sram_to_accelerator_memory(sram_address=0x00000, accelerator_dram_address=dst + r0 * cols * BPE,
-                                          element_size=take * cols)
-
-    @staticmethod
-    def _st_scatter(ue, src, dst, pitch, cols, rows, hop=131072):
-        """Contiguous [rows, cols] -> `cols` lanes of each row at row pitch `pitch` (whole 128-byte
-        lines only: a strided write chunk that starts or ends inside a line corrupts or hangs)."""
-        assert dst % 128 == 0 and (cols * BPE) % 128 == 0 and (pitch * BPE) % 128 == 0, \
-            f"strided write not line-aligned: dst 0x{dst:X}, {cols} lanes at pitch {pitch}"
-        step = max(1, hop // cols)
-        for r0 in range(0, rows, step):
-            take = min(step, rows - r0)
-            stride = dict(stride_bytes_per_chunk=cols * BPE, stride_jump_bytes=pitch * BPE) if take > 1 else {}
-            ue.accelerator_memory_to_sram(accelerator_dram_address=src + r0 * cols * BPE, sram_address=0x00000,
-                                          element_size=take * cols)
-            ue.sram_to_accelerator_memory(sram_address=0x00000, accelerator_dram_address=dst + r0 * pitch * BPE,
-                                          element_size=take * cols, **stride)
-
-    def _st_mm(self, E, m, k, n, A, leaf, OUT, full):
-        """Leaf product into a contiguous [m, n]. full: an [m, n] full-matrix bias."""
-        assert full is None or leaf["b"] is None
-        kw = dict(C_DRAM_ADDR=leaf["b"], bias_mode="broadcast_N")
-        if full is not None:
-            kw = dict(C_DRAM_ADDR=full, bias_mode="full_matrix")
-        W = leaf["w"]
-        if isinstance(W, tuple):
-            kw.update(is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=W[1])
-            W = W[0]
-        self._flops_acc += 2 * m * k * n
-        E.ue.matmat_mul_core(M=m, K=k, N=n, A_DRAM_ADDR=A, B_DRAM_ADDR=W, OUTPUT_DRAM_ADDR=OUT,
-                             gpr_M_reg=self._st_reg(E, m), **kw)
-
-    def _strassen(self, E, L, m, k, n, X, node, OUT, scr, full=None, depth=0):
-        """C [m, n] = X [m, k] . W^T (+ bias) at level L; X and OUT are contiguous row-major.
-        full: a contiguous [m, n] bias added on top (never together with a node bias)."""
-        if L == 0:
-            return self._st_mm(E, m, k, n, X, node, OUT, full)
-        ue, B = E.ue, self.pbuf[E.e]
-        h, kk, nn = m // 2, k // 2, n // 2
-        xb, pb = B[f"{scr}_X{depth}"], B[f"{scr}_P{depth}"]
-        x11, x12, x21, x22, s1, s2, s3, s4, s5 = (xb + i * h * kk * BPE for i in range(9))
-        p1, p2, p5, u, t1, t2, q11, q12, q21, q22, b11, b12, b21, b22 = (pb + i * h * nn * BPE for i in range(14))
-        r, ADD, SUB = self._st_reg(E, h), UE_MODE.ELTWISE_ADD, UE_MODE.ELTWISE_SUB
-        elt = lambda a, b, o, mode, cols: ue.eltwise_core_dram(M=h, N=cols, dram_a=a, dram_b=b, dram_out=o, mode=mode, gpr_M_reg=r)
-        rec = lambda i, x, out, full=None: self._strassen(E, L - 1, h, kk, nn, x, node["c"][i], out, scr, full, depth + 1)
-        quarters = ((0, 0), (0, 1), (1, 0), (1, 1))
-
-        for dst, (i, j) in zip((x11, x12, x21, x22), quarters):
-            self._st_gather(ue, X + (i * h * k + j * kk) * BPE, k, kk, h, dst)
-        for (a, b, mode), o in zip([(x11, x22, ADD), (x21, x22, ADD), (x11, x12, ADD), (x21, x11, SUB), (x12, x22, SUB)],
-                                   (s1, s2, s3, s4, s5)):
-            elt(a, b, o, mode, kk)
-        if full is not None:
-            for dst, (i, j) in zip((b11, b12, b21, b22), quarters):
-                self._st_gather(ue, full + (i * h * n + j * nn) * BPE, n, nn, h, dst)
-        rec(0, s1, p1)
-        rec(1, s2, p2, full=b21 if full is not None else None)
-        rec(4, s3, p5, full=b12 if full is not None else None)
-        rec(2, x11, q12, full=p5)                               # C12
-        rec(3, x22, q21, full=p2)                               # C21
-        elt(p1, p2, u, SUB, nn), elt(u, p5, u, SUB, nn)
-        elt(u, q12, t2, ADD, nn), elt(u, q21, t1, ADD, nn)
-        if full is not None:        # U lost B21 and B12 with P2' and P5'; give each quarter its own bias back
-            elt(t2, b21, t2, ADD, nn), elt(t2, b22, t2, ADD, nn)
-            elt(t1, b12, t1, ADD, nn), elt(t1, b11, t1, ADD, nn)
-        rec(5, s4, q22, full=t2)                                # C22
-        rec(6, s5, q11, full=t1)                                # C11
-        for src, (i, j) in zip((q11, q12, q21, q22), quarters):
-            self._st_scatter(ue, src, OUT + (i * h * n + j * nn) * BPE, n, nn, h)
-
     def _st_rows(self, E, n, K, N, A, node, OUT, native):
         """One layer on n rows: Strassen on the largest multiple of 2^L rows, the plain matmul
         native(rows, A, OUT) on what is left (it reads its row count from E.r_M)."""
-        L = node["L"]
+        L, B = node["L"], self.pbuf[E.e]
         ns = n - n % (1 << L)
-        E.st_regs = {}
         if ns:
-            self._strassen(E, L, ns, K, N, A, node, OUT, node["scr"])
+            self._flops_acc += 7 ** L * 2 * (ns >> L) * (K >> L) * (N >> L)
+            strassen_matmul_core_dram(E.ue, ns, K, N, A, node["tree"], OUT,
+                                      [(B[f"{node['scr']}_X{d}"], B[f"{node['scr']}_P{d}"]) for d in range(L)])
         if n > ns:
-            keep, E.r_M = E.r_M, self._st_reg(E, n - ns)
+            keep, E.r_M = E.r_M, E.ue.alloc_isa_reg()
+            E.ue.generate_instruction_add_set(E.r_M, n - ns)
             native(n - ns, A + ns * K * BPE, OUT + ns * N * BPE)
-            E.r_M = keep
-        for _ in E.st_regs:
             E.ue.release_isa_reg()
-        E.st_regs = {}
+            E.r_M = keep
 
     # ---------------------------------------------------------------- vision: weights
 
