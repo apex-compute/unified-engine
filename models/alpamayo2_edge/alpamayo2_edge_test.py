@@ -77,6 +77,10 @@ import user_dma_core
 from user_dma_core import DRAM_INSTRUCTION_ADDR, TYPE, UE_MODE, UE_VECTOR_SIZE, UnifiedEngine
 from multi_engine_shard import MultiEngineScheduler, PrivateArena, model_multicore_layout
 from nn_lib import eltwise_add_core_dram, layer_norm_core_dram_post_add
+try:        # nn_lib §10 (Strassen matmul) arrives with its own PR; only --strassen-level needs it
+    from nn_lib import strassen_levels, strassen_matmul_core_dram, strassen_weight_tree
+except ImportError:
+    strassen_levels = strassen_matmul_core_dram = strassen_weight_tree = None
 
 from alpamayo2_edge_cpu_reference import (  # host oracle + weight loading; no hardware in there
     AIP, EXP, LM, PROJ, STAT_KEYS, VIS, Alpamayo2EdgeRef, KVCache, cos_sim, resolve_model_dir, snr_db, synthetic_inputs,
@@ -105,6 +109,44 @@ PRIVATE_TENSOR_BYTES = 128 << 20   # per engine: vision scratch (~43 MB) + atten
 PRIVATE_ISA_BYTES = 256 << 20      # per engine: its share of the unrolled vision program dominates
 ZERO_CHUNK = 1 << 26               # elements per zero-fill DMA
 
+# Strassen matmuls (--strassen-level N, off at 0; --strassen-ops picks the layers). The routine is nn_lib §10.
+ST_LEVEL, ST_OPS, ST_MIN_ROWS = 0, (), 64
+ST_ALL_OPS = ("v.o", "v.fc2", "lm.q", "lm.k", "lm.v", "lm.o", "lm.fc2")
+# The extra weight copies need room: the programs use ~40 MB of their 768 MB, so with Strassen on
+# the tensor and program regions move up (tensors keep 1024 MB, programs 128 MB).
+ST_LAYOUT = {"tensor_dram_base": 0xB8000000, "program_dram_base": 0xF8000000}
+
+
+def st_level(K, N):
+    """Deepest level <= ST_LEVEL the shape allows."""
+    return strassen_levels(K, N, ST_LEVEL)
+
+
+_FP4_VALUES = [-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, -0.0, 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+_FP4_CODES = [15, 14, 13, 12, 11, 10, 9, 8, 0, 1, 2, 3, 4, 5, 6, 7]
+
+
+def if4_pack(W):
+    """quant_lib.quantize("if4", W) on the GPU (same bytes): W [N, K] -> (data, scales, N, K)."""
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    N, K = W.shape
+    b16 = lambda t: t.to(torch.bfloat16).float()
+    vals = torch.tensor(_FP4_VALUES, device=dev)
+    codes = torch.tensor(_FP4_CODES, device=dev, dtype=torch.uint8)
+    data, scales = [], []
+    step = max(1, (1 << 21) // K)
+    for r in range(0, N, step):
+        blk = b16(W[r: r + step].to(dev)).view(-1, K // 64, 64)
+        amax = blk.abs().amax(-1).clamp(min=1e-8)
+        si, sf = b16(amax / 7.0)[..., None], b16(amax / 6.0)[..., None]
+        qi = (blk / si).round().clamp(-8, 7)
+        idx = ((blk / sf)[..., None] - vals).abs().argmin(-1)
+        use_i = (blk - qi * si).pow(2).sum(-1) <= (blk - vals[idx] * sf).pow(2).sum(-1)
+        nib = torch.where(use_i[..., None], (qi.to(torch.int16) & 0xF).to(torch.uint8), codes[idx]).view(-1, K)
+        data.append((nib[:, 0::2] | (nib[:, 1::2] << 4)).cpu())
+        scales.append(torch.where(use_i, -si[..., 0], sf[..., 0]).to(torch.bfloat16).cpu())
+    return (torch.cat(data).numpy().tobytes(), torch.cat(scales).view(torch.int16).numpy().tobytes(), N, K)
+
 
 def init_hang_prevention(ue):
     """5-step hardware clear. MUST stay identical to run_from_bin.py (see skill gotchas)."""
@@ -130,6 +172,8 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         lay = CFG["dram_layout"]
         bases = {k: int(lay[k], 16) for k in ("params_dram_base", "tensor_dram_base", "program_dram_base")}
         self.NE = engines
+        if ST_LEVEL:
+            bases.update(ST_LAYOUT)
         windows = None
         if engines > 1:
             windows, model_base = model_multicore_layout(engines, model_bytes=MODEL_BYTES)
@@ -181,7 +225,7 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
             self.dma_to_accelerator_memory(addr + off * BPE, torch.zeros(n, dtype=torch.bfloat16))
 
     def _alloc(self, elements, zero=False):
-        addr = self.allocate_tensor_dram(elements * BPE)
+        addr = self.allocate_tensor_dram(elements * BPE, align_bytes=128 if ST_LEVEL else 64)
         assert self.get_tensor_dram_addr() <= self.tensor_limit, "tensor arena ran into the program arena"
         if zero:
             self._zero(addr, elements)
@@ -195,7 +239,8 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
             if self.NE == 1:
                 addr = self._alloc(elements, zero=True)
             else:
-                addr = self.arena.alloc_tensor(e, elements * BPE, name)
+                addr = self.arena.alloc_tensor(e, elements * BPE + (64 if ST_LEVEL else 0), name)
+                addr = (addr + 127) & ~127 if ST_LEVEL else addr        # Strassen's strided writes need whole lines
                 self._zero(addr, elements)
             self.pbuf[e][name] = addr
 
@@ -294,6 +339,39 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
             line += "; workers " + ", ".join(f"{w.get_program_dram_usage() / 2**20:.1f}" for w in self.sched.workers) + " MB"
         print(line)
 
+    # ---------------------------------------------------------------- Strassen matmul
+    # nn_lib.strassen_matmul_core_dram (see nn_lib §10 for how it works and its limits). Here:
+    # the weight tree per layer, the private scratch, and the rows a level cannot take.
+
+    def _st_node(self, W, b, L, scr, store=None):
+        """One layer's Strassen weights; None when the shape allows no level."""
+        if L == 0:
+            return None
+        return {"tree": strassen_weight_tree(W, b, L, store or self._store, self._store), "L": L, "scr": scr}
+
+    def _st_scratch(self, scr, uses):
+        """Private scratch for every depth. uses: [(rows, K, N, L)] of the layers sharing it."""
+        for d in range(max((u[3] for u in uses), default=0)):
+            live = [u for u in uses if u[3] > d]
+            self._palloc(f"{scr}_X{d}", 9 * max((m >> (d + 1)) * (K >> (d + 1)) for m, K, N, L in live))
+            self._palloc(f"{scr}_P{d}", 14 * max((m >> (d + 1)) * (N >> (d + 1)) for m, K, N, L in live))
+
+    def _st_rows(self, E, n, K, N, A, node, OUT, native):
+        """One layer on n rows: Strassen on the largest multiple of 2^L rows, the plain matmul
+        native(rows, A, OUT) on what is left (it reads its row count from E.r_M)."""
+        L, B = node["L"], self.pbuf[E.e]
+        ns = n - n % (1 << L)
+        if ns:
+            self._flops_acc += 7 ** L * 2 * (ns >> L) * (K >> L) * (N >> L)
+            strassen_matmul_core_dram(E.ue, ns, K, N, A, node["tree"], OUT,
+                                      [(B[f"{node['scr']}_X{d}"], B[f"{node['scr']}_P{d}"]) for d in range(L)])
+        if n > ns:
+            keep, E.r_M = E.r_M, E.ue.alloc_isa_reg()
+            E.ue.generate_instruction_add_set(E.r_M, n - ns)
+            native(n - ns, A + ns * K * BPE, OUT + ns * N * BPE)
+            E.ue.release_isa_reg()
+            E.r_M = keep
+
     # ---------------------------------------------------------------- vision: weights
 
     def vision_weight_init(self, ref, shapes):
@@ -312,6 +390,11 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
             out[:, : t.shape[1]] = t
             return out
 
+        # Strassen layers: the 7 weight combinations replace the plain weight unless some image has a
+        # row count the level cannot split (those rows then run the plain matmul).
+        Lv = {"o": st_level(VN * VD, VH) if "v.o" in ST_OPS else 0, "fc2": st_level(VIP, VH) if "v.fc2" in ST_OPS else 0}
+        self.v_st = [(max(gh * gw for gh, gw in shapes), K, VH, Lv[op]) for op, K in (("o", VN * VD), ("fc2", VIP)) if Lv[op]]
+        plain = lambda op: not Lv[op] or any((gh * gw) % (1 << Lv[op]) for gh, gw in shapes)
         self.vw = {"patch_w": st(w[VIS + "embeddings.patch_embedding.weight"]),
                    "patch_b": st(w[VIS + "embeddings.patch_embedding.bias"]),
                    "post_w": st(w[VIS + "post_layernorm.weight"]),
@@ -325,16 +408,19 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
                 "q": st(w[a + "q_proj.weight"] * q_scale), "q_b": st(w[a + "q_proj.bias"] * q_scale),
                 "k": st(w[a + "k_proj.weight"]), "k_b": st(w[a + "k_proj.bias"]),
                 "v": st(w[a + "v_proj.weight"]), "v_b": st(w[a + "v_proj.bias"]),
-                "o": st(w[a + "out_proj.weight"]), "o_b": st(w[a + "out_proj.bias"]),
+                "o": st(w[a + "out_proj.weight"]) if plain("o") else None, "o_b": st(w[a + "out_proj.bias"]),
+                "st_o": self._st_node(w[a + "out_proj.weight"], w[a + "out_proj.bias"], Lv["o"], "SV"),
+                "st_fc2": self._st_node(cols(w[p + "mlp.fc2.weight"], VIP), w[p + "mlp.fc2.bias"], Lv["fc2"], "SV"),
                 "ln2_w": st(w[p + "layer_norm2.weight"]), "ln2_b": st(w[p + "layer_norm2.bias"]),
                 "fc1": st(rows(w[p + "mlp.fc1.weight"], VIP)), "fc1_b": st(rows(w[p + "mlp.fc1.bias"], VIP)),
-                "fc2": st(cols(w[p + "mlp.fc2.weight"], VIP)), "fc2_b": st(w[p + "mlp.fc2.bias"]),
+                "fc2": st(cols(w[p + "mlp.fc2.weight"], VIP)) if plain("fc2") else None, "fc2_b": st(w[p + "mlp.fc2.bias"]),
             })
         # Learned 16x16 position grid, resized per shape on the host (a constant of the shape).
         for gh, gw in shapes:
             pos = ref.vision_pos_embed(torch.tensor([[1, gh, gw]])).float().cpu()
             self.vw["pos"][(gh, gw)] = st(rows(pos, _pad_seq(gh * gw)))
-        print(f"vision weights stored (bf16): params DRAM {self.get_params_dram_usage() / 2**20:.0f} MB")
+        note = "".join(f", Strassen level {L} on {'o_proj' if K == VN * VD else 'fc2'}" for _, K, _, L in self.v_st)
+        print(f"vision weights stored (bf16{note}): params DRAM {self.get_params_dram_usage() / 2**20:.0f} MB")
 
     # ---------------------------------------------------------------- vision: tensors
 
@@ -363,6 +449,7 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
             self._palloc(name, NM * VN * VDP)
         self._palloc("ATTN", NM * VN * VD)
         self._palloc("ATTN_SCRATCH", (VDP + NM) * NM + NM * VDP)
+        self._st_scratch("SV", self.v_st)
         self.mask = {}
         for im in self.images:
             if im["key"] in self.mask:
@@ -476,16 +563,20 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
                     E, n, N, b["Q_HM"] + h * head_bytes, b["K_HM"] + h * head_bytes, b["V_HM"] + h * head_bytes,
                     self.mask[key], b["ATTN"] + h * VD * BPE, out_row_stride=VN * VD),
                     b["ATTN"] if last else None, (n, VN * VD) if last else None)
-            add(f"{L}.o_proj", lambda la=la: self._mm(E, n, VN * VD, VH, b["ATTN"], la["o"], b["O_PROJ"], la["o_b"]),
-                b["O_PROJ"], (n, VH))
+            o_mm = lambda rows, a, o, la=la: self._mm(E, rows, VN * VD, VH, a, la["o"], o, la["o_b"])
+            fc2_mm = lambda rows, a, o, la=la: self._mm(E, rows, VIP, VH, a, la["fc2"], o, la["fc2_b"])
+            if la["st_o"]:
+                o_mm = lambda rows, a, o, la=la, f=o_mm: self._st_rows(E, rows, VN * VD, VH, a, la["st_o"], o, f)
+            if la["st_fc2"]:
+                fc2_mm = lambda rows, a, o, la=la, f=fc2_mm: self._st_rows(E, rows, VIP, VH, a, la["st_fc2"], o, f)
+            add(f"{L}.o_proj", lambda f=o_mm: f(n, b["ATTN"], b["O_PROJ"]), b["O_PROJ"], (n, VH))
             add(f"{L}.norm2", lambda h_in=h_in, la=la: layer_norm_core_dram_post_add(
                 ue, M=n, N=VH, A_DRAM_ADDR=h_in, B_DRAM_ADDR=b["O_PROJ"],
                 ADDOUTPUT_DRAM_ADDR=b["RESID"], NORMOUTPUT_DRAM_ADDR=b["NORM"],
                 GAMMA_DRAM_ADDR=la["ln2_w"], BETA_DRAM_ADDR=la["ln2_b"]), b["NORM"], (n, VH))
             add(f"{L}.fc1", lambda la=la: self._mm(E, n, VH, VIP, b["NORM"], la["fc1"], b["MLP"], la["fc1_b"], gelu=True),
                 b["MLP"], (n, VIP))
-            add(f"{L}.fc2", lambda la=la: self._mm(E, n, VIP, VH, b["MLP"], la["fc2"], b["MLP_OUT"], la["fc2_b"]),
-                b["MLP_OUT"], (n, VH))
+            add(f"{L}.fc2", lambda f=fc2_mm: f(n, b["MLP"], b["MLP_OUT"]), b["MLP_OUT"], (n, VH))
             add(f"{L}.out", lambda h_out=h_out: eltwise_add_core_dram(
                 ue, size=n * VH, A_DRAM_ADDR=b["RESID"], B_DRAM_ADDR=b["MLP_OUT"], OUTPUT_DRAM_ADDR=h_out),
                 h_out, (n, VH))
@@ -690,8 +781,13 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         self.allocate_params_dram(len(data))
         return (d_addr, s_addr)
 
-    def lm_weight_init(self, ref, packs):
+    def lm_weight_init(self, ref, packs, originals=None):
+        """originals: {"<layer>.<op>": unquantized weight} of the Strassen layers (see lm_strassen_sources)."""
         w, st, q = ref.w, self._store, self._qstore
+        originals, qs = originals or {}, lambda W: self._qstore(if4_pack(W))
+        node = lambda key: (self._st_node(originals[key], None, st_level(originals[key].shape[1], originals[key].shape[0]), "SL", qs)
+                            if key in originals else None)
+        self.l_st = sorted({(t.shape[1], t.shape[0], st_level(t.shape[1], t.shape[0])) for t in originals.values()})
         self.lw = {"norm": st(w[LM + "norm.weight"]), "head": q(packs["head"]), "layers": []}
         for li in range(LML):
             p = f"{LM}layers.{li}."
@@ -700,8 +796,11 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
                 "q": q(packs[f"{li}.q"]), "k": q(packs[f"{li}.k"]), "v": q(packs[f"{li}.v"]), "o": q(packs[f"{li}.o"]),
                 "fc1": [q(packs[f"{li}.fc1.{i}"]) for i in range(2)],
                 "fc2": [q(packs[f"{li}.fc2.{i}"]) for i in range(2)],
+                "st": {"q": node(f"{li}.q"), "k": node(f"{li}.k"), "v": node(f"{li}.v"), "o": node(f"{li}.o"),
+                       "fc2": [node(f"{li}.fc2.{i}") for i in range(2)]},
             })
-        print(f"LM weights stored (IF4): params DRAM {self.get_params_dram_usage() / 2**20:.0f} MB")
+        note = f", Strassen (K, N, level): {self.l_st}" if self.l_st else ""
+        print(f"LM weights stored (IF4{note}): params DRAM {self.get_params_dram_usage() / 2**20:.0f} MB")
 
     def expert_weight_init(self, ref):
         w, st = ref.w, self._store
@@ -754,6 +853,7 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         self._palloc("V_T", HD * CAP)
         self._palloc("SCORE", S * S)
         self._palloc("SQ", S * HD)
+        self._st_scratch("SL", [(-(-P // self.NE), K, N, L) for K, N, L in self.l_st if L])     # prefill rows per engine
         # Zeroed: slots no stage ever writes are masked, but still flow through V^T and P.V.
         kv = LML * KVH * CAP * HD
         b["KC"], b["VC"] = self._alloc(kv, zero=True), self._alloc(kv, zero=True)
@@ -899,8 +999,14 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         def row(label, fn, addr, shape):
             ops.append((f"{L}.{label}", ("row",), lambda E, r0, n, c0, cn: fn(E, r0, n), addr, shape))
 
-        def mm(label, K, N, A, W, OUT, **act):
+        S = wl.get("st", {})
+
+        def mm(label, K, N, A, W, OUT, st=None, **act):
             def fn(E, r0, n, c0, cn):
+                if st is not None and cn == N and n >= ST_MIN_ROWS:       # prefill rows; decode / expert stay plain
+                    self._st_rows(E, n, K, N, A + r0 * K * BPE, st, OUT + r0 * N * BPE,
+                                  lambda rows, a, o: self._mmw(E, rows, K, N, a, W, o))
+                    return
                 self._mmw(E, n, K, cn, A + r0 * K * BPE, self._wshard(W, K, c0), OUT + (r0 * N + c0) * BPE,
                           out_stride=N if (cn < N and n > 1) else None, **act)
             ops.append((f"{L}.{label}", ("mm", N), fn, OUT, (M, N)))
@@ -949,13 +1055,13 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
                                        mask, b["ATT"] + h * HD * BPE, parts=parts)
 
         norm("norm1", x_in, b["LNORM"], wl["ln1"])
-        mm("q", H, LQW, b["LNORM"], wl["q"], b["LQ"])
-        mm("k", H, KVW, b["LNORM"], wl["k"], b["LK"])
-        mm("v", H, KVW, b["LNORM"], wl["v"], b["LV"])
+        mm("q", H, LQW, b["LNORM"], wl["q"], b["LQ"], st=S.get("q"))
+        mm("k", H, KVW, b["LNORM"], wl["k"], b["LK"], st=S.get("k"))
+        mm("v", H, KVW, b["LNORM"], wl["v"], b["LV"], st=S.get("v"))
         rope_op("rope_q", "LQ", QH)
         rope_op("rope_k", "LK", KVH)
         ops.append((f"{L}.attn", ("heads",), attention, b["ATT"], (M, LQW)))
-        mm("o", LQW, H, b["ATT"], wl["o"], b["LO"])
+        mm("o", LQW, H, b["ATT"], wl["o"], b["LO"], st=S.get("o"))
         eltwise("res", x_in, b["LO"], b["RES"], UE_MODE.ELTWISE_ADD, H)
         norm("norm2", b["RES"], b["LNORM"], wl["ln2"])
         for i in range(parts):        # relu^2 MLP; the LM's 9216 runs as two 4608 halves (IF4 K <= 8192)
@@ -963,7 +1069,7 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         for i in range(parts):
             eltwise(f"sq_{i}", hbuf[i], hbuf[i], hbuf[i], UE_MODE.ELTWISE_MUL, I)
         for i in range(parts):
-            mm(f"fc2_{i}", I, H, hbuf[i], wl["fc2"][i], mbuf[i])
+            mm(f"fc2_{i}", I, H, hbuf[i], wl["fc2"][i], mbuf[i], st=S["fc2"][i] if S else None)
         if parts == 2:
             eltwise("fc2_sum", b["MA"], b["MB"], b["MA"], UE_MODE.ELTWISE_ADD, H)
         eltwise("out", b["RES"], b["MA"], x_out, UE_MODE.ELTWISE_ADD, H)
@@ -1208,6 +1314,22 @@ def prepare_lm_if4(ref):
     return packs
 
 
+def lm_strassen_sources(ref):
+    """The unquantized weights of the LM layers --strassen-ops selects, taken BEFORE prepare_lm_if4
+    swaps the reference to dequantized weights: Strassen quantizes its own 7 combinations."""
+    out, half = {}, LI // 2
+    names = {"q": "self_attn.q_proj", "k": "self_attn.k_proj", "v": "self_attn.v_proj", "o": "self_attn.o_proj"}
+    for li in range(LML if ST_LEVEL else 0):
+        p = f"{LM}layers.{li}."
+        for op, name in names.items():
+            if f"lm.{op}" in ST_OPS:
+                out[f"{li}.{op}"] = ref.w[p + name + ".weight"].cpu().clone()
+        if "lm.fc2" in ST_OPS:
+            for i in range(2):
+                out[f"{li}.fc2.{i}"] = ref.w[p + "mlp.fc2.weight"][:, i * half: (i + 1) * half].cpu().clone()
+    return out
+
+
 # ----------------------------------------------------------------------------- driver
 
 def pick_sample(path):
@@ -1263,6 +1385,11 @@ def main():
                     help="skip the per-op-kind timing of one decode step and one denoise step that follows the run")
     ap.add_argument("--profile-vision", action="store_true",
                     help="after the run, time the vision stage by op kind (recompiles it 7 times; adds a few minutes)")
+    ap.add_argument("--strassen-level", type=int, default=0, choices=(0, 1, 2, 3),
+                    help="Strassen depth for the layers in --strassen-ops (0 = off); a layer whose widths "
+                         "cannot split that deep uses the deepest level they allow")
+    ap.add_argument("--strassen-ops", default="v.o,v.fc2,lm.fc2",
+                    help=f"comma list of {', '.join(ST_ALL_OPS)} (v = vision tower, lm = prefill)")
     ap.add_argument("--max-new", type=int, default=CFG["model"]["max_new_tokens"])
     ap.add_argument("--steps", type=int, default=CFG["action_expert"]["flow_steps"])
     ap.add_argument("--seed", type=int, default=0)
@@ -1271,6 +1398,12 @@ def main():
     ap.add_argument("--max-traj-err", type=float, default=0.5, help="gate: max |xyz error| vs the device-equivalent reference (m)")
     args = ap.parse_args()
     vision_only = args.stop_at == "vision" or args.staged == "vision"
+    global ST_LEVEL, ST_OPS
+    ST_LEVEL, ST_OPS = args.strassen_level, tuple(o for o in args.strassen_ops.split(",") if o) if args.strassen_level else ()
+    assert all(o in ST_ALL_OPS for o in ST_OPS), f"--strassen-ops: unknown entry in {ST_OPS}"
+    if ST_LEVEL:
+        assert strassen_levels is not None, "--strassen-level needs the Strassen section of nn_lib.py (not in this checkout)"
+        print(f"Strassen level {ST_LEVEL} on {', '.join(ST_OPS)}")
 
     sample = pick_sample(args.golden)
     if sample is None:      # no captured sample (capture needs NVIDIA's code): small built-in input, no NVIDIA comparison
@@ -1373,9 +1506,10 @@ def main():
     types = packed["tokenized_data.mm_token_type_ids"][0]
     L = ids.shape[0]
     P = L - 1                                   # the last prompt token is the first decode step
+    originals = lm_strassen_sources(ref)
     packs = prepare_lm_if4(ref)
-    ue.lm_weight_init(ref, packs)
-    del packs
+    ue.lm_weight_init(ref, packs, originals)
+    del packs, originals
     ue.expert_weight_init(ref)
     ue.lm_tensor_init(P, args.max_new)
     S, CAP = ue.S, ue.KV_CAP
