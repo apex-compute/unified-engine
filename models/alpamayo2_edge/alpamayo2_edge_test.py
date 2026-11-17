@@ -1679,6 +1679,9 @@ def main():
         ue.profile("expert")
     if args.profile_vision and "vision" in ue.hw_us:
         ue.profile_vision()
+    # one machine-readable line for model_auto_test.py
+    print("TEST_RESULT:" + json.dumps({"passed": bool(ok), "traj_max_err_m": round(err, 4), "tokens": len(out),
+                                       "engines": engines, "hw_s": round(sum(hw_ms.values()) / 1e3, 1)}))
     print("PASS" if ok else f"FAIL (gates: vision/projector snr >= {args.min_snr} dB, no NaN, trajectory max err <= {args.max_traj_err} m)")
     sys.exit(0 if ok else 1)
 
