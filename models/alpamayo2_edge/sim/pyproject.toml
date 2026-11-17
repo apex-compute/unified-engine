@@ -22,7 +22,7 @@ alpamayo2_edge = "alpasim_edge_driver:Alpamayo2EdgeModel"
 alpamayo2_edge = "alpasim_edge_configs"
 
 [tool.setuptools]
-py-modules = ["alpasim_edge_driver", "edge_policy", "edge_inputs", "edge_device"]
+py-modules = ["alpasim_edge_driver", "edge_policy", "edge_inputs", "edge_device", "edge_device_cached"]
 packages = ["alpasim_edge_configs", "alpasim_edge_configs.driver"]
 
 [tool.setuptools.package-data]

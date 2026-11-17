@@ -6,6 +6,8 @@
 #   SEED=1000 COOLDOWN=30 ALPASIM=~/alpasim models/alpamayo2_edge/sim/run_closed_loop.sh turn
 #   BACKENDS="device host" ...                                   # also the GPU device-equivalent drive
 #   BACKENDS=stock ... straight turn                             # NVIDIA's published model on the GPU (no board)
+#   BACKENDS=cached ...                                          # FPGA with the frame cache: only frames not seen in an
+#                                                                # earlier plan go through vision (edge_device_cached.py)
 #
 # If the board dies mid-drive the FPGA driver says so and waits: reset the board, then
 # `touch ~/a2e_resume` in another shell. Do not stop this script -- the drive resumes at the same plan.
@@ -41,17 +43,18 @@ stop_driver() {
 }
 trap 'stop_driver; exit 130' INT TERM
 
-# drive <backend: device|host> <scene name>
+# drive <backend: device|cached|host|stock> <scene name>
 drive() {
     local backend=$1 name=$2 tag="$2_$1" ready="engines ready"
     local run="$OUT/$tag" log="$OUT/$tag.driver.log"
-    local a2e_backend=$backend equiv=1
+    local a2e_backend=$backend equiv=1 cache=0
     [ "$backend" = stock ] && { a2e_backend=host; equiv=0; }      # stock: NVIDIA's published model on the GPU
+    [ "$backend" = cached ] && { a2e_backend=device; cache=1; }   # cached: the FPGA, reusing frames seen in earlier plans
     [ "$a2e_backend" = host ] && ready="Starting alpamayo2_edge driver"
     rm -rf "$run" "$OUT/$tag.plans"
     echo; echo "=== $name on $backend: starting the driver ($(date +%T)) ==="
     cd "$ALPASIM" || exit 1
-    A2E_BACKEND=$a2e_backend A2E_HOST_EQUIV=$equiv A2E_SEED=$SEED A2E_DUMP_DIR="$OUT/$tag.plans" \
+    A2E_BACKEND=$a2e_backend A2E_HOST_EQUIV=$equiv A2E_VISION_CACHE=$cache A2E_SEED=$SEED A2E_DUMP_DIR="$OUT/$tag.plans" \
         setsid uv run --no-sync --project src/driver python -u -m alpasim_driver.main \
         --config-path="$SIM_DIR/host_driver_config" --config-name=alpamayo2_edge > "$log" 2>&1 &
     DRIVER_PID=$!
@@ -87,7 +90,7 @@ out, names = Path(sys.argv[1]), sys.argv[2:]
 keys = ["collision_any", "offroad", "dist_traveled_m", "gt_dist_traveled_m", "dist_to_gt_trajectory", "min_distance_to_obstacle_m"]
 for name in names:
     series = {}
-    for backend in ("device", "host", "stock"):
+    for backend in ("device", "cached", "host", "stock"):
         f = out / f"{name}_{backend}" / "aggregate" / "metrics_unprocessed.parquet"
         if f.exists():
             df = pl.read_parquet(f)
@@ -100,13 +103,15 @@ for name in names:
         if not series:
             print(f"{name}: no finished run")
         continue
-    other = "stock" if "stock" in series else "host"
+    other = next(b for b in ("stock", "host", "cached") if b in series)
     d, h = series["device"], series[other]
-    print(f"\n{name}: FPGA vs GPU ({'published model' if other == 'stock' else 'device-equivalent model'})")
+    what = {"stock": "GPU (published model)", "host": "GPU (device-equivalent model)", "cached": "FPGA with the frame cache"}[other]
+    col = "cache" if other == "cached" else "  GPU"
+    print(f"\n{name}: FPGA vs {what}")
     print(f"  collisions {max(d['collision_any']):.0f} vs {max(h['collision_any']):.0f}, off-road {max(d['offroad']):.0f} vs {max(h['offroad']):.0f}, "
           f"closest obstacle {min(d['min_distance_to_obstacle_m']):.2f} vs {min(h['min_distance_to_obstacle_m']):.2f} m, "
           f"recorded drive {d['gt_dist_traveled_m'][-1]:.1f} m")
-    print("   t (s) | sideways from recorded path (m): FPGA   GPU | travelled (m): FPGA    GPU")
+    print(f"   t (s) | sideways from recorded path (m): FPGA {col} | travelled (m): FPGA  {col}")
     n = min(len(d["dist_traveled_m"]), len(h["dist_traveled_m"]))
     for i in range(0, n, 4):
         print(f"   {i * 0.5:5.1f} | {d['dist_to_gt_trajectory'][i]:38.2f} {h['dist_to_gt_trajectory'][i]:5.2f} | "
