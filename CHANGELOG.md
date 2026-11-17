@@ -95,7 +95,7 @@ A drop-in replacement for one large `matmat_mul_core` call that does 7 half-size
 - **Scratch.** 9 input-quarter and 14 output-quarter buffers per depth, private per engine, zero-filled once.
 - **Whole models.** Alpamayo 2 Edge at level 1: 80.4 s -> 77.8 s (3% faster), trajectory error 0.18 m -> 0.87 m; the 4-bit prefill layers cause the error, the bf16 vision layers do not. Qwen3-4B perplexity: 19.4 plain, 21.5 / 24.3 / 40.4 at levels 1 / 2 / 3.
 
-**Status.** `nn_lib.py` holds the only implementation. It is the routine that ran on the board inside Alpamayo 2 Edge at level 1, lifted out; Alpamayo now calls it (`alpamayo2_edge_test.py --strassen-level N --strassen-ops ...` is the working example of wiring it into a model). After the lift it has been checked on the host only (levels 1-3 against the exact product), not yet re-run on the board. The experiments behind the numbers (shape sweep, level probe, LLM quality test, CSVs, plots) were removed from the tree and are in git history: `git show 68189d7 --stat -- strassen/`.
+**Status.** `nn_lib.py` holds the only implementation. It is the routine that ran on the board inside Alpamayo 2 Edge at level 1, lifted out; Alpamayo calls it (`models/alpamayo2_edge/alpamayo2_edge_test.py --strassen-level N --strassen-ops ...`, which lands with the Alpamayo 2 Edge model, is the working example of wiring it into a model). After the lift it has been checked on the host only (levels 1-3 against the exact product), not yet re-run on the board. The experiments behind the numbers (shape sweep, level probe, LLM quality test, CSVs, plots) were removed from the tree and are in git history: `git show 68189d7 --stat -- strassen/`.
 
 ---
 
