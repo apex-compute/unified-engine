@@ -60,6 +60,45 @@ New instruction generators added to `UnifiedEngine`:
 
 ---
 
+### Strassen matmul — `nn_lib.py` §10 (optional, off by default)
+
+A drop-in replacement for one large `matmat_mul_core` call that does 7 half-size products instead of 8, nested up to 3 levels. It trades accuracy for speed, so **no model uses it by default**. It is kept in `nn_lib.py` so a future model with very large matmuls can opt in.
+
+**When it is worth trying:** a matmul with K and N in the thousands, weights in bf16, and accuracy headroom of 10 dB or more per level. Do not use it on small matmuls, on 4-bit LLM layers, or on a matmul with a fused activation.
+
+**API** (all in `nn_lib.py`):
+
+| Function | Purpose |
+|----------|---------|
+| `strassen_levels(K, N, max_level)` | Deepest level the shape allows |
+| `strassen_weight_tree(W, b, levels, store_w, store_b)` | Host, at weight-init: forms and stores the 7^levels leaf weights |
+| `strassen_scratch_elements(M, K, N, levels)` | Scratch size per depth |
+| `strassen_matmul_core_dram(ue, M, K, N, A, tree, OUT, scratch)` | Emits the program; row-major in, row-major out, bias included |
+
+**How it works.** The weight is split into quarters and the 7 Strassen weight combinations are formed on the host in fp32, then stored (and quantized) one by one, so weight storage grows 1.75x per level. On the device, one level is 4 strided gathers of the input quarters, 5 elementwise sums, 7 half-size products, 4 elementwise sums and 4 strided writes of the output quarters. The last product of each output quarter adds the rest of that quarter through a full-matrix bias, so the quarters need no extra add. The formulas are in the `nn_lib.py` section header.
+
+**Measured on the board** (Alveo U50, one matmul, 4096 x 7680 -> 8192):
+
+| Level | Work | Weights | bf16 time | bf16 SNR | IF4 time | IF4 SNR |
+|-------|------|---------|-----------|----------|----------|---------|
+| 0 (plain) | 100% | 1x | 1.00x | 55.0 dB | 1.00x | ~20 dB |
+| 1 | 87.5% | 1.75x | 0.82x | 43.9 dB | 0.88x | ~14 dB |
+| 2 | 76.6% | 3.06x | 0.71x | 37.3 dB | 0.78x | ~8 dB |
+| 3 | 67.0% | 5.36x | 0.64x | 31.2 dB | 0.70x | ~2 dB |
+
+**Limitations found:**
+
+- **Accuracy drops every level**: about 11 dB at level 1 and 6 dB per further level in bf16, and 6 dB per level with 4-bit weights. Errors of separate layers add up.
+- **Small shapes get slower.** At K = N = 256 it is 1.26x slower. Across a 640-shape sweep it was faster on 215 shapes with one engine and on 121 with eight engines.
+- **Shape rules.** K and N must be multiples of 128 * 2^(levels-1), M a multiple of 2^levels (the caller runs leftover rows through the plain matmul), K below 8192, and the output address 128-byte aligned. A half narrower than 64 lanes would have to be padded and costs more work than it saves.
+- **No fused activation.** A matmul that carries GELU or a clamp cannot use it.
+- **Scratch.** 9 input-quarter and 14 output-quarter buffers per depth, private per engine, zero-filled once.
+- **Whole models.** Alpamayo 2 Edge at level 1: 80.4 s -> 77.8 s (3% faster), trajectory error 0.18 m -> 0.87 m; the 4-bit prefill layers cause the error, the bf16 vision layers do not. Qwen3-4B perplexity: 19.4 plain, 21.5 / 24.3 / 40.4 at levels 1 / 2 / 3.
+
+**Status.** The routine in `nn_lib.py` is the one run on the board inside Alpamayo 2 Edge at level 1 (`alpamayo2_edge_test.py --strassen-level 1`), lifted out. The lifted copy has been checked on the host only (levels 1-3 against the exact product), not yet on the board. The experiments behind the numbers (shape sweep, level probe, LLM quality test, CSVs, plots) are in git history: `git show 68189d7 --stat -- strassen/`.
+
+---
+
 ### TurboQuant — `tq_utils.py` (new file)
 
 New module implementing Lloyd-Max optimal codebook computation for TurboQuant quantization:
