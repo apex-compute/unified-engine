@@ -1387,6 +1387,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.write_captured_instructions_to_dram(program_addr)
         program_bytes = self.get_capture_instruction_size_bytes()
         self.allocate_program_dram(program_bytes)
+        self.enc_flops = total_flops
         return program_addr, program_bytes
     def compile_decoder(self):
         """Compile decoder programs with on-device DMA (no host round-trips per step).
@@ -1614,13 +1615,14 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         self.allocate_params_dram(total)
         _original_print(f"  Loading Toeplitz Staged BF16 Weights... {total / 1024**2:.1f} MB from bin")
         return True
-    def dump_programs(self, program_addrs, L_pad):
+    def dump_programs(self, program_addrs, L_pad, flops=None):
         """Dump compiled programs to bin + json manifest in parakeet_bin/.
-        program_addrs: dict of {name: (dram_addr, size_bytes)}."""
+        program_addrs: dict of {name: (dram_addr, size_bytes)}; flops: the programs' counted FLOPs
+        ({stage: count}), kept so a run that loads them still reports throughput."""
         bin_dir = os.path.join(self.script_dir, "parakeet_bin")
         bin_path = os.path.join(bin_dir, "programs.bin")
         meta_path = os.path.join(bin_dir, "programs.json")
-        manifest = {"L_pad": L_pad, "programs": {}}
+        manifest = {"L_pad": L_pad, "programs": {}, "flops": dict(flops or {})}
         all_bytes = bytearray()
         for name, (addr, size) in program_addrs.items():
             buf = bytearray(size)
@@ -1653,6 +1655,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             return None
         with open(bin_path, "rb") as f:
             all_bytes = f.read()
+        self.program_flops = manifest.get("flops", {})
         addrs = {}
         for name, meta in manifest["programs"].items():
             data = all_bytes[meta["offset"]:meta["offset"] + meta["size"]]
@@ -1695,6 +1698,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
         t = 0
         last_token = self.blank_id
         total_steps = 0
+        hw_us = 0.0  # the engine's latency counter over every decoder program launch
         while t < L:
             symbols = 0
             while symbols < self.max_symbols_per_step:
@@ -1702,18 +1706,18 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
                 self.isa_add_set_core(self.TOKEN_REG, ue_35bit_addr_shifter(last_token * H * bpe))
                 self.isa_add_set_core(self.ENC_T_REG, ue_35bit_addr_shifter(t * D * bpe))
                 # Predictor: state save + embedding lookup (register-addressed) + LSTM
-                self.program_execute(pred_prog)
+                hw_us += self.program_execute(pred_prog)[0]
                 # Joint token: enc_out[t] copy (register-addressed) + pred_out copy + projections + argmax
-                self.program_execute(tok_prog)
+                hw_us += self.program_execute(tok_prog)[0]
                 token_id = self.get_arg_max_index()
                 # Joint duration -> hardware argmax
-                self.program_execute(dur_prog)
+                hw_us += self.program_execute(dur_prog)[0]
                 dur_idx = self.get_arg_max_index()
                 dur = self.tdt_durations[dur_idx] if dur_idx < len(self.tdt_durations) else 0
                 total_steps += 1
                 if token_id == self.blank_id:
                     # Restore LSTM state from on-device save buffers
-                    self.program_execute(restore_prog)
+                    hw_us += self.program_execute(restore_prog)[0]
                     t += max(dur, 1)
                     break
                 else:
@@ -1726,7 +1730,95 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             else:
                 t += 1
         _original_print(f"  Decode: {total_steps} joint steps, {len(tokens)} tokens emitted")
+        self.dec_hw_us, self.dec_steps, self.dec_tokens = hw_us, total_steps, len(tokens)
         return tokens
+
+def write_run_summary(engine, args, *, audio_path, audio_dur, T_mel, L, L_pad, mel_flops, sub_hw_us, enc_hw_us,
+                      walls, text) -> str:
+    """parakeet_test_<dev>.md beside this script: hardware, sizes and per-stage metrics, as the other models' tests
+    write theirs. Launches nothing on the FPGA.
+
+    Two clocks are reported per stage. The HW counter is the engine's latency over the stage's programs (summed
+    over every launch); the CPU timer wraps the stage with its host work (input DMA, register writes, argmax
+    readback, the encoder output copied for the decoder). FLOPs are the programs' counted ones (programs.json):
+    the mel matmul, the subsampling convolutions and linear, the encoder, and the decoder per joint step (predictor,
+    token and duration heads); the mel norm, transposes and im2col add none.
+    """
+    clock_ns = getattr(engine, "_clock_period_ns", None) or user_dma_core.CLOCK_CYCLE_TIME_NS
+    freq_mhz = 1000.0 / clock_ns if clock_ns else 0.0
+    peak = freq_mhz * 128 / 1000.0  # GFLOPS: 128 lanes x 1 core
+    try:
+        hw = f"0x{engine.user_read_reg32(user_dma_core.UE_FPGA_VERSION_ADDR) & 0xFFFFFFFF:08x}"
+    except Exception as exc:  # noqa: BLE001 - the summary states what it could not read
+        hw = f"(read failed: {exc})"
+    flops = getattr(engine, "program_flops", {}) or {}
+    dec_steps = getattr(engine, "dec_steps", 0)
+    dec_hw_us = getattr(engine, "dec_hw_us", 0.0)
+    stages = [
+        ("Mel + subsampling", sub_hw_us, mel_flops + flops["subsampling"] if "subsampling" in flops else None, walls[0]),
+        (f"Encoder ({engine.num_layers} layers)", enc_hw_us, flops.get("encoder"), walls[1]),
+        (f"Decoder ({dec_steps} joint steps)", dec_hw_us,
+         flops["decoder_step"] * dec_steps if "decoder_step" in flops else None, walls[2]),
+    ]
+    total_hw = sum(s[1] for s in stages)
+    total_wall = sum(walls)
+    known = all(s[2] is not None for s in stages)
+    total_flops = sum(s[2] for s in stages) if known else None
+
+    def rate(fl, us):
+        if fl is None or not us:
+            return "n/a", "n/a"
+        g = fl / (us * 1e3)
+        return f"{g:.1f} GFLOPS", (f"{100.0 * g / peak:.1f}%" if peak else "n/a")
+
+    bin_dir = os.path.join(SCRIPT_DIR, "parakeet_bin")
+    def size(name):
+        path = os.path.join(bin_dir, name)
+        return f"{os.path.getsize(path) / 2**20:.1f} MiB" if os.path.exists(path) else "n/a"
+
+    lines = [
+        "# parakeet_test run summary", "",
+        "## Hardware", "",
+        f"- **HW version:** {hw}",
+        f"- **Device:** {args.dev} (profile {args.device})",
+        f"- **Clock:** {clock_ns:.4f} ns ({freq_mhz:.1f} MHz)",
+        f"- **AXI data width:** {user_dma_core.UE_AXI_DATA_WIDTH_BITS} bits",
+        f"- **DRAM:** {user_dma_core.AVAILABLE_DRAM_SIZE_GB} GiB",
+        f"- **Cores in use:** 1 of {user_dma_core.ANDROMEDA_CORE_COUNT} reported",
+        f"- **Peak throughput:** {peak:.1f} GFLOPS ({freq_mhz:.1f} MHz x 128 x 1 core)", "",
+        "## Weights and programs", "",
+        f"- **Weight bin:** `params.bin` - {size('params.bin')}",
+        f"- **Programs:** `programs.bin` - {size('programs.bin')} (mel programs compiled per utterance)", "",
+        "## Input", "",
+        f"- **Audio:** `{os.path.basename(audio_path)}` - {audio_dur:.2f} s",
+        f"- **Mel frames:** {T_mel}; encoder frames: {L} (padded {L_pad})", "",
+        "## Stages", "",
+        "| Stage | HW latency (counter) | Counted FLOPs | Throughput (HW) | Utilization | CPU wall |",
+        "|---|---|---|---|---|---|",
+    ]
+    for name, us, fl, wall in stages:
+        g, u = rate(fl, us)
+        lines.append(f"| {name} | {us / 1e3:.1f} ms | {fl / 1e9:.2f} GFLOP | {g} | {u} | {wall:.3f} s |"
+                     if fl is not None else f"| {name} | {us / 1e3:.1f} ms | n/a | n/a | n/a | {wall:.3f} s |")
+    g, u = rate(total_flops, total_hw)
+    lines.append(f"| **Total** | **{total_hw / 1e3:.1f} ms** | "
+                 f"{f'{total_flops / 1e9:.2f} GFLOP' if total_flops is not None else 'n/a'} | {g} | {u} | "
+                 f"**{total_wall:.3f} s** |")
+    lines += [
+        "",
+        f"- **Host overhead:** {100.0 * (1 - total_hw / 1e6 / total_wall):.1f}% of wall time outside the engine"
+        if total_wall else "- **Host overhead:** n/a",
+        f"- **Real-time factor (CPU wall / audio):** {total_wall / audio_dur:.3f}"
+        f" ({audio_dur / total_wall:.2f}x real time)" if audio_dur and total_wall else "- **Real-time factor:** n/a",
+        f"- **Decoder:** {getattr(engine, 'dec_tokens', 0)} tokens emitted over {dec_steps} joint steps, "
+        f"{dec_hw_us / 1e3 / dec_steps:.2f} ms HW per step" if dec_steps else "- **Decoder:** no steps",
+        "", "## Output", "", "```", text, "```", "",
+    ]
+    out = os.path.join(SCRIPT_DIR, f"parakeet_test_{args.dev}.md")
+    with open(out, "w") as f:
+        f.write("\n".join(lines))
+    return out
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Parakeet-TDT-0.6B accelerator inference")
@@ -1882,18 +1974,20 @@ def main():
     else:
         # Subsampling programs
         im2col_s0, _, _ = engine.compile_im2col_s0(T_mel)
-        prog_s0, _ = engine.compile_sub_stage0(N0, 64, SC)
+        prog_s0, f_s0 = engine.compile_sub_stage0(N0, 64, SC)
         im2col_s1, _, _ = engine.compile_im2col_dw(H0, W0, N1_pad, engine.SUB_OUT0_DRAM, "IM2COL_G_S1")
-        prog_s1, _ = engine.compile_sub_stage_dw_pw(N0, N1, SC,
+        prog_s1, f_s1 = engine.compile_sub_stage_dw_pw(N0, N1, SC,
             engine.SUB_PATCH_DRAM, "SUB_DW1_W", "SUB_DW1_B", "SUB_PW1_W", "SUB_PW1_B")
         im2col_s2, _, _ = engine.compile_im2col_dw(H1, W1, N2_pad, engine.SUB_PW_IN_DRAM, "IM2COL_G_S2")
-        prog_s2, _ = engine.compile_sub_stage_dw_pw(N1, N2, SC,
+        prog_s2, f_s2 = engine.compile_sub_stage_dw_pw(N1, N2, SC,
             engine.SUB_PATCH_DRAM, "SUB_DW2_W", "SUB_DW2_B", "SUB_PW2_W", "SUB_PW2_B")
-        prog_flatten_lin, _ = engine.compile_sub_flatten_linear(H2, W2)
+        prog_flatten_lin, f_lin = engine.compile_sub_flatten_linear(H2, W2)
         # Encoder program
         enc_prog_addr, enc_prog_bytes = engine.compile_encoder(L_pad, toeplitz_addrs, bn_tiled)
         # Decoder programs
-        pred_prog, tok_prog, dur_prog, restore_prog, _ = engine.compile_decoder()
+        pred_prog, tok_prog, dur_prog, restore_prog, f_dec = engine.compile_decoder()
+        engine.program_flops = {"subsampling": int(f_s0 + f_s1 + f_s2 + f_lin), "encoder": int(engine.enc_flops),
+                                "decoder_step": int(f_dec)}
         # Compute program sizes from consecutive DRAM addresses
         all_progs = [
             ("im2col_s0", im2col_s0), ("prog_s0", prog_s0),
@@ -1908,7 +2002,7 @@ def main():
         for i, (name, addr) in enumerate(all_progs):
             next_addr = all_progs[i + 1][1] if i + 1 < len(all_progs) else prog_end
             sized[name] = (addr, next_addr - addr)
-        engine.dump_programs(sized, L_pad)
+        engine.dump_programs(sized, L_pad, engine.program_flops)
     engine.progs = {"pred": (pred_prog, 0), "joint_tok": (tok_prog, 0), "joint_dur": (dur_prog, 0), "state_restore": (restore_prog, 0)}
 
     # --- HW mel pipeline program (always compiled — T_mel varies per utterance) ---
@@ -1927,6 +2021,7 @@ def main():
             _original_print(f"\r  {label} ({elapsed:.0f}s)", end="", flush=True)
 
     t_start = _time.perf_counter()
+    sub_hw_us = 0.0  # the engine's latency counter over the mel and subsampling programs
 
     stop = threading.Event()
     timer = threading.Thread(target=_progress_timer, args=("Executing", t_start, stop), daemon=True)
@@ -1939,25 +2034,25 @@ def main():
     engine.dma_to_accelerator_memory(engine.POWER_DRAM, power_padded)
 
     # Matmul + log on HW
-    engine.program_execute(engine.mel_matmul_prog)   # (128, T_mel_padded) at MEL_TEMP_DRAM
+    sub_hw_us += engine.program_execute(engine.mel_matmul_prog)[0]   # (128, T_mel_padded) at MEL_TEMP_DRAM
 
     # Mask + norm on HW (in-place at MEL_TEMP_DRAM)
     mask = torch.zeros(T_mel_padded, dtype=torch.bfloat16)
     mask[:T_mel] = 1.0
     engine.dma_to_accelerator_memory(engine.MASK_DRAM, mask)
-    engine.program_execute(engine.mel_norm_prog)     # (128, T_mel_padded) normed at MEL_TEMP_DRAM
+    sub_hw_us += engine.program_execute(engine.mel_norm_prog)[0]     # (128, T_mel_padded) normed at MEL_TEMP_DRAM
 
     # Transpose to (T_mel_padded, 128) at MEL_DRAM
-    engine.program_execute(engine.mel_transpose_prog)
+    sub_hw_us += engine.program_execute(engine.mel_transpose_prog)[0]
     engine.dma_to_accelerator_memory(engine.SUB_OUT0_DRAM, torch.zeros(N0 * SC, dtype=torch.bfloat16))
-    engine.program_execute(im2col_s0)
-    engine.program_execute(prog_s0)
-    engine.program_execute(im2col_s1)
-    engine.program_execute(prog_s1)
-    engine.program_execute(im2col_s2)
-    engine.program_execute(prog_s2)
+    sub_hw_us += engine.program_execute(im2col_s0)[0]
+    sub_hw_us += engine.program_execute(prog_s0)[0]
+    sub_hw_us += engine.program_execute(im2col_s1)[0]
+    sub_hw_us += engine.program_execute(prog_s1)[0]
+    sub_hw_us += engine.program_execute(im2col_s2)[0]
+    sub_hw_us += engine.program_execute(prog_s2)[0]
     engine.dma_to_accelerator_memory(engine.INPUT_DRAM, torch.zeros(L_pad * D, dtype=torch.bfloat16))
-    engine.program_execute(prog_flatten_lin)
+    sub_hw_us += engine.program_execute(prog_flatten_lin)[0]
     if L_pad > H2:
         ef = torch.zeros((L_pad - H2) * D, dtype=torch.bfloat16)
         ef[0::2] = 0.1; ef[1::2] = -0.1
@@ -1968,6 +2063,7 @@ def main():
     engine.start_execute_from_dram(enc_prog_addr)
     engine.wait_queue(120.0)
     t_enc_done = _time.perf_counter()
+    enc_hw_us = engine.report_latency_in_us()
 
     # --- Decoder ---
     hw_enc_out = read_dram(engine, engine.INPUT_DRAM, L_pad * D)
@@ -1995,6 +2091,12 @@ def main():
     _original_print(f"    Encoder (24 layers): {t_enc_done - t_sub_done:.3f}s")
     _original_print(f"    Decoder:             {t_dec_done - t_enc_done:.3f}s")
     _original_print(f"    Total:               {total:.3f}s")
+
+    summary = write_run_summary(engine, args, audio_path=audio_path, audio_dur=audio_dur, T_mel=T_mel, L=L, L_pad=L_pad,
+                                mel_flops=2 * engine.n_mels * K_padded * T_mel_padded, sub_hw_us=sub_hw_us,
+                                enc_hw_us=enc_hw_us, walls=(t_sub_done - t_start, t_enc_done - t_sub_done,
+                                                            t_dec_done - t_enc_done), text=hw_text)
+    _original_print(f"\nWrote summary: {summary}")
 
     import json as _json
     _original_print("TEST_RESULT:" + _json.dumps({

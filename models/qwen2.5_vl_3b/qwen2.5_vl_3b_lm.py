@@ -62,14 +62,16 @@ class Qwen25VLLMMixin:
     def _lm_quantized_projections(self) -> set[str]:
         """Projection tags stored with the configured block-quantized codec.
 
-        Qwen2.5-VL-3B keeps V/O in BF16 for accuracy. Larger compatible
-        decoders can opt either projection into IF4 independently; notably,
+        Qwen2.5-VL-3B stores all seven in IF4: with V/O in BF16 instead, decode
+        read 15% more weight per token (1801.7 vs 1563.8 MiB) and ran 19% slower
+        (341.7 vs 286.6 ms/token on a Kintex-7) for the same output. Larger
+        compatible decoders can opt either projection into IF4 independently; notably,
         Qwen2.5-Omni-7B uses IF4 O during prefill, then switches to a shared
         BF16 O overlay for decode while retaining BF16 V in both phases.
         Keeping the choices phase-aware here makes the emitter reusable without
         changing the released 3B bin format.
         """
-        default = ("q", "k", "gate", "up", "down")
+        default = ("q", "k", "v", "o", "gate", "up", "down")
         values = self._cfg.get("precision", {}).get(
             "lm_quantized_projections", default)
         valid = {"q", "k", "v", "o", "gate", "up", "down"}
@@ -79,6 +81,13 @@ class Qwen25VLLMMixin:
             raise ValueError(
                 f"unknown LM quantized projection tag(s): {sorted(unknown)}")
         return result
+
+    def _lm_weight_formats(self) -> str:
+        """The LM projections' storage for the run summary: "IF4", or "IF4 + BF16 V/O" for those left out."""
+        precision = self._cfg.get("precision", {}).get("lm", "if4").upper()
+        kept = [t.upper() for t in ("q", "k", "v", "o", "gate", "up", "down")
+                if t not in self._lm_quantized_projections()]
+        return precision + (f" + BF16 {'/'.join(kept)}" if kept else "")
 
     def _lm_projection_is_quantized(self, tag: str) -> bool:
         return tag in self._lm_quantized_projections()
