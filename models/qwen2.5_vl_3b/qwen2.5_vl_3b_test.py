@@ -452,7 +452,7 @@ class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine
         if getattr(self, "_lm_weight_init_done", False):
             L.append(f"- **LM weight DRAM:** "
                      f"{(self._lm_weight_end - self.PARAMS_BASE) / 2**20:.1f} MiB "
-                     f"(IF4 + BF16 V/O; embedding host-side)")
+                     f"({self._lm_weight_formats()}; embedding host-side)")
         for name, prog in (("Vision encoder", getattr(self, "_vis_program_bytes", None)),
                            ("Prefill program", getattr(self, "_prefill_program", None)),
                            ("Decoder program", getattr(self, "_decoder_program", None))):

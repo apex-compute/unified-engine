@@ -97,9 +97,9 @@ _TOP_MAP = {
         'merger.mlp.2.bias': 'v.merger_mlp2.bias',
     },
 }
-# LM-side quant scope: q/k/gate/up/down (v_proj and o_proj stay BF16 for
-# attention accuracy). Same set for every supported precision.
-_LM_QUANT_LAYERS = {'q_proj.weight', 'k_proj.weight',
+# LM-side quant scope: every projection, q/k/v/o/gate/up/down (precision.lm_quantized_projections narrows it, as the
+# runtime does). Same set for every supported precision.
+_LM_QUANT_LAYERS = {'q_proj.weight', 'k_proj.weight', 'v_proj.weight', 'o_proj.weight',
                     'gate_proj.weight', 'up_proj.weight', 'down_proj.weight'}
 
 _VALID_PRECISIONS = ('int4', 'fp4', 'if4')
@@ -169,7 +169,18 @@ def _write_weight_bin(bin_path, model, param_filter, mode, suffix, quant_layers,
         json.dump(manifest, f)
     print(f"Weights: {count} tensors, {os.path.getsize(bin_path)/1048576:.1f} MB -> {bin_path}")
 
-def generate_lm_weights(model, output_path, precision: str = "if4"):
+def _lm_quant_layers(cfg: dict) -> set[str]:
+    """The LM projections stored quantized: precision.lm_quantized_projections (tags q/k/v/o/gate/up/down), the
+    runtime's own choice (qwen2.5_vl_3b_lm.py _lm_quantized_projections); default q/k/gate/up/down."""
+    tags = cfg.get("precision", {}).get("lm_quantized_projections")
+    if tags is None:
+        return set(_LM_QUANT_LAYERS)
+    names = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "o_proj",
+             "gate": "gate_proj", "up": "up_proj", "down": "down_proj"}
+    return {f"{names[t]}.weight" for t in tags}
+
+
+def generate_lm_weights(model, output_path, precision: str = "if4", quant_layers=None):
     """Generate LM weight bin using the given quant_lib precision
     ('int4' / 'fp4' / 'if4'). The precision string is also the manifest
     suffix the runtime loader looks for.
@@ -182,7 +193,7 @@ def generate_lm_weights(model, output_path, precision: str = "if4"):
         raise ValueError(f"precision={precision!r} not in {_VALID_PRECISIONS}")
     _write_weight_bin(output_path, model,
         lambda n: 'model.layers' in n or 'model.embed_tokens' in n or 'model.norm' in n,
-        'lm', precision, _LM_QUANT_LAYERS, lambda t: _qs_pack(precision, t))
+        'lm', precision, quant_layers or _LM_QUANT_LAYERS, lambda t: _qs_pack(precision, t))
 
     # Pre-quantize the LM head (tied to embedding) and append to the bin.
     embed_w = model.get_input_embeddings().weight.detach().to(torch.bfloat16)
@@ -342,7 +353,7 @@ def weight_bin_generate(script_dir: str | None = None, output_params: str | None
     vis_tmp = os.path.join(bin_dir, "_params_vision.tmp.bin")
 
     model, model_dir = _ensure_hf_model(script_dir, cfg)
-    generate_lm_weights(model, lm_tmp, precision=_lm_precision(cfg))
+    generate_lm_weights(model, lm_tmp, precision=_lm_precision(cfg), quant_layers=_lm_quant_layers(cfg))
     generate_vision_weights(model, vis_tmp, precision=_vision_precision(cfg))
     del model
 
@@ -383,6 +394,24 @@ def weight_bin_generate(script_dir: str | None = None, output_params: str | None
     return params_path
 
 
+def _stale_quantization(json_path: str, cfg: dict) -> list[str]:
+    """The quantized LM projections the bin's manifest holds unquantized (layer 0, named weight.<precision>): a bin
+    generated for another lm_quantized_projections; empty when it matches or the manifest is not readable here."""
+    try:
+        with open(json_path) as f:
+            lm = json.load(f)["regions"]["lm"]["manifest"]
+    except (OSError, KeyError, ValueError):
+        return []
+    precision = _lm_precision(cfg)
+    stale = []
+    for name in sorted(_lm_quant_layers(cfg)):
+        base = next((k for k in lm if k.endswith(f"layers.0.self_attn.{name}") or k.endswith(f"layers.0.mlp.{name}")),
+                    None)
+        if base is not None:
+            stale.append(name)
+    return stale
+
+
 def ensure_params_bin(script_dir: str, verbose: bool = True) -> str:
     """Return the params.bin path, generating it (and params.json) if absent.
 
@@ -395,7 +424,13 @@ def ensure_params_bin(script_dir: str, verbose: bool = True) -> str:
     params_path = os.path.join(script_dir, cfg["paths"]["params"])
     json_path = params_path.rsplit(".", 1)[0] + ".json"
     if os.path.exists(params_path) and os.path.exists(json_path):
-        return params_path
+        stale = _stale_quantization(json_path, cfg)
+        if not stale:
+            return params_path
+        if verbose:
+            print(f"  weight bin stores {', '.join(stale)} unquantized but the config quantizes them "
+                  f"(a bin of an earlier quantization scope); regenerating it.")
+        return weight_bin_generate(script_dir)
     if verbose:
         missing = [p for p in (params_path, json_path) if not os.path.exists(p)]
         print(f"  weight bin missing ({', '.join(os.path.basename(m) for m in missing)}); "
