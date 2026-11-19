@@ -60,8 +60,10 @@ EPS = 1e-5
 # is compiled per bucket), and a bucket under 128 rows stays plain. Level 2 only pays from 256
 # rows, which this port cannot reach: the depthwise Toeplitz matrices (D x L_pad^2 per layer) fill
 # the params region by L_pad 192, so in practice only the L_pad 128 bucket has room for the leaves.
-# --strassen-level 0 = every matmul plain.
-ST_LEVEL = 1
+# OFF by default (--strassen-level 1 turns it on): measured on the board, 10 s clip, one engine,
+# the encoder went 4473.7 -> 4357.1 ms (2.6%) for 540 MB more weights, and one word of the
+# transcript changed. At 128 rows the half-size matmuls give back most of the 12.5% work cut.
+ST_LEVEL = 0
 ST_MIN_ROWS = 128
 ST_SQ_KEYS = ("ATTN_Q_W", "ATTN_K_W", "ATTN_V_W", "ATTN_OUT_W", "CONV_PW1A_W", "CONV_PW2_W")   # L_pad rows
 ST_POS_KEYS = ("ATTN_POS_W",)                                                                  # P_pad rows
@@ -1942,7 +1944,7 @@ def main():
     parser.add_argument("--dev", type=str, default="xdma0", help="XDMA device")
     parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
     parser.add_argument("--strassen-level", type=int, default=ST_LEVEL, choices=(0, 1),
-                        help="Strassen level on the encoder's wide plain matmuls (0 = off; engages at the 128-frame bucket).")
+                        help="Strassen level on the encoder's wide plain matmuls (default 0 = off; 1 engages at the 128-frame bucket).")
     args = parser.parse_args()
 
     _SILENT_MODE = True
