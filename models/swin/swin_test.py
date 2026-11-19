@@ -718,7 +718,10 @@ SWIN_PROGRAM_BASE = 0x80000000   # 2.0 GB — 2 GB for compiled instruction prog
 # the last stage's attention output projection (level 1) and MLP contract (level 2), and the patch
 # merge into it (level 2). Narrower stages are slower with it; Q/K/V (strip write-back) and the MLP
 # expand (fused GELU) cannot use it. --strassen-level caps the level; 0 = every matmul plain.
-ST_LEVEL = 2
+# OFF by default (--strassen-level 2 turns it on): measured on the board, one engine, the run went
+# 8.181 -> 8.147 s (0.4%, same prediction) for 100 MB more weights -- the last stage is too small
+# a share of the model.
+ST_LEVEL = 0
 ST_MIN_WIDTH = 1024     # K and N below this lose
 ST_MIN_ROWS = 128
 
@@ -1923,7 +1926,7 @@ def main():
                         help="Skip params packing and compile; load params.bin + programs.bin from swin_bin/ "
                              "(error if missing or stale). Default: repack and recompile.")
     parser.add_argument("--strassen-level", type=int, default=ST_LEVEL, choices=(0, 1, 2),
-                        help="Deepest Strassen level on the last stage's o / fc2 and the patch merge into it (0 = off).")
+                        help="Deepest Strassen level on the last stage's o / fc2 and the patch merge into it (default 0 = off).")
     args = parser.parse_args()
 
     _SILENT_MODE = True
