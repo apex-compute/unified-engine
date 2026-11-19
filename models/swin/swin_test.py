@@ -1748,6 +1748,7 @@ def preprocess_image(image_path: str) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def main():
+    global _SILENT_MODE, ST_LEVEL
     import argparse
     parser = argparse.ArgumentParser(description="Swin-Large accelerator inference.")
     parser.add_argument("--image", type=str, default=None, help="Path to input image")
@@ -1757,7 +1758,6 @@ def main():
                         help="Deepest Strassen level on the last stage's o / fc2 and the patch merge into it (0 = off).")
     args = parser.parse_args()
 
-    global _SILENT_MODE, ST_LEVEL
     _SILENT_MODE = True
     ST_LEVEL = args.strassen_level      # before the engine is built: it picks the weights and the bin
 
