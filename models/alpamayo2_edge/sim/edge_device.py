@@ -51,8 +51,7 @@ class DeviceRunner:
         ue.vision_weight_init(ref, sorted(set(self.grids)))
         ue.vision_tensor_init(self.grids)
         ue.projector_init(ref)
-        ue.vision_compile(list(range(len(self.grids))))
-        ue.projector_compile(self.rows)
+        self._compile_vision()
         packs = T.prepare_lm_if4(ref)               # also makes the reference's LM the dequantized one
         ue.lm_weight_init(ref, packs)
         del packs
@@ -64,6 +63,17 @@ class DeviceRunner:
         ue.lm_tensor_init(ids.shape[0] - 1, self.max_new)
         self._programs(ids)
         print(f"[device] {engines} engines ready in {time.time() - t0:.0f} s (prompt {ids.shape[0]} tokens, S {ue.S})", flush=True)
+
+    def _compile_vision(self):
+        self.ue.vision_compile(list(range(len(self.grids))))
+        self.ue.projector_compile(self.rows)
+
+    def _vision(self, packed, ms):
+        """Every frame through the vision tower and the projector: the image tokens end up in IMG."""
+        ue = self.ue
+        ue.vision_upload_pixels(packed["tokenized_data.pixel_values"].float())
+        ms["vision"] = ue._exec("vision", timeout=300.0) / 1e3
+        ms["projector"] = ue._exec("projector") / 1e3
 
     def _programs(self, ids):
         """Make the LM programs for this prompt current, compiling them the first time it is seen."""
@@ -113,10 +123,7 @@ class DeviceRunner:
         self._programs(ids)
         P, S, CAP = ue.P, ue.S, ue.KV_CAP
 
-        # vision + projector
-        ue.vision_upload_pixels(packed["tokenized_data.pixel_values"].float())
-        ms["vision"] = ue._exec("vision", timeout=300.0) / 1e3
-        ms["projector"] = ue._exec("projector") / 1e3
+        self._vision(packed, ms)
 
         # prompt: text rows from the host table, image rows scattered on the device; pad rows repeat text rows
         pos, delta = ref.mrope_positions(types, grid)
@@ -176,14 +183,14 @@ class DeviceRunner:
         return xyz, rot, out
 
 
-if __name__ == "__main__":      # repeat test without the simulator: N inferences back to back on one sample
+def cli(Runner):       # repeat test without the simulator: N inferences back to back on one sample
     sys.path.insert(0, str(HERE))
     from edge_inputs import EdgeInputBuilder, default_model_dir, synthetic_raw
 
     if len(sys.argv) > 2 and sys.argv[1] == "replay":        # replay <dump dir> [plan indices]: device vs the dumped plans
         files = sorted(Path(sys.argv[2]).glob("plan_*.pt"))
         files = [files[int(i)] for i in sys.argv[3:]] or files
-        runner = DeviceRunner(default_model_dir(), torch.load(files[0], weights_only=False)["packed"])
+        runner = Runner(default_model_dir(), torch.load(files[0], weights_only=False)["packed"])
         for f in files:
             d = torch.load(f, weights_only=False)
             xyz, _, out = runner.run(d["packed"], d["seed"])
@@ -191,10 +198,10 @@ if __name__ == "__main__":      # repeat test without the simulator: N inference
             print(f"[replay] {f.stem}: tokens {'same' if list(out) == list(d['tokens']) else 'DIFFER'} ({len(out)} vs {len(d['tokens'])}), "
                   f"max |xyz err| {float((xyz - ref).abs().max()):.3f} m, end point device ({float(xyz[-1, 0]):.2f}, {float(xyz[-1, 1]):+.2f}) "
                   f"vs host ({float(ref[-1, 0]):.2f}, {float(ref[-1, 1]):+.2f}), nav {d['nav_text']!r}", flush=True)
-        sys.exit(0)
+        return
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 3
     sample = EdgeInputBuilder(default_model_dir()).pack(**synthetic_raw(nav_text="Continue straight"))
-    runner = DeviceRunner(default_model_dir(), sample)
+    runner = Runner(default_model_dir(), sample)
     first = None
     if len(sys.argv) > 2 and sys.argv[2] == "vision":       # vision only, back to back
         pause = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0      # idle seconds between runs
@@ -202,8 +209,12 @@ if __name__ == "__main__":      # repeat test without the simulator: N inference
             time.sleep(pause if i else 0.0)
             runner.ue.vision_upload_pixels(sample["tokenized_data.pixel_values"].float())
             print(f"[device] vision run {i}: {runner.ue._exec('vision', timeout=120.0) / 1e6:.1f} s", flush=True)
-        sys.exit(0)
+        return
     for i in range(n):
         xyz, _, out = runner.run(sample, 0)
         first = xyz if first is None else first
         print(f"[device] run {i}: {len(out)} tokens, max |xyz - run 0| {float((xyz - first).abs().max()):.4f} m", flush=True)
+
+
+if __name__ == "__main__":
+    cli(DeviceRunner)

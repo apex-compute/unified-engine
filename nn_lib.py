@@ -38,6 +38,7 @@ from typing import Callable
 import numpy as np
 import torch
 
+from storage_format import StorageFormat, TensorFormats
 from user_dma_core import (
     DMA_DEVICE_C2H,
     DMA_DEVICE_H2C,
@@ -1333,9 +1334,18 @@ def flash_attention_batched_pbi(
 #   scr  = [(x_addr, p_addr), ...]                             # one pair per depth, sizes from
 #                                                              # strassen_scratch_elements(M, K, N, L)
 #   strassen_matmul_core_dram(ue, M, K, N, A, tree, OUT, scr)  # at program-capture time
-#   store_w(W [n, k] fp32) returns a bf16 weight address, or (data_addr, scale_addr) for an IF4
-#   pack; store_b(b [n]) returns a bf16 address. Rows beyond a multiple of 2^L go through the
-#   plain matmul (the caller's job).
+#   store_w gets each leaf weight [n, k] ALREADY IN fp16 and returns the address it uploaded it to
+#   unchanged (do not cast it to bf16); store_b the same for a leaf bias [n]. For 4-bit leaves
+#   pass weight_format=None: store_w then gets fp32, quantizes it and returns (data_addr,
+#   scale_addr), and store_b returns a bf16 address. Rows beyond a multiple of 2^L go through
+#   the plain matmul (the caller's job).
+#
+# PRECISION
+#   X, the layer's weight and C are bf16 as everywhere else. Everything in between is fp16: the
+#   input sums, the weight sums (formed in fp32 on the host, stored as fp16 leaves), the 7
+#   products and the recombination. In bf16 those sums cost ~11 dB per level; in fp16 one level
+#   is within ~1 dB of the plain matmul at the same speed (board, 720x4352->1152: plain 55.1 dB,
+#   level 1 43.9 dB in bf16 and 54.1 dB in fp16; levels 2 / 3 in fp16 51.8 / 48.2 dB).
 #
 # HOW IT WORKS (one level; Yij = block (i, j) of W^T, formed on the host)
 #   P1' = (X11+X22)(Y11+Y22)        P2' = (X21+X22) Y11        P5' = (X11+X12) Y22
@@ -1343,13 +1353,16 @@ def flash_attention_batched_pbi(
 #   U   = P1' - P2' - P5'
 #   C22 = (X21-X11)(Y11+Y12) + (U + C12)        C11 = (X12-X22)(Y21+Y22) + (U + C21)
 #   = 4 strided gathers of the input quarters, 5 eltwise sums, 7 half-size products, 4 eltwise
-#   sums, 4 strided writes of the output quarters. The last product of each output quarter takes
+#   sums, 4 strided writes of the output quarters (+ at the top level 2 passes that turn C12 and
+#   C21 from fp16 into bf16 once U + C12 and U + C21 have been taken from the fp16 values). The last product of each output quarter takes
 #   the rest of that quarter as a full-matrix bias, so quarters cost no extra add. The layer bias
 #   is folded into the leaf biases of P1' (b_L + b_R), P2' (b_L) and P5' (b_R).
 #
 # LIMITS (measured on the board, Alveo U50; details in CHANGELOG.md "Strassen matmul")
-#   * Accuracy drops every level. bf16, 4096x7680->8192: 55.0 dB plain, 43.9 / 37.3 / 31.2 dB at
-#     levels 1 / 2 / 3. 4-bit (IF4) weights lose 6.0 dB per level on top of ~20 dB.
+#   * Accuracy: with the fp16 intermediates above, ~1 / 3 / 7 dB below the plain matmul at
+#     levels 1 / 2 / 3 (it was 11 / 18 / 24 dB below when they were bf16). 4-bit (IF4) leaves
+#     still lose 6.0 dB per level on top of ~20 dB: that loss is the re-quantization of the
+#     weight sums, which fp16 does not touch.
 #   * Speed: 0.82x / 0.71x / 0.64x of the plain time (bf16), 0.88x / 0.78x / 0.70x (IF4), on that
 #     large shape only. Small shapes get SLOWER (K = N = 256: 1.26x). It won on 215 of 640 shapes
 #     on one engine and 121 of 640 on eight.
@@ -1358,6 +1371,7 @@ def flash_attention_batched_pbi(
 #     K below 8192. OUTPUT_DRAM_ADDR must be 128-byte aligned.
 #   * No fused activation: a layer whose matmul carries GELU / clamp cannot use it.
 #   * Scratch must be private per engine and zero-filled once (fresh DRAM holds NaN patterns).
+#     It holds fp16 data: never read it as bf16.
 #   * Whole-model results: Alpamayo 2 Edge at level 1 was 3% faster end to end (80.4 -> 77.8 s)
 #     and the trajectory error went from 0.18 m to 0.87 m (the 4-bit prefill layers cause it; the
 #     bf16 vision layers are harmless). Qwen3-4B perplexity 19.4 plain, 21.5 / 24.3 / 40.4 at
@@ -1382,20 +1396,27 @@ def strassen_combos(W: torch.Tensor, b: torch.Tensor | None):
 
 
 def strassen_weight_tree(W: torch.Tensor, b: torch.Tensor | None, levels: int,
-                         store_w: Callable, store_b: Callable | None = None) -> dict:
+                         store_w: Callable, store_b: Callable | None = None,
+                         weight_format: StorageFormat | None = StorageFormat.FP16) -> dict:
     """Host side, once: form the 7^levels leaf weights in fp32 and store each with store_w.
     Returns the tree strassen_matmul_core_dram walks: {"c": [7 children]} per level, leaves
-    {"w": store_w(W_leaf), "b": store_b(b_leaf) or None}. Sum first, quantize after: store_w
-    must quantize each leaf on its own (re-using the layer's quantized weight is wrong)."""
+    {"w": store_w(W_leaf), "b": store_b(b_leaf) or None, "f": format of both}.
+
+    weight_format FP16 (default): store_w / store_b get the leaf already cast to fp16 and must
+    upload it as it is. None: 4-bit leaves -- store_w gets fp32 and returns (data_addr,
+    scale_addr), store_b returns a bf16 address. Sum first, quantize after: store_w must quantize
+    each leaf on its own (re-using the layer's quantized weight is wrong)."""
     W = W.float().cpu()
     b = None if b is None else b.float().cpu()
     if levels == 0:
-        return {"w": store_w(W), "b": None if b is None else store_b(b)}
-    return {"c": [strassen_weight_tree(w, bb, levels - 1, store_w, store_b) for w, bb in strassen_combos(W, b)]}
+        cast = (lambda t: t) if weight_format is None else (lambda t: t.to(weight_format.dtype))
+        return {"w": store_w(cast(W)), "b": None if b is None else store_b(cast(b)),
+                "f": StorageFormat.BF16 if weight_format is None else weight_format}
+    return {"c": [strassen_weight_tree(w, bb, levels - 1, store_w, store_b, weight_format) for w, bb in strassen_combos(W, b)]}
 
 
 def strassen_scratch_elements(M: int, K: int, N: int, levels: int) -> list[tuple[int, int]]:
-    """bf16 elements of scratch per depth: [(x buffer, product buffer)] for depth 0 .. levels-1."""
+    """16-bit elements of scratch per depth: [(x buffer, product buffer)] for depth 0 .. levels-1."""
     return [(9 * (M >> (d + 1)) * (K >> (d + 1)), 14 * (M >> (d + 1)) * (N >> (d + 1))) for d in range(levels)]
 
 
@@ -1419,15 +1440,19 @@ def _strassen_rows(ue, src: int, dst: int, pitch: int, cols: int, rows: int, sca
 
 def strassen_matmul_core_dram(ue, M: int, K: int, N: int, A_DRAM_ADDR: int, tree: dict,
                               OUTPUT_DRAM_ADDR: int, scratch: list[tuple[int, int]],
-                              _full: int | None = None, _depth: int = 0, _regs: dict | None = None) -> None:
+                              _full: int | None = None, _depth: int = 0, _regs: dict | None = None,
+                              _fmt: tuple = (StorageFormat.BF16, StorageFormat.BF16, StorageFormat.BF16)) -> None:
     """C [M, N] = X [M, K] . W^T (+ bias) by nested Strassen; see the section header above.
 
     A_DRAM_ADDR / OUTPUT_DRAM_ADDR: contiguous row-major bf16. tree: from strassen_weight_tree
     (its depth sets the level). scratch: [(x_addr, p_addr)] per depth, sized by
-    strassen_scratch_elements. Allocates one ISA register per distinct row count and releases
-    them on return, so do not hold registers allocated after the call started."""
+    strassen_scratch_elements; it ends up holding fp16 values. Allocates one ISA register per
+    distinct row count and releases them on return, so do not hold registers allocated after the
+    call started. _fmt (internal): formats of A, of the output and of _full at this depth."""
     top = _regs is None
     regs = {} if top else _regs
+    xf, of, ff = _fmt
+    F = StorageFormat.FP16                                      # every intermediate
 
     def reg(rows):
         if rows not in regs:
@@ -1437,15 +1462,18 @@ def strassen_matmul_core_dram(ue, M: int, K: int, N: int, A_DRAM_ADDR: int, tree
 
     if "c" not in tree:                                         # leaf: the plain matmul
         assert _full is None or tree["b"] is None
+        wf = tree.get("f", StorageFormat.BF16)
         kw = dict(C_DRAM_ADDR=tree["b"], bias_mode="broadcast_N")
+        fm = TensorFormats(a=xf, b=wf, output=of, bias=wf)
         if _full is not None:
             kw = dict(C_DRAM_ADDR=_full, bias_mode="full_matrix")
+            fm = fm.with_formats(bias=ff)
         W = tree["w"]
-        if isinstance(W, tuple):
+        if isinstance(W, tuple):                                # 4-bit leaf: bf16 scales, bf16 bias vector
             kw.update(is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=W[1])
             W = W[0]
         ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=W,
-                           OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, gpr_M_reg=reg(M), **kw)
+                           OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, gpr_M_reg=reg(M), formats=fm, **kw)
     else:
         assert M % 2 == 0 and K % 128 == 0 and N % 128 == 0, f"Strassen level needs even M and K, N multiples of 128: {M}, {K}, {N}"
         h, kk, nn = M // 2, K // 2, N // 2
@@ -1453,30 +1481,40 @@ def strassen_matmul_core_dram(ue, M: int, K: int, N: int, A_DRAM_ADDR: int, tree
         x11, x12, x21, x22, s1, s2, s3, s4, s5 = (xb + i * h * kk * 2 for i in range(9))
         p1, p2, p5, u, t1, t2, q11, q12, q21, q22, b11, b12, b21, b22 = (pb + i * h * nn * 2 for i in range(14))
         r, ADD, SUB = reg(h), UE_MODE.ELTWISE_ADD, UE_MODE.ELTWISE_SUB
-        elt = lambda a, b, o, mode, cols: ue.eltwise_core_dram(M=h, N=cols, dram_a=a, dram_b=b, dram_out=o, mode=mode, gpr_M_reg=r)
-        rec = lambda i, x, out, full=None: strassen_matmul_core_dram(ue, h, kk, nn, x, tree["c"][i], out, scratch, full, _depth + 1, regs)
-        quarters = ((0, 0), (0, 1), (1, 0), (1, 1))
 
-        for dst, (i, j) in zip((x11, x12, x21, x22), quarters):
+        def elt(a, b, o, mode, cols, fa=F, fb=F, fo=F):
+            ue.eltwise_core_dram(M=h, N=cols, dram_a=a, dram_b=b, dram_out=o, mode=mode, gpr_M_reg=r,
+                                 formats=TensorFormats(a=fa, b=fb, output=fo))
+
+        def rec(i, x, fx, out, fo, full=None, ffull=F):
+            strassen_matmul_core_dram(ue, h, kk, nn, x, tree["c"][i], out, scratch, full, _depth + 1, regs, (fx, fo, ffull))
+        quarters = ((0, 0), (0, 1), (1, 0), (1, 1))
+        biased = _full is not None
+
+        for dst, (i, j) in zip((x11, x12, x21, x22), quarters):  # raw 16-bit copies: the quarters keep A's format
             _strassen_rows(ue, A_DRAM_ADDR + (i * h * K + j * kk) * 2, dst, K, kk, h, scatter=False)
         for (a, b, mode), o in zip([(x11, x22, ADD), (x21, x22, ADD), (x11, x12, ADD), (x21, x11, SUB), (x12, x22, SUB)],
                                    (s1, s2, s3, s4, s5)):
-            elt(a, b, o, mode, kk)
-        if _full is not None:
+            elt(a, b, o, mode, kk, xf, xf, F)                   # input sums -> fp16
+        if biased:
             for dst, (i, j) in zip((b11, b12, b21, b22), quarters):
                 _strassen_rows(ue, _full + (i * h * N + j * nn) * 2, dst, N, nn, h, scatter=False)
-        rec(0, s1, p1)
-        rec(1, s2, p2, full=b21 if _full is not None else None)
-        rec(4, s3, p5, full=b12 if _full is not None else None)
-        rec(2, x11, q12, full=p5)                               # C12
-        rec(3, x22, q21, full=p2)                               # C21
+        rec(0, s1, F, p1, F)
+        rec(1, s2, F, p2, F, b21 if biased else None, ff)
+        rec(4, s3, F, p5, F, b12 if biased else None, ff)
+        rec(2, x11, xf, q12, F, p5)                             # C12, kept in fp16 until U + C12 is taken
+        rec(3, x22, xf, q21, F, p2)                             # C21, likewise
         elt(p1, p2, u, SUB, nn), elt(u, p5, u, SUB, nn)
         elt(u, q12, t2, ADD, nn), elt(u, q21, t1, ADD, nn)
-        if _full is not None:       # U lost B21 and B12 with P2' and P5'; give each quarter its own bias back
-            elt(t2, b21, t2, ADD, nn), elt(t2, b22, t2, ADD, nn)
-            elt(t1, b12, t1, ADD, nn), elt(t1, b11, t1, ADD, nn)
-        rec(5, s4, q22, full=t2)                                # C22
-        rec(6, s5, q11, full=t1)                                # C11
+        if biased:                  # U lost B21 and B12 with P2' and P5'; give each quarter its own bias back
+            elt(t2, b21, t2, ADD, nn, F, ff, F), elt(t2, b22, t2, ADD, nn, F, ff, F)
+            elt(t1, b12, t1, ADD, nn, F, ff, F), elt(t1, b11, t1, ADD, nn, F, ff, F)
+        if of != F:                 # the quarters are copied out bit for bit: bring C12, C21 to the output format
+            for q in (q12, q21):
+                ue.eltwise_core_dram(M=h, N=nn, dram_a=q, dram_b=None, dram_out=q, mode=UE_MODE.MUL_BROADCAST, scalar=1.0,
+                                     gpr_M_reg=r, formats=TensorFormats(a=F, output=of))
+        rec(5, s4, F, q22, of, t2)                              # C22
+        rec(6, s5, F, q11, of, t1)                              # C11
         for src, (i, j) in zip((q11, q12, q21, q22), quarters):
             _strassen_rows(ue, src, OUTPUT_DRAM_ADDR + (i * h * N + j * nn) * 2, N, nn, h, scatter=True)
     if top:

@@ -103,7 +103,10 @@ RESUME_FILE = Path.home() / "a2e_resume"
 def _device_worker(conn, model_dir, device):
     """Child process that owns the board: one DeviceRunner, one reply per request, exits on any error."""
     try:
-        from edge_device import DeviceRunner
+        if os.environ.get("A2E_VISION_CACHE") == "1":       # reuse the image tokens of frames seen in earlier plans
+            from edge_device_cached import CachedDeviceRunner as DeviceRunner
+        else:
+            from edge_device import DeviceRunner
 
         sample = EdgeInputBuilder(model_dir).pack(**synthetic_raw(nav_text="Continue straight"))
         runner = DeviceRunner(model_dir, sample, ref_device=device)
