@@ -86,7 +86,17 @@ Replaces one large `matmat_mul_core` call with 7 half-size products instead of 8
 | 4-bit layer, weight bytes | 1x | 2.9x | 5.7x | 10.3x |
 | bf16 layer, weight bytes | 1x | 1.75x | 3.06x | 5.36x |
 
-**No extra weight memory on a 4-bit layer (online leaves, level 1).** The weight is stored once, as its four 4-bit quarters. Before the matmul the board dequantizes two quarters to fp16 on chip, adds them and writes the sum to a scratch all layers share; the pieces are dealt out over the engines. Measured on 8 engines, 408 and 832 rows per engine: making the five sums takes 0.27 ms (2048 x 2048) to 0.61 ms (4608 x 2048), and the matmul runs at 0.92x / 0.91x of the plain 4-bit time against 0.91x / 0.89x with stored leaves. Same accuracy as the plain 4-bit matmul (20.1 dB vs bf16).
+**No extra weight memory (online leaves).** The weight is stored once, cut into its 4^levels cells. Before the matmul the board makes every leaf that is a sum on chip (a 4-bit cell is dequantized to fp16 as it is loaded), and writes it to a scratch all layers share; the pieces are dealt out over the engines. Measured on 8 engines, time relative to the plain matmul:
+
+| Layer | Shape (rows per engine x K -> N) | Stored L1 | Online L1 | Stored L2 | Online L2 | Sums alone, L1 / L2 |
+|-------|----------------------------------|-----------|-----------|-----------|-----------|---------------------|
+| 4-bit | 408 x 2048 -> 2048 | 0.91x | 0.92x | 0.89x | 0.91x | 0.28 / 0.77 ms |
+| 4-bit | 408 x 4608 -> 2048 | 0.89x | 0.91x | 0.82x | 0.84x | 0.62 / 1.72 ms |
+| 4-bit | 832 x 4608 -> 2048 | 0.89x | 0.91x | 0.82x | 0.84x | same |
+| bf16 | 408 x 4608 -> 2048 | 0.86x | 0.87x | 0.79x | 0.81x | 1.02 / 3.13 ms |
+| bf16 | 720 x 4352 -> 1152 | 0.88x | 0.89x | n/a | n/a | 0.58 ms |
+
+Online costs 1-2 points of speed against stored leaves and no weight memory (stored: 2.9x / 5.7x on a 4-bit layer, 1.75x / 3.06x on bf16). Accuracy: a 4-bit layer stays at the plain 4-bit matmul's 20.1 dB at both levels (stored IF8 sums: 20.0 / 19.8 dB); a bf16 layer is the same as stored leaves, 54.5 / 52.4 dB. The sum scratch is 5 (level 1) or 45 (level 2) cells of fp16, one buffer for the whole model.
 
 **When to use it.** Both widths 1024 or more and halving into whole 64-lane blocks, several hundred rows per call, no fused activation, and a matmul that is a large share of the model's time. Level 2 when one side is 2048 or wider, otherwise level 1. Level 3 never won. A width that needs padding to halve is not worth it.
 
