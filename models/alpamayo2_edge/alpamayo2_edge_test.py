@@ -77,10 +77,13 @@ import user_dma_core
 from user_dma_core import DRAM_INSTRUCTION_ADDR, TYPE, UE_MODE, UE_VECTOR_SIZE, UnifiedEngine
 from multi_engine_shard import MultiEngineScheduler, PrivateArena, model_multicore_layout
 from nn_lib import eltwise_add_core_dram, layer_norm_core_dram_post_add
-try:        # nn_lib §10 (Strassen matmul) arrives with its own PR; only --strassen-level needs it
+try:        # nn_lib §10 (Strassen matmul) arrives with its own PR; without it every matmul is the plain one
     from nn_lib import strassen_levels, strassen_matmul_core_dram, strassen_weight_tree
 except ImportError:
     strassen_levels = strassen_matmul_core_dram = strassen_weight_tree = None
+    print("nn_lib.py has no Strassen section in this checkout: Strassen matmuls are off")
+
+from storage_format import StorageFormat
 
 from alpamayo2_edge_cpu_reference import (  # host oracle + weight loading; no hardware in there
     AIP, EXP, LM, PROJ, STAT_KEYS, VIS, Alpamayo2EdgeRef, KVCache, cos_sim, resolve_model_dir, snr_db, synthetic_inputs,
@@ -109,12 +112,23 @@ PRIVATE_TENSOR_BYTES = 128 << 20   # per engine: vision scratch (~43 MB) + atten
 PRIVATE_ISA_BYTES = 256 << 20      # per engine: its share of the unrolled vision program dominates
 ZERO_CHUNK = 1 << 26               # elements per zero-fill DMA
 
-# Strassen matmuls (--strassen-level N, off at 0; --strassen-ops picks the layers). The routine is nn_lib §10.
-ST_LEVEL, ST_OPS, ST_MIN_ROWS = 0, (), 64
-ST_ALL_OPS = ("v.o", "v.fc2", "lm.q", "lm.k", "lm.v", "lm.o", "lm.fc2")
-# The extra weight copies need room: the programs use ~40 MB of their 768 MB, so with Strassen on
-# the tensor and program regions move up (tensors keep 1024 MB, programs 128 MB).
-ST_LAYOUT = {"tensor_dram_base": 0xB8000000, "program_dram_base": 0xF8000000}
+# Strassen matmuls (nn_lib §10, fp16 intermediates). On by default at level 1 for the bf16 matmuls
+# it helps and that carry no fused activation: vision o_proj and fc2, projector fc2 (board, o + fc2:
+# 73.2 -> 72.6 s, same tokens and trajectory). --strassen-level 0 turns it off, --strassen-ops picks
+# the layers. These module values are the default for every user of this file (the sim driver too).
+ST_DEFAULT_OPS = ("v.o", "v.fc2", "pj.fc2")
+ST_LEVEL = 1 if strassen_levels is not None else 0
+ST_OPS, ST_MIN_ROWS = (ST_DEFAULT_OPS if ST_LEVEL else ()), 64
+PJ_ST_ROWS = 384        # most projector rows one Strassen call takes (bounds its private scratch)
+ST_LAYERS = None        # None: every layer. --probe: only the probed layer gets Strassen weights (level 3 of all does not fit)
+st_on = lambda li: ST_LAYERS is None or li in ST_LAYERS
+ST_ALL_OPS = ("v.o", "v.fc2", "pj.fc2", "lm.q", "lm.k", "lm.v", "lm.o", "lm.fc2")
+# The extra weight copies need room, so with Strassen on the tensor and program regions move up:
+# weights 2752 MB (the default ops use 2498), tensors keep 1024 MB, programs 320 MB. The frame-cache
+# path (sim/edge_device_cached.py) compiles extra vision programs and keeps a reserve, so the
+# programs cannot be squeezed to the ~50 MB one plan needs. Strassen on the prefill (lm.*) needs
+# more weight room than this leaves.
+ST_LAYOUT = {"tensor_dram_base": 0xAC000000, "program_dram_base": 0xEC000000}
 
 
 FRONT = ("vision", "projector", "scatter_img", "prefill", "build_vt")     # the default front half: one stream, this order
@@ -225,7 +239,8 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
     # ---------------------------------------------------------------- plumbing
 
     def _store(self, t):
-        t = t.to(torch.bfloat16).contiguous().flatten()
+        """bf16, unless the tensor already is fp16 (the Strassen leaves): that is uploaded as it is."""
+        t = (t if t.dtype == torch.float16 else t.to(torch.bfloat16)).contiguous().flatten()
         addr = self.get_params_dram_addr()
         self.dma_to_accelerator_memory(addr, t)
         self.allocate_params_dram(t.numel() * BPE)
@@ -369,7 +384,9 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         """One layer's Strassen weights; None when the shape allows no level."""
         if L == 0:
             return None
-        return {"tree": strassen_weight_tree(W, b, L, store or self._store, self._store), "L": L, "scr": scr}
+        # fp16 leaves, or 4-bit ones when `store` quantizes (the prefill)
+        return {"tree": strassen_weight_tree(W, b, L, store or self._store, self._store,
+                                             None if store else StorageFormat.FP16), "L": L, "scr": scr}
 
     def _st_scratch(self, scr, uses):
         """Private scratch for every depth. uses: [(rows, K, N, L)] of the layers sharing it."""
@@ -416,9 +433,11 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         # row count the level cannot split (those rows then run the plain matmul).
         Lv = {"o": st_level(VN * VD, VH) if "v.o" in ST_OPS else 0, "fc2": st_level(VIP, VH) if "v.fc2" in ST_OPS else 0}
         self.v_st = [(max(gh * gw for gh, gw in shapes), K, VH, Lv[op]) for op, K in (("o", VN * VD), ("fc2", VIP)) if Lv[op]]
+        self.pj_level = st_level(PJ_HID, PJ_OUT) if "pj.fc2" in ST_OPS else 0
+        if self.pj_level:                           # the projector shares the vision scratch (one "SV" set per engine)
+            self.v_st.append((PJ_ST_ROWS, PJ_HID, PJ_OUT, self.pj_level))
         plain = lambda op: not Lv[op] or any((gh * gw) % (1 << Lv[op]) for gh, gw in shapes)
-        parts = 1 if Lv["fc2"] else VMLP                # Strassen takes fc2 whole
-        split = lambda t: [st(c.contiguous()) for c in t.split(VIP // parts, dim=1)]
+        split = lambda t, parts: [st(c.contiguous()) for c in t.split(VIP // parts, dim=1)]
         self.vw = {"patch_w": st(w[VIS + "embeddings.patch_embedding.weight"]),
                    "patch_b": st(w[VIS + "embeddings.patch_embedding.bias"]),
                    "post_w": st(w[VIS + "post_layernorm.weight"]),
@@ -430,24 +449,26 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
             # V has no bias on the device: softmax rows sum to 1, so P.(V + b_v) = P.V + b_v, and
             # b_v goes through o_proj as a constant -> part of the o_proj bias.
             o_b = w[a + "out_proj.bias"] + w[a + "out_proj.weight"] @ w[a + "v_proj.bias"]
+            Lo, Lf = (Lv["o"], Lv["fc2"]) if st_on(li) else (0, 0)
+            parts = 1 if Lf else VMLP                   # Strassen takes fc2 whole
             self.vw["layers"].append({
                 "ln1_w": st(w[p + "layer_norm1.weight"]), "ln1_b": st(w[p + "layer_norm1.bias"]),
                 "q": st(w[a + "q_proj.weight"] * q_scale), "q_b": st(w[a + "q_proj.bias"] * q_scale),
                 "k": st(w[a + "k_proj.weight"]), "k_b": st(w[a + "k_proj.bias"]),
                 "v": st(w[a + "v_proj.weight"]),
-                "o": st(w[a + "out_proj.weight"]) if plain("o") else None, "o_b": st(o_b),
-                "st_o": self._st_node(w[a + "out_proj.weight"], o_b, Lv["o"], "SV"),
-                "st_fc2": self._st_node(cols(w[p + "mlp.fc2.weight"], VIP), w[p + "mlp.fc2.bias"], Lv["fc2"], "SV"),
+                "o": st(w[a + "out_proj.weight"]) if plain("o") or not Lo else None, "o_b": st(o_b),
+                "st_o": self._st_node(w[a + "out_proj.weight"], o_b, Lo, "SV"),
+                "st_fc2": self._st_node(cols(w[p + "mlp.fc2.weight"], VIP), w[p + "mlp.fc2.bias"], Lf, "SV"),
                 "ln2_w": st(w[p + "layer_norm2.weight"]), "ln2_b": st(w[p + "layer_norm2.bias"]),
                 "fc1": st(rows(w[p + "mlp.fc1.weight"], VIP)), "fc1_b": st(rows(w[p + "mlp.fc1.bias"], VIP)),
-                "fc2": split(cols(w[p + "mlp.fc2.weight"], VIP)) if plain("fc2") else None, "fc2_b": st(w[p + "mlp.fc2.bias"]),
+                "fc2": split(cols(w[p + "mlp.fc2.weight"], VIP), parts) if plain("fc2") or not Lf else None, "fc2_b": st(w[p + "mlp.fc2.bias"]),
                 "mlp_parts": parts,
             })
         # Learned 16x16 position grid, resized per shape on the host (a constant of the shape).
         for gh, gw in shapes:
             pos = ref.vision_pos_embed(torch.tensor([[1, gh, gw]])).float().cpu()
             self.vw["pos"][(gh, gw)] = st(rows(pos, _pad_seq(gh * gw)))
-        note = "".join(f", Strassen level {L} on {'o_proj' if K == VN * VD else 'fc2'}" for _, K, _, L in self.v_st)
+        note = "".join(f", Strassen level {L} on {'o_proj' if K == VN * VD else 'fc2' if K == VIP else 'projector fc2'}" for _, K, _, L in self.v_st)
         print(f"vision weights stored (bf16{note}): params DRAM {self.get_params_dram_usage() / 2**20:.0f} MB")
 
     # ---------------------------------------------------------------- vision: tensors
@@ -786,6 +807,9 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         self.pw = {"ln_w": st(w[PROJ + "norm.weight"]), "ln_b": st(w[PROJ + "norm.bias"]),
                    "fc1": st(w[PROJ + "linear_fc1.weight"]), "fc1_b": st(w[PROJ + "linear_fc1.bias"]),
                    "fc2": st(w[PROJ + "linear_fc2.weight"]), "fc2_b": st(w[PROJ + "linear_fc2.bias"])}
+        # fc2 (11520 -> 2048, no activation) on Strassen; the plain weight stays for odd rows and short calls.
+        # fc1 carries the fused GELU, which the Strassen routine cannot apply.
+        self.pw["st_fc2"] = self._st_node(w[PROJ + "linear_fc2.weight"], w[PROJ + "linear_fc2.bias"], getattr(self, "pj_level", 0), "SV")
         tokens = self.total_real // MERGE2
         self.buf["PJ_LN"] = self._alloc(self.total_real * VH)
         self.buf["PJ_HID"] = self._alloc(tokens * PJ_HID)
@@ -813,9 +837,28 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         ue.matmat_mul_core(M=n, K=PJ_IN, N=PJ_HID, A_DRAM_ADDR=b["PJ_LN"] + t0 * PJ_IN * BPE, B_DRAM_ADDR=pw["fc1"],
                            OUTPUT_DRAM_ADDR=b["PJ_HID"] + t0 * PJ_HID * BPE, C_DRAM_ADDR=pw["fc1_b"],
                            bias_mode="broadcast_N", gelu_enable=True, gpr_M_reg=r_tok)
-        ue.matmat_mul_core(M=n, K=PJ_HID, N=PJ_OUT, A_DRAM_ADDR=b["PJ_HID"] + t0 * PJ_HID * BPE, B_DRAM_ADDR=pw["fc2"],
-                           OUTPUT_DRAM_ADDR=b["IMG"] + t0 * PJ_OUT * BPE, C_DRAM_ADDR=pw["fc2_b"],
-                           bias_mode="broadcast_N", gpr_M_reg=r_tok)
+        fc2 = lambda rows, a, o, r: ue.matmat_mul_core(M=rows, K=PJ_HID, N=PJ_OUT, A_DRAM_ADDR=a, B_DRAM_ADDR=pw["fc2"],
+                                                       OUTPUT_DRAM_ADDR=o, C_DRAM_ADDR=pw["fc2_b"], bias_mode="broadcast_N", gpr_M_reg=r)
+        a_hid, a_img = b["PJ_HID"] + t0 * PJ_HID * BPE, b["IMG"] + t0 * PJ_OUT * BPE
+        if pw["st_fc2"] is None or n < ST_MIN_ROWS:
+            fc2(n, a_hid, a_img, r_tok)
+            return
+        self._flops_acc -= 2 * n * PJ_HID * PJ_OUT          # counted by _st_rows / the tail below instead
+        keep, E.r_M = E.r_M, None
+        for r0 in range(0, n, PJ_ST_ROWS):                  # Strassen in bounded row blocks; an odd row runs plain
+            rows = min(PJ_ST_ROWS, n - r0)
+            E.r_M = ue.alloc_isa_reg()
+            ue.generate_instruction_add_set(E.r_M, rows)
+
+            def native(m, a, o):
+                self._flops_acc += 2 * m * PJ_HID * PJ_OUT
+                fc2(m, a, o, E.r_M)
+            if rows < ST_MIN_ROWS:
+                native(rows, a_hid + r0 * PJ_HID * BPE, a_img + r0 * PJ_OUT * BPE)
+            else:
+                self._st_rows(E, rows, PJ_HID, PJ_OUT, a_hid + r0 * PJ_HID * BPE, pw["st_fc2"], a_img + r0 * PJ_OUT * BPE, native)
+            ue.release_isa_reg()
+        E.r_M = keep
 
     def projector_read(self, rows):
         return self.dma_from_accelerator_memory(self.buf["IMG"], (rows // MERGE2, PJ_OUT)).float()
@@ -1612,7 +1655,7 @@ def lm_strassen_sources(ref):
     swaps the reference to dequantized weights: Strassen quantizes its own 7 combinations."""
     out, half = {}, LI // 2
     names = {"q": "self_attn.q_proj", "k": "self_attn.k_proj", "v": "self_attn.v_proj", "o": "self_attn.o_proj"}
-    for li in range(LML if ST_LEVEL else 0):
+    for li in [li for li in range(LML if ST_LEVEL else 0) if st_on(li)]:
         p = f"{LM}layers.{li}."
         for op, name in names.items():
             if f"lm.{op}" in ST_OPS:
@@ -1688,11 +1731,13 @@ def main():
     ap.add_argument("--split-front", action="store_true",
                     help="launch vision, projector, image scatter, prefill and the V^T build one by one (per-stage times "
                          "and the prompt-embedding check). Default: one merged instruction stream, one launch")
-    ap.add_argument("--strassen-level", type=int, default=0, choices=(0, 1, 2, 3),
-                    help="Strassen depth for the layers in --strassen-ops (0 = off); a layer whose widths "
+    ap.add_argument("--strassen-level", type=int, default=None, choices=(0, 1, 2, 3),
+                    help="Strassen depth for the layers in --strassen-ops (0 = off; default 1 when nn_lib has the "
+                         "Strassen section); a layer whose widths "
                          "cannot split that deep uses the deepest level they allow")
-    ap.add_argument("--strassen-ops", default="v.o,v.fc2,lm.fc2",
-                    help=f"comma list of {', '.join(ST_ALL_OPS)} (v = vision tower, lm = prefill)")
+    ap.add_argument("--strassen-ops", default=None,
+                    help=f"comma list of {', '.join(ST_ALL_OPS)} (v = vision tower, pj = projector, lm = prefill); "
+                         f"default {','.join(ST_DEFAULT_OPS)}")
     ap.add_argument("--max-new", type=int, default=CFG["model"]["max_new_tokens"])
     ap.add_argument("--steps", type=int, default=CFG["action_expert"]["flow_steps"])
     ap.add_argument("--seed", type=int, default=0)
@@ -1703,11 +1748,14 @@ def main():
     if args.probe:
         args.max_new = 1
     vision_only = args.stop_at == "vision" or args.staged == "vision"
-    global ST_LEVEL, ST_OPS
-    ST_LEVEL, ST_OPS = args.strassen_level, tuple(o for o in args.strassen_ops.split(",") if o) if args.strassen_level else ()
+    global ST_LEVEL, ST_OPS, ST_LAYERS
+    ST_LAYERS = (args.probe_layer,) if args.probe else None
+    if args.strassen_level is not None or args.strassen_ops is not None:     # asked for: no silent fallback
+        ST_LEVEL = 1 if args.strassen_level is None else args.strassen_level
+        ST_OPS = (tuple(o for o in args.strassen_ops.split(",") if o) if args.strassen_ops else ST_DEFAULT_OPS) if ST_LEVEL else ()
+        assert not ST_LEVEL or strassen_levels is not None, "Strassen needs the Strassen section of nn_lib.py (not in this checkout)"
     assert all(o in ST_ALL_OPS for o in ST_OPS), f"--strassen-ops: unknown entry in {ST_OPS}"
     if ST_LEVEL:
-        assert strassen_levels is not None, "--strassen-level needs the Strassen section of nn_lib.py (not in this checkout)"
         print(f"Strassen level {ST_LEVEL} on {', '.join(ST_OPS)}")
 
     sample = pick_sample(args.golden)
