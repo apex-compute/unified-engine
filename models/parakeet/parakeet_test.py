@@ -55,13 +55,14 @@ URAM_B_BASE = 0x80000
 EPS = 1e-5
 
 # Strassen matmul (nn_lib §10, fp16 intermediates) on the encoder's plain bf16 matmuls that are
-# wide enough to gain: the 1024 -> 1024 projections at level 1 and the two FF down halves
-# (2048 -> 1024) at level 2 from 256 rows, level 1 below. The rows of every call are the length
-# bucket's static L_pad / P_pad (the encoder is compiled per bucket), and a call under 128 rows
-# keeps the plain matmul. --strassen-level caps the level; 0 = every matmul plain.
-ST_LEVEL = 2
+# wide enough to gain: the 1024 -> 1024 projections and the two FF down halves (2048 -> 1024),
+# all at level 1. The rows of every call are the length bucket's static L_pad / P_pad (the encoder
+# is compiled per bucket), and a bucket under 128 rows stays plain. Level 2 only pays from 256
+# rows, which this port cannot reach: the depthwise Toeplitz matrices (D x L_pad^2 per layer) fill
+# the params region by L_pad 192, so in practice only the L_pad 128 bucket has room for the leaves.
+# --strassen-level 0 = every matmul plain.
+ST_LEVEL = 1
 ST_MIN_ROWS = 128
-ST_FF_L2_ROWS = 256
 ST_SQ_KEYS = ("ATTN_Q_W", "ATTN_K_W", "ATTN_V_W", "ATTN_OUT_W", "CONV_PW1A_W", "CONV_PW2_W")   # L_pad rows
 ST_POS_KEYS = ("ATTN_POS_W",)                                                                  # P_pad rows
 ST_FF_KEYS = ("FF1_W2_LO", "FF1_W2_HI", "FF2_W2_LO", "FF2_W2_HI")                              # L_pad rows
@@ -508,7 +509,7 @@ class Parakeet_UnifiedEngine(UnifiedEngine):
             return L
         plan = {k: level(L_pad, D, 1) for k in ST_SQ_KEYS}
         plan.update({k: level(P_pad, D, 1) for k in ST_POS_KEYS})
-        plan.update({k: level(L_pad, self.ff_dim // 2, 2 if L_pad >= ST_FF_L2_ROWS else 1) for k in ST_FF_KEYS})
+        plan.update({k: level(L_pad, self.ff_dim // 2, 1) for k in ST_FF_KEYS})
         return {k: L for k, L in plan.items() if L}
     def _st_uses(self, L_pad):
         """[(rows, K, N, level)] of the bucket's Strassen calls: sizes the shared scratch."""
@@ -1939,8 +1940,8 @@ def main():
     parser.add_argument("--audio", type=str, default=None, help="Path to audio file (.wav, .flac, etc.)")
     parser.add_argument("--dev", type=str, default="xdma0", help="XDMA device")
     parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
-    parser.add_argument("--strassen-level", type=int, default=ST_LEVEL, choices=(0, 1, 2),
-                        help="Deepest Strassen level on the encoder's wide plain matmuls (0 = off; engages from 128 encoder frames).")
+    parser.add_argument("--strassen-level", type=int, default=ST_LEVEL, choices=(0, 1),
+                        help="Strassen level on the encoder's wide plain matmuls (0 = off; engages at the 128-frame bucket).")
     args = parser.parse_args()
 
     global _SILENT_MODE, ST_LEVEL
