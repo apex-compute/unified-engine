@@ -1347,6 +1347,20 @@ def flash_attention_batched_pbi(
 #   is within ~1 dB of the plain matmul at the same speed (board, 720x4352->1152: plain 55.1 dB,
 #   level 1 43.9 dB in bf16 and 54.1 dB in fp16; levels 2 / 3 in fp16 51.8 / 48.2 dB).
 #
+# 4-BIT (IF4) WEIGHTS
+#   tree = strassen_weight_tree_if4(data, scales, N, K, b, L, store_pack, store_b)
+#   takes the layer's IF4 pack as quant_lib writes it and keeps the 4-bit model's own values:
+#     * a leaf that is an untouched block of the weight (2 of the 7 per level: Y11 and Y22) is
+#       cut out of the pack byte for byte and stays IF4;
+#     * a leaf that is a true sum is formed in fp32 from the DEQUANTIZED weight and stored IF8.
+#       The sum of two 4-bit blocks does not fit a 4-bit grid again: re-quantizing it to IF4
+#       costs 6 dB per level (14 / 8 / 2 dB against bf16 at levels 1 / 2 / 3, where the plain IF4
+#       matmul is at 20 dB), whatever precision the device sums use. With IF8 sums the result
+#       is the 4-bit model's: 20.0 / 19.8 / 18.8 dB.
+#   Weight bytes against the plain IF4 pack: 2.9x / 5.7x / 10.3x at levels 1 / 2 / 3.
+#   store_pack(data_bytes, scale_bytes, n, k, TYPE.IF4 or TYPE.IF8) -> (data_addr, scale_addr).
+#   The device side is the same kernel: fp16 input sums, products and recombination.
+#
 # HOW IT WORKS (one level; Yij = block (i, j) of W^T, formed on the host)
 #   P1' = (X11+X22)(Y11+Y22)        P2' = (X21+X22) Y11        P5' = (X11+X12) Y22
 #   C12 = X11 (Y12-Y22) + P5'       C21 = X22 (Y21-Y11) + P2'
@@ -1360,9 +1374,9 @@ def flash_attention_batched_pbi(
 #
 # LIMITS (measured on the board, Alveo U50; details in CHANGELOG.md "Strassen matmul")
 #   * Accuracy: with the fp16 intermediates above, ~1 / 3 / 7 dB below the plain matmul at
-#     levels 1 / 2 / 3 (it was 11 / 18 / 24 dB below when they were bf16). 4-bit (IF4) leaves
-#     still lose 6.0 dB per level on top of ~20 dB: that loss is the re-quantization of the
-#     weight sums, which fp16 does not touch.
+#     levels 1 / 2 / 3 (it was 11 / 18 / 24 dB below when they were bf16). For 4-bit weights
+#     use strassen_weight_tree_if4 (IF8 sums); strassen_weight_tree(..., weight_format=None)
+#     with an IF4 store re-quantizes every leaf to 4 bits and loses 6.0 dB per level.
 #   * Speed: 0.82x / 0.71x / 0.64x of the plain time (bf16), 0.88x / 0.78x / 0.70x (IF4), on that
 #     large shape only. Small shapes get SLOWER (K = N = 256: 1.26x). It won on 215 of 640 shapes
 #     on one engine and 121 of 640 on eight.
@@ -1413,6 +1427,49 @@ def strassen_weight_tree(W: torch.Tensor, b: torch.Tensor | None, levels: int,
         return {"w": store_w(cast(W)), "b": None if b is None else store_b(cast(b)),
                 "f": StorageFormat.BF16 if weight_format is None else weight_format}
     return {"c": [strassen_weight_tree(w, bb, levels - 1, store_w, store_b, weight_format) for w, bb in strassen_combos(W, b)]}
+
+
+def strassen_weight_tree_if4(data: bytes, scales: bytes, N: int, K: int, b: torch.Tensor | None,
+                             levels: int, store_pack: Callable, store_b: Callable | None = None,
+                             sum_precision: str = "if8") -> dict:
+    """Host side, once, for a layer whose weight is a 4-bit IF4 pack (data, scales, N, K) as
+    quant_lib.quantize("if4", W) writes it: data = N x K/2 bytes, two weights per byte, row-major;
+    scales = one bf16 per 64 weights, row-major.
+
+    The tree keeps the 4-bit model's values. A leaf with no sum on its path (Y11 or Y22 at every
+    level) is an untouched block of the weight: its bytes and scales are cut out of the pack and it
+    stays IF4. Every other leaf is a sum of blocks of the DEQUANTIZED weight, formed in fp32 and
+    quantized to sum_precision ("if8"; "if4" re-quantizes to 4 bits and is only there to compare).
+    store_pack(data_bytes, scale_bytes, n, k, TYPE) -> (data_addr, scale_addr); store_b(b fp32)
+    -> a bf16 address. Leaves: {"w": (data_addr, scale_addr), "t": TYPE, "b": ..., "f": BF16}."""
+    import quant_lib                                            # host codecs; not needed by any other section
+    assert sum_precision in ("if4", "if8")
+    sum_type = TYPE.IF8 if sum_precision == "if8" else TYPE.IF4
+    assert K % (64 << levels) == 0 and N % (1 << levels) == 0, f"IF4 Strassen: {N} x {K} does not halve {levels} times"
+    d = np.frombuffer(data, dtype=np.uint8).reshape(N, K // 2)
+    sc = np.frombuffer(scales, dtype=np.uint8).reshape(N, K // 64 * 2)
+    Wd = quant_lib.dequant("if4", data, scales, N, K).float().cpu()     # what the 4-bit weight really is
+    b = None if b is None else b.float().cpu()
+
+    def build(W, bias, lv, at):
+        """W: this node's values. at: (row, column) of the block in the pack while no sum has touched it."""
+        if lv == 0:
+            n, k = W.shape
+            if at is not None:
+                r0, c0 = at
+                w, t = store_pack(d[r0:r0 + n, c0 // 2:(c0 + k) // 2].tobytes(),
+                                  sc[r0:r0 + n, c0 // 64 * 2:(c0 + k) // 64 * 2].tobytes(), n, k, TYPE.IF4), TYPE.IF4
+            else:
+                w, t = store_pack(*quant_lib.quantize(sum_precision, W.contiguous()), n, k, sum_type), sum_type
+            return {"w": w, "t": t, "b": None if bias is None else store_b(bias), "f": StorageFormat.BF16}
+        n, k = W.shape[0] // 2, W.shape[1] // 2
+        kids = []
+        for i, (w, bb) in enumerate(strassen_combos(W, bias)):     # products 2 and 5 take Y11 and Y22 as they are
+            sub = None if at is None or i not in (1, 4) else (at[0] + (n if i == 4 else 0), at[1] + (k if i == 4 else 0))
+            kids.append(build(w, bb, lv - 1, sub))
+        return {"c": kids}
+
+    return build(Wd, b, levels, (0, 0))
 
 
 def strassen_scratch_elements(M: int, K: int, N: int, levels: int) -> list[tuple[int, int]]:
@@ -1469,8 +1526,8 @@ def strassen_matmul_core_dram(ue, M: int, K: int, N: int, A_DRAM_ADDR: int, tree
             kw = dict(C_DRAM_ADDR=_full, bias_mode="full_matrix")
             fm = fm.with_formats(bias=ff)
         W = tree["w"]
-        if isinstance(W, tuple):                                # 4-bit leaf: bf16 scales, bf16 bias vector
-            kw.update(is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=W[1])
+        if isinstance(W, tuple):                                # quantized leaf (IF4, or IF8 for a sum): bf16 scales
+            kw.update(is_B_quantized=True, data_type=tree.get("t", TYPE.IF4), SCALE_DRAM_ADDR=W[1])
             W = W[0]
         ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=W,
                            OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, gpr_M_reg=reg(M), formats=fm, **kw)

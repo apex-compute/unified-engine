@@ -66,7 +66,9 @@ A drop-in replacement for one large `matmat_mul_core` call that does 7 half-size
 
 **fp16 intermediates.** The input, the layer's weight and the output stay bf16; the input sums, the weight sums (leaf weights), the 7 products and the recombination are stored in fp16. In bf16 those sums cost about 11 dB per level; in fp16 one level is within 1 dB of the plain matmul at the same speed. Board, one engine, 720 x 4352 -> 1152 with a bias: plain 55.1 dB, level 1 54.5 dB at 0.88x of the plain time (43.9 dB when the intermediates were bf16); 408 x 4608 -> 2048: 54.5 / 52.4 / 48.4 dB at 0.86x / 0.79x / 0.80x for levels 1 / 2 / 3. `strassen_weight_tree` hands `store_w` / `store_b` fp16 tensors to upload as they are; `weight_format=None` keeps 4-bit leaves. The bf16 SNR column of the table below is the old all-bf16 kernel.
 
-**When it is worth trying:** a bf16 matmul with K and N of a thousand or more that halves into whole 64-lane blocks. Do not use it on small matmuls, on a matmul with a fused activation, or with 4-bit leaves: re-quantizing the weight sums to 4 bits costs 6 dB per level whatever the device sums are stored in.
+**4-bit (IF4) weights.** `strassen_weight_tree_if4` takes the layer's IF4 pack. The two leaves per level that are an untouched block of the weight are cut out of the pack and stay 4-bit; the five that are sums are formed from the dequantized weight and stored IF8, because the sum of two 4-bit blocks does not fit a 4-bit grid again. Board, one engine, 408 rows, level 1, against the plain IF4 matmul (20.1 dB vs bf16): 20.0 dB at 0.87-0.90x of its time for 2.9x the weight bytes (5.7x / 10.3x at levels 2 / 3). Re-quantizing every leaf to 4 bits instead gives 14.1 / 8.1 / 2.0 dB at levels 1 / 2 / 3.
+
+**When it is worth trying:** a matmul with K and N of a thousand or more that halves into whole 64-lane blocks, several hundred rows per call, and a large share of the model's time. Do not use it on small matmuls or on a matmul with a fused activation. Measured in whole models: Alpamayo 2 Edge vision 73.2 -> 72.6 s; parakeet (128 rows) 1.8% and swin (2 of 24 layers) 0.4%, both left off by default.
 
 **API** (all in `nn_lib.py`):
 
@@ -74,6 +76,7 @@ A drop-in replacement for one large `matmat_mul_core` call that does 7 half-size
 |----------|---------|
 | `strassen_levels(K, N, max_level)` | Deepest level the shape allows |
 | `strassen_weight_tree(W, b, levels, store_w, store_b)` | Host, at weight-init: forms and stores the 7^levels leaf weights |
+| `strassen_weight_tree_if4(data, scales, N, K, b, levels, store_pack, store_b)` | Same for a 4-bit layer: untouched blocks stay IF4, sums are stored IF8 |
 | `strassen_scratch_elements(M, K, N, levels)` | Scratch size per depth |
 | `strassen_matmul_core_dram(ue, M, K, N, A, tree, OUT, scratch)` | Emits the program; row-major in, row-major out, bias included |
 
