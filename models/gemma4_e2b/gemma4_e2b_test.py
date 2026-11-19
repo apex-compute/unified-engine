@@ -218,6 +218,11 @@ def _parse_offset(val) -> int:
 # filler is real instruction text, the same as qwen2.5_omni_7b's, because a
 # prompt of repeated nonsense changes what attention does with it.
 DEFAULT_PROMPT_BASE = "Respond to the request in detail."
+# The prompt of an image + audio run with no --prompt. The transcript is asked
+# for first: asked to describe the picture first, E4B (the source model too)
+# then answers that no audio was provided.
+DEFAULT_IMAGE_AUDIO_PROMPT = ("Transcribe the speech in the audio exactly. "
+                              "Then describe the picture in two or three sentences.")
 _FIT_FILLER_SENTENCES = (
     "Address every part of the request before you stop, and do not end the "
     "answer while any part of it remains uncovered.",
@@ -1675,8 +1680,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             rate = processor.feature_extractor.sampling_rate
             samples = self._load_audio_samples(audio_path, rate, audio_seconds)
 
-        # Audio first, then the frames: the order the answer is asked for.
-        media = ([{"type": "audio"}] if audio_path else []) + [{"type": "image"}] * frames
+        # The frames first, then the audio. With the clip ahead of the image E4B
+        # answers "there is no speech in the audio" (the source model does the
+        # same in that order); frames first, both models transcribe it.
+        media = [{"type": "image"}] * frames + ([{"type": "audio"}] if audio_path else [])
 
         def _content(text: str) -> list:
             return media + [{"type": "text", "text": text}]
@@ -1694,7 +1701,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             return processor(**kwargs)
 
         if prompt is None:
-            prompt = prompt_base or DEFAULT_PROMPT_BASE
+            prompt = prompt_base or (DEFAULT_IMAGE_AUDIO_PROMPT
+                                     if image_path and audio_path and not target_prefill_tokens
+                                     else DEFAULT_PROMPT_BASE)
             if target_prefill_tokens:
                 prompt = fit_prompt_to_prefill(
                     processor.tokenizer,
