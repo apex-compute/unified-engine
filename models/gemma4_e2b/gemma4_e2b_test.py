@@ -199,7 +199,7 @@ DEFAULT_AUDIO = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samp
 # Tensor allocation, the RoPE tables and the decoder bounds follow it; the JSON
 # value (model.max_context_size) is checked against this choice.
 MIN_CONTEXT_SIZE = 1024
-MAX_CONTEXT_SIZE = 8192
+MAX_CONTEXT_SIZE = int(os.environ.get("UE_MAX_CONTEXT_SIZE", "8192"), 0)
 
 
 def _parse_offset(val) -> int:
@@ -1100,7 +1100,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     # window, and under the tiled map inside engine 1's. Audio is not exercised
     # by the image/text paths, so the collision has been latent -- it is a real
     # bug either way, and the tiled map is not going to add a second one.
-    AUDIO_WEIGHT_LEGACY_BASE = 0x6C000000
+    AUDIO_WEIGHT_LEGACY_BASE = int(os.environ.get("UE_AUDIO_WEIGHT_BASE", "0x6C000000"), 0)
     AUDIO_WEIGHT_REGION_BYTES = 0x0C000000        # 192 MB
 
     def _audio_weight_region(self) -> tuple[int, int]:
@@ -1351,11 +1351,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # Window 0 belongs to core 0, which keeps its own tensor-arena buffers;
         # its window stays reserved so engine index == window index everywhere.
         self.DRAM_END = 0x100000000 + _rebase
-        _params_base  = 0x80000000 + _rebase
+        _params_base  = int(os.environ.get("UE_PARAMS_BASE", "0x80000000"), 0) + _rebase
         _tensor_base  = 0xE1000000 + _rebase
         self.VISION_ISA_BASE             = 0xFF000000 + _rebase
         self.VISION_WORKER_ISA_BASE      = 0xFF400000 + _rebase
-        self.LM_ISA_BASE                 = 0xFF620000 + _rebase
+        self.LM_ISA_BASE                 = int(os.environ.get("UE_LM_ISA_BASE", "0xFF620000"), 0) + _rebase
         # Per-engine private windows, laid out by the library. Uniform at EVERY
         # engine count -- vision and prefill are sequential and share one arena,
         # so engine i always owns the same window in both, and the window is a
