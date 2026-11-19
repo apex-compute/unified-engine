@@ -60,11 +60,13 @@ New instruction generators added to `UnifiedEngine`:
 
 ---
 
-### Strassen matmul — `nn_lib.py` §10 (optional, off by default)
+### Strassen matmul — `nn_lib.py` §10 (optional)
 
-A drop-in replacement for one large `matmat_mul_core` call that does 7 half-size products instead of 8, nested up to 3 levels. It trades accuracy for speed, so **no model uses it by default**. It is kept in `nn_lib.py` so a future model with very large matmuls can opt in.
+A drop-in replacement for one large `matmat_mul_core` call that does 7 half-size products instead of 8, nested up to 3 levels. Alpamayo 2 Edge uses level 1 by default on its vision `o_proj` / `fc2` and projector `fc2`; no other model uses it.
 
-**When it is worth trying:** a matmul with K and N in the thousands, weights in bf16, and accuracy headroom of 10 dB or more per level. Do not use it on small matmuls, on 4-bit LLM layers, or on a matmul with a fused activation.
+**fp16 intermediates.** The input, the layer's weight and the output stay bf16; the input sums, the weight sums (leaf weights), the 7 products and the recombination are stored in fp16. In bf16 those sums cost about 11 dB per level; in fp16 one level is within 1 dB of the plain matmul at the same speed. Board, one engine, 720 x 4352 -> 1152 with a bias: plain 55.1 dB, level 1 54.5 dB at 0.88x of the plain time (43.9 dB when the intermediates were bf16); 408 x 4608 -> 2048: 54.5 / 52.4 / 48.4 dB at 0.86x / 0.79x / 0.80x for levels 1 / 2 / 3. `strassen_weight_tree` hands `store_w` / `store_b` fp16 tensors to upload as they are; `weight_format=None` keeps 4-bit leaves. The bf16 SNR column of the table below is the old all-bf16 kernel.
+
+**When it is worth trying:** a bf16 matmul with K and N of a thousand or more that halves into whole 64-lane blocks. Do not use it on small matmuls, on a matmul with a fused activation, or with 4-bit leaves: re-quantizing the weight sums to 4 bits costs 6 dB per level whatever the device sums are stored in.
 
 **API** (all in `nn_lib.py`):
 
