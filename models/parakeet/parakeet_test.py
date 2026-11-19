@@ -1998,6 +1998,7 @@ def write_run_summary(engine, args, *, audio_path, audio_dur, T_mel, L, L_pad, m
     return out
 
 def main():
+    global _SILENT_MODE, ST_LEVEL
     import argparse
     parser = argparse.ArgumentParser(description="Parakeet-TDT-0.6B accelerator inference")
     parser.add_argument("--audio", type=str, default=None, help="Path to audio file (.wav, .flac, etc.)")
@@ -2010,7 +2011,6 @@ def main():
                         help="Strassen level on the encoder's wide plain matmuls (0 = off; engages at the 128-frame bucket).")
     args = parser.parse_args()
 
-    global _SILENT_MODE, ST_LEVEL
     _SILENT_MODE = True
     ST_LEVEL = args.strassen_level
 
