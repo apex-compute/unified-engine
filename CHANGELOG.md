@@ -86,6 +86,8 @@ Replaces one large `matmat_mul_core` call with 7 half-size products instead of 8
 | 4-bit layer, weight bytes | 1x | 2.9x | 5.7x | 10.3x |
 | bf16 layer, weight bytes | 1x | 1.75x | 3.06x | 5.36x |
 
+**No extra weight memory on a 4-bit layer (online leaves, level 1).** The weight is stored once, as its four 4-bit quarters. Before the matmul the board dequantizes two quarters to fp16 on chip, adds them and writes the sum to a scratch all layers share; the pieces are dealt out over the engines. Measured on 8 engines, 408 and 832 rows per engine: making the five sums takes 0.27 ms (2048 x 2048) to 0.61 ms (4608 x 2048), and the matmul runs at 0.92x / 0.91x of the plain 4-bit time against 0.91x / 0.89x with stored leaves. Same accuracy as the plain 4-bit matmul (20.1 dB vs bf16).
+
 **When to use it.** Both widths 1024 or more and halving into whole 64-lane blocks, several hundred rows per call, no fused activation, and a matmul that is a large share of the model's time. Level 2 when one side is 2048 or wider, otherwise level 1. Level 3 never won. A width that needs padding to halve is not worth it.
 
 **In models.** Alpamayo 2 Edge, vision `o_proj` / `fc2` and projector `fc2` at level 1 (on by default): 73.2 s -> 72.6 s per plan, same output. Parakeet, 128-row clips: 1.8%. Swin, last stage only: 0.4%. Both are off by default (`--strassen-level`). No 4-bit model uses it yet.
@@ -97,6 +99,7 @@ Replaces one large `matmat_mul_core` call with 7 half-size products instead of 8
 | `strassen_levels(K, N, max_level)` | Deepest level the shape allows |
 | `strassen_weight_tree(W, b, levels, store_w, store_b)` | Host, once: the fp16 leaf weights of a bf16 layer |
 | `strassen_weight_tree_if4(data, scales, N, K, b, levels, store_pack, store_b)` | Host, once: the leaf weights of a 4-bit layer (IF4 blocks, IF8 sums) |
+| `strassen_if4_quarters`, `strassen_online_tree`, `strassen_online_sums_core`, `strassen_online_items` | A 4-bit layer with the sums made on the board: store once, emit the sums, build the tree |
 | `strassen_scratch_elements(M, K, N, levels)` | Scratch size per depth |
 | `strassen_matmul_core_dram(ue, M, K, N, A, tree, OUT, scratch)` | Emits the program; row-major in and out, bias included |
 
