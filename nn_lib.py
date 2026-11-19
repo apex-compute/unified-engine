@@ -1331,6 +1331,8 @@ def flash_attention_batched_pbi(
 #   L    = strassen_levels(K, N, wanted)                       # deepest level the shape allows
 #   tree = strassen_weight_tree(W, b, L, store_w, store_b)     # host, once: a bf16 layer
 #     or   strassen_weight_tree_if4(data, scales, N, K, b, L, store_pack, store_b)   # a 4-bit layer
+#     or   strassen_if4_quarters + strassen_online_tree, with strassen_online_sums_core emitted
+#          before the matmul: a 4-bit layer at level 1 with no extra weight storage (see below)
 #   scr  = [(x_addr, p_addr), ...]                             # one pair per depth, sized by
 #                                                              # strassen_scratch_elements(M, K, N, L)
 #   strassen_matmul_core_dram(ue, M, K, N, A, tree, OUT, scr)  # at program-capture time
@@ -1443,6 +1445,68 @@ def strassen_weight_tree_if4(data: bytes, scales: bytes, N: int, K: int, b: torc
         return {"c": kids}
 
     return build(Wd, b, levels, (0, 0))
+
+
+# ---- online leaves (4-bit layer, level 1): the weight is stored ONCE and the board makes the sums
+# Stored leaves cost 2.93x the IF4 weight. Instead keep the weight as its four IF4 quarters (the
+# same bytes) and, per matmul call, let the board dequantize two quarters to fp16 on chip, add
+# them there and write the sum to a scratch every layer can share. The work is the same for any
+# row count and can be dealt out over the engines (strassen_online_items), so it costs little
+# next to a many-row matmul. The sums are exact in fp16: the result is the 4-bit model's.
+STRASSEN_QUARTERS = {"Y11": (0, 0), "Y12": (1, 0), "Y21": (0, 1), "Y22": (1, 1)}     # (N half, K half), as in strassen_combos
+# (leaf it becomes in the tree, quarter a, quarter b, sign): leaf = a + sign * b. Leaves 1 and 4 are Y11 and Y22 as stored.
+STRASSEN_SUMS = ((0, "Y11", "Y22", +1), (2, "Y12", "Y22", -1), (3, "Y21", "Y11", -1), (5, "Y11", "Y12", +1), (6, "Y21", "Y22", +1))
+STRASSEN_DEQ_ELEMENTS = 65536       # weights per on-chip dequantize: its scale buffer holds 1024 blocks of 64
+
+
+def strassen_if4_quarters(data: bytes, scales: bytes, N: int, K: int, store_pack: Callable) -> dict:
+    """Host side, once: the layer's IF4 pack (as quant_lib writes it) cut into its four quarters,
+    each stored as a pack of its own -- the same bytes in total, nothing is re-quantized.
+    store_pack(data_bytes, scale_bytes, n, k, TYPE.IF4) -> (data_addr, scale_addr).
+    -> {"Y11": (data_addr, scale_addr), "Y12": ..., "Y21": ..., "Y22": ...}."""
+    assert N % 2 == 0 and K % 128 == 0, f"IF4 quarters: {N} x {K} does not halve into whole 64-weight blocks"
+    n, k = N // 2, K // 2
+    d = np.frombuffer(data, dtype=np.uint8).reshape(N, K // 2)
+    sc = np.frombuffer(scales, dtype=np.uint8).reshape(N, K // 64 * 2)
+    return {q: store_pack(d[i * n:(i + 1) * n, j * k // 2:(j + 1) * k // 2].tobytes(),
+                          sc[i * n:(i + 1) * n, j * k // 64 * 2:(j + 1) * k // 64 * 2].tobytes(), n, k, TYPE.IF4)
+            for q, (i, j) in STRASSEN_QUARTERS.items()}
+
+
+def strassen_online_tree(quarters: dict, sum_addrs: list[int]) -> dict:
+    """The level-1 tree strassen_matmul_core_dram walks when the sums are made on the board:
+    quarters from strassen_if4_quarters, sum_addrs = 5 fp16 buffers of [N/2, K/2] in the order of
+    STRASSEN_SUMS, filled by strassen_online_sums_core before the matmul runs."""
+    leaves = [None] * 7
+    for q, leaf in (("Y11", 1), ("Y22", 4)):
+        leaves[leaf] = {"w": quarters[q], "t": TYPE.IF4, "b": None, "f": StorageFormat.BF16}
+    for (leaf, _, _, _), addr in zip(STRASSEN_SUMS, sum_addrs):
+        leaves[leaf] = {"w": addr, "b": None, "f": StorageFormat.FP16}
+    return {"c": leaves}
+
+
+def strassen_online_items(n: int, k: int) -> list[tuple[int, int, int]]:
+    """Every piece of work of one weight's 5 sums, [(sum index, first weight, weights)]: deal
+    them out over the engines (they are independent) and pass each engine its share."""
+    return [(si, e0, min(STRASSEN_DEQ_ELEMENTS, n * k - e0)) for si in range(len(STRASSEN_SUMS))
+            for e0 in range(0, n * k, STRASSEN_DEQ_ELEMENTS)]
+
+
+def strassen_online_sums_core(ue, quarters: dict, n: int, k: int, sum_addrs: list[int],
+                              items: list[tuple[int, int, int]] | None = None) -> None:
+    """Emit the making of the weight sums for one [2n, 2k] IF4 weight: per item, dequantize the
+    two quarters to fp16 into URAM A and URAM B, add or subtract them there, and write the sum to
+    its DRAM buffer. Nothing is read back from DRAM. items: this engine's share of
+    strassen_online_items(n, k); None = all of them."""
+    fp16 = TensorFormats(a=StorageFormat.FP16, b=StorageFormat.FP16, output=StorageFormat.FP16)
+    for si, e0, take in (strassen_online_items(n, k) if items is None else items):
+        _, qa, qb, sign = STRASSEN_SUMS[si]
+        for q, sram in ((qa, URAM_A_BASE), (qb, URAM_B_BASE)):
+            d_addr, s_addr = quarters[q]
+            ue.start_queue_for_bf16_dequantize_operation(d_addr + e0 // 2, s_addr + e0 // 64 * 2, TYPE.IF4, sram, take,
+                                                         formats=TensorFormats(output=StorageFormat.FP16))
+        (ue.eltwise_add_core if sign > 0 else ue.eltwise_sub_core)(URAM_A_BASE, URAM_B_BASE, URAM_A_BASE, take, formats=fp16)
+        ue.sram_to_accelerator_memory(URAM_A_BASE, sum_addrs[si] + e0 * 2, take)
 
 
 def strassen_scratch_elements(M: int, K: int, N: int, levels: int) -> list[tuple[int, int]]:
