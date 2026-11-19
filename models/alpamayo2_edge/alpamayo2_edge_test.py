@@ -551,7 +551,7 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         if want("score"):       # bias = one row (it only hides the pad keys): loaded once, not per query row
             ue.matmat_mul_core(M=n, K=VDP, N=N, A_DRAM_ADDR=scaled_q, B_DRAM_ADDR=k, OUTPUT_DRAM_ADDR=score,
                                softmax_enable=True, C_DRAM_ADDR=bias, bias_mode="broadcast_N",
-                               gpr_M_reg=batch_reg, gpr_K_reg=qk_reg, gpr_N_reg=seq_reg)
+                               gpr_M_reg=batch_reg)      # K, N fixed: one strided write-back, not a DMA per row
         if want("pv"):
             ue.matmat_mul_core(M=n, K=N, N=VD, A_DRAM_ADDR=score, B_DRAM_ADDR=v_t, OUTPUT_DRAM_ADDR=out,
                                gpr_M_reg=batch_reg, gpr_K_reg=seq_reg, gpr_N_reg=v_reg,
@@ -715,13 +715,64 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
             load[e] += self.images[i]["N"] ** 1.1
         return assign
 
+    # Measured 2026-11-18, 8 engines: one image through the tower ~ 12.1 ms x N^1.1 (18.1 s at
+    # N = 768, 8.5 s at 384); the projector ~ 4.15 ms per image token.
+    VIS_MS, PJ_MS = 12.1, 4.15
+
+    def image_tokens(self, i):
+        """Image i -> (first token, token count) in IMG."""
+        im = self.images[i]
+        assert im["out_off"] % MERGE2 == 0 and im["n"] % MERGE2 == 0
+        return im["out_off"] // MERGE2, im["n"] // MERGE2
+
+    def plan_images(self, image_ids):
+        """-> (assign, early, late). Whole images cannot be dealt out evenly (two large ones take
+        ~1.1 s longer than one large + two small), so an engine that would wait projects its own
+        images while the others still encode -- early[e]: image ids, as many as fit without making
+        it the last to finish. late[e]: [(first token, count)], the remaining tokens split evenly;
+        they run as a second round (they read image rows other engines wrote)."""
+        assign = self.assign_images(image_ids)
+        load = [sum(self.VIS_MS * self.images[i]["N"] ** 1.1 for i in a) for a in assign]
+        end, early, rest = max(load) * 1.002, [[] for _ in assign], []
+        for e, a in enumerate(assign):
+            for i in a:
+                cost = self.PJ_MS * self.image_tokens(i)[1]
+                if load[e] + cost <= end and self.NE > 1:
+                    early[e].append(i)
+                    load[e] += cost
+                else:
+                    rest.append(i)
+        ranges = [self.image_tokens(i) for i in sorted(rest)]
+        base, rem = divmod(sum(n for _, n in ranges), self.NE)
+        late, e, room = [[] for _ in assign], 0, base + (rem > 0)
+        for t0, n in ranges:
+            while n:
+                take = min(n, room)
+                if take:
+                    late[e].append((t0, take))
+                t0, n, room = t0 + take, n - take, room - take
+                if room == 0 and e + 1 < self.NE:
+                    e += 1
+                    room = base + (e < rem)
+        return assign, early, late
+
+    def emit_vision(self, assign, early):
+        """Round 1: every engine encodes its images, then projects the ones in early."""
+        self._round(lambda E: [self._emit_image(E, i) for i in assign[E.e]]
+                    + [self.emit_projector(E, *self.image_tokens(i)) for i in early[E.e]])
+
+    def emit_late(self, late):
+        """Round 2: the image tokens round 1 left."""
+        self._round(lambda E: [self.emit_projector(E, t0, n) for t0, n in late[E.e]])
+
     def vision_compile(self, image_ids):
         t0 = time.time()
-        self.assign = self.assign_images(image_ids)
-        self._compile("vision", lambda: self._round(lambda E: [self._emit_image(E, i) for i in self.assign[E.e]]),
-                      parallel=True)
+        self.assign, self.early, self.late = self.plan_images(image_ids)
+        self._compile("vision", lambda: self.emit_vision(self.assign, self.early), parallel=True)
         if self.NE > 1:
             print("vision images per engine: " + " | ".join(",".join(map(str, a)) or "-" for a in self.assign))
+            print("  projected in the same round: " + " | ".join(",".join(map(str, a)) or "-" for a in self.early)
+                  + f"; {sum(n for l in self.late for _, n in l)} tokens left for the projector round")
         self._report_programs("vision", t0)
 
     def vision_read(self, i):
@@ -742,19 +793,12 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         print(f"projector stored: params DRAM {self.get_params_dram_usage() / 2**20:.0f} MB")
 
     def projector_compile(self, rows):
-        """rows: leading patch rows of VIS_OUT to project (a multiple of 4). The 2x2 merge is the
-        reinterpretation of (rows, 1152) as (rows / 4, 4608): block-major patch order. Tokens are
-        split evenly across engines (every op here is row-wise)."""
-        tokens = rows // MERGE2
-        base, rem = divmod(tokens, self.NE)
-        counts = [base + (i < rem) for i in range(self.NE)]
-        shards = [(sum(counts[:i]), counts[i]) for i in range(self.NE)]
-
-        def body(E):
-            t0, n = shards[E.e]
-            if n:
-                self.emit_projector(E, t0, n)
-        self._compile("projector", lambda: self._round(body), parallel=True)
+        """rows: patch rows of VIS_OUT to project (a multiple of 4). The 2x2 merge is the
+        reinterpretation of (rows, 1152) as (rows / 4, 4608): block-major patch order. This is the
+        part vision_compile's round did not already project (plan_images), split evenly."""
+        done = sum(self.image_tokens(i)[1] for a in self.early for i in a) + sum(n for l in self.late for _, n in l)
+        assert done == rows // MERGE2, f"{done} tokens planned vs {rows // MERGE2}"
+        self._compile("projector", lambda: self.emit_late(self.late), parallel=True)
 
     def emit_projector(self, E, t0, n):
         """The projector on tokens [t0, t0 + n) on engine E: their 4 n patch rows of VIS_OUT -> IMG."""
@@ -1050,7 +1094,7 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         if want("score"):       # row_mask: every row of the mask is the same, so one row is loaded once
             ue.matmat_mul_core(M=M, K=HD, N=kv_len, A_DRAM_ADDR=p["SQ"], B_DRAM_ADDR=k, OUTPUT_DRAM_ADDR=p["SCORE"],
                                softmax_enable=True, C_DRAM_ADDR=mask, bias_mode="broadcast_N" if row_mask else "full_matrix",
-                               gpr_M_reg=batch_reg, gpr_K_reg=hd_reg, gpr_N_reg=seq_reg)
+                               gpr_M_reg=batch_reg)      # K, N fixed: one strided write-back, not a DMA per row
         if want("pv"):
             ue.matmat_mul_core(M=M, K=kv_len, N=HD, A_DRAM_ADDR=p["SCORE"], B_DRAM_ADDR=v_t, OUTPUT_DRAM_ADDR=out,
                                gpr_M_reg=batch_reg, gpr_K_reg=seq_reg, gpr_N_reg=hd_reg,
@@ -1462,6 +1506,60 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
             rows.append(("whole layer", cols(ops), None, None))        # here: the whole step, as it runs
             table(f"one {stage} step, {M} row{'s' if M > 1 else ''}, each op x {LML} layers (last line: the real step)", rows,
                   (cols(ops[:1], "none"), None))
+
+        # ---- attention scores: the kernel writes the raw scores to DRAM, reads them back, normalises
+        # and writes them again. "copy" is one read + one write of the same score matrix: what one
+        # of those round trips costs. (No plain, softmax-free version of this matmul here: with
+        # K = 128 it takes the board down -- every register reads 0xffffffff -- twice on 2026-11-18.)
+        print("\nprobe: attention scores against one DRAM read + write of the score matrix (all heads of one layer / step)")
+        CH = 1 << 17                                    # elements per DRAM <-> SRAM transfer
+
+        def copy(ue, addr, elements):
+            for e0 in range(0, elements, CH):
+                take = min(CH, elements - e0)
+                ue.accelerator_memory_to_sram(accelerator_dram_address=addr + e0 * BPE, sram_address=0x00000, element_size=take)
+                ue.sram_to_accelerator_memory(sram_address=0x00000, accelerator_dram_address=addr + e0 * BPE, element_size=take)
+
+        def vis(kind):
+            def body(E):
+                n, N, pb = big["n"], big["N"], self.pbuf[E.e]
+                self._prime(E, n)
+                score = pb["ATTN_SCRATCH"]
+                for h in range(VN):
+                    if kind == "copy":
+                        copy(E.ue, score, n * N)
+                        continue
+                    self._flops_acc += 2 * n * VDP * N
+                    kw = dict(softmax_enable=True, C_DRAM_ADDR=self.mask[big["key"]], bias_mode="broadcast_N") if kind == "softmax" else {}
+                    E.ue.matmat_mul_core(M=n, K=VDP, N=N, A_DRAM_ADDR=score + N * N * BPE, B_DRAM_ADDR=pb["K_HM"] + h * N * VDP * BPE,
+                                         OUTPUT_DRAM_ADDR=score, gpr_M_reg=E.r_M, **kw)
+            return lambda: self._round(body)
+
+        def lm(kind, M, kv, mask, nl, row_mask):
+            def body(E):
+                self._prime_rows(E, M)
+                pv = self.pbuf[E.e]
+                for li in range(nl):
+                    for kvh in range(KVH):
+                        if kvh % NE != E.e:
+                            continue
+                        for _ in range(QH // KVH):
+                            if kind == "copy":
+                                copy(E.ue, pv["SCORE"], M * kv)
+                                continue
+                            self._flops_acc += 2 * M * HD * kv
+                            kw = dict(softmax_enable=True, C_DRAM_ADDR=mask, bias_mode="broadcast_N" if row_mask else "full_matrix") if kind == "softmax" else {}
+                            E.ue.matmat_mul_core(M=M, K=HD, N=kv, A_DRAM_ADDR=pv["SQ"], B_DRAM_ADDR=self._kv("KC", li, kvh),
+                                                 OUTPUT_DRAM_ADDR=pv["SCORE"], gpr_M_reg=E.r_M, **kw)
+            return lambda: self._round(body)
+
+        cases = [(f"vision, {big['n']} x {big['N']} keys, {VN} heads", vis),
+                 (f"prefill, {P} x {self.S} keys, {QH} heads", lambda k: lm(k, P, self.S, b["MASK_PRE"], 1, False)),
+                 (f"expert, {NWAY} x {CAP} keys, {QH} heads x {LML} layers", lambda k: lm(k, NWAY, CAP, b["MASK_EXP"], LML, True))]
+        for what, make in cases:
+            us, fl = time_of(f"probe sm {what} softmax", make("softmax"))
+            print(f"  {what:44s} softmax {us / 1e3:8.2f} ms | FLOPs / peak {fl / peak / 1e3:8.2f} ms", end="", flush=True)
+            print(f" | copy {time_of(f'probe sm {what} copy', make('copy'))[0] / 1e3:7.2f} ms", flush=True)
 
     def lm_read_kv(self, name, layer, n):
         return self.dma_from_accelerator_memory(self._kv(name, layer, 0), (KVH, self.KV_CAP, HD))[:, :n].float()

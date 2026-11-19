@@ -73,31 +73,24 @@ class CachedDeviceRunner(DeviceRunner):
 
     # ---------------------------------------------------------------- the program for a set of new frames
 
-    def _tokens_of(self, i):
-        """Image slot i -> (first token, token count) in IMG."""
-        im, m = self.ue.images[i], self.T.MERGE2
-        assert im["out_off"] % m == 0 and im["n"] % m == 0
-        return im["out_off"] // m, im["n"] // m
-
     def _program(self, new):
         """Vision + projector for the image slots in `new`, or None when no more programs fit.
-        One round: an engine encodes its frames (the stock per-image stream), then projects them.
-        A frame's vision rows and image tokens are touched by that one engine only."""
+        The stock streams on fewer frames (ue.plan_images): an engine encodes its frames and, if
+        it has time to spare, projects them; a second round projects what is left."""
         if new in self.sets:
             return self.sets[new]
         if len(self.sets) >= self.max_sets or self._free() < self.full_cost + LM_RESERVE:
             return None
         ue, t0 = self.ue, time.time()
-        assign = ue.assign_images(new)
+        assign, early, late = ue.plan_images(new)
 
-        def body(E):
-            for i in assign[E.e]:
-                ue._emit_image(E, i)
-            for i in assign[E.e]:
-                ue.emit_projector(E, *self._tokens_of(i))
+        def emit():
+            ue.emit_vision(assign, early)
+            if any(late):
+                ue.emit_late(late)
 
         name = f"vision_new{len(self.sets)}"
-        ue._compile(name, lambda: ue._round(body), parallel=True)
+        ue._compile(name, emit, parallel=True)
         self.sets[new] = name
         print(f"[device] vision program for {len(new)} new frames (slots {','.join(map(str, new))}) compiled in "
               f"{time.time() - t0:.0f} s; on the engines: " + " | ".join(",".join(map(str, a)) or "-" for a in assign), flush=True)
@@ -129,14 +122,14 @@ class CachedDeviceRunner(DeviceRunner):
 
         img, row = ue.buf["IMG"], T.PJ_OUT * T.BPE
         for i in new:                       # keep what the board just computed
-            t0, n = self._tokens_of(i)
+            t0, n = ue.image_tokens(i)
             t = ue.dma_from_accelerator_memory(img + t0 * row, (n, T.PJ_OUT)).to(torch.bfloat16)
             assert not bool(torch.isnan(t.float()).any()), "NaN image tokens from the device"
             self.tokens[keys[i]] = [t.contiguous(), self.plan]
         for i in sorted(set(range(len(keys))) - set(new)):      # the rest come from the cache
             entry = self.tokens[keys[i]]
             entry[1] = self.plan
-            ue.dma_to_accelerator_memory(img + self._tokens_of(i)[0] * row, entry[0].flatten())
+            ue.dma_to_accelerator_memory(img + ue.image_tokens(i)[0] * row, entry[0].flatten())
         self.tokens = {k: v for k, v in self.tokens.items() if v[1] > self.plan - self.keep}
 
 
