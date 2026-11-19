@@ -99,7 +99,7 @@ Replaces one large `matmat_mul_core` call with 7 half-size products instead of 8
 | `strassen_levels(K, N, max_level)` | Deepest level the shape allows |
 | `strassen_weight_tree(W, b, levels, store_w, store_b)` | Host, once: the fp16 leaf weights of a bf16 layer |
 | `strassen_weight_tree_if4(data, scales, N, K, b, levels, store_pack, store_b)` | Host, once: the leaf weights of a 4-bit layer (IF4 blocks, IF8 sums) |
-| `strassen_if4_quarters`, `strassen_online_tree`, `strassen_online_sums_core`, `strassen_online_items` | A 4-bit layer with the sums made on the board: store once, emit the sums, build the tree |
+| `strassen_if4_cells` / `strassen_bf16_cells`, `strassen_online_tree`, `strassen_online_sums_core`, `strassen_online_items` | Online leaves, any level, 4-bit or bf16 layer: store the weight once as its cells, emit the sums, build the tree |
 | `strassen_scratch_elements(M, K, N, levels)` | Scratch size per depth |
 | `strassen_matmul_core_dram(ue, M, K, N, A, tree, OUT, scratch)` | Emits the program; row-major in and out, bias included |
 
