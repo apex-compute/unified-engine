@@ -299,17 +299,88 @@ def ue_assert_stride_fields_fit(stride_bytes_per_chunk: int, stride_jump_bytes: 
     )
 
 
-# LARGEST SINGLE os.write()/os.read() ON AN XDMA CHAR DEVICE. For one call the
-# driver pins every page of the user buffer and builds one scatter-gather table
-# for all of it. On a host that has run an hour of large transfers that
-# allocation fails with ENOMEM for a 1.8 GB weight load, while a 157 MB write
-# moments later succeeds -- it is the size of the single mapping, not the host
-# being out of memory. 64 MiB is well inside what has been seen to work and
-# costs nothing measurable: transfers are bandwidth-bound, not syscall-bound.
-# UE_DMA_MAX_CHUNK_MB overrides it.
-DMA_MAX_CHUNK_BYTES = int(os.environ.get("UE_DMA_MAX_CHUNK_MB", "64")) * 1024 * 1024
+# LARGEST SINGLE os.write()/os.read() ON AN XDMA CHAR DEVICE.
+#
+# For every call the XDMA driver (Xilinx dma_ip_drivers 2020.2.2, loaded on the
+# lab hosts) runs char_sgdma_map_user_buf_to_sgl(), which allocates the array
+# of page pointers for the whole buffer with
+#     kcalloc(pages_nr, sizeof(struct page *), GFP_KERNEL)
+# That array must be PHYSICALLY CONTIGUOUS: 8 bytes per 4 KiB page, so a
+# 64 MiB chunk needs 128 KiB (an order-5 allocation). The kernel treats
+# order > 3 as "costly": it tries a little compaction and then gives up, and
+# write() returns ENOMEM -- with 100+ GB of page cache that could be
+# reclaimed. That is the "Cannot allocate memory" of #1409 (qwen3_4b and
+# qwen3_1.7b on p2 and dust2, 2026-11-19; flux2_klein_4b on 11-14): /proc/vmstat
+# on p2 shows compact_fail 65,762 of 91,676 compaction attempts. It depends
+# on fragmentation (Vivado, large model loads), hence intermittent.
+#
+# 8 MiB needs a 16 KiB array (order 2), which the kernel does not give up on.
+# All ENOMEM paths in the driver run before the transfer is submitted, so
+# nothing reaches the card; _dma_chunked() still halves the chunk and retries
+# if one is ever seen. UE_DMA_MAX_CHUNK_MB overrides the starting size.
+DMA_MAX_CHUNK_BYTES = int(os.environ.get("UE_DMA_MAX_CHUNK_MB", "8")) * 1024 * 1024
 if DMA_MAX_CHUNK_BYTES <= 0:
     raise ValueError("UE_DMA_MAX_CHUNK_MB must be a positive number of MiB")
+# Smallest chunk an ENOMEM retry shrinks to (2 KiB page array, order 0), and
+# how many ENOMEMs in a row at that size before the transfer is given up.
+DMA_MIN_CHUNK_BYTES = min(1024 * 1024, DMA_MAX_CHUNK_BYTES)
+DMA_ENOMEM_RETRIES_AT_MIN = 5
+
+
+def _dma_chunked(fd: int, address: int, total: int, xfer: Callable[[int, int], int],
+                 what: str, device: str) -> int:
+    """Run one large XDMA transfer as a sequence of seek + xfer(offset, length).
+
+    xfer(offset, length) does one os.write()/os.read() of up to `length` bytes
+    for buffer offset `offset` and returns the byte count. The file position
+    is set before every chunk: the XDMA char device takes the card address
+    from it and does NOT advance it, so relying on the implicit advance would
+    put every chunk on top of the first one.
+
+    ENOMEM (see DMA_MAX_CHUNK_BYTES) halves the chunk and retries the same
+    offset, down to DMA_MIN_CHUNK_BYTES; re-sending a chunk is idempotent.
+    """
+    chunk = DMA_MAX_CHUNK_BYTES
+    enomem_at_min = 0
+    warned = False
+    done = 0
+    while done < total:
+        want = min(chunk, total - done)
+        os.lseek(fd, address + done, os.SEEK_SET)
+        try:
+            n = xfer(done, want)
+        except OSError as e:
+            if e.errno == errno.ENOMEM:
+                if chunk > DMA_MIN_CHUNK_BYTES:
+                    chunk = max(DMA_MIN_CHUNK_BYTES, chunk // 2)
+                else:
+                    enomem_at_min += 1
+                    if enomem_at_min > DMA_ENOMEM_RETRIES_AT_MIN:
+                        raise OSError(
+                            e.errno,
+                            f"{what} {device} failed after {done} of {total} bytes, "
+                            f"at DRAM 0x{address + done:X}: {e.strerror} on "
+                            f"{DMA_ENOMEM_RETRIES_AT_MIN + 1} tries with "
+                            f"{DMA_MIN_CHUNK_BYTES} B chunks") from e
+                    time.sleep(0.05 * enomem_at_min)
+                if not warned:
+                    print(f"{what} {device}: ENOMEM for a {want} B chunk at DRAM "
+                          f"0x{address + done:X}; retrying with chunks of at most {chunk} B",
+                          file=sys.stderr)
+                    warned = True
+                continue
+            raise OSError(
+                e.errno,
+                f"{what} {device} failed after {done} of {total} bytes, at DRAM "
+                f"0x{address + done:X} (chunk {want} B): {e.strerror}") from e
+        if n <= 0:
+            raise OSError(
+                errno.EIO,
+                f"{what} {device} moved 0 bytes at DRAM 0x{address + done:X} "
+                f"with {total - done} of {total} bytes left")
+        enomem_at_min = 0
+        done += n
+    return done
 
 # DMA device paths (can be overridden by command-line argument)
 DMA_DEVICE_H2C = "/dev/xdma0_h2c_0"
@@ -586,6 +657,26 @@ def claim_dma_device(device_name: Optional[str] = None,
     os.environ[_device_lock_inherit_env(device_name)] = str(os.getpid())
 
 
+def _resolve_efinix_dma_device(device_name: str) -> str:
+    dma_device = os.environ.get("EFINIX_DMA_DEVICE")
+    if dma_device is not None:
+        if not (dma_device.startswith("pcie_dma") and dma_device[8:].isdigit()):
+            raise ValueError(f"Invalid EFINIX_DMA_DEVICE: {dma_device!r}")
+        return dma_device
+
+    default_bdfs = {"efinix": "0000:02:00.0", "efinix_m2": "0000:81:00.0"}
+    pcie_bdf = os.environ.get("EFINIX_PCIE_BDF", default_bdfs[device_name])
+    edma_class = "/sys/class/edma"
+    if os.path.isdir(edma_class):
+        for entry in os.listdir(edma_class):
+            if not (entry.startswith("pcie_dma") and entry.endswith("_user")):
+                continue
+            device_path = os.path.realpath(os.path.join(edma_class, entry, "device"))
+            if os.path.basename(device_path) == pcie_bdf:
+                return entry.removesuffix("_user")
+    raise RuntimeError(f"No pcie_dma device is mapped to Efinix PCIe BDF {pcie_bdf}")
+
+
 def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
     """Set DMA device paths and an optional AXI-Lite base address.
 
@@ -602,15 +693,11 @@ def set_dma_device(device_name: str, base_addr: Optional[int] = None) -> None:
     global CLOCK_CYCLE_TIME_NS
     old_identity = (DMA_DEVICE_USER, UE_0_BASE_ADDR)
     old_h2c, old_c2h, old_user = DMA_DEVICE_H2C, DMA_DEVICE_C2H, DMA_DEVICE_USER
-    if device_name == "efinix":
-        DMA_DEVICE_H2C = "/dev/pcie_dma1_htc_0"
-        DMA_DEVICE_C2H = "/dev/pcie_dma1_cth_0"
-        DMA_DEVICE_USER = "/dev/pcie_dma1_user"
-        UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
-    elif device_name == "efinix_m2":
-        DMA_DEVICE_H2C = "/dev/pcie_dma0_htc_0"
-        DMA_DEVICE_C2H = "/dev/pcie_dma0_cth_0"
-        DMA_DEVICE_USER = "/dev/pcie_dma0_user"
+    if device_name in ("efinix", "efinix_m2"):
+        dma_device = _resolve_efinix_dma_device(device_name)
+        DMA_DEVICE_H2C = f"/dev/{dma_device}_htc_0"
+        DMA_DEVICE_C2H = f"/dev/{dma_device}_cth_0"
+        DMA_DEVICE_USER = f"/dev/{dma_device}_user"
         UE_0_BASE_ADDR = 0x00000000 if base_addr is None else int(base_addr)
     else:
         DMA_DEVICE_H2C = f"/dev/{device_name}_h2c_0"
@@ -1601,7 +1688,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xc746c746, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xc746c746. Please update FPGA with update_c746c746.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
+        assert hw_version == 0xfefdd916, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xfefdd916. Please update FPGA with update_fefdd916.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
         if getattr(self, "conv_geometry_mode", CONV_GEOMETRY_LIVE_CSR) == CONV_GEOMETRY_QUEUE_CONFIG:
             # Convolution images have independent build stamps from the legacy
             # release. Explicit queue-CONFIG selection opts into that contract;
@@ -1859,32 +1946,12 @@ class UnifiedEngine:
                 # reported "did not find 'x = 2'" 48 minutes later (andromeda
                 # run 39031696086). Chunks keep each mapping small, and
                 # stopping here is better than plausible but wrong results.
+                # On a failure DRAM is partially written.
                 view = memoryview(data_bytes)
-                total = len(view)
-                done = 0
-                while done < total:
-                    piece = view[done:done + DMA_MAX_CHUNK_BYTES]
-                    # SEEK BEFORE EVERY CHUNK. The XDMA char device takes the
-                    # card address from the file position and does NOT advance
-                    # it by the bytes written, so relying on the implicit
-                    # advance writes every chunk back over the first one.
-                    os.lseek(fd, address + done, os.SEEK_SET)
-                    try:
-                        n = os.write(fd, piece)
-                    except OSError as e:
-                        raise OSError(
-                            e.errno,
-                            f"dma_write to {device} failed after {done} of {total} "
-                            f"bytes, at DRAM 0x{address + done:X} (chunk {len(piece)} B): "
-                            f"{e.strerror}. DRAM is partially written") from e
-                    if n <= 0:
-                        raise OSError(
-                            errno.EIO,
-                            f"dma_write to {device} wrote 0 bytes at DRAM "
-                            f"0x{address + done:X} with {total - done} of {total} "
-                            f"bytes left")
-                    done += n
-                return done
+                return _dma_chunked(
+                    fd, address, len(view),
+                    lambda off, n: os.write(fd, view[off:off + n]),
+                    "dma_write to", device)
             finally:
                 os.close(fd)
 
@@ -1935,26 +2002,13 @@ class UnifiedEngine:
                 # pins one huge mapping, and the file position is not advanced.
                 data_bytes = bytearray(size)
                 view = memoryview(data_bytes)
-                done = 0
-                while done < size:
-                    want = min(DMA_MAX_CHUNK_BYTES, size - done)
-                    os.lseek(fd, address + done, os.SEEK_SET)
-                    try:
-                        chunk = os.read(fd, want)
-                    except OSError as e:
-                        raise OSError(
-                            e.errno,
-                            f"dma_read from {device} failed after {done} of {size} "
-                            f"bytes, at DRAM 0x{address + done:X} (chunk {want} B): "
-                            f"{e.strerror}") from e
-                    if not chunk:
-                        raise OSError(
-                            errno.EIO,
-                            f"dma_read from {device} read 0 bytes at DRAM "
-                            f"0x{address + done:X} with {size - done} of {size} "
-                            f"bytes left")
-                    view[done:done + len(chunk)] = chunk
-                    done += len(chunk)
+
+                def _read(off: int, n: int) -> int:
+                    chunk = os.read(fd, n)
+                    view[off:off + len(chunk)] = chunk
+                    return len(chunk)
+
+                done = _dma_chunked(fd, address, size, _read, "dma_read from", device)
 
                 dma_copy_into(buffer, data_bytes, size)
 
