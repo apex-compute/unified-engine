@@ -1322,76 +1322,49 @@ def flash_attention_batched_pbi(
 # =============================================================================
 # §10 Strassen matmul (optional drop-in for one large matmul)
 # =============================================================================
-# WHAT IT IS
-#   C [M, N] = X [M, K] . W^T (+ bias), computed as 7 half-size products instead of 8, nested
-#   `levels` deep: matmul work is (7/8)^levels of the plain matmul, weight storage (7/4)^levels.
-#   Input and output are ordinary contiguous row-major tensors in DRAM, so it replaces one
-#   matmat_mul_core call. Nothing in the repo uses it by default.
+# C [M, N] = X [M, K] . W^T (+ bias) as 7 half-size products instead of 8, nested `levels` deep:
+# (7/8)^levels of the matmul work for (7/4)^levels of the weight storage. Input and output are
+# ordinary row-major bf16 tensors, so it replaces one matmat_mul_core call.
+# Measurements and where it pays: CHANGELOG.md, "Strassen matmul".
 #
-# HOW TO USE IT
+# USE
 #   L    = strassen_levels(K, N, wanted)                       # deepest level the shape allows
-#   tree = strassen_weight_tree(W, b, L, store_w, store_b)     # host, once, at weight-init time
-#   scr  = [(x_addr, p_addr), ...]                             # one pair per depth, sizes from
+#   tree = strassen_weight_tree(W, b, L, store_w, store_b)     # host, once: a bf16 layer
+#     or   strassen_weight_tree_if4(data, scales, N, K, b, L, store_pack, store_b)   # a 4-bit layer
+#   scr  = [(x_addr, p_addr), ...]                             # one pair per depth, sized by
 #                                                              # strassen_scratch_elements(M, K, N, L)
 #   strassen_matmul_core_dram(ue, M, K, N, A, tree, OUT, scr)  # at program-capture time
-#   store_w gets each leaf weight [n, k] ALREADY IN fp16 and returns the address it uploaded it to
-#   unchanged (do not cast it to bf16); store_b the same for a leaf bias [n]. For 4-bit leaves
-#   pass weight_format=None: store_w then gets fp32, quantizes it and returns (data_addr,
-#   scale_addr), and store_b returns a bf16 address. Rows beyond a multiple of 2^L go through
-#   the plain matmul (the caller's job).
 #
 # PRECISION
-#   X, the layer's weight and C are bf16 as everywhere else. Everything in between is fp16: the
-#   input sums, the weight sums (formed in fp32 on the host, stored as fp16 leaves), the 7
-#   products and the recombination. In bf16 those sums cost ~11 dB per level; in fp16 one level
-#   is within ~1 dB of the plain matmul at the same speed (board, 720x4352->1152: plain 55.1 dB,
-#   level 1 43.9 dB in bf16 and 54.1 dB in fp16; levels 2 / 3 in fp16 51.8 / 48.2 dB).
+#   X, the layer's weight and C keep the model's formats. Everything in between is fp16: the input
+#   sums, the products and the recombination (in bf16 those sums cost ~11 dB per level).
+#   The leaf weights are the weight sums, formed in fp32 on the host and stored as
+#     bf16 layer   fp16, every leaf.
+#     4-bit layer  IF4 for a leaf that is an untouched block of the weight (Y11 / Y22, 2 of the 7
+#                  per level): its bytes are cut out of the layer's pack. IF8 for a true sum: the
+#                  sum of two 4-bit blocks does not fit a 4-bit grid, and re-quantizing it to IF4
+#                  costs 6 dB per level.
 #
-# 4-BIT (IF4) WEIGHTS
-#   tree = strassen_weight_tree_if4(data, scales, N, K, b, L, store_pack, store_b)
-#   takes the layer's IF4 pack as quant_lib writes it and keeps the 4-bit model's own values:
-#     * a leaf that is an untouched block of the weight (2 of the 7 per level: Y11 and Y22) is
-#       cut out of the pack byte for byte and stays IF4;
-#     * a leaf that is a true sum is formed in fp32 from the DEQUANTIZED weight and stored IF8.
-#       The sum of two 4-bit blocks does not fit a 4-bit grid again: re-quantizing it to IF4
-#       costs 6 dB per level (14 / 8 / 2 dB against bf16 at levels 1 / 2 / 3, where the plain IF4
-#       matmul is at 20 dB), whatever precision the device sums use. With IF8 sums the result
-#       is the 4-bit model's: 20.0 / 19.8 / 18.8 dB.
-#   Weight bytes against the plain IF4 pack: 2.9x / 5.7x / 10.3x at levels 1 / 2 / 3.
-#   store_pack(data_bytes, scale_bytes, n, k, TYPE.IF4 or TYPE.IF8) -> (data_addr, scale_addr).
-#   The device side is the same kernel: fp16 input sums, products and recombination.
-#
-# HOW IT WORKS (one level; Yij = block (i, j) of W^T, formed on the host)
+# ONE LEVEL (Yij = block (i, j) of W^T)
 #   P1' = (X11+X22)(Y11+Y22)        P2' = (X21+X22) Y11        P5' = (X11+X12) Y22
 #   C12 = X11 (Y12-Y22) + P5'       C21 = X22 (Y21-Y11) + P2'
 #   U   = P1' - P2' - P5'
 #   C22 = (X21-X11)(Y11+Y12) + (U + C12)        C11 = (X12-X22)(Y21+Y22) + (U + C21)
-#   = 4 strided gathers of the input quarters, 5 eltwise sums, 7 half-size products, 4 eltwise
-#   sums, 4 strided writes of the output quarters (+ at the top level 2 passes that turn C12 and
-#   C21 from fp16 into bf16 once U + C12 and U + C21 have been taken from the fp16 values). The last product of each output quarter takes
-#   the rest of that quarter as a full-matrix bias, so quarters cost no extra add. The layer bias
-#   is folded into the leaf biases of P1' (b_L + b_R), P2' (b_L) and P5' (b_R).
+#   = 4 strided gathers of the input quarters, 5 sums, 7 half-size products, 4 sums, 4 strided
+#   writes of the output quarters. The last product of each output quarter takes the rest of that
+#   quarter as a full-matrix bias, so a quarter costs no extra add. C12 and C21 stay fp16 until
+#   U + C12 and U + C21 are taken; at the top level one pass each then turns them into bf16.
+#   The layer bias is folded into the leaf biases of P1' (b_L + b_R), P2' (b_L) and P5' (b_R).
 #
-# LIMITS (measured on the board, Alveo U50; details in CHANGELOG.md "Strassen matmul")
-#   * Accuracy: with the fp16 intermediates above, ~1 / 3 / 7 dB below the plain matmul at
-#     levels 1 / 2 / 3 (it was 11 / 18 / 24 dB below when they were bf16). For 4-bit weights
-#     use strassen_weight_tree_if4 (IF8 sums); strassen_weight_tree(..., weight_format=None)
-#     with an IF4 store re-quantizes every leaf to 4 bits and loses 6.0 dB per level.
-#   * Speed: 0.82x / 0.71x / 0.64x of the plain time (bf16), 0.88x / 0.78x / 0.70x (IF4), on that
-#     large shape only. Small shapes get SLOWER (K = N = 256: 1.26x). It won on 215 of 640 shapes
-#     on one engine and 121 of 640 on eight.
-#   * Shapes: K and N must be multiples of 128 * 2^(levels-1) (every half stays whole 64-lane
-#     blocks, and strided writes must cover whole 128-byte lines); M a multiple of 2^levels;
-#     K below 8192. OUTPUT_DRAM_ADDR must be 128-byte aligned.
-#   * No fused activation: a layer whose matmul carries GELU / clamp cannot use it.
-#   * Scratch must be private per engine and zero-filled once (fresh DRAM holds NaN patterns).
-#     It holds fp16 data: never read it as bf16.
-#   * Whole-model results: Alpamayo 2 Edge at level 1 was 3% faster end to end (80.4 -> 77.8 s)
-#     and the trajectory error went from 0.18 m to 0.87 m (the 4-bit prefill layers cause it; the
-#     bf16 vision layers are harmless). Qwen3-4B perplexity 19.4 plain, 21.5 / 24.3 / 40.4 at
-#     levels 1 / 2 / 3.
-#   The experiments (sweep, level probe, LLM quality test, CSVs and plots) are in git history:
-#   `git show 68189d7 --stat -- strassen/`.
+# RULES
+#   * K and N multiples of 128 * 2^(levels-1): every half stays whole 64-lane blocks and the
+#     strided writes cover whole 128-byte lines. K below 8192. OUTPUT_DRAM_ADDR 128-byte aligned.
+#   * M a multiple of 2^levels and a compile-time constant; leftover rows are the caller's plain matmul.
+#   * No fused activation: a matmul that carries GELU / SiLU / clamp cannot use it.
+#   * Scratch is private per engine and zero-filled once (fresh DRAM holds NaN patterns). It ends
+#     up holding fp16: never read it as bf16.
+#   * store_w / store_b get fp16 tensors and must upload them unchanged.
+#     store_pack(data_bytes, scale_bytes, n, k, TYPE.IF4 | TYPE.IF8) -> (data_addr, scale_addr).
 def strassen_levels(K: int, N: int, max_level: int) -> int:
     """Deepest level <= max_level at which every K and N half is still whole 64-lane blocks."""
     L = max_level

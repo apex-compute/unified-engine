@@ -62,45 +62,45 @@ New instruction generators added to `UnifiedEngine`:
 
 ### Strassen matmul — `nn_lib.py` §10 (optional)
 
-A drop-in replacement for one large `matmat_mul_core` call that does 7 half-size products instead of 8, nested up to 3 levels. Alpamayo 2 Edge uses level 1 by default on its vision `o_proj` / `fc2` and projector `fc2`; no other model uses it.
+Replaces one large `matmat_mul_core` call with 7 half-size products instead of 8, nested up to 3 levels. Each level removes 12.5% of the multiplies and multiplies the weight storage by 1.75.
 
-**fp16 intermediates.** The input, the layer's weight and the output stay bf16; the input sums, the weight sums (leaf weights), the 7 products and the recombination are stored in fp16. In bf16 those sums cost about 11 dB per level; in fp16 one level is within 1 dB of the plain matmul at the same speed. Board, one engine, 720 x 4352 -> 1152 with a bias: plain 55.1 dB, level 1 54.5 dB at 0.88x of the plain time (43.9 dB when the intermediates were bf16); 408 x 4608 -> 2048: 54.5 / 52.4 / 48.4 dB at 0.86x / 0.79x / 0.80x for levels 1 / 2 / 3. `strassen_weight_tree` hands `store_w` / `store_b` fp16 tensors to upload as they are; `weight_format=None` keeps 4-bit leaves. The bf16 SNR column of the table below is the old all-bf16 kernel.
+**Precision.** The input, the layer's weight and the output keep the model's formats. The sums and products in between are fp16, which keeps one level within 1 dB of the plain matmul (in bf16 each level cost 11 dB). On a 4-bit layer the leaf weights that are sums are stored in 8-bit (IF8) and the untouched blocks stay 4-bit: the sum of two 4-bit blocks does not fit a 4-bit grid, and squeezing it back cost 6 dB per level.
 
-**4-bit (IF4) weights.** `strassen_weight_tree_if4` takes the layer's IF4 pack. The two leaves per level that are an untouched block of the weight are cut out of the pack and stay 4-bit; the five that are sums are formed from the dequantized weight and stored IF8, because the sum of two 4-bit blocks does not fit a 4-bit grid again. Board, one engine, 408 rows, level 1, against the plain IF4 matmul (20.1 dB vs bf16): 20.0 dB at 0.87-0.90x of its time for 2.9x the weight bytes (5.7x / 10.3x at levels 2 / 3). Re-quantizing every leaf to 4 bits instead gives 14.1 / 8.1 / 2.0 dB at levels 1 / 2 / 3.
+**Measured** (Alveo U50, one engine, the kernel as it is; time relative to the plain matmul of the same weights):
 
-**When it is worth trying:** a matmul with K and N of a thousand or more that halves into whole 64-lane blocks, several hundred rows per call, and a large share of the model's time. Do not use it on small matmuls or on a matmul with a fused activation. Measured in whole models: Alpamayo 2 Edge vision 73.2 -> 72.6 s; parakeet (128 rows) 1.8% and swin (2 of 24 layers) 0.4%, both left off by default.
+| Weights | Shape (rows x K -> N) | Level 1 | Level 2 | Level 3 |
+|---------|-----------------------|---------|---------|---------|
+| bf16 | 720 x 1152 -> 1152 | 0.95x | n/a | n/a |
+| bf16 | 720 x 4352 -> 1152 | 0.88x | n/a | n/a |
+| bf16 | 408 x 2048 -> 2048 | 0.90x | 0.88x | 0.97x |
+| bf16 | 408 x 4608 -> 2048 | 0.86x | 0.79x | 0.80x |
+| 4-bit | 408 x 2048 -> 2048 | 0.91x | 0.89x | 0.97x |
+| 4-bit | 408 x 2048 -> 1024 | 0.93x | 0.93x | 1.17x |
+| 4-bit | 408 x 2048 -> 4608 | 0.90x | 0.85x | 0.87x |
+| 4-bit | 408 x 4608 -> 2048 | 0.89x | 0.82x | 0.82x |
+
+| | Plain | Level 1 | Level 2 | Level 3 |
+|---|-------|---------|---------|---------|
+| bf16 layer, SNR vs the exact product | 55.1 dB | 54.5 dB | 52.5 dB | 48.5 dB |
+| 4-bit layer, SNR vs the bf16 matmul | 20.1 dB | 20.0 dB | 19.8 dB | 18.9 dB |
+| 4-bit layer, weight bytes | 1x | 2.9x | 5.7x | 10.3x |
+| bf16 layer, weight bytes | 1x | 1.75x | 3.06x | 5.36x |
+
+**When to use it.** Both widths 1024 or more and halving into whole 64-lane blocks, several hundred rows per call, no fused activation, and a matmul that is a large share of the model's time. Level 2 when one side is 2048 or wider, otherwise level 1. Level 3 never won. A width that needs padding to halve is not worth it.
+
+**In models.** Alpamayo 2 Edge, vision `o_proj` / `fc2` and projector `fc2` at level 1 (on by default): 73.2 s -> 72.6 s per plan, same output. Parakeet, 128-row clips: 1.8%. Swin, last stage only: 0.4%. Both are off by default (`--strassen-level`). No 4-bit model uses it yet.
 
 **API** (all in `nn_lib.py`):
 
 | Function | Purpose |
 |----------|---------|
 | `strassen_levels(K, N, max_level)` | Deepest level the shape allows |
-| `strassen_weight_tree(W, b, levels, store_w, store_b)` | Host, at weight-init: forms and stores the 7^levels leaf weights |
-| `strassen_weight_tree_if4(data, scales, N, K, b, levels, store_pack, store_b)` | Same for a 4-bit layer: untouched blocks stay IF4, sums are stored IF8 |
+| `strassen_weight_tree(W, b, levels, store_w, store_b)` | Host, once: the fp16 leaf weights of a bf16 layer |
+| `strassen_weight_tree_if4(data, scales, N, K, b, levels, store_pack, store_b)` | Host, once: the leaf weights of a 4-bit layer (IF4 blocks, IF8 sums) |
 | `strassen_scratch_elements(M, K, N, levels)` | Scratch size per depth |
-| `strassen_matmul_core_dram(ue, M, K, N, A, tree, OUT, scratch)` | Emits the program; row-major in, row-major out, bias included |
+| `strassen_matmul_core_dram(ue, M, K, N, A, tree, OUT, scratch)` | Emits the program; row-major in and out, bias included |
 
-**How it works.** The weight is split into quarters and the 7 Strassen weight combinations are formed on the host in fp32, then stored (and quantized) one by one, so weight storage grows 1.75x per level. On the device, one level is 4 strided gathers of the input quarters, 5 elementwise sums, 7 half-size products, 4 elementwise sums and 4 strided writes of the output quarters. The last product of each output quarter adds the rest of that quarter through a full-matrix bias, so the quarters need no extra add. The formulas are in the `nn_lib.py` section header.
-
-**Measured on the board** (Alveo U50, one matmul, 4096 x 7680 -> 8192):
-
-| Level | Work | Weights | bf16 time | bf16 SNR | IF4 time | IF4 SNR |
-|-------|------|---------|-----------|----------|----------|---------|
-| 0 (plain) | 100% | 1x | 1.00x | 55.0 dB | 1.00x | ~20 dB |
-| 1 | 87.5% | 1.75x | 0.82x | 43.9 dB | 0.88x | ~14 dB |
-| 2 | 76.6% | 3.06x | 0.71x | 37.3 dB | 0.78x | ~8 dB |
-| 3 | 67.0% | 5.36x | 0.64x | 31.2 dB | 0.70x | ~2 dB |
-
-**Limitations found:**
-
-- **Accuracy drops every level**: about 11 dB at level 1 and 6 dB per further level in bf16, and 6 dB per level with 4-bit weights. Errors of separate layers add up.
-- **Small shapes get slower.** At K = N = 256 it is 1.26x slower. Across a 640-shape sweep it was faster on 215 shapes with one engine and on 121 with eight engines.
-- **Shape rules.** K and N must be multiples of 128 * 2^(levels-1), M a multiple of 2^levels (the caller runs leftover rows through the plain matmul), K below 8192, and the output address 128-byte aligned. A half narrower than 64 lanes would have to be padded and costs more work than it saves.
-- **No fused activation.** A matmul that carries GELU or a clamp cannot use it.
-- **Scratch.** 9 input-quarter and 14 output-quarter buffers per depth, private per engine, zero-filled once.
-- **Whole models.** Alpamayo 2 Edge at level 1: 80.4 s -> 77.8 s (3% faster), trajectory error 0.18 m -> 0.87 m; the 4-bit prefill layers cause the error, the bf16 vision layers do not. Qwen3-4B perplexity: 19.4 plain, 21.5 / 24.3 / 40.4 at levels 1 / 2 / 3.
-
-**Status.** `nn_lib.py` holds the only implementation. It is the routine that ran on the board inside Alpamayo 2 Edge at level 1, lifted out; Alpamayo calls it (`models/alpamayo2_edge/alpamayo2_edge_test.py --strassen-level N --strassen-ops ...`, which lands with the Alpamayo 2 Edge model, is the working example of wiring it into a model). After the lift it has been checked on the host only (levels 1-3 against the exact product), not yet re-run on the board. The experiments behind the numbers (shape sweep, level probe, LLM quality test, CSVs, plots) were removed from the tree and are in git history: `git show 68189d7 --stat -- strassen/`.
+**Rules.** K and N multiples of 128 * 2^(levels-1); rows a multiple of 2^levels and fixed at compile time (leftover rows go through the plain matmul); K below 8192; output address 128-byte aligned; scratch private per engine and zero-filled once. A model that also decodes one row at a time keeps its plain weight for that.
 
 ---
 
