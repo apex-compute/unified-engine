@@ -51,6 +51,78 @@ def quiet_print(*args, **kwargs):
 
 builtins.print = quiet_print
 
+def _shared_report(input_desc, engines, stages, prefill_tokens=None, decoded_tokens=None,
+                   decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
+    """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
+
+    ``stages`` is ``[(name, hw_seconds, gflop), ...]`` in run order.  ``hw_seconds`` is the
+    device latency counter and ``gflop`` the compile-time theoretical FLOP count of what ran,
+    in units of 1e9.  A value that was not measured is passed as None and stays null in the
+    result -- nothing is estimated here.  ``peak_gflops`` defaults to the per-engine peak times
+    ``engines``.  One engine does 128 FLOPs per clock cycle, i.e. 128 / clock_period_ns GFLOPS
+    (= freq_MHz * 0.128, the expression gemma4 / qwen2.5 use).  user_dma_core.UE_PEAK_GFLOPS
+    is 0.128 / clock_period_ns, which is that same peak in TFLOPS, so it is not used directly.
+    """
+    import user_dma_core as _udc
+    if peak_gflops is None:
+        clock_ns = getattr(_udc, "CLOCK_CYCLE_TIME_NS", None)
+        peak_gflops = 128.0 / clock_ns * engines if (clock_ns and engines) else None
+
+    def _num(value, digits=4):
+        return round(float(value), digits) if value is not None else None
+
+    def _pct(rate):
+        return _num(100.0 * rate / peak_gflops, 2) if (rate is not None and peak_gflops) else None
+
+    rows = []
+    for name, hw_s, gflop in stages:
+        rate = gflop / hw_s if (gflop is not None and hw_s) else None
+        rows.append({"name": name, "hw_s": _num(hw_s, 6), "gflop": _num(gflop),
+                     "gflops": _num(rate), "pct_peak": _pct(rate)})
+    hw_all = [hw_s for _, hw_s, _ in stages]
+    gflop_all = [gflop for _, _, gflop in stages]
+    total_hw_s = sum(hw_all) if (hw_all and all(v is not None for v in hw_all)) else None
+    total_gflop = sum(gflop_all) if (gflop_all and all(v is not None for v in gflop_all)) else None
+    avg_gflops = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+    return {
+        "input": input_desc,
+        "engines": engines,
+        "peak_gflops": _num(peak_gflops),
+        "stages": rows,
+        "total_hw_s": _num(total_hw_s, 6),
+        "total_gflop": _num(total_gflop),
+        "avg_gflops": _num(avg_gflops),
+        "avg_pct_peak": _pct(avg_gflops),
+        "prefill_tokens": prefill_tokens,
+        "decoded_tokens": decoded_tokens,
+        "decode_first_tok_s": _num(decode_first_tok_s, 3),
+        "decode_avg_tok_s": _num(decode_avg_tok_s, 3),
+    }
+
+
+class _FlopSum:
+    """Sum of the compile-time FLOP counts the user_dma_core ops return (accounting only).
+    ``value`` is None as soon as one op returned no count, so a partial sum is never reported."""
+
+    def __init__(self):
+        self.total = 0
+        self.missing = False
+
+    def add(self, flops):
+        if isinstance(flops, (int, float)) and not isinstance(flops, bool):
+            self.total += int(flops)
+        else:
+            self.missing = True
+
+    def __iadd__(self, flops):
+        self.add(flops)
+        return self
+
+    @property
+    def value(self):
+        return None if self.missing else self.total
+
+
 def _parse_offset(val) -> int:
     """Parse offset/size from JSON: int or hex string like '0x24000000'."""
     if isinstance(val, str):
@@ -2612,6 +2684,9 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         hw_gflops = total_flops / (latency_us * 1e-6) / 1e9
         self._last_total_flops = total_flops
         self._last_hw_gflops = hw_gflops
+        # Kept for the TEST_RESULT line (same numbers as the "Prefill HW latency" line).
+        self._report_prefill = {"hw_us": float(latency_us), "flops": int(total_flops),
+                                "actual_seq_len": int(actual_seq_len)}
         self._last_prefill_latency_us = latency_us
         print(f"    Prefill HW latency = {latency_us/1e3:.1f} ms  "
               f"({total_flops/1e9:.1f} GFLOP -> {hw_gflops:.1f} GFLOPS)")
@@ -3195,6 +3270,8 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
         if _use_status:
             _status_setup()
 
+        self._report_decode_lats_us = []   # per-step device latency, for the TEST_RESULT line
+        self._report_decode_flops_per_step = gflops
         while self.seq_len < max_seq_len:
             _decoder_token_cnt += 1
             _SILENT_MODE = True
@@ -3229,6 +3306,7 @@ class Qwen25VL3B_UnifiedEngine(UnifiedEngine):
 
             self.start_execute_from_dram(preamble_addr)
             self.wait_queue(10.0)
+            self._report_decode_lats_us.append(self.report_latency_in_us())   # accounting only
 
             # Token selection: HW argmax already has penalty folded in on chip.
             token_id = self.get_arg_max_index()
@@ -3891,6 +3969,8 @@ def main():
                     cache_hit = True
 
             if cache_hit:
+                # Compile-time FLOP count stored with the cached program (absent in older bins).
+                self._connector_flops = meta.get("flops") if isinstance(meta.get("flops"), (int, float)) else None
                 self._connector_program_addr = self.get_program_dram_addr()
                 self.dma_write(DMA_DEVICE_H2C, self._connector_program_addr, prog_bytes, len(prog_bytes))
                 self.allocate_program_dram(len(prog_bytes))
@@ -3900,17 +3980,19 @@ def main():
                 _original_print(f"  Compiling connector program (N={N})...")
                 self.clear_inst_id()
                 self.start_capture()
-                self.layer_norm_core_dram(M=N, N=Cin, A_DRAM_ADDR=IN, OUTPUT_DRAM_ADDR=LN,
+                _conn_flops = _FlopSum()   # accounting only: what the three ops return
+                _conn_flops += self.layer_norm_core_dram(M=N, N=Cin, A_DRAM_ADDR=IN, OUTPUT_DRAM_ADDR=LN,
                                           GAMMA_DRAM_ADDR=self.conn_ln_g, BETA_DRAM_ADDR=self.conn_ln_b)
-                self.matmat_mul_core(M=N, K=Cin, N=self._conn_hidden,
+                _conn_flops += self.matmat_mul_core(M=N, K=Cin, N=self._conn_hidden,
                                      A_DRAM_ADDR=LN, B_DRAM_ADDR=self.conn_w0,
                                      OUTPUT_DRAM_ADDR=IN,
                                      C_DRAM_ADDR=self.conn_b0, bias_mode="broadcast_N",
                                      gelu_enable=True)
-                self.matmat_mul_core(M=N, K=self._conn_hidden, N=self._conn_out,
+                _conn_flops += self.matmat_mul_core(M=N, K=self._conn_hidden, N=self._conn_out,
                                      A_DRAM_ADDR=IN, B_DRAM_ADDR=self.conn_w2,
                                      OUTPUT_DRAM_ADDR=self.VIS_ENCODER_OUT_DRAM,
                                      C_DRAM_ADDR=self.conn_b2, bias_mode="broadcast_N")
+                self._connector_flops = _conn_flops.value
                 self.stop_capture()
                 self.generate_instruction_halt()
 
@@ -3924,7 +4006,8 @@ def main():
                 self._connector_compiled_N = N
 
                 programs_bin_store(self.script_dir, conn_key, prog_bytes,
-                                   meta={"num_tokens": N, "conn_in": Cin, "program_size": len(prog_bytes)})
+                                   meta={"num_tokens": N, "conn_in": Cin, "program_size": len(prog_bytes),
+                                         "flops": self._connector_flops})
                 _original_print(f"  Connector compiled ({len(prog_bytes)} bytes) at 0x{self._connector_program_addr:X}")
 
         def run_connector(self, vit):
@@ -3935,6 +4018,7 @@ def main():
             self.dma_to_accelerator_memory(self.VIS_MERGED_DRAM, vit.contiguous().flatten())
             self.start_execute_from_dram(self._connector_program_addr)
             self.wait_queue(120.0)
+            self._connector_hw_us = self.report_latency_in_us()   # device latency (accounting)
             self._vis_num_tokens = N
 
     ue = LADecoder(script_dir=LA_DIR)
@@ -4132,13 +4216,49 @@ def main():
     print(f"overlay saved -> {path}  ({nb} boxes, {npt} points)")
 
     prefill_tok_s = len(prefill_seq) / max(t_prefill_run, 1e-9)
+    # Shared report keys (model_auto_test.py). HW seconds are the device latency counter of each
+    # program; GFLOP are compile-time theoretical counts: prefill = prefill_theoretical_flops at
+    # the real seq_len (the "Prefill HW latency" line), decode = decoder total_flops x decode
+    # steps, vision / connector = the sum the ops returned when the program was compiled (null
+    # when an older cached programs.bin entry without "flops" was loaded).
+    _stages = []
+    if fpga_vision and not args.vision_debug:
+        _mv_us = getattr(ue, "_last_moonvit_latency_us", None)
+        _mv_flops = getattr(ue, "_moonvit_flops", None)
+        _stages.append(("vision", _mv_us / 1e6 if _mv_us else None,
+                        _mv_flops / 1e9 if _mv_flops is not None else None))
+    _conn_us = getattr(ue, "_connector_hw_us", None)
+    _conn_flops = getattr(ue, "_connector_flops", None)
+    _stages.append(("connector", _conn_us / 1e6 if _conn_us is not None else None,
+                    _conn_flops / 1e9 if _conn_flops is not None else None))
+    _pf = getattr(ue, "_report_prefill", None) or {}
+    _stages.append(("prefill", _pf["hw_us"] / 1e6 if "hw_us" in _pf else None,
+                    _pf["flops"] / 1e9 if "flops" in _pf else None))
+    _dec_lats_us = list(getattr(ue, "_report_decode_lats_us", []))
+    _stages.append(("decode", sum(_dec_lats_us) / 1e6,
+                    gpt * len(_dec_lats_us) / 1e9 if isinstance(gpt, (int, float)) else None))
     _original_print("TEST_RESULT:" + json.dumps({
         "decoded_text":        answer.strip(),
         "decoded_tokens":      n_new,
         "prefill_tokens":      len(prefill_seq),
         "prefill_speed_tok_s": round(prefill_tok_s, 2),
         "decode_speed_tok_s":  round(tok_s, 2),
-    }))
+        "n_boxes":             n_boxes,
+        "vision_tokens":       int(n_img),
+        "decode_steps":        len(_dec_lats_us),
+        "prefill_hw_ms":       _pf["hw_us"] / 1e3 if "hw_us" in _pf else None,
+        "decode_first_hw_ms":  _dec_lats_us[0] / 1e3 if _dec_lats_us else None,
+        "decode_avg_hw_ms":    sum(_dec_lats_us) / len(_dec_lats_us) / 1e3 if _dec_lats_us else None,
+        # decode_first_tok_s: HW-latency rate of the first decode step;
+        # decode_avg_tok_s: the wall-clock tok/s printed above.
+        **_shared_report(
+            {"prompt": la.PROMPTS[args.prompt_kind].format(q=args.query),
+             "image": os.path.abspath(args.image)},
+            1, _stages,
+            prefill_tokens=len(prefill_seq), decoded_tokens=n_new,
+            decode_first_tok_s=(1e6 / _dec_lats_us[0]) if (_dec_lats_us and _dec_lats_us[0]) else None,
+            decode_avg_tok_s=tok_s if _dec_lats_us else None),
+    }, ensure_ascii=False))
 
     # ---- Quant fidelity comparison: bf16 vs if4 vs tq4 (CPU reference) ----
     if args.quant_compare:
@@ -4521,28 +4641,32 @@ def moonvit_attention_split_hd(ue, batch, aligned_seq_len, qk_dim, v_dim,
     scaled_q = score + S * S * bpe
 
     # 1. V^T over the padded width; only rows [0, v_dim) are consumed below.
+    # (_flops: the ops' compile-time FLOP counts, returned for accounting only. Like
+    # unified_attention_core_dynamic it counts scale + the two matmuls; the transpose returns none.)
+    _flops = _FlopSum()
     ue.bf16_transpose_core(M=S, N=qk_dim, INPUT_DRAM_ADDR=V_DRAM_ADDR,
                            OUTPUT_DRAM_ADDR=v_t, IDENTITY_DRAM_ADDR=IDENTITY_DRAM_ADDR,
                            gpr_M_reg=seq_reg)
     # 2. scale Q (1/sqrt(qk_dim); the sqrt(128/72) correction is folded into the q weights)
-    ue.eltwise_core_dram(
+    _flops += ue.eltwise_core_dram(
         M=batch, N=qk_dim, dram_a=Q_DRAM_ADDR, dram_b=None, dram_out=scaled_q,
         mode=UE_MODE.MUL_BROADCAST, scalar=1.0 / math.sqrt(qk_dim),
         gpr_M_reg=batch_reg)
     # 3. scores + softmax (contraction over qk_dim)
-    ue.matmat_mul_core(
+    _flops += ue.matmat_mul_core(
         M=batch, K=qk_dim, N=S, A_DRAM_ADDR=scaled_q, B_DRAM_ADDR=K_DRAM_ADDR,
         OUTPUT_DRAM_ADDR=score, softmax_enable=True,
         C_DRAM_ADDR=BIAS_DRAM_ADDR, bias_mode="full_matrix",
         gpr_M_reg=batch_reg, gpr_K_reg=qk_reg, gpr_N_reg=seq_reg)
     # 4. context: N = v_dim, written at the caller's row pitch
-    ue.matmat_mul_core(
+    _flops += ue.matmat_mul_core(
         M=batch, K=S, N=v_dim, A_DRAM_ADDR=score, B_DRAM_ADDR=v_t,
         OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR,
         gpr_M_reg=batch_reg, gpr_K_reg=seq_reg, gpr_N_reg=v_reg,
         gpr_out_row_stride_reg=stride_reg)
     for _ in regs:
         ue.release_isa_reg()
+    return _flops.value
 
 
 def moonvit_compile_encoder(ue, cfg, grid_hw):
@@ -4568,7 +4692,10 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     moonvit_key = f"moonvit_encoder_N{N}_{prec}_split_hd"
     _cached = programs_bin_load(os.path.dirname(_BIN_DIR), moonvit_key)
     if _cached is not None:
-        prog, _ = _cached
+        prog, _cached_meta = _cached
+        # Compile-time FLOP count stored with the cached program (absent in older bins).
+        ue._moonvit_flops = (_cached_meta.get("flops")
+                             if isinstance(_cached_meta.get("flops"), (int, float)) else None)
         program_addr = ue.get_program_dram_addr()
         ue.dma_write(DMA_DEVICE_H2C, program_addr, prog, len(prog))
         ue.allocate_program_dram(len(prog))
@@ -4593,14 +4720,15 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
         Flash/permute/norm stay static (flash can't be PBI - back-to-back bug)."""
         strip = dict(strip_cols=strip_cols, strip_out_stride=strip_out_stride,
                      gpr_out_row_stride_reg=out_stride_reg)
+        # Returns the core's compile-time FLOP count (accounting only).
         if prec == "if4":
-            ue.matmat_mul_core(M=M, K=K, N=Nn, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{name}_data'],
+            return ue.matmat_mul_core(M=M, K=K, N=Nn, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{name}_data'],
                                OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N",
                                is_B_quantized=True, data_type=TYPE.IF4,
                                SCALE_DRAM_ADDR=la[f'{name}_scale'], gelu_enable=gelu,
                                gpr_M_reg=vis_M_reg, **strip)
         else:
-            ue.matmat_mul_core(M=M, K=K, N=Nn, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{name}_weight'],
+            return ue.matmat_mul_core(M=M, K=K, N=Nn, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{name}_weight'],
                                OUTPUT_DRAM_ADDR=OUT, C_DRAM_ADDR=bias, bias_mode="broadcast_N",
                                gelu_enable=gelu, gpr_M_reg=vis_M_reg, **strip)
 
@@ -4608,6 +4736,10 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     _SILENT_MODE = True
     ue.start_capture()
 
+    # FLOP accounting for the TEST_RESULT line: the sum of what the ops return at compile time
+    # (layer norms, projections, RoPE, attention, MLP, residual adds). The strided-DMA permutes
+    # and the 2x2 patch merge are data moves and carry no FLOPs. Does not change the program.
+    _mv_flops = _FlopSum()
     ue.reset_isa_reg_counter()
     vis_M_reg = ue.alloc_isa_reg()
     ue.generate_instruction_add_set(vis_M_reg, N)
@@ -4623,7 +4755,7 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
         h_out = ue.MV_IO_B if li % 2 == 0 else ue.MV_IO_A
 
         # --- norm0 (LayerNorm) ---
-        ue.layer_norm_core_dram(M=N, N=VH, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=ue.MV_NORM_OUT,
+        _mv_flops += ue.layer_norm_core_dram(M=N, N=VH, A_DRAM_ADDR=h_in, OUTPUT_DRAM_ADDR=ue.MV_NORM_OUT,
                                 GAMMA_DRAM_ADDR=la['norm0_w'], BETA_DRAM_ADDR=la['norm0_b'])
 
         # --- q/k/v projections at the REAL N = VN*VD = 1152 (compact weights), written
@@ -4631,9 +4763,9 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
         # rotate_half halves (slot pitch 64), v strips the 72-lane heads (pitch 128).
         # Pad lanes were zeroed once in moonvit_setup_dram. ---
         for proj, dst in [('q', ue.MV_Q), ('k', ue.MV_K)]:
-            _mm(N, VH, VN_VD, ue.MV_NORM_OUT, proj, la, dst, bias=la[f'{proj}_bias'],
+            _mv_flops += _mm(N, VH, VN_VD, ue.MV_NORM_OUT, proj, la, dst, bias=la[f'{proj}_bias'],
                 strip_cols=VD // 2, strip_out_stride=VD_PAD // 2, out_stride_reg=qkv_stride_reg)
-        _mm(N, VH, VN_VD, ue.MV_NORM_OUT, 'v', la, ue.MV_V, bias=la['v_bias'],
+        _mv_flops += _mm(N, VH, VN_VD, ue.MV_NORM_OUT, 'v', la, ue.MV_V, bias=la['v_bias'],
             strip_cols=VD, strip_out_stride=VD_PAD, out_stride_reg=qkv_stride_reg)
 
         # --- permute [N, VN, 128] -> [VN, N, 128] for q/k/v via strided DMA ---
@@ -4646,7 +4778,7 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
         # Reprime vis_M_reg to VN*N for the rope calls, then restore to N for matmuls.
         ue.generate_instruction_add_set(vis_M_reg, VN * N)
         for buf in (ue.MV_Q_PAD, ue.MV_K_PAD):
-            ue.rope_hf_core_dram(M=VN * N, N=VD_PAD,
+            _mv_flops += ue.rope_hf_core_dram(M=VN * N, N=VD_PAD,
                                  input_dram_addr=buf, output_dram_addr=buf,
                                  cos_dram_addr=ue.MV_ROPE_COS, sin_dram_addr=ue.MV_ROPE_SIN,
                                  gpr_M_reg=vis_M_reg)
@@ -4656,7 +4788,7 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
         # head's (N, 72) written straight into its columns of the token-major
         # [N, VN*72] result. No inverse permute, no pad-lane trim. ---
         for h in range(VN):
-            moonvit_attention_split_hd(
+            _mv_flops += moonvit_attention_split_hd(
                 ue, N, N, VD_PAD, VD,
                 ue.MV_Q_PAD + h * head_stride_pad,
                 ue.MV_K_PAD + h * head_stride_pad,
@@ -4667,23 +4799,23 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
                 out_row_stride=VN_VD)
 
         # --- o proj (K = VN*72, unpadded weight) + residual + norm1 fused ---
-        _mm(N, VN_VD, VH, ue.MV_ATTN_RESULT, 'o', la, ue.MV_O_PROJ, bias=la['o_bias'])
-        layer_norm_core_dram_post_add(ue, M=N, N=VH,
+        _mv_flops += _mm(N, VN_VD, VH, ue.MV_ATTN_RESULT, 'o', la, ue.MV_O_PROJ, bias=la['o_bias'])
+        _mv_flops += layer_norm_core_dram_post_add(ue, M=N, N=VH,
                                       A_DRAM_ADDR=h_in, B_DRAM_ADDR=ue.MV_O_PROJ,
                                       ADDOUTPUT_DRAM_ADDR=ue.MV_RESIDUAL,
                                       NORMOUTPUT_DRAM_ADDR=ue.MV_NORM_OUT,
                                       GAMMA_DRAM_ADDR=la['norm1_w'], BETA_DRAM_ADDR=la['norm1_b'])
 
         # --- MLP: fc0 + gelu, fc1, residual add ---
-        _mm(N, VH, VIS_MLP_PAD, ue.MV_NORM_OUT, 'fc0', la, ue.MV_MLP_INTER,
+        _mv_flops += _mm(N, VH, VIS_MLP_PAD, ue.MV_NORM_OUT, 'fc0', la, ue.MV_MLP_INTER,
             bias=la['fc0_bias'], gelu=True)
-        _mm(N, VIS_MLP_PAD, VH, ue.MV_MLP_INTER, 'fc1', la, ue.MV_MLP_OUT, bias=la['fc1_bias'])
-        eltwise_add_core_dram(ue, size=N * VH, A_DRAM_ADDR=ue.MV_RESIDUAL,
+        _mv_flops += _mm(N, VIS_MLP_PAD, VH, ue.MV_MLP_INTER, 'fc1', la, ue.MV_MLP_OUT, bias=la['fc1_bias'])
+        _mv_flops += eltwise_add_core_dram(ue, size=N * VH, A_DRAM_ADDR=ue.MV_RESIDUAL,
                               B_DRAM_ADDR=ue.MV_MLP_OUT, OUTPUT_DRAM_ADDR=h_out)
 
     # --- final layernorm ---
     final_vis = ue.MV_IO_A if depth % 2 == 0 else ue.MV_IO_B
-    ue.layer_norm_core_dram(M=N, N=VH, A_DRAM_ADDR=final_vis, OUTPUT_DRAM_ADDR=ue.MV_POST_NORM,
+    _mv_flops += ue.layer_norm_core_dram(M=N, N=VH, A_DRAM_ADDR=final_vis, OUTPUT_DRAM_ADDR=ue.MV_POST_NORM,
                             GAMMA_DRAM_ADDR=ue.mv_final_ln_w, BETA_DRAM_ADDR=ue.mv_final_ln_b)
 
     # --- 2x2 patch merge [gh,gw,VH] -> [N_merged, 4*VH] ---
@@ -4697,6 +4829,7 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
 
     ue.stop_capture()
     _SILENT_MODE = False
+    ue._moonvit_flops = _mv_flops.value
     prog = bytearray()
     for inst in ue.capture_buffer:
         prog.extend(inst.get_bytes())
@@ -4705,7 +4838,7 @@ def moonvit_compile_encoder(ue, cfg, grid_hw):
     ue.allocate_program_dram(len(prog))
     ue.clear_capture_buffer()
     programs_bin_store(os.path.dirname(_BIN_DIR), moonvit_key, bytes(prog),
-                       meta={"N": N, "precision": prec, "depth": depth})
+                       meta={"N": N, "precision": prec, "depth": depth, "flops": ue._moonvit_flops})
     _original_print(f"  MoonViT encoder compiled: {len(prog)//1024//1024}MB "
                     f"({len(prog)//32} instructions, {depth} layers) -> cached programs.bin[{moonvit_key}]")
     return program_addr

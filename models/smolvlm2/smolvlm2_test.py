@@ -35,6 +35,78 @@ from nn_lib import (
     rms_norm_core_dram_post_add,
 )
 from quant_lib import quantize_q4_64 as _mlc_quantize_q4_64
+def _shared_report(input_desc, engines, stages, prefill_tokens=None, decoded_tokens=None,
+                   decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
+    """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
+
+    ``stages`` is ``[(name, hw_seconds, gflop), ...]`` in run order.  ``hw_seconds`` is the
+    device latency counter and ``gflop`` the compile-time theoretical FLOP count of what ran,
+    in units of 1e9.  A value that was not measured is passed as None and stays null in the
+    result -- nothing is estimated here.  ``peak_gflops`` defaults to the per-engine peak times
+    ``engines``.  One engine does 128 FLOPs per clock cycle, i.e. 128 / clock_period_ns GFLOPS
+    (= freq_MHz * 0.128, the expression gemma4 / qwen2.5 use).  user_dma_core.UE_PEAK_GFLOPS
+    is 0.128 / clock_period_ns, which is that same peak in TFLOPS, so it is not used directly.
+    """
+    import user_dma_core as _udc
+    if peak_gflops is None:
+        clock_ns = getattr(_udc, "CLOCK_CYCLE_TIME_NS", None)
+        peak_gflops = 128.0 / clock_ns * engines if (clock_ns and engines) else None
+
+    def _num(value, digits=4):
+        return round(float(value), digits) if value is not None else None
+
+    def _pct(rate):
+        return _num(100.0 * rate / peak_gflops, 2) if (rate is not None and peak_gflops) else None
+
+    rows = []
+    for name, hw_s, gflop in stages:
+        rate = gflop / hw_s if (gflop is not None and hw_s) else None
+        rows.append({"name": name, "hw_s": _num(hw_s, 6), "gflop": _num(gflop),
+                     "gflops": _num(rate), "pct_peak": _pct(rate)})
+    hw_all = [hw_s for _, hw_s, _ in stages]
+    gflop_all = [gflop for _, _, gflop in stages]
+    total_hw_s = sum(hw_all) if (hw_all and all(v is not None for v in hw_all)) else None
+    total_gflop = sum(gflop_all) if (gflop_all and all(v is not None for v in gflop_all)) else None
+    avg_gflops = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+    return {
+        "input": input_desc,
+        "engines": engines,
+        "peak_gflops": _num(peak_gflops),
+        "stages": rows,
+        "total_hw_s": _num(total_hw_s, 6),
+        "total_gflop": _num(total_gflop),
+        "avg_gflops": _num(avg_gflops),
+        "avg_pct_peak": _pct(avg_gflops),
+        "prefill_tokens": prefill_tokens,
+        "decoded_tokens": decoded_tokens,
+        "decode_first_tok_s": _num(decode_first_tok_s, 3),
+        "decode_avg_tok_s": _num(decode_avg_tok_s, 3),
+    }
+
+
+class _FlopSum:
+    """Sum of the compile-time FLOP counts the user_dma_core ops return (accounting only).
+    ``value`` is None as soon as one op returned no count, so a partial sum is never reported."""
+
+    def __init__(self):
+        self.total = 0
+        self.missing = False
+
+    def add(self, flops):
+        if isinstance(flops, (int, float)) and not isinstance(flops, bool):
+            self.total += int(flops)
+        else:
+            self.missing = True
+
+    def __iadd__(self, flops):
+        self.add(flops)
+        return self
+
+    @property
+    def value(self):
+        return None if self.missing else self.total
+
+
 def _load_smolvlm2_config(path: str | None = None) -> dict:
     if path is None:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smolvlm2_config.json")
@@ -1806,7 +1878,9 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 "prefill_addr": self._prefill_addr,
                 "prefill_preamble": self._prefill_preamble_addr,
                 "prefill_postamble": self._prefill_postamble_addr,
-                "prefill_final_buf": self._prefill_final_buf}
+                "prefill_final_buf": self._prefill_final_buf,
+                # Accounting only: compile-time FLOPs of one decode step (None if unknown).
+                "decoder_flops": getattr(self, "_decoder_flops", None)}
         with open(uni_bin, "wb") as f:
             f.write(raw)
         with open(uni_meta, "w") as f:
@@ -1904,6 +1978,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             _pf_sched.start_workers(self._pf_worker_preamble_addrs)
         self.start_execute_from_dram(self._prefill_preamble_addr)
         self.wait_queue(180.0)
+        _pf_main_hw_us = self.report_latency_in_us()   # device latency counter (accounting)
         if _pf_multi:
             for _w in _pf_sched.workers:
                 _w.wait_queue(180.0)
@@ -1932,6 +2007,8 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self.clear_capture_buffer()
         self.start_execute_from_dram(self._prefill_postamble_addr)
         self.wait_queue(30.0)
+        # Prefill HW time for the TEST_RESULT line = main program + final-norm/LM-head postamble.
+        self._report_prefill_hw_us = _pf_main_hw_us + self.report_latency_in_us()
         if total_flops is not None:
             try:
                 self._last_hw_gflops, _ = self.report_flop_rate_gflops(total_flops)
@@ -2042,13 +2119,17 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         ne = int(self.DECODE_NUM_ENGINES)
         if ne <= 1:
             # Byte-identical to the historical stream.
-            lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'gate', la, self.LAYER0_MLP_GATE_DRAM, silu_enable=True)
-            lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'up',   la, self.LAYER0_MLP_UP_DRAM)
+            # (the two matmul FLOP counts are returned for accounting only; the stream is unchanged)
+            _gate_flops = lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'gate', la, self.LAYER0_MLP_GATE_DRAM, silu_enable=True)
+            _up_flops = lm_matmul(1, H, I, self.LAYER0_PRE_NORM_DRAM, 'up',   la, self.LAYER0_MLP_UP_DRAM)
             self.accelerator_memory_to_sram(self.LAYER0_MLP_GATE_DRAM, 0x10000, I)
             self.accelerator_memory_to_sram(self.LAYER0_MLP_UP_DRAM,   0x90000, I)
             self.eltwise_mul_core(0x10000, 0x90000, 0x10000, I)
             self.sram_to_accelerator_memory(0x10000, self.LAYER0_MLP_MULT_DRAM, I)
-            return
+            _fs = _FlopSum()
+            _fs.add(_gate_flops)
+            _fs.add(_up_flops)
+            return _fs.value
 
         from user_dma_core import TYPE
         deterministic = bool(getattr(self, "decode_matmat_mul_core_enable", False))
@@ -2061,6 +2142,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         # is what separates "the DRAM controller is the ceiling" from "the barriers ate
         # the win" -- two conclusions with opposite implications for decode sharding.
         barrier_only = os.environ.get("SMOLVLM2_DECODE_BARRIER_ONLY") == "1"
+        _shard_flops = _FlopSum()   # accounting only: FLOPs the engines' gate/up matmuls return
 
         def _body(ctx):
             # quantized_matmat_core and the SRAM ops are not on SHARDED_OP_ALLOWLIST
@@ -2085,13 +2167,14 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 if not barrier_only:
                     B, SC = self._decode_private_weights[la[f'{proj}_data']][ctx.engine_idx]
                 if deterministic:
-                    ue.matmat_mul_core(M=1, K=H, N=nc, A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                    _f = ue.matmat_mul_core(M=1, K=H, N=nc, A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                         B_DRAM_ADDR=B, OUTPUT_DRAM_ADDR=dst + off, is_B_quantized=True,
                         data_type=TYPE.IF4, SCALE_DRAM_ADDR=SC, **act)
                 else:
-                    ue.quantized_matmat_core(M=1, K=H, N=nc, A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
+                    _f = ue.quantized_matmat_core(M=1, K=H, N=nc, A_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                         B_DRAM_ADDR=B, OUTPUT_DRAM_ADDR=dst + off, SCALE_DRAM_ADDR=SC,
                         data_type=TYPE.IF4, **act)
+                _shard_flops.add(_f)
             # Elementwise, so it stays in this engine's column lane. Each engine has
             # its own SRAM, so the fixed 0x10000/0x90000 staging addresses do not
             # collide across engines.
@@ -2101,6 +2184,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             ue.sram_to_accelerator_memory(0x10000, self.LAYER0_MLP_MULT_DRAM + off, nc)
 
         self._lm_sched.col_sharded_region(I, _body, join=True)
+        return _shard_flops.value
 
     def compile_decoder(self) -> None:
         """Compile single decoder program with runtime KV length via unified_attention_core."""
@@ -2109,13 +2193,20 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         bpe = 2
         G = self.GROUP_SIZE
         def lm_matmul(M, K, N, A, proj, la, OUT, **kw):
+            # Returns the core's compile-time FLOP count (accounting only).
             if bool(getattr(self, "decode_matmat_mul_core_enable", False)):
-                self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
+                return self.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
                     OUTPUT_DRAM_ADDR=OUT, is_B_quantized=True, data_type=TYPE.IF4,
                     SCALE_DRAM_ADDR=la[f'{proj}_scale'], **kw)
             else:
-                self.quantized_matmat_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
+                return self.quantized_matmat_core(M=M, K=K, N=N, A_DRAM_ADDR=A, B_DRAM_ADDR=la[f'{proj}_data'],
                     OUTPUT_DRAM_ADDR=OUT, SCALE_DRAM_ADDR=la[f'{proj}_scale'], data_type=TYPE.IF4, **kw)
+
+        # FLOP accounting for the TEST_RESULT line: the sum of what the decoder's ops return at
+        # compile time (norms, projections, RoPE, attention, LM head). Attention is counted at the
+        # compiled aligned_seq_len (max_seq_len); the eltwise add/mul return no count and are not
+        # included. Does not change the emitted program.
+        _dec_flops = _FlopSum()
 
         # Guarantee counter starts at 1 regardless of prior compilations.
         self.reset_isa_reg_counter()
@@ -2141,12 +2232,12 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             h_out = self.LAYER0_OUTPUT_DRAM if layer_idx % 2 == 0 else self.LAYER0_INPUT_DRAM
 
             # RMS norm (input_layernorm)
-            self.rms_norm_core_dram(M=1, N=H, A_DRAM_ADDR=h_in,
+            _dec_flops += self.rms_norm_core_dram(M=1, N=H, A_DRAM_ADDR=h_in,
                 OUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM, GAMMA_DRAM_ADDR=la['ln1_gamma'])
             # Q/K/V projections
-            lm_matmul(1, H, H,                     self.LAYER0_PRE_NORM_DRAM, 'q', la, self.LAYER0_Q_DRAM)
-            lm_matmul(1, H, self.NUM_KV_HEADS * D, self.LAYER0_PRE_NORM_DRAM, 'k', la, self.LAYER0_K_PROJ_DRAM)
-            lm_matmul(1, H, self.NUM_KV_HEADS * D, self.LAYER0_PRE_NORM_DRAM, 'v', la, self.LAYER0_V_PROJ_DRAM)
+            _dec_flops += lm_matmul(1, H, H,                     self.LAYER0_PRE_NORM_DRAM, 'q', la, self.LAYER0_Q_DRAM)
+            _dec_flops += lm_matmul(1, H, self.NUM_KV_HEADS * D, self.LAYER0_PRE_NORM_DRAM, 'k', la, self.LAYER0_K_PROJ_DRAM)
+            _dec_flops += lm_matmul(1, H, self.NUM_KV_HEADS * D, self.LAYER0_PRE_NORM_DRAM, 'v', la, self.LAYER0_V_PROJ_DRAM)
 
             # Position-based byte offsets are gpr_seq_len * stride. Following gemma3's decode
             # convention, recompute the offset register(s) immediately before each use rather
@@ -2170,7 +2261,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             # derived from gpr_seq_len inside the helper via register-addressed DMAs.
             for h in range(self.NUM_KV_HEADS):
                 k_base = self.LAYER0_K_DRAM + layer_idx * self.KV_LAYER_STRIDE + h * self.KV_HEAD_STRIDE
-                self.rope_hf_core_decode_d64(N=D,
+                _dec_flops += self.rope_hf_core_decode_d64(N=D,
                     input_dram_addr=self.LAYER0_K_PROJ_DRAM + h * D * bpe,
                     output_dram_addr=k_base, output_pos_strided=True,
                     packed_table_addr=self.ROPE_PACKED_DRAM,
@@ -2178,7 +2269,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
 
             # RoPE Q: same d64 rope, output to the fixed Q_PERM slot (attention reads from there).
             for h in range(self.NUM_HEADS):
-                self.rope_hf_core_decode_d64(N=D,
+                _dec_flops += self.rope_hf_core_decode_d64(N=D,
                     input_dram_addr=self.LAYER0_Q_DRAM + h * D * bpe,
                     output_dram_addr=self.LAYER0_Q_PERM_DRAM + h * D * bpe, output_pos_strided=False,
                     packed_table_addr=self.ROPE_PACKED_DRAM,
@@ -2203,7 +2294,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 # Scatter the group's Q [G, D] into the fixed FLASH_Q base (drop the per-group offset).
                 self.accelerator_memory_to_sram(self.LAYER0_Q_PERM_DRAM + q_start, 0x30000, G * D)
                 self.sram_to_accelerator_memory(0x30000, self.FLASH_Q_DRAM, G * D)
-                self.unified_attention_core(batch=G, aligned_seq_len=self.max_seq_len, head_dim=D,
+                _dec_flops += self.unified_attention_core(batch=G, aligned_seq_len=self.max_seq_len, head_dim=D,
                     Q_DRAM_ADDR=self.FLASH_Q_DRAM, K_DRAM_ADDR=self.FLASH_K_DRAM,
                     V_DRAM_ADDR=self.FLASH_V_DRAM, BIAS_DRAM_ADDR=self.DECODE_BIAS_DRAM,
                     OUTPUT_DRAM_ADDR=self.FLASH_OUT_DRAM, SCRATCH_DRAM_ADDR=self.FLASH_SCRATCH_DRAM,
@@ -2213,16 +2304,16 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 self.accelerator_memory_to_sram(self.FLASH_OUT_DRAM, 0x40000, G * D)
                 self.sram_to_accelerator_memory(0x40000, self.LAYER0_ATTN_OUT_DRAM + q_start, G * D)
             # O projection
-            lm_matmul(1, H, H, self.LAYER0_ATTN_OUT_DRAM, 'o', la, self.LAYER0_O_PROJ_DRAM)
+            _dec_flops += lm_matmul(1, H, H, self.LAYER0_ATTN_OUT_DRAM, 'o', la, self.LAYER0_O_PROJ_DRAM)
             # Post-attn residual + RMS norm
-            rms_norm_core_dram_post_add(self, M=1, N=H,
+            _dec_flops += rms_norm_core_dram_post_add(self, M=1, N=H,
                 A_DRAM_ADDR=h_in, B_DRAM_ADDR=self.LAYER0_O_PROJ_DRAM,
                 ADDOUTPUT_DRAM_ADDR=self.LAYER0_RESIDUAL_DRAM,
                 NORMOUTPUT_DRAM_ADDR=self.LAYER0_PRE_NORM_DRAM,
                 GAMMA_DRAM_ADDR=la['ln2_gamma'])
             # MLP
-            self._emit_decode_gate_up(la, lm_matmul, H, I, bpe)
-            lm_matmul(1, I, H, self.LAYER0_MLP_MULT_DRAM, 'down', la, self.LAYER0_MLP_DOWN_DRAM)
+            _dec_flops += self._emit_decode_gate_up(la, lm_matmul, H, I, bpe)
+            _dec_flops += lm_matmul(1, I, H, self.LAYER0_MLP_MULT_DRAM, 'down', la, self.LAYER0_MLP_DOWN_DRAM)
             # MLP residual
             self.accelerator_memory_to_sram(self.LAYER0_RESIDUAL_DRAM,  0x10000, H)
             self.accelerator_memory_to_sram(self.LAYER0_MLP_DOWN_DRAM,  0x90000, H)
@@ -2231,7 +2322,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
 
         # Final norm + LM head
         final_buf = self.LAYER0_INPUT_DRAM if self.NUM_LAYERS % 2 == 0 else self.LAYER0_OUTPUT_DRAM
-        self.rms_norm_core_dram(M=1, N=H, A_DRAM_ADDR=final_buf,
+        _dec_flops += self.rms_norm_core_dram(M=1, N=H, A_DRAM_ADDR=final_buf,
             OUTPUT_DRAM_ADDR=self.FINAL_NORM_DRAM, GAMMA_DRAM_ADDR=self.final_norm_addr)
         # The LM-head always wires PENALTY_BIAS_DRAM as its C term (zeros = pure greedy).
         lm_head_kwargs = {
@@ -2244,7 +2335,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         # deterministic flag de-fuses the per-layer decoder/prefill linears; the validated deterministic
         # path keeps this fused LM-head (run-to-run repeatable on clean DRAM — see the run_from_bin
         # end-of-run zero_dram, which is what makes consecutive load-only runs reproducible).
-        self.quantized_matmat_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=self.FINAL_NORM_DRAM,
+        _dec_flops += self.quantized_matmat_core(M=1, K=H, N=self.VOCAB_SIZE, A_DRAM_ADDR=self.FINAL_NORM_DRAM,
             B_DRAM_ADDR=self.lm_head_data, OUTPUT_DRAM_ADDR=self.LOGITS_DRAM,
             SCALE_DRAM_ADDR=self.lm_head_scale, data_type=TYPE.IF4,
             write_back_disable=True, **lm_head_kwargs)
@@ -2275,6 +2366,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
         self._decoder_attention_use_pbi = False
         self._decoder_attention_impl = "unified_attention_core"
         self._decoder_attention_shared_subroutine = False
+        self._decoder_flops = _dec_flops.value
         if self._unified_active:
             self._seg_decoder = (self._decoder_program_addr, bytes(raw))
         else:
@@ -2436,7 +2528,9 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 sched.preclear_flags()
                 self._vis_flags_precleared = True
             sched.start_workers(self._vis_worker_prog_addrs)
-        self.program_execute(encoder_addr, timeout=30.0, flops=enc_flops)
+        _enc_hw_us, _ = self.program_execute(encoder_addr, timeout=30.0, flops=enc_flops)
+        # Kept for the TEST_RESULT line: device latency counter + the FLOP count used above.
+        self._report_vision = {"hw_us": float(_enc_hw_us), "flops": int(enc_flops)}
         if multi:
             # The primary retires its halt as soon as the last rendezvous clears; a
             # worker may still be draining its (write-free) margin NOPs. Wait rather
@@ -2580,6 +2674,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
             _SILENT_MODE = True
             _lm_sched.preclear_flags()
             _SILENT_MODE = False
+        self._report_decode_lats_us = []   # per-step device latency, for the TEST_RESULT line
         while len(generated) < max_new_tokens and self.seq_len < self.max_seq_len:
             _SILENT_MODE = True
             self.seq_len += 1
@@ -2619,6 +2714,7 @@ class SmolVLM2_UnifiedEngine(SmolVLM2RuntimeAttentionStateMixin, UnifiedEngine):
                 _lm_sched.start_workers(self._lm_worker_prog_addrs)
             self.start_execute_from_dram(preamble_addr)
             self.wait_queue(30.0)
+            self._report_decode_lats_us.append(self.report_latency_in_us())   # accounting
             if _lm_multi:
                 for _w in _lm_sched.workers:
                     _w.wait_queue(30.0)
@@ -2920,6 +3016,64 @@ def main():
     _original_print(
         f"SmolVLM2 test ends. prefill {round(seq_len / prefill_time, 2) if prefill_time > 0 else 0.0} tok/s, "
         f"decode {round(n_generated / decode_time, 2) if decode_time > 0 else 0.0} tok/s.")
+
+    # One-line structured result for model_auto_test.py. HW seconds are the device latency
+    # counter; GFLOP are the script's own counts: the analytic encoder / prefill formulas above
+    # and, for decode, the compile-time sum stored with the program (null when an older
+    # programs.json without "decoder_flops" was loaded).
+    _stop_ids = set(_SMOLVLM2_CFG["model"]["stop_token_ids"])
+    # hw_token is the first answer token (it comes out of prefill); run_decoder returns the rest.
+    _text_ids = [int(t) for t in [hw_token, *hw_tokens] if t not in _stop_ids]
+    _dec_lats_us = list(getattr(ue, "_report_decode_lats_us", []))
+    _dec_hw_us = sum(_dec_lats_us)
+    _dec_flops_tok = uni_meta.get("decoder_flops")
+    if not isinstance(_dec_flops_tok, (int, float)):
+        _dec_flops_tok = None
+    _vis = getattr(ue, "_report_vision", None) if has_image else None
+    _pf_hw_us = getattr(ue, "_report_prefill_hw_us", None)
+    # (stage, engines that ran it, hw seconds, GFLOP)
+    _stage_rows = []
+    if _vis is not None:
+        _stage_rows.append(("vision", int(ue.NUM_ENGINES), _vis["hw_us"] / 1e6, _vis["flops"] / 1e9))
+    _stage_rows.append(("prefill", int(ue._prefill_engines()),
+                        _pf_hw_us / 1e6 if _pf_hw_us is not None else None, prefill_flops / 1e9))
+    _stage_rows.append(("decode", int(ue.DECODE_NUM_ENGINES), _dec_hw_us / 1e6,
+                        _dec_flops_tok * len(_dec_lats_us) / 1e9 if _dec_flops_tok is not None else None))
+    _engines = max(row[1] for row in _stage_rows)
+    _shared = _shared_report(
+        {"prompt": args.prompt, "image": image_path} if has_image else args.prompt,
+        _engines, [(name, hw_s, gflop) for name, _, hw_s, gflop in _stage_rows],
+        prefill_tokens=seq_len, decoded_tokens=n_generated,
+        decode_first_tok_s=(1e6 / _dec_lats_us[0]) if (_dec_lats_us and _dec_lats_us[0]) else None,
+        decode_avg_tok_s=(n_generated / decode_time) if (n_generated and decode_time > 0) else None)
+    # The stages do not all use the same engine count, so each row carries its own "engines"
+    # and its pct_peak is against that count; the top-level engines / peak_gflops /
+    # avg_pct_peak use the largest count.
+    _clock_ns = user_dma_core.CLOCK_CYCLE_TIME_NS
+    _peak_one = 128.0 / _clock_ns if _clock_ns else None   # GFLOPS per engine
+    for _row, (_, _n_eng, _, _) in zip(_shared["stages"], _stage_rows):
+        _row["engines"] = _n_eng
+        _row["pct_peak"] = (round(100.0 * _row["gflops"] / (_peak_one * _n_eng), 2)
+                            if (_row["gflops"] is not None and _peak_one) else None)
+    _original_print("TEST_RESULT: " + json.dumps({
+        "decoded_text": ue.tokenizer.decode(_text_ids),
+        "generated_token_ids": [int(t) for t in hw_tokens],
+        "mode": "vlm" if has_image else "text",
+        "image": image_path if has_image else None,
+        "vision_engines": int(ue.NUM_ENGINES) if has_image else None,
+        "prefill_engines": int(ue._prefill_engines()),
+        "decode_engines": int(ue.DECODE_NUM_ENGINES),
+        "image_tokens": int(num_image_tokens),
+        "text_tokens": int(num_text_tokens),
+        "prefill_speed_tok_s": round(seq_len / prefill_time, 2) if prefill_time > 0 else None,
+        "decode_speed_tok_s": round(n_generated / decode_time, 2) if decode_time > 0 else None,
+        "prefill_hw_ms": _pf_hw_us / 1e3 if _pf_hw_us is not None else None,
+        "decode_first_hw_ms": _dec_lats_us[0] / 1e3 if _dec_lats_us else None,
+        "decode_avg_hw_ms": _dec_hw_us / len(_dec_lats_us) / 1e3 if _dec_lats_us else None,
+        # decode_first_tok_s: HW-latency rate of the first decode step;
+        # decode_avg_tok_s: wall-clock average over the loop (the "decode ... tok/s" above).
+        **_shared,
+    }, ensure_ascii=False))
 
     _SILENT_MODE = True
     ue.software_reset()

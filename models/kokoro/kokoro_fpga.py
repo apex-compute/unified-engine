@@ -61,6 +61,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 import time
 from contextlib import contextmanager
@@ -115,6 +116,14 @@ def report_snr(*args, **kwargs):
     the CPU references for them costs real time on top of the printing."""
     if _DEBUG_SNR[0]:
         _original_print(*args, **kwargs)
+        if args and isinstance(args[0], str):
+            # the same lines model_auto_test.py's kokoro check reads, kept for TEST_RESULT
+            m = re.search(r"\[fpga\] Section (\d)[^\n]*?SNR[^\n]*?:\s*(-?[\d.]+|nan|inf|-inf) dB", args[0])
+            if m:
+                try:
+                    _SNR_SEEN.append((m.group(1), float(m.group(2))))
+                except ValueError:
+                    pass
 
 _STATS: "dict[str, list]" = {}    # name -> [compile_s, exec_s, runs, instructions]
 # Per-program fingerprints. Stage 1 of the single-bin work is making every captured program
@@ -130,6 +139,159 @@ _DUMP_FULL = [True]   # also keep raw instruction bytes, for field-level diffing
 _DRAM_HIGH = [0]          # peak activation bytes in use, for the budget report
 _CUR = [None]
 _T_CAPTURE = [None]
+
+
+# --- TEST_RESULT accounting --------------------------------------------------------------------
+#
+# kokoro_test.py prints one TEST_RESULT line with, per section, the hardware seconds and the
+# theoretical FLOPs of the programs that section ran. Nothing here touches an instruction stream.
+#
+#   hardware seconds: the device latency counter, read after every program (_timed_run).
+#   FLOPs: what the user_dma_core ops return when captured (matmuls, attention, norms, DRAM
+#   eltwise), one FLOP per element for the SRAM-level eltwise/broadcast ops, nothing for copies,
+#   permutes and transposes -- the same convention as the other models.
+#
+# The one kokoro-specific part: a _dyn_* wrapper captures its kernel at the CAP of a runtime
+# dimension while a register makes the device run the REAL length, so the kernel's own return
+# value is the cap-sized count. The wrappers therefore recount with the real dimensions (a Dim's
+# int value), and a hardware loop whose trip count lives in a register is entered with the real
+# trip count via _real_trips(). ``fallbacks`` counts the calls where a return value did not have
+# the expected 2*M*K*N + c*M*N shape and was scaled proportionally instead.
+#
+# Not counted: programs emitted on worker engines. A section that used a sharded region
+# (--engines > 1) reports its FLOPs as unknown (None) rather than a partial sum.
+_METER = {"flops": 0, "depth": 0, "loops": [], "next_real": None, "fallbacks": 0, "sharded": False}
+_SEC_FLOPS: "dict" = {}     # section -> theoretical FLOPs of the programs billed to it (None = unknown)
+_SEC_HW_US: "dict" = {}     # section -> device latency counter summed over those programs, in us
+_FLOP_MARK = [0]            # _METER["flops"] at the end of the previous program
+_SNR_SEEN: "list" = []      # (section digit, dB) of every "[fpga] Section N ... SNR ...: X dB" line
+
+_FLOP_RETURNING_OPS = (
+    "matmat_mul_core", "matmat_mul_core_legacy", "matmat_mul_core_dynamic", "matmat_mul_dynamic_core",
+    "matmat_mul_two_cores", "matmat_mul_multi_cores",
+    "quantized_matmat_core", "quantized_matmat_core_legacy", "quantized_matmat_core_dynamic",
+    "unified_attention_core", "unified_attention_core_legacy", "unified_attention_core_dynamic",
+    "layer_norm_core_dram", "layer_norm_core_dram_legacy", "layer_norm_core_dram_dynamic",
+    "rms_norm_core_dram", "rms_norm_core_dram_legacy", "rms_norm_core_dram_dynamic",
+    "eltwise_core_dram", "eltwise_core_dram_legacy", "eltwise_core_dram_dynamic",
+    "conv1d_core", "conv2d_core", "maxpool2d_core", "activation_core",
+)
+_FLOP_PER_ELEMENT_OPS = ("eltwise_add_core", "eltwise_mul_core", "eltwise_sub_core",
+                         "broadcast_mul", "broadcast_add")
+
+
+def _is_count(n):
+    return isinstance(n, (int, float)) and not isinstance(n, bool)
+
+
+def _count(ue, n):
+    """Add ``n`` FLOPs for the op just captured on ``ue``, times the real trip counts of the
+    hardware loops it sits in. Ignored inside another counted op, outside a capture, and on an
+    engine that carries no meter (a worker)."""
+    if (not _is_count(n) or _METER["depth"] != 0 or getattr(ue, "_flop_meter", None) is not _METER
+            or not getattr(ue, "is_capture_on", False)):
+        return
+    for trips in _METER["loops"]:
+        n *= trips
+    _METER["flops"] += n
+
+
+def _real_trips(ue, n):
+    """Declare the REAL trip count of the loop_start() that follows immediately on ``ue`` (its
+    loop_cnt argument is only the cap the body was templated at)."""
+    if getattr(ue, "_flop_meter", None) is _METER:
+        _METER["next_real"] = int(n)
+
+
+def _rescale(flops, real, templ):
+    """A count that is linear in one dimension, moved from its template value to the real one."""
+    if not _is_count(flops) or real == templ:
+        return flops
+    if not templ or (flops * real) % templ:
+        _METER["fallbacks"] += 1
+        return flops * real / templ if templ else flops
+    return flops * real // templ
+
+
+def _real_matmul_flops(flops, templ, real):
+    """matmat_mul_core returns 2*M*K*N + c*M*N (c = bias / activation terms). Recover c from the
+    template-sized return value and re-evaluate at the real (M, K, N)."""
+    if not _is_count(flops) or tuple(templ) == tuple(real):
+        return flops
+    (mt, kt, nt), (m, k, n) = templ, real
+    rem = flops - 2 * mt * kt * nt
+    if mt and nt and rem >= 0 and rem % (mt * nt) == 0:
+        return 2 * m * k * n + (rem // (mt * nt)) * m * n
+    _METER["fallbacks"] += 1
+    return flops * m * k * n / (mt * kt * nt) if (mt and kt and nt) else flops
+
+
+def _install_flop_meter(ue):
+    """Wrap the FLOP-returning ops and loop_start/loop_end on this engine instance (see above)."""
+    if getattr(ue, "_flop_meter", None) is not None:
+        return
+    meter = _METER
+
+    def counted(orig, count_of):
+        def wrapper(*args, **kwargs):
+            meter["depth"] += 1
+            try:
+                ret = orig(*args, **kwargs)
+            finally:
+                meter["depth"] -= 1
+            _count(ue, count_of(ret, args, kwargs))
+            return ret
+        return wrapper
+
+    def element_size(ret, args, kwargs):
+        return kwargs["element_size"] if "element_size" in kwargs else (args[3] if len(args) > 3 else None)
+
+    for name in _FLOP_RETURNING_OPS:
+        if hasattr(ue, name):
+            setattr(ue, name, counted(getattr(ue, name), lambda ret, args, kwargs: ret))
+    for name in _FLOP_PER_ELEMENT_OPS:
+        if hasattr(ue, name):
+            setattr(ue, name, counted(getattr(ue, name), element_size))
+
+    orig_loop_start, orig_loop_end = ue.loop_start, ue.loop_end
+
+    def loop_start(*args, **kwargs):
+        ret = orig_loop_start(*args, **kwargs)
+        trips = kwargs.get("loop_cnt", args[0] if args else 0)
+        if meter["depth"] == 0:
+            if meter["next_real"] is not None:
+                trips = meter["next_real"]
+            meter["next_real"] = None
+        meter["loops"].append(trips if (_is_count(trips) and trips > 0) else 1)
+        return ret
+
+    def loop_end(*args, **kwargs):
+        ret = orig_loop_end(*args, **kwargs)
+        if meter["loops"]:
+            meter["loops"].pop()
+        return ret
+
+    ue.loop_start, ue.loop_end = loop_start, loop_end
+    ue._flop_meter = meter
+
+
+def get_test_report():
+    """Per-section accounting of the last run_fpga_forward(), for kokoro_test.py's TEST_RESULT line.
+
+    ``stages``: [(section, hardware seconds, GFLOP or None)] in run order, for every section that
+    ran at least one program. With --debug-snr (the default) the bisect's extra programs are part
+    of both numbers, exactly as they are part of the timing table."""
+    stages = []
+    for name, st in _STATS.items():
+        if st[2] == 0:
+            continue
+        us, fl = _SEC_HW_US.get(name), _SEC_FLOPS.get(name)
+        stages.append((name, us / 1e6 if us is not None else None, fl / 1e9 if fl is not None else None))
+    return {"stages": stages, "engines": _ENGINES[0], "snr_db": list(_SNR_SEEN),
+            "flop_count_fallbacks": _METER["fallbacks"], "from_bin": bool(_BIN_LOADED[0]),
+            "programs_run": sum(st[2] for st in _STATS.values()),
+            "instructions": sum(st[3] for st in _STATS.values())}
+
 
 
 def _begin(name):
@@ -585,6 +747,7 @@ def _timed_run(ue):
     _run_via_preamble(ue, prog)
     ue.wait_queue(30.0)
     t2 = time.perf_counter()
+    hw_us = ue.report_latency_in_us()     # device latency counter of this program (TEST_RESULT)
     ue.clear_capture_buffer()
     if _CUR[0] is not None:
         st = _STATS[_CUR[0]]
@@ -592,6 +755,13 @@ def _timed_run(ue):
         st[1] += (t2 - t1)
         st[2] += 1
         st[3] += n_inst
+        _SEC_HW_US[_CUR[0]] = _SEC_HW_US.get(_CUR[0], 0.0) + hw_us
+        if _METER["sharded"] or _SEC_FLOPS.get(_CUR[0], 0) is None:
+            _SEC_FLOPS[_CUR[0]] = None        # worker engines' share is not counted: unknown
+        else:
+            _SEC_FLOPS[_CUR[0]] = _SEC_FLOPS.get(_CUR[0], 0) + (_METER["flops"] - _FLOP_MARK[0])
+    _METER["sharded"] = False
+    _FLOP_MARK[0] = _METER["flops"]
     _T_CAPTURE[0] = None
 
 
@@ -1216,6 +1386,7 @@ class ProsodyDurationFPGA:
                 # i starts at T-1 when walking backwards, so it too must come from the register.
                 ue.generate_instruction_add_imm(_emit_M(ue, T), -1, i_reg) if reverse \
                     else ue.generate_instruction_add_set(i_reg, 0)
+                _real_trips(ue, int(T))
                 ue.loop_start(loop_cnt=_template(T), gpr_loop_cnt=_emit_M(ue, T))
             else:
                 ue.generate_instruction_add_set(i_reg, (int(T) - 1) if reverse else 0)
@@ -1560,6 +1731,7 @@ class F0NPredictionFPGA:
                 # i starts at T-1 when walking backwards, so it too must come from the register.
                 ue.generate_instruction_add_imm(_emit_M(ue, T), -1, i_reg) if reverse \
                     else ue.generate_instruction_add_set(i_reg, 0)
+                _real_trips(ue, int(T))
                 ue.loop_start(loop_cnt=_template(T), gpr_loop_cnt=_emit_M(ue, T))
             else:
                 ue.generate_instruction_add_set(i_reg, (int(T) - 1) if reverse else 0)
@@ -2429,8 +2601,15 @@ def _dyn_matmul(ue, M, K, N, **kw):
     # arrives as a Dim and is copied out of its preamble register instead.
     _emit_into(ue, K, GPR_K)
     _emit_into(ue, N, GPR_N)
-    return ue.matmat_mul_core(M=Mv, K=_template(K), N=_template(N),
-                              gpr_M_reg=m_reg, gpr_K_reg=GPR_K, gpr_N_reg=GPR_N, **kw)
+    Kt, Nt = _template(K), _template(N)
+    _METER["depth"] += 1          # FLOPs: recounted below at the real dims (TEST_RESULT accounting)
+    try:
+        flops = ue.matmat_mul_core(M=Mv, K=Kt, N=Nt,
+                                   gpr_M_reg=m_reg, gpr_K_reg=GPR_K, gpr_N_reg=GPR_N, **kw)
+    finally:
+        _METER["depth"] -= 1
+    _count(ue, _real_matmul_flops(flops, (Mv, Kt, Nt), (int(M), int(K), int(N))))
+    return flops
 
 
 def _emit_into(ue, dim, dst):
@@ -2457,10 +2636,17 @@ def _dyn_eltwise(ue, M, *args, **kw):
     loop into an ISA loop; passing gpr_M_reg alone is enough, the entrypoint allocates and seeds
     any other register it needs (user_dma_core.py:2049).
     """
+    m_real = int(M)
     if (_is_dyn(M) or int(M) >= _DYN_M_MIN) and kw.get("gpr_M_reg") is None:
         kw["gpr_M_reg"] = _emit_M(ue, M)
         M = _template(M)
-    return ue.eltwise_core_dram(int(M), *args, **kw)
+    _METER["depth"] += 1          # FLOPs: recounted below at the real row count
+    try:
+        flops = ue.eltwise_core_dram(int(M), *args, **kw)
+    finally:
+        _METER["depth"] -= 1
+    _count(ue, _rescale(flops, m_real, int(M)))
+    return flops
 
 
 _ZEROS_BUF = {}
@@ -2496,7 +2682,26 @@ def _dyn_layernorm(ue, *args, **kw):
         _N = kw.get("N", args[1] if len(args) > 1 else None)
         if _N is not None and kw.get("ZEROS_DRAM_ADDR") is None:
             kw["ZEROS_DRAM_ADDR"] = _zeros_buf(ue, int(_N))
-    return ue.layer_norm_core_dram(*args, **kw)
+    # FLOPs (5*M*N + gamma/beta terms) recounted at the real dims: M from the Dim, and N from the
+    # preamble value of gpr_N_reg when the normalisation length is a runtime register.
+    m_templ = kw.get("M", args[0] if args else None)
+    n_templ = kw.get("N", args[1] if len(args) > 1 else None)
+    n_real = _RT.get(kw["gpr_N_reg"]) if kw.get("gpr_N_reg") is not None else None
+    _METER["depth"] += 1
+    try:
+        flops = ue.layer_norm_core_dram(*args, **kw)
+    finally:
+        _METER["depth"] -= 1
+    real = flops
+    if M is not None and m_templ is not None:
+        real = _rescale(real, int(M), int(m_templ))
+    if kw.get("gpr_N_reg") is not None:
+        if n_real is not None and n_templ is not None:
+            real = _rescale(real, int(n_real), int(n_templ))
+        else:
+            _METER["fallbacks"] += 1
+    _count(ue, real)
+    return flops
 
 
 def _dyn_transpose(ue, *args, **kw):
@@ -2526,7 +2731,14 @@ def _dyn_activation(ue, *args, **kw):
             kw["M"] = _template(M)
         else:
             args = (_template(M),) + tuple(args[1:])
-    return ue.activation_core(*args, **kw)
+    m_templ = kw.get("M", args[0] if args else None)
+    _METER["depth"] += 1          # FLOPs (an identity matmul, linear in M): recounted at the real M
+    try:
+        flops = ue.activation_core(*args, **kw)
+    finally:
+        _METER["depth"] -= 1
+    _count(ue, _rescale(flops, int(M), int(m_templ)) if (M is not None and m_templ is not None) else flops)
+    return flops
 
 
 
@@ -2554,7 +2766,30 @@ def _dyn_attention(ue, **kw):
             _emit_tiles(ue, batch, GPR_K)
             ue.generate_instruction_shl(GPR_K, GPR_K, 6)
             kw["gpr_aligned_seq_len_reg"] = GPR_K
-    return ue.unified_attention_core(**kw)
+    _METER["depth"] += 1          # FLOPs: recounted below at the real batch / kv length
+    try:
+        flops = ue.unified_attention_core(**kw)
+    finally:
+        _METER["depth"] -= 1
+    real = flops
+    b_t, l_t = kw.get("batch"), kw.get("aligned_seq_len")
+    if _is_count(flops) and batch is not None and aligned is not None and b_t and l_t:
+        b_r = int(batch)
+        # the device's kv length: the same register as batch when the two were equal, else
+        # the 64-aligned batch derived on device (see above)
+        l_r = int(aligned) if int(aligned) == int(batch) else -(-int(batch) // UE_VECTOR_SIZE) * UE_VECTOR_SIZE
+        if (b_r, l_r) != (int(b_t), int(l_t)):
+            # unified_attention_core counts batch*head_dim for the Q scale (unless pre-scaled)
+            # plus score and P@V matmuls that are bilinear in (batch, kv length).
+            q_scale = 0 if kw.get("q_pre_scaled") else int(kw.get("head_dim") or 0)
+            rem = flops - q_scale * int(b_t)
+            if rem >= 0 and rem % (int(b_t) * int(l_t)) == 0:
+                real = q_scale * b_r + (rem // (int(b_t) * int(l_t))) * b_r * l_r
+            else:
+                _METER["fallbacks"] += 1
+                real = flops * b_r * l_r / (int(b_t) * int(l_t))
+    _count(ue, real)
+    return flops
 
 
 
@@ -2766,6 +3001,7 @@ class SramChain:
                                           element_size=TE)
         # tile loop trip count
         T = self.T
+        real_tiles = None             # TEST_RESULT accounting: real trip count of a runtime tile loop
         shift = self.tile_rows.bit_length() - 1
         assert (1 << shift) == self.tile_rows, "tile_rows must be a power of two"
         assert SHARD_ALIGN % self.tile_rows == 0, (SHARD_ALIGN, self.tile_rows)
@@ -2781,6 +3017,7 @@ class SramChain:
             ue.generate_instruction_shr(GPR_TMP, GPR_TMP, shift)
             n_tiles_cap = -(-_template(T) // self.tile_rows)
             gpr_cnt = GPR_TMP
+            real_tiles = -(-int(T) // self.tile_rows)     # what GPR_TMP holds at run time
         else:
             n_tiles_cap = -(-int(T) // self.tile_rows)
             gpr_cnt = None
@@ -2810,6 +3047,8 @@ class SramChain:
             prog = ue.get_program_dram_addr()
             ue.generate_instruction_jump_abs(ue_35bit_addr_shifter(
                 prog + (ue.capture_count + 1) * INSTRUCTION_SIZE_BYTES))
+        if real_tiles is not None:
+            _real_trips(ue, real_tiles)
         ue.loop_start(loop_cnt=n_tiles_cap, gpr_loop_cnt=gpr_cnt, relative=relative)
         # In pointer mode the in-loop DMA's sram_address field is a per-iteration URAM INCREMENT
         # (board-verified: a slot row here walked the destination every tile); only its bank bit
@@ -2841,6 +3080,7 @@ class SramChain:
                                     _udc.LALU_MODE.BYPASS.value, 0, dbank.value, 0, drow,
                                     _udc.URAM_WRITE_SRC.URAM_WRITE_BACK.value, UE_MODE.EXP, 0, srow, 0,
                                     self.slot_rows, 0, 0, 0)
+                _count(ue, TE)        # one FLOP per element, like the broadcast ops beside it
             else:
                 raise AssertionError(kind)
         for n in self.outputs:
@@ -3591,6 +3831,10 @@ class GeneratorFPGA:
                 ue.generate_instruction_shr(GPR_TMP, GPR_TMP, 31)
                 ue.generate_instruction_add_imm(GPR_TMP, 1, GPR_TMP)
                 patch = ue._emit_forward_skip_jz(GPR_TMP, prog)
+            # TEST_RESULT accounting: a chunk the JZ skips at run time executes nothing.
+            skipped = patch is not None and j >= -(-int(T) // GEN_IN_CHUNK)
+            if skipped:
+                _METER["depth"] += 1
             _dyn_transpose(ue, M=GEN_IN_CHUNK, N=C, INPUT_DRAM_ADDR=src + j * GEN_IN_CHUNK * C * 2,
                            OUTPUT_DRAM_ADDR=xt, IDENTITY_DRAM_ADDR=self.identity_dram)
             # M=1: only row 0 of the result was ever consumed, so the former M=64 view did 64x the
@@ -3599,6 +3843,8 @@ class GeneratorFPGA:
             _dyn_matmul(ue, M=1, K=GEN_IN_CHUNK, N=C, A_DRAM_ADDR=mask + j * GEN_IN_CHUNK * 2,
                         B_DRAM_ADDR=xt, OUTPUT_DRAM_ADDR=dst_row, C_DRAM_ADDR=dst_row,
                         bias_mode="full_matrix")
+            if skipped:
+                _METER["depth"] -= 1
             if patch is not None:
                 patch()
 
@@ -5163,6 +5409,7 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
                        program_dram_base=KOKORO_PROGRAM_BASE,
                        tensor_dram_base=KOKORO_TENSOR_BASE)
     _instrument(ue)
+    _install_flop_meter(ue)   # TEST_RESULT accounting only; see _METER
     global _SILENT_MODE
     _SILENT_MODE = True   # hide the cores' per-call tiling/FLOP prints
 
@@ -5193,6 +5440,14 @@ def run_fpga_forward(model, phonemes: str, ref_s: torch.FloatTensor, speed: floa
             handshake="four_phase", region_rendezvous="master_worker")
         sched.preclear_flags()
         _SCHED[0] = sched
+        # TEST_RESULT accounting: the workers' share of a sharded region is not counted, so the
+        # FLOPs of any program holding one are reported as unknown instead of a partial sum.
+        _sharded_region = sched.sharded_region
+
+        def _flagged_sharded_region(*a, **k):
+            _METER["sharded"] = True
+            return _sharded_region(*a, **k)
+        sched.sharded_region = _flagged_sharded_region
         from models.controller_replicas import ControllerReplicas
         _CONTROLLER_REPLICAS[0] = ControllerReplicas(ue, engines)
         _TENSOR_END[0] = KOKORO_WORKER_BASE     # activations must stay below the worker arenas

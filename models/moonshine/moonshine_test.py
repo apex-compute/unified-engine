@@ -132,6 +132,180 @@ ARTIFACT_VERSION = 1
 BIN_FILES = ("params.bin", "params.json", "programs.bin", "programs.json", "workers.bin", "shards.bin")
 
 
+# ---------------------------------------------------------------------------
+# TEST_RESULT accounting (model_auto_test.py reads these keys)
+# ---------------------------------------------------------------------------
+
+def _shared_report(input_desc, engines, stages, decoded_tokens=None,
+                   decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
+    """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
+
+    ``stages`` is ``[(name, hw_seconds, gflop), ...]`` in run order.  ``hw_seconds`` is the
+    device latency counter and ``gflop`` the compile-time theoretical FLOP count of what ran,
+    in units of 1e9.  A value that was not measured is passed as None and stays null in the
+    result -- nothing is estimated here.  ``peak_gflops`` defaults to the per-engine peak
+    (128 FLOP per clock cycle per engine) times ``engines``.
+    The decoder keys are only emitted when ``decoded_tokens`` is given.
+    """
+    import user_dma_core as _udc
+    if peak_gflops is None:
+        _hz = getattr(_udc, "CORE_CLOCK_FREQ_HZ", None)
+        per_engine = _hz * 128 / 1e9 if _hz else None  # GFLOP/s per engine
+        peak_gflops = per_engine * engines if (per_engine and engines) else None
+
+    def _num(value, digits=4):
+        return round(float(value), digits) if value is not None else None
+
+    def _pct(rate):
+        return _num(100.0 * rate / peak_gflops, 2) if (rate is not None and peak_gflops) else None
+
+    rows = []
+    for name, hw_s, gflop in stages:
+        rate = gflop / hw_s if (gflop is not None and hw_s) else None
+        rows.append({"name": name, "hw_s": _num(hw_s, 6), "gflop": _num(gflop, 6),
+                     "gflops": _num(rate), "pct_peak": _pct(rate)})
+    hw_all = [hw_s for _, hw_s, _ in stages]
+    gflop_all = [gflop for _, _, gflop in stages]
+    total_hw_s = sum(hw_all) if (hw_all and all(v is not None for v in hw_all)) else None
+    total_gflop = sum(gflop_all) if (gflop_all and all(v is not None for v in gflop_all)) else None
+    avg_gflops = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+    report = {
+        "input": input_desc,
+        "engines": engines,
+        "peak_gflops": _num(peak_gflops),
+        "stages": rows,
+        "total_hw_s": _num(total_hw_s, 6),
+        "total_gflop": _num(total_gflop, 6),
+        "avg_gflops": _num(avg_gflops),
+        "avg_pct_peak": _pct(avg_gflops),
+    }
+    if decoded_tokens is not None:
+        report.update({"decoded_tokens": decoded_tokens,
+                       "decode_first_tok_s": _num(decode_first_tok_s, 3),
+                       "decode_avg_tok_s": _num(decode_avg_tok_s, 3)})
+    return report
+
+
+# user_dma_core ops that return their theoretical FLOP count when captured.
+_FLOP_RETURNING_OPS = (
+    "matmat_mul_core", "matmat_mul_core_legacy", "matmat_mul_core_dynamic", "matmat_mul_dynamic_core",
+    "matmat_mul_two_cores", "matmat_mul_multi_cores",
+    "quantized_matmat_core", "quantized_matmat_core_legacy", "quantized_matmat_core_dynamic",
+    "unified_attention_core", "unified_attention_core_legacy", "unified_attention_core_dynamic",
+    "layer_norm_core_dram", "layer_norm_core_dram_legacy", "layer_norm_core_dram_dynamic",
+    "rms_norm_core_dram", "rms_norm_core_dram_legacy", "rms_norm_core_dram_dynamic",
+    "eltwise_core_dram", "eltwise_core_dram_legacy", "eltwise_core_dram_dynamic",
+    "conv1d_core", "conv2d_core", "maxpool2d_core", "activation_core",
+)
+# SRAM-level ops that return nothing: counted at one FLOP per element (the same rate
+# eltwise_core_dram reports), read from their ``element_size`` argument (4th positional).
+_FLOP_PER_ELEMENT_OPS = ("eltwise_add_core", "eltwise_mul_core", "eltwise_sub_core",
+                         "broadcast_mul", "broadcast_add")
+
+
+def _install_flop_meter(ue, meter=None) -> dict:
+    """Sum the theoretical FLOPs of everything captured on ``ue`` (TEST_RESULT accounting only).
+
+    Wraps the op methods on this one engine instance; the instruction stream is untouched.
+    Only the outermost wrapped call counts, so an op built from other ops is not counted
+    twice, and nothing is counted outside start_capture()/stop_capture().  A count made
+    inside loop_start()/loop_end() is multiplied by the loop's ``loop_cnt``; a loop whose
+    trip count exists only in a register at run time is recorded in ``runtime_loops`` and
+    counted once (a lower bound).  ``start_queue_for_bf16_matvec_operation`` (returns
+    nothing) is counted as 2*K*N.  Ops outside these lists -- DMA copies, permutes,
+    transposes, softmax/exp -- add nothing, exactly as in the other models' counts.
+    Read ``meter["flops"]`` before and after compiling a program to get that program's FLOPs.
+    Pass the same ``meter`` for every engine of a multi-engine program: the work is split
+    between the engines, so the program's FLOPs are the sum over all of them.
+    """
+    if getattr(ue, "_flop_meter", None) is not None:
+        return ue._flop_meter
+    if meter is None:
+        meter = {"flops": 0, "depth": 0, "loops": [], "runtime_loops": 0}
+
+    def _counted(orig, count_of):
+        def counted(*args, **kwargs):
+            meter["depth"] += 1
+            try:
+                ret = orig(*args, **kwargs)
+            finally:
+                meter["depth"] -= 1
+            if meter["depth"] == 0 and getattr(ue, "is_capture_on", False):
+                n = count_of(ret, args, kwargs)
+                if isinstance(n, (int, float)) and not isinstance(n, bool):
+                    for trips in meter["loops"]:
+                        n *= trips
+                    meter["flops"] += n
+            return ret
+        return counted
+
+    def _element_size(ret, args, kwargs):
+        return kwargs["element_size"] if "element_size" in kwargs else (args[3] if len(args) > 3 else None)
+
+    def _matvec(ret, args, kwargs):
+        return 2 * kwargs["K"] * kwargs["N"] if ("K" in kwargs and "N" in kwargs) else None
+
+    for name in _FLOP_RETURNING_OPS:
+        if hasattr(ue, name):
+            setattr(ue, name, _counted(getattr(ue, name), lambda ret, args, kwargs: ret))
+    for name in _FLOP_PER_ELEMENT_OPS:
+        if hasattr(ue, name):
+            setattr(ue, name, _counted(getattr(ue, name), _element_size))
+    if hasattr(ue, "start_queue_for_bf16_matvec_operation"):
+        ue.start_queue_for_bf16_matvec_operation = _counted(ue.start_queue_for_bf16_matvec_operation, _matvec)
+
+    orig_loop_start, orig_loop_end = ue.loop_start, ue.loop_end
+
+    def loop_start(*args, **kwargs):
+        ret = orig_loop_start(*args, **kwargs)
+        trips = kwargs.get("loop_cnt", args[0] if args else 0)
+        if not (isinstance(trips, int) and trips > 0):
+            trips = 1
+            if meter["depth"] == 0:
+                meter["runtime_loops"] += 1
+        meter["loops"].append(trips)
+        return ret
+
+    def loop_end(*args, **kwargs):
+        ret = orig_loop_end(*args, **kwargs)
+        if meter["loops"]:
+            meter["loops"].pop()
+        return ret
+
+    ue.loop_start, ue.loop_end = loop_start, loop_end
+    ue._flop_meter = meter
+    return meter
+
+
+def _metered_fn(fn):
+    """Count an nn_lib kernel (first argument = the engine) by the FLOPs it returns, in place of
+    whatever the engine ops inside it would add (those do not see its softmax / norm terms)."""
+    def metered(ue, *args, **kwargs):
+        meter = getattr(ue, "_flop_meter", None)
+        if meter is None:
+            return fn(ue, *args, **kwargs)
+        meter["depth"] += 1
+        try:
+            ret = fn(ue, *args, **kwargs)
+        finally:
+            meter["depth"] -= 1
+        if (meter["depth"] == 0 and getattr(ue, "is_capture_on", False)
+                and isinstance(ret, (int, float)) and not isinstance(ret, bool)):
+            n = ret
+            for trips in meter["loops"]:
+                n *= trips
+            meter["flops"] += n
+        return ret
+    return metered
+
+
+(prefill_flash_attention_core, decode_flash_attention_core, layer_norm_core_dram_post_add,
+ rope_hf_core_dram, eltwise_add_core_dram, eltwise_mul_core_dram) = (
+    _metered_fn(f) for f in (prefill_flash_attention_core, decode_flash_attention_core,
+                             layer_norm_core_dram_post_add, rope_hf_core_dram,
+                             eltwise_add_core_dram, eltwise_mul_core_dram))
+
+
 def _ceil(a, b):
     return (a + b - 1) // b * b
 
@@ -323,6 +497,11 @@ class MoonshineEngine(UnifiedEngine):
         self.buf = {}
         self.prog = {}          # name -> (addr, size)
         self.prog_order = []
+        # TEST_RESULT accounting: theoretical FLOPs per compiled program (summed over all engines) and,
+        # inside the decode body, the part that scales with the runtime kv length (see step_flops()).
+        self.prog_flops = {}
+        self.dec_self_attn_flops = 0
+        self.run_stats = {}
         self.NE = engines
         self.worker_progs, self.dec_worker_progs = [], []
         if engines > 1:
@@ -359,6 +538,9 @@ class MoonshineEngine(UnifiedEngine):
             self.prep = WeightPrep(ref.w)
             self._upload_weights()
             self._materialize_shards()
+            meter = _install_flop_meter(self)
+            for wk in self.sched.workers:
+                _install_flop_meter(wk, meter)
             self.compile_all()
 
     # ------------------------------------------------------------------ geometry
@@ -414,9 +596,13 @@ class MoonshineEngine(UnifiedEngine):
         """capture -> HALT -> write to the next program slot. Programs are bump-allocated and
         never reset, so the whole set can be read back and frozen into programs.bin."""
         t0 = time.time()
+        meter = getattr(self, "_flop_meter", None)
+        flops_before = meter["flops"] if meter is not None else 0
         self.start_capture()
         emit()
         self.stop_capture()
+        if meter is not None:
+            self.prog_flops[name] = int(meter["flops"] - flops_before)
         self.generate_instruction_halt()
         size = self.get_capture_instruction_size_bytes()
         addr = self.get_program_dram_addr()
@@ -441,9 +627,23 @@ class MoonshineEngine(UnifiedEngine):
                     report(f"[exec {name}] engines still busy after {time.time() - t0:.1f}s: {busy} "
                            f"(barrier desync or missing worker)")
         dt = time.time() - t0
+        self._last_exec_hw_us = self.report_latency_in_us()   # device latency counter of this program
         print(f"[exec {name}] hw {dt:.3f}s")
         self._hw_time += dt
         return dt
+
+    def step_flops(self, step):
+        """Theoretical FLOPs of decode step `step`, or None when the image carries no count.
+        The decode body is compiled once with the self-attention kv length at MAX_STEPS_PAD, but the
+        device runs it at R_ALIGNED = ceil(step + 1, 64). unified_attention_core counts head_dim for
+        the Q scale plus score and P@V matmuls that are linear in the kv length, so that part is
+        rescaled to the length actually executed; everything else in the body is step-independent."""
+        body = self.prog_flops.get("decode")
+        if body is None:
+            return None
+        q_scale = self.N_DEC * self.H * self.DP
+        linear = self.dec_self_attn_flops - q_scale
+        return body - linear + linear * _ceil(step + 1, V) // self.MAX_STEPS_PAD
 
     @staticmethod
     def _report(*a):
@@ -993,7 +1193,7 @@ class MoonshineEngine(UnifiedEngine):
                         self._scatter_row(ue, ktmp, self._cache("kcache", l, h))
                         self._mm(1, CP, D, hbuf, w[f"dec{l}.v{h}"], vtmp, ue=ue)
                         self._scatter_row(ue, vtmp, self._cache("vcache", l, h))
-                        ue.unified_attention_core(
+                        self.dec_self_attn_flops += ue.unified_attention_core(
                             batch=1, aligned_seq_len=kvp, head_dim=D,
                             Q_DRAM_ADDR=q,
                             K_DRAM_ADDR=self._cache("kcache", l, h), V_DRAM_ADDR=self._cache("vcache", l, h),
@@ -1043,6 +1243,7 @@ class MoonshineEngine(UnifiedEngine):
 
     def _emit_decode_program(self):
         S = self.sched
+        self.dec_self_attn_flops = 0
         S.begin_program()
         for wk in S.workers:
             wk._isa_reg_counter = self.FIRST_FREE_REG
@@ -1133,6 +1334,7 @@ class MoonshineEngine(UnifiedEngine):
             caches = ([dict() for _ in range(self.N_DEC)], [dict() for _ in range(self.N_DEC)])
             ref_dump["logits_step0"] = self.ref.decode_step(torch.tensor([[self.BOS]]), enc_ref, 0, *caches)[0, -1]
         snr = (lambda key, got: self._report(f"  SNR {key}: {snr_db(ref_dump[key][0], got):.1f} dB")) if ref_dump else (lambda *a: None)
+        step_us = []          # device latency counter per decode step (TEST_RESULT only)
 
         # ---- stem + encoder + cross K/V: one program (workers must be launched first, every run) ----
         if self.NE > 1:
@@ -1141,6 +1343,7 @@ class MoonshineEngine(UnifiedEngine):
                 self._flags_cleared = True
             self.sched.start_workers(self.worker_progs)
         self._exec("encoder", timeout=60.0)
+        enc_hw_us = self._last_exec_hw_us
         snr("conv_stem", self._read(self.A("conv3_out"), (T3p, self.CP))[:T3, : self.C])
         x = [self.A("x_a"), self.A("x_b")]
         snr("enc_layer_6", self._read(x[(6 + 1) % 2], (T3p, self.CP))[:T3, : self.C])    # ping-pong survivors
@@ -1167,6 +1370,7 @@ class MoonshineEngine(UnifiedEngine):
             self.start_execute_from_dram(dispatch + step * 4 * 32)
             self.wait_queue(60.0)
             self._hw_time += time.time() - t0
+            step_us.append(self.report_latency_in_us())
             nxt = self._global_argmax()
             if ref_dump and step == 0:
                 lg = self._read(self.A("logits"), (self.VOCAB,))
@@ -1177,6 +1381,14 @@ class MoonshineEngine(UnifiedEngine):
             out.append(nxt)
             tok = nxt
         audio_s = n / SAMPLE_RATE
+        dec_flops = [self.step_flops(s) for s in range(len(step_us))]
+        self.run_stats = {
+            "audio_s": audio_s, "samples": n, "frames": (T1, T2, T3), "compiled_frames": (self.T1, self.T2, T3p),
+            "enc_hw_s": enc_hw_us / 1e6, "enc_flops": self.prog_flops.get("encoder"),
+            "dec_step_us": step_us, "dec_hw_s": sum(step_us) / 1e6,
+            "dec_flops": sum(dec_flops) if (dec_flops and all(f is not None for f in dec_flops)) else None,
+            "dec_wall_s": time.time() - t_dec, "wall_s": time.time() - t_e2e, "hw_wait_wall_s": self._hw_time,
+        }
         self._report(f"[decode] {len(out)} tokens in {time.time() - t_dec:.2f}s")
         self._report(f"[e2e] {time.time() - t_e2e:.2f}s wall ({self._hw_time:.2f}s on hardware) for "
                      f"{audio_s:.1f}s audio -> RTF {(time.time() - t_e2e) / audio_s:.3f}")
@@ -1232,6 +1444,9 @@ class MoonshineEngine(UnifiedEngine):
                 self._dma_read_chunks(addr, size, f)
             psize = f.tell()
         manifest["order"] = self.prog_order
+        # theoretical FLOPs per program (all engines) + the kv-length-dependent part of the decode body
+        manifest["flops"] = dict(self.prog_flops)
+        manifest["dec_self_attn_flops"] = self.dec_self_attn_flops
         # worker programs + the consts their kernels allocated (LN zero rows), ACT pattern
         # worker ISA (encoder program + decode program, contiguous in each worker's program region) + the
         # consts their kernels allocated (LN zero rows), ACT pattern. Entry addresses of both programs kept.
@@ -1298,6 +1513,8 @@ class MoonshineEngine(UnifiedEngine):
             self.prog_order.append(name)
             end = max(end, m["addr"] + m["size"])
         self.allocate_program_dram(end - self._program_dram_base)
+        self.prog_flops = dict(manifest.get("flops") or {})      # empty for an image dumped before the count
+        self.dec_self_attn_flops = manifest.get("dec_self_attn_flops", 0)
         if manifest.get("shards"):
             with open(os.path.join(bin_dir, "shards.bin"), "rb") as f:
                 sblob = f.read()
@@ -1359,12 +1576,41 @@ def main():
     ids = ue.execute(pcm, args.max_new_tokens, debug_snr=args.debug_snr)
     if not ue.from_bin:
         ue.dump_bins(BIN_DIR)
-    report(f"\n>>> {tok.decode(ids, skip_special_tokens=True)}")
+    text = tok.decode(ids, skip_special_tokens=True)
+    report(f"\n>>> {text}")
+    tokens_match = None
     if args.debug_snr:
         ref_ids = ref.generate(torch.from_numpy(pcm)[None], max_new_tokens=args.max_new_tokens)
+        tokens_match = ids == ref_ids
         report(f"[tokens] match={ids == ref_ids}  hw={len(ids)} ref={len(ref_ids)}")
         if ids != ref_ids:
             report(f"  hw : {tok.decode(ids, skip_special_tokens=True)}\n  ref: {tok.decode(ref_ids, skip_special_tokens=True)}")
+
+    # Shared TEST_RESULT keys. hw_s is the primary engine's latency counter (it spans the workers'
+    # share: the primary waits for them at every barrier); gflop is the theoretical FLOP count of the
+    # compiled programs summed over all engines. The encoder program always runs its compiled
+    # (max-seconds) geometry, whatever the clip length, so that is what is counted.
+    st = ue.run_stats
+    step_us = st.get("dec_step_us") or []
+    enc_flops, dec_flops = st.get("enc_flops"), st.get("dec_flops")
+    result = {"decoded_text": text}
+    result.update(_shared_report(
+        f"{os.path.basename(args.audio)} ({st['audio_s']:.2f} s audio, {st['frames'][2]} encoder frames; "
+        f"programs compiled for {ue.max_seconds:g} s = {st['compiled_frames'][2]} frames)",
+        ue.NE,
+        [("stem+encoder+cross_kv", st["enc_hw_s"], enc_flops / 1e9 if enc_flops is not None else None),
+         (f"decode_{len(step_us)}_steps", st["dec_hw_s"], dec_flops / 1e9 if dec_flops is not None else None)],
+        decoded_tokens=len(ids),
+        decode_first_tok_s=(1e6 / step_us[0]) if (step_us and step_us[0]) else None,
+        decode_avg_tok_s=(len(step_us) / st["dec_hw_s"]) if st["dec_hw_s"] else None))
+    result["prefill_tokens"] = 0          # the decoder starts from BOS alone: no prompt is prefilled
+    result["output"] = f"transcript ({len(ids)} tokens): {text}"
+    result["decode_steps"] = len(step_us)
+    result["tokens_match_cpu_ref"] = tokens_match
+    result["wall_s"] = round(st["wall_s"], 3)
+    result["decode_wall_s"] = round(st["dec_wall_s"], 3)
+    result["from_bin"] = bool(ue.from_bin)
+    report("TEST_RESULT:" + json.dumps(result))
 
 
 if __name__ == "__main__":

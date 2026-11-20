@@ -44,6 +44,166 @@ from nn_lib import flash_attention_batched_pbi
 COMPUTE_DTYPE = torch.bfloat16
 
 
+# ---------------------------------------------------------------------------
+# TEST_RESULT accounting (model_auto_test.py reads these keys)
+# ---------------------------------------------------------------------------
+
+def _shared_report(input_desc, engines, stages, decoded_tokens=None,
+                   decode_first_tok_s=None, decode_avg_tok_s=None, peak_gflops=None) -> dict:
+    """Shared TEST_RESULT keys that model_auto_test.py reads (_REPORT_REQUIRED / _REPORT_DECODER).
+
+    ``stages`` is ``[(name, hw_seconds, gflop), ...]`` in run order.  ``hw_seconds`` is the
+    device latency counter and ``gflop`` the compile-time theoretical FLOP count of what ran,
+    in units of 1e9.  A value that was not measured is passed as None and stays null in the
+    result -- nothing is estimated here.  ``peak_gflops`` defaults to the per-engine peak
+    (128 FLOP per clock cycle per engine) times ``engines``.
+    The decoder keys are only emitted when ``decoded_tokens`` is given.
+    """
+    import user_dma_core as _udc
+    if peak_gflops is None:
+        _hz = getattr(_udc, "CORE_CLOCK_FREQ_HZ", None)
+        per_engine = _hz * 128 / 1e9 if _hz else None  # GFLOP/s per engine
+        peak_gflops = per_engine * engines if (per_engine and engines) else None
+
+    def _num(value, digits=4):
+        return round(float(value), digits) if value is not None else None
+
+    def _pct(rate):
+        return _num(100.0 * rate / peak_gflops, 2) if (rate is not None and peak_gflops) else None
+
+    rows = []
+    for name, hw_s, gflop in stages:
+        rate = gflop / hw_s if (gflop is not None and hw_s) else None
+        rows.append({"name": name, "hw_s": _num(hw_s, 6), "gflop": _num(gflop, 6),
+                     "gflops": _num(rate), "pct_peak": _pct(rate)})
+    hw_all = [hw_s for _, hw_s, _ in stages]
+    gflop_all = [gflop for _, _, gflop in stages]
+    total_hw_s = sum(hw_all) if (hw_all and all(v is not None for v in hw_all)) else None
+    total_gflop = sum(gflop_all) if (gflop_all and all(v is not None for v in gflop_all)) else None
+    avg_gflops = total_gflop / total_hw_s if (total_gflop is not None and total_hw_s) else None
+    report = {
+        "input": input_desc,
+        "engines": engines,
+        "peak_gflops": _num(peak_gflops),
+        "stages": rows,
+        "total_hw_s": _num(total_hw_s, 6),
+        "total_gflop": _num(total_gflop, 6),
+        "avg_gflops": _num(avg_gflops),
+        "avg_pct_peak": _pct(avg_gflops),
+    }
+    if decoded_tokens is not None:
+        report.update({"decoded_tokens": decoded_tokens,
+                       "decode_first_tok_s": _num(decode_first_tok_s, 3),
+                       "decode_avg_tok_s": _num(decode_avg_tok_s, 3)})
+    return report
+
+
+# user_dma_core ops that return their theoretical FLOP count when captured.
+_FLOP_RETURNING_OPS = (
+    "matmat_mul_core", "matmat_mul_core_legacy", "matmat_mul_core_dynamic", "matmat_mul_dynamic_core",
+    "matmat_mul_two_cores", "matmat_mul_multi_cores",
+    "quantized_matmat_core", "quantized_matmat_core_legacy", "quantized_matmat_core_dynamic",
+    "unified_attention_core", "unified_attention_core_legacy", "unified_attention_core_dynamic",
+    "layer_norm_core_dram", "layer_norm_core_dram_legacy", "layer_norm_core_dram_dynamic",
+    "rms_norm_core_dram", "rms_norm_core_dram_legacy", "rms_norm_core_dram_dynamic",
+    "eltwise_core_dram", "eltwise_core_dram_legacy", "eltwise_core_dram_dynamic",
+    "conv1d_core", "conv2d_core", "maxpool2d_core", "activation_core",
+)
+# SRAM-level ops that return nothing: counted at one FLOP per element (the same rate
+# eltwise_core_dram reports), read from their ``element_size`` argument (4th positional).
+_FLOP_PER_ELEMENT_OPS = ("eltwise_add_core", "eltwise_mul_core", "eltwise_sub_core",
+                         "broadcast_mul", "broadcast_add")
+
+
+def _install_flop_meter(ue) -> dict:
+    """Sum the theoretical FLOPs of everything captured on ``ue`` (TEST_RESULT accounting only).
+
+    Wraps the op methods on this one engine instance; the instruction stream is untouched.
+    Only the outermost wrapped call counts, so an op built from other ops is not counted
+    twice, and nothing is counted outside start_capture()/stop_capture().  A count made
+    inside loop_start()/loop_end() is multiplied by the loop's ``loop_cnt``; a loop whose
+    trip count exists only in a register at run time is recorded in ``runtime_loops`` and
+    counted once (a lower bound).  ``start_queue_for_bf16_matvec_operation`` (returns
+    nothing) is counted as 2*K*N.  Ops outside these lists -- DMA copies, permutes,
+    transposes, softmax/exp -- add nothing, exactly as in the other models' counts.
+    Read ``meter["flops"]`` before and after compiling a program to get that program's FLOPs.
+    """
+    meter = getattr(ue, "_flop_meter", None)
+    if meter is not None:
+        return meter
+    meter = {"flops": 0, "depth": 0, "loops": [], "runtime_loops": 0}
+
+    def _counted(orig, count_of):
+        def counted(*args, **kwargs):
+            meter["depth"] += 1
+            try:
+                ret = orig(*args, **kwargs)
+            finally:
+                meter["depth"] -= 1
+            if meter["depth"] == 0 and getattr(ue, "is_capture_on", False):
+                n = count_of(ret, args, kwargs)
+                if isinstance(n, (int, float)) and not isinstance(n, bool):
+                    for trips in meter["loops"]:
+                        n *= trips
+                    meter["flops"] += n
+            return ret
+        return counted
+
+    def _element_size(ret, args, kwargs):
+        return kwargs["element_size"] if "element_size" in kwargs else (args[3] if len(args) > 3 else None)
+
+    def _matvec(ret, args, kwargs):
+        return 2 * kwargs["K"] * kwargs["N"] if ("K" in kwargs and "N" in kwargs) else None
+
+    for name in _FLOP_RETURNING_OPS:
+        if hasattr(ue, name):
+            setattr(ue, name, _counted(getattr(ue, name), lambda ret, args, kwargs: ret))
+    for name in _FLOP_PER_ELEMENT_OPS:
+        if hasattr(ue, name):
+            setattr(ue, name, _counted(getattr(ue, name), _element_size))
+    if hasattr(ue, "start_queue_for_bf16_matvec_operation"):
+        ue.start_queue_for_bf16_matvec_operation = _counted(ue.start_queue_for_bf16_matvec_operation, _matvec)
+
+    orig_loop_start, orig_loop_end = ue.loop_start, ue.loop_end
+
+    def loop_start(*args, **kwargs):
+        ret = orig_loop_start(*args, **kwargs)
+        trips = kwargs.get("loop_cnt", args[0] if args else 0)
+        if not (isinstance(trips, int) and trips > 0):
+            trips = 1
+            if meter["depth"] == 0:
+                meter["runtime_loops"] += 1
+        meter["loops"].append(trips)
+        return ret
+
+    def loop_end(*args, **kwargs):
+        ret = orig_loop_end(*args, **kwargs)
+        if meter["loops"]:
+            meter["loops"].pop()
+        return ret
+
+    ue.loop_start, ue.loop_end = loop_start, loop_end
+    ue._flop_meter = meter
+    return meter
+
+
+def _metered_flash_batched(fn):
+    """flash_attention_batched_pbi captures the attention body ONCE as a subroutine and calls it
+    ``num_batches`` times, so the FLOPs counted while it was captured run num_batches times."""
+    def metered(ue, *args, **kwargs):
+        meter = getattr(ue, "_flop_meter", None)
+        before = meter["flops"] if meter is not None else 0
+        ret = fn(ue, *args, **kwargs)
+        if meter is not None:
+            calls = kwargs["num_batches"] if "num_batches" in kwargs else args[0]
+            meter["flops"] += (meter["flops"] - before) * (calls - 1)
+        return ret
+    return metered
+
+
+flash_attention_batched_pbi = _metered_flash_batched(flash_attention_batched_pbi)
+
+
 def nms(boxes: torch.Tensor, scores: torch.Tensor, threshold: float):
     """Non-maximum suppression. Returns list of kept indices."""
     if boxes.numel() == 0:
@@ -2007,6 +2167,8 @@ class MobileSAM_UE(UnifiedEngine):
         _timer.start()
         self.start_execute_from_dram(prog_addr)
         self.wait_queue(timeout)
+        self.last_decoder_hw_us = self.report_latency_in_us()  # device latency counter of this run
+        self.decoder_hw_us_log = getattr(self, "decoder_hw_us_log", []) + [self.last_decoder_hw_us]
         _stop_timer = True
         _timer.join()
         import sys as _sys
@@ -2052,6 +2214,8 @@ class MobileSAM_UE(UnifiedEngine):
         _timer.start()
         self.start_execute_from_dram(prog_addr)
         self.wait_queue(timeout)
+        self.last_decoder_hw_us = self.report_latency_in_us()  # device latency counter of this run
+        self.decoder_hw_us_log = getattr(self, "decoder_hw_us_log", []) + [self.last_decoder_hw_us]
         _stop_timer = True
         _timer.join()
         import sys as _sys
@@ -3264,6 +3428,7 @@ class MobileSAM_UE(UnifiedEngine):
         _timer.start()
         self.start_execute_from_dram(prog)
         self.wait_queue(600.0)
+        self.last_encoder_hw_us = self.report_latency_in_us()  # device latency counter of this run
         _stop_timer = True
         _timer.join()
         _original_print(f"\r  Executing encoder: {time.perf_counter() - _t0:.1f}s")
@@ -4067,7 +4232,9 @@ class MobileSAM_UE(UnifiedEngine):
             ("encoder", enc_prog_addr, enc_size),
             ("decoder", dec_prog_addr, dec_size),
         ]
-        manifest = {"artifact_version": MOBILESAM_ARTIFACT_VERSION, "programs": {}}
+        # "flops": counted theoretical FLOPs per program, so a run from bins can report them.
+        manifest = {"artifact_version": MOBILESAM_ARTIFACT_VERSION, "programs": {},
+                    "flops": dict(getattr(self, "program_flops", {}) or {})}
         all_bytes = bytearray()
         CHUNK = 1 * 1024 * 1024
         for name, addr, size in programs:
@@ -4664,6 +4831,7 @@ def main():
     from PIL import Image as _PIL_Image
     import numpy as _np
     _img = _PIL_Image.open(os.path.join(SCRIPT_DIR, "../../test_samples/vette.jpg")).convert("RGB")
+    _img_orig_wh = _img.size
     _img = _img.resize((ENC_IN_W, ENC_IN_H), _PIL_Image.BILINEAR)
     _img_arr = torch.from_numpy(_np.array(_img)).float().permute(2, 0, 1) / 255.0
     image_t  = _img_arr.unsqueeze(0).bfloat16()
@@ -4716,6 +4884,11 @@ def main():
         progs = ue.load_programs()
         enc_prog = progs["encoder"]
         dec_prog = progs["decoder"]
+        try:   # counted FLOPs of the cached programs ({} for bins dumped before the count existed)
+            with open(os.path.join(BIN_DIR, "programs.json")) as f:
+                ue.program_flops = dict(json.load(f).get("flops") or {})
+        except (OSError, ValueError):
+            ue.program_flops = {}
         # Stitch on the decoder interface methods the rest of the flow expects
         import types
         def _preload(self, image_emb_t, image_pe_t, dense_t):
@@ -4737,6 +4910,8 @@ def main():
             _timer.start()
             self.start_execute_from_dram(prog_addr)
             self.wait_queue(timeout)
+            self.last_decoder_hw_us = self.report_latency_in_us()  # device latency counter of this run
+            self.decoder_hw_us_log = getattr(self, "decoder_hw_us_log", []) + [self.last_decoder_hw_us]
             _stop_timer = True
             _timer.join()
             _original_print(f"\r  Executing decoder: {time.perf_counter() - _t0:.1f}s")
@@ -4773,9 +4948,13 @@ def main():
         ue._conv_mreg = os.environ.get("CONV_MREG", "1") == "1"
         _original_print(f"  [bisect] reshape={ue._dec_pbi_reshape} convt={ue._dec_pbi_convt} "
                         f"conv={ue._enc_pbi_conv} dw={ue._enc_pbi_dw} win={ue._enc_pbi_win}")
+        _flop_meter = _install_flop_meter(ue)
+        _f0 = _flop_meter["flops"]
         enc_prog = ue.compile_encoder()
+        _f1 = _flop_meter["flops"]
         _original_print(f"\r  Encoder: 1 program  ({time.perf_counter() - _t0:.1f}s)")
         dec_prog = ue.compile_decoder()
+        ue.program_flops = {"encoder": int(_f1 - _f0), "decoder": int(_flop_meter["flops"] - _f1)}
         _stop_timer = True
         _timer.join()
         _original_print(f"  Decoder: done  ({time.perf_counter() - _t0:.1f}s total)")
@@ -4785,6 +4964,27 @@ def main():
         ue.dump_params_to_file(BIN_DIR)
         ue.dump_programs_to_file(enc_prog, dec_prog, BIN_DIR)
         _original_print("  Done saving bins.")
+
+    def _test_result(decoded_text: str, output: str, extra: dict = None) -> str:
+        """TEST_RESULT line. hw_s is the device latency counter read after each program run, gflop the
+        theoretical FLOPs counted while the program was compiled (kept in programs.json for runs from
+        bins); the decoder stage covers every decoder run of this invocation."""
+        flops = getattr(ue, "program_flops", {}) or {}
+        enc_us = getattr(ue, "last_encoder_hw_us", None)
+        dec_log = getattr(ue, "decoder_hw_us_log", [])
+        enc_f, dec_f = flops.get("encoder"), flops.get("decoder")
+        result = {"decoded_text": decoded_text}
+        result.update(_shared_report(
+            f"vette.jpg ({_img_orig_wh[0]}x{_img_orig_wh[1]}, resized to {ENC_IN_W}x{ENC_IN_H})", 1,
+            [("image_encoder", enc_us / 1e6 if enc_us is not None else None,
+              enc_f / 1e9 if enc_f is not None else None),
+             (f"mask_decoder_x{len(dec_log)}", sum(dec_log) / 1e6 if dec_log else None,
+              dec_f * len(dec_log) / 1e9 if (dec_f is not None and dec_log) else None)]))
+        result["output"] = output
+        result["decoder_runs"] = len(dec_log)
+        result["from_bin"] = bool(bins_exist)
+        result.update(extra or {})
+        return "TEST_RESULT:" + json.dumps(result)
 
     if args.debug_encode:
         if bins_exist:
@@ -4851,7 +5051,13 @@ def main():
             _original_print(f"  Saved {path}")
 
         _save_point_overlay((masks_hw[best] > _MASK_THRESHOLD).cpu().numpy(), "mask_point.png", [0, 255, 100])
-        _original_print(f"TEST_RESULT:{json.dumps({'decoded_text': f'mask_iou={iou_hw[best]:.4f}'})}")
+        _mask_px = int((masks_hw[best] > _MASK_THRESHOLD).sum().item())
+        _original_print(_test_result(
+            f"mask_iou={iou_hw[best]:.4f}",
+            f"point ({px}, {py}): best mask #{best} of 4, predicted IoU {iou_hw[best]:.4f}, "
+            f"{_mask_px} of {256 * 256} mask pixels set; saved mask_point.png",
+            {"point": [px, py], "mask_iou": round(float(iou_hw[best]), 4),
+             "iou_all": [round(float(x), 4) for x in iou_hw.tolist()], "mask_pixels": _mask_px}))
         return
 
     # ---- Execute (HW encoder + AMG decoder) ----
@@ -4878,7 +5084,9 @@ def main():
     # ---- Overlays ----
     _original_print("\nSaving overlays …")
     _save_amg_overlay(image_t, hw_masks,  "mask_hw.png")
-    _original_print(f"TEST_RESULT:{json.dumps({'decoded_text': f'{len(hw_masks)} masks'})}")
+    _original_print(_test_result(f"{len(hw_masks)} masks",
+                                 f"automatic mask generation (4x4 point grid): {len(hw_masks)} masks kept; "
+                                 f"saved mask_hw.png", {"n_masks": len(hw_masks)}))
 
 
 # ---------------------------------------------------------------------------

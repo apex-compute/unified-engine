@@ -3399,6 +3399,7 @@ class Gemma4LMMixin:
                 raise ValueError("max_new_tokens must be a positive integer")
             max_seq_len = min(max_seq_len, self.seq_len + limit)
         total_latency, total_flop_rate = 0, 0
+        total_flops_issued = 0   # sum of the per-token FLOP counts passed to the HW (accounting)
         # Single program (dynamic PBI). Ignore decoder_program_sizes length.
         prog_addr = decoder_base_addr
         flops_per_token_scalar = flops_per_token[0] if flops_per_token else None
@@ -3534,6 +3535,10 @@ class Gemma4LMMixin:
                     _w.wait_queue(300.0)
             total_latency += latency
             total_flop_rate += flop_rate_program
+            if total_flops_issued is not None and isinstance(live_flops_per_token, (int, float)):
+                total_flops_issued += live_flops_per_token
+            else:
+                total_flops_issued = None      # a step had no count: report no total
             # HW argmax of the streaming LM-head logits. When the head is
             # sharded, each engine's register holds an index into ITS OWN column
             # block and the hardware exposes no max VALUE, so the global winner is
@@ -3595,6 +3600,7 @@ class Gemma4LMMixin:
         self._decode_e2e_s = _elapsed
         self._decode_generated_n = _decoded_n
         self._decode_total_flop_rate = total_flop_rate
+        self._decode_total_flops = total_flops_issued
         self._decode_hw_latency_us = total_latency
         self._decoded_token_ids = list(_decoded_ids)
         # The last sampled token was never fed back, so its K/V is not in the

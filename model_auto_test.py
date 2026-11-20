@@ -1144,6 +1144,7 @@ def _parse_output(test: dict, stdout: str, returncode: int, elapsed: float) -> d
         "skipped": False,
         "passed": False,
         "pass_reason": "",
+        "report": {},
     }
 
     # Extract structured result from TEST_RESULT: <json> line emitted by the model script
@@ -1151,6 +1152,7 @@ def _parse_output(test: dict, stdout: str, returncode: int, elapsed: float) -> d
         if line.startswith("TEST_RESULT:"):
             try:
                 data = json.loads(line[len("TEST_RESULT:"):].strip())
+                result["report"] = data
                 result["prefill_tokens"]     = data.get("prefill_tokens")
                 result["decoded_text"]       = data.get("decoded_text", "")
                 result["decoded_tokens"]     = data.get("decoded_tokens")
@@ -1160,7 +1162,8 @@ def _parse_output(test: dict, stdout: str, returncode: int, elapsed: float) -> d
                 result["decoder_size_kb"]    = data.get("decoder_size_kb")
             except json.JSONDecodeError as e:
                 result["pass_reason"] = f"TEST_RESULT JSON parse error: {e}"
-            break
+            # no break: a script may print an early line and a fuller final one;
+            # the last one wins.
 
     # Pass check — run against the FULL captured stdout, not just the parsed
     # TEST_RESULT json. Most models don't emit a TEST_RESULT line yet, so stdout
@@ -1183,6 +1186,51 @@ def _parse_output(test: dict, stdout: str, returncode: int, elapsed: float) -> d
 # ---------------------------------------------------------------------------
 # Summary writer
 # ---------------------------------------------------------------------------
+
+# What every model's TEST_RESULT line should carry (key names are shared, the
+# rest of the line is free-form per model):
+#   input            what went in: prompt text, image / audio file, observation ...
+#   decoded_text     (LM / VLM / ASR) the text that came out
+#   output           (everything else) a one-line description of the result
+#   engines, peak_gflops
+#   stages           [{"name", "hw_s", "gflop", "gflops", "pct_peak"}, ...] in run order
+#   total_hw_s, total_gflop, avg_gflops, avg_pct_peak
+#   prefill_tokens, decoded_tokens, decode_first_tok_s, decode_avg_tok_s  (decoders)
+_REPORT_REQUIRED = ("input", "engines", "stages", "total_hw_s", "total_gflop", "avg_gflops")
+_REPORT_DECODER = ("prefill_tokens", "decoded_tokens", "decode_first_tok_s", "decode_avg_tok_s")
+_REPORT_HIDDEN = ("decoded_text", "generated_token_ids", "stages")
+
+
+def _report_lines(r: dict) -> list:
+    """The model's own TEST_RESULT fields, plus which of the expected ones are absent."""
+    report = r.get("report") or {}
+    if r.get("skipped"):
+        return []
+    lines = []
+    stages = report.get("stages") or []
+    if stages:
+        lines.append("  Stages         : name / hw s / GFLOP / GFLOP/s / % of peak")
+        for st in stages:
+            def _f(key, fmt):
+                v = st.get(key)
+                return format(v, fmt) if isinstance(v, (int, float)) else "-"
+            lines.append(f"    {str(st.get('name', '?')):<18} {_f('hw_s', '9.3f')} {_f('gflop', '10.2f')} "
+                         f"{_f('gflops', '8.2f')} {_f('pct_peak', '6.1f')}")
+    for key, value in report.items():
+        if key in _REPORT_HIDDEN or value is None:
+            continue
+        text = json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else str(value)
+        if len(text) > 200:
+            text = text[:200] + "..."
+        lines.append(f"  {key:<15}: {text}")
+    missing = [k for k in _REPORT_REQUIRED if report.get(k) in (None, "", [])]
+    if not (report.get("decoded_text") or report.get("output")):
+        missing.append("decoded_text/output")
+    if report.get("decoded_text") and report.get("decoded_tokens") is not None or report.get("prefill_tokens") is not None:
+        missing += [k for k in _REPORT_DECODER if report.get(k) is None]
+    lines.append(f"  Report missing : {', '.join(missing) if missing else 'nothing'}")
+    return lines
+
 
 def write_summary(results: list, output_path: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1235,6 +1283,7 @@ def write_summary(results: list, output_path: str) -> None:
             f"  Decode speed   : {decode_spd}",
             f"  Program size   : prefill={prefill_kb}  decoder={decoder_kb}",
             f"  Total time     : {r['elapsed_s']:.1f}s",
+            *_report_lines(r),
             "",
         ]
 

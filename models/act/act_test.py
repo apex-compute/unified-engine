@@ -531,6 +531,7 @@ class ACT_UnifiedEngine(UnifiedEngine):
         with open(os.path.join(d, "meta.json"), "w") as f:
             json.dump({"engines": self.NE, "primary_addr": program_addr, "primary_size": size,
                        "num_instructions": self.last_num_instructions, "workers": workers,
+                       "flops": getattr(self, "_flops", None),      # model FLOPs of this program (TEST_RESULT)
                        "consts_offset": tail0, "consts_size": tail1 - tail0,
                        "stamp": self._weights_stamp(),
                        "controller_replicas": self._controller_replicas.manifest()}, f)
@@ -558,6 +559,7 @@ class ACT_UnifiedEngine(UnifiedEngine):
         n = self._dma_load(addr, os.path.join(d, "primary.bin"))
         self.allocate_program_dram(n)
         self.last_num_instructions = meta.get("num_instructions", 0)
+        self._flops = meta.get("flops")     # None for a cache dumped before the count was persisted
         self.worker_progs = []
         if self.sched is not None:
             for i, w in enumerate(self.sched.workers):
@@ -1200,6 +1202,7 @@ class ACT_UnifiedEngine(UnifiedEngine):
         self.start_execute_from_dram(program_addr)
         self.wait_queue(timeout)
         self.last_inference_seconds = time.perf_counter() - t0
+        self.last_device_seconds = self.report_latency_in_us() / 1e6     # device latency counter (primary)
         out = self._read_bf16(self.ACT_OUT, self.CHP * 64).reshape(self.CHP, 64)
         return out[:self.CHUNK, :self.ACTION_DIM].numpy()
 
@@ -1401,9 +1404,11 @@ def main():
 
     actions = ue.run(ref["images"], ref["state"], prog_addr)
     times = [ue.last_inference_seconds]
+    dev_times = [ue.last_device_seconds]
     for _ in range(args.runs):
         ue.run(ref["images"], ref["state"], prog_addr)
         times.append(ue.last_inference_seconds)
+        dev_times.append(ue.last_device_seconds)
     _original_print(f"  Inference (pure HW): first {times[0] * 1000:.1f} ms, "
                     f"steady {np.median(times[1:]) * 1000 if len(times) > 1 else float('nan'):.1f} ms")
 
@@ -1449,6 +1454,28 @@ def main():
         _original_print(f"\n  Action chunk ({ue.CHUNK} x {ue.ACTION_DIM}), first {args.rows} rows, HW:")
         for t in range(min(args.rows, ue.CHUNK)):
             _original_print(f"  t={t:3d}  {actions[t]}")
+    # ---- shared report keys (model_auto_test.py). One fused program = one stage. hw_s is the
+    # device latency counter (median of the steady runs, like hw_ms; first run if --runs 0);
+    # gflop is the compile-time model FLOP count of that program (matmuls, attention and conv
+    # matvecs -- norms / elementwise ops are not counted, same as --profile).
+    hw_s = float(np.median(dev_times[1:]) if len(dev_times) > 1 else dev_times[0])
+    flops = getattr(ue, "_flops", None)
+    gflop = flops / 1e9 if flops is not None else None
+    gflops = gflop / hw_s if (gflop is not None and hw_s > 0) else None
+    peak = user_dma_core.CORE_CLOCK_FREQ_HZ * 128 / 1e9 * args.engines if user_dma_core.CORE_CLOCK_FREQ_HZ else None
+    pct = 100.0 * gflops / peak if (gflops is not None and peak) else None
+    src = "act_bin/reference.npz (act_export.py)" if os.path.exists(ref_path) else "generate_inputs(seed=0)"
+    results["input"] = (f"observation from {src}: {ue.N_CAMS} camera images 3x{ue.IMG_H}x{ue.IMG_W} + "
+                        f"state[{ue.STATE_DIM}]; weights act_bin/act_weights.pt")
+    results["output"] = (f"action chunk {actions.shape[0]}x{actions.shape[1]}, min {float(np.nanmin(actions)):.4f} "
+                         f"max {float(np.nanmax(actions)):.4f}, finite={results['actions_finite']}"
+                         + (f", SNR {results['actions_snr_db']:.1f} dB vs CPU reference" if has_ref else ""))
+    results.update({
+        "engines": args.engines, "peak_gflops": peak,
+        "stages": [{"name": "act (resnet x2cam + encoder + decoder, one program)", "hw_s": hw_s, "gflop": gflop,
+                    "gflops": gflops, "pct_peak": pct}],
+        "total_hw_s": hw_s, "total_gflop": gflop, "avg_gflops": gflops, "avg_pct_peak": pct,
+        "hw_runs": len(dev_times), "first_hw_s": float(dev_times[0])})
     _original_print("TEST_RESULT:" + json.dumps(results))
 
 
