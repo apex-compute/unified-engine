@@ -962,6 +962,17 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
                        "fc1": [node(f"{li}.fc1.{i}") for i in range(2)], "fc2": [node(f"{li}.fc2.{i}") for i in range(2)]},
             })
         self.l_st = sorted(self.l_st)
+        sums = {}               # the on-chip sum leaves: one fp16 buffer set per op, reused by every layer.
+        #                         In the weight region: at level 2 they are ~280 MB, more than the tensor arena has left.
+
+        def room(elements):
+            return self.allocate_params_dram(elements * BPE, align_bytes=128)
+        for lw in self.lw["layers"]:
+            for nd in [x for v in lw["st"].values() for x in (v if isinstance(v, list) else [v]) if x]:
+                if nd["slot"] not in sums:
+                    sums[nd["slot"]] = [room(nd["n"] * nd["k"]) for _ in range(strassen_online_sum_count(nd["L"]))]
+                nd["sums"] = sums[nd["slot"]]
+                nd["tree"] = strassen_online_tree(nd["cells"], nd["sums"], nd["L"])
         note = f", Strassen online leaves (K, N, level): {self.l_st}" if self.l_st else ""
         print(f"LM weights stored (IF4{note}): params DRAM {self.get_params_dram_usage() / 2**20:.0f} MB")
 
@@ -1017,13 +1028,6 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         self._palloc("SCORE", S * S)
         self._palloc("SQ", S * HD)
         self._st_scratch("SL", [(-(-P // self.NE), K, N, L) for K, N, L in self.l_st if L])     # prefill rows per engine
-        sums = {}               # the on-chip sum leaves: one fp16 buffer set per op, reused by every layer
-        for lw in self.lw["layers"]:
-            for nd in [x for v in lw["st"].values() for x in (v if isinstance(v, list) else [v]) if x]:
-                if nd["slot"] not in sums:
-                    sums[nd["slot"]] = [self._alloc(nd["n"] * nd["k"]) for _ in range(strassen_online_sum_count(nd["L"]))]
-                nd["sums"] = sums[nd["slot"]]
-                nd["tree"] = strassen_online_tree(nd["cells"], nd["sums"], nd["L"])
         # Zeroed: slots no stage ever writes are masked, but still flow through V^T and P.V.
         kv = LML * KVH * CAP * HD
         b["KC"], b["VC"] = self._alloc(kv, zero=True), self._alloc(kv, zero=True)
