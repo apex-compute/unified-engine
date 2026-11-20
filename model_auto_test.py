@@ -697,15 +697,15 @@ TESTS = [
     # tokens, while the vision cache keys only on kernel + engine count.
     # All three gemma4 entries run on every engine the board has, up to 8 (the
     # tiled map's count): --multi-core min(cores, 8) via "multi_core_max", e.g.
-    # 2 on the Kintex7 CI board, 8 on an Alveo. E4B needs at least 2: its
-    # weights do not fit the single-engine model map. Decode is capped at 128
+    # 2 on the Kintex7 CI board, 8 on an Alveo. On one engine E4B picks its wide
+    # single-engine map by itself (context 2048). Decode is capped at 128
     # tokens: the checks only need a coherent opening with the scene words, and
     # an 8192-token context would otherwise let a description run for ~20 min
     # on Kintex.
     {"name": "gemma4_e2b", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vlm, "extra_args": ["--image", "--max-new-tokens", "128"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
     {"name": "gemma4_e2b_run_from_bin", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "128"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
-    {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--image", "--max-new-tokens", "128"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8, "minimum_engines": 2},
-    {"name": "gemma4_e4b_run_from_bin", "script": "models/gemma4_e4b/gemma4_e4b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "128"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8, "minimum_engines": 2},
+    {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--image", "--max-new-tokens", "128"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
+    {"name": "gemma4_e4b_run_from_bin", "script": "models/gemma4_e4b/gemma4_e4b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "128"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
     {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
     {"name": "qwen3_0.6b",  "script": "models/qwen3_0.6b/qwen3_0.6b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
@@ -730,7 +730,7 @@ TESTS = [
     # before its run like every other model; smolvlm2_test.py zeroes DRAM itself
     # at startup (ue.zero_dram()) before loading weights. Remove that self-zero
     # once the read-before-write gap is fixed.
-    {"name": "smolvlm2", "script": "models/smolvlm2/smolvlm2_test.py", "pass_check": _check_smolvlm2, "mode": "VLM", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image. (default)"},
+    {"name": "smolvlm2", "multi_engine_default": True, "script": "models/smolvlm2/smolvlm2_test.py", "pass_check": _check_smolvlm2, "mode": "VLM", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image. (default)"},
     # TODO: SMOLVLM2 LM PATH IS BUGGY — restore the smolvlm2_lm auto-test only after it is fixed.
 
     # Vision / detection models: no --prompt; emit detections / class labels parsed
@@ -760,7 +760,7 @@ TESTS = [
 
     # act (LeRobot ACT): 2 cams + 7-dof -> [chunk, 14] actions, SNR vs CPU reference.
     # --engines is added by the harness generically. Caches params/programs in act_bin/.
-    {"name": "act",     "script": "models/act/act_test.py",         "pass_check": _check_act},
+    {"name": "act", "multi_engine_default": True,     "script": "models/act/act_test.py",         "pass_check": _check_act},
     # alpamayo2_edge (NVIDIA Alpamayo 2 Edge, driving VLA): 22 camera frames -> SigLIP2 vision
     # -> 4-bit LM prefill + decode -> flow-matching action expert -> 6.4 s trajectory, checked
     # against the device-equivalent host reference. Needs the 8-engine / 8 GiB layout; about
@@ -782,10 +782,10 @@ TESTS = [
     # engine count and the compiler source). The first entry decodes the VAE on the host
     # (standard image); the second runs all three phases on the FPGA and needs the CONV2D
     # queue-config image like the conv models below.
-    {"name": "flux2_klein_4b", "script": "models/flux2_klein_4b/flux2_klein_4b_test.py", "pass_check": _check_flux2,
+    {"name": "flux2_klein_4b", "multi_engine_default": True, "script": "models/flux2_klein_4b/flux2_klein_4b_test.py", "pass_check": _check_flux2,
      "extra_args": ["--height", "256", "--width", "256", "--max-seq-len", "128", "--vae", "host"],
      "mode": "T2I (TE+DiT on FPGA, VAE host)", "prompt_desc": "A photo of a red sports car on a mountain road at sunset (default)"},
-    {"name": "flux2_klein_4b_vae", "script": "models/flux2_klein_4b/flux2_klein_4b_test.py", "pass_check": _check_flux2,
+    {"name": "flux2_klein_4b_vae", "multi_engine_default": True, "script": "models/flux2_klein_4b/flux2_klein_4b_test.py", "pass_check": _check_flux2,
      "extra_args": ["--height", "256", "--width", "256", "--max-seq-len", "128", "--vae", "fpga"],
      "mode": "T2I (all phases on FPGA)", "prompt_desc": "A photo of a red sports car on a mountain road at sunset (default)",
      "requires_conv_image": True},
@@ -1020,6 +1020,18 @@ def run_test(test: dict, verbose: bool = False,
             result = _parse_output(test, "", 0, 0.0)
             result.update(passed=True, skipped=True, pass_reason=reason)
             return result
+
+    # A pinned single-engine pass (UE_CI_ENGINES below the entry's need) skips the
+    # entries that only run multi-engine: the ones with "minimum_engines", and the
+    # ones whose script picks several engines by default ("multi_engine_default").
+    _pinned = os.environ.get("UE_CI_ENGINES")
+    _needed = minimum_engines or required_engines or (2 if test.get("multi_engine_default") else None)
+    if _pinned and _pinned.isdigit() and _needed and max(1, int(_pinned)) < _needed:
+        reason = f"runs on >={_needed} engines; UE_CI_ENGINES={_pinned} selects fewer"
+        print(f"SKIP         : {reason}\n", flush=True)
+        result = _parse_output(test, "", 0, 0.0)
+        result.update(passed=True, skipped=True, pass_reason=reason)
+        return result
 
     if test.get("requires_conv_image") and os.environ.get("UE_CI_CONV_IMAGE") != "1":
         reason = ("needs the CONV2D/MAXPOOL queue-CONFIG bitstream; set UE_CI_CONV_IMAGE=1 "
