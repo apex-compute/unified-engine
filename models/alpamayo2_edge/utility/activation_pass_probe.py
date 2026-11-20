@@ -12,13 +12,19 @@ on one buffer of known values:
   B  add zero      an elementwise add of a zero buffer with the activation fields set
   C  identity dot  an on-chip identity matrix-vector product per 64 values with the activation
                    fields set (the matmul epilogue, without the DRAM round trip)  <- slower fallback
+  D  looped C      nn_lib._strassen_activate in place on a DRAM buffer: route C with the products
+                   in a hardware loop (STRASSEN_ACTIVATE_LOOPED 1 = rows, 2 = rows and pieces)
+                   against its unrolled form (0), on the full buffer and on a multi-piece one
 
 for GELU (x * sigmoid(1.702 x), the hardware's), SiLU and ReLU. Per method and activation it says
 WORKS (the result is the activation), IGNORED (the result is x: the field does nothing there) or
 WRONG, with the SNR against the host and the time per value. RESULT: PASS means the probe itself
-ran cleanly and the baseline is exact; which routes work is the table above it.
+ran cleanly, the baseline is exact and every route D program returns the activation (30 dB or
+more, as good as the unrolled form); which of the routes A-C work is the table above it. Route D
+prints the size of every program (instructions, bytes at 32 B per instruction).
 
   python models/alpamayo2_edge/utility/activation_pass_probe.py
+  python models/alpamayo2_edge/utility/activation_pass_probe.py --looped-only     # baseline and route D
 """
 import argparse
 import os
@@ -40,6 +46,7 @@ def snr(ref, x):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--elements", type=int, default=65536, help="values in the buffer (a multiple of 64, at most 65536)")
+    ap.add_argument("--looped-only", action="store_true", help="skip routes A-C")
     ap.add_argument("--dev", default=None)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -49,6 +56,7 @@ def main():
 
     sys.path.insert(0, HERE)
     import alpamayo2_edge_test as T
+    import nn_lib
     import user_dma_core
     from storage_format import StorageFormat, TensorFormats
     from user_dma_core import BROADCAST_MODE, UE_MODE, URAM_SECTION, URAM_WRITE_SRC
@@ -120,7 +128,7 @@ def main():
     NC = min(rows, 128)                                        # route C is one op per 64 values: time a part of the buffer
     table, crashed = [], None
     try:
-        for act, fn in ACTS.items():
+        for act, fn in ({} if args.looped_only else ACTS).items():
             want = fn(xd)
             for route, label, emit, n, src, loads in (
                     ("A broadcast", f"A: x * 1.0 with {act}", lambda act=act: broadcast(act), E, 0x00000, ("x",)),
@@ -147,6 +155,50 @@ def main():
         print(f"    {route:16s} " + (f"{', '.join(ok)} at about {sum(ns) / len(ns):.2f} ns per value" if ok else "nothing"))
     if crashed:
         print(f"\nRESULT: FAIL (stopped in '{crashed}'; if it was a timeout the board needs a reset)")
+        return 1
+
+    # Route D: the kernel's own pass, in place on DRAM, looped against unrolled.
+    KW = {"gelu": {"gelu_enable": True}, "silu": {"silu_enable": True},
+          "relu": {"clamp_enable": True, "clamp_min": 0.0, "clamp_max": float("inf")}}
+    FORMS = ((0, "unrolled"), (1, "rows looped"), (2, "rows + pieces looped"))
+    keep, d_bad = nn_lib.STRASSEN_ACTIVATE_LOOPED, []
+    print(f"\n  route D: nn_lib._strassen_activate in place (time includes its loads and stores)")
+    print(f"  {'values':>8} {'activation':10s} {'program':22s} {'instr':>7} {'bytes':>9} {'SNR vs activation':>18} {'SNR vs unrolled':>16} {'ns per value':>13}")
+    try:
+        for n in (E, 3 * 65536 + 4096):                         # one piece; three full pieces and a short last one
+            xn = (torch.randn(n, generator=torch.Generator().manual_seed(args.seed + 1)) * 2.0).to(FP)
+            a_buf = ue._alloc(n)
+            for act, fn in ACTS.items():
+                want, first = fn(xn.double()), None
+                for form, name in FORMS:
+                    crashed = f"D: {name}, {act}, {n} values"
+                    print(f"  running: {crashed} ...", flush=True)
+                    ue.dma_to_accelerator_memory(a_buf, xn)
+                    nn_lib.STRASSEN_ACTIVATE_LOOPED = form
+                    count = [0]
+
+                    def body(act=act, a_buf=a_buf, n=n, count=count):
+                        nn_lib._strassen_activate(ue, a_buf, n, KW[act], a_eye, B16)
+                        count[0] = ue.capture_count
+                    us = ue._run_transient(body, 60.0)
+                    y = ue.dma_from_accelerator_memory(a_buf, (n,)).double()
+                    first = y if first is None else first
+                    good, same = snr(want, y), snr(first, y)
+                    ok = bool(torch.isfinite(y).all()) and good >= 30 and (form == 0 or same >= good - 1)
+                    if not ok:
+                        d_bad.append(crashed)
+                    print(f"  {n:8d} {act:10s} {name:22s} {count[0]:7d} {count[0] * 32:9d} {good:15.1f} dB {same:13.1f} dB "
+                          f"{us * 1e3 / n:13.2f}  {'ok' if ok else 'BAD'}", flush=True)
+        crashed = None
+    except Exception:
+        traceback.print_exc()
+    finally:
+        nn_lib.STRASSEN_ACTIVATE_LOOPED = keep
+    if crashed:
+        print(f"\nRESULT: FAIL (stopped in '{crashed}'; if it was a timeout the board needs a reset)")
+        return 1
+    if d_bad:
+        print(f"\nRESULT: FAIL (route D wrong in: {'; '.join(d_bad)})")
         return 1
     print("\nRESULT: " + ("PASS" if base_ok else "FAIL (the baseline pass does not return x)"))
     return 0 if base_ok else 1
