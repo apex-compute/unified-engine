@@ -112,11 +112,13 @@ PRIVATE_TENSOR_BYTES = 128 << 20   # per engine: vision scratch (~43 MB) + atten
 PRIVATE_ISA_BYTES = 256 << 20      # per engine: its share of the unrolled vision program dominates
 ZERO_CHUNK = 1 << 26               # elements per zero-fill DMA
 
-# Strassen matmuls (nn_lib §10, fp16 intermediates). On by default at level 1 for the bf16 matmuls
-# it helps and that carry no fused activation: vision o_proj and fc2, projector fc2 (board, o + fc2:
-# 73.2 -> 72.6 s, same tokens and trajectory). --strassen-level 0 turns it off, --strassen-ops picks
-# the layers. These module values are the default for every user of this file (the sim driver too).
-ST_DEFAULT_OPS = ("v.o", "v.fc2", "pj.fc2")
+# Strassen matmuls (nn_lib §10, fp16 intermediates). On by default: vision o_proj and fc2 and
+# projector fc2 at level 1 (bf16, stored leaves), and the six prefill matmuls (4-bit, online
+# leaves, see ST_LM_LEVEL). Board, 8 engines, one plan: 73.2 s plain -> 72.5 s with the vision
+# ops -> 69.6 s with the prefill too, same tokens and trajectory. --strassen-level 0 turns it off,
+# --strassen-ops / A2E_STRASSEN_OPS pick the layers. These module values are the default for
+# every user of this file (the sim driver too).
+ST_DEFAULT_OPS = ("v.o", "v.fc2", "pj.fc2", "lm.q", "lm.k", "lm.v", "lm.o", "lm.fc1", "lm.fc2")
 ST_LEVEL = 1 if strassen_levels is not None else 0
 ST_OPS, ST_MIN_ROWS = (ST_DEFAULT_OPS if ST_LEVEL else ()), 64
 PJ_ST_ROWS = 384        # most projector rows one Strassen call takes (bounds its private scratch)
@@ -134,11 +136,10 @@ if ST_LEVEL and os.environ.get("A2E_STRASSEN_OPS"):     # for users of this file
     ST_OPS = tuple(o for o in os.environ["A2E_STRASSEN_OPS"].split(",") if o)
     assert all(o in ST_ALL_OPS for o in ST_OPS), f"A2E_STRASSEN_OPS: unknown entry in {ST_OPS}"
     print(f"Strassen on {', '.join(ST_OPS)} (A2E_STRASSEN_OPS)")
-# The extra weight copies need room, so with Strassen on the tensor and program regions move up:
-# weights 2752 MB (the default ops use 2498), tensors keep 1024 MB, programs 320 MB. The frame-cache
-# path (sim/edge_device_cached.py) compiles extra vision programs and keeps a reserve, so the
-# programs cannot be squeezed to the ~50 MB one plan needs. Strassen on the prefill (lm.*) needs
-# more weight room than this leaves.
+# The vision leaf copies and the prefill sum buffers need room, so with Strassen on the tensor
+# and program regions move up: weights 2752 MB (the default ops use 2731), tensors keep 1024 MB,
+# programs 320 MB (one plan: 80 MB on the primary, 87 MB in a worker's private window). The
+# frame-cache path (sim/edge_device_cached.py) compiles extra vision programs and keeps a reserve.
 ST_LAYOUT = {"tensor_dram_base": 0xAC000000, "program_dram_base": 0xEC000000}
 
 
