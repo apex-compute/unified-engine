@@ -78,7 +78,7 @@ from user_dma_core import DRAM_INSTRUCTION_ADDR, TYPE, UE_MODE, UE_VECTOR_SIZE, 
 from multi_engine_shard import MultiEngineScheduler, PrivateArena, model_multicore_layout
 from nn_lib import eltwise_add_core_dram, layer_norm_core_dram_post_add
 try:        # nn_lib §10 (Strassen matmul) arrives with its own PR; without it every matmul is the plain one
-    from nn_lib import (strassen_if4_cells, strassen_levels, strassen_matmul_core_dram, strassen_online_items,
+    from nn_lib import (strassen_if4_slab_cells, strassen_levels, strassen_matmul_core_dram, strassen_online_items,
                         strassen_online_sum_count, strassen_online_sums_core, strassen_online_tree, strassen_weight_tree)
 except ImportError:
     strassen_levels = strassen_matmul_core_dram = strassen_weight_tree = None
@@ -123,9 +123,13 @@ PJ_ST_ROWS = 384        # most projector rows one Strassen call takes (bounds it
 ST_LAYERS = None        # None: every layer. --probe: only the probed layer gets Strassen weights (level 3 of all does not fit)
 st_on = lambda li: ST_LAYERS is None or li in ST_LAYERS
 ST_ALL_OPS = ("v.o", "v.fc2", "pj.fc2", "lm.q", "lm.k", "lm.v", "lm.o", "lm.fc1", "lm.fc2")
-# lm.* (prefill, 4-bit) uses online leaves: the IF4 weight is stored a second time as its 4^level
-# cells (decode keeps the whole weight) and the board makes the sum leaves before each run of
-# matmuls, in one fp16 buffer set per op that every layer reuses. lm.fc1 carries its ReLU.
+# lm.* (prefill, 4-bit) uses online leaves at the levels of ST_LM_LEVEL, whatever --strassen-level
+# says: the IF4 weight is stored once, as 2^level input-column slabs, the Strassen cells are row
+# ranges of the slabs, and the board makes the sum leaves before each run of matmuls, in one fp16
+# buffer set per op that every layer reuses. Decode reads the same slabs, one dot per slab,
+# summed (_mm_slabs). lm.fc1 carries its ReLU. Board, one prefill layer, all six ops: 1350 ->
+# 1235 ms; q / o gain the same at level 1 and 2 (0.94x), fc1 / fc2 more at level 2 (0.85x vs 0.91x).
+ST_LM_LEVEL = {"q": 1, "k": 1, "v": 1, "o": 1, "fc1": 2, "fc2": 2}
 # The extra weight copies need room, so with Strassen on the tensor and program regions move up:
 # weights 2752 MB (the default ops use 2498), tensors keep 1024 MB, programs 320 MB. The frame-cache
 # path (sim/edge_device_cached.py) compiles extra vision programs and keeps a reserve, so the
@@ -937,30 +941,31 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         w, st, q = ref.w, self._store, self._qstore
         self.l_st = set()
 
-        def node(key):
-            """The Strassen cells of one prefill weight (online leaves), or None."""
+        def weight(key):
+            """-> (weight, Strassen node or None). Plain: the IF4 pack as it is. With Strassen:
+            the pack as input-column slabs (a list) and its cells as row ranges of them."""
             li, slot = key.split(".", 1)
             data, scales, N, K = packs[key]
-            L = st_level(K, N) if f"lm.{slot.split('.')[0]}" in ST_OPS and st_on(int(li)) else 0
+            op = slot.split(".")[0]
+            L = strassen_levels(K, N, ST_LM_LEVEL[op]) if ST_LEVEL and f"lm.{op}" in ST_OPS and st_on(int(li)) else 0
             if not L:
-                return None
+                return q(packs[key]), None
             self.l_st.add((K, N, L))
-            cells = strassen_if4_cells(data, scales, N, K, L, lambda d, s_, n, k, t=None: q((d, s_, n, k)))
-            return {"L": L, "scr": "SL", "cells": cells, "n": N >> L, "k": K >> L, "slot": slot}
+            slabs, cells = strassen_if4_slab_cells(data, scales, N, K, L, lambda d, s_, n, k, t=None: q((d, s_, n, k)))
+            return slabs, {"L": L, "scr": "SL", "cells": cells, "n": N >> L, "k": K >> L, "slot": slot}
         self.lw = {"norm": st(w[LM + "norm.weight"]), "head": q(packs["head"]), "layers": []}
         for li in range(LML):
             p = f"{LM}layers.{li}."
+            ws = {name: weight(f"{li}.{name}") for name in ("q", "k", "v", "o")}
+            fc = {name: [weight(f"{li}.{name}.{i}") for i in range(2)] for name in ("fc1", "fc2")}
             self.lw["layers"].append({
                 "ln1": st(w[p + "input_layernorm.weight"]), "ln2": st(w[p + "post_attention_layernorm.weight"]),
-                "q": q(packs[f"{li}.q"]), "k": q(packs[f"{li}.k"]), "v": q(packs[f"{li}.v"]), "o": q(packs[f"{li}.o"]),
-                "fc1": [q(packs[f"{li}.fc1.{i}"]) for i in range(2)],
-                "fc2": [q(packs[f"{li}.fc2.{i}"]) for i in range(2)],
-                "st": {"q": node(f"{li}.q"), "k": node(f"{li}.k"), "v": node(f"{li}.v"), "o": node(f"{li}.o"),
-                       "fc1": [node(f"{li}.fc1.{i}") for i in range(2)], "fc2": [node(f"{li}.fc2.{i}") for i in range(2)]},
+                **{name: ws[name][0] for name in ws}, **{name: [x[0] for x in fc[name]] for name in fc},
+                "st": {**{name: ws[name][1] for name in ws}, **{name: [x[1] for x in fc[name]] for name in fc}},
             })
         self.l_st = sorted(self.l_st)
         sums = {}               # the on-chip sum leaves: one fp16 buffer set per op, reused by every layer.
-        #                         In the weight region: at level 2 they are ~280 MB, more than the tensor arena has left.
+        #                         In the weight region (~245 MB at ST_LM_LEVEL): the tensor arena has no room for them.
 
         def room(elements):
             return self.allocate_params_dram(elements * BPE, align_bytes=128)
@@ -1025,6 +1030,7 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         self._palloc("SCORE", S * S)
         self._palloc("SQ", S * HD)
         self._st_scratch("SL", [(-(-P // self.NE), K, N, L) for K, N, L in self.l_st if L])     # prefill rows per engine
+        self._palloc("SLAB", LI // 2)                   # _mm_slabs: the running sum's second buffer (widest output)
         # Zeroed: slots no stage ever writes are masked, but still flow through V^T and P.V.
         kv = LML * KVH * CAP * HD
         b["KC"], b["VC"] = self._alloc(kv, zero=True), self._alloc(kv, zero=True)
@@ -1127,6 +1133,24 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         if r is not None:
             ue.release_isa_reg()
 
+    def _mm_slabs(self, E, n, K, N, c0, cn, A, slabs, OUT, act):
+        """Plain matmul, output columns [c0, c0 + cn) of N, against a weight stored as input-column
+        slabs: one row at a time, one 1-pass quantized dot per slab, each taking the sum so far
+        as a full-matrix bias (two buffers, ping-pong, ending in OUT); the activation goes on the
+        last. This is decode (board: +0.87 ms per token at 4 slabs, +0.37 at 2); in prefill only
+        the rows Strassen leaves over."""
+        g, k, part = len(slabs), K // len(slabs), self.pbuf[E.e]["SLAB"]
+        self._flops_acc += 2 * n * K * cn
+        for r in range(n):
+            out = OUT + (r * N + c0) * BPE
+            for j, slab in enumerate(slabs):
+                wd, ws = self._wshard(slab, k, c0)
+                dst, prev = (out, part) if (g - 1 - j) % 2 == 0 else (part, out)
+                E.ue.quantized_matmat_core(M=1, K=k, N=cn, A_DRAM_ADDR=A + (r * K + j * k) * BPE, B_DRAM_ADDR=wd,
+                                           OUTPUT_DRAM_ADDR=dst, SCALE_DRAM_ADDR=ws, data_type=TYPE.IF4,
+                                           **(dict(C_DRAM_ADDR=prev, bias_mode="full_matrix") if j else {}),
+                                           **(act if j == g - 1 else {}))
+
     @staticmethod
     def _gather(ue, src, col, ncols, rows, dst, rows_per_chunk=1024):
         """Column `col` (128 lanes) of a token-major [rows, ncols*128] buffer -> contiguous [rows, 128]."""
@@ -1191,13 +1215,19 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         S = wl.get("st", {})
 
         def mm(label, K, N, A, W, OUT, st=None, **act):
+            def plain(E, n, c0, cn, a, out):                             # a, out: the first of the n rows
+                if isinstance(W, list):                                   # a weight stored as slabs (Strassen layers)
+                    self._mm_slabs(E, n, K, N, c0, cn, a, W, out, act)
+                else:
+                    self._mmw(E, n, K, cn, a, self._wshard(W, K, c0), out + c0 * BPE,
+                              out_stride=N if (cn < N and n > 1) else None, **act)
+
             def fn(E, r0, n, c0, cn):
                 if st is not None and cn == N and n >= ST_MIN_ROWS:       # prefill rows; decode / expert stay plain
                     self._st_rows(E, n, K, N, A + r0 * K * BPE, st, OUT + r0 * N * BPE,
-                                  lambda rows, a, o: self._mmw(E, rows, K, N, a, W, o, **act), act)
+                                  lambda rows, a, o: plain(E, rows, 0, N, a, o), act)
                     return
-                self._mmw(E, n, K, cn, A + r0 * K * BPE, self._wshard(W, K, c0), OUT + (r0 * N + c0) * BPE,
-                          out_stride=N if (cn < N and n > 1) else None, **act)
+                plain(E, n, c0, cn, A + r0 * K * BPE, OUT + r0 * N * BPE)
             fn.st = st              # _emit_ops makes its weight sums before the round that runs it
             ops.append((f"{L}.{label}", ("mm", N), fn, OUT, (M, N)))
 
@@ -1359,8 +1389,13 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
     def _ops_as_steps(self, ops, M):
         """The op table as single-engine staged steps (full rows, full columns)."""
         E0 = self.eng[0]
-        return [(label, lambda fn=fn, k=k: fn(E0, 0, M, 0, k[1] if k[0] == "mm" else None), addr, shape)
-                for label, k, fn, addr, shape in ops]
+
+        def step(fn, k):
+            nd = getattr(fn, "st", None)
+            if nd and M >= ST_MIN_ROWS:                 # Strassen online leaves: this op's weight sums first
+                strassen_online_sums_core(E0.ue, nd["cells"], nd["n"], nd["k"], nd["sums"], nd["L"])
+            fn(E0, 0, M, 0, k[1] if k[0] == "mm" else None)
+        return [(label, lambda fn=fn, k=k: step(fn, k), addr, shape) for label, k, fn, addr, shape in ops]
 
     # ---------------------------------------------------------------- LM: compile
 
