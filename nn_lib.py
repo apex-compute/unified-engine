@@ -1322,32 +1322,31 @@ def flash_attention_batched_pbi(
 # =============================================================================
 # §10 Strassen matmul (optional drop-in for one large matmul)
 # =============================================================================
-# C [M, N] = X [M, K] . W^T (+ bias) as 7 half-size products instead of 8, nested `levels` deep:
-# (7/8)^levels of the matmul work for (7/4)^levels of the weight storage. Input and output are
-# ordinary row-major bf16 tensors, so it replaces one matmat_mul_core call.
-# Measurements and where it pays: CHANGELOG.md, "Strassen matmul".
+# C [M, N] = act(X [M, K] . W^T + bias) as 7 half-size products instead of 8, nested `levels`
+# deep: (7/8)^levels of the matmul work. Input and output are ordinary row-major bf16 tensors, so
+# it replaces one matmat_mul_core call. Measurements and where it pays: CHANGELOG.md, "Strassen matmul".
 #
 # USE
-#   L    = strassen_levels(K, N, wanted)                       # deepest level the shape allows
-#   tree = strassen_weight_tree(W, b, L, store_w, store_b)     # host, once: a bf16 layer
-#     or   strassen_weight_tree_if4(data, scales, N, K, b, L, store_pack, store_b)   # a 4-bit layer
-#     or   online leaves, no extra weight storage (see "online leaves" below):
-#          cells = strassen_if4_cells(...) or strassen_bf16_cells(...)          # host, once
-#          tree  = strassen_online_tree(cells, sum_addrs, L, b, store_b)
-#          strassen_online_sums_core(ue, cells, n, k, sum_addrs, L)             # emitted before the matmul
-#   scr  = [(x_addr, p_addr), ...]                             # one pair per depth, sized by
+#   L = strassen_levels(K, N, wanted)                          # deepest level the shape allows
+#   The leaf weights, one of two ways:
+#     online leaves (no extra weight storage; the board makes the weight sums per call)
+#       cells = strassen_if4_cells(...) or strassen_bf16_cells(...)           # host, once: the weight cut in 4^L cells
+#       tree  = strassen_online_tree(cells, sum_addrs, L, b, store_b)         # sum_addrs: strassen_online_sum_count(L) buffers
+#       strassen_online_sums_core(ue, cells, n, k, sum_addrs, L)              # emitted before the matmul
+#     stored leaves (the host makes the sums once: 1.75x weight bytes per level in bf16, 2.9x in 4-bit)
+#       tree = strassen_weight_tree(W, b, L, store_w, store_b)                # a bf16 layer
+#           or strassen_weight_tree_if4(data, scales, N, K, b, L, store_pack, store_b)   # a 4-bit layer
+#   scr = [(x_addr, p_addr), ...]                              # one pair per depth, sized by
 #                                                              # strassen_scratch_elements(M, K, N, L)
 #   strassen_matmul_core_dram(ue, M, K, N, A, tree, OUT, scr)  # at program-capture time
+#     + activation={"gelu_enable": True}, identity_addr=...    # the layer's fused activation, if it has one
 #
 # PRECISION
 #   X, the layer's weight and C keep the model's formats. Everything in between is fp16: the input
-#   sums, the products and the recombination (in bf16 those sums cost ~11 dB per level).
-#   The leaf weights are the weight sums, formed in fp32 on the host and stored as
-#     bf16 layer   fp16, every leaf.
-#     4-bit layer  IF4 for a leaf that is an untouched block of the weight (Y11 / Y22, 2 of the 7
-#                  per level): its bytes are cut out of the layer's pack. IF8 for a true sum: the
-#                  sum of two 4-bit blocks does not fit a 4-bit grid, and re-quantizing it to IF4
-#                  costs 6 dB per level.
+#   sums, the weight sums, the products and the recombination (in bf16 the sums cost ~11 dB per level).
+#   A 4-bit layer keeps its 4-bit values: a leaf that is an untouched block of the weight stays IF4,
+#   its bytes cut out of the layer's pack. A leaf that is a sum is fp16 (online) or IF8 (stored):
+#   the sum of two 4-bit blocks does not fit a 4-bit grid, and re-quantizing it costs 6 dB per level.
 #
 # ONE LEVEL (Yij = block (i, j) of W^T)
 #   P1' = (X11+X22)(Y11+Y22)        P2' = (X21+X22) Y11        P5' = (X11+X12) Y22
@@ -1364,15 +1363,13 @@ def flash_attention_batched_pbi(
 #   * K and N multiples of 128 * 2^(levels-1): every half stays whole 64-lane blocks and the
 #     strided writes cover whole 128-byte lines. K below 8192. OUTPUT_DRAM_ADDR 128-byte aligned.
 #   * M a multiple of 2^levels and a compile-time constant; leftover rows are the caller's plain matmul.
-#   * A fused activation (GELU / SiLU / ReLU clamp) is supported through activation= and
-#     identity_addr=, at a cost: the hardware ignores the activation fields on an elementwise pass,
-#     so the output quarters that do not end in a product (1/2 of the output at level 1, 3/4 at
-#     level 2) go through an on-chip identity product, ~1 cycle per value (3-4 ns), one product
-#     per 64 values in a hardware loop: a few dozen instructions per call (STRASSEN_ACTIVATE_LOOPED;
-#     the looped form is bit-identical to it on the board; 0 = one instruction per 64 values).
-#     Worth it on a large many-row matmul; marginal on a small one.
+#   * Activation: C11 and C22 end in a product and take it fused. C12 and C21 (1/2 of the output
+#     at level 1, 3/4 at level 2) do not, and the hardware ignores an activation on an elementwise
+#     pass, so they go through an on-chip identity product per 64 values: 3-4 ns per value, a
+#     hardware loop of a few dozen instructions per call (_strassen_activate).
 #   * Scratch is private per engine and zero-filled once (fresh DRAM holds NaN patterns). It ends
-#     up holding fp16: never read it as bf16.
+#     up holding fp16: never read it as bf16. Online sum buffers are shared: fill them in a round
+#     before the round that runs the matmul.
 #   * store_w / store_b get fp16 tensors and must upload them unchanged.
 #     store_pack(data_bytes, scale_bytes, n, k, TYPE.IF4 | TYPE.IF8) -> (data_addr, scale_addr).
 def strassen_levels(K: int, N: int, max_level: int) -> int:
@@ -1393,23 +1390,17 @@ def strassen_combos(W: torch.Tensor, b: torch.Tensor | None):
 
 
 def strassen_weight_tree(W: torch.Tensor, b: torch.Tensor | None, levels: int,
-                         store_w: Callable, store_b: Callable | None = None,
-                         weight_format: StorageFormat | None = StorageFormat.FP16) -> dict:
-    """Host side, once: form the 7^levels leaf weights in fp32 and store each with store_w.
-    Returns the tree strassen_matmul_core_dram walks: {"c": [7 children]} per level, leaves
-    {"w": store_w(W_leaf), "b": store_b(b_leaf) or None, "f": format of both}.
-
-    weight_format FP16 (default): store_w / store_b get the leaf already cast to fp16 and must
-    upload it as it is. None: 4-bit leaves -- store_w gets fp32 and returns (data_addr,
-    scale_addr), store_b returns a bf16 address. Sum first, quantize after: store_w must quantize
-    each leaf on its own (re-using the layer's quantized weight is wrong)."""
+                         store_w: Callable, store_b: Callable | None = None) -> dict:
+    """Host side, once, for a bf16 layer: form the 7^levels leaf weights in fp32 and store each as
+    fp16 (store_w / store_b get fp16 tensors and must upload them as they are). Returns the tree
+    strassen_matmul_core_dram walks: {"c": [7 children]} per level, leaves
+    {"w": store_w(W_leaf), "b": store_b(b_leaf) or None, "f": FP16}."""
     W = W.float().cpu()
     b = None if b is None else b.float().cpu()
     if levels == 0:
-        cast = (lambda t: t) if weight_format is None else (lambda t: t.to(weight_format.dtype))
-        return {"w": store_w(cast(W)), "b": None if b is None else store_b(cast(b)),
-                "f": StorageFormat.BF16 if weight_format is None else weight_format}
-    return {"c": [strassen_weight_tree(w, bb, levels - 1, store_w, store_b, weight_format) for w, bb in strassen_combos(W, b)]}
+        F = StorageFormat.FP16
+        return {"w": store_w(W.to(F.dtype)), "b": None if b is None else store_b(b.to(F.dtype)), "f": F}
+    return {"c": [strassen_weight_tree(w, bb, levels - 1, store_w, store_b) for w, bb in strassen_combos(W, b)]}
 
 
 def strassen_weight_tree_if4(data: bytes, scales: bytes, N: int, K: int, b: torch.Tensor | None,
