@@ -59,6 +59,8 @@ def main():
     ap.add_argument("--case", nargs=4, action="append", metavar=("WEIGHTS", "ROWS", "K", "N"),
                     help="if4 | bf16, rows per engine, input width, output width; repeatable")
     ap.add_argument("--levels", type=int, default=2, choices=(1, 2))
+    ap.add_argument("--act", choices=["gelu", "silu", "relu"], default=None,
+                    help="fuse this activation in the plain matmul and in the Strassen kernel (activation= / identity_addr=)")
     ap.add_argument("--dev", default=None)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -123,6 +125,12 @@ def main():
         return ue._exec(f"probe{count[0]}")
 
     checks, summary = [], []
+    act = {"gelu": {"gelu_enable": True}, "silu": {"silu_enable": True},
+           "relu": {"clamp_enable": True, "clamp_min": 0.0, "clamp_max": float("inf")}, None: {}}[args.act]
+    fn = {"gelu": lambda v: v * torch.sigmoid(1.702 * v), "silu": lambda v: v * torch.sigmoid(v),
+          "relu": lambda v: v.clamp(min=0), None: lambda v: v}[args.act]
+    if args.act:
+        print(f"activation: {args.act}, fused in the plain matmul and in the kernel")
 
     def check(what, ok, detail):
         checks.append((what, bool(ok), detail))
@@ -138,10 +146,11 @@ def main():
         W = torch.randn(N, K, generator=g) / K ** 0.5
         print(f"\n{name}  ({M} rows in all; levels {Ls})", flush=True)
         a_x = put(X)
+        a_eye = put(torch.eye(64, dtype=BF)) if act else None
         rows_of = lambda E: (a_x + E.e * r * K * 2, E.e * r * N * 2)        # this engine's X rows, and its output offset
         scratch = lambda E: [(ue.pbuf[E.e][f"OX{d}"], ue.pbuf[E.e][f"OP{d}"]) for d in range(max(Ls))]
         products = lambda tree, out: (lambda E: nn_lib.strassen_matmul_core_dram(
-            E.ue, r, K, N, rows_of(E)[0], tree, out + rows_of(E)[1], scratch(E)))
+            E.ue, r, K, N, rows_of(E)[0], tree, out + rows_of(E)[1], scratch(E), activation=act or None, identity_addr=a_eye))
         qstore = lambda d, s_, rows, cols, t=None: ue._qstore((d, s_, rows, cols))
 
         # ---- the plain matmul, and what "correct" means for this layer
@@ -152,8 +161,8 @@ def main():
             a_w = ue._qstore(pack)
             t0 = timed(lambda E: E.ue.matmat_mul_core(M=r, K=K, N=N, A_DRAM_ADDR=rows_of(E)[0], B_DRAM_ADDR=a_w[0],
                                                       OUTPUT_DRAM_ADDR=a_c + rows_of(E)[1], gpr_M_reg=reg(E, r),
-                                                      is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=a_w[1]))
-            truth = X.double() @ W.to(BF).double().T                        # the product with 16-bit weights
+                                                      is_B_quantized=True, data_type=TYPE.IF4, SCALE_DRAM_ADDR=a_w[1], **act))
+            truth = fn(X.double() @ W.to(BF).double().T)                      # the product with 16-bit weights
             exact = decode(data, scales, N, K)
             loaded = lambda t: t.to(FP).double()                            # a cell is dequantized to fp16 on the way in
             need = lambda L, online: 40 if online else (30, 28)[L - 1]      # agreement with the plain IF4 result, dB
@@ -163,8 +172,8 @@ def main():
             a_w, a_b = put(W.to(BF)), put(bias.to(BF))
             t0 = timed(lambda E: E.ue.matmat_mul_core(M=r, K=K, N=N, A_DRAM_ADDR=rows_of(E)[0], B_DRAM_ADDR=a_w,
                                                       OUTPUT_DRAM_ADDR=a_c + rows_of(E)[1], C_DRAM_ADDR=a_b,
-                                                      bias_mode="broadcast_N", gpr_M_reg=reg(E, r)))
-            truth = X.double() @ W.to(BF).double().T + bias.double()        # the exact product
+                                                      bias_mode="broadcast_N", gpr_M_reg=reg(E, r), **act))
+            truth = fn(X.double() @ W.to(BF).double().T + bias.double())      # the exact product
             exact = W.to(BF).double()
             loaded = lambda t: t
             need = lambda L, online: (50, 47)[L - 1]                        # SNR against the exact product, dB
