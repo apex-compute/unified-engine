@@ -565,6 +565,17 @@ SWIN_PARAMS_BASE  = 0x00000000   # 0.0 GB — 1 GB for weights, biases, norms, u
 SWIN_TENSOR_BASE  = 0x40000000   # 1.0 GB — 1 GB for intermediate activations, scratch buffers
 SWIN_PROGRAM_BASE = 0x80000000   # 2.0 GB — 2 GB for compiled instruction programs
 
+# Strassen matmul (nn_lib §10, fp16 intermediates) on the plain bf16 matmuls wide enough to gain:
+# the last stage's attention output projection (level 1) and MLP contract (level 2), and the patch
+# merge into it (level 2). Narrower stages are slower with it; Q/K/V (strip write-back) and the MLP
+# expand (fused GELU) cannot use it. --strassen-level caps the level; 0 = every matmul plain.
+# OFF by default (--strassen-level 2 turns it on): measured on the board, one engine, the run went
+# 8.181 -> 8.147 s (0.4%, same prediction) for 100 MB more weights -- the last stage is too small
+# a share of the model.
+ST_LEVEL = 0
+ST_MIN_WIDTH = 1024     # K and N below this lose
+ST_MIN_ROWS = 128
+
 
 class Swin_UnifiedEngine(UnifiedEngine):
     ARTIFACT_VERSION = 3  # dynamic LayerNorm row-count + persistent zeros/1-N operands
@@ -703,6 +714,56 @@ class Swin_UnifiedEngine(UnifiedEngine):
         return self.allocate_tensor_dram(num_elements * 2)
 
     # ------------------------------------------------------------------
+    # Strassen matmul (nn_lib §10)
+    # ------------------------------------------------------------------
+
+    def _alloc_param_fp16(self, tensor: torch.Tensor) -> int:
+        """A Strassen leaf: already fp16, uploaded as it is (a bf16 cast here would corrupt it)."""
+        assert tensor.dtype == torch.float16, "Strassen leaves must arrive in fp16"
+        t = tensor.contiguous()
+        addr = self.get_params_dram_addr()
+        self.allocate_params_dram(t.numel() * 2)
+        self.dma_to_accelerator_memory(addr, t)
+        return addr
+
+    def _st_plan(self) -> dict:
+        """{matmul: (rows, K, N, level)} of the matmuls that use Strassen. Derived from the
+        architecture constants only, so a bin run sizes the same scratch as the compile run."""
+        s = self.NUM_STAGES - 1
+        dim, rows = self.STAGE_DIMS[s], self.STAGE_SPATIAL[s] ** 2
+        want = {'o': (dim, dim, 1), 'fc2': (int(dim * self.MLP_RATIO), dim, 2),
+                'merge': (4 * self.STAGE_DIMS[s - 1], dim, 2)}
+        plan = {}
+        for name, (K, N, level) in want.items():
+            L = 0
+            if ST_LEVEL and min(K, N) >= ST_MIN_WIDTH and rows >= ST_MIN_ROWS:
+                L = nn_lib.strassen_levels(K, N, min(level, ST_LEVEL))
+            while L and rows % (1 << L):
+                L -= 1
+            if L:
+                plan[name] = (rows, K, N, L)
+        return plan
+
+    def _st_node(self, name: str, weight: torch.Tensor, bias: torch.Tensor | None) -> dict:
+        """Stage one matmul's Strassen leaves (they replace its plain weight and bias: the
+        rows are static, so no row ever needs the plain matmul)."""
+        rows, K, N, L = self._st_plan()[name]
+        assert tuple(weight.shape) == (N, K), f"{name}: weight {tuple(weight.shape)} != ({N}, {K})"
+        return {"M": rows, "K": K, "N": N, "L": L,
+                "tree": nn_lib.strassen_weight_tree(weight, bias, L, self._alloc_param_fp16, self._alloc_param_fp16)}
+
+    def _st_matmul(self, node: dict, A_DRAM_ADDR: int, OUTPUT_DRAM_ADDR: int, gpr_floor: int) -> None:
+        """Emit one Strassen matmul. The kernel allocates its row-count registers from the
+        counter, which _pbi_set / pbi_strided_copy leave pointing INTO this file's named GPRs;
+        start it above gpr_floor (the highest named one) so it cannot clobber any of them. It
+        releases what it took, and every named GPR is re-primed before its next use."""
+        assert OUTPUT_DRAM_ADDR % 128 == 0, f"Strassen output 0x{OUTPUT_DRAM_ADDR:X} not 128-byte aligned"
+        self._isa_reg_counter = gpr_floor + 1
+        self.reset_inst_ptr_counter()
+        nn_lib.strassen_matmul_core_dram(self, node["M"], node["K"], node["N"], A_DRAM_ADDR, node["tree"],
+                                         OUTPUT_DRAM_ADDR, self.st_scratch)
+
+    # ------------------------------------------------------------------
     # Initialization
     # ------------------------------------------------------------------
 
@@ -768,6 +829,7 @@ class Swin_UnifiedEngine(UnifiedEngine):
             mlp_dim = int(dim * self.MLP_RATIO)
 
             stage_weights = []
+            st_plan = self._st_plan() if s == self.NUM_STAGES - 1 else {}
             hf_stage = swin.encoder.layers[s]
             for l in range(self.DEPTHS[s]):
                 block = hf_stage.blocks[l]
@@ -816,8 +878,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 # Output projection (attention) — transformers>=5: SwinAttention.o_proj
                 out_proj = (attn.o_proj if hasattr(attn, 'o_proj')
                             else attn.output.dense)
-                lw['out_proj_weight'] = self._alloc_param(out_proj.weight.data)
-                lw['out_proj_bias'] = self._alloc_param(out_proj.bias.data)
+                if 'o' in st_plan:
+                    lw['out_proj_st'] = self._st_node('o', out_proj.weight.data, out_proj.bias.data)
+                else:
+                    lw['out_proj_weight'] = self._alloc_param(out_proj.weight.data)
+                    lw['out_proj_bias'] = self._alloc_param(out_proj.bias.data)
 
                 # Pre-MLP LayerNorm
                 lw['ln_after_gamma'] = self._alloc_param(block.layernorm_after.weight.data)
@@ -832,8 +897,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 # MLP contract: (dim, mlp_dim) — transformers>=5: SwinMLP.fc2
                 fc2 = (block.mlp.fc2 if hasattr(block, 'mlp')
                        else block.output.dense)
-                lw['mlp_contract_weight'] = self._alloc_param(fc2.weight.data)
-                lw['mlp_contract_bias'] = self._alloc_param(fc2.bias.data)
+                if 'fc2' in st_plan:
+                    lw['mlp_contract_st'] = self._st_node('fc2', fc2.weight.data, fc2.bias.data)
+                else:
+                    lw['mlp_contract_weight'] = self._alloc_param(fc2.weight.data)
+                    lw['mlp_contract_bias'] = self._alloc_param(fc2.bias.data)
 
                 stage_weights.append(lw)
             self.encoder_weights.append(stage_weights)
@@ -846,7 +914,10 @@ class Swin_UnifiedEngine(UnifiedEngine):
             pmw = {}
             pmw['norm_gamma'] = self._alloc_param(ds.norm.weight.data)   # (4*dim,)
             pmw['norm_beta']  = self._alloc_param(ds.norm.bias.data)     # (4*dim,)
-            pmw['reduction']  = self._alloc_param(ds.reduction.weight.data)  # (2*dim, 4*dim)
+            if s == self.NUM_STAGES - 2 and 'merge' in self._st_plan():
+                pmw['reduction_st'] = self._st_node('merge', ds.reduction.weight.data, None)
+            else:
+                pmw['reduction']  = self._alloc_param(ds.reduction.weight.data)  # (2*dim, 4*dim)
             self.patch_merge_weights.append(pmw)
 
         # ---- Post-encoder ----
@@ -883,6 +954,8 @@ class Swin_UnifiedEngine(UnifiedEngine):
         self.CLASSIFIER_WEIGHT_DRAM = self._alloc_param(cls_w_pad.contiguous())  # (num_labels_pad, 1536)
         self.CLASSIFIER_BIAS_DRAM = self._alloc_param(cls_b_pad)                 # (num_labels_pad,)
 
+        assert self.get_params_dram_usage() <= SWIN_TENSOR_BASE - SWIN_PARAMS_BASE, (
+            f"params DRAM overflow: {self.get_params_dram_usage() / 2**20:.1f} MB runs into the tensor region")
         del model  # free CPU memory
 
     def tensor_init(self) -> None:
@@ -1000,6 +1073,21 @@ class Swin_UnifiedEngine(UnifiedEngine):
             self.ZEROS_DRAM,
             torch.zeros(URAM_NEAR_FULL_ELEMENTS, dtype=torch.bfloat16),
         )
+        # Strassen scratch, one (x, product) pair per depth, sized for the largest call. Same
+        # contract again: allocated last (no other buffer moves) and zero-filled on every
+        # construction, because the kernel needs it zero before first use and a program loaded
+        # from bin carries these addresses.
+        uses, self.st_scratch = list(self._st_plan().values()), []
+        for d in range(max((u[3] for u in uses), default=0)):
+            live = [u for u in uses if u[3] > d]
+            pair = []
+            for elements in (9 * max((m >> (d + 1)) * (K >> (d + 1)) for m, K, N, L in live),
+                             14 * max((m >> (d + 1)) * (N >> (d + 1)) for m, K, N, L in live)):
+                addr = self.allocate_tensor_dram(elements * bpe, align_bytes=128)
+                self.dma_to_accelerator_memory(addr, torch.zeros(elements, dtype=torch.bfloat16))
+                pair.append(addr)
+            self.st_scratch.append(tuple(pair))
+        assert self.get_tensor_dram_usage() <= SWIN_PROGRAM_BASE - SWIN_TENSOR_BASE, "tensor DRAM runs into the program region"
 
     # ------------------------------------------------------------------
     # Program compilation
@@ -1025,9 +1113,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 self.dma_read(DMA_DEVICE_C2H, self._params_dram_base + offset, buf, sz)
                 f.write(buf)
                 offset += sz
+        meta = {"artifact_version": self.ARTIFACT_VERSION, "size": total, "num_labels": self.NUM_LABELS}
+        if ST_LEVEL:        # the leaves and the programs that read them are one cache unit
+            meta["strassen"] = ST_LEVEL
         with open(meta_path, "w") as f:
-            json.dump({"artifact_version": self.ARTIFACT_VERSION,
-                       "size": total, "num_labels": self.NUM_LABELS}, f)
+            json.dump(meta, f)
         _original_print(f"  Params dumped: {total / 1024**2:.1f} MB → {bin_path}")
 
     def load_params(self) -> bool:
@@ -1041,6 +1131,9 @@ class Swin_UnifiedEngine(UnifiedEngine):
             meta = json.load(f)
         if meta.get("artifact_version") != self.ARTIFACT_VERSION:
             _original_print("  Params artifact is stale; rebuilding.")
+            return False
+        if meta.get("strassen", 0) != ST_LEVEL:
+            _original_print(f"  Params artifact has Strassen level {meta.get('strassen', 0)}, want {ST_LEVEL}; rebuilding.")
             return False
         total = meta["size"]
         self.NUM_LABELS = meta["num_labels"]
@@ -1067,8 +1160,11 @@ class Swin_UnifiedEngine(UnifiedEngine):
         self.dma_read(DMA_DEVICE_C2H, program_addr, buf, size)
         with open(bin_path, "wb") as f:
             f.write(buf)
+        meta = {"artifact_version": self.ARTIFACT_VERSION, "size": size}
+        if ST_LEVEL:
+            meta["strassen"] = ST_LEVEL
         with open(meta_path, "w") as f:
-            json.dump({"artifact_version": self.ARTIFACT_VERSION, "size": size}, f)
+            json.dump(meta, f)
         _original_print(f"  Program dumped: {size / 1024**2:.1f} MB → {bin_path}")
 
     def load_programs(self) -> int | None:
@@ -1082,6 +1178,9 @@ class Swin_UnifiedEngine(UnifiedEngine):
             meta = json.load(f)
         if meta.get("artifact_version") != self.ARTIFACT_VERSION:
             _original_print("  Program artifact is stale; rebuilding.")
+            return None
+        if meta.get("strassen", 0) != ST_LEVEL:
+            _original_print("  Program artifact has another Strassen level; rebuilding.")
             return None
         with open(bin_path, "rb") as f:
             data = f.read()
@@ -1372,16 +1471,20 @@ class Swin_UnifiedEngine(UnifiedEngine):
                         )
 
                 # --- 9. Output projection ---
-                self._pbi_set(gpr_mm, M_win)
-                self.matmat_mul_core(
-                    M=M_win, K=dim, N=dim,
-                    A_DRAM_ADDR=st['attn_unpadded'],
-                    B_DRAM_ADDR=lw['out_proj_weight'],
-                    OUTPUT_DRAM_ADDR=st['out_proj'],
-                    C_DRAM_ADDR=lw['out_proj_bias'],
-                    bias_mode="broadcast_N",
-                    gpr_M_reg=gpr_mm,
-                )
+                if 'out_proj_st' in lw:
+                    assert lw['out_proj_st']["M"] == M_win
+                    self._st_matmul(lw['out_proj_st'], st['attn_unpadded'], st['out_proj'], gpr_qkv_stride)
+                else:
+                    self._pbi_set(gpr_mm, M_win)
+                    self.matmat_mul_core(
+                        M=M_win, K=dim, N=dim,
+                        A_DRAM_ADDR=st['attn_unpadded'],
+                        B_DRAM_ADDR=lw['out_proj_weight'],
+                        OUTPUT_DRAM_ADDR=st['out_proj'],
+                        C_DRAM_ADDR=lw['out_proj_bias'],
+                        bias_mode="broadcast_N",
+                        gpr_M_reg=gpr_mm,
+                    )
 
                 # --- 10. Window reverse ---
                 window_reverse_dram(self,
@@ -1452,16 +1555,20 @@ class Swin_UnifiedEngine(UnifiedEngine):
                 )
 
                 # --- 15. MLP contract ---
-                self._pbi_set(gpr_mm, M)
-                self.matmat_mul_core(
-                    M=M, K=mlp_dim, N=dim,
-                    A_DRAM_ADDR=st['mlp_mid'],
-                    B_DRAM_ADDR=lw['mlp_contract_weight'],
-                    OUTPUT_DRAM_ADDR=st['mlp_out'],
-                    C_DRAM_ADDR=lw['mlp_contract_bias'],
-                    bias_mode="broadcast_N",
-                    gpr_M_reg=gpr_mm,
-                )
+                if 'mlp_contract_st' in lw:
+                    assert lw['mlp_contract_st']["M"] == M
+                    self._st_matmul(lw['mlp_contract_st'], st['mlp_mid'], st['mlp_out'], gpr_qkv_stride)
+                else:
+                    self._pbi_set(gpr_mm, M)
+                    self.matmat_mul_core(
+                        M=M, K=mlp_dim, N=dim,
+                        A_DRAM_ADDR=st['mlp_mid'],
+                        B_DRAM_ADDR=lw['mlp_contract_weight'],
+                        OUTPUT_DRAM_ADDR=st['mlp_out'],
+                        C_DRAM_ADDR=lw['mlp_contract_bias'],
+                        bias_mode="broadcast_N",
+                        gpr_M_reg=gpr_mm,
+                    )
 
                 # --- 16. Residual add 2 ---
                 layer_output_addr = st['layer_input']
@@ -1519,14 +1626,19 @@ class Swin_UnifiedEngine(UnifiedEngine):
                     INV_N_DRAM_ADDR=self.LN_INV_N_ADDRS[4 * dim],
                 )
 
-                self._pbi_set(gpr_mm, next_M)
-                self.matmat_mul_core(
-                    M=next_M, K=4 * dim, N=next_dim,
-                    A_DRAM_ADDR=st['merge_buf'],
-                    B_DRAM_ADDR=pmw['reduction'],
-                    OUTPUT_DRAM_ADDR=self.stage_tensors[s + 1]['layer_input'],
-                    gpr_M_reg=gpr_mm,
-                )
+                if 'reduction_st' in pmw:
+                    assert pmw['reduction_st']["M"] == next_M
+                    self._st_matmul(pmw['reduction_st'], st['merge_buf'],
+                                    self.stage_tensors[s + 1]['layer_input'], gpr_qkv_stride)
+                else:
+                    self._pbi_set(gpr_mm, next_M)
+                    self.matmat_mul_core(
+                        M=next_M, K=4 * dim, N=next_dim,
+                        A_DRAM_ADDR=st['merge_buf'],
+                        B_DRAM_ADDR=pmw['reduction'],
+                        OUTPUT_DRAM_ADDR=self.stage_tensors[s + 1]['layer_input'],
+                        gpr_M_reg=gpr_mm,
+                    )
 
         # ================================================================
         # POST-ENCODER: final LN + avg pool + classifier (all on HW)
@@ -1639,15 +1751,18 @@ def preprocess_image(image_path: str) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def main():
+    global _SILENT_MODE, ST_LEVEL
     import argparse
     parser = argparse.ArgumentParser(description="Swin-Large accelerator inference.")
     parser.add_argument("--image", type=str, default=None, help="Path to input image")
     parser.add_argument("--dev", type=str, default="xdma0", help="DMA device (default: xdma0)")
     parser.add_argument("--device", type=str, default="kintex7", help='FPGA board profile (kintex7, rk, puzhi, bittware, bittware_256, alveo, efinix).')
+    parser.add_argument("--strassen-level", type=int, default=ST_LEVEL, choices=(0, 1, 2),
+                        help="Deepest Strassen level on the last stage's o / fc2 and the patch merge into it (default 0 = off).")
     args = parser.parse_args()
 
-    global _SILENT_MODE
     _SILENT_MODE = True
+    ST_LEVEL = args.strassen_level      # before the engine is built: it picks the weights and the bin
 
     set_dma_device("efinix" if args.device == "efinix" else args.dev)
     global DMA_DEVICE_H2C, DMA_DEVICE_C2H
