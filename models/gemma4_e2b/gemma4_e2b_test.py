@@ -199,7 +199,7 @@ DEFAULT_AUDIO = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samp
 # Tensor allocation, the RoPE tables and the decoder bounds follow it; the JSON
 # value (model.max_context_size) is checked against this choice.
 MIN_CONTEXT_SIZE = 1024
-MAX_CONTEXT_SIZE = 8192
+MAX_CONTEXT_SIZE = int(os.environ.get("UE_MAX_CONTEXT_SIZE", "8192"), 0)
 
 
 def _parse_offset(val) -> int:
@@ -218,6 +218,11 @@ def _parse_offset(val) -> int:
 # filler is real instruction text, the same as qwen2.5_omni_7b's, because a
 # prompt of repeated nonsense changes what attention does with it.
 DEFAULT_PROMPT_BASE = "Respond to the request in detail."
+# The prompt of an image + audio run with no --prompt. The transcript is asked
+# for first: asked to describe the picture first, E4B (the source model too)
+# then answers that no audio was provided.
+DEFAULT_IMAGE_AUDIO_PROMPT = ("Transcribe the speech in the audio exactly. "
+                              "Then describe the picture in two or three sentences.")
 _FIT_FILLER_SENTENCES = (
     "Address every part of the request before you stop, and do not end the "
     "answer while any part of it remains uncovered.",
@@ -1100,7 +1105,7 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     # window, and under the tiled map inside engine 1's. Audio is not exercised
     # by the image/text paths, so the collision has been latent -- it is a real
     # bug either way, and the tiled map is not going to add a second one.
-    AUDIO_WEIGHT_LEGACY_BASE = 0x6C000000
+    AUDIO_WEIGHT_LEGACY_BASE = int(os.environ.get("UE_AUDIO_WEIGHT_BASE", "0x6C000000"), 0)
     AUDIO_WEIGHT_REGION_BYTES = 0x0C000000        # 192 MB
 
     def _audio_weight_region(self) -> tuple[int, int]:
@@ -1351,11 +1356,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # Window 0 belongs to core 0, which keeps its own tensor-arena buffers;
         # its window stays reserved so engine index == window index everywhere.
         self.DRAM_END = 0x100000000 + _rebase
-        _params_base  = 0x80000000 + _rebase
+        _params_base  = int(os.environ.get("UE_PARAMS_BASE", "0x80000000"), 0) + _rebase
         _tensor_base  = 0xE1000000 + _rebase
         self.VISION_ISA_BASE             = 0xFF000000 + _rebase
         self.VISION_WORKER_ISA_BASE      = 0xFF400000 + _rebase
-        self.LM_ISA_BASE                 = 0xFF620000 + _rebase
+        self.LM_ISA_BASE                 = int(os.environ.get("UE_LM_ISA_BASE", "0xFF620000"), 0) + _rebase
         # Per-engine private windows, laid out by the library. Uniform at EVERY
         # engine count -- vision and prefill are sequential and share one arena,
         # so engine i always owns the same window in both, and the window is a
@@ -1675,8 +1680,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             rate = processor.feature_extractor.sampling_rate
             samples = self._load_audio_samples(audio_path, rate, audio_seconds)
 
-        # Audio first, then the frames: the order the answer is asked for.
-        media = ([{"type": "audio"}] if audio_path else []) + [{"type": "image"}] * frames
+        # The frames first, then the audio. With the clip ahead of the image E4B
+        # answers "there is no speech in the audio" (the source model does the
+        # same in that order); frames first, both models transcribe it.
+        media = [{"type": "image"}] * frames + ([{"type": "audio"}] if audio_path else [])
 
         def _content(text: str) -> list:
             return media + [{"type": "text", "text": text}]
@@ -1694,7 +1701,9 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
             return processor(**kwargs)
 
         if prompt is None:
-            prompt = prompt_base or DEFAULT_PROMPT_BASE
+            prompt = prompt_base or (DEFAULT_IMAGE_AUDIO_PROMPT
+                                     if image_path and audio_path and not target_prefill_tokens
+                                     else DEFAULT_PROMPT_BASE)
             if target_prefill_tokens:
                 prompt = fit_prompt_to_prefill(
                     processor.tokenizer,

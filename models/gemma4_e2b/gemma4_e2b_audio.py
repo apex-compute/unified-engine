@@ -38,7 +38,7 @@ AUDIO_FIXED_SOFT_TOKENS = 128
 # region (0x6C000000-0x78000000), below the model map's params at 0x80000000.
 # It was 0x98000000, inside the params (LM weights, 0x80000000-0xE1000000): the
 # audio program overwrote LM weights and every single-core audio run decoded <pad>.
-AUDIO_ISA_BASE = 0x78000000
+AUDIO_ISA_BASE = int(os.environ.get("UE_AUDIO_ISA_BASE", "0x78000000"), 0)
 # Under the tiled map the audio program gets its own shared-pool allocation of
 # this size (the legacy map's audio ISA region was 96 MiB).
 AUDIO_ISA_BYTES = 96 << 20

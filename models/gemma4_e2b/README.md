@@ -128,6 +128,12 @@ examples use the same entrypoint and select their respective encoder paths.
 the two modes are mutually exclusive. `--vision-host` with `--image` runs the
 vision encoder on the host while keeping LM prefill and decode on the FPGA.
 
+With both `--image` and `--audio` the prompt puts the image first, then the
+audio, and without `--prompt` asks "Transcribe the speech in the audio exactly.
+Then describe the picture in two or three sentences." Both choices matter on
+E4B: with the clip ahead of the image, or asked to describe the picture first,
+it answers that there is no audio -- and so does the source model.
+
 ## Files and caches
 
 Paths below are relative to `models/gemma4_e2b/`:

@@ -37,6 +37,31 @@ E4B), and the KV cache placed in the windows' shared pool rather than the
 480 MiB tensor arena. The vision and audio encoders are identical; their
 outputs project into the 2560-wide LM.
 
+## Single engine on a 4 GiB board
+
+The single-engine model map is the 2 GB one: 1552 MiB of weights at `0x80000000`,
+which E4B's 2742 MB do not fit, and an 8192-token KV cache (448 MB) that the
+480 MiB tensor region does not hold. The low 2 GB is empty at one engine, so the
+map can be stretched into it with environment overrides (each defaults to the
+unchanged map):
+
+```bash
+UE_MAX_CONTEXT_SIZE=2048 UE_PARAMS_BASE=0x20000000 UE_LM_ISA_BASE=0xFF400000 \
+UE_AUDIO_WEIGHT_BASE=0x0C000000 UE_AUDIO_ISA_BASE=0x18000000 \
+python models/gemma4_e4b/gemma4_e4b_test.py --dev xdma1 --image --audio
+```
+
+| Override | Default | Why |
+| :--- | :--- | :--- |
+| `UE_MAX_CONTEXT_SIZE` | 8192 | KV cache 448 MB -> 112 MB at 2048 |
+| `UE_PARAMS_BASE` | `0x80000000` | weights region 1552 MiB -> 3088 MiB |
+| `UE_LM_ISA_BASE` | `0xFF620000` | the E4B LM image (10.7 MiB) takes the worker ISA slot unused at one engine |
+| `UE_AUDIO_WEIGHT_BASE`, `UE_AUDIO_ISA_BASE` | `0x6C000000`, `0x78000000` | moved below the lowered weights region, which would otherwise cover them |
+
+Measured on xdma1 (198.3 MHz, one engine, 25.4 GFLOPS peak), `vette.jpg` +
+`apex.wav`, 407-token prompt: prefill 141.5 s (23.0 model GFLOPS, 91% of peak),
+decode first token 1.90 tok/s, coherent text to the stop token.
+
 ## Files
 
 - **gemma4_e4b_test.py** -- the launcher.
