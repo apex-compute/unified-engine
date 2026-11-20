@@ -305,23 +305,33 @@ def ue_assert_stride_fields_fit(stride_bytes_per_chunk: int, stride_jump_bytes: 
 # lab hosts) runs char_sgdma_map_user_buf_to_sgl(), which allocates the array
 # of page pointers for the whole buffer with
 #     kcalloc(pages_nr, sizeof(struct page *), GFP_KERNEL)
-# That array must be PHYSICALLY CONTIGUOUS: 8 bytes per 4 KiB page, so a
-# 64 MiB chunk needs 128 KiB (an order-5 allocation). The kernel treats
-# order > 3 as "costly": it tries a little compaction and then gives up, and
-# write() returns ENOMEM -- with 100+ GB of page cache that could be
-# reclaimed. That is the "Cannot allocate memory" of #1409 (qwen3_4b and
-# qwen3_1.7b on p2 and dust2, 2026-11-19; flux2_klein_4b on 11-14): /proc/vmstat
-# on p2 shows compact_fail 65,762 of 91,676 compaction attempts. It depends
-# on fragmentation (Vivado, large model loads), hence intermittent.
+# That array must be PHYSICALLY CONTIGUOUS: 8 bytes per 4 KiB page. A user
+# buffer is rarely page aligned, so a 64 MiB chunk spans 16,385 pages and
+# needs just over 128 KiB: an order-6 allocation. The kernel treats order > 3
+# as "costly": it tries a little compaction and then gives up, and write()
+# returns ENOMEM -- with 100+ GB of page cache that could be reclaimed. That
+# is the "Cannot allocate memory" of #1409. p2's kernel log has it for both
+# failed nights (2026-11-14 13:27Z flux2_klein_4b, 11-19 12:58Z qwen3_4b):
+#     python3: page allocation failure: order:6, mode:...(GFP_KERNEL|...)
+#       char_sgdma_map_user_buf_to_sgl+0x72 [xdma]
+#     xdma:char_sgdma_map_user_buf_to_sgl: pages OOM.
+# It depends on fragmentation (Vivado, large model loads), hence intermittent.
 #
-# 8 MiB needs a 16 KiB array (order 2), which the kernel does not give up on.
+# The same log has order:7 failures in xdma_init_request() (16 bytes per page
+# for the request's descriptor list) on nights that passed: that allocation
+# falls back to vmalloc, so it only warns.
+#
+# 4 MiB keeps BOTH allocations at order <= 3 (1,025 pages: 8.2 KiB -> order 2,
+# and 16.4 KiB -> order 3), which the kernel does not give up on. Throughput
+# is the same as with 64 MiB (measured on p2 kintex7: ~1.3 GiB/s write,
+# ~0.5 GiB/s read for 4, 8, 16 and 64 MiB).
 # All ENOMEM paths in the driver run before the transfer is submitted, so
 # nothing reaches the card; _dma_chunked() still halves the chunk and retries
 # if one is ever seen. UE_DMA_MAX_CHUNK_MB overrides the starting size.
-DMA_MAX_CHUNK_BYTES = int(os.environ.get("UE_DMA_MAX_CHUNK_MB", "8")) * 1024 * 1024
+DMA_MAX_CHUNK_BYTES = int(os.environ.get("UE_DMA_MAX_CHUNK_MB", "4")) * 1024 * 1024
 if DMA_MAX_CHUNK_BYTES <= 0:
     raise ValueError("UE_DMA_MAX_CHUNK_MB must be a positive number of MiB")
-# Smallest chunk an ENOMEM retry shrinks to (2 KiB page array, order 0), and
+# Smallest chunk an ENOMEM retry shrinks to (2 KiB page array, one page), and
 # how many ENOMEMs in a row at that size before the transfer is given up.
 DMA_MIN_CHUNK_BYTES = min(1024 * 1024, DMA_MAX_CHUNK_BYTES)
 DMA_ENOMEM_RETRIES_AT_MIN = 5
@@ -1688,7 +1698,7 @@ class UnifiedEngine:
         print(f"{DMA_DEVICE_USER} register access...")
         hw_version = self.get_hardware_version()
         print(f"HW version via user device: 0x{hw_version & 0xFFFFFFFF:08x}")
-        assert hw_version == 0xfefdd916, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0xfefdd916. Please update FPGA with update_fefdd916.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
+        assert hw_version == 0x25302117, f"HW version mismatch: got 0x{hw_version & 0xFFFFFFFF:08x}, expected 0x25302117. Please update FPGA with update_25302117.bin from the repo root using ./update_fpga.sh (released images: https://github.com/apex-compute/unified-engine/releases)"
         if getattr(self, "conv_geometry_mode", CONV_GEOMETRY_LIVE_CSR) == CONV_GEOMETRY_QUEUE_CONFIG:
             # Convolution images have independent build stamps from the legacy
             # release. Explicit queue-CONFIG selection opts into that contract;
