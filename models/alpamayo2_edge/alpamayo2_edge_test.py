@@ -400,6 +400,8 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
 
     def _st_scratch(self, scr, uses):
         """Private scratch for every depth. uses: [(rows, K, N, L)] of the layers sharing it."""
+        self.st_rows = getattr(self, "st_rows", {})
+        self.st_rows[scr] = max((u[0] for u in uses), default=0)       # most rows one call may take (_st_rows checks)
         for d in range(max((u[3] for u in uses), default=0)):
             live = [u for u in uses if u[3] > d]
             self._palloc(f"{scr}_X{d}", 9 * max((m >> (d + 1)) * (K >> (d + 1)) for m, K, N, L in live))
@@ -411,6 +413,7 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         act: the layer's fused activation (matmat_mul_core arguments), or None."""
         L, B = node["L"], self.pbuf[E.e]
         ns = n - n % (1 << L)
+        assert ns <= self.st_rows[node["scr"]], f"Strassen scratch {node['scr']} holds {self.st_rows[node['scr']]} rows, asked for {ns}"
         if ns:
             self._flops_acc += 7 ** L * 2 * (ns >> L) * (K >> L) * (N >> L)
             strassen_matmul_core_dram(E.ue, ns, K, N, A, node["tree"], OUT,
@@ -1034,7 +1037,10 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         self._palloc("V_T", HD * CAP)
         self._palloc("SCORE", S * S)
         self._palloc("SQ", S * HD)
-        self._st_scratch("SL", [(-(-P // self.NE), K, N, L) for K, N, L in self.l_st if L])     # prefill rows per engine
+        # prefill rows per engine, for the longest prompt S can hold: the sim recompiles for other
+        # prompt lengths without coming back here (sized for this P alone, a longer prompt overran
+        # the scratch: wrong rows, and NaN on a freshly reset board)
+        self._st_scratch("SL", [(-(-S // self.NE), K, N, L) for K, N, L in self.l_st if L])
         self._palloc("SLAB", LI // 2)                   # _mm_slabs: the running sum's second buffer (widest output)
         # Zeroed: slots no stage ever writes are masked, but still flow through V^T and P.V.
         kv = LML * KVH * CAP * HD
