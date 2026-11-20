@@ -201,6 +201,24 @@ DEFAULT_AUDIO = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "..", "test_samp
 MIN_CONTEXT_SIZE = 1024
 MAX_CONTEXT_SIZE = int(os.environ.get("UE_MAX_CONTEXT_SIZE", "8192"), 0)
 
+# THE WIDE SINGLE-ENGINE MAP. The single-engine model map keeps weights in
+# [0x80000000, 0xE1000000) -- 1552 MiB -- and every tensor, the KV cache
+# included, in the 480 MiB above them. E2B fits; E4B (2742 MB of weights, a
+# 448 MB cache at 8192 tokens) does not. One engine leaves the low 2 GB empty,
+# so a model whose weights exceed the region gets this map instead, chosen by
+# the engine from the config: weights from 0x20000000, the LM image in the
+# worker ISA slot no engine uses, the audio weights and image below the
+# weights, and a context its cache fits. Each address still follows its
+# UE_* environment override when one is set.
+SINGLE_ENGINE_PARAMS_BYTES = 0xE1000000 - 0x80000000
+WIDE_SINGLE_ENGINE = {
+    "params_base": 0x20000000,
+    "lm_isa_base": 0xFF400000,
+    "audio_weight_base": 0x0C000000,
+    "audio_isa_base": 0x18000000,
+    "max_context_size": 2048,
+}
+
 
 def _parse_offset(val) -> int:
     """Parse offset/size from JSON: int or hex string like '0x24000000'."""
@@ -1105,14 +1123,14 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
     # window, and under the tiled map inside engine 1's. Audio is not exercised
     # by the image/text paths, so the collision has been latent -- it is a real
     # bug either way, and the tiled map is not going to add a second one.
-    AUDIO_WEIGHT_LEGACY_BASE = int(os.environ.get("UE_AUDIO_WEIGHT_BASE", "0x6C000000"), 0)
+    AUDIO_WEIGHT_LEGACY_BASE = 0x6C000000         # the instance's _audio_weight_base, unless the wide map moves it
     AUDIO_WEIGHT_REGION_BYTES = 0x0C000000        # 192 MB
 
     def _audio_weight_region(self) -> tuple[int, int]:
         """(base, end) of the audio weight region for the active map."""
         if not self._tiled_map:
-            return (self.AUDIO_WEIGHT_LEGACY_BASE,
-                    self.AUDIO_WEIGHT_LEGACY_BASE + self.AUDIO_WEIGHT_REGION_BYTES)
+            base = getattr(self, "_audio_weight_base", self.AUDIO_WEIGHT_LEGACY_BASE)
+            return (base, base + self.AUDIO_WEIGHT_REGION_BYTES)
         cached = getattr(self, "_audio_weight_extent", None)
         if cached is None:
             base = self.mc_arena.alloc_shared(
@@ -1219,6 +1237,26 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         self.prefill_kernel = prefill_kernel
         self.decode_kernel = decode_kernel
         self.multi_core = multi_core
+        # One engine, weights past the single-engine region: the wide map (above).
+        self._wide_single_engine = (
+            multi_core == 1
+            and self._private_weight_bytes(script_dir, 1) > SINGLE_ENGINE_PARAMS_BYTES)
+        _wide = WIDE_SINGLE_ENGINE if self._wide_single_engine else {}
+
+        def _address(variable: str, key: str, default: int) -> int:
+            stated = os.environ.get(variable)
+            return int(stated, 0) if stated else _wide.get(key, default)
+        self._params_base_addr = _address("UE_PARAMS_BASE", "params_base", 0x80000000)
+        self._lm_isa_base_addr = _address("UE_LM_ISA_BASE", "lm_isa_base", 0xFF620000)
+        self._audio_weight_base = _address("UE_AUDIO_WEIGHT_BASE", "audio_weight_base", 0x6C000000)
+        self._audio_isa_base_addr = _address("UE_AUDIO_ISA_BASE", "audio_isa_base", 0x78000000)
+        self._context_size = (MAX_CONTEXT_SIZE if os.environ.get("UE_MAX_CONTEXT_SIZE")
+                              else min(MAX_CONTEXT_SIZE, _wide.get("max_context_size", MAX_CONTEXT_SIZE)))
+        if self._wide_single_engine:
+            print(f"[map] wide single-engine map ({MODEL_TITLE}: weights exceed the "
+                  f"{SINGLE_ENGINE_PARAMS_BYTES >> 20} MiB region): params @ 0x{self._params_base_addr:X}, "
+                  f"LM ISA @ 0x{self._lm_isa_base_addr:X}, audio weights @ 0x{self._audio_weight_base:X}, "
+                  f"audio ISA @ 0x{self._audio_isa_base_addr:X}, context {self._context_size}")
         # Program-image reuse: OFF by default (recompile programs.bin fresh every
         # run). --bin-reuse opts into reusing a matching cached section instead.
         self.bin_reuse = bin_reuse
@@ -1356,11 +1394,11 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # Window 0 belongs to core 0, which keeps its own tensor-arena buffers;
         # its window stays reserved so engine index == window index everywhere.
         self.DRAM_END = 0x100000000 + _rebase
-        _params_base  = int(os.environ.get("UE_PARAMS_BASE", "0x80000000"), 0) + _rebase
+        _params_base  = self._params_base_addr + _rebase
         _tensor_base  = 0xE1000000 + _rebase
         self.VISION_ISA_BASE             = 0xFF000000 + _rebase
         self.VISION_WORKER_ISA_BASE      = 0xFF400000 + _rebase
-        self.LM_ISA_BASE                 = int(os.environ.get("UE_LM_ISA_BASE", "0xFF620000"), 0) + _rebase
+        self.LM_ISA_BASE                 = self._lm_isa_base_addr + _rebase
         # Per-engine private windows, laid out by the library. Uniform at EVERY
         # engine count -- vision and prefill are sequential and share one arena,
         # so engine i always owns the same window in both, and the window is a
@@ -1470,10 +1508,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # q_size / k_size: bytes of one token's Q / K row (all heads).
         self.q_size = self.head_dim * self.num_q_heads * self.bytes_per_element
         self.k_size = self.head_dim * self.num_kv_heads * self.bytes_per_element
-        self.MAX_CONTEXT_SIZE = MAX_CONTEXT_SIZE
+        self.MAX_CONTEXT_SIZE = self._context_size
         # Keep fallback config lookups (for example sliding_window) consistent
         # when the source macro is changed without editing the JSON file.
-        model["max_context_size"] = MAX_CONTEXT_SIZE
+        model["max_context_size"] = self.MAX_CONTEXT_SIZE
         if (self.MAX_CONTEXT_SIZE < MIN_CONTEXT_SIZE
                 or self.MAX_CONTEXT_SIZE > MAX_CONTEXT_SIZE
                 or self.MAX_CONTEXT_SIZE % 64):

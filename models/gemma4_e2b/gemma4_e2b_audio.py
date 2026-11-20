@@ -38,7 +38,7 @@ AUDIO_FIXED_SOFT_TOKENS = 128
 # region (0x6C000000-0x78000000), below the model map's params at 0x80000000.
 # It was 0x98000000, inside the params (LM weights, 0x80000000-0xE1000000): the
 # audio program overwrote LM weights and every single-core audio run decoded <pad>.
-AUDIO_ISA_BASE = int(os.environ.get("UE_AUDIO_ISA_BASE", "0x78000000"), 0)
+AUDIO_ISA_BASE = 0x78000000   # the engine's _audio_isa_base_addr, unless the wide single-engine map moves it
 # Under the tiled map the audio program gets its own shared-pool allocation of
 # this size (the legacy map's audio ISA region was 96 MiB).
 AUDIO_ISA_BYTES = 96 << 20
@@ -2443,10 +2443,12 @@ class Gemma4AudioMixin:
         """
         if not getattr(self, "_tiled_map", False):
             weights_base, weights_end = self._audio_weight_region()
-            assert weights_end <= AUDIO_ISA_BASE and AUDIO_ISA_BASE + AUDIO_ISA_BYTES <= 0x80000000, (
-                f"audio ISA [0x{AUDIO_ISA_BASE:X}, +{AUDIO_ISA_BYTES >> 20} MiB) must sit between "
-                f"the audio weights (end 0x{weights_end:X}) and the model map's params (0x80000000)")
-            return AUDIO_ISA_BASE
+            isa_base = getattr(self, "_audio_isa_base_addr", AUDIO_ISA_BASE)
+            params_base = getattr(self, "_params_base_addr", 0x80000000)
+            assert weights_end <= isa_base and isa_base + AUDIO_ISA_BYTES <= params_base, (
+                f"audio ISA [0x{isa_base:X}, +{AUDIO_ISA_BYTES >> 20} MiB) must sit between "
+                f"the audio weights (end 0x{weights_end:X}) and the model map's params (0x{params_base:X})")
+            return isa_base
         base = getattr(self, "_audio_isa_alloc", None)
         if base is None:
             base = self.mc_arena.alloc_shared(AUDIO_ISA_BYTES, "audio ISA")
