@@ -156,7 +156,11 @@ def main():
         def body():
             ue.reset_isa_reg_counter()
             emit(reg)
+            instr[0] = ue.capture_count
         return ue._run_transient(body, 600.0)
+
+    instr = [0]                                                             # instructions of the last program run
+    prog = lambda: f"  {instr[0]} instr ({instr[0] * 32} B)"
 
     def hangs(M, K, N):
         """The softmax-free bf16 / fp16 matmul shape that took the board down twice (2026-11-18): a
@@ -212,7 +216,7 @@ def main():
                     C = ue.dma_from_accelerator_memory(a_o, (M, N)).double()
                     label = f"level {L}, sums {'IF8' if prec == 'if8' else 'IF4'}"
                     print(f"  {label:24s} {us / 1e3:9.2f} {us / t_q:6.2f}x {snr(ref_bf, C):9.1f} dB {snr(ref_q, C):8.1f} dB {nbytes[0] / size:7.2f}x"
-                          + ("" if bool(torch.isfinite(C).all()) else "  NaN/Inf!"), flush=True)
+                          + prog() + ("" if bool(torch.isfinite(C).all()) else "  NaN/Inf!"), flush=True)
         return
 
     if args.kernel:
@@ -237,10 +241,10 @@ def main():
             a_c = ue.allocate_tensor_dram(M * N * 2, align_bytes=128)
             t0 = run(lambda reg: ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=a_x, B_DRAM_ADDR=a_w, OUTPUT_DRAM_ADDR=a_c,
                                                     C_DRAM_ADDR=a_b, bias_mode="broadcast_N", gpr_M_reg=reg(M), **act))
-            native = ue.dma_from_accelerator_memory(a_c, (M, N)).double()
+            native, n_prog = ue.dma_from_accelerator_memory(a_c, (M, N)).double(), prog()
             print(f"\n{name}: {args.act or ''}(X [{M}, {K}] . W [{N}, {K}]^T + b)")
             print(f"  {'':12s} {'board ms':>9} {'time':>6} {'vs exact':>9} {'vs native':>10}")
-            print(f"  {'native':12s} {t0 / 1e3:9.2f} {1.0:5.2f}x {snr(exact, native):6.1f} dB", flush=True)
+            print(f"  {'native':12s} {t0 / 1e3:9.2f} {1.0:5.2f}x {snr(exact, native):6.1f} dB {'':>10}" + n_prog, flush=True)
             mark = ue.get_tensor_dram_addr()
             for L in range(1, nn_lib.strassen_levels(K, N, args.levels) + 1):
                 if M % (1 << L):
@@ -255,7 +259,7 @@ def main():
                 if not bool(torch.isfinite(C).all()) or snr(exact, C) < snr(exact, native) - 6:
                     bad.append(f"{name} level {L}")
                 print(f"  {'level ' + str(L):12s} {us / 1e3:9.2f} {us / t0:5.2f}x {snr(exact, C):6.1f} dB {snr(native, C):7.1f} dB"
-                      + ("" if bool(torch.isfinite(C).all()) else "  NaN/Inf!"), flush=True)
+                      + prog() + ("" if bool(torch.isfinite(C).all()) else "  NaN/Inf!"), flush=True)
         print("\nRESULT: " + ("PASS" if not bad else "FAIL (more than 6 dB below the native matmul, or not finite: " + ", ".join(bad) + ")"))
         return
 
