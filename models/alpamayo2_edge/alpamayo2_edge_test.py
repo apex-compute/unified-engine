@@ -130,6 +130,10 @@ ST_ALL_OPS = ("v.o", "v.fc2", "pj.fc2", "lm.q", "lm.k", "lm.v", "lm.o", "lm.fc1"
 # summed (_mm_slabs). lm.fc1 carries its ReLU. Board, one prefill layer, all six ops: 1350 ->
 # 1235 ms; q / o gain the same at level 1 and 2 (0.94x), fc1 / fc2 more at level 2 (0.85x vs 0.91x).
 ST_LM_LEVEL = {"q": 1, "k": 1, "v": 1, "o": 1, "fc1": 2, "fc2": 2}
+if ST_LEVEL and os.environ.get("A2E_STRASSEN_OPS"):     # for users of this file with no command line (the sim driver)
+    ST_OPS = tuple(o for o in os.environ["A2E_STRASSEN_OPS"].split(",") if o)
+    assert all(o in ST_ALL_OPS for o in ST_OPS), f"A2E_STRASSEN_OPS: unknown entry in {ST_OPS}"
+    print(f"Strassen on {', '.join(ST_OPS)} (A2E_STRASSEN_OPS)")
 # The extra weight copies need room, so with Strassen on the tensor and program regions move up:
 # weights 2752 MB (the default ops use 2498), tensors keep 1024 MB, programs 320 MB. The frame-cache
 # path (sim/edge_device_cached.py) compiles extra vision programs and keeps a reserve, so the
