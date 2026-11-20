@@ -117,6 +117,9 @@ def main():
     ap.add_argument("--kernel", action="store_true",
                     help="check the real kernel instead (nn_lib.strassen_matmul_core_dram, with a bias): SNR and time "
                          "against the native matmul at every level a shape allows without padding")
+    ap.add_argument("--act", choices=["gelu", "silu", "relu"], default=None,
+                    help="with --kernel (bf16): fuse this activation, in the native matmul and in the Strassen kernel "
+                         "(activation= / identity_addr=); ends with RESULT: PASS / FAIL")
     ap.add_argument("--dev", default=None)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -217,19 +220,25 @@ def main():
         cases = [("--shape", *args.shape)] if args.shape else [
             ("vision o", 720, 1152, 1152), ("vision fc2", 720, 4352, 1152), ("2048 -> 2048", 408, 2048, 2048), ("4608 -> 2048", 408, 4608, 2048)]
         print("nn_lib.strassen_matmul_core_dram (fp16 intermediates, fp16 leaves, bias folded in), one engine")
+        act = {"gelu": {"gelu_enable": True}, "silu": {"silu_enable": True},
+               "relu": {"clamp_enable": True, "clamp_min": 0.0, "clamp_max": float("inf")}, None: {}}[args.act]
+        fn = {"gelu": lambda v: v * torch.sigmoid(1.702 * v), "silu": lambda v: v * torch.sigmoid(v),
+              "relu": lambda v: v.clamp(min=0), None: lambda v: v}[args.act]
+        bad = []
         for name, M, K, N in cases:
             ue._tensor_dram_addr = base
             g = torch.Generator().manual_seed(args.seed)
             X = torch.randn(M, K, generator=g).to(BF)
             W = (torch.randn(N, K, generator=g) / K ** 0.5).to(BF).float()
             b = torch.randn(N, generator=g).to(BF).float()
-            exact = X.double() @ W.double().T + b.double()
+            exact = fn(X.double() @ W.double().T + b.double())
             a_x, a_w, a_b = put(X), put(W.to(BF)), put(b.to(BF))
+            a_eye = put(torch.eye(64, dtype=BF)) if act else None
             a_c = ue.allocate_tensor_dram(M * N * 2, align_bytes=128)
             t0 = run(lambda reg: ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=a_x, B_DRAM_ADDR=a_w, OUTPUT_DRAM_ADDR=a_c,
-                                                    C_DRAM_ADDR=a_b, bias_mode="broadcast_N", gpr_M_reg=reg(M)))
+                                                    C_DRAM_ADDR=a_b, bias_mode="broadcast_N", gpr_M_reg=reg(M), **act))
             native = ue.dma_from_accelerator_memory(a_c, (M, N)).double()
-            print(f"\n{name}: X [{M}, {K}] . W [{N}, {K}]^T + b")
+            print(f"\n{name}: {args.act or ''}(X [{M}, {K}] . W [{N}, {K}]^T + b)")
             print(f"  {'':12s} {'board ms':>9} {'time':>6} {'vs exact':>9} {'vs native':>10}")
             print(f"  {'native':12s} {t0 / 1e3:9.2f} {1.0:5.2f}x {snr(exact, native):6.1f} dB", flush=True)
             mark = ue.get_tensor_dram_addr()
@@ -240,10 +249,14 @@ def main():
                 tree = nn_lib.strassen_weight_tree(W, b, L, put, put)
                 scratch = [(ue._alloc(x, zero=True), ue._alloc(p_, zero=True)) for x, p_ in nn_lib.strassen_scratch_elements(M, K, N, L)]
                 a_o = ue.allocate_tensor_dram(M * N * 2, align_bytes=128)
-                us = run(lambda reg: nn_lib.strassen_matmul_core_dram(ue, M, K, N, a_x, tree, a_o, scratch))
+                us = run(lambda reg: nn_lib.strassen_matmul_core_dram(ue, M, K, N, a_x, tree, a_o, scratch,
+                                                                      activation=act or None, identity_addr=a_eye))
                 C = ue.dma_from_accelerator_memory(a_o, (M, N)).double()
+                if not bool(torch.isfinite(C).all()) or snr(exact, C) < snr(exact, native) - 6:
+                    bad.append(f"{name} level {L}")
                 print(f"  {'level ' + str(L):12s} {us / 1e3:9.2f} {us / t0:5.2f}x {snr(exact, C):6.1f} dB {snr(native, C):7.1f} dB"
                       + ("" if bool(torch.isfinite(C).all()) else "  NaN/Inf!"), flush=True)
+        print("\nRESULT: " + ("PASS" if not bad else "FAIL (more than 6 dB below the native matmul, or not finite: " + ", ".join(bad) + ")"))
         return
 
     summary = []
