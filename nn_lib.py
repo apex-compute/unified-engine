@@ -1367,8 +1367,10 @@ def flash_attention_batched_pbi(
 #   * A fused activation (GELU / SiLU / ReLU clamp) is supported through activation= and
 #     identity_addr=, at a cost: the hardware ignores the activation fields on an elementwise pass,
 #     so the output quarters that do not end in a product (1/2 of the output at level 1, 3/4 at
-#     level 2) go through an on-chip identity product, ~1 cycle per value (3-4 ns), one op per 64
-#     values. Worth it on a large many-row matmul; marginal on a small one.
+#     level 2) go through an on-chip identity product, ~1 cycle per value (3-4 ns), one product
+#     per 64 values in a hardware loop: a few dozen instructions per call (STRASSEN_ACTIVATE_LOOPED;
+#     the looped form is not board-verified yet, 0 = the verified one instruction per 64 values).
+#     Worth it on a large many-row matmul; marginal on a small one.
 #   * Scratch is private per engine and zero-filled once (fresh DRAM holds NaN patterns). It ends
 #     up holding fp16: never read it as bf16.
 #   * store_w / store_b get fp16 tensors and must upload them unchanged.
@@ -1598,26 +1600,95 @@ def _strassen_rows(ue, src: int, dst: int, pitch: int, cols: int, rows: int, sca
                                       element_size=take * cols, **wr)
 
 
+STRASSEN_ACTIVATE_LOOPED = 2        # _strassen_activate: 0 = one op per 64 values (unrolled, board-verified),
+                                    # 1 = a hardware loop over the rows of each piece, 2 = and one over the pieces
+STRASSEN_ACTIVATE_UNROLL = 8        # identity products per row-loop iteration (must divide 1024)
+
+
+def _strassen_anchor(ue) -> None:
+    """Absolute jump to the next instruction: reloads the i-cache window, so the relative jumps
+    of the loops that follow land inside it."""
+    ue.generate_instruction_jump_abs(ue_35bit_addr_shifter(
+        ue.get_program_dram_addr() + (ue.capture_count + 1) * INSTRUCTION_SIZE_BYTES))
+
+
 def _strassen_activate(ue, addr: int, elements: int, activation: dict, identity_addr: int, out_format) -> None:
     """act(x) in place over an fp16 buffer, written in out_format. The hardware applies an
     activation only behind a dot product (on an elementwise pass the fields are ignored), so this
-    is an identity matrix-vector product per 64 values, done on chip: ~1 cycle per value."""
+    is an identity matrix-vector product per 64 values, done on chip: ~1 cycle per value.
+
+    STRASSEN_ACTIVATE_LOOPED picks the program: 0 emits every product (one instruction per 64
+    values); 1 loops them with one pointer row whose vector and result rows advance by one per
+    product; 2 also loops the full 65536-value pieces with two more pointer rows for the load and
+    the store, leaving only a short last piece outside. Same ops on the same data in all three."""
     fm = TensorFormats(a=StorageFormat.FP16, b=StorageFormat.BF16, output=out_format)
     mode, la, lb = ue._matmul_activation(
         activation.get("gelu_enable", False), activation.get("silu_enable", False), activation.get("sigmoid_enable", False),
         activation.get("clamp_enable", False), activation.get("log_enable", False),
         activation.get("clamp_min", 0.0), activation.get("clamp_max", float("inf")), formats=fm)
+    P, V, U = STRASSEN_PIECE_ELEMENTS, UE_VECTOR_SIZE, STRASSEN_ACTIVATE_UNROLL
     out_sram = URAM_A_BASE + 0x40000                            # the results, clear of the 1024 rows loaded below
-    for e0 in range(0, elements, STRASSEN_PIECE_ELEMENTS):
-        take = min(STRASSEN_PIECE_ELEMENTS, elements - e0)
-        assert take % UE_VECTOR_SIZE == 0
-        ue.accelerator_memory_to_sram(accelerator_dram_address=addr + e0 * 2, sram_address=URAM_A_BASE, element_size=take)
-        ue.accelerator_memory_to_sram(accelerator_dram_address=identity_addr, sram_address=URAM_B_BASE,
-                                      element_size=UE_VECTOR_SIZE * UE_VECTOR_SIZE)
-        for row in range(take // UE_VECTOR_SIZE):
-            ue.start_queue_for_bf16_matvec_operation(0, 0, URAM_A_BASE + row * 128, URAM_B_BASE, out_sram + row * 128,
-                                                     UE_VECTOR_SIZE, UE_VECTOR_SIZE, lalu_mode=mode, lalu_a=la, lalu_b=lb, formats=fm)
-        ue.sram_to_accelerator_memory(out_sram, addr + e0 * 2, take)
+    assert elements % V == 0
+    if not STRASSEN_ACTIVATE_LOOPED:
+        for e0 in range(0, elements, P):
+            take = min(P, elements - e0)
+            ue.accelerator_memory_to_sram(accelerator_dram_address=addr + e0 * 2, sram_address=URAM_A_BASE, element_size=take)
+            ue.accelerator_memory_to_sram(accelerator_dram_address=identity_addr, sram_address=URAM_B_BASE, element_size=V * V)
+            for row in range(take // V):
+                ue.start_queue_for_bf16_matvec_operation(0, 0, URAM_A_BASE + row * 128, URAM_B_BASE, out_sram + row * 128,
+                                                         V, V, lalu_mode=mode, lalu_a=la, lalu_b=lb, formats=fm)
+            ue.sram_to_accelerator_memory(out_sram, addr + e0 * 2, take)
+        return
+
+    assert (P // V) % U == 0
+    out_row = out_sram >> 7
+    dot = ue.alloc_inst_ptr()
+
+    def product():                  # reads the pointer row, then moves its vector and result rows on by one
+        ue.start_queue_for_bf16_matvec_operation(0, 0, URAM_A_BASE + 128, URAM_B_BASE, URAM_A_BASE + 128, 0, 0,
+                                                 lalu_mode=mode, lalu_a=la, lalu_b=lb, inst_pointer_idx=dot, formats=fm)
+
+    def piece(take, load, store):
+        load()
+        ue.accelerator_memory_to_sram(accelerator_dram_address=identity_addr, sram_address=URAM_B_BASE, element_size=V * V)
+        # the fields of the unrolled product: K = N = 64, vector row 0, identity row 0, results from out_row
+        ue.generate_instruction_pbi_init(dma_length=V * V, output_size=V, uram_length=1, uram_wb_addr=out_row,
+                                         inst_pointer_idx=dot)
+        rows = take // V
+        if rows >= U:
+            ue.loop_start(loop_cnt=rows // U)
+            for _ in range(U):
+                product()
+            assert ue.loop_end() <= 256
+        for _ in range(rows % U):
+            product()
+        store()
+
+    done = 0
+    if STRASSEN_ACTIVATE_LOOPED >= 2 and elements >= 2 * P:     # the full pieces: load and store through advancing pointers
+        src, dst = ue.alloc_inst_ptr(), ue.alloc_inst_ptr()
+        ue.generate_instruction_pbi_init(dram_shared_addr=addr, dma_length=P * 2, inst_pointer_idx=src)
+        ue.generate_instruction_pbi_init(dram_shared_addr=addr, dma_length=P * 2, uram_a_start_addr=out_row,
+                                         uram_b_start_addr=out_row, inst_pointer_idx=dst)
+        _strassen_anchor(ue)
+        ue.loop_start(loop_cnt=elements // P)
+        piece(P,
+              lambda: ue.accelerator_memory_to_sram(accelerator_dram_address=P * 2, sram_address=URAM_A_BASE,
+                                                    element_size=0, inst_pointer_idx=src),
+              lambda: ue.sram_to_accelerator_memory(sram_address=URAM_A_BASE, accelerator_dram_address=P * 2,
+                                                    element_size=0, inst_pointer_idx=dst))
+        assert ue.loop_end() <= 256
+        ue.release_inst_ptr(dst)
+        ue.release_inst_ptr(src)
+        done = elements // P * P
+    for e0 in range(done, elements, P):
+        take = min(P, elements - e0)
+        _strassen_anchor(ue)
+        piece(take,
+              lambda: ue.accelerator_memory_to_sram(accelerator_dram_address=addr + e0 * 2, sram_address=URAM_A_BASE,
+                                                    element_size=take),
+              lambda: ue.sram_to_accelerator_memory(out_sram, addr + e0 * 2, take))
+    ue.release_inst_ptr(dot)
 
 
 def strassen_matmul_core_dram(ue, M: int, K: int, N: int, A_DRAM_ADDR: int, tree: dict,
