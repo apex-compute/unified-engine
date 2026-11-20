@@ -98,7 +98,9 @@ Replaces one large `matmat_mul_core` call with 7 half-size products instead of 8
 
 Online costs 1-2 points of speed against stored leaves and no weight memory (stored: 2.9x / 5.7x on a 4-bit layer, 1.75x / 3.06x on bf16). Accuracy: a 4-bit layer stays at the plain 4-bit matmul's 20.1 dB at both levels (stored IF8 sums: 20.0 / 19.8 dB); a bf16 layer is the same as stored leaves, 54.5 / 52.4 dB. The sum scratch is 5 (level 1) or 45 (level 2) cells of fp16, one buffer for the whole model.
 
-**When to use it.** Both widths 1024 or more and halving into whole 64-lane blocks, several hundred rows per call, no fused activation, and a matmul that is a large share of the model's time. Level 2 when one side is 2048 or wider, otherwise level 1. Level 3 never won. A width that needs padding to halve is not worth it.
+**When to use it.** Both widths 1024 or more and halving into whole 64-lane blocks, several hundred rows per call, and a matmul that is a large share of the model's time. Level 2 when one side is 2048 or wider, otherwise level 1. Level 3 never won. A width that needs padding to halve is not worth it.
+
+**Fused activation.** `activation=` (the `matmat_mul_core` arguments, e.g. `{"gelu_enable": True}`) with `identity_addr=` (a 64 x 64 bf16 identity in DRAM). The output quarters that end in a product take the activation fused. The rest (1/2 of the output at level 1, 3/4 at level 2) go through an on-chip identity product, because the hardware ignores the activation on elementwise ops. Measured cost of that pass: 3.1-4.1 ns per value, 55 dB for GELU, SiLU and ReLU. The kernel path itself is not board-verified yet.
 
 **In models.** Alpamayo 2 Edge, vision `o_proj` / `fc2` and projector `fc2` at level 1 (on by default): 73.2 s -> 72.6 s per plan, same output. Parakeet, 128-row clips: 1.8%. Swin, last stage only: 0.4%. Both are off by default (`--strassen-level`). No 4-bit model uses it yet.
 
