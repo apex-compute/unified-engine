@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OllApeX</title>
+<link rel="icon" href="/static/ollapex-mark.svg">
+<link rel="stylesheet" href="/static/katex/katex.min.css">
+<script src="/static/katex/katex.min.js"></script>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #141a22; --mute: #5d6878; --line: #e2e6ec; --soft: #eef1f5;
+  --acc: #0f5fa8; --acc-ink: #ffffff; --good: #1d7a46; --warn: #a15c00; --bad: #b3261e; --user: #e8f0fa;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, "DejaVu Sans Mono", monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0e1116; --panel: #161b22; --ink: #e7ebf0; --mute: #94a0b0; --line: #262d38; --soft: #1c232d;
+    --acc: #5aa9f0; --acc-ink: #06121f; --good: #56c487; --warn: #e0a54a; --bad: #f2776f; --user: #1a2a3d; color-scheme: dark; }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+button, select, input, textarea { font: inherit; color: inherit; }
+.app { display: grid; grid-template-rows: auto 1fr; height: 100%; }
+header { display: flex; align-items: center; gap: 14px; padding: 10px 18px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.brand { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: 18px; letter-spacing: -.01em; }
+.brand svg { width: 26px; height: 26px; }
+.brand b { color: var(--acc); font-weight: 700; }
+.ctl { display: flex; align-items: center; gap: 6px; color: var(--mute); font-size: 12.5px; }
+select { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 5px 8px; }
+.pill { display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px; border-radius: 999px; background: var(--soft); font-size: 12.5px; white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--mute); }
+.dot.ready { background: var(--good); } .dot.busy { background: var(--acc); animation: pulse 1s infinite; }
+.dot.loading { background: var(--warn); animation: pulse 1s infinite; } .dot.error { background: var(--bad); }
+@keyframes pulse { 50% { opacity: .35; } }
+.spacer { flex: 1; }
+.powered { display: flex; align-items: center; gap: 9px; color: var(--mute); font-size: 11.5px; text-decoration: none; }
+main { display: grid; grid-template-columns: minmax(0, 1fr) 380px; min-height: 0; }
+.chat { display: grid; grid-template-rows: 1fr auto; min-height: 0; }
+.msgs { overflow-y: auto; padding: 22px max(18px, calc((100% - 820px) / 2)); }
+.empty { color: var(--mute); text-align: center; margin-top: 12vh; }
+.empty h2 { color: var(--ink); font-size: 20px; margin: 0 0 6px; font-weight: 650; }
+.msg { margin: 0 0 16px; display: flex; flex-direction: column; }
+.msg .who { font-size: 11.5px; color: var(--mute); margin: 0 2px 3px; }
+.msg.user { align-items: flex-end; }
+.bubble { max-width: 100%; padding: 10px 14px; border-radius: 12px; background: var(--panel); border: 1px solid var(--line); overflow-wrap: anywhere; }
+.msg.user .bubble { background: var(--user); border-color: transparent; white-space: pre-wrap; max-width: 85%; }
+.bubble p { margin: 0 0 8px; } .bubble p:last-child { margin-bottom: 0; }
+.bubble h3, .bubble h4 { margin: 10px 0 5px; font-size: 14.5px; }
+.bubble ul, .bubble ol { margin: 4px 0 8px; padding-left: 22px; }
+.bubble code { font-family: var(--mono); font-size: 12.5px; background: var(--soft); padding: 1px 5px; border-radius: 4px; }
+.bubble pre { background: var(--soft); padding: 10px 12px; border-radius: 8px; overflow-x: auto; margin: 6px 0 8px; }
+.bubble pre code { background: none; padding: 0; }
+.think { border-left: 3px solid var(--line); margin: 0 0 8px; padding: 2px 10px; color: var(--mute); font-size: 13px; white-space: pre-wrap; }
+.think summary { cursor: pointer; }
+.foot { font-size: 11.5px; color: var(--mute); margin: 4px 2px 0; font-variant-numeric: tabular-nums; }
+.err { color: var(--bad); }
+.chip img { display: block; max-width: 220px; max-height: 160px; border-radius: 5px; margin: 4px 0; }
+.chip { display: block; width: fit-content; font-size: 11.5px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; margin: 0 0 6px auto; color: var(--mute); }
+.hint a { color: var(--acc); }
+.composer { padding: 10px max(18px, calc((100% - 820px) / 2)) 16px; }
+.box { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 8px 10px; }
+.box:focus-within { border-color: var(--acc); }
+textarea#in { width: 100%; border: 0; outline: 0; resize: none; background: transparent; min-height: 44px; max-height: 180px; padding: 4px; }
+.row { display: flex; align-items: center; gap: 8px; }
+.btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 11px; cursor: pointer; }
+.btn:hover:not(:disabled) { background: var(--soft); } .btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn.primary { background: var(--acc); color: var(--acc-ink); border-color: transparent; font-weight: 600; }
+.btn.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--acc); }
+.btn.stop { background: var(--bad); color: #fff; border-color: transparent; }
+.settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 14px; padding: 10px 4px 4px; border-top: 1px solid var(--line); margin-top: 8px; }
+.settings label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--mute); }
+.settings input[type=number], .settings textarea { background: var(--bg); border: 1px solid var(--line); border-radius: 7px; padding: 5px 7px; }
+.settings input[type=range] { width: 100%; accent-color: var(--acc); }
+.settings .wide { grid-column: 1 / -1; }
+.settings .val { color: var(--ink); font-variant-numeric: tabular-nums; }
+.hint { font-size: 11.5px; color: var(--mute); }
+aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 14px 16px 30px; }
+aside h3 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--mute); margin: 18px 0 8px; font-weight: 650; }
+aside h3:first-child { margin-top: 2px; }
+.big { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.stat { background: var(--soft); border-radius: 10px; padding: 9px 11px; }
+.stat .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.stat .l { font-size: 11.5px; color: var(--mute); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 12.5px; }
+.kv dt { color: var(--mute); } .kv dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.bar { height: 7px; background: var(--soft); border-radius: 4px; overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--acc); border-radius: 4px; transition: width .3s; }
+table.t { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+table.t th { text-align: right; font-weight: 600; color: var(--mute); padding: 3px 4px; border-bottom: 1px solid var(--line); }
+table.t td { text-align: right; padding: 3px 4px; border-bottom: 1px solid var(--line); }
+table.t th:first-child, table.t td:first-child { text-align: left; }
+.cardrow { display: grid; grid-template-columns: 92px 1fr 60px; gap: 8px; align-items: center; font-size: 12px; margin-bottom: 5px; font-variant-numeric: tabular-nums; }
+.cardrow .n { font-family: var(--mono); } .cardrow .m { text-align: right; color: var(--mute); } .cardrow .m b { color: var(--ink); font-weight: 650; }
+.stat.live .v { color: var(--acc); }
+.cardrow small { color: var(--mute); display: block; font-size: 10.5px; white-space: nowrap; font-family: system-ui, sans-serif; }
+details.raw summary { cursor: pointer; color: var(--mute); font-size: 12px; margin-top: 14px; }
+details.raw pre { font: 11px/1.4 var(--mono); background: var(--soft); padding: 8px; border-radius: 8px; overflow-x: auto; max-height: 320px; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { border-left: 0; border-top: 1px solid var(--line); max-height: 45vh; } }
+
+.bubble .mathblock { overflow-x: auto; overflow-y: hidden; margin: 6px 0 8px; }
+.bubble .katex-display { margin: 0; }
+.bubble .katex { font-size: 1.08em; }
+.bubble hr { border: 0; border-top: 1px solid var(--line, rgba(127,127,127,.3)); margin: 10px 0; }
+.bubble table.md { border-collapse: collapse; margin: 6px 0 8px; font-size: .95em; display: block; overflow-x: auto; }
+.bubble table.md th, .bubble table.md td { border: 1px solid var(--line, rgba(127,127,127,.3)); padding: 4px 8px; text-align: left; }
+.bubble table.md th { background: var(--soft); }
+</style>
+</head>
+<body>
+<div class="app">
+<header>
+  <div class="brand">
+    <svg viewBox="0 0 32 32" fill="none" aria-hidden="true"><rect x="6" y="6" width="20" height="20" rx="4" stroke="currentColor" stroke-width="2.2"/><path d="M12 2v4M20 2v4M12 26v4M20 26v4M2 12h4M2 20h4M26 12h4M26 20h4" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><path d="M11.5 20.5 16 11l4.5 9.5M13.3 17.3h5.4" stroke="var(--acc)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span>Oll<b>ApeX</b></span>
+  </div>
+  <div class="ctl">Model <select id="model"></select></div>
+  <div class="ctl" title="Context length loaded onto the cards. Changing it reloads the model (a few minutes).">Context <select id="ctx"></select></div>
+  <span class="pill"><span class="dot" id="dot"></span><span id="state">connecting…</span></span>
+  <button class="btn" id="new">New chat</button>
+  <a class="btn" href="/yolo" style="text-decoration:none" title="YOLO26 object detection on the same cards">YOLO</a>
+  <span class="spacer"></span>
+  <a class="powered" href="https://apexcompute.com" target="_blank" rel="noopener" title="Apex Compute Unified Engine">
+    <span>Runs on Apex Compute FPGA cards</span>
+  </a>
+</header>
+<main>
+  <section class="chat">
+    <div class="msgs" id="msgs">
+      <div class="empty" id="empty"><h2>OllApeX</h2><div>The model runs on all Apex Compute FPGA cards at the same time.<br>Ask something, or attach a file or an image; inference details appear on the right.</div></div>
+    </div>
+    <div class="composer">
+      <div class="box">
+        <textarea id="in" rows="1" placeholder="Type your message…  (Enter sends, Shift+Enter for a new line)"></textarea>
+        <div class="row">
+          <button class="btn" id="attach" title="Attach a text, code or PDF file, or an image">Attach file</button><input type="file" id="file" hidden accept="image/png,image/jpeg,image/webp,image/gif,image/bmp,.txt,.md,.csv,.json,.log,.py,.js,.ts,.c,.h,.cpp,.java,.go,.rs,.sh,.yaml,.yml,.xml,.html,.css,.sql,.ini,.toml,.pdf,text/*">
+          <button class="btn" id="toggle">Settings</button>
+          <span class="hint" id="hint"></span>
+          <span class="spacer"></span>
+          <button class="btn primary" id="send">Send</button>
+        </div>
+        <div class="settings" id="settings" hidden>
+          <label>Temperature <span class="val" id="tv">0 (most likely token)</span><input type="range" id="temp" min="0" max="1.5" step="0.05" value="0"></label>
+          <label>top_k <span class="val" id="kv">4</span><input type="range" id="topk" min="1" max="4" step="1" value="4"></label>
+          <label>top_p <span class="val" id="pv">1.00</span><input type="range" id="topp" min="0.1" max="1" step="0.05" value="1"></label>
+          <label>Max tokens to generate (num_predict)<input type="number" id="npred" min="1" max="8192" value="1024"></label>
+          <label>Seed (empty = random)<input type="number" id="seed" placeholder="random"></label>
+          <label>Thinking mode<select id="think"><option value="0">Off</option><option value="1">On</option></select></label>
+          <label>Image detail<select id="detail"></select></label>
+          <label class="wide">System prompt<textarea id="system" rows="2" placeholder="Optional. E.g. Answer briefly."></textarea></label>
+          <div class="hint wide">At temperature 0 the token is chosen on the cards. Above 0, each core reports its four best candidates and sampling happens among them, so top_k is at most 4.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+  <aside>
+    <h3>Inference</h3>
+    <div class="big">
+      <div class="stat"><div class="v" id="s-tps">–</div><div class="l">tokens/s (generation)</div></div>
+      <div class="stat"><div class="v" id="s-tok">–</div><div class="l">tokens generated</div></div>
+      <div class="stat"><div class="v" id="s-ttft">–</div><div class="l">time to first token</div></div>
+      <div class="stat"><div class="v" id="s-ms">–</div><div class="l">ms / token</div></div>
+    </div>
+    <div class="hint" id="s-phase" style="margin-top:8px"></div>
+
+    <h3>Context</h3>
+    <div class="bar"><i id="ctxbar" style="width:0"></i></div>
+    <dl class="kv" style="margin-top:7px">
+      <dt>Used / limit</dt><dd id="c-used">–</dd>
+      <dt>Prompt tokens</dt><dd id="c-prompt">–</dd>
+      <dt>Already on the cards</dt><dd id="c-reuse">–</dd>
+      <dt>Image tokens</dt><dd id="c-img">–</dd>
+      <dt>Prompt reading</dt><dd id="c-prefill">–</dd>
+    </dl>
+
+    <h3>Data exchange</h3>
+    <div class="big">
+      <div class="stat"><div class="v" id="x-tok">–</div><div class="l">per token · CPU ↔ cards</div></div>
+      <div class="stat" id="x-ans-box"><div class="v" id="x-ans">–</div><div class="l" id="x-ans-l">last answer</div></div>
+    </div>
+    <dl class="kv" id="x-kv" style="margin-top:8px"></dl>
+    <div id="x-cards" style="margin-top:8px"></div>
+    <div class="hint" id="x-note" style="margin-top:6px"></div>
+
+    <h3>Cards <span id="cards-sub" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h3>
+    <div id="cards"><div class="hint">Shown once the model is loaded.</div></div>
+
+    <h3>Model and system</h3>
+    <dl class="kv" id="sys"></dl>
+
+    <h3>Power and energy</h3>
+    <div class="big">
+      <div class="stat" id="p-wall-box"><div class="v" id="p-wall">–</div><div class="l" id="p-wall-l">system power</div></div>
+      <div class="stat" id="p-card-box"><div class="v" id="p-card">–</div><div class="l" id="p-card-l">per FPGA card</div></div>
+      <div class="stat"><div class="v" id="p-jtok">–</div><div class="l" id="p-jtok-l">energy per token</div></div>
+      <div class="stat"><div class="v" id="p-wh">–</div><div class="l" id="p-wh-l">energy, last answer</div></div>
+    </div>
+    <dl class="kv" id="p-kv" style="margin-top:8px"></dl>
+    <div class="hint" id="p-note" style="margin-top:6px"></div>
+
+    <div id="vis-box" hidden>
+    <h3>Image encoder</h3>
+    <dl class="kv" id="vis-kv"></dl>
+    <div class="hint" id="vis-note" style="margin-top:6px">The image encoder (27 transformer blocks) runs on one FPGA card; its output goes to all cards as prompt tokens.</div>
+    </div>
+
+    <h3>Time per token</h3>
+    <div id="segs"><div class="hint">Shown after the first answer.</div></div>
+
+    <details class="raw"><summary>Raw technical data (JSON)</summary><pre id="raw">–</pre></details>
+  </aside>
+</main>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const fmt = (v, d = 1) => (v === null || v === undefined || isNaN(v)) ? "–" : Number(v).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+const SEG = { attention: "Attention", router_and_experts: "Router + experts", router_and_ffn: "Router + FFN (dense + experts)", linear_attention: "Linear attention", linear_mlp: "Linear-layer MLP", full_attention: "Full attention", full_mlp: "Full-attention-layer MLP", lm_head: "Output head" };
+let status = null, messages = [], busy = false, ctrl = null, lastStats = null;
+
+function esc(s) { return s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+function inline(s) {
+  return esc(s).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/(^|[\s(])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>");
+}
+function tex(src, display) {
+  if (typeof katex === "undefined") return esc(display ? "\\[" + src + "\\]" : "\\(" + src + "\\)");
+  try { return katex.renderToString(src, { displayMode: display, throwOnError: false, output: "html", strict: "ignore" }); }
+  catch (e) { return esc(src); }
+}
+function md(src) {
+  // math is cut out first (rendered by KaTeX, kept as placeholders), so the markdown rules never touch it
+  const math = [];
+  const keep = (tx, display) => { math.push(tex(tx, display)); return display ? "\n\u0001D" + (math.length - 1) + "\u0002\n" : "\u0001I" + (math.length - 1) + "\u0002"; };
+  const pullMath = s => s
+    .replace(/\$\$([\s\S]+?)\$\$/g, (_, x) => keep(x, true))
+    .replace(/\\\[([\s\S]+?)\\\]/g, (_, x) => keep(x, true))
+    .replace(/\\\(([\s\S]+?)\\\)/g, (_, x) => keep(x, false))
+    .replace(/(^|[^\\$\w])\$([^\s$](?:[^$\n]*?[^\s$])?)\$(?![\w$])/g, (_, pre, x) => pre + keep(x, false));
+  const out = []; let list = null, para = [];
+  const flushP = () => { if (para.length) { out.push("<p>" + para.join("<br>") + "</p>"); para = []; } };
+  const flushL = () => { if (list) { out.push("</" + list + ">"); list = null; } };
+  const row = l => /^\s*\|.*\|\s*$/.test(l);
+  const rule = l => /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/.test(l);
+  const cells = l => l.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map(c => inline(c.trim()));
+  const parts = src.split(/```/);
+  parts.forEach((part, i) => {
+    if (i % 2) { flushP(); flushL(); out.push("<pre><code>" + esc(part.replace(/^[a-zA-Z0-9_+-]*\n/, "")) + "</code></pre>"); return; }
+    const lines = pullMath(part).split("\n");
+    for (let j = 0; j < lines.length; j++) {
+      const line = lines[j];
+      let m;
+      if ((m = line.match(/^\s*\u0001D(\d+)\u0002\s*$/))) { flushP(); flushL(); out.push('<div class="mathblock">\u0001D' + m[1] + "\u0002</div>"); }
+      else if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) { flushP(); flushL(); out.push("<hr>"); }
+      else if (row(line) && j + 1 < lines.length && rule(lines[j + 1])) {
+        flushP(); flushL();
+        let h = '<table class="md"><thead><tr>' + cells(line).map(c => "<th>" + c + "</th>").join("") + "</tr></thead><tbody>";
+        j += 2;
+        while (j < lines.length && row(lines[j])) { h += "<tr>" + cells(lines[j]).map(c => "<td>" + c + "</td>").join("") + "</tr>"; j++; }
+        j--;
+        out.push(h + "</tbody></table>");
+      }
+      else if ((m = line.match(/^(#{1,6})\s+(.*)$/))) { flushP(); flushL(); out.push((m[1].length <= 2 ? "<h3>" : "<h4>") + inline(m[2]) + (m[1].length <= 2 ? "</h3>" : "</h4>")); }
+      else if ((m = line.match(/^\s*[-*•]\s+(.*)$/))) { flushP(); if (list !== "ul") { flushL(); out.push("<ul>"); list = "ul"; } out.push("<li>" + inline(m[1]) + "</li>"); }
+      else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) { flushP(); if (list !== "ol") { flushL(); out.push("<ol>"); list = "ol"; } out.push("<li>" + inline(m[1]) + "</li>"); }
+      else if (!line.trim()) { flushP(); flushL(); }
+      else { flushL(); para.push(inline(line)); }
+    }
+  });
+  flushP(); flushL();
+  return out.join("").replace(/\u0001[DI](\d+)\u0002/g, (_, n) => math[+n]);
+}
+
+function addMsg(role, text) {
+  $("empty")?.remove();
+  const el = document.createElement("div");
+  el.className = "msg " + role;
+  el.innerHTML = '<div class="who">' + (role === "user" ? "You" : (status?.model || "model")) + '</div><div class="bubble"></div><div class="foot"></div>';
+  const b = el.querySelector(".bubble");
+  if (role === "user") b.textContent = text; else b.innerHTML = text ? md(text) : "";
+  $("msgs").appendChild(el);
+  $("msgs").scrollTop = $("msgs").scrollHeight;
+  return el;
+}
+
+function renderStatus() {
+  const s = status; if (!s) return;
+  const dot = $("dot"), st = $("state");
+  dot.className = "dot " + (s.error && s.state === "unloaded" ? "error" : s.state);
+  if (s.state === "loading") {
+    const p = s.progress || {};
+    st.textContent = "Loading onto cards" + (p.cards ? " · " + p.ready + "/" + p.cards + " cards" : "") + " · " + Math.round(p.elapsed_s || 0) + " s";
+  } else if (s.state === "ready") st.textContent = "Ready · " + hwCount(s.info).label;
+  else if (s.state === "busy") st.textContent = "Generating" + (s.waiting ? " · " + s.waiting + " queued" : "");
+  else st.textContent = s.error ? "Error: " + s.error.split("\n")[0].slice(0, 80) : "No model loaded";
+  const ms = $("model");
+  if (ms.options.length !== s.models.length) { ms.innerHTML = s.models.map(m => "<option>" + m + "</option>").join(""); }
+  if (document.activeElement !== ms && s.model) ms.value = s.model;
+  const cs = $("ctx");
+  if (!cs.options.length) cs.innerHTML = s.limits.ctx_choices.map(c => '<option value="' + c + '">' + c + " tokens</option>").join("");
+  if (document.activeElement !== cs && s.num_ctx) cs.value = s.num_ctx;
+  $("npred").max = s.limits.max_ctx;
+  const ds = $("detail");
+  const dsig = s.image_detail ? JSON.stringify(s.image_detail.choices) + s.image_detail.unit : "";
+  if (s.image_detail && ds.dataset.sig !== dsig) {
+    const keep = ds.value;
+    ds.innerHTML = Object.entries(s.image_detail.choices).map(([k, v]) => '<option value="' + k + '">' + k[0].toUpperCase() + k.slice(1) + " · " +
+      (s.image_detail.unit === "tokens" ? "up to " + v + " tokens" : "up to " + v + " px, " + Math.pow(v / 32, 2) + " tokens") + "</option>").join("");
+    ds.value = keep && s.image_detail.choices[keep] ? keep : s.image_detail.default; ds.dataset.sig = dsig;
+    if (attached) setAttached(attached);
+  }
+  const vi = s.info || {};
+  $("vis-note").textContent = vi.vision_shards ? "The image encoder (27 transformer blocks) runs tensor-parallel on " + vi.vision_shards + " FPGA engines; its output goes to all cards as one block of prompt tokens."
+    : "The image encoder (27 transformer blocks) runs on one FPGA card; its output goes to all cards as prompt tokens.";
+  ds.disabled = !s.vision;
+
+  $("send").disabled = !busy && s.state === "loading";
+  renderCards(); renderSys(); renderPower(); renderExchange();
+}
+
+function hwCount(i) {
+  const cores = i?.cards?.length || 0, cards = new Set((i?.cards || []).map(c => c.bdf || c.dev.split("/")[0])).size;
+  return { cards, cores, label: cards + " cards" + (cores > cards ? " · " + cores + " cores" : "") };
+}
+function renderCards() {
+  const info = status?.info, st = lastStats;
+  if (!info) { $("cards-sub").textContent = ""; return; }
+  $("cards-sub").textContent = "· " + hwCount(info).label + " · " + fmt(info.weights_mb / 1000, 1) + " GB weights";
+  const comp = {}; (st?.cards || []).forEach(c => comp[c.index] = c);
+  const max = Math.max(1, ...Object.values(comp).map(c => c.compute_ms_per_token));
+  const pd = powerModel(), act = generating(), tsum = Object.values(comp).reduce((a, c) => a + c.compute_ms_per_token, 0);
+  // a card's share of the power that inference adds follows its share of the compute time
+  const watts = c => !pd ? null : !act ? pd.fpgaIdle / pd.cores : pd.fpgaIdle / pd.cores + (pd.fpgaActive - pd.fpgaIdle) * (tsum && comp[c.index] ? comp[c.index].compute_ms_per_token / tsum : 1 / pd.cores);
+  $("cards").innerHTML = info.cards.map(c => {
+    const t = comp[c.index];
+    return '<div class="cardrow"><div class="n">' + c.dev + '<small>' + c.link + '</small></div>' +
+      '<div><div class="bar"><i style="width:' + (t ? 100 * t.compute_ms_per_token / max : 0) + '%"></i></div>' +
+      '<small style="color:var(--mute);font-size:10.5px">' + c.bdf.replace("0000:", "") + " · " + Math.round(c.params_mb) + " MB · " +
+      (c.plan?.vh ? "value heads " + c.plan.vh[0] + "–" + (c.plan.vh[1] - 1) : "") + '</small></div>' +
+      '<div class="m">' + (pd ? "<b>" + fmt(watts(c), 1) + " W</b>" : "") + (t ? (pd ? "<small>" : "") + fmt(t.compute_ms_per_token, 0) + " ms" + (pd ? "</small>" : "") : (pd ? "" : "–")) + '</div></div>';
+  }).join("") + '<div class="hint">' + (st?.cards ? "Bar and ms: compute time per token, measured by each core&#39;s own hardware counter. " : "") + (pd ? "Watts: per " + (pd.cores > pd.n ? "core" : "card") + ", " + (act ? "generating" : "idle with the model loaded") + "." : "") + "</div>";
+}
+
+function renderSys() {
+  const s = status, i = s?.info, st = lastStats;
+  const rows = [];
+  const add = (k, v) => rows.push("<dt>" + k + "</dt><dd>" + v + "</dd>");
+  if (i) {
+    add("Model", i.model + " · " + (i.details?.parameter_size || ""));
+    add("Quantization", "FP4, 4-bit · one scale per 64-value block");
+    add("Layers / hidden size", i.layers + " / " + i.hidden);
+    const c0 = i.cards[0] || {};
+    add("Cards", hwCount(i).label + (c0.clock_mhz ? " · " + fmt(c0.clock_mhz, 0) + " MHz" : "") + (c0.firmware ? " · firmware " + c0.firmware : ""));
+    add("Sync points per token", i.segments_per_token);
+    add("Card program", fmt(i.cards[0].instructions / 1000, 0) + "k instructions");
+    add("Load time", fmt(i.load_s, 0) + " s");
+  }
+  if (st?.sampling) add("Sampling", st.sampling.temperature > 0 ? "temperature " + st.sampling.temperature + " · top_k " + st.sampling.top_k + " · top_p " + st.sampling.top_p : "greedy (argmax on the cards)");
+  if (s?.host) { add("Host", s.host.hostname); add("CPU", s.host.cpu.replace(/\(R\)|\(TM\)|CPU /g, "")); add("Memory", fmt(s.host.ram_gb, 0) + " GB (the model is not here)"); }
+  add("OllApeX", s?.version || "");
+  $("sys").innerHTML = rows.join("");
+}
+
+function renderStats(st, live) {
+  if (!st) return;
+  $("s-tps").textContent = fmt(st.eval_tok_s, 2);
+  $("s-tok").textContent = st.eval_tokens ?? "–";
+  $("s-ttft").textContent = st.ttft_s ? fmt(st.ttft_s, 1) + " s" : "–";
+  $("s-ms").textContent = st.ms_per_token ? fmt(st.ms_per_token, 0) : "–";
+  if (st.num_ctx) {
+    $("ctxbar").style.width = Math.min(100, 100 * (st.context_used || 0) / st.num_ctx) + "%";
+    $("c-used").textContent = (st.context_used ?? "–") + " / " + st.num_ctx;
+  }
+  if (st.prompt_tokens !== undefined) $("c-prompt").textContent = st.prompt_tokens;
+  if (st.image_tokens !== undefined) $("c-img").textContent = st.image_tokens ? st.image_tokens + " tokens" : "–";
+  if (!live) renderVision(st);
+  if (st.reused_tokens !== undefined) $("c-reuse").textContent = st.reused_tokens + " tokens";
+  if (st.prefill_s !== undefined && !live) $("c-prefill").textContent = st.prefill_tokens + " tokens · " + fmt(st.prefill_s, 1) + " s · " + fmt(st.prefill_tok_s, 2) + " tokens/s";
+  renderPower(st, live); renderExchange(st, live);
+  if (live) return;
+  if (st.segments) {
+    $("segs").innerHTML = '<table class="t"><tr><th>Segment</th><th>Count</th><th>Card (slowest)</th><th>Round trip</th><th>Total</th></tr>' +
+      st.segments.map(g => "<tr><td>" + SEG[g.name] + "</td><td>" + g.count + "</td><td>" + fmt(g.card_ms_slowest, 2) + "</td><td>" + fmt(g.roundtrip_ms_slowest, 2) + "</td><td>" + fmt(g.per_token_ms, 0) + " ms</td></tr>").join("") +
+      "</table><dl class='kv' style='margin-top:7px'><dt>Slowest card compute</dt><dd>" + fmt(st.slowest_card_compute_ms_per_token, 0) + " ms/token</dd>" +
+      "<dt>Average card compute</dt><dd>" + fmt(st.avg_card_compute_ms_per_token, 0) + " ms/token</dd>" +
+      "<dt>Coordination and host</dt><dd>" + fmt(st.ms_per_token - st.slowest_card_compute_ms_per_token, 0) + " ms/token</dd></dl>";
+  }
+  $("raw").textContent = JSON.stringify(st, null, 1);
+  renderCards(); renderSys();
+}
+
+// Power: wall readings (idle / generating) and the CPU share come from static/power.json; the FPGA share is derived.
+let power = null;
+fetch("/static/power.json").then(r => r.json()).then(p => { power = p; renderStatus(); if (lastStats) renderPower(lastStats); }).catch(() => {});
+const generating = () => busy || status?.state === "busy";
+function powerModel() {
+  const p = power, hc = hwCount(status?.info), n = hc.cards;
+  if (!p || !n) return null;
+  const base = { n, cores: hc.cores, wallIdle: p.wall_idle_w, wallActive: p.wall_active_w, cpuIdle: p.cpu_dram_idle_w, cpuActive: p.cpu_dram_active_w };
+  const perCard = p.fpga_active_w_total ? p.fpga_active_w_total / n : p.fpga_active_w_per_card;
+  if (perCard) {
+    // per-card power while generating is given; what inference adds at the wall, minus the CPU's part, is the cards' idle-to-active step
+    const fpgaActive = n * perCard;
+    const step = (p.wall_active_w - p.wall_idle_w) * p.psu_efficiency - (p.cpu_dram_active_w - p.cpu_dram_idle_w);
+    return { ...base, given: true, fpgaActive, fpgaIdle: Math.max(0, fpgaActive - step), rest: p.wall_active_w - fpgaActive - p.cpu_dram_active_w };
+  }
+  const rest = p.board_fans_other_w;
+  return { ...base, fpgaIdle: p.wall_idle_w * p.psu_efficiency - p.cpu_dram_idle_w - rest, fpgaActive: p.wall_active_w * p.psu_efficiency - p.cpu_dram_active_w - rest };
+}
+function answerWh(s) {
+  const pd = powerModel();
+  if (!pd || !s || !s.eval_tokens || !isFinite(s.ms_per_token)) return null;
+  const sec = (s.ttft_s || 0) + (s.eval_tokens - 1) * s.ms_per_token / 1000;      // reading the prompt + generating
+  return { sec, wall: pd.wallActive * sec / 3600, extra: (pd.wallActive - pd.wallIdle) * sec / 3600, fpga: pd.fpgaActive * sec / 3600 };
+}
+let powerStats = null;
+function renderPower(st, live) {
+  if (st) powerStats = st;
+  const pd = powerModel(), s = powerStats || lastStats, act = generating();
+  if (!pd) { ["p-wall", "p-card", "p-jtok", "p-wh"].forEach(id => $(id).textContent = "–"); $("p-kv").innerHTML = ""; $("p-note").textContent = power ? "Shown once the model is loaded." : ""; return; }
+  $("p-wall-box").className = $("p-card-box").className = "stat" + (act ? " live" : "");
+  $("p-wall").textContent = fmt(act ? pd.wallActive : pd.wallIdle, 0) + " W";
+  $("p-wall-l").textContent = act ? "whole system · generating" : "whole system · idle";
+  const fp = act ? pd.fpgaActive : pd.fpgaIdle;
+  $("p-card").textContent = fmt(fp / pd.n, 1) + " W";
+  $("p-card-l").textContent = "per FPGA card · " + pd.n + " cards " + fmt(fp, 0) + " W";
+  const mspt = s && isFinite(s.ms_per_token) && s.ms_per_token > 0 ? s.ms_per_token : null;
+  $("p-jtok").textContent = mspt ? fmt(pd.fpgaActive * mspt / 1000, 0) + " J" : "–";
+  $("p-jtok-l").textContent = "per token · FPGA cards" + (mspt ? " · system " + fmt(pd.wallActive * mspt / 1000, 0) + " J" : "");
+  const e = live ? null : answerWh(lastStats);
+  if (!live) { $("p-wh").textContent = e ? fmt(e.wall, 2) + " Wh" : "–"; $("p-wh-l").textContent = "last answer · system" + (e ? " · " + fmt(e.extra, 2) + " Wh above idle" : ""); }
+  const row = (k, v) => "<dt>" + k + "</dt><dd>" + v + "</dd>";
+  $("p-kv").innerHTML = row("Idle, model loaded", fmt(pd.wallIdle, 0) + " W") + row("Generating, whole system", fmt(pd.wallActive, 0) + " W") +
+    row("Added by inference", "+" + fmt(pd.wallActive - pd.wallIdle, 0) + " W") +
+    row("FPGA cards, idle / generating", fmt(pd.fpgaIdle, 0) + " / " + fmt(pd.fpgaActive, 0) + " W") +
+    row("CPU and memory, idle / generating", fmt(pd.cpuIdle, 0) + " / " + fmt(pd.cpuActive, 0) + " W") +
+    (answerWh(lastStats) ? row("FPGA cards, last answer", fmt(answerWh(lastStats).fpga, 2) + " Wh in " + fmt(answerWh(lastStats).sec, 0) + " s") : "");
+  $("p-note").textContent = "System power: wall-meter readings (" + power.wall_idle_w + " W idle, " + power.wall_active_w + " W generating). CPU and memory: measured on the host. " +
+    (pd.given
+      ? "FPGA cards: " + fmt(pd.fpgaActive, 0) + " W for " + pd.n + " cards while generating, about " + fmt(pd.fpgaActive / pd.n, 1) + " W each; the remaining " + fmt(pd.rest, 0) + " W is board, fans and power-supply loss."
+      : "FPGA share: derived, assuming " + Math.round(power.psu_efficiency * 100) + "% power-supply efficiency and " + power.board_fans_other_w + " W for board, fans and disk.");
+}
+
+// Data exchange. The cards have no link to each other: at every sync point each card gets the residual vector from
+// the CPU and returns its partial result; the CPU adds the parts up and sends the sum to all cards.
+let xStats = null, xLive = false;
+const fmtBytes = b => b >= 1e9 ? fmt(b / 1e9, 2) + " GB" : b >= 1e6 ? fmt(b / 1e6, 1) + " MB" : fmt(b / 1e3, 1) + " kB";
+function renderExchange(st, live) {
+  if (st) { xStats = st; xLive = !!live; }
+  const i = status?.info, s = xStats || lastStats;
+  if (!i) { $("x-tok").textContent = $("x-ans").textContent = "–"; $("x-kv").innerHTML = $("x-cards").innerHTML = ""; $("x-note").textContent = "Shown once the model is loaded."; return; }
+  const n = hwCount(i).cards, S = i.segments_per_token, vec = i.hidden * 2;        // one bf16 vector of the hidden size
+  const down = n * S * n * vec, up = n * (S - 1) * vec;                            // each write carries all cards' shares                                // per token; the last segment returns only its best tokens
+  $("x-tok").textContent = fmtBytes(down + up);
+  const nt = !s ? 0 : xLive ? Math.max(0, (s.context_used || 0) - (s.reused_tokens || 0)) : (s.prefill_tokens || 0) + (s.eval_tokens || 0);
+  $("x-ans-box").className = "stat" + (xLive && generating() ? " live" : "");
+  $("x-ans").textContent = nt ? fmtBytes(nt * (down + up)) : "–";
+  $("x-ans-l").textContent = (xLive ? "this answer so far" : "last answer") + (nt ? " · " + nt + " tokens processed" : "");
+  const row = (k, v) => "<dt>" + k + "</dt><dd>" + v + "</dd>", num = v => v.toLocaleString("en-US");
+  let kv = row("Sync points per token", S) +
+    row("CPU → cards", fmtBytes(down) + " · " + num(n * S) + " writes") +
+    row("Cards → CPU", fmtBytes(up) + " · " + num(n * (S - 1)) + " reads") +
+    row("Card ↔ card", "through the CPU · " + (S - 1) + " exchanges") +
+    row("One share", fmtBytes(vec) + " (" + i.hidden + " values); a write carries " + n + " shares");
+  const f = xLive ? lastStats : s;                                                    // timing exists once an answer has finished
+  if (f?.eval_tok_s) kv += row("Data rate while generating", fmt((down + up) / 1e6 * f.eval_tok_s, 0) + " MB/s");
+  if (f?.cards && f.host_ms_per_token !== undefined) {
+    const link = f.cards.map(c => c.roundtrip_ms_per_token - c.compute_ms_per_token);
+    kv += row("CPU ↔ card link time, average", fmt(link.reduce((a, b) => a + b, 0) / link.length, 0) + " ms / token") +
+      row("Card ↔ card combine on the CPU", fmt(Math.max(0, f.ms_per_token - f.host_ms_per_token), 0) + " ms / token");
+    $("x-cards").innerHTML = '<table class="t"><tr><th>Core</th><th>Compute</th><th>CPU ↔ card</th><th>Round trip</th></tr>' +
+      f.cards.map(c => "<tr><td>" + c.dev + "</td><td>" + fmt(c.compute_ms_per_token, 0) + "</td><td>" + fmt(c.roundtrip_ms_per_token - c.compute_ms_per_token, 0) + "</td><td>" + fmt(c.roundtrip_ms_per_token, 0) + " ms</td></tr>").join("") + "</table>";
+  } else $("x-cards").innerHTML = "";
+  $("x-kv").innerHTML = kv;
+  $("x-note").textContent = "The cards have no direct link to each other: at every sync point each card sends its partial result to the CPU, which adds the parts up and sends the sum to all cards. " +
+    (f?.cards ? "Table: ms per token; CPU ↔ card is a card's round trip minus its own compute time." : "Timing appears after the first answer.");
+}
+
+async function poll() {
+  try { status = await (await fetch("/api/status")).json(); if (!lastStats && status.last) { lastStats = status.last; renderStats(lastStats); } renderStatus(); }
+  catch (e) { $("dot").className = "dot error"; $("state").textContent = "Server unreachable"; }
+  setTimeout(poll, status?.state === "loading" || busy ? 1000 : 3000);
+}
+
+function renderVision(st) {
+  const im = st?.images_encoded || [];
+  $("vis-box").hidden = !im.length;
+  if (!im.length) return;
+  const row = (k, v) => "<dt>" + k + "</dt><dd>" + v + "</dd>";
+  $("vis-kv").innerHTML = im.map(i =>
+    row("Image", esc(i.name)) + row(i.segments ? "Encoder on" : "Card", i.card) +
+    row("Size", i.source[0] + "×" + i.source[1] + " → " + i.encoded[0] + "×" + i.encoded[1] + " px (" + i.detail + ")") +
+    row("Patches → tokens", i.patches + " → " + i.tokens) +
+    row(i.segments ? "Encoding time on the cards" : "Encoding time on the card", fmt(i.card_s, 1) + " s") +
+    (i.segments ? row("Card commands", i.segments + " (2 per block + pooling)") : "") +
+    (i.compile_s > 0.5 ? row("Program build, first use of this size", fmt(i.compile_s, 0) + " s") : "") +
+    (i.weights_upload_s > 0.5 ? row("Encoder weights upload, first use", fmt(i.weights_upload_s, 0) + " s") : "") +
+    row(i.segments ? "Program per engine" : "Card program", fmt(i.instructions / 1000, 0) + "k instructions")).join("");
+}
+
+function options() {
+  const o = { temperature: +$("temp").value, top_k: +$("topk").value, top_p: +$("topp").value, num_predict: +$("npred").value || 1024, num_ctx: +$("ctx").value, image_detail: $("detail").value || "low" };
+  if ($("seed").value !== "") o.seed = +$("seed").value;
+  return o;
+}
+
+async function send() {
+  if (busy) { ctrl?.abort(); fetch("/api/abort", { method: "POST" }); return; }
+  const text = $("in").value.trim();
+  if (!text && !attached) return;
+  $("in").value = ""; autosize();
+  // the file's text travels inside the message; the chat shows only its name
+  const f = attached; setAttached(null);
+  const isImg = f?.kind === "image", ask = text || (isImg ? "Describe this image." : "Summarize this file.");
+  const full = f && !isImg ? "File: " + f.name + "\n\n" + f.text + "\n\n---\n\n" + ask : ask;
+  messages.push(isImg ? { role: "user", content: full, images: [f.image_id] } : { role: "user", content: full });
+  const um = addMsg("user", ask);
+  if (f) {
+    const c = document.createElement("div"); c.className = "chip"; c.textContent = f.name + " · " + fileTokens(f) + " tokens";
+    if (isImg && f.url) { const i = document.createElement("img"); i.src = f.url; i.alt = f.name; c.prepend(i); }
+    um.querySelector(".bubble").prepend(c);
+  }
+  const el = addMsg("assistant", ""), bubble = el.querySelector(".bubble"), foot = el.querySelector(".foot");
+  busy = true; $("send").textContent = "Stop"; $("send").classList.add("stop"); $("send").disabled = false;
+  const sys = $("system").value.trim();
+  const body = { model: $("model").value, stream: true, think: $("think").value === "1", options: options(),
+                 messages: (sys ? [{ role: "system", content: sys }] : []).concat(messages) };
+  let content = "", thinking = "", n = 0, t0 = performance.now(), tFirst = 0, live = {};
+  ctrl = new AbortController();
+  $("s-phase").textContent = "Request sent…";
+  const paint = () => {
+    bubble.innerHTML = (thinking ? '<details class="think"' + (content ? "" : " open") + "><summary>Thinking</summary>" + esc(thinking) + "</details>" : "") + md(content);
+    $("msgs").scrollTop = $("msgs").scrollHeight;
+  };
+  try {
+    const r = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: ctrl.signal });
+    if (!r.ok && !r.body) throw new Error("HTTP " + r.status);
+    const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const { done, value } = await rd.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 1); if (!line.trim()) continue;
+        const o = JSON.parse(line);
+        if (o.type === "error") throw new Error(o.message);
+        if (o.type === "status") {
+          const a = o;
+          if (a.event === "start") { live = { prompt_tokens: a.prompt_tokens, reused_tokens: a.reused_tokens, num_ctx: a.num_ctx, context_used: a.reused_tokens };
+            $("s-phase").textContent = "Reading prompt: " + (a.prompt_tokens - a.reused_tokens) + " tokens" + (a.reused_tokens ? " (" + a.reused_tokens + " tokens already on the cards)" : ""); renderStats(live, true); }
+          else if (a.event === "vision") { $("s-phase").textContent = (a.cards ? "Encoding the image on the FPGA cards: " : "Encoding the image on an FPGA card: ") + a.name + " (" + a.width + "×" + a.height + " px, " + a.tokens + " tokens)…"; }
+          else if (a.event === "prefill") { $("s-phase").textContent = "Reading prompt: " + a.done + " / " + a.total + " tokens"; live.context_used = (live.reused_tokens || 0) + a.done; renderStats(live, true); }
+        }
+        if (o.type === "thinking") { thinking += o.text; paint(); }
+        if (o.type === "content") {
+          content += o.text; n++;
+          if (!tFirst) { tFirst = performance.now(); $("s-phase").textContent = "Generating…"; }
+          const dt = (performance.now() - tFirst) / 1000;
+          live.eval_tokens = n; live.ttft_s = (tFirst - t0) / 1000; live.eval_tok_s = n > 1 && dt > 0 ? (n - 1) / dt : NaN; live.ms_per_token = n > 1 ? 1000 * dt / (n - 1) : NaN;
+          live.context_used = (live.prompt_tokens || 0) + n;
+          renderStats(live, true); paint();
+        }
+        if (o.type === "done") {
+          lastStats = o.stats; renderStats(lastStats);
+          const s = o.stats || {};
+          foot.textContent = (s.eval_tokens || 0) + " tokens · " + fmt(s.eval_tok_s, 2) + " tokens/s · first token " + fmt(s.ttft_s, 1) + " s" + (answerWh(s) ? " · " + fmt(answerWh(s).wall, 2) + " Wh" : "") +
+            (s.done_reason === "length" ? " · stopped at the token limit" : s.done_reason === "abort" ? " · stopped" : "");
+          $("s-phase").textContent = "Done.";
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") { foot.innerHTML = '<span class="err">' + esc(String(e.message || e)) + "</span>"; $("s-phase").textContent = "Error."; }
+    else { foot.textContent = "stopped"; $("s-phase").textContent = "Stopped."; }
+  }
+  paint();
+  if (content) messages.push({ role: "assistant", content }); else if (messages.length && messages[messages.length - 1].role === "user") messages.pop();
+  busy = false; ctrl = null; $("send").textContent = "Send"; $("send").classList.remove("stop");
+  $("in").focus();
+}
+
+let attached = null;
+const fileTokens = f => f.kind === "image" ? (f.plans[$("detail").value] || f.plans.low).tokens : f.tokens;
+function setAttached(f) {
+  attached = f;
+  const h = $("hint");
+  if (!f) { h.textContent = ""; h.className = "hint"; return; }
+  const ntok = fileTokens(f), left = f.num_ctx - ntok, plan = f.kind === "image" ? (f.plans[$("detail").value] || f.plans.low) : null;
+  h.className = "hint" + (left < 80 ? " err" : "");
+  h.innerHTML = "<b>" + esc(f.name) + "</b> · " + (plan ? "image " + f.width + "×" + f.height + " → " + plan.width + "×" + plan.height + " px" : /\.pdf$/i.test(f.name) ? "PDF" : "text") + " · " + ntok + " tokens" +
+    (left < 80 ? " · does not fit in the context (limit " + f.num_ctx + ")" : " · about " + Math.round(ntok / 2.1) + " s to read") +
+    ' <a href="#" id="unattach">remove</a>';
+  $("unattach").onclick = e => { e.preventDefault(); setAttached(null); };
+}
+$("attach").onclick = () => $("file").click();
+$("file").onchange = async () => {
+  const file = $("file").files[0]; $("file").value = "";
+  if (!file) return;
+  const isImage = /\.(png|jpe?g|webp|gif|bmp)$/i.test(file.name);
+  if (isImage && !status?.vision) { $("hint").className = "hint err"; $("hint").textContent = "The loaded model cannot read images."; return; }
+  const maxMb = status?.limits?.max_upload_mb || 4;
+  if (file.size > maxMb * 1048576) { $("hint").className = "hint err"; $("hint").textContent = "File too large (max " + maxMb + " MB)."; return; }
+  $("hint").className = "hint"; $("hint").textContent = "Reading " + file.name + "…";
+  try {
+    const r = await fetch("/api/file", { method: "POST", headers: { "X-Filename": encodeURIComponent(file.name) }, body: file });
+    const o = await r.json();
+    if (!r.ok) throw new Error(o.error || ("HTTP " + r.status));
+    if (o.kind === "image") o.url = URL.createObjectURL(file);
+    setAttached(o);
+  } catch (e) { $("hint").className = "hint err"; $("hint").textContent = String(e.message || e); }
+};
+
+function autosize() { const t = $("in"); t.style.height = "auto"; t.style.height = Math.min(180, t.scrollHeight) + "px"; }
+$("in").addEventListener("input", autosize);
+$("in").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
+$("send").onclick = send;
+$("toggle").onclick = () => { $("settings").hidden = !$("settings").hidden; };
+$("new").onclick = () => { if (busy) return; messages = []; $("msgs").innerHTML = '<div class="empty" id="empty"><h2>New chat</h2><div>History cleared.</div></div>'; };
+$("detail").onchange = () => { if (attached) setAttached(attached); };
+$("temp").oninput = () => { const v = +$("temp").value; $("tv").textContent = v === 0 ? "0 (most likely token)" : v.toFixed(2); };
+$("topk").oninput = () => $("kv").textContent = $("topk").value;
+$("topp").oninput = () => $("pv").textContent = (+$("topp").value).toFixed(2);
+const reload = () => { if (busy) return; fetch("/api/load", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: $("model").value, num_ctx: +$("ctx").value }) }).then(() => { lastStats = null; setTimeout(poll, 300); }); };
+$("model").onchange = reload; $("ctx").onchange = reload;
+poll();
+</script>
+</body>
+</html>

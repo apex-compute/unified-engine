@@ -1,0 +1,11 @@
+{
+  "note": "Power calibration for the OllApeX panel: readings of your own system. Edit and reload the page; no restart needed.",
+  "calibrated_with": "qwen3.8:27b on 11 cards",
+  "wall_idle_w": 180,
+  "wall_active_w": 222,
+  "cpu_dram_idle_w": 16.3,
+  "cpu_dram_active_w": 24.6,
+  "fpga_active_w_total": 60,
+  "psu_efficiency": 0.90,
+  "board_fans_other_w": 20
+}
