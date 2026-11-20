@@ -84,7 +84,6 @@ except ImportError:
     strassen_levels = strassen_matmul_core_dram = strassen_weight_tree = None
     print("nn_lib.py has no Strassen section in this checkout: Strassen matmuls are off")
 
-from storage_format import StorageFormat
 
 from alpamayo2_edge_cpu_reference import (  # host oracle + weight loading; no hardware in there
     AIP, EXP, LM, PROJ, STAT_KEYS, VIS, Alpamayo2EdgeRef, KVCache, cos_sim, resolve_model_dir, snr_db, synthetic_inputs,
@@ -384,13 +383,11 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
     # nn_lib.strassen_matmul_core_dram (see nn_lib §10 for how it works and its limits). Here:
     # the weight tree per layer, the private scratch, and the rows a level cannot take.
 
-    def _st_node(self, W, b, L, scr, store=None):
-        """One layer's Strassen weights; None when the shape allows no level."""
+    def _st_node(self, W, b, L, scr):
+        """One bf16 layer's Strassen weights (stored fp16 leaves); None when the shape allows no level."""
         if L == 0:
             return None
-        # fp16 leaves, or 4-bit ones when `store` quantizes (the prefill)
-        return {"tree": strassen_weight_tree(W, b, L, store or self._store, self._store,
-                                             None if store else StorageFormat.FP16), "L": L, "scr": scr}
+        return {"tree": strassen_weight_tree(W, b, L, self._store, self._store), "L": L, "scr": scr}
 
     def _st_scratch(self, scr, uses):
         """Private scratch for every depth. uses: [(rows, K, N, L)] of the layers sharing it."""

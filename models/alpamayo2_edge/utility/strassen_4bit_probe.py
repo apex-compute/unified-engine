@@ -6,7 +6,7 @@ recombination in fp16 (as in nn_lib.strassen_matmul_core_dram), and these ways t
 
   a  native bf16 matmul of the unquantized weight                       <- the reference
   b  native IF4 matmul                                                  <- what the model runs today
-  c  Strassen, weight sums of the UNQUANTIZED weight, each leaf re-quantized to IF4   (nn_lib, weight_format=None)
+  c  Strassen, weight sums of the UNQUANTIZED weight, each leaf re-quantized to IF4
   d  Strassen, weight sums of the 4-BIT (dequantized IF4) weight, leaves in fp16
   e  Strassen, weight sums of the unquantized weight, leaves in fp16                  (16-bit weights)
   f1 Strassen, weight sums of the unquantized weight, leaves re-quantized to IF8
