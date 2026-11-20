@@ -121,8 +121,17 @@ def main():
                     E.ue.reset_isa_reg_counter()
                     body(E)
                 ue._round(fenced)
+        workers = ue.sched.workers if NE > 1 else []
+        before = [ue.get_program_dram_addr()] + [w.get_program_dram_usage() for w in workers]
         ue._compile(f"probe{count[0]}", emit, parallel=True)
+        psize[:] = [ue.get_program_dram_addr() - before[0]] + [w.get_program_dram_usage() - b for w, b in zip(workers, before[1:])]
         return ue._exec(f"probe{count[0]}")
+
+    psize = []                                                               # bytes of the last program, per engine (HALT included)
+
+    def program(label):
+        print(f"    program, {label}: engine 0 {psize[0] // 32} instr ({psize[0]} B)"
+              + (f"; workers {', '.join(str(b // 32) for b in psize[1:])} instr ({sum(psize)} B in all)" if psize[1:] else ""), flush=True)
 
     checks, summary = [], []
     act = {"gelu": {"gelu_enable": True}, "silu": {"silu_enable": True},
@@ -199,6 +208,7 @@ def main():
                 tree = nn_lib.strassen_weight_tree(W.to(BF).float(), bias, L, store, store)
             a_o = out_buffer(M * N)
             t_st = timed(products(tree, a_o))
+            program(f"stored leaves, level {L}")
             C_st = ue.dma_from_accelerator_memory(a_o, (M, N)).double()
             rows.append((f"stored leaves, level {L}", t_st, C_st, nbytes[0] / size, None))
 
@@ -213,7 +223,9 @@ def main():
             make = lambda E: nn_lib.strassen_online_sums_core(E.ue, cells, n, k, a_s, L, deal[E.e])
             a_o = out_buffer(M * N)
             t_prep = timed(make)
+            program(f"sums alone, level {L}")
             t_on = timed(make, products(tree, a_o))
+            program(f"online leaves, level {L}")
             C_on = ue.dma_from_accelerator_memory(a_o, (M, N)).double()
             rows.append((f"online leaves, level {L}", t_on, C_on, 1.0, (t_prep, len(items))))
 
