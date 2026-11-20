@@ -1364,7 +1364,11 @@ def flash_attention_batched_pbi(
 #   * K and N multiples of 128 * 2^(levels-1): every half stays whole 64-lane blocks and the
 #     strided writes cover whole 128-byte lines. K below 8192. OUTPUT_DRAM_ADDR 128-byte aligned.
 #   * M a multiple of 2^levels and a compile-time constant; leftover rows are the caller's plain matmul.
-#   * No fused activation: a matmul that carries GELU / SiLU / clamp cannot use it.
+#   * A fused activation (GELU / SiLU / ReLU clamp) is supported through activation= and
+#     identity_addr=, at a cost: the hardware ignores the activation fields on an elementwise pass,
+#     so the output quarters that do not end in a product (1/2 of the output at level 1, 3/4 at
+#     level 2) go through an on-chip identity product, ~1 cycle per value (3-4 ns), one op per 64
+#     values. Worth it on a large many-row matmul; marginal on a small one.
 #   * Scratch is private per engine and zero-filled once (fresh DRAM holds NaN patterns). It ends
 #     up holding fp16: never read it as bf16.
 #   * store_w / store_b get fp16 tensors and must upload them unchanged.
@@ -1594,11 +1598,40 @@ def _strassen_rows(ue, src: int, dst: int, pitch: int, cols: int, rows: int, sca
                                       element_size=take * cols, **wr)
 
 
+def _strassen_activate(ue, addr: int, elements: int, activation: dict, identity_addr: int, out_format) -> None:
+    """act(x) in place over an fp16 buffer, written in out_format. The hardware applies an
+    activation only behind a dot product (on an elementwise pass the fields are ignored), so this
+    is an identity matrix-vector product per 64 values, done on chip: ~1 cycle per value."""
+    fm = TensorFormats(a=StorageFormat.FP16, b=StorageFormat.BF16, output=out_format)
+    mode, la, lb = ue._matmul_activation(
+        activation.get("gelu_enable", False), activation.get("silu_enable", False), activation.get("sigmoid_enable", False),
+        activation.get("clamp_enable", False), activation.get("log_enable", False),
+        activation.get("clamp_min", 0.0), activation.get("clamp_max", float("inf")), formats=fm)
+    out_sram = URAM_A_BASE + 0x40000                            # the results, clear of the 1024 rows loaded below
+    for e0 in range(0, elements, STRASSEN_PIECE_ELEMENTS):
+        take = min(STRASSEN_PIECE_ELEMENTS, elements - e0)
+        assert take % UE_VECTOR_SIZE == 0
+        ue.accelerator_memory_to_sram(accelerator_dram_address=addr + e0 * 2, sram_address=URAM_A_BASE, element_size=take)
+        ue.accelerator_memory_to_sram(accelerator_dram_address=identity_addr, sram_address=URAM_B_BASE,
+                                      element_size=UE_VECTOR_SIZE * UE_VECTOR_SIZE)
+        for row in range(take // UE_VECTOR_SIZE):
+            ue.start_queue_for_bf16_matvec_operation(0, 0, URAM_A_BASE + row * 128, URAM_B_BASE, out_sram + row * 128,
+                                                     UE_VECTOR_SIZE, UE_VECTOR_SIZE, lalu_mode=mode, lalu_a=la, lalu_b=lb, formats=fm)
+        ue.sram_to_accelerator_memory(out_sram, addr + e0 * 2, take)
+
+
 def strassen_matmul_core_dram(ue, M: int, K: int, N: int, A_DRAM_ADDR: int, tree: dict,
                               OUTPUT_DRAM_ADDR: int, scratch: list[tuple[int, int]],
                               _full: int | None = None, _depth: int = 0, _regs: dict | None = None,
-                              _fmt: tuple = (StorageFormat.BF16, StorageFormat.BF16, StorageFormat.BF16)) -> None:
-    """C [M, N] = X [M, K] . W^T (+ bias) by nested Strassen; see the section header above.
+                              _fmt: tuple = (StorageFormat.BF16, StorageFormat.BF16, StorageFormat.BF16),
+                              activation: dict | None = None, identity_addr: int | None = None) -> None:
+    """C [M, N] = act(X [M, K] . W^T (+ bias)) by nested Strassen; see the section header above.
+
+    activation: the fused-epilogue arguments of matmat_mul_core for the layer's activation, e.g.
+    {"gelu_enable": True}, {"silu_enable": True} or {"clamp_enable": True, "clamp_min": 0.0,
+    "clamp_max": float("inf")} (ReLU); None = no activation. It needs identity_addr, a 64 x 64
+    bf16 identity in DRAM: the output quarters that end in a product take the activation fused,
+    the others go through an identity pass (half of the output at level 1, 3/4 at level 2).
 
     A_DRAM_ADDR / OUTPUT_DRAM_ADDR: contiguous row-major bf16. tree: from strassen_weight_tree
     (its depth sets the level). scratch: [(x_addr, p_addr)] per depth, sized by
@@ -1609,6 +1642,7 @@ def strassen_matmul_core_dram(ue, M: int, K: int, N: int, A_DRAM_ADDR: int, tree
     regs = {} if top else _regs
     xf, of, ff = _fmt
     F = StorageFormat.FP16                                      # every intermediate
+    assert activation is None or identity_addr is not None, "a Strassen activation needs identity_addr"
 
     def reg(rows):
         if rows not in regs:
@@ -1629,7 +1663,7 @@ def strassen_matmul_core_dram(ue, M: int, K: int, N: int, A_DRAM_ADDR: int, tree
             kw.update(is_B_quantized=True, data_type=tree.get("t", TYPE.IF4), SCALE_DRAM_ADDR=W[1])
             W = W[0]
         ue.matmat_mul_core(M=M, K=K, N=N, A_DRAM_ADDR=A_DRAM_ADDR, B_DRAM_ADDR=W,
-                           OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, gpr_M_reg=reg(M), formats=fm, **kw)
+                           OUTPUT_DRAM_ADDR=OUTPUT_DRAM_ADDR, gpr_M_reg=reg(M), formats=fm, **kw, **(activation or {}))
     else:
         assert M % 2 == 0 and K % 128 == 0 and N % 128 == 0, f"Strassen level needs even M and K, N multiples of 128: {M}, {K}, {N}"
         h, kk, nn = M // 2, K // 2, N // 2
@@ -1642,8 +1676,9 @@ def strassen_matmul_core_dram(ue, M: int, K: int, N: int, A_DRAM_ADDR: int, tree
             ue.eltwise_core_dram(M=h, N=cols, dram_a=a, dram_b=b, dram_out=o, mode=mode, gpr_M_reg=r,
                                  formats=TensorFormats(a=fa, b=fb, output=fo))
 
-        def rec(i, x, fx, out, fo, full=None, ffull=F):
-            strassen_matmul_core_dram(ue, h, kk, nn, x, tree["c"][i], out, scratch, full, _depth + 1, regs, (fx, fo, ffull))
+        def rec(i, x, fx, out, fo, full=None, ffull=F, act=None):
+            strassen_matmul_core_dram(ue, h, kk, nn, x, tree["c"][i], out, scratch, full, _depth + 1, regs, (fx, fo, ffull),
+                                      act, identity_addr)
         quarters = ((0, 0), (0, 1), (1, 0), (1, 1))
         biased = _full is not None
 
@@ -1665,12 +1700,15 @@ def strassen_matmul_core_dram(ue, M: int, K: int, N: int, A_DRAM_ADDR: int, tree
         if biased:                  # U lost B21 and B12 with P2' and P5'; give each quarter its own bias back
             elt(t2, b21, t2, ADD, nn, F, ff, F), elt(t2, b22, t2, ADD, nn, F, ff, F)
             elt(t1, b12, t1, ADD, nn, F, ff, F), elt(t1, b11, t1, ADD, nn, F, ff, F)
-        if of != F:                 # the quarters are copied out bit for bit: bring C12, C21 to the output format
+        if activation is not None:  # C12, C21 end in no product of their own: activate them (and reach the output format) here
+            for q in (q12, q21):
+                _strassen_activate(ue, q, h * nn, activation, identity_addr, of)
+        elif of != F:               # the quarters are copied out bit for bit: bring C12, C21 to the output format
             for q in (q12, q21):
                 ue.eltwise_core_dram(M=h, N=nn, dram_a=q, dram_b=None, dram_out=q, mode=UE_MODE.MUL_BROADCAST, scalar=1.0,
                                      gpr_M_reg=r, formats=TensorFormats(a=F, output=of))
-        rec(5, s4, F, q22, of, t2)                              # C22
-        rec(6, s5, F, q11, of, t1)                              # C11
+        rec(5, s4, F, q22, of, t2, act=activation)              # C22: its last products take the activation fused
+        rec(6, s5, F, q11, of, t1, act=activation)              # C11
         for src, (i, j) in zip((q11, q12, q21, q22), quarters):
             _strassen_rows(ue, src, OUTPUT_DRAM_ADDR + (i * h * N + j * nn) * 2, N, nn, h, scatter=True)
     if top:
