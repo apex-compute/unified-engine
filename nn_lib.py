@@ -1369,7 +1369,7 @@ def flash_attention_batched_pbi(
 #     so the output quarters that do not end in a product (1/2 of the output at level 1, 3/4 at
 #     level 2) go through an on-chip identity product, ~1 cycle per value (3-4 ns), one product
 #     per 64 values in a hardware loop: a few dozen instructions per call (STRASSEN_ACTIVATE_LOOPED;
-#     the looped form is not board-verified yet, 0 = the verified one instruction per 64 values).
+#     the looped form is bit-identical to it on the board; 0 = one instruction per 64 values).
 #     Worth it on a large many-row matmul; marginal on a small one.
 #   * Scratch is private per engine and zero-filled once (fresh DRAM holds NaN patterns). It ends
 #     up holding fp16: never read it as bf16.
