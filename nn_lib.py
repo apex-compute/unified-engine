@@ -1331,6 +1331,7 @@ def flash_attention_batched_pbi(
 #   The leaf weights, one of two ways:
 #     online leaves (no extra weight storage; the board makes the weight sums per call)
 #       cells = strassen_if4_cells(...) or strassen_bf16_cells(...)           # host, once: the weight cut in 4^L cells
+#               (strassen_if4_slab_cells when a plain matmul must read the same weight, e.g. decode)
 #       tree  = strassen_online_tree(cells, sum_addrs, L, b, store_b)         # sum_addrs: strassen_online_sum_count(L) buffers
 #       strassen_online_sums_core(ue, cells, n, k, sum_addrs, L)              # emitted before the matmul
 #     stored leaves (the host makes the sums once: 1.75x weight bytes per level in bf16, 2.9x in 4-bit)
@@ -1484,6 +1485,23 @@ def strassen_if4_cells(data: bytes, scales: bytes, N: int, K: int, levels: int, 
     return {(i, j): store_pack(d[i * n:(i + 1) * n, j * k // 2:(j + 1) * k // 2].tobytes(),
                                sc[i * n:(i + 1) * n, j * k // 64 * 2:(j + 1) * k // 64 * 2].tobytes(), n, k, TYPE.IF4)
             for i in range(g) for j in range(g)}
+
+
+def strassen_if4_slab_cells(data: bytes, scales: bytes, N: int, K: int, levels: int, store_pack: Callable) -> tuple[list, dict]:
+    """Host side, once: like strassen_if4_cells, for a weight a plain matmul must still read
+    (decode). The pack is stored as 2^levels input-column slabs W[:, slab j] of [N, K / 2^levels]
+    -- the same bytes, nothing re-quantized -- and every cell is a row range of a slab, so nothing
+    is stored twice. A plain matmul is then one product per slab, summed.
+    store_pack(data_bytes, scale_bytes, N, k, TYPE.IF4) -> (data_addr, scale_addr).
+    -> ([slab (data_addr, scale_addr)], {(N index, K index): (data_addr, scale_addr)})."""
+    g = 1 << levels
+    assert N % g == 0 and K % (64 * g) == 0, f"IF4 slabs: {N} x {K} does not cut {g} ways into whole 64-weight blocks"
+    n, k = N // g, K // g
+    d = np.frombuffer(data, dtype=np.uint8).reshape(N, K // 2)
+    sc = np.frombuffer(scales, dtype=np.uint8).reshape(N, K // 64 * 2)
+    slabs = [store_pack(d[:, j * k // 2:(j + 1) * k // 2].tobytes(), sc[:, j * k // 64 * 2:(j + 1) * k // 64 * 2].tobytes(),
+                        N, k, TYPE.IF4) for j in range(g)]
+    return slabs, {(i, j): (slabs[j][0] + i * n * k // 2, slabs[j][1] + i * n * k // 64 * 2) for i in range(g) for j in range(g)}
 
 
 def strassen_bf16_cells(W: torch.Tensor, levels: int, store_w: Callable) -> dict:
