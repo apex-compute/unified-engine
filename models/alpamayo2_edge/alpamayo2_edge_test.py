@@ -1055,10 +1055,13 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
         # Prefill attention in causal blocks: query rows [r0, r0 + rows) against keys [0, kv) only --
         # the keys after a row are masked, so their scores are never used (--probe, one layer:
         # 318 ms whole, 187 ms in 8 blocks). (r0, rows, kv, offset of the block's [rows, kv] mask).
+        # The blocks cover all S rows and the emitter clips them to the prompt: the sim recompiles
+        # for other prompt lengths without coming back here (cut at this P, a longer prompt's last
+        # rows got no attention at all: stale rows, NaN on a freshly reset board).
         self.causal, r0, off = [], 0, 0
         for i in range(self.causal_blocks if self.causal_blocks > 1 else 0):
             kv = min(S, -(-S * (i + 1) // self.causal_blocks // 128) * 128)       # 128-aligned key counts
-            rows = min(kv, P) - r0
+            rows = kv - r0
             if rows > 0:
                 self.causal.append((r0, rows, kv, off))
                 r0, off = r0 + rows, off + rows * kv
@@ -1274,6 +1277,9 @@ class Alpamayo2Edge_UnifiedEngine(UnifiedEngine):
                     for h in heads:
                         self._gather(ue, b["LQ"], h, QH, M, b["Q_HM"] + h * M * HD * BPE)
                 for r0b, rows, kv, moff in (blocks or [(0, M, kv_len, 0)]) if heads else []:
+                    rows = min(rows, M - r0b)               # a causal block past the prompt's last row
+                    if rows <= 0:
+                        continue
                     if "vt" in parts and persistent:
                         self._vt_refresh(E, layer, kvh, slot0)
                     elif "vt" in parts:
