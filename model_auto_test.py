@@ -751,10 +751,12 @@ TESTS = [
     {"name": "gemma4_e4b_run_from_bin", "script": "models/gemma4_e4b/gemma4_e4b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "32"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
     {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "multi_core_max": 2},
     {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_test.py", "prompt": MATH_PROMPT, "max_engines": 1, "pass_check": _check_x_equals_2},
-    {"name": "qwen3_0.6b",  "script": "models/qwen3_0.6b/qwen3_0.6b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 2},
+    {"name": "qwen3_0.6b",  "script": "models/qwen3_0.6b/qwen3_0.6b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 2,
+     "multi_engine_warning": "qwen3_0.6b PREFILL RUNS ON ONE ENGINE: only decode is sharded, so --multi-core N speeds up decode alone (2 engines on kintex7: prefill 1.00x, decode 1.44x)."},
     {"name": "qwen3_1.7b",  "script": "models/qwen3_1.7b/qwen3_1.7b_test.py",   "prompt": MATH_PROMPT, "max_engines": 1, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"]},
     {"name": "qwen3_4b",    "script": "models/qwen3_4b/qwen3_4b_test.py",       "prompt": MATH_PROMPT, "max_engines": 1, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"]},
-    {"name": "qwen3.5_2b",  "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 2},
+    {"name": "qwen3.5_2b",  "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 2,
+     "multi_engine_warning": "qwen3.5_2b PREFILL IS SINGLE-ENGINE: only decode counts as multi-engine (2 engines on kintex7: prefill 1.06x, decode ~1.07x, 0.8 tok/s)."},
     # qwen3.5_2b VLM: FPGA vision encoder (--vision-enable defaults to on-FPGA vision)
     # on yosemite.jpg; gemma4-style criteria (coherent decode + scene keywords).
     # Single-engine only: the script refuses --multi-core > 1 with vision on
@@ -836,7 +838,7 @@ TESTS = [
     # kokoro (TTS): --fpga runs the ported sections on hardware with per-section SNR
     # bisects vs the CPU reference (on by default) and writes a wav. Bins cached in
     # kokoro_bin/ (frozen instruction image), reused on the next pass.
-    {"name": "kokoro",  "script": "models/kokoro/kokoro_test.py",   "pass_check": _check_kokoro, "extra_args": ["--fpga"]},
+    {"name": "kokoro",  "script": "models/kokoro/kokoro_test.py",   "max_engines": 1, "pass_check": _check_kokoro, "extra_args": ["--fpga"]},
 
     # FLUX.2 [klein] 4B text-to-image: Qwen3-4B text encoder + 25-block DiT (4 Euler
     # steps, one statically unrolled program per engine) on the standard image, VAE
@@ -1016,6 +1018,11 @@ def run_test(test: dict, verbose: bool = False,
         # default is several engines (act: 2) would otherwise ignore a single-engine pass.
         if _ne and (_ne > 1 or os.environ.get("UE_CI_ENGINES")):
             cmd += ["--engines", str(_ne)]
+            # smolvlm2 shards decode only with its own --decode-engines (default 1):
+            # without it a multi-engine run leaves decode on one engine.
+            if (_ne > 1 and "--decode-engines" not in cmd
+                    and _script_supports_flag(script, "--decode-engines")):
+                cmd += ["--decode-engines", str(_ne)]
     # --multi-core at the board's engine count, capped by the entry's
     # "multi_core_max" (gemma4: 8, its tiled map's engine count), for entries
     # that opt in and do not pin --multi-core themselves. UE_CI_ENGINES still
@@ -1048,6 +1055,13 @@ def run_test(test: dict, verbose: bool = False,
     print(f"Command      : {shlex.join(display_cmd)}")
     if test.get("warning"):
         print(f"!!! WARNING  : {test['warning']}")
+    _mew_active = None
+    if test.get("multi_engine_warning"):
+        _p = os.environ.get("UE_CI_ENGINES")
+        _run_ne = int(_p) if _p and _p.isdigit() else _device_capacity(dev or DMA_DEV)[0]
+        if _run_ne and int(_run_ne) > 1:
+            _mew_active = test["multi_engine_warning"]
+            print(f"!!! WARNING  : {_mew_active}")
     if test.get("mode"):
         print(f"Mode         : {test['mode']}")
     print("Execution    : FPGA")
@@ -1224,6 +1238,8 @@ def run_test(test: dict, verbose: bool = False,
     elapsed = time.perf_counter() - t_start
 
     result = _parse_output(test, stdout, returncode, elapsed)
+    if _mew_active:
+        result["multi_engine_warning"] = _mew_active
     if not verbose and not result["passed"]:
         print(f"--- {test['name']} failed; last {FAIL_TAIL_LINES} lines of its output:")
         for l in _fail_tail(result):
@@ -1440,6 +1456,8 @@ def _test_lines(r: dict, test: dict) -> list:
         lines.append(f"  Pass reason: {' '.join(str(r['pass_reason']).split())[:300]}")
     if test.get("warning"):
         lines.append(f"  !!! WARNING: {test['warning']}")
+    if r.get("multi_engine_warning"):
+        lines.append(f"  !!! WARNING: {r['multi_engine_warning']}")
     if r.get("triage"):
         # run_ci.sh greps these two lines together ("^  (Predecessor|Triage) ")
         lines.append(f"  Predecessor : {r.get('predecessor', '-')}")
