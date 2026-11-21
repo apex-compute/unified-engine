@@ -124,7 +124,41 @@ jobs:
             ].join('\n');
 
             core.setOutput('slack-message', message);
-            await core.summary.addRaw(message).write();
+            core.summary.addRaw(message).addEOL();
+
+            // The model report of the dispatched run, so the nightly's own page shows
+            // it too (ci.yml also puts it on its run page).
+            try {
+              const fs = require('fs');
+              const { execSync } = require('child_process');
+              const arts = await github.rest.actions.listWorkflowRunArtifacts({
+                ...common, run_id: completedRun.id, per_page: 100,
+              });
+              const art = arts.data.artifacts.find(a => a.name === 'model-hw-ci-results');
+              if (!art) throw new Error('no model-hw-ci-results artifact');
+              const zip = await github.rest.actions.downloadArtifact({
+                ...common, artifact_id: art.id, archive_format: 'zip',
+              });
+              const dir = `${process.env.RUNNER_TEMP}/model-hw-ci-results`;
+              fs.mkdirSync(dir, { recursive: true });
+              fs.writeFileSync(`${dir}.zip`, Buffer.from(zip.data));
+              execSync(`unzip -o -q "${dir}.zip" -d "${dir}"`);
+              const MAX = 400000;   // a step summary is capped at 1 MiB
+              const files = fs.existsSync(`${dir}/model_auto_test_results_pass1.txt`)
+                ? [['Pass 1: compile + run', 'model_auto_test_results_pass1.txt'],
+                   ['Pass 2: run from bin, shuffled', 'model_auto_test_results_shuffle.txt']]
+                : [['model_auto_test_results.txt', 'model_auto_test_results.txt']];
+              core.summary.addHeading('model_auto_test.py', 2);
+              for (const [title, name] of files) {
+                if (!fs.existsSync(`${dir}/${name}`)) continue;
+                let text = fs.readFileSync(`${dir}/${name}`, 'utf8');
+                if (text.length > MAX) text = text.slice(0, MAX) + '\n... truncated: see the artifact';
+                core.summary.addHeading(title, 3).addCodeBlock(text, 'text');
+              }
+            } catch (error) {
+              core.summary.addRaw(`\n_Model report not attached (${error.message}); see the Full Model HW CI run._\n`);
+            }
+            await core.summary.write();
 
             if (completedRun.conclusion !== 'success') {
               core.setFailed(
