@@ -707,6 +707,11 @@ def _check_kokoro(text):
 # "x = 2" (checked by _check_x_equals_2). Used for all LM/decoder models below.
 MATH_PROMPT = "If x + 3 = 5, what is x?"
 
+# Where the default-off conv ports are tested instead (see "default_off" below).
+_CONV_PORT_UHW = "user_hw_test.py conv_model_tests() runs it against its CPU reference (with FPGA cycles); use that"
+_CONV_PORT_NOT = "not in user_hw_test.py conv_model_tests() yet (it runs yolov5s/n, unet, dpdfnet, dpdfnet8khz, bigcodec)"
+
+
 TESTS = [
     # >>> pi05 RUNS FIRST <<< the harness stops on the first failure, so hoisting pi05
     # to the head gives a full/night run its pi05 verdict in ~2 min instead of after the
@@ -768,12 +773,22 @@ TESTS = [
     # before its run like every other model; smolvlm2_test.py zeroes DRAM itself
     # at startup (ue.zero_dram()) before loading weights. Remove that self-zero
     # once the read-before-write gap is fixed.
-    {"name": "smolvlm2", "script": "models/smolvlm2/smolvlm2_test.py", "pass_check": _check_smolvlm2, "mode": "VLM", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image. (default)"},
+    {"name": "smolvlm2", "script": "models/smolvlm2/smolvlm2_test.py", "pass_check": _check_smolvlm2, "mode": "VLM", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image. (default)",
+     "warning": "smolvlm2 INITIALIZATION IS INCOMPLETE: it reads DRAM it never writes. "
+                "Its own script zero-fills DRAM (ue.zero_dram()) before loading weights; "
+                "without that it fails on NaN leftovers."},
     # TODO: SMOLVLM2 LM PATH IS BUGGY — restore the smolvlm2_lm auto-test only after it is fixed.
 
     # Vision / detection models: no --prompt; emit detections / class labels parsed
     # from stdout.
-    {"name": "locateanything_3b", "script": "models/locateanything_3b/locateanything_3b_test.py",            "pass_check": _check_locateanything},
+    # locateanything_3b reads DRAM it never writes: on the NaN the preceding model left
+    # behind it decoded only '!' and found no boxes (2026-11-21 single-engine pass at
+    # 132af58); on zeroed DRAM it passes. Until its setup is fixed the harness zeroes
+    # DRAM before it, and says so loudly.
+    {"name": "locateanything_3b", "script": "models/locateanything_3b/locateanything_3b_test.py",            "pass_check": _check_locateanything,
+     "clear_dram_zero": True,
+     "warning": "locateanything_3b INITIALIZATION IS INCOMPLETE: it reads DRAM it never writes. "
+                "The harness zero-fills DRAM before it; without that it fails on NaN leftovers."},
     {"name": "mobilenetv2_224",   "script": "models/mobilenetv2/mobilenetv2_224_test.py",                    "pass_check": _check_mbv2_224},
     {"name": "mobilenetv2_ssd",   "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",        "pass_check": _check_mbv2_ssd},
 
@@ -845,14 +860,18 @@ TESTS = [
     # environment; on a board with the standard image they SKIP instead of timing out
     # waiting for a HALT that never comes. Each <model>_test.py wrapper compiles the
     # bin on pass 1 and reuses it on pass 2.
-    {"name": "yolov5s", "script": "models/yolov5s/yolov5s_test.py", "pass_check": _check_yolov5s, "image": "test_samples/vette.jpg", "requires_conv_image": True},
-    {"name": "yolov5n", "script": "models/yolov5n/yolov5n_test.py", "pass_check": _check_yolov5n, "image": "test_samples/people.jpg", "requires_conv_image": True},
-    {"name": "yolo26n", "script": "models/yolo26n/yolo26n_test.py", "pass_check": _check_yolo26n, "image": "test_samples/people.jpg", "requires_conv_image": True},
-    {"name": "yolo26s", "script": "models/yolo26s/yolo26s_test.py", "pass_check": _check_yolo26s, "image": "test_samples/people.jpg", "requires_conv_image": True},
-    {"name": "unet",    "script": "models/unet/unet_test.py",       "pass_check": _check_unet,    "image": "test_samples/vette.jpg",  "requires_conv_image": True},
-    {"name": "dpdfnet", "script": "models/dpdfnet/dpdfnet_test.py", "pass_check": _check_dpdfnet, "audio": "test_samples/apex.wav",   "requires_conv_image": True},
-    {"name": "dpdfnet8khz", "script": "models/dpdfnet8khz/dpdfnet8khz_test.py", "pass_check": _check_dpdfnet8khz, "audio": "test_samples/apex.wav", "requires_conv_image": True},
-    {"name": "bigcodec", "script": "models/bigcodec/bigcodec_test.py", "pass_check": _check_bigcodec, "audio": "test_samples/apex.wav", "requires_conv_image": True},
+    # Not run by default: these ports are tested board-side by user_hw_test.py
+    # (conv_model_tests(): FPGA vs CPU reference, FPGA cycles). The entries stay as
+    # an interface; name one with --only, or set UE_RUN_CONV_MODELS=1, to run it here.
+    # flux2_klein_4b_vae above stays in the default run.
+    {"name": "yolov5s", "script": "models/yolov5s/yolov5s_test.py", "pass_check": _check_yolov5s, "image": "test_samples/vette.jpg", "requires_conv_image": True, "default_off": _CONV_PORT_UHW},
+    {"name": "yolov5n", "script": "models/yolov5n/yolov5n_test.py", "pass_check": _check_yolov5n, "image": "test_samples/people.jpg", "requires_conv_image": True, "default_off": _CONV_PORT_UHW},
+    {"name": "yolo26n", "script": "models/yolo26n/yolo26n_test.py", "pass_check": _check_yolo26n, "image": "test_samples/people.jpg", "requires_conv_image": True, "default_off": _CONV_PORT_NOT},
+    {"name": "yolo26s", "script": "models/yolo26s/yolo26s_test.py", "pass_check": _check_yolo26s, "image": "test_samples/people.jpg", "requires_conv_image": True, "default_off": _CONV_PORT_NOT},
+    {"name": "unet",    "script": "models/unet/unet_test.py",       "pass_check": _check_unet,    "image": "test_samples/vette.jpg",  "requires_conv_image": True, "default_off": _CONV_PORT_UHW},
+    {"name": "dpdfnet", "script": "models/dpdfnet/dpdfnet_test.py", "pass_check": _check_dpdfnet, "audio": "test_samples/apex.wav",   "requires_conv_image": True, "default_off": _CONV_PORT_UHW},
+    {"name": "dpdfnet8khz", "script": "models/dpdfnet8khz/dpdfnet8khz_test.py", "pass_check": _check_dpdfnet8khz, "audio": "test_samples/apex.wav", "requires_conv_image": True, "default_off": _CONV_PORT_UHW},
+    {"name": "bigcodec", "script": "models/bigcodec/bigcodec_test.py", "pass_check": _check_bigcodec, "audio": "test_samples/apex.wav", "requires_conv_image": True, "default_off": _CONV_PORT_UHW},
 
 ]
 
@@ -928,7 +947,7 @@ def _device_max_engines():
     if override:
         try:
             _CI_MAX_ENGINES = max(1, int(override))
-            print(f"[ci] UE_CI_ENGINES={_CI_MAX_ENGINES} (env override)")
+            print(f"[ci] engine count pinned to {_CI_MAX_ENGINES} (--engines / UE_CI_ENGINES)")
             return _CI_MAX_ENGINES
         except ValueError:
             print(f"[ci] ignoring non-integer UE_CI_ENGINES={override!r}")
@@ -1080,7 +1099,16 @@ def run_test(test: dict, verbose: bool = False,
     _pinned = os.environ.get("UE_CI_ENGINES")
     _needed = minimum_engines or required_engines or (2 if test.get("multi_engine_default") else None)
     if _pinned and _pinned.isdigit() and _needed and max(1, int(_pinned)) < _needed:
-        reason = f"runs on >={_needed} engines; UE_CI_ENGINES={_pinned} selects fewer"
+        reason = f"runs on >={_needed} engines; --engines {_pinned} selects fewer"
+        print(f"SKIP         : {reason}\n", flush=True)
+        result = _parse_output(test, "", 0, 0.0)
+        result.update(passed=True, skipped=True, pass_reason=reason)
+        return result
+
+    if (test.get("default_off") and not test.get("_requested")
+            and os.environ.get("UE_RUN_CONV_MODELS") != "1"):
+        reason = (f"not run by default: {test['default_off']}. "
+                  "To run it here: --only " + test["name"] + " or UE_RUN_CONV_MODELS=1")
         print(f"SKIP         : {reason}\n", flush=True)
         result = _parse_output(test, "", 0, 0.0)
         result.update(passed=True, skipped=True, pass_reason=reason)
@@ -1102,10 +1130,9 @@ def run_test(test: dict, verbose: bool = False,
         result["pass_reason"] = f"model script not found: {rel_script}"
         return result
 
-    # Dormant per-test escape hatch: a test may set clear_dram_zero to start from
-    # zero instead of the suite's normal 0xFF poison (for a model with a known
-    # read-before-write defect that cannot self-zero). No test currently uses it —
-    # SmolVLM2 now poisons normally and zeroes DRAM inside its own script.
+    # Per-test escape hatch: a test may set clear_dram_zero to start from zero
+    # (for a model with a known read-before-write defect that cannot self-zero).
+    # parakeet and locateanything_3b use it; SmolVLM2 zeroes DRAM inside its own script.
     if test.get("clear_dram_zero"):
         print(f"[zero_dram] {test['name']} requested clean DRAM; "
               "zeroing before run ...", flush=True)
@@ -1438,6 +1465,115 @@ def _test_lines(r: dict, test: dict) -> list:
     return lines + [""]
 
 
+# Run and board facts for the summary header, collected once in main().
+RUN_INFO: dict = {}
+
+
+def _git(*args) -> str:
+    try:
+        return subprocess.run(["git", "-C", SCRIPT_DIR, *args], capture_output=True,
+                              text=True, timeout=10).stdout.strip()
+    except Exception:
+        return ""
+
+
+def collect_run_info(args, dev: str) -> dict:
+    """What ran, where, and on which board: the header of model_auto_test_results.txt."""
+    import platform
+    import socket
+    info = {
+        "started": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "host": socket.gethostname(),
+        "command": " ".join([os.path.basename(sys.executable)] + sys.argv),
+        "python": platform.python_version(),
+    }
+    branch, commit = _git("rev-parse", "--abbrev-ref", "HEAD"), _git("rev-parse", "--short=8", "HEAD")
+    dirty = _git("status", "--porcelain", "--untracked-files=no")
+    info["git"] = (f"{branch} @ {commit}" + (f" (+{len(dirty.splitlines())} uncommitted file(s))"
+                                            if dirty else "")) if commit else "unknown"
+    pinned = os.environ.get("UE_CI_ENGINES")
+    info["engines_arg"] = args.engines
+    info["engines_pinned"] = int(pinned) if pinned and pinned.isdigit() else None
+    info["dram_fill"] = ("random bf16 before each model (RANDOMIZE_DRAM=1)" if RANDOMIZE_DRAM
+                         else "none; entries with clear_dram_zero are zeroed first")
+    info["conv_image"] = os.environ.get("UE_CI_CONV_IMAGE") == "1"
+    info["conv_ports"] = os.environ.get("UE_RUN_CONV_MODELS") == "1"
+    info["order"] = (f"shuffled, seed {args.shuffle_seed}" if args.shuffle_seed is not None
+                     else "registry" + (f", --first {' '.join(args.first)}" if args.first else ""))
+    info["dev"] = dev
+    try:
+        import struct
+        import user_dma_core as u
+        u.set_dma_device(dev)
+        u.configure_clock_from_hardware()
+        fd = os.open(u.DMA_DEVICE_USER, os.O_RDONLY)
+        try:
+            raw = os.pread(fd, 4, u.UE_0_BASE_ADDR + u.UE_FPGA_VERSION_ADDR
+                           - u.AXI_LITE_TRANSLATION_OFFSET)
+        finally:
+            os.close(fd)
+        info["hw_version"] = f"0x{struct.unpack(u.REG32_FORMAT, raw)[0] & 0xFFFFFFFF:08x}"
+        info["hw_info"] = u.hardware_info_summary()
+        hi = u.configured_hardware_info()
+        cores, freq = u.ANDROMEDA_CORE_COUNT, u.CORE_CLOCK_FREQ_HZ
+        lanes = getattr(hi, "lanes", None) or u.UE_VECTOR_SIZE
+        info.update(cores=cores, dram_gib=u.AVAILABLE_DRAM_SIZE_GB, lanes=lanes,
+                    axi_bits=u.UE_AXI_DATA_WIDTH_BITS, clock_mhz=freq / 1e6 if freq else None,
+                    period_ns=u.CLOCK_CYCLE_TIME_NS,
+                    # One multiply-add per lane per cycle: the peak the per-model
+                    # "% peak" columns use (42.7 GFLOP/s per engine at 333 MHz, 64 lanes).
+                    peak_engine=2 * lanes * freq / 1e9 if freq else None)
+    except Exception as exc:
+        info["hw_error"] = repr(exc)
+    return info
+
+
+def _header_lines(info: dict) -> list:
+    if not info:
+        return []
+    def fmt(v, f="{}", none="unknown"):
+        return none if v is None else f.format(v)
+    cores, peak = info.get("cores"), info.get("peak_engine")
+    used = info.get("engines_pinned") or cores
+    lines = [
+        "Run",
+        f"  started     : {info['started']}",
+        f"  host        : {info['host']}",
+        f"  git         : {info['git']}",
+        f"  command     : {info['command']}",
+        f"  python      : {info['python']}",
+        f"  engines     : --engines {info['engines_arg']}"
+        + (f" -> {used} engine(s)" if used else "")
+        + (" (pinned)" if info.get("engines_pinned") else " (board's HW_INFO count)"),
+        f"  DRAM fill   : {info['dram_fill']}",
+        f"  conv image  : {'yes (UE_CI_CONV_IMAGE=1)' if info['conv_image'] else 'no: conv-image entries SKIP'}",
+        f"  conv ports  : {'run (UE_RUN_CONV_MODELS=1)' if info['conv_ports'] else 'default-off (see user_hw_test.py)'}",
+        f"  order       : {info['order']}",
+        "",
+        "Hardware",
+        f"  device      : {info['dev']}",
+    ]
+    if "hw_error" in info:
+        return lines + [f"  (could not read the board: {info['hw_error']})", "", "=" * 60, ""]
+    lines += [
+        f"  HW version  : {info['hw_version']}",
+        f"  cores       : {fmt(cores)}",
+        f"  clock       : {fmt(info.get('clock_mhz'), '{:.2f} MHz')} (period {fmt(info.get('period_ns'), '{:.3f} ns')})",
+        f"  DRAM        : {fmt(info.get('dram_gib'), '{} GiB')}",
+        f"  AXI width   : {fmt(info.get('axi_bits'), '{} bits')}",
+        f"  lanes       : {fmt(info.get('lanes'))} per engine",
+        f"  peak        : {fmt(peak, '{:.1f} GFLOP/s')} per engine, "
+        f"{fmt(peak * cores if peak and cores else None, '{:.1f} GFLOP/s')} for all {fmt(cores)} core(s)"
+        + (f", {peak * used:.1f} GFLOP/s for the {used} engine(s) of this run"
+           if peak and used and used != cores else ""),
+        f"  HW_INFO     : {info['hw_info']}",
+        "",
+        "=" * 60,
+        "",
+    ]
+    return lines
+
+
 def write_summary(results: list, output_path: str) -> None:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
@@ -1445,7 +1581,7 @@ def write_summary(results: list, output_path: str) -> None:
         f"Generated : {ts}",
         "=" * 60,
         "",
-    ]
+    ] + _header_lines(RUN_INFO)
     by_name = {t["name"]: t for t in TESTS}
     for r in results:
         lines += _test_lines(r, by_name.get(r["name"], {}))
@@ -1520,6 +1656,13 @@ def main():
                          "nightly: all bins already cached, so this exercises run-from-bin "
                          "under a fresh predecessor for every model). The order is printed "
                          "and reproducible from SEED. Default (unset): registry order.")
+    ap.add_argument("--engines", default="max", metavar="N|max",
+                    help="Engine count for the run. 'max' (default): the core count the "
+                         "board reports in HW_INFO. N: pin every model to N engines; it is "
+                         "passed as --engines N / --multi-core N to the scripts that take "
+                         "them, and entries that need more than N engines SKIP. N above the "
+                         "board's core count is an error. Same as env UE_CI_ENGINES=N, "
+                         "which --engines N replaces.")
     ap.add_argument("--continue-on-fail", action="store_true",
                     help="Do not stop on the first failure; run every selected test.")
     ap.add_argument("--triage", action="store_true",
@@ -1551,8 +1694,34 @@ def main():
         if unknown:
             ap.error(f"unknown test name(s): {', '.join(unknown)}")
         tests = [test for test in TESTS if test["name"] in args.only]
+        for test in tests:
+            test["_requested"] = True      # runs a default-off entry too
     else:
         tests = list(TESTS)
+
+    # --engines: N pins the run through the same UE_CI_ENGINES path the rest of the
+    # harness already reads (--engines/--multi-core forwarding, multi-engine SKIPs).
+    if args.engines != "max":
+        try:
+            n_engines = int(args.engines)
+        except ValueError:
+            ap.error(f"--engines must be an integer or 'max' (got {args.engines!r})")
+        if n_engines < 1:
+            ap.error("--engines must be >= 1")
+        board_cores, _ = _device_capacity(DMA_DEV)
+        if board_cores and n_engines > board_cores:
+            ap.error(f"--engines {n_engines} exceeds the {board_cores} core(s) {DMA_DEV} reports")
+        os.environ["UE_CI_ENGINES"] = str(n_engines)
+        print(f"[engines] --engines {n_engines}: every model runs on {n_engines} engine(s); "
+              f"entries that need more SKIP")
+    elif os.environ.get("UE_CI_ENGINES"):
+        print(f"[engines] --engines max, but env UE_CI_ENGINES={os.environ['UE_CI_ENGINES']} "
+              f"pins the count (unset it to use the board's HW_INFO count)")
+    else:
+        board_cores, _ = _device_capacity(DMA_DEV)
+        print(f"[engines] --engines max: {board_cores or 'unknown'} core(s) from {DMA_DEV} HW_INFO")
+
+    RUN_INFO.update(collect_run_info(args, DMA_DEV))
 
     # --first: hoist without reordering the registry. Validated against the SAME
     # known_names set as --only so a typo fails fast, before the device is touched.
