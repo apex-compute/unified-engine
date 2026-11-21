@@ -45,7 +45,8 @@ builtins.print = quiet_print
 import user_dma_core
 from user_dma_core import UnifiedEngine, UE_VECTOR_SIZE, set_dma_device
 from multi_engine_shard import (MultiEngineScheduler, PrivateArena,
-                                model_multicore_layout, require_multicore_dram)
+                                model_multicore_layout, require_multicore_dram,
+                                sequential_windows)
 
 # The sibling mixin file is named for the model (qwen2.5_vl_3b_vision.py), and
 # "2.5" makes that an invalid module name, so it is loaded by path rather than
@@ -101,6 +102,11 @@ MAX_ENGINES = 12
 #   reserved. Boards that place windows by controller (U55C) prefer 6 GiB.
 MULTI_CORE_PREFERRED_MODEL_BASE = 0x180000000
 MULTI_CORE_MODEL_SPAN = 2 << 30
+# Decode copies every LM projection's column shard into the engine's own window:
+# ~1.8 GiB of LM weights / N engines, plus the LM head. A 512 MiB window (496 MiB
+# of weight arena) holds that only from ~4 engines up; at 2 engines it runs out at
+# layer 25 of 36. So when the device has room for it, each window is a whole GiB.
+MULTI_CORE_LARGE_WINDOW = 1 << 30
 
 
 def _shared_report(input_desc, engines, stages, prefill_tokens=None, decoded_tokens=None,
@@ -159,9 +165,20 @@ def _board_multicore_map(num_engines: int):
     do not fall back to a core-index stride when the board policy rejects a map.
     """
     require_multicore_dram(num_engines, "Qwen2.5-VL-3B")
-    return model_multicore_layout(
+    # The board policy first: it validates the board and the 512 MiB map.
+    windows, model_base = model_multicore_layout(
         num_engines, model_bytes=MULTI_CORE_MODEL_SPAN,
         preferred_model_base=MULTI_CORE_PREFERRED_MODEL_BASE)
+    # Then grow every window to 1 GiB when N of them plus the 2 GiB model map
+    # still fit the device (kintex7 2 x 1 GiB + 2 GiB = 4 GiB; U50 up to 6
+    # engines). Same sequential layout, the model map right after the windows;
+    # on interleaved DRAM where a window sits does not change its bandwidth.
+    dram_bytes = user_dma_core.AVAILABLE_DRAM_SIZE_GB << 30
+    big = MULTI_CORE_LARGE_WINDOW
+    if (windows == sequential_windows(num_engines)
+            and num_engines * big + MULTI_CORE_MODEL_SPAN <= dram_bytes):
+        windows, model_base = sequential_windows(num_engines, big), num_engines * big
+    return windows, model_base
 
 
 class Qwen25VL_UnifiedEngine(Qwen25VLLMMixin, Qwen25VLVisionMixin, UnifiedEngine):

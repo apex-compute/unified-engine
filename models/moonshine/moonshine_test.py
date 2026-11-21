@@ -468,6 +468,8 @@ class MoonshineEngine(UnifiedEngine):
     EOS      = DEC["eos_token_id"]
     PRIMARY_PROGRAM_LIMIT = 0xD8000000   # single-engine map; shifted with the model map when sharded
 
+    WORKER_ISA_BYTES = 96 << 20        # per-engine worker program slice (multiple of 16 MiB)
+
     def __init__(self, ref: MoonshineReference = None, dev=None, max_seconds=None, from_bin=False, engines=1):
         """ref=None + from_bin=True: load params/programs from moonshine_bin/ (no HF weights,
         no compile). Otherwise upload weights from `ref` and compile everything at the cap."""
@@ -514,7 +516,11 @@ class MoonshineEngine(UnifiedEngine):
                 f"--engines {engines} but the bitstream reports {cores} core(s)"
         # Scheduler FIRST: constructing worker engines stomps 16 KB at DRAM_START (guarded inside,
         # but nothing of ours is uploaded yet either way). num_engines=1 is an exact passthrough.
-        self.arena = PrivateArena(engines, windows=self.windows) if engines > 1 else None
+        # Worker ISA slice: a worker keeps its decoder AND encoder images resident back to
+        # back, ~45 MB at 2 engines -- the 16 MB default overflowed into the next window.
+        # Its weight shards are only ~36 MB per engine, so the window has the room.
+        self.arena = (PrivateArena(engines, windows=self.windows, isa_bytes=self.WORKER_ISA_BYTES)
+                      if engines > 1 else None)
         self.sched = MultiEngineScheduler(
             self, num_engines=engines, arena=self.arena,
             # master/worker rendezvous + four-phase handshake: the shape HW-verified at 8 engines (ACT uses

@@ -727,7 +727,7 @@ TESTS = [
 
     # The deprecated gemma3_test_IF8.py is deliberately excluded: IF8 is
     # currently not working.
-    {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
+    {"name": "gemma3",      "script": "models/gemma3/gemma3_test.py",                   "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "multi_core_max": 2},
     # Gemma4 E2B FPGA vision. No --device: this script reads AXI width, clock,
     # DRAM size and engine count from HW_INFO (see resolve_engine_config).
     # The normal entry compiles fresh (--bin-reuse is off by default) with the
@@ -749,16 +749,19 @@ TESTS = [
     {"name": "gemma4_e2b_run_from_bin", "script": "models/gemma4_e2b/gemma4_e2b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "32"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
     {"name": "gemma4_e4b",  "script": "models/gemma4_e4b/gemma4_e4b_test.py",           "pass_check": _check_gemma4_e4b_vlm, "extra_args": ["--image", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
     {"name": "gemma4_e4b_run_from_bin", "script": "models/gemma4_e4b/gemma4_e4b_test.py", "pass_check": _check_gemma4_e2b_vette, "extra_args": ["--image", "test_samples/vette.jpg", "--bin-reuse", "--max-new-tokens", "32"], "mode": "VLM/bin reuse", "image": "test_samples/vette.jpg", "prompt_desc": "Describe this image in detail. (default)", "no_device": True, "multi_core_max": 8},
-    {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2},
-    {"name": "qwen3_0.6b",  "script": "models/qwen3_0.6b/qwen3_0.6b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"]},
-    {"name": "qwen3_1.7b",  "script": "models/qwen3_1.7b/qwen3_1.7b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"]},
-    {"name": "qwen3_4b",    "script": "models/qwen3_4b/qwen3_4b_test.py",       "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"]},
-    {"name": "qwen3.5_2b",  "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"]},
+    {"name": "llama3.2_1b", "script": "models/llama3.2_1b/llama3.2_1b_test.py", "prompt": MATH_PROMPT, "pass_check": _check_x_equals_2, "multi_core_max": 2},
+    {"name": "llama3.2_3b", "script": "models/llama3.2_3b/llama3.2_3b_test.py", "prompt": MATH_PROMPT, "max_engines": 1, "pass_check": _check_x_equals_2},
+    {"name": "qwen3_0.6b",  "script": "models/qwen3_0.6b/qwen3_0.6b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 2},
+    {"name": "qwen3_1.7b",  "script": "models/qwen3_1.7b/qwen3_1.7b_test.py",   "prompt": MATH_PROMPT, "max_engines": 1, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"]},
+    {"name": "qwen3_4b",    "script": "models/qwen3_4b/qwen3_4b_test.py",       "prompt": MATH_PROMPT, "max_engines": 1, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"]},
+    {"name": "qwen3.5_2b",  "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",   "prompt": MATH_PROMPT, "pass_check": _check_math_opening, "extra_args": ["--max-new-tokens", "32"], "multi_core_max": 2},
     # qwen3.5_2b VLM: FPGA vision encoder (--vision-enable defaults to on-FPGA vision)
     # on yosemite.jpg; gemma4-style criteria (coherent decode + scene keywords).
-    {"name": "qwen3.5_2b_vlm", "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",        "pass_check": _check_qwen_vlm, "extra_args": ["--vision-enable", "--vision-on-hardware", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe what you see in this image. (default)"},
-    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py", "pass_check": _check_qwen_vlm, "extra_args": ["--image", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the picture in details. (default)", "no_device": True},
+    # Single-engine only: the script refuses --multi-core > 1 with vision on
+    # ("multicore currently supports text-only generation"); the text entry above
+    # covers the same script on several engines.
+    {"name": "qwen3.5_2b_vlm", "script": "models/qwen3.5_2b/qwen3.5_2b_test.py",        "max_engines": 1, "pass_check": _check_qwen_vlm, "extra_args": ["--vision-enable", "--vision-on-hardware", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe what you see in this image. (default)"},
+    {"name": "qwen2.5_vl_3b", "script": "models/qwen2.5_vl_3b/qwen2.5_vl_3b_test.py", "pass_check": _check_qwen_vlm, "extra_args": ["--image", "--max-new-tokens", "32"], "mode": "VLM", "image": "test_samples/yosemite.jpg", "prompt_desc": "Describe the picture in details. (default)", "no_device": True, "multi_core_max": 2},
 
     # Qwen2.5-Omni-7B Thinker-only modes. The model requires the 8 GiB Alveo U55
     # eight-engine layout; unlike scripts that expose --engines, --multi-core is
@@ -785,12 +788,12 @@ TESTS = [
     # behind it decoded only '!' and found no boxes (2026-11-21 single-engine pass at
     # 132af58); on zeroed DRAM it passes. Until its setup is fixed the harness zeroes
     # DRAM before it, and says so loudly.
-    {"name": "locateanything_3b", "script": "models/locateanything_3b/locateanything_3b_test.py",            "pass_check": _check_locateanything,
+    {"name": "locateanything_3b", "script": "models/locateanything_3b/locateanything_3b_test.py",            "max_engines": 1, "pass_check": _check_locateanything,
      "clear_dram_zero": True,
      "warning": "locateanything_3b INITIALIZATION IS INCOMPLETE: it reads DRAM it never writes. "
                 "The harness zero-fills DRAM before it; without that it fails on NaN leftovers."},
-    {"name": "mobilenetv2_224",   "script": "models/mobilenetv2/mobilenetv2_224_test.py",                    "pass_check": _check_mbv2_224},
-    {"name": "mobilenetv2_ssd",   "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",        "pass_check": _check_mbv2_ssd},
+    {"name": "mobilenetv2_224",   "script": "models/mobilenetv2/mobilenetv2_224_test.py",                    "max_engines": 1, "pass_check": _check_mbv2_224},
+    {"name": "mobilenetv2_ssd",   "script": "models/mobilenetv2/mobilenetv2_ssd_fpnlite_640_test.py",        "max_engines": 1, "pass_check": _check_mbv2_ssd},
 
     # Encoder models take no --prompt and emit non-LM output (ASR transcription /
     # segmentation).
@@ -798,21 +801,21 @@ TESTS = [
     # data mobilesam leaves) it decodes 640 garbage tokens; on zeros, random bf16 or its
     # own previous run it is fine. Until its setup is fixed the harness zeroes DRAM
     # before it, and says so loudly.
-    {"name": "parakeet",  "script": "models/parakeet/parakeet_test.py",        "pass_check": _check_parakeet,
+    {"name": "parakeet",  "script": "models/parakeet/parakeet_test.py",        "max_engines": 1, "pass_check": _check_parakeet,
      "clear_dram_zero": True,
      "warning": "parakeet INITIALIZATION IS INCOMPLETE: it reads DRAM it never writes. "
                 "The harness zero-fills DRAM before it; without that it fails on NaN leftovers."},
     # moonshine (ASR, 61M enc-dec on raw PCM): transcribes test_samples/apex.wav and
     # compares HW tokens against its CPU reference. Pass 1 compiles (~85 s) and freezes
     # moonshine_bin/{params,programs}.bin; pass 2 replays the image automatically when
-    # the signature matches. --engines is pinned to 1: only the single-engine path is
-    # HW-proven (2026-10-20); drop the pin once the sharded stem/encoder is validated.
-    {"name": "moonshine", "script": "models/moonshine/moonshine_test.py",      "pass_check": _check_moonshine, "extra_args": ["--engines", "1"]},
-    {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",      "pass_check": _check_nonempty,
+    # the signature matches. Runs at the run's engine count (--engines); the sharded
+    # stem/encoder was first HW-checked on 2 engines on 2026-11-21.
+    {"name": "moonshine", "script": "models/moonshine/moonshine_test.py",      "pass_check": _check_moonshine},
+    {"name": "mobilesam", "script": "models/mobilesam/mobilesam_test.py",      "max_engines": 1, "pass_check": _check_nonempty,
      "warning": "mobilesam LEAVES NaN / inf IN DRAM (measured on a zeroed 8 GiB board: 21,248 NaN "
                 "elements at 0xE0000000.., 785,713 inf at 0x80000000.. and 0xD8000000..): a model "
                 "that reads uninitialised DRAM after it (parakeet) breaks."},
-    {"name": "swin",      "script": "models/swin/swin_test.py",                        "pass_check": _check_swin},
+    {"name": "swin",      "script": "models/swin/swin_test.py",                        "max_engines": 1, "pass_check": _check_swin},
 
     # verapulse (pulsevla): SmolVLA-derived robot policy. No --prompt and no text output
     # -- vision -> prefix -> denoise, emitting a [50, 32] action chunk of which the first
@@ -1105,6 +1108,21 @@ def run_test(test: dict, verbose: bool = False,
         result.update(passed=True, skipped=True, pass_reason=reason)
         return result
 
+    # "max_engines": the script has no multi-engine path. A run at more engines than
+    # that (--engines N, or --engines max on a multi-core board) is a multi-engine test,
+    # so the entry is skipped there; its single-engine result comes from --engines 1.
+    _max_ne = test.get("max_engines")
+    if _max_ne is not None:
+        _run_ne = (int(_pinned) if _pinned and _pinned.isdigit()
+                   else _device_capacity(dev or DMA_DEV)[0])
+        if _run_ne and int(_run_ne) > _max_ne:
+            reason = (f"single-engine model (no multi-engine path in the script); this run "
+                      f"uses {_run_ne} engines. Covered by --engines 1")
+            print(f"SKIP         : {reason}\n", flush=True)
+            result = _parse_output(test, "", 0, 0.0)
+            result.update(passed=True, skipped=True, pass_reason=reason)
+            return result
+
     if (test.get("default_off") and not test.get("_requested")
             and os.environ.get("UE_RUN_CONV_MODELS") != "1"):
         reason = (f"not run by default: {test['default_off']}. "
@@ -1206,6 +1224,10 @@ def run_test(test: dict, verbose: bool = False,
     elapsed = time.perf_counter() - t_start
 
     result = _parse_output(test, stdout, returncode, elapsed)
+    if not verbose and not result["passed"]:
+        print(f"--- {test['name']} failed; last {FAIL_TAIL_LINES} lines of its output:")
+        for l in _fail_tail(result):
+            print("    | " + l)
     result["bins"] = _bin_states(_bins_before, _bin_snapshot(script))
     result["harness_s"] = time.perf_counter() - _t_harness
     return result
@@ -1396,6 +1418,17 @@ def _performance_lines(r: dict) -> list:
     return lines
 
 
+FAIL_TAIL_LINES = 30
+
+
+def _fail_tail(r: dict) -> list:
+    """Last lines of a failed model's own output (stdout + stderr), so the reason
+    is in the console and the report even when the run was not --verbose."""
+    out = (r.get("stdout") or "").replace("\r", "\n")
+    tail = [l.rstrip() for l in out.splitlines() if l.strip()][-FAIL_TAIL_LINES:]
+    return tail or ["(the model printed nothing)"]
+
+
 def _test_lines(r: dict, test: dict) -> list:
     report = r.get("report") or {}
     status = "SKIP" if r.get("skipped") else ("PASS" if r["passed"] else "FAIL")
@@ -1413,6 +1446,9 @@ def _test_lines(r: dict, test: dict) -> list:
         lines.append(f"  Triage      : {r['triage']}")
     if r.get("skipped"):
         return lines + [""]
+    if not r["passed"]:
+        lines.append(f"  Output tail (last {FAIL_TAIL_LINES} lines of the model's output):")
+        lines += ["    | " + l[:300] for l in _fail_tail(r)]
 
     lines.append("  Input")
     given = report.get("input")
@@ -1660,7 +1696,7 @@ def main():
                     help="Engine count for the run. 'max' (default): the core count the "
                          "board reports in HW_INFO. N: pin every model to N engines; it is "
                          "passed as --engines N / --multi-core N to the scripts that take "
-                         "them, and entries that need more than N engines SKIP. N above the "
+                         "them, and entries that need more than N engines SKIP; above 1, so do the single-engine-only entries (max_engines 1). N above the "
                          "board's core count is an error. Same as env UE_CI_ENGINES=N, "
                          "which --engines N replaces.")
     ap.add_argument("--continue-on-fail", action="store_true",
