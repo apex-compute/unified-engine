@@ -1014,9 +1014,15 @@ def run_test(test: dict, verbose: bool = False,
     # explicit --engines in extra_args still wins, for a case that must pin its own count.
     if "--engines" not in cmd and _script_supports_flag(script, "--engines"):
         _ne = _device_max_engines()
+        # Unpinned (--engines max): a single-engine-only entry falls back to its
+        # max_engines, passed explicitly so a script defaulting higher still obeys it.
+        _fallback = (test.get("max_engines") is not None and not os.environ.get("UE_CI_ENGINES")
+                     and _ne and _ne > test["max_engines"])
+        if _fallback:
+            _ne = test["max_engines"]
         # A pinned count (UE_CI_ENGINES) is passed even when it is 1: a script whose own
         # default is several engines (act: 2) would otherwise ignore a single-engine pass.
-        if _ne and (_ne > 1 or os.environ.get("UE_CI_ENGINES")):
+        if _ne and (_ne > 1 or os.environ.get("UE_CI_ENGINES") or _fallback):
             cmd += ["--engines", str(_ne)]
             # smolvlm2 shards decode only with its own --decode-engines (default 1):
             # without it a multi-engine run leaves decode on one engine.
@@ -1122,14 +1128,21 @@ def run_test(test: dict, verbose: bool = False,
         result.update(passed=True, skipped=True, pass_reason=reason)
         return result
 
-    # "max_engines": the script has no multi-engine path. A run at more engines than
-    # that (--engines N, or --engines max on a multi-core board) is a multi-engine test,
-    # so the entry is skipped there; its single-engine result comes from --engines 1.
+    # "max_engines": the script has no multi-engine path. A pinned run above that
+    # (--engines N) is a multi-engine test, so the entry is skipped there; its
+    # single-engine result comes from --engines 1. An unpinned run (--engines max, the
+    # CI default) falls back: the entry runs on max_engines engines instead.
     _max_ne = test.get("max_engines")
+    _engine_fallback = None
     if _max_ne is not None:
-        _run_ne = (int(_pinned) if _pinned and _pinned.isdigit()
-                   else _device_capacity(dev or DMA_DEV)[0])
-        if _run_ne and int(_run_ne) > _max_ne:
+        if not (_pinned and _pinned.isdigit()):
+            _cores = _device_capacity(dev or DMA_DEV)[0]
+            if _cores and int(_cores) > _max_ne:
+                _engine_fallback = (f"single-engine model: runs on {_max_ne} engine(s) of the "
+                                    f"board's {_cores} (--engines max fallback)")
+                print(f"FALLBACK     : {_engine_fallback}", flush=True)
+        elif int(_pinned) > _max_ne:
+            _run_ne = int(_pinned)
             reason = (f"single-engine model (no multi-engine path in the script); this run "
                       f"uses {_run_ne} engines. Covered by --engines 1")
             print(f"SKIP         : {reason}\n", flush=True)
@@ -1240,6 +1253,8 @@ def run_test(test: dict, verbose: bool = False,
     result = _parse_output(test, stdout, returncode, elapsed)
     if _mew_active:
         result["multi_engine_warning"] = _mew_active
+    if _engine_fallback:
+        result["engine_fallback"] = _engine_fallback
     if not verbose and not result["passed"]:
         print(f"--- {test['name']} failed; last {FAIL_TAIL_LINES} lines of its output:")
         for l in _fail_tail(result):
@@ -1456,6 +1471,8 @@ def _test_lines(r: dict, test: dict) -> list:
         lines.append(f"  Pass reason: {' '.join(str(r['pass_reason']).split())[:300]}")
     if test.get("warning"):
         lines.append(f"  !!! WARNING: {test['warning']}")
+    if r.get("engine_fallback"):
+        lines.append(f"  Engines    : {r['engine_fallback']}")
     if r.get("multi_engine_warning"):
         lines.append(f"  !!! WARNING: {r['multi_engine_warning']}")
     if r.get("triage"):
@@ -1714,7 +1731,7 @@ def main():
                     help="Engine count for the run. 'max' (default): the core count the "
                          "board reports in HW_INFO. N: pin every model to N engines; it is "
                          "passed as --engines N / --multi-core N to the scripts that take "
-                         "them, and entries that need more than N engines SKIP; above 1, so do the single-engine-only entries (max_engines 1). N above the "
+                         "them, and entries that need more than N engines SKIP; above 1, so do the single-engine-only entries (max_engines 1), which under 'max' fall back to 1 engine instead. N above the "
                          "board's core count is an error. Same as env UE_CI_ENGINES=N, "
                          "which --engines N replaces.")
     ap.add_argument("--continue-on-fail", action="store_true",
