@@ -1329,7 +1329,10 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
                                    else TILED_WINDOW_BYTES)
         self._tile_tensor_bytes = (KINTEX_PRIVATE_TENSOR_BYTES if self._kintex_tiled_map
                                    else TILED_TENSOR_BYTES)
-        self._tile_isa_bytes = (KINTEX_ISA_BYTES if self._kintex_tiled_map
+        # Below TILED_MAP_MIN_ENGINES the packed map uses the slice sizes proven at
+        # 2 engines on kintex7: each worker carries a larger share of the program.
+        self._tile_isa_bytes = (KINTEX_ISA_BYTES if (self._kintex_tiled_map
+                                                     or multi_core < TILED_MAP_MIN_ENGINES)
                                 else TILED_ISA_BYTES)
         # The floor per map, raised to what this model's slices need (E4B).
         self._tile_private_reserve_bytes = max(
@@ -1353,8 +1356,12 @@ class Gemma4_UnifiedEngine(Gemma4LMMixin, Gemma4VisionMixin,
         # tensor slices -- the windows sit back to back from 0, and everything
         # shared (weights, the tensor extent, KV cache) goes to ONE contiguous
         # region above them that runs to the end of the device.
-        _packed = (dram_interleaved()
-                   and (self._kintex_tiled_map or multi_core >= TILED_MAP_MIN_ENGINES))
+        # Every multi-engine count, not only kintex7 x2 and >= 8 engines: the
+        # 512 MiB model map below cannot hold 2..7 engines on the U50 -- at 2 the
+        # prefill attention scratch overflows its 16 MiB tensor slice (E2B), the
+        # LM tensor region overflows the 2 GB map (E4B), and the decode shards need
+        # ~608 MiB per engine against a 496 MiB arena.
+        _packed = dram_interleaved() and self._use_multicore_dram_layout
         if _packed:
             _window = (self._tile_private_reserve_bytes + self._tile_isa_bytes
                        + self._tile_tensor_bytes)

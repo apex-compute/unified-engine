@@ -172,7 +172,7 @@ class Gemma4MulticoreLayout(unittest.TestCase):
         self.assertEqual([r.base for r in engine.mc_arena.regions], engine._tile_bases)
 
     def test_non_tiled_windows_follow_board_controllers_and_reserve_model(self):
-        for cores, gib, active in ((8, 8, 4), (12, 16, 4), (12, 8, 12)):
+        for cores, gib, active in ((12, 8, 12),):
             with self.subTest(cores=cores, gib=gib, active=active):
                 engine = self.engine(cores, gib, active)
                 self.assertFalse(engine._tiled_map)
@@ -183,10 +183,21 @@ class Gemma4MulticoreLayout(unittest.TestCase):
                 self.assertEqual(engine.DRAM_END, model_base + (2 << 30))
                 for base, size in expected:
                     self.assertTrue(base + size <= model_base or base >= engine.DRAM_END)
-        # Interleaved U50: sequential 512 MiB windows, the model map right after.
-        u50 = self.engine(active=4)
-        self.assertEqual(u50._board_windows, [(i << 29, 512 << 20) for i in range(4)])
-        self.assertEqual(u50._params_dram_base, 2 << 30)
+
+    def test_interleaved_boards_pack_every_multi_engine_count(self):
+        # Interleaved DRAM (U50, U55C) uses the packed map at every engine count,
+        # not the 512 MiB model map: at 2..7 engines that map overflows (prefill
+        # scratch, LM tensors, decode shards). Windows back to back from 0, one
+        # shared region from their end to the end of the device.
+        for cores, gib, active in ((8, 8, 2), (8, 8, 4), (12, 16, 4)):
+            with self.subTest(cores=cores, gib=gib, active=active):
+                engine = self.engine(cores, gib, active)
+                self.assertTrue(engine._tiled_map)
+                self.assertIsNotNone(engine._shared_region)
+                w = engine._tile_window_bytes
+                self.assertEqual(engine._tile_bases, [i * w for i in range(active)])
+                self.assertEqual(engine._shared_region, (active * w, (gib << 30) - active * w))
+                self.assertTrue(engine.dram_layout.startswith(f"pack{active}"))
 
     def test_layout_identity_distinguishes_same_count_on_different_boards(self):
         u50 = self.engine()

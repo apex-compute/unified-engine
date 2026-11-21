@@ -8001,7 +8001,21 @@ def _programs_stem(engines):
     8-engine set replayed on 4 hangs waiting on workers that were never launched.
     """
     e, p, d = (int(engines[s]) for s in _PROGRAM_ORDER)
-    return f"programs_e{e}_{p}_{d}"
+    return f"programs_e{e}_{p}_{d}_{_board_tag()}"
+
+
+def _board_tag():
+    """The board profile a program set was compiled for: HW_INFO cores and DRAM GiB.
+
+    Part of the programs file stem. Controller replicas, private windows and the
+    per-stage clamps all follow the board, so a set compiled on one board is not
+    valid on another -- replayed on kintex7, a U50 single-engine set ran to the end
+    and produced NaN actions; the other way round the replica check refused it.
+    """
+    if (user_dma_core.ANDROMEDA_CORE_COUNT is None
+            or user_dma_core.AVAILABLE_DRAM_SIZE_GB is None):
+        user_dma_core.configure_clock_from_hardware()
+    return f"c{user_dma_core.ANDROMEDA_CORE_COUNT}m{user_dma_core.AVAILABLE_DRAM_SIZE_GB}"
 
 
 class Pi05Libero_Run(Pi05Libero_UnifiedEngine):
