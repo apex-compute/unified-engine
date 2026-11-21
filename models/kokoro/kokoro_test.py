@@ -172,21 +172,13 @@ def main():
                               "fingerprint and the capacity caps -- deliberately NOT on the "
                               "sequence length, since one image is meant to serve every prompt.")
     parser.add_argument("--engines", type=int, default=1,
-                         help="Engine count. Only 1 is supported: see the check below.")
+                         help="Accelerator engines to row-shard the generator's conv taps across "
+                              "(1 = single engine). >1 compiles every run for now (no bin cache).")
     parser.add_argument("--no-snr", action="store_false", dest="debug_snr",
                          help="Skip the per-section SNR bisects against the CPU reference. "
                               "They run by default; pass this to opt out.")
     parser.set_defaults(debug_snr=True)
     args = parser.parse_args()
-    # Multi-engine is not supported. The sharded generator only exists on the fused path,
-    # which the default per-section SNR checks bypass (they pass a CPU reference, so the
-    # generator ran on one engine whatever --engines said); and on the fused path the
-    # sharded AdaIN stats staging is sized for many engines -- at 2 it overflows at compile
-    # time (_stats_sharded: 32896 rows per engine vs 8192 staged). Refuse rather than
-    # silently run on one engine.
-    if args.engines != 1:
-        parser.error(f"--engines {args.engines}: kokoro supports a single engine only "
-                     f"(the multi-engine generator does not work yet)")
 
     # FPGA is the default; --cuda opts out to the stock reference path.
     use_fpga = not args.cuda
